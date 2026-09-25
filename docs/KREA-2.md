@@ -29,7 +29,7 @@ pins the diffusers subfolders it needs and skips the redundant top-level
 ## The pipelines
 
 - **[`prepare-krea-2.vpipeline`](pipelines/prepare-krea-2.vpipeline)** — fetch
-  the model and the M87 LoRA. Run once.
+  the model, the M87 LoRA and the live-preview TAE. Run once.
 - **[`krea-2-text-to-image.vpipeline`](pipelines/krea-2-text-to-image.vpipeline)**
   — prompt in, `.jpeg` out. Plain, and the one to run from the terminal.
 - **[`krea-2-preview.vpipeline`](pipelines/krea-2-preview.vpipeline)** — the
@@ -253,34 +253,49 @@ linearly: the DiT is ~all of the time, and it runs once per step.
 ## The live preview
 
 [`krea-2-preview.vpipeline`](pipelines/krea-2-preview.vpipeline) is the same
-graph with two stages added and two edges moved, and it shows the image
-**forming** rather than appearing:
+graph with one stage added, and it shows the image **forming** rather than
+appearing:
 
 ```
-generate-image ─1─> vae-decode ─┬─> preview      (all 8 steps, as video)
-                                └─> temporal-slice(-1) ──> save-image
+generate-image ─0─> vae-decode ──> save-image
+               └─2─> preview      (one picture per step)
 ```
 
-Three things make that work, and each is worth knowing on its own.
+**`generate-image` has a preview port.** After each step, port **2** takes
+the model's current guess at the *finished* image and decodes it with a
+**tiny autoencoder** (a TAE) instead of the real VAE. The guess is the
+clean estimate, not the noisy state it is stepping. The `preview` stage
+shows each one as it arrives. The TAE is madebyollin's **`taew2_1`**
+(22 MB). It was trained for Wan 2.1's latent space, which is Krea-2's:
+the Qwen-Image VAE kept Wan 2.1's encoder and retrained only the decoder.
+[`prepare-krea-2.vpipeline`](pipelines/prepare-krea-2.vpipeline) fetches
+it beside the model, registered as `madebyollin/taew2_1`.
 
-**`generate-image` has a second oport.** Port 0 is the finished latent; port
-**1** is `step_latent` — one beat per sampler step, same format — and it is
-**only emitted when something is connected**. So the preview costs nothing in
-the graph that does not ask for it.
+**The knobs are on `krea2-model-config`:** `preview_vae` names the TAE,
+`preview_every` renders every *N*th step (the last always renders), and
+`preview_max_edge` scales the picture down before it is sent (512 by
+default). Leave `preview_vae` empty, or port 2 unwired, and nothing is
+loaded or decoded.
 
-**One decode serves both.** `vae-decode` is wired to port 1, so it decodes
-every step, and the preview and the file both read that one stream. The
-price is honest: eight VAE decodes instead of one. That is why the plain
-pipeline does not do it, and why it is the better one for the terminal.
+**What it costs**, measured at 1024 × 1024 with 8 steps on an M4 Pro:
 
-**`temporal-slice` throws the intermediates away.** `start: -1` keeps the
-**last** beat of the stream and drops the rest, so `save-image` writes the
-finished image and not eight files. The stage can only resolve a negative
-index once the source hits EOS, which is exactly when the last step lands.
+- **No measurable cost to the denoise.** With a preview on every step the
+  denoise took 143.6 and 143.8 s; without previews it took 144.9 s (runs
+  alternated).
+- Each preview arrived **2.2–2.4 s** after its step, but that is time
+  queued behind the DiT's work rather than work: the last one, rendered
+  with the GPU free, took 0.54 s.
+- The decode runs on a thread of its own, so the generation never waits
+  for it. A preview still queued when the next one is due is replaced,
+  not kept.
+- The step-4 preview is already recognisably the final picture (23.7 dB
+  against the real decode). The last step's preview matches the real VAE
+  at **36.1 dB**.
 
-The `preview` stage carries `image_mode: false` — *always video*. The eight
-frames then arrive as a short clip of the denoise rather than as eight
-stills replacing one another.
+**Port 1 is still there.** `step_latent` emits the raw noisy state every
+step, in the latent format. Wire a `vae-decode` to it to see exactly what
+the sampler holds at each step, at the price of a full VAE decode per
+step. That makes it a debugging view, where port 2 is the one to watch.
 
 Open the web UI from your work directory, load the pipeline, and the preview
 appears in the Composer panel while it runs.

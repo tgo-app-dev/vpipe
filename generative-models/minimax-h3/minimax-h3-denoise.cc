@@ -192,6 +192,8 @@ denoise(const DenoiseRequest& req, std::string* err)
     }
   }
 
+  // A preview's clean estimate, filled only on a step that renders one.
+  std::vector<float> preview_x0;
   for (int i = 0; i < steps; ++i) {
     // Every row's timestep, this step. The conditioning rows keep their
     // own value while the generated video and audio rows walk their two
@@ -305,6 +307,15 @@ denoise(const DenoiseRequest& req, std::string* err)
         vxcorr = den > 0.0 ? sxy / den : 0.0;
       }
       float* vx = req.video + (std::size_t)ncond * PE;
+      // The clean estimate, taken before the step overwrites the state it
+      // is estimated from.
+      if (req.preview && req.preview_due && req.preview_due(i + 1, steps)) {
+        preview_x0.resize(vel.size());
+        if (!sv.estimate_x0(vel.data(), i, vx, preview_x0.data(),
+                            vel.size())) {
+          preview_x0.clear();
+        }
+      }
       const bool vok =
           res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
                  : sv.step(vel.data(), i, vx, vel.size());
@@ -382,6 +393,10 @@ denoise(const DenoiseRequest& req, std::string* err)
           vxcorr, arms, xarms, axcorr));
     }
 
+    if (!preview_x0.empty()) {
+      req.preview(i + 1, steps, preview_x0.data());
+      preview_x0.clear();
+    }
     if (req.progress && !req.progress(i + 1, steps)) { break; }
   }
   return true;

@@ -1,6 +1,9 @@
 #include "stages/z-image-model-config-stage.h"
+#include "stages/latent-preview.h"
+#include "stages/model-registry.h"
 
 #include "common/flex-data.h"
+#include "common/vpipe-format.h"
 
 #include <string>
 #include <utility>
@@ -32,6 +35,19 @@ const ConfigKey kAttrs[] = {
           "artefacts. Unset => 1.0, which never fires. Only read when "
           "guidance_scale > 0",
    .def_real = 1.0},
+  // The live-preview keys every family's config source shares; see
+  // stages/latent-preview.h. Z-Image decodes with the FLUX.1
+  // autoencoder, so its TAE is madebyollin's `taef1`, fed the DiT's own
+  // latent: the AE's scale and shift are the real decode's to undo.
+  {.key = latent_preview::kVaeKey, .type = ConfigType::String,
+   .required = false, .doc = latent_preview::kVaeDoc,
+   .suggest_db = kModelRegistryDb,
+   // Typed, so the picker offers a TAE for THIS latent space only.
+   .suggest_db_type = "z-image-tae"},
+  {.key = latent_preview::kEveryKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kEveryDoc, .def_int = 1},
+  {.key = latent_preview::kMaxEdgeKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kMaxEdgeDoc, .def_int = 512},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -44,7 +60,8 @@ const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "z-image parameters as one FlexData object {model_family: "
           "z-image, +guidance_scale, +cfg_normalization, "
-          "+cfg_truncation}, for a generate-image model_config iport",
+          "+cfg_truncation, +preview_vae and its knobs}, for a "
+          "generate-image model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -75,6 +92,15 @@ ZImageModelConfigStage::ZImageModelConfigStage(
                                                    std::move(iports),
                                                    std::move(config))
 {
+  _preview.vae      = attr_str(latent_preview::kVaeKey);
+  _preview.every    = (int)attr_int(latent_preview::kEveryKey);
+  _preview.max_edge = (int)attr_int(latent_preview::kMaxEdgeKey);
+  if (_preview.every < 0 || _preview.max_edge < 0) {
+    fail_config(fmt(
+        "ZImageModelConfigStage('{}'): preview_every and "
+        "preview_max_edge must be >= 0 (got {} / {})", this->id(),
+        _preview.every, _preview.max_edge));
+  }
   allocate_oports(spec().oports.size());
 }
 
@@ -103,6 +129,8 @@ ZImageModelConfigStage::resolved_config() const
     carry("cfg_normalization");
     carry("cfg_truncation");
   }
+  // Emitted only when a preview VAE is named.
+  _preview.emit(fd);
   return fd;
 }
 

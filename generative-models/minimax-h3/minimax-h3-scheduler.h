@@ -90,6 +90,13 @@ class MiniMaxH3Scheduler {
   bool step(const float* velocity, int step_index, float* x,
             std::size_t n) const;
 
+  // The x0 above on its own, into `out`: the model's CLEAN ESTIMATE at
+  // this step, which is what a latent preview decodes. Both samplers take
+  // it this way, so a preview is the same picture either one would step
+  // towards. Call it before the step overwrites `x`.
+  bool estimate_x0(const float* velocity, int step_index, const float* x,
+                   float* out, std::size_t n) const;
+
   // One `res_multistep` step -- the sampler the ComfyUI t2v template
   // actually ships (`KSamplerSelect: res_multistep`, eta = 0), a
   // second-order exponential multistep in log-sigma time.

@@ -21,6 +21,7 @@
 #include "generative-models/boogu/metal-boogu-transformer.h"
 #include "generative-models/z-image/metal-z-image-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
+#include "stages/latent-preview.h"
 #endif
 
 #include <array>
@@ -87,6 +88,16 @@ namespace genai { class ImageModelFamily; class ImageGenerator; }
 //
 //   oport0  TensorBeatPayload, an f32 latent [z_dim, H/8, W/8] (channel-first,
 //           unpacked, still whitened -- the vae-decode stage un-whitens).
+//   oport2  OPTIONAL live PREVIEW: planar U8 RGB [3, H, W], one beat per
+//           rendered step -- the model's clean estimate at that step,
+//           decoded by the tiny autoencoder the family's config source
+//           names (`preview_vae` and its three knobs). Feed a `preview`
+//           stage. PUSH-STYLE (DropOldest, one consumer), written from a
+//           thread of this stage's, so a preview nobody reads is dropped
+//           and never slows the generation. Unwired, or with no preview
+//           VAE, nothing is loaded or decoded. Rendered by krea2, flux2,
+//           z-image and qwen-image-21 (RGBA, [4, H, W]), and by a
+//           registered family that hands back `preview_x0`.
 //
 // Config (FlexData object):
 //   hf_dir     (string, OPTIONAL) -- the model dir; the transformer/ subfolder's
@@ -294,6 +305,13 @@ private:
   // Loaded lazily by ensure_loaded_ (one DiT per the detected family); left
   // null on failure (stage stays inert). The text encoder + tokenizer + vision
   // tower live in the paired diffusion-conditioner stage, not here.
+  // The live-preview renderer (oport2), built on the first model_config
+  // latch and kept, so its TAE survives from image to image.
+  std::unique_ptr<LatentPreviewer> _preview;
+  // Said once: a registered family handed back a preview_x0 of the wrong
+  // shape.
+  bool _preview_shape_said = false;
+
   std::unique_ptr<genai::MetalKrea2Transformer>   _dit;
   std::unique_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
   std::unique_ptr<genai::MetalQwenImageTransformer> _qie_dit;

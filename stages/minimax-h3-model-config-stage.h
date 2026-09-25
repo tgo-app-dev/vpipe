@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 #define VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 
+#include "stages/latent-preview.h"
 #include "stages/model-config-source.h"
 
 #include <string>
@@ -51,6 +52,10 @@ namespace vpipe {
 //                              few-step Turbo distillation and a style
 //                              or identity adapter, with independent,
 //                              live strengths
+//   preview_vae (+ preview_every, preview_max_edge, preview_frames) --
+//                              a tiny autoencoder for LIVE previews on
+//                              generate-video's `preview` oport; see
+//                              stages/latent-preview.h
 class MiniMaxH3ModelConfigStage final
   : public ModelConfigSourceStage<MiniMaxH3ModelConfigStage> {
 public:
@@ -87,6 +92,7 @@ private:
   // key's doc -- it decides whether a FUSED qkv adapter's rows are
   // permuted into a per-head DiT's order.
   std::string _lora_qkv;
+  LatentPreviewSpec _preview;
 };
 
 }  // namespace vpipe

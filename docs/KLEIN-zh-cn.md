@@ -390,6 +390,32 @@ model-select ──> diffusion-conditioner, vae-encode-1, vae-encode-2, generate
 `load-image` 和 `save-image` 中的路径都相对于沙盒——在 Web UI 下，编辑结果保存在
 工作目录的 `sandbox/klein-edit.jpeg`（或 `sandbox/klein-kv-edit.jpeg`）。
 
+<a id="watching-it-form--live-previews"></a>
+## 看着它成形——实时预览
+
+任何 klein 流水线都可以逐步显示画面的形成。`generate-image` 的端口 **2** 在每一步之后
+取出模型对成图的当前估计，用 madebyollin 的 **TAEF2**（为 FLUX.2 潜空间训练的小型自编码器）
+解码；接在那里的 `preview` 阶段会依次显示。两处改动即可开启：
+
+1. 在 `flux2-model-config` 上把 `preview_vae` 设为 `madebyollin/taef2`。-kv 流水线已经带有
+   这个阶段；klein-9B 的流水线需要添加一个，并接到 `generate-image` 的 `model_config` 输入
+   端口。用一个 `model_path` 为 `madebyollin/taef2` 的 `model-fetch` 阶段下载一次（10 MB）。
+2. 添加一个 `preview` 阶段，输入接 `generate-image` 的端口 2。
+
+`preview_every` 每 *N* 步渲染一次（最后一步总会渲染），`preview_max_edge`（默认 512）在
+发送前缩小画面。`preview_vae` 留空或端口 2 不接，就什么都不加载。
+
+实测（FLUX.2-klein-4B，1024 × 1024，4 步，M4 Pro）：
+
+- **没有可测量的开销：**每一步都预览为 21.2 秒，不预览为 21.0 秒。
+- 每个预览在对应步骤之后 1.2–1.8 秒到达，是排在 DiT 后面等待；最后一个在 GPU 空闲时只用了
+  0.3 秒。
+- 最后一步的预览与真正 VAE 的解码结果一致度为 **28.2 dB**。TAEF2 比完整的 FLUX.2 VAE 粗糙，
+  预览就当预览看；端口 0 上的成图仍由真正的 VAE 解码。
+
+TAEF2 读取的是反打块（unpatchify）后的 DiT 潜变量，但*不*做反归一化：真正 VAE 会先做的
+批归一化逆变换，恰恰是这个 TAE 蒸馏时没有的。
+
 <a id="saved-composer-view"></a>
 ## 已保存的自定义（Composer）视图
 

@@ -169,6 +169,13 @@ struct ImageGenRequest {
   // graph that wired neither produces, and a family must work then.
   vpipe::genai::NamedInputFn input;
   const FlexData*            extras = nullptr;
+
+  // Named OUTPUTS, mid-generation -- the input seam's mirror, and where
+  // the next thing a family hands back goes. See gen-input.h; the first
+  // name is kOutputPreviewX0 (a live preview's clean estimate, shaped
+  // like ImageGenResult::latent). Always installed by the host.
+  vpipe::genai::OutputWantedFn output_wanted;
+  vpipe::genai::NamedOutputFn  output;
 };
 
 // What a generation produced: the latent `vae-decode` will un-whiten.

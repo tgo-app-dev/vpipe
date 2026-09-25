@@ -525,3 +525,70 @@ TEST(preview_stage, rgba_still_is_accepted_and_flattened)
                 && c.last_image[2] == 'N' && c.last_image[3] == 'G');
   }
 }
+
+namespace {
+
+// A [F, 3, H, W] U8 clip whose frames differ, so a player stuck on one
+// frame and a player that loops are distinguishable downstream.
+TensorBeat
+make_clip_(int F, int H, int W, int fps)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::U8;
+  tb.shape = {F, 3, H, W};
+  tb.resize_contiguous(static_cast<size_t>(F) * 3 * H * W);
+  uint8_t* p = tb.as_u8();
+  for (int f = 0; f < F; ++f) {
+    std::memset(p + static_cast<size_t>(f) * 3 * H * W,
+                static_cast<int>(40 + 40 * f), static_cast<size_t>(3) * H * W);
+  }
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert("fps_num", FlexData::make_uint(fps));
+  sb.as_object().insert("fps_den", FlexData::make_uint(1));
+  sb.as_object().insert("frames", FlexData::make_int(F));
+  tb.sideband = std::move(sb);
+  return tb;
+}
+
+}  // namespace
+
+// A rank-4 beat is a CLIP: held, played at its own rate from frame 0, and
+// looped -- one beat, many frames out. A denoise preview arrives this way
+// (one clip per rendered step) and would otherwise show only its last
+// frame, the way a burst of frames is sampled.
+TEST(preview_stage, a_clip_is_looped_at_its_fps)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb    = make_clip_(4, 96, 128, 10);
+  src_u->count = 1;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 1500);
+  EXPECT_TRUE(pv->clips_in() == 1);
+  EXPECT_TRUE(pv->clip_frames() == 4);
+  EXPECT_TRUE(pv->cadence_fps() == 10);
+  // Played as video however slowly it arrived: a clip is never a still.
+  EXPECT_TRUE(!pv->image_mode_active());
+  EXPECT_TRUE(c.image == 0);
+  EXPECT_TRUE(c.fragment >= 2);
+  EXPECT_TRUE(pv->output_width() == 128);
+  EXPECT_TRUE(pv->output_height() == 96);
+}
+
+// The port's tag set takes both shapes, so generate-video's preview
+// (rgb-clip) and vae-decode's frames (rgb-frames) both wire to it.
+TEST(preview_stage, the_frames_port_accepts_a_clip)
+{
+  Session sess;
+  PreviewStage pv(&sess, "pv", {}, FlexData::make_object());
+  const auto& in = pv.spec().iports[0];
+  EXPECT_TRUE(port_tags_compatible("rgb-clip", in.tags));
+  EXPECT_TRUE(port_tags_compatible("rgb-frames", in.tags));
+}

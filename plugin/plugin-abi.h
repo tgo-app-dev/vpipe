@@ -95,6 +95,25 @@
 // [n, rank] reads past a banded B") and the bump was still missed, which is
 // the point: knowing a change is dangerous and remembering that danger is
 // spelled as a number here are two different things.
+//
+// SIX ALSO CARRIES THE NAMED-OUTPUT SEAM, and that is the more important
+// half for anyone porting a family. VideoGenRequest and ImageGenRequest
+// each APPENDED two members, `output_wanted` and `output`
+// (generative-models/gen-input.h: OutputWantedFn / NamedOutputFn) -- the
+// mirror of the `input` lookup, through which a family hands a tensor
+// back MID-GENERATION by name. Its first name is `preview_x0`, the clean
+// estimate a live TAE preview decodes (stages/latent-preview.h). Like
+// `input`, the seam exists so the NEXT such output costs no bump: a new
+// name is an addition an old binary never asks for. The host always
+// installs both, so a family calls them unguarded.
+//
+// Folded into six, not given a seven, on the terms THREE and FOUR set
+// out above, and CHECKED rather than assumed: on 2026-09-24 the public
+// remote's main (aad3a10e) and every public tag still read 5, and the
+// last public snapshot was built from cc4dfc56, which predates 7b91f1e
+// where six was introduced. So no binary reports 6 and means only the
+// lora::Factors change. If a snapshot has shipped since, this sentence
+// is the one to re-check before folding anything else into six.
 #define VPIPE_PLUGIN_ABI_VERSION 6u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively

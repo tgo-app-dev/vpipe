@@ -22,6 +22,7 @@ set(LOCAL_SOURCES
   save-video-stage.cc
   rgb-to-video-stage.cc
   generate-video-stage.cc
+  latent-preview.cc
   wan2-model-config-stage.cc
   minimax-h3-model-config-stage.cc
   flashvsr-src-encoder-stage.cc
@@ -96,6 +97,7 @@ set(LOCAL_HEADERS
   generate-video-stage.h
   wan2-model-config-stage.h
   minimax-h3-model-config-stage.h
+  latent-preview.h
   flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h
   krea2-model-config-stage.h

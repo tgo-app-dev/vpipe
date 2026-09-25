@@ -6,6 +6,7 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "generative-models/image-model-registry.h"
 #include "generative-models/shared/dit-block-progress.h"
@@ -415,7 +416,23 @@ const PortSpec kOports[] = {
           "denoising progression for debugging. Only emitted when connected.",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
+  // Its OWN clock: several previews per image, at the step rate.
+  {.name = "preview",
+   .doc = "OPTIONAL live preview while the image denoises: planar U8 RGB "
+          "[3, H, W], one beat per rendered step -- the model's clean "
+          "estimate, decoded by the tiny autoencoder the family's config "
+          "source names (`preview_vae`). Feed a `preview` stage. Push-style "
+          "(DropOldest, one consumer): a preview nobody reads is dropped, "
+          "never waited for. Unwired, nothing is decoded. Far cheaper than "
+          "`step_latent` through the full VAE, and it shows the image the "
+          "model is heading for rather than the noisy state",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-frames", .clock_group = 1},
 };
+[[maybe_unused]] constexpr unsigned kPreviewPort = 2;
+// Deep enough that the preview stage's tick can pick one up, shallow
+// enough that a beat nobody reads is not hoarded.
+constexpr unsigned kPreviewDepth = 2;
 const StageSpec kSpec = {
   .type_name = "generate-image",
   .doc       = "Diffusion DiT denoiser: conditioning (from a diffusion-"
@@ -684,6 +701,7 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
         "{}x{})", this->id(), _height, _width));
   }
   allocate_oports(spec().oports.size());
+  set_oport_policy(kPreviewPort, {kPreviewDepth, OverrunPolicy::DropOldest});
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _scheduler_spec.steps = _steps;   // config default; port beats override
 #endif
@@ -1128,6 +1146,14 @@ GenerateImageStage::reset_run_state()
   _zi_guidance  = 0.0;
   _zi_cfg_norm  = 0.0;
   _zi_cfg_trunc = 1.0;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // The preview keys too: a relaunch whose graph no longer names a
+  // preview VAE must not inherit one.
+  if (_preview) {
+    _preview->configure(LatentPreviewSpec{},
+                        genai::MetalTaeDecoder::Trim::kLeading);
+  }
+#endif
 }
 
 void
@@ -1296,6 +1322,15 @@ GenerateImageStage::declare_resources() const
           genai::ImageModelRegistry::get().claim_for(
               session(), root, resolve_model(session(), _hf_dir).model_type)) {
     std::vector<ResourceClaim> pout = fam->declare_resources(root);
+    // A registered family renders previews through the output seam, so
+    // its preview is booked exactly as a built-in's is.
+    for (auto& c : latent_preview_claims(
+             session(), this->id(),
+             LatentPreviewSpec::from_model_config(_model_cfg),
+             genai::MetalTaeDecoder::Trim::kLeading,
+             _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
+      pout.push_back(std::move(c));
+    }
     for (auto& c : model_memory::weight_claims({enc})) {
       pout.push_back(std::move(c));
     }
@@ -1426,6 +1461,19 @@ GenerateImageStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
+  // The live preview's TAE and its decode, for the families that render
+  // one -- exact, from the TAE's headers; see latent_preview_claims.
+  const std::string pfam = model_config::family_of(_model_cfg);
+  if (pfam == "krea2" || pfam == "flux2" || pfam == "z-image" ||
+      pfam == "qwen-image-21") {
+    for (auto& c : latent_preview_claims(
+             session(), this->id(),
+             LatentPreviewSpec::from_model_config(_model_cfg),
+             genai::MetalTaeDecoder::Trim::kLeading,
+             _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
+      out.push_back(std::move(c));
+    }
+  }
   return out;
 }
 
@@ -1447,6 +1495,18 @@ GenerateImageStage::apply_model_config_()
         this->id(), want, _family));
     return false;
   }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // The preview keys are the same on every family's config source and
+  // the port is this stage's, so they are read here, beside the family's
+  // own keys. Every image TAE trims the leading raw frames: a still is
+  // one latent frame, and the temporal TAEs keep its last sub-frame.
+  if (!_preview) {
+    _preview = std::make_unique<LatentPreviewer>(session(),
+                                                 std::string(this->id()));
+  }
+  _preview->configure(LatentPreviewSpec::from_model_config(_model_cfg),
+                      genai::MetalTaeDecoder::Trim::kLeading);
+#endif
   std::string perr;
   // The adapter keys, read the same way by every family that has one.
   // The PATH is a LOAD-TIME argument -- it decides whether a
@@ -2776,6 +2836,37 @@ cond_to_shared_(metal_compute::MetalCompute* mc, const TensorBeatPayload& tb)
 
 }  // namespace
 
+namespace {
+
+// A live preview's CLEAN ESTIMATE, x0 = x - sigma v, from the LAST model
+// evaluation of a step the previewer renders (for a multi-evaluation
+// sampler, the one at the lowest noise). Every flow family here returns
+// its velocity in FlowSampler's convention, so one tap serves them all.
+// Nothing is built on a step that is not armed.
+struct X0Tap {
+  bool want = false;
+  std::vector<float> x0;
+  void
+  arm(bool due)
+  {
+    want = due;
+    x0.clear();
+  }
+  void
+  take(const std::vector<float>& x, double sigma,
+       const std::vector<float>& v)
+  {
+    if (!want || v.size() != x.size()) { return; }
+    x0.resize(x.size());
+    for (std::size_t k = 0; k < x.size(); ++k) {
+      x0[k] = x[k] - (float)sigma * v[k];
+    }
+  }
+  bool ready() const noexcept { return want && !x0.empty(); }
+};
+
+}  // namespace
+
 std::vector<float>
 GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_real,
                             const metal_compute::SharedBuffer& cond_neg,
@@ -2997,6 +3088,9 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
   // revise_scratch() refuses to create, so this is a no-op when the plan
   // booked nothing.
   bool ane_checked = false;
+  // A live preview's clean estimate, packed like the state; unpacked
+  // once the step is done.
+  X0Tap tap;
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
@@ -3042,6 +3136,7 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
         v[k] = vneg + gscale * (v[k] - vneg);
       }
     }
+    tap.take(cand, sigma, v);
     return v;
   };
   sampler.reset();   // clear multistep history / reseed the SDE RNG for this run
@@ -3082,10 +3177,16 @@ GenerateImageStage::generate_(const metal_compute::SharedBuffer& cond, int n_rea
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): denoise step {}/{} sigma {}", this->id(),
         i + 1, S, (float)sig[(std::size_t)i]));
+    tap.arm(_preview && _preview->due(i - start + 1, nsteps));
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
     if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
+    if (tap.ready()) {
+      // One latent frame: [16, lh, lw] is [16, 1, lh, lw].
+      _preview->submit(unpack(tap.x0), 16, 1, lh, lw, i - start + 1,
+                       nsteps);
+    }
     prog.end_step(i - start);
   }
   const double gen_s = std::chrono::duration<double>(
@@ -3285,6 +3386,7 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
       prog_guard(_flux2_dit.get(), prog);
   // Set once the first forward has shown whether the ANE tiers armed.
   bool flux2_ane_checked = false;
+  X0Tap tap;   // a live preview's clean estimate (packed)
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<_Float16*>(latbuf.contents());
@@ -3312,6 +3414,7 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
     const auto* vp = static_cast<const _Float16*>(vel.contents());
     std::vector<float> v(cand.size());
     for (std::size_t k = 0; k < v.size(); ++k) { v[k] = (float)vp[k]; }
+    tap.take(cand, sigma, v);
     return v;
   };
   sampler.reset();
@@ -3344,10 +3447,31 @@ GenerateImageStage::generate_flux2_(const metal_compute::SharedBuffer& context,
   };
   const auto gen_t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < S; ++i) {
+    tap.arm(_preview && _preview->due(i + 1, S));
     sampler.step(i, packed,
                  prof ? genai::FlowSampler::DenoiseFn(denoise_p) : denoise);
     if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
+    if (tap.ready()) {
+      // taef2 reads the DiT's latent UNPATCHIFIED -- [IC/4, 2gh, 2gw],
+      // channel c*4 + ph*2 + pw landing at (2i+ph, 2j+pw), the FLUX.2
+      // VAE's own order -- and NOT un-normalized: the batch-norm inverse
+      // the real VAE applies first is exactly what the TAE was distilled
+      // without (its diffusers wrapper swaps in an identity BN).
+      const std::vector<float> z = unpack(tap.x0);
+      const int L = IC / 4, h8 = 2 * gh, w8 = 2 * gw;
+      std::vector<float> lat((std::size_t)L * h8 * w8);
+      for (int cc = 0; cc < IC; ++cc) {
+        const int c = cc / 4, ph = (cc % 4) / 2, pw = cc % 2;
+        for (int y = 0; y < gh; ++y) {
+          for (int x = 0; x < gw; ++x) {
+            lat[((std::size_t)c * h8 + 2 * y + ph) * w8 + 2 * x + pw] =
+                z[((std::size_t)cc * gh + y) * gw + x];
+          }
+        }
+      }
+      _preview->submit(std::move(lat), L, 1, h8, w8, i + 1, S);
+    }
     prog.end_step(i);
   }
   const double gen_s = std::chrono::duration<double>(
@@ -3603,6 +3727,7 @@ GenerateImageStage::generate_qwen_image21_(
     return out;
   };
 
+  X0Tap tap;   // a live preview's clean estimate (packed)
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     // The target block's rows are the TAIL of the packed latent.
@@ -3632,6 +3757,7 @@ GenerateImageStage::generate_qwen_image21_(
     // reference hands the DiT output straight to
     // FlowMatchEulerDiscreteScheduler.step, which is the ordinary
     // noise-ward convention this sampler already implements.
+    tap.take(cand, sigma, out);
     return out;
   };
 
@@ -3650,9 +3776,16 @@ GenerateImageStage::generate_qwen_image21_(
   const auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < S; ++i) {
     step_i = i;
+    tap.arm(_preview && _preview->due(i + 1, S));
     sampler.step(i, packed, denoise);
     if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
+    if (tap.ready()) {
+      // taeqi2_1 reads the DiT's latent as it stands -- [64, H/16, W/16],
+      // unpatched and still whitened -- and makes RGBA of it, as the real
+      // VAE does.
+      _preview->submit(unpack(tap.x0), IC, 1, lh, lw, i + 1, S);
+    }
     prog.end_step(i);
   }
   const double secs = std::chrono::duration<double>(
@@ -3825,6 +3958,7 @@ GenerateImageStage::generate_z_image_(
     return out;
   };
 
+  X0Tap tap;   // a live preview's clean estimate (packed)
   auto denoise = [&](const std::vector<float>& cand,
                      double sigma) -> std::vector<float> {
     auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
@@ -3873,6 +4007,7 @@ GenerateImageStage::generate_z_image_(
     // scheduler step; this sampler's Euler update is the ordinary
     // noise-ward one, so the negation belongs here.
     for (auto& o : out) { o = -o; }
+    tap.take(cand, sigma, out);
     return out;
   };
 
@@ -3884,9 +4019,15 @@ GenerateImageStage::generate_z_image_(
 
   const auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < S; ++i) {
+    tap.arm(_preview && _preview->due(i + 1, S));
     sampler.step(i, packed, denoise);
     if (!dit_ok) { return {}; }
     if (emit_step) { emit_step(unpack(packed)); }
+    if (tap.ready()) {
+      // taef1 reads the DiT's own latent space: the FLUX.1 AE's scale and
+      // shift are what the real decode undoes, and the TAE never saw them.
+      _preview->submit(unpack(tap.x0), Z, 1, lh, lw, i + 1, S);
+    }
     prog.end_step(i);
   }
   const double secs = std::chrono::duration<double>(
@@ -4962,6 +5103,39 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // an empty std::function throws -- which on this path is a family
     // taking the host down for asking a question the answer to is "no".
     req.input = [](std::string_view, genai::NamedTensor*) { return false; };
+    // The output seam, installed for the same reason. The one name this
+    // stage takes is a live preview's clean estimate, on a step the
+    // previewer renders; the family hands it back shaped like its result
+    // latent, [z, h, w], and it is decoded as one latent frame.
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
+    const bool previewing = preview_scope.active();
+    req.output_wanted = [this, previewing](std::string_view name, int step,
+                                           int total) {
+      return previewing && name == genai::kOutputPreviewX0 &&
+             _preview->due(step, total);
+    };
+    req.output = [this, previewing](std::string_view name, int step,
+                                    int total, const genai::NamedTensor& t) {
+      if (!previewing || name != genai::kOutputPreviewX0) { return; }
+      const bool r3 = t.shape.size() == 3;
+      const bool r4 = t.shape.size() == 4 && t.shape[1] == 1;
+      if (t.data == nullptr || t.elem_size != 4 || t.elems() == 0 ||
+          (!r3 && !r4)) {
+        if (!_preview_shape_said) {
+          _preview_shape_said = true;
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): family '{}' handed back a '{}' "
+              "that is not an f32 [z, h, w] latent; no previews from it",
+              this->id(), _family, genai::kOutputPreviewX0));
+        }
+        return;
+      }
+      const float* p = static_cast<const float*>(t.data);
+      const int h = t.shape[r3 ? 1 : 2], w = t.shape[r3 ? 2 : 3];
+      _preview->submit(std::vector<float>(p, p + t.elems()), t.shape[0], 1,
+                       h, w, step, total);
+    };
     genai::ImageGenResult res;
     bool ok = false;
     try {
@@ -5070,6 +5244,10 @@ GenerateImageStage::process(RuntimeContext& ctx)
     const int Cdit = _flux2_dit->config().in_channels;
     const int fgh = gen_h / 16, fgw = gen_w / 16;
     _flux2_dit->set_stream_stop(stopping);
+    // Previews for this image, ended when this block returns -- after the
+    // latent is written.
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
     const std::vector<float> fl =
         generate_flux2_(cond, n_real, gen_h, gen_w, frefs, init_ptr,
                         step_emitter({Cdit, fgh, fgw}));
@@ -5286,6 +5464,8 @@ GenerateImageStage::process(RuntimeContext& ctx)
     if (!_ref[0].empty()) { qrefs.push_back(_ref[0]); }
     if (!_ref[1].empty()) { qrefs.push_back(_ref[1]); }
     _qi21_dit->set_stream_stop(stopping);
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
     const std::vector<float> ql =
         generate_qwen_image21_(cond, n_real, cond_neg, n_real_neg, gen_h,
                                gen_w, qrefs, step_emitter({QZ, qlh, qlw}));
@@ -5325,6 +5505,8 @@ GenerateImageStage::process(RuntimeContext& ctx)
   if (_family == "z-image") {
     const int ZZ = _zi_dit->config().in_channels;
     _zi_dit->set_stream_stop(stopping);
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
     const std::vector<float> zl =
         generate_z_image_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
                           step_emitter({ZZ, lh, lw}));
@@ -5400,6 +5582,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
     }
   }
   _dit->set_stream_stop(stopping);
+  // Previews for THIS image, on oport2, ended when process() returns --
+  // after the latent is written, so the last step's preview renders while
+  // vae-decode is already working. Declines, loading nothing, when the
+  // port is unwired or no preview VAE is named.
+  LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                       0.0, 0);
   const std::vector<float> out_latent =
       generate_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w, init_ptr,
                 latent_ptr, krefs, step_emitter({16, lh, lw}));

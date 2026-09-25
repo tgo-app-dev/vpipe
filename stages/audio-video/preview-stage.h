@@ -53,8 +53,17 @@ struct TensorBeat;
 // above 1 fps the stage returns to video mode. Auto + adaptive; gated by
 // the `image_mode` config (default on).
 //
-// iport 0: video RGB TensorBeat ([3,H,W], F32 or U8). The first frame sets
-//          the output resolution; later size changes are dropped.
+// CLIP MODE. A rank-4 beat [F,C,H,W] on iport 0 is a whole clip rather
+// than a frame -- a denoise preview from generate-video, or vae-decode's
+// clip port. It is held and LOOPED, one frame per cadence tick, until the
+// next beat replaces it; the cadence adopts the clip's fps. A clip is the
+// unit a slow producer delivers (one per preview render), so a player
+// that sampled it the way it samples frames would show only its last
+// frame. A frame beat arriving later ends the loop.
+//
+// iport 0: video RGB TensorBeat ([3,H,W], F32 or U8), or a clip
+//          ([F,3,H,W] / [F,4,H,W]). The first frame or clip sets the
+//          output resolution; later size changes are dropped.
 // iport 1: (optional) audio PCM TensorBeat -- F32 rank-1 [n] (mono) or
 //          rank-2 [channels, n]. sideband.sample_rate honoured.
 // oports : none (sink).
@@ -103,6 +112,9 @@ public:
   int  output_width()  const noexcept { return _out_w; }
   int  output_height() const noexcept { return _out_h; }
   bool image_mode_active() const noexcept { return _mode == Mode::Image; }
+  int  clip_frames() const noexcept { return _clip_frames; }
+  int  clip_position() const noexcept { return _clip_pos; }
+  std::uint64_t clips_in() const noexcept { return _clips_in; }
 
 private:
   void resolve_roles_(RuntimeContext& ctx);
@@ -124,7 +136,15 @@ private:
   void adopt_fps_(const TensorBeat& tb);
   bool ensure_sws_(int W, int H);
   void convert_to_frame_(const TensorBeat& tb);   // RGB [3,H,W] -> _frame
+  // Planar U8 RGB [3, _out_h, _out_w] -> _frame. The one conversion both
+  // a frame beat and a clip's playhead go through.
+  void convert_u8_planar_(const std::uint8_t* src);
   void fill_black_();
+
+  // Clip mode: hold a [F,C,H,W] beat as contiguous planar U8 RGB and
+  // loop it. advance_clip_() converts the playhead frame and steps it.
+  void handle_clip_(const TensorBeat& tb);
+  void advance_clip_();
 
   // Still-image mode: keep the latest frame as packed RGB24, PNG-encode it
   // on demand, and push it as a type-5 message. Only image-type sources
@@ -208,6 +228,13 @@ private:
   AVPacket*       _png_pkt = nullptr;
   bool            _png_bad = false;     // encoder unavailable => stay video
   bool            _have_rgb = false;
+
+  // Clip mode. `_clip` is [F, 3, _out_h, _out_w] planar U8, already
+  // composited when the clip carried alpha; empty when no clip is held.
+  std::vector<std::uint8_t> _clip;
+  int           _clip_frames = 0;
+  int           _clip_pos    = 0;
+  std::uint64_t _clips_in    = 0;
 
   // Audio passthrough.
   bool _audio_seen = false;

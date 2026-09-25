@@ -421,6 +421,39 @@ Paths in `load-image` and `save-image` are relative to the sandbox — under the
 web UI, the edit lands at `sandbox/klein-edit.jpeg` (or
 `sandbox/klein-kv-edit.jpeg`) in the work directory.
 
+## Watching it form — live previews
+
+Any klein graph can show the picture forming, step by step. `generate-image`'s
+port **2** takes the model's current guess at the finished image after each
+step and decodes it with madebyollin's **TAEF2**, a tiny autoencoder
+trained for FLUX.2's latent space. A `preview` stage wired there shows each
+guess as it arrives. Two edits turn it on:
+
+1. On `flux2-model-config`, set `preview_vae` to `madebyollin/taef2`. The -kv
+   graphs already have this stage; in a klein-9B graph, add one and wire it
+   to `generate-image`'s `model_config` iport. Fetch the TAE once, with a
+   `model-fetch` stage whose `model_path` is `madebyollin/taef2` (10 MB).
+2. Add a `preview` stage whose input is `generate-image`, port 2.
+
+`preview_every` renders every *N*th step (the last always renders), and
+`preview_max_edge` (512 by default) scales the picture down before it is
+sent. Leave `preview_vae` empty, or port 2 unwired, and nothing is loaded.
+
+Measured on FLUX.2-klein-4B at 1024 × 1024, 4 steps, on an M4 Pro:
+
+- **No measurable cost:** 21.2 s with a preview on every step, 21.0 s
+  without.
+- A preview arrived 1.2–1.8 s after its step, queued behind the DiT; the
+  last one, with the GPU free, took 0.3 s.
+- The last step's preview matched the real VAE decode at **28.2 dB**.
+  TAEF2 is a coarser decoder than the full FLUX.2 VAE, so treat the
+  preview as a preview. The file on port 0 is still decoded by the real
+  VAE.
+
+TAEF2 is fed the DiT's latent unpatchified, but *not* un-normalized. The
+real VAE's batch-norm inverse is exactly what the TAE was distilled
+without.
+
 ## The saved Composer view
 
 `klein-ref-edit.vpipeline` and `klein-kv-ref-edit.vpipeline` carry more than a

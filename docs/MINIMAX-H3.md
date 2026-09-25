@@ -27,6 +27,7 @@ arrives in **8–16 steps** instead of 30+.
 - [Step 2 — text to video and audio](#step-2--text-to-video-and-audio)
   - [The settings worth knowing](#the-settings-worth-knowing)
   - [How long it takes](#how-long-it-takes)
+  - [Watching it form — live previews](#watching-it-form--live-previews)
   - [More than text in](#more-than-text-in)
   - [Conditioning on references (Ref2VA)](#conditioning-on-references-ref2va)
     - [Two ways to hand it a reference](#two-ways-to-hand-it-a-reference)
@@ -146,6 +147,9 @@ you want to see the model work before spending the hours and the 115 GB.
   you want it; the two share a download.
 - **[`minimax-h3-text-to-video.vpipeline`](pipelines/minimax-h3-text-to-video.vpipeline)**
   — prompt in, `.mp4` with sound out.
+- **[`minimax-h3-text-to-video-preview.vpipeline`](pipelines/minimax-h3-text-to-video-preview.vpipeline)**
+  — the same, with a **live preview** of the clip forming, step by step (see
+  [Watching it form](#watching-it-form--live-previews)).
 - **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
   — the same, anchored to an image at both ends (see
   [More than text in](#more-than-text-in)).
@@ -423,6 +427,67 @@ column as a figure you can reproduce.
 > **1620 MHz — the maximum — at 100% for the whole run.** That is **1.25×**
 > the Air's sustained clock before any difference in core count, so clock
 > alone accounts for part of the 2.3–2.8× gap and not for most of it.
+
+### Watching it form — live previews
+
+A denoise of this model runs for minutes, and without a preview there is
+nothing to look at until the very end. `generate-video` can show the clip
+as it forms: after a step, it takes the model's current best guess at the
+finished clip and decodes it with a **tiny autoencoder** (a TAE) instead
+of the real video VAE. The result goes out on `generate-video`'s port 2,
+and a `preview` stage wired there plays it in the web UI, looping each
+clip until the next step replaces it.
+
+**[`minimax-h3-text-to-video-preview.vpipeline`](pipelines/minimax-h3-text-to-video-preview.vpipeline)**
+is the text-to-video graph with this added. It needs one small file, and
+[`prepare-minimax-h3-preview.vpipeline`](pipelines/prepare-minimax-h3-preview.vpipeline)
+fetches it (23 MB) and registers it as `madebyollin/taeh3`:
+
+```sh
+cd ~/vpipe-work                                    # the SAME work directory
+vpipe --launch ~/src/vpipe/docs/pipelines/prepare-minimax-h3-preview.vpipeline
+```
+
+That is madebyollin's **`taeh3`**, trained for this model's latent space.
+It is published on GitHub rather than Hugging Face; the catalogue knows
+where. It decodes the same frame count the real VAE does and keeps the
+motion. **Kijai's `MiniMax-H3-TAE`** also works (`Kijai/MiniMax-H3-TAE`,
+10 MB, also in the catalogue). It is a still-image decoder, though, so it
+makes one frame per latent frame and plays them slower to fill the same
+time. On the same clip it also scored lower against the real VAE: 23.3 dB,
+against `taeh3`'s 25.3 dB.
+
+The knobs are on `minimax-h3-model-config`, next to H3's other settings:
+
+| key | default | notes |
+|---|---|---|
+| `preview_vae` | *(empty)* | The TAE: a registered model (`madebyollin/taeh3`), a directory holding one `.safetensors`, or a path to one. Empty turns previews off. |
+| `preview_every` | 1 | Render after every *N*th step; the last step always renders. |
+| `preview_max_edge` | 512 | Longest edge of the preview picture. The TAE always decodes at full size; the picture is then scaled down. Shrinking the latent first instead measured blurry, with colour shifts. |
+| `preview_frames` | 0 | Preview only the first *N* frames; 0 is the whole clip. This is the knob that makes a preview cheaper. |
+
+What it costs, measured on an M4 Pro:
+
+- A 39-frame 512 × 288 preview took about **0.5 s** while the DiT ran
+  (the model resident, 8 s per step).
+- A full 90-frame 960 × 576 clip takes **2.1 s** to decode on an idle GPU.
+- The decode runs off the generation thread. If a render is still running
+  when the next one is due, the waiting clip is replaced rather than
+  queued, so previews never make the generation wait.
+- The decode does share the GPU. A preview on **every** step added about
+  **3%** to the denoise: 85 s without previews against 87 and 88 s with
+  them, over 7 steps with the runs alternated. Raise `preview_every` to
+  spend less.
+- The last step's preview matched the real VAE decode at **30–32 dB**.
+
+Leave port 2 unwired, or `preview_vae` empty, and nothing is loaded or
+decoded. Two things to know:
+
+- **One consumer only.** The port drops a clip nobody reads rather than
+  holding the generation up, and that policy takes a single consumer.
+- **The `preview` stage runs until you stop the pipeline.** It is a live
+  view, so a graph that includes one does not finish by itself from the
+  command line. Use it in the web UI.
 
 ### More than text in
 

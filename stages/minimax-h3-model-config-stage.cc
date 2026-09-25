@@ -1,4 +1,5 @@
 #include "stages/minimax-h3-model-config-stage.h"
+#include "stages/latent-preview.h"
 #include "stages/model-registry.h"
 
 #include "common/beat-payload-intf.h"
@@ -129,6 +130,22 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: the "
           "distillation stays where it was trained while this one is "
           "swept. 0 skips its two GEMMs", .def_real = 1.0},
+  // The live-preview keys every family's config source shares; see
+  // stages/latent-preview.h. For H3 the TAE is madebyollin's `taeh3`
+  // (temporal, 4x in time) or Kijai's 2D one (a frame per latent frame).
+  {.key = latent_preview::kVaeKey, .type = ConfigType::String,
+   .required = false, .doc = latent_preview::kVaeDoc,
+   .suggest_db = kModelRegistryDb,
+   // Typed like the LoRA fields, and for their reason: a TAE is catalogued
+   // as a supplement, so an untyped picker offers nothing -- and the type
+   // keeps a TAE for another model's latent space out of this field.
+   .suggest_db_type = "minimax-h3-tae"},
+  {.key = latent_preview::kEveryKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kEveryDoc, .def_int = 1},
+  {.key = latent_preview::kMaxEdgeKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kMaxEdgeDoc, .def_int = 512},
+  {.key = latent_preview::kFramesKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kFramesDoc, .def_int = 0},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -142,8 +159,8 @@ const PortSpec kOports[] = {
    .doc = "MiniMax-H3 generation parameters as one FlexData object "
           "{model_family: minimax-h3, video_shift, audio_shift, "
           "condition_timestep, condition_audio_timestep, audio_seconds, "
-          "+lora, +lora2 and their scales}, for a generate-video "
-          "model_config iport",
+          "+lora, +lora2 and their scales, +preview_vae and its three "
+          "knobs}, for a generate-video model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -186,6 +203,17 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _lora2         = attr_str("lora2");
   _lora2_scale   = attr_real("lora2_scale");
   _lora2_qkv     = attr_str("lora2_qkv_layout");
+  _preview.vae        = attr_str(latent_preview::kVaeKey);
+  _preview.every      = (int)attr_int(latent_preview::kEveryKey);
+  _preview.max_edge   = (int)attr_int(latent_preview::kMaxEdgeKey);
+  _preview.max_frames = (int)attr_int(latent_preview::kFramesKey);
+  if (_preview.every < 0 || _preview.max_edge < 0 ||
+      _preview.max_frames < 0) {
+    fail_config(fmt(
+        "MiniMaxH3ModelConfigStage('{}'): preview_every, preview_max_edge "
+        "and preview_frames must be >= 0 (got {} / {} / {})", this->id(),
+        _preview.every, _preview.max_edge, _preview.max_frames));
+  }
   // Deferred validation: the ctor never throws, so a nonsense number is
   // reported and the runtime skips the stage at launch. A non-positive
   // shift collapses the schedule to a single sigma, which generates
@@ -260,6 +288,8 @@ MiniMaxH3ModelConfigStage::resolved_config() const
                          FlexData::make_string(_lora2_qkv));
     }
   }
+  // Emitted only when a preview VAE is named, like the LoRA keys.
+  _preview.emit(fd);
   return fd;
 }
 
@@ -269,7 +299,7 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
   (void)fd;
   session()->info(fmt(
       "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}, condition "
-      "t {:.3f}/{:.3f}, audio {}{}{}", this->id(), _video_shift,
+      "t {:.3f}/{:.3f}, audio {}{}{}{}", this->id(), _video_shift,
       _audio_shift,
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()
@@ -277,7 +307,10 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
       _lora.empty() ? std::string()
                     : fmt(", runtime LoRA at {:.2f}", _lora_scale)(),
       _lora2.empty() ? std::string()
-                     : fmt(", second at {:.2f}", _lora2_scale)()));
+                     : fmt(", second at {:.2f}", _lora2_scale)(),
+      _preview.enabled()
+          ? fmt(", previews every {} step(s)", _preview.every)()
+          : std::string()));
 }
 
 VPIPE_REGISTER_STAGE(MiniMaxH3ModelConfigStage)

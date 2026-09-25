@@ -2278,6 +2278,19 @@ const STRINGS = {
       '可選的逐步潛變數（每個取樣步一個節拍，格式與 `latent` 相同）——在這裡'
       + '接一個 vae-decode 即可把去噪過程視覺化，便於偵錯。只有接上時才發出'
       + '。'],
+  'port.generate-image.preview': ['',
+      '可选：图像去噪进行中的实时预览——平面 U8 RGB [3, H, W]，每渲染一步'
+      + '发出一拍：模型对成图的干净估计，由模型族配置源指定的小型自编码器'
+      + '（`preview_vae`）解码。接到 `preview` 阶段。推送式（DropOldest，只'
+      + '接一个消费者）：没人读取的预览会被丢弃，绝不等待。未接时不做任何'
+      + '解码。比把 `step_latent` 接到完整 VAE 便宜得多，而且显示的是模型正'
+      + '在趋向的图像，而不是带噪的中间状态',
+      '可選：影像去噪進行中的即時預覽——平面 U8 RGB [3, H, W]，每渲染一步'
+      + '發出一拍：模型對成圖的乾淨估計，由模型族設定來源指定的小型自編碼器'
+      + '（`preview_vae`）解碼。接到 `preview` 階段。推送式（DropOldest，只'
+      + '接一個消費者）：沒人讀取的預覽會被丟棄，絕不等待。未接時不做任何'
+      + '解碼。比把 `step_latent` 接到完整 VAE 便宜得多，而且顯示的是模型正'
+      + '在趨向的影像，而不是帶噪的中間狀態'],
 
   // ---- Generate Video (generative) ----
   'stage.generate-video.name': ['', '生成视频', '生成影片'],
@@ -2624,6 +2637,17 @@ const STRINGS = {
       + '——不生成配乐的模型族永远不会写它',
       'f32 潛在音訊 [audio_channels, audio_latents]，來自會產生配樂的模型族'
       + '——不產生配樂的模型族永遠不會寫它'],
+  'port.generate-video.preview': ['',
+      '可选：去噪进行中片段的实时预览——平面 U8 RGB [F, 3, H, W]，每渲染'
+      + '一步发出一拍，由模型族配置源指定的小型自编码器（`preview_vae`）解'
+      + '码。接到 `preview` 阶段，它会循环播放每一段，直到下一段到来。推送式'
+      + '（DropOldest，只接一个消费者）：没人读取的预览会被丢弃，绝不等待。'
+      + '未接时不做任何解码',
+      '可選：去噪進行中片段的即時預覽——平面 U8 RGB [F, 3, H, W]，每渲染'
+      + '一步發出一拍，由模型族設定來源指定的小型自編碼器（`preview_vae`）解'
+      + '碼。接到 `preview` 階段，它會循環播放每一段，直到下一段到來。推送式'
+      + '（DropOldest，只接一個消費者）：沒人讀取的預覽會被丟棄，絕不等待。'
+      + '未接時不做任何解碼'],
 
   // ---- Model Select (generative) ----
   'stage.model-select.name': ['', '模型选择', '模型選擇'],
@@ -3514,6 +3538,35 @@ const STRINGS = {
   'cfg.qwen-image-21-model-config.vl_max_pixels': ['',
       '接地编码：图像处理器的上界。未设置 => 本模型族自己的 16777216',
       '接地編碼：影像處理器的上界。未設定 => 本模型族自己的 16777216'],
+  'cfg.qwen-image-21-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
+      + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
+      + ' 阶段可直接播放。可以是已注册的模型、只含一个 .safetensors 的目录，'
+      + '或指向它的路径。它必须是为「这个」模型的潜空间训练的。留空（默认）'
+      + '即关闭预览，端口不接也一样——那时什么都不加载、不解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。每走完一個去噪步，模型對'
+      + '成片的乾淨估計會由它解碼，寫到去噪階段的 `preview` 輸出埠，`preview`'
+      + ' 階段可直接播放。可以是已註冊的模型、只含一個 .safetensors 的目錄，'
+      + '或指向它的路徑。它必須是為「這個」模型的潛空間訓練的。留空（預設）'
+      + '即關閉預覽，埠不接也一樣——那時什麼都不載入、不解碼'],
+  'cfg.qwen-image-21-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待：下一次到期时仍在排队的预览会被「替换」而不是'
+      + '保留。它确实与去噪共用 GPU，所以 N 越大，还给去噪的 GPU 时间越多。'
+      + '填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待：下一次到期時仍在排隊的預覽會被「替換」而不是'
+      + '保留。它確實與去噪共用 GPU，所以 N 越大，還給去噪的 GPU 時間越多。'
+      + '填 0 即關閉預覽'],
+  'cfg.qwen-image-21-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下（所以 512 会把 960x576 变成 480x288）。解码本身总以 TAE 自己的'
+      + '尺寸进行：改为先缩小潜变量会让画面变糊并偏色。填 0 即按解码原样发'
+      + '送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下（所以 512 會把 960x576 變成 480x288）。解碼本身總以 TAE 自己的'
+      + '尺寸進行：改為先縮小潛變數會讓畫面變糊並偏色。填 0 即按解碼原樣傳'
+      + '送'],
   'port.qwen-image-21-model-config.trigger': ['',
       '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
       + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
@@ -3523,11 +3576,13 @@ const STRINGS = {
       + '發一次'],
   'port.qwen-image-21-model-config.model_config': ['',
       'qwen-image-2.1 参数，作为一个 FlexData 对象 {model_family: '
-      + 'qwen-image-21, +use_kv_cache, +vl_*}，供 generate-image 或 '
-      + 'diffusion-conditioner 的 model_config 输入端口使用',
+      + 'qwen-image-21, +use_kv_cache, +vl_*, +preview_vae 与它的选项}，供 '
+      + 'generate-image 或 diffusion-conditioner 的 model_config 输入端口'
+      + '使用',
       'qwen-image-2.1 參數，作為一個 FlexData 物件 {model_family: '
-      + 'qwen-image-21, +use_kv_cache, +vl_*}，供 generate-image 或 '
-      + 'diffusion-conditioner 的 model_config 輸入埠使用'],
+      + 'qwen-image-21, +use_kv_cache, +vl_*, +preview_vae 與它的選項}，供 '
+      + 'generate-image 或 diffusion-conditioner 的 model_config 輸入埠使'
+      + '用'],
 
   // ---- Z-Image Model Config (model-specific-config) ----
   'stage.z-image-model-config.name': ['',
@@ -3569,6 +3624,35 @@ const STRINGS = {
       '當 (1 - sigma) 超過此值時（即排程表靠近乾淨的一端，CFG 在那裡多半只'
       + '會帶來偽影）關閉引導。未設定 => 1.0，即永不觸發。僅在 '
       + 'guidance_scale > 0 時生效'],
+  'cfg.z-image-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
+      + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
+      + ' 阶段可直接播放。可以是已注册的模型、只含一个 .safetensors 的目录，'
+      + '或指向它的路径。它必须是为「这个」模型的潜空间训练的。留空（默认）'
+      + '即关闭预览，端口不接也一样——那时什么都不加载、不解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。每走完一個去噪步，模型對'
+      + '成片的乾淨估計會由它解碼，寫到去噪階段的 `preview` 輸出埠，`preview`'
+      + ' 階段可直接播放。可以是已註冊的模型、只含一個 .safetensors 的目錄，'
+      + '或指向它的路徑。它必須是為「這個」模型的潛空間訓練的。留空（預設）'
+      + '即關閉預覽，埠不接也一樣——那時什麼都不載入、不解碼'],
+  'cfg.z-image-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待：下一次到期时仍在排队的预览会被「替换」而不是'
+      + '保留。它确实与去噪共用 GPU，所以 N 越大，还给去噪的 GPU 时间越多。'
+      + '填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待：下一次到期時仍在排隊的預覽會被「替換」而不是'
+      + '保留。它確實與去噪共用 GPU，所以 N 越大，還給去噪的 GPU 時間越多。'
+      + '填 0 即關閉預覽'],
+  'cfg.z-image-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下（所以 512 会把 960x576 变成 480x288）。解码本身总以 TAE 自己的'
+      + '尺寸进行：改为先缩小潜变量会让画面变糊并偏色。填 0 即按解码原样发'
+      + '送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下（所以 512 會把 960x576 變成 480x288）。解碼本身總以 TAE 自己的'
+      + '尺寸進行：改為先縮小潛變數會讓畫面變糊並偏色。填 0 即按解碼原樣傳'
+      + '送'],
   'port.z-image-model-config.trigger': ['',
       '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
       + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
@@ -3578,11 +3662,13 @@ const STRINGS = {
       + '發一次'],
   'port.z-image-model-config.model_config': ['',
       'z-image 参数，作为一个 FlexData 对象 {model_family: z-image, '
-      + '+guidance_scale, +cfg_normalization, +cfg_truncation}，供 '
-      + 'generate-image 的 model_config 输入端口使用',
+      + '+guidance_scale, +cfg_normalization, +cfg_truncation, '
+      + '+preview_vae 与它的选项}，供 generate-image 的 model_config 输入端'
+      + '口使用',
       'z-image 參數，作為一個 FlexData 物件 {model_family: z-image, '
-      + '+guidance_scale, +cfg_normalization, +cfg_truncation}，供 '
-      + 'generate-image 的 model_config 輸入埠使用'],
+      + '+guidance_scale, +cfg_normalization, +cfg_truncation, '
+      + '+preview_vae 與它的選項}，供 generate-image 的 model_config 輸入埠'
+      + '使用'],
 
   // ---- FlashVSR Model Config (model-specific-config) ----
   'stage.flashvsr-model-config.name': ['',
@@ -3743,6 +3829,35 @@ const STRINGS = {
       '`lora2` 的強度，按每次前向生效，且與 `lora_scale` 相互獨立——這正是第'
       + '二個槽位的意義所在：一個轉接器保持它訓練時的強度，另一個則可隨意掃'
       + '參。填 0 會跳過它的兩個 GEMM'],
+  'cfg.flux2-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
+      + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
+      + ' 阶段可直接播放。可以是已注册的模型、只含一个 .safetensors 的目录，'
+      + '或指向它的路径。它必须是为「这个」模型的潜空间训练的。留空（默认）'
+      + '即关闭预览，端口不接也一样——那时什么都不加载、不解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。每走完一個去噪步，模型對'
+      + '成片的乾淨估計會由它解碼，寫到去噪階段的 `preview` 輸出埠，`preview`'
+      + ' 階段可直接播放。可以是已註冊的模型、只含一個 .safetensors 的目錄，'
+      + '或指向它的路徑。它必須是為「這個」模型的潛空間訓練的。留空（預設）'
+      + '即關閉預覽，埠不接也一樣——那時什麼都不載入、不解碼'],
+  'cfg.flux2-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待：下一次到期时仍在排队的预览会被「替换」而不是'
+      + '保留。它确实与去噪共用 GPU，所以 N 越大，还给去噪的 GPU 时间越多。'
+      + '填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待：下一次到期時仍在排隊的預覽會被「替換」而不是'
+      + '保留。它確實與去噪共用 GPU，所以 N 越大，還給去噪的 GPU 時間越多。'
+      + '填 0 即關閉預覽'],
+  'cfg.flux2-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下（所以 512 会把 960x576 变成 480x288）。解码本身总以 TAE 自己的'
+      + '尺寸进行：改为先缩小潜变量会让画面变糊并偏色。填 0 即按解码原样发'
+      + '送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下（所以 512 會把 960x576 變成 480x288）。解碼本身總以 TAE 自己的'
+      + '尺寸進行：改為先縮小潛變數會讓畫面變糊並偏色。填 0 即按解碼原樣傳'
+      + '送'],
   'port.flux2-model-config.trigger': ['',
       '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
       + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
@@ -3752,10 +3867,11 @@ const STRINGS = {
       + '發一次'],
   'port.flux2-model-config.model_config': ['',
       'FLUX.2 参数，作为一个 FlexData 对象 {model_family: flux2, klein_kv, '
-      + '+lora, +lora_scale}，供 generate-image 的 model_config 输入端口使'
-      + '用',
+      + '+lora, +lora2 与它们的强度，+preview_vae 与它的选项}，供 '
+      + 'generate-image 的 model_config 输入端口使用',
       'FLUX.2 參數，作為一個 FlexData 物件 {model_family: flux2, klein_kv, '
-      + '+lora, +lora_scale}，供 generate-image 的 model_config 輸入埠使用'],
+      + '+lora, +lora2 與它們的強度，+preview_vae 與它的選項}，供 '
+      + 'generate-image 的 model_config 輸入埠使用'],
 
   // ---- Krea-2 Model Config (model-specific-config) ----
   'stage.krea2-model-config.name': ['',
@@ -3828,6 +3944,35 @@ const STRINGS = {
   'cfg.krea2-model-config.vl_max_pixels': ['',
       '接地编码：图像处理器的上界。未设置 => 视觉塔的默认值',
       '接地編碼：影像處理器的上界。未設定 => 視覺塔的預設值'],
+  'cfg.krea2-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
+      + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
+      + ' 阶段可直接播放。可以是已注册的模型、只含一个 .safetensors 的目录，'
+      + '或指向它的路径。它必须是为「这个」模型的潜空间训练的。留空（默认）'
+      + '即关闭预览，端口不接也一样——那时什么都不加载、不解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。每走完一個去噪步，模型對'
+      + '成片的乾淨估計會由它解碼，寫到去噪階段的 `preview` 輸出埠，`preview`'
+      + ' 階段可直接播放。可以是已註冊的模型、只含一個 .safetensors 的目錄，'
+      + '或指向它的路徑。它必須是為「這個」模型的潛空間訓練的。留空（預設）'
+      + '即關閉預覽，埠不接也一樣——那時什麼都不載入、不解碼'],
+  'cfg.krea2-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待：下一次到期时仍在排队的预览会被「替换」而不是'
+      + '保留。它确实与去噪共用 GPU，所以 N 越大，还给去噪的 GPU 时间越多。'
+      + '填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待：下一次到期時仍在排隊的預覽會被「替換」而不是'
+      + '保留。它確實與去噪共用 GPU，所以 N 越大，還給去噪的 GPU 時間越多。'
+      + '填 0 即關閉預覽'],
+  'cfg.krea2-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下（所以 512 会把 960x576 变成 480x288）。解码本身总以 TAE 自己的'
+      + '尺寸进行：改为先缩小潜变量会让画面变糊并偏色。填 0 即按解码原样发'
+      + '送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下（所以 512 會把 960x576 變成 480x288）。解碼本身總以 TAE 自己的'
+      + '尺寸進行：改為先縮小潛變數會讓畫面變糊並偏色。填 0 即按解碼原樣傳'
+      + '送'],
   'port.krea2-model-config.trigger': ['',
       '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
       + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
@@ -3837,13 +3982,15 @@ const STRINGS = {
       + '發一次'],
   'port.krea2-model-config.model_config': ['',
       'krea2 参数，作为一个 FlexData 对象 {model_family: krea2, +vl_*, +'
-      + 'lora, +lora_scale}。其中 vl_* 各键给 diffusion-conditioner 的 '
-      + 'model_config 输入端口（接地编码），lora 各键给 generate-image 的。'
-      + '请同时接到两者——各自只读取属于自己的部分',
+      + 'lora, +lora2 与它们的强度，+preview_vae 与它的选项}。其中 vl_* 各'
+      + '键给 diffusion-conditioner 的 model_config 输入端口（接地编码），'
+      + 'lora 与 preview 各键给 generate-image 的。请同时接到两者——各自只读'
+      + '取属于自己的部分',
       'krea2 參數，作為一個 FlexData 物件 {model_family: krea2, +vl_*, +'
-      + 'lora, +lora_scale}。其中 vl_* 各鍵給 diffusion-conditioner 的 '
-      + 'model_config 輸入埠（接地編碼），lora 各鍵給 generate-image 的。請'
-      + '同時接到兩者——各自只讀取屬於自己的部分'],
+      + 'lora, +lora2 與它們的強度，+preview_vae 與它的選項}。其中 vl_* 各'
+      + '鍵給 diffusion-conditioner 的 model_config 輸入埠（接地編碼），'
+      + 'lora 與 preview 各鍵給 generate-image 的。請同時接到兩者——各自只讀'
+      + '取屬於自己的部分'],
 
   // ---- Mage-Flow Model Config (model-specific-config) ----
   'stage.mage-flow-model-config.name': ['',
@@ -4040,6 +4187,42 @@ const STRINGS = {
       '`lora2` 的強度，按每次前向生效，且與 `lora_scale` 相互獨立——這正是第'
       + '二個槽位的意義所在：蒸餾轉接器保持它訓練時的強度，而這一個可以隨意'
       + '掃參。填 0 會跳過它的兩個 GEMM'],
+  'cfg.minimax-h3-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
+      + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
+      + ' 阶段可直接播放。可以是已注册的模型、只含一个 .safetensors 的目录，'
+      + '或指向它的路径。它必须是为「这个」模型的潜空间训练的。留空（默认）'
+      + '即关闭预览，端口不接也一样——那时什么都不加载、不解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。每走完一個去噪步，模型對'
+      + '成片的乾淨估計會由它解碼，寫到去噪階段的 `preview` 輸出埠，`preview`'
+      + ' 階段可直接播放。可以是已註冊的模型、只含一個 .safetensors 的目錄，'
+      + '或指向它的路徑。它必須是為「這個」模型的潛空間訓練的。留空（預設）'
+      + '即關閉預覽，埠不接也一樣——那時什麼都不載入、不解碼'],
+  'cfg.minimax-h3-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待：下一次到期时仍在排队的预览会被「替换」而不是'
+      + '保留。它确实与去噪共用 GPU，所以 N 越大，还给去噪的 GPU 时间越多。'
+      + '填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待：下一次到期時仍在排隊的預覽會被「替換」而不是'
+      + '保留。它確實與去噪共用 GPU，所以 N 越大，還給去噪的 GPU 時間越多。'
+      + '填 0 即關閉預覽'],
+  'cfg.minimax-h3-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下（所以 512 会把 960x576 变成 480x288）。解码本身总以 TAE 自己的'
+      + '尺寸进行：改为先缩小潜变量会让画面变糊并偏色。填 0 即按解码原样发'
+      + '送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下（所以 512 會把 960x576 變成 480x288）。解碼本身總以 TAE 自己的'
+      + '尺寸進行：改為先縮小潛變數會讓畫面變糊並偏色。填 0 即按解碼原樣傳'
+      + '送'],
+  'cfg.minimax-h3-model-config.preview_frames': ['',
+      '可选：视频预览的长度上限（帧）。0（默认）预览整段，N 只解码前 N '
+      + '帧。这是精确结果而非近似——视频 TAE 的记忆只向前传递——也是唯一能'
+      + '让预览变「便宜」的选项',
+      '可選：影片預覽的長度上限（影格）。0（預設）預覽整段，N 只解碼前 N '
+      + '格。這是精確結果而非近似——影片 TAE 的記憶只向前傳遞——也是唯一能'
+      + '讓預覽變「便宜」的選項'],
   'port.minimax-h3-model-config.trigger': ['',
       '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
       + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
@@ -4051,11 +4234,13 @@ const STRINGS = {
       'MiniMax-H3 生成参数，作为一个 FlexData 对象 {model_family: '
       + 'minimax-h3, video_shift, audio_shift, condition_timestep, '
       + 'condition_audio_timestep, audio_seconds，以及可选的 lora、lora2 '
-      + '与它们的强度}，供 generate-video 的 model_config 输入端口使用',
+      + '与它们的强度，可选的 preview_vae 与它的三个选项}，供 generate-video '
+      + '的 model_config 输入端口使用',
       'MiniMax-H3 生成參數，作為一個 FlexData 物件 {model_family: '
       + 'minimax-h3, video_shift, audio_shift, condition_timestep, '
       + 'condition_audio_timestep, audio_seconds，以及可選的 lora、lora2 '
-      + '與它們的強度}，供 generate-video 的 model_config 輸入埠使用'],
+      + '與它們的強度，可選的 preview_vae 與它的三個選項}，供 generate-video '
+      + '的 model_config 輸入埠使用'],
 
   // ---- Qwen-Image-Edit Model Config (model-specific-config) ----
   'stage.qwen-image-edit-model-config.name': ['',
@@ -4314,8 +4499,16 @@ const STRINGS = {
       '對影格率很低的影像類來源允許靜態圖片模式（低於 1 fps 時傳送圖片而不'
       + '是視訊）；false = 始終按視訊處理'],
   'port.preview.frames': ['',
-      '视频 RGB TensorBeat [3,H,W]（F32 或 U8）；第一帧决定原生分辨率',
-      '視訊 RGB TensorBeat [3,H,W]（F32 或 U8）；第一格決定原生解析度'],
+      '视频 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat（F32 或 U8）；RGBA 会合'
+      + '成到棋盘格背景上，因为静态 PNG 和 H.264 都不带 alpha。第一帧决定原'
+      + '生分辨率。秩为 4 的 [F,C,H,W] 拍是一个「片段」（generate-video 的去'
+      + '噪预览，或 vae-decode 的 clip 端口）：它会被保留，按自身帧率循环播'
+      + '放，直到下一拍替换它',
+      '視訊 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat（F32 或 U8）；RGBA 會合'
+      + '成到棋盤格背景上，因為靜態 PNG 和 H.264 都不帶 alpha。第一格決定原'
+      + '生解析度。秩為 4 的 [F,C,H,W] 拍是一個「片段」（generate-video 的去'
+      + '噪預覽，或 vae-decode 的 clip 埠）：它會被保留，按自身影格率循環播'
+      + '放，直到下一拍替換它'],
   'port.preview.audio': ['',
       '可选的音频 PCM TensorBeat：F32，秩为 1 的 [n]（单声道）或秩为 2 的 ['
       + '声道数, n]。sideband.sample_rate 会被采用。',

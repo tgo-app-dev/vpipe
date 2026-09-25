@@ -37,6 +37,7 @@ set(LOCAL_SOURCES
   shared/gguf-file.cc
   shared/grounded-encode-params.cc
   shared/i8-gemm.cc
+  shared/metal-tae-decoder.cc
   shared/lora-names.cc
   shared/runtime-lora.cc
   shared/torch-zip.cc

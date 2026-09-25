@@ -1,12 +1,12 @@
 {
-  "id": "krea-2-preview",
+  "id": "qwen-image-2.1-rgba-preview",
   "stages": [
     {
       "id": "model-select",
       "type": "model-select",
       "iports": [],
       "config": {
-        "hf_dir": "krea/Krea-2-Turbo"
+        "hf_dir": "Qwen/Qwen-Image-2.1"
       }
     },
     {
@@ -14,17 +14,15 @@
       "type": "text-prompt",
       "iports": [],
       "config": {
-        "text": "masterpiece, best quality, ultra-detailed, photorealistic magical realism, warm analog film photograph, square composition, close-up waist-up portrait of a woman sitting beside an open wooden window in a quiet seaside bookstore cafe, bright ocean horizon and blue sky outside, golden morning sunlight flooding the room, she holds an open blank book toward the camera, dozens of blank pages rise from the book and turn into luminous translucent sky fragments and delicate glass butterflies, jasmine tea steam curling beside her, sparkling dust motes in sunlight, soft cream sage pale blue and warm gold palette, cinematic backlight, shallow depth of field, crisp expressive eyes, elegant clean composition, no readable text, no watermark, no logo --preview"
+        "text": "This is an RGBA image with transparency. A single red maple leaf, crisp edges, centred, high detail. The background is transparent."
       }
     },
     {
-      "id": "krea2-model-config",
-      "type": "krea2-model-config",
+      "id": "qwen-image-21-model-config",
+      "type": "qwen-image-21-model-config",
       "iports": [],
       "config": {
-        "lora": "mgwr/M87",
-        "lora_scale": 1.0,
-        "preview_vae": "madebyollin/taew2_1",
+        "preview_vae": "madebyollin/taeqi2_1",
         "preview_every": 1
       }
     },
@@ -33,8 +31,7 @@
       "type": "scheduler-select",
       "iports": [],
       "config": {
-        "steps": 8,
-        "shift": 0.3
+        "steps": 20
       }
     },
     {
@@ -62,7 +59,7 @@
           "oport": 0
         },
         {
-          "src": "krea2-model-config",
+          "src": "qwen-image-21-model-config",
           "oport": 0
         }
       ],
@@ -101,16 +98,28 @@
           "oport": 0
         },
         {
-          "src": "krea2-model-config",
+          "src": "qwen-image-21-model-config",
           "oport": 0
         }
       ],
       "config": {
         "height": 1024,
         "width": 1024,
-        "steps": 8,
-        "seed": 0,
-        "i8_gemm": true
+        "steps": 20,
+        "seed": 7
+      }
+    },
+    {
+      "id": "preview",
+      "type": "preview",
+      "iports": [
+        {
+          "src": "generate-image",
+          "oport": 2
+        }
+      ],
+      "config": {
+        "title": "Qwen-Image-2.1 denoising"
       }
     },
     {
@@ -129,19 +138,6 @@
       "config": {}
     },
     {
-      "id": "preview",
-      "type": "preview",
-      "iports": [
-        {
-          "src": "generate-image",
-          "oport": 2
-        }
-      ],
-      "config": {
-        "title": "Krea-2 denoising"
-      }
-    },
-    {
       "id": "save-image",
       "type": "save-image",
       "iports": [
@@ -151,8 +147,9 @@
         }
       ],
       "config": {
-        "path": "krea-2-preview.jpeg",
-        "quality": 95
+        "path": "qwen-image-2.1-rgba-preview.png",
+        "format": "png",
+        "compression": 6
       }
     }
   ],

@@ -671,6 +671,26 @@ builtin_catalog_()
                "krea2_identity_edit_v1_2_r128.safetensors",
                "krea2_identity_edit_v1_2_r64.safetensors"},
      .needs_tokenizer_json = false},
+    // A tiny autoencoder for LIVE PREVIEWS on generate-image's `preview`
+    // port (named on krea2-model-config's `preview_vae`). madebyollin's
+    // `taew2_1` is trained on the Wan 2.1 latent space, which is Krea-2's:
+    // its Qwen-Image VAE keeps Wan 2.1's ENCODER (and its latents_mean /
+    // latents_std) and retrained only the decoder. The taehv README names
+    // it as Qwen-Image's TAE. Published in a GitHub repo, so fetched by URL
+    // into the same `madebyollin/taehv/` directory as `taeh3`; the pinned
+    // file is what tells the two apart there.
+    {.family = "Krea", .version = "2", .param_class = "TAE",
+     .variant = "taew2_1 temporal preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taehv",
+     .model_type = "krea2-tae",
+     .parent_model_type = "krea2",
+     .files = {"taew2_1.safetensors"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/madebyollin/taehv/main/"
+           "safetensors/taew2_1.safetensors",
+           "taew2_1.safetensors"}}),
+     .name = "madebyollin/taew2_1"},
     // Krea2-HD VAE (wikeeyang): the Qwen-Image VAE fine-tuned alongside a
     // Krea-2-Turbo HD fine-tune of the DiT, and published as a
     // STANDALONE VAE -- one 507 MB safetensors carrying the full
@@ -928,6 +948,25 @@ builtin_catalog_()
                "processor/video_preprocessor_config.json",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // A tiny autoencoder for LIVE PREVIEWS of Qwen-Image-2.1
+    // (qwen-image-21-model-config's `preview_vae`): madebyollin's
+    // `taeqi2_1`, TAESD's 16x variant with a 2x2 pixel-shuffled head and
+    // RGBA out, like the model's own VAE. It reads the DiT's 64-channel
+    // latent as it stands, still whitened. Published only as a torch .pth
+    // in the taesd GitHub repo, so fetched by URL; the preview's resolver
+    // takes a .pth where an adapter field would not.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "TAE",
+     .variant = "taeqi2_1 RGBA preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taesd",
+     .model_type = "qwen-image-21-tae",
+     .parent_model_type = "qwen-image-21",
+     .files = {"taeqi2_1_decoder.pth"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/madebyollin/taesd/main/"
+           "taeqi2_1_decoder.pth",
+           "taeqi2_1_decoder.pth"}}),
+     .name = "madebyollin/taeqi2_1"},
     // Z-Image (Tongyi-MAI): a 6B single-stream DiT in the Lumina/NextDiT
     // lineage, and the cheapest first-class image family in this tree --
     // two of its three sub-models are already supported code.
@@ -1014,6 +1053,19 @@ builtin_catalog_()
                "tokenizer/merges.txt",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = true},
+    // A tiny autoencoder for LIVE PREVIEWS of either Z-Image checkpoint
+    // (z-image-model-config's `preview_vae`). Z-Image decodes with the
+    // FLUX.1 autoencoder, so its TAE is madebyollin's TAESD for FLUX.1,
+    // fed the DiT's own latent: the AE's scale and shift are the real
+    // decode's to undo, and this was distilled without them. Diffusers'
+    // AutoencoderTiny layout.
+    {.family = "Z-Image", .version = "1", .param_class = "TAE",
+     .variant = "taef1 preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taef1",
+     .model_type = "z-image-tae",
+     .parent_model_type = "z-image",
+     .files = {"config.json", "diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false},
     // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
     // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
     // separate VAE stages), but the FLUX topology rather than Qwen-Image
@@ -1138,6 +1190,19 @@ builtin_catalog_()
                "tokenizer/tokenizer_config.json",
                "tokenizer/chat_template.jinja",
                "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // A tiny autoencoder for LIVE PREVIEWS of any FLUX.2 checkpoint
+    // (flux2-model-config's `preview_vae`): madebyollin's TAEF2, whose
+    // first blocks carry a GroupNorm over the whole picture. It reads the
+    // DiT's latent unpatchified to 32 channels and NOT un-normalized --
+    // the batch-norm inverse the real VAE applies is what it was
+    // distilled without.
+    {.family = "FLUX", .version = "2", .param_class = "TAE",
+     .variant = "taef2 preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taef2",
+     .model_type = "flux2-tae",
+     .parent_model_type = "flux2",
+     .files = {"taef2.safetensors"},
      .needs_tokenizer_json = false},
     // ---- Mage-Flow: NOT HERE, and that is the point ------------------
     // Its six records moved into the vpipe-mage-flow plugin, which
@@ -1896,6 +1961,41 @@ builtin_catalog_()
      .weight_format = "comfyui",
      .needs_tokenizer_json = false,
      .name = "Mamad8/MiniMax-H3-Image-VAE"},
+    // A tiny autoencoder for LIVE PREVIEWS: it decodes a denoise step's
+    // clean estimate onto generate-video's `preview` port at a small
+    // fraction of the video VAE's cost. Named on minimax-h3-model-config's
+    // `preview_vae`; see stages/latent-preview.h.
+    //
+    // madebyollin's `taeh3` first: it is TEMPORAL, so it decodes the
+    // clip's real frame count and keeps the motion, and against the real
+    // VAE it MEASURED 25.3 dB where Kijai's scored 23.3 on the same
+    // latent. It is published in a GitHub repo, not on the Hub, so it is
+    // fetched by URL (`url_files`) into `madebyollin/taehv/`.
+    //
+    // Kijai's is a 2D decoder -- one frame per latent frame, no temporal
+    // structure -- so its preview plays a quarter of the clip's frames,
+    // slowed to the same duration; each reproduces the LAST pixel frame
+    // its latent frame covers. Both read the same latent space, so the
+    // parent is nominal: both partitions take either.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "TAE",
+     .variant = "taeh3 temporal preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taehv",
+     .model_type = "minimax-h3-tae",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"taeh3.safetensors"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/madebyollin/taehv/main/"
+           "safetensors/taeh3.safetensors",
+           "taeh3.safetensors"}}),
+     .name = "madebyollin/taeh3"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "TAE",
+     .variant = "2D tiny preview decoder (Kijai)",
+     .hf_path = "Kijai/MiniMax-H3-TAE",
+     .model_type = "minimax-h3-tae",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"vae_approx/taeh3.safetensors"},
+     .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -2317,6 +2417,47 @@ catalog_by_name(const std::string& name)
     }
   }
   return nullptr;
+}
+
+std::vector<std::pair<std::string, std::string>>
+catalog_url_files(const ModelCatalogEntry& e)
+{
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!e.extra.is_object()) { return out; }
+  FlexData extra = e.extra;
+  auto o = extra.as_object();
+  if (!o.contains("url_files")) { return out; }
+  FlexData list = o.at("url_files");
+  if (!list.is_array()) { return out; }
+  auto a = list.as_array();
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    FlexData pair = a.at(i);
+    if (!pair.is_array()) { continue; }
+    auto pa = pair.as_array();
+    if (pa.size() != 2) { continue; }
+    std::string url(pa.at(0).as_string(""));
+    std::string dest(pa.at(1).as_string(""));
+    if (!url.empty() && !dest.empty()) {
+      out.emplace_back(std::move(url), std::move(dest));
+    }
+  }
+  return out;
+}
+
+FlexData
+catalog_url_files_extra(
+    std::vector<std::pair<std::string, std::string>> files)
+{
+  FlexData list = FlexData::make_array();
+  for (auto& [url, dest] : files) {
+    FlexData pair = FlexData::make_array();
+    pair.as_array().push_back(FlexData::make_string(url));
+    pair.as_array().push_back(FlexData::make_string(dest));
+    list.as_array().push_back(std::move(pair));
+  }
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert_or_assign("url_files", std::move(list));
+  return extra;
 }
 
 std::string

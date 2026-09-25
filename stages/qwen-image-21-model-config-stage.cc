@@ -1,6 +1,9 @@
 #include "stages/qwen-image-21-model-config-stage.h"
+#include "stages/latent-preview.h"
+#include "stages/model-registry.h"
 
 #include "common/flex-data.h"
+#include "common/vpipe-format.h"
 
 #include <string>
 #include <utility>
@@ -42,6 +45,19 @@ const ConfigKey kAttrs[] = {
   {.key = "vl_max_pixels", .type = ConfigType::Int, .required = false,
    .doc = "grounded encode: the image processor's upper bound. Unset => "
           "the family's own 16777216"},
+  // The live-preview keys every family's config source shares; see
+  // stages/latent-preview.h. Qwen-Image-2.1's TAE is madebyollin's
+  // `taeqi2_1`: 16x, reading the DiT's 64-channel latent as it stands,
+  // RGBA out like the real VAE -- a torch .pth, fetched by URL.
+  {.key = latent_preview::kVaeKey, .type = ConfigType::String,
+   .required = false, .doc = latent_preview::kVaeDoc,
+   .suggest_db = kModelRegistryDb,
+   // Typed, so the picker offers a TAE for THIS latent space only.
+   .suggest_db_type = "qwen-image-21-tae"},
+  {.key = latent_preview::kEveryKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kEveryDoc, .def_int = 1},
+  {.key = latent_preview::kMaxEdgeKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kMaxEdgeDoc, .def_int = 512},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -53,8 +69,9 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "qwen-image-2.1 parameters as one FlexData object "
-          "{model_family: qwen-image-21, +use_kv_cache, +vl_*}, for a "
-          "generate-image or diffusion-conditioner model_config iport",
+          "{model_family: qwen-image-21, +use_kv_cache, +vl_*, "
+          "+preview_vae and its knobs}, for a generate-image or "
+          "diffusion-conditioner model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -83,6 +100,15 @@ QwenImage21ModelConfigStage::QwenImage21ModelConfigStage(
                                                         std::move(iports),
                                                         std::move(config))
 {
+  _preview.vae      = attr_str(latent_preview::kVaeKey);
+  _preview.every    = (int)attr_int(latent_preview::kEveryKey);
+  _preview.max_edge = (int)attr_int(latent_preview::kMaxEdgeKey);
+  if (_preview.every < 0 || _preview.max_edge < 0) {
+    fail_config(fmt(
+        "QwenImage21ModelConfigStage('{}'): preview_every and "
+        "preview_max_edge must be >= 0 (got {} / {})", this->id(),
+        _preview.every, _preview.max_edge));
+  }
   allocate_oports(spec().oports.size());
 }
 
@@ -109,6 +135,8 @@ QwenImage21ModelConfigStage::resolved_config() const
           FlexData::make_bool(in.at("use_kv_cache").as_bool(true)));
     }
   }
+  // Emitted only when a preview VAE is named.
+  _preview.emit(fd);
   return fd;
 }
 

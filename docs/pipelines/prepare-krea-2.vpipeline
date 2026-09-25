@@ -31,6 +31,24 @@
         "skip_existing_files": true,
         "overwrite_existing": false
       }
+    },
+    {
+      "id": "fetch-preview-tae",
+      "type": "model-fetch",
+      "iports": [
+        {
+          "src": "fetch-m87-lora",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "model_path": "madebyollin/taehv",
+        "model_variant": "madebyollin/taew2_1",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
     }
   ],
   "subpipelines": []

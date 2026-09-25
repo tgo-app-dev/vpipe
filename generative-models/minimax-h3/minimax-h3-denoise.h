@@ -92,6 +92,19 @@ struct DenoiseRequest {
   // whatever steps have run.
   std::function<bool(int step, int total)> progress;
 
+  // A LATENT PREVIEW. After step `step` (1-based, of `total`) for which
+  // `preview_due` says yes, `preview` gets the model's clean estimate
+  // x0 = x + sigma * v of the GENERATED video rows --
+  // [num_video_rows, video_patch_elems] f32, in packed order, the tail
+  // `video` holds past its conditioning rows. Borrowed for the call.
+  //
+  // x0 rather than the state: the state is mostly noise for the first
+  // half of the schedule, and x0 is what the model currently believes
+  // the clip is. Asking first means a step nobody previews builds
+  // nothing; both empty is no previews.
+  std::function<bool(int step, int total)> preview_due;
+  std::function<void(int step, int total, const float* x0)> preview;
+
   // Adopt a caller's per-generation choices. Here rather than at each
   // call site so a field added to GenerationParams reaches the loop
   // without every driver having to be found and updated -- which is the

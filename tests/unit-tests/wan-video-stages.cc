@@ -1142,13 +1142,14 @@ TEST(generate_video, family_generic_surface)
 
   const StageSpec& sp = s->spec();
   // The audio latent port exists on the type, so a graph can wire it
-  // whether or not the resident family fills it.
-  EXPECT_TRUE(sp.oports.size() == 2);
-  bool has_audio = false;
-  for (const auto& p : sp.oports) {
-    if (std::string(p.name) == "audio_latent") { has_audio = true; }
+  // whether or not the resident family fills it; the live preview is
+  // APPENDED after it, so both latent ports keep their indices.
+  EXPECT_TRUE(sp.oports.size() == 3);
+  if (sp.oports.size() == 3) {
+    EXPECT_TRUE(std::string(sp.oports[0].name) == "latent");
+    EXPECT_TRUE(std::string(sp.oports[1].name) == "audio_latent");
+    EXPECT_TRUE(std::string(sp.oports[2].name) == "preview");
   }
-  EXPECT_TRUE(has_audio);
   // The wan-side ports keep their INDICES, with the h3 anchors, the
   // Ref2VA reference rows, the config port and the audio conditioning
   // appended -- which is what lets a graph written for an earlier port

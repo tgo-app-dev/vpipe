@@ -180,6 +180,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         flashvsr-kv.cc
         torch-zip.cc
         wan-vae.cc
+        tae-decoder.cc
+        latent-preview.cc
         wan-umt5.cc
         wan-unipc.cc
         wan-dit.cc

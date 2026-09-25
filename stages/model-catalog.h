@@ -111,9 +111,18 @@ struct ModelCatalogEntry {
   // protect, and packaging facts are as likely to be lists or numbers
   // as strings.
   //
-  // Keys are the host's, lower_snake, added and never repurposed. None
-  // is defined today, which is the honest state of it: this is the
-  // seam, not a backlog.
+  // Keys are the host's, lower_snake, added and never repurposed.
+  // Defined so far:
+  //
+  //   url_files  [[url, dest], ...] -- the model's files are fetched
+  //              VERBATIM from these absolute URLs into the entry's
+  //              directory, instead of from a Hub repo. For weights
+  //              published somewhere model-fetch cannot walk (a GitHub
+  //              repo's raw files). Registered as a MODEL, unlike
+  //              `dataset_files`; `files` should name the same `dest`s
+  //              so the registry record pins them. Build it with
+  //              catalog_url_files_extra(); read it with
+  //              catalog_url_files().
   FlexData extra;
 
   std::string name;         // registration key + extract subdir (when several
@@ -234,6 +243,15 @@ const ModelCatalogEntry* catalog_by_name(const std::string& name);
 // Derived category of an entry: "dataset" (carries dataset_files),
 // "supplement" (has a parent_model_type -- a tower / LoRA), else "model".
 std::string catalog_category(const ModelCatalogEntry& e);
+
+// The `url_files` packaging fact (see ModelCatalogEntry::extra): the
+// {url, dest} pairs, empty when the entry has none.
+std::vector<std::pair<std::string, std::string>>
+catalog_url_files(const ModelCatalogEntry& e);
+// An `extra` holding `url_files`, for a catalogue entry's initialiser.
+FlexData
+catalog_url_files_extra(
+    std::vector<std::pair<std::string, std::string>> files);
 
 // Default input / output modalities for a runtime `model_type`, each a
 // subset of {"text","image","audio","video"}. This is the table the

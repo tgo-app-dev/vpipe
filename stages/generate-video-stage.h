@@ -19,6 +19,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/wan/metal-wan-transformer.h"
+#include "stages/latent-preview.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #endif
@@ -156,6 +157,19 @@ struct TensorBeat;
 //           {latents_per_second} -- what `audio-vae-decode` reads. Never
 //           written by a family that does not generate audio, so a graph
 //           that leaves it unconnected is not doing anything wrong.
+//   oport2  OPTIONAL live PREVIEW of the clip being denoised: planar U8
+//           RGB [F, 3, H, W] (the `rgb-clip` shape), one beat per rendered
+//           step, sideband {frames, fps, fps_num, fps_den, step, steps,
+//           preview}. The model's clean estimate at that step, decoded by
+//           a tiny autoencoder named on the family's config source
+//           (`preview_vae`, with `preview_every` / `preview_max_edge` /
+//           `preview_frames`) -- so a `preview` stage wired here plays the
+//           clip forming. PUSH-STYLE like rtsp-capture's: DropOldest,
+//           written from a thread of this stage's, so a preview nobody
+//           reads is dropped and never holds the generation up; that
+//           policy takes ONE consumer. Unwired, or with no preview VAE,
+//           nothing is loaded and nothing is decoded. Rendered by
+//           minimax-h3 today; the other families leave it silent.
 //
 // Config (FlexData object):
 //   hf_dir           (string, OPTIONAL) -- the Wan model root
@@ -519,6 +533,18 @@ private:
                int ref_frames, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
                std::vector<float>* audio_out, std::vector<int>* audio_shape);
+
+  // The live-preview renderer (oport2). Built on the first model_config
+  // latch and kept, so its TAE survives from clip to clip; its keys are
+  // read from the same beat as the family's own.
+  std::unique_ptr<LatentPreviewer> _preview;
+  // Said once: a plugin family handed back a preview_x0 of the wrong
+  // shape. Per clip it would bury everything else.
+  bool _preview_shape_said = false;
+  // The TAE the folded model_config names, for the plan: its weights and
+  // its decode scratch, booked like every other model this stage holds.
+  std::vector<ResourceClaim> preview_claims_(int w, int h,
+                                             int frames) const;
 
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   // What decide_resources() named in its phase claim. Mutable because

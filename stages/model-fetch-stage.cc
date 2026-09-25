@@ -690,8 +690,23 @@ ModelFetchStage::process(RuntimeContext& ctx)
     }
   }
 
-  s->info(fmt("ModelFetchStage('{}'): fetching '{}' from {} -> '{}'",
-              this->id(), hf_path, src->label(), local_dir.string()));
+  // Where the bytes really come from: a url_files entry names its own
+  // host, and "from HuggingFace" for a GitHub download would mislead.
+  {
+    const auto urls = entry != nullptr && entry->dataset_files.empty()
+                          ? catalog_url_files(*entry)
+                          : std::vector<std::pair<string, string>>{};
+    string from = src->label();
+    if (!urls.empty()) {
+      const string& u = urls.front().first;
+      const auto p0 = u.find("://");
+      const auto p1 = p0 == string::npos ? string::npos
+                                         : u.find('/', p0 + 3);
+      from = p0 == string::npos ? u : u.substr(p0 + 3, p1 - (p0 + 3));
+    }
+    s->info(fmt("ModelFetchStage('{}'): fetching '{}' from {} -> '{}'",
+                this->id(), hf_path, from, local_dir.string()));
+  }
 
   // How every file below is fetched: no total deadline, a stall window,
   // retries that resume, the content store for the big ones, and a
@@ -703,47 +718,62 @@ ModelFetchStage::process(RuntimeContext& ctx)
   fopts.verify      = _verify_checksums;
   fopts.xet_streams = _xet_streams;
 
-  // -------- 3b. Dataset fetch (eval datasets) -------------------------
-  // A catalogue entry carrying explicit dataset_files is fetched VERBATIM from
-  // the given URLs (the HF datasets-server /rows pages) into local_dir and
-  // registered -- no model-repo tree walk. Keeps dataset text out of the binary
-  // (the model-eval stage reads these rows-*.json pages on demand).
-  if (entry != nullptr && !entry->dataset_files.empty()) {
-    // These are VERBATIM URLs into HuggingFace's datasets-server, which
-    // has no mirror counterpart -- there is no ModelScope endpoint that
-    // serves the same /rows pages. Say so rather than let a fetch that
-    // cannot reach the host look like a network fault.
+  // -------- 3b. Verbatim URL fetch: datasets, and models off the Hub ---
+  // A catalogue entry carrying explicit URLs is fetched VERBATIM into
+  // local_dir and registered -- no model-repo tree walk. Two kinds:
+  //   * dataset_files -- eval datasets (the HF datasets-server /rows
+  //     pages), which keeps dataset text out of the binary; the
+  //     model-eval stage reads the rows-*.json pages on demand.
+  //   * the `url_files` packaging fact -- a MODEL published somewhere this
+  //     stage cannot walk (a GitHub repo's raw files; madebyollin's TAEs
+  //     live there). Registered as an ordinary model, with its model_type
+  //     and the files it pins, so a picker and resolve_adapter_file()
+  //     find it exactly as they find a Hub download.
+  const bool is_dataset = entry != nullptr && !entry->dataset_files.empty();
+  const std::vector<std::pair<string, string>> url_files =
+      entry != nullptr && !is_dataset
+          ? catalog_url_files(*entry)
+          : std::vector<std::pair<string, string>>{};
+  if (is_dataset || !url_files.empty()) {
+    const auto& list = is_dataset ? entry->dataset_files : url_files;
+    const char* kind = is_dataset ? "dataset" : "model";
+    // Dataset rows are VERBATIM URLs into HuggingFace's datasets-server,
+    // which has no mirror counterpart -- there is no ModelScope endpoint
+    // that serves the same /rows pages. Say so rather than let a fetch
+    // that cannot reach the host look like a network fault. A url_files
+    // model names its own host, which no source setting moves either.
     if (src->name() != string("huggingface")) {
       s->warn(fmt(
-          "ModelFetchStage('{}'): '{}' is a DATASET, and its rows come "
-          "from HuggingFace's datasets-server by absolute URL -- source "
-          "'{}' does not apply and this fetch still needs "
-          "huggingface.co to be reachable",
-          this->id(), reg_key, src->name()));
+          "ModelFetchStage('{}'): '{}' is fetched from absolute URLs ({}), "
+          "so source '{}' does not apply and this fetch still needs that "
+          "host to be reachable",
+          this->id(), reg_key,
+          is_dataset ? string("HuggingFace's datasets-server")
+                     : list.front().first,
+          src->name()));
     }
     std::error_code ec;
     fs::create_directories(local_dir, ec);
     uint64_t total = 0;
     FlexData files_arr = FlexData::make_array();
-    for (size_t i = 0; i < entry->dataset_files.size(); ++i) {
+    for (size_t i = 0; i < list.size(); ++i) {
       if (ctx.stop_requested()) {
         s->error(fmt("ModelFetchStage('{}'): canceled", this->id()));
       }
-      const string& url  = entry->dataset_files[i].first;
-      const string& dest = entry->dataset_files[i].second;
+      const string& url  = list[i].first;
+      const string& dest = list[i].second;
       const fs::path out = local_dir / dest;
-      s->info(fmt("  [{}/{}] {} ...",
-                  i + 1, entry->dataset_files.size(), dest));
+      s->info(fmt("  [{}/{}] {} ...", i + 1, list.size(), dest));
       long st = 0;
       string derr;
-      // Datasets-server is public -- no auth token needed. It publishes
-      // no checksum either, so these retry but never resume: a part
-      // with nothing to check it against is not worth continuing.
+      // Public URLs -- no auth token. Neither host publishes a checksum
+      // either, so these retry but never resume: a part with nothing to
+      // check it against is not worth continuing.
       FetchRequest dreq;
       dreq.url = url;
       if (!fetch_file(s, dreq, fopts, out, st, derr, nullptr, &cancel)) {
-        s->error(fmt("ModelFetchStage('{}'): dataset fetch '{}' failed: {}",
-                     this->id(), dest, derr));
+        s->error(fmt("ModelFetchStage('{}'): {} fetch '{}' failed: {}",
+                     this->id(), kind, dest, derr));
       }
       files_arr.as_array().push_back(FlexData::make_string(dest));
       total += static_cast<uint64_t>(fs::file_size(out, ec));
@@ -754,8 +784,12 @@ ModelFetchStage::process(RuntimeContext& ctx)
                         FlexData::make_string(local_dir.string()));
     ro.insert_or_assign("source_url",
                         FlexData::make_string(
-                            "https://huggingface.co/datasets"));
-    ro.insert_or_assign("dataset", FlexData::make_bool(true));
+                            is_dataset ? string("https://huggingface.co/"
+                                                "datasets")
+                                       : list.front().first));
+    if (is_dataset) {
+      ro.insert_or_assign("dataset", FlexData::make_bool(true));
+    }
     record_detected_fields(ro, detect_model_dir(local_dir.string(), hf_path));
     ro.insert_or_assign("model_type",
                         FlexData::make_string(entry->model_type));
@@ -769,13 +803,12 @@ ModelFetchStage::process(RuntimeContext& ctx)
       txn.commit();
     }
     s->info(fmt(
-        "ModelFetchStage('{}'): dataset '{}' ({}) registered in the "
-        "model registry", this->id(), reg_key, human_bytes(total)));
+        "ModelFetchStage('{}'): {} '{}' ({}) registered in the model "
+        "registry", this->id(), kind, reg_key, human_bytes(total)));
     ro.insert_or_assign("stage", FlexData::make_string("model-fetch"));
     ro.insert_or_assign("text", FlexData::make_string(
-        fmt("[model-fetch] dataset {}\n  -> {}\n  {} file(s), {} bytes",
-            reg_key, local_dir.string(),
-            entry->dataset_files.size(), total)()));
+        fmt("[model-fetch] {} {}\n  -> {}\n  {} file(s), {} bytes",
+            kind, reg_key, local_dir.string(), list.size(), total)()));
     if (ctx.has_consumers(0)) {
       co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(rec)));
     }

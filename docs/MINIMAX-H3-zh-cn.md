@@ -25,6 +25,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
 - [第 2 步——文本生成视频**与音频**](#step-2--text-to-video-and-audio)
   - [值得了解的设置](#the-settings-worth-knowing)
   - [耗时](#how-long-it-takes)
+  - [看着它成形——实时预览](#watching-it-form--live-previews)
   - [不只是文本输入](#more-than-text-in)
   - [以参考素材为条件（Ref2VA）](#conditioning-on-references-ref2va)
     - [两种传入参考素材的方式](#two-ways-to-hand-it-a-reference)
@@ -137,6 +138,8 @@ Ref2VA 那一行指的是**整个模型**，而不只是它的 transformer，这
   两者共用同一次下载。
 - **[`minimax-h3-text-to-video.vpipeline`](pipelines/minimax-h3-text-to-video.vpipeline)**
   ——输入提示词，输出带声音的 `.mp4`。
+- **[`minimax-h3-text-to-video-preview.vpipeline`](pipelines/minimax-h3-text-to-video-preview.vpipeline)**
+  ——同上，外加片段逐步成形的**实时预览**（见[看着它成形](#watching-it-form--live-previews)）。
 - **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
   ——同上，但首尾两端都锚定到一张图片（见[不止文本输入](#more-than-text-in)）。
 - **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
@@ -374,6 +377,55 @@ trigger 时，它在整次运行中只发出一次。
 > 风扇足够好，以至于这个负载把 GPU 钉在 **1620 MHz——也就是最高频——整次运行都在
 > 100%**。那是 Air 持续频率的 **1.25×**，这还没算核心数的差别，所以时钟本身能解释
 > 2.3–2.8× 差距的一部分，而不是大部分。
+
+<a id="watching-it-form--live-previews"></a>
+### 看着它成形——实时预览
+
+这个模型的一次去噪要跑几分钟，没有预览的话，直到最后都没有东西可看。`generate-video`
+可以让你看着片段成形：每走完一步，它就取出模型此刻对成片的最佳估计，用一个**小型自编码器**
+（TAE）而不是真正的视频 VAE 解码，从 `generate-video` 的端口 2 送出。接在那里的 `preview`
+阶段会在网页界面里播放它，每段循环播放，直到下一步的预览替换它。
+
+**[`minimax-h3-text-to-video-preview.vpipeline`](pipelines/minimax-h3-text-to-video-preview.vpipeline)**
+就是加上了预览的文本生成视频图。它需要一个小文件，
+[`prepare-minimax-h3-preview.vpipeline`](pipelines/prepare-minimax-h3-preview.vpipeline)
+会下载它（23 MB）并注册为 `madebyollin/taeh3`：
+
+```sh
+cd ~/vpipe-work                                    # 同一个工作目录
+vpipe --launch ~/src/vpipe/docs/pipelines/prepare-minimax-h3-preview.vpipeline
+```
+
+这是 madebyollin 的 **`taeh3`**，为这个模型的潜空间训练。它发布在 GitHub 而不是
+Hugging Face 上，模型目录知道去哪里取。它解出的帧数与真正的 VAE 相同，动作也保留下来。
+**Kijai 的 `MiniMax-H3-TAE`** 也能用（`Kijai/MiniMax-H3-TAE`，10 MB，同样在目录里）。
+不过它是逐帧的静态图解码器，每个潜帧只出一帧，放慢播放以填满同样的时长。在同一段片子上，
+它与真正 VAE 的一致度也更低：23.3 dB，`taeh3` 是 25.3 dB。
+
+这些选项在 `minimax-h3-model-config` 上，和 H3 的其它设置放在一起：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `preview_vae` | *（空）* | TAE：一个已注册的模型（`madebyollin/taeh3`）、一个只含一个 `.safetensors` 的目录，或指向它的路径。留空即关闭预览。 |
+| `preview_every` | 1 | 每 *N* 步渲染一次；最后一步总会渲染。 |
+| `preview_max_edge` | 512 | 预览画面的最长边。TAE 总是以原尺寸解码，之后再把画面缩小。实测先缩小潜变量会让画面变糊，颜色也会偏。 |
+| `preview_frames` | 0 | 只预览前 *N* 帧；0 表示整段。这是让预览更省的那个选项。 |
+
+实测代价（M4 Pro）：
+
+- DiT 运行时（模型常驻，每步 8 秒），一段 39 帧、512 × 288 的预览约需 **0.5 秒**。
+- GPU 空闲时，完整的 90 帧、960 × 576 片段解码需 **2.1 秒**。
+- 解码不在生成线程上进行。下一次预览到期时如果上一次还在渲染，排队中的那段会被替换，
+  而不是排在后面，所以预览不会让生成等待。
+- 不过解码确实与去噪共用 GPU。**每一步**都预览，大约让去噪多花 **3%**：不预览 85 秒，
+  预览 87 秒和 88 秒（7 步，交替运行）。调大 `preview_every` 可以少花一些。
+- 最后一步的预览与真正 VAE 的解码结果一致度为 **30–32 dB**。
+
+端口 2 不接，或 `preview_vae` 留空，就什么都不加载、不解码。有两点要知道：
+
+- **只能接一个消费者。**没人读取的预览会被丢弃，而不是拖住生成，这种策略只支持一个消费者。
+- **`preview` 阶段会一直运行，直到你停止流水线。**它是实时画面，所以含有它的图在命令行下
+  不会自己结束。请在网页界面里使用它。
 
 <a id="more-than-text-in"></a>
 ### 输入不止文本

@@ -97,9 +97,12 @@ const PortSpec kIports[] = {
                             "(F32 or U8); RGBA is composited over a "
                             "checkerboard, since neither the still PNG nor "
                             "H.264 carries alpha. The first frame sets the "
-                            "native resolution",
+                            "native resolution. A rank-4 [F,C,H,W] beat is "
+                            "a CLIP (a generate-video denoise preview, or "
+                            "vae-decode's clip port): it is held and looped "
+                            "at its fps until the next beat replaces it",
    .type = &typeid(TensorBeatPayload),
-   .tags = "rgb-frames", .clock_group = 0},
+   .tags = "rgb-frames, rgb-clip", .clock_group = 0},
   {.name = "audio", .doc = "OPTIONAL audio PCM TensorBeat: F32 rank-1 [n] "
                            "(mono) or rank-2 [channels, n]. "
                            "sideband.sample_rate honoured.",
@@ -439,17 +442,8 @@ PreviewStage::convert_to_frame_(const TensorBeat& tb)
       tmp = tb.materialize_contiguous();
       src = tmp.data();
     }
-    for (int c = 0; c < 3; ++c) {
-      const int      plane = kGbrpPlaneForChannel[c];
-      uint8_t*       dst   = _gbrp->data[plane];
-      const int      ls    = _gbrp->linesize[plane];
-      const uint8_t* src_c = src + static_cast<size_t>(c) * H * W;
-      for (int y = 0; y < H; ++y) {
-        std::memcpy(dst + static_cast<size_t>(y) * ls,
-                    src_c + static_cast<size_t>(y) * W,
-                    static_cast<size_t>(W));
-      }
-    }
+    convert_u8_planar_(src);
+    return;
   } else if (tb.dtype == TensorBeat::DType::F32) {
     const float*         src = nullptr;
     AlignedVector<float> tmp;
@@ -478,6 +472,28 @@ PreviewStage::convert_to_frame_(const TensorBeat& tb)
     return;   // unsupported dtype: keep the previous frame
   }
 
+  _libs->swscale().api.scale(
+      _sws, _gbrp->data, _gbrp->linesize, 0, H,
+      _frame->data, _frame->linesize);
+}
+
+void
+PreviewStage::convert_u8_planar_(const uint8_t* src)
+{
+  const int W = _out_w;
+  const int H = _out_h;
+  if (!ensure_sws_(W, H)) { _fatal = true; return; }
+  for (int c = 0; c < 3; ++c) {
+    const int      plane = kGbrpPlaneForChannel[c];
+    uint8_t*       dst   = _gbrp->data[plane];
+    const int      ls    = _gbrp->linesize[plane];
+    const uint8_t* src_c = src + static_cast<size_t>(c) * H * W;
+    for (int y = 0; y < H; ++y) {
+      std::memcpy(dst + static_cast<size_t>(y) * ls,
+                  src_c + static_cast<size_t>(y) * W,
+                  static_cast<size_t>(W));
+    }
+  }
   _libs->swscale().api.scale(
       _sws, _gbrp->data, _gbrp->linesize, 0, H,
       _frame->data, _frame->linesize);
@@ -589,6 +605,116 @@ PreviewStage::handle_video_frame_(const TensorBeat& tb)
     if (ensure_rgb_(_out_w, _out_h)) { pack_rgb24_(tb); }
   }
   convert_to_frame_(tb);
+}
+
+// A whole clip: [F, C, H, W], C 3 or 4, U8 or F32. Held as planar U8 RGB
+// (composited once, here, when it carries alpha) and played from its
+// first frame; a clip at a resolution other than the adopted one is
+// dropped, as a frame would be.
+void
+PreviewStage::handle_clip_(const TensorBeat& tb)
+{
+  if (_fatal) { return; }
+  const int F = static_cast<int>(tb.shape[0]);
+  const int C = static_cast<int>(tb.shape[1]);
+  const int H = static_cast<int>(tb.shape[2]);
+  const int W = static_cast<int>(tb.shape[3]);
+  if (F <= 0 || H <= 0 || W <= 0) { return; }
+  if (tb.dtype != TensorBeat::DType::U8 &&
+      tb.dtype != TensorBeat::DType::F32) {
+    return;
+  }
+  if (!_have_frame) {
+    if (W != _out_w || H != _out_h) {
+      if (!build_pipeline_(W, H)) { _fatal = true; return; }
+    }
+    _have_frame = true;
+  } else if (W != _out_w || H != _out_h) {
+    return;
+  }
+  // Motion, whatever its rate: a clip is never a still.
+  _source_is_video = true;
+  if (_mode == Mode::Image) {
+    _mode               = Mode::Video;
+    _force_next_key     = true;
+    _frames_since_flush = 0;
+  }
+  adopt_fps_(tb);
+  if (tb.sideband.is_object()) {
+    // vae-decode's clip port carries its rate as a real `fps` only.
+    auto sb = tb.sideband.as_object();
+    if (!sb.contains("fps_num") && sb.contains("fps")) {
+      const double fps = sb.at("fps").as_real(0.0);
+      if (fps > 0.0) {
+        TensorBeat r;
+        r.sideband = FlexData::make_object();
+        r.sideband.as_object().insert_or_assign(
+            "fps_num", FlexData::make_uint(
+                static_cast<uint64_t>(llround(fps * 1000.0))));
+        r.sideband.as_object().insert_or_assign("fps_den",
+                                                FlexData::make_uint(1000));
+        adopt_fps_(r);
+      }
+    }
+  }
+
+  const size_t plane = static_cast<size_t>(H) * W;
+  const size_t per_in = static_cast<size_t>(C) * plane;
+  _clip.assign(static_cast<size_t>(F) * 3 * plane, 0);
+  const bool u8 = tb.dtype == TensorBeat::DType::U8;
+  AlignedVector<uint8_t> tmp8;
+  AlignedVector<float>   tmpf;
+  const uint8_t* src8 = nullptr;
+  const float*   srcf = nullptr;
+  if (u8) {
+    if (tb.is_contiguous() && tb.byte_size() == F * per_in) {
+      src8 = tb.as_u8();
+    } else {
+      tmp8 = tb.materialize_contiguous();
+      src8 = tmp8.data();
+    }
+  } else {
+    tmpf = tb.materialize_contiguous_as<float>();
+    srcf = tmpf.data();
+  }
+  const float scale = u8 ? 1.0f : (_input_normalized ? 255.0f : 1.0f);
+  for (int f = 0; f < F; ++f) {
+    uint8_t* dst = _clip.data() + static_cast<size_t>(f) * 3 * plane;
+    for (size_t i = 0; i < plane; ++i) {
+      auto at = [&](int c) {
+        const size_t k = static_cast<size_t>(f) * per_in + c * plane + i;
+        return u8 ? static_cast<float>(src8[k]) : srcf[k] * scale;
+      };
+      // Over the same checkerboard composite_rgba_ uses for a frame.
+      const float a01 = C == 4 ? at(3) / 255.0f : 1.0f;
+      const int x = static_cast<int>(i % static_cast<size_t>(W));
+      const int y = static_cast<int>(i / static_cast<size_t>(W));
+      const float bg = ((x / 8) + (y / 8)) % 2 == 0 ? 255.0f : 204.0f;
+      for (int c = 0; c < 3; ++c) {
+        dst[c * plane + i] = clamp_byte_(at(c) * a01 + bg * (1.0f - a01));
+      }
+    }
+  }
+  _clip_frames = F;
+  _clip_pos = 0;
+  if (++_clips_in == 1) {
+    session()->info(fmt(
+        "preview('{}'): looping a {}-frame clip at {}x{}, {} fps; each new "
+        "clip replaces it", this->id(), F, W, H,
+        _cadence_den ? _cadence_num / _cadence_den : 0));
+  } else {
+    session()->log_debug(fmt("preview('{}'): clip #{} ({} frames)",
+                             this->id(), _clips_in, F));
+  }
+}
+
+void
+PreviewStage::advance_clip_()
+{
+  const size_t per = static_cast<size_t>(3) * _out_h * _out_w;
+  if (_clip.size() < per * static_cast<size_t>(_clip_frames)) { return; }
+  convert_u8_planar_(_clip.data() + per * static_cast<size_t>(_clip_pos));
+  _clip_pos = (_clip_pos + 1) % _clip_frames;
 }
 
 bool
@@ -867,6 +993,11 @@ PreviewStage::reset_run_state()
   _have_rgb        = false;
   _png_bad         = false;
 
+  _clip.clear();
+  _clip_frames = 0;
+  _clip_pos    = 0;
+  _clips_in    = 0;
+
   _audio_seen = false;
   _audio_rate = 0;
   _audio_ch   = 0;
@@ -905,9 +1036,17 @@ PreviewStage::process(RuntimeContext& ctx)
       auto beat = co_await ctx.read(0);
       if (!beat) { break; }
       const auto* tb = dynamic_cast<const TensorBeatPayload*>(beat.get());
-      if (tb && tb->shape.size() == 3
+      if (tb && tb->shape.size() == 4
+          && (tb->shape[1] == 3 || tb->shape[1] == 4) && tb->shape[0] > 0) {
+        handle_clip_(*tb);
+        got_frame = true;
+      } else if (tb && tb->shape.size() == 3
           && (tb->shape[0] == 3 || tb->shape[0] == 4)) {
         ++_frames_in;
+        // A single frame ends a clip's loop: the source moved on.
+        _clip.clear();
+        _clip_frames = 0;
+        _clip_pos = 0;
         // Neither the still PNG nor H.264 carries alpha, so an RGBA
         // beat is flattened ONCE here rather than in both.
         if (tb->shape[0] == 4) {
@@ -972,6 +1111,7 @@ PreviewStage::process(RuntimeContext& ctx)
   if (_mode == Mode::Image) {
     if (entered_image || got_frame) { send_image_(); }
   } else {
+    if (_clip_frames > 0 && !_fatal) { advance_clip_(); }
     encode_tick_();
   }
 

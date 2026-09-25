@@ -1,7 +1,9 @@
 #include "stages/flux2-model-config-stage.h"
+#include "stages/latent-preview.h"
 #include "stages/model-registry.h"
 
 #include "common/flex-data.h"
+#include "common/vpipe-format.h"
 
 #include <string>
 #include <utility>
@@ -60,6 +62,19 @@ const ConfigKey kAttrs[] = {
           "`lora_scale` -- which is the point of a second slot: one "
           "adapter stays where it was trained while the other is swept. "
           "0 skips its two GEMMs", .def_real = 1.0},
+  // The live-preview keys every family's config source shares; see
+  // stages/latent-preview.h. FLUX.2's TAE is madebyollin's
+  // `taef2`, which reads the DiT's latent unpatchified and NOT
+  // un-normalized.
+  {.key = latent_preview::kVaeKey, .type = ConfigType::String,
+   .required = false, .doc = latent_preview::kVaeDoc,
+   .suggest_db = kModelRegistryDb,
+   // Typed, so the picker offers a TAE for THIS latent space only.
+   .suggest_db_type = "flux2-tae"},
+  {.key = latent_preview::kEveryKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kEveryDoc, .def_int = 1},
+  {.key = latent_preview::kMaxEdgeKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kMaxEdgeDoc, .def_int = 512},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -71,9 +86,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "FLUX.2 parameters as one FlexData object {model_family: flux2, "
-          "klein_kv, +lora, +lora2 and their scales}, for a "
-          "generate-image "
-          "model_config iport",
+          "klein_kv, +lora, +lora2 and their scales, +preview_vae and its "
+          "knobs}, for a generate-image model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -102,6 +116,15 @@ Flux2ModelConfigStage::Flux2ModelConfigStage(const SessionContextIntf* s,
                                                   std::move(config))
 {
   _klein_kv = attr_bool("klein_kv");
+  _preview.vae      = attr_str(latent_preview::kVaeKey);
+  _preview.every    = (int)attr_int(latent_preview::kEveryKey);
+  _preview.max_edge = (int)attr_int(latent_preview::kMaxEdgeKey);
+  if (_preview.every < 0 || _preview.max_edge < 0) {
+    fail_config(fmt(
+        "Flux2ModelConfigStage('{}'): preview_every and "
+        "preview_max_edge must be >= 0 (got {} / {})", this->id(),
+        _preview.every, _preview.max_edge));
+  }
   allocate_oports(spec().oports.size());
 }
 
@@ -128,6 +151,8 @@ Flux2ModelConfigStage::resolved_config() const
       if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
     }
   }
+  // Emitted only when a preview VAE is named, like the adapter keys.
+  _preview.emit(fd);
   return fd;
 }
 

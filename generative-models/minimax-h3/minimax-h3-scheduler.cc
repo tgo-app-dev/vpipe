@@ -119,6 +119,20 @@ MiniMaxH3Scheduler::step(const float* velocity, int step_index, float* x,
 }
 
 bool
+MiniMaxH3Scheduler::estimate_x0(const float* velocity, int step_index,
+                                const float* x, float* out,
+                                std::size_t n) const
+{
+  if (velocity == nullptr || x == nullptr || out == nullptr) { return false; }
+  if (step_index < 0 || step_index >= (int)_timesteps.size()) { return false; }
+  const float sigma_from_t = 1.0f - _timesteps[(std::size_t)step_index];
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = x[i] + sigma_from_t * velocity[i];
+  }
+  return true;
+}
+
+bool
 MiniMaxH3Scheduler::step_res(const float* velocity, int step_index, float* x,
                              std::size_t n,
                              std::vector<float>* prev_x0) const

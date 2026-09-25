@@ -1,7 +1,9 @@
 #include "stages/krea2-model-config-stage.h"
+#include "stages/latent-preview.h"
 #include "stages/model-registry.h"
 
 #include "common/flex-data.h"
+#include "common/vpipe-format.h"
 
 #include <string>
 #include <utility>
@@ -63,6 +65,20 @@ const ConfigKey kAttrs[] = {
   {.key = "vl_max_pixels", .type = ConfigType::Int, .required = false,
    .doc = "grounded encode: the image processor's upper bound. Unset => "
           "the tower default"},
+  // The live-preview keys every family's config source shares; see
+  // stages/latent-preview.h. Krea-2 decodes with the Qwen-Image VAE, whose
+  // encoder -- and so whose latent space -- is Wan 2.1's, which is what
+  // madebyollin's `taew2_1` was trained on.
+  {.key = latent_preview::kVaeKey, .type = ConfigType::String,
+   .required = false, .doc = latent_preview::kVaeDoc,
+   .suggest_db = kModelRegistryDb,
+   // Typed, so the picker offers a TAE for THIS latent space and nothing
+   // else; untyped, it would offer no supplement at all.
+   .suggest_db_type = "krea2-tae"},
+  {.key = latent_preview::kEveryKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kEveryDoc, .def_int = 1},
+  {.key = latent_preview::kMaxEdgeKey, .type = ConfigType::Int,
+   .required = false, .doc = latent_preview::kMaxEdgeDoc, .def_int = 512},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -74,11 +90,11 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "krea2 parameters as one FlexData object {model_family: krea2, "
-          "+vl_*, +lora, +lora2 and their scales}. The vl_* keys are "
-          "for a "
-          "diffusion-conditioner's model_config iport (the grounded "
-          "encode); the lora keys are for generate-image's. Wire it to "
-          "both -- each reads only what it owns",
+          "+vl_*, +lora, +lora2 and their scales, +preview_vae and its "
+          "knobs}. The vl_* keys are for a diffusion-conditioner's "
+          "model_config iport (the grounded encode); the lora and preview "
+          "keys are for generate-image's. Wire it to both -- each reads "
+          "only what it owns",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -107,6 +123,15 @@ Krea2ModelConfigStage::Krea2ModelConfigStage(
                                                   std::move(iports),
                                                   std::move(config))
 {
+  _preview.vae      = attr_str(latent_preview::kVaeKey);
+  _preview.every    = (int)attr_int(latent_preview::kEveryKey);
+  _preview.max_edge = (int)attr_int(latent_preview::kMaxEdgeKey);
+  if (_preview.every < 0 || _preview.max_edge < 0) {
+    fail_config(fmt(
+        "Krea2ModelConfigStage('{}'): preview_every and preview_max_edge "
+        "must be >= 0 (got {} / {})", this->id(), _preview.every,
+        _preview.max_edge));
+  }
   allocate_oports(spec().oports.size());
 }
 
@@ -133,6 +158,8 @@ Krea2ModelConfigStage::resolved_config() const
       if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
     }
   }
+  // Emitted only when a preview VAE is named, like the adapter keys.
+  _preview.emit(fd);
   return fd;
 }
 

@@ -3,6 +3,7 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/oport-policy.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -411,7 +412,23 @@ const PortSpec kOports[] = {
           "write it",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
+  // Its OWN clock: previews come several per clip, at the step rate, and
+  // a consumer of them is not on the latent's clock.
+  {.name = "preview",
+   .doc = "OPTIONAL live preview of the clip while it denoises: planar U8 "
+          "RGB [F, 3, H, W], one beat per rendered step, decoded by the "
+          "tiny autoencoder the family's config source names "
+          "(`preview_vae`). Feed a `preview` stage, which loops each clip "
+          "until the next. Push-style (DropOldest, one consumer): a preview "
+          "nobody reads is dropped, never waited for. Unwired, nothing is "
+          "decoded",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-clip", .clock_group = 1},
 };
+[[maybe_unused]] constexpr unsigned kPreviewPort = 2;
+// Deep enough that the preview stage's tick can pick one up, shallow
+// enough that a clip-sized beat nobody reads is not hoarded.
+constexpr unsigned kPreviewDepth = 2;
 const StageSpec kSpec = {
   .type_name = "generate-video",
   .doc       = "Video DiT denoiser: conditioning (+ optional keyframe or "
@@ -599,6 +616,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _scheduler_spec.num_train = 1000;
 #endif
   allocate_oports(spec().oports.size());
+  set_oport_policy(kPreviewPort, {kPreviewDepth, OverrunPolicy::DropOldest});
 }
 
 GenerateVideoStage::~GenerateVideoStage() = default;
@@ -814,6 +832,27 @@ GenerateVideoStage::vdn_dir_() const
   return std::string(o.at("linear_branch").as_string(""));
 }
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+std::vector<ResourceClaim>
+GenerateVideoStage::preview_claims_(int w, int h, int frames) const
+{
+  // Only a family that can render previews books them: MiniMax-H3, and a
+  // registered family, which hands its clean estimate back through the
+  // request's output seam. A preview VAE on a Wan config would be claimed
+  // and never loaded.
+  const std::string fam = model_config::family_of(_model_cfg);
+  if (fam != "minimax-h3" &&
+      genai::VideoModelRegistry::get().find(fam) == nullptr) {
+    return {};
+  }
+  return latent_preview_claims(
+      session(), this->id(), LatentPreviewSpec::from_model_config(_model_cfg),
+      fam == "minimax-h3" ? genai::MetalTaeDecoder::Trim::kH3Chunks
+                          : genai::MetalTaeDecoder::Trim::kLeading,
+      w, h, frames);
+}
+#endif
+
 std::string
 GenerateVideoStage::ane_claim_label_() const
 {
@@ -1014,6 +1053,9 @@ GenerateVideoStage::declare_resources() const
                model_memory::kPhaseDecodeAudio, model_memory::kPhaseDecode)) {
         arena.push_back(std::move(c));
       }
+    }
+    for (auto& c : preview_claims_(aw, ah, af)) {
+      arena.push_back(std::move(c));
     }
   }
 
@@ -1256,12 +1298,55 @@ GenerateVideoStage::reset_run_state()
   _scheduler_latched = false;
   _cfg_latched = false;
   _model_cfg = FlexData{};
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // The preview keys were PARSED out of the beat reset above; a relaunch
+  // whose graph no longer names a preview VAE must not inherit one.
+  if (_preview) {
+    _preview->configure(LatentPreviewSpec{},
+                        genai::MetalTaeDecoder::Trim::kLeading);
+  }
+#endif
 }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 using metal_compute::MetalCompute;
 using metal_compute::SharedBuffer;
+
+namespace {
+
+// MiniMax-H3's GENERATED video rows -- [n_rows, ZC * ph * pw] in packed
+// order, one (1, ph, pw) cell of every channel per row -- back to a
+// [ZC, lt, lh, lw] latent grid. The final latent and every preview go
+// through this one function, so a preview cannot be laid out differently
+// from the clip it previews.
+void
+unpatchify_h3_rows_(const float* rows, int n_rows, int ZC, int lt, int lh,
+                    int lw, int ph, int pw, std::vector<float>* out)
+{
+  const int gh = lh / ph, gw = lw / pw;
+  const std::size_t PE = (std::size_t)ZC * ph * pw;
+  const std::size_t plane = (std::size_t)lh * lw;
+  out->assign((std::size_t)ZC * lt * plane, 0.0f);
+  for (int r = 0; r < n_rows; ++r) {
+    const float* row = rows + (std::size_t)r * PE;
+    const int cell = r % (gh * gw);
+    const int t    = r / (gh * gw);
+    if (t >= lt) { break; }
+    const int by   = (cell / gw) * ph, bx = (cell % gw) * pw;
+    for (int ch = 0; ch < ZC; ++ch) {
+      for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+          (*out)[(std::size_t)ch * lt * plane + (std::size_t)t * plane +
+                 (std::size_t)(by + y) * lw + (bx + x)] =
+              row[((std::size_t)ch * ph + y) * pw + x];
+        }
+      }
+    }
+  }
+}
+
+}  // namespace
 
 void
 GenerateVideoStage::resolve_config_()
@@ -1440,6 +1525,19 @@ GenerateVideoStage::apply_model_config_()
         this->id(), want, _family));
     return;
   }
+  // The preview keys are the same on every family's config source and
+  // the port is this stage's, so they are read here, beside -- not by --
+  // the family's parser; a plugin family's beat carries them too. Only
+  // the temporal rule is the family's, and every published TAEHV but
+  // H3's trims the LEADING frames.
+  if (!_preview) {
+    _preview = std::make_unique<LatentPreviewer>(session(),
+                                                 std::string(this->id()));
+  }
+  _preview->configure(LatentPreviewSpec::from_model_config(_model_cfg),
+                      _family == "minimax-h3"
+                          ? genai::MetalTaeDecoder::Trim::kH3Chunks
+                          : genai::MetalTaeDecoder::Trim::kLeading);
   // A plugin family parses its own beat, at generate time, from the
   // request -- which is the whole point of passing it down UNREAD: a
   // knob the family adds later needs no change here. So there is
@@ -1675,6 +1773,37 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   // an empty std::function throws -- which on this path is a family
   // taking the host down for asking a question the answer to is "no".
   req.input = [](std::string_view, genai::NamedTensor*) { return false; };
+  // The output seam, ALWAYS installed for the same reason. The one name
+  // this stage takes is a live preview's clean estimate, and only on a
+  // step the previewer renders -- so a family that asks first builds
+  // nothing for a preview nobody is watching.
+  const bool previewing = _preview && _preview->active();
+  req.output_wanted = [this, previewing](std::string_view name, int step,
+                                         int total) {
+    return previewing && name == genai::kOutputPreviewX0 &&
+           _preview->due(step, total);
+  };
+  req.output = [this, previewing](std::string_view name, int step,
+                                  int total, const genai::NamedTensor& t) {
+    if (!previewing || name != genai::kOutputPreviewX0) { return; }
+    // Shaped like the result latent, f32 -- or refused out loud, once:
+    // a family that got the contract wrong would otherwise preview
+    // nothing and never learn why.
+    if (t.data == nullptr || t.shape.size() != 4 || t.elem_size != 4 ||
+        t.elems() == 0) {
+      if (!_preview_shape_said) {
+        _preview_shape_said = true;
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): family '{}' handed back a '{}' that "
+            "is not an f32 [z, T, h, w] latent; no previews from it",
+            this->id(), _family, genai::kOutputPreviewX0));
+      }
+      return;
+    }
+    const float* p = static_cast<const float*>(t.data);
+    _preview->submit(std::vector<float>(p, p + t.elems()), t.shape[0],
+                     t.shape[1], t.shape[2], t.shape[3], step, total);
+  };
   try {
     const bool ok = _plugin_gen->generate(req, out);
     bar.finish();
@@ -2977,6 +3106,22 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     prog.end_step(step - 1);
     return true;
   };
+  // Live previews, when process() opened a preview for this clip. The
+  // loop hands over the generated rows' clean estimate; it is laid out
+  // as the final latent is and queued for the preview thread, so the
+  // next step starts without waiting on the decode.
+  if (_preview && _preview->active()) {
+    req.preview_due = [this](int step, int total) {
+      return _preview->due(step, total);
+    };
+    req.preview = [&, this](int step, int total, const float* x0) {
+      std::vector<float> lat;
+      unpatchify_h3_rows_(x0, L.num_video_rows, c.video_channels, lt, lh,
+                          lw, c.patch_h, c.patch_w, &lat);
+      _preview->submit(std::move(lat), c.video_channels, lt, lh, lw, step,
+                       total);
+    };
+  }
   std::string derr;
   const bool ok = genai::denoise(req, &derr);
   bar.finish();
@@ -3007,27 +3152,10 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // conditioning rows lead the block, so the generated ones start at
   // num_condition_rows.
   const int ZC = c.video_channels;
-  const int ph = c.patch_h, pw = c.patch_w;
-  const int gh = lh / ph, gw = lw / pw;
-  video_out->assign((std::size_t)ZC * lt * lh * lw, 0.0f);
+  unpatchify_h3_rows_(vid.data() + (std::size_t)L.num_condition_rows * PE,
+                      L.num_video_rows, ZC, lt, lh, lw, c.patch_h,
+                      c.patch_w, video_out);
   *video_shape = {ZC, lt, lh, lw};
-  const std::size_t plane = (std::size_t)lh * lw;
-  for (int r = 0; r < L.num_video_rows; ++r) {
-    const float* row = vid.data() +
-                       ((std::size_t)L.num_condition_rows + r) * PE;
-    const int cell = r % (gh * gw);
-    const int t    = r / (gh * gw);
-    const int by   = (cell / gw) * ph, bx = (cell % gw) * pw;
-    for (int ch = 0; ch < ZC; ++ch) {
-      for (int y = 0; y < ph; ++y) {
-        for (int x = 0; x < pw; ++x) {
-          (*video_out)[(std::size_t)ch * lt * plane + (std::size_t)t * plane +
-                       (std::size_t)(by + y) * lw + (bx + x)] =
-              row[((std::size_t)ch * ph + y) * pw + x];
-        }
-      }
-    }
-  }
   // Diagnostic: the FINAL video latent, [z, T, lh, lw] f32, so it can be
   // compared cell-by-cell against the reference's. Spatial coherence is
   // a property of the LATENT, so this settles "is the tile grid already
@@ -3201,6 +3329,11 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   // ---- a plugin family: it owns the whole generation ------------------
   if (_plugin_family != nullptr && _plugin_gen) {
     genai::VideoGenResult res;
+    // Previews for THIS clip, as for the built-in families: the family
+    // hands its clean estimate back through the request's output seam
+    // and the render happens here, off its thread.
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         _fps, _frames);
     if (!run_plugin_family_(ctx, cond->data.data(), (int)cond->shape[0],
                             (int)cond->shape[1], &cond->sideband,
                             neg ? neg->data.data() : nullptr,
@@ -3245,6 +3378,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       // clip.
       _plugin_gen->release_idle();
       _plugin_gen.reset();
+      preview_scope.release = true;
       if (auto* mgr = session()->services()->generative_model_manager()) {
         if (!_dit_dir_declared_.empty()) {
           // `auto` DROPS here too. It only unloads once it has judged the
@@ -3470,6 +3604,13 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // captured past this generation -- the lambda holds a reference.
     auto stopping = [&ctx]() { return ctx.stop_requested(); };
     if (_h3_dit) { _h3_dit->set_stream_stop(stopping); }
+    // Previews for THIS clip, on oport2. Ended when this block is left --
+    // after the latents are written on the ordinary path, so the last
+    // step's preview renders while vae-decode is already working -- and
+    // on every early return too. begin() declines, loading nothing, when
+    // the port is unwired or the config names no preview VAE.
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         _fps, _frames);
     const bool ok_h3 =
         run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
                 have_r2v ? &r2v : nullptr,
@@ -3513,6 +3654,10 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       // model on every schedule -- it is dropped rather than kept, so
       // the reload is real and visible either way.
       _h3_dit.reset();
+      // The preview TAE goes with it, once its last render is out: small
+      // weights, but its decode scratch is what an idle stage should not
+      // keep.
+      preview_scope.release = true;
       if (auto* mgr = session()->services()->generative_model_manager()) {
         if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
           mgr->drop_weights(_dit_dir_declared_);

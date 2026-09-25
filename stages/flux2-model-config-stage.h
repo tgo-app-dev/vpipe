@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_FLUX2_MODEL_CONFIG_STAGE_H
 #define VPIPE_STAGES_FLUX2_MODEL_CONFIG_STAGE_H
 
+#include "stages/latent-preview.h"
 #include "stages/model-config-source.h"
 
 #include <string>
@@ -47,6 +48,9 @@ public:
 
 private:
   bool _klein_kv = false;
+  // The live-preview keys (preview_vae / _every / _max_edge). No
+  // `preview_frames`: a picture is one frame.
+  LatentPreviewSpec _preview;
 };
 
 }  // namespace vpipe

@@ -328,6 +328,45 @@ look like a hang.
 Ship the family's knobs as a `ModelConfigSourceStage` (above), not as keys
 on `generate-video`.
 
+### Live previews
+
+`generate-video` can stream a **live preview** of the clip while it
+denoises (its `preview` oport, played by a `preview` stage). The host
+decodes each preview with a tiny autoencoder (TAE) and handles the port,
+the pacing, the memory booking and the dropping. Because your family owns
+the denoise loop, one thing is left to you: handing back the model's
+**clean estimate**, through the request's named-output seam:
+
+```cpp
+// after step `s` of `total`, before the scheduler overwrites the state
+if (req.output_wanted(vpipe::genai::kOutputPreviewX0, s, total)) {
+  // x0, not the noisy state: the model's current guess at the clip, in
+  // the SAME space, layout and shape as VideoGenResult::video [z, T, h, w]
+  vpipe::genai::NamedTensor t;
+  t.data = x0.data(); t.shape = {z, T, h, w}; t.elem_size = 4;
+  req.output(vpipe::genai::kOutputPreviewX0, s, total, t);
+}
+```
+
+**Ask before you build.** Unpacking a clip-sized latent every step for a
+host that renders every eighth wastes work. The host always installs both
+calls, so you never null-check them. A test of yours that builds its own
+`VideoGenRequest` has to install them too, as the host does; an empty
+`std::function` throws when called. The tensor is borrowed for the call.
+
+Your config source declares the four preview keys: `preview_vae`,
+`preview_every`, `preview_max_edge` and `preview_frames`. Use the NAMES
+and doc strings from `stages/latent-preview.h`, and emit them into your
+beat. Use the names, not the `LatentPreviewSpec` struct: the key names are
+the contract, while the struct's layout is not ABI and can change. The
+TAE a user names must be trained for your latent space; madebyollin's
+`taeltx_2` and `taew2_1` are examples. The host decodes every TAEHV with
+the leading-frame trim (T latent frames give `t_upscale * T - t_upscale +
+1` frames), which is every published one but MiniMax-H3's.
+
+A family that never calls `output` works as before, and its preview port
+simply stays silent.
+
 ### Where new things go, and why they do not go in a field
 
 The ABI is a strict-equality cookie, so anything that moves a layout
@@ -339,6 +378,7 @@ thing that moved. Four places used to grow that way and no longer do:
 | an acceleration tier | the `accel` bag | a field on the request |
 | a per-family fact the host needs | a **family profile** domain | a switch in the host |
 | a new generation INPUT with a shape | `req.input("name", &t)` | a field on the request |
+| a tensor handed back MID-generation | `req.output("name", step, total, t)`, asked first with `req.output_wanted` | a callback field on the request |
 | a scalar the host states | `req.extras` | a field on the request |
 | something a family wants said back | `result.sideband` | a field on the result |
 | a new packaging fact | `ModelCatalogEntry::extra` | a field on the entry |
@@ -771,7 +811,12 @@ not interpret it, so what your conditioner emitted is what your DiT
 reads. `req.accel` is the same acceleration bag described above.
 `req.step_latent`, when non-null, streams each step's latent to a
 downstream preview; a family that cannot produce an intermediate simply
-never calls it.
+never calls it. The request also carries the named-output seam described
+under [Live previews](#live-previews), `req.output_wanted` /
+`req.output`. `generate-image` takes `preview_x0` through it exactly as
+`generate-video` does: your latent, shaped like `ImageGenResult::latent`
+(`[z, h, w]`), is decoded as one latent frame by the TAE your config
+source names. That is the same path Krea-2's built-in previews take.
 
 The registry is consulted **before** the built-in `flux2` / `krea2` /
 `qwen-image-edit` / `qwen-image-21` / `boogu-image` / `z-image` /
@@ -942,6 +987,15 @@ same invocation just registered.
 
 **Pin `files`.** Most modern video repos publish several precisions in one
 repo; fetching the whole thing pulls packings this build cannot read.
+
+**Weights that are not on the Hub.** Some weights live only in a code
+repository; madebyollin's TAEs are in GitHub `safetensors/` folders, for
+example. For those, set the `url_files` key in the entry's `extra` bag:
+`e.extra = vpipe::catalog_url_files_extra({{url, "file.safetensors"}});`,
+and list the same file in `files`. `model-fetch` downloads each URL as-is
+into the entry's directory and registers it as an ordinary model. `hf_path`
+is then only the registry key and directory name. This is a packaging fact
+in the bag, not a field, so it cost no ABI bump.
 
 **Mirrors.** `hf_path` is a HuggingFace coordinate, and it stays the entry's
 identity — the registry key and the on-disk directory come from it whichever
