@@ -55,6 +55,7 @@ ComputeEncoder::ComputeEncoder(ComputeEncoder&& o) noexcept
     _since_split(std::exchange(o._since_split, 0)),
     _scope_depth(std::exchange(o._scope_depth, 0)),
     _state_dirty(std::exchange(o._state_dirty, false)),
+    _fn_bad(std::exchange(o._fn_bad, false)),
     _pending(std::move(o._pending)),
     _pending_bytes(std::move(o._pending_bytes)),
     _pending_pso(std::exchange(o._pending_pso, nullptr)),
@@ -77,6 +78,7 @@ ComputeEncoder::operator=(ComputeEncoder&& o) noexcept
   _since_split   = std::exchange(o._since_split, 0);
   _scope_depth   = std::exchange(o._scope_depth, 0);
   _state_dirty   = std::exchange(o._state_dirty, false);
+  _fn_bad        = std::exchange(o._fn_bad, false);
   _pending       = std::move(o._pending);
   _pending_bytes = std::move(o._pending_bytes);
   _pending_pso   = std::exchange(o._pending_pso, nullptr);
@@ -182,9 +184,24 @@ ComputeEncoder::end()
 void
 ComputeEncoder::set_function(const ComputeFunction& fn)
 {
-  if (_enc == nullptr || !fn.valid()) {
+  if (_enc == nullptr) {
     return;
   }
+  // AN INVALID FUNCTION POISONS THE NEXT DISPATCH rather than falling
+  // through it. Returning here leaves the PREVIOUS op's pipeline state
+  // bound, and dispatch() does not know a function was ever asked for
+  // -- so a mis-spelt entry point does not read as a missing kernel,
+  // it reads as the last kernel run again over this op's buffers,
+  // constants and grid. That is how one wrong name in a model loader
+  // became a GPU hang (z-image w4) and a blank picture (qwen-image-2.1
+  // w4) instead of a load-time refusal. The dispatch is skipped and
+  // the stream's failure latch records it, so the caller's wait_ok()
+  // says so.
+  if (!fn.valid()) {
+    _fn_bad = true;
+    return;
+  }
+  _fn_bad = false;
   // Auto command-buffer split: at an OP BOUNDARY (set_function starts a new op),
   // once _split_every dispatches have accumulated, commit the current buffer +
   // reopen a fresh one, so the CPU-encode of the next chunk pipelines against
@@ -396,6 +413,17 @@ ComputeEncoder::dispatch(LaunchDims threads_per_grid,
                          LaunchDims threads_per_threadgroup)
 {
   if (_enc == nullptr) {
+    return;
+  }
+  if (_fn_bad) {
+    // Nothing is encoded: see set_function. Latched, not merely
+    // skipped -- a dispatch that quietly does nothing is a wrong
+    // answer, and this one is unrecoverable by definition.
+    if (_stream != nullptr) {
+      _stream->note_encode_failure_(
+          "a dispatch was encoded with no valid kernel bound (the "
+          "requested Metal function did not resolve)");
+    }
     return;
   }
   ++_n_dispatch;

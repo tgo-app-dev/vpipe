@@ -684,19 +684,29 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_rms = m->_lib_rms.function("rms_norm_fast_f16");
   m->_fn_tr_rope = m->_lib_rope.function("transpose_rope_pair_ftab_f16");
-  m->_fn_dequant4 = m->_lib_dequant.function("affine_dequant4_bf16");
-  m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant8_bf16");
+  // THE QUANTIZED ENTRY POINTS ARE NAMED BY THEIR GROUP, and the group
+  // is read off the checkpoint above -- `affine_qmm_steel_w4g64`, not a
+  // `_f16` suffix (that suffix belongs to the kernels whose MSL name
+  // carries it, e.g. dense_gemm_t_f16; these do not). Both bit widths,
+  // because a mixed pack holds both. Only loaded for a quantized
+  // checkpoint, so a dense one cannot be refused for their absence.
+  if (m->_quant_bits > 0) {
+    const std::string g = "g" + std::to_string(m->_quant_group);
+    m->_fn_dequant4 = m->_lib_dequant.function("affine_dequant_w4" + g);
+    m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8" + g);
+    m->_fn_qmm4 = m->_lib_qmm.function("affine_qmm_steel_w4" + g);
+    m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8" + g);
+  }
   m->_fn_gemm_mma = m->_lib_mma.function("dense_gemm_mma_t_n128_f16");
   m->_fn_gemm_mma_deep =
       m->_lib_mma.function("dense_gemm_mma_t_n128x256_f16");
   m->_fn_gemm_mma_tn2 =
       m->_lib_mma.function("dense_gemm_mma_t_n128x256_tn2_f16");
-  m->_fn_qmm = m->_lib_qmm.function(
-      m->_quant_bits == 8 ? "affine_qmm_steel_w8g64_f16"
-                          : "affine_qmm_steel_w4g64_f16");
 
-  // VALIDATE. An unvalidated ComputeFunction dispatches as a silent
-  // no-op, which in a 34-block stack is a picture, not a failure.
+  // VALIDATE. An unvalidated ComputeFunction encodes NOTHING and poisons
+  // its dispatch, which in a 34-block stack is a picture, not a failure --
+  // and before ComputeEncoder was taught to refuse it, it was worse than
+  // that: the previous op's kernel ran again in its place.
   if (!m->_fn_gemm_t.valid() || !m->_fn_ln_plain.valid() ||
       !m->_fn_adaln.valid() || !m->_fn_gated_tanh.valid() ||
       !m->_fn_swiglu.valid() || !m->_fn_rms.valid() ||
@@ -706,6 +716,22 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
     if (mc->session() != nullptr) {
       mc->session()->error(fmt("MetalZImageTransformer: a required kernel "
                                "did not build"));
+    }
+    return nullptr;
+  }
+  // A QUANTIZED CHECKPOINT WHOSE GEMM DID NOT LOAD IS A REFUSAL, not a
+  // degraded run. `set_function` on an invalid handle leaves the
+  // PREVIOUS kernel bound and the dispatch that follows runs THAT one
+  // over 4-bit codes -- which is how a mis-spelt entry point surfaced
+  // as a GPU hang rather than as a wrong picture. Nothing downstream
+  // can recover from it, so say which group failed and stop.
+  if (m->_quant_bits > 0 &&
+      (!m->_fn_qmm4.valid() || !m->_fn_qmm8.valid())) {
+    if (mc->session() != nullptr) {
+      mc->session()->error(fmt(
+          "MetalZImageTransformer: no quantized GEMM for group {} -- this "
+          "checkpoint cannot be run (re-quantize at group 64)",
+          m->_quant_group));
     }
     return nullptr;
   }
@@ -1145,7 +1171,7 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       lora_after();
       return;
     }
-    enc.set_function(_fn_qmm);
+    enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
     enc.set_buffer(0, w.codes); enc.set_buffer(1, w.scales);
     enc.set_buffer(2, w.qbias); enc.set_buffer(3, x, xe * 2);
     enc.set_buffer(4, y, ye * 2);

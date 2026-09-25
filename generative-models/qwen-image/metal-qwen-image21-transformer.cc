@@ -611,19 +611,30 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
   // pipeline state at all -- it fails inside Metal's validator rather
   // than coming back invalid. They are built per forward, with the
   // alignment constants the geometry decides.
-  m->_fn_dequant4 = m->_lib_dequant.function("affine_dequant4_bf16");
-  m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant8_bf16");
+
+  // THE QUANTIZED ENTRY POINTS ARE NAMED BY THEIR GROUP, and the group
+  // is read off the checkpoint above -- `affine_qmm_steel_w4g64`, not a
+  // `_f16` suffix (that suffix belongs to the kernels whose MSL name
+  // carries it, e.g. dense_gemm_t_f16; these do not). Both bit widths,
+  // because a mixed pack holds both. Only loaded for a quantized
+  // checkpoint, so a dense one cannot be refused for their absence.
+  if (m->_quant_bits > 0) {
+    const std::string g = "g" + std::to_string(m->_quant_group);
+    m->_fn_dequant4 = m->_lib_dequant.function("affine_dequant_w4" + g);
+    m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8" + g);
+    m->_fn_qmm4 = m->_lib_qmm.function("affine_qmm_steel_w4" + g);
+    m->_fn_qmm8 = m->_lib_qmm.function("affine_qmm_steel_w8" + g);
+  }
   m->_fn_gemm_mma = m->_lib_mma.function("dense_gemm_mma_t_n128_f16");
   m->_fn_gemm_mma_deep =
       m->_lib_mma.function("dense_gemm_mma_t_n128x256_f16");
   m->_fn_gemm_mma_tn2 =
       m->_lib_mma.function("dense_gemm_mma_t_n128x256_tn2_f16");
-  m->_fn_qmm = m->_lib_qmm.function(
-      m->_quant_bits == 8 ? "affine_qmm_steel_w8g64_f16"
-                          : "affine_qmm_steel_w4g64_f16");
 
-  // VALIDATE. An unvalidated ComputeFunction dispatches as a silent
-  // no-op, which in a 32-block stack is a picture, not a failure.
+  // VALIDATE. An unvalidated ComputeFunction encodes NOTHING and poisons
+  // its dispatch, which in a 32-block stack is a picture, not a failure --
+  // and before ComputeEncoder was taught to refuse it, it was worse than
+  // that: the previous op's kernel ran again in its place.
   if (!m->_fn_gemm_t.valid() || !m->_fn_ln_mod.valid() ||
       !m->_fn_gated_tanh.valid() || !m->_fn_swiglu.valid() ||
       !m->_fn_rms.valid() || !m->_fn_tr_rope.valid() ||
@@ -633,6 +644,22 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
     if (mc->session() != nullptr) {
       mc->session()->error(fmt("MetalQwenImage21Transformer: a required "
                                "kernel did not build"));
+    }
+    return nullptr;
+  }
+  // A QUANTIZED CHECKPOINT WHOSE GEMM DID NOT LOAD IS A REFUSAL, not a
+  // degraded run. `set_function` on an invalid handle leaves the
+  // PREVIOUS kernel bound and the dispatch that follows runs THAT one
+  // over 4-bit codes, so a mis-spelt entry point does not read as a
+  // missing kernel at all -- on this family it read as a picture with
+  // no alpha, three times faster than bf16.
+  if (m->_quant_bits > 0 &&
+      (!m->_fn_qmm4.valid() || !m->_fn_qmm8.valid())) {
+    if (mc->session() != nullptr) {
+      mc->session()->error(fmt(
+          "MetalQwenImage21Transformer: no quantized GEMM for group {} -- "
+          "this checkpoint cannot be run (re-quantize at group 64)",
+          m->_quant_group));
     }
     return nullptr;
   }
@@ -1085,7 +1112,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
                     (unsigned)(((M + bm - 1) / bm) * 2), 2}, {32, 2, 2});
       return;
     }
-    enc.set_function(_fn_qmm);
+    enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
     enc.set_buffer(0, w.codes); enc.set_buffer(1, w.scales);
     enc.set_buffer(2, w.qbias); enc.set_buffer(3, x, xe * 2);
     enc.set_buffer(4, y, ye * 2);

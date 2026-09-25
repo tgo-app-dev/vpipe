@@ -52,6 +52,12 @@ public:
   ComputeEncoder
   begin_compute(DispatchType dispatch_type = DispatchType::Serial);
 
+  // Internal (called by ComputeEncoder::dispatch when an op reached it
+  // with no valid kernel bound): latch `why` so the Fence the caller
+  // waits on reports it. Same latch the fire-and-forget commits use --
+  // see Failure. First failure wins.
+  void note_encode_failure_(const char* why);
+
   // Internal (called by ComputeEncoder::dispatch for the auto command-buffer
   // split): commit the current command buffer fire-and-forget and reopen a
   // fresh one, retargeting `enc` at it (same dispatch type). Not for direct
@@ -190,6 +196,7 @@ public:
 
 private:
   friend class MetalCompute;
+  friend class ComputeEncoder;
   explicit CommandStream(MTL::CommandQueue* queue) noexcept;
 
   // Open the lazy command buffer if none is in flight, returning

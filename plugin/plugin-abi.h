@@ -83,7 +83,19 @@
 // params key, a new binding name, a new info() field are all additions an
 // old plugin never asks for. Tier itself is one pointer with out-of-line
 // methods, so its layout is not compiled into anything.
-#define VPIPE_PLUGIN_ABI_VERSION 5u
+// SIX: lora::Factors grew two fields (generative-models/shared/runtime-lora.h,
+// f9e7451) and was NOT bumped for, which is what this line exists to prevent.
+// `parts` and `group` were appended to an existing struct the host FILLS IN
+// THROUGH A CALLER'S POINTER -- lora::Stack::bind(module, n, k, Factors* out)
+// -- so a plugin compiled against the five-field version passes a smaller
+// object and the host writes past its end. Not a misread: an overwrite of
+// whatever the plugin had after it. The same commit did it again in
+// shared/ane-ffn.h. The struct's own comment states the hazard exactly ("EVERY
+// consumer of a Factors has to know this form -- a kernel that reads `b` as
+// [n, rank] reads past a banded B") and the bump was still missed, which is
+// the point: knowing a change is dangerous and remembering that danger is
+// spelled as a number here are two different things.
+#define VPIPE_PLUGIN_ABI_VERSION 6u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively
 // without breaking the three-symbol contract.

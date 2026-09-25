@@ -1583,3 +1583,266 @@ TEST(z_image_dit, ane_tiers_rows_are_right)
   // base model.
   EXPECT_TRUE(r_lora < 0.06);
 }
+
+
+// ---- the quantized forward ------------------------------------------
+//
+// THE BUG THIS PINS. The loader asked its metallib for
+// `affine_qmm_steel_w4g64_f16` and `affine_dequant4_bf16`. Neither name
+// exists -- the entry points are `affine_qmm_steel_w4g64` and
+// `affine_dequant_w4g64`, and the `_f16` suffix belongs to the kernels
+// whose MSL name carries it (dense_gemm_t_f16), not to these. So every
+// quantized GEMM in the model reached `set_function` with an invalid
+// handle, which left the PREVIOUS op's pipeline bound and dispatched
+// THAT kernel over 4-bit codes. The published w4 checkpoint hung the
+// GPU at every geometry tried, from 384^2 up, while bf16 was fine and
+// quantize reported success with no warnings.
+//
+// WHAT MAKES IT A TEST AND NOT A GLANCE: nothing above the metallib
+// knows the difference. The names are strings, the lookup returns an
+// invalid handle rather than failing, and the load, the block count,
+// the declared floor and the progress line are all exactly what a
+// working w4 run prints. The only thing that tells them apart is
+// running one.
+//
+// It builds its own checkpoint rather than reading an env var, because
+// a test that skips without a model is what let this ship: the w4 path
+// had no coverage at all. Three blocks at the PUBLISHED widths' shape
+// (head_dim 128, ffn = int(dim/3*8), adaLN K = 256) so every K the
+// quantizer sees divides the group, at dim 384 so the whole thing is
+// ~14 MB.
+namespace {
+
+struct TinyZi {
+  bool ok = false;
+  std::filesystem::path dir;
+  MetalZImageTransformer::Config cfg;
+};
+
+// Deterministic, zero-mean, and DIFFERENT per tensor -- a constant
+// fill quantizes exactly and would pass the comparison below however
+// the codes were read.
+std::vector<std::uint16_t>
+zi_fill_(std::size_t n, std::uint32_t seed, float amp)
+{
+  std::vector<std::uint16_t> v(n);
+  std::uint32_t s = seed * 2654435761u + 1u;
+  for (std::size_t i = 0; i < n; ++i) {
+    s = s * 1664525u + 1013904223u;
+    const float f = amp * (((float)((s >> 8) & 0xffffu) / 32768.0f) - 1.0f);
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const std::uint32_t r = (u >> 16) & 1u;
+    v[i] = (std::uint16_t)((u + 0x7fffu + r) >> 16);
+  }
+  return v;
+}
+
+TinyZi
+write_tiny_zimage_(const std::filesystem::path& dir)
+{
+  TinyZi t;
+  t.dir = dir;
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  MetalZImageTransformer::Config& c = t.cfg;
+  c.hidden = 384; c.n_heads = 3; c.head_dim = 128;
+  c.n_layers = 1; c.n_refiner = 1;
+  c.in_channels = 16; c.patch = 2; c.f_patch = 1;
+  c.ffn_inner = (int)((double)c.hidden / 3.0 * 8.0);   // 1024
+  c.cap_dim = 128;
+  const int H = c.hidden, FFI = c.ffn_inner, AD = c.adaln_dim;
+  const int PD = c.patch_dim();
+
+  std::vector<std::pair<std::string, std::vector<std::int64_t>>> ts;
+  std::vector<std::vector<std::uint16_t>> data;
+  std::uint32_t seed = 1;
+  auto put = [&](const std::string& nm, std::vector<std::int64_t> shape,
+                 float amp) {
+    std::size_t n = 1;
+    for (std::int64_t d : shape) { n *= (std::size_t)d; }
+    ts.emplace_back(nm, std::move(shape));
+    data.push_back(zi_fill_(n, seed++, amp));
+  };
+  auto ones = [&](const std::string& nm, int n) {
+    ts.emplace_back(nm, std::vector<std::int64_t>{n});
+    // bf16 1.0
+    data.push_back(std::vector<std::uint16_t>((std::size_t)n, 0x3f80));
+  };
+  auto block = [&](const std::string& p, bool with_ada) {
+    for (const char* nm : {"attention.to_q", "attention.to_k",
+                           "attention.to_v", "attention.to_out.0"}) {
+      put(p + nm + ".weight", {H, H}, 0.05f);
+    }
+    ones(p + "attention.norm_q.weight", c.head_dim);
+    ones(p + "attention.norm_k.weight", c.head_dim);
+    put(p + "feed_forward.w1.weight", {FFI, H}, 0.05f);
+    put(p + "feed_forward.w3.weight", {FFI, H}, 0.05f);
+    put(p + "feed_forward.w2.weight", {H, FFI}, 0.05f);
+    ones(p + "attention_norm1.weight", H);
+    ones(p + "attention_norm2.weight", H);
+    ones(p + "ffn_norm1.weight", H);
+    ones(p + "ffn_norm2.weight", H);
+    if (with_ada) {
+      put(p + "adaLN_modulation.0.weight", {4 * H, AD}, 0.05f);
+      put(p + "adaLN_modulation.0.bias", {4 * H}, 0.02f);
+    }
+  };
+  block("context_refiner.0.", false);     // NO adaLN -- see the loader
+  block("noise_refiner.0.", true);
+  block("layers.0.", true);
+  const std::string pk = "2-1";
+  put("all_x_embedder." + pk + ".weight", {H, PD}, 0.1f);
+  put("all_x_embedder." + pk + ".bias", {H}, 0.02f);
+  ones("cap_embedder.0.weight", c.cap_dim);
+  put("cap_embedder.1.weight", {H, c.cap_dim}, 0.1f);
+  put("cap_embedder.1.bias", {H}, 0.02f);
+  put("t_embedder.mlp.0.weight", {c.time_mid, c.time_freq}, 0.05f);
+  put("t_embedder.mlp.0.bias", {c.time_mid}, 0.02f);
+  put("t_embedder.mlp.2.weight", {AD, c.time_mid}, 0.05f);
+  put("t_embedder.mlp.2.bias", {AD}, 0.02f);
+  put("x_pad_token", {H}, 0.1f);
+  put("cap_pad_token", {H}, 0.1f);
+  put("all_final_layer." + pk + ".adaLN_modulation.1.weight", {H, AD}, 0.05f);
+  put("all_final_layer." + pk + ".adaLN_modulation.1.bias", {H}, 0.02f);
+  put("all_final_layer." + pk + ".linear.weight", {PD, H}, 0.1f);
+  put("all_final_layer." + pk + ".linear.bias", {PD}, 0.02f);
+
+  if (!write_bf16_st_(dir / "model.safetensors", ts, data)) { return t; }
+  std::ofstream cf(dir / "config.json");
+  if (!cf) { return t; }
+  cf << "{\"_class_name\":\"ZImageTransformer2DModel\",\"dim\":" << H
+     << ",\"n_heads\":" << c.n_heads << ",\"n_kv_heads\":" << c.n_heads
+     << ",\"n_layers\":" << c.n_layers
+     << ",\"n_refiner_layers\":" << c.n_refiner
+     << ",\"in_channels\":" << c.in_channels
+     << ",\"all_patch_size\":[" << c.patch << "]"
+     << ",\"all_f_patch_size\":[" << c.f_patch << "]"
+     << ",\"cap_feat_dim\":" << c.cap_dim
+     << ",\"axes_dims\":[32,48,48],\"axes_lens\":[1536,512,512]"
+     << ",\"norm_eps\":1e-05,\"qk_norm\":true"
+     << ",\"rope_theta\":256.0,\"t_scale\":1000.0}";
+  cf.close();
+  t.ok = true;
+  return t;
+}
+
+// One forward over a fixed input, as the flat bf16 image rows.
+std::vector<float>
+zi_forward_(MetalZImageTransformer* m, MetalCompute* mc,
+            const MetalZImageTransformer::Config& c,
+            const zimage::Layout& lay, std::string* err)
+{
+  std::vector<float> out;
+  const int PD = c.patch_dim();
+  std::vector<float> pat((std::size_t)lay.img_tokens * PD);
+  std::vector<float> cap((std::size_t)lay.cap_len * c.cap_dim);
+  for (std::size_t i = 0; i < pat.size(); ++i) {
+    pat[i] = 0.02f * (float)((i * 37) % 71) - 0.7f;
+  }
+  for (std::size_t i = 0; i < cap.size(); ++i) {
+    cap[i] = 0.02f * (float)((i * 13) % 53) - 0.52f;
+  }
+  metal_compute::SharedBuffer lb = to_bf16_(mc, pat);
+  metal_compute::SharedBuffer cb = to_bf16_(mc, cap);
+  if (lb.empty() || cb.empty()) { return out; }
+  MetalZImageTransformer::Request req;
+  req.latents = &lb; req.cap = &cb; req.layout = &lay; req.timestep = 0.75f;
+  metal_compute::SharedBuffer v = m->forward(req, err);
+  if (v.empty()) { return out; }
+  const std::size_t n = (std::size_t)lay.img_tokens * PD;
+  if (v.byte_size() < n * 2) { return out; }
+  const auto* d = static_cast<const std::uint16_t*>(v.contents());
+  out.resize(n);
+  for (std::size_t i = 0; i < n; ++i) { out[i] = bf16_(d[i]); }
+  return out;
+}
+
+}  // namespace
+
+TEST(z_image_dit, a_quantized_checkpoint_runs_and_tracks_the_dense_one)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::error_code ec;
+  const fs::path root =
+      fs::temp_directory_path() / ("vpipe-zi-w4-" + std::to_string(::getpid()));
+  fs::remove_all(root, ec);
+  const TinyZi t = write_tiny_zimage_(root / "dense");
+  ZI_REQUIRE(t.ok);
+
+  MetalZImageTransformer::Config cfg;
+  ZI_REQUIRE(MetalZImageTransformer::Config::read_dims(
+      (root / "dense").string(), &cfg));
+  zimage::Layout lay;
+  std::string le;
+  ZI_REQUIRE(zimage::build_layout(8, 8, 24, &lay, &le));
+
+  // The dense arm first: the reference this compares against is the
+  // SAME weights before quantization, so no external golden is needed.
+  std::vector<float> dense;
+  {
+    auto m = MetalZImageTransformer::load((root / "dense").string(), mc, cfg,
+                                          false);
+    ZI_REQUIRE(m != nullptr);
+    EXPECT_TRUE(m->quant_bits() == 0);
+    std::string e;
+    dense = zi_forward_(m.get(), mc, cfg, lay, &e);
+    if (dense.empty()) { std::printf("[z_image_dit] dense: %s\n", e.c_str()); }
+  }
+  ZI_REQUIRE(!dense.empty());
+
+  // BOTH WIDTHS. `lin` picks the entry point from the WEIGHT's bits, so
+  // w8 is a different kernel and not a variation on this one -- and it
+  // was equally unreachable, under the same wrong spelling.
+  // 4-bit's bar is looser because 4-bit costs more, not because the
+  // path is less certain.
+  for (const auto& arm : {std::make_pair(4, 0.25), std::make_pair(8, 0.05)}) {
+    const int bits = arm.first;
+    const double bar = arm.second;
+    const fs::path qdir = root / ("w" + std::to_string(bits));
+    FlexData qcfg = FlexData::make_object();
+    {
+      auto o = qcfg.as_object();
+      o.insert("src_model", FlexData::make_string((root / "dense").string()));
+      o.insert("output_name", FlexData::make_string(qdir.string()));
+      o.insert("bits", FlexData::make_int(bits));
+      o.insert("group_size", FlexData::make_int(64));
+      o.insert("skip_existing", FlexData::make_bool(false));
+      o.insert("awq", FlexData::make_bool(false));
+    }
+    vpipe::ModelQuantizeStage qst(&sess, "qzi", std::vector<InEdge>{},
+                                  std::move(qcfg));
+    ZI_REQUIRE(qst.config_error().empty());
+    ZI_REQUIRE(qst.quantize_once());
+
+    // ENGAGEMENT BEFORE ACCURACY. A checkpoint whose quantization went
+    // undetected loads as dense and would pass every bar below by being
+    // the reference, so the bits are asserted first.
+    auto q = MetalZImageTransformer::load(qdir.string(), mc, cfg, false);
+    ZI_REQUIRE(q != nullptr);
+    ZI_REQUIRE(q->quant_bits() == bits);
+    std::string qe;
+    const std::vector<float> got = zi_forward_(q.get(), mc, cfg, lay, &qe);
+    if (got.empty()) {
+      std::printf("[z_image_dit] w%d forward: '%s'\n", bits, qe.c_str());
+    }
+    ZI_REQUIRE(!got.empty());
+    int bad = 0;
+    for (float f : got) { if (!std::isfinite(f)) { ++bad; } }
+    EXPECT_TRUE(bad == 0);
+    const double rel = rel_l2_(got, dense);
+    std::printf("[z_image_dit] w%d vs dense rel-L2 = %.6f (%d rows)\n",
+                bits, rel, lay.img_tokens);
+    // What QUANTIZATION costs. A dispatch that ran the wrong kernel, or
+    // none at all, lands at ~1 (or worse) rather than near this.
+    EXPECT_TRUE(rel < bar);
+    // And it is a real number, not the dense one echoed back: the
+    // quantized arm has to MOVE the answer, or "tracks the dense one"
+    // is vacuous.
+    EXPECT_TRUE(rel > 1e-4);
+  }
+  fs::remove_all(root, ec);
+}

@@ -322,7 +322,11 @@ class MetalQwenImage21Transformer {
       _lib_attn, _lib_attn_nax, _lib_mma, _lib_dequant, _lib_qmm;
   metal_compute::ComputeFunction _fn_ln_mod, _fn_gated_tanh, _fn_rms,
       _fn_swiglu, _fn_gelu_tanh, _fn_tr_rope, _fn_residual, _fn_gemm_t,
-      _fn_qmm, _fn_dequant4, _fn_dequant8, _fn_gemm_mma,
+      // BOTH widths, picked per WEIGHT rather than per checkpoint: a
+      // mixed pack (`mixed`, or an 8-bit modulation over a 4-bit body)
+      // carries w4 and w8 tensors side by side, and `load_qw_` already
+      // reads each one's bits off its own code/scale shapes.
+      _fn_qmm4, _fn_qmm8, _fn_dequant4, _fn_dequant8, _fn_gemm_mma,
       _fn_gemm_mma_deep, _fn_gemm_mma_tn2, _fn_copy_rows,
       _fn_gated_tanh4, _fn_swiglu4, _fn_gemm_bm64, _fn_gemm_bm64bn64,
       _fn_ln_plain, _fn_scale_rows, _fn_silu, _fn_transpose;

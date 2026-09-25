@@ -128,6 +128,16 @@ CommandStream::fire_and_forget_stats(unsigned long long* completed,
 }
 
 void
+CommandStream::note_encode_failure_(const char* why)
+{
+  if (!_fail) { _fail = std::make_shared<Failure>(); }
+  bool expected = false;
+  if (!_fail->failed.compare_exchange_strong(expected, true)) { return; }
+  std::lock_guard<std::mutex> lk(_fail->mu);
+  _fail->reason = why;
+}
+
+void
 CommandStream::split_encoder_(ComputeEncoder& enc)
 {
   const DispatchType dt = enc._dt;
