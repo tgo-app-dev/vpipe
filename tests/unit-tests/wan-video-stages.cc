@@ -16,6 +16,7 @@
 #include "interfaces/ui-delegate-intf.h"
 #include <cmath>
 #include <mutex>
+#include "pipeline/stage-config.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
@@ -67,6 +68,13 @@ public:
   // one pixel out of the encoder says what the composite did.
   int ch = 3;
   uint8_t rgba[4] = {0, 0, 0, 255};
+  // ch==4 only. 0 = the constant `rgba`; 1 = alternating COLUMNS of
+  // `rgba` and `rgbb`; 2 = alternating ROWS. The two stripe patterns are
+  // what tell the chroma subsamplings apart: a horizontal subsample
+  // averages the columns and leaves the rows, so 4:2:2 keeps pattern 2
+  // and loses pattern 1, while 4:2:0 loses both and 4:4:4 keeps both.
+  int pattern = 0;
+  uint8_t rgbb[4] = {255, 255, 255, 255};
 
   Job
   process(RuntimeContext& ctx) override
@@ -81,7 +89,15 @@ public:
       if (ch == 4) {
         const size_t plane = (size_t)h * w;
         for (int c = 0; c < 4; ++c) {
-          for (size_t k = 0; k < plane; ++k) { p[c * plane + k] = rgba[c]; }
+          for (int yy = 0; yy < h; ++yy) {
+            for (int xx = 0; xx < w; ++xx) {
+              const bool second = pattern == 1 ? ((xx & 1) != 0)
+                                : pattern == 2 ? ((yy & 1) != 0)
+                                               : false;
+              p[c * plane + (size_t)yy * w + xx] =
+                  second ? rgbb[c] : rgba[c];
+            }
+          }
         }
       } else {
       for (size_t k = 0; k < n; ++k) { p[k] = (uint8_t)((i * 40 + k) & 0xff); }
@@ -123,6 +139,19 @@ public:
   // Only filled for rgb24, where the bytes are the picture -- a yuv420p
   // readback would be testing the colour conversion as well.
   int first_px[3] = {-1, -1, -1};
+  // What the header SAID the YUV means. The tag is half the contract --
+  // the pixels are the other half -- and a stage that converts one way
+  // while tagging the other is exactly the failure nothing downstream
+  // can see.
+  int last_range = -1, last_csp = -1, last_pri = -1, last_trc = -1;
+  // Top-left Y,U,V of the first yuv420p frame, which IS the colour
+  // conversion and is what the matrix tests read.
+  int first_yuv[3] = {-1, -1, -1};
+  // U at chroma-plane (0,0) (0,1) (1,0) (1,1) of the first frame, for
+  // any planar YUV format. Which of these are EQUAL is what says how the
+  // chroma was subsampled.
+  int u_quad[4] = {-1, -1, -1, -1};
+  int chroma_w = 0, chroma_h = 0;
 
   Job
   process(RuntimeContext& ctx) override
@@ -138,12 +167,34 @@ public:
       rate_num = hp->frame_rate.num;
       rate_den = hp->frame_rate.den;
       last_model = hp->model_name;
+      last_range = hp->color_range;
+      last_csp   = hp->colorspace;
+      last_pri   = hp->color_primaries;
+      last_trc   = hp->color_trc;
     } else if (const auto* fp =
                    dynamic_cast<const FrameRefPayload*>(b.get())) {
       if (frames == 0 && fp->ref && fp->ref->format == AV_PIX_FMT_RGB24) {
         for (int c = 0; c < 3; ++c) {
           first_px[c] = fp->ref->data[0][c];
         }
+      }
+      const bool planar_yuv =
+          fp->ref && (fp->ref->format == AV_PIX_FMT_YUV420P
+                      || fp->ref->format == AV_PIX_FMT_YUV422P
+                      || fp->ref->format == AV_PIX_FMT_YUV444P);
+      if (frames == 0 && planar_yuv) {
+        for (int c = 0; c < 3; ++c) {
+          first_yuv[c] = fp->ref->data[c][0];
+        }
+        const int sx = fp->ref->format == AV_PIX_FMT_YUV444P ? 1 : 2;
+        const int sy = fp->ref->format == AV_PIX_FMT_YUV420P ? 2 : 1;
+        chroma_w = fp->ref->width / sx;
+        chroma_h = fp->ref->height / sy;
+        const int ls = fp->ref->linesize[1];
+        u_quad[0] = fp->ref->data[1][0];
+        u_quad[1] = fp->ref->data[1][1];
+        u_quad[2] = fp->ref->data[1][ls];
+        u_quad[3] = fp->ref->data[1][ls + 1];
       }
       ++frames;
     }
@@ -434,6 +485,395 @@ TEST(rgb_to_video, rgba_endpoints_are_exact)
 // carry it -- and it is also the one save-video reads before it writes
 // the container header. Losing it here would leave every generated clip
 // anonymous with nothing failing.
+// WHICH AXES THE CHROMA IS AVERAGED OVER, per pixel format.
+//
+// The averaging block was a literal 2x2 -- `y += 2`, `x += 2`, four
+// samples times 0.25f -- so the stage could only ever emit 4:2:0. It is
+// now the format's (hx, hy), and the thing to prove is that each format
+// averages over the axes it is supposed to and NOT the others. A block
+// that is too large is a soft-looking picture nobody can point at; one
+// that is too small writes past the plane.
+//
+// Told apart with STRIPES, because a solid colour cannot see any of it:
+// every average of one colour is that colour, so a 4:2:0 stage
+// masquerading as 4:4:4 passes a constant-frame test perfectly.
+//
+//   columns of red|blue  -- a HORIZONTAL subsample averages them
+//   rows    of red|blue  -- a VERTICAL subsample averages them
+//
+// so 4:2:2 is exactly the format that keeps the rows and loses the
+// columns, which is what separates it from both neighbours.
+TEST(rgb_to_video, chroma_is_averaged_over_the_formats_own_block)
+{
+  // BT.601 limited. Red and blue sit at opposite ends of U, which makes
+  // "averaged" and "kept" 75 code values apart rather than a rounding.
+  const int U_RED = 90, U_BLUE = 240, U_MIX = (U_RED + U_BLUE) / 2;
+
+  struct Case { const char* fmt; int pattern; int want[4]; };
+  const Case cases[] = {
+    // 4:4:4 keeps everything: the quad is the pattern itself.
+    {"yuv444p", 1, {U_RED, U_BLUE, U_RED, U_BLUE}},   // columns
+    {"yuv444p", 2, {U_RED, U_RED, U_BLUE, U_BLUE}},   // rows
+    // 4:2:2 averages across x only.
+    {"yuv422p", 1, {U_MIX, U_MIX, U_MIX, U_MIX}},
+    {"yuv422p", 2, {U_RED, U_RED, U_BLUE, U_BLUE}},   // rows SURVIVE
+    // 4:2:0 averages both.
+    {"yuv420p", 1, {U_MIX, U_MIX, U_MIX, U_MIX}},
+    {"yuv420p", 2, {U_MIX, U_MIX, U_MIX, U_MIX}},
+  };
+
+  for (const Case& c : cases) {
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<RgbSource>(&sess, "src", vector<InEdge>{},
+                                        FlexData::make_object());
+    src_u->count = 1; src_u->w = 16; src_u->h = 16; src_u->ch = 4;
+    src_u->pattern = c.pattern;
+    src_u->rgba[0] = 255; src_u->rgba[1] = 0; src_u->rgba[2] = 0;
+    src_u->rgbb[0] = 0;   src_u->rgbb[1] = 0; src_u->rgbb[2] = 255;
+    src_u->allocate_oports(1);
+    auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("pix_fmt",
+                                     FlexData::make_string(c.fmt));
+    auto cvt_u = make_unique<RgbToVideoStage>(&sess, "cvt",
+                                              vector<InEdge>{{src, 0}}, cfg);
+    auto* cvt = static_cast<RgbToVideoStage*>(
+        pl->insert_stage(std::move(cvt_u)));
+    auto sink_u = make_unique<VideoSink>(&sess, "sink",
+                                         vector<InEdge>{{cvt, 0}},
+                                         FlexData::make_object());
+    auto* sink = static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+
+    EXPECT_TRUE(sink->frames == 1);
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+      // +-1 for the rounding of an average that lands on a half.
+      if (std::abs(sink->u_quad[i] - c.want[i]) > 1) { ok = false; }
+    }
+    EXPECT_TRUE(ok);
+    std::printf("[rgb_to_video] %s %s: U quad %d %d %d %d (want %d %d %d "
+                "%d), chroma plane %dx%d%s\n", c.fmt,
+                c.pattern == 1 ? "columns" : "rows   ",
+                sink->u_quad[0], sink->u_quad[1], sink->u_quad[2],
+                sink->u_quad[3], c.want[0], c.want[1], c.want[2],
+                c.want[3], sink->chroma_w, sink->chroma_h,
+                ok ? "" : "   <-- MISMATCH");
+  }
+}
+
+// A SUBSAMPLED AXIS MAY NOT BE ODD, and which axes those are is the
+// format's. The check was written for 4:2:0 and tested both dimensions;
+// applied unchanged it would refuse an odd-height 4:2:2 frame, which is
+// perfectly representable, and let an odd-width one through, which is
+// not. Refusing is deliberate -- rounding would either fail deep inside
+// the encoder or silently drop a line.
+TEST(rgb_to_video, odd_sizes_are_refused_per_format_not_per_stage)
+{
+  struct Case { const char* fmt; int w, h; bool ok; };
+  const Case cases[] = {
+    {"yuv420p", 16, 16, true},  {"yuv420p", 15, 16, false},
+    {"yuv420p", 16, 15, false},
+    // 4:2:2 subsamples x only, so an odd HEIGHT is fine.
+    {"yuv422p", 16, 16, true},  {"yuv422p", 15, 16, false},
+    {"yuv422p", 16, 15, true},
+    // 4:4:4 and rgb24 subsample nothing.
+    {"yuv444p", 15, 15, true},  {"rgb24",   15, 15, true},
+  };
+  for (const Case& c : cases) {
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<RgbSource>(&sess, "src", vector<InEdge>{},
+                                        FlexData::make_object());
+    src_u->count = 1; src_u->w = c.w; src_u->h = c.h;
+    src_u->allocate_oports(1);
+    auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("pix_fmt",
+                                     FlexData::make_string(c.fmt));
+    auto cvt_u = make_unique<RgbToVideoStage>(&sess, "cvt",
+                                              vector<InEdge>{{src, 0}}, cfg);
+    auto* cvt = static_cast<RgbToVideoStage*>(
+        pl->insert_stage(std::move(cvt_u)));
+    auto sink_u = make_unique<VideoSink>(&sess, "sink",
+                                         vector<InEdge>{{cvt, 0}},
+                                         FlexData::make_object());
+    auto* sink = static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    // Emitted iff the geometry is representable.
+    EXPECT_TRUE((sink->frames > 0) == c.ok);
+    std::printf("[rgb_to_video] %s %dx%d -> %s\n", c.fmt, c.w, c.h,
+                sink->frames > 0 ? "emitted" : "refused");
+  }
+}
+
+// THE DROPDOWN AND THE VALIDATOR ARE THE SAME CLOSED SET.
+//
+// Three of this stage's keys accept one of a fixed pair, and each pair
+// is now written down three times: in the doc string, in the branch in
+// resolve_config_() that rejects everything else, and in the `choices`
+// list the editor renders as a dropdown. The doc is prose and nothing
+// can check it, but the other two MUST agree in both directions -- a
+// dropdown offering a value the stage rejects sets a graph up to fail
+// at launch with a value the editor suggested, and one missing a value
+// the stage accepts hides a mode behind a field the UI has turned into
+// a closed set.
+//
+// So this drives the stage with every offered value and asserts it is
+// taken, then with one that is not offered and asserts it is refused.
+TEST(rgb_to_video, every_offered_choice_is_one_the_stage_accepts)
+{
+  // Straight off the schema the editor reads, not off a list retyped
+  // here -- retyping it would pin the test to itself.
+  Session spec_sess;
+  RgbToVideoStage probe(&spec_sess, "probe", vector<InEdge>{},
+                        FlexData::make_object());
+  FlexData schema = config_params_to_flex(
+      resolve_config_params(probe.spec().attrs, FlexData::make_object()));
+  auto rows = schema.as_array();
+  int checked_keys = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    FlexData row = rows.at(i);
+    auto ro = row.as_object();
+    if (!ro.contains("choices")) { continue; }
+    const std::string key(ro.at("key").as_string(""));
+    FlexData ch = ro.at("choices");
+    auto cv = ch.as_array();
+    EXPECT_TRUE(cv.size() >= 2u);
+    ++checked_keys;
+    for (size_t c = 0; c < cv.size(); ++c) {
+      const std::string val(cv.at(c).as_string(""));
+      Session sess;
+      auto cfg = FlexData::make_object();
+      cfg.as_object().insert_or_assign(key, FlexData::make_string(val));
+      RgbToVideoStage st(&sess, "cfg", vector<InEdge>{}, cfg);
+      const bool accepted = st.config_error().empty();
+      EXPECT_TRUE(accepted);
+      if (!accepted) {
+        std::printf("[rgb_to_video] %s=%s was OFFERED but refused: %s\n",
+                    key.c_str(), val.c_str(), st.config_error().c_str());
+      }
+    }
+    // And the set is genuinely closed: a plausible near-miss is refused,
+    // or "choices" is decoration over a field that takes anything.
+    Session sess;
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign(
+        key, FlexData::make_string("definitely-not-a-valid-value"));
+    RgbToVideoStage st(&sess, "cfg", vector<InEdge>{}, cfg);
+    EXPECT_FALSE(st.config_error().empty());
+    std::printf("[rgb_to_video] %s: %zu offered, all accepted, junk "
+                "refused\n", key.c_str(), cv.size());
+  }
+  // The loop must have found something, or it passed by iterating over
+  // nothing at all.
+  EXPECT_TRUE(checked_keys == 3);
+}
+
+// THE MATRIX, and that the file says which one it is.
+//
+// rgb-to-video wrote BT.601 and only BT.601, with the constant hardcoded
+// into the tag. `colorspace` makes it a choice, and the thing that has
+// to hold is that the PIXELS and the TAG move together: a stage that
+// converts one way and tags the other produces a file nothing
+// downstream can read correctly and nothing can see is wrong.
+//
+// Checked against the textbook definition recomputed here, deliberately
+// in a different spelling from the stage's (which folds the swing into
+// precomputed per-channel coefficients). Comparing the stage's numbers
+// with a copy of the stage's numbers would pass through any change to
+// either.
+//
+//   Y' = Kr*R' + Kg*G' + Kb*B'        Cb = (B'-Y')/(2(1-Kb))
+//   Kg = 1-Kr-Kb                      Cr = (R'-Y')/(2(1-Kr))
+//
+// Studio swing: Y in 16..235, chroma 128 +- 112. Full: 0..255, 128 +- 128.
+namespace {
+
+struct ExpectYuv { int y, u, v; };
+
+ExpectYuv
+expect_yuv_(int r8, int g8, int b8, double kr, double kb, bool full)
+{
+  const double kg = 1.0 - kr - kb;
+  const double r = r8 / 255.0, g = g8 / 255.0, b = b8 / 255.0;
+  const double yn = kr * r + kg * g + kb * b;
+  const double cb = (b - yn) / (2.0 * (1.0 - kb));
+  const double cr = (r - yn) / (2.0 * (1.0 - kr));
+  const double ys = full ? 255.0 : 219.0;
+  const double y0 = full ? 0.0 : 16.0;
+  const double cs = full ? 255.0 : 224.0;
+  auto q = [](double v) {
+    v = std::round(v);
+    if (v < 0.0) { return 0; }
+    if (v > 255.0) { return 255; }
+    return (int)v;
+  };
+  return { q(y0 + ys * yn), q(128.0 + cs * cb), q(128.0 + cs * cr) };
+}
+
+// One constant-colour frame through the stage; returns its top-left YUV
+// and fills the header tags.
+VideoSink*
+run_one_colour_(Pipeline* pl, Session* sess, uint8_t r, uint8_t g,
+                uint8_t b, const char* csp, const char* range)
+{
+  auto src_u = make_unique<RgbSource>(sess, "src", vector<InEdge>{},
+                                      FlexData::make_object());
+  src_u->count = 1;
+  src_u->w = 16;
+  src_u->h = 16;
+  // ch=4 with alpha 255 is the only way to get a CONSTANT frame out of
+  // this source (ch=3 writes a ramp), and the composite over white is
+  // exact at alpha 255, so the pixels are r,g,b unchanged.
+  src_u->ch = 4;
+  src_u->rgba[0] = r; src_u->rgba[1] = g; src_u->rgba[2] = b;
+  src_u->rgba[3] = 255;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("colorspace", FlexData::make_string(csp));
+  cfg.as_object().insert_or_assign("color_range",
+                                   FlexData::make_string(range));
+  auto cvt_u = make_unique<RgbToVideoStage>(sess, "cvt",
+                                            vector<InEdge>{{src, 0}}, cfg);
+  auto* cvt = static_cast<RgbToVideoStage*>(
+      pl->insert_stage(std::move(cvt_u)));
+  auto sink_u = make_unique<VideoSink>(sess, "sink",
+                                       vector<InEdge>{{cvt, 0}},
+                                       FlexData::make_object());
+  return static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+}
+
+}  // namespace
+
+TEST(rgb_to_video, colorspace_picks_the_matrix_and_the_tag_follows)
+{
+  struct Case { const char* csp; const char* range; double kr, kb;
+                bool full; int want_csp, want_range, want_pri, want_trc; };
+  const Case cases[] = {
+    {"bt601", "limited", 0.299,  0.114,  false, AVCOL_SPC_SMPTE170M,
+     AVCOL_RANGE_MPEG, AVCOL_PRI_SMPTE170M, AVCOL_TRC_SMPTE170M},
+    {"bt601", "full",    0.299,  0.114,  true,  AVCOL_SPC_SMPTE170M,
+     AVCOL_RANGE_JPEG, AVCOL_PRI_SMPTE170M, AVCOL_TRC_SMPTE170M},
+    {"bt709", "limited", 0.2126, 0.0722, false, AVCOL_SPC_BT709,
+     AVCOL_RANGE_MPEG, AVCOL_PRI_BT709, AVCOL_TRC_BT709},
+    {"bt709", "full",    0.2126, 0.0722, true,  AVCOL_SPC_BT709,
+     AVCOL_RANGE_JPEG, AVCOL_PRI_BT709, AVCOL_TRC_BT709},
+  };
+  // Green discriminates the two matrices on all THREE components; red
+  // and blue sit at a chroma extreme where the two agree.
+  const uint8_t R = 0, G = 255, B = 0;
+
+  for (const Case& c : cases) {
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto* sink = run_one_colour_(pl.get(), &sess, R, G, B, c.csp, c.range);
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+
+    const ExpectYuv w = expect_yuv_(R, G, B, c.kr, c.kb, c.full);
+    // +-1: the stage rounds once per pixel and averages chroma over the
+    // 2x2 block, so a half-LSB can land either side.
+    const bool y_ok = std::abs(sink->first_yuv[0] - w.y) <= 1;
+    const bool u_ok = std::abs(sink->first_yuv[1] - w.u) <= 1;
+    const bool v_ok = std::abs(sink->first_yuv[2] - w.v) <= 1;
+    EXPECT_TRUE(y_ok);
+    EXPECT_TRUE(u_ok);
+    EXPECT_TRUE(v_ok);
+    if (!(y_ok && u_ok && v_ok)) {
+      std::printf("[rgb_to_video] %s/%s got Y%d U%d V%d want Y%d U%d V%d\n",
+                  c.csp, c.range, sink->first_yuv[0], sink->first_yuv[1],
+                  sink->first_yuv[2], w.y, w.u, w.v);
+    }
+    // THE TAG, which travels with the pixels or the file is a lie.
+    EXPECT_TRUE(sink->last_csp == c.want_csp);
+    EXPECT_TRUE(sink->last_range == c.want_range);
+    // Primaries and transfer were UNSPECIFIED before; a colour-managed
+    // player falls back on convention when they are, and the convention
+    // for HD is BT.709 whatever the matrix says.
+    EXPECT_TRUE(sink->last_pri == c.want_pri);
+    EXPECT_TRUE(sink->last_trc == c.want_trc);
+    std::printf("[rgb_to_video] %s/%s -> Y%d U%d V%d, tagged csp=%d "
+                "range=%d pri=%d trc=%d\n", c.csp, c.range,
+                sink->first_yuv[0], sink->first_yuv[1], sink->first_yuv[2],
+                sink->last_csp, sink->last_range, sink->last_pri,
+                sink->last_trc);
+  }
+}
+
+// THE NO-REGRESSION PIN. The four matrices are now DERIVED from Kr/Kb
+// rather than typed out, and the one that already shipped must come back
+// bit-identical -- every clip this tree has ever written is BT.601
+// studio swing, and a derivation that is a rounding off would change
+// them all at once with nothing to show for it.
+//
+// These are the exact constants the stage carried before.
+TEST(rgb_to_video, the_derived_bt601_matrix_is_the_one_that_shipped)
+{
+  const uint8_t colours[][3] = {
+    {0, 0, 0}, {255, 255, 255}, {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
+    {37, 211, 91},
+  };
+  for (const auto& c : colours) {
+    const double r = c[0], g = c[1], b = c[2];
+    // Verbatim from the retired rgb_to_yuv_().
+    const double y = 16.0  + 0.256788 * r + 0.504129 * g + 0.097906 * b;
+    const double u = 128.0 - 0.148223 * r - 0.290993 * g + 0.439216 * b;
+    const double v = 128.0 + 0.439216 * r - 0.367788 * g - 0.071427 * b;
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto* sink = run_one_colour_(pl.get(), &sess, c[0], c[1], c[2],
+                                 "bt601", "limited");
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    EXPECT_TRUE(sink->first_yuv[0] == (int)std::lround(y));
+    EXPECT_TRUE(sink->first_yuv[1] == (int)std::lround(u));
+    EXPECT_TRUE(sink->first_yuv[2] == (int)std::lround(v));
+  }
+  std::printf("[rgb_to_video] derived BT.601 limited reproduces the "
+              "shipped coefficients exactly\n");
+}
+
+// And the two matrices must actually DIFFER, or everything above passes
+// on a stage that ignores the key.
+TEST(rgb_to_video, bt709_is_not_bt601)
+{
+  int got[2][3];
+  const char* csps[2] = {"bt601", "bt709"};
+  for (int i = 0; i < 2; ++i) {
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto* sink = run_one_colour_(pl.get(), &sess, 0, 255, 0, csps[i],
+                                 "limited");
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    for (int c = 0; c < 3; ++c) { got[i][c] = sink->first_yuv[c]; }
+  }
+  // Green's luma is the biggest single difference between the two.
+  EXPECT_TRUE(std::abs(got[0][0] - got[1][0]) > 20);
+  EXPECT_TRUE(got[0][1] != got[1][1]);
+  EXPECT_TRUE(got[0][2] != got[1][2]);
+  std::printf("[rgb_to_video] green: 601 Y%d U%d V%d vs 709 Y%d U%d V%d\n",
+              got[0][0], got[0][1], got[0][2],
+              got[1][0], got[1][1], got[1][2]);
+}
+
 TEST(rgb_to_video, carries_the_model_name_onto_the_header)
 {
   Session sess;

@@ -709,6 +709,17 @@ MetalCompute::residency_stats() const noexcept
   return out;
 }
 
+MetalCompute::CacheStats
+MetalCompute::cache_stats() const noexcept
+{
+  CacheStats out;
+  if (!_impl->valid) { return out; }
+  std::lock_guard<std::mutex> lk(_impl->cache_mu);
+  out.libraries = _impl->lib_cache.size();
+  out.pipelines = _impl->pso_cache.size();
+  return out;
+}
+
 MetalCompute::MemoryBudget
 MetalCompute::memory_budget() const noexcept
 {

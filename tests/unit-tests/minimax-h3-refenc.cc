@@ -297,6 +297,88 @@ TEST(minimax_h3_refenc, progress_is_weighed_by_work_planned_up_front)
   EXPECT_TRUE(named_phase);
 }
 
+// A STOP REACHES THE REFERENCE ENCODE, and arrives as a stop.
+//
+// This is the longest stretch in an H3 graph that is not the denoise --
+// the conditioner is loaded and streamed and every reference is read
+// twice, so on a memory-bounded box it is minutes -- and it had no stop
+// check anywhere. A stop request was served whenever the whole request
+// happened to finish.
+//
+// TWO THINGS ARE UNDER TEST and the second is the one a caller depends
+// on. That it stops at all, and that it says so by returning false with
+// an EMPTY reason: the stage tells a stop from a failure by the absence
+// of a message, so that it must not fill one in. A stop reported as a
+// failure puts a warning in front of someone who pressed stop.
+//
+// Driven with every model pointer null, as the progress test is: that
+// runs the planning and the phase structure with no GPU behind it, so
+// the trigger can be placed exactly. The BOUND -- how long a stop
+// actually takes on real work -- is not a thing this harness can see,
+// and is measured end to end instead; it rests on the video VAE
+// checking between tiles, each of which commits and waits.
+TEST(minimax_h3_refenc, a_stop_is_honoured_and_is_not_a_failure)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;
+
+  std::vector<h3::MediaReference> refs;
+  {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1; m.height = 64; m.width = 64; m.short_edge = 128;
+    m.rgb.assign((std::size_t)3 * 64 * 64, 10);
+    refs.push_back(std::move(m));
+  }
+  {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 60; m.height = 96; m.width = 160; m.fps = 30.0;
+    m.rgb.assign((std::size_t)60 * 3 * 96 * 160, 20);
+    refs.push_back(std::move(m));
+  }
+
+  // Fire once the FIRST reference is finished, so the stop lands at a
+  // boundary the encoder reaches mid-request rather than before it
+  // starts -- a predicate that is true from the outset would be
+  // answered by the first check and prove only that one check exists.
+  bool stop_now = false;
+  std::vector<std::string> seen;
+  h3::ReferenceEncoders models;
+  models.progress = [&](std::uint64_t, std::uint64_t,
+                        const std::string& detail) {
+    seen.push_back(detail);
+    if (detail == "reference 1/2 (image): done") { stop_now = true; }
+  };
+  models.stopping = [&]() { return stop_now; };
+
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references(refs, "a prompt", plan, models,
+                                        &enc, &err);
+
+  EXPECT_FALSE(ok);
+  // THE CONTRACT THE STAGE READS. An empty reason is the signal.
+  EXPECT_TRUE(err.empty());
+  // And it really did stop early: the second reference never ran a
+  // phase, and the request never reported itself done.
+  bool second_phase_ran = false, said_done = false;
+  for (const std::string& d : seen) {
+    if (d.rfind("reference 2/2", 0) == 0 && d.find(':') != std::string::npos) {
+      second_phase_ran = true;
+    }
+    if (d == "done") { said_done = true; }
+  }
+  EXPECT_FALSE(second_phase_ran);
+  EXPECT_FALSE(said_done);
+  EXPECT_TRUE(enc.fits.size() < 2);
+  std::printf("[minimax_h3_refenc] stop after reference 1: ok=%d err='%s' "
+              "(%zu reports, second phase ran=%d, said done=%d)\n",
+              (int)ok, err.c_str(), seen.size(), (int)second_phase_ran,
+              (int)said_done);
+}
+
 // The plan's geometry IS the resize's: video_reference_geometry is what
 // normalize_video_reference asks, so the two agree on every input --
 // rate conversions that hold and drop, truncation, the never-upscale

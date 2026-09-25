@@ -296,6 +296,7 @@ LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(frame_free,          "av_frame_free");
   VPIPE_RESOLVE(frame_unref,         "av_frame_unref");
   VPIPE_RESOLVE(frame_get_buffer,    "av_frame_get_buffer");
+  VPIPE_RESOLVE(get_pix_fmt_name,    "av_get_pix_fmt_name");
   VPIPE_RESOLVE(rescale_q,           "av_rescale_q");
   VPIPE_RESOLVE(rescale_q_rnd,       "av_rescale_q_rnd");
   VPIPE_RESOLVE(get_sample_fmt_name, "av_get_sample_fmt_name");
@@ -515,6 +516,8 @@ LibSwScale::LibSwScale(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(get_cached_context, "sws_getCachedContext");
   VPIPE_RESOLVE(scale,              "sws_scale");
   VPIPE_RESOLVE(free_context,       "sws_freeContext");
+  VPIPE_RESOLVE(set_colorspace_details, "sws_setColorspaceDetails");
+  VPIPE_RESOLVE(get_coefficients,       "sws_getCoefficients");
 
 #undef VPIPE_RESOLVE
 }

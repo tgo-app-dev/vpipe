@@ -48,6 +48,14 @@ struct VideoStreamParams {
   // until something decodes its output and gets flat, hue-tilted RGB.
   int        color_range = AVCOL_RANGE_UNSPECIFIED;
   int        colorspace  = AVCOL_SPC_UNSPECIFIED;
+  // The other two thirds of the colour description. A wrong matrix
+  // tilts hue outright; these decide how a colour-managed player maps
+  // the result onto its display, so leaving them unspecified is the
+  // smaller error of the same kind -- the reader falls back on
+  // convention, and for an untagged HD file that convention is BT.709
+  // whatever the matrix actually was.
+  int        color_primaries = AVCOL_PRI_UNSPECIFIED;
+  int        color_trc       = AVCOL_TRC_UNSPECIFIED;
 };
 
 struct AudioStreamParams {

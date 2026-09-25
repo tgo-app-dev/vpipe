@@ -82,6 +82,19 @@ public:
   };
   AllocStats alloc_stats() const noexcept;
 
+  // What the process-wide kernel caches are holding. Both are keyed by
+  // name and NEVER evicted -- a compiled library and its pipeline states
+  // are the same for every pipeline that ever runs, so they outlive any
+  // one of them by design. Reported because "by design" and "invisible"
+  // are different things: after a heavy graph is unloaded these are a
+  // large part of what a fresh-versus-after comparison shows, and
+  // without a count there is no way to tell them from a leak.
+  struct CacheStats {
+    std::size_t libraries = 0;
+    std::size_t pipelines = 0;
+  };
+  CacheStats cache_stats() const noexcept;
+
   // Bind an on-disk MTL::BinaryArchive to the PSO build path.
   // Subsequent compute pipeline builds register their compiled
   // binaries with the archive; if `path` already exists, the

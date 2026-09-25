@@ -1956,6 +1956,7 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
     // reason decode_tiled_'s untiled path does.
     if (_prog_total <= 0) { _prog_total = 1; _prog_done = 0; }
     if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+    if (stopping()) { return {}; }
     SharedBuffer one = encode(x, T, H, W, err);
     if (!one.empty()) { ++_prog_done; }
     if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
@@ -1972,6 +1973,9 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
   tiles.reserve(ys.start.size() * xs.start.size());
   for (std::size_t i = 0; i < ys.start.size(); ++i) {
     for (std::size_t j = 0; j < xs.start.size(); ++j) {
+      // Between tiles, with the GPU idle: the previous tile committed
+      // and waited. Empty and NO `err` -- a stop is not a failure.
+      if (stopping()) { return {}; }
       const int y0 = ys.start[i], th = ys.length[i];
       const int x0 = xs.start[j], tw = xs.length[j];
       SharedBuffer sub =
@@ -2217,6 +2221,7 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
   const int ZC2 = 2 * c.z_channels;
 
   for (int n = 0; n < nclips; ++n) {
+    if (stopping()) { return {}; }
     auto* cd = static_cast<std::uint16_t*>(clip.contents());
     for (int ch = 0; ch < IC; ++ch) {
       for (int t = 0; t < cl; ++t) {

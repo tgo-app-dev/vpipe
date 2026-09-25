@@ -298,6 +298,26 @@ struct ReferenceEncoders {
   // box with memory to spare, and the stage log could not tell the two
   // apart because it reports whole references.
   std::function<void(const std::string&)> log;
+
+  // A COOPERATIVE STOP. Optional; unset means the request always runs
+  // to completion, which is what it did before this existed.
+  //
+  // Checked at every phase boundary and, through the video VAE's own
+  // hook, between its tiles -- which is where it has to reach, because
+  // the VAE is 96% of a reference encode and a single long clip can
+  // spend minutes inside ONE phase. A stop bounded by "the current
+  // reference" would, on the request people actually wait through, be
+  // no bound at all.
+  //
+  // The one phase it does NOT reach into is the conditioner: that is a
+  // single call over the whole presentation with no hook to offer, so a
+  // stop arriving inside it is served when it returns.
+  //
+  // A STOP IS NOT A FAILURE. encode_references returns false with `err`
+  // left EMPTY, and the caller tells the two apart by asking its own
+  // predicate again -- an empty reason is the signal, so nothing has to
+  // match on message text.
+  std::function<bool()> stopping;
 };
 
 // Which frames of a normalized 24 fps reference the CONDITIONER reads,

@@ -354,6 +354,16 @@ LoadVideoStage::cache_stream_(int stream_idx, bool video)
   if (video) {
     m.width  = (unsigned)st->codecpar->width;
     m.height = (unsigned)st->codecpar->height;
+    // THE CONTAINER'S COLOUR DESCRIPTION, carried so a decoder built
+    // from `extradata` alone is not left with only the bitstream's. An
+    // H.264 SPS may carry a VUI and when it does it wins, but a file
+    // tagged only in the `colr` box has nothing in the bitstream at all
+    // -- and reading that as untagged costs a 601-for-709 hue tilt that
+    // nothing downstream reports. See EncodedSegment.
+    m.color_range     = (int)st->codecpar->color_range;
+    m.colorspace      = (int)st->codecpar->color_space;
+    m.color_primaries = (int)st->codecpar->color_primaries;
+    m.color_trc       = (int)st->codecpar->color_trc;
     // avg_frame_rate first, r_frame_rate as the fallback, 0/0 when the
     // container advertises neither -- the same three-way answer
     // rtsp-capture gives, so video-to-rgb's sideband means one thing
@@ -436,6 +446,10 @@ LoadVideoStage::segment_(bool video)
     seg->height  = m.height;
     seg->fps_num = m.fps_num;
     seg->fps_den = m.fps_den;
+    seg->color_range     = m.color_range;
+    seg->colorspace      = m.colorspace;
+    seg->color_primaries = m.color_primaries;
+    seg->color_trc       = m.color_trc;
   } else {
     seg->sample_rate = m.sample_rate;
     seg->channels    = m.channels;
@@ -443,6 +457,10 @@ LoadVideoStage::segment_(bool video)
     seg->total_samples = m.total_samples;
     seg->part_index    = (unsigned)_seq_index;
   }
+  // The container's own answer to "can a decoder start here", which is
+  // the only one a non-H.264 codec has -- nothing in an FFV1 packet
+  // says it. Audio ignores it.
+  seg->key_frame = (_pkt->flags & AV_PKT_FLAG_KEY) != 0;
   seg->data.assign(_pkt->data, _pkt->data + _pkt->size);
 
   const AVRational us = {1, 1000000};

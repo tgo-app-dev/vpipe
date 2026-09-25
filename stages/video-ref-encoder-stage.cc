@@ -1559,6 +1559,14 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     models.log = [ui](const std::string& line) {
       ui->log_normal(fmt("{}", line));
     };
+    // A STOP HAS TO REACH IN HERE. This is the longest stretch in the
+    // graph that is not the denoise -- the conditioner is loaded and
+    // streamed and every reference is read twice, so on a
+    // memory-bounded box it is minutes -- and it had no stop check at
+    // all, so a stop was served whenever the whole request happened to
+    // finish. The encoder checks at every phase boundary and, through
+    // the video VAE, between its tiles.
+    models.stopping = [&ctx]() { return ctx.stop_requested(); };
   }
 
   h3::EncodedReferences enc;
@@ -1569,6 +1577,17 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // sitting under the message that explains it.
   bar.finish();
   if (!encoded) {
+    // A STOP IS NOT A FAILURE, and must not be reported as one: the
+    // encoder returns false with an EMPTY reason for it, which is the
+    // signal, so nothing here has to recognise a message. Asking the
+    // context again rather than trusting the empty string alone keeps a
+    // genuine failure that forgot its reason from being filed as a stop.
+    if (eerr.empty() && ctx.stop_requested()) {
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): stopped during the reference "
+          "encode; no conditioning emitted", this->id()));
+      co_return;
+    }
     session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
                         this->id(), eerr));
     co_return;

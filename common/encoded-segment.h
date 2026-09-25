@@ -95,6 +95,43 @@ struct EncodedSegment {
   std::int64_t skip_head    = 0;          // audio only, encoder priming
   std::int64_t total_samples = 0;         // audio only, true length
 
+  // Whether this packet can START a decode, i.e. the container's
+  // AV_PKT_FLAG_KEY. Video only.
+  //
+  // For H.264 the consumer does NOT read this -- it scans the access
+  // unit for an IDR NAL instead, because the live source (rtsp-capture)
+  // has no container to ask and delivers SPS/PPS/IDR in-band. For every
+  // OTHER codec that scan is meaningless: FFV1 has no NAL framing at
+  // all, so a gate written against H.264's returns false forever and
+  // the decoder never starts. See video-to-rgb's sync gate.
+  //
+  // DEFAULTS TRUE, and the default is the safe direction: a producer
+  // that does not know must not be able to stall a decoder for the
+  // length of a stream. The cost of guessing true on a long-GOP codec
+  // is a few bad frames until the next real keyframe; the cost of
+  // guessing false is silence.
+  bool       key_frame = true;
+
+  // WHAT THE CONTAINER SAYS THE YUV MEANS, video only, as AVCOL_* ints.
+  //
+  // Carried because the bitstream is not the only place it lives and a
+  // decoder built from `extradata` alone can only ever see the other
+  // one. H.264 may put a colour description in the SPS VUI, and when it
+  // does that wins -- but plenty of files tag only the container (mp4's
+  // `colr` box, matroska's colour elements), and for those the VUI is
+  // silent and this is the whole of the answer. ffmpeg's own decode
+  // seeds the codec context from the container and lets the VUI
+  // overwrite it, which is the behaviour these fields exist to
+  // reproduce.
+  //
+  // UNSPECIFIED is the honest default and what every producer that does
+  // not know writes: the reader then falls back on convention, which is
+  // where a wrong answer becomes a hue tilt nothing reports.
+  int color_range     = 0;   // AVCOL_RANGE_UNSPECIFIED
+  int colorspace      = 2;   // AVCOL_SPC_UNSPECIFIED
+  int color_primaries = 2;   // AVCOL_PRI_UNSPECIFIED
+  int color_trc       = 2;   // AVCOL_TRC_UNSPECIFIED
+
   std::vector<uint8_t> extradata;
   std::vector<uint8_t> data;
 };

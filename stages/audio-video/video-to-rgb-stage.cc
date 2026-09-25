@@ -396,6 +396,15 @@ VideoToRgbStage::VideoToRgbStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The decode routes, for the editor's dropdown. `auto` takes hardware
+// when the build and the stream allow it and falls back on its own; the
+// other two pin it. The ctor's own check stays the authority -- unlike
+// most closed sets in this tree it COERCES rather than refuses, warning
+// and using `auto`, so the dropdown is what keeps a typo from silently
+// becoming a different decode route.
+constexpr SpecExtra kHwaccelChoices[] = {
+  {"choices", "auto,videotoolbox,none"},
+};
 // The element types this stage emits, for the editor's dropdown; the
 // ctor's own check stays the authority.
 constexpr SpecExtra kOutputDtypeChoices[] = {
@@ -407,7 +416,13 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "oport_capacity", .type = ConfigType::Uint,
    .doc = "oport buffer depth", .def_uint = 4},
   {.key = "hwaccel", .type = ConfigType::String,
-   .doc = "auto | videotoolbox | none", .def_str = "auto"},
+   .doc = "which decoder to use. \"auto\" (the default) takes the "
+          "hardware decoder when this build and this stream allow it and "
+          "falls back to software on its own; \"videotoolbox\" asks for "
+          "it explicitly; \"none\" pins software decode, which is what "
+          "to set when comparing the two. An unrecognised value WARNS "
+          "and uses \"auto\" rather than failing the stage",
+   .def_str = "auto", .extra = kHwaccelChoices},
   {.key = "output_dtype", .type = ConfigType::String,
    .doc = "f32 | u8", .def_str = "f32", .extra = kOutputDtypeChoices},
   {.key = "output_width", .type = ConfigType::Int,
@@ -610,6 +625,29 @@ open_h264_codec_(const OpenCodecParams& p)
     cctx->extradata_size = static_cast<int>(n);
   }
 
+  // SEED THE COLOUR DESCRIPTION FROM THE CONTAINER, which is what
+  // avcodec_parameters_to_context would have done had this decoder been
+  // built from an AVStream instead of from `extradata`. It was not, so
+  // nothing did, and a file whose colour lives only in the mp4 `colr`
+  // box arrived here untagged -- src_color() then fell back on the size
+  // convention and read a 544-line BT.709 clip as BT.601. MEASURED
+  // against ffmpeg's own decode of the same file: 40.0 dB, red worst
+  // and blue nearly clean, which is the 601/709 signature.
+  //
+  // SEEDED, NOT FORCED. The H.264 decoder overwrites these from the SPS
+  // VUI when the bitstream carries one, so the VUI still wins and the
+  // container is only the fallback -- exactly ffmpeg's own order. A
+  // file whose two disagree therefore decodes the same here as
+  // everywhere else.
+  cctx->color_range =
+      static_cast<AVColorRange>(p.seg->color_range);
+  cctx->colorspace =
+      static_cast<AVColorSpace>(p.seg->colorspace);
+  cctx->color_primaries =
+      static_cast<AVColorPrimaries>(p.seg->color_primaries);
+  cctx->color_trc =
+      static_cast<AVColorTransferCharacteristic>(p.seg->color_trc);
+
   int rc = p.libs->avcodec().api.open2(cctx, codec, nullptr);
   if (rc < 0) {
     p.libs->avcodec().api.free_context(&cctx);
@@ -799,12 +837,27 @@ centered_crop_(int in_w, int in_h, int out_w, int out_h)
 
 }  // namespace
 
+VideoToRgbStage::SrcColor
+VideoToRgbStage::src_color(int colorspace, int color_range, int height)
+{
+  SrcColor c;
+  // AVCOL_RANGE_UNSPECIFIED means limited for YUV, which is the
+  // convention every decoder applies to an untagged stream.
+  c.full_range = (color_range == AVCOL_RANGE_JPEG);
+  // The MATRIX, likewise. Untagged falls back on the size convention
+  // every decoder uses: BT.709 for HD and above, BT.601 below it.
+  c.bt709 = (colorspace == AVCOL_SPC_BT709)
+            || (colorspace == AVCOL_SPC_UNSPECIFIED && height > 576);
+  return c;
+}
+
 void
-VideoToRgbStage::ensure_sws_(int w, int h, int dec_pix_fmt)
+VideoToRgbStage::ensure_sws_(int w, int h, int dec_pix_fmt, SrcColor color)
 {
   if (_sws_chroma && _sws_rgb
       && w == _last_w && h == _last_h
-      && dec_pix_fmt == _last_dec_pix_fmt) {
+      && dec_pix_fmt == _last_dec_pix_fmt
+      && _last_color_valid && color == _last_color) {
     return;
   }
   // Surface resolution / pix_fmt changes -- they invalidate any
@@ -888,9 +941,52 @@ VideoToRgbStage::ensure_sws_(int w, int h, int dec_pix_fmt)
     return;
   }
 
+  // THE COLOUR HALF, which sws_getContext does not take. Without it
+  // swscale runs its default -- BT.601, limited -- whatever the frame
+  // carries, and a BT.709 clip comes back hue-tilted with no warning.
+  //
+  // Both contexts, and for different reasons. The RGB pass is where the
+  // matrix and the swing are applied, so it gets the source's. The
+  // CHROMA pass is YUV->YUV and needs no matrix, but it still has a
+  // range opinion: its destination is plain YUV444P, which swscale
+  // treats as limited, so a full-range source handed to it unasked is
+  // quietly compressed to studio swing before the RGB pass ever sees
+  // it. Telling it both ends are the source's range makes it a pure
+  // chroma upsample, which is all it is here for.
+  auto& sws = _libs->swscale().api;
+  const int* src_cf =
+      sws.get_coefficients(color.bt709 ? SWS_CS_ITU709 : SWS_CS_ITU601);
+  const int* dst_cf = sws.get_coefficients(SWS_CS_DEFAULT);
+  const int src_full = color.full_range ? 1 : 0;
+  int crc = sws.set_colorspace_details(_sws_chroma, src_cf, src_full,
+                                       src_cf, src_full,
+                                       0, 1 << 16, 1 << 16);
+  // RGB is always full-swing, whatever the YUV was.
+  int rrc = sws.set_colorspace_details(_sws_rgb, src_cf, src_full,
+                                       dst_cf, 1,
+                                       0, 1 << 16, 1 << 16);
+  if ((crc < 0 || rrc < 0) && !_sws_color_warned) {
+    // Said once, and NOT fatal: the conversion still runs, on
+    // swscale's defaults. What it costs is a hue tilt on a BT.709
+    // source, which is exactly the thing nothing else would report.
+    _sws_color_warned = true;
+    session()->warn(fmt(
+      "video-to-rgb('{}'): swscale declined the colour description "
+      "(chroma {}, rgb {}) for pix_fmt {}; falling back on its default "
+      "BT.601 limited, which tilts hue on a {} source",
+      this->id(), crc, rrc, dec_pix_fmt,
+      color.bt709 ? "BT.709" : "full-range"));
+  }
+  session()->info(fmt(
+    "video-to-rgb('{}'): source colour {} {}, read from the frame",
+    this->id(), color.bt709 ? "BT.709" : "BT.601",
+    color.full_range ? "full range" : "limited range"));
+
   _last_w = w;
   _last_h = h;
   _last_dec_pix_fmt = dec_pix_fmt;
+  _last_color = color;
+  _last_color_valid = true;
 }
 
 enum AVPixelFormat
@@ -1153,17 +1249,14 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
       // 219/255 = 0.859 of the contrast and lifts black to 16. It is
       // invisible on a single decode -- the picture is merely a little
       // flat -- and compounds in a graph that re-reads its own output.
-      // AVCOL_RANGE_UNSPECIFIED means limited for YUV, which is the
-      // convention every decoder applies to an untagged stream.
-      const bool src_full_range =
-          (_yuv_in->color_range == AVCOL_RANGE_JPEG);
-      // The MATRIX, likewise. Untagged falls back on the size
-      // convention every decoder uses: BT.709 for HD and above, BT.601
-      // below it -- which is also what this tree's own writer emits.
-      const bool src_bt709 =
-          (_yuv_in->colorspace == AVCOL_SPC_BT709) ||
-          (_yuv_in->colorspace == AVCOL_SPC_UNSPECIFIED &&
-           _yuv_in->height > 576);
+      // Through src_color(), NOT a copy of the rule: the swscale path
+      // makes the same decision, and two spellings of it is how the two
+      // came to disagree in the first place.
+      const SrcColor sc = src_color(_yuv_in->colorspace,
+                                    _yuv_in->color_range,
+                                    _yuv_in->height);
+      const bool src_full_range = sc.full_range;
+      const bool src_bt709      = sc.bt709;
       auto shared =
           metal_compute::make_shared_storage(*_mc, need, session());
       bool mok = false;
@@ -1236,7 +1329,22 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
         src = _sw_frame;
       }
     }
-    ensure_sws_(src->width, src->height, src->format);
+    // THE COLOUR COMES OFF `_yuv_in`, NOT off `src`, and the difference
+    // is the whole of a bug worth naming: av_hwframe_transfer_data moves
+    // PIXELS, not properties, so on the hardware path `_sw_frame` has
+    // colorspace and color_range at their defaults -- UNSPECIFIED --
+    // however well tagged the file is. src_color() then falls back on
+    // the size convention, which is BT.601 at or below 576 lines, and a
+    // 544-line BT.709 clip decoded as BT.601 with nothing said.
+    //
+    // MEASURED before this line moved: the same BT.709 file through the
+    // hardware and software paths came back 40.9 dB apart, red worst,
+    // blue nearly clean -- the 601/709 signature again, this time
+    // between two paths of the same stage. `_yuv_in` is the decoder's
+    // own frame and carries the tags in both cases.
+    ensure_sws_(src->width, src->height, src->format,
+                src_color(_yuv_in->colorspace, _yuv_in->color_range,
+                          _yuv_in->height));
     if (_sws_chroma && _sws_rgb) {
       auto tb = frame_to_tensor_beat_(src, timestamp_us, camera_name);
       co_await ctx.write(0, std::move(tb));
@@ -1320,7 +1428,26 @@ VideoToRgbStage::decode_segment_(RuntimeContext& ctx,
   size_t au_idx         = 0;
   for (const auto& [off, len] : aus) {
     const std::uint8_t* p = seg.data.data() + off;
-    const bool au_idr = au_contains_idr_(p, len, annexb);
+    // CAN A FRESHLY-OPENED DECODER START HERE?
+    //
+    // For H.264 that is a scan for an IDR NAL, and it has to be: the
+    // live source has no container to ask, and delivers SPS/PPS/IDR
+    // in-band on every IDR. For ANY OTHER codec the scan is not merely
+    // unhelpful, it is a permanent no -- au_contains_idr_ reads H.264
+    // NAL framing, and FFV1 has none, so it returns false for every
+    // packet and the gate below drops the entire stream in silence.
+    // MEASURED before this line: an ffv1.mkv decoded 0 of 6 frames and
+    // logged one "dropping non-IDR AUs until next IDR".
+    //
+    // So: the NAL scan where it means something, the container's flag
+    // everywhere else. That also fixes HEVC, which this scan never
+    // matched either -- it masks & 0x1F and tests type 5, which is
+    // H.264's encoding of an IDR; HEVC's are types 19/20 in a different
+    // bit layout, so an HEVC stream could not sync here by this route.
+    const bool nal_framed =
+        seg.codec_id == static_cast<unsigned>(AV_CODEC_ID_H264);
+    const bool au_idr = nal_framed ? au_contains_idr_(p, len, annexb)
+                                   : seg.key_frame;
     if (au_idr) {
       // New GOP: clear the HW-broken flag so HW is retried.
       _hw_broken_this_gop = false;
@@ -1557,7 +1684,12 @@ VideoToRgbStage::flush_decoder_(RuntimeContext& ctx)
           src = _sw_frame;
         }
       }
-      ensure_sws_(src->width, src->height, src->format);
+      // `_yuv_in`, not `src` -- see the note at the other call site:
+      // av_hwframe_transfer_data does not carry the colour description
+      // onto the software frame.
+      ensure_sws_(src->width, src->height, src->format,
+                  src_color(_yuv_in->colorspace, _yuv_in->color_range,
+                            _yuv_in->height));
       if (_sws_chroma && _sws_rgb) {
         // No source AU for B-frame reorder buffers drained at EOS;
         // stamp them with wall-clock now so consumers still see a

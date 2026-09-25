@@ -9,6 +9,7 @@
 #include "generative-models/shared/mma-splitk.h"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -343,6 +344,25 @@ class MetalMiniMaxH3VideoVae {
     _tile_progress = std::move(fn);
   }
 
+  // A COOPERATIVE STOP, checked between tiles and between clips of an
+  // ENCODE. Optional; unset means nothing ever stops.
+  //
+  // Those are real interruption points and not merely convenient ones:
+  // a tile commits its command stream and WAITS on it, so a check
+  // between two of them is reached with the GPU idle and the stop is
+  // bounded by one tile. That is the distinction this tree keeps having
+  // to make -- checking between units of work only interrupts anything
+  // when the units are separately committed, and where a loop encodes
+  // the whole job into one command buffer the same check can only
+  // observe a request that was already set.
+  //
+  // On a stop the call returns an EMPTY buffer and leaves `err`
+  // untouched, because a stop is not a failure. A caller distinguishes
+  // it from a real failure by asking its own stop predicate, which is
+  // what encode_references does.
+  void set_stop(std::function<bool()> fn) { _stop = std::move(fn); }
+  bool stopping() const { return _stop && _stop(); }
+
  private:
   MetalMiniMaxH3VideoVae() = default;
 
@@ -541,6 +561,7 @@ class MetalMiniMaxH3VideoVae {
   // is set by decode_video (chunks x tiles) so the bar spans the whole
   // clip; a bare decode_tiled_ call sets it to its own tile count.
   genai::VaeTileProgressFn _tile_progress;
+  std::function<bool()>    _stop;
   int _prog_done = 0;
   int _prog_total = 0;
   bool _use_mma2 = false;

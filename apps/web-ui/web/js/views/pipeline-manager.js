@@ -2244,6 +2244,12 @@ function mountEditor(container, opts = {}) {
         ? !!f.present
         : (f.current !== undefined && f.current !== null);
     let input, read, unsetBtn = null, datalist = null, browseBtn = null;
+    // Set by the branch that actually renders a JSON textarea, never
+    // re-derived from f.type further down. The auto-apply wiring at the
+    // bottom has to agree with what was rendered, and a second type list
+    // kept in step by hand is the stale fall-through this tree keeps
+    // finding: the final `else` also catches a type neither list knows.
+    let isJson = false;
     // Two-state fields (numbers, JSON) have no "present but empty" reading --
     // an empty number is not a number, an empty box is not valid JSON -- so
     // blank IS unset and `read()` already omits the key. They still need the
@@ -2252,6 +2258,14 @@ function mountEditor(container, opts = {}) {
     // distinguishes unset from set. Assigned per branch; called after any
     // programmatic change to the box.
     let syncUnset = () => {};
+    // Drops the "did not parse" mark on a JSON box. Assigned by the
+    // auto-apply wiring at the bottom and called from anywhere that sets
+    // `input.value` PROGRAMMATICALLY: that fires no `input` event, so the
+    // listener which normally clears the mark never runs and a box the
+    // user has just emptied would keep wearing the warning for a value
+    // it no longer holds. Declared here, assigned later -- every caller
+    // is a click handler, so it runs long after the assignment.
+    let clearJsonMark = () => {};
     const emptyMeansUnset = () => {
       syncUnset = () => {
         const unset = input.value.trim() === '';
@@ -2459,6 +2473,7 @@ function mountEditor(container, opts = {}) {
       read = textTriState();     // same unset-vs-empty split as `string`
     } else {
       // array / object / any -> JSON textarea.
+      isJson = true;
       input = el('textarea', { id, disabled, placeholder },
         present ? JSON.stringify(f.current ?? null, null, 2) : '');
       // An empty JSON box is not a value either (it does not parse), so blank
@@ -2471,9 +2486,10 @@ function mountEditor(container, opts = {}) {
       unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
         disabled, onclick: () => {
           if (input.value.trim() === '') { input.focus(); return; }
-          input.value = ''; syncUnset(); input.focus();
-          // Safe to commit even though the JSON box has no blur-commit: an
-          // empty box always reads cleanly as "unset", never a parse error.
+          input.value = ''; syncUnset(); clearJsonMark(); input.focus();
+          // An empty box always reads cleanly as "unset", never a parse
+          // error -- so Clear commits whatever the box held before it,
+          // valid or not.
           if (onCommit) { onCommit(); }
         } });
       emptyMeansUnset();
@@ -2580,12 +2596,55 @@ function mountEditor(container, opts = {}) {
     // fires on blur-after-edit (and Enter), so tabbing through untouched
     // fields costs nothing; onCommit self-gates on the pipeline being
     // stopped. `text` is a plain-string textarea that never throws on read,
-    // so it commits on blur like `string`; only the JSON textareas
-    // (array/object/any) are excluded -- a half-typed blob would just throw
-    // on every blur.
+    // so it commits on blur like `string`.
     if (onCommit && (f.type === 'string' || f.type === 'text'
         || f.type === 'int' || f.type === 'uint' || f.type === 'real')) {
       input.addEventListener('change', () => onCommit());
+    } else if (onCommit && isJson) {
+      // JSON TEXTAREAS COMMIT ON BLUR TOO, once the box parses.
+      //
+      // They were excluded because a half-typed blob throws on read, and
+      // the exclusion was worse than the throw it avoided. applyConfig
+      // reads EVERY input, so a hand-edit here was not merely
+      // uncommitted -- it rode out on whatever committed next. Blur a
+      // neighbouring string field, or pick a path with Browse, and the
+      // edit went with it; touch nothing else and switch stage, and it
+      // was discarded without a word. That is the unpredictable part:
+      // not that the edit waited, but that WHEN it landed was decided by
+      // an unrelated field. The same reading is why a half-typed box is
+      // not harmless either -- it makes the neighbour's commit fail too,
+      // and the neighbour is where the error surfaces.
+      //
+      // So: parse first, commit only on success, and when it does not
+      // parse SAY SO on the box itself. A toast on every blur is what
+      // the old comment was right to avoid; a silent no-op is what sent
+      // the user looking for the bug in the stage.
+      //
+      // THE PHONE SHEET HAS THIS RULE TOO, in phone/phone-config.js --
+      // it renders its own controls, so the rule is copied rather than
+      // shared, and a value that applies on one shell and not the other
+      // is the drift this directory has already seen once. Change both,
+      // and phone-config.test.mjs pins that copy.
+      const markBad = (bad) => {
+        input.classList.toggle('field-invalid', bad);
+        if (bad) { input.title = t('pl.json_invalid'); }
+        else { input.removeAttribute('title'); }
+      };
+      // Typing is the fix in progress -- drop the mark rather than leave
+      // it nagging through every keystroke of a correction. Browse also
+      // fires `input` before it commits, so a pick clears a stale mark.
+      clearJsonMark = () => markBad(false);
+      input.addEventListener('input', () => markBad(false));
+      input.addEventListener('change', () => {
+        try {
+          read();
+        } catch (e) {
+          markBad(true);
+          return;
+        }
+        markBad(false);
+        onCommit();
+      });
     }
     return { field, read };
   }

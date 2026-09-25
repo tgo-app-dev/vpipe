@@ -463,8 +463,34 @@ encode_references(const std::vector<MediaReference>& refs,
       models.progress(std::min(done, total_work), total_work, detail);
     }
   };
+  auto stopped = [&]() {
+    return models.stopping && models.stopping();
+  };
+  // A STOP IS NOT A FAILURE: false, and `err` left exactly as it was.
+  // An empty reason is what the caller matches on, so nothing has to
+  // recognise a message.
+  auto bail_stop = [&]() { return false; };
+
+  // REACH INTO THE VIDEO VAE, which is where the time is -- 96% of a
+  // reference encode, and one long clip can spend minutes in a single
+  // phase. Bounding a stop by "the current reference" would leave the
+  // request people actually wait through no more interruptible than
+  // before. The VAE checks between tiles, each of which committed and
+  // waited, so the bound is one tile.
+  //
+  // CLEARED ON THE WAY OUT. The VAE outlives this call -- the stage
+  // holds it across requests -- so a predicate left behind would be
+  // consulted by the next encode, whose RuntimeContext may be gone.
+  struct VaeStopGuard {
+    MetalMiniMaxH3VideoVae* vae;
+    ~VaeStopGuard() { if (vae != nullptr) { vae->set_stop(nullptr); } }
+  } vae_stop_guard{models.video_vae};
+  if (models.video_vae != nullptr && models.stopping) {
+    models.video_vae->set_stop(models.stopping);
+  }
 
   for (std::size_t i = 0; i < refs.size(); ++i) {
+    if (stopped()) { return bail_stop(); }
     const MediaReference& m = refs[i];
     const std::string where = "reference " + std::to_string(i + 1);
     const char* kind =
@@ -741,6 +767,14 @@ encode_references(const std::vector<MediaReference>& refs,
         metal_compute::SharedBuffer mom =
             models.video_vae->encode_video(in, use, th, tw, &lf, &eerr);
         if (mom.empty() || lf <= 0) {
+          // A STOP COMES BACK THROUGH HERE, as an empty buffer with no
+          // reason -- that is the VAE's contract for one, because a
+          // stop is not a failure. Asking before reporting is what
+          // keeps "the video VAE encode failed (unknown error)" off the
+          // screen of somebody who pressed stop. MEASURED before this
+          // check existed: a timer-fired stop 14 s into a 2048x2048
+          // reference was served in 7.6 s and then filed as a failure.
+          if (stopped()) { return bail_stop(); }
           return fail(where + ": the video VAE encode failed (" +
                       (eerr.empty() ? "unknown error" : eerr) + ")");
         }
@@ -796,6 +830,12 @@ encode_references(const std::vector<MediaReference>& refs,
   // ---- the presentation ------------------------------------------------
   // One conditioner call over the whole request: the labels are numbered
   // across references, so this cannot be done a reference at a time.
+  //
+  // THE LAST CHANCE TO STOP CHEAPLY. What follows is a single call with
+  // no hook to offer, so a stop arriving inside it is served when it
+  // returns; checking here is what keeps a stop from paying for a
+  // conditioner run whose output is about to be thrown away.
+  if (stopped()) { return bail_stop(); }
   if (models.text != nullptr) {
     std::vector<MiniMaxH3TextEncoder::Reference> pres;
     pres.reserve(refs.size());

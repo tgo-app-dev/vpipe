@@ -93,6 +93,15 @@ endif()
 if(APPLE AND NOT OPENSSL_ROOT_DIR AND EXISTS /opt/homebrew/opt/openssl@3)
     set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
 endif()
+# The metal-compute facet of /api/system/status (this PROCESS's GPU
+# allocation, the never-evicted kernel caches, the residency set) needs
+# the same guard the library is built under -- it is PRIVATE there, so
+# without this the block compiles out silently and the endpoint simply
+# reports fewer fields than it looks like it does.
+if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
+    target_compile_definitions(vpipe-web-ui PRIVATE VPIPE_BUILD_APPLE_SILICON=1)
+endif()
+
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
     target_sources(vpipe-web-ui PRIVATE tls-context.cc)

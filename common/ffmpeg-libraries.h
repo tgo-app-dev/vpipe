@@ -17,6 +17,7 @@ extern "C" {
 #include <libavutil/log.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
 #include <libavutil/samplefmt.h>
 #include <libavfilter/avfilter.h>
@@ -62,6 +63,11 @@ public:
     decltype(&::av_frame_free)          frame_free;
     decltype(&::av_frame_unref)         frame_unref;
     decltype(&::av_frame_get_buffer)    frame_get_buffer;
+    // Names a pixel format for a message. Through the library rather
+    // than a switch here: a hand-written list of format names is one
+    // more thing to go stale, and this one is only ever read by a human
+    // who is already having a bad time.
+    decltype(&::av_get_pix_fmt_name)    get_pix_fmt_name;
     decltype(&::av_rescale_q)           rescale_q;
     decltype(&::av_rescale_q_rnd)       rescale_q_rnd;
     decltype(&::av_get_sample_fmt_name) get_sample_fmt_name;
@@ -181,6 +187,11 @@ public:
     decltype(&::sws_getCachedContext) get_cached_context;
     decltype(&::sws_scale)            scale;
     decltype(&::sws_freeContext)      free_context;
+    // The COLOUR half of a conversion, which sws_getContext does not
+    // take: without these a YUV->RGB context runs swscale's default,
+    // BT.601 limited, whatever the frame actually carries.
+    decltype(&::sws_setColorspaceDetails) set_colorspace_details;
+    decltype(&::sws_getCoefficients)      get_coefficients;
   } api{};
 };
 

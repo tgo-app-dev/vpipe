@@ -407,6 +407,13 @@
    default applies. Visually distinct from a field set to the empty
    string, which is a different configuration. */
 .ph-field.unset .ph-input { border-style: dashed; opacity: .75; }
+/* A JSON box that did not parse when it lost focus, so its value was NOT
+   applied. Auto-apply is silent by design -- the value simply goes -- so
+   the one case where it declines has to be visible, and on a phone there
+   is no hover to explain it. The :focus twin keeps the warning up while
+   the box is being corrected, which is exactly when it is being read. */
+.ph-field.bad-json .ph-input,
+.ph-field.bad-json .ph-input:focus { border-color: var(--danger); }
 .ph-textarea { resize: vertical; min-height: 58px; }
 .ph-select { height: 38px; }
 .ph-apply { width: 100%; justify-content: center; margin-top: 12px;

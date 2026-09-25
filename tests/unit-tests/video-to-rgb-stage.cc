@@ -15,6 +15,8 @@
 #include "pipeline/typed-stage.h"
 #include "stages/load-video-stage.h"
 #include "stages/save-video-stage.h"
+#include <array>
+#include "pipeline/stage-config.h"
 #include "stages/audio-video/video-to-rgb-stage.h"
 #include "stages/audio-video/video-tokens.h"
 
@@ -274,6 +276,354 @@ make_solid_color_segment_(Session&        sess,
   return !out.data.empty();
 }
 
+}
+
+// WHICH MATRIX AND WHICH SWING the source YUV is, read off the frame.
+//
+// This stage converts two ways -- a Metal kernel for hardware NV12, and
+// swscale for everything else -- and the rule has to be ONE rule or the
+// same file decodes to different colours depending on whether hardware
+// decode happened to engage. It was two: the Metal path read the frame's
+// tags from the start and swscale never called
+// sws_setColorspaceDetails at all, so it ran BT.601 limited on
+// everything. MEASURED on one picture encoded both ways, through the CPU
+// path: 37.8 dB where the files' own codec noise explains 42.6, with the
+// per-channel split -- red 34.8, green 39.7, blue 42.6 -- that is the
+// 601/709 luma difference and nothing else.
+//
+// Tested through the static because the rule needs neither a decoder nor
+// a GPU, and because it is the half that fails SILENTLY: a hue tilt on
+// somebody else's footage looks like somebody else's footage.
+// EVERY VALUE THE DROPDOWN OFFERS IS ONE THE STAGE RECOGNISES.
+//
+// `hwaccel` and `output_dtype` are closed sets, and each is written down
+// three times: in the doc, in the if-chain that reads it, and in the
+// `choices` list the editor renders as a dropdown. The list and the
+// chain have to agree in both directions or the editor suggests a value
+// the stage does not take.
+//
+// AND THE FAILURE HERE IS QUIETER THAN A REFUSAL. Unlike the closed keys
+// on rgb-to-video, these two COERCE: an unrecognised value warns and
+// falls back to `auto` / `f32` rather than failing the stage. So a typo
+// -- or a stale dropdown entry -- does not stop the graph, it silently
+// runs a different decode route, which is exactly the kind of thing
+// somebody later measures and cannot explain. The warning is the only
+// signal, so that is what this reads.
+namespace {
+// Session::warn routes to the UI delegate, not the log delegate -- a
+// LogDelegateIntf here catches nothing at all, which reads exactly like
+// "the stage did not warn".
+struct WarnCatcher : public UiDelegateIntf {
+  std::vector<std::string> lines;
+  void error(const VpipeFormat& f) override { lines.push_back(f()); }
+  void warn (const VpipeFormat& f) override { lines.push_back(f()); }
+  void info (const VpipeFormat&) override {}
+  UiInputStatus getline(const VpipeFormat&, std::string&,
+                        const std::function<bool()>&) override
+  {
+    return UiInputStatus::Eof;
+  }
+  std::unique_ptr<UiTextStream> open_text_stream() override
+  {
+    return std::make_unique<NullUiTextStream>();
+  }
+};
+
+// Builds a stage with `key` = `val` and returns whether it complained
+// about that key. The delegate is installed BEFORE the stage is built,
+// because the read happens in the constructor.
+bool warned_about_(const std::string& key, const std::string& val) {
+  Session sess;
+  auto cap = std::make_unique<WarnCatcher>();
+  WarnCatcher* raw = cap.get();
+  sess.set_ui_delegate(std::move(cap));
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign(key, FlexData::make_string(val));
+  VideoToRgbStage st(&sess, "v2r", std::vector<InEdge>{}, cfg);
+  for (const std::string& m : raw->lines) {
+    if (m.find(key) != std::string::npos) { return true; }
+  }
+  return false;
+}
+}  // namespace
+
+// THE CONTAINER'S COLOUR DESCRIPTION REACHES THE DECODER.
+//
+// This stage builds its decoder from the segment's `extradata`, not from
+// an AVStream, so nothing was doing what avcodec_parameters_to_context
+// does -- and the only colour it could ever see was the bitstream's own
+// SPS VUI. An mp4 that tags only its `colr` box has no VUI at all, so it
+// arrived untagged and src_color() fell back on the size convention: a
+// 544-line BT.709 clip read as BT.601. MEASURED against ffmpeg's decode
+// of the same file, 40.0 dB with red worst and blue nearly clean, which
+// is the 601/709 signature; 46.6 dB and no asymmetry once seeded.
+//
+// Driven by SETTING the segment's fields rather than by finding a file
+// that tags one way and not the other: the property under test is that
+// these fields are honoured, and a fixture file would also be testing
+// what ffmpeg chooses to write into a container.
+// A CODEC WITH NO NAL FRAMING STILL DECODES.
+//
+// The sync gate asks "can a freshly-opened decoder start at this access
+// unit", and for H.264 it answers by scanning for an IDR NAL -- which it
+// must, because the live source has no container to ask and sends
+// SPS/PPS/IDR in-band. That scan was applied to EVERY codec. FFV1 has no
+// NAL framing at all, so it answered false for every packet and the gate
+// dropped the whole stream: an ffv1.mkv decoded 0 of 6 frames, logging
+// one "dropping non-IDR AUs until next IDR" and nothing else. Silence,
+// not an error.
+//
+// Two things made it hard to see from the outside. The AVCC splitter is
+// accidentally HARMLESS here -- it reads the packet's first four bytes
+// as a NAL length (4230479876 against a 162629-byte packet), bails, and
+// its tail rule then emits the whole packet as one AU, which is exactly
+// right. And the drop message prints ONCE per desync, so a long stream
+// produces a single INFO line and no frames.
+//
+// End to end through load-video because that is the path that broke;
+// the unit underneath is an inline ternary with no seam to test.
+TEST(video_to_rgb_stage, a_codec_without_nal_framing_still_decodes) {
+  Session sess;
+  const string mkv = tmp_path_("ffv1clip", ".mkv");
+  remove(mkv.c_str());
+
+  // ---- write a solid-colour FFV1 clip ------------------------------
+  {
+    auto pl = make_unique<Pipeline>("w", &sess);
+    auto src_u = make_unique<SolidYuvSource>(
+        &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->target_frames = 4;
+    src_u->width = 160;
+    src_u->height = 120;
+    src_u->y_level = 150;
+    src_u->u_level = 60;
+    src_u->v_level = 200;
+    src_u->allocate_oports(1);
+    auto* src = static_cast<SolidYuvSource*>(
+        pl->insert_stage(std::move(src_u)));
+    FlexData cfg = FlexData::make_object();
+    {
+      auto o = cfg.as_object();
+      o.insert("output_url", FlexData::make_string(mkv));
+      o.insert("enable_audio", FlexData::make_bool(false));
+      // FFV1: lossless, intra-only, and -- the point here -- not a NAL
+      // codec. Also licence-clean, unlike libx264.
+      o.insert("video_codec", FlexData::make_string("ffv1"));
+    }
+    auto enc_u = make_unique<SaveVideoStage>(
+        &sess, "enc", vector<InEdge>{{src, 0}}, std::move(cfg));
+    pl->insert_stage(std::move(enc_u));
+    PipelineRuntime rt(pl.get(), &sess);
+    if (!rt.launch()) { return; }
+    rt.wait_idle();
+    rt.stop();
+  }
+  // No ffv1 encoder in this FFmpeg build: skip rather than fail.
+  {
+    std::FILE* f = std::fopen(mkv.c_str(), "rb");
+    if (f == nullptr) { return; }
+    std::fclose(f);
+  }
+
+  // ---- read it back through the real path ---------------------------
+  Session s2;
+  auto pl = make_unique<Pipeline>("r", &s2);
+  FlexData lcfg = FlexData::make_object();
+  lcfg.as_object().insert("input_url", FlexData::make_string(mkv));
+  auto load_u = make_unique<LoadVideoStage>(
+      &s2, "load", vector<InEdge>{}, std::move(lcfg));
+  auto* load = static_cast<LoadVideoStage*>(
+      pl->insert_stage(std::move(load_u)));
+  FlexData ccfg = FlexData::make_object();
+  {
+    auto o = ccfg.as_object();
+    o.insert("output_dtype", FlexData::make_string("u8"));
+    // There is no hardware FFV1 decoder, so this would fall back
+    // anyway; pinning it keeps the test about the sync gate.
+    o.insert("hwaccel", FlexData::make_string("none"));
+  }
+  auto cvt_u = make_unique<VideoToRgbStage>(
+      &s2, "cvt", vector<InEdge>{{load, 0}}, std::move(ccfg));
+  auto* cvt = static_cast<VideoToRgbStage*>(
+      pl->insert_stage(std::move(cvt_u)));
+  auto sink_u = make_unique<TensorBeatSink>(
+      &s2, "sink", vector<InEdge>{{cvt, 0}}, FlexData::make_object());
+  auto* sink = static_cast<TensorBeatSink*>(
+      pl->insert_stage(std::move(sink_u)));
+  PipelineRuntime rt(pl.get(), &s2);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  remove(mkv.c_str());
+
+  // THE ASSERTION IS "ANY AT ALL". The bug was not a wrong pixel, it
+  // was an empty stream.
+  const bool got = !sink->collected().empty();
+  EXPECT_TRUE(got);
+  std::printf("[video_to_rgb] ffv1: %zu frame(s) decoded%s\n",
+              sink->collected().size(),
+              got ? "" : "   <-- the sync gate dropped the stream");
+  if (!got) { return; }
+  // And it is the picture, not noise: a solid frame stays solid.
+  const TensorBeat& t = sink->collected()[0];
+  const std::uint8_t* d = t.as_u8();
+  if (d != nullptr && t.data.size() >= 3) {
+    const std::size_t plane = t.data.size() / 3;
+    bool flat = true;
+    for (std::size_t i = 1; i < plane && flat; i += 37) {
+      if (std::abs((int)d[i] - (int)d[0]) > 2) { flat = false; }
+    }
+    EXPECT_TRUE(flat);
+  }
+}
+
+TEST(video_to_rgb_stage, the_segments_colour_reaches_the_decode) {
+  Session sess;
+  EncodedSegment base;
+  // Mid grey carries no chroma, so pick something the two matrices
+  // disagree about: this is a green-ish YUV.
+  if (!make_solid_color_segment_(sess, 150, 60, 80, 320, 240, 2, base)) {
+    return;                       // no encoder in this build; skip
+  }
+
+  auto decode_with = [&](int csp) {
+    EncodedSegment seg = base;
+    seg.colorspace  = csp;
+    seg.color_range = AVCOL_RANGE_MPEG;
+    Session s2;
+    auto pl = make_unique<Pipeline>("p", &s2);
+    auto src_u = make_unique<OneSegmentSource>(
+        &s2, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->seg = seg;
+    src_u->allocate_oports(1);
+    auto* src = static_cast<OneSegmentSource*>(
+        pl->insert_stage(std::move(src_u)));
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("output_dtype",
+                                     FlexData::make_string("u8"));
+    // Software decode: the Metal path reads the same fields but only
+    // takes hardware NV12, and this must not depend on what the box has.
+    cfg.as_object().insert_or_assign("hwaccel",
+                                     FlexData::make_string("none"));
+    auto cvt_u = make_unique<VideoToRgbStage>(
+        &s2, "cvt", vector<InEdge>{{src, 0}}, cfg);
+    auto* cvt = static_cast<VideoToRgbStage*>(
+        pl->insert_stage(std::move(cvt_u)));
+    auto sink_u = make_unique<TensorBeatSink>(
+        &s2, "sink", vector<InEdge>{{cvt, 0}}, FlexData::make_object());
+    auto* sink = static_cast<TensorBeatSink*>(
+        pl->insert_stage(std::move(sink_u)));
+    PipelineRuntime rt(pl.get(), &s2);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    std::array<int, 3> px{-1, -1, -1};
+    if (!sink->collected().empty()) {
+      const TensorBeat& t = sink->collected()[0];
+      const std::uint8_t* d = t.as_u8();
+      if (d != nullptr && t.data.size() >= 3) {
+        const std::size_t plane = t.data.size() / 3;
+        px = { d[0], d[plane], d[2 * plane] };
+      }
+    }
+    return px;
+  };
+
+  const auto as601 = decode_with(AVCOL_SPC_SMPTE170M);
+  const auto as709 = decode_with(AVCOL_SPC_BT709);
+  EXPECT_TRUE(as601[0] >= 0);
+  EXPECT_TRUE(as709[0] >= 0);
+  // Same bytes, two declared matrices: the RGB must differ, or the
+  // field went nowhere. Pure luma would be equal under both, which is
+  // why the fixture is not grey.
+  const bool differs = as601 != as709;
+  EXPECT_TRUE(differs);
+  std::printf("[video_to_rgb] same frame declared 601 -> RGB %d,%d,%d; "
+              "declared 709 -> %d,%d,%d%s\n", as601[0], as601[1],
+              as601[2], as709[0], as709[1], as709[2],
+              differs ? "" : "   <-- the segment's colorspace was IGNORED");
+}
+
+TEST(video_to_rgb_stage, every_offered_choice_is_one_the_stage_knows) {
+  Session spec_sess;
+  VideoToRgbStage probe(&spec_sess, "probe", std::vector<InEdge>{},
+                        FlexData::make_object());
+  FlexData schema = config_params_to_flex(
+      resolve_config_params(probe.spec().attrs, FlexData::make_object()));
+  auto rows = schema.as_array();
+
+  int closed_keys = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    FlexData row = rows.at(i);
+    auto ro = row.as_object();
+    if (!ro.contains("choices")) { continue; }
+    const std::string key(ro.at("key").as_string(""));
+    FlexData ch = ro.at("choices");
+    auto cv = ch.as_array();
+    EXPECT_TRUE(cv.size() >= 2u);
+    ++closed_keys;
+    for (size_t c = 0; c < cv.size(); ++c) {
+      const std::string val(cv.at(c).as_string(""));
+      const bool complained = warned_about_(key, val);
+      EXPECT_FALSE(complained);
+      if (complained) {
+        std::printf("[video_to_rgb] %s=%s was OFFERED but not "
+                    "recognised\n", key.c_str(), val.c_str());
+      }
+    }
+    // The other direction: the set really is closed, so a value outside
+    // it is noticed. Without this the checks above pass on a key that
+    // takes anything and the dropdown is decoration.
+    EXPECT_TRUE(warned_about_(key, "definitely-not-a-valid-value"));
+    std::printf("[video_to_rgb] %s: %zu offered, all recognised, junk "
+                "warned\n", key.c_str(), cv.size());
+  }
+  // hwaccel and output_dtype. A zero here would mean the loop proved
+  // nothing by iterating over nothing.
+  EXPECT_TRUE(closed_keys == 2);
+}
+
+TEST(video_to_rgb_stage, src_color_reads_the_frames_tags) {
+  using V = VideoToRgbStage;
+
+  // Tagged: the tag wins at any size.
+  EXPECT_TRUE(V::src_color(AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, 480).bt709);
+  EXPECT_FALSE(
+      V::src_color(AVCOL_SPC_SMPTE170M, AVCOL_RANGE_MPEG, 1080).bt709);
+  EXPECT_FALSE(
+      V::src_color(AVCOL_SPC_BT470BG, AVCOL_RANGE_MPEG, 1080).bt709);
+
+  // Range: only JPEG is full. UNSPECIFIED is limited, which is what
+  // every decoder assumes of YUV -- getting this wrong scales the
+  // picture's contrast by 219/255 and nothing reports it.
+  EXPECT_TRUE(
+      V::src_color(AVCOL_SPC_BT709, AVCOL_RANGE_JPEG, 1080).full_range);
+  EXPECT_FALSE(
+      V::src_color(AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, 1080).full_range);
+  EXPECT_FALSE(V::src_color(AVCOL_SPC_BT709, AVCOL_RANGE_UNSPECIFIED,
+                            1080).full_range);
+
+  // UNTAGGED falls back on the size convention players use: BT.709 for
+  // HD and above, BT.601 below. 576 is the boundary and belongs to
+  // BT.601 (it is PAL's active height).
+  EXPECT_TRUE(V::src_color(AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_MPEG,
+                           1080).bt709);
+  EXPECT_TRUE(V::src_color(AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_MPEG,
+                           720).bt709);
+  EXPECT_FALSE(V::src_color(AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_MPEG,
+                            576).bt709);
+  EXPECT_FALSE(V::src_color(AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_MPEG,
+                            480).bt709);
+
+  // The two halves are independent: a full-range BT.601 file is a real
+  // thing (it is what rgb-to-video writes at color_range: full,
+  // colorspace: bt601) and must not be read as either 709 or limited.
+  const auto c = V::src_color(AVCOL_SPC_SMPTE170M, AVCOL_RANGE_JPEG, 544);
+  EXPECT_FALSE(c.bt709);
+  EXPECT_TRUE(c.full_range);
+
+  std::printf("[video_to_rgb] src_color: tag wins, UNSPECIFIED falls back "
+              "709>576 / 601 at or below, range only JPEG is full\n");
 }
 
 TEST(video_to_rgb_stage, shape_and_strides_match_segment) {

@@ -465,6 +465,9 @@ SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
   // its own output.
   _venc->color_range = static_cast<AVColorRange>(p.color_range);
   _venc->colorspace  = static_cast<AVColorSpace>(p.colorspace);
+  _venc->color_primaries =
+      static_cast<AVColorPrimaries>(p.color_primaries);
+  _venc->color_trc = static_cast<AVColorTransferCharacteristic>(p.color_trc);
   _venc->bit_rate  = _video_bitrate;
   _venc->gop_size  = _video_gop_size;
 
@@ -496,9 +499,34 @@ SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
   int rc = _libs->avcodec().api.open2(_venc, codec, &opts);
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
+    // NAME THE LIKELY CAUSE when the frames are not 4:2:0. An encoder
+    // that cannot take the pixel format it is handed fails here as a
+    // bare "Invalid argument", which says nothing about the encoder OR
+    // the format -- and since rgb-to-video can now emit 4:2:2 and 4:4:4
+    // while the default encoder (h264_videotoolbox) is 4:2:0 only, that
+    // is the first thing most people will hit on reaching for them.
+    //
+    // A GUESS, and phrased as one: this does not interrogate the codec
+    // (AVCodec::pix_fmts is deprecated and its replacement is too new to
+    // rely on), so it must not claim to know. Saying "may not accept"
+    // and naming the two that do is enough to act on.
+    const int pf = p.pix_fmt;
+    const bool subsampled_or_odd =
+        pf != AV_PIX_FMT_YUV420P && pf != AV_PIX_FMT_NV12;
+    const char* pf_name =
+        _libs->avutil().api.get_pix_fmt_name(
+            static_cast<AVPixelFormat>(pf));
     session()->error(fmt(
-        "SaveVideoStage('{}'): avcodec_open2 (video) failed: "
-        "{}", this->id(), av_err_(rc)));
+        "SaveVideoStage('{}'): avcodec_open2 (video) failed: {}{}",
+        this->id(), av_err_(rc),
+        subsampled_or_odd
+            ? fmt(" -- the frames are {} and '{}' may not accept it "
+                  "(h264_videotoolbox is yuv420p only). Set video_codec "
+                  "to libx264 or ffv1, or pix_fmt to yuv420p on the "
+                  "rgb-to-video stage",
+                  pf_name ? pf_name : "an unnamed pixel format",
+                  _video_codec)()
+            : std::string()));
   }
 
   _vstream = _libs->avformat().api.new_stream(_ofctx, codec);

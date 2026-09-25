@@ -92,6 +92,33 @@ struct EncodedSegment;
 // decode attempt fails. Remove via destructor.
 class VideoToRgbStage final : public TypedStage<VideoToRgbStage> {
 public:
+  // WHAT THE SOURCE YUV MEANS: the swing it uses and the matrix it was
+  // written with, read off the decoded frame rather than assumed.
+  //
+  // ONE ANSWER FOR BOTH PATHS. This stage converts two ways -- a Metal
+  // kernel for hardware NV12 and swscale for everything else -- and they
+  // must agree, or the same file decodes to different colours depending
+  // on whether hardware decode happened to engage. That is not a
+  // hypothetical: the Metal path read the frame's tags from the start
+  // and swscale never did, so a BT.709 clip came back hue-tilted on the
+  // CPU path alone. MEASURED before the fix, on one picture encoded both
+  // ways: 37.8 dB against the 42.6 dB the files' own codec noise
+  // explains, and the per-channel split -- red 34.8, green 39.7, blue
+  // 42.6 -- is the 601-vs-709 luma difference and nothing else.
+  //
+  // Static and public so a test can reach it without a decoder, and so
+  // the fallbacks are pinned: UNSPECIFIED range is limited (what every
+  // decoder assumes of YUV), and an UNSPECIFIED matrix is BT.709 at HD
+  // and above, BT.601 below -- the size convention players use.
+  struct SrcColor {
+    bool full_range = false;
+    bool bt709      = false;
+    bool operator==(const SrcColor& o) const noexcept {
+      return full_range == o.full_range && bt709 == o.bt709;
+    }
+  };
+  static SrcColor src_color(int colorspace, int color_range, int height);
+
   static constexpr const char* kTypeName = "video-to-rgb";
 
   enum class HwMode { Auto, Videotoolbox, None };
@@ -129,7 +156,7 @@ private:
   Job  flush_decoder_ (RuntimeContext& ctx);
   void ensure_codec_hw_(const EncodedSegment& seg);
   void ensure_codec_sw_(const EncodedSegment& seg);
-  void ensure_sws_    (int w, int h, int dec_pix_fmt);
+  void ensure_sws_    (int w, int h, int dec_pix_fmt, SrcColor color);
   void teardown_codec_();
   void teardown_sws_  ();
   std::unique_ptr<BeatPayloadIntf>
@@ -182,6 +209,12 @@ private:
   int      _last_w           = 0;
   int      _last_h           = 0;
   int      _last_dec_pix_fmt = -1;
+  // Part of the sws cache key: the colour description is baked into the
+  // contexts by sws_setColorspaceDetails, so a stream that changes it
+  // mid-run needs them rebuilt exactly as a size change does.
+  SrcColor _last_color{};
+  bool     _last_color_valid = false;
+  bool     _sws_color_warned = false;
   unsigned _last_codec_id    = 0;
 
   // Config attributes; defaults live in kSpec.attrs and are read in the

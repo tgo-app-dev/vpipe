@@ -206,6 +206,10 @@ private:
     unsigned width = 0, height = 0;
     unsigned fps_num = 0, fps_den = 0;
     unsigned sample_rate = 0, channels = 0;
+    // The container's colour description, video only; see
+    // EncodedSegment. UNSPECIFIED until cache_stream_ reads it.
+    int color_range = 0, colorspace = 2;
+    int color_primaries = 2, color_trc = 2;
     // Gapless bookkeeping for an AUDIO stream; see EncodedSegment.
     std::int64_t skip_head = 0, total_samples = 0;
     std::vector<std::uint8_t> extradata;

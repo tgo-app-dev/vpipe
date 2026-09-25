@@ -41,6 +41,7 @@ private:
   // through IOKit). Always available; no auth state needed beyond the
   // existing /api/* gating.
   HttpResponse h_system_status_(const HttpRequest&);
+  HttpResponse h_release_memory_(const HttpRequest&);
 
   // Startup permission self-test results, set once at boot. The browser
   // fetches this when it connects and shows the report in a dialog.

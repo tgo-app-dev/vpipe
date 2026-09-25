@@ -82,6 +82,12 @@ private:
   std::string   _pix_fmt_name;
   int           _pix_fmt = 0;
   bool          _full_range = false;   // config `color_range`
+  bool          _bt709 = false;        // config `colorspace`
+  // The chroma subsampling of `_pix_fmt`, as a block size. 2x2 for
+  // yuv420p, 2x1 for yuv422p, 1x1 for yuv444p (and unused for rgb24).
+  // Held rather than re-derived per frame: it decides both the averaging
+  // block and which axes may not be odd, and those two must agree.
+  int           _chroma_x = 2, _chroma_y = 2;
   std::uint64_t _frames = 0;
   bool          _header_sent = false;
   int           _w = 0, _h = 0;
