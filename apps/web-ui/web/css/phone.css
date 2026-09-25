@@ -643,6 +643,14 @@
 #app.phone .userio .io-text { font-size: 12.5px; }
 #app.phone .userio .console { font-size: 12.5px; padding: 8px 10px; }
 #app.phone .io-md-toggle { font-size: 11px; white-space: nowrap; }
+/* The console text-size control. The desktop's 20px buttons are a
+   pointer's target, not a finger's, so it takes the header strip's
+   own thumb size (.ph-act is 34x30). */
+#app.phone .tz { gap: 2px; }
+#app.phone .tz-btn,
+#app.phone .tz-size {
+  height: 30px; min-width: 30px; font-size: 12px;
+}
 /* The prompt label eats the width the input needs; it only ever says
    "waiting" or repeats the pending request, which the placeholder and
    the enabled state already convey. */

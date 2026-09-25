@@ -13,14 +13,20 @@
 // buffer); the cap is configurable in Settings.
 //
 // Embeddable pane: renders the console into `body` and appends its
-// level dropdown + Clear control into the caller-provided `actions`
-// (the host pane header). Returns a cleanup that stops the poll.
+// text-size control, level dropdown and Clear button into the
+// caller-provided `actions` (the host pane header). Returns a
+// cleanup that stops the poll and unregisters the size control.
 
 import { el, clear, toast } from '../dom.js';
 import { api } from '../api.js';
 import { t } from '../i18n.js';
+import { mountTextZoom } from '../text-zoom.js';
 
 const POLL_MS = 600;
+// Console text size, in px. Separate from the User I/O console's
+// key on purpose -- the log is skimmed for shape and someone
+// usually wants it SMALLER than the prose pane, not the same.
+const FONT_KEY = 'vpipe_log_font_px';
 
 // Fallback level list if the server doesn't return one (older backend).
 const FALLBACK_LEVELS =
@@ -65,8 +71,12 @@ export function mountLog(body, actions) {
     api.logClear().catch(() => {});
   } }, t('common.clear'));
 
+  // Text size first, then the level dropdown and Clear -- the same
+  // slot the User I/O header gives it, so the two read alike.
+  const zoom = mountTextZoom(consoleEl, FONT_KEY);
   if (actions) {
-    actions.append(el('span', { class: 'log-level-label' }, t('log.level')),
+    actions.append(zoom.el,
+                   el('span', { class: 'log-level-label' }, t('log.level')),
                    levelSel, clearBtn);
   }
 
@@ -168,5 +178,5 @@ export function mountLog(body, actions) {
     tick();
   }, POLL_MS);
 
-  return () => { stopped = true; clearInterval(timer); };
+  return () => { stopped = true; clearInterval(timer); zoom.dispose(); };
 }

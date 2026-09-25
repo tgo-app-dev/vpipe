@@ -2,11 +2,22 @@
   "id": "minimax-h3-extend-part1",
   "stages": [
     {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12,
+        "audio_shift": 3,
+        "condition_timestep": 1,
+        "audio_seconds": 0
+      }
+    },
+    {
       "id": "model-select",
       "type": "model-select",
       "iports": [],
       "config": {
-        "hf_dir": "local/MiniMax-H3-FL2VA-8bit"
+        "hf_dir": "MiniMaxAI/MiniMax-H3-FL2VA"
       }
     },
     {
@@ -14,7 +25,7 @@
       "type": "text-prompt",
       "iports": [],
       "config": {
-        "text": "integrated_multimodal_description: [Shot 1] Live-action, cinematic, shallow depth of field, warm candlelit night interior. A wide shot reveals a cramped clockmaker's workshop: dozens of antique wall clocks with brass pendulums cover the dark wooden walls, a frost-covered window at the back shows snow falling in blue night light, and a long workbench is scattered with tiny gears, tweezers, and loupes under a low green-shaded lamp. An elderly woman with silver hair in a loose bun, round brass-rimmed spectacles, a dark green wool cardigan over a cream blouse, and a worn brown leather apron sits hunched at the bench. The camera pushes in with small amplitude at slow speed as she lifts a palm-sized brass songbird from a velvet cloth. The bird is made of engraved overlapping brass feather plates, with tiny ruby-glass eyes and a small silver winding key in its back. [Shot 2] At 00:03.500, the camera cuts to a close-up of her wrinkled hands. She holds the brass songbird steady with her left hand while her right thumb and forefinger turn the silver key in small, careful twists, the ratchet clicking with each turn. The elderly woman with a soft, warm, slightly husky voice (S1) murmurs under her breath: <d>[English] Just one more turn.</d> She releases the key, and it stops with a final click. [Shot 3] At 00:06.000, the shot cuts to a static medium close-up. The woman sits on the left third of the frame, facing right, and raises her extended index finger to eye level with the brass songbird perched on it, its ruby eyes catching the candlelight. Her spectacles reflect two small candle flames. She holds completely still with her lips closed, watching the bird, expectant, her breath held. The bird remains motionless. The camera holds a static shot through the end of the video; only the candle flames flicker gently and the blurred pendulums behind her keep swinging in the background.\n\noverall_soundscape: Dozens of clocks tick in slightly offset rhythms throughout, over a quiet room tone and the faint crackle of candle wicks. The winding key produces crisp metallic ratchet clicks, and fabric rustles softly as she raises her hand, after which the ticking is the only sound.\n\nnon_diegetic_music: A delicate solo celesta motif at a slow tempo over sustained low strings, settling onto a single held, unresolved chord that stays suspended and quiet through the final seconds."
+        "text": "integrated_multimodal_description:\n[Shot 1] Live-action, cinematic, shallow depth of field, warm candlelit night interior. A wide shot reveals a cramped clockmaker's workshop: dozens of antique wall clocks with brass pendulums cover the dark wooden walls, a frost-covered window at the back shows snow falling in blue night light, and a long workbench is scattered with tiny gears, tweezers, and loupes under a low green-shaded lamp. An elderly woman with silver hair in a loose bun, round brass-rimmed spectacles, a dark green wool cardigan over a cream blouse, and a worn brown leather apron sits hunched at the bench. The camera pushes in with small amplitude at slow speed as she lifts a palm-sized brass songbird from a velvet cloth. The bird is made of engraved overlapping brass feather plates, with tiny ruby-glass eyes and a small silver winding key in its back.\n[Shot 2] At 00:03.500, the camera cuts to a close-up of her wrinkled hands. She holds the brass songbird steady with her left hand while her right thumb and forefinger turn the silver key in small, careful twists, the ratchet clicking with each turn. The elderly woman with a soft, warm, slightly husky voice (S1) murmurs under her breath: <d>[English] Just one more turn.</d> She releases the key, and it stops with a final click.\n[Shot 3] At 00:06.000, the shot cuts to a static medium close-up. The woman sits on the left third of the frame, facing right, and raises her extended index finger to eye level with the brass songbird perched on it, its ruby eyes catching the candlelight. Her spectacles reflect two small candle flames. She holds completely still with her lips closed, watching the bird, expectant, her breath held. The bird remains motionless. The camera holds a static shot through the end of the video; only the candle flames flicker gently and the blurred pendulums behind her keep swinging in the background.\n\noverall_soundscape:\nDozens of clocks tick in slightly offset rhythms throughout, over a quiet room tone and the faint crackle of candle wicks. The winding key produces crisp metallic ratchet clicks, and fabric rustles softly as she raises her hand, after which the ticking is the only sound.\n\nnon_diegetic_music:\nA delicate solo celesta motif at a slow tempo over sustained low strings, settling onto a single held, unresolved chord that stays suspended and quiet through the final seconds.\n"
       }
     },
     {
@@ -35,20 +46,7 @@
         }
       ],
       "config": {
-        "unload_when_idle": "always"
-      }
-    },
-    {
-      "id": "minimax-h3-model-config",
-      "type": "minimax-h3-model-config",
-      "iports": [],
-      "config": {
-        "video_shift": 12.0,
-        "audio_shift": 3.0,
-        "condition_timestep": 1.0,
-        "audio_seconds": 0.0,
-        "lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
-        "lora_scale": 1.0
+        "unload_when_idle": "destroy"
       }
     },
     {
@@ -97,24 +95,25 @@
         }
       ],
       "config": {
-        "height": 544,
+        "height": 576,
         "width": 960,
         "frames": 243,
         "fps": 24,
-        "steps": 8,
+        "steps": 21,
         "seed": 6,
         "i8_gemm": true,
-        "sol_attn": true,
+        "ane_ffn": false,
+        "sol_attn": false,
         "unload_when_idle": "always"
       }
     },
     {
-      "id": "vae-decode",
-      "type": "vae-decode",
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
       "iports": [
         {
           "src": "generate-video",
-          "oport": 0
+          "oport": 1
         },
         {
           "src": "model-select",
@@ -124,12 +123,12 @@
       "config": {}
     },
     {
-      "id": "audio-vae-decode",
-      "type": "audio-vae-decode",
+      "id": "vae-decode",
+      "type": "vae-decode",
       "iports": [
         {
           "src": "generate-video",
-          "oport": 1
+          "oport": 0
         },
         {
           "src": "model-select",
@@ -148,7 +147,10 @@
         }
       ],
       "config": {
-        "fps": 24
+        "fps": 24,
+        "pix_fmt": "yuv444p",
+        "color_range": "full",
+        "colorspace": "bt709"
       }
     },
     {
@@ -167,7 +169,15 @@
       "config": {
         "output_url": "minimax-h3-extend-part1.mp4",
         "enable_video": true,
-        "enable_audio": true
+        "enable_audio": true,
+        "video_codec": "ffv1",
+        "video_bitrate": 10240000,
+        "video_gop_size": 24,
+        "audio_codec": "alac",
+        "audio_bitrate": 192000,
+        "muxer_options": {
+          "movflags": "+faststart"
+        }
       }
     }
   ],

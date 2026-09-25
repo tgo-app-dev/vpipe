@@ -20,6 +20,7 @@ import { makeIcon } from '../icons.js';
 import { api } from '../api.js';
 import { t } from '../i18n.js';
 import { renderMarkdown } from '../markdown.js';
+import { mountTextZoom } from '../text-zoom.js';
 
 const POLL_MS = 600;
 
@@ -43,6 +44,13 @@ function readThinkPref() {
   try { return localStorage.getItem(THINK_KEY) === '1'; }
   catch (e) { return false; }
 }
+
+// Console text size, in px (see text-zoom.js, which owns the reading
+// and writing). Its OWN key rather than one shared with the Session
+// Log: the two panes are read for different things -- a reply is prose
+// and the log is a firehose -- and someone who wants one large usually
+// wants the other small.
+const FONT_KEY = 'vpipe_io_font_px';
 
 // Unified vpipe thinking markers. The backend detokenizers rewrite
 // every model family's reasoning begin/end tokens (Qwen <think>,
@@ -264,10 +272,13 @@ export function mountUserIo(body, actions) {
      attachImgBtn, attachAudBtn, fileImg, fileAud, sendBtn);
   const root = el('div', { class: 'userio' }, consoleEl, inputRow, hint);
   body.append(root);
-  // The pane header (owned by the workspace) carries the Thinking +
-  // Markdown toggles + the Interrupt and Clear buttons.
+  // The pane header (owned by the workspace) carries the text-size
+  // control, the Thinking + Markdown toggles, and Interrupt / Clear.
+  // Size goes FIRST, in the same slot the Session Log gives it, so the
+  // two consoles' headers read the same way.
+  const zoom = mountTextZoom(consoleEl, FONT_KEY);
   if (actions) {
-    actions.append(thinkToggle, mdToggle, interruptBtn, clearBtn);
+    actions.append(zoom.el, thinkToggle, mdToggle, interruptBtn, clearBtn);
   }
 
   // Grow the textarea with its content up to a cap, then scroll.
@@ -778,6 +789,7 @@ export function mountUserIo(body, actions) {
   return () => {
     stopped = true;
     clearInterval(timer);
+    zoom.dispose();
     window.removeEventListener('dragover', onWindowDragOver);
     window.removeEventListener('drop', onWindowDrop);
   };

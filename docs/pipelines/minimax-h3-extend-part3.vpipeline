@@ -2,38 +2,9 @@
   "id": "minimax-h3-extend-part3",
   "stages": [
     {
-      "id": "model-select",
-      "type": "model-select",
-      "iports": [],
-      "config": {
-        "hf_dir": "local/MiniMax-H3-Ref2VA-8bit"
-      }
-    },
-    {
-      "id": "text-prompt",
-      "type": "text-prompt",
-      "iports": [],
-      "config": {
-        "text": "subject_definitions:\n<Subject 1> is the elderly clockmaker in <Video 1>, with silver hair in a loose bun, round brass-rimmed spectacles, a dark green wool cardigan over a cream blouse, and a worn brown leather apron.\n<Subject 2> is the palm-sized brass mechanical songbird in <Video 1>, made of engraved overlapping brass feather plates, with tiny ruby-glass eyes and a small silver winding key in its back.\n<Subject 3> is the candlelit clockmaker's workshop in <Video 1>, with dozens of antique wall clocks and swinging brass pendulums on dark wooden walls, a workbench of tiny gears under a green-shaded lamp, and a frost-covered window with snow falling outside.\n<Video 1> is the source video whose final moment the target video continues from.\n<Audio 1> is the synchronized audio track of <Video 1>, providing the clock ticking ambience and the celesta-and-strings score to continue.\n\nsummary:\n[video continuation + audio reference] The target video continues directly from the end of <Video 1>. <Subject 2> sits still on the windowsill of <Subject 3> until <Subject 1> reaches past it, unlatches the brass catch and lifts the sash; snow and cold air enter the workshop, the bird hops onto the open frame and looks back at her, and she tells it to go. The ambience and score follow <Audio 1> without copying the signal.\n\nretention_analysis:\n<Subject 1> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - her identity, silver bun, brass-rimmed spectacles, green cardigan, cream blouse, and leather apron are retained.\n<Subject 2> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the engraved brass feather plates, ruby-glass eyes, and silver winding key are retained.\n<Subject 3> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the frosted window, wall of clocks, pendulums, workbench, lamp, and candlelight are retained, with the window newly opened.\n<Video 1> (continuation starting point): fully_preserved - [Shot 1] starts from the final framing, pose, and lighting of <Video 1>.\n<Audio 1>: reference - the offset clock ticking, room tone, and celesta and low-string score continue in the same timbre and tempo without copying the original signal.\n\ndetailed_description:\nThe target video is live-action and cinematic, with warm candlelight, a shallow depth of field, and cool blue night light from the window.\n[Shot 1] The shot continues seamlessly from the final moment of <Video 1>, keeping the same static close shot of the frost-covered window of <Subject 3>, with <Subject 2> perched motionless on the wooden sill and snow falling in blue night light beyond the glass. For the first two seconds only the snow moves. Then the weathered hand of <Subject 1> enters the frame from the right, takes hold of the small brass catch beside the bird, and turns it until it clicks free. She slides the sash upward; cold air pours in, a thin drift of snowflakes blows across the sill and settles on the brass feather plates of <Subject 2>, and the candle flames reflected in the glass bend sharply sideways.\n[Shot 2] At 00:03.500, the shot cuts to a medium shot of <Subject 1> standing at the open window, her left hand still resting on the raised sash, her cardigan and loose silver hair stirred by the draft. Snowflakes drift through the opening and melt on the workbench of <Subject 3>. She looks down at <Subject 2>, which hops from the sill onto the open wooden frame, grips it with its small brass feet, and turns its head back toward her, ruby eyes catching the lamp's green glow. <Subject 1> (S1) says quietly, in her soft, warm, slightly husky elderly voice: <d>[English] Go on, then. It's your sky.</d> Her lips close and she gives a single small nod.\n[Shot 3] At 00:07.000, the shot cuts to a static closer shot of the open window frame. <Subject 2> stands poised on the wet wood with its brass wings half-raised and still, snow settling along its back, the dark snowy night behind it and the warm workshop light on its breast. At the left edge of the frame <Subject 1> stands motionless with her hand on the sash, watching. The camera holds a static shot through the end of the video; nothing moves but the falling snow and the candlelight.\n\noverall_soundscape:\nThe offset clock ticking and room tone referenced from <Audio 1> continue underneath. The brass catch clicks and the sash slides up with a low wooden rumble, after which a soft winter wind and the hiss of snow enter the room; fabric stirs in the draft, the bird's feet tap twice on wood, and a candle gutters.\n\nnon_diegetic_music:\nThe celesta motif referenced from <Audio 1> continues at the same slow tempo over sustained low strings, thinning to a single sustained note as the window opens and holding it, unresolved, to the end."
-      }
-    },
-    {
-      "id": "minimax-h3-model-config",
-      "type": "minimax-h3-model-config",
-      "iports": [],
-      "config": {
-        "video_shift": 6.0,
-        "audio_shift": 3.0,
-        "condition_timestep": 1.0,
-        "condition_audio_timestep": 1.0,
-        "audio_seconds": 0.0,
-        "lora": "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p",
-        "lora_scale": 1.0
-      }
-    },
-    {
       "id": "load-guide",
       "type": "load-video",
+      "iports": [],
       "config": {
         "input_url": "minimax-h3-extend-part2.mp4",
         "enable_audio": false
@@ -62,7 +33,51 @@
         }
       ],
       "config": {
-        "start": -56
+        "start": -90
+      }
+    },
+    {
+      "id": "load-guide-audio",
+      "type": "load-audio",
+      "iports": [],
+      "config": {
+        "input_url": "minimax-h3-extend-part2.mp4",
+        "start_s": 6.375,
+        "duration_s": 3.75
+      }
+    },
+    {
+      "id": "guide-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-guide-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_sample_rate": 32000,
+        "channels": 2,
+        "chunk_duration_s": 3.75,
+        "max_chunk_duration_s": 60
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12,
+        "audio_shift": 3,
+        "condition_timestep": 1
+      }
+    },
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "MiniMaxAI/MiniMax-H3-Ref2VA"
       }
     },
     {
@@ -81,31 +96,6 @@
       }
     },
     {
-      "id": "load-guide-audio",
-      "type": "load-audio",
-      "config": {
-        "input_url": "minimax-h3-extend-part2.mp4",
-        "start_s": 7.791667,
-        "duration_s": 2.333333
-      }
-    },
-    {
-      "id": "guide-pcm",
-      "type": "audio-to-pcm",
-      "iports": [
-        {
-          "src": "load-guide-audio",
-          "oport": 0
-        }
-      ],
-      "config": {
-        "output_sample_rate": 32000,
-        "channels": 2,
-        "chunk_duration_s": 30.0,
-        "max_chunk_duration_s": 60.0
-      }
-    },
-    {
       "id": "stack-pcm",
       "type": "temporal-stack",
       "iports": [
@@ -117,6 +107,14 @@
       "config": {
         "mode": "audio",
         "group_size": 0
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "subject_definitions:\n<Subject 1> is the elderly clockmaker in <Video 1>, with silver hair in a loose bun, round brass-rimmed spectacles, a dark green wool cardigan over a cream blouse, and a worn brown leather apron.\n<Subject 2> is the palm-sized brass mechanical songbird in <Video 1>, made of engraved overlapping brass feather plates, with tiny ruby-glass eyes and a small silver winding key in its back.\n<Subject 3> is the candlelit clockmaker's workshop in <Video 1>, with dozens of antique wall clocks and swinging brass pendulums on dark wooden walls, a workbench of tiny gears under a green-shaded lamp, and a frost-covered window with snow falling outside.\n<Video 1> is the source video whose final moment the target video continues from.\n<Audio 1> is the synchronized audio track of <Video 1>, providing the clock ticking ambience and the celesta-and-strings score to continue.\n\nsummary:\n[video continuation + audio reference] The target video continues directly from the end of <Video 1>. <Subject 2> sits still on the windowsill of <Subject 3> until <Subject 1> reaches past it, unlatches the brass catch and lifts the sash; snow and cold air enter the workshop, the bird hops onto the open frame and looks back at her, and she tells it to go. The ambience and score follow <Audio 1> without copying the signal.\n\nretention_analysis:\n<Subject 1> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - her identity, silver bun, brass-rimmed spectacles, green cardigan, cream blouse, and leather apron are retained.\n<Subject 2> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the engraved brass feather plates, ruby-glass eyes, and silver winding key are retained.\n<Subject 3> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the frosted window, wall of clocks, pendulums, workbench, lamp, and candlelight are retained, with the window newly opened.\n<Video 1> (continuation starting point): fully_preserved - [Shot 1] starts from the final framing, pose, and lighting of <Video 1>.\n<Audio 1>: reference - the offset clock ticking, room tone, and celesta and low-string score continue in the same timbre and tempo without copying the original signal.\n\ndetailed_description:\nThe target video is live-action and cinematic, with warm candlelight, a shallow depth of field, and cool blue night light from the window.\n[Shot 1] The shot continues seamlessly from the final moment of <Video 1>, keeping the same static close shot of the frost-covered window of <Subject 3>, with <Subject 2> perched motionless on the wooden sill and snow falling in blue night light beyond the glass. For the first two seconds only the snow moves. Then the weathered hand of <Subject 1> enters the frame from the right, takes hold of the small brass catch beside the bird, and turns it until it clicks free. She slides the sash upward; cold air pours in, a thin drift of snowflakes blows across the sill and settles on the brass feather plates of <Subject 2>, and the candle flames reflected in the glass bend sharply sideways.\n[Shot 2] At 00:03.500, the shot cuts to a medium shot of <Subject 1> standing at the open window, her left hand still resting on the raised sash, her cardigan and loose silver hair stirred by the draft. Snowflakes drift through the opening and melt on the workbench of <Subject 3>. She looks down at <Subject 2>, which hops from the sill onto the open wooden frame, grips it with its small brass feet, and turns its head back toward her, ruby eyes catching the lamp's green glow. <Subject 1> (S1) says quietly, in her soft, warm, slightly husky elderly voice: <d>[English] Go on, then. It's your sky.</d> Her lips close and she gives a single small nod.\n[Shot 3] At 00:07.000, the shot cuts to a static closer shot of the open window frame. <Subject 2> stands poised on the wet wood with its brass wings half-raised and still, snow settling along its back, the dark snowy night behind it and the warm workshop light on its breast. At the left edge of the frame <Subject 1> stands motionless with her hand on the sash, watching. The camera holds a static shot through the end of the video; nothing moves but the falling snow and the candlelight.\n\noverall_soundscape:\nThe offset clock ticking and room tone referenced from <Audio 1> continue underneath. The brass catch clicks and the sash slides up with a low wooden rumble, after which a soft winter wind and the hiss of snow enter the room; fabric stirs in the draft, the bird's feet tap twice on wood, and a candle gutters.\n\nnon_diegetic_music:\nThe celesta motif referenced from <Audio 1> continues at the same slow tempo over sustained low strings, thinning to a single sustained note as the window opens and holding it, unresolved, to the end.\n"
       }
     },
     {
@@ -143,10 +141,11 @@
       "config": {
         "frames": 243,
         "reference_video_short_edge": 0,
-        "unload_when_idle": "auto",
         "attach_audio": [
           2
-        ]
+        ],
+        "max_prompt_tokens": 131072,
+        "unload_when_idle": "destroy"
       }
     },
     {
@@ -195,24 +194,24 @@
         }
       ],
       "config": {
-        "height": 544,
+        "height": 576,
         "width": 960,
         "frames": 243,
         "fps": 24,
-        "steps": 8,
+        "steps": 21,
         "seed": 8,
         "i8_gemm": true,
-        "sol_attn": true,
-        "unload_when_idle": "always"
+        "sol_attn": false,
+        "unload_when_idle": "destroy"
       }
     },
     {
-      "id": "vae-decode",
-      "type": "vae-decode",
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
       "iports": [
         {
           "src": "generate-video",
-          "oport": 0
+          "oport": 1
         },
         {
           "src": "model-select",
@@ -222,12 +221,12 @@
       "config": {}
     },
     {
-      "id": "audio-vae-decode",
-      "type": "audio-vae-decode",
+      "id": "vae-decode",
+      "type": "vae-decode",
       "iports": [
         {
           "src": "generate-video",
-          "oport": 1
+          "oport": 0
         },
         {
           "src": "model-select",
@@ -246,7 +245,10 @@
         }
       ],
       "config": {
-        "fps": 24
+        "fps": 24,
+        "pix_fmt": "yuv444p",
+        "color_range": "full",
+        "colorspace": "bt709"
       }
     },
     {
@@ -265,7 +267,15 @@
       "config": {
         "output_url": "minimax-h3-extend-part3.mp4",
         "enable_video": true,
-        "enable_audio": true
+        "enable_audio": true,
+        "video_codec": "ffv1",
+        "video_bitrate": 6400000,
+        "video_gop_size": 24,
+        "audio_codec": "alac",
+        "audio_bitrate": 192000,
+        "muxer_options": {
+          "movflags": "+faststart"
+        }
       }
     }
   ],

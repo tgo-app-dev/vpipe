@@ -6,13 +6,33 @@
       "type": "load-video",
       "iports": [],
       "config": {
-        "input_url": "minimax-h3-extend-parts.txt",
-        "format": "concat",
+        "input_url": [
+          "minimax-h3-extend-part1.mp4",
+          "minimax-h3-extend-part2.mp4",
+          "minimax-h3-extend-part3.mp4",
+          "minimax-h3-extend-part4.mp4"
+        ],
+        "enable_video": true,
+        "enable_audio": true,
         "options": {
           "safe": "0"
-        },
-        "enable_video": true,
-        "enable_audio": true
+        }
+      }
+    },
+    {
+      "id": "audio-to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-parts",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "output_sample_rate": 32000,
+        "channels": 2,
+        "chunk_duration_s": 10.125,
+        "max_chunk_duration_s": 30
       }
     },
     {
@@ -42,22 +62,6 @@
       }
     },
     {
-      "id": "audio-to-pcm",
-      "type": "audio-to-pcm",
-      "iports": [
-        {
-          "src": "load-parts",
-          "oport": 1
-        }
-      ],
-      "config": {
-        "output_sample_rate": 32000,
-        "channels": 2,
-        "chunk_duration_s": 10.0,
-        "max_chunk_duration_s": 30.0
-      }
-    },
-    {
       "id": "save-video",
       "type": "save-video",
       "iports": [
@@ -74,7 +78,7 @@
         "output_url": "minimax-h3-extend.mp4",
         "enable_video": true,
         "enable_audio": true,
-        "video_bitrate": 12000000,
+        "video_bitrate": 10240000,
         "video_gop_size": 24,
         "audio_bitrate": 192000,
         "muxer_options": {

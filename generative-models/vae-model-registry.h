@@ -371,6 +371,10 @@ public:
   virtual bool encode(const VaeEncodeRequest& req, std::vector<float>* out,
                       std::vector<int>* shape, std::string* err) = 0;
 
+  // The soft lever, as VaeDecoder::release_idle: for a manager reclaim,
+  // not for the stage's own unload. A stage whose verdict is "unload"
+  // DESTROYS the encoder and loads a new one for the next beat, so a
+  // family may implement this as a drop it cannot come back from.
   virtual void release_idle() {}
   virtual std::uint64_t resident_bytes() const { return 0; }
 };

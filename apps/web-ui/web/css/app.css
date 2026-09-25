@@ -602,6 +602,14 @@ svg.sb-spark .line {
 }
 .pm > .pane { flex: 0 0 19%; min-width: 150px; }   /* the selector list */
 .pm.no-sel > .pane { flex: 0 0 auto; }
+/* The selector : editor divider takes .pe-divider's whole appearance
+   (width, col-resize cursor, accent on hover) because it is the same
+   affordance; only the drag guard is its own. The 19% above is just
+   the STARTING width -- a drag writes flex-basis inline (see
+   applySelSplit) and the min-width keeps a hard drag left from erasing
+   the list. Without the guard the pointer paints the pipeline names
+   blue on the way past. */
+.pm > .pm-divider { user-select: none; -webkit-user-select: none; }
 .pe-editor { flex: 1 1 auto; display: flex; min-width: 0; }
 .pe-editor > .pane { min-width: 0; flex-shrink: 1; border-right: none; }
 .pe-divider {
@@ -867,6 +875,17 @@ svg.graph { display: block; width: 100%; height: 100%;
   box-shadow: 0 1px 3px rgba(0,0,0,.25);
 }
 .graph-ctl:hover { background: var(--bg-3); border-color: #475061; }
+/* The wheel-mode toggle carries an icon where its neighbours carry text
+   ("1:1", "Fit"), so it centres its child and drops the text padding.
+   Pressed == scroll-to-zoom, i.e. the non-default mode. */
+.graph-ctl.wheel-ctl {
+  padding: 0; display: inline-flex; align-items: center;
+  justify-content: center; color: var(--fg-dim);
+}
+.graph-ctl.wheel-ctl:hover { color: var(--fg); }
+.graph-ctl.wheel-ctl[aria-pressed="true"] {
+  color: var(--accent); border-color: var(--accent);
+}
 .gnode rect.box {
   fill: var(--bg-2); stroke: var(--line); stroke-width: 1.2;
   rx: 6; filter: drop-shadow(0 2px 3px rgba(0,0,0,.4));
@@ -1781,6 +1800,28 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
 /* The growing-stream caret would float below the block content; hide it
    in Markdown mode where partial syntax is re-rendered each tick anyway. */
 .userio .console .line.md.stream.streaming::after { content: none; }
+
+/* ---- Console text-size control (User I/O + Session Log headers) ----
+   Lives in the host pane's action row, so it sizes itself against that
+   row rather than against the console it scales. The readout doubles as
+   the reset button: there is nowhere else to put a third control that
+   is worth a third button. */
+.tz { display: flex; align-items: center; gap: 1px; flex: 0 0 auto; }
+.tz-btn, .tz-size {
+  height: 20px; padding: 0 4px;
+  border: 1px solid transparent; border-radius: 4px;
+  background: transparent; color: var(--fg-dim);
+  font: inherit; font-size: 11px; line-height: 1; cursor: pointer;
+  /* The pane header is an uppercase, letter-spaced caption row; these
+     are controls sitting in it, not part of the caption. The level
+     dropdown beside them opts out the same way. */
+  text-transform: none; letter-spacing: 0;
+}
+.tz-btn { min-width: 22px; }
+/* Tabular figures so stepping 9 -> 10 -> 11 does not shuffle the two
+   buttons sideways under the pointer. */
+.tz-size { min-width: 18px; font-variant-numeric: tabular-nums; }
+.tz-btn:hover, .tz-size:hover { color: var(--fg); background: var(--bg-3); }
 
 /* ---- Session Log console ---- */
 

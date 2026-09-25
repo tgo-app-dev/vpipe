@@ -3431,11 +3431,33 @@ GenerateImageStage::generate_qwen_image21_(
     // differently and the layout below would silently mean something
     // else.
     if (gh != refs[i].h || gw != refs[i].w) {
+      // SAY IT IN PIXELS, because pixels are what the graph can act
+      // on. Both numbers divide back: the latent grid is this model's
+      // /16, and the published grid is twice the tower's merged one,
+      // which is the same /16. So each side names the picture its
+      // stage actually read, and the difference is a resize somebody
+      // did and somebody else did not -- almost always the
+      // conditioner's own `vl_pixel_budget` cap (1024^2 by default,
+      // floored to a multiple of 32), which vae-encode knows nothing
+      // about.
+      //
+      // The conditioner's size is the whole remedy, and it is worth
+      // saying why it is safe to name: it RESIZES TO ITSELF. It is
+      // already under the budget and already aligned to 32, so feeding
+      // it to both stages leaves the cap a no-op and the two agree.
+      const int vw = refs[i].w * 16, vh = refs[i].h * 16;
+      const int cw = gw * 16, ch = gh * 16;
       session()->warn(fmt(
-          "GenerateImageStage('{}'): reference {} is a {}x{} latent but the "
-          "conditioner saw a {}x{} grid -- the vae-encode and the "
-          "conditioner must be given the SAME resized picture",
-          this->id(), (int)i, refs[i].w, refs[i].h, gw, gh));
+          "GenerateImageStage('{}'): reference {} disagrees -- vae-encode "
+          "read a {}x{} picture ({}x{} latent) and the conditioner read "
+          "{}x{} ({}x{} grid). ONE resize has to feed both. Either "
+          "resample the reference to {}x{} ahead of BOTH stages "
+          "(image-resample, fit 'crop', both axes multiples of 32), or "
+          "set vl_pixel_budget to at least {} on "
+          "qwen-image-21-model-config so the conditioner stops shrinking "
+          "it",
+          this->id(), (int)i, vw, vh, refs[i].w, refs[i].h, cw, ch, gw, gh,
+          cw, ch, (long long)vw * (long long)vh));
       return {};
     }
     blocks.push_back(genai::qi21::ImgBlock{1, gh, gw});

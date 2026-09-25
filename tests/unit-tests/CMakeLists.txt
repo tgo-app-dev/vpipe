@@ -250,6 +250,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         tensor-io-stage.cc
         temporal-slice-stage.cc
         vae-encode-range.cc
+        vae-encode-plugin.cc
+        content-aware-continuation-stage.cc
         temporal-stack-stage.cc
         temporal-resample-stage.cc
         audio-temporal-resample-stage.cc

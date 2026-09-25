@@ -30,6 +30,17 @@ import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
 const LS_DOCK  = 'vpipe_pe_cfg_dock';    // 'bottom' (default) | 'right'
 const LS_DOCS  = 'vpipe_pe_cfg_docs';    // '1' (default) | '0'
 const LS_LANES = 'vpipe_pe_lane_view';   // '1' | '0' (default)
+// WHAT A BARE WHEEL DOES ON THE CANVAS. Nothing in a wheel event says
+// whether a trackpad or a mouse sent it, and the right default differs
+// between them -- a two-finger swipe should move the canvas, a mouse's
+// one wheel should zoom it -- so it is a preference, not a heuristic.
+// Default 'pan', which is the trackpad this is mostly used from.
+const LS_WHEEL = 'vpipe_pe_wheel';       // 'pan' (default) | 'zoom'
+// THE SELECTOR : EDITOR SPLIT, as the selector's fraction of the view.
+// A fraction, like the stage:config split, so a window resize keeps the
+// proportion someone set rather than stranding a pixel width. Only the
+// full manager has a selector; the standalone editor ignores this.
+const LS_SELW  = 'vpipe_pm_sel_width';   // '0.19' by default (the CSS)
 // WHICH PIPELINE THE SELECTOR LAST HAD. Every view switch re-mounts this
 // view (app.js calls mount() again), so the selection cannot live in the
 // closure: leaving the Pipelines view for User I/O and coming back built
@@ -99,6 +110,11 @@ function mountEditor(container, opts = {}) {
   // about a long pipeline per vertical pixel than the canvas does, and
   // someone reading topology rather than editing it may simply prefer it.
   let forceLanes = prefGet(LS_LANES, '0') === '1';
+  let wheelMode = prefGet(LS_WHEEL, 'pan') === 'zoom' ? 'zoom' : 'pan';
+  // The CSS default (19%) is the fallback, so the two cannot disagree
+  // about where an unconfigured selector starts.
+  let selSplit = clampN(
+    parseFloat(prefGet(LS_SELW, '')) || 0.19, 0.08, 0.5);
   // ONE step of undo for a configuration edit, which is the mistake this
   // is for: a value typed over, a checkbox flipped, a field cleared --
   // noticed immediately. {sid, before, after, undone}; `undone` says
@@ -552,10 +568,47 @@ function mountEditor(container, opts = {}) {
     window.addEventListener('pointerup', up);
   });
 
+  // The selector : editor divider, the same affordance as the editor's
+  // own and deliberately the same class, because it is the same thing:
+  // a pipeline list is narrow until the names are long, and a canvas is
+  // short of width always. Only the full manager has one -- the
+  // standalone editor has no selector to resize against.
+  const selDivider = showSelector
+    ? el('div', { class: 'pe-divider pm-divider',
+                  title: t('pl.resize_selector') })
+    : null;
+  function applySelSplit() {
+    // flex-basis only: .pm > .pane keeps grow/shrink at 0 and the CSS
+    // min-width still floors it, so a hard drag left cannot squeeze the
+    // list into an unreadable sliver.
+    listPane.style.flexBasis = (selSplit * 100).toFixed(3) + '%';
+  }
+  if (selDivider) { applySelSplit(); }
+
   const pmRoot = showSelector
-    ? el('div', { class: 'pm' }, listPane, editorArea)
+    ? el('div', { class: 'pm' }, listPane, selDivider, editorArea)
     : el('div', { class: 'pm no-sel' }, editorArea);
   clear(container).append(pmRoot);
+
+  if (selDivider) {
+    selDivider.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      const r = pmRoot.getBoundingClientRect();
+      const mv = (e) => {
+        selSplit = clampN((e.clientX - r.left) / r.width, 0.08, 0.5);
+        applySelSplit();
+      };
+      // Persisted on RELEASE, not per frame: a drag fires dozens of
+      // moves and localStorage is synchronous.
+      const up = () => {
+        window.removeEventListener('pointermove', mv);
+        window.removeEventListener('pointerup', up);
+        prefSet(LS_SELW, selSplit.toFixed(4));
+      };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', up);
+    });
+  }
 
   // Watch the graph pane for the canvas/list crossover. Every cause of a
   // width change lands here -- the window, the stage:config divider, the
@@ -1178,6 +1231,11 @@ function mountEditor(container, opts = {}) {
         onNodeMove,
         onAutoArrange: autoArrange,
         onNodeContext,
+        // Scroll-to-pan (trackpad) or scroll-to-zoom (mouse). The graph
+        // owns the toggle button -- it sits with the other view
+        // controls -- and this view owns the preference.
+        wheelMode,
+        onWheelMode: (m) => { wheelMode = m; prefSet(LS_WHEEL, m); },
         editable,
         pending: state.pending,
         pendingType: state.pending

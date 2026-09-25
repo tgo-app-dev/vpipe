@@ -1174,7 +1174,17 @@ VaeEncodeStage::process(RuntimeContext& ctx)
         this->id(), _family, _latents_emitted, dims,
         stacked ? std::to_string(in_frames) + " frames of" : "one",
         H, W, resize ? " (letterbox)" : ""));
-    if (_unload_idle) { _plugin_enc->release_idle(); }
+    // THROUGH unload_vae_(), like every built-in branch below -- NOT the
+    // family's release_idle(). That is the soft lever the interface
+    // reserves for a manager reclaim, and a family may implement it as a
+    // drop it cannot come back from (LTX-2.5's resets its encoder). The
+    // stage then held a hollow encoder with `_unloaded` never set, so
+    // nothing reloaded it and every beat after the first failed with
+    // "the encoder was released" -- a clip stacked into groups encoded
+    // its first group and nothing else. unload_vae_() destroys the
+    // encoder and marks it, and the next beat's reload_vae_() builds a
+    // fresh one.
+    if (_unload_idle) { unload_vae_(); }
     co_await ctx.write(0, std::move(out));
     co_return;
   }

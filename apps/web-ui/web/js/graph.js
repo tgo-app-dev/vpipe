@@ -22,7 +22,8 @@
 // it survives the frequent re-renders (selection changes); callers
 // reset it (pass a fresh {}) only on pipeline switch, which refits.
 
-import { el, svgEl } from './dom.js';
+import { el, svgEl, clear } from './dom.js';
+import { makeIcon } from './icons.js';
 // t() is aliased: this file has three locals called `t` (an SVG <title>,
 // an easing parameter, shortType's argument) and a shadowed import
 // would fail silently at whichever one is in scope.
@@ -485,6 +486,9 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 // Build and return a container element (<div>) holding the graph SVG
 // plus a floating zoom/center control cluster. opts:
 //   { selected, onSelect, view }  (view: shared {k,cx,cy}, mutated)
+//   wheelMode       'pan' (default) | 'zoom' -- what a BARE wheel does
+//   onWheelMode(m)  fires when the cluster's toggle flips it, so the
+//                   host can persist it as a user preference
 // Composer (editor) extras, all optional and gated on `editable`:
 //   editable        true => render port/edge edit affordances
 //   pending         {from, from_port} armed output port (rubber-band)
@@ -899,12 +903,42 @@ export function renderGraph(graph, opts = {}) {
   const ctl = (label, title, fn) =>
     el('button', { class: 'graph-ctl', title,
       onclick: (e) => { e.stopPropagation(); fn(); } }, label);
+  // WHAT A BARE WHEEL DOES, and the button that flips it. A trackpad
+  // wants pan (a two-finger swipe IS the gesture for moving a canvas,
+  // and pinch still zooms); a mouse has no swipe and no pinch, so its
+  // one wheel has to be the zoom. Neither default can serve both
+  // devices, which is why this is a choice and not a heuristic --
+  // nothing in a wheel event says which device sent it.
+  //
+  // The button shows what the wheel does NOW, not what pressing it
+  // would change to: a mode indicator someone can read at a glance
+  // beats a verb they have to reason about.
+  let wheelMode = opts.wheelMode === 'zoom' ? 'zoom' : 'pan';
+  const wheelBtn = el('button', { class: 'graph-ctl wheel-ctl',
+    type: 'button',
+    onclick: (e) => {
+      e.stopPropagation();
+      wheelMode = wheelMode === 'pan' ? 'zoom' : 'pan';
+      applyWheelMode();
+      if (typeof opts.onWheelMode === 'function') {
+        opts.onWheelMode(wheelMode);
+      }
+    } });
+  function applyWheelMode() {
+    const zoomy = wheelMode === 'zoom';
+    clear(wheelBtn).append(makeIcon(zoomy ? 'zoom' : 'pan', 'sm'));
+    wheelBtn.title = zoomy ? t_('pl.wheel_zoom') : t_('pl.wheel_pan');
+    wheelBtn.setAttribute('aria-pressed', zoomy ? 'true' : 'false');
+  }
+  applyWheelMode();
+
   const controls = el('div', { class: 'graph-controls' },
     ctl('−', t_('pl.zoom_out'), () => zoomBy(1 / ZOOM_STEP)),
     ctl('+', t_('pl.zoom_in'), () => zoomBy(ZOOM_STEP)),
     ctl('1:1', t_('pl.actual_size'), () => setZoom(1)),
     ctl('Fit', t_('pl.fit_all'), fit),
-    ctl('⊙', t_('pl.center'), center));
+    ctl('⊙', t_('pl.center'), center),
+    wheelBtn);
   // Auto-arrange: re-layout the graph tidily (drops manual placements).
   // Sits with the view controls; only shown when the caller wires it.
   if (opts.onAutoArrange) {
@@ -961,7 +995,8 @@ export function renderGraph(graph, opts = {}) {
   svg.addEventListener('pointerup', endPan);
   svg.addEventListener('pointercancel', endPan);
 
-  // Wheel PANS; ctrl/cmd-wheel ZOOMS, anchored at the cursor.
+  // In 'pan' mode (the default) the wheel PANS and ctrl/cmd-wheel ZOOMS,
+  // anchored at the cursor. In 'zoom' mode the wheel zooms outright.
   //
   // A trackpad's two-finger swipe is the gesture people expect to move a
   // canvas around -- it is what every map and every design tool does with
@@ -969,6 +1004,13 @@ export function renderGraph(graph, opts = {}) {
   // keeps the modifier, which costs nothing: macOS reports a trackpad
   // PINCH as a wheel event with ctrlKey already set, so pinch-to-zoom
   // works through the same branch without a gesture handler of its own.
+  //
+  // CTRL/CMD ZOOMS IN BOTH MODES -- it is not flipped to mean "pan" in
+  // 'zoom' mode. That is the pinch again: a trackpad user who switched
+  // to 'zoom' deliberately would otherwise find their pinch panning.
+  // The way to pan in 'zoom' mode is to DRAG, which works over the whole
+  // canvas (the background hit rect covers the empty parts) and is what
+  // a mouse user reaches for anyway.
   //
   // The − / + buttons and the keys below are the discrete way to zoom,
   // for a plain mouse that has no pinch and no horizontal wheel.
@@ -982,7 +1024,12 @@ export function renderGraph(graph, opts = {}) {
     if (!W || !H) { return; }
     const k0 = view.k || 1;
 
-    if (e.ctrlKey || e.metaKey) {
+    if (wheelMode === 'zoom' || e.ctrlKey || e.metaKey) {
+      // A PURELY HORIZONTAL wheel carries no zoom direction, and the
+      // test below would read its deltaY of 0 as "zoom out". Harmless
+      // in 'pan' mode, where such an event never reaches here, but in
+      // 'zoom' mode a trackpad's sideways swipe would shrink the graph.
+      if (e.deltaY === 0) { return; }
       const rect = svg.getBoundingClientRect();
       const px = e.clientX - rect.left, py = e.clientY - rect.top;
       const wx = (view.cx - (W / k0) / 2) + px / k0;

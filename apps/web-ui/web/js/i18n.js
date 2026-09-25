@@ -64,6 +64,12 @@ const STRINGS = {
   'common.send':    ['Send', '发送', '傳送'],
   'common.loading': ['Loading…', '加载中…', '載入中…'],
   'common.dismiss': ['Dismiss', '关闭', '關閉'],
+  // The console text-size control (User I/O + Session Log headers).
+  'common.text_size':    ['Text size', '文字大小', '文字大小'],
+  'common.text_smaller': ['Smaller text', '缩小文字', '縮小文字'],
+  'common.text_larger':  ['Larger text', '放大文字', '放大文字'],
+  'common.text_size_reset': ['Reset to the default text size',
+      '恢复默认文字大小', '恢復預設文字大小'],
 
   // ---- File open/save dialog ----
   'fs.open_title':     ['Open file', '打开文件', '開啟檔案'],
@@ -389,6 +395,9 @@ const STRINGS = {
       '左右拖动以调整配置面板宽度', '左右拖曳以調整設定面板寬度'],
   'pl.resize_height':  ['Drag up or down to resize the configuration pane',
       '上下拖动以调整配置面板高度', '上下拖曳以調整設定面板高度'],
+  'pl.resize_selector':['Drag left or right to resize the pipeline list',
+      '左右拖动以调整流水线列表宽度',
+      '左右拖曳以調整管線列表寬度'],
   'pl.select_pipeline':['Select a pipeline', '请选择一个流水线', '請選擇一個管線'],
   'pl.empty_drag':     ['Empty pipeline — drag a stage from the toolbox',
       '空流水线 — 从工具箱拖入一个阶段',
@@ -491,6 +500,20 @@ const STRINGS = {
   'pl.actual_size':    ['Actual size', '实际大小', '實際大小'],
   'pl.fit_all':        ['Fit whole pipeline', '适配整条流水线', '符合整條管線'],
   'pl.center':         ['Center', '居中', '置中'],
+  // The wheel-mode toggle names what the wheel does NOW, and what a
+  // press would switch it to, because the button is a mode indicator.
+  'pl.wheel_pan':      ['Scroll pans the canvas (trackpad) — '
+      + 'click for scroll to zoom; hold ⌘/Ctrl to zoom',
+      '滚动平移画布（触控板）— '
+      + '点击切换为滚动缩放；按住 ⌘/Ctrl 可缩放',
+      '滾動平移畫布（觸控板）— '
+      + '點擊切換為滾動縮放；按住 ⌘/Ctrl 可縮放'],
+  'pl.wheel_zoom':     ['Scroll zooms the canvas (mouse) — '
+      + 'click for scroll to pan; drag to pan',
+      '滚动缩放画布（鼠标）— '
+      + '点击切换为滚动平移；拖动可平移',
+      '滾動縮放畫布（滑鼠）— '
+      + '點擊切換為滾動平移；拖曳可平移'],
   'pl.add_input':      ['add input', '添加输入端口', '新增輸入埠'],
   'pl.needs_config':   ['Needs configuration: {msg}', '需要配置：{msg}',
       '需要設定：{msg}'],
@@ -5771,6 +5794,70 @@ const STRINGS = {
   'port.image-levels.out.image': ['',
       '形状与 dtype 均不变，仅影调经过调整',
       '形狀與 dtype 均不變，僅影調經過調整'],
+
+  'stage.content-aware-continuation.name': ['', '内容感知续接', '內容感知續接'],
+  'stage.content-aware-continuation.doc': ['',
+      '让一段续接片段与它所续接的片段相匹配：在接缝处测量影调与几何上的'
+      + '跳变——续接片段的开头几帧对比参考片段的最后几帧——并把它从每一帧'
+      + '中去掉。当两者看起来不像同一个静止镜头时拒绝校正，并说明原因。',
+      '讓一段續接片段與它所續接的片段相符：在接縫處測量影調與幾何上的'
+      + '跳變——續接片段的開頭幾格對比參考片段的最後幾格——並把它從每一格'
+      + '中去掉。當兩者看起來不像同一個靜止鏡頭時拒絕校正，並說明原因。'],
+  'cfg.content-aware-continuation.tone': ['',
+      '把续接片段的影调匹配到参考片段：每个通道一条单调曲线，拟合自接缝'
+      + '两侧对齐后的像素。用曲线而不是增益加偏移，因为续接片段的跳变在'
+      + '暗部最大',
+      '把續接片段的影調匹配到參考片段：每個通道一條單調曲線，擬合自接縫'
+      + '兩側對齊後的像素。用曲線而不是增益加偏移，因為續接片段的跳變在'
+      + '暗部最大'],
+  'cfg.content-aware-continuation.geometry': ['',
+      '把续接片段的几何匹配到参考片段：每个轴一个围绕画面中心的缩放加一'
+      + '个平移，拟合自块匹配得到的位移场。用于去掉续接片段回来时高了、矮'
+      + '了或偏移了零点几个百分点的情况',
+      '把續接片段的幾何匹配到參考片段：每個軸一個圍繞畫面中心的縮放加一'
+      + '個平移，擬合自區塊比對得到的位移場。用於去掉續接片段回來時高了、'
+      + '矮了或偏移了零點幾個百分點的情況'],
+  'cfg.content-aware-continuation.window': ['',
+      '接缝每一侧参与平均的帧数：参考片段的最后 `window` 帧与续接片段的'
+      + '最初 `window` 帧。接缝落在静止镜头上时——续接片段的接缝本就该落在'
+      + '那里——帧数越多越能平均掉噪声。该 stage 会先攒下这么多帧，再输出'
+      + '第一帧',
+      '接縫每一側參與平均的影格數：參考片段的最後 `window` 格與續接片段'
+      + '的最初 `window` 格。接縫落在靜止鏡頭上時——續接片段的接縫本就該落'
+      + '在那裡——影格越多越能平均掉雜訊。該 stage 會先攢下這麼多格，再輸'
+      + '出第一格'],
+  'cfg.content-aware-continuation.max_scale': ['',
+      '仍被视为接缝漂移的最大缩放误差，以比例表示（0.05 = 5%）。超过它，'
+      + '几何校正就会被拒绝并报告，而不是被应用——偏差这么大的续接片段是'
+      + '另一个镜头，而不是漂移了的同一个镜头',
+      '仍被視為接縫漂移的最大縮放誤差，以比例表示（0.05 = 5%）。超過它，'
+      + '幾何校正就會被拒絕並回報，而不是被套用——偏差這麼大的續接片段是'
+      + '另一個鏡頭，而不是漂移了的同一個鏡頭'],
+  'cfg.content-aware-continuation.max_tone': ['',
+      '影调曲线在任一色阶上所能做的最大偏移，以 0..255 刻度上的码值计。'
+      + '超过它，影调匹配就会被拒绝并报告，理由相同',
+      '影調曲線在任一色階上所能做的最大偏移，以 0..255 刻度上的碼值計。'
+      + '超過它，影調匹配就會被拒絕並回報，理由相同'],
+  'cfg.content-aware-continuation.fade_frames': ['',
+      '0（默认）把校正应用到续接片段的**每一**帧——当跳变贯穿整段片段时'
+      + '这是对的，而这正是该 stage 所针对的情况。N > 0 则在最初 N 帧内把'
+      + '校正逐渐淡出，在接缝之后把画面交还给模型自己的观感',
+      '0（預設）把校正套用到續接片段的**每一**格——當跳變貫穿整段片段時'
+      + '這是對的，而這正是該 stage 所針對的情況。N > 0 則在最初 N 格內把'
+      + '校正逐漸淡出，在接縫之後把畫面交還給模型自己的觀感'],
+  'port.content-aware-continuation.in.frames': ['',
+      '续接片段的帧，平面 RGB [3,H,W]，u8 或 f32，按顺序——即 vae-decode '
+      + '的输出',
+      '續接片段的影格，平面 RGB [3,H,W]，u8 或 f32，依序——即 vae-decode '
+      + '的輸出'],
+  'port.content-aware-continuation.reference': ['',
+      '被续接的片段：一段堆叠的 [T,3,H,W] 片段（即 temporal-stack 为引导'
+      + '片段输出的形式）或一帧 [3,H,W]。只读取它的**最后** `window` 帧',
+      '被續接的片段：一段堆疊的 [T,3,H,W] 片段（即 temporal-stack 為引導'
+      + '片段輸出的形式）或一格 [3,H,W]。只讀取它的**最後** `window` 格'],
+  'port.content-aware-continuation.out.frames': ['',
+      '同样的帧，形状与 dtype 不变，接缝处的影调与几何已被去掉',
+      '同樣的影格，形狀與 dtype 不變，接縫處的影調與幾何已被去掉'],
 
   'stage.alpha-mix.name': ['', '透明度混合', '透明度混合'],
   'stage.alpha-mix.doc': ['',

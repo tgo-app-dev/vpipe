@@ -41,7 +41,6 @@ arrives in **8–16 steps** instead of 30+.
     - [How a part takes its guide](#how-a-part-takes-its-guide)
     - [Writing the prompts](#writing-the-prompts)
     - [Joining the parts](#joining-the-parts)
-    - [What the parts cost](#what-the-parts-cost)
     - [Making it your own](#making-it-your-own)
   - [The released weights, either partition](#the-released-weights-either-partition)
   - [Fewer steps — the Turbo LoRA](#fewer-steps--the-turbo-lora)
@@ -160,13 +159,16 @@ you want to see the model work before spending the hours and the 115 GB.
   [Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights)).
 - **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
   … **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
-  — a **33-second** clip in four runs: FL2VA text-to-video, then three Ref2VA
-  continuations, each carrying on from the last 2.33 s of the part before it
-  (see [Longer clips](#longer-clips--one-story-in-four-parts)). Needs both
-  partitions, and each part applies its partition's own Turbo adapter.
+  — a **40-second** clip in four runs: FL2VA text-to-video, then three Ref2VA
+  continuations, each carrying on from the last 3.75 s of the part before it
+  (see [Longer clips](#longer-clips--one-story-in-four-parts)). Runs both
+  partitions of the **released** weights at 21 steps, with no Turbo adapter,
+  and writes each part **lossless** — FFV1 video at 4:4:4, ALAC sound — so
+  every continuation reads back exactly what the part before it made.
 - **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
-  — joins those four parts into one 33-second file through the concat
-  demuxer, with no model and no hand-written ffmpeg.
+  — joins those four parts into one 40-second file through the concat
+  demuxer, with no model and no hand-written ffmpeg. The one lossy encode in
+  the chain.
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -986,19 +988,19 @@ from you:
 
 A single generation gets expensive fast as it grows: every frame adds rows
 to the packed sequence, and attention pays for rows squared. Four ordinary
-10-second runs are the cheaper way to a **33-second** clip. Each run after
+10-second runs are the cheaper way to a **40-second** clip. Each run after
 the first hands the **tail of the one before** to Ref2VA as a clip to
 continue from, so the story is carried forward by the picture and the sound
 rather than by the prompt alone:
 
 - **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
   — text to video and audio on the **FL2VA** checkpoint, 243 frames
-  (10.125 s). It writes `minimax-h3-extend-part1.mp4`.
+  (10.125 s) at 960 × 576. It writes `minimax-h3-extend-part1.mp4`.
 - **[`…-part2`](pipelines/minimax-h3-extend-part2.vpipeline)** /
   **[`…-part3`](pipelines/minimax-h3-extend-part3.vpipeline)** /
   **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
-  — **Ref2VA**, each conditioned on the last 2.33 s of the part before it,
-  picture and sound. 243 frames each.
+  — **Ref2VA**, each conditioned on the last 3.75 s (90 frames) of the part
+  before it, picture and sound. 243 frames each.
 - **[`…-concat`](pipelines/minimax-h3-extend-concat.vpipeline)** — joins the
   four into one file, in vpipe rather than by hand. See
   [Joining the parts](#joining-the-parts).
@@ -1006,40 +1008,41 @@ rather than by the prompt alone:
 Every continuation is the same graph with a different prompt and a different
 file to read, so a fifth is a copy of the fourth.
 
-**EACH PARTITION TAKES ITS OWN TURBO ADAPTER, and that is not a detail the
-graphs can hide.** An adapter is distilled for one task, so part 1 applies
-an **FL2VA** one and parts 2 to 4 a **Ref2VA** one; the parent link in the
-catalogue is what keeps each out of the other's graph (see
-[Which Turbo adapters work](#which-turbo-adapters-work)). As shipped:
+**The shipped graphs run the released weights at 21 steps, with no
+adapter.** Every part names the publisher's own checkpoint (see
+[The released weights, either partition](#the-released-weights-either-partition)):
 
-| | adapter | steps | shifts |
+| | checkpoint | steps | shifts |
 |---|---|---|---|
-| part 1 | `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` | 8 | 12 / 3 |
-| parts 2–4 | `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p` | 8 | **6** / 3 |
+| part 1 | `MiniMaxAI/MiniMax-H3-FL2VA` | 21 | 12 / 3 |
+| parts 2–4 | `MiniMaxAI/MiniMax-H3-Ref2VA` | 21 | 12 / 3 |
 
-The Ref2VA adapter is the only one here that needs **`video_shift: 6.0`**,
-and its graphs set it. Applied at RUNTIME rather than fused: the Turbo delta
-is 2–4e-4 against weights whose bf16 step is ~4e-3, so merging rounds most
-of it away. Drop the two `lora` keys and the parts run on the base
-checkpoints at the same step count.
+That is a choice for quality over time, and a chain is where it pays. A
+Turbo adapter buys its step count with some of what the base model knows
+about composition — a part can come back with the subject badly placed, a
+hand wrong, or a beat the prompt asked for simply missing — and in a chain
+every later part continues from whatever the one before it got wrong.
+The graphs also leave `sol_attn` off; `i8_gemm` stays on in every part.
 
-> **A Turbo adapter is a distillation, and it has limits.** Buying the step
-> count costs some of what the base model knows about composition: a part
-> can come back with the subject badly placed, a hand wrong, or a beat the
-> prompt asked for simply missing, where the undistilled model at a higher
-> count would have held it. They are also a MOVING TARGET — both lines above
-> have been re-distilled more than once, and a newer file often just fixes
-> what an older one got wrong, so check the publisher before settling on a
-> copy.
->
-> When a part comes back with a composition you do not want, two things are
-> worth trying before rewriting the prompt. A **different `seed`** is the
-> cheaper one and is often enough, since what the adapter lost is a sample's
-> worth of structure rather than the prompt's meaning. Failing that, run
-> that part **without the adapter at 16–20 steps**: that is the base
-> model's own quality and the thing to judge the adapter against. Drop its
-> `lora` and `lora_scale` keys and raise `steps`; nothing else in the graph
-> changes, and the parts after it still read only its tail.
+**To run the chain faster**, put back what the shipped graphs leave out:
+the prepared 8-bit repacks (`local/MiniMax-H3-FL2VA-8bit` and
+`local/MiniMax-H3-Ref2VA-8bit` on `model-select`), `sol_attn: true` on each
+`generate-video`, and one Turbo adapter per partition on
+`minimax-h3-model-config` — each partition takes ITS OWN, since an adapter
+is distilled for one task and the catalogue's parent link refuses the other
+partition's (see [Which Turbo adapters work](#which-turbo-adapters-work)):
+
+| | `lora` | `steps` | `video_shift` |
+|---|---|---|---|
+| part 1 | `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` | 8 | 12 |
+| parts 2–4 | `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p` | 8 | **6.0** |
+
+The Ref2VA adapter is the only one here that needs `video_shift: 6.0`.
+
+When a part comes back with a composition you do not want, try a
+**different `seed`** before rewriting the prompt: it is the cheaper change
+and often enough. Nothing else in the graph changes, and the parts after it
+still read only its tail.
 
 The shipped story is *the clockmaker's songbird*:
 
@@ -1052,10 +1055,14 @@ The shipped story is *the clockmaker's songbird*:
 
 #### Running the chain
 
-You need **both** partitions prepared (step 1 and
-[Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint)). Run
-them in order, from the same work directory — each part opens the previous
-part's `.mp4` by its relative name:
+You need **both** partitions of the released weights: fetch
+`MiniMaxAI/MiniMax-H3` twice, with `model_variant: fl2va` and `ref2va` (see
+[The released weights, either partition](#the-released-weights-either-partition)).
+To run on the repacks prepared in step 1 and
+[Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint) instead,
+change each part's `model-select` as described above. Run the parts in
+order, from the same work directory — each part opens the previous part's
+`.mp4` by its relative name:
 
 ```sh
 cd ~/vpipe-work                                    # the work directory again
@@ -1071,39 +1078,89 @@ Run them **one at a time**, never together: each holds a 33B transformer
 missing produces nothing, and the next part would then condition on a stale
 file rather than fail.
 
+The four part files are **FFV1**, which QuickTime and most browsers do not
+play; they are for the chain to read, not for watching. Watch the joined
+clip, or open a part in `ffplay` or VLC.
+
 #### How a part takes its guide
 
 ```
-load-video ─> video-to-rgb(u8) ─> temporal-slice(start −56) ─> temporal-stack ─> ref1
-load-audio(start_s 7.7917, duration_s 2.3333) ─> audio-to-pcm(32000, stereo)
-                                              ─> temporal-stack ─────────────> ref2
+load-video ─> video-to-rgb(u8) ─> temporal-slice(start −90)
+                                ─> temporal-stack ─────────────> ref1
+load-audio(start_s 6.375, duration_s 3.75) ─> audio-to-pcm(32000, stereo)
+                                           ─> temporal-stack ────────────> ref2
 ```
+
+**The guide reaches the model exactly as it was decoded.** The slice feeds
+the stack directly — no resample and no levels adjustment in between. What
+the previous part produced is what the next part continues from.
+
+**The prompt decides where a continuation picks up.** It is meant to carry
+on from the guide's final frame, and with the shipped prompts every part
+does: the parts join without a jump.
+
+Write your own continuation prompts the way these are written — name the
+subjects that carry over and say they are preserved, open the summary with
+`[video continuation + audio reference]`, and give the shot an explicit
+timeline of what happens and when. If a join does jump, **rewrite the
+prompt** rather than correcting the picture: a resample or a brightness
+lift fitted to one join will not transfer to the next.
+
+**The parts are written lossless, because the next part reads them.** Each
+part's `rgb-to-video` emits `yuv444p` at `full` range, tagged `bt709`, and
+its `save-video` encodes that with `video_codec: ffv1` and
+`audio_codec: alac`. So the guide a continuation reads is the decoded picture
+itself — no chroma halved to 4:2:0, no lossy quantization, all 256 code
+values rather than 219 — and nothing compounds down the chain however many
+parts it has. The only lossy encode is the join at the end. A part is about
+80–93 MB for its 10 s at 960 × 576, and the `video_bitrate` its sink carries
+is inert under FFV1.
+
+**Colour range is carried, not assumed.** `save-video` tags the stream it
+writes and `video-to-rgb` reads that tag back, so a clip that is decoded,
+conditioned on and re-encoded keeps its contrast. That matters here
+because a continuation re-reads its own
+output once per part, and an untagged file read by the wrong convention
+loses 219/255 of its contrast on every hop.
 
 **The frame cut is `temporal-slice`, not a seek.** `load-video`'s `start_s`
 lands on the keyframe at or before the time asked for, which in a 10-second
-file may be the first frame. A negative `start` holds exactly the last 56
+file may be the first frame. A negative `start` holds exactly the last 90
 decoded frames until the stream ends, so the cut is exact to the frame and
 costs one decode of a short file. Audio packets decode independently, so
 `load-audio` can take its window by time. That window is
-`243/24 − 56/24 = 7.7917 s` onward, the same 2.33 s the frames cover.
+`243/24 − 90/24 = 6.375 s` onward, the same 3.75 s the frames cover.
 
 **`attach_audio: [2]`** folds that soundtrack onto the clip before it, so the
 model reads one `<Video 1>` with its `<Audio 1>` rather than two unrelated
 references (see [Audio that belongs to a clip](#audio-that-belongs-to-a-clip)).
 
-**Why 56 frames and not 48.** Two seconds at 24 fps is 48, but the encoder
-snaps a reference clip down to a whole `17n + 5` chunk count **from the
-start**. Given 48 it keeps 39, and the 9 frames it drops are the last
-ones — the very moment the continuation is supposed to pick up from. 56 is
-`17 × 3 + 5`, so nothing is dropped. The encoder's line confirms it:
-8,670 reference video rows is 17 latent frames of 510 cells. MiniMax
-documents **2 s** as the shortest reference clip, and 2.33 s clears it.
+**Why 90 frames.** The encoder snaps a reference clip down to a whole
+`17n + 5` frames **from the start**, so a guide of any other length loses its
+LAST frames — the very moment the continuation is supposed to pick up from.
+Two seconds at 24 fps is 48, which it cuts to 39. 90 is `17 × 5 + 5`, so
+nothing is dropped, and at 3.75 s it carries more of the motion across the
+seam than the shortest clean guide, 56 frames (2.33 s). It encodes to 27
+latent frames of 540 cells: **14,580** reference video rows. MiniMax
+documents **2 s** as the shortest reference clip.
 
-**`reference_video_short_edge: 0`** keeps the guide on its own 960 × 544
+**`reference_video_short_edge: 0`** keeps the guide on its own 960 × 576
 canvas, the output's own size, instead of upscaling it to 1344 × 768. That
-keeps the reference at 8,670 rows rather than roughly twice that. It is the
+keeps the reference at 14,580 rows rather than roughly twice that. It is the
 trade described under [What it costs](#what-it-costs), and it has not been
 compared side by side on this story.
+
+**`max_prompt_tokens`** on `video-ref-encoder` is raised from its default of
+16,384 — to **65,536** on part 2 and **131,072** on parts 3 and 4. It is the
+ceiling on the conditioner's sequence: the prompt plus the vision tower's
+reading of the guide, which the encoder refuses outright rather than
+truncates when it runs longer. Its KV is paged and costs ~200 KB per token
+actually encoded, so a high ceiling is not memory held up front. Raise it
+when the encoder reports a presentation longer than its token pool.
+
+**`unload_when_idle: destroy`** on both the reference encoder and
+`generate-video` hands each model's memory back as soon as its phase of the
+part is over.
 
 #### Writing the prompts
 
@@ -1127,45 +1184,75 @@ prompt verbatim, with no rewriting step in between.
   `detailed_description` follow.
 
 **Every part but the last ends on a held shot, and the next one opens on
-it.** Part 1 closes with six seconds of static medium close-up in which
-nothing moves but the candle flames; part 2 opens on that framing and holds
-it two seconds before the bird wakes; part 2 in turn ends on the bird
-motionless on the sill, and so on down the chain. The guide is always cut
-from inside one of those holds, so every seam falls where the picture is
-still. Plan the story that way from the start: the beats worth generating
-are the ones **between** the seams.
+it.** Part 1 closes on a static medium close-up from 6.0 s in which nothing
+moves but the candle flames and the pendulums; part 2 opens on that framing
+and holds it two seconds before the bird wakes; part 2 in turn ends on the
+bird motionless on the sill, and so on down the chain. Every guide ENDS
+inside one of those holds, so every seam falls where the picture is still.
+A 3.75 s guide does not always START inside one: parts 2 and 3 cut to their
+final shot at 7.5 s and 7.0 s, so the guides parts 3 and 4 read open on the
+last moments of the shot before — the cut is part of what the model sees.
+Plan the story that way from the start: the beats worth generating are the
+ones **between** the seams, and a hold at least as long as the guide keeps
+the whole guide on it.
+
+**Plant what the next part will act on.** Part 3 opens the window, so part
+2's prompt gives the frame a small brass catch that can lift the sash, keeps
+the window shut through its own shot, and lands the bird just beside the
+catch. The guide part 3 reads then shows the thing it has to use; a detail
+that first appears in the part that needs it is one the model has to invent
+on the spot.
 
 **Carry the subject definitions over word for word.** Parts 2 to 4 describe
 the woman, the bird and the room in identical words, because the clip shows
 them and the text names them — any drift in the wording is drift the model
 is free to apply to the picture. Some drift arrives anyway; see below.
 
-**Ref2VA continues AFTER the clip; it does not replay it.** MEASURED: part
-2's first frame is closest to part 1's **last** frame (31.5 dB PSNR),
-far closer than to the first frame of the guide window (26.3 dB). That is
-continuation the model learned from the task type, not a pinned frame. The
+**Ref2VA continues AFTER the clip; it does not replay it.** Part 2 opens
+on the moment after part 1's **last** frame, not on the first frame of the
+guide window. That is continuation the model learned from the task type,
+not a pinned frame. The
 [caveat above](#conditioning-on-references-ref2va) still stands, which is
 one more reason to meet on a moment that does not move.
 
 #### Joining the parts
 
-Each part's last 2.33 s and the next part's opening hold are the same
-moment, so the cut can fall anywhere inside it.
+**The parts are CONSECUTIVE, so they are joined end to end and nothing is
+trimmed.** A continuation resumes *after* its guide instead of re-rendering
+it, so part 2's first frame follows part 1's **last** frame — not the frame
+3.75 s earlier where the guide was cut from. There is no overlapping
+material, so there is nothing to cut inside.
 
 **In vpipe**, that is
 [`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline):
-one `load-video` reading a LIST rather than a file, through the **concat
-demuxer**, with an `outpoint` per part trimming it at its seam.
+one `load-video` handed all four files, which it joins in the order given.
 
-```text
-file 'minimax-h3-extend-part1.mp4'
-outpoint 7.791667
-file 'minimax-h3-extend-part2.mp4'
-outpoint 7.791667
-file 'minimax-h3-extend-part3.mp4'
-outpoint 7.791667
-file 'minimax-h3-extend-part4.mp4'
+```json
+"config": {
+  "input_url": [
+    "minimax-h3-extend-part1.mp4",
+    "minimax-h3-extend-part2.mp4",
+    "minimax-h3-extend-part3.mp4",
+    "minimax-h3-extend-part4.mp4"
+  ],
+  "enable_video": true,
+  "enable_audio": true,
+  "options": {
+    "safe": "0"
+  }
+}
 ```
+
+**In the web UI this is a file picker.** Open the pipeline in the editor,
+press Browse on `input_url`, and select the four parts in one dialog — they
+land in the array in the order picked. There is no list file to write and no
+demuxer to name.
+
+> **Do not trim the parts as you join them.** Cutting each one where its
+> guide starts looks natural — it is the moment the next part was
+> conditioned on — but it **skips the rendered frames between that point
+> and the part's end**, 3.75 s of story per seam with the shipped guide, and
+> that skip is a visible jump.
 
 ```sh
 vpipe --launch minimax-h3-extend-concat.vpipeline
@@ -1174,75 +1261,51 @@ vpipe --launch minimax-h3-extend-concat.vpipeline
 The graph is the ordinary file chain — `load-video → video-to-rgb →
 rgb-to-video → save-video`, with the soundtrack through `audio-to-pcm` — so
 the join is one re-encode at whatever `video_bitrate` the sink is set to,
-and both streams are cut at the same places. Two keys make it work:
-`format: "concat"` (a list file probes as ANSI art otherwise, since that is
-what a text file looks like to a prober) and `options: {"safe": "0"}`, which
-the demuxer wants before it will follow absolute paths.
+and picture and sound stay locked together across every boundary. It is the
+chain's one lossy step: the sink's defaults, H.264 at 4:2:0 and limited
+range with AAC sound, which is what every player expects of a delivered
+file.
+`start_s` / `duration_s` address the joined timeline, not any one part.
 
-**By hand**, if the seam wants a cross-fade rather than a cut — the graph
-has no stage for one — the same four files take each part up to where its
-guide starts and fade over five frames:
+> **When you still want a list file.** An array joins whole clips, which is
+> the case here. To trim each clip *as* it joins — `inpoint` / `outpoint`
+> per entry — write the list yourself and name the demuxer with
+> `format: "concat"`, which then also wants `options: {"safe": "0"}` before
+> it will follow absolute paths. Setting `format` alongside an array is an
+> error rather than one of them quietly winning.
+
+The result is **40.5 s** — all four parts whole, 972 frames.
+
+**What it costs.** Each part's held tail and the next part's held opening
+are both kept, so a seam sits on its static beat for both of them rather
+than for one. That longer dwell is the price of losing nothing, and it is
+usually the right trade: a pause reads as deliberate, a skip reads as a
+glitch. If one seam does stall, trim a *few* frames there — never the whole
+guide, which puts the skip back.
+
+**By hand**, if a seam wants a cross-fade rather than a cut — the graph has
+no stage for one — fade over five frames at each junction. With whole parts
+of 10.125 s, each `offset` is the timeline so far less the fade:
 
 ```sh
 ffmpeg -i minimax-h3-extend-part1.mp4 -i minimax-h3-extend-part2.mp4 \
        -i minimax-h3-extend-part3.mp4 -i minimax-h3-extend-part4.mp4 \
   -filter_complex "\
-[0:v]trim=end=8.0,setpts=PTS-STARTPTS[v0];\
-[1:v]trim=end=8.0,setpts=PTS-STARTPTS[v1];\
-[2:v]trim=end=8.0,setpts=PTS-STARTPTS[v2];[3:v]setpts=PTS-STARTPTS[v3];\
-[v0][v1]xfade=transition=fade:duration=0.208:offset=7.792[a01];\
-[a01][v2]xfade=transition=fade:duration=0.208:offset=15.583[a02];\
-[a02][v3]xfade=transition=fade:duration=0.208:offset=23.375,format=yuv420p[v];\
-[0:a]atrim=end=8.0,asetpts=PTS-STARTPTS[t0];\
-[1:a]atrim=end=8.0,asetpts=PTS-STARTPTS[t1];\
-[2:a]atrim=end=8.0,asetpts=PTS-STARTPTS[t2];[3:a]asetpts=PTS-STARTPTS[t3];\
+[0:v]setpts=PTS-STARTPTS[v0];[1:v]setpts=PTS-STARTPTS[v1];\
+[2:v]setpts=PTS-STARTPTS[v2];[3:v]setpts=PTS-STARTPTS[v3];\
+[v0][v1]xfade=transition=fade:duration=0.208:offset=9.917[a01];\
+[a01][v2]xfade=transition=fade:duration=0.208:offset=19.834[a02];\
+[a02][v3]xfade=transition=fade:duration=0.208:offset=29.751,format=yuv420p[v];\
+[0:a]asetpts=PTS-STARTPTS[t0];[1:a]asetpts=PTS-STARTPTS[t1];\
+[2:a]asetpts=PTS-STARTPTS[t2];[3:a]asetpts=PTS-STARTPTS[t3];\
 [t0][t1]acrossfade=d=0.208[s01];[s01][t2]acrossfade=d=0.208[s02];\
 [s02][t3]acrossfade=d=0.208[a]" \
   -map "[v]" -map "[a]" -c:v libx264 -crf 18 -c:a aac -b:a 192k \
   minimax-h3-extend.mp4
 ```
 
-Each `offset` is where the next part's hold begins on the timeline built so
-far: 7.792, then 7.792 × 2, then 7.792 × 3. The result is **33.5 s** — the
-four parts' 40.5 s less three 2.33 s overlaps. Because every seam sits inside
-a held shot, plain cuts work too: MEASURED, each part's last frame against
-the next part's first lands at **31.4, 29.8 and 32.7 dB** PSNR.
-
-#### What the parts cost
-
-All four graphs ship with **[`sol_attn`](#faster-attention--sol-attn-routing)
-on**, which is most of what makes a clip this long affordable. MEASURED on
-the 24 GB M5 Pro, 8-bit, 960 × 544, 243 frames, 8 steps, with the two Turbo
-adapters above applied at run time:
-
-| | packed rows | denoise | wall clock | peak memory |
-|---|---|---|---|---|
-| part 1 (text) | 38,072 | 9 min 3 s | 10 min 52 s | 18.1 GB |
-| part 2 | 49,152 | 16 min 32 s | 20 min 29 s | 17.0 GB |
-| part 3 | 49,111 | 16 min 28 s | 20 min 24 s | 16.9 GB |
-| part 4 | 49,102 | 16 min 35 s | 20 min 30 s | 17.9 GB |
-| the concat | — | — | **2.1 s** | — |
-
-The whole 33.5-second clip is **1 h 12 min** of generation, and a
-continuation costs the same as its siblings however far down the chain it
-sits — each one reads exactly 2.33 s of video, whatever came before it.
-
-**The adapters here buy quality, not time.** Both are 8-step distillations
-and the runs already used 8 steps, so the LoRA costs what it computes —
-about 3% on the wall clock, against 1 h 10 min for the same four parts
-without them. Their value is at a LOWER count: the 4-step entries in the
-table under [Fewer steps](#fewer-steps--the-turbo-lora) halve this, and the
-Ref2VA line has one.
-
-A continuation costs more than the text run it follows: the guide adds 8,670
-video rows and 190 audio rows, and the conditioning grows to ~2,750 rows
-because the vision tower's reading of the clip is part of the prompt. That is
-1.29× the rows for 1.87× the wall clock — attention pays for rows squared,
-and the reference encode adds about two minutes before the first step.
-
-Sol saves less on a continuation than on the text run: it kept **24%** of
-key blocks exact on part 1 against **41%** on part 2, because reference rows
-are attended from everywhere.
+A cross-fade consumes the frames it blends, so this lands at **39.9 s**
+rather than 40.5. It is optional.
 
 #### Making it your own
 
@@ -1250,22 +1313,26 @@ are attended from everywhere.
   `video-ref-encoder`; they are checked against each other. The parts do not
   have to be the same length as each other.
 - **Change a part's length and the next part's audio window moves.**
-  `start_s` is `previous_part_frames / 24 − 56 / 24`. Leave `duration_s` at
-  2.3333 as long as the slice stays at 56.
-- **A longer guide is `17n + 5` frames**: 73 (3.04 s) or 90 (3.75 s). Change
-  `temporal-slice`'s `start`, and the audio window with it. A longer guide
-  carries more motion and costs about 510 rows per extra latent frame.
+  `start_s` is `previous_part_frames / 24 − 90 / 24`. Leave `duration_s` at
+  3.75 as long as the slice stays at 90.
+- **A guide is `17n + 5` frames**: 56 (2.33 s), 73 (3.04 s) or the shipped
+  90 (3.75 s). Change `temporal-slice`'s `start`, and the audio window with
+  it. A longer guide carries more motion and costs about 540 rows per extra
+  latent frame at 960 × 576.
+- **Keep the parts lossless.** Switch a part's sink back to H.264 and every
+  continuation after it conditions on a compressed, 4:2:0 copy of the one
+  before — a loss that compounds once per part.
 - **Expect identity to drift along the chain**, and write against it. Each
-  part sees only the 2.33 s before it, so a detail the guide does not show
+  part sees only the 3.75 s before it, so a detail the guide does not show
   is carried by the prompt alone. Keep the descriptions identical between
   parts, keep distinguishing features in frame near the seams, and check the
   last part against the first rather than against the one before it.
 - **For a fifth part**, copy part 4, point its two `load-guide*` stages at
   `…-part4.mp4`, give the new part its own `output_url`, and add it to the
   concat list.
-- **Swapping a Turbo adapter changes the step count and the shifts with
-  it.** Each one is distilled at a recipe; the table above is what the
-  shipped pair wants, and
+- **Adding a Turbo adapter changes the step count and the shifts with
+  it.** Each one is distilled at a recipe; the table above is what that
+  pair wants, and
   [Which Turbo adapters work](#which-turbo-adapters-work) lists the rest
   with theirs. An adapter for the other partition is refused, not applied.
 
