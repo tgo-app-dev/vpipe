@@ -98,7 +98,9 @@ model_dir_available(const SessionContextIntf* session,
 // Resolve a reference to ONE `.safetensors` -- an adapter, which is a
 // file where every other model reference here is a directory.
 //
-// Three shapes, in order: a direct path to a file; a registry key, whose
+// Three shapes, in order: a direct path to a file (under the web-ui's
+// file sandbox, a path in the sandbox's own "/"-rooted tree is tried
+// first -- it is what that UI's file browser writes); a registry key, whose
 // record NAMES its file (the only thing that disambiguates two records
 // over one directory -- both MiniMax-H3 Turbo checkpoints are published
 // from one repo and land side by side); and a bare directory, scanned

@@ -310,7 +310,11 @@ const ConfigKey kAttrs[] = {
    // Both families this stage can adapt. A comma list so the picker
    // offers either and refuses the rest -- a Krea-2 adapter on a FLUX.2
    // DiT binds nothing and says so, but not until it has been fetched.
-   .suggest_db_type = "krea2-lora,flux2-lora"},
+   .suggest_db_type = "krea2-lora,flux2-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora_scale", .type = ConfigType::Real, .required = false,
    .doc = "the adapter's strength, applied PER FORWARD. Live: it rides the "
           "GEMM as a constant, so it can be swept without a reload. 1.0 = "
@@ -327,7 +331,11 @@ const ConfigKey kAttrs[] = {
           "same way. A `lora2` on the family's model-config beat "
           "OVERRIDES this",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2-lora,flux2-lora"},
+   .suggest_db_type = "krea2-lora,flux2-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
    .doc = "`lora2`'s strength, per FORWARD and independent of "
           "`lora_scale` -- which is the point of a second slot: one "

@@ -202,6 +202,40 @@ TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_named)
 // has to equal the canvas the fit record says it was resized to. That is
 // the property that matters -- the plan reads the same geometry rule as
 // the resize, and a copy of the rule would drift.
+// The prompt-only form gets through the whole encode, not just the
+// limits check: a request with no references packs no rows and emits no
+// layout entries, which is what makes the stage's sideband say
+// `references: []` rather than something a consumer has to interpret.
+//
+// Driven with every model pointer null, as the progress test is, so it
+// needs no GPU; what the CONDITIONER makes of an empty presentation is
+// minimax_h3_text_enc.prompt_only_presentation_is_the_prompt.
+TEST(minimax_h3_refenc, an_empty_request_encodes_to_no_rows)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  std::vector<std::string> said;
+  models.progress = [&said](std::uint64_t, std::uint64_t,
+                            const std::string& detail) {
+    said.push_back(detail);
+  };
+
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references({}, "a prompt", plan, models, &enc,
+                                        &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  EXPECT_TRUE(enc.layout.empty());
+  EXPECT_TRUE(enc.fits.empty());
+  EXPECT_TRUE(enc.video_rows.empty());
+  EXPECT_TRUE(enc.audio_rows.empty());
+  // Finished, and said so -- a bar left short of "done" reads as a hang.
+  EXPECT_TRUE(!said.empty() && said.back() == "done");
+}
+
 TEST(minimax_h3_refenc, progress_is_weighed_by_work_planned_up_front)
 {
   h3::ReferencePlan plan;
@@ -490,8 +524,11 @@ TEST(minimax_h3_refenc, request_limits)
   h3::ReferenceLimits lim;
   std::string err;
 
-  // Empty is not a degenerate ref2va, it is a t2va request.
-  EXPECT_FALSE(h3::validate_reference_request({}, lim, &err));
+  // Empty is the prompt-only form, and passes: nothing in its
+  // presentation describes a reference the model cannot see, which is
+  // what the audio-alone rule below is about. Whether the caller MEANT
+  // it is the stage's question.
+  EXPECT_TRUE(h3::validate_reference_request({}, lim, &err));
 
   // Audio alone never reaches the conditioner, so a request of nothing
   // but audio packs text rows describing references the model cannot

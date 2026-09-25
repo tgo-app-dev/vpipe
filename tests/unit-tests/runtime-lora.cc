@@ -36,6 +36,9 @@ struct T {
   std::string               name;
   std::vector<std::int64_t> shape;
   std::vector<float>        v;
+  // "F32", or "I64" for the integer alpha musubi-tuner's converter
+  // writes -- the values are then rounded to int64 on the way out.
+  std::string               dtype = "F32";
 };
 
 // A minimal F32 safetensors: 8-byte header length, JSON header, data.
@@ -54,9 +57,10 @@ write_st(const fs::path& p, const std::vector<T>& ts,
     hdr += "},";
   }
   for (std::size_t i = 0; i < ts.size(); ++i) {
-    const std::size_t n = ts[i].v.size() * 4;
+    const std::size_t n = ts[i].v.size() * (ts[i].dtype == "I64" ? 8 : 4);
     if (i) { hdr += ","; }
-    hdr += "\"" + ts[i].name + "\":{\"dtype\":\"F32\",\"shape\":[";
+    hdr += "\"" + ts[i].name + "\":{\"dtype\":\"" + ts[i].dtype +
+           "\",\"shape\":[";
     for (std::size_t d = 0; d < ts[i].shape.size(); ++d) {
       if (d) { hdr += ","; }
       hdr += std::to_string(ts[i].shape[d]);
@@ -73,6 +77,13 @@ write_st(const fs::path& p, const std::vector<T>& ts,
   f.write(reinterpret_cast<const char*>(&hl), 8);
   f.write(hdr.data(), (std::streamsize)hdr.size());
   for (const auto& t : ts) {
+    if (t.dtype == "I64") {
+      for (float x : t.v) {
+        const std::int64_t q = (std::int64_t)std::lround(x);
+        f.write(reinterpret_cast<const char*>(&q), 8);
+      }
+      continue;
+    }
     f.write(reinterpret_cast<const char*>(t.v.data()),
             (std::streamsize)t.v.size() * 4);
   }
@@ -244,6 +255,159 @@ TEST(runtime_lora, file_touches_reads_only_the_header)
   EXPECT_FALSE(genai::lora::Adapter::file_touches(
       (scratch() / "nope.safetensors").string(), ".mlp.fc1.lora_"));
   fs::remove(p, ec);
+}
+
+// ---- the kohya / musubi-tuner names (issue #34) ---------------------
+
+// What sd-scripts and musubi-tuner save, and what community MiniMax-H3
+// LoRAs on Civitai ship in: `lora_unet_` plus the module path with its
+// dots flattened to underscores, factors spelled `lora_down` /
+// `lora_up`, and a per-module `alpha`. It named nothing a model has, so
+// such a file bound ZERO modules -- the "adapts none of this model's
+// modules" of the issue -- and the workaround in circulation renames
+// the keys by hand, dropping `alpha` (a strength change) on the way.
+//
+// Values, not counts: the flattening and the factor spelling are two
+// separate rewrites, and the alpha that travels with them is the one
+// that changes every output silently when it is lost.
+TEST(runtime_lora, binds_the_kohya_musubi_spelling)
+{
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::error_code ec;
+  fs::create_directories(scratch(), ec);
+  const fs::path p = scratch() / "kohya.safetensors";
+
+  const int R = 4, K = 8, N = 6;
+  ASSERT_TRUE(write_st(p, {
+      {"lora_unet_blocks_0_attn_qkv_proj.lora_down.weight", {R, K},
+       ramp(R * K, 1.0f, 0.0f)},
+      {"lora_unet_blocks_0_attn_qkv_proj.lora_up.weight", {N, R},
+       ramp(N * R, 3.0f, 0.0f)},
+      {"lora_unet_blocks_0_attn_qkv_proj.alpha", {}, {2.0f}},  // 2/4
+      // No alpha: already at strength, exactly as for any other file.
+      {"lora_unet_token_refiner_blocks_1_mlp_fc1.lora_down.weight", {R, K},
+       ramp(R * K, 1.0f, 0.0f)},
+      {"lora_unet_token_refiner_blocks_1_mlp_fc1.lora_up.weight", {N, R},
+       ramp(N * R, 1.0f, 0.0f)},
+      // musubi's diffusers -> native converter writes alpha as INT64.
+      {"lora_unet_blocks_2_mlp_fc2.lora_down.weight", {R, K},
+       ramp(R * K, 1.0f, 0.0f)},
+      {"lora_unet_blocks_2_mlp_fc2.lora_up.weight", {N, R},
+       ramp(N * R, 1.0f, 0.0f)},
+      {"lora_unet_blocks_2_mlp_fc2.alpha", {}, {1.0f}, "I64"},    // 1/4
+  }));
+
+  std::string err;
+  auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+  ASSERT_TRUE(ad != nullptr);
+  if (!ad) { return; }
+
+  // Asked for by the MODEL's name, found under the flattened one.
+  EXPECT_TRUE(ad->has("blocks.0.attn.qkv_proj"));
+  genai::lora::Factors qkv, fc1, fc2, absent;
+  ASSERT_TRUE(ad->bind("blocks.0.attn.qkv_proj", N, K, &qkv));
+  ASSERT_TRUE(ad->bind("token_refiner.blocks.1.mlp.fc1", N, K, &fc1));
+  ASSERT_TRUE(ad->bind("blocks.2.mlp.fc2", N, K, &fc2));
+  EXPECT_FALSE(ad->bind("blocks.0.attn.out_proj", N, K, &absent));
+  EXPECT_TRUE(qkv.rank == R && fc1.rank == R && fc2.rank == R);
+
+  // lora_down is A and lora_up is B -- not the other way round, which
+  // would still bind at a square shape and apply the transpose.
+  EXPECT_TRUE(bf16_at(qkv.a, 0) == 0.5f);   // alpha/rank = 2/4 folded in
+  EXPECT_TRUE(bf16_at(qkv.b, 0) == 3.0f);   // B untouched
+  EXPECT_TRUE(bf16_at(fc1.a, 0) == 1.0f);   // no alpha: at strength
+  EXPECT_TRUE(bf16_at(fc2.a, 0) == 0.25f);  // the integer alpha, read
+  EXPECT_TRUE(ad->modules() == 3);
+  EXPECT_TRUE(ad->skipped() == 0);
+  EXPECT_TRUE(ad->renamed() == 0);          // not a family rename
+  const std::string sum = ad->summary(p.string(), 1.0f);
+  EXPECT_TRUE(sum.find("kohya") != std::string::npos);
+  std::printf("[runtime_lora] %s\n", sum.c_str());
+  fs::remove(p, ec);
+}
+
+// The same adapter in the two spellings binds to the SAME factors.
+// Nothing about kohya's form is a different decomposition -- it is the
+// peft file with its names rewritten -- so anything but byte equality
+// would mean one of the two readers is wrong.
+TEST(runtime_lora, kohya_and_peft_spellings_bind_identically)
+{
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::error_code ec;
+  fs::create_directories(scratch(), ec);
+  const fs::path pk = scratch() / "same-kohya.safetensors";
+  const fs::path pp = scratch() / "same-peft.safetensors";
+  const int R = 4, K = 8, N = 6;
+  const std::vector<float> a = ramp(R * K, -0.7f, 0.05f);
+  const std::vector<float> b = ramp(N * R, 0.3f, -0.02f);
+  ASSERT_TRUE(write_st(pk, {
+      {"lora_unet_blocks_7_adaln_proj_linear.lora_down.weight", {R, K}, a},
+      {"lora_unet_blocks_7_adaln_proj_linear.lora_up.weight", {N, R}, b},
+      {"lora_unet_blocks_7_adaln_proj_linear.alpha", {}, {8.0f}},
+  }));
+  ASSERT_TRUE(write_st(pp, {
+      {"diffusion_model.blocks.7.adaln_proj.linear.lora_A.weight", {R, K}, a},
+      {"diffusion_model.blocks.7.adaln_proj.linear.lora_B.weight", {N, R}, b},
+      {"diffusion_model.blocks.7.adaln_proj.linear.alpha", {}, {8.0f}},
+  }));
+  std::string err;
+  auto ak = genai::lora::Adapter::open(pk.string(), mc, &err);
+  auto ap = genai::lora::Adapter::open(pp.string(), mc, &err);
+  ASSERT_TRUE(ak != nullptr && ap != nullptr);
+  if (!ak || !ap) { return; }
+  genai::lora::Factors fk, fp;
+  ASSERT_TRUE(ak->bind("blocks.7.adaln_proj.linear", N, K, &fk));
+  ASSERT_TRUE(ap->bind("blocks.7.adaln_proj.linear", N, K, &fp));
+  bool same = fk.rank == fp.rank && !fk.a.empty() && !fp.a.empty() &&
+              fk.a.byte_size() == fp.a.byte_size() &&
+              fk.b.byte_size() == fp.b.byte_size();
+  same = same &&
+         std::memcmp(fk.a.contents(), fp.a.contents(), fk.a.byte_size()) ==
+             0 &&
+         std::memcmp(fk.b.contents(), fp.b.contents(), fk.b.byte_size()) ==
+             0;
+  EXPECT_TRUE(same);
+  fs::remove(pk, ec);
+  fs::remove(pp, ec);
+}
+
+// The pre-build question has to see kohya's names too. MiniMax-H3 asks
+// "does any adapter touch mlp.fc1?" BEFORE loading a block, to turn the
+// fused SwiGLU off -- a kohya file that bound its fc1 through the
+// flattening but answered NO here would keep the fusion, whose epilogue
+// has nowhere for a pre-activation delta, and drop fc1's half of the
+// adapter with nothing said.
+//
+// And ONLY kohya's names are flattened: a file in another convention
+// that happens to contain the flattened text is not a kohya file, and
+// must not start matching needles it never matched.
+TEST(runtime_lora, file_touches_sees_the_kohya_spelling)
+{
+  std::error_code ec;
+  fs::create_directories(scratch(), ec);
+  const fs::path k = scratch() / "touch-kohya.safetensors";
+  const fs::path o = scratch() / "touch-other.safetensors";
+  ASSERT_TRUE(write_st(k, {
+      {"lora_unet_blocks_0_mlp_fc1.lora_down.weight", {2, 2},
+       ramp(4, 1.0f, 0.0f)},
+      {"lora_unet_blocks_0_mlp_fc1.lora_up.weight", {2, 2},
+       ramp(4, 1.0f, 0.0f)},
+  }));
+  ASSERT_TRUE(write_st(o, {
+      {"x_blocks_0_mlp_fc1.lora_A.weight", {2, 2}, ramp(4, 1.0f, 0.0f)},
+      {"x_blocks_0_mlp_fc1.lora_B.weight", {2, 2}, ramp(4, 1.0f, 0.0f)},
+  }));
+  using A = genai::lora::Adapter;
+  EXPECT_TRUE(A::file_touches(k.string(), ".mlp.fc1.lora_"));
+  EXPECT_FALSE(A::file_touches(k.string(), ".mlp.fc2.lora_"));
+  EXPECT_FALSE(A::file_touches(k.string(), ".attn.qkv_proj.lora_"));
+  EXPECT_FALSE(A::file_touches(o.string(), ".mlp.fc1.lora_"));
+  fs::remove(k, ec);
+  fs::remove(o, ec);
 }
 
 // ---- the ai-toolkit / ComfyUI names ---------------------------------

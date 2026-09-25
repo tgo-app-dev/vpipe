@@ -33,6 +33,7 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "stages/model-quantize-stage.h"
+#include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
 #include <cmath>
@@ -609,6 +610,83 @@ TEST(minimax_h3_text_enc, config_from_json)
   EXPECT_TRUE(cfg.tap <= cfg.total_layers && cfg.total_layers >= 50);
   // Nothing past the tap runs, so there is no head to load.
   EXPECT_TRUE(cfg.lm.backbone_only);
+}
+
+// A `ref2va` request with NO references -- the prompt-only form -- is
+// presented as the prompt alone and conditions BYTE-IDENTICALLY to
+// the t2va path. That is what makes it the same request text-to-video
+// makes, read by different DiT weights, rather than a near relative:
+// diffusion-conditioner calls encode(), video-ref-encoder calls
+// encode_references(), and for an empty list the two must agree to the
+// bit or "prompt only" quietly means two different conditionings
+// depending on which stage a graph used.
+//
+// Truncated depth like the rest of this file: two layers are enough to
+// put the rotary layout, the tap and the embedding through the forward,
+// and the claim is equality, not accuracy against a reference. Env:
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH only -- no golden is involved.
+TEST(minimax_h3_text_enc, prompt_only_presentation_is_the_prompt)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &cerr));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  auto m = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  if (m == nullptr) { std::printf("[minimax_h3_text_enc] load failed\n"); }
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  // The presentation: the prompt verbatim, every row text, no vision
+  // run, and a rotary layout whose three axes all carry the row index.
+  MiniMaxH3TextEncoder::Presentation P;
+  std::string perr;
+  const bool built = m->build_presentation({}, kPrompt, &P, &perr);
+  if (!built) { std::printf("[minimax_h3_text_enc] %s\n", perr.c_str()); }
+  ASSERT_TRUE(built);
+  if (!built) { return; }
+  const std::vector<std::int32_t> ids = m->tokenize(kPrompt);
+  const int n = P.size();
+  ASSERT_TRUE(n > 0 && P.ids == ids);
+  EXPECT_TRUE(P.runs.empty());
+  bool all_text = (int)P.tags.size() == n;
+  for (int t : P.tags) { all_text = all_text && t == minimax_h3::kTextTag; }
+  EXPECT_TRUE(all_text);
+  bool flat = (int)P.mrope.size() == 3 * n;
+  for (int i = 0; flat && i < n; ++i) {
+    flat = P.mrope[(std::size_t)i] == i &&
+           P.mrope[(std::size_t)n + i] == i &&
+           P.mrope[(std::size_t)2 * n + i] == i;
+  }
+  EXPECT_TRUE(flat);
+
+  // The conditioning: the same bytes encode() returns.
+  std::vector<int> tags;
+  int rn = 0, tn = 0;
+  std::string rerr, terr;
+  SharedBuffer r = m->encode_references({}, kPrompt, &tags, &rn, &rerr);
+  SharedBuffer t = m->encode(kPrompt, &tn, &terr);
+  if (r.empty()) { std::printf("[minimax_h3_text_enc] %s\n", rerr.c_str()); }
+  if (t.empty()) { std::printf("[minimax_h3_text_enc] %s\n", terr.c_str()); }
+  ASSERT_TRUE(!r.empty() && !t.empty());
+  if (r.empty() || t.empty()) { return; }
+  EXPECT_TRUE(rn == tn && rn == n);
+  EXPECT_TRUE(tags == P.tags);
+  const std::size_t bytes = (std::size_t)n * cfg.text_dim * 2;
+  ASSERT_TRUE(r.byte_size() >= bytes && t.byte_size() >= bytes);
+  const bool same =
+      r.byte_size() >= bytes && t.byte_size() >= bytes &&
+      std::memcmp(r.contents(), t.contents(), bytes) == 0;
+  EXPECT_TRUE(same);
+  std::printf("[minimax_h3_text_enc] prompt-only ref2va: %d tokens, %s the "
+              "t2va conditioning\n", n,
+              same ? "byte-identical to" : "DIFFERS from");
 }
 
 namespace {

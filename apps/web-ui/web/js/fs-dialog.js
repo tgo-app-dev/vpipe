@@ -27,22 +27,13 @@ import { t } from './i18n.js';
 import { api } from './api.js';
 import { createFsList, joinPath } from './fs-list.js';
 import { createFsPreview } from './fs-preview.js';
+import { CATEGORY_EXTS } from './path-categories.js';
 
 // Remembers the side-preview toggle across dialogs and reloads.
 const LS_PREVIEW = 'vpipe_fs_preview';
 
-// Category -> extension set. Kept in sync with the backend `path_filter`
-// keywords a stage may declare (stage-config.h). Lower-case, dot-led.
-const CATEGORY_EXTS = {
-  image: ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.ppm',
-          '.pgm', '.tiff', '.tif', '.heic'],
-  audio: ['.wav', '.mp3', '.flac', '.aac', '.m4a', '.ogg', '.opus',
-          '.aiff', '.aif'],
-  video: ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.ts',
-          '.flv', '.mpg', '.mpeg'],
-  text:  ['.txt', '.md', '.json', '.csv', '.log', '.yaml', '.yml',
-          '.xml', '.srt', '.vtt'],
-};
+// Category -> extension set: shared with the phone shell, see
+// path-categories.js.
 
 // Build a filter list for a backend `path_filter` keyword, which may be
 // a COMMA-SEPARATED list of categories ("image,video,audio") for a field

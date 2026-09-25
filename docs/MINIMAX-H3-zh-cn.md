@@ -29,6 +29,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
   - [不只是文本输入](#more-than-text-in)
   - [以参考素材为条件（Ref2VA）](#conditioning-on-references-ref2va)
     - [两种传入参考素材的方式](#two-ways-to-hand-it-a-reference)
+    - [这次不用参考——只用提示词](#no-references-this-time--prompt-only)
     - [示例](#the-example)
     - [代价](#what-it-costs)
     - [参考素材是怎么被读取的](#how-a-reference-is-read)
@@ -49,6 +50,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [同时用两个](#two-at-once)
     - [合并，以及为什么它会丢掉这个适配器的大部分](#merging-and-why-it-loses-most-of-this-adapter)
     - [哪些 Turbo 适配器可用](#which-turbo-adapters-work)
+    - [社区 LoRA——Civitai、musubi-tuner、ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
   - [八步——HyperFlow](#eight-steps--hyperflow)
     - [获取，然后指定它](#fetch-it-then-name-it)
     - [它的不同之处](#what-makes-it-different)
@@ -496,7 +498,8 @@ MiniMax-H3 还发布了**第二个模型文件** `ref2va`，它不以关键帧�
 两个模式是同一套架构，随附的 transformer 配置逐字节相同，所以**权重里没有
 任何东西能把它们区分开**——vpipe 是从打包方式上读出来的。把 Ref2VA 模型文件
 当作 FL2VA 接线会被拒绝，而不是照跑：那样它会加载成功、以完整 33B 的代价
-去噪，然后生成一段不以任何东西为条件的视频。
+去噪，然后生成一段不以任何东西为条件的视频。*有意*不给任何参考则是另一种
+请求，它是接受的——见[只用提示词](#no-references-this-time--prompt-only)。
 
 反过来那个方向则是一种真实存在的用法，而不是接错线：FL2VA 权重同样能经由这条
 序列接收参考图片，这就是下面的[类 Ref2VA](#ref2va-like--references-on-the-fl2va-weights)。
@@ -553,6 +556,47 @@ MiniMax-H3 还发布了**第二个模型文件** `ref2va`，它不以关键帧�
 3 段视频、3 条音轨、总计 12 个）作用于两者的并集。当参考就是你手头的文件、
 并且你愿意让模型自己的规则来决定尺寸时，用列表；当参考由某个 stage 生成、
 或者你想自己设定尺寸时，用端口。
+
+<a id="no-references-this-time--prompt-only"></a>
+#### 这次不用参考——只用提示词
+
+**空列表**本身就是一种请求：只凭提示词生成，走的是已经加载好的 Ref2VA
+模型文件。
+
+```json
+"references": []
+```
+
+这让同一张图既能处理带参考的请求，也能处理不带参考的请求——去掉最后一个
+参考不再意味着换成 FL2VA 模型文件（在别处也用到 Ref2VA 的机器上，就是两份
+都得常驻），之后再加一个参考也只是改列表，而不是改图。一个已接线的 `ref`
+端口若发来**空张量**，表达的是同一个意思，因为那正是它约定的“本轮没有内容”
+的写法。
+
+实际运行的是文生视频自己的序列 `[text | target audio | target video]`，由
+Ref2VA 权重来读：条件只有提示词本身，与 `diffusion-conditioner` 为它产出的
+逐字节相同，不打包任何参考行。两边的日志都会写明：
+
+```
+VideoRefEncoderStage('refenc'): prompt only (an explicitly empty reference
+  list) -> 34 conditioning rows, no reference rows
+GenerateVideoStage('gen'): prompt-only Ref2VA -- the request's reference list
+  is explicitly empty, so the Ref2VA weights denoise from the prompt alone
+  over the text-to-video layout
+```
+
+**省略这个键不是同一个请求。** 既没有 `references` 键、也没有接任何 `ref`
+端口时，编码器等于什么都没拿到——这正是一张没接好线的图的样子——它会给出
+警告并跳过这个请求，而不是为它花掉一次 33B 的去噪。`generate-video` 也守着
+同一条线：在 Ref2VA 模型文件上，一个不带参考列表的条件（比如来自
+`diffusion-conditioner` 的）会被拒绝，只有明确为空的列表才会运行。
+
+在 **FL2VA** 模型文件上，空列表就是普通的文生视频，接在 5 号端口上的关键帧
+照常生效。在 Ref2VA 上则不然：只用提示词的请求仍然是 Ref2VA 的序列，而它
+没有关键帧的位置。
+
+这是让 Ref2VA 权重去做文生视频：序列允许这样做，但 Ref2VA 的配方并没有描述
+它。FL2VA 模型文件才是为此训练的路线；这条路是给已经持有 Ref2VA 的图用的。
 
 <a id="the-example"></a>
 #### 示例
@@ -1524,7 +1568,9 @@ bf16 ULP，不是随尺度变化的误差。两个*不同*的适配器付出同�
 #### 哪些 Turbo 适配器可用
 
 两条路径都以模型自身的模块名为键，并容许在其上再加一层 `diffusion_model.`
-容器前缀（ComfyUI 的约定）。针对 FL2VA 基础模型实测：
+容器前缀（ComfyUI 的约定）——或者 kohya 对这些名字的扁平化写法，社区 LoRA 用的
+就是它（见[社区 LoRA](#community-loras--civitai-musubi-tuner-ai-toolkit)）。
+针对 FL2VA 基础模型实测：
 
 | 适配器 | 模块数 | 是否可用 |
 |---|---|---|
@@ -1558,6 +1604,49 @@ lightx2v 的 `_comfyui_` 版 `qkv_proj` 是 rank 384——三个 rank-128 适配
 发布版上，它会把一个头的 `q` 增量加到另一个头的 `k` 上，50 个 block 全都如此，
 而且没有任何东西会报出来。这正是拆分文件不存在的问题：它们的 q、k、v 是分开
 到达、在这里融合的，融进所加载的那个 DiT 实际采用的分组。
+
+<a id="community-loras--civitai-musubi-tuner-ai-toolkit"></a>
+#### 社区 LoRA——Civitai、musubi-tuner、ai-toolkit
+
+社区训练的风格、运动或角色 LoRA，加载方式与 Turbo 适配器完全相同：把
+`.safetensors` 填进 `lora`（或 `lora2`），用 `lora_scale` 设定强度。在 Web UI
+里这个字段有两个按钮——模型选择器用于已编目的适配器，文件浏览器用于你下载到
+沙盒里的 `.safetensors`。**不需要任何转换。** 读取器接受 H3 各训练工具已知会写出的每一种写法：
+
+| 由谁写出 | 张量名 | 强度 |
+|---|---|---|
+| musubi-tuner、kohya sd-scripts | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` / `.lora_up.weight` | 每个模块自带的 `.alpha` |
+| ai-toolkit、diffusion-pipe、ComfyUI 转换版 | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight` / `.lora_B.weight` | 有 `.alpha` 就用，否则按满强度 |
+| 本 DiT 自己的名字 | `blocks.0.attn.qkv_proj.lora_A.weight` | 同上 |
+| diffusers / peft | `transformer_blocks.0.attn.to_q.lora_A.default.weight` | 文件头里的 `alpha` |
+
+kohya 的名字就是本模型自己的模块路径，只是把点换成了下划线。这一步从文件
+那一侧无法还原——`qkv_proj` 和 `qkv.proj` 扁平化后一模一样——所以 vpipe 反过来
+做：把模型的名字扁平化后去查找，这是精确的。`lora-fuse` 也以同样方式读取
+kohya 的写法，所以对这样的文件，运行时路径和合并路径适配的是同一批投影。
+
+日志会写明它识别出的是哪种写法——下面是一个按 musubi-tuner 默认目标训练的
+LoRA，50 个 block 里各四个投影：
+
+```
+MetalMiniMaxH3Transformer: runtime LoRA 'my-style.safetensors' -- 200 modules
+  at scale 1, rank <= 32, kohya lora_down/lora_up factors
+```
+
+**不要手工改键名。** 转换过的文件只有保住两样东西才能用，而随手写的脚本往往
+会丢掉它们。第一是 `.alpha`：kohya 对每个模块按 `alpha / rank` 施加，丢掉它就
+改变了强度——一个以 alpha 1、rank 32 保存的适配器会因此**强 32 倍**。第二是每对
+因子所属的模块：被改名到错误投影上的一对因子会被搁置，适配器的其余部分照常
+运行——新名字若指向另一形状的投影，日志报为 `SKIPPED (shape mismatch)`；若指向
+模型里根本没有的名字，则什么都不报。请把训练工具写出的原始文件直接交给加载器。
+
+一个仍然绑定不上任何模块的文件会被拒绝，错误信息里列出上面这些写法。那是命名
+问题，而不是下载损坏——请附上它的几个张量名提一个 issue。
+
+融合的 `qkv_proj` 带有一种行顺序，名字里看不出来。与 Turbo 适配器一样，vpipe
+把融合的 `qkv_proj` 适配器按 Comfy-Org 的扁平分组来读，并为 per-head 的
+MiniMaxAI 发布版重新排序。如果某个适配器是在 MiniMaxAI 自己的权重上训练的，
+请设置 `lora_qkv_layout: per_head`（第二个槽位用 `lora2_qkv_layout`）。
 
 <a id="eight-steps--hyperflow"></a>
 ### 八步——HyperFlow

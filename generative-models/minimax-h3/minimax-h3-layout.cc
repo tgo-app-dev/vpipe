@@ -290,7 +290,11 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
                              int patch_h, int patch_w, int audio_channels,
                              PackedLayout* out)
 {
-  if (out == nullptr || references.empty()) { return false; }
+  // An empty list is NOT refused. It is the prompt-only form, and it
+  // falls out of the general case with no branch: the reference loop
+  // below places nothing, so the generated rows start where the text
+  // ends and the layout is `t2va`'s row for row (the test pins that).
+  if (out == nullptr) { return false; }
   if (num_latent_frames <= 0 || latent_height <= 0 || latent_width <= 0 ||
       patch_h <= 0 || patch_w <= 0 || audio_channels <= 0 ||
       num_audio_latents < 0) {

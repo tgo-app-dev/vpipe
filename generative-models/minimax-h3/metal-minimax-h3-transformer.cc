@@ -1355,16 +1355,19 @@ MetalMiniMaxH3Transformer::lora_route_b_(int rank, int N) const
 //
 // The module names are the MODEL's own -- blocks.N.attn.qkv_proj,
 // mlp.fc1/fc2, adaln_proj.linear, token_refiner.blocks.N.* -- so this is
-// a lookup rather than a remap. A module the checkpoint does not carry is
-// SKIPPED and counted, not an error: an adapter trained on a subset of
-// the projections is normal, and refusing one would be refusing the
-// common case.
+// a lookup rather than a remap. That holds for kohya / musubi-tuner
+// files too (`lora_unet_blocks_0_attn_qkv_proj.lora_down.weight`):
+// musubi trains against these same module names and only flattens
+// them, and lora::Adapter reads the flattening. A module the
+// checkpoint does not carry is SKIPPED and counted, not an error: an
+// adapter trained on a subset of the projections is normal, and
+// refusing one would be refusing the common case.
 bool
 MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
                                       std::string* err)
 {
   // Reading the FILE is shared with every other family that takes an
-  // adapter (shared/runtime-lora.h): the two publisher spellings, the
+  // adapter (shared/runtime-lora.h): the publisher spellings, the
   // alpha/rank rescale, the bf16 conversion, the shape check and the
   // skip counting. What stays here is the MODULE LIST, which is the
   // model -- a family that shared that would bind an adapter to the
@@ -1570,9 +1573,21 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   slot.modules  = ad->modules();
   slot.max_rank = ad->max_rank();
   if (slot.modules == 0) {
+    // NAME what would have matched. "none of this model's modules" is
+    // the whole of what a user sees when a trainer's naming is one this
+    // reader does not know, and it reads as a broken file -- so the
+    // conventions it DOES know go in the message, with one module in
+    // each spelling, which is what lets the next unknown one be
+    // recognised as a naming question rather than a bad download.
     if (err != nullptr) {
       *err = "minimax-h3 lora: '" + spec.path +
-             "' adapts none of this model's modules";
+             "' adapts none of this model's modules. Module names are "
+             "read as this DiT's own (`blocks.0.attn.qkv_proj`, bare or "
+             "under `diffusion_model.` / `transformer.`), as kohya / "
+             "musubi-tuner's (`lora_unet_blocks_0_attn_qkv_proj`), or as "
+             "the diffusers decomposition "
+             "(`transformer_blocks.0.attn.to_q`); factors as lora_A / "
+             "lora_B or lora_down / lora_up";
     }
     return false;
   }

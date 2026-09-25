@@ -26,7 +26,10 @@ class MetalLlamaWeights;
 // It also makes the strength a knob rather than a rebuild.
 //
 // WHAT IS SHARED AND WHAT IS NOT. Everything about reading the FILE is
-// shared: the two publisher spellings, the alpha/rank rescale, the bf16
+// shared: the publisher spellings (bare, `diffusion_model.` and
+// `transformer.` prefixes, peft's adapter infix, and kohya /
+// musubi-tuner's `lora_unet_<flattened_module>.lora_down/lora_up`), the
+// alpha/rank rescale, the bf16
 // conversion, the shape check, and the counting that tells "this adapter
 // is for another model" from "this module simply is not adapted". What
 // is NOT shared is the module NAME LIST and the forward -- those are the
@@ -286,8 +289,9 @@ private:
   // names the rename actually changed. Empty when no rename is
   // installed, and when the file is already in the model's convention.
   std::map<std::string, std::string> _by_renamed;
-  // What follows a module name in this file: ".lora_A.weight", or
-  // peft's ".lora_A.<adapter>.weight". Discovered once rather than
+  // What follows a module name in this file: ".lora_A.weight", peft's
+  // ".lora_A.<adapter>.weight", or kohya's ".lora_down.weight" (B then
+  // ".lora_up.weight"). Discovered once rather than
   // guessed per lookup, so any adapter name works and not just
   // "default".
   std::string _suf_a = ".lora_A.weight";

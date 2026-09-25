@@ -31,6 +31,7 @@ arrives in **8–16 steps** instead of 30+.
   - [More than text in](#more-than-text-in)
   - [Conditioning on references (Ref2VA)](#conditioning-on-references-ref2va)
     - [Two ways to hand it a reference](#two-ways-to-hand-it-a-reference)
+    - [No references this time — prompt only](#no-references-this-time--prompt-only)
     - [The example](#the-example)
     - [What it costs](#what-it-costs)
     - [How a reference is read](#how-a-reference-is-read)
@@ -51,6 +52,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Two at once](#two-at-once)
     - [Merging, and why it loses most of this adapter](#merging-and-why-it-loses-most-of-this-adapter)
     - [Which Turbo adapters work](#which-turbo-adapters-work)
+    - [Community LoRAs — Civitai, musubi-tuner, ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
   - [Eight steps — HyperFlow](#eight-steps--hyperflow)
     - [Fetch it, then name it](#fetch-it-then-name-it)
     - [What makes it different](#what-makes-it-different)
@@ -567,7 +569,9 @@ The two partitions are the same architecture and ship byte-identical
 transformer configs, so **nothing in the weights tells them apart** — vpipe
 reads it off the packaging. A Ref2VA checkpoint wired as if it were FL2VA is
 refused rather than run: it would load, denoise at full 33B cost, and generate
-video conditioned on nothing.
+video conditioned on nothing. Asking it for *no references on purpose* is a
+different request, and one it takes — see
+[prompt only](#no-references-this-time--prompt-only).
 
 The *other* direction is a real mode rather than a mistake: FL2VA weights will
 take reference images through this same sequence, which is what
@@ -631,6 +635,51 @@ limits (9 images, 3 clips, 3 soundtracks, 12 total) apply to the union. Reach
 for the list when the references are files you have and are happy for the
 model's own rule to size; reach for the ports when a stage produces the
 reference, or when you want to set its size.
+
+#### No references this time — prompt only
+
+An **empty list** is a request of its own: generate from the prompt alone,
+through the Ref2VA checkpoint that is already loaded.
+
+```json
+"references": []
+```
+
+That is what lets one graph serve requests with and without references —
+dropping the last reference no longer means swapping to the FL2VA checkpoint
+(and holding both, on a box that uses Ref2VA elsewhere), and adding one later
+is a change to the list rather than to the graph. A wired `ref` port that
+beats an **empty tensor** says the same thing, since that is its declared way
+of saying *nothing this time*.
+
+What runs is text-to-video's own sequence, `[text | target audio | target
+video]`, read by the Ref2VA weights: the conditioning is the prompt alone,
+byte for byte what `diffusion-conditioner` produces for it, and no reference
+rows are packed. The log says so on each side:
+
+```
+VideoRefEncoderStage('refenc'): prompt only (an explicitly empty reference
+  list) -> 34 conditioning rows, no reference rows
+GenerateVideoStage('gen'): prompt-only Ref2VA -- the request's reference list
+  is explicitly empty, so the Ref2VA weights denoise from the prompt alone
+  over the text-to-video layout
+```
+
+**Leaving the key out is not the same request.** With no `references` key and
+no `ref` port wired, the encoder has been handed nothing at all — which is
+what an unwired graph looks like — and it skips the request with a warning
+rather than spend a 33B denoise on it. `generate-video` holds the same line:
+on the Ref2VA checkpoint, a conditioning that carries no reference list (one
+from a `diffusion-conditioner`, say) is refused, and only an explicitly empty
+one runs.
+
+On the **FL2VA** checkpoint an empty list is simply text-to-video, and a
+keyframe wired on port 5 is honoured as usual. On Ref2VA it is not: the
+prompt-only request is still Ref2VA's sequence, which has no keyframe slot.
+
+This is the Ref2VA weights doing text-to-video, which the sequence permits
+but the Ref2VA recipe does not describe. The FL2VA checkpoint is the trained
+route for it; this one is for the graph that already holds Ref2VA.
 
 #### The example
 
@@ -1731,7 +1780,9 @@ qkv grouping. Neither is visible in the tensors. Budget the disk: it reads
 #### Which Turbo adapters work
 
 Both paths key on the model's own module names, and tolerate a
-`diffusion_model.` container prefix (the ComfyUI convention) on top of them.
+`diffusion_model.` container prefix (the ComfyUI convention) on top of them —
+or kohya's flattened spelling of them, which is what community LoRAs come in
+(see [Community LoRAs](#community-loras--civitai-musubi-tuner-ai-toolkit)).
 Measured against the FL2VA base:
 
 | adapter | modules | works |
@@ -1773,6 +1824,57 @@ flat grouping. Applied to the per-head release it would add one head's `q`
 delta onto another head's `k`, in all 50 blocks, with nothing to report. This
 is exactly the case the split files do not have: their q, k and v arrive
 separately and are fused here, into whichever grouping the loaded DiT has.
+
+#### Community LoRAs — Civitai, musubi-tuner, ai-toolkit
+
+A style, motion or character LoRA trained by the community loads exactly as
+the Turbo adapters do: name the `.safetensors` in `lora` (or `lora2`) and set
+its strength with `lora_scale`. In the web UI the field has two buttons — the
+model picker for catalogued adapters, and a file browser for a `.safetensors`
+you downloaded into the sandbox. **No conversion is needed.** The reader takes
+each spelling H3's trainers are known to write:
+
+| written by | tensor names | strength |
+|---|---|---|
+| musubi-tuner, kohya sd-scripts | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` / `.lora_up.weight` | per-module `.alpha` |
+| ai-toolkit, diffusion-pipe, ComfyUI conversions | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight` / `.lora_B.weight` | `.alpha` if present, else at full strength |
+| this DiT's own names | `blocks.0.attn.qkv_proj.lora_A.weight` | the same |
+| diffusers / peft | `transformer_blocks.0.attn.to_q.lora_A.default.weight` | the header's `alpha` |
+
+kohya's names are this model's own module paths with the dots flattened to
+underscores. That cannot be undone from the file's side — `qkv_proj` and
+`qkv.proj` flatten alike — so vpipe goes the other way: it flattens the
+model's names and looks those up, which is exact. `lora-fuse` reads kohya's
+spelling the same way, so for such a file the runtime and merged paths adapt
+the same projections.
+
+The log line says which it found — here a musubi-tuner LoRA at its default
+targets, four projections in each of the 50 blocks:
+
+```
+MetalMiniMaxH3Transformer: runtime LoRA 'my-style.safetensors' -- 200 modules
+  at scale 1, rank <= 32, kohya lora_down/lora_up factors
+```
+
+**Do not rename the keys by hand.** A converted file works only if it keeps
+two things a quick script tends to lose. The first is `.alpha`: kohya
+applies each module at `alpha / rank`, so dropping it changes the strength —
+an adapter saved at alpha 1 over rank 32 then lands **32× too strong**. The
+second is the module each factor pair belongs to: a pair renamed onto the
+wrong projection is set aside while the rest of the adapter runs — reported
+as `SKIPPED (shape mismatch)` when the new name is a projection of another
+shape, and not at all when it names nothing the model has. Hand the loader
+the file as the trainer wrote it.
+
+A file that still binds nothing is refused with the spellings above named in
+the message. That is a naming question, not a broken download — open an
+issue with a few of its tensor names.
+
+The fused `qkv_proj` carries a row order that the names do not show. As with
+the Turbo adapters, vpipe reads a fused `qkv_proj` adapter as Comfy-Org's
+flat grouping and re-orders it for the per-head MiniMaxAI release. If an
+adapter was trained on MiniMaxAI's own weights, set
+`lora_qkv_layout: per_head` (`lora2_qkv_layout` for the second slot).
 
 ### Eight steps — HyperFlow
 

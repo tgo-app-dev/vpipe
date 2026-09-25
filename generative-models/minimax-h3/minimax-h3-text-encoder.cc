@@ -580,10 +580,10 @@ MiniMaxH3TextEncoder::build_presentation(const std::vector<Reference>& refs,
   };
   if (out == nullptr) { return fail("null output"); }
   if (!_tok) { return fail("encoder has no tokenizer"); }
-  if (refs.empty()) {
-    return fail("ref2va needs at least one reference; use encode() for a "
-                "text-only prompt");
-  }
+  // No references is the prompt-only form, and it needs no special
+  // case: the loop below emits nothing, so the presentation is the
+  // prompt verbatim, tagged text, on a plain 1-D rotary layout -- which
+  // is exactly what encode() tokenizes.
 
   const std::int32_t vs = _tok->special_token_id("<|vision_start|>");
   const std::int32_t ve = _tok->special_token_id("<|vision_end|>");
@@ -716,6 +716,18 @@ MiniMaxH3TextEncoder::encode_references(const std::vector<Reference>& refs,
 
   Presentation P;
   if (!build_presentation(refs, prompt, &P, err)) { return {}; }
+  // NO VISION BLOCK is plain text, and plain text is what encode_ids()
+  // runs: the prompt-only form of a `ref2va` request then conditions
+  // BYTE-IDENTICALLY to the `t2va` workflow, rather than to within
+  // whatever the 3-axis rotary path rounds differently from the 1-D one
+  // when all three axes carry the same position.
+  if (P.runs.empty()) {
+    SharedBuffer h = encode_ids(P.ids, err);
+    if (h.empty()) { return {}; }
+    if (token_tags != nullptr) { *token_tags = std::move(P.tags); }
+    if (n_tokens != nullptr) { *n_tokens = P.size(); }
+    return h;
+  }
   const std::vector<std::int32_t>& ids = P.ids;
   const std::vector<Presentation::Run>& runs = P.runs;
   const int n = P.size();

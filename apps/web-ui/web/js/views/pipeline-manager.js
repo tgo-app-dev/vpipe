@@ -2302,6 +2302,7 @@ function mountEditor(container, opts = {}) {
         ? !!f.present
         : (f.current !== undefined && f.current !== null);
     let input, read, unsetBtn = null, datalist = null, browseBtn = null;
+    let modelBtn = null;
     // Set by the branch that actually renders a JSON textarea, never
     // re-derived from f.type further down. The auto-apply wiring at the
     // bottom has to agree with what was rendered, and a second type list
@@ -2562,7 +2563,14 @@ function mountEditor(container, opts = {}) {
       const openBrowser = () => {
         let seedDir = '';
         if (f.type === 'string') {
-          seedDir = splitPath(input.value.trim()).dir;
+          const v = input.value.trim();
+          // A field with a model picker too may hold a registry KEY
+          // ("org/name"), which is no directory in the sandbox -- seeding
+          // from it opens the dialog on an error toast. Seed only from
+          // what is plainly a path.
+          const pathish = f.suggest_db !== MODEL_REGISTRY_DB
+              || v.startsWith('/') || /\.safetensors$/i.test(v);
+          seedDir = pathish ? splitPath(v).dir : '';
         } else {
           try {
             const v = JSON.parse(input.value.trim() || '[]');
@@ -2609,9 +2617,15 @@ function mountEditor(container, opts = {}) {
     // model browser instead of a datalist: it lists only installed models
     // matching the field's model_type(s) AND the parent model chosen in a
     // sibling field. Free text is still allowed in the input.
+    //
+    // Its OWN button, beside the file browser rather than in place of it.
+    // A field may carry both hints -- a LoRA is as often a downloaded
+    // .safetensors in the sandbox as a catalogued model -- and the stage
+    // resolves either (resolve_adapter_file), so offering one of them
+    // would be hiding a working input.
     if (f.suggest_db === MODEL_REGISTRY_DB && f.type === 'string'
         && !disabled) {
-      browseBtn = el('button', { class: 'btn ghost mini browse',
+      modelBtn = el('button', { class: 'btn ghost mini browse',
         type: 'button', title: t('pl.mb_browse'),
         onclick: () => openModelBrowser(f, input, (val) => {
           input.value = val;
@@ -2645,6 +2659,7 @@ function mountEditor(container, opts = {}) {
       isBool ? null : el('span', { class: 'ty' }, f.type));
     const inputRow = el('div', { class: 'field-input-row' }, input);
     if (datalist) { inputRow.append(datalist); }
+    if (modelBtn) { inputRow.append(modelBtn); }
     if (browseBtn) { inputRow.append(browseBtn); }
     if (unsetBtn) { inputRow.append(unsetBtn); }
     const field = el('div', { class: 'field' + (isBool ? ' field-bool' : '') },

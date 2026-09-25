@@ -2069,6 +2069,46 @@ TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
               "reported, no keyframe 0 and silent\n");
 }
 
+// NO REFERENCES IS TWO REQUESTS, and only one of them is a mistake
+// (issue #37). A conditioning with no `references` key at all did not
+// come from a video-ref-encoder -- a diffusion-conditioner feeding a
+// Ref2VA graph, say -- and on those weights it would load, run at full
+// 33B cost and condition on nothing anybody asked for, so it is refused.
+// An EXPLICITLY EMPTY list is Ref2VA's prompt-only form: the encoder
+// emits it only when told to, and it runs.
+//
+// Both halves fail silently in their own direction -- a refusal of a
+// request that was meant, or a denoise of one that was not -- and the
+// whole difference between them is one bool, which is why it is pinned
+// here rather than left to a 33B end-to-end run.
+TEST(generate_video, ref2va_tells_an_empty_list_from_no_list)
+{
+  using R = GenerateVideoStage::H3Route;
+  auto route = [](bool said, int n, const char* partition) {
+    return GenerateVideoStage::h3_reference_route(said, n, partition);
+  };
+
+  // Ref2VA: absent is refused, explicitly empty is the reference layout
+  // with no blocks (prompt-only), and references are references.
+  EXPECT_TRUE(route(false, 0, "ref2va") == R::kRefuse);
+  EXPECT_TRUE(route(true, 0, "ref2va") == R::kReference);
+  EXPECT_TRUE(route(true, 2, "ref2va") == R::kReference);
+
+  // FL2VA: an empty list is just t2va / fl2va -- the keyframe layout, so
+  // a wired anchor is honoured rather than dropped -- and references are
+  // the Ref2VA-like mode.
+  EXPECT_TRUE(route(false, 0, "fl2va") == R::kKeyframe);
+  EXPECT_TRUE(route(true, 0, "fl2va") == R::kKeyframe);
+  EXPECT_TRUE(route(true, 1, "fl2va") == R::kReference);
+
+  // A partition nobody could name refuses nothing it did not before.
+  EXPECT_TRUE(route(false, 0, "") == R::kKeyframe);
+  EXPECT_TRUE(route(true, 3, "") == R::kReference);
+
+  std::printf("[generate_video] ref2va: no list refused, [] prompt-only; "
+              "fl2va: [] is t2va\n");
+}
+
 // Ref2VA-like: references on the FL2VA weights, which upstream renders
 // at a 768 short edge and NOT at the 2048 of MiniMaxH3Ref2VASetupStep,
 // whose checkpoint was trained on references.

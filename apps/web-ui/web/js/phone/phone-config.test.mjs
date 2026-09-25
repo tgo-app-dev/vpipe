@@ -81,6 +81,8 @@ globalThis.localStorage = {
 globalThis.window = globalThis;
 
 const { configField } = await import('./phone-config.js');
+const { MODEL_REGISTRY_DB } = await import('../api.js');
+const { extsForFilter } = await import('../path-categories.js');
 
 let failed = 0;
 function check(what, got, want) {
@@ -193,6 +195,54 @@ function build(field) {
   inp.value = 'y';
   inp.dispatchEvent({ type: 'change' });
   check('a string field still commits once on blur', n, 1);
+}
+
+// ---- a LoRA field offers BOTH pickers --------------------------------
+// A field carrying both hints -- `is_path` AND a model-registry
+// `suggest_db` -- is a LoRA: a downloaded .safetensors in the sandbox or
+// a catalogued adapter, and the stage resolves either. This shell used
+// an `else if`, so the file browser won and the model picker vanished.
+{
+  const glyphs = (field) => {
+    const out = [];
+    const walk = (e) => {
+      if (!e || !e.children) { return; }
+      if (e.tag === 'button' && e.className === 'ph-f-btn') {
+        out.push(e.children.map((c) => c.text).join(''));
+      }
+      e.children.forEach(walk);
+    };
+    walk(configField(field, {}).el);
+    // ⌫ is the unset button, which every field has; only pickers count.
+    return out.filter((g) => g !== '⌫').sort().join(' ');
+  };
+  const lora = { key: 'lora', type: 'string', current: '', present: false,
+                 suggest_db: MODEL_REGISTRY_DB,
+                 suggest_db_type: 'minimax-h3-lora',
+                 is_path: true, path_filter: 'weights' };
+  check('a LoRA field has the model AND the file picker',
+        glyphs(lora), '… ⌄');
+  check('a model-only field keeps just the model picker',
+        glyphs({ ...lora, is_path: false }), '⌄');
+  check('a path-only field keeps just the file picker',
+        glyphs({ ...lora, suggest_db: undefined }), '…');
+}
+
+// ---- path_filter: category keywords AND extension patterns ------------
+// The desktop dialog reads `path_filter` as keywords ("image",
+// "image,video,audio"); this shell used to parse extension patterns only,
+// so every keyword reached it as "no filter". One parser now serves both.
+{
+  check('a keyword maps to its extensions',
+        JSON.stringify(extsForFilter('weights')), '[".safetensors"]');
+  check('a keyword list is the union',
+        extsForFilter('image,audio').includes('.wav') &&
+        extsForFilter('image,audio').includes('.png'), true);
+  check('an extension pattern still works',
+        JSON.stringify(extsForFilter('*.png;*.JPG')), '[".png",".jpg"]');
+  check('no filter is no restriction', extsForFilter(''), null);
+  check('an unknown keyword is no restriction',
+        extsForFilter('nonsense'), null);
 }
 
 print(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);

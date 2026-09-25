@@ -86,7 +86,11 @@ const ConfigKey kAttrs[] = {
    // `supplement` (it attaches to a parent rather than standing alone).
    // Naming the type is also what keeps a Krea-2 or Wan adapter out of
    // an H3 field.
-   .suggest_db_type = "minimax-h3-lora"},
+   .suggest_db_type = "minimax-h3-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora_qkv_layout", .type = ConfigType::String, .required = false,
    .doc = "which row order a FUSED attn.qkv_proj adapter is in. The two "
           "publishers group that projection's rows differently -- "
@@ -118,7 +122,11 @@ const ConfigKey kAttrs[] = {
           "projection at rank 64; the base weight is still read once. "
           "LOAD-time like `lora`",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-lora"},
+   .suggest_db_type = "minimax-h3-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora2_qkv_layout", .type = ConfigType::String, .required = false,
    .doc = "the row order of `lora2`'s FUSED attn.qkv_proj, exactly as "
           "`lora_qkv_layout` is for `lora`. Per slot because the order is "

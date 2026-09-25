@@ -136,6 +136,22 @@ resolve_adapter_file(const SessionContextIntf* session,
   };
   if (ref.empty()) { return fail("no adapter named"); }
   std::error_code ec;
+  // A path the web-ui's FILE BROWSER produced. Under the sandbox that
+  // browser shows a chroot-like tree whose root is "/", so what it writes
+  // into a LoRA field ("/loras/style.safetensors") names nothing on the
+  // host until it is confined -- the field offers that browser beside the
+  // model picker, and the pick has to open. Tried FIRST when sandboxed,
+  // because that is the namespace the path was chosen in; a registry key
+  // confines to a file that does not exist and falls through, and so
+  // does a host path outside the sandbox, which the direct test below
+  // still takes as it always did.
+  if (session != nullptr && session->fs_sandboxed()) {
+    std::string cerr;
+    const fs::path c = session->confine_path(ref, false, &cerr);
+    if (cerr.empty() && !c.empty() && fs::is_regular_file(c, ec) && !ec) {
+      return c.string();
+    }
+  }
   if (fs::is_regular_file(fs::path(ref), ec) && !ec) { return ref; }
 
   const ResolvedModel rm = resolve_model(session, ref);

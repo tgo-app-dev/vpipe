@@ -659,6 +659,19 @@ GenerateVideoStage::h3_anchor_count(bool have_references, bool have_keyframe,
 }
 
 // See the declaration. Outside the Apple-Silicon guard for the same
+// reason as h3_anchor_count.
+GenerateVideoStage::H3Route
+GenerateVideoStage::h3_reference_route(bool said, int num_references,
+                                       const std::string& partition)
+{
+  if (num_references > 0) { return H3Route::kReference; }
+  if (partition == "ref2va") {
+    return said ? H3Route::kReference : H3Route::kRefuse;
+  }
+  return H3Route::kKeyframe;
+}
+
+// See the declaration. Outside the Apple-Silicon guard for the same
 // reason as h3_anchor_count: it is a property of the port contract.
 int
 GenerateVideoStage::h3_reference_rows(const TensorBeatPayload* t,
@@ -1419,17 +1432,14 @@ GenerateVideoStage::resolve_config_()
   }
   if (_family == "minimax-h3") {
     // WHICH partition. The two ship byte-identical DiT configs, so the
-    // detection above cannot tell them apart -- and running a Ref2VA
-    // checkpoint through the t2va path is the worst failure this stage
-    // has: it loads, it runs at full cost, and it generates video
-    // conditioned on nothing at all. Refuse instead.
-    // WHICH partition. The two ship byte-identical DiT configs, so the
     // detection above cannot tell them apart, and running Ref2VA
-    // weights through the t2va path is the worst failure this stage
-    // has: it loads, it runs at full cost, and it generates video
-    // conditioned on nothing at all. What closes that is the check in
-    // initialize() -- a Ref2VA checkpoint with no reference rows wired
-    // is refused there, where iport connectivity is known.
+    // weights through the t2va path BY ACCIDENT is the worst failure
+    // this stage has: it loads, it runs at full cost, and it generates
+    // video conditioned on nothing at all. initialize() warns about a
+    // graph that cannot deliver references, and process() refuses a
+    // conditioning that carries no reference list -- while honouring an
+    // explicitly EMPTY one, which is the same forward asked for on
+    // purpose (Ref2VA's prompt-only form).
     _h3_partition =
         genai::MetalMiniMaxH3Transformer::partition_of(_root, want_partition);
     // Which partition, and on whose authority. Worth a line: when a
@@ -2344,6 +2354,12 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
   // connectivity is known, which is why the notice lives here and the
   // per-request refusal -- the one that actually stops a wrong
   // generation -- lives where the beat arrives.
+  //
+  // "Every request" is exact for any request that LISTS references --
+  // their rows have no way in. The one that survives is prompt-only, an
+  // explicitly empty list, which needs no rows; but it still has to come
+  // from a video-ref-encoder, and a graph that wired one would normally
+  // have wired its rows too, so the warning stands.
   if (_h3_partition == "ref2va" &&
       !(ctx.num_iports() > kRefVideoRowsPort &&
         ctx.iport_connected(kRefVideoRowsPort))) {
@@ -2351,9 +2367,10 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
         "GenerateVideoStage('{}'): '{}' is MiniMax-H3's Ref2VA partition, "
         "which conditions on a list of reference images, clips and "
         "soundtracks, but iport{} (ref_video_rows) is unwired -- every "
-        "request will be refused. Wire a `video-ref-encoder` to iport{} "
-        "and iport{}, or use the FL2VA checkpoint for text-to-video and "
-        "first/last-frame work.",
+        "request with references will be refused. Wire a "
+        "`video-ref-encoder` to iport{} and iport{} (`references: []` on "
+        "it asks for prompt-only), or use the FL2VA checkpoint for "
+        "text-to-video and first/last-frame work.",
         this->id(), _root, kRefVideoRowsPort, kRefVideoRowsPort,
         kRefAudioRowsPort));
   }
@@ -2732,7 +2749,11 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
   const FlexData refs = so.at("references");
   if (!refs.is_array()) { return true; }
   const auto ra = refs.as_array();
-  if (ra.size() == 0) { return true; }
+  // An empty array is SAID, not absent, and falls through: the tags and
+  // the row beats are read the same way, and rows arriving for a
+  // request that lists no references are caught where the layout's
+  // counts are compared with them.
+  out->said = true;
 
   out->refs.clear();
   out->refs.reserve(ra.size());
@@ -2866,15 +2887,21 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   if (n_anchor >= 2) { anchors.push_back(h3::Anchor::kLast); }
   if (kf_ignored && !_kf_on_ref2va_said) {
     _kf_on_ref2va_said = true;
+    // A prompt-only Ref2VA request lands here too: it lists no
+    // references, but it is packed by the reference builder all the
+    // same, so it has no slot either.
     session()->warn(fmt(
         "GenerateVideoStage('{}'): a keyframe anchor is wired on iport {} "
-        "but this request carries REFERENCES, whose layout has no keyframe "
+        "but this request {}, whose layout has no keyframe "
         "slot -- the anchor is ignored. A reference image conditions the "
         "whole clip (subject, wardrobe, style) and cannot pin one frame; "
         "asking for it in the prompt does nothing either. Anchoring an "
         "opening frame is the keyframe layout's job, and the two are "
         "mutually exclusive whichever partition is resident.",
-        this->id(), kRefPort));
+        this->id(), kRefPort,
+        r2v->refs.empty()
+            ? "is prompt-only Ref2VA (an explicitly empty reference list)"
+            : "carries REFERENCES"));
   }
   // h3::kAudioChannels is the STEREO count (2) -- how many soundtrack
   // channels the audio rows are packed channel-major over. It is NOT
@@ -3476,13 +3503,38 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     if (!parse_h3_references_(cond->sideband, rvt, rat, &r2v)) {
       co_return;   // already warned
     }
-    have_r2v = !r2v.refs.empty();
-    if (_h3_partition == "ref2va" && !have_r2v) {
+    // A conditioning with NO `references` key did not come from a
+    // video-ref-encoder, and on the Ref2VA partition that is still
+    // refused: it is what a mis-wired graph delivers, and it would load,
+    // run at full cost and condition on nothing anyone asked for.
+    //
+    // An EMPTY list is a different request. The encoder emits it only
+    // when it was told to (`references: []`, or wired ports that each
+    // said "nothing this time"), so it is Ref2VA's prompt-only form:
+    // the layout is t2va's row for row, read by the Ref2VA weights. On
+    // the FL2VA partition the same empty list is simply t2va / fl2va,
+    // so it takes that path -- keyframe anchors included -- rather than
+    // the reference one, which has no slot for them.
+    const H3Route route = h3_reference_route(
+        r2v.said, (int)r2v.refs.size(), _h3_partition);
+    if (route == H3Route::kRefuse) {
       session()->warn(fmt(
           "GenerateVideoStage('{}'): a Ref2VA checkpoint is resident but the "
-          "conditioning carries no references; a Ref2VA forward without them "
-          "generates video conditioned on nothing. Skipping", this->id()));
+          "conditioning carries no reference list -- it did not come from a "
+          "video-ref-encoder, and a Ref2VA forward on it generates video "
+          "conditioned on nothing anyone asked for. For a prompt-only "
+          "request, set `references: []` on the video-ref-encoder. "
+          "Skipping", this->id()));
       co_return;
+    }
+    have_r2v = route == H3Route::kReference;
+    if (have_r2v && r2v.refs.empty() && !_ref2va_prompt_only_said) {
+      _ref2va_prompt_only_said = true;
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): prompt-only Ref2VA -- the request's "
+          "reference list is explicitly empty, so the Ref2VA weights "
+          "denoise from the prompt alone over the text-to-video layout",
+          this->id()));
     }
     // REFERENCES ON THE FL2VA PARTITION: upstream's Ref2VA-like mode.
     //
@@ -3502,7 +3554,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // clip that ignores its references while looking perfectly ordinary
     // -- so the log says which mode ran rather than leaving the reader
     // to infer it from the graph.
-    if (have_r2v && _h3_partition == "fl2va") {
+    if (!r2v.refs.empty() && _h3_partition == "fl2va") {
       if (!_ref2va_like_said) {
         _ref2va_like_said = true;
         session()->info(fmt(

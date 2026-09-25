@@ -266,6 +266,28 @@ public:
   static int h3_reference_rows(const class TensorBeatPayload* t,
                                int want_elems, const float** data);
 
+  // Which layout a MiniMax-H3 request is packed with, from what its
+  // conditioning SAID about references and which partition is resident.
+  //
+  // `said` is whether the sideband carried a `references` ARRAY at all,
+  // and it is the whole point: an ABSENT list on the Ref2VA partition is
+  // what a mis-wired graph delivers, and is refused, while an explicitly
+  // EMPTY one is Ref2VA's prompt-only form and runs. On FL2VA an empty
+  // list is just t2va / fl2va, keyframes and all.
+  //
+  // Public and static for the same reason as the two above: the
+  // difference between "nobody asked" and "asked for none" is one bool,
+  // it fails silently in either direction (a refused request, or a 33B
+  // denoise conditioned on nothing), and a test of it needs neither a
+  // model nor a runtime.
+  enum class H3Route {
+    kRefuse,      // Ref2VA weights, and nothing said which request
+    kKeyframe,    // [text | keyframe conditions | audio | video]
+    kReference,   // [text | reference blocks | audio | video]
+  };
+  static H3Route h3_reference_route(bool said, int num_references,
+                                    const std::string& partition);
+
   // Test-only accessors.
   const std::string& hf_dir()          const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _emitted; }
@@ -437,6 +459,8 @@ private:
   // inside one.
   bool _ref2va_like_said = false;
   bool _ref2va_like_media_said = false;
+  // Said ONCE: a prompt-only Ref2VA request (an explicitly empty list).
+  bool _ref2va_prompt_only_said = false;
   // Said-once guard for the memory-gate arithmetic (allowance, supply,
   // margin). A denoise consults the gate on every block, and the figures
   // are a property of the box rather than of the forward.
@@ -481,6 +505,11 @@ private:
   // are megabytes, and every reference is encoded at a resolution of
   // its own, so rows are the only shape they share).
   struct H3References {
+    // The sideband carried a `references` ARRAY -- which an empty one
+    // does too. That is Ref2VA's prompt-only form, and it is what tells
+    // a video-ref-encoder that was asked for no references apart from a
+    // conditioning that never came from one.
+    bool said = false;
     std::vector<genai::minimax_h3::Reference> refs;
     // Borrowed from the beats, which outlive the forward.
     const float* video_rows   = nullptr;
@@ -520,10 +549,11 @@ private:
   // instead. The two are mutually exclusive by construction -- they are
   // different checkpoints.
   // Read a `ref2va` plan off the conditioning beat's sideband and pair
-  // it with the two reference-row beats. Leaves `out->refs` empty (and
-  // returns true) when the conditioning carries no references at all --
-  // that is a `t2va` / `fl2va` request, not a malformed one. False only
-  // on a plan that IS present and does not add up, after warning.
+  // it with the two reference-row beats. Leaves `out->said` false (and
+  // returns true) when the conditioning carries no `references` at all
+  // -- that is a `t2va` / `fl2va` request, not a malformed one. An
+  // EMPTY array sets `said` with no refs: the prompt-only form. False
+  // only on a plan that IS present and does not add up, after warning.
   bool parse_h3_references_(const FlexData& sideband,
                             const class TensorBeatPayload* video_rows,
                             const class TensorBeatPayload* audio_rows,

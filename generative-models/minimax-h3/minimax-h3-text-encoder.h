@@ -193,6 +193,10 @@ class MiniMaxH3TextEncoder {
   // verbatim. No chat template and no special tokens, exactly as the
   // text-only path.
   //
+  // An EMPTY `refs` is the prompt-only form: the presentation is the
+  // prompt alone, and it is run through encode()'s own path, so it
+  // returns the same bytes encode(prompt) does.
+  //
   // `token_tags`, when non-null, receives MiniMax-H3's own per-row
   // modality tag: text rows are tagged 1 and a VISION BLOCK's rows are
   // tagged 0 (video). That is not the same thing as the Qwen-internal

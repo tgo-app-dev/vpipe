@@ -347,6 +347,11 @@ private:
   // Paths only: WHAT each one is comes from the file when it is opened,
   // not from anything held here.
   std::vector<std::string> _references;
+  // Whether the config carried `references` as an ARRAY, even an empty
+  // one. `references: []` is how a graph asks for Ref2VA's prompt-only
+  // form; an ABSENT key is what an unwired graph looks like, and the two
+  // must not be confused -- see process().
+  bool          _references_said = false;
   int           _frames = 121;
   int           _ref_short_edge = 2048;
   // Whether the GRAPH set the short edge, as distinct from inheriting

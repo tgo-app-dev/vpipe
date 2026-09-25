@@ -350,6 +350,13 @@ bool condition_frame_indices(int num_frames, double fps, double sample_fps,
 // of nothing but audio has no visual reference at all -- it is a `t2va`
 // request wearing a `ref2va` shape, and it packs a sequence whose text
 // rows describe references the model cannot see.
+//
+// An EMPTY list passes. It is the prompt-only form of `ref2va`, and it
+// differs from audio-alone in the way that matters: nothing in its
+// presentation describes a reference, so there is nothing the model is
+// told about and cannot see. Whether a caller MEANT it is the stage's
+// question (an absent list and an explicitly empty one look the same by
+// the time they get here), not this one's.
 bool validate_reference_request(const std::vector<MediaReference>& refs,
                                 const ReferenceLimits& limits,
                                 std::string* err = nullptr);

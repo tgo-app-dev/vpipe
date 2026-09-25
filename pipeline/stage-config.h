@@ -154,7 +154,12 @@ struct ConfigKey {
   // Only meaningful for String keys (or an Array of path strings). NOTE:
   // model-manager paths (hf_dir, model_path, ...) are deliberately NOT
   // flagged here -- they are sandbox-exempt and get a model picker
-  // instead of the sandbox browser.
+  // instead of the sandbox browser. The exception is an ADAPTER field
+  // (`lora`, `lora2`): it sets BOTH this and suggest_db, and the editor
+  // offers both pickers, because a LoRA is as often a downloaded file as
+  // a catalogued model. Its value is then either a registry key or a
+  // path, and resolve_adapter_file() takes both -- a sandbox-relative
+  // path from the browser included.
   bool             is_path    = false;
   // When is_path: true, this path is WRITTEN (a save target) rather than
   // read; the browser opens in "save" mode (offers a filename field).
@@ -163,8 +168,8 @@ struct ConfigKey {
   // anything else (empty) selects a file. Static storage.
   std::string_view path_kind  = {};
   // When is_path: an optional filter category the browser maps to a set
-  // of extensions ("image", "audio", "video", "text"); empty = no
-  // filter (all files). Static storage.
+  // of extensions ("image", "audio", "video", "text", "weights" for
+  // .safetensors); empty = no filter (all files). Static storage.
   //
   // COMMA-SEPARATED for a field that takes more than one kind
   // ("image,video,audio"): the dialog offers the union first and the

@@ -38,6 +38,8 @@
 #include "stages/generate-image-stage.h"
 #endif
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -579,24 +581,38 @@ TEST(model_config, krea2_emits_the_adapter_keys_only_when_set)
   }
 }
 
-// Every `lora` key offers a MODEL picker, filtered to its own family.
+// Every LoRA key offers BOTH pickers: a MODEL picker filtered to its
+// own family, and a FILE browser for `.safetensors`.
 //
 // The failure this pins is a UI one, which is exactly why it needs a
-// test: a `lora` field declared `is_path` renders a FILE BROWSER, and a
-// browser cannot show a catalogued adapter at all -- so the models the
-// catalogue exists to offer are invisible and the field looks broken
-// while being, technically, configurable. Krea-2's shipped that way.
+// test. It has gone wrong in both directions. A `lora` field declared
+// ONLY `is_path` rendered a file browser, which cannot show a catalogued
+// adapter at all -- so the models the catalogue exists to offer were
+// invisible and the field looked broken while being, technically,
+// configurable. Krea-2's shipped that way. The fix made them model
+// pickers only, and then a LoRA downloaded from Civitai into the
+// sandbox -- as common as a catalogued one -- could only be typed in by
+// path. The editor now renders both buttons when a field carries both
+// hints (views/pipeline-manager.js, phone/phone-config.js), and the
+// stage's resolve_adapter_file() takes either value.
 //
 // The type also has to be the family's OWN, or the picker offers every
 // adapter in the catalogue and a Krea-2 LoRA can be chosen for a FLUX.2
 // DiT, which loads and binds nothing.
 TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
 {
-  struct Row { const char* stage; const char* want_type; };
+  struct Row { const char* stage; const char* key; const char* want_type; };
   const Row rows[] = {
-    {"krea2-model-config",      "krea2-lora"},
-    {"flux2-model-config",      "flux2-lora"},
-    {"minimax-h3-model-config", "minimax-h3-lora"},
+    {"krea2-model-config",      "lora",  "krea2-lora"},
+    {"krea2-model-config",      "lora2", "krea2-lora"},
+    {"flux2-model-config",      "lora",  "flux2-lora"},
+    {"flux2-model-config",      "lora2", "flux2-lora"},
+    {"minimax-h3-model-config", "lora",  "minimax-h3-lora"},
+    {"minimax-h3-model-config", "lora2", "minimax-h3-lora"},
+    {"generate-image",          "lora",  "krea2-lora,flux2-lora"},
+    {"generate-image",          "lora2", "krea2-lora,flux2-lora"},
+    {"lora-fuse",               "lora",
+     "krea2-lora,flux2-lora,minimax-h3-lora"},
   };
   for (const Row& row : rows) {
     const StageSpec* sp = StageRegistry::get().spec(row.stage);
@@ -605,18 +621,27 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
     const Row& r = row;
     const ConfigKey* lora = nullptr;
     for (const ConfigKey& k : sp->attrs) {
-      if (k.key == "lora") { lora = &k; break; }
+      if (k.key == r.key) { lora = &k; break; }
     }
     EXPECT_TRUE(lora != nullptr);
-    if (lora == nullptr) { continue; }
-    // A model picker, not the filesystem browser.
-    EXPECT_TRUE(!lora->is_path);
+    if (lora == nullptr) {
+      std::printf("[model_config] %s has no `%s`\n", r.stage, r.key);
+      continue;
+    }
+    // A model picker...
     EXPECT_TRUE(lora->suggest_db == kModelRegistryDb);
     EXPECT_TRUE(lora->suggest_db_type == r.want_type);
-    if (lora->suggest_db_type != r.want_type) {
-      std::printf("[model_config] %s lora suggest_db_type '%s' != '%s'\n",
-                  r.stage, std::string(lora->suggest_db_type).c_str(),
-                  r.want_type);
+    // ...AND a file browser that offers weights.
+    EXPECT_TRUE(lora->is_path);
+    EXPECT_TRUE(lora->path_filter == "weights");
+    EXPECT_FALSE(lora->path_write);
+    if (lora->suggest_db_type != r.want_type || !lora->is_path ||
+        lora->path_filter != "weights") {
+      std::printf("[model_config] %s.%s: suggest_db_type '%s' (want '%s'), "
+                  "is_path %d, path_filter '%s'\n", r.stage, r.key,
+                  std::string(lora->suggest_db_type).c_str(), r.want_type,
+                  (int)lora->is_path,
+                  std::string(lora->path_filter).c_str());
     }
   }
 
@@ -635,6 +660,60 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
   EXPECT_TRUE(h3 > 0);
   std::printf("[model_config] catalogued adapters: krea2 %d, h3 %d, "
               "flux2 %d (none published yet)\n", krea, h3, flux);
+}
+
+// What the FILE browser on a LoRA field writes has to open.
+//
+// Under the web-ui's sandbox the browser shows a chroot-like tree whose
+// root is "/", so a pick reads "/loras/style.safetensors" -- a path that
+// names nothing on the host until it is confined. The stage resolves the
+// field through resolve_adapter_file(), which took host paths and
+// registry keys only; a picked file then failed with "neither a file, a
+// registered model, nor a directory" while sitting in the sandbox.
+TEST(model_config, a_lora_picked_in_the_sandbox_resolves)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-lora-sbx";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "loras", ec);
+  {
+    std::ofstream f(root / "loras" / "style.safetensors");
+    f << "x";
+  }
+  const std::string cfg = "{\"file_sandbox\":{\"enabled\":true,"
+                          "\"root\":\"" + root.string() + "\"}}";
+  Session sess(cfg);
+  EXPECT_TRUE(sess.fs_sandboxed());
+
+  std::string err;
+  const std::string got =
+      resolve_adapter_file(&sess, "/loras/style.safetensors", &err);
+  if (got.empty()) { std::printf("[model_config] %s\n", err.c_str()); }
+  EXPECT_TRUE(!got.empty() &&
+              fs::equivalent(fs::path(got),
+                             root / "loras" / "style.safetensors", ec));
+  // The relative spelling of the same pick.
+  err.clear();
+  EXPECT_TRUE(!resolve_adapter_file(&sess, "loras/style.safetensors", &err)
+                   .empty());
+  // A host path OUTSIDE the sandbox still resolves as it always did --
+  // this adds a namespace, it does not take one away.
+  const fs::path host = fs::temp_directory_path() / "vpipe-lora-host.st";
+  {
+    std::ofstream f(host);
+    f << "x";
+  }
+  err.clear();
+  EXPECT_TRUE(resolve_adapter_file(&sess, host.string(), &err) ==
+              host.string());
+  // And a name that is none of these still fails, with a reason.
+  err.clear();
+  EXPECT_TRUE(resolve_adapter_file(&sess, "/loras/absent.safetensors", &err)
+                  .empty());
+  EXPECT_FALSE(err.empty());
+  fs::remove(host, ec);
+  fs::remove_all(root, ec);
 }
 
 // generate-image reads the adapter from its OWN config, and a beat
@@ -677,9 +756,11 @@ TEST(model_config, generate_image_takes_the_adapter_from_its_own_config)
     EXPECT_TRUE(s->lora_scale() == 0.75);
   }
 
-  // And the picker for it offers BOTH families this stage can adapt --
-  // a file browser here would hide every catalogued adapter, which is
-  // the bug this key was added to stop repeating.
+  // And the model picker for it offers BOTH families this stage can
+  // adapt. A file browser ALONE would hide every catalogued adapter,
+  // which is the bug this key was added to stop repeating -- so the
+  // browser rides BESIDE the picker (is_path + suggest_db, both rendered;
+  // see every_lora_key_offers_a_filtered_model_picker), never instead.
   const StageSpec* sp = StageRegistry::get().spec("generate-image");
   EXPECT_TRUE(sp != nullptr);
   if (sp != nullptr) {
@@ -689,7 +770,6 @@ TEST(model_config, generate_image_takes_the_adapter_from_its_own_config)
     }
     EXPECT_TRUE(lora != nullptr);
     if (lora != nullptr) {
-      EXPECT_TRUE(!lora->is_path);
       EXPECT_TRUE(lora->suggest_db == kModelRegistryDb);
       EXPECT_TRUE(lora->suggest_db_type.find("krea2-lora") !=
                   std::string_view::npos);

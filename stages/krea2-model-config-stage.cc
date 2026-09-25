@@ -34,12 +34,14 @@ const ConfigKey kAttrs[] = {
           "weights are BUILT (an adapted ff.gate/ff.up forbids the "
           "fused-SwiGLU weave), so a beat that changes it once the DiT is "
           "up is reported and ignored. Unset => no adapter",
-   // A MODEL picker, not a file browser: an adapter is a catalogued
-   // model here, and `krea2-lora` is what keeps a FLUX.2 or H3 adapter
-   // out of the list. Free text still works, so a bare path is
-   // unaffected -- see ConfigKey::suggest_db.
+   // A MODEL picker -- `krea2-lora` is what keeps a FLUX.2 or H3
+   // adapter out of its list -- AND a file browser: a LoRA is as often
+   // a download sitting in the sandbox (Civitai) as a catalogued model,
+   // and the editor offers both pickers when a field carries both
+   // hints. Free text still works either way -- see ConfigKey.
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2-lora"},
+   .suggest_db_type = "krea2-lora",
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora_scale", .type = ConfigType::Real, .required = false,
    .doc = "the adapter's strength, applied PER FORWARD. Live: it rides the "
           "GEMM as a constant, so it can be swept without a reload. 1.0 = as "
@@ -56,7 +58,11 @@ const ConfigKey kAttrs[] = {
           "skinny GEMMs; the base weight is still read once. LOAD-time "
           "like `lora`",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2-lora"},
+   .suggest_db_type = "krea2-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
    .doc = "`lora2`'s strength, per FORWARD and independent of "
           "`lora_scale` -- which is the point of a second slot: one "

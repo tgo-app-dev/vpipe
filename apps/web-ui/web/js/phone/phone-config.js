@@ -38,6 +38,7 @@ import { el, clear, openModal } from '../dom.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
 import { t, tOr } from '../i18n.js';
 import { openFsSheet, dirOf, baseOf } from './phone-fs.js';
+import { extsForFilter } from '../path-categories.js';
 import { compatibleModels } from '../model-filter.js';
 
 const NUMERIC = new Set(['int', 'uint', 'real']);
@@ -268,21 +269,31 @@ export function configField(f, opts = {}) {
       // array path fields, which have no blur-commit of their own.
       commit();
     };
+    // BOTH pickers when a field carries both hints -- a LoRA is as often
+    // a downloaded file as a catalogued model, and the stage resolves
+    // either. The desktop twin is configField in views/pipeline-manager.js.
+    const isModel = f.suggest_db === MODEL_REGISTRY_DB;
+    if (isModel) {
+      addBtn('⌄', () => openModelPicker(f, setPath, opts.peerValues));
+    }
     if (f.is_path) {
       const kind = f.path_kind || '';
       addBtn('…', () => {
+        // A registry key is no directory in the sandbox; do not seed the
+        // sheet from one (it would open on an error).
+        const last = lastPath();
+        const pathish = !isModel || last.startsWith('/') ||
+            /\.safetensors$/i.test(last);
         openFsSheet({
           title: t('phone.pick_path'),
-          start: dirOf(lastPath()) || '',
+          start: (pathish ? dirOf(last) : '') || '',
           pickDirs: kind === 'dir' || kind === 'directory',
-          exts: extsFromFilter(f.path_filter),
+          exts: extsForFilter(f.path_filter),
           nameField: !!f.path_write && kind !== 'dir',
-          defaultName: f.path_write ? baseOf(lastPath()) : '',
+          defaultName: f.path_write ? baseOf(last) : '',
           onPick: setPath,
         });
       });
-    } else if (f.suggest_db === MODEL_REGISTRY_DB) {
-      addBtn('⌄', () => openModelPicker(f, setPath, opts.peerValues));
     }
   }
 
@@ -292,19 +303,6 @@ export function configField(f, opts = {}) {
     key: f.key,
     value: () => (valueEl ? String(valueEl.value ?? '').trim() : ''),
   };
-}
-
-// A stage's `path_filter` is a display string like "*.png;*.jpg"; the
-// listing API wants dot-led extensions. An unparseable filter yields no
-// restriction, which shows too much rather than too little.
-function extsFromFilter(filter) {
-  if (!filter) { return null; }
-  const out = [];
-  for (const part of String(filter).split(/[;,\s]+/)) {
-    const m = /\.([A-Za-z0-9_]+)$/.exec(part.trim());
-    if (m) { out.push('.' + m[1].toLowerCase()); }
-  }
-  return out.length ? out : null;
 }
 
 // Installed models for a model-registry `suggest_db` field, filtered by

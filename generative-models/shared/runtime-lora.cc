@@ -58,6 +58,18 @@ scalar_f32(const MetalLlamaWeights& w, const std::string& name,
     *out = bf16_to_f32(*static_cast<const std::uint16_t*>(b.contents()));
     return true;
   }
+  // An INTEGER alpha is what musubi-tuner's diffusers -> native
+  // conversion writes (`torch.tensor(rank)`, int64). Unread, it would
+  // fall back to 1.0 -- right only because that converter happens to
+  // set alpha to the rank.
+  if (ti->dtype == "I64") {
+    *out = (float)*static_cast<const std::int64_t*>(b.contents());
+    return true;
+  }
+  if (ti->dtype == "I32") {
+    *out = (float)*static_cast<const std::int32_t*>(b.contents());
+    return true;
+  }
   return false;
 }
 
@@ -74,13 +86,35 @@ scalar_f32(const MetalLlamaWeights& w, const std::string& name,
 // the bare name, so a model whose own names begin with it still matches.
 const char* const kPrefixes[] = {"", "diffusion_model.", "transformer."};
 
-// Two spellings of a factor tensor are in the wild and they differ by
-// an infix: `<module>.lora_A.weight`, and peft's
+// Three spellings of a factor tensor are in the wild and they differ by
+// an infix: `<module>.lora_A.weight`, peft's
 // `<module>.lora_A.<adapter>.weight` where the adapter is usually
-// "default". Rather than try both at every lookup -- which would only
-// ever cover the adapter names guessed at -- a file's spelling is
-// DISCOVERED once from its own tensor names.
-const char kMark[] = ".lora_A.";
+// "default", and kohya's `<module>.lora_down.weight` (B is `lora_up`),
+// which is what sd-scripts and musubi-tuner save. Rather than try them
+// all at every lookup -- which would only ever cover the adapter names
+// guessed at -- a file's spelling is DISCOVERED once from its own
+// tensor names.
+const char* const kMarks[] = {".lora_A.", ".lora_down."};
+
+// kohya's MODULE spelling, which travels with its factor spelling:
+// `lora_unet_` and the module path with every '.' turned into '_', so
+// `blocks.0.attn.qkv_proj` is `lora_unet_blocks_0_attn_qkv_proj`. The
+// flattening loses the dots and so cannot be undone from the file's
+// side -- `qkv_proj` and `qkv.proj` flatten alike -- but it does not
+// have to be: bind() arrives holding the MODEL's name, and flattening
+// THAT is exact. It is tried after every dotted spelling, so a file in
+// any other convention resolves exactly as before.
+const char kKohyaPrefix[] = "lora_unet_";
+
+std::string
+kohya_name(const std::string& module)
+{
+  std::string k = kKohyaPrefix + module;
+  for (std::size_t i = sizeof(kKohyaPrefix) - 1; i < k.size(); ++i) {
+    if (k[i] == '.') { k[i] = '_'; }
+  }
+  return k;
+}
 
 // The module a factor tensor belongs to, plus the suffix that followed
 // it. Empty module when the name is not an A factor. B is not scanned:
@@ -88,10 +122,13 @@ const char kMark[] = ".lora_A.";
 std::string
 split_factor(const std::string& tensor, std::string* suffix)
 {
-  const std::size_t p = tensor.find(kMark);
-  if (p == std::string::npos) { return {}; }
-  if (suffix != nullptr) { *suffix = tensor.substr(p); }
-  return tensor.substr(0, p);
+  for (const char* mark : kMarks) {
+    const std::size_t p = tensor.find(mark);
+    if (p == std::string::npos) { continue; }
+    if (suffix != nullptr) { *suffix = tensor.substr(p); }
+    return tensor.substr(0, p);
+  }
+  return {};
 }
 
 // The module part of an A-factor tensor, given this file's suffix.
@@ -105,12 +142,18 @@ module_of(const std::string& tensor, const std::string& suf)
   return tensor.substr(0, tensor.size() - suf.size());
 }
 
-// ".lora_A.<x>.weight" -> ".lora_B.<x>.weight".
+// ".lora_A.<x>.weight" -> ".lora_B.<x>.weight", and kohya's
+// ".lora_down.weight" -> ".lora_up.weight".
 std::string
 b_of_a(std::string suf)
 {
-  const std::size_t p = suf.find("lora_A");
-  if (p != std::string::npos) { suf[p + 5] = 'B'; }
+  std::size_t p = suf.find("lora_A");
+  if (p != std::string::npos) {
+    suf[p + 5] = 'B';
+    return suf;
+  }
+  p = suf.find("lora_down");
+  if (p != std::string::npos) { suf.replace(p, 9, "lora_up"); }
   return suf;
 }
 
@@ -211,6 +254,13 @@ Adapter::resolve_(const std::string& module, bool* via_rename) const
   };
   for (const char* pre : kPrefixes) {
     const std::string kk = std::string(pre) + module;
+    if (both(kk)) { return kk; }
+  }
+  // kohya / musubi-tuner. Not a rename: the model's name, flattened, IS
+  // the file's name, so it needs no family map and reaches every family
+  // whose trainer named the modules as the model does.
+  {
+    const std::string kk = kohya_name(module);
     if (both(kk)) { return kk; }
   }
   // The file's OWN spelling wins; the rename is the fallback. A file
@@ -624,8 +674,11 @@ Adapter::permute_b_rows(Factors* f, int n, const RowMap& rows)
 std::string
 Adapter::summary(const std::string& path, float scale) const
 {
-  return fmt("runtime LoRA '{}' -- {} modules at scale {}, rank <= {}{}{}",
+  return fmt("runtime LoRA '{}' -- {} modules at scale {}, rank <= {}{}{}{}",
              path, _modules, scale, _max_rank,
+             _suf_a.find("lora_down") != std::string::npos
+                 ? std::string(", kohya lora_down/lora_up factors")
+                 : std::string(),
              _renamed > 0
                  ? fmt(", {} via the ai-toolkit/ComfyUI names", _renamed)()
                  : std::string(),
@@ -640,8 +693,31 @@ Adapter::file_touches(const std::string& path, const std::string& needle,
 {
   auto w = MetalLlamaWeights::open(path);
   if (!w.has_value()) { return false; }
+  // The needle in kohya's spelling: the module path before the
+  // `.lora_` marker flattened ('.mlp.fc1.lora_' -> '_mlp_fc1.lora_').
+  // Asked only of names that ARE kohya-spelled, so flattening cannot
+  // widen a match in any other convention. Without it a kohya adapter
+  // on a pre-activation projection binds (resolve_ flattens too) and
+  // then finds the fused kernel still in place -- the silent drop this
+  // predicate exists to prevent.
+  std::string flat;
+  {
+    const std::size_t m = needle.find(".lora_");
+    if (m != std::string::npos) {
+      flat = needle.substr(0, m);
+      for (char& ch : flat) {
+        if (ch == '.') { ch = '_'; }
+      }
+      flat += needle.substr(m);
+    }
+  }
   for (const std::string& n : w->tensor_names()) {
     if (n.find(needle) != std::string::npos) { return true; }
+    if (!flat.empty() &&
+        n.compare(0, sizeof(kKohyaPrefix) - 1, kKohyaPrefix) == 0 &&
+        n.find(flat) != std::string::npos) {
+      return true;
+    }
     if (rename == nullptr) { continue; }
     // The needle is a MODEL name, so the file's name has to be brought
     // into that spelling before it can be compared. The suffix goes

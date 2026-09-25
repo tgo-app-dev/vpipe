@@ -81,7 +81,12 @@ const ConfigKey kAttrs[] = {
           "from the FILE, not from its name: a container with one frame is "
           "an image reference, an .mp4 with no video stream is an audio one. "
           "At most 9 images, 3 videos and 3 audios, 12 in total, and audio "
-          "cannot be the only kind",
+          "cannot be the only kind. An EMPTY list, `[]`, is a prompt-only "
+          "request: the conditioning is the prompt alone and no reference "
+          "rows are packed -- the same sequence text-to-video builds, "
+          "through whichever partition is resident. Leaving the key out "
+          "is NOT that: with no reference iport wired either, the request "
+          "is skipped as an unwired graph",
    .is_path = true, .path_filter = "image,video,audio"},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the MiniMax-H3 model dir (text_encoder/, video_vae/, audio_vae/). "
@@ -345,6 +350,7 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
     auto o = this->config().as_object();
     FlexData refs = o.contains("references") ? o.at("references")
                                              : FlexData::make_null();
+    _references_said = refs.is_array();
     if (refs.is_string()) {
       _references.push_back(std::string(refs.as_string("")));
     } else if (refs.is_array()) {
@@ -386,7 +392,9 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
     // knowable here -- iport_connected() is a RuntimeContext question.
     // The "conditioned on nothing" check therefore moved to process(),
     // where the combined list is known. It costs a load before the
-    // refusal, which is the price of the ports being optional.
+    // refusal, which is the price of the ports being optional. And an
+    // EXPLICIT `[]` is not refused there either: it is the prompt-only
+    // form, which is why `_references_said` is kept.
   }
   _frames           = attr_int("frames");
   _ref_short_edge   = attr_int("reference_image_short_edge");
@@ -1337,6 +1345,10 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
 
   std::vector<h3::MediaReference> refs;
   if (!decode_references_(&refs)) { co_return; }
+  // Whether a wired reference port said "nothing this time" with an
+  // empty tensor -- the port contract's declared way of saying it, and
+  // so as deliberate a prompt-only request as `references: []`.
+  bool port_said_none = false;
 
   // ---- the tensor reference iports ----------------------------------
   // Read unconditionally when WIRED, in port order, appended after the
@@ -1364,7 +1376,10 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     // `data` empty and holds its bytes externally, so reading `data`
     // would take a full picture for an absent one -- and absent
     // renumbers every reference after it.
-    if (tb->shape.empty() || tb->byte_size() == 0) { continue; }
+    if (tb->shape.empty() || tb->byte_size() == 0) {
+      port_said_none = true;
+      continue;
+    }
     h3::MediaReference m;
     std::string merr;
     if (!media_from_beat(*tb, (int)(p - kFirstRefPort + 1), &m, &merr)) {
@@ -1489,12 +1504,24 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     refs.push_back(std::move(m));
   }
 
-  if (refs.empty()) {
+  // NO REFERENCES is two different requests, and only one of them is a
+  // mistake. `references: []` (or a wired port beating an empty tensor)
+  // SAYS "prompt only" -- Ref2VA's weights denoise from the prompt alone
+  // through the same layout text-to-video builds, so a graph that
+  // varies per request need not swap checkpoints to drop its last
+  // reference. An ABSENT key with nothing wired says nothing: that is an
+  // unwired graph, and running it would spend a full 33B denoise on a
+  // request nobody made. A prompt-only request goes out with
+  // `references: []` on its sideband, which is how generate-video tells
+  // it from a conditioning that never came from here.
+  const bool prompt_only = refs.empty();
+  if (prompt_only && !_references_said && !port_said_none) {
     session()->warn(fmt(
-        "VideoRefEncoderStage('{}'): no references -- `references` is empty "
-        "and no reference iport delivered one. A ref2va checkpoint with "
-        "nothing to condition on denoises at full cost and generates from "
-        "the prompt alone; skipping", this->id()));
+        "VideoRefEncoderStage('{}'): no references -- `references` is not "
+        "set and no reference iport is wired, which is what an unwired "
+        "graph looks like. A Ref2VA request with nothing to condition on "
+        "denoises at full cost from the prompt alone; if that is the "
+        "intent, say so with `references: []`. Skipping", this->id()));
     co_return;
   }
 
@@ -1546,7 +1573,9 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // the detail names the reference and the phase. See
   // ReferenceEncoders::progress.
   UiProgress bar = session()->open_progress("encoding references");
-  bar.update(0, 0, std::to_string(refs.size()) + " reference(s)");
+  bar.update(0, 0, prompt_only ? std::string("prompt only")
+                               : std::to_string(refs.size()) +
+                                     " reference(s)");
   {
     auto* ui = session();
     models.progress = [&bar](std::uint64_t done, std::uint64_t total,
@@ -1676,10 +1705,17 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     co_await ctx.write(0, std::move(t));
   }
 
-  session()->info(fmt(
-      "VideoRefEncoderStage('{}'): {} reference(s) -> {} conditioning rows, "
-      "{} reference video rows, {} reference audio rows", this->id(),
-      refs.size(), enc.n_tokens, vrows, arows));
+  if (prompt_only) {
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): prompt only (an explicitly empty "
+        "reference list) -> {} conditioning rows, no reference rows",
+        this->id(), enc.n_tokens));
+  } else {
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): {} reference(s) -> {} conditioning "
+        "rows, {} reference video rows, {} reference audio rows",
+        this->id(), refs.size(), enc.n_tokens, vrows, arows));
+  }
   // What each visual reference was actually encoded at. The canvas is
   // resolved from the reference's own aspect and never appears in the
   // config, so an upscale -- which costs here AND in every denoise step,

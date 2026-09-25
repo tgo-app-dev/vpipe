@@ -93,7 +93,12 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "base model dir or models-DB key (for Krea-2, the transformer/ DiT)",
    .suggest_db = kModelRegistryDb},
   {.key = "lora", .type = ConfigType::String, .required = true,
-   .doc = "LoRA .safetensors file, or a dir/key with one .safetensors"},
+   .doc = "LoRA .safetensors file, or a dir/key with one .safetensors",
+   // Both pickers, as on the model-config stages' `lora` fields: a
+   // catalogued adapter, or a downloaded file in the sandbox.
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "krea2-lora,flux2-lora,minimax-h3-lora",
+   .is_path = true, .path_filter = "weights"},
   {.key = "output_name", .type = ConfigType::String, .required = true,
    .doc = "result name -> <cwd>/models/<output_name> (registered), or an "
           "explicit path"},

@@ -241,6 +241,113 @@ TEST(minimax_h3_lora, comfy_base_fuses_into_a_typed_directory)
   fs::remove_all(root, ec);
 }
 
+// lora-fuse reads kohya / musubi-tuner files too (issue #34), and has
+// to AGREE with the runtime binder about them -- shared/lora-names.h's
+// rule: the two paths meaning different projections by one adapter is
+// the bug that file exists to prevent.
+//
+// The same adapter in both spellings must fuse to the same BYTES: the
+// kohya copy carries alpha = rank / 2 and a doubled lora_up, exact in
+// bf16, so an alpha read wrong shows as a different weight. Then the
+// hazard the flattening brings: two base weights whose names flatten
+// alike (`a.b_c` and `a_b.c`) are ambiguous, and the fuse must adapt
+// NEITHER rather than guess which one `lora_unet_a_b_c` meant.
+TEST(minimax_h3_lora, kohya_spelling_fuses_like_the_native_one)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const fs::path root = fs::temp_directory_path() / "vpipe-h3-kohya-fuse";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "diffusion_models", ec);
+  const fs::path base =
+      root / "diffusion_models" / "minimax_h3_fl2va_bf16.safetensors";
+  const int N = 8, K = 4, R = 2;
+  const std::string cfg =
+      "{\"config\":\"{\\\"transformer\\\": {\\\"image_model\\\": "
+      "\\\"minimax_h3\\\", \\\"hidden_size\\\": 4}}\"}";
+  ASSERT_TRUE(write_st_(base, {
+      {"blocks.0.attn.qkv_proj.weight", {N, K}, ramp_(N * K, 0.7f, 0.5f)},
+      {"blocks.0.mlp.fc1.weight", {N, K}, ramp_(N * K, 0.4f, 0.5f)},
+  }, cfg));
+
+  const std::vector<float> a = ramp_(R * K, 1.1f, 0.25f);
+  const std::vector<float> b = ramp_(N * R, 0.9f, 0.25f);
+  std::vector<float> b2 = b;
+  for (float& x : b2) { x *= 2.0f; }
+  const fs::path native = root / "native.safetensors";
+  const fs::path kohya  = root / "kohya.safetensors";
+  ASSERT_TRUE(write_st_(native, {
+      {"blocks.0.attn.qkv_proj.lora_A.weight", {R, K}, a},
+      {"blocks.0.attn.qkv_proj.lora_B.weight", {N, R}, b},
+      {"blocks.0.mlp.fc1.lora_A.weight", {R, K}, a},
+      {"blocks.0.mlp.fc1.lora_B.weight", {N, R}, b},
+  }, ""));
+  ASSERT_TRUE(write_st_(kohya, {
+      {"lora_unet_blocks_0_attn_qkv_proj.lora_down.weight", {R, K}, a},
+      {"lora_unet_blocks_0_attn_qkv_proj.lora_up.weight", {N, R}, b2},
+      {"lora_unet_blocks_0_attn_qkv_proj.alpha", {}, {1.0f}},  // R / 2
+      {"lora_unet_blocks_0_mlp_fc1.lora_down.weight", {R, K}, a},
+      {"lora_unet_blocks_0_mlp_fc1.lora_up.weight", {N, R}, b2},
+      {"lora_unet_blocks_0_mlp_fc1.alpha", {}, {1.0f}},
+  }, ""));
+
+  std::string err;
+  const fs::path out_n = root / "fused-native";
+  const fs::path out_k = root / "fused-kohya";
+  ASSERT_TRUE(fuse_lora(mc, base.string(), native.string(), out_n.string(),
+                        1.0f, &err));
+  const bool fused_k = fuse_lora(mc, base.string(), kohya.string(),
+                                 out_k.string(), 1.0f, &err);
+  if (!fused_k) {
+    std::printf("[minimax_h3_lora] kohya fuse: %s\n", err.c_str());
+  }
+  ASSERT_TRUE(fused_k);
+  auto wn = MetalLlamaWeights::open_model(out_n.string());
+  auto wk = MetalLlamaWeights::open_model(out_k.string());
+  ASSERT_TRUE(wn.has_value() && wk.has_value());
+  if (!wn.has_value() || !wk.has_value()) { return; }
+  int same = 0, moved = 0;
+  for (const char* t : {"blocks.0.attn.qkv_proj.weight",
+                        "blocks.0.mlp.fc1.weight"}) {
+    const metal_compute::SharedBuffer xn = wn->load(t, mc);
+    const metal_compute::SharedBuffer xk = wk->load(t, mc);
+    ASSERT_TRUE(!xn.empty() && xn.byte_size() == xk.byte_size());
+    if (xn.empty() || xn.byte_size() != xk.byte_size()) { continue; }
+    same += std::memcmp(xn.contents(), xk.contents(), xn.byte_size()) == 0;
+    // Not vacuous: the fuse CHANGED the weight.
+    const auto* p0 = static_cast<const std::uint16_t*>(xn.contents());
+    const std::vector<float> base_v = ramp_(N * K,
+        std::string(t).find("qkv") != std::string::npos ? 0.7f : 0.4f,
+        0.5f);
+    for (int i = 0; i < N * K; ++i) {
+      if (p0[i] != to_bf16_(base_v[(std::size_t)i])) { ++moved; break; }
+    }
+  }
+  EXPECT_TRUE(same == 2);
+  EXPECT_TRUE(moved == 2);
+
+  // ---- an ambiguous flattened name adapts nothing -------------------
+  const fs::path amb = root / "amb.safetensors";
+  const fs::path amb_lora = root / "amb-lora.safetensors";
+  ASSERT_TRUE(write_st_(amb, {
+      {"a.b_c.weight", {N, K}, ramp_(N * K, 0.7f, 0.5f)},
+      {"a_b.c.weight", {N, K}, ramp_(N * K, 0.4f, 0.5f)},
+  }, ""));
+  ASSERT_TRUE(write_st_(amb_lora, {
+      {"lora_unet_a_b_c.lora_down.weight", {R, K}, a},
+      {"lora_unet_a_b_c.lora_up.weight", {N, R}, b},
+  }, ""));
+  std::string aerr;
+  EXPECT_FALSE(fuse_lora(mc, amb.string(), amb_lora.string(),
+                         (root / "fused-amb").string(), 1.0f, &aerr));
+  EXPECT_TRUE(aerr.find("no LoRA tensors matched") != std::string::npos);
+  std::printf("[minimax_h3_lora] kohya fuse: %d of 2 weights byte-identical "
+              "to the native fuse; ambiguous name refused\n", same);
+  fs::remove_all(root, ec);
+}
+
 // The REAL adapter against the REAL base: every module has to resolve.
 //
 // Env: VPIPE_MINIMAX_H3_TURBO_LORA (the .safetensors) and
@@ -503,12 +610,228 @@ TEST(minimax_h3_lora, both_fc1_spellings_reach_the_fused_swiglu_gate)
       {"transformer_blocks.0.ff.net.0.proj.lora_B.default.weight", {N, R},
        ramp_(N * R, 0.9f, 0.25f)},
   }, ""));
+  // kohya / musubi-tuner (issue #34): the same module, flattened. The
+  // SAME needle has to find it -- the binder reaches this file's fc1
+  // through the flattening, so a gate that could not would keep the
+  // fused SwiGLU and drop the delta.
+  const fs::path kohya = dir / "kohya.safetensors";
+  ASSERT_TRUE(write_st_(kohya, {
+      {"lora_unet_blocks_0_mlp_fc1.lora_down.weight", {R, K},
+       ramp_(R * K, 1.1f, 0.25f)},
+      {"lora_unet_blocks_0_mlp_fc1.lora_up.weight", {N, R},
+       ramp_(N * R, 0.9f, 0.25f)},
+  }, ""));
   using A = genai::lora::Adapter;
   EXPECT_TRUE(A::file_touches(comfy.string(), ".mlp.fc1.lora_"));
   // The gap: the diffusers copy adapts the same projection under
   // another name, and the old single needle could not see it.
   EXPECT_FALSE(A::file_touches(diff.string(), ".mlp.fc1.lora_"));
   EXPECT_TRUE(A::file_touches(diff.string(), ".ff.net.0.proj.lora_"));
+  EXPECT_TRUE(A::file_touches(kohya.string(), ".mlp.fc1.lora_"));
+  fs::remove_all(dir, ec);
+}
+
+// A kohya / musubi-tuner file IS the adapter it names (issue #34).
+//
+// Community MiniMax-H3 LoRAs are trained with musubi-tuner, which saves
+// `lora_unet_<module, dots flattened>.lora_down/lora_up/alpha`, and
+// before lora::Adapter read that spelling every one of them bound zero
+// modules. The claim is stronger than "it binds": the forward has to be
+// the forward of the same adapter in this DiT's own spelling -- BIT FOR
+// BIT, on the real model, with the real Turbo LoRA.
+//
+// The kohya copy is written with alpha = rank / 2 and lora_up DOUBLED,
+// so the strength is unchanged and every factor still lands on an exact
+// bf16 value (a power-of-two scale is exact). That makes the alpha read
+// load-bearing: lose it and the delta doubles; read it as rank and the
+// same. Only the first four blocks' modules are copied -- the model is
+// cut to four -- plus the refiner and the final AdaLN.
+//
+// The fused-SwiGLU gate rides along for free on a QUANTIZED base
+// without matrix cores, where the fusion is live: a kohya fc1 that the
+// gate missed would run fused with its delta dropped, and the two arms
+// would differ.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_MINIMAX_H3_TURBO_LORA.
+TEST(minimax_h3_lora, kohya_spelling_is_the_same_adapter)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_MINIMAX_H3_TURBO_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_lora] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 4;
+
+  // ---- the two copies of the adapter -------------------------------
+  auto src = MetalLlamaWeights::open(lp);
+  ASSERT_TRUE(src.has_value());
+  if (!src.has_value()) { return; }
+  auto strip = [](std::string n) {
+    for (const char* pre : {"diffusion_model.", "transformer."}) {
+      const std::string ps = pre;
+      if (n.compare(0, ps.size(), ps) == 0) { return n.substr(ps.size()); }
+    }
+    return n;
+  };
+  auto kept = [](const std::string& m) {
+    if (m.compare(0, 7, "blocks.") != 0) { return true; }
+    return std::atoi(m.c_str() + 7) < 4;
+  };
+  auto flat = [](std::string m) {
+    for (char& ch : m) {
+      if (ch == '.') { ch = '_'; }
+    }
+    return "lora_unet_" + m;
+  };
+  auto values = [&](const std::string& n, std::vector<float>* out) {
+    const auto* ti = src->info(n);
+    if (ti == nullptr) { return false; }
+    const metal_compute::SharedBuffer b = src->load(n, mc);
+    if (b.empty()) { return false; }
+    std::size_t cnt = 1;
+    for (auto d : ti->shape) { cnt *= (std::size_t)d; }
+    out->resize(cnt);
+    if (ti->dtype == "BF16") {
+      const auto* q = static_cast<const std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < cnt; ++i) { (*out)[i] = from_bf16_(q[i]); }
+    } else if (ti->dtype == "F32") {
+      std::memcpy(out->data(), b.contents(), cnt * 4);
+    } else {
+      return false;
+    }
+    return true;
+  };
+  std::vector<Tensor> native, kohya;
+  int n_modules = 0;
+  for (const std::string& n : src->tensor_names()) {
+    const std::size_t pa = n.find(".lora_A.");
+    if (pa == std::string::npos) { continue; }
+    const std::string mod_file = n.substr(0, pa);
+    const std::string mod = strip(mod_file);
+    if (!kept(mod)) { continue; }
+    const std::string suf_a = n.substr(pa);
+    std::string suf_b = suf_a;
+    suf_b[6] = 'B';                         // ".lora_A." -> ".lora_B."
+    std::vector<float> a, b, al;
+    ASSERT_TRUE(values(n, &a) && values(mod_file + suf_b, &b));
+    const auto* ai = src->info(n);
+    const auto* bi = src->info(mod_file + suf_b);
+    const int rank = (int)ai->shape[0];
+    // The file's own alpha, or none -- which means alpha == rank.
+    float alpha = (float)rank;
+    const bool has_alpha = values(mod_file + ".alpha", &al) && !al.empty();
+    if (has_alpha) { alpha = al[0]; }
+    native.push_back({n, ai->shape, a});
+    native.push_back({mod_file + suf_b, bi->shape, b});
+    if (has_alpha) { native.push_back({mod_file + ".alpha", {}, al}); }
+    const std::string k = flat(mod);
+    std::vector<float> b2 = b;
+    for (float& x : b2) { x *= 2.0f; }
+    kohya.push_back({k + ".lora_down.weight", ai->shape, a});
+    kohya.push_back({k + ".lora_up.weight", bi->shape, b2});
+    kohya.push_back({k + ".alpha", {}, {alpha * 0.5f}});
+    ++n_modules;
+  }
+  ASSERT_TRUE(n_modules > 0);
+  const fs::path dir = fs::temp_directory_path() / "vpipe-h3-kohya";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  const fs::path pn = dir / "native.safetensors";
+  const fs::path pk = dir / "kohya.safetensors";
+  ASSERT_TRUE(write_st_(pn, native, ""));
+  ASSERT_TRUE(write_st_(pk, kohya, ""));
+
+  // ---- the forward, three ways -------------------------------------
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 1.0f, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp_((std::size_t)n_video * cfg.video_patch_elems(), 0.017f,
+                0.5f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp_((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f,
+                0.5f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp_(tags.size() * (std::size_t)cfg.text_dim, 0.005f, 0.5f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  // The fused-FF gate is part of what is under test, so a previous
+  // test's pin of the split path is lifted for this one and restored.
+  const char* pinned = std::getenv("VPIPE_H3_NO_FUSED_FF");
+  const std::string pinned_v = pinned != nullptr ? pinned : "";
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  using Specs = std::vector<MetalMiniMaxH3Transformer::LoraSpec>;
+  auto arm = [&](const Specs& specs, std::vector<std::uint16_t>* out,
+                 int* mods) {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, specs);
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    *mods = m->lora_modules();
+    MetalMiniMaxH3Transformer::Step step;
+    step.video = &vb;  step.audio = &ab;  step.text = &tb;
+    step.layout = &L;  step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    std::string ferr;
+    const auto v = m->forward(step, &ferr);
+    if (v.empty()) {
+      std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+      return false;
+    }
+    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+    const auto* q = static_cast<const std::uint16_t*>(v.video.contents());
+    out->assign(q, q + n);
+    return true;
+  };
+  std::vector<std::uint16_t> v_base, v_native, v_kohya;
+  int m_base = 0, m_native = 0, m_kohya = 0;
+  const bool ok =
+      arm({}, &v_base, &m_base) &&
+      arm({MetalMiniMaxH3Transformer::LoraSpec{pn.string(), 1.0f}},
+          &v_native, &m_native) &&
+      arm({MetalMiniMaxH3Transformer::LoraSpec{pk.string(), 1.0f}},
+          &v_kohya, &m_kohya);
+  if (!pinned_v.empty()) {
+    ::setenv("VPIPE_H3_NO_FUSED_FF", pinned_v.c_str(), 1);
+  }
+  ASSERT_TRUE(ok);
+  if (!ok) { fs::remove_all(dir, ec); return; }
+
+  // Every module the native copy bound, the kohya copy bound.
+  EXPECT_TRUE(m_native == n_modules && m_kohya == n_modules);
+  // Not vacuous: the adapter moves the model...
+  double moved = 0.0, ref = 0.0;
+  std::size_t differ = 0;
+  for (std::size_t i = 0; i < v_native.size(); ++i) {
+    const double d = (double)from_bf16_(v_native[i]) -
+                     (double)from_bf16_(v_base[i]);
+    moved += d * d;
+    ref += (double)from_bf16_(v_base[i]) * from_bf16_(v_base[i]);
+    differ += v_kohya[i] != v_native[i] ? 1 : 0;
+  }
+  const double rel = ref > 0.0 ? std::sqrt(moved / ref) : 0.0;
+  EXPECT_TRUE(rel > 1e-2);
+  // ...and the kohya copy moves it EXACTLY as far.
+  EXPECT_TRUE(v_kohya.size() == v_native.size() && differ == 0);
+  std::printf("[minimax_h3_lora] kohya copy of '%s': %d of %d modules "
+              "bound, adapter moves the output %.3g rel-L2, kohya vs "
+              "native %zu of %zu values differ\n", lp, m_kohya, n_modules,
+              rel, differ, v_native.size());
   fs::remove_all(dir, ec);
 }
 

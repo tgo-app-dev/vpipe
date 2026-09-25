@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -60,6 +61,14 @@ to_f32(const SharedBuffer& buf, const std::string& dtype, std::size_t n)
   } else if (dtype == "BF16") {
     const auto* s = static_cast<const std::uint16_t*>(buf.contents());
     for (std::size_t i = 0; i < n; ++i) { v[i] = bf16_to_f32(s[i]); }
+  } else if (dtype == "I64") {
+    // musubi-tuner's diffusers -> native conversion writes alpha as
+    // `torch.tensor(rank)`, an int64 scalar.
+    const auto* s = static_cast<const std::int64_t*>(buf.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)s[i]; }
+  } else if (dtype == "I32") {
+    const auto* s = static_cast<const std::int32_t*>(buf.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)s[i]; }
   } else {
     v.clear();
   }
@@ -86,8 +95,27 @@ from_f32(const std::vector<float>& w, const std::string& dtype)
   return out;
 }
 
-const std::string kSufA = ".lora_A.weight";
-const std::string kSufB = ".lora_B.weight";
+// The low-rank factor spellings: peft / diffusers / ai-toolkit, and
+// kohya's (sd-scripts, musubi-tuner), which calls A `lora_down` and B
+// `lora_up`.
+const std::pair<std::string, std::string> kFactorSpellings[] = {
+    {".lora_A.weight", ".lora_B.weight"},
+    {".lora_down.weight", ".lora_up.weight"},
+};
+
+// kohya names a module `lora_unet_` + its path with every '.' flattened
+// to '_' -- the same rule shared/runtime-lora.cc reads.
+const std::string kKohyaPrefix = "lora_unet_";
+
+std::string
+kohya_flat(const std::string& module)
+{
+  std::string k = kKohyaPrefix + module;
+  for (std::size_t i = kKohyaPrefix.size(); i < k.size(); ++i) {
+    if (k[i] == '.') { k[i] = '_'; }
+  }
+  return k;
+}
 
 // A resolved LoRA/LoKr adapter targeting one base weight.
 struct Adapter {
@@ -143,9 +171,46 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
   const MetalLlamaWeights& base = *baseopt;
   const MetalLlamaWeights& lora = *loraopt;
 
+  // kohya's flattened module name -> the base weight it means. The
+  // flattening loses the dots, so it cannot be undone from the FILE's
+  // side; it is run over the BASE's names instead, which is exact. A
+  // flattened name two base weights share is AMBIGUOUS and maps to
+  // nothing -- guessing would fuse a delta into the wrong projection.
+  // Built on first use, so a file in any other convention never pays
+  // for it.
+  std::unordered_map<std::string, std::string> kohya_base;
+  bool kohya_built = false;
+  auto kohya_lookup = [&](const std::string& module) -> std::string {
+    if (!kohya_built) {
+      kohya_built = true;
+      std::unordered_set<std::string> ambiguous;
+      auto add = [&](const std::string& mod, const std::string& weight) {
+        const std::string k = kohya_flat(mod);
+        auto it = kohya_base.find(k);
+        if (it == kohya_base.end()) {
+          if (ambiguous.count(k) == 0) { kohya_base.emplace(k, weight); }
+        } else if (it->second != weight) {
+          kohya_base.erase(it);
+          ambiguous.insert(k);
+        }
+      };
+      for (const std::string& t : base.tensor_names()) {
+        if (!ends_with(t, ".weight")) { continue; }
+        const std::string mod = t.substr(0, t.size() - 7);
+        add(mod, t);
+        // The same leading-segment strip find_base applies below.
+        const auto dot = mod.find('.');
+        if (dot != std::string::npos) { add(mod.substr(dot + 1), t); }
+      }
+    }
+    const auto it = kohya_base.find(module);
+    return it == kohya_base.end() ? std::string() : it->second;
+  };
+
   // Match an adapter `<module>` to a base weight: try <module>.weight, strip
   // the leading component segment (diffusers' "transformer." etc.), then the
-  // ai-toolkit / ComfyUI name remap (diffusion_model.* -> diffusers).
+  // ai-toolkit / ComfyUI name remap (diffusion_model.* -> diffusers), then
+  // kohya's flattened `lora_unet_*`.
   auto find_base = [&](const std::string& module) -> std::string {
     if (base.info(module + ".weight") != nullptr) { return module + ".weight"; }
     const auto dot = module.find('.');
@@ -156,6 +221,9 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
     const std::string rm = lora::remap_ai_toolkit_module(module);
     if (!rm.empty() && base.info(rm + ".weight") != nullptr) {
       return rm + ".weight";
+    }
+    if (module.compare(0, kKohyaPrefix.size(), kKohyaPrefix) == 0) {
+      return kohya_lookup(module);
     }
     return {};
   };
@@ -173,19 +241,26 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
 
   // Build base_weight_name -> Adapter (low-rank LoRA or LoKr).
   std::unordered_map<std::string, Adapter> fuse;
-  // Low-rank LoRA: <module>.lora_A.weight + <module>.lora_B.weight.
+  // Low-rank LoRA: <module>.lora_A.weight + <module>.lora_B.weight, or
+  // kohya's <module>.lora_down.weight + <module>.lora_up.weight.
   for (const std::string& name : lora.tensor_names()) {
-    if (!ends_with(name, kSufA)) { continue; }
-    const std::string module = name.substr(0, name.size() - kSufA.size());
-    const std::string bname = module + kSufB;
-    if (lora.info(bname) == nullptr) { continue; }
-    const std::string base_name = find_base(module);
-    if (base_name.empty()) { continue; }
-    Adapter ad;
-    ad.a = name;
-    ad.b = bname;
-    if (lora.info(module + ".alpha") != nullptr) { ad.alpha = module + ".alpha"; }
-    fuse[base_name] = ad;
+    for (const auto& sp : kFactorSpellings) {
+      if (!ends_with(name, sp.first)) { continue; }
+      const std::string module =
+          name.substr(0, name.size() - sp.first.size());
+      const std::string bname = module + sp.second;
+      if (lora.info(bname) == nullptr) { break; }
+      const std::string base_name = find_base(module);
+      if (base_name.empty()) { break; }
+      Adapter ad;
+      ad.a = name;
+      ad.b = bname;
+      if (lora.info(module + ".alpha") != nullptr) {
+        ad.alpha = module + ".alpha";
+      }
+      fuse[base_name] = ad;
+      break;
+    }
   }
   // LoKr: <module>.lokr_w{1,2}[ _a/_b ] (+ optional <module>.alpha).
   {
@@ -217,8 +292,9 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
   if (fuse.empty()) {
     return fail(
         "lora-fuse: no LoRA tensors matched the base model. This path "
-        "reads `<module>.lora_{A,B}.weight` against the base's own "
-        "module names; a peft/diffusers export spells its factors "
+        "reads `<module>.lora_{A,B}.weight` (or kohya / musubi-tuner's "
+        "`lora_unet_<module>.lora_{down,up}.weight`) against the base's "
+        "own module names; a peft/diffusers export spells its factors "
         "`.lora_A.<adapter>.weight` and may DECOMPOSE a projection the "
         "base fuses (separate to_q/to_k/to_v against one qkv_proj), "
         "which is a conversion and not a name match. Those load through "

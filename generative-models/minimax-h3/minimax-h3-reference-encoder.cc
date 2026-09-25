@@ -345,10 +345,11 @@ validate_reference_request(const std::vector<MediaReference>& refs,
     if (err != nullptr) { *err = std::move(m); }
     return false;
   };
-  if (refs.empty()) {
-    return fail("a ref2va request needs at least one reference; a "
-                "text-only request is the t2va workflow");
-  }
+  // An EMPTY list is Ref2VA's prompt-only form: the presentation is the
+  // prompt alone and the layout packs no reference block, which is the
+  // t2va sequence exactly. It is only reachable by saying so -- see the
+  // stage, which refuses a request that merely has none.
+  if (refs.empty()) { return true; }
   int n_img = 0, n_vid = 0, n_aud = 0;
   for (const MediaReference& r : refs) {
     switch (r.kind) {
@@ -857,8 +858,11 @@ encode_references(const std::vector<MediaReference>& refs,
     std::string cerr;
     // Indeterminate: see ReferenceEncoders::progress.
     if (reporting) {
-      models.progress(0, 0, "conditioner, " + std::to_string(refs.size()) +
-                                " reference(s)");
+      models.progress(0, 0, refs.empty()
+                                ? std::string("conditioner, prompt only")
+                                : "conditioner, " +
+                                      std::to_string(refs.size()) +
+                                      " reference(s)");
     }
     if (timing) { (void)tick(); }
     r.conditioning = models.text->encode_references(pres, prompt,

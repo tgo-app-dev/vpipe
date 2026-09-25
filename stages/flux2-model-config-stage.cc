@@ -39,7 +39,11 @@ const ConfigKey kAttrs[] = {
    // Named for the same reason H3's is: a typeless field falls back to
    // plain models and shows no adapter at all, and the type is what
    // keeps a Krea-2 or H3 adapter out of a FLUX.2 field.
-   .suggest_db_type = "flux2-lora"},
+   .suggest_db_type = "flux2-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora_scale", .type = ConfigType::Real, .required = false,
    .doc = "the adapter's strength, applied PER FORWARD. Live: it rides the "
           "GEMM as a constant, so it can be swept without a reload. 1.0 = "
@@ -56,7 +60,11 @@ const ConfigKey kAttrs[] = {
           "as `lora`. Costs one more pair of skinny GEMMs; the base weight "
           "is still read once. LOAD-time like `lora`",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "flux2-lora"},
+   .suggest_db_type = "flux2-lora",
+   // AND a file browser: a LoRA is as often a download sitting in
+   // the sandbox (Civitai) as a catalogued model, and the editor
+   // offers both pickers when a field carries both hints.
+   .is_path = true, .path_filter = "weights"},
   {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
    .doc = "`lora2`'s strength, per FORWARD and independent of "
           "`lora_scale` -- which is the point of a second slot: one "

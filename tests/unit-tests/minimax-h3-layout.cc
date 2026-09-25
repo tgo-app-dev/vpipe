@@ -799,9 +799,9 @@ TEST(minimax_h3_layout, ref2va_rejects_bad_requests)
   const std::vector<int> tags(16, 1);
   h3::PackedLayout L;
 
-  // No references at all is a t2va request, not a degenerate ref2va.
-  EXPECT_FALSE(h3::build_ref2va_packed_sequence(tags, {}, 7, 16, 16, 37, 2, 2,
-                                                h3::kAudioChannels, &L));
+  // (No references at all is NOT refused -- it is the prompt-only form;
+  // see an_empty_reference_list_packs_the_t2va_layout.)
+  //
   // A reference is encoded at a resolution of ITS OWN, so the target's
   // divisibility says nothing about whether the reference's divides.
   EXPECT_FALSE(h3::build_ref2va_packed_sequence(
@@ -818,6 +818,74 @@ TEST(minimax_h3_layout, ref2va_rejects_bad_requests)
   EXPECT_FALSE(h3::build_ref2va_packed_sequence(
       tags, {Ref{Kind::kAudio, 0, 0, 0, 0}}, 7, 16, 16, 37, 2, 2,
       h3::kAudioChannels, &L));
+}
+
+// An EMPTY reference list is Ref2VA's prompt-only form, and what it
+// packs is the t2va layout -- not something like it, the same one, in
+// every field a reader could look at. That is the claim that makes the
+// mode safe to offer: the Ref2VA weights see exactly the sequence shape
+// text-to-video gives the FL2VA ones, and nothing in the layout is left
+// over from a reference block that is not there.
+//
+// Checked over two geometries, one with an odd latent frame count and a
+// non-square grid and one with no audio at all, because the audio rows'
+// width pins and the rotary clock are the two things most likely to
+// have been computed from a reference cursor that never moved.
+TEST(minimax_h3_layout, an_empty_reference_list_packs_the_t2va_layout)
+{
+  struct Case { int frames, lh, lw, alat; };
+  const Case cases[] = {{7, 32, 56, 37}, {5, 16, 16, 0}};
+  // A tag run that is not uniform, so the text pass is visibly the
+  // caller's rather than a default that happens to agree.
+  std::vector<int> tags(19, h3::kTextTag);
+  tags[3] = h3::kVideoTag;
+
+  for (const Case& c : cases) {
+    h3::PackedLayout t2va, r2va;
+    ASSERT_TRUE(h3::build_packed_sequence(tags, c.frames, c.lh, c.lw, c.alat,
+                                          2, 2, h3::kAudioChannels, {},
+                                          &t2va));
+    ASSERT_TRUE(h3::build_ref2va_packed_sequence(tags, {}, c.frames, c.lh,
+                                                 c.lw, c.alat, 2, 2,
+                                                 h3::kAudioChannels, &r2va));
+    EXPECT_TRUE(r2va.seq_len == t2va.seq_len);
+    EXPECT_TRUE(r2va.num_text_rows == t2va.num_text_rows);
+    // Bitwise: the two builders place every row from the same grids.
+    EXPECT_TRUE(r2va.position_ids == t2va.position_ids);
+    EXPECT_TRUE(r2va.token_tags == t2va.token_tags);
+    EXPECT_TRUE(r2va.condition_start == t2va.condition_start);
+    EXPECT_TRUE(r2va.num_condition_rows == 0 && t2va.num_condition_rows == 0);
+    EXPECT_TRUE(r2va.audio_start == t2va.audio_start);
+    EXPECT_TRUE(r2va.num_audio_rows == t2va.num_audio_rows);
+    EXPECT_TRUE(r2va.video_start == t2va.video_start);
+    EXPECT_TRUE(r2va.num_video_rows == t2va.num_video_rows);
+    EXPECT_TRUE(r2va.video_indices == t2va.video_indices);
+    EXPECT_TRUE(r2va.audio_indices == t2va.audio_indices);
+    auto same_runs = [](const std::vector<h3::RowRun>& a,
+                        const std::vector<h3::RowRun>& b) {
+      if (a.size() != b.size()) { return false; }
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].start != b[i].start || a[i].count != b[i].count) {
+          return false;
+        }
+      }
+      return true;
+    };
+    EXPECT_TRUE(same_runs(r2va.video_runs, t2va.video_runs));
+    EXPECT_TRUE(same_runs(r2va.audio_runs, t2va.audio_runs));
+    EXPECT_TRUE(r2va.num_condition_video_rows == 0);
+    EXPECT_TRUE(r2va.num_condition_audio_rows == 0);
+    // Only the builder's name differs -- and with no conditioning rows,
+    // the one reader of it (the VDN branch's report) has nothing to say.
+    EXPECT_TRUE(r2va.ref2va);
+    EXPECT_FALSE(t2va.ref2va);
+    // Not vacuous: the case carries target rows of both kinds it can.
+    EXPECT_TRUE(r2va.num_video_rows > 0);
+    EXPECT_TRUE((c.alat > 0) == (r2va.num_audio_rows > 0));
+    std::printf("[minimax_h3_layout] prompt-only ref2va %dx%dx%d, %d audio "
+                "latents: %d rows, identical to t2va\n", c.frames, c.lh,
+                c.lw, c.alat, r2va.seq_len);
+  }
 }
 
 // A one-image reference request and a one-keyframe request can agree on

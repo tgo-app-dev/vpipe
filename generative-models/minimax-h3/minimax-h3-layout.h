@@ -229,9 +229,12 @@ bool build_packed_sequence(const std::vector<int>& text_token_tags,
 // video rows and share their origin, which is why the two modalities
 // interleave and `audio_runs` exists.
 //
+// An EMPTY `references` is the prompt-only form of `ref2va`, and packs
+// the `t2va` layout exactly -- every position, tag, index and run --
+// with `ref2va` set, since this builder made it.
+//
 // False on an inconsistent request: a reference whose geometry is not
-// positive or not divisible by the patch, or an empty list (a request
-// with no references is `t2va`, not a degenerate `ref2va`).
+// positive or not divisible by the patch.
 bool build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
                                   const std::vector<Reference>& references,
                                   int num_latent_frames, int latent_height,

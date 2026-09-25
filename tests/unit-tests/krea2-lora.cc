@@ -10,6 +10,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 #include "common/session.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/llama3/metal-llama-weights.h"
@@ -410,4 +411,86 @@ TEST(krea2_lora, an_ai_toolkit_fixture_binds_every_module)
     }
     fs::remove(p, ec);
   }
+}
+
+// A PUBLISHED adapter against the REAL model's shape: every module the
+// file carries has to bind, and none may be skipped.
+//
+// The fixture test above proves the name map on a tiny shape. This is
+// the question a user's file actually asks -- does somebody else's
+// upload line up with this model -- and it fails in the quiet way: a
+// module the map cannot reach is simply absent, a shape that does not
+// fit is set aside, and the adapter still "loads". So the count is
+// taken from the FILE, not from the model's list, and compared exactly.
+//
+// Needs the checkpoint's transformer/config.json and the adapter's
+// factors -- not the DiT's weights, so it runs in a second.
+//
+// Env: VPIPE_KREA2_TEST_MODEL_PATH (the model root) + VPIPE_KREA2_LORA.
+TEST(krea2_lora, a_published_adapter_binds_every_module_it_carries)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  const char* lp   = std::getenv("VPIPE_KREA2_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  std::ifstream cf(std::string(root) + "/transformer/config.json");
+  ASSERT_TRUE((bool)cf);
+  if (!cf) { return; }
+  const std::string ctxt((std::istreambuf_iterator<char>(cf)),
+                         std::istreambuf_iterator<char>());
+  const FlexData j = FlexData::from_json(ctxt);
+  ASSERT_TRUE(j.is_object());
+  if (!j.is_object()) { return; }
+  const auto o = j.as_object();
+  auto geti = [&](const char* k) {
+    return o.contains(k) ? (int)o.at(k).as_int(0) : 0;
+  };
+  MetalKrea2Transformer::Config c;
+  c.n_heads       = geti("num_attention_heads");
+  c.n_kv_heads    = geti("num_key_value_heads");
+  c.head_dim      = geti("attention_head_dim");
+  c.hidden        = c.n_heads * c.head_dim;
+  c.ffn           = geti("intermediate_size");
+  c.n_layers      = geti("num_layers");
+  c.text_hidden   = geti("text_hidden_dim");
+  c.text_heads    = geti("text_num_attention_heads");
+  c.text_kv_heads = geti("text_num_key_value_heads");
+  c.text_ffn      = geti("text_intermediate_size");
+  c.n_layerwise   = geti("num_layerwise_text_blocks");
+  c.n_refiner     = geti("num_refiner_text_blocks");
+  ASSERT_TRUE(c.hidden > 0 && c.n_layers > 0);
+
+  // What the FILE carries: one A factor per adapted module.
+  auto w = MetalLlamaWeights::open(lp);
+  ASSERT_TRUE(w.has_value());
+  if (!w.has_value()) { return; }
+  int in_file = 0;
+  for (const std::string& n : w->tensor_names()) {
+    if (n.find(".lora_A.") != std::string::npos ||
+        n.find(".lora_down.") != std::string::npos) {
+      ++in_file;
+    }
+  }
+
+  std::string err;
+  auto ad = lora::Adapter::open(lp, mc, &err,
+                                MetalKrea2Transformer::lora_rename());
+  ASSERT_TRUE(ad != nullptr);
+  if (!ad) { return; }
+  const auto mods = MetalKrea2Transformer::lora_module_list(c);
+  lora::Factors f;
+  for (const auto& m : mods) { ad->bind(m.name, m.n, m.k, &f); }
+  std::printf("[krea2_lora] '%s': %d of %d modules in the file bound "
+              "(model has %zu adaptable), %d skipped, %d via the "
+              "ai-toolkit/ComfyUI names, rank <= %d\n", lp, ad->modules(),
+              in_file, mods.size(), ad->skipped(), ad->renamed(),
+              ad->max_rank());
+  EXPECT_TRUE(in_file > 0);
+  EXPECT_TRUE(ad->modules() == in_file);
+  EXPECT_TRUE(ad->skipped() == 0);
 }
