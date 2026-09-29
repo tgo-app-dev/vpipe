@@ -4,6 +4,7 @@
 #include "interfaces/session-context-intf.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/stage-command.h"
 #include "pipeline/stage-registry.h"
 #include "pipeline/stage.h"
 #include <exception>
@@ -154,7 +155,37 @@ find_stage_(Pipeline* pl, const string& id)
   return nullptr;
 }
 
+// Resolve "a/b/stage": each leading segment names a nested pipeline.
+Stage*
+find_stage_path_(Pipeline* pl, string_view path)
+{
+  while (pl != nullptr) {
+    const size_t slash = path.find('/');
+    if (slash == string_view::npos) {
+      return find_stage_(pl, string(path));
+    }
+    pl = dynamic_cast<Pipeline*>(pl->graph(string(path.substr(0, slash))));
+    path.remove_prefix(slash + 1);
+  }
+  return nullptr;
+}
+
 }  // namespace
+
+StageHandle
+PipelineHandleImpl::stage(string_view id)
+{
+  if (!_pipeline) { return HandleAccess::make_stage(nullptr); }
+  Stage* s = find_stage_path_(_pipeline.get(), id);
+  if (s == nullptr) { return HandleAccess::make_stage(nullptr); }
+  for (const auto& h : _stage_handles) {
+    if (h->stage() == s) { return HandleAccess::make_stage(h.get()); }
+  }
+  auto himpl = make_unique<StageHandleImpl>(s);
+  StageHandleImpl* hraw = himpl.get();
+  _stage_handles.push_back(std::move(himpl));
+  return HandleAccess::make_stage(hraw);
+}
 
 bool
 PipelineHandleImpl::move_iport(const string& stage_id, unsigned iport,
@@ -295,6 +326,15 @@ PipelineHandle::insert_pipeline(string id)
   return _impl->insert_pipeline(std::move(id));
 }
 
+StageHandle
+PipelineHandle::stage(string_view id)
+{
+  if (!_impl) {
+    return HandleAccess::make_stage(nullptr);
+  }
+  return _impl->stage(id);
+}
+
 bool
 PipelineHandle::move_iport(string stage_id, unsigned iport,
                            string src_id, unsigned src_oport)
@@ -317,6 +357,51 @@ StageHandle::config_schema_json() const
     return "[]";
   }
   return s->config_schema().to_json();
+}
+
+string
+StageHandle::id() const
+{
+  const Stage* s = _impl ? _impl->stage() : nullptr;
+  return s != nullptr ? s->id() : string();
+}
+
+string
+StageHandle::commands_json() const
+{
+  const Stage* s = _impl ? _impl->stage() : nullptr;
+  if (!s) { return "[]"; }
+  return describe_commands(s->spec()).to_json();
+}
+
+CommandHandle
+StageHandle::command(string_view name, string_view args_json,
+                     vector<DataBuffer> in) const
+{
+  Stage* s = _impl ? _impl->stage() : nullptr;
+  if (!s) {
+    return HandleAccess::make_command(
+        StageCommand::refused("null stage handle"));
+  }
+  FlexData args = FlexData::make_object();
+  bool has_payload = false;
+  for (char c : args_json) {
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+      has_payload = true;
+      break;
+    }
+  }
+  if (has_payload) {
+    try {
+      args = FlexData::from_json(args_json);
+    } catch (const exception& e) {
+      return HandleAccess::make_command(StageCommand::refused(
+          fmt("stage '{}' command '{}': the arguments are not JSON: {}",
+              s->id(), name, e.what())()));
+    }
+  }
+  return HandleAccess::make_command(
+      open_stage_command(*s, name, std::move(args), std::move(in)));
 }
 
 }

@@ -80,6 +80,7 @@ set(LOCAL_TEST_SOURCES
   segment-writer.cc
   session-config.cc
   session.cc
+  stage-command.cc
   stage-config.cc
   stage-spec.cc
   stdout-log-delegate-async.cc

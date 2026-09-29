@@ -114,7 +114,23 @@
 // where six was introduced. So no binary reports 6 and means only the
 // lora::Factors change. If a snapshot has shipped since, this sentence
 // is the one to re-check before folding anything else into six.
-#define VPIPE_PLUGIN_ABI_VERSION 6u
+//
+// SEVEN: stage COMMAND CHANNELS (pipeline/stage-command.h,
+// docs/STAGE-COMMANDS.md). StageSpec APPENDED `commands`, a span of the
+// new CommandSpec / BufferSpec -- the host reads it off every spec a
+// plugin registers, so a six-era spec is read past its end. Stage gained
+// members (its command inbox and the lock guarding it), RuntimeContext
+// and its inline ReadAnyAwaiter gained the inbox pointer. NOT folded
+// into six, and checked
+// rather than assumed: on 2026-09-28 the public remote's main (c2989a76,
+// a snapshot of 1c9e6072) reads 6, so six HAS left. What seven freezes:
+// the layouts of CommandSpec, BufferSpec, DataBuffer, BufferLayout and
+// the two awaiters in stage-command.h, which live in a plugin's coroutine
+// frame. What it does not: StageCommand and CommandInbox are created by
+// the host and reached only through out-of-line methods, so their
+// members grow without a bump -- and a new command, a new buffer, a new
+// key in a spec's `extra` never needs one.
+#define VPIPE_PLUGIN_ABI_VERSION 7u
 
 // Layout version of VpipePluginInfo, so the struct can grow additively
 // without breaking the three-symbol contract.

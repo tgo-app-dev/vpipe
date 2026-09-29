@@ -1,4 +1,5 @@
 #include "stages/audio-video/create-mask-stage.h"
+#include "stages/tensor-buffer.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -26,12 +27,6 @@ using namespace std;
 namespace vpipe {
 
 namespace {
-
-// How long one interactive process() call waits on the editor before
-// coming back round. Short enough that a stop request and a newly
-// arrived reference image are both picked up promptly, long enough that
-// an idle editor costs nothing measurable.
-constexpr int kCommitPollMs = 200;
 
 // Fallback palette, used when `class_colors` is unset. Index 0 is
 // background and is never painted, so its entry only has to exist.
@@ -159,6 +154,55 @@ const PortSpec kOports[] = {
    .type = &typeid(TensorBeatPayload),
    .tags = "mask-frames,rgb-frames", .clock_group = 0},
 };
+// The commands. `commit` is what the editor itself sends (as `png`);
+// a program sends the mask as samples instead. Everything here is the
+// stage's own vocabulary -- see docs/STAGE-COMMANDS.md for the protocol.
+const ConfigKey kEmitResults[] = {
+  {.key = "seq", .type = ConfigType::Uint,
+   .doc = "the 1-based index of the beat this command emitted"},
+  {.key = "width", .type = ConfigType::Int, .doc = "mask canvas width"},
+  {.key = "height", .type = ConfigType::Int, .doc = "mask canvas height"},
+};
+const BufferSpec kCommitIn[] = {
+  {.name = "mask",
+   .doc  = "the mask as samples, [1,H,W] or [H,W]: u8 as stored, or f32 "
+           "coverage scaled by `input_normalized`; a class index either "
+           "way in class mode. Resampled onto the canvas",
+   .type = "u8,f32", .shape = "1,H,W|H,W", .optional = true},
+  {.name = "png",
+   .doc  = "the mask as an encoded PNG, as the editor sends it; read from "
+           "its first channel",
+   .type = "bytes", .format = "image/png", .optional = true},
+};
+const ConfigKey kReadResults[] = {
+  {.key = "width", .type = ConfigType::Int, .doc = "mask canvas width"},
+  {.key = "height", .type = ConfigType::Int, .doc = "mask canvas height"},
+  {.key = "mode", .type = ConfigType::String,
+   .doc = "\"binary\", \"alpha\" or \"class\""},
+};
+const BufferSpec kReadOut[] = {
+  {.name = "mask", .doc = "the current mask, one byte per sample",
+   .type = "u8", .shape = "1,H,W", .contiguous = true},
+  {.name = "ref",
+   .doc  = "the reference image, packed RGB; absent when there is none",
+   .type = "u8", .shape = "RH,RW,3", .optional = true, .contiguous = true},
+};
+const CommandSpec kCommands[] = {
+  {.name = "commit",
+   .doc  = "replace the mask and emit ONE beat, exactly as a commit from "
+           "the editor does. Give `mask` or `png`, not both. The reply "
+           "comes once the beat is on the oport",
+   .results = kEmitResults, .in = kCommitIn},
+  {.name = "release",
+   .doc  = "emit the current mask again, unchanged, as one beat",
+   .results = kEmitResults},
+  {.name = "read",
+   .doc  = "the current mask and reference image, in place. The stage "
+           "does nothing else -- no edits, no emits -- until the command "
+           "is closed",
+   .results = kReadResults, .out = kReadOut, .holds = true},
+};
+
 const StageSpec kSpec = {
   .type_name = "create-mask",
   .doc       = "Authors a mask -- painted by hand in its own web-ui editor "
@@ -174,6 +218,7 @@ const StageSpec kSpec = {
   .iports    = kIports,
   .oports    = kOports,
   .attrs     = kAttrs,
+  .commands  = kCommands,
 };
 
 }  // namespace
@@ -637,10 +682,12 @@ CreateMaskStage::encode_png_(PngEncoder* enc, const uint8_t* src,
 }
 
 bool
-CreateMaskStage::decode_commit_(const vector<uint8_t>& png,
+CreateMaskStage::decode_commit_(const uint8_t* png, size_t n,
                                 vector<uint8_t>* out, int* w, int* h)
 {
-  if (_dec_bad || _libs == nullptr || png.empty()) { return false; }
+  if (_dec_bad || _libs == nullptr || png == nullptr || n == 0) {
+    return false;
+  }
 
   if (_dec == nullptr) {
     const AVCodec* codec =
@@ -669,8 +716,8 @@ CreateMaskStage::decode_commit_(const vector<uint8_t>& png,
   // packet_unref on a buf-less packet is well defined and just clears
   // the fields.
   _libs->avcodec().api.packet_unref(_pkt);
-  _pkt->data = const_cast<uint8_t*>(png.data());
-  _pkt->size = static_cast<int>(png.size());
+  _pkt->data = const_cast<uint8_t*>(png);
+  _pkt->size = static_cast<int>(n);
   const int src = _libs->avcodec().api.send_packet(_dec, _pkt);
   _pkt->data = nullptr;
   _pkt->size = 0;
@@ -841,7 +888,8 @@ CreateMaskStage::process(RuntimeContext& ctx)
 {
   resolve_roles_(ctx);
 
-  // Headless with no mask input: nothing can ever drive this stage.
+  // Headless with no mask input: nothing but a command could ever drive
+  // this stage, and a headless graph is not one that sends them.
   if (!_interactive && !_want_mask) {
     if (!_warned_idle) {
       _warned_idle = true;
@@ -857,13 +905,19 @@ CreateMaskStage::process(RuntimeContext& ctx)
   if (_want_ref)  { ports.push_back(0); }
   if (_want_mask) { ports.push_back(1); }
 
-  // Headless runs at the pace of its inputs, so it blocks on them. The
-  // editor must NOT: the user decides when something happens, so that
-  // path takes only what is already queued and then waits on the commit
-  // instead. Blocking on an input there would stall an editor whose
-  // reference image is a single still that has already arrived.
-  if (!_interactive && !ports.empty()) {
-    co_await ctx.read_any(ports);
+  // Wait on the inputs AND the commands at once, whichever comes first
+  // -- but only on inputs still open: a port at EOS always reads as
+  // ready, and a still reference image that has already arrived must
+  // not turn the wait into a spin. Headless with every input closed has
+  // nothing left to wait for and ends below.
+  {
+    vector<unsigned> open;
+    for (unsigned p : ports) {
+      if (!ctx.eos(p)) { open.push_back(p); }
+    }
+    if (_interactive || !open.empty()) {
+      co_await ctx.read_any(std::move(open), true);
+    }
   }
 
   bool changed    = false;
@@ -895,46 +949,140 @@ CreateMaskStage::process(RuntimeContext& ctx)
     publish_();
   }
 
-  if (!_interactive) {
-    // Input-driven: every mask that arrives is one beat out.
-    if (mask_moved) {
-      if (auto out = make_output_()) {
-        co_await ctx.write(0, std::move(out));
-      }
+  // Headless is input-driven: every mask that arrives is one beat out.
+  if (!_interactive && mask_moved) {
+    if (auto out = make_output_()) {
+      co_await ctx.write(0, std::move(out));
     }
+  }
+
+  // Every queued command, in the order it arrived -- in either mode. One
+  // commit is one beat however many land while the stage is busy: the
+  // inbox is a queue, not a latch.
+  while (auto cmd = ctx.try_command()) {
+    co_await serve_(ctx, std::move(cmd));
+  }
+
+  if (!_interactive) {
     bool all_eos = true;
     for (unsigned p : ports) {
       if (!ctx.eos(p)) { all_eos = false; break; }
     }
     if (all_eos || ctx.stop_requested()) { ctx.signal_done(); }
+  }
+  co_return;
+}
+
+Job
+CreateMaskStage::serve_(RuntimeContext& ctx, shared_ptr<StageCommand> cmd)
+{
+  const string_view name = cmd->name();
+  if (name == "commit") {
+    const DataBuffer* mb = cmd->input("mask");
+    const DataBuffer* pb = cmd->input("png");
+    if ((mb == nullptr) == (pb == nullptr)) {
+      cmd->fail("give exactly one of `mask` and `png`");
+      co_return;
+    }
+    vector<uint8_t> m;
+    int cw = 0, ch = 0;
+    if (pb != nullptr) {
+      if (!decode_commit_(static_cast<const uint8_t*>(pb->data), pb->size,
+                          &m, &cw, &ch)) {
+        session()->warn(fmt("create-mask('{}'): undecodable commit dropped",
+                            this->id()));
+        cmd->fail("the PNG could not be decoded");
+        co_return;
+      }
+    } else {
+      TensorBeat tb;
+      string err;
+      if (!tensor_from_buffer(*mb, &tb, &err) ||
+          !unpack_mask_(tb, &m, &cw, &ch)) {
+        cmd->fail(err.empty() ? string("the mask could not be read") : err);
+        co_return;
+      }
+    }
+    refresh_canvas_(cw, ch);
+    resample_mask_(m, cw, ch, _mw, _mh, &_mask);
+    co_await emit_(ctx, std::move(cmd));
     co_return;
   }
-
-  // Interactive: one bounded wait per call, so the runtime's process
-  // loop keeps its grip on stop_requested and a reference image that
-  // lands mid-wait is picked up on the next turn. One commit is one
-  // beat -- the sequence number is what keeps that true when two
-  // commits land inside the same window.
-  const auto c = _channel->wait_commit(_seen_commit, kCommitPollMs);
-  if (c.seq == _seen_commit || !c.png) { co_return; }
-  _seen_commit = c.seq;
-
-  vector<uint8_t> m;
-  int cw = 0, ch = 0;
-  if (!decode_commit_(*c.png, &m, &cw, &ch)) {
-    session()->warn(fmt("create-mask('{}'): undecodable commit dropped",
-                        this->id()));
+  if (name == "release") {
+    if (_mask.empty()) {
+      cmd->fail("there is no mask yet");
+      co_return;
+    }
+    co_await emit_(ctx, std::move(cmd));
     co_return;
   }
-  refresh_canvas_(cw, ch);
-  resample_mask_(m, cw, ch, _mw, _mh, &_mask);
-
-  if (auto out = make_output_()) {
-    co_await ctx.write(0, std::move(out));
+  if (name == "read") {
+    if (_mask.empty() || _mw <= 0 || _mh <= 0) {
+      cmd->fail("there is no mask yet");
+      co_return;
+    }
+    // The mask and the reference are lent OUT of the stage for the span
+    // of the command: moved into shared holders the reply points into,
+    // and taken back after the close -- whole when the caller let go of
+    // every view, as a copy when it kept one (that memory is then the
+    // caller's). Nothing else runs meanwhile, so nothing misses them.
+    auto mask = make_shared<vector<uint8_t>>(std::move(_mask));
+    shared_ptr<vector<uint8_t>> ref;
+    vector<DataBuffer> out;
+    out.push_back(DataBuffer::view(
+        "mask", mask->data(),
+        BufferLayout::contiguous(ElementType::U8, {1, _mh, _mw}), mask));
+    if (_ref_valid && !_ref.empty()) {
+      ref = make_shared<vector<uint8_t>>(std::move(_ref));
+      out.push_back(DataBuffer::view(
+          "ref", ref->data(),
+          BufferLayout::contiguous(ElementType::U8, {_rh, _rw, 3}), ref));
+    }
+    FlexData r = FlexData::make_object();
+    {
+      auto ro = r.as_object();
+      ro.insert("width", FlexData::make_int(_mw));
+      ro.insert("height", FlexData::make_int(_mh));
+      ro.insert("mode", FlexData::make_string(
+          _mode == MaskEditorChannel::Mode::Alpha ? "alpha"
+          : (_mode == MaskEditorChannel::Mode::Class ? "class" : "binary")));
+    }
+    if (cmd->reply(std::move(r), std::move(out))) {
+      co_await cmd->until_closed();
+    }
+    auto take_back = [](shared_ptr<vector<uint8_t>>& h) {
+      vector<uint8_t> v = h.use_count() == 1 ? std::move(*h) : *h;
+      h.reset();
+      return v;
+    };
+    _mask = take_back(mask);
+    if (ref) { _ref = take_back(ref); }
+    co_return;
   }
+  cmd->fail("unknown command");
+  co_return;
+}
+
+Job
+CreateMaskStage::emit_(RuntimeContext& ctx, shared_ptr<StageCommand> cmd)
+{
+  auto out = make_output_();
+  if (!out) {
+    cmd->fail("there is no canvas to emit yet");
+    co_return;
+  }
+  co_await ctx.write(0, std::move(out));
   // Re-latch, so an editor that mounts later opens on the mask that was
-  // actually committed rather than the one the stage started from.
+  // actually emitted rather than the one the stage started from.
   publish_();
+  FlexData r = FlexData::make_object();
+  {
+    auto ro = r.as_object();
+    ro.insert("seq", FlexData::make_uint(++_emitted));
+    ro.insert("width", FlexData::make_int(_mw));
+    ro.insert("height", FlexData::make_int(_mh));
+  }
+  cmd->reply(std::move(r));
   co_return;
 }
 

@@ -11,33 +11,22 @@
 
 namespace vpipe {
 
-// Transport between the create-mask stage and its GUI mask editor.
+// Transport from the create-mask stage to its GUI mask editor: a Frame
+// carrying the background to paint over, the mask to start from, the
+// canvas geometry, and the editor settings the stage was configured
+// with. Latest-wins behind a version, exactly like CompareImageChannel
+// -- an editor that falls behind wants the current background, never
+// the intermediate ones.
 //
-// This is the FIRST view channel that carries traffic UPWARDS -- preview
-// and compare-image only push pixels at a panel, whereas a mask editor
-// exists to send something back. So it is two latches, not one:
+// The OTHER direction -- the mask the user painted -- is not here. It
+// is the stage's `commit` COMMAND (pipeline/stage-command.h), the same
+// one a program sends: the view backend opens it with the PNG the
+// browser's canvas produced, and the reply arrives once the beat is
+// out. A queue of commands, not a latch, so two commits are two beats
+// however close together they land.
 //
-//   DOWN  a Frame: the background to paint over, the mask to start
-//         from, the canvas geometry, and the editor settings the stage
-//         was configured with. Latest-wins behind a version, exactly
-//         like CompareImageChannel -- an editor that falls behind wants
-//         the current background, never the intermediate ones.
-//   UP    a Commit: the mask the user painted, as encoded image bytes,
-//         behind a monotonically increasing sequence number. The stage
-//         emits ONE output beat per commit, so the sequence is what
-//         makes "one click, one beat" true even if the stage is slow to
-//         come back round: a commit that lands while the stage is busy
-//         is still seen, and two commits that land in the same window
-//         are two beats, not one.
-//
-// The commit carries ENCODED bytes (a PNG, whatever the browser's
-// canvas produced) rather than raw samples: the wire is a JSON message
-// and a hand-painted mask compresses to a fraction of its W*H bytes.
-// The stage decodes and normalises to GRAY8 -- see CreateMaskStage.
-//
-// Thread-safe in both directions. The stage's coroutine publishes
-// frames and waits for commits; the view backend's connection thread
-// waits for frames and posts commits. Held by shared_ptr so a mounted
+// Thread-safe. The stage's coroutine publishes frames; the view
+// backend's thread waits for them. Held by shared_ptr so a mounted
 // panel outlives the stage's teardown; close() then ends it promptly.
 class MaskEditorChannel {
 public:
@@ -80,12 +69,6 @@ public:
     bool          closed  = false;
   };
 
-  // Editor -> stage.
-  struct Commit {
-    Bytes         png;                 // encoded mask, any pixel format
-    std::uint64_t seq = 0;             // 0 only before the first commit
-  };
-
   MaskEditorChannel() = default;
   MaskEditorChannel(const MaskEditorChannel&)            = delete;
   MaskEditorChannel& operator=(const MaskEditorChannel&) = delete;
@@ -96,20 +79,10 @@ public:
   // version, so republishing an identical frame still notifies.
   void publish(Frame f);
 
-  // Block up to `timeout_ms` for a commit newer than `since`. Returns
-  // seq == since on timeout, and returns immediately once closed.
-  Commit wait_commit(std::uint64_t since, int timeout_ms) const;
-
-  std::uint64_t commit_seq() const noexcept;
-
-  // End the channel: waiters in both directions wake. Idempotent.
+  // End the channel: every waiter wakes. Idempotent.
   void close();
 
   // ---- editor side ---------------------------------------------------
-
-  // Post a painted mask. Returns the sequence number assigned to it.
-  // Dropped (returning the current sequence) once the channel is closed.
-  std::uint64_t commit(std::vector<std::uint8_t> png);
 
   Frame snapshot() const;
 
@@ -124,7 +97,6 @@ private:
   mutable std::mutex              _mu;
   mutable std::condition_variable _cv;
   Frame                           _frame;
-  Commit                          _commit;
   bool                            _closed = false;
 };
 

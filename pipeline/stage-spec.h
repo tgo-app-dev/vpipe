@@ -74,6 +74,69 @@ struct PortSpec {
 bool port_tags_compatible(std::string_view produced,
                           std::string_view accepted) noexcept;
 
+// ---- command channels -------------------------------------------------
+//
+// A stage may accept COMMANDS while its pipeline runs: named requests
+// from outside the graph (the C++ API's StageHandle::command, the
+// Python binding, a GUI view) that carry JSON arguments and, optionally,
+// buffers in either direction. The spec DECLARES them, so a caller can
+// discover them and the host can refuse a malformed one before the
+// stage ever sees it. docs/STAGE-COMMANDS.md is the full contract; the
+// stage side is pipeline/stage-command.h.
+
+// One named buffer a command carries. The LAYOUT fields are patterns,
+// checked by the host against the concrete DataBuffer:
+//
+//   type    accepted element types, comma-separated ("u8,f32"); empty =
+//           any. "bytes" is an opaque byte string -- any one-byte
+//           element type, rank 1, contiguous -- and `format` says what
+//           it encodes.
+//   shape   accepted shapes: alternatives separated by '|', dimensions
+//           by ','. A dimension is an integer (exactly that size), a
+//           NAME (any size, but the SAME size wherever that name
+//           appears in this command's buffers of the same direction),
+//           '?' (any size) or '...' (any number of dimensions, at most
+//           once per alternative). Empty = any shape. "1,H,W|H,W" takes
+//           a mask with or without its channel axis; "H,W,3" packed RGB.
+//   format  for "bytes": the media type ("image/png"). A buffer that
+//           names no format takes this one; one that names another is
+//           refused.
+struct BufferSpec {
+  std::string_view name;
+  std::string_view doc;
+  std::string_view type;
+  std::string_view shape;
+  std::string_view format;
+  // IN: the caller may omit it. OUT: the stage may omit it.
+  bool             optional   = false;
+  // OUT only: the caller may WRITE the stage's bytes before closing.
+  bool             writable   = false;
+  // The buffer must be C-contiguous (no padded or permuted strides).
+  bool             contiguous = false;
+  // Anything this struct has no field for. See SpecExtra.
+  std::span<const SpecExtra> extra;
+};
+
+// One command a stage accepts.
+struct CommandSpec {
+  std::string_view            name;
+  std::string_view            doc;
+  // The JSON arguments, as ConfigKeys: type, required and doc are
+  // enforced/used exactly as for configuration. An argument not listed
+  // here is refused, so a typo is an error rather than a default.
+  std::span<const ConfigKey>  args;
+  // The keys of the JSON result, for discovery. Not enforced.
+  std::span<const ConfigKey>  results;
+  std::span<const BufferSpec> in;       // caller -> stage
+  std::span<const BufferSpec> out;      // stage -> caller, in place
+  // The stage HOLDS its output while this command's reply is exposed:
+  // everything downstream waits until the caller closes it. A promise
+  // to the caller about the pipeline, stated so it can be discovered.
+  bool                        holds = false;
+  // Anything this struct has no field for. See SpecExtra.
+  std::span<const SpecExtra>  extra;
+};
+
 // One formal description of a stage type: its human description,
 // category, declared input/output ports, and configuration attributes
 // (reusing ConfigKey, whose def_* fields are the single source of truth
@@ -108,7 +171,15 @@ struct StageSpec {
   // ports/docs -- this only hides it from the "add a new stage" list.
   // For structural / internal stages (call, passthrough).
   bool                       hidden = false;
+  // The commands this stage accepts while running. Empty = none, and
+  // then no inbox is created for it. LAST so every existing designated
+  // initializer stays valid.
+  std::span<const CommandSpec> commands;
 };
+
+// The command named `name` in `spec`, or null.
+const CommandSpec* find_command(const StageSpec& spec,
+                                std::string_view name) noexcept;
 
 }
 

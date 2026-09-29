@@ -105,7 +105,7 @@ export function mount(body, actions, ctx) {
       case 'gone':    setDesignation(null); break;
       case 'frame':   if (editor) { editor.onFrame(msg); } break;
       case 'committed':
-        if (editor) { editor.onCommitted(msg.seq); }
+        if (editor) { editor.onCommitted(msg); }
         break;
       default: break;
     }
@@ -608,8 +608,15 @@ export function mount(body, actions, ctx) {
       channel.send({ m: 'commit', png: toBase64(bytes) });
     }
 
-    function onCommitted() {
-      setStatus(t('mask.committed'));
+    function onCommitted(msg) {
+      // The stage's own answer: the beat is out, still queued behind
+      // earlier commits, or refused (and why).
+      if (msg && msg.error) {
+        setStatus(t('mask.commit_failed', { why: msg.error }));
+        return;
+      }
+      setStatus(t(msg && msg.pending ? 'mask.commit_queued'
+                                     : 'mask.committed'));
       // Back to the usual hint, so the panel doesn't sit claiming a
       // commit that has scrolled out of relevance.
       window.setTimeout(() => {

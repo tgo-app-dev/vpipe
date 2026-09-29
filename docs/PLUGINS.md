@@ -149,6 +149,43 @@ like it does:
   any stage — which is what lets a plugin extend a family the host does not
   know about.
 
+### Command channels
+
+A plugin stage can accept **commands** while its pipeline runs — requests
+from the C++ API, Python or a GUI view, carrying JSON arguments and buffers
+in either direction, zero-copy. Declare them in the spec and the host does
+the rest: it queues them first in first out, validates each against your
+declaration before your stage sees it, and cancels them at stop.
+
+```cpp
+const vpipe::BufferSpec kFrameOut[] = {
+  {.name = "frame", .type = "u8", .shape = "H,W,3", .contiguous = true},
+};
+const vpipe::CommandSpec kCommands[] = {
+  {.name = "snapshot", .doc = "the current frame, in place",
+   .out = kFrameOut, .holds = true},
+};
+const vpipe::StageSpec kSpec = { .type_name = "acme-camera", /* ... */
+                                 .commands = kCommands };
+
+// In process(): answer between beats, or sleep on beats AND commands.
+co_await ctx.read_any({0}, /*commands=*/true);
+while (auto cmd = ctx.try_command()) {
+  cmd->reply(result, {vpipe::DataBuffer::view("frame", _frame.data(),
+      vpipe::BufferLayout::contiguous(vpipe::ElementType::U8,
+                                      {_h, _w, 3}), _frame_owner)});
+  co_await cmd->until_closed();   // hold: nothing downstream moves
+}
+```
+
+The layout grammar (`type`, `shape`, `format`), the lifecycle and the
+ownership rules are in [STAGE-COMMANDS.md](STAGE-COMMANDS.md). The two
+things a plugin gets wrong: an exposed buffer's `owner` must keep the
+memory alive for as long as the caller holds a view (so a stage that wants
+its memory back checks `use_count()` after the close and copies when the
+caller kept one), and a command taken must be answered — `reply()` or
+`fail()` — or its caller waits until the pipeline stops.
+
 ## Extension point 2 — Metal shaders
 
 Compile a self-contained `.metal` offline and embed its bytes with the
@@ -1196,7 +1233,7 @@ method.
 ## Versioning
 
 - `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the plugin
-  contract version, currently **3**. The host loads a plugin only when the
+  contract version, currently **7**. The host loads a plugin only when the
   plugin's reported value **equals** the host's — strict equality, no
   backward compatibility.
 

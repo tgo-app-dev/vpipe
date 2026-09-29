@@ -310,6 +310,9 @@ sweep_table_(size_t* n)
     // job on each launch, and the capture stages are driven by a device
     // rather than a counter.
     {"text-input", "{}", true, "reads stdin; no input in the runner"},
+    {"external-input", "{}", true,
+     "emits only when commanded; its relaunch is driven by "
+     "stage_command.a_relaunch_starts_over"},
     {"load-video", "{}", true, "needs a decodable video fixture"},
     {"audio-capture", "{}", true, "needs a capture device"},
     {"video-capture", "{}", true, "needs a camera"},

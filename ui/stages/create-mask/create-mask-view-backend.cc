@@ -10,8 +10,9 @@
 //   {m:"list"}                      enumerate declared create-mask stages
 //   {m:"watch", pipeline, stage}    follow this stage
 //   {m:"unwatch"}                   stop following
-//   {m:"commit", png:"<base64>"}    the painted mask; the stage emits
-//                                   ONE beat per accepted commit
+//   {m:"commit", png:"<base64>"}    the painted mask, sent on as the
+//                                   stage's `commit` COMMAND; the stage
+//                                   emits ONE beat per commit
 //
 // PROTOCOL (backend -> view):
 //   {m:"stages", list:[{pipeline,stage,title,state,live}]}
@@ -19,7 +20,9 @@
 //   {m:"frame", width, height, bg_width, bg_height, has_bg, has_mask,
 //               version, editor:{mode,classes,colors,overlay_opacity,
 //                                interactive}}
-//   {m:"committed", seq}            the commit reached the stage
+//   {m:"committed", seq}            the stage emitted the beat
+//   {m:"committed", pending:true}   queued; the beat follows
+//   {m:"committed", error}          the stage refused it
 //   binary {m:"image", slot:"bg"|"mask"} + PNG bytes
 //
 // The frame message ALWAYS precedes the images of that version, so the
@@ -37,6 +40,7 @@
 #include "common/flex-data.h"
 #include "common/mask-editor-channel.h"
 #include "common/media-line.h"
+#include "pipeline/stage-command.h"
 #include "pipeline/stage.h"
 
 #include <chrono>
@@ -57,6 +61,12 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr const char* kStageType = "create-mask";
+
+// How long the connection thread waits for the stage to answer a commit
+// before acknowledging it as pending. A commit is served in well under
+// this; a stage whose output is backed up takes as long as that takes,
+// and the ack should not.
+constexpr int kCommitAckMs = 2000;
 
 std::string
 str_field(const FlexData& obj, std::string_view key)
@@ -171,11 +181,11 @@ private:
     if (_worker.joinable()) { _worker.join(); }
   }
 
-  // Resolve the followed stage's channel, or null. Taken fresh on each
-  // use: the pipeline may have been relaunched under the panel, and the
-  // Stage* is only valid while it stays launched.
-  std::shared_ptr<MaskEditorChannel>
-  channel_() const
+  // The followed stage, or null. Taken fresh on each use: the pipeline
+  // may have been relaunched under the panel, and the Stage* is only
+  // valid while it stays launched.
+  Stage*
+  live_stage_() const
   {
     std::string pipeline;
     std::string stage;
@@ -185,26 +195,53 @@ private:
       stage    = _want_stage;
     }
     if (pipeline.empty()) { return nullptr; }
-    Stage* s = _host.live_stage(pipeline, stage);
-    if (s == nullptr) { return nullptr; }
-    auto* src = dynamic_cast<MaskEditorSource*>(s);
+    return _host.live_stage(pipeline, stage);
+  }
+
+  // The followed stage's channel, or null.
+  std::shared_ptr<MaskEditorChannel>
+  channel_() const
+  {
+    auto* src = dynamic_cast<MaskEditorSource*>(live_stage_());
     return src != nullptr ? src->mask_channel() : nullptr;
   }
 
-  // A painted mask on its way up. Acknowledged with the sequence the
-  // stage assigned it, so the view can tell "the stage took it" from
-  // "the socket ate it" -- the difference between a beat and nothing.
+  // A painted mask on its way up, as the stage's own `commit` command --
+  // the same one a program sends. Acknowledged with what the stage
+  // answered, so the view can tell "the beat is out" from "the stage
+  // refused it" from "the socket ate it".
   void
   handle_commit_(UiViewChannel& ch, const FlexData& msg)
   {
-    auto cc = channel_();
-    if (!cc || cc->closed()) { return; }
+    Stage* s = live_stage_();
+    if (s == nullptr) { return; }
     auto bytes = media_line::base64_decode(str_field(msg, "png"));
     if (!bytes || bytes->empty()) { return; }
-    const std::uint64_t seq = cc->commit(std::move(*bytes));
+    auto png = std::make_shared<std::vector<std::uint8_t>>(
+        std::move(*bytes));
+    std::vector<DataBuffer> in;
+    in.push_back(DataBuffer::view(
+        "png", png->data(),
+        BufferLayout::contiguous(
+            ElementType::Bytes, {static_cast<std::int64_t>(png->size())}),
+        png));
+    // Dropping `cmd` after the wait does NOT close it: a commit still
+    // queued is still served, and the ack below says so.
+    auto cmd = open_stage_command(*s, "commit", FlexData::make_object(),
+                                  std::move(in));
+    const CommandState st = cmd->wait(kCommitAckMs);
     FlexData m = msg_obj("committed");
     auto mo = m.as_object();
-    mo.insert("seq", FlexData::make_uint(seq));
+    if (st == CommandState::Replied) {
+      const FlexData r = cmd->result();
+      mo.insert("seq", FlexData::make_uint(
+          r.is_object() && r.as_object().contains("seq")
+              ? r.as_object().at("seq").as_uint(0) : 0));
+    } else if (st == CommandState::Pending || st == CommandState::Active) {
+      mo.insert("pending", FlexData::make_bool(true));
+    } else {
+      mo.insert("error", FlexData::make_string(cmd->error()));
+    }
     ch.send(m);
   }
 

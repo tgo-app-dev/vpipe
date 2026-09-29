@@ -7,6 +7,9 @@
 //   * SessionIntf     (vpipe/session-intf.h)
 //   * PipelineHandle, StageHandle, StagePortHandle
 //                     (vpipe/pipeline-handle.h)
+//   * CommandHandle, DataBuffer, BufferLayout -- commands to a running
+//     stage, with data in and out by reference
+//                     (vpipe/stage-command.h)
 //   * Status          (vpipe/status.h)
 //
 // Everything else (the implementation classes, the Stage type tree,

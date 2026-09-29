@@ -91,4 +91,13 @@ stage_category_name(StageCategory c) noexcept
   return "generic";
 }
 
+const CommandSpec*
+find_command(const StageSpec& spec, std::string_view name) noexcept
+{
+  for (const CommandSpec& c : spec.commands) {
+    if (c.name == name) { return &c; }
+  }
+  return nullptr;
+}
+
 }

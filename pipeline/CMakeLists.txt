@@ -10,6 +10,7 @@ set(LOCAL_SOURCES
   pipeline.cc
   memory-plan.cc
   resource-plan.cc
+  stage-command.cc
   stage-config.cc
   stage-registry.cc
   stage-spec.cc
@@ -27,6 +28,7 @@ set(LOCAL_HEADERS
   pipeline.h
   resource-plan.h
   runtime-context.h
+  stage-command.h
   stage-config.h
   stage-registry.h
   stage-spec.h

@@ -15,6 +15,7 @@
 
 namespace vpipe {
 
+class CommandInbox;
 class EdgeReader;
 class InitBarrier;
 class OportBuffer;
@@ -141,6 +142,10 @@ private:
   // launch. Used by stop() to clear each stage's running flag once the
   // drivers have drained, so post-stop topology edits are permitted.
   std::vector<Stage*>                          _live_stages;
+
+  // One per stage that declares commands, for the span of the launch.
+  // Shut at stop() before anything waits on the drivers.
+  std::vector<std::shared_ptr<CommandInbox>>   _inboxes;
 
   // ---- the topological memory plan, and its revisions ------------------
   //

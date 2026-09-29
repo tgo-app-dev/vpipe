@@ -22,7 +22,10 @@
 #ifndef PIPELINE_HANDLE_H
 #define PIPELINE_HANDLE_H
 
+#include "vpipe/stage-command.h"
+
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vpipe {
@@ -55,6 +58,35 @@ public:
   // schema. Lets a client discover a stage's configuration keys,
   // types, and current values without knowing the stage type.
   std::string config_schema_json() const;
+
+  // The stage's id ("" for a null handle).
+  std::string id() const;
+
+  // ---- command channels ----------------------------------------------
+  //
+  // JSON description of the commands this stage accepts while its
+  // pipeline runs: an array of { "name", "doc", "holds", "args",
+  // "results", "in", "out" } objects, where args / results use the
+  // config_schema_json() entry shape and in / out list the buffers as
+  // { "name", "doc", "type", "shape", "format", "optional",
+  // "writable", "contiguous" }. "[]" for a stage with none. See
+  // docs/STAGE-COMMANDS.md for the layout grammar.
+  std::string commands_json() const;
+
+  // Send the stage command `name`. Never blocks and never throws: the
+  // command is validated against the stage's spec and queued, and the
+  // returned handle is how the caller waits for the reply, reads the
+  // stage's buffers and closes it. A refusal -- no such command, bad
+  // `args_json`, a buffer that does not fit its spec, a stage whose
+  // pipeline is not running -- comes back as a handle in state Failed
+  // whose error() says which.
+  //
+  //   args_json  a JSON object of the command's arguments; "" = {}.
+  //   in         the caller's buffers, by the names the spec gives
+  //              them. See DataBuffer for who keeps them alive.
+  CommandHandle command(std::string_view        name,
+                        std::string_view        args_json = {},
+                        std::vector<DataBuffer> in = {}) const;
 
   // True iff this handle refers to a live stage. A default-/null-
   // constructed handle, or one returned from an unimplemented stub,
@@ -101,6 +133,11 @@ public:
                            std::string         config_json = "");
 
   PipelineHandle insert_pipeline(std::string id);
+
+  // The stage with id `id`, whether it was inserted through this handle
+  // or loaded from a spec -- the way to reach a loaded pipeline's
+  // stages at all. Null handle when there is none.
+  StageHandle stage(std::string_view id);
 
   // Re-point one of a stage's input ports after construction, the
   // post-construction edge edit behind the web-ui composer's

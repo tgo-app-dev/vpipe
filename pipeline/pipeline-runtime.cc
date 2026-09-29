@@ -1001,12 +1001,24 @@ PipelineRuntime::launch_()
   // a concurrent editor sees the pipeline as live the instant launch
   // commits. stop() clears these once the drivers have drained.
   _live_stages = stages;
-  for (Stage* s : _live_stages) {
+  for (size_t i = 0; i < stages.size(); ++i) {
+    Stage* s = stages[i];
     StageLifecycleAccess::set_running(s, true);
     // The revise channel, for exactly the span the plan exists over. A
     // stage outlives the launch it ran in, so a sink left behind would
     // be a dangling pointer the next beat writes through.
     StageLifecycleAccess::set_memory_sink(s, this);
+    // A command inbox for every stage that declares commands, published
+    // on the stage (where callers find it) and on its context (where the
+    // stage reads it) before any driver runs. Same span as the running
+    // flag, for the same reason as the sink.
+    if (!s->spec().commands.empty()) {
+      auto inbox = make_shared<CommandInbox>(
+          s->id(), session()->thread_pool());
+      _contexts[i]->attach_commands(inbox.get());
+      StageLifecycleAccess::set_command_inbox(s, inbox);
+      _inboxes.push_back(std::move(inbox));
+    }
   }
   // Stamped with the flag that makes the pipeline live, so the span
   // stop() reports is exactly the span _running is true for.
@@ -1055,6 +1067,13 @@ void
 PipelineRuntime::stop()
 {
   pause();
+  // Cancel every command first: a stage suspended on one -- waiting for
+  // the next command, or HOLDING its output until a caller closes one --
+  // is woken here, and would otherwise keep wait_idle() waiting on a
+  // caller that may never come back.
+  for (auto& inbox : _inboxes) {
+    inbox->shutdown("the pipeline is stopping");
+  }
   // Wake any drivers currently suspended on a buffer wait list.
   for (auto& buf : _oport_bufs) {
     buf->close();
@@ -1070,6 +1089,7 @@ PipelineRuntime::stop()
   for (Stage* s : _live_stages) {
     StageLifecycleAccess::set_running(s, false);
     StageLifecycleAccess::set_memory_sink(s, nullptr);
+    StageLifecycleAccess::set_command_inbox(s, nullptr);
   }
   close_plan();
   // HOW LONG IT RAN, at INFO and once per launch.
@@ -1262,6 +1282,9 @@ stage_driver_(Stage*                    stage,
       stage->id()));
   }
 
+  // Nothing reads this stage's commands any more: refuse new ones and
+  // cancel any it left open, so no caller waits on a stage that ended.
+  ctx->shut_commands(fmt("stage '{}' has finished", stage->id())());
   ctx->close_outputs();
 
   {

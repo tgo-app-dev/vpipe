@@ -11,6 +11,7 @@
 #include "pipeline/pipeline-handle-impl.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline-spec.h"
+#include "pipeline/stage-command.h"
 #include "pipeline/stage.h"
 #include "pipeline/stage-registry.h"
 #include "plugin/plugin-manager.h"
@@ -556,6 +557,9 @@ PipelineApi::h_stage_types_(const HttpRequest&)
       // still renders with its spec) but the composer omits them from
       // the add-a-stage toolbox.
       oo.insert("hidden", FlexData::make_bool(sp->hidden));
+      // The command channels a running instance accepts (see
+      // docs/STAGE-COMMANDS.md); [] for most stages.
+      oo.insert("commands", describe_commands(*sp));
     } else {
       oo.insert("category", fstr("generic"));
       oo.insert("doc", fstr(""));
@@ -564,6 +568,7 @@ PipelineApi::h_stage_types_(const HttpRequest&)
       oo.insert("oports", FlexData::make_array());
       oo.insert("attr_count", FlexData::make_uint(0));
       oo.insert("hidden", FlexData::make_bool(false));
+      oo.insert("commands", FlexData::make_array());
     }
     a.push_back(std::move(o));
   }

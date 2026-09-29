@@ -41,6 +41,11 @@ public:
                               std::string         config_json = "");
   PipelineHandle insert_pipeline(std::string id);
 
+  // The stage `id` -- a plain id at the top level, or "sub/stage" into a
+  // nested pipeline -- as a handle, reusing the one insert_stage made
+  // when there is one. Null handle when there is no such stage.
+  StageHandle stage(std::string_view id);
+
   // Re-point stage `stage_id`'s input port `iport` to `src_id`'s
   // output `src_oport` (empty src_id => disconnect). See
   // PipelineHandle::move_iport.
@@ -129,6 +134,10 @@ public:
   static StageHandleImpl*
   impl(const StageHandle& h) noexcept
   { return h._impl; }
+
+  static CommandHandle
+  make_command(std::shared_ptr<StageCommand> c) noexcept
+  { return CommandHandle(std::move(c)); }
 };
 
 }

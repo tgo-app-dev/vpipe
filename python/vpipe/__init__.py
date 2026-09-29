@@ -31,6 +31,7 @@ import os
 
 from . import _vpipe
 from ._vpipe import (
+    CommandHandle,
     PipelineHandle,
     SessionIntf,
     SessionManager,
@@ -40,6 +41,7 @@ from ._vpipe import (
 )
 
 __all__ = [
+    "CommandHandle",
     "PipelineHandle",
     "SessionIntf",
     "SessionManager",

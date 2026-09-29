@@ -206,6 +206,22 @@ StageLifecycleAccess::set_memory_sink(Stage* s, MemoryPlanSink* sink)
 }
 
 void
+StageLifecycleAccess::set_command_inbox(Stage* s,
+                                        shared_ptr<CommandInbox> inbox)
+{
+  if (s == nullptr) { return; }
+  lock_guard<mutex> lk(s->_inbox_mu);
+  s->_inbox = std::move(inbox);
+}
+
+shared_ptr<CommandInbox>
+Stage::command_inbox() const
+{
+  lock_guard<mutex> lk(_inbox_mu);
+  return _inbox;
+}
+
+void
 StageLifecycleAccess::set_needs_init(Stage* s, bool needs_init)
 {
   s->_needs_init.store(needs_init, memory_order_release);

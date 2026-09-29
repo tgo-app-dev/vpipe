@@ -1568,6 +1568,38 @@ const STRINGS = {
       '發出多少個節拍後結束；0 = 永不停止'],
   'port.chrono.tick': ['', '周期性的 TriggerBeat', '週期性的 TriggerBeat'],
 
+  // ---- External Input (control) ----
+  'stage.external-input.name': ['', '外部输入', '外部輸入'],
+  'stage.external-input.doc': ['',
+      '源：来自管线外部的节拍。每条 `push` 命令把调用方的张量复制成一个节拍'
+      + '发出；每条 `lease` 把一个可写节拍交给调用方原地填写，命令关闭时发出'
+      + '；`finish` 结束流。由 C++ / Python API 驱动。',
+      '來源：來自管線外部的節拍。每條 `push` 命令把呼叫方的張量複製成一個節拍'
+      + '發出；每條 `lease` 把一個可寫節拍交給呼叫方原地填寫，命令關閉時發出'
+      + '；`finish` 結束串流。由 C++ / Python API 驅動。'],
+  'port.external-input.tensor': ['',
+      '每次 push、每个关闭的 lease 各一个 TensorBeat',
+      '每次 push、每個關閉的 lease 各一個 TensorBeat'],
+
+  // ---- External Tap (control) ----
+  'stage.external-tap.name': ['', '外部探针', '外部探針'],
+  'stage.external-tap.doc': ['',
+      '透传阶段，让管线外部的代码原地读取和修改节拍：`read` 命令零拷贝地暴'
+      + '露下一个 TensorBeat，并一直持有到命令关闭。gate 模式下每个节拍都要等'
+      + '一次读取。由 C++ / Python API 驱动。',
+      '透傳階段，讓管線外部的程式碼原地讀取和修改節拍：`read` 命令零拷貝地暴'
+      + '露下一個 TensorBeat，並一直持有到命令關閉。gate 模式下每個節拍都要等'
+      + '一次讀取。由 C++ / Python API 驅動。'],
+  'cfg.external-tap.mode': ['',
+      '"pass"：节拍自由通过，排队中的 read 取走下一个。"gate"：每个 '
+      + 'TensorBeat 都等待一次 read，管线按调用方的节奏运行',
+      '"pass"：節拍自由通過，排隊中的 read 取走下一個。"gate"：每個 '
+      + 'TensorBeat 都等待一次 read，管線按呼叫方的節奏執行'],
+  'port.external-tap.in': ['', '任意节拍', '任意節拍'],
+  'port.external-tap.out': ['',
+      '同样的节拍，顺序不变，带着调用方原地所做的修改',
+      '同樣的節拍，順序不變，帶著呼叫方原地所做的修改'],
+
   // ---- Feedback In (control) ----
   'stage.feedback-rx.name': ['', '反馈器接收端', '回饋器接收端'],
   'stage.feedback-rx.doc': ['',

@@ -79,6 +79,7 @@ add_custom_target(vpipe_stages_doc ALL DEPENDS ${VPIPE_STAGES_MD})
 set(VPIPE_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/include/vpipe/vpipe.h
     ${CMAKE_SOURCE_DIR}/include/vpipe/status.h
+    ${CMAKE_SOURCE_DIR}/include/vpipe/stage-command.h
     ${CMAKE_SOURCE_DIR}/include/vpipe/pipeline-handle.h
     ${CMAKE_SOURCE_DIR}/include/vpipe/session-intf.h
     ${CMAKE_SOURCE_DIR}/include/vpipe/session-manager.h

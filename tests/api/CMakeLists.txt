@@ -1,5 +1,6 @@
 set(LOCAL_TEST_SOURCES
   basics.cc
+  stage-commands.cc
 )
 set(LOCAL_TEST_HEADERS "")
 

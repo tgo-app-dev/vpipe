@@ -5,6 +5,7 @@
 #include "common/job.h"
 #include "pipeline/edge-reader.h"
 #include "pipeline/oport-buffer.h"
+#include "pipeline/stage-command.h"
 
 #include <atomic>
 #include <coroutine>
@@ -156,9 +157,15 @@ public:
   // await_suspend is still registering the remaining ports (see
   // MultiReadWaiter's armed/fired handshake). await_ready short-
   // circuits when a port is already readable (no suspend).
+  //
+  // With `commands` set it ALSO wakes when a command reaches the stage's
+  // inbox (or the inbox shuts at stop), so a stage that answers commands
+  // can sleep on its inputs and its commands at once. With commands set
+  // the port list may be empty -- then it waits on commands alone.
   struct ReadAnyAwaiter {
     std::vector<EdgeReader*>         _readers;
     std::shared_ptr<MultiReadWaiter> _state;
+    CommandInbox*                    _inbox = nullptr;
 
     bool
     await_ready()
@@ -166,7 +173,7 @@ public:
       for (auto* r : _readers) {
         if (r->readable_now()) { return true; }
       }
-      return false;
+      return _inbox != nullptr && _inbox->ready();
     }
 
     bool
@@ -182,6 +189,10 @@ public:
           any_ready = true;
         }
       }
+      CommandInbox* inbox = _inbox;
+      if (inbox != nullptr && !inbox->register_waiter(_state)) {
+        any_ready = true;
+      }
       // Arm last, under the state lock: if a registered port already
       // fired (or one was Ready), resume inline instead of suspending,
       // and claim `fired` so a late notify() becomes a no-op.
@@ -194,6 +205,7 @@ public:
       }
       if (inline_resume) {
         for (auto* r : _readers) { r->deregister_multi(_state); }
+        if (inbox != nullptr) { inbox->deregister_waiter(_state); }
         return false;
       }
       return true;
@@ -206,17 +218,62 @@ public:
       // (the winner already cleared its own slot).
       if (_state) {
         for (auto* r : _readers) { r->deregister_multi(_state); }
+        if (_inbox != nullptr) { _inbox->deregister_waiter(_state); }
       }
     }
   };
 
   ReadAnyAwaiter
-  read_any(std::vector<unsigned> ports)
+  read_any(std::vector<unsigned> ports, bool commands = false)
   {
     std::vector<EdgeReader*> rs;
     rs.reserve(ports.size());
     for (unsigned p : ports) { rs.push_back(reader_(p)); }
-    return ReadAnyAwaiter{ std::move(rs), {} };
+    return ReadAnyAwaiter{ std::move(rs), {}, commands ? _inbox : nullptr };
+  }
+
+  // ---- command channels (pipeline/stage-command.h) --------------------
+  //
+  // Present only when the stage's spec declares commands. Commands
+  // arrive first in first out; each one taken is Active and the stage's
+  // to answer (reply or fail) -- an unanswered one leaves its caller
+  // waiting until the pipeline stops.
+
+  bool has_commands() const noexcept { return _inbox != nullptr; }
+
+  // The next queued command, or null. Never suspends.
+  std::shared_ptr<StageCommand>
+  try_command()
+  {
+    return _inbox != nullptr ? _inbox->take() : nullptr;
+  }
+
+  // `auto cmd = co_await ctx.next_command();` -- the next command,
+  // suspending until one arrives. Null means no more will: the pipeline
+  // is stopping, or the stage has no command channels at all.
+  NextCommandAwaiter
+  next_command()
+  {
+    return NextCommandAwaiter{ _inbox, {}, {} };
+  }
+
+  // Cancel every command this stage took and has not seen closed, e.g.
+  // on reaching the end of its stream with a read still open. The
+  // inbox stays open for new commands.
+  void
+  cancel_open_commands(std::string_view why)
+  {
+    if (_inbox != nullptr) { _inbox->cancel_open(why); }
+  }
+
+  // Runtime only: bind the stage's inbox, and shut it when the stage's
+  // driver has finished so a caller is refused rather than left
+  // waiting on a stage that will never read again.
+  void attach_commands(CommandInbox* inbox) noexcept { _inbox = inbox; }
+  void
+  shut_commands(std::string_view why)
+  {
+    if (_inbox != nullptr) { _inbox->shutdown(why); }
   }
 
   // Move-out acquire at cursor. Suspends only for "not-yet-written"
@@ -286,6 +343,7 @@ private:
   mutable EdgeReader        _eos_reader{nullptr, 0};
   std::atomic<bool>*        _stop;
   bool                      _done = false;
+  CommandInbox*             _inbox = nullptr;
 };
 
 }

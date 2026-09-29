@@ -10,6 +10,8 @@ set(LOCAL_SOURCES
   buffer-stage.cc
   call-stage.cc
   chrono-stage.cc
+  external-input-stage.cc
+  external-tap-stage.cc
   load-audio-stage.cc
   load-image-stage.cc
   load-text-stage.cc
@@ -59,6 +61,7 @@ set(LOCAL_SOURCES
   save-text-stage.cc
   shell-stage.cc
   text-input-stage.cc
+  tensor-buffer.cc
   text-prompt-stage.cc
   videos-db-cleanup-stage.cc
   # vision (always built)
@@ -108,6 +111,9 @@ set(LOCAL_HEADERS
   qwen-image-edit-model-config-stage.h
   model-config-source.h
   shell-stage.h
+  external-input-stage.h
+  external-tap-stage.h
+  tensor-buffer.h
   text-input-stage.h
   text-prompt-stage.h
   trigger-beat.h

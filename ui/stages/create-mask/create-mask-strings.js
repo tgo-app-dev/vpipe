@@ -69,6 +69,10 @@ export const strings = {
       '发送该蒙版 — 阶段将输出一个节拍',
       '傳送該遮罩 — 階段將輸出一個節拍'],
   'mask.committed':    ['Committed', '已提交', '已提交'],
+  'mask.commit_queued': ['Committed — queued behind earlier commits',
+      '已提交 — 正在前面的提交之后排队', '已提交 — 正在前面的提交之後排隊'],
+  'mask.commit_failed': ['Not committed: {why}', '未提交：{why}',
+      '未提交：{why}'],
   'mask.readonly':     ['This stage runs without the editor '
       + '(interactive: false) — the mask is shown but cannot be '
       + 'committed.',

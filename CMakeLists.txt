@@ -480,6 +480,9 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/oport-buffer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/resource-plan.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/runtime-context.h
+    # runtime-context.h includes it: a stage answers commands through
+    # its context, and every plugin stage includes the context.
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-command.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-registry.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-spec.h

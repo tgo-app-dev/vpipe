@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -24,6 +25,7 @@ namespace vpipe {
 
 enum class StageTypeId : unsigned { unknown = 0 };
 
+class CommandInbox;
 class Job;
 class RuntimeContext;
 class StageLifecycleAccess;
@@ -428,6 +430,13 @@ public:
     return _needs_init.load(std::memory_order_acquire);
   }
 
+  // The stage's command inbox while its pipeline runs -- from launch
+  // until stop, and only when spec().commands is non-empty; null
+  // otherwise. A caller posts through it (open_stage_command in
+  // pipeline/stage-command.h); the stage itself reads its commands from
+  // its RuntimeContext, never from here.
+  std::shared_ptr<CommandInbox> command_inbox() const;
+
   // ---- Performance tracing ------------------------------------
   //
   // Producer hot path. The event is routed into the calling
@@ -532,6 +541,10 @@ private:
   std::string       _config_error;
   std::atomic<bool> _running{false};
   std::atomic<bool> _needs_init{false};
+  // Set and cleared by the runtime (StageLifecycleAccess) while callers
+  // on other threads read it, hence the lock.
+  mutable std::mutex            _inbox_mu;
+  std::shared_ptr<CommandInbox> _inbox;
 };
 
 using StagePtr = std::unique_ptr<Stage>;
@@ -551,6 +564,9 @@ public:
   // a revision arriving after the plan is gone must not find a dangling
   // one.
   static void set_memory_sink(Stage* s, MemoryPlanSink* sink);
+  // The command inbox for the span of a launch; null clears it.
+  static void set_command_inbox(Stage* s,
+                                std::shared_ptr<CommandInbox> inbox);
 };
 
 }
