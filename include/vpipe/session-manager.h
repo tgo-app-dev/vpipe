@@ -17,6 +17,10 @@
 #include "vpipe/session-intf.h"
 #include <string_view>
 
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class SessionManager {
@@ -57,5 +61,7 @@ protected:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

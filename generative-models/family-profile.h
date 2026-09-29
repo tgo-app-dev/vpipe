@@ -55,6 +55,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe::genai::profile {
 
 // ---- readers ---------------------------------------------------------
@@ -135,6 +139,7 @@ integers(const FlexData* p, std::string_view key)
 // its vtable, which invalidates every plugin already built against it.
 // Nothing here moved anyone's vtable.
 class Registry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static Registry& get() noexcept;
 
@@ -160,5 +165,7 @@ private:
 };
 
 }  // namespace vpipe::genai::profile
+
+VPIPE_API_END
 
 #endif

@@ -29,6 +29,9 @@
 #include <limits>
 #include <string_view>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 namespace vpipe::genai::fp8 {
 
 enum class Format { kNone, kE4M3, kE5M2 };

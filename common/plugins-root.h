@@ -3,6 +3,11 @@
 
 #include <filesystem>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 // The conventional place to keep vpipe plugin dylibs: the work
@@ -32,5 +37,7 @@ namespace vpipe {
 const std::filesystem::path& plugins_root();
 
 }  // namespace vpipe
+
+VPIPE_HOST_API_END
 
 #endif  // VPIPE_PLUGINS_ROOT_H

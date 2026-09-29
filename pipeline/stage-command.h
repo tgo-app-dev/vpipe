@@ -53,6 +53,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class Stage;
@@ -60,6 +64,7 @@ class ThreadPool;
 struct MultiReadWaiter;
 
 class StageCommand : public std::enable_shared_from_this<StageCommand> {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // ---- what was asked ------------------------------------------------
   std::string_view   name() const noexcept;
@@ -164,6 +169,7 @@ private:
 // creates one for each stage whose spec declares commands; a caller
 // reaches it through Stage::command_inbox().
 class CommandInbox {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   CommandInbox(std::string stage_id, ThreadPool* pool,
                std::size_t capacity = 64);
@@ -264,5 +270,7 @@ bool match_shape(std::string_view pattern,
                  ShapeSymbols* symbols);
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Process-wide map of stage type-name <-> StageTypeId plus a factory
@@ -22,6 +26,7 @@ namespace vpipe {
 // reflect the dynamic order in which TypedStage<T>::_type_id is
 // initialized. Persist stages by type_name(); never by type().
 class StageRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   using Factory = StagePtr (*)(const SessionContextIntf*,
                                std::string,
@@ -86,6 +91,18 @@ public:
   void        attribute_since(StageTypeId first, std::string_view origin);
   std::string_view origin(std::string_view type_name) const noexcept;
 
+  // ---- quarantine ----------------------------------------------------
+  //
+  // A plugin's stage types register themselves while its dylib LOADS --
+  // before the host has checked that the plugin speaks a supported ABI.
+  // Between begin_quarantine() and end_quarantine() every new type and
+  // spec is PENDING: registered, but invisible to lookups, creation and
+  // listings. end_quarantine(true) admits them; end_quarantine(false)
+  // withdraws them for good, so a refused plugin leaves no factory
+  // behind that points into code built against another layout.
+  void begin_quarantine();
+  void end_quarantine(bool admit);
+
 private:
   StageRegistry() = default;
 
@@ -112,7 +129,15 @@ private:
     std::string name;
     Factory     factory;
     std::string origin;     // contributing plugin, empty for built-ins
+    bool        pending   = false;   // registered under quarantine
+    bool        withdrawn = false;   // quarantine ended in refusal
   };
+
+  bool visible_(unsigned id) const noexcept
+  {
+    return id >= 1 && id <= _entries.size() &&
+           !_entries[id - 1].pending && !_entries[id - 1].withdrawn;
+  }
 
   // Index is (id - 1). Entry::name owns the canonical string and
   // backs the string_views handed back from find_name.
@@ -123,9 +148,13 @@ private:
   // Sparse: only stages that declared a spec appear.
   std::unordered_map<std::string, const StageSpec*,
                      StringHash, StringEq> _specs;
+  bool                     _quarantine = false;
+  std::vector<std::string> _quarantined_specs;   // names set_spec added
   mutable std::mutex _mu;
 };
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -28,6 +28,7 @@
 
 #include "common/flex-data.h"
 #include "vpipe/vpipe.h"
+#include "common/beat-keys.h"
 
 #include <string>
 #include <utility>
@@ -35,7 +36,7 @@
 namespace vpipe::provenance {
 
 // The sideband key every stage in the chain agrees on.
-inline constexpr const char* kSidebandKey = "model_name";
+inline constexpr std::string_view kSidebandKey = sideband::kModelName;
 
 // The model as the USER named it ("local/MiniMax-H3-FL2VA-8bit"), or ""
 // when the producer sent none.

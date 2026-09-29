@@ -2,15 +2,21 @@
 #define UI_VIEW_REGISTRY_H
 
 #include "interfaces/ui-view-intf.h"
+#include "pipeline/spec-extra.h"
 
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -61,6 +67,9 @@ struct UiViewSpec {
   // client-side panel).
   std::unique_ptr<UiViewBackendIntf> (*make_backend)(UiViewHostIntf&)
       = nullptr;
+
+  // Anything this struct has no field for. See SpecExtra.
+  std::span<const SpecExtra> extra;
 };
 
 // One embedded front-end file: `path` is the URL it is served at,
@@ -72,6 +81,7 @@ struct UiViewAsset {
 };
 
 class UiViewRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static UiViewRegistry& get() noexcept;
 
@@ -140,5 +150,7 @@ private:
     return 0; }(); }
 
 }
+
+VPIPE_API_END
 
 #endif

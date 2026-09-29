@@ -16,12 +16,17 @@
 #ifndef VPIPE_STAGES_MODEL_MEMORY_H
 #define VPIPE_STAGES_MODEL_MEMORY_H
 
+#include "common/flex-data.h"
 #include "pipeline/resource-plan.h"
 
 #include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -492,6 +497,9 @@ struct StreamPlan {
   std::size_t others    = 0;   // the same, minus the DiT's own bytes
   std::size_t retires   = 0;   // what `dit_retires` took off the footprint
   std::size_t transient = 0;   // peers that let go before this model runs
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // `dit_retires` is what the DiT will RELEASE after load and before the
@@ -581,5 +589,7 @@ const char* unload_policy_name(UnloadPolicy p);
 
 }  // namespace model_memory
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

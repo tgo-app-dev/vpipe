@@ -218,10 +218,10 @@ namespace {
 // Closed value sets for the editor's dropdowns (SpecExtra "choices"),
 // agreeing with the validation in the ctor above.
 constexpr SpecExtra kMethodChoices[] = {
-  {"choices", "GET,POST,PUT,PATCH,DELETE,HEAD"},
+  {spec_key::kChoices, "GET,POST,PUT,PATCH,DELETE,HEAD"},
 };
 constexpr SpecExtra kPayloadFormatChoices[] = {
-  {"choices", "json,raw_string,none"},
+  {spec_key::kChoices, "json,raw_string,none"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "method", .type = ConfigType::String, .required = true,

@@ -1,6 +1,10 @@
 #ifndef SESSION_MEMBER_H
 #define SESSION_MEMBER_H
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class SessionContextIntf;
@@ -17,6 +21,8 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif
 

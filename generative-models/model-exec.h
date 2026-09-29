@@ -1,16 +1,22 @@
 #ifndef VPIPE_GENERATIVE_MODELS_MODEL_EXEC_H
 #define VPIPE_GENERATIVE_MODELS_MODEL_EXEC_H
 
+#include "common/flex-data.h"
 #include "generative-models/context-manager.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 
+#include <string_view>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe::genai {
 
@@ -31,6 +37,8 @@ struct GpuSamplerParams {
   float         presence_penalty   = 0.0f;
   std::uint64_t seed               = 0;
   int           n_iter             = 24;
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData      extra;
 };
 
 // Abstract LLM forward-pass driver. One concrete subclass per
@@ -458,8 +466,23 @@ public:
   // implements the route (the metal Qwen exec) override.
   virtual void set_i8_gemm(bool on) { (void)on; }
 
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 }
+
+VPIPE_API_END
 
 #endif

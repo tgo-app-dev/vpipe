@@ -3,6 +3,7 @@
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/detect-profile.h"
 
+#include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 
@@ -1016,6 +1017,21 @@ resolve_vae_dir(const std::string& root)
     const fs::path vae = fs::path(root) / "Wan2.1_VAE.pth";
     if (fs::exists(vae) && fs::exists(fs::path(root) / "LQ_proj_in.ckpt")) {
       return vae.string();
+    }
+  }
+  // Mage-Flow's Comfy-Org repack: the MageVAE as ONE freely-named file
+  // under `vae/`, with no config anywhere -- the repack drops it and the
+  // original repositories that carry it are gated. Returned by FILE, as
+  // FlashVSR's is, so the decode opens the VAE and not the repository
+  // (a 290 MB VAE had been claimed at the repository's 18 GB), and the
+  // family comes from its tensors (vae_family_). Only a file the
+  // MageVAE probe recognises: another family's single-file `vae/` keeps
+  // resolving as it did.
+  {
+    const std::string v = (fs::path(root) / "vae").string();
+    const std::string only = resolve_vae_weights_path(v);
+    if (only != v && genai::MetalMageVae::is_native_checkpoint(only)) {
+      return only;
     }
   }
   return root;

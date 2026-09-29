@@ -14,6 +14,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 namespace metal_compute { class MetalCompute; }
@@ -97,12 +101,13 @@ struct VaeDecodeRequest {
   const FlexData* accel = nullptr;
 
   // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
-  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // looks up anything with a SHAPE by name, `borrowed_extra` carries
+  // scalars.
   // The host always installs `input`, so it may be called
   // unconditionally; it returns false for every name a graph did not
   // wire.
   vpipe::genai::NamedInputFn input;
-  const FlexData*            extras = nullptr;
+  const FlexData*            borrowed_extra = nullptr;
 
   // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
   // chosen kernel. An out-parameter on the REQUEST rather than a field
@@ -146,10 +151,10 @@ struct VaeFrameChunk {
   // the log line and the preflight only. A family that mispredicts its
   // own geometry should produce a confusing log, not a mislabelled beat.
   int frames_total = 0;
-  // Anything this struct has no field for, per chunk. See SpecExtra's
-  // argument in pipeline/stage-config.h: a field added here moves a
-  // layout every VAE plugin already compiled.
-  const FlexData* extra = nullptr;
+  // Anything this struct has no field for, per chunk, LENT by the
+  // decoder for the call (common/flex-bag.h): a field added here would
+  // move a layout every VAE plugin already compiled.
+  const FlexData* borrowed_extra = nullptr;
 };
 
 // Returning false ABORTS the decode; decode() then returns false too.
@@ -203,6 +208,19 @@ public:
   // every peer size itself against a checkpoint it cannot see. See
   // docs/MODEL-MEMORY.md, "Declarations".
   virtual std::uint64_t resident_bytes() const { return 0; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // ---- the AUDIO half -------------------------------------------------
@@ -252,12 +270,13 @@ struct AudioVaeDecodeRequest {
   const FlexData* accel = nullptr;
 
   // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
-  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // looks up anything with a SHAPE by name, `borrowed_extra` carries
+  // scalars.
   // The host always installs `input`, so it may be called
   // unconditionally; it returns false for every name a graph did not
   // wire.
   vpipe::genai::NamedInputFn input;
-  const FlexData*            extras = nullptr;
+  const FlexData*            borrowed_extra = nullptr;
 
   // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
   // chosen kernel. An out-parameter on the REQUEST rather than a field
@@ -293,6 +312,19 @@ public:
 
   virtual void release_idle() {}
   virtual std::uint64_t resident_bytes() const { return 0; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Everything a family's load receives. Mirrors VideoModelCreateArgs.
@@ -338,12 +370,13 @@ struct VaeEncodeRequest {
   const FlexData* accel = nullptr;
 
   // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
-  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // looks up anything with a SHAPE by name, `borrowed_extra` carries
+  // scalars.
   // The host always installs `input`, so it may be called
   // unconditionally; it returns false for every name a graph did not
   // wire.
   vpipe::genai::NamedInputFn input;
-  const FlexData*            extras = nullptr;
+  const FlexData*            borrowed_extra = nullptr;
 
   // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
   // chosen kernel. An out-parameter on the REQUEST rather than a field
@@ -377,6 +410,19 @@ public:
   // family may implement this as a drop it cannot come back from.
   virtual void release_idle() {}
   virtual std::uint64_t resident_bytes() const { return 0; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // One AUDIO encode: a whole reference soundtrack, in one call.
@@ -415,12 +461,13 @@ struct AudioVaeEncodeRequest {
   const FlexData* accel = nullptr;
 
   // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h: `input`
-  // looks up anything with a SHAPE by name, `extras` carries scalars.
+  // looks up anything with a SHAPE by name, `borrowed_extra` carries
+  // scalars.
   // The host always installs `input`, so it may be called
   // unconditionally; it returns false for every name a graph did not
   // wire.
   vpipe::genai::NamedInputFn input;
-  const FlexData*            extras = nullptr;
+  const FlexData*            borrowed_extra = nullptr;
 
   // WHAT THE FAMILY WANTS SAID BACK -- realized tiling, a peak arena, a
   // chosen kernel. An out-parameter on the REQUEST rather than a field
@@ -453,6 +500,19 @@ public:
 
   virtual void release_idle() {}
   virtual std::uint64_t resident_bytes() const { return 0; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 struct VaeModelCreateArgs {
@@ -467,6 +527,9 @@ struct VaeModelCreateArgs {
   std::string model_type;                    // models-DB hint, may be ""
   metal_compute::MetalCompute* metal   = nullptr;
   const SessionContextIntf*    session = nullptr;
+  // Anything this struct has no field for, host-owned and borrowed for
+  // the call; null when the host sends none. See common/flex-bag.h.
+  const FlexData*              borrowed_extra  = nullptr;
 };
 
 // A VAE FAMILY: process-wide, stateless, one per architecture.
@@ -592,12 +655,26 @@ public:
   // yet leaves the stage inert rather than emitting silence.
   virtual std::unique_ptr<AudioVaeDecoder>
   load_audio_decoder(const VaeModelCreateArgs& /*args*/) { return nullptr; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Process-wide family set. Same singleton discipline as StageRegistry
 // and VideoModelRegistry: a plugin MUST link the host libvpipe shared so
 // it registers into THIS instance rather than forking a second one.
 class VaeModelRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static VaeModelRegistry& get() noexcept;
 
@@ -626,5 +703,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

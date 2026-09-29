@@ -44,8 +44,9 @@ namespace vpipe {
 //                                     `transformer/` DiT of `base_pipeline`.
 //   lora        (string, required) -- LoRA .safetensors file, or a dir/key
 //                                     containing exactly one .safetensors.
-//   output_name (string, required) -- result name -> <cwd>/models/<name>
-//                                     (registered), or an explicit "/.." path.
+//   output_name (string, required) -- result name -> models/<name> beside
+//                                     the session database (registered), or
+//                                     an explicit "/.." path.
 //   base_pipeline (string, optional) -- the base diffusers pipeline ROOT whose
 //                                     non-transformer components are copied next
 //                                     to the fused DiT -> a self-contained model.

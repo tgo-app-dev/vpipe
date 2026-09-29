@@ -1,4 +1,5 @@
 #include "generative-models/krea2/flow-sampler.h"
+#include "generative-models/spec-keys.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -48,29 +49,30 @@ xorshift64(std::uint64_t& s)
 FlexData
 FlowSchedulerSpec::to_flex() const
 {
+  namespace k = scheduler_spec;
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("scheduler", FlexData::make_string("flow_match"));
-  o.insert_or_assign("type", FlexData::make_string(type));
-  o.insert_or_assign("steps", FlexData::make_int(steps));
-  o.insert_or_assign("shift", FlexData::make_real(shift));
-  o.insert_or_assign("shift_type", FlexData::make_string(shift_type));
-  o.insert_or_assign("rho", FlexData::make_real(rho));
-  if (type == "boogu_v1") {
-    o.insert_or_assign("base_shift", FlexData::make_real(base_shift));
-    o.insert_or_assign("max_shift", FlexData::make_real(max_shift));
-    o.insert_or_assign("base_seq", FlexData::make_int(base_seq));
-    o.insert_or_assign("max_seq", FlexData::make_int(max_seq));
-    o.insert_or_assign("seq_len", FlexData::make_int(seq_len));
+  o.insert_or_assign(k::kScheduler, FlexData::make_string(k::kFlowMatch));
+  o.insert_or_assign(k::kType, FlexData::make_string(type));
+  o.insert_or_assign(k::kSteps, FlexData::make_int(steps));
+  o.insert_or_assign(k::kShift, FlexData::make_real(shift));
+  o.insert_or_assign(k::kShiftType, FlexData::make_string(shift_type));
+  o.insert_or_assign(k::kRho, FlexData::make_real(rho));
+  if (type == k::kBooguV1) {
+    o.insert_or_assign(k::kBaseShift, FlexData::make_real(base_shift));
+    o.insert_or_assign(k::kMaxShift, FlexData::make_real(max_shift));
+    o.insert_or_assign(k::kBaseSeq, FlexData::make_int(base_seq));
+    o.insert_or_assign(k::kMaxSeq, FlexData::make_int(max_seq));
+    o.insert_or_assign(k::kSeqLen, FlexData::make_int(seq_len));
   }
   if (dynamic_shift) {
-    o.insert_or_assign("dynamic_shift", FlexData::make_bool(true));
-    o.insert_or_assign("base_shift", FlexData::make_real(base_shift));
-    o.insert_or_assign("max_shift", FlexData::make_real(max_shift));
-    o.insert_or_assign("shift_terminal", FlexData::make_real(shift_terminal));
-    o.insert_or_assign("base_seq", FlexData::make_int(base_seq));
-    o.insert_or_assign("max_seq", FlexData::make_int(max_seq));
-    o.insert_or_assign("num_train", FlexData::make_int(num_train));
+    o.insert_or_assign(k::kDynamicShift, FlexData::make_bool(true));
+    o.insert_or_assign(k::kBaseShift, FlexData::make_real(base_shift));
+    o.insert_or_assign(k::kMaxShift, FlexData::make_real(max_shift));
+    o.insert_or_assign(k::kShiftTerminal, FlexData::make_real(shift_terminal));
+    o.insert_or_assign(k::kBaseSeq, FlexData::make_int(base_seq));
+    o.insert_or_assign(k::kMaxSeq, FlexData::make_int(max_seq));
+    o.insert_or_assign(k::kNumTrain, FlexData::make_int(num_train));
   }
   return fd;
 }
@@ -78,45 +80,46 @@ FlowSchedulerSpec::to_flex() const
 FlowSchedulerSpec
 FlowSchedulerSpec::from_flex(const FlexData& fd, std::string* err)
 {
+  namespace k = scheduler_spec;
   FlowSchedulerSpec s;
   if (!fd.is_object()) { return s; }
   auto o = fd.as_object();
-  if (o.contains("type")) {
-    s.type = std::string(o.at("type").as_string(s.type.c_str()));
+  if (o.contains(k::kType)) {
+    s.type = std::string(o.at(k::kType).as_string(s.type.c_str()));
   }
-  if (o.contains("steps")) { s.steps = (int)o.at("steps").as_int(s.steps); }
-  if (o.contains("shift")) { s.shift = o.at("shift").as_real(s.shift); }
-  if (o.contains("shift_type")) {
+  if (o.contains(k::kSteps)) { s.steps = (int)o.at(k::kSteps).as_int(s.steps); }
+  if (o.contains(k::kShift)) { s.shift = o.at(k::kShift).as_real(s.shift); }
+  if (o.contains(k::kShiftType)) {
     s.shift_type =
-        std::string(o.at("shift_type").as_string(s.shift_type.c_str()));
+        std::string(o.at(k::kShiftType).as_string(s.shift_type.c_str()));
   }
-  if (o.contains("rho")) { s.rho = o.at("rho").as_real(s.rho); }
-  if (o.contains("dynamic_shift")) {
-    s.dynamic_shift = o.at("dynamic_shift").as_bool(false);
+  if (o.contains(k::kRho)) { s.rho = o.at(k::kRho).as_real(s.rho); }
+  if (o.contains(k::kDynamicShift)) {
+    s.dynamic_shift = o.at(k::kDynamicShift).as_bool(false);
   }
-  if (o.contains("base_shift")) {
-    s.base_shift = o.at("base_shift").as_real(s.base_shift);
+  if (o.contains(k::kBaseShift)) {
+    s.base_shift = o.at(k::kBaseShift).as_real(s.base_shift);
   }
-  if (o.contains("max_shift")) {
-    s.max_shift = o.at("max_shift").as_real(s.max_shift);
+  if (o.contains(k::kMaxShift)) {
+    s.max_shift = o.at(k::kMaxShift).as_real(s.max_shift);
   }
-  if (o.contains("shift_terminal")) {
-    s.shift_terminal = o.at("shift_terminal").as_real(s.shift_terminal);
+  if (o.contains(k::kShiftTerminal)) {
+    s.shift_terminal = o.at(k::kShiftTerminal).as_real(s.shift_terminal);
   }
-  if (o.contains("base_seq")) {
-    s.base_seq = (int)o.at("base_seq").as_int(s.base_seq);
+  if (o.contains(k::kBaseSeq)) {
+    s.base_seq = (int)o.at(k::kBaseSeq).as_int(s.base_seq);
   }
-  if (o.contains("max_seq")) {
-    s.max_seq = (int)o.at("max_seq").as_int(s.max_seq);
+  if (o.contains(k::kMaxSeq)) {
+    s.max_seq = (int)o.at(k::kMaxSeq).as_int(s.max_seq);
   }
-  if (o.contains("num_train")) {
-    s.num_train = (int)o.at("num_train").as_int(s.num_train);
+  if (o.contains(k::kNumTrain)) {
+    s.num_train = (int)o.at(k::kNumTrain).as_int(s.num_train);
   }
-  if (o.contains("seq_len")) {
-    s.seq_len = (int)o.at("seq_len").as_int(s.seq_len);
+  if (o.contains(k::kSeqLen)) {
+    s.seq_len = (int)o.at(k::kSeqLen).as_int(s.seq_len);
   }
   if (s.steps < 1) { s.steps = 1; }
-  if (s.type == "boogu_v1") { return s; }
+  if (s.type == k::kBooguV1) { return s; }
   if (s.type != "simple" && s.type != "karras" && s.type != "exponential") {
     if (err != nullptr) {
       *err = "unknown scheduler type '" + s.type + "'; using 'simple'";
@@ -320,20 +323,21 @@ FlowSamplerSpec::canon_method(const std::string& m, bool* ok)
 FlexData
 FlowSamplerSpec::to_flex() const
 {
+  namespace k = sampler_spec;
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("sampler", FlexData::make_string("flow_match"));
-  o.insert_or_assign("method", FlexData::make_string(method));
-  o.insert_or_assign("eta", FlexData::make_real(eta));
-  o.insert_or_assign("s_noise", FlexData::make_real(s_noise));
-  o.insert_or_assign("seed", FlexData::make_int((std::int64_t)seed));
-  if (method == "dmd") {
-    o.insert_or_assign("conditioning_sigma",
+  o.insert_or_assign(k::kSampler, FlexData::make_string(k::kFlowMatch));
+  o.insert_or_assign(k::kMethod, FlexData::make_string(method));
+  o.insert_or_assign(k::kEta, FlexData::make_real(eta));
+  o.insert_or_assign(k::kSNoise, FlexData::make_real(s_noise));
+  o.insert_or_assign(k::kSeed, FlexData::make_int((std::int64_t)seed));
+  if (method == k::kDmd) {
+    o.insert_or_assign(k::kConditioningSigma,
                        FlexData::make_real(conditioning_sigma));
   }
-  if (method == "unipc") {
-    o.insert_or_assign("order", FlexData::make_int(order));
-    o.insert_or_assign("solver_type",
+  if (method == k::kUnipc) {
+    o.insert_or_assign(k::kOrder, FlexData::make_int(order));
+    o.insert_or_assign(k::kSolverType,
                        FlexData::make_string(solver_bh2 ? "bh2" : "bh1"));
   }
   return fd;
@@ -342,34 +346,37 @@ FlowSamplerSpec::to_flex() const
 FlowSamplerSpec
 FlowSamplerSpec::from_flex(const FlexData& fd, std::string* err)
 {
+  namespace k = sampler_spec;
   FlowSamplerSpec s;
   if (!fd.is_object()) { return s; }
   auto o = fd.as_object();
-  if (o.contains("method")) {
+  if (o.contains(k::kMethod)) {
     bool ok = true;
     s.method =
-        canon_method(std::string(o.at("method").as_string("euler")), &ok);
+        canon_method(std::string(o.at(k::kMethod).as_string("euler")), &ok);
     if (!ok && err != nullptr) {
       *err = "sampler method is not one this host implements; a "
              "registered family may still understand it, and the "
              "built-in samplers will run euler";
     }
   }
-  if (o.contains("eta")) { s.eta = o.at("eta").as_real(s.eta); }
-  if (o.contains("s_noise")) { s.s_noise = o.at("s_noise").as_real(s.s_noise); }
-  if (o.contains("seed")) {
-    s.seed = (std::uint64_t)o.at("seed").as_int((std::int64_t)s.seed);
+  if (o.contains(k::kEta)) { s.eta = o.at(k::kEta).as_real(s.eta); }
+  if (o.contains(k::kSNoise)) {
+    s.s_noise = o.at(k::kSNoise).as_real(s.s_noise);
   }
-  if (o.contains("conditioning_sigma")) {
+  if (o.contains(k::kSeed)) {
+    s.seed = (std::uint64_t)o.at(k::kSeed).as_int((std::int64_t)s.seed);
+  }
+  if (o.contains(k::kConditioningSigma)) {
     s.conditioning_sigma =
-        o.at("conditioning_sigma").as_real(s.conditioning_sigma);
+        o.at(k::kConditioningSigma).as_real(s.conditioning_sigma);
   }
-  if (o.contains("order")) {
-    s.order = (int)o.at("order").as_int(s.order);
+  if (o.contains(k::kOrder)) {
+    s.order = (int)o.at(k::kOrder).as_int(s.order);
     if (s.order < 1) { s.order = 1; }
   }
-  if (o.contains("solver_type")) {
-    s.solver_bh2 = std::string(o.at("solver_type").as_string("bh2")) != "bh1";
+  if (o.contains(k::kSolverType)) {
+    s.solver_bh2 = std::string(o.at(k::kSolverType).as_string("bh2")) != "bh1";
   }
   return s;
 }

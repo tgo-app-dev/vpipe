@@ -10,6 +10,7 @@ set(LOCAL_SOURCES
   pipeline.cc
   memory-plan.cc
   resource-plan.cc
+  runtime-context.cc
   stage-command.cc
   stage-config.cc
   stage-registry.cc

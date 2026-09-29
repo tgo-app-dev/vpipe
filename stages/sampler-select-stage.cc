@@ -1,4 +1,5 @@
 #include "stages/sampler-select-stage.h"
+#include "generative-models/spec-keys.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -110,18 +111,19 @@ SamplerSelectStage::resolved_spec() const
   // spec. The "sampler" discriminator lets a consumer tell this apart from a
   // diffusion-sampler-select beat (which tags itself "flow_match") -- both
   // travel as FlexDataPayload, so the port type alone can't catch a swap.
+  namespace k = genai::token_sampler_spec;
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("sampler", FlexData::make_string("token"));
-  o.insert_or_assign("temperature", FlexData::make_real(_temperature));
-  o.insert_or_assign("top_k", FlexData::make_int(_top_k));
-  o.insert_or_assign("top_p", FlexData::make_real(_top_p));
-  o.insert_or_assign("min_p", FlexData::make_real(_min_p));
-  o.insert_or_assign("repetition_penalty",
+  o.insert_or_assign(k::kSampler, FlexData::make_string(k::kToken));
+  o.insert_or_assign(k::kTemperature, FlexData::make_real(_temperature));
+  o.insert_or_assign(k::kTopK, FlexData::make_int(_top_k));
+  o.insert_or_assign(k::kTopP, FlexData::make_real(_top_p));
+  o.insert_or_assign(k::kMinP, FlexData::make_real(_min_p));
+  o.insert_or_assign(k::kRepetitionPenalty,
                      FlexData::make_real(_repetition_penalty));
-  o.insert_or_assign("presence_penalty",
+  o.insert_or_assign(k::kPresencePenalty,
                      FlexData::make_real(_presence_penalty));
-  o.insert_or_assign("seed", FlexData::make_uint(_seed));
+  o.insert_or_assign(k::kSeed, FlexData::make_uint(_seed));
   return fd;
 }
 

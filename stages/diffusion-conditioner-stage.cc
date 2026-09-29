@@ -1,4 +1,6 @@
 #include "stages/diffusion-conditioner-stage.h"
+#include "generative-models/gen-input.h"
+#include "common/beat-keys.h"
 #include <chrono>
 
 #include "apple-silicon/tensor-beat.h"
@@ -53,10 +55,10 @@ namespace {
 // legacy "always" / "never", which this stage's own doc still names);
 // the reference modes are the ctor's own three.
 constexpr SpecExtra kUnloadChoices[] = {
-  {"choices", "auto,destroy,park,keep"},
+  {spec_key::kChoices, "auto,destroy,park,keep"},
 };
 constexpr SpecExtra kReferenceModeChoices[] = {
-  {"choices", "auto,latch,per_beat"},
+  {spec_key::kChoices, "auto,latch,per_beat"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -79,14 +81,15 @@ const ConfigKey kAttrs[] = {
    .suggest_db_type = "dinov2"},
   {.key = "reference_mode", .type = ConfigType::String, .required = false,
    .doc = "how a reference image on the ref_image iports pairs with the "
-          "prompts. \"latch\" holds the FIRST picture for the whole run, "
-          "which is what an edit graph wants: one source image, many "
-          "instructions. \"per_beat\" reads a fresh picture for every "
-          "conditioning, which is what a RESTORATION graph wants: the "
-          "picture IS the input and changes every time, and latching it "
-          "would quietly restore a folder of images from the first one. "
-          "\"auto\" (default) is per_beat for a vision-only family and "
-          "latch for the rest",
+          "prompts. \"auto\" (the default) is the rule every input of this "
+          "stage follows: a picture whose source sends ONE beat and ends is "
+          "used for every prompt (one source image, many instructions), "
+          "and one that keeps sending is consumed a picture per "
+          "conditioning (a folder, each edited by the same instruction). "
+          "\"latch\" holds the FIRST picture for the whole run even from "
+          "a source that stays open -- a live input that will never end "
+          "its stream. \"per_beat\" wants a new picture for EVERY "
+          "conditioning and ends the run when they stop, even after one",
    .def_str = "auto", .extra = kReferenceModeChoices},
   {.key = "grounded_negative", .type = ConfigType::Bool, .required = false,
    .doc = "image-aware families only: always emit a negative conditioning on "
@@ -146,8 +149,20 @@ const PortSpec kIports[] = {
           "own numbers apply",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
+  {.name = "ref_images",
+   .doc = "OPTIONAL reference images as ONE LIST (load-image's `images`): "
+          "as many as the graph has, each in ref_image's format and at its "
+          "own size. They follow whatever is on ref_image / ref_image2, in "
+          "list order, and an image-aware family sees them all -- one that "
+          "takes fewer uses the first and says so. Pair it with vae-encode's "
+          "`images` from the same list so the latents line up",
+   .type = &typeid(TensorListPayload),
+   .tags = "rgb-frames-list", .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelCfgPort = 5;
+// The reference LIST, after every older port so a graph written before it
+// keeps its port numbers.
+[[maybe_unused]] constexpr unsigned kRefListPort = 6;
 const PortSpec kOports[] = {
   {.name = "conditioning",
    .doc = "conditioning tensor for the generate-image DiT (family-shaped + typed: "
@@ -170,7 +185,11 @@ const StageSpec kSpec = {
                "prompt (and, for an edit, the source image) is first screened "
                "by the model's own content-policy classifier -- mandatory, no "
                "config key; a refused prompt yields a blank image instead of "
-               "a generation.",
+               "a generation. Inputs pair the way generate-image's do: one "
+               "beat and the end of its stream serves every conditioning, a "
+               "stream that keeps sending is consumed a beat per "
+               "conditioning -- so one prompt over a folder of pictures "
+               "conditions each picture.",
   .display_name = "Diffusion Conditioner",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -803,7 +822,9 @@ std::string flex_text_(const FlexData& fd)
   if (fd.is_string()) { return std::string(fd.as_string("")); }
   if (fd.is_object()) {
     auto o = fd.as_object();
-    if (o.contains("text")) { return std::string(o.at("text").as_string("")); }
+    if (o.contains(beat::kText)) {
+      return std::string(o.at(beat::kText).as_string(""));
+    }
   }
   return "";
 }
@@ -825,16 +846,19 @@ DiffusionConditionerStage::DiffusionConditionerStage(
   _venc_dir  = attr_str("encoder_dir");
   _grounded_negative = attr_bool("grounded_negative");
   {
+    using Mode = GenerationInput::Mode;
     const std::string rm = attr_str("reference_mode");
-    if (rm == "latch")         { _ref_mode = RefMode::kLatch; }
-    else if (rm == "per_beat") { _ref_mode = RefMode::kPerBeat; }
-    else if (rm.empty() || rm == "auto") { _ref_mode = RefMode::kAuto; }
+    if (rm == "latch")         { _ref_mode = Mode::kLatch; }
+    else if (rm == "per_beat") { _ref_mode = Mode::kFresh; }
+    else if (rm.empty() || rm == "auto") { _ref_mode = Mode::kAuto; }
     else {
       // Deferred-validated config: warn and take the default.
       session()->warn(fmt(
           "DiffusionConditionerStage('{}'): reference_mode '{}' is not "
           "auto|latch|per_beat; using auto", this->id(), rm));
     }
+    for (GenerationInput& in : _ref_port_in) { in.set_mode(_ref_mode); }
+    _ref_list_in.set_mode(_ref_mode);
   }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
@@ -1241,20 +1265,29 @@ DiffusionConditionerStage::reset_run_state()
   // re-emitted beat is never latched and this stage keeps the previous
   // run's selection.
   _model_latched    = false;
-  _cfg_latched      = false;
   _model_cfg        = FlexData{};
-  _negative_latched = false;
+  // Every generation input starts over, and so does what it held: a
+  // relaunched graph with no negative wired must not inherit the last
+  // run's negative prompt.
+  _cfg_in.reset();
+  _prompt_in.reset();
+  _prompt.clear();
+  _negative_in.reset();
+  _negative_prompt.clear();
   // Re-decided next launch: peers may differ.
   _unload_resolved  = false;
-  // Same for the cached reference images: `_ref_rgb[i]` non-empty makes
-  // the iport3/iport4 read conditional, so a relaunch would never
-  // consume the new reference and would re-encode the previous run's
-  // picture instead.
-  for (int i = 0; i < kMaxRefs; ++i) {
-    _ref_rgb[i].clear();
-    _ref_rgb_h[i] = 0;
-    _ref_rgb_w[i] = 0;
+  // Same for the cached reference images: a latched input is not read
+  // again, so a relaunch would never consume the new reference and would
+  // re-encode the previous run's picture instead.
+  for (int i = 0; i < kRefPorts; ++i) {
+    _ref_port[i] = RefImage{};
+    _ref_port_in[i].reset();
   }
+  _ref_list.clear();
+  _ref_list_in.reset();
+  _ref_rgb.clear();
+  _ref_rgb_h.clear();
+  _ref_rgb_w.clear();
   _n_ref = 0;
 
 }
@@ -2004,10 +2037,10 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
 {
   n_img = 0;
   _img_n = 0;
-  for (int i = 0; i < kMaxRefs; ++i) {
-    _img_mh[i] = 0; _img_mw[i] = 0; _img_tok[i] = 0;
-  }
-  if (_n_ref <= 0 || _ref_rgb[0].empty()) { return {}; }
+  _img_mh.assign((std::size_t)std::max(_n_ref, 0), 0);
+  _img_mw.assign((std::size_t)std::max(_n_ref, 0), 0);
+  _img_tok.assign((std::size_t)std::max(_n_ref, 0), 0);
+  if (_n_ref <= 0 || _ref_rgb.empty() || _ref_rgb[0].empty()) { return {}; }
 
   // Qwen-Image-Edit: Qwen2.5-VL tower -> bf16 [n_img_total, 3584]. QIE-2511 is
   // a MULTI-reference edit model, so every wired picture is encoded and the
@@ -2451,7 +2484,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
     std::vector<std::pair<int, int>> runs;
     if (nref > 0) {
-      runs = expand_pads_(ids, pad_id, _img_tok, nref);
+      runs = expand_pads_(ids, pad_id, _img_tok.data(), nref);
     }
     if ((int)ids.size() <= drop) { return {}; }
     const int n = (int)ids.size();
@@ -2552,7 +2585,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         text + std::string(kBooguSuffix);
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
     std::vector<std::pair<int, int>> runs;
-    if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok, nref); }
+    if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok.data(), nref); }
     if (ids.empty()) { return {}; }
     const int n = (int)ids.size();
     SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
@@ -2616,9 +2649,11 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     // normal 2-D mROPE grid (t=base, h=base+row, w=base+col; text resumes at
     // base + max(mh,mw)) -- NOT Mage-Flow's flat arange override. Each
     // reference gets its OWN band.
-    const bool use_mrope = grounded && !runs.empty() && _img_mw[0] > 0;
+    const bool use_mrope = grounded && !runs.empty() && img_mw_(0) > 0;
     std::vector<std::int32_t> pos;
-    if (use_mrope) { pos = mrope_positions_(n, runs, _img_mh, _img_mw); }
+    if (use_mrope) {
+      pos = mrope_positions_(n, runs, _img_mh.data(), _img_mw.data());
+    }
     genai::ContextManager* cm = _encoder->context_manager();
     const genai::ContextId cid = cm->acquire_root();
     SharedBuffer taps;
@@ -2779,7 +2814,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
       return {};
     }
     std::vector<std::pair<int, int>> runs;
-    if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok, nref); }
+    if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok.data(), nref); }
     const int n = (int)ids.size();
     SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
     if (x.empty()) { return {}; }
@@ -2834,9 +2869,11 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         }
       }
     }
-    const bool use_mrope = grounded && !runs.empty() && _img_mw[0] > 0;
+    const bool use_mrope = grounded && !runs.empty() && img_mw_(0) > 0;
     std::vector<std::int32_t> pos;
-    if (use_mrope) { pos = mrope_positions_(n, runs, _img_mh, _img_mw); }
+    if (use_mrope) {
+      pos = mrope_positions_(n, runs, _img_mh.data(), _img_mw.data());
+    }
     genai::ContextManager* cm = _encoder->context_manager();
     const genai::ContextId cid = cm->acquire_root();
     SharedBuffer taps;
@@ -2880,9 +2917,11 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     // because one resize feeds both the tower and the VAE. See
     // GroundedEncodeParams::for_family.
     _qi21_nref = nref;
-    for (int i = 0; i < nref && i < kMaxRefs; ++i) {
-      _qi21_grid_h[i] = _img_mh[i] * 2;
-      _qi21_grid_w[i] = _img_mw[i] * 2;
+    _qi21_grid_h.assign((std::size_t)std::max(nref, 0), 0);
+    _qi21_grid_w.assign((std::size_t)std::max(nref, 0), 0);
+    for (int i = 0; i < nref && i < (int)_img_mh.size(); ++i) {
+      _qi21_grid_h[(std::size_t)i] = _img_mh[(std::size_t)i] * 2;
+      _qi21_grid_w[(std::size_t)i] = _img_mw[(std::size_t)i] * 2;
     }
     n_real_out = keep;
     session()->log_debug(fmt(
@@ -2929,7 +2968,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                   : c_::text(_profile, c_::kPromptSuffix, kSuffix));
     std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
     std::vector<std::pair<int, int>> runs;
-    if (grounded) { runs = expand_pads_(ids, pad_id, _img_tok, _img_n); }
+    if (grounded) { runs = expand_pads_(ids, pad_id, _img_tok.data(), _img_n); }
     if ((int)ids.size() <= drop) { return {}; }
     const int n = (int)ids.size();
     const int n_real = n - drop;
@@ -3126,7 +3165,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
   // positions and the grounded conditioning collapses (image tokens diverge
   // from the reference). Sequential path kept for the text-only case.
   const bool use_mrope = img_aware && first_pad >= 0
-                         && _img_mh[0] > 0 && _img_mw[0] > 0;
+                         && img_mh_(0) > 0 && img_mw_(0) > 0;
   std::vector<std::int32_t> pos;
   if (use_mrope) {
     pos.assign((std::size_t)3 * n, 0);
@@ -3136,10 +3175,10 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         const int base = cur;
         for (int j = 0; j < n_img && i < n; ++j, ++i) {
           pos[(std::size_t)i] = base;                          // T
-          pos[(std::size_t)n + i] = base + j / _img_mw[0];     // H
-          pos[(std::size_t)2 * n + i] = base + j % _img_mw[0]; // W
+          pos[(std::size_t)n + i] = base + j / img_mw_(0);     // H
+          pos[(std::size_t)2 * n + i] = base + j % img_mw_(0); // W
         }
-        cur = base + std::max(_img_mh[0], _img_mw[0]);
+        cur = base + std::max(img_mh_(0), img_mw_(0));
       } else {
         pos[(std::size_t)i] = cur;
         pos[(std::size_t)n + i] = cur;
@@ -3226,7 +3265,8 @@ blocked_beat_(int enc_hidden)
   out->resize_contiguous((std::size_t)enc_hidden);
   std::memset(out->as_u8(), 0, (std::size_t)enc_hidden * 2);
   FlexData sb = FlexData::make_object();
-  sb.as_object().insert_or_assign("content_blocked", FlexData::make_bool(true));
+  sb.as_object().insert_or_assign(sideband::kContentBlocked,
+                                  FlexData::make_bool(true));
   out->sideband = std::move(sb);
   return out;
 }
@@ -3235,20 +3275,89 @@ genai::MageScreenVerdict
 DiffusionConditionerStage::screen_(const std::string& prompt,
                                    const SharedBuffer& vtok, int n_img) const
 {
-  genai::MageScreenRequest req;
-  req.prompt = prompt;
-  if (n_img > 0 && !vtok.empty()) {
-    req.vision = &vtok;
-    req.n_img  = n_img;
-    // The content screen judges the source picture(s) as one block; with
-    // several references the grids differ, so pass the FIRST (the screen only
-    // needs a consistent 2-D band, and Mage-Flow's own screen path is
-    // single-image).
-    req.img_mh = _img_mh[0];
-    req.img_mw = _img_mw[0];
-    for (const auto& f : _ds_feats) { req.deepstack.push_back(&f); }
+  // TEXT ONLY: the text-to-image policy, once.
+  if (n_img <= 0 || vtok.empty() || _img_n <= 0) {
+    genai::MageScreenRequest req;
+    req.prompt = prompt;
+    return genai::mage_screen(*_encoder, *_tokenizer, req, session());
   }
-  return genai::mage_screen(*_encoder, *_tokenizer, req, session());
+
+  // ONE PASS PER REFERENCE, each with its own picture: its rows of the
+  // tower output, its own merged grid and its own deepstack rows, with
+  // the instruction every time -- and the prompt is blocked if ANY pass
+  // blocks. The classifier judges ONE source image per turn (the
+  // reference screen builds a single image item), so this is the policy
+  // applied to every picture rather than a new one, and a picture in the
+  // second slot cannot pass unscreened. Packing every reference into one
+  // image block under the FIRST reference's grid is what this replaced:
+  // the token count no longer matched the grid, the position build
+  // failed, and every multi-reference prompt was refused.
+  //
+  // The rows are COPIED into a buffer per pass: the screen reads a
+  // buffer from its first row, and a pass costs one reference's rows
+  // (a few MB) once per prompt.
+  metal_compute::MetalCompute* mc =
+      session() != nullptr ? session()->services()->metal_compute() : nullptr;
+  const std::size_t row_bytes = (std::size_t)_enc_hidden * 2;
+  auto slice = [&](const SharedBuffer& src, std::size_t row0, int rows) {
+    SharedBuffer b;
+    if (mc == nullptr || rows <= 0 ||
+        src.byte_size() < (row0 + (std::size_t)rows) * row_bytes) {
+      return b;
+    }
+    b = mc->make_shared_buffer((std::size_t)rows * row_bytes);
+    if (!b.empty()) {
+      std::memcpy(b.contents(),
+                  static_cast<const std::uint8_t*>(src.contents()) +
+                      row0 * row_bytes,
+                  (std::size_t)rows * row_bytes);
+    }
+    return b;
+  };
+
+  genai::MageScreenVerdict last;
+  std::size_t row0 = 0;
+  for (int i = 0; i < _img_n; ++i) {
+    const int tok = i < (int)_img_tok.size() ? _img_tok[(std::size_t)i] : 0;
+    SharedBuffer v = slice(vtok, row0, tok);
+    std::vector<SharedBuffer> ds;
+    bool ok = !v.empty() && row0 + (std::size_t)tok <= (std::size_t)n_img;
+    for (const SharedBuffer& f : _ds_feats) {
+      if (!ok) { break; }
+      ds.push_back(slice(f, row0, tok));
+      ok = !ds.back().empty();
+    }
+    if (!ok) {
+      // FAIL-CLOSED, like every other failure the screen can have.
+      genai::MageScreenVerdict blocked;
+      blocked.reason = "reference " + std::to_string(i) +
+                       " could not be prepared for the screen";
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): mage_screen: {}; BLOCKING "
+          "(fail-closed)", this->id(), blocked.reason));
+      return blocked;
+    }
+    genai::MageScreenRequest req;
+    req.prompt = prompt;
+    req.vision = &v;
+    req.n_img  = tok;
+    req.img_mh = img_mh_((std::size_t)i);
+    req.img_mw = img_mw_((std::size_t)i);
+    for (const SharedBuffer& f : ds) { req.deepstack.push_back(&f); }
+    genai::MageScreenVerdict verdict =
+        genai::mage_screen(*_encoder, *_tokenizer, req, session());
+    if (verdict.violates) {
+      if (_img_n > 1) {
+        session()->log_debug(fmt(
+            "DiffusionConditionerStage('{}'): mage_screen blocked on "
+            "reference {} of {}", this->id(), i, _img_n));
+      }
+      return verdict;
+    }
+    last = std::move(verdict);
+    row0 += (std::size_t)tok;
+  }
+  return last;
 }
 
 // The ref_image iports: the first is iport3, the second iport4.
@@ -3324,19 +3433,27 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr) { co_return; }
 
-  // The model config. Latched, but RE-READ whenever another beat is
-  // waiting: a config source with no trigger emits once for the whole
-  // run, while a trigger-driven one emits per request. Blocking on the
-  // first beat and polling after serves both -- the first prompt waits
-  // for the parameters it was wired to use, later ones pick up a change
-  // without waiting for one that may never come. Unlike the DiT's, every
-  // parameter here is read per encode, so a late change simply applies.
+  // ONE CALL, ONE CONDITIONING. The prompt, the negative, the reference
+  // pictures and the model config are generation inputs, paired by the
+  // rule in stages/generation-input.h -- the one generate-image pairs its
+  // own inputs by, so the conditioning it receives and the latent it
+  // denoises against come from the same beats. One beat and the end of
+  // its stream serves every conditioning of the run; a stream that keeps
+  // sending is consumed a beat per conditioning.
+  using Took = GenerationInput::Took;
+  GenerationRound round;
+
+  // The model config: a source with no trigger emits once and ends, so
+  // its beat serves the whole run, while a trigger-driven one emits a
+  // beat per request. Every parameter here is read per encode, so a new
+  // beat simply applies.
   if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
-      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+      _cfg_in.wants()) {
     auto gb = co_await ctx.read(kModelCfgPort);
-    _cfg_latched = true;
-    if (const auto* gfd =
-            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+    const Took took = _cfg_in.took(gb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* gfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
       _model_cfg = gfd->data;
       // Only once the family is known; otherwise ensure_loaded_ applies
       // it at the moment it becomes known.
@@ -3396,94 +3513,148 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // Latch the negative prompt (iport1) + reference image (iport3) once.
-  if (!_negative_latched && (int)ctx.num_iports() > 1 &&
-      ctx.iport_connected(1)) {
+  // The negative prompt (iport1).
+  if ((int)ctx.num_iports() > 1 && ctx.iport_connected(1) &&
+      _negative_in.wants()) {
     auto nb = co_await ctx.read(1);
-    if (const auto* fp = nb ? dynamic_cast<const FlexDataPayload*>(nb.get())
-                            : nullptr) {
+    const Took took = _negative_in.took(nb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* fp = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(nb.get()) : nullptr) {
       _negative_prompt = flex_text_(fp->data);
     }
-    _negative_latched = true;
   }
-  // Reference images latch independently on iport3 / iport4, then compact to a
-  // contiguous [0, _n_ref) run so "reference i" always means the i-th picture
-  // the VLM sees even if only the second port was wired.
-  // LATCHED, unless the graph said the picture changes per beat. An edit
-  // graph sends one source image and many instructions, so holding the
-  // first is right and re-reading would block forever. A graph that
-  // sends a picture WITH every prompt is the opposite case, and the two
-  // cannot share a default -- see the `reference_mode` config key.
-  const bool ref_fresh = ref_per_beat_();
-  for (int i = 0; i < kMaxRefs; ++i) {
+  // Reference images on iport3 / iport4 and the LIST on iport6, each a
+  // generation input in `reference_mode`, then packed into one run -- the
+  // two ports first, then the list -- so "reference i" always means the
+  // i-th picture the VLM sees even if only the second port was wired. An
+  // edit graph sends one source image and many instructions, and it is
+  // held; a folder sends a picture per conditioning, and each is used
+  // once.
+  // One picture into `dst` (empty for anything that is not one).
+  auto take_picture = [&](const TensorBeat& tb, RefImage& dst,
+                          const std::string& what) {
+    dst = RefImage{};
+    if (tb.dtype != TensorBeat::DType::U8 || tb.shape.size() != 3 ||
+        (tb.shape[0] != 3 && tb.shape[0] != 4)) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): {} must be a planar U8 RGB or "
+          "RGBA picture; ignoring it", this->id(), what));
+      return;
+    }
+    const auto bytes = tb.materialize_contiguous();
+    const int rh = (int)tb.shape[1], rw = (int)tb.shape[2];
+    if (tb.shape[0] == 4) {
+      // THE VISION TOWER TAKES RGB, so an RGBA reference is
+      // COMPOSITED OVER WHITE here -- and only here. The VAE
+      // encoder alongside reads the same file at four channels,
+      // which is the split Qwen-Image-2.1 needs: the tower sees a
+      // picture, the latent keeps the transparency.
+      //
+      // Over white rather than truncated for the reason save-image
+      // composites: under a transparent pixel the stored colour is
+      // arbitrary, and on a generated RGBA image it is usually
+      // black, so a truncation would show the tower a dark halo
+      // that is not in the picture.
+      const std::size_t hw = (std::size_t)rh * rw;
+      std::vector<std::uint8_t> flat(3 * hw);
+      for (std::size_t px = 0; px < hw; ++px) {
+        const int a = bytes[3 * hw + px];
+        for (int c = 0; c < 3; ++c) {
+          flat[(std::size_t)c * hw + px] = (std::uint8_t)(
+              (bytes[(std::size_t)c * hw + px] * a + 255 * (255 - a) +
+               127) / 255);
+        }
+      }
+      dst.rgb = std::move(flat);
+      session()->log_debug(fmt(
+          "DiffusionConditionerStage('{}'): {} arrived RGBA; composited "
+          "over white for the vision tower", this->id(), what));
+    } else {
+      dst.rgb.assign(bytes.begin(), bytes.end());
+    }
+    dst.h = rh;
+    dst.w = rw;
+  };
+  bool refs_changed = false;
+  for (int i = 0; i < kRefPorts; ++i) {
     const unsigned port = 3u + (unsigned)i;
-    if (!_ref_rgb[i].empty() && !ref_fresh) { continue; }
-    if ((int)ctx.num_iports() <= (int)port || !ctx.iport_connected(port)) {
+    if ((int)ctx.num_iports() <= (int)port || !ctx.iport_connected(port) ||
+        !_ref_port_in[i].wants()) {
       continue;
     }
+    // COUNTED whatever arrives -- a bad beat too -- so a malformed
+    // picture costs its own conditioning a reference, not the pairing of
+    // every later one.
     auto rb = co_await ctx.read(port);
+    const Took took = _ref_port_in[i].took(rb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took != Took::kFresh) { continue; }      // held, or never sent
+    _ref_port[i] = RefImage{};
+    refs_changed = true;
     const auto* tb = rb ? dynamic_cast<const TensorBeatPayload*>(rb.get())
                         : nullptr;
-    if (tb != nullptr && tb->dtype == TensorBeat::DType::U8 &&
-        tb->shape.size() == 3 &&
-        (tb->shape[0] == 3 || tb->shape[0] == 4)) {
-      const auto bytes = tb->materialize_contiguous();
-      const int rh = (int)tb->shape[1], rw = (int)tb->shape[2];
-      if (tb->shape[0] == 4) {
-        // THE VISION TOWER TAKES RGB, so an RGBA reference is
-        // COMPOSITED OVER WHITE here -- and only here. The VAE
-        // encoder alongside reads the same file at four channels,
-        // which is the split Qwen-Image-2.1 needs: the tower sees a
-        // picture, the latent keeps the transparency.
-        //
-        // Over white rather than truncated for the reason save-image
-        // composites: under a transparent pixel the stored colour is
-        // arbitrary, and on a generated RGBA image it is usually
-        // black, so a truncation would show the tower a dark halo
-        // that is not in the picture.
-        const std::size_t hw = (std::size_t)rh * rw;
-        std::vector<std::uint8_t> flat(3 * hw);
-        for (std::size_t px = 0; px < hw; ++px) {
-          const int a = bytes[3 * hw + px];
-          for (int c = 0; c < 3; ++c) {
-            flat[(std::size_t)c * hw + px] = (std::uint8_t)(
-                (bytes[(std::size_t)c * hw + px] * a + 255 * (255 - a) +
-                 127) / 255);
-          }
-        }
-        _ref_rgb[i] = std::move(flat);
-        session()->log_debug(fmt(
-            "DiffusionConditionerStage('{}'): reference {} arrived RGBA; "
-            "composited over white for the vision tower", this->id(), i));
-      } else {
-        _ref_rgb[i].assign(bytes.begin(), bytes.end());
-      }
-      _ref_rgb_h[i] = rh;
-      _ref_rgb_w[i] = rw;
+    if (tb != nullptr) {
+      take_picture(*tb, _ref_port[i], i == 0 ? "ref_image" : "ref_image2");
     }
   }
-  {
-    int w = 0;
-    for (int i = 0; i < kMaxRefs; ++i) {
-      if (_ref_rgb[i].empty()) { continue; }
-      if (w != i) {
-        _ref_rgb[w] = std::move(_ref_rgb[i]);
-        _ref_rgb_h[w] = _ref_rgb_h[i]; _ref_rgb_w[w] = _ref_rgb_w[i];
-        _ref_rgb[i].clear();
-      }
-      ++w;
+  if ((int)ctx.num_iports() > (int)kRefListPort &&
+      ctx.iport_connected(kRefListPort) && _ref_list_in.wants()) {
+    auto rb = co_await ctx.read(kRefListPort);
+    const Took took = _ref_list_in.took(rb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took == Took::kFresh) {
+      _ref_list.clear();
+      refs_changed = true;
     }
-    _n_ref = w;
+    if (const auto* lp = took == Took::kFresh
+            ? dynamic_cast<const TensorListPayload*>(rb.get()) : nullptr) {
+      for (std::size_t i = 0; i < lp->items.size(); ++i) {
+        RefImage one;
+        take_picture(lp->items[i], one,
+                     "ref_images[" + std::to_string(i) + "]");
+        if (!one.empty()) { _ref_list.push_back(std::move(one)); }
+      }
+    } else if (took == Took::kFresh) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): ref_images must be a list of "
+          "pictures; got {}, ignoring", this->id(), rb->describe()));
+    }
+  }
+  if (refs_changed) {
+    _ref_rgb.clear();
+    _ref_rgb_h.clear();
+    _ref_rgb_w.clear();
+    auto add = [&](const RefImage& r) {
+      if (r.empty()) { return; }
+      _ref_rgb.push_back(r.rgb);
+      _ref_rgb_h.push_back(r.h);
+      _ref_rgb_w.push_back(r.w);
+    };
+    for (const RefImage& r : _ref_port) { add(r); }
+    for (const RefImage& r : _ref_list) { add(r); }
+    _n_ref = (int)_ref_rgb.size();
   }
 
-  // Read the prompt (iport0). A null beat means the upstream source is
-  // exhausted: signal done so the runtime tears the stage down instead of
-  // re-invoking process() in a tight EOF-read loop.
-  auto pb = co_await ctx.read(0);
-  if (!pb) { ctx.signal_done(); co_return; }
-  const auto* fp = dynamic_cast<const FlexDataPayload*>(pb.get());
-  if (fp == nullptr) { co_return; }
-  const std::string prompt = flex_text_(fp->data);
+  // The prompt (iport0). No prompt at all ends the run -- signalled, so
+  // the runtime tears the stage down instead of re-invoking process() in
+  // a tight end-of-stream loop.
+  if (_prompt_in.wants()) {
+    auto pb = co_await ctx.read(0);
+    const Took took = _prompt_in.took(pb != nullptr);
+    if (round.note(took) || took == Took::kNone) {
+      ctx.signal_done();
+      co_return;
+    }
+    if (took == Took::kFresh) {
+      const auto* fp = dynamic_cast<const FlexDataPayload*>(pb.get());
+      _prompt = fp != nullptr ? flex_text_(fp->data) : std::string();
+    }
+  }
+  // Nothing new on any input: everything is broadcasting, and this
+  // conditioning would repeat the last one exactly.
+  if (round.idle()) { ctx.signal_done(); co_return; }
+  const std::string prompt = _prompt;
   if (prompt.empty()) { co_return; }
 
   // ONLY NOW is the encoder worth having again.
@@ -3604,20 +3775,21 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
           a.push_back(FlexData::make_int(v != 0 ? 1 : 0));
         }
       }
-      o.insert_or_assign("img_slots", std::move(slots));
+      o.insert_or_assign(genai::cond_sideband::kImgSlots, std::move(slots));
       // Per reference, the DiT's LATENT grid -- twice the tower's
       // merged grid, because one slot is a 2x2 group of latent tokens.
       FlexData gh = FlexData::make_array(), gw = FlexData::make_array();
       {
         auto ah = gh.as_array();
         auto aw = gw.as_array();
-        for (int i = 0; i < _qi21_nref && i < kMaxRefs; ++i) {
-          ah.push_back(FlexData::make_int(_qi21_grid_h[i]));
-          aw.push_back(FlexData::make_int(_qi21_grid_w[i]));
+        for (int i = 0; i < _qi21_nref && i < (int)_qi21_grid_h.size();
+             ++i) {
+          ah.push_back(FlexData::make_int(_qi21_grid_h[(std::size_t)i]));
+          aw.push_back(FlexData::make_int(_qi21_grid_w[(std::size_t)i]));
         }
       }
-      o.insert_or_assign("ref_grid_h", std::move(gh));
-      o.insert_or_assign("ref_grid_w", std::move(gw));
+      o.insert_or_assign(genai::cond_sideband::kRefGridH, std::move(gh));
+      o.insert_or_assign(genai::cond_sideband::kRefGridW, std::move(gw));
       beat->sideband = std::move(sb);
     }
     // Opt-in trace of the conditioning ITSELF. Two prompts that produce

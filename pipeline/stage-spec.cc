@@ -1,5 +1,7 @@
 #include "pipeline/stage-spec.h"
 
+#include "common/abi-struct.h"
+
 #include <vector>
 
 namespace vpipe {
@@ -94,10 +96,17 @@ stage_category_name(StageCategory c) noexcept
 const CommandSpec*
 find_command(const StageSpec& spec, std::string_view name) noexcept
 {
-  for (const CommandSpec& c : spec.commands) {
+  for (const CommandSpec& c : spec_commands(spec)) {
     if (c.name == name) { return &c; }
   }
   return nullptr;
+}
+
+std::span<const CommandSpec>
+spec_commands(const StageSpec& spec) noexcept
+{
+  if (!abi_has(spec, &StageSpec::commands)) { return {}; }
+  return spec.commands;
 }
 
 }

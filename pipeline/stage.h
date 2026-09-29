@@ -21,11 +21,16 @@
 #include <typeinfo>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 enum class StageTypeId : unsigned { unknown = 0 };
 
 class CommandInbox;
+class StageState;
 class Job;
 class RuntimeContext;
 class StageLifecycleAccess;
@@ -40,7 +45,7 @@ public:
   Stage(const SessionContextIntf*, std::string id,
         std::vector<InEdge> iports,
         FlexData config = FlexData::make_object());
-  ~Stage() override = default;
+  ~Stage() override;
 
   // Numeric type id assigned at static init by TypedStage; unique
   // in the running process but NOT stable across runs / builds.
@@ -358,7 +363,7 @@ public:
   // constructed with. Public so pipeline serialization can
   // round-trip a stage's config back into the spec; derived
   // stages also use it from their ctor bodies.
-  const FlexData& config() const noexcept { return _config; }
+  const FlexData& config() const noexcept;
 
   // ---- Stage specification ------------------------------------
   //
@@ -404,7 +409,7 @@ public:
   // skipped (its initialize() and process() never run), while the rest
   // of the pipeline launches normally. Empty => the configuration is
   // valid.
-  const std::string& config_error() const noexcept { return _config_error; }
+  const std::string& config_error() const noexcept;
 
   // ---- Lifecycle state (driven by PipelineRuntime) ------------
   //
@@ -413,10 +418,7 @@ public:
   // driver has drained. Topology edits to a running stage are unsafe
   // (the edge buffers are frozen at launch), so Graph::move_iport_to
   // refuses them via Pipeline::can_move_iport.
-  bool running() const noexcept
-  {
-    return _running.load(std::memory_order_acquire);
-  }
+  bool running() const noexcept;
 
   // True when this stage's wiring changed since it was last
   // initialized -- i.e. an iport was moved (Pipeline::on_iport_moved)
@@ -425,10 +427,7 @@ public:
   // runtime clears it once initialize() runs against the new
   // topology. A freshly constructed stage reports false (its initial
   // wiring is its ctor wiring).
-  bool needs_init() const noexcept
-  {
-    return _needs_init.load(std::memory_order_acquire);
-  }
+  bool needs_init() const noexcept;
 
   // The stage's command inbox while its pipeline runs -- from launch
   // until stop, and only when spec().commands is non-empty; null
@@ -532,19 +531,24 @@ private:
   // Fetch the raw config value for `key` into `out`; true iff present.
   bool attr_present_(std::string_view key, FlexData& out) const;
 
-  // Set by the runtime for the span of a launch; null otherwise. Atomic
-  // because a revision comes from the stage's own thread while stop() may
-  // be clearing it from another.
-  std::atomic<MemoryPlanSink*> _mem_sink{nullptr};
+  // EVERYTHING a Stage keeps for itself, behind one pointer. A plugin's
+  // stage derives from this class, so its members sit after Stage's: a
+  // field added HERE would move every one of them. Behind the pointer,
+  // the host can grow its bookkeeping without moving a plugin's layout.
+  std::unique_ptr<StageState> _st;
 
-  FlexData          _config;
-  std::string       _config_error;
-  std::atomic<bool> _running{false};
-  std::atomic<bool> _needs_init{false};
-  // Set and cleared by the runtime (StageLifecycleAccess) while callers
-  // on other threads read it, hence the lock.
-  mutable std::mutex            _inbox_mu;
-  std::shared_ptr<CommandInbox> _inbox;
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 using StagePtr = std::unique_ptr<Stage>;
@@ -570,5 +574,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

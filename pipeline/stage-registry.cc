@@ -29,6 +29,7 @@ StageRegistry::register_type(string_view type_name, Factory f)
   unsigned id = static_cast<unsigned>(_entries.size()) + 1;
   StageTypeId tid = static_cast<StageTypeId>(id);
   _entries.push_back(Entry{string(type_name), f});
+  _entries.back().pending = _quarantine;
   _by_name.emplace(_entries.back().name, tid);
   return tid;
 }
@@ -38,7 +39,8 @@ StageRegistry::find_id(string_view type_name) const noexcept
 {
   lock_guard<mutex> lk(_mu);
   auto it = _by_name.find(type_name);
-  if (it == _by_name.end()) {
+  if (it == _by_name.end() ||
+      !visible_(static_cast<unsigned>(it->second))) {
     return StageTypeId::unknown;
   }
   return it->second;
@@ -51,7 +53,9 @@ StageRegistry::set_spec(string_view type_name,
   lock_guard<mutex> lk(_mu);
   // First registration sticks (mirrors register_type's duplicate
   // handling); a second include of the same stage is a no-op.
-  _specs.emplace(string(type_name), spec);
+  if (_specs.emplace(string(type_name), spec).second && _quarantine) {
+    _quarantined_specs.emplace_back(type_name);
+  }
 }
 
 const StageSpec*
@@ -59,7 +63,18 @@ StageRegistry::spec(string_view type_name) const noexcept
 {
   lock_guard<mutex> lk(_mu);
   auto it = _specs.find(type_name);
-  return it == _specs.end() ? nullptr : it->second;
+  if (it == _specs.end()) { return nullptr; }
+  // A spec whose type is still pending is pending with it.
+  auto t = _by_name.find(type_name);
+  if (t != _by_name.end() && !visible_(static_cast<unsigned>(t->second))) {
+    return nullptr;
+  }
+  if (_quarantine) {
+    for (const string& q : _quarantined_specs) {
+      if (q == type_name) { return nullptr; }
+    }
+  }
+  return it->second;
 }
 
 string_view
@@ -67,7 +82,7 @@ StageRegistry::find_name(StageTypeId tid) const noexcept
 {
   lock_guard<mutex> lk(_mu);
   unsigned id = static_cast<unsigned>(tid);
-  if (id == 0 || id > _entries.size()) {
+  if (!visible_(id)) {
     return {};
   }
   return _entries[id - 1].name;
@@ -84,7 +99,8 @@ StageRegistry::create(string_view               type_name,
   {
     lock_guard<mutex> lk(_mu);
     auto it = _by_name.find(type_name);
-    if (it == _by_name.end()) {
+    if (it == _by_name.end() ||
+        !visible_(static_cast<unsigned>(it->second))) {
       if (session) {
         session->warn(fmt(
             "StageRegistry::create: unknown stage type '{}'",
@@ -164,10 +180,42 @@ StageRegistry::all() const
   vector<pair<StageTypeId, string>> out;
   out.reserve(_entries.size());
   for (size_t i = 0; i < _entries.size(); ++i) {
+    if (!visible_(static_cast<unsigned>(i + 1))) { continue; }
     out.emplace_back(static_cast<StageTypeId>(i + 1),
                      _entries[i].name);
   }
   return out;
+}
+
+void
+StageRegistry::begin_quarantine()
+{
+  lock_guard<mutex> lk(_mu);
+  _quarantine = true;
+  _quarantined_specs.clear();
+}
+
+void
+StageRegistry::end_quarantine(bool admit)
+{
+  lock_guard<mutex> lk(_mu);
+  for (Entry& e : _entries) {
+    if (!e.pending) { continue; }
+    e.pending = false;
+    if (admit) { continue; }
+    // Withdrawn for good. The slot stays -- ids index the vector and are
+    // never reused -- but the name is free again for a plugin that
+    // passes, and nothing can reach the factory.
+    e.withdrawn = true;
+    e.factory   = nullptr;
+    _by_name.erase(e.name);
+    _specs.erase(e.name);
+  }
+  if (!admit) {
+    for (const string& n : _quarantined_specs) { _specs.erase(n); }
+  }
+  _quarantined_specs.clear();
+  _quarantine = false;
 }
 
 }

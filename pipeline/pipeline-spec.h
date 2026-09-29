@@ -4,6 +4,11 @@
 #include "common/flex-data.h"
 #include <memory>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 class Pipeline;
@@ -54,5 +59,7 @@ pipeline_from_spec(const FlexData&           spec,
                    const SessionContextIntf* session);
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

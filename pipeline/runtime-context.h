@@ -15,6 +15,10 @@
 #include <utility>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // One RuntimeContext per Stage instance per running Pipeline. The
@@ -38,23 +42,22 @@ namespace vpipe {
 // produced payload once. Cursors borrow via peek; the slowest cursor
 // can acquire by moving the slot out. Compat read() does both
 // transparently.
+//
+// Plugin ABI: nothing here is inline, so a plugin compiles no knowledge of
+// the members. The awaiters these methods return live in the caller's
+// coroutine frame, and THEIR layouts are frozen (abi/ snapshot).
 class RuntimeContext {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   RuntimeContext(std::vector<EdgeReader*>  in_readers,
                  std::vector<OportBuffer*> out_bufs,
-                 std::atomic<bool>*        stop)
-    : _in_readers(std::move(in_readers))
-    , _out_bufs(std::move(out_bufs))
-    , _stop(stop)
-  {}
+                 std::atomic<bool>*        stop);
+  ~RuntimeContext();
 
   RuntimeContext(const RuntimeContext&)            = delete;
   RuntimeContext& operator=(const RuntimeContext&) = delete;
 
-  unsigned num_iports() const noexcept
-  {
-    return static_cast<unsigned>(_in_readers.size());
-  }
+  unsigned num_iports() const noexcept;
 
 private:
   // Reading a positional iport a stage does NOT have -- `ctx.read(0)` on a
@@ -66,14 +69,7 @@ private:
   // port behaves the same way. Every stage's existing
   // `if (!beat) { signal_done(); }` path then ends the stage cleanly instead
   // of crashing.
-  EdgeReader*
-  reader_(unsigned p) const noexcept
-  {
-    if (p < _in_readers.size() && _in_readers[p] != nullptr) {
-      return _in_readers[p];
-    }
-    return &_eos_reader;
-  }
+  EdgeReader* reader_(unsigned p) const noexcept;
 
 public:
 
@@ -82,13 +78,7 @@ public:
   // distinguishes "unwired" from "wired producer that has finished".
   // Stages with optional inputs (e.g. hls-broadcast video vs audio)
   // branch on this at launch instead of a config flag.
-  bool
-  iport_connected(unsigned p) const noexcept
-  {
-    return p < _in_readers.size()
-        && _in_readers[p] != nullptr
-        && _in_readers[p]->parent() != nullptr;
-  }
+  bool iport_connected(unsigned p) const noexcept;
 
   // Non-blocking count of unread items on iport `p`. Returns 0 when
   // the cursor is fully drained (a subsequent read() would suspend
@@ -99,53 +89,28 @@ public:
   // drain the other port's backlog non-blockingly per tick. The
   // result is a relaxed snapshot — it may under-count progress but
   // never returns a stale value above the true backlog.
-  std::uint32_t
-  backlog(unsigned p) const noexcept
-  {
-    return reader_(p)->backlog();
-  }
+  std::uint32_t backlog(unsigned p) const noexcept;
 
   // True iff iport `p` is drained AND closed -- a subsequent read()
   // returns null (EOS). Pairs with read_any(): a backlog-bounded drain
   // loop reads nothing on an empty-but-closed port, so the driver tests
   // eos() to end the stage instead of spinning (read_any treats a
   // closed port as perpetually "ready").
-  bool
-  eos(unsigned p) const
-  {
-    return reader_(p)->at_eos();
-  }
+  bool eos(unsigned p) const;
 
-  unsigned num_oports() const noexcept
-  {
-    return static_cast<unsigned>(_out_bufs.size());
-  }
+  unsigned num_oports() const noexcept;
 
   // True iff the named oport has at least one consumer wired up at
   // pipeline launch time. The graph is frozen after launch so the
   // answer is stable for the life of the stage.
-  bool
-  has_consumers(unsigned out_port) const noexcept
-  {
-    return out_port < _out_bufs.size()
-        && _out_bufs[out_port]
-        && _out_bufs[out_port]->num_cursors() > 0;
-  }
+  bool has_consumers(unsigned out_port) const noexcept;
 
   // Compat one-shot read. Returns null on EOS.
-  EdgeReader::ReadAwaiter
-  read(unsigned in_port)
-  {
-    return reader_(in_port)->read();
-  }
+  EdgeReader::ReadAwaiter read(unsigned in_port);
 
   // Window peek: borrow at cursor + offset. Suspends until written.
   // Returns nullptr on EOS at that offset. Does not advance.
-  EdgeReader::PeekAwaiter
-  peek(unsigned in_port, std::uint32_t offset = 0)
-  {
-    return reader_(in_port)->peek(offset);
-  }
+  EdgeReader::PeekAwaiter peek(unsigned in_port, std::uint32_t offset = 0);
 
   // Suspend until ANY of `ports` is readable (a beat is available or
   // EOS), then resume; the caller drains whichever port(s) are ready
@@ -162,75 +127,21 @@ public:
   // inbox (or the inbox shuts at stop), so a stage that answers commands
   // can sleep on its inputs and its commands at once. With commands set
   // the port list may be empty -- then it waits on commands alone.
+  //
+  // The awaiter lives in the stage's coroutine frame, so its LAYOUT is
+  // part of the plugin ABI; its logic is out of line.
   struct ReadAnyAwaiter {
     std::vector<EdgeReader*>         _readers;
     std::shared_ptr<MultiReadWaiter> _state;
     CommandInbox*                    _inbox = nullptr;
 
-    bool
-    await_ready()
-    {
-      for (auto* r : _readers) {
-        if (r->readable_now()) { return true; }
-      }
-      return _inbox != nullptr && _inbox->ready();
-    }
-
-    bool
-    await_suspend(std::coroutine_handle<> h)
-    {
-      _state = std::make_shared<MultiReadWaiter>();
-      _state->h = h;
-      // Register on every not-yet-ready port. A port that is already
-      // readable returns Ready (no registration) -> resume inline.
-      bool any_ready = false;
-      for (auto* r : _readers) {
-        if (r->register_multi(_state) == EdgeReader::MultiReg::Ready) {
-          any_ready = true;
-        }
-      }
-      CommandInbox* inbox = _inbox;
-      if (inbox != nullptr && !inbox->register_waiter(_state)) {
-        any_ready = true;
-      }
-      // Arm last, under the state lock: if a registered port already
-      // fired (or one was Ready), resume inline instead of suspending,
-      // and claim `fired` so a late notify() becomes a no-op.
-      bool inline_resume = any_ready;
-      {
-        std::lock_guard<std::mutex> lk(_state->mu);
-        if (_state->fired) { inline_resume = true; }
-        _state->armed = true;
-        if (inline_resume) { _state->fired = true; }
-      }
-      if (inline_resume) {
-        for (auto* r : _readers) { r->deregister_multi(_state); }
-        if (inbox != nullptr) { inbox->deregister_waiter(_state); }
-        return false;
-      }
-      return true;
-    }
-
-    void
-    await_resume()
-    {
-      // Clear our registrations on the ports that did not win the wake
-      // (the winner already cleared its own slot).
-      if (_state) {
-        for (auto* r : _readers) { r->deregister_multi(_state); }
-        if (_inbox != nullptr) { _inbox->deregister_waiter(_state); }
-      }
-    }
+    bool await_ready();
+    bool await_suspend(std::coroutine_handle<> h);
+    void await_resume();
   };
 
-  ReadAnyAwaiter
-  read_any(std::vector<unsigned> ports, bool commands = false)
-  {
-    std::vector<EdgeReader*> rs;
-    rs.reserve(ports.size());
-    for (unsigned p : ports) { rs.push_back(reader_(p)); }
-    return ReadAnyAwaiter{ std::move(rs), {}, commands ? _inbox : nullptr };
-  }
+  ReadAnyAwaiter read_any(std::vector<unsigned> ports,
+                          bool commands = false);
 
   // ---- command channels (pipeline/stage-command.h) --------------------
   //
@@ -239,102 +150,61 @@ public:
   // to answer (reply or fail) -- an unanswered one leaves its caller
   // waiting until the pipeline stops.
 
-  bool has_commands() const noexcept { return _inbox != nullptr; }
+  bool has_commands() const noexcept;
 
   // The next queued command, or null. Never suspends.
-  std::shared_ptr<StageCommand>
-  try_command()
-  {
-    return _inbox != nullptr ? _inbox->take() : nullptr;
-  }
+  std::shared_ptr<StageCommand> try_command();
 
   // `auto cmd = co_await ctx.next_command();` -- the next command,
   // suspending until one arrives. Null means no more will: the pipeline
   // is stopping, or the stage has no command channels at all.
-  NextCommandAwaiter
-  next_command()
-  {
-    return NextCommandAwaiter{ _inbox, {}, {} };
-  }
+  NextCommandAwaiter next_command();
 
   // Cancel every command this stage took and has not seen closed, e.g.
   // on reaching the end of its stream with a read still open. The
   // inbox stays open for new commands.
-  void
-  cancel_open_commands(std::string_view why)
-  {
-    if (_inbox != nullptr) { _inbox->cancel_open(why); }
-  }
+  void cancel_open_commands(std::string_view why);
 
   // Runtime only: bind the stage's inbox, and shut it when the stage's
   // driver has finished so a caller is refused rather than left
   // waiting on a stage that will never read again.
-  void attach_commands(CommandInbox* inbox) noexcept { _inbox = inbox; }
-  void
-  shut_commands(std::string_view why)
-  {
-    if (_inbox != nullptr) { _inbox->shutdown(why); }
-  }
+  void attach_commands(CommandInbox* inbox) noexcept;
+  void shut_commands(std::string_view why);
 
   // Move-out acquire at cursor. Suspends only for "not-yet-written"
   // or EOS. Returns null + records "not-slowest" if this cursor is
   // not the slowest (in fanout); the caller should fall back to
   // peek+clone+release.
-  EdgeReader::AcquireAwaiter
-  acquire(unsigned in_port)
-  {
-    return reader_(in_port)->acquire();
-  }
+  EdgeReader::AcquireAwaiter acquire(unsigned in_port);
 
   // Explicit advance. Non-blocking.
-  void
-  release_read(unsigned in_port, std::uint32_t n = 1)
-  {
-    reader_(in_port)->release_read(n);
-  }
+  void release_read(unsigned in_port, std::uint32_t n = 1);
 
   // Push a payload to the oport buffer.
-  OportBuffer::WriteAwaiter
-  write(unsigned out_port, std::unique_ptr<BeatPayloadIntf> t)
-  {
-    return _out_bufs[out_port]->write(std::move(t));
-  }
+  OportBuffer::WriteAwaiter write(unsigned out_port,
+                                  std::unique_ptr<BeatPayloadIntf> t);
 
   // Non-coroutine push to an oport, for a stage that produces from a
   // thread it owns rather than from its process() coroutine. Returns
   // false iff the oport buffer is closed (teardown) -- the caller
   // should stop producing. See OportBuffer::push_sync.
-  bool
-  write_sync(unsigned out_port, std::unique_ptr<BeatPayloadIntf> t)
-  {
-    return _out_bufs[out_port]->push_sync(std::move(t));
-  }
+  bool write_sync(unsigned out_port, std::unique_ptr<BeatPayloadIntf> t);
 
   // Stage signals it has produced its last output (or read past EOS
   // and has no more work). The driver loop closes outputs and exits
   // after the current process_one returns.
-  void signal_done() noexcept { _done = true; }
-  bool done()        const noexcept { return _done; }
+  void signal_done() noexcept;
+  bool done() const noexcept;
 
-  bool
-  stop_requested() const noexcept
-  {
-    return _stop && _stop->load(std::memory_order_acquire);
-  }
+  bool stop_requested() const noexcept;
 
   // Close every downstream OportBuffer. Called by the driver after
   // the stage signals done or after an exception.
-  void
-  close_outputs()
-  {
-    for (auto* buf : _out_bufs) {
-      if (buf) {
-        buf->close();
-      }
-    }
-  }
+  void close_outputs();
 
 private:
+  // Every method is out of line, so this layout is the host's alone: a
+  // plugin's stage holds a RuntimeContext& and never reaches a member.
   std::vector<EdgeReader*>  _in_readers;
   std::vector<OportBuffer*> _out_bufs;
   // Parent-less => permanently at EOS. Stands in for any iport index the
@@ -347,5 +217,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

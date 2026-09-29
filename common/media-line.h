@@ -8,6 +8,11 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 // Media-line marker protocol: a single line of user text that carries
 // inline image/audio attachments as special text sequences, so the
 // whole message still travels every text-only channel (stdin, the
@@ -119,5 +124,7 @@ make_base64_marker(Modality m, std::span<const std::uint8_t> bytes);
 std::string to_display(std::string_view line);
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

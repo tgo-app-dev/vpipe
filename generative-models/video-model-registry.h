@@ -11,9 +11,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -108,6 +113,22 @@ struct VideoGenRequest {
   int              n_ref_audio_rows = 0;
   int              ref_audio_dim    = 0;
 
+  // ---- reference LATENTS, as many as the graph supplies ---------------
+  //
+  // Subject, style or identity references -- the multi-reference
+  // conditioning newer video models take -- one entry each, in the order
+  // the graph gave them, each a latent as vae-encode emits it (see
+  // ImageGenRequest::references for the format and the rules). Distinct
+  // from `ref` / `ref_last`, which are KEYFRAMES pinned to a position in
+  // the clip, and from the encoder rows above, which are one family's
+  // own packing.
+  //
+  // Nothing fills it yet: generate-video has no port for it. It is here
+  // so the first family that wants references reads them through a field
+  // every plugin in the window already has, rather than one that moves
+  // this layout. Empty means none.
+  std::span<const NamedTensor> references;
+
   // ---- the family's own knobs (iport9), UNPARSED --------------------
   // Passed down exactly as the config source emitted it, so a knob added
   // later needs no change in generate-video. Null / non-object means the
@@ -169,12 +190,13 @@ struct VideoGenRequest {
   // each moved this layout, and each invalidated every family binary
   // including the ones that ignore it.
   //
-  // `input` looks up anything with a SHAPE by name; `extras` carries
-  // scalars the host wants to state and no family has to read. Both are
-  // legitimately absent -- a null `input` and a null `extras` are what a
-  // graph that wired neither produces, and a family must work then.
+  // `input` looks up anything with a SHAPE by name; `borrowed_extra`
+  // carries scalars the host wants to state and no family has to read.
+  // Both are legitimately absent -- a null `input` and a null
+  // `borrowed_extra` are what a graph that wired neither produces, and a
+  // family must work then.
   vpipe::genai::NamedInputFn input;
-  const FlexData*            extras = nullptr;
+  const FlexData*            borrowed_extra = nullptr;
 
   // Named OUTPUTS, mid-generation -- the input seam's mirror, and where
   // the next thing a family hands back goes. See gen-input.h; the first
@@ -231,6 +253,19 @@ public:
   // itself against a checkpoint it cannot see. See
   // docs/MODEL-MEMORY.md, "Declarations".
   virtual std::uint64_t resident_bytes() const { return 0; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Everything a family's `load` receives. Mirrors ModelExecCreateArgs.
@@ -324,7 +359,7 @@ struct VideoModelCreateArgs {
   // the graph named none and the family finds its own weights under
   // `root`, which is what every family did before this existed.
   //
-  // It is a typed field rather than an `extras` key because it is not
+  // It is a typed field rather than a `borrowed_extra` key because it is not
   // an optional capability: it is the same resolved path the built-in
   // families have always been handed, and a family that ignores it
   // silently loads weights the operator did not ask for.
@@ -340,7 +375,7 @@ struct VideoModelCreateArgs {
 
   // NEW ARGUMENTS GO IN HERE, NOT IN A NEW FIELD. See gen-input.h.
   // Null is what a host with nothing to add produces.
-  const FlexData* extras = nullptr;
+  const FlexData* borrowed_extra = nullptr;
 };
 
 // A video model FAMILY: process-wide, stateless, one per architecture.
@@ -487,6 +522,19 @@ public:
   // leaves the stage inert rather than taking the pipeline down.
   virtual std::unique_ptr<VideoGenerator>
   load(const VideoModelCreateArgs& args) = 0;
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Process-wide family set. Same singleton discipline as StageRegistry
@@ -494,6 +542,7 @@ public:
 // shared so it registers into THIS instance rather than forking a
 // second one.
 class VideoModelRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static VideoModelRegistry& get() noexcept;
 
@@ -522,5 +571,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

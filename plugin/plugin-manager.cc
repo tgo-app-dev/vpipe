@@ -7,9 +7,19 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
-#include <filesystem>
+#include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <utility>
+#include <vector>
+
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -34,6 +44,128 @@ canonical_(std::string_view path)
   return p.string();
 }
 
+// ---- the version, read from the FILE -------------------------------------
+//
+// So a plugin outside the support window is refused before any of its code
+// runs: dlopen executes its static initialisers, which may call into host
+// code with layouts from another ABI. Only the `vpipe_plugin_abi` constant
+// is read -- a plain 4-byte value in a const section, no relocation.
+enum class FileAbi { Found, Absent, Unreadable };
+
+#ifdef __APPLE__
+FileAbi
+read_file_abi_(const std::string& path, std::uint32_t* out)
+{
+  std::ifstream f(path, std::ios::binary);
+  if (!f) { return FileAbi::Unreadable; }
+  auto at = [&](std::uint64_t off, void* dst, std::size_t n) {
+    f.seekg(static_cast<std::streamoff>(off));
+    f.read(static_cast<char*>(dst), static_cast<std::streamsize>(n));
+    return static_cast<bool>(f);
+  };
+#if defined(__arm64__) || defined(__aarch64__)
+  const cpu_type_t want = CPU_TYPE_ARM64;
+#else
+  const cpu_type_t want = CPU_TYPE_X86_64;
+#endif
+  std::uint32_t magic = 0;
+  if (!at(0, &magic, 4)) { return FileAbi::Unreadable; }
+  std::uint64_t base = 0;
+  if (magic == FAT_CIGAM || magic == FAT_CIGAM_64) {
+    // Universal binary: headers are big-endian; take the host's slice.
+    fat_header fh{};
+    if (!at(0, &fh, sizeof fh)) { return FileAbi::Unreadable; }
+    const std::uint32_t n = OSSwapBigToHostInt32(fh.nfat_arch);
+    bool found = false;
+    for (std::uint32_t i = 0; i < n && !found; ++i) {
+      if (magic == FAT_CIGAM_64) {
+        fat_arch_64 a{};
+        if (!at(sizeof fh + i * sizeof a, &a, sizeof a)) { break; }
+        if (static_cast<cpu_type_t>(OSSwapBigToHostInt32(a.cputype)) ==
+            want) {
+          base  = OSSwapBigToHostInt64(a.offset);
+          found = true;
+        }
+      } else {
+        fat_arch a{};
+        if (!at(sizeof fh + i * sizeof a, &a, sizeof a)) { break; }
+        if (static_cast<cpu_type_t>(OSSwapBigToHostInt32(a.cputype)) ==
+            want) {
+          base  = OSSwapBigToHostInt32(a.offset);
+          found = true;
+        }
+      }
+    }
+    if (!found || !at(base, &magic, 4)) { return FileAbi::Unreadable; }
+  }
+  if (magic != MH_MAGIC_64) { return FileAbi::Unreadable; }
+  mach_header_64 mh{};
+  if (!at(base, &mh, sizeof mh)) { return FileAbi::Unreadable; }
+
+  std::vector<section_64> sects;          // n_sect is 1-based, in order
+  symtab_command          st{};
+  bool                    have_st = false;
+  std::uint64_t off = base + sizeof mh;
+  for (std::uint32_t i = 0; i < mh.ncmds; ++i) {
+    load_command lc{};
+    if (!at(off, &lc, sizeof lc) || lc.cmdsize < sizeof lc) {
+      return FileAbi::Unreadable;
+    }
+    if (lc.cmd == LC_SEGMENT_64) {
+      segment_command_64 sc{};
+      if (!at(off, &sc, sizeof sc)) { return FileAbi::Unreadable; }
+      for (std::uint32_t j = 0; j < sc.nsects; ++j) {
+        section_64 s{};
+        if (!at(off + sizeof sc + j * sizeof s, &s, sizeof s)) {
+          return FileAbi::Unreadable;
+        }
+        sects.push_back(s);
+      }
+    } else if (lc.cmd == LC_SYMTAB) {
+      if (!at(off, &st, sizeof st)) { return FileAbi::Unreadable; }
+      have_st = true;
+    }
+    off += lc.cmdsize;
+  }
+  if (!have_st) { return FileAbi::Unreadable; }
+
+  std::vector<char>     strtab(st.strsize);
+  std::vector<nlist_64> syms(st.nsyms);
+  if (!at(base + st.stroff, strtab.data(), strtab.size()) ||
+      !at(base + st.symoff, syms.data(), syms.size() * sizeof(nlist_64))) {
+    return FileAbi::Unreadable;
+  }
+  static constexpr char kName[] = "_vpipe_plugin_abi";
+  for (const nlist_64& n : syms) {
+    if ((n.n_type & N_STAB) != 0 || (n.n_type & N_TYPE) != N_SECT) {
+      continue;
+    }
+    const std::uint32_t sx = n.n_un.n_strx;
+    if (sx >= strtab.size() || strtab.size() - sx < sizeof kName ||
+        std::strncmp(strtab.data() + sx, kName, sizeof kName) != 0) {
+      continue;
+    }
+    if (n.n_sect == 0 || n.n_sect > sects.size()) {
+      return FileAbi::Unreadable;
+    }
+    const section_64& s = sects[n.n_sect - 1];
+    if (n.n_value < s.addr || n.n_value + 4 > s.addr + s.size) {
+      return FileAbi::Unreadable;
+    }
+    const std::uint64_t foff = base + s.offset + (n.n_value - s.addr);
+    return at(foff, out, 4) ? FileAbi::Found : FileAbi::Unreadable;
+  }
+  return FileAbi::Absent;
+}
+#else
+FileAbi
+read_file_abi_(const std::string&, std::uint32_t*)
+{
+  // No pre-read off Apple: the version is checked after dlopen instead.
+  return FileAbi::Unreadable;
+}
+#endif
+
 }  // namespace
 
 PluginManager&
@@ -54,9 +186,10 @@ PluginManager::get() noexcept
 bool
 PluginManager::is_abi_compatible(std::uint32_t plugin_abi) noexcept
 {
-  // Strict equality for now. If/when backward compatibility becomes a
-  // goal, relax this to a major-version comparison.
-  return plugin_abi == VPIPE_PLUGIN_ABI_VERSION;
+  // The support window: this version and the one before it, never below
+  // the version that introduced the window.
+  return plugin_abi >= VPIPE_PLUGIN_ABI_OLDEST &&
+         plugin_abi <= VPIPE_PLUGIN_ABI_VERSION;
 }
 
 bool
@@ -69,6 +202,30 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
     return true;                       // already loaded this process
   }
 
+  auto warn = [&](const VpipeFormat& f) {
+    if (session != nullptr) { session->warn(f); }
+  };
+  auto window = [] {
+    return VPIPE_PLUGIN_ABI_OLDEST == VPIPE_PLUGIN_ABI_VERSION
+        ? fmt("{}", VPIPE_PLUGIN_ABI_VERSION)()
+        : fmt("{}..{}", VPIPE_PLUGIN_ABI_OLDEST, VPIPE_PLUGIN_ABI_VERSION)();
+  };
+
+  // The version, from the FILE, before any of the plugin's code runs.
+  std::uint32_t file_abi = 0;
+  const FileAbi fa = read_file_abi_(canon, &file_abi);
+  if (fa == FileAbi::Absent) {
+    warn(fmt("plugin '{}': carries no `vpipe_plugin_abi`, so it was built "
+             "for plugin ABI 7 or older; this host loads ABI {}. Rebuild "
+             "it against this vpipe", canon, window()));
+    return false;
+  }
+  if (fa == FileAbi::Found && !is_abi_compatible(file_abi)) {
+    warn(fmt("plugin '{}': built for plugin ABI {}; this host loads ABI {}. "
+             "Rebuild it against this vpipe", canon, file_abi, window()));
+    return false;
+  }
+
   // The stage-type id the registry is ABOUT to hand out. Everything
   // registered from here on belongs to this plugin -- captured BEFORE
   // the dlopen because a TypedStage<T> registers its own factory from a
@@ -76,16 +233,20 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
   // vpipe_plugin_register is called. See StageRegistry::attribute_since.
   const StageTypeId first_type = StageRegistry::get().next_id();
 
+  // And everything registered while it loads is QUARANTINED until the
+  // handshake below passes -- withdrawn on every path that refuses it.
+  StageRegistry::get().begin_quarantine();
+  struct Quarantine {
+    bool admit = false;
+    ~Quarantine() { StageRegistry::get().end_quarantine(admit); }
+  } quarantine;
+
   // dlopen (Optional: warns + valid()==false on failure, never throws).
   auto handle = std::make_unique<LibraryHandle>(
       session, canon, LibraryHandle::LoadMode::Optional);
   if (!handle->valid()) {
     return false;                      // LibraryHandle already warned
   }
-
-  auto warn = [&](const VpipeFormat& f) {
-    if (session != nullptr) { session->warn(f); }
-  };
 
   // Resolve the three required entry points.
   auto abi_fn = reinterpret_cast<vpipe_plugin_abi_version_fn>(
@@ -103,12 +264,13 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
     return false;
   }
 
-  // ABI-version handshake.
+  // ABI-version handshake: the function must agree with the constant it
+  // was read from, which is what off-Apple builds check instead.
   const std::uint32_t plugin_abi = abi_fn();
-  if (!is_abi_compatible(plugin_abi)) {
-    warn(fmt("plugin '{}': ABI version {} is incompatible with host {} "
-             "(rebuild the plugin against this vpipe)",
-             canon, plugin_abi, VPIPE_PLUGIN_ABI_VERSION));
+  if (!is_abi_compatible(plugin_abi) ||
+      (fa == FileAbi::Found && plugin_abi != file_abi)) {
+    warn(fmt("plugin '{}': built for plugin ABI {}; this host loads ABI {}. "
+             "Rebuild it against this vpipe", canon, plugin_abi, window()));
     return false;
   }
 
@@ -118,6 +280,26 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
   if (info != nullptr && info->name != nullptr) {
     pname = info->name;
   }
+  // The features it cannot run without -- refused by name, before it
+  // registers anything, rather than failing on a missing symbol later.
+  if (info != nullptr && info->schema_version >= 2 &&
+      info->required_features != nullptr) {
+    std::string missing;
+    for (const char* const* f = info->required_features; *f != nullptr;
+         ++f) {
+      if (!host_has_feature(*f)) {
+        if (!missing.empty()) { missing += ", "; }
+        missing += *f;
+      }
+    }
+    if (!missing.empty()) {
+      warn(fmt("plugin '{}': requires feature(s) this host does not "
+               "provide: {}", pname, missing));
+      return false;
+    }
+  }
+  quarantine.admit = true;
+
   if (info != nullptr) {
     if (session != nullptr) {
       session->info(fmt(
@@ -132,10 +314,11 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
     warn(fmt("plugin '{}': vpipe_plugin_info() returned null", canon));
   }
 
+
   // Register the plugin's extensions. A throwing register must not take
   // down the host: demote to a warning. Registrations that succeeded
   // before a throw stay in the registries; the handle is kept alive.
-  VpipePluginContext ctx(session, pname);
+  VpipePluginContext ctx(session, pname, plugin_abi);
   // Stamp provenance on EVERY exit path, including the throwing ones --
   // the comment below is explicit that partial registrations stay in the
   // registries, so a stage that made it in must still say where it came
@@ -174,6 +357,7 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
     Record r;
     r.path    = canon;
     r.name    = pname;
+    r.abi     = plugin_abi;
     if (info != nullptr) {
       r.version     = info->version     ? info->version     : "";
       r.vendor      = info->vendor      ? info->vendor      : "";

@@ -519,7 +519,8 @@ TEST(save_image_stage, metadata_iport_is_declared_and_optional) {
   const StageSpec* si = StageRegistry::get().spec("save-image");
   const StageSpec* li = StageRegistry::get().spec("load-image");
   ASSERT_TRUE(si != nullptr && li != nullptr);
-  ASSERT_TRUE(si->iports.size() == 2 && li->oports.size() == 2);
+  // load-image: image, metadata, then the `images` list.
+  ASSERT_TRUE(si->iports.size() == 2 && li->oports.size() == 3);
   // save-image's metadata iport must accept exactly what load-image's
   // metadata oport emits, or the two cannot be wired together.
   EXPECT_TRUE(si->iports[1].type == li->oports[1].type);

@@ -3,9 +3,14 @@
 
 #include "pipeline/stage-config.h"
 
+#include <cstdint>
 #include <span>
 #include <string_view>
 #include <typeinfo>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -150,6 +155,9 @@ struct CommandSpec {
 // `attrs` may point at a `constexpr ConfigKey[]` table. The base default
 // (Stage::spec) returns an empty Generic spec.
 struct StageSpec {
+  // A plugin's spec is PLUGIN memory the host reads, so it says how much
+  // of it there is (common/abi-struct.h). Leave it defaulted.
+  std::uint32_t              struct_size = sizeof(StageSpec);
   std::string_view           type_name;
   std::string_view           doc;
   // Optional human-friendly label for tooling (the web-ui toolbox shows
@@ -181,6 +189,12 @@ struct StageSpec {
 const CommandSpec* find_command(const StageSpec& spec,
                                 std::string_view name) noexcept;
 
+// spec.commands, read only when the spec -- plugin memory -- is new enough
+// to have the field (common/abi-struct.h). Host code reads it through this.
+std::span<const CommandSpec> spec_commands(const StageSpec& spec) noexcept;
+
 }
+
+VPIPE_API_END
 
 #endif

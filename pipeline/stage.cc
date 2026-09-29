@@ -1,5 +1,6 @@
 #include "pipeline/stage.h"
 #include "common/job.h"
+#include "pipeline/stage-command.h"
 #include "common/path-sandbox.h"
 #include "common/perf-event.h"
 #include <string>
@@ -8,13 +9,60 @@ using namespace std;
 
 namespace vpipe {
 
+// Stage's own state (see the comment on Stage::_st). Host-private: no
+// plugin sees this layout, so it grows freely.
+class StageState {
+public:
+  explicit StageState(FlexData c) : config(std::move(c)) {}
+
+  // Set by the runtime for the span of a launch; null otherwise. Atomic
+  // because a revision comes from the stage's own thread while stop() may
+  // be clearing it from another.
+  std::atomic<MemoryPlanSink*> mem_sink{nullptr};
+
+  FlexData          config;
+  std::string       config_error;
+  std::atomic<bool> running{false};
+  std::atomic<bool> needs_init{false};
+  // Set and cleared by the runtime (StageLifecycleAccess) while callers
+  // on other threads read it, hence the lock.
+  mutable std::mutex            inbox_mu;
+  std::shared_ptr<CommandInbox> inbox;
+};
+
 Stage::Stage(const SessionContextIntf* s,
              string id,
              vector<InEdge> iports,
              FlexData config)
   : Vertex(s, std::move(id), std::move(iports))
-  , _config(std::move(config))
+  , _st(std::make_unique<StageState>(std::move(config)))
 {
+}
+
+Stage::~Stage() = default;
+
+const FlexData&
+Stage::config() const noexcept
+{
+  return _st->config;
+}
+
+const string&
+Stage::config_error() const noexcept
+{
+  return _st->config_error;
+}
+
+bool
+Stage::running() const noexcept
+{
+  return _st->running.load(memory_order_acquire);
+}
+
+bool
+Stage::needs_init() const noexcept
+{
+  return _st->needs_init.load(memory_order_acquire);
 }
 
 // Default lifecycle hooks: empty coroutines. Stages override only
@@ -168,7 +216,7 @@ Stage::perf_event_name(uint32_t type) const
 vector<ConfigParam>
 Stage::config_params() const
 {
-  return resolve_config_params(config_spec(), _config);
+  return resolve_config_params(config_spec(), _st->config);
 }
 
 FlexData
@@ -180,21 +228,21 @@ Stage::config_schema() const
 void
 Stage::fail_config(const VpipeFormat& message)
 {
-  if (_config_error.empty()) {
-    _config_error = message();
+  if (_st->config_error.empty()) {
+    _st->config_error = message();
   }
 }
 
 void
 StageLifecycleAccess::set_running(Stage* s, bool running)
 {
-  s->_running.store(running, memory_order_release);
+  s->_st->running.store(running, memory_order_release);
 }
 
 void
 Stage::revise_memory(const StageMemory& m) const
 {
-  if (MemoryPlanSink* sink = _mem_sink.load(std::memory_order_acquire)) {
+  if (MemoryPlanSink* sink = _st->mem_sink.load(std::memory_order_acquire)) {
     sink->revise(this, m);
   }
 }
@@ -202,7 +250,9 @@ Stage::revise_memory(const StageMemory& m) const
 void
 StageLifecycleAccess::set_memory_sink(Stage* s, MemoryPlanSink* sink)
 {
-  if (s != nullptr) { s->_mem_sink.store(sink, std::memory_order_release); }
+  if (s != nullptr) {
+    s->_st->mem_sink.store(sink, std::memory_order_release);
+  }
 }
 
 void
@@ -210,21 +260,21 @@ StageLifecycleAccess::set_command_inbox(Stage* s,
                                         shared_ptr<CommandInbox> inbox)
 {
   if (s == nullptr) { return; }
-  lock_guard<mutex> lk(s->_inbox_mu);
-  s->_inbox = std::move(inbox);
+  lock_guard<mutex> lk(s->_st->inbox_mu);
+  s->_st->inbox = std::move(inbox);
 }
 
 shared_ptr<CommandInbox>
 Stage::command_inbox() const
 {
-  lock_guard<mutex> lk(_inbox_mu);
-  return _inbox;
+  lock_guard<mutex> lk(_st->inbox_mu);
+  return _st->inbox;
 }
 
 void
 StageLifecycleAccess::set_needs_init(Stage* s, bool needs_init)
 {
-  s->_needs_init.store(needs_init, memory_order_release);
+  s->_st->needs_init.store(needs_init, memory_order_release);
 }
 
 }

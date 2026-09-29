@@ -45,7 +45,7 @@ sb_num_(const FlexData& sb, const char* key, double* out)
 // The resampling methods, for the editor's dropdown; the ctor's own
 // branch chain stays the authority.
 constexpr SpecExtra kMethodChoices[] = {
-  {"choices", "nearest,blend,average,motion"},
+  {spec_key::kChoices, "nearest,blend,average,motion"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_fps", .type = ConfigType::Real, .required = true,

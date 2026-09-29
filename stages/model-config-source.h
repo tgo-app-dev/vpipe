@@ -14,6 +14,10 @@
 #include <string_view>
 #include <utility>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // The contract every MODEL-SPECIFIC config source honours, and that
@@ -213,5 +217,7 @@ protected:
 };
 
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

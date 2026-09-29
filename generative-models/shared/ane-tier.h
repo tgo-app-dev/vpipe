@@ -38,6 +38,10 @@
 #include <string>
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 namespace metal_compute { class MetalCompute; }
@@ -176,6 +180,7 @@ std::unique_ptr<Tier> create(const SessionContextIntf* session,
 //   kProbe: same split point, GPU over every row, note_probe(timing)
 //   kGpu:   nothing
 class Tier {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
  public:
   enum class Plan : int { kGpu = 0, kSplit = 1, kProbe = 2 };
 
@@ -213,5 +218,7 @@ class Tier {
 }  // namespace ane
 }  // namespace genai
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

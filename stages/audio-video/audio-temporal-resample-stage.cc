@@ -60,7 +60,7 @@ atempo_chain_(double tempo)
 // The pitch policies, for the editor's dropdown; the ctor's own check
 // stays the authority.
 constexpr SpecExtra kPitchChoices[] = {
-  {"choices", "maintain,follow,raise,lower"},
+  {spec_key::kChoices, "maintain,follow,raise,lower"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_sample_rate", .type = ConfigType::Int, .required = false,

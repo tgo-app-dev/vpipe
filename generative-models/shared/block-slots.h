@@ -79,6 +79,9 @@
 #include <future>
 #include <string>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 namespace vpipe::genai {
 
 // HOW A DESTINATION RELATES TO THE CHECKPOINT, which the model must

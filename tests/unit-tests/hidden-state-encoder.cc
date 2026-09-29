@@ -74,6 +74,20 @@ row_rms_(const HiddenTapResult& r, int slot, int row)
 
 }  // namespace
 
+namespace {
+
+// A tap request by value.
+HiddenTapRequest
+tap_(std::vector<int> indices, int key_valid_len)
+{
+  HiddenTapRequest r;
+  r.indices       = std::move(indices);
+  r.key_valid_len = key_valid_len;
+  return r;
+}
+
+}  // namespace
+
 TEST(hidden_state_encoder, builtin_gemma_is_registered) {
   auto& reg = HiddenStateEncoderRegistry::get();
   // The whole point of referencing register_builtin_hidden_state_encoders
@@ -249,11 +263,11 @@ TEST(hidden_state_encoder, gemma_refuses_what_it_cannot_do) {
   // different layer than the caller asked for and nothing downstream can
   // tell.
   err.clear();
-  EXPECT_TRUE(!enc->encode(ids, {{L + 1}, 0}, &res, &err));
+  EXPECT_TRUE(!enc->encode(ids, tap_({L + 1}, 0), &res, &err));
   EXPECT_TRUE(!err.empty());
 
   err.clear();
-  EXPECT_TRUE(!enc->encode(ids, {{-1}, 0}, &res, &err));
+  EXPECT_TRUE(!enc->encode(ids, tap_({-1}, 0), &res, &err));
   EXPECT_TRUE(!err.empty());
 
   // Inside the KV-shared tail: refused, and the message must say WHY --
@@ -261,28 +275,28 @@ TEST(hidden_state_encoder, gemma_refuses_what_it_cannot_do) {
   // range would go looking in the wrong place.
   if (enc->max_tap_index() < L) {
     err.clear();
-    EXPECT_TRUE(!enc->encode(ids, {{L}, 0}, &res, &err));
+    EXPECT_TRUE(!enc->encode(ids, tap_({L}, 0), &res, &err));
     EXPECT_TRUE(err.find("KV-shared") != std::string::npos);
     // The boundary itself IS available: the tap is taken before the
     // collapse, so index max_tap_index() is still full width.
     err.clear();
-    EXPECT_TRUE(enc->encode(ids, {{enc->max_tap_index()}, 0}, &res, &err));
+    EXPECT_TRUE(enc->encode(ids, tap_({enc->max_tap_index()}, 0), &res, &err));
   }
 
   // A duplicate index would leave one of the two slots stale.
   err.clear();
-  EXPECT_TRUE(!enc->encode(ids, {{0, 1, 0}, 0}, &res, &err));
+  EXPECT_TRUE(!enc->encode(ids, tap_({0, 1, 0}, 0), &res, &err));
   EXPECT_TRUE(!err.empty());
 
   // No prefix key-mask on this model: honouring key_valid_len silently
   // would condition the states on the padding.
   err.clear();
-  EXPECT_TRUE(!enc->encode(ids, {{0}, 1}, &res, &err));
+  EXPECT_TRUE(!enc->encode(ids, tap_({0}, 1), &res, &err));
   EXPECT_TRUE(err.find("key_valid_len") != std::string::npos);
 
   // Nothing to encode.
   err.clear();
-  EXPECT_TRUE(!enc->encode({}, {{0}, 0}, &res, &err));
+  EXPECT_TRUE(!enc->encode({}, tap_({0}, 0), &res, &err));
   EXPECT_TRUE(!err.empty());
 }
 

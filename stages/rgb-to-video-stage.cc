@@ -32,13 +32,13 @@ namespace {
 // offers the values instead of leaving the user to find them in the doc
 // and then discover a typo at launch.
 constexpr SpecExtra kPixFmtChoices[] = {
-  {"choices", "yuv420p,yuv422p,yuv444p,rgb24"},
+  {spec_key::kChoices, "yuv420p,yuv422p,yuv444p,rgb24"},
 };
 constexpr SpecExtra kColorRangeChoices[] = {
-  {"choices", "limited,full"},
+  {spec_key::kChoices, "limited,full"},
 };
 constexpr SpecExtra kColorspaceChoices[] = {
-  {"choices", "bt601,bt709"},
+  {spec_key::kChoices, "bt601,bt709"},
 };
 
 const ConfigKey kAttrs[] = {

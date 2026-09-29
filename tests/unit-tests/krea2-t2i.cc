@@ -785,8 +785,8 @@ TEST(krea2_t2i, enc_quantized_hf_dir)
 }
 
 // Model-free: the iport contract is {conditioning, neg_conditioning, model,
-// sampler, scheduler, ref_latent0, ref_latent1, model_config} in that
-// order, and guidance_scale is a valid config attr.
+// sampler, scheduler, ref_latent0, ref_latent1, model_config, ref_latents}
+// in that order, and guidance_scale is a valid config attr.
 //
 // guidance_scale STAYS on the stage while the family-specific keys moved
 // to per-family config sources, and the line between them is worth
@@ -802,7 +802,7 @@ TEST(krea2_t2i, negative_prompt_ports_and_cfg_config)
   EXPECT_TRUE(s.config_error().empty());   // guidance_scale is accepted
 
   const auto& ip = s.spec().iports;
-  ASSERT_TRUE(ip.size() == 8);
+  ASSERT_TRUE(ip.size() == 9);
   EXPECT_TRUE(ip[0].name == "conditioning");
   EXPECT_TRUE(ip[1].name == "neg_conditioning");
   EXPECT_TRUE(ip[2].name == "model");
@@ -813,6 +813,8 @@ TEST(krea2_t2i, negative_prompt_ports_and_cfg_config)
   // Appended, so every earlier index keeps its meaning and a graph
   // written before the split still wires correctly.
   EXPECT_TRUE(ip[7].name == "model_config");
+  // ...and so is the reference LIST.
+  EXPECT_TRUE(ip[8].name == "ref_latents");
 }
 
 // Classifier-free guidance actually consumes the negative prompt: the SAME

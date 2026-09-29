@@ -414,27 +414,167 @@ TEST(session, swappable_other_bytes_is_bounded) {
 }
 #endif
 
+// Chdir into `dir` for the duration, then restore -- the db-path tests
+// all decide from the CWD, and a test that left the process somewhere
+// else would move the ones after it.
+struct ScopedCwd {
+  filesystem::path saved;
+  bool             ok = false;
+  explicit ScopedCwd(const filesystem::path& to) {
+    error_code ec;
+    saved = filesystem::current_path(ec);
+    if (ec) { return; }
+    filesystem::current_path(to, ec);
+    ok = !ec;
+  }
+  ~ScopedCwd() {
+    if (saved.empty()) { return; }
+    error_code ec;
+    filesystem::current_path(saved, ec);
+  }
+};
+
+// Materialise data.mdb / lock.mdb in `dir` by opening an env there.
+bool
+make_db_(const filesystem::path& dir)
+{
+  vpipe::Session sess(R"({"db":{"path":")" + dir.string() + R"("}})");
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  error_code ec;
+  return env != nullptr && env->valid() &&
+         filesystem::exists(dir / "data.mdb", ec);
+}
+
 TEST(session, lmdb_env_defaults_to_cwd_without_db_path) {
   // No db.path in config => lmdb_env() opens "." (the process
   // CWD). To avoid sprinkling data.mdb / lock.mdb files into the
   // build directory we chdir into a fresh tmpdir, exercise the
   // accessor, then restore the original CWD before the tmpdir is
   // removed.
+  //
+  // TWO levels down, and the intermediate is left empty on purpose: the
+  // default is "." only while the parent has no database of its own (see
+  // the sandbox test below), and one level down would make that depend on
+  // whatever happens to sit in the system temp directory.
   SessionTempDir dir;
   error_code ec;
-  filesystem::path saved_cwd = filesystem::current_path(ec);
+  const filesystem::path cwd = filesystem::path(dir.path) / "empty" / "run";
+  filesystem::create_directories(cwd, ec);
   ASSERT_FALSE(static_cast<bool>(ec));
-  filesystem::current_path(dir.path, ec);
-  ASSERT_FALSE(static_cast<bool>(ec));
-  {
-    vpipe::Session sess;
-    vpipe::LmdbEnv* env = sess.lmdb_env();
-    EXPECT_TRUE(env != nullptr);
-    if (env) {
-      EXPECT_TRUE(env->valid());
-    }
+  ScopedCwd chdir_(cwd);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) {
+    EXPECT_TRUE(env->valid());
+    EXPECT_TRUE(env->path() == ".");
   }
-  filesystem::current_path(saved_cwd, ec);
+}
+
+TEST(session, lmdb_env_adopts_the_database_beside_a_sandbox_cwd) {
+  // The web-ui's layout: the database sits in its starting directory and
+  // the pipelines it writes live in `sandbox` beneath it. A CLI run from
+  // inside `sandbox` finds no database in the CWD and must adopt the one
+  // beside it rather than create a second, empty one -- otherwise every
+  // registered model misses.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path sandbox = parent / "sandbox";
+  error_code ec;
+  filesystem::create_directories(sandbox, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  ASSERT_TRUE(make_db_(parent));
+
+  ScopedCwd chdir_(sandbox);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) {
+    EXPECT_TRUE(env->valid());
+    // Canonical on both sides: the adopted path comes from
+    // current_path(), which resolves symlinks, while temp_directory_path()
+    // does not -- on macOS that is /private/var against /var for the same
+    // directory.
+    error_code e1, e2;
+    EXPECT_TRUE(filesystem::canonical(filesystem::path(string(env->path())),
+                                      e1) ==
+                filesystem::canonical(parent, e2));
+    EXPECT_FALSE(static_cast<bool>(e1));
+    EXPECT_FALSE(static_cast<bool>(e2));
+  }
+  // ...and nothing was created in the sandbox itself.
+  EXPECT_FALSE(filesystem::exists(sandbox / "data.mdb", ec));
+}
+
+TEST(session, lmdb_env_keeps_a_database_that_is_in_the_cwd) {
+  // The CWD's own database WINS over the parent's, so a nested working
+  // directory that has been used before keeps using what it has. Both
+  // directories hold one here, which is the only arrangement that can
+  // tell the two rules apart.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path child = parent / "child";
+  error_code ec;
+  filesystem::create_directories(child, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  ASSERT_TRUE(make_db_(parent));
+  ASSERT_TRUE(make_db_(child));
+
+  ScopedCwd chdir_(child);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) { EXPECT_TRUE(env->path() == "."); }
+}
+
+TEST(session, lmdb_env_ignores_a_parent_holding_only_a_lock_file) {
+  // A stray lock.mdb is not a database: adopting a directory on the
+  // strength of one would point the run at an empty env that LMDB then
+  // creates beside the lock. The DATA file is what says a database is
+  // there.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path child = parent / "child";
+  error_code ec;
+  filesystem::create_directories(child, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  { ofstream(parent / "lock.mdb") << "not a database"; }
+
+  ScopedCwd chdir_(child);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) { EXPECT_TRUE(env->path() == "."); }
+}
+
+TEST(session, configured_db_path_beats_the_sandbox_rule) {
+  // An explicit db.path is used as given, whatever the CWD looks like.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path sandbox = parent / "sandbox";
+  const filesystem::path elsewhere = parent / "elsewhere";
+  error_code ec;
+  filesystem::create_directories(sandbox, ec);
+  filesystem::create_directories(elsewhere, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  ASSERT_TRUE(make_db_(parent));
+
+  ScopedCwd chdir_(sandbox);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess(R"({"db":{"path":")" + elsewhere.string() +
+                      R"("}})");
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) { EXPECT_TRUE(env->path() == elsewhere.string()); }
 }
 
 TEST(session, lmdb_env_lazily_opens_when_db_path_configured) {

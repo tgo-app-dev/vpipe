@@ -12,6 +12,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 namespace metal_compute { class MetalCompute; }
@@ -70,6 +74,11 @@ struct HiddenTapRequest {
   // encoder that cannot honour it must FAIL rather than return the
   // normed state, which is indistinguishable downstream.
   bool skip_final_norm = false;
+
+  // Anything this struct has no field for: see common/flex-bag.h. The
+  // caller allocates this struct, so a field appended to it would be one
+  // an older caller's copy does not have.
+  FlexData extra;
 };
 
 // [slot][pos][hidden] in the model's compute dtype, slot j being
@@ -83,6 +92,11 @@ struct HiddenTapResult {
   // The dtype the buffer holds, so a consumer converts once and
   // correctly rather than assuming. "bf16" or "f16".
   std::string dtype;
+
+  // Anything this struct has no field for: see common/flex-bag.h. The
+  // CALLER allocates this and the encoder fills it, so an encoder newer
+  // than its caller writes what it adds here rather than past the end.
+  FlexData extra;
 
   bool valid() const { return !data.empty() && slots > 0 && tokens > 0; }
 };
@@ -189,6 +203,10 @@ struct HiddenStateEncoderArgs {
   // architecture but not the problem -- which is the difference between
   // a missing tensor and an unparseable config.
   std::string*                 err = nullptr;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  // (`config` above is the MODEL's config, not this.)
+  FlexData                     extra;
 };
 
 using HiddenStateEncoderFactory =
@@ -204,6 +222,7 @@ using HiddenStateEncoderFactory =
 // only a path can still open the right encoder -- which is what a
 // conditioner serving several families needs.
 class HiddenStateEncoderRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static HiddenStateEncoderRegistry& get() noexcept;
 
@@ -232,5 +251,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

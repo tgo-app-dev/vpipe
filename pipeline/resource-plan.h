@@ -24,12 +24,17 @@
 #ifndef RESOURCE_PLAN_H
 #define RESOURCE_PLAN_H
 
+#include "common/flex-data.h"
 #include <memory>
 #include <mutex>
 #include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -86,6 +91,9 @@ struct ResourceClaim {
   // A planner reports both totals so a graph that does not fit preloaded
   // but does fit streamed is distinguishable from one that fits neither.
   std::size_t floor_bytes = 0;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Consumes the claims of ONE kind across a launch.
@@ -150,6 +158,7 @@ public:
 // StageRegistry: a plugin library MUST link the host libvpipe shared so
 // it observes this instance rather than forking a second one.
 class ResourcePlannerRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static ResourcePlannerRegistry& get() noexcept;
 
@@ -187,5 +196,7 @@ private:
     return 0; }(); }
 
 }
+
+VPIPE_API_END
 
 #endif

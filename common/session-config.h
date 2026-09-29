@@ -4,6 +4,11 @@
 #include "common/flex-data.h"
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 // Parses a Session config string into a FlexData tree. Rules:
@@ -25,5 +30,7 @@ namespace vpipe {
 FlexData parse_session_config(std::string_view src);
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

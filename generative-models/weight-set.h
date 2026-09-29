@@ -71,6 +71,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 }
@@ -81,6 +85,7 @@ namespace vpipe::genai {
 
 class WeightSet : public WeightOwner,
                   public std::enable_shared_from_this<WeightSet> {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // How a tensor is materialised.
   //
@@ -109,12 +114,14 @@ public:
   WeightSet(const WeightSet&)            = delete;
   WeightSet& operator=(const WeightSet&) = delete;
 
-  const std::string& dir() const noexcept { return _dir; }
+  // Out of line, like every WeightSet method: a plugin holds a WeightSet
+  // through a shared_ptr and must never compile knowledge of its members.
+  const std::string& dir() const noexcept;
 
   // The underlying checkpoint, for callers that need info() /
   // tensor_names() / their own read strategy (the streaming DiTs re-read
   // blocks per forward and deliberately do not cache).
-  const MetalLlamaWeights& src() const noexcept { return *_wts; }
+  const MetalLlamaWeights& src() const noexcept;
 
   bool has(const std::string& name) const;
 
@@ -424,5 +431,7 @@ open_weight_set(const std::string&        dir,
                 const std::string&        variant = {});
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

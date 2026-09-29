@@ -5,6 +5,11 @@
 #include <string>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 // Request to confine the CURRENT process's filesystem WRITES at the OS
@@ -51,5 +56,7 @@ OsSandboxStatus
 apply_os_file_sandbox(const OsSandboxSpec& spec, std::string* err);
 
 }  // namespace vpipe
+
+VPIPE_HOST_API_END
 
 #endif  // VPIPE_OS_SANDBOX_H

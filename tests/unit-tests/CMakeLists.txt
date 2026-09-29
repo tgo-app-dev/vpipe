@@ -1,6 +1,8 @@
 set(LOCAL_TEST_SOURCES
   accel-settings.cc
   image-model-registry.cc
+  image-references.cc
+  video-generation-inputs.cc
   buffer-stage.cc
   byte-track-stage.cc
   call-stage.cc
@@ -25,6 +27,7 @@ set(LOCAL_TEST_SOURCES
   oport-buffer-wrap.cc
   ffmpeg-libraries.cc
   ffmpeg-log-tap.cc
+  flex-bag.cc
   flex-data.cc
   graph-move-iport.cc
   load-image-stage.cc
@@ -106,6 +109,7 @@ if(APPLE)
 endif()
 if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     list(APPEND LOCAL_TEST_SOURCES
+        kernel-contract.cc
         save-audio-stage.cc
         audio-segment-stage.cc
         audio-tagging-stage.cc

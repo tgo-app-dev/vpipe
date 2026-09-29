@@ -14,6 +14,10 @@
 #include <utility>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class MlxRuntime;
 class SessionContextIntf;
@@ -59,6 +63,7 @@ enum class ComputeDtype { F16, BF16, F32 };
 // per device, so this matches the underlying compute reality; the
 // future batch-decode path will relax the serialisation.
 class LoadedLanguageModel {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   ~LoadedLanguageModel();
 
@@ -533,5 +538,7 @@ build_mrope_position_ids(
     int*                                     out_rope_next_position);
 
 }
+
+VPIPE_API_END
 
 #endif

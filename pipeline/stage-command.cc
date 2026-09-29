@@ -1051,7 +1051,7 @@ open_stage_command(Stage& s, std::string_view name, FlexData args,
   const CommandSpec* cs = find_command(sp, name);
   if (cs == nullptr) {
     string names;
-    for (const CommandSpec& c : sp.commands) {
+    for (const CommandSpec& c : spec_commands(sp)) {
       if (!names.empty()) { names += ", "; }
       names += string(c.name);
     }
@@ -1115,7 +1115,7 @@ describe_commands(const StageSpec& spec)
   };
   FlexData arr = FlexData::make_array();
   auto av = arr.as_array();
-  for (const CommandSpec& c : spec.commands) {
+  for (const CommandSpec& c : spec_commands(spec)) {
     FlexData e = FlexData::make_object();
     auto eo = e.as_object();
     eo.insert("name", FlexData::make_string(c.name));

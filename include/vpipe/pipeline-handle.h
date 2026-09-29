@@ -28,6 +28,10 @@
 #include <string_view>
 #include <vector>
 
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class PipelineHandleImpl;
@@ -167,5 +171,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -7,6 +7,10 @@
 #include <string>
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 struct VpipeFormat {
@@ -83,6 +87,8 @@ human_duration(double seconds)
 }
 
 }
+
+VPIPE_API_END
 
 #endif
 

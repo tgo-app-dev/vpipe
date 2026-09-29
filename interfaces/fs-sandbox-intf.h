@@ -14,6 +14,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class FsSandboxIntf {
@@ -57,5 +61,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <memory>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Where a TensorBeat's backing bytes physically live, and what kinds
@@ -69,5 +73,7 @@ struct ExternalStorageHandle {
 };
 
 }
+
+VPIPE_API_END
 
 #endif

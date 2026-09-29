@@ -10,6 +10,10 @@
 #include <mutex>
 #include <string>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace MTL {
 class CommandBuffer;
 class CommandQueue;
@@ -208,8 +212,14 @@ private:
   // Created lazily on the first fire-and-forget commit; shared with every
   // Fence this stream returns. See Failure.
   std::shared_ptr<Failure> _fail;
+  // RESERVED for the next field (plugin ABI): a plugin holds this type BY
+  // VALUE, so its size is compiled into every plugin in the support
+  // window. A new member takes a reserved slot instead of growing it.
+  std::uintptr_t _reserved[2] = {};
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

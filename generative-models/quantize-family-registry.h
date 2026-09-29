@@ -1,11 +1,17 @@
 #ifndef VPIPE_GENERATIVE_MODELS_QUANTIZE_FAMILY_REGISTRY_H
 #define VPIPE_GENERATIVE_MODELS_QUANTIZE_FAMILY_REGISTRY_H
 
+#include "common/flex-data.h"
+
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe::genai {
 
@@ -79,6 +85,9 @@ struct QuantizableComponent {
   // pipeline it came from is still recognisable. Optional: its own
   // config says what architecture it is, not what job it did.
   std::string component_tag;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 class QuantizableFamily {
@@ -101,9 +110,23 @@ public:
   // reported in when `target` names none of them, so put the one a
   // caller most likely wants first.
   virtual std::vector<QuantizableComponent> components() const = 0;
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 class QuantizeFamilyRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static QuantizeFamilyRegistry& get() noexcept;
 
@@ -129,5 +152,7 @@ private:
 };
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

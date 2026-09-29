@@ -7,6 +7,10 @@
 #include "interfaces/runtime-services-intf.h"
 #include "interfaces/ui-port-intf.h"
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class SessionServicesIntf;
@@ -55,5 +59,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

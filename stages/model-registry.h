@@ -1,9 +1,15 @@
 #ifndef STAGES_MODEL_REGISTRY_H
 #define STAGES_MODEL_REGISTRY_H
 
+#include "common/flex-data.h"
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -16,6 +22,30 @@ class FlexData;
 // about where a model reference resolves. The leading underscores keep it
 // out of the way of the user-named sub-dbs (cameras, videos, ...).
 inline constexpr std::string_view kModelRegistryDb = "__vpipe_model_registry";
+
+// The directory the session's databases live in: where its LmdbEnv
+// actually opened, made absolute.
+//
+// NOT always the process CWD. A CLI run started inside the web-ui's
+// `sandbox` directory adopts the database beside it, one level up, so
+// that a pipeline authored in the web-ui resolves the same models from
+// either (see Session::lmdb_env). Anything anchored to the DATABASE --
+// the default parent for model directories, a registry record that
+// stored a relative path -- must be measured from here rather than from
+// the CWD, or a CLI run one directory down disagrees with the web-ui
+// about where the same name points.
+//
+// Opens the env if it is not open yet (that is what says where it is).
+// Falls back to the CWD when the session has none.
+std::filesystem::path
+session_db_dir(const SessionContextIntf* session);
+
+// `<session_db_dir>/models`: the default parent directory for model
+// directories this process WRITES -- model-fetch's downloads,
+// model-quantize's and lora-fuse's outputs. One spelling, so a fetch and
+// the quantize that reads it cannot land in different trees.
+std::filesystem::path
+default_models_dir(const SessionContextIntf* session);
 
 // Resolve a model reference to a directory. If `ref` is a key in the
 // model registry (kModelRegistryDb, the sub-db model-fetch writes, keyed
@@ -51,6 +81,9 @@ struct ResolvedModel {
   // cannot answer, and answers WRONGLY rather than loudly.
   std::vector<std::string> files;
   bool from_registry = false;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Resolve `ref` to a directory AND whatever the registry says about it.
@@ -126,5 +159,7 @@ apply_model_select_beat(const FlexData& beat,
                         std::string&    hf_dir);
 
 }
+
+VPIPE_API_END
 
 #endif

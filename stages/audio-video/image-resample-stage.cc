@@ -93,10 +93,10 @@ namespace {
 // These must agree with the ctor's own branch chains above, which stay
 // the authority on what is accepted.
 constexpr SpecExtra kFitChoices[] = {
-  {"choices", "pad,crop,stretch,manual"},
+  {spec_key::kChoices, "pad,crop,stretch,manual"},
 };
 constexpr SpecExtra kAlgorithmChoices[] = {
-  {"choices", "lanczos,bilinear,bicubic"},
+  {spec_key::kChoices, "lanczos,bilinear,bicubic"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "width",  .type = ConfigType::Int,

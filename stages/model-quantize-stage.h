@@ -37,7 +37,8 @@ namespace genai { struct QuantArchInfo; }
 // Registry-aware:
 //   * src_model may be a models-DB key (registered by model-fetch) OR a path.
 //   * output_name names the result: a bare name (or "org/name") -> the output
-//     dir is inferred as <cwd>/models/<output_name> and the result is
+//     dir is inferred as models/<output_name> beside the session database
+//     (see default_models_dir) and the result is
 //     registered in the models DB under that key. An absolute/relative path
 //     ("/..", "./..") is used verbatim and NOT registered.
 //   * arch / n_layers / layer_prefix are auto-detected from the source
@@ -56,7 +57,8 @@ namespace genai { struct QuantArchInfo; }
 //                  scale per tensor or per row) as code * scale, and its
 //                  scale tensors are not written out. MXFP8, NVFP4, int8
 //                  and block-scaled encodings are refused by name.
-//   output_name   (string, required) -- result name (-> <cwd>/models/<name>,
+//   output_name   (string, required) -- result name (-> models/<name> beside
+//                  the session database,
 //                  registered) or an explicit path ("/..", "./..").
 //   bits          (uint, default 8)  -- backbone affine bit-width (4 | 8),
 //                  or 16: a DENSE output that quantizes nothing -- FP8

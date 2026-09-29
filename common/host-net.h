@@ -9,6 +9,11 @@
 #include <utility>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe::netx {
 
 // Thin RAII wrapper around an IPv4 UDP socket. Used by WS-Discovery
@@ -103,5 +108,7 @@ tcp_request(std::string_view          host,
             std::chrono::milliseconds timeout);
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

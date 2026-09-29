@@ -403,12 +403,12 @@ namespace {
 // and using `auto`, so the dropdown is what keeps a typo from silently
 // becoming a different decode route.
 constexpr SpecExtra kHwaccelChoices[] = {
-  {"choices", "auto,videotoolbox,none"},
+  {spec_key::kChoices, "auto,videotoolbox,none"},
 };
 // The element types this stage emits, for the editor's dropdown; the
 // ctor's own check stays the authority.
 constexpr SpecExtra kOutputDtypeChoices[] = {
-  {"choices", "f32,u8"},
+  {spec_key::kChoices, "f32,u8"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "normalize", .type = ConfigType::Bool,

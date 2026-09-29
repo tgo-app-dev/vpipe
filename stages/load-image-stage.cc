@@ -160,7 +160,7 @@ LoadImageStage::LoadImageStage(const SessionContextIntf* s,
 
 namespace {
 constexpr SpecExtra kAlphaChoices[] = {
-  {"choices", "drop,keep"},
+  {spec_key::kChoices, "drop,keep"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "url", .type = ConfigType::Any, .required = true,
@@ -194,7 +194,17 @@ const PortSpec kOports[] = {
                               "save-image's metadata iport",
    .type = &typeid(FlexDataPayload),
    .tags = "image-metadata", .clock_group = 0},
+  {.name = "images",
+   .doc = "EVERY image of `url` as ONE LIST beat, in url order, each in "
+          "the `image` port's format and at its own size -- the reference "
+          "set of a multi-reference edit, for vae-encode's `images` and the "
+          "conditioner's `ref_images`. Emitted once per run, ahead of any "
+          "pacing; with only this port wired the stage ends after it. An "
+          "image that cannot be decoded is left out and said so",
+   .type = &typeid(TensorListPayload),
+   .tags = "rgb-frames-list", .clock_group = 0},
 };
+constexpr unsigned kImagesPort = 2;
 const StageSpec kSpec = {
   .type_name = "load-image",
   .doc       = "Source: decodes still images from files/URLs (FFmpeg) to "
@@ -511,11 +521,38 @@ LoadImageStage::reset_run_state()
   // nothing downstream would see an image and the pipeline would
   // "complete" in milliseconds.
   _next = 0;
+  _list_emitted = false;
 }
 
 Job
 LoadImageStage::process(RuntimeContext& ctx)
 {
+  // The whole url list as ONE beat, once per run, when that port is wired.
+  if (!_list_emitted && ctx.num_oports() > kImagesPort &&
+      ctx.has_consumers(kImagesPort)) {
+    _list_emitted = true;
+    auto list = std::make_unique<TensorListPayload>();
+    for (const string& url : _urls) {
+      auto p = decode_url_(url);
+      auto* tb = p ? dynamic_cast<TensorBeatPayload*>(p.get()) : nullptr;
+      if (tb == nullptr) {
+        session()->warn(fmt(
+            "LoadImageStage('{}'): '{}' could not be decoded; the `images` "
+            "list goes out without it", this->id(), url));
+        continue;
+      }
+      list->items.push_back(std::move(static_cast<TensorBeat&>(*tb)));
+    }
+    co_await ctx.write(kImagesPort, std::move(list));
+    // Nothing reads the one-at-a-time ports: the list was the whole job.
+    const bool singles = ctx.has_consumers(0) ||
+                         (ctx.num_oports() > 1 && ctx.has_consumers(1));
+    if (!singles) {
+      ctx.signal_done();
+      co_return;
+    }
+  }
+
   if (_next >= _urls.size()) {
     ctx.signal_done();
     co_return;

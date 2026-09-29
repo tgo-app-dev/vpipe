@@ -1,6 +1,10 @@
 #ifndef VPIPE_APPLE_SILICON_METAL_COMPUTE_FENCE_H
 #define VPIPE_APPLE_SILICON_METAL_COMPUTE_FENCE_H
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace MTL { class Fence; }
 
 namespace vpipe::metal_compute {
@@ -62,5 +66,7 @@ private:
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

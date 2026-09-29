@@ -27,6 +27,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
@@ -280,5 +284,7 @@ private:
 };
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

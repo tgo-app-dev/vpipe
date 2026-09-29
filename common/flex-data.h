@@ -14,6 +14,10 @@
 #include <string_view>
 #include <utility>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 enum class FlexKind : unsigned char {
@@ -291,5 +295,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

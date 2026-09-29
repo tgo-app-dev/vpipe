@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,18 @@ float silu_(float x) { return x / (1.0f + std::exp(-x)); }
 }  // namespace
 
 MetalMageVae::~MetalMageVae() = default;
+
+bool
+MetalMageVae::is_native_checkpoint(const std::string& path)
+{
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(path, ec) || ec) { return false; }
+  auto w = MetalLlamaWeights::open_model(path);
+  return w.has_value() &&
+         w->has("pipeline.dec_net.cond_embed.weight") &&
+         w->has("pipeline.x_embedder.embedder.0.weight") &&
+         w->has("pipeline.final_layer.linear.weight");
+}
 
 // ---------------------------------------------------------------------------
 // Load helpers

@@ -4,6 +4,7 @@
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/generation-input.h"
 
 // The video denoisers (MetalWanTransformer, MetalMiniMaxH3Transformer) are
 // from-scratch metal-compute modules on the VPIPE_BUILD_APPLE_SILICON axis.
@@ -185,7 +186,9 @@ struct TensorBeat;
 //                              re-authored. The adjustment is logged.
 //   fps              (real) -- stamped on the latent for the decoder
 //   steps            (int)  -- denoising steps
-//   seed             (int)  -- initial-noise RNG seed
+//   seed             (int)  -- initial-noise RNG seed of the first clip
+//   seed_sequence    (string) -- increment|randomize|keep: the seed of
+//                              each later clip of the run
 //   unload_when_idle (string) -- auto|always|never
 //
 // Everything family-specific lives on iport9 instead; see the config
@@ -357,13 +360,33 @@ private:
   // generative-models/shared/accel-settings.h for why the boundary is a
   // bag and not fields.
   FlexData _accel{};
-  std::uint64_t _seed   = 0;
+  // THE SEED. `_seed_base` is what the graph configured; `_seed` is what
+  // THIS clip uses, settled at the top of each generation by
+  // `seed_sequence` (stages/generation-input.h), so every family below
+  // reads `_seed` and none has to know which clip of the run it is.
+  SeedSequence  _seed_seq  = SeedSequence::kIncrement;
+  std::uint64_t _seed_base = 0;
+  std::uint64_t _seed      = 0;
+  // Generations started this run, the one in progress included.
+  std::uint64_t _generation = 0;
   std::uint64_t _emitted = 0;
 
   bool _model_latched     = false;
-  bool _sampler_latched   = false;
-  bool _scheduler_latched = false;
-  bool _cfg_latched       = false;
+
+  // THE GENERATION INPUTS (stages/generation-input.h): one beat and the
+  // end of its stream serves every clip of the run, a stream that keeps
+  // sending is consumed a beat per clip, and the run ends when a
+  // consumed stream does. Each is HELD between clips, which is what lets
+  // a single first-frame picture serve every prompt. The negative
+  // (iport1) is not an input of its own: the conditioner emits it just
+  // before the positive it belongs to, and only for prompts that have
+  // one, so it is read with each fresh conditioning and held with it.
+  GenerationInput _cond_in, _sampler_in, _scheduler_in, _cfg_in;
+  GenerationInput _ref0_in, _ref1_in, _ref_video_in, _ref_audio_in,
+                  _audio_cond_in;
+  std::unique_ptr<BeatPayloadIntf> _cond_beat, _neg_beat;
+  std::unique_ptr<BeatPayloadIntf> _ref0_beat, _ref1_beat, _ref_video_beat,
+                                   _ref_audio_beat, _audio_cond_beat;
 
   // The last model-config beat, held UNPARSED. Which family's parser
   // reads it is not known until the checkpoint resolves, and a config

@@ -200,7 +200,7 @@ namespace {
 // of the two aliased formats are offered, because both are accepted and
 // a config may hold either.
 constexpr SpecExtra kFormatChoices[] = {
-  {"choices", "png,jpeg,jpg,webp,bmp,tiff,tif"},
+  {spec_key::kChoices, "png,jpeg,jpg,webp,bmp,tiff,tif"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,

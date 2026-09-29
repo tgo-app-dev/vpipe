@@ -53,6 +53,10 @@
 #include <string>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 }
@@ -133,6 +137,7 @@ public:
 };
 
 class WeightRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit WeightRegistry(const SessionContextIntf* session)
     : _session(session) {}
@@ -221,5 +226,7 @@ private:
 };
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

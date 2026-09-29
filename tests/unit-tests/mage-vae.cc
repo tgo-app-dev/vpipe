@@ -16,12 +16,18 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
 #include "common/session.h"
 #include "generative-models/mage/metal-mage-vae.h"
+#include "pipeline/resource-plan.h"
+#include "stages/model-detect.h"
+#include "stages/vae-decode-stage.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -57,6 +63,31 @@ rel_l2_(const float* a, const float* b, std::size_t n)
     den += (double)b[i] * (double)b[i];
   }
   return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+}
+
+// A header-complete safetensors of zero F32 tensors, one element per
+// name, so a loader can see the names without the bytes mattering.
+void
+write_names_(const std::filesystem::path& p,
+             const std::vector<std::string>& names)
+{
+  std::filesystem::create_directories(p.parent_path());
+  std::string hdr = "{";
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    if (i != 0) { hdr += ","; }
+    hdr += "\"" + names[i] + "\":{\"dtype\":\"F32\",\"shape\":[1],"
+           "\"data_offsets\":[" + std::to_string(i * 4) + "," +
+           std::to_string(i * 4 + 4) + "]}";
+  }
+  hdr += "}";
+  while (hdr.size() % 8 != 0) { hdr += ' '; }
+  std::ofstream f(p, std::ios::binary);
+  const std::uint64_t len = hdr.size();
+  f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  const std::vector<float> zeros(names.size(), 0.0f);
+  f.write(reinterpret_cast<const char*>(zeros.data()),
+          (std::streamsize)(zeros.size() * sizeof(float)));
 }
 
 }  // namespace
@@ -286,4 +317,64 @@ TEST(mage_vae, saturated_white_decodes_without_nan)
   EXPECT_TRUE(inf == 0);
   // White in, white out: the codec round-trips a constant field to ~+1.
   EXPECT_TRUE(mean > 0.9);
+}
+
+// THE COMFY-ORG REPACK: the MageVAE as one freely-named file under `vae/`
+// with no config anywhere -- the repack drops it, and the original repos
+// that carry it are gated. Without a config the host used to resolve the
+// VAE to the REPOSITORY ROOT: the decode opened the root (and read no
+// checkpoint), and the claim named the whole repack, 18 GB for a 290 MB
+// VAE. The file's own tensors are what say what it is.
+TEST(mage_vae, a_config_free_repack_resolves_to_its_file)
+{
+  namespace fs = std::filesystem;
+  // Canonical, so the stage's own resolution of `hf_dir` names the same
+  // strings (the temp dir is a symlink on macOS).
+  const fs::path base =
+      fs::canonical(fs::temp_directory_path()) / "vpipe-mage-vae-comfy";
+  std::error_code ec;
+  fs::remove_all(base, ec);
+
+  const fs::path root = base / "Mage-Flow";
+  const fs::path vae = root / "vae" / "mage_flow_vae_bf16.safetensors";
+  write_names_(vae, {"pipeline.dec_net.cond_embed.weight",
+                     "pipeline.x_embedder.embedder.0.weight",
+                     "pipeline.final_layer.linear.weight",
+                     "student.dconv_encoder.head.weight"});
+  // The repack's other components, which the VAE must not be taken for.
+  write_names_(root / "diffusion_models" / "mage_flow_bf16.safetensors",
+               {"blocks.0.attn.weight", "blocks.1.attn.weight"});
+  write_names_(root / "text_encoders" / "qwen3vl_4b_bf16.safetensors",
+               {"model.language_model.embed_tokens.weight"});
+
+  EXPECT_TRUE(MetalMageVae::is_native_checkpoint(vae.string()));
+  EXPECT_FALSE(MetalMageVae::is_native_checkpoint(root.string()));
+  EXPECT_TRUE(resolve_vae_dir(root.string()) == vae.string());
+
+  // ...and the claim follows it: vae-decode declares the FILE.
+  {
+    Session sess;
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(root.string()));
+    VaeDecodeStage stage(&sess, "vae", std::vector<InEdge>{},
+                         std::move(cfg));
+    bool file = false, whole = false;
+    for (const ResourceClaim& c : stage.declare_resources()) {
+      if (c.key == vae.string()) { file = true; }
+      if (c.key == root.string()) { whole = true; }
+    }
+    EXPECT_TRUE(file);
+    EXPECT_FALSE(whole);
+  }
+
+  // Another family's single-file `vae/` is NOT this, and keeps resolving
+  // as it did: the rule is the MageVAE's tensors, not the directory shape.
+  const fs::path other = base / "Other";
+  write_names_(other / "vae" / "ae.safetensors",
+               {"decoder.conv_in.weight", "encoder.conv_in.weight"});
+  EXPECT_FALSE(MetalMageVae::is_native_checkpoint(
+      (other / "vae" / "ae.safetensors").string()));
+  EXPECT_TRUE(resolve_vae_dir(other.string()) == other.string());
+
+  fs::remove_all(base, ec);
 }

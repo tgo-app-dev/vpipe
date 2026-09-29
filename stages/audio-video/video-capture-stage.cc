@@ -164,7 +164,7 @@ namespace {
 // The element types this stage emits, for the editor's dropdown; the
 // ctor's own check stays the authority.
 constexpr SpecExtra kOutputDtypeChoices[] = {
-  {"choices", "u8,f32"},
+  {spec_key::kChoices, "u8,f32"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "device_id", .type = ConfigType::Uint,

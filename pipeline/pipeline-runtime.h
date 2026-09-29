@@ -13,6 +13,11 @@
 #include <string>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 class CommandInbox;
@@ -206,5 +211,7 @@ private:
 };
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

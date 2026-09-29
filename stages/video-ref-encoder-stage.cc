@@ -1,4 +1,5 @@
 #include "stages/video-ref-encoder-stage.h"
+#include "generative-models/gen-input.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -69,7 +70,7 @@ constexpr const char* kRefPortDoc =
 // would release 0 bytes even if the policy reached it (see the claim
 // comment below). The legacy "always" / "never" stay accepted.
 constexpr SpecExtra kUnloadChoices[] = {
-  {"choices", "auto,destroy,keep"},
+  {spec_key::kChoices, "auto,destroy,keep"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "references", .type = ConfigType::Any, .required = false,
@@ -259,7 +260,10 @@ const StageSpec kSpec = {
                "`frames`. EITHER PARTITION: references are Ref2VA's trained "
                "task, and the FL2VA weights take them too as upstream's "
                "Ref2VA-like mode -- images only there, and at a 768 short "
-               "edge rather than 2048.",
+               "edge rather than 2048. The prompt and reference ports pair "
+               "the way generate-video's inputs do: one beat and the end of "
+               "its stream serves every request, a stream that keeps "
+               "sending is consumed a beat per request.",
   .display_name = "Video Reference Encoder",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -513,6 +517,14 @@ VideoRefEncoderStage::reset_run_state()
   // beat is never latched and the stage keeps the previous run's model.
   _model_latched   = false;
   _unload_resolved = false;
+  // A run's beats pair among themselves, never with the last run's.
+  static_assert(kNumRefPorts == (unsigned)kRefInputs);
+  _prompt_in.reset();
+  _prompt_beat.reset();
+  for (int i = 0; i < kRefInputs; ++i) {
+    _ref_in[i].reset();
+    _ref_beat[i].reset();
+  }
 }
 
 StageMemory
@@ -1318,13 +1330,41 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     ensure_loaded_();
   }
 
-  auto pb = co_await ctx.read(0);
-  if (!pb) { ctx.signal_done(); co_return; }
-  const auto* pfd = dynamic_cast<const FlexDataPayload*>(pb.get());
+  // ONE CALL, ONE REQUEST. The prompt and every reference port are read
+  // here, up front, and paired by the generation rule -- before anything
+  // can end the request early, because pairing is by position in each
+  // stream. No prompt at all ends the run.
+  using Took = GenerationInput::Took;
+  GenerationRound round;
+  if (_prompt_in.wants()) {
+    auto pb = co_await ctx.read(0);
+    const Took took = _prompt_in.took(pb != nullptr);
+    if (round.note(took) || took == Took::kNone) {
+      ctx.signal_done();
+      co_return;
+    }
+    if (took == Took::kFresh) { _prompt_beat = std::move(pb); }
+  }
+  if (!_prompt_beat) { ctx.signal_done(); co_return; }
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    const unsigned i = p - kFirstRefPort;
+    if (ctx.num_iports() <= p || !ctx.iport_connected(p) ||
+        !_ref_in[i].wants()) {
+      continue;
+    }
+    auto rb = co_await ctx.read(p);
+    const Took took = _ref_in[i].took(rb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took == Took::kFresh) { _ref_beat[i] = std::move(rb); }
+  }
+  // Nothing new on any input: this request would repeat the last one.
+  if (round.idle()) { ctx.signal_done(); co_return; }
+
+  const auto* pfd = dynamic_cast<const FlexDataPayload*>(_prompt_beat.get());
   if (pfd == nullptr) {
     session()->warn(fmt(
         "VideoRefEncoderStage('{}'): expected a FlexData prompt, got {}; "
-        "skipping", this->id(), pb->describe()));
+        "skipping", this->id(), _prompt_beat->describe()));
     co_return;
   }
   const std::string prompt = prompt_of_(pfd->data);
@@ -1351,17 +1391,18 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   bool port_said_none = false;
 
   // ---- the tensor reference iports ----------------------------------
-  // Read unconditionally when WIRED, in port order, appended after the
-  // config list. Not polled: a wired producer beats every request (an
-  // empty tensor is how it says "nothing this time"), so a poll would be
-  // a race where a read is not -- the same rule generate-video applies
-  // to the reference-row ports it reads from this stage. It is also what
-  // keeps the NUMBERING static, and the numbering is the request: a port
-  // that could fall silent would renumber every reference after it.
+  // What each WIRED port holds for this request (read above), in port
+  // order, appended after the config list. Read with a blocking read,
+  // never polled: a producer that beats every request (an empty tensor
+  // is how it says "nothing this time") would race a poll -- the same
+  // rule generate-video applies to the reference-row ports it reads from
+  // this stage. It is also what keeps the NUMBERING static, and the
+  // numbering is the request: a port that could fall silent would
+  // renumber every reference after it.
   for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
     if (ctx.num_iports() <= p || !ctx.iport_connected(p)) { continue; }
-    auto rb = co_await ctx.read(p);
-    const auto* tb = dynamic_cast<const TensorBeatPayload*>(rb.get());
+    const BeatPayloadIntf* rb = _ref_beat[p - kFirstRefPort].get();
+    const auto* tb = dynamic_cast<const TensorBeatPayload*>(rb);
     if (tb == nullptr) {
       if (rb) {
         session()->warn(fmt(
@@ -1679,28 +1720,29 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     for (int v : enc.token_tags) {
       tags.as_array().push_back(FlexData::make_int(v));
     }
-    o.insert_or_assign("token_tags", std::move(tags));
+    namespace ck = genai::cond_sideband;
+    o.insert_or_assign(ck::kTokenTags, std::move(tags));
     FlexData rl = FlexData::make_array();
     for (const auto& L : enc.layout) {
       FlexData r = FlexData::make_object();
       auto ro = r.as_object();
       ro.insert_or_assign(
-          "kind",
+          ck::kKind,
           FlexData::make_string(
-              L.kind == h3::Reference::Kind::kImage   ? "image"
-              : L.kind == h3::Reference::Kind::kVideo ? "video"
-                                                      : "audio"));
-      ro.insert_or_assign("latent_frames",
+              L.kind == h3::Reference::Kind::kImage   ? ck::kImage
+              : L.kind == h3::Reference::Kind::kVideo ? ck::kVideo
+                                                      : ck::kAudio));
+      ro.insert_or_assign(ck::kLatentFrames,
                           FlexData::make_int(L.num_latent_frames));
-      ro.insert_or_assign("latent_height",
+      ro.insert_or_assign(ck::kLatentHeight,
                           FlexData::make_int(L.latent_height));
-      ro.insert_or_assign("latent_width",
+      ro.insert_or_assign(ck::kLatentWidth,
                           FlexData::make_int(L.latent_width));
-      ro.insert_or_assign("audio_latents",
+      ro.insert_or_assign(ck::kAudioLatents,
                           FlexData::make_int(L.num_audio_latents));
       rl.as_array().push_back(std::move(r));
     }
-    o.insert_or_assign("references", std::move(rl));
+    o.insert_or_assign(ck::kReferences, std::move(rl));
     t->sideband = std::move(sb);
     co_await ctx.write(0, std::move(t));
   }

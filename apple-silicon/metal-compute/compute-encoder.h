@@ -6,6 +6,10 @@
 #include <type_traits>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace MTL {
 class Buffer;
 class CommandBuffer;
@@ -285,8 +289,14 @@ private:
   std::vector<std::uint8_t> _pending_bytes;
   MTL::ComputePipelineState* _pending_pso = nullptr;
   DispatchType _dt = DispatchType::Serial;
+  // RESERVED for the next field (plugin ABI): a plugin holds this type BY
+  // VALUE, so its size is compiled into every plugin in the support
+  // window. A new member takes a reserved slot instead of growing it.
+  std::uintptr_t _reserved[2] = {};
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

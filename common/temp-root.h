@@ -3,6 +3,11 @@
 
 #include <filesystem>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 // The application's temporary-file root: a self-maintained directory the
@@ -25,5 +30,7 @@ namespace vpipe {
 const std::filesystem::path& temp_root();
 
 }  // namespace vpipe
+
+VPIPE_HOST_API_END
 
 #endif  // VPIPE_TEMP_ROOT_H

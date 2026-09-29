@@ -89,8 +89,9 @@ TEST(load_image_stage, config_url_string) {
   LoadImageStage s(&sess, "li", vector<InEdge>{}, std::move(cfg));
   EXPECT_TRUE(s.urls().size() == 1);
   EXPECT_TRUE(s.urls()[0] == "/tmp/x.png");
-  // oport0 image, oport1 the metadata that rides with it.
-  EXPECT_TRUE(s.num_oports() == 2);
+  // oport0 image, oport1 the metadata that rides with it, oport2 every
+  // image as one list.
+  EXPECT_TRUE(s.num_oports() == 3);
 }
 
 TEST(load_image_stage, config_url_array) {
@@ -428,4 +429,98 @@ TEST(load_image_stage, alpha_keep_emits_four_channels) {
     EXPECT_TRUE(keep[3] == 255);
   }
   remove(path.c_str());
+}
+
+// THE `images` PORT: every url as ONE list beat, in url order, each at its
+// own size -- the reference set a multi-reference edit feeds to vae-encode
+// and the conditioner. With only that port wired the list is the whole
+// job, and the stage ends after it instead of emitting nothing forever.
+namespace {
+
+string
+write_ppm_at_(const string& tag, int W, int H, uint8_t v)
+{
+  string path = string("/tmp/vpipe-load-image-") + to_string(getpid()) +
+                "-" + tag + ".ppm";
+  ofstream out(path, ios::binary);
+  out << "P6\n" << W << " " << H << "\n255\n";
+  for (int i = 0; i < W * H * 3; ++i) { out.put(static_cast<char>(v)); }
+  return path;
+}
+
+}  // namespace
+
+TEST(load_image_stage, the_images_port_is_the_whole_list_in_one_beat) {
+  Session sess;
+  CerrSilencer hush;
+  const string a = write_ppm_at_("la", 2, 2, 10);
+  const string b = write_ppm_at_("lb", 4, 3, 20);
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  FlexData cfg = FlexData::make_object();
+  {
+    FlexData urls = FlexData::make_array();
+    urls.as_array().push_back(string_view(a));
+    urls.as_array().push_back(string_view(b));
+    cfg.as_object().insert("url", std::move(urls));
+  }
+  auto* li = pl->insert_stage(make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{}, std::move(cfg)));
+  auto* sink = static_cast<SinkCapture*>(pl->insert_stage(
+      make_unique<SinkCapture>(&sess, "sink", vector<InEdge>{{li, 2}},
+                               FlexData::make_object())));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  remove(a.c_str());
+  remove(b.c_str());
+
+  ASSERT_TRUE(sink->captured.size() == 1);
+  if (sink->captured.size() != 1) { return; }
+  const auto* lp =
+      dynamic_cast<const TensorListPayload*>(sink->captured[0].get());
+  ASSERT_TRUE(lp != nullptr);
+  if (lp == nullptr) { return; }
+  ASSERT_TRUE(lp->items.size() == 2);
+  if (lp->items.size() != 2) { return; }
+  EXPECT_TRUE((lp->items[0].shape == vector<int64_t>{3, 2, 2}));
+  EXPECT_TRUE((lp->items[1].shape == vector<int64_t>{3, 3, 4}));
+  EXPECT_TRUE(lp->items[0].materialize_contiguous()[0] == 10);
+  EXPECT_TRUE(lp->items[1].materialize_contiguous()[0] == 20);
+}
+
+TEST(load_image_stage, the_list_does_not_replace_the_single_images) {
+  Session sess;
+  CerrSilencer hush;
+  const string a = write_ppm_at_("sa", 2, 2, 30);
+  const string b = write_ppm_at_("sb", 2, 2, 40);
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  FlexData cfg = FlexData::make_object();
+  {
+    FlexData urls = FlexData::make_array();
+    urls.as_array().push_back(string_view(a));
+    urls.as_array().push_back(string_view(b));
+    cfg.as_object().insert("url", std::move(urls));
+  }
+  auto* li = pl->insert_stage(make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{}, std::move(cfg)));
+  auto* one = static_cast<SinkCapture*>(pl->insert_stage(
+      make_unique<SinkCapture>(&sess, "one", vector<InEdge>{{li, 0}},
+                               FlexData::make_object())));
+  auto* all = static_cast<SinkCapture*>(pl->insert_stage(
+      make_unique<SinkCapture>(&sess, "all", vector<InEdge>{{li, 2}},
+                               FlexData::make_object())));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  remove(a.c_str());
+  remove(b.c_str());
+
+  EXPECT_TRUE(one->captured.size() == 2);
+  EXPECT_TRUE(all->captured.size() == 1);
 }

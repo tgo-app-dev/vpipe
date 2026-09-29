@@ -2477,8 +2477,8 @@ catalog_url_files(const ModelCatalogEntry& e)
   if (!e.extra.is_object()) { return out; }
   FlexData extra = e.extra;
   auto o = extra.as_object();
-  if (!o.contains("url_files")) { return out; }
-  FlexData list = o.at("url_files");
+  if (!o.contains(catalog_extra::kUrlFiles)) { return out; }
+  FlexData list = o.at(catalog_extra::kUrlFiles);
   if (!list.is_array()) { return out; }
   auto a = list.as_array();
   for (std::size_t i = 0; i < a.size(); ++i) {
@@ -2507,7 +2507,7 @@ catalog_url_files_extra(
     list.as_array().push_back(std::move(pair));
   }
   FlexData extra = FlexData::make_object();
-  extra.as_object().insert_or_assign("url_files", std::move(list));
+  extra.as_object().insert_or_assign(catalog_extra::kUrlFiles, std::move(list));
   return extra;
 }
 

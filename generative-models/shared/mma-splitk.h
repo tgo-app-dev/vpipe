@@ -65,6 +65,9 @@
 #include <utility>
 #include <vector>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 namespace vpipe::genai {
 
 // Loaded kernels + the partial-plane scratch. One per model instance.

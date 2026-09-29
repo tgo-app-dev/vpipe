@@ -30,6 +30,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe::genai::detect {
 
 inline constexpr std::string_view kDomain = "detect";
@@ -90,5 +94,7 @@ std::string model_type_for_class(std::string_view class_name, bool edit);
 const FlexData* for_model_type(std::string_view model_type);
 
 }  // namespace vpipe::genai::detect
+
+VPIPE_API_END
 
 #endif

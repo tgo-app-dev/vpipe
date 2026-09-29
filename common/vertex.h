@@ -10,6 +10,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class Vertex;
@@ -135,6 +139,8 @@ public:
 
 }
 
+
+VPIPE_API_END
 
 #endif
 

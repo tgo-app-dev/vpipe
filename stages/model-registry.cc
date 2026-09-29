@@ -1,4 +1,5 @@
 #include "stages/model-registry.h"
+#include "common/beat-keys.h"
 
 #include "common/flex-data.h"
 #include "common/lmdb-db.h"
@@ -12,6 +13,34 @@
 #include <filesystem>
 
 namespace vpipe {
+
+std::filesystem::path
+session_db_dir(const SessionContextIntf* session)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path cwd = fs::current_path(ec);
+  const fs::path fallback = ec ? fs::path(".") : cwd;
+  if (session == nullptr || session->services() == nullptr) {
+    return fallback;
+  }
+  LmdbEnv* env = session->services()->lmdb_env();
+  if (env == nullptr) {
+    return fallback;
+  }
+  const std::string p(env->path());
+  if (p.empty()) {
+    return fallback;
+  }
+  const fs::path abs = fs::absolute(fs::path(p), ec);
+  return ec ? fallback : abs.lexically_normal();
+}
+
+std::filesystem::path
+default_models_dir(const SessionContextIntf* session)
+{
+  return session_db_dir(session) / "models";
+}
 
 ResolvedModel
 resolve_model(const SessionContextIntf* session, const std::string& ref)
@@ -75,6 +104,15 @@ resolve_model(const SessionContextIntf* session, const std::string& ref)
   }
   if (local.empty()) {
     return out;
+  }
+  // A record may hold a RELATIVE local_path -- a `base_path` given as
+  // one. It was relative to the directory the DATABASE lives in, which
+  // is the CWD for a session that opened the env there and the parent
+  // for a CLI run that adopted the web-ui's database from inside
+  // `sandbox`. Resolving it against the CWD instead would send that run
+  // one level too deep, into a models tree that does not exist.
+  if (std::filesystem::path(local).is_relative()) {
+    local = (session_db_dir(session) / local).lexically_normal().string();
   }
   session->info(fmt("model registry: '{}' -> '{}'", ref, local));
   out.dir           = local;
@@ -219,8 +257,8 @@ apply_model_select_beat(const FlexData& beat,
     ref = std::string(beat.as_string(""));
   } else if (beat.is_object()) {
     auto o = beat.as_object();
-    if (o.contains("hf_dir")) {
-      ref = std::string(o.at("hf_dir").as_string(""));
+    if (o.contains(beat::kHfDir)) {
+      ref = std::string(o.at(beat::kHfDir).as_string(""));
     } else if (o.contains("model")) {
       ref = std::string(o.at("model").as_string(""));
     }

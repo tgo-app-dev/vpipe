@@ -1,4 +1,5 @@
 #include "stages/scheduler-select-stage.h"
+#include "generative-models/spec-keys.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -18,10 +19,10 @@ namespace {
 // They must agree with the ctor's validation above, which stays the
 // authority on what is accepted.
 constexpr SpecExtra kTypeChoices[] = {
-  {"choices", "simple,karras,exponential,boogu_v1"},
+  {spec_key::kChoices, "simple,karras,exponential,boogu_v1"},
 };
 constexpr SpecExtra kShiftTypeChoices[] = {
-  {"choices", "exponential,linear"},
+  {spec_key::kChoices, "exponential,linear"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "type", .type = ConfigType::String, .required = false,
@@ -123,25 +124,26 @@ SchedulerSelectStage::resolved_spec() const
   if (!_shift_type.empty()) { shift_type = _shift_type; }
   if (_rho > 0.0) { rho = _rho; }
 
+  namespace k = genai::scheduler_spec;
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("scheduler", FlexData::make_string("flow_match"));
-  o.insert_or_assign("type", FlexData::make_string(type));
-  o.insert_or_assign("steps", FlexData::make_int(steps));
-  o.insert_or_assign("shift", FlexData::make_real(shift));
-  o.insert_or_assign("shift_type", FlexData::make_string(shift_type));
-  o.insert_or_assign("rho", FlexData::make_real(rho));
-  if (type == "boogu_v1") {
-    o.insert_or_assign("seq_len",
+  o.insert_or_assign(k::kScheduler, FlexData::make_string(k::kFlowMatch));
+  o.insert_or_assign(k::kType, FlexData::make_string(type));
+  o.insert_or_assign(k::kSteps, FlexData::make_int(steps));
+  o.insert_or_assign(k::kShift, FlexData::make_real(shift));
+  o.insert_or_assign(k::kShiftType, FlexData::make_string(shift_type));
+  o.insert_or_assign(k::kRho, FlexData::make_real(rho));
+  if (type == k::kBooguV1) {
+    o.insert_or_assign(k::kSeqLen,
                        FlexData::make_int(_seq_len > 0 ? _seq_len : 4096));
-    o.insert_or_assign("base_shift",
+    o.insert_or_assign(k::kBaseShift,
                        FlexData::make_real(_base_shift > 0.0 ? _base_shift
                                                              : 0.5));
-    o.insert_or_assign("max_shift",
+    o.insert_or_assign(k::kMaxShift,
                        FlexData::make_real(_max_shift > 0.0 ? _max_shift
                                                             : 1.15));
-    o.insert_or_assign("base_seq", FlexData::make_int(256));
-    o.insert_or_assign("max_seq", FlexData::make_int(4096));
+    o.insert_or_assign(k::kBaseSeq, FlexData::make_int(256));
+    o.insert_or_assign(k::kMaxSeq, FlexData::make_int(4096));
   }
   return fd;
 }

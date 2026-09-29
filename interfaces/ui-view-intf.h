@@ -10,6 +10,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class Stage;
@@ -80,6 +84,19 @@ public:
   // The panel closed / the client disconnected. Called exactly once,
   // before destruction; the channel is no longer usable.
   virtual void on_close() {}
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // What a view backend may ask of the hosting application. The app owns
@@ -117,5 +134,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

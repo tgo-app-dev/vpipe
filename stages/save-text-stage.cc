@@ -49,7 +49,7 @@ SaveTextStage::SaveTextStage(const SessionContextIntf* s,
 namespace {
 // The separator policy's closed set, for the editor's dropdown.
 constexpr SpecExtra kNewlineChoices[] = {
-  {"choices", "after,before,none"},
+  {spec_key::kChoices, "after,before,none"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,

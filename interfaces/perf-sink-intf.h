@@ -18,6 +18,10 @@
 #include <chrono>
 #include <cstdint>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class PerfSinkIntf {
@@ -62,5 +66,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

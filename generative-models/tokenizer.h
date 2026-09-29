@@ -9,6 +9,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 }
@@ -140,5 +144,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -75,6 +75,10 @@
 #include <span>
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe::metal_compute {
 class MetalCompute;
 class SharedBuffer;
@@ -215,5 +219,7 @@ class WiredPool {
 };
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

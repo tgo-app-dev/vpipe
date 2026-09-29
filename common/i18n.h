@@ -5,6 +5,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Lightweight UI/message localization for the application layer (web-ui
@@ -41,5 +45,7 @@ std::string normalize_language(std::string_view tag);
 std::string localize(std::string_view lang, std::string_view key);
 
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

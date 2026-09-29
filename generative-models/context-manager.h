@@ -11,6 +11,10 @@
 #include <optional>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 }
@@ -79,6 +83,7 @@ struct ContextId { std::uint32_t v = kInvalid;
 // mutex; for v1 there's one context per pipeline stage in flight,
 // so contention is negligible.
 class ContextManager : public SessionMember {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // Per-layer attention kind. Full = classical paged/contiguous K/V;
   // Sliding = trailing-window attention (bounded KV in the contiguous
@@ -565,5 +570,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

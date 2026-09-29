@@ -424,6 +424,34 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
     }
   }
 
+  // A COMPONENT DIRECTORY: one freely-named .safetensors beside the
+  // config.json that describes it. That is a Comfy-Org repack's
+  // component (`text_encoders/qwen3vl_4b_bf16.safetensors`) completed
+  // with its model's config and tokenizer -- the repack itself is
+  // weights-only, so a catalogue entry fetches those as companions.
+  // Opened exactly as the file would be, so everything that names the
+  // DIRECTORY -- the config and tokenizer reads, a vision tower in the
+  // same file, the claim and the release -- names one checkpoint.
+  //
+  // Only beside a config.json, and only when the file is the sole
+  // .safetensors: a LoRA folder, or a repository root whose components
+  // sit in subdirectories, is neither and fails as it always did.
+  if (!fs::exists(dir / "model.safetensors", ec)
+      && !fs::exists(dir / "diffusion_pytorch_model.safetensors", ec)
+      && fs::exists(dir / "config.json", ec)) {
+    std::string only;
+    int n = 0;
+    std::error_code lec;
+    for (const auto& de : fs::directory_iterator(dir, lec)) {
+      if (de.is_regular_file(lec) &&
+          de.path().extension() == ".safetensors") {
+        ++n;
+        only = de.path().string();
+      }
+    }
+    if (n == 1) { return open_model(only); }
+  }
+
   // Single-file layout (model.safetensors or the diffusers name).
   fs::path sf = dir / "model.safetensors";
   if (!fs::exists(sf, ec)) {

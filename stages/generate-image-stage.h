@@ -21,6 +21,7 @@
 #include "generative-models/boogu/metal-boogu-transformer.h"
 #include "generative-models/z-image/metal-z-image-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
+#include "stages/generation-input.h"
 #include "stages/latent-preview.h"
 #endif
 
@@ -267,8 +268,30 @@ private:
   // beside `sage`); the other built-ins ignore it, and a registered
   // family reads the bag rather than this member.
   genai::sol::Config _sol{};
+  // THE SEED. `_seed_base` is what the graph configured; `_seed` is what
+  // THIS generation uses, settled at the top of each one by
+  // `seed_sequence` -- so every path below reads `_seed` and none of
+  // them has to know which generation of the run it is in.
+  SeedSequence  _seed_seq = SeedSequence::kIncrement;
+  std::uint64_t _seed_base{};
   std::uint64_t _seed{};
+  // Generations started this run, the one in progress included. Counted
+  // when the inputs are settled, BEFORE a refusal or a dropped beat can
+  // end one early, so generation n always gets the same seed however
+  // the ones before it went.
+  std::uint64_t _generation = 0;
   std::uint64_t _latents_emitted = 0;
+
+  // The conditioning (iport0) and its paired negative (iport1), HELD
+  // across generations: a conditioning beat followed by the end of its
+  // stream serves every generation of the run (stages/generation-input.h).
+  // The negative is not an input of its own -- the conditioner emits it
+  // just before the positive it belongs to, and only for prompts that
+  // have one -- so it is read with each FRESH conditioning and held with
+  // a held one.
+  GenerationInput                  _cond_in;
+  std::unique_ptr<BeatPayloadIntf> _cond_beat;
+  std::unique_ptr<BeatPayloadIntf> _neg_beat;
 
   // "krea2" | "flux2" | "qwen-image-edit" | "boogu-image" (from
   // the transformer _class_name).
@@ -279,7 +302,9 @@ private:
   // beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
-  bool _cfg_latched    = false;
+  // The model config (iport7): read per generation, broadcast when its
+  // source sends once -- which a config source without a trigger does.
+  GenerationInput _cfg_in;
 
   // The last model-config beat, held UNPARSED. Which family's parser
   // reads it is not known until the checkpoint resolves, and the two
@@ -437,26 +462,25 @@ private:
   bool load_boogu_dit_();
   bool load_vosr_dit_();
 
-  // How the reference latents pair with the conditioning beats. See the
-  // `reference_mode` config key: an edit graph latches one reference for
-  // many prompts, a restoration graph gets a new one every beat, and a
-  // latch on the second is a silent wrong answer rather than an error.
-  enum class RefMode { kAuto, kLatch, kPerBeat };
-  RefMode _ref_mode = RefMode::kAuto;
-  bool ref_per_beat_() const noexcept
-  {
-    return _ref_mode == RefMode::kPerBeat
-        || (_ref_mode == RefMode::kAuto && _family == "vosr");
-  }
+  // How the reference latents pair with the conditioning beats: the
+  // `reference_mode` config key, as the mode of each reference input.
+  // "auto" is the general rule (one beat broadcasts, several are
+  // consumed), which serves an edit graph and a restoration graph alike.
+  GenerationInput::Mode _ref_mode = GenerationInput::Mode::kAuto;
   // The manager's shared view of a checkpoint's weights (weight-set.h).
   std::shared_ptr<genai::WeightSet> weight_set_(const std::string& dir) const;
   void free_boogu_dit_for_decode_(int gen_w, int gen_h);
 
   // The active sampler (integrator) + scheduler (sigma schedule) specs. Seeded
   // from config (euler + simple / _steps / shift 1.15) and each overridden by
-  // the first beat latched off the sampler / scheduler iports.
+  // the beats on the sampler / scheduler iports -- one per generation, or
+  // the only one for all of them.
   genai::FlowSamplerSpec   _sampler_spec;
   genai::FlowSchedulerSpec _scheduler_spec;
+  GenerationInput          _sampler_in;
+  GenerationInput          _scheduler_in;
+  // Whether a spec beat has arrived at all: the families' own schedule
+  // defaults apply only when none has.
   bool                     _sampler_latched   = false;
   bool                     _scheduler_latched = false;
 
@@ -468,9 +492,24 @@ private:
     int c = 0, h = 0, w = 0;
     bool empty() const { return chw.empty(); }
   };
-  // Cached reference latents from iport4 / iport5 (read once when a beat is
-  // available, reused for every later prompt like the negative prompt).
-  RefLatent _ref[2];
+  // What each reference INPUT holds: ref_latent0 / ref_latent1, then
+  // the ref_latents list, each paired with the conditioning by the
+  // generation rule (stages/generation-input.h) in `reference_mode`.
+  RefLatent              _ref_port[2];
+  GenerationInput        _ref_port_in[2];
+  std::vector<RefLatent> _ref_list;
+  GenerationInput        _ref_list_in;
+  // THE REFERENCES, as every family sees them: the two ports, then the
+  // list, packed -- so "reference i" is the i-th one wired even when the
+  // first port is not. Rebuilt whenever an input brings a new beat.
+  std::vector<RefLatent> _ref;
+  // Reference `i`, or an empty one past the end.
+  const RefLatent&
+  ref_(std::size_t i) const
+  {
+    static const RefLatent kNone;
+    return i < _ref.size() ? _ref[i] : kNone;
+  }
 
   // ---- Qwen-Image-2.1 ------------------------------------------------
   std::unique_ptr<genai::MetalQwenImage21Transformer> _qi21_dit;

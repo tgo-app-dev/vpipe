@@ -699,9 +699,9 @@ constexpr ConfigKey kAttrs[] = {
           "names",
    .suggest_db = kModelRegistryDb},
   {.key = "output_name", .type = ConfigType::String, .required = true,
-   .doc = "result name -> <cwd>/models/<output_name> (registered in the "
-          "models DB under this key), or an explicit path (\"/..\", \"./..\") "
-          "used verbatim and not registered"},
+   .doc = "result name -> models/<output_name> beside the database "
+          "(registered in the models DB under this key), or an explicit "
+          "path (\"/..\", \"./..\") used verbatim and not registered"},
   {.key = "bits", .type = ConfigType::Uint,
    .doc = "backbone affine bit-width (4 | 8), or 16 for a DENSE output that "
           "quantizes nothing: FP8 tensors are decoded to bf16 (exactly -- "
@@ -905,15 +905,16 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   const std::string src_dir =
       resolve_model_dir(session(), _src_model);
 
-  // Resolve the output. A bare name (or "org/name") -> <cwd>/models/<name>,
-  // registered under that key; an absolute/relative path ("/..", "./..") is
-  // used verbatim and NOT registered.
+  // Resolve the output. A bare name (or "org/name") ->
+  // <session_db_dir>/models/<name>, registered under that key; an
+  // absolute/relative path ("/..", "./..") is used verbatim and NOT
+  // registered.
   const bool explicit_path =
       _output_name[0] == '/' ||
       _output_name.rfind("./", 0) == 0 || _output_name.rfind("../", 0) == 0;
   const std::string out_dir = explicit_path
       ? _output_name
-      : (fs::current_path() / "models" / _output_name).string();
+      : (default_models_dir(session()) / _output_name).string();
 
   if (_skip_existing && fs::exists(fs::path(out_dir) / "config.json", ec)) {
     session()->info(fmt(

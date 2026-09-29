@@ -543,7 +543,7 @@ PipelineApi::h_stage_types_(const HttpRequest&)
       // plugin stage whose kind this tree has no enumerator for can
       // say so without an enum change, and an enum change is an ABI
       // change. See SpecExtra in pipeline/stage-config.h.
-      std::string_view cat = spec_extra(sp->extra, "category");
+      std::string_view cat = spec_extra(sp->extra, spec_key::kCategory);
       if (cat.empty()) { cat = stage_category_name(sp->category); }
       oo.insert("category",
                 FlexData::make_string(cat));

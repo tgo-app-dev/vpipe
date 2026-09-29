@@ -5,6 +5,11 @@
 #include <memory>
 #include <string>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 // One metric's aggregate over a sampling window.
@@ -86,5 +91,7 @@ private:
 };
 
 }  // namespace vpipe
+
+VPIPE_HOST_API_END
 
 #endif

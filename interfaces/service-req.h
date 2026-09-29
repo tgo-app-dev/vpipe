@@ -14,7 +14,14 @@
 #ifndef SERVICE_REQ_H
 #define SERVICE_REQ_H
 
+#include <span>
 #include <string_view>
+
+#include "pipeline/spec-extra.h"
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -26,8 +33,13 @@ struct ServiceReq {
   // says so here rather than leaving the reader to infer it from a
   // null check buried in initialize().
   bool             required = true;
+  // Anything this struct has no field for. See SpecExtra. A stage hands
+  // these back in a std::vector, so the size is compiled into the plugin.
+  std::span<const SpecExtra> extra;
 };
 
 }
+
+VPIPE_API_END
 
 #endif

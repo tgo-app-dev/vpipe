@@ -18,7 +18,7 @@ namespace {
 // What the slice can index, for the editor's dropdown; the ctor's own
 // check stays the authority.
 constexpr SpecExtra kSequenceChoices[] = {
-  {"choices", "beats,frames"},
+  {spec_key::kChoices, "beats,frames"},
 };
 constexpr ConfigKey kAttrs[] = {
   // All three optional, like every part of a Python slice. With none of

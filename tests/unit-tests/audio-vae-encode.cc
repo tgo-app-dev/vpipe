@@ -25,10 +25,13 @@
 #include "pipeline/typed-stage.h"
 #include "common/job.h"
 #include "common/session.h"
+#include "pipeline/resource-plan.h"
 #include "pipeline/runtime-context.h"
 #include "stages/audio-vae-encode-stage.h"
+#include "stages/model-memory.h"
 
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -315,4 +318,74 @@ TEST(audio_vae_encode, no_family_means_inert_not_a_wrong_encoder)
   const Result r = run_(2, 1600, 16000, 0, "/ut/aenc-nobody-claims-this");
   EXPECT_TRUE(g_seen.calls == 0);
   EXPECT_TRUE(r.beats == 0);
+}
+
+// THE CLAIM NAMES THE AUDIO VAE. A family that generates a soundtrack
+// ships two VAEs in two files, and its declare_resources() answers for
+// the VIDEO decode -- which is what this stage delegated to, so it
+// claimed LTX-2.5's video VAE and its audio VAE not at all, while its
+// own declare_memory() named the audio one. Asked by role, as
+// audio-vae-decode already does.
+namespace {
+
+std::string g_two_vae_root;
+
+class TwoVaeFamily : public genai::VaeModelFamily {
+public:
+  std::string_view tag() const noexcept override { return "ut-aenc-two"; }
+
+  bool claims(const std::string& root, const std::string&,
+              const std::string&) const override
+  {
+    return !g_two_vae_root.empty() && root == g_two_vae_root;
+  }
+
+  std::vector<ResourceClaim>
+  declare_resources(const std::string& root,
+                    const std::string&) const override
+  {
+    return model_memory::weight_claims({vae_path(root, kRoleVideo)});
+  }
+
+  std::string vae_path(const std::string& root,
+                       std::string_view role) const override
+  {
+    if (role == kRoleAudio) { return root + "/vae/audio-vae.safetensors"; }
+    if (role == kRoleVideo) { return root + "/vae/video-vae.safetensors"; }
+    return {};
+  }
+
+  std::unique_ptr<genai::VaeDecoder>
+  load_decoder(const genai::VaeModelCreateArgs&) override { return nullptr; }
+};
+
+}  // namespace
+
+TEST(audio_vae_encode, the_claim_names_the_audio_vae)
+{
+  static const bool once = genai::VaeModelRegistry::get().add(
+      std::make_unique<TwoVaeFamily>());
+  EXPECT_TRUE(once);
+  // resolve_model_dir() keeps a path that does not exist as given, so
+  // the family is asked about exactly this string.
+  g_two_vae_root = "/ut/aenc-two-vae-model";
+
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("hf_dir",
+                                   FlexData::make_string(g_two_vae_root));
+  AudioVaeEncodeStage stage(&sess, "aenc", std::vector<InEdge>{},
+                            std::move(cfg));
+  bool audio = false, video = false;
+  for (const ResourceClaim& c : stage.declare_resources()) {
+    if (c.key == g_two_vae_root + "/vae/audio-vae.safetensors") {
+      audio = true;
+    }
+    if (c.key == g_two_vae_root + "/vae/video-vae.safetensors") {
+      video = true;
+    }
+  }
+  EXPECT_TRUE(audio);
+  EXPECT_FALSE(video);
+  g_two_vae_root.clear();
 }

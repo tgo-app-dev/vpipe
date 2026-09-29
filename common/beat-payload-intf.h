@@ -1,10 +1,15 @@
 #ifndef BEAT_PAYLOAD_INTF_H
 #define BEAT_PAYLOAD_INTF_H
 
+#include <string_view>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -39,6 +44,19 @@ public:
   // Typical format: "<TypeName> <shape-or-key-fields>".
   virtual std::string
   describe() const = 0;
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Helper: build a `unique_ptr<BeatPayloadIntf>` from a concrete
@@ -54,5 +72,7 @@ make_payload(Args&&... args)
 }
 
 }
+
+VPIPE_API_END
 
 #endif

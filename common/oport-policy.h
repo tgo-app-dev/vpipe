@@ -3,6 +3,10 @@
 
 #include <cstdint>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Producer-side knobs for an edge buffer. A Vertex / Stage owns one
@@ -42,5 +46,7 @@ struct OportPolicy {
 };
 
 }
+
+VPIPE_API_END
 
 #endif

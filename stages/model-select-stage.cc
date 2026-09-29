@@ -1,4 +1,5 @@
 #include "stages/model-select-stage.h"
+#include "common/beat-keys.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -87,7 +88,7 @@ ModelSelectStage::resolved_beat() const
 {
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("hf_dir", FlexData::make_string(_hf_dir));
+  o.insert_or_assign(beat::kHfDir, FlexData::make_string(_hf_dir));
   return fd;
 }
 

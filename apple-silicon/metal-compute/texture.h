@@ -4,6 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace MTL { class Texture; }
 
 namespace vpipe::metal_compute {
@@ -111,5 +115,7 @@ struct YuvBiplanarTextures {
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

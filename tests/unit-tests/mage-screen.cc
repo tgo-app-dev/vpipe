@@ -565,3 +565,80 @@ TEST(mage_screen, a_benign_edit_clears_the_multimodal_gate)
   ASSERT_TRUE(tb->shape.size() == 2);
   EXPECT_TRUE(tb->shape[0] > 1);          // real conditioning, not the marker
 }
+
+// SEVERAL references clear too -- each judged on its own picture. The
+// screen runs one pass per reference with that reference's rows, grid and
+// deepstack slice; before it did, every reference was packed into one
+// image block under the FIRST one's grid, the position build failed on
+// the token count, and every multi-reference prompt blocked. As above,
+// only a CLEAR proves anything: a mis-sliced reference fails closed.
+//
+// The pictures ride load-image's `images` list (oport 2) into the
+// conditioner's `ref_images` (iport 6). VPIPE_MAGE_EDIT_IMAGE_2 names a
+// second benign photo; without it the first is used twice, which still
+// catches the packing but not an offset error between two pictures.
+TEST(mage_screen, several_references_each_clear_the_multimodal_gate)
+{
+  const char* root = mage_root_();
+  if (root == nullptr) { return; }
+  const char* imge = std::getenv("VPIPE_MAGE_EDIT_IMAGE");
+  if (imge == nullptr || *imge == '\0' || !std::filesystem::exists(imge)) {
+    std::printf("[mage_screen] no VPIPE_MAGE_EDIT_IMAGE; skipping\n");
+    return;
+  }
+  const char* img2 = std::getenv("VPIPE_MAGE_EDIT_IMAGE_2");
+  if (img2 == nullptr || *img2 == '\0' || !std::filesystem::exists(img2)) {
+    img2 = imge;
+  }
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+
+  auto pl = std::make_unique<Pipeline>("screen-multi", &sess);
+  auto su = std::make_unique<PromptSource>(&sess, "src", std::vector<InEdge>{},
+                                           FlexData::make_object());
+  auto* src = static_cast<PromptSource*>(pl->insert_stage(std::move(su)));
+  src->prompt = "combine the two pictures into one scene, watercolor";
+
+  FlexData ic = FlexData::make_object();
+  {
+    FlexData urls = FlexData::make_array();
+    urls.as_array().push_back(FlexData::make_string(imge));
+    urls.as_array().push_back(FlexData::make_string(img2));
+    ic.as_object().insert("url", std::move(urls));
+  }
+  auto iu = std::make_unique<LoadImageStage>(&sess, "img",
+                                             std::vector<InEdge>{},
+                                             std::move(ic));
+  auto* img = pl->insert_stage(std::move(iu));
+
+  FlexData cc = FlexData::make_object();
+  cc.as_object().insert("hf_dir", FlexData::make_string(root));
+  const InEdge none{nullptr, 0};
+  auto cu = std::make_unique<DiffusionConditionerStage>(
+      &sess, "cond",
+      std::vector<InEdge>{{src, 0}, none, none, none, none, none, {img, 2}},
+      std::move(cc));
+  auto* cond = static_cast<DiffusionConditionerStage*>(
+      pl->insert_stage(std::move(cu)));
+
+  auto ku = std::make_unique<Sink>(&sess, "sink",
+                                   std::vector<InEdge>{{cond, 0}},
+                                   FlexData::make_object());
+  auto* sink = static_cast<Sink*>(pl->insert_stage(std::move(ku)));
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  ASSERT_TRUE(cond->conditionings_emitted() == 1);
+  EXPECT_TRUE(cond->blocked_by_policy() == 0);
+  ASSERT_TRUE(sink->captured.size() == 1);
+  if (sink->captured.size() != 1) { return; }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(sink->captured[0].get());
+  ASSERT_TRUE(tb != nullptr);
+  if (tb == nullptr) { return; }
+  ASSERT_TRUE(tb->shape.size() == 2);
+  EXPECT_TRUE(tb->shape[0] > 1);          // real conditioning, not the marker
+}

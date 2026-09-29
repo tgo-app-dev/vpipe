@@ -5,6 +5,10 @@
 #include <functional>
 #include <memory>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Threads for Apple Neural Engine dispatch, created ONCE with the
@@ -33,6 +37,7 @@ namespace vpipe {
 // vision towers, the inference stage and a generative family all
 // dispatch to the same ANE and should share the same thread.
 class AneWorker {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
  public:
   AneWorker();
   ~AneWorker();
@@ -65,5 +70,7 @@ class AneWorker {
 };
 
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

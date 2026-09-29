@@ -39,6 +39,10 @@
 #include <string_view>
 #include <vector>
 
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // The element type of a buffer.
@@ -209,5 +213,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

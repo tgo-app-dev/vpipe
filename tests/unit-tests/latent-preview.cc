@@ -708,7 +708,7 @@ public:
         genai::NamedTensor t;
         t.data = g_stub_latent.data();
         t.shape = g_stub_shape;
-        t.elem_size = 4;
+        t.set_dtype(genai::named_tensor::kF32);
         req.output(genai::kOutputPreviewX0, s, total, t);
         ++g_stub.handed;
       }

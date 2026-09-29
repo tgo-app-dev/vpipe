@@ -26,6 +26,10 @@
 
 #include "vpipe/session-manager.h"
 
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Returns a NUL-terminated build identifier of the form
@@ -44,5 +48,7 @@ const char* vpipe_version_number();
 const char* vpipe_build_hash();
 
 }
+
+VPIPE_API_END
 
 #endif

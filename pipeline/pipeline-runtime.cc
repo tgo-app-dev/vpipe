@@ -1012,7 +1012,7 @@ PipelineRuntime::launch_()
     // on the stage (where callers find it) and on its context (where the
     // stage reads it) before any driver runs. Same span as the running
     // flag, for the same reason as the sink.
-    if (!s->spec().commands.empty()) {
+    if (!spec_commands(s->spec()).empty()) {
       auto inbox = make_shared<CommandInbox>(
           s->id(), session()->thread_pool());
       _contexts[i]->attach_commands(inbox.get());

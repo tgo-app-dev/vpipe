@@ -1571,3 +1571,56 @@ TEST(weight_set, a_shard_over_max_buffer_length_still_maps)
   EXPECT_TRUE(std::memcmp(copied.contents(), mapped.contents(),
                           mapped.byte_size()) == 0);
 }
+
+// A COMPONENT DIRECTORY: one freely-named .safetensors beside the
+// config.json that describes it -- a Comfy-Org repack's
+// `text_encoders/qwen3vl_4b_bf16.safetensors` once its config and
+// tokenizer are fetched beside it. It opens as the file would, so
+// everything naming the DIRECTORY (config, tokenizer, the claim, the
+// release) names one checkpoint. Before, open_model() globbed only
+// model.safetensors and shards, and Mage-Flow's conditioner failed with
+// "cannot open text encoder checkpoint".
+//
+// The near misses must keep failing: without a config it is no more a
+// component than a LoRA folder is, and with two files there is no
+// saying which one the config describes.
+TEST(weight_set, a_component_directory_opens_its_one_file) {
+  namespace fs = std::filesystem;
+  const fs::path base =
+      fs::temp_directory_path() / "vpipe-weight-set-component-dir";
+  std::error_code ec;
+  fs::remove_all(base, ec);
+  auto write_ = [](const fs::path& p) {
+    fs::create_directories(p.parent_path());
+    std::string hdr =
+        "{\"enc.w\":{\"dtype\":\"F32\",\"shape\":[2],"
+        "\"data_offsets\":[0,8]}}";
+    while (hdr.size() % 8 != 0) { hdr += ' '; }
+    ofstream f(p, ios::binary);
+    const std::uint64_t len = hdr.size();
+    f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    const float z[2] = {0.0f, 0.0f};
+    f.write(reinterpret_cast<const char*>(z), sizeof(z));
+  };
+  auto touch_ = [](const fs::path& p) { ofstream(p) << "{}"; };
+
+  const fs::path one = base / "text_encoders";
+  write_(one / "qwen3vl_4b_bf16.safetensors");
+  touch_(one / "config.json");
+  auto w = MetalLlamaWeights::open_model(one.string());
+  ASSERT_TRUE(w.has_value());
+  if (w.has_value()) { EXPECT_TRUE(w->has("enc.w")); }
+
+  const fs::path bare = base / "no-config";
+  write_(bare / "adapter.safetensors");
+  EXPECT_FALSE(MetalLlamaWeights::open_model(bare.string()).has_value());
+
+  const fs::path two = base / "two";
+  write_(two / "a.safetensors");
+  write_(two / "b.safetensors");
+  touch_(two / "config.json");
+  EXPECT_FALSE(MetalLlamaWeights::open_model(two.string()).has_value());
+
+  fs::remove_all(base, ec);
+}

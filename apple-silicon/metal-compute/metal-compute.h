@@ -1,6 +1,7 @@
 #ifndef VPIPE_APPLE_SILICON_METAL_COMPUTE_METAL_COMPUTE_H
 #define VPIPE_APPLE_SILICON_METAL_COMPUTE_METAL_COMPUTE_H
 
+#include "common/flex-data.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -12,6 +13,10 @@
 #include <cstddef>
 #include <memory>
 #include <string_view>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace MTL {
 class ComputePipelineState;
@@ -35,6 +40,7 @@ namespace vpipe::metal_compute {
 // added in subsequent steps; step 1 only exposes the bare facade so
 // Session can hand out a non-null pointer.
 class MetalCompute final : public SessionMember {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit MetalCompute(const SessionContextIntf* session);
   ~MetalCompute() override;
@@ -291,6 +297,13 @@ public:
       if (available_physical == 0) { return true; }
       return (double)need <= (double)available_physical * (1.0 - margin);
     }
+
+    // Anything this struct has no field for: see common/flex-bag.h. A
+    // plugin receives this BY VALUE and also value-initialises one
+    // itself, so its size is compiled into every plugin in the support
+    // window: a new figure is a key here, never a new member (one added
+    // mid-struct once moved every field after it).
+    FlexData extra;
   };
   MemoryBudget memory_budget() const noexcept;
 
@@ -435,5 +448,7 @@ private:
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

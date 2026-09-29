@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // N-D tensor exchanged between stages. Row-major, PyTorch-style
@@ -500,6 +504,48 @@ public:
   }
 };
 
+// A LIST of tensors in one beat: every reference of a multi-reference
+// model, the pictures of a set. Items are NOT stacked -- references come
+// at their own sizes, so each keeps its own shape, dtype and sideband --
+// and there is no fixed count: a producer sends as many as it has and a
+// consumer that takes fewer uses the first ones and says so.
+//
+// The list's own `sideband` describes the list as a whole; what belongs
+// to one item goes on that item's.
+class TensorListPayload : public BeatPayloadIntf {
+public:
+  std::vector<TensorBeat> items;
+  FlexData                sideband;
+
+  std::unique_ptr<BeatPayloadIntf>
+  clone() const override
+  {
+    // TensorBeat's copy materialises shared storage, exactly as a
+    // TensorBeatPayload clone does, so two clones never share a buffer.
+    return std::make_unique<TensorListPayload>(*this);
+  }
+
+  std::string
+  describe() const override
+  {
+    std::string s = "TensorList x" + std::to_string(items.size());
+    for (std::size_t i = 0; i < items.size() && i < 4; ++i) {
+      s += i ? ", " : " (";
+      s += items[i].dtype_name();
+      s += " [";
+      for (std::size_t d = 0; d < items[i].shape.size(); ++d) {
+        if (d) { s += ","; }
+        s += std::to_string(items[i].shape[d]);
+      }
+      s += "]";
+    }
+    if (!items.empty()) { s += items.size() > 4 ? ", ...)" : ")"; }
+    return s;
+  }
+};
+
 }
+
+VPIPE_API_END
 
 #endif

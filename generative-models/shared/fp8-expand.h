@@ -24,6 +24,9 @@
 #include <string>
 #include <vector>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 namespace vpipe::metal_compute {
 class ComputeEncoder;
 class MetalCompute;

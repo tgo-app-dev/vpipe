@@ -5,6 +5,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class Stage;
@@ -102,5 +106,7 @@ ClockDomainAssignment compute_clock_domains(
     const std::vector<Stage*>& stages);
 
 }
+
+VPIPE_API_END
 
 #endif

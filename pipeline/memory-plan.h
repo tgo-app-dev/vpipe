@@ -41,11 +41,16 @@
 // time; a continuous capture graph has everything live at once and every
 // stage says so.
 
+#include "common/flex-data.h"
 #include "pipeline/clock-domain.h"
 
 #include <cstddef>
 #include <string>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -88,6 +93,9 @@ struct StageHolding {
   // this is about bytes that can be reclaimed at any moment and are
   // still wanted.
   bool reclaimable = false;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 
   // What this holding costs on a box with no room to spare.
   std::size_t floor_bytes() const
@@ -155,6 +163,9 @@ struct StageMemory {
   // Shorter than the stage's oport count is fine; the rest are zero.
   std::vector<std::size_t> outputs;
 
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
+
   // The common case: one checkpoint, named.
   void hold(std::string source, std::size_t preload, std::size_t floor = 0,
             bool releases = false, bool reclaimable = false)
@@ -175,6 +186,9 @@ struct MemoryPlanStep {
   std::string stage_id;
   std::size_t at_floor   = 0;   // everything streamable at its floor
   std::size_t at_preload = 0;   // everything resident
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 struct MemoryPlan {
@@ -191,6 +205,9 @@ struct MemoryPlan {
   // then computed in declaration order, which is still an upper bound on
   // nothing in particular -- callers should report rather than refuse.
   bool ordered = true;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Where a stage's revision goes once the run has started.
@@ -226,5 +243,7 @@ MemoryPlan compute_memory_plan(const std::vector<Stage*>&       stages,
                                const std::vector<StageMemory>&  mem);
 
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

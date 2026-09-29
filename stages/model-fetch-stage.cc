@@ -586,7 +586,7 @@ ModelFetchStage::process(RuntimeContext& ctx)
   // -------- 2. Resolve the download location ---------------------------
   string base_in = _base_path;
   if (base_in.empty()) {
-    const fs::path def = fs::current_path() / "models";
+    const fs::path def = default_models_dir(s);
     string line;
     if (s->getline(fmt("Base download path [default {}]: ", def.string()),
                    line, cancel) == UiInputStatus::Ok) {

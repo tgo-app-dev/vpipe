@@ -2,16 +2,22 @@
 #define VPIPE_PLUGIN_CONTEXT_H
 
 #include "pipeline/stage-registry.h"
+#include "plugin/plugin-abi.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-catalog.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -31,15 +37,29 @@ namespace genai { class QuantizableFamily; }
 // no-op registration (the name/arch is already taken) is logged as a
 // warning through the session so collisions are visible.
 class VpipePluginContext {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
+  // `plugin_abi` is the version the plugin reported -- the host's own
+  // when the context is not for a loaded plugin (tests, built-ins).
   VpipePluginContext(const SessionContextIntf* session,
-                     std::string_view          plugin_name);
+                     std::string_view          plugin_name,
+                     std::uint32_t             plugin_abi =
+                         VPIPE_PLUGIN_ABI_VERSION);
 
   // ---- introspection -------------------------------------------------
-  // The host's plugin ABI version (== VPIPE_PLUGIN_ABI_VERSION) and a
-  // human libvpipe version string, so a plugin can feature-detect.
+  // The HOST's plugin ABI version (== VPIPE_PLUGIN_ABI_VERSION), the one
+  // this plugin was built for (the same, or VPIPE_PLUGIN_ABI_OLDEST when
+  // a newer host loads it inside the support window), and a human
+  // libvpipe version string.
   std::uint32_t    abi_version()  const noexcept;
+  std::uint32_t    plugin_abi()   const noexcept { return _plugin_abi; }
   std::string_view host_version() const noexcept;
+
+  // Does this host provide `feature` (a VPIPE_FEATURE_* string)? The way a
+  // plugin uses an addition when it is there and does without when it is
+  // not. One it cannot do without belongs in VpipePluginInfo::
+  // required_features instead, so the host refuses the plugin at load.
+  bool has_feature(std::string_view feature) const noexcept;
 
   // ---- stages --------------------------------------------------------
   // Register a stage type T (a TypedStage<T> subclass with a static
@@ -203,8 +223,16 @@ private:
 
   const SessionContextIntf* _session;
   std::string               _plugin;
+  std::uint32_t             _plugin_abi;
 };
 
+// The features this host provides, and a lookup. Callable at any time,
+// not only while registering -- a stage may test for one at run time.
+std::span<const std::string_view> host_features() noexcept;
+bool host_has_feature(std::string_view feature) noexcept;
+
 }
+
+VPIPE_API_END
 
 #endif

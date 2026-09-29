@@ -12,6 +12,11 @@
 #include <thread>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 // Default UiDelegateIntf: error/warn -> stderr, info -> stdout (each
@@ -172,5 +177,7 @@ private:
 };
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

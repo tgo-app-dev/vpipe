@@ -1,6 +1,7 @@
 #ifndef VPIPE_APPLE_SILICON_COREML_MODEL_MANAGER_H
 #define VPIPE_APPLE_SILICON_COREML_MODEL_MANAGER_H
 
+#include "common/flex-data.h"
 #include "apple-silicon/coreml/ane-worker.h"
 #include "interfaces/log-sink-intf.h"
 
@@ -13,6 +14,10 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace CML {
 class Model;
@@ -59,6 +64,8 @@ struct CoreMLInputDesc {
   int                  image_height = 0;
   std::uint32_t        pixel_format = 0;           // Image CVPixelFormat
   bool                 fixed = false;
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData             extra;
 };
 
 // Per-output metadata captured at model-load time. `fixed == true`
@@ -71,6 +78,8 @@ struct CoreMLOutputDesc {
   std::vector<int64_t> shape;
   CoreMLDType          dtype = CoreMLDType::F32;
   bool                 fixed = false;
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData             extra;
 };
 
 // One MODEL INPUT bound for CoreMLLoadedModel::predict(). Populate the
@@ -221,6 +230,7 @@ private:
 // rare race that wastes one load, never produces UB; the cache
 // stabilises on whichever winner wins the second lock.
 class CoreMLModelManager final {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit CoreMLModelManager(const LogSinkIntf* session);
 
@@ -269,5 +279,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

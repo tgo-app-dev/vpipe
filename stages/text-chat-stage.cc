@@ -248,7 +248,7 @@ namespace {
 // The compute precisions the LM loader accepts, for the editor's
 // dropdown; the loader stays the authority.
 constexpr SpecExtra kComputeDtypeChoices[] = {
-  {"choices", "bf16,f16,f32"},
+  {spec_key::kChoices, "bf16,f16,f32"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,

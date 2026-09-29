@@ -12,6 +12,10 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 namespace metal_compute { class MetalCompute; }
@@ -32,6 +36,9 @@ struct ModelExecCreateArgs {
   std::uint32_t                page_tokens;  // KV page sizing
   std::uint32_t                max_pages;
   bool                         use_bf16;     // compute dtype: bf16 vs f16
+  // Anything this struct has no field for, host-owned and borrowed for
+  // the call; null when the host sends none. See common/flex-bag.h.
+  const FlexData*              borrowed_extra = nullptr;
 };
 
 using ModelExecFactory =
@@ -44,6 +51,7 @@ using ModelExecFactory =
 // singleton from its vpipe_plugin_register. The registry lives in libvpipe
 // so a plugin that links libvpipe shares it.
 class ModelExecRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static ModelExecRegistry& get() noexcept;
 
@@ -66,5 +74,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

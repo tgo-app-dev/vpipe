@@ -43,7 +43,7 @@ parse_hex_color_(string s, uint8_t* r, uint8_t* g, uint8_t* b)
 }
 
 constexpr SpecExtra kOutputChoices[] = {
-  {"choices", "rgb,rgba"},
+  {spec_key::kChoices, "rgb,rgba"},
 };
 
 constexpr ConfigKey kAttrs[] = {

@@ -1,5 +1,6 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
+#include "common/beat-keys.h"
 
 #include <cstring>
 
@@ -98,7 +99,7 @@ namespace {
 // something other than what it says, so it is not offered. The legacy
 // "always" / "never" stay accepted and show as unlisted.
 constexpr SpecExtra kUnloadChoices[] = {
-  {"choices", "auto,destroy,keep"},
+  {spec_key::kChoices, "auto,destroy,keep"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -238,6 +239,10 @@ vae_family_(const std::string& vae_dir)
                                        {"video_vae"}).empty()) {
     return "minimax-h3";
   }
+  // Mage-Flow's MageVAE by FILE, with no config to read a class name
+  // from (resolve_vae_dir() hands the Comfy-Org repack's back this way).
+  // Its tensors say what it is; the geometry is MetalMageVae's defaults.
+  if (genai::MetalMageVae::is_native_checkpoint(vae_dir)) { return "mage"; }
   std::ifstream in(fs::path(vae_dir) / "config.json");
   if (in) {
     FlexData fd = FlexData::from_json(in);
@@ -1106,9 +1111,9 @@ VaeDecodeStage::finish_clip_(TensorBeatPayload* clip, double fps,
   // the leading extent rather than being a second opinion about it.
   FlexData sb = FlexData::make_object();
   sb.as_object().insert_or_assign(
-      "frames",
+      sideband::kFrames,
       FlexData::make_int(clip->shape.empty() ? 0 : clip->shape[0]));
-  sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+  sb.as_object().insert_or_assign(sideband::kFps, FlexData::make_real(fps));
   clip->sideband = std::move(sb);
   forward_model_name_(src, *clip);
 }
@@ -1165,12 +1170,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   if (tbp->sideband.is_object()) {
     FlexData sb = tbp->sideband;          // as_object() is a view: keep it
     auto o = sb.as_object();
-    if (o.contains("content_blocked")
-        && o.at("content_blocked").as_bool(false)) {
-      const int H = o.contains("refusal_height")
-                        ? (int)o.at("refusal_height").as_int(0) : 0;
-      const int W = o.contains("refusal_width")
-                        ? (int)o.at("refusal_width").as_int(0) : 0;
+    if (o.contains(sideband::kContentBlocked)
+        && o.at(sideband::kContentBlocked).as_bool(false)) {
+      const int H = o.contains(sideband::kRefusalHeight)
+                        ? (int)o.at(sideband::kRefusalHeight).as_int(0) : 0;
+      const int W = o.contains(sideband::kRefusalWidth)
+                        ? (int)o.at(sideband::kRefusalWidth).as_int(0) : 0;
       if (H <= 0 || W <= 0) {
         session()->warn(fmt(
             "VaeDecodeStage('{}'): refusal beat carries no image size; "
@@ -1321,8 +1326,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     if (tbp->sideband.is_object()) {
       FlexData sb = tbp->sideband;        // as_object() is a view: keep it
       auto o = sb.as_object();
-      if (o.contains("fps") && o.at("fps").as_real(0.0) > 0.0) {
-        fps = o.at("fps").as_real(fps);
+      if (o.contains(sideband::kFps) &&
+          o.at(sideband::kFps).as_real(0.0) > 0.0) {
+        fps = o.at(sideband::kFps).as_real(fps);
       }
     }
 
@@ -1553,11 +1559,11 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         }
       }
       FlexData sb = FlexData::make_object();
-      sb.as_object().insert_or_assign("frame",
+      sb.as_object().insert_or_assign(sideband::kFrame,
                                       FlexData::make_int((std::int64_t)f));
-      sb.as_object().insert_or_assign("frames",
+      sb.as_object().insert_or_assign(sideband::kFrames,
                                       FlexData::make_int((std::int64_t)F));
-      sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+      sb.as_object().insert_or_assign(sideband::kFps, FlexData::make_real(fps));
       out->sideband = std::move(sb);
       forward_model_name_(*tbp, *out);
       add_to_clip_(clip.get(), f, *out);
@@ -1605,8 +1611,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     if (tbp->sideband.is_object()) {
       FlexData sb = tbp->sideband;        // as_object() is a view: keep it
       auto o = sb.as_object();
-      if (o.contains("fps") && o.at("fps").as_real(0.0) > 0.0) {
-        fps = o.at("fps").as_real(fps);
+      if (o.contains(sideband::kFps) &&
+          o.at(sideband::kFps).as_real(0.0) > 0.0) {
+        fps = o.at(sideband::kFps).as_real(fps);
       }
     }
     // The bar the family's `progress` feeds. Declared BEFORE the request
@@ -1686,10 +1693,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         if (is_video) {
           FlexData sb = FlexData::make_object();
           sb.as_object().insert_or_assign(
-              "frame", FlexData::make_int((std::int64_t)(c.frame0 + k)));
+              sideband::kFrame,
+              FlexData::make_int((std::int64_t)(c.frame0 + k)));
           sb.as_object().insert_or_assign(
-              "frames", FlexData::make_int((std::int64_t)c.frames_total));
-          sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+              sideband::kFrames,
+              FlexData::make_int((std::int64_t)c.frames_total));
+          sb.as_object().insert_or_assign(sideband::kFps,
+                                          FlexData::make_real(fps));
           out->sideband = std::move(sb);
         }
         forward_model_name_(*tbp, *out);
@@ -1798,8 +1808,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     if (tbp->sideband.is_object()) {
       FlexData sb = tbp->sideband;        // as_object() is a view: keep it
       auto o = sb.as_object();
-      if (o.contains("fps") && o.at("fps").as_real(0.0) > 0.0) {
-        fps = o.at("fps").as_real(fps);
+      if (o.contains(sideband::kFps) &&
+          o.at(sideband::kFps).as_real(0.0) > 0.0) {
+        fps = o.at(sideband::kFps).as_real(fps);
       }
     }
     const int F = genai::MetalWanVae::video_frames(T);
@@ -1852,10 +1863,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           }
         }
         FlexData sb = FlexData::make_object();
-        sb.as_object().insert_or_assign("frame",
+        sb.as_object().insert_or_assign(sideband::kFrame,
                                         FlexData::make_int((std::int64_t)(frame0 + k)));
-        sb.as_object().insert_or_assign("frames", FlexData::make_int((std::int64_t)F));
-        sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+        sb.as_object().insert_or_assign(sideband::kFrames,
+                                        FlexData::make_int((std::int64_t)F));
+        sb.as_object().insert_or_assign(sideband::kFps,
+                                        FlexData::make_real(fps));
         out->sideband = std::move(sb);
         forward_model_name_(*tbp, *out);
         frames.push_back(std::move(out));

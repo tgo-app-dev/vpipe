@@ -4,137 +4,79 @@
 // The vpipe plugin ABI: the stable, C-linkage contract every plugin
 // .dylib must satisfy. A plugin is a C++ shared library that links the
 // host libvpipe (so it observes the same registry singletons + RTTI) and
-// exports the three `extern "C"` entry points below. All the rich
-// registration happens in C++ via VpipePluginContext (plugin-context.h);
-// this header is deliberately C-clean so the version/discovery handshake
-// never depends on C++ ABI details.
+// exports the `extern "C"` entry points below. All the rich registration
+// happens in C++ via VpipePluginContext (plugin-context.h); this header
+// is deliberately C-clean so the version/discovery handshake never
+// depends on C++ ABI details.
 //
-// See docs/PLUGINS.md for the author-facing guide.
+// See docs/PLUGINS.md, "Versioning", for the author-facing rules.
+//
+// ---- the version ----------------------------------------------------------
+//
+// ONE INTEGER, plus FEATURE FLAGS for what is added in between.
+//
+//   * The integer (VPIPE_PLUGIN_ABI_VERSION) changes for any change that an
+//     already-built plugin could observe: a field in a struct the plugin
+//     allocates, reads or is handed; a virtual in an interface it
+//     implements or calls; the signature of an exported function; the
+//     meaning of a contracted kernel. What that covers is the STABLE
+//     SURFACE -- the installed SDK headers, exported with VPIPE_API --
+//     and the layout and symbol snapshots under abi/ are what enforce
+//     it: a change to the surface fails the build until the snapshot
+//     is regenerated, which is where the number is decided. It no
+//     longer rests on someone remembering; it did not, repeatedly.
+//
+//   * A FEATURE is an addition that breaks nothing already built: a new
+//     function, a new registry, a new interface a plugin may opt into, a
+//     new command or kernel in a contract. It is a string ("name/rev"),
+//     listed by the host (vpipe::host_features()) and queried by a plugin
+//     (VpipePluginContext::has_feature). A plugin that cannot run without
+//     one names it in VpipePluginInfo::required_features, and a host without it
+//     refuses the plugin at load, by name, instead of letting it fail on
+//     a missing symbol later.
+//
+//   * THE SUPPORT WINDOW is the last TWO versions: a host at N loads
+//     plugins built for N and N-1 (VPIPE_PLUGIN_ABI_OLDEST). Keeping N-1
+//     working is the host's job -- the old layouts and entry points stay,
+//     or are translated -- so a version change is rare, batched, and
+//     never casual. Eight is the first version under this scheme, so
+//     there is no seven to keep: its OLDEST is eight.
+//
+// The version is read from the FILE before the plugin is loaded (the
+// `vpipe_plugin_abi` data symbol, see VPIPE_PLUGIN_DEFINE), so a plugin
+// outside the window is refused without running any of its code -- and
+// with a message that names both versions, not a missing-symbol error.
+// Anything a plugin registers while it loads (a TypedStage registers its
+// factory from a static initialiser) is held back until the handshake
+// passes, and withdrawn if it does not.
 
 #include <stddef.h>
 #include <stdint.h>
 
-// Bumped on ANY incompatible change to the plugin contract. The host loads
-// a plugin only when the plugin's reported version EQUALS this value
-// (strict equality -- backward compatibility is not a goal yet).
-// Independent of the dylib SOVERSION, which guards the underlying
-// C++/singleton ABI.
-//
-// NO LEDGER OF PAST VERSIONS, deliberately. Strict equality gives the
-// number no ordering meaning -- N does not mean "N-1 and more", it is an
-// opaque cookie -- so a list of superseded versions describes nothing a
-// plugin author can act on. It also rots: this comment previously
-// documented 1 and 2 while the value read 4.
-//
-// WHAT COUNTS AS THE CONTRACT is the part that is not obvious, and it is
-// wider than this file. A bump is required for any change to the three C
-// entry points below, to the VpipePluginContext facade -- and to the
-// INTERFACES A PLUGIN SUBCLASSES (VideoModelFamily, VaeModelFamily,
-// ModelExec, Stage, ...). Adding a virtual to one of those changes no C
-// symbol and no facade method, yet moves the vtable: a plugin built
-// against the older header passes every check and then calls through the
-// wrong slot. That has already happened once here.
-//
-// It covers the STRUCTS those interfaces are handed, too -- and that is
-// the half that was missed: `sol::Config` was added beside `sage` in
-// VideoGenRequest without a bump, which is a layout change an old plugin
-// would have passed every check and then misread. This value is the one
-// thing standing between that and a wrong answer, so a field is never
-// added to one of those structs without touching this line.
-//
-// ...AND WHAT DOES NOT COUNT. Adding a KEY to
-// generative-models/shared/accel-settings.h is not a bump: the bag is
-// one pointer whose layout does not move, its readers are header-only
-// and compiled into the plugin, and a key an old plugin was never told
-// about is one it never asks for. That is the whole reason those
-// settings stopped being fields -- see the same header, and
-// docs/PLUGINS.md, "Why a bag and not fields".
-//
-// THREE CARRIED TWO CHANGES, which was only legitimate because it
-// never shipped. It was introduced for the acceleration bag and then
-// reused for `register_image_family`, both on the same day, with nothing
-// outside this tree ever having reported 3 -- so no binary exists that
-// says 3 and means only the first of them. Reusing a number that HAS
-// been released is the exact failure this line prevents: two different
-// contracts answering to one cookie, and a plugin that passes the check
-// and then misreads. The test is not "has anything been built against
-// it", it is "has anything LEFT" -- check the number's introducing
-// commit against the public remote before ever doing this again.
-//
-// FOUR CARRIES TWO CHANGES TOO, on the same terms. It was introduced for
-// VideoModelFamily::denoise_scratch_bytes (a new virtual, 722924e) and
-// then absorbed MetalCompute::MemoryBudget::self_graphics (a field added
-// MID-struct, 5ecb0ad) -- a struct plugins get back BY VALUE from
-// memory_budget(), so every field after it moved. Both landed before any
-// plugin was rebuilt against 4, so no binary reports 4 and means only
-// the first.
-// FIVE: generative-models/shared/wired-pool.h's WiredPool became OPAQUE --
-// one pointer, every method out of line -- after its layout had changed
-// under a plugin that holds one as a member (SenseNova-U1.5). From here its
-// layout and method signatures are FROZEN like ane::Tier's below; its
-// open() options, info() fields, new methods and the policy itself grow
-// without a bump.
-// THE ANE TIER IS THE SAME SHAPE OF PROMISE, and was built that way so
-// new work never costs a bump. generative-models/shared/ane-tier.h
-// FREEZES ane::Binding, the signatures of ane::create/runtime_bytes and of
-// ane::Tier's methods, and Tier::Plan's values -- a change to any of those
-// is a bump. It does NOT freeze its vocabulary: a new kind (another
-// activation, another projection, an attention block), a new spec or
-// params key, a new binding name, a new info() field are all additions an
-// old plugin never asks for. Tier itself is one pointer with out-of-line
-// methods, so its layout is not compiled into anything.
-// SIX: lora::Factors grew two fields (generative-models/shared/runtime-lora.h,
-// f9e7451) and was NOT bumped for, which is what this line exists to prevent.
-// `parts` and `group` were appended to an existing struct the host FILLS IN
-// THROUGH A CALLER'S POINTER -- lora::Stack::bind(module, n, k, Factors* out)
-// -- so a plugin compiled against the five-field version passes a smaller
-// object and the host writes past its end. Not a misread: an overwrite of
-// whatever the plugin had after it. The same commit did it again in
-// shared/ane-ffn.h. The struct's own comment states the hazard exactly ("EVERY
-// consumer of a Factors has to know this form -- a kernel that reads `b` as
-// [n, rank] reads past a banded B") and the bump was still missed, which is
-// the point: knowing a change is dangerous and remembering that danger is
-// spelled as a number here are two different things.
-//
-// SIX ALSO CARRIES THE NAMED-OUTPUT SEAM, and that is the more important
-// half for anyone porting a family. VideoGenRequest and ImageGenRequest
-// each APPENDED two members, `output_wanted` and `output`
-// (generative-models/gen-input.h: OutputWantedFn / NamedOutputFn) -- the
-// mirror of the `input` lookup, through which a family hands a tensor
-// back MID-GENERATION by name. Its first name is `preview_x0`, the clean
-// estimate a live TAE preview decodes (stages/latent-preview.h). Like
-// `input`, the seam exists so the NEXT such output costs no bump: a new
-// name is an addition an old binary never asks for. The host always
-// installs both, so a family calls them unguarded.
-//
-// Folded into six, not given a seven, on the terms THREE and FOUR set
-// out above, and CHECKED rather than assumed: on 2026-09-24 the public
-// remote's main (aad3a10e) and every public tag still read 5, and the
-// last public snapshot was built from cc4dfc56, which predates 7b91f1e
-// where six was introduced. So no binary reports 6 and means only the
-// lora::Factors change. If a snapshot has shipped since, this sentence
-// is the one to re-check before folding anything else into six.
-//
-// SEVEN: stage COMMAND CHANNELS (pipeline/stage-command.h,
-// docs/STAGE-COMMANDS.md). StageSpec APPENDED `commands`, a span of the
-// new CommandSpec / BufferSpec -- the host reads it off every spec a
-// plugin registers, so a six-era spec is read past its end. Stage gained
-// members (its command inbox and the lock guarding it), RuntimeContext
-// and its inline ReadAnyAwaiter gained the inbox pointer. NOT folded
-// into six, and checked
-// rather than assumed: on 2026-09-28 the public remote's main (c2989a76,
-// a snapshot of 1c9e6072) reads 6, so six HAS left. What seven freezes:
-// the layouts of CommandSpec, BufferSpec, DataBuffer, BufferLayout and
-// the two awaiters in stage-command.h, which live in a plugin's coroutine
-// frame. What it does not: StageCommand and CommandInbox are created by
-// the host and reached only through out-of-line methods, so their
-// members grow without a bump -- and a new command, a new buffer, a new
-// key in a spec's `extra` never needs one.
-#define VPIPE_PLUGIN_ABI_VERSION 7u
+// The ABI this SDK builds plugins for, and the oldest one a host built
+// from it still loads.
+#define VPIPE_PLUGIN_ABI_VERSION 8u
+#define VPIPE_PLUGIN_ABI_OLDEST  8u
 
-// Layout version of VpipePluginInfo, so the struct can grow additively
-// without breaking the three-symbol contract.
-#define VPIPE_PLUGIN_INFO_SCHEMA 1u
+// Layout version of VpipePluginInfo, so the struct grows additively.
+//   1  name, version, vendor, license, description
+//   2  + required_features
+#define VPIPE_PLUGIN_INFO_SCHEMA 2u
+
+// ---- features -------------------------------------------------------------
+//
+// The features ABI 8 ships with. A later host may add more; it never
+// withdraws one while the ABI that introduced it is inside its window.
+//   stage-commands   docs/STAGE-COMMANDS.md
+//   kernel-contract  apple-silicon/metal-compute/kernel-contract.h
+//   named-outputs    generative-models/gen-input.h's input/output seams
+//   family-profiles  VpipePluginContext::register_family_profile
+//   accel-bag        generative-models/shared/accel-settings.h
+#define VPIPE_FEATURE_STAGE_COMMANDS  "stage-commands/1"
+#define VPIPE_FEATURE_KERNEL_CONTRACT "kernel-contract/1"
+#define VPIPE_FEATURE_NAMED_OUTPUTS   "named-outputs/1"
+#define VPIPE_FEATURE_FAMILY_PROFILES "family-profiles/1"
+#define VPIPE_FEATURE_ACCEL_BAG       "accel-bag/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }
@@ -151,13 +93,17 @@ typedef struct VpipePluginInfo {
   const char* vendor;           // e.g. "Acme Inc."
   const char* license;          // e.g. "Commercial", "Apache-2.0"
   const char* description;      // one-line summary
+  // schema 2: the features this plugin cannot run without, as a
+  // null-terminated array of VPIPE_FEATURE_* strings; null = none.
+  const char* const* required_features;
 } VpipePluginInfo;
 
-// The host resolves these three symbols by name (unmangled) from the
-// plugin dylib. The typedefs describe the pointer types the loader casts
-// dlsym results to; the plugin DEFINES the actual functions (usually via
-// VPIPE_PLUGIN_DEFINE below).
+// The host resolves these by name (unmangled) from the plugin dylib. The
+// typedefs describe the pointer types the loader casts dlsym results to;
+// the plugin DEFINES them (via VPIPE_PLUGIN_DEFINE below).
 //
+//   const uint32_t         vpipe_plugin_abi;          (data: read from the
+//                                                      file before loading)
 //   uint32_t               vpipe_plugin_abi_version(void);
 //   const VpipePluginInfo* vpipe_plugin_info(void);
 //   void                   vpipe_plugin_register(VpipePluginContext*);
@@ -173,26 +119,33 @@ typedef void (*vpipe_plugin_register_fn)(void*);
 }  // extern "C"
 #endif
 
-// Convenience for the (C++) plugin author: emit the three exported
-// symbols. `INFO_PTR` is a pointer to a static VpipePluginInfo; `REGFN` is
-// a `void(vpipe::VpipePluginContext*)`. Place at file scope:
+// Convenience for the (C++) plugin author: emit the exported symbols.
+// `INFO_PTR` is a pointer to a static VpipePluginInfo; `REGFN` is a
+// `void(vpipe::VpipePluginContext*)`. Place at file scope:
 //
+//   static const char* const kRequires[] = {
+//       VPIPE_FEATURE_KERNEL_CONTRACT, nullptr };
 //   static const VpipePluginInfo kInfo = {
 //       VPIPE_PLUGIN_INFO_SCHEMA, "acme-codecs", "1.0.0",
-//       "Acme Inc.", "Commercial", "Acme audio codecs" };
+//       "Acme Inc.", "Commercial", "Acme audio codecs", kRequires };
 //   static void acme_register(vpipe::VpipePluginContext* c) { ... }
 //   VPIPE_PLUGIN_DEFINE(&kInfo, acme_register)
 #ifdef __cplusplus
 #define VPIPE_PLUGIN_DEFINE(INFO_PTR, REGFN)                             \
-  extern "C" uint32_t vpipe_plugin_abi_version(void)                     \
+  extern "C" __attribute__((visibility("default"), used))               \
+  const uint32_t vpipe_plugin_abi = VPIPE_PLUGIN_ABI_VERSION;            \
+  extern "C" __attribute__((visibility("default")))                     \
+  uint32_t vpipe_plugin_abi_version(void)                                \
   {                                                                      \
     return VPIPE_PLUGIN_ABI_VERSION;                                     \
   }                                                                      \
-  extern "C" const ::VpipePluginInfo* vpipe_plugin_info(void)           \
+  extern "C" __attribute__((visibility("default")))                     \
+  const ::VpipePluginInfo* vpipe_plugin_info(void)                       \
   {                                                                      \
     return (INFO_PTR);                                                   \
   }                                                                      \
-  extern "C" void vpipe_plugin_register(::vpipe::VpipePluginContext* c)  \
+  extern "C" __attribute__((visibility("default")))                     \
+  void vpipe_plugin_register(::vpipe::VpipePluginContext* c)             \
   {                                                                      \
     (REGFN)(c);                                                          \
   }

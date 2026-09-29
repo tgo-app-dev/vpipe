@@ -9,6 +9,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
 class SessionContextIntf;
@@ -28,8 +33,9 @@ class PluginManager {
 public:
   static PluginManager& get() noexcept;
 
-  // True when a plugin reporting `plugin_abi` is loadable by this host.
-  // Strict equality for now (backward compatibility is not yet a goal).
+  // True when a plugin reporting `plugin_abi` is loadable by this host:
+  // inside the support window [VPIPE_PLUGIN_ABI_OLDEST,
+  // VPIPE_PLUGIN_ABI_VERSION] -- the last two versions.
   static bool is_abi_compatible(std::uint32_t plugin_abi) noexcept;
 
   // Load one plugin from `path`. `session` is used for logging and as the
@@ -54,6 +60,7 @@ public:
     std::string   vendor;
     std::string   license;
     std::string   description;
+    std::uint32_t abi     = 0;   // the plugin ABI it was built for
     bool          enabled = true;
   };
   std::vector<Record> records() const;
@@ -95,5 +102,7 @@ private:
 };
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

@@ -69,6 +69,8 @@ private:
   // graph that was working yesterday. See the config doc.
   bool _keep_alpha = false;
   std::size_t              _next = 0;
+  // The `images` list has gone out this run.
+  bool                     _list_emitted = false;
 
   const FFmpegLibraries*   _libs = nullptr;
 };

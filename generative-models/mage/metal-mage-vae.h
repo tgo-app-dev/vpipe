@@ -63,6 +63,15 @@ class MetalMageVae {
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool with_encoder = true);
 
+  // Is `path` a MageVAE named by FILE, with no config beside it? That is
+  // the Comfy-Org repack (`vae/mage_flow_vae_bf16.safetensors`), which
+  // ships no config anywhere -- and the original repositories that do
+  // are gated. The TENSORS decide: the decoder's `pipeline.dec_net.` and
+  // `pipeline.x_embedder.` under the names load() reads. The geometry is
+  // then the Config defaults, which ARE the published model's. False for
+  // a directory, and for any file that is not this.
+  static bool is_native_checkpoint(const std::string& path);
+
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so a second VAE over the
   // same directory reuses these tensors instead of loading its own copy.

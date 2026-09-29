@@ -23,6 +23,7 @@
 #include "generative-models/tokenizer.h"
 #include "generative-models/vosr/metal-dinov2-encoder.h"
 #include "generative-models/weight-set.h"
+#include "stages/generation-input.h"
 #include "stages/model-memory.h"
 #endif
 
@@ -71,6 +72,11 @@ namespace vpipe {
 //                          for Boogu), its own 2-D mROPE band and its own
 //                          deepstack run. Krea-2 is single-reference by design
 //                          (ComfyUI-Krea2Edit) and ignores it with a warning.
+//   iport6  ref_images     OPTIONAL reference images as ONE LIST (load-image's
+//                          `images`): as many as the graph has, each in
+//                          ref_image's format, following whatever is on
+//                          iport3 / iport4 in list order. Last, so a graph
+//                          written before it keeps its port numbers.
 //
 //   oport0  conditioning   TensorBeatPayload bf16, family-shaped:
 //                            krea2  [n_real, 12, 2560] (12-tap; the DiT fuses)
@@ -149,16 +155,11 @@ private:
   // VOSR only: the DINOv2 checkpoint, which is not under _hf_dir. Empty
   // until initialize() resolves it.
   std::string _venc_dir;
-  // How a reference image pairs with the conditioning beats. See the
-  // `reference_mode` config key: latching is right for an edit graph and
-  // wrong for a restoration one, and the two cannot share a default.
-  enum class RefMode { kAuto, kLatch, kPerBeat };
-  RefMode _ref_mode = RefMode::kAuto;
-  bool ref_per_beat_() const noexcept
-  {
-    return _ref_mode == RefMode::kPerBeat
-        || (_ref_mode == RefMode::kAuto && _family == "vosr");
-  }
+  // How a reference image pairs with the prompts: the `reference_mode`
+  // config key, as the mode of each reference input. "auto" is the rule
+  // every input here follows (stages/generation-input.h), which serves an
+  // edit graph and a folder of pictures alike.
+  GenerationInput::Mode _ref_mode = GenerationInput::Mode::kAuto;
   // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
   std::string _family = "krea2";
   // Within the qwen-image-edit family, WHICH of the two Qwen-Image
@@ -195,7 +196,13 @@ private:
   // since the beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
-  bool _cfg_latched    = false;
+  // The model config: a generation input, broadcast when its source sends
+  // once -- which a config source without a trigger does.
+  GenerationInput _cfg_in;
+  // The prompt (iport0), a generation input like the rest: one prompt
+  // and a folder of reference pictures condition every picture on it.
+  GenerationInput _prompt_in;
+  std::string     _prompt;
   // The last model-config beat, held UNPARSED: which family reads it is
   // not known until the checkpoint resolves, and the two beats arrive on
   // different ports in either order.
@@ -249,17 +256,30 @@ private:
   mutable std::unique_ptr<genai::MetalQwenVisionEncoder> _vision3;  // krea2, lazy
   int _enc_hidden = 2560;
 
-  // Cached negative prompt + raw reference images, latched once like the DiT
-  // stage's negative / ref-latent inputs. kMaxRefs is the number of ref_image
-  // iports; `_n_ref` is how many actually arrived (they latch independently, so
-  // a graph may wire only the second).
-  static constexpr int kMaxRefs = 2;
+  // The negative prompt + raw reference images, each a generation input
+  // paired with the prompt the way generate-image pairs its own.
   std::string               _negative_prompt;
-  bool                      _negative_latched = false;
-  std::vector<std::uint8_t> _ref_rgb[kMaxRefs];
-  int _ref_rgb_h[kMaxRefs] = {0, 0};
-  int _ref_rgb_w[kMaxRefs] = {0, 0};
-  int _n_ref = 0;                  // contiguous count actually latched
+  GenerationInput           _negative_in;
+  // One reference picture, RGB planar U8 [3, h, w].
+  struct RefImage {
+    std::vector<std::uint8_t> rgb;
+    int h = 0, w = 0;
+    bool empty() const { return rgb.empty(); }
+  };
+  // What each reference INPUT holds: ref_image / ref_image2 (kRefPorts
+  // of them), then the ref_images list, each a generation input in
+  // `reference_mode`.
+  static constexpr int kRefPorts = 2;
+  RefImage              _ref_port[kRefPorts];
+  GenerationInput       _ref_port_in[kRefPorts];
+  std::vector<RefImage> _ref_list;
+  GenerationInput       _ref_list_in;
+  // THE REFERENCES, as the model sees them: the two ports, then the
+  // list, packed -- so "reference i" is the i-th picture the VLM sees
+  // even when only the second port is wired. No fixed count.
+  std::vector<std::vector<std::uint8_t>> _ref_rgb;
+  std::vector<int> _ref_rgb_h, _ref_rgb_w;
+  int _n_ref = 0;                  // == _ref_rgb.size()
   // Qwen3-VL deepstack features (krea2 grounded encode), bf16 [n_img, EH] each,
   // one per vision deepstack merger. Computed once in vision_tokens_, ADDED to
   // the encoder hidden states at the image rows after LM layers 0.. by encode_.
@@ -267,9 +287,19 @@ private:
   // Per-reference merged vision grid (mh, mw) and token count -- the 3-axis
   // mROPE position_ids give each reference its OWN band, so these are per
   // image, not global.
-  mutable int _img_mh[kMaxRefs] = {0, 0};
-  mutable int _img_mw[kMaxRefs] = {0, 0};
-  mutable int _img_tok[kMaxRefs] = {0, 0};
+  mutable std::vector<int> _img_mh, _img_mw, _img_tok;
+  // Reference i's merged grid, 0 past the end -- which is what a prompt
+  // with no reference reads for reference 0.
+  int
+  img_mh_(std::size_t i) const
+  {
+    return i < _img_mh.size() ? _img_mh[i] : 0;
+  }
+  int
+  img_mw_(std::size_t i) const
+  {
+    return i < _img_mw.size() ? _img_mw[i] : 0;
+  }
   mutable int _img_n = 0;          // references the tower actually encoded
 
   // Qwen-Image-2.1's joint-sequence bookkeeping, published on the
@@ -277,8 +307,7 @@ private:
   // an image row's embedding is a tower output, not a token id, so
   // which rows are image slots is knowable only here.
   mutable std::vector<std::uint8_t> _qi21_slots;
-  mutable int _qi21_grid_h[kMaxRefs] = {0, 0};
-  mutable int _qi21_grid_w[kMaxRefs] = {0, 0};
+  mutable std::vector<int> _qi21_grid_h, _qi21_grid_w;
   mutable int _qi21_nref = 0;
 
   bool load_encoder_(metal_compute::MetalCompute* mc);
@@ -335,9 +364,10 @@ private:
                                              int& n_img) const;
 
   // Mage-Flow's MANDATORY content screen over the encoder this stage already
-  // owns (see generative-models/mage/mage-screen.h). With a reference image
-  // the multimodal EDIT policy runs -- it judges the source picture as well
-  // as the instruction. Never throws; blocks on every failure.
+  // owns (see generative-models/mage/mage-screen.h). With reference images
+  // the multimodal EDIT policy runs once PER REFERENCE -- it judges each
+  // source picture as well as the instruction, and blocks if any pass
+  // does. Never throws; blocks on every failure.
   genai::MageScreenVerdict screen_(const std::string&                 prompt,
                                    const metal_compute::SharedBuffer& vtok,
                                    int                                n_img)

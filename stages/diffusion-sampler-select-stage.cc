@@ -1,4 +1,5 @@
 #include "stages/diffusion-sampler-select-stage.h"
+#include "generative-models/spec-keys.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -32,7 +33,7 @@ canon_sampler_method(const std::string& m)
 
 // The integrators this stage can select, for the editor's dropdown.
 constexpr SpecExtra kMethodChoices[] = {
-  {"choices", "euler,heun,dpmpp_2m,dpmpp_sde,dmd"},
+  {spec_key::kChoices, "euler,heun,dpmpp_2m,dpmpp_sde,dmd"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "method", .type = ConfigType::String, .required = false,
@@ -125,15 +126,16 @@ DiffusionSamplerSelectStage::resolved_spec() const
   const double s_noise = _s_noise_set ? _s_noise : 1.0;
   const std::int64_t seed = _seed_set ? _seed : 0;
 
+  namespace k = genai::sampler_spec;
   FlexData fd = FlexData::make_object();
   auto o = fd.as_object();
-  o.insert_or_assign("sampler", FlexData::make_string("flow_match"));
-  o.insert_or_assign("method", FlexData::make_string(method));
-  o.insert_or_assign("eta", FlexData::make_real(eta));
-  o.insert_or_assign("s_noise", FlexData::make_real(s_noise));
-  o.insert_or_assign("seed", FlexData::make_int(seed));
-  if (method == "dmd") {
-    o.insert_or_assign("conditioning_sigma",
+  o.insert_or_assign(k::kSampler, FlexData::make_string(k::kFlowMatch));
+  o.insert_or_assign(k::kMethod, FlexData::make_string(method));
+  o.insert_or_assign(k::kEta, FlexData::make_real(eta));
+  o.insert_or_assign(k::kSNoise, FlexData::make_real(s_noise));
+  o.insert_or_assign(k::kSeed, FlexData::make_int(seed));
+  if (method == k::kDmd) {
+    o.insert_or_assign(k::kConditioningSigma,
                        FlexData::make_real(_cond_sigma_set ? _cond_sigma : 0.0));
   }
   return fd;

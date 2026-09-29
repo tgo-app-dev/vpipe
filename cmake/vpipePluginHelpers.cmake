@@ -52,6 +52,12 @@ function(vpipe_add_plugin name)
       BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "")
   target_link_libraries(${name} PRIVATE vpipe::vpipe)
+  # The toolkit (generative-models/shared) is compiled INTO the plugin, not
+  # called in libvpipe: see the vpipe_toolkit target in vpipe's own
+  # CMakeLists. Present on Apple-silicon builds of the SDK.
+  if(TARGET vpipe::toolkit)
+    target_link_libraries(${name} PRIVATE vpipe::toolkit)
+  endif()
   target_compile_features(${name} PRIVATE cxx_std_20)
   if(APPLE AND P_METAL)
     target_link_libraries(${name} PRIVATE

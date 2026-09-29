@@ -1,6 +1,7 @@
 #ifndef VPIPE_GENERATIVE_MODELS_MODEL_LOADER_H
 #define VPIPE_GENERATIVE_MODELS_MODEL_LOADER_H
 
+#include "common/flex-data.h"
 #include "common/session-member.h"
 
 
@@ -9,6 +10,10 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -306,6 +311,12 @@ struct ModelConfig {
     std::vector<int>  layer_n_kv_heads;
   };
   Gemma4 gemma4;
+
+  // Anything this struct -- or one of the configs nested in it -- has no
+  // field for: see common/flex-bag.h. A nested config's future field is
+  // a key here, prefixed with its name ("vision.<key>"), because
+  // growing the nested struct would move every member after it.
+  FlexData extra;
 };
 
 // Result of a successful ModelLoader::load(). Tensors are keyed by
@@ -371,5 +382,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

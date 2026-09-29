@@ -1,4 +1,6 @@
 #include "stages/generate-video-stage.h"
+#include "generative-models/gen-input.h"
+#include "common/beat-keys.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -72,7 +74,10 @@ constexpr int kH3LoraSlots = 2;
 // something other than what it says, so it is not offered. The legacy
 // "always" / "never" stay accepted and show as unlisted.
 constexpr SpecExtra kUnloadChoices[] = {
-  {"choices", "auto,destroy,keep"},
+  {spec_key::kChoices, "auto,destroy,keep"},
+};
+constexpr SpecExtra kSeedSequenceExtra[] = {
+  {spec_key::kChoices, kSeedSequenceChoices},
 };
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -118,7 +123,18 @@ const ConfigKey kAttrs[] = {
           "that ships its own grid (a flow-map adapter) runs that instead",
    .def_int = 40},
   {.key = "seed", .type = ConfigType::Int, .required = false,
-   .doc = "initial-noise RNG seed (default 0)"},
+   .doc = "initial-noise RNG seed (default 0). The run's FIRST clip uses "
+          "it; `seed_sequence` decides what later ones use"},
+  {.key = "seed_sequence", .type = ConfigType::String, .required = false,
+   .doc = "the seed of each clip when a run makes several -- a prompt per "
+          "beat, a folder of first frames. \"increment\" (default): "
+          "`seed`, then `seed`+1, `seed`+2, ... in generation order, so any "
+          "one of them can be re-run alone by setting its number. "
+          "\"randomize\": ignore `seed` and draw each from the clock; "
+          "every seed used is logged, and fits the `seed` field for a "
+          "re-run. \"keep\": `seed` for every clip, which compares prompts "
+          "on the same noise",
+   .def_str = "increment", .extra = kSeedSequenceExtra},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls instead of bf16, at int8 quality. Independent of "
@@ -520,7 +536,11 @@ const StageSpec kSpec = {
                "reference latents) -> the resident family's sampler over its "
                "transformer -> a latent VIDEO, and a latent SOUNDTRACK from "
                "the families that generate one, on the metal-compute backend. "
-               "Feed vae-decode (and audio-vae-decode).",
+               "Feed vae-decode (and audio-vae-decode). A run makes one clip "
+               "per generation: an input whose source sends one beat and "
+               "ends serves every clip, one that keeps sending is consumed a "
+               "beat per clip, and the run ends when a consumed input does. "
+               "`seed_sequence` sets each clip's seed.",
   .display_name = "Generate Video",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -686,7 +706,17 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _sage = genai::sage::config_from_flex(&_accel);
   _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
 
-  _seed   = (std::uint64_t)attr_int("seed");
+  _seed_base = (std::uint64_t)attr_int("seed");
+  _seed      = _seed_base;
+  {
+    const std::string sq = attr_str("seed_sequence");
+    if (!sq.empty() && !parse_seed_sequence(sq, &_seed_seq)) {
+      // Deferred-validated config: warn and take the default.
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): seed_sequence '{}' is not "
+          "increment|randomize|keep; using increment", this->id(), sq));
+    }
+  }
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
   // because the key is now inert, not wrong -- the graph runs, it just
@@ -1445,10 +1475,25 @@ GenerateVideoStage::reset_run_state()
 {
   _emitted = 0;
   _model_latched = false;
-  _sampler_latched = false;
-  _scheduler_latched = false;
-  _cfg_latched = false;
   _model_cfg = FlexData{};
+  // Every generation input starts over, and so does what it held: a
+  // run's beats pair among themselves, never with the last run's, and
+  // the seed sequence starts again from `seed`.
+  for (GenerationInput* in : {&_cond_in, &_sampler_in, &_scheduler_in,
+                              &_cfg_in, &_ref0_in, &_ref1_in,
+                              &_ref_video_in, &_ref_audio_in,
+                              &_audio_cond_in}) {
+    in->reset();
+  }
+  _cond_beat.reset();
+  _neg_beat.reset();
+  _ref0_beat.reset();
+  _ref1_beat.reset();
+  _ref_video_beat.reset();
+  _ref_audio_beat.reset();
+  _audio_cond_beat.reset();
+  _generation = 0;
+  _seed       = _seed_base;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The preview keys were PARSED out of the beat reset above; a relaunch
   // whose graph no longer names a preview VAE must not inherit one.
@@ -1963,8 +2008,8 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
     // Shaped like the result latent, f32 -- or refused out loud, once:
     // a family that got the contract wrong would otherwise preview
     // nothing and never learn why.
-    if (t.data == nullptr || t.shape.size() != 4 || t.elem_size != 4 ||
-        t.elems() == 0) {
+    if (t.data == nullptr || t.shape.size() != 4 ||
+        !t.is(genai::named_tensor::kF32) || t.elems() == 0) {
       if (!_preview_shape_said) {
         _preview_shape_said = true;
         session()->warn(fmt(
@@ -2907,8 +2952,9 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
   // as_object()/as_array() return VIEWS into their owner, so every value
   // taken out of one is bound to a local before it is read.
   const auto so = sideband.as_object();
-  if (!so.contains("references")) { return true; }
-  const FlexData refs = so.at("references");
+  namespace ck = genai::cond_sideband;
+  if (!so.contains(ck::kReferences)) { return true; }
+  const FlexData refs = so.at(ck::kReferences);
   if (!refs.is_array()) { return true; }
   const auto ra = refs.as_array();
   // An empty array is SAID, not absent, and falls through: the tags and
@@ -2928,24 +2974,25 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
       return false;
     }
     const auto eo = e.as_object();
-    auto num = [&](const char* k) -> int {
+    auto num = [&](std::string_view k) -> int {
       return eo.contains(k) ? (int)eo.at(k).as_int() : 0;
     };
     h3::Reference r;
-    const FlexData kd = eo.contains("kind") ? eo.at("kind") : FlexData{};
+    const FlexData kd =
+        eo.contains(ck::kKind) ? eo.at(ck::kKind) : FlexData{};
     const std::string kind = kd.is_string() ? std::string(kd.as_string()) : "";
-    r.kind = kind == "video"   ? h3::Reference::Kind::kVideo
-             : kind == "audio" ? h3::Reference::Kind::kAudio
-                               : h3::Reference::Kind::kImage;
-    r.num_latent_frames = num("latent_frames");
-    r.latent_height     = num("latent_height");
-    r.latent_width      = num("latent_width");
-    r.num_audio_latents = num("audio_latents");
+    r.kind = kind == ck::kVideo   ? h3::Reference::Kind::kVideo
+             : kind == ck::kAudio ? h3::Reference::Kind::kAudio
+                                  : h3::Reference::Kind::kImage;
+    r.num_latent_frames = num(ck::kLatentFrames);
+    r.latent_height     = num(ck::kLatentHeight);
+    r.latent_width      = num(ck::kLatentWidth);
+    r.num_audio_latents = num(ck::kAudioLatents);
     out->refs.push_back(r);
   }
 
-  if (so.contains("token_tags")) {
-    const FlexData t = so.at("token_tags");
+  if (so.contains(ck::kTokenTags)) {
+    const FlexData t = so.at(ck::kTokenTags);
     if (t.is_array()) {
       const auto ta = t.as_array();
       out->text_tags.reserve(ta.size());
@@ -3399,6 +3446,21 @@ GenerateVideoStage::tag_model_(TensorBeat& tb) const
 Job
 GenerateVideoStage::process(RuntimeContext& ctx)
 {
+  // ONE CALL, ONE CLIP. Every input is read here, up front, and paired
+  // by the rule in stages/generation-input.h -- the one generate-image
+  // follows: an input whose source sends one beat and ends serves every
+  // clip of the run, one that keeps sending is consumed a beat per clip,
+  // and the run ends when a consumed input runs out or when nothing new
+  // arrives at all.
+  //
+  // ALL of them, and before anything can end the clip early -- a missing
+  // DiT, a malformed beat. Pairing is by position in each stream, so an
+  // input skipped once pairs every later clip with the wrong beat. The
+  // model (iport2) is the exception: it is what LOADS, once, not an
+  // input of each clip.
+  using Took = GenerationInput::Took;
+  GenerationRound round;
+
   if (!_model_latched && ctx.num_iports() > kModelPort &&
       ctx.iport_connected(kModelPort)) {
     auto mb = co_await ctx.read(kModelPort);
@@ -3408,12 +3470,15 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       if (apply_model_select_beat(mfd->data, _hf_dir)) { resolve_config_(); }
     }
   }
-  if (!_sampler_latched && ctx.num_iports() > kSamplerPort &&
-      ctx.iport_connected(kSamplerPort)) {
+  // The sampler / scheduler specs: a select source emits one and ends, so
+  // it serves every clip.
+  if (ctx.num_iports() > kSamplerPort && ctx.iport_connected(kSamplerPort) &&
+      _sampler_in.wants()) {
     auto sb = co_await ctx.read(kSamplerPort);
-    _sampler_latched = true;
-    if (const auto* sfd =
-            sb ? dynamic_cast<const FlexDataPayload*>(sb.get()) : nullptr) {
+    const Took took = _sampler_in.took(sb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* sfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(sb.get()) : nullptr) {
       std::string serr;
       _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
       if (!serr.empty()) {
@@ -3422,12 +3487,13 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       }
     }
   }
-  if (!_scheduler_latched && ctx.num_iports() > kSchedPort &&
-      ctx.iport_connected(kSchedPort)) {
+  if (ctx.num_iports() > kSchedPort && ctx.iport_connected(kSchedPort) &&
+      _scheduler_in.wants()) {
     auto cb = co_await ctx.read(kSchedPort);
-    _scheduler_latched = true;
-    if (const auto* cfd =
-            cb ? dynamic_cast<const FlexDataPayload*>(cb.get()) : nullptr) {
+    const Took took = _scheduler_in.took(cb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* cfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(cb.get()) : nullptr) {
       std::string cerr;
       _scheduler_spec = genai::FlowSchedulerSpec::from_flex(cfd->data, &cerr);
       if (!cerr.empty()) {
@@ -3460,19 +3526,16 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     }
   }
 
-  // The model config. Latched like the sampler and scheduler, but
-  // RE-READ whenever another beat is waiting: a config source with no
-  // trigger emits once for the whole run, while one driven by a trigger
-  // emits per request. Blocking on the first beat and polling after
-  // serves both -- the first request waits for the parameters it was
-  // wired to use, and later ones pick up a change without waiting for
-  // one that may never come.
+  // The model config: a source with no trigger emits once and ends, so
+  // its beat serves every clip, while one driven by a trigger emits a
+  // beat per request.
   if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
-      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+      _cfg_in.wants()) {
     auto gb = co_await ctx.read(kModelCfgPort);
-    _cfg_latched = true;
-    if (const auto* gfd =
-            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+    const Took took = _cfg_in.took(gb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* gfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
       _model_cfg = gfd->data;
       // Only if the family is already known; otherwise resolve_config_
       // applies it the moment it is.
@@ -3480,9 +3543,68 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     }
   }
 
-  auto in = co_await ctx.read(0);
-  if (!in) { ctx.signal_done(); co_return; }
-  const auto* cond = dynamic_cast<const TensorBeatPayload*>(in.get());
+  // The conditioning -- and with a NEW one, its negative. The conditioner
+  // emits the negative BEFORE the positive, so by the time the positive
+  // lands its pair is already queued: a non-blocking poll rather than a
+  // read that could deadlock when there is no negative. No conditioning
+  // at all ends the run.
+  if (_cond_in.wants()) {
+    auto in = co_await ctx.read(0);
+    const Took took = _cond_in.took(in != nullptr);
+    if (round.note(took) || took == Took::kNone) {
+      ctx.signal_done();
+      co_return;
+    }
+    if (took == Took::kFresh) {
+      _cond_beat = std::move(in);
+      _neg_beat.reset();
+      if (ctx.num_iports() > 1 && ctx.iport_connected(1) &&
+          ctx.backlog(1) > 0) {
+        _neg_beat = co_await ctx.read(1);
+      }
+    }
+  }
+  if (!_cond_beat) { ctx.signal_done(); co_return; }
+  // The keyframe / first-frame latents, the `ref2va` reference rows and
+  // the audio conditioning. Blocking reads when wired, never polls: a
+  // video-ref-encoder emits BOTH row beats every request, with 0 rows
+  // when a modality is absent, so a poll would be a race where a read is
+  // not. A single first frame under many prompts is sent once and held.
+  struct HeldInput {
+    unsigned                          port;
+    GenerationInput*                  in;
+    std::unique_ptr<BeatPayloadIntf>* beat;
+  };
+  const HeldInput held[] = {
+    {kRefPort, &_ref0_in, &_ref0_beat},
+    {kRefPort1, &_ref1_in, &_ref1_beat},
+    {kRefVideoRowsPort, &_ref_video_in, &_ref_video_beat},
+    {kRefAudioRowsPort, &_ref_audio_in, &_ref_audio_beat},
+    {kAudioCondPort, &_audio_cond_in, &_audio_cond_beat},
+  };
+  for (const HeldInput& h : held) {
+    if (ctx.num_iports() <= h.port || !ctx.iport_connected(h.port) ||
+        !h.in->wants()) {
+      continue;
+    }
+    auto b = co_await ctx.read(h.port);
+    const Took took = h.in->took(b != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took == Took::kFresh) { *h.beat = std::move(b); }
+  }
+  // Nothing new on any input: everything is broadcasting, and this clip
+  // would repeat the last one exactly.
+  if (round.idle()) { ctx.signal_done(); co_return; }
+  // THIS clip's seed, before anything can end it early.
+  _seed = generation_seed(_seed_seq, _seed_base, _generation);
+  ++_generation;
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): generation {}, seed {}{}", this->id(),
+      _generation, _seed,
+      _seed_seq == SeedSequence::kRandomize ? " (randomized)" : ""));
+
+  const BeatPayloadIntf* in = _cond_beat.get();
+  const auto* cond = dynamic_cast<const TensorBeatPayload*>(in);
   if (cond == nullptr || cond->shape.size() != 2) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): expected a [text_seq, {}] conditioning "
@@ -3490,50 +3612,15 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         in->describe()));
     co_return;
   }
-  // The negative is emitted BEFORE the positive by the conditioner, so by
-  // the time the positive lands its pair is already queued -- a non-blocking
-  // poll rather than a read that could deadlock when there is no negative.
-  std::unique_ptr<BeatPayloadIntf> negb;
-  if (ctx.num_iports() > 1 && ctx.iport_connected(1) && ctx.backlog(1) > 0) {
-    negb = co_await ctx.read(1);
-  }
-  const auto* neg =
-      negb ? dynamic_cast<const TensorBeatPayload*>(negb.get()) : nullptr;
-  std::unique_ptr<BeatPayloadIntf> refb;
-  if (ctx.num_iports() > kRefPort && ctx.iport_connected(kRefPort)) {
-    refb = co_await ctx.read(kRefPort);
-  }
-  const auto* ref =
-      refb ? dynamic_cast<const TensorBeatPayload*>(refb.get()) : nullptr;
-  std::unique_ptr<BeatPayloadIntf> refb1;
-  if (ctx.num_iports() > kRefPort1 && ctx.iport_connected(kRefPort1)) {
-    refb1 = co_await ctx.read(kRefPort1);
-  }
-  const auto* ref1 =
-      refb1 ? dynamic_cast<const TensorBeatPayload*>(refb1.get()) : nullptr;
-  // The `ref2va` reference rows. Read unconditionally when wired: a
-  // video-ref-encoder emits BOTH every request, with 0 rows when a
-  // modality is absent, so a poll would be a race where a read is not.
-  std::unique_ptr<BeatPayloadIntf> rvb, rab;
-  if (ctx.num_iports() > kRefVideoRowsPort &&
-      ctx.iport_connected(kRefVideoRowsPort)) {
-    rvb = co_await ctx.read(kRefVideoRowsPort);
-  }
-  if (ctx.num_iports() > kRefAudioRowsPort &&
-      ctx.iport_connected(kRefAudioRowsPort)) {
-    rab = co_await ctx.read(kRefAudioRowsPort);
-  }
-  std::unique_ptr<BeatPayloadIntf> acb;
-  if (ctx.num_iports() > kAudioCondPort &&
-      ctx.iport_connected(kAudioCondPort)) {
-    acb = co_await ctx.read(kAudioCondPort);
-  }
-  const auto* act =
-      acb ? dynamic_cast<const TensorBeatPayload*>(acb.get()) : nullptr;
-  const auto* rvt =
-      rvb ? dynamic_cast<const TensorBeatPayload*>(rvb.get()) : nullptr;
-  const auto* rat =
-      rab ? dynamic_cast<const TensorBeatPayload*>(rab.get()) : nullptr;
+  auto tensor_of = [](const std::unique_ptr<BeatPayloadIntf>& b) {
+    return b ? dynamic_cast<const TensorBeatPayload*>(b.get()) : nullptr;
+  };
+  const auto* neg  = tensor_of(_neg_beat);
+  const auto* ref  = tensor_of(_ref0_beat);
+  const auto* ref1 = tensor_of(_ref1_beat);
+  const auto* act  = tensor_of(_audio_cond_beat);
+  const auto* rvt  = tensor_of(_ref_video_beat);
+  const auto* rat  = tensor_of(_ref_audio_beat);
 
   if (!ensure_expert_(0)) {
     session()->warn(fmt(
@@ -3623,9 +3710,10 @@ GenerateVideoStage::process(RuntimeContext& ctx)
                 res.video.size() * sizeof(float));
     {
       FlexData sb = FlexData::make_object();
-      sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      sb.as_object().insert_or_assign(sideband::kFps,
+                                      FlexData::make_real(_fps));
       sb.as_object().insert_or_assign(
-          "frames", FlexData::make_int((std::int64_t)_frames));
+          sideband::kFrames, FlexData::make_int((std::int64_t)_frames));
       vout->sideband = std::move(sb);
     }
     ++_emitted;
@@ -3653,7 +3741,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       if (res.latents_per_second > 0.0) {
         FlexData sb = FlexData::make_object();
         sb.as_object().insert_or_assign(
-            "latents_per_second",
+            sideband::kLatentsPerSecond,
             FlexData::make_real(res.latents_per_second));
         aout->sideband = std::move(sb);
       }
@@ -3921,9 +4009,10 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     std::memcpy(vout->as_f32(), vlat.data(), vlat.size() * sizeof(float));
     {
       FlexData sb = FlexData::make_object();
-      sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      sb.as_object().insert_or_assign(sideband::kFps,
+                                      FlexData::make_real(_fps));
       sb.as_object().insert_or_assign(
-          "frames", FlexData::make_int((std::int64_t)_frames));
+          sideband::kFrames, FlexData::make_int((std::int64_t)_frames));
       vout->sideband = std::move(sb);
     }
     ++_emitted;
@@ -3947,7 +4036,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
                   alat_out.size() * sizeof(float));
       FlexData sb = FlexData::make_object();
       sb.as_object().insert_or_assign(
-          "latents_per_second",
+          sideband::kLatentsPerSecond,
           FlexData::make_int((std::int64_t)h3::kAudioLatentsPerSecond));
       aout->sideband = std::move(sb);
       tag_model_(*aout);
@@ -4158,8 +4247,8 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   out->resize_contiguous(nlat);
   std::memcpy(out->as_f32(), x.data(), nlat * sizeof(float));
   FlexData sb = FlexData::make_object();
-  sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
-  sb.as_object().insert_or_assign("frames",
+  sb.as_object().insert_or_assign(sideband::kFps, FlexData::make_real(_fps));
+  sb.as_object().insert_or_assign(sideband::kFrames,
                                   FlexData::make_int((std::int64_t)_frames));
   out->sideband = std::move(sb);
   ++_emitted;

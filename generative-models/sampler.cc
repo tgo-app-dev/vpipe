@@ -1,4 +1,5 @@
 #include "generative-models/sampler.h"
+#include "generative-models/spec-keys.h"
 
 #include "common/flex-data.h"
 
@@ -507,38 +508,39 @@ Sampler::sample_topk(std::span<const float>        top_vals,
 SamplerParams
 parse_sampler_config(const FlexData& obj)
 {
+  namespace k = token_sampler_spec;
   SamplerParams p;
   if (!obj.is_object()) {
     return p;
   }
   auto root = obj.as_object();
-  if (root.contains("temperature")) {
+  if (root.contains(k::kTemperature)) {
     p.temperature = static_cast<float>(
-        root.at("temperature").as_real(p.temperature));
+        root.at(k::kTemperature).as_real(p.temperature));
   }
-  if (root.contains("top_k")) {
+  if (root.contains(k::kTopK)) {
     p.top_k = static_cast<int>(
-        root.at("top_k").as_int(p.top_k));
+        root.at(k::kTopK).as_int(p.top_k));
   }
-  if (root.contains("top_p")) {
+  if (root.contains(k::kTopP)) {
     p.top_p = static_cast<float>(
-        root.at("top_p").as_real(p.top_p));
+        root.at(k::kTopP).as_real(p.top_p));
   }
-  if (root.contains("min_p")) {
+  if (root.contains(k::kMinP)) {
     p.min_p = static_cast<float>(
-        root.at("min_p").as_real(p.min_p));
+        root.at(k::kMinP).as_real(p.min_p));
   }
-  if (root.contains("repetition_penalty")) {
+  if (root.contains(k::kRepetitionPenalty)) {
     p.repetition_penalty = static_cast<float>(
-        root.at("repetition_penalty").as_real(p.repetition_penalty));
+        root.at(k::kRepetitionPenalty).as_real(p.repetition_penalty));
   }
-  if (root.contains("presence_penalty")) {
+  if (root.contains(k::kPresencePenalty)) {
     p.presence_penalty = static_cast<float>(
-        root.at("presence_penalty").as_real(p.presence_penalty));
+        root.at(k::kPresencePenalty).as_real(p.presence_penalty));
   }
-  if (root.contains("seed")) {
+  if (root.contains(k::kSeed)) {
     p.seed = static_cast<std::uint64_t>(
-        root.at("seed").as_uint(p.seed));
+        root.at(k::kSeed).as_uint(p.seed));
   }
   return p;
 }
@@ -548,8 +550,9 @@ is_diffusion_sampler_spec(const FlexData& obj)
 {
   if (!obj.is_object()) { return false; }
   auto root = obj.as_object();
-  if (!root.contains("sampler")) { return false; }
-  return root.at("sampler").as_string("") == "flow_match";
+  if (!root.contains(sampler_spec::kSampler)) { return false; }
+  return root.at(sampler_spec::kSampler).as_string("") ==
+         sampler_spec::kFlowMatch;
 }
 
 }

@@ -100,8 +100,8 @@ constexpr ConfigKey kAttrs[] = {
    .suggest_db_type = "krea2-lora,flux2-lora,minimax-h3-lora",
    .is_path = true, .path_filter = "weights"},
   {.key = "output_name", .type = ConfigType::String, .required = true,
-   .doc = "result name -> <cwd>/models/<output_name> (registered), or an "
-          "explicit path"},
+   .doc = "result name -> models/<output_name> beside the database "
+          "(registered), or an explicit path"},
   {.key = "base_pipeline", .type = ConfigType::String,
    .doc = "optional base diffusers pipeline ROOT (dir or key); when set, the "
           "fused DiT is written under <output>/transformer/ and the pipeline's "
@@ -221,7 +221,7 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
       _output_name.rfind("../", 0) == 0;
   const std::string out_dir = explicit_path
       ? _output_name
-      : (fs::current_path() / "models" / _output_name).string();
+      : (default_models_dir(session()) / _output_name).string();
   _out_dir = out_dir;
 
   metal_compute::MetalCompute* mc = session()->services()->metal_compute();

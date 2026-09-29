@@ -13,6 +13,10 @@
 #include <optional>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Per-producer-oport shared buffer. Holds payloads (unique_ptr<
@@ -93,6 +97,7 @@ struct MultiReadWaiter {
 };
 
 class OportBuffer : public SessionMember {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // capacity == 0 selects default mode (ring sized next_pow2(
   // soft_error), soft thresholds armed). Non-zero capacity is
@@ -273,5 +278,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

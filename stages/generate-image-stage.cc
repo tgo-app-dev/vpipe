@@ -1,4 +1,6 @@
 #include "stages/generate-image-stage.h"
+#include "generative-models/gen-input.h"
+#include "common/beat-keys.h"
 
 #include "stages/model-memory.h"
 #include "stages/model-provenance.h"
@@ -67,7 +69,10 @@ bf16_to_f32_(std::uint16_t b)
 // How a reference latent pairs with the conditioning beats -- the
 // ctor's own three, for the editor's dropdown.
 constexpr SpecExtra kReferenceModeChoices[] = {
-  {"choices", "auto,latch,per_beat"},
+  {spec_key::kChoices, "auto,latch,per_beat"},
+};
+constexpr SpecExtra kSeedSequenceExtra[] = {
+  {spec_key::kChoices, kSeedSequenceChoices},
 };
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -103,7 +108,18 @@ const ConfigKey kAttrs[] = {
    .doc = "turbo sampler steps (default 8; 1 on a VOSR restorer, which is "
           "distilled to one and gains nothing from more)"},
   {.key = "seed", .type = ConfigType::Int, .required = false,
-   .doc = "initial-noise RNG seed (default 0)"},
+   .doc = "initial-noise RNG seed (default 0). The run's FIRST generation "
+          "uses it; `seed_sequence` decides what later ones use"},
+  {.key = "seed_sequence", .type = ConfigType::String, .required = false,
+   .doc = "the seed of each generation when a run makes several -- a "
+          "prompt per beat, a folder of references. \"increment\" "
+          "(default): `seed`, then `seed`+1, `seed`+2, ... in generation "
+          "order, so any one of them can be re-run alone by setting its "
+          "number. \"randomize\": ignore `seed` and draw each from the "
+          "clock; every seed used is logged, and fits the `seed` field "
+          "for a re-run. \"keep\": `seed` for every generation, which "
+          "compares prompts on the same noise",
+   .def_str = "increment", .extra = kSeedSequenceExtra},
   {.key = "guidance_scale", .type = ConfigType::Real, .required = false,
    .doc = "classifier-free guidance scale; 1 (default) disables CFG. >1 with "
           "a negative prompt on iport1 runs a 2nd DiT pass per step"},
@@ -350,14 +366,16 @@ const ConfigKey kAttrs[] = {
           "0 skips its two GEMMs", .def_real = 1.0},
   {.key = "reference_mode", .type = ConfigType::String, .required = false,
    .doc = "how the reference latents pair with the conditioning beats. "
-          "\"latch\" holds the FIRST reference for the whole run, which is "
-          "what an edit graph wants: one source picture, many prompts. "
-          "\"per_beat\" reads a fresh reference for every beat, which is "
-          "what a RESTORATION graph wants: the reference IS the input and "
-          "changes every time, and latching it would restore a whole folder "
-          "from the first picture without ever saying so. \"auto\" (the "
-          "default) is per_beat for a restorer and latch for everything "
-          "else", .def_str = "auto", .extra = kReferenceModeChoices},
+          "\"auto\" (the default) is the rule every input of this stage "
+          "follows: a reference whose source sends ONE beat and ends is "
+          "used for every generation (one source picture, many prompts), "
+          "and one that keeps sending is consumed a beat per generation "
+          "(a folder to restore or edit). \"latch\" holds the FIRST "
+          "reference for the whole run even from a source that stays "
+          "open -- a live input that will never end its stream. "
+          "\"per_beat\" wants a new reference for EVERY generation and "
+          "ends the run when they stop, even after one",
+   .def_str = "auto", .extra = kReferenceModeChoices},
 };
 
 // The keys that MOVED to the per-family config stages. Named so a
@@ -412,6 +430,14 @@ const PortSpec kIports[] = {
           "goes nowhere, silently",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
+  {.name = "ref_latents",
+   .doc = "OPTIONAL reference latents as ONE LIST (vae-encode's `latents`): "
+          "as many as the graph has, each at its own size, for a "
+          "multi-reference family. They follow whatever is on ref_latent0 / "
+          "ref_latent1, in list order, and the family sees them all as its "
+          "references; one that takes fewer uses the first ones and says so",
+   .type = &typeid(TensorListPayload),
+   .tags = "latent-list", .clock_group = 0},
 };
 
 // The model iport (a model-select source) overrides hf_dir. Inserted after the
@@ -420,6 +446,9 @@ const PortSpec kIports[] = {
 // from the Apple-gated code; maybe_unused for the inert non-Apple build.)
 [[maybe_unused]] constexpr unsigned kModelPort = 2;
 [[maybe_unused]] constexpr unsigned kModelCfgPort = 7;
+// ...and the reference LIST after them all, so every graph written before
+// it keeps its port numbers.
+[[maybe_unused]] constexpr unsigned kRefListPort = 8;
 const PortSpec kOports[] = {
   {.name = "latent",
    .doc = "f32 latent [z_dim, H/8, W/8] (unpacked, whitened)",
@@ -453,7 +482,11 @@ const StageSpec kSpec = {
   .doc       = "Diffusion DiT denoiser: conditioning (from a diffusion-"
                "conditioner stage) -> family MMDiT -> FlowMatchEuler -> latent, "
                "on the metal-compute backend. The denoiser half of the split "
-               "(feed vae-decode).",
+               "(feed vae-decode). A run makes one image per generation: an "
+               "input whose source sends one beat and ends serves every "
+               "generation, one that keeps sending is consumed a beat per "
+               "generation, and the run ends when a consumed input does. "
+               "`seed_sequence` sets each generation's seed.",
   .display_name = "Generate Image",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -559,15 +592,18 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   }
   _tile_overlap = (int)attr_int("tile_overlap");
   {
+    using Mode = GenerationInput::Mode;
     const std::string rm = attr_str("reference_mode");
-    if (rm == "latch")         { _ref_mode = RefMode::kLatch; }
-    else if (rm == "per_beat") { _ref_mode = RefMode::kPerBeat; }
+    if (rm == "latch")         { _ref_mode = Mode::kLatch; }
+    else if (rm == "per_beat") { _ref_mode = Mode::kFresh; }
     else if (!rm.empty() && rm != "auto") {
       // Deferred-validated config: warn and take the default.
       session()->warn(fmt(
           "GenerateImageStage('{}'): reference_mode '{}' is not "
           "auto|latch|per_beat; using auto", this->id(), rm));
     }
+    for (GenerationInput& in : _ref_port_in) { in.set_mode(_ref_mode); }
+    _ref_list_in.set_mode(_ref_mode);
   }
   _init_latents = attr_str("init_latents");
   _height = (int)attr_int("height");
@@ -675,7 +711,17 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   _lora[0].scale = attr_real("lora_scale");
   _lora[1].path  = attr_str("lora2");
   _lora[1].scale = attr_real("lora2_scale");
-  _seed   = (std::uint64_t)attr_int("seed");
+  _seed_base = (std::uint64_t)attr_int("seed");
+  _seed      = _seed_base;
+  {
+    const std::string sq = attr_str("seed_sequence");
+    if (!sq.empty() && !parse_seed_sequence(sq, &_seed_seq)) {
+      // Deferred-validated config: warn and take the default.
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): seed_sequence '{}' is not "
+          "increment|randomize|keep; using increment", this->id(), sq));
+    }
+  }
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
   // because the key is now inert, not wrong -- the graph runs, it just
@@ -1145,17 +1191,31 @@ GenerateImageStage::reset_run_state()
   _model_latched     = false;
   _sampler_latched   = false;
   _scheduler_latched = false;
-  _cfg_latched       = false;
   _model_cfg         = FlexData{};
-  // The reference latents latch on FIRST arrival and are cached for
-  // every later prompt (`_ref[]`), which is right within a run and
-  // wrong across one: a non-empty cache makes the iport5/iport6 read
-  // conditional, so on the next launch the stage never consumes the
-  // reference beat the vae-encode upstream just produced. That beat
-  // then sits on the wire forever (the edge shows a permanent backlog)
-  // and the run silently re-uses the PREVIOUS image's reference.
-  _ref[0] = RefLatent{};
-  _ref[1] = RefLatent{};
+  // Every per-generation input starts over: a run's beats pair among
+  // themselves, never with the last run's, and the seed sequence starts
+  // again from `seed`.
+  _cfg_in.reset();
+  _cond_in.reset();
+  _sampler_in.reset();
+  _scheduler_in.reset();
+  _cond_beat.reset();
+  _neg_beat.reset();
+  _generation = 0;
+  _seed       = _seed_base;
+  // The reference latents are held across generations (`_ref`), which
+  // is right within a run and wrong across one: an input still holding
+  // is not read, so on the next launch the stage would never consume
+  // the reference beat the vae-encode upstream just produced. That beat
+  // would sit on the wire forever (the edge shows a permanent backlog)
+  // and the run would silently re-use the PREVIOUS image's reference.
+  _ref_port[0] = RefLatent{};
+  _ref_port[1] = RefLatent{};
+  _ref_port_in[0].reset();
+  _ref_port_in[1].reset();
+  _ref_list.clear();
+  _ref_list_in.reset();
+  _ref.clear();
   // ...AND THE VALUES PARSED OUT OF IT. `_model_cfg` going empty is not
   // enough: the parsed derivatives live in their own members, and an
   // ABSENT key means "no opinion" on purpose -- which is right WITHIN a
@@ -3940,7 +4000,7 @@ GenerateImageStage::generate_z_image_(
   // released edit checkpoint, and nothing in the sequence for a
   // reference to occupy -- so a wired reference latent is ignored, and
   // saying so beats letting someone wonder why their edit did nothing.
-  if (!_ref[0].empty() || !_ref[1].empty()) {
+  if (!_ref.empty()) {
     session()->warn(fmt(
         "GenerateImageStage('{}'): a reference latent is wired but "
         "Z-Image is text-to-image only -- it is ignored. The family's "
@@ -4718,23 +4778,38 @@ Job
 GenerateImageStage::process(RuntimeContext& ctx)
 {
   auto* mc = session()->services()->metal_compute();
+  // ONE CALL, ONE GENERATION. Every input is read here, up front, and
+  // paired by the rule in stages/generation-input.h: an input whose source
+  // sends one beat and ends serves every generation of the run, one that
+  // keeps sending is consumed a beat per generation, and the run ends
+  // when a consumed input runs out or when nothing new arrives at all.
+  //
+  // ALL of them, and before anything can end the generation early -- a
+  // refusal, a dropped beat. Pairing is by position in each stream, so an
+  // input skipped once pairs every later generation with the wrong beat.
+  // The model (iport2) is the exception: it is what LOADS, once, not an
+  // input of each generation.
+  using Took = GenerationInput::Took;
+  GenerationRound round;
+
   // The model config FIRST, before anything can load: `klein_kv` is an
   // argument to the DiT's construction, not a per-step knob, so a beat
   // read after ensure_loaded_ would arrive too late to matter and would
   // do so silently.
   //
-  // Latched, but RE-READ whenever another beat is waiting: a config
-  // source with no trigger emits once for the whole run, while a
-  // trigger-driven one emits per request. Blocking on the first and
-  // polling after serves both. (A later beat cannot change `klein_kv` on
-  // an already-built DiT -- see the note where that is reported.)
+  // A generation input like the rest: a config source with no trigger
+  // emits once and ends, so its beat serves the whole run, while a
+  // trigger-driven one emits a beat per request. (A later beat cannot
+  // change `klein_kv` on an already-built DiT -- see the note where that
+  // is reported.)
   if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
-      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+      _cfg_in.wants()) {
     auto gb = co_await ctx.read(kModelCfgPort);
-    const bool first = !_cfg_latched;
-    _cfg_latched = true;
-    if (const auto* gfd =
-            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+    const bool first = _cfg_in.beats() == 0;
+    const Took took = _cfg_in.took(gb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* gfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
       const bool kv_before = _flux2_params.klein_kv;
       _model_cfg = gfd->data;
       // Only if the family is already known; otherwise ensure_loaded_
@@ -4767,18 +4842,211 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // A config wired but no model-select source: initialize() deferred the
   // load so the config could be read first, so nothing has loaded yet.
   ensure_loaded_();
-  auto in = co_await ctx.read(0);
-  if (!in) { ctx.signal_done(); co_return; }
+  // The conditioning (iport0) -- and with a NEW one, its negative
+  // (iport1). The conditioner enqueues oport1 BEFORE oport0, so when a
+  // positive arrives its paired negative is already in that FIFO: the
+  // non-blocking backlog gate reads it reliably, and finds nothing for a
+  // prompt that has none. No conditioning at all ends the run.
+  if (_cond_in.wants()) {
+    auto cb = co_await ctx.read(0);
+    const Took took = _cond_in.took(cb != nullptr);
+    if (round.note(took) || took == Took::kNone) {
+      ctx.signal_done();
+      co_return;
+    }
+    if (took == Took::kFresh) {
+      _cond_beat = std::move(cb);
+      _neg_beat.reset();
+      if (ctx.num_iports() >= 2 && ctx.iport_connected(1) &&
+          ctx.backlog(1) > 0) {
+        _neg_beat = co_await ctx.read(1);
+      }
+    }
+  }
+  if (!_cond_beat) { ctx.signal_done(); co_return; }
+  // Reference latents on iport5 / iport6, and the LIST on iport8, each a
+  // generation input in `reference_mode` (by default the general rule):
+  // one source picture for many prompts is sent once and held, a folder
+  // to restore or edit is consumed a picture per generation. Blocking
+  // reads, so a reference reliably pairs with its prompt -- a non-blocking
+  // poll would race the producer. `_ref` is what the families read: the
+  // two ports, then the list, packed. FLUX.2 threads them as
+  // multi-reference conditioning tokens; Krea-2 uses the first as the
+  // img2img init.
+  // One [C,H,W] f32 latent into `dst`; false (and `dst` left empty) for
+  // anything else, which `what` names in the warning.
+  auto take_latent = [&](const TensorBeat& tb, RefLatent& dst,
+                         const std::string& what) {
+    dst = RefLatent{};
+    if (tb.dtype != TensorBeat::DType::F32 || tb.shape.size() != 3 ||
+        tb.shape[0] <= 0 || tb.shape[1] <= 0 || tb.shape[2] <= 0) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): {} must be an f32 [C,H,W] latent; "
+          "got {} [{} dims], ignoring", this->id(), what, tb.dtype_name(),
+          tb.shape.size()));
+      return false;
+    }
+    const auto bytes = tb.materialize_contiguous();
+    const std::size_t n =
+        (std::size_t)tb.shape[0] * tb.shape[1] * tb.shape[2];
+    const float* fp = reinterpret_cast<const float*>(bytes.data());
+    dst.chw.assign(fp, fp + n);
+    dst.c = (int)tb.shape[0];
+    dst.h = (int)tb.shape[1];
+    dst.w = (int)tb.shape[2];
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): {} = [{}, {}, {}]", this->id(), what,
+        dst.c, dst.h, dst.w));
+    return true;
+  };
+  bool refs_changed = false;
+  for (int r = 0; r < 2; ++r) {
+    const int port = 5 + r;
+    if ((int)ctx.num_iports() <= port || !ctx.iport_connected(port) ||
+        !_ref_port_in[r].wants()) {
+      continue;
+    }
+    // COUNTED whatever arrives -- a bad beat too -- so a malformed
+    // reference costs its own generation a reference, not the pairing
+    // of every later one.
+    auto rb = co_await ctx.read(port);
+    const Took took = _ref_port_in[r].took(rb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took != Took::kFresh) { continue; }      // held, or never sent
+    _ref_port[r] = RefLatent{};
+    refs_changed = true;
+    const auto* tb = rb ? dynamic_cast<const TensorBeatPayload*>(rb.get())
+                        : nullptr;
+    if (tb != nullptr) {
+      take_latent(*tb, _ref_port[r], "ref_latent" + std::to_string(r));
+    } else if (rb) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): ref_latent{} must be an f32 [C,H,W] "
+          "TensorBeat; got {}, ignoring", this->id(), r, rb->describe()));
+    }
+  }
+  // The LIST: every reference a multi-reference graph has, in one beat.
+  if ((int)ctx.num_iports() > (int)kRefListPort &&
+      ctx.iport_connected(kRefListPort) && _ref_list_in.wants()) {
+    auto rb = co_await ctx.read(kRefListPort);
+    const Took took = _ref_list_in.took(rb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took == Took::kFresh) {
+      _ref_list.clear();
+      refs_changed = true;
+    }
+    if (const auto* lp = took == Took::kFresh
+            ? dynamic_cast<const TensorListPayload*>(rb.get()) : nullptr) {
+      for (std::size_t i = 0; i < lp->items.size(); ++i) {
+        RefLatent one;
+        if (take_latent(lp->items[i], one,
+                        "ref_latents[" + std::to_string(i) + "]")) {
+          _ref_list.push_back(std::move(one));
+        }
+      }
+    } else if (took == Took::kFresh) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): ref_latents must be a list of f32 "
+          "[C,H,W] latents; got {}, ignoring", this->id(), rb->describe()));
+    }
+  }
+  if (refs_changed) {
+    _ref.clear();
+    for (const RefLatent& r : _ref_port) {
+      if (!r.empty()) { _ref.push_back(r); }
+    }
+    for (const RefLatent& r : _ref_list) { _ref.push_back(r); }
+    if (_ref.size() > 2) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): {} reference latents", this->id(),
+          _ref.size()));
+    }
+  }
+  // The sampler / scheduler specs off iport3 / iport4, generation inputs
+  // too: the `diffusion-sampler-select` / `scheduler-select` sources emit
+  // one spec beat and end, so it serves every generation of the run.
+  if (ctx.num_iports() >= 4 && ctx.iport_connected(3) && _sampler_in.wants()) {
+    auto sb = co_await ctx.read(3);
+    const Took took = _sampler_in.took(sb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    const auto* sfd = took == Took::kFresh
+        ? dynamic_cast<const FlexDataPayload*>(sb.get()) : nullptr;
+    if (sfd != nullptr) {
+      _sampler_latched = true;
+      // KEPT UNPARSED as well as parsed: the built-ins take the typed
+      // spec, and a registered family reads what it understands out of
+      // the beat itself -- an integrator this tree does not implement is
+      // still a thing a plugin may.
+      _sampler_raw = sfd->data;
+      std::string serr;
+      _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
+      if (!serr.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): sampler spec: {}",
+                            this->id(), serr));
+      }
+      session()->info(fmt(
+          "GenerateImageStage('{}'): sampler = {} (eta {}, s_noise {})",
+          this->id(), _sampler_spec.method, _sampler_spec.eta,
+          _sampler_spec.s_noise));
+    }
+  }
+  if (ctx.num_iports() >= 5 && ctx.iport_connected(4) &&
+      _scheduler_in.wants()) {
+    auto cb = co_await ctx.read(4);
+    const Took took = _scheduler_in.took(cb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    const auto* cfd = took == Took::kFresh
+        ? dynamic_cast<const FlexDataPayload*>(cb.get()) : nullptr;
+    if (cfd != nullptr) {
+      _scheduler_latched = true;
+      _scheduler_raw = cfd->data;
+      std::string cerr;
+      _scheduler_spec = genai::FlowSchedulerSpec::from_flex(cfd->data, &cerr);
+      if (!cerr.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): scheduler spec: {}",
+                            this->id(), cerr));
+      }
+      session()->info(fmt(
+          "GenerateImageStage('{}'): scheduler = {} ({} steps, shift {} {})",
+          this->id(), _scheduler_spec.type, _scheduler_spec.steps,
+          _scheduler_spec.shift, _scheduler_spec.shift_type));
+      // A wired scheduler OWNS the step count: its spec replaces this
+      // stage's wholesale, `steps` included. When the graph also named a
+      // count here and the two disagree, only one of them runs, and the
+      // one in plain sight on this stage is the one that does not -- so
+      // say which.
+      if (_steps_set && _scheduler_spec.steps > 0 &&
+          _scheduler_spec.steps != _steps) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): steps {} is IGNORED -- the wired "
+            "scheduler runs {} steps and owns the count. Set it on the "
+            "scheduler-select stage, or make the two agree",
+            this->id(), _steps, _scheduler_spec.steps));
+      }
+    }
+  }
+  // Nothing new on any input: everything is broadcasting, and this
+  // generation would repeat the last one exactly.
+  if (round.idle()) { ctx.signal_done(); co_return; }
+  // THIS generation's seed, before anything can end it early -- see
+  // `_generation`.
+  _seed = generation_seed(_seed_seq, _seed_base, _generation);
+  ++_generation;
+  session()->info(fmt(
+      "GenerateImageStage('{}'): generation {}, seed {}{}", this->id(),
+      _generation, _seed,
+      _seed_seq == SeedSequence::kRandomize ? " (randomized)" : ""));
+  const BeatPayloadIntf* in = _cond_beat.get();
   // Did the conditioner REFUSE this prompt? Read the flag off the beat up
   // front; the refusal itself is emitted further down, once the output size
   // is known.
   bool cond_blocked = false;
-  if (const auto* stb = dynamic_cast<const TensorBeatPayload*>(in.get())) {
+  if (const auto* stb = dynamic_cast<const TensorBeatPayload*>(in)) {
     if (stb->sideband.is_object()) {
       FlexData sb = stb->sideband;        // as_object() is a view: keep it
       auto o = sb.as_object();
-      cond_blocked = o.contains("content_blocked")
-                     && o.at("content_blocked").as_bool(false);
+      cond_blocked = o.contains(sideband::kContentBlocked)
+                     && o.at(sideband::kContentBlocked).as_bool(false);
       // Qwen-Image-2.1's joint-sequence bookkeeping. Read here rather
       // than in the family branch because the beat is consumed by then,
       // and read EVERY beat -- a second prompt with a different
@@ -4788,7 +5056,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
         _qi21_slots.clear();
         _qi21_ref_gh.clear();
         _qi21_ref_gw.clear();
-        auto ints = [&](const char* k, std::vector<int>& dst) {
+        auto ints = [&](std::string_view k, std::vector<int>& dst) {
           if (!o.contains(k)) { return; }
           const FlexData f = o.at(k);
           if (!f.is_array()) { return; }
@@ -4798,11 +5066,11 @@ GenerateImageStage::process(RuntimeContext& ctx)
           }
         };
         std::vector<int> sl;
-        ints("img_slots", sl);
+        ints(genai::cond_sideband::kImgSlots, sl);
         _qi21_slots.reserve(sl.size());
         for (int v : sl) { _qi21_slots.push_back(v != 0 ? 1 : 0); }
-        ints("ref_grid_h", _qi21_ref_gh);
-        ints("ref_grid_w", _qi21_ref_gw);
+        ints(genai::cond_sideband::kRefGridH, _qi21_ref_gh);
+        ints(genai::cond_sideband::kRefGridW, _qi21_ref_gw);
       }
     }
   }
@@ -4859,7 +5127,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
   }
   // iport0: the conditioning tensor from a diffusion-conditioner stage
   // (family-shaped + typed; rows = shape[0]). Copy it into a metal buffer.
-  const auto* ctb = dynamic_cast<const TensorBeatPayload*>(in.get());
+  const auto* ctb = dynamic_cast<const TensorBeatPayload*>(in);
   if (ctb == nullptr || ctb->shape.empty() || ctb->shape[0] <= 0) {
     session()->warn(fmt(
         "GenerateImageStage('{}'): expected a conditioning TensorBeat, got {}; "
@@ -4879,16 +5147,13 @@ GenerateImageStage::process(RuntimeContext& ctx)
       n_real, ctb->dtype == TensorBeat::DType::Bf16 ? "bf16" : "f16"));
 
   // iport1: OPTIONAL negative conditioning (the conditioner's oport1) for
-  // classifier-free guidance. The conditioner enqueues oport1 BEFORE oport0, so
-  // when iport0 arrives its paired negative is already in this port's FIFO --
-  // the non-blocking backlog gate reads it reliably (and never stalls when no
-  // negative is wired).
+  // classifier-free guidance, read with its positive at the top.
   metal_compute::SharedBuffer cond_neg;
   int n_real_neg = 0;
-  if (ctx.num_iports() >= 2 && ctx.iport_connected(1) && ctx.backlog(1) > 0) {
-    auto nb = co_await ctx.read(1);
-    const auto* ntb = nb ? dynamic_cast<const TensorBeatPayload*>(nb.get())
-                         : nullptr;
+  {
+    const auto* ntb =
+        _neg_beat ? dynamic_cast<const TensorBeatPayload*>(_neg_beat.get())
+                  : nullptr;
     if (ntb != nullptr && !ntb->shape.empty() && ntb->shape[0] > 0) {
       cond_neg = cond_to_shared_(mc, *ntb);
       if (!cond_neg.empty()) { n_real_neg = (int)ntb->shape[0]; }
@@ -4913,47 +5178,6 @@ GenerateImageStage::process(RuntimeContext& ctx)
     }
   }
 
-  // Reference latents on iport5 / iport6: latch the FIRST reference on each
-  // connected port (blocking, like the sampler/scheduler specs) and cache it
-  // (`_ref[]`), so the reference reliably pairs with the prompt (a non-blocking
-  // poll would race the producer) and a fixed reference supplied once is reused
-  // for every later prompt. FLUX.2 threads them as multi-reference conditioning
-  // tokens (below); Krea-2 uses ref latent 0 as the img2img init and ignores
-  // ref latent 1.
-  //
-  // ...UNLESS the graph said otherwise. A restoration graph hands this
-  // stage a new reference on every beat and the picture IS the input, so
-  // holding the first would restore a whole folder from it and never say
-  // so. See the `reference_mode` config key.
-  const bool ref_fresh = ref_per_beat_();
-  for (int r = 0; r < 2; ++r) {
-    const int port = 5 + r;
-    if ((int)ctx.num_iports() > port && ctx.iport_connected(port) &&
-        (_ref[r].empty() || ref_fresh)) {
-      auto rb = co_await ctx.read(port);
-      const auto* tb = rb ? dynamic_cast<const TensorBeatPayload*>(rb.get())
-                          : nullptr;
-      if (tb != nullptr && tb->dtype == TensorBeat::DType::F32 &&
-          tb->shape.size() == 3 && tb->shape[0] > 0 && tb->shape[1] > 0 &&
-          tb->shape[2] > 0) {
-        const auto bytes = tb->materialize_contiguous();
-        const std::size_t n =
-            (std::size_t)tb->shape[0] * tb->shape[1] * tb->shape[2];
-        const float* fp = reinterpret_cast<const float*>(bytes.data());
-        _ref[r].chw.assign(fp, fp + n);
-        _ref[r].c = (int)tb->shape[0];
-        _ref[r].h = (int)tb->shape[1];
-        _ref[r].w = (int)tb->shape[2];
-        session()->log_debug(fmt(
-            "GenerateImageStage('{}'): reference latent {} = [{}, {}, {}]",
-            this->id(), r, _ref[r].c, _ref[r].h, _ref[r].w));
-      } else if (rb) {
-        session()->warn(fmt(
-            "GenerateImageStage('{}'): ref_latent{} must be an f32 [C,H,W] "
-            "TensorBeat; got {}, ignoring", this->id(), r, rb->describe()));
-      }
-    }
-  }
 
   // Output size. An explicit width/height ALWAYS wins; only a completely
   // unconfigured size infers, and then from ref_latent0 -- vae-encode's output
@@ -4967,7 +5191,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // falls back rather than silently truncating the grid.
   int gen_h = _height, gen_w = _width;
   if (_infer_size) {
-    const RefLatent& r0 = _ref[0];
+    const RefLatent& r0 = ref_(0);
     if (!r0.empty()) {
       const int s = latent_scale_(_family);
       const int ih = r0.h * s, iw = r0.w * s;
@@ -5005,9 +5229,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->as_f32()[0] = 0.0f;
     FlexData sb = FlexData::make_object();
     auto o = sb.as_object();
-    o.insert_or_assign("content_blocked", FlexData::make_bool(true));
-    o.insert_or_assign("refusal_height", FlexData::make_int(gen_h));
-    o.insert_or_assign("refusal_width",  FlexData::make_int(gen_w));
+    o.insert_or_assign(sideband::kContentBlocked, FlexData::make_bool(true));
+    o.insert_or_assign(sideband::kRefusalHeight, FlexData::make_int(gen_h));
+    o.insert_or_assign(sideband::kRefusalWidth,  FlexData::make_int(gen_w));
     out->sideband = std::move(sb);
     ++_latents_emitted;
     session()->info(fmt(
@@ -5026,8 +5250,8 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // skips this -- refs are conditioning tokens, not an init, handled in
   // generate_flux2_. When the size was inferred above, rr.h/rr.w match lh/lw
   // by construction.
-  if (_family == "krea2" && _strength > 0.0 && !_ref[0].empty()) {
-    const RefLatent& rr = _ref[0];
+  if (_family == "krea2" && _strength > 0.0 && !ref_(0).empty()) {
+    const RefLatent& rr = ref_(0);
     const bool ok_type = rr.c == 16 && rr.h > 0 && rr.w > 0;
     if (ok_type && rr.h == lh && rr.w == lw) {
       latent = rr.chw;
@@ -5040,63 +5264,6 @@ GenerateImageStage::process(RuntimeContext& ctx)
     }
   }
 
-  // Latch the sampler / scheduler specs off iport3 / iport4 (once each): the
-  // `diffusion-sampler-select` / `scheduler-select` sources emit a single spec
-  // beat, which
-  // we cache and reuse for every subsequent prompt.
-  if (!_sampler_latched && ctx.num_iports() >= 4 && ctx.iport_connected(3)) {
-    auto sb = co_await ctx.read(3);
-    _sampler_latched = true;
-    const auto* sfd = dynamic_cast<const FlexDataPayload*>(sb.get());
-    if (sfd != nullptr) {
-      // KEPT UNPARSED as well as parsed: the built-ins take the typed
-      // spec, and a registered family reads what it understands out of
-      // the beat itself -- an integrator this tree does not implement is
-      // still a thing a plugin may.
-      _sampler_raw = sfd->data;
-      std::string serr;
-      _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
-      if (!serr.empty()) {
-        session()->warn(fmt("GenerateImageStage('{}'): sampler spec: {}",
-                            this->id(), serr));
-      }
-      session()->info(fmt(
-          "GenerateImageStage('{}'): sampler = {} (eta {}, s_noise {})",
-          this->id(), _sampler_spec.method, _sampler_spec.eta,
-          _sampler_spec.s_noise));
-    }
-  }
-  if (!_scheduler_latched && ctx.num_iports() >= 5 && ctx.iport_connected(4)) {
-    auto cb = co_await ctx.read(4);
-    _scheduler_latched = true;
-    const auto* cfd = dynamic_cast<const FlexDataPayload*>(cb.get());
-    if (cfd != nullptr) {
-      _scheduler_raw = cfd->data;
-      std::string cerr;
-      _scheduler_spec = genai::FlowSchedulerSpec::from_flex(cfd->data, &cerr);
-      if (!cerr.empty()) {
-        session()->warn(fmt("GenerateImageStage('{}'): scheduler spec: {}",
-                            this->id(), cerr));
-      }
-      session()->info(fmt(
-          "GenerateImageStage('{}'): scheduler = {} ({} steps, shift {} {})",
-          this->id(), _scheduler_spec.type, _scheduler_spec.steps,
-          _scheduler_spec.shift, _scheduler_spec.shift_type));
-      // A wired scheduler OWNS the step count: its spec replaces this
-      // stage's wholesale, `steps` included. When the graph also named a
-      // count here and the two disagree, only one of them runs, and the
-      // one in plain sight on this stage is the one that does not -- so
-      // say which.
-      if (_steps_set && _scheduler_spec.steps > 0 &&
-          _scheduler_spec.steps != _steps) {
-        session()->warn(fmt(
-            "GenerateImageStage('{}'): steps {} is IGNORED -- the wired "
-            "scheduler runs {} steps and owns the count. Set it on the "
-            "scheduler-select stage, or make the two agree",
-            this->id(), _steps, _scheduler_spec.steps));
-      }
-    }
-  }
 
   // ---- FLUX.2: text-to-image from noise (+ optional reference-image
   // conditioning from iport5/iport6) -> latent [dit_channels, H/16, W/16].
@@ -5145,7 +5312,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     req.height = gen_h;
     req.width  = gen_w;
     req.steps  = _scheduler_spec.steps;
-    req.seed   = _seed + (std::uint64_t)_latents_emitted;
+    req.seed   = _seed;
     req.guidance_scale = _guidance_scale;
     // MATERIALIZED, because a beat may be strided or offset and a
     // family reads a contiguous block. Held in a local for the call,
@@ -5157,14 +5324,18 @@ GenerateImageStage::process(RuntimeContext& ctx)
     req.cond_elem_size = ctb->dtype == TensorBeat::DType::F32 ? 4 : 2;
     req.cond_is_bf16   = ctb->dtype == TensorBeat::DType::Bf16;
     req.cond_sideband  = ctb->sideband.is_object() ? &ctb->sideband : nullptr;
-    if (!_ref[0].empty()) {
-      req.ref_latent0 = _ref[0].chw.data();
-      req.ref0_shape  = {_ref[0].c, _ref[0].h, _ref[0].w};
+    // Every wired reference, in port order, packed: a graph that wires
+    // only the second port hands the family ONE reference. Held in a
+    // local for the call, like the conditioning above.
+    std::vector<genai::NamedTensor> refs;
+    for (const RefLatent& r : _ref) {
+      genai::NamedTensor t;
+      t.data  = r.chw.data();
+      t.shape = {r.c, r.h, r.w};
+      t.set_dtype(genai::named_tensor::kF32);
+      refs.push_back(std::move(t));
     }
-    if (!_ref[1].empty()) {
-      req.ref_latent1 = _ref[1].chw.data();
-      req.ref1_shape  = {_ref[1].c, _ref[1].h, _ref[1].w};
-    }
+    req.references = refs;
     req.model_config   = _model_cfg.is_object() ? &_model_cfg : nullptr;
     req.sampler_spec   = _sampler_raw.is_object() ? &_sampler_raw : nullptr;
     req.scheduler_spec = _scheduler_raw.is_object() ? &_scheduler_raw : nullptr;
@@ -5229,8 +5400,8 @@ GenerateImageStage::process(RuntimeContext& ctx)
       if (!previewing || name != genai::kOutputPreviewX0) { return; }
       const bool r3 = t.shape.size() == 3;
       const bool r4 = t.shape.size() == 4 && t.shape[1] == 1;
-      if (t.data == nullptr || t.elem_size != 4 || t.elems() == 0 ||
-          (!r3 && !r4)) {
+      if (t.data == nullptr || !t.is(genai::named_tensor::kF32) ||
+          t.elems() == 0 || (!r3 && !r4)) {
         if (!_preview_shape_said) {
           _preview_shape_said = true;
           session()->warn(fmt(
@@ -5348,8 +5519,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
 
   if (_family == "flux2") {
     std::vector<RefLatent> frefs;
-    if (!_ref[0].empty()) { frefs.push_back(_ref[0]); }
-    if (!_ref[1].empty()) { frefs.push_back(_ref[1]); }
+    for (const RefLatent& r : _ref) { frefs.push_back(r); }
     const int Cdit = _flux2_dit->config().in_channels;
     const int fgh = gen_h / 16, fgw = gen_w / 16;
     _flux2_dit->set_stream_stop(stopping);
@@ -5389,8 +5559,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // tokens) + norm-preserving true-CFG -> whitened latent [16, H/8, W/8]. ----
   if (_family == "qwen-image-edit") {
     std::vector<RefLatent> qrefs;
-    if (!_ref[0].empty()) { qrefs.push_back(_ref[0]); }
-    if (!_ref[1].empty()) { qrefs.push_back(_ref[1]); }
+    for (const RefLatent& r : _ref) { qrefs.push_back(r); }
     _qie_dit->set_stream_stop(stopping);
     const std::vector<float> ql =
         generate_qie_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
@@ -5432,7 +5601,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // negative beat, the sampler, `strength` -- has no meaning on this
   // path and is not read.
   if (_family == "vosr") {
-    const RefLatent& r0 = _ref[0];
+    const RefLatent& r0 = ref_(0);
     if (r0.empty()) {
       session()->warn(fmt(
           "GenerateImageStage('{}'): VOSR restores a picture and nothing was "
@@ -5470,7 +5639,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     // default has to be the one the weights were distilled for, not this
     // stage's text-to-image default of 20.
     rr.steps     = _steps_set ? _scheduler_spec.steps : 1;
-    rr.seed      = _seed + (std::uint64_t)_latents_emitted;
+    rr.seed      = _seed;
     // TILING IS THE DEFAULT past the grid the weights were distilled at.
     //
     // Pixels in the config, latent cells in the request: one conversion,
@@ -5570,8 +5739,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     const int qlh = gen_h / 16, qlw = gen_w / 16;
     const int QZ = _qi21_dit->config().out_channels;
     std::vector<RefLatent> qrefs;
-    if (!_ref[0].empty()) { qrefs.push_back(_ref[0]); }
-    if (!_ref[1].empty()) { qrefs.push_back(_ref[1]); }
+    for (const RefLatent& r : _ref) { qrefs.push_back(r); }
     _qi21_dit->set_stream_stop(stopping);
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
@@ -5647,8 +5815,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
 
   if (_family == "boogu-image") {
     std::vector<RefLatent> brefs;
-    if (!_ref[0].empty()) { brefs.push_back(_ref[0]); }
-    if (!_ref[1].empty()) { brefs.push_back(_ref[1]); }
+    for (const RefLatent& r : _ref) { brefs.push_back(r); }
     _boogu_dit->set_stream_stop(stopping);
     const std::vector<float> bl =
         generate_boogu_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
@@ -5685,9 +5852,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // both. (Reference conditioning only steers a reference-trained checkpoint.)
   std::vector<RefLatent> krefs;
   {
-    const int first = (latent_ptr != nullptr) ? 1 : 0;
-    for (int i = first; i < 2; ++i) {
-      if (!_ref[i].empty()) { krefs.push_back(_ref[i]); }
+    const std::size_t first = (latent_ptr != nullptr) ? 1 : 0;
+    for (std::size_t i = first; i < _ref.size(); ++i) {
+      krefs.push_back(_ref[i]);
     }
   }
   _dit->set_stream_stop(stopping);

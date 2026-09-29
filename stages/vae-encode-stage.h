@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_VAE_ENCODE_STAGE_H
 #define VPIPE_STAGES_VAE_ENCODE_STAGE_H
 
+#include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -128,6 +129,11 @@ public:
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
 
 private:
+  // One picture (or clip) -> one latent; null, having said why, when it
+  // cannot be. Serves both the `image` port and each item of `images`.
+  std::unique_ptr<TensorBeatPayload>
+  encode_one_(const TensorBeat& in, const std::string& what);
+
   std::string _hf_dir;
   // Optional letterbox resize target (both > 0 => enabled). Multiples of 8.
   int _target_w = 0;

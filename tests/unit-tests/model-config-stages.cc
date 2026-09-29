@@ -418,8 +418,10 @@ TEST(model_config, the_image_stages_expose_the_port_and_not_the_keys)
     auto s = make_unique<GenerateImageStage>(&sess, "gi", vector<InEdge>{},
                                              FlexData::make_object());
     const StageSpec& sp = s->spec();
-    ASSERT_TRUE(sp.iports.size() == 8u);
+    // model_config, then the reference list -- each appended in turn.
+    ASSERT_TRUE(sp.iports.size() == 9u);
     EXPECT_TRUE(std::string(sp.iports[7].name) == "model_config");
+    EXPECT_TRUE(std::string(sp.iports[8].name) == "ref_latents");
     EXPECT_TRUE(port_tags_compatible(model_config::kConfigTag,
                                      sp.iports[7].tags));
     // The earlier ports are untouched.
@@ -443,8 +445,9 @@ TEST(model_config, the_image_stages_expose_the_port_and_not_the_keys)
     auto s = make_unique<DiffusionConditionerStage>(
         &sess, "dc", vector<InEdge>{}, FlexData::make_object());
     const StageSpec& sp = s->spec();
-    ASSERT_TRUE(sp.iports.size() == 6u);
+    ASSERT_TRUE(sp.iports.size() == 7u);
     EXPECT_TRUE(std::string(sp.iports[5].name) == "model_config");
+    EXPECT_TRUE(std::string(sp.iports[6].name) == "ref_images");
     EXPECT_TRUE(port_tags_compatible(model_config::kConfigTag,
                                      sp.iports[5].tags));
     EXPECT_TRUE(std::string(sp.iports[3].name) == "ref_image");

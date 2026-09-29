@@ -1,5 +1,6 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/audio-vae-decode-stage.h"
+#include "common/beat-keys.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
 
@@ -33,7 +34,7 @@ namespace {
 // something other than what it says, so it is not offered. The legacy
 // "always" / "never" stay accepted and show as unlisted.
 constexpr SpecExtra kUnloadChoices[] = {
-  {"choices", "auto,destroy,keep"},
+  {spec_key::kChoices, "auto,destroy,keep"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -555,8 +556,9 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
     if (atb->sideband.is_object()) {
       FlexData sb = atb->sideband;          // as_object() is a view
       auto o = sb.as_object();
-      if (o.contains("latents_per_second")) {
-        areq.latents_per_second = o.at("latents_per_second").as_real(0.0);
+      if (o.contains(sideband::kLatentsPerSecond)) {
+        areq.latents_per_second =
+            o.at(sideband::kLatentsPerSecond).as_real(0.0);
       }
     }
     // The same lazy bar the video twin opens, and for the same reason:

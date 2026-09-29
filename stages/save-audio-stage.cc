@@ -144,7 +144,7 @@ constexpr int kSeqPad = 3;
 // The container set, matching is_known_format_() above -- which stays
 // the authority; this is only what the editor offers.
 constexpr SpecExtra kFormatChoices[] = {
-  {"choices", "wav,aac,mp3,m4a"},
+  {spec_key::kChoices, "wav,aac,mp3,m4a"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_path", .type = ConfigType::String, .required = true,

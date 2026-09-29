@@ -45,6 +45,10 @@
 
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe::genai::cond {
 
 // The domain name to register under. See family-profile.h: one method
@@ -142,5 +146,7 @@ find(std::string_view family) noexcept
 }
 
 }  // namespace vpipe::genai::cond
+
+VPIPE_API_END
 
 #endif

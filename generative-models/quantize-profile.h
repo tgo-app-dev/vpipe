@@ -27,6 +27,10 @@
 
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe::genai::quant {
 
 inline constexpr std::string_view kDomain = "quantize";
@@ -104,5 +108,7 @@ find(std::string_view family) noexcept
 std::string family_for_class(std::string_view class_name);
 
 }  // namespace vpipe::genai::quant
+
+VPIPE_API_END
 
 #endif

@@ -17,6 +17,9 @@
 
 #include <cstdlib>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 namespace vpipe::genai {
 
 // K at or above which the 128x256 tile wins: the deep-K weight stream

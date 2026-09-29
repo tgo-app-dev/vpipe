@@ -12,6 +12,9 @@
 #include <string_view>
 #include <vector>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 // Two questions a model has to answer from the CHECKPOINT, before it has
 // loaded anything: how little can it hold, and -- if it has no residency
 // policy -- how much should it pin.

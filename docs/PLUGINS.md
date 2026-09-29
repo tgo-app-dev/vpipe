@@ -393,9 +393,10 @@ calls, so you never null-check them. A test of yours that builds its own
 
 Your config source declares the four preview keys: `preview_vae`,
 `preview_every`, `preview_max_edge` and `preview_frames`. Use the NAMES
-and doc strings from `stages/latent-preview.h`, and emit them into your
-beat. Use the names, not the `LatentPreviewSpec` struct: the key names are
-the contract, while the struct's layout is not ABI and can change. The
+from `genai::preview_key` (`generative-models/gen-input.h`), and emit them
+into your beat. Use the names, not the `LatentPreviewSpec` struct: the key
+names are the contract, while the struct's layout is not ABI and can
+change. The
 TAE a user names must be trained for your latent space; madebyollin's
 `taeltx_2` and `taew2_1` are examples. The host decodes every TAEHV with
 the leading-frame trim (T latent frames give `t_upscale * T - t_upscale +
@@ -416,7 +417,7 @@ thing that moved. Four places used to grow that way and no longer do:
 | a per-family fact the host needs | a **family profile** domain | a switch in the host |
 | a new generation INPUT with a shape | `req.input("name", &t)` | a field on the request |
 | a tensor handed back MID-generation | `req.output("name", step, total, t)`, asked first with `req.output_wanted` | a callback field on the request |
-| a scalar the host states | `req.extras` | a field on the request |
+| a scalar the host states | `req.borrowed_extra` | a field on the request |
 | something a family wants said back | `result.sideband` | a field on the result |
 | a new packaging fact | `ModelCatalogEntry::extra` | a field on the entry |
 | new stage or port metadata | `spec.extra` (a `SpecExtra` span) | a field on the spec |
@@ -444,7 +445,7 @@ which today is every name.
 
 The same four seams are on the **VAE** requests
 (`vae-model-registry.h`), which had none of them: an `accel` bag, the
-named-input lookup, `extras`, and a `report` out-parameter a family
+named-input lookup, `borrowed_extra`, and a `report` out-parameter a family
 writes what it wants said back into. `report` is on the REQUEST rather
 than a result, because a decode reports through a sink and has no
 result struct to grow -- so a family gains an output without anyone's
@@ -1232,67 +1233,169 @@ method.
 
 ## Versioning
 
-- `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the plugin
-  contract version, currently **7**. The host loads a plugin only when the
-  plugin's reported value **equals** the host's — strict equality, no
-  backward compatibility.
+vpipe versions the plugin ABI as **one integer plus feature flags**, and a
+host supports **the last two integers** at once. The contract itself is
+written down and checked by the build, not left to anyone's memory.
 
-  There is deliberately **no ledger of superseded versions**. Strict
-  equality gives the number no ordering meaning (N does not mean "N−1 and
-  more"; it is an opaque cookie), so a history of retired versions tells a
-  plugin author nothing they can act on — and it rots: the header's list
-  had drifted to describing 1 and 2 while the value read 4. vpipe is alpha
-  and no plugin has ever shipped against an earlier number, so the count
-  was reset rather than carried.
+### The version, the features, and the window
 
-- **What counts as the contract is wider than the C symbols**, and this is
-  the part that catches people. Bump the version for any change to the
-  three `extern "C"` entry points, to the `VpipePluginContext` facade —
-  *and to any interface a plugin subclasses* (`VideoModelFamily`,
-  `VaeModelFamily`, `ModelExec`, `Stage`, …). Adding a virtual to one of
-  those changes no C symbol and no facade method, yet it moves the vtable:
-  a plugin built against the older header passes every check and then calls
-  through the wrong slot. That has already happened once, which is why it
-  is written down here rather than left to judgement.
+- `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the ABI a plugin
+  is built for, currently **8**. A host at version N loads plugins built
+  for **N and N−1** (`VPIPE_PLUGIN_ABI_OLDEST`); keeping N−1 working is the
+  host's job. Eight is the first version under this scheme, so it stands
+  alone: nothing built for 7 or earlier loads.
+- The number changes only for a change an already-built plugin can
+  observe. Everything ADDITIVE is a **feature** instead: a string such as
+  `"stage-commands/1"`, listed by the host (`vpipe::host_features()`) and
+  queried with `VpipePluginContext::has_feature()`. A plugin that cannot
+  run without one lists it in `VpipePluginInfo::required_features`, and a
+  host that lacks it refuses the plugin at load, by name.
+- The version is read from the plugin **file** (`vpipe_plugin_abi`, emitted
+  by `VPIPE_PLUGIN_DEFINE`) before the host loads it, so a plugin outside
+  the window is refused without running any of its code. Anything a plugin
+  registers while it loads is held back until the handshake passes, and
+  withdrawn if it does not.
 
-  It covers the **structs those interfaces are handed**, too, and that is
-  the half that was missed once: a field was added to `VideoGenRequest`
-  without a bump, which an old plugin would have passed every check and
-  then misread.
+### What the contract is
 
-  **What does *not* need a bump: a new key in the acceleration bag.**
-  That is the point of `accel-settings.h` — one pointer whose layout does
-  not move, header-only readers compiled into your binary, and a key you
-  were never told about is one you never ask for. If a new tier ever
-  forces a rebuild, something has been put back that should not have
-  been.
+The plugin ABI is exactly the **installed SDK headers**, in three tiers:
 
-  **Two SDK classes are OPAQUE for the same reason: `ane::Tier`
-  (`ane-tier.h`) and `WiredPool` (`wired-pool.h`).** Each is one pointer
-  with every method out of line, so no part of its state is compiled into
-  your plugin. Their layouts and method signatures are frozen (a change is a
-  bump). Their vocabularies grow freely: Tier kinds and keys, WiredPool
-  `open()` options and `info()` fields, new methods, and the policy behind
-  them. A plugin built against an older header keeps loading; one that
-  calls a method an older host lacks fails to load by symbol rather than
-  misbehaving.
-- The `libvpipe` `SOVERSION` guards the underlying C++/ABI. It moves
-  independently; a plugin records a dependency on a compatible `libvpipe`.
+- **The stable surface.** Headers that wrap their declarations in
+  `VPIPE_API_BEGIN` / `VPIPE_API_END` (`vpipe/export.h`). libvpipe is built
+  hidden by default, so these are the *only* host symbols a plugin can
+  link: stages and their specs, the runtime context, beats (`FlexData`,
+  `TensorBeat`), the session services, the family interfaces and their
+  requests, `WeightSet`, memory planning, and the Metal compute core.
+- **The toolkit** (`generative-models/shared/`). Helpers a plugin compiles
+  INTO itself: `vpipe_add_plugin` links `libvpipe_toolkit.a`. They change as
+  fast as the models do, and your plugin keeps the copy it was built and
+  tested with. `WiredPool` and `ane::Tier` are the exceptions: they own
+  host resources, so they are part of the stable surface.
+- **The kernel contract** (`apple-silicon/metal-compute/kernel-contract.h`).
+  The host Metal kernels you may dispatch by name, including the ones the
+  toolkit dispatches, with the parameter blocks and function constants
+  they depend on. A kernel that is not listed is the host's own business:
+  copy it into your plugin's metallib instead.
+
+Within the stable surface, a type is one of two kinds:
+
+- **Frozen.** Anything you hold by value, allocate, derive from, or keep in
+  a coroutine frame: its layout and vtable may not move.
+- **Opaque** (`VPIPE_ABI_OPAQUE`). A host-owned object you only reach
+  through a pointer or reference (`RuntimeContext`, `WeightSet`,
+  `MetalCompute`, the registries). Its members are the host's; its virtuals
+  and methods are still contract.
+
+Four rules keep frozen types frozen without a version change:
+
+1. **Interfaces grow through `query_extension(id)`**, never through a new
+   virtual. Every interface a plugin implements has it: a newer host asks
+   for a capability by name, and your older plugin returns null, which
+   means "keep the old behaviour".
+2. **Parameter structs grow through a FlexData bag.** Every value struct
+   that crosses the boundary carrying parameters rather than bulk data --
+   requests and create-args, results, resource claims and holdings, plans,
+   catalogue entries, `ModelConfig`, memory figures -- ends in one
+   `FlexData extra` -- a bag the struct OWNS. Where the struct only
+   BORROWS one, owned by whoever lends it for the call (the args and
+   requests the host builds for a family, the chunks a VAE hands back),
+   it is `const FlexData* borrowed_extra`: the name says which, rather
+   than a plural one letter away. That is the only place a field is added
+   once the ABI is out: a new field is a KEY, lower_snake, the host's,
+   never renamed or repurposed. An absent key means the behaviour from
+   before it existed, because that is what every older binary sends -- so
+   read with a default. `common/flex-bag.h` has the readers and writers; a
+   writer there turns a null bag into an object, which a struct's
+   untouched `extra` is. A null bag costs one pointer.
+   `NamedTensor` is the worked example: its DATA FORMAT is the `dtype`
+   key in its `extra` (`genai::named_tensor`), absent meaning f32, so a
+   new element type is a new value and never a new field.
+3. **Spec structs grow through `extra` spans.** `StageSpec`, `PortSpec`,
+   `ConfigKey`, `CommandSpec`, `BufferSpec`, `ServiceReq` and `UiViewSpec`
+   live in static storage (constexpr tables, registry pointers), so they
+   cannot hold a FlexData; theirs is a span of `SpecExtra` string pairs
+   (`pipeline/spec-extra.h`), with a structured value carried as JSON text.
+   Arrays of them cannot grow at all, because the host would index them
+   with its own stride. `StageSpec` alone also carries `struct_size`, for
+   the rare TYPED addition a string cannot carry (`commands` was one);
+   the host reads such a field only when `abi_has()` says your copy has
+   it (`common/abi-struct.h`).
+4. **Compute handles keep a reserved tail** (`ComputeEncoder`,
+   `CommandStream`, `SharedBuffer`): they are on the hot path and carry no
+   parameters, so the next field takes a reserved slot instead of changing
+   the size you compiled.
+
+Structs that carry bulk data -- a tensor, a buffer, a frame (`TensorBeat`,
+`DataBuffer`, `NamedTensor`, the VAE and generation requests' latent and
+pixel pointers) -- keep their fixed layout, and grow through the FlexData
+they already point at (`borrowed_extra`, `sideband`, `report`).
+
+**Every key is a named constant in a stable header**, and the ABI snapshot
+records each one with its value in a `[keys]` section, so renaming or
+dropping a key fails `vpipe_sdk_check` like any other break. Use the
+constant, never the spelling:
+
+| vocabulary | where |
+|---|---|
+| a struct's `extra`: `NamedTensor` format, catalogue | `genai::named_tensor` (`gen-input.h`), `catalog_extra` (`stages/model-catalog.h`) |
+| the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
+| scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
+| the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |
+| beats and TensorBeat sidebands | `beat`, `sideband` (`common/beat-keys.h`) |
+| `model_config` keys the host reads | `model_config::kFamilyKey` (`stages/model-config-source.h`), `genai::preview_key` (`gen-input.h`) |
+| family profiles | `genai::cond`, `quant`, `detect` (`*-profile.h`) |
+| the ANE tier, the wired pool | `genai::ane`, `genai::wired_pool` |
+| resource claims | `model_memory::kWeightsKind`, `kPhase*` (`stages/model-memory.h`) |
+| spec metadata (`SpecExtra`) | `spec_key` (`pipeline/spec-extra.h`) |
+
+Keys a family defines for itself -- its own `model_config` knobs, a
+sideband only its own stages read -- are its own business and need not
+be here.
+
+### How it is enforced
+
+- `abi/plugin-abi-<N>.txt` is the ABI written down: every frozen layout
+  (from the compiler's own record-layout dump), every virtual in vtable
+  order, and every exported symbol the stable headers declare. The target
+  **`vpipe_sdk_check`** installs the SDK to a scratch prefix and checks
+  three things:
+  - every installed header, and the toolkit's sources, compile against
+    that prefix alone;
+  - the SDK example plugin builds against it;
+  - the ABI matches the snapshot. Anything removed or changed fails;
+    additions are reported.
+
+  Run it after any change to an installed header.
+- A failure means one of two things. Either the change was a mistake, or
+  it is a new ABI version. In that case keep the old snapshot (the host
+  still has to serve N−1), bump `VPIPE_PLUGIN_ABI_VERSION`, set
+  `VPIPE_PLUGIN_ABI_OLDEST` to N−1, add the compatibility the host needs
+  for N−1, and regenerate with **`vpipe_abi_snapshot`**. The regenerated
+  file is the diff a reviewer reads.
 - `VpipePluginInfo::schema_version` lets the info struct grow additively.
+- The `libvpipe` `SOVERSION` guards the underlying C++ library ABI
+  independently.
 
-The practical rule: **rebuild your plugin against the vpipe you deploy
-with.** A mismatch is reported and refused, not crashed.
+### Porting a plugin to ABI 8
 
-  With one trap in the way of actually doing it: `cmake --install`
-  **preserves each header's source mtime**, so a freshly installed
-  `plugin-abi.h` can look OLDER than the plugin object built minutes
-  earlier. The build then reports success, relinks, and quietly keeps the
-  stale object — the rebuild you just ran did nothing. `touch` the file
-  defining `VPIPE_PLUGIN_DEFINE` (or delete the build tree) if the loader
-  still reports the version you just moved away from. This is exactly the
-  case the strict-equality check catches; it is also why the check has to
-  exist, because the same stale object with an UNCHANGED version number
-  loads and calls through the wrong slot.
+1. Rebuild against an ABI-8 install. `vpipe_add_plugin` now also links the
+   toolkit. `cmake --install` preserves header mtimes, so `touch` the file
+   holding `VPIPE_PLUGIN_DEFINE` (or wipe the build tree) if the loader
+   still reports the old number.
+   Only the plugin module gets the toolkit automatically. A test
+   executable, or any other target that compiles code calling it, links
+   `vpipe::toolkit` itself (it brings `vpipe::vpipe` along); without it
+   the link fails on `I8GemmContext`, `MetalSageAttention`, `fp8::`,
+   `comfy::` and the like, which libvpipe no longer exports.
+2. Host kernels you dispatch by name must appear in `kernel-contract.h`.
+   Use its `SteelAttnParams` and `kAttn*` constants instead of a private
+   copy of the parameter block.
+3. Build `StageSpec` by name, not position: it begins with `struct_size`.
+   The parameter structs gained a trailing `extra` bag, which positional
+   braces leave defaulted, so they need no change.
+4. `model_memory::plan_streaming` takes a `phase` argument.
+5. If your plugin needs a feature to function, name it in
+   `required_features`.
 
 ## Where your stages show up
 

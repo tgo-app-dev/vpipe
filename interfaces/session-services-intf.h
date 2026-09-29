@@ -25,6 +25,10 @@
 
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class CoreMLModelManager;
@@ -180,5 +184,7 @@ constexpr ServiceReq optional_service()
 SessionServicesIntf* null_session_services() noexcept;
 
 }
+
+VPIPE_API_END
 
 #endif

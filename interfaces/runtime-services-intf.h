@@ -9,6 +9,10 @@
 #ifndef RUNTIME_SERVICES_INTF_H
 #define RUNTIME_SERVICES_INTF_H
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class ThreadPool;
@@ -24,5 +28,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -332,12 +332,15 @@ in place.
 
 ## Versioning
 
-Command channels are part of plugin ABI **7**. What that version freezes:
-the layouts of `CommandSpec`, `BufferSpec`, `DataBuffer`, `BufferLayout`
-and the two awaiters, which live in a plugin's coroutine frame.
+Command channels are the feature `stage-commands/1` of the plugin ABI (see
+[PLUGINS.md](PLUGINS.md), "Versioning"). What it freezes: the layouts of
+`CommandSpec`, `BufferSpec`, `DataBuffer`, `BufferLayout` and the two
+awaiters, which live in a plugin's coroutine frame. The ABI snapshot
+(`abi/`) holds them to that.
 
-What grows without a bump:
+What grows without an ABI change:
 
-- `StageCommand` and `CommandInbox`. The host creates them and a plugin
-  reaches them only through out-of-line methods.
+- `StageCommand` and `CommandInbox`, which are opaque (`VPIPE_ABI_OPAQUE`).
+  The host creates them, and a plugin reaches them only through
+  out-of-line methods.
 - A new command, a new buffer, or a new `extra` key on any spec.

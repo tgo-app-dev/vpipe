@@ -7,6 +7,10 @@
 #include <exception>
 #include <utility>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Opaque profiling tag carried by every pool coroutine. The pipeline
@@ -244,5 +248,7 @@ perf_tag_of(std::coroutine_handle<> h) noexcept
 }
 
 }
+
+VPIPE_API_END
 
 #endif

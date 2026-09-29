@@ -30,6 +30,10 @@
 #include <string>
 #include <string_view>
 
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class SessionIntf {
@@ -263,5 +267,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

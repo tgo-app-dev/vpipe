@@ -8,6 +8,10 @@
 #include <span>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe { namespace metal_compute { class SharedBuffer; } }
 
 namespace vpipe::genai {
@@ -47,5 +51,7 @@ struct TokenRef {
 
 
 }
+
+VPIPE_API_END
 
 #endif

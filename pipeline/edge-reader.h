@@ -8,6 +8,10 @@
 #include <cstdint>
 #include <memory>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Per-consumer-iport cursor handle into an OportBuffer. One
@@ -26,6 +30,7 @@ namespace vpipe {
 //     this cursor is not the slowest (caller falls back to peek).
 //   * release_read(n) -- non-blocking advance.
 class EdgeReader {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   EdgeReader(OportBuffer* parent, unsigned cursor_idx);
 
@@ -129,5 +134,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

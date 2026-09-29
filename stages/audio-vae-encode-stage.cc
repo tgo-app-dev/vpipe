@@ -32,7 +32,7 @@ namespace {
 // advertise a behaviour that does not happen; see the doc on the key.
 // The legacy "always" / "never" stay accepted and show as unlisted.
 constexpr SpecExtra kUnloadChoices[] = {
-  {"choices", "auto,destroy,keep"},
+  {spec_key::kChoices, "auto,destroy,keep"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
@@ -295,6 +295,16 @@ AudioVaeEncodeStage::declare_resources() const
   if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
           session(), root, root,
           resolve_model(session(), _hf_dir).model_type)) {
+    // The AUDIO one, asked for by role, as audio-vae-decode does and as
+    // declare_memory() above already names it. The family's
+    // declare_resources() answers for the VIDEO decode, so delegating
+    // to it claimed LTX-2.5's video VAE for this stage and its audio VAE
+    // not at all.
+    const std::string a =
+        f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
+    if (!a.empty()) { return model_memory::weight_claims({a}); }
+    // No separate audio file: the family's single answer is the one
+    // VAE a checkpoint with one codec for both uses.
     return f->declare_resources(root, root);
   }
   return {};

@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_LATENT_PREVIEW_H
 #define VPIPE_STAGES_LATENT_PREVIEW_H
 
+#include "generative-models/gen-input.h"
 #include "common/flex-data.h"
 #include "pipeline/resource-plan.h"
 
@@ -47,10 +48,12 @@ class SessionContextIntf;
 // these docs so every family reads the same.
 namespace latent_preview {
 
-inline constexpr std::string_view kVaeKey      = "preview_vae";
-inline constexpr std::string_view kEveryKey    = "preview_every";
-inline constexpr std::string_view kMaxEdgeKey  = "preview_max_edge";
-inline constexpr std::string_view kFramesKey   = "preview_frames";
+// The names themselves are in the stable SDK (generative-models/
+// gen-input.h), so a plugin's config source can use them.
+inline constexpr std::string_view kVaeKey      = genai::preview_key::kVae;
+inline constexpr std::string_view kEveryKey    = genai::preview_key::kEvery;
+inline constexpr std::string_view kMaxEdgeKey  = genai::preview_key::kMaxEdge;
+inline constexpr std::string_view kFramesKey   = genai::preview_key::kFrames;
 
 inline constexpr std::string_view kVaeDoc =
     "OPTIONAL tiny autoencoder for LIVE PREVIEWS: after a denoising step, "

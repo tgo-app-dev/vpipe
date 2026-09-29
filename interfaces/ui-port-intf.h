@@ -18,6 +18,10 @@
 #include <string>
 #include <string_view>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 struct VpipeFormat;
@@ -127,5 +131,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

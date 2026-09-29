@@ -187,7 +187,7 @@ resolve_config_params(span<const ConfigKey> spec, const FlexData& config)
     // The closed value set, if the key declares one. Carried across this
     // hop because `extra` lives on the plugin-facing ConfigKey and stops
     // here: everything downstream reads ConfigParam.
-    split_into_(spec_extra(k.extra, "choices"), &p.choices);
+    split_into_(spec_extra(k.extra, spec_key::kChoices), &p.choices);
     p.is_path         = k.is_path;
     p.path_write      = k.path_write;
     p.path_kind       = string(k.path_kind);

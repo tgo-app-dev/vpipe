@@ -58,6 +58,18 @@ WeightSet::hash_(const metal_compute::SharedBuffer& b) const
   return (h ^ n) * 1099511628211ull;
 }
 
+const std::string&
+WeightSet::dir() const noexcept
+{
+  return _dir;
+}
+
+const MetalLlamaWeights&
+WeightSet::src() const noexcept
+{
+  return *_wts;
+}
+
 WeightSet::~WeightSet() = default;
 
 shared_ptr<WeightSet>

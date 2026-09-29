@@ -13,6 +13,9 @@
 #include <utility>
 #include <vector>
 
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
+
 namespace vpipe::genai {
 
 // Pick the fastest of `n_cands` candidates. bench(i) runs candidate i's fixed

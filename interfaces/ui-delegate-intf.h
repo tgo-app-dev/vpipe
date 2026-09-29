@@ -13,6 +13,10 @@
 #include <string_view>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 struct VpipeFormat;
@@ -77,6 +81,7 @@ using UiInterruptHandler = std::function<bool()>;
 // unregisters into thin air instead of dangling. Safe to call from
 // multiple threads.
 class UiInterruptRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // Returns the id to pass to remove(). Never 0.
   std::uint64_t add(std::string label, UiInterruptHandler fn);
@@ -173,6 +178,7 @@ private:
 // libcurl progress callback firing hundreds of times a second call
 // straight through without a percentage-change guard.
 class UiProgressRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // One live report, as a renderer sees it.
   struct Item {
@@ -472,5 +478,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

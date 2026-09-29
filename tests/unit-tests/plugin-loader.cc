@@ -8,6 +8,7 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "pipeline/stage-registry.h"
+#include "plugin/plugin-abi.h"
 #include "plugin/plugin-manager.h"
 
 #include <iostream>
@@ -60,12 +61,70 @@ TEST(plugin_loader, dlopen_register_instantiate)
   // Its StageSpec was attached by the plugin's register call.
   EXPECT_TRUE(StageRegistry::get().spec("plugin-echo") != nullptr);
 
+  // It reported the version it was built for, and it was recorded.
+  bool recorded = false;
+  for (const auto& r : PluginManager::get().records()) {
+    if (r.name == "plugin-echo" || r.path.find("echo") != std::string::npos) {
+      recorded = recorded || r.abi == VPIPE_PLUGIN_ABI_VERSION;
+    }
+  }
+  EXPECT_TRUE(recorded);
   // And it constructs through the registry factory.
   auto s = StageRegistry::get().create(
       "plugin-echo", &sess, "e0", std::vector<InEdge>{},
       FlexData::make_object());
   ASSERT_TRUE(s != nullptr);
   EXPECT_TRUE(s->type_name() == "plugin-echo");
+}
+
+#ifndef VPIPE_TEST_HANDSHAKE_OLD_ABI
+#define VPIPE_TEST_HANDSHAKE_OLD_ABI ""
+#define VPIPE_TEST_HANDSHAKE_NO_CONSTANT ""
+#define VPIPE_TEST_HANDSHAKE_MISSING_FEATURE ""
+#endif
+
+// Outside the window, and read from the FILE: refused without the dylib
+// ever being loaded, so its static initialiser never registered a thing
+// (the registry did not even mint an id).
+TEST(plugin_loader, a_plugin_outside_the_window_is_never_loaded)
+{
+  Session sess;
+  CerrSilencer hush;
+  for (const char* path : {VPIPE_TEST_HANDSHAKE_OLD_ABI,
+                           VPIPE_TEST_HANDSHAKE_NO_CONSTANT}) {
+    ASSERT_TRUE(std::string(path).size() > 0);
+    const StageTypeId before = StageRegistry::get().next_id();
+    EXPECT_FALSE(PluginManager::get().load(&sess, path));
+    EXPECT_TRUE(StageRegistry::get().next_id() == before);
+  }
+  EXPECT_TRUE(StageRegistry::get().find_id("plugin-handshake-old-abi")
+              == StageTypeId::unknown);
+  EXPECT_TRUE(StageRegistry::get().find_id("plugin-handshake-no-constant")
+              == StageTypeId::unknown);
+  EXPECT_FALSE(PluginManager::get().is_loaded_path(
+      VPIPE_TEST_HANDSHAKE_OLD_ABI));
+}
+
+// Inside the window but asking for a feature this host lacks: the dylib is
+// loaded -- its static initialiser DID register a stage -- and refused
+// after. The registration is withdrawn: nothing can find or create it.
+TEST(plugin_loader, a_missing_feature_is_refused_and_its_stages_withdrawn)
+{
+  Session sess;
+  CerrSilencer hush;
+  const std::string path = VPIPE_TEST_HANDSHAKE_MISSING_FEATURE;
+  ASSERT_TRUE(!path.empty());
+  const StageTypeId before = StageRegistry::get().next_id();
+  EXPECT_FALSE(PluginManager::get().load(&sess, path));
+  // It ran -- an id was minted while it loaded -- ...
+  EXPECT_TRUE(static_cast<unsigned>(StageRegistry::get().next_id()) >
+              static_cast<unsigned>(before));
+  // ...and left nothing reachable.
+  EXPECT_TRUE(StageRegistry::get().find_id(
+                  "plugin-handshake-missing-feature") == StageTypeId::unknown);
+  EXPECT_TRUE(StageRegistry::get().create(
+                  "plugin-handshake-missing-feature", &sess, "x", {}) ==
+              nullptr);
 }
 
 TEST(plugin_loader, bad_path_is_rejected)

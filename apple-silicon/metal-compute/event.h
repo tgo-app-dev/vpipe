@@ -4,6 +4,10 @@
 #include <chrono>
 #include <cstdint>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace MTL { class SharedEvent; }
 
 namespace vpipe::metal_compute {
@@ -53,5 +57,7 @@ private:
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

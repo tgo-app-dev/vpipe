@@ -8,9 +8,19 @@
 #include <utility>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class FlexData;
+
+// Keys of ModelCatalogEntry::extra. What each means is documented on
+// the field.
+namespace catalog_extra {
+inline constexpr std::string_view kUrlFiles = "url_files";
+}  // namespace catalog_extra
 
 // One downloadable model in the internal HuggingFace catalogue.
 //
@@ -77,6 +87,8 @@ struct ModelCatalogEntry {
     std::string repo;  // an hf_path, e.g. "MiniMaxAI/MiniMax-H3"
     std::string file;  // path within `repo`
     std::string dest;  // where it lands under this entry's local dir
+    // Anything this struct has no field for: see common/flex-bag.h.
+    FlexData    extra;
   };
   std::vector<Companion> companion_files;
   // On-disk weight format, when it is NOT the upstream diffusers/HF
@@ -301,6 +313,9 @@ struct HfFile {
   // it can be rebuilt from deduplicated chunks instead of streamed
   // whole. Empty for a file the store does not hold.
   std::string   xet_hash;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Extract the downloadable files (type == "file") from a HuggingFace
@@ -309,5 +324,7 @@ struct HfFile {
 std::vector<HfFile> hf_tree_files(const FlexData& tree_json);
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -101,9 +101,52 @@ parse_log_config(const FlexData& config, LogConfigState* out)
   }
 }
 
+// WHERE THE DATABASES ARE when the config does not say.
+//
+// Normally the process CWD. The exception is a CLI run started INSIDE
+// the web-ui's sandbox: the web-ui confines every stage's file I/O to a
+// `sandbox` directory under its own starting CWD, so a pipeline authored
+// there names its files relative to THAT directory while the session's
+// LMDB -- model registry, catalogue, log -- sits one level up beside it.
+// Running the same pipeline from the CLI therefore means `cd sandbox`,
+// and opening the env at "." would CREATE a second, empty database
+// there: every registered model would miss, and a pipeline that works in
+// the web-ui would fail on the model reference it resolves fine from.
+//
+// So when the CWD holds no database and its parent does, the parent's is
+// the one meant. Asymmetric on purpose: EITHER file in the CWD means the
+// CWD has a database (a half-written pair is still one, and adopting the
+// parent's over it would be the silent wrong answer), while the parent
+// must have the DATA file before it is adopted -- a stray lock.mdb is
+// not a database.
+//
+// Only the default is affected. A configured `db.path` is used as given.
+string
+default_db_path_()
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path cwd = fs::current_path(ec);
+  if (ec) {
+    return ".";
+  }
+  auto exists_ = [](const fs::path& p) {
+    std::error_code e;
+    return fs::exists(p, e) && !e;
+  };
+  if (exists_(cwd / "data.mdb") || exists_(cwd / "lock.mdb")) {
+    return ".";
+  }
+  const fs::path up = cwd.parent_path();
+  if (up.empty() || up == cwd || !exists_(up / "data.mdb")) {
+    return ".";
+  }
+  return up.lexically_normal().string();
+}
+
 // Reads the top-level `db.path` / `db.map_size_mb` from the session
 // config. An empty `db.path` is fine: `Session::lmdb_env()` falls
-// back to the process CWD (".") at first-open time.
+// back to default_db_path_() at first-open time.
 void
 parse_db_config(const FlexData& config,
                 string*         out_path,
@@ -712,20 +755,28 @@ Session::confine_path(std::string_view user_path, bool for_write,
 LmdbEnv*
 Session::lmdb_env() const
 {
-  // Resolve the path: if the config didn't set db.path we fall
-  // back to "." (the process CWD at first-open time). LMDB
-  // resolves "." against CWD inside mdb_env_open, so we capture
-  // whatever the caller's working directory is when the env is
-  // first materialized.
-  const string path = _db_path.empty() ? string(".") : _db_path;
-
   // Lazy open. If the open throws, _env stays null and the
   // once_flag is *not* fulfilled -- a later call will retry. The
   // env reports its construction failures through `this` (the
   // session), so the message lands in the active log delegate.
-  std::call_once(_env_once, [this, &path] {
+  //
+  // The path is resolved HERE rather than at construction because "."
+  // means the process CWD at FIRST-OPEN time -- LMDB resolves it inside
+  // mdb_env_open -- and default_db_path_() has to read the same CWD to
+  // decide whether the database beside it is the one meant.
+  std::call_once(_env_once, [this] {
+    const string path = _db_path.empty() ? default_db_path_() : _db_path;
     try {
       _env = make_unique<LmdbEnv>(this, path, _db_map_size);
+      if (_db_path.empty() && path != ".") {
+        // Only reachable with a non-db log delegate: the db delegate is
+        // installed after its own lmdb_env() call has fulfilled this
+        // once_flag, so it can never re-enter here.
+        info(fmt(
+          "Session: no database in the working directory; using the one "
+          "beside it at '{}' (a CLI run inside the web-ui's sandbox "
+          "resolves the same models the web-ui does)", path));
+      }
     } catch (const exception& e) {
       warn(fmt(
         "Session: lmdb_env open failed for '{}': {}; lmdb_env() "

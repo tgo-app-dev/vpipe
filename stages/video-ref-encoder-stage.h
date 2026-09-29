@@ -16,6 +16,7 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/weight-set.h"
+#include "stages/generation-input.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #endif
@@ -377,6 +378,20 @@ private:
 
   bool _model_latched  = false;
   bool _load_attempted = false;
+
+  // The prompt and the six reference ports are GENERATION INPUTS
+  // (stages/generation-input.h), paired the way generate-video pairs the
+  // rows and conditioning this stage emits: one beat and the end of its
+  // stream serves every request of the run, a stream that keeps sending
+  // is consumed a beat per request. Each beat is HELD between requests,
+  // so a single subject picture under several prompts is a reference of
+  // every one of them rather than of the first -- and a held port never
+  // falls silent, which would renumber every reference after it.
+  static constexpr int kRefInputs = 6;
+  GenerationInput                  _prompt_in;
+  std::unique_ptr<BeatPayloadIntf> _prompt_beat;
+  GenerationInput                  _ref_in[kRefInputs];
+  std::unique_ptr<BeatPayloadIntf> _ref_beat[kRefInputs];
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The conditioner backbone (Qwen3-VL-32B tapped at layer 50) and its

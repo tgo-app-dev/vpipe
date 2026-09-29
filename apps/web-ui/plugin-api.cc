@@ -83,6 +83,9 @@ PluginApi::h_list_(const HttpRequest&)
     eo.insert("vendor",      fstr(r.vendor));
     eo.insert("license",     fstr(r.license));
     eo.insert("description", fstr(r.description));
+    // The plugin ABI it was built for: the host's own, or the previous
+    // one when it runs inside the support window.
+    eo.insert("abi",         FlexData::make_uint(r.abi));
     eo.insert("loaded",      FlexData::make_bool(true));
     eo.insert("enabled",     FlexData::make_bool(r.enabled));
     eo.insert("stage_count",

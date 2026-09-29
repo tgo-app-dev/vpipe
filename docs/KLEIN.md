@@ -239,6 +239,12 @@ Pick a directory on a volume with the space from
 directory in steps 2 and 3: the model you are about to prepare is recorded in
 that directory's registry, so a run started elsewhere will not find it.
 
+The one exception is that `sandbox/` itself counts as the same workspace. A
+pipeline authored in `vpipe-web-ui` names its files relative to `sandbox/`, so
+running it from the `vpipe` CLI means `cd sandbox` first — and a directory with
+no registry of its own, whose parent has one, uses the parent's. The same
+pipeline therefore resolves the same models from either.
+
 ### Then run the pipeline
 
 Take klein-9B's, the -kv variant's, or both — each is self-contained:

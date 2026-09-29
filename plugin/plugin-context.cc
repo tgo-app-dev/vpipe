@@ -38,9 +38,40 @@ host_version_string_()
 }  // namespace
 
 VpipePluginContext::VpipePluginContext(const SessionContextIntf* session,
-                                       std::string_view          plugin_name)
-  : _session(session), _plugin(plugin_name)
+                                       std::string_view          plugin_name,
+                                       std::uint32_t             plugin_abi)
+  : _session(session), _plugin(plugin_name), _plugin_abi(plugin_abi)
 {
+}
+
+bool
+VpipePluginContext::has_feature(std::string_view feature) const noexcept
+{
+  return host_has_feature(feature);
+}
+
+std::span<const std::string_view>
+host_features() noexcept
+{
+  // The features ABI 8 shipped with. Append; never remove one while the
+  // ABI that introduced it is inside the support window.
+  static constexpr std::string_view kFeatures[] = {
+    VPIPE_FEATURE_STAGE_COMMANDS,
+    VPIPE_FEATURE_KERNEL_CONTRACT,
+    VPIPE_FEATURE_NAMED_OUTPUTS,
+    VPIPE_FEATURE_FAMILY_PROFILES,
+    VPIPE_FEATURE_ACCEL_BAG,
+  };
+  return kFeatures;
+}
+
+bool
+host_has_feature(std::string_view feature) noexcept
+{
+  for (std::string_view f : host_features()) {
+    if (f == feature) { return true; }
+  }
+  return false;
 }
 
 std::uint32_t

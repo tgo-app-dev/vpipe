@@ -6,6 +6,10 @@
 #include <new>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // std::allocator-conformant allocator that hands back memory aligned
@@ -75,5 +79,7 @@ template <typename T>
 using AlignedVector = std::vector<T, AlignedAllocator<T>>;
 
 }
+
+VPIPE_API_END
 
 #endif

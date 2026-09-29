@@ -24,6 +24,10 @@
 #ifndef STATUS_H
 #define STATUS_H
 
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 struct Status {
@@ -37,5 +41,7 @@ struct Status {
 const char* to_str(Status s);
 
 }
+
+VPIPE_API_END
 
 #endif

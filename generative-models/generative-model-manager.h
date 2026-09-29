@@ -1,6 +1,7 @@
 #ifndef VPIPE_GENERATIVE_MODELS_GENERATIVE_MODEL_MANAGER_H
 #define VPIPE_GENERATIVE_MODELS_GENERATIVE_MODEL_MANAGER_H
 
+#include "common/flex-data.h"
 #include "common/session-member.h"
 #include "generative-models/weight-registry.h"
 
@@ -14,6 +15,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -56,6 +61,9 @@ struct LoadSpec {
   // Page-pool capacity. seq_len <= page_tokens * max_pages across
   // all contexts of this model combined.
   std::uint32_t max_pages     = 4096;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Session-shared cache of loaded language models. Two loads with the
@@ -75,6 +83,7 @@ struct LoadSpec {
 // returns nullptr. The full pipeline (ModelLoader -> Tokenizer ->
 // ContextManager -> LlamaModelExec) lands in subsequent commits.
 class GenerativeModelManager final : public SessionMember {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit GenerativeModelManager(const SessionContextIntf* session);
 
@@ -981,5 +990,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif
