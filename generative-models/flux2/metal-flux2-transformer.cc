@@ -3287,12 +3287,25 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         enc.end();
         stream.commit().wait();
         const double g_ms = ane_ms(dq_t0);
+        int lost = -1;
         if (dq_rows > 0) {
-          (void)_ane_dqkv->finish(L, IS, g_ms, dq_drain);
+          if (!_ane_dqkv->finish(L, IS, g_ms, dq_drain)) {
+            lost = _ane_dqkv->lost_row0();
+          }
         } else {
           _ane_dqkv->note_probe(dq_drain, g_ms);
         }
         reopen();
+        // THE GPU FALLBACK: the image rows the ANE lost, projected from
+        // `nrm` (only the tier's input) into the image region of q/k/v.
+        if (lost >= 0 && lost < IS) {
+          const int n = IS - lost;
+          const std::size_t xe = (std::size_t)lost * H;
+          const std::size_t ye = (std::size_t)(TS + lost) * H;
+          op.gemm(nrm, b.q, jq, ye, n, H, H, xe, dl(&DoubleLora::q));
+          op.gemm(nrm, b.k, jk, ye, n, H, H, xe, dl(&DoubleLora::k));
+          op.gemm(nrm, b.v, jv, ye, n, H, H, xe, dl(&DoubleLora::v));
+        }
       }
       if (dq_split && df_split) { ane_stage_dff_(L, b); }
       dsplit(t_d_qkv_img);
@@ -3360,30 +3373,50 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
         }
         reopen();
       }
+      // The GPU's image feed-forward over rows [r0, r0 + n) of `nrm`, into
+      // the same rows of `ob`: its share of a split, and the rows the ANE
+      // lost. The fused kernel reads its input from row 0, so a later band
+      // is handed `nrm` from r0 on.
+      auto dff_gpu = [&](int r0, int n) {
+        if (n <= 0) { return; }
+        const std::size_t xe = (std::size_t)r0 * H;
+        if (_fuse_ff) {
+          SharedBuffer sub;
+          if (r0 > 0) {
+            sub = nrm.subview(xe * 2, (std::size_t)n * H * 2);
+          }
+          op.swiglu_ff(r0 > 0 ? sub : nrm, b.ff_in, smlp, n, H,
+                       DFF);                           // silu(gate)*up
+        } else {
+          op.gemm(nrm, b.ff_in, ff1, 0, n, DFF, H, xe,   // [rows, 2*INNER]
+                  dl(&DoubleLora::ff_in));
+          op.slice(ff1, sg, n, DFF, INNER, 0);           // gate = first half
+          op.slice(ff1, su, n, DFF, INNER, INNER);       // up = second half
+          op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, n * INNER);
+        }
+        if (r0 == 0) { op.tap("dbl_ffact_img", L, smlp, 0, n, INNER); }
+        op.gemm(smlp, b.ff_out, ob, xe, n, H, INNER, 0,
+                dl(&DoubleLora::ff_out));
+      };
       const int df_g = IS - df_rows;
       const auto df_t0 = std::chrono::steady_clock::now();
-      if (_fuse_ff) {
-        op.swiglu_ff(nrm, b.ff_in, smlp, df_g, H, DFF);  // silu(gate)*up [,INNER]
-      } else {
-        op.gemm(nrm, b.ff_in, ff1, 0, df_g, DFF, H, 0,   // [rows, 2*INNER]
-                dl(&DoubleLora::ff_in));
-        op.slice(ff1, sg, df_g, DFF, INNER, 0);          // gate = first half
-        op.slice(ff1, su, df_g, DFF, INNER, INNER);      // up = second half
-        op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, df_g * INNER);
-      }
-      op.tap("dbl_ffact_img", L, smlp, 0, df_g, INNER);
-      op.gemm(smlp, b.ff_out, ob, 0, df_g, H, INNER, 0,
-              dl(&DoubleLora::ff_out));
+      dff_gpu(0, df_g);
       if (df_meas) {
         enc.end();
         stream.commit().wait();
         const double g_ms = ane_ms(df_t0);
+        int lost = -1;
         if (df_rows > 0) {
-          (void)_ane_dff->finish(L, IS, g_ms, df_drain);
+          if (!_ane_dff->finish(L, IS, g_ms, df_drain)) {
+            lost = _ane_dff->lost_row0();
+          }
         } else {
           _ane_dff->note_probe(df_drain, g_ms);
         }
         reopen();
+        // THE GPU FALLBACK: `nrm` is only the tier's input, so the rows it
+        // lost run again from it, before the gated add reads `ob`.
+        if (lost >= 0 && lost < IS) { dff_gpu(lost, IS - lost); }
       }
       // VPIPE_FLUX2_ANE_FF_PROBE: the ANE's rows against the GPU's own
       // feed-forward over the SAME rows of the same input, block-local. Tells
@@ -3625,38 +3658,72 @@ MetalFlux2Transformer::forward_dit(const SharedBuffer& context, int text_seq,
                                "for the ANE failed; it keeps the GPU", L));
       }
       sreopen();
+      // The GPU's projection and SwiGLU over rows [r0, r0 + n): its share
+      // of a split, and the rows the ANE lost. Every buffer is handed from
+      // row r0 on, because the slices and the fused kernel address from row
+      // 0 -- the scratch (sproj, sg, su) is used from its first row.
+      auto sp_gpu = [&](int r0, int n) {
+        if (n <= 0) { return; }
+        auto from = [&](const SharedBuffer& buf, int w) {
+          return buf.subview((std::size_t)r0 * w * 2, (std::size_t)n * w * 2);
+        };
+        SharedBuffer xs, qs, ks, vs, ms;
+        if (r0 > 0) {
+          xs = from(nrm, H);
+          qs = from(jq, H);
+          ks = from(jk, H);
+          vs = from(jv, H);
+          ms = from(smlp, SMLP);
+        }
+        const SharedBuffer& x  = r0 > 0 ? xs : nrm;
+        const SharedBuffer& q_ = r0 > 0 ? qs : jq;
+        const SharedBuffer& k_ = r0 > 0 ? ks : jk;
+        const SharedBuffer& v_ = r0 > 0 ? vs : jv;
+        const SharedBuffer& m_ = r0 > 0 ? ms : smlp;
+        if (_fuse_ff) {
+          op.gemm(x, b.qkv, sproj, 0, n, 3 * H, H);
+          op.slice(sproj, q_, n, 3 * H, H, 0);
+          op.slice(sproj, k_, n, 3 * H, H, H);
+          op.slice(sproj, v_, n, 3 * H, H, 2 * H);
+          op.swiglu_ff(x, b.mlp_gu, m_, n, H, 2 * SMLP);
+        } else {
+          op.gemm(x, b.qkv_mlp, sproj, 0, n, PW, H, 0,
+                  sl(&SingleLora::qkv_mlp));
+          op.slice(sproj, q_, n, PW, H, 0);
+          op.slice(sproj, k_, n, PW, H, H);
+          op.slice(sproj, v_, n, PW, H, 2 * H);
+          op.slice(sproj, sg, n, PW, SMLP, 3 * H);
+          op.slice(sproj, su, n, PW, SMLP, 3 * H + SMLP);
+          op.elt(_fn_swiglu, sg, 0, su, 0, m_, 0, n * SMLP);
+        }
+      };
       const int sp_g = seq - sp_rows;
       const auto sp_t0 = std::chrono::steady_clock::now();
-      if (_fuse_ff) {
-        op.gemm(nrm, b.qkv, sproj, 0, sp_g, 3 * H, H);
-        op.slice(sproj, jq, sp_g, 3 * H, H, 0);
-        op.slice(sproj, jk, sp_g, 3 * H, H, H);
-        op.slice(sproj, jv, sp_g, 3 * H, H, 2 * H);
-        op.swiglu_ff(nrm, b.mlp_gu, smlp, sp_g, H, 2 * SMLP);
-      } else {
-        op.gemm(nrm, b.qkv_mlp, sproj, 0, sp_g, PW, H, 0,
-                sl(&SingleLora::qkv_mlp));
-        op.slice(sproj, jq, sp_g, PW, H, 0);
-        op.slice(sproj, jk, sp_g, PW, H, H);
-        op.slice(sproj, jv, sp_g, PW, H, 2 * H);
-        op.slice(sproj, sg, sp_g, PW, SMLP, 3 * H);
-        op.slice(sproj, su, sp_g, PW, SMLP, 3 * H + SMLP);
-        op.elt(_fn_swiglu, sg, 0, su, 0, smlp, 0, sp_g * SMLP);
-      }
+      sp_gpu(0, sp_g);
       enc.end();
       stream.commit().wait();
       const double g_ms = sms(sp_t0);
+      int lost = -1;
       if (sp_rows > 0) {
-        (void)_ane_sproj->finish(L, seq, g_ms, sp_drain);
+        if (!_ane_sproj->finish(L, seq, g_ms, sp_drain)) {
+          lost = _ane_sproj->lost_row0();
+          if (lost < sp_g || lost >= seq) { lost = sp_g; }
+        }
       } else {
         _ane_sproj->note_probe(sp_drain, g_ms);
       }
       sreopen();
-      if (sp_rows > 0) {
-        // The ANE's gate|up is in: its rows' SwiGLU, beside the GPU's.
+      // The rows the ANE DID write: its gate|up is in sg/su, so their
+      // SwiGLU, beside the GPU's -- and only theirs. Encoded before the
+      // fallback, which reuses sg/su's first rows as scratch.
+      const int ane_done = sp_rows > 0 ? (lost >= 0 ? lost : seq) - sp_g : 0;
+      if (ane_done > 0) {
         const std::size_t e0 = (std::size_t)sp_g * (std::size_t)SMLP;
-        op.elt(_fn_swiglu, sg, e0, su, e0, smlp, e0, sp_rows * SMLP);
+        op.elt(_fn_swiglu, sg, e0, su, e0, smlp, e0, ane_done * SMLP);
       }
+      // THE GPU FALLBACK: `nrm` is only the tier's input, so the rows it
+      // lost run again from it, into q/k/v and the MLP activation.
+      if (lost >= 0) { sp_gpu(lost, seq - lost); }
     } else if (_fuse_ff) {
       // qkv-only proj [seq, 3H] + a fused-SwiGLU mlp GEMM writing smlp directly
       // (no [seq, 2*SMLP] gate|up intermediate + slice + swiglu).

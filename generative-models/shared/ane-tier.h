@@ -137,11 +137,21 @@ inline constexpr std::string_view kDrainMs = "drain_ms";
 // ---- info() ----------------------------------------------------------
 //
 //   kind, activation, chunk, rows_per_block, timing (bool), host_bytes,
-//   error (the last refusal, empty when none)
+//   error (the last refusal, empty when none), lost_row0, gpu_only
 inline constexpr std::string_view kInfoRowsPerBlock = "rows_per_block";
 inline constexpr std::string_view kInfoTiming = "timing";
 inline constexpr std::string_view kInfoHostBytes = "host_bytes";
 inline constexpr std::string_view kInfoError = "error";
+// THE GPU FALLBACK. After a finish() that returned false, the first row
+// the ANE did not write: rows [lost_row0, seq) still hold what they held
+// before the split -- the input, where `in` was `out` -- and the caller
+// computes them on its GPU path. Rows before it were written and are
+// exact. -1 when nothing was lost; ABSENT on a host older than the key,
+// where the caller has no range to trust and should fail the forward.
+inline constexpr std::string_view kInfoLostRow0 = "lost_row0";
+// True once a block has lost rows: plan_block() answers kGpu from then on,
+// for the life of the tier.
+inline constexpr std::string_view kInfoGpuOnly = "gpu_only";
 
 // ---- the frozen surface ----------------------------------------------
 
@@ -176,7 +186,9 @@ std::unique_ptr<Tier> create(const SessionContextIntf* session,
 //           join_stage(layer); wait for the GPU
 //           rows = begin(args, io)          the ANE takes the tail rows
 //           ... GPU computes rows [0, seq - rows) ...
-//           finish(layer, timing)           joins; false = rows lost
+//           finish(layer, timing)           joins; false = rows lost:
+//                                           compute [info()[lost_row0],
+//                                           seq) on the GPU
 //   kProbe: same split point, GPU over every row, note_probe(timing)
 //   kGpu:   nothing
 class Tier {

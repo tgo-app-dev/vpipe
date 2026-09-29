@@ -1789,12 +1789,26 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       const double t_gpu = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_q0).count();
       if (qkv_probe) { _ane_qkv->note_probe(q_drain_ms, t_gpu); }
+      // THE GPU FALLBACK: rows the ANE lost are projected here, on the
+      // stream the attention is about to use. `tmp` is only the tier's
+      // input, so every row of it is still there.
+      int q_lost = -1;
       if (!_ane_qkv->finish(L, ROWS, t_gpu, q_drain_ms) && q_rows > 0) {
-        return fail("qwen-image-2.1 forward: the ANE left its rows of a "
-                    "q/k/v projection uncomputed");
+        q_lost = _ane_qkv->lost_row0();
+        if (q_lost < 0 || q_lost >= ROWS) {
+          return fail("qwen-image-2.1 forward: the ANE lost q/k/v rows "
+                      "it cannot name");
+        }
       }
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
+      if (q_lost >= 0) {
+        const std::size_t e0 = (std::size_t)q_lost * H;
+        const int n = ROWS - q_lost;
+        lin(tmp, e0, b->qw, qb, e0, n, H, H, LB(&BlockLora::q));
+        lin(tmp, e0, b->kw, kb, e0, n, H, H, LB(&BlockLora::k));
+        lin(tmp, e0, b->vw, vb, e0, n, H, H, LB(&BlockLora::v));
+      }
     }
     // The worker is free again: the feed-forward's weights now, so they
     // stage under the attention exactly as they would alone.
@@ -2050,38 +2064,45 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
     }
+    // The GPU's feed-forward over rows [r0, r0 + n) of `tmp`, in place:
+    // its share of a split, every row of an unsplit block, and the rows
+    // the ANE lost. The scratch is used from its first row whatever r0 is.
+    auto gpu_ff = [&](int r0, int n) {
+      const std::size_t e0 = (std::size_t)r0 * H;
+      if (n > 0) {
+        lin(tmp, e0, b->gate_w, g1, 0, n, FF, H, LB(&BlockLora::gate));
+        lin(tmp, e0, b->proj_w, u1, 0, n, FF, H, LB(&BlockLora::proj));
+      }
+      mark("gemm.ff_up");
+      // out(silu(gate_layer(x)) * proj(x)). GATE FIRST: `gate_layer` is
+      // the silu'd half and `proj` the multiplicand, which the names do
+      // not make obvious and which no shape check can tell apart.
+      // The largest elementwise dispatch in the model -- ROWS*FF, which
+      // at 1024^2 is 51M elements -- so it is the one that pays most for
+      // being four-wide.
+      const std::size_t sw_n = (std::size_t)n * FF;
+      if (n > 0 && (sw_n % 4) == 0 && _fn_swiglu4.valid()) {
+        enc.set_function(_fn_swiglu4);
+        enc.set_buffer(0, g1); enc.set_buffer(1, u1); enc.set_buffer(2, s1);
+        enc.set_constant(3, (int)(sw_n / 4));
+        enc.dispatch({(unsigned)(sw_n / 4), 1, 1}, {256, 1, 1});
+      } else if (n > 0) {
+        enc.set_function(_fn_swiglu);
+        enc.set_buffer(0, g1); enc.set_buffer(1, u1); enc.set_buffer(2, s1);
+        enc.set_constant(3, (int)sw_n);
+        enc.dispatch({(unsigned)sw_n, 1, 1}, {256, 1, 1});
+      }
+      mark("elt");
+      if (n > 0) {
+        lin(s1, 0, b->out_w, tmp, e0, n, H, FF, LB(&BlockLora::out));
+      }
+      mark("gemm.ff_down");
+    };
     // The GPU's share. A probe block deliberately takes every row: that
     // is what makes its time comparable with the split's.
     const int g_rows = ROWS - a_rows;
     const auto t_g0 = std::chrono::steady_clock::now();
-    if (g_rows > 0) {
-    lin(tmp, 0, b->gate_w, g1, 0, g_rows, FF, H, LB(&BlockLora::gate));
-    lin(tmp, 0, b->proj_w, u1, 0, g_rows, FF, H, LB(&BlockLora::proj));
-    }
-    mark("gemm.ff_up");
-    // out(silu(gate_layer(x)) * proj(x)). GATE FIRST: `gate_layer` is the
-    // silu'd half and `proj` the multiplicand, which the names do not
-    // make obvious and which no shape check can tell apart.
-    // The largest elementwise dispatch in the model -- ROWS*FF, which
-    // at 1024^2 is 51M elements -- so it is the one that pays most for
-    // being four-wide.
-    const std::size_t sw_n = (std::size_t)g_rows * FF;
-    if (g_rows > 0 && (sw_n % 4) == 0 && _fn_swiglu4.valid()) {
-      enc.set_function(_fn_swiglu4);
-      enc.set_buffer(0, g1); enc.set_buffer(1, u1); enc.set_buffer(2, s1);
-      enc.set_constant(3, (int)(sw_n / 4));
-      enc.dispatch({(unsigned)(sw_n / 4), 1, 1}, {256, 1, 1});
-    } else if (g_rows > 0) {
-      enc.set_function(_fn_swiglu);
-      enc.set_buffer(0, g1); enc.set_buffer(1, u1); enc.set_buffer(2, s1);
-      enc.set_constant(3, (int)sw_n);
-      enc.dispatch({(unsigned)sw_n, 1, 1}, {256, 1, 1});
-    }
-    mark("elt");
-    if (g_rows > 0) {
-      lin(s1, 0, b->out_w, tmp, 0, g_rows, H, FF, LB(&BlockLora::out));
-    }
-    mark("gemm.ff_down");
+    gpu_ff(0, g_rows);
     // ---- rejoin ------------------------------------------------------
     //
     // The GPU's rows have to be DONE before the ANE's are folded in and
@@ -2097,12 +2118,20 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       const double t_gpu = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_g0).count();
       if (ane_probe) { _ane->note_probe(ane_drain_ms, t_gpu); }
+      // THE GPU FALLBACK: `tmp` is the tier's input AND output, and a
+      // chunk is written only once it all came back finite, so the rows
+      // from lost_row0() on are still the input.
+      int ff_lost = -1;
       if (!_ane->finish(L, ROWS, t_gpu, ane_drain_ms) && a_rows > 0) {
-        return fail("qwen-image-2.1 forward: the ANE left its rows of a "
-                    "feed-forward uncomputed");
+        ff_lost = _ane->lost_row0();
+        if (ff_lost < 0 || ff_lost >= ROWS) {
+          return fail("qwen-image-2.1 forward: the ANE lost feed-forward "
+                      "rows it cannot name");
+        }
       }
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
+      if (ff_lost >= 0) { gpu_ff(ff_lost, ROWS - ff_lost); }
     }
     for (const Band& bd : bands) {
       gated(jh, (std::size_t)bd.start * H,

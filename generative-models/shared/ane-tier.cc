@@ -311,6 +311,8 @@ Tier::info() const
   acc::set_flag(&f, kInfoTiming, _p->ff->timing());
   acc::set_integer(&f, kInfoHostBytes, (long long)_p->ff->host_bytes());
   acc::set_text(&f, kInfoError, _p->error);
+  acc::set_integer(&f, kInfoLostRow0, _p->ff->lost_row0());
+  acc::set_flag(&f, kInfoGpuOnly, _p->ff->gpu_only());
   return f;
 }
 

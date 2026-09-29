@@ -322,6 +322,17 @@ class MetalKrea2Transformer {
   // eligibility -- so a caller revising what the plan booked has to ask
   // about both.
   bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return _ane != nullptr && _ane->gpu_only();
+  }
+  bool ane_qkv_gpu_only() const noexcept
+  {
+    return _ane_qkv != nullptr && _ane_qkv->gpu_only();
+  }
 
   // M3a: run the text-fusion tower + txt_in on the (text_seq, n_text_layers,
   // text_hidden) f16 encoder-tap stack -> the (text_seq, hidden) fused text

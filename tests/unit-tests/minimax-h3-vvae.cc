@@ -993,6 +993,70 @@ TEST(minimax_h3_vvae, decode_ane_matches_gpu)
   EXPECT_TRUE(ane.armed);
   EXPECT_TRUE(bad == 0);
   EXPECT_TRUE(rel < 0.02 && rel > 0.0);
+  if (!ane.armed) { return; }
+
+  // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tier reads it when the
+  // first decode builds it). The FIRST split losing every ANE row leaves
+  // the whole decode the GPU's, which proves no later block split again.
+  // A PINNED share of 512-row chunks losing only its SECOND chunk is the
+  // in-place case -- s.nm is the feed-forward's input and output, so the
+  // rows before the loss are outputs and the rows after it must still be
+  // inputs; recomputing the wrong range lands far from the GPU arm.
+  auto failing = [&](const char* spec, bool pinned, bool* latched) {
+    std::vector<float> rgb;
+    MetalMiniMaxH3VideoVae::Config rc = cfg;
+    rc.ane_ffn  = true;
+    rc.ane_rows = pinned ? 1.0f : 0.0f;
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, rc);
+    if (m == nullptr) { return rgb; }
+    setenv("VPIPE_ANE_FAIL", spec, 1);
+    if (pinned) { setenv("VPIPE_H3_VVAE_ANE_CHUNK", "512", 1); }
+    std::string derr;
+    SharedBuffer out = m->decode(z, LT, lh, lw, &derr);
+    unsetenv("VPIPE_ANE_FAIL");
+    if (pinned) { unsetenv("VPIPE_H3_VVAE_ANE_CHUNK"); }
+    if (out.empty()) {
+      std::printf("[minimax_h3_vvae] decode: %s\n", derr.c_str());
+      return rgb;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(out.contents());
+    rgb.resize(out.byte_size() / 2);
+    for (std::size_t k = 0; k < rgb.size(); ++k) {
+      rgb[k] = bf16_to_f32_(p[k]);
+    }
+    *latched = m->ane_gpu_only();
+    return rgb;
+  };
+  auto rel_of = [&](const std::vector<float>& a, bool* finite) {
+    double nm2 = 0.0, dn2 = 0.0;
+    *finite = !a.empty();
+    for (std::size_t k = 0; k < a.size() && k < gpu.rgb.size(); ++k) {
+      if (!std::isfinite(a[k])) { *finite = false; continue; }
+      const double d = (double)a[k] - (double)gpu.rgb[k];
+      nm2 += d * d;
+      dn2 += (double)gpu.rgb[k] * (double)gpu.rgb[k];
+    }
+    return dn2 > 0.0 ? std::sqrt(nm2 / dn2) : 0.0;
+  };
+  bool l0 = false, l1 = false, fin0 = false, fin1 = false;
+  const std::vector<float> f0 = failing("0:0", false, &l0);
+  const std::vector<float> f1 = failing("0:1", true, &l1);
+  ASSERT_TRUE(f0.size() == gpu.rgb.size() && f1.size() == gpu.rgb.size());
+  if (f0.size() != gpu.rgb.size() || f1.size() != gpu.rgb.size()) {
+    return;
+  }
+  const double r_f0 = rel_of(f0, &fin0);
+  const double r_f1 = rel_of(f1, &fin1);
+  std::printf("[minimax_h3_vvae] ANE rows lost -> GPU: rel-L2 %.4e (first "
+              "split, every row), %.4e (second 512-row chunk of a pinned "
+              "share) against GPU-only\n", r_f0, r_f1);
+  EXPECT_TRUE(l0);                 // engaged: the tier fell back
+  EXPECT_TRUE(l1);
+  EXPECT_TRUE(fin0 && fin1);
+  EXPECT_TRUE(r_f0 < 1e-6);        // every row the GPU's
+  EXPECT_TRUE(r_f0 < 0.01 * rel);
+  EXPECT_TRUE(r_f1 < 0.02);        // the right rows were recomputed
+  EXPECT_TRUE(r_f1 > r_f0);        // and the ANE's first chunk kept
 }
 
 // ---------------------------------------------------------------------

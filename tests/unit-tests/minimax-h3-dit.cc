@@ -2952,6 +2952,66 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
   // reached the ANE at all.
   EXPECT_TRUE(rv < 0.02 && ra < 0.02);
   EXPECT_TRUE(rv > 0.0);
+  if (!ane.armed) { return; }
+
+  // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
+  // first forward builds them), the feed-forward and q/k/v at once. The
+  // FIRST split losing every ANE row leaves the whole forward the GPU's,
+  // which proves no later block split again. A PINNED share losing only
+  // its SECOND chunk is the in-place case: the feed-forward writes s.nm
+  // where it read it, so the rows before the loss are outputs and the
+  // rows after it must still be inputs -- recomputing the wrong range
+  // lands far from the GPU arm.
+  auto failing = [&](const char* spec, float rows, bool* latched) {
+    Arm arm;
+    MetalMiniMaxH3Transformer::Config rc = cfg;
+    rc.ane_ffn  = true;
+    rc.ane_qkv  = true;
+    rc.ane_rows = rows;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, rc, stream, loras);
+    if (m == nullptr) { return arm; }
+    setenv("VPIPE_ANE_FAIL", spec, 1);
+    std::string ferr;
+    MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
+    unsetenv("VPIPE_ANE_FAIL");
+    if (out.empty()) {
+      std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
+      return arm;
+    }
+    arm.video = to_f32(out.video);
+    arm.audio = to_f32(out.audio);
+    *latched = m->ane_gpu_only() && m->ane_qkv_gpu_only();
+    return arm;
+  };
+  auto finite = [](const std::vector<float>& v) {
+    for (float f : v) {
+      if (!std::isfinite(f)) { return false; }
+    }
+    return !v.empty();
+  };
+  bool l0 = false, l1 = false;
+  const Arm f0 = failing("0:0", 0.0f, &l0);
+  const Arm f1 = failing("0:1", 1.0f, &l1);
+  ASSERT_TRUE(f0.video.size() == gpu.video.size() &&
+              f1.video.size() == gpu.video.size());
+  if (f0.video.size() != gpu.video.size() ||
+      f1.video.size() != gpu.video.size()) {
+    return;
+  }
+  const double r_f0 = rel(f0.video, gpu.video);
+  const double r_f1 = rel(f1.video, gpu.video);
+  std::printf("[minimax_h3_dit] ANE rows lost -> GPU: video rel-L2 %.4e "
+              "(first split, every row), %.4e (second chunk of a pinned "
+              "share) against GPU-only\n", r_f0, r_f1);
+  EXPECT_TRUE(l0);                 // engaged: both tiers fell back
+  EXPECT_TRUE(l1);
+  EXPECT_TRUE(finite(f0.video) && finite(f0.audio));
+  EXPECT_TRUE(finite(f1.video) && finite(f1.audio));
+  EXPECT_TRUE(r_f0 < 1e-6);        // every row the GPU's
+  EXPECT_TRUE(rel(f0.audio, gpu.audio) < 1e-6);
+  EXPECT_TRUE(r_f0 < 0.01 * rv);
+  EXPECT_TRUE(r_f1 < 0.02);        // the right rows were recomputed
+  EXPECT_TRUE(r_f1 > r_f0);        // and the ANE's first chunk kept
 }
 
 // Two checkpoints of the SAME model, one forward each on the same

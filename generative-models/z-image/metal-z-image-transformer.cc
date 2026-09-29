@@ -1494,11 +1494,23 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       const double t_gpu = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_q0).count();
       if (qkv_probe) { _ane_qkv->note_probe(q_drain_ms, t_gpu); }
+      // THE GPU FALLBACK: rows the ANE lost are projected here, on the
+      // stream the attention is about to use. `nrm` is only the tier's
+      // input, so every row of it is still there.
+      int q_lost = -1;
       if (!_ane_qkv->finish(L, rows, t_gpu, q_drain_ms) && q_rows > 0) {
-        return false;
+        q_lost = _ane_qkv->lost_row0();
+        if (q_lost < 0 || q_lost >= rows) { return false; }
       }
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
+      if (q_lost >= 0) {
+        const std::size_t e0 = (std::size_t)q_lost * H;
+        const int n = rows - q_lost;
+        lin(nrm, e0, b.qw, qb, e0, n, H, H, LA(&BlockLora::q));
+        lin(nrm, e0, b.kw, kb, e0, n, H, H, LA(&BlockLora::k));
+        lin(nrm, e0, b.vw, vb, e0, n, H, H, LA(&BlockLora::v));
+      }
     }
     // The worker is free again: the feed-forward's weights now, so they
     // stage under the attention exactly as they would alone.
@@ -1559,19 +1571,25 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
     }
+    // The GPU's feed-forward over rows [r0, r0 + n), `nrm` into `ob`: its
+    // share of a split, every row of an unsplit block, and the rows the
+    // ANE lost. The scratch is used from its first row whatever r0 is.
+    auto gpu_ff = [&](int r0, int n) {
+      if (n <= 0) { return; }
+      const std::size_t e0 = (std::size_t)r0 * H;
+      lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
+      lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
+      // In place on the gate: same index in, same index out. The
+      // largest elementwise dispatch in the model, so it is the one
+      // that pays most for being four-wide.
+      swiglu(ffg, ffu, ffg, n * FFI);
+      lin(ffg, 0, b.w2, ob, e0, n, H, FFI, LA(&BlockLora::w2));
+    };
     // The GPU's share. A probe block deliberately takes EVERY row:
     // that is what makes its time comparable with the split's.
     const int g_rows = rows - a_rows;
     const auto t_g0 = std::chrono::steady_clock::now();
-    if (g_rows > 0) {
-      lin(nrm, 0, b.w1, ffg, 0, g_rows, FFI, H, LA(&BlockLora::w1));
-      lin(nrm, 0, b.w3, ffu, 0, g_rows, FFI, H, LA(&BlockLora::w3));
-      // In place on the gate: same index in, same index out. The
-      // largest elementwise dispatch in the model, so it is the one
-      // that pays most for being four-wide.
-      swiglu(ffg, ffu, ffg, g_rows * FFI);
-      lin(ffg, 0, b.w2, ob, 0, g_rows, H, FFI, LA(&BlockLora::w2));
-    }
+    gpu_ff(0, g_rows);
     mark("gemm.ff");
     // The GPU's rows have to be DONE before the ANE's are folded in and
     // before the norm below reads the whole tensor, so this commit is
@@ -1586,11 +1604,16 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       const double t_gpu = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_g0).count();
       if (ane_probe) { _ane->note_probe(ane_drain_ms, t_gpu); }
+      // THE GPU FALLBACK: `nrm` is only the tier's input, so the rows it
+      // lost can be run again from it.
+      int ff_lost = -1;
       if (!_ane->finish(L, rows, t_gpu, ane_drain_ms) && a_rows > 0) {
-        return false;
+        ff_lost = _ane->lost_row0();
+        if (ff_lost < 0 || ff_lost >= rows) { return false; }
       }
       stream = mc->make_command_stream();
       enc = stream.begin_compute();
+      if (ff_lost >= 0) { gpu_ff(ff_lost, rows - ff_lost); }
     }
     rms(ob, 0, b.fn2, ob, 0, rows, H);
     if (modulated) {

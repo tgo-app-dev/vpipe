@@ -1357,6 +1357,85 @@ TEST(flux2_smoke, forward_dit_ane_matches_gpu)
   EXPECT_TRUE(ane.armed);
   EXPECT_TRUE(r > 0.0);
   EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  if (!ane.armed) { return; }
+
+  // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
+  // first forward builds them), all three tiers at once -- the double
+  // blocks' q|k|v and feed-forward and the single blocks' projection --
+  // over ONE forward, the one the failure happens in. The FIRST split
+  // losing every ANE row leaves that forward the GPU's, which proves no
+  // later block split again. A PINNED share of 1024-row chunks losing only
+  // its SECOND chunk keeps the first chunk's ANE rows and recomputes the
+  // rest -- for the single blocks, their q/k/v AND the SwiGLU of the rows
+  // the ANE did write; the wrong range lands far from the GPU arm.
+  auto failing = [&](const char* spec, bool pinned, bool* latched) {
+    std::vector<float> v;
+    MetalFlux2Transformer::Config cfg;
+    cfg.session  = &sess;
+    cfg.ane_qkv  = true;
+    cfg.ane_rows = pinned ? 1.0f : 0.0f;
+    auto m = MetalFlux2Transformer::load(tdir, mc, cfg);
+    if (m == nullptr) { return v; }
+    const auto& c = m->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    std::mt19937 rng(7);                  // the same inputs as run()
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    setenv("VPIPE_ANE_FAIL", spec, 1);
+    if (pinned) { setenv("VPIPE_FLUX2_ANE_CHUNK", "1024", 1); }
+    SharedBuffer vel =
+        m->forward_dit(ctx, TS, lat, img_seq, grid, grid, 0.5f);
+    unsetenv("VPIPE_ANE_FAIL");
+    if (pinned) { unsetenv("VPIPE_FLUX2_ANE_CHUNK"); }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (vel.byte_size() < n * 2) { return v; }
+    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
+    v.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t bits = (std::uint32_t)vp[i] << 16;
+      std::memcpy(&v[i], &bits, sizeof(float));
+    }
+    *latched = m->ane_gpu_only();
+    return v;
+  };
+  auto rel_of = [&](const std::vector<float>& a, bool* finite) {
+    double nm2 = 0.0, dn2 = 0.0;
+    *finite = !a.empty();
+    for (std::size_t i = 0; i < a.size() && i < gpu.vel.size(); ++i) {
+      if (!std::isfinite(a[i])) { *finite = false; continue; }
+      const double d = (double)a[i] - (double)gpu.vel[i];
+      nm2 += d * d;
+      dn2 += (double)gpu.vel[i] * (double)gpu.vel[i];
+    }
+    return dn2 > 0.0 ? std::sqrt(nm2 / dn2) : 0.0;
+  };
+  bool l0 = false, l1 = false, fin0 = false, fin1 = false;
+  const std::vector<float> f0 = failing("0:0", false, &l0);
+  const std::vector<float> f1 = failing("0:1", true, &l1);
+  ASSERT_TRUE(f0.size() == gpu.vel.size() && f1.size() == gpu.vel.size());
+  if (f0.size() != gpu.vel.size() || f1.size() != gpu.vel.size()) { return; }
+  const double r_f0 = rel_of(f0, &fin0);
+  const double r_f1 = rel_of(f1, &fin1);
+  std::printf("[flux2_smoke] ANE rows lost -> GPU: rel-L2 %.3e (first "
+              "split, every row), %.3e (second 1024-row chunk of a pinned "
+              "share) against GPU-only\n", r_f0, r_f1);
+  EXPECT_TRUE(l0);                 // engaged: the tiers fell back
+  EXPECT_TRUE(l1);
+  EXPECT_TRUE(fin0 && fin1);
+  EXPECT_TRUE(r_f0 < 1e-6);        // every row the GPU's
+  EXPECT_TRUE(r_f0 < 0.01 * r);
+  EXPECT_TRUE(r_f1 < 0.10);        // the right rows were recomputed
+  EXPECT_TRUE(r_f1 > r_f0);        // and the ANE's first chunk kept
 }
 
 // BLOCK STREAMING MUST NOT CHANGE A SINGLE BIT.

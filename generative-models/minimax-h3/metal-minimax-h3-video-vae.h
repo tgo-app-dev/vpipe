@@ -338,6 +338,13 @@ class MetalMiniMaxH3VideoVae {
   // Whether the tier tried to arm, and whether it did.
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return _ane != nullptr && _ane->gpu_only();
+  }
 
   void set_tile_progress(genai::VaeTileProgressFn fn)
   {

@@ -6715,14 +6715,24 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         stream.commit().wait();
         const double qg_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_qg0).count();
+        int q_lost = -1;
         if (q_rows > 0) {
-          (void)_ane_qkv->finish(lora_layer, rows, qg_ms, q_drain_ms);
+          if (!_ane_qkv->finish(lora_layer, rows, qg_ms, q_drain_ms)) {
+            q_lost = _ane_qkv->lost_row0();
+          }
         } else {
           _ane_qkv->note_probe(q_drain_ms, qg_ms);
         }
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
+        // THE GPU FALLBACK: `s.nm` is only the tier's input, so the rows it
+        // lost are projected again from it before anything reads s.qkv.
+        if (q_lost >= 0 && q_lost < rows) {
+          const std::size_t r0 = (std::size_t)q_lost;
+          gemm_(enc, s.nm, r0 * H, b.qkv, s.qkv, r0 * 3 * I, rows - q_lost,
+                3 * I, H, &lo_qkv);
+        }
       }
       // The FF's staging, deferred from the block start when qkv split.
       if (qkv_block && ane_block) {
@@ -6940,50 +6950,64 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
       }
+      // The GPU's feed-forward over rows [r0, r0 + n) of s.nm, IN PLACE: its
+      // share of a split, and the rows the ANE lost -- which still hold
+      // their input, because the ANE writes a chunk back only once all of
+      // it came out finite. The scratch is used from its first row.
+      auto gpu_ff = [&](int r0, int n) {
+        if (n <= 0) { return; }
+        const std::size_t e0 = (std::size_t)r0 * H;
+        const bool head = r0 == 0;          // the dumps describe the head
+        // s.qkv is free by now and is the only scratch wide enough to take
+        // the activation, whichever path writes it.
+        if (b.fc1.gu_inter) {
+          // One GEMM: the epilogue holds each (gate, up) pair in one
+          // accumulator fragment and stores silu(gate)*up straight into
+          // s.qkv. No [rows, 2*ffn] intermediate is written and none is
+          // read back -- which is the whole saving, since the arithmetic is
+          // identical either way.
+          const bool bm64 = _qmm_tile >= 1 &&
+                            (b.fc1.bits == 8 ? _fn_qmm_swiglu8_bm64.valid()
+                                             : _fn_qmm_swiglu4_bm64.valid());
+          enc.set_function(b.fc1.bits == 8
+                               ? (bm64 ? _fn_qmm_swiglu8_bm64 : _fn_qmm_swiglu8)
+                               : (bm64 ? _fn_qmm_swiglu4_bm64
+                                       : _fn_qmm_swiglu4));
+          enc.set_buffer(0, b.fc1.codes); enc.set_buffer(1, b.fc1.scales);
+          enc.set_buffer(2, b.fc1.qbias); enc.set_buffer(3, s.nm, e0 * 2);
+          enc.set_buffer(4, s.qkv);
+          enc.set_constant(5, H);
+          enc.set_constant(6, 2 * FF);     // the FUSED width, not the output
+          enc.set_constant(7, n);
+          const int bm = bm64 ? 64 : 32;
+          enc.dispatch({(unsigned)(((2 * FF + 31) / 32) * 32),
+                        (unsigned)(((n + bm - 1) / bm) * 2), 2}, {32, 2, 2});
+        } else {
+          gemm_(enc, s.nm, e0, b.fc1, s.ff, 0, n, 2 * FF, H,
+                &lo_fc1);
+          if (head) {
+            bdump("fc1", s.ff, 2 * FF);
+            trip(trip_blk, 6, s.ff, (std::size_t)n * 2 * FF);
+          }
+          // fc1 is FUSED [gate | up], GATE first -- the diffusers SwiGLU
+          // convention, not the llama one the rest of this tree follows.
+          enc.set_function(_fn_swiglu);
+          enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
+          enc.set_constant(2, n);
+          enc.set_constant(3, FF);
+          enc.dispatch({(unsigned)(n * FF), 1, 1}, {256, 1, 1});
+        }
+        if (head) {
+          bdump("swiglu", s.qkv, FF);
+          trip(trip_blk, 7, s.qkv, (std::size_t)n * FF);
+        }
+        gemm_(enc, s.qkv, 0, b.fc2, s.nm, e0, n, H, FF,
+              &lo_fc2);
+      };
       // The ANE always leaves the GPU at least one row.
       const int g_rows = rows - a_rows;
       const auto t_g0 = std::chrono::steady_clock::now();
-      // s.qkv is free by now and is the only scratch wide enough to take
-      // the activation, whichever path writes it.
-      if (b.fc1.gu_inter) {
-        // One GEMM: the epilogue holds each (gate, up) pair in one
-        // accumulator fragment and stores silu(gate)*up straight into
-        // s.qkv. No [rows, 2*ffn] intermediate is written and none is
-        // read back -- which is the whole saving, since the arithmetic is
-        // identical either way.
-        const bool bm64 = _qmm_tile >= 1 &&
-                          (b.fc1.bits == 8 ? _fn_qmm_swiglu8_bm64.valid()
-                                           : _fn_qmm_swiglu4_bm64.valid());
-        enc.set_function(b.fc1.bits == 8
-                             ? (bm64 ? _fn_qmm_swiglu8_bm64 : _fn_qmm_swiglu8)
-                             : (bm64 ? _fn_qmm_swiglu4_bm64
-                                     : _fn_qmm_swiglu4));
-        enc.set_buffer(0, b.fc1.codes); enc.set_buffer(1, b.fc1.scales);
-        enc.set_buffer(2, b.fc1.qbias); enc.set_buffer(3, s.nm);
-        enc.set_buffer(4, s.qkv);
-        enc.set_constant(5, H);
-        enc.set_constant(6, 2 * FF);     // the FUSED width, not the output
-        enc.set_constant(7, g_rows);
-        const int bm = bm64 ? 64 : 32;
-        enc.dispatch({(unsigned)(((2 * FF + 31) / 32) * 32),
-                      (unsigned)(((g_rows + bm - 1) / bm) * 2), 2}, {32, 2, 2});
-      } else {
-        gemm_(enc, s.nm, 0, b.fc1, s.ff, 0, g_rows, 2 * FF, H,
-              &lo_fc1);
-        bdump("fc1", s.ff, 2 * FF);
-      trip(trip_blk, 6, s.ff, (std::size_t)g_rows * 2 * FF);
-        // fc1 is FUSED [gate | up], GATE first -- the diffusers SwiGLU
-        // convention, not the llama one the rest of this tree follows.
-        enc.set_function(_fn_swiglu);
-        enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
-        enc.set_constant(2, g_rows);
-        enc.set_constant(3, FF);
-        enc.dispatch({(unsigned)(g_rows * FF), 1, 1}, {256, 1, 1});
-      }
-      bdump("swiglu", s.qkv, FF);
-      trip(trip_blk, 7, s.qkv, (std::size_t)g_rows * FF);
-      gemm_(enc, s.qkv, 0, b.fc2, s.nm, 0, g_rows, H, FF,
-            &lo_fc2);
+      gpu_ff(0, g_rows);
       if (a_rows > 0) {
         // The GPU's half, drained, then the ANE joined behind it.
         enc.end();
@@ -6993,10 +7017,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                 ? std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t_g0).count()
                 : 0.0;
-        (void)_ane->finish(lora_layer, rows, t_gpu, ane_drain_ms);
+        const bool ane_ok =
+            _ane->finish(lora_layer, rows, t_gpu, ane_drain_ms);
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
+        // THE GPU FALLBACK, in place over the rows the ANE lost.
+        const int lost = ane_ok ? -1 : _ane->lost_row0();
+        if (lost >= 0 && lost < rows) { gpu_ff(lost, rows - lost); }
       } else if (ane_probe) {
         // The GPU over every row, drained, for the on/off measurement.
         enc.end();

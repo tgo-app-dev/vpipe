@@ -1354,14 +1354,23 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
         }
         enc = stream.begin_compute();
       }
+      // The GPU's feed-forward over rows [r0, r0 + n) of s.nm, in place:
+      // its share of a split, and the rows the ANE lost -- which still hold
+      // their input, because the ANE writes a chunk back only once all of
+      // it came out finite. The scratch is used from its first row.
+      auto gpu_ff = [&](int r0, int n) {
+        if (n <= 0) { return; }
+        const std::size_t e0 = (std::size_t)r0 * D;
+        gemm_(enc, s.nm, e0, b.w1, s.ff, 0, n, 2 * FF, D);
+        enc.set_function(_fn_swiglu);
+        enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
+        enc.set_constant(2, n); enc.set_constant(3, FF);
+        enc.dispatch({(unsigned)(n * FF), 1, 1}, {256, 1, 1});
+        gemm_(enc, s.qkv, 0, b.w2, s.nm, e0, n, D, FF);
+      };
       const int g_rows = rows - a_rows;      // the ANE leaves the GPU >= 1
       const auto t_g0 = Clk::now();
-      gemm_(enc, s.nm, 0, b.w1, s.ff, 0, g_rows, 2 * FF, D);
-      enc.set_function(_fn_swiglu);
-      enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
-      enc.set_constant(2, g_rows); enc.set_constant(3, FF);
-      enc.dispatch({(unsigned)(g_rows * FF), 1, 1}, {256, 1, 1});
-      gemm_(enc, s.qkv, 0, b.w2, s.nm, 0, g_rows, D, FF);
+      gpu_ff(0, g_rows);
       if (a_rows > 0) {
         enc.end();
         stream.commit().wait();
@@ -1369,8 +1378,11 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
             _ane->timing() ? std::chrono::duration<double, std::milli>(
                                  Clk::now() - t_g0).count()
                            : 0.0;
-        (void)_ane->finish(L, rows, gpu_ms, ane_drain_ms);
+        const bool ane_ok = _ane->finish(L, rows, gpu_ms, ane_drain_ms);
         enc = stream.begin_compute();
+        // THE GPU FALLBACK, in place over the rows the ANE lost.
+        const int lost = ane_ok ? -1 : _ane->lost_row0();
+        if (lost >= 0 && lost < rows) { gpu_ff(lost, rows - lost); }
       } else if (ane_probe) {
         // The GPU over every row, drained, for the on/off measurement.
         enc.end();

@@ -220,6 +220,17 @@ class MetalQwenImage21Transformer {
   bool ane_armed() const noexcept { return _ane != nullptr; }
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return _ane != nullptr && _ane->gpu_only();
+  }
+  bool ane_qkv_gpu_only() const noexcept
+  {
+    return _ane_qkv != nullptr && _ane_qkv->gpu_only();
+  }
 
   // What the CoreML module holds, for the resource plan. Its bytes are
   // CoreML's and no other ledger in this process can see them, so the

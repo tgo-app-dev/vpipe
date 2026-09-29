@@ -229,6 +229,18 @@ AneFeedForward::create(const Options& o)
   f->_auto    = !(o.rows > 0.0f);
   f->_profile = o.profile;
   f->_check   = std::getenv("VPIPE_ANE_CHECK") != nullptr;
+  if (const char* fe = std::getenv("VPIPE_ANE_FAIL")) {
+    const char* want = std::getenv("VPIPE_ANE_FAIL_TAG");
+    if (want == nullptr || tag == want) {
+      int b = -1, c = 0;
+      if (std::sscanf(fe, "%d:%d", &b, &c) >= 1 && b >= 0 && c >= 0) {
+        f->_fail_block = b;
+        f->_fail_chunk = c;
+        ss->warn(fmt("{}: VPIPE_ANE_FAIL -- split {} will lose its rows "
+                     "from chunk {} on (test hook)", tag, b, c));
+      }
+    }
+  }
   ss->info(fmt("{}: ANE {} armed (runtime weights, {} MB IOSurface "
                "slots, module ready in {:.0f} ms), {} of {} rows per block "
                "in {} chunks of {} (GPU takes {})",
@@ -269,6 +281,8 @@ int AneFeedForward::chunk() const noexcept { return _chunk; }
 int AneFeedForward::rows_per_block() const noexcept { return _rows_per_block; }
 bool AneFeedForward::timing() const noexcept { return _auto || _profile; }
 bool AneFeedForward::needs_barrier() const noexcept { return _barrier; }
+int AneFeedForward::lost_row0() const noexcept { return _lost_row0; }
+bool AneFeedForward::gpu_only() const noexcept { return _gpu_only; }
 
 std::size_t
 AneFeedForward::gelu_runtime_bytes(int hidden, int ffn, int chunk) noexcept
@@ -672,6 +686,13 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
 AneFeedForward::Plan
 AneFeedForward::plan_block()
 {
+  // Latched by a block that lost rows, pinned share or not. An unsplit
+  // block needs no barrier.
+  if (_gpu_only) {
+    _barrier   = false;
+    _prev_plan = Plan::kGpu;
+    return Plan::kGpu;
+  }
   if (!_auto) { return Plan::kSplit; }
   const int n = _blocks_seen++;
   Plan p;
@@ -762,6 +783,7 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
                       const std::vector<OutSeg>& outs, int seq)
 {
   _ok = false;
+  _lost_row0 = -1;
   _t_cin = _t_pred = _t_cout = 0.0;
   // Whole chunks, and the GPU keeps at least one row: a later forward may
   // be shorter than the one the share was set from.
@@ -815,8 +837,13 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
   const bool tm = timing();
   const std::size_t off  = (std::size_t)(seq - a) * (std::size_t)_hidden;
   const std::size_t row0 = (std::size_t)(seq - a);   // first ANE row
+  // Nothing is written until the job has predicted a chunk, so every ANE
+  // row starts out lost; the job moves the mark past each chunk it writes.
+  _lost_row0 = (int)row0;
+  const int fail_chunk = _splits++ == _fail_block ? _fail_chunk : -1;
   AneWorker& w = worker();
-  w.dispatch([this, &w, in_p, segs, off, row0, cin_n, cout_n, a, tm]() {
+  w.dispatch([this, &w, in_p, segs, off, row0, cin_n, cout_n, a, tm,
+              fail_chunk]() {
     auto* in16 = static_cast<_Float16*>(_in.contents());
     const auto* o16 = static_cast<const _Float16*>(_out.contents());
     const auto* src = static_cast<const std::uint16_t*>(in_p);
@@ -898,6 +925,10 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
         }
       }
       if (tm) { _t_cin += ms_since_(ta); }
+      if (ch == fail_chunk) {                  // VPIPE_ANE_FAIL
+        _out_bad = cout_n;
+        return;
+      }
       const auto tp = Clk::now();
       bool ok = _rt->run(_in, 0, _out, 0, *_w);
       std::size_t bad = ok ? non_finite() : 0;
@@ -938,7 +969,9 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
         }
       });
       if (tm) { _t_cout += ms_since_(tc); }
+      _lost_row0 = (int)(rbase + (std::size_t)_chunk);
     }
+    _lost_row0 = -1;
     _out_bad = 0;
     if (_check) {
       _in_max  = mx;
@@ -1056,11 +1089,15 @@ AneFeedForward::finish(int layer, int seq, double gpu_ms, double drain_ms)
                        _rescales, _rescales == 1 ? "y" : "ies"));
   }
   if (!_ok) {
-    // Both engines have already run; there is no falling back to a GPU
-    // path for these rows, so this is loud.
-    _session->warn(fmt("{}: ANE feed-forward failed on block {} ({} "
-                       "non-finite outputs); those rows are not computed",
-                       _tag, layer, _out_bad));
+    // The rows are the FAMILY's to recompute (lost_row0()), since only it
+    // has the GPU path. What is decided here is that no later block tries
+    // the ANE again -- see gpu_only().
+    _gpu_only = true;
+    _session->warn(fmt("{}: ANE {} failed on block {} ({} non-finite "
+                       "outputs): rows {}..{} go back to the GPU, and "
+                       "this module stays on the GPU for the rest of the "
+                       "run", _tag, _matmul ? "projection" : "feed-forward",
+                       layer, _out_bad, _lost_row0, seq - 1));
   }
   return _ok;
 }

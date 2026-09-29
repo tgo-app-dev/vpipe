@@ -3412,6 +3412,113 @@ TEST(ane_tier, gelu_ffn_matches_the_feed_forward_it_wraps)
                           (std::size_t)a1 * H * 2) == 0);
 }
 
+// THE GPU FALLBACK'S CONTRACT, through the described surface a plugin
+// uses. A split whose second chunk is lost (VPIPE_ANE_FAIL, read when the
+// tier is built) must:
+//   * fail finish(), and name its first lost row in info()["lost_row0"];
+//   * have written the chunk BEFORE it, exactly as a clean run does;
+//   * leave every row from lost_row0 on as it was -- run IN PLACE here,
+//     which is what every in-place family's fallback leans on: those rows
+//     are still the input, and the GPU recomputes them from it;
+//   * answer kGpu to every later plan_block(), with no barrier to take.
+// And a tier that lost nothing says so: lost_row0 -1, gpu_only false.
+TEST(ane_tier, a_lost_chunk_is_named_and_the_tier_stays_off)
+{
+  namespace ane = vpipe::genai::ane;
+  namespace acc = vpipe::genai::accel;
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  // Two 256-row chunks: a pinned share takes rows [256, 768).
+  constexpr int H = 256, F = 1024, seq = 768, chunk = 256;
+  std::mt19937 rng(5);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto bf16 = [&](std::size_t n, float sc) {
+    vpipe::metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const float f = nd(rng) * sc;
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &f, sizeof(bits));
+      p[i] = (std::uint16_t)(bits >> 16);
+    }
+    return b;
+  };
+  const auto wu = bf16((std::size_t)F * H, 1.0f / std::sqrt((float)H));
+  const auto wd = bf16((std::size_t)H * F, 1.0f / std::sqrt((float)F));
+  const auto x0 = bf16((std::size_t)seq * H, 0.5f);
+  const std::size_t bytes = (std::size_t)seq * H * 2;
+  auto copy_of = [&](const vpipe::metal_compute::SharedBuffer& src) {
+    auto b = mc->make_shared_buffer(bytes);
+    std::memcpy(b.contents(), src.contents(), bytes);
+    return b;
+  };
+  auto spec = tier_spec_("ffn", "gelu_tanh", H, F, seq, chunk);
+  acc::set_real(&spec, ane::kRows, 1.0);
+  const std::string nuw = ane::key(ane::kProjUp, "w");
+  const std::string ndw = ane::key(ane::kProjDown, "w");
+  const ane::Binding wb[] = {{nuw, &wu}, {ndw, &wd}};
+  vpipe::FlexData args = vpipe::FlexData::make_object();
+  acc::set_integer(&args, ane::kSeq, seq);
+  // One split, in place over `plane`: true when finish() succeeded.
+  auto split = [&](ane::Tier& t, vpipe::metal_compute::SharedBuffer& plane,
+                   int* rows) {
+    const vpipe::FlexData params = vpipe::FlexData::make_object();
+    if (!t.stage(0, params, wb) || !t.join_stage(0)) { return false; }
+    const ane::Binding io[] = {{ane::kIoIn, &plane}, {ane::kIoOut, &plane}};
+    *rows = t.begin(args, io);
+    return t.finish(0, vpipe::FlexData::make_object());
+  };
+
+  std::string why;
+  auto clean = ane::create(&sess, mc, spec, &why);
+  if (clean == nullptr) { return; }              // no ANE on this box
+  auto good = copy_of(x0);
+  int a_good = 0;
+  ASSERT_TRUE(split(*clean, good, &a_good));
+  ASSERT_TRUE(a_good == 2 * chunk);
+  {
+    const vpipe::FlexData inf = clean->info();
+    EXPECT_TRUE(acc::integer(&inf, ane::kInfoLostRow0, 0) == -1);
+    EXPECT_FALSE(acc::flag(&inf, ane::kInfoGpuOnly));
+  }
+
+  setenv("VPIPE_ANE_FAIL", "0:1", 1);
+  auto lossy = ane::create(&sess, mc, spec, &why);
+  unsetenv("VPIPE_ANE_FAIL");
+  ASSERT_TRUE(lossy != nullptr);
+  if (lossy == nullptr) { return; }
+  auto plane = copy_of(x0);
+  int a_lost = 0;
+  EXPECT_FALSE(split(*lossy, plane, &a_lost));
+  EXPECT_TRUE(a_lost == a_good);
+  const vpipe::FlexData inf = lossy->info();
+  const int lost = (int)acc::integer(&inf, ane::kInfoLostRow0, -1);
+  const int row0 = seq - a_lost;
+  EXPECT_TRUE(lost == row0 + chunk);             // the second chunk
+  EXPECT_TRUE(acc::flag(&inf, ane::kInfoGpuOnly));
+  if (lost != row0 + chunk) { return; }
+  const auto* got = static_cast<const char*>(plane.contents());
+  const std::size_t rb = (std::size_t)H * 2;
+  // The first chunk: written, and exactly as the clean run wrote it.
+  EXPECT_TRUE(std::memcmp(got + (std::size_t)row0 * rb,
+                          static_cast<const char*>(good.contents()) +
+                              (std::size_t)row0 * rb,
+                          (std::size_t)chunk * rb) == 0);
+  // The lost rows, and the GPU's head: untouched, i.e. still the input.
+  EXPECT_TRUE(std::memcmp(got + (std::size_t)lost * rb,
+                          static_cast<const char*>(x0.contents()) +
+                              (std::size_t)lost * rb,
+                          (std::size_t)(seq - lost) * rb) == 0);
+  EXPECT_TRUE(std::memcmp(got, x0.contents(), (std::size_t)row0 * rb) == 0);
+  // And it stays off.
+  for (int b = 0; b < 3; ++b) {
+    EXPECT_TRUE(lossy->plan_block() == ane::Tier::Plan::kGpu);
+    EXPECT_FALSE(lossy->needs_barrier());
+  }
+  EXPECT_TRUE(clean->plan_block() != ane::Tier::Plan::kGpu);
+}
+
 // WHAT THE ANE TIER HOLDS, AND WHERE IT IS CHARGED. Weight slots are
 // IOSurfaces, host rows are unwired SharedBuffers, and CoreML's compiled
 // program is the driver's -- none of it goes through the wired pool. This

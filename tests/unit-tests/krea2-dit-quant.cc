@@ -812,3 +812,111 @@ TEST(krea2_dit_quant, stage_mixed_dit)
   ASSERT_TRUE(r >= 0.0);
   EXPECT_TRUE(r < 0.046);                          // better than pure w4
 }
+
+// THE ANE TIERS AND THEIR GPU FALLBACK, on the real checkpoint at 1024^2
+// with random inputs. Four arms, each its own model:
+//
+//   GPU-only                      the reference
+//   ANE ff + q|k|v|gate           a split: fp16 rows, so close, not equal
+//   lost at the first split       VPIPE_ANE_FAIL=0:0 -- every ANE row of
+//                                 block 0 goes back to the GPU and both
+//                                 tiers stay there, so the forward is the
+//                                 GPU's to the bit; any later split would
+//                                 put fp16 rows back in
+//   lost at a second chunk        a pinned two-chunk share losing chunk 1:
+//                                 the first chunk's ANE rows are kept and
+//                                 the rest recomputed; the wrong range
+//                                 lands far from the GPU arm
+//
+// Env: VPIPE_KREA2_TEST_MODEL_PATH.
+TEST(krea2_ane, lost_rows_fall_back_to_the_gpu)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const MetalKrea2Transformer::Config cfg0;
+  const int HID = cfg0.hidden, IC = cfg0.in_channels;
+  // 64 x 64 = 4096 image rows plus the text: the tiers chunk at 2048, so
+  // this is the smallest square that gives a pinned share two chunks.
+  const int grid = 64, img_seq = grid * grid, text_seq = 64;
+  const std::string dit = std::string(root) + "/transformer";
+  auto rnd = [&](std::size_t n, std::uint32_t seed) {
+    SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<_Float16*>(b.contents());
+    std::uint32_t st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      d[i] = (_Float16)(((float)(st >> 8) / 8388608.0f - 1.0f) * 0.5f);
+    }
+    return b;
+  };
+  const SharedBuffer fused = rnd((std::size_t)text_seq * HID, 71u);
+  const SharedBuffer lat = rnd((std::size_t)img_seq * IC, 72u);
+  ASSERT_TRUE(!fused.empty() && !lat.empty());
+  if (fused.empty() || lat.empty()) { return; }
+
+  enum Arm { kGpu, kAne, kLost0, kLost1, kArms };
+  struct Out {
+    std::vector<float> v;
+    bool armed = false, latched = false;
+  };
+  auto run = [&](int arm) {
+    Out o;
+    MetalKrea2Transformer::Config cfg;
+    if (arm != kGpu) {
+      cfg.session  = &sess;
+      cfg.ane_qkv  = true;
+      cfg.ane_rows = arm == kLost1 ? 1.0f : 0.0f;
+    }
+    auto m = MetalKrea2Transformer::load(dit, mc, cfg);
+    if (!m) { return o; }
+    const char* spec = arm == kLost0 ? "0:0" : arm == kLost1 ? "0:1"
+                                                             : nullptr;
+    if (spec != nullptr) { setenv("VPIPE_ANE_FAIL", spec, 1); }
+    SharedBuffer out = m->forward_dit(fused, text_seq, lat, img_seq, grid,
+                                      grid, 0.5f, -1);
+    if (spec != nullptr) { unsetenv("VPIPE_ANE_FAIL"); }
+    if (out.byte_size() < (std::size_t)img_seq * IC * 2) { return o; }
+    const auto* p = static_cast<const _Float16*>(out.contents());
+    o.v.resize((std::size_t)img_seq * IC);
+    for (std::size_t i = 0; i < o.v.size(); ++i) { o.v[i] = (float)p[i]; }
+    o.armed   = m->ane_armed() && m->ane_qkv_armed();
+    o.latched = m->ane_gpu_only() && m->ane_qkv_gpu_only();
+    return o;      // the model goes here: one 24 GB DiT resident at a time
+  };
+  Out out[kArms];
+  for (int a = 0; a < kArms; ++a) {
+    out[a] = run(a);
+    ASSERT_TRUE(out[a].v.size() == (std::size_t)img_seq * IC);
+    if (out[a].v.size() != (std::size_t)img_seq * IC) { return; }
+  }
+  if (!out[kAne].armed) {
+    std::printf("[krea2_ane] ANE did not arm -- SKIPPED\n");
+    return;
+  }
+  auto finite = [](const std::vector<float>& v) {
+    for (float f : v) {
+      if (!std::isfinite(f)) { return false; }
+    }
+    return true;
+  };
+  const std::size_t n = out[kGpu].v.size();
+  const double r_ane = rel_l2q_(out[kAne].v.data(), out[kGpu].v.data(), n);
+  const double r_f0 = rel_l2q_(out[kLost0].v.data(), out[kGpu].v.data(), n);
+  const double r_f1 = rel_l2q_(out[kLost1].v.data(), out[kGpu].v.data(), n);
+  std::printf("[krea2_ane] against GPU-only at 1024^2: ANE split rel-L2 "
+              "%.4e; rows lost -> GPU %.4e (first split, every row), %.4e "
+              "(second chunk of a pinned share)\n", r_ane, r_f0, r_f1);
+  EXPECT_TRUE(r_ane > 0.0 && r_ane < 0.05);   // rows reached the ANE
+  EXPECT_TRUE(out[kLost0].latched);           // engaged: both fell back
+  EXPECT_TRUE(out[kLost1].latched);
+  EXPECT_TRUE(!out[kAne].latched);
+  EXPECT_TRUE(finite(out[kLost0].v) && finite(out[kLost1].v));
+  EXPECT_TRUE(r_f0 < 1e-6);                   // every row the GPU's
+  EXPECT_TRUE(r_f0 < 0.01 * r_ane);
+  EXPECT_TRUE(r_f1 < 0.05);                   // the right rows recomputed
+  EXPECT_TRUE(r_f1 > r_f0);                   // the first chunk kept
+}

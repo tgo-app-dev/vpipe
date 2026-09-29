@@ -2402,6 +2402,55 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
   EXPECT_TRUE(r_ff < 0.05);
   EXPECT_TRUE(r_qkv < 0.05);
 
+  // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
+  // first forward builds them). Two cases, both tiers at once:
+  //
+  //  * the FIRST split loses every ANE row (chunk 0). The rows go back
+  //    to the GPU and the tiers stay there, so the whole forward is the
+  //    GPU's -- it matches the GPU arm far closer than any split does,
+  //    which is what proves no later block split again;
+  //  * a PINNED two-chunk share loses only its SECOND chunk. The feed-
+  //    forward writes in place, so this is the case where rows before
+  //    the loss are already outputs and rows after it must still be
+  //    inputs: recomputing the wrong range lands far from the GPU arm.
+  auto finite = [](const std::vector<float>& v) {
+    for (float f : v) {
+      if (!std::isfinite(f)) { return false; }
+    }
+    return !v.empty();
+  };
+  auto failing = [&](const char* spec, int rows,
+                     std::vector<float>* outv, bool* latched) {
+    MetalQwenImage21Transformer::Config c = cfg;
+    c.ane_ffn  = true;
+    c.ane_qkv  = true;
+    c.ane_rows = rows;
+    auto mf = MetalQwenImage21Transformer::load(dir, mc, c, stream, loras);
+    if (!mf) { return false; }
+    setenv("VPIPE_ANE_FAIL", spec, 1);
+    const bool ok = fwd(mf.get(), outv);
+    unsetenv("VPIPE_ANE_FAIL");
+    *latched = mf->ane_gpu_only() && mf->ane_qkv_gpu_only();
+    return ok;
+  };
+  std::vector<float> f0, f1;
+  bool l0 = false, l1 = false;
+  Q21D_REQUIRE(failing("0:0", 0, &f0, &l0));
+  Q21D_REQUIRE(failing("0:1", 1, &f1, &l1));
+  const double r_f0 = rel(f0, out[kGpu]);
+  const double r_f1 = rel(f1, out[kGpu]);
+  std::printf("[qwen_image_21_dit] ANE rows lost -> GPU: rel-L2 %.4e "
+              "(first split, every row), %.4e (second chunk of a pinned "
+              "share) against GPU-only\n", r_f0, r_f1);
+  EXPECT_TRUE(l0);                 // engaged: both tiers fell back
+  EXPECT_TRUE(l1);
+  EXPECT_TRUE(finite(f0));
+  EXPECT_TRUE(finite(f1));
+  EXPECT_TRUE(r_f0 < 1e-6);        // every row the GPU's
+  EXPECT_TRUE(r_f0 < 0.01 * r_qkv);
+  EXPECT_TRUE(r_f1 < 0.05);        // the right rows were recomputed
+  EXPECT_TRUE(r_f1 > r_f0);        // and the ANE's first chunk kept
+
   if (reps <= 0) { return; }
   double t[kArms] = {};
   std::vector<double> per[kArms];

@@ -538,6 +538,17 @@ class MetalMiniMaxH3Transformer {
   // the module can release the booking when it did not.
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return _ane != nullptr && _ane->gpu_only();
+  }
+  bool ane_qkv_gpu_only() const noexcept
+  {
+    return _ane_qkv != nullptr && _ane_qkv->gpu_only();
+  }
   // Take the ANE tiers off for this model before a forward that cannot
   // afford them: modules released, config off, and the VPIPE_H3_ANE_QKV
   // override ignored. The stage calls this when a clip fits only without

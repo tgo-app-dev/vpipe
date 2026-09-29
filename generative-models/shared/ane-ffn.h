@@ -248,8 +248,22 @@ class AneFeedForward {
             const std::vector<OutSeg>& outs, int seq);
   // Join the ANE, move the balance using the GPU's time for its rows, and
   // log the block under `profile`. False when the predict failed, which
-  // leaves those rows uncomputed.
+  // leaves rows [lost_row0(), seq) uncomputed.
   bool finish(int layer, int seq, double gpu_ms, double drain_ms);
+
+  // THE GPU FALLBACK. After a finish() that returned false, the first row
+  // the ANE did NOT write. Rows before it came back finite and were
+  // written; rows [lost_row0(), seq) still hold what they held before the
+  // split -- the INPUT, where `in` is `out`, because a chunk is converted
+  // out only once its whole prediction is finite -- so the family can run
+  // its own GPU path over exactly those rows. -1 when nothing was lost.
+  int  lost_row0() const noexcept;
+  // True once a block has lost rows: from then on plan_block() answers
+  // kGpu, for the life of this tier. A module whose fp16 range the
+  // activations exceeded once meets them again, and retrying every block
+  // pays the staging, the drain and six rescaled predicts each time only
+  // to hand the rows back.
+  bool gpu_only() const noexcept;
 
  private:
   AneFeedForward() = default;
@@ -291,6 +305,17 @@ class AneFeedForward {
   int    _staged   = -1;
   double _stage_ms = 0.0;
   bool   _ok       = false;
+  int    _lost_row0 = -1;                          // see lost_row0()
+  bool   _gpu_only  = false;                       // see gpu_only()
+  // TEST HOOK, VPIPE_ANE_FAIL=<block>[:<chunk>] (and VPIPE_ANE_FAIL_TAG=
+  // <tag> to pick one tier): the <block>th split of this tier, counting
+  // from 0, loses its rows from chunk <chunk> on as if that chunk had come
+  // back non-finite after every retry. Real non-finite output cannot be
+  // produced on demand, and a fallback nobody can trigger is one nobody
+  // has seen work.
+  int    _fail_block = -1;
+  int    _fail_chunk = 0;
+  int    _splits     = 0;                          // begin()s with rows
   double _t_cin = 0.0, _t_pred = 0.0, _t_cout = 0.0;
   int    _a_rows = 0;                              // this block's
   // ON/OFF: block-section times, from the split point to the end of the

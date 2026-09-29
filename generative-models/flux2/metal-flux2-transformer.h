@@ -177,6 +177,15 @@ class MetalFlux2Transformer {
     return _ane_dff != nullptr || _ane_dqkv != nullptr ||
            _ane_sproj != nullptr;
   }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return (_ane_dff != nullptr && _ane_dff->gpu_only()) ||
+           (_ane_dqkv != nullptr && _ane_dqkv->gpu_only()) ||
+           (_ane_sproj != nullptr && _ane_sproj->gpu_only());
+  }
 
   // What a CALLER chooses for a FLUX.2 run, as against Config, which is
   // read from the checkpoint. It lives here rather than in the driving

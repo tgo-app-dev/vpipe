@@ -3137,12 +3137,29 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         stream.commit().wait();
         const double qg_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_qg0).count();
+        int q_lost = -1;
         if (q_rows > 0) {
-          (void)_ane_qkv->finish(L, seq, qg_ms, q_drain_ms);
+          if (!_ane_qkv->finish(L, seq, qg_ms, q_drain_ms)) {
+            q_lost = _ane_qkv->lost_row0();
+          }
         } else {
           _ane_qkv->note_probe(q_drain_ms, qg_ms);
         }
         enc = stream.begin_compute();
+        // THE GPU FALLBACK: the rows the ANE lost, projected on the GPU
+        // before anything reads q/k/v/gate. `gemm` reads its input from
+        // row 0, so it is handed `nm` from the first lost row on.
+        if (q_lost >= 0 && q_lost < seq) {
+          const int n = seq - q_lost;
+          const std::size_t r0 = (std::size_t)q_lost;
+          const SharedBuffer x = nm.subview(r0 * HID * 2,
+                                            (std::size_t)n * HID * 2);
+          gemm(x, b.q, q, r0 * qd, n, qd, HID, lb(&BlockLora::q));
+          gemm(x, b.k, k, r0 * kd, n, kd, HID, lb(&BlockLora::k));
+          gemm(x, b.v, v, r0 * kd, n, kd, HID, lb(&BlockLora::v));
+          gemm(x, b.gate, gate, r0 * HID, n, HID, HID,
+               lb(&BlockLora::gate));
+        }
       }
       // The FF's staging, deferred from the block start when qkv split.
       if (qkv_block && ane_block) { ane_stage_(L, b); }
@@ -3223,10 +3240,12 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       // separate swiglu pass). N passed to either kernel is the fused 2*FF.
       // A lambda over `rows` because the ANE split runs it for the GPU's
       // HEAD rows: every kernel here reads from row 0 and writes at offset 0.
-      auto fused_ff = [&](int rows) {
+      // Over `rows` rows of `x` (`nm`, or a subview of it from a later
+      // row), into `o` from element `ye`.
+      auto fused_ff = [&](const SharedBuffer& x, int rows, std::size_t ye) {
         if (rows <= 0) { return; }
         if (!_dit.gu.empty() &&
-            gemm_mma_(enc, nm, b.ff_gu, _dit.gu, 0, rows, 2 * FF, HID)) {
+            gemm_mma_(enc, x, b.ff_gu, _dit.gu, 0, rows, 2 * FF, HID)) {
           psplit(t_ffup);
           enc.set_function(_fn_swiglu_inter);
           enc.set_buffer(0, _dit.gu); enc.set_buffer(1, g);
@@ -3248,7 +3267,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
                   : (huge ? _fn_qmm_swiglu4_bm128
                           : (a16 ? _fn_qmm_swiglu4_a16 : _fn_qmm_swiglu4)));
           enc.set_buffer(0, b.ff_gu.codes); enc.set_buffer(1, b.ff_gu.scales);
-          enc.set_buffer(2, b.ff_gu.qbias); enc.set_buffer(3, nm);
+          enc.set_buffer(2, b.ff_gu.qbias); enc.set_buffer(3, x);
           enc.set_buffer(4, g);
           enc.set_constant(5, HID); enc.set_constant(6, 2 * FF);
           enc.set_constant(7, rows);
@@ -3259,7 +3278,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
           psplit(t_ffact);   // activation fused into the GEMM epilogue
         }
         if (_calib_on) { colmax(g, _cb_dn[(std::size_t)L], rows, FF); }
-        gemm(g, b.ff_down, o, 0, rows, HID, FF,
+        gemm(g, b.ff_down, o, ye, rows, HID, FF,
              lb(&BlockLora::ff_down));
       };
       // A block on the ANE takes the SPLIT path below even when it is
@@ -3267,7 +3286,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       // entirely -- staging ran for every block and no row ever reached
       // the ANE (a 4-bit forward came out identical to GPU-only).
       if (!b.ff_gu.empty() && !ane_block && !ane_probe) {
-        fused_ff(seq);
+        fused_ff(nm, seq, 0);
       } else {
         // ---- the dense feed-forward, optionally split ------------
         //
@@ -3334,33 +3353,42 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         }
         const int g_rows = seq - a_rows;
 
-        // The GPU's share, as one lambda so the split and unsplit paths
-        // cannot drift: whatever rows it is given, it does the whole
-        // feed-forward over them.
-        auto gpu_ff = [&](int rows) {
+        // The GPU's share, as one lambda so the split, the unsplit path
+        // and the ANE's lost rows cannot drift: whatever rows it is given,
+        // [r0, r0 + rows), it does the whole feed-forward over them.
+        // `gemm` reads its input from row 0, so a later band is handed
+        // `nm` from r0 on.
+        auto gpu_ff = [&](int r0, int rows) {
           if (rows <= 0) { return; }
+          SharedBuffer sub;
+          if (r0 > 0) {
+            sub = nm.subview((std::size_t)r0 * HID * 2,
+                             (std::size_t)rows * HID * 2);
+          }
+          const SharedBuffer& x = r0 > 0 ? sub : nm;
+          const std::size_t ye = (std::size_t)r0 * HID;
           // A quantized block's GPU rows run the FUSED kernels whenever the
           // fused weight exists: it is the faster GPU path, and a promoted
           // or preloaded block has released its split gate/up anyway.
           if (!b.ff_gu.empty()) {
-            fused_ff(rows);
+            fused_ff(x, rows, ye);
             return;
           }
-          gemm(nm, b.ff_gate, g, 0, rows, FF, HID,
+          gemm(x, b.ff_gate, g, 0, rows, FF, HID,
                lb(&BlockLora::ff_gate));
-          gemm(nm, b.ff_up, u, 0, rows, FF, HID, lb(&BlockLora::ff_up));
+          gemm(x, b.ff_up, u, 0, rows, FF, HID, lb(&BlockLora::ff_up));
           psplit(t_ffup);
           elt3(_fn_swiglu, g, u, g, rows * FF);
           psplit(t_ffact);
           if (_calib_on) { colmax(g, _cb_dn[(std::size_t)L], rows, FF); }
-          gemm(g, b.ff_down, o, 0, rows, HID, FF,
+          gemm(g, b.ff_down, o, ye, rows, HID, FF,
                lb(&BlockLora::ff_down));
         };
 
         if (a_rows == 0 && ane_probe) {
           // The GPU over every row, drained, for the on/off measurement.
           const auto t_p0 = std::chrono::steady_clock::now();
-          gpu_ff(seq);
+          gpu_ff(0, seq);
           enc.end();
           stream.commit().wait();
           _ane->note_probe(ane_drain_ms,
@@ -3369,7 +3397,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
                                .count());
           enc = stream.begin_compute();
         } else if (a_rows == 0) {
-          gpu_ff(seq);
+          gpu_ff(0, seq);
         } else {
           // ---- the two engines, concurrently --------------------
           //
@@ -3380,7 +3408,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
           // well since CoreML offers no Metal-shared-event interop to
           // express one with.
           const auto t_g0 = std::chrono::steady_clock::now();
-          gpu_ff(g_rows);
+          gpu_ff(0, g_rows);
           enc.end();
           stream.commit().wait();
           const double t_gpu =
@@ -3388,8 +3416,12 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
                   ? std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t_g0).count()
                   : 0.0;
-          (void)_ane->finish(L, seq, t_gpu, ane_drain_ms);
+          const bool ane_ok = _ane->finish(L, seq, t_gpu, ane_drain_ms);
           enc = stream.begin_compute();
+          // THE GPU FALLBACK: `nm` is only the tier's input, so the rows
+          // it lost run again from it, before the gated add reads `o`.
+          const int lost = ane_ok ? -1 : _ane->lost_row0();
+          if (lost >= 0 && lost < seq) { gpu_ff(lost, seq - lost); }
         }
       }
       gated(joint, mod, 5 * HID, o, HID, seq * HID);          // += postgate*ff
