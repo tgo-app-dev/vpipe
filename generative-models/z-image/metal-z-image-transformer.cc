@@ -858,7 +858,7 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   if (mc->session() != nullptr) {
     mc->session()->log_normal(fmt(
         "MetalZImageTransformer: {} blocks ({} ctx + {} noise + {} main), "
-        "hidden {}, {} heads x {}, ffn {}, {}{}{}",
+        "hidden {}, {} heads x {}, ffn {}, {}{}{}{}",
         m->_cfg.n_blocks(), m->_cfg.n_refiner, m->_cfg.n_refiner,
         m->_cfg.n_layers, m->_cfg.hidden, m->_cfg.n_heads, m->_cfg.head_dim,
         m->_cfg.ffn_inner,
@@ -867,7 +867,18 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
                   std::to_string(m->_quant_group)
             : std::string(m->_src_f32 ? "f32 -> bf16" : "bf16"),
         stream_blocks ? ", streaming" : "",
-        m->_use_mma2 ? ", matmul2d" : ""));
+        m->_use_mma2 ? ", matmul2d" : "",
+        // WHETHER THE TIER TOOK, not whether it was asked for -- and the
+        // two spelled apart, because they are different answers and
+        // silence could mean either. i8_gemm is opt-in and declines on
+        // its own for a machine without matrix cores or a metallib
+        // without its entries, so a run that asked for it and did not
+        // get it looked exactly like a run that never asked: the load
+        // line, the block count and the progress beat all read the same,
+        // and the only evidence was a clock that did not move.
+        m->_i8            ? ", i8"
+        : m->_cfg.i8_gemm ? ", i8 REQUESTED BUT UNAVAILABLE"
+                          : ""));
   }
   return m;
 }

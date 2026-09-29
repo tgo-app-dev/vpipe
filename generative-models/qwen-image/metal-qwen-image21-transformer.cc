@@ -789,13 +789,21 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
   if (mc->session() != nullptr) {
     mc->session()->log_normal(fmt(
         "MetalQwenImage21Transformer: {} blocks, hidden {}, {} heads x {}, "
-        "ffn {}, {}{}", m->_cfg.n_layers, m->_cfg.hidden, m->_cfg.n_heads,
+        "ffn {}, {}{}{}", m->_cfg.n_layers, m->_cfg.hidden, m->_cfg.n_heads,
         m->_cfg.head_dim, m->_cfg.hidden * m->_cfg.mlp_ratio,
         m->_quant_bits > 0
             ? "w" + std::to_string(m->_quant_bits) + " g" +
                   std::to_string(m->_quant_group)
             : std::string("bf16"),
-        stream_blocks ? ", streaming" : ""));
+        stream_blocks ? ", streaming" : "",
+        // WHETHER THE TIER TOOK, and the asked-for-but-declined case
+        // spelled apart from never-asked: i8_gemm is opt-in and gates
+        // itself on matrix cores and on its kernels being there, so
+        // silence used to mean either, and the only evidence of the
+        // difference was a clock that did not move.
+        m->_i8            ? ", i8"
+        : m->_cfg.i8_gemm ? ", i8 REQUESTED BUT UNAVAILABLE"
+                          : ""));
   }
   return m;
 }

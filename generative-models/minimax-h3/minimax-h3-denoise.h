@@ -1,6 +1,7 @@
 #ifndef GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_DENOISE_H
 #define GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_DENOISE_H
 
+#include "common/flex-data.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 
@@ -34,6 +35,20 @@ namespace genai {
 //     20+ times over a latent that starts as unit noise, and the
 //     reference steps in float32 for exactly that reason; the bf16 round
 //     trip happens per forward, not per accumulation.
+//
+// What a denoise did, for a caller that wants to report or assert it.
+// `forwards` is the transformer calls that RAN; `reused` the steps
+// MotionCache answered from its residual instead. They sum to `steps`.
+// `motion_cache` says the cache was ARMED for the clip, which is what
+// tells "asked, and nothing was close enough to reuse" from "asked, and
+// the geometry turned it off".
+struct DenoiseReport {
+  int  steps        = 0;
+  int  forwards     = 0;
+  int  reused       = 0;
+  bool motion_cache = false;
+};
+
 struct DenoiseRequest {
   MetalMiniMaxH3Transformer*      dit    = nullptr;
   const minimax_h3::PackedLayout* layout = nullptr;
@@ -60,6 +75,21 @@ struct DenoiseRequest {
   int    video_grid_h = 0;
   int    video_grid_w = 0;
 
+  // Denoising steps -- one transformer FORWARD each, which is what
+  // diffusers' `num_inference_steps` and ComfyUI's `steps` count: N steps
+  // run N forwards over the N + 1 sigmas of linspace(1, 0, N + 1), the
+  // last of them the terminal zero.
+  //
+  // MiniMax's own reference scheduler counts differently -- its
+  // `num_inference_steps` is the number of GRID POINTS, terminal zero
+  // included, so it runs one forward fewer than it says -- and
+  // MiniMaxH3Scheduler::set_timesteps keeps that signature so it can be
+  // checked against the reference directly. The loop asks it for
+  // num_steps + 1 points. Matching the tools people come from matters
+  // more than matching one reference's argument: a step count copied from
+  // a ComfyUI workflow, or a Turbo adapter's "4-step" / "8-step" name,
+  // means forwards, and read the other way it lands one short -- off the
+  // grid a few-step distillation was trained on.
   int    num_steps   = 32;
   // An explicit RAW sigma grid (1 -> 0, unshifted), overriding
   // `num_steps`. Each modality pushes it through its own shift, as with
@@ -73,6 +103,13 @@ struct DenoiseRequest {
   // Leading steps whose attention runs DENSE with Sol-Attn on (see
   // Step::dense_attention). 0 routes every step.
   int sol_dense_steps = 0;
+  // The acceleration bag (shared/accel-settings.h), for the tiers the
+  // SAMPLING LOOP implements rather than the transformer -- MotionCache
+  // (shared/motion-cache.h), which decides per step whether to run the
+  // forward at all. Borrowed; null reads as every default, i.e. off.
+  const FlexData* accel = nullptr;
+  // Filled when set.
+  DenoiseReport* report = nullptr;
   double video_shift = 12.0;
   double audio_shift = 3.0;
   // The timestep the pinned keyframe rows are conditioned on. They are
@@ -118,6 +155,27 @@ struct DenoiseRequest {
     condition_audio_timestep = (float)p.condition_audio_timestep;
   }
 };
+
+// MotionCache's view of this loop's packed state (shared/motion-cache.h):
+// the offsets that pick its subsampled grids out of the GENERATED tails.
+//
+// Video is [C][T][H'][W'] over every `subsample`-th latent ROW and
+// COLUMN -- not patch; that is what the reference's [..., ::f, ::f]
+// keeps -- mapped through the packing: row t * gh * gw + cell, element
+// (c * patch_h + y) * patch_w + x. Audio is every `subsample`-th latent
+// step of each stereo channel, all lanes; its rows are channel-major in
+// time. False, with the reason, when the geometry has no such view.
+struct MotionCacheGathers {
+  std::vector<std::uint32_t> video;
+  std::vector<std::uint32_t> audio;
+  int channels = 0;
+  int frames   = 0;
+  int plane    = 0;   // H' * W'
+};
+bool motion_cache_gathers(const MetalMiniMaxH3Transformer::Config& cfg,
+                          int grid_h, int grid_w, int video_rows,
+                          int audio_rows, int subsample,
+                          MotionCacheGathers* out, std::string* why);
 
 // Run the loop. False on failure, with a reason in `err`. On success the
 // request's `video` / `audio` hold the denoised latents, still in packed

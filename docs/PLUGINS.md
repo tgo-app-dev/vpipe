@@ -558,8 +558,10 @@ const vpipe::FlexData* accel;   // and it stays one pointer
 
 — and so do `ImageModelCreateArgs` and `ImageGenRequest`, from
 `generate-image`. The two generating stages carry the **same three
-tiers** under the same key spellings, so a family that reads the bag
-reads it identically whichever one it plugs into.
+attention and GEMM tiers** under the same key spellings, so a family
+that reads the bag reads it identically whichever one it plugs into.
+`generate-video` also carries `motion_cache`, a sampling-loop tier
+described [below](#motion_cache--whether-a-forward-runs-at-all).
 
 These are the cross-family settings the graph asked for, as an **open
 bag**. The
@@ -760,6 +762,75 @@ Sage: take the loan back before you replace it.
 `exact_blocks()` / `total_blocks()` report what the *previous* forward
 actually routed. Realized sparsity is a property of the clip rather than
 of `sol_tau`, so it is worth logging rather than predicting.
+
+#### `motion_cache` — whether a forward runs at all
+
+The tiers above make a forward cheaper. [**MotionCache**](https://github.com/MAC-AutoML/MotionCache)
+skips whole ones, so it composes with every one of them — and it lives
+in your **sampling loop**, not your transformer. `generate-video` sends
+it; `generate-image` does not.
+
+After a warm-up, each step predicts how far the model's output has moved
+since the last forward that ran: a gain measured between the last two
+computed forwards, times how far the input has moved since, over the
+output's size. Every change is weighted per latent position by how much
+the clip is moving there, read from frame-to-frame differences of the
+model's own clean estimate. While that prediction, summed over
+consecutive skips, stays under `motion_cache_threshold`, the step reuses
+the last forward's residual carried to the new input instead of running
+one. This is the step-level form the method's MiniMax-H3 adaptation
+takes; the method's own implementations also route individual tokens
+through a partial forward, which needs a gathered attention per family
+and is not offered here.
+
+The bookkeeping is shared; what only you can supply is **where your
+latent is**:
+
+```cpp
+#include "generative-models/shared/motion-cache.h"
+namespace mc = vpipe::genai::motion_cache;
+
+// Per generation. The window is a fraction of the sampling range, mapped
+// to sigma through YOUR shift -- only you know it.
+const mc::Config cfg = mc::config_from_flex(req.accel);
+mc::Cache cache;
+if (cache.begin(req.accel, mc::percent_to_sigma(cfg.start, shift),
+                mc::percent_to_sigma(cfg.end, shift),
+                /*x0_sign=*/+1.0f)) {   // +1: x0 = x + sigma * v
+  // Offsets into your flat GENERATED state: the latent subsampled every
+  // cache.subsample() rows and columns, in [C][T][H'][W'] order.
+  cache.set_video(gather.data(), C, T, H_sub * W_sub, video_elems);
+  cache.set_audio(agather.data(), agather.size(), audio_elems); // optional
+}
+
+// Per step, with the state the forward WOULD run on.
+if (cache.decide(sigma, x_video, x_audio)) {
+  cache.predict(x_video, v_video, x_audio, v_audio);  // no forward
+} else {
+  run_forward(/* -> v_video, v_audio */);
+  cache.update(sigma, x_video, v_video, x_audio, v_audio);
+}
+step_the_sampler(v_video, v_audio);
+```
+
+Three things decide whether it does what it says:
+
+- **The gather is in LATENT coordinates, not tokens.** The estimate reads
+  every Nth latent row and column and differences whole frames, so a
+  patch-packed state has to be mapped back through its packing — which
+  is why this is yours to build. `motion_cache_gathers()` in
+  `generative-models/minimax-h3/minimax-h3-denoise.h` is a worked
+  example for 2 × 2 patches.
+- **Generated rows only.** Conditioning rows that are never stepped would
+  sit in every mean as zero change and dilute the score.
+- **The velocity sign.** `x0_sign` is +1 when `x0 = x + sigma * v` and -1
+  when `x0 = x - sigma * v`. The motion estimate and the reused residual
+  both depend on it; a wrong sign still runs and still skips steps.
+
+`calls()` / `skipped()` are what to log: a threshold that never triggers
+and a cache that was never consulted read the same on a wall clock. The
+class holds one pointer and is configured from the bag, so holding one
+costs your binary nothing when its settings grow.
 
 ## Extension point 4a — image families
 

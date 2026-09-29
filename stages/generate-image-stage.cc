@@ -235,28 +235,28 @@ const ConfigKey kAttrs[] = {
    .doc = "Sol-Attn routing threshold, in STANDARD DEVIATIONS of a query "
           "block's own proxy-score distribution -- which is what lets one "
           "number serve every head, layer and resolution where a fixed "
-          "block count would not. HIGHER keeps fewer blocks: quality falls "
-          "and speed rises, monotonically in both.\n"
-          "0.7 IS THE DEFAULT HERE, against 1.0 on generate-video, and the "
-          "difference is measured rather than cautious. MEASURED on "
-          "Krea-2 at 1024^2 (joint 4160 tokens, 65 routing blocks, 8 "
-          "routed layers), velocity rel-L2 against the dense attention: "
-          "0.0529 at tau <= 0.815 and 0.0680 at tau >= 0.82 -- a 29% step "
-          "inside 0.005 of a standard deviation, with flat plateaus on "
-          "both sides. 1.0 sits on the far side of that step, and the "
-          "image it produces is a visibly different sample rather than a "
-          "slightly softer one (PSNR 15.9 dB against dense, where tau 0.7 "
-          "gives 18.9 dB and two dense runs differ by 66.1 dB). 0.7 sits "
-          "mid-plateau, so it is not a knife edge: anything from 0.5 to "
-          "0.815 measures the same.\n"
-          "IT COSTS LITTLE OF THE SPEEDUP, which is why the step is worth "
-          "staying under: on the same box the denoise ran 143 s dense, "
-          "132 s at tau 0.7 and 133 s at tau 1.0 -- single samples with "
-          "~1.4% run-to-run drift, so read the two Sol arms as equal. "
-          "generate-video keeps 1.0 because its sequences are ~5x longer, "
-          "where the published profile's 1.0/1.25/1.5 was measured and "
-          "where the step above has not been re-measured",
-   .def_real = 0.7},
+          "block count would not. The threshold is mean + tau * sd, so "
+          "HIGHER keeps fewer blocks: quality falls and speed rises, "
+          "monotonically in both.\n"
+          "0 IS THE DEFAULT HERE, against 1.0 on generate-video, because "
+          "the higher value this stage used to ship was reported to show "
+          "artifacts on real image graphs. It is the most accurate point "
+          "that still routes.\n"
+          "TAU 0 IS NOT DENSE: the threshold sits at the mean, so every "
+          "below-average block is still dropped. It reduces artifacts "
+          "rather than removing them, and `sol_attn false` is the only "
+          "unapproximated setting.\n"
+          "WHAT ANY TAU CAN SAVE IS A PROPERTY OF THE RESOLUTION, not of "
+          "tau. Attention is O(seq^2) where the GEMMs are linear in it, "
+          "so Sol's share of a step -- and so the whole tier's value -- "
+          "grows with the picture: at ordinary image sizes there is "
+          "little to divide however tau is set, and it earns its keep at "
+          "the large ones. Raise tau toward 0.5-0.8 on a graph that "
+          "tolerates it, where the speed actually is.\n"
+          "generate-video keeps 1.0: its sequences are several times "
+          "longer, which is where its published profile was measured and "
+          "where this stage's report has not been re-checked",
+   .def_real = 0.0},
   {.key = "sol_dense_layers", .type = ConfigType::Int, .required = false,
    .doc = "leading transformer blocks left DENSE, untouched by Sol-Attn. "
           "The first blocks are where the residual stream is least "
@@ -5003,6 +5003,19 @@ GenerateImageStage::process(RuntimeContext& ctx)
           "GenerateImageStage('{}'): scheduler = {} ({} steps, shift {} {})",
           this->id(), _scheduler_spec.type, _scheduler_spec.steps,
           _scheduler_spec.shift, _scheduler_spec.shift_type));
+      // A wired scheduler OWNS the step count: its spec replaces this
+      // stage's wholesale, `steps` included. When the graph also named a
+      // count here and the two disagree, only one of them runs, and the
+      // one in plain sight on this stage is the one that does not -- so
+      // say which.
+      if (_steps_set && _scheduler_spec.steps > 0 &&
+          _scheduler_spec.steps != _steps) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): steps {} is IGNORED -- the wired "
+            "scheduler runs {} steps and owns the count. Set it on the "
+            "scheduler-select stage, or make the two agree",
+            this->id(), _steps, _scheduler_spec.steps));
+      }
     }
   }
 

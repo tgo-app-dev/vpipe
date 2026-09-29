@@ -18,6 +18,7 @@
 // typed field back.
 
 #include "generative-models/shared/accel-settings.h"
+#include "generative-models/shared/motion-cache.h"
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/video-model-registry.h"
@@ -259,15 +260,21 @@ TEST(accel_settings, an_image_graph_that_asked_for_nothing_gets_defaults)
   //
   // The absent-bag reader falls back to sol::Config's own default, which
   // is the value generate-video and every out-of-tree family still take.
-  // generate-image SETTLES a lower one, because Krea-2 at image
-  // sequence lengths crosses a measured error step above ~0.82 (see the
-  // `sol_tau` key's doc). So "asked for nothing" is not the same as "no
-  // bag at all" for this field, and a stage-settled value reaching the
-  // family is the whole point of writing the bag rather than leaving it
-  // empty. Do not restore the equality: it would only pass again by
-  // making one of the two defaults wrong.
+  // generate-image SETTLES a lower one -- 0, the most accurate point
+  // that still routes -- because 0.7 was reported to show artifacts on
+  // real image graphs (the numbers are in the test below; the key's own
+  // doc deliberately carries none, being config documentation a perf
+  // figure would go stale in). So "asked for
+  // nothing" is not the same as "no bag at all" for this field, and a
+  // stage-settled value reaching the family is the whole point of
+  // writing the bag rather than leaving it empty. THE ZERO IS ALSO WHY
+  // the bag is written rather than left sparse: accel::real() falls
+  // back on a key's ABSENCE, so a settled 0 that went unwritten would
+  // reach the family as 1.0 -- the opposite end of the axis. Do not
+  // restore the equality: it would only pass again by making one of the
+  // two defaults wrong.
   EXPECT_TRUE(from_null.tau == 1.0f);
-  EXPECT_TRUE(from_bag.tau == 0.7f);
+  EXPECT_TRUE(from_bag.tau == 0.0f);
   // The stage's own view agrees with the bag it wrote.
   EXPECT_TRUE(st.sol_config().dense_layers == from_bag.dense_layers);
   EXPECT_TRUE(st.sol_config().tau == from_bag.tau);
@@ -277,13 +284,27 @@ TEST(accel_settings, an_image_graph_that_asked_for_nothing_gets_defaults)
 // either of them until a change to one surfaced as an unrelated
 // equality failure in the test above.
 //
-// They differ deliberately: generate-image ships 0.7 and generate-video
-// ships 1.0. MEASURED on Krea-2 at 1024^2 -- velocity rel-L2 against
-// dense is 0.0529 at tau <= 0.815 and 0.0680 at tau >= 0.82, a 29% step
-// inside 0.005 of a standard deviation -- so an image graph's default
-// sits mid-plateau below the step. Video sequences are ~5x longer, the
-// published profile was measured there at 1.0/1.25/1.5, and the step
-// has NOT been re-measured at that length, so video keeps 1.0.
+// They differ deliberately: generate-image ships 0 and generate-video
+// ships 1.0. The image default was 0.7 -- mid-plateau below a measured
+// error step (rel-L2 0.0529 at tau <= 0.815 against 0.0680 at tau >=
+// 0.82 on Krea-2 at 1024^2) -- and moved to 0 because 0.7 was reported
+// to show artifacts in practice. The two readings agree: that same
+// measurement put tau 0.7 at 18.9 dB PSNR against dense where two dense
+// runs differ by 66.1 dB, so it was established as STABLE, never as
+// faithful. Video sequences are ~5x longer, the published profile was
+// measured there at 1.0/1.25/1.5, and neither the step nor the artifact
+// report has been re-checked at that length, so video keeps 1.0.
+//
+// AND THE ZERO COSTS LITTLE WHERE THE TIER PAYS, which is what makes it
+// affordable as a default. MEASURED on Krea-2 at 2048^2 on an M5 Pro,
+// per DiT step: 21+ s dense, 18 s at tau 0, 17 s at tau 0.7 -- so tau 0
+// takes three quarters of the available saving. At 1024^2 the whole
+// tier was ~8% (143 s dense against 132 s at 0.7), i.e. inside a
+// fanless box's own drift. Attention is O(seq^2) where the GEMMs are
+// linear, so Sol is a HIGH-RESOLUTION tier and a share measured at
+// 1024^2 says nothing about 2048^2. These numbers live here and not in
+// the key's doc: that doc is config documentation, where a perf figure
+// goes stale without anyone noticing.
 //
 // If one of these moves, this test should fail rather than the
 // divergence being discovered somewhere else.
@@ -296,10 +317,78 @@ TEST(accel_settings, the_two_stages_ship_different_default_tau)
                          FlexData::make_object());
   EXPECT_TRUE(img.config_error().empty());
   EXPECT_TRUE(vid.config_error().empty());
-  EXPECT_TRUE(img.sol_config().tau == 0.7f);
+  EXPECT_TRUE(img.sol_config().tau == 0.0f);
   EXPECT_TRUE(vid.sol_config().tau == 1.0f);
   // Whatever each stage settled is what its bag carries, so a family
   // reading the bag cannot see a different number from the log line.
-  EXPECT_TRUE(sol::config_from_flex(&img.accel_settings()).tau == 0.7f);
+  EXPECT_TRUE(sol::config_from_flex(&img.accel_settings()).tau ==
+              0.0f);
   EXPECT_TRUE(sol::config_from_flex(&vid.accel_settings()).tau == 1.0f);
+}
+
+// MotionCache off generate-video: what the graph said, SETTLED, in the
+// bag -- and a value that would make the estimate meaningless falls back
+// to the shipped one rather than reaching a family as said.
+TEST(accel_settings, the_video_stage_settles_motion_cache)
+{
+  namespace mc = vpipe::genai::motion_cache;
+  Session sess;
+  {
+    FlexData cfg = FlexData::make_object();
+    auto o = cfg.as_object();
+    o.insert_or_assign("motion_cache", FlexData::make_bool(true));
+    o.insert_or_assign("motion_cache_threshold", FlexData::make_real(0.2));
+    o.insert_or_assign("motion_cache_strength", FlexData::make_real(0.5));
+    o.insert_or_assign("motion_cache_warmup", FlexData::make_int(3));
+    o.insert_or_assign("motion_cache_max_skips", FlexData::make_int(1));
+    o.insert_or_assign("motion_cache_start", FlexData::make_real(0.2));
+    o.insert_or_assign("motion_cache_end", FlexData::make_real(0.9));
+    o.insert_or_assign("motion_cache_subsample", FlexData::make_int(4));
+    GenerateVideoStage st(&sess, "gv", std::vector<InEdge>{}, cfg);
+    EXPECT_TRUE(st.config_error().empty());
+    const FlexData& bag = st.accel_settings();
+    const mc::Config c = mc::config_from_flex(&bag);
+    EXPECT_TRUE(c.enabled && c.threshold == 0.2 &&
+                c.motion_strength == 0.5 && c.warmup_steps == 3 &&
+                c.max_skips == 1 && c.start == 0.2 && c.end == 0.9 &&
+                c.subsample == 4);
+    const auto on = accel::tiers_on(&bag);
+    EXPECT_TRUE(on.size() == 1 && on[0] == accel::kMotionCache);
+  }
+  {
+    FlexData cfg = FlexData::make_object();
+    auto o = cfg.as_object();
+    o.insert_or_assign("motion_cache", FlexData::make_bool(true));
+    o.insert_or_assign("motion_cache_threshold", FlexData::make_real(-1));
+    o.insert_or_assign("motion_cache_strength", FlexData::make_real(-2));
+    o.insert_or_assign("motion_cache_warmup", FlexData::make_int(-1));
+    o.insert_or_assign("motion_cache_max_skips", FlexData::make_int(0));
+    // An inverted window is empty, not merely narrow.
+    o.insert_or_assign("motion_cache_start", FlexData::make_real(0.9));
+    o.insert_or_assign("motion_cache_end", FlexData::make_real(0.2));
+    o.insert_or_assign("motion_cache_subsample", FlexData::make_int(0));
+    GenerateVideoStage st(&sess, "gv", std::vector<InEdge>{}, cfg);
+    EXPECT_TRUE(st.config_error().empty());
+    const FlexData& bag = st.accel_settings();
+    const mc::Config c = mc::config_from_flex(&bag);
+    const mc::Config d;
+    EXPECT_TRUE(c.enabled);
+    EXPECT_TRUE(c.threshold == d.threshold);
+    EXPECT_TRUE(c.motion_strength == d.motion_strength);
+    EXPECT_TRUE(c.warmup_steps == d.warmup_steps);
+    EXPECT_TRUE(c.max_skips == 1);
+    EXPECT_TRUE(c.start == d.start && c.end == d.end);
+    EXPECT_TRUE(c.subsample == d.subsample);
+  }
+  {
+    // Nothing asked: off, at the shipped values.
+    GenerateVideoStage st(&sess, "gv", std::vector<InEdge>{},
+                          FlexData::make_object());
+    const FlexData& bag = st.accel_settings();
+    const mc::Config c = mc::config_from_flex(&bag);
+    const mc::Config d;
+    EXPECT_TRUE(!c.enabled && c.threshold == d.threshold &&
+                c.warmup_steps == d.warmup_steps && c.end == d.end);
+    EXPECT_TRUE(accel::tiers_on(&bag).empty());
+  }
 }

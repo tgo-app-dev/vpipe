@@ -26,7 +26,9 @@ arrives in **8–16 steps** instead of 30+.
   - [Then run the pipeline](#then-run-the-pipeline)
 - [Step 2 — text to video and audio](#step-2--text-to-video-and-audio)
   - [The settings worth knowing](#the-settings-worth-knowing)
+    - [Counting steps](#counting-steps)
   - [How long it takes](#how-long-it-takes)
+    - [Against h3.c](#against-h3c)
   - [Watching it form — live previews](#watching-it-form--live-previews)
   - [More than text in](#more-than-text-in)
   - [Conditioning on references (Ref2VA)](#conditioning-on-references-ref2va)
@@ -65,6 +67,9 @@ arrives in **8–16 steps** instead of 30+.
     - [What it saves](#what-it-saves-1)
     - [Against the VDN branch](#against-the-vdn-branch)
     - [The knobs](#the-knobs)
+  - [Fewer forwards — MotionCache](#fewer-forwards--motioncache)
+    - [What it saves](#what-it-saves-2)
+    - [Its knobs](#its-knobs)
   - [The Neural Engine — for M4-family Macs](#the-neural-engine--for-m4-family-macs)
     - [What it saves on an M4](#what-it-saves-on-an-m4)
     - [How it behaves](#how-it-behaves)
@@ -168,7 +173,7 @@ you want to see the model work before spending the hours and the 115 GB.
   — a **40-second** clip in four runs: FL2VA text-to-video, then three Ref2VA
   continuations, each carrying on from the last 3.75 s of the part before it
   (see [Longer clips](#longer-clips--one-story-in-four-parts)). Runs both
-  partitions of the **released** weights at 21 steps, with no Turbo adapter,
+  partitions of the **released** weights at 20 steps, with no Turbo adapter,
   and writes each part **lossless** — FFV1 video at 4:4:4, ALAC sound — so
   every continuation reads back exactly what the part before it made.
 - **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
@@ -338,12 +343,13 @@ From the `generate-video` stage:
 | `width` / `height` | 960 × 544 | **Rounded up** to the nearest multiple of **32** — the video VAE's 16× spatial stride times the DiT's 2× patch. A multiple of 16 is not enough: 1360 is one, and its latent is an odd 85 that the packer cannot patch. The stage logs the change. |
 | `frames` | 120 | **Rounded up** to the nearest count the VAE can chunk — 5, 22, 39, 56, 73, 90, 107, **124**, … So 120 becomes 124. The stage logs the change. |
 | `fps` | 24 | 124 frames ≈ 5.2 s; 56 ≈ 2.3 s. |
-| `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
+| `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. One step is one forward of the model, counted the way ComfyUI and diffusers count them — see [Counting steps](#counting-steps). Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `i8_gemm` | `true` | An opt-in **lossy** accelerated mode, on in every shipped pipeline here. Only matrix-core GPUs (M5 and newer) can use it, so it does nothing on an M4 — and on an M5 turning it off is slower. It changes the picture slightly, so turn it off when you are judging output rather than speed. |
 | `sage_attn` | `false` | An opt-in **lossy** accelerated mode, independent of both `i8_gemm` and `sol_attn` and settable with either — it runs the attention's QK^T product in int8 with a per-block scale, where `sol_attn` decides which blocks are attended at all. 1.20× on the attention at video geometry, at the same cosine the f16 kernel scores. Matrix cores only. See [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk). |
 | `ane_ffn` / `ane_qkv` | `false` | Opt-in **lossy** modes that run part of every block on the **Apple Neural Engine** beside the GPU. Worth it on an **M4-family** Mac, normally not on an M5. See [The Neural Engine](#the-neural-engine--for-m4-family-macs). |
 | `sol_attn` | `false` | Another opt-in **lossy** accelerated mode, and an independent one — it changes how the attention between the GEMMs is computed where `i8_gemm` changes the GEMMs. 1.27× on the wall clock at 124 frames of 832 × 480, with no extra weights; see [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing) for the knobs beside it. |
+| `motion_cache` | `false` | An opt-in **lossy** mode of a different kind: it skips whole denoising steps whose answer the last one already predicts, so it composes with every setting above. It pays on long schedules — 1.32× on the denoise at `steps: 20` — and has little to skip on an 8-step draft or a Turbo run. See [Fewer forwards — MotionCache](#fewer-forwards--motioncache). |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
 And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
@@ -368,10 +374,35 @@ distilled model has no unconditional pass to guide against. Wan's guidance
 and expert boundary live in `wan2-model-config` for the same reason — each
 family carries its own.
 
+#### Counting steps
+
+**`steps` is the number of times the model runs**, which is how ComfyUI's
+`steps` and diffusers' `num_inference_steps` count: `steps: 8` is eight
+forwards over the nine sigmas of `linspace(1, 0, 9)`, shifted, the last of
+them the clean end point.
+
+MiniMax's own reference scheduler counts the other way. Its
+`num_inference_steps` is the number of points on that grid, end point
+included, so the same number there runs **one forward fewer**. vpipe
+follows ComfyUI and diffusers rather than the reference for two reasons:
+
+- **A step count travels.** It gets copied out of ComfyUI workflows,
+  model cards and other people's settings, and every one of those means
+  forwards. Read the reference's way, each one lands a step short: 20
+  steps copied from a ComfyUI graph would run 19.
+- **The Turbo adapters are named for it.** A "4-step" or "8-step"
+  distillation is fit to that many forwards on that many intervals of the
+  grid. One forward fewer is a different grid, and nothing reports it.
+
+What the reference-style count would have given is still one number away:
+`steps: N` here is `num_inference_steps: N + 1` there, and the schedules
+are then identical.
+
 ### How long it takes
 
-Measured on the 8-bit model at 960 × 544 (0.5 MP) and 24 fps, 6 steps with
-the [Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time, on the
+Measured on the 8-bit model at 960 × 544 (0.5 MP) and 24 fps, 5 steps with
+the [Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time (the
+shipped Turbo graph runs 6, one forward more), on the
 smallest machine that runs this at all — a **fanless MacBook Air 15-inch
 (M5)**, 10-core CPU / 10-core GPU, 16 GB — and on a **MacBook Pro 16-inch
 (M5 Pro)**, 24 GB:
@@ -429,6 +460,58 @@ column as a figure you can reproduce.
 > **1620 MHz — the maximum — at 100% for the whole run.** That is **1.25×**
 > the Air's sustained clock before any difference in core count, so clock
 > alone accounts for part of the 2.3–2.8× gap and not for most of it.
+
+<a id="against-h3c"></a>
+#### Against h3.c
+
+The same clip, run against [h3.c](https://github.com/antirez/h3.c) with
+nothing that either runtime can do and the other cannot: the published
+**bf16** weights (the MiniMaxAI snapshot, which is the layout h3.c reads)
+from the internal SSD, **no LoRA and no quantization pass**, 960 × 544,
+124 frames, **6 DiT steps**, the same prompt and seed. h3.c runs its exact
+mode — all 50 blocks, no step reuse — so VPIPE runs without
+[MotionCache](#fewer-forwards--motioncache) too. Each VPIPE run turns on
+what its chip has: `ane_ffn` + `ane_qkv` on the M4 Pro, which has no int8
+matrix path, and `i8_gemm` on the M5 machines, where the
+[Neural Engine does not pay](#the-neural-engine--for-m4-family-macs).
+Wall clock, from launch to the written file:
+
+| | M4 Pro Mac mini, 64 GB | | M5 Pro MacBook Pro 16", 24 GB | |
+|---|---|---|---|---|
+| | **VPIPE** | h3.c | **VPIPE** | h3.c |
+| text encoder + DiT setup | 30 s | 28 s | 20 s | 12 s |
+| denoise, 6 steps | **14 min 27 s** | 19 min 59 s | **4 min 25 s** | 5 min 0 s |
+| VAE decode, video + audio | 2 min 46 s | 2 min 41 s | **43 s** | 1 min 59 s |
+| **total** | **17 min 43 s** | 23 min 9 s | **5 min 29 s** | 7 min 11 s |
+| peak memory | 46.0 GB | 45.2 GB | 18.2 GB | 11.6 GB |
+
+**On the M4 Pro the gain is the denoise, 1.38×, and it is the Neural
+Engine's.** The two tiers take about half of each block's feed-forward and
+q|k|v rows off the GPU. `ane_ffn` alone measured 16 min 3 s on the same
+denoise (19 min 23 s in total); adding `ane_qkv` is the rest. Setup and the
+VAE decode are a wash.
+
+**On the M5 Pro most of it is the decode.** The denoise is 1.13× faster; the
+video VAE decode is 2.8× faster, on the matrix-core convolution. h3.c's
+footprint is the smaller one here because on 24 GB it needs
+`--ssd-streaming`, which reads every block every step — and which runs
+**bf16**: its int8 engines need the whole transformer resident, so on this
+machine they are off. VPIPE streams too, and keeps the blocks it has room
+for (14 of 50 on this run).
+
+**On the fanless M5 MacBook Air 15", 16 GB**, on an ice pack, the same run
+takes **13 min 7 s** against h3.c's 16 min 22 s — **1.25×** end to end, with
+`i8_gemm` as on the M5 Pro and h3.c again on `--ssd-streaming`. Only the
+whole-run times were taken there, and it is the row whose number depends
+on how it is cooled (see the ice-pack note above).
+
+Across the three, VPIPE's times line up as **17 min 43 s** (M4 Pro),
+**13 min 7 s** (M5 Air) and **5 min 29 s** (M5 Pro): the fanless Air finishes
+**1.35×** faster than the fan-cooled M4 Pro on a quarter of its memory, and
+the M5 Pro is **2.4×** the Air — **3.2×** the M4 Pro.
+
+h3.c's M4 figure repeats: run first or second, its denoise landed within
+0.6%.
 
 ### Watching it form — live previews
 
@@ -823,7 +906,8 @@ what you get by resampling the clip to 960 × 544 in `size-clip`; setting
 `reference_video_short_edge` on the encoder would change nothing. The same
 goes for `reference_image_short_edge` and the still.
 
-As shipped — 960 × 544, 39 frames, 8 steps, one still and one clip — that is
+At the shipped 960 × 544 and 39 frames, one still and one clip, but 7 steps
+where the graph asks for 8, that is
 **23 min 54 s** on the fanless 16 GB M5 (the `references` list, same geometry,
 measured 23 min 07 s: the ports chain resizes every decoded frame and the list
 resizes only the ones it keeps). Around a third of it happens before
@@ -1125,14 +1209,14 @@ rather than by the prompt alone:
 Every continuation is the same graph with a different prompt and a different
 file to read, so a fifth is a copy of the fourth.
 
-**The shipped graphs run the released weights at 21 steps, with no
+**The shipped graphs run the released weights at 20 steps, with no
 adapter.** Every part names the publisher's own checkpoint (see
 [The released weights, either partition](#the-released-weights-either-partition)):
 
 | | checkpoint | steps | shifts |
 |---|---|---|---|
-| part 1 | `MiniMaxAI/MiniMax-H3-FL2VA` | 21 | 12 / 3 |
-| parts 2–4 | `MiniMaxAI/MiniMax-H3-Ref2VA` | 21 | 12 / 3 |
+| part 1 | `MiniMaxAI/MiniMax-H3-FL2VA` | 20 | 12 / 3 |
+| parts 2–4 | `MiniMaxAI/MiniMax-H3-Ref2VA` | 20 | 12 / 3 |
 
 That is a choice for quality over time, and a chain is where it pays. A
 Turbo adapter buys its step count with some of what the base model knows
@@ -1594,7 +1678,7 @@ the adapter replaces the step count, not the checkpoint. Everything else in
 the graph is untouched, which is the point: applying a LoRA is a config edit
 on one stage, not a different pipeline.
 
-**What it costs.** 960 × 544 · 24 fps · **124 frames** (5.17 s) · 6 steps,
+**What it costs.** 960 × 544 · 24 fps · **124 frames** (5.17 s) · 5 steps,
 end to end from `vpipe --launch` to the muxed mp4. The pipeline asks for 120
 and the stage rounds **up to 124** — the video VAE takes 17-frame clips and
 keeps 5 latents from each, so only 17n+5 has a latent form, and it says so in
@@ -1972,8 +2056,8 @@ Measured on an M4 Pro (64 GB) with the 8-bit FL2VA checkpoint preloaded, at
 
 | | forwards | per forward | denoise |
 |---|---:|---:|---:|
-| base, `steps: 8` | 7 | 27.7 s | 194 s |
-| base, `steps: 16` (good quality) | 15 | 27.7 s | ~415 s |
+| base, `steps: 7` | 7 | 27.7 s | 194 s |
+| base, `steps: 15` (good quality) | 15 | 27.7 s | ~415 s |
 | **HyperFlow** | **8** | **30.2 s** | **241 s** |
 
 The adapter makes each forward **9% slower**. What it buys is the step
@@ -2139,7 +2223,7 @@ run starts.
 #### What it saves
 
 The same 124-frame clip as [How long it takes](#how-long-it-takes), on the
-**M5 Pro, 24 GB**, 6 steps with the Turbo LoRA:
+**M5 Pro, 24 GB**, 5 steps with the Turbo LoRA:
 
 | | 124 frames, 5.2 s |
 |---|---|
@@ -2260,7 +2344,7 @@ video, and a prompt summarised by its centroid is a prompt half-read.
 
 #### What it saves
 
-124 frames at **832 × 480**, 24 fps, 6 steps with the
+124 frames at **832 × 480**, 24 fps, 5 steps with the
 [Turbo LoRA](#fewer-steps--the-turbo-lora) and `i8_gemm`, on a **MacBook
 Pro 16-inch (M5 Pro), 24 GB**:
 
@@ -2324,6 +2408,92 @@ switching Sol on does not amplify what `i8_gemm` costs.
 > committing a long job to it, and raise `sol_tau` only against output you
 > have looked at.
 
+### Fewer forwards — MotionCache
+
+Every setting above makes a step cheaper. [**MotionCache**](https://github.com/MAC-AutoML/MotionCache)
+skips some steps outright. Like Sol it is training-free — nothing to
+download, nothing partition-specific — and it is one flag on
+`generate-video`:
+
+```json
+"motion_cache": true
+```
+
+**What it does.** Past the first few steps, consecutive denoising steps ask
+the model nearly the same question and get nearly the same answer. So
+before each forward, MotionCache predicts how far the model's output has
+moved since the last forward that actually ran — a gain measured between
+the last two real forwards, times how far the latent has moved since. If
+that is small, the step reuses the last forward's residual, carried to the
+new latent, instead of running the 33B stack; the step itself still
+happens, so the schedule is unchanged.
+
+**The prediction is weighted by motion.** Every latent position counts in
+proportion to how much the clip is moving there, read from the model's own
+clean estimate frame to frame. A drift over a still background is cheap; the
+same drift on a moving hand is not. The predictions **add up** across
+consecutive skips, and at most two steps are skipped in a row, so a reused
+answer is never far from a real one.
+
+This is the step-level form that the [MiniMax H3 MotionCache node for
+ComfyUI](https://github.com/starsFriday/ComfyUI-MiniMax-H3-MotionCache)
+takes, with the same defaults, and vpipe's decisions are tested against that
+node's own code step for step. The method's token-level variant, which
+recomputes only the moving tokens, is not implemented.
+
+#### What it saves
+
+The shipped prompt, 39 frames at 512 × 288, `steps: 20`, no Turbo LoRA,
+seed 6, on a **MacBook Pro M4 Pro, 64 GB**:
+
+| | forwards | denoise | whole run | video vs off | audio vs off |
+|---|---|---|---|---|---|
+| off | 20 | 249 s | 6 min 3 s | — | — |
+| `motion_cache: true` (threshold 0.15) | **15** | **189 s** | **4 min 58 s** | 30.8 dB mean PSNR, 27.5 worst frame | 14.2 dB SNR |
+
+A skipped step costs a few milliseconds of host work against 12.7 s for a
+forward, so the denoise saving is simply the share of forwards skipped.
+
+**Where it skips.** Not early: the predicted change starts near 0.4 a step
+and only falls under the threshold around the middle of the schedule. On
+the run above the first reuse was step 10, and from there it alternated —
+reuse, forward, reuse — until the last two steps, which ran. That is also
+why **a short schedule has little to give**: warm-up takes the first four
+steps, and on a schedule of eight each remaining step moves the latent far
+enough to keep the prediction high. Reach for it at 16 steps and up.
+
+**The threshold moves in jumps.** Raising it to 0.2 changed nothing on this
+clip: the scores nearest the line were 0.204 and 0.218, both still over it,
+so the same five steps were skipped. What a threshold buys depends on where
+a clip's scores happen to fall, and the per-step trace
+(`VPIPE_H3_DENOISE_PROFILE=1`) prints each one.
+
+**What the difference looks like.** The two clips are the same shot —
+same framing, same performance — with small shifts in pose and hand
+position where the reused steps nudged the trajectory. The soundtrack moves
+more than the picture (14 dB SNR): the sound is the same, the waveform is
+not, so listen before trusting a long job to it.
+
+#### Its knobs
+
+| key | shipped | notes |
+|---|---|---|
+| `motion_cache` | `false` | Off. It is an approximation; faces, hands, fast motion and lip sync are where it shows first. |
+| `motion_cache_threshold` | `0.15` | How much predicted change the reused steps may add up to. **Higher skips more.** The ComfyUI node's example workflow uses 0.2. |
+| `motion_cache_strength` | `1.0` | How much motion weighs. 0 treats every position alike. |
+| `motion_cache_warmup` | `4` | Leading steps always run. The first two run regardless — the prediction needs two real forwards to measure from. |
+| `motion_cache_max_skips` | `2` | Most steps reused in a row. |
+| `motion_cache_start` / `motion_cache_end` | `0.15` / `0.95` | The window it is consulted in, as fractions of the schedule from noise (0) to clean (1). Steps outside it always run. |
+| `motion_cache_subsample` | `8` | The stride of the samples the decision is made from. A reused step still reuses every value. |
+
+It composes with everything above — Sol, Sage, `i8_gemm`, the Neural
+Engine and the LoRAs all make a forward cheaper, and this runs fewer of
+them. The log says what it did once per clip:
+
+```
+h3-denoise: motion_cache reused 5 of 20 steps -- 15 forwards ran, 1.33x fewer
+```
+
 ### The Neural Engine — for M4-family Macs
 
 Every Apple Silicon Mac has a second accelerator beside the GPU, the
@@ -2349,7 +2519,7 @@ ANE is roughly as quick as before, so there is much less for it to take back.
 Both engines also read the same memory, so the GPU's own rate falls while the
 ANE is predicting. What is left is a few percent, and it depends on the
 geometry: MEASURED on the 24 GB M5 Pro at 960 × 544, 243 frames, Sol and
-Sage on, 4 steps, the tier armed and took the denoise **203 s → 189 s
+Sage on, 3 steps, the tier armed and took the denoise **203 s → 189 s
 (1.07×)**.
 
 The case where it could pay on an M5 is the one where the feed-forward and
@@ -2380,7 +2550,7 @@ computes a row.
 #### What it saves on an M4
 
 MEASURED on a **MacBook Pro (M4 Pro), 64 GB**, 8-bit, 960 × 544, 124
-frames, 4 steps, dense attention:
+frames, 3 steps, dense attention:
 
 | | denoise | wall clock |
 |---|---|---|

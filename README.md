@@ -41,7 +41,7 @@ preview panels, profiler, and reproducible model configuration.*
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
   ([简体中文](docs/MINIMAX-H3-zh-cn.md))
 
-  * 5s @ 0.5 MP 24p, 6 steps takes **~11 minutes** on a fanless
+  * 5s @ 0.5 MP 24p, 6 steps takes **~13 minutes** on a fanless
     15-inch **base-model** M5 MacBook Air, 16 GB [^1]
 
 - Runs **LTX-2.5** on an Apple Silicon Mac — a 22B model generating video
@@ -83,16 +83,26 @@ preview panels, profiler, and reproducible model configuration.*
 
 ## Flagship workloads / performance
 
-### MiniMax H3 Turbo LoRA — matched runs
+### MiniMax H3 — matched runs against h3.c
 
 Matched MiniMax H3 runs using the same **960 × 544, 124-frame, 6-DiT-step**
-workload and settings for both runtimes:
+workload for both runtimes: the published bf16 weights read from the
+internal SSD, no LoRA and no quantization pass, the same prompt and seed.
+h3.c runs its exact mode (all 50 blocks, no step reuse). VPIPE turns on the
+acceleration each chip has — the Neural Engine tiers (`ane_ffn` +
+`ane_qkv`) on the M4 Pro, which has no int8 matrix path, and `i8_gemm` on
+the two M5 machines, where the Neural Engine does not pay:
 
 | Hardware | VPIPE | h3.c |
 | --- | ---: | ---: |
-| M4 Pro Mac mini, 64 GB RAM | **21 min 44 sec** | 27 min 40 sec |
-| Base M5 MacBook Air 15", 16 GB RAM | **11 min 25 sec** | 16 min 22 sec |
-| M5 Pro MacBook Pro 16", 24 GB RAM | **5 min 0 sec** | 7 min 19 sec |
+| M4 Pro Mac mini, 64 GB RAM | **17 min 43 sec** | 23 min 9 sec |
+| Base M5 MacBook Air 15", 16 GB RAM | **13 min 7 sec** | 16 min 22 sec |
+| M5 Pro MacBook Pro 16", 24 GB RAM | **5 min 29 sec** | 7 min 11 sec |
+
+On the 16 GB and 24 GB M5 machines, h3.c needs `--ssd-streaming`, which
+runs bf16 — its int8 engines need the whole transformer resident. The
+phase-by-phase breakdown is in
+[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md#against-h3c).
 
 **Cooling is part of what these rows measure.** The fanless MacBook Air was
 run on an ice pack: it holds its full 1578 MHz for about two minutes, then

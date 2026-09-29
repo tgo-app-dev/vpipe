@@ -1,5 +1,6 @@
 #include "apps/web-ui/system-status.h"
 
+#include "common/soc-activity.h"
 #include "common/soc-energy-channel.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -10,12 +11,14 @@
 #include <mach/mach_host.h>
 #include <sys/sysctl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------
 // IOReport (private framework). On modern macOS this framework lives
@@ -51,6 +54,15 @@ using ChannelGetChannelName_t = CFStringRef (*)(CFDictionaryRef);
 using ChannelGetUnitLabel_t   = CFStringRef (*)(CFDictionaryRef);
 using SimpleGetIntegerValue_t =
     std::int64_t (*)(CFDictionaryRef, int idx);
+using MergeChannels_t = void (*)(
+    CFMutableDictionaryRef a, CFDictionaryRef b, CFTypeRef c);
+using ChannelGetFormat_t     = int (*)(CFDictionaryRef);
+using StateGetCount_t        = int (*)(CFDictionaryRef);
+using StateGetNameForIndex_t = CFStringRef (*)(CFDictionaryRef, int);
+using StateGetResidency_t    = std::int64_t (*)(CFDictionaryRef, int);
+
+// IOReportChannelGetFormat's value for a state (residency) channel.
+constexpr int kFormatState = 2;
 
 struct Api {
   bool ok = false;
@@ -62,6 +74,16 @@ struct Api {
   ChannelGetChannelName_t  channel_get_channel_name  = nullptr;
   ChannelGetUnitLabel_t    channel_get_unit_label    = nullptr;
   SimpleGetIntegerValue_t  simple_get_integer_value  = nullptr;
+  // The power-manager (PMP) state channels -- see common/soc-activity.h.
+  // Optional: without them the meter falls back to energy alone, which
+  // is what it was before.
+  bool states_ok = false;
+  MergeChannels_t          merge_channels            = nullptr;
+  ChannelGetGroup_t        channel_get_subgroup      = nullptr;
+  ChannelGetFormat_t       channel_get_format        = nullptr;
+  StateGetCount_t          state_get_count           = nullptr;
+  StateGetNameForIndex_t   state_get_name_for_index  = nullptr;
+  StateGetResidency_t      state_get_residency       = nullptr;
 };
 
 const Api& resolve() {
@@ -111,6 +133,21 @@ const Api& resolve() {
          && r.create_samples         && r.create_samples_delta
          && r.channel_get_group      && r.channel_get_channel_name
          && r.channel_get_unit_label && r.simple_get_integer_value;
+    r.merge_channels = reinterpret_cast<MergeChannels_t>(
+        S("IOReportMergeChannels"));
+    r.channel_get_subgroup = reinterpret_cast<ChannelGetGroup_t>(
+        S("IOReportChannelGetSubGroup"));
+    r.channel_get_format = reinterpret_cast<ChannelGetFormat_t>(
+        S("IOReportChannelGetFormat"));
+    r.state_get_count = reinterpret_cast<StateGetCount_t>(
+        S("IOReportStateGetCount"));
+    r.state_get_name_for_index = reinterpret_cast<StateGetNameForIndex_t>(
+        S("IOReportStateGetNameForIndex"));
+    r.state_get_residency = reinterpret_cast<StateGetResidency_t>(
+        S("IOReportStateGetResidency"));
+    r.states_ok = r.ok && r.merge_channels && r.channel_get_subgroup
+               && r.channel_get_format && r.state_get_count
+               && r.state_get_name_for_index && r.state_get_residency;
     // Intentionally never dlclose: the function pointers are kept
     // for the life of the process.
     return r;
@@ -387,6 +424,45 @@ struct SystemStatusPoller::Impl {
   // times the number of ANE channels the sample actually carried.
   double                                      ane_max_w = 8.0;
 
+  // Whether the ANE's OWN energy channels are live -- see SocEnergyGate.
+  // Per source on purpose: on macOS 27 a busy GPU keeps "GPU Energy"
+  // moving while ANE0 is stale, so the group moving vouches for nothing.
+  SocEnergyGate                               ane_gate;
+
+  // Add the ANE's power-manager channels to `desired`: the fabric floor
+  // its links hold ("SOC Floor") and its bandwidth histograms ("AF BW").
+  // The group is "PMP" on some releases and "PMP<n>" on others (the
+  // same tile-index rename as the Energy Model blocks), so every
+  // spelling is asked for and whatever exists is merged in. Only these
+  // two subgroups, never the whole group: PMP carries some 600 channels.
+  void add_pmp_channels_(const ioreport::Api& api) {
+    if (!api.states_ok) { return; }
+    static const char* const kGroups[]    = {"PMP", "PMP0", "PMP1",
+                                             "PMP2", "PMP3"};
+    static const CFStringRef kSubgroups[] = {CFSTR("SOC Floor"),
+                                             CFSTR("AF BW")};
+    for (const char* g : kGroups) {
+      CFStringRef group = CFStringCreateWithCString(
+          nullptr, g, kCFStringEncodingUTF8);
+      for (CFStringRef sg : kSubgroups) {
+        CFMutableDictionaryRef c =
+            api.copy_channels_in_group(group, sg, 0, 0, 0);
+        if (!c) { continue; }
+        const void* arr = CFDictionaryGetValue(c, CFSTR("IOReportChannels"));
+        const bool any = arr && CFGetTypeID(arr) == CFArrayGetTypeID() &&
+                         CFArrayGetCount(static_cast<CFArrayRef>(arr)) > 0;
+        if (any && desired) {
+          api.merge_channels(desired, c, nullptr);
+        } else if (any) {
+          desired = c;
+          c = nullptr;
+        }
+        if (c) { CFRelease(c); }
+      }
+      CFRelease(group);
+    }
+  }
+
   Impl() {
     ane_max_w = detect_ane_max_watts_();
     const auto& api = ioreport::resolve();
@@ -394,6 +470,7 @@ struct SystemStatusPoller::Impl {
 
     desired = api.copy_channels_in_group(
         CFSTR("Energy Model"), nullptr, 0, 0, 0);
+    add_pmp_channels_(api);
     if (!desired) { return; }
 
     sub = api.create_subscription(
@@ -418,19 +495,45 @@ struct SystemStatusPoller::Impl {
     if (desired)   { CFRelease(desired);   desired   = nullptr; }
   }
 
-  // What one sample said: the block's power, and how many ANE units
-  // contributed to it. The count travels with the watts because the
-  // ceiling depends on it and both come from the same sample -- asking
-  // the machine again afterwards could answer about a different one.
+  // What one sample said about the ANE. Every field is optional on its
+  // own, because each comes from a source that may be dead on this
+  // machine (see common/soc-activity.h):
+  //   watts    the Energy Model power -- only when that counter is live
+  //   units    how many ANE energy channels the sample carried; travels
+  //            with the watts because the ceiling depends on it and both
+  //            come from the same sample
+  //   active   share of the interval the ANE's fabric floor sat above
+  //            VMIN, from the busiest of its links (0..1)
+  //   bw_gbps  the ANE's fabric bandwidth, summed over its links
   struct AneSample {
-    double watts = 0.0;
-    int    units = 0;
+    std::optional<double> watts;
+    int                   units = 0;
+    std::optional<double> active;
+    std::optional<double> bw_gbps;
   };
 
-  // Read one Energy Model sample, delta against `prev`, sum per-
-  // channel ANE energy, divide by elapsed time -> instantaneous ANE
-  // power in watts.
-  std::optional<AneSample> ane_power_w() {
+  // The residencies of one state channel, named. The names point into
+  // `owned`, which the caller keeps alive for as long as it reads them.
+  static std::vector<SocState>
+  states_of_(const ioreport::Api& api, CFDictionaryRef ch,
+             std::vector<std::string>* owned) {
+    const int n = api.state_get_count(ch);
+    owned->clear();
+    owned->reserve(n > 0 ? (std::size_t)n : 0u);
+    std::vector<SocState> out;
+    for (int j = 0; j < n; ++j) {
+      owned->push_back(
+          cf_string_to_utf8_(api.state_get_name_for_index(ch, j)));
+    }
+    for (int j = 0; j < n; ++j) {
+      out.push_back({(*owned)[(std::size_t)j],
+                     api.state_get_residency(ch, j)});
+    }
+    return out;
+  }
+
+  // One sample of every subscribed channel, delta against `prev`.
+  std::optional<AneSample> ane_sample() {
     std::lock_guard<std::mutex> lk(mu);
     if (!ready) { return std::nullopt; }
     const auto& api = ioreport::resolve();
@@ -459,6 +562,9 @@ struct SystemStatusPoller::Impl {
     const CFIndex n = CFArrayGetCount(arr);
     double ane_energy_J = 0.0;
     int    ane_units    = 0;
+    bool   ane_moved    = false;
+    AneSample out;
+    std::vector<std::string> state_names;
 
     for (CFIndex i = 0; i < n; ++i) {
       CFDictionaryRef ch = static_cast<CFDictionaryRef>(
@@ -466,18 +572,45 @@ struct SystemStatusPoller::Impl {
       if (!ch) { continue; }
       const std::string group =
           cf_string_to_utf8_(api.channel_get_group(ch));
-      if (group != "Energy Model") { continue; }
       const std::string name =
           cf_string_to_utf8_(api.channel_get_channel_name(ch));
+      // The ANE's power-manager channels: its fabric floor and its
+      // bandwidth. A prefix match on "ANE" is right HERE, unlike for
+      // energy: the floor is a maximum over links and the bandwidth a
+      // sum over distinct links, neither of which a twin channel could
+      // inflate -- and the links are named per release ("ANE0 L0 RD+WR",
+      // "ANE L0 RD+WR", "ANE-LNK0-AF-BW").
+      if (soc_block_energy_channel(group, "PMP")) {
+        if (!api.states_ok || name.rfind("ANE", 0) != 0 ||
+            api.channel_get_format(ch) != ioreport::kFormatState) {
+          continue;
+        }
+        const std::string sg =
+            cf_string_to_utf8_(api.channel_get_subgroup(ch));
+        const std::vector<SocState> st = states_of_(api, ch, &state_names);
+        if (sg == "SOC Floor") {
+          if (auto a = soc_floor_active_fraction(st)) {
+            out.active = std::max(out.active.value_or(0.0), *a);
+          }
+        } else if (sg == "AF BW" && name.size() >= 6 &&
+                   name.compare(name.size() - 6, 6, " RD+WR") == 0) {
+          if (auto b = soc_bw_histogram_mean_gbps(st)) {
+            out.bw_gbps = out.bw_gbps.value_or(0.0) + *b;
+          }
+        }
+        continue;
+      }
+      if (group != "Energy Model") { continue; }
       // "ANE" (macOS 26 and earlier) or "ANE<n>" (macOS 27 indexes every
       // block), summed across units. NOT a prefix match: that would also
       // take any future "ANE SRAM"-style companion into the total, the
       // way the GPU reader used to double-count "GPU Energy".
       if (!soc_block_energy_channel(name, "ANE")) { continue; }
-      const std::string unit =
-          cf_string_to_utf8_(api.channel_get_unit_label(ch));
       const std::int64_t raw =
           api.simple_get_integer_value(ch, 0);
+      if (raw != 0) { ane_moved = true; }
+      const std::string unit =
+          cf_string_to_utf8_(api.channel_get_unit_label(ch));
       // Reported energy unit -> joules.
       double scale = 1.0;
       if (unit.find("mJ") != std::string::npos)      { scale = 1e-3; }
@@ -488,8 +621,21 @@ struct SystemStatusPoller::Impl {
       ++ane_units;
     }
     CFRelease(delta);
-    if (ane_units == 0) { return std::nullopt; }
-    return AneSample{ ane_energy_J / elapsed_s, ane_units };
+    // Power only from a channel known to be live: a stale one's zeros are
+    // silence, not an idle ANE, and its one move in minutes is a lump.
+    // The ceiling is a second, independent guard -- nothing a real ANE
+    // draws comes near several times its rated power, and a lump always
+    // does.
+    const SocEnergyGate::Verdict v = ane_gate.feed(ane_moved);
+    if (ane_units > 0 && v == SocEnergyGate::Verdict::kLive) {
+      const double w = ane_energy_J / elapsed_s;
+      if (w <= 4.0 * ane_max_w * (double)ane_units) { out.watts = w; }
+    }
+    out.units = ane_units;
+    if (!out.watts && !out.active && !out.bw_gbps && ane_units == 0) {
+      return std::nullopt;
+    }
+    return out;
   }
 };
 
@@ -530,20 +676,42 @@ SystemStatusPoller::query()
     oo.insert("gpu_cores", FlexData::make_uint(gpu.core_count));
   }
 
-  // ANE (IOReport). The ceiling is per-unit times the units this box
-  // turned out to have, so a two-ANE part does not read 200% busy.
-  // Before the first sample there is nothing to count, and one unit is
-  // the honest assumption -- every part shipped so far has one.
-  if (auto s = _impl->ane_power_w()) {
-    const double ceiling = _impl->ane_max_w * (double)s->units;
-    const double pct     = ceiling > 0.0 ? (s->watts / ceiling) * 100.0 : 0.0;
-    oo.insert("ane_max_w",   FlexData::make_real(ceiling));
-    oo.insert("ane_units",   FlexData::make_int(s->units));
-    oo.insert("ane_power_w", FlexData::make_real(s->watts));
-    oo.insert("ane_util_pct",
-        FlexData::make_real(pct < 0.0 ? 0.0 : (pct > 100.0 ? 100.0 : pct)));
-  } else {
-    oo.insert("ane_max_w", FlexData::make_real(_impl->ane_max_w));
+  // ANE (IOReport). Two readings, because on any one machine one of them
+  // may be dead (see common/soc-activity.h): power over a ceiling where
+  // the energy counter is live, and the share of time its fabric floor
+  // sat above idle where the power manager reports it. The meter is the
+  // larger of the two -- a dead source reads nothing rather than a low
+  // number, so the larger IS the live one, with no per-chip table.
+  //
+  // The ceiling is per-unit times the units this box turned out to have,
+  // so a two-ANE part does not read 200% busy. Before the first sample
+  // there is nothing to count, and one unit is the honest assumption --
+  // every part shipped so far has one.
+  auto clamp_pct = [](double p) {
+    return p < 0.0 ? 0.0 : (p > 100.0 ? 100.0 : p);
+  };
+  const auto s = _impl->ane_sample();
+  const int  units = (s && s->units > 0) ? s->units : 1;
+  const double ceiling = _impl->ane_max_w * (double)units;
+  oo.insert("ane_max_w", FlexData::make_real(ceiling));
+  if (s) {
+    std::optional<double> util;
+    if (s->units > 0) {
+      oo.insert("ane_units", FlexData::make_int(s->units));
+    }
+    if (s->watts) {
+      oo.insert("ane_power_w", FlexData::make_real(*s->watts));
+      util = clamp_pct(ceiling > 0.0 ? *s->watts / ceiling * 100.0 : 0.0);
+    }
+    if (s->active) {
+      const double a = clamp_pct(*s->active * 100.0);
+      oo.insert("ane_active_pct", FlexData::make_real(a));
+      util = std::max(util.value_or(0.0), a);
+    }
+    if (s->bw_gbps) {
+      oo.insert("ane_bw_gbps", FlexData::make_real(*s->bw_gbps));
+    }
+    if (util) { oo.insert("ane_util_pct", FlexData::make_real(*util)); }
   }
 
   // This process's physical footprint -- the number Activity

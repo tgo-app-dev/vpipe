@@ -174,6 +174,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         sol-attention.cc
         sol-attention-h3.cc
         sol-attention-mma.cc
+        motion-cache.cc
         flashvsr-lq-proj.cc
         flashvsr-dit-load.cc
         flashvsr-vae.cc

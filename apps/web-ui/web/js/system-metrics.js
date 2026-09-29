@@ -3,7 +3,8 @@
 // /api/system/status carries the Apple-Silicon IOKit readings (the same
 // IORegistry data nvtop's AS backend, asitop and mactop consume -- see
 // apps/web-ui/system-status.cc). Turning those raw fields into the four
-// monitors is not obvious: ANE utilisation is inferred from power, GPU
+// monitors is not obvious: ANE utilisation is inferred (from power, or
+// from the power manager where the energy counter is not live), GPU
 // memory has two counters that differ by ~10x and only one of them is
 // comparable to what other tools report, and "MEM" is a footprint rather
 // than an RSS. That reasoning lives HERE, once, because two very
@@ -45,16 +46,24 @@ export const METRICS = [
   {
     key: 'ane',
     labelKey: 'status.ane',
-    // Estimated from ANE POWER, the same way macmon does it:
-    // ane_power_w / ane_max_w. The backend already reduces that to a
-    // percentage; the watts ride along because they are the reading
-    // that is actually measured.
+    // ane_util_pct is the larger of two backend readings, because on a
+    // given machine one of them may be dead: ANE power over a ceiling
+    // (the way macmon does it), and the share of time the ANE's fabric
+    // floor sat above idle. On macOS 27 the energy counter is not live,
+    // so ane_power_w is ABSENT there rather than zero. The parenthesis
+    // shows whichever measured quantity is live: the watts, else the
+    // ANE's fabric bandwidth -- but not on an idle ANE, where a channel
+    // that happens to report sits wholly in its lowest bin and would
+    // read as ~1 GB/s of nothing.
     read(s) {
       const pct = num(s, 'ane_util_pct');
       const w = num(s, 'ane_power_w');
+      const bw = num(s, 'ane_bw_gbps');
+      const extra = w !== null ? ' (' + w.toFixed(2) + ' W)'
+        : (bw !== null && pct !== null && pct >= 1)
+          ? ' (' + bw.toFixed(1) + ' GB/s)' : '';
       return {
-        display: pct === null ? '—'
-          : fmtPct(pct) + (w !== null ? ' (' + w.toFixed(2) + ' W)' : ''),
+        display: pct === null ? '—' : fmtPct(pct) + extra,
         ratio: pct === null ? null : pct / 100,
       };
     },

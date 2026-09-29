@@ -99,7 +99,7 @@
         "width": 960,
         "frames": 243,
         "fps": 24,
-        "steps": 21,
+        "steps": 20,
         "seed": 6,
         "i8_gemm": true,
         "ane_ffn": false,

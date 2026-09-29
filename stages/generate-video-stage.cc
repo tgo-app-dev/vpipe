@@ -18,6 +18,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
+#include "generative-models/shared/motion-cache.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
 #endif
@@ -102,7 +103,11 @@ const ConfigKey kAttrs[] = {
           "at another rate wants it set",
    .def_real = 24.0},
   {.key = "steps", .type = ConfigType::Int, .required = false,
-   .doc = "denoising steps", .def_int = 40},
+   .doc = "denoising steps, each one forward of the model (two under "
+          "classifier-free guidance) -- counted the way diffusers' "
+          "num_inference_steps and ComfyUI's steps count them. A family "
+          "that ships its own grid (a flow-map adapter) runs that instead",
+   .def_int = 40},
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "initial-noise RNG seed (default 0)"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
@@ -284,6 +289,77 @@ const ConfigKey kAttrs[] = {
           "is not put to the vote. -1 routes even the query's own block, "
           "which is an ablation rather than a setting",
    .def_int = 1},
+  // ---- MotionCache (MAC-AutoML, arXiv:2605.01725) -------------------
+  // A SAMPLING-LOOP tier rather than a transformer one: it decides per
+  // step whether to run the forward at all, so it composes with every
+  // tier above, each of which makes a forward cheaper.
+  {.key = "motion_cache", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated sampling (LOSSY): MotionCache skips whole denoising "
+          "FORWARDS. After a warm-up, each step predicts how far the "
+          "model's output has moved since the last forward that ran -- a "
+          "gain measured between the last two computed forwards, times how "
+          "far the input has moved since, over the output's size -- with "
+          "every latent position weighted by how much the clip is MOVING "
+          "there, read from the frame-to-frame difference of the model's "
+          "own clean estimate. While that prediction, summed over "
+          "consecutive skips, stays under motion_cache_threshold, the step "
+          "reuses the last forward's residual (output minus input, carried "
+          "to the new input) instead of running one. It saves forwards "
+          "rather than making one cheaper, so it composes with i8_gemm, "
+          "sage_attn, sol_attn and ane_ffn; the decision is host work on "
+          "a subsample of the latent, milliseconds a step. A few-step "
+          "schedule (a Turbo LoRA, HyperFlow) has little left to skip once "
+          "the warm-up has run. Taken by minimax-h3; other families ignore "
+          "it. Off by default -- it is an approximation, and faces, hands, "
+          "fast motion and lip sync are where it shows first",
+   .def_bool = false},
+  {.key = "motion_cache_threshold", .type = ConfigType::Real,
+   .required = false,
+   .doc = "MotionCache's budget: the accumulated predicted relative change "
+          "of the output under which a step reuses instead of running. "
+          "HIGHER skips more and drifts more. 0.15 is the reference "
+          "node's default; the example workflow it ships runs 0.2. Lower "
+          "it if faces, hands, fast motion, lip sync or sound effects go "
+          "unstable",
+   .def_real = 0.15},
+  {.key = "motion_cache_strength", .type = ConfigType::Real,
+   .required = false,
+   .doc = "how much MOTION weighs in MotionCache's change measures: a "
+          "latent position counts 1 + strength x its frame-to-frame motion "
+          "(normalised to mean 1), so a drift where the clip moves costs "
+          "more than the same drift over a still background. 0 weighs "
+          "every position alike",
+   .def_real = 1.0},
+  {.key = "motion_cache_warmup", .type = ConfigType::Int, .required = false,
+   .doc = "leading forwards MotionCache always runs -- the early steps "
+          "decide the clip's coarse structure. The first two run whatever "
+          "this says: the gain a prediction needs is measured between two "
+          "computed forwards",
+   .def_int = 4},
+  {.key = "motion_cache_max_skips", .type = ConfigType::Int,
+   .required = false,
+   .doc = "most steps MotionCache reuses in a row before it forces a "
+          "forward, which bounds how stale a residual can get. At least 1",
+   .def_int = 2},
+  {.key = "motion_cache_start", .type = ConfigType::Real, .required = false,
+   .doc = "where in the schedule MotionCache starts being consulted, as a "
+          "fraction of the sampling range: 0 is pure noise, 1 is clean. "
+          "Mapped to a sigma through the family's own VIDEO shift, the way "
+          "the reference maps it -- so at minimax-h3's shift of 12, 0.15 "
+          "is sigma 0.986. Steps outside the window always run",
+   .def_real = 0.15},
+  {.key = "motion_cache_end", .type = ConfigType::Real, .required = false,
+   .doc = "where MotionCache stops being consulted, on the same scale as "
+          "motion_cache_start and above it. The last steps are the fine "
+          "detail, so 0.95 leaves them dense",
+   .def_real = 0.95},
+  {.key = "motion_cache_subsample", .type = ConfigType::Int,
+   .required = false,
+   .doc = "stride, in latent rows and columns (and audio latent steps), of "
+          "the samples MotionCache DECIDES from. A reused step still "
+          "reuses every element; only the estimate is subsampled. 1 reads "
+          "everything",
+   .def_int = 8},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
@@ -515,6 +591,64 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                             _sol.dense_layers);
   genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
                             _sol.local_radius);
+  // MotionCache, settled the way sol_key_block is above: a value that
+  // would make the estimate meaningless WARNS and falls back to the
+  // shipped one rather than refusing the stage, and the bag carries what
+  // was settled on.
+  {
+    namespace a = genai::accel;
+    const genai::motion_cache::Config dflt;
+    auto bad = [&](const char* key, const std::string& said,
+                   const std::string& used) {
+      session()->warn(fmt("GenerateVideoStage('{}'): {} {} is out of "
+                          "range; using {}", this->id(), key, said, used));
+    };
+    double thr = attr_real("motion_cache_threshold");
+    if (!(thr >= 0.0) || !std::isfinite(thr)) {
+      bad("motion_cache_threshold", fmt("{}", thr)(),
+          fmt("{}", dflt.threshold)());
+      thr = dflt.threshold;
+    }
+    double strength = attr_real("motion_cache_strength");
+    if (!(strength >= 0.0) || !std::isfinite(strength)) {
+      bad("motion_cache_strength", fmt("{}", strength)(),
+          fmt("{}", dflt.motion_strength)());
+      strength = dflt.motion_strength;
+    }
+    long long warm = attr_int("motion_cache_warmup");
+    if (warm < 0) {
+      bad("motion_cache_warmup", std::to_string(warm),
+          std::to_string(dflt.warmup_steps));
+      warm = dflt.warmup_steps;
+    }
+    long long skips = attr_int("motion_cache_max_skips");
+    if (skips < 1) {
+      bad("motion_cache_max_skips", std::to_string(skips), "1");
+      skips = 1;
+    }
+    double start = attr_real("motion_cache_start");
+    double end   = attr_real("motion_cache_end");
+    if (!(start >= 0.0 && start < end && end <= 1.0)) {
+      bad("motion_cache_start/_end", fmt("{}/{}", start, end)(),
+          fmt("{}/{}", dflt.start, dflt.end)());
+      start = dflt.start;
+      end   = dflt.end;
+    }
+    long long sub = attr_int("motion_cache_subsample");
+    if (sub < 1) {
+      bad("motion_cache_subsample", std::to_string(sub),
+          std::to_string(dflt.subsample));
+      sub = dflt.subsample;
+    }
+    a::set_flag(&_accel, a::kMotionCache, attr_bool("motion_cache"));
+    a::set_real(&_accel, a::kMotionCacheThreshold, thr);
+    a::set_real(&_accel, a::kMotionCacheStrength, strength);
+    a::set_integer(&_accel, a::kMotionCacheWarmup, warm);
+    a::set_integer(&_accel, a::kMotionCacheMaxSkips, skips);
+    a::set_real(&_accel, a::kMotionCacheStart, start);
+    a::set_real(&_accel, a::kMotionCacheEnd, end);
+    a::set_integer(&_accel, a::kMotionCacheSubsample, sub);
+  }
   // The ANE tier. An empty `ane_templates` does NOT disable it: a family
   // that can emit its own graph needs no template, and only the family
   // knows whether it can. `ane_layers` caps the blocks that use it; no
@@ -1486,6 +1620,13 @@ GenerateVideoStage::resolve_config_()
     return;
   }
   align_frames_(genai::MetalWanVae::align_num_frames(_frames));
+  // Said once rather than left to a wall clock: a tier asked for and not
+  // taken reads exactly like one that was taken and saved nothing.
+  if (genai::accel::flag(&_accel, genai::accel::kMotionCache)) {
+    session()->log_normal(fmt(
+        "GenerateVideoStage('{}'): motion_cache is not implemented for "
+        "Wan; every step runs its forward", this->id()));
+  }
   // Wan's VAE is 8x spatial against H3's 16, so its grid is 16.
   align_size_(8 * _cfg.patch_h, 8 * _cfg.patch_w);
   _two_experts = fs::exists(fs::path(_root) / "transformer_2" / "config.json");
@@ -3107,6 +3248,9 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // GenerationParams reaches the loop without this call site changing.
   req.set_params(_h3_params);
   req.sol_dense_steps = _sol_dense_steps;
+  // The bag, for the tiers the LOOP takes rather than the transformer --
+  // MotionCache, which decides per step whether a forward runs at all.
+  req.accel = &_accel;
   UiProgress bar = session()->open_progress("denoise");
   // Block-granular, like the image DiTs. A step here is one forward of a
   // 33B stack over a ~19k-row sequence -- tens of seconds at the model's
@@ -3123,10 +3267,10 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   ScopedBlockProgress<genai::MetalMiniMaxH3Transformer> hook(_h3_dit.get(),
                                                              prog);
   req.progress = [&](int step, int total) {
-    // `total` is the count the SCHEDULER settled on, which is not
-    // `_steps`: that is a sigma grid including the terminal zero, and the
-    // shift can collapse duplicates on top. Adopting it is what makes the
-    // bar finish at 100% instead of at (steps-1)/steps.
+    // `total` is the count the SCHEDULER settled on, which can fall
+    // short of `_steps`: the shift can collapse duplicate sigmas, and a
+    // flow-map adapter runs its own grid. Adopting it is what makes the
+    // bar finish at 100% whatever the schedule turned out to be.
     prog.set_steps(total);
     // `step` is 1-based on entry here; end_step takes the 0-based index
     // it just finished, and re-syncs the bar to the exact boundary.
@@ -3268,6 +3412,29 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       if (!cerr.empty()) {
         session()->warn(fmt("GenerateVideoStage('{}'): scheduler spec: {}",
                             this->id(), cerr));
+      }
+      // Two step counts, and only one of them runs. A family that
+      // samples from the spec takes the SCHEDULER's; MiniMax-H3 carries
+      // its own schedule and takes this stage's. Either way the other
+      // number sits in the graph looking authoritative, so when the graph
+      // named both and they disagree, say which one ran.
+      const bool said = this->config().is_object() &&
+                        this->config().as_object().contains("steps");
+      if (said && _scheduler_spec.steps > 0 &&
+          _scheduler_spec.steps != _steps) {
+        if (_family == "minimax-h3") {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): the wired scheduler's {} steps are "
+              "NOT used -- minimax-h3 runs its own schedule, at this "
+              "stage's steps {}", this->id(), _scheduler_spec.steps,
+              _steps));
+        } else {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): steps {} is IGNORED -- the wired "
+              "scheduler runs {} steps and owns the count. Set it on the "
+              "scheduler-select stage, or make the two agree",
+              this->id(), _steps, _scheduler_spec.steps));
+        }
       }
     }
   }

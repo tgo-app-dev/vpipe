@@ -13,20 +13,29 @@ namespace vpipe::webui {
 //
 // GPU utilisation + GPU memory come from the same IOKit `IOAccelerator`
 // PerformanceStatistics dictionary nvtop's Apple-Silicon backend (and
-// asitop / mactop) read. ANE utilisation comes from the same IOReport
-// private framework macmon uses: an "Energy Model" subscription gives
-// per-sample energy deltas for ANE / GPU / CPU clusters, and we
-// estimate ANE utilisation as
+// asitop / mactop) read. ANE utilisation comes from the IOReport private
+// framework macmon uses, read two ways because on a given machine one
+// of them may be dead (common/soc-activity.h has the measurements):
 //
-//     ane_util_pct = 100 * ane_power_W / ane_max_W
+//   * power: an "Energy Model" delta over a per-chip ceiling (8.0 W for
+//     M1/M2/M4, 8.5 W for M3 -- macmon's table), the way macmon does
+//     it. Reported only while that counter is live; on macOS 27 it
+//     publishes minutes of energy at once and is silent in between.
+//   * activity: the share of the interval the ANE's fabric floor (group
+//     "PMP"/"PMP<n>", subgroup "SOC Floor") sat above VMIN, which the
+//     power manager updates every second.
 //
-// where `ane_max_W` is a per-chip ceiling (8.0 W for M1/M2, 8.5 W for
-// M3 — same table macmon ships with). Numbers are clipped to [0,100].
+//     ane_util_pct = max(100 * ane_power_W / ane_max_W, ane_active_pct)
+//
+// clipped to [0,100]. A dead source contributes nothing, so the max is
+// whichever one is live.
 //
 // State (held across queries):
-//   * an IOReport subscription on the "Energy Model" channels
-//   * the previous sample, used to compute the per-second energy delta
-//     (and hence power) on the next query
+//   * one IOReport subscription: the "Energy Model" group plus the PMP
+//     "SOC Floor" and "AF BW" channels
+//   * the previous sample, used to compute the per-second delta on the
+//     next query
+//   * whether the ANE's own energy channels are live (SocEnergyGate)
 //
 // Thread-safe: a single SystemStatusPoller may be queried from any
 // thread; an internal mutex serialises sample-delta computation.
@@ -49,8 +58,15 @@ public:
   //   "gpu_model"           string -- GPU/chip model, e.g. "Apple M4"
   //                                   (falls back to the CPU brand string)
   //   "gpu_cores"           uint -- GPU core count ("gpu-core-count")
-  //   "ane_util_pct"        real -- estimated ANE util [0,100]
-  //   "ane_power_w"         real -- instantaneous ANE power, watts
+  //   "ane_util_pct"        real -- estimated ANE util [0,100]: the
+  //                                 larger of the two readings below
+  //   "ane_power_w"         real -- ANE power, watts; ONLY while the
+  //                                 Energy Model counter is live
+  //   "ane_active_pct"      real -- share of the interval the ANE's
+  //                                 fabric floor sat above VMIN [0,100]
+  //   "ane_bw_gbps"         real -- the ANE's fabric bandwidth, GB/s
+  //                                 (absent while it is idle)
+  //   "ane_units"           int  -- ANE energy channels seen
   //   "ane_max_w"           real -- per-chip ANE TDP ceiling
   //   "phys_footprint_bytes" uint -- task_vm_info.phys_footprint, the
   //                                  number Activity Monitor's

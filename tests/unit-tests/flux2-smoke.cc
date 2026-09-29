@@ -1754,7 +1754,10 @@ TEST(flux2_kv, sol_routes_the_joint_attention_and_declines_klein_kv)
   }
   sol::Config on;
   on.enabled = true;
-  on.tau = 0.7f;              // generate-image's shipped default
+  // A routing point, NOT the stage default -- generate-image now
+  // ships 0, which keeps more blocks and would weaken the
+  // routed-differs-from-dense signal this test turns on.
+  on.tau = 0.7f;
   on.key_block = 64;
   on.local_radius = 1;
   on.dense_layers = 1;

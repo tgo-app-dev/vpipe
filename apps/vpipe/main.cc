@@ -538,6 +538,13 @@ run(int argc, char** argv)
       if (r.have_temp) {
         oo.insert_or_assign("temp_c", FlexData::make_real(r.temp_c));
       }
+      // GPU power, for a person reading the JSON -- the verdict does not
+      // use it. Present only while the Energy Model counter is live: on
+      // macOS 27 it is silent for minutes and then publishes everything
+      // at once, and the reader drops that lump rather than report it.
+      if (g.power_w.ok) {
+        oo.insert_or_assign("gpu_power_w", FlexData::make_real(g.power_w.avg));
+      }
       // The OS's own answer, alongside ours. Keeping both makes the
       // disagreement visible in a bug report rather than arguable.
       oo.insert_or_assign("os_thermal_state",

@@ -49,6 +49,7 @@
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/accel-settings.h"
 
 #include <chrono>
 #include <algorithm>
@@ -1100,6 +1101,176 @@ TEST(minimax_h3_dit, denoise_holds_the_anchors)
   req2.audio = aud2.data();
   ASSERT_TRUE(genai::denoise(req2, &derr));
   EXPECT_TRUE(vid2 == vid && aud2 == aud);
+}
+
+// MotionCache in the real loop, on the real (shallow) model.
+//
+// shared/motion-cache.h is verified against the reference's own state
+// machine in motion-cache.cc; what is left to show here is that the LOOP
+// uses it: that an armed cache that never reuses changes nothing at all,
+// that one told to reuse really does skip forwards -- in exactly the
+// cadence the schedule knobs imply -- and that a reused step still holds
+// the anchors and lands on finite numbers. A cache the loop consulted but
+// never acted on would pass every numeric bar and save nothing, so the
+// forward COUNT is asserted, not just the output.
+TEST(minimax_h3_dit, denoise_motion_cache_skips_forwards)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = kLayers;
+
+  h3::PackedLayout L;
+  const std::vector<int> text_tags((std::size_t)kTextRows, h3::kTextTag);
+  const std::vector<h3::Anchor> anchors = {h3::Anchor::kFirst};
+  ASSERT_TRUE(h3::build_packed_sequence(text_tags, kLatentF, kLatentH,
+                                        kLatentW, kAudioLat, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        anchors, &L));
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+
+  const int PE = cfg.video_patch_elems();
+  const int AC = cfg.audio_channels;
+  const int vrows = (int)L.video_indices.size();
+  SharedBuffer tb = mc->make_shared_buffer(
+      (std::size_t)kTextRows * cfg.text_dim * 2);
+  ASSERT_TRUE(!tb.empty());
+  {
+    auto* d = static_cast<std::uint16_t*>(tb.contents());
+    for (int i = 0; i < kTextRows * cfg.text_dim; ++i) {
+      d[i] = f32_to_bf16_(0.02f * (float)(i * 37 % 23 - 11));
+    }
+  }
+
+  struct Run {
+    std::vector<float> vid, aud;
+    genai::DenoiseReport rep;
+    bool ok = false;
+  };
+  constexpr int kSteps = 12;
+  auto run = [&](const FlexData* bag) {
+    Run r;
+    r.vid.assign((std::size_t)vrows * PE, 0.0f);
+    r.aud.assign((std::size_t)L.num_audio_rows * AC, 0.0f);
+    for (std::size_t i = 0; i < r.vid.size(); ++i) {
+      r.vid[i] = 0.1f * (float)((int)(i * 31 % 19) - 9);
+    }
+    for (std::size_t i = 0; i < r.aud.size(); ++i) {
+      r.aud[i] = 0.1f * (float)((int)(i * 17 % 13) - 6);
+    }
+    genai::DenoiseRequest req;
+    req.dit    = m.get();
+    req.layout = &L;
+    req.text   = &tb;
+    req.video  = r.vid.data();
+    req.audio  = r.aud.data();
+    req.num_steps = kSteps;
+    // The grid is what the gathers are built from; without it the cache
+    // declines, which is its own case below.
+    req.video_grid_h = kLatentH / cfg.patch_h;
+    req.video_grid_w = kLatentW / cfg.patch_w;
+    req.accel  = bag;
+    req.report = &r.rep;
+    std::string derr;
+    r.ok = genai::denoise(req, &derr);
+    if (!r.ok) { std::printf("[minimax_h3_dit] denoise: %s\n", derr.c_str()); }
+    return r;
+  };
+  namespace a = genai::accel;
+  auto bag = [](double threshold) {
+    FlexData b = FlexData::make_object();
+    a::set_flag(&b, a::kMotionCache, true);
+    a::set_real(&b, a::kMotionCacheThreshold, threshold);
+    a::set_integer(&b, a::kMotionCacheWarmup, 2);
+    a::set_integer(&b, a::kMotionCacheMaxSkips, 2);
+    a::set_real(&b, a::kMotionCacheStart, 0.0);
+    a::set_real(&b, a::kMotionCacheEnd, 1.0);
+    a::set_integer(&b, a::kMotionCacheSubsample, 2);
+    return b;
+  };
+
+  const Run base = run(nullptr);
+  ASSERT_TRUE(base.ok);
+  EXPECT_TRUE(!base.rep.motion_cache);
+  // `num_steps` counts FORWARDS, as diffusers and ComfyUI count them --
+  // not the reference scheduler's grid points, which would run one
+  // fewer.
+  const int steps = base.rep.steps;
+  EXPECT_TRUE(steps == kSteps);
+  ASSERT_TRUE(steps >= 8);
+  EXPECT_TRUE(base.rep.forwards == steps && base.rep.reused == 0);
+
+  // Armed, and never close enough: threshold 0 is "never". The run must
+  // be BIT-identical -- the cache reads the state, it does not touch it.
+  const FlexData never = bag(0.0);
+  const Run r0 = run(&never);
+  ASSERT_TRUE(r0.ok);
+  EXPECT_TRUE(r0.rep.motion_cache);
+  EXPECT_TRUE(r0.rep.forwards == steps && r0.rep.reused == 0);
+  EXPECT_TRUE(r0.vid == base.vid && r0.aud == base.aud);
+
+  // Told to reuse whenever it may: warm-up 2 and runs of 2 over the
+  // whole range give C C R R C R R C R R C ... -- two forwards, then one
+  // in every three steps.
+  const FlexData always = bag(1e9);
+  const Run r1 = run(&always);
+  ASSERT_TRUE(r1.ok);
+  EXPECT_TRUE(r1.rep.motion_cache);
+  EXPECT_TRUE(r1.rep.steps == steps);
+  const int want_fwd = 2 + (steps - 2) / 3;
+  EXPECT_TRUE(r1.rep.forwards == want_fwd &&
+              r1.rep.reused == steps - want_fwd);
+  bool anchors_held = true, finite = true;
+  for (std::size_t i = 0; i < (std::size_t)L.num_condition_rows * PE; ++i) {
+    if (r1.vid[i] != base.vid[i]) { anchors_held = false; break; }
+  }
+  for (float x : r1.vid) { if (!std::isfinite(x)) { finite = false; } }
+  for (float x : r1.aud) { if (!std::isfinite(x)) { finite = false; } }
+  EXPECT_TRUE(anchors_held);
+  EXPECT_TRUE(finite);
+  auto rel = [](const std::vector<float>& x, const std::vector<float>& y,
+                std::size_t from) {
+    double d = 0.0, n = 0.0;
+    for (std::size_t i = from; i < x.size(); ++i) {
+      d += (double)(x[i] - y[i]) * (x[i] - y[i]);
+      n += (double)y[i] * y[i];
+    }
+    return n > 0.0 ? std::sqrt(d / n) : 0.0;
+  };
+  const double dv =
+      rel(r1.vid, base.vid, (std::size_t)L.num_condition_rows * PE);
+  const double da = rel(r1.aud, base.aud, 0);
+  // Reusing changes the answer -- it is an approximation -- so the
+  // outputs must differ; a cache whose reuse left them identical would
+  // be one whose velocity never reached the scheduler.
+  EXPECT_TRUE(dv > 0.0 && da > 0.0);
+
+  // Deterministic: a second generation starts from a fresh cache.
+  const Run r2 = run(&always);
+  ASSERT_TRUE(r2.ok);
+  EXPECT_TRUE(r2.vid == r1.vid && r2.aud == r1.aud);
+  EXPECT_TRUE(r2.rep.forwards == want_fwd);
+
+  // The shipped defaults, for the record: what they make of this model.
+  FlexData dflt = FlexData::make_object();
+  a::set_flag(&dflt, a::kMotionCache, true);
+  const Run rd = run(&dflt);
+  ASSERT_TRUE(rd.ok);
+
+  std::printf("[minimax_h3_dit] motion_cache over %d steps: never %d/%d, "
+              "always %d forwards (video %.4f, audio %.4f from dense), "
+              "defaults %d reused of %d (video %.4f from dense)\n", steps,
+              r0.rep.forwards, r0.rep.steps, r1.rep.forwards, dv, da,
+              rd.rep.reused, rd.rep.steps,
+              rel(rd.vid, base.vid, (std::size_t)L.num_condition_rows * PE));
 }
 
 // Step timing at an ARBITRARY geometry, which is the whole question for

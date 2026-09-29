@@ -24,7 +24,9 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
   - [然后运行流水线](#then-run-the-pipeline)
 - [第 2 步——文本生成视频**与音频**](#step-2--text-to-video-and-audio)
   - [值得了解的设置](#the-settings-worth-knowing)
+    - [步数怎么算](#counting-steps)
   - [耗时](#how-long-it-takes)
+    - [与 h3.c 对比](#against-h3c)
   - [看着它成形——实时预览](#watching-it-form--live-previews)
   - [不只是文本输入](#more-than-text-in)
   - [以参考素材为条件（Ref2VA）](#conditioning-on-references-ref2va)
@@ -63,6 +65,9 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [能省多少](#what-it-saves-1)
     - [与 VDN 分支的对比](#against-the-vdn-branch)
     - [可调项](#the-knobs)
+  - [更少的前向——MotionCache](#fewer-forwards--motioncache)
+    - [能省多少](#what-it-saves-2)
+    - [它的选项](#its-knobs)
   - [神经引擎（ANE）——面向 M4 系列 Mac](#the-neural-engine--for-m4-family-macs)
     - [在 M4 上能省多少](#what-it-saves-on-an-m4)
     - [它的行为](#how-it-behaves)
@@ -154,7 +159,7 @@ Ref2VA 那一行指的是**整个模型**，而不只是它的 transformer，这
   … **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
   ——用四次运行生成一段 **40 秒**的片段：先是 FL2VA 文生视频，然后是三段 Ref2VA
   续接，每一段都从上一部分的最后 3.75 s 接着往下走（见
-  [更长的片段](#longer-clips--one-story-in-four-parts)）。以 21 步、不加 Turbo 适配器
+  [更长的片段](#longer-clips--one-story-in-four-parts)）。以 20 步、不加 Turbo 适配器
   运行**官方发布权重**的两个模式，并把每一部分**无损**写出——FFV1 视频、4:4:4、
   ALAC 声音——所以每一次续接读回的正是上一部分生成的内容。
 - **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
@@ -303,12 +308,13 @@ stage 指向模型文件，而不是四个。
 | `width` / `height` | 960 × 544 | **向上取整**到最近的 **32** 的倍数——即视频 VAE 的 16× 空间步长乘以 DiT 的 2× patch。16 的倍数还不够：1360 是 16 的倍数，而它的潜变量是奇数 85，打包器无法对其做 patch。这个 stage 会把改动记进日志。 |
 | `frames` | 120 | **向上取整**到 VAE 能分块的最近帧数——5、22、39、56、73、90、107、**124**……所以 120 变成 124。这个 stage 会把改动记进日志。 |
 | `fps` | 24 | 124 帧 ≈ 5.2 s；56 帧 ≈ 2.3 s。 |
-| `steps` | 8 | **8 步是草稿质量**——足以看出一条提示词的效果——而 **16 步给出良好质量**。少于 8 步是 [Turbo LoRA](#fewer-steps--the-turbo-lora) 的领域，不是这个模型本身的。`guidance_scale` 和负面提示词在这里是**无效的**——蒸馏模型没有无条件前向可以用来引导，所以 vpipe 直接跳过它，而不是在一个 33B 模型上白付 2× 的代价。 |
+| `steps` | 8 | **8 步是草稿质量**——足以看出一条提示词的效果——而 **16 步给出良好质量**。一步就是模型的一次前向，与 ComfyUI 和 diffusers 的计数方式相同——见[步数怎么算](#counting-steps)。少于 8 步是 [Turbo LoRA](#fewer-steps--the-turbo-lora) 的领域，不是这个模型本身的。`guidance_scale` 和负面提示词在这里是**无效的**——蒸馏模型没有无条件前向可以用来引导，所以 vpipe 直接跳过它，而不是在一个 33B 模型上白付 2× 的代价。 |
 | `seed` | 6 | 相同的 seed + 相同的设置 ⇒ 相同的片子。 |
 | `i8_gemm` | `true` | 一个需要显式开启的**有损**加速模式，本文随附的每个流水线都开着它。只有带矩阵核心的 GPU（M5 及更新）能用，所以在 M4 上它什么也不做——而在 M5 上关掉它更慢。它会让画面略有变化，所以当你在评判输出而非速度时，把它关掉。 |
 | `sage_attn` | `false` | 一个需要显式开启的**有损**加速模式，与 `i8_gemm` 和 `sol_attn` 都互相独立，可以和任一个一起设置——它把注意力的 QK^T 乘积用 int8 加逐块 scale 来算，而 `sol_attn` 决定哪些块根本参与注意力。在视频几何尺寸下注意力提速 1.20×，cosine 与 f16 kernel 相同。仅限矩阵核心。见[更省的注意力——SageAttention 的 int8 QK](#cheaper-attention--sageattentions-int8-qk)。 |
 | `ane_ffn` / `ane_qkv` | `false` | 需要显式开启的**有损**模式，把每个 block 的一部分放到 GPU 旁边的 **Apple Neural Engine** 上运行。在 **M4 系列** Mac 上值得开，在 M5 上通常不值得。见[Neural Engine](#the-neural-engine--for-m4-family-macs)。 |
 | `sol_attn` | `false` | 又一个需要显式开启的**有损**加速模式，而且是独立的——它改变 GEMM 之间的注意力的计算方式，而 `i8_gemm` 改变的是 GEMM。在 832 × 480 的 124 帧上，挂钟时间提速 1.27×，且不需要额外权重；旁边的各个选项见[更快的注意力——Sol-Attn 路由](#faster-attention--sol-attn-routing)。 |
+| `motion_cache` | `false` | 另一类需要显式开启的**有损**模式：上一步已经能预测出答案的去噪步，它整步跳过，因此能与上面每一个设置组合。它在长调度上才划算——`steps: 20` 时去噪提速 1.32×——而 8 步草稿或 Turbo 运行里几乎没有可跳的。见[更少的前向——MotionCache](#fewer-forwards--motioncache)。 |
 | `unload_when_idle` | `always` | 两次运行之间丢弃权重。在 16 GB 上，正是这一项让下一个 stage 能用上整台机器。 |
 
 以及来自 **`minimax-h3-model-config`** stage 的设置，它连接到 `generate-video` 的
@@ -331,11 +337,32 @@ trigger 时，它在整次运行中只发出一次。
 引导。出于同样的原因，Wan 的 guidance 和专家边界住在 `wan2-model-config` 里——每个
 模型家族都带着自己的那一份。
 
+<a id="counting-steps"></a>
+#### 步数怎么算
+
+**`steps` 就是模型运行的次数**，与 ComfyUI 的 `steps` 和 diffusers 的
+`num_inference_steps` 计数方式相同：`steps: 8` 是在 `linspace(1, 0, 9)` 经 shift
+之后的九个 sigma 上做八次前向，最后一个是干净的终点。
+
+MiniMax 自己的参考调度器计数方式不同。它的 `num_inference_steps` 是网格上的点数，
+终点也算在内，所以同一个数字在那里会**少跑一次前向**。vpipe 采用 ComfyUI 和
+diffusers 的方式而不是参考实现的方式，有两个原因：
+
+- **步数会被到处复制。**它来自 ComfyUI 工作流、模型卡片和别人的设置，而这些地方
+  指的都是前向次数。按参考实现的方式去读，每一个都会少一步：从 ComfyUI 图里抄来
+  的 20 步只会跑 19 次。
+- **Turbo 适配器就是按它命名的。**“4 步”或“8 步”的蒸馏，是针对网格上那么多个区间、
+  那么多次前向拟合出来的。少一次前向就是另一张网格，而且没有任何东西会报告这一点。
+
+参考实现那种计数方式的结果依然只差一个数：这里的 `steps: N` 就是那里的
+`num_inference_steps: N + 1`，此时两者的调度完全相同。
+
 <a id="how-long-it-takes"></a>
 ### 耗时多久
 
-在 8-bit 模型上实测，960 × 544（0.5 MP）、24 fps、6 步，运行时应用了
-[Turbo LoRA](#fewer-steps--the-turbo-lora)，测试机是能跑起它的最小机器——一台
+在 8-bit 模型上实测，960 × 544（0.5 MP）、24 fps、5 步，运行时应用了
+[Turbo LoRA](#fewer-steps--the-turbo-lora)（随附的 Turbo 流水线图跑 6 步，多一次
+前向），测试机是能跑起它的最小机器——一台
 无风扇的 **MacBook Air 15 英寸（M5）**，10 核 CPU / 10 核 GPU、16 GB——以及一台
 **MacBook Pro 16 英寸（M5 Pro）**、24 GB：
 
@@ -379,6 +406,49 @@ trigger 时，它在整次运行中只发出一次。
 > 风扇足够好，以至于这个负载把 GPU 钉在 **1620 MHz——也就是最高频——整次运行都在
 > 100%**。那是 Air 持续频率的 **1.25×**，这还没算核心数的差别，所以时钟本身能解释
 > 2.3–2.8× 差距的一部分，而不是大部分。
+
+<a id="against-h3c"></a>
+#### 与 h3.c 对比
+
+同一段片子，与 [h3.c](https://github.com/antirez/h3.c) 对比，双方都不用对方做不到
+的东西：公开发布的 **bf16** 权重（MiniMaxAI 的快照，也就是 h3.c 读取的布局），放在
+内置 SSD 上，**不用 LoRA、不做量化**，960 × 544、124 帧、**6 个 DiT 步**，同样的
+提示词和种子。h3.c 跑它的精确模式——50 个 block 全跑、不复用任何一步——所以 VPIPE
+也不开 [MotionCache](#fewer-forwards--motioncache)。每次 VPIPE 运行都打开所在芯片
+具备的加速：M4 Pro 上是 `ane_ffn` + `ane_qkv`（它没有 int8 矩阵通路），两台 M5 上是
+`i8_gemm`（在那里 [Neural Engine 并不划算](#the-neural-engine--for-m4-family-macs)）。
+挂钟时间，从启动到写出文件：
+
+| | M4 Pro Mac mini，64 GB | | M5 Pro MacBook Pro 16"，24 GB | |
+|---|---|---|---|---|
+| | **VPIPE** | h3.c | **VPIPE** | h3.c |
+| 文本编码器 + DiT 准备 | 30 s | 28 s | 20 s | 12 s |
+| 去噪，6 步 | **14 min 27 s** | 19 min 59 s | **4 min 25 s** | 5 min 0 s |
+| VAE 解码，视频 + 音频 | 2 min 46 s | 2 min 41 s | **43 s** | 1 min 59 s |
+| **合计** | **17 min 43 s** | 23 min 9 s | **5 min 29 s** | 7 min 11 s |
+| 峰值内存 | 46.0 GB | 45.2 GB | 18.2 GB | 11.6 GB |
+
+**在 M4 Pro 上，收益在去噪，1.38×，来自 Neural Engine。** 这两层把每个 block 的
+前馈和 q|k|v 大约一半的行从 GPU 上拿走。只开 `ane_ffn` 时，同样的去噪实测
+16 min 3 s（合计 19 min 23 s）；再加上 `ane_qkv` 就是剩下的部分。准备阶段和 VAE
+解码两边持平。
+
+**在 M5 Pro 上，大部分来自解码。** 去噪快 1.13×；视频 VAE 解码快 2.8×，用的是矩阵
+核心上的卷积。这里 h3.c 的内存占用更小，因为在 24 GB 上它需要 `--ssd-streaming`，
+每一步都重读每个 block——而且跑的是 **bf16**：它的 int8 引擎需要整个 transformer
+常驻，所以在这台机器上是关着的。VPIPE 也是流式加载，并把放得下的 block 留在内存里
+（这次是 50 个里的 14 个）。
+
+**在无风扇的 M5 MacBook Air 15 英寸、16 GB 上**，放在冰袋上，同样的运行耗时
+**13 min 7 s**，h3.c 是 16 min 22 s——端到端 **1.25×**，和 M5 Pro 一样开着
+`i8_gemm`，h3.c 同样用 `--ssd-streaming`。那台机器只记录了整次运行的时间，而且它是
+数字取决于散热方式的那一行（见上面关于冰袋的说明）。
+
+三台机器上 VPIPE 的时间依次是 **17 min 43 s**（M4 Pro）、**13 min 7 s**（M5 Air）
+和 **5 min 29 s**（M5 Pro）：无风扇的 Air 比有风扇的 M4 Pro 快 **1.35×**，内存只有
+它的四分之一；M5 Pro 是 Air 的 **2.4×**——M4 Pro 的 **3.2×**。
+
+h3.c 在 M4 上的数字可以重复：不论先跑还是后跑，它的去噪相差不到 0.6%。
 
 <a id="watching-it-form--live-previews"></a>
 ### 看着它成形——实时预览
@@ -725,7 +795,7 @@ smart-resize，所以这个画布也决定了一段视频贡献多少视觉 toke
 重采样到 960 × 544 得到的结果；在编码器上设 `reference_video_short_edge`
 不会改变任何东西。`reference_image_short_edge` 和那张静帧同理。
 
-按随附配置——960 × 544、39 帧、8 步、一张静帧加一段视频——在无风扇的 16 GB
+按随附的 960 × 544、39 帧、一张静帧加一段视频，但以 7 步而非图里的 8 步运行，在无风扇的 16 GB
 M5 上是 **23 min 54 s**（`references` 列表在相同几何尺寸下实测 23 min
 07 s：端口链会缩放每一个解码出来的帧，而列表只缩放它保留的那些）。其中大约
 三分之一发生在第一个去噪步之前：32B 的条件编码器要加载并流式读取，而两个
@@ -993,13 +1063,13 @@ MiniMax-H3 那个独立的 `transformer_ref`。两个模式随附的 transformer
 每一次续接都是同一张流水线图，只是换了提示词和要读的文件，所以第五部分就是第四
 部分的一份副本。
 
-**随附的流水线图以 21 步运行官方发布的权重，不加适配器。**每一部分都指向发布者
+**随附的流水线图以 20 步运行官方发布的权重，不加适配器。**每一部分都指向发布者
 自己的模型文件（见[发布的权重，两个模式都有](#the-released-weights-either-partition)）：
 
 | | 模型文件 | 步数 | shift 值 |
 |---|---|---|---|
-| 第 1 部分 | `MiniMaxAI/MiniMax-H3-FL2VA` | 21 | 12 / 3 |
-| 第 2–4 部分 | `MiniMaxAI/MiniMax-H3-Ref2VA` | 21 | 12 / 3 |
+| 第 1 部分 | `MiniMaxAI/MiniMax-H3-FL2VA` | 20 | 12 / 3 |
+| 第 2–4 部分 | `MiniMaxAI/MiniMax-H3-Ref2VA` | 20 | 12 / 3 |
 
 这是以时间换质量的选择，而一条链正是它值得的地方。Turbo 适配器换来更少的步数，代价
 是牺牲一部分基础模型对构图的理解——某一部分可能返回主体位置很糟的画面、一只画错的
@@ -1402,7 +1472,7 @@ vpipe --launch docs/pipelines/minimax-h3-text-to-video-turbo.vpipeline
 是步数，不是模型文件。图里其他一切都没有动，而这正是重点：应用一个 LoRA 是在
 一个 stage 上改配置，而不是换一条流水线。
 
-**它的开销。** 960 × 544 · 24 fps · **124 帧**（5.17 秒）· 6 步，从
+**它的开销。** 960 × 544 · 24 fps · **124 帧**（5.17 秒）· 5 步，从
 `vpipe --launch` 到封装好的 mp4 的端到端时间。流水线要求的是 120 帧，而 stage
 向**上取整到了 124**——视频 VAE 处理 17 帧的片段并从每段保留 5 个潜变量，所以
 只有 17n+5 才有对应的潜变量形式，日志里会说明这一点。
@@ -1735,8 +1805,8 @@ temb = emb(t) + gate * (emb_r(r) - emb(t))        gate = 0.25
 
 | | 前向次数 | 每次前向 | 去噪 |
 |---|---:|---:|---:|
-| 原始模型，`steps: 8` | 7 | 27.7 s | 194 s |
-| 原始模型，`steps: 16`（良好质量） | 15 | 27.7 s | 约 415 s |
+| 原始模型，`steps: 7` | 7 | 27.7 s | 194 s |
+| 原始模型，`steps: 15`（良好质量） | 15 | 27.7 s | 约 415 s |
 | **HyperFlow** | **8** | **30.2 s** | **241 s** |
 
 适配器让每次前向**慢 9%**。它换来的是步数：原始模型要 15 步以上的片段，它 8 次
@@ -1875,7 +1945,7 @@ vpipe --launch docs/pipelines/prepare-minimax-h3-vdn.vpipeline
 #### 它能省下多少
 
 和[需要多长时间](#how-long-it-takes)里同一段 124 帧的片段，在 **M5 Pro，
-24 GB** 上，配 Turbo LoRA 跑 6 步：
+24 GB** 上，配 Turbo LoRA 跑 5 步：
 
 | | 124 帧，5.2 秒 |
 |---|---|
@@ -1979,7 +2049,7 @@ FL2VA 的块训练出来的。只需在 `generate-video` 上加一个开关：
 <a id="what-it-saves-1"></a>
 #### 它能省下多少
 
-124 帧，**832 × 480**，24 fps，6 步，配合
+124 帧，**832 × 480**，24 fps，5 步，配合
 [Turbo LoRA](#fewer-steps--the-turbo-lora) 和 `i8_gemm`，在一台
 **MacBook Pro 16 英寸（M5 Pro）、24 GB** 上：
 
@@ -2037,6 +2107,81 @@ FL2VA 的块训练出来的。只需在 `generate-video` 上加一个开关：
 > 他们的说法，而不是一次复现。在把一个长任务交给它之前，先用你满意的随机
 > 种子把两种结果都生成出来，并且只在你亲眼看过输出之后再提高 `sol_tau`。
 
+<a id="fewer-forwards--motioncache"></a>
+### 更少的前向——MotionCache
+
+上面的每个设置都让一步变得更便宜。[**MotionCache**](https://github.com/MAC-AutoML/MotionCache)
+则干脆跳过其中一些步的前向。它和 Sol 一样无需训练——不用下载任何东西，也不分
+分区——在 `generate-video` 上只是一个开关：
+
+```json
+"motion_cache": true
+```
+
+**它做什么。**过了最初几步之后，相邻的去噪步向模型提出的几乎是同一个问题，得到
+的也几乎是同一个答案。所以在每次前向之前，MotionCache 先预测：自上一次真正运行
+的前向以来，模型的输出移动了多少——用最近两次真实前向之间测得的增益，乘以潜变量
+此后移动的幅度。如果这个值很小，这一步就复用上一次前向的残差（带到新的潜变量上），
+而不去运行 33B 的整个网络；这一步本身照常执行，所以调度不变。
+
+**预测按运动加权。**每个潜变量位置按片段在那里运动的程度计入，运动程度取自模型
+自己的干净估计的帧间差异。静止背景上的漂移代价很低；运动中的手上同样大小的漂移
+则不然。连续跳过的步上，预测值会**累加**，而且最多连续跳过两步，所以复用的答案
+离真实答案永远不远。
+
+这是 [面向 ComfyUI 的 MiniMax H3 MotionCache 节点](https://github.com/starsFriday/ComfyUI-MiniMax-H3-MotionCache)
+所采用的逐步形式，默认值也相同；vpipe 的判定在测试中逐步与该节点自己的代码对照过。
+该方法的逐 token 变体——只重算运动中的 token——没有实现。
+
+<a id="what-it-saves-2"></a>
+#### 能省多少
+
+出厂提示词，512 × 288 的 39 帧，`steps: 20`，不用 Turbo LoRA，种子 6，在
+**MacBook Pro M4 Pro, 64 GB** 上：
+
+| | 前向次数 | 去噪 | 整次运行 | 视频与关闭时相比 | 音频与关闭时相比 |
+|---|---|---|---|---|---|
+| 关闭 | 20 | 249 秒 | 6 分 3 秒 | — | — |
+| `motion_cache: true`（阈值 0.15） | **15** | **189 秒** | **4 分 58 秒** | 平均 PSNR 30.8 dB，最差一帧 27.5 | SNR 14.2 dB |
+
+跳过一步只花几毫秒的主机端计算，而一次前向在这里是 12.7 秒，所以去噪节省的时间
+就等于跳过的前向所占的比例。
+
+**它在哪里跳。**不在前面：预测的变化一开始每步接近 0.4，要到调度中段才降到阈值
+以下。在上面那次运行里，第一次复用发生在第 10 步，此后便交替进行——复用、前向、
+复用——直到最后两步，那两步照常运行。这也是**短调度收获很少**的原因：预热占去前
+四步，而在 8 步的调度里，剩下的每一步都让潜变量移动得足够远，使预测值一直偏高。
+16 步及以上再用它。
+
+**阈值是跳跃式起作用的。**把它提高到 0.2，在这个片段上什么也没改变：离阈值最近的
+两个分数是 0.204 和 0.218，仍然都在它之上，所以跳过的还是同样的五步。一个阈值能
+换来多少，取决于片段的分数恰好落在哪里；逐步跟踪（`VPIPE_H3_DENOISE_PROFILE=1`）
+会把每一个分数打印出来。
+
+**差别看起来是什么样。**两个片段是同一个镜头——同样的构图、同样的演奏——只是在被
+复用的步稍微推动了轨迹的地方，姿势和手的位置有细小偏移。音轨比画面动得多（SNR
+14 dB）：声音是同样的声音，波形却不同，所以在把长任务交给它之前先听一听。
+
+<a id="its-knobs"></a>
+#### 它的选项
+
+| 选项 | 出厂值 | 说明 |
+|---|---|---|
+| `motion_cache` | `false` | 关闭。它是一种近似；脸、手、快速运动和口型同步是最先显出问题的地方。 |
+| `motion_cache_threshold` | `0.15` | 被复用的步累计允许的预测变化量。**越高跳得越多。**ComfyUI 节点的示例工作流用 0.2。 |
+| `motion_cache_strength` | `1.0` | 运动所占的权重。0 表示所有位置同等对待。 |
+| `motion_cache_warmup` | `4` | 开头总是运行的步数。前两步无论如何都会运行——预测需要两次真实前向来测量。 |
+| `motion_cache_max_skips` | `2` | 最多连续复用的步数。 |
+| `motion_cache_start` / `motion_cache_end` | `0.15` / `0.95` | 它被参考的窗口，以调度从噪声（0）到干净（1）的比例表示。窗口之外的步总是运行。 |
+| `motion_cache_subsample` | `8` | 做判定所用样本的步长。被复用的步仍然复用每一个值。 |
+
+它能与上面所有设置组合——Sol、Sage、`i8_gemm`、神经引擎和各种 LoRA 都是让一次
+前向更便宜，而它让前向跑得更少。每个片段日志里会有一行说明它做了什么：
+
+```
+h3-denoise: motion_cache reused 5 of 20 steps -- 15 forwards ran, 1.33x fewer
+```
+
 <a id="the-neural-engine--for-m4-family-macs"></a>
 ### 神经网络引擎——面向 M4 系列 Mac
 
@@ -2058,7 +2203,7 @@ Engine**（ANE），而一次生成通常会让它闲置。vpipe 可以把每个
 好几倍，而 ANE 大致还是原来的速度，所以留给它接手的空间要小得多。两个引擎还
 读取同一份内存，所以 ANE 在推理时 GPU 自身的速率会下降。剩下的收益只有百分之
 几，而且取决于几何配置：在 24 GB 的 M5 Pro 上，960 × 544、243 帧、开启 Sol
-和 Sage、4 步的条件下**实测**，该层级成功启用，把去噪从 **203 s 降到 189 s
+和 Sage、3 步的条件下**实测**，该层级成功启用，把去噪从 **203 s 降到 189 s
 （1.07×）**。
 
 在 M5 上它有可能划算的情形，是前馈网络和投影在一个块中占主导的情形——即
@@ -2087,7 +2232,7 @@ M5 上，请把这个层级当作需要**在你自己的片段上实测**的东�
 #### 在 M4 上能省下多少
 
 在一台 **MacBook Pro（M4 Pro）、64 GB** 上**实测**，8-bit，960 × 544，124
-帧，4 步，稠密注意力：
+帧，3 步，稠密注意力：
 
 | | 去噪 | 整体耗时 |
 |---|---|---|

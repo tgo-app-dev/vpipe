@@ -1070,6 +1070,24 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     // dequant scratch weight, and y are all bf16); load the _bf16 i8 kernels.
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
+    // SAY WHICH WAY IT WENT, on the same terms as the Sol-Attn lines
+    // below: the context gates itself on matrix cores and on its
+    // kernels being there, so a run that asked for i8 and did not get
+    // it used to look exactly like a run that never asked -- same load
+    // lines, same block count, and the only evidence a clock that did
+    // not move. Nothing is said when it was not asked for.
+    if (cfg.i8_gemm && mc->session() != nullptr) {
+      if (m->_i8) {
+        mc->session()->info(fmt(
+            "MetalFlux2Transformer: i8_gemm on -- the block GEMMs run "
+            "dynamic-int8"));
+      } else {
+        mc->session()->warn(fmt(
+            "MetalFlux2Transformer: i8_gemm was asked for but the int8 "
+            "kernels or the matrix cores are not there; keeping "
+            "the dense GEMMs"));
+      }
+    }
   }
   {
     bool sage_fatal = false;

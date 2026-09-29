@@ -1,6 +1,7 @@
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
+#include "generative-models/shared/motion-cache.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -39,6 +40,69 @@ bf16_to_f32_(std::uint16_t b)
 }
 
 }  // namespace
+
+bool
+motion_cache_gathers(const MetalMiniMaxH3Transformer::Config& cfg,
+                     int grid_h, int grid_w, int video_rows,
+                     int audio_rows, int subsample,
+                     MotionCacheGathers* out, std::string* why)
+{
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    return false;
+  };
+  const int ph = cfg.patch_h, pw = cfg.patch_w;
+  const int PE = cfg.video_patch_elems();
+  const int cells = grid_h * grid_w;
+  const int f = std::max(1, subsample);
+  if (grid_h <= 0 || grid_w <= 0) {
+    return no("the request carries no video grid");
+  }
+  if (video_rows <= 0 || video_rows % cells != 0) {
+    return no(fmt("{} generated rows are not whole {}x{} frames",
+                  video_rows, grid_h, grid_w)());
+  }
+  if (cfg.patch_t != 1) { return no("a temporal patch is not supported"); }
+  if ((std::uint64_t)video_rows * (std::uint64_t)PE > 0xffffffffull) {
+    return no("the video state is past 32-bit offsets");
+  }
+  const int lt = video_rows / cells;
+  const int H = grid_h * ph, W = grid_w * pw;
+  out->channels = cfg.video_channels;
+  out->frames   = lt;
+  out->plane    = ((H + f - 1) / f) * ((W + f - 1) / f);
+  out->video.clear();
+  out->video.reserve((std::size_t)out->channels * lt * out->plane);
+  for (int c = 0; c < cfg.video_channels; ++c) {
+    for (int t = 0; t < lt; ++t) {
+      for (int y = 0; y < H; y += f) {
+        for (int x = 0; x < W; x += f) {
+          const std::size_t row = (std::size_t)t * cells +
+                                  (std::size_t)(y / ph) * grid_w +
+                                  (std::size_t)(x / pw);
+          const std::size_t el =
+              ((std::size_t)c * ph + (std::size_t)(y % ph)) * pw +
+              (std::size_t)(x % pw);
+          out->video.push_back((std::uint32_t)(row * PE + el));
+        }
+      }
+    }
+  }
+  out->audio.clear();
+  const int AC = cfg.audio_channels;
+  if (audio_rows > 0 && audio_rows % minimax_h3::kAudioChannels == 0) {
+    const int alat = audio_rows / minimax_h3::kAudioChannels;
+    for (int ch = 0; ch < minimax_h3::kAudioChannels; ++ch) {
+      for (int t = 0; t < alat; t += f) {
+        for (int k = 0; k < AC; ++k) {
+          out->audio.push_back(
+              (std::uint32_t)(((std::size_t)ch * alat + t) * AC + k));
+        }
+      }
+    }
+  }
+  return true;
+}
 
 bool
 denoise(const DenoiseRequest& req, std::string* err)
@@ -101,8 +165,12 @@ denoise(const DenoiseRequest& req, std::string* err)
                       grid == &req.sigma_grid ? "requested" : "adapter's",
                       grid->size(), req.video_shift, req.audio_shift)());
     }
-  } else if (!sv.set_timesteps(req.num_steps) ||
-             !sa.set_timesteps(req.num_steps)) {
+  } else if (req.num_steps < 1 ||
+             !sv.set_timesteps(req.num_steps + 1) ||
+             !sa.set_timesteps(req.num_steps + 1)) {
+    // `num_steps` counts FORWARDS, and the scheduler takes grid POINTS:
+    // N steps is the N + 1 points of linspace(1, 0, N + 1), the terminal
+    // zero included. See DenoiseRequest::num_steps for why the two differ.
     return fail("denoise: bad step count " + std::to_string(req.num_steps));
   }
   // The shift collapses duplicate sigmas, and it does so at whichever
@@ -192,6 +260,55 @@ denoise(const DenoiseRequest& req, std::string* err)
     }
   }
 
+  // MotionCache: a step whose forward a cached residual predicts well
+  // enough runs no forward at all. The window is a fraction of the
+  // sampling range mapped through the VIDEO shift -- the schedule the
+  // reference's sampler carries, the audio being mapped onto it -- and
+  // the estimator reads the generated rows only, through gathers that
+  // undo this loop's patch packing.
+  const motion_cache::Config mcfg =
+      motion_cache::config_from_flex(req.accel);
+  motion_cache::Cache mcache;
+  if (mcfg.enabled) {
+    std::string why;
+    MotionCacheGathers mg;
+    if (!mcache.begin(
+            req.accel,
+            motion_cache::percent_to_sigma(mcfg.start, req.video_shift),
+            motion_cache::percent_to_sigma(mcfg.end, req.video_shift),
+            /*x0_sign=*/1.0f)) {
+      why = fmt("the window {:.2f}-{:.2f} is empty", mcfg.start,
+                mcfg.end)();
+    } else if (!motion_cache_gathers(cfg, req.video_grid_h,
+                                     req.video_grid_w, nvid, naud,
+                                     mcache.subsample(), &mg, &why)) {
+      mcache = motion_cache::Cache();
+    }
+    if (why.empty()) {
+      mcache.set_video(mg.video.data(), mg.channels, mg.frames, mg.plane,
+                       (std::size_t)nvid * PE);
+      if (!mg.audio.empty()) {
+        mcache.set_audio(mg.audio.data(), mg.audio.size(),
+                         (std::size_t)naud * AC);
+      }
+      if (sess != nullptr) {
+        sess->info(fmt("h3-denoise: motion_cache on -- {}",
+                       mcache.describe()));
+      }
+    } else if (sess != nullptr) {
+      sess->warn(fmt("h3-denoise: motion_cache is OFF for this clip: {}",
+                     why));
+    }
+  }
+  // Only a computed step fills these; a reused one is filled by the
+  // cache. Held across steps so a reuse has somewhere to land.
+  std::vector<float> vel_v((std::size_t)nvid * PE);
+  std::vector<float> vel_a((std::size_t)naud * AC);
+  // Whether the cached residual covers the audio -- a computed step
+  // whose head wrote none leaves nothing to reuse there.
+  bool cached_audio = false;
+  int forwards = 0, reused_steps = 0, steps_run = 0;
+
   // A preview's clean estimate, filled only on a step that renders one.
   std::vector<float> preview_x0;
   for (int i = 0; i < steps; ++i) {
@@ -237,43 +354,84 @@ denoise(const DenoiseRequest& req, std::string* err)
                      uniq.size(), s));
     }
 
-    {
-      auto* d = static_cast<std::uint16_t*>(vb.contents());
-      for (std::size_t k = 0; k < (std::size_t)vrows * PE; ++k) {
-        d[k] = f32_to_bf16_(req.video[k]);
-      }
-    }
-    if (arows > 0) {
-      // Every audio row, reference blocks included -- they are what the
-      // generated rows attend to. Uploading only the generated count
-      // would leave the tail of the buffer whatever the allocation had
-      // in it, which is how a reference request turns into NaN.
-      auto* d = static_cast<std::uint16_t*>(ab.contents());
-      for (std::size_t k = 0; k < (std::size_t)arows * AC; ++k) {
-        d[k] = f32_to_bf16_(req.audio[k]);
-      }
-    }
-
-    MetalMiniMaxH3Transformer::Step st;
-    st.video  = &vb;
-    st.audio  = &ab;
-    st.text   = req.text;
-    st.layout = &L;
-    st.timesteps          = &uniq;
-    st.row_timestep_index = &row_idx;
-    st.endpoints          = two_time ? &uniq_r : nullptr;
-    st.schedule_index     = baked ? i : -1;
-    st.dense_attention    = i < req.sol_dense_steps;
-    st.video_grid_h       = req.video_grid_h;
-    st.video_grid_w       = req.video_grid_w;
-    std::string ferr;
+    float* vx = req.video + (std::size_t)ncond * PE;
+    float* ax = req.audio + (std::size_t)ncaud * AC;
+    const double sigma_v = sv.sigmas()[(std::size_t)i];
+    // Before anything is uploaded: a reused step never touches the GPU.
+    const bool reuse =
+        mcache.armed() && mcache.decide(sigma_v, vx, naud > 0 ? ax : nullptr);
+    bool have_aud = false;
     const auto t_fwd0 = std::chrono::steady_clock::now();
-    MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);
-    const auto t_fwd1 = std::chrono::steady_clock::now();
-    if (v.empty()) {
-      return fail("denoise: step " + std::to_string(i) + ": " +
-                  (ferr.empty() ? std::string("forward failed") : ferr));
+    if (reuse) {
+      mcache.predict(vx, vel_v.data(), cached_audio ? ax : nullptr,
+                     cached_audio ? vel_a.data() : nullptr);
+      have_aud = cached_audio;
+      ++reused_steps;
+    } else {
+      {
+        auto* d = static_cast<std::uint16_t*>(vb.contents());
+        for (std::size_t k = 0; k < (std::size_t)vrows * PE; ++k) {
+          d[k] = f32_to_bf16_(req.video[k]);
+        }
+      }
+      if (arows > 0) {
+        // Every audio row, reference blocks included -- they are what the
+        // generated rows attend to. Uploading only the generated count
+        // would leave the tail of the buffer whatever the allocation had
+        // in it, which is how a reference request turns into NaN.
+        auto* d = static_cast<std::uint16_t*>(ab.contents());
+        for (std::size_t k = 0; k < (std::size_t)arows * AC; ++k) {
+          d[k] = f32_to_bf16_(req.audio[k]);
+        }
+      }
+
+      MetalMiniMaxH3Transformer::Step st;
+      st.video  = &vb;
+      st.audio  = &ab;
+      st.text   = req.text;
+      st.layout = &L;
+      st.timesteps          = &uniq;
+      st.row_timestep_index = &row_idx;
+      st.endpoints          = two_time ? &uniq_r : nullptr;
+      st.schedule_index     = baked ? i : -1;
+      st.dense_attention    = i < req.sol_dense_steps;
+      st.video_grid_h       = req.video_grid_h;
+      st.video_grid_w       = req.video_grid_w;
+      std::string ferr;
+      MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);
+      if (v.empty()) {
+        return fail("denoise: step " + std::to_string(i) + ": " +
+                    (ferr.empty() ? std::string("forward failed") : ferr));
+      }
+      ++forwards;
+      // The GENERATED tails only. The head writes every row it was given,
+      // conditioning included, and those are never stepped.
+      {
+        const auto* g =
+            static_cast<const std::uint16_t*>(v.video.contents()) +
+            (std::size_t)ncond * PE;
+        for (std::size_t k = 0; k < vel_v.size(); ++k) {
+          vel_v[k] = bf16_to_f32_(g[k]);
+        }
+      }
+      if (naud > 0 && !v.audio.empty()) {
+        const auto* g =
+            static_cast<const std::uint16_t*>(v.audio.contents()) +
+            (std::size_t)ncaud * AC;
+        for (std::size_t k = 0; k < vel_a.size(); ++k) {
+          vel_a[k] = bf16_to_f32_(g[k]);
+        }
+        have_aud = true;
+      }
+      // With the state the forward ran ON -- the scheduler has not
+      // stepped it yet.
+      if (mcache.armed()) {
+        mcache.update(sigma_v, vx, vel_v.data(), have_aud ? ax : nullptr,
+                      have_aud ? vel_a.data() : nullptr);
+        cached_audio = have_aud;
+      }
     }
+    const auto t_fwd1 = std::chrono::steady_clock::now();
 
     // Step ONLY the generated tail. The conditioning rows lead the video
     // block precisely so this is a contiguous slice -- writing them
@@ -283,10 +441,8 @@ denoise(const DenoiseRequest& req, std::string* err)
     double vrms = 0.0, arms = 0.0, xrms = 0.0, vxcorr = 0.0;
     double xarms = 0.0, axcorr = 0.0;
     {
-      const auto* g = static_cast<const std::uint16_t*>(v.video.contents());
-      std::vector<float> vel((std::size_t)nvid * PE);
+      std::vector<float>& vel = vel_v;
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        vel[k] = bf16_to_f32_(g[(std::size_t)ncond * PE + k]);
         vrms += (double)vel[k] * (double)vel[k];
       }
       vrms = vel.empty() ? 0.0 : std::sqrt(vrms / (double)vel.size());
@@ -297,16 +453,15 @@ denoise(const DenoiseRequest& req, std::string* err)
       // corr near -1: x0 = x + sigma*v then collapses to a rescaling of
       // the input noise, which is prompt-independent noise out.
       {
-        const float* xb = req.video + (std::size_t)ncond * PE;
         double sxy = 0.0, sxx = 0.0;
         for (std::size_t k = 0; k < vel.size(); ++k) {
-          sxy += (double)vel[k] * (double)xb[k];
-          sxx += (double)xb[k] * (double)xb[k];
+          sxy += (double)vel[k] * (double)vx[k];
+          sxx += (double)vx[k] * (double)vx[k];
         }
-        const double den = std::sqrt(sxx) * std::sqrt((double)vel.size()) * vrms;
+        const double den =
+            std::sqrt(sxx) * std::sqrt((double)vel.size()) * vrms;
         vxcorr = den > 0.0 ? sxy / den : 0.0;
       }
-      float* vx = req.video + (std::size_t)ncond * PE;
       // The clean estimate, taken before the step overwrites the state it
       // is estimated from.
       if (req.preview && req.preview_due && req.preview_due(i + 1, steps)) {
@@ -322,22 +477,16 @@ denoise(const DenoiseRequest& req, std::string* err)
       if (!vok) {
         return fail("denoise: video step " + std::to_string(i) + " failed");
       }
-      const float* x = req.video + (std::size_t)ncond * PE;
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        xrms += (double)x[k] * (double)x[k];
+        xrms += (double)vx[k] * (double)vx[k];
       }
       xrms = vel.empty() ? 0.0 : std::sqrt(xrms / (double)vel.size());
     }
-    if (naud > 0 && !v.audio.empty()) {
-      // The head writes every audio row it was given, reference rows
-      // included; only the generated tail is stepped, so both the
-      // velocity and the state are read from `ncaud` on.
-      const auto* g = static_cast<const std::uint16_t*>(v.audio.contents()) +
-                      (std::size_t)ncaud * AC;
-      float* ax = req.audio + (std::size_t)ncaud * AC;
-      std::vector<float> vel((std::size_t)naud * AC);
+    if (have_aud) {
+      // Only the generated tail is stepped, so both the velocity and the
+      // state are read from `ncaud` on.
+      std::vector<float>& vel = vel_a;
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        vel[k] = bf16_to_f32_(g[k]);
         arms += (double)vel[k] * (double)vel[k];
       }
       arms = vel.empty() ? 0.0 : std::sqrt(arms / (double)vel.size());
@@ -370,6 +519,7 @@ denoise(const DenoiseRequest& req, std::string* err)
       }
       xarms = vel.empty() ? 0.0 : std::sqrt(xarms / (double)vel.size());
     }
+    ++steps_run;
 
     // Per-step trace. Timing alone cannot separate "the GPU work never
     // launched" from "it launched and returned garbage" -- a kernel that
@@ -383,14 +533,25 @@ denoise(const DenoiseRequest& req, std::string* err)
           std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count();
       const double tot_ms =
           std::chrono::duration<double, std::milli>(t_end - t_fwd0).count();
+      // What MotionCache made of the step, when it was asked: the score
+      // is the predicted relative change of the output, and the sum is
+      // what the threshold compares.
+      std::string mc;
+      if (mcache.armed()) {
+        mc = reuse ? "  REUSED" : "  computed";
+        if (mcache.last_score() >= 0.0) {
+          mc += fmt(" (score {:.5f}, accumulated {:.5f})",
+                    mcache.last_score(), mcache.accumulated())();
+        }
+      }
       sess->info(fmt(
           "h3-denoise step {:2}/{}  sigma {:.4f} -> {:.4f}  fwd {:7.1f} ms  "
           "total {:7.1f} ms  |v_vid| {:.5f}  |x_vid| {:.5f} "
           "corr_vid {:+.5f}  |  |v_aud| {:.5f}  |x_aud| {:.5f} "
-          "corr_aud {:+.5f}",
+          "corr_aud {:+.5f}{}",
           i + 1, steps, sv.sigmas()[(std::size_t)i],
           sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, vrms, xrms,
-          vxcorr, arms, xarms, axcorr));
+          vxcorr, arms, xarms, axcorr, mc));
     }
 
     if (!preview_x0.empty()) {
@@ -398,6 +559,20 @@ denoise(const DenoiseRequest& req, std::string* err)
       preview_x0.clear();
     }
     if (req.progress && !req.progress(i + 1, steps)) { break; }
+  }
+  if (req.report != nullptr) {
+    req.report->steps    = steps_run;
+    req.report->forwards = forwards;
+    req.report->reused   = reused_steps;
+    req.report->motion_cache = mcache.armed();
+  }
+  // The one line that says whether the setting did anything. The ratio
+  // is of FORWARDS, the dominant cost of a step, not of wall time.
+  if (mcache.armed() && sess != nullptr) {
+    sess->info(fmt("h3-denoise: motion_cache reused {} of {} steps -- {} "
+                   "forwards ran, {:.2f}x fewer", reused_steps, steps_run,
+                   forwards,
+                   forwards > 0 ? (double)steps_run / forwards : 1.0));
   }
   return true;
 }

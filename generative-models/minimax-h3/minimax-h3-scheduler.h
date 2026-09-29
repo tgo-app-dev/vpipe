@@ -39,6 +39,11 @@ class MiniMaxH3Scheduler {
   // evaluations -- the terminal sigma has none. False when `num_steps`
   // is under 2 or the shift is not positive.
   //
+  // That is the REFERENCE's argument, kept so this class can be checked
+  // against it call for call. It is not what a user's `steps` means: the
+  // denoise loop counts forwards, as diffusers and ComfyUI do, and asks
+  // for steps + 1 points (see DenoiseRequest::num_steps).
+  //
   // The grid is linspace(1, 0, num_steps) pushed through
   //     sigma' = s*sigma / (1 + (s-1)*sigma)
   // with consecutive duplicates collapsed: the shift compresses the grid

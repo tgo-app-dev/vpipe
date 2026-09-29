@@ -44,6 +44,7 @@ set(LOCAL_SOURCES
   shared/sol-attention.cc
   shared/metal-sol-attention.cc
   shared/metal-sage-attention.cc
+  shared/motion-cache.cc
   shared/wan-vae-names.cc
   shared/wired-pool.cc
   shared/mcp/file-sandbox.cc

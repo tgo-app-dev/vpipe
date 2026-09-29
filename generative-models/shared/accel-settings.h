@@ -98,6 +98,37 @@ inline constexpr std::string_view kSolDenseLayers = "sol_dense_layers";
 // Key blocks either side of the query's own, kept exact. Int; default 1.
 inline constexpr std::string_view kSolLocalRadius = "sol_local_radius";
 
+// ---- MotionCache ----------------------------------------------------
+//
+// Step-level caching (shared/motion-cache.h): a denoiser forward whose
+// output a cached residual predicts well enough is skipped. Unlike every
+// tier above it saves whole FORWARDS rather than making one cheaper, so it
+// composes with all of them. Implemented by the family's SAMPLING LOOP,
+// not by its transformer.
+//
+// Bool; default false.
+inline constexpr std::string_view kMotionCache = "motion_cache";
+// Accumulated predicted relative change under which a step reuses.
+// Real; default 0.15. Higher skips more.
+inline constexpr std::string_view kMotionCacheThreshold =
+    "motion_cache_threshold";
+// Weight of frame-to-frame motion in every change measure. Real;
+// default 1.0; 0 weighs every position equally.
+inline constexpr std::string_view kMotionCacheStrength =
+    "motion_cache_strength";
+// Leading forwards always computed. Int; default 4.
+inline constexpr std::string_view kMotionCacheWarmup = "motion_cache_warmup";
+// Most reused forwards in a row. Int; default 2, at least 1.
+inline constexpr std::string_view kMotionCacheMaxSkips =
+    "motion_cache_max_skips";
+// The window it is consulted in, as fractions of the sampling range (0
+// noise, 1 clean). Real; defaults 0.15 and 0.95, start < end.
+inline constexpr std::string_view kMotionCacheStart = "motion_cache_start";
+inline constexpr std::string_view kMotionCacheEnd = "motion_cache_end";
+// Latent stride of the change estimator. Int; default 8, at least 1.
+inline constexpr std::string_view kMotionCacheSubsample =
+    "motion_cache_subsample";
+
 // ---- the ANE tier ---------------------------------------------------
 //
 // The block's feed-forward on the Apple Neural Engine. This is the one
@@ -257,7 +288,8 @@ inline std::vector<std::string_view>
 tiers_on(const FlexData* bag)
 {
   std::vector<std::string_view> out;
-  for (std::string_view k : {kI8Gemm, kSageAttn, kSolAttn, kAneFfn}) {
+  for (std::string_view k :
+       {kI8Gemm, kSageAttn, kSolAttn, kAneFfn, kMotionCache}) {
     if (flag(bag, k)) { out.push_back(k); }
   }
   return out;
