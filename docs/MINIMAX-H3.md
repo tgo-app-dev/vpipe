@@ -55,6 +55,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Merging, and why it loses most of this adapter](#merging-and-why-it-loses-most-of-this-adapter)
     - [Which Turbo adapters work](#which-turbo-adapters-work)
     - [Community LoRAs — Civitai, musubi-tuner, ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
+  - [FP8 checkpoints — lightx2v's turbo DiT](#fp8-checkpoints--lightx2vs-turbo-dit)
   - [Eight steps — HyperFlow](#eight-steps--hyperflow)
     - [Fetch it, then name it](#fetch-it-then-name-it)
     - [What makes it different](#what-makes-it-different)
@@ -1962,6 +1963,61 @@ the Turbo adapters, vpipe reads a fused `qkv_proj` adapter as Comfy-Org's
 flat grouping and re-orders it for the per-head MiniMaxAI release. If an
 adapter was trained on MiniMaxAI's own weights, set
 `lora_qkv_layout: per_head` (`lora2_qkv_layout` for the second slot).
+
+### FP8 checkpoints — lightx2v's turbo DiT
+
+[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+publishes the FL2VA DiT with its 4-step Turbo **merged in** and stored as
+**FP8** — `minimax_h3_fl2v_turbo_4step_v1.1_768p_fp8.safetensors`, 32 GB
+against the 66 GB of bf16. It is one file with no config, in the
+**diffusers** naming (`transformer_blocks.0.attn.to_q` rather than this
+model's own `blocks.0.attn.qkv_proj`), and each weight carries a per-row
+scale.
+
+Run it as it is. Point `generate-video`'s `dit_dir` at the file and keep
+`model-select` on the H3 checkpoint you already have, which supplies the
+prompt encoder and both VAEs:
+
+```json
+"config": {
+  "height": 480,
+  "width": 832,
+  "frames": 56,
+  "steps": 4,
+  "seed": 6,
+  "dit_dir": "/path/to/minimax_h3_fl2v_turbo_4step_v1.1_768p_fp8.safetensors"
+}
+```
+
+The Turbo is inside those weights, so leave the Turbo LoRA off and run
+4 steps.
+
+Nothing is converted and nothing lands on disk. The names are translated
+when the file is opened: q, k and v are stacked into the fused projection,
+the two halves of the first feed-forward matrix are exchanged into this
+model's gate-first order, and the rotary table the file omits is computed
+from its base. The weights **stay FP8 in memory**. Each projection is
+widened to bf16 on the GPU just before it is used, so a streamed block is
+half the size it is in bf16 (367 MB against 735). That computes exactly
+what a bf16 copy of the file would, checked bit for bit, streamed and
+preloaded. So is the translation itself: the publisher's bf16 diffusers
+checkpoint (`MiniMaxAI/MiniMax-H3-diffusers`) now loads the same way, and
+matches the native release to the bit.
+
+MEASURED on an M4 Pro at 832×480×56, 4 steps, with the file on an external
+SSD: 4 m 54 s end to end, against 4 m 56 s for the bf16 FL2VA weights with
+lightx2v's matching bf16 Turbo LoRA applied at runtime. The two clips show
+the same shot and motion. The FP8 weights, and the Turbo merged into them
+rather than applied at runtime, move the details a little.
+
+**FP8 LoRAs**, plain or scaled, work anywhere a LoRA does. A scaled FP8
+adapter runs exactly what its bf16 decode does. Prefer the scaled form,
+because plain FP8 flushes the small values a LoRA is made of.
+
+Not supported: Comfy-Org's `…_pruned_fp8_scaled` files. The FP8 in them
+reads, but *pruned* H3 is a different network (a table-driven AdaLN in
+place of the time embedder), and this build does not run it in any
+precision.
 
 ### Eight steps — HyperFlow
 

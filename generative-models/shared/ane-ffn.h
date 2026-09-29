@@ -38,7 +38,19 @@ namespace genai {
 // source rows one slot row comes from, so a fused [gate; up] matrix is
 // read as two halves (stride 1, offset 0 / ffn) and an interleaved
 // [g0,u0,g1,u1,...] one as every other row (stride 2, offset 0 / 1).
+//
+// A DENSE source may also be FP8: `bits` set to kFp8E4M3 / kFp8E5M2 with
+// `quantized` false says `*w` holds one FP8 code per element rather than
+// bf16. Spelled as a NEGATIVE bits value, not a new field, on purpose:
+// this struct crosses the plugin boundary, a field would move its layout,
+// and no producer has ever handed a dense source a negative width -- they
+// pass 0, or a quantized weight's 4 / 8 -- so the value cannot collide.
+// A SCALED FP8 source puts its f32 scale in `scales` -- one value, or
+// one per source row -- which a dense source has no other use for; an
+// unscaled one leaves it null or empty.
 struct AneFfnSource {
+  static constexpr int kFp8E4M3 = -1;
+  static constexpr int kFp8E5M2 = -2;
   const metal_compute::SharedBuffer* w      = nullptr;
   const metal_compute::SharedBuffer* codes  = nullptr;
   const metal_compute::SharedBuffer* scales = nullptr;

@@ -10,6 +10,7 @@
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/boogu/metal-boogu-calibration.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
+#include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/krea2/metal-krea2-calibration.h"
 #include "generative-models/quantize-profile.h"
 #include "generative-models/qwen-image/metal-qwen-image-calibration.h"
@@ -83,9 +84,20 @@ ModelQuantizeStage::ModelQuantizeStage(
     fail_config(fmt("ModelQuantizeStage('{}'): config.output_name is required",
                     this->id()));
   }
-  if (_bits != 4 && _bits != 8) {
-    fail_config(fmt("ModelQuantizeStage('{}'): bits must be 4 or 8 (got {})",
-                    this->id(), _bits));
+  if (_bits != 4 && _bits != 8 && _bits != 16) {
+    fail_config(fmt("ModelQuantizeStage('{}'): bits must be 4 or 8, or 16 "
+                    "for a dense bf16 checkpoint (got {})", this->id(),
+                    _bits));
+  }
+  // 16 is not a bit-width the affine path has: it quantizes nothing, so
+  // every option that shapes a quantization is a contradiction rather
+  // than a no-op, and silently ignoring one would leave a user thinking
+  // it had run.
+  if (_bits == 16 && (_awq || _mixed || _quant_modulation)) {
+    fail_config(fmt(
+        "ModelQuantizeStage('{}'): bits=16 writes a dense checkpoint and "
+        "quantizes nothing, so awq / mixed / quant_modulation do not apply",
+        this->id()));
   }
   if (_group_size != 32 && _group_size != 64) {
     fail_config(fmt(
@@ -217,6 +229,16 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family,
         }
       }
     }
+  }
+  // A Krea-2 DiT in Krea's OWN layout, named directly -- the single
+  // .safetensors community fine-tunes ship (often FP8). No config.json and
+  // no `__metadata__`: it is recognised by its tensor names, and the
+  // quantizer translates it to the diffusers layout on the way through
+  // (krea2/krea2-native-checkpoint.h), so the output is an ordinary
+  // transformer directory.
+  if (genai::krea2::is_native_dit_file(src_dir)) {
+    if (family != nullptr) { *family = "krea2"; }
+    return src_dir;
   }
   // A repack this stage has ALREADY quantized: the role subdirs survive and
   // the quantized component is a directory checkpoint inside its own, so the
@@ -671,14 +693,21 @@ dit_num_layers_(const std::string& src_dir)
 constexpr ConfigKey kAttrs[] = {
   {.key = "src_model", .type = ConfigType::String, .required = true,
    .doc = "source model: a models-DB key (registered by model-fetch) or a "
-          "bf16/f16 safetensors directory path",
+          "path -- a bf16/f16/fp8 safetensors directory, or ONE .safetensors "
+          "file: a Comfy-Org component, or a Krea-2 DiT in Krea's own layout "
+          "(a community fine-tune), which is written out under diffusers "
+          "names",
    .suggest_db = kModelRegistryDb},
   {.key = "output_name", .type = ConfigType::String, .required = true,
    .doc = "result name -> <cwd>/models/<output_name> (registered in the "
           "models DB under this key), or an explicit path (\"/..\", \"./..\") "
           "used verbatim and not registered"},
   {.key = "bits", .type = ConfigType::Uint,
-   .doc = "backbone affine bit-width (4 | 8)", .def_uint = 8},
+   .doc = "backbone affine bit-width (4 | 8), or 16 for a DENSE output that "
+          "quantizes nothing: FP8 tensors are decoded to bf16 (exactly -- "
+          "every FP8 value is a bf16 value) and everything else is copied, "
+          "so an FP8 checkpoint becomes an ordinary bf16 one",
+   .def_uint = 8},
   {.key = "group_size", .type = ConfigType::Uint,
    .doc = "affine group size (32 | 64)", .def_uint = 64},
   {.key = "arch", .type = ConfigType::String,
@@ -797,6 +826,9 @@ const StageSpec kSpec = {
                "the output is a SELF-CONTAINED pipeline (all components copied, "
                "the target quantized) usable directly as a generate-image "
                "hf_dir -- chain passes to quantize more than one component. "
+               "FP8 sources (F8_E4M3 / F8_E5M2, plain or scaled) are read "
+               "as bf16; bits=16 writes one out dense instead of "
+               "quantizing it. "
                "Optional trigger in / summary out.",
   .display_name = "Model Quantize",
   .category  = StageCategory::Preparation,
@@ -832,7 +864,9 @@ ModelQuantizeStage::register_output_(const std::string& key,
     auto ro = rec.as_object();
     ro.insert_or_assign("local_path", FlexData::make_string(dir));
     ro.insert_or_assign("source", FlexData::make_string(_src_model));
-    ro.insert_or_assign("quantized", FlexData::make_bool(true));
+    // bits=16 is the dense pass: an FP8 or native-layout source written
+    // out as an ordinary checkpoint, which is not a quantized one.
+    ro.insert_or_assign("quantized", FlexData::make_bool(bits < 16));
     ro.insert_or_assign("bits", FlexData::make_uint((std::uint64_t)bits));
     // Describe the OUTPUT by probing it (model-detect.h), so a quantized
     // model carries the same runtime type + I/O modalities as a fetched
@@ -1022,10 +1056,16 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
                                  stop)) {
       return false;
     }
-    session()->log_normal(fmt(
-        "ModelQuantizeStage('{}'): quantized {} DiT '{}' -> '{}' ({}-bit "
-        "g{}{}{})", this->id(), t2i_family, src_dir, out_dir, _bits,
-        _group_size, _mixed ? " mixed" : "", _awq ? " awq-clip" : ""));
+    if (_bits == 16) {
+      session()->log_normal(fmt(
+          "ModelQuantizeStage('{}'): wrote {} DiT '{}' -> '{}' dense (bf16, "
+          "nothing quantized)", this->id(), t2i_family, src_dir, out_dir));
+    } else {
+      session()->log_normal(fmt(
+          "ModelQuantizeStage('{}'): quantized {} DiT '{}' -> '{}' ({}-bit "
+          "g{}{}{})", this->id(), t2i_family, src_dir, out_dir, _bits,
+          _group_size, _mixed ? " mixed" : "", _awq ? " awq-clip" : ""));
+    }
     // "<family>-dit" (transformer-only) -> the generate-image dit_dir slot.
     if (!explicit_path) {
       register_output_(_output_name, out_dir, t2i_family + "-dit", _bits);
@@ -1320,7 +1360,7 @@ ModelQuantizeStage::quantize_dit_component_(
   // gate/up projections are all group-32 work. Pick the largest supported group
   // that divides the DiT's hidden width and say so, rather than shipping a
   // checkpoint that only quantized the layers that happened to fit.
-  {
+  if (_bits != 16) {
     const int hid = dit_hidden_size_(dit_dir);
     if (hid > 0 && (hid % opt.group) != 0) {
       int g = 0;
@@ -1509,6 +1549,17 @@ ModelQuantizeStage::quantize_dit_component_(
     // Krea-2 DiT config over its weights. Refuse instead. Plain and
     // mixed quantization are unaffected, and an explicit calib_dir
     // still works.
+    if (fs::is_regular_file(fs::path(dit_dir), ec) && _calib_dir.empty()) {
+      // On-device calibration drives the family's text encoder, which it
+      // finds BESIDE the DiT -- and a DiT named as one file has nothing
+      // beside it. Say so here rather than let the collector fail on a
+      // missing encoder under the file's parent directory.
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): '{}' is a single-file DiT, so there is "
+          "no text encoder beside it to calibrate AWQ with -- supply "
+          "calib_dir, or drop awq", this->id(), dit_dir));
+      return false;
+    }
     if (is_zimage && _calib_dir.empty()) {
       session()->warn(fmt(
           "ModelQuantizeStage('{}'): z-image has no on-device AWQ "
@@ -2402,10 +2453,14 @@ ModelQuantizeStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // bits=16 is the dense pass, which has no group and quantizes nothing.
+  const std::string format =
+      _bits == 16 ? std::string("dense bf16")
+                  : fmt("{}-bit g{}", _bits, _group_size)();
   session()->info(fmt(
-      "ModelQuantizeStage('{}'): quantizing '{}' -> '{}' ({}-bit g{}{}{})",
-      this->id(), _src_model, _output_name, _bits, _group_size,
-      _awq ? (_awq_clip ? " awq+clip" : " awq") : "",
+      "ModelQuantizeStage('{}'): {} '{}' -> '{}' ({}{}{})", this->id(),
+      _bits == 16 ? "converting" : "quantizing", _src_model, _output_name,
+      format, _awq ? (_awq_clip ? " awq+clip" : " awq") : "",
       _mixed ? " mixed" : ""));
   const bool ok = quantize_once([&ctx] { return ctx.stop_requested(); });
   // Emit the summary only on success, so a failed quantization halts the
@@ -2420,9 +2475,8 @@ ModelQuantizeStage::process(RuntimeContext& ctx)
     so.insert_or_assign("group_size", FlexData::make_int(_group_size));
     so.insert_or_assign("quantized", FlexData::make_bool(ok));
     so.insert_or_assign("text", FlexData::make_string(
-        fmt("[model-quantize] {} -> {} ({}-bit, group {}) [{}]",
-            _src_model, _output_name, _bits, _group_size,
-            ok ? "ok" : "failed")()));
+        fmt("[model-quantize] {} -> {} ({}) [{}]", _src_model,
+            _output_name, format, ok ? "ok" : "failed")()));
     co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(summary)));
   }
   ctx.signal_done();

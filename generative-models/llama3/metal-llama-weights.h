@@ -19,6 +19,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <map>
 #include <optional>
@@ -109,6 +110,32 @@ public:
   // All tensor names in the checkpoint (unordered). Used by the model
   // quantizer to enumerate + classify every tensor.
   std::vector<std::string> tensor_names() const;
+
+  // RENAME the checkpoint's tensors in place: the name table only, never
+  // a byte -- every offset, size and dtype stays exactly as the file
+  // holds it, so load / load_mapped / pread_into keep reading the same
+  // bytes under the new names.
+  //
+  // For a checkpoint published in a layout other than the one its loader
+  // reads (a Krea-2 fine-tune in Krea's own naming): translating once
+  // here means every reader above -- a WeightSet, the block-slot refill,
+  // the streaming planner, the quantizer -- sees one namespace, instead
+  // of each carrying a map it could forget.
+  //
+  // `fn` gets each (name, info) and returns the new name, having edited
+  // the info's SHAPE if the layout needs a reshape (the bytes are
+  // row-major either way); an EMPTY return drops the tensor. It is all or
+  // nothing: two tensors mapping to one name leaves the table untouched
+  // and returns false.
+  //
+  // What was translated is NOT recorded on this object, deliberately:
+  // plugins receive a MetalLlamaWeights BY VALUE (open_model returns an
+  // optional of one), so a data member added here moves its layout under
+  // them. A caller that needs to know asks the file (open() does not
+  // translate).
+  using RenameFn = std::function<std::string(const std::string& name,
+                                             TensorInfo& info)>;
+  bool rename_tensors(const RenameFn& fn);
 
   // Where a load's wall time went. The two halves answer different
   // questions for a streaming model: `alloc` is the SharedBuffer, which

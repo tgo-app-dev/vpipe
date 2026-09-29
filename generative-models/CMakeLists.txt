@@ -82,6 +82,9 @@ set(LOCAL_SOURCES
   krea2/metal-krea2-vae.cc
   krea2/metal-krea2-calibration.cc
   krea2/flow-sampler.cc
+  krea2/krea2-native-checkpoint.cc
+  shared/fp8-layout.cc
+  shared/fp8-expand.cc
   qwen-image/metal-qwen-image-transformer.cc
   qwen-image/qwen-image21-layout.cc
   qwen-image/metal-qwen-image21-transformer.cc
@@ -106,6 +109,7 @@ set(LOCAL_SOURCES
   wan/metal-umt5-encoder.cc
   wan/metal-wan-transformer.cc
   minimax-h3/minimax-h3-layout.cc
+  minimax-h3/minimax-h3-diffusers-layout.cc
   minimax-h3/vdn-geometry.cc
   minimax-h3/vdn-delta-solve.cc
   minimax-h3/vdn-linear-features.cc
@@ -127,6 +131,7 @@ set(LOCAL_SOURCES
   quantize/calibration.cc
   quantize/calibration-corpus.cc
   quantize/model-quantizer.cc
+  quantize/quant-source.cc
   quantize/safetensors-writer.cc
   eval/lm-eval.cc
 )

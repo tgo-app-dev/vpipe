@@ -10,6 +10,9 @@
 #include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/fp8-expand.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
@@ -412,7 +415,19 @@ class MetalKrea2Transformer {
     metal_compute::SharedBuffer codes, scales, qbias;  // affine quant
     bool quantized = false;
     int  bits = 0;                                   // 4 or 8 (per-weight; mixed)
-    bool empty() const { return quantized ? codes.empty() : w.empty(); }
+    // FP8 storage: `codes` holds the checkpoint's own [N, K] bytes,
+    // expanded to bf16 on the GPU right before each GEMM (fp8_dense_).
+    // Deliberately NOT `quantized`: no group scales, and every path that
+    // reads an affine triple must not be handed one. SCALED FP8 adds
+    // `f8_scale`, f32 -- one value, or one per row when `f8_per_row` --
+    // multiplied in by the same expansion (shared/fp8-layout.h).
+    fp8::Format f8 = fp8::Format::kNone;
+    metal_compute::SharedBuffer f8_scale;
+    bool f8_per_row = false;
+    bool is_fp8() const { return f8 != fp8::Format::kNone; }
+    bool empty() const {
+      return (quantized || is_fp8()) ? codes.empty() : w.empty();
+    }
   };
 
   // A Krea2 attention+SwiGLU block (used by the fusion tower and the main image
@@ -485,6 +500,29 @@ class MetalKrea2Transformer {
                  const metal_compute::SharedBuffer& xin, const QWeight& w,
                  const metal_compute::SharedBuffer& y, std::size_t ye, int M,
                  int N, int K);
+
+  // A projection's FP8 scale as an f32 buffer (one value, or one per
+  // row), read fresh -- tiny, and for a streamed block it has to follow
+  // the block. Empty on failure.
+  metal_compute::SharedBuffer fp8_scale_buf_(const std::string& weight);
+
+  // After a slot refill: does the slot's KIND of each projection (FP8 or
+  // not, format, scale shape) match what block L holds? A checkpoint that
+  // mixes kinds across blocks (ComfyUI's "mixed ops") would otherwise have
+  // one block's bytes read as another's encoding. False sends the slots to
+  // their per-block fallback, which builds each block as it is.
+  bool fp8_kinds_match_(int L, const Block& b) const;
+
+  // The dense view every GEMM path reads for an FP8 weight: encode its
+  // expansion into the reusable _w_deq scratch and return `view` aliasing
+  // it, or `w` itself for any other kind. Serial dispatch on one encoder is
+  // what makes the one scratch safe across the block's GEMMs -- each
+  // expand-then-multiply pair runs before the next expansion writes, the
+  // same guarantee gemm_mma_'s affine dequant rests on. Null when the
+  // scratch cannot be had (then _fp8_failed is latched and the forward
+  // reports failure rather than multiplying by an empty buffer).
+  const QWeight* fp8_dense_(metal_compute::ComputeEncoder& enc,
+                            const QWeight& w, QWeight& view, int N, int K);
 
   // Dynamic-int8 accelerated GEMMs (Config::i8_gemm / VPIPE_I8_GEMM);
   // null when off. Tried first in gemm_mma_ for qualifying shapes.
@@ -801,6 +839,15 @@ class MetalKrea2Transformer {
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep,
       _fn_dense_mma_tn2, _fn_dequant4, _fn_dequant8;
   metal_compute::SharedBuffer _w_deq;   // reusable [N,K] f16 dequant scratch
+  // FP8 weights (a checkpoint stored F8_E4M3 / F8_E5M2): the expansion
+  // kernels, loaded only when the checkpoint holds one, on EVERY box --
+  // unlike the affine dequant above, which only the matrix-core path
+  // needs, an FP8 weight has no in-kernel form on either.
+  fp8::Expander _fp8x;          // the widening kernels (shared/fp8-expand.h)
+  bool _fp8_failed = false;
+  // Which checkpoint tensors are FP8 and with what scale; the encoding's
+  // own tensors are in `aux`. Scanned once at load, before any read.
+  fp8::Layout _f8;
   bool _use_mma2 = false;
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128-row tile
   // Split-K deep-reduction GEMM for the very deep K (ff-down, K=16384): the

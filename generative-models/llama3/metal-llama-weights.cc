@@ -1,5 +1,9 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 
+#include "generative-models/krea2/krea2-native-checkpoint.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/shared/fp8-layout.h"
+
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/shared/torch-zip.h"
@@ -203,6 +207,31 @@ MetalLlamaWeights::open(const std::string& safetensors_path)
   return w;
 }
 
+namespace {
+
+// Every name translation a checkpoint can need, applied here, once, so
+// every reader of it sees the one namespace its loader reads. Each is a
+// no-op on a checkpoint that is not its layout, and each renames a
+// checkpoint WHOLE or not at all.
+//
+//   krea2::translate_native    Krea-2 in Krea's own naming (single files)
+//   fp8::translate_torchao     torchao's `_weight_qdata`/`_weight_scale`
+//                              FP8 spelling -> the comfy_quant one
+//   minimax_h3::translate_diffusers
+//                              MiniMax-H3 in the diffusers naming -> H3's
+//
+// torchao first: the H3 layout test reads `.weight` names.
+void
+translate_names_(std::optional<MetalLlamaWeights>& w, bool single_file)
+{
+  if (!w.has_value()) { return; }
+  if (single_file) { (void)krea2::translate_native(*w); }
+  (void)fp8::translate_torchao(*w);
+  (void)minimax_h3::translate_diffusers(*w);
+}
+
+}  // namespace
+
 std::optional<MetalLlamaWeights>
 MetalLlamaWeights::open_model(const std::string& model_dir)
 {
@@ -225,7 +254,15 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   // already come up. Naming the file is how a caller picks ONE quant out
   // of a repo directory that holds several, so it has to work.
   if (fs::is_regular_file(dir, ec) && !ec && dir.extension() != ".gguf") {
-    return open(model_dir);
+    auto w = open(model_dir);
+    // A Krea-2 DiT in Krea's OWN naming -- the single file community
+    // fine-tunes ship -- is presented under the diffusers names its
+    // loader reads. Here, once, so that every reader of this checkpoint
+    // sees the same namespace (krea2/krea2-native-checkpoint.h). A file
+    // the translation cannot place whole keeps its own names, and then
+    // loads as what it is: a checkpoint the loader does not recognise.
+    translate_names_(w, /*single_file=*/true);
+    return w;
   }
 
   // mlx-optiq stores the (unquantized BF16) vision tower in a SIDECAR
@@ -351,7 +388,9 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
       return std::nullopt;   // every listed shard absent -> nothing to load
     }
     map_vision_sidecar_(w);
-    return w;
+    std::optional<MetalLlamaWeights> ow(std::move(w));
+    translate_names_(ow, /*single_file=*/false);
+    return ow;
   }
 
   // Index-less sharded layout: some checkpoints (e.g. MOSS-TTS-8B) ship
@@ -379,7 +418,9 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
         }
       }
       map_vision_sidecar_(w);
-      return w;
+      std::optional<MetalLlamaWeights> ow(std::move(w));
+      translate_names_(ow, /*single_file=*/false);
+      return ow;
     }
   }
 
@@ -391,6 +432,7 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   }
   auto single = open(sf.string());
   if (single) { map_vision_sidecar_(*single); }
+  translate_names_(single, /*single_file=*/false);
   return single;
 }
 
@@ -463,6 +505,23 @@ MetalLlamaWeights::tensor_names() const
   names.reserve(_tensors.size());
   for (const auto& kv : _tensors) { names.push_back(kv.first); }
   return names;
+}
+
+bool
+MetalLlamaWeights::rename_tensors(const RenameFn& fn)
+{
+  // Built aside and swapped in whole, so a collision leaves the table as
+  // it was rather than half-renamed.
+  std::unordered_map<std::string, TensorInfo> next;
+  next.reserve(_tensors.size());
+  for (const auto& [name, info] : _tensors) {
+    TensorInfo ti = info;
+    std::string to = fn(name, ti);
+    if (to.empty()) { continue; }
+    if (!next.emplace(std::move(to), std::move(ti)).second) { return false; }
+  }
+  _tensors = std::move(next);
+  return true;
 }
 
 MetalLlamaWeights::Alignment

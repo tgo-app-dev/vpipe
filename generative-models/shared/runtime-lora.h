@@ -281,6 +281,10 @@ private:
   metal_compute::SharedBuffer take_(const std::string& name, float m);
   // One factor as f32, scaled by `m`.
   bool take_f32_(const std::string& name, float m, std::vector<float>* out);
+  // An FP8 factor, plain or scaled, as bf16 (runtime-lora.cc). A METHOD,
+  // not state: a data member here would move this class's layout.
+  bool fp8_factor_(const std::string& name,
+                   std::vector<std::uint16_t>* out) const;
 
   metal_compute::MetalCompute* _mc = nullptr;
   std::unique_ptr<MetalLlamaWeights> _w;

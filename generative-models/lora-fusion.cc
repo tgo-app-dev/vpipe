@@ -7,6 +7,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/safetensors-writer.h"
 #include "generative-models/shared/comfy-output-config.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/lora-names.h"
 #include "interfaces/session-context-intf.h"
 
@@ -170,6 +171,16 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
   }
   const MetalLlamaWeights& base = *baseopt;
   const MetalLlamaWeights& lora = *loraopt;
+  // An FP8 LoRA -- plain, or scaled (shared/fp8-layout.h) -- is decoded
+  // factor by factor below; one in an encoding that cannot be decoded is
+  // refused here, by name.
+  {
+    fp8::Layout l;
+    std::string ferr;
+    if (!fp8::scan(lora, &l, &ferr)) {
+      return fail("lora-fuse: " + lora_path + ": " + ferr);
+    }
+  }
 
   // kohya's flattened module name -> the base weight it means. The
   // flattening loses the dots, so it cannot be undone from the FILE's
@@ -229,6 +240,9 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
   };
 
   // Load a LoRA-side tensor into f32 (empty on miss / unsupported dtype).
+  // An FP8 factor decodes to what a bf16 copy of the file would hold --
+  // exact when plain, code * scale rounded once to bf16 when scaled -- so
+  // fusing it and fusing that copy give the same weights.
   auto load_f32 = [&](const std::string& tn) -> std::vector<float> {
     const auto* ti = lora.info(tn);
     if (ti == nullptr) { return {}; }
@@ -236,6 +250,25 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
     for (auto d : ti->shape) { n *= (std::size_t)d; }
     SharedBuffer b = lora.load(tn, mc);
     if (b.empty()) { return {}; }
+    fp8::Weight fw;
+    if (fp8::resolve(lora, tn, &fw, nullptr)) {
+      const std::size_t rows =
+          ti->shape.empty() ? 1 : (std::size_t)ti->shape[0];
+      std::vector<float> sc;
+      if (rows == 0 || n % rows != 0 ||
+          !fp8::read_scale(lora, fw, rows, &sc, nullptr)) {
+        return {};
+      }
+      std::vector<std::uint16_t> bf(n);
+      fp8::decode_bf16(static_cast<const std::uint8_t*>(b.contents()),
+                       bf.data(), rows, n / rows, fw.format, sc);
+      std::vector<float> out(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t u = (std::uint32_t)bf[i] << 16;
+        std::memcpy(&out[i], &u, 4);
+      }
+      return out;
+    }
     return to_f32(b, ti->dtype, n);
   };
 
@@ -365,6 +398,20 @@ fuse_lora(MetalCompute* mc, const std::string& base_dir,
     }
 
     const int N = (int)ti->shape[0], K = (int)ti->shape[1];
+    // An FP8 BASE is not fused here: the result could not be written back
+    // as FP8 without a second rounding, and the base's own scales would
+    // then describe weights that are no longer codes. Said plainly rather
+    // than as an unknown dtype.
+    {
+      fp8::Weight fw;
+      std::string ferr;
+      if (fp8::resolve(base, name, &fw, &ferr) || !ferr.empty()) {
+        return fail("lora-fuse: base weight '" + name + "' is FP8 -- apply "
+                    "the LoRA at runtime (generate-image's `lora`), or fuse "
+                    "into a bf16 copy (model-quantize with bits: 16)" +
+                    (ferr.empty() ? std::string() : " (" + ferr + ")"));
+      }
+    }
     std::vector<float> W = to_f32(wb, ti->dtype, (std::size_t)N * K);
     if (W.empty()) { return fail("lora-fuse: unsupported dtype for " + name); }
     const Adapter& ad = it->second;

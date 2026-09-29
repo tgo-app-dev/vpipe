@@ -68,6 +68,19 @@ to_bf16_(const MetalLlamaWeights& wts, MetalCompute* mc,
   if (info == nullptr || info->shape.empty()) { return {}; }
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
+  // FP8, plain or scaled (or U8 codes a comfy_quant record calls FP8):
+  // decoded whole, scale applied -- what a dense conversion holds.
+  if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
+      info->dtype == "U8") {
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty() ||
+        !fp8::decode_tensor_bf16(
+            wts, nm, static_cast<std::uint16_t*>(out.contents()), n,
+            nullptr)) {
+      return {};
+    }
+    return out;
+  }
   SharedBuffer raw = wts.load(nm, mc);
   if (raw.empty()) { return {}; }
   SharedBuffer out = mc->make_shared_buffer(n * 2);
@@ -172,7 +185,7 @@ MetalQwenImage21Transformer::wire_block_(Block& b, bool on)
     changed += n;
   };
   auto qw = [&](QWeight& w) {
-    one(w.w); one(w.codes); one(w.scales); one(w.qbias);
+    one(w.w); one(w.codes); one(w.scales); one(w.qbias); one(w.f8_scale);
   };
   QWeight* q[] = {&b.qw, &b.kw, &b.vw, &b.ow,
                   &b.gate_w, &b.proj_w, &b.out_w};
@@ -269,6 +282,43 @@ MetalQwenImage21Transformer::Config::read_dims(const std::string& dir,
                                                Config* out)
 {
   if (out == nullptr) { return false; }
+  // A single-file DiT: no config beside it, so the dimensions come off
+  // the tensors, and what the tensors cannot say (eps, rope axes, the
+  // causal condition) keeps the architecture's own defaults -- the
+  // published config's values.
+  if (is_single_file_dit(dir)) {
+    auto w = MetalLlamaWeights::open_model(dir);
+    if (!w.has_value()) { return false; }
+    auto dim = [&](const std::string& n, int axis) -> int {
+      const auto* ti = w->info(n);
+      return ti != nullptr && (int)ti->shape.size() > axis
+                 ? (int)ti->shape[(std::size_t)axis]
+                 : -1;
+    };
+    int layers = 0;
+    while (w->has("transformer_blocks." + std::to_string(layers) +
+                  ".attn.to_q.weight")) {
+      ++layers;
+    }
+    const int hidden = dim("img_in.weight", 0);
+    const int hd = dim("transformer_blocks.0.attn.norm_q.weight", 0);
+    const int inner = dim("transformer_blocks.0.img_mlp.gate_layer.weight",
+                          0);
+    if (hidden <= 0 || hd <= 0 || hidden % hd != 0 || inner <= 0 ||
+        inner % hidden != 0 || layers <= 0) {
+      return false;
+    }
+    out->head_dim     = hd;
+    out->n_heads      = hidden / hd;
+    out->hidden       = hidden;
+    out->n_layers     = layers;
+    out->in_channels  = dim("img_in.weight", 1);
+    out->out_channels = dim("proj_out.weight", 0);
+    out->txt_dim      = dim("txt_in.in_layer.weight", 1);
+    out->mlp_ratio    = inner / hidden;
+    return out->in_channels > 0 && out->out_channels > 0 &&
+           out->txt_dim > 0;
+  }
   std::ifstream in(fs::path(dir) / "config.json");
   if (!in) { return false; }
   FlexData fd;
@@ -321,6 +371,23 @@ MetalQwenImage21Transformer::Config::read_dims(const std::string& dir,
   return out->hidden > 0 && out->n_layers > 0;
 }
 
+bool
+MetalQwenImage21Transformer::is_single_file_dit(const std::string& path)
+{
+  std::error_code ec;
+  const fs::path p(path);
+  if (!fs::is_regular_file(p, ec) || ec || p.extension() != ".safetensors") {
+    return false;
+  }
+  auto w = MetalLlamaWeights::open_model(path);
+  // Three names no other family in this tree spells together: the ONE
+  // shared modulation, the zero-centred text norm, and the SwiGLU's
+  // `gate_layer`.
+  return w.has_value() && w->has("modulation.1.weight") &&
+         w->has("txt_in.text_norm.weight") &&
+         w->has("transformer_blocks.0.img_mlp.gate_layer.weight");
+}
+
 // ---- weights --------------------------------------------------------
 
 SharedBuffer
@@ -360,8 +427,88 @@ MetalQwenImage21Transformer::load_qw_(WeightSet& ws, const std::string& name,
     }
     qw.codes = {}; qw.scales = {}; qw.qbias = {};
   }
+  // FP8: the file's codes, kept at their own size and widened per GEMM
+  // (fp8_dense_). One that cannot be read comes back EMPTY -- never as a
+  // dense read of the codes.
+  if (const fp8::Weight* fw = _f8.find(name + ".weight"); fw != nullptr) {
+    if (ci == nullptr || ci->shape.size() != 2) { return QWeight{}; }
+    qw.codes = r == Retain::Streamed
+                   ? ws.stream_tensor(name + ".weight", _mc,
+                                      WeightSet::Residency::Copied)
+                   : ws.tensor(name + ".weight", _mc,
+                               WeightSet::Residency::Copied);
+    qw.f8_scale = fp8_scale_buf_(name + ".weight");
+    if (qw.codes.empty() || (!fw->scale.empty() && qw.f8_scale.empty())) {
+      return QWeight{};
+    }
+    qw.f8         = fw->format;
+    qw.f8_per_row = fw->per_row;
+    return qw;
+  }
   qw.w = to_elt_(ws, name + ".weight", r);
   return qw;
+}
+
+SharedBuffer
+MetalQwenImage21Transformer::fp8_scale_buf_(const std::string& weight) const
+{
+  const fp8::Weight* fw = _f8.find(weight);
+  if (fw == nullptr || !_ws) { return {}; }
+  const auto* ti = _ws->src().info(weight);
+  if (ti == nullptr || ti->shape.empty()) { return {}; }
+  bool ok = true;
+  return fp8::scale_buffer(_ws->src(), *fw, (std::size_t)ti->shape[0], _mc,
+                           &ok);
+}
+
+bool
+MetalQwenImage21Transformer::fp8_kinds_match_(int L, const Block& b) const
+{
+  if (!_f8.any()) { return true; }
+  const std::string p = block_pre_(L);
+  const std::pair<const char*, const QWeight*> all[] = {
+      {"attn.to_q", &b.qw},       {"attn.to_k", &b.kw},
+      {"attn.to_v", &b.vw},       {"attn.to_out.0", &b.ow},
+      {"img_mlp.gate_layer", &b.gate_w}, {"img_mlp.proj", &b.proj_w},
+      {"img_mlp.out", &b.out_w}};
+  for (const auto& [proj, q] : all) {
+    const fp8::Weight* fw = _f8.find(p + proj + ".weight");
+    if (q->is_fp8() != (fw != nullptr)) { return false; }
+    if (fw == nullptr) { continue; }
+    if (q->f8 != fw->format || q->f8_scale.empty() != fw->scale.empty() ||
+        q->f8_per_row != fw->per_row) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const MetalQwenImage21Transformer::QWeight*
+MetalQwenImage21Transformer::fp8_dense_(ComputeEncoder& enc, const QWeight& w,
+                                        QWeight& view, int N, int K) const
+{
+  if (!w.is_fp8()) { return &w; }
+  const std::size_t need = (std::size_t)N * (std::size_t)K * 2;
+  // The dequant scratch the quantized path widens into, shared the same
+  // way (see _w_deq).
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { _fp8_failed = true; return nullptr; }
+  }
+  fp8::Codes c;
+  c.codes   = &w.codes;
+  c.format  = w.f8;
+  c.scale   = &w.f8_scale;
+  c.per_row = w.f8_per_row;
+  if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
+    _fp8_failed = true;
+    return nullptr;
+  }
+  // An alias of the scratch (same Metal buffer, retained), not a copy.
+  view = QWeight{};
+  view.w = _w_deq.subview(0, need);
+  if (view.w.empty()) { _fp8_failed = true; return nullptr; }
+  return &view;
 }
 
 bool
@@ -417,6 +564,7 @@ MetalQwenImage21Transformer::qw_bytes_(const QWeight& w)
   if (w.quantized) {
     return w.codes.byte_size() + w.scales.byte_size() + w.qbias.byte_size();
   }
+  if (w.is_fp8()) { return w.codes.byte_size() + w.f8_scale.byte_size(); }
   return w.w.byte_size();
 }
 
@@ -440,6 +588,14 @@ MetalQwenImage21Transformer::each_block_tensor_(
       fn(p + nm + ".weight", w.codes, Placement::kRaw);
       fn(p + nm + ".scales", w.scales, Placement::kBf16);
       fn(p + nm + ".biases", w.qbias, Placement::kBf16);
+    } else if (w.is_fp8()) {
+      // FP8 codes, placed as the file holds them; the scale is rebuilt
+      // per refill (it is converted to f32, and it is small).
+      fn(p + nm + ".weight", w.codes, Placement::kRaw);
+      if (const fp8::Weight* fw = _f8.find(p + nm + ".weight");
+          fw != nullptr && !fw->scale.empty()) {
+        fn(fw->scale, w.f8_scale, Placement::kDerived);
+      }
     } else {
       fn(p + nm + ".weight", w.w, Placement::kBf16);
     }
@@ -456,6 +612,20 @@ MetalQwenImage21Transformer::each_block_tensor_(
 }
 
 namespace {
+
+// An FP8 weight as the ANE tier stages it: the codes, one per element,
+// and the f32 scale in `scales` (shared/ane-ffn.h).
+template <class QW>
+void
+fp8_source_(const QW& q, AneFfnSource& s)
+{
+  if (!q.is_fp8()) { return; }
+  s.w         = &q.codes;
+  s.quantized = false;
+  s.bits      = q.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
+                                           : AneFfnSource::kFp8E4M3;
+  s.scales    = q.f8_scale.empty() ? nullptr : &q.f8_scale;
+}
 
 bool
 clone_buf_(MetalCompute* mc, const SharedBuffer& s, SharedBuffer& d, bool copy)
@@ -475,8 +645,11 @@ MetalQwenImage21Transformer::clone_block_(const Block& src, Block& dst,
 {
   bool ok = true;
   auto cq = [&](const QWeight& s, QWeight& d) {
-    d.quantized = s.quantized;
-    d.bits = s.bits;
+    d.quantized  = s.quantized;
+    d.bits       = s.bits;
+    d.f8         = s.f8;
+    d.f8_per_row = s.f8_per_row;
+    ok = clone_buf_(_mc, s.f8_scale, d.f8_scale, copy) && ok;
     ok = clone_buf_(_mc, s.w, d.w, copy) && ok;
     ok = clone_buf_(_mc, s.codes, d.codes, copy) && ok;
     ok = clone_buf_(_mc, s.scales, d.scales, copy) && ok;
@@ -495,6 +668,16 @@ SharedBuffer
 MetalQwenImage21Transformer::rebuild_one_(const std::string& nm, Placement how)
 {
   if (_ws == nullptr) { return {}; }
+  // An FP8 SCALE: the f32 multiplier of the weight it sits beside.
+  if (fp8::is_aux_name(nm)) {
+    for (const char* suf : {".weight_scale", ".scale_weight"}) {
+      const std::size_t k = std::char_traits<char>::length(suf);
+      if (nm.size() > k && nm.compare(nm.size() - k, k, suf) == 0) {
+        return fp8_scale_buf_(nm.substr(0, nm.size() - k) + ".weight");
+      }
+    }
+    return {};
+  }
   if (how == Placement::kRaw) {
     return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
   }
@@ -519,6 +702,9 @@ MetalQwenImage21Transformer::configure_slots_()
   };
   ops.bytes = [](const Block& b) { return block_bytes_(b); };
   ops.empty = [](const Block& b) { return b.qw.empty(); };
+  // A slot built for one kind of weight and refilled with another
+  // (an FP8 file with a dense block) cannot be read as either: rebuilt.
+  ops.post_refill = [this](int L, Block& b) { return fp8_kinds_match_(L, b); };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(ops), "MetalQwenImage21Transformer",
                    "VPIPE_QWEN_IMAGE21_NO_SLOTS");
@@ -562,6 +748,46 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
       const long K = si->shape[1] * (long)m->_quant_group;
       m->_quant_bits = K > 0 ? (int)(ci->shape[1] * 32 / K) : 0;
       if (m->_quant_bits != 4 && m->_quant_bits != 8) { m->_quant_bits = 0; }
+    }
+  }
+  // FP8 weights (shared/fp8-layout.h), plain or scaled: surveyed before
+  // anything loads, since load_qw_ asks the survey what it is reading.
+  // An encoding this build cannot decode is refused here, by name,
+  // rather than as a missing tensor later.
+  {
+    const SessionContextIntf* sess = mc->session();
+    const MetalLlamaWeights& src = m->_ws->src();
+    std::string ferr;
+    if (!fp8::scan(src, &m->_f8, &ferr)) {
+      if (sess != nullptr) {
+        sess->warn(fmt("qwen-image-2.1: '{}': {}", m->_ws->dir(), ferr));
+      }
+      return nullptr;
+    }
+    if (m->_f8.any()) {
+      if (!m->_fp8x.load(mc)) {
+        if (sess != nullptr) {
+          sess->warn(fmt("qwen-image-2.1: '{}' stores FP8 weights and the "
+                         "FP8 expansion kernels did not load",
+                         m->_ws->dir()));
+        }
+        return nullptr;
+      }
+      std::size_t fp8_bytes = 0, n_scaled = 0;
+      for (const auto& [n, fw] : m->_f8.weights) {
+        if (const auto* ti = src.info(n); ti != nullptr) {
+          fp8_bytes += (std::size_t)ti->nbytes;
+        }
+        if (!fw.scale.empty()) { ++n_scaled; }
+      }
+      if (sess != nullptr) {
+        sess->info(fmt(
+            "qwen-image-2.1: FP8 checkpoint -- {} tensors ({} MB){} kept as "
+            "FP8 codes and widened per GEMM",
+            m->_f8.weights.size(), fp8_bytes >> 20,
+            n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
+                         : std::string()));
+      }
     }
   }
 
@@ -1095,8 +1321,14 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   };
 
   // ---- dispatch helpers ---------------------------------------------
-  auto lin = [&](const SharedBuffer& x, std::size_t xe, const QWeight& w,
+  auto lin = [&](const SharedBuffer& x, std::size_t xe, const QWeight& w_in,
                  const SharedBuffer& y, std::size_t ye, int M, int N, int K) {
+    // FP8: widened into the dequant scratch first, and from here on an
+    // ordinary dense weight to every route -- matrix cores, i8, steel.
+    QWeight fv;
+    const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
+    if (wp == nullptr) { return; }
+    const QWeight& w = *wp;
     // Matrix cores first; a decline encodes nothing and falls through.
     if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { return; }
     if (!w.quantized) {
@@ -1927,6 +2159,14 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     if (kv_fill && req.kv != nullptr) { req.kv->clear(); }
     return fail("qwen-image-2.1 forward: " + ge);
   }
+  // An FP8 weight that could not be widened left its projection
+  // unwritten: the forward ran and its output is not the model's.
+  if (_fp8_failed) {
+    _fp8_failed = false;
+    if (kv_fill && req.kv != nullptr) { req.kv->clear(); }
+    return fail("qwen-image-2.1 forward: an FP8 weight could not be "
+                "widened for its GEMM");
+  }
   if (prof && _mc->session() != nullptr) {
     double tot = 0.0;
     for (const auto& b : pbuckets) { tot += b.second; }
@@ -2143,6 +2383,7 @@ MetalQwenImage21Transformer::ane_stage_(int L, const Block& b)
     s.bits      = q.quantized ? q.bits : 0;
     s.stride    = 1;
     s.offset    = 0;
+    fp8_source_(q, s);
     return s;
   };
   _ane->stage(L, src(b.gate_w), src(b.proj_w), src(b.out_w), _quant_group);
@@ -2211,6 +2452,7 @@ MetalQwenImage21Transformer::ane_qkv_stage_(int L, const Block& b)
     s.bits      = q.quantized ? q.bits : 0;
     s.stride    = 1;
     s.offset    = 0;
+    fp8_source_(q, s);
     s.slot      = 0;
     s.slot_row  = row0;
     s.rows      = H;

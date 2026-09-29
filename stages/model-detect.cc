@@ -1,8 +1,10 @@
 #include "stages/model-detect.h"
 
+#include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/detect-profile.h"
 
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 
 #include "common/flex-data.h"
 #include "generative-models/shared/comfy-checkpoint.h"
@@ -447,6 +449,9 @@ dit_component_tag_(const std::string& cls)
   // A bare H3 DiT carries no model_index.json, so which partition it
   // came from is not knowable here -- and does not matter to a picker.
   if (cls == "MiniMaxH3DiTModel")            { return "minimax-h3-dit"; }
+  // The same DiT in the diffusers naming (minimax-h3-diffusers-layout.h),
+  // which the H3 loader reads as it is.
+  if (cls == "MiniMaxH3Transformer3DModel")  { return "minimax-h3-dit"; }
   return {};
 }
 
@@ -766,6 +771,37 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     if (!d.model_type.empty()) {
       d.detected_by = "diffusers";
     }
+  }
+
+  // ---- 2a. a Krea-2 DiT in Krea's own single-file layout --------------
+  // What community fine-tunes ship: the DiT alone, one .safetensors in the
+  // reference naming (usually FP8), with no config and no metadata -- the
+  // tensor names are the only identity it has. generate-image reads it as
+  // it is through `dit_dir`, so it registers as the DiT it is.
+  if (d.model_type.empty() && !d.is_dir &&
+      genai::krea2::is_native_dit_file(dir)) {
+    d.model_type    = "krea2-dit";
+    d.detected_by   = "krea2-native";
+    d.weight_format = "safetensors";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+  // Two more DiTs published as ONE file with no config, and read as they
+  // are through a `dit_dir`: Qwen-Image-2.1 under its diffusers names
+  // (unsloth's FP8), and MiniMax-H3 under the diffusers naming
+  // (lightx2v's FP8 turbo DiT). Both registered by their tensor names.
+  if (d.model_type.empty() && !d.is_dir &&
+      genai::MetalQwenImage21Transformer::is_single_file_dit(dir)) {
+    d.model_type    = "qwen-image-21-dit";
+    d.detected_by   = "single-file";
+    d.weight_format = "safetensors";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+  if (d.model_type.empty() && !d.is_dir &&
+      genai::minimax_h3::is_diffusers_dit_file(dir)) {
+    d.model_type    = "minimax-h3-dit";
+    d.detected_by   = "diffusers-names";
+    d.weight_format = "safetensors";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
   }
 
   // ---- 2b. a Comfy-Org repack (no transformer/config.json) ------------

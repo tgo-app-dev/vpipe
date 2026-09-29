@@ -53,6 +53,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [合并，以及为什么它会丢掉这个适配器的大部分](#merging-and-why-it-loses-most-of-this-adapter)
     - [哪些 Turbo 适配器可用](#which-turbo-adapters-work)
     - [社区 LoRA——Civitai、musubi-tuner、ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
+  - [FP8 检查点——lightx2v 的 turbo DiT](#fp8-checkpoints--lightx2vs-turbo-dit)
   - [八步——HyperFlow](#eight-steps--hyperflow)
     - [获取，然后指定它](#fetch-it-then-name-it)
     - [它的不同之处](#what-makes-it-different)
@@ -1719,6 +1720,54 @@ MetalMiniMaxH3Transformer: runtime LoRA 'my-style.safetensors' -- 200 modules
 把融合的 `qkv_proj` 适配器按 Comfy-Org 的扁平分组来读，并为 per-head 的
 MiniMaxAI 发布版重新排序。如果某个适配器是在 MiniMaxAI 自己的权重上训练的，
 请设置 `lora_qkv_layout: per_head`（第二个槽位用 `lora2_qkv_layout`）。
+
+<a id="fp8-checkpoints--lightx2vs-turbo-dit"></a>
+### FP8 检查点——lightx2v 的 turbo DiT
+
+[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+发布了**已合并** 4 步 Turbo、以 **FP8** 存储的 FL2VA DiT——
+`minimax_h3_fl2v_turbo_4step_v1.1_768p_fp8.safetensors`，32 GB，而 bf16 是
+66 GB。它是一个没有配置的单文件，采用 **diffusers** 命名
+（`transformer_blocks.0.attn.to_q`，而不是本模型自己的
+`blocks.0.attn.qkv_proj`），每个权重带有逐行的缩放系数。
+
+直接运行即可。把 `generate-video` 的 `dit_dir` 指向这个文件，`model-select`
+仍然指向你已有的 H3 检查点，由它提供提示词编码器和两个 VAE：
+
+```json
+"config": {
+  "height": 480,
+  "width": 832,
+  "frames": 56,
+  "steps": 4,
+  "seed": 6,
+  "dit_dir": "/path/to/minimax_h3_fl2v_turbo_4step_v1.1_768p_fp8.safetensors"
+}
+```
+
+Turbo 已经在权重里了，所以不要再挂 Turbo LoRA，用 4 步。
+
+不做任何转换，也不在磁盘上多写任何东西。名字在打开文件时翻译：q、k、v
+被叠成融合投影；第一个前馈矩阵的两半对调成本模型“gate 在前”的顺序；文件
+里缺少的旋转位置表按它的底数算出。权重**在内存里保持 FP8**，每个投影在用
+到之前才在 GPU 上展开成 bf16，因此流式加载的一个块只有 bf16 时的一半大
+（367 MB 对 735 MB）。算出来的结果和这个文件的 bf16 副本逐比特相同，流式
+和预加载都验证过。翻译本身也一样：发布方的 bf16 diffusers 检查点
+（`MiniMaxAI/MiniMax-H3-diffusers`）现在也能这样加载，并和原生发布版逐比
+特一致。
+
+实测（M4 Pro，832×480×56，4 步，文件放在外置 SSD 上）：端到端 4 分 54 秒，
+而 bf16 FL2VA 权重加上 lightx2v 对应的 bf16 Turbo LoRA（运行时挂载）是 4
+分 56 秒。两段视频镜头和动作相同；FP8 权重、以及 Turbo 被合并进权重而不是
+运行时挂载，会让细节有些不同。
+
+**FP8 LoRA**，无论带不带缩放系数，凡是能用 LoRA 的地方都能用。带缩放的
+FP8 适配器和它的 bf16 解码结果运行起来完全一致。优先用带缩放的版本：不带
+缩放的 FP8 会把 LoRA 里那些很小的数值冲成零。
+
+不支持：Comfy-Org 的 `…_pruned_fp8_scaled` 文件。其中的 FP8 能读，但
+*剪枝版* H3 是另一个网络（用查表式 AdaLN 取代了时间嵌入器），本版本在任
+何精度下都不运行它。
 
 <a id="eight-steps--hyperflow"></a>
 ### 八步——HyperFlow

@@ -2525,3 +2525,113 @@ TEST(qwen_image_21_dit, quantize_produces_a_loadable_checkpoint)
   EXPECT_TRUE(m->quant_bits() == 4);
   std::filesystem::remove_all(out, ec);
 }
+
+// Two checkpoints of the SAME model, one forward each on the same
+// request: an FP8 file against its own dense conversion, which have to
+// agree to the BIT (shared/fp8-expand.h), or against the bf16 original,
+// to a stated rel-L2.
+//
+// Env: VPIPE_QWEN_IMAGE21_CKPT_A / _B (a transformer directory or a
+// single-file DiT); _LAYERS (default 4); _STREAM=1 to stream the blocks,
+// which with 3+ layers takes the slot refill; _PX (default 512); _TOL, a
+// rel-L2 bound in place of bit-identity.
+TEST(qwen_image_21_dit, checkpoints_agree)
+{
+  const char* pa = std::getenv("VPIPE_QWEN_IMAGE21_CKPT_A");
+  const char* pb = std::getenv("VPIPE_QWEN_IMAGE21_CKPT_B");
+  if (pa == nullptr || *pa == '\0' || pb == nullptr || *pb == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int layers = envi("VPIPE_QWEN_IMAGE21_CKPT_LAYERS", 4);
+  const bool stream = envi("VPIPE_QWEN_IMAGE21_CKPT_STREAM", 0) != 0;
+  const int px = envi("VPIPE_QWEN_IMAGE21_CKPT_PX", 512);
+  const char* tol_s = std::getenv("VPIPE_QWEN_IMAGE21_CKPT_TOL");
+  const int lg = px / 16, n_text = 64;
+  std::vector<std::uint8_t> slot((std::size_t)n_text, 0);
+  slot.insert(slot.end(), (std::size_t)(lg * lg / 4), 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, lg, lg}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  auto run = [&](const char* dir) -> std::vector<float> {
+    MetalQwenImage21Transformer::Config cfg;
+    if (!MetalQwenImage21Transformer::Config::read_dims(dir, &cfg)) {
+      std::printf("[checkpoints_agree] %s: read_dims failed\n", dir);
+      return {};
+    }
+    std::printf("[checkpoints_agree] %s: hidden %d heads %d layers %d "
+                "mlp_ratio %d in %d out %d txt %d\n", dir, cfg.hidden,
+                cfg.n_heads, cfg.n_layers, cfg.mlp_ratio, cfg.in_channels,
+                cfg.out_channels, cfg.txt_dim);
+    cfg.n_layers = std::min(cfg.n_layers, layers);
+    auto rnd = [&](std::size_t n, unsigned seed) {
+      metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+      if (b.empty()) { return b; }
+      auto* d = static_cast<std::uint16_t*>(b.contents());
+      unsigned st = seed;
+      for (std::size_t i = 0; i < n; ++i) {
+        st = st * 1664525u + 1013904223u;
+        const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+        std::uint32_t u;
+        std::memcpy(&u, &v, 4);
+        d[i] = (std::uint16_t)(u >> 16);
+      }
+      return b;
+    };
+    metal_compute::SharedBuffer lat =
+        rnd((std::size_t)lay.image_len * cfg.in_channels, 61u);
+    metal_compute::SharedBuffer txt =
+        rnd((std::size_t)lay.text_len * cfg.txt_dim, 62u);
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    auto m = MetalQwenImage21Transformer::load(dir, mc, cfg, stream);
+    if (m == nullptr) {
+      std::printf("[checkpoints_agree] %s: load failed\n", dir);
+      return {};
+    }
+    std::string ferr;
+    metal_compute::SharedBuffer out = m->forward(req, &ferr);
+    const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+    if (out.empty() || out.byte_size() < n * 2) {
+      std::printf("[checkpoints_agree] %s: forward: %s\n", dir, ferr.c_str());
+      return {};
+    }
+    std::vector<float> v(n);
+    const auto* d = static_cast<const std::uint16_t*>(out.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t u = (std::uint32_t)d[i] << 16;
+      std::memcpy(&v[i], &u, 4);
+    }
+    return v;
+  };
+  const std::vector<float> a = run(pa);
+  const std::vector<float> b = run(pb);
+  Q21D_REQUIRE(!a.empty() && a.size() == b.size());
+  double num = 0.0, den = 0.0, mx = 0.0;
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const double d = (double)a[i] - (double)b[i];
+    num += d * d;
+    den += (double)b[i] * (double)b[i];
+    mx = std::max(mx, std::fabs(d));
+    diff += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+  std::printf("[checkpoints_agree] %zu of %zu differ, max |d| %.3g, rel-L2 "
+              "%.3e\n", diff, a.size(), mx, rel);
+  if (tol_s != nullptr) {
+    EXPECT_TRUE(rel <= std::atof(tol_s));
+  } else {
+    EXPECT_TRUE(diff == 0);
+  }
+}

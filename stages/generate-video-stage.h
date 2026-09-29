@@ -307,6 +307,11 @@ private:
   // config that predates the split still means what it did.
   std::string   _family = "wan";
   std::string   _hf_dir;
+  // MiniMax-H3 only: a DiT checkpoint in place of the one under _hf_dir
+  // (the text encoder and the VAEs still come from there). See h3_dit_.
+  std::string   _dit_dir;
+  std::string h3_dit_(const std::string& root,
+                      const std::string& partition) const;
   // The VDN-H3 release root the DiT was BUILT with, or empty for the
   // stock attention. Latched from the model_config beat like a LoRA
   // path -- see the `linear_branch` key on `minimax-h3-model-config`,

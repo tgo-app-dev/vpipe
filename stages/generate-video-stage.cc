@@ -85,6 +85,15 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va",
    .model_channel = "diffusion-model"},
+  {.key = "dit_dir", .type = ConfigType::String, .required = false,
+   .doc = "MiniMax-H3 only: a DiT checkpoint to run in place of the one "
+          "under hf_dir, whose text encoder and VAEs are still used -- a "
+          "single .safetensors (a Comfy-Org repack, or the diffusers "
+          "naming, e.g. lightx2v's FP8 turbo DiT, read as it is with FP8 "
+          "kept FP8) or a transformer directory. Empty: the one hf_dir "
+          "holds",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "minimax-h3-dit,minimax-h3-fl2va,minimax-h3-ref2va"},
   {.key = "height", .type = ConfigType::Int, .required = false,
    .doc = "video height in pixels. ROUNDED UP to the resident family's VAE "
           "stride times its DiT patch, which differs per family, so any "
@@ -529,6 +538,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                                    std::move(config))
 {
   _hf_dir = attr_str("hf_dir");
+  _dit_dir = attr_str("dit_dir");
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
   _frames = (int)attr_int("frames");
@@ -1247,9 +1257,7 @@ GenerateVideoStage::declare_resources() const
   const std::string part =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  const std::string dit = h3_dit_(root, part);
   // BOTH numbers: what this DiT weighs, and the floor it can be reduced
   // to by streaming its blocks. A graph that does not fit the first and
   // does fit the second is not one to refuse -- it is one to stream.
@@ -1364,9 +1372,7 @@ GenerateVideoStage::declare_memory() const
   const std::string part =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  const std::string dit = h3_dit_(root, part);
   // NAMED by its directory, so two stages over one checkpoint are one
   // set of weights in the plan rather than two.
   // Remembered HERE as well as in decide_resources, because this method
@@ -1422,9 +1428,7 @@ GenerateVideoStage::decide_resources() const
   const std::string part =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  const std::string dit = h3_dit_(root, part);
   // Remembered, so the release below names exactly what was claimed --
   // the resolver can answer differently once the model has loaded, and
   // a release under a different name reads as a promise never kept.
@@ -1563,6 +1567,25 @@ GenerateVideoStage::resolve_config_()
                                                          &h3err,
                                                          want_partition)) {
     _family = "minimax-h3";
+    // A DiT named on its own is what runs, so ITS config is the one the
+    // forward, the scratch and the plan are sized from. The root still
+    // decided the family: it is an H3 pipeline whatever DiT it carries.
+    if (!_dit_dir.empty()) {
+      const std::string d = h3_dit_(_root, want_partition);
+      std::string derr;
+      if (!genai::MetalMiniMaxH3Transformer::config_from_json(
+              d, _h3_cfg, &derr, want_partition)) {
+        // Said, and the family withdrawn so nothing runs: this is
+        // initialize(), where fail_config() is read by no one, and
+        // falling back to hf_dir's own DiT would run a model the graph
+        // did not ask for.
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): dit_dir '{}' is not a MiniMax-H3 DiT "
+            "this build reads ({}); the stage will not run", id(), _dit_dir,
+            derr));
+        _family.clear();
+      }
+    }
   }
   if (_family == "minimax-h3") {
     // WHICH partition. The two ship byte-identical DiT configs, so the
@@ -2166,9 +2189,7 @@ GenerateVideoStage::ensure_expert_(int which)
     // model's supported range anyway, so this asks the same question the
     // other DiT families ask rather than assuming the stack fits.
     namespace fs = std::filesystem;
-    const std::string dit_dir =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root,
-                                                          _h3_partition);
+    const std::string dit_dir = h3_dit_(_root, _h3_partition);
     // Through the encoder's own resolver, not by spelling a sibling of
     // the DiT: on a Comfy-Org repack the DiT's parent IS the root and the
     // encoder lives under `text_encoders/`, so building the path by hand
@@ -2608,7 +2629,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // the box and one against a larger would refuse runs that fit.
   constexpr int kTimestepsUpperBound =
       genai::MetalMiniMaxH3Transformer::kTimestepSlots;
-  const bool dq = _h3_dit && _h3_dit->uses_matrix_cores();
+  const bool dq = _h3_dit && _h3_dit->uses_dequant_scratch();
   // AND THE BRANCH'S, which is a second allocation of the same order and
   // is spent inside the first forward -- after this. Left out, the
   // reserve below is short by a gigabyte or more and the DiT keeps
@@ -4177,5 +4198,25 @@ GenerateVideoStage::process(RuntimeContext& ctx)
 
 VPIPE_REGISTER_STAGE(GenerateVideoStage)
 VPIPE_REGISTER_SPEC(GenerateVideoStage, kSpec)
+
+// The MiniMax-H3 DiT this stage runs: `dit_dir` when the graph names
+// one, else the one under the model root, through the same resolver the
+// model's own load uses -- one answer, so the plan, the claim, the
+// release and the load all name the same file.
+std::string
+GenerateVideoStage::h3_dit_(const std::string& root,
+                            const std::string& partition) const
+{
+  if (!_dit_dir.empty()) {
+    return genai::MetalMiniMaxH3Transformer::resolve_dit_dir(
+        resolve_model_dir(session(), _dit_dir), partition);
+  }
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, partition);
+  if (dit == root) {
+    dit = (std::filesystem::path(root) / "transformer").string();
+  }
+  return dit;
+}
 
 }  // namespace vpipe

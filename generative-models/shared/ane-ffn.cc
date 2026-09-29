@@ -6,6 +6,7 @@
 #include "apple-silicon/coreml/ane-worker.h"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/fp8.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -55,6 +56,46 @@ bf16_to_f16_lut_()
     return t;
   }();
   return lut.data();
+}
+
+// FP8 -> fp16 as a table, one per format. Exact: E4M3's range (2^-9 ..
+// 448) and E5M2's (2^-16 .. 57344) both sit inside fp16's, and neither
+// mantissa is wider than fp16's.
+const std::uint16_t*
+fp8_to_f16_lut_(fp8::Format f)
+{
+  auto make = [](fp8::Format fm) {
+    std::vector<std::uint16_t> t(256);
+    for (int c = 0; c < 256; ++c) {
+      const _Float16 hv = (_Float16)fp8::to_f32((std::uint8_t)c, fm);
+      std::memcpy(&t[(std::size_t)c], &hv, sizeof(hv));
+    }
+    return t;
+  };
+  static const std::vector<std::uint16_t> e4m3 = make(fp8::Format::kE4M3);
+  static const std::vector<std::uint16_t> e5m2 = make(fp8::Format::kE5M2);
+  return f == fp8::Format::kE5M2 ? e5m2.data() : e4m3.data();
+}
+
+// f32 -> bf16, round to nearest even: the rounding every converter in
+// this tree uses, and the one shared/fp8-layout.h's decoder applies.
+std::uint16_t
+bf16_rne_(float v)
+{
+  std::uint32_t u;
+  std::memcpy(&u, &v, sizeof(u));
+  return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+// The FP8 format a dense source's `bits` names (see AneFfnSource), kNone
+// for bf16 and for every quantized source.
+fp8::Format
+dense_fp8_(const AneFfnSource& q)
+{
+  if (q.quantized) { return fp8::Format::kNone; }
+  if (q.bits == AneFfnSource::kFp8E4M3) { return fp8::Format::kE4M3; }
+  if (q.bits == AneFfnSource::kFp8E5M2) { return fp8::Format::kE5M2; }
+  return fp8::Format::kNone;
 }
 
 float
@@ -342,9 +383,22 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       if (!ok) { break; }
       // The last source row read, plus one.
       const std::size_t srows = q.offset + (rows - 1) * q.stride + 1;
+      const fp8::Format f8 = dense_fp8_(q);
+      // A scaled FP8 source's f32 scale: one value, or one per SOURCE row.
+      const float* f8s = nullptr;
+      bool f8s_row = false;
+      if (f8 != fp8::Format::kNone && q.scales != nullptr &&
+          !q.scales->empty()) {
+        const std::size_t ns = q.scales->byte_size() / sizeof(float);
+        f8s = static_cast<const float*>(q.scales->contents());
+        f8s_row = ns > 1;
+        ok = ok && (ns == 1 || ns >= srows);
+      }
       if (!q.quantized) {
-        ok = q.w->contents() != nullptr &&
-             q.w->byte_size() >= srows * cols * 2;
+        // One byte an element for FP8, two for bf16.
+        const std::size_t eb = f8 != fp8::Format::kNone ? 1 : 2;
+        ok = ok && q.w->contents() != nullptr &&
+             q.w->byte_size() >= srows * cols * eb;
       } else {
         const std::size_t per = 32 / (std::size_t)q.bits;
         ok = q.codes->contents() != nullptr && cols % per == 0 &&
@@ -383,6 +437,27 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       // Source row `sr` straight to fp16: bf16 through the table, 4-bit
       // through a per-group table of its 16 values, 8-bit computed directly.
       auto direct_row = [&](std::size_t sr, std::uint8_t* dr) {
+        if (f8 != fp8::Format::kNone) {
+          const std::uint8_t* s =
+              static_cast<const std::uint8_t*>(q.w->contents()) + sr * cols;
+          if (f8s == nullptr) {
+            const std::uint16_t* t8 = fp8_to_f16_lut_(f8);
+            for (std::size_t cc = 0; cc < cols; ++cc) {
+              std::memcpy(dr + cc * 2, &t8[s[cc]], sizeof(std::uint16_t));
+            }
+            return;
+          }
+          // Scaled: code * scale rounded to bf16 FIRST, then to fp16 --
+          // the value a dense bf16 conversion of the file holds, so the
+          // two stage identically.
+          const std::array<float, 256>& t = fp8::f32_table(f8);
+          const float sc = f8s[f8s_row ? sr : 0];
+          for (std::size_t cc = 0; cc < cols; ++cc) {
+            const std::uint16_t b = bf16_rne_(t[s[cc]] * sc);
+            std::memcpy(dr + cc * 2, &lut[b], sizeof(std::uint16_t));
+          }
+          return;
+        }
         if (!q.quantized) {
           const std::uint16_t* s =
               static_cast<const std::uint16_t*>(q.w->contents()) + sr * cols;
@@ -431,6 +506,23 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       };
       // Source row `sr` into f32, for the rows that are scaled or adapted.
       auto decode_row = [&](std::size_t sr, float* acc) {
+        if (f8 != fp8::Format::kNone) {
+          const std::uint8_t* s =
+              static_cast<const std::uint8_t*>(q.w->contents()) + sr * cols;
+          if (f8s == nullptr) {
+            for (std::size_t cc = 0; cc < cols; ++cc) {
+              acc[cc] = fp8::to_f32(s[cc], f8);
+            }
+            return;
+          }
+          // Through bf16, for the reason direct_row gives.
+          const std::array<float, 256>& t = fp8::f32_table(f8);
+          const float sc = f8s[f8s_row ? sr : 0];
+          for (std::size_t cc = 0; cc < cols; ++cc) {
+            acc[cc] = f32_of_bf16_(bf16_rne_(t[s[cc]] * sc));
+          }
+          return;
+        }
         if (!q.quantized) {
           const std::uint16_t* s =
               static_cast<const std::uint16_t*>(q.w->contents()) + sr * cols;

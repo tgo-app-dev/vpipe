@@ -34,6 +34,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <cstring>
 #include <iterator>
@@ -3663,4 +3664,247 @@ TEST(ane_module, matmul_tier_shape_bench)
               "(%.2f TOPS, serial) = %.2f ms/1k rows\n", K, N, M, tile,
               build_ms, best_pred, flop / best_pred / 1e9, best_all,
               flop / best_all / 1e9, best_pred * 1000.0 / (double)M);
+}
+
+// WHERE fp16 OVERFLOW CAN ARISE IN THE ANE's FEED-FORWARD, op by op. Each
+// graph isolates one op with identity projections, so the output is that
+// op as the ANE computes it, over fp16 inputs swept log-spaced from 1e-2
+// to 65504 on both signs:
+//   silu     SwiGLU with Wg = I, Wu = 0 + bu = 1, Wd = I  -> silu(x)
+//   silu*x   SwiGLU with Wg = Wu = Wd = I                 -> silu(x) * x
+//   gelu     GELU  with Wu = Wd = I                        -> gelu_tanh(x)
+// A non-finite output where the true value is finite and inside fp16 is an
+// overflow INSIDE the op's implementation; one where the true value is
+// itself past 65504 is the op's result not fitting. Env-gated
+// (VPIPE_ANE_RANGE_PROBE=1): a characterisation, not a contract.
+TEST(ane_module, activation_range_probe)
+{
+  if (std::getenv("VPIPE_ANE_RANGE_PROBE") == nullptr) { return; }
+  vpipe::Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  if (!vpipe::genai::AneModule::emitter_usable(&sess)) { return; }
+  using vpipe::genai::AneModule;
+  using vpipe::genai::AneWeightSlots;
+  // ONE VALUE PER ROW. The down projection sums a whole row, so a single
+  // inf in `hh` turns every column of its row into inf * 0 = NaN -- a
+  // sweep that mixed magnitudes or signs within a row would charge that
+  // spread to the op under test.
+  // M, the row count the graph is compiled for, CHANGES the lowering of
+  // the activations -- VPIPE_ANE_RANGE_M to compare (the tiers use 2048).
+  const int M = [] {
+    const char* e = std::getenv("VPIPE_ANE_RANGE_M");
+    return e != nullptr ? std::max(16, std::atoi(e)) : 2048;
+  }();
+  const int D = [] {
+    const char* e = std::getenv("VPIPE_ANE_RANGE_D");
+    return e != nullptr ? std::max(64, std::atoi(e)) : 256;
+  }();
+  // VPIPE_ANE_RANGE_ONLY=<label>: run just that probe.
+  const char* only = std::getenv("VPIPE_ANE_RANGE_ONLY");
+  const std::size_t n = (std::size_t)M * D;
+  std::vector<_Float16> xs(n);
+  for (int r = 0; r < M; ++r) {
+    const double t = (double)(r / 2) / (double)(M / 2 - 1);
+    const double m = std::exp(std::log(1e-2) +
+                              t * (std::log(65504.0) - std::log(1e-2)));
+    for (int c = 0; c < D; ++c) {
+      xs[(std::size_t)r * D + c] = (_Float16)((r % 2) ? -m : m);
+    }
+  }
+  const double kc = std::sqrt(2.0 / M_PI);
+  auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
+  auto gelu = [&](double v) {
+    return 0.5 * v * (1.0 + std::tanh(kc * (v + 0.044715 * v * v * v)));
+  };
+  int tile_k = 0;   // K tiling of the graphs below (0 = none)
+  // A slot's contents: `eye` * v on the diagonal, or v everywhere.
+  struct Fill { bool eye; float v; };
+  const Fill I{true, 1.0f}, Z{false, 0.0f}, O{false, 1.0f};
+  auto probe = [&](const char* label, vpipe::AneGraphSpec::Kind kind,
+                   std::vector<Fill> fills,
+                   const std::function<double(double)>& ref) {
+    if (only != nullptr && std::string(only) != label) { return; }
+    vpipe::AneGraphSpec s;
+    s.kind = kind;
+    s.M = M; s.K = D; s.N = D;
+    s.bk = tile_k;
+    s.runtime_weights = true;
+    s.biases = kind != vpipe::AneGraphSpec::Kind::Matmul;
+    ASSERT_TRUE(s.valid());
+    auto mod = AneModule::build_runtime(
+        &sess, s, std::filesystem::temp_directory_path().string() +
+                      "/ane-range-" + label + ".mlmodelc");
+    auto slots = AneWeightSlots::create(s);
+    ASSERT_TRUE(mod != nullptr && slots != nullptr &&
+                slots->count() == fills.size());
+    if (mod == nullptr || slots == nullptr) { return; }
+    for (std::size_t i = 0; i < fills.size(); ++i) {
+      const int rows = slots->rows(i), cols = slots->cols(i);
+      ASSERT_TRUE(slots->fill(i, [&](void* base, std::size_t bpr) {
+        for (int r = 0; r < rows; ++r) {
+          auto* d = reinterpret_cast<_Float16*>(
+              static_cast<std::uint8_t*>(base) + (std::size_t)r * bpr);
+          for (int c = 0; c < cols; ++c) {
+            d[c] = (!fills[i].eye || r == c) ? (_Float16)fills[i].v
+                                             : (_Float16)0.0f;
+          }
+        }
+      }));
+    }
+    auto x = mc->make_shared_buffer(n * 2);
+    auto y = mc->make_shared_buffer(n * 2);
+    std::memcpy(x.contents(), xs.data(), n * 2);
+    ASSERT_TRUE(mod->run(x, 0, y, 0, *slots));
+    const auto* yp = static_cast<const _Float16*>(y.contents());
+    // What the op returns at a few magnitudes, both signs -- the tail a
+    // relative error hides, where the true value is ~0.
+    {
+      std::string line;
+      for (double want_x : {8.0, 12.0, 16.0, 24.0, 40.0, 100.0, 300.0,
+                            1000.0}) {
+        for (double sg : {1.0, -1.0}) {
+          std::size_t best = 0;
+          for (std::size_t i = 0; i < n; ++i) {
+            if (std::fabs((double)xs[i] - sg * want_x) <
+                std::fabs((double)xs[best] - sg * want_x)) {
+              best = i;
+            }
+          }
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), " f(%.4g)=%.4g", (double)xs[best],
+                        (double)yp[best]);
+          line += buf;
+        }
+      }
+      std::printf("[ane_range] %-7s samples:%s\n", label, line.c_str());
+    }
+    // Per sign: the smallest |x| whose output is non-finite although the
+    // true value fits fp16 (an INTERNAL overflow), the smallest whose true
+    // value does not fit (the result overflowing), and the worst relative
+    // error among finite outputs of |true| > 1e-2.
+    for (int sign : {+1, -1}) {
+      double first_internal = 0.0, first_result = 0.0, worst = 0.0,
+             worst_at = 0.0, abs8 = 0.0;
+      int internal = 0, result = 0;
+      for (std::size_t i = 0; i < n; ++i) {
+        const double v = (double)xs[i];
+        if ((v > 0) != (sign > 0)) { continue; }
+        const double want = ref(v);
+        const double got = (double)yp[i];
+        const bool fits = std::fabs(want) <= 65504.0;
+        if (!std::isfinite(got)) {
+          if (fits) {
+            ++internal;
+            if (first_internal == 0.0) { first_internal = std::fabs(v); }
+          } else {
+            ++result;
+            if (first_result == 0.0) { first_result = std::fabs(v); }
+          }
+          continue;
+        }
+        if (fits && std::fabs(want) > 1e-2) {
+          const double e = std::fabs(got - want) / std::fabs(want);
+          if (e > worst) { worst = e; worst_at = v; }
+        }
+        if (std::fabs(v) <= 8.0) {
+          abs8 = std::max(abs8, std::fabs(got - want));
+        }
+      }
+      std::printf("[ane_range] %-7s x%c0: %5d non-finite with a result that "
+                  "FITS (first at |x| = %.4g), %5d where the result does not "
+                  "(first at |x| = %.4g); worst finite rel err %.2e at %.4g; "
+                  "max abs err over |x| <= 8 %.2e\n",
+                  label, sign > 0 ? '>' : '<', internal, first_internal,
+                  result, first_result, worst, worst_at, abs8);
+    }
+  };
+  using K = vpipe::AneGraphSpec::Kind;
+  probe("silu", K::SwiGluFfn, {I, Z, I, Z, O, Z}, silu);
+  probe("silu*x", K::SwiGluFfn, {I, I, I, Z, Z, Z},
+        [&](double v) { return silu(v) * v; });
+  probe("gelu", K::GeluFfn, {I, I, Z, Z}, gelu);
+  // Which op overflows: the product (a constant 256 through the up bias),
+  // the down matmul (silu, then Wd = 256 I), or a bare matmul.
+  const Fill C{false, 256.0f}, E{true, 256.0f};
+  probe("silu*256", K::SwiGluFfn, {I, Z, I, Z, C, Z},
+        [&](double v) { return silu(v) * 256.0; });
+  probe("silu@256I", K::SwiGluFfn, {I, Z, E, Z, O, Z},
+        [&](double v) { return silu(v) * 256.0; });
+  probe("gelu@256I", K::GeluFfn, {I, E, Z, Z},
+        [&](double v) { return gelu(v) * 256.0; });
+  probe("x@256I", K::Matmul, {E}, [](double v) { return v * 256.0; });
+  // The same matmul split into two K tiles joined by an add: identical
+  // arithmetic (the second tile contributes 0 to every column the first
+  // covers and vice versa), but each tile's result is now CONSUMED by
+  // another op instead of being the output.
+  tile_k = 128;
+  probe("x@256I/2t", K::Matmul, {E}, [](double v) { return v * 256.0; });
+  tile_k = 0;
+  // The fused silu(g) * u: sweep the constant u to see what its overflow
+  // threshold on |g| depends on.
+  for (float u : {2.0f, 8.0f, 32.0f, 64.0f, 128.0f, 512.0f, 2048.0f}) {
+    const std::string l = "silu*" + std::to_string((int)u);
+    probe(l.c_str(), K::SwiGluFfn, {I, Z, I, Z, Fill{false, u}, Z},
+          [&](double v) { return silu(v) * (double)u; });
+  }
+}
+
+// THE ANE MATMUL's OUTPUT CEILING. W has 256 on its (i, i) diagonal and
+// the x rows are constant, so out = 256 * x on the first min(K, N)
+// columns, swept across 16384..81920. MEASURED on an M4 Pro at M = 2048:
+// K = N = 256 overflows where fp16 does (65536), but K >= 512 OR N >= 512
+// overflows at 32768 -- half fp16's range. Every real projection is past
+// 256, which is what the feed-forward's fp16 headroom retry is covering
+// (a MiniMax-H3 down projection of 40142 came back inf). Env-gated
+// (VPIPE_ANE_CEILING_PROBE=1): a characterisation, not a contract.
+TEST(ane_module, matmul_ceiling_k_vs_n)
+{
+  if (std::getenv("VPIPE_ANE_CEILING_PROBE") == nullptr) { return; }
+  vpipe::Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using vpipe::genai::AneModule;
+  using vpipe::genai::AneWeightSlots;
+  const int M = 2048;
+  for (const auto& [K, N] : std::vector<std::pair<int, int>>{
+           {256, 256}, {512, 256}, {1024, 256}, {4096, 256},
+           {256, 512}, {256, 1024}, {256, 4096}}) {
+    vpipe::AneGraphSpec s;
+    s.kind = vpipe::AneGraphSpec::Kind::Matmul;
+    s.M = M; s.K = K; s.N = N;
+    s.runtime_weights = true;
+    auto mod = AneModule::build_runtime(
+        &sess, s, std::filesystem::temp_directory_path().string() +
+                      "/ane-ceil.mlmodelc");
+    auto slots = AneWeightSlots::create(s);
+    ASSERT_TRUE(mod != nullptr && slots != nullptr);
+    if (mod == nullptr || slots == nullptr) { continue; }
+    slots->fill(0, [&](void* base, std::size_t bpr) {
+      for (int r = 0; r < slots->rows(0); ++r) {
+        auto* d = reinterpret_cast<_Float16*>(
+            static_cast<std::uint8_t*>(base) + (std::size_t)r * bpr);
+        for (int c = 0; c < slots->cols(0); ++c) {
+          d[c] = (r == c) ? (_Float16)256.0f : (_Float16)0.0f;
+        }
+      }
+    });
+    auto x = mc->make_shared_buffer((std::size_t)M * K * 2);
+    auto y = mc->make_shared_buffer((std::size_t)M * N * 2);
+    auto* xp = static_cast<_Float16*>(x.contents());
+    for (int r = 0; r < M; ++r) {
+      const double v = 64.0 + 256.0 * (double)r / (double)M;   // 64..320
+      for (int c = 0; c < K; ++c) { xp[(std::size_t)r * K + c] = (_Float16)v; }
+    }
+    mod->run(x, 0, y, 0, *slots);
+    const auto* yp = static_cast<const _Float16*>(y.contents());
+    double first_bad = 0.0;
+    for (int r = 0; r < M && first_bad == 0.0; ++r) {
+      if (!std::isfinite((float)yp[(std::size_t)r * N])) {
+        first_bad = 256.0 * (double)xp[(std::size_t)r * K];
+      }
+    }
+    std::printf("[ane_ceiling] K=%4d N=%4d: first non-finite at a true "
+                "result of %.0f\n", K, N, first_bad);
+  }
 }

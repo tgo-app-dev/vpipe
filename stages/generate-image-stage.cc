@@ -9,6 +9,7 @@
 #include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "generative-models/image-model-registry.h"
+#include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "stages/denoise-progress.h"
 #include "generative-models/generative-model-manager.h"
@@ -79,7 +80,11 @@ const ConfigKey kAttrs[] = {
        "boogu-image,boogu-image-edit,z-image,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
-   .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else <hf_dir>/transformer",
+   .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else "
+          "<hf_dir>/transformer. Krea-2 also takes a single .safetensors "
+          "in Krea's own layout -- a community fine-tune, FP8 included -- "
+          "and Qwen-Image-2.1 a single-file DiT under its diffusers names "
+          "(unsloth's FP8), each read as it is, with no conversion step",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2-dit,flux2-dit,qwen-image-edit-dit,qwen-image-21-dit,"
@@ -883,6 +888,17 @@ std::string
 t2i_family_(const std::string& transformer_dir)
 {
   namespace fs = std::filesystem;
+  // A Krea-2 DiT in Krea's own single-file layout (a community fine-tune,
+  // usually FP8) has no config.json at all, so it is recognised by its
+  // tensor names -- a READING, where the "krea2" at the bottom is a
+  // guess.
+  if (genai::krea2::is_native_dit_file(transformer_dir)) { return "krea2"; }
+  // Likewise a Qwen-Image-2.1 DiT published as ONE file (unsloth's FP8):
+  // no config, so read off its tensor names.
+  if (genai::MetalQwenImage21Transformer::is_single_file_dit(
+          transformer_dir)) {
+    return "qwen-image-21";
+  }
   std::ifstream in(fs::path(transformer_dir) / "config.json");
   if (in) {
     FlexData fd = FlexData::from_json(in);
@@ -1776,7 +1792,9 @@ GenerateImageStage::ensure_loaded_()
   // NOT for VOSR: the probe above READ its args.json, so the family is a
   // reading and not a fall-through, and saying otherwise sends an
   // operator looking for a plugin that does not exist.
-  if (_plugin_family == nullptr && _family != "vosr") {
+  if (_plugin_family == nullptr && _family != "vosr" &&
+      !genai::krea2::is_native_dit_file(dit_dir) &&
+      !genai::MetalQwenImage21Transformer::is_single_file_dit(dit_dir)) {
     std::error_code cec;
     if (!fs::exists(fs::path(dit_dir) / "config.json", cec)) {
       session()->warn(fmt(

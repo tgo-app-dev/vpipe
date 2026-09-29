@@ -1,7 +1,8 @@
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/krea2/krea2-native-checkpoint.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
-
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/lora-names.h"
 #include "generative-models/shared/dit-gpu-progress.h"
@@ -92,6 +93,11 @@ to_f16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   } else if (info->dtype == "F16") {
     const auto* s = static_cast<const _Float16*>(raw.contents());
     for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_((float)s[i]); }
+  } else if (const fp8::Format f = fp8::format_of(info->dtype);
+             f != fp8::Format::kNone) {
+    // Exact: every FP8 value is a bf16 value.
+    fp8::decode_bf16(static_cast<const std::uint8_t*>(raw.contents()), d, n,
+                     f);
   } else {
     return {};
   }
@@ -123,8 +129,45 @@ to_f16_norm_(const MetalLlamaWeights& wts, MetalCompute* mc,
   } else if (info->dtype == "BF16") {
     const auto* s = static_cast<const std::uint16_t*>(raw.contents());
     for (std::size_t i = 0; i < n; ++i) { put(i, bf16_to_f32_(s[i])); }
+  } else if (const fp8::Format f = fp8::format_of(info->dtype);
+             f != fp8::Format::kNone) {
+    const auto* s = static_cast<const std::uint8_t*>(raw.contents());
+    for (std::size_t i = 0; i < n; ++i) { put(i, fp8::to_f32(s[i], f)); }
   } else {
     return {};
+  }
+  return out;
+}
+
+// An FP8 tensor read whole into bf16, its scale applied: code * scale
+// rounded once to bf16, then -- for a norm -- the (1 + w) fold on THAT
+// value. Rounding before the fold is deliberate: it is what a dense bf16
+// conversion of the same file holds, and then folds, so the two agree to
+// the bit.
+SharedBuffer
+fp8_elt_(const MetalLlamaWeights& wts, MetalCompute* mc,
+         const std::string& nm, const fp8::Weight& fw, bool norm)
+{
+  const auto* ti = wts.info(nm);
+  if (ti == nullptr) { return {}; }
+  std::size_t n = 1;
+  for (auto d : ti->shape) { n *= (std::size_t)d; }
+  const std::size_t rows =
+      ti->shape.empty() ? 1 : (std::size_t)ti->shape[0];
+  if (rows == 0 || n % rows != 0) { return {}; }
+  std::vector<float> scale;
+  if (!fp8::read_scale(wts, fw, rows, &scale, nullptr)) { return {}; }
+  SharedBuffer raw = wts.load(nm, mc);
+  if (raw.empty() || raw.byte_size() < n) { return {}; }
+  SharedBuffer out = mc->make_shared_buffer(n * 2);
+  if (out.empty()) { return {}; }
+  auto* d = static_cast<std::uint16_t*>(out.contents());
+  fp8::decode_bf16(static_cast<const std::uint8_t*>(raw.contents()), d,
+                   rows, n / rows, fw.format, scale);
+  if (norm) {
+    for (std::size_t i = 0; i < n; ++i) {
+      d[i] = f32_to_bf16_(bf16_to_f32_(d[i]) + 1.0f);
+    }
   }
   return out;
 }
@@ -138,6 +181,9 @@ MetalKrea2Transformer::elt_(WeightSet& ws, const std::string& nm, Retain r,
                             bool norm)
 {
   auto build = [&]() {
+    if (const fp8::Weight* fw = _f8.find(nm); fw != nullptr) {
+      return fp8_elt_(ws.src(), _mc, nm, *fw, norm);
+    }
     return norm ? to_f16_norm_(ws.src(), _mc, nm)
                 : to_f16_(ws.src(), _mc, nm);
   };
@@ -184,6 +230,30 @@ MetalKrea2Transformer::load_qw_(WeightSet& ws, const std::string& name,
       return qw;
     }
     qw.codes = {}; qw.scales = {}; qw.qbias = {};
+  }
+  // FP8: keep the checkpoint's own codes -- half a bf16 weight's bytes --
+  // and expand them per GEMM (fp8_dense_). Read raw, exactly as a
+  // quantized pack's u32 codes are. A scaled weight brings its scale, as
+  // f32, alongside.
+  if (const fp8::Weight* fw = _f8.find(name + ".weight");
+      fw != nullptr && ci != nullptr && ci->shape.size() == 2) {
+    const auto res = _mmap_weights ? WeightSet::Residency::Mapped
+                                   : WeightSet::Residency::Copied;
+    qw.codes = r == Retain::Streamed
+                   ? ws.stream_tensor(name + ".weight", _mc, res)
+                   : ws.tensor(name + ".weight", _mc, res);
+    if (!fw->scale.empty()) {
+      const std::string wn = name + ".weight";
+      auto build = [this, wn]() { return fp8_scale_buf_(wn); };
+      qw.f8_scale = r == Retain::Streamed
+                        ? ws.stream_derived(build)
+                        : ws.derived(std::string(kKey) + "f8s|" + fw->scale,
+                                     build);
+      qw.f8_per_row = fw->per_row;
+      if (qw.f8_scale.empty()) { return QWeight{}; }
+    }
+    if (!qw.codes.empty()) { qw.f8 = fw->format; }
+    return qw;
   }
   qw.w = elt_(ws, name + ".weight", r);              // dense fallback
   return qw;
@@ -293,13 +363,21 @@ MetalKrea2Transformer::each_block_tensor_(
     int L, Block& b, const BlockSlots<Block>::TensorFn& fn) const
 {
   const std::string p = "transformer_blocks." + std::to_string(L) + ".";
-  const auto qw = [&fn](const std::string& base, QWeight& w) {
+  const auto qw = [this, &fn](const std::string& base, QWeight& w) {
     if (w.quantized) {
       // Codes are the checkpoint's own u32 words; the group scales and
       // minima are read as bf16 (F16 in the pack, converted in place).
       fn(base + ".weight", w.codes, P::kRaw);
       fn(base + ".scales", w.scales, P::kBf16);
       fn(base + ".biases", w.qbias, P::kBf16);
+    } else if (w.is_fp8()) {
+      // FP8 codes, placed as the file holds them; a scale is rebuilt per
+      // refill (it is converted to f32, and it is four bytes).
+      fn(base + ".weight", w.codes, P::kRaw);
+      if (const fp8::Weight* fw = _f8.find(base + ".weight");
+          fw != nullptr && !fw->scale.empty()) {
+        fn(fw->scale, w.f8_scale, P::kDerived);
+      }
     } else {
       fn(base + ".weight", w.w, P::kBf16);
     }
@@ -372,9 +450,11 @@ MetalKrea2Transformer::clone_block_(const Block& src, Block& dst,
     if (copy) { std::memcpy(d.contents(), s.contents(), s.byte_size()); }
   };
   const auto qw = [&](const QWeight& s, QWeight& d) {
-    d.quantized = s.quantized;
-    d.bits      = s.bits;
-    one(s.w, d.w); one(s.codes, d.codes);
+    d.quantized  = s.quantized;
+    d.bits       = s.bits;
+    d.f8         = s.f8;
+    d.f8_per_row = s.f8_per_row;
+    one(s.w, d.w); one(s.codes, d.codes); one(s.f8_scale, d.f8_scale);
     one(s.scales, d.scales); one(s.qbias, d.qbias);
   };
   one(src.n1, dst.n1); one(src.n2, dst.n2);
@@ -393,6 +473,16 @@ SharedBuffer
 MetalKrea2Transformer::rebuild_one_(const std::string& nm, P how)
 {
   if (!_ws) { return {}; }
+  // An FP8 SCALE: the f32 multiplier of the weight it sits beside.
+  if (fp8::is_aux_name(nm)) {
+    for (const char* suf : {".weight_scale", ".scale_weight"}) {
+      const std::size_t k = std::char_traits<char>::length(suf);
+      if (nm.size() > k && nm.compare(nm.size() - k, k, suf) == 0) {
+        return fp8_scale_buf_(nm.substr(0, nm.size() - k) + ".weight");
+      }
+    }
+    return {};
+  }
   if (how == P::kRaw) {
     const auto res = _mmap_weights ? WeightSet::Residency::Mapped
                                    : WeightSet::Residency::Copied;
@@ -430,8 +520,9 @@ MetalKrea2Transformer::configure_slots_()
   };
   o.bytes = [](const Block& b) { return block_bytes_(b); };
   o.empty = [](const Block& b) { return b.q.empty(); };
-  o.post_refill = [this](int, Block& b) {
-    return weave_into_(b.ff_gate, b.ff_up, b.ff_gu);
+  o.post_refill = [this](int L, Block& b) {
+    return fp8_kinds_match_(L, b) &&
+           weave_into_(b.ff_gate, b.ff_up, b.ff_gu);
   };
   _slots.set_weight_set(_ws.get());
   _slots.configure(_mc, std::move(o), "MetalKrea2Transformer",
@@ -688,6 +779,73 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
             }
           }
         }
+      }
+    }
+  }
+
+  // FP8 WEIGHTS: a checkpoint stored F8_E4M3 / F8_E5M2 -- typically the
+  // single file a community fine-tune ships, which MetalLlamaWeights reads
+  // under the diffusers names (krea2/krea2-native-checkpoint.h). The
+  // projections keep their codes, half a bf16 weight's bytes, and each is
+  // expanded on the GPU right before its GEMM; everything small is widened
+  // to bf16 as it loads. Plain FP8 is exact (every FP8 value is a bf16
+  // value); SCALED FP8 (shared/fp8-layout.h) is code * scale rounded once,
+  // the same value a dense conversion of the file holds.
+  //
+  // Two shapes are refused HERE, with the reason, rather than left to fail
+  // as "missing tensor" several lines on: an encoding the scan cannot
+  // decode (MXFP8, NVFP4, int8, block scales), and a native file the
+  // reader could not translate whole. Warned, and null returned, like
+  // every other refusal here: the caller owns the verdict (and a
+  // session's error() throws).
+  {
+    const MetalLlamaWeights& src = ws.src();
+    // The compute session, not cfg.session: that one is set only when
+    // the ANE tier is asked for, and these lines matter without it.
+    const SessionContextIntf* sess = mc->session();
+    if (krea2::native_prefix(src).has_value()) {
+      if (sess != nullptr) {
+        sess->warn(fmt(
+            "krea2: '{}' is a Krea-2 DiT in Krea's own layout, but tensor "
+            "'{}' has no diffusers name, so the checkpoint cannot be read "
+            "whole", model_dir, krea2::untranslatable_tensor(src)));
+      }
+      return nullptr;
+    }
+    std::string ferr;
+    if (!fp8::scan(src, &m->_f8, &ferr)) {
+      if (sess != nullptr) {
+        sess->warn(fmt("krea2: '{}': {}", model_dir, ferr));
+      }
+      return nullptr;
+    }
+    if (m->_f8.any()) {
+      if (!m->_fp8x.load(mc)) {
+        if (sess != nullptr) {
+          sess->warn(fmt(
+              "krea2: '{}' stores FP8 weights and the FP8 expansion kernels "
+              "did not load", model_dir));
+        }
+        return nullptr;
+      }
+      std::size_t fp8_bytes = 0, n_scaled = 0;
+      for (const auto& [n, fw] : m->_f8.weights) {
+        if (const auto* ti = src.info(n); ti != nullptr) {
+          fp8_bytes += (std::size_t)ti->nbytes;
+        }
+        if (!fw.scale.empty()) { ++n_scaled; }
+      }
+      if (sess != nullptr) {
+        sess->info(fmt(
+            "krea2: FP8 checkpoint{} -- {} tensors ({} MB){} kept as FP8 "
+            "codes and expanded per GEMM",
+            krea2::is_native_dit_file(model_dir)
+                ? std::string(" (Krea's own layout, read under diffusers "
+                              "names)")
+                : std::string(),
+            m->_f8.weights.size(), fp8_bytes >> 20,
+            n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
+                         : std::string()));
       }
     }
   }
@@ -1372,6 +1530,28 @@ MetalKrea2Transformer::ane_qkv_setup_(int seq)
   return _ane_qkv != nullptr;
 }
 
+namespace {
+
+// An FP8 projection handed to staging: its codes ARE the dense matrix,
+// one byte an element, which AneFfnSource spells as a negative width,
+// with a scaled one's f32 scale in `scales` (see ane-ffn.h). Every other
+// kind is left as the caller built it.
+template <class QW>
+void
+ane_fp8_source_(const QW& q, AneFfnSource& s)
+{
+  if (!q.is_fp8()) { return; }
+  s.w         = &q.codes;
+  s.quantized = false;
+  s.bits      = q.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
+                                           : AneFfnSource::kFp8E4M3;
+  // A scaled one's f32 scale rides in `scales`, which a dense source has
+  // no other use for (see ane-ffn.h).
+  if (!q.f8_scale.empty()) { s.scales = &q.f8_scale; }
+}
+
+}  // namespace
+
 bool
 MetalKrea2Transformer::ane_qkv_eligible_(int L, const Block& b)
 {
@@ -1382,7 +1562,7 @@ MetalKrea2Transformer::ane_qkv_eligible_(int L, const Block& b)
   if (L >= cap) { return false; }
   auto stageable = [](const QWeight& q) {
     if (q.empty()) { return false; }
-    if (!q.quantized) { return true; }
+    if (!q.quantized) { return true; }   // bf16, or FP8 codes
     return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
            !q.qbias.empty();
   };
@@ -1408,6 +1588,7 @@ MetalKrea2Transformer::ane_qkv_stage_(int L, const Block& b)
     s.qbias     = &q.qbias;
     s.quantized = q.quantized;
     s.bits      = q.bits;
+    ane_fp8_source_(q, s);
     s.slot      = 0;
     s.slot_row  = row0;
     s.rows      = n;
@@ -1443,7 +1624,7 @@ MetalKrea2Transformer::ane_eligible_(int L, const Block& b)
   // quantized projection is dequantized into its slot per block.
   auto stageable = [](const QWeight& q) {
     if (q.empty()) { return false; }
-    if (!q.quantized) { return true; }
+    if (!q.quantized) { return true; }   // bf16, or FP8 codes
     return (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
            !q.qbias.empty();
   };
@@ -1462,8 +1643,9 @@ MetalKrea2Transformer::ane_eligible_(int L, const Block& b)
   if (!ok && !_ane_skip_warned && _cfg.session != nullptr) {
     _ane_skip_warned = true;
     _cfg.session->warn(
-        fmt("krea2: block {} has no fp16 or 4/8-bit affine feed-forward to "
-            "stage, so it (and any like it) keeps the GPU feed-forward", L));
+        fmt("krea2: block {} has no bf16, FP8 or 4/8-bit affine "
+            "feed-forward to stage, so it (and any like it) keeps the GPU "
+            "feed-forward", L));
   }
   return ok;
 }
@@ -1484,6 +1666,7 @@ MetalKrea2Transformer::ane_stage_(int L, const Block& b)
     s.qbias     = &q.qbias;
     s.quantized = q.quantized;
     s.bits      = q.bits;
+    ane_fp8_source_(q, s);
     s.stride    = stride;
     s.offset    = offset;
     for (int i = 0; i < st.n && s.deltas < AneFfnSource::kMaxDeltas; ++i) {
@@ -1593,7 +1776,7 @@ std::size_t
 MetalKrea2Transformer::qw_bytes_(const QWeight& w)
 {
   return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size() +
-         w.qbias.byte_size();
+         w.qbias.byte_size() + w.f8_scale.byte_size();
 }
 
 // ---- the wired pool ---------------------------------------------------
@@ -1830,6 +2013,77 @@ MetalKrea2Transformer::release_resident_blocks(std::size_t bytes)
   return freed;
 }
 
+SharedBuffer
+MetalKrea2Transformer::fp8_scale_buf_(const std::string& weight)
+{
+  const fp8::Weight* fw = _f8.find(weight);
+  if (fw == nullptr || !_ws) { return {}; }
+  const auto* ti = _ws->src().info(weight);
+  if (ti == nullptr || ti->shape.empty()) { return {}; }
+  std::vector<float> v;
+  if (!fp8::read_scale(_ws->src(), *fw, (std::size_t)ti->shape[0], &v,
+                       nullptr) ||
+      v.empty()) {
+    return {};
+  }
+  SharedBuffer b = _mc->make_shared_buffer(v.size() * sizeof(float));
+  if (b.empty()) { return {}; }
+  std::memcpy(b.contents(), v.data(), v.size() * sizeof(float));
+  return b;
+}
+
+bool
+MetalKrea2Transformer::fp8_kinds_match_(int L, const Block& b) const
+{
+  if (!_f8.any()) { return true; }
+  const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+  const std::pair<const char*, const QWeight*> all[] = {
+      {"attn.to_q", &b.q},       {"attn.to_k", &b.k},
+      {"attn.to_v", &b.v},       {"attn.to_gate", &b.gate},
+      {"attn.to_out.0", &b.o},   {"ff.gate", &b.ff_gate},
+      {"ff.up", &b.ff_up},       {"ff.down", &b.ff_down}};
+  for (const auto& [proj, q] : all) {
+    if (q->empty()) { continue; }   // released (fused) or absent
+    const fp8::Weight* fw = _f8.find(p + proj + ".weight");
+    if (q->is_fp8() != (fw != nullptr)) { return false; }
+    if (fw == nullptr) { continue; }
+    if (q->f8 != fw->format || q->f8_scale.empty() != fw->scale.empty() ||
+        q->f8_per_row != fw->per_row) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const MetalKrea2Transformer::QWeight*
+MetalKrea2Transformer::fp8_dense_(ComputeEncoder& enc, const QWeight& w,
+                                  QWeight& view, int N, int K)
+{
+  if (!w.is_fp8()) { return &w; }
+  const std::size_t n = (std::size_t)N * (std::size_t)K;
+  const std::size_t need = n * 2;
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { _fp8_failed = true; return nullptr; }
+  }
+  // The widening itself is shared (shared/fp8-expand.h): one launch over
+  // the whole [N, K], scale applied per row or per tensor. It declines,
+  // encoding nothing, on a short buffer or a count past its 32-bit index.
+  fp8::Codes c;
+  c.codes   = &w.codes;
+  c.format  = w.f8;
+  c.scale   = &w.f8_scale;
+  c.per_row = w.f8_per_row;
+  if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
+    _fp8_failed = true;
+    return nullptr;
+  }
+  // An alias of the scratch (same Metal buffer, retained), not a copy.
+  view.w = _w_deq.subview(0, need);
+  if (view.w.empty()) { _fp8_failed = true; return nullptr; }
+  return &view;
+}
+
 bool
 MetalKrea2Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& xin,
                                  const QWeight& w, const SharedBuffer& y,
@@ -1966,6 +2220,7 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
   const int HID = c.hidden;                   // 6144
   const float eps = c.norm_eps;
   if (TS <= 0 || ehs.byte_size() < (std::size_t)TS * NL * TH * 2) { return {}; }
+  _fp8_failed = false;   // per forward: a latch, not a verdict on the model
 
   // LLM-lane event: the text-fusion tower runs once per image. value = seq.
   PerfAuxScope _perf(_mc->session(), kPerfLaneLLM, kGvidLlmDitText,
@@ -2001,9 +2256,15 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
     ComputeEncoder enc = stream.begin_compute();
     // y[M,N] = x[M,K] @ W[N,K]^T. dense_gemm_t (f16 W) or affine_qmm_steel
     // (quantized W). y written at element offset `ye`.
-    auto gemm_off = [&](const SharedBuffer& xin, const QWeight& w,
+    auto gemm_off = [&](const SharedBuffer& xin, const QWeight& w_in,
                         const SharedBuffer& y, std::size_t ye, int M, int N,
                         int K) {
+      // An FP8 weight is expanded first and then IS a dense one to every
+      // path below.
+      QWeight fv;
+      const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
+      if (wp == nullptr) { return; }
+      const QWeight& w = *wp;
       if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) { return; }
       if (w.quantized) {
         enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
@@ -2037,9 +2298,13 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
       enc.set_constant(2, N); enc.set_constant(3, M * N);
       enc.dispatch({(unsigned)(M * N), 1, 1}, {256, 1, 1});
     };
-    auto gemm_bias = [&](const SharedBuffer& xin, const QWeight& w,
+    auto gemm_bias = [&](const SharedBuffer& xin, const QWeight& w_in,
                          const SharedBuffer& bs, const SharedBuffer& y, int M,
                          int N, int K) {
+      QWeight fv;
+      const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
+      if (wp == nullptr) { return; }
+      const QWeight& w = *wp;
       if (gemm_mma_(enc, xin, w, y, 0, M, N, K)) {   // dense OR quant on M5
         bias_add(bs, y, M, N);
         return;
@@ -2172,6 +2437,14 @@ MetalKrea2Transformer::forward_text(const SharedBuffer& ehs, int text_seq)
     gemm_bias(y2, _txt_l2w, _txt_l2b, y3, TS, HID, HID);
   }
   stream.commit().wait();
+  if (_fp8_failed) {
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt(
+          "MetalKrea2Transformer::forward_text: no scratch to expand an FP8 "
+          "weight into"));
+    }
+    return {};
+  }
   // Downcast the bf16 fused-text to the public f16 boundary (forward_dit upcasts
   // it back -- lossless: the txt_in output is f16-safe, the overflow that needs
   // bf16 is deeper in the forward_dit residual stream).
@@ -2215,6 +2488,7 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       return {};
     }
   }
+  _fp8_failed = false;   // per forward: a latch, not a verdict on the model
   // Image layout for scratch + RoPE: generated (frame 0) then each reference
   // (frame = index). grid_h/grid_w anchor the generated grid + shape key.
   std::vector<ImgSeg> segs;
@@ -2365,12 +2639,18 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
     // encoded after it. Threaded through the lambda rather than called
     // at each site so the adapter cannot be forgotten on one projection
     // and applied on the other seven.
-    auto gemm = [&](const SharedBuffer& xin, const QWeight& w,
+    auto gemm = [&](const SharedBuffer& xin, const QWeight& w_in,
                     const SharedBuffer& y, std::size_t ye, int M, int N,
                     int K, const lora::Stack& lf = lora::Stack{}) {
       auto lora_after = [&]() {
         _lora.apply(enc, xin, 0, lf, y, ye, M, N, K, _mma_min_m);
       };
+      // An FP8 weight is expanded first and then IS a dense one to every
+      // path below -- matmul2d, i8_gemm and the steel tiles alike.
+      QWeight fv;
+      const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
+      if (wp == nullptr) { return; }
+      const QWeight& w = *wp;
       if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) { lora_after(); return; }
       int bm = 32, bn = 32;               // steel tile
       if (w.quantized) {
@@ -2415,9 +2695,13 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
                    {32, 2, tgz});
       lora_after();
     };
-    auto gemm_bias = [&](const SharedBuffer& xin, const QWeight& w,
+    auto gemm_bias = [&](const SharedBuffer& xin, const QWeight& w_in,
                          const SharedBuffer& bs, const SharedBuffer& y,
                          std::size_t ye, int M, int N, int K) {
+      QWeight fv;
+      const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
+      if (wp == nullptr) { return; }
+      const QWeight& w = *wp;
       if (gemm_mma_(enc, xin, w, y, ye, M, N, K)) {   // dense OR quant on M5
         enc.set_function(_fn_bias_add);
         enc.set_buffer(0, y, ye * 2); enc.set_buffer(1, bs);
@@ -3223,6 +3507,16 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       }
       return {};
     }
+  }
+  // A GEMM whose FP8 weight had no scratch to expand into was skipped,
+  // so the velocity is missing a term -- a failed step, not an answer.
+  if (_fp8_failed) {
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt(
+          "MetalKrea2Transformer::forward_dit: no scratch to expand an FP8 "
+          "weight into"));
+    }
+    return {};
   }
   if (prof && _mc->session() != nullptr) {
     const double tot = t_cond + t_norm + t_qkv + t_attn + t_oproj + t_ffup

@@ -57,13 +57,36 @@
 //
 // f32 is unservable under both: the destination is half the source, so
 // there is nowhere to put the bytes.
+//
+// U8 is served RAW only: it is how ComfyUI's comfy_quant writer stores
+// FP8 codes whose format lives in a record beside them, and the caller
+// that asks for its raw bytes is the one that read the record.
+//
+// FP8 (F8_E4M3 / F8_E5M2) is served under both, differently:
+//
+//   kRaw   the codes are placed as they sit -- a model that keeps its
+//          weights FP8 and expands them on the GPU reads exactly the
+//          file's bytes, at half a bf16 slot's size.
+//   kBf16  WIDENED in place: the codes are read into the upper half of
+//          the destination (which is twice their size) and decoded
+//          forward, every write landing below the next unread code --
+//          output i fills bytes [2i, 2i+2) while code i sits at n + i, and
+//          2i + 1 < n + i + 1 for every i < n. Exact, since every FP8
+//          value is a bf16 value (shared/fp8.h). A SCALED weight widens
+//          with its scale, code x scale rounded once -- fp8::decode_bf16's
+//          value -- and never without it: the codes alone are the weight
+//          off by that factor, and nothing downstream could tell.
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "generative-models/weight-set.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace vpipe::genai {
 
@@ -133,7 +156,39 @@ refill_serves(WeightSet& ws, const std::string& name, RefillDst as)
   const auto* ti = ws.src().info(name);
   if (ti == nullptr) { return false; }
   return ti->dtype == "BF16" || ti->dtype == "U32" ||
+         fp8::format_of(ti->dtype) != fp8::Format::kNone ||
+         (ti->dtype == "U8" && as == RefillDst::kRaw) ||
          (ti->dtype == "F16" && as == RefillDst::kBf16);
+}
+
+// FP8 codes -> bf16 where the bytes already lie: the n codes sit in the
+// UPPER half of `buf` (2n bytes) and are decoded forward. See the dtype
+// rule above for why no write overtakes an unread code. `scale` is empty
+// (plain), one value, or one per row of `cols` codes.
+inline void
+bf16_from_fp8_in_place(const metal_compute::SharedBuffer& buf,
+                       fp8::Format f,
+                       const std::vector<float>& scale = {},
+                       std::size_t cols = 0)
+{
+  const std::size_t n = buf.byte_size() / 2;
+  auto* base = static_cast<std::uint8_t*>(buf.contents());
+  const std::uint8_t* codes = base + n;
+  if (scale.empty()) {
+    const std::array<std::uint16_t, 256>& t = fp8::bf16_table(f);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint16_t v = t[codes[i]];
+      std::memcpy(base + 2 * i, &v, sizeof(v));
+    }
+    return;
+  }
+  const std::array<float, 256>& t = fp8::f32_table(f);
+  const bool per_row = scale.size() > 1 && cols > 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float s = per_row ? scale[i / cols] : scale[0];
+    const std::uint16_t v = bf16_from_f32(t[codes[i]] * s);
+    std::memcpy(base + 2 * i, &v, sizeof(v));
+  }
 }
 
 // Put `name`'s bytes into `dst`, which the caller owns and which must
@@ -151,7 +206,30 @@ refill_streamed_tensor(WeightSet& ws, const std::string& name,
   const auto* ti = ws.src().info(name);
   if (ti == nullptr) { return Refill::kFailed; }
   const bool f16 = ti->dtype == "F16" && as == RefillDst::kBf16;
+  const fp8::Format f8 = as == RefillDst::kBf16
+                             ? fp8::format_of(ti->dtype)
+                             : fp8::Format::kNone;
   if (!refill_serves(ws, name, as)) { return Refill::kUnservable; }
+  if (f8 != fp8::Format::kNone) {
+    if (2 * ti->nbytes != dst.byte_size()) { return Refill::kFailed; }
+    // The scale first, so a scaled weight whose scale cannot be read
+    // fails before any byte of `dst` is touched.
+    std::vector<float> scale;
+    fp8::Weight fw;
+    std::string ferr;
+    const std::size_t rows =
+        ti->shape.empty() ? 1 : (std::size_t)ti->shape[0];
+    if (!fp8::resolve(ws.src(), name, &fw, &ferr)) {
+      if (!ferr.empty()) { return Refill::kFailed; }
+    } else if (!fp8::read_scale(ws.src(), fw, rows, &scale, nullptr)) {
+      return Refill::kFailed;
+    }
+    auto* hi = static_cast<std::uint8_t*>(dst.contents()) + ti->nbytes;
+    if (!ws.stream_into(name, hi, ti->nbytes)) { return Refill::kFailed; }
+    bf16_from_fp8_in_place(dst, f8, scale,
+                           rows > 0 ? (std::size_t)ti->nbytes / rows : 0);
+    return Refill::kFilled;
+  }
   if (ti->nbytes != dst.byte_size()) { return Refill::kFailed; }
   if (!ws.stream_into(name, dst.contents(), dst.byte_size())) {
     return Refill::kFailed;

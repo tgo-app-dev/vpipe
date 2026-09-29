@@ -1940,9 +1940,13 @@ const STRINGS = {
       + '包含管道。可選：model 輸入埠上的 model-select 來源會覆寫它'],
   'cfg.generate-image.dit_dir': ['',
       '覆盖 DiT 目录（例如一个量化过的 4/8 位 DiT）；否则取 <hf_dir>/'
-      + 'transformer',
+      + 'transformer。Krea-2 也接受 Krea 自有布局的单个 .safetensors 文件'
+      + '——社区微调模型，包括 FP8；Qwen-Image-2.1 也接受以 diffusers 名称'
+      + '存放的单文件 DiT（unsloth 的 FP8）——均按原样读取，无需转换',
       '覆寫 DiT 目錄（例如一個量化過的 4/8 位元 DiT）；否則取 <hf_dir>/'
-      + 'transformer'],
+      + 'transformer。Krea-2 也接受 Krea 自有佈局的單個 .safetensors 檔案'
+      + '——社群微調模型，包括 FP8；Qwen-Image-2.1 也接受以 diffusers 名稱'
+      + '存放的單檔 DiT（unsloth 的 FP8）——均按原樣讀取，無需轉換'],
   'cfg.generate-image.strength': ['',
       '图生图强度，取值 [0,1]；0（默认）表示从噪声开始的文生图（初始潜变量'
       + '由 vae-encode 从 `latent` 输入端口送入）',
@@ -2314,6 +2318,17 @@ const STRINGS = {
       + '目錄的樹，也可能是命名不同的重新打包版本——每個已註冊的模型族會認領'
       + '它能辨識的根目錄，因此這裡只要給出檢查點根目錄，由認領它的模型族決'
       + '定其餘細節。可選：model 輸入埠上的 model-select 來源會覆寫它'],
+  'cfg.generate-video.dit_dir': ['',
+      '仅限 MiniMax-H3：用来替代 hf_dir 下那份 DiT 运行的检查点，hf_dir 的'
+      + '文本编码器和 VAE 仍照常使用——可以是单个 .safetensors（Comfy-Org 重'
+      + '打包，或 diffusers 命名，例如 lightx2v 的 FP8 turbo DiT，按原样读取，'
+      + 'FP8 保持为 FP8），也可以是 transformer 目录。留空：使用 hf_dir 自带'
+      + '的那份',
+      '僅限 MiniMax-H3：用來替代 hf_dir 下那份 DiT 執行的檢查點，hf_dir 的'
+      + '文字編碼器和 VAE 仍照常使用——可以是單個 .safetensors（Comfy-Org 重'
+      + '新打包，或 diffusers 命名，例如 lightx2v 的 FP8 turbo DiT，按原樣讀'
+      + '取，FP8 保持為 FP8），也可以是 transformer 目錄。留空：使用 hf_dir '
+      + '自帶的那份'],
   'cfg.generate-video.height': ['',
       '视频高度（像素）。会向上取整到常驻模型族的 VAE 步幅乘以其 DiT patch '
       + '的倍数，各族不同，因此任何正值都接受，阶段会记录实际使用的值',
@@ -5058,29 +5073,41 @@ const STRINGS = {
       + '化；嵌入/输出头/归一化/辅助模块原样透传。对 Krea-2（文生图）模型，'
       + '`target` 选择组件（dit | text_encoder | vae），输出是一个自包含的'
       + '管道（所有组件都复制过来，只有目标被量化），可直接用作 '
-      + 'generate-image 的 hf_dir——多次串联即可量化多个组件。可选的 trigger'
-      + ' 输入与 summary 输出。',
+      + 'generate-image 的 hf_dir——多次串联即可量化多个组件。FP8 源'
+      + '（F8_E4M3 / F8_E5M2，带或不带缩放）按 bf16 读取；bits=16 则'
+      + '把它原样写成稠密检查点，而不做量化。可选的 trigger 输入与 summary'
+      + ' 输出。',
       '來源：一次性離線把 safetensors 模型量化為 MLX 仿射分組量化格式，涵蓋'
       + ' vpipe 支援的各個模型族（Llama / Qwen2 / Qwen3 / Qwen3.5 / Gemma-4'
       + ' / MOSS）。arch / layer_prefix / n_layers 從來源自動偵測。線性層被'
       + '量化；嵌入/輸出頭/正規化/輔助模組原樣透傳。對 Krea-2（文生圖）模型'
       + '，`target` 選擇元件（dit | text_encoder | vae），輸出是一個自包含'
       + '的管道（所有元件都複製過來，只有目標被量化），可直接用作 '
-      + 'generate-image 的 hf_dir——多次串聯即可量化多個元件。可選的 trigger'
-      + ' 輸入與 summary 輸出。'],
+      + 'generate-image 的 hf_dir——多次串聯即可量化多個元件。FP8 來源'
+      + '（F8_E4M3 / F8_E5M2，帶或不帶縮放）按 bf16 讀取；bits=16 則'
+      + '把它原樣寫成稠密檢查點，而不做量化。可選的 trigger 輸入與 summary'
+      + ' 輸出。'],
   'cfg.model-quantize.src_model': ['',
-      '源模型：models 数据库中的键（由 model-fetch 注册），或一个 bf16/f16 '
-      + '的 safetensors 目录路径',
-      '來源模型：models 資料庫中的鍵（由 model-fetch 註冊），或一個 bf16/'
-      + 'f16 的 safetensors 目錄路徑'],
+      '源模型：models 数据库中的键（由 model-fetch 注册），或一个路径——'
+      + 'bf16/f16/fp8 的 safetensors 目录，或单个 .safetensors 文件：'
+      + 'Comfy-Org 的组件，或 Krea 自有布局的 Krea-2 DiT（社区微调模型），'
+      + '后者会以 diffusers 名称写出',
+      '來源模型：models 資料庫中的鍵（由 model-fetch 註冊），或一個路徑——'
+      + 'bf16/f16/fp8 的 safetensors 目錄，或單個 .safetensors 檔案：'
+      + 'Comfy-Org 的元件，或 Krea 自有佈局的 Krea-2 DiT（社群微調模型），'
+      + '後者會以 diffusers 名稱寫出'],
   'cfg.model-quantize.output_name': ['',
       '结果名称 -> <cwd>/models/<output_name>（以该键注册进 models 数据库）'
       + '，或一个显式路径（"/.."、"./.."），后者原样使用且不注册',
       '結果名稱 -> <cwd>/models/<output_name>（以該鍵註冊進 models 資料庫）'
       + '，或一個明確路徑（"/.."、"./.."），後者原樣使用且不註冊'],
   'cfg.model-quantize.bits': ['',
-      '骨干网络的仿射量化位宽（4 | 8）',
-      '骨幹網路的仿射量化位元寬度（4 | 8）'],
+      '骨干网络的仿射量化位宽（4 | 8），或 16：输出稠密检查点、不做任何'
+      + '量化——FP8 张量解码为 bf16（精确无损，每个 FP8 值都是一个 bf16 '
+      + '值），其余原样复制，于是 FP8 检查点变成普通的 bf16 检查点',
+      '骨幹網路的仿射量化位元寬度（4 | 8），或 16：輸出稠密檢查點、不做'
+      + '任何量化——FP8 張量解碼為 bf16（精確無損，每個 FP8 值都是一個 '
+      + 'bf16 值），其餘原樣複製，於是 FP8 檢查點變成普通的 bf16 檢查點'],
   'cfg.model-quantize.group_size': ['',
       '仿射量化的分组大小（32 | 64）',
       '仿射量化的分組大小（32 | 64）'],

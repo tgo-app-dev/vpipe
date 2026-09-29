@@ -1,5 +1,7 @@
 #include "generative-models/shared/runtime-lora.h"
 
+#include "generative-models/shared/fp8-layout.h"
+
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "interfaces/session-context-intf.h"
@@ -168,6 +170,17 @@ Adapter::open(const std::string& path, MetalCompute* mc, std::string* err,
     if (err != nullptr) { *err = "cannot open " + path; }
     return nullptr;
   }
+  // An FP8 adapter (plain or scaled) is read factor by factor below; one
+  // in an encoding that cannot be decoded is refused HERE, by name,
+  // rather than binding nothing and reporting success.
+  {
+    fp8::Layout l;
+    std::string ferr;
+    if (!fp8::scan(*w, &l, &ferr)) {
+      if (err != nullptr) { *err = path + ": " + ferr; }
+      return nullptr;
+    }
+  }
   std::unique_ptr<Adapter> a(new Adapter());
   a->_mc = mc;
   a->_w = std::make_unique<MetalLlamaWeights>(std::move(*w));
@@ -200,6 +213,10 @@ void
 Adapter::index_suffix_()
 {
   for (const std::string& t : _w->tensor_names()) {
+    // A scaled-FP8 factor's scale (`.lora_A.weight_scale`) carries the
+    // factor marker too, and taking ITS suffix would make every factor
+    // lookup miss.
+    if (fp8::is_aux_name(t)) { continue; }
     std::string suf;
     if (split_factor(t, &suf).empty()) { continue; }
     _suf_a = suf;
@@ -318,6 +335,30 @@ Adapter::factor_meta_(const std::string& key, int* rank, float* mul)
 // One factor, converted to bf16 and (for A) pre-scaled -- folding the
 // file's strength here keeps the kernels scale-free and costs one pass
 // over the smaller of the two matrices.
+// An FP8 factor (plain, or scaled by a sibling `.weight_scale` /
+// `.scale_weight`) as the bf16 values it stands for: exact when plain,
+// code * scale rounded once when scaled -- what a bf16 conversion of the
+// file would hold, so the two adapters apply identically. False, *out
+// untouched, for a factor that is not FP8.
+bool
+Adapter::fp8_factor_(const std::string& name,
+                     std::vector<std::uint16_t>* out) const
+{
+  fp8::Weight fw;
+  if (!fp8::resolve(*_w, name, &fw, nullptr)) { return false; }
+  const auto* ti = _w->info(name);
+  if (ti == nullptr || ti->shape.size() != 2) { return false; }
+  const std::size_t rows = (std::size_t)ti->shape[0];
+  const std::size_t cols = (std::size_t)ti->shape[1];
+  std::vector<float> scale;
+  if (!fp8::read_scale(*_w, fw, rows, &scale, nullptr)) { return false; }
+  std::vector<std::uint8_t> codes(rows * cols);
+  if (!_w->read_into(name, codes.data(), codes.size())) { return false; }
+  out->resize(rows * cols);
+  fp8::decode_bf16(codes.data(), out->data(), rows, cols, fw.format, scale);
+  return true;
+}
+
 SharedBuffer
 Adapter::take_(const std::string& name, float m)
 {
@@ -330,6 +371,13 @@ Adapter::take_(const std::string& name, float m)
   SharedBuffer dst = _mc->make_shared_buffer(cnt * 2);
   if (dst.empty()) { return {}; }
   auto* d = static_cast<std::uint16_t*>(dst.contents());
+  std::vector<std::uint16_t> f8;
+  if (fp8_factor_(name, &f8)) {
+    for (std::size_t i = 0; i < cnt; ++i) {
+      d[i] = m == 1.0f ? f8[i] : f32_to_bf16(bf16_to_f32(f8[i]) * m);
+    }
+    return dst;
+  }
   if (ti->dtype == "BF16") {
     const auto* p = static_cast<const std::uint16_t*>(src.contents());
     for (std::size_t i = 0; i < cnt; ++i) {
@@ -360,6 +408,11 @@ Adapter::take_f32_(const std::string& name, float m, std::vector<float>* out)
   if (src.empty()) { return false; }
   out->resize(cnt);
   float* d = out->data();
+  std::vector<std::uint16_t> f8;
+  if (fp8_factor_(name, &f8)) {
+    for (std::size_t i = 0; i < cnt; ++i) { d[i] = bf16_to_f32(f8[i]) * m; }
+    return true;
+  }
   if (ti->dtype == "F32") {
     const auto* p = static_cast<const float*>(src.contents());
     for (std::size_t i = 0; i < cnt; ++i) { d[i] = p[i] * m; }

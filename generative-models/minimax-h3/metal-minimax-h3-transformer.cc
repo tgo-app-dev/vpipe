@@ -139,6 +139,20 @@ to_bf16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   if (info == nullptr || info->shape.empty()) { return {}; }
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
+  // FP8, plain or scaled (or U8 codes a comfy_quant record calls FP8):
+  // decoded whole, scale applied, to the bits a dense conversion of the
+  // file holds. A U8 tensor no record claims fails here, as it should.
+  if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
+      info->dtype == "U8") {
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty() ||
+        !fp8::decode_tensor_bf16(
+            wts, nm, static_cast<std::uint16_t*>(out.contents()), n,
+            nullptr)) {
+      return {};
+    }
+    return out;
+  }
   SharedBuffer raw = wts.load(nm, mc);
   if (raw.empty()) { return {}; }
   if (info->dtype == "BF16") { return raw; }
@@ -169,6 +183,11 @@ to_host_f32_(WeightSet& ws, MetalCompute* mc, const std::string& nm,
   if (info == nullptr || info->shape.empty()) { return false; }
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
+  if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
+      info->dtype == "U8") {
+    out.resize(n);
+    return fp8::decode_tensor_f32(ws.src(), nm, out.data(), n, nullptr);
+  }
   SharedBuffer raw = ws.read(nm, mc, WeightSet::Residency::Copied);
   if (raw.empty()) { return false; }
   out.resize(n);
@@ -452,6 +471,9 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
   out.partition =
       partition.empty() ? partition_of(p.string()) : partition;
   const bool is_comfy = comfy::is_component(p.string(), kComfyKey);
+  // The diffusers layout (minimax-h3-diffusers-layout.h): its assembled
+  // qkv is FLAT, whatever a config says about grouping.
+  bool diffusers = false;
   FlexData cfg;
   // ---- the Comfy-Org single file -------------------------------------
   // No config.json: the whole transformer config is a JSON string in the
@@ -486,6 +508,49 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
     if (im != "minimax_h3") {
       return fail("not a minimax_h3 checkpoint (image_model=" + im + ")");
     }
+  } else if (fs::is_regular_file(p) && lower_(p.extension().string()) ==
+                                           ".safetensors") {
+    // ---- a single diffusers-layout file with no config --------------
+    // lightx2v's FP8 turbo DiT: the H3 architecture's dimensions are read
+    // off the tensors, and everything the tensors cannot say (patch, rope,
+    // eps) keeps the architecture's defaults.
+    auto w = MetalLlamaWeights::open_model(p.string());
+    if (!w.has_value()) { return fail("cannot open " + p.string()); }
+    if (!w->has("blocks.0.attn.qkv_proj.q.weight")) {
+      return fail(p.string() + " is neither a Comfy-Org H3 component nor an "
+                               "H3 DiT in the diffusers naming");
+    }
+    auto dim = [&](const std::string& n, int axis) -> long {
+      const auto* ti = w->info(n);
+      return ti != nullptr && (int)ti->shape.size() > axis
+                 ? (long)ti->shape[(std::size_t)axis]
+                 : -1;
+    };
+    auto count = [&](const std::string& pre) {
+      int n = 0;
+      while (w->has(pre + std::to_string(n) + ".norm1.weight")) { ++n; }
+      return n;
+    };
+    const long hidden = dim("condition_proj.weight", 0);
+    const long vin = dim("video_patch_proj.weight", 1);
+    if (hidden <= 0 || vin <= 0 || vin % 4 != 0) {
+      return fail(p.string() + ": cannot read the H3 dimensions off it");
+    }
+    cfg = FlexData::from_json(fmt(
+        "{{\"hidden_size\": {}, \"num_attention_heads\": {}, "
+        "\"num_layers\": {}, \"token_refiner_num_layers\": {}, "
+        "\"ffn_hidden_size\": {}, \"latents_dim\": {}, "
+        "\"audio_latents_dim\": {}, \"text_dim\": {}, "
+        "\"timestep_input_dim\": {}, \"time_embed_hidden_size\": {}, "
+        "\"time_embed_dim\": {}}}",
+        hidden, dim("blocks.0.attn.qkv_proj.q.weight", 0) / 128,
+        count("blocks."), count("token_refiner.blocks."),
+        dim("blocks.0.mlp.fc2.weight", 1), vin / 4,
+        dim("audio_patch_proj.weight", 1), dim("condition_proj.weight", 1),
+        dim("time_embedder.proj_in.weight", 1),
+        dim("time_embedder.proj_in.weight", 0),
+        dim("time_embedder.proj_out.weight", 0))());
+    diffusers = true;
   } else {
     if (fs::is_directory(p)) { p = p / "config.json"; }
     std::ifstream f(p);
@@ -502,7 +567,32 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
     const FlexData cls_fd =
         co.contains("_class_name") ? co.at("_class_name") : FlexData();
     const std::string cls(cls_fd.as_string(""));
-    if (cls != "MiniMaxH3DiTModel") {
+    if (cls == "MiniMaxH3Transformer3DModel") {
+      // The diffusers config: the same model under diffusers' own key
+      // names, which are moved onto the native ones read below. Only the
+      // keys that differ are listed; the rest are spelled alike.
+      static const std::pair<const char*, const char*> kKeys[] = {
+          {"num_refiner_layers", "token_refiner_num_layers"},
+          {"ffn_dim", "ffn_hidden_size"},
+          {"in_channels", "latents_dim"},
+          {"audio_in_channels", "audio_latents_dim"},
+          {"freq_dim", "timestep_input_dim"},
+          {"time_embed_hidden_dim", "time_embed_hidden_size"},
+          {"rope_freq_dim", "rope_inv_freq_len"},
+      };
+      std::string j = "{";
+      for (const auto& [k, v] : co) {
+        std::string key(k);
+        for (const auto& [from, to] : kKeys) {
+          if (key == from) { key = to; }
+        }
+        if (j.size() > 1) { j += ", "; }
+        j += "\"" + key + "\": " + v.to_json();
+      }
+      j += "}";
+      cfg = FlexData::from_json(j);
+      diffusers = true;
+    } else if (cls != "MiniMaxH3DiTModel") {
       return fail("not a MiniMaxH3DiTModel config (_class_name=" + cls + ")");
     }
   }
@@ -514,7 +604,8 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
   // is an ordinary directory that has copied the flat order through:
   // there is nothing left in its shape or its path to infer it from,
   // so the producer has to state it and this has to believe it.
-  out.qkv_per_head = o.contains("qkv_per_head")
+  out.qkv_per_head = diffusers ? false
+                     : o.contains("qkv_per_head")
                          ? o.at("qkv_per_head").as_bool(true)
                          : !is_comfy;
   auto gi = [&](const char* k, int d) {
@@ -536,6 +627,7 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
   out.time_hidden    = gi("time_embed_hidden_size", 5376);
   out.time_dim       = gi("time_embed_dim", 2688);
   out.rope_freq_dim  = gi("rope_inv_freq_len", 16);
+  out.rope_theta     = gf("rope_theta", 10000.0f);
   out.norm_eps       = gf("norm_eps", 1e-5f);
   out.qk_norm_eps    = gf("qk_norm_eps", 1e-5f);
   out.final_norm_eps = gf("final_norm_eps", 1e-5f);
@@ -710,6 +802,11 @@ MetalMiniMaxH3Transformer::Linear
 MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
                                    bool bias, Retain r)
 {
+  // Stored in pieces (the diffusers layout): assembled whole.
+  if (const auto parts = minimax_h3::assembled_parts(ws.src(), nm);
+      !parts.empty()) {
+    return assemble_(ws, nm, parts, bias, r);
+  }
   Linear l;
   if (bias) { l.b = weight_(ws, nm + ".bias", r); }
   const MetalLlamaWeights& src = ws.src();
@@ -744,8 +841,279 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     }
     l.codes = {}; l.scales = {}; l.qbias = {};
   }
+  // FP8: the file's codes, kept at their own size and widened per GEMM
+  // (fp8_dense_) -- the same residency rule as every other byte the
+  // model keeps. An FP8 weight whose codes or scale cannot be read comes
+  // back EMPTY, never as a dense read of the codes.
+  if (const fp8::Weight* fw = _f8.find(nm + ".weight"); fw != nullptr) {
+    if (ci == nullptr || ci->shape.size() != 2) { return l; }
+    const auto res = kept_residency_(_stream_blocks, _wire.on());
+    l.codes = r == Retain::Streamed
+                  ? ws.stream_tensor(nm + ".weight", _mc, res)
+                  : ws.tensor(nm + ".weight", _mc, res);
+    bool sok = true;
+    l.f8_scale = fp8::scale_buffer(src, *fw, (std::size_t)ci->shape[0],
+                                   _mc, &sok);
+    if (l.codes.empty() || !sok) { return Linear{}; }
+    l.f8         = fw->format;
+    l.f8_per_row = fw->per_row;
+    return l;
+  }
   l.w = weight_(ws, nm + ".weight", r);
   return l;
+}
+
+namespace {
+
+// The per-row f32 scale of a weight assembled from `parts`, in output-row
+// order: each piece's own scale (one value spread over its rows, or its
+// rows' values), 1 for a piece that has none. Empty when no piece is
+// scaled -- the assembled weight is then plain FP8.
+bool
+assembled_scale_(const MetalLlamaWeights& src, const fp8::Layout& f8,
+                 const std::vector<minimax_h3::Part>& parts,
+                 std::vector<float>* out)
+{
+  out->clear();
+  bool any = false;
+  for (const auto& p : parts) {
+    const fp8::Weight* fw = f8.find(p.layer + ".weight");
+    if (fw != nullptr && !fw->scale.empty()) { any = true; }
+  }
+  if (!any) { return true; }
+  for (const auto& p : parts) {
+    const fp8::Weight* fw = f8.find(p.layer + ".weight");
+    const auto* ti = src.info(p.layer + ".weight");
+    if (fw == nullptr || ti == nullptr || ti->shape.empty()) { return false; }
+    std::vector<float> v;
+    if (!fp8::read_scale(src, *fw, (std::size_t)ti->shape[0], &v, nullptr)) {
+      return false;
+    }
+    for (std::int64_t r = 0; r < p.rows; ++r) {
+      out->push_back(v.empty()       ? 1.0f
+                     : v.size() == 1 ? v[0]
+                                     : v[(std::size_t)(p.row0 + r)]);
+    }
+  }
+  return true;
+}
+
+// Exchange the two halves of `b` in place -- the swapped fc1 of the
+// diffusers layout, after a whole-tensor refill. Through a bounded
+// stack chunk, since a full-size temporary is the half being avoided.
+void
+swap_halves_(const SharedBuffer& b)
+{
+  const std::size_t half = b.byte_size() / 2;
+  auto* p = static_cast<std::uint8_t*>(b.contents());
+  alignas(64) std::uint8_t tmp[1 << 16];
+  for (std::size_t o = 0; o < half; o += sizeof(tmp)) {
+    const std::size_t n = std::min(sizeof(tmp), half - o);
+    std::memcpy(tmp, p + o, n);
+    std::memcpy(p + o, p + half + o, n);
+    std::memcpy(p + half + o, tmp, n);
+  }
+}
+
+}  // namespace
+
+MetalMiniMaxH3Transformer::Linear
+MetalMiniMaxH3Transformer::assemble_(
+    WeightSet& ws, const std::string& nm,
+    const std::vector<minimax_h3::Part>& parts, bool bias, Retain r)
+{
+  const MetalLlamaWeights& src = ws.src();
+  // Every piece has to be a matrix of one width, and the rows it lends
+  // have to exist.
+  std::int64_t rows = 0, K = -1;
+  fp8::Format f = fp8::Format::kNone;
+  bool all_f8 = true;
+  for (const auto& p : parts) {
+    const auto* ti = src.info(p.layer + ".weight");
+    if (ti == nullptr || ti->shape.size() != 2 ||
+        p.row0 < 0 || p.rows <= 0 || p.row0 + p.rows > ti->shape[0] ||
+        (K >= 0 && ti->shape[1] != K)) {
+      return Linear{};
+    }
+    K = ti->shape[1];
+    rows += p.rows;
+    const fp8::Weight* fw = _f8.find(p.layer + ".weight");
+    if (fw == nullptr ||
+        (f != fp8::Format::kNone && fw->format != f)) {
+      all_f8 = false;
+    } else {
+      f = fw->format;
+    }
+  }
+  // FP8 codes stacked, or bf16: one element's bytes, and the piece's
+  // bytes as this weight stores them.
+  const std::size_t elt = all_f8 ? 1 : 2;
+  const std::size_t row_bytes = (std::size_t)K * elt;
+  auto build = [&]() -> SharedBuffer {
+    SharedBuffer d = _mc->make_shared_buffer((std::size_t)rows * row_bytes);
+    if (d.empty()) { return {}; }
+    auto* dp = static_cast<std::uint8_t*>(d.contents());
+    std::size_t off = 0;
+    for (const auto& p : parts) {
+      // Read, not tensor(): the piece is CONSUMED into the assembly, and
+      // caching it would keep a second copy beside the product.
+      SharedBuffer piece =
+          all_f8 ? ws.read(p.layer + ".weight", _mc,
+                           WeightSet::Residency::Copied)
+                 : to_bf16_(src, _mc, p.layer + ".weight");
+      const std::size_t nb = (std::size_t)p.rows * row_bytes;
+      if (piece.empty() ||
+          piece.byte_size() < (std::size_t)(p.row0 + p.rows) * row_bytes) {
+        return {};
+      }
+      std::memcpy(dp + off,
+                  static_cast<const std::uint8_t*>(piece.contents()) +
+                      (std::size_t)p.row0 * row_bytes,
+                  nb);
+      off += nb;
+    }
+    return d;
+  };
+  Linear l;
+  const std::string key =
+      std::string(all_f8 ? "h3-asm/f8|" : "h3-asm/bf16|") + nm;
+  SharedBuffer w = r == Retain::Streamed ? ws.stream_derived(build)
+                                         : ws.derived(key, build);
+  if (w.empty()) { return Linear{}; }
+  if (all_f8) {
+    std::vector<float> sc;
+    if (!assembled_scale_(src, _f8, parts, &sc)) { return Linear{}; }
+    if (!sc.empty()) {
+      l.f8_scale = _mc->make_shared_buffer(sc.size() * sizeof(float));
+      if (l.f8_scale.empty()) { return Linear{}; }
+      std::memcpy(l.f8_scale.contents(), sc.data(), sc.size() * sizeof(float));
+      l.f8_per_row = true;
+    }
+    l.codes = std::move(w);
+    l.f8    = f;
+  } else {
+    l.w = std::move(w);
+  }
+  // No H3 projection stored in pieces carries a bias; one that did would
+  // need its pieces assembled too, and is refused rather than dropped.
+  if (bias) {
+    for (const auto& p : parts) {
+      if (src.has(p.layer + ".bias")) { return Linear{}; }
+    }
+  }
+  return l;
+}
+
+bool
+MetalMiniMaxH3Transformer::refill_linear_(WeightSet& ws,
+                                          const std::string& nm, Linear& l)
+{
+  const MetalLlamaWeights& src = ws.src();
+  const auto parts = minimax_h3::assembled_parts(src, nm);
+  if (parts.empty()) {
+    if (!l.is_fp8() || l.codes.empty()) { return false; }
+    // One FP8 tensor: the codes as they sit, the scale beside them.
+    if (refill_streamed_tensor(ws, nm + ".weight", l.codes,
+                               RefillDst::kRaw) != Refill::kFilled) {
+      return false;
+    }
+    if (!l.f8_scale.empty()) {
+      const fp8::Weight* fw = _f8.find(nm + ".weight");
+      const auto* ti = src.info(nm + ".weight");
+      std::vector<float> v;
+      if (fw == nullptr || ti == nullptr || ti->shape.empty() ||
+          !fp8::read_scale(src, *fw, (std::size_t)ti->shape[0], &v,
+                           nullptr) ||
+          v.size() * sizeof(float) != l.f8_scale.byte_size()) {
+        return false;
+      }
+      std::memcpy(l.f8_scale.contents(), v.data(), l.f8_scale.byte_size());
+    }
+    if (!l.b.empty() &&
+        refill_streamed_tensor(ws, nm + ".bias", l.b, RefillDst::kBf16) !=
+            Refill::kFilled) {
+      return false;
+    }
+    return true;
+  }
+  if (!l.b.empty()) { return false; }
+  const bool f8 = l.is_fp8();
+  SharedBuffer& dst = f8 ? l.codes : l.w;
+  if (dst.empty()) { return false; }
+  const RefillDst as = f8 ? RefillDst::kRaw : RefillDst::kBf16;
+  const auto* t0 = src.info(parts[0].layer + ".weight");
+  if (t0 == nullptr || t0->shape.size() != 2) { return false; }
+  const std::size_t row_bytes = (std::size_t)t0->shape[1] * (f8 ? 1 : 2);
+  // The two assemblies this layout has: DISTINCT whole tensors stacked
+  // (qkv), each refilled straight into its rows; and ONE tensor's halves
+  // exchanged (fc1), refilled whole and swapped where it lies.
+  const bool swapped = parts.size() == 2 &&
+                       parts[0].layer == parts[1].layer &&
+                       parts[1].row0 == 0 && parts[0].row0 == parts[1].rows &&
+                       parts[0].rows == parts[1].rows;
+  if (swapped) {
+    if (refill_streamed_tensor(ws, parts[0].layer + ".weight", dst, as) !=
+        Refill::kFilled) {
+      return false;
+    }
+    swap_halves_(dst);
+  } else {
+    std::size_t off = 0;
+    for (const auto& p : parts) {
+      const auto* ti = src.info(p.layer + ".weight");
+      if (ti == nullptr || ti->shape.size() != 2 || p.row0 != 0 ||
+          p.rows != ti->shape[0]) {
+        return false;
+      }
+      const std::size_t nb = (std::size_t)p.rows * row_bytes;
+      if (off + nb > dst.byte_size() ||
+          refill_streamed_tensor(ws, p.layer + ".weight",
+                                 dst.subview(off, nb), as) !=
+              Refill::kFilled) {
+        return false;
+      }
+      off += nb;
+    }
+    if (off != dst.byte_size()) { return false; }
+  }
+  if (f8 && !l.f8_scale.empty()) {
+    std::vector<float> sc;
+    if (!assembled_scale_(src, _f8, parts, &sc) ||
+        sc.size() * sizeof(float) != l.f8_scale.byte_size()) {
+      return false;
+    }
+    std::memcpy(l.f8_scale.contents(), sc.data(), l.f8_scale.byte_size());
+  }
+  return true;
+}
+
+const MetalMiniMaxH3Transformer::Linear*
+MetalMiniMaxH3Transformer::fp8_dense_(ComputeEncoder& enc, const Linear& l,
+                                      Linear& view, int N, int K)
+{
+  if (!l.is_fp8()) { return &l; }
+  const std::size_t need = (std::size_t)N * (std::size_t)K * 2;
+  // The dequant scratch the quantized path widens into, shared the same
+  // way: encoded in order into one stream, so each GEMM reads it before
+  // the next expansion overwrites it.
+  if (_w_deq.empty() || _w_deq.byte_size() < need) {
+    _w_deq = _mc->make_shared_buffer(need);
+    if (_w_deq.empty()) { _fp8_failed = true; return nullptr; }
+  }
+  fp8::Codes c;
+  c.codes   = &l.codes;
+  c.format  = l.f8;
+  c.scale   = &l.f8_scale;
+  c.per_row = l.f8_per_row;
+  if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
+    _fp8_failed = true;
+    return nullptr;
+  }
+  // An alias of the scratch (same Metal buffer, retained), not a copy.
+  view = Linear{};
+  view.w = _w_deq.subview(0, need);
+  if (view.w.empty()) { _fp8_failed = true; return nullptr; }
+  return &view;
 }
 
 // fc1 in the interleaved gate/up layout, for a block the model KEEPS.
@@ -901,14 +1269,17 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     }
   };
   auto lin = [&](const Linear& s, Linear& d) {
-    d.quantized = s.quantized;
-    d.bits      = s.bits;
-    d.gu_inter  = s.gu_inter;
+    d.quantized  = s.quantized;
+    d.bits       = s.bits;
+    d.gu_inter   = s.gu_inter;
+    d.f8         = s.f8;
+    d.f8_per_row = s.f8_per_row;
     one(s.w, d.w);
     one(s.b, d.b);
     one(s.codes, d.codes);
     one(s.scales, d.scales);
     one(s.qbias, d.qbias);
+    one(s.f8_scale, d.f8_scale);
   };
   one(src.n1, dst.n1);
   one(src.n2, dst.n2);
@@ -974,14 +1345,18 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
     // a tensor: a Linear whose quantized-ness or bit width has changed
     // under the slot. Rebuild the whole Linear so its buffers and its
     // metadata cannot disagree.
-    if (!linear_matches_(ws, nm, l)) {
+    auto rebuild = [&]() {
       Linear fresh = linear_(ws, nm, !l.b.empty(), Retain::Streamed);
-      const bool built = fresh.quantized
-                             ? !fresh.codes.empty()
-                             : !fresh.w.empty();
-      if (!built) { ok = false; return; }
+      if (fresh.empty()) { ok = false; return; }
       l = std::move(fresh);
       ++repaired;
+    };
+    if (!linear_matches_(ws, nm, l)) { rebuild(); return; }
+    // FP8, and anything stored in pieces, refill as a whole Linear --
+    // codes raw, scale beside them, pieces into their rows -- and are
+    // rebuilt whole when any piece cannot be placed.
+    if (l.is_fp8() || !minimax_h3::assembled_parts(ws.src(), nm).empty()) {
+      if (!refill_linear_(ws, nm, l)) { rebuild(); }
       return;
     }
     if (l.quantized) {
@@ -1991,6 +2366,59 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       }
     }
   }
+  // The checkpoint's LAYOUT and its FP8 weights, surveyed before anything
+  // loads: linear_ asks the survey what it is reading. An encoding this
+  // build cannot decode (block scales, NVFP4, int8 codes) and a diffusers-
+  // named file with a tensor the translation cannot place are refused
+  // HERE, by name -- either would otherwise surface as a missing tensor
+  // several lines on, which names the wrong cause.
+  {
+    const SessionContextIntf* sess = mc->session();
+    const MetalLlamaWeights& src = ws.src();
+    if (const std::string u = minimax_h3::untranslatable_tensor(src);
+        !u.empty()) {
+      if (sess != nullptr) {
+        sess->warn(fmt("minimax-h3: '{}' is an H3 DiT in the diffusers "
+                       "naming, but tensor '{}' has no H3 name, so the "
+                       "checkpoint cannot be read whole", ws.dir(), u));
+      }
+      return nullptr;
+    }
+    std::string ferr;
+    if (!fp8::scan(src, &m->_f8, &ferr)) {
+      if (sess != nullptr) {
+        sess->warn(fmt("minimax-h3: '{}': {}", ws.dir(), ferr));
+      }
+      return nullptr;
+    }
+    if (m->_f8.any()) {
+      if (!m->_fp8x.load(mc)) {
+        if (sess != nullptr) {
+          sess->warn(fmt("minimax-h3: '{}' stores FP8 weights and the FP8 "
+                         "expansion kernels did not load", ws.dir()));
+        }
+        return nullptr;
+      }
+      std::size_t fp8_bytes = 0, n_scaled = 0;
+      for (const auto& [n, fw] : m->_f8.weights) {
+        if (const auto* ti = src.info(n); ti != nullptr) {
+          fp8_bytes += (std::size_t)ti->nbytes;
+        }
+        if (!fw.scale.empty()) { ++n_scaled; }
+      }
+      if (sess != nullptr) {
+        sess->info(fmt(
+            "MetalMiniMaxH3Transformer: FP8 checkpoint{} -- {} tensors "
+            "({} MB){} kept as FP8 codes and widened per GEMM",
+            src.has("blocks.0.attn.qkv_proj.q.weight")
+                ? std::string(" (diffusers layout, read under H3's names)")
+                : std::string(),
+            m->_f8.weights.size(), fp8_bytes >> 20,
+            n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
+                         : std::string()));
+      }
+    }
+  }
   if (m->_quant_bits > 0) {
     const std::string g = "g" + std::to_string(m->_quant_group);
     m->_lib_qmm = mc->load_library("affine_qmm_steel_bf16");
@@ -2237,11 +2665,29 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     return nullptr;
   }
   // rope.inv_freq is LOADED rather than recomputed from a theta. The
-  // config carries no rope_theta at all, so recomputing it would mean
-  // guessing the base -- and a wrong base is a wrong model that still
-  // produces smooth video.
-  if (!to_host_f32_(ws, mc, "rope.inv_freq", m->_inv_freq) ||
-      (int)m->_inv_freq.size() != cfg.rope_freq_dim) {
+  // native config carries no rope_theta at all, so recomputing it would
+  // mean guessing the base -- and a wrong base is a wrong model that
+  // still produces smooth video.
+  //
+  // The diffusers layout has no such tensor and states the base instead
+  // (`rope_theta`, config_from_json), so there it is computed -- in f32,
+  // as 1 / theta^(2i / (2 * rope_freq_dim)), which reproduces the native
+  // table BIT FOR BIT (checked against the Comfy-Org file; a double
+  // evaluation rounds 4 of the 16 entries differently).
+  if (ws.src().has("rope.inv_freq")) {
+    if (!to_host_f32_(ws, mc, "rope.inv_freq", m->_inv_freq) ||
+        (int)m->_inv_freq.size() != cfg.rope_freq_dim) {
+      return nullptr;
+    }
+  } else if (ws.src().has("blocks.0.attn.qkv_proj.q.weight") &&
+             cfg.rope_theta > 0.0f && cfg.rope_freq_dim > 0) {
+    m->_inv_freq.resize((std::size_t)cfg.rope_freq_dim);
+    const float dim = (float)(2 * cfg.rope_freq_dim);
+    for (int i = 0; i < cfg.rope_freq_dim; ++i) {
+      m->_inv_freq[(std::size_t)i] =
+          1.0f / std::pow(cfg.rope_theta, (float)(2 * i) / dim);
+    }
+  } else {
     return nullptr;
   }
 
@@ -2849,9 +3295,15 @@ MetalMiniMaxH3Transformer::dispatch_row_bands_(ComputeEncoder& enc,
                                                std::size_t y_off, int M,
                                                int N, int K, GemmRoute route)
 {
+  // An FP8 weight is timed the way the forward runs it: widened once,
+  // then the tile. Measuring the codes as a dense operand would read
+  // an empty `w`.
+  Linear fv;
+  const Linear* wl = fp8_dense_(enc, l, fv, N, K);
+  if (wl == nullptr) { return; }
   const int band = mma_row_band(N, K);
   for (int m0 = 0; m0 < M; m0 += band) {
-    gemm_route_dispatch_(enc, x, x_off + (std::size_t)m0 * K, l, y,
+    gemm_route_dispatch_(enc, x, x_off + (std::size_t)m0 * K, *wl, y,
                          y_off + (std::size_t)m0 * N,
                          std::min(band, M - m0), N, K, route, nullptr,
                          nullptr);
@@ -2880,6 +3332,12 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                                  int M, int N, int K, const LoraStack* lora)
 {
   const bool bias = !l.b.empty();
+  // FP8: widened ONCE for the whole projection, ahead of every band,
+  // into the dequant scratch -- `wl` is then an ordinary dense weight to
+  // every route, i8 and LoRA fold below. The bias stays `l`'s.
+  Linear fv;
+  const Linear* wl = fp8_dense_(enc, l, fv, N, K);
+  if (wl == nullptr) { return; }
   // Whether an adapter can run at all was settled in lora_stack_, so an
   // empty stack here simply means none is attached.
   const int nl = lora != nullptr ? lora->n : 0;
@@ -2916,7 +3374,7 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
       if (scaled[i]) { fold = i; }
     }
     bool folded = false;
-    gemm_route_dispatch_(enc, x, xo, l, y, yo, rows, N, K, route,
+    gemm_route_dispatch_(enc, x, xo, *wl, y, yo, rows, N, K, route,
                          fold >= 0 ? lora->s[fold].f : nullptr,
                          &folded, fold >= 0 ? lo[fold] : 0);
     for (int i = 0; i < nl; ++i) {
@@ -3600,7 +4058,12 @@ MetalMiniMaxH3Transformer::adaln_table_bytes() const
 bool
 MetalMiniMaxH3Transformer::adaln_into_(const std::string& nm, Linear& dst)
 {
-  if (!dst.empty()) {
+  if (!dst.empty() &&
+      (dst.is_fp8() || !minimax_h3::assembled_parts(_ws->src(), nm).empty())) {
+    if (linear_matches_(*_ws, nm, dst) && refill_linear_(*_ws, nm, dst)) {
+      return true;
+    }
+  } else if (!dst.empty()) {
     // bf16, because that is what this model reads a projection as: the
     // f16 scales and biases are converted by to_bf16_() on the old path
     // and in place here, to the same bits.
@@ -3711,7 +4174,8 @@ MetalMiniMaxH3Transformer::bake_adaln(
   // real in both arms and is not what this number is about.
   auto lin_bytes = [](const Linear& l) {
     return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
-           l.scales.byte_size() + l.qbias.byte_size();
+           l.scales.byte_size() + l.qbias.byte_size() +
+           l.f8_scale.byte_size();
   };
   std::size_t freed = 0;
   _adaln_tab.clear();
@@ -3753,6 +4217,11 @@ MetalMiniMaxH3Transformer::bake_adaln(
       // held. That is a whole-latent corruption in BOTH modalities from
       // a run that reported success.
       std::string bake_err;
+      if (_fp8_failed) {
+        _fp8_failed = false;
+        return fail(fmt("AdaLN bake of block {}: its FP8 projection could "
+                        "not be widened", i)());
+      }
       if (!st.commit().wait_ok(&bake_err)) {
         return fail(fmt("AdaLN bake of block {} failed: {}", i,
                         bake_err.empty() ? std::string("GPU error")
@@ -4121,7 +4590,9 @@ MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
       &b.fc1.w, &b.fc1.b, &b.fc1.codes, &b.fc1.scales, &b.fc1.qbias,
       &b.fc2.w, &b.fc2.b, &b.fc2.codes, &b.fc2.scales, &b.fc2.qbias,
       &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
-      &b.adaln.qbias};
+      &b.adaln.qbias,
+      &b.qkv.f8_scale, &b.out.f8_scale, &b.fc1.f8_scale, &b.fc2.f8_scale,
+      &b.adaln.f8_scale};
   std::size_t n = 0;
   for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
   return n;
@@ -4183,9 +4654,31 @@ MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
                                            const Linear& l) const
 {
   const MetalLlamaWeights& src = ws.src();
+  // Stored in pieces: FP8 exactly when assemble_ would make it FP8 --
+  // every piece FP8 of one format -- and never quantized.
+  if (const auto parts = minimax_h3::assembled_parts(src, nm);
+      !parts.empty()) {
+    fp8::Format f = fp8::Format::kNone;
+    bool all = true;
+    for (const auto& p : parts) {
+      const fp8::Weight* fw = _f8.find(p.layer + ".weight");
+      if (fw == nullptr || (f != fp8::Format::kNone && fw->format != f)) {
+        all = false;
+      } else {
+        f = fw->format;
+      }
+    }
+    return !l.quantized && (all ? l.f8 == f : !l.is_fp8());
+  }
   const auto* si = src.info(nm + ".scales");
   const auto* ci = src.info(nm + ".weight");
   if (ci == nullptr) { return false; }
+  if (const fp8::Weight* fw = _f8.find(nm + ".weight"); fw != nullptr) {
+    return l.is_fp8() && l.f8 == fw->format &&
+           l.f8_scale.empty() == fw->scale.empty() &&
+           l.f8_per_row == fw->per_row;
+  }
+  if (l.is_fp8()) { return false; }
   const bool ckpt_quant = _quant_bits > 0 && si != nullptr &&
                           si->shape.size() == 2 && ci->shape.size() == 2;
   if (ckpt_quant != l.quantized) { return false; }
@@ -4226,7 +4719,9 @@ MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
       &b.fc1.w, &b.fc1.b, &b.fc1.codes, &b.fc1.scales, &b.fc1.qbias,
       &b.fc2.w, &b.fc2.b, &b.fc2.codes, &b.fc2.scales, &b.fc2.qbias,
       &b.adaln.w, &b.adaln.b, &b.adaln.codes, &b.adaln.scales,
-      &b.adaln.qbias};
+      &b.adaln.qbias,
+      &b.qkv.f8_scale, &b.out.f8_scale, &b.fc1.f8_scale, &b.fc2.f8_scale,
+      &b.adaln.f8_scale};
   std::size_t changed = 0;
   for (metal_compute::SharedBuffer* p : all) {
     const std::size_t n = _wire.wire_one(_mc, *p, on);
@@ -4966,6 +5461,14 @@ MetalMiniMaxH3Transformer::ane_stage_(int L, const Block& b,
     s.qbias     = &l.qbias;
     s.quantized = l.quantized;
     s.bits      = l.bits;
+    // FP8: the codes, one per element, and the f32 scale in `scales`,
+    // which a dense source has no other use for (shared/ane-ffn.h).
+    if (l.is_fp8()) {
+      s.w         = &l.codes;
+      s.bits      = l.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
+                                               : AneFfnSource::kFp8E4M3;
+      s.scales    = l.f8_scale.empty() ? nullptr : &l.f8_scale;
+    }
     s.stride    = stride;
     s.offset    = offset;
     // B is [out rows, rank] in the weight's own row order, so the source
@@ -5041,6 +5544,12 @@ MetalMiniMaxH3Transformer::ane_qkv_stage_(int L, const Block& b,
   s.qbias     = &b.qkv.qbias;
   s.quantized = b.qkv.quantized;
   s.bits      = b.qkv.bits;
+  if (b.qkv.is_fp8()) {
+    s.w      = &b.qkv.codes;
+    s.bits   = b.qkv.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
+                                              : AneFfnSource::kFp8E4M3;
+    s.scales = b.qkv.f8_scale.empty() ? nullptr : &b.qkv.f8_scale;
+  }
   // The qkv adapter's B rows were permuted to the projection's own head
   // grouping at bind, so they map 1:1 (the Delta defaults).
   for (int i = 0; i < lora.n && s.deltas < AneFfnSource::kMaxDeltas; ++i) {
@@ -5196,7 +5705,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     wire_fixed_(true);
   }
   _resid.note_reserve_allocated(
-      scratch_bytes(c, seq, n_text, n_t, uses_matrix_cores()));
+      scratch_bytes(c, seq, n_text, n_t, uses_dequant_scratch()));
   const auto mbudget = _mc->memory_budget();
   _resid.begin_forward(mbudget, [this]() -> std::size_t {
     return evict_tail_block_();
@@ -7192,6 +7701,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("MiniMax-H3 DiT forward failed")
                                 : gpu_err);
+  }
+  // An FP8 weight that could not be widened left its projection
+  // unwritten: the forward ran and its output is not the model's.
+  if (_fp8_failed) {
+    _fp8_failed = false;
+    return fail("an FP8 weight could not be widened for its GEMM (dequant "
+                "scratch allocation or buffer size); the forward is void");
   }
   // THE TRIPWIRE'S VERDICT, read once now that everything has completed.
   // Names the block and the op that first held a non-finite value, the

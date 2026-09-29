@@ -7,6 +7,7 @@
 #include "interfaces/ui-delegate-intf.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/affine-quantizer.h"
+#include "generative-models/quantize/quant-source.h"
 #include "generative-models/quantize/safetensors-writer.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
@@ -278,6 +279,88 @@ load_calib_(const std::string& dir, const std::string& tap, int nL, int ch)
   return v;
 }
 
+// Write the output's config.json: the source's own, the one a translated
+// layout synthesized (a native Krea-2 file has none), or the one a
+// Comfy-Org single-file component carries in its `__metadata__`.
+// `quantized` adds the top-level `quantization` block the loaders read to
+// decide the checkpoint is affine; a dense pass must not have one.
+bool
+write_output_config_(const std::string& in_dir, const std::string& out_dir,
+                     const QuantSource& src, const QuantizeOptions& opt,
+                     bool quantized, std::string* err)
+{
+  namespace fs = std::filesystem;
+  auto fail = [&](const std::string& m) { if (err) { *err = m; }
+                                          return false; };
+  FlexData cfg;
+  std::error_code fe;
+  if (src.config() != nullptr) {
+    cfg = *src.config();
+  } else if (fs::is_regular_file(fs::path(in_dir), fe) && !fe) {
+    // A Comfy-Org single-file source: there is no config.json to copy,
+    // the config lives in the safetensors `__metadata__`. Lift it out
+    // and write it as one, so the output is an ordinary directory
+    // checkpoint that every loader here already reads.
+    //
+    // `qkv_per_head` is the part that MUST survive: Comfy-Org's
+    // MiniMax-H3 conversion reorders the fused qkv projection, this
+    // pass copies that order through verbatim, and the tensor names
+    // and shapes are the same either way -- so an output that does not
+    // SAY which order it is in gets read as the released one and
+    // computes nonsense. Recording it is what keeps a quantized
+    // Comfy-Org DiT loadable at all.
+    if (!comfy_output_config(in_dir, cfg, err)) { return false; }
+  } else {
+    std::string cfg_txt;
+    const std::string cfg_in = (fs::path(in_dir) / "config.json").string();
+    if (!read_file_(cfg_in, &cfg_txt)) {
+      return fail("model-quantize: cannot read config.json");
+    }
+    try { cfg = FlexData::from_json(cfg_txt); }
+    catch (...) { return fail("model-quantize: bad config.json"); }
+    if (!cfg.is_object()) {
+      return fail("model-quantize: config not object");
+    }
+  }
+  if (quantized) {
+    FlexData qb = FlexData::make_object();
+    {
+      auto o = qb.as_object();
+      o.insert_or_assign("group_size", FlexData::make_int(opt.group));
+      o.insert_or_assign("bits", FlexData::make_int(opt.bits));
+    }
+    cfg.as_object().insert_or_assign("quantization", std::move(qb));
+  }
+  if (!opt.component_tag.empty()) {
+    cfg.as_object().insert_or_assign(
+        "_vpipe_component", FlexData::make_string(opt.component_tag));
+  }
+  if (!write_file_((fs::path(out_dir) / "config.json").string(),
+                   cfg.to_json(true))) {
+    return fail("model-quantize: cannot write config.json");
+  }
+  return true;
+}
+
+// Copy sidecar files (tokenizer, processor, etc.) -- everything that is
+// not a weight file or config.json (already rewritten). A single-file
+// source has no sidecars, and iterating it as a directory would fail.
+void
+copy_sidecars_(const std::string& in_dir, const std::string& out_dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (!fs::is_directory(fs::path(in_dir), ec)) { return; }
+  for (const auto& de : fs::directory_iterator(in_dir, ec)) {
+    if (!de.is_regular_file()) { continue; }
+    const std::string fn = de.path().filename().string();
+    if (fn == "config.json" || fn.find(".safetensors") != std::string::npos) {
+      continue;
+    }
+    fs::copy_file(de.path(), fs::path(out_dir) / fn,
+                  fs::copy_options::overwrite_existing, ec);
+  }
+}
 
 }  // namespace
 
@@ -291,9 +374,14 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                                           return false; };
 
   if (_mc == nullptr) { return fail("model-quantize: null MetalCompute"); }
-  if ((opt.bits != 4 && opt.bits != 8) ||
-      (opt.group != 32 && opt.group != 64)) {
-    return fail("model-quantize: bits must be 4|8, group 32|64");
+  const bool dense = opt.bits == 16;
+  if (!dense && ((opt.bits != 4 && opt.bits != 8) ||
+                 (opt.group != 32 && opt.group != 64))) {
+    return fail("model-quantize: bits must be 4|8 (or 16), group 32|64");
+  }
+  if (dense && (opt.mixed || opt.smoothquant || opt.dit_awq)) {
+    return fail("model-quantize: bits=16 quantizes nothing, so mixed / awq "
+                "do not apply");
   }
   if (opt.mixed && (opt.bits != 4 || opt.high_bits != 8 || opt.group != 64)) {
     // The mixed-affine decode kernels are w4g64 + w8g64 only.
@@ -308,9 +396,28 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   if (!q.valid()) {
     return fail("model-quantize: affine quant kernels unavailable");
   }
-  auto src = MetalLlamaWeights::open_model(in_dir);
-  if (!src.has_value()) {
-    return fail("model-quantize: cannot open source model: " + in_dir);
+  // Through QuantSource, not MetalLlamaWeights directly: it decodes FP8
+  // tensors to BF16 and presents a native-layout checkpoint under the
+  // names below, so none of this function has to know about either.
+  std::string open_err;
+  auto src = QuantSource::open(in_dir, &open_err);
+  if (!src.has_value()) { return fail(open_err); }
+  if (S != nullptr && (src->n_fp8() > 0 || !src->layout().empty())) {
+    S->info(fmt(
+        "model-quantize: source {}{}{}{}", in_dir,
+        src->layout().empty() ? std::string()
+                              : " is a " + src->layout() + " checkpoint",
+        src->n_fp8() > 0
+            ? (src->n_scaled() > 0
+                   ? fmt("; {} FP8 tensors read as BF16, {} of them scaled",
+                         src->n_fp8(), src->n_scaled())()
+                   : fmt("; {} FP8 tensors read as BF16 (exact)",
+                         src->n_fp8())())
+            : std::string(),
+        src->n_ignored() > 0
+            ? fmt("; {} tensors outside the DiT ignored",
+                  src->n_ignored())()
+            : std::string()));
   }
 
   std::error_code ec;
@@ -335,6 +442,66 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
         }
       }
     }
+  }
+
+  // ---- bits = 16: DENSE. Quantize nothing -------------------------------
+  // Every tensor is written as the source view presents it: an FP8 one as
+  // the BF16 it decodes to exactly, everything else byte for byte. What
+  // this is for is the FP8 checkpoint that has to become an ordinary one
+  // -- a dequantization, not a rounding -- and the native-layout file
+  // that has to become a diffusers-named directory; a source that is
+  // neither comes out as a copy.
+  //
+  // An AFFINE-quantized source is refused: its codes would pass through
+  // as codes, and an output called dense that is still 4-bit is worse
+  // than no output.
+  if (dense) {
+    std::vector<std::string> dn = src->tensor_names();
+    std::sort(dn.begin(), dn.end());
+    for (const auto& name : dn) {
+      const std::string kSc = ".scales";
+      if (name.size() > kSc.size() &&
+          name.compare(name.size() - kSc.size(), kSc.size(), kSc) == 0) {
+        const auto* w = src->info(name.substr(0, name.size() - kSc.size()) +
+                                  ".weight");
+        if (w != nullptr && w->dtype == "U32") {
+          return fail("model-quantize: bits=16 writes a dense checkpoint, "
+                      "and '" + in_dir + "' is already affine-quantized ('" +
+                      name + "') -- dequantizing affine codes back is not "
+                      "supported");
+        }
+      }
+    }
+    if (S) {
+      S->log_normal(fmt("model-quantize: {} tensors -> dense ({} -> {})",
+                        dn.size(), in_dir, out_dir));
+    }
+    SafetensorsWriter dwr(out_dir, opt.shard_max_bytes);
+    std::size_t done = 0;
+    for (const auto& name : dn) {
+      if (stop()) { return fail("model-quantize: stopped"); }
+      const auto* ti = src->info(name);
+      SharedBuffer in = src->load(name, _mc);
+      if (ti == nullptr || in.empty()) {
+        return fail("model-quantize: load failed: " + name);
+      }
+      if (!dwr.add(name, ti->dtype, ti->shape, in.contents(), ti->nbytes)) {
+        return fail("model-quantize: write failed: " + name);
+      }
+      ++done;
+      bar.update((std::uint64_t)done, (std::uint64_t)dn.size(), "dense");
+    }
+    bar.finish();
+    if (!dwr.close()) { return fail("model-quantize: finalize shards failed"); }
+    if (!write_output_config_(in_dir, out_dir, *src, opt, false, err)) {
+      return false;
+    }
+    copy_sidecars_(in_dir, out_dir);
+    if (S) {
+      S->info(fmt("model-quantize: {} -> {} (dense): {} tensors, {} decoded "
+                  "from FP8", in_dir, out_dir, dn.size(), src->n_fp8()));
+    }
+    return true;
   }
 
   std::unordered_set<std::string> quant_set;
@@ -1959,66 +2126,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
 
   // Rewrite config.json with the top-level quantization block (the loader
   // reads outer.quantization.{bits,group_size}); copy everything else.
-  {
-    FlexData cfg;
-    std::error_code fe;
-    if (fs::is_regular_file(fs::path(in_dir), fe) && !fe) {
-      // A Comfy-Org single-file source: there is no config.json to copy,
-      // the config lives in the safetensors `__metadata__`. Lift it out
-      // and write it as one, so the output is an ordinary directory
-      // checkpoint that every loader here already reads.
-      //
-      // `qkv_per_head` is the part that MUST survive: Comfy-Org's
-      // MiniMax-H3 conversion reorders the fused qkv projection, this
-      // pass copies that order through verbatim, and the tensor names
-      // and shapes are the same either way -- so an output that does not
-      // SAY which order it is in gets read as the released one and
-      // computes nonsense. Recording it is what keeps a quantized
-      // Comfy-Org DiT loadable at all.
-      if (!comfy_output_config(in_dir, cfg, err)) { return false; }
-    } else {
-      std::string cfg_txt;
-      const std::string cfg_in = (fs::path(in_dir) / "config.json").string();
-      if (!read_file_(cfg_in, &cfg_txt)) {
-        return fail("model-quantize: cannot read config.json");
-      }
-      try { cfg = FlexData::from_json(cfg_txt); }
-      catch (...) { return fail("model-quantize: bad config.json"); }
-      if (!cfg.is_object()) {
-        return fail("model-quantize: config not object");
-      }
-    }
-    FlexData qb = FlexData::make_object();
-    {
-      auto o = qb.as_object();
-      o.insert_or_assign("group_size", FlexData::make_int(opt.group));
-      o.insert_or_assign("bits", FlexData::make_int(opt.bits));
-    }
-    cfg.as_object().insert_or_assign("quantization", std::move(qb));
-    if (!opt.component_tag.empty()) {
-      cfg.as_object().insert_or_assign(
-          "_vpipe_component", FlexData::make_string(opt.component_tag));
-    }
-    if (!write_file_((fs::path(out_dir) / "config.json").string(),
-                     cfg.to_json(true))) {
-      return fail("model-quantize: cannot write config.json");
-    }
+  if (!write_output_config_(in_dir, out_dir, *src, opt, true, err)) {
+    return false;
   }
-
-  // Copy sidecar files (tokenizer, processor, etc.) -- everything that is
-  // not a weight file or config.json (already rewritten). A single-file
-  // source has no sidecars, and iterating it as a directory would fail.
-  if (fs::is_directory(fs::path(in_dir), ec)) {
-    for (const auto& de : fs::directory_iterator(in_dir, ec)) {
-      if (!de.is_regular_file()) { continue; }
-      const std::string fn = de.path().filename().string();
-      if (fn == "config.json" || fn.find(".safetensors") != std::string::npos) {
-        continue;
-      }
-      fs::copy_file(de.path(), fs::path(out_dir) / fn,
-                    fs::copy_options::overwrite_existing, ec);
-    }
-  }
+  copy_sidecars_(in_dir, out_dir);
 
   if (_mc->session() != nullptr) {
     _mc->session()->info(fmt(

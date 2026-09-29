@@ -46,10 +46,24 @@ namespace genai { struct QuantArchInfo; }
 //
 // Config (FlexData object):
 //   src_model     (string, required) -- source model: a models-DB key or a
-//                  bf16/f16 safetensors directory path.
+//                  path: a bf16/f16/fp8 safetensors directory, or ONE
+//                  .safetensors file -- a Comfy-Org component, or a Krea-2
+//                  DiT in Krea's own layout (the single file community
+//                  fine-tunes ship), which is translated to the diffusers
+//                  layout on the way through. FP8 tensors (F8_E4M3 /
+//                  F8_E5M2) are read as the bf16 they decode to exactly;
+//                  SCALED FP8 (ComfyUI's scaled_fp8 / comfy_quant, a
+//                  scale per tensor or per row) as code * scale, and its
+//                  scale tensors are not written out. MXFP8, NVFP4, int8
+//                  and block-scaled encodings are refused by name.
 //   output_name   (string, required) -- result name (-> <cwd>/models/<name>,
 //                  registered) or an explicit path ("/..", "./..").
-//   bits          (uint, default 8)  -- backbone affine bit-width (4 | 8).
+//   bits          (uint, default 8)  -- backbone affine bit-width (4 | 8),
+//                  or 16: a DENSE output that quantizes nothing -- FP8
+//                  decoded to bf16, everything else copied. That is the
+//                  dequantization of an FP8 checkpoint (lossless), and for
+//                  a native-layout file also its conversion to diffusers
+//                  names. An affine-quantized source is refused.
 //   group_size    (uint, default 64) -- affine group size (32 | 64).
 //   arch          (string, default "") -- model family tag; empty => auto-
 //                  detect from the source config.json model_type.

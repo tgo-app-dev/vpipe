@@ -2953,3 +2953,143 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
   EXPECT_TRUE(rv < 0.02 && ra < 0.02);
   EXPECT_TRUE(rv > 0.0);
 }
+
+// Two checkpoints of the SAME model, one forward each on the same
+// inputs. The layout test: the diffusers naming (minimax-h3-diffusers-
+// layout.h -- split qkv, swapped fc1, computed rope) against H3's own,
+// which have to agree to the BIT; and an FP8 file against its own dense
+// conversion, which has to as well (shared/fp8-expand.h).
+//
+// Env: VPIPE_MINIMAX_H3_LAYOUT_A / _B = the two checkpoints (a directory,
+// a Comfy-Org file or a diffusers-named file); _LAYERS (default 2);
+// _STREAM=1 streams the blocks, which with 3+ layers takes the slot
+// refill -- where an assembled weight is put back together in place, so
+// that path is the one worth running; _TOL = a rel-L2 bound instead of
+// bit-identity, for two checkpoints that differ on purpose (FP8 against
+// its bf16 origin).
+TEST(minimax_h3_dit, layouts_agree)
+{
+  const char* pa = std::getenv("VPIPE_MINIMAX_H3_LAYOUT_A");
+  const char* pb = std::getenv("VPIPE_MINIMAX_H3_LAYOUT_B");
+  if (pa == nullptr || *pa == '\0' || pb == nullptr || *pb == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int layers = envi("VPIPE_MINIMAX_H3_LAYOUT_LAYERS", 2);
+  const bool stream = envi("VPIPE_MINIMAX_H3_LAYOUT_STREAM", 0) != 0;
+  const char* tol_s = std::getenv("VPIPE_MINIMAX_H3_LAYOUT_TOL");
+  const int latf = 5, lath = 16, latw = 16, naud = 37, ntext = 16;
+
+  struct Arm { std::vector<float> video, audio; };
+  // _LORA_A / _LORA_B: a runtime adapter on that arm only -- how an FP8
+  // adapter is held to its own dense conversion over one base.
+  auto run = [&](const char* root, const char* lora_env) -> Arm {
+    std::vector<MetalMiniMaxH3Transformer::LoraSpec> loras;
+    if (const char* lp = std::getenv(lora_env); lp != nullptr && *lp) {
+      MetalMiniMaxH3Transformer::LoraSpec sp;
+      sp.path  = lp;
+      sp.scale = 1.0f;
+      loras.push_back(sp);
+    }
+    MetalMiniMaxH3Transformer::Config cfg;
+    std::string cerr;
+    if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+      std::printf("[layouts_agree] %s: config: %s\n", root, cerr.c_str());
+      return {};
+    }
+    cfg.n_layers = layers;
+    std::printf("[layouts_agree] %s: hidden %d heads %d ffn %d "
+                "qkv_per_head %d rope_theta %.0f\n", root, cfg.hidden,
+                cfg.n_heads, cfg.ffn, (int)cfg.qkv_per_head,
+                (double)cfg.rope_theta);
+    h3::PackedLayout L;
+    const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
+    if (!h3::build_packed_sequence(text_tags, latf, lath, latw, naud,
+                                   cfg.patch_h, cfg.patch_w,
+                                   h3::kAudioChannels, {h3::Anchor::kFirst},
+                                   &L)) {
+      return {};
+    }
+    std::vector<float> uniq;
+    std::vector<int> row_idx;
+    h3::build_row_timesteps(L, kTVideo, kTAudio, kTCond, &uniq, &row_idx);
+    const int n_video = (int)L.video_indices.size();
+    std::vector<float> vin((std::size_t)n_video * cfg.video_patch_elems());
+    std::vector<float> ain((std::size_t)L.num_audio_rows * cfg.audio_channels);
+    std::vector<float> tin((std::size_t)ntext * cfg.text_dim);
+    std::uint32_t sd = 0x51ced00du;
+    auto fill = [&](std::vector<float>& v) {
+      for (auto& e : v) {
+        sd = sd * 1664525u + 1013904223u;
+        e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+      }
+    };
+    fill(vin);
+    fill(ain);
+    fill(tin);
+    const SharedBuffer vb = to_bf16_buf_(mc, vin);
+    const SharedBuffer ab = to_bf16_buf_(mc, ain);
+    const SharedBuffer tb = to_bf16_buf_(mc, tin);
+    MetalMiniMaxH3Transformer::Step step;
+    step.video  = &vb;
+    step.audio  = &ab;
+    step.text   = &tb;
+    step.layout = &L;
+    step.timesteps = &uniq;
+    step.row_timestep_index = &row_idx;
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, stream, loras);
+    if (m == nullptr) {
+      std::printf("[layouts_agree] %s: load failed\n", root);
+      return {};
+    }
+    std::string ferr;
+    MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
+    if (out.empty()) {
+      std::printf("[layouts_agree] %s: forward: %s\n", root, ferr.c_str());
+      return {};
+    }
+    auto to_f32 = [](const SharedBuffer& b) {
+      std::vector<float> v(b.byte_size() / 2);
+      const auto* p = static_cast<const std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < v.size(); ++i) { v[i] = bf16_to_f32_(p[i]); }
+      return v;
+    };
+    return {to_f32(out.video), to_f32(out.audio)};
+  };
+  const Arm a = run(pa, "VPIPE_MINIMAX_H3_LAYOUT_LORA_A");
+  const Arm b = run(pb, "VPIPE_MINIMAX_H3_LAYOUT_LORA_B");
+  ASSERT_TRUE(!a.video.empty() && !b.video.empty());
+  if (a.video.empty() || b.video.empty()) { return; }
+  ASSERT_TRUE(a.video.size() == b.video.size() &&
+              a.audio.size() == b.audio.size());
+  auto cmp = [](const std::vector<float>& x, const std::vector<float>& y,
+                const char* what) {
+    double num = 0.0, den = 0.0, mx = 0.0;
+    std::size_t diff = 0;
+    for (std::size_t i = 0; i < x.size() && i < y.size(); ++i) {
+      const double d = (double)x[i] - (double)y[i];
+      num += d * d;
+      den += (double)y[i] * (double)y[i];
+      mx = std::max(mx, std::fabs(d));
+      diff += std::memcmp(&x[i], &y[i], sizeof(float)) != 0;
+    }
+    const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+    std::printf("[layouts_agree] %s: %zu of %zu differ, max |d| %.3g, "
+                "rel-L2 %.3e\n", what, diff, x.size(), mx, rel);
+    return std::make_pair(diff, rel);
+  };
+  const auto v = cmp(a.video, b.video, "video");
+  const auto u = cmp(a.audio, b.audio, "audio");
+  if (tol_s != nullptr) {
+    const double tol = std::atof(tol_s);
+    EXPECT_TRUE(v.second <= tol && u.second <= tol);
+  } else {
+    EXPECT_TRUE(v.first == 0 && u.first == 0);
+  }
+}

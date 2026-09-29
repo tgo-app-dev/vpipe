@@ -426,6 +426,122 @@ gated-repo case on an older build. Either register a Krea-2 checkpoint
 (which is then used directly) or drop `Qwen/Qwen-Image`'s `vae/config.json`
 into the VAE directory by hand.
 
+## Community fine-tunes (one `.safetensors`, often FP8)
+
+Fine-tunes of Krea-2 made in ComfyUI are usually published as **one
+`.safetensors` file** holding only the DiT, in Krea's own tensor naming
+(`blocks.0.attn.wq.weight`, `txtfusion.…`, `tproj.1.…`) rather than the
+diffusers layout, with no `config.json` — and often stored as **FP8**
+(`F8_E4M3`), about 12.8 GB.
+
+### Run it as it is
+
+Point `generate-image`'s `dit_dir` at the file, and keep `model-select` on
+`krea/Krea-2-Turbo`, which supplies the text encoder, the VAE and the
+scheduler:
+
+```json
+"config": {
+  "height": 1024,
+  "width": 1024,
+  "steps": 8,
+  "seed": 0,
+  "dit_dir": "/path/to/the-fine-tune_fp8.safetensors"
+}
+```
+
+Nothing is converted and nothing extra lands on disk. The tensor names and
+the one reshape (the per-block modulation table) are translated as the file
+is opened, and the weights **stay FP8 in memory**. Each projection is
+expanded to bf16 on the GPU just before it is used. That computes exactly
+what a bf16 copy of the file would, because every FP8 value is also a bf16
+value. It was checked pixel for pixel against such a copy on an M4 Pro, with
+and without the ANE tiers, and on an M5 Pro through the matrix cores. To pick
+the file from the web UI's model lists, register it with `model-register`,
+typing the file's path (that stage's browser picks directories). It detects
+as a Krea-2 DiT and is offered for `dit_dir`.
+
+**Measured** on a 12.8 GB `F8_E4M3` fine-tune of Krea-2-Turbo, 1024x1024,
+8 steps, against the same file converted to bf16 and to 8-bit (below).
+Rounds were interleaved, with the order reversed in the second:
+
+| | M4 Pro 64 GB, s/step | peak | M5 Pro 24 GB, s/step | peak |
+|---|---:|---:|---:|---:|
+| **FP8 file, as is** | 17.5 / 16.8 | **21.2 GB** | 4.05 / 3.98 | **16.1 GB** |
+| converted, 8-bit | 17.9 / 17.9 | 22.0 GB | 4.09 / 4.08 | 16.4 GB |
+| converted, bf16 | 16.8 / 16.9 | 28.1 GB | 4.01 / 3.94 | 17.2–18.0 GB |
+
+The M4 Pro ran GPU-only with the DiT preloaded. The M5 Pro ran the stock
+graph (`i8_gemm` on, blocks streamed from its internal SSD). The expansion
+costs 0–4% against bf16 on the M4, and nothing measurable on the M5. The
+file runs no slower than its 8-bit conversion on either box, and holds the
+least memory of the three.
+
+**Scaled FP8** — ComfyUI's `fp8_scaled` checkpoints — works the same way.
+Each weight's codes are multiplied by a scale stored beside them, and the
+expansion applies it. All three spellings in circulation are read:
+
+- a `scaled_fp8` marker with a `<layer>.scale_weight` per layer;
+- per-layer `<layer>.comfy_quant` records with `<layer>.weight_scale`, where
+  the weights may even be stored as plain `U8`;
+- the same records in the file header's `_quantization_metadata`.
+
+A scale may be one value per tensor or one per output row. Encodings that
+are not FP8-with-a-scale — MXFP8, NVFP4, int8, block-wise scales — are
+refused with the reason, never loaded as if they were. Checked on a scaled
+re-encode of the same fine-tune (a per-tensor scale on each of its 264
+Linear weights): pixel-identical to that file's own bf16 conversion, on the
+GPU and with the ANE tiers. A full ComfyUI
+checkpoint whose DiT keys sit under `model.diffusion_model.` works too; any
+bundled text encoder or VAE in it is ignored.
+
+**FP8 LoRAs**, plain or scaled, are read wherever a LoRA is: the `lora` key
+of `krea2-model-config` (and every other family's runtime LoRA), and
+`lora-fuse`. They apply exactly as a bf16 copy of the same file would.
+Prefer the scaled form: a LoRA's weights are small, and plain FP8 flushes
+the smallest to zero. Measured with a real Krea-2 style LoRA re-encoded
+both ways: the scaled FP8 copy lands at 41.9 dB PSNR from the bf16 original
+in the final image, and the plain one at 39.5 dB. (`lora-fuse` does not fuse *into* an FP8 base;
+apply the LoRA at runtime instead, as above, or fuse into a `bits: 16`
+conversion.)
+
+### Or convert it
+
+`model-quantize` writes the same file out as an ordinary DiT directory, for
+when you would rather keep a converted copy — to quantize it further, fuse a
+LoRA into it, or share it in the diffusers layout:
+
+```json
+{
+  "id": "model-quantize",
+  "type": "model-quantize",
+  "iports": [],
+  "config": {
+    "src_model": "/path/to/the-fine-tune_fp8.safetensors",
+    "output_name": "my-krea2-finetune-w8",
+    "bits": 8
+  }
+}
+```
+
+- **`bits: 8`** writes the usual 8-bit group-64 checkpoint, the same format
+  the published model quantizes to.
+- **`bits: 16`** quantizes nothing: every FP8 value is written as the bf16
+  value it stands for, so the output computes what the FP8 file does, at
+  twice the size.
+
+Use the output as `dit_dir` exactly like the file itself (a bare
+`output_name` registers it, so the key works there). The pass took 58 s
+(`bits: 16`, 24 GB out) and 49 s (`bits: 8`, 13 GB) on an M4 Pro reading and
+writing an external Thunderbolt SSD, and 13.6 s / 12.3 s on an M5 Pro's
+internal one. Memory stayed under 0.9 GB: one tensor is in flight at a time.
+
+Re-quantizing FP8 values to 8 bits adds 0.6–0.7% error per tensor; the same
+prompt and seed through the 8-bit and bf16 outputs gives 34 dB PSNR between
+the images. FP8 itself had already cost ~3% — this file's weights sit that
+far from the published bf16 Turbo — so the 8-bit copy is effectively as
+faithful as the file it came from.
+
 ## Troubleshooting
 
 **`model-fetch` reports an authorization failure.** The licence is not

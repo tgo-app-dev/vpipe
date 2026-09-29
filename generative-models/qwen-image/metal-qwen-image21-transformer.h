@@ -10,6 +10,7 @@
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "generative-models/shared/dit-gpu-progress.h"
+#include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/sage-attention.h"
@@ -103,7 +104,9 @@ class MetalQwenImage21Transformer {
     bool ane_qkv   = false;
 
     // Read what can be read from <dir>/config.json. False when the file
-    // is absent or names a different class.
+    // is absent or names a different class. `dir` may also be a single
+    // .safetensors DiT (is_single_file_dit), whose dimensions are then
+    // read off its tensors.
     static bool read_dims(const std::string& dir, Config* out);
   };
 
@@ -146,6 +149,12 @@ class MetalQwenImage21Transformer {
     KvCache* kv = nullptr;
     KvMode kv_mode = KvMode::kOff;
   };
+
+  // A single .safetensors holding a Qwen-Image-2.1 DiT under its
+  // diffusers names -- unsloth's pre-quantized FP8 file, which has no
+  // config beside it. Recognised by what the tensors are called once
+  // the checkpoint is open (torchao's spelling already translated).
+  static bool is_single_file_dit(const std::string& path);
 
   static std::unique_ptr<MetalQwenImage21Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
@@ -214,7 +223,18 @@ class MetalQwenImage21Transformer {
     metal_compute::SharedBuffer codes, scales, qbias; // affine quant
     bool quantized = false;
     int  bits = 0;
-    bool empty() const { return quantized ? codes.empty() : w.empty(); }
+    // FP8 storage: `codes` holds the checkpoint's own [N, K] bytes,
+    // widened to bf16 right before each GEMM (fp8_dense_). NOT
+    // `quantized`: no group scales, and nothing reading an affine triple
+    // may be handed one. A scaled weight's f32 scale is `f8_scale`, one
+    // value or one per row (shared/fp8-expand.h).
+    fp8::Format f8 = fp8::Format::kNone;
+    metal_compute::SharedBuffer f8_scale;
+    bool f8_per_row = false;
+    bool is_fp8() const { return f8 != fp8::Format::kNone; }
+    bool empty() const {
+      return (quantized || is_fp8()) ? codes.empty() : w.empty();
+    }
   };
 
   // Everything a block owns. Biasless throughout, and with NO modulation
@@ -272,6 +292,17 @@ class MetalQwenImage21Transformer {
                  const QWeight& w,
                  const metal_compute::SharedBuffer& y, std::size_t ye,
                  int M, int N, int K) const;
+
+  // FP8. The weight `w` holds as a dense operand for this GEMM: `w`
+  // itself, or -- for FP8 -- a `view` aliasing _w_deq, which the
+  // expansion has just been encoded into. Null (and _fp8_failed latched)
+  // when it cannot be widened.
+  const QWeight* fp8_dense_(metal_compute::ComputeEncoder& enc,
+                            const QWeight& w, QWeight& view, int N,
+                            int K) const;
+  // After a slot refill: every FP8 weight still the kind the file says.
+  bool fp8_kinds_match_(int L, const Block& b) const;
+  metal_compute::SharedBuffer fp8_scale_buf_(const std::string& weight) const;
 
   // ---- residency + the wired pool ------------------------------------
   //
@@ -372,6 +403,10 @@ class MetalQwenImage21Transformer {
   // ordering plus Metal's WAR tracking make that safe, since each
   // dequant/matmul pair runs before the next writes.
   mutable metal_compute::SharedBuffer _w_deq;
+  // The checkpoint's FP8 weights and the kernels that widen them.
+  fp8::Layout   _f8;
+  fp8::Expander _fp8x;
+  mutable bool  _fp8_failed = false;
   std::unique_ptr<MetalSageAttention> _sage;
   std::unique_ptr<MetalSolAttention> _sol;
   std::unique_ptr<AneFeedForward> _ane;

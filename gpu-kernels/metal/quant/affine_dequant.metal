@@ -853,3 +853,93 @@ kernel void quant_f16_i8_row_g512_bfp(
     if (lane == 0) { eexp[(int64_t)row * G + g] = (char)((int)em - 21); }
   }
 }
+
+// ---- FP8 weights --------------------------------------------------------
+//
+// A checkpoint stored as FP8 (safetensors F8_E4M3 / F8_E5M2) keeps its
+// codes resident and has each weight expanded into a dense VPIPE_ELT
+// scratch just before its GEMM -- the same dequant-then-dense shape the
+// matrix-core path takes for affine weights, and on a box without matrix
+// cores the dense steel tiles then read the scratch. No scales: plain FP8
+// is its own value.
+//
+// E4M3 (OCP E4M3FN: bias 7, subnormals, no infinities). Its seven
+// magnitude bits placed at half's bit 7 ARE a half -- same mantissa, the
+// exponent field read against bias 15 instead of 7, and the subnormals
+// line up because both formats put them at exponent field 0 -- worth
+// exactly 2^-8 of the FP8 value. So one shift and one multiply decode
+// every finite code EXACTLY (the product is a power-of-two scaling of a
+// value with a 3-bit mantissa). The one NaN code, S.1111.111, comes out as
+// +-480 rather than NaN; a weight is never NaN, and the host decoder
+// (shared/fp8.h) is the reference that says otherwise.
+//
+// E5M2 is the top byte of a half, so it needs no arithmetic at all.
+//
+//   0:codes(uchar) 1:y(VPIPE_ELT) 2:n (elements, the whole [N,K])
+// Flat, one thread per 4 codes: grid {ceil(n/4), 1, 1}.
+inline float
+fp8_e4m3_f_(uint c)
+{
+  const ushort h = (ushort)(((c & 0x80u) << 8) | ((c & 0x7Fu) << 7));
+  return (float)as_type<half>(h) * 256.0f;
+}
+
+inline float
+fp8_e5m2_f_(uint c)
+{
+  return (float)as_type<half>((ushort)(c << 8));
+}
+
+#define VPIPE_FP8_DEQUANT(NAME, DECODE)                                     \
+  kernel void NAME(const device uchar* w [[buffer(0)]],                     \
+                   device VPIPE_ELT*   y [[buffer(1)]],                     \
+                   const constant uint& n [[buffer(2)]],                    \
+                   uint gid [[thread_position_in_grid]])                    \
+  {                                                                         \
+    const uint e = gid * 4u;                                                \
+    if (e + 4u <= n) {                                                      \
+      const uchar4 c = *reinterpret_cast<const device uchar4*>(w + e);     \
+      *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(y + e) =                 \
+          vec<VPIPE_ELT, 4>((VPIPE_ELT)DECODE(c.x), (VPIPE_ELT)DECODE(c.y), \
+                            (VPIPE_ELT)DECODE(c.z), (VPIPE_ELT)DECODE(c.w));\
+      return;                                                               \
+    }                                                                       \
+    for (uint i = e; i < n; ++i) { y[i] = (VPIPE_ELT)DECODE(w[i]); }        \
+  }
+
+VPIPE_FP8_DEQUANT(fp8_e4m3_dequant, fp8_e4m3_f_)
+VPIPE_FP8_DEQUANT(fp8_e5m2_dequant, fp8_e5m2_f_)
+
+// SCALED FP8 (ComfyUI's `scaled_fp8` / comfy_quant float8): value =
+// code * scale, the product taken in f32 and rounded ONCE into
+// VPIPE_ELT -- what the host decoder (shared/fp8-layout.h) and ComfyUI
+// compute, so a runtime expansion and a dense conversion agree. Element e
+// takes scale[e / div]: div = K gives one scale per output row, div = n
+// the single per-tensor scale to every element.
+//
+//   0:codes(uchar) 1:y(VPIPE_ELT) 2:n 3:scale(float) 4:div
+#define VPIPE_FP8_DEQUANT_SCALED(NAME, DECODE)                              \
+  kernel void NAME(const device uchar* w     [[buffer(0)]],                 \
+                   device VPIPE_ELT*   y     [[buffer(1)]],                 \
+                   const constant uint& n    [[buffer(2)]],                 \
+                   const device float* scale [[buffer(3)]],                 \
+                   const constant uint& div  [[buffer(4)]],                 \
+                   uint gid [[thread_position_in_grid]])                    \
+  {                                                                         \
+    const uint e = gid * 4u;                                                \
+    if (e + 4u <= n) {                                                      \
+      const uchar4 c = *reinterpret_cast<const device uchar4*>(w + e);     \
+      *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(y + e) =                 \
+          vec<VPIPE_ELT, 4>((VPIPE_ELT)(DECODE(c.x) * scale[e / div]),      \
+                            (VPIPE_ELT)(DECODE(c.y) * scale[(e + 1u) / div]),\
+                            (VPIPE_ELT)(DECODE(c.z) * scale[(e + 2u) / div]),\
+                            (VPIPE_ELT)(DECODE(c.w) * scale[(e + 3u) / div]));\
+      return;                                                               \
+    }                                                                       \
+    for (uint i = e; i < n; ++i) {                                          \
+      y[i] = (VPIPE_ELT)(DECODE(w[i]) * scale[i / div]);                    \
+    }                                                                       \
+  }
+
+VPIPE_FP8_DEQUANT_SCALED(fp8_e4m3_dequant_scaled, fp8_e4m3_f_)
+VPIPE_FP8_DEQUANT_SCALED(fp8_e5m2_dequant_scaled, fp8_e5m2_f_)

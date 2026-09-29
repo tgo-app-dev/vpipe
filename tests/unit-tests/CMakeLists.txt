@@ -218,6 +218,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         mage-screen.cc
         krea2-t2i.cc
         krea2-dit-quant.cc
+        krea2-native-checkpoint.cc
+        fp8-layouts.cc
         krea2-lora.cc
         lora-fuse-stage.cc
         krea2-sampler.cc

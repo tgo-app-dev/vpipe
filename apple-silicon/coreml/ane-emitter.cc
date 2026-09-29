@@ -374,11 +374,21 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
         << "]> ub = add(x = " << u << ", y = bu)[name = string(\"ub\")];\n";
       u = "ub";
     }
-    static const bool kExplicit =
-        std::getenv("VPIPE_ANE_GELU_EXPLICIT") != nullptr;
-    if (kExplicit) {
-      // PROTOTYPE: torch's approximate="tanh" spelled out,
-      // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))).
+    // GELU SPELLED OUT: torch's approximate="tanh",
+    // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))), as elementwise ops.
+    //
+    // For the reason SiLU is (see the SwiGLU branch below): the compiler's
+    // `gelu` op goes to a low-precision form once the graph is compiled
+    // for 2048 rows, the tiers' chunk. MEASURED on an M4 Pro, the op in
+    // isolation: max abs error 6.0e-3 over |x| <= 8 (8% relative on small
+    // values) against 1.8e-3 spelled out; at LTX-2.5's feed-forward
+    // (4096 x 16384, 6144 ANE rows) the whole FF's error against fp64
+    // halves, 7.1e-3 -> 3.3e-3, for +9.3% ANE time (27.0 -> 29.5 ms per
+    // 1k rows). Nothing inside overflows: x^3 saturating to inf takes
+    // tanh to +-1, never inf - inf. VPIPE_ANE_GELU_OP=1 emits the op
+    // instead, for A/B.
+    static const bool kGeluOp = std::getenv("VPIPE_ANE_GELU_OP") != nullptr;
+    if (!kGeluOp) {
       const std::string T =
           "tensor<fp16, [" + std::to_string(s.M) + ", " +
           std::to_string(s.N) + "]> ";
@@ -434,10 +444,48 @@ AneEmitter::emit_mil_(const AneGraphSpec& s)
       g = biased(g, "bg", s.N, "gb");
       u = biased(u, "bu", s.N, "ub");
     }
-    o << "            tensor<fp16, [" << s.M << ", " << s.N
-      << "]> sg = silu(x = " << g << ")[name = string(\"sg\")];\n"
-      << "            tensor<fp16, [" << s.M << ", " << s.N
-      << "]> hh = mul(x = sg, y = " << u << ")[name = string(\"hh\")];\n";
+    // SiLU AS THE TWO-PATH STABLE SIGMOID, spelled out, branch-free:
+    //   silu(g) = g * exp(min(g, 0)) / (1 + exp(-|g|))
+    // -- exp(-g) above zero and exp(g) below, so neither exponent is ever
+    // positive and neither exp can overflow.
+    //
+    // Spelled out because the compiler's own `silu` (and `sigmoid`, which
+    // it lowers the same way) goes to a low-precision form once the graph
+    // is compiled for 1024 or more rows -- which every tier's 2048-row
+    // chunk is. MEASURED on an M4 Pro, one op in isolation over fp16
+    // inputs: 11% relative error on small values (max abs 1.5e-2 over
+    // |x| <= 8) against 0.1% (4.7e-3) for this form, which matches what
+    // the op gives at 512 rows. On a Krea-2 1024^2 image with the ANE
+    // feed-forward, 35.2 -> 39.3 dB against GPU-only; the module is 5-8%
+    // slower and a whole step ~0.5%, the extra ANE time hiding under the
+    // GPU's rows. VPIPE_ANE_SILU_OP=1 emits the op instead, for A/B.
+    static const bool kSiluOp = std::getenv("VPIPE_ANE_SILU_OP") != nullptr;
+    const std::string T = "tensor<fp16, [" + std::to_string(s.M) + ", " +
+                          std::to_string(s.N) + "]> ";
+    auto cst = [&](const char* nm, double v) {
+      o << "            fp16 " << nm << " = const()[name = string(\"" << nm
+        << "\"), val = fp16(" << v << ")];\n";
+    };
+    auto op = [&](const char* nm, const std::string& expr) {
+      o << "            " << T << nm << " = " << expr << "[name = string(\""
+        << nm << "\")];\n";
+    };
+    if (kSiluOp) {
+      op("sg", "silu(x = " + g + ")");
+    } else {
+      cst("s_zero", 0.0);
+      cst("s_one", 1.0);
+      cst("s_neg", -1.0);
+      op("s_min", "minimum(x = " + g + ", y = s_zero)");
+      op("s_num", "exp(x = s_min)");
+      op("s_abs", "abs(x = " + g + ")");
+      op("s_nab", "mul(x = s_abs, y = s_neg)");
+      op("s_e", "exp(x = s_nab)");
+      op("s_den", "add(x = s_e, y = s_one)");
+      op("sgm", "real_div(x = s_num, y = s_den)");
+      op("sg", "mul(x = " + g + ", y = sgm)");
+    }
+    op("hh", "mul(x = sg, y = " + u + ")");
     if (s.biases) {
       last = biased(tiled("hh", s.N, s.K, "d", "dout"), "bd", s.K, "out");
     } else {

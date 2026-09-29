@@ -122,9 +122,31 @@ TEST(model_quantize_stage, invalid_bits_deferred)
   Session sess;
   CerrSilencer hush;
   FlexData cfg = FlexData::from_json(
-      R"({"src_model":"/a","output_name":"/b","bits":16})");
+      R"({"src_model":"/a","output_name":"/b","bits":12})");
   ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, std::move(cfg));
   EXPECT_FALSE(s.config_error().empty());
+}
+
+// bits=16 is the DENSE pass (FP8 -> bf16, nothing quantized), so it is a
+// valid width -- and every option that shapes a quantization contradicts
+// it rather than being quietly ignored.
+TEST(model_quantize_stage, dense_bits_rejects_quantization_options)
+{
+  Session sess;
+  CerrSilencer hush;
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"src_model":"/a","output_name":"/b","bits":16})");
+    ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  for (const char* extra : {R"("awq":true)", R"("quant_modulation":true)"}) {
+    FlexData cfg = FlexData::from_json(
+        std::string(R"({"src_model":"/a","output_name":"/b","bits":16,)") +
+        extra + "}");
+    ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, std::move(cfg));
+    EXPECT_FALSE(s.config_error().empty());
+  }
 }
 
 TEST(model_quantize_stage, missing_src_model_deferred)

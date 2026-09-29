@@ -6,7 +6,9 @@
 #include "common/flex-data.h"
 #include "generative-models/shared/ane-ffn.h"
 #include "generative-models/minimax-h3/metal-vdn-branch.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/i8-gemm.h"
@@ -128,6 +130,9 @@ class MetalMiniMaxH3Transformer {
     int time_hidden   = 5376;
     int time_dim      = 2688;     // AdaLN projection input
     int rope_freq_dim = 16;       // per AXIS; 3 axes, doubled -> rot 96
+    // Only for a checkpoint with no `rope.inv_freq` tensor (the
+    // diffusers layout), which the table is then computed from.
+    float rope_theta  = 10000.0f;
     float norm_eps       = 1e-5f;
     float qk_norm_eps    = 1e-5f;
     float final_norm_eps = 1e-5f;
@@ -965,6 +970,11 @@ class MetalMiniMaxH3Transformer {
   // like the Qwen fast-path guard: a silent fallback to steel is 2-3x
   // slower but numerically fine, so no correctness test can see it.
   bool uses_matrix_cores() const { return _use_mma2; }
+  // Whether the dequant scratch (_w_deq) exists at all: the matrix-core
+  // path widens quantized weights into it, and an FP8 checkpoint widens
+  // every weight into it on EVERY machine. What scratch_bytes()'s
+  // `with_dequant` has to be told.
+  bool uses_dequant_scratch() const { return _use_mma2 || _f8.any(); }
   // True when every block runs the fused-SwiGLU FF, so the ff scratch is
   // the narrow one. Pair with scratch_bytes()'s `narrow_ff`.
   bool ff_scratch_narrow() const { return !_ff_needs_wide; }
@@ -1080,7 +1090,19 @@ class MetalMiniMaxH3Transformer {
     // takes the split path, so the two can coexist within one forward --
     // which is what a streamed block that has not been promoted yet is.
     bool gu_inter = false;
-    bool empty() const { return quantized ? codes.empty() : w.empty(); }
+    // FP8 storage: `codes` holds the checkpoint's own [N, K] bytes,
+    // widened to bf16 on the GPU right before each GEMM (fp8_dense_).
+    // Deliberately NOT `quantized`: there are no group scales, and every
+    // path that reads an affine triple must not be handed one. A SCALED
+    // weight carries `f8_scale`, f32 -- one value, or one per row when
+    // `f8_per_row` (shared/fp8-expand.h).
+    fp8::Format f8 = fp8::Format::kNone;
+    metal_compute::SharedBuffer f8_scale;
+    bool f8_per_row = false;
+    bool is_fp8() const { return f8 != fp8::Format::kNone; }
+    bool empty() const {
+      return (quantized || is_fp8()) ? codes.empty() : w.empty();
+    }
   };
 
   // Put `nm`'s tensors into `dst`, reusing its buffers when they already
@@ -1207,6 +1229,23 @@ class MetalMiniMaxH3Transformer {
   metal_compute::SharedBuffer weight_(WeightSet& ws, const std::string& nm,
                                       Retain r);
   Linear linear_(WeightSet& ws, const std::string& nm, bool bias, Retain r);
+  // A linear the checkpoint stores in PIECES (the diffusers layout's
+  // split qkv and swapped fc1 -- minimax-h3-diffusers-layout.h), built
+  // whole: FP8 codes when every piece is FP8 of one format, else bf16.
+  Linear assemble_(WeightSet& ws, const std::string& nm,
+                   const std::vector<minimax_h3::Part>& parts, bool bias,
+                   Retain r);
+  // Put `nm` into the Linear `l` already holds, in place, when its
+  // buffers fit -- FP8 and assembled linears; quantized and plain dense
+  // ones keep refill_block_'s per-tensor path. False when any piece
+  // cannot be placed, and the caller rebuilds the Linear.
+  bool refill_linear_(WeightSet& ws, const std::string& nm, Linear& l);
+  // The weight `l` holds as a dense bf16 operand for this GEMM: `l`
+  // itself, or -- for FP8 -- a `view` aliasing _w_deq, which the
+  // expansion has just been encoded into. Null (and _fp8_failed latched)
+  // when an FP8 weight cannot be expanded.
+  const Linear* fp8_dense_(metal_compute::ComputeEncoder& enc,
+                           const Linear& l, Linear& view, int N, int K);
   bool load_block_(WeightSet& ws, const std::string& prefix, Block& b,
                    bool with_adaln, Retain r);
 
@@ -1688,6 +1727,12 @@ class MetalMiniMaxH3Transformer {
   // released config), grown on demand and kept -- regrowing it per block
   // would be an allocation inside the denoise loop.
   metal_compute::SharedBuffer _w_deq;
+  // The checkpoint's FP8 weights (shared/fp8-layout.h) and the kernels
+  // that widen them per GEMM. The latch reports an expansion that could
+  // not run, which leaves a projection unwritten, as a failed forward.
+  fp8::Layout   _f8;
+  fp8::Expander _fp8x;
+  bool          _fp8_failed = false;
   // Dynamic-int8 accelerated GEMMs (Config::i8_gemm). Null unless enabled
   // AND available; the DiT runs bf16, so it holds the bf16 i8 kernels --
   // the f16 ones would misread these buffers into NaN.
