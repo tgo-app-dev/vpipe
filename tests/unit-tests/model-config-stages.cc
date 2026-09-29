@@ -581,6 +581,65 @@ TEST(model_config, krea2_emits_the_adapter_keys_only_when_set)
   }
 }
 
+// Qwen-Image-2.1 builds its beat by hand as well, and carries two
+// things the others do not: a few-step adapter's SCHEDULE (`sigmas`,
+// `shift_terminal`) beside the adapter itself. Both must arrive only
+// when set -- an emitted `shift_terminal` default would override the
+// checkpoint's 0.02 on every plain run -- and `sigmas` must arrive as
+// the array it was written as, since generate-image refuses anything
+// else and falls back to the default grid.
+TEST(model_config, qwen_image_21_emits_adapter_and_schedule_only_when_set)
+{
+  Session sess;
+  {
+    QwenImage21ModelConfigStage s(&sess, "q", {}, FlexData::make_object());
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    for (const char* k : {"lora", "lora_scale", "lora2", "lora2_scale",
+                          "sigmas", "shift_terminal"}) {
+      EXPECT_FALSE(o.contains(k));
+      if (o.contains(k)) { std::printf("[model_config] emitted %s\n", k); }
+    }
+  }
+  {
+    auto cfg = FlexData::make_object();
+    auto c = cfg.as_object();
+    c.insert_or_assign("lora", FlexData::make_string("/m/turbo.safetensors"));
+    c.insert_or_assign("lora2_scale", FlexData::make_real(0.5));
+    auto sig = FlexData::make_array();
+    for (double x : {1.0, 0.9375, 0.875, 0.75, 0.5, 0.25}) {
+      sig.as_array().push_back(FlexData::make_real(x));
+    }
+    c.insert_or_assign("sigmas", sig);
+    c.insert_or_assign("shift_terminal", FlexData::make_real(0.0));
+    QwenImage21ModelConfigStage s(&sess, "q2", {}, cfg);
+    FlexData fd = s.resolved_config();
+    auto o = fd.as_object();
+    EXPECT_TRUE(o.contains("lora") &&
+                std::string(o.at("lora").as_string("")) ==
+                    "/m/turbo.safetensors");
+    EXPECT_FALSE(o.contains("lora_scale"));
+    EXPECT_FALSE(o.contains("lora2"));
+    EXPECT_TRUE(o.contains("lora2_scale") &&
+                o.at("lora2_scale").as_real(1.0) == 0.5);
+    EXPECT_TRUE(o.contains("shift_terminal") &&
+                o.at("shift_terminal").as_real(1.0) == 0.0);
+    EXPECT_TRUE(o.contains("sigmas"));
+    if (o.contains("sigmas")) {
+      FlexData a = o.at("sigmas");
+      EXPECT_TRUE(a.is_array());
+      if (a.is_array()) {
+        auto v = a.as_array();
+        EXPECT_TRUE(v.size() == 6);
+        EXPECT_TRUE(v.size() == 6 && v[1].as_real(0.0) == 0.9375 &&
+                    v[5].as_real(0.0) == 0.25);
+      }
+    }
+    EXPECT_TRUE(std::string(o.at("model_family").as_string("")) ==
+                "qwen-image-21");
+  }
+}
+
 // Every LoRA key offers BOTH pickers: a MODEL picker filtered to its
 // own family, and a FILE browser for `.safetensors`.
 //
@@ -609,8 +668,12 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
     {"flux2-model-config",      "lora2", "flux2-lora"},
     {"minimax-h3-model-config", "lora",  "minimax-h3-lora"},
     {"minimax-h3-model-config", "lora2", "minimax-h3-lora"},
-    {"generate-image",          "lora",  "krea2-lora,flux2-lora"},
-    {"generate-image",          "lora2", "krea2-lora,flux2-lora"},
+    {"qwen-image-21-model-config", "lora",  "qwen-image-21-lora"},
+    {"qwen-image-21-model-config", "lora2", "qwen-image-21-lora"},
+    {"generate-image",          "lora",
+     "krea2-lora,flux2-lora,qwen-image-21-lora"},
+    {"generate-image",          "lora2",
+     "krea2-lora,flux2-lora,qwen-image-21-lora"},
     {"lora-fuse",               "lora",
      "krea2-lora,flux2-lora,minimax-h3-lora"},
   };
@@ -650,16 +713,19 @@ TEST(model_config, every_lora_key_offers_a_filtered_model_picker)
   // and is stated as one: nothing verified has been published for that
   // family yet, so the FILTER is right and the list is empty until one
   // is. If that changes, so should this.
-  int krea = 0, h3 = 0, flux = 0;
+  int krea = 0, h3 = 0, flux = 0, qi21 = 0;
   for (const ModelCatalogEntry& e : model_catalog()) {
-    if (e.model_type == "krea2-lora")      { ++krea; }
-    if (e.model_type == "minimax-h3-lora") { ++h3; }
-    if (e.model_type == "flux2-lora")      { ++flux; }
+    if (e.model_type == "krea2-lora")         { ++krea; }
+    if (e.model_type == "minimax-h3-lora")    { ++h3; }
+    if (e.model_type == "flux2-lora")         { ++flux; }
+    if (e.model_type == "qwen-image-21-lora") { ++qi21; }
   }
   EXPECT_TRUE(krea > 0);
   EXPECT_TRUE(h3 > 0);
+  EXPECT_TRUE(qi21 > 0);
   std::printf("[model_config] catalogued adapters: krea2 %d, h3 %d, "
-              "flux2 %d (none published yet)\n", krea, h3, flux);
+              "qwen-image-21 %d, flux2 %d (none published yet)\n", krea,
+              h3, qi21, flux);
 }
 
 // What the FILE browser on a LoRA field writes has to open.

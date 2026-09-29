@@ -628,6 +628,49 @@ TEST(runtime_lora, the_file_level_alpha_is_read_when_no_module_has_one)
     }
     fs::remove(p, ec);
   }
+  {   // diffusers' `save_lora_weights` states the LoraConfig as ONE
+      // JSON string, its keys prefixed by the component (Viggle's
+      // Qwen-Image-2.1 turbo). A key that merely ENDS in the letters
+      // is not the alpha; the prefixed one is.
+    const fs::path p = scratch() / "adapter-meta-alpha.safetensors";
+    ASSERT_TRUE(write_st(p, {
+        {"m.lora_A.weight", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+        {"m.lora_B.weight", {N, R}, ramp(N * R, 1.0f, 0.0f)},
+    }, {{"lora_adapter_metadata",
+         "{\\\"transformer.xlora_alpha\\\": 8, "
+         "\\\"transformer.lora_alpha\\\": 2, "
+         "\\\"transformer.r\\\": 4}"}}));
+    std::string err;
+    auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      EXPECT_TRUE(ad->metadata_alpha() == 2.0f);
+      genai::lora::Factors f;
+      EXPECT_TRUE(ad->bind("m", N, K, &f));
+      EXPECT_TRUE(bf16_at(f.a, 0) == 0.5f);   // 2/4
+    }
+    fs::remove(p, ec);
+  }
+  {   // A top-level `alpha` beside it WINS, so no file that bound before
+      // the JSON was read changes strength.
+    const fs::path p = scratch() / "both-meta-alpha.safetensors";
+    ASSERT_TRUE(write_st(p, {
+        {"m.lora_A.weight", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+        {"m.lora_B.weight", {N, R}, ramp(N * R, 1.0f, 0.0f)},
+    }, {{"alpha", "1"},
+        {"lora_adapter_metadata",
+         "{\\\"transformer.lora_alpha\\\": 2}"}}));
+    std::string err;
+    auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      EXPECT_TRUE(ad->metadata_alpha() == 1.0f);
+      genai::lora::Factors f;
+      EXPECT_TRUE(ad->bind("m", N, K, &f));
+      EXPECT_TRUE(bf16_at(f.a, 0) == 0.25f);  // 1/4
+    }
+    fs::remove(p, ec);
+  }
   {   // NEITHER still means "already at strength" -- unchanged, and the
       // reason the metadata read is a fallback and not a default.
     const fs::path p = scratch() / "no-alpha.safetensors";

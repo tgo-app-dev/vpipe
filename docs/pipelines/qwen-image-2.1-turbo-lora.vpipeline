@@ -1,0 +1,86 @@
+{
+  "id": "qwen-image-2.1-turbo-lora",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Qwen/Qwen-Image-2.1"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A photograph of an old fisherman mending a net on a wooden pier at golden hour, weathered hands, gulls in the background, shallow depth of field, detailed skin texture."
+      }
+    },
+    {
+      "id": "qwen-image-21-model-config",
+      "type": "qwen-image-21-model-config",
+      "iports": [],
+      "config": {
+        "lora": "Viggle/Qwen-Image-2.1-viggle-turbo-v0.2.1-r256",
+        "sigmas": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25],
+        "shift_terminal": 0.0
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 }
+      ],
+      "config": {
+        "height": 1024,
+        "width": 1024,
+        "steps": 6,
+        "seed": 7
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "qwen-image-2.1-turbo.png",
+        "format": "png",
+        "compression": 6
+      }
+    }
+  ],
+  "subpipelines": []
+}

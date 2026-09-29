@@ -2179,15 +2179,15 @@ const STRINGS = {
       '在运行时生效的 LoRA——每个被适配的投影计算 W x + scale * B (A x)，而'
       + '不是把增量折进权重里；对 4 位基座而言，这就是“保住一个小修正”和“把'
       + '它四舍五入抹掉”的区别。可以是一个已注册的模型、一个含单个 '
-      + '.safetensors 的目录，或指向该文件的路径。仅 Krea-2 与 FLUX.2 支持'
-      + '。加载时生效：它决定各 block 如何构建，因此 DiT 起来之后再改的节拍'
+      + '.safetensors 的目录，或指向该文件的路径。支持 Krea-2、FLUX.2、'
+      + 'Z-Image 与 Qwen-Image-2.1。加载时生效：它决定各 block 如何构建，因此 DiT 起来之后再改的节拍'
       + '只会被报告并忽略。模型族 model-config 节拍上的 `lora` 会覆盖这里的'
       + '设置',
       '在執行階段生效的 LoRA——每個被套用的投影計算 W x + scale * B (A x)，'
       + '而不是把增量摺進權重裡；對 4 位元基座而言，這就是「保住一個小修正'
       + '」和「把它四捨五入抹掉」的差別。可以是一個已註冊的模型、一個含單個'
-      + ' .safetensors 的目錄，或指向該檔案的路徑。僅 Krea-2 與 FLUX.2 支援'
-      + '。載入時生效：它決定各 block 如何建構，因此 DiT 起來之後再改的節拍'
+      + ' .safetensors 的目錄，或指向該檔案的路徑。支援 Krea-2、FLUX.2、'
+      + 'Z-Image 與 Qwen-Image-2.1。載入時生效：它決定各 block 如何建構，因此 DiT 起來之後再改的節拍'
       + '只會被報告並忽略。模型族 model-config 節拍上的 `lora` 會覆寫這裡的'
       + '設定'],
   'cfg.generate-image.lora_scale': ['',
@@ -3604,12 +3604,14 @@ const STRINGS = {
       'Qwen-Image-2.1 模型配置',
       'Qwen-Image-2.1 模型設定'],
   'stage.qwen-image-21-model-config.doc': ['',
-      '源：Qwen-Image-2.1 专属参数——跨步前缀 KV 缓存，以及对参考图像的界限'
-      + '（这些界限是与 VAE 共用的，并非可以随意选择）。发一个节拍即结束；'
-      + '若接了 trigger 输入端口，则每收到一个节拍发一次。',
-      '來源：Qwen-Image-2.1 專屬參數——跨步前綴 KV 快取，以及對參考影像的界'
-      + '限（這些界限是與 VAE 共用的，並非可以隨意選擇）。發一個節拍即結束'
-      + '；若接了 trigger 輸入埠，則每收到一個節拍發一次。'],
+      '源：Qwen-Image-2.1 专属参数——跨步前缀 KV 缓存、对参考图像的界限'
+      + '（这些界限是与 VAE 共用的，并非可以随意选择）、运行时 LoRA，以及少'
+      + '步适配器自带的调度。发一个节拍即结束；若接了 trigger 输入端口，则'
+      + '每收到一个节拍发一次。',
+      '來源：Qwen-Image-2.1 專屬參數——跨步前綴 KV 快取、對參考影像的界限'
+      + '（這些界限是與 VAE 共用的，並非可以隨意選擇）、執行階段 LoRA，以及'
+      + '少步轉接器自帶的排程。發一個節拍即結束；若接了 trigger 輸入埠，則'
+      + '每收到一個節拍發一次。'],
   'cfg.qwen-image-21-model-config.use_kv_cache': ['',
       '在各去噪步之间复用文本与条件图像前缀的注意力 K/V。之所以成立，是因为'
       + '本模型在 t=0 调制该前缀，使它与步数无关——因此这是精确优化而非近似'
@@ -3641,6 +3643,60 @@ const STRINGS = {
   'cfg.qwen-image-21-model-config.vl_max_pixels': ['',
       '接地编码：图像处理器的上界。未设置 => 本模型族自己的 16777216',
       '接地編碼：影像處理器的上界。未設定 => 本模型族自己的 16777216'],
+  'cfg.qwen-image-21-model-config.lora': ['',
+      '在运行时生效的 LoRA——每个被适配的投影计算 W x + scale * B (A x)，而'
+      + '不是把增量折进权重里。可以是一个已注册的模型、一个含单个 '
+      + '.safetensors 的目录，或指向该文件的路径，peft、diffusers 与 kohya '
+      + '三种写法均可；除 block 内的投影外，共享调制与时间步 Linear 上的适'
+      + '配（Viggle 的 turbo）也能绑定。加载时生效：DiT 起来之后再改的节拍'
+      + '只会被报告并忽略。会覆盖 generate-image 自己的 `lora`。未设置 => '
+      + '不加适配器',
+      '在執行階段生效的 LoRA——每個被套用的投影計算 W x + scale * B (A x)，'
+      + '而不是把增量摺進權重裡。可以是一個已註冊的模型、一個含單個 '
+      + '.safetensors 的目錄，或指向該檔案的路徑，peft、diffusers 與 kohya '
+      + '三種寫法均可；除 block 內的投影外，共享調變與時間步 Linear 上的轉'
+      + '接（Viggle 的 turbo）也能繫結。載入時生效：DiT 起來之後再改的節拍'
+      + '只會被報告並忽略。會覆寫 generate-image 自己的 `lora`。未設定 => '
+      + '不加轉接器'],
+  'cfg.qwen-image-21-model-config.lora_scale': ['',
+      '适配器强度，按每次前向生效。可实时调整：它作为常数随 GEMM 一起计算，'
+      + '因此无需重新加载即可扫参。1.0 = 与训练时一致；0 会跳过两个适配器 '
+      + 'GEMM，所以关掉就是真的关掉',
+      '轉接器強度，按每次前向生效。可即時調整：它作為常數隨 GEMM 一起計算，'
+      + '因此無需重新載入即可掃參。1.0 = 與訓練時一致；0 會跳過兩個轉接器 '
+      + 'GEMM，所以關掉就是真的關掉'],
+  'cfg.qwen-image-21-model-config.lora2': ['',
+      '第二个运行时 LoRA，与第一个同时生效——比如 `lora` 放少步适配器，这里'
+      + '放风格适配器；两个槽位本身并无区别，谁放哪个都行。可接受的写法与 '
+      + '`lora` 相同，也同样在加载时生效',
+      '第二個執行階段 LoRA，與第一個同時生效——比如 `lora` 放少步轉接器，這'
+      + '裡放風格轉接器；兩個槽位本身並無區別，誰放哪個都行。可接受的寫法與'
+      + ' `lora` 相同，也同樣在載入時生效'],
+  'cfg.qwen-image-21-model-config.lora2_scale': ['',
+      '`lora2` 的强度，按每次前向生效，且与 `lora_scale` 相互独立。填 0 会'
+      + '跳过它的两个 GEMM',
+      '`lora2` 的強度，按每次前向生效，且與 `lora_scale` 相互獨立。填 0 會'
+      + '跳過它的兩個 GEMM'],
+  'cfg.qwen-image-21-model-config.sigmas': ['',
+      '调度的「原始」sigma 节点，噪声最高者在前——即 diffusers 管线的 '
+      + '`sigmas=` 参数——用来取代 linspace(1, 1/steps, steps)；步数就是节'
+      + '点个数，随分辨率而变的时间偏移照常施加在这些节点上，与默认网格无异'
+      + '。这是少步适配器随附的东西：Viggle 的 turbo v0.2.1 是 [1.0, '
+      + '0.9375, 0.875, 0.75, 0.5, 0.25]，配 shift_terminal 0。未设置 => '
+      + '默认网格',
+      '排程的「原始」sigma 節點，雜訊最高者在前——即 diffusers 管線的 '
+      + '`sigmas=` 參數——用來取代 linspace(1, 1/steps, steps)；步數就是節'
+      + '點個數，隨解析度而變的時間偏移照常施加在這些節點上，與預設網格無異'
+      + '。這是少步轉接器隨附的東西：Viggle 的 turbo v0.2.1 是 [1.0, '
+      + '0.9375, 0.875, 0.75, 0.5, 0.25]，配 shift_terminal 0。未設定 => '
+      + '預設網格'],
+  'cfg.qwen-image-21-model-config.shift_terminal': ['',
+      '偏移后调度的最后一个非零 sigma 被拉伸到的位置。未设置 => 检查点自己'
+      + '的 0.02；0 = 不拉伸，这正是以 shift_terminal null 发布的调度所要求'
+      + '的',
+      '偏移後排程的最後一個非零 sigma 被拉伸到的位置。未設定 => 檢查點自己'
+      + '的 0.02；0 = 不拉伸，這正是以 shift_terminal null 發佈的排程所要求'
+      + '的'],
   'cfg.qwen-image-21-model-config.preview_vae': ['',
       '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
       + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
@@ -3679,11 +3735,13 @@ const STRINGS = {
       + '發一次'],
   'port.qwen-image-21-model-config.model_config': ['',
       'qwen-image-2.1 参数，作为一个 FlexData 对象 {model_family: '
-      + 'qwen-image-21, +use_kv_cache, +vl_*, +preview_vae 与它的选项}，供 '
+      + 'qwen-image-21, +use_kv_cache, +vl_*, +lora、+lora2 及其强度, '
+      + '+sigmas, +shift_terminal, +preview_vae 与它的选项}，供 '
       + 'generate-image 或 diffusion-conditioner 的 model_config 输入端口'
       + '使用',
       'qwen-image-2.1 參數，作為一個 FlexData 物件 {model_family: '
-      + 'qwen-image-21, +use_kv_cache, +vl_*, +preview_vae 與它的選項}，供 '
+      + 'qwen-image-21, +use_kv_cache, +vl_*, +lora、+lora2 及其強度, '
+      + '+sigmas, +shift_terminal, +preview_vae 與它的選項}，供 '
       + 'generate-image 或 diffusion-conditioner 的 model_config 輸入埠使'
       + '用'],
 

@@ -627,6 +627,22 @@ fp8_source_(const QW& q, AneFfnSource& s)
   s.scales    = q.f8_scale.empty() ? nullptr : &q.f8_scale;
 }
 
+// A projection's adapters as the ANE tier merges them into its staged
+// rows (shared/ane-ffn.h), each at its live strength.
+void
+lora_deltas_(const lora::Stack& st, AneFfnSource& s)
+{
+  for (int i = 0; i < st.n && s.deltas < AneFfnSource::kMaxDeltas; ++i) {
+    AneFfnSource::Delta& d = s.delta[s.deltas++];
+    d.a     = &st.s[i].f->a;
+    d.b     = &st.s[i].f->b;
+    d.rank  = st.s[i].f->b_rank();
+    d.group = st.s[i].f->group;
+    d.parts = st.s[i].f->parts;
+    d.scale = st.s[i].scale;
+  }
+}
+
 bool
 clone_buf_(MetalCompute* mc, const SharedBuffer& s, SharedBuffer& d, bool copy)
 {
@@ -715,15 +731,18 @@ MetalQwenImage21Transformer::configure_slots_()
 std::unique_ptr<MetalQwenImage21Transformer>
 MetalQwenImage21Transformer::load(const std::string& model_dir,
                                   MetalCompute* mc, const Config& cfg,
-                                  bool stream_blocks)
+                                  bool stream_blocks,
+                                  const std::vector<LoraSpec>& loras)
 {
-  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks);
+  return load(WeightSet::open(model_dir, nullptr), mc, cfg, stream_blocks,
+              loras);
 }
 
 std::unique_ptr<MetalQwenImage21Transformer>
 MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
                                   MetalCompute* mc, const Config& cfg,
-                                  bool stream_blocks)
+                                  bool stream_blocks,
+                                  const std::vector<LoraSpec>& loras)
 {
   if (ws == nullptr || mc == nullptr) { return nullptr; }
   std::unique_ptr<MetalQwenImage21Transformer> m(
@@ -1011,6 +1030,13 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
         return nullptr;
       }
     }
+  }
+  // After the blocks: the factors are keyed by name, so a preloaded and
+  // a streamed stack bind the same way.
+  if (!m->bind_loras_(loras) && mc->session() != nullptr) {
+    mc->session()->warn(fmt(
+        "MetalQwenImage21Transformer: the runtime-LoRA kernels did not load; "
+        "the adapters are NOT applied"));
   }
   if (mc->session() != nullptr) {
     mc->session()->log_normal(fmt(
@@ -1322,7 +1348,15 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
 
   // ---- dispatch helpers ---------------------------------------------
   auto lin = [&](const SharedBuffer& x, std::size_t xe, const QWeight& w_in,
-                 const SharedBuffer& y, std::size_t ye, int M, int N, int K) {
+                 const SharedBuffer& y, std::size_t ye, int M, int N, int K,
+                 const lora::Stack& lf = lora::Stack{}) {
+    // The adapters, ACCUMULATED onto whatever the base route wrote --
+    // after every exit below, so no route can skip them.
+    auto lora_after = [&]() {
+      if (!lf.empty()) {
+        _lora.apply(enc, x, xe, lf, y, ye, M, N, K, _mma_min_m);
+      }
+    };
     // FP8: widened into the dequant scratch first, and from here on an
     // ordinary dense weight to every route -- matrix cores, i8, steel.
     QWeight fv;
@@ -1330,7 +1364,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     if (wp == nullptr) { return; }
     const QWeight& w = *wp;
     // Matrix cores first; a decline encodes nothing and falls through.
-    if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { return; }
+    if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
     if (!w.quantized) {
       // The tile, which is the whole of this path's performance on a box
       // with no matrix cores.
@@ -1350,6 +1384,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       // fraction of the output and leaves the rest as it found it.
       enc.dispatch({(unsigned)(((N + bn - 1) / bn) * 32),
                     (unsigned)(((M + bm - 1) / bm) * 2), 2}, {32, 2, 2});
+      lora_after();
       return;
     }
     enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
@@ -1359,6 +1394,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
     enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
                   (unsigned)(((M + 31) / 32) * 2), 2u}, {32, 2, 2});
+    lora_after();
   };
   auto rms = [&](const SharedBuffer& x, std::size_t xe, const SharedBuffer& w,
                  const SharedBuffer& y, std::size_t ye, int R, int D) {
@@ -1422,15 +1458,37 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
                  {256, 1, 1});
   };
 
+  // ---- runtime LoRA scratch -----------------------------------------
+  // [rows, rank] per slot, rows the WIDEST adapted GEMM this forward
+  // runs: the joint stream, the image rows, the modulation rows, and
+  // the text encoder's rows, which txt_in reads before they are placed.
+  // Set before the first adapted GEMM; an Applier with no scratch
+  // encodes nothing, which would be an adapter that silently is not.
+  if (_lora_rank_total > 0) {
+    const int enc_all =
+        req.txt != nullptr
+            ? (int)(req.txt->byte_size() / ((std::size_t)_cfg.txt_dim * 2))
+            : 0;
+    _lora_scratch_rows = (std::size_t)std::max(
+        {JT, IMG, ROWS, MOD_ROWS, enc_all});
+    if (!_lora.ensure_scratch(_lora_scratch_rows *
+                              (std::size_t)_lora_rank_total)) {
+      return fail("qwen-image-2.1 forward: LoRA scratch alloc failed");
+    }
+  }
+  auto LF = [&](lora::Factors FixedLora::* w) { return lora_fix_(w); };
+
   // ---- timestep, and the shared modulation --------------------------
-  lin(tin, 0, _time_1, temb, 0, MOD_ROWS, H, _cfg.time_proj);
+  lin(tin, 0, _time_1, temb, 0, MOD_ROWS, H, _cfg.time_proj,
+      LF(&FixedLora::time_1));
   mul_sig(temb, tsil, MOD_ROWS * H);
-  lin(tsil, 0, _time_2, temb, 0, MOD_ROWS, H, H);
+  lin(tsil, 0, _time_2, temb, 0, MOD_ROWS, H, H, LF(&FixedLora::time_2));
   // modulation is Sequential(SiLU, Linear): the SiLU is on temb, and the
   // SAME silu'd temb feeds norm_out's scale at the end.
   mul_sig(temb, tsil, MOD_ROWS * H);
-  lin(tsil, 0, _mod, modb, 0, MOD_ROWS, 4 * H, H);
-  lin(tsil, 0, _norm_out, nsc, 0, MOD_ROWS, H, H);
+  lin(tsil, 0, _mod, modb, 0, MOD_ROWS, 4 * H, H, LF(&FixedLora::mod));
+  lin(tsil, 0, _norm_out, nsc, 0, MOD_ROWS, H, H,
+      LF(&FixedLora::norm_out));
 
   // Row ranges. Under causal_condition the prefix reads the t=0 row and
   // the target its own; otherwise everything reads row 0. Contiguous by
@@ -1464,11 +1522,12 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     // nothing else in the sequence is run.
     lin(*req.latents,
         (std::size_t)(IMG - lay.target_len) * _cfg.in_channels, _img_in,
-        jh, 0, ROWS, H, _cfg.in_channels);
+        jh, 0, ROWS, H, _cfg.in_channels, LF(&FixedLora::img_in));
   } else {
     SharedBuffer ih = buf((std::size_t)IMG * H);
     if (ih.empty()) { return fail("qwen-image-2.1 forward: alloc failed"); }
-    lin(*req.latents, 0, _img_in, ih, 0, IMG, H, _cfg.in_channels);
+    lin(*req.latents, 0, _img_in, ih, 0, IMG, H, _cfg.in_channels,
+        LF(&FixedLora::img_in));
     // txt_in: zero-centered RMS norm (the +1 is folded into the weight
     // at load), in_layer, GELU(tanh), out_layer.
     const int ENC = (int)lay.text_src.size() + 0;
@@ -1482,12 +1541,13 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       return fail("qwen-image-2.1 forward: alloc failed");
     }
     rms(*req.txt, 0, _txt_norm, tn, 0, enc_rows, _cfg.txt_dim);
-    lin(tn, 0, _txt_in_a, th, 0, enc_rows, H, _cfg.txt_dim);
+    lin(tn, 0, _txt_in_a, th, 0, enc_rows, H, _cfg.txt_dim,
+        LF(&FixedLora::txt_a));
     enc.set_function(_fn_gelu_tanh);
     enc.set_buffer(0, th); enc.set_buffer(1, tg);
     enc.set_constant(2, (int)((std::size_t)enc_rows * H));
     enc.dispatch({(unsigned)((std::size_t)enc_rows * H), 1, 1}, {256, 1, 1});
-    lin(tg, 0, _txt_in_b, th, 0, enc_rows, H, H);
+    lin(tg, 0, _txt_in_b, th, 0, enc_rows, H, H, LF(&FixedLora::txt_b));
 
     int img_at = 0, txt_at = 0;
     for (const qi21::Segment& sg : lay.segments) {
@@ -1580,6 +1640,9 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   const float ascale = 1.0f / std::sqrt((float)Hd);
 
   for (int L = 0; L < _cfg.n_layers; ++L) {
+    // This block's adapters, per projection -- the same index a
+    // streamed, promoted or held block is looked up by.
+    auto LB = [&](lora::Factors BlockLora::* w) { return lora_blk_(L, w); };
     // COOPERATIVE STOP, checked every block rather than only on the
     // streamed tail, so a slow high-resolution step answers within
     // roughly one block on both paths. It returns EMPTY WITHOUT AN
@@ -1709,9 +1772,9 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     const int qg_rows = ROWS - q_rows;
     const auto t_q0 = std::chrono::steady_clock::now();
     if (qg_rows > 0) {
-      lin(tmp, 0, b->qw, qb, 0, qg_rows, H, H);
-      lin(tmp, 0, b->kw, kb, 0, qg_rows, H, H);
-      lin(tmp, 0, b->vw, vb, 0, qg_rows, H, H);
+      lin(tmp, 0, b->qw, qb, 0, qg_rows, H, H, LB(&BlockLora::q));
+      lin(tmp, 0, b->kw, kb, 0, qg_rows, H, H, LB(&BlockLora::k));
+      lin(tmp, 0, b->vw, vb, 0, qg_rows, H, H, LB(&BlockLora::v));
     }
     mark("gemm.qkv");
     if (qkv_split || qkv_probe) {
@@ -1944,7 +2007,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     enc.dispatch({(unsigned)Hd, (unsigned)ROWS, (unsigned)NH},
                  {(unsigned)Hd, 1, 1});
     mark("transpose");
-    lin(af, 0, b->ow, tmp, 0, ROWS, H, H);
+    lin(af, 0, b->ow, tmp, 0, ROWS, H, H, LB(&BlockLora::o));
     mark("gemm.out");
     for (const Band& bd : bands) {
       gated(jh, (std::size_t)bd.start * H,
@@ -1992,8 +2055,8 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     const int g_rows = ROWS - a_rows;
     const auto t_g0 = std::chrono::steady_clock::now();
     if (g_rows > 0) {
-    lin(tmp, 0, b->gate_w, g1, 0, g_rows, FF, H);
-    lin(tmp, 0, b->proj_w, u1, 0, g_rows, FF, H);
+    lin(tmp, 0, b->gate_w, g1, 0, g_rows, FF, H, LB(&BlockLora::gate));
+    lin(tmp, 0, b->proj_w, u1, 0, g_rows, FF, H, LB(&BlockLora::proj));
     }
     mark("gemm.ff_up");
     // out(silu(gate_layer(x)) * proj(x)). GATE FIRST: `gate_layer` is the
@@ -2016,7 +2079,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     }
     mark("elt");
     if (g_rows > 0) {
-      lin(s1, 0, b->out_w, tmp, 0, g_rows, H, FF);
+      lin(s1, 0, b->out_w, tmp, 0, g_rows, H, FF, LB(&BlockLora::out));
     }
     mark("gemm.ff_down");
     // ---- rejoin ------------------------------------------------------
@@ -2139,7 +2202,8 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   if (out_all.empty() || out.empty()) {
     return fail("qwen-image-2.1 forward: output alloc failed");
   }
-  lin(tmp, 0, _proj_out, out_all, 0, ROWS, _cfg.out_channels, H);
+  lin(tmp, 0, _proj_out, out_all, 0, ROWS, _cfg.out_channels, H,
+      LF(&FixedLora::proj_out));
   // The TARGET rows only -- the tail by construction, so one copy
   // rather than a gather.
   //
@@ -2386,7 +2450,16 @@ MetalQwenImage21Transformer::ane_stage_(int L, const Block& b)
     fp8_source_(q, s);
     return s;
   };
-  _ane->stage(L, src(b.gate_w), src(b.proj_w), src(b.out_w), _quant_group);
+  // The adapters MERGED into the staged rows, or the ANE's rows would
+  // run the base model while the GPU's run the adapted one -- which
+  // reads as the adapter at part strength, not as an error.
+  auto with = [&](AneFfnSource s, lora::Factors BlockLora::* which) {
+    lora_deltas_(lora_blk_(L, which), s);
+    return s;
+  };
+  _ane->stage(L, with(src(b.gate_w), &BlockLora::gate),
+              with(src(b.proj_w), &BlockLora::proj),
+              with(src(b.out_w), &BlockLora::out), _quant_group);
 }
 
 // THE q/k/v TIER: one matmul module, hidden -> 3*hidden, whose single
@@ -2442,7 +2515,8 @@ MetalQwenImage21Transformer::ane_qkv_stage_(int L, const Block& b)
   const std::size_t H = (std::size_t)_cfg.hidden;
   // Stacked along the slot's rows in the order the split scatters the
   // output columns: q, then k, then v.
-  auto part = [&](const QWeight& q, std::size_t row0) {
+  auto part = [&](const QWeight& q, std::size_t row0,
+                  lora::Factors BlockLora::* which) {
     AneFfnSource s;
     s.w         = &q.w;
     s.codes     = q.quantized ? &q.codes : nullptr;
@@ -2453,15 +2527,164 @@ MetalQwenImage21Transformer::ane_qkv_stage_(int L, const Block& b)
     s.stride    = 1;
     s.offset    = 0;
     fp8_source_(q, s);
+    lora_deltas_(lora_blk_(L, which), s);
     s.slot      = 0;
     s.slot_row  = row0;
     s.rows      = H;
     return s;
   };
   _ane_qkv->stage(L,
-                  std::vector<AneFfnSource>{part(b.qw, 0), part(b.kw, H),
-                                            part(b.vw, 2 * H)},
+                  std::vector<AneFfnSource>{
+                      part(b.qw, 0, &BlockLora::q),
+                      part(b.kw, H, &BlockLora::k),
+                      part(b.vw, 2 * H, &BlockLora::v)},
                   _quant_group);
+}
+
+// ---- runtime LoRA ---------------------------------------------------
+//
+// THE MODULE NAMES ARE THE CHECKPOINT'S OWN, the convention every
+// published Qwen-Image-2.1 adapter uses: the base tensor's path without
+// `.weight`, under an optional `transformer.` / `diffusion_model.`
+// wrapper the shared reader strips, in peft (`lora_A[.default]`),
+// diffusers (`lora_A.weight`) or kohya (`lora_down`) spelling. VERIFIED
+// by binding Viggle's turbo (diffusers, with the modulation and the
+// timestep Linears) and a peft adapter (the seven block projections)
+// whole.
+//
+// alibaba-pai's Fun-Acc files are NOT a LoRA: their "prefused" format
+// replaces norms outright and carries a different output head, which a
+// factor reader would skip without a word and run a model neither the
+// base nor the distillation is. Refused by name.
+bool
+MetalQwenImage21Transformer::bind_loras_(const std::vector<LoraSpec>& loras)
+{
+  if (loras.empty()) { return true; }
+  if (!_lora.init(_mc, _use_mma2) || !_lora.valid()) { return false; }
+  const int H = _cfg.hidden, FF = _cfg.hidden * _cfg.mlp_ratio;
+  int slot = 0;
+  for (const LoraSpec& spec : loras) {
+    if (slot >= kMaxLoraSlots || spec.path.empty()) { break; }
+    std::string err;
+    auto ad = lora::Adapter::open(spec.path, _mc, &err);
+    auto warn = [&](const std::string& m) {
+      if (_mc->session() != nullptr) {
+        _mc->session()->warn(fmt("MetalQwenImage21Transformer: lora '{}' {}",
+                                 spec.path, m));
+      }
+    };
+    if (ad == nullptr) {
+      warn("did not open: " + (err.empty() ? std::string("unreadable") : err));
+      continue;
+    }
+    {
+      // By the file's own tensor names (a header read): a whole weight
+      // of this model beside the factors, under any wrapper prefix.
+      const auto raw = MetalLlamaWeights::open(spec.path);
+      auto whole = [&](const std::string& n) {
+        if (!raw.has_value()) { return false; }
+        for (const char* pre : {"", "transformer.", "diffusion_model."}) {
+          if (raw->has(std::string(pre) + n)) { return true; }
+        }
+        return false;
+      };
+      const bool prefused =
+          ad->metadata("format").find("prefused") != std::string::npos ||
+          whole("proj_out.weight") || whole("txt_in.text_norm.weight") ||
+          whole(block_pre_(0) + "attn.norm_q.weight");
+      if (prefused) {
+        warn("is not a LoRA this family reads: it carries whole weights "
+             "(norms, an output head) beside its factors -- a \"prefused\" "
+             "distillation checkpoint, which would run as neither model. "
+             "NOT applied");
+        continue;
+      }
+    }
+    // resize, not assign: Factors holds SharedBuffers and is move-only.
+    _lora_blk[slot].clear();
+    _lora_blk[slot].resize((std::size_t)_cfg.n_layers);
+    _lora_fix[slot] = FixedLora{};
+    for (int L = 0; L < _cfg.n_layers; ++L) {
+      const std::string p = block_pre_(L);
+      BlockLora& d = _lora_blk[slot][(std::size_t)L];
+      ad->bind(p + "attn.to_q", H, H, &d.q);
+      ad->bind(p + "attn.to_k", H, H, &d.k);
+      ad->bind(p + "attn.to_v", H, H, &d.v);
+      ad->bind(p + "attn.to_out.0", H, H, &d.o);
+      ad->bind(p + "img_mlp.gate_layer", FF, H, &d.gate);
+      ad->bind(p + "img_mlp.proj", FF, H, &d.proj);
+      ad->bind(p + "img_mlp.out", H, FF, &d.out);
+    }
+    FixedLora& f = _lora_fix[slot];
+    ad->bind("img_in", H, _cfg.in_channels, &f.img_in);
+    ad->bind("txt_in.in_layer", H, _cfg.txt_dim, &f.txt_a);
+    ad->bind("txt_in.out_layer", H, H, &f.txt_b);
+    ad->bind("time_text_embed.timestep_embedder.linear_1", H,
+             _cfg.time_proj, &f.time_1);
+    ad->bind("time_text_embed.timestep_embedder.linear_2", H, H, &f.time_2);
+    ad->bind("modulation.1", 4 * H, H, &f.mod);
+    ad->bind("norm_out.linear", H, H, &f.norm_out);
+    ad->bind("proj_out", _cfg.out_channels, H, &f.proj_out);
+    _lora_bound[slot] = ad->modules();
+    _lora_scale[slot] = spec.scale;
+    _lora_rank_prefix[slot] = _lora_rank_total;
+    _lora_rank_total += ad->max_rank();
+    if (_mc->session() != nullptr) {
+      _mc->session()->log_normal(fmt("MetalQwenImage21Transformer: {}",
+                                     ad->summary(spec.path, spec.scale)));
+    }
+    if (ad->modules() == 0) {
+      // LOUD. An adapter for another model binds nothing and would
+      // otherwise report success by saying nothing at all.
+      warn("bound NO modules -- it is for a different model, or its names "
+           "are in a convention this family does not map yet");
+    }
+    ++slot;
+  }
+  _lora_slots = slot;
+  return true;
+}
+
+lora::Stack
+MetalQwenImage21Transformer::lora_blk_(int L,
+                                       lora::Factors BlockLora::* which) const
+{
+  lora::Stack st;
+  for (int i = 0; i < _lora_slots; ++i) {
+    const std::vector<BlockLora>& v = _lora_blk[i];
+    if (L < 0 || L >= (int)v.size()) { continue; }
+    // Each slot gets its OWN region of the [rows, rank] scratch --
+    // sharing one would make the last writer's intermediate the thing
+    // every B factor multiplies.
+    st.add(v[(std::size_t)L].*which, _lora_scale[i],
+           _lora_scratch_rows * (std::size_t)_lora_rank_prefix[i]);
+  }
+  return st;
+}
+
+lora::Stack
+MetalQwenImage21Transformer::lora_fix_(lora::Factors FixedLora::* which) const
+{
+  lora::Stack st;
+  for (int i = 0; i < _lora_slots; ++i) {
+    st.add(_lora_fix[i].*which, _lora_scale[i],
+           _lora_scratch_rows * (std::size_t)_lora_rank_prefix[i]);
+  }
+  return st;
+}
+
+void
+MetalQwenImage21Transformer::set_lora_scale(int slot, float s)
+{
+  if (slot < 0 || slot >= kMaxLoraSlots) { return; }
+  _lora_scale[slot] = s;
+}
+
+int
+MetalQwenImage21Transformer::lora_modules(int slot) const
+{
+  if (slot < 0 || slot >= kMaxLoraSlots) { return 0; }
+  return _lora_bound[slot];
 }
 
 std::size_t

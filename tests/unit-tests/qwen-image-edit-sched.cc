@@ -125,3 +125,46 @@ TEST(qwen_image_edit_sched, dynamic_fields_roundtrip)
   EXPECT_TRUE(FlowSchedulerSpec::from_flex(stat.to_flex()) == stat);
   EXPECT_TRUE(!stat.dynamic_shift);
 }
+
+TEST(qwen_image_edit_sched, raw_sigmas_match_diffusers)
+{
+  // A few-step adapter ships its schedule as the pipeline's `sigmas=`
+  // argument (Viggle's Qwen-Image-2.1 turbo: six nodes, no terminal
+  // stretch). Reference from the REAL diffusers
+  // FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=..., mu=...),
+  // with shift_terminal None, then 0.02.
+  const std::vector<double> nodes = {1.0, 0.9375, 0.875, 0.75, 0.5, 0.25};
+  const std::vector<double> ref_1024 = {
+      1.00000000, 0.96255648, 0.92305654, 0.83717018, 0.63151217,
+      0.36356997, 0.00000000};
+  const std::vector<double> ref_4096 = {
+      1.00000000, 0.96775448, 0.93335831, 0.85719192, 0.66675580,
+      0.40009630, 0.00000000};
+  const std::vector<double> ref_term = {
+      1.00000000, 0.94732386, 0.89113444, 0.76670933, 0.45561373,
+      0.01999998, 0.00000000};
+
+  FlowSchedulerSpec s = qwen_image_sched();
+  s.steps = (int)nodes.size();
+  s.base_sigmas = nodes;
+  s.shift_terminal = 0.0;
+  const double d1 = max_abs_diff(s.sigmas(1024), ref_1024);
+  const double d2 = max_abs_diff(s.sigmas(4096), ref_4096);
+  ASSERT_TRUE(s.sigmas(1024).size() == ref_1024.size());
+  s.shift_terminal = 0.02;
+  const double d3 = max_abs_diff(s.sigmas(4096), ref_term);
+  std::printf("[qwen_image_edit_sched] raw nodes max|d| vs diffusers: "
+              "img1024=%.2e img4096=%.2e terminal=%.2e\n", d1, d2, d3);
+  EXPECT_TRUE(d1 < 1e-6);
+  EXPECT_TRUE(d2 < 1e-6);
+  EXPECT_TRUE(d3 < 1e-6);
+
+  // Nodes whose count is not the step count are not half-applied: the
+  // default grid runs, exactly as with none.
+  FlowSchedulerSpec wrong = qwen_image_sched();
+  FlowSchedulerSpec none = wrong;
+  wrong.base_sigmas = nodes;   // 6 nodes, 8 steps
+  EXPECT_TRUE(max_abs_diff(wrong.sigmas(4096), none.sigmas(4096)) == 0.0);
+  // And they are part of the spec's identity.
+  EXPECT_TRUE(!(wrong == none));
+}

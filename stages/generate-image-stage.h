@@ -479,6 +479,11 @@ private:
   // qwen-image-21-model-config's `use_kv_cache`. Defaults ON, matching
   // the reference; an unset key is "no opinion", not `false`.
   bool _qi21_use_kv_cache = true;
+  // A few-step adapter's own schedule, off qwen-image-21-model-config:
+  // raw sigma nodes (empty = the default grid) and the terminal stretch
+  // (< 0 = the checkpoint's 0.02). Reset between runs.
+  std::vector<double> _qi21_sigmas;
+  double _qi21_shift_terminal = -1.0;
   // The joint-sequence bookkeeping the CONDITIONER publishes on its
   // beat's sideband. Nothing here can reconstruct it: which conditioning
   // rows are image slots depends on where the tower's rows were spliced

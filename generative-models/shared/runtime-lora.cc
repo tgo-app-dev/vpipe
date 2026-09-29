@@ -2,11 +2,13 @@
 
 #include "generative-models/shared/fp8-layout.h"
 
+#include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "interfaces/session-context-intf.h"
 
 #include <cstring>
+#include <string_view>
 #include <vector>
 #include <algorithm>
 
@@ -236,6 +238,32 @@ Adapter::index_suffix_()
     } catch (...) {
       _meta_alpha = 0.0f;
     }
+    return;
+  }
+  // diffusers' own export (`save_lora_weights` with adapter metadata)
+  // states the peft LoraConfig as ONE JSON string, `lora_adapter_
+  // metadata`, its keys prefixed by the component -- `transformer.
+  // lora_alpha`. Read only when neither key above is present, so no
+  // file that already bound changes strength. Per-module overrides
+  // (`alpha_pattern`) are not read; the files seen state them empty.
+  auto jt = md.find("lora_adapter_metadata");
+  if (jt == md.end()) { return; }
+  try {
+    const FlexData j = FlexData::from_json(jt->second);
+    if (!j.is_object()) { return; }
+    for (const auto& [k, v] : j.as_object()) {
+      const std::string_view key(k);
+      static constexpr std::string_view kA = "lora_alpha";
+      if (key.size() >= kA.size() &&
+          key.substr(key.size() - kA.size()) == kA &&
+          (key.size() == kA.size() ||
+           key[key.size() - kA.size() - 1] == '.')) {
+        _meta_alpha = (float)v.as_real(0.0);
+        break;
+      }
+    }
+  } catch (...) {
+    _meta_alpha = 0.0f;
   }
 }
 

@@ -212,10 +212,13 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
     const double mu = (double)img_seq_len_override * m + b;
 
     std::vector<double> sig((std::size_t)S + 1);
+    const bool raw = (int)base_sigmas.size() == S;
     for (int i = 0; i < S; ++i) {
       const double r = (S == 1) ? 0.0 : (double)i / (double)(S - 1);
-      // base = linspace(1.0, 1/S, S) -- the pipeline's explicit sigmas arg.
-      const double base = 1.0 + r * ((1.0 / (double)S) - 1.0);
+      // base = linspace(1.0, 1/S, S) -- the pipeline's explicit sigmas
+      // arg -- unless the caller passed its own nodes.
+      const double base = raw ? base_sigmas[(std::size_t)i]
+                              : 1.0 + r * ((1.0 / (double)S) - 1.0);
       sig[(std::size_t)i] = time_shift(base, mu, expo);
     }
     // stretch_shift_to_terminal: 1 - (1 - sig) / ((1 - sig[S-1])/(1 - term)).

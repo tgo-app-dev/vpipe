@@ -967,6 +967,57 @@ builtin_catalog_()
            "taeqi2_1_decoder.pth",
            "taeqi2_1_decoder.pth"}}),
      .name = "madebyollin/taeqi2_1"},
+    // Viggle's few-step distillation of Qwen-Image-2.1, applied as a
+    // RUNTIME LoRA (qwen-image-21-model-config `lora`), with no CFG.
+    // The adapter reaches past the blocks -- the shared modulation and
+    // both timestep-embedder Linears carry factors too -- and the file
+    // is diffusers-keyed (`transformer.` prefix, `lora_A.weight`) with
+    // its alpha only in the `lora_adapter_metadata` JSON.
+    //
+    // SCHEDULE, and it is part of the adapter, not a preference: six
+    // steps on the RAW sigma nodes [1.0, 0.9375, 0.875, 0.75, 0.5,
+    // 0.25] -- the 4-step training grid with its first segment cut in
+    // three -- time-shifted per resolution like the default grid, and
+    // shift_terminal 0 where the base checkpoint's is 0.02. Put both
+    // (`sigmas`, `shift_terminal`) in the same model-config beat as the
+    // adapter, and guidance_scale 1. The low-noise nodes are the ones
+    // the student lands on; to change the step count, add or remove
+    // nodes at the high-noise end only.
+    //
+    // Both ranks are one adapter: r128 is r256 truncated, half the
+    // size, and what upstream's ComfyUI workflows load. The older v0.2
+    // and v0.1 files in the same repo are superseded and not listed.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "LoRA",
+     .variant = "viggle-turbo 6-step v0.2.1 r256 (Viggle)",
+     .hf_path = "Viggle/Qwen-Image-2.1-viggle-turbo",
+     .model_type = "qwen-image-21-lora",
+     .parent_model_type = "qwen-image-21",
+     .files = {"Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     // Two entries pin one file each out of one repo, so each needs its
+     // own registration key -- see the H3 Turbo entries.
+     .name = "Viggle/Qwen-Image-2.1-viggle-turbo-v0.2.1-r256"},
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "LoRA",
+     .variant = "viggle-turbo 6-step v0.2.1 r128 (Viggle)",
+     .hf_path = "Viggle/Qwen-Image-2.1-viggle-turbo",
+     .model_type = "qwen-image-21-lora",
+     .parent_model_type = "qwen-image-21",
+     .files = {"Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "Viggle/Qwen-Image-2.1-viggle-turbo-v0.2.1-r128"},
+    // A style adapter on the default 40-step schedule: natural,
+    // balanced exposure. peft-keyed (`lora_A.default.weight`), rank 16
+    // on the seven block projections only. The repo's ckpts/ holds the
+    // intermediate steps; the top-level file is the final one.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "LoRA",
+     .variant = "Natural Exposure (prithivMLmods)",
+     .hf_path = "prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA",
+     .model_type = "qwen-image-21-lora",
+     .parent_model_type = "qwen-image-21",
+     .files = {"Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors"},
+     .needs_tokenizer_json = false},
     // Z-Image (Tongyi-MAI): a 6B single-stream DiT in the Lumina/NextDiT
     // lineage, and the cheapest first-class image family in this tree --
     // two of its three sub-models are already supported code.

@@ -80,6 +80,12 @@ struct FlowSchedulerSpec {
   int         base_seq       = 256;
   int         max_seq        = 8192;
   int         num_train      = 1000;        // num_train_timesteps
+  // dynamic_shift only: the RAW base sigmas -- the diffusers pipeline's
+  // `sigmas=` argument -- in place of linspace(1, 1/steps, steps), each
+  // then time-shifted and terminal-stretched as that grid is. Their
+  // number IS the step count, and `steps` must equal it. Empty = the
+  // default grid. What a few-step adapter ships its schedule as.
+  std::vector<double> base_sigmas;
   // Per-image RUNTIME binding (packed grid_h*grid_w) -- NOT a config
   // choice: excluded from operator== and (de)serialization. The caller
   // sets it before constructing the FlowSampler when dynamic_shift is on.
@@ -104,6 +110,7 @@ struct FlowSchedulerSpec {
            dynamic_shift == o.dynamic_shift && base_shift == o.base_shift &&
            max_shift == o.max_shift && shift_terminal == o.shift_terminal &&
            base_seq == o.base_seq && max_seq == o.max_seq &&
+           base_sigmas == o.base_sigmas &&
            num_train == o.num_train && seq_len == o.seq_len;
   }
 };

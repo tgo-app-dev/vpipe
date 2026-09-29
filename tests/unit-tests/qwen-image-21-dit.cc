@@ -2316,11 +2316,27 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
   // the one before it, not only against nothing.
   enum Arm { kGpu, kFf, kQkv, kArms };
   const char* const kName[kArms] = {"GPU-only", "ANE ff", "ANE ff+qkv"};
+  // VPIPE_QWEN_IMAGE21_ANE_LORA=<adapter>[:scale]: the same runtime
+  // adapter on EVERY arm. The GPU applies it as side GEMMs and the
+  // ANE's rows take it merged into their staged weights, so the three
+  // still agree -- where rows staged WITHOUT it would run the base
+  // model under a GPU running the adapted one, the adapter at part
+  // strength and no error anywhere.
+  std::vector<MetalQwenImage21Transformer::LoraSpec> loras;
+  if (const char* lp = std::getenv("VPIPE_QWEN_IMAGE21_ANE_LORA")) {
+    std::string v(lp);
+    MetalQwenImage21Transformer::LoraSpec sp;
+    const std::size_t c = v.rfind(':');
+    sp.path  = c == std::string::npos ? v : v.substr(0, c);
+    sp.scale = c == std::string::npos ? 1.0f
+                                      : (float)std::atof(v.c_str() + c + 1);
+    loras.push_back(sp);
+  }
   auto make = [&](int arm) {
     MetalQwenImage21Transformer::Config c = cfg;
     c.ane_ffn = arm != kGpu;
     c.ane_qkv = arm == kQkv;
-    return MetalQwenImage21Transformer::load(dir, mc, c, stream);
+    return MetalQwenImage21Transformer::load(dir, mc, c, stream, loras);
   };
   auto fwd = [&](MetalQwenImage21Transformer* m, std::vector<float>* outv) {
     std::string ferr;
@@ -2373,8 +2389,12 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
   const double r_ff = rel(out[kFf], out[kGpu]);
   const double r_qkv = rel(out[kQkv], out[kGpu]);
   std::printf("[qwen_image_21_dit] ANE split vs GPU-only: rel-L2 %.4e ff, "
-              "%.4e ff+qkv (joint %d, %d layers)\n", r_ff, r_qkv,
-              lay.joint_len, cfg.n_layers);
+              "%.4e ff+qkv (joint %d, %d layers%s)\n", r_ff, r_qkv,
+              lay.joint_len, cfg.n_layers,
+              loras.empty() ? "" : ", runtime LoRA on every arm");
+  if (!loras.empty()) {
+    EXPECT_TRUE(m[kGpu]->lora_modules(0) > 0);
+  }
   // The same function over disjoint rows, one side fp16: a rounding
   // difference through 32 blocks, not a different answer. The q/k/v
   // rows are fp16 too, and are normalized per head right after, so
@@ -2634,4 +2654,148 @@ TEST(qwen_image_21_dit, checkpoints_agree)
   } else {
     EXPECT_TRUE(diff == 0);
   }
+}
+
+// Runtime LoRA against the same adapter FUSED into the base weights --
+// W + (alpha/rank) B A, computed in f32 and rounded once to bf16 by a
+// script outside this tree -- over the same blocks, on the same
+// request. Asserts what an adapter test has to, in order:
+//   it BOUND modules (an adapter for another model binds none and says
+//     nothing), and as many as the caller expects when told;
+//   it MOVES the base well past the bf16 floor, or "matches the fused
+//     reference" would be vacuous;
+//   runtime and fused agree to within that floor;
+//   a streamed stack takes the same adapters as a held one, to the bit;
+//   scale 0 reproduces the base EXACTLY, not to rounding.
+//
+// Env: VPIPE_QWEN_IMAGE21_LORA_BASE (the base transformer), _LORA (the
+// adapter), _LORA_FUSED (base + adapter, fused); _LORA_LAYERS (default
+// 4, the fused file's depth); _LORA_EXPECT, the modules the adapter must
+// bind at that depth; _LORA_PX (default 512).
+TEST(qwen_image_21_dit, runtime_lora_matches_fused)
+{
+  const char* pbase = std::getenv("VPIPE_QWEN_IMAGE21_LORA_BASE");
+  const char* plora = std::getenv("VPIPE_QWEN_IMAGE21_LORA");
+  const char* pfuse = std::getenv("VPIPE_QWEN_IMAGE21_LORA_FUSED");
+  if (pbase == nullptr || plora == nullptr || pfuse == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int layers = envi("VPIPE_QWEN_IMAGE21_LORA_LAYERS", 4);
+  const int expect = envi("VPIPE_QWEN_IMAGE21_LORA_EXPECT", 0);
+  const int px = envi("VPIPE_QWEN_IMAGE21_LORA_PX", 512);
+  const int lg = px / 16, n_text = 64;
+  std::vector<std::uint8_t> slot((std::size_t)n_text, 0);
+  slot.insert(slot.end(), (std::size_t)(lg * lg / 4), 1);
+  const std::vector<qi21::ImgBlock> blocks = {{1, lg, lg}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(pbase, &cfg));
+  cfg.n_layers = std::min(cfg.n_layers, layers);
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    unsigned st = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      const float v = ((float)((st >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.image_len * cfg.in_channels, 61u);
+  metal_compute::SharedBuffer txt =
+      rnd((std::size_t)lay.text_len * cfg.txt_dim, 62u);
+  MetalQwenImage21Transformer::Request req;
+  req.latents = &lat;
+  req.txt = &txt;
+  req.layout = &lay;
+  req.timestep = 0.75f;
+  const std::size_t n = (std::size_t)lay.target_len * cfg.out_channels;
+  auto fwd = [&](MetalQwenImage21Transformer* m) -> std::vector<float> {
+    std::string ferr;
+    metal_compute::SharedBuffer out = m->forward(req, &ferr);
+    if (out.empty() || out.byte_size() < n * 2) {
+      std::printf("[runtime_lora] forward failed: %s\n", ferr.c_str());
+      return {};
+    }
+    std::vector<float> v(n);
+    const auto* d = static_cast<const std::uint16_t*>(out.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t u = (std::uint32_t)d[i] << 16;
+      std::memcpy(&v[i], &u, 4);
+    }
+    return v;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      num += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+      den += (double)b[i] * b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : 0.0;
+  };
+  // _LORA_SCALE: the strength both here and in the fused reference (the
+  // fuse script's own argument) -- how a rounding floor, which stays
+  // put, is told apart from a mapping error, which grows with it.
+  const char* sc_s = std::getenv("VPIPE_QWEN_IMAGE21_LORA_SCALE");
+  const float lscale = sc_s != nullptr ? (float)std::atof(sc_s) : 1.0f;
+  const std::vector<MetalQwenImage21Transformer::LoraSpec> specs = {
+      {plora, lscale}};
+  auto base_m = MetalQwenImage21Transformer::load(pbase, mc, cfg, false);
+  Q21D_REQUIRE(base_m != nullptr);
+  const std::vector<float> base = fwd(base_m.get());
+  base_m.reset();
+  auto lora_m = MetalQwenImage21Transformer::load(pbase, mc, cfg, false,
+                                                  specs);
+  Q21D_REQUIRE(lora_m != nullptr);
+  const int bound = lora_m->lora_modules(0);
+  const std::vector<float> got = fwd(lora_m.get());
+  MetalQwenImage21Transformer::Config fcfg = cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(pfuse, &fcfg));
+  fcfg.n_layers = cfg.n_layers;
+  auto fused_m = MetalQwenImage21Transformer::load(pfuse, mc, fcfg, false);
+  Q21D_REQUIRE(fused_m != nullptr);
+  const std::vector<float> want = fwd(fused_m.get());
+  fused_m.reset();
+  auto stream_m = MetalQwenImage21Transformer::load(pbase, mc, cfg, true,
+                                                    specs);
+  Q21D_REQUIRE(stream_m != nullptr);
+  const std::vector<float> streamed = fwd(stream_m.get());
+  stream_m.reset();
+  lora_m->set_lora_scale(0, 0.0f);
+  const std::vector<float> off = fwd(lora_m.get());
+  Q21D_REQUIRE(!base.empty() && !got.empty() && !want.empty() &&
+               !streamed.empty() && !off.empty());
+  const double moved = rel(base, want);
+  const double err = rel(got, want);
+  std::printf("[runtime_lora] bound %d modules at %d blocks; the adapter "
+              "moves the base %.4f; runtime vs fused %.4f; streamed vs "
+              "held %.3e; scale 0 vs base %.3e\n", bound, cfg.n_layers,
+              moved, err, rel(streamed, got), rel(off, base));
+  EXPECT_TRUE(bound > 0);
+  if (expect > 0) { EXPECT_TRUE(bound == expect); }
+  // The floor is bf16 rounding -- the fused weight's one rounding
+  // against the runtime path's rounded intermediate and double-rounded
+  // accumulate -- and it does NOT grow with the strength: MEASURED on
+  // Viggle's turbo (modulation + timestep Linears only), 0.0105 / 0.0172
+  // / 0.0173 at scales 0.25 / 1 / 4 while the adapter's effect went
+  // 0.018 / 0.039 / 0.117. So the bound is the floor, stated, and the
+  // effect has to clear it several times over -- run a weak adapter at
+  // a higher _LORA_SCALE (fused at the same) rather than loosen this.
+  EXPECT_TRUE(moved > 0.02);
+  EXPECT_TRUE(err < 0.03);
+  EXPECT_TRUE(err < 0.25 * moved);
+  EXPECT_TRUE(std::memcmp(streamed.data(), got.data(),
+                          n * sizeof(float)) == 0);
+  EXPECT_TRUE(std::memcmp(off.data(), base.data(), n * sizeof(float)) == 0);
 }

@@ -45,6 +45,46 @@ const ConfigKey kAttrs[] = {
   {.key = "vl_max_pixels", .type = ConfigType::Int, .required = false,
    .doc = "grounded encode: the image processor's upper bound. Unset => "
           "the family's own 16777216"},
+  {.key = "lora", .type = ConfigType::String, .required = false,
+   .doc = "a LoRA applied AT RUNTIME -- every adapted projection computes "
+          "W x + scale * B (A x) rather than having the delta folded into "
+          "the weights. A registered model, a directory holding one "
+          ".safetensors, or a path to one, in peft, diffusers or kohya "
+          "spelling; adapters on the shared modulation and the timestep "
+          "Linears (Viggle's turbo) bind as well as the block projections. "
+          "LOAD-TIME: a beat that changes it once the DiT is up is "
+          "reported and ignored. Overrides generate-image's own `lora`. "
+          "Unset => no adapter",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "qwen-image-21-lora",
+   .is_path = true, .path_filter = "weights"},
+  {.key = "lora_scale", .type = ConfigType::Real, .required = false,
+   .doc = "the adapter's strength, applied PER FORWARD. Live: it rides the "
+          "GEMM as a constant, so it can be swept without a reload. 1.0 = as "
+          "trained; 0 skips both adapter GEMMs, so off is exactly off",
+   .def_real = 1.0},
+  {.key = "lora2", .type = ConfigType::String, .required = false,
+   .doc = "a SECOND runtime LoRA beside the first -- a few-step adapter in "
+          "`lora` and a style one here, say; either slot may hold either. "
+          "Same accepted forms as `lora`, and LOAD-time in the same way",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "qwen-image-21-lora",
+   .is_path = true, .path_filter = "weights"},
+  {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
+   .doc = "`lora2`'s strength, per FORWARD and independent of `lora_scale`. "
+          "0 skips its two GEMMs", .def_real = 1.0},
+  {.key = "sigmas", .type = ConfigType::Array, .required = false,
+   .doc = "the schedule's RAW sigma nodes, highest noise first -- the "
+          "diffusers pipeline's `sigmas=` argument -- in place of "
+          "linspace(1, 1/steps, steps); the step count is their number, "
+          "and the resolution-dependent time shift is applied to them as "
+          "to the default grid. What a few-step adapter ships: Viggle's "
+          "turbo v0.2.1 is [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25] with "
+          "shift_terminal 0. Unset => the default grid"},
+  {.key = "shift_terminal", .type = ConfigType::Real, .required = false,
+   .doc = "where the shifted schedule's last nonzero sigma is stretched "
+          "to. Unset => the checkpoint's own 0.02; 0 = no stretch, which "
+          "is what a schedule shipped with shift_terminal null asks for"},
   // The live-preview keys every family's config source shares; see
   // stages/latent-preview.h. Qwen-Image-2.1's TAE is madebyollin's
   // `taeqi2_1`: 16x, reading the DiT's 64-channel latent as it stands,
@@ -69,7 +109,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "qwen-image-2.1 parameters as one FlexData object "
-          "{model_family: qwen-image-21, +use_kv_cache, +vl_*, "
+          "{model_family: qwen-image-21, +use_kv_cache, +vl_*, +lora, "
+          "+lora2 and their scales, +sigmas, +shift_terminal, "
           "+preview_vae and its knobs}, for a generate-image or "
           "diffusion-conditioner model_config iport",
    .type = &typeid(FlexDataPayload),
@@ -78,9 +119,10 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "qwen-image-21-model-config",
   .doc       = "Source: the Qwen-Image-2.1-specific parameters -- the "
-               "cross-step prefix KV cache and the bounds on a reference "
+               "cross-step prefix KV cache, the bounds on a reference "
                "image, which this model shares with the VAE rather than "
-               "choosing freely. One beat then done; with a trigger "
+               "choosing freely, runtime LoRAs and a few-step adapter's "
+               "own schedule. One beat then done; with a trigger "
                "iport, one beat per inbound beat.",
   .display_name = "Qwen-Image-2.1 Model Config",
   .category  = StageCategory::ModelSpecificConfig,
@@ -133,6 +175,14 @@ QwenImage21ModelConfigStage::resolved_config() const
       fd.as_object().insert_or_assign(
           "use_kv_cache",
           FlexData::make_bool(in.at("use_kv_cache").as_bool(true)));
+    }
+    // The adapters and the schedule, on the same rule: written only when
+    // SET, so an unset key reads downstream as "no opinion" and not as a
+    // choice of the default.
+    auto o = fd.as_object();
+    for (const char* k : {"lora", "lora_scale", "lora2", "lora2_scale",
+                          "sigmas", "shift_terminal"}) {
+      if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
     }
   }
   // Emitted only when a preview VAE is named.

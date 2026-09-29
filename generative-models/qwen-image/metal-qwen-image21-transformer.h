@@ -13,6 +13,7 @@
 #include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/runtime-lora.h"
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/wired-pool.h"
@@ -156,13 +157,32 @@ class MetalQwenImage21Transformer {
   // the checkpoint is open (torchao's spelling already translated).
   static bool is_single_file_dit(const std::string& path);
 
+  // ---- runtime LoRA --------------------------------------------------
+  struct LoraSpec {
+    std::string path;          // one .safetensors of adapter factors
+    float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
+  };
+  // Two adapters at once -- a few-step distillation beside a style one
+  // -- each in its own slot so its strength stays a live knob.
+  static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
+
   static std::unique_ptr<MetalQwenImage21Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const std::vector<LoraSpec>& loras = {});
 
   static std::unique_ptr<MetalQwenImage21Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const std::vector<LoraSpec>& loras = {});
+
+  // LIVE. The strength rides the accumulating GEMM as a constant, so it
+  // can change between steps with no rebuild; exactly 0 encodes
+  // nothing, so "off" is off rather than two roundings that cancel.
+  void set_lora_scale(int slot, float s);
+  // How many projections each slot bound. 0 is what a test must refuse:
+  // an adapter for another model binds nothing and says so only here.
+  int lora_modules(int slot) const;
 
   // One forward. Returns the TARGET block's rows only --
   // [layout->target_len, out_channels] f32-convertible f16 -- because
@@ -407,6 +427,39 @@ class MetalQwenImage21Transformer {
   fp8::Layout   _f8;
   fp8::Expander _fp8x;
   mutable bool  _fp8_failed = false;
+
+  // ---- runtime LoRA ---------------------------------------------------
+  //
+  // One slot's factors for one block's seven projections, and for the
+  // model-level linears -- which this family's adapters DO train:
+  // Viggle's turbo adapts the shared modulation and both timestep
+  // Linears, and leaving those out would apply a distillation in part
+  // and say nothing. All of them run through the forward's one GEMM
+  // helper, so they are adapted the same way. Bound once at load; only
+  // the strength is live.
+  struct BlockLora {
+    lora::Factors q, k, v, o, gate, proj, out;
+  };
+  struct FixedLora {
+    lora::Factors img_in, txt_a, txt_b, time_1, time_2, mod, norm_out,
+        proj_out;
+  };
+  lora::Applier _lora;
+  std::vector<BlockLora> _lora_blk[kMaxLoraSlots];
+  FixedLora _lora_fix[kMaxLoraSlots];
+  float _lora_scale[kMaxLoraSlots] = {0.0f, 0.0f};
+  int _lora_bound[kMaxLoraSlots] = {0, 0};
+  int _lora_rank_prefix[kMaxLoraSlots] = {0, 0};
+  int _lora_rank_total = 0;
+  int _lora_slots = 0;
+  // Rows the [rows, rank] intermediate is sized for THIS forward -- the
+  // widest adapted GEMM's -- so a slot's base offset is rows * its rank
+  // prefix.
+  mutable std::size_t _lora_scratch_rows = 0;
+  bool bind_loras_(const std::vector<LoraSpec>& loras);
+  // The stack for one projection, empty when nothing is attached.
+  lora::Stack lora_blk_(int L, lora::Factors BlockLora::* which) const;
+  lora::Stack lora_fix_(lora::Factors FixedLora::* which) const;
   std::unique_ptr<MetalSageAttention> _sage;
   std::unique_ptr<MetalSolAttention> _sol;
   std::unique_ptr<AneFeedForward> _ane;

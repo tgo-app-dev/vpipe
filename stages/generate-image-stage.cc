@@ -307,15 +307,17 @@ const ConfigKey kAttrs[] = {
           "the weights, which for a quantized base is the difference "
           "between keeping a small correction and rounding it away. A "
           "registered model, a directory holding one .safetensors, or a "
-          "path to one. Krea-2 and FLUX.2 only. LOAD-time: it decides how "
+          "path to one. Krea-2, FLUX.2, Z-Image and Qwen-Image-2.1. "
+          "LOAD-time: it decides how "
           "the blocks are BUILT, so a beat that changes it once the DiT "
           "is up is reported and ignored. A `lora` on the family's "
           "model-config beat OVERRIDES this",
    .suggest_db = kModelRegistryDb,
-   // Both families this stage can adapt. A comma list so the picker
-   // offers either and refuses the rest -- a Krea-2 adapter on a FLUX.2
-   // DiT binds nothing and says so, but not until it has been fetched.
-   .suggest_db_type = "krea2-lora,flux2-lora",
+   // The catalogued families this stage can adapt. A comma list so the
+   // picker offers each and refuses the rest -- a Krea-2 adapter on a
+   // FLUX.2 DiT binds nothing and says so, but not until it has been
+   // fetched. (Z-Image has no catalogued adapter to offer.)
+   .suggest_db_type = "krea2-lora,flux2-lora,qwen-image-21-lora",
    // AND a file browser: a LoRA is as often a download sitting in
    // the sandbox (Civitai) as a catalogued model, and the editor
    // offers both pickers when a field carries both hints.
@@ -336,7 +338,7 @@ const ConfigKey kAttrs[] = {
           "same way. A `lora2` on the family's model-config beat "
           "OVERRIDES this",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2-lora,flux2-lora",
+   .suggest_db_type = "krea2-lora,flux2-lora,qwen-image-21-lora",
    // AND a file browser: a LoRA is as often a download sitting in
    // the sandbox (Civitai) as a catalogued model, and the editor
    // offers both pickers when a field carries both hints.
@@ -1170,6 +1172,11 @@ GenerateImageStage::reset_run_state()
   _zi_guidance  = 0.0;
   _zi_cfg_norm  = 0.0;
   _zi_cfg_trunc = 1.0;
+  // Qwen-Image-2.1's schedule keys, which carry no default of their own
+  // to argue about: a graph that stops naming a turbo schedule must not
+  // keep running it.
+  _qi21_sigmas.clear();
+  _qi21_shift_terminal = -1.0;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The preview keys too: a relaunch whose graph no longer names a
   // preview VAE must not inherit one.
@@ -1612,7 +1619,43 @@ GenerateImageStage::apply_model_config_()
       if (o.contains("use_kv_cache")) {
         _qi21_use_kv_cache = o.at("use_kv_cache").as_bool(true);
       }
+      // A schedule's raw sigma nodes: all in (0, 1], strictly falling.
+      // Anything else is refused rather than half-applied -- a wrong
+      // node is a different sampler that still produces a picture.
+      if (o.contains("sigmas")) {
+        const FlexData a = o.at("sigmas");
+        std::vector<double> v;
+        bool ok = a.is_array();
+        if (ok) {
+          auto arr = a.as_array();
+          for (std::size_t i = 0; i < arr.size(); ++i) {
+            const double x = arr.at(i).as_real(-1.0);
+            ok = ok && x > 0.0 && x <= 1.0 && (v.empty() || x < v.back());
+            v.push_back(x);
+          }
+        }
+        if (ok && !v.empty()) {
+          _qi21_sigmas = std::move(v);
+        } else {
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): model_config `sigmas` must be a "
+              "non-empty list of values in (0, 1], strictly falling; "
+              "IGNORED, the default schedule runs", this->id()));
+        }
+      }
+      if (o.contains("shift_terminal")) {
+        const double t = o.at("shift_terminal").as_real(-1.0);
+        if (t >= 0.0 && t < 1.0) { _qi21_shift_terminal = t; }
+      }
     }
+  }
+  if (_family == "qwen-image-21") {
+    adapter_keys("Qwen-Image-2.1", _qi21_dit != nullptr,
+                 [&](int i, float s) {
+                   if (_qi21_dit && _qi21_dit->lora_modules(i) > 0) {
+                     _qi21_dit->set_lora_scale(i, s);
+                   }
+                 });
   }
   if (_family == "flux2") {
     _flux2_params =
@@ -2523,7 +2566,8 @@ GenerateImageStage::load_qwen_image21_dit_()
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
   _qi21_dit = genai::MetalQwenImage21Transformer::load(
-      weight_set_(_qi21_dit_dir), mc, cfg, _qi21_stream);
+      weight_set_(_qi21_dit_dir), mc, cfg, _qi21_stream,
+      lora_specs_<genai::MetalQwenImage21Transformer::LoraSpec>());
   if (_qi21_dit && _qi21_stream) {
     session()->info(fmt(
         "GenerateImageStage('{}'): Qwen-Image-2.1 DiT streaming {} blocks; "
@@ -3645,6 +3689,23 @@ GenerateImageStage::generate_qwen_image21_(
     sched.base_seq = 256; sched.max_seq = 8192;
     sched.shift_terminal = 0.02;
     sched.steps = _steps > 0 ? _steps : 40;
+    // A few-step adapter's own schedule, when the model config names one:
+    // its raw nodes replace the default grid and ARE the step count; the
+    // shift is applied to them all the same.
+    if (!_qi21_sigmas.empty()) {
+      sched.base_sigmas = _qi21_sigmas;
+      sched.steps = (int)_qi21_sigmas.size();
+    }
+    if (_qi21_shift_terminal >= 0.0) {
+      sched.shift_terminal = _qi21_shift_terminal;
+    }
+  } else if (!_qi21_sigmas.empty() || _qi21_shift_terminal >= 0.0) {
+    // A wired scheduler beats the model config, as it does for steps --
+    // but a turbo adapter run on the default grid is a different
+    // sampler that still makes a picture, so say so.
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): a scheduler is wired, so the model "
+        "config's `sigmas` / `shift_terminal` are IGNORED", this->id()));
   }
   sched.img_seq_len = img_seq;
   genai::FlowSampler sampler(_sampler_spec, sched);
