@@ -12,6 +12,10 @@
 //                     (vpipe/stage-command.h)
 //   * Status          (vpipe/status.h)
 //
+// Specs, configs and command arguments go in as JSON text, or -- for a
+// host that builds them in code -- as FlexData documents
+// (common/flex-data.h, from the SDK), with no text written or parsed.
+//
 // Everything else (the implementation classes, the Stage type tree,
 // internal helpers) lives under non-installed headers and is reached
 // only by code linked into libvpipe itself.

@@ -56,6 +56,14 @@ inline constexpr std::string_view kFps = "fps";
 inline constexpr std::string_view kFrames = "frames";
 // This beat's frame index within that clip, from 0. Int.
 inline constexpr std::string_view kFrame = "frame";
+// The frame rate as a fraction, when it is exactly one (29.97 is
+// 30000/1001). Uint each. (The capture and decode stages have written
+// these spellings since before they were named here.)
+inline constexpr std::string_view kFpsNum = "fps_num";
+inline constexpr std::string_view kFpsDen = "fps_den";
+// This frame's presentation time in the file it was read from,
+// microseconds from the file's start. Int.
+inline constexpr std::string_view kPtsUs = "pts_us";
 // Latent frames per second of an AUDIO latent. Real.
 inline constexpr std::string_view kLatentsPerSecond = "latents_per_second";
 
@@ -65,6 +73,39 @@ inline constexpr std::string_view kLatentsPerSecond = "latents_per_second";
 inline constexpr std::string_view kContentBlocked = "content_blocked";
 inline constexpr std::string_view kRefusalWidth   = "refusal_width";
 inline constexpr std::string_view kRefusalHeight  = "refusal_height";
+
+// ---- what a picture's samples MEAN --------------------------------------
+//
+// A picture beat ([C,H,W] U8, F16 or F32) says how its samples are encoded,
+// as its source declared it, so a writer can tag the file it makes and
+// nothing is re-interpreted on the way. Absent keys mean what a picture
+// beat always meant: 8-bit RGB in sRGB (BT.709 primaries), straight
+// alpha. F16 and F32 samples run 0..1 over the source's code range in its own
+// transfer; a linear (scene- or display-linear) picture may exceed 1.
+//
+// ITU-T H.273 (CICP) code points, Uint, 2 = unspecified:
+// primaries 1 BT.709, 9 BT.2020, 12 Display P3; transfer 1 BT.709,
+// 8 linear, 13 sRGB, 16 PQ (ST 2084), 18 HLG; matrix -- the YCbCr matrix
+// the samples were decoded from, kept for re-encoding -- 0 RGB,
+// 1 BT.709, 6 BT.601, 9 BT.2020 NCL.
+inline constexpr std::string_view kColorPrimaries = "color_primaries";
+inline constexpr std::string_view kColorTransfer  = "color_transfer";
+inline constexpr std::string_view kColorMatrix    = "color_matrix";
+// Bool: the source's YCbCr was full range (the RGB samples always are).
+inline constexpr std::string_view kColorFullRange = "color_full_range";
+// "straight" | "premultiplied": how a 4-channel picture's colour relates
+// to its alpha. Absent = straight.
+inline constexpr std::string_view kAlphaMode = "alpha_mode";
+// Bits per sample of the source (8, 10, 12, 16; 16 or 32 for float
+// sources) -- what a writer can keep. Uint, informative.
+inline constexpr std::string_view kSourceBits = "source_bits";
+// HDR10 static metadata, as the source declared it. Mastering display
+// (SMPTE ST 2086): an array of 10 numbers -- red, green, blue, white
+// point x,y in units of 0.00002, then max and min luminance in units of
+// 0.0001 cd/m^2. Content light (CTA-861.3): [max_cll, max_fall] in
+// cd/m^2.
+inline constexpr std::string_view kMasteringDisplay = "mastering_display";
+inline constexpr std::string_view kContentLight     = "content_light";
 
 }  // namespace sideband
 

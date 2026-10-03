@@ -33,6 +33,11 @@
 #include "pipeline/stage-spec.h"
 #include "pipeline/typed-stage.h"
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/media/video-io.h"
+#include "apple-silicon/tensor-beat.h"
+#endif
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -159,6 +164,30 @@ wav_path_()
   return p;
 }
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// Three 16x16 ProRes frames for avf-load-video, written through the same
+// AVFoundation writer the stage reads back with.
+string
+mov_path_()
+{
+  const string p = tmpdir_() + "/vpipe-sweep.mov";
+  apple_media::VideoWriteOptions opt;
+  opt.codec = "prores422";
+  opt.width = 16;
+  opt.height = 16;
+  apple_media::VideoWriter w;
+  std::string err;
+  if (!w.open(p, opt, &err)) { return p; }
+  TensorBeat pic;
+  pic.dtype = TensorBeat::DType::U8;
+  pic.shape = {3, 16, 16};
+  pic.data.assign(3 * 16 * 16, 128);
+  for (int i = 0; i < 3; ++i) { w.write(pic, i, &err); }
+  w.finish(&err);
+  return p;
+}
+#endif
+
 }  // namespace
 
 // Launch `type` twice over ONE stage object and report the beats each
@@ -275,6 +304,10 @@ sweep_table_(size_t* n)
   static const string wav = wav_path_();
   static const string load_audio_cfg =
       "{\"input_url\":\"" + wav + "\"}";
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  static const string avf_load_video_cfg =
+      "{\"url\":\"" + mov_path_() + "\"}";
+#endif
 
   static const SweepEntry kSweep[] = {
     {"chrono", "{\"frequency_hz\":200,\"count\":3}", false, nullptr},
@@ -286,6 +319,9 @@ sweep_table_(size_t* n)
     {"load-image", load_image_cfg.c_str(), false, nullptr},
     {"load-text", load_text_cfg.c_str(), false, nullptr},
     {"load-audio", load_audio_cfg.c_str(), false, nullptr},
+#ifdef VPIPE_BUILD_APPLE_SILICON
+    {"avf-load-video", avf_load_video_cfg.c_str(), false, nullptr},
+#endif
 
     // The per-family model-config sources. One-shot emitters gated by a
     // `_done` flag, which is the exact shape this test exists for --
@@ -314,6 +350,9 @@ sweep_table_(size_t* n)
      "emits only when commanded; its relaunch is driven by "
      "stage_command.a_relaunch_starts_over"},
     {"load-video", "{}", true, "needs a decodable video fixture"},
+    {"tensor-list", "{}", true,
+     "a collector, not a source: its iports are all optional so any "
+     "subset can be wired, and with none it emits nothing"},
     {"audio-capture", "{}", true, "needs a capture device"},
     {"video-capture", "{}", true, "needs a camera"},
     {"rtsp-capture", "{}", true, "needs a reachable RTSP camera"},

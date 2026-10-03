@@ -563,20 +563,41 @@ collect_plugin_paths_(const FlexData& config)
   return paths;
 }
 
+Session::ParsedConfig
+Session::parse_config_(string_view cfg)
+{
+  try {
+    return {parse_session_config(cfg), {}};
+  } catch (const exception& e) {
+    return {FlexData::make_object(),
+            fmt("session config parse failed: {}", e.what())()};
+  }
+}
+
 Session::Session(string_view cfg)
-  : _config(FlexData::make_object())
+  : Session(parse_config_(cfg))
+{
+}
+
+Session::Session(const FlexData& cfg)
+  : Session(cfg.is_object() ? ParsedConfig{cfg, {}}
+            : cfg.is_null() ? ParsedConfig{FlexData::make_object(), {}}
+                            : ParsedConfig{FlexData::make_object(),
+                                           "session config is not an object"})
+{
+}
+
+Session::Session(ParsedConfig parsed)
+  : _config(std::move(parsed.config))
   , _delegate(make_unique<StdoutLogDelegate>(LogLevel::Normal))
   , _ui_delegate(make_unique<StdioUiDelegate>())
   , _db_map_size(DbLogDelegate::kDefaultMapSize)
 {
-  // Phase 1: parse config. Fail-soft: a parse error becomes a warning
-  // through the bootstrap stdout delegate, and we keep going with an
-  // empty config object.
-  try {
-    _config = parse_session_config(cfg);
-  } catch (const exception& e) {
-    warn(fmt("session config parse failed: {}; using defaults",
-             e.what()));
+  // Phase 1 (the caller's): the config document. Fail-soft: a config
+  // that could not be had becomes a warning through the bootstrap
+  // stdout delegate, and we keep going with an empty config object.
+  if (!parsed.error.empty()) {
+    warn(fmt("{}; using defaults", parsed.error));
     _config = FlexData::make_object();
     _pool = make_unique<ThreadPool>(default_workers(), this);
     attach_if_stdout_(_delegate.get(), this);
@@ -894,6 +915,12 @@ Session::load_pipeline(string_view spec_sv)
     return HandleAccess::make_pipeline(nullptr);
   }
 
+  return load_pipeline_spec(spec, std::move(storage));
+}
+
+PipelineHandle
+Session::load_pipeline_spec(const FlexData& spec, string storage)
+{
   auto pipeline = pipeline_from_spec(spec, this);
   if (!pipeline) {
     // pipeline_from_spec already logged the underlying cause.
@@ -911,6 +938,18 @@ Session::load_pipeline(string_view spec_sv)
     _pipelines.emplace(raw, std::move(impl));
   }
   return HandleAccess::make_pipeline(raw);
+}
+
+// SessionIntf's in-memory form. Non-virtual, so the interface's vtable is
+// what it was; every SessionIntf a caller holds is a Session made here.
+PipelineHandle
+SessionIntf::load_pipeline(const FlexData& spec)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return HandleAccess::make_pipeline(nullptr);
+  }
+  return s->load_pipeline_spec(spec);
 }
 
 PipelineHandle

@@ -404,4 +404,20 @@ StageHandle::command(string_view name, string_view args_json,
       open_stage_command(*s, name, std::move(args), std::move(in)));
 }
 
+CommandHandle
+StageHandle::command(string_view name, const FlexData& args,
+                     vector<DataBuffer> in) const
+{
+  Stage* s = _impl ? _impl->stage() : nullptr;
+  if (!s) {
+    return HandleAccess::make_command(
+        StageCommand::refused("null stage handle"));
+  }
+  // Null means no arguments, as an empty args_json does; anything else
+  // is checked against the command's declaration like parsed JSON is.
+  FlexData a = args.is_null() ? FlexData::make_object() : args;
+  return HandleAccess::make_command(
+      open_stage_command(*s, name, std::move(a), std::move(in)));
+}
+
 }

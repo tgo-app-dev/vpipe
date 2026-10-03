@@ -132,6 +132,19 @@ struct EncodedSegment {
   int color_primaries = 2;   // AVCOL_PRI_UNSPECIFIED
   int color_trc       = 2;   // AVCOL_TRC_UNSPECIFIED
 
+  // HOW FAR THE STREAM REORDERS, video only: frames a decoder must hold
+  // before its first output (AVCodecParameters::video_delay), as the
+  // demuxer measured it. 0 = not known.
+  //
+  // Carried for the same reason as the colour above. An H.264 SPS
+  // without VUI bitstream_restriction -- VideoToolbox writes none --
+  // leaves the decoder guessing a delay of 1, and on a deeper B-pyramid
+  // it discovers its mistake one frame late and DROPS the picture that
+  // came out of order. MEASURED: an h264_videotoolbox file with bf=2
+  // lost frame 1 of 33 through video-to-rgb (both slots) while ffmpeg,
+  // whose decoder is seeded from the stream, decoded all 33.
+  int video_delay = 0;
+
   std::vector<uint8_t> extradata;
   std::vector<uint8_t> data;
 };

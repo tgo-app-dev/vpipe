@@ -118,6 +118,24 @@ bool resample_lanczos_planar_u8_to_u8(
     std::uint8_t pad_r, std::uint8_t pad_g, std::uint8_t pad_b,
     const SessionContextIntf* session);
 
+// The element type of a float picture resample.
+enum class PlanarFloat { F16, F32 };
+
+// Resample of a planar float picture [C,in_h,in_w] -> [C,out_h,out_w] of
+// the same element type (resample_planar_float kernels), C 3 or 4, with
+// the fit mode + solid pad of the u8 ops above. `filter`: 0 bilinear,
+// 1 Lanczos-3 (PIL LANCZOS), 2 bicubic (PIL BICUBIC) -- the same
+// geometry and coefficient tables as image-resample's CPU path, which the
+// result matches to float rounding. Samples are never clamped (a linear
+// picture exceeds 1; the windowed filters ring). An RGBA picture
+// resamples PREMULTIPLIED inside the kernel and comes back straight.
+// `pad` is in the picture's units; its alpha is the pad's own.
+bool resample_planar_float(
+    MetalCompute& mc, const ExternalStorageHandle& src, PlanarFloat elt,
+    int channels, int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h, int mode, int src_x, int src_y, float scale,
+    int filter, const float pad[4], const SessionContextIntf* session);
+
 // Bilinear letterbox + RGB->BGRA pack into a kCVPixelFormatType_32BGRA
 // CVPixelBuffer (destination dims read off the pixel buffer).
 bool letterbox_planar_u8_to_bgra_cvpixelbuffer(

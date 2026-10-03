@@ -1,4 +1,9 @@
 #include "stages/save-image-stage.h"
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/media/color-tags.h"
+#include "apple-silicon/media/image-io.h"
+#endif
 #include "stages/model-provenance.h"
 
 #include "apple-silicon/tensor-beat.h"
@@ -150,6 +155,7 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
   _compression = (int)attr_int("compression");
   _lossless    = attr_bool("lossless");
   _no_overwrite = attr_bool("no_overwrite");
+  _software_host = attr_str("software_host");
   // The template is checked HERE, not at the first write: a misspelt
   // %t{...} is a config mistake and belongs in the editor's error line,
   // where it can still be fixed, rather than in a log the run produced
@@ -180,13 +186,37 @@ SaveImageStage::SaveImageStage(const SessionContextIntf* s,
   if (key.empty()) { key = lower_ext(_path); }
   if (key.empty()) { key = "png"; }
   const FormatDef* fd = lookup_format(key);
-  if (fd == nullptr) {
+  if (key == "exr") {
+    // OpenEXR is ImageIO's (Apple), not FFmpeg's.
+#ifdef VPIPE_BUILD_APPLE_SILICON
+    _format = "exr";
+#else
+    fail_config(fmt("SaveImageStage('{}'): exr needs the Apple build",
+                    this->id()));
+#endif
+  } else if (fd == nullptr) {
     fail_config(fmt(
         "SaveImageStage('{}'): unsupported format '{}' (want one of "
-        "png, jpeg, webp, bmp, tiff)", this->id(), key));
+        "png, jpeg, webp, bmp, tiff, exr)", this->id(), key));
   } else {
     _format = fd->key;
   }
+  _bit_depth = (int)attr_int("bit_depth");
+  if (_bit_depth != 0 && _bit_depth != 8 && _bit_depth != 16) {
+    fail_config(fmt("SaveImageStage('{}'): bit_depth must be 0, 8 or 16",
+                    this->id()));
+  }
+  if (_bit_depth == 16 && _format != "png" && _format != "tiff" &&
+      _format != "tif") {
+    fail_config(fmt("SaveImageStage('{}'): 16 bits is for png and tiff",
+                    this->id()));
+  }
+#ifndef VPIPE_BUILD_APPLE_SILICON
+  if (_bit_depth == 16) {
+    fail_config(fmt("SaveImageStage('{}'): 16 bits needs the Apple build",
+                    this->id()));
+  }
+#endif
   if (!_libs || !_libs->valid()) {
     fail_config(fmt(
         "SaveImageStage('{}'): FFmpegLibraries unavailable", this->id()));
@@ -200,7 +230,10 @@ namespace {
 // of the two aliased formats are offered, because both are accepted and
 // a config may hold either.
 constexpr SpecExtra kFormatChoices[] = {
-  {spec_key::kChoices, "png,jpeg,jpg,webp,bmp,tiff,tif"},
+  {spec_key::kChoices, "png,jpeg,jpg,webp,bmp,tiff,tif,exr"},
+};
+constexpr SpecExtra kBitDepthChoices[] = {
+  {spec_key::kChoices, "0,8,16"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,
@@ -209,15 +242,29 @@ constexpr ConfigKey kAttrs[] = {
           "local time (%t{...} takes a strftime format); without a "
           "conversion later images get a -NNNNNN suffix",
    .is_path = true, .path_write = true, .path_filter = "image"},
+  {.key = "software_host", .type = ConfigType::String, .required = false,
+   .doc = "the application that ran the graph, as it names itself "
+          "(\"ExampleApp 1.0\"). A generated image's EXIF Software then "
+          "reads \"<host> (Vpipe <version> <hash> with <model>)\". An "
+          "image no model made is left unmarked either way",
+   .def_str = ""},
   {.key = "no_overwrite", .type = ConfigType::Bool, .required = false,
    .doc = "never write over a file that already exists: the sequence "
           "number starts past every name on disk instead of at 0. Off by "
           "default, because the usual graph wants the same name rewritten "
           "each run", .def_bool = false},
   {.key = "format", .type = ConfigType::String, .required = false,
-   .doc = "png | jpeg (jpg) | webp | bmp | tiff; default from the path "
-          "extension, else png",
+   .doc = "png | jpeg (jpg) | webp | bmp | tiff | exr; default from the "
+          "path extension, else png. exr (OpenEXR, half float, linear "
+          "light) is written by ImageIO",
    .extra = kFormatChoices},
+  {.key = "bit_depth", .type = ConfigType::Int, .required = false,
+   .doc = "png / tiff bits per component: 8 or 16; 0 (the default) "
+          "follows the picture -- 16 for an F16 picture, 8 for U8. 16 "
+          "bits, OpenEXR and any F16 picture are encoded by ImageIO with "
+          "the colour space the picture is tagged with (sideband "
+          "color_primaries / color_transfer)",
+   .def_int = 0, .extra = kBitDepthChoices},
   {.key = "quality", .type = ConfigType::Int, .required = false,
    .doc = "lossy codecs (jpeg, lossy webp): 1..100, higher is better "
           "(default 90)"},
@@ -227,9 +274,8 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "webp lossless mode (default false)"},
 };
 const PortSpec kIports[] = {
-  {.name = "image", .doc = "planar U8 RGB [3,H,W] or RGBA [4,H,W] "
-          "TensorBeat (load-image / "
-                           "vae-decode format)",
+  {.name = "image", .doc = "planar RGB [3,H,W] or RGBA [4,H,W] "
+          "TensorBeat, U8 or F16 (load-image / vae-decode format)",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
   {.name = "metadata", .doc = "OPTIONAL FlexData carrying exif_tiff_b64 (as "
@@ -267,19 +313,74 @@ SaveImageStage::av_err_(int rc) const
 }
 
 bool
+SaveImageStage::encode_apple_(const TensorBeat& pic,
+                              std::vector<std::uint8_t>* bytes)
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  apple_media::StillWriteOptions opt;
+  opt.format = _format == "tif" ? "tiff" : _format;
+  opt.bits = _bit_depth != 0 ? _bit_depth
+           : pic.dtype == TensorBeat::DType::F16 ? 16 : 8;
+  opt.quality = _quality / 100.0;
+  string err;
+  if (!apple_media::encode_still(pic,
+                                 apple_media::ColorTags::read(pic.sideband),
+                                 opt, bytes, &err)) {
+    session()->error(fmt("SaveImageStage('{}'): {}", this->id(), err));
+    return false;
+  }
+  return true;
+#else
+  (void)pic;
+  (void)bytes;
+  return false;
+#endif
+}
+
+bool
 SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
                         std::span<const std::uint8_t> exif_tiff)
 {
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(&beat);
-  if (tbp == nullptr || tbp->dtype != TensorBeat::DType::U8 ||
+  if (tbp == nullptr ||
+      (tbp->dtype != TensorBeat::DType::U8 &&
+       tbp->dtype != TensorBeat::DType::F16) ||
       tbp->shape.size() != 3 ||
       (tbp->shape[0] != 3 && tbp->shape[0] != 4)) {
     session()->warn(fmt(
-        "SaveImageStage('{}'): expected a U8 [3,H,W] RGB or [4,H,W] RGBA "
-        "TensorBeat, got {}; dropping beat", this->id(),
+        "SaveImageStage('{}'): expected a U8 or F16 [3,H,W] RGB or "
+        "[4,H,W] RGBA TensorBeat, got {}; dropping beat", this->id(),
         beat.describe()));
     return false;
   }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // As deep as the picture, OpenEXR, or F16: ImageIO, the colour kept.
+  if (_format == "exr" || _bit_depth == 16 ||
+      tbp->dtype == TensorBeat::DType::F16) {
+    std::vector<std::uint8_t> bytes;
+    if (!encode_apple_(*tbp, &bytes)) { return false; }
+    if (!exif_tiff.empty()) {
+      const bool ok =
+          (_format == "png")  ? imgmeta::png_set_exif(bytes, exif_tiff)
+        : (_format == "tiff" || _format == "tif")
+                              ? imgmeta::tiff_set_exif(bytes, exif_tiff)
+                              : imgmeta::jpeg_set_exif(bytes, exif_tiff);
+      if (!ok) {
+        session()->warn(fmt(
+            "SaveImageStage('{}'): could not write EXIF into '{}' ({}); "
+            "the image is still written without it", this->id(), out_path,
+            _format));
+      }
+    }
+    return write_file_(bytes, out_path);
+  }
+#else
+  if (tbp->dtype != TensorBeat::DType::U8) {
+    session()->warn(fmt("SaveImageStage('{}'): F16 pictures need the Apple "
+                        "build; dropping beat", this->id()));
+    return false;
+  }
+#endif
   const int CH = (int)tbp->shape[0];
   const int H = (int)tbp->shape[1];
   const int W = (int)tbp->shape[2];
@@ -482,6 +583,13 @@ SaveImageStage::encode_(const BeatPayloadIntf& beat, const string& out_path,
     }
   }
 
+  return write_file_(bytes, out_path);
+}
+
+bool
+SaveImageStage::write_file_(const std::vector<std::uint8_t>& bytes,
+                            const string& out_path)
+{
   namespace fs = std::filesystem;
   std::error_code ec;
   const fs::path parent = fs::path(out_path).parent_path();
@@ -589,8 +697,11 @@ SaveImageStage::process(RuntimeContext& ctx)
     const std::string model = itb != nullptr
         ? provenance::model_name(itb->sideband) : std::string();
     if (!model.empty()) {
-      exif_tiff = imgmeta::exif_set_software(
-          exif_tiff, provenance::software_string(model));
+      // A host names itself first, and vpipe's line is in brackets: the
+      // application made the image, with vpipe and that model.
+      std::string sw = provenance::software_string(model);
+      if (!_software_host.empty()) { sw = _software_host + " (" + sw + ")"; }
+      exif_tiff = imgmeta::exif_set_software(exif_tiff, sw);
     }
   }
 

@@ -58,6 +58,15 @@ public:
   // Status{1} until a path-taking `store_pipeline` sets one.
   virtual PipelineHandle load_pipeline(std::string_view spec) = 0;
 
+  // Load a pipeline from a spec document already in memory -- the
+  // document the JSON form parses into -- so a host that builds its
+  // graphs in code skips writing and re-parsing JSON. Otherwise as
+  // above: a null handle on failure, reported through the log delegate;
+  // no storage path. Needs common/flex-data.h. (Non-virtual: the library
+  // implements it for the sessions it creates, and the interface's
+  // vtable stays as it was.)
+  PipelineHandle load_pipeline(const FlexData& spec);
+
   // Create a new empty pipeline with the given id. The returned
   // handle is owned by this session and remains valid until the
   // session is destroyed or `unload_pipeline` is called on it.

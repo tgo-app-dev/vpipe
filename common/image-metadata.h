@@ -99,6 +99,13 @@ exif_set_software(std::span<const std::uint8_t> base,
 // on a format it cannot annotate.
 bool format_supports_exif(std::string_view format);
 
+// Set IFD0's Orientation (0x0112) in a TIFF/EXIF block, in place. For a
+// picture whose decoder already turned it upright -- a developed camera
+// RAW -- the carried EXIF must say 1, or every viewer turns it again.
+// False when the block has no Orientation entry to set (nothing to undo).
+bool exif_set_orientation(std::vector<std::uint8_t>& tiff,
+                          std::uint16_t              value);
+
 }  // namespace imgmeta
 }  // namespace vpipe
 

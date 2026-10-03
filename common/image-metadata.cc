@@ -336,9 +336,14 @@ collect_ifd_(const Tiff& src, std::size_t src_off,
     OutEntry oe;
     oe.tag = tag; oe.type = type; oe.count = count;
 
-    if (tag == 0x8769 || tag == 0x8825) {
-      // Sub-IFD: copy it wholesale (never structural-filtered -- an Exif IFD
-      // has no pixel-layout tags) and point at its new home.
+    if (tag == 0x8769 || tag == 0x8825 || tag == 0xA005) {
+      // Sub-IFD -- Exif, GPS, or the Interoperability IFD the Exif IFD
+      // points at: copy it wholesale (never structural-filtered -- none has
+      // pixel-layout tags) and point at its new home. Copied as a plain
+      // LONG, 0xA005 kept the SOURCE's offset and pointed into whatever
+      // the new block held there: MEASURED on a Canon CR2, whose block
+      // read back with a 62506-entry Interop IFD (ffmpeg: "not enough bytes
+      // remaining in EXIF buffer"). Most camera JPEGs carry one too.
       std::vector<OutEntry> sub;
       if (!collect_ifd_(src, src.u32(e + 8), dst, dst_le,
                         /*skip_structural=*/false, sub, depth + 1)) {
@@ -789,6 +794,35 @@ format_supports_exif(std::string_view format)
 {
   return format == "jpeg" || format == "jpg" || format == "png"
       || format == "tiff" || format == "tif";
+}
+
+bool
+exif_set_orientation(std::vector<std::uint8_t>& tiff, std::uint16_t value)
+{
+  if (tiff.size() < 8) { return false; }
+  Tiff t{tiff, true};
+  if (tiff[0] == 'I' && tiff[1] == 'I')      { t.little = true; }
+  else if (tiff[0] == 'M' && tiff[1] == 'M') { t.little = false; }
+  else { return false; }
+  if (t.u16(2) != 42) { return false; }
+  const std::size_t ifd = t.u32(4);
+  if (ifd + 2 > tiff.size()) { return false; }
+  const std::size_t n = t.u16(ifd);
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::size_t e = ifd + 2 + 12 * i;
+    if (e + 12 > tiff.size()) { break; }
+    // One SHORT, stored in the entry itself: the only shape the spec
+    // allows for Orientation.
+    if (t.u16(e) != 0x0112 || t.u16(e + 2) != 3 || t.u32(e + 4) != 1) {
+      continue;
+    }
+    tiff[e + 8] = t.little ? (std::uint8_t)(value & 0xff)
+                           : (std::uint8_t)(value >> 8);
+    tiff[e + 9] = t.little ? (std::uint8_t)(value >> 8)
+                           : (std::uint8_t)(value & 0xff);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace imgmeta

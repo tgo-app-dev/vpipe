@@ -12,6 +12,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/image-decode.h"
 #include "stages/model-config-source.h"
 #include "stages/model-registry.h"
 
@@ -122,10 +123,12 @@ const PortSpec kIports[] = {
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_image", .doc = "OPTIONAL raw reference image, load-image "
-                               "format: planar U8 RGB [3,H,W], or RGBA "
+                               "format: planar RGB [3,H,W], or RGBA "
                                "[4,H,W] which is composited over white for "
                                "the vision tower (the VAE encoder alongside "
-                               "keeps the alpha). Image-aware families "
+                               "keeps the alpha). U8, or F16 / F32 in 0..1, "
+                               "rounded to 8 bits for the tower (the VAE "
+                               "keeps them deep). Image-aware families "
                                "(Qwen-Image-Edit) run it through the "
                                "Qwen2.5-VL vision tower; others ignore it.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
@@ -150,7 +153,8 @@ const PortSpec kIports[] = {
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
   {.name = "ref_images",
-   .doc = "OPTIONAL reference images as ONE LIST (load-image's `images`): "
+   .doc = "OPTIONAL reference images as ONE LIST (load-image's `images`, "
+          "or tensor-list's `list` of resampled pictures): "
           "as many as the graph has, each in ref_image's format and at its "
           "own size. They follow whatever is on ref_image / ref_image2, in "
           "list order, and an image-aware family sees them all -- one that "
@@ -3412,12 +3416,14 @@ DiffusionConditionerStage::process_vosr_(RuntimeContext& ctx)
   auto rb = co_await ctx.read(kRefPort);
   if (!rb) { ctx.signal_done(); co_return; }
   const auto* tb = dynamic_cast<const TensorBeatPayload*>(rb.get());
-  if (tb == nullptr || tb->dtype != TensorBeat::DType::U8 ||
-      tb->shape.size() != 3 || tb->shape[0] != 3 || tb->shape[1] <= 0 ||
-      tb->shape[2] <= 0) {
+  // DINOv2 reads 8 bits: an F16 / F32 picture (0..1) is rounded to them.
+  std::vector<std::uint8_t> bytes;
+  if (tb == nullptr || tb->shape.size() != 3 || tb->shape[0] != 3 ||
+      tb->shape[1] <= 0 || tb->shape[2] <= 0 ||
+      !picture_bytes_u8(*tb, &bytes)) {
     session()->warn(fmt(
-        "DiffusionConditionerStage('{}'): expected a planar U8 RGB [3,H,W] "
-        "TensorBeat, got {}; dropping beat", this->id(),
+        "DiffusionConditionerStage('{}'): expected a planar RGB [3,H,W] "
+        "TensorBeat (U8, F16 or F32), got {}; dropping beat", this->id(),
         rb->describe()));
     co_return;
   }
@@ -3425,7 +3431,6 @@ DiffusionConditionerStage::process_vosr_(RuntimeContext& ctx)
   if (_dinov2 == nullptr) { co_return; }
 
   const int H = (int)tb->shape[1], W = (int)tb->shape[2];
-  const auto bytes = tb->materialize_contiguous();
   int n_tok = 0;
   SharedBuffer tokens =
       _dinov2->encode_rgb(bytes.data(), H, W, _dino_size, &n_tok);
@@ -3555,14 +3560,17 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   auto take_picture = [&](const TensorBeat& tb, RefImage& dst,
                           const std::string& what) {
     dst = RefImage{};
-    if (tb.dtype != TensorBeat::DType::U8 || tb.shape.size() != 3 ||
-        (tb.shape[0] != 3 && tb.shape[0] != 4)) {
+    // THE VISION TOWER READS 8 BITS -- its preprocessing rescales bytes --
+    // so an F16 or F32 picture (0..1: a deep or RAW reference, kept deep
+    // for the VAE beside it) is rounded to them here, and only here.
+    std::vector<std::uint8_t> bytes;
+    if (tb.shape.size() != 3 || (tb.shape[0] != 3 && tb.shape[0] != 4) ||
+        !picture_bytes_u8(tb, &bytes)) {
       session()->warn(fmt(
-          "DiffusionConditionerStage('{}'): {} must be a planar U8 RGB or "
-          "RGBA picture; ignoring it", this->id(), what));
+          "DiffusionConditionerStage('{}'): {} must be a planar RGB or "
+          "RGBA picture (U8, F16 or F32); ignoring it", this->id(), what));
       return;
     }
-    const auto bytes = tb.materialize_contiguous();
     const int rh = (int)tb.shape[1], rw = (int)tb.shape[2];
     if (tb.shape[0] == 4) {
       // THE VISION TOWER TAKES RGB, so an RGBA reference is

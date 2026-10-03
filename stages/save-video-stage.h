@@ -145,6 +145,12 @@ private:
   // the only thing that may send one.
   void flush_pcm_tail_();
   void drain_encoder_(AVCodecContext* enc, AVStream* st);
+  // A reordering video encoder's packets, dts repaired; see
+  // drain_encoder_.
+  bool video_reorders_() const;
+  void settle_video_dts_();
+  void write_video_packet_(AVPacket* pkt);
+  void free_held_video_();
   void finalize_();
   // Free the muxer/encoder objects (finalizing first if needed).
   // Shared by the destructor and the per-launch reset.
@@ -237,6 +243,16 @@ private:
   std::vector<float> _apcm_join;
 
   int _next_port = 0;
+
+  // DTS REPAIR for a video encoder that reorders (drain_encoder_): its
+  // first packets wait in `_vheld` until the shift their dts need is
+  // known, in the stream's time base. Per run.
+  std::vector<AVPacket*> _vheld;
+  std::int64_t _vdts_shift   = 0;
+  bool         _vdts_settled = false;
+  std::int64_t _vlast_dts    = 0;
+  bool         _vlast_valid  = false;
+  bool         _vdts_guessed = false;
 };
 
 }

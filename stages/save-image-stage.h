@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_SAVE_IMAGE_STAGE_H
 #define VPIPE_STAGES_SAVE_IMAGE_STAGE_H
 
+#include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -84,6 +85,19 @@ private:
 
   bool            _no_overwrite = false;
   outpath::Tokens _tok;         // which template tokens `path` carries
+  // Who ran the graph ("ExampleApp 1.0"): written ahead of vpipe's own
+  // line in EXIF Software, which then goes in brackets.
+  std::string     _software_host;
+  // 8 or 16 bits per component for png / tiff; 0 = from the picture
+  // (16 for F16, 8 for U8). 16 bits, OpenEXR and F16 pictures are
+  // encoded by ImageIO (Apple), with the colour the picture is tagged.
+  int             _bit_depth = 0;
+
+  // The ImageIO path: a picture as deep as it is, its colour embedded.
+  bool encode_apple_(const TensorBeat& pic,
+                     std::vector<std::uint8_t>* bytes);
+  bool write_file_(const std::vector<std::uint8_t>& bytes,
+                   const std::string& out_path);
 
   const FFmpegLibraries* _libs = nullptr;
   // The filename index lives in the picker now (it was `_seen`), so the

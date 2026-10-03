@@ -371,3 +371,130 @@ TEST(image_metadata, empty_software_is_a_no_op) {
   ASSERT_TRUE(blk.size() == base.size());
   EXPECT_TRUE(std::memcmp(blk.data(), base.data(), base.size()) == 0);
 }
+
+// A developed camera RAW comes out upright, so the EXIF carried with it
+// is set to Orientation 1 -- in place, every other tag untouched, in
+// either byte order.
+TEST(image_metadata, orientation_is_set_in_place) {
+  auto t = make_tiff_();
+  const std::size_t size = t.size();
+  EXPECT_TRUE(exif_set_orientation(t, 8));
+  EXPECT_TRUE(t.size() == size);
+  FlexData p = parse_exif(t);
+  ASSERT_TRUE(p.is_object());
+  if (!p.is_object()) { return; }
+  EXPECT_TRUE(p.as_object().at("Orientation").as_uint() == 8);
+  EXPECT_TRUE(std::string(p.as_object().at("Make").as_string()) == "VPIPE");
+  EXPECT_TRUE(exif_set_orientation(t, 1));
+  EXPECT_TRUE(parse_exif(t).as_object().at("Orientation").as_uint() == 1);
+
+  // Big-endian: one IFD holding only Orientation = 6.
+  std::vector<std::uint8_t> be = {
+    'M', 'M', 0, 42, 0, 0, 0, 8,
+    0, 1,                                  // one entry
+    0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0,
+    0, 0, 0, 0,                            // no next IFD
+  };
+  EXPECT_TRUE(exif_set_orientation(be, 1));
+  EXPECT_TRUE(parse_exif(be).as_object().at("Orientation").as_uint() == 1);
+
+  // Nothing to set: no Orientation entry, or not a TIFF block.
+  std::vector<std::uint8_t> none = {
+    'I', 'I', 42, 0, 8, 0, 0, 0,
+    0, 0,                                  // no entries
+    0, 0, 0, 0,
+  };
+  EXPECT_FALSE(exif_set_orientation(none, 1));
+  std::vector<std::uint8_t> junk = {1, 2, 3};
+  EXPECT_FALSE(exif_set_orientation(junk, 1));
+}
+
+// The Interoperability IFD (0xA005, inside the Exif IFD) is a pointer
+// like the Exif and GPS ones, and must be relocated with the block.
+// Copied as a plain LONG it kept its old offset -- into whatever the new
+// block held there -- which a Canon CR2's EXIF did on its way into a
+// JPEG, and which most camera JPEGs (they carry one) did through the
+// Software stamp.
+namespace {
+
+// IFD0 {Make "VPIPE", ExifIFD} -> Exif {ISO 100, InteropIFD} -> Interop
+// {InteroperabilityIndex "R98"}, little-endian. The Interop IFD sits
+// BEFORE the Exif IFD, so an offset kept from here lands elsewhere in any
+// re-laid-out block:
+//    0  header            8  IFD0 (2 entries)    38  "VPIPE\0"
+//   44  Interop IFD (1)  62  pad                 64  Exif IFD (2)   94 end
+std::vector<std::uint8_t>
+make_interop_tiff_()
+{
+  std::vector<std::uint8_t> t(94, 0);
+  auto put16 = [&](std::size_t o, std::uint16_t v) {
+    t[o] = (std::uint8_t)v; t[o + 1] = (std::uint8_t)(v >> 8);
+  };
+  auto put32 = [&](std::size_t o, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) { t[o + i] = (std::uint8_t)(v >> (8 * i)); }
+  };
+  auto entry = [&](std::size_t o, std::uint16_t tag, std::uint16_t type,
+                   std::uint32_t count, std::uint32_t value) {
+    put16(o, tag); put16(o + 2, type); put32(o + 4, count);
+    put32(o + 8, value);
+  };
+  t[0] = 'I'; t[1] = 'I'; put16(2, 42); put32(4, 8);
+  put16(8, 2);
+  entry(10, 0x010F, 2, 6, 38);              // Make -> "VPIPE\0"
+  entry(22, 0x8769, 4, 1, 64);              // ExifIFD
+  put32(34, 0);
+  std::memcpy(t.data() + 38, "VPIPE", 6);
+  put16(44, 1);
+  entry(46, 0x0001, 2, 4, 0);               // InteroperabilityIndex,
+  std::memcpy(t.data() + 54, "R98", 4);     // "R98\0" inline
+  put32(58, 0);
+  put16(64, 2);
+  entry(66, 0x8827, 3, 1, 100);             // ISOSpeedRatings
+  entry(78, 0xA005, 4, 1, 44);              // InteropIFD
+  put32(90, 0);
+  return t;
+}
+
+// Follow IFD0 -> Exif -> Interop in a block; the InteroperabilityIndex
+// string, or empty when a pointer leads nowhere sensible.
+std::string
+interop_index_(const std::vector<std::uint8_t>& t)
+{
+  auto u16 = [&](std::size_t o) -> std::uint32_t {
+    return o + 2 <= t.size() ? (std::uint32_t)(t[o] | (t[o + 1] << 8)) : 0;
+  };
+  auto u32 = [&](std::size_t o) -> std::uint32_t {
+    if (o + 4 > t.size()) { return 0; }
+    return (std::uint32_t)t[o] | ((std::uint32_t)t[o + 1] << 8) |
+           ((std::uint32_t)t[o + 2] << 16) | ((std::uint32_t)t[o + 3] << 24);
+  };
+  auto find = [&](std::size_t ifd, std::uint16_t tag) -> std::size_t {
+    const std::uint32_t n = u16(ifd);
+    if (n == 0 || ifd + 2 + 12 * n > t.size()) { return 0; }
+    for (std::uint32_t i = 0; i < n; ++i) {
+      if (u16(ifd + 2 + 12 * i) == tag) { return ifd + 2 + 12 * i; }
+    }
+    return 0;
+  };
+  const std::size_t ex = find(u32(4), 0x8769);
+  if (ex == 0) { return {}; }
+  const std::size_t io = find(u32(ex + 8), 0xA005);
+  if (io == 0) { return {}; }
+  const std::size_t idx = find(u32(io + 8), 0x0001);
+  if (idx == 0 || u32(idx + 4) != 4) { return {}; }
+  return std::string(reinterpret_cast<const char*>(t.data() + idx + 8));
+}
+
+}  // namespace
+
+TEST(image_metadata, interop_ifd_is_relocated) {
+  const auto src = make_interop_tiff_();
+  EXPECT_TRUE(interop_index_(src) == "R98");   // the fixture is sound
+  const auto out = exif_set_software(src, "vpipe test");
+  EXPECT_TRUE(out.size() != src.size());       // re-laid out, not copied
+  std::printf("[image_metadata] interop index after relocation: '%s'\n",
+              interop_index_(out).c_str());
+  EXPECT_TRUE(interop_index_(out) == "R98");
+  EXPECT_TRUE(std::string(parse_exif(out).as_object().at("Software")
+                              .as_string("")) == "vpipe test");
+}

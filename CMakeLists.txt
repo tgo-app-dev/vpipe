@@ -275,13 +275,24 @@ if(VPIPE_SOURCES)
         # weak-import-aware and falls back to default-constructed
         # values when dyld returns null. vpipe itself never reads
         # them.
+        # AVFoundation, CoreMedia, VideoToolbox, ImageIO, CoreGraphics:
+        # the Apple-native media path (apple-silicon/media) -- ProRes,
+        # HEVC Main10/HDR, OpenEXR and 16-bit stills; CoreImage and
+        # UniformTypeIdentifiers: camera RAW, developed.
         target_link_libraries(vpipe_link INTERFACE
             "-framework Accelerate"
+            "-framework AVFoundation"
+            "-framework CoreGraphics"
+            "-framework CoreImage"
+            "-framework CoreMedia"
             "-framework CoreML"
             "-framework CoreVideo"
             "-framework Foundation"
+            "-framework ImageIO"
             "-framework IOKit"
             "-framework Metal"
+            "-framework UniformTypeIdentifiers"
+            "-framework VideoToolbox"
             metal_cpp_foundation)
         target_link_options(vpipe_link INTERFACE
             "LINKER:-undefined,dynamic_lookup")

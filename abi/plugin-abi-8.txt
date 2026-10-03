@@ -2080,6 +2080,7 @@ vpipe::CommandHandle::error() const
 vpipe::CommandHandle::id() const
 vpipe::CommandHandle::ok() const
 vpipe::CommandHandle::operator=(vpipe::CommandHandle&&)
+vpipe::CommandHandle::result() const
 vpipe::CommandHandle::result_json() const
 vpipe::CommandHandle::state() const
 vpipe::CommandHandle::wait(int) const
@@ -2296,6 +2297,8 @@ vpipe::RuntimeContext::write(unsigned int, std::__1::unique_ptr<vpipe::BeatPaylo
 vpipe::RuntimeContext::write_sync(unsigned int, std::__1::unique_ptr<vpipe::BeatPayloadIntf, std::__1::default_delete<vpipe::BeatPayloadIntf>>)
 vpipe::RuntimeContext::~RuntimeContext()
 vpipe::SessionContextIntf::services() const
+vpipe::SessionIntf::load_pipeline(vpipe::FlexData const&)
+vpipe::SessionManager::create_session(vpipe::FlexData const&)
 vpipe::SessionManager::get()
 vpipe::SessionMember::SessionMember(vpipe::SessionContextIntf const*)
 vpipe::SessionMember::session() const
@@ -2350,6 +2353,7 @@ vpipe::StageCommand::until_closed()
 vpipe::StageCommand::wait(int) const
 vpipe::StageCommand::wake_closer_(std::__1::coroutine_handle<void>)
 vpipe::StageHandle::command(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::vector<vpipe::DataBuffer, std::__1::allocator<vpipe::DataBuffer>>) const
+vpipe::StageHandle::command(std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::FlexData const&, std::__1::vector<vpipe::DataBuffer, std::__1::allocator<vpipe::DataBuffer>>) const
 vpipe::StageHandle::commands_json() const
 vpipe::StageHandle::config_schema_json() const
 vpipe::StageHandle::id() const
@@ -3179,14 +3183,25 @@ vpipe::model_memory::kPhaseDecodeAudio = "decode-audio"
 vpipe::model_memory::kPhaseDenoise = "denoise"
 vpipe::model_memory::kScratchKind = "activation-scratch"
 vpipe::model_memory::kWeightsKind = "model-weights"
+vpipe::sideband::kAlphaMode = "alpha_mode"
+vpipe::sideband::kColorFullRange = "color_full_range"
+vpipe::sideband::kColorMatrix = "color_matrix"
+vpipe::sideband::kColorPrimaries = "color_primaries"
+vpipe::sideband::kColorTransfer = "color_transfer"
 vpipe::sideband::kContentBlocked = "content_blocked"
+vpipe::sideband::kContentLight = "content_light"
 vpipe::sideband::kFps = "fps"
+vpipe::sideband::kFpsDen = "fps_den"
+vpipe::sideband::kFpsNum = "fps_num"
 vpipe::sideband::kFrame = "frame"
 vpipe::sideband::kFrames = "frames"
 vpipe::sideband::kLatentsPerSecond = "latents_per_second"
+vpipe::sideband::kMasteringDisplay = "mastering_display"
 vpipe::sideband::kModelName = "model_name"
+vpipe::sideband::kPtsUs = "pts_us"
 vpipe::sideband::kRefusalHeight = "refusal_height"
 vpipe::sideband::kRefusalWidth = "refusal_width"
+vpipe::sideband::kSourceBits = "source_bits"
 vpipe::spec_key::kCategory = "category"
 vpipe::spec_key::kChoices = "choices"
 vpipe::spec_key::kSince = "since"

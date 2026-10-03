@@ -8,8 +8,10 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/ffmpeg-libraries.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace vpipe {
 
@@ -35,6 +37,14 @@ decode_image_file(const FFmpegLibraries* libs, const std::string& url,
 // open. Cheap next to a decode only in that nothing is converted.
 bool probe_image_size(const FFmpegLibraries* libs, const std::string& url,
                       int* w, int* h, std::string* err);
+
+// A planar picture [C,H,W] as tight planar U8 bytes, for a consumer
+// whose model reads 8 bits (a vision tower's preprocessing rescales
+// bytes): U8 as it is, F16 and F32 -- 0..1 by the picture convention --
+// rounded, values outside 0..1 clamped. False for another dtype or a
+// shape that is not [C,H,W].
+bool picture_bytes_u8(const TensorBeat& pic,
+                      std::vector<std::uint8_t>* out);
 
 }  // namespace vpipe
 

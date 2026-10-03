@@ -1,0 +1,153 @@
+{
+  "id": "qwen-image-2.1-multi-ref",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Qwen/Qwen-Image-2.1"
+      }
+    },
+    {
+      "id": "load-image-1",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [ "minimax-h3-reference-subject.jpg" ]
+      }
+    },
+    {
+      "id": "load-image-2",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [ "klein-multi-ref-panda.jpg" ]
+      }
+    },
+    {
+      "id": "image-resample-1",
+      "type": "image-resample",
+      "iports": [
+        { "src": "load-image-1", "oport": 0 }
+      ],
+      "config": {
+        "width": 1024,
+        "height": 1024,
+        "fit": "crop",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "image-resample-2",
+      "type": "image-resample",
+      "iports": [
+        { "src": "load-image-2", "oport": 0 }
+      ],
+      "config": {
+        "width": 768,
+        "height": 768,
+        "fit": "crop",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "references",
+      "type": "tensor-list",
+      "iports": [
+        { "src": "image-resample-1", "oport": 0 },
+        { "src": "image-resample-2", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "The orange tabby cat wearing the navy velvet jacket from image 1 sits beside the giant panda from image 2 on a mossy rock in a misty bamboo forest."
+      }
+    },
+    {
+      "id": "qwen-image-21-model-config",
+      "type": "qwen-image-21-model-config",
+      "iports": [],
+      "config": {}
+    },
+    {
+      "id": "scheduler-select",
+      "type": "scheduler-select",
+      "iports": [],
+      "config": {
+        "steps": 20
+      }
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "references", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 },
+        { "src": "references", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "scheduler-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 },
+        { "src": "vae-encode", "oport": 1 }
+      ],
+      "config": {
+        "height": 1024,
+        "width": 1024,
+        "steps": 20,
+        "seed": 7
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "qwen-image-2.1-multi-ref.png",
+        "format": "png",
+        "compression": 6
+      }
+    }
+  ],
+  "subpipelines": []
+}

@@ -66,6 +66,18 @@ private:
   // transparent PNG into a 4-channel beat by surprise would break the
   // graph that was working yesterday. See the config doc.
   bool _keep_alpha = false;
+  // `dtype`: "u8" (the default; what every consumer reads), "f16"
+  // (deeper than 8 bits survive), or "auto" (f16 for a file deeper than
+  // 8 bits or float). `decoder`: "auto" | "ffmpeg" | "imageio" -- auto
+  // reads with ImageIO what FFmpeg would flatten (16-bit, float, EXR,
+  // HEIC) and whatever is asked for as F16; FFmpeg otherwise.
+  std::string _dtype = "u8";
+  std::string _decoder = "auto";
+  // A camera RAW is DEVELOPED (ImageIO / Core Image): `raw` "rendered"
+  // (the camera's look, sRGB) or "linear" (scene-linear BT.2020), at
+  // `raw_exposure` EV. It always reads through ImageIO, upright.
+  bool        _raw_linear = false;
+  double      _raw_exposure = 0;
   std::size_t              _next = 0;
   // The `images` list has gone out this run.
   bool                     _list_emitted = false;

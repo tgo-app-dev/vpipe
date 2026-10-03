@@ -51,6 +51,7 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   _src_x  = static_cast<int>(attr_int("src_x"));
   _src_y  = static_cast<int>(attr_int("src_y"));
   _scale  = attr_real("scale");
+  _gpu    = attr_bool("gpu");
   parse_hex_color_(attr_str("pad_color"), &_pad_r, &_pad_g, &_pad_b);
 
   const string fit = attr_str("fit");
@@ -113,8 +114,8 @@ constexpr ConfigKey kAttrs[] = {
           "manual (sample from src_x,src_y at scale, pad the rest)",
    .def_str = "pad", .extra = kFitChoices},
   {.key = "pad_color", .type = ConfigType::String,
-   .doc = "#RRGGBB solid pad colour for pad / manual (f32 frames treat it "
-          "as 0..1 normalised)",
+   .doc = "#RRGGBB solid pad colour for pad / manual (f16 / f32 frames "
+          "treat it as 0..1 normalised)",
    .def_str = "#727272"},
   {.key = "src_x", .type = ConfigType::Int,
    .doc = "manual: source origin x", .def_int = 0},
@@ -134,17 +135,25 @@ constexpr ConfigKey kAttrs[] = {
           "preprocessing used it and the pixels are what it conditions on: "
           "a VOSR restoration upscales its input this way before anything "
           "sees it, and a different filter there is a different input. It "
-          "has no GPU kernel and runs on the CPU",
+          "runs on the GPU for f16 and f32 frames and on the CPU for u8",
    .def_str = "lanczos", .extra = kAlgorithmChoices},
+  {.key = "gpu", .type = ConfigType::Bool,
+   .doc = "resample on the GPU where a kernel exists (the default): "
+          "every filter, fit and channel count for f16 and f32 frames; "
+          "bilinear and lanczos for u8 RGB. false pins the CPU path, which "
+          "implements all of them too -- what to set when comparing the "
+          "two",
+   .def_bool = true},
 };
 const PortSpec kIports[] = {
-  {.name = "frames", .doc = "planar RGB TensorBeat [3,H,W] (u8 or f32)",
+  {.name = "frames", .doc = "planar RGB [3,H,W] or RGBA [4,H,W] "
+                            "TensorBeat (u8, f16 or f32)",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
 };
 const PortSpec kOports[] = {
   {.name = "frames",
-   .doc = "resampled planar RGB TensorBeat [3,height,width] (same dtype)",
+   .doc = "resampled planar TensorBeat [3|4,height,width] (same dtype)",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
 };
@@ -153,10 +162,10 @@ const StageSpec kSpec = {
   .doc       = "Resample rgb-frames to a fixed width x height, with a "
                "configurable aspect-ratio fit (pad / crop / stretch / "
                "manual) and pad colour. Resamples with Lanczos-3 by "
-               "default; 'bilinear' is available and cheaper. u8 frames go "
-               "through the GPU letterbox kernel, f32 through a CPU path "
-               "that implements BOTH filters. iport and oport share one "
-               "clock domain (1:1).",
+               "default; 'bilinear' is cheaper and 'bicubic' matches PIL. "
+               "f16 and f32 frames, RGB or RGBA, resample on the GPU with "
+               "every filter; u8 RGB with bilinear or lanczos; the rest on "
+               "the CPU. iport and oport share one clock domain (1:1).",
   .display_name = "Resample",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -182,18 +191,19 @@ ImageResampleStage::initialize(RuntimeContext&)
   // no GPU kernel and always takes the CPU path, so a graph that asked
   // for it was told metal was fine and quietly did not use it.
   //
-  // THIS RUNS BEFORE ANY BEAT, so it cannot know the channel count --
-  // and RGBA is the second thing that takes the CPU whatever the
-  // filter, since the kernel has three planes and no notion of the
-  // premultiplication an alpha resample needs. Said here rather than
-  // left to contradict a later log line.
+  // THIS RUNS BEFORE ANY BEAT, so it cannot know the dtype or the
+  // channel count -- and for u8 they decide it: the u8 kernels have
+  // three planes and no bicubic, so u8 RGBA and u8 bicubic take the CPU.
+  // f16 and f32 have kernels for all of it. Said here rather than left
+  // to contradict a later log line.
   const char* alg = _alg == 0 ? "bilinear" : _alg == 2 ? "bicubic"
                                                        : "lanczos";
-  const bool gpu = _mc && _mc->valid() && _alg != 2;
+  const bool gpu = _gpu && _mc && _mc->valid();
   session()->info(fmt(
       "ImageResampleStage('{}'): -> {}x{}, fit={}, {} on the {}{}",
       this->id(), ws, hs, _mode, alg, gpu ? "GPU" : "CPU",
-      gpu ? " (RGB; an RGBA beat takes the CPU path)" : ""));
+      !gpu ? "" : _alg == 2 ? " for f16/f32 frames (u8: the CPU)"
+                            : " (a u8 RGBA beat takes the CPU)"));
   co_return;
 }
 
@@ -359,12 +369,14 @@ ImageResampleStage::process(RuntimeContext& ctx)
   if (tin == nullptr || tin->shape.size() != 3
       || (tin->shape[0] != 3 && tin->shape[0] != 4)
       || (tin->dtype != TensorBeat::DType::U8
+          && tin->dtype != TensorBeat::DType::F16
           && tin->dtype != TensorBeat::DType::F32)) {
     session()->warn(fmt(
         "ImageResampleStage('{}'): expected planar RGB [3,H,W] or RGBA "
-        "[4,H,W] u8/f32 TensorBeat; dropping beat", this->id()));
+        "[4,H,W] u8/f16/f32 TensorBeat; dropping beat", this->id()));
     co_return;
   }
+  using DType = TensorBeat::DType;
   const int CH = static_cast<int>(tin->shape[0]);
   const int in_h = static_cast<int>(tin->shape[1]);
   const int in_w = static_cast<int>(tin->shape[2]);
@@ -389,34 +401,64 @@ ImageResampleStage::process(RuntimeContext& ctx)
     src_tight = contig.data();
   }
 
-  // GPU fast path: u8 frames via the (generalised) letterbox kernel.
-  // RGB ONLY -- the kernel takes three pad bytes and three planes, and
-  // an RGBA resample additionally has to run PREMULTIPLIED, which it
-  // has no notion of. Four channels take the CPU path below; a still
-  // is not a video loop, so what that costs is milliseconds.
-  if (CH == 3 && tin->dtype == TensorBeat::DType::U8 && _mc
-      && _mc->valid()) {
-    const ExternalStorageHandle* src_h = nullptr;
-    if (tin->external && contiguous) {
-      src_h = tin->external.get();               // already GPU-resident
-    } else {
-      const size_t need = static_cast<size_t>(3) * in_w * in_h;
-      if (!_src_stage || _stage_in_w != in_w || _stage_in_h != in_h) {
-        _src_stage =
-            metal_compute::make_shared_storage(*_mc, need, session());
-        _stage_in_w = in_w; _stage_in_h = in_h;
-      }
-      if (_src_stage) {
-        std::memcpy(_src_stage->contents, src_tight, need);
-        src_h = _src_stage.get();
-      }
+  // The source as the GPU reads it: the beat's own Metal buffer when it
+  // has one and is tight, else a reused staging buffer.
+  const bool gpu = _gpu && _mc && _mc->valid();
+  const size_t esz = TensorBeat::byte_size_of(tin->dtype);
+  const size_t src_bytes = static_cast<size_t>(CH) * in_w * in_h * esz;
+  auto gpu_source = [&]() -> const ExternalStorageHandle* {
+    if (tin->external && contiguous) { return tin->external.get(); }
+    if (!_src_stage || _stage_bytes < src_bytes) {
+      _src_stage =
+          metal_compute::make_shared_storage(*_mc, src_bytes, session());
+      _stage_bytes = _src_stage ? src_bytes : 0;
     }
+    if (!_src_stage) { return nullptr; }
+    std::memcpy(_src_stage->contents, src_tight, src_bytes);
+    return _src_stage.get();
+  };
+
+  // GPU, FLOAT FRAMES: every filter, every fit, RGB or RGBA (resampled
+  // premultiplied inside the kernel), in the frame's own element type --
+  // nothing passes through 8 bits or through a CPU conversion.
+  if (gpu && tin->dtype != DType::U8) {
+    const ExternalStorageHandle* src_h = gpu_source();
+    auto dst = metal_compute::make_shared_storage(
+        *_mc, static_cast<size_t>(CH) * out_w * out_h * esz, session());
+    // A border invented to make an aspect fit is not part of the
+    // picture, so an RGBA pad is TRANSPARENT (the CPU path's rule).
+    const float pad[4] = { _pad_r / 255.0f, _pad_g / 255.0f,
+                           _pad_b / 255.0f, 0.0f };
+    if (src_h && dst
+        && metal_compute::resample_planar_float(
+               *_mc, *src_h,
+               tin->dtype == DType::F16 ? metal_compute::PlanarFloat::F16
+                                        : metal_compute::PlanarFloat::F32,
+               CH, in_w, in_h, *dst, out_w, out_h, _mode, _src_x, _src_y,
+               static_cast<float>(_scale), _alg, pad, session())) {
+      TensorBeat tb;
+      tb.dtype = tin->dtype;
+      tb.shape = { CH, out_h, out_w };
+      tb.sideband = tin->sideband;
+      tb.external = std::move(dst);
+      co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
+      co_return;
+    }
+    // fall through to the CPU path on any GPU failure
+  }
+
+  // GPU, U8 FRAMES via the (generalised) letterbox and Lanczos kernels.
+  // RGB ONLY -- they take three pad bytes and three planes, and an RGBA
+  // resample additionally has to run PREMULTIPLIED, which they have no
+  // notion of. Four channels take the CPU path below; a still is not a
+  // video loop, so what that costs is milliseconds.
+  // No u8 bicubic kernel either: _alg 2 takes the CPU path below.
+  if (gpu && CH == 3 && tin->dtype == DType::U8 && _alg != 2) {
+    const ExternalStorageHandle* src_h = gpu_source();
     if (src_h) {
       auto dst = metal_compute::make_shared_storage(
           *_mc, static_cast<size_t>(3) * out_w * out_h, session());
-      // No bicubic GPU twin: _alg 2 falls through to the CPU path below,
-      // which is where the Pillow-exact cubic coefficients live.
-      const bool ok = _alg != 2 && dst && (_alg == 1
+      const bool ok = dst && (_alg == 1
           ? metal_compute::resample_lanczos_planar_u8_to_u8(
                 *_mc, *src_h, in_w, in_h, *dst, out_w, out_h,
                 _mode, _src_x, _src_y, static_cast<float>(_scale),
@@ -439,13 +481,25 @@ ImageResampleStage::process(RuntimeContext& ctx)
     // fall through to the CPU path on any GPU failure
   }
 
-  // CPU fallback: f32 frames, no-metal builds, RGBA, or a GPU miss.
+  // CPU path: `gpu: false`, no-metal builds, u8 RGBA or bicubic, or a
+  // GPU miss. F16 runs as F32 here -- widened in, narrowed back out --
+  // so the CPU code has two element types, not three.
+  const bool is_f16 = tin->dtype == DType::F16;
+  AlignedVector<uint8_t> wide;
+  if (is_f16) {
+    const size_t n = static_cast<size_t>(CH) * in_w * in_h;
+    wide.resize(n * sizeof(float));
+    const auto* h = reinterpret_cast<const _Float16*>(src_tight);
+    float* f = reinterpret_cast<float*>(wide.data());
+    for (size_t i = 0; i < n; ++i) { f[i] = static_cast<float>(h[i]); }
+    src_tight = wide.data();
+  }
   TensorBeat tb;
-  tb.dtype = tin->dtype;
+  tb.dtype = is_f16 ? DType::F32 : tin->dtype;
   tb.shape = { CH, out_h, out_w };
   tb.sideband = tin->sideband;
   tb.resize_contiguous(static_cast<size_t>(CH) * out_w * out_h);
-  const bool is_f32 = tin->dtype == TensorBeat::DType::F32;
+  const bool is_f32 = tb.dtype == DType::F32;
 
   // RGBA RESAMPLES PREMULTIPLIED. Averaging colour and alpha
   // independently pulls the colour of fully transparent pixels into
@@ -504,6 +558,20 @@ ImageResampleStage::process(RuntimeContext& ctx)
         }
       }
     }
+  }
+  if (is_f16) {
+    TensorBeat narrow;
+    narrow.dtype = DType::F16;
+    narrow.shape = tb.shape;
+    narrow.sideband = std::move(tb.sideband);
+    const size_t n = static_cast<size_t>(CH) * out_w * out_h;
+    narrow.resize_contiguous(n);
+    const float* f = tb.as_f32();
+    auto* h = reinterpret_cast<_Float16*>(narrow.bytes_());
+    for (size_t i = 0; i < n; ++i) { h[i] = static_cast<_Float16>(f[i]); }
+    co_await ctx.write(0,
+        make_payload<TensorBeatPayload>(std::move(narrow)));
+    co_return;
   }
   co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
 }

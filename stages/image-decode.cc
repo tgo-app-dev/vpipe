@@ -324,4 +324,33 @@ decode_image_file(const FFmpegLibraries* libs, const std::string& url,
   return out;
 }
 
+bool
+picture_bytes_u8(const TensorBeat& pic, std::vector<std::uint8_t>* out)
+{
+  using DType = TensorBeat::DType;
+  if (pic.shape.size() != 3 ||
+      (pic.dtype != DType::U8 && pic.dtype != DType::F16 &&
+       pic.dtype != DType::F32)) {
+    return false;
+  }
+  const auto bytes = pic.materialize_contiguous();
+  if (pic.dtype == DType::U8) {
+    out->assign(bytes.begin(), bytes.end());
+    return true;
+  }
+  const bool f32 = pic.dtype == DType::F32;
+  const std::size_t n = bytes.size() / (f32 ? 4 : 2);
+  out->resize(n);
+  const auto* s32 = reinterpret_cast<const float*>(bytes.data());
+  const auto* s16 = reinterpret_cast<const _Float16*>(bytes.data());
+  for (std::size_t i = 0; i < n; ++i) {
+    const float v = f32 ? s32[i] : (float)s16[i];
+    // !(v > 0) also catches NaN.
+    (*out)[i] = !(v > 0.0f) ? 0
+              : v >= 1.0f   ? 255
+              : (std::uint8_t)(v * 255.0f + 0.5f);
+  }
+  return true;
+}
+
 }  // namespace vpipe

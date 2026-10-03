@@ -63,6 +63,15 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _fps = attr_real("fps");
+  {
+    const std::string dt = attr_str("dtype");
+    if (dt == "f16") {
+      _out_dtype = TensorBeat::DType::F16;
+    } else if (dt != "u8") {
+      fail_config(fmt("VaeDecodeStage('{}'): dtype must be u8 or f16",
+                      this->id()));
+    }
+  }
   if (!(_fps > 0.0)) { _fps = 24.0; }
   {
     bool bad = false;
@@ -101,7 +110,16 @@ namespace {
 constexpr SpecExtra kUnloadChoices[] = {
   {spec_key::kChoices, "auto,destroy,keep"},
 };
+constexpr SpecExtra kDtypeChoices[] = {
+  {spec_key::kChoices, "u8,f16"},
+};
 const ConfigKey kAttrs[] = {
+  {.key = "dtype", .type = ConfigType::String, .required = false,
+   .doc = "u8 | f16: the pictures this emits. u8 (the default) quantizes "
+          "the decoder's samples to 8 bits, what most consumers read. f16 "
+          "keeps them, 0..1 -- for a 16-bit PNG/TIFF, OpenEXR or a 10-bit "
+          "video (save-image, avf-save-video), nothing is lost here",
+   .def_str = "u8", .extra = kDtypeChoices},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the model root whose VAE this decodes; the resident family "
           "locates the VAE within it (conventionally <hf_dir>/vae). "
@@ -1067,6 +1085,21 @@ forward_model_name_(const TensorBeatPayload& src, TensorBeat& dst)
   provenance::carry_model_name(src.sideband, dst.sideband);
 }
 
+// One decoded sample, already mapped to 0..1, into a picture of either
+// dtype: U8 rounded, F16 as it is -- both clamped to 0..1 (NaN to 0), as
+// the reference's PIL conversion clamps.
+inline void
+put_unit_(TensorBeatPayload& out, std::size_t i, float unit)
+{
+  if (!(unit > 0.0f)) { unit = 0.0f; }
+  if (unit > 1.0f) { unit = 1.0f; }
+  if (out.dtype == TensorBeat::DType::F16) {
+    reinterpret_cast<_Float16*>(out.bytes_())[i] = (_Float16)unit;
+  } else {
+    out.bytes_()[i] = (std::uint8_t)std::lround(unit * 255.0f);
+  }
+}
+
 }  // namespace
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -1079,7 +1112,7 @@ VaeDecodeStage::begin_clip_(RuntimeContext& ctx, int F, int H, int W) const
   if (!(ctx.num_oports() > 1 && ctx.has_consumers(1))) { return nullptr; }
   if (F <= 0 || H <= 0 || W <= 0) { return nullptr; }
   auto clip = std::make_unique<TensorBeatPayload>();
-  clip->dtype = TensorBeat::DType::U8;
+  clip->dtype = _out_dtype;  // the frames' own
   clip->shape = {(std::int64_t)F, 3, (std::int64_t)H, (std::int64_t)W};
   clip->resize_contiguous((std::size_t)F * 3 * (std::size_t)H * W);
   return clip;
@@ -1098,7 +1131,7 @@ VaeDecodeStage::add_to_clip_(TensorBeatPayload* clip, int f,
   // disagreement between them would be a heap overwrite, not a bad
   // picture.
   if (off + per > clip->byte_size()) { return; }
-  std::memcpy(clip->as_u8() + off, frame.bytes_(), per);
+  std::memcpy(clip->bytes_() + off, frame.bytes_(), per);
 }
 
 void
@@ -1183,11 +1216,11 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         co_return;
       }
       auto out = std::make_unique<TensorBeatPayload>();
-      out->dtype = TensorBeat::DType::U8;
+      out->dtype = _out_dtype;
       out->shape = {3, H, W};
       const std::size_t n = (std::size_t)3 * H * W;
       out->resize_contiguous(n);
-      std::memset(out->as_u8(), 0xff, n);      // white
+      for (std::size_t i = 0; i < n; ++i) { put_unit_(*out, i, 1.0f); }
       ++_images_emitted;
       session()->info(fmt(
           "VaeDecodeStage('{}'): content-policy refusal -> blank {}x{} image",
@@ -1252,17 +1285,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     const int H = h16 * px, W = w16 * px;
     const std::size_t n = (std::size_t)3 * H * W;
     auto out = std::make_unique<TensorBeatPayload>();
-    out->dtype = TensorBeat::DType::U8;
+    out->dtype = _out_dtype;
     out->shape = {3, H, W};
     out->resize_contiguous(n);
     const auto* rp = static_cast<const _Float16*>(rgb.contents());
-    std::uint8_t* op = out->as_u8();
     for (std::size_t i = 0; i < n; ++i) {
-      float v = ((float)rp[i] + 1.0f) * 0.5f * 255.0f;
-      v = std::round(v);
-      if (v < 0.0f) { v = 0.0f; }
-      if (v > 255.0f) { v = 255.0f; }
-      op[i] = (std::uint8_t)v;
+      put_unit_(*out, i, ((float)rp[i] + 1.0f) * 0.5f);
     }
     ++_images_emitted;
     session()->log_debug(fmt(
@@ -1529,13 +1557,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     auto clip = one_frame ? nullptr : begin_clip_(ctx, F, H, W);
     for (int f = 0; f < F; ++f) {
       auto out = std::make_unique<TensorBeatPayload>();
-      out->dtype = TensorBeat::DType::U8;
+      out->dtype = _out_dtype;
       out->shape = {3, H, W};
       out->resize_contiguous(3 * plane);
-      std::uint8_t* op = out->as_u8();
       for (int c = 0; c < 3; ++c) {
         const std::uint16_t* src = rp + ((std::size_t)c * F + f) * plane;
-        std::uint8_t* dst = op + (std::size_t)c * plane;
+        const std::size_t base = (std::size_t)c * plane;
         // The ViT decoder emits IMAGENET-NORMALIZED pixels, not [-1, 1]:
         // the encoder's first act is `(x + 1)/2` then `(. - mean)/std`,
         // and the reference decode undoes exactly that before clamping.
@@ -1549,13 +1576,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           const std::uint32_t u = (std::uint32_t)src[i] << 16;
           float x;
           std::memcpy(&x, &u, 4);
-          float unit = x * ps + pm;             // -> [0, 1]
-          if (unit < 0.0f) { unit = 0.0f; }
-          if (unit > 1.0f) { unit = 1.0f; }
-          float v = std::round(unit * 255.0f);
-          if (v < 0.0f) { v = 0.0f; }
-          if (v > 255.0f) { v = 255.0f; }
-          dst[i] = (std::uint8_t)v;
+          put_unit_(*out, base + i, x * ps + pm);  // -> [0, 1]
         }
       }
       FlexData sb = FlexData::make_object();
@@ -1670,22 +1691,18 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       const std::size_t plane = (std::size_t)c.height * c.width;
       for (int k = 0; k < c.n; ++k) {
         auto out = std::make_unique<TensorBeatPayload>();
-        out->dtype = TensorBeat::DType::U8;
+        out->dtype = _out_dtype;
         out->shape = {3, c.height, c.width};
         out->resize_contiguous((std::size_t)3 * plane);
-        std::uint8_t* op = out->as_u8();
         for (int ch = 0; ch < 3; ++ch) {
           // A family with fewer than 3 channels comes out greyscale
           // rather than read past the end of its own chunk.
           const int sc = (ch < c.channels) ? ch : (c.channels - 1);
           const float* src =
               c.rgb + ((std::size_t)sc * c.n + k) * plane;
-          std::uint8_t* dst = op + (std::size_t)ch * plane;
+          const std::size_t base = (std::size_t)ch * plane;
           for (std::size_t i = 0; i < plane; ++i) {
-            float v = std::round((src[i] + 1.0f) * 0.5f * 255.0f);
-            if (!(v > 0.0f)) { v = 0.0f; }        // also catches NaN
-            if (v > 255.0f) { v = 255.0f; }
-            dst[i] = (std::uint8_t)v;
+            put_unit_(*out, base + i, (src[i] + 1.0f) * 0.5f);
           }
         }
         // Video stamps {frame, frames, fps}; an image VAE stamps nothing,
@@ -1844,22 +1861,18 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       const std::size_t per = (std::size_t)3 * H * W;
       for (int k = 0; k < n; ++k) {
         auto out = std::make_unique<TensorBeatPayload>();
-        out->dtype = TensorBeat::DType::U8;
+        out->dtype = _out_dtype;
         out->shape = {3, H, W};
         out->resize_contiguous(per);
-        std::uint8_t* op = out->as_u8();
         // The VAE hands back [3, n, H, W] (channel-first over the chunk),
         // so frame k is a stride into each channel plane, not a contiguous
         // block.
         for (int c = 0; c < 3; ++c) {
           const _Float16* src =
               rp + ((std::size_t)c * n + k) * (std::size_t)H * W;
-          std::uint8_t* dst = op + (std::size_t)c * H * W;
+          const std::size_t base = (std::size_t)c * H * W;
           for (std::size_t i = 0; i < (std::size_t)H * W; ++i) {
-            float v = std::round(((float)src[i] + 1.0f) * 0.5f * 255.0f);
-            if (v < 0.0f) { v = 0.0f; }
-            if (v > 255.0f) { v = 255.0f; }
-            dst[i] = (std::uint8_t)v;
+            put_unit_(*out, base + i, ((float)src[i] + 1.0f) * 0.5f);
           }
         }
         FlexData sb = FlexData::make_object();
@@ -1962,18 +1975,14 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     const int H = h * P, W = w * P;
     const std::size_t n = (std::size_t)3 * H * W;
     auto out = std::make_unique<TensorBeatPayload>();
-    out->dtype = TensorBeat::DType::U8;
+    out->dtype = _out_dtype;
     out->shape = {3, H, W};
     out->resize_contiguous(n);
     const auto* rp = static_cast<const _Float16*>(rgb.contents());
-    std::uint8_t* op = out->as_u8();
     for (std::size_t i = 0; i < n; ++i) {
       // MetalMageVae::decode does NOT clamp (the reference clamps at the PIL
-      // conversion, which is this).
-      float v = std::round(((float)rp[i] + 1.0f) * 0.5f * 255.0f);
-      if (v < 0.0f) { v = 0.0f; }
-      if (v > 255.0f) { v = 255.0f; }
-      op[i] = (std::uint8_t)v;
+      // conversion, which is put_unit_'s).
+      put_unit_(*out, i, ((float)rp[i] + 1.0f) * 0.5f);
     }
     ++_images_emitted;
     session()->log_debug(fmt(
@@ -2042,7 +2051,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // f16 [C,H,W] in [-1,1] -> planar U8 (x+1)/2*255, rounded + clamped.
+  // f16 [C,H,W] in [-1,1] -> planar (x+1)/2: U8 rounded and clamped, or
+  // F16 clamped to 0..1 (`dtype`).
   const int H = h8 * px, W = w8 * px;
   // THE CHANNEL COUNT IS THE VAE'S, not three. Qwen-Image-2.1 decodes
   // FOUR -- RGBA is its headline feature -- and this used to truncate
@@ -2059,22 +2069,18 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   }
   const std::size_t n = (std::size_t)OC * H * W;
   auto out = std::make_unique<TensorBeatPayload>();
-  out->dtype = TensorBeat::DType::U8;
+  out->dtype = _out_dtype;
   out->shape = {OC, H, W};
   out->resize_contiguous(n);
   const auto* rp = static_cast<const _Float16*>(rgb.contents());
-  std::uint8_t* op = out->as_u8();
   for (std::size_t i = 0; i < n; ++i) {
-    float v = ((float)rp[i] + 1.0f) * 0.5f * 255.0f;
-    v = std::round(v);
-    if (v < 0.0f) { v = 0.0f; }
-    if (v > 255.0f) { v = 255.0f; }
-    op[i] = (std::uint8_t)v;
+    put_unit_(*out, i, ((float)rp[i] + 1.0f) * 0.5f);
   }
   ++_images_emitted;
   session()->log_debug(fmt(
-      "VaeDecodeStage('{}'): decoded + emitted image #{} planar U8 {} "
+      "VaeDecodeStage('{}'): decoded + emitted image #{} planar {} {} "
       "[{}, {}, {}]", this->id(), _images_emitted,
+      _out_dtype == TensorBeat::DType::F16 ? "F16" : "U8",
       OC == 4 ? "RGBA" : "RGB", OC, H, W));
   forward_model_name_(*tbp, *out);
   if (_unload_idle) { unload_vae_(); }

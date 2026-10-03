@@ -45,6 +45,12 @@ VPIPE_API_BEGIN
 
 namespace vpipe {
 
+// The JSON-like document type of vpipe's plugin SDK (common/flex-data.h).
+// Forward-declared: the in-memory overloads below and in the other public
+// headers take or return one, and a caller that uses them includes
+// common/flex-data.h; a caller that does not pays nothing.
+class FlexData;
+
 // The element type of a buffer.
 //
 // `Bytes` is an opaque byte string -- an encoded image, a file -- whose
@@ -194,6 +200,9 @@ public:
   // reply), and the reason for a Failed / Cancelled state ("" else).
   std::string result_json() const;
   std::string error() const;
+  // The same result as a document, without a text round trip (Null
+  // before a reply). Needs common/flex-data.h.
+  FlexData result() const;
 
   // The stage's buffers, readable in place from the reply until
   // close(). Each copy shares the stage's owner. Empty before a reply

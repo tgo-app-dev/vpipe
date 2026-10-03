@@ -13,6 +13,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/load-image-stage.h"
+#include "stages/model-provenance.h"
 #include "stages/save-image-stage.h"
 
 #include <cctype>
@@ -563,6 +564,49 @@ TEST(save_image_stage, generated_image_records_the_model_in_exif_software) {
   EXPECT_TRUE(sw.find(vpipe_build_hash()) != string::npos);
   EXPECT_TRUE(sw.find(" with local/Some-Model-4bit") != string::npos);
   remove(path.c_str());
+}
+
+// A host that ran the graph names itself first; vpipe's line follows in
+// brackets. A model given as a local absolute path is recorded as
+// <org>/<repo> only: the file must not carry the user's home directory.
+TEST(save_image_stage, software_host_comes_first_and_brackets_vpipe) {
+  Session sess;
+  CerrSilencer hush;
+  const string path = tmp_path_(".png");
+  remove(path.c_str());
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  cfg.as_object().insert("software_host",
+                         FlexData::make_string("ExampleApp 1.0"));
+  SolidSource* src = nullptr;
+  run_store_(sess, src, std::move(cfg), 1, 0x12, 0xAB, 0xF0,
+             false, 4, 3, "/Users/someone/models/Qwen/Qwen-Image-2.1/");
+  ASSERT_TRUE(src != nullptr);
+
+  const auto blob = imgmeta::read_exif_blob(path);
+  ASSERT_TRUE(!blob.empty());
+  FlexData d = imgmeta::parse_exif(blob);
+  ASSERT_TRUE(d.is_object());
+  auto o = d.as_object();
+  ASSERT_TRUE(o.contains("Software"));
+  const string sw(o.at("Software").as_string(""));
+  std::printf("[save_image_stage] Software = %s\n", sw.c_str());
+  EXPECT_TRUE(sw.rfind("ExampleApp 1.0 (Vpipe ", 0) == 0);
+  EXPECT_TRUE(sw.find(" with Qwen/Qwen-Image-2.1)") != string::npos);
+  EXPECT_TRUE(sw.back() == ')');
+  EXPECT_TRUE(sw.find("/Users/") == string::npos);
+  remove(path.c_str());
+}
+
+TEST(save_image_stage, public_model_name_keeps_org_and_repo) {
+  using provenance::public_model_name;
+  EXPECT_TRUE(public_model_name("local/Model-4bit") == "local/Model-4bit");
+  EXPECT_TRUE(public_model_name("/a/b/org/Repo") == "org/Repo");
+  EXPECT_TRUE(public_model_name("/a/b/org/Repo//") == "org/Repo");
+  EXPECT_TRUE(public_model_name("/org/Repo") == "org/Repo");
+  EXPECT_TRUE(public_model_name("/Repo") == "Repo");
+  EXPECT_TRUE(public_model_name("") == "");
 }
 
 // ...and an image with NO model on its sideband (a plain load -> save copy)

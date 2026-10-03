@@ -678,6 +678,97 @@ TEST(video_stages, a_file_reaches_the_tensor_chain) {
   remove(out_path.c_str());
 }
 
+// A stream WITH B-FRAMES decodes whole, through both decoder slots. The
+// decoder holds the first picture back until later (non-IDR) packets
+// arrive. video-to-rgb used to count itself synced only once a frame
+// came OUT, so its gate dropped every packet after the IDR: 1 frame of
+// 25. The file above is written without B-frames (VideoToolbox's
+// default), which is why that test never saw it.
+TEST(video_stages, a_stream_with_b_frames_decodes_whole) {
+  Session sess;
+  CerrSilencer hush;
+
+  const unsigned kFrames = 33;
+  const string out_path = tmp_path_("bframes", ".mp4");
+  remove(out_path.c_str());
+  {
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SynthVideoSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->target_frames = kFrames;
+    src_u->fps = AVRational{16, 1};
+    src_u->allocate_oports(1);
+    auto* src = static_cast<SynthVideoSource*>(
+      pl->insert_stage(std::move(src_u)));
+    // bf=2: VideoToolbox (and libx264, the non-Apple fallback) reorder
+    // with it -- I B B B P on this fixture.
+    FlexData enc_cfg = FlexData::from_json(
+      R"({"enable_audio":false,"video_options":{"bf":"2"}})");
+    enc_cfg.as_object().insert("output_url", FlexData::make_string(out_path));
+    auto enc_u = make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
+    pl->insert_stage(std::move(enc_u));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  ASSERT_TRUE(file_size_or_zero_(out_path) > 0);
+
+  // The fixture must actually reorder, or this tests nothing.
+  int delay = -1;
+  {
+    const FFmpegLibraries& libs = *sess.services()->ffmpeg_libraries();
+    AVFormatContext* ic = nullptr;
+    if (libs.avformat().api.open_input(&ic, out_path.c_str(), nullptr,
+                                       nullptr) == 0) {
+      if (libs.avformat().api.find_stream_info(ic, nullptr) >= 0) {
+        for (unsigned i = 0; i < ic->nb_streams; ++i) {
+          const AVCodecParameters* cp = ic->streams[i]->codecpar;
+          if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+            delay = cp->video_delay;
+          }
+        }
+      }
+      libs.avformat().api.close_input(&ic);
+    }
+  }
+  printf("[video_stages] b-frame fixture: decoder delay %d\n", delay);
+  EXPECT_TRUE(delay > 0);
+
+  for (const char* hw : {"auto", "none"}) {
+    unsigned frames = 0;
+    {
+      auto pl = make_unique<Pipeline>("p2", &sess);
+      FlexData lv_cfg = FlexData::from_json(R"({"enable_audio":false})");
+      lv_cfg.as_object().insert("input_url", FlexData::make_string(out_path));
+      auto lv_u = make_unique<LoadVideoStage>(
+        &sess, "lv", vector<InEdge>{}, std::move(lv_cfg));
+      lv_u->allocate_oports(1);
+      auto* lv = static_cast<LoadVideoStage*>(
+        pl->insert_stage(std::move(lv_u)));
+      FlexData vr_cfg = FlexData::make_object();
+      vr_cfg.as_object().insert("hwaccel", FlexData::make_string(hw));
+      auto vr_u = make_unique<VideoToRgbStage>(
+        &sess, "vr", vector<InEdge>{{lv, 0}}, std::move(vr_cfg));
+      auto* vr = static_cast<VideoToRgbStage*>(
+        pl->insert_stage(std::move(vr_u)));
+      auto cnt_u = make_unique<RgbCounter>(
+        &sess, "cnt", vector<InEdge>{{vr, 0}}, FlexData::make_object());
+      auto* cnt = static_cast<RgbCounter*>(pl->insert_stage(std::move(cnt_u)));
+      PipelineRuntime rt(pl.get(), &sess);
+      EXPECT_TRUE(rt.launch());
+      rt.wait_idle();
+      rt.stop();
+      frames = cnt->frames;
+    }
+    printf("[video_stages] b-frames, hwaccel %s: %u of %u frames\n", hw,
+           frames, kFrames);
+    EXPECT_TRUE(frames == kFrames);
+  }
+  remove(out_path.c_str());
+}
+
 TEST(video_stages, round_trip_or_skips) {
   const char* in_path = std::getenv("VPIPE_TEST_VIDEO");
   if (!in_path) {

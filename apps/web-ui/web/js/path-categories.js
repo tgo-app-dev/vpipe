@@ -12,7 +12,11 @@
 // dot-led.
 export const CATEGORY_EXTS = {
   image: ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.ppm',
-          '.pgm', '.tiff', '.tif', '.heic'],
+          '.pgm', '.tiff', '.tif', '.heic', '.exr',
+          // Camera RAW (load-image develops it on macOS).
+          '.dng', '.cr2', '.cr3', '.crw', '.nef', '.nrw', '.arw', '.srf',
+          '.sr2', '.raf', '.orf', '.rw2', '.pef', '.srw', '.3fr', '.fff',
+          '.iiq', '.mos', '.erf', '.dcr', '.mrw', '.rwl'],
   audio: ['.wav', '.mp3', '.flac', '.aac', '.m4a', '.ogg', '.opus',
           '.aiff', '.aif'],
   video: ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.ts',

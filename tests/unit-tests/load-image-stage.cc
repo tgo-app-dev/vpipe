@@ -9,6 +9,7 @@
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
+#include "stages/image-decode.h"
 #include "pipeline/typed-stage.h"
 #include "stages/chrono-stage.h"
 #include "stages/load-image-stage.h"
@@ -523,4 +524,42 @@ TEST(load_image_stage, the_list_does_not_replace_the_single_images) {
 
   EXPECT_TRUE(one->captured.size() == 2);
   EXPECT_TRUE(all->captured.size() == 1);
+}
+
+// A deep picture for an 8-bit reader (a vision tower): U8 as it is, F16
+// and F32 rounded from 0..1, out-of-range clamped, a padded row pitch
+// read through. What diffusion-conditioner gives its tower when a
+// reference arrives deep.
+TEST(load_image_stage, deep_pictures_round_to_bytes)
+{
+  for (TensorBeat::DType dt : {TensorBeat::DType::F16,
+                               TensorBeat::DType::F32}) {
+    TensorBeat t;
+    t.dtype = dt;
+    t.resize_contiguous(12);           // (clears strides: set them after)
+    t.shape = {3, 1, 2};
+    t.strides = {4, 4, 1};             // each plane padded to 4
+    const float v[12] = {0.0f, 1.0f, 9, 9, 0.5f, -0.25f, 9, 9,
+                         1.5f, 0.2f, 9, 9};
+    for (int i = 0; i < 12; ++i) {
+      if (dt == TensorBeat::DType::F16) {
+        reinterpret_cast<_Float16*>(t.bytes_())[i] = (_Float16)v[i];
+      } else {
+        t.as_f32()[i] = v[i];
+      }
+    }
+    std::vector<std::uint8_t> b;
+    ASSERT_TRUE(vpipe::picture_bytes_u8(t, &b));
+    ASSERT_TRUE(b.size() == 6);
+    if (b.size() != 6) { return; }
+    EXPECT_TRUE(b[0] == 0 && b[1] == 255);
+    EXPECT_TRUE(b[2] == 128 && b[3] == 0);       // 0.5 rounds, -0.25 clamps
+    EXPECT_TRUE(b[4] == 255 && b[5] == 51);      // 1.5 clamps, 0.2 -> 51
+  }
+  TensorBeat i8;
+  i8.dtype = TensorBeat::DType::I8;
+  i8.shape = {3, 1, 1};
+  i8.resize_contiguous(3);
+  std::vector<std::uint8_t> b;
+  EXPECT_FALSE(vpipe::picture_bytes_u8(i8, &b));
 }

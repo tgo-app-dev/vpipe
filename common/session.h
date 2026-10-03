@@ -47,6 +47,12 @@ public:
   //                                        or binary-FlexData config
   Session(std::string_view = "");
 
+  // The same, from a config document already in memory: the document the
+  // text forms parse into (SessionManager::create_session(const FlexData&)).
+  // Null means built-in defaults; anything but an object is refused with
+  // a warning, and defaults are used, as for an unparsable string.
+  explicit Session(const FlexData& config);
+
   // Test / library-user injection. Bypasses config-driven delegate
   // selection. A null pointer falls back to a default StdoutLogDelegate.
   // Worker count and edge-buffer capacity use built-in defaults.
@@ -58,6 +64,12 @@ public:
 
   /* external */
   PipelineHandle load_pipeline(std::string_view) override;
+  // SessionIntf's non-virtual FlexData form, visible on a Session too.
+  using SessionIntf::load_pipeline;
+  // Build a pipeline from a parsed spec document. `storage` is the file it
+  // came from ("" for an inline or in-memory spec).
+  PipelineHandle load_pipeline_spec(const FlexData& spec,
+                                    std::string storage = {});
   PipelineHandle create_pipeline(std::string) override;
   Status launch_pipeline(PipelineHandle) override;
   Status pause_pipeline(PipelineHandle) override;
@@ -249,6 +261,15 @@ public:
   ThreadPool* pool() noexcept { return _pool.get(); }
 
 private:
+  // Both public config constructors delegate here: the parsed document,
+  // or the reason there is none (then built-in defaults, with a warning).
+  struct ParsedConfig {
+    FlexData    config;
+    std::string error;
+  };
+  explicit Session(ParsedConfig);
+  static ParsedConfig parse_config_(std::string_view);
+
   // Resolve a PipelineHandle to its owning Impl, or nullptr if the
   // handle is unknown to this Session.
   PipelineHandleImpl* resolve(PipelineHandle) const;

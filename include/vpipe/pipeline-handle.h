@@ -92,6 +92,13 @@ public:
                         std::string_view        args_json = {},
                         std::vector<DataBuffer> in = {}) const;
 
+  // The same, with the arguments as a document already in memory (an
+  // object, or Null for none): no JSON text is written or parsed. Needs
+  // common/flex-data.h.
+  CommandHandle command(std::string_view        name,
+                        const FlexData&         args,
+                        std::vector<DataBuffer> in = {}) const;
+
   // True iff this handle refers to a live stage. A default-/null-
   // constructed handle, or one returned from an unimplemented stub,
   // is invalid.

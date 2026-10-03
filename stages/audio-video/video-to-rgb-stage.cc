@@ -647,6 +647,13 @@ open_h264_codec_(const OpenCodecParams& p)
       static_cast<AVColorPrimaries>(p.seg->color_primaries);
   cctx->color_trc =
       static_cast<AVColorTransferCharacteristic>(p.seg->color_trc);
+  // THE REORDER DEPTH, seeded the same way (avcodec_parameters_to_context
+  // copies video_delay into has_b_frames). Without it a stream whose SPS
+  // does not state its depth -- VideoToolbox's -- loses the first frame
+  // the decoder finds out of order. See EncodedSegment::video_delay.
+  if (p.seg->video_delay > 0) {
+    cctx->has_b_frames = p.seg->video_delay;
+  }
 
   int rc = p.libs->avcodec().api.open2(cctx, codec, nullptr);
   if (rc < 0) {
@@ -1204,6 +1211,17 @@ VideoToRgbStage::try_decode_au_(RuntimeContext& ctx,
   if (rc < 0 && rc != AVERROR(EAGAIN)) {
     *out_rc = rc;
     co_return;
+  }
+  // The decoder holds an IDR: it is synced from here, whether or not a
+  // frame comes out of THIS packet. A decoder with output delay -- an
+  // H.264 stream with B-frames, which reorders -- returns its first
+  // picture only after more input, and that input is non-IDR: syncing on
+  // "a frame came out" (below) let the gate drop all of it. MEASURED: a
+  // libx264 mp4 (B-frames on, its default) decoded 1 of 25 frames -- the
+  // IDR, released at the end-of-stream flush -- through both the
+  // hardware and software slots; an all-IDR copy decoded 25.
+  if (rc >= 0 && has_idr) {
+    slot.synced = true;
   }
 
   while (true) {

@@ -28,6 +28,7 @@
 #include "stages/vae-encode-stage.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -43,6 +44,8 @@ struct Counts {
   int loads = 0, encodes = 0, refused = 0, released = 0;
 };
 Counts g_counts;
+// The normalized pixels of the last encode, as the family received them.
+std::vector<float> g_pixels;
 
 // A causal video encoder in shape only: 32x space, 8x time, and a
 // release_idle() it cannot come back from.
@@ -61,6 +64,8 @@ public:
       return false;
     }
     ++g_counts.encodes;
+    g_pixels.assign(req.pixels, req.pixels + (std::size_t)req.frames * 3 *
+                                                 req.height * req.width);
     const int t = 1 + (req.frames - 1) / 8;
     *shape = {4, t, req.height / 32, req.width / 32};
     out->assign((std::size_t)4 * t * (req.height / 32) * (req.width / 32),
@@ -449,4 +454,100 @@ TEST(vae_encode_plugin, a_list_of_pictures_encodes_to_a_list_of_latents)
   EXPECT_TRUE((sink->shapes[1] == std::vector<std::int64_t>{4, 1, 1, 3}));
   EXPECT_TRUE(g_counts.encodes == 2);
   EXPECT_TRUE(g_counts.loads == 1);
+}
+
+// ---- AN F16 PICTURE ---------------------------------------------------
+//
+// F16 is 0..1 by its convention, so it must reach the family exactly as
+// the same picture in F32 does: 2v - 1. And `input_range` -- the F32
+// key -- must not move it: set to "byte" here, it would read an F32
+// picture as 0..255 and crush it to -1.
+namespace {
+
+class PictureSource : public TypedStage<PictureSource> {
+public:
+  static constexpr const char* kTypeName = "ut-venc-picture-source";
+  using TypedStage::TypedStage;
+  TensorBeat::DType dtype = TensorBeat::DType::F32;
+  bool emitted = false;
+
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    if (emitted) { ctx.signal_done(); co_return; }
+    emitted = true;
+    auto b = std::make_unique<TensorBeatPayload>();
+    b->dtype = dtype;
+    b->shape = {3, 64, 64};
+    const std::size_t n = (std::size_t)3 * 64 * 64;
+    b->resize_contiguous(n);
+    // 0, 0.25, 0.5, 1 in turn: exact in f16, so the two dtypes agree to
+    // the bit.
+    static const float kV[4] = {0.0f, 0.25f, 0.5f, 1.0f};
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = kV[i % 4];
+      if (dtype == TensorBeat::DType::F16) {
+        reinterpret_cast<_Float16*>(b->bytes_())[i] = (_Float16)v;
+      } else {
+        b->as_f32()[i] = v;
+      }
+    }
+    co_await ctx.write(0, std::move(b));
+  }
+
+  const StageSpec&
+  spec() const noexcept override
+  {
+    static const PortSpec op[] = {
+      {.name = "image", .doc = "", .type = &typeid(TensorBeatPayload)}};
+    static const StageSpec s = {.type_name = kTypeName, .doc = "",
+                                .display_name = "", .oports = op};
+    return s;
+  }
+};
+
+std::vector<float>
+encode_picture_(TensorBeat::DType dtype, const char* input_range)
+{
+  g_pixels.clear();
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto src_u = std::make_unique<PictureSource>(&sess, "src",
+                                               std::vector<InEdge>{},
+                                               FlexData::make_object());
+  src_u->dtype = dtype;
+  src_u->allocate_oports(1);
+  auto* src = pl->insert_stage(std::move(src_u));
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("hf_dir",
+                                   FlexData::make_string("/ut/venc-model"));
+  cfg.as_object().insert_or_assign("input_range",
+                                   FlexData::make_string(input_range));
+  auto* enc = pl->insert_stage(std::make_unique<VaeEncodeStage>(
+      &sess, "venc", std::vector<InEdge>{{src, 0}}, cfg));
+  pl->insert_stage(std::make_unique<LatentSink>(
+      &sess, "sink", std::vector<InEdge>{{enc, 0}},
+      FlexData::make_object()));
+  PipelineRuntime rt(pl.get(), &sess);
+  if (!rt.launch()) { return {}; }
+  rt.wait_idle();
+  rt.stop();
+  return g_pixels;
+}
+
+}  // namespace
+
+TEST(vae_encode_plugin, an_f16_picture_encodes_as_its_f32_twin)
+{
+  EXPECT_TRUE(register_stub_());
+  const auto f32 = encode_picture_(TensorBeat::DType::F32, "unit");
+  const auto f16 = encode_picture_(TensorBeat::DType::F16, "byte");
+  std::printf("[vae_encode_plugin] f16: %zu pixels, f32: %zu\n",
+              f16.size(), f32.size());
+  ASSERT_TRUE(!f32.empty() && f16.size() == f32.size());
+  if (f32.empty() || f16.size() != f32.size()) { return; }
+  EXPECT_TRUE(f16 == f32);
+  // And what both are: 2v - 1 for v = 0, 0.25, 0.5, 1.
+  EXPECT_TRUE(f16[0] == -1.0f && f16[1] == -0.5f && f16[2] == 0.0f &&
+              f16[3] == 1.0f);
 }

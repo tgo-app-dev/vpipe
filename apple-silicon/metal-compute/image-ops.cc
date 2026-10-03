@@ -719,6 +719,111 @@ resample_lanczos_planar_u8_to_u8(
 }
 
 bool
+resample_planar_float(
+    MetalCompute& mc, const ExternalStorageHandle& src, PlanarFloat elt,
+    int channels, int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h, int mode, int src_x, int src_y, float scale,
+    int filter, const float pad[4], const SessionContextIntf* session)
+{
+  if (!mc.valid() || (channels != 3 && channels != 4)
+      || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) {
+    return false;
+  }
+  auto* src_buf = static_cast<MTL::Buffer*>(src.mtl_buffer);
+  auto* dst_buf = static_cast<MTL::Buffer*>(dst.mtl_buffer);
+  if (!src_buf || !dst_buf) { return false; }
+  const std::size_t esz = elt == PlanarFloat::F16 ? 2 : 4;
+  const std::size_t need_src =
+      static_cast<std::size_t>(channels) * in_w * in_h * esz;
+  const std::size_t need_dst =
+      static_cast<std::size_t>(channels) * out_w * out_h * esz;
+  if (src.byte_size < need_src || dst.byte_size < need_dst) { return false; }
+
+  const ResampleGeom g =
+      compute_resample_geom(in_w, in_h, out_w, out_h, mode, src_x, src_y,
+                            scale);
+  // A source rectangle with no area (manual, sampled past the edge) is
+  // all pad: the kernels test every pixel against an empty rectangle.
+  const int new_w = std::max(g.new_w, 0), new_h = std::max(g.new_h, 0);
+  uint32_t params[4] = {
+      static_cast<uint32_t>(in_w),  static_cast<uint32_t>(in_h),
+      static_cast<uint32_t>(out_w), static_cast<uint32_t>(out_h) };
+  uint32_t params2[4] = {
+      static_cast<uint32_t>(new_w),   static_cast<uint32_t>(new_h),
+      static_cast<uint32_t>(g.pad_x), static_cast<uint32_t>(g.pad_y) };
+  const float padv[4] = { pad[0], pad[1], pad[2], pad[3] };
+  const char* sfx = elt == PlanarFloat::F16 ? "f16" : "f32";
+
+  if (filter == 0) {
+    float params3[4] = { g.inv_x, g.inv_y, g.src_x0, g.src_y0 };
+    uint32_t params4[4] = { static_cast<uint32_t>(channels), 0u, 0u, 0u };
+    const std::string fn = std::string("resample_bilinear_planar_") + sfx;
+    return dispatch_(mc, "resample_planar_float", fn, "resample-float",
+        session, [&](ComputeEncoder& enc, const ComputeFunction& f) {
+          enc.set_mtl_buffer(0, src_buf, 0);
+          enc.set_mtl_buffer(1, dst_buf, 0);
+          enc.set_constant_bytes(2, params,  sizeof(params));
+          enc.set_constant_bytes(3, params2, sizeof(params2));
+          enc.set_constant_bytes(4, params3, sizeof(params3));
+          enc.set_constant_bytes(5, params4, sizeof(params4));
+          enc.set_constant_bytes(6, padv,    sizeof(padv));
+          const Dims2D d = dims2d_(f, out_w, out_h);
+          enc.dispatch(d.grid, d.threadgroup);
+          return true;
+        });
+  }
+
+  // Lanczos or bicubic: the filter IS the table. One element stands in
+  // for an empty axis, whose taps no thread reads.
+  std::vector<int> bx, by;
+  std::vector<float> wx, wy;
+  int ksx = 0, ksy = 0;
+  if (new_w > 0 && new_h > 0) {
+    const bool cubic = filter == 2;
+    ksx = cubic
+        ? build_cubic_coeffs(in_w, g.src_x0, new_w, g.inv_x, bx, wx)
+        : build_lanczos_coeffs(in_w, g.src_x0, new_w, g.inv_x, bx, wx);
+    ksy = cubic
+        ? build_cubic_coeffs(in_h, g.src_y0, new_h, g.inv_y, by, wy)
+        : build_lanczos_coeffs(in_h, g.src_y0, new_h, g.inv_y, by, wy);
+  }
+  if (bx.empty()) { bx.assign(1, 0); wx.assign(1, 0.0f); }
+  if (by.empty()) { by.assign(1, 0); wy.assign(1, 0.0f); }
+  SharedBuffer wxb =
+      staging_from_bytes_(mc, wx.data(), wx.size() * sizeof(float));
+  SharedBuffer bxb =
+      staging_from_bytes_(mc, bx.data(), bx.size() * sizeof(int));
+  SharedBuffer wyb =
+      staging_from_bytes_(mc, wy.data(), wy.size() * sizeof(float));
+  SharedBuffer byb =
+      staging_from_bytes_(mc, by.data(), by.size() * sizeof(int));
+  if (wxb.empty() || bxb.empty() || wyb.empty() || byb.empty()) {
+    return false;
+  }
+  uint32_t params3[4] = {
+      static_cast<uint32_t>(ksx), static_cast<uint32_t>(ksy),
+      static_cast<uint32_t>(channels), 0u };
+  const std::string fn = std::string("resample_separable_planar_") + sfx;
+  // The coeff SharedBuffers outlive the synchronous dispatch below.
+  return dispatch_(mc, "resample_planar_float", fn, "resample-float",
+      session, [&](ComputeEncoder& enc, const ComputeFunction& f) {
+        enc.set_mtl_buffer(0, src_buf, 0);
+        enc.set_mtl_buffer(1, dst_buf, 0);
+        enc.set_buffer(2, wxb, 0);
+        enc.set_buffer(3, bxb, 0);
+        enc.set_buffer(4, wyb, 0);
+        enc.set_buffer(5, byb, 0);
+        enc.set_constant_bytes(6, params,  sizeof(params));
+        enc.set_constant_bytes(7, params2, sizeof(params2));
+        enc.set_constant_bytes(8, params3, sizeof(params3));
+        enc.set_constant_bytes(9, padv,    sizeof(padv));
+        const Dims2D d = dims2d_(f, out_w, out_h);
+        enc.dispatch(d.grid, d.threadgroup);
+        return true;
+      });
+}
+
+bool
 letterbox_planar_u8_to_bgra_cvpixelbuffer(
     MetalCompute& mc, const ExternalStorageHandle& src,
     int in_w, int in_h, void* cv_pixel_buffer,

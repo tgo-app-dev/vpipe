@@ -17,6 +17,7 @@ list(APPEND VPIPE_SOURCES ${LOCAL_SOURCES})
 
 if(VPIPE_BUILD_APPLE_SILICON)
     add_subdirectory(coreml)
+    add_subdirectory(media)
     add_subdirectory(metal-compute)
     # The generative-model (LLM/VLM) subsystem moved to the top-level
     # generative-models/ tree (added from the root CMakeLists). The

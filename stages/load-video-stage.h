@@ -210,6 +210,7 @@ private:
     // EncodedSegment. UNSPECIFIED until cache_stream_ reads it.
     int color_range = 0, colorspace = 2;
     int color_primaries = 2, color_trc = 2;
+    int video_delay = 0;    // B-frame reorder depth; see EncodedSegment
     // Gapless bookkeeping for an AUDIO stream; see EncodedSegment.
     std::int64_t skip_head = 0, total_samples = 0;
     std::vector<std::uint8_t> extradata;

@@ -267,6 +267,26 @@ push.wait();                       // replied once the beat is out
 `StageHandle::commands_json()` describes what a stage accepts. Every call
 is thread-safe, and none throws.
 
+**Without JSON text.** A host that builds its data in code can skip the
+text: `StageHandle::command(name, const FlexData& args, buffers)` takes the
+arguments as a document (checked against the declaration exactly as parsed
+JSON is; Null means none), and `CommandHandle::result()` returns the reply
+as one. Kinds survive that way: an unsigned `seq` is a Uint, where JSON
+text would only say "a number". The same in-memory forms exist for a
+pipeline spec (`SessionIntf::load_pipeline(const FlexData&)`) and a session
+config (`SessionManager::create_session(const FlexData&)`). They need
+`common/flex-data.h`, from the SDK.
+
+```cpp
+#include "common/flex-data.h"
+
+FlexData args = FlexData::make_object();
+args.as_object().insert("type", FlexData::make_string("f16"));
+// ... "shape" ...
+CommandHandle lease = p.stage("in").command("lease", args);
+const FlexData r = lease.result();       // {"seq": 1, ...}, kinds intact
+```
+
 ## Calling from Python
 
 Buffers go in as anything array-like: numpy, torch or jax arrays, `bytes`,

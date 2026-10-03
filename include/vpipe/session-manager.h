@@ -46,6 +46,11 @@ public:
   // methods on SessionIntf may be called on it.
   virtual const SessionIntf* create_session(std::string_view = "") = 0;
 
+  // The same, from a config document already in memory (an object; Null
+  // for the built-in defaults). Needs common/flex-data.h. (Non-virtual,
+  // like SessionIntf::load_pipeline(const FlexData&).)
+  const SessionIntf* create_session(const FlexData& config);
+
   // Destroy a session previously returned by `create_session`. Any
   // pipelines still launched on it are stopped first. After this
   // call every PipelineHandle / StageHandle that referenced the

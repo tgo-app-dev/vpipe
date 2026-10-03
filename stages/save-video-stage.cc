@@ -389,6 +389,7 @@ SaveVideoStage::release_media_()
     _libs->avutil().api.frame_free(&_apcm_frame);
     _apcm_frame = nullptr;
   }
+  free_held_video_();
   _vstream = nullptr;
   _astream = nullptr;
 }
@@ -411,6 +412,11 @@ SaveVideoStage::reset_run_state()
   _apcm_carry.clear();
   _apcm_carry_n      = 0;
   _next_port         = 0;
+  _vdts_shift        = 0;
+  _vdts_settled      = false;
+  _vlast_dts         = 0;
+  _vlast_valid       = false;
+  _vdts_guessed      = false;
   _model_name.clear();
   // A fresh name for the next launch. Without `no_overwrite` the
   // template resolves to the same thing again and the run rewrites its
@@ -1072,21 +1078,122 @@ SaveVideoStage::open_output_and_write_header_()
   }
 }
 
+// Packets a reordering video encoder hands out before its dts shift is
+// settled: enough to see a few mini-GOPs of any B-frame structure.
+constexpr std::size_t kReorderWindow = 16;
+
+bool
+SaveVideoStage::video_reorders_() const
+{
+  return _venc != nullptr
+      && (_venc->max_b_frames > 0 || _venc->has_b_frames > 0);
+}
+
+// THE DTS A REORDERING ENCODER STAMPS CAN RUN AHEAD OF ITS PTS, and the
+// muxer refuses such a packet ("Invalid argument") -- the frame is gone.
+// h264_videotoolbox does it with B-frames on (bf > 0): VideoToolbox
+// builds a B-pyramid that reorders two frames deep while libavcodec's
+// wrapper offsets dts for one, so one B-frame per mini-GOP is stamped
+// pts < dts. MEASURED: 33 frames in, 29 in the file, 4 refusals. (The
+// ffmpeg CLI patches the same packets with a guess; see
+// write_video_packet_.)
+//
+// The fix that keeps every timestamp: hold the first kReorderWindow
+// packets, shift ALL dts down by the worst pts < dts among them, write.
+// A constant shift keeps dts increasing; an encoder whose dts are
+// already sound (libx264) gets a shift of 0 and an unchanged file.
+void
+SaveVideoStage::settle_video_dts_()
+{
+  std::int64_t need = 0;
+  for (AVPacket* p : _vheld) {
+    if (p->pts != AV_NOPTS_VALUE && p->dts != AV_NOPTS_VALUE) {
+      need = std::max(need, p->dts - p->pts);
+    }
+  }
+  _vdts_shift = need;
+  _vdts_settled = true;
+  if (need > 0) {
+    session()->log_verbose(fmt(
+      "encoder('{}'): the video encoder's dts run {} tick(s) ahead of "
+      "pts; shifting them back", this->id(), need));
+  }
+  for (AVPacket*& p : _vheld) {
+    write_video_packet_(p);
+    _libs->avcodec().api.packet_free(&p);
+  }
+  _vheld.clear();
+}
+
+void
+SaveVideoStage::write_video_packet_(AVPacket* pkt)
+{
+  if (pkt->dts != AV_NOPTS_VALUE) { pkt->dts -= _vdts_shift; }
+  // A packet the window did not foresee still cannot go in as it is.
+  // The ffmpeg CLI's own repair, last resort: pts and dts both become
+  // the middle of (pts, dts, previous dts + 1) -- a tick off in the
+  // muxer's time base, rather than a frame lost.
+  if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE
+      && pkt->dts > pkt->pts) {
+    if (!_vdts_guessed) {
+      session()->warn(fmt(
+        "encoder('{}'): video packet with dts {} > pts {}; guessing "
+        "its timestamps", this->id(), pkt->dts, pkt->pts));
+      _vdts_guessed = true;
+    }
+    const std::int64_t floor = _vlast_valid ? _vlast_dts + 1 : pkt->pts;
+    const std::int64_t a = pkt->pts, b = pkt->dts;
+    pkt->pts = pkt->dts = std::max(std::min(a, b),
+                                   std::min(std::max(a, b), floor));
+  }
+  if (pkt->dts != AV_NOPTS_VALUE) {
+    _vlast_dts = pkt->dts;
+    _vlast_valid = true;
+  }
+  int rc = _libs->avformat().api.interleaved_write_frame(_ofctx, pkt);
+  if (rc < 0) {
+    session()->warn(fmt(
+      "encoder('{}'): interleaved_write_frame: {}",
+      this->id(), av_err_(rc)));
+  }
+}
+
+void
+SaveVideoStage::free_held_video_()
+{
+  for (AVPacket*& p : _vheld) {
+    _libs->avcodec().api.packet_free(&p);
+  }
+  _vheld.clear();
+}
+
 void
 SaveVideoStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
 {
+  const bool reorders = enc == _venc && video_reorders_();
   while (true) {
-    int rc = _libs->avcodec().api.receive_packet(enc, _enc_pkt);
+    // A packet to hold is received straight into its own allocation.
+    AVPacket* pkt = _enc_pkt;
+    if (reorders && !_vdts_settled) {
+      pkt = _libs->avcodec().api.packet_alloc();
+      if (pkt == nullptr) {
+        settle_video_dts_();
+        pkt = _enc_pkt;
+      }
+    }
+    int rc = _libs->avcodec().api.receive_packet(enc, pkt);
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+      if (pkt != _enc_pkt) { _libs->avcodec().api.packet_free(&pkt); }
       break;
     }
     if (rc < 0) {
       session()->warn(fmt(
         "encoder('{}'): receive_packet: {}",
         this->id(), av_err_(rc)));
+      if (pkt != _enc_pkt) { _libs->avcodec().api.packet_free(&pkt); }
       break;
     }
-    _enc_pkt->stream_index = st->index;
+    pkt->stream_index = st->index;
     // An encoder that leaves duration at 0 costs the LAST sample its
     // length: the mov muxer derives every other sample's duration from
     // the next packet's dts, and there is no next packet for the final
@@ -1095,25 +1202,33 @@ SaveVideoStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
     // the final frame -- a 33-frame clip plays back 32. Fill it in
     // from the encoder's own rate before the rescale, which carries
     // duration across with the timestamps.
-    if (_enc_pkt->duration <= 0) {
+    if (pkt->duration <= 0) {
       if (enc->codec_type == AVMEDIA_TYPE_VIDEO
           && enc->framerate.num > 0 && enc->framerate.den > 0)
       {
-        _enc_pkt->duration = _libs->avutil().api.rescale_q(
+        pkt->duration = _libs->avutil().api.rescale_q(
             1, av_inv_q(enc->framerate), enc->time_base);
       } else if (enc->codec_type == AVMEDIA_TYPE_AUDIO
                  && enc->frame_size > 0 && enc->sample_rate > 0)
       {
-        _enc_pkt->duration = _libs->avutil().api.rescale_q(
+        pkt->duration = _libs->avutil().api.rescale_q(
             enc->frame_size, AVRational{1, enc->sample_rate},
             enc->time_base);
       }
     }
-    _libs->avcodec().api.packet_rescale_ts(_enc_pkt,
+    _libs->avcodec().api.packet_rescale_ts(pkt,
                                           enc->time_base,
                                           st->time_base);
-    rc = _libs->avformat().api.interleaved_write_frame(_ofctx,
-                                                      _enc_pkt);
+    if (pkt != _enc_pkt) {
+      _vheld.push_back(pkt);
+      if (_vheld.size() >= kReorderWindow) { settle_video_dts_(); }
+      continue;
+    }
+    if (reorders) {
+      write_video_packet_(pkt);
+      continue;
+    }
+    rc = _libs->avformat().api.interleaved_write_frame(_ofctx, pkt);
     if (rc < 0) {
       session()->warn(fmt(
         "encoder('{}'): interleaved_write_frame: {}",
@@ -1158,6 +1273,8 @@ SaveVideoStage::finalize_()
     if (_venc) {
       _libs->avcodec().api.send_frame(_venc, nullptr);
       drain_encoder_(_venc, _vstream);
+      // A clip shorter than the window: its packets are all held.
+      if (!_vheld.empty()) { settle_video_dts_(); }
     }
     if (_aenc) {
       // The samples that never filled a frame. HERE is the one place a

@@ -1,6 +1,10 @@
 #include "stages/load-image-stage.h"
 #include "stages/image-decode.h"
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/media/image-io.h"
+#endif
+
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -42,6 +46,30 @@ LoadImageStage::LoadImageStage(const SessionContextIntf* s,
   // stage must construct for any config so a graph can be built/edited
   // before a url is supplied.
   _keep_alpha = attr_str("alpha") == "keep";
+  _dtype = attr_str("dtype");
+  _decoder = attr_str("decoder");
+  const string raw = attr_str("raw");
+  _raw_linear = raw == "linear";
+  _raw_exposure = attr_real("raw_exposure");
+  if (raw != "rendered" && raw != "linear") {
+    fail_config(fmt("LoadImageStage('{}'): raw must be rendered or linear",
+                    this->id()));
+  }
+  if (_dtype != "u8" && _dtype != "f16" && _dtype != "auto") {
+    fail_config(fmt("LoadImageStage('{}'): dtype must be u8, f16 or auto",
+                    this->id()));
+  }
+  if (_decoder != "auto" && _decoder != "ffmpeg" && _decoder != "imageio") {
+    fail_config(fmt(
+        "LoadImageStage('{}'): decoder must be auto, ffmpeg or imageio",
+        this->id()));
+  }
+#ifndef VPIPE_BUILD_APPLE_SILICON
+  if (_decoder == "imageio" || _dtype == "f16") {
+    fail_config(fmt("LoadImageStage('{}'): ImageIO and F16 need the "
+                    "Apple build", this->id()));
+  }
+#endif
   const FlexData& cfg = this->config();
   if (cfg.is_object()) {
     auto root = cfg.as_object();
@@ -95,6 +123,15 @@ namespace {
 constexpr SpecExtra kAlphaChoices[] = {
   {spec_key::kChoices, "drop,keep"},
 };
+constexpr SpecExtra kDtypeChoices[] = {
+  {spec_key::kChoices, "u8,f16,auto"},
+};
+constexpr SpecExtra kDecoderChoices[] = {
+  {spec_key::kChoices, "auto,ffmpeg,imageio"},
+};
+constexpr SpecExtra kRawChoices[] = {
+  {spec_key::kChoices, "rendered,linear"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "url", .type = ConfigType::Any, .required = true,
    .doc = "image path/URL string or array of strings",
@@ -109,6 +146,39 @@ constexpr ConfigKey kAttrs[] = {
           "whatever colour sits under its transparent pixels rather "
           "than being composited",
    .def_str = "drop", .extra = kAlphaChoices},
+  {.key = "dtype", .type = ConfigType::String, .required = false,
+   .doc = "u8 | f16 | auto. u8 (the default) is what every consumer "
+          "reads. f16 keeps what is deeper than 8 bits -- 16-bit PNG and "
+          "TIFF, 10/12-bit HEIC, OpenEXR's float (values above 1 "
+          "included): samples 0..1 over the file's code range in its own "
+          "transfer, tagged with its colour (sideband color_primaries, "
+          "color_transfer, ...). auto: f16 for a file deeper than 8 bits "
+          "or float -- a camera RAW is -- u8 otherwise",
+   .def_str = "u8", .extra = kDtypeChoices},
+  {.key = "decoder", .type = ConfigType::String, .required = false,
+   .doc = "auto | ffmpeg | imageio. imageio (Apple) reads 16-bit, float "
+          "(OpenEXR) and HEIC stills as stored and keeps the colour space "
+          "the file declares; FFmpeg's path is 8-bit and untagged. auto: "
+          "ImageIO for those files, camera RAW and an f16 read, FFmpeg "
+          "otherwise",
+   .def_str = "auto", .extra = kDecoderChoices},
+  {.key = "raw", .type = ConfigType::String, .required = false,
+   .doc = "rendered | linear: how a camera RAW (CR2, CR3, NEF, ARW, RAF, "
+          "DNG, ...) is DEVELOPED -- it has no colour space to read, the "
+          "development decides one. rendered (the default): the camera's "
+          "own look, as a viewer shows the file -- its tone curve, "
+          "noise reduction, highlight recovery -- as sRGB 0..1, what a "
+          "model was trained on. linear: scene-linear, no tone curve, "
+          "the sensor's highlight headroom kept above 1, in linear "
+          "BT.2020 so no camera colour clips; read it as f16. Either "
+          "way the picture comes out UPRIGHT (the EXIF orientation "
+          "applied, and the metadata oport's EXIF says 1). Ignored for "
+          "other files",
+   .def_str = "rendered", .extra = kRawChoices},
+  {.key = "raw_exposure", .type = ConfigType::Real, .required = false,
+   .doc = "exposure for a camera RAW, in EV on top of the camera's "
+          "baseline (+1 doubles the light). Ignored for other files",
+   .def_real = 0.0},
 };
 const PortSpec kIports[] = {
   {.name = "trigger", .doc = "optional pacing beat (e.g. chrono); each "
@@ -116,9 +186,9 @@ const PortSpec kIports[] = {
    .type = nullptr, .clock_group = 0},
 };
 const PortSpec kOports[] = {
-  {.name = "image", .doc = "decoded image as a planar U8 TensorBeat -- "
-                           "RGB [3,H,W], or RGBA [4,H,W] when the "
-                           "`alpha` config says keep",
+  {.name = "image", .doc = "decoded image as a planar TensorBeat, U8 or "
+                           "(per `dtype`) F16 -- RGB [3,H,W], or RGBA "
+                           "[4,H,W] when the `alpha` config says keep",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
   {.name = "metadata", .doc = "FlexData {url, width, height, exif{...}, "
@@ -140,9 +210,11 @@ const PortSpec kOports[] = {
 constexpr unsigned kImagesPort = 2;
 const StageSpec kSpec = {
   .type_name = "load-image",
-  .doc       = "Source: decodes still images from files/URLs (FFmpeg) to "
-               "planar U8 RGB TensorBeats. With a wired trigger iport one "
-               "beat emits one image; unwired it emits all then ends.",
+  .doc       = "Source: decodes still images from files/URLs to planar "
+               "RGB TensorBeats -- FFmpeg (U8), or ImageIO for 16-bit, "
+               "OpenEXR and HEIC (U8 or F16, colour tagged). With a wired "
+               "trigger iport one beat emits one image; unwired it emits "
+               "all then ends.",
   .display_name = "Load Image",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -162,6 +234,39 @@ LoadImageStage::~LoadImageStage() = default;
 unique_ptr<BeatPayloadIntf>
 LoadImageStage::decode_url_(const string& url) const
 {
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // ImageIO for what FFmpeg would flatten, or when asked. Only a local
+  // file: ImageIO does not fetch.
+  string local = url;
+  if (local.rfind("file://", 0) == 0) { local.erase(0, 7); }
+  const bool remote = local.find("://") != string::npos;
+  if (!remote && _decoder != "ffmpeg") {
+    apple_media::StillInfo info;
+    string perr;
+    const bool known = apple_media::probe_still(local, &info, &perr);
+    const bool deep = known && apple_media::prefers_imageio(info);
+    const bool f16 = _dtype == "f16" || (_dtype == "auto" && deep);
+    if (_decoder == "imageio" || f16 || deep) {
+      apple_media::RawOptions raw;
+      raw.look = _raw_linear ? apple_media::RawOptions::Look::Linear
+                             : apple_media::RawOptions::Look::Rendered;
+      raw.exposure = _raw_exposure;
+      if (info.raw && _raw_linear && !f16) {
+        session()->warn(fmt(
+            "LoadImageStage('{}'): a linear RAW in 8 bits bands; read it "
+            "with dtype f16", this->id()));
+      }
+      string err;
+      auto out = apple_media::read_still(
+          local, f16 ? TensorBeat::DType::F16 : TensorBeat::DType::U8,
+          _keep_alpha, nullptr, &err, raw);
+      if (!out) {
+        session()->warn(fmt("LoadImageStage('{}'): {}", this->id(), err));
+      }
+      return out;
+    }
+  }
+#endif
   ImageDecodeOptions opt;
   opt.keep_alpha = _keep_alpha;
   string err;
@@ -195,7 +300,19 @@ LoadImageStage::build_metadata_(const string&          url,
   if (local.rfind("file://", 0) == 0) { local.erase(0, 7); }
   const bool is_remote = local.find("://") != string::npos;
   if (!is_remote) {
-    const vector<uint8_t> tiff = imgmeta::read_exif_blob(local);
+    vector<uint8_t> tiff = imgmeta::read_exif_blob(local);
+#ifdef VPIPE_BUILD_APPLE_SILICON
+    // A camera RAW was developed UPRIGHT (decode_url_), so the EXIF that
+    // goes with it must not ask a viewer to turn it again.
+    if (!tiff.empty() && _decoder != "ffmpeg") {
+      apple_media::StillInfo info;
+      string perr;
+      if (apple_media::probe_still(local, &info, &perr) && info.raw &&
+          info.orientation != 1) {
+        imgmeta::exif_set_orientation(tiff, 1);
+      }
+    }
+#endif
     if (!tiff.empty()) {
       FlexData ex = imgmeta::parse_exif(tiff);
       if (ex.is_object()) {

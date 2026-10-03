@@ -14,14 +14,17 @@ namespace vpipe {
 
 namespace metal_compute { class MetalCompute; }
 
-// Apple-Silicon image-resample stage. Takes planar RGB TensorBeats
-// (rgb-frames, [3,H,W], u8 or f32) and emits the same, resampled to the
-// configured width x height. The iport and oport share one clock domain
-// (1:1). u8 frames go through the (generalised) letterbox GPU kernel; a
-// CPU bilinear fallback covers f32 and no-metal builds.
+// Apple-Silicon image-resample stage. Takes planar RGB or RGBA
+// TensorBeats (rgb-frames, [3|4,H,W], u8, f16 or f32) and emits the same,
+// resampled to the configured width x height. The iport and oport share
+// one clock domain (1:1). f16 and f32 frames resample on the GPU in their
+// own element type (resample_planar_float: every filter, fit and channel
+// count); u8 RGB through the letterbox / Lanczos kernels; a CPU path
+// implements everything, for u8 RGBA and bicubic, no-metal builds and
+// `gpu: false`.
 //
-//   iport0  planar RGB TensorBeat [3,H,W] (u8 or f32), tag rgb-frames.
-//   oport0  planar RGB TensorBeat [3,height,width] (same dtype), rgb-frames.
+//   iport0  planar TensorBeat [3|4,H,W] (u8, f16 or f32), tag rgb-frames.
+//   oport0  planar TensorBeat [3|4,height,width] (same dtype), rgb-frames.
 //
 // `fit` picks how a mismatched input/output aspect ratio is handled:
 //   pad      match the long side, centre, pad the rest with `pad_color`.
@@ -29,7 +32,8 @@ namespace metal_compute { class MetalCompute; }
 //   stretch  fill the output, change the aspect ratio.
 //   manual   sample from (src_x, src_y) at `scale`, placed at the output
 //            origin, `pad_color` where the source runs out.
-// `algorithm` selects the interpolation (bilinear only for now).
+// `algorithm` selects the interpolation: lanczos (default), bilinear,
+// bicubic.
 class ImageResampleStage final : public TypedStage<ImageResampleStage> {
 public:
   static constexpr const char* kTypeName = "image-resample";
@@ -64,15 +68,16 @@ private:
   int          _src_x{}, _src_y{}; // manual source origin
   double       _scale{};           // manual resample ratio
   std::uint8_t _pad_r{}, _pad_g{}, _pad_b{};
+  bool         _gpu{true};         // false pins the CPU path
 
   metal_compute::MetalCompute* _mc = nullptr;
-  // Reused src-upload staging buffer (only for a CpuCached u8 input on the
-  // GPU path); re-allocated when the input dims change.
+  // Reused src-upload staging buffer (a CpuCached input on a GPU path);
+  // re-allocated when a frame needs more bytes than it holds.
   std::unique_ptr<ExternalStorageHandle> _src_stage;
-  int _stage_in_w = 0, _stage_in_h = 0;
+  std::size_t _stage_bytes = 0;
 
-  // CPU bilinear fallback (f32, or no metal). Handles u8 and f32; matches
-  // the GPU kernel's geometry exactly for u8. `out_w`/`out_h` are the
+  // CPU bilinear path. Handles u8 and f32 (f16 arrives widened); matches
+  // the GPU kernels' geometry exactly. `out_w`/`out_h` are the
   // resolved (aspect-inferred) output dimensions.
   // `C` is the plane count: 3 for RGB, 4 for RGBA. An RGBA source is
   // handed here PREMULTIPLIED and unpremultiplied by the caller -- see
@@ -81,10 +86,9 @@ private:
                      int out_w, int out_h,
                      std::uint8_t* dst, bool is_f32, int C = 3) const;
 
-  // CPU separable-kernel fallback (f32 frames, no metal, or bicubic --
-  // which has no GPU twin). `cubic` picks Pillow's BICUBIC over
-  // Lanczos-3; both match PIL and the resample_lanczos_planar_u8 GPU
-  // kernel's geometry.
+  // CPU separable-kernel path (u8 bicubic, u8 RGBA, no metal, or
+  // `gpu: false`). `cubic` picks Pillow's BICUBIC over Lanczos-3; both
+  // match PIL and the GPU kernels' geometry and tables.
   void cpu_lanczos_(const std::uint8_t* src, int in_w, int in_h,
                     int out_w, int out_h,
                     std::uint8_t* dst, bool is_f32, bool cubic,

@@ -1881,11 +1881,13 @@ const STRINGS = {
       '可选的共享模型引用，来自 model-select 源；覆盖 hf_dir 配置',
       '可選的共享模型參照，來自 model-select 來源；覆寫 hf_dir 設定'],
   'port.diffusion-conditioner.ref_image': ['',
-      '可选的原始参考图像（平面 U8 RGB TensorBeat [3,H,W]，即 load-image 的'
-      + '格式）。能看图的模型族（Qwen-Image-Edit）会把它送进 Qwen2.5-VL 视'
+      '可选的原始参考图像（平面 RGB TensorBeat [3,H,W]，即 load-image 的'
+      + '格式；U8，或 0..1 的 F16 / F32——为视觉塔舍入到 8 位，VAE 仍保留其'
+      + '精度）。能看图的模型族（Qwen-Image-Edit）会把它送进 Qwen2.5-VL 视'
       + '觉塔；其余模型族会忽略它。',
-      '可選的原始參考影像（平面 U8 RGB TensorBeat [3,H,W]，即 load-image 的'
-      + '格式）。能看圖的模型族（Qwen-Image-Edit）會把它送進 Qwen2.5-VL 視'
+      '可選的原始參考影像（平面 RGB TensorBeat [3,H,W]，即 load-image 的'
+      + '格式；U8，或 0..1 的 F16 / F32——為視覺塔捨入到 8 位元，VAE 仍保留'
+      + '其精度）。能看圖的模型族（Qwen-Image-Edit）會把它送進 Qwen2.5-VL 視'
       + '覺塔；其餘模型族會忽略它。'],
   'port.diffusion-conditioner.ref_image2': ['',
       '可选的第二张参考图像（格式相同）。Qwen-Image-Edit-2511 支持多参考，'
@@ -3378,6 +3380,15 @@ const STRINGS = {
       + '格一個節拍，好讓下游沿用既有的逐格機制（save-image、rgb-to-video -'
       + '> save-video、預覽），也可以在 1 號輸出埠以單個節拍取回整段片段。'
       + '具體執行哪個解碼器取決於常駐模型族；由外掛註冊的模型族自行解碼。'],
+  'cfg.vae-decode.dtype': ['',
+      'u8 | f16：发出的图片格式。u8（默认）把解码器的样本量化为 8 位，是多数'
+      + '消费端读取的格式。f16 保留它们（0..1）——用于 16 位 PNG/TIFF、'
+      + 'OpenEXR 或 10 位视频（save-image、avf-save-video），在这里不损失任何'
+      + '精度',
+      'u8 | f16：發出的影像格式。u8（預設）把解碼器的樣本量化為 8 位元，是多數'
+      + '消費端讀取的格式。f16 保留它們（0..1）——用於 16 位元 PNG/TIFF、'
+      + 'OpenEXR 或 10 位元影片（save-image、avf-save-video），在這裡不損失任何'
+      + '精度'],
   'cfg.vae-decode.hf_dir': ['',
       '要解码其 VAE 的模型根目录；常驻模型族会在其中定位 VAE（惯例是 <'
       + 'hf_dir>/vae）。可选：model 输入端口上的 model-select 源会覆盖它',
@@ -3472,13 +3483,13 @@ const STRINGS = {
       + '）的白化潛變數。它是 vae-decode 的鏡像；下游接 generate-image 的 `'
       + 'latent` 埠（圖生圖）。'],
   'cfg.vae-encode.input_range': ['',
-      '仅对 F32 输入有效（U8 恒为 0..255）：采样值代表什么。"unit"（默认）'
+      '仅对 F32 输入有效（U8 恒为 0..255，F16 恒为 0..1）：采样值代表什么。"unit"（默认）'
       + '是 [0,1]——即 video-to-rgb 打开 `normalize` 时发出的范围，也是预览'
       + '阶段所说的归一化；"byte" 是 [0,255]，即 video-to-rgb 关闭 `'
       + 'normalize` 时；"signed" 是 [-1,1]，VAE 自身的约定，供已经完成映射'
       + '的生产者使用。设错不会报错——它只会让每个潜变量整体偏移，取回的画面'
       + '看起来不过是发白而已',
-      '僅對 F32 輸入有效（U8 恆為 0..255）：取樣值代表什麼。"unit"（預設）'
+      '僅對 F32 輸入有效（U8 恆為 0..255，F16 恆為 0..1）：取樣值代表什麼。"unit"（預設）'
       + '是 [0,1]——即 video-to-rgb 開啟 `normalize` 時發出的範圍，也是預覽'
       + '階段所說的正規化；"byte" 是 [0,255]，即 video-to-rgb 關閉 `'
       + 'normalize` 時；"signed" 是 [-1,1]，VAE 自身的約定，供已經完成映射'
@@ -3544,12 +3555,12 @@ const STRINGS = {
       + '被測量。只有已註冊的模型族會讀取它；內建的編解碼器會忽略。環境變數 '
       + 'VPIPE_I8_GEMM 可覆寫'],
   'port.vae-encode.image': ['',
-      'U8 或 f32 RGB，通道优先（U8 为 0..255；f32 按 `input_range` 解读，默'
+      'U8、f16 或 f32 RGB，通道优先（U8 为 0..255；f16 为 0..1；f32 按 `input_range` 解读，默'
       + '认 [0,1]）。由秩决定含义：[3,H,W] 是一张图片，[frames,3,H,W] 是一'
       + '段片段——即 temporal-stack 发出的形状，也是视频 VAE 一次调用就能编'
       + '码的形状，因为它是因果的。图像 VAE 遇到片段会拒绝，而不是只取它的'
       + '第一帧',
-      'U8 或 f32 RGB，通道優先（U8 為 0..255；f32 按 `input_range` 解讀，預'
+      'U8、f16 或 f32 RGB，通道優先（U8 為 0..255；f16 為 0..1；f32 按 `input_range` 解讀，預'
       + '設 [0,1]）。由秩決定含義：[3,H,W] 是一張圖片，[frames,3,H,W] 是一'
       + '段片段——即 temporal-stack 發出的形狀，也是影片 VAE 一次呼叫就能編'
       + '碼的形狀，因為它是因果的。影像 VAE 遇到片段會拒絕，而不是只取它的'
@@ -6688,13 +6699,15 @@ const STRINGS = {
       '合成結果：依 output 為平面 [3,H,W] 或 [4,H,W]，dtype 跟隨 front'],
   'stage.image-resample.doc': ['',
       '把 rgb-frames 重采样到固定的宽 x 高，宽高比的处理方式（填充 / 裁剪 /'
-      + ' 拉伸 / 手动）与填充色均可配置。默认使用 Lanczos-3 重采样；也可选'
-      + '更省的 \'bilinear\'。u8 帧走 GPU 信箱缩放内核，f32 帧走同时实现了两'
-      + '种滤波器的 CPU 路径。输入端口与输出端口同属一个时钟域（1:1）。',
+      + ' 拉伸 / 手动）与填充色均可配置。默认使用 Lanczos-3 重采样；\'bilinear\''
+      + ' 更省，\'bicubic\' 与 PIL 一致。f16 与 f32 帧（RGB 或 RGBA）以任一滤'
+      + '波器在 GPU 上重采样；u8 RGB 帧用 bilinear 或 lanczos 时走 GPU；其余'
+      + '走 CPU。输入端口与输出端口同属一个时钟域（1:1）。',
       '把 rgb-frames 重新取樣到固定的寬 x 高，長寬比的處理方式（填充 / 裁剪'
-      + ' / 拉伸 / 手動）與填充色均可設定。預設使用 Lanczos-3 重新取樣；也'
-      + '可選更省的 \'bilinear\'。u8 影格走 GPU 信箱縮放核心，f32 影格走同時'
-      + '實作了兩種濾波器的 CPU 路徑。輸入埠與輸出埠同屬一個時脈域（1:1）。'],
+      + ' / 拉伸 / 手動）與填充色均可設定。預設使用 Lanczos-3 重新取樣；'
+      + '\'bilinear\' 更省，\'bicubic\' 與 PIL 一致。f16 與 f32 影格（RGB 或 '
+      + 'RGBA）以任一濾波器在 GPU 上重新取樣；u8 RGB 影格用 bilinear 或 '
+      + 'lanczos 時走 GPU；其餘走 CPU。輸入埠與輸出埠同屬一個時脈域（1:1）。'],
   'cfg.image-resample.width': ['',
       '输出宽度（像素）；留空（或设为小于等于 0）则由 height 推断，保持源的'
       + '宽高比',
@@ -6713,8 +6726,8 @@ const STRINGS = {
       + '置中裁剪）| stretch（改變長寬比）| manual（從 src_x,src_y 起按 '
       + 'scale 取樣，其餘填充）'],
   'cfg.image-resample.pad_color': ['',
-      'pad / manual 所用的 #RRGGBB 纯色填充（f32 帧按 0..1 归一化解读）',
-      'pad / manual 所用的 #RRGGBB 純色填充（f32 影格按 0..1 正規化解讀）'],
+      'pad / manual 所用的 #RRGGBB 纯色填充（f16 / f32 帧按 0..1 归一化解读）',
+      'pad / manual 所用的 #RRGGBB 純色填充（f16 / f32 影格按 0..1 正規化解讀）'],
   'cfg.image-resample.src_x': ['',
       'manual：源起点 x',
       'manual：來源起點 x'],
@@ -6728,29 +6741,86 @@ const STRINGS = {
       '插值算法：\'lanczos\'（默认——Lanczos-3，带抗锯齿，与 PIL 的 LANCZOS 一'
       + '致）| \'bilinear\'（更省，但缩小时会产生混叠）。经过本阶段的绝大多数'
       + '流量都是缩小到某个模型的输入画布，而双线性恰恰保留了本应被滤掉的高'
-      + '频——所以好滤波器是默认，快滤波器需要显式选择',
+      + '频——所以好滤波器是默认，快滤波器需要显式选择 | \'bicubic\'（与 PIL '
+      + '的 BICUBIC 一致）。当模型自身的预处理使用它、而像素正是模型据以'
+      + '条件化的内容时，请选 \'bicubic\'：VOSR 修复在任何环节看到输入之前'
+      + '就以这种方式放大输入，换一种滤波器就是另一份输入。f16 与 f32 帧在 '
+      + 'GPU 上运行，u8 帧在 CPU 上运行',
       '插值演算法：\'lanczos\'（預設——Lanczos-3，帶反鋸齒，與 PIL 的 LANCZOS '
       + '一致）| \'bilinear\'（更省，但縮小時會產生疊頻）。經過本階段的絕大多'
       + '數流量都是縮小到某個模型的輸入畫布，而雙線性恰恰保留了本應被濾掉的'
-      + '高頻——所以好濾波器是預設，快濾波器需要明確選擇'],
+      + '高頻——所以好濾波器是預設，快濾波器需要明確選擇 | \'bicubic\'（與 '
+      + 'PIL 的 BICUBIC 一致）。當模型自身的前處理使用它、而像素正是模型據'
+      + '以條件化的內容時，請選 \'bicubic\'：VOSR 修復在任何環節看到輸入之'
+      + '前就以這種方式放大輸入，換一種濾波器就是另一份輸入。f16 與 f32 影'
+      + '格在 GPU 上執行，u8 影格在 CPU 上執行'],
+  'cfg.image-resample.gpu': ['',
+      '在有内核的地方用 GPU 重采样（默认）：f16 与 f32 帧的所有滤波器、适配'
+      + '方式与通道数；u8 RGB 的 bilinear 与 lanczos。设为 false 则固定走 '
+      + 'CPU 路径——它同样实现了以上全部——用于比较两者',
+      '在有核心的地方用 GPU 重新取樣（預設）：f16 與 f32 影格的所有濾波器、'
+      + '適配方式與通道數；u8 RGB 的 bilinear 與 lanczos。設為 false 則固定'
+      + '走 CPU 路徑——它同樣實作了以上全部——用於比較兩者'],
   'port.image-resample.in.frames': ['',
-      '平面 RGB TensorBeat [3,H,W]（u8 或 f32）',
-      '平面 RGB TensorBeat [3,H,W]（u8 或 f32）'],
+      '平面 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat（u8、f16 或 f32）',
+      '平面 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat（u8、f16 或 f32）'],
   'port.image-resample.out.frames': ['',
-      '重采样后的平面 RGB TensorBeat [3,height,width]（dtype 不变）',
-      '重新取樣後的平面 RGB TensorBeat [3,height,width]（dtype 不變）'],
+      '重采样后的平面 TensorBeat [3|4,height,width]（dtype 不变）',
+      '重新取樣後的平面 TensorBeat [3|4,height,width]（dtype 不變）'],
 
   // ---- Image Levels (visual) ----
 
   // ---- Load Image (visual) ----
   'stage.load-image.name': ['', '加载图片', '載入影像'],
   'stage.load-image.doc': ['',
-      '源：用 FFmpeg 把文件/URL 中的静态图片解码为平面 U8 RGB TensorBeat。'
+      '源：把文件/URL 中的静态图片解码为平面 RGB TensorBeat——用 FFmpeg（U8）'
+      + '，或对 16 位、OpenEXR 与 HEIC 用 ImageIO（U8 或 F16，带色彩标记）。'
       + '若接了 trigger 输入端口，则每个节拍发出一张图片；未接时一次发完全'
       + '部然后结束。',
-      '來源：用 FFmpeg 把檔案/URL 中的靜態影像解碼為平面 U8 RGB TensorBeat'
-      + '。若接了 trigger 輸入埠，則每個節拍發出一張影像；未接時一次發完全'
+      '來源：把檔案/URL 中的靜態影像解碼為平面 RGB TensorBeat——用 FFmpeg（U8）'
+      + '，或對 16 位元、OpenEXR 與 HEIC 用 ImageIO（U8 或 F16，帶色彩標記）。'
+      + '若接了 trigger 輸入埠，則每個節拍發出一張影像；未接時一次發完全'
       + '部然後結束。'],
+  'cfg.load-image.dtype': ['',
+      'u8 | f16 | auto。u8（默认）是所有消费端都读的格式。f16 保留 8 位以上'
+      + '的精度——16 位 PNG/TIFF、10/12 位 HEIC、OpenEXR 的浮点（含大于 1 的值）'
+      + '：样本 0..1 对应文件自身传递函数下的码值范围，并带上文件的色彩标记'
+      + '（sideband color_primaries、color_transfer……）。auto：文件深于 8 位'
+      + '或为浮点时用 f16（相机 RAW 即属此类），否则 u8',
+      'u8 | f16 | auto。u8（預設）是所有消費端都讀的格式。f16 保留 8 位元以上'
+      + '的精度——16 位元 PNG/TIFF、10/12 位元 HEIC、OpenEXR 的浮點（含大於 1 '
+      + '的值）：樣本 0..1 對應檔案自身轉換函數下的碼值範圍，並帶上檔案的色彩'
+      + '標記（sideband color_primaries、color_transfer……）。auto：檔案深於 8 '
+      + '位元或為浮點時用 f16（相機 RAW 即屬此類），否則 u8'],
+  'cfg.load-image.decoder': ['',
+      'auto | ffmpeg | imageio。imageio（Apple）按原样读取 16 位、浮点'
+      + '（OpenEXR）与 HEIC 图片，并保留文件声明的色彩空间；FFmpeg 路径为 8 位'
+      + '且不带标记。auto：对这些文件、相机 RAW 以及 f16 读取用 ImageIO，否则'
+      + '用 FFmpeg',
+      'auto | ffmpeg | imageio。imageio（Apple）按原樣讀取 16 位元、浮點'
+      + '（OpenEXR）與 HEIC 影像，並保留檔案宣告的色彩空間；FFmpeg 路徑為 8 '
+      + '位元且不帶標記。auto：對這些檔案、相機 RAW 以及 f16 讀取用 ImageIO，'
+      + '否則用 FFmpeg'],
+  'cfg.load-image.raw': ['',
+      'rendered | linear：相机 RAW（CR2、CR3、NEF、ARW、RAF、DNG……）如何'
+      + '“冲洗”——它没有可读取的色彩空间，由冲洗决定。rendered（默认）：相机'
+      + '自己的观感，即查看器显示的样子——其色调曲线、降噪、高光恢复——输出为 '
+      + 'sRGB 0..1，正是模型训练所用的。linear：场景线性，无色调曲线，传感器'
+      + '的高光余量保留在 1 以上，采用线性 BT.2020，相机色彩不被裁切；请以 '
+      + 'f16 读取。两种方式输出的画面都是正立的（已应用 EXIF 方向，metadata '
+      + '输出端口的 EXIF 记为 1）。对其他文件无效',
+      'rendered | linear：相機 RAW（CR2、CR3、NEF、ARW、RAF、DNG……）如何'
+      + '「沖洗」——它沒有可讀取的色彩空間，由沖洗決定。rendered（預設）：相機'
+      + '自己的觀感，即檢視器顯示的樣子——其色調曲線、降噪、亮部復原——輸出為 '
+      + 'sRGB 0..1，正是模型訓練所用的。linear：場景線性，無色調曲線，感光元件'
+      + '的亮部餘量保留在 1 以上，採用線性 BT.2020，相機色彩不被裁切；請以 '
+      + 'f16 讀取。兩種方式輸出的畫面都是正立的（已套用 EXIF 方向，metadata '
+      + '輸出埠的 EXIF 記為 1）。對其他檔案無效'],
+  'cfg.load-image.raw_exposure': ['',
+      '相机 RAW 的曝光，单位 EV，叠加在相机基准曝光之上（+1 使光量加倍）。'
+      + '对其他文件无效',
+      '相機 RAW 的曝光，單位 EV，疊加在相機基準曝光之上（+1 使光量加倍）。'
+      + '對其他檔案無效'],
   'cfg.load-image.url': ['',
       '图片路径/URL 字符串，或字符串数组',
       '影像路徑/URL 字串，或字串陣列'],
@@ -6758,8 +6828,10 @@ const STRINGS = {
       '可选的节奏节拍（例如 chrono）；每来一个就解码并发出下一张图片',
       '可選的節奏節拍（例如 chrono）；每來一個就解碼並發出下一張影像'],
   'port.load-image.image': ['',
-      '解码后的图片，平面 U8 RGB TensorBeat [3,H,W]',
-      '解碼後的影像，平面 U8 RGB TensorBeat [3,H,W]'],
+      '解码后的图片，平面 TensorBeat，U8 或（按 `dtype`）F16——RGB [3,H,W]，'
+      + '`alpha` 为 keep 时为 RGBA [4,H,W]',
+      '解碼後的影像，平面 TensorBeat，U8 或（按 `dtype`）F16——RGB [3,H,W]，'
+      + '`alpha` 為 keep 時為 RGBA [4,H,W]'],
   'port.load-image.metadata': ['',
       '随图片一同携带的 FlexData {url, width, height, exif{...}, '
       + 'exif_tiff_b64}；每张图片一个节拍，与 0 号输出端口配对。可接到 '
@@ -6776,6 +6848,109 @@ const STRINGS = {
       + '尺寸——多參考編輯的參考集合，接到 vae-encode 的 `images` 和條件編碼'
       + '器的 `ref_images`。每次執行發出一次，先於任何節奏控制；只接這一個'
       + '埠時，發出後即結束。無法解碼的影像會被略去並給出提示'],
+
+  // ---- Load / Save Video through AVFoundation (visual) ----
+  'stage.avf-load-video.name': ['', '加载视频（AVFoundation）',
+      '載入影片（AVFoundation）'],
+  'stage.avf-load-video.doc': ['',
+      '源：通过 AVFoundation / VideoToolbox（Apple）读取影片的各帧——带 alpha '
+      + '的 ProRes 4444、带 PQ/HLG 及其 HDR10 元数据的 HEVC Main10——输出为 F16'
+      + '（或 U8）平面图片，并带上文件声明的色彩标记。仅视频。',
+      '來源：透過 AVFoundation / VideoToolbox（Apple）讀取影片的各格——帶 '
+      + 'alpha 的 ProRes 4444、帶 PQ/HLG 及其 HDR10 中繼資料的 HEVC Main10——'
+      + '輸出為 F16（或 U8）平面影像，並帶上檔案宣告的色彩標記。僅影片。'],
+  'cfg.avf-load-video.url': ['',
+      '影片文件（.mov、.mp4、.m4v）：ProRes、HEVC（Main10 与 HDR）、H.264——'
+      + 'AVFoundation 能解码的都行',
+      '影片檔（.mov、.mp4、.m4v）：ProRes、HEVC（Main10 與 HDR）、H.264——'
+      + 'AVFoundation 能解碼的都行'],
+  'cfg.avf-load-video.dtype': ['',
+      'f16 | u8 | f32。f16（默认）保留 10 与 12 位，以及 HDR 传递函数的码值'
+      + '（0..1）；u8 是 8 位消费端读取的格式；f32（0..1）是 video-to-rgb '
+      + '的默认格式，供围绕它构建的消费端使用',
+      'f16 | u8 | f32。f16（預設）保留 10 與 12 位元，以及 HDR 轉換函數的'
+      + '碼值（0..1）；u8 是 8 位元消費端讀取的格式；f32（0..1）是 '
+      + 'video-to-rgb 的預設格式，供圍繞它建構的消費端使用'],
+  'cfg.avf-load-video.alpha': ['',
+      'keep | drop。keep（默认）在轨道带 alpha 时（ProRes 4444）发出 [4,H,W]'
+      + '，为直通 alpha，除非文件声明为预乘（sideband alpha_mode）',
+      'keep | drop。keep（預設）在軌道帶 alpha 時（ProRes 4444）發出 '
+      + '[4,H,W]，為直通 alpha，除非檔案宣告為預乘（sideband alpha_mode）'],
+  'cfg.avf-load-video.start_s': ['', '从文件的第几秒开始',
+      '從檔案的第幾秒開始'],
+  'cfg.avf-load-video.duration_s': ['', '读取的秒数；0（默认）= 到结尾',
+      '讀取的秒數；0（預設）= 到結尾'],
+  'cfg.avf-load-video.max_frames': ['',
+      '读到这么多帧就停止；0（默认）= 不限',
+      '讀到這麼多格就停止；0（預設）= 不限'],
+  'port.avf-load-video.frames': ['',
+      '每帧一个平面 TensorBeat [3|4,H,W]，F16、U8 或 F32，其 sideband 携带文件的'
+      + '色彩（color_primaries、color_transfer、color_matrix、alpha_mode、'
+      + 'source_bits、mastering_display、content_light）与时间信息（fps、'
+      + 'fps_num、fps_den、frame、frames、pts_us）',
+      '每格一個平面 TensorBeat [3|4,H,W]，F16、U8 或 F32，其 sideband 攜帶檔案的'
+      + '色彩（color_primaries、color_transfer、color_matrix、alpha_mode、'
+      + 'source_bits、mastering_display、content_light）與時間資訊（fps、'
+      + 'fps_num、fps_den、frame、frames、pts_us）'],
+  'stage.avf-save-video.name': ['', '保存视频（AVFoundation）',
+      '儲存影片（AVFoundation）'],
+  'stage.avf-save-video.doc': ['',
+      '汇聚节点：通过 AVFoundation / VideoToolbox（Apple）把图片写成影片——'
+      + '带 alpha 的 ProRes 4444、ProRes 422、带 PQ/HLG 与 HDR10 元数据的 HEVC '
+      + 'Main10、H.264——文件按各帧的色彩标记声明。流结束时完成。仅视频。',
+      '匯聚節點：透過 AVFoundation / VideoToolbox（Apple）把影像寫成影片——'
+      + '帶 alpha 的 ProRes 4444、ProRes 422、帶 PQ/HLG 與 HDR10 中繼資料的 '
+      + 'HEVC Main10、H.264——檔案按各格的色彩標記宣告。串流結束時完成。僅影片。'],
+  'cfg.avf-save-video.path': ['',
+      '要写入的影片：.mov（任意编解码器）或 .mp4 / .m4v（HEVC、H.264）。'
+      + '已存在的文件会被替换',
+      '要寫入的影片：.mov（任意編解碼器）或 .mp4 / .m4v（HEVC、H.264）。'
+      + '已存在的檔案會被取代'],
+  'cfg.avf-save-video.codec': ['',
+      'prores4444 | prores4444xq | prores422hq | prores422 | prores422lt | '
+      + 'prores422proxy | hevc（Main10；帧为 PQ 或 HLG 时即 HDR）| hevc8 | '
+      + 'h264。留空：.mov 用 prores4444，.mp4 用 hevc',
+      'prores4444 | prores4444xq | prores422hq | prores422 | prores422lt | '
+      + 'prores422proxy | hevc（Main10；格為 PQ 或 HLG 時即 HDR）| hevc8 | '
+      + 'h264。留空：.mov 用 prores4444，.mp4 用 hevc'],
+  'cfg.avf-save-video.fps': ['',
+      '每秒帧数；0（默认）取帧自身的（sideband fps_num/fps_den 或 fps），'
+      + '否则为 24',
+      '每秒格數；0（預設）取格自身的（sideband fps_num/fps_den 或 fps），'
+      + '否則為 24'],
+  'cfg.avf-save-video.alpha': ['',
+      'keep | drop。keep（默认）把 4 通道图片的 alpha 写入 ProRes 4444；其他'
+      + '编解码器没有 alpha',
+      'keep | drop。keep（預設）把 4 通道影像的 alpha 寫入 ProRes 4444；其他'
+      + '編解碼器沒有 alpha'],
+  'cfg.avf-save-video.quality': ['',
+      'HEVC / H.264 质量 0..1；0（默认）= 编码器自定',
+      'HEVC / H.264 品質 0..1；0（預設）= 編碼器自定'],
+  'cfg.avf-save-video.bitrate': ['',
+      'HEVC / H.264 平均每秒比特数；0（默认）= 自动',
+      'HEVC / H.264 平均每秒位元數；0（預設）= 自動'],
+  'cfg.avf-save-video.color_primaries': ['',
+      '要声明的色彩，覆盖帧的标记（CICP：1 BT.709、9 BT.2020、12 Display P3）'
+      + '；0（默认）= 帧自身的',
+      '要宣告的色彩，覆寫格的標記（CICP：1 BT.709、9 BT.2020、12 Display '
+      + 'P3）；0（預設）= 格自身的'],
+  'cfg.avf-save-video.color_transfer': ['',
+      '要声明的 CICP 传递函数（1 BT.709、16 PQ、18 HLG、8 线性）；0（默认）= '
+      + '帧自身的。它说明样本是什么——不做任何转换',
+      '要宣告的 CICP 轉換函數（1 BT.709、16 PQ、18 HLG、8 線性）；0（預設）'
+      + '= 格自身的。它說明樣本是什麼——不做任何轉換'],
+  'cfg.avf-save-video.color_matrix': ['',
+      'CICP YCbCr 矩阵（1 BT.709、9 BT.2020）；0（默认）= 帧自身的，否则按其'
+      + '原色推断',
+      'CICP YCbCr 矩陣（1 BT.709、9 BT.2020）；0（預設）= 格自身的，否則按其'
+      + '原色推斷'],
+  'port.avf-save-video.frames': ['',
+      '每帧一个平面 TensorBeat [3|4,H,W]，F16、U8 或 F32（0..1，video-to-rgb '
+      + '的默认格式），尺寸一致（avf-load-video / video-to-rgb / vae-decode '
+      + '的格式）',
+      '每格一個平面 TensorBeat [3|4,H,W]，F16、U8 或 F32（0..1，video-to-rgb '
+      + '的預設格式），尺寸一致（avf-load-video / video-to-rgb / vae-decode '
+      + '的格式）'],
 
   // ---- Load Video (visual) ----
   'stage.load-video.name': ['', '加载视频', '載入影片'],
@@ -6855,11 +7030,11 @@ const STRINGS = {
   // ---- RGB to Video (visual) ----
   'stage.rgb-to-video.name': ['', 'RGB → 视频', 'RGB → 視訊'],
   'stage.rgb-to-video.doc': ['',
-      '把平面 U8 RGB 或 RGBA 图像节拍适配成 save-video 编码器所读取的 '
+      '把平面 RGB 或 RGBA 图像节拍（U8、F16、F32）适配成 save-video 编码器所读取的 '
       + 'VideoStreamParams + FrameRef 流。生成式图像格式与 ffmpeg 之间的接'
       + '缝。由于 yuv420p 与 rgb24 都不承载 alpha，RGBA 帧会被压平到白色；'
       + '若要合成到别的底色或另一段素材上，请在本级之前接一个 alpha-mix。',
-      '把平面 U8 RGB 或 RGBA 影像節拍轉接成 save-video 編碼器所讀取的 '
+      '把平面 RGB 或 RGBA 影像節拍（U8、F16、F32）轉接成 save-video 編碼器所讀取的 '
       + 'VideoStreamParams + FrameRef 串流。生成式影像格式與 ffmpeg 之間的'
       + '接縫。由於 yuv420p 與 rgb24 都不承載 alpha，RGBA 影格會被壓平到白'
       + '色；若要合成到別的底色或另一段素材上，請在本級之前接一個 '
@@ -6916,12 +7091,14 @@ const STRINGS = {
       + '不會互相抵消。改動它改的是像素而不只是標記：無論選哪個，檔案都會'
       + '聲明自己用的是哪個矩陣，所以 vpipe 讀回時都不會走樣'],
   'port.rgb-to-video.image': ['',
-      '平面 U8 RGB [3, H, W] 或 RGBA [4, H, W] TensorBeat，按呈现顺序每帧'
-      + '一个。这里没有哪种视频像素格式承载 alpha，所以第四个平面会被压平'
-      + '到白色',
-      '平面 U8 RGB [3, H, W] 或 RGBA [4, H, W] TensorBeat，按呈現順序每格'
-      + '一個。這裡沒有哪種視訊像素格式承載 alpha，所以第四個平面會被壓平'
-      + '到白色'],
+      '平面 RGB [3, H, W] 或 RGBA [4, H, W] TensorBeat，按呈现顺序每帧'
+      + '一个：U8，或 0..1 的 F16 / F32（avf-load-video、vae-decode、'
+      + 'video-to-rgb），舍入到 8 位。这里没有哪种视频像素格式承载 alpha，'
+      + '所以第四个平面会被压平到白色',
+      '平面 RGB [3, H, W] 或 RGBA [4, H, W] TensorBeat，按呈現順序每格'
+      + '一個：U8，或 0..1 的 F16 / F32（avf-load-video、vae-decode、'
+      + 'video-to-rgb），捨入到 8 位元。這裡沒有哪種視訊像素格式承載 '
+      + 'alpha，所以第四個平面會被壓平到白色'],
   'port.rgb-to-video.video': ['',
       '先一个 VideoStreamParams 头，然后每帧一个 FrameRef——即 save-video 读'
       + '取的约定',
@@ -6931,12 +7108,14 @@ const STRINGS = {
   // ---- Save Image (visual) ----
   'stage.save-image.name': ['', '保存图片', '儲存影像'],
   'stage.save-image.doc': ['',
-      '汇聚节点：用 FFmpeg 把每个平面 U8 RGB TensorBeat [3,H,W] 编码为图片'
-      + '文件（PNG/JPEG/WebP/BMP/TIFF）。load-image 的逆过程；质量/压缩旋钮'
-      + '控制落盘方式。',
-      '匯聚節點：用 FFmpeg 把每個平面 U8 RGB TensorBeat [3,H,W] 編碼為影像'
-      + '檔（PNG/JPEG/WebP/BMP/TIFF）。load-image 的逆過程；品質/壓縮旋鈕控'
-      + '制存檔方式。'],
+      '汇聚节点：把每个平面 RGB TensorBeat 编码为图片文件——U8 用 FFmpeg'
+      + '（PNG/JPEG/WebP/BMP/TIFF）；F16、16 位 PNG/TIFF 与 OpenEXR 用 '
+      + 'ImageIO，并嵌入图片所标记的色彩空间。load-image 的逆过程；质量/压缩'
+      + '旋钮控制落盘方式。',
+      '匯聚節點：把每個平面 RGB TensorBeat 編碼為影像檔——U8 用 FFmpeg'
+      + '（PNG/JPEG/WebP/BMP/TIFF）；F16、16 位元 PNG/TIFF 與 OpenEXR 用 '
+      + 'ImageIO，並嵌入影像所標記的色彩空間。load-image 的逆過程；品質/壓縮'
+      + '旋鈕控制存檔方式。'],
   'cfg.save-image.path': ['',
       '输出图片文件路径。路径中带 printf 整数格式（如 frame-%04d.png）时用'
       + '于给图片序列编号，%t 则填入本地时间（%t{...} 可写 strftime 格式）；'
@@ -6949,9 +7128,25 @@ const STRINGS = {
       + '从 0 开始。默认关闭，因为通常的流水线希望每次运行都重写同一个文件',
       '絕不覆蓋已存在的檔案：序號從磁碟上所有已占用的名字之後開始，而不是'
       + '從 0 開始。預設關閉，因為通常的管線希望每次執行都重寫同一個檔案'],
+  'cfg.save-image.software_host': ['',
+      '运行此流水线的应用程序的自称（"ExampleApp 1.0"）。生成图片的 EXIF '
+      + 'Software 随后写作 "<应用> (Vpipe <版本> <哈希> with <模型>)"。不是'
+      + '模型生成的图片一律不加标记',
+      '執行此管線的應用程式的自稱（"ExampleApp 1.0"）。生成影像的 EXIF '
+      + 'Software 隨後寫作 "<應用> (Vpipe <版本> <雜湊> with <模型>)"。不是'
+      + '模型生成的影像一律不加標記'],
   'cfg.save-image.format': ['',
-      'png | jpeg (jpg) | webp | bmp | tiff；默认取自路径扩展名，否则为 png',
-      'png | jpeg (jpg) | webp | bmp | tiff；預設取自路徑副檔名，否則為 png'],
+      'png | jpeg (jpg) | webp | bmp | tiff | exr；默认取自路径扩展名，否则为'
+      + ' png。exr（OpenEXR，半精度浮点，线性光）由 ImageIO 写出',
+      'png | jpeg (jpg) | webp | bmp | tiff | exr；預設取自路徑副檔名，否則為'
+      + ' png。exr（OpenEXR，半精度浮點，線性光）由 ImageIO 寫出'],
+  'cfg.save-image.bit_depth': ['',
+      'png / tiff 每分量位数：8 或 16；0（默认）跟随图片——F16 图片为 16，U8 '
+      + '为 8。16 位、OpenEXR 以及任何 F16 图片都由 ImageIO 编码，并使用图片'
+      + '所标记的色彩空间（sideband color_primaries / color_transfer）',
+      'png / tiff 每分量位元數：8 或 16；0（預設）跟隨影像——F16 影像為 16，'
+      + 'U8 為 8。16 位元、OpenEXR 以及任何 F16 影像都由 ImageIO 編碼，並使用'
+      + '影像所標記的色彩空間（sideband color_primaries / color_transfer）'],
   'cfg.save-image.quality': ['',
       '有损编码（jpeg、有损 webp）：1..100，越大越好（默认 90）',
       '失真編碼（jpeg、失真 webp）：1..100，越大越好（預設 90）'],
@@ -6962,8 +7157,10 @@ const STRINGS = {
       'webp 无损模式（默认 false）',
       'webp 無失真模式（預設 false）'],
   'port.save-image.image': ['',
-      '平面 U8 RGB TensorBeat [3,H,W]（load-image / vae-decode 的格式）',
-      '平面 U8 RGB TensorBeat [3,H,W]（load-image / vae-decode 的格式）'],
+      '平面 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat，U8 或 F16（load-image / '
+      + 'vae-decode 的格式）',
+      '平面 RGB [3,H,W] 或 RGBA [4,H,W] TensorBeat，U8 或 F16（load-image / '
+      + 'vae-decode 的格式）'],
   'port.save-image.metadata': ['',
       '可选的 FlexData，携带 exif_tiff_b64（即 load-image 的 metadata 输出'
       + '端口所发的内容）；接上后会把 EXIF 块写入每个输出文件。每张图片一个'

@@ -364,6 +364,7 @@ LoadVideoStage::cache_stream_(int stream_idx, bool video)
     m.colorspace      = (int)st->codecpar->color_space;
     m.color_primaries = (int)st->codecpar->color_primaries;
     m.color_trc       = (int)st->codecpar->color_trc;
+    m.video_delay     = st->codecpar->video_delay;
     // avg_frame_rate first, r_frame_rate as the fallback, 0/0 when the
     // container advertises neither -- the same three-way answer
     // rtsp-capture gives, so video-to-rgb's sideband means one thing
@@ -450,6 +451,7 @@ LoadVideoStage::segment_(bool video)
     seg->colorspace      = m.colorspace;
     seg->color_primaries = m.color_primaries;
     seg->color_trc       = m.color_trc;
+    seg->video_delay     = m.video_delay;
   } else {
     seg->sample_rate = m.sample_rate;
     seg->channels    = m.channels;

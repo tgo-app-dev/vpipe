@@ -84,6 +84,7 @@ set(LOCAL_TEST_SOURCES
   session-config.cc
   session.cc
   stage-command.cc
+  host-flex-api.cc
   stage-config.cc
   stage-spec.cc
   stdout-log-delegate-async.cc
@@ -109,6 +110,8 @@ if(APPLE)
 endif()
 if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     list(APPEND LOCAL_TEST_SOURCES
+        apple-media.cc
+        apple-media-stages.cc
         kernel-contract.cc
         save-audio-stage.cc
         audio-segment-stage.cc
@@ -268,6 +271,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         vae-encode-plugin.cc
         content-aware-continuation-stage.cc
         temporal-stack-stage.cc
+        tensor-list-stage.cc
         temporal-resample-stage.cc
         audio-temporal-resample-stage.cc
         text-chat-stage.cc

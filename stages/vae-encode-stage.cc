@@ -192,7 +192,8 @@ namespace {
 // that is what the one producer emits. `signed` keeps the old reading for
 // an out-of-tree producer that really does hand over [-1,1].
 constexpr const char* kInputRangeDoc =
-    "F32 input only (U8 is always 0..255): what the sample values MEAN. "
+    "F32 input only (U8 is always 0..255, F16 always 0..1): what the "
+    "sample values MEAN. "
     "\"unit\" (the default) is [0,1] -- what video-to-rgb emits with its "
     "`normalize` on, and what preview-stage calls normalized; \"byte\" is "
     "[0,255], video-to-rgb with `normalize` off; \"signed\" is [-1,1], the "
@@ -269,8 +270,9 @@ const ConfigKey kAttrs[] = {
    .def_bool = false},
 };
 const PortSpec kIports[] = {
-  {.name = "image", .doc = "U8 or f32 RGB, channel-first (U8 0..255; f32 is "
-                           "read per `input_range`, [0,1] by default). "
+  {.name = "image", .doc = "U8, f16 or f32 RGB, channel-first (U8 "
+                           "0..255; f16 0..1; f32 is read per "
+                           "`input_range`, [0,1] by default). "
                            "The RANK says which: [3,H,W] is one "
                            "picture, [frames,3,H,W] is a CLIP -- what "
                            "temporal-stack emits, and what a video VAE "
@@ -283,7 +285,8 @@ const PortSpec kIports[] = {
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "images",
-   .doc = "OPTIONAL pictures as ONE LIST (load-image's `images`), each in "
+   .doc = "OPTIONAL pictures as ONE LIST (load-image's `images`, or "
+          "tensor-list's `list`), each in "
           "the `image` port's format and at its own size -- the references "
           "of a multi-reference model. Encoded one by one, in order, onto "
           "`latents`. A list with a picture that cannot be encoded emits "
@@ -1193,9 +1196,10 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
                       && (tbp->shape[0] == 3 || tbp->shape[0] == 4);
   if (tbp == nullptr || (!stacked && !single) || in_frames <= 0 ||
       (tbp->dtype != TensorBeat::DType::U8 &&
+       tbp->dtype != TensorBeat::DType::F16 &&
        tbp->dtype != TensorBeat::DType::F32)) {
     session()->warn(fmt(
-        "VaeEncodeStage('{}'): expected a U8/f32 RGB [3,H,W] or RGBA "
+        "VaeEncodeStage('{}'): expected a U8/f16/f32 RGB [3,H,W] or RGBA "
         "[4,H,W] picture, or a [frames,3,H,W] clip (what temporal-stack "
         "emits), got {}; skipping",
         this->id(), what));
@@ -1204,10 +1208,32 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
   // The source picture's size, wherever the rank put it.
   const int src_h = (int)tbp->shape[stacked ? 2 : 1];
   const int src_w = (int)tbp->shape[stacked ? 3 : 2];
-  // U8 is unambiguous -- 0..255 -- so only F32 consults `input_range`.
+  // F16 IS WIDENED HERE, ONCE, so every family below keeps reading U8 or
+  // F32. An F16 picture is 0..1 by its own convention (common/beat-keys.h:
+  // load-image, avf-load-video and vae-decode all emit it that way), so
+  // it is read as `unit` whatever `input_range` says -- that key exists
+  // for F32, whose range the dtype does not settle. A linear picture's
+  // values above 1 go through as they are; the VAE was trained on 0..1.
+  TensorBeat widened;
+  const bool src_f16 = tbp->dtype == TensorBeat::DType::F16;
+  if (src_f16) {
+    const auto bytes = tbp->materialize_contiguous();
+    const auto* h = reinterpret_cast<const _Float16*>(bytes.data());
+    const std::size_t n = bytes.size() / sizeof(_Float16);
+    widened.dtype = TensorBeat::DType::F32;
+    widened.shape = tbp->shape;
+    widened.sideband = tbp->sideband;
+    widened.resize_contiguous(n);
+    float* f = widened.as_f32();
+    for (std::size_t i = 0; i < n; ++i) { f[i] = (float)h[i]; }
+    tbp = &widened;
+  }
+  // U8 is unambiguous -- 0..255 -- and F16 is 0..1, so only F32 consults
+  // `input_range`.
   const bool src_u8 = tbp->dtype == TensorBeat::DType::U8;
-  const float in_scale = src_u8 ? 2.0f / 255.0f : _f32_scale;
-  const float in_off   = src_u8 ? -1.0f : _f32_offset;
+  const float in_scale = src_u8 ? 2.0f / 255.0f
+                       : src_f16 ? 2.0f : _f32_scale;
+  const float in_off   = src_u8 || src_f16 ? -1.0f : _f32_offset;
   // THIS is where the encoder's weights are read: a real reference image
   // has arrived, so they will actually be used. Idempotent after the
   // first beat.

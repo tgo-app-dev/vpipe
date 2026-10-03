@@ -87,11 +87,12 @@ const ConfigKey kAttrs[] = {
    .def_str = "bt601", .extra = kColorspaceChoices},
 };
 const PortSpec kIports[] = {
-  {.name = "image", .doc = "planar U8 RGB [3, H, W] or RGBA [4, H, W] "
+  {.name = "image", .doc = "planar RGB [3, H, W] or RGBA [4, H, W] "
                            "TensorBeat, one per frame in presentation "
-                           "order. No video pixel format here carries "
-                           "alpha, so a fourth plane is composited over "
-                           "white",
+                           "order: U8, or F16 / F32 in 0..1 (avf-load-video, "
+                           "vae-decode, video-to-rgb), rounded to 8 bits. "
+                           "No video pixel format here carries alpha, so "
+                           "a fourth plane is composited over white",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
 };
@@ -103,7 +104,8 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "rgb-to-video",
-  .doc       = "Adapts planar U8 RGB or RGBA image beats into the "
+  .doc       = "Adapts planar RGB or RGBA image beats (U8, F16, F32) "
+               "into the "
                "VideoStreamParams + FrameRef stream a save-video encoder "
                "reads. The seam between the generative image format and "
                "ffmpeg. An RGBA frame is flattened onto white, since "
@@ -268,12 +270,15 @@ RgbToVideoStage::process(RuntimeContext& ctx)
     co_return;
   }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
-  if (tbp == nullptr || tbp->dtype != TensorBeat::DType::U8 ||
+  if (tbp == nullptr ||
+      (tbp->dtype != TensorBeat::DType::U8 &&
+       tbp->dtype != TensorBeat::DType::F16 &&
+       tbp->dtype != TensorBeat::DType::F32) ||
       tbp->shape.size() != 3 ||
       (tbp->shape[0] != 3 && tbp->shape[0] != 4)) {
     session()->warn(fmt(
-        "RgbToVideoStage('{}'): expected a planar U8 RGB [3,H,W] or RGBA "
-        "[4,H,W] TensorBeat, got {}; skipping",
+        "RgbToVideoStage('{}'): expected a planar U8, F16 or F32 RGB "
+        "[3,H,W] or RGBA [4,H,W] TensorBeat, got {}; skipping",
         this->id(), in->describe()));
     co_return;
   }
@@ -385,12 +390,39 @@ RgbToVideoStage::process(RuntimeContext& ctx)
   // 32-byte-aligned GBRP linesize, so a width that is not a multiple of
   // 32 arrives strided. Materialise when it is not contiguous.
   AlignedVector<std::uint8_t> contig;
-  const std::uint8_t* src = tbp->as_u8();
+  using DType = TensorBeat::DType;
+  const std::uint8_t* src =
+      tbp->dtype == DType::U8 ? tbp->as_u8()
+    : tbp->dtype == DType::F32
+        ? reinterpret_cast<const std::uint8_t*>(tbp->as_f32())
+        : reinterpret_cast<const std::uint8_t*>(tbp->as_f16());
   if (!tbp->is_contiguous()) {
     contig = tbp->materialize_contiguous();
     src = contig.data();
   }
   const std::size_t plane = (std::size_t)H * W;
+
+  // FLOAT FRAMES ARE 0..1 -- video-to-rgb's default F32, avf-load-video's
+  // and vae-decode's F16 -- and every pixel format here is 8-bit, so they
+  // round to U8 first, clamped: an HDR or linear frame's values above 1
+  // clip, as they would on an 8-bit display. Their colour tags are not
+  // read; the encoder writes the matrix and range its config names.
+  std::vector<std::uint8_t> narrowed;
+  if (tbp->dtype != DType::U8) {
+    const std::size_t n = (std::size_t)CH * plane;
+    narrowed.resize(n);
+    const bool f32 = tbp->dtype == DType::F32;
+    const auto* s32 = reinterpret_cast<const float*>(src);
+    const auto* s16 = reinterpret_cast<const _Float16*>(src);
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = f32 ? s32[i] : (float)s16[i];
+      // !(v > 0) also catches NaN.
+      narrowed[i] = !(v > 0.0f) ? 0
+                  : v >= 1.0f   ? 255
+                  : (std::uint8_t)(v * 255.0f + 0.5f);
+    }
+    src = narrowed.data();
+  }
 
   // COMPOSITE OVER WHITE, since neither yuv420p nor rgb24 carries alpha.
   // Truncating the fourth plane is NOT the neutral choice: under a

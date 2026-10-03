@@ -261,6 +261,12 @@ CommandHandle::result_json() const
   return _cmd ? _cmd->result().to_json() : std::string("null");
 }
 
+FlexData
+CommandHandle::result() const
+{
+  return _cmd ? _cmd->result() : FlexData();
+}
+
 std::string
 CommandHandle::error() const
 {
