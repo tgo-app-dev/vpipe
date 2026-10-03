@@ -203,6 +203,24 @@ add_vpipe_metal_kernel(affine_qmm_steel_bf16
                        SRC quant/affine_qmm_steel.metal
                        DEFINES VPIPE_ELT=bfloat
                        DEPENDS ${STEEL_GEMM_HDRS})
+# LoRA training: the backward's elementwise ops, loss and optimizers; the
+# GEMM shapes the forward's NT kernels do not cover (TN over the rows,
+# NN against a small factor); and the flash attention's backward.
+add_vpipe_metal_kernel(train_ops SRC train/train_ops.metal)
+add_vpipe_metal_kernel(train_ops_bf16 SRC train/train_ops.metal
+                       DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(train_gemm SRC train/train_gemm.metal
+                       DEPENDS ${STEEL_GEMM_HDRS})
+add_vpipe_metal_kernel(train_gemm_bf16 SRC train/train_gemm.metal
+                       DEFINES VPIPE_ELT=bfloat
+                       DEPENDS ${STEEL_GEMM_HDRS})
+# Their matrix-core (M5+) twins for the attention backward's batched GEMMs;
+# bound only where the GPU has matrix cores.
+add_vpipe_metal_kernel(train_gemm_mma SRC train/train_gemm_mma.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS})
+add_vpipe_metal_kernel(train_gemm_mma_bf16 SRC train/train_gemm_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
 # Matrix-core (M5+) 4-bit quantized GEMM via MetalPerformancePrimitives
 # matmul2d. Drop-in for affine_qmm_steel_w4g64; gated at runtime on
 # matrix-core capability (older GPUs keep the steel path).
@@ -249,6 +267,22 @@ add_vpipe_metal_kernel(attn_steel
                                vendored/mlx/backend/metal/kernels/steel/attn/params.h
                                vendored/mlx/backend/metal/kernels/steel/attn/transforms.h
                                vendored/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h
+                               vendored/mlx/backend/metal/kernels/steel/gemm/params.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+
+# The steel flash attention's backward (LoRA training): dQ, and dK/dV
+# accumulated in f32, in the forward's per-segment band form. Both element
+# types are instantiated in the one library, by name.
+add_vpipe_metal_kernel(attn_bwd
+                       SRC train/attn_bwd.metal
+                       DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
+                               vendored/mlx/backend/metal/kernels/steel/utils.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/attn.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/loader.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/mma.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/params.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/transforms.h
                                vendored/mlx/backend/metal/kernels/steel/gemm/params.h
                                vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
                                vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)

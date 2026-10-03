@@ -14,6 +14,10 @@ set(LOCAL_SOURCES
   external-tap-stage.cc
   load-audio-stage.cc
   load-image-stage.cc
+  image-decode.cc
+  training-dataset-stage.cc
+  optimizer-select-stage.cc
+  train-lora-stage.cc
   load-text-stage.cc
   load-video-stage.cc
   lora-fuse-stage.cc
@@ -82,6 +86,10 @@ set(LOCAL_HEADERS
   chrono-stage.h
   load-audio-stage.h
   load-image-stage.h
+  image-decode.h
+  training-dataset-stage.h
+  optimizer-select-stage.h
+  train-lora-stage.h
   load-text-stage.h
   load-video-stage.h
   model-catalog.h

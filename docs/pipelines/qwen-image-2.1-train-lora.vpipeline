@@ -1,0 +1,96 @@
+{
+  "id": "qwen-image-2.1-train-lora",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Qwen/Qwen-Image-2.1"
+      }
+    },
+    {
+      "id": "dataset",
+      "type": "training-dataset",
+      "iports": [
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {
+        "dir": "lora-datasets/my-subject",
+        "trigger_word": "ohwx",
+        "resolution": [512, 768, 1024],
+        "preview_prompts": [
+          "{trigger}",
+          "a photo of {trigger} in a snowy park"
+        ]
+      }
+    },
+    {
+      "id": "optimizer",
+      "type": "optimizer-select",
+      "iports": [],
+      "config": {
+        "optimizer": "adamw",
+        "learning_rate": 0.0001,
+        "lr_schedule": "constant"
+      }
+    },
+    {
+      "id": "conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "dataset", "oport": 1 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        { "src": "dataset", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "train",
+      "type": "train-lora",
+      "iports": [
+        { "src": "conditioner", "oport": 0 },
+        { "src": "vae-encode", "oport": 0 },
+        { "src": "dataset", "oport": 2 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "optimizer", "oport": 0 }
+      ],
+      "config": {
+        "output_dir": "lora-output",
+        "name": "my-subject",
+        "rank": 16,
+        "targets": "attn_ff"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "train", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "lora-output/preview-%04d.png",
+        "format": "png"
+      }
+    }
+  ],
+  "subpipelines": []
+}

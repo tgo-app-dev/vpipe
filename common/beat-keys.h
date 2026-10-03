@@ -30,6 +30,16 @@ namespace beat {
 inline constexpr std::string_view kText = "text";
 // A `model-select` beat: the model directory or registry key it chose.
 inline constexpr std::string_view kHfDir = "hf_dir";
+// Bool, on a text beat (or a TensorBeat's sideband): this beat is one of a
+// SERIES that ends with the stream -- a training dataset. A consumer that
+// loads a model for it holds the model across the series and releases it
+// at end of stream, rather than after every beat as a generation graph's
+// idle policy would; absent or false is the old behaviour.
+inline constexpr std::string_view kBatch = "batch";
+// Bool, on a text beat: encode the text even when it is EMPTY -- the empty
+// prompt's own conditioning, which caption dropout trains against. Absent
+// or false, an empty prompt produces nothing, as before.
+inline constexpr std::string_view kAllowEmpty = "allow_empty";
 
 }  // namespace beat
 

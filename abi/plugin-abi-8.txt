@@ -2983,6 +2983,8 @@ vtable for vpipe::genai::WeightSet
 vtable for vpipe::metal_compute::MetalCompute
 
 [keys]
+vpipe::beat::kAllowEmpty = "allow_empty"
+vpipe::beat::kBatch = "batch"
 vpipe::beat::kHfDir = "hf_dir"
 vpipe::beat::kText = "text"
 vpipe::catalog_extra::kUrlFiles = "url_files"

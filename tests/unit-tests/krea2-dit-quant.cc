@@ -823,10 +823,14 @@ TEST(krea2_dit_quant, stage_mixed_dit)
 //                                 tiers stay there, so the forward is the
 //                                 GPU's to the bit; any later split would
 //                                 put fp16 rows back in
-//   lost at a second chunk        a pinned two-chunk share losing chunk 1:
-//                                 the first chunk's ANE rows are kept and
-//                                 the rest recomputed; the wrong range
-//                                 lands far from the GPU arm
+//   lost at a second chunk        a pinned share losing chunk 1: the
+//                                 first chunk's ANE rows are kept and the
+//                                 rest recomputed; the wrong range lands
+//                                 far from the GPU arm. In 1024-row
+//                                 chunks, because the q|k|v|gate tier
+//                                 keeps its OWN auto share, which opens at
+//                                 half the rows -- one 2048-row chunk here,
+//                                 with no second chunk to lose
 //
 // Env: VPIPE_KREA2_TEST_MODEL_PATH.
 TEST(krea2_ane, lost_rows_fall_back_to_the_gpu)
@@ -876,9 +880,11 @@ TEST(krea2_ane, lost_rows_fall_back_to_the_gpu)
     const char* spec = arm == kLost0 ? "0:0" : arm == kLost1 ? "0:1"
                                                              : nullptr;
     if (spec != nullptr) { setenv("VPIPE_ANE_FAIL", spec, 1); }
+    if (arm == kLost1) { setenv("VPIPE_KREA2_ANE_CHUNK", "1024", 1); }
     SharedBuffer out = m->forward_dit(fused, text_seq, lat, img_seq, grid,
                                       grid, 0.5f, -1);
     if (spec != nullptr) { unsetenv("VPIPE_ANE_FAIL"); }
+    if (arm == kLost1) { unsetenv("VPIPE_KREA2_ANE_CHUNK"); }
     if (out.byte_size() < (std::size_t)img_seq * IC * 2) { return o; }
     const auto* p = static_cast<const _Float16*>(out.contents());
     o.v.resize((std::size_t)img_seq * IC);

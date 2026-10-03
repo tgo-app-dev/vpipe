@@ -1931,6 +1931,321 @@ const STRINGS = {
       '负向提示词的条件（形状/类型相同）；仅在接了负向提示词时才发出',
       '負向提示詞的條件（形狀/型別相同）；僅在接了負向提示詞時才發出'],
 
+  // ---- LoRA training (generative) ----
+  'stage.training-dataset.name': ['', '训练数据集', '訓練資料集'],
+  'stage.training-dataset.doc': ['',
+      '源阶段：把一个图片与标注文件夹变成 LoRA 训练图所需的三路数据流——'
+      + '适配到长宽比分桶的图片（给 vae-encode）、套用了触发词的标注（给 '
+      + 'diffusion-conditioner），以及告诉 train-lora 如何配对的清单。'
+      + '编码结果按模型缓存，重跑时只编码有变化的部分。0-1 入 / 3 出。',
+      '源階段：把一個圖片與標註資料夾變成 LoRA 訓練圖所需的三路資料流——'
+      + '適配到長寬比分桶的圖片（給 vae-encode）、套用了觸發詞的標註（給 '
+      + 'diffusion-conditioner），以及告訴 train-lora 如何配對的清單。'
+      + '編碼結果按模型快取，重跑時只編碼有變化的部分。0-1 入 / 3 出。'],
+  'cfg.training-dataset.dir': ['',
+      '图片所在文件夹，递归扫描（png、jpg、jpeg、webp、bmp、tif）。名为 '
+      + 'N_名称 的子文件夹里的图片每轮重复 N 次（与 kohya 数据集的布局相同）。',
+      '圖片所在資料夾，遞迴掃描（png、jpg、jpeg、webp、bmp、tif）。名為 '
+      + 'N_名稱 的子資料夾裡的圖片每輪重複 N 次（與 kohya 資料集的佈局相同）。'],
+  'cfg.training-dataset.captions': ['',
+      '标注来源：sidecar（每张图旁的文本文件，多行即多条标注）、jsonl（文件夹'
+      + '中带 file_name 与 text 的 metadata.jsonl），或 none',
+      '標註來源：sidecar（每張圖旁的文字檔，多行即多條標註）、jsonl（資料夾'
+      + '中帶 file_name 與 text 的 metadata.jsonl），或 none'],
+  'cfg.training-dataset.caption_ext': ['',
+      'sidecar 标注文件的扩展名（默认 .txt）',
+      'sidecar 標註檔的副檔名（預設 .txt）'],
+  'cfg.training-dataset.trigger_word': ['',
+      '适配器要学会响应的词。按 caption_template 加到每条标注上，标注里已有'
+      + '该词时不再添加；标注中的 [trigger] 占位符会被原地替换。会写入保存的'
+      + '适配器元数据。',
+      '適配器要學會回應的詞。按 caption_template 加到每條標註上，標註裡已有'
+      + '該詞時不再添加；標註中的 [trigger] 佔位符會被原地替換。會寫入儲存的'
+      + '適配器中繼資料。'],
+  'cfg.training-dataset.caption_template': ['',
+      '触发词如何与标注拼接：替换 {trigger} 与 {caption}（默认 '
+      + '"{trigger}, {caption}"）',
+      '觸發詞如何與標註拼接：替換 {trigger} 與 {caption}（預設 '
+      + '"{trigger}, {caption}"）'],
+  'cfg.training-dataset.missing_caption': ['',
+      '没有标注的图片：trigger_only（只用触发词——用少量图片训练一个主体的'
+      + '常见做法）、skip 或 error',
+      '沒有標註的圖片：trigger_only（只用觸發詞——用少量圖片訓練一個主體的'
+      + '常見做法）、skip 或 error'],
+  'cfg.training-dataset.shuffle_tags': ['',
+      '逗号分隔的标签式标注：打乱 keep_tags 之后的标签顺序，免得适配器学到'
+      + '顺序。每种打乱都会预先编码（共 caption_variants 种）。',
+      '逗號分隔的標籤式標註：打亂 keep_tags 之後的標籤順序，免得適配器學到'
+      + '順序。每種打亂都會預先編碼（共 caption_variants 種）。'],
+  'cfg.training-dataset.keep_tags': ['',
+      '打乱时固定在最前面的标签数（默认 1，即触发词）',
+      '打亂時固定在最前面的標籤數（預設 1，即觸發詞）'],
+  'cfg.training-dataset.caption_variants': ['',
+      '打乱时每条标注保留的编码数（默认 4；嵌入是缓存的，所以每轮变化的标注'
+      + '必须预先编码）',
+      '打亂時每條標註保留的編碼數（預設 4；嵌入是快取的，所以每輪變化的標註'
+      + '必須預先編碼）'],
+  'cfg.training-dataset.resolution': ['',
+      '每个分桶保持的面积对应的正方形边长：一个数（默认 1024）或列表，如 '
+      + '[512, 768, 1024]——每张图都会在每个分辨率下编码，小数据集这样泛化更好',
+      '每個分桶保持的面積對應的正方形邊長：一個數（預設 1024）或列表，如 '
+      + '[512, 768, 1024]——每張圖都會在每個解析度下編碼，小資料集這樣泛化更好'],
+  'cfg.training-dataset.bucket_step': ['',
+      '分桶边长取该值的整数倍（默认 32，即 Qwen-Image-2.1 的尺寸网格）',
+      '分桶邊長取該值的整數倍（預設 32，即 Qwen-Image-2.1 的尺寸網格）'],
+  'cfg.training-dataset.max_aspect': ['',
+      '分桶允许的最大长宽比（默认 2.0）；更宽的图片会被裁到这个比例',
+      '分桶允許的最大長寬比（預設 2.0）；更寬的圖片會被裁到這個比例'],
+  'cfg.training-dataset.flip': ['',
+      'off 或 random：每张图还会额外编码一份镜像。默认关闭——文字和不对称'
+      + '的主体经不起镜像。',
+      'off 或 random：每張圖還會額外編碼一份鏡像。預設關閉——文字和不對稱'
+      + '的主體經不起鏡像。'],
+  'cfg.training-dataset.alpha': ['',
+      'drop（RGB 图片）或 keep（RGBA，用于接受四通道的 VAE 以及带透明度的'
+      + '图片）',
+      'drop（RGB 圖片）或 keep（RGBA，用於接受四通道的 VAE 以及帶透明度的'
+      + '圖片）'],
+  'cfg.training-dataset.preview_prompts': ['',
+      '每个检查点都采样的提示词，便于对比：字符串或列表；{trigger} 会被展开。'
+      + '默认只用触发词。',
+      '每個檢查點都取樣的提示詞，便於對比：字串或列表；{trigger} 會被展開。'
+      + '預設只用觸發詞。'],
+  'cfg.training-dataset.seed': ['',
+      '标签打乱与留出样本选择的随机种子（默认 0）',
+      '標籤打亂與保留樣本選擇的隨機種子（預設 0）'],
+  'cfg.training-dataset.cache_dir': ['',
+      '编码后的标注与图片在多次运行之间保存的位置，重跑时只编码有变化的'
+      + '部分：auto（~/Library/Caches/vpipe/train 下每个数据集一个文件夹）、'
+      + '一个目录，或 none。需要接上 model 端口——缓存按模型区分。请放在内置 '
+      + 'SSD 上。',
+      '編碼後的標註與圖片在多次執行之間保存的位置，重跑時只編碼有變化的'
+      + '部分：auto（~/Library/Caches/vpipe/train 下每個資料集一個資料夾）、'
+      + '一個目錄，或 none。需要接上 model 埠——快取按模型區分。請放在內建 '
+      + 'SSD 上。'],
+  'cfg.training-dataset.validation': ['',
+      '从训练中留出、在每个检查点以固定噪声打分的图片：-1（auto：500 张及'
+      + '以上的数据集留出 1%，最多 64；更少则不留）、0，或一个数量',
+      '從訓練中保留、在每個檢查點以固定雜訊評分的圖片：-1（auto：500 張及'
+      + '以上的資料集保留 1%，最多 64；更少則不保留）、0，或一個數量'],
+  'port.training-dataset.model': ['',
+      '可选：model-select 源，编码后的数据集按它指定的检查点缓存',
+      '可選：model-select 源，編碼後的資料集按它指定的檢查點快取'],
+  'port.training-dataset.images': ['',
+      '适配到分桶的平面 U8 [C,H,W] 图片，给 vae-encode（每个样本、分辨率与'
+      + '镜像各一张）',
+      '適配到分桶的平面 U8 [C,H,W] 圖片，給 vae-encode（每個樣本、解析度與'
+      + '鏡像各一張）'],
+  'port.training-dataset.captions': ['',
+      '给 diffusion-conditioner 的标注文本：所有变体，然后是空提示词，然后是'
+      + '预览提示词',
+      '給 diffusion-conditioner 的標註文字：所有變體，然後是空提示詞，然後是'
+      + '預覽提示詞'],
+  'port.training-dataset.manifest': ['',
+      '一个节拍，描述每个样本以及另外两路流的顺序，给 train-lora',
+      '一個節拍，描述每個樣本以及另外兩路流的順序，給 train-lora'],
+
+  'stage.optimizer-select.name': ['', '优化器', '最佳化器'],
+  'stage.optimizer-select.doc': ['',
+      '选择 train-lora 使用的优化器与学习率计划，作为一个 FlexData 节拍发出。'
+      + '与 training-dataset 和 train-lora 配套。0 入 / 1 出（只发一次）。',
+      '選擇 train-lora 使用的最佳化器與學習率排程，作為一個 FlexData 節拍發出。'
+      + '與 training-dataset 和 train-lora 配套。0 入 / 1 出（只發一次）。'],
+  'cfg.optimizer-select.optimizer': ['',
+      'adamw（默认）、prodigy（自行估计步长——learning_rate 设为 1.0；对小'
+      + '数据集较宽容）、lion 或 sgd',
+      'adamw（預設）、prodigy（自行估計步長——learning_rate 設為 1.0；對小'
+      + '資料集較寬容）、lion 或 sgd'],
+  'cfg.optimizer-select.learning_rate': ['',
+      '0（默认）取优化器自己的默认值：adamw 1e-4、prodigy 1.0、lion 3e-5、'
+      + 'sgd 1e-2',
+      '0（預設）取最佳化器自己的預設值：adamw 1e-4、prodigy 1.0、lion 3e-5、'
+      + 'sgd 1e-2'],
+  'cfg.optimizer-select.beta1': ['',
+      '一阶矩衰减（sgd 为动量），默认 0.9',
+      '一階矩衰減（sgd 為動量），預設 0.9'],
+  'cfg.optimizer-select.beta2': ['', '二阶矩衰减，默认 0.999',
+      '二階矩衰減，預設 0.999'],
+  'cfg.optimizer-select.eps': ['', '默认 1e-8', '預設 1e-8'],
+  'cfg.optimizer-select.weight_decay': ['', '解耦权重衰减，默认 0.01',
+      '解耦權重衰減，預設 0.01'],
+  'cfg.optimizer-select.lr_schedule': ['',
+      '学习率随训练如何变化：auto（默认：小数据集用 constant，64 张及以上'
+      + '用 cosine）、constant、linear、cosine、cosine_restarts。叫 '
+      + 'lr_schedule 是因为这里的“scheduler”指噪声计划。',
+      '學習率隨訓練如何變化：auto（預設：小資料集用 constant，64 張及以上'
+      + '用 cosine）、constant、linear、cosine、cosine_restarts。叫 '
+      + 'lr_schedule 是因為這裡的「scheduler」指雜訊排程。'],
+  'cfg.optimizer-select.warmup_steps': ['',
+      '从零开始的线性预热；-1（默认）为整个训练的 2%',
+      '從零開始的線性預熱；-1（預設）為整個訓練的 2%'],
+  'cfg.optimizer-select.min_lr_ratio': ['',
+      'linear 与 cosine 结束时的学习率比例（默认 0）',
+      'linear 與 cosine 結束時的學習率比例（預設 0）'],
+  'cfg.optimizer-select.restarts': ['',
+      'cosine_restarts 的周期数（默认 1）',
+      'cosine_restarts 的週期數（預設 1）'],
+  'cfg.optimizer-select.grad_clip': ['',
+      '梯度裁剪的全局 L2 范数；0 关闭（默认 1.0）',
+      '梯度裁剪的全域 L2 範數；0 關閉（預設 1.0）'],
+  'cfg.optimizer-select.ema': ['',
+      '适配器权重的 EMA 衰减，如 0.999；每个检查点同时保存平均后的适配器。'
+      + '0（默认）关闭。',
+      '適配器權重的 EMA 衰減，如 0.999；每個檢查點同時儲存平均後的適配器。'
+      + '0（預設）關閉。'],
+  'cfg.optimizer-select.prodigy_d_coef': ['',
+      'prodigy：缩放其步长估计（默认 1.0）',
+      'prodigy：縮放其步長估計（預設 1.0）'],
+  'cfg.optimizer-select.bias_correction': ['',
+      'prodigy：Adam 的偏差校正（默认关闭，与 prodigyopt 相同）',
+      'prodigy：Adam 的偏差校正（預設關閉，與 prodigyopt 相同）'],
+  'port.optimizer-select.optimizer': ['',
+      '优化器配置 {kind: optimizer, optimizer, learning_rate, ...}',
+      '最佳化器組態 {kind: optimizer, optimizer, learning_rate, ...}'],
+
+  'stage.train-lora.name': ['', '训练 LoRA', '訓練 LoRA'],
+  'stage.train-lora.doc': ['',
+      '在扩散模型上训练 LoRA 适配器，数据来自由模型自身的条件编码器与 VAE 编码'
+      + '的 training-dataset。缓存编码后的数据集，等编码器用完后再载入模型，按 '
+      + 'optimizer-select 的配置训练，并保存检查点（附预览），generate-image 的'
+      + '适配器选择器会列出它们。目前支持 Qwen-Image-2.1。',
+      '在擴散模型上訓練 LoRA 適配器，資料來自由模型自身的條件編碼器與 VAE 編碼'
+      + '的 training-dataset。快取編碼後的資料集，等編碼器用完後再載入模型，按 '
+      + 'optimizer-select 的組態訓練，並儲存檢查點（附預覽），generate-image 的'
+      + '適配器選擇器會列出它們。目前支援 Qwen-Image-2.1。'],
+  'cfg.train-lora.hf_dir': ['',
+      '要训练的模型：注册键或检查点根目录（model 端口上的 model-select 节拍'
+      + '会覆盖它）',
+      '要訓練的模型：註冊鍵或檢查點根目錄（model 埠上的 model-select 節拍'
+      + '會覆蓋它）'],
+  'cfg.train-lora.output_dir': ['',
+      '适配器、检查点与续训状态的存放位置',
+      '適配器、檢查點與續訓狀態的存放位置'],
+  'cfg.train-lora.name': ['',
+      '适配器名称：<name>.safetensors、每个检查点的 <name>-000500.safetensors，'
+      + '以及它在注册表中的键',
+      '適配器名稱：<name>.safetensors、每個檢查點的 <name>-000500.safetensors，'
+      + '以及它在註冊表中的鍵'],
+  'cfg.train-lora.rank': ['', '适配器的秩（默认 16）',
+      '適配器的秩（預設 16）'],
+  'cfg.train-lora.alpha': ['',
+      '适配器的 alpha；0（默认）等于秩，即强度 1',
+      '適配器的 alpha；0（預設）等於秩，即強度 1'],
+  'cfg.train-lora.targets': ['',
+      '训练哪些投影：attn_ff（默认——q、k、v、out 与前馈；多数已发布适配器'
+      + '都这样训练）或 attn',
+      '訓練哪些投影：attn_ff（預設——q、k、v、out 與前饋；多數已發布適配器'
+      + '都這樣訓練）或 attn'],
+  'cfg.train-lora.init_from': ['',
+      '从同目标、同秩的现有适配器文件继续（留空：新的适配器，初始即为基础'
+      + '模型）',
+      '從同目標、同秩的現有適配器檔案繼續（留空：新的適配器，初始即為基礎'
+      + '模型）'],
+  'cfg.train-lora.steps': ['',
+      '优化器步数；0（默认）为自动——小数据集每张图 100 步（600 至 3000），'
+      + '大数据集两轮',
+      '最佳化器步數；0（預設）為自動——小資料集每張圖 100 步（600 至 3000），'
+      + '大資料集兩輪'],
+  'cfg.train-lora.epochs': ['', '遍历数据集的轮数，steps 为 0 时使用',
+      '遍歷資料集的輪數，steps 為 0 時使用'],
+  'cfg.train-lora.batch_size': ['',
+      '优化器每步累积的样本数（默认 1）。样本依次运行，所以批量越大花的是'
+      + '时间而不是内存。',
+      '最佳化器每步累積的樣本數（預設 1）。樣本依次執行，所以批次越大花的是'
+      + '時間而不是記憶體。'],
+  'cfg.train-lora.seed': ['',
+      '本次训练的随机种子：样本顺序、噪声、sigma、丢弃',
+      '本次訓練的隨機種子：樣本順序、雜訊、sigma、丟棄'],
+  'cfg.train-lora.seed_sequence': ['',
+      '多个优化器节拍做扫参时每个训练任务的种子：increment（默认）、'
+      + 'randomize、keep',
+      '多個最佳化器節拍做掃參時每個訓練任務的種子：increment（預設）、'
+      + 'randomize、keep'],
+  'cfg.train-lora.caption_dropout': ['',
+      '样本改用空提示词而非其标注训练的概率（默认 0.05），用于保持引导有效',
+      '樣本改用空提示詞而非其標註訓練的機率（預設 0.05），用於保持引導有效'],
+  'cfg.train-lora.timestep_sampling': ['',
+      'sigma 如何抽取：auto（logit-normal 抽样再按图片尺寸套用模型自己的推理'
+      + '平移，使训练集中在采样花步数的地方）、uniform、logit_normal 或 shift'
+      + '（静态平移）',
+      'sigma 如何抽取：auto（logit-normal 抽樣再按圖片尺寸套用模型自己的推理'
+      + '平移，使訓練集中在取樣花步數的地方）、uniform、logit_normal 或 shift'
+      + '（靜態平移）'],
+  'cfg.train-lora.logit_mean': ['', 'logit-normal 的均值（默认 0）',
+      'logit-normal 的均值（預設 0）'],
+  'cfg.train-lora.logit_std': ['', 'logit-normal 的标准差（默认 1）',
+      'logit-normal 的標準差（預設 1）'],
+  'cfg.train-lora.shift': ['',
+      'timestep_sampling=shift 时的静态平移（默认 3）',
+      'timestep_sampling=shift 時的靜態平移（預設 3）'],
+  'cfg.train-lora.save_every': ['',
+      '检查点间隔步数；0（默认）为自动（小数据集每 250 步）',
+      '檢查點間隔步數；0（預設）為自動（小資料集每 250 步）'],
+  'cfg.train-lora.preview_every': ['',
+      '预览采样间隔步数；0（默认）为每个检查点，-1 为从不',
+      '預覽取樣間隔步數；0（預設）為每個檢查點，-1 為從不'],
+  'cfg.train-lora.preview_steps': ['', '预览的采样步数（默认 20）',
+      '預覽的取樣步數（預設 20）'],
+  'cfg.train-lora.preview_cfg': ['',
+      '预览相对空提示词的引导强度（默认 4；1 为不引导）',
+      '預覽相對空提示詞的引導強度（預設 4；1 為不引導）'],
+  'cfg.train-lora.preview_seed': ['',
+      '预览的噪声种子，各检查点相同以便对比（默认 42）',
+      '預覽的雜訊種子，各檢查點相同以便對比（預設 42）'],
+  'cfg.train-lora.recompute': ['',
+      'auto（默认）：内存够时保留每个块的激活，省下约四分之一的步时；不够时'
+      + '逐块重算。always / never 强制其一。',
+      'auto（預設）：記憶體夠時保留每個區塊的啟用值，省下約四分之一的步時；'
+      + '不夠時逐區塊重算。always / never 強制其一。'],
+  'cfg.train-lora.ane': ['',
+      'M4 系列：前向与反向中的大 GEMM 与神经网络引擎分摊（M4 Pro 上 1024^2 '
+      + '一步实测快 1.13 倍）。不要在 M5 上启用。',
+      'M4 系列：前向與反向中的大 GEMM 與神經網路引擎分攤（M4 Pro 上 1024^2 '
+      + '一步實測快 1.13 倍）。不要在 M5 上啟用。'],
+  'cfg.train-lora.i8_gemm': ['',
+      'M5 及更新：前向与反向使用 int8 矩阵核心 GEMM（有损，每个 GEMM 约 '
+      + '1e-2）',
+      'M5 及更新：前向與反向使用 int8 矩陣核心 GEMM（有損，每個 GEMM 約 '
+      + '1e-2）'],
+  'cfg.train-lora.resume': ['',
+      'auto（默认）：继续同名的被停止的训练；never：重新开始',
+      'auto（預設）：繼續同名的被停止的訓練；never：重新開始'],
+  'cfg.train-lora.register': ['',
+      '把训练好的适配器登记到模型注册表，让 generate-image 的 LoRA 选择器'
+      + '列出它（默认开启）',
+      '把訓練好的適配器登記到模型註冊表，讓 generate-image 的 LoRA 選擇器'
+      + '列出它（預設開啟）'],
+  'cfg.train-lora.cache': ['',
+      '训练时编码后数据集存放的位置：ram、disk（每一步从 training-dataset '
+      + '的 cache_dir 读取），或 auto——放得下本机内存的八分之一就用 ram，'
+      + '否则用 disk',
+      '訓練時編碼後資料集存放的位置：ram、disk（每一步從 training-dataset '
+      + '的 cache_dir 讀取），或 auto——放得下本機記憶體的八分之一就用 ram，'
+      + '否則用 disk'],
+  'port.train-lora.conditioning': ['',
+      'diffusion-conditioner 对每条标注、空提示词与预览提示词的输出，按清单顺序',
+      'diffusion-conditioner 對每條標註、空提示詞與預覽提示詞的輸出，按清單順序'],
+  'port.train-lora.latents': ['',
+      'vae-encode 对每张图片的 f32 [C,h,w] 潜变量，按清单顺序',
+      'vae-encode 對每張圖片的 f32 [C,h,w] 潛變量，按清單順序'],
+  'port.train-lora.manifest': ['', 'training-dataset 的清单（一个节拍）',
+      'training-dataset 的清單（一個節拍）'],
+  'port.train-lora.model': ['',
+      '可选：来自 model-select 源的共享模型引用',
+      '可選：來自 model-select 源的共享模型引用'],
+  'port.train-lora.optimizer': ['',
+      '可选：optimizer-select 的配置（默认 AdamW）；多个节拍各跑一个训练任务',
+      '可選：optimizer-select 的組態（預設 AdamW）；多個節拍各跑一個訓練任務'],
+  'port.train-lora.previews': ['',
+      '每个检查点的预览潜变量，f32 [C,h,w]，给 vae-decode',
+      '每個檢查點的預覽潛變量，f32 [C,h,w]，給 vae-decode'],
+  'port.train-lora.checkpoints': ['',
+      '每保存一个适配器发一个节拍 {path, step, loss, trigger_word}',
+      '每儲存一個適配器發一個節拍 {path, step, loss, trigger_word}'],
+  'port.train-lora.metrics': ['',
+      '每步一个节拍 {step, loss, lr, grad_norm, sec}',
+      '每步一個節拍 {step, loss, lr, grad_norm, sec}'],
+
   // ---- Diffusion Sampler (generative) ----
   'stage.diffusion-sampler-select.name': ['', '扩散采样器', '擴散取樣器'],
   'stage.diffusion-sampler-select.doc': ['',

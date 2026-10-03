@@ -88,6 +88,8 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen-image-transformer.cc
   qwen-image/qwen-image21-layout.cc
   qwen-image/metal-qwen-image21-transformer.cc
+  qwen-image/qwen-image21-trainer.cc
+  qwen-image/qwen-image21-lora-trainer.cc
   qwen-image/metal-qwen-image-calibration.cc
   qwen-image/metal-qwen25-vision.cc
   z-image/z-image-layout.cc
@@ -126,6 +128,10 @@ set(LOCAL_SOURCES
   minimax-h3/minimax-h3-text-encoder.cc
   minimax-h3/minimax-h3-denoise.cc
   lora-fusion.cc
+  train/train-ops.cc
+  train/lora-params.cc
+  train/optimizer.cc
+  train/sample-cache.cc
   quantize/affine-quantizer.cc
   quantize/arch-detect.cc
   quantize/calibration.cc
@@ -177,6 +183,8 @@ set(LOCAL_HEADERS
   qwen3/metal-qwen-vision.h
   qwen-image/qwen-image21-layout.h
   qwen-image/metal-qwen-image21-transformer.h
+  qwen-image/qwen-image21-trainer.h
+  qwen-image/qwen-image21-lora-trainer.h
   z-image/z-image-layout.h
   z-image/metal-z-image-transformer.h
   llama3/metal-llama-model.h
@@ -219,6 +227,11 @@ set(LOCAL_HEADERS
   minimax-h3/minimax-h3-denoise.h
   mage/metal-mage-vae.h
   mage/mage-screen.h
+  train/train-ops.h
+  train/lora-params.h
+  train/optimizer.h
+  train/lora-trainer.h
+  train/sample-cache.h
   quantize/affine-quantizer.h
   quantize/arch-detect.h
   quantize/calibration.h

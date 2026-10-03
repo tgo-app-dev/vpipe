@@ -60,8 +60,6 @@ private:
   std::unique_ptr<BeatPayloadIntf>
   build_metadata_(const std::string& url, const BeatPayloadIntf& image) const;
 
-  std::string av_err_(int rc) const;
-
   std::vector<std::string> _urls;
   // `alpha: keep` emits four channels. DEFAULT DROP, because the beat
   // every other consumer here reads is [3,H,W] and turning a

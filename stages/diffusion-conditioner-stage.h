@@ -203,6 +203,14 @@ private:
   // and a folder of reference pictures condition every picture on it.
   GenerationInput _prompt_in;
   std::string     _prompt;
+  // The prompt beats say they are a series (beat::kBatch): hold the
+  // encoder until end of stream. And the current one may be empty.
+  bool            _batch = false;
+  bool            _batch_checked = false;
+  // A batch on a box that holds the encoder whole loads it resident
+  // (see process()); sticky for the stage's life, like the load itself.
+  bool            _resident_for_batch = false;
+  bool            _allow_empty = false;
   // The last model-config beat, held UNPARSED: which family reads it is
   // not known until the checkpoint resolves, and the two beats arrive on
   // different ports in either order.

@@ -1169,6 +1169,11 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
                   "different geometry -- refill it rather than reusing it");
     }
   }
+  const TrainTap* tap = req.train;
+  if (tap != nullptr && (kv_fill || kv_use)) {
+    return fail("qwen-image-2.1 forward: a training forward runs the "
+                "whole sequence; the prefix cache does not apply");
+  }
   if (lay.prefix_len <= 0 && (kv_fill || kv_use)) {
     return fail("qwen-image-2.1 forward: nothing to cache (empty prefix)");
   }
@@ -1350,51 +1355,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   auto lin = [&](const SharedBuffer& x, std::size_t xe, const QWeight& w_in,
                  const SharedBuffer& y, std::size_t ye, int M, int N, int K,
                  const lora::Stack& lf = lora::Stack{}) {
-    // The adapters, ACCUMULATED onto whatever the base route wrote --
-    // after every exit below, so no route can skip them.
-    auto lora_after = [&]() {
-      if (!lf.empty()) {
-        _lora.apply(enc, x, xe, lf, y, ye, M, N, K, _mma_min_m);
-      }
-    };
-    // FP8: widened into the dequant scratch first, and from here on an
-    // ordinary dense weight to every route -- matrix cores, i8, steel.
-    QWeight fv;
-    const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
-    if (wp == nullptr) { return; }
-    const QWeight& w = *wp;
-    // Matrix cores first; a decline encodes nothing and falls through.
-    if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
-    if (!w.quantized) {
-      // The tile, which is the whole of this path's performance on a box
-      // with no matrix cores.
-      int bm = 32, bn = 32;
-      const metal_compute::ComputeFunction* fn = &_fn_gemm_t;
-      if (_gemm_tile == 1) { fn = &_fn_gemm_bm64; bm = 64; }
-      else if (_gemm_tile == 2) {
-        fn = &_fn_gemm_bm64bn64; bm = 64; bn = 64;
-      }
-      enc.set_function(*fn);
-      enc.set_buffer(0, x, xe * 2); enc.set_buffer(1, w.w);
-      enc.set_buffer(2, zero); enc.set_buffer(3, y, ye * 2);
-      enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, M);
-      enc.set_constant(7, 0);
-      // THREADGROUP-indexed: x = ceil(N/BN)*32, y = ceil(M/BM)*2, z = 2
-      // over a {32,2,2} group. A thread-indexed grid here computes a
-      // fraction of the output and leaves the rest as it found it.
-      enc.dispatch({(unsigned)(((N + bn - 1) / bn) * 32),
-                    (unsigned)(((M + bm - 1) / bm) * 2), 2}, {32, 2, 2});
-      lora_after();
-      return;
-    }
-    enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
-    enc.set_buffer(0, w.codes); enc.set_buffer(1, w.scales);
-    enc.set_buffer(2, w.qbias); enc.set_buffer(3, x, xe * 2);
-    enc.set_buffer(4, y, ye * 2);
-    enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
-    enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
-                  (unsigned)(((M + 31) / 32) * 2), 2u}, {32, 2, 2});
-    lora_after();
+    lin_(enc, zero, x, xe, w_in, y, ye, M, N, K, lf);
   };
   auto rms = [&](const SharedBuffer& x, std::size_t xe, const SharedBuffer& w,
                  const SharedBuffer& y, std::size_t ye, int R, int D) {
@@ -1680,7 +1641,9 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     // the GPU over every row and times both sides, which is how the
     // tier learns whether the split pays on this box and geometry.
     AneFeedForward::Plan ane_plan = AneFeedForward::Plan::kGpu;
-    if (_cfg.ane_ffn && ane_setup_(ROWS) && ane_eligible_(L, *b)) {
+    const TrainKeep* keep = tap != nullptr ? tap->keep : nullptr;
+    if (keep == nullptr && _cfg.ane_ffn && ane_setup_(ROWS) &&
+        ane_eligible_(L, *b)) {
       ane_plan = _ane->plan_block();
     }
     const bool ane_split = ane_plan == AneFeedForward::Plan::kSplit;
@@ -1730,12 +1693,26 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       report_block(stream, _block_progress, L, _cfg.n_layers);
     }
 
+    // TRAINING: this block's input, which its backward recomputes it from.
+    if (tap != nullptr && tap->ckpt != nullptr) {
+      copy_rows(jh, 0, *tap->ckpt, (std::size_t)L * ROWS * H, ROWS, H, H, H);
+    }
+
+    // TRAINING, KEEP: this block's slice of an intermediate's arena.
+    auto kept = [&](const SharedBuffer* arena, const SharedBuffer& src,
+                    std::size_t width) {
+      if (keep == nullptr || arena == nullptr) { return; }
+      copy_rows(src, 0, *arena, (std::size_t)L * ROWS * width, ROWS,
+                (int)width, (int)width, (int)width);
+    };
+
     // --- attention half ---
     for (const Band& bd : bands) {
       ln_mod(jh, (std::size_t)bd.start * H,
              modb, (std::size_t)bd.mod_row * 4 * H + 0,
              tmp, (std::size_t)bd.start * H, bd.rows);
     }
+    if (keep != nullptr) { kept(keep->h1, tmp, (std::size_t)H); }
     mark("elt");
     // ---- the q/k/v split point --------------------------------------
     //
@@ -1815,6 +1792,11 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     if (qkv_split && ane_split) { ane_stage_(L, *b); }
     // Per-head RMSNorm, then the fused transpose+rope. Token-major
     // [JT, NH, Hd] normalizes over the last Hd with JT*NH rows.
+    if (keep != nullptr) {
+      kept(keep->qpre, qb, (std::size_t)H);
+      kept(keep->kpre, kb, (std::size_t)H);
+      kept(keep->vb, vb, (std::size_t)H);
+    }
     rms(qb, 0, b->nq, qb, 0, ROWS * NH, Hd);
     rms(kb, 0, b->nk, kb, 0, ROWS * NH, Hd);
     // The rotary table is bound at this step's FIRST GLOBAL ROW, so a
@@ -1839,6 +1821,11 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     enc.set_constant(4, Hd);
     enc.dispatch({(unsigned)Hd, (unsigned)NH, (unsigned)ROWS},
                  {(unsigned)Hd, 1, 1});
+    if (keep != nullptr) {
+      kept(keep->qh, qh, (std::size_t)H);
+      kept(keep->kh, kh, (std::size_t)H);
+      kept(keep->vh, vh, (std::size_t)H);
+    }
 
     // ---- the cache -------------------------------------------------
     //
@@ -1947,7 +1934,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       // sit at ROW0 in the sequence, so the buffer row and the sequence
       // position are different numbers and the local band wants the
       // second.
-      if (_sol && nax && !sg.causal && _cfg.sol.enabled &&
+      if (tap == nullptr && _sol && nax && !sg.causal && _cfg.sol.enabled &&
           L >= _cfg.sol.dense_layers && qL >= kSolMinSegment) {
         const int blk = _cfg.sol.key_block > 0 ? _cfg.sol.key_block
                                                : sol::kBlock;
@@ -1980,7 +1967,7 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       // one segment qualifies, which is also what keeps the scratch
       // from being rebuilt inside a block.
       bool i8_ok = false;
-      if (_sage && nax && _cfg.sage.enabled &&
+      if (tap == nullptr && _sage && nax && _cfg.sage.enabled &&
           L >= _cfg.sage.dense_layers && qL >= kSageMinSegment) {
         const MetalSageAttention::Operand qo{
             &qh, (std::size_t)sg.qrow * Hd, Hd, ROWS * Hd};
@@ -1993,6 +1980,10 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
           .set_bool(300, false).set_bool(301, sg.causal).set_bool(302, false)
           .set_bool(sage::kQkInt8Constant, i8_ok);
+      // TRAINING, KEEP: the row statistics the backward's P needs.
+      const bool exp_ml =
+          keep != nullptr && keep->mlm != nullptr && keep->mls != nullptr;
+      if (exp_ml) { fc.set_bool(304, true); }
       metal_compute::ComputeFunction fn =
           nax ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
               : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
@@ -2008,6 +1999,12 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       enc.set_buffer(2, vuse);
       enc.set_buffer(3, ao, (std::size_t)sg.qrow * Hd * 2);
       enc.set_buffer(4, aparams[si]);
+      if (exp_ml) {
+        const std::size_t mo =
+            ((std::size_t)L * NH * ROWS + (std::size_t)NH * sg.qrow) * 4;
+        enc.set_buffer(12, *keep->mlm, mo);
+        enc.set_buffer(13, *keep->mls, mo);
+      }
       if (i8_ok) { _sage->bind(enc); }
       enc.dispatch({(unsigned)(32 * ((qL + A_BQ - 1) / A_BQ)),
                     (unsigned)(4 * NH), 1}, {32, 4, 1});
@@ -2021,6 +2018,10 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     enc.dispatch({(unsigned)Hd, (unsigned)ROWS, (unsigned)NH},
                  {(unsigned)Hd, 1, 1});
     mark("transpose");
+    if (keep != nullptr) {
+      kept(keep->ao, ao, (std::size_t)H);
+      kept(keep->af, af, (std::size_t)H);
+    }
     lin(af, 0, b->ow, tmp, 0, ROWS, H, H, LB(&BlockLora::o));
     mark("gemm.out");
     for (const Band& bd : bands) {
@@ -2030,11 +2031,13 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     }
 
     // --- feed-forward half ---
+    if (keep != nullptr) { kept(keep->x1, jh, (std::size_t)H); }
     for (const Band& bd : bands) {
       ln_mod(jh, (std::size_t)bd.start * H,
              modb, (std::size_t)bd.mod_row * 4 * H + 2 * H,
              tmp, (std::size_t)bd.start * H, bd.rows);
     }
+    if (keep != nullptr) { kept(keep->h2, tmp, (std::size_t)H); }
     mark("elt");
     // ---- the ANE split point ----------------------------------------
     //
@@ -2093,6 +2096,11 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
         enc.dispatch({(unsigned)sw_n, 1, 1}, {256, 1, 1});
       }
       mark("elt");
+      if (keep != nullptr && r0 == 0 && n == ROWS) {
+        kept(keep->g, g1, (std::size_t)FF);
+        kept(keep->u, u1, (std::size_t)FF);
+        kept(keep->s, s1, (std::size_t)FF);
+      }
       if (n > 0) {
         lin(s1, 0, b->out_w, tmp, e0, n, H, FF, LB(&BlockLora::out));
       }
@@ -2217,6 +2225,19 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     trace(("blk" + std::to_string(L)).c_str(), jh, (std::size_t)ROWS * H);
   }
 
+  // TRAINING: norm_out's input and the rows the backward modulates by.
+  if (tap != nullptr) {
+    if (tap->final_hidden != nullptr) {
+      copy_rows(jh, 0, *tap->final_hidden, 0, ROWS, H, H, H);
+    }
+    if (tap->modb != nullptr) {
+      copy_rows(modb, 0, *tap->modb, 0, MOD_ROWS, 4 * H, 4 * H, 4 * H);
+    }
+    if (tap->nsc != nullptr) {
+      copy_rows(nsc, 0, *tap->nsc, 0, MOD_ROWS, H, H, H);
+    }
+  }
+
   // ---- head ----------------------------------------------------------
   //
   // norm_out is scale-ONLY: LN(x) * (1 + scale), no shift, which is why
@@ -2283,6 +2304,64 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
   return out;
 }
 
+// The one GEMM helper; see the header. Everything a route needs beyond
+// the operands is on the model, and the bias slot takes the caller's zero
+// row -- this model is biasless throughout.
+void
+MetalQwenImage21Transformer::lin_(ComputeEncoder& enc,
+                                  const SharedBuffer& zero,
+                                  const SharedBuffer& x, std::size_t xe,
+                                  const QWeight& w_in, const SharedBuffer& y,
+                                  std::size_t ye, int M, int N, int K,
+                                  const lora::Stack& lf)
+{
+  // The adapters, ACCUMULATED onto whatever the base route wrote --
+  // after every exit below, so no route can skip them.
+  auto lora_after = [&]() {
+    if (!lf.empty()) {
+      _lora.apply(enc, x, xe, lf, y, ye, M, N, K, _mma_min_m);
+    }
+  };
+  // FP8: widened into the dequant scratch first, and from here on an
+  // ordinary dense weight to every route -- matrix cores, i8, steel.
+  QWeight fv;
+  const QWeight* wp = fp8_dense_(enc, w_in, fv, N, K);
+  if (wp == nullptr) { return; }
+  const QWeight& w = *wp;
+  // Matrix cores first; a decline encodes nothing and falls through.
+  if (gemm_mma_(enc, x, xe, w, y, ye, M, N, K)) { lora_after(); return; }
+  if (!w.quantized) {
+    // The tile, which is the whole of this path's performance on a box
+    // with no matrix cores.
+    int bm = 32, bn = 32;
+    const metal_compute::ComputeFunction* fn = &_fn_gemm_t;
+    if (_gemm_tile == 1) { fn = &_fn_gemm_bm64; bm = 64; }
+    else if (_gemm_tile == 2) {
+      fn = &_fn_gemm_bm64bn64; bm = 64; bn = 64;
+    }
+    enc.set_function(*fn);
+    enc.set_buffer(0, x, xe * 2); enc.set_buffer(1, w.w);
+    enc.set_buffer(2, zero); enc.set_buffer(3, y, ye * 2);
+    enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, M);
+    enc.set_constant(7, 0);
+    // THREADGROUP-indexed: x = ceil(N/BN)*32, y = ceil(M/BM)*2, z = 2
+    // over a {32,2,2} group. A thread-indexed grid here computes a
+    // fraction of the output and leaves the rest as it found it.
+    enc.dispatch({(unsigned)(((N + bn - 1) / bn) * 32),
+                  (unsigned)(((M + bm - 1) / bm) * 2), 2}, {32, 2, 2});
+    lora_after();
+    return;
+  }
+  enc.set_function(w.bits == 8 ? _fn_qmm8 : _fn_qmm4);
+  enc.set_buffer(0, w.codes); enc.set_buffer(1, w.scales);
+  enc.set_buffer(2, w.qbias); enc.set_buffer(3, x, xe * 2);
+  enc.set_buffer(4, y, ye * 2);
+  enc.set_constant(5, K); enc.set_constant(6, N); enc.set_constant(7, M);
+  enc.dispatch({(unsigned)(((N + 31) / 32) * 32),
+                (unsigned)(((M + 31) / 32) * 2), 2u}, {32, 2, 2});
+  lora_after();
+}
+
 // Bytes one block costs, taken from the CHECKPOINT rather than from a
 // loaded block: while streaming there is no loaded block to measure, and
 // the schedule has to be set before the first forward.
@@ -2347,7 +2426,8 @@ MetalQwenImage21Transformer::gemm_mma_(ComputeEncoder& enc,
   // Accelerated mode, from the SAME dense operand the tiles below would
   // read -- so it sits after the dequant and before the tile choice,
   // and a shape it declines falls through with nothing encoded.
-  if (_i8 && _i8->gemm(enc, xin, xe, *wdense, y, ye, M, N, K)) {
+  if (_i8 && !_i8_hold && _i8->gemm(enc, xin, xe, *wdense, y, ye, M, N,
+                                    K)) {
     return true;
   }
 
@@ -2714,6 +2794,78 @@ MetalQwenImage21Transformer::lora_modules(int slot) const
 {
   if (slot < 0 || slot >= kMaxLoraSlots) { return 0; }
   return _lora_bound[slot];
+}
+
+std::string
+MetalQwenImage21Transformer::block_module(int L, const std::string& leaf)
+{
+  return block_pre_(L) + leaf;
+}
+
+void
+MetalQwenImage21Transformer::release_live_lora(int slot)
+{
+  if (slot < 0 || slot >= kMaxLoraSlots || slot >= _lora_slots) { return; }
+  _lora_blk[slot].clear();
+  _lora_fix[slot] = FixedLora{};
+  _lora_bound[slot] = 0;
+  _lora_scale[slot] = 0.0f;
+  if (slot == _lora_slots - 1) {
+    _lora_rank_total = _lora_rank_prefix[slot];
+    _lora_slots = slot;
+  }
+}
+
+// The same module walk bind_loras_ does for a file, asking a trainer
+// instead. Idempotent per slot: a second call replaces the first.
+int
+MetalQwenImage21Transformer::bind_live_lora(int slot, const LiveLoraFn& fn)
+{
+  if (slot < 0 || slot >= kMaxLoraSlots || !fn) { return 0; }
+  if (!_lora.valid() && !_lora.init(_mc, _use_mma2)) { return 0; }
+  const int H = _cfg.hidden, FF = _cfg.hidden * _cfg.mlp_ratio;
+  _lora_blk[slot].clear();
+  _lora_blk[slot].resize((std::size_t)_cfg.n_layers);
+  _lora_fix[slot] = FixedLora{};
+  int bound = 0;
+  int max_rank = 0;
+  auto ask = [&](const std::string& m, int n, int k, lora::Factors* f) {
+    if (fn(m, n, k, f) && !f->empty()) {
+      ++bound;
+      max_rank = std::max(max_rank, f->rank);
+    }
+  };
+  for (int L = 0; L < _cfg.n_layers; ++L) {
+    BlockLora& d = _lora_blk[slot][(std::size_t)L];
+    ask(block_module(L, "attn.to_q"), H, H, &d.q);
+    ask(block_module(L, "attn.to_k"), H, H, &d.k);
+    ask(block_module(L, "attn.to_v"), H, H, &d.v);
+    ask(block_module(L, "attn.to_out.0"), H, H, &d.o);
+    ask(block_module(L, "img_mlp.gate_layer"), FF, H, &d.gate);
+    ask(block_module(L, "img_mlp.proj"), FF, H, &d.proj);
+    ask(block_module(L, "img_mlp.out"), H, FF, &d.out);
+  }
+  FixedLora& f = _lora_fix[slot];
+  ask("img_in", H, _cfg.in_channels, &f.img_in);
+  ask("txt_in.in_layer", H, _cfg.txt_dim, &f.txt_a);
+  ask("txt_in.out_layer", H, H, &f.txt_b);
+  ask("time_text_embed.timestep_embedder.linear_1", H, _cfg.time_proj,
+      &f.time_1);
+  ask("time_text_embed.timestep_embedder.linear_2", H, H, &f.time_2);
+  ask("modulation.1", 4 * H, H, &f.mod);
+  ask("norm_out.linear", H, H, &f.norm_out);
+  ask("proj_out", _cfg.out_channels, H, &f.proj_out);
+  // The slot's region of the shared [rows, rank] scratch starts after
+  // every slot before it; a re-bind of an existing slot keeps its place
+  // only when it is the last one, which is how a trainer uses it.
+  if (slot >= _lora_slots) {
+    _lora_rank_prefix[slot] = _lora_rank_total;
+    _lora_rank_total += max_rank;
+    _lora_slots = slot + 1;
+  }
+  _lora_bound[slot] = bound;
+  _lora_scale[slot] = 1.0f;
+  return bound;
 }
 
 std::size_t

@@ -215,6 +215,9 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         load-video-stage.cc
         vae-decode-clip.cc
         runtime-lora.cc
+        train-ops.cc
+        qwen-image-21-train.cc
+        train-lora-stage.cc
         minimax-h3-text-encoder.cc
         minimax-h3-refenc.cc
         mage-vae.cc

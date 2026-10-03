@@ -198,6 +198,9 @@ private:
   // the same rule the DiT and conditioner stages use.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   bool _unload_idle   = false;
+  // The pictures say they are a series (beat::kBatch in the sideband):
+  // hold the VAE until end of stream rather than per beat.
+  bool _batch         = false;
   bool _unload_resolved = false;
   bool _unloaded      = false;
   bool _quiet_reload  = false;   // reload logs at debug, not info

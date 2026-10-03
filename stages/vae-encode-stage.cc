@@ -430,7 +430,7 @@ VaeEncodeStage::reset_run_state()
   // re-emitted beat is never latched and this stage keeps the previous
   // run's selection.
   _model_latched = false;
-
+  _batch = false;
 }
 std::string
 VaeEncodeStage::vae_dir_for_release_() const
@@ -1100,6 +1100,9 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   }
   auto in = co_await ctx.read(port);
   if (!in) {
+    // THE END OF A BATCH: a dataset's pictures held the VAE across the
+    // series; now the idle policy applies.
+    if (_batch && _unload_idle && !_unloaded) { unload_vae_(); }
     // Upstream EOS -> close the oports -- unless the OTHER input is still
     // open, in which case the next call reads it.
     if (!(one && many)) { ctx.signal_done(); }
@@ -1148,9 +1151,18 @@ VaeEncodeStage::process(RuntimeContext& ctx)
         this->id(), in->describe()));
     co_return;
   }
+  // A picture of a SERIES (a training dataset) holds the VAE until the
+  // series ends: the next picture is certain.
+  if (tb->sideband.is_object()) {
+    FlexData sb = tb->sideband;       // as_object() is a view: keep it
+    auto so = sb.as_object();
+    if (so.contains(beat::kBatch) && so.at(beat::kBatch).as_bool(false)) {
+      _batch = true;
+    }
+  }
   auto out = encode_one_(*tb, in->describe());
   if (!out) { co_return; }
-  if (_unload_idle) { unload_vae_(); }
+  if (_unload_idle && !_batch) { unload_vae_(); }
   co_await ctx.write(0, std::move(out));
 }
 

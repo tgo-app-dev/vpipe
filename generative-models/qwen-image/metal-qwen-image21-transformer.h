@@ -138,6 +138,40 @@ class MetalQwenImage21Transformer {
     kCached,    // run the target rows only, against the kept prefix
   };
 
+  // What the forward leaves for a LoRA trainer's backward. Every buffer is
+  // the storage type and the caller's; a null one is not written.
+  //
+  //   ckpt          [n_layers, rows, hidden] -- each block's INPUT, the
+  //                 checkpoint its backward recomputes the block from;
+  //   final_hidden  [rows, hidden] -- the stream after the last block,
+  //                 norm_out's input;
+  //   modb          [mod_rows, 4 * hidden] -- the shared modulation;
+  //   nsc           [mod_rows, hidden] -- norm_out's scale rows.
+  //
+  // A training forward is EXACT: Sol and Sage, the approximate attention
+  // tiers, are skipped even when configured, and the KV cache refused.
+  //
+  // KEEP: every block's intermediates too, each an arena of n_layers
+  // slices ([rows, hidden], [rows, ffn], or [heads, rows] f32 for the
+  // attention's exported row statistics), so the backward reads them
+  // instead of recomputing the block. The feed-forward then runs on the
+  // GPU -- the ANE's fused module never materialises gate and up -- while
+  // the q/k/v tier, whose outputs ARE the kept projections, still runs.
+  struct TrainKeep {
+    const metal_compute::SharedBuffer *h1 = nullptr, *qpre = nullptr,
+        *kpre = nullptr, *vb = nullptr, *qh = nullptr, *kh = nullptr,
+        *vh = nullptr, *ao = nullptr, *af = nullptr, *x1 = nullptr,
+        *h2 = nullptr, *g = nullptr, *u = nullptr, *s = nullptr,
+        *mlm = nullptr, *mls = nullptr;
+  };
+  struct TrainTap {
+    const metal_compute::SharedBuffer* ckpt = nullptr;
+    const metal_compute::SharedBuffer* final_hidden = nullptr;
+    const metal_compute::SharedBuffer* modb = nullptr;
+    const metal_compute::SharedBuffer* nsc = nullptr;
+    const TrainKeep* keep = nullptr;
+  };
+
   struct Request {
     // Packed latents for EVERY image block in order, condition images
     // first and the target last: [layout->image_len, in_channels].
@@ -149,7 +183,11 @@ class MetalQwenImage21Transformer {
     float timestep = 0.0f;      // sigma in [0, 1], NOT scaled by 1000
     KvCache* kv = nullptr;
     KvMode kv_mode = KvMode::kOff;
+    // TRAINING: what a backward needs from this forward, copied out as
+    // the forward runs. Null for inference.
+    const TrainTap* train = nullptr;
   };
+
 
   // A single .safetensors holding a Qwen-Image-2.1 DiT under its
   // diffusers names -- unsloth's pre-quantized FP8 file, which has no
@@ -183,6 +221,21 @@ class MetalQwenImage21Transformer {
   // How many projections each slot bound. 0 is what a test must refuse:
   // an adapter for another model binds nothing and says so only here.
   int lora_modules(int slot) const;
+
+  // A TRAINER's adapter in `slot`: for every projection this family can
+  // adapt, `fn(module, n, k, &factors)` fills the factors the forward is to
+  // read -- live buffers the trainer keeps writing -- or returns false to
+  // leave the module unadapted. Strength 1; the trainer folds alpha into
+  // its A factors exactly as a file's would be. Returns the modules bound.
+  using LiveLoraFn = std::function<bool(const std::string& module, int n,
+                                        int k, lora::Factors* out)>;
+  int bind_live_lora(int slot, const LiveLoraFn& fn);
+  // Unbind `slot` (a trainer going away): nothing in it is read again,
+  // and the last slot's place in the scratch is given back.
+  void release_live_lora(int slot);
+  // The module path of block L's projection `leaf` ("attn.to_q", ...), as
+  // adapter files and bind_live_lora name it.
+  static std::string block_module(int L, const std::string& leaf);
 
   // One forward. Returns the TARGET block's rows only --
   // [layout->target_len, out_channels] f32-convertible f16 -- because
@@ -242,6 +295,7 @@ class MetalQwenImage21Transformer {
   int quant_bits() const { return _quant_bits; }
 
  private:
+  friend class QwenImage21Trainer;
   MetalQwenImage21Transformer() = default;
 
   enum class Retain { Cached, Streamed };
@@ -314,6 +368,17 @@ class MetalQwenImage21Transformer {
   bool ane_qkv_setup_(int seq);
   bool ane_qkv_eligible_(int L, const Block& b) const;
   void ane_qkv_stage_(int L, const Block& b);
+
+  // y = x W^T (+ the adapters in `lf`) by whichever route this box and
+  // shape take -- FP8 widening, matrix cores, int8, the steel tiles or the
+  // affine qmm -- with the LoRA accumulated after every route. The ONE
+  // GEMM helper: the forward and a trainer's backward both go through it.
+  void lin_(metal_compute::ComputeEncoder& enc,
+            const metal_compute::SharedBuffer& zero,
+            const metal_compute::SharedBuffer& x, std::size_t xe,
+            const QWeight& w, const metal_compute::SharedBuffer& y,
+            std::size_t ye, int M, int N, int K,
+            const lora::Stack& lf = lora::Stack{});
 
   // The matrix-core GEMM. Returns false with NOTHING encoded when this
   // box or this shape is not for it, and the caller keeps its steel
@@ -478,6 +543,9 @@ class MetalQwenImage21Transformer {
   std::unique_ptr<AneFeedForward> _ane_qkv;
   bool _ane_qkv_tried = false;
   std::unique_ptr<I8GemmContext> _i8;
+  // Set by the trainer around a backward GEMM it keeps off the int8
+  // pipe (QwenImage21Trainer::set_i8_backward).
+  bool _i8_hold = false;
 };
 
 }  // namespace genai

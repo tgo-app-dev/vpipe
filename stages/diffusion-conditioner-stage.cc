@@ -829,6 +829,15 @@ std::string flex_text_(const FlexData& fd)
   return "";
 }
 
+// A bool on a prompt object ({text, batch, allow_empty}); false for a bare
+// string or an absent key.
+bool flex_flag_(const FlexData& fd, std::string_view key)
+{
+  if (!fd.is_object()) { return false; }
+  auto o = fd.as_object();
+  return o.contains(key) && o.at(key).as_bool(false);
+}
+
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
 }  // namespace
@@ -1167,6 +1176,14 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     // the stack and only the tail is re-read.
     ecfg.stream_layers = true;
     ecfg.pin_frac      = plan.pin_frac;
+    // A BATCH is the exception to "one pass per prompt": a dataset's
+    // captions prefill hundreds or thousands of times in a row, and a
+    // streamed encoder re-reads its stack for every one of them. Where
+    // the box holds the encoder whole, the batch loads it resident.
+    if (_resident_for_batch) {
+      ecfg.stream_layers = false;
+      ecfg.pin_frac = 0.0;
+    }
     if (const char* e = std::getenv("VPIPE_ENC_STREAM")) {
       ecfg.stream_layers = (std::atoi(e) != 0);
       if (!ecfg.stream_layers) { ecfg.pin_frac = 0.0; }
@@ -1271,6 +1288,9 @@ DiffusionConditionerStage::reset_run_state()
   // run's negative prompt.
   _cfg_in.reset();
   _prompt_in.reset();
+  _batch = false;
+  _batch_checked = false;
+  _allow_empty = false;
   _prompt.clear();
   _negative_in.reset();
   _negative_prompt.clear();
@@ -3643,19 +3663,27 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     auto pb = co_await ctx.read(0);
     const Took took = _prompt_in.took(pb != nullptr);
     if (round.note(took) || took == Took::kNone) {
+      // THE END OF A BATCH: a dataset's captions held the encoder across
+      // the series; the series is over, so the idle policy applies now.
+      if (_batch && !_unloaded) { release_encoder_when_idle_(); }
       ctx.signal_done();
       co_return;
     }
     if (took == Took::kFresh) {
       const auto* fp = dynamic_cast<const FlexDataPayload*>(pb.get());
       _prompt = fp != nullptr ? flex_text_(fp->data) : std::string();
+      _allow_empty =
+          fp != nullptr && flex_flag_(fp->data, beat::kAllowEmpty);
+      if (fp != nullptr && flex_flag_(fp->data, beat::kBatch)) {
+        _batch = true;
+      }
     }
   }
   // Nothing new on any input: everything is broadcasting, and this
   // conditioning would repeat the last one exactly.
   if (round.idle()) { ctx.signal_done(); co_return; }
   const std::string prompt = _prompt;
-  if (prompt.empty()) { co_return; }
+  if (prompt.empty() && !_allow_empty) { co_return; }
 
   // ONLY NOW is the encoder worth having again.
   //
@@ -3667,6 +3695,24 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // rebuild it) back alongside a 33B denoise that had just been given
   // room by dropping it. Reading first costs nothing: the beat is already
   // in hand, and a null one returns above without touching the encoder.
+  // THE FIRST BEAT OF A BATCH: a streamed encoder re-reads its whole
+  // stack per prompt, which a dataset pays once per caption. When the box
+  // holds it resident -- the encode phase has nothing else large in it --
+  // swap the streamed model for a resident one, once.
+  if (_batch && !_batch_checked) {
+    _batch_checked = true;
+    if (_encoder && _encoder->streaming_layers() &&
+        model_memory::dir_weights_bytes(_enc_dir) +
+                model_memory::kStreamHeadroom <=
+            model_memory::phys_ram()) {
+      session()->info(fmt(
+          "DiffusionConditionerStage('{}'): a batch of prompts -- loading "
+          "the text encoder resident instead of re-reading its layers for "
+          "every one", this->id()));
+      _resident_for_batch = true;
+      unload_encoder_();
+    }
+  }
   if (_unloaded) { reload_encoder_(); }
   if (_encoder == nullptr && _umt5 == nullptr && _h3_enc == nullptr) {
     session()->warn(fmt(
@@ -3752,8 +3798,10 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   }
   // Drop the encoder BEFORE the conditioning is published: the DiT stage starts
   // its denoise as soon as the beat lands, so releasing here is what gives it
-  // the working set. It reloads when the next prompt arrives.
-  release_encoder_when_idle_();
+  // the working set. It reloads when the next prompt arrives. A BATCH holds
+  // it until its end of stream instead: the next beat is certain, and a
+  // reload per caption would read the encoder once per sample.
+  if (!_batch) { release_encoder_when_idle_(); }
   {
     auto beat = to_beat_(cond, shape_for(n_real), cdt);
     // Qwen-Image-2.1's joint-sequence bookkeeping. This is the ONLY
