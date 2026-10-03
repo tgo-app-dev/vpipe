@@ -359,7 +359,7 @@ class MetalSolAttention {
   bool ensure_scratch_(int heads, int kv_heads, int q_tokens, int k_tokens,
                        int d, std::string* err);
   void set_band_params_(int heads, int kv_heads, const Band& band, int d);
-  bool ensure_steel_(int tokens, std::string* err);
+  bool ensure_steel_(int q_tokens, int k_tokens, std::string* err);
   // The steel entry point for this object's kernel arm AND head width.
   metal_compute::ComputeFunction _lib_for_width_(
       const metal_compute::FunctionConstants& fc) const;
@@ -408,6 +408,7 @@ class MetalSolAttention {
   metal_compute::ComputeLibrary  _lib_proxy;
   metal_compute::ComputeFunction _fn_proxy, _fn_route_p;
   int _steel_seq = -1, _steel_nk = -1;
+  int _steel_qseq = -1;                // the QUERY extent; _steel_seq keys
   // THE EXACT HALF'S KERNEL, AND ITS TILE. On a matrix-core GPU the
   // blocks the routing keeps go to attn_steel_nax, whose query block is
   // 64 and key block 32 against the ALU kernel's 32 and 16 -- and those

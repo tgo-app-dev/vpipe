@@ -1,0 +1,61 @@
+{
+  "id": "yue2-cover-from-score",
+  "stages": [
+    {
+      "id": "generate-audio",
+      "type": "generate-audio",
+      "iports": [],
+      "config": {
+        "hf_dir": "m-a-p/YuE2-3B",
+        "style": "Jazz-funk, warm female lead vocal, Rhodes piano, electric bass, tight drums, groovy",
+        "lyrics": "[Intro]\n\n[Verse]\nTwinkle, twinkle, little star\nHow I wonder what you are\nUp above the world so high\nLike a diamond in the sky\nTwinkle, twinkle, little star\nHow I wonder what you are\n\n[Verse]\nWhen the blazing sun is gone\nWhen he nothing shines upon\nThen you show your little light\nTwinkle, twinkle, all the night\nTwinkle, twinkle, little star\nHow I wonder what you are\n\n[Outro]",
+        "abc": "X:1\nT:\nM:4/4\nL:1/16\nQ:1/4=96\nV: Vocal clef=treble name=\"Vocal Melody\" snm=\"Vocal\"\nV: Ins clef=treble name=\"Ins Melody\" snm=\"Inst.\"\nK:C\n% intro\nV: Vocal\nz16|z16|z16|z16|\nV: Ins\nc4c4g4g4|a4a4g8|f4f4e4e4|d4d4c8|\n% verse\nV: Vocal\nC4C4G4G4|A4A4G8|F4F4E4E4|D4D4C8|\nV: Ins\nZ4|\nV: Vocal\nG4G4F4F4|E4E4D8|G4G4F4F4|E4E4D8|\nV: Ins\nZ4|\nV: Vocal\nC4C4G4G4|A4A4G8|F4F4E4E4|D4D4C8|\nV: Ins\nZ4|\n% verse\nV: Vocal\nC4C4G4G4|A4A4G8|F4F4E4E4|D4D4C8|\nV: Ins\nZ4|\nV: Vocal\nG4G4F4F4|E4E4D8|G4G4F4F4|E4E4D8|\nV: Ins\nZ4|\nV: Vocal\nC4C4G4G4|A4A4G8|F4F4E4E4|D4D4C8|\nV: Ins\nZ4|\n% outro\nV: Vocal\nz16|z16|z16|z16|\nV: Ins\nc4c4g4g4|a4a4g8|f4f4e4e4|d4d4c8|\n",
+        "cot": "melody",
+        "seed": 831001
+      }
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "m-a-p/YuE2-Vae"
+      }
+    },
+    {
+      "id": "save-audio",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "yue2-cover.m4a",
+        "bitrate": 256000
+      }
+    },
+    {
+      "id": "save-score",
+      "type": "save-text",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "path": "yue2-cover.abc",
+        "newline": "after",
+        "append": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

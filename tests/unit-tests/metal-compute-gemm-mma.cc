@@ -4271,13 +4271,29 @@ TEST(gemm_i8, native_affine_rate) {
     std::printf("[gemm_i8natr] unavailable -- skip\n");
     return;
   }
-  struct Shape { int M, N, K, bits; const char* what; };
-  const Shape shapes[] = {
+  struct Shape { int M, N, K, bits; std::string what; };
+  std::vector<Shape> shapes = {
       {4096, 12288, 4096, 4, "flux2 block proj, w4"},
       {4096, 4096, 12288, 4, "deep K, w4"},
       {1024, 7168, 14336, 8, "H3 fc2, w8"},
       {4096, 4096, 4096, 8, "square, w8"},
   };
+  // VPIPE_I8_NATR_SHAPES="M:N:K:bits,..." times those instead (a family's
+  // own projections, to see where its untuned split lands).
+  if (const char* e = std::getenv("VPIPE_I8_NATR_SHAPES")) {
+    shapes.clear();
+    const std::string want = e;
+    for (std::size_t b = 0; b < want.size();) {
+      std::size_t end = want.find(',', b);
+      if (end == std::string::npos) { end = want.size(); }
+      const std::string one = want.substr(b, end - b);
+      int m = 0, n = 0, k = 0, bits = 0;
+      if (std::sscanf(one.c_str(), "%d:%d:%d:%d", &m, &n, &k, &bits) == 4) {
+        shapes.push_back({m, n, k, bits, "w" + std::to_string(bits)});
+      }
+      b = end + 1;
+    }
+  }
   for (const Shape& sh : shapes) {
     const int M = sh.M, N = sh.N, K = sh.K, bits = sh.bits, G = K / 64;
     const std::size_t row_bytes = bits == 8 ? (std::size_t)K : (std::size_t)K / 2;
@@ -4288,7 +4304,8 @@ TEST(gemm_i8, native_affine_rate) {
     SharedBuffer wdq = mc->make_shared_buffer((std::size_t)N * K * 2);
     SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
     if (y.empty() || wdq.empty() || wb.empty()) {
-      std::printf("[gemm_i8natr] alloc failed at %s -- skip\n", sh.what);
+      std::printf("[gemm_i8natr] alloc failed at %s -- skip\n",
+                  sh.what.c_str());
       continue;
     }
     // Patterned operands: the rates are data-independent, the bytes only
@@ -4306,7 +4323,8 @@ TEST(gemm_i8, native_affine_rate) {
     }
     const double gflop = 2.0 * M * (double)N * K * 1e-9;
     const int iters = 3;
-    std::printf("[gemm_i8natr] %s  M=%d N=%d K=%d\n", sh.what, M, N, K);
+    std::printf("[gemm_i8natr] %s  M=%d N=%d K=%d\n", sh.what.c_str(), M,
+                N, K);
     struct ArmC { const char* name; bool native; int S; int cmode; };
     const ArmC arms[] = {
         {"dequant+requant", false, 0, 0},

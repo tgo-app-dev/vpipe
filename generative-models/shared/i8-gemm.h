@@ -277,8 +277,7 @@ class I8GemmContext {
     for (const Tuned& t : _tuned) {
       if (t.N == N && t.K == K && t.M == key) { return t.splits; }
     }
-    std::vector<int> cands{0};
-    for (int S : split_candidates(M, N, K)) { cands.push_back(S); }
+    const std::vector<int> cands = tune_candidates(M, N, K);
     if (cands.size() < 2) {
       _tuned.push_back(Tuned{N, K, key, 0});
       return 0;
@@ -335,6 +334,31 @@ class I8GemmContext {
   // row block that still fills the 64-row tile.
   std::vector<int> split_candidates(int M, int N, int K) const;
 
+  // WHERE THE SPLIT IS FOR: the deep-K cliff. A single-op contraction
+  // past it runs at about half rate (the occupancy deficit described
+  // above), and the split is the cure. Short of it there is nothing to
+  // cure, so an untuned shape there runs UNSPLIT, and the tuner weighs
+  // only the single op against S=2 -- cheap, and two candidates leave a
+  // one-sample vote little room to pick wrong.
+  //
+  // MEASURED on the M5 Pro, g64 requant, S=2's rate against the single
+  // op's (MxNxK):
+  //   YuE2 at 5347 rows, Nx2048 and 2048x6144       0.67-0.90x
+  //   Qwen-Image-2.1 / Z-Image at 4096 rows, K 3840 / 4096   0.75-0.83x
+  // and the native w4/w8 route at Krea-2 / FLUX.2 shapes, 4096 rows,
+  // K 4096 / 6144: 0.86-0.92x at five of six (the sixth, 4096^3 w4,
+  // disagreed between its two kernel modes). Over a YuE2 song that was
+  // 1258 ms per evaluation against 1130 unsplit. Default 9216 (the cliff
+  // sits between 9k and 10k); VPIPE_I8_SPLIT_MIN_K moves it, and 0
+  // restores the old rule (every untuned shape at S=2, every width
+  // tuned).
+  int split_min_k() const { return _split_min_k; }
+
+  // What tune() and tune_pending() weigh for a shape: the single op, and
+  // below split_min_k() S=2 alone, at or past it every split the shape
+  // admits.
+  std::vector<int> tune_candidates(int M, int N, int K) const;
+
   // Set by tune() around each candidate; see MmaSplitK for the pattern.
   bool bypass_split = false;
   int  force_splits = 0;
@@ -386,6 +410,7 @@ class I8GemmContext {
   // does -- slower, allocation-free.
   std::size_t _plane_budget = 0;
   int _max_splits = 16;              // VPIPE_I8_SPLITK_MAX_S; 0 disables
+  int _split_min_k = 9216;           // VPIPE_I8_SPLIT_MIN_K; see above
   metal_compute::SharedBuffer _planes;
 
   struct Tuned { int N, K, M, splits; };
@@ -400,6 +425,8 @@ class I8GemmContext {
   // block (S=2 won at both 1024 and 2560 rows there). So it measures a
   // bounded stand-in and keys the answer to the real row bucket.
   static constexpr int kTuneRows = 2048;
+  // What one timed sample of the deferred tuner should last, at least.
+  static constexpr double kTuneSampleMs = 4.0;
   // Encode ONE candidate's GEMM (+ fold) over the existing scratches.
   void encode_tuned_(metal_compute::ComputeEncoder& enc, int M, int N,
                      int KP, int S);

@@ -646,9 +646,11 @@ MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
   _k_tokens = k_tokens; _d = d;
   _nq = nq; _nk = nk;
   // In STEEL key blocks: that is what the route kernel counts, so a
-  // fraction against routing blocks would read above 100%.
+  // fraction against routing blocks would read above 100%. Over the KEY
+  // extent -- the query one undercounts any band whose keys outnumber its
+  // queries, which is how a kept fraction above 100% was first reported.
   _total_blocks = (long long)heads * nq *
-                  ((tokens + _bk - 1) / _bk);
+                  ((k_tokens + _bk - 1) / _bk);
   return true;
 }
 
@@ -673,7 +675,8 @@ MetalSolAttention::_lib_for_width_(
 }
 
 bool
-MetalSolAttention::ensure_steel_(int tokens, std::string* err)
+MetalSolAttention::ensure_steel_(int q_tokens, int k_tokens,
+                                 std::string* err)
 {
   // KEYED ON THE SUMMARY LENGTH TOO. align_K for the approximate half is
   // a property of `nk`, which moves with the key block at a fixed
@@ -687,12 +690,17 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
   // widths at one sequence length is not a shape anything runs today,
   // but the cache would hand the second one the first one's kernel and
   // the failure is a silent read past the shorter rows.
-  if (_steel_seq == tokens && _steel_nk == _nk && _steel_sage == want_sage
-      && _steel_d == _d && _fn_steel.valid()) {
+  // ...AND ON BOTH EXTENTS. align_Q is a property of the QUERIES and
+  // align_K of the KEYS, which were one number until the band form: a
+  // band whose key count happened to be aligned and whose query count did
+  // not would have run full query blocks past its last row.
+  if (_steel_seq == k_tokens && _steel_qseq == q_tokens &&
+      _steel_nk == _nk && _steel_sage == want_sage && _steel_d == _d &&
+      _fn_steel.valid()) {
     return true;
   }
   FunctionConstants fc;
-  fc.set_bool(200, (tokens % 64) == 0).set_bool(201, (tokens % 32) == 0)
+  fc.set_bool(200, (q_tokens % 64) == 0).set_bool(201, (k_tokens % 32) == 0)
       .set_bool(300, false).set_bool(301, false).set_bool(302, false)
       .set_bool(303, true).set_bool(304, true)
       .set_bool(sage::kQkInt8Constant, want_sage != 0);
@@ -713,7 +721,7 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
     // 32) and therefore right: an unnecessary length mask costs the
     // ragged block a predicate, where a missing one reads past kL.
     FunctionConstants fa;
-    fa.set_bool(200, (tokens % 64) == 0).set_bool(201, (_nk % 32) == 0)
+    fa.set_bool(200, (q_tokens % 64) == 0).set_bool(201, (_nk % 32) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
         .set_bool(303, false).set_bool(304, true).set_bool(305, true);
     _fn_approx_masked = _lib_for_width_(fa);
@@ -724,7 +732,8 @@ MetalSolAttention::ensure_steel_(int tokens, std::string* err)
       return false;
     }
   }
-  _steel_seq = tokens;
+  _steel_seq = k_tokens;
+  _steel_qseq = q_tokens;
   _steel_nk = _nk;
   _steel_sage = want_sage;
   _steel_d = _d;
@@ -837,7 +846,7 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
     return false;
   }
   set_band_params_(heads, kv_heads, band, d);
-  if (!ensure_steel_(tokens, err)) { return false; }
+  if (!ensure_steel_(q_tokens, k_tokens, err)) { return false; }
   // WHAT ACTUALLY HAPPENED, not what was asked: set_sage already
   // dropped the driver on a box with no matrix cores, so this is the
   // one place that knows, and sage_engaged() is what a caller should

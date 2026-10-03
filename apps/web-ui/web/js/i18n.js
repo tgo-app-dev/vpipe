@@ -2306,6 +2306,145 @@ const STRINGS = {
       '取樣器組態 {sampler,method,eta,s_noise,seed,+conditioning_sigma}'],
 
   // ---- Generate Image (generative) ----
+  'stage.generate-audio.name': ['', '生成音频', '生成音訊'],
+  'stage.generate-audio.doc': ['',
+      '根据风格提示词和歌词生成歌曲（YuE2，metal）：先规划 ABC 乐谱，再写出歌'
+      + '曲的语义 token，最后用流匹配生成供 audio-vae-decode 解码的潜空间音频'
+      + '。',
+      '根據風格提示詞和歌詞生成歌曲（YuE2，metal）：先規劃 ABC 樂譜，再寫出歌'
+      + '曲的語義 token，最後用流匹配生成供 audio-vae-decode 解碼的潛空間音訊'
+      + '。'],
+  'cfg.generate-audio.hf_dir': ['',
+      '音频生成模型：models 数据库中的键或模型目录。目前支持 YuE2（m-a-p/YuE2'
+      + '-3B）。VAE 不在这里——请把 audio_latent 接到 audio-vae-decode，并在那'
+      + '里使用 m-a-p/YuE2-Vae',
+      '音訊生成模型：models 資料庫中的鍵或模型目錄。目前支援 YuE2（m-a-p/YuE2'
+      + '-3B）。VAE 不在這裡——請把 audio_latent 接到 audio-vae-decode，並在那'
+      + '裡使用 m-a-p/YuE2-Vae'],
+  'cfg.generate-audio.style': ['',
+      '风格提示词——曲风、情绪、乐器、人声（即 [Tags] 段）。提示节拍中的 "styl'
+      + 'e" 会覆盖它',
+      '風格提示詞——曲風、情緒、樂器、人聲（即 [Tags] 段）。提示節拍中的 "styl'
+      + 'e" 會覆蓋它'],
+  'cfg.generate-audio.lyrics': ['',
+      '歌词，用 [Verse] / [Chorus] / [Bridge] / [Intro] / [Outro] 标题分段。'
+      + '提示节拍会覆盖它',
+      '歌詞，用 [Verse] / [Chorus] / [Bridge] / [Intro] / [Outro] 標題分段。'
+      + '提示節拍會覆蓋它'],
+  'cfg.generate-audio.abc': ['',
+      '可选：ABC 记谱法的乐谱，用于翻唱或改编（需要 cot 为 melody 或 full）。'
+      + '留空则由模型自行谱写',
+      '選用：ABC 記譜法的樂譜，用於翻唱或改編（需要 cot 為 melody 或 full）。'
+      + '留空則由模型自行譜寫'],
+  'cfg.generate-audio.cot': ['',
+      '规划方式："full"（旋律加和弦，默认）、"melody"（仅旋律——翻唱时推荐）、'
+      + '"off"（不写乐谱）',
+      '規劃方式："full"（旋律加和弦，預設）、"melody"（僅旋律——翻唱時建議）、'
+      + '"off"（不寫樂譜）'],
+  'cfg.generate-audio.seed': ['',
+      'token 采样与流匹配噪声的随机种子',
+      'token 取樣與流匹配雜訊的隨機種子'],
+  'cfg.generate-audio.cfg_scale': ['',
+      '歌曲阶段的文本引导强度；< 0 表示沿用协议默认值（full/melody 为 1.0，of'
+      + 'f 为 1.01）。大于 1 时歌曲阶段的解码开销加倍',
+      '歌曲階段的文字引導強度；< 0 表示沿用協定預設值（full/melody 為 1.0，of'
+      + 'f 為 1.01）。大於 1 時歌曲階段的解碼成本加倍'],
+  'cfg.generate-audio.ode_steps': ['',
+      '流匹配中点法步数（每步两次模型前向）；发布协议为 32',
+      '流匹配中點法步數（每步兩次模型前向）；發布協定為 32'],
+  'cfg.generate-audio.max_seconds': ['',
+      '歌曲长度上限（秒）；0 = 协议上限（9000 个 token，即 6 分钟）。模型会在'
+      + '此之前自行结束歌曲',
+      '歌曲長度上限（秒）；0 = 協定上限（9000 個 token，即 6 分鐘）。模型會在'
+      + '此之前自行結束歌曲'],
+  'cfg.generate-audio.abc_temperature': ['', '乐谱采样温度', '樂譜取樣溫度'],
+  'cfg.generate-audio.abc_top_p': ['',
+      '乐谱的 nucleus（top-p）概率质量',
+      '樂譜的 nucleus（top-p）機率質量'],
+  'cfg.generate-audio.abc_top_k': ['', '乐谱的 top-k', '樂譜的 top-k'],
+  'cfg.generate-audio.abc_repetition_penalty': ['',
+      '乐谱的重复惩罚，作用于最近 100 个 token',
+      '樂譜的重複懲罰，作用於最近 100 個 token'],
+  'cfg.generate-audio.song_temperature': ['',
+      '歌曲 token 的采样温度',
+      '歌曲 token 的取樣溫度'],
+  'cfg.generate-audio.song_top_p': ['',
+      '歌曲 token 的 nucleus（top-p）概率质量',
+      '歌曲 token 的 nucleus（top-p）機率質量'],
+  'cfg.generate-audio.song_top_k': ['',
+      '歌曲 token 的 top-k',
+      '歌曲 token 的 top-k'],
+  'cfg.generate-audio.song_repetition_penalty': ['',
+      '歌曲 token 的重复惩罚，作用于最近 50 个 token',
+      '歌曲 token 的重複懲罰，作用於最近 50 個 token'],
+  'cfg.generate-audio.i8_gemm': ['',
+      '加速模式（有损）：流匹配中的大 GEMM 用动态 int8 的 matmul2d 计算，每个'
+      + ' GEMM 约 1e-2 的误差。仅限矩阵核心——这是 M5 的路径；其他机器保持稠密'
+      + '。环境变量 VPIPE_I8_GEMM 可覆盖',
+      '加速模式（有損）：流匹配中的大 GEMM 以動態 int8 的 matmul2d 計算，每個'
+      + ' GEMM 約 1e-2 的誤差。僅限矩陣核心——這是 M5 的路徑；其他機器維持稠密'
+      + '。環境變數 VPIPE_I8_GEMM 可覆蓋'],
+  'cfg.generate-audio.ane_ffn': ['',
+      '加速前馈（fp16）：把流匹配阶段 SwiGLU 的各行在 Apple 神经网络引擎与 GP'
+      + 'U 之间拆分并发运行——除 ANE 的 fp16 精度外完全等价（实测与参考 fp32 '
+      + '的偏差 0.0206，GPU 为 0.0191）。面向没有 GPU 矩阵核心的 M4 系列。模'
+      + '块大小固定，与歌曲长度无关；是否装得下由资源规划决定',
+      '加速前饋（fp16）：把流匹配階段 SwiGLU 的各行在 Apple 神經網路引擎與 GP'
+      + 'U 之間拆分並行執行——除 ANE 的 fp16 精度外完全等價（實測與參考 fp32 '
+      + '的偏差 0.0206，GPU 為 0.0191）。面向沒有 GPU 矩陣核心的 M4 系列。模'
+      + '組大小固定，與歌曲長度無關；是否容得下由資源規劃決定'],
+  'cfg.generate-audio.ane_rows': ['',
+      '交给 ANE 的前馈行比例；0（默认）按两个引擎实测的耗时自动平衡',
+      '交給 ANE 的前饋行比例；0（預設）依兩個引擎實測的耗時自動平衡'],
+  'cfg.generate-audio.ane_layers': ['',
+      '最多拆分 28 层中的多少层；0（默认）= 全部',
+      '最多拆分 28 層中的多少層；0（預設）= 全部'],
+  'cfg.generate-audio.sage_attn': ['',
+      '加速注意力（有损）：流匹配的 QK^T 用 INT8 计算，K 先减去均值。仅限矩阵'
+      + '核心——这是 M5 的指令；其他机器会提示一次并保持稠密计算',
+      '加速注意力（有損）：流匹配的 QK^T 以 INT8 計算，K 先減去平均值。僅限矩'
+      + '陣核心——這是 M5 的指令；其他機器會提示一次並維持稠密計算'],
+  'cfg.generate-audio.sage_dense_layers': ['',
+      'sage_attn 保持原数据类型的前几层',
+      'sage_attn 維持原資料型別的前幾層'],
+  'cfg.generate-audio.sol_attn': ['',
+      '加速注意力（有损）：Sol-Attn 在流匹配注意力（[文本前缀 ; 歌曲 token ; '
+      + '潜变量]）上按整块路由键：代理分数保留的块精确计算，其余用质心代替。'
+      + '文本前缀（指令、风格、歌词、乐谱）始终精确计算',
+      '加速注意力（有損）：Sol-Attn 在流匹配注意力（[文字前綴 ; 歌曲 token ; '
+      + '潛變數]）上按整塊路由鍵：代理分數保留的塊精確計算，其餘以質心代替。'
+      + '文字前綴（指令、風格、歌詞、樂譜）始終精確計算'],
+  'cfg.generate-audio.sol_tau': ['',
+      'Sol-Attn 阈值，以查询块自身代理分数分布的标准差为单位；越高保留的块越'
+      + '少。0 并非稠密：低于平均的块仍会被丢弃',
+      'Sol-Attn 閾值，以查詢塊自身代理分數分布的標準差為單位；越高保留的塊越'
+      + '少。0 並非稠密：低於平均的塊仍會被捨棄'],
+  'cfg.generate-audio.sol_dense_layers': ['',
+      'sol_attn 保持稠密的前几层',
+      'sol_attn 維持稠密的前幾層'],
+  'cfg.generate-audio.sol_key_block': ['',
+      '每个 Sol 质心汇总的键数：32 或 64；0（默认）取 64',
+      '每個 Sol 質心彙總的鍵數：32 或 64；0（預設）取 64'],
+  'cfg.generate-audio.sol_local_radius': ['',
+      '查询所在块两侧始终精确计算的键块数',
+      '查詢所在塊兩側始終精確計算的鍵塊數'],
+  'port.generate-audio.prompt': ['',
+      '可选 FlexData：字符串（即歌词），或包含 style / tags、lyrics、abc、cot'
+      + '、seed、cfg_scale 中任意键的对象；缺少的键回退到配置。每个节拍生成一'
+      + '首歌。未连接时，本阶段按配置生成一首歌',
+      '選用 FlexData：字串（即歌詞），或包含 style / tags、lyrics、abc、cot、'
+      + 'seed、cfg_scale 中任意鍵的物件；缺少的鍵回退到設定。每個節拍生成一首'
+      + '歌。未連接時，本階段依設定生成一首歌'],
+  'port.generate-audio.audio_latent': ['',
+      'f32 潜空间音频 [1, 64, frames]，每秒 25 帧（sideband 中的 latents_per_'
+      + 'second）；用 audio-vae-decode 解码',
+      'f32 潛空間音訊 [1, 64, frames]，每秒 25 幀（sideband 中的 latents_per_'
+      + 'second）；用 audio-vae-decode 解碼'],
+  'port.generate-audio.score': ['',
+      'FlexData 字符串：歌曲的 ABC 乐谱（模型规划的，或输入提供的）。cot=off '
+      + '时不输出',
+      'FlexData 字串：歌曲的 ABC 樂譜（模型規劃的，或輸入提供的）。cot=off 時'
+      + '不輸出'],
   'stage.generate-image.name': ['', '生成图片', '生成影像'],
   'stage.generate-image.doc': ['',
       '扩散 DiT 去噪器：条件（来自 diffusion-conditioner 阶段）-> 模型族的 '

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <regex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -180,7 +181,8 @@ is_ws_(unsigned char c)
 // length of the matched chunk, or 0 if no alternative matched
 // (caller advances by one codepoint to make progress).
 size_t
-llama3_match_one_(const char* data, size_t len, size_t pos)
+llama3_match_one_(const char* data, size_t len, size_t pos,
+                  int max_digits)
 {
   // --- Alt 1: contractions (case-insensitive ASCII) -----------------
   if (pos < len && data[pos] == '\'') {
@@ -235,11 +237,11 @@ llama3_match_one_(const char* data, size_t len, size_t pos)
     if (w > 0) { return w; }
   }
 
-  // --- Alt 3: \p{N}{1,3} --------------------------------------------
+  // --- Alt 3: \p{N}{1,3} (Llama-3), or \p{N} (Qwen) ---------------
   {
     size_t end = pos;
     int count = 0;
-    while (count < 3 && end < len) {
+    while (count < max_digits && end < len) {
       size_t cl;
       uint32_t cp = utf8_next_(data, len, end, &cl);
       if (!is_digit_cp_(cp)) { break; }
@@ -451,6 +453,9 @@ public:
   bool parse(const FlexData& root, string_view tag,
              const SessionContextIntf* session);
   bool load_gguf(const GgufFile& g, const SessionContextIntf* session);
+  bool load_tiktoken(string_view path,
+                     span<const string> specials,
+                     const SessionContextIntf* session);
 
   vector<int32_t> encode(string_view text) const;
   string          decode(span<const int32_t> ids) const;
@@ -486,6 +491,18 @@ private:
   // that walks the seven alternatives of that regex directly, with
   // best-effort Unicode property classification.
   bool                                                      _use_llama3_pre = false;
+  // Longest digit run the scanner keeps in one pre-token: the Llama-3
+  // pattern spells \p{N}{1,3}, Qwen's spells a bare \p{N}. Left at 3
+  // for tokenizer.json (whose Qwen vocabularies carry no digit merges,
+  // so the two spellings agree there); a tiktoken rank file sets 1.
+  int                                                       _pre_digit_run = 3;
+  // tiktoken rank-file BPE (qwen.tiktoken): there is no merges list.
+  // The pair to merge is the adjacent pair whose CONCATENATION has the
+  // lowest rank, and a token's rank is its id -- so the priority is a
+  // vocab lookup and no merges table is built. Ids at or above
+  // `_n_ordinary` are specials and never take part.
+  bool                                                      _rank_merges = false;
+  int32_t                                                   _n_ordinary = 0;
   int32_t                                                   _vocab_size = 0;
 
   // SentencePiece-style metaspace mode (Gemma): a `Replace " " -> "▁"`
@@ -1039,6 +1056,68 @@ Tokenizer::Impl::load_gguf(const GgufFile& g,
   return !_vocab.empty();
 }
 
+bool
+Tokenizer::Impl::load_tiktoken(string_view path, span<const string> specials,
+                               const SessionContextIntf* session)
+{
+  const string path_str(path);
+  ifstream in(path_str, ios::binary);
+  if (!in) {
+    if (session) {
+      session->warn(fmt("Tokenizer::from_tiktoken('{}'): cannot open",
+                        path_str));
+    }
+    return false;
+  }
+  // One "<base64 bytes> <rank>" per line. The vocab is keyed in the
+  // byte-level alphabet like every other BPE here, so encode_chunk_ and
+  // the decoder need no tiktoken arm of their own.
+  string line;
+  int32_t max_rank = -1;
+  while (getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+    if (line.empty()) { continue; }
+    const auto sp = line.find(' ');
+    if (sp == string::npos) { return false; }
+    auto bytes = media_line::base64_decode(string_view(line).substr(0, sp));
+    if (!bytes) { return false; }
+    int32_t rank = -1;
+    try {
+      rank = static_cast<int32_t>(stol(line.substr(sp + 1)));
+    } catch (const exception&) {
+      return false;
+    }
+    if (rank < 0) { return false; }
+    const string tok = bytes_to_byte_level_(
+        string_view(reinterpret_cast<const char*>(bytes->data()),
+                    bytes->size()));
+    _vocab.emplace(tok, rank);
+    _inv_vocab.emplace(rank, tok);
+    max_rank = std::max(max_rank, rank);
+  }
+  if (max_rank < 0 || (size_t)(max_rank + 1) != _vocab.size()) {
+    if (session) {
+      session->warn(fmt(
+          "Tokenizer::from_tiktoken('{}'): {} ranks are not dense in "
+          "[0, {})", path_str, _vocab.size(), max_rank + 1));
+    }
+    return false;
+  }
+  _n_ordinary = max_rank + 1;
+  _vocab_size = _n_ordinary;
+  // Specials follow the ordinary ranks, in the order given.
+  for (const auto& name : specials) {
+    const int32_t id = _vocab_size++;
+    _special_by_name.emplace(name, id);
+    _special_by_id.emplace(id, name);
+  }
+  _rank_merges = true;
+  _use_llama3_pre = true;
+  _pre_digit_run = 1;
+  detect_thinking_markers_();
+  return true;
+}
+
 void
 Tokenizer::Impl::detect_thinking_markers_()
 {
@@ -1064,9 +1143,20 @@ Tokenizer::Impl::bpe_(vector<string>* pieces) const
     size_t best_idx = numeric_limits<size_t>::max();
     int32_t best_prio = numeric_limits<int32_t>::max();
     for (size_t i = 0; i + 1 < pieces->size(); ++i) {
-      auto it = _merge_priority.find({(*pieces)[i], (*pieces)[i + 1]});
-      if (it != _merge_priority.end() && it->second < best_prio) {
-        best_prio = it->second;
+      int32_t prio = numeric_limits<int32_t>::max();
+      if (_rank_merges) {
+        auto it = _vocab.find((*pieces)[i] + (*pieces)[i + 1]);
+        if (it != _vocab.end() && it->second < _n_ordinary) {
+          prio = it->second;
+        }
+      } else {
+        auto it = _merge_priority.find({(*pieces)[i], (*pieces)[i + 1]});
+        if (it != _merge_priority.end()) { prio = it->second; }
+      }
+      // Strictly less: the LEFTMOST of equal priorities merges first,
+      // which is also what tiktoken does.
+      if (prio < best_prio) {
+        best_prio = prio;
         best_idx  = i;
       }
     }
@@ -1284,7 +1374,7 @@ Tokenizer::Impl::pre_tokenize_(string_view text) const
     const size_t len = text.size();
     size_t pos = 0;
     while (pos < len) {
-      size_t n = llama3_match_one_(data, len, pos);
+      size_t n = llama3_match_one_(data, len, pos, _pre_digit_run);
       if (n == 0) { break; }
       out.emplace_back(data + pos, n);
       pos += n;
@@ -1481,6 +1571,17 @@ Tokenizer::from_gguf(const GgufFile& gguf, const SessionContextIntf* session)
 {
   unique_ptr<Tokenizer> tok(new Tokenizer);
   if (!tok->_impl->load_gguf(gguf, session)) {
+    return nullptr;
+  }
+  return tok;
+}
+
+unique_ptr<Tokenizer>
+Tokenizer::from_tiktoken(string_view path, span<const string> specials,
+                         const SessionContextIntf* session)
+{
+  unique_ptr<Tokenizer> tok(new Tokenizer);
+  if (!tok->_impl->load_tiktoken(path, specials, session)) {
     return nullptr;
   }
   return tok;

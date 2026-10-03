@@ -94,6 +94,10 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen25-vision.cc
   z-image/z-image-layout.cc
   z-image/metal-z-image-transformer.cc
+  yue2/yue2-protocol.cc
+  yue2/metal-yue2-model.cc
+  yue2/metal-oobleck-decoder.cc
+  yue2/yue2-vae-family.cc
   mage/metal-mage-vae.cc
   mage/mage-screen.cc
   mage/mage-screen-policy.cc

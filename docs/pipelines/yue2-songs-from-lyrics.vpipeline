@@ -1,0 +1,75 @@
+{
+  "id": "yue2-songs-from-lyrics",
+  "stages": [
+    {
+      "id": "load-lyrics",
+      "type": "load-text",
+      "iports": [],
+      "config": {
+        "path": [
+          "lyrics-1.txt",
+          "lyrics-2.txt"
+        ]
+      }
+    },
+    {
+      "id": "generate-audio",
+      "type": "generate-audio",
+      "iports": [
+        {
+          "src": "load-lyrics",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "m-a-p/YuE2-3B",
+        "style": "Indie pop, warm female vocal, acoustic guitar, soft drums, bright synth pads, uplifting, summer evening",
+        "cot": "full",
+        "seed": 831001
+      }
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "m-a-p/YuE2-Vae"
+      }
+    },
+    {
+      "id": "save-audio",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "yue2-song-%02d.m4a",
+        "bitrate": 256000
+      }
+    },
+    {
+      "id": "save-score",
+      "type": "save-text",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "path": "yue2-songs.abc",
+        "newline": "after",
+        "append": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

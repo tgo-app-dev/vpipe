@@ -209,6 +209,8 @@ family_version_(const std::string& mt, std::string& family,
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
       {"moss-codec",             "MOSS",        "Audio-Tokenizer"},
       {"moss-codec-v2",          "MOSS",        "Audio-Tokenizer"},
+      {"yue2",                   "YuE",         "2"},
+      {"yue2-vae",               "YuE",         "2-Vae"},
       {"yolo",                   "YOLOX",       "L"},
       {"silero-vad",             "Silero",      "VAD"},
       {"audio-tagging",          "BEATs",       "iter3+"},
@@ -267,6 +269,9 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   if (starts("moss_tts_local"))    { return "moss-tts-local"; }
   if (starts("moss_tts_realtime")) { return "moss-tts-realtime"; }
   if (starts("moss_tts"))          { return "moss-tts"; }
+  // YuE2 names its VAE export "yue2_vae": test that first.
+  if (starts("yue2_vae"))          { return "yue2-vae"; }
+  if (starts("yue2"))              { return "yue2"; }
   if (starts("llama"))             { return "llama3"; }
   return {};
 }

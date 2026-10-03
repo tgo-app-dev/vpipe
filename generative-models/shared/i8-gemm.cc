@@ -1,5 +1,7 @@
 #include "generative-models/shared/i8-gemm.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <vector>
 
@@ -95,6 +97,10 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16) : _mc(mc)
     const int v = std::atoi(e);
     _max_splits = v >= 0 ? v : 16;
   }
+  if (const char* e = std::getenv("VPIPE_I8_SPLIT_MIN_K")) {
+    const int v = std::atoi(e);
+    if (v >= 0) { _split_min_k = v; }
+  }
   if (const char* e = std::getenv("VPIPE_I8_GEMM_MIN_M")) {
     _min_m = std::atoi(e);
   }
@@ -122,6 +128,16 @@ I8GemmContext::split_candidates(int M, int N, int K) const
   return out;
 }
 
+std::vector<int>
+I8GemmContext::tune_candidates(int M, int N, int K) const
+{
+  std::vector<int> out{0};
+  for (int S : split_candidates(M, N, K)) {
+    if (K >= _split_min_k || S == 2) { out.push_back(S); }
+  }
+  return out;
+}
+
 int
 I8GemmContext::plan_(int M, int N, int K) const
 {
@@ -131,12 +147,16 @@ I8GemmContext::plan_(int M, int N, int K) const
   for (const Tuned& t : _tuned) {
     if (t.N == N && t.K == K && t.M == key) { return t.splits; }
   }
-  // UNTUNED: 2, when the shape admits it. Not 0, because a caller that
-  // never tunes should still get the part of this that is free, and not
-  // more, because 2 is the only width that won at every row count
-  // measured (1.23-1.44x) -- the wider ones win big at 256 rows and LOSE
-  // at 1024+. An untuned guess that can lose is worse than a small
-  // certain gain.
+  // UNTUNED, short of the deep-K cliff: the single op. There is no
+  // occupancy deficit there for a split to cure, and S=2 measured 0.67-
+  // 0.92x of it at the shapes tried (see split_min_k()).
+  if (K < _split_min_k) { return 0; }
+  // UNTUNED, past it: 2, when the shape admits it. Not 0, because a
+  // caller that never tunes should still get the part of this that is
+  // free, and not more, because 2 is the only width that won at every row
+  // count measured at H3's fc2 (1.23-1.44x) -- the wider ones win big at
+  // 256 rows and LOSE at 1024+. An untuned guess that can lose is worse
+  // than a small certain gain.
   const std::vector<int> c = split_candidates(M, N, K);
   for (int S : c) {
     if (S == 2) { return 2; }
@@ -457,8 +477,7 @@ I8GemmContext::tune_pending(MetalCompute* mc)
   for (const Tuned& p : todo) {
     const int KP = kpad_(p.K);
     const int M = p.M < kTuneRows ? p.M : kTuneRows;
-    std::vector<int> cands{0};
-    for (int S : split_candidates(M, p.N, p.K)) { cands.push_back(S); }
+    const std::vector<int> cands = tune_candidates(M, p.N, p.K);
     // The scratches must still cover the shape. They are grow-only and
     // this shape ran, so they do -- unless release_scratch() intervened,
     // in which case the honest answer is to drop the shape rather than
@@ -484,13 +503,22 @@ I8GemmContext::tune_pending(MetalCompute* mc)
       _tuned.push_back(Tuned{p.N, p.K, p.M, 0});
       continue;
     }
-    const int w = autotune_vote((int)cands.size(), /*rounds=*/3,
-        /*reps_for_us=*/1,
-        [&](int i) {
-          return autotune_time(mc, 1, [&](ComputeEncoder& e) {
-            encode_tuned_(e, M, p.N, KP, cands[(std::size_t)i]);
-          });
-        });
+    // A SAMPLE OF ~4 ms, not one dispatch. At the tune rows a short-K
+    // GEMM is 0.5-3 ms, the same order as a commit-and-wait's jitter and
+    // as the gap between the two candidates below the cliff, and
+    // one-dispatch samples voted S=2 in 4 of 35 trials there (M5 Pro)
+    // against a single op 10-30% faster. Sized off the single op, timed
+    // once (which also warms it).
+    auto sample = [&](int S, int reps) {
+      return autotune_time(mc, reps, [&](ComputeEncoder& e) {
+        encode_tuned_(e, M, p.N, KP, S);
+      });
+    };
+    const double one_ms = 1e3 * sample(0, 1);
+    const int reps = one_ms <= 0.0 ? 1
+        : std::clamp((int)std::ceil(kTuneSampleMs / one_ms), 1, 8);
+    const int w = autotune_vote((int)cands.size(), /*rounds=*/3, reps,
+        [&](int i) { return sample(cands[(std::size_t)i], reps); });
     _tuned.push_back(Tuned{p.N, p.K, p.M, cands[(std::size_t)w]});
   }
   // Held only for the measurement: it is as large as an output and the

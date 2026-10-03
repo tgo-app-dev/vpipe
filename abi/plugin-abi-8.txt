@@ -2700,6 +2700,7 @@ vpipe::genai::Tokenizer::encode(std::__1::basic_string_view<char, std::__1::char
 vpipe::genai::Tokenizer::from_gguf(vpipe::genai::GgufFile const&, vpipe::SessionContextIntf const*)
 vpipe::genai::Tokenizer::from_huggingface_json(std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::SessionContextIntf const*)
 vpipe::genai::Tokenizer::from_huggingface_string(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::SessionContextIntf const*)
+vpipe::genai::Tokenizer::from_tiktoken(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::span<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const, 18446744073709551615ul>, vpipe::SessionContextIntf const*)
 vpipe::genai::Tokenizer::has_pre_tokenizer() const
 vpipe::genai::Tokenizer::make_stream_decoder() const
 vpipe::genai::Tokenizer::merge_count() const

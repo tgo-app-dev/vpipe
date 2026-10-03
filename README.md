@@ -386,8 +386,9 @@ worth knowing.
 web UI, and adds speech transcription. For image editing from a reference
 photo, **[docs/KLEIN.md](docs/KLEIN.md)**; for text-to-image,
 **[docs/KREA-2.md](docs/KREA-2.md)**; for text-to-video *with sound*,
-**[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**. Each ships the pipelines it
-describes.
+**[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**; for whole songs from a style
+prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**. Each ships the
+pipelines it describes.
 
 ---
 

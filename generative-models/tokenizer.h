@@ -66,6 +66,18 @@ public:
   static std::unique_ptr<Tokenizer>
   from_gguf(const GgufFile& gguf, const SessionContextIntf* session);
 
+  // Build from a tiktoken rank file (`<base64 bytes> <rank>` per line,
+  // e.g. the `qwen.tiktoken` YuE2 ships in place of a tokenizer.json).
+  // There is no merges list: the pair BPE merges is the adjacent pair
+  // whose concatenation has the lowest rank, which is how tiktoken
+  // itself encodes. The pre-tokenizer is the Qwen pattern -- the
+  // \p{L}/\p{N} split, one digit per pre-token. `specials` take the ids
+  // after the last rank, in order. nullptr on failure.
+  static std::unique_ptr<Tokenizer>
+  from_tiktoken(std::string_view                  path,
+                std::span<const std::string>      specials,
+                const SessionContextIntf*         session);
+
   // For round-trip tests and other callers that already have the
   // tokenizer.json content in memory: parse from a literal string.
   // `tag` appears in error messages so the caller knows what was

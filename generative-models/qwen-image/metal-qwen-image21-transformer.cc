@@ -1285,6 +1285,12 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     }
   }
 
+  // The int8 split's width, for the shapes an earlier forward recorded.
+  // HERE because it runs its own command streams: forward 1 records, 2
+  // measures, every one after reads the cache. No-op when nothing is
+  // pending, and on a run with i8 off.
+  if (_i8) { _i8->tune_pending(mc); }
+
   CommandStream stream = mc->make_command_stream();
   ComputeEncoder enc = stream.begin_compute();
   if (!enc.valid()) {

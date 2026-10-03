@@ -548,6 +548,35 @@ builtin_catalog_()
      .variant = "bf16 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-TTS-Realtime",
      .model_type = "moss-tts-realtime", .needs_tokenizer_json = false},
+    // ---- YuE2 (text-to-music: AR-NAR LM + Oobleck VAE) ---------------
+    // The generate-audio stage's hf_dir (model_type "yue2"): one 3.6B bf16
+    // checkpoint that plans an ABC score, writes a semantic token per 25 Hz
+    // frame and flow-matches them to 64-wide VAE latents. Weights are
+    // CC BY-NC 4.0. PINNED: the repo also carries demo audio, figures and
+    // the reference's Python wheels, none of which runs here.
+    {.family = "YuE", .version = "2", .param_class = "3B",
+     .variant = "bf16 (m-a-p)",
+     .hf_path = "m-a-p/YuE2-3B",
+     .model_type = "yue2",
+     .files = {"config.json", "generation_config.json",
+               "yue2_generation_config.json", "model.safetensors",
+               "qwen.tiktoken", "examples/tonight-awake.json", "LICENSE"},
+     .needs_tokenizer_json = false},
+    // Its two 48 kHz stereo decoders, for audio-vae-decode: the standard
+    // one (better perceptual quality, the release default) and the legacy
+    // one the paper's benchmarks used. One latent space; either serves.
+    {.family = "YuE", .version = "2-Vae", .param_class = "VAE",
+     .variant = "F32 standard (m-a-p)",
+     .hf_path = "m-a-p/YuE2-Vae",
+     .model_type = "yue2-vae",
+     .files = {"config.json", "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = false},
+    {.family = "YuE", .version = "2-Vae", .param_class = "VAE",
+     .variant = "F32 legacy (m-a-p)",
+     .hf_path = "m-a-p/YuE2-Vae-legacy",
+     .model_type = "yue2-vae",
+     .files = {"config.json", "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = false},
     // ---- Krea (text-to-image diffusion) ------------------------------
     // Krea-2-Turbo: a flow-matching (rectified-flow) text-to-image model,
     // model_type "krea2". Diffusers-layout repo with per-component
@@ -2242,6 +2271,10 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
              || mt == "moss-tts-realtime") {
     set({"text"}, {"audio"});
   } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
+    set({"audio"}, {"audio"});
+  } else if (mt == "yue2") {
+    set({"text"}, {"audio"});
+  } else if (mt == "yue2-vae") {
     set({"audio"}, {"audio"});
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
              ) {

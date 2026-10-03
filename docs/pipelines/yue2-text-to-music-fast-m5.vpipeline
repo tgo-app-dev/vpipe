@@ -1,0 +1,63 @@
+{
+  "id": "yue2-text-to-music-fast-m5",
+  "stages": [
+    {
+      "id": "generate-audio",
+      "type": "generate-audio",
+      "iports": [],
+      "config": {
+        "hf_dir": "m-a-p/YuE2-3B",
+        "style": "Indie pop, warm female vocal, acoustic guitar, soft drums, bright synth pads, uplifting, summer evening",
+        "lyrics": "[Intro]\n\n[Verse]\nStreetlights hum a quiet tune\nShadows dancing with the moon\nEvery window holds a glow\nStories only night winds know\n\n[Chorus]\nStay awake with me tonight\nHold the city in the light\nEvery heartbeat, every sound\nLifts us up above the ground\n\n[Verse]\nPaper boats on silver streams\nCarry all our summer dreams\nFootsteps echo, soft and slow\nWhere the river bends we go\n\n[Chorus]\nStay awake with me tonight\nHold the city in the light\nEvery heartbeat, every sound\nLifts us up above the ground\n\n[Outro]\nStay awake, stay awake",
+        "cot": "full",
+        "seed": 831001,
+        "sage_attn": true,
+        "sol_attn": true,
+        "sol_tau": 0.0
+      }
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "m-a-p/YuE2-Vae"
+      }
+    },
+    {
+      "id": "save-audio",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "yue2-song-fast-m5.m4a",
+        "bitrate": 256000
+      }
+    },
+    {
+      "id": "save-score",
+      "type": "save-text",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "path": "yue2-song-fast-m5.abc",
+        "newline": "after",
+        "append": false
+      }
+    }
+  ],
+  "subpipelines": []
+}
