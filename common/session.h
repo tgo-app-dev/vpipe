@@ -136,6 +136,10 @@ public:
   // caller installs it before launching pipelines.
   void set_ui_delegate(std::unique_ptr<UiDelegateIntf>);
 
+  // The delegate installed now -- what SessionIntf::progress() reads the
+  // live reports from. Never null (see _ui_delegate).
+  const UiDelegateIntf& ui_delegate() const { return *_ui_delegate; }
+
   // Install the diagnostic log delegate (the log_* channels). Defaults
   // to a StdoutLogDelegate; the web-ui app swaps in one that diverts
   // the leveled log stream to the browser's Session Log view. The
@@ -287,6 +291,15 @@ private:
   // checked in those methods. With it, a swap can never race against
   // a worker-thread log() call so no extra synchronization is needed.
   std::unique_ptr<LogDelegateIntf> _delegate;
+
+  // The host's log listener (SessionIntf::set_log_listener), shared so a
+  // reporting thread keeps the one it took while it is swapped.
+  mutable std::mutex                        _listener_mu;
+  std::shared_ptr<const LogListener>        _listener;
+  friend class SessionIntf;
+  // The listener, if any, given `msg` at `level`.
+  void tell_listener_(LogLevel level, const std::string& msg) const;
+  std::shared_ptr<const LogListener> listener_() const;
 
   // User-facing I/O delegate (error/warn/info + getline). Defaults to
   // a StdioUiDelegate; swappable via set_ui_delegate(). Declared right

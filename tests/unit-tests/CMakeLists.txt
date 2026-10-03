@@ -85,6 +85,7 @@ set(LOCAL_TEST_SOURCES
   session.cc
   stage-command.cc
   host-flex-api.cc
+  system-monitor.cc
   stage-config.cc
   stage-spec.cc
   stdout-log-delegate-async.cc

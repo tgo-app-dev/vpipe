@@ -1,6 +1,6 @@
 #include "apps/web-ui/system-api.h"
 #include "apps/web-ui/api-common.h"
-#include "apps/web-ui/system-status.h"
+#include "vpipe/system-monitor.h"
 
 #include "common/host-net.h"
 #include "common/i18n.h"
@@ -37,11 +37,11 @@ namespace vpipe::webui {
 SystemApi::SystemApi(ApiContext& ctx, PipelineApi& pipelines)
   : _ctx(ctx)
   , _pipelines(pipelines)
-  , _status(std::make_unique<SystemStatusPoller>())
+  , _status(std::make_unique<SystemMonitor>())
 {
 }
 
-// Out-of-line so the unique_ptr<SystemStatusPoller> dtor can see the
+// Out-of-line so the unique_ptr<SystemMonitor> dtor can see the
 // complete type (the pImpl-with-unique_ptr incomplete-type pitfall).
 SystemApi::~SystemApi() = default;
 
@@ -253,7 +253,7 @@ SystemApi::h_wired_pool_set_(const HttpRequest& req)
 HttpResponse
 SystemApi::h_system_status_(const HttpRequest&)
 {
-  FlexData o = _status->query();
+  FlexData o = _status->status();
   // THIS PROCESS's GPU memory, beside the IORegistry counters above.
   //
   // `gpu_alloc_bytes` up there is the ACCELERATOR's, i.e. every process

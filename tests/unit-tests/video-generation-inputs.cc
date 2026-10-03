@@ -25,6 +25,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/generate-video-stage.h"
+#include "stages/model-config-source.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -303,4 +304,35 @@ TEST(video_generation_inputs, seed_sequence_increment_keep_randomize)
       EXPECT_TRUE(v < (1ull << 53));
     }
   }
+}
+
+// A MODEL CONFIG DELIVERED BEFORE LAUNCH SURVIVES THE RESET (issue #47).
+// The runtime hands a config source's constant to the stage, and only
+// then resets the stage for the run; clearing the config there meant the
+// checkpoint was identified -- and its schedule logged -- without it. A
+// second reset with nothing delivered is a relaunch whose graph has no
+// config source, and must not inherit the last one.
+TEST(video_generation_inputs, a_launch_model_config_survives_the_reset)
+{
+  Session sess;
+  GenerateVideoStage gv(&sess, "gv", std::vector<InEdge>{},
+                        FlexData::make_object());
+  unsigned port = 0;
+  bool found = false;
+  const auto& ips = gv.spec().iports;
+  for (std::size_t i = 0; i < ips.size(); ++i) {
+    if (ips[i].name == "model_config") { port = (unsigned)i; found = true; }
+  }
+  ASSERT_TRUE(found);
+  FlexData beat = model_config::make_config("minimax-h3");
+  beat.as_object().insert_or_assign("video_shift", FlexData::make_real(6.0));
+  gv.apply_constant(port, beat);
+  gv.reset_run_state();
+  const FlexData& held = gv.model_config();
+  ASSERT_TRUE(held.is_object());
+  if (held.is_object()) {
+    EXPECT_TRUE(held.as_object().at("video_shift").as_real(0.0) == 6.0);
+  }
+  gv.reset_run_state();
+  EXPECT_TRUE(gv.model_config().is_null());
 }

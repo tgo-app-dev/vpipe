@@ -1731,8 +1731,8 @@ MiniMaxAI 发布版重新排序。如果某个适配器是在 MiniMaxAI 自己�
 （`transformer_blocks.0.attn.to_q`，而不是本模型自己的
 `blocks.0.attn.qkv_proj`），每个权重带有逐行的缩放系数。
 
-直接运行即可。把 `generate-video` 的 `dit_dir` 指向这个文件，`model-select`
-仍然指向你已有的 H3 检查点，由它提供提示词编码器和两个 VAE：
+直接运行即可，只需两处设置。把 `generate-video` 的 `dit_dir` 指向这个文件，
+`model-select` 仍然指向你已有的 H3 检查点，由它提供提示词编码器和两个 VAE：
 
 ```json
 "config": {
@@ -1745,7 +1745,24 @@ MiniMaxAI 发布版重新排序。如果某个适配器是在 MiniMaxAI 自己�
 }
 ```
 
+再在接到 `generate-video` 的 `model_config` 端口的 `minimax-h3-model-config`
+阶段里，把**视频 shift 设为 6**：
+
+```json
+"config": {
+  "video_shift": 6.0,
+  "audio_shift": 3.0
+}
+```
+
 Turbo 已经在权重里了，所以不要再挂 Turbo LoRA，用 4 步。
+
+这个 shift 是蒸馏时所拟合的调度。上游的表格里，768p 的 Turbo 版本（4 步和 8 步
+v1.0）的视频 / 音频 shift 是 6 / 3，而基础模型和 544p 的 Turbo 是 12 / 3。这个
+文件是 768p 4 步系列的 v1.1，表格里没有列出，所以 6 是按它所在的系列取的。如果
+保持默认的 12，合并进去的 Turbo 采样的调度就和它蒸馏时的不同。`generate-video`
+在识别检查点时会在日志里写出将要使用的 shift
+（`MiniMax-H3 (video+audio) at …, shifts 6.0/3.0`）。
 
 不做任何转换，也不在磁盘上多写任何东西。名字在打开文件时翻译：q、k、v
 被叠成融合投影；第一个前馈矩阵的两半对调成本模型“gate 在前”的顺序；文件

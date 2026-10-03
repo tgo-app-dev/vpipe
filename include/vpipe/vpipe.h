@@ -11,6 +11,12 @@
 //     stage, with data in and out by reference
 //                     (vpipe/stage-command.h)
 //   * Status          (vpipe/status.h)
+//   * the live progress reports a host draws its own bars from
+//                     (SessionIntf::progress, as /api/io/progress)
+//   * SystemMonitor   the machine's load and GPU thermal verdict, as the
+//                     web UI's status bar and `vpipe --gpu-thermal` read
+//                     them (vpipe/system-monitor.h; included on its own:
+//                     it needs no session)
 //
 // Specs, configs and command arguments go in as JSON text, or -- for a
 // host that builds them in code -- as FlexData documents

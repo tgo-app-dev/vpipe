@@ -24,6 +24,7 @@
 #include "pipeline/stage.h"
 #include "plugin/plugin-manager.h"
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -1162,6 +1163,7 @@ Session::error(const VpipeFormat& f) const
   if (DiagnosticCapture::active()) {
     DiagnosticCapture::note(msg);
   }
+  tell_listener_(LogLevel::Error, msg);
   _ui_delegate->error(VpipeFormat([msg] { return msg; }));
   throw runtime_error(msg + "\nError reported\n");
 }
@@ -1169,43 +1171,69 @@ Session::error(const VpipeFormat& f) const
 void
 Session::warn(const VpipeFormat& f) const
 {
-  if (!DiagnosticCapture::active()) {
+  const bool listened = listener_() != nullptr;
+  if (!DiagnosticCapture::active() && !listened) {
     _ui_delegate->warn(f);
     return;
   }
   const string msg = f();
-  DiagnosticCapture::note(msg);
+  if (DiagnosticCapture::active()) {
+    DiagnosticCapture::note(msg);
+  }
+  tell_listener_(LogLevel::Warn, msg);
   _ui_delegate->warn(VpipeFormat([msg] { return msg; }));
 }
 
 void
 Session::info(const VpipeFormat& f) const
 {
-  _ui_delegate->info(f);
+  if (!listener_()) {
+    _ui_delegate->info(f);
+    return;
+  }
+  // Formatted once, for both.
+  const string msg = f();
+  tell_listener_(LogLevel::Info, msg);
+  _ui_delegate->info(VpipeFormat([msg] { return msg; }));
+}
+
+// The diagnostic channels: below the log level a line is not even
+// formatted -- the listener hears what the delegate would print.
+#define VPIPE_SESSION_LOG_(name, level)                                    \
+  void Session::name(const VpipeFormat& f) const                           \
+  {                                                                        \
+    if (!listener_() ||                                                    \
+        (level != LogLevel::Always && level > _delegate->threshold())) {   \
+      _delegate->log(level, f);                                            \
+      return;                                                              \
+    }                                                                      \
+    const string msg = f();                                                \
+    tell_listener_(level, msg);                                            \
+    _delegate->log(level, VpipeFormat([msg] { return msg; }));             \
+  }
+VPIPE_SESSION_LOG_(log_debug, LogLevel::Debug)
+VPIPE_SESSION_LOG_(log_verbose, LogLevel::Verbose)
+VPIPE_SESSION_LOG_(log_normal, LogLevel::Normal)
+VPIPE_SESSION_LOG_(log_always, LogLevel::Always)
+#undef VPIPE_SESSION_LOG_
+
+std::shared_ptr<const SessionIntf::LogListener>
+Session::listener_() const
+{
+  std::lock_guard<std::mutex> lk(_listener_mu);
+  return _listener;
 }
 
 void
-Session::log_debug(const VpipeFormat& f) const
+Session::tell_listener_(LogLevel level, const string& msg) const
 {
-  _delegate->log(LogLevel::Debug, f);
-}
-
-void
-Session::log_verbose(const VpipeFormat& f) const
-{
-  _delegate->log(LogLevel::Verbose, f);
-}
-
-void
-Session::log_normal(const VpipeFormat& f) const
-{
-  _delegate->log(LogLevel::Normal, f);
-}
-
-void
-Session::log_always(const VpipeFormat& f) const
-{
-  _delegate->log(LogLevel::Always, f);
+  if (auto l = listener_()) {
+    try {
+      (*l)(static_cast<int>(level), msg);
+    } catch (...) {
+      // A host's listener failing must not fail the line's stage.
+    }
+  }
 }
 
 UiInputStatus
@@ -1242,6 +1270,70 @@ UiProgress
 Session::open_progress(string desc) const
 {
   return _ui_delegate->open_progress(std::move(desc));
+}
+
+// SessionIntf's progress reports, as /api/io/progress serves them (the
+// web UI reads them here too). Non-virtual, as load_pipeline(const
+// FlexData&): every SessionIntf a caller holds is a Session made here.
+FlexData
+SessionIntf::progress() const
+{
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  FlexData arr = FlexData::make_array();
+  const auto* s = dynamic_cast<const Session*>(this);
+  if (s == nullptr) {
+    oo.insert("version", FlexData::make_uint(0));
+    oo.insert("items", std::move(arr));
+    return o;
+  }
+  const UiDelegateIntf& ui = s->ui_delegate();
+  oo.insert("version", FlexData::make_uint(ui.progress_version()));
+  auto a = arr.as_array();
+  // One instant for the whole snapshot, so concurrent reports that
+  // opened together do not drift apart by the cost of the loop.
+  const auto now = chrono::steady_clock::now();
+  for (const auto& it : ui.progress_snapshot()) {
+    FlexData e = FlexData::make_object();
+    auto eo = e.as_object();
+    eo.insert("id", FlexData::make_uint(it.id));
+    eo.insert("desc", FlexData::make_string(it.desc));
+    eo.insert("done", FlexData::make_uint(it.done));
+    // 0 total means INDETERMINATE; a renderer draws motion, not a fill.
+    eo.insert("total", FlexData::make_uint(it.total));
+    eo.insert("detail", FlexData::make_string(it.detail));
+    eo.insert("seq", FlexData::make_uint(it.seq));
+    // The report's AGE, computed here rather than by the reader from a
+    // first-seen time: a reader that starts polling in the middle of a
+    // four-minute denoise would otherwise start its clock at zero.
+    const auto ms = chrono::duration_cast<chrono::milliseconds>(
+        now - it.started).count();
+    eo.insert("elapsed_ms",
+              FlexData::make_uint(static_cast<uint64_t>(ms < 0 ? 0 : ms)));
+    a.push_back(std::move(e));
+  }
+  oo.insert("items", std::move(arr));
+  return o;
+}
+
+uint64_t
+SessionIntf::progress_version() const
+{
+  const auto* s = dynamic_cast<const Session*>(this);
+  return s != nullptr ? s->ui_delegate().progress_version() : 0;
+}
+
+void
+SessionIntf::set_log_listener(LogListener listener)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return;
+  }
+  auto l = listener ? std::make_shared<const LogListener>(std::move(listener))
+                    : nullptr;
+  std::lock_guard<std::mutex> lk(s->_listener_mu);
+  s->_listener = std::move(l);
 }
 
 UiInterruptToken

@@ -303,6 +303,8 @@ public:
   // The bag itself, which is what a plugin family gets. A test seam like
   // sol_config() beside it, and the one that can check the two agree.
   const FlexData& accel_settings() const noexcept { return _accel; }
+  // The model_config beat as the stage holds it now.
+  const FlexData& model_config() const noexcept { return _model_cfg; }
 
 private:
   // Which DiT family the resident checkpoint is, from its `_class_name`
@@ -392,6 +394,10 @@ private:
   // reads it is not known until the checkpoint resolves, and a config
   // beat can arrive before the model does.
   FlexData _model_cfg;
+  // The same beat as delivered BEFORE launch (apply_constant), held until
+  // reset_run_state() puts it back: the runtime resets a stage after it
+  // has delivered its constants.
+  FlexData _model_cfg_launch;
   // The runtime LoRA SLOTS for the MiniMax-H3 DiT, off the model_config
   // beat, in the order the DiT binds them. Two, so a few-step Turbo
   // distillation and a style or identity adapter can ride together --

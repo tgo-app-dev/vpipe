@@ -1,5 +1,5 @@
-#ifndef WEBUI_SYSTEM_STATUS_H
-#define WEBUI_SYSTEM_STATUS_H
+#ifndef VPIPE_STAGES_SYSTEM_STATUS_H
+#define VPIPE_STAGES_SYSTEM_STATUS_H
 
 #include "common/flex-data.h"
 
@@ -7,9 +7,12 @@
 #include <memory>
 #include <mutex>
 
-namespace vpipe::webui {
+namespace vpipe {
 
-// Stateful system-status sampler for the bottom status bar.
+// Stateful system-status sampler for the bottom status bar. (It was the
+// web UI's own; it moved into the library so a host embedding vpipe reads
+// the same numbers the same way -- vpipe/system-monitor.h is its public
+// face.)
 //
 // GPU utilisation + GPU memory come from the same IOKit `IOAccelerator`
 // PerformanceStatistics dictionary nvtop's Apple-Silicon backend (and

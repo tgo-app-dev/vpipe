@@ -6,6 +6,8 @@
 # APPLE_SILICON); the gate, not the directory, decides where its sources go.
 
 set(LOCAL_SOURCES
+  # vpipe/system-monitor.h: every build (a stub off Apple Silicon).
+  system-monitor.cc
   # generic (always built)
   buffer-stage.cc
   call-stage.cc
@@ -196,6 +198,9 @@ if(VPIPE_BUILD_APPLE_SILICON)
   list(APPEND LOCAL_SOURCES model-eval-stage.cc)
   list(APPEND LOCAL_HEADERS model-eval-stage.h)
   list(APPEND LOCAL_SOURCES model-benchmark-stage.cc gpu-telemetry.mm)
+  # The status bar's readings (vpipe/system-monitor.h), once the web UI's.
+  list(APPEND LOCAL_SOURCES system-status.cc)
+  list(APPEND LOCAL_HEADERS system-status.h)
   # The Apple-native video path (apple-silicon/media).
   list(APPEND LOCAL_SOURCES avf-load-video-stage.cc avf-save-video-stage.cc)
   list(APPEND LOCAL_HEADERS avf-load-video-stage.h avf-save-video-stage.h)

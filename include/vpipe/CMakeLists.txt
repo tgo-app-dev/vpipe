@@ -3,6 +3,7 @@ set(LOCAL_HEADERS
   session-intf.h
   session-manager.h
   status.h
+  system-monitor.h
   vpipe.h
 )
 

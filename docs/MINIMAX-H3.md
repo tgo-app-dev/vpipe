@@ -1974,9 +1974,9 @@ against the 66 GB of bf16. It is one file with no config, in the
 model's own `blocks.0.attn.qkv_proj`), and each weight carries a per-row
 scale.
 
-Run it as it is. Point `generate-video`'s `dit_dir` at the file and keep
-`model-select` on the H3 checkpoint you already have, which supplies the
-prompt encoder and both VAEs:
+Run it as it is, with two settings. Point `generate-video`'s `dit_dir` at
+the file and keep `model-select` on the H3 checkpoint you already have,
+which supplies the prompt encoder and both VAEs:
 
 ```json
 "config": {
@@ -1989,8 +1989,27 @@ prompt encoder and both VAEs:
 }
 ```
 
+Then set the **video shift to 6** in the `minimax-h3-model-config` stage
+wired to `generate-video`'s `model_config` port:
+
+```json
+"config": {
+  "video_shift": 6.0,
+  "audio_shift": 3.0
+}
+```
+
 The Turbo is inside those weights, so leave the Turbo LoRA off and run
 4 steps.
+
+The shift is the schedule the distillation was fit to. Upstream's table
+lists video / audio shifts of 6 / 3 for the 768p Turbo releases (the
+4-step and 8-step v1.0), against 12 / 3 for the base model and the 544p
+Turbos. This file is the 4-step 768p line at v1.1, which the table does
+not list, so the 6 comes from its line. Left at the default 12, the
+merged Turbo samples a different schedule from the one it was distilled
+on. `generate-video` logs the shifts it will run with when it identifies
+the checkpoint (`MiniMax-H3 (video+audio) at …, shifts 6.0/3.0`).
 
 Nothing is converted and nothing lands on disk. The names are translated
 when the file is opened: q, k and v are stacked into the fused projection,

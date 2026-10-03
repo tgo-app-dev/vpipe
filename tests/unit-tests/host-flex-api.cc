@@ -8,10 +8,12 @@
 #include "minitest.h"
 #include "common/flex-data.h"
 #include "common/session.h"
+#include "common/vpipe-format.h"
 #include "vpipe/vpipe.h"
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -160,5 +162,101 @@ TEST(host_flex_api, pipeline_and_commands_without_json_text)
 
   (void)s->wait_pipelines(3000);
   EXPECT_TRUE(s->unload_pipeline(p).code == 0);
+  SessionManager::get().destroy_session(s);
+}
+
+// The live progress reports, read as a host reads them: the document
+// /api/io/progress serves, from SessionIntf alone. The Session behind the
+// interface opens the report, as a stage would through its context.
+TEST(host_flex_api, progress_reports_as_a_document)
+{
+  const SessionIntf* s = SessionManager::get().create_session();
+  ASSERT_TRUE(s != nullptr);
+  if (s == nullptr) { return; }
+  const auto* impl = dynamic_cast<const Session*>(s);
+  ASSERT_TRUE(impl != nullptr);
+  if (impl == nullptr) { SessionManager::get().destroy_session(s); return; }
+
+  // The views borrow the document they view: hold each one by name.
+  auto items = [&] { return s->progress().as_object().at("items"); };
+  const uint64_t v0 = s->progress_version();
+  const FlexData before = s->progress();
+  EXPECT_TRUE(before.as_object().at("version").as_uint() == v0);
+  EXPECT_TRUE(items().as_array().size() == 0);
+  {
+    UiProgress bar = impl->open_progress("denoise");
+    bar.update(3, 10, "step 1/4");
+    UiProgress dl = impl->open_progress("fetch");   // indeterminate
+    EXPECT_TRUE(s->progress_version() > v0);
+    const FlexData live = items();
+    const auto a = live.as_array();
+    ASSERT_TRUE(a.size() == 2);
+    if (a.size() == 2) {
+      // Oldest-opened first; ids only grow.
+      const FlexData d0 = a[0];
+      const FlexData f0 = a[1];
+      const auto d = d0.as_object();
+      EXPECT_TRUE(d.at("desc").as_string() == "denoise");
+      EXPECT_TRUE(d.at("done").as_uint() == 3);
+      EXPECT_TRUE(d.at("total").as_uint() == 10);
+      EXPECT_TRUE(d.at("detail").as_string() == "step 1/4");
+      EXPECT_TRUE(d.at("elapsed_ms").is_uint());
+      const auto f = f0.as_object();
+      EXPECT_TRUE(f.at("desc").as_string() == "fetch");
+      EXPECT_TRUE(f.at("total").as_uint() == 0);
+      EXPECT_TRUE(f.at("id").as_uint() > d.at("id").as_uint());
+      // The most recently moved has the highest seq.
+      bar.update(4, 10);
+      const FlexData after = items();
+      const auto b = after.as_array();
+      const FlexData b0 = b[0];
+      const FlexData b1 = b[1];
+      EXPECT_TRUE(b0.as_object().at("seq").as_uint() >
+                  b1.as_object().at("seq").as_uint());
+    }
+  }
+  // Closed with their handles: nothing is live.
+  EXPECT_TRUE(items().as_array().size() == 0);
+  SessionManager::get().destroy_session(s);
+}
+
+// SessionIntf::set_log_listener: a host hears what the session reports
+// -- info and warnings always, the diagnostic log at or above its level
+// -- and an empty listener stops it.
+TEST(host_flex_api, log_listener_hears_the_session)
+{
+  SessionIntf* s = const_cast<SessionIntf*>(
+      SessionManager::get().create_session());
+  ASSERT_TRUE(s != nullptr);
+  if (s == nullptr) { return; }
+  const auto* impl = dynamic_cast<const Session*>(s);
+  ASSERT_TRUE(impl != nullptr);
+  if (impl == nullptr) { SessionManager::get().destroy_session(s); return; }
+
+  std::mutex mu;
+  std::vector<std::pair<int, std::string>> heard;
+  s->set_log_listener([&](int level, std::string_view text) {
+    std::lock_guard<std::mutex> lk(mu);
+    heard.emplace_back(level, std::string(text));
+  });
+  impl->info(fmt("hello {}", 7));
+  impl->warn(fmt("careful"));
+  impl->log_always(fmt("always"));
+  impl->log_debug(fmt("debug, below the default level"));
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    ASSERT_TRUE(heard.size() == 3);
+    if (heard.size() == 3) {
+      EXPECT_TRUE(heard[0].first == 2 && heard[0].second == "hello 7");
+      EXPECT_TRUE(heard[1].first == 1 && heard[1].second == "careful");
+      EXPECT_TRUE(heard[2].first == 6 && heard[2].second == "always");
+    }
+  }
+  s->set_log_listener({});
+  impl->info(fmt("unheard"));
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    EXPECT_TRUE(heard.size() == 3);
+  }
   SessionManager::get().destroy_session(s);
 }

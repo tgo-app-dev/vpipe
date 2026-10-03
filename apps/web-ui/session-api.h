@@ -53,7 +53,7 @@ public:
   explicit SessionApi(SessionIntf* session, WebUiDelegate* ui = nullptr,
                       WebUiLogDelegate* log = nullptr);
   // Out-of-line so a controller's pImpl member (SystemApi's
-  // SystemStatusPoller) can stay incomplete in this header.
+  // SystemMonitor) can stay incomplete in this header.
   ~SessionApi();
 
   // Register every /api/* route on the given server.

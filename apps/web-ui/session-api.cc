@@ -20,7 +20,7 @@ SessionApi::SessionApi(SessionIntf* session, WebUiDelegate* ui,
 }
 
 // Out-of-line so the controllers' incomplete pImpl members (notably
-// SystemApi's SystemStatusPoller) do not have to be complete in the
+// SystemApi's SystemMonitor) do not have to be complete in the
 // header.
 SessionApi::~SessionApi() = default;
 

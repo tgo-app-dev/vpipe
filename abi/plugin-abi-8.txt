@@ -87,6 +87,7 @@ vpipe/session-intf.h
 vpipe/session-manager.h
 vpipe/stage-command.h
 vpipe/status.h
+vpipe/system-monitor.h
 vpipe/vpipe.h
 
 [layouts]
@@ -675,6 +676,11 @@ record vpipe::Status
   0 | unsigned int code
   | [sizeof=4, dsize=4, align=4,
   | nvsize=4, nvalign=4]
+record vpipe::SystemMonitor
+  0 | class vpipe::SystemMonitor
+  0 | class std::unique_ptr<struct vpipe::SystemMonitor::Impl> _impl
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
 record vpipe::TensorBeat
   0 | struct vpipe::TensorBeat
   0 | DType dtype
@@ -2298,6 +2304,9 @@ vpipe::RuntimeContext::write_sync(unsigned int, std::__1::unique_ptr<vpipe::Beat
 vpipe::RuntimeContext::~RuntimeContext()
 vpipe::SessionContextIntf::services() const
 vpipe::SessionIntf::load_pipeline(vpipe::FlexData const&)
+vpipe::SessionIntf::progress() const
+vpipe::SessionIntf::progress_version() const
+vpipe::SessionIntf::set_log_listener(std::__1::function<void (int, std::__1::basic_string_view<char, std::__1::char_traits<char>>)>)
 vpipe::SessionManager::create_session(vpipe::FlexData const&)
 vpipe::SessionManager::get()
 vpipe::SessionMember::SessionMember(vpipe::SessionContextIntf const*)
@@ -2375,6 +2384,10 @@ vpipe::StageRegistry::origin(std::__1::basic_string_view<char, std::__1::char_tr
 vpipe::StageRegistry::register_type(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::unique_ptr<vpipe::Stage, std::__1::default_delete<vpipe::Stage>> (*)(vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::vector<vpipe::InEdge, std::__1::allocator<vpipe::InEdge>>, vpipe::FlexData))
 vpipe::StageRegistry::set_spec(std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::StageSpec const*)
 vpipe::StageRegistry::spec(std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
+vpipe::SystemMonitor::SystemMonitor()
+vpipe::SystemMonitor::gpu_thermal(int)
+vpipe::SystemMonitor::status()
+vpipe::SystemMonitor::~SystemMonitor()
 vpipe::UiInterruptRegistry::add(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::function<bool ()>)
 vpipe::UiInterruptRegistry::dispatch()
 vpipe::UiInterruptRegistry::remove(unsigned long long)

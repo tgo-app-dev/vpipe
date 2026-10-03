@@ -1,4 +1,4 @@
-#include "apps/web-ui/system-status.h"
+#include "stages/system-status.h"
 
 #include "common/soc-activity.h"
 #include "common/soc-energy-channel.h"
@@ -27,6 +27,9 @@
 // link it lazily via dlopen / dlsym instead of `-framework IOReport`.
 // macmon and asitop use the same set of symbols.
 // ---------------------------------------------------------------------
+// Internal linkage: the library's GPU telemetry (gpu-telemetry.mm) keeps
+// its own resolver under the same name, with a different symbol set.
+namespace {
 namespace ioreport {
 
 using SubscriptionRef = CFTypeRef;
@@ -156,8 +159,9 @@ const Api& resolve() {
 }
 
 }  // namespace ioreport
+}  // namespace
 
-namespace vpipe::webui {
+namespace vpipe {
 
 namespace {
 

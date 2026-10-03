@@ -18,14 +18,16 @@
 #include <memory>
 #include <vector>
 
-namespace vpipe::webui {
+namespace vpipe {
+class SystemMonitor;
+}
 
-class SystemStatusPoller;
+namespace vpipe::webui {
 
 class SystemApi {
 public:
   SystemApi(ApiContext& ctx, PipelineApi& pipelines);
-  // Out-of-line so SystemStatusPoller can be incomplete here.
+  // Out-of-line so SystemMonitor can be incomplete here.
   ~SystemApi();
 
   void register_routes(HttpServer& s);
@@ -94,11 +96,10 @@ private:
 
   ApiContext&  _ctx;
   PipelineApi& _pipelines;
-  // Stateful poller for the bottom status bar: owns the IOReport
-  // "Energy Model" subscription used to derive ANE power. Created in
-  // the ctor so a non-Apple build doesn't pay for it (the class is
-  // Apple-only by virtue of its .cc file).
-  std::unique_ptr<SystemStatusPoller> _status;
+  // Stateful poller for the bottom status bar (vpipe/system-monitor.h,
+  // the library's, so a host embedding vpipe reads the same): owns the
+  // IOReport subscription used to derive ANE utilisation.
+  std::unique_ptr<SystemMonitor> _status;
   // Startup permission-check report (FlexData object), set once at boot
   // and served by /api/startup-checks. Null (not an object) until the
   // probes finish -> the endpoint reports ready:false.

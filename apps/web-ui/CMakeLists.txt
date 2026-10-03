@@ -17,7 +17,6 @@ set(VPIPE_WEBUI_SOURCES
     db-browser.cc
     model-browser.cc
     qr-code.cc
-    system-status.cc
     startup-checks.cc
 )
 # Microphone permission probe (AVCaptureDevice authorization status) is
@@ -62,17 +61,11 @@ target_include_directories(vpipe-web-ui
 # links it PRIVATE so it isn't propagated -- link it here too.
 target_link_libraries(vpipe-web-ui PRIVATE vpipe lmdb)
 
-# system-status.cc reads Apple Silicon GPU stats via IOKit
-# (IOAccelerator's PerformanceStatistics) -- the same data nvtop's
-# AS backend and asitop / mactop consume. CoreFoundation is already
-# brought in transitively via libvpipe; IOKit is local to this app.
+# The status bar's GPU / ANE readings are the library's now
+# (vpipe/system-monitor.h, stages/system-status.cc), which links IOKit
+# itself; the IOReport private framework is resolved there at runtime
+# via dlopen. These stay for the web UI's own IOKit / CF use.
 if(APPLE)
-    # IOKit for GPU stats. The IOReport private framework (used for
-    # ANE energy samples, the same source macmon reads) is resolved at
-    # runtime via dlopen("/System/Library/PrivateFrameworks/IOReport
-    # .framework/IOReport") from the dyld shared cache -- no link-time
-    # framework path exists for it on modern macOS, so we don't pass
-    # `-framework IOReport`.
     target_link_libraries(vpipe-web-ui PRIVATE
         "-framework IOKit"
         "-framework CoreFoundation")

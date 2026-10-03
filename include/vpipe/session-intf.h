@@ -27,6 +27,8 @@
 #include "vpipe/pipeline-handle.h"
 #include "vpipe/status.h"
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -179,6 +181,52 @@ public:
   // back via SessionContextIntf::language(). This is the application UI
   // locale, NOT a per-stage model/ASR language hint.
   virtual Status set_language(std::string_view tag) = 0;
+
+  // ---- Progress ------------------------------------------------
+  //
+  // The live progress reports -- what stages open through
+  // SessionContextIntf::open_progress (a denoise counted per DiT
+  // block, a VAE decode per tile, a download per byte) and what the
+  // console footer and the web UI's status bar draw -- for a host that
+  // draws its own. The same document /api/io/progress serves:
+  //
+  //   {"version": u,
+  //    "items": [{"id": u, "desc": s, "done": u, "total": u,
+  //               "detail": s, "seq": u, "elapsed_ms": u}, ...]}
+  //
+  // Items are OLDEST-OPENED FIRST (a stable order as reports come and
+  // go); `total` 0 is INDETERMINATE; `seq` is bumped per update, so the
+  // highest is the most recently moved; `elapsed_ms` is the report's
+  // age at the snapshot. Ids are never reused and only grow, which is
+  // how a caller tells its run's reports from an earlier run's. A
+  // report lives from its stage opening it to closing it -- an empty
+  // list between phases is normal.
+  //
+  // Producers update without throttling and this reads one snapshot
+  // under one lock, so poll at whatever rate the host repaints (vpipe's
+  // own renderers use 10 Hz and 1 Hz); compare progress_version() first
+  // and skip the document when nothing moved. Safe from any thread.
+  // Needs common/flex-data.h. (Non-virtual, as load_pipeline(const
+  // FlexData&) is: the interface's vtable stays as it was.)
+  FlexData      progress() const;
+  std::uint64_t progress_version() const;
+
+  // ---- The session's log, for a host ------------------------------
+  //
+  // Every line the session reports -- its stages' errors, warnings and
+  // info (what the UI delegate shows: the console's "[INFO] ..." lines)
+  // and its diagnostic log at or above the log level -- is ALSO handed
+  // to `listener` as it is reported, so a host can show vpipe's log in
+  // its own window rather than only on stdout. Nothing is diverted: the
+  // delegates see what they saw before.
+  //
+  // `level` is the log's: 0 error, 1 warn, 2 info, 3 normal, 4 verbose,
+  // 5 debug, 6 always. The listener runs on the reporting thread, any of
+  // them, while that thread waits: keep it quick, and thread-safe. One
+  // listener per session; an empty one removes it. (Non-virtual, as
+  // progress() is.)
+  using LogListener = std::function<void(int level, std::string_view)>;
+  void set_log_listener(LogListener listener);
 
   // ---- The wired pool ------------------------------------------
   //

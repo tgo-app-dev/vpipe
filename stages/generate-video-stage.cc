@@ -920,7 +920,12 @@ GenerateVideoStage::apply_constant(unsigned iport, const FlexData& beat)
     // without. Stored RAW and re-parsed by the runtime latch, which
     // stays in place -- apply_model_config_() needs a resolved family
     // and there is none yet.
+    //
+    // Kept twice: `_model_cfg` for declare_resources(), which runs next,
+    // and `_model_cfg_launch` for reset_run_state(), which runs after
+    // that and must not lose it (see there).
     _model_cfg = beat;
+    _model_cfg_launch = beat;
     return;
   }
   if (iport != kModelPort) { return; }
@@ -1475,7 +1480,16 @@ GenerateVideoStage::reset_run_state()
 {
   _emitted = 0;
   _model_latched = false;
-  _model_cfg = FlexData{};
+  // THIS launch's pre-launch constant, and nothing older. The runtime
+  // delivers constants (apply_constant) BEFORE it resets a stage, so
+  // clearing `_model_cfg` here threw the launch's own config away: the
+  // checkpoint was then identified -- and its shifts logged -- with no
+  // config at all, and the beat only took effect when the port
+  // re-delivered it. MEASURED (issue #47): a model-config at video shift
+  // 6 ran at 6 but logged "shifts 12.0/3.0". Consumed, so a relaunch
+  // whose graph has no config source does not inherit this one.
+  _model_cfg = std::move(_model_cfg_launch);
+  _model_cfg_launch = FlexData{};
   // Every generation input starts over, and so does what it held: a
   // run's beats pair among themselves, never with the last run's, and
   // the seed sequence starts again from `seed`.
