@@ -554,6 +554,15 @@ const STRINGS = {
       '请选择一个阶段以查看其配置。', '請選擇一個階段以檢視其配置。'],
   'pl.config_unavailable': ['Config unavailable: {msg}', '配置不可用：{msg}',
       '配置不可用：{msg}'],
+  // A running stage's commands (docs/STAGE-COMMANDS.md).
+  'pl.commands': ['Commands', '命令', '命令'],
+  'pl.cmd_sent': ['{name}: sent; the stage answers when it next can',
+      '{name}：已发送；阶段会在下一个空档回应',
+      '{name}：已傳送；階段會在下一個空檔回應'],
+  'pl.cmd_replied': ['{name}: {result}', '{name}：{result}',
+      '{name}：{result}'],
+  'pl.cmd_failed': ['{name} failed: {msg}', '{name} 失败：{msg}',
+      '{name} 失敗：{msg}'],
   // One step of undo for a configuration edit. Both buttons read the
   // same slot from opposite ends, so the two hints describe one move.
   'pl.undo_hint':      ['Undo the last configuration change to this stage',
@@ -2224,6 +2233,18 @@ const STRINGS = {
       '訓練時編碼後資料集存放的位置：ram、disk（每一步從 training-dataset '
       + '的 cache_dir 讀取），或 auto——放得下本機記憶體的八分之一就用 ram，'
       + '否則用 disk'],
+  'cmd.train-lora.save': ['Save now', '立即保存', '立即儲存'],
+  'cmd.train-lora.save.doc': ['',
+      '现在保存一个检查点（含续训状态），并在 checkpoints 端口发出；在优化步'
+      + '之间处理',
+      '現在儲存一個檢查點（含續訓狀態），並在 checkpoints 埠發出；在最佳化步'
+      + '之間處理'],
+  'cmd.train-lora.preview': ['Preview now', '立即预览', '立即預覽'],
+  'cmd.train-lora.preview.doc': ['',
+      '用当前适配器立即采样预览提示词，并在 previews 端口发出潜变量；在优化步'
+      + '之间处理',
+      '用目前的適配器立即取樣預覽提示詞，並在 previews 埠發出潛變數；在最佳化'
+      + '步之間處理'],
   'port.train-lora.conditioning': ['',
       'diffusion-conditioner 对每条标注、空提示词与预览提示词的输出，按清单顺序',
       'diffusion-conditioner 對每條標註、空提示詞與預覽提示詞的輸出，按清單順序'],

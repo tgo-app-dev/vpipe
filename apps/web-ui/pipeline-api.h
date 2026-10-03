@@ -144,6 +144,7 @@ private:
   HttpResponse h_disconnect_(const HttpRequest&);
   HttpResponse h_get_stage_config_(const HttpRequest&);
   HttpResponse h_set_stage_config_(const HttpRequest&);
+  HttpResponse h_stage_command_(const HttpRequest&);
 
   // ---- internals -------------------------------------------------
   Pipe* find_(const std::string& id);

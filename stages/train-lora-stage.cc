@@ -239,6 +239,48 @@ const PortSpec kOports[] = {
    .type = &typeid(FlexDataPayload), .clock_group = 0},
 };
 
+const ConfigKey kSaveResults[] = {
+  {.key = "path", .type = ConfigType::String,
+   .doc = "the checkpoint written"},
+  {.key = "step", .type = ConfigType::Int,
+   .doc = "the optimizer step it holds"},
+  {.key = "loss", .type = ConfigType::Real,
+   .doc = "the mean training loss since the previous checkpoint"},
+  {.key = "val_loss", .type = ConfigType::Real,
+   .doc = "the held-out loss, when the dataset holds samples out"},
+};
+const ConfigKey kPreviewArgs[] = {
+  {.key = "prompt", .type = ConfigType::Int,
+   .doc = "which preview prompt, from 0; -1 (default) for all of them",
+   .def_int = -1},
+  {.key = "steps", .type = ConfigType::Int,
+   .doc = "sampling steps; 0 (default) for the stage's preview_steps",
+   .def_int = 0},
+  {.key = "cfg", .type = ConfigType::Real,
+   .doc = "guidance; 0 (default) for the stage's preview_cfg",
+   .def_real = 0.0},
+  {.key = "seed", .type = ConfigType::Int,
+   .doc = "the first prompt's seed; -1 (default) for the stage's "
+          "preview_seed",
+   .def_int = -1},
+};
+const ConfigKey kPreviewResults[] = {
+  {.key = "step", .type = ConfigType::Int,
+   .doc = "the optimizer step the adapter was at"},
+  {.key = "previews", .type = ConfigType::Int,
+   .doc = "latents emitted on the previews port"},
+};
+const CommandSpec kCommands[] = {
+  {.name = "save",
+   .doc = "save a checkpoint now, with its resume state, and emit it on "
+          "the checkpoints port; served between optimizer steps",
+   .results = kSaveResults},
+  {.name = "preview",
+   .doc = "sample the preview prompts with the live adapter now and emit "
+          "the latents on the previews port; served between steps",
+   .args = kPreviewArgs, .results = kPreviewResults},
+};
+
 const StageSpec kSpec = {
   .type_name = "train-lora",
   .doc = "Train a LoRA adapter on a diffusion model from a training-"
@@ -252,6 +294,7 @@ const StageSpec kSpec = {
   .iports = kIports,
   .oports = kOports,
   .attrs = kAttrs,
+  .commands = kCommands,
 };
 
 std::uint64_t
@@ -354,7 +397,6 @@ TrainLoraStage::reset_run_state()
   _model_latched = false;
   _manifest = FlexData{};
   _opt_flex = FlexData{};
-  _next_sample = 0;
   _run = 0;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   _texts.clear();
@@ -369,6 +411,13 @@ TrainLoraStage::reset_run_state()
   _latent_c = 0;
   _val.clear();
   _val_last = -1.0;
+  _saved_step = -1;
+  _last_checkpoint = FlexData();
+  _encode_planned = false;
+  _want_text.clear();
+  _want_pic.clear();
+  _got_text = 0;
+  _got_pic = 0;
   _step = 0;
   _saved.clear();
 #endif
@@ -1000,6 +1049,261 @@ TrainLoraStage::register_(const std::string& path)
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+
+bool
+TrainLoraStage::plan_encode_(std::string* err)
+{
+  FlexData man = _manifest;
+  auto mo = man.as_object();
+  const FlexData samples = mo.at("samples");
+  auto sa = samples.as_array();
+  auto str_at = [](const FlexData& arr, std::size_t i) {
+    if (!arr.is_array()) { return std::string(); }
+    auto a = arr.as_array();
+    return i < a.size() ? std::string(a.at(i).as_string("")) : std::string();
+  };
+  auto bool_at = [](const FlexData& arr, std::size_t i) {
+    if (!arr.is_array()) { return false; }
+    auto a = arr.as_array();
+    return i < a.size() && a.at(i).as_bool(false);
+  };
+  // A text slot: filled from the cache index now, or by the conditioner.
+  auto text_slot = [&](const std::string& key, bool cached,
+                       const std::string& what) {
+    Text t;
+    t.key = key;
+    if (cached) {
+      const genai::train::SampleCache::Entry* e = _cache.find(key);
+      if (e == nullptr || e->shape.size() != 2) {
+        *err = what + " is marked cached but is not in '" + _cache.dir() +
+               "' -- was the cache changed during the run? Run again to "
+               "re-encode it";
+        return -1;
+      }
+      t.rows = (int)e->shape[0];
+      if (!e->sideband.empty()) {
+        t.sideband = FlexData::from_json(e->sideband);
+      }
+    }
+    _texts.push_back(std::move(t));
+    const int idx = (int)_texts.size() - 1;
+    if (!cached) { _want_text.push_back(idx); }
+    return idx;
+  };
+  for (std::size_t si = 0; si < sa.size(); ++si) {
+    const FlexData e = sa.at(si);
+    auto eo = e.as_object();
+    const std::string file(eo.at("file").as_string(""));
+    Sample s;
+    s.repeats = std::max<int>(1, (int)eo.at("repeats").as_int(1));
+    s.validation = eo.contains("validation") &&
+                   eo.at("validation").as_bool(false);
+    const FlexData caps = eo.at("captions");
+    const FlexData pics = eo.at("pictures");
+    const FlexData ckeys =
+        eo.contains("caption_keys") ? eo.at("caption_keys") : FlexData();
+    const FlexData ccached =
+        eo.contains("caption_cached") ? eo.at("caption_cached") : FlexData();
+    auto ca = caps.as_array();
+    auto pa = pics.as_array();
+    for (std::size_t i = 0; i < ca.size(); ++i) {
+      const int idx = text_slot(str_at(ckeys, i), bool_at(ccached, i),
+                                fmt("caption {} of '{}'", i, file)());
+      if (idx < 0) { return false; }
+      s.texts.push_back(idx);
+    }
+    for (std::size_t i = 0; i < pa.size(); ++i) {
+      const FlexData pe = pa.at(i);
+      auto po = pe.as_object();
+      Picture p;
+      p.key = po.contains("key") ? std::string(po.at("key").as_string(""))
+                                 : std::string();
+      if (po.contains("cached") && po.at("cached").as_bool(false)) {
+        const genai::train::SampleCache::Entry* ce = _cache.find(p.key);
+        if (ce == nullptr || ce->shape.size() != 3) {
+          *err = fmt("picture {} of '{}' is marked cached but is not in "
+                     "'{}' -- was the cache changed during the run? Run "
+                     "again to re-encode it", i, file, _cache.dir())();
+          return false;
+        }
+        _latent_c = (int)ce->shape[0];
+        p.h = (int)ce->shape[1];
+        p.w = (int)ce->shape[2];
+      } else {
+        _want_pic.push_back(WantPic{(int)si, (int)i,
+                                    (int)po.at("h").as_int(0),
+                                    (int)po.at("w").as_int(0), file});
+      }
+      s.pics.push_back(std::move(p));
+    }
+    _samples.push_back(std::move(s));
+  }
+  // The empty prompt, then the previews.
+  {
+    const std::string key =
+        mo.contains("null_key") ? std::string(mo.at("null_key").as_string(""))
+                                : std::string();
+    const bool cached =
+        mo.contains("null_cached") && mo.at("null_cached").as_bool(false);
+    _null_text = text_slot(key, cached, "the empty prompt");
+    if (_null_text < 0) { return false; }
+  }
+  const FlexData pk =
+      mo.contains("preview_keys") ? mo.at("preview_keys") : FlexData();
+  const FlexData pc =
+      mo.contains("preview_cached") ? mo.at("preview_cached") : FlexData();
+  for (std::size_t i = 0; i < _preview_prompts.size(); ++i) {
+    const int idx = text_slot(str_at(pk, i), bool_at(pc, i),
+                              fmt("preview prompt {}", i)());
+    if (idx < 0) { return false; }
+    _preview_texts.push_back(idx);
+  }
+  return true;
+}
+
+Job
+TrainLoraStage::checkpoint_(RuntimeContext& ctx, FlexData* out,
+                            std::string* err)
+{
+  if (!save_(false, err)) {
+    *err = "saving a checkpoint failed: " + *err;
+    co_return;
+  }
+  FlexData c = FlexData::make_object();
+  auto co = c.as_object();
+  co.insert_or_assign("path", FlexData::make_string(_saved.back()));
+  co.insert_or_assign("step", FlexData::make_int(_step));
+  co.insert_or_assign("loss",
+                      FlexData::make_real(_loss_sum / std::max(_loss_n, 1)));
+  if (!_val.empty()) {
+    double vl = 0.0;
+    if (!validate_(&vl, err)) {
+      *err = "scoring the held-out samples failed: " + *err;
+      co_return;
+    }
+    co.insert_or_assign("val_loss", FlexData::make_real(vl));
+    session()->info(fmt("TrainLoraStage('{}'): step {}: held-out loss "
+                        "{:.4f} over {} samples{}", this->id(), _step, vl,
+                        _val.size(),
+                        _val_last < 0.0 ? std::string()
+                                        : fmt(" (was {:.4f})", _val_last)()));
+    _val_last = vl;
+  }
+  co.insert_or_assign("trigger_word", FlexData::make_string(_trigger));
+  _saved_step = _step;
+  _last_checkpoint = c;
+  *out = c;
+  co_await ctx.write(1, make_payload<FlexDataPayload>(std::move(c)));
+  _loss_sum = 0.0;
+  _loss_n = 0;
+}
+
+Job
+TrainLoraStage::previews_(RuntimeContext& ctx, int which, int steps,
+                          double cfg, std::uint64_t seed, int* n,
+                          std::string* err)
+{
+  *n = 0;
+  if (_preview_texts.empty() || _samples.empty() ||
+      _samples.front().pics.empty()) {
+    *err = "there are no preview prompts";
+    co_return;
+  }
+  if (which >= (int)_preview_texts.size()) {
+    *err = fmt("there are {} preview prompts; {} is not one of them",
+               _preview_texts.size(), which)();
+    co_return;
+  }
+  // The preview geometry: the first sample's first picture.
+  const Picture& gp = _samples.front().pics.front();
+  for (std::size_t i = 0; i < _preview_texts.size(); ++i) {
+    if (which >= 0 && (int)i != which) { continue; }
+    const Text& t = _texts[(std::size_t)_preview_texts[i]];
+    genai::train::PreviewRequest r;
+    r.text = &t.buf;
+    r.text_rows = t.rows;
+    r.sideband = &t.sideband;
+    if (_null_text >= 0 && cfg != 1.0) {
+      const Text& nt = _texts[(std::size_t)_null_text];
+      r.neg_text = &nt.buf;
+      r.neg_rows = nt.rows;
+      r.neg_sideband = &nt.sideband;
+    }
+    r.grid_h = gp.h;
+    r.grid_w = gp.w;
+    r.steps = steps;
+    r.cfg = (float)cfg;
+    r.seed = seed + i;
+    std::vector<float> chw;
+    if (!_trainer->preview(r, &chw, err)) { co_return; }
+    auto tb = std::make_unique<TensorBeatPayload>();
+    tb->dtype = TensorBeat::DType::F32;
+    tb->shape = {_trainer->latent_channels(), gp.h, gp.w};
+    tb->resize_contiguous(chw.size());
+    std::memcpy(tb->as_f32(), chw.data(), chw.size() * 4);
+    FlexData sb = FlexData::make_object();
+    auto so = sb.as_object();
+    so.insert_or_assign("step", FlexData::make_int(_step));
+    so.insert_or_assign("prompt", FlexData::make_string(_preview_prompts[i]));
+    tb->sideband = std::move(sb);
+    co_await ctx.write(0, std::move(tb));
+    ++*n;
+  }
+}
+
+#endif  // VPIPE_BUILD_APPLE_SILICON
+
+Job
+TrainLoraStage::serve_commands_(RuntimeContext& ctx)
+{
+  while (auto cmd = ctx.try_command()) {
+#ifdef VPIPE_BUILD_APPLE_SILICON
+    if (_phase != Phase::kTrain || !_trainer) {
+      cmd->fail(_phase == Phase::kDone
+                    ? "training has finished"
+                    : "training has not started: the dataset is still "
+                      "encoding, or the model loading");
+      continue;
+    }
+    const std::string name(cmd->name());
+    std::string err;
+    if (name == "save") {
+      // Twice at one step is one checkpoint.
+      FlexData r;
+      if (_saved_step == _step && _last_checkpoint.is_object()) {
+        r = _last_checkpoint;
+      } else {
+        co_await checkpoint_(ctx, &r, &err);
+      }
+      if (!err.empty()) { cmd->fail(err); continue; }
+      cmd->reply(std::move(r));
+    } else if (name == "preview") {
+      const FlexData a = cmd->args();
+      auto ao = a.as_object();
+      const int which = (int)ao.at("prompt").as_int(-1);
+      const int steps = (int)ao.at("steps").as_int(0);
+      const double cfg = ao.at("cfg").as_real(0.0);
+      const std::int64_t seed = ao.at("seed").as_int(-1);
+      int n = 0;
+      co_await previews_(ctx, which, steps > 0 ? steps : _preview_steps,
+                         cfg > 0.0 ? cfg : _preview_cfg,
+                         seed >= 0 ? (std::uint64_t)seed : _preview_seed, &n,
+                         &err);
+      if (!err.empty()) { cmd->fail(err); continue; }
+      FlexData r = FlexData::make_object();
+      r.as_object().insert_or_assign("step", FlexData::make_int(_step));
+      r.as_object().insert_or_assign("previews", FlexData::make_int(n));
+      cmd->reply(std::move(r));
+    } else {
+      cmd->fail("unknown command '" + name + "'");
+    }
+#else
+    cmd->fail("training needs Apple Silicon");
+#endif
+  }
+}
+
 Job
 TrainLoraStage::process(RuntimeContext& ctx)
 {
@@ -1013,6 +1317,9 @@ TrainLoraStage::process(RuntimeContext& ctx)
     _phase = Phase::kDone;
     ctx.signal_done();
   };
+
+  // Commands, between whatever this call does: a step, an encode.
+  co_await serve_commands_(ctx);
 
   // ---- the model, the optimizer and the manifest ----------------------
   if (_phase == Phase::kStart) {
@@ -1083,223 +1390,149 @@ TrainLoraStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // ---- ENCODE: one sample's beats per call, in the manifest's order -----
+  // ---- ENCODE: drain both encoders' streams as they arrive ------------
   //
-  // A caption or picture the manifest marks CACHED arrives from the cache,
-  // not from the conditioner or the VAE: the dataset stage did not emit
-  // it. Everything that does arrive goes into the cache too.
+  // The manifest says what arrives on each port and in which order: the
+  // conditioner's beats are the uncached captions, sample by sample,
+  // then the empty prompt and the previews; the VAE's are the uncached
+  // pictures. The two streams are read INDEPENDENTLY, whichever has a
+  // beat, and never in lockstep: a conditioner that batches its prompts
+  // holds dozens of captions back, and a reader waiting on sample 0's
+  // caption while the pictures pile up behind it would stall the dataset
+  // that feeds both -- the batch would never fill.
   if (_phase == Phase::kEncode) {
-    FlexData man = _manifest;
-    auto mo = man.as_object();
-    const FlexData samples = mo.at("samples");
-    auto sa = samples.as_array();
-    auto str_at = [](const FlexData& arr, std::size_t i) {
-      if (!arr.is_array()) { return std::string(); }
-      auto a = arr.as_array();
-      return i < a.size() ? std::string(a.at(i).as_string(""))
-                          : std::string();
-    };
-    auto bool_at = [](const FlexData& arr, std::size_t i) {
-      if (!arr.is_array()) { return false; }
-      auto a = arr.as_array();
-      return i < a.size() && a.at(i).as_bool(false);
-    };
-    // A cached text: its shape and sideband from the index, its bytes
-    // later (settle_cache_ or the step that needs them).
-    auto cached_text = [&](const std::string& key, int* idx) {
-      const genai::train::SampleCache::Entry* e = _cache.find(key);
-      if (e == nullptr || e->shape.size() != 2) { return false; }
-      Text t;
-      t.key = key;
-      t.rows = (int)e->shape[0];
-      if (!e->sideband.empty()) {
-        t.sideband = FlexData::from_json(e->sideband);
-      }
-      _texts.push_back(std::move(t));
-      *idx = (int)_texts.size() - 1;
-      return true;
-    };
-    // One conditioning beat into RAM and the cache; false for anything
-    // else.
-    auto take_text = [&](const BeatPayloadIntf* cb, const std::string& key,
-                         int* idx) {
+    if (!_encode_planned) {
+      _encode_planned = true;
+      std::string perr;
+      if (!plan_encode_(&perr)) { fail(perr); co_return; }
+    }
+    // One conditioning beat into its slot, RAM and the cache.
+    auto take_text = [&](const BeatPayloadIntf* cb, int idx) {
       const auto* tb = cb ? dynamic_cast<const TensorBeatPayload*>(cb)
                           : nullptr;
       if (tb == nullptr || tb->shape.size() != 2) { return false; }
-      Text t;
+      Text& t = _texts[(std::size_t)idx];
       t.buf = copy_beat_(mc, *tb);
       t.rows = (int)tb->shape[0];
       t.sideband = tb->sideband;
-      t.key = key;
       _cache_bytes += t.buf.byte_size();
-      cache_put_(key, *tb, false);
-      _texts.push_back(std::move(t));
-      *idx = (int)_texts.size() - 1;
+      cache_put_(t.key, *tb, false);
       return true;
     };
-    auto missing = [&](const std::string& what) {
-      fail(fmt("{} is marked cached but is not in '{}' -- was the cache "
-               "changed during the run? Run again to re-encode it", what,
-               _cache.dir())());
+    // One latent into its picture: f32 [C,h,w], rounded to the storage
+    // type now, exactly as packing would -- so a latent read back from
+    // the cache is the SAME latent.
+    auto take_latent = [&](const BeatPayloadIntf* lb, const WantPic& w,
+                           std::string* why) {
+      const auto* tb = lb ? dynamic_cast<const TensorBeatPayload*>(lb)
+                          : nullptr;
+      if (tb == nullptr || tb->dtype != TensorBeat::DType::F32 ||
+          tb->shape.size() != 3) {
+        *why = fmt("the latent of sample {} ('{}') did not arrive as f32 "
+                   "[C,h,w] -- vae-encode and the training-dataset "
+                   "disagree", w.sample, w.file)();
+        return false;
+      }
+      const int lc = (int)tb->shape[0], lh = (int)tb->shape[1],
+                lw = (int)tb->shape[2];
+      // The picture and its latent agree on a scale, or the VAE was
+      // handed something else.
+      if (lh <= 0 || lw <= 0 || w.ph % lh != 0 || w.pw % lw != 0 ||
+          w.ph / lh != w.pw / lw) {
+        *why = fmt("sample {}'s latent [{}, {}, {}] is not a picture of "
+                   "{}x{}", w.sample, lc, lh, lw, w.pw, w.ph)();
+        return false;
+      }
+      const auto bytes = tb->materialize_contiguous();
+      const std::size_t n = bytes.size() / 4;
+      Picture& p =
+          _samples[(std::size_t)w.sample].pics[(std::size_t)w.pic];
+      p.h = lh;
+      p.w = lw;
+      _latent_c = lc;
+      // Held as f32 [C,h,w] until the family can pack it: the model has
+      // not loaded yet, on purpose.
+      p.x0 = mc->make_shared_buffer(bytes.size());
+      {
+        const auto* src = reinterpret_cast<const float*>(bytes.data());
+        auto* dst = static_cast<float*>(p.x0.contents());
+        for (std::size_t j = 0; j < n; ++j) {
+          dst[j] = genai::train::bf16_to_f32(
+              genai::train::f32_to_bf16(src[j]));
+        }
+      }
+      _cache_bytes += n * 2;
+      cache_put_(p.key, *tb, true);
+      return true;
     };
-    if (_next_sample < sa.size()) {
-      const FlexData e = sa.at(_next_sample);
-      auto eo = e.as_object();
-      const std::string file(eo.at("file").as_string(""));
-      Sample s;
-      s.repeats = std::max<int>(1, (int)eo.at("repeats").as_int(1));
-      s.validation = eo.contains("validation") &&
-                     eo.at("validation").as_bool(false);
-      const FlexData caps = eo.at("captions");
-      const FlexData pics = eo.at("pictures");
-      const FlexData ckeys =
-          eo.contains("caption_keys") ? eo.at("caption_keys") : FlexData();
-      const FlexData ccached = eo.contains("caption_cached")
-                                   ? eo.at("caption_cached")
-                                   : FlexData();
-      auto ca = caps.as_array();
-      auto pa = pics.as_array();
-      for (std::size_t i = 0; i < ca.size(); ++i) {
-        int idx = -1;
-        const std::string key = str_at(ckeys, i);
-        if (bool_at(ccached, i)) {
-          if (!cached_text(key, &idx)) {
-            missing(fmt("caption {} of '{}'", i, file)());
-            co_return;
-          }
-          s.texts.push_back(idx);
-          continue;
-        }
+
+    const bool want_t = _got_text < _want_text.size();
+    const bool want_p = _got_pic < _want_pic.size();
+    if (want_t || want_p) {
+      std::vector<unsigned> ports;
+      if (want_t && !ctx.eos(kCondPort)) { ports.push_back(kCondPort); }
+      if (want_p && !ctx.eos(kLatentPort)) { ports.push_back(kLatentPort); }
+      if (want_t && ctx.eos(kCondPort)) {
+        fail(fmt("the conditioning ended after {} of {} encodes -- the "
+                 "diffusion-conditioner and the training-dataset disagree "
+                 "about how many captions there are (is the conditioner "
+                 "current: it must accept allow_empty?)", _got_text,
+                 _want_text.size())());
+        co_return;
+      }
+      if (want_p && ctx.eos(kLatentPort)) {
+        fail(fmt("the latents ended after {} of {} pictures -- vae-encode "
+                 "and the training-dataset disagree", _got_pic,
+                 _want_pic.size())());
+        co_return;
+      }
+      co_await ctx.read_any(std::move(ports), true);
+      while (_got_text < _want_text.size() && ctx.backlog(kCondPort) > 0) {
         auto cb = co_await ctx.read(kCondPort);
-        if (!take_text(cb.get(), key, &idx)) {
-          fail(fmt("the conditioning of sample {} ('{}') did not arrive -- "
-                   "the diffusion-conditioner and the training-dataset "
-                   "disagree about how many captions there are",
-                   _next_sample, file)());
+        const int idx = _want_text[_got_text];
+        if (!take_text(cb.get(), idx)) {
+          fail(fmt("conditioning {} of {} did not arrive as a [rows, dim] "
+                   "tensor", _got_text, _want_text.size())());
           co_return;
         }
-        s.texts.push_back(idx);
+        ++_got_text;
       }
-      for (std::size_t i = 0; i < pa.size(); ++i) {
-        const FlexData pe = pa.at(i);
-        auto po = pe.as_object();
-        const std::string key =
-            po.contains("key") ? std::string(po.at("key").as_string(""))
-                               : std::string();
-        if (po.contains("cached") && po.at("cached").as_bool(false)) {
-          const genai::train::SampleCache::Entry* ce = _cache.find(key);
-          if (ce == nullptr || ce->shape.size() != 3) {
-            missing(fmt("picture {} of '{}'", i, file)());
-            co_return;
-          }
-          Picture p;
-          p.key = key;
-          _latent_c = (int)ce->shape[0];
-          p.h = (int)ce->shape[1];
-          p.w = (int)ce->shape[2];
-          s.pics.push_back(std::move(p));
-          continue;
-        }
+      while (_got_pic < _want_pic.size() && ctx.backlog(kLatentPort) > 0) {
         auto lb = co_await ctx.read(kLatentPort);
-        const auto* tb =
-            lb ? dynamic_cast<const TensorBeatPayload*>(lb.get()) : nullptr;
-        if (tb == nullptr || tb->dtype != TensorBeat::DType::F32 ||
-            tb->shape.size() != 3) {
-          fail(fmt("the latent of sample {} ('{}') did not arrive as f32 "
-                   "[C,h,w] -- vae-encode and the training-dataset disagree",
-                   _next_sample, file)());
+        std::string why;
+        if (!take_latent(lb.get(), _want_pic[_got_pic], &why)) {
+          fail(why);
           co_return;
         }
-        const int ph = (int)po.at("h").as_int(0);
-        const int pw = (int)po.at("w").as_int(0);
-        const int lc = (int)tb->shape[0], lh = (int)tb->shape[1],
-                  lw = (int)tb->shape[2];
-        // The picture and its latent agree on a scale, or the VAE was
-        // handed something else.
-        if (lh <= 0 || lw <= 0 || ph % lh != 0 || pw % lw != 0 ||
-            ph / lh != pw / lw) {
-          fail(fmt("sample {}'s latent [{}, {}, {}] is not a picture of "
-                   "{}x{}", _next_sample, lc, lh, lw, pw, ph)());
-          co_return;
-        }
-        // Rounded to the storage type now, exactly as packing would: a
-        // latent read back from the cache is then the SAME latent.
-        const auto bytes = tb->materialize_contiguous();
-        const std::size_t n = bytes.size() / 4;
-        Picture p;
-        p.h = lh;
-        p.w = lw;
-        p.key = key;
-        _latent_c = lc;
-        // Held as f32 [C,h,w] until the family can pack it: the model has
-        // not loaded yet, on purpose.
-        p.x0 = mc->make_shared_buffer(bytes.size());
-        {
-          const auto* src = reinterpret_cast<const float*>(bytes.data());
-          auto* dst = static_cast<float*>(p.x0.contents());
-          for (std::size_t j = 0; j < n; ++j) {
-            dst[j] = genai::train::bf16_to_f32(
-                genai::train::f32_to_bf16(src[j]));
+        ++_got_pic;
+        if (_cache.pending_bytes() >= ((std::size_t)256 << 20)) {
+          std::string cerr;
+          if (!_cache.flush(&cerr)) {
+            session()->warn(fmt("TrainLoraStage('{}'): the sample cache was "
+                                "not written: {}", this->id(), cerr));
           }
         }
-        _cache_bytes += n * 2;
-        cache_put_(key, *tb, true);
-        s.pics.push_back(std::move(p));
       }
-      _samples.push_back(std::move(s));
-      ++_next_sample;
-      if (_cache.pending_bytes() >= ((std::size_t)256 << 20)) {
-        std::string cerr;
-        if (!_cache.flush(&cerr)) {
-          session()->warn(fmt("TrainLoraStage('{}'): the sample cache was "
-                              "not written: {}", this->id(), cerr));
-        }
+      if (_got_text < _want_text.size() || _got_pic < _want_pic.size()) {
+        co_return;
       }
-      co_return;
     }
-    // The empty prompt, then the previews.
-    {
-      const std::string key =
-          mo.contains("null_key") ? std::string(mo.at("null_key").as_string(""))
-                                  : std::string();
-      if (mo.contains("null_cached") && mo.at("null_cached").as_bool(false)) {
-        if (!cached_text(key, &_null_text)) {
-          missing("the empty prompt");
-          co_return;
-        }
-      } else {
-        auto nb = co_await ctx.read(kCondPort);
-        if (!take_text(nb.get(), key, &_null_text)) {
-          fail("the empty prompt's conditioning did not arrive -- is the "
-               "diffusion-conditioner current (it must accept allow_empty)?");
+    // Then the END of both streams. The encoders let go of their models
+    // before they signal it, and the model below must not load beside
+    // them: a trainer that starts while the conditioner still holds its
+    // encoder runs its whole course with that much less room. A beat
+    // past what the manifest promised is a disagreement, not a spare.
+    for (const unsigned p : {kCondPort, kLatentPort}) {
+      while (ctx.iport_connected(p) && !ctx.eos(p)) {
+        auto extra = co_await ctx.read(p);
+        if (extra) {
+          fail(fmt("more {} arrived than the training-dataset's manifest "
+                   "lists", p == kCondPort ? "conditionings" : "latents")());
           co_return;
         }
       }
     }
-    {
-      const FlexData pk =
-          mo.contains("preview_keys") ? mo.at("preview_keys") : FlexData();
-      const FlexData pc = mo.contains("preview_cached")
-                              ? mo.at("preview_cached")
-                              : FlexData();
-      for (std::size_t i = 0; i < _preview_prompts.size(); ++i) {
-        int idx = -1;
-        const std::string key = str_at(pk, i);
-        if (bool_at(pc, i)) {
-          if (!cached_text(key, &idx)) {
-            missing(fmt("preview prompt {}", i)());
-            co_return;
-          }
-        } else {
-          auto pb = co_await ctx.read(kCondPort);
-          if (!take_text(pb.get(), key, &idx)) {
-            fail("a preview prompt's conditioning did not arrive");
-            co_return;
-          }
-        }
-        _preview_texts.push_back(idx);
-      }
-    }
+
     std::string err;
     if (!settle_cache_(&err)) { fail(err); co_return; }
     session()->info(fmt(
@@ -1309,7 +1542,42 @@ TrainLoraStage::process(RuntimeContext& ctx)
         _disk ? "read from the cache every step" : "in RAM",
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       _encode_t0).count()));
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      // What the encoders left POOLED -- held by nobody, kept for a
+      // relaunch -- is given back before the model loads: parked bytes
+      // are still allocated, and the GPU's working set is what a
+      // preview's decode has to fit in beside the trainer. A preview's
+      // VAE decode reloads the half it needs.
+      const std::size_t freed = mgr->pool_evict(mgr->pooled_bytes());
+      if (freed > 0) {
+        session()->info(fmt("TrainLoraStage('{}'): gave back {} MB the "
+                            "encoders left pooled", this->id(),
+                            freed >> 20));
+      }
+    }
+    const auto mb0 = mc->memory_budget();
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      // Whatever checkpoint is still held as training starts, by whom.
+      for (const auto& u : mgr->weight_report()) {
+        if (u.bytes < ((std::size_t)64 << 20)) { continue; }
+        session()->info(fmt(
+            "TrainLoraStage('{}'): still held as training starts: {} ({} "
+            "MB, {} holder(s){})", this->id(), u.dir, u.bytes >> 20,
+            u.holders, u.parked ? ", parked" : ""));
+      }
+    }
     if (!load_model_(&err)) { fail(err); co_return; }
+    {
+      // What the GPU's working set holds before the model and after it:
+      // the first is everything else in the process -- the encoders'
+      // leftovers above all -- which a preview's decode has to fit
+      // beside.
+      const auto mb1 = mc->memory_budget();
+      session()->info(fmt(
+          "TrainLoraStage('{}'): GPU working set {} MB before the model, "
+          "{} MB after, of {} MB", this->id(), mb0.allocated >> 20,
+          mb1.allocated >> 20, mb1.recommended >> 20));
+    }
     // Pack every latent held in RAM now that the family can.
     const int C = _trainer->latent_channels();
     for (Sample& s : _samples) {
@@ -1475,81 +1743,20 @@ TrainLoraStage::process(RuntimeContext& ctx)
     }
     const bool save_now = _step % _save_every == 0 && _step < _total_steps;
     if (save_now) {
-      if (!save_(false, &err)) {
-        fail("saving a checkpoint failed: " + err);
-        co_return;
-      }
-      FlexData c = FlexData::make_object();
-      auto co = c.as_object();
-      co.insert_or_assign("path", FlexData::make_string(_saved.back()));
-      co.insert_or_assign("step", FlexData::make_int(_step));
-      co.insert_or_assign("loss",
-                          FlexData::make_real(_loss_sum /
-                                              std::max(_loss_n, 1)));
-      if (!_val.empty()) {
-        double vl = 0.0;
-        if (!validate_(&vl, &err)) {
-          fail("scoring the held-out samples failed: " + err);
-          co_return;
-        }
-        co.insert_or_assign("val_loss", FlexData::make_real(vl));
-        session()->info(fmt("TrainLoraStage('{}'): step {}: held-out loss "
-                            "{:.4f} over {} samples{}", this->id(), _step,
-                            vl, _val.size(),
-                            _val_last < 0.0
-                                ? std::string()
-                                : fmt(" (was {:.4f})", _val_last)()));
-        _val_last = vl;
-      }
-      co.insert_or_assign("trigger_word", FlexData::make_string(_trigger));
-      co_await ctx.write(1, make_payload<FlexDataPayload>(std::move(c)));
-      _loss_sum = 0.0;
-      _loss_n = 0;
+      FlexData c;
+      co_await checkpoint_(ctx, &c, &err);
+      if (!err.empty()) { fail(err); co_return; }
     }
     const bool preview_now =
         _preview_every > 0 && !_preview_texts.empty() &&
         (_step % _preview_every == 0 || _step == _total_steps);
     if (preview_now) {
-      // The preview geometry: the first sample's first picture.
-      const Picture& gp = _samples.front().pics.front();
-      for (std::size_t i = 0; i < _preview_texts.size(); ++i) {
-        const Text& t = _texts[(std::size_t)_preview_texts[i]];
-        genai::train::PreviewRequest r;
-        r.text = &t.buf;
-        r.text_rows = t.rows;
-        r.sideband = &t.sideband;
-        if (_null_text >= 0 && _preview_cfg != 1.0) {
-          const Text& nt = _texts[(std::size_t)_null_text];
-          r.neg_text = &nt.buf;
-          r.neg_rows = nt.rows;
-          r.neg_sideband = &nt.sideband;
-        }
-        r.grid_h = gp.h;
-        r.grid_w = gp.w;
-        r.steps = _preview_steps;
-        r.cfg = (float)_preview_cfg;
-        r.seed = _preview_seed + i;
-        std::vector<float> chw;
-        std::string perr;
-        if (!_trainer->preview(r, &chw, &perr)) {
-          if (!perr.empty()) {
-            session()->warn(fmt("TrainLoraStage('{}'): preview failed: {}",
-                                this->id(), perr));
-          }
-          break;
-        }
-        auto tb = std::make_unique<TensorBeatPayload>();
-        tb->dtype = TensorBeat::DType::F32;
-        tb->shape = {_trainer->latent_channels(), gp.h, gp.w};
-        tb->resize_contiguous(chw.size());
-        std::memcpy(tb->as_f32(), chw.data(), chw.size() * 4);
-        FlexData sb = FlexData::make_object();
-        auto so = sb.as_object();
-        so.insert_or_assign("step", FlexData::make_int(_step));
-        so.insert_or_assign("prompt",
-                            FlexData::make_string(_preview_prompts[i]));
-        tb->sideband = std::move(sb);
-        co_await ctx.write(0, std::move(tb));
+      int n = 0;
+      co_await previews_(ctx, -1, _preview_steps, _preview_cfg,
+                         _preview_seed, &n, &err);
+      if (!err.empty()) {
+        session()->warn(fmt("TrainLoraStage('{}'): preview failed: {}",
+                            this->id(), err));
       }
     }
     co_return;

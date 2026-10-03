@@ -1104,8 +1104,9 @@ VaeEncodeStage::process(RuntimeContext& ctx)
   auto in = co_await ctx.read(port);
   if (!in) {
     // THE END OF A BATCH: a dataset's pictures held the VAE across the
-    // series; now the idle policy applies.
-    if (_batch && _unload_idle && !_unloaded) { unload_vae_(); }
+    // series. Now it goes, whatever the idle policy says: what follows a
+    // batch is a trainer that runs for hours beside it.
+    if (_batch && !_unloaded) { unload_vae_(); }
     // Upstream EOS -> close the oports -- unless the OTHER input is still
     // open, in which case the next call reads it.
     if (!(one && many)) { ctx.signal_done(); }

@@ -857,6 +857,9 @@ DiffusionConditionerStage::DiffusionConditionerStage(
   // (when iport connectivity is known), not at construction.
   _hf_dir    = attr_str("hf_dir");
   _venc_dir  = attr_str("encoder_dir");
+  if (const char* e = std::getenv("VPIPE_COND_BATCH")) {
+    _batch_max = std::max(1, std::atoi(e));
+  }
   _grounded_negative = attr_bool("grounded_negative");
   {
     using Mode = GenerationInput::Mode;
@@ -2317,6 +2320,94 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
   return {};   // flux2 etc.: text-only
 }
 
+bool
+DiffusionConditionerStage::qi21_ids_(const std::string& text, int nref,
+                                     std::vector<std::int32_t>* ids,
+                                     int* drop) const
+{
+  const std::string tmpl = genai::qi21::prompt_template(nref, text);
+  *ids = encode_with_specials_(*_tokenizer, tmpl);
+  if (ids->empty()) { return false; }
+  // How many leading tokens the reference drops. It derives the count
+  // by tokenizing the SYSTEM TURN ALONE rather than hardcoding it, so
+  // that it tracks the template; this does the same, against the same
+  // prefix string, rather than assuming a number.
+  const std::vector<std::int32_t> sys_ids =
+      encode_with_specials_(*_tokenizer, genai::qi21::system_prefix());
+  *drop = (int)sys_ids.size();
+  if (*drop <= 0 || *drop >= (int)ids->size()) {
+    session()->warn(fmt(
+        "DiffusionConditionerStage('{}'): the system prefix tokenized to "
+        "{} of {} tokens, which cannot be right; dropping beat",
+        this->id(), *drop, (int)ids->size()));
+    return false;
+  }
+  return true;
+}
+
+SharedBuffer
+DiffusionConditionerStage::embed_rows_(
+    const std::vector<std::int32_t>& ids) const
+{
+  auto* mc = session()->services()->metal_compute();
+  const int EH = _enc_hidden;
+  const int n = (int)ids.size();
+  SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+  if (x.empty()) { return {}; }
+  const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
+  auto* xb = static_cast<std::uint8_t*>(x.contents());
+  const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
+  for (int i = 0; i < n; ++i) {
+    const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
+    if (id >= vocab) { return {}; }
+    std::memcpy(xb + (std::size_t)i * EH * 2, tbl + (std::size_t)id * EH * 2,
+                (std::size_t)EH * 2);
+  }
+  return x;
+}
+
+FlexData
+DiffusionConditionerStage::qi21_sideband_(
+    const std::vector<std::uint8_t>& slots, int nref,
+    const std::vector<int>& grid_h, const std::vector<int>& grid_w)
+{
+  FlexData sb = FlexData::make_object();
+  auto o = sb.as_object();
+  FlexData sl = FlexData::make_array();
+  {
+    auto a = sl.as_array();
+    for (std::uint8_t v : slots) {
+      a.push_back(FlexData::make_int(v != 0 ? 1 : 0));
+    }
+  }
+  o.insert_or_assign(genai::cond_sideband::kImgSlots, std::move(sl));
+  // Per reference, the DiT's LATENT grid -- twice the tower's merged
+  // grid, because one slot is a 2x2 group of latent tokens.
+  FlexData gh = FlexData::make_array(), gw = FlexData::make_array();
+  {
+    auto ah = gh.as_array();
+    auto aw = gw.as_array();
+    for (int i = 0; i < nref && i < (int)grid_h.size(); ++i) {
+      ah.push_back(FlexData::make_int(grid_h[(std::size_t)i]));
+      aw.push_back(FlexData::make_int(grid_w[(std::size_t)i]));
+    }
+  }
+  o.insert_or_assign(genai::cond_sideband::kRefGridH, std::move(gh));
+  o.insert_or_assign(genai::cond_sideband::kRefGridW, std::move(gw));
+  return sb;
+}
+
+bool
+DiffusionConditionerStage::batchable_() const
+{
+  // Text-only Qwen-Image-2.1 on an encoder that streams its layers: the
+  // case where one prompt at a time re-reads the whole stack per prompt.
+  // A resident encoder gains nothing from it.
+  return _batch && _family == "qwen-image-21" && _encoder != nullptr &&
+         _encoder->streaming_layers() && _ref_rgb.empty() &&
+         _negative_prompt.empty() && !_grounded_negative;
+}
+
 SharedBuffer
 DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                                    int& n_real_out,
@@ -2820,39 +2911,14 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     // Rendered by the layout module, which is where this model's
     // checkpoint-free facts live and where it is tested against the
     // reference's own rendered string.
-    const std::string tmpl = genai::qi21::prompt_template(nref, text);
-    std::vector<std::int32_t> ids = encode_with_specials_(*_tokenizer, tmpl);
-    if (ids.empty()) { return {}; }
-    // How many leading tokens the reference drops. It derives the count
-    // by tokenizing the SYSTEM TURN ALONE rather than hardcoding it, so
-    // that it tracks the template; this does the same, against the same
-    // prefix string, rather than assuming a number.
-    const std::vector<std::int32_t> sys_ids =
-        encode_with_specials_(*_tokenizer, genai::qi21::system_prefix());
-    const int drop = (int)sys_ids.size();
-    if (drop <= 0 || drop >= (int)ids.size()) {
-      session()->warn(fmt(
-          "DiffusionConditionerStage('{}'): the system prefix tokenized to "
-          "{} of {} tokens, which cannot be right; dropping beat",
-          this->id(), drop, (int)ids.size()));
-      return {};
-    }
+    std::vector<std::int32_t> ids;
+    int drop = 0;
+    if (!qi21_ids_(text, nref, &ids, &drop)) { return {}; }
     std::vector<std::pair<int, int>> runs;
     if (nref > 0) { runs = expand_pads_(ids, pad_id, _img_tok.data(), nref); }
     const int n = (int)ids.size();
-    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    SharedBuffer x = embed_rows_(ids);
     if (x.empty()) { return {}; }
-    {
-      const auto* tbl = static_cast<const std::uint8_t*>(_embed.contents());
-      auto* xb = static_cast<std::uint8_t*>(x.contents());
-      const std::size_t vocab = _embed.byte_size() / ((std::size_t)EH * 2);
-      for (int i = 0; i < n; ++i) {
-        const std::uint32_t id = (std::uint32_t)ids[(std::size_t)i];
-        if (id >= vocab) { return {}; }
-        std::memcpy(xb + (std::size_t)i * EH * 2,
-                    tbl + (std::size_t)id * EH * 2, (std::size_t)EH * 2);
-      }
-    }
     // Splice the tower rows over the image_pad embeddings.
     int first_pad = -1;
     if (grounded) {
@@ -3453,6 +3519,81 @@ DiffusionConditionerStage::process_vosr_(RuntimeContext& ctx)
 }
 
 Job
+DiffusionConditionerStage::flush_batch_(RuntimeContext& ctx)
+{
+  auto* mc = session()->services()->metal_compute();
+  const int EH = _enc_hidden;
+  const int NL = _encoder->config().n_layers;
+  const std::size_t B = _pend.size();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::vector<std::int32_t>> ids(B);
+  std::vector<int> drops(B, 0), ns(B, 0);
+  std::vector<SharedBuffer> xs(B);
+  std::vector<SharedBuffer*> xp;
+  std::vector<std::size_t> which;   // the prompts that tokenized
+  for (std::size_t i = 0; i < B; ++i) {
+    if (!qi21_ids_(_pend[i], 0, &ids[i], &drops[i])) { continue; }
+    xs[i] = embed_rows_(ids[i]);
+    if (xs[i].empty()) { continue; }
+    ns[i] = (int)ids[i].size();
+    which.push_back(i);
+  }
+  std::vector<int> nb;
+  for (std::size_t i : which) {
+    xp.push_back(&xs[i]);
+    nb.push_back(ns[i]);
+  }
+  std::vector<SharedBuffer> taps;
+  if (!xp.empty()) {
+    PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                       kPerfLlmDitTextBegin, (std::uint64_t)xp.size());
+    taps = _encoder->forward_embeddings_taps_batch(xp, nb,
+                                                   std::vector<int>{NL - 1});
+  }
+  if (taps.size() != which.size()) {
+    // The batch did not run: one prompt at a time, so no beat is lost.
+    session()->warn(fmt("DiffusionConditionerStage('{}'): a batched encode "
+                        "of {} prompts failed; encoding them one at a time",
+                        this->id(), B));
+    for (const std::string& p : _pend) {
+      int n_real = 0;
+      SharedBuffer cond = encode_(p, "prompt", n_real, SharedBuffer{}, 0);
+      if (cond.empty()) { continue; }
+      auto beat = to_beat_(cond, {n_real, EH}, TensorBeat::DType::Bf16);
+      beat->sideband = qi21_sideband_(
+          std::vector<std::uint8_t>((std::size_t)n_real, 0), 0, {}, {});
+      co_await ctx.write(0, std::move(beat));
+      ++_emitted;
+    }
+    _pend.clear();
+    co_return;
+  }
+  // NO FINAL NORM, as in encode_: the last layer's residual, minus the
+  // system turn the reference drops.
+  for (std::size_t k = 0; k < which.size(); ++k) {
+    const std::size_t i = which[k];
+    const int keep = ns[i] - drops[i];
+    SharedBuffer out = mc->make_shared_buffer((std::size_t)keep * EH * 2);
+    if (out.empty()) { continue; }
+    std::memcpy(out.contents(),
+                static_cast<const std::uint8_t*>(taps[k].contents()) +
+                    (std::size_t)drops[i] * EH * 2,
+                (std::size_t)keep * EH * 2);
+    auto beat = to_beat_(out, {keep, EH}, TensorBeat::DType::Bf16);
+    beat->sideband = qi21_sideband_(
+        std::vector<std::uint8_t>((std::size_t)keep, 0), 0, {}, {});
+    co_await ctx.write(0, std::move(beat));
+    ++_emitted;
+  }
+  session()->info(fmt(
+      "DiffusionConditionerStage('{}'): encoded {} prompts in one pass over "
+      "the streamed encoder ({:.1f} s)", this->id(), B,
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count()));
+  _pend.clear();
+}
+
+Job
 DiffusionConditionerStage::process(RuntimeContext& ctx)
 {
   auto* mc = session()->services()->metal_compute();
@@ -3671,9 +3812,21 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     auto pb = co_await ctx.read(0);
     const Took took = _prompt_in.took(pb != nullptr);
     if (round.note(took) || took == Took::kNone) {
-      // THE END OF A BATCH: a dataset's captions held the encoder across
-      // the series; the series is over, so the idle policy applies now.
-      if (_batch && !_unloaded) { release_encoder_when_idle_(); }
+      // THE END OF A BATCH: the prompts still held back go first; then
+      // the encoder goes, whatever the idle policy says. A batch is a
+      // dataset's encode phase, and what follows it is a trainer that
+      // runs for hours beside whatever this leaves behind -- the policy's
+      // "keep it warm for a relaunch" is the wrong trade there. MEASURED
+      // on the M5 Pro 24 GB: 2.9 GB left in the GPU working set starved
+      // every preview decode of the training run that followed.
+      if (!_pend.empty() && _encoder != nullptr) {
+        co_await flush_batch_(ctx);
+      }
+      if (_batch) {
+        unload_encoder_();
+      } else if (!_unloaded) {
+        release_encoder_when_idle_();
+      }
       ctx.signal_done();
       co_return;
     }
@@ -3726,6 +3879,15 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     session()->warn(fmt(
         "DiffusionConditionerStage('{}'): the encoder could not be reloaded; "
         "dropping this prompt", this->id()));
+    co_return;
+  }
+  // A BATCH ON A STREAMED ENCODER: held back and encoded layer-major,
+  // up to _batch_max at a time -- one read of the stack per batch instead
+  // of one per prompt. Emitted in arrival order, so nothing downstream
+  // can tell, except by the clock.
+  if (batchable_()) {
+    _pend.push_back(prompt);
+    if ((int)_pend.size() >= _batch_max) { co_await flush_batch_(ctx); }
     co_return;
   }
 
@@ -3822,31 +3984,8 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     // that geometry and this stage does not.
     if (_family == "qwen-image-21" &&
         (int)_qi21_slots.size() == n_real) {
-      FlexData sb = FlexData::make_object();
-      auto o = sb.as_object();
-      FlexData slots = FlexData::make_array();
-      {
-        auto a = slots.as_array();
-        for (std::uint8_t v : _qi21_slots) {
-          a.push_back(FlexData::make_int(v != 0 ? 1 : 0));
-        }
-      }
-      o.insert_or_assign(genai::cond_sideband::kImgSlots, std::move(slots));
-      // Per reference, the DiT's LATENT grid -- twice the tower's
-      // merged grid, because one slot is a 2x2 group of latent tokens.
-      FlexData gh = FlexData::make_array(), gw = FlexData::make_array();
-      {
-        auto ah = gh.as_array();
-        auto aw = gw.as_array();
-        for (int i = 0; i < _qi21_nref && i < (int)_qi21_grid_h.size();
-             ++i) {
-          ah.push_back(FlexData::make_int(_qi21_grid_h[(std::size_t)i]));
-          aw.push_back(FlexData::make_int(_qi21_grid_w[(std::size_t)i]));
-        }
-      }
-      o.insert_or_assign(genai::cond_sideband::kRefGridH, std::move(gh));
-      o.insert_or_assign(genai::cond_sideband::kRefGridW, std::move(gw));
-      beat->sideband = std::move(sb);
+      beat->sideband = qi21_sideband_(_qi21_slots, _qi21_nref, _qi21_grid_h,
+                                      _qi21_grid_w);
     }
     // Opt-in trace of the conditioning ITSELF. Two prompts that produce
     // the same downstream generation are ambiguous between "the encoder

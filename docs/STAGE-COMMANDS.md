@@ -350,6 +350,23 @@ in place.
   nothing else until the close. The web UI's editor sends its commits
   through this same channel.
 
+**`train-lora`** — LoRA training, between its optimizer steps.
+
+- `save`: a checkpoint now, with its resume state, emitted on the
+  checkpoints port.
+- `preview`: the preview prompts sampled now with the live adapter
+  (optionally one prompt, other steps, guidance or seed), emitted on the
+  previews port.
+
+### From the web UI
+
+A running stage's commands that need no buffers and no required argument
+appear as buttons in its configuration panel. They go through
+`POST /api/pipelines/:id/stages/:sid/command` with
+`{"name": ..., "args": {...}, "timeout_ms": ...}`. The route answers
+`{"state": "replied", "result": {...}}`, or `{"state": ..., "error": ...}`
+when the stage refuses or does not answer in time.
+
 ## Versioning
 
 Command channels are the feature `stage-commands/1` of the plugin ABI (see

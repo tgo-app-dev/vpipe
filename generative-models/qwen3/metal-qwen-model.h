@@ -354,6 +354,24 @@ public:
                           int key_valid_len = 0,
                           const DeepstackInject* deepstack = nullptr);
 
+  // forward_embeddings_taps for a BATCH of text sequences, LAYER-MAJOR:
+  // every sequence runs through a layer before any runs the next. A model
+  // whose layers stream (Config::stream_layers) then reads each layer from
+  // disk ONCE for the whole batch, where one sequence at a time re-reads
+  // the stack per sequence -- which is what a dataset's captions cost a
+  // box that cannot hold its encoder. Each sequence gets its own context,
+  // so nothing attends across sequences. `xs[b]` (bf16 [ns[b], H]) is
+  // consumed as that sequence's residual stream, exactly as
+  // forward_embeddings_taps consumes its `x`. Returns one taps buffer per
+  // sequence ([tap][pos][hidden]), each equal to what
+  // forward_embeddings_taps returns for that sequence alone; empty on
+  // failure. Plain RoPE at sequential positions, no deepstack.
+  std::vector<metal_compute::SharedBuffer>
+  forward_embeddings_taps_batch(
+      const std::vector<metal_compute::SharedBuffer*>& xs,
+      const std::vector<int>& ns, const std::vector<int>& tap_layers,
+      int key_valid_len = 0);
+
   // Like forward_embeddings_taps but with 3-axis mROPE (position_ids [3*n],
   // row 0=T,1=H,2=W) for a text+vision-spliced multimodal sequence -- the
   // image-aware conditioning tap (Qwen-Image-Edit last-hidden, or Krea-2's
@@ -789,6 +807,26 @@ private:
   // per-layer hidden states a downstream consumer conditions on (matches HF
   // output_hidden_states[L+1]). *taps_out must be a [tap_layers->size()*n*H]
   // compute-dtype buffer. No effect when either is null.
+  // A prefill IN WINDOWS (forward_embeddings_taps_batch): one call runs
+  // the layers [begin, end) of one sequence, the next continues where it
+  // stopped -- the residual stream is the caller's `x`, updated in place.
+  // The first window reserves the sequence's KV slots and records them
+  // here; later windows reuse them. The CALLER holds streamed layers
+  // resident across a window.
+  struct PrefillChunk {
+    std::size_t page_off;
+    int slot;
+    int src_off;
+    int cnt;
+  };
+  struct PrefillWindow {
+    int begin = 0;
+    int end = 0;
+    bool reserved = false;
+    std::vector<PrefillChunk> chunks;
+    int q_offset = 0;
+  };
+
   std::vector<float> forward_chunk_(
       ContextId cid, const metal_compute::SharedBuffer& x, int n,
       const metal_compute::SharedBuffer* mrope_cos,
@@ -800,7 +838,9 @@ private:
       const std::vector<int>* tap_layers = nullptr,
       metal_compute::SharedBuffer* taps_out = nullptr,
       int key_valid_len = 0, int stop_after_layer = -1,
-      const DeepstackInject* deepstack = nullptr);
+      const DeepstackInject* deepstack = nullptr,
+      PrefillWindow* win = nullptr);
+
 
   // ---- Batched (N-branch parallel) decode --------------------------
   // VQA fanout: N branched contexts that share a prefix each decode one

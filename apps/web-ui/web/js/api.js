@@ -295,6 +295,12 @@ export const api = {
   setStageConfig:(id, sid, cfg) => req('PUT',
                        `/api/pipelines/${pid(id)}/stages/${pid(sid)}/config`,
                        cfg),
+  // A buffer-less command to a stage of a RUNNING pipeline
+  // (docs/STAGE-COMMANDS.md): resolves to {state, result} or
+  // {state, error} once the stage answers.
+  stageCommand: (id, sid, name, args) => req('POST',
+                       `/api/pipelines/${pid(id)}/stages/${pid(sid)}/command`,
+                       { name, args: args || {} }),
 
   // User I/O console + interactive getline.
   ioConsole:     (since)   => req('GET',

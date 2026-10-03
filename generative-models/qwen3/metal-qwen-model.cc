@@ -5290,6 +5290,82 @@ MetalQwenModel::forward_embeddings_taps(ContextId cid, const SharedBuffer& x,
   return taps;
 }
 
+std::vector<SharedBuffer>
+MetalQwenModel::forward_embeddings_taps_batch(
+    const std::vector<SharedBuffer*>& xs, const std::vector<int>& ns,
+    const std::vector<int>& tap_layers, int key_valid_len)
+{
+  const int H = _cfg.hidden;
+  const std::size_t B = xs.size();
+  if (B == 0 || ns.size() != B || tap_layers.empty()) { return {}; }
+  for (std::size_t b = 0; b < B; ++b) {
+    if (xs[b] == nullptr || ns[b] <= 0 ||
+        xs[b]->byte_size() < (std::size_t)ns[b] * H * 2) {
+      return {};
+    }
+  }
+  int stop = 0;
+  for (int t : tap_layers) { stop = std::max(stop, t); }
+  const int last = std::min(stop, _cfg.n_layers - 1);
+  // Streamed layers per group: each group is read once and run over the
+  // whole batch, so a wider group costs memory and saves nothing on the
+  // read -- it only means fewer windows per sequence.
+  int group = 2;
+  if (const char* e = std::getenv("VPIPE_QWEN_BATCH_LAYERS")) {
+    group = std::max(1, std::atoi(e));
+  }
+  std::vector<ContextId> cids(B);
+  std::vector<SharedBuffer> taps(B);
+  std::vector<PrefillWindow> wins(B);
+  for (std::size_t b = 0; b < B; ++b) {
+    cids[b] = _ctx->acquire_root();
+    taps[b] = _mc->make_shared_buffer((std::size_t)tap_layers.size() *
+                                      ns[b] * H * 2);
+  }
+  auto release = [&]() {
+    for (std::size_t b = 0; b < B; ++b) {
+      if (cids[b].valid()) { _ctx->release(cids[b]); }
+    }
+  };
+  for (std::size_t b = 0; b < B; ++b) {
+    if (!cids[b].valid() || taps[b].empty()) { release(); return {}; }
+  }
+  for (int L0 = 0; L0 <= last; ) {
+    const bool streamed = _stream_layers && L0 >= _pinned_layers;
+    int L1 = last + 1;
+    if (streamed) {
+      L1 = std::min(L0 + group, last + 1);
+      for (int L = L0; L < L1; ++L) {
+        if (!build_layer_(L)) {
+          for (int k = L0; k < L; ++k) { free_layer_(k); }
+          release();
+          return {};
+        }
+      }
+    } else if (_stream_layers) {
+      L1 = std::min(_pinned_layers, last + 1);   // the resident prefix
+    }
+    for (std::size_t b = 0; b < B; ++b) {
+      wins[b].begin = L0;
+      wins[b].end = L1;
+      SharedBuffer hidden;   // discarded, as in forward_embeddings_taps
+      forward_chunk_(cids[b], *xs[b], ns[b], nullptr, nullptr,
+                     /*verify_all=*/false, /*preds_out=*/nullptr,
+                     /*return_hidden=*/true, &hidden,
+                     /*allhidden_out=*/nullptr, &tap_layers, &taps[b],
+                     key_valid_len, stop, /*deepstack=*/nullptr, &wins[b]);
+    }
+    // forward_chunk_ waited for its command buffer, so the GPU is done
+    // with the group.
+    if (streamed) {
+      for (int L = L0; L < L1; ++L) { free_layer_(L); }
+    }
+    L0 = L1;
+  }
+  release();
+  return taps;
+}
+
 // Like forward_embeddings_taps but with 3-axis mROPE (position_ids [3*n],
 // row 0=T,1=H,2=W) -- for the image-aware multimodal prefill (Qwen-Image-Edit
 // conditioning): the DiT reads the LAST-layer hidden of a text+vision-spliced
@@ -5949,7 +6025,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
                                const std::vector<int>* tap_layers,
                                SharedBuffer* taps_out, int key_valid_len,
                                int stop_after_layer,
-                               const DeepstackInject* deepstack)
+                               const DeepstackInject* deepstack,
+                               PrefillWindow* win)
 {
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim, Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -5967,21 +6044,41 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   // the shapes are settled, and on a model that never turned i8 on.
   if (_i8) { _i8->tune_pending(_mc); }
 
-  // Reserve KV slots (chunked into pages), build the page table.
-  struct Chunk { std::size_t page_off; int slot; int src_off; int cnt; };
+  // Reserve KV slots (chunked into pages), build the page table. A
+  // WINDOW after a sequence's first reuses the slots its first reserved:
+  // appending again would lengthen the context by n per window.
+  using Chunk = PrefillChunk;
   std::vector<Chunk> chunks;
   int q_offset = -1;
-  for (int written = 0; written < n; ) {
-    const int cap = _ctx->next_append_capacity(cid);
-    const int cnt = std::min(n - written, cap);
-    ContextManager::AppendSlot s = _ctx->append(cid, cnt);
-    if (!s.valid()) { return {}; }
-    if (q_offset < 0) { q_offset = s.position; }
-    chunks.push_back({(std::size_t)s.page_id.v * _ctx->page_stride_bytes(),
-                      s.slot_offset, written, cnt});
-    written += cnt;
+  if (win != nullptr && win->reserved) {
+    chunks = win->chunks;
+    q_offset = win->q_offset;
+  } else {
+    for (int written = 0; written < n; ) {
+      const int cap = _ctx->next_append_capacity(cid);
+      const int cnt = std::min(n - written, cap);
+      ContextManager::AppendSlot s = _ctx->append(cid, cnt);
+      if (!s.valid()) { return {}; }
+      if (q_offset < 0) { q_offset = s.position; }
+      chunks.push_back({(std::size_t)s.page_id.v * _ctx->page_stride_bytes(),
+                        s.slot_offset, written, cnt});
+      written += cnt;
+    }
+    if (q_offset < 0) { q_offset = 0; }
+    if (win != nullptr) {
+      win->chunks = chunks;
+      win->q_offset = q_offset;
+      win->reserved = true;
+    }
   }
-  if (q_offset < 0) { q_offset = 0; }
+  // The layers this call runs, and whether it is the sequence's last
+  // window -- only that one finishes the pass (final norm, head, pulls).
+  const int L_begin = win != nullptr ? win->begin : 0;
+  const int L_end = win != nullptr ? std::min(win->end, c.n_layers)
+                                   : c.n_layers;
+  const bool last_window =
+      win == nullptr || L_end >= c.n_layers ||
+      (stop_after_layer >= 0 && L_end > stop_after_layer);
   const int page_tokens = _ctx->page_tokens();
   const int n_pages =
       _ctx->fill_page_table(cid, static_cast<std::int32_t*>(_pgtab.contents()));
@@ -6348,8 +6445,9 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
     const bool use_pset = (D == 256) && _prefill_set.ready();
 
     if (kLayerDump != nullptr) { tap(x, dbgEmbed, n * H); }
-    for (int L = 0; L < c.n_layers; ++L) {
-      if (_stream_layers && L >= _pinned_layers) {
+    for (int L = L_begin; L < L_end; ++L) {
+      // A window's caller holds the streamed layers resident itself.
+      if (_stream_layers && L >= _pinned_layers && win == nullptr) {
         // This layer's weights are not resident. Close the command buffer
         // FIRST: the dispatches already encoded still read the previous
         // layer's buffers, and freeing them under an open encoder frees
@@ -6943,7 +7041,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       if (stop_after_layer >= 0 && L >= stop_after_layer) { break; }
     }
 
-    if (verify_all && preds_out) {
+    if (!last_window) {
+      // A window before the sequence's last: the residual stream in `x`
+      // is the whole of what carries over.
+    } else if (verify_all && preds_out) {
       // MTP batched verify: final-norm ALL n rows, lm_head over the whole
       // [n, H] stack (steel GEMM M=n -> weights read ONCE for all drafts),
       // then a per-row argmax -> the per-position greedy predictions.
@@ -6997,7 +7098,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
     }
     // MTP prefix seed: final-norm ALL n positions into `ah` (the per-position
     // post-norm hiddens). Encoded in this same buffer so no extra round-trip.
-    if (allhidden_out) {
+    if (allhidden_out && last_window) {
       ah = buf((std::size_t)n * H);
       rms(x, 0, _final_ln, ah, 0, n, H);
     }

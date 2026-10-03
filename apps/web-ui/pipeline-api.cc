@@ -1534,6 +1534,72 @@ PipelineApi::h_get_stage_config_(const HttpRequest& req)
   return HttpResponse::json(200, o.to_json());
 }
 
+// POST /api/pipelines/:id/stages/:sid/command  {name, args?, timeout_ms?}
+//
+// A buffer-less command to a stage of a RUNNING pipeline (docs/STAGE-
+// COMMANDS.md), answered with what the stage replied. The stage is found
+// and the command posted under the lock; the wait for the reply is not,
+// since a command answered between training steps can take minutes, and
+// nothing but the command itself is touched after the lock is released.
+HttpResponse
+PipelineApi::h_stage_command_(const HttpRequest& req)
+{
+  auto body = parse_json_body(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "command body must be a JSON object");
+  }
+  auto bo = body->as_object();
+  const string name = bo.contains("name")
+                          ? string(bo.at("name").as_string(""))
+                          : string();
+  if (name.empty()) { return HttpResponse::error(400, "missing `name`"); }
+  FlexData args = bo.contains("args") ? bo.at("args") : FlexData();
+  if (!args.is_object()) { args = FlexData::make_object(); }
+  int timeout_ms = 300000;
+  if (bo.contains("timeout_ms")) {
+    timeout_ms = (int)std::clamp<long long>(
+        bo.at("timeout_ms").as_int(timeout_ms), 0, 3600000);
+  }
+  shared_ptr<StageCommand> cmd;
+  {
+    lock_guard<mutex> lk(_ctx.mu);
+    auto pit = req.params.find("id");
+    auto sit = req.params.find("sid");
+    Pipe* p = (pit != req.params.end()) ? find_(pit->second) : nullptr;
+    if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+    if (sit == req.params.end()) {
+      return HttpResponse::error(400, "missing stage id");
+    }
+    Stage* s = nullptr;
+    if (p->handle && p->handle->valid()) {
+      if (Pipeline* pl = live_pipeline(*p->handle)) {
+        for (auto it = pl->begin(); it != pl->end(); ++it) {
+          if (Stage* cs = dynamic_cast<Stage*>(*it)) {
+            if (cs->id() == sit->second) { s = cs; break; }
+          }
+        }
+      }
+    }
+    if (!s) { return HttpResponse::error(404, "no such running stage"); }
+    cmd = open_stage_command(*s, name, std::move(args), {});
+  }
+  const CommandState st = cmd->wait(timeout_ms);
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  oo.insert("state", fstr(string(command_state_name(st))));
+  if (st == CommandState::Replied) {
+    oo.insert("result", cmd->result());
+  } else {
+    oo.insert("error", fstr(st == CommandState::Pending ||
+                                    st == CommandState::Active
+                                ? string("no reply yet; the stage may "
+                                         "still be busy")
+                                : cmd->error()));
+  }
+  cmd->close();
+  return HttpResponse::json(200, o.to_json());
+}
+
 HttpResponse
 PipelineApi::h_set_stage_config_(const HttpRequest& req)
 {
@@ -1713,6 +1779,8 @@ PipelineApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_get_stage_config_(r); });
   s.route("PUT", "/api/pipelines/:id/stages/:sid/config",
           [this](const HttpRequest& r) { return h_set_stage_config_(r); });
+  s.route("POST", "/api/pipelines/:id/stages/:sid/command",
+          [this](const HttpRequest& r) { return h_stage_command_(r); });
 }
 
 }

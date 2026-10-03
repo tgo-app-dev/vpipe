@@ -2078,6 +2078,53 @@ function mountEditor(container, opts = {}) {
       fieldsWrap.append(field);
     }
     wrap.append(fieldsWrap);
+    // COMMANDS a running stage answers (docs/STAGE-COMMANDS.md): one
+    // button for each that needs no buffers and no required argument --
+    // train-lora's save and preview, say. A stopped pipeline has no stage
+    // to send them to, so they show only while it runs.
+    if (!editable && sp && Array.isArray(sp.commands)) {
+      const usable = sp.commands.filter((c) =>
+        !(c.in && c.in.length) && !(c.out && c.out.length) &&
+        !(c.args || []).some((a) => a.required));
+      if (usable.length) {
+        const result = el('div', { class: 'stage-desc' });
+        const row = el('div', { class: 'cmd-row' });
+        const show = (c, r) => {
+          if (r && r.state === 'replied') {
+            const parts = Object.entries(r.result || {}).map(([k, v]) =>
+              `${k}: ${typeof v === 'number' && !Number.isInteger(v)
+                ? v.toPrecision(4) : v}`);
+            result.textContent = t('pl.cmd_replied',
+              { name: c.name, result: parts.join(' · ') });
+          } else {
+            result.textContent = t('pl.cmd_failed',
+              { name: c.name, msg: (r && r.error) || (r && r.state) || '' });
+          }
+        };
+        for (const c of usable) {
+          const btn = el('button', {
+            class: 'btn ghost mini',
+            title: tOr(`cmd.${info.type}.${c.name}.doc`, c.doc || ''),
+            onclick: async () => {
+              btn.disabled = true;
+              result.textContent = t('pl.cmd_sent', { name: c.name });
+              try {
+                show(c, await api.stageCommand(state.selectedId,
+                                               state.selectedStage,
+                                               c.name, {}));
+              } catch (e) {
+                show(c, { state: 'failed', error: e.message });
+              } finally {
+                btn.disabled = false;
+              }
+            },
+          }, tOr(`cmd.${info.type}.${c.name}`, c.name));
+          row.append(btn);
+        }
+        wrap.append(el('div', { class: 'stage-type' }, t('pl.commands')),
+                    row, result);
+      }
+    }
     body.append(wrap);
     // Now that it is in the document and has a width to measure.
     layoutCfgColumns(body);

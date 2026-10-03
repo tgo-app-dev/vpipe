@@ -194,8 +194,25 @@ The two phases never coexist:
 
 | phase | holds |
 |---|---|
-| encode | the text encoder (resident if it fits, otherwise streamed layer by layer) and the VAE encoder |
+| encode | the text encoder (resident if it fits, otherwise streamed layer by layer and run over the captions in batches) and the VAE encoder |
 | train | the DiT (resident, or block-streamed when it does not fit), the step's activations, the adapter's state, the encoded cache; previews add a VAE decode |
+
+The encoders are released when their streams end, and the model loads
+only after that: training never starts beside a leftover encoder.
+
+**A text encoder that does not fit** (16 and 24 GB machines, for
+Qwen-Image-2.1's 16.7 GB encoder) streams its layers from disk. One
+caption at a time, that re-reads the whole encoder for every caption. So
+the conditioner holds a training dataset's captions back and encodes them
+32 at a time, layer by layer: each layer is read once and run over every
+caption in the batch. The conditioning is identical, bit for bit, to
+what the resident encoder produces. Measured:
+
+| machine | captions | one at a time | one batch |
+|---|---:|---:|---:|
+| M5 Pro 24 GB | 5 | 13.2 s | 3.2 s |
+| M5 Pro 24 GB | 10 | — | 5.7 s |
+| M5 MacBook Air 16 GB | 5 | 15.4 s | 4.0 s |
 
 Activations are the variable term. Measured for Qwen-Image-2.1, rank 16:
 
@@ -250,12 +267,34 @@ training run learns 98% of what bf16 does over the same steps.
 - **Metrics.** One beat per step on the metrics port: loss, learning rate,
   gradient norm and step time.
 
+### While it runs
+
+`train-lora` takes two commands between its optimizer steps:
+
+- **`save`** writes a checkpoint now, with its resume state, and emits
+  it on the checkpoints port as a scheduled one would be. The reply names
+  the file, the step and the mean loss since the last checkpoint.
+- **`preview`** samples the preview prompts now with the live adapter.
+  Optional arguments pick one prompt (`prompt`, from 0) and override
+  `steps`, `cfg` and `seed`.
+
+In the web UI they are buttons in the stage's panel while the pipeline
+runs. From Python:
+
+```python
+train = pipeline.stage("train")
+train.call("save")                       # {"path": ..., "step": ...}
+train.call("preview", args={"prompt": 0, "steps": 12})
+```
+
+A command sent while the dataset is still encoding is refused with the
+reason. One sent during a step is answered when the step ends.
+
 ## What is not supported yet
 
 - Edit-pair training: condition pictures plus an instruction.
 - Training the text encoder.
 - Adapter types other than LoRA.
-- A batched encode for a layer-streamed text encoder. Where the encoder
-  does not fit resident (16 GB machines), every caption re-reads it, so a
-  large set encodes slowly there. The cache means that cost is paid only
-  once per caption.
+- A batched encode for captions with reference pictures, or for families
+  other than Qwen-Image-2.1. Those encode one caption at a time on a
+  streamed encoder.

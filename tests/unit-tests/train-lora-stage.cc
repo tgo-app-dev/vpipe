@@ -20,12 +20,14 @@
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
+#include "pipeline/stage-command.h"
 #include "pipeline/typed-stage.h"
 #include "stages/optimizer-select-stage.h"
 #include "stages/train-lora-stage.h"
 #include "stages/training-dataset-stage.h"
 #include "generative-models/train/sample-cache.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +37,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -770,5 +773,193 @@ TEST(training_dataset, a_rerun_emits_only_what_is_not_cached)
   EXPECT_TRUE(s20.as_object().at("pictures").as_array().at(0).as_object()
                   .at("cached").as_bool(false));
   EXPECT_TRUE(m2o.at("null_cached").as_bool(false));
+  fs::remove_all(root);
+}
+
+// LIVE COMMANDS. A run takes `save` and `preview` between its steps: a
+// save before training starts is refused with the reason, then writes a
+// checkpoint mid-run and answers with it; a preview of one prompt emits
+// exactly one latent; a prompt that does not exist is refused.
+TEST(train_lora, save_and_preview_commands_serve_between_steps)
+{
+  const char* g = std::getenv("VPIPE_QWEN_IMAGE21_TRAIN_GOLDEN");
+  if (g == nullptr || *g == '\0') { return; }
+  const fs::path gd(g);
+  if (!fs::is_directory(gd / "train")) { return; }
+  const fs::path root = fs::temp_directory_path() / "vpipe-ut-train-cmds";
+  fs::remove_all(root);
+  fs::create_directories(root / "model");
+  fs::create_directory_symlink(gd / "train", root / "model" / "transformer");
+  const fs::path out = root / "out";
+
+  const int N = 2, TXT = 11, D = 256, C = 64, G = 8, STEPS = 400;
+  FlexData man = FlexData::make_object();
+  {
+    auto o = man.as_object();
+    o.insert_or_assign("kind", FlexData::make_string("training-manifest"));
+    o.insert_or_assign("trigger_word", FlexData::make_string("ohwx"));
+    FlexData arr = FlexData::make_array();
+    for (int i = 0; i < N; ++i) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert_or_assign("file", FlexData::make_string("s" +
+                                                        std::to_string(i)));
+      eo.insert_or_assign("repeats", FlexData::make_int(1));
+      FlexData caps = FlexData::make_array();
+      caps.as_array().push_back(FlexData::make_string("c"));
+      eo.insert_or_assign("captions", std::move(caps));
+      FlexData pics = FlexData::make_array();
+      FlexData po = FlexData::make_object();
+      po.as_object().insert_or_assign("w", FlexData::make_int(G * 16));
+      po.as_object().insert_or_assign("h", FlexData::make_int(G * 16));
+      pics.as_array().push_back(std::move(po));
+      eo.insert_or_assign("pictures", std::move(pics));
+      arr.as_array().push_back(std::move(e));
+    }
+    o.insert_or_assign("samples", std::move(arr));
+    FlexData pv = FlexData::make_array();
+    pv.as_array().push_back(FlexData::make_string("ohwx"));
+    pv.as_array().push_back(FlexData::make_string("ohwx at night"));
+    o.insert_or_assign("preview_prompts", std::move(pv));
+  }
+  std::mt19937 rng(9);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto cond = [&]() {
+    auto tb = std::make_unique<TensorBeatPayload>();
+    tb->dtype = TensorBeat::DType::Bf16;
+    tb->shape = {TXT, D};
+    tb->resize_contiguous((std::size_t)TXT * D);
+    auto* d = reinterpret_cast<std::uint16_t*>(tb->data.data());
+    for (int i = 0; i < TXT * D; ++i) {
+      float f = nd(rng);
+      std::uint32_t u;
+      std::memcpy(&u, &f, 4);
+      d[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+    return tb;
+  };
+  auto latent = [&]() {
+    auto tb = std::make_unique<TensorBeatPayload>();
+    tb->dtype = TensorBeat::DType::F32;
+    tb->shape = {C, G, G};
+    tb->resize_contiguous((std::size_t)C * G * G);
+    for (std::size_t i = 0; i < (std::size_t)C * G * G; ++i) {
+      tb->as_f32()[i] = nd(rng);
+    }
+    return tb;
+  };
+
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto src = [&](const char* id) {
+    auto u = std::make_unique<Beats>(&sess, id, std::vector<InEdge>{},
+                                     FlexData::make_object());
+    u->allocate_oports(1);
+    return static_cast<Beats*>(pl->insert_stage(std::move(u)));
+  };
+  Beats* conds = src("conds");
+  Beats* lats = src("lats");
+  Beats* mans = src("man");
+  for (int i = 0; i < N; ++i) {
+    conds->beats.push_back(cond());
+    lats->beats.push_back(latent());
+  }
+  conds->beats.push_back(cond());   // the empty prompt
+  conds->beats.push_back(cond());   // the two preview prompts
+  conds->beats.push_back(cond());
+  mans->beats.push_back(make_payload<FlexDataPayload>(man));
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert_or_assign("hf_dir", FlexData::make_string((root / "model")
+                                                           .string()));
+    o.insert_or_assign("output_dir", FlexData::make_string(out.string()));
+    o.insert_or_assign("name", FlexData::make_string("ut-cmd"));
+    o.insert_or_assign("rank", FlexData::make_int(4));
+    o.insert_or_assign("steps", FlexData::make_int(STEPS));
+    // No scheduled checkpoint before the end, and so no scheduled
+    // preview: what the previews port carries early is the command's.
+    o.insert_or_assign("save_every", FlexData::make_int(100000));
+    o.insert_or_assign("preview_steps", FlexData::make_int(2));
+    o.insert_or_assign("register", FlexData::make_bool(false));
+    o.insert_or_assign("resume", FlexData::make_string("never"));
+  }
+  const InEdge none{nullptr, 0};
+  std::vector<InEdge> in = {{conds, 0}, {lats, 0}, {mans, 0}, none, none};
+  auto tr_u = std::make_unique<TrainLoraStage>(&sess, "train", in, cfg);
+  ASSERT_TRUE(tr_u->config_error().empty());
+  if (!tr_u->config_error().empty()) { return; }
+  auto* tr = pl->insert_stage(std::move(tr_u));
+  Sink* sinks[2];
+  for (int p = 0; p < 2; ++p) {
+    auto s = std::make_unique<Sink>(&sess, "tsink" + std::to_string(p),
+                                    std::vector<InEdge>{{tr, (unsigned)p}},
+                                    FlexData::make_object());
+    sinks[p] = static_cast<Sink*>(pl->insert_stage(std::move(s)));
+  }
+  PipelineRuntime rt(pl.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+
+  // `save` until training has started: refused, with the reason, before.
+  FlexData saved;
+  int refused = 0;
+  for (int i = 0; i < 2000; ++i) {
+    auto c = open_stage_command(*tr, "save", FlexData::make_object(), {});
+    const CommandState st = c->wait(10000);
+    if (st == CommandState::Replied) {
+      saved = c->result();
+      break;
+    }
+    if (st == CommandState::Failed &&
+        c->error().find("not started") != std::string::npos) {
+      ++refused;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      continue;
+    }
+    std::printf("[train_lora] save: %s\n", c->error().c_str());
+    break;
+  }
+  ASSERT_TRUE(saved.is_object());
+  FlexData pr, bad;
+  {
+    FlexData a = FlexData::make_object();
+    a.as_object().insert_or_assign("prompt", FlexData::make_int(1));
+    auto c = open_stage_command(*tr, "preview", std::move(a), {});
+    if (c->wait(30000) == CommandState::Replied) { pr = c->result(); }
+    FlexData b = FlexData::make_object();
+    b.as_object().insert_or_assign("prompt", FlexData::make_int(5));
+    auto c2 = open_stage_command(*tr, "preview", std::move(b), {});
+    EXPECT_TRUE(c2->wait(30000) == CommandState::Failed);
+  }
+  rt.wait_idle();
+  rt.stop();
+
+  if (saved.is_object()) {
+    auto so = saved.as_object();
+    const int step = (int)so.at("step").as_int(-1);
+    const std::string path(so.at("path").as_string(""));
+    std::printf("[train_lora] save at step %d of %d ('%s'), %d refusals "
+                "before training\n", step, STEPS,
+                fs::path(path).filename().c_str(), refused);
+    EXPECT_TRUE(step >= 0 && step < STEPS);
+    EXPECT_TRUE(fs::exists(path));
+  }
+  ASSERT_TRUE(pr.is_object());
+  if (pr.is_object()) {
+    EXPECT_TRUE(pr.as_object().at("previews").as_int(0) == 1);
+  }
+  // The command's checkpoint and the final adapter; the command's
+  // preview (prompt 1 alone) and the final two.
+  EXPECT_TRUE(sinks[1]->got.size() == 2);
+  ASSERT_TRUE(sinks[0]->got.size() == 3);
+  {
+    const auto* tb =
+        dynamic_cast<const TensorBeatPayload*>(sinks[0]->got[0].get());
+    ASSERT_TRUE(tb != nullptr);
+    FlexData sb = tb->sideband;
+    EXPECT_TRUE(std::string(sb.as_object().at("prompt").as_string("")) ==
+                "ohwx at night");
+  }
+  EXPECT_TRUE(fs::exists(out / "ut-cmd.safetensors"));
   fs::remove_all(root);
 }

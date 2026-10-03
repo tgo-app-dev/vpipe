@@ -211,3 +211,94 @@ TEST(qwen_image_21_cond, bf16_encoder_streams_and_taps)
   // A dead tap reads as finite zeros, which is the failure this is for.
   EXPECT_TRUE(sum > 0.0);
 }
+
+// A BATCH, LAYER-MAJOR. Five sequences of different lengths through the
+// streamed encoder one at a time -- which re-reads the stack for each --
+// and then as one batch, which reads every layer once and runs it over
+// all five before the next. Each sequence has its own context, so the
+// batch must give each one EXACTLY the taps it gets alone: the same
+// kernels over the same rows, only the order of the work changes.
+TEST(qwen_image_21_cond, a_batch_reads_the_stack_once_and_matches_alone)
+{
+  const std::string dir = enc_dir_();
+  if (dir.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalQwenModel::Config cfg = encoder_config_(dir);
+  const char* nostream = std::getenv("VPIPE_QWEN_IMAGE21_ENC_NO_STREAM");
+  cfg.stream_layers = !(nostream != nullptr && *nostream != '\0');
+  auto m = MetalQwenModel::load(dir, mc, cfg);
+  Q21C_REQUIRE(m != nullptr);
+
+  auto wts = MetalLlamaWeights::open_model(dir);
+  Q21C_REQUIRE(wts.has_value());
+  SharedBuffer emb =
+      wts->load("model.language_model.embed_tokens.weight", mc);
+  Q21C_REQUIRE(!emb.empty());
+  const int H = cfg.hidden;
+  const std::vector<int> ns = {20, 48, 33, 7, 64};
+  const std::size_t B = ns.size();
+  // The embeddings, on the host: each run consumes its x.
+  std::vector<std::vector<std::uint8_t>> rows(B);
+  {
+    const auto* tbl = static_cast<const std::uint8_t*>(emb.contents());
+    for (std::size_t b = 0; b < B; ++b) {
+      rows[b].resize((std::size_t)ns[b] * H * 2);
+      for (int i = 0; i < ns[b]; ++i) {
+        const std::size_t id = (std::size_t)(500 + 131 * b + 29 * i);
+        std::memcpy(rows[b].data() + (std::size_t)i * H * 2,
+                    tbl + id * (std::size_t)H * 2, (std::size_t)H * 2);
+      }
+    }
+  }
+  emb = SharedBuffer{};
+  auto fresh = [&](std::size_t b) {
+    SharedBuffer x = mc->make_shared_buffer(rows[b].size());
+    std::memcpy(x.contents(), rows[b].data(), rows[b].size());
+    return x;
+  };
+  const std::vector<int> taps = {cfg.n_layers - 1};
+
+  // One at a time.
+  std::vector<std::vector<std::uint8_t>> alone(B);
+  ContextManager* cm = m->context_manager();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (std::size_t b = 0; b < B; ++b) {
+    SharedBuffer x = fresh(b);
+    const ContextId cid = cm->acquire_root();
+    SharedBuffer t = m->forward_embeddings_taps(cid, x, ns[b], taps);
+    cm->release(cid);
+    Q21C_REQUIRE(!t.empty());
+    const auto* p = static_cast<const std::uint8_t*>(t.contents());
+    alone[b].assign(p, p + (std::size_t)ns[b] * H * 2);
+  }
+  const double ms_alone = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+
+  // As one batch.
+  std::vector<SharedBuffer> xs;
+  std::vector<SharedBuffer*> xp;
+  for (std::size_t b = 0; b < B; ++b) { xs.push_back(fresh(b)); }
+  for (SharedBuffer& x : xs) { xp.push_back(&x); }
+  const auto t1 = std::chrono::steady_clock::now();
+  std::vector<SharedBuffer> got =
+      m->forward_embeddings_taps_batch(xp, ns, taps);
+  const double ms_batch = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t1).count();
+  Q21C_REQUIRE(got.size() == B);
+
+  std::size_t differ = 0;
+  for (std::size_t b = 0; b < B; ++b) {
+    Q21C_REQUIRE(got[b].byte_size() >= alone[b].size());
+    if (std::memcmp(got[b].contents(), alone[b].data(), alone[b].size()) !=
+        0) {
+      ++differ;
+    }
+  }
+  std::printf("[qwen_image_21_cond] %zu sequences (%s): one at a time "
+              "%.0f ms, one batch %.0f ms (%.1fx); %zu differ\n", B,
+              m->streaming_layers() ? "STREAMED" : "preloaded", ms_alone,
+              ms_batch, ms_alone / std::max(ms_batch, 1e-3), differ);
+  EXPECT_TRUE(differ == 0);
+}

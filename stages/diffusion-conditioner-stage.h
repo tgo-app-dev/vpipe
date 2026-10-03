@@ -211,6 +211,10 @@ private:
   // (see process()); sticky for the stage's life, like the load itself.
   bool            _resident_for_batch = false;
   bool            _allow_empty = false;
+  // A batch on a STREAMED encoder holds prompts back and encodes them
+  // layer-major, this many at a time (VPIPE_COND_BATCH).
+  std::vector<std::string> _pend;
+  int             _batch_max = 32;
   // The last model-config beat, held UNPARSED: which family reads it is
   // not known until the checkpoint resolves, and the two beats arrive on
   // different ports in either order.
@@ -364,6 +368,23 @@ private:
   metal_compute::SharedBuffer
   encode_(const std::string& text, const char* which, int& n_real,
           const metal_compute::SharedBuffer& vtok, int n_img) const;
+
+  // Qwen-Image-2.1: the template's ids for `text` and how many leading
+  // ones the reference drops (the system turn).
+  bool qi21_ids_(const std::string& text, int nref,
+                 std::vector<std::int32_t>* ids, int* drop) const;
+  // The encoder's input rows for `ids`, gathered from its embedding table.
+  metal_compute::SharedBuffer
+  embed_rows_(const std::vector<std::int32_t>& ids) const;
+  // The conditioning beat's Qwen-Image-2.1 sideband: the slot mask and
+  // each reference's latent grid.
+  static FlexData qi21_sideband_(const std::vector<std::uint8_t>& slots,
+                                 int nref, const std::vector<int>& grid_h,
+                                 const std::vector<int>& grid_w);
+  // The prompts held back from a batch on a streamed encoder, encoded in
+  // one layer-major pass and emitted in order.
+  bool batchable_() const;
+  Job flush_batch_(RuntimeContext& ctx);
 
   // Run the reference image through the family vision tower -> vision tokens,
   // sets n_img. QIE: Qwen2.5-VL, bf16 [n_img, 3584]. Krea-2 edit: Qwen3-VL,

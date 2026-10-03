@@ -23,6 +23,10 @@
 //
 // Outputs: preview latents at every checkpoint (for vae-decode), one beat
 // per saved checkpoint, and one metrics beat per step.
+//
+// Commands (docs/STAGE-COMMANDS.md): `save` writes a checkpoint now and
+// `preview` samples the preview prompts now, both between optimizer
+// steps, so a run can be inspected and kept without stopping it.
 
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
@@ -112,9 +116,11 @@ private:
   FlexData _opt_flex;
   std::string _trigger;
   std::string _base_ref;     // what hf_dir named, for the metadata
-  std::size_t _next_sample = 0;
   std::chrono::steady_clock::time_point _encode_t0;
   std::uint64_t _run = 0;    // training jobs finished (a sweep's count)
+
+  // Commands: `save` and `preview`, served between optimizer steps.
+  Job serve_commands_(RuntimeContext& ctx);
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // An entry with a cache key and no buffer lives in the cache only: it
@@ -179,6 +185,28 @@ private:
                metal_compute::SharedBuffer* scratch, std::string* err);
   // The held-out loss at fixed (sample, sigma, noise).
   bool validate_(double* loss, std::string* err);
+  // A checkpoint at this step, emitted on the checkpoints port; `*out`
+  // is its beat. `*err` says why when it fails.
+  Job checkpoint_(RuntimeContext& ctx, FlexData* out, std::string* err);
+  // The preview prompts (`which` < 0: all) with the live adapter, each
+  // latent emitted on the previews port; `*n` counts them.
+  Job previews_(RuntimeContext& ctx, int which, int steps, double cfg,
+                std::uint64_t seed, int* n, std::string* err);
+  int _saved_step = -1;
+  FlexData _last_checkpoint;
+
+  // The encode phase: every slot laid out from the manifest up front, and
+  // the ones the two encoders still owe, in their arrival order.
+  struct WantPic {
+    int sample = 0, pic = 0;
+    int ph = 0, pw = 0;      // the picture the latent must match
+    std::string file;
+  };
+  bool plan_encode_(std::string* err);
+  bool _encode_planned = false;
+  std::vector<int> _want_text;
+  std::vector<WantPic> _want_pic;
+  std::size_t _got_text = 0, _got_pic = 0;
   bool start_training_(std::string* err);
   bool save_(bool final_save, std::string* err);
   bool resume_(std::string* err);

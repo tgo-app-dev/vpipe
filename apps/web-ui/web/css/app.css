@@ -1156,6 +1156,11 @@ svg.graph.editable .port-grp.in.connected:hover .port-x { opacity: 1; }
   margin: 4px 0 10px;
 }
 .cfg .ro-note { color: var(--warn); font-size: 11px; margin: 4px 0 10px; }
+/* A running stage's commands (save, preview, ...): a row of buttons, the
+   last reply under it. */
+.cfg .cmd-row {
+  display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px;
+}
 /* One point below the shell's 13px: a configuration form is dense by
    nature and the fields read better tightened, in every dock. */
 .field { margin-bottom: 12px; font-size: 12px; }
