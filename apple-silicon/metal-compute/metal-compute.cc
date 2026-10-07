@@ -841,11 +841,26 @@ MetalCompute::pso_archive_stats() const noexcept
 namespace {
 thread_local int         t_wire_depth = 0;
 thread_local std::size_t t_wired      = 0;
+// The buffers this thread's open scopes wired and have not freed, by
+// contents pointer, and their total. Kept only while a scope is open: a
+// buffer freed after the outermost one closes was the load's to keep.
+thread_local std::unordered_map<const void*, std::size_t> t_live;
+thread_local std::size_t t_live_bytes = 0;
 }  // namespace
 
-WireOnAlloc::WireOnAlloc() noexcept : _start(t_wired) { ++t_wire_depth; }
+WireOnAlloc::WireOnAlloc() noexcept
+    : _start(t_wired), _start_live(t_live_bytes)
+{
+  ++t_wire_depth;
+}
 
-WireOnAlloc::~WireOnAlloc() { --t_wire_depth; }
+WireOnAlloc::~WireOnAlloc()
+{
+  if (--t_wire_depth == 0) {
+    t_live.clear();
+    t_live_bytes = 0;
+  }
+}
 
 bool
 WireOnAlloc::active() noexcept
@@ -854,15 +869,40 @@ WireOnAlloc::active() noexcept
 }
 
 void
-WireOnAlloc::note_wired(std::size_t bytes) noexcept
+WireOnAlloc::note_wired(const void* contents, std::size_t bytes) noexcept
 {
   t_wired += bytes;
+  try {
+    t_live[contents] = bytes;
+    t_live_bytes += bytes;
+  } catch (...) {
+    // Untracked, so neither live nor ever subtracted: an under-charge of
+    // one buffer, never a count that goes negative.
+  }
+}
+
+void
+WireOnAlloc::note_unwired(const void* contents) noexcept
+{
+  if (t_wire_depth == 0) { return; }
+  const auto it = t_live.find(contents);
+  if (it == t_live.end()) { return; }
+  t_live_bytes -= it->second;
+  t_live.erase(it);
 }
 
 std::size_t
 WireOnAlloc::wired_bytes() const noexcept
 {
   return t_wired - _start;
+}
+
+std::size_t
+WireOnAlloc::live_bytes() const noexcept
+{
+  // Clamped: an outer scope's buffer freed inside this one leaves the
+  // total below where this scope started.
+  return t_live_bytes > _start_live ? t_live_bytes - _start_live : 0;
 }
 
 SharedBuffer
@@ -941,7 +981,7 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   // pages are the heap's, shared with whatever else lives there.
   if (WireOnAlloc::active() && !from_heap &&
       byte_size >= WireOnAlloc::kMinBytes && out.set_wired(true)) {
-    WireOnAlloc::note_wired(byte_size);
+    WireOnAlloc::note_wired(out.contents(), byte_size);
   }
   pool->release();
   return out;

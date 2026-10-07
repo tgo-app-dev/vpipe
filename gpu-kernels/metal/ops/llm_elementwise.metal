@@ -2415,6 +2415,93 @@ kernel void copy_rect_f16(
   out[dst_off + r * dst_stride + c] = src[src_off + r * src_stride + c];
 }
 
+// ---- a key / value cache in 8 bits (TaoMate-H3's clean K/V) -------------
+//
+// Head-major planes [heads, rows, D], D a multiple of 64, stored as 8-bit
+// AFFINE groups of 64 along D: v ~= q * scale + min, q in [0, 255], a half
+// scale and a half minimum per group -- 1.0625 bytes an element against
+// bf16's 2. Affine rather than symmetric: a group of values or of rotated
+// keys need not straddle zero, and the minimum costs 3% more bytes for up
+// to twice the resolution on the ones that do not.
+//
+// quant: rows [src_row0, src_row0 + n) of a [heads, src_rows, D] plane ->
+//        q [heads, n, D], scale / minimum [heads, n, D / 64].
+// 0:src 1:q 2:scale 3:minimum 4:heads 5:n 6:D 7:src_rows 8:src_row0
+// One SIMD group a group of 64 (two elements a lane): grid heads*n*D/64*32.
+kernel void kv_quant_u8g64(
+    const device VPIPE_ELT* src      [[buffer(0)]],
+    device uchar*           q        [[buffer(1)]],
+    device half*            scale    [[buffer(2)]],
+    device half*            minimum  [[buffer(3)]],
+    constant int&           heads    [[buffer(4)]],
+    constant int&           n        [[buffer(5)]],
+    constant int&           D        [[buffer(6)]],
+    constant int&           src_rows [[buffer(7)]],
+    constant int&           src_row0 [[buffer(8)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const uint G = (uint)D / 64u;
+  const uint g = gid / 32u;                      // the same across a SIMD
+  if (g >= (uint)heads * (uint)n * G) { return; }
+  const uint gi = g % G;
+  const uint r = (g / G) % (uint)n;
+  const uint h = g / (G * (uint)n);
+  const ulong s = ((ulong)h * (uint)src_rows + (uint)src_row0 + r) *
+                      (uint)D + gi * 64u + lane * 2u;
+  const float a = (float)src[s], b = (float)src[s + 1];
+  const float mn = simd_min(min(a, b));
+  const float mx = simd_max(max(a, b));
+  // Quantized against the scale and minimum AS STORED, so the rounding of
+  // the two halves is inside the code, not on top of it.
+  const half sh = (half)((mx - mn) / 255.0f);
+  const half mh = (half)mn;
+  const float sf = (float)sh, mf = (float)mh;
+  const float inv = sf > 0.0f ? 1.0f / sf : 0.0f;
+  const ulong d = ((ulong)h * (uint)n + r) * (uint)D + gi * 64u + lane * 2u;
+  q[d]     = (uchar)clamp(rint((a - mf) * inv), 0.0f, 255.0f);
+  q[d + 1] = (uchar)clamp(rint((b - mf) * inv), 0.0f, 255.0f);
+  if (lane == 0) {
+    scale[g]   = sh;
+    minimum[g] = mh;
+  }
+}
+
+// dequant: rows [q_row0, q_row0 + n) of q [heads, q_rows, D] (its groups
+// [heads, q_rows, D / 64]) -> rows [dst_row0, ...) of a [heads, dst_rows, D]
+// plane. 0:q 1:scale 2:minimum 3:dst 4:heads 5:n 6:D 7:q_rows 8:q_row0
+// 9:dst_rows 10:dst_row0. Four elements a thread: grid heads*n*D/4.
+kernel void kv_dequant_u8g64(
+    const device uchar*     q        [[buffer(0)]],
+    const device half*      scale    [[buffer(1)]],
+    const device half*      minimum  [[buffer(2)]],
+    device VPIPE_ELT*       dst      [[buffer(3)]],
+    constant int&           heads    [[buffer(4)]],
+    constant int&           n        [[buffer(5)]],
+    constant int&           D        [[buffer(6)]],
+    constant int&           q_rows   [[buffer(7)]],
+    constant int&           q_row0   [[buffer(8)]],
+    constant int&           dst_rows [[buffer(9)]],
+    constant int&           dst_row0 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const uint per = (uint)D / 4u;
+  if (gid >= (uint)heads * (uint)n * per) { return; }
+  const uint c = (gid % per) * 4u;
+  const uint r = (gid / per) % (uint)n;
+  const uint h = gid / (per * (uint)n);
+  const ulong row = (ulong)h * (uint)q_rows + (uint)q_row0 + r;
+  const uchar4 v = *(const device uchar4*)(q + row * (uint)D + c);
+  const ulong g = row * ((uint)D / 64u) + c / 64u;
+  const float sf = (float)scale[g], mf = (float)minimum[g];
+  const ulong o = ((ulong)h * (uint)dst_rows + (uint)dst_row0 + r) *
+                      (uint)D + c;
+  dst[o]     = (VPIPE_ELT)((float)v.x * sf + mf);
+  dst[o + 1] = (VPIPE_ELT)((float)v.y * sf + mf);
+  dst[o + 2] = (VPIPE_ELT)((float)v.z * sf + mf);
+  dst[o + 3] = (VPIPE_ELT)((float)v.w * sf + mf);
+}
+
 // Diagnostic-only no-op carrying a REALISTIC dispatch arg load (8 read buffers
 // + 4 constants + 1 write), so VPIPE_GEMMA_DUMMY_DISP measures true per-launch
 // cost (arg-binding + command-processor setup + dependent-chain bubble) rather

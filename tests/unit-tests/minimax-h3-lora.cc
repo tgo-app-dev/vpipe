@@ -2405,3 +2405,99 @@ TEST(minimax_h3_lora, banded_qkv_is_the_block_diagonal_adapter)
                 tk_ms / reps, tk_ms / tb_ms);
   }
 }
+
+// A STREAMED DiT's adapter factors stream with their blocks: spilled to a
+// temp file at load and read back into one set of buffers per slot for the
+// streamed block, a promoted block taking a resident copy. The velocity is
+// the same, bit for bit, as with every factor held resident
+// (VPIPE_H3_LORA_RESIDENT=1) -- the same factors through the same kernels
+// -- on the first forward and the second (when residency has promoted
+// blocks); and the adapter holds a fraction of the GPU memory. TaoMate's
+// rank-128 adapter when VPIPE_H3_TAOMATE_LORA names it, else the Turbo LoRA.
+TEST(minimax_h3_lora, adapter_factors_stream_with_their_blocks)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const char* tm   = std::getenv("VPIPE_H3_TAOMATE_LORA");
+  const char* lp   = tm != nullptr && *tm != '\0'
+                         ? tm : std::getenv("VPIPE_MINIMAX_H3_TURBO_LORA");
+  if (root == nullptr || lp == nullptr || *root == '\0' || *lp == '\0') {
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    std::printf("[minimax_h3_lora] config: %s\n", cerr.c_str());
+    return;
+  }
+  cfg.n_layers = 4;
+  h3::PackedLayout L;
+  const std::vector<int> tags(8, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 2, 12, 20, 8, cfg.patch_h,
+                                        cfg.patch_w, h3::kAudioChannels,
+                                        {}, &L));
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 1.0f, &uniq, &row_idx);
+  const int n_video = (int)L.video_indices.size();
+  auto ramp = [](std::size_t n, float k) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k) * 0.5f;
+    }
+    return v;
+  };
+  const metal_compute::SharedBuffer vb = to_bf16_buf_(
+      mc, ramp((std::size_t)n_video * cfg.video_patch_elems(), 0.017f));
+  const metal_compute::SharedBuffer ab = to_bf16_buf_(
+      mc, ramp((std::size_t)L.num_audio_rows * cfg.audio_channels, 0.031f));
+  const metal_compute::SharedBuffer tb = to_bf16_buf_(
+      mc, ramp((std::size_t)tags.size() * cfg.text_dim, 0.005f));
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+  const auto kPin = MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32;
+  MetalMiniMaxH3Transformer::LoraSpec spec;
+  spec.path = lp;
+  spec.scale = 1.0f;
+
+  // Two forwards of one streamed load; the adapter's GPU bytes after it.
+  auto arm = [&](bool resident, std::vector<std::uint16_t>* f1,
+                 std::vector<std::uint16_t>* f2, std::size_t* bytes) {
+    if (resident) { ::setenv("VPIPE_H3_LORA_RESIDENT", "1", 1); }
+    else { ::unsetenv("VPIPE_H3_LORA_RESIDENT"); }
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, true, {spec});
+    ::unsetenv("VPIPE_H3_LORA_RESIDENT");
+    if (m == nullptr || m->lora_modules() == 0) { return false; }
+    m->set_gemm_route(kPin);
+    *bytes = m->lora_bytes();
+    for (std::vector<std::uint16_t>* out : {f1, f2}) {
+      MetalMiniMaxH3Transformer::Step step;
+      step.video = &vb;  step.audio = &ab;  step.text = &tb;
+      step.layout = &L;  step.timesteps = &uniq;
+      step.row_timestep_index = &row_idx;
+      std::string ferr;
+      const auto v = m->forward(step, &ferr);
+      if (v.empty()) {
+        std::printf("[minimax_h3_lora] forward: %s\n", ferr.c_str());
+        return false;
+      }
+      const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
+      const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+      out->assign(p, p + n);
+    }
+    return true;
+  };
+  std::vector<std::uint16_t> s1, s2, r1, r2;
+  std::size_t s_bytes = 0, r_bytes = 0;
+  ASSERT_TRUE(arm(false, &s1, &s2, &s_bytes));
+  ASSERT_TRUE(arm(true, &r1, &r2, &r_bytes));
+  int diff1 = 0, diff2 = 0;
+  for (std::size_t i = 0; i < s1.size(); ++i) { diff1 += s1[i] != r1[i]; }
+  for (std::size_t i = 0; i < s2.size(); ++i) { diff2 += s2[i] != r2[i]; }
+  std::printf("[minimax_h3_lora] streamed factors: %zu MB held vs %zu MB "
+              "resident (4 blocks); differing velocities %d / %d of %zu\n",
+              s_bytes >> 20, r_bytes >> 20, diff1, diff2, s1.size());
+  EXPECT_TRUE(diff1 == 0 && diff2 == 0);
+  EXPECT_TRUE(s_bytes < r_bytes);
+}

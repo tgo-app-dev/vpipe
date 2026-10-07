@@ -2,6 +2,7 @@
 #include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 
 #include "common/flex-data.h"
+#include "common/temp-root.h"
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/riffle-rows.h"
@@ -28,6 +29,9 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace vpipe {
 namespace genai {
@@ -1572,13 +1576,228 @@ MetalMiniMaxH3Transformer::lora_stack_(bool refiner, int layer,
 {
   LoraStack st;
   if (_s.lora.empty() || !_fn_gemm_acc.valid()) { return st; }
-  for (const LoraSlot& sl : _lora) {
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    const LoraSlot& sl = _lora[si];
     const std::vector<BlockLora>& v = refiner ? sl.refiner : sl.blocks;
     if (layer < 0 || (std::size_t)layer >= v.size()) { continue; }
-    st.add(v[(std::size_t)layer].*which, sl.scale,
-           _lora_scratch_rows * (std::size_t)sl.rank_prefix);
+    const LoraFactors* f = &(v[(std::size_t)layer].*which);
+    // Spilled (shape only): the streamed copy read in for this block.
+    if (f->empty() && f->rank > 0 && !refiner &&
+        layer == _lora_stream_layer && si < _lora_stream.size()) {
+      f = &(_lora_stream[si].*which);
+    }
+    st.add(*f, sl.scale, _lora_scratch_rows * (std::size_t)sl.rank_prefix);
   }
   return st;
+}
+
+// ---- adapter factors streamed with their block (see the header) ------
+
+MetalMiniMaxH3Transformer::SpillFile::~SpillFile()
+{
+  if (fd >= 0) { ::close(fd); }
+}
+
+namespace {
+
+bool
+pwrite_all(int fd, const void* p, std::size_t n, std::uint64_t off)
+{
+  const auto* c = static_cast<const char*>(p);
+  while (n > 0) {
+    const ssize_t w = ::pwrite(fd, c, n, (off_t)off);
+    if (w <= 0) { return false; }
+    c += w;
+    n -= (std::size_t)w;
+    off += (std::uint64_t)w;
+  }
+  return true;
+}
+
+bool
+pread_all(int fd, void* p, std::size_t n, std::uint64_t off)
+{
+  auto* c = static_cast<char*>(p);
+  while (n > 0) {
+    const ssize_t r = ::pread(fd, c, n, (off_t)off);
+    if (r <= 0) { return false; }
+    c += r;
+    n -= (std::size_t)r;
+    off += (std::uint64_t)r;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool
+MetalMiniMaxH3Transformer::spill_lora_()
+{
+  if (_lora.empty() || std::getenv("VPIPE_H3_LORA_RESIDENT") != nullptr) {
+    return false;
+  }
+  const std::string tmpl =
+      (temp_root() / "vpipe-h3-lora-XXXXXX").string();
+  std::vector<char> name(tmpl.begin(), tmpl.end());
+  name.push_back('\0');
+  const int fd = ::mkstemp(name.data());
+  if (fd < 0) { return false; }
+  ::unlink(name.data());   // gone with the descriptor, crash or not
+
+  std::vector<std::vector<BlockSpill>> at(_lora.size());
+  std::vector<BlockLora> stream(_lora.size());
+  std::uint64_t off = 0;
+  std::size_t spilled = 0;
+  // Into the file first, every slot and block; only then is anything
+  // freed, so a failed write leaves the model exactly as bound.
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    LoraSlot& sl = _lora[si];
+    at[si].resize(sl.blocks.size());
+    for (std::size_t L = 0; L < sl.blocks.size(); ++L) {
+      // A block resident now (pinned at load) keeps its factors.
+      if (L < _blocks.size() && !_blocks[L].qkv.empty()) { continue; }
+      for (std::size_t m = 0; m < std::size(kLoraMembers); ++m) {
+        const LoraFactors& f = sl.blocks[L].*kLoraMembers[m];
+        if (f.empty()) { continue; }
+        LoraSpillAt& w = at[si][L].*kSpillMembers[m];
+        w.a_off = off;
+        w.a_bytes = f.a.byte_size();
+        w.b_off = off + w.a_bytes;
+        w.b_bytes = f.b.byte_size();
+        if (!pwrite_all(fd, f.a.contents(), w.a_bytes, w.a_off) ||
+            !pwrite_all(fd, f.b.contents(), w.b_bytes, w.b_off)) {
+          ::close(fd);
+          return false;
+        }
+        off += w.a_bytes + w.b_bytes;
+        // The streamed set: one buffer pair per projection, the size of
+        // the largest block's.
+        LoraFactors& d = stream[si].*kLoraMembers[m];
+        if (d.a.byte_size() < w.a_bytes) {
+          d.a = _mc->make_shared_buffer(w.a_bytes);
+        }
+        if (d.b.byte_size() < w.b_bytes) {
+          d.b = _mc->make_shared_buffer(w.b_bytes);
+        }
+        if (d.a.empty() || d.b.empty()) {
+          ::close(fd);
+          return false;
+        }
+        ++spilled;
+      }
+    }
+  }
+  if (spilled == 0) {
+    ::close(fd);
+    return false;
+  }
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    for (std::size_t L = 0; L < _lora[si].blocks.size(); ++L) {
+      for (std::size_t m = 0; m < std::size(kLoraMembers); ++m) {
+        if ((at[si][L].*kSpillMembers[m]).a_bytes == 0) { continue; }
+        LoraFactors& f = _lora[si].blocks[L].*kLoraMembers[m];
+        f.a = metal_compute::SharedBuffer{};   // the shape stays
+        f.b = metal_compute::SharedBuffer{};
+      }
+    }
+  }
+  std::size_t held = 0;
+  for (const BlockLora& b : stream) {
+    for (auto m : kLoraMembers) {
+      held += (b.*m).a.byte_size() + (b.*m).b.byte_size();
+    }
+  }
+  _lora_spill_file.fd = fd;
+  _lora_spill = std::move(at);
+  _lora_stream = std::move(stream);
+  _lora_stream_layer = -1;
+  if (_mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: adapter factors stream with their "
+        "blocks -- {} MB spilled ({} projections), {} MB held for the "
+        "streamed block", off >> 20, spilled, held >> 20));
+  }
+  return true;
+}
+
+bool
+MetalMiniMaxH3Transformer::fill_lora_(int layer)
+{
+  if (_lora_spill_file.fd < 0 || layer == _lora_stream_layer) {
+    return true;
+  }
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    if ((std::size_t)layer >= _lora_spill[si].size()) { continue; }
+    const BlockLora& shape = _lora[si].blocks[(std::size_t)layer];
+    for (std::size_t m = 0; m < std::size(kLoraMembers); ++m) {
+      const LoraSpillAt& w =
+          _lora_spill[si][(std::size_t)layer].*kSpillMembers[m];
+      if (w.a_bytes == 0) { continue; }
+      LoraFactors& d = _lora_stream[si].*kLoraMembers[m];
+      const LoraFactors& f = shape.*kLoraMembers[m];
+      if (!pread_all(_lora_spill_file.fd, d.a.contents(), w.a_bytes,
+                     w.a_off) ||
+          !pread_all(_lora_spill_file.fd, d.b.contents(), w.b_bytes,
+                     w.b_off)) {
+        if (_mc->session() != nullptr) {
+          _mc->session()->error(fmt(
+              "MetalMiniMaxH3Transformer: adapter factors of block {} "
+              "could not be read back", layer));
+        }
+        _lora_stream_layer = -1;
+        return false;
+      }
+      d.rank = f.rank;
+      d.parts = f.parts;
+      d.group = f.group;
+    }
+  }
+  _lora_stream_layer = layer;
+  return true;
+}
+
+void
+MetalMiniMaxH3Transformer::keep_lora_(int layer)
+{
+  if (_lora_spill_file.fd < 0 || layer != _lora_stream_layer) { return; }
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    if ((std::size_t)layer >= _lora_spill[si].size()) { continue; }
+    for (std::size_t m = 0; m < std::size(kLoraMembers); ++m) {
+      const LoraSpillAt& w =
+          _lora_spill[si][(std::size_t)layer].*kSpillMembers[m];
+      if (w.a_bytes == 0) { continue; }
+      LoraFactors& f =
+          _lora[si].blocks[(std::size_t)layer].*kLoraMembers[m];
+      const LoraFactors& src = _lora_stream[si].*kLoraMembers[m];
+      metal_compute::SharedBuffer a = _mc->make_shared_buffer(w.a_bytes);
+      metal_compute::SharedBuffer b = _mc->make_shared_buffer(w.b_bytes);
+      if (a.empty() || b.empty()) { continue; }   // stays streamed
+      std::memcpy(a.contents(), src.a.contents(), w.a_bytes);
+      std::memcpy(b.contents(), src.b.contents(), w.b_bytes);
+      f.a = std::move(a);
+      f.b = std::move(b);
+    }
+  }
+}
+
+void
+MetalMiniMaxH3Transformer::drop_lora_(int layer)
+{
+  if (_lora_spill_file.fd < 0) { return; }
+  for (std::size_t si = 0; si < _lora.size(); ++si) {
+    if ((std::size_t)layer >= _lora_spill[si].size()) { continue; }
+    for (std::size_t m = 0; m < std::size(kLoraMembers); ++m) {
+      if ((_lora_spill[si][(std::size_t)layer].*kSpillMembers[m])
+              .a_bytes == 0) {
+        continue;
+      }
+      LoraFactors& f =
+          _lora[si].blocks[(std::size_t)layer].*kLoraMembers[m];
+      f.a = metal_compute::SharedBuffer{};
+      f.b = metal_compute::SharedBuffer{};
+    }
+  }
+  if (layer == _lora_stream_layer) { _lora_stream_layer = -1; }
 }
 
 MetalMiniMaxH3Transformer::LoraStack
@@ -1623,6 +1842,10 @@ MetalMiniMaxH3Transformer::lora_bytes() const
       }
     }
     n += fb(sl.final_adaln);
+  }
+  // ...and the set a streamed block's factors are read into.
+  for (const BlockLora& bl : _lora_stream) {
+    n += fb(bl.qkv) + fb(bl.out) + fb(bl.fc1) + fb(bl.fc2) + fb(bl.adaln);
   }
   return n;
 }
@@ -2792,6 +3015,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     }
     m->_lora.push_back(std::move(slot));
   }
+  // A streamed DiT's adapter factors stream with their blocks.
+  if (stream_blocks) { (void)m->spill_lora_(); }
   // The ff scratch can only shrink when NOTHING can present an unfused
   // fc1: streaming can, at any step, and so can a block whose interleave
   // failed to allocate. Asked of the blocks that exist rather than
@@ -4799,6 +5024,7 @@ MetalMiniMaxH3Transformer::evict_tail_block_()
     // counter honest without having to infer it from destructors.
     _wire.note_unwired(wire_block_(b, false));
     b = Block{};
+    drop_lora_(i);
     // Taking one out of the PINNED prefix un-pins it: that prefix was
     // sized at load against what the box was believed to hold, and a
     // measurement saying its pages are no longer in RAM is that belief
@@ -4847,8 +5073,10 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   //
   // The floor is a MINIMUM for the same reason: an arena that already
   // clears it is not a reason to reallocate.
+  // ...and a q|k|v scratch wide enough for a stream forward's staging.
+  const bool qkv_fits = _s.qkv.byte_size() >= _qkv_floor_elems * 2;
   if (_s.seq == seq && _s.n_text == n_text && _s.n_t >= n_t
-      && _s.attn.byte_size() >= arena_floor) {
+      && _s.attn.byte_size() >= arena_floor && qkv_fits) {
     return true;
   }
   // Under a floor (set_scratch_floor), a scratch that FITS is kept, and
@@ -4856,7 +5084,7 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   // longest forward pays for one allocation.
   if (_scratch_floor_seq > 0) {
     if (_s.seq >= seq && _s.n_text >= n_text && _s.n_t >= n_t &&
-        _s.attn.byte_size() >= arena_floor) {
+        _s.attn.byte_size() >= arena_floor && qkv_fits) {
       return true;
     }
     seq    = std::max(seq, _scratch_floor_seq);
@@ -4912,7 +5140,7 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   s.rsin = _mc->make_shared_buffer(S * rot_half * sizeof(float));
   s.x    = mk(S * H);
   s.nm   = mk(S * H);
-  s.qkv  = mk(S * 3 * I);
+  s.qkv  = mk(std::max(S * 3 * I, _qkv_floor_elems));
   // The arena, then five windows into it. subview() keeps the same
   // MTL::Buffer and carries the offset, so binding a window addresses
   // its slice with no copy -- and each window is CONTIGUOUS, which the
@@ -5673,6 +5901,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   }
   // ---- the streaming attention's preconditions ------------------------
   minimax_h3::StreamKv* const skv = in.stream_kv;
+  bool stage_in_qkv = false;
   const bool sattn = skv != nullptr;
   const bool stream_commit = sattn && in.stream_commit;
   minimax_h3::StreamKv::CommitPlan splan;
@@ -5697,12 +5926,30 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       return fail("streaming attention needs the steel flash kernel and "
                   "copy_rect_f16");
     }
-    if (!skv->ensure_staging(seq)) {
+    // Staging lives in the q|k|v scratch (StreamKv::adopt_staging) when
+    // nothing else writes that scratch inside the attention window -- the
+    // ANE's q|k|v rows land in it asynchronously -- else apart. A run
+    // names the width up front (set_scratch_floor); a forward only ever
+    // raises it.
+    stage_in_qkv = _ane_qkv == nullptr &&
+                   std::getenv("VPIPE_H3_STAGING_APART") == nullptr;
+    if (stage_in_qkv) {
+      _qkv_floor_elems =
+          std::max(_qkv_floor_elems, skv->staging_bytes(seq) / 2);
+    } else if (!skv->ensure_staging(seq)) {
       return fail("streaming attention: cannot allocate the K/V staging");
     }
     if (stream_commit) {
       std::string perr;
       if (!skv->plan_commit(n_text, n_audio, n_video, &splan, &perr)) {
+        return fail(perr);
+      }
+    }
+    // A cache on disk starts reading block 0's rows now, under everything
+    // the forward does before its first block.
+    {
+      std::string perr;
+      if (!skv->begin_forward(stream_commit ? &splan : nullptr, &perr)) {
         return fail(perr);
       }
     }
@@ -5730,6 +5977,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                           &vdn_arena);
   if (!ensure_scratch_(seq, n_text, n_t, vdn_arena)) {
     return fail("activation allocation failed (out of GPU memory)");
+  }
+  if (stage_in_qkv &&
+      !skv->adopt_staging(_s.qkv, skv->capacity() + seq)) {
+    return fail("streaming attention: the q|k|v scratch cannot hold the "
+                "K/V staging");
   }
   const auto p_scratch = PClock::now();
   // Re-arm growth for this forward. The per-forward flag is what stops
@@ -7315,6 +7567,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     };
 
     // ---- 3. the block stack ------------------------------------------
+    // A streaming attention whose cache is ON DISK reads block L's rows
+    // while the GPU runs block L - 1, so every block -- resident ones too
+    // -- is committed and waited for: that wait is what frees a slot for
+    // the next read and hands a clean forward's new rows to their file.
+    const bool kv_io = sattn && skv->on_disk();
     for (int Lx = 0; Lx < c.n_layers; ++Lx) {
       // Cooperative stop, checked EVERY block rather than only on the
       // streamed tail. The denoise loop already stops between steps, but
@@ -7513,6 +7770,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         }
       }
       const Block& b = streaming ? *bp : _blocks[(std::size_t)Lx];
+      // Its adapters' factors, spilled at load, read in beside it.
+      if (streaming && !fill_lora_(Lx)) { return {}; }
       // The modulation table for this block: [n_t, 6*H*3], which is the
       // same bytes as [n_t*3, 6*H] -- the layout `timestep_index * 3 +
       // tag` addresses. M is the number of DISTINCT timesteps, so this
@@ -7665,6 +7924,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       };
       ane_on_commit = streaming ? std::function<void()>(issue_prefetch)
                                 : std::function<void()>();
+      if (kv_io) {
+        std::string kerr;
+        if (!skv->acquire(Lx, &kerr)) { return fail(kerr); }
+      }
       bprobe = xprobe && Lx == 0;
       trip_blk = Lx;
       block(b, s.x, seq, true, Lx);
@@ -7688,7 +7951,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // an unwatched run, so this drops a diagnostic that was only
       // present when a bar happened to be attached rather than one
       // anything relied on.
-      if (streaming) {
+      if (streaming || kv_io) {
         enc.end();
         std::string blk_err;
         // Taken unconditionally: the query-tile probe charges this block's
@@ -7696,6 +7959,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // nothing beside the block.
         const auto gp0 = std::chrono::steady_clock::now();
         metal_compute::CommandStream::Fence fence = stream.commit();
+        // The cache's next block, into the slot block Lx - 1 used.
+        if (kv_io) { skv->prefetch(Lx + 1); }
         // Between the commit and the wait is the whole opportunity: the
         // GPU is busy with block Lx and this thread has nothing to do.
         //
@@ -7706,18 +7971,21 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // reads them, and a hidden read becomes read + compress +
         // decompress. Asked per block and never queued, so the moment it
         // stops being affordable the next iteration is serial again.
-        issue_prefetch();
+        if (streaming) { issue_prefetch(); }
         if (!fence.wait_ok(&blk_err)) {
           return fail("streamed block " + std::to_string(Lx) + ": " +
                       (blk_err.empty() ? std::string("GPU error") : blk_err));
         }
+        if (kv_io) { skv->layer_done(Lx); }
         const double blk_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - gp0).count();
-        if (sprof) { sp_gpu_ms += blk_ms; }
-        note_attn_tile_(blk_ms);
+        if (sprof && streaming) { sp_gpu_ms += blk_ms; }
+        if (streaming) { note_attn_tile_(blk_ms); }
         stream = _mc->make_command_stream();
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
+      }
+      if (streaming) {
         // The VDN branch follows the DiT, and HERE is the only place it
         // can: the commit above has been waited for, so nothing encoded
         // still points at this block's branch buffers. On the resident
@@ -7767,6 +8035,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
               // sized for a streaming run and blocks below this one may
               // still be unfused), so the two paths coexist.
               if (_fuse_ff) { interleave_gu_(_blocks[(std::size_t)Lx].fc1); }
+              // Its adapters' factors stay with it.
+              keep_lora_(Lx);
               // Wired LAST, after every write this block will ever get:
               // mlock pins the pages that exist now, and interleave_gu_
               // above replaces buffers outright.
@@ -7789,6 +8059,20 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             }
           }
         }
+      }
+    }
+
+    // Every read and write of the cache's files, joined: a clean
+    // forward's chunk is whole on disk before finish_commit names it.
+    if (kv_io) {
+      std::string kerr;
+      if (!skv->end_forward(&kerr)) { return fail(kerr); }
+      if (_mc->session() != nullptr) {
+        const minimax_h3::StreamKv::IoStats io = skv->io_stats();
+        _mc->session()->log_debug(fmt(
+            "MetalMiniMaxH3Transformer: stream K/V from disk -- {} rows, "
+            "{} MB read, {} MB written, {:.0f} ms waited for reads",
+            s_rows, io.read >> 20, io.written >> 20, io.wait_ms));
       }
     }
 

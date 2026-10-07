@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 
 #include <cstdint>
 #include <functional>
@@ -229,6 +230,12 @@ struct RunConfig {
   // OTHER slot is set to.
   int   lora_slot  = 0;
   float lora_scale = 1.0f;
+  // Where the clean-K/V cache lives (kv_storage below): on disk, a layer
+  // read ahead of the attention, or -- `kv_disk` false -- all of it on the
+  // GPU, upstream's own. `kv_bits` 8 stores it in affine 8-bit groups of
+  // 64 (disk only); 16 keeps the bf16 the forwards compute.
+  bool  kv_disk    = true;
+  int   kv_bits    = 16;
   // Progress in forwards (done, total); return false to stop.
   std::function<bool(int done, int total)> progress;
   // One line per milestone of the run, for the host's log.
@@ -247,7 +254,10 @@ struct RunResult {
   int audio_latents = 0;
   int forwards = 0;              // teacher + chunk + commit
   bool stopped = false;
-  std::size_t kv_bytes = 0;      // what the clean-KV cache held
+  std::size_t kv_bytes = 0;      // what the clean-KV cache held in memory
+  std::size_t kv_disk_peak = 0;  // the most its files held
+  std::size_t kv_read = 0;       // what the forwards read back
+  std::size_t kv_written = 0;    // and what the commits wrote
 };
 
 // Rows the clean-KV cache must hold for this canvas over a run of any
@@ -256,10 +266,19 @@ struct RunResult {
 int kv_capacity_rows(int latent_h, int latent_w);
 int max_chunk_seq(int latent_h, int latent_w, int max_text);
 
-// What a run holds on the GPU besides the model: the clean-KV cache and
-// its staging, for `layers` blocks of `heads` x `head_dim`.
+// The cache's storage for this canvas: on disk, its slots sized for the
+// most rows a layer's committed chunks take as stored (chunk 0 whole, its
+// audio kept in its file after it ages, beside the two largest others)
+// and the largest chunk a commit adds.
+StreamKv::Storage kv_storage(int latent_h, int latent_w, bool disk,
+                             int bits);
+
+// What a run holds on the GPU besides the model: the clean-KV cache (or
+// its two slots) and what its staging adds to the DiT's scratch, for
+// `layers` blocks of `heads` x `head_dim`.
 std::size_t kv_cache_bytes(int latent_h, int latent_w, int max_text,
-                           int layers, int heads, int head_dim);
+                           int layers, int heads, int head_dim,
+                           const StreamKv::Storage& st);
 
 // Run the method over `requests` on `dit`, whose slot `cfg.lora_slot`
 // holds the TaoMate adapter. False with a reason on failure; a STOP

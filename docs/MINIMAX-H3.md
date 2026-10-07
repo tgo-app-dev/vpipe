@@ -2220,34 +2220,63 @@ it was trained for, and kept only for comparison.
   schedule the adapter was distilled at. Text-to-audio-video only: keyframe
   and reference inputs are ignored, with a warning.
 
-#### Memory: the cache is the cost
+#### Memory: the cache lives on disk
 
-The cache is bf16 keys and values for every one of the 50 blocks, so it grows
-with the canvas, not with the clip:
+The cache is keys and values for every one of the 50 blocks, so it grows
+with the canvas, not with the clip — and in memory it is the run's largest
+allocation by far:
 
-| canvas | clean-K/V cache |
-|---|---|
-| 864 × 480 | ~18 GB |
-| 1376 × 768 | ~46 GB |
-| 1920 × 1088 | ~90 GB |
+| canvas | in memory (bf16) | on disk, 8-bit |
+|---|---|---|
+| 864 × 480 | ~18 GB | ~9.3 GB |
+| 1376 × 768 | ~46 GB | ~24 GB |
+| 1920 × 1088 | ~90 GB | ~46 GB |
 
-On a 64 GB Mac that makes **480p** the size that fits beside the 8-bit
-checkpoint; 768p wants a 128 GB machine. The cache is allocated before the
-first forward and counted in the same preflight as the activations, so a box
-that cannot hold it is told so before anything runs.
+A forward reads each block's cached rows exactly once, in block order, which
+is the access a file serves best. So by default the cache is **on disk**:
+each committed chunk is a file of its own (under vpipe's temp root,
+`VPIPE_TMPDIR`, unlinked as it is made), written once by the commit that made
+it and dropped whole when the cache lets the chunk go. A forward reads block
+L's rows into one of two GPU slots while the GPU runs block L − 1, uncached;
+what the run holds beside the model is those two slots — **~0.5 GB** in 8 bits
+at 832 × 480, ~1 GB in bf16. The preflight counts the slots, not the cache.
+
+`taomate_kv` on the model-config stage says where it lives:
+
+- **`auto`** (the default): on disk, in **8 bits** when `i8_gemm` is on —
+  affine groups of 64 along each head, about half the bytes to write and read
+  back — else in bf16;
+- **`bf16`** / **`int8`**: on disk at that width. bf16 on disk gives exactly
+  the numbers of `memory` (the same bytes, moved through files); 8 bits
+  moved a three-block DiT's velocities by 0.3% (relative L2), under the ~0.6%
+  bf16 itself sits from upstream's reference at two blocks;
+- **`memory`**: upstream's way, the whole cache in RAM. No disk traffic — but
+  on a Mac without the room, the compressor takes the cache between forwards
+  and every forward pays to bring it back.
+
+The disk traffic, MEASURED at 832 × 480 in 8 bits: the files peak at 9.3 GB;
+a 5-second request writes 10.8 GB and reads 77 GB back (at 8–12 GB/s on an
+M5 Pro's internal SSD, under the GPU's work).
 
 #### How long it takes
 
-MEASURED on a Mac mini M4 Pro, 64 GB, the 8-bit FL2VA checkpoint preloaded
-from an external SSD, 864 × 480:
+MEASURED on a MacBook Pro M5 Pro, 24 GB, the bf16 FL2VA checkpoint streamed
+(16 of its 50 blocks resident), `i8_gemm` on, 832 × 480, one request:
 
 | | forwards a request | per forward |
 |---|---|---|
-| soundtrack (base model, audio only) | 9 | 3.2 s |
-| video (4 chunks × 3 steps + a commit) | 16 | 37 s |
+| soundtrack (base model, audio only) | 9 | 3.4 s |
+| video (4 chunks × 3 steps + a commit) | 16 | 7.9 s |
 
-So **about 10½ minutes per 5 seconds** of video on that machine, and a 10-second
-clip took 28 minutes from launch to file, loads and decodes included.
+So **about 3½ minutes per 5 seconds** of video there, decode included
+(denoise 161 s, decode 33 s). With the cache in memory the same run took 10
+minutes 42 seconds: 34.5 s a chunk forward, with ~10 GB compressed and 3 GB of
+swap.
+
+On a Mac mini M4 Pro, 64 GB, the 8-bit checkpoint preloaded from an external
+SSD at 864 × 480 (the cache in memory): 3.2 s a soundtrack forward, 37 s a
+chunk forward — about 10½ minutes per 5 seconds, and a 10-second clip 28
+minutes from launch to file.
 
 #### How it was verified
 
@@ -2261,6 +2290,15 @@ and a chunk read through a cache that has already been trimmed.
 `tools/dump_taomate_h3_host_golden.py` does the same for the chunk plans, the
 positions on the clip's timeline, the schedules and the noise. Those match
 exactly, apart from one soundtrack sigma that is a float32 ulp off.
+
+What that does **not** cover is a whole clip against its prompt: the forward
+comparison holds two blocks to upstream's, not fifty, and no clip has been
+compared with one upstream's runtime made. It matters, because one has been
+seen to stray. On an M5 Pro at 832 × 480, "a fox trotting through snow at
+dawn, birdsong" came out as a husky in a sunlit pine forest on all three seeds
+tried — the cache in memory or on disk, bf16 or 8-bit — where the base model
+with lightx2v's 4-step LoRA drew the fox at dawn. Whether that is the method
+or this port is not known yet.
 
 #### Not ported (yet)
 

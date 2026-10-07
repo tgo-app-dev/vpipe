@@ -650,7 +650,12 @@ TEST(minimax_h3_taomate, forwards_match_upstream)
 // every 12 requests -- and the lazy way it is applied here: the rows
 // stay in the buffer until the next commit compacts them, and the
 // gather skips them meanwhile. Synthetic, exact: every key is the small
-// integer fwd * 32 + row, which bf16 holds exactly.
+// integer fwd * 32 + row (plus its column mod 8), which bf16 holds
+// exactly.
+//
+// The same forwards run through each storage: in memory (upstream's
+// layout), on disk in bf16 -- the same staging to the bit -- and on disk
+// in 8 bits, within a step of its groups' range (7 / 255).
 #include "apple-silicon/metal-compute/command-stream.h"
 
 TEST(minimax_h3_taomate, stream_kv_retains_and_drops_audio)
@@ -661,10 +666,7 @@ TEST(minimax_h3_taomate, stream_kv_retains_and_drops_audio)
   metal_compute::ComputeFunction copy_rect =
       mc->load_library("llm_elementwise_bf16").function("copy_rect_f16");
   ASSERT_TRUE(copy_rect.valid());
-  const int H = 2, D = 4;
-  minimax_h3::StreamKv kv;
-  std::string err;
-  ASSERT_TRUE(kv.init(mc, 1, H, D, 40, &err));
+  const int H = 2, D = 64;
 
   auto bf = [](float f) {
     std::uint32_t u;
@@ -677,91 +679,269 @@ TEST(minimax_h3_taomate, stream_kv_retains_and_drops_audio)
     std::memcpy(&f, &u, 4);
     return f;
   };
-  // One "forward": its head-major keys/values, gathered, then (maybe)
-  // committed. Returns the staging keys of head 1, column 3, per row.
-  auto step = [&](int fwd, int n_text, int audio, int video, bool commit,
-                  std::vector<float>* staged) {
-    const int seq = n_text + audio + video;
-    metal_compute::SharedBuffer k =
-        mc->make_shared_buffer((std::size_t)H * seq * D * 2);
-    metal_compute::SharedBuffer v =
-        mc->make_shared_buffer((std::size_t)H * seq * D * 2);
-    auto* kp = static_cast<std::uint16_t*>(k.contents());
-    auto* vp = static_cast<std::uint16_t*>(v.contents());
-    for (int h = 0; h < H; ++h) {
-      for (int r = 0; r < seq; ++r) {
-        for (int d = 0; d < D; ++d) {
-          kp[((std::size_t)h * seq + r) * D + d] = bf((float)(fwd * 32 + r));
-          vp[((std::size_t)h * seq + r) * D + d] = bf((float)(fwd * 32 + r));
+
+  auto exercise = [&](const minimax_h3::StreamKv::Storage& st,
+                      const char* name, float tol) {
+    minimax_h3::StreamKv kv;
+    std::string err;
+    ASSERT_TRUE(kv.init(mc, 1, H, D, 40, st, &err));
+    // One "forward": its head-major keys/values, gathered, then (maybe)
+    // committed. Returns the staging keys of head 1, column 3, per row.
+    auto step = [&](int fwd, int n_text, int audio, int video, bool commit,
+                    std::vector<float>* staged) {
+      const int seq = n_text + audio + video;
+      metal_compute::SharedBuffer k =
+          mc->make_shared_buffer((std::size_t)H * seq * D * 2);
+      metal_compute::SharedBuffer v =
+          mc->make_shared_buffer((std::size_t)H * seq * D * 2);
+      auto* kp = static_cast<std::uint16_t*>(k.contents());
+      auto* vp = static_cast<std::uint16_t*>(v.contents());
+      for (int h = 0; h < H; ++h) {
+        for (int r = 0; r < seq; ++r) {
+          for (int d = 0; d < D; ++d) {
+            const float x = (float)(fwd * 32 + r + d % 8);
+            kp[((std::size_t)h * seq + r) * D + d] = bf(x);
+            vp[((std::size_t)h * seq + r) * D + d] = bf(x);
+          }
+        }
+      }
+      if (!kv.ensure_staging(seq)) { return false; }
+      minimax_h3::StreamKv::CommitPlan plan;
+      if (commit && !kv.plan_commit(n_text, audio, video, &plan, &err)) {
+        return false;
+      }
+      if (!kv.begin_forward(commit ? &plan : nullptr, &err)) { return false; }
+      if (!kv.acquire(0, &err)) { return false; }
+      const int SR = kv.rows() + seq;
+      {
+        metal_compute::CommandStream cs = mc->make_command_stream();
+        metal_compute::ComputeEncoder enc = cs.begin_compute();
+        kv.encode_gather(enc, copy_rect, 0, k, v, seq);
+        if (commit) { kv.encode_commit(enc, copy_rect, 0, plan, seq); }
+        enc.end();
+        std::string gerr;
+        if (!cs.commit().wait_ok(&gerr)) { return false; }
+      }
+      kv.layer_done(0);
+      if (!kv.end_forward(&err)) { return false; }
+      if (staged != nullptr) {
+        staged->clear();
+        const auto* s =
+            static_cast<const std::uint16_t*>(kv.staging_k().contents());
+        for (int r = 0; r < SR; ++r) {
+          staged->push_back(fl(s[((std::size_t)1 * SR + r) * D + 3]));
+        }
+      }
+      if (commit) { kv.finish_commit(plan); }
+      return true;
+    };
+    auto same = [&](const std::vector<float>& got,
+                    const std::vector<float>& want) {
+      bool ok = got.size() == want.size();
+      for (std::size_t i = 0; ok && i < got.size(); ++i) {
+        ok = std::fabs(got[i] - want[i]) <= tol;
+      }
+      if (!ok) {
+        std::printf("[stream_kv %s] got", name);
+        for (float x : got) { std::printf(" %g", x); }
+        std::printf("\n");
+      }
+      return ok;
+    };
+    // Three chunks, [text 2 | audio a | video v] each.
+    ASSERT_TRUE(step(1, 2, 4, 6, true, nullptr));
+    ASSERT_TRUE(step(2, 2, 3, 5, true, nullptr));
+    EXPECT_TRUE(kv.rows() == 10 + 8);                 // both whole
+    ASSERT_TRUE(step(3, 2, 2, 4, true, nullptr));
+    // From three on: chunk 0 aged to its video, the two latest whole.
+    EXPECT_TRUE(kv.commits() == 3);
+    EXPECT_TRUE(kv.rows() == 6 + 8 + 6);
+    EXPECT_TRUE(kv.audio_rows() == 3 + 2);
+    if (st.disk) {
+      // A file a chunk, a layer's record each: chunk 0's audio is still
+      // in its file, skipped.
+      EXPECT_TRUE(kv.disk_bytes() > 0);
+    }
+
+    // The reset. Nothing moves; the gather simply stops seeing audio.
+    EXPECT_TRUE(kv.drop_audio() == 5);
+    EXPECT_TRUE(kv.rows() == 6 + 5 + 4);
+    std::vector<float> s;
+    ASSERT_TRUE(step(4, 2, 1, 2, false, &s));
+    std::vector<float> want;
+    for (int r = 6; r < 12; ++r) { want.push_back((float)(1 * 32 + r + 3)); }
+    for (int r = 5; r < 10; ++r) { want.push_back((float)(2 * 32 + r + 3)); }
+    for (int r = 4; r < 8; ++r) { want.push_back((float)(3 * 32 + r + 3)); }
+    for (int r = 0; r < 5; ++r) { want.push_back((float)(4 * 32 + r + 3)); }
+    EXPECT_TRUE(same(s, want));
+
+    // A commit after the reset compacts: [chunk 0 video | chunk 2 video
+    // (its audio gone) | the new chunk's audio and video].
+    ASSERT_TRUE(step(4, 2, 1, 2, true, nullptr));
+    EXPECT_TRUE(kv.commits() == 3);
+    EXPECT_TRUE(kv.rows() == 6 + 4 + 3);
+    EXPECT_TRUE(kv.audio_rows() == 1);
+    ASSERT_TRUE(step(5, 1, 1, 1, false, &s));
+    want.clear();
+    for (int r = 6; r < 12; ++r) { want.push_back((float)(1 * 32 + r + 3)); }
+    for (int r = 4; r < 8; ++r) { want.push_back((float)(3 * 32 + r + 3)); }
+    for (int r = 2; r < 5; ++r) { want.push_back((float)(4 * 32 + r + 3)); }
+    for (int r = 0; r < 3; ++r) { want.push_back((float)(5 * 32 + r + 3)); }
+    EXPECT_TRUE(same(s, want));
+    // A retained set past the capacity is refused, not overflowed.
+    minimax_h3::StreamKv::CommitPlan p;
+    EXPECT_FALSE(kv.plan_commit(1, 20, 20, &p, &err));
+    if (st.disk) {
+      const minimax_h3::StreamKv::IoStats io = kv.io_stats();
+      std::printf("[stream_kv %s] last forward read %zu bytes\n", name,
+                  io.read);
+    }
+  };
+
+  exercise({}, "memory", 0.0f);
+  minimax_h3::StreamKv::Storage disk;
+  disk.disk = true;
+  disk.slot_rows = 60;
+  disk.new_rows = 20;
+  exercise(disk, "disk bf16", 0.0f);
+  disk.bits = 8;
+  exercise(disk, "disk 8-bit", 7.0f / 255.0f);
+}
+
+// ---- the storages, through the DiT ---------------------------------------
+//
+// Request 0's four chunks -- a denoising forward and the commit each --
+// through a DiT cut to three blocks, the cache in memory, on disk in
+// bf16, and on disk in 8 bits. On disk in bf16 is the same bytes moved
+// through files, so its velocities must be the memory cache's TO THE BIT;
+// 8 bits within a small relative distance. Resident blocks and streamed
+// ones both: a cache on disk makes either path wait for every block.
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (the FL2VA dir).
+TEST(minimax_h3_taomate, stream_kv_storages_agree_through_the_dit)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr));
+  cfg.n_layers = 3;
+  const int lh = 4, lw = 6;          // six patches a latent frame
+  const int fr = (lh / 2) * (lw / 2);
+  const int n_text = 12;
+  const std::vector<int> tags((std::size_t)n_text, minimax_h3::kTextTag);
+  auto ramp = [](std::size_t n, float k, float phase) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = std::sin((float)i * k + phase) * 0.7f;
+    }
+    return v;
+  };
+  const metal_compute::SharedBuffer text = bf16_buf_tm(
+      mc, ramp((std::size_t)n_text * cfg.text_dim, 0.005f, 0.0f));
+  ASSERT_TRUE(!text.empty());
+  const tmh::Plan plan = tmh::request_plan(0);
+
+  // Every chunk's denoising velocity (video rows, bf16), in order.
+  using Vel = std::vector<std::vector<std::uint16_t>>;
+  auto chunks = [&](MetalMiniMaxH3Transformer& m,
+                    const minimax_h3::StreamKv::Storage& st, Vel* out,
+                    std::size_t* read) {
+    minimax_h3::StreamKv kv;
+    std::string err;
+    if (!kv.init(mc, cfg.n_layers, cfg.n_heads, cfg.head_dim,
+                 tmh::kv_capacity_rows(lh, lw), st, &err)) {
+      std::printf("[stream_kv dit] init: %s\n", err.c_str());
+      return false;
+    }
+    *read = 0;
+    for (const tmh::Phase& ph : plan.phases) {
+      minimax_h3::PackedLayout L;
+      if (!tmh::build_chunk_layout(tags, ph, lh, lw, n_text, 0, 0, &L)) {
+        return false;
+      }
+      const std::size_t nv =
+          (std::size_t)ph.video_latents() * fr * cfg.video_patch_elems();
+      const std::size_t na = (std::size_t)minimax_h3::kAudioChannels *
+                             ph.audio_latents() * cfg.audio_channels;
+      const metal_compute::SharedBuffer vb =
+          bf16_buf_tm(mc, ramp(nv, 0.013f, (float)ph.index));
+      const metal_compute::SharedBuffer ab =
+          bf16_buf_tm(mc, ramp(na, 0.029f, (float)ph.index));
+      for (bool commit : {false, true}) {
+        std::vector<float> uniq;
+        std::vector<int> ri;
+        const float t = commit ? 1.0f : 0.6f;
+        minimax_h3::build_row_timesteps(L, t, t, 1.0f, &uniq, &ri, 1.0f);
+        MetalMiniMaxH3Transformer::Step s;
+        s.video = &vb;
+        s.audio = &ab;
+        s.text = &text;
+        s.layout = &L;
+        s.timesteps = &uniq;
+        s.row_timestep_index = &ri;
+        s.stream_kv = &kv;
+        s.stream_commit = commit;
+        std::string ferr;
+        const MetalMiniMaxH3Transformer::Velocity v = m.forward(s, &ferr);
+        if (v.empty()) {
+          std::printf("[stream_kv dit] forward: %s\n", ferr.c_str());
+          return false;
+        }
+        *read += kv.io_stats().read;
+        if (!commit) {
+          const auto* g =
+              static_cast<const std::uint16_t*>(v.video.contents());
+          out->emplace_back(g, g + nv);
         }
       }
     }
-    if (!kv.ensure_staging(seq)) { return false; }
-    minimax_h3::StreamKv::CommitPlan plan;
-    if (commit && !kv.plan_commit(n_text, audio, video, &plan, &err)) {
-      return false;
-    }
-    const int SR = kv.rows() + seq;
-    {
-      metal_compute::CommandStream st = mc->make_command_stream();
-      metal_compute::ComputeEncoder enc = st.begin_compute();
-      kv.encode_gather(enc, copy_rect, 0, k, v, seq);
-      if (commit) { kv.encode_commit(enc, copy_rect, 0, plan, seq); }
-      enc.end();
-      std::string gerr;
-      if (!st.commit().wait_ok(&gerr)) { return false; }
-    }
-    if (staged != nullptr) {
-      staged->clear();
-      const auto* s =
-          static_cast<const std::uint16_t*>(kv.staging_k().contents());
-      for (int r = 0; r < SR; ++r) {
-        staged->push_back(fl(s[((std::size_t)1 * SR + r) * D + 3]));
-      }
-    }
-    if (commit) { kv.finish_commit(plan); }
     return true;
   };
-  // Three chunks, [text 2 | audio a | video v] each.
-  ASSERT_TRUE(step(1, 2, 4, 6, true, nullptr));
-  ASSERT_TRUE(step(2, 2, 3, 5, true, nullptr));
-  EXPECT_TRUE(kv.rows() == 10 + 8);                 // both whole
-  ASSERT_TRUE(step(3, 2, 2, 4, true, nullptr));
-  // From three on: chunk 0 aged to its video, the two latest whole.
-  EXPECT_TRUE(kv.commits() == 3);
-  EXPECT_TRUE(kv.rows() == 6 + 8 + 6);
-  EXPECT_TRUE(kv.audio_rows() == 3 + 2);
+  auto rel = [](const std::vector<std::uint16_t>& a,
+                const std::vector<std::uint16_t>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      std::uint32_t ua = (std::uint32_t)a[i] << 16;
+      std::uint32_t ub = (std::uint32_t)b[i] << 16;
+      float fa, fb;
+      std::memcpy(&fa, &ua, 4);
+      std::memcpy(&fb, &ub, 4);
+      num += ((double)fa - fb) * ((double)fa - fb);
+      den += (double)fb * fb;
+    }
+    return den > 0.0 ? std::sqrt(num / den) : 1.0;
+  };
 
-  // The reset. Nothing moves; the gather simply stops seeing audio.
-  EXPECT_TRUE(kv.drop_audio() == 5);
-  EXPECT_TRUE(kv.rows() == 6 + 5 + 4);
-  std::vector<float> s;
-  ASSERT_TRUE(step(4, 2, 1, 2, false, &s));
-  std::vector<float> want;
-  for (int r = 6; r < 12; ++r) { want.push_back((float)(1 * 32 + r)); }
-  for (int r = 5; r < 10; ++r) { want.push_back((float)(2 * 32 + r)); }
-  for (int r = 4; r < 8; ++r) { want.push_back((float)(3 * 32 + r)); }
-  for (int r = 0; r < 5; ++r) { want.push_back((float)(4 * 32 + r)); }
-  EXPECT_TRUE(s == want);
-
-  // A commit after the reset compacts: [chunk 0 video | chunk 2 video
-  // (its audio gone) | the new chunk's audio and video].
-  ASSERT_TRUE(step(4, 2, 1, 2, true, nullptr));
-  EXPECT_TRUE(kv.commits() == 3);
-  EXPECT_TRUE(kv.rows() == 6 + 4 + 3);
-  EXPECT_TRUE(kv.audio_rows() == 1);
-  ASSERT_TRUE(step(5, 1, 1, 1, false, &s));
-  want.clear();
-  for (int r = 6; r < 12; ++r) { want.push_back((float)(1 * 32 + r)); }
-  for (int r = 4; r < 8; ++r) { want.push_back((float)(3 * 32 + r)); }
-  for (int r = 2; r < 5; ++r) { want.push_back((float)(4 * 32 + r)); }
-  for (int r = 0; r < 3; ++r) { want.push_back((float)(5 * 32 + r)); }
-  EXPECT_TRUE(s == want);
-  if (s != want) {
-    for (float x : s) { std::printf("%g ", x); }
-    std::printf("\n");
+  for (bool streamed : {false, true}) {
+    auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, streamed, {});
+    ASSERT_TRUE(m != nullptr);
+    if (!m) { return; }
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    minimax_h3::StreamKv::Storage disk =
+        tmh::kv_storage(lh, lw, true, 16);
+    Vel mem, d16, d8;
+    std::size_t r0 = 0, r16 = 0, r8 = 0;
+    ASSERT_TRUE(chunks(*m, {}, &mem, &r0));
+    ASSERT_TRUE(chunks(*m, disk, &d16, &r16));
+    disk.bits = 8;
+    ASSERT_TRUE(chunks(*m, disk, &d8, &r8));
+    ASSERT_TRUE(mem.size() == 4 && d16.size() == 4 && d8.size() == 4);
+    for (std::size_t c = 0; c < mem.size(); ++c) {
+      const double r = rel(d8[c], mem[c]);
+      std::printf("[stream_kv dit] %s blocks, chunk %zu: bf16 on disk %s, "
+                  "8-bit rel-L2 %.5f\n", streamed ? "streamed" : "resident",
+                  c, d16[c] == mem[c] ? "bit-identical" : "DIFFERS", r);
+      EXPECT_TRUE(d16[c] == mem[c]);
+      // Chunk 0 attends to no cache: its velocity cannot move at all.
+      if (c == 0) { EXPECT_TRUE(d8[c] == mem[c]); }
+      EXPECT_TRUE(r < 0.02);
+    }
+    // Something was read back from disk, and half as much in 8 bits.
+    std::printf("[stream_kv dit] read back: bf16 %zu, 8-bit %zu bytes\n",
+                r16, r8);
+    EXPECT_TRUE(r16 > 0 && r8 > 0 && r8 < r16);
   }
-  // A retained set past the capacity is refused, not overflowed.
-  minimax_h3::StreamKv::CommitPlan p;
-  EXPECT_FALSE(kv.plan_commit(1, 20, 20, &p, &err));
 }

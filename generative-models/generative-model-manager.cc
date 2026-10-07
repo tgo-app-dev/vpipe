@@ -13,9 +13,6 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 
-#include <libproc.h>
-#include <sys/resource.h>
-#include <unistd.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -286,19 +283,6 @@ GenerativeModelManager::wired_pool_device_max() const
 }
 
 namespace {
-
-// This process's wired memory, as the kernel counts it (mlock'd pages
-// included); 0 when it will not say.
-std::size_t
-process_wired_bytes()
-{
-  rusage_info_v4 ri{};
-  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4,
-                      reinterpret_cast<rusage_info_t*>(&ri)) != 0) {
-    return 0;
-  }
-  return static_cast<std::size_t>(ri.ri_wired_size);
-}
 
 // The bytes of wired-model records whose model is gone, those records
 // dropped. A template, not a method: a private method of the manager is
@@ -1849,12 +1833,20 @@ GenerativeModelManager::load(const LoadSpec& spec)
   // also what lets a WireOnAlloc scope on this thread see every buffer the
   // load makes (load_spec::kWireWeights).
   const bool wire = bag::flag(spec.extra, load_spec::kWireWeights);
-  const std::size_t wired_before = wire ? process_wired_bytes() : 0;
   shared_ptr<LoadedLanguageModel> lm;
+  std::size_t wired = 0, wired_tmp = 0;
   {
     std::optional<metal_compute::WireOnAlloc> scope;
     if (wire) { scope.emplace(); }
     lm = build();
+    if (scope) {
+      // What THIS load wired and still holds, counted on this thread --
+      // not the process's wired size before and after, which also takes
+      // in whatever a concurrently initializing peer wired or unwired
+      // meanwhile (wire-on-alloc.h).
+      wired = scope->live_bytes();
+      wired_tmp = scope->wired_bytes() - wired;
+    }
   }
   if (!lm) {
     if (session()) {
@@ -1868,18 +1860,17 @@ GenerativeModelManager::load(const LoadSpec& spec)
   // theirs back to the kernel -- is charged to the pool while it lives, so
   // every model sizing its resident set plans around it.
   if (wire) {
-    const std::size_t now = process_wired_bytes();
-    const std::size_t bytes = now > wired_before ? now - wired_before : 0;
-    charge_external_wired(bytes);
+    charge_external_wired(wired);
     {
       lock_guard<mutex> lk(_warm_mu);
-      _wired_lms.push_back(Wired{lm, bytes});
+      _wired_lms.push_back(Wired{lm, wired});
     }
     if (session()) {
       session()->info(fmt(
           "GenerativeModelManager::load('{}'): {} MB wired as it loaded "
-          "(the compressor cannot take it; charged to the wired pool)",
-          key.hf_dir, bytes >> 20));
+          "(the compressor cannot take it; charged to the wired pool; {} MB "
+          "of load temporaries wired and freed)",
+          key.hf_dir, wired >> 20, wired_tmp >> 20));
     }
   }
 

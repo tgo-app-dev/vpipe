@@ -24,7 +24,13 @@
 // was: unwired, exactly as without a scope. Freeing a wired buffer unwires
 // it in the kernel, so a temporary made inside the scope costs nothing past
 // its life. Whoever opens a scope accounts for what it wired (the
-// generative model manager charges it to the wired pool).
+// generative model manager charges it to the wired pool), and live_bytes()
+// is the figure to charge: what THIS THREAD's scope wired and has not
+// freed. Not the process's wired size before and after -- every stage
+// initializes concurrently, so that delta also takes in whatever a peer
+// wires or unwires meanwhile (a DiT's residency, an arena) -- and not
+// wired_bytes() either, which still counts the load's temporaries
+// (MEASURED 1.6-2.2 GB of them on a Qwen3.5-4B load).
 //
 // INTERNAL: not installed and not exported (libvpipe is hidden by default).
 // It is a host's load-time policy, not something a plugin calls.
@@ -42,16 +48,22 @@ public:
 
   // A scope is open on this thread (they nest).
   static bool active() noexcept;
-  // make_shared_buffer's report of a buffer it wired.
-  static void note_wired(std::size_t bytes) noexcept;
+  // make_shared_buffer's report of a buffer it wired, by its contents.
+  static void note_wired(const void* contents, std::size_t bytes) noexcept;
+  // A wired buffer's teardown, where it unlocks: one an open scope on this
+  // thread wired stops counting as live.
+  static void note_unwired(const void* contents) noexcept;
   // What this scope wired, freed buffers included.
   std::size_t wired_bytes() const noexcept;
+  // What this scope wired that is still alive: what a load leaves held.
+  std::size_t live_bytes() const noexcept;
 
   // The smallest buffer worth a syscall: the wired pool's own minimum.
   static constexpr std::size_t kMinBytes = 64 * 1024;
 
 private:
   std::size_t _start;
+  std::size_t _start_live;
 };
 
 }  // namespace vpipe::metal_compute

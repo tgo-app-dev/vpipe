@@ -2771,7 +2771,8 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // scratch can. MEASURED on the M4 Pro 64 GB at 864x480: 33 GB of
   // weights, a 21 GB cache and the scratch over a 48 GB recommended
   // working set ran every chunk forward at 37 s, its compute-bound time,
-  // with 2.8 GB of swap; the working-set test alone had refused it.
+  // with 2.8 GB of swap; the working-set test alone had refused it. With
+  // the cache on disk (`taomate_kv`, the default) this is its two slots.
   const std::size_t need = gpu_need + ane + pageable;
 
   // THE TWO GATES, WITH THEIR MARGINS SPELLED OUT HERE rather than left
@@ -3576,13 +3577,32 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
   int R = 1;
   while (tmh::kRequestFrames + (R - 1) * steady < _frames) { ++R; }
   const int native = tmh::kRequestFrames + (R - 1) * steady;
+  // Where the cache lives (minimax-h3-model-config's `taomate_kv`): on
+  // disk unless asked otherwise, in 8 bits where the GEMMs already are.
+  std::string kv_mode = "auto";
+  if (_model_cfg.is_object()) {
+    const auto o = _model_cfg.as_object();
+    if (o.contains("taomate_kv")) {
+      kv_mode = std::string(o.at("taomate_kv").as_string("auto"));
+    }
+  }
+  const bool kv_disk = kv_mode != "memory";
+  const int kv_bits =
+      kv_mode == "int8" || (kv_mode == "auto" && c.i8_gemm) ? 8 : 16;
+  const genai::minimax_h3::StreamKv::Storage kv_st =
+      tmh::kv_storage(lh, lw, kv_disk, kv_bits);
   const std::size_t kv = tmh::kv_cache_bytes(lh, lw, text_rows, c.n_layers,
-                                             c.n_heads, c.head_dim);
+                                             c.n_heads, c.head_dim, kv_st);
   session()->info(fmt(
       "GenerateVideoStage('{}'): TaoMate-H3 -- {} request(s) of 5 s, {} "
       "native frames at {}x{}; base-model audio teacher, then 4 chunks x "
-      "(3 steps + a commit) a request; clean-K/V cache {} MB{}",
-      this->id(), R, native, _width, _height, kv >> 20,
+      "(3 steps + a commit) a request; clean-K/V cache {}{}",
+      this->id(), R, native, _width, _height,
+      kv_disk ? fmt("on disk ({}), {} MB held for it", kv_bits == 8
+                                                          ? "8-bit"
+                                                          : "bf16",
+                    kv >> 20)()
+              : fmt("in memory, {} MB", kv >> 20)(),
       _steps > 0 && _steps != 3
           ? fmt("; `steps` {} does not apply (the method is 3 a chunk)",
                 _steps)()
@@ -3619,6 +3639,8 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
   rc.latent_w = lw;
   rc.audio_seed = _seed;
   rc.lora_slot = slot;
+  rc.kv_disk = kv_disk;
+  rc.kv_bits = kv_bits;
   rc.lora_scale = slot < (int)_h3_lora.size()
                       ? (float)_h3_lora[(std::size_t)slot].scale
                       : 1.0f;
@@ -3664,9 +3686,11 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
   *audio_shape = {h3::kAudioChannels, AC, alat};
   session()->info(fmt(
       "GenerateVideoStage('{}'): TaoMate-H3 done -- {} forwards, video "
-      "[{}, {}, {}, {}], audio {} latents, cache peak {} MB", this->id(),
-      res.forwards, ZC, res.video_latents, lh, lw, alat,
-      res.kv_bytes >> 20));
+      "[{}, {}, {}, {}], audio {} latents, cache {} MB in memory{}",
+      this->id(), res.forwards, ZC, res.video_latents, lh, lw, alat,
+      res.kv_bytes >> 20,
+      kv_disk ? fmt(", {} MB on disk at most", res.kv_disk_peak >> 20)()
+              : std::string()));
   return true;
 }
 

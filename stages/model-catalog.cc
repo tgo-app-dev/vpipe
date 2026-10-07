@@ -284,8 +284,7 @@ builtin_catalog_()
     // the MTP draft head text-chat decodes with (its `mtp`, on by
     // default), and optiq_vision.safetensors, the vision tower. A
     // whole-repo fetch (no `files`), so the recursive tree walk brings
-    // the subdir along. 20.7 GB in all: the assistant Valtz offers on a
-    // 24 GB Mac.
+    // the subdir along. 20.7 GB in all.
     {.family = "Qwen", .version = "3.8", .param_class = "27B",
      .variant = "MLX OptiQ 4-bit (mlx-community)",
      .hf_path = "mlx-community/Qwen3.8-27B-OptiQ-4bit",
@@ -1057,6 +1056,35 @@ builtin_catalog_()
            "taeqi2_1_decoder.pth",
            "taeqi2_1_decoder.pth"}}),
      .name = "madebyollin/taeqi2_1"},
+    // Qwen-Image-2.1's PROMPT REWRITERS: QwenLM's own instructions for
+    // turning a request into a prompt (text-to-image) or an edit
+    // instruction, for an assistant model to follow -- text, not weights,
+    // used by a host's prompt enhancer. Under the Qwen Research
+    // License: NON-COMMERCIAL use only, so a host fetches them on the
+    // user's request instead of shipping them; the LICENSE comes along.
+    // Published in the model's GitHub repo, so fetched by URL, PINNED to
+    // a commit: an instruction set that changed underneath would change
+    // every prompt written with it.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "prompt",
+     .variant = "prompt rewriters (QwenLM, non-commercial)",
+     .hf_path = "QwenLM/Qwen-Image-2.1",
+     .model_type = "qwen-image-21-rewriter",
+     .files = {"system_prompt_t2i.txt", "system_prompt_edit.txt",
+               "LICENSE"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/"
+           "7307809d2c9d582be700a1b9b04d393fc9cdf865/prompt_rewrite/"
+           "prompts/system_prompt_t2i.txt",
+           "system_prompt_t2i.txt"},
+          {"https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/"
+           "7307809d2c9d582be700a1b9b04d393fc9cdf865/prompt_rewrite/"
+           "prompts/system_prompt_edit.txt",
+           "system_prompt_edit.txt"},
+          {"https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/"
+           "7307809d2c9d582be700a1b9b04d393fc9cdf865/LICENSE",
+           "LICENSE"}}),
+     .name = "QwenLM/Qwen-Image-2.1-rewriters"},
     // Viggle's few-step distillation of Qwen-Image-2.1, applied as a
     // RUNTIME LoRA (qwen-image-21-model-config `lora`), with no CFG.
     // The adapter reaches past the blocks -- the shared modulation and

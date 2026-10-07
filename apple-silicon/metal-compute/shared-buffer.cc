@@ -1,4 +1,5 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "apple-silicon/metal-compute/wire-on-alloc.h"
 
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
@@ -195,6 +196,8 @@ SharedBuffer::teardown_() noexcept
         round_up_to_page_(_byte_size, page_size);
     ::munlock(_contents, unlock_size);
     _wired = false;
+    // A load's temporary, wired as it was made: no longer the load's.
+    WireOnAlloc::note_unwired(_contents);
   }
   if (_buf != nullptr) {
     if (_accounted) {

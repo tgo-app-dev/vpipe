@@ -439,13 +439,38 @@ max_chunk_seq(int latent_h, int latent_w, int max_text)
   return max_text + max_chunk_rows_((latent_h / 2) * (latent_w / 2));
 }
 
+StreamKv::Storage
+kv_storage(int latent_h, int latent_w, bool disk, int bits)
+{
+  StreamKv::Storage st;
+  st.disk = disk;
+  st.bits = disk ? bits : 16;
+  if (disk) {
+    const int fr = (latent_h / 2) * (latent_w / 2);
+    const Plan first = request_plan(0);
+    st.slot_rows = chunk_rows_(first.phases[0], fr) +
+                   2 * max_chunk_rows_(fr, true);
+    st.new_rows = max_chunk_rows_(fr);
+  }
+  return st;
+}
+
 std::size_t
 kv_cache_bytes(int latent_h, int latent_w, int max_text, int layers,
-               int heads, int head_dim)
+               int heads, int head_dim, const StreamKv::Storage& st)
 {
-  return StreamKv::bytes_for(layers, heads, head_dim,
-                             kv_capacity_rows(latent_h, latent_w),
-                             max_chunk_seq(latent_h, latent_w, max_text));
+  // The staging lives in the DiT's q|k|v scratch, which the preflight
+  // counts already ([seq, 3 * inner]); only what it needs beyond that is
+  // the cache's.
+  const int seq = max_chunk_seq(latent_h, latent_w, max_text);
+  const std::size_t all =
+      StreamKv::bytes_for(layers, heads, head_dim,
+                          kv_capacity_rows(latent_h, latent_w), seq, st);
+  const std::size_t qkv = (std::size_t)seq * 3 * heads * head_dim * 2;
+  const std::size_t staging =
+      2 * (std::size_t)heads * head_dim * 2 *
+      (std::size_t)(kv_capacity_rows(latent_h, latent_w) + seq);
+  return all - std::min(staging, qkv);
 }
 
 bool
@@ -548,8 +573,17 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
     return true;
   };
 
-  // The scratch for the longest forward of the run, kept for all of them.
-  dit->set_scratch_floor(max_chunk_seq(lh, lw, max_text), max_text);
+  // The scratch for the longest forward of the run, kept for all of them
+  // -- its q|k|v part wide enough to hold the K/V staging too, which
+  // lives there (StreamKv::adopt_staging) instead of beside it.
+  {
+    const std::size_t row = (std::size_t)c.n_heads * c.head_dim * 2;
+    const std::size_t staging =
+        2 * row * (std::size_t)(kv_capacity_rows(lh, lw) +
+                                max_chunk_seq(lh, lw, max_text));
+    dit->set_scratch_floor(max_chunk_seq(lh, lw, max_text), max_text,
+                           staging / 2);
+  }
   struct ScratchFloorReset {
     MetalMiniMaxH3Transformer* d;
     ~ScratchFloorReset() { d->set_scratch_floor(0, 0); }
@@ -563,7 +597,22 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
   } scale_reset{dit, cfg.lora_slot, scale0};
 
   // One forward. `vrows` may be empty (the teacher); the commit wants no
-  // velocity back.
+  // velocity back. The rows go up through two buffers kept for the run --
+  // grown, never reallocated per forward (each is read by the forward
+  // that is waited for before the next upload).
+  SharedBuffer vb_keep, ab_keep;
+  auto upload = [&](const std::vector<float>& rows, SharedBuffer& keep,
+                    SharedBuffer* view) -> bool {
+    const std::size_t n = rows.size() * 2;
+    if (keep.byte_size() < n) {
+      keep = SharedBuffer{};
+      keep = mc->make_shared_buffer(n);
+      if (keep.empty()) { return false; }
+    }
+    *view = keep.subview(0, n);
+    upload_(rows, *view);
+    return !view->empty();
+  };
   auto forward = [&](const PackedLayout& L, const Request& q,
                      const std::vector<float>& vrows,
                      const std::vector<float>& arows, float t_video,
@@ -571,15 +620,11 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
                      bool commit, std::vector<float>* vel_video,
                      std::vector<float>* vel_audio) -> bool {
     SharedBuffer vb, ab;
-    if (!vrows.empty()) {
-      vb = mc->make_shared_buffer(vrows.size() * 2);
-      if (vb.empty()) { return fail("taomate: video upload allocation"); }
-      upload_(vrows, vb);
+    if (!vrows.empty() && !upload(vrows, vb_keep, &vb)) {
+      return fail("taomate: video upload allocation");
     }
-    if (!arows.empty()) {
-      ab = mc->make_shared_buffer(arows.size() * 2);
-      if (ab.empty()) { return fail("taomate: audio upload allocation"); }
-      upload_(arows, ab);
+    if (!arows.empty() && !upload(arows, ab_keep, &ab)) {
+      return fail("taomate: audio upload allocation");
     }
     std::vector<float> uniq;
     std::vector<int> ri;
@@ -596,6 +641,11 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
     st.stream_commit = commit;
     std::string ferr;
     MetalMiniMaxH3Transformer::Velocity v = dit->forward(st, &ferr);
+    if (kv != nullptr && kv->on_disk()) {
+      const StreamKv::IoStats io = kv->io_stats();
+      out->kv_read += io.read;
+      out->kv_written += io.written;
+    }
     if (v.empty()) {
       if (ferr == "stopped") {
         out->stopped = true;
@@ -627,16 +677,26 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
   StreamKv kv;
   {
     std::string kerr;
+    // Its staging is not made here: the forwards carve it out of the
+    // DiT's q|k|v scratch (or make it apart, when they cannot).
+    const StreamKv::Storage st =
+        kv_storage(lh, lw, cfg.kv_disk, cfg.kv_bits);
     if (!kv.init(mc, c.n_layers, c.n_heads, c.head_dim,
-                 kv_capacity_rows(lh, lw), &kerr) ||
-        !kv.ensure_staging(max_chunk_seq(lh, lw, max_text))) {
+                 kv_capacity_rows(lh, lw), st, &kerr)) {
       return fail("taomate: " + (kerr.empty()
                                      ? std::string("kv staging allocation")
                                      : kerr));
     }
     out->kv_bytes = kv.bytes();
-    log(fmt("taomate: clean-KV cache {} rows x {} layers, {} MB",
-            kv.capacity(), c.n_layers, kv.bytes() >> 20)());
+    if (kv.on_disk()) {
+      log(fmt("taomate: clean-KV cache {} rows x {} layers on disk, {}, "
+              "read a layer ahead through two {} MB slots", kv.capacity(),
+              c.n_layers, kv.bits() == 8 ? "8-bit (groups of 64)" : "bf16",
+              (kv.bytes() / 2) >> 20)());
+    } else {
+      log(fmt("taomate: clean-KV cache {} rows x {} layers, {} MB",
+              kv.capacity(), c.n_layers, kv.bytes() >> 20)());
+    }
   }
 
   // ---- 1. the audio teacher: the BASE model, every request ----------
@@ -732,6 +792,9 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
     const int vskip = kRequestVideoLatents - plan.video_latents();
     const std::size_t v0 = (std::size_t)vskip * fr * PE;
     for (const Phase& ph : plan.phases) {
+      const auto tc0 = std::chrono::steady_clock::now();
+      const std::size_t rd0 = out->kv_read, wr0 = out->kv_written;
+      const int cache_rows = kv.rows();
       PackedLayout L;
       if (!build_chunk_layout(q.text_tags, ph, lh, lw, media_origin,
                               video_off, audio_off, &L)) {
@@ -772,6 +835,17 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
                    nullptr, nullptr)) {
         return false;
       }
+      out->kv_disk_peak = std::max(out->kv_disk_peak, kv.disk_bytes());
+      log(fmt("taomate: request {} chunk {}: {} rows over a cache of {}, "
+              "{} steps + the commit in {:.1f} s{}", r + 1, ph.index + 1,
+              L.num_video_rows + L.num_audio_rows, cache_rows, c_steps,
+              std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - tc0).count(),
+              kv.on_disk()
+                  ? fmt(" (the cache: {} MB read, {} MB written)",
+                        (out->kv_read - rd0) >> 20,
+                        (out->kv_written - wr0) >> 20)()
+                  : std::string())());
       if (!tick()) { return false; }
       out->video_rows.insert(out->video_rows.end(), vrows.begin(),
                              vrows.end());
@@ -801,6 +875,11 @@ run(MetalMiniMaxH3Transformer* dit, const RunConfig& cfg,
   log(fmt("taomate: video, {} request(s) x 4 chunks x {} forwards: {:.1f} s",
           R, c_steps + 1,
           std::chrono::duration<double>(t2 - t1).count())());
+  if (kv.on_disk()) {
+    log(fmt("taomate: the cache's files peaked at {} MB; the forwards read "
+            "{} MB back, the commits wrote {} MB", out->kv_disk_peak >> 20,
+            out->kv_read >> 20, out->kv_written >> 20)());
+  }
   return true;
 }
 

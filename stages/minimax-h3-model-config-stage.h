@@ -95,6 +95,9 @@ private:
   // TaoMate-H3's streaming method: "auto" (run it when an adapter slot
   // holds the TaoMate adapter), "on", "off".
   std::string _taomate;
+  // Where its clean-K/V cache lives: "auto" (on disk, 8-bit with
+  // i8_gemm), "bf16", "int8" (on disk), "memory".
+  std::string _taomate_kv;
   LatentPreviewSpec _preview;
 };
 

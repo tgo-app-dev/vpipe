@@ -147,7 +147,21 @@ const ConfigKey kAttrs[] = {
           "ordinary denoise with it, which is not what it was trained "
           "for. Text-to-audio-video only, in whole 5-second requests; "
           "`steps` and the shifts do not apply. The clean-K/V cache is "
-          "~19 GB at 864x480 and ~48 GB at 1376x768",
+          "~19 GB at 864x480 and ~48 GB at 1376x768 -- on disk by "
+          "default, see `taomate_kv`",
+   .def_str = "auto"},
+  {.key = "taomate_kv", .type = ConfigType::String, .required = false,
+   .doc = "where TaoMate-H3's clean-K/V cache lives. `auto` (the "
+          "default) keeps it ON DISK -- one file per committed chunk, each "
+          "block's keys and values read back a block ahead of the "
+          "attention that needs them, through two slots of a few hundred "
+          "MB -- in 8 bits when `i8_gemm` is on, else in bf16. `bf16` and "
+          "`int8` choose the width on disk: int8 is affine groups of 64 "
+          "(about half the bytes to write and read; the attention sees "
+          "keys and values to 8 bits), bf16 is exactly the numbers of "
+          "`memory`. `memory` holds the whole cache in RAM, upstream's "
+          "way: no disk traffic, but ~17 GB at 832x480, which a 24 GB "
+          "Mac pages every forward",
    .def_str = "auto"},
   {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
    .doc = "`lora2`'s strength, per FORWARD and independent of "
@@ -233,6 +247,14 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
     fail_config(fmt(
         "MiniMaxH3ModelConfigStage('{}'): taomate must be auto, on or off "
         "(got '{}')", this->id(), _taomate));
+  }
+  _taomate_kv    = attr_str("taomate_kv");
+  if (_taomate_kv.empty()) { _taomate_kv = "auto"; }
+  if (_taomate_kv != "auto" && _taomate_kv != "bf16" &&
+      _taomate_kv != "int8" && _taomate_kv != "memory") {
+    fail_config(fmt(
+        "MiniMaxH3ModelConfigStage('{}'): taomate_kv must be auto, bf16, "
+        "int8 or memory (got '{}')", this->id(), _taomate_kv));
   }
   _preview.vae        = attr_str(latent_preview::kVaeKey);
   _preview.every      = (int)attr_int(latent_preview::kEveryKey);
@@ -322,6 +344,9 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   // Emitted only off its default, which the consumer applies anyway.
   if (_taomate != "auto") {
     o.insert_or_assign("taomate", FlexData::make_string(_taomate));
+  }
+  if (_taomate_kv != "auto") {
+    o.insert_or_assign("taomate_kv", FlexData::make_string(_taomate_kv));
   }
   // Emitted only when a preview VAE is named, like the LoRA keys.
   _preview.emit(fd);

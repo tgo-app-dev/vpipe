@@ -644,10 +644,17 @@ class MetalMiniMaxH3Transformer {
   // times a request. Every buffer in the scratch is addressed with the
   // forward's OWN length, so a larger one is a correct one. 0 restores
   // the exact-fit policy every other caller relies on.
-  void set_scratch_floor(int seq, int n_text)
+  //
+  // `qkv_elems`: what the q|k|v scratch must hold for a stream forward's
+  // K/V staging (StreamKv::staging_bytes / 2), named up front so the
+  // first forward -- the audio-only teacher -- already builds it that
+  // wide. Raised later, it would REBUILD the scratch, and a rebuild holds
+  // both sets at once.
+  void set_scratch_floor(int seq, int n_text, std::size_t qkv_elems = 0)
   {
     _scratch_floor_seq  = seq > 0 ? seq : 0;
     _scratch_floor_text = n_text > 0 ? n_text : 0;
+    _qkv_floor_elems    = _scratch_floor_seq > 0 ? qkv_elems : 0;
   }
 
   // Attach VDN-H3's linear branch, turning every main block's attention
@@ -1662,6 +1669,61 @@ class MetalMiniMaxH3Transformer {
   // to point, and there is no forward without the scratch.
   std::size_t _lora_scratch_rows = 0;
 
+  // ---- adapter factors STREAMED WITH THEIR BLOCK ----------------------
+  //
+  // A streamed DiT keeps about one main block resident, but its adapters'
+  // factors stayed resident for all 50: TaoMate-H3's rank-128 set (fused
+  // q|k|v, out, fc1, fc2 and the AdaLN projection) is ~50 MB a block,
+  // ~2.4 GB in all -- beside a block of ~1.3 GB (bf16) or ~0.65 GB (w8)
+  // and a box that is streaming precisely because it has no room.
+  //
+  // So, once the slots are bound -- every conversion done: alpha folded,
+  // q|k|v fused or banded, rows permuted -- a streamed DiT SPILLS each
+  // main block's factors to an unlinked temp file and frees them, keeping
+  // only their shape (rank, parts, group). A streamed block's iteration
+  // reads its factors back into ONE set of buffers per slot, refilled in
+  // place: the block's commit is waited for before the next block starts
+  // (see the promotion below the block), so nothing still reads them.
+  // A block PROMOTED to resident takes a resident copy of its factors,
+  // and an evicted one gives it back. File-backed pages are the cheapest
+  // memory the kernel can take back, unlike the anonymous GPU buffers
+  // they replace. VPIPE_H3_LORA_RESIDENT=1 keeps them all resident.
+  struct LoraSpillAt {
+    std::uint64_t a_off = 0, a_bytes = 0, b_off = 0, b_bytes = 0;
+  };
+  struct BlockSpill { LoraSpillAt qkv, out, fc1, fc2, adaln; };
+  // The five adapted projections of a main block, in one order for the
+  // spill, the fill and the copies.
+  static constexpr LoraFactors BlockLora::* kLoraMembers[] = {
+    &BlockLora::qkv, &BlockLora::out, &BlockLora::fc1, &BlockLora::fc2,
+    &BlockLora::adaln,
+  };
+  static constexpr LoraSpillAt BlockSpill::* kSpillMembers[] = {
+    &BlockSpill::qkv, &BlockSpill::out, &BlockSpill::fc1, &BlockSpill::fc2,
+    &BlockSpill::adaln,
+  };
+  struct SpillFile {
+    int fd = -1;
+    SpillFile() = default;
+    SpillFile(const SpillFile&) = delete;
+    SpillFile& operator=(const SpillFile&) = delete;
+    ~SpillFile();
+  };
+  SpillFile _lora_spill_file;
+  std::vector<std::vector<BlockSpill>> _lora_spill;   // [slot][main block]
+  // The streamed block's factors, per slot; and which block they hold.
+  std::vector<BlockLora> _lora_stream;
+  int _lora_stream_layer = -1;
+  // Spill every main block not resident now. False (nothing changed) when
+  // the file cannot be made.
+  bool spill_lora_();
+  // Read block `layer`'s factors into _lora_stream.
+  bool fill_lora_(int layer);
+  // A promoted block's factors made resident from _lora_stream; an
+  // evicted block's given back.
+  void keep_lora_(int layer);
+  void drop_lora_(int layer);
+
   // The live adapters for one projection of one block, named by the
   // member that holds it. `refiner` picks which stack of blocks.
   LoraStack lora_stack_(bool refiner, int layer,
@@ -1821,6 +1883,9 @@ class MetalMiniMaxH3Transformer {
   // A floor under the activation scratch: kept rather than rebuilt while
   // a forward fits it. See set_scratch_floor().
   int _scratch_floor_seq = 0, _scratch_floor_text = 0;
+  // Elements the q|k|v scratch must hold beyond its own [seq, 3 * inner]:
+  // a stream forward's K/V staging lives in it (StreamKv::adopt_staging).
+  std::size_t _qkv_floor_elems = 0;
   metal_compute::ComputeFunction _fn_attn_main, _fn_attn_text;
   // The int8-QK twin of _fn_attn_main. Two instantiations rather than
   // one, because `sage.dense_layers` leaves the leading blocks on the

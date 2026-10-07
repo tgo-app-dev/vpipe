@@ -850,6 +850,11 @@ endif()
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
     DESTINATION share/doc/vpipe
 )
+# Apache-2.0 section 4(d): a redistributed libvpipe carries the NOTICE
+# too -- an app bundling it copies this directory into its licences.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/NOTICE
+    DESTINATION share/doc/vpipe
+)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md
     DESTINATION share/doc/vpipe
 )
