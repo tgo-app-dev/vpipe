@@ -691,6 +691,164 @@ TEST(runtime_lora, the_file_level_alpha_is_read_when_no_module_has_one)
   }
 }
 
+// ---- TaoMate-H3's spelling, and the alpha beside the file -----------
+
+namespace {
+
+// One adapter per DIRECTORY: the json is read from beside the file, so
+// two cases sharing a directory would read each other's.
+fs::path
+case_dir(const char* name)
+{
+  const fs::path d = scratch() / name;
+  std::error_code ec;
+  fs::remove_all(d, ec);
+  fs::create_directories(d, ec);
+  return d;
+}
+
+void
+write_text(const fs::path& p, const std::string& s)
+{
+  std::ofstream f(p);
+  f << s;
+}
+
+}  // namespace
+
+// TaoMate-H3 names its factors `<module>.lora_a` / `.lora_b` -- lowercase,
+// nothing after -- and states rank and alpha only in a config.json beside
+// the safetensors. Before the spelling was known NOTHING bound, which
+// makes MiniMax-H3's load fail outright rather than run without it.
+TEST(runtime_lora, binds_the_taomate_spelling_and_its_sibling_alpha)
+{
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const int R = 4, K = 8, N = 6;
+  std::error_code ec;
+
+  {   // The spelling, and `config.json`'s alpha: 2 / 4 folds into A.
+    const fs::path d = case_dir("taomate");
+    const fs::path p = d / "adapter_model.safetensors";
+    ASSERT_TRUE(write_st(p, {
+        {"blocks.0.attn.qkv_proj.lora_a", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+        {"blocks.0.attn.qkv_proj.lora_b", {N, R}, ramp(N * R, 3.0f, 0.0f)},
+        {"token_refiner.blocks.1.mlp.fc1.lora_a", {R, K},
+         ramp(R * K, 1.0f, 0.0f)},
+        {"token_refiner.blocks.1.mlp.fc1.lora_b", {N, R},
+         ramp(N * R, 1.0f, 0.0f)},
+    }, {{"format", "pt"}, {"weight_source", "generator_ema"}}));
+    write_text(d / "config.json",
+               "{\"rank\": 4, \"alpha\": 2.0, "
+               "\"weight_source\": \"generator_ema\"}");
+    std::string err;
+    auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      EXPECT_TRUE(ad->metadata_alpha() == 2.0f);
+      EXPECT_TRUE(ad->has("blocks.0.attn.qkv_proj"));
+      genai::lora::Factors qkv, fc1, absent;
+      EXPECT_TRUE(ad->bind("blocks.0.attn.qkv_proj", N, K, &qkv));
+      EXPECT_TRUE(ad->bind("token_refiner.blocks.1.mlp.fc1", N, K, &fc1));
+      EXPECT_FALSE(ad->bind("blocks.0.attn.out_proj", N, K, &absent));
+      // lora_a is A, lora_b is B: a swap would still bind a square shape.
+      EXPECT_TRUE(bf16_at(qkv.a, 0) == 0.5f);
+      EXPECT_TRUE(bf16_at(qkv.b, 0) == 3.0f);
+      EXPECT_TRUE(ad->modules() == 2);
+      EXPECT_TRUE(ad->skipped() == 0);
+      // And a directory resolves the same json.
+      auto ad2 = genai::lora::Adapter::open(p.string(), mc, &err);
+      EXPECT_TRUE(ad2 != nullptr && ad2->metadata_alpha() == 2.0f);
+    }
+    // The pre-build header question sees the spelling too: MiniMax-H3
+    // turns its fused SwiGLU off for an adapted fc1.
+    EXPECT_TRUE(genai::lora::Adapter::file_touches(p.string(),
+                                                   ".mlp.fc1.lora_"));
+    fs::remove_all(d, ec);
+  }
+  {   // A json stating a DIFFERENT rank describes something else: the
+      // fallback (at strength) stands.
+    const fs::path d = case_dir("taomate-wrong-rank");
+    const fs::path p = d / "a.safetensors";
+    ASSERT_TRUE(write_st(p, {
+        {"m.lora_a", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+        {"m.lora_b", {N, R}, ramp(N * R, 1.0f, 0.0f)},
+    }));
+    write_text(d / "config.json", "{\"rank\": 8, \"alpha\": 2.0}");
+    std::string err;
+    auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      EXPECT_TRUE(ad->metadata_alpha() == 0.0f);
+      genai::lora::Factors f;
+      EXPECT_TRUE(ad->bind("m", N, K, &f));
+      EXPECT_TRUE(bf16_at(f.a, 0) == 1.0f);
+    }
+    fs::remove_all(d, ec);
+  }
+  {   // peft's own save: `adapter_config.json` with r / lora_alpha, and a
+      // bare header. 8 / 4 = 2.
+    const fs::path d = case_dir("peft-dir");
+    const fs::path p = d / "adapter_model.safetensors";
+    ASSERT_TRUE(write_st(p, {
+        {"m.lora_A.weight", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+        {"m.lora_B.weight", {N, R}, ramp(N * R, 1.0f, 0.0f)},
+    }));
+    write_text(d / "adapter_config.json",
+               "{\"r\": 4, \"lora_alpha\": 8, \"use_rslora\": false, "
+               "\"rank_pattern\": {}, \"alpha_pattern\": {}}");
+    std::string err;
+    auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      genai::lora::Factors f;
+      EXPECT_TRUE(ad->bind("m", N, K, &f));
+      EXPECT_TRUE(bf16_at(f.a, 0) == 2.0f);
+    }
+    fs::remove_all(d, ec);
+  }
+  {   // rsLoRA scales by alpha / sqrt(r), and a pattern overrides it per
+      // module; neither is read, so both keep the fallback whole.
+    for (const char* json :
+         {"{\"r\": 4, \"lora_alpha\": 8, \"use_rslora\": true}",
+          "{\"r\": 4, \"lora_alpha\": 8, "
+          "\"alpha_pattern\": {\"m\": 16}}"}) {
+      const fs::path d = case_dir("peft-unread");
+      const fs::path p = d / "adapter_model.safetensors";
+      ASSERT_TRUE(write_st(p, {
+          {"m.lora_A.weight", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+          {"m.lora_B.weight", {N, R}, ramp(N * R, 1.0f, 0.0f)},
+      }));
+      write_text(d / "adapter_config.json", json);
+      std::string err;
+      auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+      ASSERT_TRUE(ad != nullptr);
+      if (ad) {
+        EXPECT_TRUE(ad->metadata_alpha() == 0.0f);
+      }
+      fs::remove_all(d, ec);
+    }
+  }
+  {   // The header's own alpha WINS over the json beside it.
+    const fs::path d = case_dir("header-wins");
+    const fs::path p = d / "adapter_model.safetensors";
+    ASSERT_TRUE(write_st(p, {
+        {"m.lora_A.weight", {R, K}, ramp(R * K, 1.0f, 0.0f)},
+        {"m.lora_B.weight", {N, R}, ramp(N * R, 1.0f, 0.0f)},
+    }, {{"alpha", "1"}}));
+    write_text(d / "adapter_config.json",
+               "{\"r\": 4, \"lora_alpha\": 8}");
+    std::string err;
+    auto ad = genai::lora::Adapter::open(p.string(), mc, &err);
+    ASSERT_TRUE(ad != nullptr);
+    if (ad) {
+      EXPECT_TRUE(ad->metadata_alpha() == 1.0f);
+    }
+    fs::remove_all(d, ec);
+  }
+}
+
 // ---- fusing separate projections into one -------------------------
 
 // A = the parts stacked on the rank axis; B = each part's rows

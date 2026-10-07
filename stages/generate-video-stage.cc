@@ -21,6 +21,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-taomate.h"
 #include "generative-models/shared/motion-cache.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
@@ -2341,6 +2342,7 @@ GenerateVideoStage::ensure_expert_(int which)
     // consecutive indices and a strength beat still reaches them.
     std::vector<genai::MetalMiniMaxH3Transformer::LoraSpec> loras;
     using QL = genai::MetalMiniMaxH3Transformer::LoraSpec::QkvLayout;
+    int taomate_slot = -1;
     _h3_lora.resize(kH3LoraSlots);
     for (int i = 0; i < kH3LoraSlots; ++i) {
       const H3LoraSlot& sl = _h3_lora[(std::size_t)i];
@@ -2363,6 +2365,9 @@ GenerateVideoStage::ensure_expert_(int which)
             "GenerateVideoStage('{}'): lora_qkv_layout '{}' is not one of "
             "auto / flat / per_head; using auto", this->id(), sl.qkv));
       }
+      if (genai::minimax_h3::taomate::is_adapter(spec.path)) {
+        taomate_slot = (int)loras.size();
+      }
       loras.push_back(std::move(spec));
     }
     // NOTE for the pinned prefix: stream_pin_count now measures the
@@ -2375,6 +2380,13 @@ GenerateVideoStage::ensure_expert_(int which)
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
         stream_blocks, loras);
+    _h3_taomate_slot = _h3_dit ? taomate_slot : -1;
+    if (_h3_taomate_slot >= 0) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): adapter slot {} is TaoMate-H3's 3-step "
+          "streaming adapter -- clips run its method (taomate: auto)",
+          this->id(), _h3_taomate_slot));
+    }
     // VDN's hybrid attention, if the graph asked for one. AFTER the DiT
     // loads because the branch sizes itself from the stack it joins, and
     // a FAILED CONFIG rather than a warning because a graph that names a
@@ -2672,7 +2684,8 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
 bool
 GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
                                           const h3::PackedLayout& L,
-                                          int grid_h, int grid_w)
+                                          int grid_h, int grid_w,
+                                          std::size_t pageable)
 {
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr || seq <= 0) { return true; }
@@ -2749,7 +2762,17 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // 1344x768x328 (98887 rows): charging the ANE's 3.1 GB to the working set
   // refused a clip that runs GPU-only.
   const std::size_t gpu_need = dit + vdn + sol + sage;
-  const std::size_t need = gpu_need + ane;
+  // AND WHAT THE CALLER HOLDS BESIDE THE FORWARD for the whole denoise --
+  // TaoMate-H3's clean-K/V cache, which at 864x480 is larger than every
+  // term above together. It is judged against PHYSICAL RAM and kept out
+  // of the residency's way, but NOT counted in the working-set test: the
+  // working set is the wired ceiling, and these buffers are not wired --
+  // the OS can page them, so they cannot starve the kernel the way the
+  // scratch can. MEASURED on the M4 Pro 64 GB at 864x480: 33 GB of
+  // weights, a 21 GB cache and the scratch over a 48 GB recommended
+  // working set ran every chunk forward at 37 s, its compute-bound time,
+  // with 2.8 GB of swap; the working-set test alone had refused it.
+  const std::size_t need = gpu_need + ane + pageable;
 
   // THE TWO GATES, WITH THEIR MARGINS SPELLED OUT HERE rather than left
   // inside the predicates.
@@ -2834,7 +2857,8 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // are fixed-size slots and one-chunk host buffers, so they are added at
   // face value. Grossing them up too charged a 24 GB M5 Pro ~1.6 GB of
   // margin for a ~1.1 GB module and ran a clip without it.
-  const std::size_t need_phys = grossed_up(gpu_need, kPhysicalMargin) + ane;
+  const std::size_t need_phys =
+      grossed_up(gpu_need, kPhysicalMargin) + ane + pageable;
   auto fits_phys = [&](const auto& b, std::size_t extra) {
     return b.available_physical + swap_room >=
            grossed_up(gpu_need, kPhysicalMargin) + extra;
@@ -2852,7 +2876,8 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // Both budgets, for the reason generate-image gives: fits() is our Metal
   // working set and misses other processes' resident memory; fits_physical
   // is host-wide reclaimable RAM and catches it.
-  if (mb.fits(gpu_need, kWorkingSetMargin) && fits_phys(mb, ane)) {
+  if (mb.fits(gpu_need, kWorkingSetMargin) &&
+      fits_phys(mb, ane + pageable)) {
     return true;
   }
 
@@ -2863,7 +2888,8 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     parked = gm->reclaim_at_least(need);
   }
   mb = mc->memory_budget();
-  if (mb.fits(gpu_need, kWorkingSetMargin) && fits_phys(mb, ane)) {
+  if (mb.fits(gpu_need, kWorkingSetMargin) &&
+      fits_phys(mb, ane + pageable)) {
     session()->info(fmt(
         "GenerateVideoStage('{}'): parked ~{} MB to fit the {}-row forward's "
         "~{} MB of scratch{}", this->id(), parked >> 20, seq, need >> 20,
@@ -2886,10 +2912,10 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // THE ANE IS THE OPTIONAL PART. When the clip fits without its modules,
   // run the GPU alone -- a slower clip -- instead of refusing the clip.
   if (ane > 0 && mb.fits(gpu_need, kWorkingSetMargin) &&
-      fits_phys(mb, 0)) {
+      fits_phys(mb, pageable)) {
     if (_h3_dit) {
       _h3_dit->disable_ane();
-      _h3_dit->set_residency_reserve(gpu_need + (1ull << 30));
+      _h3_dit->set_residency_reserve(gpu_need + pageable + (1ull << 30));
     }
     _h3_cfg.ane_ffn = false;
     _h3_cfg.ane_qkv = false;
@@ -2909,7 +2935,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     return true;
   }
   const bool ws_ok = mb.fits(gpu_need, kWorkingSetMargin);
-  const bool ph_ok = fits_phys(mb, ane);
+  const bool ph_ok = fits_phys(mb, ane + pageable);
   auto gate = [](const char* what, bool ok, std::size_t want,
                  std::size_t have) {
     return ok ? fmt("{} needs ~{} MB, has ~{} MB -- ok", what, want >> 20,
@@ -2936,6 +2962,7 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
     part("sol_attn", sol);
     part("sage_attn", sage);
     part("ane", ane);
+    part("stream_kv", pageable);
     FlexData gates = FlexData::make_array();
     auto gate_doc = [&](const char* name, bool ok, std::size_t want,
                         std::size_t have) {
@@ -3495,6 +3522,154 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   return true;
 }
 
+int
+GenerateVideoStage::taomate_slot_() const
+{
+  std::string mode = "auto";
+  if (_model_cfg.is_object()) {
+    const auto o = _model_cfg.as_object();
+    if (o.contains("taomate")) {
+      mode = std::string(o.at("taomate").as_string("auto"));
+    }
+  }
+  if (mode == "off" || !_h3_dit) { return -1; }
+  if (_h3_taomate_slot >= 0) { return _h3_taomate_slot; }
+  // `on` with an adapter the tensor check did not recognise: the first
+  // slot, as asked.
+  if (mode == "on" && _h3_dit->lora_slots() > 0 &&
+      _h3_dit->lora_modules(0) > 0) {
+    return 0;
+  }
+  return -1;
+}
+
+bool
+GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
+                                    int slot, std::vector<float>* video_out,
+                                    std::vector<int>* video_shape,
+                                    std::vector<float>* audio_out,
+                                    std::vector<int>* audio_shape)
+{
+  namespace tmh = genai::minimax_h3::taomate;
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !_h3_dit) { return false; }
+  const auto& c = _h3_cfg;
+  const int lh = _height / 16, lw = _width / 16;
+  if (lh <= 0 || lw <= 0 || lh % 2 != 0 || lw % 2 != 0) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): TaoMate-H3 needs both edges a multiple "
+        "of 32 (got {}x{})", this->id(), _width, _height));
+    return false;
+  }
+  const int short_edge = std::min(_width, _height);
+  if (short_edge != 480 && short_edge != 768 && short_edge != 1088) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): TaoMate-H3 was validated at a 480, 768 "
+        "or 1088 short edge; {}x{} runs, untested", this->id(), _width,
+        _height));
+  }
+  // Whole 5-second requests: the first carries the clip's 5-frame
+  // prefix (124 native frames), each later one 119 more. The fewest that
+  // cover the frames asked for -- the same "at or above" rule the VAE's
+  // own alignment applies, so `frames: 120` (already 124 by here) is one.
+  const int steady = tmh::kRequestFrames - tmh::kPrefixFrames;
+  int R = 1;
+  while (tmh::kRequestFrames + (R - 1) * steady < _frames) { ++R; }
+  const int native = tmh::kRequestFrames + (R - 1) * steady;
+  const std::size_t kv = tmh::kv_cache_bytes(lh, lw, text_rows, c.n_layers,
+                                             c.n_heads, c.head_dim);
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): TaoMate-H3 -- {} request(s) of 5 s, {} "
+      "native frames at {}x{}; base-model audio teacher, then 4 chunks x "
+      "(3 steps + a commit) a request; clean-K/V cache {} MB{}",
+      this->id(), R, native, _width, _height, kv >> 20,
+      _steps > 0 && _steps != 3
+          ? fmt("; `steps` {} does not apply (the method is 3 a chunk)",
+                _steps)()
+          : std::string()));
+
+  // The longest forward the run makes is request 0's first chunk; the
+  // preflight judges the box against it plus the cache, and declares
+  // both as the reserve a streamed DiT's residency must leave clear.
+  {
+    h3::PackedLayout L0;
+    const std::vector<int> tags((std::size_t)text_rows, h3::kTextTag);
+    if (!tmh::build_chunk_layout(tags, tmh::request_plan(0).phases[0], lh,
+                                 lw, text_rows, 0, 0, &L0) ||
+        !preflight_h3_scratch_(
+            tmh::max_chunk_seq(lh, lw, text_rows), text_rows, L0,
+            lh / c.patch_h, lw / c.patch_w, kv)) {
+      return false;
+    }
+  }
+
+  metal_compute::SharedBuffer tb =
+      mc->make_shared_buffer((std::size_t)text_rows * c.text_dim * 2);
+  if (tb.empty()) { return false; }
+  std::memcpy(tb.contents(), cond, (std::size_t)text_rows * c.text_dim * 2);
+
+  std::vector<tmh::Request> reqs((std::size_t)R);
+  for (tmh::Request& q : reqs) {
+    q.text = &tb;
+    q.text_tags.assign((std::size_t)text_rows, h3::kTextTag);
+    q.seed = _seed;
+  }
+  tmh::RunConfig rc;
+  rc.latent_h = lh;
+  rc.latent_w = lw;
+  rc.audio_seed = _seed;
+  rc.lora_slot = slot;
+  rc.lora_scale = slot < (int)_h3_lora.size()
+                      ? (float)_h3_lora[(std::size_t)slot].scale
+                      : 1.0f;
+  UiProgress bar = session()->open_progress("denoise");
+  rc.progress = [&bar](int done, int total) {
+    bar.update((std::uint64_t)done, (std::uint64_t)total);
+    return true;
+  };
+  rc.log = [this](const std::string& m) {
+    session()->info(fmt("GenerateVideoStage('{}'): {}", this->id(), m));
+  };
+  tmh::RunResult res;
+  std::string err;
+  if (!tmh::run(_h3_dit.get(), rc, reqs, &res, &err)) {
+    if (!res.stopped) {
+      session()->warn(fmt("GenerateVideoStage('{}'): TaoMate-H3: {}",
+                          this->id(), err));
+    }
+    return false;
+  }
+  bar.finish();
+
+  const int ZC = c.video_channels;
+  const int fr = (lh / c.patch_h) * (lw / c.patch_w);
+  unpatchify_h3_rows_(res.video_rows.data(), res.video_latents * fr, ZC,
+                      res.video_latents, lh, lw, c.patch_h, c.patch_w,
+                      video_out);
+  *video_shape = {ZC, res.video_latents, lh, lw};
+  // Channel-major [stereo * alat, AC] rows to the [stereo, AC, alat] the
+  // audio VAE decodes -- run_h3_'s own transpose.
+  const int AC = c.audio_channels;
+  const int alat = res.audio_latents;
+  audio_out->assign((std::size_t)h3::kAudioChannels * AC * alat, 0.0f);
+  for (int ch = 0; ch < h3::kAudioChannels; ++ch) {
+    for (int i = 0; i < alat; ++i) {
+      const float* row =
+          res.audio_rows.data() + ((std::size_t)ch * alat + i) * AC;
+      for (int k = 0; k < AC; ++k) {
+        (*audio_out)[((std::size_t)ch * AC + k) * alat + i] = row[k];
+      }
+    }
+  }
+  *audio_shape = {h3::kAudioChannels, AC, alat};
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): TaoMate-H3 done -- {} forwards, video "
+      "[{}, {}, {}, {}], audio {} latents, cache peak {} MB", this->id(),
+      res.forwards, ZC, res.video_latents, lh, lw, alat,
+      res.kv_bytes >> 20));
+  return true;
+}
+
 void
 GenerateVideoStage::tag_model_(TensorBeat& tb) const
 {
@@ -4000,10 +4175,20 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // the port is unwired or the config names no preview VAE.
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          _fps, _frames);
+    const int tm_slot = taomate_slot_();
+    if (tm_slot >= 0 && (refp != nullptr || have_r2v)) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): TaoMate-H3 is text-to-audio-video only; "
+          "the keyframe / reference inputs are IGNORED for this clip",
+          this->id()));
+    }
     const bool ok_h3 =
-        run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
-                have_r2v ? &r2v : nullptr,
-                &vlat, &vshape, &alat_out, &ashape);
+        tm_slot >= 0
+            ? run_h3_taomate_(cond->data.data(), (int)cond->shape[0],
+                              tm_slot, &vlat, &vshape, &alat_out, &ashape)
+            : run_h3_(cond->data.data(), (int)cond->shape[0], refp,
+                      ref_frames, have_r2v ? &r2v : nullptr,
+                      &vlat, &vshape, &alat_out, &ashape);
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
     // What the adaptive residency actually reached. This is the number
     // that says whether the machine got used: with 0 pinned at load, every

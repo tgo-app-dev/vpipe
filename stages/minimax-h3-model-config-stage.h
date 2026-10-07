@@ -92,6 +92,9 @@ private:
   // key's doc -- it decides whether a FUSED qkv adapter's rows are
   // permuted into a per-head DiT's order.
   std::string _lora_qkv;
+  // TaoMate-H3's streaming method: "auto" (run it when an adapter slot
+  // holds the TaoMate adapter), "on", "off".
+  std::string _taomate;
   LatentPreviewSpec _preview;
 };
 

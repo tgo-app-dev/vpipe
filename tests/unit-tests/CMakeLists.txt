@@ -203,6 +203,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-lora.cc
         minimax-h3-comfy.cc
         minimax-h3-layout.cc
+        minimax-h3-taomate.cc
         vdn-geometry.cc
         vdn-delta-solve.cc
         vdn-linear-features.cc

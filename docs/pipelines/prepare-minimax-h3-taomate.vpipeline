@@ -1,0 +1,17 @@
+{
+  "id": "prepare-minimax-h3-taomate",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "TaoLiveAIGC/TaoMate-H3",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

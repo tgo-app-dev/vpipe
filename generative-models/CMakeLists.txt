@@ -134,6 +134,8 @@ set(LOCAL_SOURCES
   minimax-h3/minimax-h3-scheduler.cc
   minimax-h3/minimax-h3-text-encoder.cc
   minimax-h3/minimax-h3-denoise.cc
+  minimax-h3/minimax-h3-taomate.cc
+  minimax-h3/minimax-h3-stream-kv.cc
   lora-fusion.cc
   train/train-ops.cc
   train/lora-params.cc
@@ -235,6 +237,8 @@ set(LOCAL_HEADERS
   minimax-h3/minimax-h3-scheduler.h
   minimax-h3/minimax-h3-text-encoder.h
   minimax-h3/minimax-h3-denoise.h
+  minimax-h3/minimax-h3-taomate.h
+  minimax-h3/minimax-h3-stream-kv.h
   mage/metal-mage-vae.h
   mage/mage-screen.h
   train/train-ops.h

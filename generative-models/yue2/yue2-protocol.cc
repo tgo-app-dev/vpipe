@@ -1,5 +1,6 @@
 #include "generative-models/yue2/yue2-protocol.h"
 
+#include "generative-models/shared/torch-randn.h"
 #include "generative-models/tokenizer.h"
 
 #include <algorithm>
@@ -397,37 +398,8 @@ TokenPicker::pick(const float* logits, int step)
 std::vector<float>
 torch_cpu_randn(std::uint64_t seed, std::size_t n)
 {
-  std::vector<float> d(n);
-  if (n < 16) { return d; }
-  // at::mt19937 seeds with the low 32 bits exactly as std::mt19937 does,
-  // and CPUGeneratorImpl::random() is one draw of it.
-  std::mt19937 gen((std::uint32_t)(seed & 0xffffffffu));
-  auto uniform = [&]() -> float {
-    // uniform_real_distribution<float>: 24 random bits over 2^24.
-    const double x = (double)(gen() & 0xffffffu) * (1.0 / 16777216.0);
-    return (float)x;
-  };
-  auto fill16 = [](float* p) {
-    for (int j = 0; j < 8; ++j) {
-      const float u1 = 1.0f - p[j];
-      const float u2 = p[j + 8];
-      const float radius = std::sqrt(-2.0f * std::log(u1));
-      // ATen spells theta `2.0f * pi<double> * u2` into a FLOAT: the
-      // product is double, the angle and its cos/sin are not. Keeping it
-      // double is off by an ulp in about half the draws.
-      const float theta = (float)(2.0 * std::numbers::pi * (double)u2);
-      p[j]     = radius * std::cos(theta);
-      p[j + 8] = radius * std::sin(theta);
-    }
-  };
-  for (std::size_t i = 0; i < n; ++i) { d[i] = uniform(); }
-  for (std::size_t i = 0; i + 16 <= n; i += 16) { fill16(d.data() + i); }
-  if (n % 16 != 0) {
-    float* t = d.data() + n - 16;
-    for (int i = 0; i < 16; ++i) { t[i] = uniform(); }
-    fill16(t);
-  }
-  return d;
+  if (n < 16) { return std::vector<float>(n, 0.0f); }
+  return TorchCpuRandn(seed).randn(n);
 }
 
 }  // namespace vpipe::genai::yue2

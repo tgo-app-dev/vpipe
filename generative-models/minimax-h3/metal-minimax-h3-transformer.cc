@@ -1,4 +1,5 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -2279,6 +2280,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_bias_add  = m->_lib_elt.function("bias_add_rows_f16");
   // The blit a baked AdaLN needs when an adapter has to be added on top.
   m->_fn_copy      = m->_lib_elt.function("copy_f16");
+  m->_fn_copy_rect = m->_lib_elt.function("copy_rect_f16");
   m->_fn_nan_trip  = m->_lib_elt.function("nan_tripwire_f16");
   {
     m->_lib_sdpa = mc->load_library("sdpa_bf16");
@@ -4849,6 +4851,17 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
       && _s.attn.byte_size() >= arena_floor) {
     return true;
   }
+  // Under a floor (set_scratch_floor), a scratch that FITS is kept, and
+  // one that does not is rebuilt at the floor -- so a run that knows its
+  // longest forward pays for one allocation.
+  if (_scratch_floor_seq > 0) {
+    if (_s.seq >= seq && _s.n_text >= n_text && _s.n_t >= n_t &&
+        _s.attn.byte_size() >= arena_floor) {
+      return true;
+    }
+    seq    = std::max(seq, _scratch_floor_seq);
+    n_text = std::max(n_text, _scratch_floor_text);
+  }
   // WHAT MOVED, and it is worth a line: this reallocates every activation
   // buffer, and at video geometry that is over 13 GB -- built in full
   // BEFORE the old set is dropped, so the peak is both at once. A
@@ -5596,8 +5609,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   };
   const Config& c = _cfg;
   if (in.layout == nullptr || in.timesteps == nullptr ||
-      in.row_timestep_index == nullptr || in.video == nullptr ||
-      in.text == nullptr) {
+      in.row_timestep_index == nullptr || in.text == nullptr) {
     return fail("incomplete Step");
   }
   const h3::PackedLayout& L = *in.layout;
@@ -5647,8 +5659,53 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (n_audio > 0 && in.audio == nullptr) {
     return fail("the layout has audio rows but no audio latents");
   }
-  if (in.video->byte_size() < (std::size_t)n_video * VPE * 2) {
+  // A layout with NO video rows is legal: TaoMate-H3's audio teacher is a
+  // text + audio sequence, and the reference runs it as one.
+  if (n_video > 0 && in.video == nullptr) {
+    return fail("the layout has video rows but no video latents");
+  }
+  if (n_audio <= 0 && n_video <= 0) {
+    return fail("the layout has neither video nor audio rows");
+  }
+  if (n_video > 0 &&
+      in.video->byte_size() < (std::size_t)n_video * VPE * 2) {
     return fail("video rows are smaller than num_video_rows * patch elems");
+  }
+  // ---- the streaming attention's preconditions ------------------------
+  minimax_h3::StreamKv* const skv = in.stream_kv;
+  const bool sattn = skv != nullptr;
+  const bool stream_commit = sattn && in.stream_commit;
+  minimax_h3::StreamKv::CommitPlan splan;
+  if (in.stream_commit && !sattn) {
+    return fail("stream_commit names no stream_kv");
+  }
+  if (sattn) {
+    if (!skv->ready() || skv->layers() != c.n_layers) {
+      return fail(fmt("streaming attention: the cache holds {} layers, the "
+                      "model {}", skv->layers(), c.n_layers)());
+    }
+    // [text | audio | video] and nothing else: the split attention reads
+    // rows [0, n_text) as the prompt and everything after as media.
+    if (n_cond > 0 || L.num_condition_audio_rows > 0 ||
+        L.audio_start != n_text ||
+        (n_video > 0 && L.video_start != n_text + n_audio) ||
+        n_text + n_audio + n_video != seq) {
+      return fail("streaming attention needs a [text | audio | video] "
+                  "layout with no conditioning rows");
+    }
+    if (!_steel_ok || !_fn_copy_rect.valid()) {
+      return fail("streaming attention needs the steel flash kernel and "
+                  "copy_rect_f16");
+    }
+    if (!skv->ensure_staging(seq)) {
+      return fail("streaming attention: cannot allocate the K/V staging");
+    }
+    if (stream_commit) {
+      std::string perr;
+      if (!skv->plan_commit(n_text, n_audio, n_video, &splan, &perr)) {
+        return fail(perr);
+      }
+    }
   }
   if (in.text->byte_size() < (std::size_t)n_text * c.text_dim * 2) {
     return fail("text conditioning is smaller than num_text_rows * text_dim");
@@ -5757,12 +5814,19 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   const auto p_tune = PClock::now();
 
   Velocity out;
-  out.video = _mc->make_shared_buffer((std::size_t)n_video * VPE * 2);
-  if (n_audio > 0) {
-    out.audio = _mc->make_shared_buffer((std::size_t)n_audio * AC * 2);
-  }
-  if (out.video.empty() || (n_audio > 0 && out.audio.empty())) {
-    return fail("velocity allocation failed");
+  // A commit writes no velocity at all; an audio-only forward has none
+  // for video.
+  if (!stream_commit) {
+    if (n_video > 0) {
+      out.video = _mc->make_shared_buffer((std::size_t)n_video * VPE * 2);
+    }
+    if (n_audio > 0) {
+      out.audio = _mc->make_shared_buffer((std::size_t)n_audio * AC * 2);
+    }
+    if ((n_video > 0 && out.video.empty()) ||
+        (n_audio > 0 && out.audio.empty())) {
+      return fail("velocity allocation failed");
+    }
   }
 
   build_rope_(L, s.rcos, s.rsin);
@@ -5822,7 +5886,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // is over whole frames and the short conv is a (t, h, w) stencil, and
   // neither can be recovered from a row count.
   const bool vdn_on = (bool)_vdn && in.video_grid_h > 0
-                      && in.video_grid_w > 0 && L.num_video_rows > 0;
+                      && in.video_grid_w > 0 && L.num_video_rows > 0
+                      && !sattn;
   // TWO SWITCHES, not one. The per-head softmax gate is part of the
   // hybrid's attention whatever the window does; the WINDOW and the
   // linear branch are a matched pair that turn off together when the
@@ -5879,19 +5944,19 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // setting (it is the ablation that says the filter works), so it has
   // to mean "unchanged model", not "same answer, different kernel".
   const bool sol_on = (bool)_sol && !vdn_linear && !in.dense_attention &&
-                      c.sol.dense_layers < c.n_layers;
+                      c.sol.dense_layers < c.n_layers && !sattn;
   // SAGE IS A KERNEL VARIANT, not a second attention: it needs the
   // matrix-core steel entry, because the int8 fragment MMA only exists
   // there. `_attn_nax` is resolved further down, so this is re-tested at
   // the point the functions are built rather than assumed here.
   const bool sage_want = (bool)_sage && c.sage.enabled &&
-                         c.sage.dense_layers < c.n_layers;
+                         c.sage.dense_layers < c.n_layers && !sattn;
   // THE QUERY TILE, once the three specialisations that own the tile size are
   // known. DENSE-ONLY: the spans block list, Sage's int8 scale arrays and
   // Sol's blocks are each built for one query tile, so a forward using any of
   // them stays at BQ 64. The probe itself runs at most once per model, on the
   // first forward long enough for the wide tile to matter.
-  const bool tile_dense = !vdn_on && !sol_on && !sage_want;
+  const bool tile_dense = !vdn_on && !sol_on && !sage_want && !sattn;
   tune_attn_tile_(seq, tile_dense);
   // BUILT whenever the wide tile may run: latched to 128, or still probing,
   // which alternates whole blocks between the two and so needs both pairs.
@@ -5990,7 +6055,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // nothing. A knob that makes the layers it excludes 19x slower is not
   // an accelerator, and it looked exactly like the new kernels being
   // slow.
-  const int fused_attn = sol_on ? 0 : _fused_attn;
+  // The streaming split reads HEAD-MAJOR q/k/v and writes a head-major
+  // o, exactly as Sol does, so it unfuses the same way.
+  const int fused_attn = (sol_on || sattn) ? 0 : _fused_attn;
   // The FUNCTIONS depend on the sequence lengths alone; the PARAMS also
   // depend on which layout attention is reading, and the A/B setter
   // flips that between forwards. Kept apart so toggling the layout does
@@ -6155,6 +6222,80 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   }
   if (use_steel) {
     use_steel = _fn_attn_main.valid() && _fn_attn_text.valid();
+  }
+  // ---- the streaming split: two parameter blocks, two pipelines ------
+  //
+  // Filled per forward: the cache's row count moves with every commit,
+  // and with it kL. Both attentions are the same steel entry the dense
+  // path runs -- only the strides differ: queries and outputs are rows of
+  // the head-major [NH, seq, HD] scratch, keys and values rows of the
+  // [NH, cache + seq, HD] staging the cache gathers into.
+  const int s_rows = sattn ? skv->rows() : 0;
+  const int s_media = seq - n_text;
+  const metal_compute::ComputeFunction* s_fn_text = nullptr;
+  const metal_compute::ComputeFunction* s_fn_media = nullptr;
+  if (sattn) {
+    if (!use_steel) {
+      return fail("streaming attention: the steel flash kernel is "
+                  "unavailable");
+    }
+    struct P {
+      int B, H, D, qL, kL, gqa_factor;
+      float scale;
+      int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+      std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+    };
+    for (SharedBuffer* pb : {&_sattn_p_text, &_sattn_p_media}) {
+      if (pb->empty()) { *pb = _mc->make_shared_buffer(sizeof(P)); }
+      if (pb->empty()) { return fail("streaming attention: params"); }
+    }
+    const int SR = s_rows + seq;
+    auto fill = [&](SharedBuffer& pb, int qL, int kL) {
+      auto* p = static_cast<P*>(pb.contents());
+      p->B = 1; p->H = NH; p->D = HD;
+      p->qL = qL; p->kL = kL;
+      p->gqa_factor = 1; p->scale = scale;
+      p->NQ = (qL + A_BQ - 1) / A_BQ;
+      p->NK = (kL + A_BK - 1) / A_BK;
+      p->NQ_aligned = qL / A_BQ; p->NK_aligned = kL / A_BK;
+      p->qL_rem = qL - p->NQ_aligned * A_BQ;
+      p->kL_rem = kL - p->NK_aligned * A_BK;
+      p->qL_off = 0;
+      const std::int64_t q[3] = {(std::int64_t)NH * seq * HD,
+                                 (std::int64_t)seq * HD, HD};
+      const std::int64_t k[3] = {(std::int64_t)NH * SR * HD,
+                                 (std::int64_t)SR * HD, HD};
+      for (int i = 0; i < 3; ++i) {
+        p->Q_strides[i] = q[i];
+        p->O_strides[i] = q[i];
+        p->K_strides[i] = k[i];
+        p->V_strides[i] = k[i];
+      }
+    };
+    fill(_sattn_p_text, n_text, n_text);
+    fill(_sattn_p_media, s_media, SR);
+    auto pipeline = [&](int qL, int kL) -> metal_compute::ComputeFunction* {
+      const int nx = _attn_nax ? 1 : 0;
+      const int aq = (qL % A_BQ) == 0 ? 1 : 0;
+      const int ak = (kL % A_BK) == 0 ? 1 : 0;
+      metal_compute::ComputeFunction& f = _fn_sattn[nx][aq][ak];
+      if (!f.valid()) {
+        metal_compute::FunctionConstants fc;
+        fc.set_bool(200, aq != 0).set_bool(201, ak != 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+            .set_bool(303, false)
+            .set_bool(sage::kQkInt8Constant, false);
+        f = _attn_nax
+                ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+                : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      }
+      return &f;
+    };
+    s_fn_text = pipeline(n_text, n_text);
+    s_fn_media = pipeline(s_media, SR);
+    if (!s_fn_text->valid() || !s_fn_media->valid()) {
+      return fail("streaming attention: the steel pipelines did not build");
+    }
   }
   // A block-sparse kernel that did not validate must not fall back to
   // the DENSE one: dense attention over a windowed model is not a
@@ -6426,6 +6567,38 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // stream is least redundant, and the published profile keeps one of
     // 48 exact for that reason.
     auto attn = [&](int rows, bool main, int layer) {
+      // TaoMate-H3's split, on the main blocks. The refiner below is text
+      // alone either way.
+      if (sattn && main) {
+        skv->encode_gather(enc, _fn_copy_rect, layer, s.kh, s.vh, rows);
+        const std::size_t kv_text = (std::size_t)s_rows * HD * 2;
+        const std::size_t q_media = (std::size_t)n_text * HD * 2;
+        // Text rows over the text keys alone: staging rows past the cache.
+        enc.set_function(*s_fn_text);
+        enc.set_buffer(0, s.qh);
+        enc.set_buffer(1, skv->staging_k(), kv_text);
+        enc.set_buffer(2, skv->staging_v(), kv_text);
+        enc.set_buffer(3, s.oh);
+        enc.set_buffer(4, _sattn_p_text);
+        enc.dispatch({32 * (unsigned)((n_text + A_BQ - 1) / A_BQ),
+                      4 * (unsigned)NH, 1}, {32, 4, 1});
+        // Media rows over [cache ; text ; media]: the whole staging.
+        enc.set_function(*s_fn_media);
+        enc.set_buffer(0, s.qh, q_media);
+        enc.set_buffer(1, skv->staging_k());
+        enc.set_buffer(2, skv->staging_v());
+        enc.set_buffer(3, s.oh, q_media);
+        enc.set_buffer(4, _sattn_p_media);
+        enc.dispatch({32 * (unsigned)((s_media + A_BQ - 1) / A_BQ),
+                      4 * (unsigned)NH, 1}, {32, 4, 1});
+        // The commit reads the OLD cache out of staging, so it can only
+        // come after both attentions have read it -- which the encoder's
+        // order guarantees.
+        if (stream_commit) {
+          skv->encode_commit(enc, _fn_copy_rect, layer, splan, rows);
+        }
+        return;
+      }
       // `main` only: the other two blocks are H3's TOKEN REFINER, which
       // attends over the prompt alone. There is no video sequence there
       // to be sparse in, and the published profile likewise leaves
@@ -7667,6 +7840,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     }
 
     // ---- 4. the shared output norm and the two heads ------------------
+    // A streaming COMMIT wanted the blocks' keys and values, which the
+    // attention has already written into the cache; it has no velocity.
+    if (!stream_commit) {
     const SharedBuffer* fmod_buf = &s.fmod;
     std::size_t fmod_off = 0;
     const LoraStack fin_lo = lora_stack_final_();
@@ -7721,6 +7897,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         dst += (std::size_t)r.count;
       }
     }
+    }   // !stream_commit
     psplit(t_final);
   }
   std::string gpu_err;
@@ -7830,6 +8007,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                                  : "linear branch on video rows"),
         t_vdn_read, t_sgate));
   }
+  // The GPU has run the whole forward, write-backs included, so the
+  // cache's bookkeeping can now say what its buffers hold.
+  if (stream_commit) { skv->finish_commit(splan); }
+  out.ok = true;
   return out;
 }
 

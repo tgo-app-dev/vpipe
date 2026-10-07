@@ -10,6 +10,9 @@ MiniMaxH3Scheduler::MiniMaxH3Scheduler(double shift) : _shift(shift) {}
 bool
 MiniMaxH3Scheduler::set_timesteps(int num_steps)
 {
+  // torch rounds `(shift - 1) * base` and then `1 + ...`; a fused
+  // multiply-add rounds once and lands an ulp away on some points.
+#pragma clang fp contract(off)
   _sigmas.clear();
   _timesteps.clear();
   _endpoints.clear();
@@ -32,15 +35,11 @@ MiniMaxH3Scheduler::set_timesteps(int num_steps)
   // above it are built DOWN from `end`, both with a float32 step. That
   // is also what makes the terminal point exactly zero rather than a
   // rounded near-zero, which the Euler ratio below depends on.
-  const float stepf = (float)(-1.0 / (double)(num_steps - 1));
   const float sh    = (float)_shift;
   const float sh1   = (float)(_shift - 1.0);
   std::vector<float> shifted;
   shifted.reserve((std::size_t)num_steps);
-  for (int i = 0; i < num_steps; ++i) {
-    const float base = (i < num_steps / 2)
-                           ? (1.0f + stepf * (float)i)
-                           : (0.0f - stepf * (float)(num_steps - 1 - i));
+  for (float base : linspace_grid(num_steps)) {
     shifted.push_back(sh * base / (1.0f + sh1 * base));
   }
   // unique_consecutive: the shift maps distinct base points onto the same
@@ -53,9 +52,26 @@ MiniMaxH3Scheduler::set_timesteps(int num_steps)
   return true;
 }
 
+std::vector<float>
+MiniMaxH3Scheduler::linspace_grid(int num_points)
+{
+#pragma clang fp contract(off)   // torch's start + step * i, two roundings
+  std::vector<float> g;
+  if (num_points < 2) { return g; }
+  const float stepf = (float)(-1.0 / (double)(num_points - 1));
+  g.reserve((std::size_t)num_points);
+  for (int i = 0; i < num_points; ++i) {
+    g.push_back((i < num_points / 2)
+                    ? (1.0f + stepf * (float)i)
+                    : (0.0f - stepf * (float)(num_points - 1 - i)));
+  }
+  return g;
+}
+
 bool
 MiniMaxH3Scheduler::set_sigmas(const std::vector<float>& raw)
 {
+#pragma clang fp contract(off)   // as in set_timesteps
   _sigmas.clear();
   _timesteps.clear();
   _endpoints.clear();

@@ -96,12 +96,13 @@ from_f32(const std::vector<float>& w, const std::string& dtype)
   return out;
 }
 
-// The low-rank factor spellings: peft / diffusers / ai-toolkit, and
-// kohya's (sd-scripts, musubi-tuner), which calls A `lora_down` and B
-// `lora_up`.
+// The low-rank factor spellings: peft / diffusers / ai-toolkit, kohya's
+// (sd-scripts, musubi-tuner), which calls A `lora_down` and B `lora_up`,
+// and TaoMate-H3's bare lowercase `lora_a` / `lora_b`.
 const std::pair<std::string, std::string> kFactorSpellings[] = {
     {".lora_A.weight", ".lora_B.weight"},
     {".lora_down.weight", ".lora_up.weight"},
+    {".lora_a", ".lora_b"},
 };
 
 // kohya names a module `lora_unet_` + its path with every '.' flattened

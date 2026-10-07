@@ -1805,6 +1805,21 @@ builtin_catalog_()
      .files = {"minimax_h3_turbo_4step_ema_ckpt850.safetensors"},
      .needs_tokenizer_json = false,
      .name = "larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema"},
+    // TaoLiveAIGC's TaoMate-H3: a 3-step adapter for a STREAMING method,
+    // not a few-step LoRA for the ordinary denoise. generate-video knows
+    // it by its tensors and runs that method -- the base model's
+    // soundtrack, then the video in chunks against a cache of the clean
+    // ones before it (generative-models/minimax-h3/minimax-h3-taomate.h).
+    // Its rank and alpha (128 / 128) are stated only in config.json, which
+    // is why that file is fetched beside the weights.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "TaoMate 3-step streaming T2AV (TaoLiveAIGC)",
+     .hf_path = "TaoLiveAIGC/TaoMate-H3",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"adapter_model.safetensors", "config.json",
+               "adapter_config.json"},
+     .needs_tokenizer_json = false},
     // lightx2v's Turbo line, the OTHER few-step distillation of this
     // model -- and the only one that covers BOTH partitions.
     //

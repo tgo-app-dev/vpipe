@@ -412,6 +412,10 @@ private:
     std::string qkv;
   };
   std::vector<H3LoraSlot> _h3_lora;
+  // The DiT slot holding a TaoMate-H3 adapter (recognised from its
+  // tensors at load), or -1. With `taomate` auto/on in the model config
+  // the clip is made by that method rather than the ordinary denoise.
+  int _h3_taomate_slot = -1;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;
@@ -577,7 +581,8 @@ private:
   bool preflight_h3_scratch_(int seq, int text_rows,
                              const genai::minimax_h3::PackedLayout& L,
                              int grid_h,
-                             int grid_w);
+                             int grid_w,
+                             std::size_t pageable = 0);
   // `r2v` is the `ref2va` request when there is one; null is the
   // `t2va` / `fl2va` path, where `ref` carries the keyframe anchors
   // instead. The two are mutually exclusive by construction -- they are
@@ -597,6 +602,19 @@ private:
                int ref_frames, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
                std::vector<float>* audio_out, std::vector<int>* audio_shape);
+
+  // TaoMate-H3's streaming method (generative-models/minimax-h3/
+  // minimax-h3-taomate.h): the base model's soundtrack, then the
+  // adapter's video in chunks against a clean-K/V cache, in whole
+  // 5-second requests. The same outputs as run_h3_.
+  bool run_h3_taomate_(const void* cond, int text_rows, int slot,
+                       std::vector<float>* video_out,
+                       std::vector<int>* video_shape,
+                       std::vector<float>* audio_out,
+                       std::vector<int>* audio_shape);
+  // The slot to run TaoMate with this beat, from the config's `taomate`
+  // key and the slot found at load; -1 for the ordinary denoise.
+  int taomate_slot_() const;
 
   // The live-preview renderer (oport2). Built on the first model_config
   // latch and kept, so its TAE survives from clip to clip; its keys are

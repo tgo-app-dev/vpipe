@@ -133,6 +133,22 @@ const ConfigKey kAttrs[] = {
           "a property of the FILE: two adapters from different "
           "publishers need different answers",
    .def_str = "auto"},
+  {.key = "taomate", .type = ConfigType::String, .required = false,
+   .doc = "TaoMate-H3's STREAMING method, for its 3-step adapter "
+          "(TaoLiveAIGC/TaoMate-H3 in `lora`). That adapter is not a "
+          "few-step LoRA for the ordinary denoise: it was distilled for a "
+          "method in which the BASE model makes the soundtrack (an "
+          "audio-only pass) and the adapter makes the video in four "
+          "chunks per 5 seconds, three steps each, every chunk attending "
+          "to a cache of the clean chunks before it. `auto` (the default) "
+          "runs that method whenever an adapter slot holds the TaoMate "
+          "adapter, recognised from its tensors; `on` runs it with the "
+          "adapter in `lora` whatever its spelling; `off` runs the "
+          "ordinary denoise with it, which is not what it was trained "
+          "for. Text-to-audio-video only, in whole 5-second requests; "
+          "`steps` and the shifts do not apply. The clean-K/V cache is "
+          "~19 GB at 864x480 and ~48 GB at 1376x768",
+   .def_str = "auto"},
   {.key = "lora2_scale", .type = ConfigType::Real, .required = false,
    .doc = "`lora2`'s strength, per FORWARD and independent of "
           "`lora_scale` -- which is the point of a second slot: the "
@@ -167,8 +183,8 @@ const PortSpec kOports[] = {
    .doc = "MiniMax-H3 generation parameters as one FlexData object "
           "{model_family: minimax-h3, video_shift, audio_shift, "
           "condition_timestep, condition_audio_timestep, audio_seconds, "
-          "+lora, +lora2 and their scales, +preview_vae and its three "
-          "knobs}, for a generate-video model_config iport",
+          "+lora, +lora2 and their scales, +taomate, +preview_vae and its "
+          "three knobs}, for a generate-video model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -211,6 +227,13 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _lora2         = attr_str("lora2");
   _lora2_scale   = attr_real("lora2_scale");
   _lora2_qkv     = attr_str("lora2_qkv_layout");
+  _taomate       = attr_str("taomate");
+  if (_taomate.empty()) { _taomate = "auto"; }
+  if (_taomate != "auto" && _taomate != "on" && _taomate != "off") {
+    fail_config(fmt(
+        "MiniMaxH3ModelConfigStage('{}'): taomate must be auto, on or off "
+        "(got '{}')", this->id(), _taomate));
+  }
   _preview.vae        = attr_str(latent_preview::kVaeKey);
   _preview.every      = (int)attr_int(latent_preview::kEveryKey);
   _preview.max_edge   = (int)attr_int(latent_preview::kMaxEdgeKey);
@@ -295,6 +318,10 @@ MiniMaxH3ModelConfigStage::resolved_config() const
       o.insert_or_assign("lora2_qkv_layout",
                          FlexData::make_string(_lora2_qkv));
     }
+  }
+  // Emitted only off its default, which the consumer applies anyway.
+  if (_taomate != "auto") {
+    o.insert_or_assign("taomate", FlexData::make_string(_taomate));
   }
   // Emitted only when a preview VAE is named, like the LoRA keys.
   _preview.emit(fd);

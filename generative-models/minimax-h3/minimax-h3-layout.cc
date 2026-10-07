@@ -92,6 +92,9 @@ audio_latent_num_frames(int num_frames, double fps, int latents_per_second)
 std::vector<double>
 spatial_position_grid(int dim, int patch, double sqrt_area)
 {
+  // numpy rounds `i * step` and then `+ start`; a fused multiply-add
+  // rounds once, and lands an ulp away on a third of the grid.
+#pragma clang fp contract(off)
   std::vector<double> grid;
   if (dim <= 0 || patch <= 0 || !(sqrt_area > 0.0)) { return grid; }
   const int num = dim / patch;
@@ -99,10 +102,17 @@ spatial_position_grid(int dim, int patch, double sqrt_area)
   const double ratio = (double)dim / sqrt_area;
   const double left  = (1.0 - ratio) / 2.0;
   // numpy linspace(start, stop, num, endpoint=False):
-  //   start + arange(num) * (stop - start) / num, with stop - start =
-  //   ratio. torch.linspace divides by num-1 and includes the endpoint,
-  //   so it is a different grid -- not a rounding difference.
-  const double step = ratio / (double)num;
+  //   start + arange(num) * ((stop - start) / num). torch.linspace
+  //   divides by num-1 and includes the endpoint, so it is a different
+  //   grid -- not a rounding difference.
+  //
+  // The step is (stop - start) as numpy computes it -- from the ROUNDED
+  // stop, `left + ratio` -- not `ratio` itself: the two differ in the
+  // last bit of a double, which is invisible once the rope rounds the
+  // position to float32, but it is what keeps a layout comparable to the
+  // reference's bit for bit.
+  const double right = left + ratio;
+  const double step  = (right - left) / (double)num;
   grid.reserve((std::size_t)num);
   for (int i = 0; i < num; ++i) {
     grid.push_back((left + (double)i * step) * (double)kRopeSpatialScale);

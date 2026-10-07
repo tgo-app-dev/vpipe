@@ -60,6 +60,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Fetch it, then name it](#fetch-it-then-name-it)
     - [What makes it different](#what-makes-it-different)
     - [What it costs](#what-it-costs-1)
+  - [Three steps, streamed — TaoMate-H3](#three-steps-streamed--taomate-h3)
   - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
     - [Get it and run it](#get-it-and-run-it)
     - [What it saves](#what-it-saves)
@@ -181,6 +182,12 @@ you want to see the model work before spending the hours and the 115 GB.
   — joins those four parts into one 40-second file through the concat
   demuxer, with no model and no hand-written ffmpeg. The one lossy encode in
   the chain.
+- **[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)**
+  / **[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline)**
+  — fetch TaoLiveAIGC's **3-step** adapter and run its **streaming** method:
+  the soundtrack from the base model, the video in chunks that remember the
+  ones before them, in whole 5-second requests (see
+  [Three steps, streamed](#three-steps-streamed--taomate-h3)).
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -2152,6 +2159,119 @@ vpipe that is `sol_dense_steps: 2`, `sol_dense_layers: 2` and `sol_tau: 1.0` on
 unrouted model exactly, but the combination's picture quality has not been
 measured here — judge it on a seed you know. See
 [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing).
+
+### Three steps, streamed — TaoMate-H3
+
+[TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3) (Alibaba TaoLive
+AIGC) is a **3-step** adapter for the FL2VA weights, and unlike every adapter
+above it is **not a LoRA you run through the ordinary denoise**. It was
+distilled for a *streaming* method, and vpipe runs that method whenever it
+finds the adapter in a LoRA slot:
+
+1. **The soundtrack comes from the base model.** For each 5-second request an
+   audio-only pass of the plain FL2VA model (no adapter, no video rows, nine
+   forwards over a few hundred rows) writes the request's audio — anchored,
+   from the second request on, on the last second of the request before it.
+2. **The video comes from the adapter, in chunks.** Each request is four
+   chunks (two, two, two and one 17-frame groups; the first request also owns
+   the clip's 5-frame prefix), and each chunk runs **three** steps. Between
+   steps the chunk's audio rows are replaced by the soundtrack's matching
+   state, so the picture is made against the sound it will be played with.
+3. **Every chunk remembers the clean ones before it.** After its three steps a
+   chunk runs one more forward at t = 1 that writes its keys and values into a
+   cache; later chunks attend to that cache as well as to their own rows. The
+   cache keeps the first chunk's video for the whole clip and the two most
+   recent chunks, so a long clip keeps its subject without its cost growing.
+
+#### Fetch it, then name it
+
+[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)
+fetches it (2.5 GB) as `TaoLiveAIGC/TaoMate-H3`, and
+[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline) is
+the step-2 graph with it named on the config stage:
+
+```json
+"lora": "TaoLiveAIGC/TaoMate-H3",
+"lora_scale": 1.0,
+"taomate": "auto"
+```
+
+`taomate: auto` (the default) is what turns the method on: the adapter is
+recognised from its tensors, and the log says so:
+
+```
+GenerateVideoStage('generate-video'): adapter slot 0 is TaoMate-H3's 3-step
+streaming adapter -- clips run its method (taomate: auto)
+```
+
+`off` runs the ordinary denoise with the adapter instead — which is not what
+it was trained for, and kept only for comparison.
+
+#### What you set, and what you do not
+
+- **`frames`** decides the length, in **whole 5-second requests**: the fewest
+  that cover it. 120 is one request (124 native frames, 5.17 s), 240 is two
+  (243 frames, 10.1 s), and every request after the first adds 119.
+- **`width` / `height`**: both a multiple of 32. Upstream validated a short
+  edge of **480, 768 or 1088**; anything else runs, and is warned about.
+- **`seed`**: one seed seeds both the soundtrack and the video, request by
+  request, the way upstream's runner does.
+- **`steps` and the shifts do not apply** — three steps a chunk, on the
+  schedule the adapter was distilled at. Text-to-audio-video only: keyframe
+  and reference inputs are ignored, with a warning.
+
+#### Memory: the cache is the cost
+
+The cache is bf16 keys and values for every one of the 50 blocks, so it grows
+with the canvas, not with the clip:
+
+| canvas | clean-K/V cache |
+|---|---|
+| 864 × 480 | ~18 GB |
+| 1376 × 768 | ~46 GB |
+| 1920 × 1088 | ~90 GB |
+
+On a 64 GB Mac that makes **480p** the size that fits beside the 8-bit
+checkpoint; 768p wants a 128 GB machine. The cache is allocated before the
+first forward and counted in the same preflight as the activations, so a box
+that cannot hold it is told so before anything runs.
+
+#### How long it takes
+
+MEASURED on a Mac mini M4 Pro, 64 GB, the 8-bit FL2VA checkpoint preloaded
+from an external SSD, 864 × 480:
+
+| | forwards a request | per forward |
+|---|---|---|
+| soundtrack (base model, audio only) | 9 | 3.2 s |
+| video (4 chunks × 3 steps + a commit) | 16 | 37 s |
+
+So **about 10½ minutes per 5 seconds** of video on that machine, and a 10-second
+clip took 28 minutes from launch to file, loads and decodes included.
+
+#### How it was verified
+
+Upstream's runtime is CUDA-only, but its model code is plain PyTorch once
+FlashAttention-3 is replaced by PyTorch's own attention.
+`tools/dump_taomate_h3_golden.py` runs **upstream's** DiT on the CPU with the
+adapter, through upstream's own layouts, schedules, attention hook and cache.
+vpipe matches it to bf16's floor on every kind of forward: the soundtrack pass
+with and without the previous request's audio, a chunk with an empty cache,
+and a chunk read through a cache that has already been trimmed.
+`tools/dump_taomate_h3_host_golden.py` does the same for the chunk plans, the
+positions on the clip's timeline, the schedules and the noise. Those match
+exactly, apart from one soundtrack sigma that is a float32 ulp off.
+
+#### Not ported (yet)
+
+- **A prompt per 5 seconds.** Upstream takes one prompt per request; here every
+  request reuses the one prompt.
+- **Upstream's int8 acceleration** of the interior qkv / fc1 projections — an
+  NVIDIA-specific speed choice. vpipe runs the adapter on whatever checkpoint
+  you load, bf16 or quantized.
+- **The exact 5.000-second delivery.** Upstream squeezes 124 native frames into
+  120 and time-stretches the sound to match; vpipe writes the native 124 frames
+  and the soundtrack at its own length.
 
 ### Faster attention — the VDN linear branch
 

@@ -58,6 +58,7 @@ vpipe 自己的 Metal kernel，前向计算中不使用 Python，也不使用第
     - [获取，然后指定它](#fetch-it-then-name-it)
     - [它的不同之处](#what-makes-it-different)
     - [代价](#what-it-costs-1)
+  - [三步，流式生成——TaoMate-H3](#three-steps-streamed--taomate-h3)
   - [更快的注意力——VDN 线性分支](#faster-attention--the-vdn-linear-branch)
     - [获取并运行](#get-it-and-run-it)
     - [能省多少](#what-it-saves)
@@ -166,6 +167,11 @@ Ref2VA 那一行指的是**整个模型**，而不只是它的 transformer，这
 - **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
   ——通过 concat demuxer 把这四部分拼接成一个 40 秒的文件，不需要模型，也不需要手写
   ffmpeg。这是整条链中唯一一次有损编码。
+- **[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)**
+  / **[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline)**
+  ——获取淘宝直播 AIGC 团队的 **3 步**适配器，并运行它的**流式**方法：音轨来自基础
+  模型，视频分块生成且每块记得之前的块，以完整的 5 秒请求为单位（见
+  [三步，流式生成](#three-steps-streamed--taomate-h3)）。
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   ——获取 **VDN** 混合注意力分支，并用它运行文生视频。**只支持 FL2VA 模式**——
@@ -1891,6 +1897,105 @@ temb = emb(t) + gate * (emb_r(r) - emb(t))        gate = 0.25
 [更快的注意力——Sol-Attn 路由](#faster-attention--sol-attn-routing)。
 
 <a id="faster-attention--the-vdn-linear-branch"></a>
+<a id="three-steps-streamed--taomate-h3"></a>
+### 三步，流式生成——TaoMate-H3
+
+[TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3)（阿里巴巴淘宝直播
+AIGC 团队）是一个面向 FL2VA 权重的 **3 步**适配器。和上面所有适配器都不同，它
+**不是一个可以直接套进普通去噪流程的 LoRA**：它是为一种*流式*方法蒸馏出来的。
+只要在 LoRA 槽位里发现这个适配器，vpipe 就会运行这种方法：
+
+1. **音轨来自基础模型。** 每个 5 秒请求先由原始 FL2VA 模型做一次纯音频推理（不加
+   适配器、没有视频行，在几百行上做九次前向），写出这个请求的音频；从第二个请求起，
+   它以上一个请求最后一秒的干净音频为锚。
+2. **视频来自适配器，分块生成。** 每个请求分成四块（分别是两组、两组、两组和一组
+   17 帧；第一个请求还包含片段开头的 5 帧前缀），每块跑**三**步。每一步之后，该块的
+   音频行都会被替换成音轨在对应阶段的状态，所以画面是对着它最终要配的声音生成的。
+3. **每一块都记得之前的干净块。** 一块跑完三步后，会在 t = 1 再做一次前向，把它的
+   键和值写进缓存；后面的块除了自己的行，也会关注这个缓存。缓存在整个片段里一直保留
+   第一块的视频，以及最近的两块，所以长片段能保持主体一致，而开销不会随长度增长。
+
+<a id="fetch-it-then-name-it-1"></a>
+#### 获取，然后指定它
+
+[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)
+负责下载（2.5 GB），注册为 `TaoLiveAIGC/TaoMate-H3`；
+[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline)
+就是第 2 步的流水线，在配置阶段指定了它：
+
+```json
+"lora": "TaoLiveAIGC/TaoMate-H3",
+"lora_scale": 1.0,
+"taomate": "auto"
+```
+
+开启这种方法的是 `taomate: auto`（默认值）：适配器会根据它的张量被识别出来，日志
+里会写明：
+
+```
+GenerateVideoStage('generate-video'): adapter slot 0 is TaoMate-H3's 3-step
+streaming adapter -- clips run its method (taomate: auto)
+```
+
+设为 `off` 则改用普通去噪来跑这个适配器——这并不是它的训练方式，只是为了对比而保留。
+
+#### 需要设置的，和不用设置的
+
+- **`frames`** 决定长度，以**完整的 5 秒请求**为单位：取能覆盖它的最少请求数。
+  120 是一个请求（124 个原生帧，5.17 秒），240 是两个（243 帧，10.1 秒），第一个
+  请求之后每多一个请求增加 119 帧。
+- **`width` / `height`**：都必须是 32 的倍数。上游验证过的短边是 **480、768 或
+  1088**；其他尺寸也能跑，但会有警告。
+- **`seed`**：一个种子同时决定音轨和视频，逐个请求，与上游的运行器相同。
+- **`steps` 和 shift 不适用**——每块三步，用的是适配器蒸馏时的调度。只支持文本生成
+  音视频：关键帧和参考输入会被忽略，并给出警告。
+
+#### 内存：主要开销是缓存
+
+缓存是全部 50 个块的 bf16 键和值，所以它随画幅增长，而不是随片段长度增长：
+
+| 画幅 | 干净 K/V 缓存 |
+|---|---|
+| 864 × 480 | ~18 GB |
+| 1376 × 768 | ~46 GB |
+| 1920 × 1088 | ~90 GB |
+
+在 64 GB 的 Mac 上，这意味着 **480p** 是能和 8 位检查点放在一起的尺寸；768p 需要
+128 GB 的机器。缓存在第一次前向之前就会分配，并和激活值一起计入同一次预检，所以放不
+下的机器会在任何计算开始之前就得到提示。
+
+#### 耗时多久
+
+在 Mac mini M4 Pro（64 GB）上**实测**，8 位 FL2VA 检查点从外置 SSD 预加载，
+864 × 480：
+
+| | 每个请求的前向次数 | 每次前向 |
+|---|---|---|
+| 音轨（基础模型，纯音频） | 9 | 3.2 秒 |
+| 视频（4 块 × 3 步 + 一次提交） | 16 | 37 秒 |
+
+也就是在这台机器上**每 5 秒视频大约 10 分半钟**；一个 10 秒的片段从启动到写出文件
+用了 28 分钟，包括加载和解码。
+
+#### 如何验证
+
+上游的运行时只支持 CUDA，但把 FlashAttention-3 换成 PyTorch 自带的注意力之后，它的
+模型代码就是普通的 PyTorch。`tools/dump_taomate_h3_golden.py` 在 CPU 上带着适配器
+运行**上游自己的** DiT，用的是上游自己的布局、调度、注意力钩子和缓存。vpipe 在每一种
+前向上都与它一致，误差在 bf16 的精度下限：带和不带上一个请求音频的音轨推理、缓存为空
+的块，以及读取一个已经裁剪过的缓存的块。
+`tools/dump_taomate_h3_host_golden.py` 对分块计划、片段时间轴上的位置、调度和噪声
+做了同样的比对，结果完全一致，只有一个音轨 sigma 相差一个 float32 ulp。
+
+#### 尚未移植的部分
+
+- **每 5 秒一个提示词。** 上游每个请求可以有自己的提示词；这里所有请求共用同一个
+  提示词。
+- **上游对内部 qkv / fc1 投影的 int8 加速**——这是针对 NVIDIA 的速度选择。vpipe 在你
+  加载的任何检查点上运行适配器，无论是 bf16 还是量化版本。
+- **精确的 5.000 秒交付。** 上游把 124 个原生帧压进 120 帧，并对声音做时间伸缩来匹配；
+  vpipe 输出原生的 124 帧，音轨保持它自身的长度。
+
 ### 更快的注意力——VDN 线性分支
 
 上面的 Turbo LoRA 削减的是一个片段要花多少步。这里削减的是一步要花多少，而它的

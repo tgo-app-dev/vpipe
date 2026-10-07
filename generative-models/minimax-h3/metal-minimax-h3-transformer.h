@@ -31,6 +31,7 @@ namespace vpipe {
 namespace genai {
 
 class WeightSet;   // generative-models/weight-set.h
+namespace minimax_h3 { class StreamKv; }   // minimax-h3-stream-kv.h
 
 // The MiniMax-H3 omni denoiser (MiniMaxH3DiTModel): a 33B dense
 // SINGLE-STREAM transformer that predicts video AND audio velocity from
@@ -605,17 +606,49 @@ class MetalMiniMaxH3Transformer {
     // early, structure-deciding steps exact (HyperFlow's published Sol
     // recipe keeps the first two of eight dense) says so step by step.
     bool dense_attention = false;
+    // TaoMate-H3's STREAMING attention (minimax-h3-stream-kv.h). Set, and
+    // every main block's attention splits in two:
+    //   text rows   -> the text rows alone
+    //   other rows  -> [text ; the cache's committed clean K/V ; this
+    //                   forward's media rows]
+    // non-causally, over a layout of [text | audio | video] rows. Sol,
+    // VDN, Sage and the fused-attention spellings are not used for such
+    // a forward -- each assumes one square self-attention.
+    minimax_h3::StreamKv* stream_kv = nullptr;
+    // ...and this is the chunk's CLEAN forward: after each block's
+    // attention has read the cache, the block's cache is rewritten as the
+    // rows that survive this commit plus this forward's media rows. The
+    // output heads do not run; the Velocity comes back ok and empty.
+    bool stream_commit = false;
   };
 
   struct Velocity {
     // [num_video_rows, 96] and [num_audio_rows, audio_channels] bf16, in
     // the same row order the inputs were given in.
     metal_compute::SharedBuffer video, audio;
-    bool empty() const { return video.empty(); }
+    // Success, stated rather than read off a buffer: an AUDIO-ONLY
+    // forward (no video rows) has no video velocity, and a streaming
+    // commit has neither.
+    bool ok = false;
+    bool empty() const { return !ok; }
   };
 
   // One denoiser evaluation. Empty on failure, with a reason in `err`.
   Velocity forward(const Step& in, std::string* err = nullptr);
+
+  // Size the activation scratch for at least `seq` rows and `n_text`
+  // text rows, and KEEP it for any forward that fits, rather than
+  // rebuilding on every change of length. A streaming run alternates
+  // four chunk lengths and a short audio-only teacher; rebuilt each time,
+  // that is several GB reallocated (and both sets briefly live) several
+  // times a request. Every buffer in the scratch is addressed with the
+  // forward's OWN length, so a larger one is a correct one. 0 restores
+  // the exact-fit policy every other caller relies on.
+  void set_scratch_floor(int seq, int n_text)
+  {
+    _scratch_floor_seq  = seq > 0 ? seq : 0;
+    _scratch_floor_text = n_text > 0 ? n_text : 0;
+  }
 
   // Attach VDN-H3's linear branch, turning every main block's attention
   // into the hybrid: a chunk-windowed softmax over the frames near the
@@ -1667,6 +1700,8 @@ class MetalMiniMaxH3Transformer {
   // directly instead of gathering.
   std::vector<int> _adaln_row0, _adaln_nt;
   metal_compute::ComputeFunction _fn_copy;
+  // copy_rect_f16: the streaming attention's K/V gathers.
+  metal_compute::ComputeFunction _fn_copy_rect;
 
   bool _lora_mma_off = false;    // VPIPE_H3_NO_LORA_MMA
   bool _lora_fuse_off = false;   // VPIPE_H3_NO_LORA_FUSE
@@ -1777,6 +1812,15 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_nan_trip;
   metal_compute::SharedBuffer    _nan_report;
   metal_compute::SharedBuffer _attn_p_main, _attn_p_text;
+  // The streaming attention's two parameter blocks (text over text, media
+  // over [cache ; text ; media]) and its pipelines, one per alignment
+  // pair -- qL and kL move every chunk, so they are built on demand and
+  // kept: [nax][align_Q][align_K].
+  metal_compute::SharedBuffer _sattn_p_text, _sattn_p_media;
+  metal_compute::ComputeFunction _fn_sattn[2][2][2];
+  // A floor under the activation scratch: kept rather than rebuilt while
+  // a forward fits it. See set_scratch_floor().
+  int _scratch_floor_seq = 0, _scratch_floor_text = 0;
   metal_compute::ComputeFunction _fn_attn_main, _fn_attn_text;
   // The int8-QK twin of _fn_attn_main. Two instantiations rather than
   // one, because `sage.dense_layers` leaves the leading blocks on the

@@ -8,6 +8,9 @@
 #include "interfaces/session-context-intf.h"
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string_view>
 #include <vector>
 #include <algorithm>
@@ -100,6 +103,12 @@ const char* const kPrefixes[] = {"", "diffusion_model.", "transformer."};
 // tensor names.
 const char* const kMarks[] = {".lora_A.", ".lora_down."};
 
+// A fourth, TaoMate-H3's: `<module>.lora_a` / `.lora_b`, lowercase and
+// with nothing after it. Matched only at the END of a name -- there is
+// no trailing dot to anchor an infix search on, and anchoring at the end
+// keeps it from matching inside anything longer.
+const char kTailMarkA[] = ".lora_a";
+
 // kohya's MODULE spelling, which travels with its factor spelling:
 // `lora_unet_` and the module path with every '.' turned into '_', so
 // `blocks.0.attn.qkv_proj` is `lora_unet_blocks_0_attn_qkv_proj`. The
@@ -132,6 +141,12 @@ split_factor(const std::string& tensor, std::string* suffix)
     if (suffix != nullptr) { *suffix = tensor.substr(p); }
     return tensor.substr(0, p);
   }
+  constexpr std::size_t n = sizeof(kTailMarkA) - 1;
+  if (tensor.size() > n &&
+      tensor.compare(tensor.size() - n, n, kTailMarkA) == 0) {
+    if (suffix != nullptr) { *suffix = kTailMarkA; }
+    return tensor.substr(0, tensor.size() - n);
+  }
   return {};
 }
 
@@ -146,8 +161,8 @@ module_of(const std::string& tensor, const std::string& suf)
   return tensor.substr(0, tensor.size() - suf.size());
 }
 
-// ".lora_A.<x>.weight" -> ".lora_B.<x>.weight", and kohya's
-// ".lora_down.weight" -> ".lora_up.weight".
+// ".lora_A.<x>.weight" -> ".lora_B.<x>.weight", kohya's
+// ".lora_down.weight" -> ".lora_up.weight", and ".lora_a" -> ".lora_b".
 std::string
 b_of_a(std::string suf)
 {
@@ -157,8 +172,69 @@ b_of_a(std::string suf)
     return suf;
   }
   p = suf.find("lora_down");
-  if (p != std::string::npos) { suf.replace(p, 9, "lora_up"); }
+  if (p != std::string::npos) {
+    suf.replace(p, 9, "lora_up");
+    return suf;
+  }
+  if (suf == kTailMarkA) { suf.back() = 'b'; }
   return suf;
+}
+
+// The alpha an adapter states BESIDE its file rather than in it, or 0.
+//
+// Two publishers keep it there: peft's `save_pretrained` writes
+// `adapter_config.json` with `r` / `lora_alpha` and leaves the
+// safetensors header bare, and TaoMate-H3 writes `config.json` (and an
+// identical `adapter_config.json`) with `rank` / `alpha`. Read without
+// it, both apply at alpha == rank, which is right only when the two
+// happen to agree.
+//
+// Trusted only when the json states the SAME rank the factors have --
+// so a model's own config.json, or a json describing some other file in
+// the directory, is never taken for this adapter's -- and only for
+// plain scaling: rsLoRA (alpha / sqrt(r)) and per-module patterns are
+// not read, and such a file keeps the fallback rather than half of it.
+float
+sibling_alpha(const std::string& path, int rank)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path p(path);
+  const fs::path dir = fs::is_directory(p, ec) ? p : p.parent_path();
+  for (const char* name : {"config.json", "adapter_config.json"}) {
+    std::ifstream in(dir / name);
+    if (!in) { continue; }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    try {
+      const FlexData j = FlexData::from_json(ss.str());
+      if (!j.is_object()) { continue; }
+      const auto o = j.as_object();
+      auto num = [&](const char* k) {
+        return o.contains(k) ? o.at(k).as_real(0.0) : 0.0;
+      };
+      const double r = num("rank") > 0.0 ? num("rank") : num("r");
+      const double a = num("alpha") > 0.0 ? num("alpha")
+                                          : num("lora_alpha");
+      if (r <= 0.0 || a <= 0.0 || (int)r != rank) { continue; }
+      if (o.contains("use_rslora") && o.at("use_rslora").as_bool()) {
+        continue;
+      }
+      bool patterned = false;
+      for (const char* k : {"rank_pattern", "alpha_pattern"}) {
+        if (!o.contains(k)) { continue; }
+        const FlexData pat = o.at(k);
+        if (pat.is_object() && !pat.as_object().empty()) {
+          patterned = true;
+        }
+      }
+      if (patterned) { continue; }
+      return (float)a;
+    } catch (...) {
+      continue;
+    }
+  }
+  return 0.0f;
 }
 
 }  // namespace
@@ -189,6 +265,22 @@ Adapter::open(const std::string& path, MetalCompute* mc, std::string* err,
   a->_rename = rename;
   a->index_suffix_();
   if (rename != nullptr) { a->index_renames_(); }
+  // Nothing in the header: the alpha may be in a json beside the file.
+  // The rank it must agree with is any one A factor's -- a file with
+  // mixed ranks states its alpha per module or not at all, and the json
+  // check below then simply finds no agreement.
+  if (a->_meta_alpha <= 0.0f) {
+    for (const std::string& t : a->_w->tensor_names()) {
+      if (fp8::is_aux_name(t) || module_of(t, a->_suf_a).empty()) {
+        continue;
+      }
+      const auto* ti = a->_w->info(t);
+      if (ti != nullptr && ti->shape.size() == 2) {
+        a->_meta_alpha = sibling_alpha(path, (int)ti->shape[0]);
+      }
+      break;
+    }
+  }
   return a;
 }
 

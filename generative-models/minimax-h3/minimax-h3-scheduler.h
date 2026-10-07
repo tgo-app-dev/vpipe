@@ -65,6 +65,14 @@ class MiniMaxH3Scheduler {
   // diffusers' own check on a grid handed to set_timesteps(sigmas=).
   bool set_sigmas(const std::vector<float>& raw);
 
+  // torch.linspace(1, 0, num_points) in float32, at torch's rounding --
+  // the RAW grid set_timesteps shifts. Exposed for a distillation that
+  // keeps a SUBSET of a longer schedule (TaoMate-H3 runs points 0, 16,
+  // 33 and 49 of fifty): picking the raw points and shifting them is the
+  // same float32 arithmetic as shifting fifty and picking, point for
+  // point. Empty below 2.
+  static std::vector<float> linspace_grid(int num_points);
+
   // Sigma grid, descending, terminating at exactly 0. Size is one more
   // than timesteps().
   const std::vector<float>& sigmas() const { return _sigmas; }
