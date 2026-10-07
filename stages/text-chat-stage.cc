@@ -2,6 +2,7 @@
 
 #include "common/beat-payload-intf.h"
 #include "common/temp-root.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/media-decode.h"
 #include "common/media-line.h"
@@ -164,6 +165,20 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   // Scalar attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _hf_dir        = attr_str("hf_dir");
+  _mtp_model     = attr_str("mtp_model");
+  _draft_model   = attr_str("draft_model");
+  _draft_block   = static_cast<int>(attr_int("draft_block_size"));
+  _draft_bits    = static_cast<int>(attr_int("draft_bits"));
+  if (_draft_block < 0 || _draft_block == 1) {
+    fail_config(fmt("TextChatStage('{}'): draft_block_size must be 0 "
+                    "(adaptive) or >= 2 (got {})", this->id(), _draft_block));
+  }
+  if (_draft_bits != 0 && _draft_bits != 4 && _draft_bits != 8) {
+    fail_config(fmt("TextChatStage('{}'): draft_bits must be 0, 4 or 8 "
+                    "(got {})", this->id(), _draft_bits));
+  }
+  _keep_loaded   = attr_real("keep_loaded");
+  _wire_weights  = attr_bool("wire_weights");
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -350,6 +365,49 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "use the MTP speculative-decode head when the model carries one "
           "(token-exact; perf only); false forces the standard decode path",
    .def_bool = true},
+  {.key = "wire_weights", .type = ConfigType::Bool,
+   .doc = "wire (mlock) the model's buffers as they are allocated, so the "
+          "OS compressor never takes the weights mid-read: on a box short "
+          "of free memory the first forward otherwise spends tens of "
+          "seconds bringing them back. The GPU wires them at first use "
+          "anyway; charged to the wired pool",
+   .def_bool = true},
+  {.key = "keep_loaded", .type = ConfigType::Real,
+   .doc = "seconds to keep the model loaded after this stage lets it go "
+          "(its graph unloaded): a chat that runs a graph per request "
+          "gets it back with no read and no warmup. Renewed after each "
+          "reply; released sooner when a launch needs other weights. 0 "
+          "unloads it with the graph",
+   .def_real = 0.0},
+  {.key = "mtp_model", .type = ConfigType::String,
+   .doc = "a separate MTP drafter to decode with (a models-DB key or a "
+          "directory holding its model.safetensors): the draft head a "
+          "model's conversion dropped -- mlx-community's Qwen3.8-27B-MTP-"
+          "4bit beside its Qwen3.8-27B-4bit. Empty: the head the model's "
+          "own directory carries, if any",
+   .def_str = "", .suggest_db = kModelRegistryDb},
+  {.key = "draft_model", .type = ConfigType::String,
+   .doc = "a DFlash / DFlash 2 block drafter to decode with (a models-DB "
+          "key or its directory): a small model that drafts a block of "
+          "tokens from the target's hidden states, which the model then "
+          "verifies in one forward -- incoai's Qwen3.8-27B-DFlash2 for "
+          "mlx-community's Qwen3.8-27B-4bit. Greedy output is the model's "
+          "own (sampled: its own per-slot samples); perf only. Takes over "
+          "from mtp when set. Empty: none",
+   .def_str = "", .suggest_db = kModelRegistryDb},
+  {.key = "draft_block_size", .type = ConfigType::Int,
+   .doc = "tokens a DFlash round verifies (the anchor + drafts, 2 up to "
+          "the drafter's trained block). 0 (default) adapts it: each "
+          "size's measured round time against the drafts it gets "
+          "accepted -- on a GPU without matrix cores a short block wins, "
+          "since verifying a row costs nearly a decode step there",
+   .def_int = 0},
+  {.key = "draft_bits", .type = ConfigType::Int,
+   .doc = "the DFlash drafter's in-memory precision: 8 (default) or 4 -- "
+          "affine group-64, quantized at load; 4 halves its memory and "
+          "draft time for slightly fewer accepted drafts -- or 0 for its "
+          "stored bf16",
+   .def_int = 8},
   {.key = "mtp_prefix_seed", .type = ConfigType::Bool,
    .doc = "seed the MTP drafter's KV with the prompt at decode start: higher "
           "draft acceptance / decode throughput for a small extra prefill "
@@ -500,6 +558,15 @@ TextChatStage::reset_run_state()
   _sampler_latched = false;
 }
 
+void
+TextChatStage::renew_warm_()
+{
+  if (_keep_loaded <= 0 || !_lm || session() == nullptr) { return; }
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->keep_warm(_lm, resolve_model_dir(session(), _hf_dir), _keep_loaded);
+  }
+}
+
 StageMemory
 TextChatStage::declare_memory() const
 {
@@ -515,8 +582,11 @@ std::vector<ResourceClaim>
 TextChatStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return model_memory::weight_claims(
-      {resolve_model_dir(session(), _hf_dir)});
+  std::vector<std::string> dirs{resolve_model_dir(session(), _hf_dir)};
+  if (!_draft_model.empty()) {
+    dirs.push_back(resolve_model_dir(session(), _draft_model));
+  }
+  return model_memory::weight_claims(dirs);
 }
 
 Job
@@ -561,6 +631,18 @@ TextChatStage::initialize(RuntimeContext& ctx)
   spec.compute_dtype = _compute_dtype;
   spec.page_tokens   = _page_tokens;
   spec.max_pages     = _max_pages;
+  if (!_mtp_model.empty()) {
+    bag::set_text(spec.extra, genai::load_spec::kMtpDir,
+                  resolve_model_dir(session(), _mtp_model));
+  }
+  if (!_draft_model.empty()) {
+    bag::set_text(spec.extra, genai::load_spec::kDraftDir,
+                  resolve_model_dir(session(), _draft_model));
+    bag::set_integer(spec.extra, genai::load_spec::kDraftBits, _draft_bits);
+  }
+  if (_wire_weights) {
+    bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  }
   session()->info(fmt(
       "TextChatStage('{}'): loading model from '{}' "
       "(dtype={}, page_tokens={}, max_pages={})",
@@ -574,6 +656,8 @@ TextChatStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     co_return;
   }
+  // Kept warm past this graph: the next chat's load is handed this one.
+  if (_keep_loaded > 0) { mgr->keep_warm(_lm, spec.hf_dir, _keep_loaded); }
   // Apply the MTP prefix-seed preference before any prefill (no-op unless the
   // model carries a metal MTP head). Chat is decode-bound, so default on.
   if (_mtp_enabled) { _lm->set_mtp_prefix_seed(_mtp_prefix_seed); }
@@ -723,6 +807,11 @@ TextChatStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // Kept warm from the END of this reply, however it ends.
+  struct RenewWarm {
+    TextChatStage* self;
+    ~RenewWarm() { self->renew_warm_(); }
+  } renew{this};
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Latch the token-sampler spec off the OPTIONAL sampler iport, once: the
@@ -1201,14 +1290,15 @@ TextChatStage::process(RuntimeContext& ctx)
     // (greedy) or decode_pipelined (sampling, the verify samples each position).
     // The prefill's first token was already streamed above (and primes the
     // pipeline); on_tokens drops MTP's echo of it (out_ids[0] == next) and emits
-    // the rest, stopping as soon as a stop token is seen. Greedy OR penalty-free
-    // sampling -- the verify applies no repetition/presence penalty, so a
-    // penalised sampler stays on the loops below (which apply it).
-    const bool mtp_no_penalty =
-        (_sampler_params.repetition_penalty == 1.0f
-         && _sampler_params.presence_penalty == 0.0f);
-    if (next >= 0 && !is_stop(next) && _mtp_enabled && _lm->mtp_available()
-        && (!sampled_path || mtp_no_penalty)) {
+    // the rest, stopping as soon as a stop token is seen. Greedy or sampled,
+    // penalties included: the verify's seen-sets start from the prompt as
+    // pdecode_begin's does.
+    // Speculative decode: a DFlash drafter when one is attached (it was
+    // asked for by name), else the MTP head unless `mtp` opts out.
+    const std::string drafter = _lm->spec_drafter();
+    const bool use_spec = next >= 0 && !is_stop(next) && !drafter.empty() &&
+        (drafter != genai::spec_decode::kDrafterMtp || _mtp_enabled);
+    if (use_spec) {
       bool first_echo = true;
       bool stopped = false;
       int  produced = 0;
@@ -1221,8 +1311,17 @@ TextChatStage::process(RuntimeContext& ctx)
             }
             return !ctx.stop_requested() && !interrupted();
           };
-      _lm->mtp_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
-                        is_stop, on_toks, &produced, &stopped);
+      genai::SpecDecodeResult sres;
+      _lm->spec_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
+                         is_stop, on_toks, &produced, &stopped, prompt_ids,
+                         _draft_block, &sres);
+      if (sres.rounds > 0) {
+        session()->info(fmt(
+            "TextChatStage('{}'): {} decode: {} tokens in {} rounds "
+            "({:.2f} a round), {}/{} drafts accepted", this->id(), drafter,
+            produced, sres.rounds, (double)produced / (double)sres.rounds,
+            sres.accepted, sres.drafted));
+      }
       if (stopped) {
         reason = StopReason::StopToken;
       } else if (interrupted()) {

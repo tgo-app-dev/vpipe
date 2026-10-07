@@ -1340,6 +1340,9 @@ constant, never the spelling:
 | a struct's `extra`: `NamedTensor` format, catalogue | `genai::named_tensor` (`gen-input.h`), `catalog_extra` (`stages/model-catalog.h`) |
 | the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
 | scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
+| `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
+| `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
+| speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |
 | the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |
 | beats and TensorBeat sidebands | `beat`, `sideband` (`common/beat-keys.h`) |
 | `model_config` keys the host reads | `model_config::kFamilyKey` (`stages/model-config-source.h`), `genai::preview_key` (`gen-input.h`) |

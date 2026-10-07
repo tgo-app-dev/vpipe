@@ -82,6 +82,11 @@ add_vpipe_metal_kernel(audio_vae_1d SRC ops/audio_vae_1d.metal)
 add_vpipe_metal_kernel(rope SRC ops/rope.metal)
 add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
                        DEFINES VPIPE_ELT=bfloat)
+# The DFlash block-diffusion drafter (speculative decoding):
+# generative-models/shared/dflash-drafter.h.
+add_vpipe_metal_kernel(dflash SRC ops/dflash.metal)
+add_vpipe_metal_kernel(dflash_bf16 SRC ops/dflash.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(sdpa SRC attention/sdpa.metal)
 add_vpipe_metal_kernel(sdpa_bf16 SRC attention/sdpa.metal
                        DEFINES VPIPE_ELT=bfloat VPIPE_BF16=1)

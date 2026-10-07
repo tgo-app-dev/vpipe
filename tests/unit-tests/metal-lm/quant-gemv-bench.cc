@@ -654,6 +654,15 @@ TEST(metal_lm_smoke, qmv_batch_bandwidth_sweep) {
   auto fn_xh   = lib.function("affine_qmv_batch8_xh_w4g64");
   auto fn_xh16 = lib.function("affine_qmv_batch8_xh16_w4g64");
   auto fn_xp4  = lib.function("affine_qmv_batch4_xp_w4g64");
+  struct KsFn { metal_compute::ComputeFunction fn; int M; int KP; };
+  KsFn ks[] = {{lib.function("affine_qmv_ks1_w4g64"), 1, 2},
+               {lib.function("affine_qmv_ks2_w4g64"), 2, 2},
+               {lib.function("affine_qmv_ks3_w4g64"), 3, 2},
+               {lib.function("affine_qmv_ks4_w4g64"), 4, 2},
+               {lib.function("affine_qmv_ks4k4_w4g64"), 4, 4},
+               {lib.function("affine_qmv_ks6_w4g64"), 6, 2},
+               {lib.function("affine_qmv_ks8_w4g64"), 8, 2}};
+  for (auto& k : ks) { ASSERT_TRUE(k.fn.valid()); }
   ASSERT_TRUE(fn_xh.valid() && fn_xh16.valid() && fn_xp4.valid());
   ASSERT_TRUE(fn_qmv.valid() && fn_b2.valid() && fn_b4.valid());
   ASSERT_TRUE(fn_tg8.valid() && fn_tg8x4.valid() && fn_steel.valid());
@@ -661,15 +670,102 @@ TEST(metal_lm_smoke, qmv_batch_bandwidth_sweep) {
   using Clock = std::chrono::steady_clock;
   const double kPeak = 153.0;
   struct Shape { const char* name; int n; int k; };
-  const Shape shapes[] = {
+  const Shape shapes4b[] = {
       {"o-proj  2560x2560", 2560, 2560},
       {"down    2560x9728", 2560, 9728},
       {"gate|up 19456x2560", 19456, 2560},
       {"lm_head 151936x2560", 151936, 2560},
   };
+  const Shape shapes27b[] = {
+      {"gate|up 34816x5120", 34816, 5120},
+      {"down    5120x17408", 5120, 17408},
+      {"gdn_in  16480x5120", 16480, 5120},
+      {"lm_head 248320x5120", 248320, 5120},
+  };
+  const bool big = std::getenv("VPIPE_QMV_AB_27B") != nullptr;
+  // Lean: only the tiles a plan can pick (a short run on a fanless box).
+  const bool lean = big || std::getenv("VPIPE_QMV_AB_LEAN") != nullptr;
+  std::vector<Shape> shapes(big ? std::begin(shapes27b) : std::begin(shapes4b),
+                            big ? std::end(shapes27b) : std::end(shapes4b));
   std::mt19937 rng(7);
   std::uniform_int_distribution<std::uint32_t> du(0, 0xffffffffu);
-  const int kMs[] = {2, 3, 4, 5, 6, 8};
+  auto fn_b2sw = lib.function("affine_qmv_batch_swiglu_w4g64");
+  KsFn kssw[] = {{lib.function("affine_qmv_ks2_swiglu_w4g64"), 2, 2},
+                 {lib.function("affine_qmv_ks3_swiglu_w4g64"), 3, 2},
+                 {lib.function("affine_qmv_ks4_swiglu_w4g64"), 4, 2},
+                 {lib.function("affine_qmv_ks6_swiglu_w4g64"), 6, 2}};
+  struct CheckShape { int n, k; bool sw; };
+  for (const CheckShape cs : {CheckShape{512, 5120, false},
+                              CheckShape{248320, 5120, false},
+                              CheckShape{34816, 5120, true},
+                              CheckShape{512, 5120, true}}) {
+    // ks* against the batch MAXM=2 tile on fully random data.
+    const int N = cs.n, K = cs.k, G = K / 64, MM = 8;
+    auto w = mc->make_shared_buffer((std::size_t)N * K / 2);
+    auto sc = mc->make_shared_buffer((std::size_t)N * G * 2);
+    auto bi = mc->make_shared_buffer((std::size_t)N * G * 2);
+    auto x = mc->make_shared_buffer((std::size_t)MM * K * 2);
+    auto y0 = mc->make_shared_buffer((std::size_t)MM * N * 2);
+    auto y1 = mc->make_shared_buffer((std::size_t)MM * N * 2);
+    auto* wp = static_cast<std::uint32_t*>(w.contents());
+    for (std::size_t i = 0; i < (std::size_t)N * K / 8; ++i) {
+      wp[i] = du(rng);
+    }
+    std::uniform_real_distribution<float> ur(-1.f, 1.f);
+    auto* sp = static_cast<_Float16*>(sc.contents());
+    auto* bp = static_cast<_Float16*>(bi.contents());
+    for (int i = 0; i < N * G; ++i) {
+      sp[i] = (_Float16)(0.01f * ur(rng)); bp[i] = (_Float16)(0.05f * ur(rng));
+    }
+    auto* xp = static_cast<_Float16*>(x.contents());
+    for (int i = 0; i < MM * K; ++i) { xp[i] = (_Float16)ur(rng); }
+    const int NO = cs.sw ? N / 2 : N;
+    std::vector<const KsFn*> kl;
+    if (cs.sw) { for (const KsFn& k : kssw) { kl.push_back(&k); } }
+    else { for (const KsFn& k : ks) { kl.push_back(&k); } }
+    for (const KsFn* kp : kl) {
+      const KsFn& k = *kp;
+      for (int m : {1, 2, 3, 4, 5, 6, 8}) {
+        if (m == 1) { continue; }
+        std::memset(y1.contents(), 0, y1.byte_size());
+        metal_compute::CommandStream st = mc->make_command_stream();
+        {
+          metal_compute::ComputeEncoder e = st.begin_compute();
+          auto bindc = [&](const metal_compute::ComputeFunction& fn,
+                           metal_compute::SharedBuffer& y) {
+            e.set_function(fn);
+            e.set_buffer(0, w); e.set_buffer(1, sc); e.set_buffer(2, bi);
+            e.set_buffer(3, x); e.set_buffer(4, y);
+            e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, m);
+          };
+          bindc(cs.sw ? fn_b2sw : fn_b2, y0);
+          e.dispatch({32u, (unsigned)(N / 4), (unsigned)((m + 1) / 2)},
+                     {32u, 2u, 1u});
+          bindc(k.fn, y1);
+          e.dispatch({(unsigned)(32 * k.KP), (unsigned)(N / 4),
+                      (unsigned)((m + k.M - 1) / k.M)},
+                     {(unsigned)(32 * k.KP), 1u, 1u});
+        }
+        st.commit().wait();
+        const auto* a = static_cast<const _Float16*>(y0.contents());
+        const auto* c = static_cast<const _Float16*>(y1.contents());
+        double num = 0, den = 0, mx = 0, ymx = 0;
+        for (int i = 0; i < m * NO; ++i) {
+          const double d = (double)a[i] - (double)c[i];
+          num += d * d; den += (double)a[i] * (double)a[i];
+          mx = std::max(mx, std::fabs(d));
+          ymx = std::max(ymx, std::fabs((double)a[i]));
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        std::printf("[qmv-check] %dx%d%s ks M=%d m=%d rel %.2e max|d| %.3g "
+                    "(max|y| %.3g)%s\n", N, K, cs.sw ? " swiglu" : "", k.M,
+                    m, rel, mx, ymx, rel > 2e-3 ? " MISMATCH" : "");
+        EXPECT_TRUE(rel < 2e-3);
+      }
+    }
+    std::printf("[qmv-sweep] ks* vs batch MAXM=2 checked\n");
+  }
+  const int kMs[] = {1, 2, 3, 4, 5, 6, 8};
   for (const Shape& sh : shapes) {
     const int groups = sh.k / 64;
     const std::size_t wwords = (std::size_t)sh.n * sh.k / 8;   // w4
@@ -701,10 +797,28 @@ TEST(metal_lm_smoke, qmv_batch_bandwidth_sweep) {
                           {"xd8 (no tgm)", 6},   {"xp1 (w-regs)", 7},
                           {"xp2 (w-regs)", 8},   {"mma2 BM=64", 9},
                           {"xh8 (hoist)", 10},   {"xh16 (half)", 11},
-                          {"xp4 (w-regs)", 12},  {"mix xp4+b2", 13}};
+                          {"xp4 (w-regs)", 12},  {"mix xp4+b2", 13},
+                          {"ks1 kp2", 14}, {"ks2 kp2", 15}, {"ks3 kp2", 16},
+                          {"ks4 kp2", 17}, {"ks4 kp4", 18}, {"ks6 kp2", 19},
+                          {"ks8 kp2", 20}};
     for (int m : kMs) {
       for (const KV& kv : kernels) {
         if (kv.kind == 9 && !fn_mma.valid()) { continue; }
+        if (lean && (kv.kind == 3 || kv.kind == 4 || kv.kind == 5 ||
+                     kv.kind == 6 || kv.kind == 10)) {
+          continue;
+        }
+        if (m == 1 && kv.kind != 0 && kv.kind != 14) { continue; }
+        if (lean && (kv.kind == 7 || kv.kind == 8 ||
+                    (kv.kind == 0 && m > 1))) {
+          continue;
+        }
+        if (kv.kind >= 14) {
+          const int M = ks[kv.kind - 14].M;
+          // a tile taller than m pads; one shorter than m/2 re-reads a lot
+          if (M > 2 * m && M != 1) { continue; }
+          if (M < m && M != 4 && M != 2 && M != 8) { continue; }
+        }
         auto dispatch_R = [&](int reps, bool cold) {
           metal_compute::CommandStream st = mc->make_command_stream();
           {
@@ -785,6 +899,16 @@ TEST(metal_lm_smoke, qmv_batch_bandwidth_sweep) {
                   e.dispatch({32u, (unsigned)(sh.n / 4),
                               (unsigned)((m + 3) / 4)}, {32u, 2u, 1u});
                   break;
+                case 14: case 15: case 16: case 17: case 18: case 19:
+                case 20: {
+                  const KsFn& k = ks[kv.kind - 14];
+                  bind(const_cast<metal_compute::ComputeFunction&>(k.fn));
+                  e.set_constant(7, m);
+                  e.dispatch({(unsigned)(32 * k.KP), (unsigned)(sh.n / 4),
+                              (unsigned)((m + k.M - 1) / k.M)},
+                             {(unsigned)(32 * k.KP), 1u, 1u});
+                  break;
+                }
                 case 13: {
                   // Heterogeneous 2-read plan for m=5..6: xp4 on rows 0..3
                   // (one weight read @ ~84 GB/s) + batch MAXM=2 on the

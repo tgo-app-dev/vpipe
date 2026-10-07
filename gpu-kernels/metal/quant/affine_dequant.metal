@@ -361,6 +361,54 @@ kernel void affine_quant_rows_w8g64(
   }
 }
 
+// The 4-bit twin of affine_quant_rows_w8g64: same contract (VPIPE_ELT
+// scales / biases, codes fit to the ROUNDED pair, rows placed at
+// r * row_mul + row_add), 15 steps a group, eight codes a word at nibble
+// i << 4i -- the order affine_qmv / affine_qmm read. Used for a model that
+// holds a raw checkpoint at 4 bits in memory (the DFlash drafter's w4).
+//   0:x(VPIPE_ELT [N,K]) 1:w(u32) 2:scales 3:biases (VPIPE_ELT)
+//   4:K 5:N 6:row_mul 7:row_add       grid {K/64, N, 1}
+kernel void affine_quant_rows_w4g64(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device uint32_t*        w      [[buffer(1)]],
+    device VPIPE_ELT*       s      [[buffer(2)]],
+    device VPIPE_ELT*       b      [[buffer(3)]],
+    const constant int&     K      [[buffer(4)]],
+    const constant int&     N      [[buffer(5)]],
+    const constant int&     row_mul [[buffer(6)]],
+    const constant int&     row_add [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int grp = (int)gid.x;           // 0 .. K/64-1
+  const int n   = (int)gid.y;           // 0 .. N-1
+  const int KG  = K / 64;
+  if (n >= N || grp >= KG) { return; }
+  const int64_t dn = (int64_t)n * row_mul + row_add;
+  const device VPIPE_ELT* xp = x + (int64_t)n * K + (int64_t)grp * 64;
+  float mn = INFINITY, mx = -INFINITY;
+  for (int i = 0; i < 64; ++i) {
+    const float v = (float)xp[i];
+    mn = min(mn, v); mx = max(mx, v);
+  }
+  const VPIPE_ELT se = (VPIPE_ELT)((mx - mn) / 15.0f);
+  const VPIPE_ELT be = (VPIPE_ELT)mn;
+  s[dn * KG + grp] = se;
+  b[dn * KG + grp] = be;
+  const float sf  = (float)se;
+  const float bf  = (float)be;
+  const float inv = (sf > 0.0f) ? 1.0f / sf : 0.0f;
+  device uint32_t* wp = w + dn * (K / 8) + (int64_t)grp * 8;
+  for (int wi = 0; wi < 8; ++wi) {
+    uint32_t packed = 0;
+    for (int i = 0; i < 8; ++i) {
+      const float v = (float)xp[wi * 8 + i];
+      const int q = clamp((int)round((v - bf) * inv), 0, 15);
+      packed |= ((uint32_t)q) << (4 * i);
+    }
+    wp[wi] = packed;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // ROW PLACEMENT for a model that STREAMS an affine pack: the pack stores q,
 // k, v and gate, up as separate [N, K] tensors, and the forward reads them

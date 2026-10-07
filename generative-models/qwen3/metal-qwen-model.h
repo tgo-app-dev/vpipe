@@ -46,6 +46,8 @@ namespace vpipe::genai {
 struct ModelConfig;
 class I8GemmContext;   // fwd (shared/i8-gemm.h)
 class WeightSet;       // generative-models/weight-set.h
+class MetalDFlashDrafter;   // shared/dflash-drafter.h
+class DFlashTarget;         // shared/dflash-drafter.h
 class MetalLlamaWeights;   // llama3/metal-llama-weights.h
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
@@ -83,9 +85,14 @@ struct MtpDecodeCtl {
   // committed token IS the verifier's pick from the correctly-conditioned P, so
   // the output distribution is exactly autoregressive sampling from the main
   // model -- the drafter (MTP head, still argmax) only affects acceptance rate,
-  // not the tokens. (Penalties/seen-set are NOT applied in the verify; the
-  // caller restricts the sampled path to no-penalty configs.)
+  // not the tokens. Repetition / presence PENALTIES apply too: each verified
+  // position samples against the seen-set pdecode would hold at that step
+  // (`prime`, every token kept before, the drafts up to it), so penalised
+  // sampling stays token-exact with pdecode_begin(prime) as well.
   GpuSamplerParams sampler{};
+  // The prompt the penalty seen-set starts from (pdecode_begin's `prompt`);
+  // first_token is added to it. Unused without penalties.
+  std::span<const std::int32_t> prime;
 };
 
 class MetalQwenModel {
@@ -129,6 +136,11 @@ public:
     // loads the *_bf16 kernel metallibs and keeps the checkpoint's bf16
     // scales/norms/conv raw (no load-time conversion).
     bool  use_bf16    = false;
+    // A SEPARATE MTP drafter's directory (LoadSpec::mtp_dir): its
+    // model.safetensors carries the head under bare names (fc, layers.0,
+    // norm, pre_fc_norm_*), its norms TRUE weights, its fc quantized.
+    // Probed before the model's own head.
+    std::string mtp_dir;
     // Quantization bit-width of the linear weights: 4 (Qwen3.5/Llama) or
     // 8 (Qwen3-ASR). Selects the affine_qmv/affine_qmm_steel w4g64 vs
     // w8g64 kernel entry points and the packed-weight row stride.
@@ -665,9 +677,15 @@ public:
 
   // ---- MTP speculative decode (Multi-Token Prediction) ----------------
   // Whether a bundled MTP head (mtp.safetensors: one full-attn decoder layer
-  // + the eh-fusion `fc` and pre-norms) was loaded. Drives the spec-decode
-  // fast path; false => callers use the plain serial decode.
-  bool has_mtp() const noexcept { return _mtp.ok; }
+  // + the eh-fusion `fc` and pre-norms) was loaded AND this model's layout
+  // can run it. Drives the spec-decode fast path; false => callers use the
+  // plain serial decode. mtp_decode verifies on the de-fused mixed-affine,
+  // k-quant and dense layouts only: a UNIFORM affine model (mlx-community's
+  // plain 4-bit) with a head beside it -- one lent from its OptiQ pack --
+  // loads the head, but mtp_decode refuses it, and reporting it usable sent
+  // text-chat down a path that emitted nothing past the first token.
+  bool has_mtp() const noexcept
+  { return _mtp.ok && (_mixed || _kquant || _dense); }
 
   // Speculative greedy decode with the MTP head as the drafter and THIS model
   // as the verifier. Generates up to `n_steps` tokens from `first_token`
@@ -704,6 +722,59 @@ public:
   // depth-1 decode's MTP attention window). Prints + returns the hit/total.
   bool mtp_teacher_force(ContextId cid, const std::vector<std::int32_t>& cont,
                          int chunk, long* d1_hits, long* d1_total);
+
+  // ---- DFlash block-drafter speculative decode --------------------------
+  // A DFlash / DFlash 2 drafter (shared/dflash-drafter.h) borrows this
+  // model's embedding and lm_head and conditions on the residual stream at
+  // its target_layer_ids. Once attached, every TEXT prefill taps those
+  // layers and feeds the drafter's context cache, and dflash_decode()
+  // drafts a block per round, verifies it in one forward, and keeps the
+  // longest prefix the verifier agrees with. Runs on every layout this
+  // model loads (uniform affine, mixed, k-quant, dense) -- unlike MTP it
+  // does not ask for the de-fused layout. Detach with nullptr.
+  bool attach_dflash(std::unique_ptr<MetalDFlashDrafter> drafter,
+                     std::string* err = nullptr);
+  bool has_dflash() const noexcept { return _dflash != nullptr; }
+  // The split-K verify / batched-decode GEMV tiles (see _ks_verify), on
+  // or off for this model -- e.g. a test pinning the row-identical
+  // ladder to prove the speculative loop exact against serial decode.
+  // A no-op where the tiles did not load (8-bit, k-quant).
+  void set_qmv_ksplit(bool verify, bool batched) noexcept
+  {
+    _ks_verify = verify && _ks_loaded;
+    _ks_batched = batched && _ks_loaded;
+  }
+  // Split-K GEMV dispatches encoded so far: a test's proof the tier ran.
+  std::uint64_t qmv_ksplit_dispatches() const noexcept
+  {
+    return _ks_dispatches;
+  }
+  const MetalDFlashDrafter* dflash() const noexcept { return _dflash.get(); }
+  // The attached drafter and this model's embedding + head as the drafter
+  // sees them -- for a test that drives ingest / draft by hand. Null when
+  // nothing is attached.
+  MetalDFlashDrafter* dflash_mut() noexcept { return _dflash.get(); }
+  DFlashTarget* dflash_target() noexcept;
+
+  // Counters of one speculative decode.
+  struct SpecStats {
+    long   rounds   = 0;    // verify forwards
+    long   drafted  = 0;    // draft tokens offered to the verifier
+    long   accepted = 0;    // of those, kept
+    double gpu_ms   = 0.0;  // wall time of the round command buffers
+  };
+
+  // Speculative decode with the DFlash drafter: the dflash counterpart of
+  // mtp_decode, same contract (first_token not yet appended; out_ids
+  // includes it and excludes a stop token; greedy is token-exact vs a
+  // greedy loop, a sampler vs decode_pipelined with the same seed and
+  // prime, penalties included). `block` overrides the drafter's trained
+  // block size (2 .. its block_size; 0 = trained). False when no drafter
+  // is attached or a round failed before anything was kept.
+  bool dflash_decode(ContextId cid, std::int32_t first_token, int n_steps,
+                     std::vector<std::int32_t>& out_ids,
+                     const MtpDecodeCtl& ctl = {}, int block = 0,
+                     SpecStats* stats = nullptr);
 
   // Toggle the shared-prefix batched decode attention at runtime (default set
   // at load from VPIPE_QWEN_SHARED_ATTN + kernel availability). For A/B tests
@@ -759,6 +830,8 @@ public:
   bool uses_mixed_precision() const noexcept { return _mixed; }
   // Native k-quant (GGUF) path engaged (per-tensor q4_K/q5_K/q6_K blocks).
   bool uses_kquant() const noexcept { return _kquant; }
+  // Unquantized (dense f16/bf16) linears: no affine GEMV tiers apply.
+  bool uses_dense() const noexcept { return _dense; }
 
 private:
   MetalQwenModel() = default;
@@ -887,7 +960,9 @@ private:
   // *taps_out at slot offset j*n*H (j = index into tap_layers) -- the
   // per-layer hidden states a downstream consumer conditions on (matches HF
   // output_hidden_states[L+1]). *taps_out must be a [tap_layers->size()*n*H]
-  // compute-dtype buffer. No effect when either is null.
+  // compute-dtype buffer. No effect when either is null. `tap_row0` > 0
+  // taps only rows [tap_row0, n) -- the DFlash drafter's window of a long
+  // prefill -- and *taps_out is then [size][n - tap_row0][H].
   // A prefill IN WINDOWS (forward_embeddings_taps_batch): one call runs
   // the layers [begin, end) of one sequence, the next continues where it
   // stopped -- the residual stream is the caller's `x`, updated in place.
@@ -920,7 +995,7 @@ private:
       metal_compute::SharedBuffer* taps_out = nullptr,
       int key_valid_len = 0, int stop_after_layer = -1,
       const DeepstackInject* deepstack = nullptr,
-      PrefillWindow* win = nullptr);
+      PrefillWindow* win = nullptr, int tap_row0 = 0);
 
 
   // ---- Batched (N-branch parallel) decode --------------------------
@@ -1403,6 +1478,44 @@ private:
   };
   QmvPlan _qmv_plan[kQmvBatchMaxRows + 1] = {};
   bool _qmv_plan_probed = false;
+  // Split-K GEMV tiles (affine_qmv_ks<r>_w4g64 + SwiGLU twins, indexed by
+  // the tile's row count 2/3/4/6): KP=2 simdgroups each reduce half of K
+  // over 4 output columns, with x kept in its storage type, so 4 rows
+  // read a weight about as fast as one row does -- where the ladder
+  // above pays ~1.7x (M4 Pro, 27B lm_head: 3.20 vs 5.40 ms at m=4). The
+  // rows sum in another order: NOT bit-identical to the single-row qmv
+  // (within an ulp), so a greedy run can split a near-tie with serial.
+  // They engage by CALLER -- the speculative verify (MTP, DFlash) and
+  // batched decode, both by default; never the single-row decode.
+  // VPIPE_QMV_KSPLIT=0 off, 1 verify only, 2 verify + batched decode
+  // (default); set_qmv_ksplit() overrides.
+  enum class KsScope : std::uint8_t { kNone, kVerify, kBatched };
+  metal_compute::ComputeFunction _fn_qmv_ks[7], _fn_qmv_ks_swiglu[7];
+  bool _ks_loaded = false, _ks_verify = false, _ks_batched = false;
+  KsScope _ks_scope = KsScope::kNone;
+  mutable std::uint64_t _ks_dispatches = 0;
+  // Marks which caller is encoding for the span of one encode.
+  class KsScopeGuard {
+  public:
+    KsScopeGuard(MetalQwenModel& m, KsScope s) : _m(m), _prev(m._ks_scope)
+    {
+      m._ks_scope = s;
+    }
+    ~KsScopeGuard() { _m._ks_scope = _prev; }
+    KsScopeGuard(const KsScopeGuard&) = delete;
+    KsScopeGuard& operator=(const KsScopeGuard&) = delete;
+
+  private:
+    MetalQwenModel& _m;
+    KsScope _prev;
+  };
+  bool ks_dispatch_(metal_compute::ComputeEncoder& enc, int m,
+                    const metal_compute::SharedBuffer& w,
+                    const metal_compute::SharedBuffer& s,
+                    const metal_compute::SharedBuffer& b,
+                    const metal_compute::SharedBuffer& xin,
+                    const metal_compute::SharedBuffer& y,
+                    int Kk, int Nout, bool swiglu) const;
   void qmv_ladder_defaults_();
   void autotune_qmv_ladder_();
   // Matrix-core prefill path (M5+). Set at load when the GPU has matrix
@@ -1618,6 +1731,69 @@ private:
     std::vector<metal_compute::SharedBuffer> qkv, gbuf, betabuf;
   };
 
+  // What the DFlash decode adds to mtp_verify_chunk_.
+  struct VerifyOpts {
+    // Encoded FIRST in the verify's encoder, before the layer stack: the
+    // previous round's GDN replay, the drafter's ingest + draft, and the
+    // embed gather that fills `x` from the drafted ids -- so a whole round
+    // is one command buffer.
+    std::function<void(metal_compute::ComputeEncoder&)> prologue;
+    // Snapshot the residual stream after each of these layers into `taps`
+    // [tap_layers.size()][n][H], layer-major (HF hidden_states[L + 1]).
+    const std::vector<int>*            tap_layers = nullptr;
+    const metal_compute::SharedBuffer* taps = nullptr;
+    // GDN batched over the n rows, reading ring slot 0 and writing slot 1,
+    // with the step inputs captured into the gcache for a replay of the
+    // kept prefix (encode_gdn_replay2_). Needs the ring on (depth >= 1).
+    bool gdn_ring2 = false;
+  };
+
+  // Re-advance every GDN layer from ring slot 0 to slot 1 over the first
+  // `keep` rows of the last verify's captured inputs (gc): the partial-
+  // accept half of VerifyOpts::gdn_ring2, encoded into the caller's
+  // encoder. Same kernels, same inputs -> the state a keep-row verify
+  // would have left. The caller advances the ring cursor afterwards.
+  void encode_gdn_replay2_(metal_compute::ComputeEncoder& enc, ContextId cid,
+                           int keep, const GdnVerifyCache& gc);
+
+  // ---- DFlash state ----
+  // The adaptive round length (dflash_decode with block 0): what a round
+  // of each candidate length COSTS on this machine (an EMA of its wall
+  // time) against what it YIELDS (the acceptance of draft i given every
+  // draft before it accepted), picking the length with the most tokens a
+  // millisecond. Kept across decodes; reset on attach. Verifying a row
+  // costs nearly a decode step on a GPU without matrix cores and a
+  // fraction of one with them, so the answer is the machine's, not the
+  // drafter's.
+  struct DFlashTuner {
+    std::vector<int>    cand;      // candidate lengths, ascending
+    std::vector<double> cost;      // EMA ms a round, per candidate
+    std::vector<int>    seen;      // rounds measured, per candidate
+    std::vector<long>   reach;     // per draft position i (index i)
+    std::vector<long>   hit;
+    long                rounds = 0;
+    int                 last = -1; // candidate index of the last pick
+    void reset(int trained);
+    int  pick(int budget);         // a length <= budget, >= 1
+    void record(int L, double ms, int run);
+    double expect(int L) const;    // tokens a round of length L yields
+  };
+  DFlashTuner _dflash_tuner;
+  std::unique_ptr<MetalDFlashDrafter> _dflash;
+  // The target context the drafter's context cache describes; a prefill
+  // or decode on another context resets it.
+  ContextId _dflash_cid{};
+  class DFlashHooks;                       // DFlashTarget over this model
+  std::unique_ptr<DFlashHooks> _dflash_hooks;
+  // Prefill rows worth tapping for the drafter: its widest window (every
+  // row when a layer attends the full context).
+  int dflash_tap_rows_(int n) const;
+  // Point the drafter at `cid`, resetting its cache on a switch.
+  void dflash_bind_ctx_(ContextId cid);
+  // An embedding / multimodal prefill on `cid`, which the drafter does
+  // not tap: resets it when the prefill starts a fresh context.
+  void dflash_untapped_(ContextId cid);
+
   // (The sibling mtp.safetensors is loaded inline in load(), reusing the same
   // weight reader + 4-bit qtri/fuse/interleave helpers as the main layers.)
   // Reset the MTP head's local KV context (a fresh drafting window per verify).
@@ -1708,7 +1884,8 @@ private:
                          const metal_compute::SharedBuffer* mtp_cond = nullptr,
                          const std::function<
                              void(metal_compute::ComputeEncoder&)>&
-                             pre_commit = {});
+                             pre_commit = {},
+                         const VerifyOpts* vo = nullptr);
 
   // Partial-accept GDN rollback. With every linear layer's conv/ssm recurrent
   // state restored to the round's S0 snapshot, replay conv1d -> qk_norm ->
@@ -1901,6 +2078,9 @@ private:
   // accuracy (0.63->0.88) on a fixed sequence, the whole vpipe->reference gap.
   // Set per-decode from VPIPE_MTP_NO_PERSIST in mtp_decode (default ON).
   bool _mtp_persist = false;
+  // Penalised speculative sampling: the verify's per-position seen-sets
+  // ([n, vocab] uint8), set by mtp_decode for one verify; empty otherwise.
+  std::vector<std::uint8_t> _mtp_seen_rows;
   // _lc_mlogits2 holds the SECOND chained MTP-head application's logits (the
   // depth-2 draft q2); _lc_mlogits is the first (q1), _lc_vlogits the verifier.
   metal_compute::SharedBuffer _lc_vlogits, _lc_mlogits, _lc_mlogits2;

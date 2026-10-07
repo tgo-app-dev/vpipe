@@ -320,13 +320,16 @@ TEST(model_catalog, qwen38_27b_family) {
   auto p = catalog_param_classes("Qwen", "3.8");
   EXPECT_TRUE(p.size() == 1);
   EXPECT_TRUE(has_(p, "27B"));
-  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 4);
+  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 6);
 
   struct Row { const char* path; const char* variant; };
   const Row rows[] = {
       {"Qwen/Qwen3.8-27B", "bf16 (Qwen)"},
       {"lmstudio-community/Qwen3.8-27B-MLX-4bit",
        "MLX 4-bit (lmstudio-community)"},
+      {"mlx-community/Qwen3.8-27B-4bit", "MLX 4-bit (mlx-community)"},
+      {"mlx-community/Qwen3.8-27B-OptiQ-4bit",
+       "MLX OptiQ 4-bit (mlx-community)"},
       {"unsloth/Qwen3.8-27B-GGUF", "Q4_K_M GGUF +mmproj (unsloth)"},
   };
   for (const Row& r : rows) {
@@ -344,10 +347,14 @@ TEST(model_catalog, qwen38_27b_family) {
     EXPECT_FALSE(e->needs_tokenizer_json);
   }
 
-  // Only the GGUF entry pins files; the two safetensors repos fetch whole.
+  // Only the GGUF entry pins files; the safetensors repos fetch whole --
+  // the OptiQ pack's optiq/ companions (its MTP head) with it.
   EXPECT_TRUE(catalog_by_path("Qwen/Qwen3.8-27B")->files.empty());
   EXPECT_TRUE(
       catalog_by_path("lmstudio-community/Qwen3.8-27B-MLX-4bit")
+          ->files.empty());
+  EXPECT_TRUE(
+      catalog_by_path("mlx-community/Qwen3.8-27B-OptiQ-4bit")
           ->files.empty());
   // TWO GGUF rows share the repo -- one per quantization point -- so the
   // by-path lookup answers with the first (documented) and the caller
@@ -1485,4 +1492,32 @@ TEST(model_catalog, minimax_h3_image_vae_entry) {
   EXPECT_TRUE(has_(e->inputs, "image"));
   EXPECT_TRUE(has_(e->outputs, "image"));
   EXPECT_TRUE(e->inputs.size() == 1 && e->outputs.size() == 1);
+}
+
+// The DFlash drafters are SUPPLEMENTS of the target they were trained
+// for: no modality of their own, and a parent pinned by type and size so
+// a picker offers each beside the right model only.
+TEST(model_catalog, dflash_drafters) {
+  struct Row {
+    const char* path;
+    const char* type;
+    const char* version;
+    const char* parent_class;
+  };
+  const Row rows[] = {
+      {"incoai/Qwen3.8-27B-DFlash2", "dflash2", "2", "27B"},
+      {"z-lab/Qwen3.5-4B-DFlash", "dflash", "1", "4B"},
+  };
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "DFlash");
+    EXPECT_TRUE(e->version == r.version);
+    EXPECT_TRUE(e->model_type == r.type);
+    EXPECT_TRUE(e->parent_model_type == "qwen3.5");
+    EXPECT_TRUE(e->parent_param_class == r.parent_class);
+    EXPECT_TRUE(e->inputs.empty() && e->outputs.empty());
+    EXPECT_FALSE(e->needs_tokenizer_json);
+  }
 }

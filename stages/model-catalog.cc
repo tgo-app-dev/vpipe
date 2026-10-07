@@ -278,6 +278,18 @@ builtin_catalog_()
      .variant = "MLX 4-bit (lmstudio-community)",
      .hf_path = "lmstudio-community/Qwen3.8-27B-MLX-4bit",
      .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // The same 27B pre-quantized OptiQ, as the 3.6 OptiQ pack below:
+    // mixed 4/8-bit per linear over a group-64 affine base, 4 shards
+    // (19.4 GB) plus the OptiQ companions in optiq/ -- mtp.safetensors,
+    // the MTP draft head text-chat decodes with (its `mtp`, on by
+    // default), and optiq_vision.safetensors, the vision tower. A
+    // whole-repo fetch (no `files`), so the recursive tree walk brings
+    // the subdir along. 20.7 GB in all: the assistant Valtz offers on a
+    // 24 GB Mac.
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
     // GGUF. The repo ships ~23 quantization points plus two projectors,
     // so the entry pins ONE quant and the projector rather than pulling
     // all of them.
@@ -319,6 +331,37 @@ builtin_catalog_()
      .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
      .files = {"Qwen3.8-27B-Q8_0.gguf",    // main quant
                "mmproj-F16.gguf"},         // F16 multimodal projector
+     .needs_tokenizer_json = false},
+    // mlx-community's plain 4-bit conversion: uniform group-affine like the
+    // lmstudio one above (no MTP head; the tower in the shards). It is the
+    // target the DFlash 2 drafter below was published against.
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "MLX 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-27B-4bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // ---- DFlash block drafters (speculative decoding) -------------------
+    //
+    // Not models of their own: a drafter has no embedding and no head; it
+    // borrows both from its target and conditions on the target's hidden
+    // states (shared/dflash-drafter.h). text-chat's `draft_model` names
+    // one. Each is trained for ONE target -- the parent row below -- and
+    // attaching it elsewhere is refused at load (layer count, width,
+    // vocabulary are checked).
+    //
+    // DFlash 2 (Inco AI): five layers, a 2B-parameter bf16 checkpoint
+    // (3.8 GB; held at w8 or w4 in memory by default), drafting 7 tokens a
+    // block along one candidate path. z-lab/Qwen3.8-27B-DFlash2 is the same
+    // checkpoint mirrored.
+    {.family = "DFlash", .version = "2", .param_class = "27B",
+     .variant = "drafter for Qwen3.8-27B (incoai)",
+     .hf_path = "incoai/Qwen3.8-27B-DFlash2", .model_type = "dflash2",
+     .parent_model_type = "qwen3.5", .parent_param_class = "27B",
+     .needs_tokenizer_json = false},
+    // DFlash (z-lab): six layers, block 16, for Qwen3.5-4B.
+    {.family = "DFlash", .version = "1", .param_class = "4B",
+     .variant = "drafter for Qwen3.5-4B (z-lab)",
+     .hf_path = "z-lab/Qwen3.5-4B-DFlash", .model_type = "dflash",
+     .parent_model_type = "qwen3.5", .parent_param_class = "4B",
      .needs_tokenizer_json = false},
     // Qwen3.6-27B: a Qwen3.5-family hybrid VLM (model_type "qwen3_5",
     // full-attn + gated-DeltaNet, 64 layers, hidden 5120). bf16 source

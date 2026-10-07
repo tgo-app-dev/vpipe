@@ -33,6 +33,7 @@ set(LOCAL_SOURCES
   shared/ane-tier.cc
   shared/comfy-checkpoint.cc
   shared/comfy-output-config.cc
+  shared/dflash-drafter.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
   shared/grounded-encode-params.cc

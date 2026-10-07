@@ -6,17 +6,23 @@
 #include "generative-models/model-loader.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
+#include "common/flex-bag.h"
 #include "common/vpipe-format.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/wire-on-alloc.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 
+#include <libproc.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
 #include <cerrno>
 #include <cstring>
+#include <optional>
 
 #include <chrono>
 #include <exception>
@@ -84,6 +90,9 @@ GenerativeModelManager::KeyHash::operator()(const Key& k) const noexcept
   mix(hash<string>{}(k.compute_dtype));
   mix(hash<int>{}(k.page_tokens));
   mix(hash<uint32_t>{}(k.max_pages));
+  mix(hash<string>{}(k.mtp_dir));
+  mix(hash<string>{}(k.draft_dir));
+  mix(hash<int>{}(k.draft_bits));
   return h;
 }
 std::string
@@ -276,8 +285,54 @@ GenerativeModelManager::wired_pool_device_max() const
   return rec;
 }
 
+namespace {
+
+// This process's wired memory, as the kernel counts it (mlock'd pages
+// included); 0 when it will not say.
+std::size_t
+process_wired_bytes()
+{
+  rusage_info_v4 ri{};
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4,
+                      reinterpret_cast<rusage_info_t*>(&ri)) != 0) {
+    return 0;
+  }
+  return static_cast<std::size_t>(ri.ri_wired_size);
+}
+
+// The bytes of wired-model records whose model is gone, those records
+// dropped. A template, not a method: a private method of the manager is
+// an exported symbol (see `_warm` in the header).
+template <class Records>
+std::size_t
+gone_wired_bytes(Records& recs)
+{
+  std::size_t n = 0;
+  for (auto it = recs.begin(); it != recs.end();) {
+    if (it->lm.expired()) {
+      n += it->bytes;
+      it = recs.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return n;
+}
+
+}  // namespace
+
 GenerativeModelManager::~GenerativeModelManager()
 {
+  // The warm models first: they hold weight sets of their own.
+  std::vector<Warm> warm;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    _warm_stop = true;
+    warm.swap(_warm);
+  }
+  _warm_cv.notify_all();
+  if (_warm_reaper.joinable()) { _warm_reaper.join(); }
+  warm.clear();
   // See the declaration: the sets must be released while the registry
   // they deregister from is still alive.
   std::unordered_map<string, shared_ptr<WeightSet>> sets;
@@ -1658,10 +1713,25 @@ GenerativeModelManager::GenerativeModelManager(const SessionContextIntf* s)
 shared_ptr<LoadedLanguageModel>
 GenerativeModelManager::load(const LoadSpec& spec)
 {
+  const std::string mtp_spec = bag::text(spec.extra, load_spec::kMtpDir);
   Key key{ canonicalize_(session(), spec.hf_dir),
            spec.compute_dtype,
            spec.page_tokens,
-           spec.max_pages };
+           spec.max_pages,
+           mtp_spec.empty() ? std::string()
+                            : canonicalize_(session(), mtp_spec) };
+  {
+    const std::string dd = bag::text(spec.extra, load_spec::kDraftDir);
+    key.draft_dir = dd.empty() ? std::string() : canonicalize_(session(), dd);
+    key.draft_bits = (int)bag::integer(spec.extra, load_spec::kDraftBits, 8);
+  }
+
+  // Models wired by an earlier load that are gone give their bytes back
+  // to the pool before this one sizes anything.
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    release_external_wired(gone_wired_bytes(_wired_lms));
+  }
 
   // Fast path: existing live entry. Locked briefly; the lookup is
   // O(1) and weak_ptr::lock() is a couple of atomics.
@@ -1697,11 +1767,14 @@ GenerativeModelManager::load(const LoadSpec& spec)
   const string dir = key.hf_dir;
   const int    page_tokens = key.page_tokens;
   const uint32_t max_pages = key.max_pages;
+  const string mtp_dir = key.mtp_dir;
+  const string draft_dir = key.draft_dir;
+  const int    draft_bits = key.draft_bits;
   using ProfClock = std::chrono::steady_clock;
   const bool profile_load = std::getenv("VPIPE_LOAD_PROFILE") != nullptr;
   auto build =
       [this, &dir, compute_dtype, page_tokens, max_pages, rt,
-       profile_load]
+       profile_load, &mtp_dir, &draft_dir, draft_bits]
       () -> shared_ptr<LoadedLanguageModel> {
         auto t0 = ProfClock::now();
         ModelLoader loader(session());
@@ -1742,9 +1815,26 @@ GenerativeModelManager::load(const LoadSpec& spec)
         auto built = make_shared<LoadedLanguageModel>(
             std::move(*loaded), std::move(tok),
             compute_dtype, page_tokens, max_pages,
-            rt, session(), std::string(dir));
+            rt, session(), std::string(dir), mtp_dir);
         if (!built->valid()) {
           return nullptr;
+        }
+        // A DFlash drafter is an accelerator: one that cannot draft for
+        // this model is warned about and the model serves without it.
+        if (!draft_dir.empty()) {
+          std::string err;
+          if (!built->attach_draft_model(draft_dir, draft_bits, &err)) {
+            if (session()) {
+              session()->warn(fmt(
+                  "GenerativeModelManager::load('{}'): drafter '{}' not "
+                  "attached: {}", dir, draft_dir, err));
+            }
+          } else if (session()) {
+            session()->info(fmt(
+                "GenerativeModelManager::load('{}'): {} drafter '{}' "
+                "attached (w{})", dir, built->spec_drafter(), draft_dir,
+                draft_bits));
+          }
         }
         auto t3 = ProfClock::now();
         if (profile_load && session()) {
@@ -1755,8 +1845,17 @@ GenerativeModelManager::load(const LoadSpec& spec)
         return built;
       };
   // Metal-only: run inline -- the metal backend loads its own weights
-  // and the LM's dispatch_() runs inline when runtime == nullptr.
-  shared_ptr<LoadedLanguageModel> lm = build();
+  // and the LM's dispatch_() runs inline when runtime == nullptr. Inline is
+  // also what lets a WireOnAlloc scope on this thread see every buffer the
+  // load makes (load_spec::kWireWeights).
+  const bool wire = bag::flag(spec.extra, load_spec::kWireWeights);
+  const std::size_t wired_before = wire ? process_wired_bytes() : 0;
+  shared_ptr<LoadedLanguageModel> lm;
+  {
+    std::optional<metal_compute::WireOnAlloc> scope;
+    if (wire) { scope.emplace(); }
+    lm = build();
+  }
   if (!lm) {
     if (session()) {
       session()->warn(fmt(
@@ -1764,6 +1863,24 @@ GenerativeModelManager::load(const LoadSpec& spec)
           "(see prior warns)", key.hf_dir));
     }
     return nullptr;
+  }
+  // What the load left wired -- its temporaries, freed, already gave
+  // theirs back to the kernel -- is charged to the pool while it lives, so
+  // every model sizing its resident set plans around it.
+  if (wire) {
+    const std::size_t now = process_wired_bytes();
+    const std::size_t bytes = now > wired_before ? now - wired_before : 0;
+    charge_external_wired(bytes);
+    {
+      lock_guard<mutex> lk(_warm_mu);
+      _wired_lms.push_back(Wired{lm, bytes});
+    }
+    if (session()) {
+      session()->info(fmt(
+          "GenerativeModelManager::load('{}'): {} MB wired as it loaded "
+          "(the compressor cannot take it; charged to the wired pool)",
+          key.hf_dir, bytes >> 20));
+    }
   }
 
   // Re-lock and stash the result. If a racing thread already
@@ -1781,6 +1898,123 @@ GenerativeModelManager::load(const LoadSpec& spec)
     _cache[key] = lm;
   }
   return lm;
+}
+
+void
+GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
+                                  const string& dir, double seconds)
+{
+  if (!lm) { return; }
+  const string key = canonicalize_(session(), dir);
+  shared_ptr<LoadedLanguageModel> dropped;   // freed outside the lock
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    if (_warm_stop) { return; }
+    auto it = std::find_if(_warm.begin(), _warm.end(),
+                           [&](const Warm& w) { return w.lm == lm; });
+    if (seconds <= 0) {
+      if (it != _warm.end()) {
+        dropped = std::move(it->lm);
+        _warm.erase(it);
+      }
+    } else {
+      const auto until = std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(seconds));
+      if (it != _warm.end()) {
+        it->until = std::max(it->until, until);
+      } else {
+        _warm.push_back(Warm{lm, key, until});
+      }
+      if (!_warm_reaper.joinable()) {
+        _warm_reaper = std::thread([this] {
+          std::unique_lock<mutex> rl(_warm_mu);
+          while (!_warm_stop) {
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<Warm> expired;
+            auto soonest = std::chrono::steady_clock::time_point::max();
+            for (auto w = _warm.begin(); w != _warm.end();) {
+              if (w->until <= now) {
+                expired.push_back(std::move(*w));
+                w = _warm.erase(w);
+              } else {
+                soonest = std::min(soonest, w->until);
+                ++w;
+              }
+            }
+            if (!expired.empty()) {
+              // Freed with the lock dropped: a 16 GB model's buffers take
+              // a moment, and a keep_warm must not wait on them.
+              rl.unlock();
+              for (const auto& w : expired) {
+                if (session()) {
+                  session()->info(fmt(
+                      "GenerativeModelManager: '{}' was kept warm and is "
+                      "now idle -- unloaded", w.dir));
+                }
+              }
+              expired.clear();
+              rl.lock();
+              release_external_wired(gone_wired_bytes(_wired_lms));
+              continue;
+            }
+            if (soonest == std::chrono::steady_clock::time_point::max()) {
+              _warm_cv.wait(rl);
+            } else {
+              _warm_cv.wait_until(rl, soonest);
+            }
+          }
+        });
+      }
+    }
+  }
+  _warm_cv.notify_all();
+}
+
+size_t
+GenerativeModelManager::release_warm_unclaimed()
+{
+  std::unordered_set<string> declared;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    for (const auto& [dir, bytes] : _declared) {
+      if (bytes > 0) { declared.insert(dir); }
+    }
+  }
+  if (declared.empty()) { return 0; }
+  std::vector<Warm> gone;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto it = _warm.begin(); it != _warm.end();) {
+      if (declared.count(it->dir) == 0) {
+        gone.push_back(std::move(*it));
+        it = _warm.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (const auto& w : gone) {
+    if (session()) {
+      session()->info(fmt(
+          "GenerativeModelManager: '{}' was kept warm; this launch does "
+          "not use it -- unloaded to make room", w.dir));
+    }
+  }
+  const std::size_t n = gone.size();
+  gone.clear();   // the models go now -- and what they had wired with them
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    release_external_wired(gone_wired_bytes(_wired_lms));
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_count() const
+{
+  lock_guard<mutex> lk(_warm_mu);
+  return _warm.size();
 }
 
 size_t

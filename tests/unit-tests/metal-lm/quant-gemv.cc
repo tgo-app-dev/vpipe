@@ -200,6 +200,181 @@ TEST(metal_lm_smoke, qmv_batch_tg_matches_batch) {
   }
 }
 
+// The split-K verify tiles (affine_qmv_ks<r>_w4g64 and their SwiGLU twins,
+// the speculative verify's default GEMV) against an fp32 CPU reference,
+// next to the register batch kernel (MAXM=2) they replace. They sum in
+// another order, so they cannot match it byte for byte; the bar is that
+// they are AS ACCURATE (rel-L2 to the reference within 1.25x the batch
+// kernel's) -- in bf16 both sit near one output ulp. And a row must come
+// out BYTE-IDENTICAL whichever tile computes it (2/3/4/6 rows, alone or
+// with others), or one token verified in two rounds could round two
+// ways. K=768 has a K-tail past the last 512-block; K=5120 is a real
+// width. Always-on (no model).
+TEST(metal_lm_smoke, qmv_ksplit_matches_batch) {
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  std::mt19937 rng(23);
+  std::uniform_int_distribution<std::uint32_t> du(0, 0xffffffffu);
+  std::uniform_real_distribution<float> df(-1.0f, 1.0f);
+  auto to_bf16 = [](float f) -> std::uint16_t {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto from_bf16 = [](std::uint16_t h) -> float {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  const int MM = 8, N = 128;
+  for (const bool bf : {false, true}) {
+    auto lib = mc->load_library(bf ? "affine_qmv_bf16" : "affine_qmv");
+    for (const int K : {768, 5120}) {
+      for (const bool sw : {false, true}) {
+        const int groups = K / 64, NO = sw ? N / 2 : N;
+        auto ref_fn = lib.function(sw ? "affine_qmv_batch_swiglu_w4g64"
+                                      : "affine_qmv_batch_w4g64");
+        ASSERT_TRUE(ref_fn.valid());
+        if (!ref_fn.valid()) { continue; }
+        const std::size_t wwords = (std::size_t)N * K / 8;
+        auto wb = mc->make_shared_buffer(wwords * 4);
+        auto sb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+        auto bb = mc->make_shared_buffer((std::size_t)N * groups * 2);
+        auto xb = mc->make_shared_buffer((std::size_t)MM * K * 2);
+        auto y0 = mc->make_shared_buffer((std::size_t)MM * NO * 2);
+        auto y1 = mc->make_shared_buffer((std::size_t)MM * NO * 2);
+        auto* wp = static_cast<std::uint32_t*>(wb.contents());
+        for (std::size_t i = 0; i < wwords; ++i) { wp[i] = du(rng); }
+        auto fill = [&](metal_compute::SharedBuffer& b, std::size_t n,
+                        float scale) {
+          auto* p = static_cast<std::uint16_t*>(b.contents());
+          for (std::size_t i = 0; i < n; ++i) {
+            const float v = df(rng) * scale;
+            if (bf) {
+              p[i] = to_bf16(v);
+            } else {
+              const __fp16 h = (__fp16)v;
+              std::memcpy(&p[i], &h, 2);
+            }
+          }
+        };
+        fill(sb, (std::size_t)N * groups, 0.02f);
+        fill(bb, (std::size_t)N * groups, 0.1f);
+        fill(xb, (std::size_t)MM * K, 1.0f);
+        auto val = [&](const metal_compute::SharedBuffer& y, int i) {
+          const auto* p = static_cast<const std::uint16_t*>(y.contents());
+          if (bf) { return from_bf16(p[i]); }
+          __fp16 h;
+          std::memcpy(&h, &p[i], 2);
+          return (float)h;
+        };
+        auto run = [&](const metal_compute::ComputeFunction& fn,
+                       metal_compute::SharedBuffer& y, int m, unsigned tx,
+                       unsigned tiles, unsigned tgx, unsigned tgy) {
+          metal_compute::CommandStream st = mc->make_command_stream();
+          {
+            metal_compute::ComputeEncoder e = st.begin_compute();
+            e.set_function(fn);
+            e.set_buffer(0, wb); e.set_buffer(1, sb); e.set_buffer(2, bb);
+            e.set_buffer(3, xb); e.set_buffer(4, y);
+            e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, m);
+            e.dispatch({tx, (unsigned)(N / 4), tiles}, {tgx, tgy, 1u});
+          }
+          st.commit().wait();
+        };
+        // fp32 CPU reference over the stored (rounded) inputs.
+        auto in_val = [&](const metal_compute::SharedBuffer& b,
+                          std::size_t i) {
+          const auto* p = static_cast<const std::uint16_t*>(b.contents());
+          if (bf) { return from_bf16(p[i]); }
+          __fp16 h;
+          std::memcpy(&h, &p[i], 2);
+          return (float)h;
+        };
+        std::vector<double> lin((std::size_t)MM * N, 0.0);
+        for (int n = 0; n < N; ++n) {
+          for (int k = 0; k < K; ++k) {
+            const std::uint32_t word = wp[(std::size_t)n * (K / 8) + k / 8];
+            const int q = (int)((word >> (4 * (k % 8))) & 0xFu);
+            const std::size_t g = (std::size_t)n * groups + k / 64;
+            const double wv = (double)q * in_val(sb, g) + in_val(bb, g);
+            for (int r = 0; r < MM; ++r) {
+              lin[(std::size_t)r * N + n] +=
+                  wv * in_val(xb, (std::size_t)r * K + k);
+            }
+          }
+        }
+        std::vector<double> cref((std::size_t)MM * NO);
+        for (int r = 0; r < MM; ++r) {
+          for (int o = 0; o < NO; ++o) {
+            if (!sw) {
+              cref[(std::size_t)r * NO + o] = lin[(std::size_t)r * N + o];
+            } else {
+              const double g = lin[(std::size_t)r * N + 2 * o];
+              const double u = lin[(std::size_t)r * N + 2 * o + 1];
+              cref[(std::size_t)r * NO + o] = g / (1.0 + std::exp(-g)) * u;
+            }
+          }
+        }
+        auto rel_to_ref = [&](const metal_compute::SharedBuffer& y, int m) {
+          double num = 0.0, den = 0.0;
+          for (int i = 0; i < m * NO; ++i) {
+            const double d = (double)val(y, i) - cref[(std::size_t)i];
+            num += d * d;
+            den += cref[(std::size_t)i] * cref[(std::size_t)i];
+          }
+          return std::sqrt(num / std::max(den, 1e-30));
+        };
+        // Row results of the first tile run, the byte-identity reference.
+        std::vector<std::uint16_t> first(
+            (std::size_t)MM * NO, 0);
+        bool have_first = false;
+        double worst = 0.0, worst_b = 0.0;
+        for (const int tr : {2, 3, 4, 6}) {
+          const std::string name = "affine_qmv_ks" + std::to_string(tr) +
+                                   (sw ? "_swiglu_w4g64" : "_w4g64");
+          auto fn = lib.function(name);
+          ASSERT_TRUE(fn.valid());
+          if (!fn.valid()) { continue; }
+          for (int m = 2; m <= MM; ++m) {
+            std::memset(y1.contents(), 0, y1.byte_size());
+            run(ref_fn, y0, m, 32u, (unsigned)((m + 1) / 2), 32u, 2u);
+            run(fn, y1, m, 64u, (unsigned)((m + tr - 1) / tr), 64u, 1u);
+            const double rel_b = rel_to_ref(y0, m);
+            const double rel = rel_to_ref(y1, m);
+            const auto* y1p = static_cast<const std::uint16_t*>(
+                y1.contents());
+            bool same = true;
+            if (!have_first) {
+              std::memcpy(first.data(), y1p, (std::size_t)m * NO * 2);
+              if (m == MM) { have_first = true; }
+            } else {
+              same = std::memcmp(first.data(), y1p,
+                                 (std::size_t)m * NO * 2) == 0;
+            }
+            const bool ok = rel <= 1.25 * rel_b + 1e-6;
+            if (!ok || !same) {
+              std::printf("[qmv-ksplit] %s %s K=%d m=%d rel %.2e (batch "
+                          "%.2e)%s\n", bf ? "bf16" : "f16", name.c_str(), K,
+                          m, rel, rel_b,
+                          same ? "" : " NOT byte-identical across tiles");
+            }
+            worst = std::max(worst, rel);
+            worst_b = std::max(worst_b, rel_b);
+            EXPECT_TRUE(ok);
+            EXPECT_TRUE(same);
+          }
+        }
+        std::printf("[qmv-ksplit] %s K=%d %s: rel to fp32 <= %.2e "
+                    "(batch %.2e)\n", bf ? "bf16" : "f16", K,
+                    sw ? "swiglu" : "plain", worst, worst_b);
+      }
+    }
+  }
+}
+
 // Numerically verify the decode-only quantized GEMV at group-size 32
 // (affine_qmv_w4g32 -- the GGUF q4_0 path's q/k/v/o + down_proj decode
 // kernel, never exercised by prefill [steel qmm] or e4b [g64]) against a

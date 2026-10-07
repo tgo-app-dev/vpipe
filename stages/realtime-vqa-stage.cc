@@ -1432,13 +1432,10 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   // decode (m_decode_batched_) is preferred there and never uses MTP, and N
   // serial MTP decodes lose to one weight-amortized batched pass. rope is
   // anchored on ctx (post-image/audio mROPE or sequential) exactly as
-  // pdecode_begin reads it. Greedy OR penalty-free sampling -- the verify
-  // applies no repetition/presence penalty, so a penalised sampler stays on the
-  // loops below (which do apply it).
+  // pdecode_begin reads it. Penalties apply as pdecode's do, its seen-set
+  // primed from the first token alone (no text prompt) here too.
   const std::span<const std::int32_t> no_prompt;
-  const bool mtp_ok = use_mtp && cur >= 0 && _lm->mtp_available()
-      && (argmax || (sp.repetition_penalty == 1.0f
-                     && sp.presence_penalty == 0.0f));
+  const bool mtp_ok = use_mtp && cur >= 0 && _lm->mtp_available();
   if (mtp_ok) {
     auto is_stop = [tpl](std::int32_t id) {
       return tpl && tpl->is_stop_token(id);

@@ -15,6 +15,7 @@
 #include "generative-models/token-muxer.h"
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/flex-bag.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -302,6 +303,22 @@ LoadedLanguageModel::LoadedLanguageModel(
     MlxRuntime*                runtime,
     const SessionContextIntf*  session,
     const std::string&         model_dir)
+  : LoadedLanguageModel(std::move(weights), std::move(tokenizer),
+                        compute_dtype_in, page_tokens, max_pages, runtime,
+                        session, model_dir, std::string())
+{
+}
+
+LoadedLanguageModel::LoadedLanguageModel(
+    LoadedWeights              weights,
+    unique_ptr<Tokenizer>      tokenizer,
+    ComputeDtype               compute_dtype_in,
+    int                        page_tokens,
+    uint32_t                   max_pages,
+    MlxRuntime*                runtime,
+    const SessionContextIntf*  session,
+    const std::string&         model_dir,
+    const std::string&         mtp_dir)
   : _impl(make_unique<Impl>())
 {
   _impl->weights   = std::move(weights);
@@ -473,6 +490,7 @@ LoadedLanguageModel::LoadedLanguageModel(
         mcfg.page_tokens = page_tokens;
         mcfg.max_pages   = (int)max_pages;
         mcfg.use_bf16    = (compute_dtype_in == ComputeDtype::BF16);
+        mcfg.mtp_dir     = mtp_dir;
         _impl->metal_bf16 = mcfg.use_bf16;
         _impl->exec = make_unique<MetalQwenModelExec>(
             model_dir, mc_be, mcfg, session);
@@ -1726,6 +1744,18 @@ LoadedLanguageModel::mtp_generate(
     const std::function<bool(span<const int32_t>)>&      on_tokens,
     int* produced, bool* hit_stop)
 {
+  return mtp_generate(ctx, first_token, max_tokens, params, is_stop,
+                      on_tokens, produced, hit_stop, span<const int32_t>{});
+}
+
+bool
+LoadedLanguageModel::mtp_generate(
+    Context& ctx, int32_t first_token, int max_tokens,
+    const SamplerParams&                                 params,
+    const std::function<bool(int32_t)>&                  is_stop,
+    const std::function<bool(span<const int32_t>)>&      on_tokens,
+    int* produced, bool* hit_stop, span<const int32_t> prompt)
+{
   if (produced) { *produced = 0; }
   if (hit_stop) { *hit_stop = false; }
   if (!valid() || !ctx.valid() || !_impl->exec || max_tokens <= 0) {
@@ -1738,7 +1768,17 @@ LoadedLanguageModel::mtp_generate(
   // The verify's sampler: greedy => argmax accept; non-greedy => speculative
   // sampling (per-position GPU sample). Same SamplerParams->GpuSamplerParams
   // path the pdecode loop uses (seed 0 -> a random base so turns differ).
-  const GpuSamplerParams sp = gpu_sampler_params_(params);
+  GpuSamplerParams sp = gpu_sampler_params_(params);
+  // The penalty seen-set's start rides in the sampler's bag: the exec
+  // virtual keeps the signature plugins were built against.
+  if (!prompt.empty()) {
+    FlexData ids = FlexData::make_array();
+    {
+      FlexData::ArrayView av = ids.as_array();
+      for (const int32_t t : prompt) { av.push_back((int64_t)t); }
+    }
+    bag::set(sp.extra, gpu_sampler::kPrime, std::move(ids));
+  }
   PerfAuxScope _perf(_impl->session, kPerfLaneLLM, kGvidLlmDecode,
                      kPerfLlmDecodeBegin, 1);
   int  prod   = 0;
@@ -1773,6 +1813,106 @@ LoadedLanguageModel::mtp_generate(
   return true;
 }
 
+
+namespace {
+
+SpecDecodeExt*
+spec_ext_(ModelExec* exec)
+{
+  return exec != nullptr ? static_cast<SpecDecodeExt*>(
+                               exec->query_extension(spec_decode::kExtensionId))
+                         : nullptr;
+}
+
+}  // namespace
+
+bool
+LoadedLanguageModel::spec_decode_available() const
+{
+  if (!valid() || !_impl->exec) { return false; }
+  const SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  return sx != nullptr && !sx->drafter().empty();
+}
+
+std::string
+LoadedLanguageModel::spec_drafter() const
+{
+  if (!valid() || !_impl->exec) { return {}; }
+  const SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  return sx != nullptr ? std::string(sx->drafter()) : std::string();
+}
+
+bool
+LoadedLanguageModel::attach_draft_model(const std::string& dir, int bits,
+                                        std::string* err)
+{
+  if (!valid() || !_impl->exec) {
+    if (err) { *err = "no model"; }
+    return false;
+  }
+  SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  if (sx == nullptr) {
+    if (err) { *err = "this backend has no speculative decode"; }
+    return false;
+  }
+  return dispatch_(_impl->runtime, [&]() -> bool {
+    return sx->attach_drafter(dir, bits, err);
+  });
+}
+
+bool
+LoadedLanguageModel::spec_generate(
+    Context& ctx, int32_t first_token, int max_tokens,
+    const SamplerParams&                                 params,
+    const std::function<bool(int32_t)>&                  is_stop,
+    const std::function<bool(span<const int32_t>)>&      on_tokens,
+    int* produced, bool* hit_stop, span<const int32_t> prompt, int block,
+    SpecDecodeResult* stats)
+{
+  if (produced) { *produced = 0; }
+  if (hit_stop) { *hit_stop = false; }
+  if (!valid() || !ctx.valid() || !_impl->exec || max_tokens <= 0) {
+    return false;
+  }
+  SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  if (sx == nullptr || sx->drafter().empty()) { return false; }
+  PerfAuxScope _perf(_impl->session, kPerfLaneLLM, kGvidLlmDecode,
+                     kPerfLlmDecodeBegin, 1);
+  // Track the last kept token for the context's bookkeeping (the verify
+  // appends each kept token's KV itself).
+  int32_t last_tok = first_token;
+  const std::function<bool(span<const int32_t>)> on_wrapped =
+      [&last_tok, &on_tokens](span<const int32_t> toks) -> bool {
+        if (!toks.empty()) { last_tok = toks.back(); }
+        return on_tokens ? on_tokens(toks) : true;
+      };
+  SpecDecodeRequest rq;
+  rq.ctx = ctx._id;
+  rq.first_token = first_token;
+  rq.max_tokens = max_tokens;
+  // The first decoded token's rotary position, as pdecode_begin takes it.
+  rq.rope_first = ctx._rope_next_position;
+  rq.sampler = gpu_sampler_params_(params);
+  rq.prime = prompt;
+  rq.is_stop = is_stop ? &is_stop : nullptr;
+  rq.on_tokens = &on_wrapped;
+  rq.block = block;
+  SpecDecodeResult r;
+  const bool ok = dispatch_(_impl->runtime, [&]() -> bool {
+    return sx->generate(rq, &r);
+  });
+  _perf.set_value(static_cast<std::uint64_t>(r.produced));
+  if (r.produced > 0) {
+    ctx._last_predicted = last_tok;
+    if (ctx._rope_next_position >= 0) {
+      ctx._rope_next_position += r.produced;
+    }
+  }
+  if (produced) { *produced = r.produced; }
+  if (hit_stop) { *hit_stop = r.hit_stop; }
+  if (stats) { *stats = std::move(r); }
+  return ok;
+}
 
 // The profile API is only meaningful for LlamaModelExec (the
 // per-stage tick instrumentation lives on the concrete class). For

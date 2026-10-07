@@ -161,6 +161,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-lm/quant-gemv.cc
         metal-lm/qwen-text.cc
         metal-lm/speculative-mtp.cc
+        metal-lm/speculative-dflash.cc
         model-quantize-roundtrip.cc
         model-quantize-stage.cc
         model-eval-stage.cc

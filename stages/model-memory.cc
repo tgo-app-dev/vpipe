@@ -849,6 +849,13 @@ public:
     mgr->declare_weights(dir, b, phase, last_phase,
                          floor > 0 && floor < b ? floor : 0);
     _declared.fetch_add(b, std::memory_order_relaxed);
+    // A language model kept warm (text-chat's `keep_loaded`) that this
+    // launch has not claimed goes NOW, at the first claim that is not it:
+    // before any stage's decide_resources() sizes the box with it still
+    // counted -- a DiT's streaming, an encoder's release -- and before
+    // anything of this launch loads. A graph that claims it as well as
+    // others keeps it if it claims it first; else it is loaded again.
+    mgr->release_warm_unclaimed();
   }
 
   void
@@ -889,6 +896,9 @@ public:
   end_plan(const SessionContextIntf* session) override
   {
     auto* mgr = manager(session);
+    // (A language model kept warm was released at this launch's claims;
+    // again here for one that claimed nothing the planner weighed.)
+    if (mgr != nullptr) { mgr->release_warm_unclaimed(); }
     // Apply the buffered refinements, now that every stage has both
     // declared and decided against the same complete picture.
     std::size_t phased = 0;

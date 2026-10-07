@@ -3,6 +3,7 @@
 
 #include "generative-models/context-manager.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/speculative-decode.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/tokenizer.h"
 
@@ -93,6 +94,17 @@ public:
                       MlxRuntime*                runtime,
                       const SessionContextIntf*  session,
                       const std::string&         model_dir = {});
+  // The same with a separate MTP drafter's directory (LoadSpec::extra
+  // load_spec::kMtpDir).
+  LoadedLanguageModel(LoadedWeights              weights,
+                      std::unique_ptr<Tokenizer> tokenizer,
+                      ComputeDtype               compute_dtype,
+                      int                        page_tokens,
+                      std::uint32_t              max_pages,
+                      MlxRuntime*                runtime,
+                      const SessionContextIntf*  session,
+                      const std::string&         model_dir,
+                      const std::string&         mtp_dir);
 
   // Built successfully? On any internal failure (missing weight,
   // model-spec mismatch with the ContextManager, etc.) the
@@ -465,9 +477,10 @@ public:
   // greedy (argmax) sampler reproduces serial greedy decode; a non-greedy
   // sampler reproduces serial sampling (speculative sampling -- the committed
   // tokens are exactly autoregressive samples from the main model; the drafter
-  // only changes acceptance rate). The verify does NOT apply repetition /
-  // presence penalties, so a caller that wants those must pass a penalty-free
-  // sampler (else fall back to the normal loop). `is_stop` ends the decode at
+  // only changes acceptance rate). Repetition / presence penalties apply as in
+  // pdecode_begin: `prompt` is the seen-set's start (pdecode_begin's
+  // `prompt`; first_token is added), so a penalised sampler stays token-exact
+  // with the pdecode loop given the same prompt. `is_stop` ends the decode at
   // the first accepted stop token WITHOUT keeping it (its speculative KV is
   // rolled back so the context ends cleanly). `on_tokens(span)` is invoked per
   // spec round with that round's newly accepted (non-stop) tokens, for
@@ -480,7 +493,38 @@ public:
       const SamplerParams&                                      params,
       const std::function<bool(std::int32_t)>&                  is_stop,
       const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+      int* produced, bool* hit_stop, std::span<const std::int32_t> prompt);
+  // The same with no prompt: the penalty seen-set starts empty.
+  bool mtp_generate(
+      Context& ctx, std::int32_t first_token, int max_tokens,
+      const SamplerParams&                                      params,
+      const std::function<bool(std::int32_t)>&                  is_stop,
+      const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
       int* produced = nullptr, bool* hit_stop = nullptr);
+
+  // ---- Speculative decode, any drafter (speculative-decode.h) ----------
+  // True iff the backend can decode speculatively with a drafter it
+  // carries: an attached DFlash / DFlash 2 drafter, or an MTP head.
+  bool spec_decode_available() const;
+  // spec_decode::kDrafter* of that drafter, "" when there is none.
+  std::string spec_drafter() const;
+  // Attach a separate drafter -- a DFlash / DFlash 2 checkpoint -- held at
+  // `bits` (0 as stored, 8 or 4). "" detaches. The model manager calls
+  // this when a LoadSpec names load_spec::kDraftDir; false (with *err)
+  // when the drafter cannot draft for this model, which is then unchanged.
+  bool attach_draft_model(const std::string& dir, int bits = 8,
+                          std::string* err = nullptr);
+  // mtp_generate's contract with whichever drafter is attached (DFlash
+  // first). `block` = tokens a round verifies, 0 = the drafter's choice;
+  // `*stats` gets the rounds / drafted / accepted counters.
+  bool spec_generate(
+      Context& ctx, std::int32_t first_token, int max_tokens,
+      const SamplerParams&                                      params,
+      const std::function<bool(std::int32_t)>&                  is_stop,
+      const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+      int* produced = nullptr, bool* hit_stop = nullptr,
+      std::span<const std::int32_t> prompt = {}, int block = 0,
+      SpecDecodeResult* stats = nullptr);
 
 
   // ---- Per-stage profile (for perf comparison vs mlx-lm) ------

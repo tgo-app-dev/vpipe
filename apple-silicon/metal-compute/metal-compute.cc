@@ -1,4 +1,5 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/wire-on-alloc.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -835,6 +836,35 @@ MetalCompute::pso_archive_stats() const noexcept
   return out;
 }
 
+// ---- WireOnAlloc (wire-on-alloc.h) ----------------------------------------
+
+namespace {
+thread_local int         t_wire_depth = 0;
+thread_local std::size_t t_wired      = 0;
+}  // namespace
+
+WireOnAlloc::WireOnAlloc() noexcept : _start(t_wired) { ++t_wire_depth; }
+
+WireOnAlloc::~WireOnAlloc() { --t_wire_depth; }
+
+bool
+WireOnAlloc::active() noexcept
+{
+  return t_wire_depth > 0;
+}
+
+void
+WireOnAlloc::note_wired(std::size_t bytes) noexcept
+{
+  t_wired += bytes;
+}
+
+std::size_t
+WireOnAlloc::wired_bytes() const noexcept
+{
+  return t_wired - _start;
+}
+
 SharedBuffer
 MetalCompute::make_shared_buffer(std::size_t byte_size,
                                  std::size_t alignment,
@@ -853,6 +883,7 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   }
 
   MTL::Buffer* buf = nullptr;
+  bool from_heap = false;
 
   // Heap fast path: small Tracked allocations sub-allocate from
   // the pre-created automatic heap. Untracked bypasses (heap's
@@ -868,6 +899,7 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
         static_cast<NS::UInteger>(byte_size), opts);
     if (buf != nullptr) {
       ++_impl->alloc_buffers_heap;
+      from_heap = true;
     }
   }
   if (buf == nullptr) {
@@ -904,6 +936,13 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   // MTL::Buffer by refcount and are deliberately not counted again).
   out._accounted = true;
   account_alloc_(byte_size);
+  // Inside a WireOnAlloc scope: wired before anything is written, so the
+  // compressor never takes it (wire-on-alloc.h). Not a heap slice: its
+  // pages are the heap's, shared with whatever else lives there.
+  if (WireOnAlloc::active() && !from_heap &&
+      byte_size >= WireOnAlloc::kMinBytes && out.set_wired(true)) {
+    WireOnAlloc::note_wired(byte_size);
+  }
   pool->release();
   return out;
 }

@@ -5,6 +5,8 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 
+#include "common/flex-bag.h"
+
 // MTP speculative decode: the bundled mtp.safetensors head drafts tokens, the
 // main model verifies them, the longest greedy-matching prefix is accepted,
 // and the rejected speculative tail is rolled back (paged KV via kv_rollback +
@@ -207,6 +209,185 @@ TEST(metal_lm_smoke, dense_mtp_speculative_token_exact) {
   };
   run_mtp(child1, /*draft_len=*/1, "depth-1");
   run_mtp(child2, /*draft_len=*/2, "depth-2");
+}
+
+// A UNIFORM affine model with a SEPARATE MTP drafter: mlx-community's
+// Qwen3.8-27B-4bit (its conversion drops the head) beside its
+// Qwen3.8-27B-MTP-4bit (bare names, TRUE norms, fc quantized), loaded through
+// Config::mtp_dir. The model takes the de-fused layout so the drafts verify,
+// and the decode must be token-exact with the plain serial one at depth 1
+// and 2. Single load (a 27B on a 24 GB box). Env: VPIPE_UNIFORM_MTP_MODEL =
+// the model dir, VPIPE_UNIFORM_MTP_DRAFTER = the drafter dir.
+TEST(metal_lm_smoke, uniform_mtp_drafter_token_exact) {
+  const char* path = std::getenv("VPIPE_UNIFORM_MTP_MODEL");
+  const char* drafter = std::getenv("VPIPE_UNIFORM_MTP_DRAFTER");
+  if (!path || !*path || !drafter || !*drafter) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.use_bf16 = false;
+  mcfg.page_tokens = 512;
+  int kGen = 32;
+  if (const char* e = std::getenv("VPIPE_MTP_GEN_TOKENS")) {
+    const int v = std::atoi(e);
+    if (v > 0) { kGen = v; }
+  }
+  mcfg.max_pages = std::max(8, (3 * kGen) / 512 + 8);
+  mcfg.mtp_dir = drafter;
+  auto model = genai::MetalQwenModel::load(path, mc, mcfg);
+  ASSERT_TRUE(model != nullptr);
+  ASSERT_TRUE(model->has_mtp());                 // the drafter loaded ...
+  EXPECT_TRUE(model->uses_mixed_precision());    // ... on the de-fused layout
+
+  const std::string tk = std::string(path) + "/tokenizer.json";
+  auto tok = genai::Tokenizer::from_huggingface_json(tk, &sess);
+  ASSERT_TRUE(tok != nullptr);
+  // VPIPE_MTP_PROMPT: another prompt (a long one reaches the long-context
+  // attention kernels).
+  const char* pe = std::getenv("VPIPE_MTP_PROMPT");
+  std::vector<std::int32_t> ids =
+      tok->encode(pe && *pe ? pe : "The capital of France is");
+  ASSERT_TRUE(!ids.empty());
+  auto argmax = [](const std::vector<float>& v) -> std::int32_t {
+    std::int32_t best = 0;
+    float bv = v.empty() ? 0.0f : v[0];
+    for (std::size_t i = 1; i < v.size(); ++i) {
+      if (v[i] > bv) { bv = v[i]; best = (std::int32_t)i; }
+    }
+    return best;
+  };
+  std::vector<float> lg = model->prefill(ids);
+  ASSERT_TRUE(!lg.empty());
+  const std::int32_t first = argmax(lg);
+  const genai::ContextId child1 =
+      model->context_manager()->branch(model->root_context());
+  const genai::ContextId child2 =
+      model->context_manager()->branch(model->root_context());
+  const genai::ContextId child3 =
+      model->context_manager()->branch(model->root_context());
+  ASSERT_TRUE(child1.valid() && child2.valid() && child3.valid());
+
+  std::vector<std::int32_t> ref;
+  ref.push_back(first);
+  for (int i = 0; i < kGen; ++i) {
+    const std::int32_t t = model->forward_argmax(ref.back());
+    if (t < 0) { break; }
+    ref.push_back(t);
+  }
+  std::printf("[uniform_mtp] prompt %zu tok; serial ref %zu tok, first=%d\n",
+              ids.size(), ref.size(), first);
+  // The production decode (GPU-resident, pipelined) must agree with the
+  // serial one too: it is what MTP's output is held to in a chat.
+  {
+    std::vector<std::int32_t> pids;
+    EXPECT_TRUE(model->decode_pipelined(child3, first, kGen, pids));
+    int pm = 0;
+    for (std::size_t i = 0; i < pids.size() && i + 1 < ref.size(); ++i) {
+      if (pids[i] != ref[i + 1]) { ++pm; }
+    }
+    std::printf("[uniform_mtp] pipelined vs serial mismatches=%d/%zu\n", pm,
+                pids.size());
+  }
+  auto run_mtp = [&](genai::ContextId cid, int draft_len, const char* tag) {
+    std::vector<std::int32_t> got;
+    long accepted = 0, rounds = 0;
+    const bool ok = model->mtp_decode(cid, first, (int)ref.size(), got,
+                                      draft_len, &accepted, &rounds);
+    EXPECT_TRUE(ok);
+    int mism = 0;
+    const std::size_t nn = std::min(ref.size(), got.size());
+    for (std::size_t i = 0; i < nn; ++i) {
+      if (ref[i] != got[i]) { ++mism; }
+    }
+    std::printf("[uniform_mtp] %s: %zu tok rounds=%ld tok/round=%.2f "
+                "mism=%d\n", tag, got.size(), rounds,
+                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism);
+    EXPECT_TRUE(mism == 0);
+    EXPECT_TRUE(got.size() + 1 >= ref.size());
+    // A drafter that drafts well: more than one token a round.
+    EXPECT_TRUE(rounds > 0 && (double)got.size() / (double)rounds > 1.3);
+  };
+  run_mtp(child1, /*draft_len=*/1, "depth-1");
+  run_mtp(child2, /*draft_len=*/2, "depth-2");
+}
+
+// The same drafter through the MODEL MANAGER, as text-chat loads it
+// (LoadSpec::mtp_dir): a chat-template prompt prefilled, then
+// lm->mtp_generate against the serial greedy loop from the identical state.
+// Env as above; VPIPE_MTP_PROMPT the user turn.
+TEST(metal_lm_smoke, uniform_mtp_drafter_chat_token_exact) {
+  const char* path = std::getenv("VPIPE_UNIFORM_MTP_MODEL");
+  const char* drafter = std::getenv("VPIPE_UNIFORM_MTP_DRAFTER");
+  if (!path || !*path || !drafter || !*drafter) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  bag::set_text(spec.extra, genai::load_spec::kMtpDir, drafter);
+  spec.compute_dtype =
+      std::getenv("VPIPE_MTP_DTYPE") ? std::getenv("VPIPE_MTP_DTYPE") : "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 16;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  ASSERT_TRUE(lm->mtp_available());
+  const auto* tpl = lm->chat_template();
+  ASSERT_TRUE(tpl != nullptr);
+  const char* pe = std::getenv("VPIPE_MTP_PROMPT");
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(pe && *pe ? pe : "Describe a fox in snow.",
+                        /*is_first_turn=*/true, &ids);
+  ASSERT_TRUE(!ids.empty());
+  auto is_stop = [tpl](std::int32_t id) { return tpl->is_stop_token(id); };
+  const int kBudget = 160;
+
+  std::vector<std::int32_t> ref;
+  {
+    auto ctx = lm->make_context();
+    std::int32_t cur = lm->prefill(ctx, ids);
+    ASSERT_TRUE(cur >= 0);
+    for (int i = 0; i < kBudget && !is_stop(cur); ++i) {
+      ref.push_back(cur);
+      cur = lm->next_token_greedy(ctx, cur);
+      if (cur < 0) { break; }
+    }
+  }
+  std::vector<std::int32_t> got;
+  {
+    auto ctx = lm->make_context();
+    const std::int32_t first = lm->prefill(ctx, ids);
+    ASSERT_TRUE(first >= 0);
+    int produced = 0;
+    bool hit = false;
+    auto on_toks = [&](std::span<const std::int32_t> toks) -> bool {
+      for (std::int32_t id : toks) { got.push_back(id); }
+      return true;
+    };
+    EXPECT_TRUE(lm->mtp_generate(ctx, first, kBudget, genai::SamplerParams{},
+                                 is_stop, on_toks, &produced, &hit));
+  }
+  int mism = 0, first_mism = -1;
+  const std::size_t nn = std::min(ref.size(), got.size());
+  for (std::size_t i = 0; i < nn; ++i) {
+    if (ref[i] != got[i]) {
+      if (first_mism < 0) { first_mism = (int)i; }
+      ++mism;
+    }
+  }
+  std::printf("[uniform_mtp_chat] dtype=%s prompt=%zu ref=%zu got=%zu "
+              "mism=%d first_mism=%d\n", spec.compute_dtype.c_str(),
+              ids.size(), ref.size(), got.size(), mism, first_mism);
+  EXPECT_TRUE(mism == 0);
 }
 
 // MTP acceptance/speedup on LONG, COHERENT text -- the regime the "<1.0x at
@@ -973,6 +1154,131 @@ TEST(metal_lm_smoke, qwen_optiq_mtp_sampled_token_exact) {
   EXPECT_TRUE(mism == 0);            // sampled output is token-exact vs serial
   EXPECT_TRUE(got.size() == ref.size() + 1);   // mtp includes `first`
   EXPECT_TRUE(rounds < (long)got.size());      // drafts actually landed (speedup)
+}
+
+// MTP speculative sampling WITH PENALTIES (Qwen's recommended non-thinking
+// sampler: temperature 0.7, top_p 0.8, top_k 20, presence 1.5; then a
+// repetition penalty): each verified position samples against the seen-set
+// pdecode holds at that step -- the prompt, every token kept before, the
+// drafts up to it -- so mtp_decode reproduces the pdecode loop primed with the
+// same prompt, token for token. Up to f16 rounding: the verify's logits come
+// from a chunk forward, the decode's from a single-token one, and a sample on
+// a near-tie can flip -- with or without penalties, about one seed in ten
+// over 96 tokens; this seed has none. Gated on
+// VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, qwen_optiq_mtp_penalised_token_exact) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.use_bf16 = false;
+  mcfg.page_tokens = 512;
+  mcfg.max_pages = 8;
+  auto model = genai::MetalQwenModel::load(path, mc, mcfg);
+  ASSERT_TRUE(model != nullptr);
+  ASSERT_TRUE(model->has_mtp());
+
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec tspec;
+  tspec.hf_dir = path;
+  tspec.compute_dtype = "f16";
+  auto lm = mgr->load(tspec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const auto* tpl = lm->chat_template();
+  ASSERT_TRUE(tpl != nullptr);
+
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(
+      "Describe a harbour at dawn in vivid detail, then list five colours "
+      "you would paint it with.", /*is_first_turn=*/true, &ids);
+  ASSERT_TRUE(!ids.empty());
+  std::vector<float> lg = model->prefill(ids);
+  ASSERT_TRUE(!lg.empty());
+  std::int32_t first = 0;
+  for (std::size_t i = 1; i < lg.size(); ++i) {
+    if (lg[i] > lg[(std::size_t)first]) { first = (std::int32_t)i; }
+  }
+
+  struct Case { const char* name; float rep, pres; bool unprimed; };
+  // The last two are controls: no penalty (the output must differ -- the
+  // penalties are exercised), and MTP without the prompt's seen-set (must
+  // differ from the pdecode loop that has it -- the prime is what matches).
+  const Case cases[] = {{"presence 1.5", 1.0f, 1.5f, false},
+                        {"repetition 1.1", 1.1f, 0.0f, false},
+                        {"no penalty", 1.0f, 0.0f, false},
+                        {"presence 1.5, unprimed", 1.0f, 1.5f, true}};
+  const int kGen = 96;
+  std::vector<std::vector<std::int32_t>> refs;
+  for (const Case& cs : cases) {
+    genai::GpuSamplerParams sp;
+    sp.greedy             = false;
+    sp.temperature        = 0.7f;
+    sp.top_p              = 0.8f;
+    sp.top_k              = 20;
+    sp.min_p              = 0.0f;
+    sp.repetition_penalty = cs.rep;
+    sp.presence_penalty   = cs.pres;
+    sp.seed               = 987654322ull;
+    sp.n_iter             = 16;
+    const genai::ContextId refc =
+        model->context_manager()->branch(model->root_context());
+    const genai::ContextId mtpc =
+        model->context_manager()->branch(model->root_context());
+    ASSERT_TRUE(refc.valid() && mtpc.valid());
+
+    // Reference: the pdecode loop, its seen-set primed with the prompt.
+    std::vector<std::int32_t> ref;
+    ASSERT_TRUE(model->pdecode_begin(refc, first, ids, sp, kGen + 1));
+    for (int i = 0; i < kGen; ++i) {
+      if (!model->pdecode_commit(refc)) { break; }
+      const std::int32_t t = model->pdecode_next(refc);
+      if (t < 0) { break; }
+      ref.push_back(t);
+    }
+    model->pdecode_end(refc);
+
+    genai::MtpDecodeCtl ctl;
+    ctl.sampler = sp;
+    if (!cs.unprimed) { ctl.prime = ids; }
+    std::vector<std::int32_t> got;
+    long accepted = 0, rounds = 0;
+    ASSERT_TRUE(model->mtp_decode(mtpc, first, kGen + 1, got,
+                                  /*draft_len=*/1, &accepted, &rounds, ctl));
+    int mism = 0, first_mism = -1;
+    const std::size_t gov = got.empty() ? 0 : got.size() - 1;
+    const std::size_t nn = std::min(ref.size(), gov);
+    for (std::size_t i = 0; i < nn; ++i) {
+      if (ref[i] != got[i + 1]) {
+        if (first_mism < 0) { first_mism = (int)i; }
+        ++mism;
+      }
+    }
+    std::printf("[qwen_optiq_mtp_penalised] %s: ref=%zu got=%zu rounds=%ld "
+                "tok/round=%.2f mism=%d (first at %d)\n",
+                cs.name, ref.size(), got.size(), rounds,
+                rounds > 0 ? (double)got.size() / (double)rounds : 0.0, mism,
+                first_mism);
+    if (cs.unprimed) {
+      EXPECT_TRUE(mism > 0);
+    } else {
+      EXPECT_TRUE(mism == 0);
+      EXPECT_TRUE(got.size() == ref.size() + 1);
+      EXPECT_TRUE(rounds < (long)got.size());
+    }
+    refs.push_back(std::move(ref));
+    model->context_manager()->release(refc);
+    model->context_manager()->release(mtpc);
+  }
+  EXPECT_TRUE(refs[0] != refs[2]);   // presence changed the sample
+  EXPECT_TRUE(refs[1] != refs[2]);   // so did repetition
 }
 
 // MTP through the PUBLIC LoadedLanguageModel::mtp_generate path -- the exact

@@ -3,6 +3,7 @@
 // GGUF byte-level tokenizer round trip.
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
+#include "common/flex-bag.h"
 
 // Matrix-core (M5+) prefill GEMM must be greedy token-exact with the steel
 // quantized GEMM. Loads the SAME Qwen3.5 checkpoint twice -- once with the
@@ -580,4 +581,103 @@ TEST(metal_lm_smoke, qwen_gguf_tokenizer_byte_level_round_trip) {
       EXPECT_TRUE(hf->decode(hf->encode(text)) == text);
     }
   }
+}
+
+// A language model KEPT WARM (GenerativeModelManager::keep_warm, text-chat's
+// `keep_loaded`): once its last user lets it go, the next load of the same
+// spec is handed the SAME model -- no read, no warmup; a launch declaring
+// other weights releases it before that launch loads; and its time runs
+// out on its own. Gated on VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, language_model_kept_warm) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const genai::LoadedLanguageModel* first = lm.get();
+  mgr->keep_warm(lm, path, 60.0);
+  lm.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->cached_count() == 1);   // its last user is gone
+  const auto t0 = std::chrono::steady_clock::now();
+  auto again = mgr->load(spec);
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  EXPECT_TRUE(again.get() == first);
+  EXPECT_TRUE(ms < 50.0);
+  again.reset();
+
+  // A launch that holds other weights: released before it loads.
+  mgr->clear_declarations();
+  mgr->declare_weights(path, 1 << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 0);   // it holds this one
+  mgr->clear_declarations();
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 0);   // it holds nothing
+  mgr->declare_weights("/nonexistent/another-model", 1 << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 1);
+  mgr->clear_declarations();
+  EXPECT_TRUE(mgr->warm_count() == 0);
+  EXPECT_TRUE(mgr->cached_count() == 0);             // unloaded
+
+  // Its time runs out on its own.
+  auto third = mgr->load(spec);
+  ASSERT_TRUE(third != nullptr);
+  mgr->keep_warm(third, path, 0.3);
+  third.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  for (int i = 0; i < 50 && mgr->warm_count() > 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_TRUE(mgr->warm_count() == 0);
+  EXPECT_TRUE(mgr->cached_count() == 0);
+}
+
+// A language model WIRED AS IT LOADS (load_spec::kWireWeights, text-chat's
+// `wire_weights`): its buffers mlock'd as they are allocated, so the
+// compressor cannot take the weights mid-read; what the load left wired is
+// charged to the wired pool while the model lives and given back once it is
+// gone. Gated on VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, language_model_wired_as_it_loads) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+  bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  const std::size_t pool0 = mgr->wired_pool_used();
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const std::size_t charged = mgr->wired_pool_used() - pool0;
+  // Most of the checkpoint (the 9B OptiQ: ~7 GB on disk).
+  EXPECT_TRUE(charged > (std::size_t)4 << 30);
+  // It decodes as ever.
+  {
+    auto ctx = lm->make_context();
+    ASSERT_TRUE(ctx.valid());
+    const std::int32_t ids[4] = {9707, 11, 1879, 0};
+    EXPECT_TRUE(lm->prefill(ctx, std::span<const std::int32_t>(ids, 4)) >= 0);
+  }
+  lm.reset();
+  // Gone: the next planning pass (or load) gives its bytes back.
+  mgr->release_warm_unclaimed();
+  mgr->clear_declarations();
+  mgr->declare_weights("/nonexistent/another-model", 1 << 20);
+  mgr->release_warm_unclaimed();
+  mgr->clear_declarations();
+  EXPECT_TRUE(mgr->wired_pool_used() == pool0);
 }

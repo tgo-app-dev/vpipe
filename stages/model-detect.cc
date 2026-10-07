@@ -211,6 +211,8 @@ family_version_(const std::string& mt, std::string& family,
       {"moss-codec-v2",          "MOSS",        "Audio-Tokenizer"},
       {"yue2",                   "YuE",         "2"},
       {"yue2-vae",               "YuE",         "2-Vae"},
+      {"dflash",                 "DFlash",      "1"},
+      {"dflash2",                "DFlash",      "2"},
       {"yolo",                   "YOLOX",       "L"},
       {"silero-vad",             "Silero",      "VAD"},
       {"audio-tagging",          "BEATs",       "iter3+"},
@@ -273,6 +275,25 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   if (starts("yue2_vae"))          { return "yue2-vae"; }
   if (starts("yue2"))              { return "yue2"; }
   if (starts("llama"))             { return "llama3"; }
+  return {};
+}
+
+// A DFlash / DFlash 2 drafter's config.json names its architecture
+// (DFlashDraftModel / DFlash2DraftModel); "" for anything else.
+std::string
+dflash_tag_(const FlexData& cfg)
+{
+  if (!cfg.is_object()) { return {}; }
+  const FlexData::ConstObjectView o = cfg.as_object();
+  if (!o.contains("architectures")) { return {}; }
+  const FlexData arch = o.at("architectures");
+  if (!arch.is_array()) { return {}; }
+  const FlexData::ConstArrayView a = arch.as_array();
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const std::string s(a[i].as_string());
+    if (s == "DFlash2DraftModel") { return "dflash2"; }
+    if (s == "DFlashDraftModel") { return "dflash"; }
+  }
   return {};
 }
 
@@ -903,6 +924,13 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
           d.category    = "component";
           d.detected_by = "diffusers-component";
         }
+      } else if (const std::string df = dflash_tag_(cfg); !df.empty()) {
+        // A DFlash drafter reports model_type "qwen3" (its layers are
+        // Qwen3's) but runs nothing on its own: a supplement of its
+        // target, named by text-chat's draft_model.
+        d.model_type  = df;
+        d.category    = "supplement";
+        d.detected_by = "config";
       } else {
         d.model_type =
             lm_tag_(str_field_(cfg, "model_type"), base_lc, d.param_class);

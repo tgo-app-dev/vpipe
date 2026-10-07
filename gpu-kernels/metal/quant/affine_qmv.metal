@@ -3172,3 +3172,154 @@ kernel void affine_qmv_geglu_w8g64(
       w, scales, biases, x, y, in_vec_size, out_vec_size,
       tid, simd_gid, simd_lid);
 }
+
+// ===================================================================
+// Split-K M-row GEMV (the speculative verify's tiles; the morphology of
+// MTPLX's verify_kernels.py split-K family). One threadgroup = 4 output
+// columns x KP simdgroups, each reducing a 1/KP slice of K lane-strided
+// one 32-bit pack (8 weights) at a time; the KP partials meet in
+// threadgroup memory. x stays in its storage type (8 values a row a
+// lane), so a thread holds 4*M accumulators + M Vec8 -- no pre-scaled
+// float copy of x as the batch tiles above keep. That footprint is the
+// whole win: 4 rows read a weight about as fast as 1 does (M4 Pro).
+// Per-row arithmetic does not depend on M or on the other rows, so a
+// row is BYTE-IDENTICAL whichever tile computes it -- but NOT to the
+// batch tiles / single-row qmv (another summation order, within an ulp;
+// qmv_ksplit_matches_batch). M=8 (32 accumulators) loses occupancy;
+// ks1 / ks4k4 / ks8 are benchmark arms (qmv_batch_bandwidth_sweep).
+// Grid (threads) = {32*KP, N/4, ceil(m/M)}, tg = {32*KP, 1, 1}.
+// ===================================================================
+template <typename T, int M, int KP, bool SWIGLU = false>
+METAL_FUNC void qmv_ksplit_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& m_total,
+    threadgroup float* partials,
+    uint3 tid, uint sg, uint lane) {
+  // Every small loop is FULLY unrolled: an accumulator array indexed by
+  // a live loop counter spills to the stack (measured ~10x slower).
+  constexpr int GS = 64;
+  const int K_by_p = K / 8;
+  const int K_by_gs = K / GS;
+  const int per_part = K_by_p / KP;
+  const int n0 = (int)tid.y * 4;
+  const int base_row = (int)tid.z * M;
+  if (base_row >= m_total) { return; }
+  const int m_rows = metal::min(M, m_total - base_row);
+  const int p_start = (int)sg * per_part;
+  const int p_end = ((int)sg == KP - 1) ? K_by_p : p_start + per_part;
+  using Vec8 = vec<T, 8>;
+  const device Vec8* xv[M];
+#pragma clang loop unroll(full)
+  for (int m = 0; m < M; ++m) {
+    const int r = base_row + ((m < m_rows) ? m : (m_rows - 1));
+    xv[m] = (const device Vec8*)(x + (size_t)r * K);
+  }
+  float acc[4 * M];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < 4 * M; ++i) { acc[i] = 0.0f; }
+  const device uint32_t* w0 = w + (size_t)(n0 + 0) * K_by_p;
+  const device uint32_t* w1 = w + (size_t)(n0 + 1) * K_by_p;
+  const device uint32_t* w2 = w + (size_t)(n0 + 2) * K_by_p;
+  const device uint32_t* w3 = w + (size_t)(n0 + 3) * K_by_p;
+  const device T* sc = scales + (size_t)n0 * K_by_gs;
+  const device T* bi = biases + (size_t)n0 * K_by_gs;
+  for (int pack = p_start + (int)lane; pack < p_end; pack += 32) {
+    const int gi = (pack * 8) / GS;
+    Vec8 v[M];
+#pragma clang loop unroll(full)
+    for (int m = 0; m < M; ++m) { v[m] = xv[m][pack]; }
+    const uint32_t p0 = w0[pack], p1 = w1[pack], p2 = w2[pack],
+                   p3 = w3[pack];
+    float s[4], b[4];
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4; ++j) {
+      s[j] = float(sc[j * K_by_gs + gi]);
+      b[j] = float(bi[j * K_by_gs + gi]);
+    }
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t packed = j == 0 ? p0 : (j == 1 ? p1 : (j == 2 ? p2 : p3));
+#pragma clang loop unroll(full)
+      for (int ki = 0; ki < 8; ++ki) {
+        const float wv = float((packed >> (ki * 4)) & 0xFu) * s[j] + b[j];
+#pragma clang loop unroll(full)
+        for (int m = 0; m < M; ++m) {
+          acc[j * M + m] += float(v[m][ki]) * wv;
+        }
+      }
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < 4 * M; ++i) { acc[i] = simd_sum(acc[i]); }
+  if (lane == 0) {
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4 * M; ++i) { partials[sg * 4 * M + i] = acc[i]; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (SWIGLU) {
+    // Columns n0..n0+3 are gate g, up g, gate g+1, up g+1 (rows 2g /
+    // 2g+1 interleaved), so lane j*M+row's up partner is lane + M.
+    if (sg != 0) { return; }
+    float total = 0.0f;
+    if ((int)lane < 4 * M) {
+#pragma clang loop unroll(full)
+      for (int q = 0; q < KP; ++q) { total += partials[q * 4 * M + lane]; }
+    }
+    const float up = simd_shuffle_down(total, (ushort)M);
+    const int j = (int)lane / M;
+    const int row = (int)lane - j * M;
+    if ((int)lane < 4 * M && (j & 1) == 0 && row < m_rows) {
+      y[(size_t)(base_row + row) * (N / 2) + n0 / 2 + j / 2] =
+          static_cast<T>((total / (1.0f + metal::exp(-total))) * up);
+    }
+    return;
+  }
+  if (sg == 0 && (int)lane < 4 * M) {
+    float total = 0.0f;
+#pragma clang loop unroll(full)
+    for (int q = 0; q < KP; ++q) { total += partials[q * 4 * M + lane]; }
+    const int j = (int)lane / M;
+    const int row = (int)lane - j * M;
+    if (row < m_rows) {
+      y[(size_t)(base_row + row) * N + n0 + j] = static_cast<T>(total);
+    }
+  }
+}
+
+#define VPIPE_QMV_KSPLIT_SW(NAME, M, KP, SW)                                 \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    threadgroup float partials[KP * 4 * M];                                  \
+    qmv_ksplit_impl<VPIPE_ELT, M, KP, SW>(                                   \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        partials, tid, simd_gid, simd_lid);                                  \
+  }
+#define VPIPE_QMV_KSPLIT(NAME, M, KP) VPIPE_QMV_KSPLIT_SW(NAME, M, KP, false)
+#define VPIPE_QMV_KSPLIT_SWIGLU(NAME, M) VPIPE_QMV_KSPLIT_SW(NAME, M, 2, true)
+VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks2_swiglu_w4g64, 2)
+VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks3_swiglu_w4g64, 3)
+VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks4_swiglu_w4g64, 4)
+VPIPE_QMV_KSPLIT_SWIGLU(affine_qmv_ks6_swiglu_w4g64, 6)
+VPIPE_QMV_KSPLIT(affine_qmv_ks1_w4g64, 1, 2)
+VPIPE_QMV_KSPLIT(affine_qmv_ks2_w4g64, 2, 2)
+VPIPE_QMV_KSPLIT(affine_qmv_ks3_w4g64, 3, 2)
+VPIPE_QMV_KSPLIT(affine_qmv_ks4_w4g64, 4, 2)
+VPIPE_QMV_KSPLIT(affine_qmv_ks4k4_w4g64, 4, 4)
+VPIPE_QMV_KSPLIT(affine_qmv_ks6_w4g64, 6, 2)
+VPIPE_QMV_KSPLIT(affine_qmv_ks8_w4g64, 8, 2)

@@ -37,9 +37,18 @@ struct GpuSamplerParams {
   float         presence_penalty   = 0.0f;
   std::uint64_t seed               = 0;
   int           n_iter             = 24;
-  // Anything this struct has no field for: see common/flex-bag.h.
+  // Anything this struct has no field for: see common/flex-bag.h. Keys:
+  // gpu_sampler::* below.
   FlexData      extra;
 };
+
+// GpuSamplerParams::extra keys.
+namespace gpu_sampler {
+// int array: the token ids the repetition / presence seen-set starts from
+// -- pdecode_begin's `prompt` -- for a decode handed it no other way
+// (ModelExec::mtp_generate). Absent: an empty seen-set.
+inline constexpr std::string_view kPrime = "prime";
+}  // namespace gpu_sampler
 
 // Abstract LLM forward-pass driver. One concrete subclass per
 // supported model architecture (LlamaModelExec for the dense
@@ -429,6 +438,8 @@ public:
   // (optional) is true iff a stop token ended it. Token-exact vs the serial
   // decode (greedy: argmax loop; sampling: decode_pipelined with the same
   // per-slot seed). Default: unsupported.
+  // sp.extra[gpu_sampler::kPrime]: the prompt the penalty seen-set starts
+  // from (pdecode_begin's `prompt`).
   virtual bool
   mtp_generate(ContextId ctx, std::int32_t first_token, int max_tokens,
                int rope_first, const GpuSamplerParams& sp,

@@ -43,7 +43,12 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
   // Sweep the adaptive MAXM tiers: N=3 -> MAXM=4 (1 grid.z tile); N=6 ->
   // MAXM=2 (ceil(m/2) tiles); N=8 -> the grouped-x xp2 tall tile (one
   // weight read for all 8 rows). All must stay token-exact with serial
-  // decode.
+  // decode -- first on the row-identical batch tiles, then on the split-K
+  // tiles batched decode runs by default: another reduction order, held
+  // to the same near-tie tolerance, and they must actually engage.
+  for (const bool ks : {false, true}) {
+  model->set_qmv_ksplit(true, ks);
+  const std::uint64_t ks0 = model->qmv_ksplit_dispatches();
   for (int N : {3, 6, 8}) {
 
   // Two independent branch sets sharing the same prefix: one batched, one
@@ -128,12 +133,17 @@ TEST(metal_lm_smoke, qwen_batched_decode_token_exact) {
   // here, but a borderline early flip on a large batch could sneak under 5%;
   // tighten / add a per-branch contiguous-tail check if that bites in practice.
   EXPECT_TRUE(mismatched * 20 <= total);   // <= 5% flipped
-  std::printf("[metal_lm_smoke.qwen_batched_decode] N=%d steps=%d matched "
-              "%d/%d (%d near-tie flips, tol %d)\n", N, n_steps, matched, total,
-              mismatched, total / 20);
+  std::printf("[metal_lm_smoke.qwen_batched_decode] %sN=%d steps=%d "
+              "matched %d/%d (%d near-tie flips, tol %d)\n",
+              ks ? "split-K " : "", N, n_steps, matched, total, mismatched,
+              total / 20);
   for (auto id : batched) { ctxm->release(id); }
   for (auto id : serial) { ctxm->release(id); }
   }
+  const std::uint64_t ks_ran = model->qmv_ksplit_dispatches() - ks0;
+  EXPECT_TRUE(ks ? ks_ran > 0 : ks_ran == 0);
+  }
+  model->set_qmv_ksplit(true, true);
 
   // --- Margin probe: is the N>4 mismatch a numerical near-tie or a real bug?
   // Reproduce branch 0 (the observed flip site) in an N=8 batch and, in

@@ -603,12 +603,9 @@ VisualQaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   // pdecode loop (greedy) or decode_pipelined (sampling -- the verify samples
   // each position). rope is anchored on ctx (post-image mROPE after a
   // multimodal prefill, or sequential after the per-question text prefill)
-  // exactly as pdecode_begin reads it. Greedy OR penalty-free sampling -- the
-  // verify applies no repetition/presence penalty, so a penalised sampler stays
-  // on the loops below.
-  const bool mtp_ok = cur >= 0 && _lm->mtp_available()
-      && (genai::Sampler(sp).is_argmax()
-          || (sp.repetition_penalty == 1.0f && sp.presence_penalty == 0.0f));
+  // exactly as pdecode_begin reads it. Penalties apply as pdecode's do, its
+  // seen-set primed from the first token alone (no text prompt) here too.
+  const bool mtp_ok = cur >= 0 && _lm->mtp_available();
   if (mtp_ok) {
     auto is_stop = [tpl](std::int32_t id) {
       return tpl && tpl->is_stop_token(id);

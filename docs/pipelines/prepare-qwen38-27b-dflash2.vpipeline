@@ -1,0 +1,37 @@
+{
+  "id": "prepare-qwen38-27b-dflash2",
+  "stages": [
+    {
+      "id": "fetch-qwen38-27b",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "mlx-community/Qwen3.8-27B-4bit",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-dflash2",
+      "type": "model-fetch",
+      "iports": [
+        {
+          "src": "fetch-qwen38-27b",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "model_path": "incoai/Qwen3.8-27B-DFlash2",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

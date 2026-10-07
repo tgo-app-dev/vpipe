@@ -10,6 +10,7 @@
 
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/model-exec.h"
+#include "generative-models/speculative-decode.h"
 
 #include <cstdint>
 #include <functional>
@@ -24,7 +25,7 @@ namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
 
-class MetalQwenModelExec : public ModelExec {
+class MetalQwenModelExec : public ModelExec, private SpecDecodeExt {
 public:
   MetalQwenModelExec(const std::string&            model_dir,
                      metal_compute::MetalCompute*  mc,
@@ -140,13 +141,26 @@ public:
   // to the metal model (see MetalQwenModel::set_i8_gemm).
   void set_i8_gemm(bool on) override;
 
+  // spec_decode::kExtensionId -> the speculative decode below.
+  void* query_extension(std::string_view id) noexcept override;
+
 private:
+  // ---- SpecDecodeExt: DFlash when a drafter is attached, else MTP ----
+  std::string_view drafter() const noexcept override;
+  bool attach_drafter(const std::string& dir, int bits,
+                      std::string* err) override;
+  bool generate(const SpecDecodeRequest& rq, SpecDecodeResult* out) override;
+
   struct CtxState { ContextId metal_cid; };
   CtxState* state_for_(ContextId ctx);
 
   std::unique_ptr<MetalQwenModel>             _model;
   std::unordered_map<std::uint32_t, CtxState> _ctxmap;
   std::vector<float>                          _logits;
+  // For attach_drafter: the drafter's weights go through the session's
+  // model manager like the model's own.
+  metal_compute::MetalCompute*                _mc = nullptr;
+  const SessionContextIntf*                   _session = nullptr;
 };
 
 }  // namespace vpipe::genai

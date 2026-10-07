@@ -134,6 +134,24 @@ namespace vpipe {
 //                                                Token-exact, so perf-only;
 //                                                false forces the standard
 //                                                pdecode loop.
+//   mtp_model        (string, default "")      -- a SEPARATE MTP drafter
+//                                                (models-DB key or dir:
+//                                                mlx-community's *-MTP-4bit,
+//                                                whose model ships without
+//                                                its head) to decode with.
+//   draft_model      (string, default "")      -- a DFlash / DFlash 2 block
+//                                                drafter (models-DB key or
+//                                                dir: incoai's Qwen3.8-27B-
+//                                                DFlash2 for mlx-community's
+//                                                Qwen3.8-27B-4bit). Takes
+//                                                over from MTP when set.
+//   draft_block_size (int,    default 0)       -- tokens a DFlash round
+//                                                verifies; 0 adapts it to
+//                                                the measured cost of a
+//                                                round on this machine.
+//   draft_bits       (int,    default 8)       -- the drafter's in-memory
+//                                                precision: 8 / 4 affine,
+//                                                0 as stored (bf16).
 //
 // Available on VPIPE_BUILD_APPLE_SILICON builds (both the MLX and the
 // no-MLX metal path, which is the default). On other builds the
@@ -189,9 +207,23 @@ public:
 #endif
 
 private:
+  // keep_loaded: the model kept warm from now (end of a reply).
+  void renew_warm_();
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _hf_dir;
+  // A separate MTP drafter (config "mtp_model"); "" none.
+  std::string _mtp_model;
+  // A DFlash block drafter (config "draft_model"); "" none. Its round
+  // length (0 = adaptive) and in-memory precision.
+  std::string _draft_model;
+  int         _draft_block{};
+  int         _draft_bits{};
+  // Seconds the model stays loaded after the graph (config
+  // "keep_loaded"); 0 none.
+  double      _keep_loaded{};
+  // Its buffers wired as they are allocated (config "wire_weights").
+  bool        _wire_weights{};
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};

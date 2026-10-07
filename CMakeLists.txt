@@ -654,6 +654,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-exec.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-exec-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-loader.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/speculative-decode.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/token-muxer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tokenizer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/vae-model-registry.h

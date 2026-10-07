@@ -6,12 +6,15 @@
 #include "generative-models/weight-registry.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,9 +65,37 @@ struct LoadSpec {
   // all contexts of this model combined.
   std::uint32_t max_pages     = 4096;
 
-  // Anything this struct has no field for: see common/flex-bag.h.
+  // Anything this struct has no field for: see common/flex-bag.h. Keys
+  // read here: load_spec::* below.
   FlexData extra;
 };
+
+// LoadSpec::extra keys.
+namespace load_spec {
+// string: a SEPARATE MTP drafter to decode with -- a directory holding the
+// draft head's own model.safetensors (+ config.json, model_type
+// "qwen3_5_mtp"): mlx-community's Qwen3.8-27B-MTP-4bit beside its
+// Qwen3.8-27B-4bit, whose conversion drops the head. Absent / "": only the
+// head the model's own directory carries (optiq/mtp.safetensors, in-shard
+// mtp.*). Part of the cache key: the drafter changes what is loaded.
+inline constexpr std::string_view kMtpDir = "mtp_dir";
+// string: a separate DFlash / DFlash 2 block DRAFTER's directory (its
+// config.json names DFlashDraftModel or DFlash2DraftModel), attached after
+// the model loads; see speculative-decode.h. Absent / "": none. Part of the
+// cache key.
+inline constexpr std::string_view kDraftDir = "draft_dir";
+// int: the precision that drafter is held at in memory -- 0 as stored, 8
+// or 4 affine group-64. Absent: 8. Part of the cache key.
+inline constexpr std::string_view kDraftBits = "draft_bits";
+// bool: WIRE the model's buffers as they are allocated, so the compressor
+// never takes the weights while they are read (on a box without that much
+// free, the first forward then spent 30 s bringing them back; wired, 2 s).
+// The GPU wires them at first use anyway: no memory is held that the model
+// would not hold. What it wired is charged to the wired pool while the
+// model lives. Absent: false. Not part of the cache key -- it changes how
+// the model is held, not what is loaded.
+inline constexpr std::string_view kWireWeights = "wire_weights";
+}  // namespace load_spec
 
 // Session-shared cache of loaded language models. Two loads with the
 // same LoadSpec (including dtype + page sizing) share one in-memory
@@ -118,6 +149,33 @@ public:
   // Diagnostics / tests: number of live entries in the cache. Walks
   // the map under `_mu`; not on any hot path.
   std::size_t cached_count() const;
+
+  // ---- a language model kept WARM ------------------------------------
+  //
+  // A host that runs a graph per request -- an app's assistant, asked to
+  // rewrite one prompt and then another -- would read the whole
+  // checkpoint again for each, and make it resident to the GPU again.
+  // MEASURED on a 24 GB M5 Pro with Qwen3.8-27B 4-bit (16 GB): the read
+  // 3-4 s, the first command buffer's residency 2.5 s on a quiet box and
+  // 31 s on one already 3.5 GB into swap -- before every first token.
+  //
+  // A model kept warm outlives its last user by `seconds`: the next load
+  // of the same spec is handed it, no read, no warmup (load()'s weak
+  // cache entry stays alive). Each call renews the time. It goes sooner
+  // when a launch declares weights but not its directory -- what is
+  // starting needs the room more (release_warm_unclaimed, from the weight
+  // planner's end_plan) -- and at the manager's end. 0 drops it now.
+  //
+  // PLUGIN ABI 8: these three methods are ADDITIONS (vpipe_sdk_check);
+  // the class is opaque, so the members behind them are not. Nothing else
+  // of the hold is exported -- its reaper is a lambda, see `_warm`.
+  void keep_warm(const std::shared_ptr<LoadedLanguageModel>& lm,
+                 const std::string& dir, double seconds);
+  // Drop the warm models whose directory this launch has not declared.
+  // Nothing when it declares no weights at all (an export, a probe):
+  // those compete for nothing a model holds. Returns how many went.
+  std::size_t release_warm_unclaimed();
+  std::size_t warm_count() const;
 
   // ---- shared non-LM models ----------------------------------------
   //
@@ -856,13 +914,19 @@ private:
     std::string   compute_dtype;
     int           page_tokens;
     std::uint32_t max_pages;
+    std::string   mtp_dir;
+    std::string   draft_dir;     // load_spec::kDraftDir, canonical
+    int           draft_bits = 8;
 
     bool operator==(const Key& o) const noexcept
     {
       return page_tokens == o.page_tokens
           && max_pages   == o.max_pages
           && compute_dtype == o.compute_dtype
-          && hf_dir       == o.hf_dir;
+          && hf_dir       == o.hf_dir
+          && mtp_dir      == o.mtp_dir
+          && draft_dir    == o.draft_dir
+          && draft_bits   == o.draft_bits;
     }
   };
   struct KeyHash {
@@ -987,6 +1051,34 @@ private:
   std::unordered_map<Key,
                      std::weak_ptr<LoadedLanguageModel>,
                      KeyHash>                                 _cache;
+
+  // Kept warm (keep_warm): each model, its canonical directory, until
+  // when. The reaper thread (started by the first keep_warm, stopped and
+  // joined by the destructor) drops each at its time. Its loop is a
+  // LAMBDA in keep_warm, deliberately not a private method: this class
+  // sits in an exported region, so every method of it -- private ones
+  // too -- is a libvpipe symbol the ABI snapshot records, and once
+  // recorded it could not be removed within ABI 8. (It briefly was one,
+  // reap_warm_(), before any ABI 8 build with it was published.)
+  struct Warm {
+    std::shared_ptr<LoadedLanguageModel>  lm;
+    std::string                           dir;
+    std::chrono::steady_clock::time_point until;
+  };
+  // Models loaded with load_spec::kWireWeights and the bytes their load
+  // left wired, charged to the pool; given back once the model is gone
+  // (checked at each load, keep_warm, release and expiry). Guarded by
+  // _warm_mu.
+  struct Wired {
+    std::weak_ptr<LoadedLanguageModel> lm;
+    std::size_t                        bytes;
+  };
+  std::vector<Wired>       _wired_lms;
+  mutable std::mutex       _warm_mu;
+  std::condition_variable  _warm_cv;
+  std::vector<Warm>        _warm;
+  std::thread              _warm_reaper;
+  bool                     _warm_stop = false;
 };
 
 }
