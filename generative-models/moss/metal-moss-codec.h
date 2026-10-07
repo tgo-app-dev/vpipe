@@ -61,6 +61,16 @@ public:
 
   bool valid() const { return _ok; }
   bool has_encoder() const { return _with_encoder; }
+
+  // The weight bytes this codec holds: the decoder, plus the encoder when
+  // it was loaded. Read into the codec's own members (not the weight set's
+  // cache), so the set cannot see them -- this is the figure a stage books.
+  std::size_t resident_bytes() const;
+  // What loading `model_dir` will hold, from the checkpoint alone: the F32
+  // decoder (and, `with_encoder`, encoder) tensors at f16. An upper bound
+  // for an int8 codec. 0 when the checkpoint cannot be read.
+  static std::size_t plan_bytes(const std::string& model_dir,
+                                bool with_encoder);
   int sample_rate() const { return _sample_rate; }
   int n_quantizers() const { return _n_vq; }
 

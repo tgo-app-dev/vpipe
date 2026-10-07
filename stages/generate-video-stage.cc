@@ -1,5 +1,6 @@
 #include "stages/generate-video-stage.h"
 #include "generative-models/gen-input.h"
+#include "common/host-report.h"
 #include "common/beat-keys.h"
 
 #include "apple-silicon/tensor-beat.h"
@@ -2917,6 +2918,52 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
                     want >> 20, have >> 20,
                     want > have ? (want - have) >> 20 : 0u)();
   };
+  // The same numbers for the host to act on (common/host-report.h):
+  // what the forward wanted, part by part -- summing to `need` -- and
+  // each budget's need and room in the units its gate applies.
+  {
+    auto u = [](std::size_t b) { return FlexData::make_uint(b); };
+    FlexData parts = FlexData::make_array();
+    auto part = [&](const char* name, std::size_t b) {
+      if (b == 0) { return; }
+      FlexData e = FlexData::make_object();
+      e.as_object().insert("name", FlexData::make_string(name));
+      e.as_object().insert("bytes", u(b));
+      parts.as_array().push_back(std::move(e));
+    };
+    part("transformer", dit);
+    part("vdn_branch", vdn);
+    part("sol_attn", sol);
+    part("sage_attn", sage);
+    part("ane", ane);
+    FlexData gates = FlexData::make_array();
+    auto gate_doc = [&](const char* name, bool ok, std::size_t want,
+                        std::size_t have) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("name", FlexData::make_string(name));
+      eo.insert("need", u(want));
+      eo.insert("have", u(have));
+      eo.insert("ok", FlexData::make_bool(ok));
+      gates.as_array().push_back(std::move(e));
+    };
+    gate_doc("gpu_working_set", ws_ok, need_ws, mb.headroom);
+    gate_doc("reclaimable_ram", ph_ok, need_phys,
+             mb.available_physical + swap_room);
+    FlexData d = FlexData::make_object();
+    auto o = d.as_object();
+    o.insert("stage", FlexData::make_string(this->id()));
+    o.insert("step", FlexData::make_string("denoise"));
+    o.insert("rows", FlexData::make_uint((std::uint64_t)seq));
+    o.insert("grid_h", FlexData::make_uint((std::uint64_t)grid_h));
+    o.insert("grid_w", FlexData::make_uint((std::uint64_t)grid_w));
+    o.insert("need", u(need));
+    o.insert("parts", std::move(parts));
+    o.insert("gates", std::move(gates));
+    o.insert("parked", u(parked));
+    o.insert("swap_room", u(swap_room));
+    host_report(session(), "memory", std::move(d));
+  }
   session()->error(fmt(
       "GenerateVideoStage('{}'): not enough memory for a {}-row forward. "
       "It wants ~{} MB of scratch{}, which with the safety margins the "

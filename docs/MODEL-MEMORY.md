@@ -960,6 +960,17 @@ checkpoint, and without this the irreversible decision is taken against a
 model 39% of which is about to stop existing. Pass it **only** when the
 release is certain; zero is always safe.
 
+**In-memory quantization is the same argument.** A loader that quantizes
+an unquantized checkpoint as it builds each layer never holds the bf16
+bytes it reads, so what it sheds is `retires` exactly as a bake's is. A
+text-to-speech backbone held as affine w8 group-64 keeps ~53% of its
+projections' bf16 bytes: MEASURED on an 8B, 9983 MB held against
+16193 MB on disk, with its logits as close to an fp32 reference as the
+reference's own bf16 run (rel-L2 0.0075 against 0.0070). Book the held
+size in `StageMemory::hold()` from the start — the plan's preload column
+is a stage's own statement — while the claims ledger, which sizes from
+disk, is corrected by `revise_declaration()` once the model has loaded.
+
 A streaming model must then call `revise_declaration()` down to what it
 actually holds, so peers do not size against weights that are never
 there.
@@ -993,11 +1004,52 @@ there.
 `StreamPlan::pin_frac` is **language-model layer pinning only.** Every DiT
 that used it is retired: the block-streaming families grow a resident set
 by measuring instead (mechanism 6), which is what a fraction of total RAM
-decided before the run could never do. The LMs keep it because they have
-nothing to grow into — they pin a prefix of layers with no residency
-policy behind it, so removing the fraction would leave the text encoders
-streaming everything with no way back. Give them a `BlockResidency` and
-the field goes too.
+decided before the run could never do. The prefill-only text encoders keep
+it: they pin a prefix of layers with no residency policy behind it.
+
+**An autoregressive decoder streams like a DiT.** A dense full-attention
+backbone whose layers are built from the raw checkpoint (quantized in
+memory or kept bf16) streams with the same machinery the DiTs use — two
+pread-refilled slots, the next streamed layer read under the current
+one's GPU work, measured residency, the wired pool — through DECODE as
+well as prefill. Two things differ, and both follow from decode:
+
+* **A forward is a token.** Residency's probe-and-double runs per decode
+  step, so a model reaches the resident set the box will hold within a
+  handful of tokens, and the schedule is sized from the token budget.
+* **A streamed layer is rebuilt where it runs.** The slot holds the raw
+  tensors; the products (quantized codes, fused projections) are built
+  in the same command buffer that runs the layer, by the same function
+  that builds a resident layer at load. Streamed and resident output are
+  then byte-identical by construction, which is the bar — not closeness.
+
+What streaming costs a decoder is a disk read per streamed layer per
+TOKEN, so it is the answer to "cannot fit" and never to "would rather
+not": a box that needs it gets slower, a box that pages makes no
+progress at all.
+
+**Stream the bytes you hold, not the bytes you build from.** A decoder
+held as w8 but streamed from its bf16 checkpoint reads twice what it
+keeps for every streamed layer of every token, and its slot carries a
+bf16 copy of the layer beside the w8 one. An affine w8 group-64 pack of
+the same checkpoint streams as it sits: the slot holds the pack's
+tensors (most of them ARE the products) plus the two fusions the forward
+reads, q|k|v by rows and gate|up interleaved, made by row copies in the
+command buffer that runs the layer. MEASURED on an 8B text-to-speech
+backbone: 196 MB read per streamed layer against 368, a slot of 323 MB
+against 563. Write the pack with the in-memory build's own kernel
+(scales in the compute dtype, codes fit to the rounded scale and bias)
+and the streamed pack is byte-identical to the in-memory build of the
+raw checkpoint; a pack whose scales are F16 for a bf16 model is rounded
+again at load, which on that model doubled the error against an fp32
+reference.
+
+**The trunk is weights too.** A decoder's embedding table and output
+head are read every token and are often a quarter of the checkpoint:
+2.4 GB of bf16 on that 8B. Holding them at w8 as well took the whole
+model from 9983 MB to 8843 MB. Keep exact the rows read on every step
+(control tokens in, the tokens a constrained step ranks out), so the
+quantization reaches only what varies.
 
 ### Reading a streamed block
 
@@ -1790,6 +1842,25 @@ exhausts the box. `ContextManager::resident_bytes()` → `ModelExec::kv_bytes()`
 → `GenerativeModelManager::resident_kv_bytes()` reports what the pools grew
 to. **A new exec that owns its K/V must override `kv_bytes()`.**
 
+**Book the pool's capacity, for the whole run.** The paged pool grows by
+DOUBLING — its capacity is the next power of two of the pages in use —
+and nothing shrinks it when a context is released. So a generator that
+decodes a long sequence is still holding that capacity while everything
+downstream of it runs. Two consequences for a stage's claims:
+
+* size it as capacity, not tokens × bytes per token: a 12,000-token song
+  on a 3B decoder needs 47 pages and holds 64, and a guided decode (CFG,
+  two contexts) holds 128;
+* claim it UNPHASED (alive for the whole run), not in the phase that
+  allocated it — the decode that follows still has it beside its own
+  arena. The same goes for any grow-only scratch a model keeps between
+  items.
+
+What is freed inside one item (a copy made for one pass, the pool's old
+buffers during a doubling) is the phased part. A generator also books
+the decode it feeds when only it knows the length — the VAE's arena and
+the samples it produces — as a video generator does for its soundtrack.
+
 ---
 
 ## Idle policy: `destroy` / `park` / `keep` / `auto`
@@ -1880,6 +1951,17 @@ whose release never arrived (mechanism 2), a claim whose kind has no
 planner, and a graph that does not fit the pool while `wired_pool_enforce`
 is off (mechanism 7). At **error**, only the last of those with the veto
 turned on.
+
+**To a host, as numbers.** The same figures reach an embedding host as
+documents, so it can show what a run asked for without parsing the
+log's English (`SessionIntf::reports()`, `common/host-report.h`): a
+`memory-plan` report with the resource plan's peak by phase, RAM and the
+wired pool; and, when a stage refuses -- generate-video's forward
+preflight, vae-decode's output preflight -- a `memory` report with what
+the step needed part by part (the transformer, the VDN branch, Sol,
+Sage, the ANE; the decoded frames) and each gate's need and room in the
+units the gate applies, margins included. A host reads
+`reports_version()` before it launches and the items above it after.
 
 ---
 

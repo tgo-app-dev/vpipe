@@ -2306,6 +2306,8 @@ vpipe::SessionContextIntf::services() const
 vpipe::SessionIntf::load_pipeline(vpipe::FlexData const&)
 vpipe::SessionIntf::progress() const
 vpipe::SessionIntf::progress_version() const
+vpipe::SessionIntf::reports() const
+vpipe::SessionIntf::reports_version() const
 vpipe::SessionIntf::set_log_listener(std::__1::function<void (int, std::__1::basic_string_view<char, std::__1::char_traits<char>>)>)
 vpipe::SessionManager::create_session(vpipe::FlexData const&)
 vpipe::SessionManager::get()

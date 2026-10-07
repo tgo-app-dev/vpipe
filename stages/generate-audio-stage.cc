@@ -4,6 +4,7 @@
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
+#include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
@@ -16,6 +17,7 @@
 #include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
+#include "generative-models/yue2/metal-oobleck-decoder.h"
 #include "generative-models/yue2/metal-yue2-model.h"
 #include "generative-models/yue2/yue2-protocol.h"
 #endif
@@ -31,11 +33,12 @@ namespace vpipe {
 
 namespace {
 
-// The KV of one token: 28 layers x (K, V) x 8 heads x 128 x bf16.
-constexpr std::size_t kKvBytesPerToken = 28u * 2u * 8u * 128u * 2u;
-// What a typical request's prefix costs in tokens, for plan-time sizing
-// only (a full score plus long lyrics; the real figure is known at run).
-constexpr int kPlanPrefixTokens = 3000;
+// The longest prefix the plan books for, in tokens: style and lyrics, plus
+// a score at the protocol's planning budget unless cot=off (no score).
+// Plan-time only; a song whose real prefix is longer revises the claims
+// before it runs.
+constexpr int kPlanTextTokens  = 1024;
+constexpr int kPlanScoreTokens = 4096;
 
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
@@ -95,6 +98,15 @@ const ConfigKey kAttrs[] = {
   {.key = "song_repetition_penalty", .type = ConfigType::Real,
    .doc = "song-token repetition penalty over the last 50 tokens",
    .def_real = 1.2},
+  {.key = "lm_quant", .type = ConfigType::String,
+   .doc = "how the AR stack -- the half that writes the score and the "
+          "song's tokens -- is held: \"w8\" (default) quantizes its "
+          "projections in memory as it loads, to affine 8-bit group-64 -- "
+          "1.26 GB less, a faster song phase since every token reads every "
+          "weight, and as close to the reference's fp32 run as bf16; "
+          "\"bf16\" keeps it as published. The flow-matching stack stays "
+          "bf16 either way",
+   .def_str = "w8"},
   // The flow matching's acceleration tiers -- the same spellings as the
   // image and video stages, because they are one vocabulary.
   {.key = "i8_gemm", .type = ConfigType::Bool,
@@ -190,8 +202,9 @@ GenerateAudioStage::GenerateAudioStage(const SessionContextIntf* s,
                                        std::string id,
                                        std::vector<InEdge> iports,
                                        FlexData config)
-  : TypedStage<GenerateAudioStage>(s, std::move(id), std::move(iports),
-                                   std::move(config))
+  : TypedStage<GenerateAudioStage>(s, std::move(id), iports,
+                                   std::move(config)),
+    _prompt_wired(!iports.empty())
 {
   _hf_dir = attr_str("hf_dir");
   _style = attr_str("style");
@@ -221,6 +234,15 @@ GenerateAudioStage::GenerateAudioStage(const SessionContextIntf* s,
   if (_ode_steps < 1) {
     fail_config(fmt("GenerateAudioStage('{}'): ode_steps must be >= 1",
                     this->id()));
+  }
+  {
+    std::string q = attr_str("lm_quant");
+    if (q.empty()) { q = "w8"; }
+    if (q != "w8" && q != "bf16") {
+      fail_config(fmt("GenerateAudioStage('{}'): lm_quant must be \"w8\" "
+                      "or \"bf16\" (got \"{}\")", this->id(), q));
+    }
+    _lm_quant_bits = q == "bf16" ? 0 : 8;
   }
   // The tiers, SETTLED: an out-of-range value is the one it falls back
   // to, said once, so the model never re-checks.
@@ -263,32 +285,100 @@ GenerateAudioStage::ane_claim_label_() const
   return "generate-audio:" + this->id();
 }
 
-std::size_t
-GenerateAudioStage::scratch_bytes_() const
+std::string
+GenerateAudioStage::scratch_label_() const
 {
-  const int frames = _max_seconds > 0.0
-                         ? (int)std::ceil(_max_seconds * 25.0)
-                         : 9000;
-  const std::size_t ctx = (std::size_t)std::min(24576,
-                                                kPlanPrefixTokens + frames);
-  // The decode context's paged KV (the pool keeps its high-water mark),
-  // the flow matching's contiguous copy of it plus its own rows, and the
-  // NAR activations: ~45 KB a latent row.
-  std::size_t b = ctx * kKvBytesPerToken +
-                  (ctx + (std::size_t)frames) * kKvBytesPerToken +
-                  (std::size_t)(frames + 2) * 45 * 1024;
+  return "generate-audio:" + this->id();
+}
+
+int
+GenerateAudioStage::plan_frames_() const
+{
+  // The protocol's song budget (9000 tokens, one latent frame each), or
+  // max_seconds when that is shorter.
+  int frames = 9000;
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  // Sol's routing scratch, which this stage lends it nothing for: the
-  // queries are the latent rows, the keys everything before them too.
+  frames = genai::yue2::Sampling::semantic_default().max_tokens;
+#endif
+  if (_max_seconds > 0.0) {
+    frames = std::min(frames, (int)std::ceil(_max_seconds * 25.0));
+  }
+  return frames;
+}
+
+GenerateAudioStage::SongBytes
+GenerateAudioStage::song_bytes_(int prefix, int frames, bool guided) const
+{
+  SongBytes b;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (_hf_dir.empty()) { return b; }
+  // The checkpoint's own dims (defaults when there is no readable config:
+  // a plan has to say something before the model exists).
+  genai::MetalYue2Model::Config cfg;
+  (void)genai::MetalYue2Model::config_from_dir(
+      resolve_model_dir(session(), _hf_dir), &cfg);
+  if (frames < 0) { frames = plan_frames_(); }
+  if (prefix < 0) {
+    prefix = kPlanTextTokens + (_cot == "off" ? 0 : kPlanScoreTokens);
+  }
+  // The song phase decodes a negative context beside the prompt whenever
+  // guidance is not 1: what the config asks for, or what a beat did.
+  const bool cfg_guided = _cfg_scale >= 0.0 ? _cfg_scale != 1.0
+                                            : _cot == "off";
+  const auto r = genai::MetalYue2Model::run_bytes(cfg, prefix, frames,
+                                                  guided || cfg_guided);
+  b.held = r.held;
+  b.transient = r.transient;
+  // Sol's routing scratch is the model's for the rest of the run too:
+  // the queries are the latent rows, the keys everything before them.
   if (_sol_attn) {
     auto* mc = session() ? session()->services()->metal_compute() : nullptr;
-    b += genai::MetalSolAttention::scratch_bytes(
-        16, 8, (int)(ctx + (std::size_t)frames), 128,
+    const int keys = std::min(cfg.context, prefix + 2 * frames + 3);
+    b.held += genai::MetalSolAttention::scratch_bytes(
+        cfg.n_heads, cfg.n_kv_heads, keys, cfg.head_dim,
         _sol_key_block > 0 ? _sol_key_block : genai::sol::kBlock,
         mc != nullptr && mc->supports_matrix_cores());
   }
+  // The decode downstream, at YuE2-Vae's released config and the tile a
+  // loaded decoder uses: the arena is the tile's, the PCM the song's.
+  genai::MetalOobleckDecoder::decode_cost(
+      genai::MetalOobleckDecoder::Config{},
+      genai::MetalOobleckDecoder::kDefaultCoreFrames, frames, &b.pcm,
+      &b.decode);
+#else
+  (void)prefix;
+  (void)frames;
+  (void)guided;
 #endif
   return b;
+}
+
+void
+GenerateAudioStage::revise_song_bytes_(const SongBytes& b)
+{
+  auto* mgr = session() ? session()->services()->generative_model_manager()
+                        : nullptr;
+  if (mgr == nullptr) { return; }
+  const std::string l = scratch_label_();
+  auto up = [&](std::size_t want, std::size_t& booked, const char* sfx) {
+    if (want <= booked) { return; }
+    booked = want;
+    mgr->revise_scratch(l + sfx, want);
+  };
+  up(b.held, _booked.held, "/held");
+  up(b.transient, _booked.transient, "/ode");
+  up(b.decode, _booked.decode, "/audio-decode");
+  up(b.pcm, _booked.pcm, "/pcm");
+}
+
+std::size_t
+GenerateAudioStage::held_scratch_bytes() const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  return _model ? _model->held_scratch_bytes() : 0;
+#else
+  return 0;
+#endif
 }
 
 std::vector<ResourceClaim>
@@ -297,17 +387,28 @@ GenerateAudioStage::declare_resources() const
   if (_hf_dir.empty()) { return {}; }
   std::vector<ResourceClaim> c = model_memory::weight_claims(
       {resolve_model_dir(session(), _hf_dir)});
-  auto s = model_memory::scratch_claims("generate-audio", scratch_bytes_(),
-                                        model_memory::kPhaseDenoise);
-  c.insert(c.end(), s.begin(), s.end());
+  const SongBytes b = song_bytes_(-1, -1, false);
+  const std::string l = scratch_label_();
+  auto add = [&](std::vector<ResourceClaim> v) {
+    c.insert(c.end(), v.begin(), v.end());
+  };
+  // The KV pool and the NAR scratch are allocated by the first song and
+  // kept: UNPHASED, alive through the audio decode and whatever follows.
+  add(model_memory::scratch_claims(l + "/held", b.held, {}));
+  add(model_memory::scratch_claims(l + "/ode", b.transient,
+                                   model_memory::kPhaseDenoise));
+  add(model_memory::scratch_claims(l + "/audio-decode", b.decode,
+                                   model_memory::kPhaseDecodeAudio));
+  add(model_memory::payload_claims(l + "/pcm", b.pcm,
+                                   model_memory::kPhaseDecodeAudio,
+                                   model_memory::kPhaseDecodeAudio));
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The ANE module, in UNITS: CoreML holds those bytes and no ledger in
   // this process can see them. Granted or not at initialize().
   if (_ane_ffn) {
-    auto a = model_memory::coreml_claims(
+    add(model_memory::coreml_claims(
         ane_claim_label_(), genai::MetalYue2Model::ane_runtime_bytes(), 1,
-        model_memory::kPhaseDenoise);
-    c.insert(c.end(), a.begin(), a.end());
+        model_memory::kPhaseDenoise));
   }
 #endif
   return c;
@@ -319,7 +420,20 @@ GenerateAudioStage::declare_memory() const
   StageMemory m;
   if (_hf_dir.empty()) { return m; }
   const std::string d = resolve_model_dir(session(), _hf_dir);
-  m.hold(d, model_memory::dir_weights_bytes(d));
+  // What the model will HOLD: with lm_quant w8 the AR stack at w8. The
+  // claims ledger sizes from disk and is corrected once it has loaded.
+  std::size_t held = 0;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  held = genai::MetalYue2Model::weight_bytes(d, _lm_quant_bits);
+#endif
+  m.hold(d, held > 0 ? held : model_memory::dir_weights_bytes(d));
+  // The report ledger's view of what declare_resources() claims: a song's
+  // working set while it runs, and the latent it hands downstream (f32
+  // [1, 64, frames]). The VAE decode's terms are claimed here too, but
+  // they are that stage's to report.
+  const SongBytes b = song_bytes_(-1, -1, false);
+  m.scratch = b.held + b.transient;
+  m.outputs = {(std::size_t)plan_frames_() * 64 * 4};
   return m;
 }
 
@@ -328,6 +442,8 @@ GenerateAudioStage::initialize(RuntimeContext& ctx)
 {
   (void)ctx;
   _one_shot_done = false;
+  // What declare_resources() booked for this launch; a beat revises up.
+  _booked = song_bytes_(-1, -1, false);
 #ifdef VPIPE_BUILD_APPLE_SILICON
   if (_hf_dir.empty()) { co_return; }
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -350,6 +466,7 @@ GenerateAudioStage::initialize(RuntimeContext& ctx)
         "stage knows ({}); inert", this->id(), dir, err));
     co_return;
   }
+  cfg.ar_quant_bits = _lm_quant_bits;
   _tok = genai::Tokenizer::from_tiktoken(
       (std::filesystem::path(dir) / "qwen.tiktoken").string(),
       genai::yue2::tiktoken_specials(), session());
@@ -399,12 +516,18 @@ GenerateAudioStage::initialize(RuntimeContext& ctx)
       co_return;
     }
   }
+  // The claims ledger booked the checkpoint's disk size; correct it to
+  // what the model holds (the AR stack at w8 holds 1.26 GB less).
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_declaration(dir, _model->resident_bytes());
+  }
   session()->info(fmt(
-      "GenerateAudioStage('{}'): YuE2 loaded in {:.1f} s ({:.2f} GB; NAR "
-      "on {} GEMMs, {} attention)", this->id(),
+      "GenerateAudioStage('{}'): YuE2 loaded in {:.1f} s ({:.2f} GB; AR "
+      "{}; NAR on {} GEMMs, {} attention)", this->id(),
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
           .count(),
       (double)_model->resident_bytes() / 1e9,
+      _model->ar_quantized() ? "w8 in memory" : "bf16",
       _model->uses_mma() ? "matmul2d" : "steel",
       _model->uses_attn_nax() ? "NAX" : "steel"));
 #endif
@@ -578,6 +701,11 @@ GenerateAudioStage::process(RuntimeContext& ctx)
                     (int)std::ceil(_max_seconds * yue2::kLatentsPerSecond)));
   }
   clamp_budget(&ss, std::max(prefix.size(), negative.size()));
+  // This song's bound, now that its prefix, budget and guidance are known:
+  // the claims rise to it before anything is allocated for it.
+  revise_song_bytes_(song_bytes_(
+      (int)std::max(prefix.size(), negative.size()), ss.max_tokens,
+      guide != 1.0f));
   genai::MetalYue2Model::DecodeResult song;
   {
     const bool ok = _model->decode(
@@ -660,10 +788,15 @@ GenerateAudioStage::process(RuntimeContext& ctx)
     if (st.i8_gemms > 0) {
       tiers += fmt(", {} int8 GEMMs", st.i8_gemms)();
     }
+    // And what the song left held beside the weights against what the
+    // claims book for it: a figure above the booking is a plan that
+    // under-reads, and this line is where it shows.
     session()->info(fmt(
         "GenerateAudioStage('{}'): latents in {:.1f} s ({} steps, {:.0f} ms "
-        "an evaluation{})", this->id(), nar_s, _ode_steps,
-        st.evals > 0 ? st.ms / st.evals : 0.0, tiers));
+        "an evaluation{}); {} MB held beside the weights, {} MB booked",
+        this->id(), nar_s, _ode_steps,
+        st.evals > 0 ? st.ms / st.evals : 0.0, tiers,
+        _model->held_scratch_bytes() >> 20, _booked.held >> 20));
   }
   bar.finish();
 

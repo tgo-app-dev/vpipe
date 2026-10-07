@@ -519,13 +519,31 @@ builtin_catalog_()
      .variant = "MLX 8-bit (mlx-community)",
      .hf_path = "mlx-community/MOSS-TTS-8B-8bit",
      .model_type = "moss-tts", .needs_tokenizer_json = false},
+    // MOSS-TTS-v1.5: the same delay-pattern 8B, continued from MOSS-TTS
+    // 1.0 -- stronger multilingual synthesis when the language is named
+    // (the stage's `language`), steadier voice cloning, inline
+    // "[pause 3.2s]" markers, and a text normalizer its processor runs on
+    // every input (the stage detects the script and runs the same). Runs
+    // as published: the stage holds the bf16 backbone as w8 in memory by
+    // default and streams its layers on a box that cannot hold even that.
+    // prepare-moss-tts-v1.5 also writes a w8 pack (model-quantize, bits 8),
+    // byte-identical to that in-memory build and streamed at half the
+    // bytes -- the one to point a 16 GB box at.
+    // Uses the 24 kHz MOSS-Audio-Tokenizer below. A whole-repo fetch: the
+    // normalizer script is how the stage knows to normalize, and nothing
+    // else in the repo is large.
+    {.family = "MOSS", .version = "TTS", .param_class = "v1.5 8B",
+     .variant = "bf16 (OpenMOSS-Team)",
+     .hf_path = "OpenMOSS-Team/MOSS-TTS-v1.5",
+     .model_type = "moss-tts", .needs_tokenizer_json = false},
     {.family = "MOSS", .version = "Audio-Tokenizer", .param_class = "codec",
      .variant = "F32 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer",
      .model_type = "moss-codec", .needs_tokenizer_json = false},
-    // MOSS-TTS-Local-v1.5: the text-to-speech stage's v1.5 LM (hf_dir,
-    // model_type "moss-tts-local"; quantize it with model-quantize before
-    // use) + its 48 kHz stereo codec (codec_dir, "moss-codec-v2"). The
+    // MOSS-TTS-Local-v1.5: the text-to-speech stage's Local LM (hf_dir,
+    // model_type "moss-tts-local"; runs as published -- the stage holds
+    // the bf16 backbone as w8 in memory -- or after model-quantize) + its
+    // 48 kHz stereo codec (codec_dir, "moss-codec-v2"). The
     // text-to-speech stage auto-detects this variant from config.json.
     {.family = "MOSS", .version = "TTS-Local", .param_class = "v1.5",
      .variant = "bf16 (OpenMOSS-Team)",

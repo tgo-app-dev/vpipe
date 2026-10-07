@@ -20,7 +20,7 @@ model's license, not vpipe's; read it before you publish anything you make.
 | | |
 |---|---|
 | **Machine** | Apple Silicon Mac (M-series). |
-| **Memory** | The plan books **11.4 GB** at its peak: 7.4 GB of weights and a 4.0 GB working set sized for a six-minute song. Measured on a 64 GB machine; a 16 GB one should hold it but has not been timed. |
+| **Memory** | **11.0 GB** at its peak: 6.2 GB of weights (the song-writing half held at 8 bits — `lm_quant`, the default; 7.4 GB with `bf16`) and a 4.8 GB working set sized for a six-minute song, 2.3 GB of which stays held for the rest of the run. Measured on a 64 GB machine; a 16 GB one should hold it but has not been timed. |
 | **Disk** | **~7.3 GiB** — 6.8 GiB for the model, 506 MiB for the decoder. |
 | **Build** | An Apple Silicon build of vpipe — the default on arm64 macOS. See the main [README](../README.md). |
 | **Account** | None. Both repos are public and ungated. |
@@ -196,6 +196,7 @@ use when a program feeds the port and every song needs its own style.
 | key | default | what it does |
 |---|---|---|
 | `hf_dir` | — | The model: `m-a-p/YuE2-3B`, or a folder. |
+| `lm_quant` | `w8` | How the half that writes the score and the song tokens is held: `w8` builds it at 8 bits in memory as it loads — 1.26 GB less, and that half runs 1.4× faster — `bf16` keeps it as published. The flow matching is bf16 either way. |
 | `style` | | The tags. |
 | `lyrics` | | The sectioned lyrics. |
 | `abc` | empty | A score to follow; empty plans one. |
@@ -259,7 +260,9 @@ On an **M4 Pro, 64 GB**, the same song end to end, dense:
 
 With `ane_ffn` and `sol_attn` the whole run is 6 min 17 s. The example
 pipeline's own song, unchanged, comes out at 2 min 10 s — the model's choice
-— in **4 min 21 s**. Planning and the song tokens run at 52–59 tokens/s; the
+— in **4 min 21 s**. Planning and the song tokens run at 52–59 tokens/s with
+that half in bf16, as measured above; held at 8 bits (`lm_quant: w8`, the
+default) a 30-second song's ran at 74 and 87 tokens/s against 54 and 60. The
 flow matching is what grows fastest with the song's length, because its
 attention spans the whole song.
 
@@ -313,6 +316,11 @@ closely than the reference matches itself is not possible, and not the goal.
 | flow velocity vs fp32 (two times) | 0.0125 / 0.019 | 0.0149 / 0.032 |
 | decoder | 0.0017 | |
 
+With the song-writing half held at 8 bits (`lm_quant: w8`, the default) the
+same checks read: score logits 0.0022, song logits 0.0135, flow velocity
+0.0153 / 0.021 — every one inside the reference's own bf16 error — and the
+same 29 of 29 decisive picks, the same 48- and 32-token greedy runs.
+
 Greedy decoding matches the reference token for token over the stretches
 checked: the first 48 tokens of a **score**, and the first 32 of a `cot: off`
 song with guidance. The planned song phase, free-running, does not — and
@@ -322,7 +330,10 @@ tokens. So that phase is checked **teacher-forced**, on the steps where fp32
 has a clear winner (29 of 29).
 
 Last, the ear's proxy: a speech recognizer transcribes the generated vocals
-as the requested lyrics.
+as the requested lyrics — `yue2.sung_lyrics_transcribe` writes a 30-second
+song per holding and holds the share of lyric words heard back (bf16 22 of
+22, w8 20 of 22, its last two words cut off by the 30-second cap). It is
+opt-in: set `VPIPE_YUE2_ASR_CHECK=1` and `VPIPE_QWEN3_ASR_TEST_MODEL_PATH`.
 
 To re-run it, point three variables at the model, the decoder and a golden
 directory written by `tools/dump_yue2_golden.py`:

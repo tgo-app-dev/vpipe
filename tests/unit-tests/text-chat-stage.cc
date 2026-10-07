@@ -173,6 +173,24 @@ TEST(text_chat_stage, stream_answer_only_config) {
   }
 }
 
+// The streaming out-port's chunk: ~20 words by default (speakable units),
+// 0 for every decoded piece as it comes. Pure config parse.
+TEST(text_chat_stage, stream_words_config) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.stream_words() == 20);
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/tmp/chat-fake-model","stream_words":0})");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+    EXPECT_TRUE(s.stream_words() == 0);
+  }
+}
+
 TEST(text_chat_stage, enable_python_tool_config) {
   Session sess;
   CerrSilencer hush;

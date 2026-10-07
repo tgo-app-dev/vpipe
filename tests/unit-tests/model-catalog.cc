@@ -221,6 +221,19 @@ TEST(model_catalog, moss_tts_pair_present) {
   EXPECT_TRUE(codec->model_type == "moss-codec");
   EXPECT_TRUE(codec->files.empty());
   EXPECT_FALSE(codec->needs_tokenizer_json);
+
+  // MOSS-TTS-v1.5: the delay-pattern model's successor, same model_type,
+  // fetched whole -- its normalizer script is how the stage knows to run
+  // the v1.5 text clean-up.
+  const ModelCatalogEntry* v15 =
+      catalog_by_path("OpenMOSS-Team/MOSS-TTS-v1.5");
+  EXPECT_TRUE(v15 != nullptr);
+  if (v15 != nullptr) {
+    EXPECT_TRUE(v15->family == "MOSS");
+    EXPECT_TRUE(v15->model_type == "moss-tts");
+    EXPECT_TRUE(v15->files.empty());
+    EXPECT_FALSE(v15->needs_tokenizer_json);
+  }
 }
 
 // OptiQ 4-bit MLX variants for 2B/4B/9B; whole-repo fetch (no pin).

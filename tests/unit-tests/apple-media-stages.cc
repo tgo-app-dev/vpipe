@@ -302,6 +302,42 @@ TEST(apple_media_stages, prores4444_alpha_through_the_stages)
   std::remove(path.c_str());
 }
 
+// A long movie's progress: the writer counts its frames against the
+// `frames` it is told to expect -- else the frames' sideband, else none --
+// and the reader runs at most `oport_capacity` frames ahead (4 by
+// default: unbounded, a 4K export held 3.3 GB of frames).
+TEST(apple_media_stages, a_long_movie_is_counted_and_paced)
+{
+  Session sess;
+  const std::string path = tmp_("counted.mov");
+  std::vector<TensorBeat> frames;
+  for (int i = 0; i < 3; ++i) {
+    frames.push_back(pic_(3, 32, 48, [i](int c, int, int) {
+      return 0.2f + 0.1f * c + 0.05f * i;
+    }));
+  }
+  std::uint64_t total = 1;
+  REQUIRE_(write_<AvfSaveVideoStage>(
+      sess, frames,
+      cfg_({{"path", str_(path)}, {"frames", FlexData::make_uint(3)}}),
+      std::function<void(AvfSaveVideoStage&)>(
+          [&](AvfSaveVideoStage& sink) { total = sink.progress_total(); })));
+  EXPECT_TRUE(total == 3);
+  REQUIRE_(write_<AvfSaveVideoStage>(
+      sess, frames, cfg_({{"path", str_(path)}}),
+      std::function<void(AvfSaveVideoStage&)>(
+          [&](AvfSaveVideoStage& sink) { total = sink.progress_total(); })));
+  EXPECT_TRUE(total == 0);  // no sideband frames: uncounted
+  AvfLoadVideoStage paced(&sess, "in", {}, cfg_({{"url", str_(path)}}));
+  EXPECT_TRUE(paced.oport_policy(0).capacity == 4);
+  EXPECT_TRUE(paced.oport_policy(0).mode == OverrunPolicy::Backpressure);
+  AvfLoadVideoStage deeper(
+      &sess, "in2", {},
+      cfg_({{"url", str_(path)}, {"oport_capacity", FlexData::make_uint(9)}}));
+  EXPECT_TRUE(deeper.oport_policy(0).capacity == 9);
+  std::remove(path.c_str());
+}
+
 // HEVC Main10 PQ -> avf-load-video -> avf-save-video (hevc) -> the copy
 // declares what the original did: BT.2020, PQ, its mastering display.
 TEST(apple_media_stages, hevc_pq_transcode_keeps_tags)

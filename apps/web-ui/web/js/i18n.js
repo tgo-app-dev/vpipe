@@ -2377,6 +2377,15 @@ const STRINGS = {
   'cfg.generate-audio.song_repetition_penalty': ['',
       '歌曲 token 的重复惩罚，作用于最近 50 个 token',
       '歌曲 token 的重複懲罰，作用於最近 50 個 token'],
+  'cfg.generate-audio.lm_quant': ['',
+      '自回归部分（写乐谱和歌曲 token 的那一半）如何驻留："w8"（默认）在载入'
+      + '时于内存中把它的投影量化为仿射 8 位 group-64——少占 1.26 GB，歌曲阶段'
+      + '也更快（每个 token 都要读一遍全部权重），与参考实现的 fp32 结果的接近'
+      + '程度和 bf16 相同；"bf16" 保持官方原样。流匹配部分始终是 bf16',
+      '自迴歸部分（寫樂譜和歌曲 token 的那一半）如何駐留："w8"（預設）在載入'
+      + '時於記憶體中把它的投影量化為仿射 8 位元 group-64——少佔 1.26 GB，歌曲'
+      + '階段也更快（每個 token 都要讀一遍全部權重），與參考實作的 fp32 結果的'
+      + '接近程度和 bf16 相同；"bf16" 保持官方原樣。流匹配部分始終是 bf16'],
   'cfg.generate-audio.i8_gemm': ['',
       '加速模式（有损）：流匹配中的大 GEMM 用动态 int8 的 matmul2d 计算，每个'
       + ' GEMM 约 1e-2 的误差。仅限矩阵核心——这是 M5 的路径；其他机器保持稠密'
@@ -3424,28 +3433,34 @@ const STRINGS = {
   'stage.text-to-speech.doc': ['',
       '文本转语音（MOSS-TTS，metal）：把每个输入文本节拍合成为 PCM 波形并作'
       + '为 TensorBeat 发出。具体变体由语言模型目录 config.json 中的 '
-      + 'model_type 决定："moss_tts"（8B 延迟模式 -> 24 kHz 单声道）或 "'
-      + 'moss_tts_local"（v1.5 深度解码器 -> 48 kHz 立体声）。',
+      + 'model_type 决定："moss_tts_delay" / "moss_tts"（MOSS-TTS 8B 与 '
+      + 'MOSS-TTS-v1.5，延迟模式 -> 24 kHz 单声道）、"moss_tts_local"（'
+      + 'Local-v1.5 深度解码器 -> 48 kHz 立体声）或 "moss_tts_realtime"（'
+      + '24 kHz 单声道）。',
       '文字轉語音（MOSS-TTS，metal）：把每個輸入文字節拍合成為 PCM 波形並作'
       + '為 TensorBeat 發出。具體變體由語言模型目錄 config.json 中的 '
-      + 'model_type 決定："moss_tts"（8B 延遲模式 -> 24 kHz 單聲道）或 "'
-      + 'moss_tts_local"（v1.5 深度解碼器 -> 48 kHz 立體聲）。'],
+      + 'model_type 決定："moss_tts_delay" / "moss_tts"（MOSS-TTS 8B 與 '
+      + 'MOSS-TTS-v1.5，延遲模式 -> 24 kHz 單聲道）、"moss_tts_local"（'
+      + 'Local-v1.5 深度解碼器 -> 48 kHz 立體聲）或 "moss_tts_realtime"（'
+      + '24 kHz 單聲道）。'],
   'cfg.text-to-speech.hf_dir': ['',
       'MOSS-TTS 语言模型：models 数据库中的键（由 model-fetch / '
       + 'model-quantize 注册）或 HF 风格的模型目录；同名时数据库键优先于路'
-      + '径。可选 8B（moss-tts）、v1.5（moss-tts-local）或实时版（'
-      + 'moss-tts-realtime）。',
+      + '径。延迟模式的 MOSS-TTS 8B / MOSS-TTS-v1.5（moss-tts；可直接用官方 '
+      + 'bf16，或 model-quantize 量化后的目录）、Local-v1.5（moss-tts-local'
+      + '）或实时版（moss-tts-realtime）。',
       'MOSS-TTS 語言模型：models 資料庫中的鍵（由 model-fetch / '
       + 'model-quantize 註冊）或 HF 風格的模型目錄；同名時資料庫鍵優先於路'
-      + '徑。可選 8B（moss-tts）、v1.5（moss-tts-local）或即時版（'
-      + 'moss-tts-realtime）。'],
+      + '徑。延遲模式的 MOSS-TTS 8B / MOSS-TTS-v1.5（moss-tts；可直接用官方 '
+      + 'bf16，或 model-quantize 量化後的目錄）、Local-v1.5（moss-tts-local'
+      + '）或即時版（moss-tts-realtime）。'],
   'cfg.text-to-speech.codec_dir': ['',
       'MOSS-Audio-Tokenizer（编解码器）模型：models 数据库中的键或文件系统'
       + '路径；同名时数据库键优先于路径。需与语言模型变体匹配：moss-codec（'
-      + '8B）或 moss-codec-v2（v1.5）。',
+      + 'MOSS-TTS 8B / v1.5、实时版）或 moss-codec-v2（Local-v1.5）。',
       'MOSS-Audio-Tokenizer（編解碼器）模型：models 資料庫中的鍵或檔案系統'
       + '路徑；同名時資料庫鍵優先於路徑。需與語言模型變體相符：moss-codec（'
-      + '8B）或 moss-codec-v2（v1.5）。'],
+      + 'MOSS-TTS 8B / v1.5、即時版）或 moss-codec-v2（Local-v1.5）。'],
   'cfg.text-to-speech.codec_quant': ['',
       '编解码器权重精度："int8" 表示把编解码器 transformer 的 GEMM 权重存成'
       + ' int8 分组 32 的仿射量化（常驻占用约减半，音质代价很小）；默认/留'
@@ -3454,8 +3469,10 @@ const STRINGS = {
       + ' int8 分組 32 的仿射量化（常駐占用約減半，音質代價很小）；預設/留'
       + '空 = f16'],
   'cfg.text-to-speech.max_new_tokens': ['',
-      '仅 8B：每个节拍的延迟模式生成预算（>= 1）',
-      '僅 8B：每個節拍的延遲模式生成預算（>= 1）'],
+      '仅限延迟模式变体（MOSS-TTS 8B、MOSS-TTS-v1.5）：每个节拍的生成预算，'
+      + '以行计（>= 1；12.5 行约 1 秒音频，另加 32 行延迟尾部）',
+      '僅限延遲模式變體（MOSS-TTS 8B、MOSS-TTS-v1.5）：每個節拍的生成預算，'
+      + '以列計（>= 1；12.5 列約 1 秒音訊，另加 32 列延遲尾端）'],
   'cfg.text-to-speech.stream_chunk_frames': ['',
       '每生成 N 个编解码帧就发出一段 PCM（准实时流式）；0 = 一次性（单个节'
       + '拍）。每帧约 80 毫秒音频。',
@@ -3467,14 +3484,55 @@ const STRINGS = {
       '新文字一到就中止正在合成的這句話（先把已產生的部分沖出），然後朗讀新'
       + '文字；false = 每句話都完整念完再念下一句'],
   'cfg.text-to-speech.max_frames': ['',
-      '仅 v1.5：每个节拍的帧预算（每帧约 80 毫秒 @ 48 kHz）；>= 1',
-      '僅 v1.5：每個節拍的影格預算（每格約 80 毫秒 @ 48 kHz）；>= 1'],
+      '仅限 Local-v1.5 / 实时版：每个节拍的帧预算（每帧约 80 毫秒）；>= 1',
+      '僅限 Local-v1.5 / 即時版：每個節拍的影格預算（每格約 80 毫秒）；>= 1'],
   'cfg.text-to-speech.instruction': ['',
-      '仅 v1.5：可选的风格指令（prompt 字段）',
-      '僅 v1.5：可選的風格指令（prompt 欄位）'],
+      '可选的风格指令（prompt 字段；MOSS-TTS / v1.5 与 Local-v1.5）。"None" '
+      + '= 不设置',
+      '可選的風格指令（prompt 欄位；MOSS-TTS / v1.5 與 Local-v1.5）。"None" '
+      + '= 不設定'],
   'cfg.text-to-speech.language': ['',
-      '仅 v1.5：可选的语言标签（prompt 字段）',
-      '僅 v1.5：可選的語言標籤（prompt 欄位）'],
+      '文本的语言，用英文名称："English"、"Chinese"、"French"……（prompt '
+      + '字段；MOSS-TTS / v1.5 与 Local-v1.5）。设置后 MOSS-TTS-v1.5 在几乎'
+      + '所有语言上都明显更好。"None" = 不设置',
+      '文字的語言，用英文名稱："English"、"Chinese"、"French"……（prompt '
+      + '欄位；MOSS-TTS / v1.5 與 Local-v1.5）。設定後 MOSS-TTS-v1.5 在幾乎'
+      + '所有語言上都明顯更好。"None" = 不設定'],
+  'cfg.text-to-speech.duration_tokens': ['',
+      '仅限延迟模式变体：语音的期望长度，以音频 token 计（12.5 个约 1 秒），'
+      + '即 prompt 的时长控制。0 = 由模型决定',
+      '僅限延遲模式變體：語音的期望長度，以音訊 token 計（12.5 個約 1 秒），'
+      + '即 prompt 的時長控制。0 = 由模型決定'],
+  'cfg.text-to-speech.lm_quant': ['',
+      '未量化的语言模型 checkpoint 的主干如何驻留："w8"（默认）在载入时于内存'
+      + '中量化为仿射 8 位 group-64——约为 bf16 字节的 53%，精度接近 bf16，而'
+      + '且每个 token 都要读一遍全部权重，所以解码也更快；"bf16" 保持官方原样'
+      + '。在延迟模式模型上，"w8" 还会把文本嵌入表与文本输出头也按 w8 驻留（其'
+      + '槽位 token 的行保持精确）。model-quantize 量化过的或 MLX 8 位模型无论'
+      + '如何都按原样载入。若连这样也放不下，主干会流式读取各层（在载入前根据内'
+      + '存规划决定），并让机器能容纳的层尽量常驻；8 位量化包每层流式读取的字节'
+      + '只有 bf16 checkpoint 的一半，所以在小内存机器上请把 hf_dir 指向这样的'
+      + '包（model-quantize，bits 8）',
+      '未量化的語言模型 checkpoint 的主幹如何駐留："w8"（預設）在載入時於記憶'
+      + '體中量化為仿射 8 位元 group-64——約為 bf16 位元組的 53%，精度接近 '
+      + 'bf16，而且每個 token 都要讀一遍全部權重，所以解碼也更快；"bf16" 保持'
+      + '官方原樣。在延遲模式模型上，"w8" 還會把文字嵌入表與文字輸出頭也按 w8 '
+      + '駐留（其槽位 token 的列保持精確）。model-quantize 量化過的或 MLX 8 位元'
+      + '模型無論如何都按原樣載入。若連這樣也放不下，主幹會串流讀取各層（在載入'
+      + '前依記憶體規劃決定），並讓機器能容納的層盡量常駐；8 位元量化包每層串流'
+      + '讀取的位元組只有 bf16 checkpoint 的一半，所以在小記憶體機器上請把 '
+      + 'hf_dir 指向這樣的包（model-quantize，bits 8）'],
+  'cfg.text-to-speech.text_normalizer': ['',
+      '构建 prompt 前的文本清理："robust" = MOSS-TTS-v1.5 自带的规范化器（换'
+      + '行变为句子边界、中英文之间的空格、括号、箭头、重复标点；保护网址、电'
+      + '子邮件与文件名），"basic" = 去掉控制字符并合并空白，"auto"（默认）= '
+      + '仅当语言模型目录附带 v1.5 的规范化脚本时用 robust，与其 processor 一'
+      + '致',
+      '建構 prompt 前的文字清理："robust" = MOSS-TTS-v1.5 內建的正規化器（換'
+      + '行變為句子邊界、中英文之間的空格、括號、箭頭、重複標點；保護網址、電'
+      + '子郵件與檔名），"basic" = 去除控制字元並合併空白，"auto"（預設）= '
+      + '僅當語言模型目錄附帶 v1.5 的正規化腳本時用 robust，與其 processor 一'
+      + '致'],
   'cfg.text-to-speech.voice_lock': ['',
       '一次定音：缓存第一次生成出来的音色，并在之后每个节拍都把它当作克隆参'
       + '考，使不同文本之间音色保持一致（第一次的音色由音频采样器的种子决定'
@@ -3520,12 +3578,12 @@ const STRINGS = {
       + '。在第一個節拍時鎖存；未接線 = 貪婪，而這裡貪婪正是合適的預設（文'
       + '字通道由 vpipe 產生，它必須緊跟轉寫內容才能抵達 audio_end）'],
   'port.text-to-speech.pcm': ['',
-      'f32 PCM 的 TensorBeat（已设置 sideband.sample_rate）；下游可选。8B '
-      + '变体：秩为 1 的 [采样数] 单声道 @ 24 kHz。v1.5 变体：秩为 2 的 [2,'
-      + ' 采样数] 立体声 @ 48 kHz。',
-      'f32 PCM 的 TensorBeat（已設定 sideband.sample_rate）；下游可選。8B '
-      + '變體：秩為 1 的 [取樣數] 單聲道 @ 24 kHz。v1.5 變體：秩為 2 的 [2,'
-      + ' 取樣數] 立體聲 @ 48 kHz。'],
+      'f32 PCM 的 TensorBeat（已设置 sideband.sample_rate）；下游可选。延迟'
+      + '模式变体：秩为 1 的 [采样数] 单声道 @ 24 kHz。Local-v1.5：秩为 2 的 '
+      + '[2, 采样数] 立体声 @ 48 kHz。实时版：[1, 采样数] 单声道 @ 24 kHz。',
+      'f32 PCM 的 TensorBeat（已設定 sideband.sample_rate）；下游可選。延遲'
+      + '模式變體：秩為 1 的 [取樣數] 單聲道 @ 24 kHz。Local-v1.5：秩為 2 的 '
+      + '[2, 取樣數] 立體聲 @ 48 kHz。即時版：[1, 取樣數] 單聲道 @ 24 kHz。'],
 
   // ---- VAE Decode (generative) ----
   'stage.vae-decode.name': ['', 'VAE 解码', 'VAE 解碼'],
@@ -6131,6 +6189,13 @@ const STRINGS = {
       '把推理（<think>）與工具呼叫區塊從串流輸出埠（編號 1）中剔除，好讓說'
       + '話的消費者（例如 text-to-speech）只朗讀答案；0 號輸出埠仍然攜帶完'
       + '整回覆'],
+  'cfg.text-chat.stream_words': ['',
+      '流式输出端口（编号 1）的分块：超过这么多个词后在句读处发出（硬上限为 '
+      + '3 倍，至少 60）——适合 text-to-speech 朗读的单位；0 则每解码出一段'
+      + '就立即发出，供读者看着回复写出来',
+      '串流輸出埠（編號 1）的分塊：超過這麼多個詞後在句讀處發出（硬上限為 '
+      + '3 倍，至少 60）——適合 text-to-speech 朗讀的單位；0 則每解碼出一段'
+      + '就立即發出，供讀者看著回覆寫出來'],
   'cfg.text-chat.mtp': ['',
       '模型自带 MTP 推测解码头时使用它（token 精确；只影响性能）；设为 '
       + 'false 则强制走标准解码路径',
@@ -7043,6 +7108,11 @@ const STRINGS = {
   'cfg.avf-load-video.max_frames': ['',
       '读到这么多帧就停止；0（默认）= 不限',
       '讀到這麼多格就停止；0（預設）= 不限'],
+  'cfg.avf-load-video.oport_capacity': ['',
+      '最多领先消费者读取的帧数（反压）；0（默认）= 4。一帧 4K F16 为 50 MB：'
+      + '解码比编码快，不加限制时会占满内存',
+      '最多領先消費者讀取的格數（反壓）；0（預設）= 4。一格 4K F16 為 50 MB：'
+      + '解碼比編碼快，不加限制時會佔滿記憶體'],
   'port.avf-load-video.frames': ['',
       '每帧一个平面 TensorBeat [3|4,H,W]，F16、U8 或 F32，其 sideband 携带文件的'
       + '色彩（color_primaries、color_transfer、color_matrix、alpha_mode、'
@@ -7104,6 +7174,11 @@ const STRINGS = {
       + '原色推断',
       'CICP YCbCr 矩陣（1 BT.709、9 BT.2020）；0（預設）= 格自身的，否則按其'
       + '原色推斷'],
+  'cfg.avf-save-video.frames': ['',
+      '预计的帧数，用于进度报告（“save video”：已写入的帧数 / 此数）；0（默认）'
+      + '= 取帧的 sideband frames，否则不计数。不会据此截断或补齐',
+      '預計的格數，用於進度回報（「save video」：已寫入的格數 / 此數）；0（預設）'
+      + '= 取格的 sideband frames，否則不計數。不會據此截斷或補齊'],
   'port.avf-save-video.frames': ['',
       '每帧一个平面 TensorBeat [3|4,H,W]，F16、U8 或 F32（0..1，video-to-rgb '
       + '的默认格式），尺寸一致（avf-load-video / video-to-rgb / vae-decode '

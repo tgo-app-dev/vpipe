@@ -300,6 +300,90 @@ VPIPE_AFFINE_QUANT(affine_quant_w4_g64, 4, 64)
 VPIPE_AFFINE_QUANT(affine_quant_w8_g32, 8, 32)
 VPIPE_AFFINE_QUANT(affine_quant_w4_g32, 4, 32)
 
+// ---------------------------------------------------------------------------
+// IN-MEMORY affine w8 group-64 quantization, for a model that quantizes its
+// raw checkpoint at load (and re-quantizes a streamed layer per use) rather
+// than reading a pack. Two differences from affine_quant_impl above:
+//
+//   * scales / biases are written in VPIPE_ELT -- the element type the qmv /
+//     steel kernels read -- not F16, so nothing narrows them afterwards;
+//   * the codes are computed against the ROUNDED scale and bias. A bf16
+//     scale carries 8 bits, so quantizing against the f32 scale and then
+//     storing it rounded moves the top code by up to ~half a step
+//     (255 * 2^-9); fitting the codes to the stored pair keeps every value
+//     within half a step of the scale the dequant actually uses.
+//
+// Output row r of the [N, K] source lands at row r * row_mul + row_add of
+// the destination, so one dispatch per projection writes straight into a
+// fused q|k|v matrix (row_add = rows before it) or an interleaved gate|up
+// one (row_mul 2, row_add 0 / 1). Byte order per u32 word as
+// affine_dequant_w8g64.
+//   0:x(VPIPE_ELT [N,K]) 1:w(u32) 2:scales 3:biases (VPIPE_ELT)
+//   4:K 5:N 6:row_mul 7:row_add       grid {K/64, N, 1}
+kernel void affine_quant_rows_w8g64(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device uint32_t*        w      [[buffer(1)]],
+    device VPIPE_ELT*       s      [[buffer(2)]],
+    device VPIPE_ELT*       b      [[buffer(3)]],
+    const constant int&     K      [[buffer(4)]],
+    const constant int&     N      [[buffer(5)]],
+    const constant int&     row_mul [[buffer(6)]],
+    const constant int&     row_add [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int grp = (int)gid.x;           // 0 .. K/64-1
+  const int n   = (int)gid.y;           // 0 .. N-1
+  const int KG  = K / 64;
+  if (n >= N || grp >= KG) { return; }
+  const int64_t dn = (int64_t)n * row_mul + row_add;
+  const device VPIPE_ELT* xp = x + (int64_t)n * K + (int64_t)grp * 64;
+  float mn = INFINITY, mx = -INFINITY;
+  for (int i = 0; i < 64; ++i) {
+    const float v = (float)xp[i];
+    mn = min(mn, v); mx = max(mx, v);
+  }
+  const VPIPE_ELT se = (VPIPE_ELT)((mx - mn) / 255.0f);
+  const VPIPE_ELT be = (VPIPE_ELT)mn;
+  s[dn * KG + grp] = se;
+  b[dn * KG + grp] = be;
+  const float sf  = (float)se;
+  const float bf  = (float)be;
+  const float inv = (sf > 0.0f) ? 1.0f / sf : 0.0f;
+  device uint32_t* wp = w + dn * (K / 4) + (int64_t)grp * 16;
+  for (int wi = 0; wi < 16; ++wi) {
+    uint32_t packed = 0;
+    for (int i = 0; i < 4; ++i) {
+      const float v = (float)xp[wi * 4 + i];
+      const int q = clamp((int)round((v - bf) * inv), 0, 255);
+      packed |= ((uint32_t)q) << (8 * i);
+    }
+    wp[wi] = packed;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ROW PLACEMENT for a model that STREAMS an affine pack: the pack stores q,
+// k, v and gate, up as separate [N, K] tensors, and the forward reads them
+// fused (q|k|v by rows) and interleaved (gate|up, row_mul 2). Source row r
+// lands at destination row r * row_mul + row_add, the same map as
+// affine_quant_rows_w8g64 above, so a streamed pack layer ends up in the
+// layout a pack loaded resident has. Type-blind: one call each for the
+// codes, the scales and the biases, `row_words` 32-bit words per row.
+//   0:src 1:dst 2:row_words 3:row_mul 4:row_add   grid {row_words, N, 1}
+kernel void copy_rows_u32(
+    device const uint*  src       [[buffer(0)]],
+    device uint*        dst       [[buffer(1)]],
+    const constant int& row_words [[buffer(2)]],
+    const constant int& row_mul   [[buffer(3)]],
+    const constant int& row_add   [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if ((int)gid.x >= row_words) { return; }
+  const ulong r = gid.y;
+  dst[(r * (ulong)row_mul + (ulong)row_add) * (ulong)row_words + gid.x] =
+      src[r * (ulong)row_words + gid.x];
+}
+
 // ---------------------------------------------------------------------
 // Block-floating-point f16 -> i8 quantization (group 64), feeding the
 // int8 convolution2d/matmul paths: one simdgroup per 64-element block

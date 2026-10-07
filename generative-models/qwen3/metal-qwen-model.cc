@@ -1,4 +1,5 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/qwen3/metal-qwen-raw-layers.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
@@ -987,14 +988,24 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_gdn_qk_norm = m->_lib_gdn.function("qwen3_5_gdn_qk_norm_f16");
   m->_fn_gdn_gated_rms = m->_lib_gdn.function("qwen3_5_gdn_gated_rms_f16");
   // Matrix-core (M5+) prefill GEMM: only when the GPU has hardware matrix
-  // units and the model is 4-bit. dequant a projection weight -> dense
-  // compute-elt scratch, then run dense matmul2d (matrix units). Gated so
-  // older GPUs keep the steel quantized GEMM (byte-identical behaviour).
-  // VPIPE_QWEN_NO_MMA=1 forces the steel path even on M5 (A/B + safety).
-  if (cfg.quant_bits != 8 && mc->supports_matrix_cores()) {
+  // units. dequant a projection weight -> dense compute-elt scratch, then
+  // run dense matmul2d (matrix units). Gated so older GPUs keep the steel
+  // quantized GEMM (byte-identical behaviour). VPIPE_QWEN_NO_MMA=1 forces
+  // the steel path even on M5 (A/B + safety).
+  //
+  // BOTH WIDTHS. This was 4-bit only, so every w8 checkpoint -- Qwen3-ASR,
+  // every MOSS-TTS backbone, in-memory w8 included -- prefilled on the
+  // steel GEMM on M5 and never reached the matrix units, nor the int8 tier
+  // that lives inside this path. A w8 model dequantizes at its own width
+  // (affine_dequant_w8g64, 4 values per word); the mixed (OptiQ) fused MLP
+  // is 4-bit by construction and keeps the w4 kernel.
+  if (mc->supports_matrix_cores()) {
     m->_lib_dequant = mc->load_library("affine_dequant" + sfx);
     m->_lib_dense_mma = mc->load_library("dense_gemm_mma" + sfx);
     m->_fn_dequant = m->_lib_dequant.function("affine_dequant_w4g64");
+    if (cfg.quant_bits == 8) {
+      m->_fn_dequant8 = m->_lib_dequant.function("affine_dequant_w8g64");
+    }
     // Tile-adaptive dense matmul2d: 128x128 (8 simdgroups) for K <= 4096,
     // 128x256 for deeper K (down_proj) -- the 128x128 tile degrades past
     // K~4096 while 128x256 stays ~10 TFLOP/s at all depths (M5 tile sweep,
@@ -1005,7 +1016,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_swiglu_inter = m->_lib_elt.function("swiglu_interleaved_f16");
     m->_use_mma = m->_fn_dequant.valid() && m->_fn_dense_mma.valid() &&
                   m->_fn_dense_mma_deep.valid() &&
-                  m->_fn_swiglu_inter.valid();
+                  m->_fn_swiglu_inter.valid() &&
+                  (cfg.quant_bits != 8 || m->_fn_dequant8.valid());
     // Matrix-core (matmul2d) flash attention: head_dim 256 (Qwen3.5) and 128
     // (Llama-3 / the Krea-2 Qwen3-VL text encoder). Optional: its absence just
     // leaves prefill attention on the key-split simdgroup flash / scalar path.
@@ -1202,6 +1214,74 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
       m->_mixed = false;
     }
   }
+  // RAW-SOURCE LAYERS (metal-qwen-raw-layers.h): in-memory w8 and/or
+  // decode-capable streaming of a raw dense backbone. Decided HERE -- once
+  // the checkpoint is known to be raw, before the layers are built and
+  // before the dense kernels load -- because quantizing changes which
+  // path the whole forward takes: the model becomes an affine w8 one, not
+  // a dense one. The affine kernels above were loaded for cfg.quant_bits,
+  // so a quantizing build needs that to be 8 too.
+  if (m->_dense && (cfg.load_quant_bits == 8 || cfg.stream_decode)) {
+    if (!raw_eligible_(cfg)) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->info(fmt("[qwen] in-memory quantization / decode streaming need "
+                    "a dense full-attention backbone_only bf16 model with "
+                    "plain RMSNorm; this one loads {} as before",
+                    m->_stream_layers ? "prefill-streamed" : "resident"));
+      }
+    } else if (cfg.load_quant_bits == 8 && cfg.quant_bits != 8) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] load_quant_bits 8 needs quant_bits 8 (the "
+                    "affine kernels were chosen for {}); loading dense",
+                    cfg.quant_bits));
+      }
+    } else {
+      m->_raw = true;
+      m->_raw_quant = cfg.load_quant_bits == 8;
+      if (m->_raw_quant) { m->_dense = false; }
+      // Decode streaming takes the place of the prefill-only mechanism and
+      // its pinned prefix: the resident set is grown by measurement.
+      m->_stream_layers = cfg.stream_decode;
+      m->_rs = std::make_unique<RawStream>(m.get(), mc, m->_raw_quant,
+                                           cfg.stream_decode);
+      if (!m->_rs->init()) {
+        if (const SessionContextIntf* s = mc->session()) {
+          s->warn(fmt("[qwen] raw-source layers: the build kernel did not "
+                      "load (affine_quant_rows_w8g64 / copy_f16); model not "
+                      "loaded"));
+        }
+        return nullptr;
+      }
+    }
+  }
+  // A STREAMED PACK: an affine w8 group-64 checkpoint whose layers the plan
+  // said cannot all be held. They are the products already, short of the
+  // q|k|v and gate|up fusions, so they stream through the same slots at
+  // half a raw bf16 source's bytes (metal-qwen-raw-layers.h).
+  if (!m->_raw && !m->_dense && !m->_kquant && !m->_mixed &&
+      cfg.stream_decode) {
+    if (cfg.quant_bits == 8 && raw_eligible_(cfg) &&
+        pack_streamable_(*wts, cfg)) {
+      m->_raw = true;
+      m->_raw_quant = true;
+      m->_raw_pack = true;
+      m->_stream_layers = true;
+      m->_rs = std::make_unique<RawStream>(m.get(), mc, /*quantize=*/true,
+                                           /*stream=*/true, /*pack=*/true);
+      if (!m->_rs->init()) {
+        if (const SessionContextIntf* s = mc->session()) {
+          s->warn(fmt("[qwen] streaming a w8 pack: copy_rows_u32 did not "
+                      "load; model not loaded"));
+        }
+        return nullptr;
+      }
+    } else if (const SessionContextIntf* s = mc->session()) {
+      s->info(fmt("[qwen] decode streaming of a pack needs a dense "
+                  "full-attention backbone_only bf16 model quantized "
+                  "uniformly to affine w8 group 64; this {}-bit one loads "
+                  "resident", cfg.quant_bits));
+    }
+  }
   if (m->_dense) {
     // Dense f16 GEMM/GEMV (the same kernels the k-quant prefill runs post-
     // dequant) + the in-stream embed gather. dense_gemm_ rides the matrix
@@ -1378,7 +1458,7 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_layers.resize(cfg.n_layers);
   // Pinned prefix (streaming only): as many leading layers as fit resident
   // beside the in-flight one, so a roomy box re-reads only the tail.
-  if (m->_stream_layers && cfg.pin_frac > 0.0) {
+  if (m->_stream_layers && !m->_raw && cfg.pin_frac > 0.0) {
     std::vector<std::string> pfx;
     pfx.reserve((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
@@ -1394,6 +1474,14 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     // Streaming calibration: leave the layer's weights EMPTY (loaded one at a
     // time later by calib_build_layer) so the full model never resides.
     if (cfg.calib_stream) { continue; }
+    if (m->_raw) {
+      // Streaming: every layer starts streamed and residency grows the
+      // kept set by measurement. Preloaded: built here, from the raw
+      // tensors, by the same builder a streamed use runs.
+      if (m->_rs->streaming) { continue; }
+      if (!m->_rs->build_resident(L)) { return nullptr; }
+      continue;
+    }
     // Streamed tail: built on demand by the prefill, freed after use.
     if (m->_stream_layers && L >= m->_pinned_layers) { continue; }
     if (!H.build_layer(L)) { return nullptr; }
@@ -2757,12 +2845,29 @@ MetalQwenModel::LayerLoad::build_layer(int L)
   return ok;
 }
 
-MetalQwenModel::~MetalQwenModel() = default;
+MetalQwenModel::~MetalQwenModel()
+{
+  // Give the wired pool back and join any streamed read BEFORE the layers
+  // go: only unwire_from_pool decrements the pool's counter.
+  if (_rs) { _rs->shutdown(); }
+}
+
+// A raw checkpoint tensor in the compute dtype, read uncached -- the
+// RawStream's one way in, through the same converter LayerLoad uses.
+SharedBuffer
+MetalQwenModel::raw_read_(const std::string& name)
+{
+  if (!_lload) { return {}; }
+  return _lload->to_elt(name);
+}
 
 bool
 MetalQwenModel::build_layer_(int L)
 {
-  if (!_lload || L < 0 || L >= (int)_layers.size()) { return false; }
+  if (L < 0 || L >= (int)_layers.size()) { return false; }
+  // A raw-source model has exactly one builder, whoever asks.
+  if (_rs) { return _rs->build_resident(L); }
+  if (!_lload) { return false; }
   return _lload->build_layer(L);
 }
 
@@ -2813,7 +2918,10 @@ MetalQwenModel::dense_gemm_(ComputeEncoder& enc, const SharedBuffer& w,
   // Dynamic-int8 accelerated mode (opt-in, LOSSY): quantize activations +
   // the f16 weight on the fly, run the int8 matmul. Prefill-only by
   // construction (the M gate); decode M=1 never qualifies.
-  if (_i8 && _i8->gemm(enc, x, 0, w, y, 0, M, N, K)) { return; }
+  if (_i8 && _i8->gemm(enc, x, 0, w, y, 0, M, N, K)) {
+    ++_i8_count;
+    return;
+  }
   // y[M,N] = x[M,K] @ w[N,K]^T, all f16, no bias. The caller (kqmm_ / the
   // fused-dequant QKV+GDN paths) has already dequantized the k-quant weight
   // into the f16 scratch, so this is the same plain f16 GEMM the affine
@@ -3011,9 +3119,14 @@ MetalQwenModel::encode_decode_step_(
     ComputeEncoder& enc, ContextId cid, int pos, int rpos,
     std::size_t page_off, int n_pages,
     const ContextManager::AppendSlot& slot,
-    const SharedBuffer& pgtab, std::size_t pgtab_off, bool return_hidden)
+    const SharedBuffer& pgtab, std::size_t pgtab_off, bool return_hidden,
+    metal_compute::CommandStream* stream)
 {
-  if (_stream_layers && !stream_decode_ok_()) { return; }
+  // A raw-source streaming model serves decode -- given the stream, since
+  // a streamed layer needs commits of its own. Anything else that streams
+  // only prefills.
+  const bool raw_stream = _rs != nullptr && _rs->streaming && stream != nullptr;
+  if (_stream_layers && !raw_stream && !stream_decode_ok_()) { return; }
   const Config& c = _cfg;
   const int H = c.hidden, D = c.head_dim;
   const int Hq = c.n_heads, Hkv = c.n_kv_heads;
@@ -3247,7 +3360,15 @@ MetalQwenModel::encode_decode_step_(
     enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
   };
 
+  if (raw_stream) { _rs->begin_forward(); }
   for (int L = 0; L < c.n_layers; ++L) {
+    if (raw_stream) {
+      // Finish the streamed layer before this one, then open this one if
+      // it streams. A failed read leaves the stack unrunnable: stop, and
+      // let the caller see RawStream::failed.
+      if (!_rs->finish(*stream, enc)) { return; }
+      if (_rs->streamed(L) && !_rs->enter(L, *stream, enc)) { return; }
+    }
     Layer& ly = _layers[L];
     DUP(DC_NORM, [&] { rms(_d_x, 0, ly.in_ln, _d_hn, 0, 1, H); });
     if (ly.is_full) {
@@ -3702,6 +3823,7 @@ MetalQwenModel::encode_decode_step_(
     }
   }
 
+  if (raw_stream && !_rs->finish(*stream, enc)) { return; }
   DUP(DC_NORM, [&] { rms(_d_x, 0, _final_ln, _d_hn, 0, 1, H); });
   // MOSS-TTS: the caller (decode_embedding_hidden) consumes _d_hn directly;
   // skip the lm_head (backbone_only models never loaded one).
@@ -5335,9 +5457,14 @@ MetalQwenModel::forward_embeddings_taps_batch(
     int L1 = last + 1;
     if (streamed) {
       L1 = std::min(L0 + group, last + 1);
+      // A layer residency is holding is already built -- and rebuilding
+      // it here, then freeing it below, would drop it from under the
+      // residency ledger.
+      auto ours = [&](int L) { return !_rs || _rs->streamed(L); };
       for (int L = L0; L < L1; ++L) {
+        if (!ours(L)) { continue; }
         if (!build_layer_(L)) {
-          for (int k = L0; k < L; ++k) { free_layer_(k); }
+          for (int k = L0; k < L; ++k) { if (ours(k)) { free_layer_(k); } }
           release();
           return {};
         }
@@ -5358,7 +5485,9 @@ MetalQwenModel::forward_embeddings_taps_batch(
     // forward_chunk_ waited for its command buffer, so the GPU is done
     // with the group.
     if (streamed) {
-      for (int L = L0; L < L1; ++L) { free_layer_(L); }
+      for (int L = L0; L < L1; ++L) {
+        if (!_rs || _rs->streamed(L)) { free_layer_(L); }
+      }
     }
     L0 = L1;
   }
@@ -5959,13 +6088,16 @@ MetalQwenModel::decode_embedding_hidden(
   {
     ComputeEncoder enc = stream.begin_compute();
     encode_decode_step_(enc, cid, pos, rpos, page_off, n_pages, slot, _pgtab,
-                        0, /*return_hidden=*/true);
+                        0, /*return_hidden=*/true, &stream);
     // Fuse the caller's dispatches (MOSS heads) into the same command buffer,
     // reading _d_hn which the final norm above wrote (GPU-ordered).
-    if (post_hidden != nullptr) { (*post_hidden)(enc, _d_hn); }
+    if (post_hidden != nullptr && !(_rs && _rs->failed)) {
+      (*post_hidden)(enc, _d_hn);
+    }
   }
   const auto t_enc1 = std::chrono::steady_clock::now();
   stream.commit().wait();
+  if (_rs && _rs->failed) { return nullptr; }
   if (kProf) {
     static double enc_ms = 0.0, gpu_ms = 0.0;
     static int cnt = 0;
@@ -6291,24 +6423,37 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       // counts; M-independent dequant cost amortizes over the n rows.
       // Restricted to enough rows that the dequant pass pays off.
       if (_use_mma && n >= _mma_min_m) {
+        // Dynamic-int8 (opt-in, LOSSY): the checkpoint's own codes straight
+        // into the int8 GEMM -- no dequant scratch, the weight quantized
+        // once rather than twice. Declines (nothing encoded) below its
+        // M / K floors or for a width its policy excludes.
+        if (_i8 && _i8->gemm_affine(enc, xin, 0, w, s, b, c.quant_bits, y, 0,
+                                    n, N, Kk)) {
+          ++_i8_count;
+          return;
+        }
         const std::size_t need = (std::size_t)N * Kk * 2;  // compute-elt bytes
         if (_w_deq.empty() || _w_deq.byte_size() < need) {
           _w_deq = _mc->make_shared_buffer(need);
         }
-        // dequant: (w, s, b) -> _w_deq[N,Kk]  (one thread per weight byte)
+        // dequant: (w, s, b) -> _w_deq[N,Kk], one thread per u32 word (8
+        // values at w4, 4 at w8).
         if (!_skip_dequant) {
-          enc.set_function(_fn_dequant);
+          enc.set_function(c.quant_bits == 8 ? _fn_dequant8 : _fn_dequant);
           enc.set_buffer(0, w);
           enc.set_buffer(1, s);
           enc.set_buffer(2, b);
           enc.set_buffer(3, _w_deq);
           enc.set_constant(4, Kk);
           enc.set_constant(5, N);
-          enc.dispatch({(unsigned)(Kk / 8), (unsigned)N, 1}, {64, 1, 1});
+          enc.dispatch({(unsigned)(Kk * c.quant_bits / 32), (unsigned)N, 1},
+                       {64, 1, 1});
         }
         // dense matmul2d: y[n,N] = xin[n,Kk] @ _w_deq[N,Kk]^T (no bias) --
         // or the dynamic-int8 accelerated GEMM when enabled + qualifying.
-        if (!(_i8 && _i8->gemm(enc, xin, 0, _w_deq, y, 0, n, N, Kk))) {
+        if (_i8 && _i8->gemm(enc, xin, 0, _w_deq, y, 0, n, N, Kk)) {
+          ++_i8_count;
+        } else {
           dense_mma(xin, _w_deq, y, Kk, N);
         }
         return;
@@ -6445,9 +6590,16 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
     const bool use_pset = (D == 256) && _prefill_set.ready();
 
     if (kLayerDump != nullptr) { tap(x, dbgEmbed, n * H); }
+    // Raw-source streaming (metal-qwen-raw-layers.h): a streamed layer is
+    // read into a slot and rebuilt in its own command buffer. A window's
+    // caller builds its group itself, so windows take the old branch.
+    const bool raw_stream = _rs != nullptr && _rs->streaming && win == nullptr;
+    if (raw_stream) { _rs->begin_forward(); }
     for (int L = L_begin; L < L_end; ++L) {
-      // A window's caller holds the streamed layers resident itself.
-      if (_stream_layers && L >= _pinned_layers && win == nullptr) {
+      if (raw_stream) {
+        if (!_rs->finish(stream, enc)) { return {}; }
+        if (_rs->streamed(L) && !_rs->enter(L, stream, enc)) { return {}; }
+      } else if (_stream_layers && L >= _pinned_layers && win == nullptr) {
         // This layer's weights are not resident. Close the command buffer
         // FIRST: the dispatches already encoded still read the previous
         // layer's buffers, and freeing them under an open encoder frees
@@ -6853,18 +7005,27 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           // matrix units. Byte-identical weight/layout to the uniform branch,
           // so it stays token-exact (verified vs the steel path).
           const int N2 = 2 * ffn;
-          const std::size_t need = (std::size_t)N2 * H * 2;
-          if (_w_deq.empty() || _w_deq.byte_size() < need) {
-            _w_deq = _mc->make_shared_buffer(need);
+          if (_i8 && _i8->gemm_affine(enc, hn, 0, ly.guw, ly.gus, ly.gub,
+                                      4, gu_full, 0, n, N2, H)) {
+            ++_i8_count;
+          } else {
+            const std::size_t need = (std::size_t)N2 * H * 2;
+            if (_w_deq.empty() || _w_deq.byte_size() < need) {
+              _w_deq = _mc->make_shared_buffer(need);
+            }
+            if (!_skip_dequant) {
+              enc.set_function(_fn_dequant);
+              enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
+              enc.set_buffer(2, ly.gub); enc.set_buffer(3, _w_deq);
+              enc.set_constant(4, H); enc.set_constant(5, N2);
+              enc.dispatch({(unsigned)(H / 8), (unsigned)N2, 1}, {64, 1, 1});
+            }
+            if (_i8 && _i8->gemm(enc, hn, 0, _w_deq, gu_full, 0, n, N2, H)) {
+              ++_i8_count;
+            } else {
+              dense_mma(hn, _w_deq, gu_full, H, N2);   // K=H -> 128x128
+            }
           }
-          if (!_skip_dequant) {
-            enc.set_function(_fn_dequant);
-            enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
-            enc.set_buffer(2, ly.gub); enc.set_buffer(3, _w_deq);
-            enc.set_constant(4, H); enc.set_constant(5, N2);
-            enc.dispatch({(unsigned)(H / 8), (unsigned)N2, 1}, {64, 1, 1});
-          }
-          dense_mma(hn, _w_deq, gu_full, H, N2);   // K=H (<=4096) -> 128x128
           enc.set_function(_fn_swiglu_inter);
           enc.set_buffer(0, gu_full); enc.set_buffer(1, sg);
           enc.set_constant(2, n); enc.set_constant(3, ffn);
@@ -6918,19 +7079,32 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         if (mma_mlp) {
           // Matrix-core MLP: dequant interleaved gate|up weight -> dense
           // matmul2d -> gu_full[n, 2*ffn], then SwiGLU-combine -> sg[n,ffn].
+          // The int8 tier, when on, takes the widest GEMM of the layer here
+          // (natively from the codes, else after the dequant).
           const int N2 = 2 * ffn;
-          const std::size_t need = (std::size_t)N2 * H * 2;
-          if (_w_deq.empty() || _w_deq.byte_size() < need) {
-            _w_deq = _mc->make_shared_buffer(need);
+          if (_i8 && _i8->gemm_affine(enc, hn, 0, ly.guw, ly.gus, ly.gub,
+                                      c.quant_bits, gu_full, 0, n, N2, H)) {
+            ++_i8_count;
+          } else {
+            const std::size_t need = (std::size_t)N2 * H * 2;
+            if (_w_deq.empty() || _w_deq.byte_size() < need) {
+              _w_deq = _mc->make_shared_buffer(need);
+            }
+            if (!_skip_dequant) {
+              enc.set_function(c.quant_bits == 8 ? _fn_dequant8
+                                                 : _fn_dequant);
+              enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
+              enc.set_buffer(2, ly.gub); enc.set_buffer(3, _w_deq);
+              enc.set_constant(4, H); enc.set_constant(5, N2);
+              enc.dispatch({(unsigned)(H * c.quant_bits / 32), (unsigned)N2,
+                            1}, {64, 1, 1});
+            }
+            if (_i8 && _i8->gemm(enc, hn, 0, _w_deq, gu_full, 0, n, N2, H)) {
+              ++_i8_count;
+            } else {
+              dense_mma(hn, _w_deq, gu_full, H, N2);   // K=H -> 128x128
+            }
           }
-          if (!_skip_dequant) {
-            enc.set_function(_fn_dequant);
-            enc.set_buffer(0, ly.guw); enc.set_buffer(1, ly.gus);
-            enc.set_buffer(2, ly.gub); enc.set_buffer(3, _w_deq);
-            enc.set_constant(4, H); enc.set_constant(5, N2);
-            enc.dispatch({(unsigned)(H / 8), (unsigned)N2, 1}, {64, 1, 1});
-          }
-          dense_mma(hn, _w_deq, gu_full, H, N2);   // K=H (<=4096) -> 128x128
           enc.set_function(_fn_swiglu_inter);
           enc.set_buffer(0, gu_full); enc.set_buffer(1, sg);
           enc.set_constant(2, n); enc.set_constant(3, ffn);
@@ -7040,6 +7214,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       // LM path, which needs the final norm + lm_head.
       if (stop_after_layer >= 0 && L >= stop_after_layer) { break; }
     }
+    if (raw_stream && !_rs->finish(stream, enc)) { return {}; }
 
     if (!last_window) {
       // A window before the sequence's last: the residual stream in `x`

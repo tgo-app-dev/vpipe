@@ -205,6 +205,8 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   _web_allow_private = attr_bool("web_allow_private");
   _allow_system_temp = attr_bool("allow_system_temp");
   _stream_answer_only = attr_bool("stream_answer_only");
+  _stream_words = static_cast<int>(
+      std::max<int64_t>(0, attr_int("stream_words")));
 
   // disable_thinking is tri-state (unset = family default), with no flat
   // ConfigKey form, so it's read from the config object directly.
@@ -337,6 +339,13 @@ constexpr ConfigKey kAttrs[] = {
           "text-to-speech) voices only the answer; out-port 0 still "
           "carries the full reply",
    .def_bool = false},
+  {.key = "stream_words", .type = ConfigType::Int,
+   .doc = "the streaming out-port's (index 1) chunk: flushed at a "
+          "sentence/clause punctuation past this many words (hard cap 3x, "
+          "at least 60) -- speakable units for text-to-speech; 0 flushes "
+          "every decoded piece as it comes, for a reader watching the "
+          "reply being written",
+   .def_int = 20},
   {.key = "mtp", .type = ConfigType::Bool,
    .doc = "use the MTP speculative-decode head when the model carries one "
           "(token-exact; perf only); false forces the standard decode path",
@@ -1047,9 +1056,11 @@ TextChatStage::process(RuntimeContext& ctx)
   // unchanged. write_sync is used because the decode loop is synchronous
   // (no co_await inside it); the default-depth oport ring never
   // backpressures and a closed buffer (teardown) simply ends streaming.
-  constexpr int kStreamWordTarget = 20;   // flush at a punct past ~20 words
-  constexpr int kStreamWordMax    = 60;   // hard cap (runaway clause)
-  text_stream::Chunker stream_chunker(kStreamWordTarget, kStreamWordMax);
+  // Flush at a punctuation past ~`stream_words` words (20 by default),
+  // with a hard cap for a runaway clause; 0 = each piece as decoded.
+  const int stream_word_target = _stream_words;
+  const int stream_word_max    = std::max(60, 3 * _stream_words);
+  text_stream::Chunker stream_chunker(stream_word_target, stream_word_max);
   bool stream_alive = true;
   bool streamed_any = false;
   // When stream_answer_only is set, fold reasoning (<think>) and tool-call
@@ -1080,6 +1091,11 @@ TextChatStage::process(RuntimeContext& ctx)
   auto stream_consume =
       [&](const std::string& chunk) {
         if (chunk.empty() || !stream_alive) { return; }
+        if (stream_word_target == 0) {
+          streamed_any = true;
+          stream_emit(chunk, /*end_of_response=*/false);
+          return;
+        }
         if (stream_chunker.push(chunk)) {
           streamed_any = true;
           stream_emit(stream_chunker.take(), /*end_of_response=*/false);

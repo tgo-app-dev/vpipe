@@ -8,12 +8,14 @@
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
+#include "pipeline/memory-plan.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/ffmpeg-libraries.h"
 #include "generative-models/moss/metal-moss-tts-model.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/moss/metal-moss-codec.h"
 #include "generative-models/moss/metal-moss-codec-v2.h"
@@ -21,10 +23,13 @@
 #include "generative-models/moss/moss-v15-processor.h"
 #include "generative-models/moss/metal-moss-rt-model.h"
 #include "generative-models/moss/moss-rt-processor.h"
+#include "generative-models/moss/moss-delay-processor.h"
+#include "generative-models/moss/moss-text-normalizer.h"
 #include "generative-models/tokenizer.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <utility>
@@ -130,8 +135,39 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
   _hf_dir    = attr_str("hf_dir");
   _codec_dir = attr_str("codec_dir");
   _codec_int8 = (attr_str("codec_quant") == "int8");
-  _instruction = attr_str("instruction");
-  _language    = attr_str("language");
+  _instruction   = attr_str("instruction");
+  _language      = attr_str("language");
+  _quality       = attr_str("quality");
+  _sound_event   = attr_str("sound_event");
+  _ambient_sound = attr_str("ambient_sound");
+  _wait_reference = attr_bool("wait_for_reference");
+  {
+    int64_t v = attr_int("duration_tokens");
+    if (v < 0) {
+      fail_config(fmt(
+          "TextToSpeechStage('{}'): duration_tokens must be >= 0 (0 = let "
+          "the model decide; got {})", this->id(), v));
+    }
+    _duration_tokens = v > 0 ? static_cast<int>(v) : 0;
+  }
+  _lm_quant = attr_str("lm_quant");
+  if (_lm_quant.empty()) { _lm_quant = "w8"; }
+  if (_lm_quant != "w8" && _lm_quant != "bf16") {
+    fail_config(fmt(
+        "TextToSpeechStage('{}'): lm_quant must be \"w8\" or \"bf16\" "
+        "(got \"{}\")", this->id(), _lm_quant));
+  }
+  _lm_quant_bits = _lm_quant == "bf16" ? 0 : 8;
+  _i8_gemm = attr_bool("i8_gemm");
+  _text_normalizer = attr_str("text_normalizer");
+  if (_text_normalizer.empty()) { _text_normalizer = "auto"; }
+  if (_text_normalizer != "auto" && _text_normalizer != "robust" &&
+      _text_normalizer != "basic") {
+    fail_config(fmt(
+        "TextToSpeechStage('{}'): text_normalizer must be \"auto\", "
+        "\"robust\" or \"basic\" (got \"{}\")", this->id(),
+        _text_normalizer));
+  }
   {
     int64_t v = attr_int("max_new_tokens");
     if (v < 1) {
@@ -195,14 +231,16 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "MOSS-TTS LM model: a models-DB key (registered by model-fetch / "
           "model-quantize) or an HF-style model dir; a DB key wins over a "
-          "same-named path. 8B (moss-tts), v1.5 (moss-tts-local), or realtime "
-          "(moss-tts-realtime).",
+          "same-named path. Delay-pattern MOSS-TTS 8B / MOSS-TTS-v1.5 "
+          "(moss-tts; bf16 as published, or model-quantize'd), Local-v1.5 "
+          "(moss-tts-local), or realtime (moss-tts-realtime).",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "moss-tts,moss-tts-local,moss-tts-realtime"},
   {.key = "codec_dir", .type = ConfigType::String, .required = true,
    .doc = "MOSS-Audio-Tokenizer (codec) model: a models-DB key or a "
           "filesystem path; a DB key wins over a same-named path. Match the "
-          "LM variant: moss-codec (8B) or moss-codec-v2 (v1.5).",
+          "LM variant: moss-codec (MOSS-TTS 8B / v1.5, realtime) or "
+          "moss-codec-v2 (Local-v1.5).",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "moss-codec,moss-codec-v2"},
   {.key = "codec_quant", .type = ConfigType::String,
@@ -211,7 +249,9 @@ constexpr ConfigKey kAttrs[] = {
           "footprint, small audio-quality cost); default/empty = f16",
    .def_str = ""},
   {.key = "max_new_tokens", .type = ConfigType::Int,
-   .doc = "8B-only: per-beat delay-pattern generation budget (>= 1)",
+   .doc = "delay-pattern variants (MOSS-TTS 8B, MOSS-TTS-v1.5) only: "
+          "per-beat generation budget in rows (>= 1; 12.5 rows ~= 1 s of "
+          "audio, plus 32 rows of delay tail)",
    .def_int = 1024},
   // Streaming: emit PCM incrementally as the LM generates instead of decoding
   // the whole utterance at the end. The codec streams its decode with a
@@ -233,17 +273,84 @@ constexpr ConfigKey kAttrs[] = {
           "soon as new text arrives, then speak the new text; false = finish "
           "each utterance fully before the next",
    .def_bool = true},
-  // v1.5-only (model_type moss_tts_local): per-beat frame budget + prompt
-  // fields. Ignored for the 8B variant.
+  // The depth-decoder variants' frame budget (Local-v1.5, realtime).
   {.key = "max_frames", .type = ConfigType::Int,
-   .doc = "v1.5-only: per-beat frame budget (each ~= 80 ms @ 48 kHz); >= 1",
+   .doc = "Local-v1.5 / realtime only: per-beat frame budget (each ~= "
+          "80 ms); >= 1",
    .def_int = 1000},
+  // Prompt fields (the processor's <user_inst> block). "None" is how the
+  // reference renders an unset field.
   {.key = "instruction", .type = ConfigType::String,
-   .doc = "v1.5-only: optional style instruction (prompt field)",
+   .doc = "optional style instruction (prompt field; MOSS-TTS / v1.5 and "
+          "Local-v1.5). \"None\" = unset",
    .def_str = "None"},
   {.key = "language", .type = ConfigType::String,
-   .doc = "v1.5-only: optional language tag (prompt field)",
+   .doc = "language of the text, by English name: \"English\", "
+          "\"Chinese\", \"French\", ... (prompt field; MOSS-TTS / v1.5 and "
+          "Local-v1.5). MOSS-TTS-v1.5 is markedly better on almost every "
+          "language when it is set. \"None\" = unset",
    .def_str = "None"},
+  {.key = "quality", .type = ConfigType::String,
+   .doc = "delay-pattern variants only: a whole-utterance quality / style "
+          "hint (prompt field), e.g. \"Studio recording\", \"Telephone "
+          "call quality\". \"None\" = unset",
+   .def_str = "None"},
+  {.key = "sound_event", .type = ConfigType::String,
+   .doc = "delay-pattern variants only: a whole-utterance sound-event hint "
+          "(prompt field), e.g. \"Laughter\", \"Sigh\", \"Breathing\" -- "
+          "the whole utterance is conditioned on it, not one point in it. "
+          "\"None\" = unset",
+   .def_str = "None"},
+  {.key = "ambient_sound", .type = ConfigType::String,
+   .doc = "delay-pattern variants only: a whole-utterance ambience hint "
+          "(prompt field), e.g. \"Rain\", \"Office room tone\". "
+          "Experimental on the base model: weak, or a longer tail. "
+          "\"None\" = unset",
+   .def_str = "None"},
+  {.key = "wait_for_reference", .type = ConfigType::Bool,
+   .doc = "with the audio-ref iport wired: the FIRST utterance waits for "
+          "a reference beat (or that port's end) before it is spoken. "
+          "Off, the port is drained without waiting, so a reference that "
+          "arrives after the first text (one decoded from a file, behind "
+          "a graph that emits the text at launch) clones nothing for it",
+   .def_bool = false},
+  {.key = "duration_tokens", .type = ConfigType::Int,
+   .doc = "delay-pattern variants only: the expected length of the speech "
+          "in audio tokens (12.5 tokens ~= 1 s), the prompt's duration "
+          "control. 0 = let the model decide",
+   .def_int = 0},
+  {.key = "lm_quant", .type = ConfigType::String,
+   .doc = "how an UNQUANTIZED LM checkpoint's backbone is held: \"w8\" "
+          "(default) quantizes it in memory as it loads, to affine 8-bit "
+          "group-64 -- ~53% of the bf16 bytes at near-bf16 accuracy, and "
+          "the faster decode since every token reads every weight; "
+          "\"bf16\" keeps it as published. On the delay-pattern model "
+          "\"w8\" also holds the text embedding and text head at w8 "
+          "(their slot-token rows stay exact). A model-quantize'd or MLX "
+          "8-bit LM loads as it sits either way. When even that does not "
+          "fit the box, the backbone streams its layers (decided before "
+          "loading, from the memory plan) and keeps as many resident as "
+          "the machine allows; an 8-bit pack streams at half the bytes "
+          "per layer of a bf16 checkpoint, so on a small box point hf_dir "
+          "at one (model-quantize, bits 8)",
+   .def_str = "w8"},
+  {.key = "i8_gemm", .type = ConfigType::Bool,
+   .doc = "accelerated mode (LOSSY): the LM backbone's prefill GEMMs as "
+          "dynamic-int8 matmul2d, ~1e-2 per GEMM. MATRIX CORES ONLY -- an "
+          "M5 path; any other box stays dense. It declines GEMMs under "
+          "1024 rows, so only a long prompt (long-form text, or text plus "
+          "a long cloned voice) reaches it; generation itself is one row a "
+          "frame and never does. Env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
+  {.key = "text_normalizer", .type = ConfigType::String,
+   .doc = "text clean-up before the prompt is built: \"robust\" = "
+          "MOSS-TTS-v1.5's own normalizer (line breaks become sentence "
+          "breaks, CJK/Latin spacing, brackets, arrows, repeated "
+          "punctuation; URLs, e-mails and file names protected), "
+          "\"basic\" = control characters dropped and whitespace "
+          "collapsed, \"auto\" (default) = robust exactly when the LM dir "
+          "ships v1.5's normalizer script, as its processor does",
+   .def_str = "auto"},
   {.key = "voice_lock", .type = ConfigType::Bool,
    .doc = "design-once: cache the FIRST generated voice and reuse it as the "
           "clone reference for every later beat, so the timbre stays the same "
@@ -290,8 +397,9 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "pcm",
    .doc = "TensorBeat f32 PCM (sideband.sample_rate set); downstream "
-          "optional. 8B variant: rank-1 [n_samples] mono @ 24 kHz. v1.5 "
-          "variant: rank-2 [2, n_samples] stereo @ 48 kHz.",
+          "optional. Delay-pattern variants: rank-1 [n_samples] mono @ "
+          "24 kHz. Local-v1.5: rank-2 [2, n_samples] stereo @ 48 kHz. "
+          "Realtime: [1, n_samples] mono @ 24 kHz.",
    .type = &typeid(TensorBeatPayload),
    .tags = "pcm-samples", .clock_group = 0},
 };
@@ -300,8 +408,10 @@ const StageSpec kSpec = {
   .doc       = "Text-to-speech (MOSS-TTS, metal): synthesizes each input "
                "text beat into a PCM waveform and emits it as a TensorBeat. "
                "The variant is chosen from the LM dir's config.json "
-               "model_type: \"moss_tts\" (8B delay-pattern -> 24 kHz mono) "
-               "or \"moss_tts_local\" (v1.5 depth decoder -> 48 kHz stereo).",
+               "model_type: \"moss_tts_delay\" / \"moss_tts\" (MOSS-TTS 8B "
+               "and MOSS-TTS-v1.5, delay pattern -> 24 kHz mono), "
+               "\"moss_tts_local\" (Local-v1.5 depth decoder -> 48 kHz "
+               "stereo) or \"moss_tts_realtime\" (24 kHz mono).",
   .display_name = "Speak",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -353,6 +463,9 @@ v15_backbone_cfg_(const std::string& dir)
   c.rope_theta = 1.0e6f; c.rms_eps = 1e-6f; c.rotary_dim = 128;
   c.full_attn_interval = 1; c.tie_embeddings = false; c.use_bf16 = true;
   c.quant_bits = 8; c.dense = true; c.attn_output_gate = false;
+  // Plain Qwen3 RMSNorm: consulted when the checkpoint is raw bf16, where
+  // the Qwen3.5 default would fold +1 into every norm.
+  c.zero_centered_norm = false;
   c.backbone_only = true; c.weight_prefix = "transformer."; c.model_seg = "";
   c.max_seq = 2048; c.page_tokens = 256;
   std::ifstream in(dir + "/config.json");
@@ -460,6 +573,60 @@ rt_qwen_cfg_(const std::string& dir, const std::string& prefix,
   return c;
 }
 
+// What one of the three MOSS LM variants will hold, from its checkpoint
+// alone -- the only source available while a graph is being planned.
+struct LmPlan {
+  std::string variant;       // "delay" | "local" | "realtime"
+  std::string layer_prefix;  // the streamable backbone stack
+  int n_layers = 0, n_kv = 8, head_dim = 128;
+  genai::MetalMossTtsModel::MemoryPlan mem;
+};
+
+LmPlan
+lm_plan_(const std::string& dir, int quant_bits)
+{
+  LmPlan p;
+  const std::string mt = read_model_type_(dir);
+  std::string sub = "language_config";
+  if (mt == "moss_tts_local") {
+    p.variant = "local";
+    p.layer_prefix = "transformer.layers.";
+    p.n_layers = 36;
+    sub = "qwen3_config";
+  } else if (mt == "moss_tts_realtime") {
+    p.variant = "realtime";
+    p.layer_prefix = "language_model.model.layers.";
+    p.n_layers = 28;
+  } else {
+    p.variant = "delay";
+    p.layer_prefix = "language_model.layers.";
+    p.n_layers = 36;
+  }
+  std::ifstream in(dir + "/config.json");
+  if (in) {
+    try {
+      FlexData root = FlexData::from_json(in);
+      if (root.is_object() && root.as_object().contains(sub)) {
+        const FlexData lc = root.as_object().at(sub);
+        if (lc.is_object()) {
+          const auto o = lc.as_object();
+          auto gi = [&](const char* k, int d) {
+            return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+          };
+          p.n_layers = gi("num_hidden_layers", p.n_layers);
+          p.n_kv     = gi("num_key_value_heads", p.n_kv);
+          p.head_dim = gi("head_dim", p.head_dim);
+        }
+      }
+    } catch (...) {}
+  }
+  // The delay model also holds its text embedding and text head at w8
+  // when the backbone is (MossTtsLoadOptions::trunk_w8).
+  p.mem = genai::MetalMossTtsModel::plan_memory(
+      dir, p.layer_prefix, p.n_layers, quant_bits, p.variant == "delay");
+  return p;
+}
+
 }  // namespace
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
@@ -477,41 +644,224 @@ TextToSpeechStage::release_models_()
   _lm.reset();
   _codec.reset();
   _tokenizer.reset();
+  // Hand the checkpoints to the manager's removable pool now that nothing
+  // borrows them: a relaunch over the same models then finds the cached
+  // trunk (embedding tables, heads) instead of re-reading it, and under
+  // pressure the pages simply go.
+  if (auto* mgr = session() != nullptr
+                      ? session()->services()->generative_model_manager()
+                      : nullptr) {
+    if (!_lm_dir_resolved.empty()) { mgr->pool_weights(_lm_dir_resolved); }
+    if (!_codec_dir_resolved.empty()) {
+      mgr->pool_weights(_codec_dir_resolved);
+    }
+  }
   // Per-run conversation state that belongs to the weights just freed.
   _ref_codes.clear();
   _ref_set = false;
 }
 #endif
 
+std::string
+TextToSpeechStage::scratch_label_() const
+{
+  // Per STAGE: two TTS stages in one graph each allocate their own.
+  return "text-to-speech:" + this->id();
+}
+
+// What the stage allocates to run, beyond weights: the LM's K/V at the
+// configured budget (plus a generous prompt -- a long text, or a cloned
+// voice spliced into it), and the codec's decode working set plus the PCM
+// of a whole utterance. Bounded from configuration, corrected per beat.
+std::size_t
+TextToSpeechStage::scratch_bytes_(const std::string& lm_dir,
+                                  std::size_t* kv_part) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
+  const bool delay = p.variant == "delay";
+  const std::size_t budget =
+      (std::size_t)(delay ? _max_new_tokens : _max_frames);
+  const std::size_t prompt =
+      512 + (std::size_t)(std::max(0.0, _voice_ref_seconds) * 12.5) + 32;
+  std::size_t tokens = budget + prompt;
+  tokens = (tokens + 255) / 256 * 256;            // K/V pages hold 256
+  const std::size_t kv = tokens * (std::size_t)p.n_layers * p.n_kv *
+                         p.head_dim * 2 /*K,V*/ * 2 /*bf16*/;
+  // PCM: 1920 samples per 80 ms frame at 24 kHz mono (3840 x 2 channels
+  // at 48 kHz for Local-v1.5), f32, for the one-shot decode's utterance.
+  const std::size_t pcm = budget * 1920 * 4 * (delay ? 1 : 2);
+  if (kv_part != nullptr) { *kv_part = kv; }
+  return kv + pcm + ((std::size_t)256 << 20);
+#else
+  (void)lm_dir;
+  if (kv_part != nullptr) { *kv_part = 0; }
+  return 0;
+#endif
+}
+
 StageMemory
 TextToSpeechStage::declare_memory() const
 {
   StageMemory m;
-  // BOTH, and each NAMED: this stage holds the LM and the codec at once,
-  // and naming them is what stops a second stage over either one being
-  // billed for the same bytes.
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // BOTH holdings, each NAMED by its checkpoint so a second stage over
+  // either one is not billed twice -- and each at what it will HOLD, not
+  // what it weighs on disk: the LM backbone built (w8 in memory by
+  // default) with its streaming floor, the codec at f16 without the
+  // encoder it only loads for cloning.
+  std::string lm_dir;
   if (!_hf_dir.empty()) {
-    const std::string d = resolve_model_dir(session(), _hf_dir);
-    m.hold(d, model_memory::dir_weights_bytes(d));
+    lm_dir = resolve_model_dir(session(), _hf_dir);
+    const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
+    m.hold(lm_dir, p.mem.preload > 0 ? p.mem.preload
+                                     : model_memory::dir_weights_bytes(lm_dir),
+           p.mem.raw ? p.mem.floor : 0,
+           /*releases=*/false, /*reclaimable=*/false);
+    if (!_codec_dir.empty()) {
+      const std::string cd = resolve_model_dir(session(), _codec_dir);
+      const std::size_t held =
+          p.variant == "local"
+              ? genai::MetalMossCodecV2::plan_bytes(cd, _with_encoder)
+              : genai::MetalMossCodec::plan_bytes(cd, _with_encoder);
+      m.hold(cd, held > 0 ? held : model_memory::dir_weights_bytes(cd));
+    }
+    m.scratch = scratch_bytes_(lm_dir);
+    // One PCM chunk leaves per stream_chunk_frames frames (one utterance
+    // in one-shot mode).
+    const std::size_t frames =
+        _stream_chunk > 0 ? (std::size_t)_stream_chunk
+                          : (std::size_t)(p.variant == "delay"
+                                              ? _max_new_tokens
+                                              : _max_frames);
+    m.outputs = {frames * 1920 * 4 * (p.variant == "local" ? 2u : 1u)};
   }
-  if (!_codec_dir.empty()) {
-    const std::string d = resolve_model_dir(session(), _codec_dir);
-    m.hold(d, model_memory::dir_weights_bytes(d));
-  }
+#endif
   return m;
 }
 
 std::vector<ResourceClaim>
 TextToSpeechStage::declare_resources() const
 {
-  std::vector<std::string> dirs;
-  if (!_hf_dir.empty()) {
-    dirs.push_back(resolve_model_dir(session(), _hf_dir));
+  std::vector<ResourceClaim> out;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (_hf_dir.empty()) { return out; }
+  const std::string lm_dir = resolve_model_dir(session(), _hf_dir);
+  const LmPlan p = lm_plan_(lm_dir, _lm_quant_bits);
+  // STREAMABLE when the backbone is raw: its floor -- the trunk plus a
+  // slot pair -- is a promise the loader keeps (stream_decode), and the
+  // claim is the only ledger the refusal check reads. A pack holds as it
+  // sits, so it claims plainly.
+  if (p.mem.raw && p.mem.floor > 0) {
+    out.push_back(model_memory::weight_claim_streamable(lm_dir, p.mem.floor));
+  } else {
+    for (auto& c : model_memory::weight_claims({lm_dir})) {
+      out.push_back(std::move(c));
+    }
   }
   if (!_codec_dir.empty()) {
-    dirs.push_back(resolve_model_dir(session(), _codec_dir));
+    for (auto& c : model_memory::weight_claims(
+             {resolve_model_dir(session(), _codec_dir)})) {
+      out.push_back(std::move(c));
+    }
   }
-  return model_memory::weight_claims(std::move(dirs));
+  // Held for the whole run: a TTS stage serves every beat it is given.
+  for (auto& c : model_memory::scratch_claims(scratch_label_(),
+                                              scratch_bytes_(lm_dir), {})) {
+    out.push_back(std::move(c));
+  }
+#endif
+  return out;
+}
+
+// The plan was declared from the checkpoints; now the models say what they
+// actually hold. Both ledgers, every time -- after load, and after every
+// utterance, since residency grows a streaming backbone as it decodes.
+void
+TextToSpeechStage::revise_holdings_()
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (_lm_dir_resolved.empty()) { return; }
+  std::size_t lm_held = 0, codec_held = 0, kv = 0;
+  if (_lm) {
+    lm_held = _lm->resident_bytes();
+    kv = _lm->kv_bytes();
+  } else if (_lm_v15 && _lm_v15->backbone()) {
+    lm_held = _lm_v15->backbone()->resident_bytes() + _lm_trunk;
+    if (auto* cm = _lm_v15->backbone()->context_manager()) {
+      kv = cm->resident_bytes();
+    }
+  } else if (_lm_rt && _lm_rt->backbone()) {
+    lm_held = _lm_rt->backbone()->resident_bytes() + _lm_trunk;
+    if (auto* cm = _lm_rt->backbone()->context_manager()) {
+      kv = cm->resident_bytes();
+    }
+  }
+  if (_codec) { codec_held = _codec->resident_bytes(); }
+  if (_codec_v15) { codec_held = _codec_v15->resident_bytes(); }
+  if (lm_held == 0) { return; }
+  // Int8 engagement since the last revision: an enabled tier is not an
+  // engaged one (it declines every GEMM under 1024 rows), so say which.
+  {
+    std::uint64_t i8 = 0;
+    if (_lm) { i8 = _lm->i8_gemm_count(); }
+    else if (_lm_v15 && _lm_v15->backbone()) {
+      i8 = _lm_v15->backbone()->i8_gemm_count();
+    } else if (_lm_rt && _lm_rt->backbone()) {
+      i8 = _lm_rt->backbone()->i8_gemm_count();
+    }
+    if (i8 > _i8_seen) {
+      session()->info(fmt(
+          "TextToSpeechStage('{}'): int8 tier took {} prefill GEMMs",
+          this->id(), i8 - _i8_seen));
+    }
+    _i8_seen = i8;
+  }
+  // A streaming backbone's kept set moves as it decodes: say where it got
+  // to, once per change, so a slow utterance reads as disk or as compute.
+  if (_lm_streams) {
+    int kept = 0, layers = 0;
+    if (_lm) {
+      kept = _lm->resident_layer_count();
+      layers = _lm->n_layers();
+    } else if (_lm_v15 && _lm_v15->backbone()) {
+      kept = _lm_v15->backbone()->resident_layer_count();
+      layers = _lm_v15->backbone()->config().n_layers;
+    } else if (_lm_rt && _lm_rt->backbone()) {
+      kept = _lm_rt->backbone()->resident_layer_count();
+      layers = _lm_rt->backbone()->config().n_layers;
+    }
+    if (kept != _kept_seen) {
+      session()->info(fmt(
+          "TextToSpeechStage('{}'): streaming backbone now keeps {}/{} "
+          "layers resident (LM holds {} MB)", this->id(), kept, layers,
+          lm_held >> 20));
+      _kept_seen = kept;
+    }
+  }
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_declaration(_lm_dir_resolved, lm_held);
+    if (codec_held > 0 && !_codec_dir_resolved.empty()) {
+      mgr->revise_declaration(_codec_dir_resolved, codec_held);
+    }
+    // The scratch claim's K/V term was a bound from config; now it is
+    // what the pools grew to. The codec / PCM allowance stays as bounded.
+    std::size_t kv_bound = 0;
+    const std::size_t bound = scratch_bytes_(_lm_dir_resolved, &kv_bound);
+    if (kv > 0) {
+      mgr->revise_scratch(scratch_label_(), bound - kv_bound + kv);
+    }
+  }
+  StageMemory m = declare_memory();
+  for (StageHolding& h : m.holdings) {
+    if (h.source == _lm_dir_resolved) {
+      correct_loaded_holding(h, lm_held, _lm_floor);
+    } else if (h.source == _codec_dir_resolved && codec_held > 0) {
+      correct_loaded_holding(h, codec_held);
+    }
+  }
+  revise_memory(m);
+#endif
 }
 
 Job
@@ -555,203 +905,264 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
       resolve_model_dir(session(), _hf_dir);
   const std::string codec_dir =
       resolve_model_dir(session(), _codec_dir);
-
-  // Pick the variant from the LM dir's config.json. "moss_tts_realtime" => the
-  // realtime streaming path (Qwen3-1.7B backbone + depth decoder -> 24 kHz
-  // mono); "moss_tts_local" => the v1.5 depth-decoder path (48 kHz stereo);
-  // anything else => the 8B delay-pattern path (24 kHz mono).
-  const std::string _mt = read_model_type_(lm_dir);
-  if (_mt == "moss_tts_realtime") {
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): loading MOSS-TTS-Realtime LM from '{}'",
-        this->id(), _hf_dir));
-    genai::MetalMossRtModel::Config cfg;
-    cfg.backbone = rt_qwen_cfg_(lm_dir, "language_model.", "model.", 28, 2048,
-                                256);
-    cfg.local    = rt_qwen_cfg_(lm_dir, "local_transformer.", "model.", 4, 32,
-                                32);
-    _lm_rt = genai::MetalMossRtModel::load(
-        genai::open_weight_set(lm_dir, session()), mc, cfg);
-    if (!_lm_rt) {
-      session()->error(fmt(
-          "TextToSpeechStage('{}'): failed to load MOSS-TTS-Realtime LM from "
-          "'{}'; inert. Point hf_dir at the unquantized bf16 checkpoint (runs "
-          "as-is) OR a model-quantize'd 8-bit dir (~2x faster).",
-          this->id(), _hf_dir));
-      co_return;
-    }
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): loading MOSS-Audio-Tokenizer codec from "
-        "'{}'{}", this->id(), _codec_dir,
-        _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
-    _codec = genai::MetalMossCodec::load(
-        genai::open_weight_set(codec_dir, session()), mc, _codec_int8,
-        _with_encoder);
-    if (!_codec || !_codec->valid()) {
-      session()->error(fmt(
-          "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; inert",
-          this->id(), _codec_dir));
-      _lm_rt.reset();
-      co_return;
-    }
-    // Route the codec's audio-codec-lane profiler events to this session (the
-    // MetalMossRtModel already took mc->session() at load). Without this the
-    // codec-decode events never fire.
-    _codec->set_session(session());
-    _tokenizer = genai::Tokenizer::from_huggingface_json(
-        lm_dir + "/tokenizer.json", session());
-    if (!_tokenizer) {
-      session()->error(fmt(
-          "TextToSpeechStage('{}'): no tokenizer.json in '{}'; inert",
-          this->id(), lm_dir));
-      _lm_rt.reset(); _codec.reset();
-      co_return;
-    }
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): ready (realtime, 24 kHz mono, "
-        "n_vq={}, max_frames={})", this->id(), _lm_rt->config().n_vq,
-        _max_frames));
-    co_return;
-  }
-  if (_mt == "moss_tts_local") {
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): loading MOSS-TTS-Local-v1.5 LM from '{}'",
-        this->id(), _hf_dir));
-    genai::MetalMossV15Model::Config cfg;
-    cfg.backbone = v15_backbone_cfg_(lm_dir);
-    _lm_v15 = genai::MetalMossV15Model::load(
-        genai::open_weight_set(lm_dir, session()), mc, cfg);
-    if (!_lm_v15) {
-      session()->error(fmt(
-          "TextToSpeechStage('{}'): failed to load v1.5 LM from '{}' "
-          "(quantize the bf16 source with model-quantize first); inert",
-          this->id(), _hf_dir));
-      co_return;
-    }
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): loading codec-v2 from '{}'{}", this->id(),
-        _codec_dir,
-        _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
-    _codec_v15 = genai::MetalMossCodecV2::load(
-        genai::open_weight_set(codec_dir, session()), mc, _with_encoder);
-    if (!_codec_v15 || !_codec_v15->valid()) {
-      session()->error(fmt(
-          "TextToSpeechStage('{}'): failed to load codec-v2 from '{}'; inert",
-          this->id(), _codec_dir));
-      _lm_v15.reset();
-      co_return;
-    }
-    _tokenizer = genai::Tokenizer::from_huggingface_json(
-        lm_dir + "/tokenizer.json", session());
-    if (!_tokenizer) {
-      session()->error(fmt(
-          "TextToSpeechStage('{}'): no tokenizer.json in '{}'; inert",
-          this->id(), lm_dir));
-      _lm_v15.reset(); _codec_v15.reset();
-      co_return;
-    }
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): ready (v1.5, 48 kHz stereo, max_frames={})",
-        this->id(), _max_frames));
-    co_return;
-  }
+  // "auto" follows the checkpoint's own processor: MOSS-TTS-v1.5 ships
+  // (and runs) its normalizer script, every other MOSS checkpoint does not.
+  _robust_text = _text_normalizer == "robust" ||
+                 (_text_normalizer == "auto" &&
+                  genai::moss_tts_has_text_normalizer(lm_dir));
 
   using clock = std::chrono::steady_clock;
   auto ms = [](clock::duration d) {
     return static_cast<int>(
         std::chrono::duration<double, std::milli>(d).count());
   };
+  auto mb = [](std::size_t b) { return b >> 20; };
+  _lm_dir_resolved    = lm_dir;
+  _codec_dir_resolved = codec_dir;
+  _i8_seen            = 0;
+  _kept_seen          = -1;
+  auto* mgr = session()->services()->generative_model_manager();
 
-  session()->info(fmt(
-      "TextToSpeechStage('{}'): loading MOSS-TTS LM from '{}'",
-      this->id(), _hf_dir));
-  const auto t_lm0 = clock::now();
-  _lm = genai::MetalMossTtsModel::load(
-      genai::open_weight_set(lm_dir, session()), mc);
-  if (!_lm || !_lm->valid()) {
-    session()->error(fmt(
-        "TextToSpeechStage('{}'): failed to load MOSS-TTS LM from '{}'; "
-        "the stage is inert", this->id(), _hf_dir));
-    _lm.reset();
-    co_return;
-  }
-  session()->info(fmt(
-      "TextToSpeechStage('{}'): MOSS-TTS LM loaded in {} ms",
-      this->id(), ms(clock::now() - t_lm0)));
+  // The variant comes from the LM dir's config.json: "moss_tts_realtime"
+  // (Qwen3-1.7B backbone + depth decoder -> 24 kHz mono), "moss_tts_local"
+  // (Local-v1.5 depth decoder -> codec-v2, 48 kHz stereo), anything else
+  // the delay pattern (MOSS-TTS 8B / MOSS-TTS-v1.5 -> 24 kHz mono).
+  const LmPlan lmp = lm_plan_(lm_dir, _lm_quant_bits);
+  const bool realtime = lmp.variant == "realtime";
+  const bool local    = lmp.variant == "local";
 
+  // 1. THE CODEC FIRST, and its declaration corrected at once: the LM's
+  // streaming decision below sizes itself against everything this graph
+  // holds, and the codec's F32 checkpoint is ~4x what the codec keeps.
   session()->info(fmt(
-      "TextToSpeechStage('{}'): loading MOSS-Audio-Tokenizer codec from "
-      "'{}'{}", this->id(), _codec_dir,
+      "TextToSpeechStage('{}'): loading {} from '{}'{}", this->id(),
+      local ? "codec-v2" : "MOSS-Audio-Tokenizer codec", _codec_dir,
       _with_encoder ? " (with encoder: voice cloning enabled)" : ""));
   const auto t_cc0 = clock::now();
-  _codec = genai::MetalMossCodec::load(
-      genai::open_weight_set(codec_dir, session()), mc, _codec_int8,
-      _with_encoder);
-  if (!_codec || !_codec->valid()) {
-    session()->error(fmt(
-        "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; "
-        "the stage is inert", this->id(), _codec_dir));
-    _lm.reset();
-    _codec.reset();
-    co_return;
+  std::size_t codec_held = 0;
+  if (local) {
+    _codec_v15 = genai::MetalMossCodecV2::load(
+        genai::open_weight_set(codec_dir, session()), mc, _with_encoder);
+    if (!_codec_v15 || !_codec_v15->valid()) {
+      session()->error(fmt(
+          "TextToSpeechStage('{}'): failed to load codec-v2 from '{}'; inert",
+          this->id(), _codec_dir));
+      _codec_v15.reset();
+      co_return;
+    }
+    codec_held = _codec_v15->resident_bytes();
+  } else {
+    _codec = genai::MetalMossCodec::load(
+        genai::open_weight_set(codec_dir, session()), mc, _codec_int8,
+        _with_encoder);
+    if (!_codec || !_codec->valid()) {
+      session()->error(fmt(
+          "TextToSpeechStage('{}'): failed to load MOSS codec from '{}'; "
+          "the stage is inert", this->id(), _codec_dir));
+      _codec.reset();
+      co_return;
+    }
+    // Route the codec's audio-codec-lane profiler events to this session.
+    _codec->set_session(session());
+    codec_held = _codec->resident_bytes();
+  }
+  if (mgr != nullptr && codec_held > 0) {
+    mgr->revise_declaration(codec_dir, codec_held);
   }
   session()->info(fmt(
-      "TextToSpeechStage('{}'): MOSS codec loaded in {} ms",
-      this->id(), ms(clock::now() - t_cc0)));
+      "TextToSpeechStage('{}'): codec loaded in {} ms, holding {} MB "
+      "({} MB on disk)", this->id(), ms(clock::now() - t_cc0),
+      mb(codec_held), mb(model_memory::dir_weights_bytes(codec_dir))));
 
-  // Tokenizer for the LM prompt. The MOSS user_inst prompt encodes the
-  // <|im_start|> / <|im_end|> markers as single special-token ids.
+  // 2. THE LM'S MEMORY DECISIONS (docs/MODEL-MEMORY.md). An autoregressive
+  // backbone re-reads every weight per token, so whatever of it the box
+  // cannot keep in RAM is paid per token: it must never page. Streaming is
+  // an argument to the backbone's load -- irreversible -- so it is taken
+  // HERE, by plan_streaming with the wider headroom, against the backbone
+  // as it will be BUILT: the bytes in-memory quantization sheds are its
+  // `retires`, exactly as an AdaLN bake's are. An affine w8 pack streams
+  // as it sits, at half a bf16 source's bytes per read; any other pack
+  // (4-bit, mixed) holds as it sits.
+  _lm_floor   = lmp.mem.raw ? lmp.mem.floor : 0;
+  _lm_trunk   = lmp.mem.trunk;
+  _lm_streams = false;
+  const int qbits = lmp.mem.raw ? _lm_quant_bits : 0;
+  if (lmp.mem.raw && lmp.mem.floor > 0) {
+    const auto sp = model_memory::plan_streaming(
+        session(), lm_dir, codec_dir, model_memory::kStreamHeadroom,
+        lmp.mem.retires, std::string_view{});
+    _lm_streams = sp.stream;
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): LM backbone {}{} -> {} MB held ({} MB "
+        "on disk); {} GB with everything else resident + {} GB headroom "
+        "vs {} GB RAM -> {}", this->id(),
+        lmp.mem.pack  ? "is an affine w8 pack"
+        : qbits == 8 ? "quantized in memory to w8"
+                     : "kept bf16",
+        qbits == 8 && lmp.variant == "delay" ? ", text embedding + head w8"
+                                             : "",
+        mb(lmp.mem.preload), mb(lmp.mem.disk), sp.footprint >> 30,
+        model_memory::kStreamHeadroom >> 30, model_memory::phys_ram() >> 30,
+        _lm_streams ? fmt("STREAM its layers (floor {} MB; residency grows "
+                          "the kept set into what the box can hold)",
+                          mb(lmp.mem.floor))()
+                    : std::string("resident")));
+  } else {
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): LM is a quantized pack, held as it sits "
+        "({} MB)", this->id(), mb(lmp.mem.disk)));
+  }
+
+  // 3. The LM.
+  session()->info(fmt("TextToSpeechStage('{}'): loading {} LM from '{}'",
+                      this->id(),
+                      realtime ? "MOSS-TTS-Realtime"
+                      : local  ? "MOSS-TTS-Local-v1.5"
+                               : "MOSS-TTS",
+                      _hf_dir));
+  const auto t_lm0 = clock::now();
+  genai::MetalQwenModel* backbone = nullptr;
+  if (realtime) {
+    genai::MetalMossRtModel::Config cfg;
+    cfg.backbone = rt_qwen_cfg_(lm_dir, "language_model.", "model.", 28, 2048,
+                                256);
+    cfg.backbone.load_quant_bits = qbits;
+    cfg.backbone.stream_decode   = _lm_streams;
+    cfg.local    = rt_qwen_cfg_(lm_dir, "local_transformer.", "model.", 4, 32,
+                                32);
+    _lm_rt = genai::MetalMossRtModel::load(
+        genai::open_weight_set(lm_dir, session()), mc, cfg);
+    if (_lm_rt) { backbone = _lm_rt->backbone(); }
+  } else if (local) {
+    genai::MetalMossV15Model::Config cfg;
+    cfg.backbone = v15_backbone_cfg_(lm_dir);
+    cfg.backbone.load_quant_bits = qbits;
+    cfg.backbone.stream_decode   = _lm_streams;
+    _lm_v15 = genai::MetalMossV15Model::load(
+        genai::open_weight_set(lm_dir, session()), mc, cfg);
+    if (_lm_v15) { backbone = _lm_v15->backbone(); }
+  } else {
+    genai::MossTtsLoadOptions opts;
+    opts.quant_bits = qbits;
+    opts.stream     = _lm_streams;
+    _lm = genai::MetalMossTtsModel::load(
+        genai::open_weight_set(lm_dir, session()), mc, opts);
+    if (_lm && !_lm->valid()) { _lm.reset(); }
+  }
+  if (!_lm && !_lm_v15 && !_lm_rt) {
+    session()->error(fmt(
+        "TextToSpeechStage('{}'): failed to load the MOSS LM from '{}'; the "
+        "stage is inert", this->id(), _hf_dir));
+    release_models_();
+    co_return;
+  }
+  // The realtime / Local wrappers load their own tables after the backbone;
+  // wire trunk-then-layers now (the delay model does this inside load()).
+  if (backbone != nullptr) { backbone->wire_resident(); }
+  // The int8 prefill tier, when asked for. set_i8_gemm(false) still
+  // consults VPIPE_I8_GEMM, so the env override reaches every variant.
+  bool i8_on = false;
+  if (_lm) {
+    _lm->set_i8_gemm(_i8_gemm);
+    i8_on = _lm->i8_gemm_enabled();
+  } else if (backbone != nullptr) {
+    backbone->set_i8_gemm(_i8_gemm);
+    i8_on = backbone->i8_gemm_enabled();
+  }
+  if (_i8_gemm && !i8_on) {
+    session()->info(fmt(
+        "TextToSpeechStage('{}'): i8_gemm asked for, but this GPU has no "
+        "matrix cores (or the int8 kernels did not load); the backbone "
+        "prefill stays dense", this->id()));
+  }
+
   _tokenizer = genai::Tokenizer::from_huggingface_json(
       lm_dir + "/tokenizer.json", session());
   if (!_tokenizer) {
     session()->error(fmt(
-        "TextToSpeechStage('{}'): failed to load tokenizer from "
-        "'{}/tokenizer.json'; the stage is inert",
+        "TextToSpeechStage('{}'): no tokenizer.json in '{}'; inert",
         this->id(), lm_dir));
-    _lm.reset();
-    _codec.reset();
+    release_models_();
     co_return;
   }
 
-  // Route profiling events (text-prefill / text-decode / audio-codec) onto
-  // the session's LLM perf lane.
-  _lm->set_session(session());
-  _codec->set_session(session());
-
-  // Cold-start warmup: the FIRST forward pass pays the Metal pipeline-state
-  // compilation + first-touch weight residency (tens of seconds on the 8B LM)
-  // with the GPU mostly idle. Run a tiny throwaway LM generation + codec decode
-  // HERE, at load, so that cost lands during stage init -- the first real
-  // synthesis then runs warm. Disable with VPIPE_TTS_NO_WARMUP for A/B.
-  if (std::getenv("VPIPE_TTS_NO_WARMUP") == nullptr) {
-    const auto t_w0 = clock::now();
-    const int n_vq = _lm->config().n_vq;
-    const int pad  = _lm->config().audio_pad_code;
-    // A few rows: channel 0 a valid text id, audio channels at pad. The exact
-    // ids are irrelevant -- this only compiles kernels + makes weights
-    // resident; the generated output is discarded.
-    std::vector<std::vector<std::int32_t>> wprompt(
-        4, std::vector<std::int32_t>(static_cast<std::size_t>(1 + n_vq), pad));
-    wprompt[0][0] = _lm->config().im_start;
-    wprompt[1][0] = _lm->config().pad_token;
-    wprompt[2][0] = _lm->config().pad_token;
-    wprompt[3][0] = _lm->config().pad_token;
-    (void)_lm->generate_delay_greedy(wprompt, 8);
-    // Codec: a few zero-code frames warm the RVQ decode + 4 transformer stages.
-    std::vector<std::vector<std::int32_t>> wcodes(
-        4, std::vector<std::int32_t>(static_cast<std::size_t>(n_vq), 0));
-    (void)_codec->decode(wcodes, nullptr);
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): warmup done in {} ms (cold pipeline-state "
-        "+ weight residency paid at load; first synthesis runs warm)",
-        this->id(), ms(clock::now() - t_w0)));
+  // 4. Residency, for a streaming backbone. The reserve is what must stay
+  // clear for what runs after a forward and has not allocated yet -- the
+  // codec's decode of a chunk -- and is SET (growth stays off until it
+  // is); the schedule is one forward per generated frame.
+  if (_lm_streams) {
+    const std::size_t reserve = (std::size_t)256 << 20;
+    const int forwards = local || realtime ? _max_frames : _max_new_tokens;
+    if (_lm) {
+      _lm->set_residency_reserve(reserve);
+      _lm->set_residency_schedule(forwards);
+    } else if (backbone != nullptr) {
+      backbone->set_residency_reserve(reserve);
+      backbone->set_residency_schedule(forwards);
+    }
   }
 
+  if (_lm) {
+    // Route profiling events (text-prefill / text-decode) onto the LLM lane.
+    _lm->set_session(session());
+    // Cold-start warmup: the FIRST forward pass pays the Metal
+    // pipeline-state compilation + first-touch weight residency with the GPU
+    // mostly idle. Run a tiny throwaway LM generation + codec decode HERE,
+    // at load, so that cost lands during stage init -- the first real
+    // synthesis then runs warm. Disable with VPIPE_TTS_NO_WARMUP for A/B.
+    if (std::getenv("VPIPE_TTS_NO_WARMUP") == nullptr) {
+      const auto t_w0 = clock::now();
+      const int n_vq = _lm->config().n_vq;
+      const int pad  = _lm->config().audio_pad_code;
+      // A few rows: channel 0 a valid text id, audio channels at pad. The
+      // exact ids are irrelevant -- this only compiles kernels + makes
+      // weights resident; the generated output is discarded.
+      std::vector<std::vector<std::int32_t>> wprompt(
+          4, std::vector<std::int32_t>(static_cast<std::size_t>(1 + n_vq),
+                                       pad));
+      wprompt[0][0] = _lm->config().im_start;
+      wprompt[1][0] = _lm->config().pad_token;
+      wprompt[2][0] = _lm->config().pad_token;
+      wprompt[3][0] = _lm->config().pad_token;
+      (void)_lm->generate_delay_greedy(wprompt, 8);
+      // Codec: a few zero-code frames warm the RVQ decode + transformers.
+      std::vector<std::vector<std::int32_t>> wcodes(
+          4, std::vector<std::int32_t>(static_cast<std::size_t>(n_vq), 0));
+      (void)_codec->decode(wcodes, nullptr);
+      session()->info(fmt(
+          "TextToSpeechStage('{}'): warmup done in {} ms (cold "
+          "pipeline-state + weight residency paid at load; first synthesis "
+          "runs warm)", this->id(), ms(clock::now() - t_w0)));
+    }
+  }
+
+  // 5. The plan was declared from the checkpoints; correct both ledgers
+  // with what the models actually hold.
+  revise_holdings_();
+  std::size_t lm_held = 0;
+  int kept = 0, layers = 0;
+  if (_lm) {
+    lm_held = _lm->resident_bytes();
+    kept = _lm->resident_layer_count();
+    layers = _lm->n_layers();
+  } else if (backbone != nullptr) {
+    lm_held = (std::size_t)backbone->resident_bytes() + _lm_trunk;
+    kept = backbone->resident_layer_count();
+    layers = backbone->config().n_layers;
+  }
   session()->info(fmt(
-      "TextToSpeechStage('{}'): ready (n_vq={}, sample_rate={}, "
-      "max_new_tokens={})",
-      this->id(), _lm->config().n_vq, _codec->sample_rate(),
-      _max_new_tokens));
+      "TextToSpeechStage('{}'): ready ({} -- LM loaded in {} ms, holding {} "
+      "MB{}{}; codec {} MB; language={}, text normalizer={})", this->id(),
+      realtime ? "realtime, 24 kHz mono"
+      : local  ? "Local-v1.5, 48 kHz stereo"
+               : "delay pattern, 24 kHz mono",
+      ms(clock::now() - t_lm0), mb(lm_held),
+      qbits == 8 ? ", backbone w8 in memory" : "",
+      _lm_streams ? fmt(", streaming: {}/{} layers resident so far", kept,
+                        layers)()
+                  : std::string(),
+      mb(codec_held), _language,
+      _robust_text ? "robust (MOSS-TTS-v1.5)" : "basic"));
 #else
   session()->error(fmt(
       "TextToSpeechStage('{}'): this build was compiled without "
@@ -764,10 +1175,11 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
 #ifdef VPIPE_BUILD_APPLE_SILICON
 namespace {
 
-// Minimal text normalization (full unicode \p{L} regex normalization is
-// a TODO -- std::regex can't do \p{L}). Replace CR/CRLF with a space,
-// drop ASCII control chars except spaces, collapse whitespace runs to a
-// single space, and trim leading/trailing whitespace.
+// The BASIC text clean-up (text_normalizer "basic"; every checkpoint but
+// MOSS-TTS-v1.5 under "auto"). Replace CR/CRLF with a space, drop ASCII
+// control chars except spaces, collapse whitespace runs to a single
+// space, and trim leading/trailing whitespace. The robust one is
+// genai::moss_tts_normalize_text.
 std::string
 normalize_text_(const std::string& in)
 {
@@ -804,131 +1216,41 @@ normalize_text_(const std::string& in)
   return out;
 }
 
-// Render the MOSS user_inst prompt EXACTLY (the reference processor
-// format), substituting `text` for {TEXT}. There is a trailing newline
-// after "assistant".
+// The text clean-up `text_normalizer` resolved to: MOSS-TTS-v1.5's own
+// normalizer, or the basic one above.
 std::string
-render_moss_prompt_(const std::string& text)
+clean_text_(const std::string& raw, bool robust)
 {
-  std::string p;
-  p += "<|im_start|>user\n";
-  p += "<user_inst>\n";
-  p += "- Reference(s):\n";
-  p += "None\n";
-  p += "- Instruction:\n";
-  p += "None\n";
-  p += "- Tokens:\n";
-  p += "None\n";
-  p += "- Quality:\n";
-  p += "None\n";
-  p += "- Sound Event:\n";
-  p += "None\n";
-  p += "- Ambient Sound:\n";
-  p += "None\n";
-  p += "- Language:\n";
-  p += "None\n";
-  p += "- Text:\n";
-  p += text;
-  p += "\n";
-  p += "</user_inst><|im_end|>\n";
-  p += "<|im_start|>assistant\n";
-  return p;
+  return robust ? genai::moss_tts_normalize_text(raw) : normalize_text_(raw);
 }
 
-// Encode the rendered prompt to ids, treating the <|im_start|> / <|im_end|>
-// markers as SINGLE special-token ids. vpipe's Tokenizer::encode() does NOT
-// recognise special tokens in input text (it would byte-level-BPE the literal
-// "<|im_start|>" into ~6 tokens), so we split on the special-token literals,
-// BPE the text between, and inject special_token_id() for each marker.
-std::vector<std::int32_t>
-encode_moss_prompt_(const genai::Tokenizer& tok, const std::string& s)
+// The delay-pattern prompt ids, from the loaded model's config.json.
+genai::MossDelayPromptIds
+delay_prompt_ids_(const genai::MetalMossTtsModel::Config& c)
 {
-  static const char* const kSpecials[] = {"<|im_start|>", "<|im_end|>"};
-  std::vector<std::int32_t> ids;
-  std::size_t pos = 0;
-  while (pos < s.size()) {
-    std::size_t best = std::string::npos;
-    std::size_t best_len = 0;
-    std::int32_t best_id = -1;
-    for (const char* sp : kSpecials) {
-      const std::size_t f = s.find(sp, pos);
-      if (f != std::string::npos &&
-          (best == std::string::npos || f < best)) {
-        best = f;
-        best_len = std::char_traits<char>::length(sp);
-        best_id = tok.special_token_id(sp);
-      }
-    }
-    const std::size_t end = (best == std::string::npos) ? s.size() : best;
-    if (end > pos) {
-      const std::vector<std::int32_t> seg = tok.encode(s.substr(pos, end - pos));
-      ids.insert(ids.end(), seg.begin(), seg.end());
-    }
-    if (best == std::string::npos) { break; }
-    if (best_id >= 0) { ids.push_back(best_id); }
-    pos = best + best_len;
-  }
+  genai::MossDelayPromptIds ids;
+  ids.im_start        = c.im_start;
+  ids.im_end          = c.im_end;
+  ids.audio_start     = c.audio_start;
+  ids.audio_end       = c.audio_end;
+  ids.audio_user_slot = c.audio_user_slot;
+  ids.n_vq            = c.n_vq;
+  ids.audio_pad       = c.audio_pad_code;
   return ids;
 }
 
-// Build the MOSS prompt GRID [seq][1 + n_vq]: channel 0 = text/control id,
-// channels 1..n_vq = audio codes (audio_pad_code where inactive). When `ref`
-// is non-null/non-empty, splice it into the - Reference(s): section as a
-// single-speaker USER audio block, exactly as the MOSS processor does: the
-// channel-0 span is audio_start, then audio_user_slot for every (delayed) row,
-// then audio_end; channels 1..n_vq carry the reference codes with the delay
-// pattern applied (delayed[r][cb] = ref[r-cb][cb], else pad). Without a
-// reference this is the plain (- Reference(s): None) prompt.
-std::vector<std::vector<std::int32_t>>
-build_moss_grid_(const genai::Tokenizer&                       tok,
-                 const std::string&                            text,
-                 const genai::MetalMossTtsModel::Config&       cfg,
-                 const std::vector<std::vector<std::int32_t>>* ref)
+// The MOSS processor's loudness_normalize, applied to a clone reference
+// before it is encoded: scale toward -20 dBFS RMS, by at most +-3 dB.
+void
+loudness_normalize_(std::vector<float>& wav)
 {
-  const int n_vq  = cfg.n_vq;
-  const int pad   = cfg.audio_pad_code;
-  const int nchan = 1 + n_vq;
-  std::vector<std::vector<std::int32_t>> grid;
-  auto text_row = [&](std::int32_t id) {
-    std::vector<std::int32_t> r(static_cast<std::size_t>(nchan), pad);
-    r[0] = id;
-    return r;
-  };
-  auto push_text = [&](const std::string& s) {
-    for (std::int32_t id : encode_moss_prompt_(tok, s)) {
-      grid.push_back(text_row(id));
-    }
-  };
-
-  if (ref == nullptr || ref->empty()) {
-    push_text(render_moss_prompt_(text));
-    return grid;
-  }
-
-  // Reference (S1) audio block, then the remaining user_inst sections + text.
-  push_text("<|im_start|>user\n<user_inst>\n- Reference(s):\n[S1]:\n");
-  grid.push_back(text_row(cfg.audio_start));
-  const int T = static_cast<int>(ref->size());
-  for (int r = 0; r < T + n_vq - 1; ++r) {           // apply_delay_pattern
-    std::vector<std::int32_t> g(static_cast<std::size_t>(nchan), pad);
-    g[0] = cfg.audio_user_slot;
-    for (int cb = 0; cb < n_vq; ++cb) {
-      const int src = r - cb;                          // delayed[r][cb]
-      if (src >= 0 && src < T) {
-        int v = (*ref)[static_cast<std::size_t>(src)][static_cast<std::size_t>(cb)];
-        if (v < 0) { v = 0; }
-        if (v >= pad) { v = pad - 1; }
-        g[static_cast<std::size_t>(1 + cb)] = v;
-      }
-    }
-    grid.push_back(std::move(g));
-  }
-  grid.push_back(text_row(cfg.audio_end));
-  push_text("\n- Instruction:\nNone\n- Tokens:\nNone\n- Quality:\nNone\n"
-            "- Sound Event:\nNone\n- Ambient Sound:\nNone\n- Language:\nNone\n"
-            "- Text:\n" + text + "\n</user_inst><|im_end|>\n"
-            "<|im_start|>assistant\n");
-  return grid;
+  if (wav.empty()) { return; }
+  double sq = 0.0;
+  for (float v : wav) { sq += static_cast<double>(v) * v; }
+  const double dbfs = 10.0 * std::log10(sq / wav.size() + 1e-9);
+  const double gain = std::clamp(-20.0 - dbfs, -3.0, 3.0);
+  const float factor = static_cast<float>(std::pow(10.0, gain / 20.0));
+  for (float& v : wav) { v *= factor; }
 }
 
 // Resample a mono f32 clip from in_sr to out_sr via FFmpeg swresample (proper
@@ -1075,6 +1397,14 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // wait_for_reference: the first utterance waits until the reference
+  // voice is readable (or its port ended) -- peeked, not taken: each
+  // variant's drain below reads it as it always does.
+  if (_wait_reference && !_ref_waited && _with_encoder &&
+      ctx.num_iports() >= 2 && ctx.iport_connected(1)) {
+    _ref_waited = true;
+    (void)co_await ctx.peek(1, 0);
+  }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Latch the two token-sampler specs off the OPTIONAL sampler iports 2
@@ -1167,7 +1497,7 @@ TextToSpeechStage::process(RuntimeContext& ctx)
       auto obj = rtfdp->data.as_object();
       if (obj.contains("text")) { rtraw = std::string(obj.at("text").as_string("")); }
     }
-    const std::string rt_text = normalize_text_(rtraw);
+    const std::string rt_text = clean_text_(rtraw, _robust_text);
     if (rt_text.empty()) {
       session()->warn(fmt(
           "TextToSpeechStage('{}'): empty text; dropping beat", this->id()));
@@ -1335,6 +1665,8 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         static_cast<int>(frames.size()), static_cast<int>(total_samps),
         total_samps / static_cast<double>(rt_sr), rt_sr,
         rtms(rt_gen - rt0), rt_mode));
+    // Residency may have grown the backbone during the utterance.
+    revise_holdings_();
     co_return;
   }
 
@@ -1360,7 +1692,7 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         raw = std::string(obj.at("text").as_string(""));
       }
     }
-    const std::string v15_text = normalize_text_(raw);
+    const std::string v15_text = clean_text_(raw, _robust_text);
     if (v15_text.empty()) {
       session()->warn(fmt(
           "TextToSpeechStage('{}'): empty text; dropping beat", this->id()));
@@ -1540,6 +1872,8 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         v15_ch, static_cast<int>(total_samps),
         total_samps / static_cast<double>(v15_sr), v15_sr,
         v15ms(vt_gen - vt0), mode));
+    // Residency may have grown the backbone during the utterance.
+    revise_holdings_();
     co_return;
   }
 
@@ -1578,7 +1912,7 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  const std::string text = normalize_text_(in_text);
+  const std::string text = clean_text_(in_text, _robust_text);
   if (text.empty()) {
     session()->warn(fmt(
         "TextToSpeechStage('{}'): empty text after normalization; "
@@ -1593,9 +1927,10 @@ TextToSpeechStage::process(RuntimeContext& ctx)
   const int pad  = _lm->config().audio_pad_code;   // 1024
 
   // 0. Drain any reference-audio beats on iport1 (voice cloning). The latest
-  // sets the cloned voice for this and subsequent text beats (sticky). Each
-  // is resampled to the codec rate, encoded to RVQ codes, and capped to
-  // voice_ref_seconds. backlog() keeps the read non-blocking.
+  // sets the cloned voice for this and subsequent text beats (sticky). Like
+  // the reference processor: mixed down to mono, resampled to the codec
+  // rate, loudness-normalized (-20 dBFS, +-3 dB), then encoded; capped to
+  // voice_ref_seconds first. backlog() keeps the read non-blocking.
   if (_with_encoder && ctx.num_iports() >= 2) {
     while (ctx.backlog(1) > 0) {
       auto rp = co_await ctx.read(1);
@@ -1607,24 +1942,15 @@ TextToSpeechStage::process(RuntimeContext& ctx)
             "TensorBeat, got {}; ignoring", this->id(), rp->describe()));
         continue;
       }
-      int rsr = _codec->sample_rate();
-      if (tbp->sideband.is_object()) {
-        auto sb = tbp->sideband.as_object();
-        if (sb.contains("sample_rate")) {
-          rsr = static_cast<int>(sb.at("sample_rate").as_int(rsr));
-        }
-      }
-      const std::size_t n_in =
-          static_cast<std::size_t>(tbp->element_count());
-      std::vector<float> ref_pcm = resample_pcm_(
-          session(), tbp->as_f32(), n_in, rsr, _codec->sample_rate());
+      std::vector<float> ref_pcm = build_mono_ref_wave_(
+          session(), *tbp, _codec->sample_rate(), _voice_ref_seconds);
       if (ref_pcm.empty()) {
         session()->warn(fmt(
-            "TextToSpeechStage('{}'): reference resample {} Hz -> {} Hz "
-            "produced no samples; ignoring", this->id(), rsr,
-            _codec->sample_rate()));
+            "TextToSpeechStage('{}'): reference PCM produced no usable "
+            "samples; ignoring", this->id()));
         continue;
       }
+      loudness_normalize_(ref_pcm);
       auto rc = _codec->encode(ref_pcm);
       if (rc.empty()) {
         session()->warn(fmt(
@@ -1632,25 +1958,29 @@ TextToSpeechStage::process(RuntimeContext& ctx)
             "produced 0 frames; ignoring", this->id()));
         continue;
       }
-      if (_voice_ref_seconds > 0.0) {              // cap reference length
-        const std::size_t cap = static_cast<std::size_t>(
-            _voice_ref_seconds * _codec->sample_rate() / 1920.0);
-        if (cap >= 1 && rc.size() > cap) { rc.resize(cap); }
-      }
       _ref_codes = std::move(rc);
       _ref_set   = true;
       session()->info(fmt(
-          "TextToSpeechStage('{}'): cloned reference voice from {} samples "
-          "@ {} Hz -> {} codec frames", this->id(), n_in, rsr,
-          static_cast<int>(_ref_codes.size())));
+          "TextToSpeechStage('{}'): cloned reference voice -> {} codec "
+          "frames", this->id(), static_cast<int>(_ref_codes.size())));
     }
   }
 
   // 1. Build the prompt grid [seq][1 + n_vq]: channel 0 = text/control id,
   // channels 1..n_vq = audio codes. A clone reference (from iport1 above, or
   // the voice_lock cache) splices into - Reference(s):; else None.
-  std::vector<std::vector<std::int32_t>> prompt = build_moss_grid_(
-      *_tokenizer, text, _lm->config(), _ref_set ? &_ref_codes : nullptr);
+  genai::MossDelayUserFields fields;
+  fields.instruction   = _instruction;
+  fields.language      = _language;
+  fields.quality       = _quality;
+  fields.sound_event   = _sound_event;
+  fields.ambient_sound = _ambient_sound;
+  if (_duration_tokens > 0) {
+    fields.tokens = std::to_string(_duration_tokens);
+  }
+  std::vector<std::vector<std::int32_t>> prompt = genai::moss_delay_build_grid(
+      *_tokenizer, text, delay_prompt_ids_(_lm->config()), fields,
+      _ref_set ? &_ref_codes : nullptr);
   if (prompt.empty()) {
     session()->warn(fmt(
         "TextToSpeechStage('{}'): empty prompt grid for the text; "
@@ -1658,52 +1988,98 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // 2. Sampled delay-pattern generation -> [G][1 + n_vq]. Separate audio +
-  // text sampling, each from its own sampler iport. Greedy audio
-  // (temperature <= 0) degenerates into silent loops, so the audio channel
-  // falls back to the MossTTSDelay-8B recommendation rather than to argmax;
-  // the text channel does fall back to greedy (it must follow the transcript).
+  // 2. Sampled delay-pattern generation, de-delayed into codec frames as the
+  // rows arrive. Separate audio + text sampling, each from its own sampler
+  // iport. Greedy audio (temperature <= 0) degenerates into silent loops, so
+  // the audio channel falls back to the MossTTSDelay-8B recommendation
+  // rather than to argmax; the text channel does fall back to greedy (it
+  // must follow the transcript).
   const genai::MossSampling audio_sp = moss_sampling_of(_audio_sp);
   const genai::MossSampling text_sp  = moss_sampling_of(_text_sp);
-  // NOTE: the 8B delay-pattern path is not yet streamed -- de-delaying a real
-  // frame needs its code channels from the next n_vq delayed rows, so streaming
-  // it requires a rolling de-delay (a self-contained follow-up). It always
-  // decodes one-shot; flag it once so stream_chunk_frames isn't silently ignored.
-  if (_stream_chunk > 0) {
-    session()->info(fmt(
-        "TextToSpeechStage('{}'): stream_chunk_frames set but the 8B "
-        "delay-pattern variant decodes one-shot (streaming N/A here)",
-        this->id()));
+  const int sr = _codec->sample_rate();
+  auto make_pcm_beat = [&](const std::vector<float>& wav) {
+    TensorBeat tb;
+    tb.dtype = TensorBeat::DType::F32;
+    tb.shape = { static_cast<std::int64_t>(wav.size()) };
+    tb.resize_contiguous(wav.size());
+    std::memcpy(tb.as_f32(), wav.data(), wav.size() * sizeof(float));
+    tb.sideband = FlexData::make_object();
+    tb.sideband.as_object().insert("sample_rate", FlexData::make_int(sr));
+    return tb;
+  };
+
+  // Frame f's codebook cb is generated in row f + cb, so a frame is whole
+  // n_vq - 1 rows after its first code: the de-delay completes frames on
+  // the fly, the codec streams them out in stream_chunk_frames chunks
+  // (bit-identical to decoding the whole utterance at once), and the first
+  // audio leaves ~n_vq + one chunk of rows after speech starts.
+  genai::MossDelayDedelay dedelay(n_vq, pad);
+  std::vector<std::vector<std::int32_t>> codes;   // every frame, in order
+  std::vector<std::int32_t> frame;
+  std::int64_t total_samps = 0;
+  double peak = 0.0;
+  bool open = true;
+  std::size_t streamed = 0;                       // frames sent to the codec
+  auto note_peak = [&](const std::vector<float>& wav) {
+    for (float v : wav) {
+      peak = std::max(peak, static_cast<double>(std::fabs(v)));
+    }
+  };
+  auto flush = [&]() {
+    if (!open || streamed >= codes.size()) { return; }
+    std::vector<std::vector<std::int32_t>> chunk(
+        codes.begin() + static_cast<std::ptrdiff_t>(streamed), codes.end());
+    streamed = codes.size();
+    std::vector<float> pcm = _codec->decode_stream_chunk(*_stream_v1, chunk);
+    if (pcm.empty()) { return; }
+    total_samps += static_cast<std::int64_t>(pcm.size());
+    note_peak(pcm);
+    open = ctx.write_sync(
+        0, make_payload<TensorBeatPayload>(make_pcm_beat(pcm)));
+    if (open) { ++_clips_emitted; }
+  };
+  const bool streaming = _stream_chunk > 0;
+  if (streaming) {
+    // Reuse the cached ring state across beats; reallocate only when the
+    // chunk size or the active-codebook count changed.
+    if (!_stream_v1 || _stream_v1->max_chunk != _stream_chunk ||
+        _stream_v1->n_active != 0) {
+      _stream_v1 = _codec->decode_stream_begin(_stream_chunk);
+    } else {
+      _stream_v1->reset();
+    }
+    open = (_stream_v1 != nullptr);
   }
+  // Progress: the speech so far, in seconds of it -- a fraction of the
+  // duration asked for, when one was (12.5 frames a second).
+  UiProgress bar = session()->open_progress("speech");
+  const double fps = sr / 1920.0;
   auto gen = _lm->generate_delay(
       prompt, _max_new_tokens, audio_sp, text_sp, _audio_sp.seed,
-      [&]() { return new_text_pending(); });   // barge-in: stop on new text
+      [&](const std::vector<std::int32_t>& row) {
+        if (dedelay.push(row, frame)) {
+          codes.push_back(frame);
+          const auto n = static_cast<std::uint64_t>(codes.size());
+          bar.update(_duration_tokens > 0 ? std::min<std::uint64_t>(
+                                                n, _duration_tokens)
+                                          : 0,
+                     static_cast<std::uint64_t>(_duration_tokens),
+                     fmt("speaking: {:.1f} s",
+                         static_cast<double>(n) / fps)());
+          if (streaming &&
+              static_cast<int>(codes.size() - streamed) >= _stream_chunk) {
+            flush();
+          }
+        }
+        // Barge-in: stop on new text; also stop once downstream closed,
+        // or the graph is asked to stop.
+        return (!streaming || open) && !new_text_pending() &&
+               !ctx.stop_requested();
+      });
+  if (ctx.stop_requested()) { co_return; }
+  if (streaming) { flush(); }   // the final partial chunk
   const auto t_gen = clock::now();
-  if (gen.empty()) {
-    session()->warn(fmt(
-        "TextToSpeechStage('{}'): generate_delay_greedy produced 0 rows; "
-        "emitting nothing", this->id()));
-    co_return;
-  }
-
-  // 3. De-delay + drop all-pad frames -> codes [T][n_vq]. tokens[t][cb]
-  // = gen[cb + t][1 + cb]; a frame whose every codebook is pad is
-  // dropped. Matches the reference _decode_generated_audio pipeline.
-  const int Gg      = static_cast<int>(gen.size());
-  const int out_len = Gg - n_vq + 1;
-  std::vector<std::vector<std::int32_t>> codes;
-  for (int row = 0; row < out_len; ++row) {
-    std::vector<std::int32_t> r(static_cast<std::size_t>(n_vq), 0);
-    bool all_pad = true;
-    for (int cb = 0; cb < n_vq; ++cb) {
-      int v = gen[static_cast<std::size_t>(cb + row)]
-                 [static_cast<std::size_t>(1 + cb)];
-      if (v != pad) { all_pad = false; }
-      if (v < 0 || v >= pad) { v = pad - 1; }  // clamp pad/OOB to valid
-      r[static_cast<std::size_t>(cb)] = v;
-    }
-    if (!all_pad) { codes.push_back(std::move(r)); }
-  }
+  const int Gg = static_cast<int>(gen.size());
   if (codes.empty()) {
     session()->warn(fmt(
         "TextToSpeechStage('{}'): no non-pad audio frames after de-delay "
@@ -1711,15 +2087,15 @@ TextToSpeechStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // 3b. voice_lock (design-once): cache the FIRST generated voice and reuse it
+  // 3. voice_lock (design-once): cache the FIRST generated voice and reuse it
   // as the clone reference for later beats, so the timbre stays consistent
   // across texts. An external iport reference (above) takes precedence (it
   // sets _ref_set), so this only fires until a voice is locked.
   if (_voice_lock && !_ref_set) {
-    _ref_codes = codes;                            // copy (codes is decoded next)
+    _ref_codes = codes;
     if (_voice_ref_seconds > 0.0) {
       const std::size_t cap = static_cast<std::size_t>(
-          _voice_ref_seconds * _codec->sample_rate() / 1920.0);
+          _voice_ref_seconds * sr / 1920.0);
       if (cap >= 1 && _ref_codes.size() > cap) { _ref_codes.resize(cap); }
     }
     _ref_set = true;
@@ -1729,51 +2105,43 @@ TextToSpeechStage::process(RuntimeContext& ctx)
         static_cast<int>(_ref_codes.size())));
   }
 
-  // 4. Codec decode -> [T*1920] f32 PCM @ sample_rate.
-  std::vector<float> wave = _codec->decode(codes, nullptr);
-  const int sr = _codec->sample_rate();
-  const auto t_decode = clock::now();
-  if (wave.empty()) {
-    session()->warn(fmt(
-        "TextToSpeechStage('{}'): codec decode produced 0 PCM samples; "
-        "emitting nothing", this->id()));
-    co_return;
+  // 4. One-shot: decode the whole utterance and emit a single PCM beat.
+  if (!streaming) {
+    bar.update(0, 0, "decoding");
+    std::vector<float> wave = _codec->decode(codes, nullptr);
+    if (wave.empty()) {
+      session()->warn(fmt(
+          "TextToSpeechStage('{}'): codec decode produced 0 PCM samples; "
+          "emitting nothing", this->id()));
+      co_return;
+    }
+    total_samps = static_cast<std::int64_t>(wave.size());
+    note_peak(wave);
+    ++_clips_emitted;
+    co_await ctx.write(0, make_payload<TensorBeatPayload>(make_pcm_beat(wave)));
   }
+  const auto t_done = clock::now();
 
-  // 5. Emit the PCM as a rank-1 [n_samples] f32 TensorBeat, with the
-  // sample rate in the sideband object.
-  TensorBeat tb;
-  tb.dtype = TensorBeat::DType::F32;
-  tb.shape = { static_cast<std::int64_t>(wave.size()) };
-  tb.resize_contiguous(wave.size());
-  std::memcpy(tb.as_f32(), wave.data(), wave.size() * sizeof(float));
-  tb.sideband = FlexData::make_object();
-  tb.sideband.as_object().insert("sample_rate", FlexData::make_int(sr));
-
-  double peak = 0.0;
-  for (float s : wave) {
-    const double a = s < 0.0f ? -static_cast<double>(s)
-                              :  static_cast<double>(s);
-    if (a > peak) { peak = a; }
-  }
   auto ms = [](clock::duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
   };
+  const std::string mode = streaming
+      ? fmt("streamed {}-frame chunks", _stream_chunk)()
+      : fmt("{} ms one-shot decode", static_cast<int>(ms(t_done - t_gen)))();
   session()->info(fmt(
       "TextToSpeechStage('{}'): {} chars -> {} prompt rows{} -> {} gen rows "
       "-> {} frames -> {} PCM samples = {:.2f}s @ {} Hz, peak={:.3f} "
-      "({} ms gen + {} ms decode)",
+      "({} ms gen, {})",
       this->id(),
       static_cast<int>(text.size()),
       static_cast<int>(prompt.size()),
       _ref_set ? " (cloned)" : "", Gg,
-      static_cast<int>(codes.size()), wave.size(),
-      wave.size() / static_cast<double>(sr), sr, peak,
-      static_cast<int>(ms(t_gen - t_start)),
-      static_cast<int>(ms(t_decode - t_gen))));
-
-  ++_clips_emitted;
-  co_await ctx.write(0, make_payload<TensorBeatPayload>(std::move(tb)));
+      static_cast<int>(codes.size()), total_samps,
+      total_samps / static_cast<double>(sr), sr, peak,
+      static_cast<int>(ms(t_gen - t_start)), mode));
+  // Residency may have grown the backbone during the utterance, and K/V
+  // is now what the pools grew to.
+  revise_holdings_();
 #else
   (void)t;
   // No apple-silicon MOSS-TTS in this build: emit nothing.

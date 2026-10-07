@@ -139,16 +139,18 @@ sample_logits_(const float* logit, int n, const MossSampling& sp,
 
 std::unique_ptr<MetalMossTtsModel>
 MetalMossTtsModel::load(const std::string& model_dir,
-                        metal_compute::MetalCompute* mc)
+                        metal_compute::MetalCompute* mc,
+                        const LoadOptions& opts)
 {
   // No session to ask, so this opens a PRIVATE set: correct, just not
   // shared with whatever else has the same checkpoint open.
-  return load(WeightSet::open(model_dir, nullptr), mc);
+  return load(WeightSet::open(model_dir, nullptr), mc, opts);
 }
 
 std::unique_ptr<MetalMossTtsModel>
 MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
-                        metal_compute::MetalCompute* mc)
+                        metal_compute::MetalCompute* mc,
+                        const LoadOptions& opts)
 {
   if (mc == nullptr || !mc->valid() || ws == nullptr) {
     return nullptr;
@@ -170,6 +172,7 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
   bc.vocab      = 155648;
   bc.rope_theta = 1.0e6f;
   bc.rms_eps    = 1e-6f;
+  bc.quant_bits = 8;      // when quantized and config.json does not say
 
   {
     std::ifstream in(model_dir + "/config.json");
@@ -194,6 +197,14 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
           cfg.audio_delay_slot =
               geti_(ro, "audio_assistant_delay_slot_token_id",
                     cfg.audio_delay_slot);
+          // A model-quantize'd (or mlx-community) dir states its affine
+          // width; a raw bf16 checkpoint has no block and loads dense.
+          if (ro.contains("quantization")) {
+            const FlexData q = ro.at("quantization");
+            if (q.is_object()) {
+              bc.quant_bits = geti_(q.as_object(), "bits", bc.quant_bits);
+            }
+          }
           if (ro.contains("language_config")) {
             const FlexData lc = ro.at("language_config");
             if (lc.is_object()) {
@@ -223,13 +234,21 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
   bc.full_attn_interval = 1;            // dense: every layer is full-attn
   bc.tie_embeddings    = false;
   bc.use_bf16          = true;          // match the reference dtype
-  bc.quant_bits        = 8;
   bc.dense             = true;
+  // Plain Qwen3 RMSNorm (weight * h). Consulted only when the backbone is
+  // raw bf16 (MOSS-TTS / MOSS-TTS-v1.5 as published): left at the Qwen3.5
+  // default it folds +1 into every norm and the model emits no audio.
+  bc.zero_centered_norm = false;
   bc.attn_output_gate  = false;
   bc.weight_prefix     = "language_";   // -> language_model.layers / .norm
   bc.backbone_only     = true;
   bc.max_seq           = 16384;
   bc.page_tokens       = 256;
+  // How the backbone is held. Both apply only to an unquantized checkpoint
+  // (the backbone ignores them for a pack): in-memory w8, and layer
+  // streaming through decode when the plan said the box cannot hold it.
+  bc.load_quant_bits   = opts.quant_bits == 8 ? 8 : 0;
+  bc.stream_decode     = opts.stream;
 
   self->_backbone = MetalQwenModel::load(ws, mc, bc);
   if (!self->_backbone) {
@@ -243,10 +262,45 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
   // the backbone reads it by copy.
   WeightSet& wts = *ws;
   const auto cp = WeightSet::Residency::Copied;
-  self->_embed_tokens =
-      wts.tensor("language_model.embed_tokens.weight", mc, cp);
-  if (self->_embed_tokens.empty()) {
-    return nullptr;
+  // trunk_w8: the text embedding and text head at w8 too. Built here from
+  // an uncached read, as the backbone builds its w8 layers, and handed to
+  // the backbone so they are wired with its trunk. The rows the audio
+  // phase reads every step stay exact bf16: the slot tokens in, and the
+  // two the text channel ranks out.
+  if (opts.quant_bits == 8 && opts.trunk_w8 && cfg.vocab % 8 == 0) {
+    self->_lib_qmv = mc->load_library("affine_qmv_bf16");
+    self->_fn_qmv8 = self->_lib_qmv.function("affine_qmv_w8g64");
+  }
+  if (self->_fn_qmv8.valid()) {
+    const std::vector<int> in_rows = {
+        cfg.audio_gen_slot, cfg.audio_delay_slot, cfg.audio_start,
+        cfg.audio_end, cfg.audio_user_slot, cfg.pad_token};
+    const std::vector<int> out_rows = {cfg.audio_gen_slot,
+                                       cfg.audio_delay_slot};
+    SharedBuffer eq = self->quantize_table_(
+        wts, "language_model.embed_tokens.weight", in_rows,
+        self->_embed_exact, &self->_e_soff, &self->_e_boff);
+    SharedBuffer hq;
+    if (!eq.empty()) {
+      hq = self->quantize_table_(wts, "lm_heads.0.weight", out_rows,
+                                 self->_head_exact, &self->_h_soff,
+                                 &self->_h_boff);
+    }
+    if (!eq.empty() && !hq.empty()) {
+      self->_embed_q  = &self->_backbone->adopt_trunk(std::move(eq));
+      self->_head0_q  = &self->_backbone->adopt_trunk(std::move(hq));
+      self->_trunk_w8 = true;
+    } else {
+      self->_embed_exact.clear();
+      self->_head_exact.clear();
+    }
+  }
+  if (!self->_trunk_w8) {
+    self->_embed_tokens =
+        wts.tensor("language_model.embed_tokens.weight", mc, cp);
+    if (self->_embed_tokens.empty()) {
+      return nullptr;
+    }
   }
   self->_emb_ext.resize((std::size_t)cfg.n_vq);
   for (int i = 0; i < cfg.n_vq; ++i) {
@@ -260,11 +314,13 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
   self->_head_out.resize((std::size_t)cfg.n_vq + 1);
   for (int i = 0; i <= cfg.n_vq; ++i) {
     const std::string nm = "lm_heads." + std::to_string(i) + ".weight";
-    self->_heads[(std::size_t)i] = wts.tensor(nm, mc, cp);
-    if (self->_heads[(std::size_t)i].empty()) {
-      return nullptr;
-    }
     const auto* info = wts.src().info(nm);
+    if (i > 0 || !self->_trunk_w8) {   // the w8 text head is _head0_q
+      self->_heads[(std::size_t)i] = wts.tensor(nm, mc, cp);
+      if (self->_heads[(std::size_t)i].empty()) {
+        return nullptr;
+      }
+    }
     self->_head_out[(std::size_t)i] =
         (info != nullptr && !info->shape.empty())
             ? (int)info->shape[0]
@@ -280,7 +336,260 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
   const std::size_t logit_elts =
       (std::size_t)cfg.vocab + (std::size_t)cfg.n_vq * (cfg.audio_vocab + 1);
   self->_logits_buf = mc->make_shared_buffer(logit_elts * 2);
+  // Now that the tables and heads are loaded -- they are this checkpoint's
+  // trunk, read on every token -- wire what the model keeps: trunk first,
+  // then the resident layers.
+  self->_backbone->wire_resident();
   return self;
+}
+
+MetalMossTtsModel::MemoryPlan
+MetalMossTtsModel::plan_memory(const std::string& model_dir, int quant_bits,
+                               bool trunk_w8)
+{
+  int n_layers = 36;
+  {
+    std::ifstream in(model_dir + "/config.json");
+    if (in) {
+      try {
+        FlexData root = FlexData::from_json(in);
+        if (root.is_object() && root.as_object().contains("language_config")) {
+          const FlexData lc = root.as_object().at("language_config");
+          if (lc.is_object()) {
+            n_layers = geti_(lc.as_object(), "num_hidden_layers", n_layers);
+          }
+        }
+      } catch (...) {}
+    }
+  }
+  return plan_memory(model_dir, "language_model.layers.", n_layers,
+                     quant_bits, trunk_w8);
+}
+
+MetalMossTtsModel::MemoryPlan
+MetalMossTtsModel::plan_memory(const std::string& model_dir,
+                               const std::string& layer_prefix, int n_layers,
+                               int quant_bits, bool trunk_w8)
+{
+  MemoryPlan p;
+  auto wts = MetalLlamaWeights::open_model(model_dir);
+  if (!wts.has_value()) { return p; }
+  for (const std::string& nm : wts->tensor_names()) {
+    if (const auto* ti = wts->info(nm)) { p.disk += (std::size_t)ti->nbytes; }
+  }
+  // What the trunk_w8 tables shed: each bf16 [N, K] held as w8 group-64,
+  // as load() builds them (the handful of exact rows is noise).
+  std::size_t trunk_shed = 0;
+  if (quant_bits == 8 && trunk_w8) {
+    for (const char* nm : {"language_model.embed_tokens.weight",
+                           "lm_heads.0.weight"}) {
+      const auto* ti = wts->info(nm);
+      if (ti == nullptr || ti->dtype != "BF16" || ti->shape.size() != 2 ||
+          ti->shape[1] % 64 != 0) {
+        trunk_shed = 0;
+        break;
+      }
+      const std::size_t w8 = (std::size_t)(ti->shape[0] * ti->shape[1]) +
+                             (std::size_t)(ti->shape[0] * (ti->shape[1] / 64))
+                                 * 4;
+      trunk_shed += (std::size_t)ti->nbytes - w8;
+    }
+  }
+  p.n_layers = n_layers;
+  const auto rs = MetalQwenModel::raw_sizes(
+      *wts, layer_prefix, n_layers, quant_bits == 8 ? 8 : 0);
+  if (rs.n_layers != n_layers || rs.raw == 0) {
+    // Neither raw nor a w8 pack (a 4-bit or mixed one): held as it sits,
+    // and the backbone does not stream it.
+    p.preload = p.disk - trunk_shed;
+    p.retires = trunk_shed;
+    p.floor   = 0;
+    return p;
+  }
+  p.raw     = true;
+  p.pack    = rs.pack;
+  p.trunk   = p.disk - rs.raw - trunk_shed;
+  p.layer   = rs.layer;
+  p.preload = p.trunk + rs.built;
+  p.retires = p.disk > p.preload ? p.disk - p.preload : 0;
+  // Streaming holds the trunk plus a slot PAIR -- each a layer's sources
+  // and the products built from them (for a pack, mostly the same bytes).
+  p.floor   = p.trunk + 2 * rs.slot;
+  return p;
+}
+
+std::size_t
+MetalMossTtsModel::resident_bytes() const
+{
+  std::size_t n = _backbone ? (std::size_t)_backbone->resident_bytes() : 0;
+  n += _embed_tokens.byte_size() + _logits_buf.byte_size();
+  for (const auto& b : _emb_ext) { n += b.byte_size(); }
+  for (const auto& b : _heads) { n += b.byte_size(); }
+  // trunk_w8: the backbone owns these (adopt_trunk) but does not book them.
+  if (_embed_q != nullptr) { n += _embed_q->byte_size(); }
+  if (_head0_q != nullptr) { n += _head0_q->byte_size(); }
+  for (const auto& kv : _embed_exact) { n += kv.second.size() * 2; }
+  for (const auto& kv : _head_exact) { n += kv.second.size() * 2; }
+  return n;
+}
+
+void
+MetalMossTtsModel::set_residency_reserve(std::size_t bytes)
+{
+  if (_backbone) { _backbone->set_residency_reserve(bytes); }
+}
+
+void
+MetalMossTtsModel::set_residency_schedule(int forwards)
+{
+  if (_backbone) { _backbone->set_residency_schedule(forwards); }
+}
+
+std::size_t
+MetalMossTtsModel::release_resident_layers(std::size_t bytes)
+{
+  return _backbone ? _backbone->release_resident_layers(bytes) : 0;
+}
+
+bool
+MetalMossTtsModel::streams() const
+{
+  return _backbone && _backbone->streams_decode();
+}
+
+bool
+MetalMossTtsModel::streams_pack() const
+{
+  return _backbone && _backbone->streams_pack();
+}
+
+bool
+MetalMossTtsModel::quantized_on_load() const
+{
+  return _backbone && _backbone->quantized_on_load();
+}
+
+int
+MetalMossTtsModel::resident_layer_count() const
+{
+  return _backbone ? _backbone->resident_layer_count() : 0;
+}
+
+int
+MetalMossTtsModel::n_layers() const
+{
+  return _backbone ? _backbone->config().n_layers : 0;
+}
+
+void
+MetalMossTtsModel::set_i8_gemm(bool on)
+{
+  if (_backbone) { _backbone->set_i8_gemm(on); }
+}
+
+bool
+MetalMossTtsModel::i8_gemm_enabled() const
+{
+  return _backbone && _backbone->i8_gemm_enabled();
+}
+
+std::uint64_t
+MetalMossTtsModel::i8_gemm_count() const
+{
+  return _backbone ? _backbone->i8_gemm_count() : 0;
+}
+
+std::size_t
+MetalMossTtsModel::kv_bytes() const
+{
+  if (!_backbone) { return 0; }
+  ContextManager* cm = _backbone->context_manager();
+  return cm != nullptr ? cm->resident_bytes() : 0;
+}
+
+SharedBuffer
+MetalMossTtsModel::quantize_table_(
+    WeightSet& wts, const std::string& name, const std::vector<int>& exact,
+    std::unordered_map<int, std::vector<std::uint16_t>>& rows,
+    std::size_t* soff, std::size_t* boff)
+{
+  const auto* ti = wts.src().info(name);
+  if (ti == nullptr || ti->dtype != "BF16" || ti->shape.size() != 2 ||
+      ti->shape[1] % 64 != 0 || ti->shape[0] <= 0) {
+    return {};
+  }
+  const int N = (int)ti->shape[0], K = (int)ti->shape[1];
+  // The build kernel the backbone's in-memory w8 layers go through, so the
+  // tables quantize exactly as a layer would (scales in bf16, codes fit to
+  // the rounded scale and bias).
+  metal_compute::ComputeLibrary lib = _mc->load_library("affine_dequant_bf16");
+  metal_compute::ComputeFunction fn = lib.function("affine_quant_rows_w8g64");
+  if (!fn.valid()) { return {}; }
+  // Consumed here, so read UNCACHED: caching it would keep the bf16 table
+  // beside its w8 copy.
+  SharedBuffer src = wts.read(name, _mc, WeightSet::Residency::Copied);
+  if (src.empty()) { return {}; }
+  const std::size_t codes = (std::size_t)N * K;
+  const std::size_t sc = (std::size_t)N * (K / 64) * 2;
+  SharedBuffer q = _mc->make_shared_buffer(codes + 2 * sc);
+  if (q.empty()) { return {}; }
+  metal_compute::CommandStream st = _mc->make_command_stream();
+  {
+    ComputeEncoder enc = st.begin_compute();
+    const int one = 1, zero = 0;
+    enc.set_function(fn);
+    enc.set_buffer(0, src);
+    enc.set_buffer(1, q, 0);
+    enc.set_buffer(2, q, codes);
+    enc.set_buffer(3, q, codes + sc);
+    enc.set_constant(4, K);
+    enc.set_constant(5, N);
+    enc.set_constant(6, one);
+    enc.set_constant(7, zero);
+    enc.dispatch({(unsigned)(K / 64), (unsigned)N, 1}, {32, 8, 1});
+  }
+  if (!st.commit().wait_ok()) { return {}; }
+  const auto* sp = static_cast<const std::uint16_t*>(src.contents());
+  for (int id : exact) {
+    if (id < 0 || id >= N || rows.count(id) != 0) { continue; }
+    rows[id].assign(sp + (std::size_t)id * K, sp + (std::size_t)(id + 1) * K);
+  }
+  *soff = codes;
+  *boff = codes + sc;
+  return q;
+}
+
+void
+MetalMossTtsModel::embed_row_(int id, std::uint16_t* out) const
+{
+  const int H = _cfg.hidden;
+  if (!_trunk_w8) {
+    const auto* et =
+        static_cast<const std::uint16_t*>(_embed_tokens.contents());
+    std::memcpy(out, et + (std::size_t)id * H, (std::size_t)H * 2);
+    return;
+  }
+  const auto it = _embed_exact.find(id);
+  if (it != _embed_exact.end()) {
+    std::memcpy(out, it->second.data(), (std::size_t)H * 2);
+    return;
+  }
+  // Dequantize the row as affine_dequant_w8g64 does: s * q + b in f32,
+  // rounded once to bf16.
+  const auto* base = static_cast<const std::uint8_t*>(_embed_q->contents());
+  const std::uint8_t* q = base + (std::size_t)id * H;
+  const int G = H / 64;
+  const auto* s = reinterpret_cast<const std::uint16_t*>(base + _e_soff) +
+                  (std::size_t)id * G;
+  const auto* b = reinterpret_cast<const std::uint16_t*>(base + _e_boff) +
+                  (std::size_t)id * G;
+  for (int g = 0; g < G; ++g) {
+    const float sf = bf16_to_f32_(s[g]), bf = bf16_to_f32_(b[g]);
+    for (int j = 0; j < 64; ++j) {
+      const int k = g * 64 + j;
+      out[k] = f32_to_bf16_(sf * (float)q[k] + bf);
+    }
+  }
 }
 
 SharedBuffer
@@ -290,7 +599,6 @@ MetalMossTtsModel::assemble_embeds_(
   const int H = _cfg.hidden, NV = _cfg.n_vq;
   SharedBuffer x = _mc->make_shared_buffer((std::size_t)n * H * 2);
   auto* xp = static_cast<std::uint16_t*>(x.contents());
-  const auto* et = static_cast<const std::uint16_t*>(_embed_tokens.contents());
   // Match the reference's accumulation: inputs_embeds starts as the bf16
   // text embedding, then each audio-code embedding is added one at a time
   // with the result ROUNDED BACK TO BF16 after every add (MLX bf16 add).
@@ -299,9 +607,7 @@ MetalMossTtsModel::assemble_embeds_(
   std::vector<std::uint16_t> cur((std::size_t)H);
   for (int r = 0; r < n; ++r) {
     const auto& row = rows[(std::size_t)(start + r)];
-    const int text_id = row[0];
-    const auto* trow = et + (std::size_t)text_id * H;
-    for (int h = 0; h < H; ++h) { cur[(std::size_t)h] = trow[h]; }
+    embed_row_(row[0], cur.data());
     for (int cb = 0; cb < NV; ++cb) {
       const int code = row[(std::size_t)(1 + cb)];
       const auto* arow =
@@ -339,7 +645,20 @@ MetalMossTtsModel::dispatch_heads_(ComputeEncoder& enc, const SharedBuffer& hn,
     gemv(_heads[(std::size_t)(1 + cb)], off, AC);
     off += (std::size_t)AC;
   }
-  if (need_full_text) { gemv(_heads[0], 0, V); }
+  if (!need_full_text) { return; }
+  if (!_trunk_w8) {
+    gemv(_heads[0], 0, V);
+    return;
+  }
+  enc.set_function(_fn_qmv8);
+  enc.set_buffer(0, *_head0_q, 0);
+  enc.set_buffer(1, *_head0_q, _h_soff);
+  enc.set_buffer(2, *_head0_q, _h_boff);
+  enc.set_buffer(3, hn, 0);
+  enc.set_buffer(4, _logits_buf, 0);
+  enc.set_constant(5, H);
+  enc.set_constant(6, V);
+  enc.dispatch({32, (unsigned)(V / 4), 1}, {32, 2, 1});
 }
 
 void
@@ -367,9 +686,17 @@ MetalMossTtsModel::read_heads_(const SharedBuffer& hn, bool need_full_text,
     // two cheap host dot products hn . text_head_row[slot] (bf16 UMA reads).
     text_logits.resize((std::size_t)V);
     const auto* h = static_cast<const std::uint16_t*>(hn.contents());
-    const auto* tw = static_cast<const std::uint16_t*>(_heads[0].contents());
     for (int slot : {_cfg.audio_gen_slot, _cfg.audio_delay_slot}) {
-      const auto* row = tw + (std::size_t)slot * H;
+      // trunk_w8 keeps exactly these two rows of the text head in bf16.
+      const std::uint16_t* row = nullptr;
+      if (_trunk_w8) {
+        const auto it = _head_exact.find(slot);
+        if (it == _head_exact.end()) { continue; }
+        row = it->second.data();
+      } else {
+        row = static_cast<const std::uint16_t*>(_heads[0].contents()) +
+              (std::size_t)slot * H;
+      }
       float acc = 0.0f;
       for (int k = 0; k < H; ++k) {
         acc += bf16_to_f32_(h[k]) * bf16_to_f32_(row[k]);
@@ -398,7 +725,7 @@ std::vector<std::vector<std::int32_t>>
 MetalMossTtsModel::generate_delay(
     const std::vector<std::vector<std::int32_t>>& prompt, int max_new_tokens,
     const MossSampling& audio_sp, const MossSampling& text_sp,
-    std::uint64_t seed, const std::function<bool()>& should_stop)
+    std::uint64_t seed, const RowCb& on_row)
 {
   std::vector<std::vector<std::int32_t>> out;
   const int NV = _cfg.n_vq;
@@ -563,11 +890,12 @@ MetalMossTtsModel::generate_delay(
     for (int cb = 0; cb < NV; ++cb) { row.push_back(next_audio[(std::size_t)cb]); }
     out.push_back(row);
 
-    if (is_stopping) { break; }
-    // Barge-in: new text arrived -> stop ASAP. The delayed codes still in
-    // flight (the last ~n_vq rows) never complete; the caller's de-delay drops
-    // them, so the emitted audio ends a hair early but the new text starts now.
-    if (should_stop && should_stop()) { break; }
+    // The caller sees the row first (a streaming de-delay may complete a
+    // frame on it), then may stop -- barge-in: the delayed codes still in
+    // flight (the last ~n_vq rows) never complete and the de-delay drops
+    // them, so the audio ends a hair early but the new text starts now.
+    const bool keep_going = !on_row || on_row(row);
+    if (is_stopping || !keep_going) { break; }
 
     // Feed the new row back through the optimized qmv decode path, FUSING the
     // next step's heads (the state is now t+1) into the same command buffer.
@@ -606,45 +934,60 @@ MetalMossTtsModel::teacher_force_audio_mismatches(
 {
   std::vector<AudioMismatch> out;
   const int NV = _cfg.n_vq;
+  constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+  // Verification only inspects the audio heads; skip the text head.
+  teacher_force_logits(
+      prompt, ref_rows, /*full_text=*/false,
+      [&](int r, const std::vector<std::vector<float>>& audio_logits,
+          const std::vector<float>&) {
+        const auto& ref = ref_rows[(std::size_t)r];
+        for (int cb = 0; cb < NV; ++cb) {
+          const int ref_code = ref[(std::size_t)(1 + cb)];
+          if (ref_code == _cfg.audio_pad_code) { continue; }   // inactive
+          const auto& cl = audio_logits[(std::size_t)cb];
+          float bv = kNegInf;
+          int best = 0;
+          for (int c = 0; c < _cfg.audio_vocab; ++c) {
+            if (cl[(std::size_t)c] > bv) { bv = cl[(std::size_t)c]; best = c; }
+          }
+          if (best != ref_code) {
+            out.push_back({r, cb, best, ref_code, bv,
+                           cl[(std::size_t)ref_code]});
+          }
+        }
+      });
+  return out;
+}
+
+void
+MetalMossTtsModel::teacher_force_logits(
+    const std::vector<std::vector<std::int32_t>>& prompt,
+    const std::vector<std::vector<std::int32_t>>& rows, bool full_text,
+    const LogitsCb& cb)
+{
   const int seq = (int)prompt.size();
-  if (seq <= 0 || ref_rows.empty()) { return out; }
+  if (seq <= 0 || rows.empty()) { return; }
   ContextManager* cm = _backbone->context_manager();
   const ContextId cid = cm->acquire_root();
-  constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
   SharedBuffer x = assemble_embeds_(prompt, 0, seq);
   SharedBuffer prefill_hn = _backbone->forward_embeddings_hidden(cid, x, seq);
-  if (prefill_hn.empty()) { cm->release(cid); return out; }
+  if (prefill_hn.empty()) { cm->release(cid); return; }
   const SharedBuffer* cur_hn = &prefill_hn;
 
   std::vector<float> text_logits;
   std::vector<std::vector<float>> audio_logits;
-  for (int r = 0; r < (int)ref_rows.size(); ++r) {
-    // Verification only inspects the audio heads; skip the text head entirely.
-    head_logits_(*cur_hn, /*need_full_text=*/false, /*need_2slots=*/false,
-                 text_logits, audio_logits);
-    const auto& ref = ref_rows[(std::size_t)r];
-    for (int cb = 0; cb < NV; ++cb) {
-      const int ref_code = ref[(std::size_t)(1 + cb)];
-      if (ref_code == _cfg.audio_pad_code) { continue; }   // inactive
-      const auto& cl = audio_logits[(std::size_t)cb];
-      float bv = kNegInf;
-      int best = 0;
-      for (int c = 0; c < _cfg.audio_vocab; ++c) {
-        if (cl[(std::size_t)c] > bv) { bv = cl[(std::size_t)c]; best = c; }
-      }
-      if (best != ref_code) {
-        out.push_back({r, cb, best, ref_code, bv,
-                       cl[(std::size_t)ref_code]});
-      }
-    }
-    std::vector<std::vector<std::int32_t>> one(1, ref);
+  for (int r = 0; r < (int)rows.size(); ++r) {
+    text_logits.clear();
+    head_logits_(*cur_hn, full_text, /*need_2slots=*/false, text_logits,
+                 audio_logits);
+    cb(r, audio_logits, text_logits);
+    std::vector<std::vector<std::int32_t>> one(1, rows[(std::size_t)r]);
     SharedBuffer xe = assemble_embeds_(one, 0, 1);
     cur_hn = _backbone->decode_embedding_hidden(cid, xe);
     if (cur_hn == nullptr) { break; }
   }
   cm->release(cid);
-  return out;
 }
 
 }  // namespace vpipe::genai

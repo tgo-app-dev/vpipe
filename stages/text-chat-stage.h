@@ -74,7 +74,9 @@ namespace vpipe {
 // A chunk is flushed roughly every ~20 words at a sentence/clause
 // punctuation boundary (English + Chinese; see common/text-stream-chunk.h),
 // so a streaming consumer -- notably text-to-speech, whose barge-in
-// respects end_of_response -- can start before the turn finishes. Like
+// respects end_of_response -- can start before the turn finishes.
+// `stream_words` sets that target; 0 flushes each decoded piece as it
+// comes, for a reader watching the reply being written. Like
 // out-port 0 it is unconditional and downstream-optional. When
 // `stream_answer_only` is set the reasoning (<think>) and tool-call blocks
 // are folded OUT of this port so a speaking consumer voices only the
@@ -118,6 +120,12 @@ namespace vpipe {
 //                                                OFF; Qwen3-VL: ON;
 //                                                Llama-3 / ChatML
 //                                                ignore this flag).
+//   stream_words     (int,    default 20)      -- out-port 1's chunk:
+//                                                flushed at punctuation
+//                                                past this many words
+//                                                (hard cap 3x, at least
+//                                                60); 0 = every decoded
+//                                                piece as it comes.
 //   mtp              (bool,   default true)    -- use the MTP speculative-
 //                                                decode head when the
 //                                                loaded model carries one
@@ -165,6 +173,7 @@ public:
   bool web_tools_enabled() const noexcept { return _enable_web_tools; }
   bool allow_system_temp() const noexcept { return _allow_system_temp; }
   bool stream_answer_only() const noexcept { return _stream_answer_only; }
+  int stream_words() const noexcept { return _stream_words; }
   const std::string& file_sandbox_mode() const noexcept
   { return _file_sandbox_mode; }
   const std::string& file_sandbox_root() const noexcept
@@ -232,6 +241,9 @@ private:
   // (config "stream_answer_only", default false). Out-port 0 always
   // carries the full text.
   bool        _stream_answer_only{};
+  // Out-port 1's chunk target in words (config "stream_words", default
+  // 20); 0 flushes every decoded piece -- a reader, not a speaker.
+  int         _stream_words{20};
   // The locally-dispatchable tool registry, seeded in initialize() when
   // tools are enabled and supported. Empty otherwise.
   McpToolRegistry _tools;

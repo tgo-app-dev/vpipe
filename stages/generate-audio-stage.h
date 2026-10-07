@@ -69,9 +69,27 @@ public:
 
   const StageSpec& spec() const noexcept override;
 
+  // What one song costs beside the weights, as the claims book it:
+  //   held       the AR pool and the NAR row scratch -- never given back,
+  //              so booked for the whole run
+  //   transient  the flow matching's chunk K/V (denoise)
+  //   decode     the downstream VAE decode's arena (decode-audio)
+  //   pcm        the PCM that decode hands on (decode-audio)
+  // The generator books the last two, as generate-video does for its
+  // soundtrack: it is the stage that knows how long the song can be.
+  struct SongBytes {
+    std::size_t held = 0, transient = 0, decode = 0, pcm = 0;
+  };
+
   // Test-only.
   std::uint64_t songs_emitted() const noexcept { return _songs; }
   const std::string& last_score() const noexcept { return _last_score; }
+  // The plan's figures, and what the model holds beside its weights now.
+  SongBytes planned_song_bytes() const { return song_bytes_(-1, -1, false); }
+  std::size_t held_scratch_bytes() const;
+  // The claims' labels: one per stage instance, since two claims sharing
+  // a label are counted once.
+  std::string scratch_label_() const;
 
 private:
   // Config. Defaults live in kSpec.attrs.
@@ -87,6 +105,7 @@ private:
   double _song_temperature{}, _song_top_p{};
   int _song_top_k{};
   double _song_penalty{};
+  int _lm_quant_bits = 8;   // lm_quant: 8 = the AR stack w8 in memory
   // The flow matching's acceleration tiers, settled in the ctor.
   bool _i8_gemm{};
   bool _ane_ffn{};
@@ -107,10 +126,20 @@ private:
   bool _one_shot_done = false;
   std::uint64_t _songs = 0;
   std::string _last_score;
+  // A wired prompt can ask for guidance per song (cfg_scale, cot) where
+  // the config did not; the claims are revised up when one does.
+  bool _prompt_wired = false;
+  SongBytes _booked;   // what the claims say now
 
-  // Estimated activation scratch for one song at max_seconds: the
-  // decode's KV and the flow matching's frozen K/V plus its rows.
-  std::size_t scratch_bytes_() const;
+  // One song's costs. prefix / frames < 0 take the plan's bounds (the
+  // score budget plus style and lyrics; max_seconds or the protocol's
+  // 9000 tokens); `guided` adds to what the config already asks for.
+  SongBytes song_bytes_(int prefix, int frames, bool guided) const;
+  // The longest song the plan books: max_seconds or the protocol's cap.
+  int plan_frames_() const;
+  // Raise the claims to cover `b` -- never lower them: the pool keeps
+  // what it grew to, and a later song may be longer.
+  void revise_song_bytes_(const SongBytes& b);
 };
 
 }  // namespace vpipe

@@ -1,5 +1,6 @@
 #include "stages/model-memory.h"
 
+#include "common/host-report.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
@@ -359,6 +360,17 @@ vae_decode_scratch_bytes(const std::string& root, int width, int height)
   namespace fs = std::filesystem;
   if (root.empty() || width <= 0 || height <= 0) { return 0; }
   std::ifstream in(fs::path(root) / "vae" / "config.json");
+  // WHERE THE DECODER FINDS ITS VAE, not only `vae/`: VOSR ships its
+  // autoencoder as `Qwen-Image-vae-2d/` under the model's root, and read
+  // from `vae/` alone its decode was declared as nothing -- a picture
+  // decoded at 2K and more that the plan never heard of.
+  if (!in) {
+    const fs::path dir = resolve_vae_dir(root);
+    std::error_code ec;
+    if (!dir.empty() && fs::is_directory(dir, ec)) {
+      in = std::ifstream(dir / "config.json");
+    }
+  }
   // A STANDALONE VAE checkpoint IS its own root -- there is no model
   // around it to hold a `vae/` subdirectory. Without this fallback the
   // read returns 0, the decode arena goes undeclared, and the
@@ -381,7 +393,9 @@ vae_decode_scratch_bytes(const std::string& root, int width, int height)
   // to the 128 default against a real 96, over-declaring 1.33x: the
   // safe direction, but not a number anybody computed, and it made an
   // "exact" claim for Krea-2 that was not.
-  if (cls == "AutoencoderKLQwenImage") {
+  // The 2-D one (VOSR's) is the same network over pictures alone: the
+  // same widths, the same peak.
+  if (cls == "AutoencoderKLQwenImage" || cls == "AutoencoderKLQwenImage2D") {
     int base = 96;                        // the stock default
     if (o.contains("base_dim")) {
       const int b = (int)FlexData(o.at("base_dim")).as_real(0.0);
@@ -959,6 +973,25 @@ public:
     session->info(fmt(
         "resource-plan: peak {} MB in phase '{}' ({})",
         need >> 20, tight, breakdown));
+    // The same, for the host to show beside a refusal later in the run
+    // (common/host-report.h): what the graph asked for, phase by phase.
+    {
+      FlexData phases = FlexData::make_array();
+      for (const auto& [p, b] : per_phase) {
+        FlexData e = FlexData::make_object();
+        e.as_object().insert("name", FlexData::make_string(p));
+        e.as_object().insert("bytes", FlexData::make_uint(b));
+        phases.as_array().push_back(std::move(e));
+      }
+      FlexData d = FlexData::make_object();
+      auto o = d.as_object();
+      o.insert("peak", FlexData::make_uint(need));
+      o.insert("phase", FlexData::make_string(tight));
+      o.insert("phases", std::move(phases));
+      o.insert("ram", FlexData::make_uint(phys_ram()));
+      o.insert("pool", FlexData::make_uint(pool));
+      host_report(session, "memory-plan", std::move(d));
+    }
     if (need <= pool) { return true; }
 
     // OVER THE POOL IS NOT OVER THE BOX, and only one of the two is a

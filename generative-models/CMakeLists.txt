@@ -64,6 +64,7 @@ set(LOCAL_SOURCES
   gemma4/metal-gemma4-vision.cc
   qwen3/metal-audio-encoder.cc
   qwen3/metal-qwen-model.cc
+  qwen3/metal-qwen-raw-layers.cc
   qwen3/metal-qwen-model-exec.cc
   qwen3/metal-qwen-vision.cc
   llama3/metal-llama-model.cc
@@ -73,6 +74,8 @@ set(LOCAL_SOURCES
   moss/metal-moss-codec.cc
   moss/metal-moss-codec-v2.cc
   moss/moss-v15-processor.cc
+  moss/moss-delay-processor.cc
+  moss/moss-text-normalizer.cc
   moss/metal-moss-local-transformer.cc
   moss/metal-moss-local-model.cc
   moss/metal-moss-v15-model.cc
@@ -183,6 +186,7 @@ set(LOCAL_HEADERS
   gemma4/metal-gemma4-vision.h
   qwen3/metal-audio-encoder.h
   qwen3/metal-qwen-model.h
+  qwen3/metal-qwen-raw-layers.h
   qwen3/metal-qwen-model-exec.h
   qwen3/metal-qwen-vision.h
   qwen-image/qwen-image21-layout.h
@@ -198,6 +202,8 @@ set(LOCAL_HEADERS
   moss/metal-moss-codec.h
   moss/metal-moss-codec-v2.h
   moss/moss-v15-processor.h
+  moss/moss-delay-processor.h
+  moss/moss-text-normalizer.h
   moss/metal-moss-local-transformer.h
   moss/metal-moss-local-model.h
   moss/metal-moss-v15-model.h

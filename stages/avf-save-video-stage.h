@@ -2,6 +2,7 @@
 #define VPIPE_STAGES_AVF_SAVE_VIDEO_STAGE_H
 
 #include "common/job.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 
@@ -36,6 +37,8 @@ public:
   // Test-only.
   std::uint64_t frames_written() const noexcept { return _written; }
   bool finished() const noexcept { return _finished; }
+  // What its progress counted against (0: uncounted).
+  std::uint64_t progress_total() const noexcept { return _total; }
 
 private:
   void finish_();
@@ -50,10 +53,15 @@ private:
   int         _transfer = 0;
   int         _matrix = 0;
 
+  std::uint64_t _expected = 0;   // config.frames; 0 = from the frames
+
   std::unique_ptr<apple_media::VideoWriter> _writer;
   bool          _failed = false;
   bool          _finished = false;
   std::uint64_t _written = 0;
+  // Frames written of how many: a long movie's progress ("save video").
+  UiProgress    _bar;
+  std::uint64_t _total = 0;
 };
 
 }  // namespace vpipe

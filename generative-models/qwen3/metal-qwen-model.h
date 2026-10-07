@@ -46,6 +46,7 @@ namespace vpipe::genai {
 struct ModelConfig;
 class I8GemmContext;   // fwd (shared/i8-gemm.h)
 class WeightSet;       // generative-models/weight-set.h
+class MetalLlamaWeights;   // llama3/metal-llama-weights.h
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
 // is on the affine (safetensors / gemma-style) path. The metal forward
@@ -189,6 +190,26 @@ public:
     // prefill; only the tail streams. 0 => pure streaming.
     bool   stream_layers = false;
     double pin_frac      = 0.0;
+    // IN-MEMORY QUANTIZATION of a raw checkpoint. 8 quantizes every
+    // projection of an UNQUANTIZED (raw HF float) checkpoint to affine w8
+    // group 64 as the layer is built, and the model then runs the affine
+    // path an 8-bit pack takes -- at ~53% of the bf16 bytes, which for an
+    // autoregressive backbone is the difference between fitting in RAM
+    // and paging. 0 keeps a raw checkpoint dense. No effect on a
+    // checkpoint that is already quantized, nor without raw_layers()
+    // eligibility (dense full-attention, backbone_only, bf16, plain
+    // RMSNorm, q/k norms, no attention bias).
+    int    load_quant_bits = 0;
+    // DECODE-CAPABLE layer streaming, for the same eligible backbones:
+    // a streamed layer keeps its raw checkpoint tensors in one of two
+    // pread-refilled slots (shared/block-slots.h) and is rebuilt -- w8
+    // or bf16, exactly as a resident layer is -- inside the command
+    // buffer that runs it, so streamed and resident output are
+    // byte-identical. The resident set grows by measurement
+    // (shared/block-residency.h) and is wired into the pool. Serves both
+    // forward_embeddings_hidden and decode_embedding_hidden; pin_frac is
+    // not used. Takes the place of stream_layers when it engages.
+    bool   stream_decode = false;
     // Weight-name root prepended before "model." / "lm_head." Qwen3.5-VL
     // nests the LM under "language_model."; Qwen3-ASR is at the root ("").
     std::string weight_prefix = "language_model.";
@@ -404,6 +425,61 @@ public:
   // prompt both ways.
   bool streaming_layers() const { return _stream_layers; }
   int  pinned_layers()    const { return _pinned_layers; }
+
+  // ---- Raw-source layers (Config::load_quant_bits / stream_decode) -------
+  // Whether the layers are built by this model (in-memory w8 or bf16
+  // streaming from a raw checkpoint, or a streamed affine w8 pack),
+  // whether a raw checkpoint was quantized on the way in, whether the
+  // source is a pack, and whether layers stream through decode.
+  bool raw_layers()        const { return _raw; }
+  bool quantized_on_load() const { return _raw_quant && !_raw_pack; }
+  bool streams_pack()      const { return _raw_pack; }
+  bool streams_decode()    const;
+  // Residency, as the block-streaming DiTs take it (docs/MODEL-MEMORY.md
+  // mechanisms 6 and 7). The reserve is what must stay clear for whatever
+  // runs after this model's forward and has not allocated yet; growth is
+  // off until one is set, and 0 is a real answer. The schedule sizes the
+  // growth rate from how many forwards the run will make.
+  void set_residency_reserve(std::size_t bytes);
+  void set_residency_schedule(int forwards);
+  std::size_t release_resident_layers(std::size_t bytes);
+  int  resident_layer_count() const;
+  // Wire what this model keeps into the pool: the checkpoint's cached
+  // trunk first, then (preloaded) every layer. For the OWNER to call once
+  // it has loaded its own tensors from the same checkpoint -- a MOSS
+  // model's embedding tables and heads are that trunk, and they load
+  // after this model does. Streaming models also re-wire the trunk at
+  // the top of every forward.
+  void wire_resident();
+  // Take ownership of a buffer the OWNER built and reads on every token --
+  // a MOSS model's w8 embedding table and text head, which are transforms
+  // of the checkpoint and so are not the set's to wire. It is wired with
+  // the trunk (ahead of any layer) and lives as long as this model; the
+  // reference stays valid for that long. NOT counted in resident_bytes():
+  // the owner already books what it built.
+  metal_compute::SharedBuffer& adopt_trunk(metal_compute::SharedBuffer b);
+  // The backbone weight bytes this model holds NOW: every built layer
+  // (all of them, preloaded; the promoted ones, streaming), the two
+  // streaming slots and the final norm. K/V is not included.
+  std::uint64_t resident_bytes() const;
+
+  // Sizes of a raw-source backbone, from the checkpoint alone -- for a
+  // stage that has to plan before anything loads. `layer_prefix` is the
+  // stem before the layer index ("language_model.layers."); `quant_bits`
+  // 8 builds w8, 0 keeps bf16. An affine w8 group-64 pack is sized too
+  // (`pack`): its layers stream as they sit, whatever `quant_bits` says.
+  // Zeros when the layers are neither raw nor such a pack.
+  struct RawSizes {
+    int         n_layers = 0;
+    std::size_t raw      = 0;   // on-disk bytes of all layers
+    std::size_t built    = 0;   // what all layers hold once built
+    std::size_t layer    = 0;   // what the WIDEST layer holds built
+    std::size_t slot     = 0;   // one streaming slot: sources + products
+    bool        pack     = false;   // the layers are already affine w8
+  };
+  static RawSizes raw_sizes(const MetalLlamaWeights& wts,
+                            const std::string& layer_prefix, int n_layers,
+                            int quant_bits);
   // [n_layers][channels] abs-max (hidden for qkv/gateup, ffn_inner for down).
   const std::vector<std::vector<float>>& calib_qkv()    const { return _calib_qkv; }
   const std::vector<std::vector<float>>& calib_gateup() const { return _calib_gu; }
@@ -674,6 +750,10 @@ public:
   // overrides. Wired from the stage config via the exec.
   void set_i8_gemm(bool on);
   bool i8_gemm_enabled() const noexcept { return _i8 != nullptr; }
+  // GEMMs the int8 tier actually took since load -- engagement, which an
+  // enabled tier does not imply: it declines every shape under its M / K
+  // floors (1024 rows; a decode step is one).
+  std::uint64_t i8_gemm_count() const noexcept { return _i8_count; }
   // Mixed-precision affine (OptiQ) de-fused per-tensor path engaged (some
   // 4-bit, some 8-bit linears). For the token-exact OptiQ guard test.
   bool uses_mixed_precision() const noexcept { return _mixed; }
@@ -733,7 +813,8 @@ private:
       std::size_t page_off, int n_pages,
       const ContextManager::AppendSlot& slot,
       const metal_compute::SharedBuffer& pgtab, std::size_t pgtab_off,
-      bool return_hidden = false);
+      bool return_hidden = false,
+      metal_compute::CommandStream* stream = nullptr);
 
   // Encode the next-token pick (greedy argmax or full GPU sampler) into
   // `enc`: reads `logits`, writes the chosen id to out_id[out_off], and
@@ -1333,6 +1414,7 @@ private:
   bool _use_mma = false;
   // Dynamic-int8 accelerated prefill GEMMs (set_i8_gemm); null when off.
   std::unique_ptr<I8GemmContext> _i8;
+  std::uint64_t _i8_count = 0;
   // Split-K for the very deep down_proj contraction (Qwen3.6-27B, K=17408).
   // Inert on every other checkpoint -- it keys on the exact depth.
   MmaSplitK _splitk;
@@ -1664,6 +1746,26 @@ private:
   bool _stream_layers = false;
   int  _pinned_layers = 0;       // leading layers kept resident
   bool _stream_decode_warned = false;   // decode-on-streamed, reported once
+
+  // Raw-source layers (metal-qwen-raw-layers.cc). RawLayer is one layer's
+  // raw checkpoint tensors plus the products built from them; RawStream
+  // owns the slots, the residency policy and the wired-pool window.
+  struct RawLayer;
+  struct RawStream;
+  friend struct RawStream;
+  std::unique_ptr<RawStream> _rs;
+  bool _raw = false;
+  bool _raw_quant = false;
+  bool _raw_pack = false;    // the source is an affine w8g64 pack
+  static bool raw_eligible_(const Config& c);
+  // An affine w8 group-64 pack whose layers a RawStream can stream: every
+  // projection a (u32 codes, scales, biases) triple of one width that a
+  // refill can place, and a hidden size whose rows copy in 32-bit words.
+  static bool pack_streamable_(const MetalLlamaWeights& wts, const Config& c);
+  metal_compute::SharedBuffer raw_read_(const std::string& name);
+  // Buffers adopt_trunk() took. A deque, so a reference handed out stays
+  // valid as more arrive.
+  std::deque<metal_compute::SharedBuffer> _trunk_extra;
 
   std::vector<Layer> _layers;
   metal_compute::SharedBuffer _embed_w, _embed_s, _embed_b;   // tied lm_head

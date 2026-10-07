@@ -7,6 +7,7 @@
 
 #include "minitest.h"
 #include "common/flex-data.h"
+#include "common/host-report.h"
 #include "common/session.h"
 #include "common/vpipe-format.h"
 #include "vpipe/vpipe.h"
@@ -258,5 +259,57 @@ TEST(host_flex_api, log_listener_hears_the_session)
     std::lock_guard<std::mutex> lk(mu);
     EXPECT_TRUE(heard.size() == 3);
   }
+  SessionManager::get().destroy_session(s);
+}
+
+// SessionIntf::reports(): what a stage refused and why, as numbers a host
+// can act on (common/host-report.h) -- the newest 32, oldest first, ids
+// only growing, the version the newest.
+TEST(host_flex_api, reports_reach_the_host_as_a_document)
+{
+  const SessionIntf* s = SessionManager::get().create_session();
+  ASSERT_TRUE(s != nullptr);
+  if (s == nullptr) { return; }
+  const auto* impl = dynamic_cast<const Session*>(s);
+  ASSERT_TRUE(impl != nullptr);
+  if (impl == nullptr) { SessionManager::get().destroy_session(s); return; }
+
+  const uint64_t v0 = s->reports_version();
+  {
+    FlexData d = FlexData::make_object();
+    d.as_object().insert("need", FlexData::make_uint(3u << 30));
+    d.as_object().insert("step", FlexData::make_string("denoise"));
+    host_report(impl, "memory", std::move(d));
+  }
+  EXPECT_TRUE(s->reports_version() == v0 + 1);
+  {
+    const FlexData doc = s->reports();
+    EXPECT_TRUE(doc.as_object().at("version").as_uint() == v0 + 1);
+    const FlexData items = doc.as_object().at("items");
+    ASSERT_TRUE(items.as_array().size() >= 1);
+    const FlexData last = items.as_array()[items.as_array().size() - 1];
+    const auto o = last.as_object();
+    EXPECT_TRUE(o.at("id").as_uint() == v0 + 1);
+    EXPECT_TRUE(o.at("kind").as_string() == "memory");
+    EXPECT_TRUE(o.at("age_ms").is_uint());
+    const FlexData data = o.at("data");
+    EXPECT_TRUE(data.as_object().at("need").as_uint() == (3ull << 30));
+    EXPECT_TRUE(data.as_object().at("step").as_string() == "denoise");
+  }
+  // Bounded: the newest 32 kept, the oldest gone.
+  for (int i = 0; i < 40; ++i) {
+    host_report(impl, "memory-plan", FlexData::make_object());
+  }
+  {
+    const FlexData doc = s->reports();
+    const FlexData items = doc.as_object().at("items");
+    EXPECT_TRUE(items.as_array().size() == 32);
+    const FlexData first = items.as_array()[0];
+    EXPECT_TRUE(first.as_object().at("id").as_uint() == v0 + 41 - 31);
+    EXPECT_TRUE(doc.as_object().at("version").as_uint() == v0 + 41);
+  }
+  // A context that is not vpipe's own Session drops the report.
+  host_report(nullptr, "memory", FlexData::make_object());
+  EXPECT_TRUE(s->reports_version() == v0 + 41);
   SessionManager::get().destroy_session(s);
 }

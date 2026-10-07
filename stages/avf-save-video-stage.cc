@@ -9,6 +9,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <utility>
 
@@ -62,6 +63,12 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "color_matrix", .type = ConfigType::Uint, .required = false,
    .doc = "CICP YCbCr matrix (1 BT.709, 9 BT.2020); 0 (the default) = "
           "the frames' own, else the one their primaries imply",
+   .def_uint = 0},
+  {.key = "frames", .type = ConfigType::Uint, .required = false,
+   .doc = "the frames to expect, for the progress report (\"save "
+          "video\": frames written of these); 0 (the default) = the "
+          "frames' sideband `frames`, else uncounted. Nothing is cut or "
+          "padded to it",
    .def_uint = 0},
 };
 const PortSpec kIports[] = {
@@ -118,6 +125,7 @@ AvfSaveVideoStage::AvfSaveVideoStage(const SessionContextIntf* s,
   _primaries = (int)attr_uint("color_primaries");
   _transfer = (int)attr_uint("color_transfer");
   _matrix = (int)attr_uint("color_matrix");
+  _expected = attr_uint("frames");
 }
 
 AvfSaveVideoStage::~AvfSaveVideoStage() = default;
@@ -135,6 +143,8 @@ AvfSaveVideoStage::reset_run_state()
   _failed = false;
   _finished = false;
   _written = 0;
+  _bar.finish();
+  _total = 0;
 }
 
 void
@@ -150,6 +160,7 @@ AvfSaveVideoStage::finish_()
     session()->error(fmt("AvfSaveVideoStage('{}'): {}", this->id(), err));
   }
   _writer.reset();
+  _bar.finish();
 }
 
 Job
@@ -214,15 +225,28 @@ AvfSaveVideoStage::process(RuntimeContext& ctx)
       _failed = true;
       co_return;
     }
+    // A long movie -- an hour's export -- reports its frames as it goes.
+    _total = _expected;
+    if (_total == 0 && sb.is_object() &&
+        sb.as_object().contains(sideband::kFrames)) {
+      const std::int64_t n =
+          sb.as_object().at(sideband::kFrames).as_int(0);
+      _total = n > 0 ? (std::uint64_t)n : 0;
+    }
+    _bar = session()->open_progress("save video");
+    _bar.update(0, _total);
   }
   std::string err;
   if (!_writer->write(*pic, (std::int64_t)_written, &err)) {
     session()->error(fmt("AvfSaveVideoStage('{}'): {}", this->id(), err));
     _writer.reset();
+    _bar.finish();
     _failed = true;
     co_return;
   }
   ++_written;
+  // Past what it was told (an estimate from a duration): still counted.
+  _bar.update(_written, _total > 0 ? std::max(_total, _written) : 0);
 }
 
 VPIPE_REGISTER_STAGE(AvfSaveVideoStage)

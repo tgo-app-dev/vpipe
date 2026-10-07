@@ -45,6 +45,21 @@ TEST(quant_arch_detect, moss_tts_local_dense_calibratable)
   EXPECT_TRUE(m.backbone.hidden == 2560);
 }
 
+// MOSS-TTS-v1.5 (and 1.0) as published say model_type "moss_tts_delay".
+// It must map to the moss-tts family -- which keeps the embedding tables
+// and heads bf16 -- rather than fall through as a tag of its own.
+TEST(quant_arch_detect, moss_tts_delay_is_moss_tts)
+{
+  const char* d = std::getenv("VPIPE_MOSS_TTS_V15_MODEL");
+  if (!has_model_(d)) { return; }
+  Session sess;
+  const auto m = genai::detect_quant_arch(&sess, d);
+  EXPECT_TRUE(m.detected);
+  EXPECT_TRUE(m.arch == "moss-tts");
+  EXPECT_TRUE(m.layer_prefix == "language_model.layers.");
+  EXPECT_TRUE(m.n_layers == 36);
+}
+
 // Qwen3.5 hybrid: only the periodic full-attention layers carry self_attn.
 // q_proj (the rest are gated-DeltaNet), but BOTH block types start with
 // input_layernorm, so AWQ folds the in-projection group on every layer ->

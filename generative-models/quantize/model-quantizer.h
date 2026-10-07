@@ -77,6 +77,17 @@ struct QuantizeOptions {
   // are unaffected.
   bool quant_embeddings = false;
 
+  // Scales and biases in BF16, with the codes fit to the ROUNDED pair --
+  // what a bf16-compute model holds in memory -- rather than F16. For a
+  // model whose forward runs bf16 (every MOSS backbone) an F16 pack's
+  // scales are rounded to bf16 at load, after the codes were fit to the
+  // unrounded ones: MEASURED on MOSS-TTS-v1.5 that doubles the w8 error
+  // against the fp32 reference (rel 0.0109 against 0.0061). Taken only
+  // where the in-memory build kernel applies: 8 bits, group 64, a bf16
+  // or f32 source and no column fold; anything else stays F16. The layers
+  // then come out byte-identical to that model's in-memory w8 build.
+  bool bf16_scales = false;
+
   // Zero-centered RMSNorm convention (the raw-HF Qwen3.5/3.6 family): the
   // checkpoint stores RMSNorm weights centered at 0 and the model applies
   // (1 + weight). vpipe's RMSNorm kernel multiplies by `weight` directly

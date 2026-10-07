@@ -131,6 +131,65 @@ TEST(text_to_speech_stage, bad_max_new_tokens_deferred) {
   EXPECT_FALSE(s.config_error().empty());
 }
 
+// The v1.5 keys: how the LM is held, the duration control and the text
+// clean-up. Defaults, overrides, and the bad values deferred to launch.
+TEST(text_to_speech_stage, v15_keys) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.lm_quant() == "w8");
+    EXPECT_TRUE(s.duration_tokens() == 0);
+    EXPECT_TRUE(s.text_normalizer() == "auto");
+    EXPECT_FALSE(s.lm_streams());
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/a","codec_dir":"/b","lm_quant":"bf16",)"
+        R"("duration_tokens":325,"text_normalizer":"robust"})");
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.lm_quant() == "bf16");
+    EXPECT_TRUE(s.duration_tokens() == 325);
+    EXPECT_TRUE(s.text_normalizer() == "robust");
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  for (const char* bad : {
+           R"({"hf_dir":"/a","codec_dir":"/b","lm_quant":"w4"})",
+           R"({"hf_dir":"/a","codec_dir":"/b","duration_tokens":-1})",
+           R"({"hf_dir":"/a","codec_dir":"/b","text_normalizer":"x"})"}) {
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{},
+                        FlexData::from_json(bad));
+    EXPECT_FALSE(s.config_error().empty());
+  }
+}
+
+// The rest of the prompt's whole-utterance fields (quality, sound event,
+// ambient sound) and the reference wait: "None" / off unless set.
+TEST(text_to_speech_stage, prompt_fields_and_reference_wait) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.quality() == "None");
+    EXPECT_TRUE(s.sound_event() == "None");
+    EXPECT_TRUE(s.ambient_sound() == "None");
+    EXPECT_FALSE(s.wait_for_reference());
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/a","codec_dir":"/b","quality":"Studio recording",)"
+        R"("sound_event":"Laughter","ambient_sound":"Rain",)"
+        R"("wait_for_reference":true})");
+    TextToSpeechStage s(&sess, "tts", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.quality() == "Studio recording");
+    EXPECT_TRUE(s.sound_event() == "Laughter");
+    EXPECT_TRUE(s.ambient_sound() == "Rain");
+    EXPECT_TRUE(s.wait_for_reference());
+    EXPECT_TRUE(s.config_error().empty());
+  }
+}
+
 TEST(text_to_speech_stage, type_is_registered) {
   EXPECT_TRUE(string_view(TextToSpeechStage::kTypeName)
               == "text-to-speech");
@@ -433,6 +492,9 @@ TEST(text_to_speech_stage, metal_voice_lock_smoke) {
     o.insert("codec_dir", FlexData::make_string(cc));
     o.insert("max_new_tokens", FlexData::make_int(512));
     o.insert("voice_lock", FlexData::make_bool(true));
+    // One PCM beat per utterance, so the count below is a count of
+    // utterances: the delay-pattern variant streams in chunks by default.
+    o.insert("stream_chunk_frames", FlexData::make_int(0));
     // voice_lock spans multiple beats, so both must generate fully -- opt out
     // of the default barge-in (which would abort the first beat the instant the
     // second is queued, leaving nothing to design the locked voice from).

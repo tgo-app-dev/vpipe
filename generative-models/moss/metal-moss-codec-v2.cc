@@ -997,4 +997,47 @@ MetalMossCodecV2::encode_rvq_(const SharedBuffer& hidden, int T)
   return codes;
 }
 
+std::size_t
+MetalMossCodecV2::resident_bytes() const
+{
+  auto qw = [&](const SharedBuffer& b) { return b.byte_size(); };
+  std::size_t n = _rvq_outw.byte_size() + _rvq_outb.byte_size() +
+                  _rvq_inw.byte_size() + _rvq_inb.byte_size() +
+                  _inv_freq.byte_size();
+  for (const auto* v : {&_codebook, &_q_outw, &_q_outb, &_q_inw, &_q_inb,
+                        &_codebook_norm}) {
+    for (const auto& b : *v) { n += b.byte_size(); }
+  }
+  for (const auto* stages : {&_stages, &_enc_stages}) {
+    for (const Stage& st : *stages) {
+      n += qw(st.in_proj) + qw(st.out_proj);
+      for (const Layer& ly : st.layers) {
+        n += ly.n1w.byte_size() + ly.n1b.byte_size() + ly.n2w.byte_size() +
+             ly.n2b.byte_size() + qw(ly.qkvw) + qw(ly.ow) + qw(ly.fc1) +
+             qw(ly.fc2);
+      }
+    }
+  }
+  return n;
+}
+
+std::size_t
+MetalMossCodecV2::plan_bytes(const std::string& model_dir, bool with_encoder)
+{
+  auto wts = MetalLlamaWeights::open_model(model_dir);
+  if (!wts.has_value()) { return 0; }
+  std::size_t n = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    const bool enc = nm.rfind("encoder.", 0) == 0 ||
+                     nm.rfind("quantizer.input_proj", 0) == 0;
+    if (enc && !with_encoder) { continue; }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    // Held at f16: half of an F32 tensor, as-is otherwise.
+    n += ti->dtype == "F32" ? (std::size_t)ti->nbytes / 2
+                            : (std::size_t)ti->nbytes;
+  }
+  return n;
+}
+
 }  // namespace vpipe::genai

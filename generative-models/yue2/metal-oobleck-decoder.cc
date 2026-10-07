@@ -385,13 +385,23 @@ void
 MetalOobleckDecoder::decode_cost(int frames, std::size_t* pcm,
                                  std::size_t* arena) const
 {
+  std::size_t bound = 0;
+  decode_cost(_cfg, _core, frames, &bound, arena);
   *pcm = (std::size_t)std::max(0, natural_length(frames)) *
          (std::size_t)_cfg.out_channels * 4;
+}
+
+void
+MetalOobleckDecoder::decode_cost(const Config& c, int core, int frames,
+                                 std::size_t* pcm, std::size_t* arena)
+{
+  *pcm = (std::size_t)std::max(0, frames) * (std::size_t)c.hop() *
+         (std::size_t)c.out_channels * 4;
   // A tile's widest activation is about hop * frames * channels at the
   // last stage; three of them, the pre-fold and the im2col band.
-  const std::size_t tf = (std::size_t)(_core + 2 * _cfg.halo_frames);
+  const std::size_t tf = (std::size_t)(std::max(core, 1) + 2 * c.halo_frames);
   const std::size_t act =
-      tf * (std::size_t)_cfg.hop() * (std::size_t)_cfg.channels * 2;
+      tf * (std::size_t)c.hop() * (std::size_t)c.channels * 2;
   *arena = 5 * act + kColCap * 2;
 }
 

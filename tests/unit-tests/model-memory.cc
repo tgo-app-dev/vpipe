@@ -1484,6 +1484,21 @@ TEST(model_memory, a_decode_arena_is_estimated_from_the_vae_config)
   EXPECT_TRUE(model_memory::vae_decode_scratch_bytes(root.string(), 1024, 1024)
               == (std::size_t)1024 * 1024 * 256 * 27);
 
+  // VOSR's autoencoder is `Qwen-Image-vae-2d/` under the model's root
+  // (where the decoder finds it, resolve_vae_dir), the 2-D class of the
+  // same network: the same peak -- not the nothing a `vae/`-only read
+  // declared.
+  fs::remove_all(root / "vae", ec);
+  fs::create_directories(root / "Qwen-Image-vae-2d", ec);
+  {
+    std::ofstream f(root / "Qwen-Image-vae-2d" / "config.json");
+    f << "{\"_class_name\": \"AutoencoderKLQwenImage2D\", "
+         "\"base_dim\": 96}";
+  }
+  EXPECT_TRUE(model_memory::vae_decode_scratch_bytes(root.string(), 1280, 704)
+              == (std::size_t)1280 * 704 * 96 * 27);
+  fs::remove_all(root / "Qwen-Image-vae-2d", ec);
+
   // No readable config at all is 0, not a guess: a caller that gets 0
   // falls back to its old behaviour rather than to a number nobody
   // computed.

@@ -1,0 +1,49 @@
+{
+  "id": "moss-tts-v1.5-speak",
+  "stages": [
+    {
+      "id": "load-text",
+      "type": "load-text",
+      "iports": [],
+      "config": {
+        "path": [
+          "speech-1.txt",
+          "speech-2.txt"
+        ]
+      }
+    },
+    {
+      "id": "speak",
+      "type": "text-to-speech",
+      "iports": [
+        {
+          "src": "load-text",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "local/MOSS-TTS-v1.5-8bit",
+        "codec_dir": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+        "language": "English",
+        "lm_quant": "w8",
+        "stream_chunk_frames": 0,
+        "interrupt_on_new_text": false,
+        "max_new_tokens": 2048
+      }
+    },
+    {
+      "id": "save-audio",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "speak",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "moss-tts-v1.5-%02d.wav"
+      }
+    }
+  ],
+  "subpipelines": []
+}

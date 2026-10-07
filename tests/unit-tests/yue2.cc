@@ -27,11 +27,14 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage-registry.h"
 #include "pipeline/typed-stage.h"
+#include "stages/audio-transcribe-stage.h"
 #include "stages/audio-vae-decode-stage.h"
+#include "stages/audio-video/audio-temporal-resample-stage.h"
 #include "stages/generate-audio-stage.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/weight-set.h"
 #include "generative-models/yue2/metal-oobleck-decoder.h"
 #include "generative-models/yue2/metal-yue2-model.h"
 #include "generative-models/yue2/yue2-protocol.h"
@@ -315,6 +318,14 @@ TEST(yue2, tokenizer_and_prefixes_match_reference)
 
 // ---- the AR decode ---------------------------------------------------------
 
+// Two holdings of the AR stack, against the same reference:
+//
+//   bf16  as published: logits within 1.5x the reference's own bf16
+//         error, greedy token-exact through every mask and penalty
+//   w8    its projections built affine w8 group-64 in memory
+//         (Config::ar_quant_bits): logits held to a quantization bar, and
+//         every fp32-DECISIVE pick still agrees. Free greedy runs are
+//         reported, not held: a near-tie may land either side.
 TEST(yue2, ar_matches_reference)
 {
   const std::string mp = env_("VPIPE_YUE2_TEST_MODEL_PATH");
@@ -324,113 +335,136 @@ TEST(yue2, ar_matches_reference)
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  std::string err;
-  auto m = MetalYue2Model::load(mp, mc, &err);
-  if (m == nullptr) { std::printf("[yue2] load: %s\n", err.c_str()); }
-  ASSERT_TRUE(m != nullptr);
-  if (m == nullptr) { return; }
+  for (int qb : {0, 8}) {
+    const bool w8 = qb == 8;
+    const char* arm = w8 ? "w8" : "bf16";
+    std::string err;
+    MetalYue2Model::Config mcfg;
+    ASSERT_TRUE(MetalYue2Model::config_from_dir(mp, &mcfg, &err));
+    mcfg.ar_quant_bits = qb;
+    auto m = MetalYue2Model::load(WeightSet::open(mp, nullptr), mc, mcfg, &err);
+    if (m == nullptr) { std::printf("[yue2] load: %s\n", err.c_str()); }
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    EXPECT_TRUE(m->ar_quantized() == w8);
+    // The figure the stage books before loading is what the model holds
+    // (the host-widened time embedder is the only difference, ~9 MB).
+    const std::size_t plan = MetalYue2Model::weight_bytes(mp, qb);
+    std::printf("[yue2] AR %s: %zu MB of weights held, %zu MB planned\n",
+                arm, m->resident_bytes() >> 20, plan >> 20);
+    EXPECT_TRUE(plan >= m->resident_bytes() &&
+                plan - m->resident_bytes() < ((std::size_t)16 << 20));
 
-  // Logits at the end of each prefix, over each phase's window.
-  struct L { const char* prefix; const char* logits; yue2::Phase ph; };
-  for (const L& c : {L{"prefix_abc.i32", "logits_abc.f32", yue2::Phase::kAbc},
-                     L{"prefix_sem.i32", "logits_sem.f32",
-                       yue2::Phase::kSemantic}}) {
-    const auto pre = read_raw_<std::int32_t>(golden / c.prefix);
-    const auto want = read_raw_<float>(golden / c.logits);
-    std::string f32 = c.logits;
-    f32.replace(f32.find(".f32"), 4, "_fp32.f32");
-    const auto exact = read_raw_<float>(golden / f32);
-    std::vector<float> got;
-    ASSERT_TRUE(m->prefill_logits(pre, &got, &err));
-    ASSERT_TRUE(got.size() == want.size() && exact.size() == want.size());
-    if (got.size() != want.size() || exact.size() != want.size()) { return; }
-    // The yardstick is the reference's OWN bf16 error against its fp32
-    // run: the music window's logits are small, so both sit near 2%.
-    const yue2::Window w = yue2::phase_window(c.ph);
-    const std::size_t o = (std::size_t)w.row0, n = (std::size_t)w.rows;
-    const double ref = rel_l2_(want.data() + o, exact.data() + o, n);
-    const double ours = rel_l2_(got.data() + o, exact.data() + o, n);
-    const double vs_ref = rel_l2_(got.data() + o, want.data() + o, n);
-    std::printf("[yue2] %s: vs fp32 %.4g (the reference's bf16: %.4g), "
-                "vs the bf16 reference %.4g\n", c.logits, ours, ref, vs_ref);
-    EXPECT_TRUE(ours < 1.5 * ref + 1e-3);
-  }
-
-  // Greedy, token for token, through the masks and the windowed penalty.
-  auto greedy = [&](const char* prefix, yue2::Phase ph, int n,
-                    const std::vector<std::int32_t>* neg, float cfg,
-                    bool legacy) {
-    yue2::Sampling s = ph == yue2::Phase::kAbc
-                           ? yue2::Sampling::abc_default()
-                           : yue2::Sampling::semantic_default();
-    s.temperature = 0.0f;
-    s.min_tokens = n;
-    s.max_tokens = n;
-    MetalYue2Model::DecodeResult res;
-    const auto pre = read_raw_<std::int32_t>(golden / prefix);
-    EXPECT_TRUE(m->decode(pre, ph, s, 1, neg, cfg, legacy, {}, &res, &err));
-    return res;
-  };
-  {
-    const auto want = read_raw_<std::int32_t>(golden / "abc_greedy.i32");
-    const auto res = greedy("prefix_abc.i32", yue2::Phase::kAbc,
-                            (int)want.size(), nullptr, 1.0f, false);
-    report_ids_("abc greedy", res.ids, want);
-    EXPECT_TRUE(res.ids == want);
-    std::printf("[yue2] abc: %zu tokens in %.2f s (prefill %.2f s)\n",
-                res.ids.size(), res.seconds, res.prefill_seconds);
-  }
-  {
-    // The music phase is full of near-ties (top-2 margins of a few
-    // hundredths are common, and the reference's own bf16 and fp32 runs
-    // disagree inside 48 tokens), so a free run is reported, not held.
-    // What IS held: teacher-forced along the reference's path, every pick
-    // whose fp32 margin is decisive matches.
-    const auto want = read_raw_<std::int32_t>(golden / "sem_greedy.i32");
-    const auto res = greedy("prefix_sem.i32", yue2::Phase::kSemantic,
-                            (int)want.size(), nullptr, 1.0f, false);
-    report_ids_("semantic greedy (free run)", res.ids, want);
-    const auto margin = read_raw_<float>(golden / "sem_tf_margin_fp32.f32");
-    const auto top = read_raw_<std::int32_t>(golden / "sem_tf_top_fp32.i32");
-    ASSERT_TRUE(margin.size() == want.size() && top.size() == want.size());
-    yue2::Sampling s = yue2::Sampling::semantic_default();
-    s.temperature = 0.0f;
-    s.min_tokens = (int)want.size();
-    s.max_tokens = (int)want.size();
-    std::vector<std::int32_t> picks;
-    const auto pre = read_raw_<std::int32_t>(golden / "prefix_sem.i32");
-    ASSERT_TRUE(m->decode_forced(pre, yue2::Phase::kSemantic, s, want,
-                                 &picks, &err));
-    int decided = 0, agree = 0, close_agree = 0, close = 0;
-    for (std::size_t k = 0; k < picks.size() && k < want.size(); ++k) {
-      if (margin[k] >= 0.25f && top[k] == want[k]) {
-        ++decided;
-        if (picks[k] == want[k]) { ++agree; }
-        else {
-          std::printf("[yue2] step %zu: got %d want %d (margin %.3f)\n", k,
-                      picks[k], want[k], margin[k]);
-        }
-      } else {
-        ++close;
-        if (picks[k] == want[k]) { ++close_agree; }
-      }
+    // Logits at the end of each prefix, over each phase's window.
+    struct L { const char* prefix; const char* logits; yue2::Phase ph; };
+    for (const L& c : {L{"prefix_abc.i32", "logits_abc.f32", yue2::Phase::kAbc},
+                       L{"prefix_sem.i32", "logits_sem.f32",
+                         yue2::Phase::kSemantic}}) {
+      const auto pre = read_raw_<std::int32_t>(golden / c.prefix);
+      const auto want = read_raw_<float>(golden / c.logits);
+      std::string f32 = c.logits;
+      f32.replace(f32.find(".f32"), 4, "_fp32.f32");
+      const auto exact = read_raw_<float>(golden / f32);
+      std::vector<float> got;
+      ASSERT_TRUE(m->prefill_logits(pre, &got, &err));
+      ASSERT_TRUE(got.size() == want.size() && exact.size() == want.size());
+      if (got.size() != want.size() || exact.size() != want.size()) { return; }
+      // The yardstick is the reference's OWN bf16 error against its fp32
+      // run: the music window's logits are small, so both sit near 2%.
+      const yue2::Window w = yue2::phase_window(c.ph);
+      const std::size_t o = (std::size_t)w.row0, n = (std::size_t)w.rows;
+      const double ref = rel_l2_(want.data() + o, exact.data() + o, n);
+      const double ours = rel_l2_(got.data() + o, exact.data() + o, n);
+      const double vs_ref = rel_l2_(got.data() + o, want.data() + o, n);
+      std::printf("[yue2] %s %s: vs fp32 %.4g (the reference's bf16: %.4g), "
+                  "vs the bf16 reference %.4g\n", arm, c.logits, ours, ref,
+                  vs_ref);
+      EXPECT_TRUE(ours < (w8 ? 2.0 : 1.5) * ref + 1e-3);
     }
-    std::printf("[yue2] semantic teacher-forced: %d/%d decided picks agree; "
-                "%d/%d near-ties agree\n", agree, decided, close_agree, close);
-    EXPECT_TRUE(decided >= 24 && agree == decided);
-  }
-  {
-    const auto want = read_raw_<std::int32_t>(golden / "off_cfg_greedy.i32");
-    const auto neg = read_raw_<std::int32_t>(golden / "negative_off.i32");
-    const auto res = greedy("prefix_off.i32", yue2::Phase::kSemantic,
-                            (int)want.size(), &neg, 1.01f, true);
-    report_ids_("cot=off CFG greedy", res.ids, want);
-    EXPECT_TRUE(res.ids == want);
+
+    // Greedy, token for token, through the masks and the windowed penalty.
+    auto greedy = [&](const char* prefix, yue2::Phase ph, int n,
+                      const std::vector<std::int32_t>* neg, float cfg,
+                      bool legacy) {
+      yue2::Sampling s = ph == yue2::Phase::kAbc
+                             ? yue2::Sampling::abc_default()
+                             : yue2::Sampling::semantic_default();
+      s.temperature = 0.0f;
+      s.min_tokens = n;
+      s.max_tokens = n;
+      MetalYue2Model::DecodeResult res;
+      const auto pre = read_raw_<std::int32_t>(golden / prefix);
+      EXPECT_TRUE(m->decode(pre, ph, s, 1, neg, cfg, legacy, {}, &res, &err));
+      return res;
+    };
+    {
+      const auto want = read_raw_<std::int32_t>(golden / "abc_greedy.i32");
+      const auto res = greedy("prefix_abc.i32", yue2::Phase::kAbc,
+                              (int)want.size(), nullptr, 1.0f, false);
+      report_ids_(w8 ? "abc greedy (w8)" : "abc greedy", res.ids, want);
+      if (!w8) { EXPECT_TRUE(res.ids == want); }
+      std::printf("[yue2] abc %s: %zu tokens in %.2f s (%.1f tok/s, prefill "
+                  "%.2f s)\n", arm, res.ids.size(), res.seconds,
+                  res.seconds > 0 ? (double)res.ids.size() / res.seconds : 0.0,
+                  res.prefill_seconds);
+    }
+    {
+      // The music phase is full of near-ties (top-2 margins of a few
+      // hundredths are common, and the reference's own bf16 and fp32 runs
+      // disagree inside 48 tokens), so a free run is reported, not held.
+      // What IS held: teacher-forced along the reference's path, every pick
+      // whose fp32 margin is decisive matches.
+      const auto want = read_raw_<std::int32_t>(golden / "sem_greedy.i32");
+      const auto res = greedy("prefix_sem.i32", yue2::Phase::kSemantic,
+                              (int)want.size(), nullptr, 1.0f, false);
+      report_ids_("semantic greedy (free run)", res.ids, want);
+      const auto margin = read_raw_<float>(golden / "sem_tf_margin_fp32.f32");
+      const auto top = read_raw_<std::int32_t>(golden / "sem_tf_top_fp32.i32");
+      ASSERT_TRUE(margin.size() == want.size() && top.size() == want.size());
+      yue2::Sampling s = yue2::Sampling::semantic_default();
+      s.temperature = 0.0f;
+      s.min_tokens = (int)want.size();
+      s.max_tokens = (int)want.size();
+      std::vector<std::int32_t> picks;
+      const auto pre = read_raw_<std::int32_t>(golden / "prefix_sem.i32");
+      ASSERT_TRUE(m->decode_forced(pre, yue2::Phase::kSemantic, s, want,
+                                   &picks, &err));
+      int decided = 0, agree = 0, close_agree = 0, close = 0;
+      for (std::size_t k = 0; k < picks.size() && k < want.size(); ++k) {
+        if (margin[k] >= 0.25f && top[k] == want[k]) {
+          ++decided;
+          if (picks[k] == want[k]) { ++agree; }
+          else {
+            std::printf("[yue2] step %zu: got %d want %d (margin %.3f)\n", k,
+                        picks[k], want[k], margin[k]);
+          }
+        } else {
+          ++close;
+          if (picks[k] == want[k]) { ++close_agree; }
+        }
+      }
+      std::printf("[yue2] semantic teacher-forced %s: %d/%d decided picks "
+                  "agree; %d/%d near-ties agree\n", arm, agree, decided,
+                  close_agree, close);
+      EXPECT_TRUE(decided >= 24 && agree == decided);
+    }
+    {
+      const auto want = read_raw_<std::int32_t>(golden / "off_cfg_greedy.i32");
+      const auto neg = read_raw_<std::int32_t>(golden / "negative_off.i32");
+      const auto res = greedy("prefix_off.i32", yue2::Phase::kSemantic,
+                              (int)want.size(), &neg, 1.01f, true);
+      report_ids_(w8 ? "cot=off CFG greedy (w8)" : "cot=off CFG greedy",
+                  res.ids, want);
+      if (!w8) { EXPECT_TRUE(res.ids == want); }
+    }
   }
 }
 
 // ---- the flow matching -----------------------------------------------------
 
+// The flow matching attends the AR stack's K/V, so it is held for both
+// AR holdings (see ar_matches_reference): bf16 within 1.5x the
+// reference's own bf16 error, w8 within a quantization bar.
 TEST(yue2, nar_matches_reference)
 {
   const std::string mp = env_("VPIPE_YUE2_TEST_MODEL_PATH");
@@ -440,67 +474,77 @@ TEST(yue2, nar_matches_reference)
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  std::string err;
-  auto m = MetalYue2Model::load(mp, mc, &err);
-  ASSERT_TRUE(m != nullptr);
-  if (m == nullptr) { return; }
-  std::printf("[yue2] NAR routes: %s GEMMs, %s attention\n",
-              m->uses_mma() ? "matmul2d" : "steel",
-              m->uses_attn_nax() ? "NAX" : "steel");
-  // ENGAGEMENT: both matrix-core routes wherever there are matrix cores,
-  // unless the A/B switches name them off.
-  EXPECT_TRUE(m->uses_mma() == (mc->supports_matrix_cores() &&
-                                std::getenv("VPIPE_YUE2_NO_MMA2") ==
-                                    nullptr));
-  EXPECT_TRUE(m->uses_attn_nax() ==
-              (mc->supports_matrix_cores() &&
-               std::getenv("VPIPE_YUE2_NO_NAX_ATTN") == nullptr));
+  for (int qb : {0, 8}) {
+    const bool w8 = qb == 8;
+    const char* arm = w8 ? "w8 AR" : "bf16 AR";
+    std::string err;
+    MetalYue2Model::Config mcfg;
+    ASSERT_TRUE(MetalYue2Model::config_from_dir(mp, &mcfg, &err));
+    mcfg.ar_quant_bits = qb;
+    auto m = MetalYue2Model::load(WeightSet::open(mp, nullptr), mc, mcfg,
+                                  &err);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    std::printf("[yue2] NAR routes: %s GEMMs, %s attention\n",
+                m->uses_mma() ? "matmul2d" : "steel",
+                m->uses_attn_nax() ? "NAX" : "steel");
+    // ENGAGEMENT: both matrix-core routes wherever there are matrix cores,
+    // unless the A/B switches name them off.
+    EXPECT_TRUE(m->uses_mma() == (mc->supports_matrix_cores() &&
+                                  std::getenv("VPIPE_YUE2_NO_MMA2") ==
+                                      nullptr));
+    EXPECT_TRUE(m->uses_attn_nax() ==
+                (mc->supports_matrix_cores() &&
+                 std::getenv("VPIPE_YUE2_NO_NAX_ATTN") == nullptr));
 
-  const auto ar = read_raw_<std::int32_t>(golden / "ar_tokens.i32");
-  const auto noise = read_raw_<float>(golden / "noise.f32");
-  ASSERT_TRUE(!ar.empty() && !noise.empty());
-  struct V { double raw; const char* file; };
-  for (const V& c : {V{20.0, "nar_v_t1.f32"}, V{0.0, "nar_v_t05.f32"}}) {
-    std::vector<float> v;
-    ASSERT_TRUE(m->velocity(ar, noise, c.raw, &v, &err));
-    const auto want = read_raw_<float>(golden / c.file);
-    std::string f32 = c.file;
-    f32.replace(f32.find(".f32"), 4, "_fp32.f32");
-    const auto exact = read_raw_<float>(golden / f32);
-    ASSERT_TRUE(v.size() == want.size() && exact.size() == want.size());
-    if (v.size() != want.size() || exact.size() != want.size()) { return; }
-    const double ref = rel_l2_(want.data(), exact.data(), v.size());
-    const double ours = rel_l2_(v.data(), exact.data(), v.size());
-    std::printf("[yue2] velocity raw_t=%g: vs fp32 %.4g (the reference's "
-                "bf16: %.4g), vs the bf16 reference %.4g\n", c.raw, ours,
-                ref, rel_l2_(v.data(), want.data(), v.size()));
-    EXPECT_TRUE(ours < 1.5 * ref + 1e-3);
-  }
+    const auto ar = read_raw_<std::int32_t>(golden / "ar_tokens.i32");
+    const auto noise = read_raw_<float>(golden / "noise.f32");
+    ASSERT_TRUE(!ar.empty() && !noise.empty());
+    struct V { double raw; const char* file; };
+    for (const V& c : {V{20.0, "nar_v_t1.f32"}, V{0.0, "nar_v_t05.f32"}}) {
+      std::vector<float> v;
+      ASSERT_TRUE(m->velocity(ar, noise, c.raw, &v, &err));
+      const auto want = read_raw_<float>(golden / c.file);
+      std::string f32 = c.file;
+      f32.replace(f32.find(".f32"), 4, "_fp32.f32");
+      const auto exact = read_raw_<float>(golden / f32);
+      ASSERT_TRUE(v.size() == want.size() && exact.size() == want.size());
+      if (v.size() != want.size() || exact.size() != want.size()) { return; }
+      const double ref = rel_l2_(want.data(), exact.data(), v.size());
+      const double ours = rel_l2_(v.data(), exact.data(), v.size());
+      std::printf("[yue2] %s velocity raw_t=%g: vs fp32 %.4g (the "
+                  "reference's bf16: %.4g), vs the bf16 reference %.4g\n",
+                  arm, c.raw, ours, ref,
+                  rel_l2_(v.data(), want.data(), v.size()));
+      EXPECT_TRUE(ours < (w8 ? 2.0 : 1.5) * ref + 1e-3);
+    }
 
-  // The whole ODE from the song's own noise (drawn here, not read): the
-  // prefix and codes are the golden's sampled run.
-  const auto prefix = read_raw_<std::int32_t>(golden / "prefix_sem.i32");
-  const auto codec = read_raw_<std::int32_t>(golden / "codec.i32");
-  const FlexData meta = read_json_(golden / "meta.json");
-  ASSERT_TRUE(meta.is_object());
-  if (!meta.is_object()) { return; }
-  auto mo = meta.as_object();
-  const std::uint64_t seed = (std::uint64_t)mo.at("seed").as_int();
-  struct S { int steps; const char* file; double tol; };
-  for (const S& c : {S{4, "nar_latents_s4.f32", 0.03},
-                     S{32, "nar_latents.f32", 0.05}}) {
-    std::vector<float> lat;
-    int calls = 0;
-    ASSERT_TRUE(m->synthesize(prefix, codec, seed, c.steps, &lat,
-                              [&](int, int) { ++calls; return true; },
-                              &err));
-    EXPECT_TRUE(calls == 2 * c.steps);
-    const auto want = read_raw_<float>(golden / c.file);
-    ASSERT_TRUE(lat.size() == want.size());
-    if (lat.size() != want.size()) { return; }
-    const double rl = rel_l2_(lat.data(), want.data(), lat.size());
-    std::printf("[yue2] latents (%d steps) rel-L2 %.4g\n", c.steps, rl);
-    EXPECT_TRUE(rl < c.tol);
+    // The whole ODE from the song's own noise (drawn here, not read): the
+    // prefix and codes are the golden's sampled run.
+    const auto prefix = read_raw_<std::int32_t>(golden / "prefix_sem.i32");
+    const auto codec = read_raw_<std::int32_t>(golden / "codec.i32");
+    const FlexData meta = read_json_(golden / "meta.json");
+    ASSERT_TRUE(meta.is_object());
+    if (!meta.is_object()) { return; }
+    auto mo = meta.as_object();
+    const std::uint64_t seed = (std::uint64_t)mo.at("seed").as_int();
+    struct S { int steps; const char* file; double tol; };
+    for (const S& c : {S{4, "nar_latents_s4.f32", 0.03},
+                       S{32, "nar_latents.f32", 0.05}}) {
+      std::vector<float> lat;
+      int calls = 0;
+      ASSERT_TRUE(m->synthesize(prefix, codec, seed, c.steps, &lat,
+                                [&](int, int) { ++calls; return true; },
+                                &err));
+      EXPECT_TRUE(calls == 2 * c.steps);
+      const auto want = read_raw_<float>(golden / c.file);
+      ASSERT_TRUE(lat.size() == want.size());
+      if (lat.size() != want.size()) { return; }
+      const double rl = rel_l2_(lat.data(), want.data(), lat.size());
+      std::printf("[yue2] %s latents (%d steps) rel-L2 %.4g\n", arm,
+                  c.steps, rl);
+      EXPECT_TRUE(rl < (w8 ? 2.0 : 1.0) * c.tol);
+    }
   }
 }
 
@@ -645,6 +689,98 @@ TEST(yue2, generate_audio_stage_surface)
   bad.as_object().insert("cot", FlexData::make_string("sideways"));
   GenerateAudioStage st2(&sess, "ga2", {}, std::move(bad));
   EXPECT_TRUE(st2.songs_emitted() == 0);
+  // lm_quant: w8 (the default) or bf16, nothing else.
+  for (const char* q : {"w8", "bf16", "w4"}) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string("x"));
+    c.as_object().insert("lm_quant", FlexData::make_string(q));
+    GenerateAudioStage st3(&sess, "ga3", {}, std::move(c));
+    EXPECT_TRUE(st3.config_error().empty() == (std::string(q) != "w4"));
+  }
+}
+
+// WHAT A SONG HOLDS, AS THE PLAN BOOKS IT -- no model needed: the figures
+// come from the config (here the defaults, as for a checkpoint with no
+// readable config) and the claims are what declare_resources() returns.
+//
+//   held          the AR pool (pages of 256 tokens, capacity grown by
+//                 DOUBLING and kept) + the NAR row scratch, UNPHASED --
+//                 neither is ever given back, so both are still there
+//                 while the VAE decodes
+//   ode           the flow matching's chunk K/V, denoise only
+//   audio-decode  the downstream Oobleck arena, decode-audio
+//   pcm           the PCM it hands on, decode-audio
+//
+// At the protocol's 9000-token cap behind a planned score the song phase
+// holds 56 + 1 pages: capacity 64, 1879 MB. cot=off plans no score but
+// asks for guidance (1.01), so it holds two shorter contexts, 82 pages:
+// capacity 128, exactly 64 pages (1879 MB) more. The stage had booked a
+// single context at a flat 112 KB a token, ~1.3 GB, for the denoise only.
+// MEASURED against a real song (120 s, cot=off, M4 Pro): 1060 MB held,
+// the figure this formula gives for that prompt's length.
+TEST(yue2, generate_audio_declares_what_a_song_holds)
+{
+  Session sess;
+  auto make = [&](const char* id, const char* cot, double max_s) {
+    FlexData cfg = FlexData::make_object();
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string("/nonexistent/yue2-plan"));
+    o.insert("cot", FlexData::make_string(cot));
+    o.insert("max_seconds", FlexData::make_real(max_s));
+    return std::make_unique<GenerateAudioStage>(
+        &sess, id, std::vector<InEdge>{}, std::move(cfg));
+  };
+  const std::size_t page = 256ull * 28 * 2 * 8 * 128 * 2;   // 29.4 MB
+  auto full = make("ga-full", "full", 0.0);
+  auto off = make("ga-off", "off", 0.0);
+  auto shortsong = make("ga-short", "full", 60.0);
+  const auto f = full->planned_song_bytes();
+  const auto g = off->planned_song_bytes();
+  const auto sh = shortsong->planned_song_bytes();
+  std::printf("[yue2] plan: held %zu MB (guided %zu, 60 s %zu) | ode %zu MB "
+              "| audio decode %zu MB, pcm %zu MB\n", f.held >> 20,
+              g.held >> 20, sh.held >> 20, f.transient >> 20,
+              f.decode >> 20, f.pcm >> 20);
+  // 9000 frames + the 5120-token plan prefix: 57 pages -> capacity 64.
+  const std::size_t rows = (std::size_t)(9000 + 2) *
+                           ((2 * 64 + 3 * 2048 + 4 * 2048 + 2 * 1024 +
+                             2 * 6144) * 2);
+  EXPECT_TRUE(f.held == 64 * page + rows);
+  EXPECT_TRUE(g.held - f.held == 64 * page);   // the second context
+  // 60 s = 1500 frames: 26 pages -> capacity 32, and far fewer rows.
+  EXPECT_TRUE(sh.held < f.held && sh.held >= 32 * page);
+  // The chunk: prefix + codes + END + START + latents + END, every layer.
+  EXPECT_TRUE(f.transient == (std::size_t)(5120 + 9000 + 1 + 9002) *
+                                 (page / 256));
+  // YuE2-Vae at its 256-frame tile; 48 kHz stereo f32 for 9000 frames.
+  EXPECT_TRUE(f.decode == 5ull * 288 * 1920 * 64 * 2 + (32ull << 20));
+  EXPECT_TRUE(f.pcm == 9000ull * 1920 * 2 * 4);
+
+  // The claims: one label per INSTANCE, each lifetime as what it is.
+  const auto claims = full->declare_resources();
+  int seen = 0;
+  for (const ResourceClaim& c : claims) {
+    if (c.kind != "activation-scratch") { continue; }
+    const std::string label = c.key.substr(0, c.key.find('|'));
+    if (label == "generate-audio:ga-full/held") {
+      EXPECT_TRUE(c.phase.empty());
+      ++seen;
+    } else if (label == "generate-audio:ga-full/ode") {
+      EXPECT_TRUE(c.phase == "denoise");
+      ++seen;
+    } else if (label == "generate-audio:ga-full/audio-decode") {
+      EXPECT_TRUE(c.phase == "decode-audio");
+      ++seen;
+    } else if (label == "generate-audio:ga-full/pcm") {
+      EXPECT_TRUE(c.phase == "decode-audio" &&
+                  c.last_phase == "decode-audio");
+      ++seen;
+    } else {
+      std::printf("[yue2] unexpected scratch claim '%s'\n", c.key.c_str());
+      EXPECT_TRUE(false);
+    }
+  }
+  EXPECT_TRUE(seen == 4);
 }
 
 // One short song from the stage's config, through audio-vae-decode: the
@@ -705,6 +841,177 @@ TEST(yue2, generate_audio_end_to_end)
   EXPECT_TRUE(pcm->samples >= 200 * 1920 - 64 &&
               pcm->samples <= 250 * 1920 - 64);
   EXPECT_TRUE(pcm->peak > 0.01 && pcm->peak <= 1.0 && pcm->rms > 1e-3);
+  // What the song left held beside the weights -- the AR pool at its
+  // high-water capacity and the NAR row scratch -- is inside what the
+  // plan booked for a song at this cap.
+  const std::size_t held = gen->held_scratch_bytes();
+  const std::size_t booked = gen->planned_song_bytes().held;
+  std::printf("[yue2] e2e: held beside the weights %zu MB, booked %zu MB\n",
+              held >> 20, booked >> 20);
+  EXPECT_TRUE(held > 0 && held <= booked);
+}
+
+// SUNG LYRICS, HEARD BACK: the listening check as a test. One short song
+// per AR holding (lm_quant bf16, then w8), same seed, through the stage,
+// the VAE, a downmix, a 16 kHz resample and Qwen3-ASR; held is the share
+// of the lyrics' words heard back. The songs are SAMPLED, so the two runs
+// are two performances, not one compared bit for bit -- the forced tests
+// above are where the holdings are compared. Opt-in (VPIPE_YUE2_ASR_CHECK
+// =1, plus VPIPE_QWEN3_ASR_TEST_MODEL_PATH): two songs are minutes.
+namespace {
+
+class Yue2Mono : public TypedStage<Yue2Mono> {
+public:
+  static constexpr const char* kTypeName = "ut-yue2-mono";
+  using TypedStage::TypedStage;
+  Job process(RuntimeContext& ctx) override
+  {
+    auto p = co_await ctx.read(0);
+    if (!p) { ctx.signal_done(); co_return; }
+    const auto* t = dynamic_cast<const TensorBeatPayload*>(p.get());
+    if (t == nullptr || t->dtype != TensorBeat::DType::F32 ||
+        t->shape.size() != 2) {
+      co_return;
+    }
+    const std::int64_t C = t->shape[0], N = t->shape[1];
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {1, N};
+    out->resize_contiguous((std::size_t)N);
+    const float* src = t->as_f32();
+    float* dst = out->as_f32();
+    for (std::int64_t i = 0; i < N; ++i) {
+      float acc = 0.0f;
+      for (std::int64_t c = 0; c < C; ++c) { acc += src[c * N + i]; }
+      dst[i] = acc / (float)C;
+    }
+    out->sideband = t->sideband;
+    co_await ctx.write(0, std::move(out));
+  }
+};
+
+class Yue2Transcript : public TypedStage<Yue2Transcript> {
+public:
+  static constexpr const char* kTypeName = "ut-yue2-transcript";
+  using TypedStage::TypedStage;
+  std::string text;
+  Job process(RuntimeContext& ctx) override
+  {
+    auto p = co_await ctx.read(0);
+    if (!p) { ctx.signal_done(); co_return; }
+    if (const auto* f = dynamic_cast<const FlexDataPayload*>(p.get())) {
+      if (f->data.is_object() && f->data.as_object().contains("text")) {
+        text = std::string(f->data.as_object().at("text").as_string(""));
+      }
+    }
+  }
+};
+
+// Lower-case words; section tags ("[Verse]") and Qwen3-ASR's leading
+// "language X<asr_text>" dropped.
+std::vector<std::string>
+lyric_words_(std::string s)
+{
+  const std::size_t tag = s.find("<asr_text>");
+  if (tag != std::string::npos) { s = s.substr(tag + 10); }
+  std::vector<std::string> out;
+  std::string w;
+  bool in_tag = false;
+  for (unsigned char ch : s) {
+    if (ch == '[') { in_tag = true; continue; }
+    if (ch == ']') { in_tag = false; continue; }
+    if (in_tag) { continue; }
+    if (std::isalnum(ch) || ch == '\'') {
+      w.push_back((char)std::tolower(ch));
+    } else if (!w.empty()) {
+      out.push_back(w);
+      w.clear();
+    }
+  }
+  if (!w.empty()) { out.push_back(w); }
+  return out;
+}
+
+}  // namespace
+
+TEST(yue2, sung_lyrics_transcribe)
+{
+  const std::string mp = env_("VPIPE_YUE2_TEST_MODEL_PATH");
+  const std::string vp = env_("VPIPE_YUE2_VAE_TEST_MODEL_PATH");
+  const std::string ap = env_("VPIPE_QWEN3_ASR_TEST_MODEL_PATH");
+  if (mp.empty() || vp.empty() || ap.empty() ||
+      env_("VPIPE_YUE2_ASR_CHECK").empty()) {
+    return;
+  }
+  const std::string lyrics =
+      "[Verse]\nCity lights are calling me\nI can hear the river sing\n"
+      "[Chorus]\nTonight we never sleep\nTonight the stars are ours to keep\n";
+  const std::vector<std::string> said = lyric_words_(lyrics);
+  for (const char* q : {"bf16", "w8"}) {
+    Session sess;
+    Pipeline pl(std::string("yue2-asr-") + q, &sess);
+    FlexData cfg = FlexData::make_object();
+    {
+      auto o = cfg.as_object();
+      o.insert("hf_dir", FlexData::make_string(mp));
+      o.insert("style", FlexData::make_string(
+                            "Pop, clear female vocal, piano, soft drums"));
+      o.insert("lyrics", FlexData::make_string(lyrics));
+      o.insert("cot", FlexData::make_string("melody"));
+      o.insert("max_seconds", FlexData::make_real(30.0));
+      o.insert("seed", FlexData::make_int(20261004));
+      o.insert("lm_quant", FlexData::make_string(q));
+    }
+    auto* gen = static_cast<GenerateAudioStage*>(pl.insert_stage(
+        std::make_unique<GenerateAudioStage>(
+            &sess, "gen", std::vector<InEdge>{}, std::move(cfg))));
+    FlexData vcfg = FlexData::make_object();
+    vcfg.as_object().insert("hf_dir", FlexData::make_string(vp));
+    auto* dec = pl.insert_stage(std::make_unique<AudioVaeDecodeStage>(
+        &sess, "dec", std::vector<InEdge>{{gen, 0}}, std::move(vcfg)));
+    // A test-local stage has no spec, so no oports until it is given one.
+    auto mono_st = std::make_unique<Yue2Mono>(
+        &sess, "mono", std::vector<InEdge>{{dec, 0}}, FlexData::make_object());
+    mono_st->allocate_oports(1);
+    auto* mono = pl.insert_stage(std::move(mono_st));
+    FlexData rcfg = FlexData::make_object();
+    rcfg.as_object().insert("output_sample_rate", FlexData::make_int(16000));
+    auto* rs = pl.insert_stage(std::make_unique<AudioTemporalResampleStage>(
+        &sess, "resample", std::vector<InEdge>{{mono, 0}}, std::move(rcfg)));
+    FlexData acfg = FlexData::make_object();
+    {
+      auto o = acfg.as_object();
+      o.insert("hf_dir", FlexData::make_string(ap));
+      o.insert("max_new_tokens", FlexData::make_int(256));
+      o.insert("pcm_buffer_s", FlexData::make_real(60.0));
+    }
+    auto* asr = pl.insert_stage(std::make_unique<AudioTranscribeStage>(
+        &sess, "asr", std::vector<InEdge>{{rs, 0}}, std::move(acfg)));
+    auto* sink = static_cast<Yue2Transcript*>(pl.insert_stage(
+        std::make_unique<Yue2Transcript>(&sess, "sink",
+                                         std::vector<InEdge>{{asr, 0}},
+                                         FlexData::make_object())));
+    pl.insert_stage(std::make_unique<Yue2TextSink>(
+        &sess, "score", std::vector<InEdge>{{gen, 1}},
+        FlexData::make_object()));
+    PipelineRuntime rt(&pl, &sess);
+    ASSERT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    EXPECT_TRUE(gen->songs_emitted() == 1);
+    // Recall: the lyrics' words heard, each heard word used once.
+    std::vector<std::string> heard = lyric_words_(sink->text);
+    int hit = 0;
+    for (const std::string& w : said) {
+      auto it = std::find(heard.begin(), heard.end(), w);
+      if (it != heard.end()) { ++hit; heard.erase(it); }
+    }
+    const double recall = said.empty() ? 0.0 : (double)hit / said.size();
+    std::printf("[yue2] lm_quant %s: %d/%zu lyric words heard (%.2f)\n"
+                "  heard '%s'\n", q, hit, said.size(), recall,
+                sink->text.c_str());
+    EXPECT_TRUE(recall >= 0.5);
+  }
 }
 
 // ---- the flow-matching tiers -------------------------------------------------

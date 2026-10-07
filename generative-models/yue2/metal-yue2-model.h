@@ -73,6 +73,13 @@ public:
     int   max_latent_frames = 24576;
     float timestep_shift    = 1.0f;
     int   context    = yue2::kContext;
+    // How the AR stack is held. 8: its projections as affine w8 group-64,
+    // built in memory from the bf16 checkpoint as each layer loads
+    // (MetalQwenModel::Config::load_quant_bits) -- ~53% of their bytes,
+    // and the song phase's decode reads every one per token. 0: bf16, as
+    // published. The NAR stack, the embedding and the head stay bf16.
+    // Not read from config.json: the caller's choice.
+    int   ar_quant_bits = 0;
   };
 
   // config.json with model_type "yue2" (and latent_type "vae", the only
@@ -95,6 +102,13 @@ public:
 
   const Config& config() const { return _cfg; }
   MetalQwenModel* backbone() { return _lm.get(); }
+  // Whether the AR stack was built w8 in memory (ar_quant_bits 8 on a
+  // checkpoint whose AR stack the backbone can build).
+  bool ar_quantized() const;
+  // What a model loaded from `dir` will hold in weights, from the
+  // checkpoint alone -- for a stage that books before anything loads.
+  // `ar_quant_bits` as Config::ar_quant_bits; 0 when `dir` is unreadable.
+  static std::size_t weight_bytes(const std::string& dir, int ar_quant_bits);
 
   // ---- AR ---------------------------------------------------------------
   struct DecodeResult {
@@ -220,6 +234,28 @@ public:
   // What this model holds: its own tensors plus the backbone's.
   std::size_t resident_bytes() const;
 
+  // What a song holds BESIDE the weights, for a stage that has to plan
+  // before anything loads. `prefix` is the longest prompt prefix the song
+  // phase sees (style, lyrics and score), `frames` its latent rows -- one
+  // per song token -- and `guided` whether the song phase decodes a
+  // negative context beside it (CFG).
+  //
+  //   held       allocated by a song and never given back: the AR pool,
+  //              whose Metal pages grow by DOUBLING and keep their high-
+  //              water capacity, and the NAR row scratch (grow-only).
+  //              Alive for the rest of the run, whatever phase it is.
+  //   transient  allocated and freed inside one song: the flow matching's
+  //              head-major copy of the chunk's K/V, or the pool's old
+  //              capacity while a doubling copies it, whichever is larger.
+  struct RunBytes {
+    std::size_t held = 0, transient = 0;
+  };
+  static RunBytes run_bytes(const Config& c, int prefix, int frames,
+                            bool guided);
+  // The held term as it stands NOW: the AR pool's capacity plus the NAR
+  // row scratch. For checking run_bytes() against a real song.
+  std::size_t held_scratch_bytes() const;
+
   // Whether the M5 matrix-core GEMM / attention routes were selected.
   bool uses_mma() const { return _use_mma; }
   bool uses_attn_nax() const { return _use_nax; }
@@ -275,6 +311,8 @@ private:
   bool eval_(Chunk& c, const std::vector<float>& state, double raw_t,
              std::vector<float>* v, std::string* err);
   bool ensure_scratch_(int rows);
+  // Bytes ensure_scratch_ allocates per row; run_bytes() books them.
+  static std::size_t nar_row_bytes_(const Config& c);
   void time_embedding_(double raw_t, std::vector<std::uint16_t>* out) const;
   bool ane_setup_(int seq);
   bool ane_eligible_(int L) const;

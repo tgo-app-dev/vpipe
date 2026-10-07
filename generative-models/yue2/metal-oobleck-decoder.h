@@ -94,6 +94,14 @@ public:
   // What a decode of `frames` costs: `pcm` is the planar f32 output this
   // hands downstream, `arena` the scratch a tile allocates.
   void decode_cost(int frames, std::size_t* pcm, std::size_t* arena) const;
+  // The same from a config alone, for a stage that has to plan before any
+  // VAE is loaded -- the generator, which is the one that knows how long
+  // the song can be. The arena is exact for tile `core`; the PCM is
+  // bounded by frames * hop (the natural length is a few samples short).
+  static void decode_cost(const Config& c, int core, int frames,
+                          std::size_t* pcm, std::size_t* arena);
+  // The tile a freshly loaded decoder decodes in.
+  static constexpr int kDefaultCoreFrames = 256;
 
   // Called once per tile with (done, total). Return false to stop.
   using ProgressFn = std::function<bool(int done, int total)>;
@@ -177,7 +185,7 @@ private:
 
   // Scratch for one tile: three activations at the widest stage, the
   // transposed convolutions' pre-fold GEMM output, and a banded im2col.
-  int _core = 256;
+  int _core = kDefaultCoreFrames;
   int _tile_frames = 0;
   metal_compute::SharedBuffer _a, _b, _c, _pre, _col;
   std::size_t _col_cap = 0;

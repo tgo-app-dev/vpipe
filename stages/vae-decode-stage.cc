@@ -1,5 +1,6 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
+#include "common/host-report.h"
 #include "common/beat-keys.h"
 
 #include <cstring>
@@ -1453,6 +1454,40 @@ VaeDecodeStage::process(RuntimeContext& ctx)
               "{}x{} decode (~{} MB of output)", this->id(), parked >> 20,
               out_frames, lw * vc.patch, lh * vc.patch, need >> 20));
         } else {
+          // For the host to act on (common/host-report.h).
+          FlexData d = FlexData::make_object();
+          auto o = d.as_object();
+          auto u = [](std::size_t b) { return FlexData::make_uint(b); };
+          o.insert("stage", FlexData::make_string(this->id()));
+          o.insert("step", FlexData::make_string("decode"));
+          o.insert("frames", u(out_frames));
+          o.insert("width", u((std::size_t)(lw * vc.patch)));
+          o.insert("height", u((std::size_t)(lh * vc.patch)));
+          o.insert("need", u(need));
+          FlexData parts = FlexData::make_array();
+          for (const auto& [name, b] :
+               {std::pair<const char*, std::size_t>{"decoded_frames",
+                                                    px * 3 * 2},
+                {"frames_u8", px * 3}}) {
+            FlexData e = FlexData::make_object();
+            e.as_object().insert("name", FlexData::make_string(name));
+            e.as_object().insert("bytes", u(b));
+            parts.as_array().push_back(std::move(e));
+          }
+          o.insert("parts", std::move(parts));
+          FlexData gates = FlexData::make_array();
+          {
+            FlexData e = FlexData::make_object();
+            auto eo = e.as_object();
+            eo.insert("name", FlexData::make_string("reclaimable_ram"));
+            eo.insert("need", u(need));
+            eo.insert("have", u(mb.available_physical));
+            eo.insert("ok", FlexData::make_bool(false));
+            gates.as_array().push_back(std::move(e));
+          }
+          o.insert("gates", std::move(gates));
+          o.insert("parked", u(parked));
+          host_report(session(), "memory", std::move(d));
           session()->error(fmt(
               "VaeDecodeStage('{}'): not enough memory to decode {} frames "
               "at {}x{} -- the output alone is ~{} MB and only ~{} MB is "

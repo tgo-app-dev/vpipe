@@ -5,6 +5,7 @@
 #include "common/beat-keys.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -43,6 +44,11 @@ constexpr ConfigKey kAttrs[] = {
    .def_real = 0},
   {.key = "max_frames", .type = ConfigType::Uint, .required = false,
    .doc = "stop after this many frames; 0 (the default) = no limit",
+   .def_uint = 0},
+  {.key = "oport_capacity", .type = ConfigType::Uint, .required = false,
+   .doc = "frames read ahead of the consumer, at most (backpressure); 0 "
+          "(the default) = 4. A 4K F16 frame is 50 MB: the decoder runs "
+          "faster than an encoder, and unbounded it filled memory",
    .def_uint = 0},
 };
 const PortSpec kOports[] = {
@@ -96,7 +102,10 @@ AvfLoadVideoStage::AvfLoadVideoStage(const SessionContextIntf* s,
   _start_s = attr_real("start_s");
   _duration_s = attr_real("duration_s");
   _max_frames = attr_uint("max_frames");
+  unsigned cap = static_cast<unsigned>(attr_uint("oport_capacity"));
   allocate_oports(kSpec.oports.size());
+  // A few frames ahead, no more: the reader waits for its consumer.
+  set_oport_policy(0, {cap > 0 ? cap : 4u, OverrunPolicy::Backpressure});
 }
 
 AvfLoadVideoStage::~AvfLoadVideoStage() = default;

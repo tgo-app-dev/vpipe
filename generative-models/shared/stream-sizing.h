@@ -38,10 +38,11 @@
 //                          replaced it with shared/block-residency.h,
 //                          which grows a resident set by MEASURING and
 //                          sheds when it finds its own pages outside
-//                          RAM. metal-qwen-model and metal-gemma-model
-//                          keep it because they have nothing to grow
-//                          into. Give them BlockResidency and this half
-//                          goes.
+//                          RAM. The prefill-only text encoders
+//                          (metal-qwen-model, metal-gemma-model) keep
+//                          it; a decoding qwen backbone that streams
+//                          (Config::stream_decode) grows a resident set
+//                          by measurement and never reads it.
 //
 // ---- the pinned prefix ------------------------------------------------
 //

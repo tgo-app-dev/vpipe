@@ -51,7 +51,14 @@ arch_tag_(const std::string& model_type)
   };
   if (model_type == "moss_tts_local")    { return "moss-tts-local"; }
   if (model_type == "moss_tts_realtime") { return "moss-tts-realtime"; }
-  if (model_type == "moss_tts")          { return "moss-tts"; }
+  // The delay-pattern MOSS-TTS 8B / MOSS-TTS-v1.5 as OpenMOSS publishes
+  // them ("moss_tts_delay"; MLX conversions say "moss_tts"). Unmatched, it
+  // fell through as its own tag, quant_embeddings switched on, and the
+  // pack's embedding tables and heads -- which the loader reads as bf16 --
+  // came out quantized.
+  if (model_type == "moss_tts" || model_type == "moss_tts_delay") {
+    return "moss-tts";
+  }
   if (starts("qwen3_5"))              { return "qwen3.5"; }
   if (model_type == "qwen3")          { return "qwen3"; }
   if (model_type == "qwen2")          { return "qwen2"; }

@@ -1,4 +1,5 @@
 #include "common/session.h"
+#include "common/host-report.h"
 #include "common/db-log-delegate.h"
 #include "common/diagnostic-capture.h"
 #include "common/ffmpeg-libraries.h"
@@ -1321,6 +1322,71 @@ SessionIntf::progress_version() const
 {
   const auto* s = dynamic_cast<const Session*>(this);
   return s != nullptr ? s->ui_delegate().progress_version() : 0;
+}
+
+void
+host_report(const SessionContextIntf* session, string kind, FlexData data)
+{
+  const auto* s = dynamic_cast<const Session*>(session);
+  if (s == nullptr) {
+    return;
+  }
+  auto* self = const_cast<Session*>(s);
+  std::lock_guard<std::mutex> lk(self->_reports_mu);
+  Session::HostReport r;
+  r.id = ++self->_report_id;
+  r.kind = std::move(kind);
+  r.data = std::move(data);
+  r.at = chrono::steady_clock::now();
+  self->_reports.push_back(std::move(r));
+  while (self->_reports.size() > Session::kReportsKept) {
+    self->_reports.pop_front();
+  }
+}
+
+// SessionIntf's structured reports (common/host-report.h). Non-virtual,
+// as progress() is.
+FlexData
+SessionIntf::reports() const
+{
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  FlexData arr = FlexData::make_array();
+  const auto* s = dynamic_cast<const Session*>(this);
+  if (s == nullptr) {
+    oo.insert("version", FlexData::make_uint(0));
+    oo.insert("items", std::move(arr));
+    return o;
+  }
+  std::lock_guard<std::mutex> lk(s->_reports_mu);
+  oo.insert("version", FlexData::make_uint(s->_report_id));
+  auto a = arr.as_array();
+  const auto now = chrono::steady_clock::now();
+  for (const auto& r : s->_reports) {
+    FlexData e = FlexData::make_object();
+    auto eo = e.as_object();
+    eo.insert("id", FlexData::make_uint(r.id));
+    eo.insert("kind", FlexData::make_string(r.kind));
+    eo.insert("data", r.data);
+    const auto ms =
+        chrono::duration_cast<chrono::milliseconds>(now - r.at).count();
+    eo.insert("age_ms",
+              FlexData::make_uint(static_cast<uint64_t>(ms < 0 ? 0 : ms)));
+    a.push_back(std::move(e));
+  }
+  oo.insert("items", std::move(arr));
+  return o;
+}
+
+uint64_t
+SessionIntf::reports_version() const
+{
+  const auto* s = dynamic_cast<const Session*>(this);
+  if (s == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(s->_reports_mu);
+  return s->_report_id;
 }
 
 void

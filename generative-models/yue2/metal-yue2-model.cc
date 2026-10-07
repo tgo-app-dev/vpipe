@@ -194,6 +194,10 @@ MetalYue2Model::init_(const std::shared_ptr<WeightSet>& ws, MetalCompute* mc,
   q.use_bf16           = true;
   q.dense              = true;
   q.zero_centered_norm = false;           // plain Qwen3 RMSNorm
+  // The affine kernels are chosen for this width whether or not the stack
+  // is quantized; a w8 build needs them to be the w8 ones.
+  q.quant_bits         = 8;
+  q.load_quant_bits    = cfg.ar_quant_bits == 8 ? 8 : 0;
   q.attn_output_gate   = false;
   q.qk_norm            = true;
   q.backbone_only      = true;            // embed + head are ours
@@ -327,19 +331,101 @@ MetalYue2Model::resident_bytes() const
 {
   std::size_t b = _embed.byte_size() + _head.byte_size() +
                   _final_ln.byte_size() + _vae2llm_w.byte_size() +
-                  _llm2vae_w.byte_size() + _pos.byte_size();
+                  _vae2llm_b.byte_size() + _llm2vae_w.byte_size() +
+                  _llm2vae_b.byte_size() + _pos.byte_size();
   for (const NarLayer& n : _nar) {
-    b += n.q.byte_size() + n.k.byte_size() + n.v.byte_size() +
-         n.o.byte_size() + n.gate.byte_size() + n.up.byte_size() +
-         n.down.byte_size();
+    b += n.in_ln.byte_size() + n.mlp_ln.byte_size() + n.q.byte_size() +
+         n.k.byte_size() + n.v.byte_size() + n.o.byte_size() +
+         n.q_norm.byte_size() + n.k_norm.byte_size() + n.gate.byte_size() +
+         n.up.byte_size() + n.down.byte_size();
   }
-  // The AR stack: four projections and the MLP per layer, bf16.
-  const std::size_t H = (std::size_t)_cfg.hidden;
-  const std::size_t qd = (std::size_t)_cfg.n_heads * _cfg.head_dim;
-  const std::size_t kd = (std::size_t)_cfg.n_kv_heads * _cfg.head_dim;
-  const std::size_t per_layer =
-      (H * (qd + 2 * kd) + qd * H + 3 * H * (std::size_t)_cfg.ffn) * 2;
-  b += per_layer * (std::size_t)_cfg.n_layers;
+  // The AR stack as the backbone holds it, not as the config implies.
+  if (_lm) { b += (std::size_t)_lm->resident_bytes(); }
+  return b;
+}
+
+bool
+MetalYue2Model::ar_quantized() const
+{
+  return _lm != nullptr && _lm->quantized_on_load();
+}
+
+std::size_t
+MetalYue2Model::weight_bytes(const std::string& dir, int ar_quant_bits)
+{
+  auto wts = MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return 0; }
+  std::size_t disk = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (const auto* ti = wts->info(nm)) { disk += (std::size_t)ti->nbytes; }
+  }
+  if (ar_quant_bits != 8) { return disk; }
+  Config c;
+  if (!config_from_dir(dir, &c)) { return disk; }
+  // The AR stack is the plain Qwen3 names under model.layers. (the NAR's
+  // are nar_*, which this does not count); built, it is w8.
+  const auto rs = MetalQwenModel::raw_sizes(*wts, "model.layers.",
+                                            c.n_layers, 8);
+  if (rs.n_layers != c.n_layers || rs.pack || rs.raw > disk) { return disk; }
+  return disk - rs.raw + rs.built;
+}
+
+std::size_t
+MetalYue2Model::nar_row_bytes_(const Config& c)
+{
+  // ensure_scratch_: the latent in and out, x / h / o at the hidden
+  // width, q and the head-major query and attention outputs at q width,
+  // k / v at kv width, gate and up at the feed-forward width. bf16.
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t qd = (std::size_t)c.n_heads * c.head_dim;
+  const std::size_t kvd = (std::size_t)c.n_kv_heads * c.head_dim;
+  const std::size_t F = (std::size_t)c.ffn;
+  const std::size_t Z = (std::size_t)c.latent_dim;
+  return (2 * Z + 3 * H + 4 * qd + 2 * kvd + 2 * F) * 2;
+}
+
+MetalYue2Model::RunBytes
+MetalYue2Model::run_bytes(const Config& c, int prefix, int frames,
+                          bool guided)
+{
+  RunBytes r;
+  if (frames <= 0) { return r; }
+  const std::size_t kv_tok = (std::size_t)c.n_layers * 2 *
+                             (std::size_t)c.n_kv_heads * c.head_dim * 2;
+  // The AR pool: MetalQwenModel's ContextManager, pages of kPage tokens,
+  // capacity grown by doubling from one page to cover the highest page
+  // id in use -- every page the song phase holds at once, both contexts
+  // when guided. Its cap (max_seq / page * 16) is far above any song.
+  constexpr int kPage = 256;   // MetalQwenModel::Config::page_tokens
+  const int ctx = std::min(c.context, prefix + frames);
+  const int per = (ctx + kPage - 1) / kPage + 1;   // + the page in progress
+  const int pages = guided ? 2 * per : per;
+  int cap = 1, prev = 0;
+  while (cap < pages) { prev = cap; cap *= 2; }
+  const std::size_t page_bytes = (std::size_t)kPage * kv_tok;
+  r.held = (std::size_t)cap * page_bytes +
+           (std::size_t)(frames + 2) * nar_row_bytes_(c);
+  // The chunk: its AR tokens (prefix, codes, MUSIC_END) and its NAR rows
+  // (START, latents, END), head-major, every layer.
+  const std::size_t chunk = (std::size_t)(ctx + 1 + frames + 2) * kv_tok;
+  r.transient = std::max(chunk, (std::size_t)prev * page_bytes);
+  return r;
+}
+
+std::size_t
+MetalYue2Model::held_scratch_bytes() const
+{
+  std::size_t b = 0;
+  if (_lm != nullptr) {
+    if (ContextManager* cm = _lm->context_manager()) {
+      b += cm->resident_bytes();
+    }
+  }
+  for (const SharedBuffer* p : {&_n_in, &_n_x, &_n_h, &_n_q, &_n_k, &_n_vv,
+                                &_n_qh, &_n_aoh, &_n_ao, &_n_o, &_n_g, &_n_u,
+                                &_n_v, &_n_t}) {
+    b += p->byte_size();
+  }
   return b;
 }
 

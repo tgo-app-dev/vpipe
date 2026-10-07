@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -291,6 +292,21 @@ private:
   // checked in those methods. With it, a swap can never race against
   // a worker-thread log() call so no extra synchronization is needed.
   std::unique_ptr<LogDelegateIntf> _delegate;
+
+  // Structured reports for the host (common/host-report.h): the latest
+  // kReportsKept, oldest first, each with the id SessionIntf::reports()
+  // gives it.
+  struct HostReport {
+    std::uint64_t                         id = 0;
+    std::string                           kind;
+    FlexData                              data;
+    std::chrono::steady_clock::time_point at;
+  };
+  static constexpr std::size_t kReportsKept = 32;
+  mutable std::mutex                        _reports_mu;
+  std::deque<HostReport>                    _reports;
+  std::uint64_t                             _report_id = 0;
+  friend void host_report(const SessionContextIntf*, std::string, FlexData);
 
   // The host's log listener (SessionIntf::set_log_listener), shared so a
   // reporting thread keeps the one it took while it is swapped.

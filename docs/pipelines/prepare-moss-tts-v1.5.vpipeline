@@ -1,0 +1,54 @@
+{
+  "id": "prepare-moss-tts-v1.5",
+  "stages": [
+    {
+      "id": "fetch-moss-tts-v1.5",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "OpenMOSS-Team/MOSS-TTS-v1.5",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-moss-audio-tokenizer",
+      "type": "model-fetch",
+      "iports": [
+        {
+          "src": "fetch-moss-tts-v1.5",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "model_path": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "quantize-moss-tts-v1.5-8bit",
+      "type": "model-quantize",
+      "iports": [
+        {
+          "src": "fetch-moss-audio-tokenizer",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "src_model": "OpenMOSS-Team/MOSS-TTS-v1.5",
+        "output_name": "local/MOSS-TTS-v1.5-8bit",
+        "bits": 8,
+        "group_size": 64,
+        "skip_existing": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

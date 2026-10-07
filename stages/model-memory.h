@@ -487,11 +487,11 @@ struct StreamPlan {
   // (BlockResidency), which is what a fraction of total RAM decided
   // before the run could never do.
   //
-  // The language models are not retired because they have nothing to
-  // grow into -- metal-qwen-model and metal-gemma-model pin a prefix of
-  // layers and have no residency policy behind it, so removing this
-  // would leave the text encoders streaming everything with no way back.
-  // Give them BlockResidency and this field goes too.
+  // The prefill-only text encoders keep it: they pin a prefix of layers
+  // with no residency policy behind it, so removing this would leave them
+  // streaming everything with no way back. A decoding backbone that
+  // streams (MetalQwenModel::Config::stream_decode) grows a resident set
+  // by measurement instead and does not read this.
   double      pin_frac  = 0.0;
   std::size_t footprint = 0;   // DiT + encoder + everything resident
   std::size_t others    = 0;   // the same, minus the DiT's own bytes

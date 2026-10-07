@@ -174,6 +174,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         moss-rt-driver.cc
         quant-arch-detect.cc
         moss-tts-local.cc
+        moss-tts-delay.cc
         krea2-encoder.cc
         krea2-dit.cc
         krea2-vae.cc

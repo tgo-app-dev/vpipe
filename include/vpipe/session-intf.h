@@ -211,6 +211,26 @@ public:
   FlexData      progress() const;
   std::uint64_t progress_version() const;
 
+  // ---- Reports, for a host to act on -----------------------------
+  //
+  // What a stage refused and why, as NUMBERS rather than the log's
+  // sentence: a host shows what a clip asked for and points at the
+  // setting that would make it fit, without parsing English that is
+  // free to change. The latest 32, oldest first:
+  //
+  //   {"version": u,
+  //    "items": [{"id": u, "kind": s, "data": {...}, "age_ms": u}, ...]}
+  //
+  // `kind` names the shape of `data` (common/host-report.h lists them:
+  // "memory", a refusal for lack of memory -- what it needed, part by
+  // part, and each budget's need and room; "memory-plan", the resource
+  // plan's peak by phase). Ids only grow and are never reused, and
+  // `version` is the newest: read reports_version() when a job starts
+  // and take the items above it when it ends. Safe from any thread.
+  // (Non-virtual, as progress() is.)
+  FlexData      reports() const;
+  std::uint64_t reports_version() const;
+
   // ---- The session's log, for a host ------------------------------
   //
   // Every line the session reports -- its stages' errors, warnings and

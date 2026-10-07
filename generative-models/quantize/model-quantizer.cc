@@ -1,5 +1,8 @@
 #include "generative-models/quantize/model-quantizer.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
+#include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -60,6 +63,42 @@ narrow_f32_bf16_(metal_compute::MetalCompute* mc,
     d[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
   }
   return out;
+}
+
+// bf16 [N, K] -> affine w8 group-64 with BF16 scales and biases, the codes
+// fit to the rounded pair: the kernel a bf16 model's in-memory w8 build
+// runs (affine_quant_rows_w8g64, bf16 library), so a pack written this way
+// holds exactly what that model would have built. False on any failure.
+bool
+quant_rows_bf16_(metal_compute::MetalCompute* mc,
+                 const metal_compute::SharedBuffer& in, int N, int K,
+                 metal_compute::SharedBuffer& w, metal_compute::SharedBuffer& s,
+                 metal_compute::SharedBuffer& b)
+{
+  if (mc == nullptr || K % 64 != 0 || N <= 0) { return false; }
+  metal_compute::ComputeLibrary lib = mc->load_library("affine_dequant_bf16");
+  metal_compute::ComputeFunction fn = lib.function("affine_quant_rows_w8g64");
+  if (!fn.valid()) { return false; }
+  w = mc->make_shared_buffer((std::size_t)N * K);
+  s = mc->make_shared_buffer((std::size_t)N * (K / 64) * 2);
+  b = mc->make_shared_buffer((std::size_t)N * (K / 64) * 2);
+  if (w.empty() || s.empty() || b.empty()) { return false; }
+  metal_compute::CommandStream st = mc->make_command_stream();
+  {
+    metal_compute::ComputeEncoder enc = st.begin_compute();
+    const int one = 1, zero = 0;
+    enc.set_function(fn);
+    enc.set_buffer(0, in);
+    enc.set_buffer(1, w);
+    enc.set_buffer(2, s);
+    enc.set_buffer(3, b);
+    enc.set_constant(4, K);
+    enc.set_constant(5, N);
+    enc.set_constant(6, one);
+    enc.set_constant(7, zero);
+    enc.dispatch({(unsigned)(K / 64), (unsigned)N, 1}, {32, 8, 1});
+  }
+  return st.commit().wait_ok();
 }
 
 }  // namespace
@@ -1400,6 +1439,20 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                                                  : dtype_raw;
     SharedBuffer w, s, b;
     bool ok;
+    if (opt.bf16_scales && bits == 8 && opt.group == 64 &&
+        dtype == "BF16" && col_scale == nullptr) {
+      // The in-memory w8 build's own kernel (bf16 library): bf16 scales,
+      // codes fit to them. See QuantizeOptions::bf16_scales.
+      if (!quant_rows_bf16_(_mc, in, N, K, w, s, b)) { return false; }
+      const std::int64_t wcols = (std::int64_t)K / 4;
+      const std::int64_t gcols = (std::int64_t)K / 64;
+      return wr.add(pfx + ".weight", "U32", {N, wcols}, w.contents(),
+                    w.byte_size()) &&
+             wr.add(pfx + ".scales", "BF16", {N, gcols}, s.contents(),
+                    s.byte_size()) &&
+             wr.add(pfx + ".biases", "BF16", {N, gcols}, b.contents(),
+                    b.byte_size());
+    }
     if (col_scale != nullptr) {
       SharedBuffer f = _mc->make_shared_buffer((std::size_t)N * K * 2);
       if (f.empty()) { return false; }

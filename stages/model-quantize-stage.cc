@@ -1236,6 +1236,9 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // tied text head reads language_model.embed_tokens), so leave it off.
   const bool moss = eff_arch.rfind("moss-tts", 0) == 0;
   opt.quant_embeddings = !eff_arch.empty() && !moss;
+  // Every MOSS backbone runs bf16: write the scales it will hold (bf16,
+  // codes fit to them), not F16 ones it would round at load.
+  opt.bf16_scales = moss;
   // Qwen3.5/3.6 store zero-centered RMSNorm weights and apply (1 + weight)
   // (Gemma-style); vpipe's RMSNorm kernel multiplies by `weight` directly (as
   // MLX-converted checkpoints, which pre-fold the +1), so fold +1 into the
