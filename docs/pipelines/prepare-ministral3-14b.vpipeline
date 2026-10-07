@@ -1,0 +1,17 @@
+{
+  "id": "prepare-ministral3-14b",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "mlx-community/Ministral-3-14B-Instruct-2512-4bit",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

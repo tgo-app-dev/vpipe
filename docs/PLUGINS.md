@@ -1341,6 +1341,7 @@ constant, never the spelling:
 | the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
 | scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
 | `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
+| `ModelConfig::extra` (what config.json says that the struct has no field for: a YaRN / Llama-4 `rope_parameters`, a vision tower's input edge, a chat template's default system message) | `genai::model_config` (`generative-models/model-loader.h`) |
 | `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
 | speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |
 | the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |

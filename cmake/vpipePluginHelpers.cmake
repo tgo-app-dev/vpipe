@@ -178,9 +178,19 @@ function(vpipe_add_metal_library objlib name)
     foreach(d IN LISTS K_DEFINES)
       list(APPEND _defs "-D${d}")
     endforeach()
+    # The deployment target, explicitly: CMake does not export
+    # MACOSX_DEPLOYMENT_TARGET to a custom command, so the metal
+    # compiler would otherwise target the BUILD MACHINE's OS. Both the
+    # triple and the AIR bytecode version move with it, so a plugin
+    # built on a newer OS would not load on the host's minimum at all.
+    set(_vp_min_os "")
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+      set(_vp_min_os -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
+    endif()
     add_custom_command(
       OUTPUT "${_cc}"
-      COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx metal ${_defs}
+      COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx metal
+              ${_vp_min_os} ${_defs}
               -c "${_src_abs}" -o "${_air}"
       COMMAND ${VPIPE_XCRUN_EXECUTABLE} -sdk macosx metallib
               "${_air}" -o "${_lib}"

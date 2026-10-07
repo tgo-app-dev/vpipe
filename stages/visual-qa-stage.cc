@@ -16,6 +16,7 @@
 #if defined(VPIPE_BUILD_APPLE_SILICON)
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/tokenizer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/tensor-beat-bridge.h"
@@ -266,6 +267,19 @@ VisualQaStage::spec() const noexcept
 
 VisualQaStage::~VisualQaStage() = default;
 
+#if defined(VPIPE_BUILD_APPLE_SILICON)
+const char*
+VisualQaStage::tower_name_() const
+{
+  if (_m_coreml) { return "coreml"; }
+  if (_mgvis)    { return "metal-gemma4"; }
+  if (_mpix)     { return "metal-pixtral"; }
+  if (_mguni)    { return "gemma4-unified"; }
+  if (_mvis)     { return "metal-tower"; }
+  return "none";
+}
+#endif
+
 std::vector<ServiceReq>
 VisualQaStage::declare_services() const
 {
@@ -339,7 +353,7 @@ VisualQaStage::initialize(RuntimeContext& ctx)
   // on backends without the route; env VPIPE_I8_GEMM overrides.
   if (_i8_prefill) { _lm->set_i8_prefill(true); }
   _chat_tpl = genai::make_chat_template(
-      _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
+      _lm->config(), _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
     session()->warn(fmt(
         "VisualQaStage('{}'): [metal] no chat template for '{}'; "
@@ -347,9 +361,10 @@ VisualQaStage::initialize(RuntimeContext& ctx)
   }
   _mvis  = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
+  _mpix  = _lm->metal_pixtral_vision_encoder();
   _mguni = _lm->gemma4_unified_embedder();
   if (_mguni && !_mguni->has_vision()) { _mguni = nullptr; }
-  if (!_mvis && !_mgvis && !_mguni) {
+  if (!_mvis && !_mgvis && !_mpix && !_mguni) {
     session()->warn(fmt(
         "VisualQaStage('{}'): [metal] no metal vision tower (model has "
         "no vision config?); every round will drop", this->id()));
@@ -385,10 +400,7 @@ VisualQaStage::initialize(RuntimeContext& ctx)
       "VisualQaStage('{}'): [metal/no-MLX] model ready ({} layers, "
       "vocab={}, vision={})", this->id(), _lm->config().n_layers,
       _lm->config().vocab_size,
-      _m_coreml ? "coreml"
-                : (_mvis ? "metal-tower"
-                         : (_mgvis ? "metal-gemma4"
-                                   : (_mguni ? "gemma4-unified" : "none")))));
+      tower_name_()));
 #else
   session()->error(fmt(
       "VisualQaStage('{}'): this build was compiled without "
@@ -439,7 +451,7 @@ VisualQaStage::process(RuntimeContext& ctx)
   }
   const int H = static_cast<int>(tbp->shape[1]);
   const int W = static_cast<int>(tbp->shape[2]);
-  if (_m_coreml || _mvis || _mgvis || _mguni) {
+  if (_m_coreml || _mvis || _mgvis || _mpix || _mguni) {
     if (_video_enabled && !_m_video_warned) {
       session()->warn(fmt(
           "VisualQaStage('{}'): [metal] video 2:1 temporal merge is not "
@@ -491,6 +503,14 @@ VisualQaStage::process(RuntimeContext& ctx)
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h;
       m.mw         = r.grid_w;
+    } else if (_mpix) {
+      // Pixtral: the rows include the image's [IMG_BREAK] / [IMG_END]
+      // rows, one placeholder each; 1-D RoPE (the grid is informational).
+      auto r = _mpix->encode(rgb, H, W);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
     } else if (_mguni) {
       // Gemma-4-12B "unified": encoder-less shallow embedder. Host-f32 rows
       // ([n_tokens, H]) routed through the TokenRef embeddings_host splice.
@@ -514,10 +534,7 @@ VisualQaStage::process(RuntimeContext& ctx)
     session()->info(fmt(
         "VisualQaStage('{}'): [metal] vision encode ({}) {}x{} -> {} tok "
         "in {:.3f} s", this->id(),
-        _m_coreml ? "coreml"
-                  : (_mgvis ? "metal-gemma4"
-                            : (_mguni ? "gemma4-unified" : "metal-tower")),
-        W, H, m.n_tokens, ve_s));
+        tower_name_(), W, H, m.n_tokens, ve_s));
     if (m.n_tokens > 0 &&
         (!m.embeddings.empty() || !m.embeddings_host.empty())) {
       _m_imgs.push_back(std::move(m));

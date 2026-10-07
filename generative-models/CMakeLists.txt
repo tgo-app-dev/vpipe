@@ -71,6 +71,7 @@ set(LOCAL_SOURCES
   llama3/metal-llama-model.cc
   llama3/metal-llama-model-exec.cc
   llama3/metal-llama-weights.cc
+  mistral3/metal-pixtral-vision.cc
   moss/metal-moss-tts-model.cc
   moss/metal-moss-codec.cc
   moss/metal-moss-codec-v2.cc
@@ -192,6 +193,7 @@ set(LOCAL_HEADERS
   qwen3/metal-qwen-raw-layers.h
   qwen3/metal-qwen-model-exec.h
   qwen3/metal-qwen-vision.h
+  mistral3/metal-pixtral-vision.h
   qwen-image/qwen-image21-layout.h
   qwen-image/metal-qwen-image21-transformer.h
   qwen-image/qwen-image21-trainer.h

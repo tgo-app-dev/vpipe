@@ -22,6 +22,26 @@ class FlexData;
 
 namespace vpipe::genai {
 
+// ModelConfig::extra keys: what config.json says that the struct has no
+// field for. An absent key means the model does not use it.
+namespace model_config {
+// object: the text model's `rope_parameters` exactly as config.json
+// spells it (text_config's when the LM is nested), kept when its
+// rope_type is anything but "default" -- e.g. Ministral-3's YaRN
+// {factor, original_max_position_embeddings, beta_fast, beta_slow,
+// mscale, mscale_all_dim} and its llama_4_scaling_beta. The member
+// names inside are Hugging Face's, not vpipe's.
+inline constexpr std::string_view kRopeParameters = "rope_parameters";
+// int: the vision tower's largest input edge in pixels (Pixtral's
+// vision_config.image_size). Absent: the tower's own default.
+inline constexpr std::string_view kVisionImageSize = "vision.image_size";
+// string: the system message the checkpoint's own chat template puts in
+// when the conversation brings none (Mistral's `default_system_message`),
+// verbatim -- placeholders such as {today} are left for the renderer.
+inline constexpr std::string_view kDefaultSystemPrompt =
+    "default_system_prompt";
+}  // namespace model_config
+
 // Parsed view of a Hugging Face `config.json`. Holds the subset of
 // fields the LLM subsystem cares about; unknown keys are ignored.
 // Values are populated with defaults so a partial config still

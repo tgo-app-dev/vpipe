@@ -32,6 +32,7 @@
 #if defined(VPIPE_BUILD_APPLE_SILICON)
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/tokenizer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/tensor-beat-bridge.h"
@@ -757,7 +758,7 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   // fit here (per-scene re-prefill). No-op on backends without the route.
   if (_i8_prefill) { _lm->set_i8_prefill(true); }
   _chat_tpl = genai::make_chat_template(
-      _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
+      _lm->config(), _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): [metal] no chat template for '{}'; "
@@ -798,10 +799,11 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   }
   _mvis = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
+  _mpix  = _lm->metal_pixtral_vision_encoder();
   _mgaud = _lm->metal_gemma4_audio_encoder();
   _mguni = _lm->gemma4_unified_embedder();
   if (_mguni && !_mguni->has_vision()) { _mguni = nullptr; }
-  if (!_mvis && !_mgvis && !_mguni) {
+  if (!_mvis && !_mgvis && !_mpix && !_mguni) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): [metal] no metal vision tower "
         "(model has no vision config?); frames will be dropped",
@@ -1220,7 +1222,7 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
                                   std::uint64_t ts_us, bool ts_present,
                                   const metal_compute::SharedBuffer* src_buf)
 {
-  if (!_lm || (!_mvis && !_m_coreml && !_mgvis && !_mguni)) {
+  if (!_lm || (!_mvis && !_m_coreml && !_mgvis && !_mpix && !_mguni)) {
     if (!_m_vision_warned) {
       session()->warn(fmt(
           "RealtimeVqaStage('{}'): [metal] vision tower unavailable; "
@@ -1320,6 +1322,20 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h;
       m.mw         = r.grid_w;
+    } else if (_mpix) {
+      // Pixtral sizes a frame by its own longest-edge rule, which at
+      // camera resolutions is ~1200 tokens a frame -- a scene of them
+      // overruns the context. vlm_max_soft_tokens caps the grid; unset,
+      // a frame gets 256 tokens, about what the other families' frame
+      // budgets give. Rows include the frame's [IMG_BREAK]/[IMG_END].
+      constexpr int kPixtralFrameTokens = 256;
+      auto r = _mpix->encode(urgb, uh, uw,
+                             _vlm_max_soft_tokens > 0 ? _vlm_max_soft_tokens
+                                                      : kPixtralFrameTokens);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
     } else if (_mguni) {
       // Gemma-4-12B "unified": encoder-less shallow embedder, host-f32
       // rows routed through the TokenRef embeddings_host splice.
@@ -1343,9 +1359,10 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       std::chrono::duration<double>(clock::now() - t0).count();
   return m_append_mimg_(std::move(m), recv_ts_us, ts_us, ts_present,
                         _m_coreml ? "coreml"
-                                  : (_mgvis ? "metal-gemma4"
-                                            : (_mguni ? "gemma4-unified"
-                                                      : "metal-tower")),
+                                  : _mgvis ? "metal-gemma4"
+                                  : _mpix  ? "metal-pixtral"
+                                  : _mguni ? "gemma4-unified"
+                                           : "metal-tower",
                         eff_w, eff_h, enc_s);
 }
 

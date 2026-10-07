@@ -8,6 +8,7 @@
 #include "generative-models/gemma4/metal-gemma4-audio.h"
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/gemma4/metal-gemma4-vision.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/model-exec.h"
 #include "generative-models/model-exec-registry.h"
@@ -70,6 +71,10 @@ struct LoadedLanguageModel::Impl {
   // f16 SharedBuffer + the audio Result host f32, both spliced via the
   // owns_kv metal multimodal path. MLX-free.
   unique_ptr<MetalGemma4VisionEncoder> metal_gemma4_vision;
+  unique_ptr<MetalPixtralVisionEncoder> metal_pixtral_vision;
+  // Image rows take 1-D RoPE positions: the grids a caller passes to
+  // prefill_multimodal_metal are for mROPE families only (Mistral3).
+  bool image_rope_1d = false;
   unique_ptr<MetalGemma4AudioEncoder>  metal_gemma4_audio;
   // Gemma-4-12B "unified" (gemma4_unified): encoder-less shallow multimodal
   // embedder (vision + audio in one object), weights from the mmproj GGUF.
@@ -357,8 +362,7 @@ LoadedLanguageModel::LoadedLanguageModel(
   // raw prefill still works, only the lm->chat_template() accessor
   // returns nullptr in that case.
   _impl->chat_tpl =
-      make_chat_template(_impl->weights.config.architecture,
-                         *_impl->tokenizer);
+      make_chat_template(_impl->weights.config, *_impl->tokenizer);
   phase_log("chat_tpl");
   if (!_impl->chat_tpl && session) {
     session->warn(fmt(
@@ -407,7 +411,10 @@ LoadedLanguageModel::LoadedLanguageModel(
         // tied text head (embed_tokens). Loaded as a Qwen text LM so it emits
         // [vocab] logits. It has NO real text head (predicts audio), so
         // absolute perplexity is meaningless -- use the A/B divergence mode.
-        || arch_be == "MossTTSRealtime";
+        || arch_be == "MossTTSRealtime"
+        // Mistral3 / Ministral-3: a plain dense decoder (no q/k norm, no
+        // output gate) with YaRN RoPE; the Pixtral tower feeds it below.
+        || arch_be == "Mistral3ForConditionalGeneration";
     const bool metal_gemma = arch_be == "Gemma4ForConditionalGeneration"
         || arch_be == "Gemma4UnifiedForConditionalGeneration";
     // A plugin may register a new arch -> ModelExec factory. Consulted
@@ -527,7 +534,9 @@ LoadedLanguageModel::LoadedLanguageModel(
       }
       // Metal vision tower (Qwen3-VL): host-f32 image embeddings for the
       // metal multimodal splice. No MLX in the forward.
-      if (_impl->weights.config.vision.present && metal_qwen) {
+      const bool pixtral =
+          arch_be == "Mistral3ForConditionalGeneration";
+      if (_impl->weights.config.vision.present && metal_qwen && !pixtral) {
         // The tower's weights live in the LM's own checkpoint, so it
         // goes through the manager's set for that directory -- the same
         // one the exec above is holding. Without this the ViT opened a
@@ -541,6 +550,40 @@ LoadedLanguageModel::LoadedLanguageModel(
         if (_impl->metal_vision) {
           _impl->metal_vision->set_session(session);
           phase_log("metal_vision_encoder (load + bind, no MLX)");
+        }
+      }
+      // Metal Pixtral tower + Mistral3 projector (Ministral-3). Its rows
+      // carry each image's [IMG_BREAK] / [IMG_END] too, as the LM's own
+      // embeddings of those tokens -- so one placeholder per row splices
+      // exactly what the reference's token stream embeds. Images take
+      // 1-D RoPE positions like text.
+      if (_impl->weights.config.vision.present && pixtral) {
+        _impl->image_rope_1d = true;
+        auto enc = MetalPixtralVisionEncoder::load(
+            open_weight_set(model_dir, session), mc_be,
+            MetalPixtralVisionEncoder::config_from(_impl->weights.config));
+        const Tokenizer* tok = _impl->tokenizer.get();
+        const std::int32_t ids[2] = {
+            tok ? tok->special_token_id("[IMG_BREAK]") : -1,
+            tok ? tok->special_token_id("[IMG_END]") : -1};
+        const std::size_t H = (std::size_t)_impl->weights.config.hidden;
+        if (enc && ids[0] >= 0 && ids[1] >= 0) {
+          const std::vector<float> rows = _impl->exec->embed_text_rows(
+              std::span<const std::int32_t>(ids, 2));
+          if (rows.size() >= 2 * H) {
+            enc->set_layout_rows(
+                std::vector<float>(rows.begin(), rows.begin() + (long)H),
+                std::vector<float>(rows.begin() + (long)H,
+                                   rows.begin() + (long)(2 * H)));
+            enc->set_session(session);
+            _impl->metal_pixtral_vision = std::move(enc);
+            phase_log("metal_pixtral_vision_encoder (load + bind, no MLX)");
+          }
+        }
+        if (!_impl->metal_pixtral_vision && session) {
+          session->warn(fmt(
+              "LoadedLanguageModel: the Pixtral vision tower did not load "
+              "for '{}'; image input is unavailable", model_dir));
         }
       }
       // Gemma-4-12B "unified" (gemma4_unified): the encoder-LESS shallow
@@ -855,6 +898,12 @@ LoadedLanguageModel::metal_gemma4_vision_encoder() const noexcept
   return _impl ? _impl->metal_gemma4_vision.get() : nullptr;
 }
 
+MetalPixtralVisionEncoder*
+LoadedLanguageModel::metal_pixtral_vision_encoder() const noexcept
+{
+  return _impl ? _impl->metal_pixtral_vision.get() : nullptr;
+}
+
 MetalGemma4AudioEncoder*
 LoadedLanguageModel::metal_gemma4_audio_encoder() const noexcept
 {
@@ -1164,7 +1213,9 @@ LoadedLanguageModel::prefill_multimodal_metal(
   // plain 1-D RoPE (audio / text).
   std::vector<int32_t> pos_t, pos_h, pos_w;
   int rope_next = -1;
-  const bool have_grids = !image_grids.empty();
+  // mROPE families only: a 1-D RoPE family (Mistral3) positions its
+  // image rows like text whatever grids the caller passes.
+  const bool have_grids = !image_grids.empty() && !_impl->image_rope_1d;
   if (have_grids) {
     if (!build_mrope_position_ids(refs, image_grids, &pos_t, &pos_h, &pos_w,
                                   &rope_next)) {

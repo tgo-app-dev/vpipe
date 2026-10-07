@@ -21,6 +21,7 @@
 #include "generative-models/gemma4/metal-gemma4-audio.h"
 #include "generative-models/gemma4/metal-gemma4-vision.h"
 #include "generative-models/loaded-language-model.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/mcp/python-sandbox.h"
@@ -68,18 +69,28 @@ struct MediaItem {
 
 // Encode one decoded RGB image through whichever vision tower the LM
 // carries. Tower priority mirrors visual-qa (gemma-4 e4b tower, then
-// the encoder-less 12B unified embedder, then the Qwen metal tower).
+// the encoder-less 12B unified embedder, then the Qwen metal tower);
+// the Pixtral tower is its family's only one.
 optional<MediaItem>
-encode_image_item_(genai::MetalQwenVisionEncoder*   mvis,
-                   genai::MetalGemma4VisionEncoder* mgvis,
-                   genai::Gemma4UnifiedEmbedder*    mguni,
-                   const uint8_t*                   rgb,
-                   int                              H,
-                   int                              W)
+encode_image_item_(genai::MetalQwenVisionEncoder*    mvis,
+                   genai::MetalGemma4VisionEncoder*  mgvis,
+                   genai::Gemma4UnifiedEmbedder*     mguni,
+                   genai::MetalPixtralVisionEncoder* mpix,
+                   const uint8_t*                    rgb,
+                   int                               H,
+                   int                               W)
 {
   MediaItem m;
   m.kind = genai::MediaChunk::Kind::Image;
-  if (mgvis) {
+  if (mpix) {
+    // Rows include the image's [IMG_BREAK] / [IMG_END] rows; the grid
+    // is informational (1-D RoPE family).
+    auto r       = mpix->encode(rgb, H, W);
+    m.embeddings = std::move(r.embeddings);
+    m.n_tokens   = r.n_tokens;
+    m.mh         = r.grid_h;
+    m.mw         = r.grid_w;
+  } else if (mgvis) {
     auto r       = mgvis->encode(rgb, H, W);
     m.embeddings = std::move(r.embeddings);
     m.n_tokens   = r.n_tokens;
@@ -670,6 +681,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
   // on a text-only checkpoint -- media turns then warn and drop.
   _mvis     = _lm->metal_vision_encoder();
   _mgvis    = _lm->metal_gemma4_vision_encoder();
+  _mpix     = _lm->metal_pixtral_vision_encoder();
   _mguni    = _lm->gemma4_unified_embedder();
   _m_audio  = _lm->metal_audio_encoder();
   _mg_audio = _lm->metal_gemma4_audio_encoder();
@@ -689,7 +701,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
   // When the config flag is unset the factory uses the family
   // default (Qwen3-VL: thinking-ON, Qwen3 text-only: OFF, others: n/a).
   _chat_tpl = genai::make_chat_template(
-      _lm->config().architecture, _lm->tokenizer(),
+      _lm->config(), _lm->tokenizer(),
       _disable_thinking, _reasoning_effort);
   // An effort that reached no instruction is reported, not dropped: the
   // two ways that happens -- thinking off, or a family with no such
@@ -945,7 +957,7 @@ TextChatStage::process(RuntimeContext& ctx)
       session()->warn(fmt("TextChatStage('{}'): {}", this->id(), e));
     }
     const bool image_ok = tpl->image_pad_token_id() >= 0
-        && (_mvis || _mgvis || (_mguni && _mguni->has_vision()));
+        && (_mvis || _mgvis || _mpix || (_mguni && _mguni->has_vision()));
     const bool audio_ok = tpl->audio_pad_token_id() >= 0
         && (_m_audio || _mg_audio || (_mguni && _mguni->has_audio()));
     const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
@@ -980,7 +992,7 @@ TextChatStage::process(RuntimeContext& ctx)
                                       seg.bytes.size()),
                   &derr);
         if (img) {
-          item = encode_image_item_(_mvis, _mgvis, _mguni,
+          item = encode_image_item_(_mvis, _mgvis, _mguni, _mpix,
                                     img->rgb.data(), img->height,
                                     img->width);
           if (!item) { derr = "vision encode failed"; }

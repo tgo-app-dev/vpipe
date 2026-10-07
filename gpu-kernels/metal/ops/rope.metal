@@ -578,6 +578,49 @@ kernel void rope_partial_f16(
   x[base + i + half_r] = VPIPE_ELT(x1 * s + x2 * c);
 }
 
+// rope_partial_f16 for QUERIES under the Llama-4 attention temperature
+// (Ministral-3): after the rotation the whole head -- the rotated pairs
+// and any pass-through tail -- is scaled by
+//   1 + beta * log(1 + floor(pos / orig))
+// at the row's own position. That is exactly 1.0f below `orig`, so a
+// shorter context is bit-identical to rope_partial_f16.
+//   0..6 as rope_partial_f16, 7:beta 8:orig. Same grid.
+kernel void rope_partial_qscale_f16(
+    device VPIPE_ELT*        x          [[buffer(0)]],
+    const device float* inv_freq   [[buffer(1)]],
+    constant int&       H          [[buffer(2)]],
+    constant int&       T          [[buffer(3)]],
+    constant int&       D          [[buffer(4)]],
+    constant int&       rotary_dim [[buffer(5)]],
+    constant int&       offset     [[buffer(6)]],
+    constant float&     beta       [[buffer(7)]],
+    constant int&       orig       [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  (void)H;
+  const int half_r = rotary_dim / 2;
+  const int i = (int)gid.x;
+  if (i >= half_r) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+
+  const int pos = offset + t;
+  const float angle = float(pos) * inv_freq[i];
+  const float c = cos(angle);
+  const float s = sin(angle);
+  const float qs =
+      1.0f + beta * metal::precise::log(1.0f + float(pos / orig));
+
+  const uint base = ((uint)h * T + t) * D;
+  const float x1 = float(x[base + i]);
+  const float x2 = float(x[base + i + half_r]);
+  x[base + i]          = VPIPE_ELT((x1 * c - x2 * s) * qs);
+  x[base + i + half_r] = VPIPE_ELT((x1 * s + x2 * c) * qs);
+  for (int d = rotary_dim + i; d < D; d += half_r) {
+    x[base + d] = VPIPE_ELT(float(x[base + d]) * qs);
+  }
+}
+
 // Multimodal partial RoPE (Qwen3-VL prefill): like rope_partial_f16, but
 // the per-token cos/sin come from precomputed tables [n, rotary_dim]
 // (built host-side from the 3-axis position_ids + interleaved axis

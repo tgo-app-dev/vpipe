@@ -14,6 +14,7 @@
 namespace vpipe::genai {
 
 class Tokenizer;
+struct ModelConfig;
 
 // One ordered piece of a mixed text/media user turn (see
 // ChatTemplate::render_user_turn_media). Text chunks carry the run's
@@ -579,6 +580,16 @@ protected:
 // `if enable_thinking`).
 std::unique_ptr<ChatTemplate>
 make_chat_template(const std::string&    architecture,
+                   const Tokenizer&      tokenizer,
+                   std::optional<bool>   disable_thinking = std::nullopt,
+                   std::string_view      reasoning_effort = {});
+
+// The same dispatch from the parsed config, for the families whose
+// template reads more of the checkpoint than its architecture (Mistral:
+// the default system message its chat_template.jinja declares). Prefer
+// this overload wherever the config is at hand.
+std::unique_ptr<ChatTemplate>
+make_chat_template(const ModelConfig&    config,
                    const Tokenizer&      tokenizer,
                    std::optional<bool>   disable_thinking = std::nullopt,
                    std::string_view      reasoning_effort = {});

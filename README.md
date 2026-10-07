@@ -122,14 +122,15 @@ speed claim. [^3]
 | --- | --- |
 | Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
 | Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9B / 9b-kv:** 4-bit reference image editing and two-reference composition, 4-step default pipelines and compare-image UI on Apple Silicon; the -kv variant trades a little quality for speed. |
-| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. |
+| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. **Ministral 3 14B:** text and image chat (Pixtral vision tower) on the MLX 4-bit weights. |
 
 See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
 settings, caveats, and Turbo LoRA notes; **[docs/KREA-2.md](docs/KREA-2.md)**
 for text-to-image, the tuned 8-step schedule and the live denoising preview;
 and **[docs/KLEIN.md](docs/KLEIN.md)** and
 **[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
-workflows.
+workflows, and **[docs/MINISTRAL3.md](docs/MINISTRAL3.md)** for Ministral 3
+chat with pictures.
 
 [^3]: These are matched MiniMax H3 runs, not a general speed claim.
 

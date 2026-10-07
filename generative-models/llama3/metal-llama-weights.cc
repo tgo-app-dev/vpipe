@@ -384,13 +384,18 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
       }
       mapped_any = true;
     }
-    if (!mapped_any) {
-      return std::nullopt;   // every listed shard absent -> nothing to load
+    if (mapped_any) {
+      map_vision_sidecar_(w);
+      std::optional<MetalLlamaWeights> ow(std::move(w));
+      translate_names_(ow, /*single_file=*/false);
+      return ow;
     }
-    map_vision_sidecar_(w);
-    std::optional<MetalLlamaWeights> ow(std::move(w));
-    translate_names_(ow, /*single_file=*/false);
-    return ow;
+    // EVERY listed shard absent: a STALE index, not a partial download.
+    // mlx-community's Ministral-3-14B-Instruct-2512-4bit ships the FP8
+    // upstream's index (four model-0000N-of-00004 shards, FP8 names)
+    // beside its own two 4-bit shards; mlx globs and never reads it.
+    // Fall through to the index-less glob below, which finds the real
+    // shards -- each one's own header names its tensors -- or nothing.
   }
 
   // Index-less sharded layout: some checkpoints (e.g. MOSS-TTS-8B) ship

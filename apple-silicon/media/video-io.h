@@ -74,7 +74,24 @@ struct VideoWriteOptions {
   ColorTags   color;            // what the frames' samples mean
   double      quality = 0;      // HEVC / H.264: 0..1; 0 = the encoder's
   std::int64_t bitrate = 0;     // HEVC / H.264 bits per second; 0 = auto
+  // HEVC / H.264 rate and structure -- what a delivery spec asks for. 0,
+  // -1 or "" leaves each to the encoder.
+  std::int64_t max_bitrate = 0; // the most bits in any one second
+  int         keyframe_interval = 0;  // the most frames between keyframes
+  int         frame_reordering = -1;  // B-frames: 1 allowed, 0 not
+  // H.264 only: "baseline" | "main" | "high" ("" high), its level ("3.0"
+  // .. "5.2", "" auto) and entropy coding ("cabac" | "cavlc"; baseline
+  // has CAVLC alone, and no B-frames).
+  std::string profile;
+  std::string level;
+  std::string entropy;
 };
+
+// Is `profile` / `level` / `entropy` one VideoWriter takes for H.264
+// ("" each: the default)?
+bool h264_settings_known(const std::string& profile,
+                         const std::string& level,
+                         const std::string& entropy);
 
 class VideoWriter {
 public:

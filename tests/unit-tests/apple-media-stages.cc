@@ -8,6 +8,7 @@
 
 #include "apple-silicon/media/color-tags.h"
 #include "apple-silicon/media/image-io.h"
+#include "apple-silicon/media/video-io.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-keys.h"
 #include "common/beat-payload-intf.h"
@@ -377,6 +378,80 @@ TEST(apple_media_stages, hevc_pq_transcode_keeps_tags)
   EXPECT_TRUE(std::fabs(at_(got[1], 1, 32, 32) - 0.51f) < 0.02f);
   std::remove(a.c_str());
   std::remove(b.c_str());
+}
+
+// The bytes after the first `box` (a four-letter MP4 box type) in `f`;
+// empty without one.
+std::string
+box_(const std::string& f, const char* box)
+{
+  const auto at = f.find(box);
+  return at == std::string::npos ? std::string() : f.substr(at + 4);
+}
+
+// H.264 as a delivery spec asks for it: its profile and level, CAVLC, a
+// keyframe every 4 frames, no B-frames -- read back from the file's own
+// boxes (avcC's profile, level and PPS; stss's sync samples; no ctts).
+TEST(apple_media_stages, h264_profile_level_gop_and_entropy)
+{
+  Session sess;
+  const std::string path = tmp_("h264.mp4");
+  std::vector<TensorBeat> frames;
+  for (int i = 0; i < 12; ++i) {
+    frames.push_back(pic_(3, 64, 96, [i](int c, int y, int x) {
+      return 0.2f + 0.5f * ((x + 3 * i) % 96) / 96.0f + 0.1f * c +
+             0.001f * y;
+    }));
+  }
+  REQUIRE_(write_<AvfSaveVideoStage>(
+      sess, frames,
+      cfg_({{"path", str_(path)}, {"codec", str_("h264")},
+            {"profile", str_("main")}, {"level", str_("4.1")},
+            {"entropy", str_("cavlc")}, {"frame_reordering", str_("off")},
+            {"keyframe_interval", FlexData::make_uint(4)},
+            {"bitrate", FlexData::make_int(2000000)},
+            {"max_bitrate", FlexData::make_int(3000000)}})));
+  std::FILE* fp = std::fopen(path.c_str(), "rb");
+  REQUIRE_(fp != nullptr);
+  std::string f;
+  char buf[65536];
+  for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, fp)) > 0;) {
+    f.append(buf, n);
+  }
+  std::fclose(fp);
+  // avcC: version, profile_idc, compatibility, level_idc, length size,
+  // the SPS count and each (16-bit length, bytes), the PPS count, ...
+  const std::string avcc = box_(f, "avcC");
+  REQUIRE_(avcc.size() > 8);
+  const auto u8 = [&](std::size_t i) { return (unsigned char)avcc[i]; };
+  std::printf("[apple_media_stages] h264 profile_idc %d level_idc %d\n",
+              u8(1), u8(3));
+  EXPECT_TRUE(u8(1) == 77);   // Main
+  EXPECT_TRUE(u8(3) == 41);   // 4.1
+  std::size_t i = 6;
+  const std::size_t sps = (std::size_t(u8(i)) << 8) | u8(i + 1);
+  i += 2 + sps;
+  REQUIRE_(i + 4 < avcc.size() && u8(i) >= 1);
+  // The PPS: its NAL header, then ue(v) pps_id and sps_id (both 0: one
+  // bit each), then entropy_coding_mode_flag -- 0 for CAVLC.
+  const unsigned char pps = u8(i + 4);
+  EXPECT_TRUE((pps & 0xC0) == 0xC0);
+  EXPECT_TRUE((pps & 0x20) == 0);
+  // stss: version / flags, then the count of keyframes -- 0, 4, 8.
+  const std::string stss = box_(f, "stss");
+  REQUIRE_(stss.size() > 8);
+  const unsigned n = (unsigned(stss[4] & 0xff) << 24) |
+                     (unsigned(stss[5] & 0xff) << 16) |
+                     (unsigned(stss[6] & 0xff) << 8) | unsigned(stss[7] & 0xff);
+  std::printf("[apple_media_stages] h264 keyframes %u of 12\n", n);
+  EXPECT_TRUE(n >= 3);
+  // No B-frames: no composition offsets.
+  EXPECT_TRUE(f.find("ctts") == std::string::npos);
+  // A profile H.264 has not: refused.
+  EXPECT_TRUE(!apple_media::h264_settings_known("main", "6.0", ""));
+  EXPECT_TRUE(!apple_media::h264_settings_known("high", "", "rle"));
+  EXPECT_TRUE(apple_media::h264_settings_known("baseline", "auto", ""));
+  std::remove(path.c_str());
 }
 
 // F32 pictures (0..1, video-to-rgb's format) in and out of the avf

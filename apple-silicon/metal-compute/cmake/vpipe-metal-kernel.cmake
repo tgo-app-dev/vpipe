@@ -202,11 +202,35 @@ function(add_vpipe_metal_kernel KERNEL_NAME)
     )
   else()
     # --- build-time: compile .metal -> .air -> .metallib, embed bytes --
+    #
+    # The DEPLOYMENT TARGET has to be passed explicitly. CMake does not
+    # export MACOSX_DEPLOYMENT_TARGET to a custom command, so without
+    # this the metal compiler uses ITS OWN default -- which is the
+    # BUILD MACHINE's OS, not the project's target. MEASURED on an
+    # Xcode 27 box: the default records air64_v29-apple-macosx27.0.0
+    # where the pin records air64_v28-apple-macosx26.0.0, so the AIR
+    # BYTECODE VERSION moves with the triple and a library built
+    # unpinned does not load on an older OS at all.
+    #
+    # Before this, every kernel without a FLAGS override happened to
+    # record the right target only because the build box ran the same
+    # OS as the deployment target. That is not a guarantee, and it
+    # stopped being true the moment one machine upgraded.
+    #
+    # It goes BEFORE ${K_FLAGS} on purpose: the LAST
+    # -mmacosx-version-min wins, so a per-kernel override (the NAX
+    # kernels' 26.2) still beats this project-wide floor. VERIFIED by
+    # compiling with both and reading the recorded triple.
+    set(_VP_MIN_OS "")
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+      set(_VP_MIN_OS -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
+    endif()
     add_custom_command(
       OUTPUT ${AIR}
       COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal
               -gline-tables-only -frecord-sources
-              -Wall -Wextra -fno-fast-math ${STD_FLAG} ${DEFINE_FLAGS} ${K_FLAGS}
+              -Wall -Wextra -fno-fast-math ${_VP_MIN_OS}
+              ${STD_FLAG} ${DEFINE_FLAGS} ${K_FLAGS}
               -I "${VPIPE_METAL_KERNEL_DIR}"
               -I "${VPIPE_METAL_KERNEL_DIR}/vendored"
               -c "${SRC}" -o "${AIR}"

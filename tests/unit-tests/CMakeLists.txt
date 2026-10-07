@@ -154,6 +154,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-lm/gemma-text.cc
         metal-lm/kquant.cc
         metal-lm/manager.cc
+        metal-lm/ministral3.cc
         metal-lm/moss.cc
         metal-lm/multimodal-vqa.cc
         metal-lm/pdecode.cc

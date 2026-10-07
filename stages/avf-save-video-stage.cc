@@ -25,6 +25,18 @@ constexpr SpecExtra kCodecChoices[] = {
 constexpr SpecExtra kAlphaChoices[] = {
   {spec_key::kChoices, "keep,drop"},
 };
+constexpr SpecExtra kProfileChoices[] = {
+  {spec_key::kChoices, ",baseline,main,high"},
+};
+constexpr SpecExtra kLevelChoices[] = {
+  {spec_key::kChoices, ",auto,3.0,3.1,3.2,4.0,4.1,4.2,5.0,5.1,5.2"},
+};
+constexpr SpecExtra kEntropyChoices[] = {
+  {spec_key::kChoices, ",auto,cabac,cavlc"},
+};
+constexpr SpecExtra kReorderChoices[] = {
+  {spec_key::kChoices, "auto,on,off"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,
    .doc = "the movie to write: .mov (any codec) or .mp4 / .m4v (HEVC, "
@@ -50,6 +62,31 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "bitrate", .type = ConfigType::Int, .required = false,
    .doc = "HEVC / H.264 average bits per second; 0 (the default) = auto",
    .def_int = 0},
+  {.key = "max_bitrate", .type = ConfigType::Int, .required = false,
+   .doc = "HEVC / H.264: the most bits in any one second (a peak, as "
+          "a delivery spec caps it); 0 (the default) = none",
+   .def_int = 0},
+  {.key = "keyframe_interval", .type = ConfigType::Uint, .required = false,
+   .doc = "HEVC / H.264: the most frames from one keyframe to the next "
+          "(a GOP's length); 0 (the default) = the encoder's",
+   .def_uint = 0},
+  {.key = "frame_reordering", .type = ConfigType::String,
+   .required = false,
+   .doc = "HEVC / H.264 B-frames: auto (the default, the encoder's) | on "
+          "| off. H.264 baseline has none",
+   .def_str = "auto", .extra = kReorderChoices},
+  {.key = "profile", .type = ConfigType::String, .required = false,
+   .doc = "H.264's profile: baseline | main | high; empty (the default) "
+          "= high. HEVC's is its codec's (hevc Main10, hevc8 Main)",
+   .def_str = "", .extra = kProfileChoices},
+  {.key = "level", .type = ConfigType::String, .required = false,
+   .doc = "H.264's level: 3.0 .. 5.2; empty or auto (the default) = the "
+          "encoder's for the size and rate",
+   .def_str = "", .extra = kLevelChoices},
+  {.key = "entropy", .type = ConfigType::String, .required = false,
+   .doc = "H.264's entropy coding: cabac | cavlc; empty or auto (the "
+          "default) = the encoder's (CABAC; baseline has CAVLC alone)",
+   .def_str = "", .extra = kEntropyChoices},
   {.key = "color_primaries", .type = ConfigType::Uint, .required = false,
    .doc = "the colour to declare, overriding the frames' tags (CICP: 1 "
           "BT.709, 9 BT.2020, 12 Display P3); 0 (the default) = the "
@@ -122,6 +159,20 @@ AvfSaveVideoStage::AvfSaveVideoStage(const SessionContextIntf* s,
   _keep_alpha = attr_str("alpha") != "drop";
   _quality = attr_real("quality");
   _bitrate = attr_int("bitrate");
+  _max_bitrate = attr_int("max_bitrate");
+  _keyframe_interval = (int)attr_uint("keyframe_interval");
+  const std::string reorder = attr_str("frame_reordering");
+  _frame_reordering = reorder == "on" ? 1 : reorder == "off" ? 0 : -1;
+  _profile = attr_str("profile");
+  _level = attr_str("level");
+  _entropy = attr_str("entropy");
+  if (_entropy == "auto") { _entropy.clear(); }
+  if (_codec == "h264" &&
+      !apple_media::h264_settings_known(_profile, _level, _entropy)) {
+    fail_config(fmt("AvfSaveVideoStage('{}'): no H.264 profile '{}' at "
+                    "level '{}' with entropy '{}'", this->id(), _profile,
+                    _level, _entropy));
+  }
   _primaries = (int)attr_uint("color_primaries");
   _transfer = (int)attr_uint("color_transfer");
   _matrix = (int)attr_uint("color_matrix");
@@ -193,6 +244,12 @@ AvfSaveVideoStage::process(RuntimeContext& ctx)
     opt.alpha = _keep_alpha && pic->shape[0] == 4;
     opt.quality = _quality;
     opt.bitrate = _bitrate;
+    opt.max_bitrate = _max_bitrate;
+    opt.keyframe_interval = _keyframe_interval;
+    opt.frame_reordering = _frame_reordering;
+    opt.profile = _profile;
+    opt.level = _level;
+    opt.entropy = _entropy;
     opt.color = apple_media::ColorTags::read(pic->sideband);
     if (_primaries) { opt.color.primaries = _primaries; }
     if (_transfer) { opt.color.transfer = _transfer; }

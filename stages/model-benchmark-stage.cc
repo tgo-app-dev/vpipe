@@ -94,7 +94,7 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "text LLM to benchmark: a models-DB key (model-fetch / "
           "model-quantize) or a model directory path",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "qwen3.5,qwen3.6,gemma4,gemma4_unified"},
+   .suggest_db_type = "qwen3.5,qwen3.6,gemma4,gemma4_unified,mistral3"},
   {.key = "contexts", .type = ConfigType::String,
    .doc = "comma-separated context lengths to benchmark (e.g. add "
           "\"8192,16384\" for longer probes)",

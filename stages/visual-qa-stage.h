@@ -305,6 +305,11 @@ private:
   // Gemma-4 metal vision tower (borrowed; mutually exclusive with _mvis
   // by family). Reports the POST-merger grid directly (no /S).
   genai::MetalGemma4VisionEncoder*            _mgvis = nullptr; // borrowed
+  // Pixtral tower + Mistral3 projector (borrowed; its family's only
+  // tower). Rows include the image's [IMG_BREAK] / [IMG_END] rows.
+  genai::MetalPixtralVisionEncoder*           _mpix = nullptr;  // borrowed
+  // The tower encode() runs, by the same priority, for logs.
+  const char* tower_name_() const;
   // Gemma-4-12B "unified" encoder-less shallow embedder (borrowed; host-f32
   // rows). Mutually exclusive with _mgvis/_mvis by family.
   genai::Gemma4UnifiedEmbedder*               _mguni = nullptr; // borrowed

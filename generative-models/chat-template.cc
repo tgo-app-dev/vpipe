@@ -1,7 +1,9 @@
 #include "generative-models/chat-template.h"
 
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/media-line.h"
+#include "generative-models/model-loader.h"
 #include "generative-models/shared/mcp/mcp-tools.h"
 #include "generative-models/tokenizer.h"
 
@@ -10,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <ctime>
 #include <exception>
 #include <memory>
 #include <span>
@@ -598,6 +602,247 @@ private:
   const std::int32_t _eot;
   const std::int32_t _eom;
   const std::int32_t _end_text;
+};
+
+// ---------------------------------------------------------------------
+// Mistral (Ministral-3 / Mistral3, Tekken vocabulary):
+//
+//   <s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT]        (first turn only)
+//   [INST]{user}[/INST]{assistant}</s>[INST]{user}[/INST]...
+//
+// The checkpoint's chat template puts its own default system message in
+// whenever the conversation brings none, and this renders the same one
+// (model_config::kDefaultSystemPrompt) with {today} / {yesterday}
+// filled as Mistral's serving code fills them -- the Jinja leaves the
+// braces literal. An image is N [IMG] placeholders: the Pixtral tower's
+// rows include its [IMG_BREAK] / [IMG_END] rows (embedded from the LM's
+// own table), so every placeholder takes the next row and the image
+// layout needs nothing from the template but the count.
+// ---------------------------------------------------------------------
+class MistralChatTemplate final : public ChatTemplate {
+public:
+  MistralChatTemplate(const Tokenizer& tok, std::string system_prompt)
+    : _tok(tok)
+    , _system(std::move(system_prompt))
+    , _bos     (sp_(tok, "<s>"))
+    , _eos     (sp_(tok, "</s>"))
+    , _inst    (sp_(tok, "[INST]"))
+    , _inst_end(sp_(tok, "[/INST]"))
+    , _sys     (sp_(tok, "[SYSTEM_PROMPT]"))
+    , _sys_end (sp_(tok, "[/SYSTEM_PROMPT]"))
+    , _img     (sp_(tok, "[IMG]"))
+  {}
+
+  void render_user_turn(std::string_view              content,
+                        bool                          is_first_turn,
+                        std::vector<std::int32_t>*    dst) const override
+  {
+    open_(is_first_turn, dst);
+    append_text_(_tok, content, dst);
+    (void)push_sp_(_inst_end, dst);
+  }
+
+  void
+  render_user_turn_vlm(std::string_view              content,
+                       std::span<const int>          image_token_counts,
+                       bool                          is_first_turn,
+                       std::vector<std::int32_t>*    dst) const override
+  {
+    open_(is_first_turn, dst);
+    for (int n : image_token_counts) { images_(n, dst); }
+    append_text_(_tok, content, dst);
+    (void)push_sp_(_inst_end, dst);
+  }
+
+  bool
+  render_user_turn_media(std::span<const MediaChunk>   chunks,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Audio
+          || (c.kind == MediaChunk::Kind::Image && _img < 0)) {
+        return false;
+      }
+    }
+    open_(is_first_turn, dst);
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Text) {
+        append_text_(_tok, c.text, dst);
+      } else {
+        images_(c.n_tokens, dst);
+      }
+    }
+    (void)push_sp_(_inst_end, dst);
+    return true;
+  }
+
+  std::int32_t image_pad_token_id() const noexcept override
+  { return _img; }
+
+  bool
+  render_vlm_prefix(std::span<const int>          image_token_counts,
+                    bool                          is_first_turn,
+                    std::vector<std::int32_t>*    dst) const override
+  {
+    if (_img < 0) { return false; }
+    open_(is_first_turn, dst);
+    for (int n : image_token_counts) { images_(n, dst); }
+    return true;
+  }
+
+  bool
+  render_vlm_completion(std::string_view              content,
+                        std::vector<std::int32_t>*    dst) const override
+  {
+    append_text_(_tok, content, dst);
+    (void)push_sp_(_inst_end, dst);
+    return true;
+  }
+
+  bool
+  render_vlm_prefix_ex(std::span<const int>          image_token_counts,
+                       bool                          is_first_turn,
+                       std::string_view              pre_image_prompt,
+                       std::string_view              post_image_prompt,
+                       bool                          close_turn,
+                       std::vector<std::int32_t>*    dst) const override
+  {
+    if (_img < 0) { return false; }
+    open_(is_first_turn, dst);
+    append_text_(_tok, pre_image_prompt, dst);
+    for (int n : image_token_counts) { images_(n, dst); }
+    append_text_(_tok, post_image_prompt, dst);
+    if (close_turn) { (void)push_sp_(_inst_end, dst); }
+    return true;
+  }
+
+  // Video: the frames as a sequence of images, each led by its time
+  // (Pixtral has no video training; this is the multi-image form).
+  bool
+  render_video_prefix(std::span<const float>        frame_timestamps_seconds,
+                      std::span<const int>          image_token_counts,
+                      bool                          is_first_turn,
+                      std::string_view              pre_image_prompt,
+                      std::vector<std::int32_t>*    dst) const override
+  {
+    if (_img < 0
+        || frame_timestamps_seconds.size() != image_token_counts.size()) {
+      return false;
+    }
+    open_(is_first_turn, dst);
+    append_text_(_tok, pre_image_prompt, dst);
+    for (std::size_t i = 0; i < image_token_counts.size(); ++i) {
+      char ts[32];
+      std::snprintf(ts, sizeof(ts), "<%.1f seconds>",
+                    (double)frame_timestamps_seconds[i]);
+      append_text_(_tok, ts, dst);
+      images_(image_token_counts[i], dst);
+    }
+    return true;
+  }
+
+  bool
+  render_video_prefix(std::span<const float>        frame_timestamps_seconds,
+                      std::span<const int>          image_token_counts,
+                      bool                          is_first_turn,
+                      std::vector<std::int32_t>*    dst) const override
+  {
+    return render_video_prefix(frame_timestamps_seconds,
+                               image_token_counts, is_first_turn, {},
+                               dst);
+  }
+
+  void
+  render_user_turn_video(std::string_view              content,
+                         std::span<const float>        frame_timestamps_seconds,
+                         std::span<const int>          image_token_counts,
+                         bool                          is_first_turn,
+                         std::string_view              pre_image_prompt,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    if (!render_video_prefix(frame_timestamps_seconds, image_token_counts,
+                             is_first_turn, pre_image_prompt, dst)) {
+      render_user_turn(content, is_first_turn, dst);
+      return;
+    }
+    (void)render_vlm_completion(content, dst);
+  }
+
+  void
+  render_user_turn_video(std::string_view              content,
+                         std::span<const float>        frame_timestamps_seconds,
+                         std::span<const int>          image_token_counts,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    render_user_turn_video(content, frame_timestamps_seconds,
+                           image_token_counts, is_first_turn, {}, dst);
+  }
+
+  // The model ends its turn with </s>; committing it closes the turn the
+  // way the template's own assistant block does.
+  std::int32_t assistant_close_token_id() const override { return _eos; }
+
+  bool is_stop_token(std::int32_t id) const override
+  {
+    return id >= 0 && id == _eos;
+  }
+
+  std::string_view family_name() const override { return "mistral"; }
+
+private:
+  // Session start (first turn: <s> + the system turn) and the user open.
+  void open_(bool is_first_turn, std::vector<std::int32_t>* dst) const
+  {
+    if (is_first_turn) {
+      (void)push_sp_(_bos, dst);
+      if (!_system.empty() && _sys >= 0 && _sys_end >= 0) {
+        dst->push_back(_sys);
+        append_text_(_tok, with_dates_(_system), dst);
+        dst->push_back(_sys_end);
+      }
+    }
+    (void)push_sp_(_inst, dst);
+  }
+
+  void images_(int n, std::vector<std::int32_t>* dst) const
+  {
+    if (_img < 0) { return; }
+    dst->insert(dst->end(), (std::size_t)std::max(0, n), _img);
+  }
+
+  // {today} / {yesterday} as YYYY-MM-DD in local time.
+  static std::string with_dates_(std::string s)
+  {
+    auto ymd = [](std::time_t t) {
+      std::tm tm{};
+      localtime_r(&t, &tm);
+      char b[16];
+      std::strftime(b, sizeof(b), "%Y-%m-%d", &tm);
+      return std::string(b);
+    };
+    const std::time_t now = std::time(nullptr);
+    const std::pair<const char*, std::string> subs[] = {
+        {"{today}", ymd(now)}, {"{yesterday}", ymd(now - 24 * 3600)}};
+    for (const auto& [key, val] : subs) {
+      for (std::size_t p = s.find(key); p != std::string::npos;
+           p = s.find(key, p + val.size())) {
+        s.replace(p, std::strlen(key), val);
+      }
+    }
+    return s;
+  }
+
+  const Tokenizer&   _tok;
+  const std::string  _system;
+  const std::int32_t _bos;
+  const std::int32_t _eos;
+  const std::int32_t _inst;
+  const std::int32_t _inst_end;
+  const std::int32_t _sys;
+  const std::int32_t _sys_end;
+  const std::int32_t _img;
 };
 
 // ---------------------------------------------------------------------
@@ -1957,6 +2202,11 @@ make_chat_template(const std::string&    architecture,
   if (architecture == "Qwen2ForCausalLM") {
     return std::make_unique<ChatMLChatTemplate>(tokenizer);
   }
+  if (architecture == "Mistral3ForConditionalGeneration") {
+    // No system message from the architecture alone; the ModelConfig
+    // overload brings the checkpoint's default.
+    return std::make_unique<MistralChatTemplate>(tokenizer, std::string());
+  }
   if (architecture == "Qwen3ASRForConditionalGeneration") {
     // ASR is single-pass transcription -- no thinking flag.
     (void)disable_thinking;
@@ -2005,6 +2255,21 @@ make_chat_template(const std::string&    architecture,
         tokenizer, disable_thinking.value_or(true), reasoning_effort);
   }
   return nullptr;
+}
+
+std::unique_ptr<ChatTemplate>
+make_chat_template(const ModelConfig&    config,
+                   const Tokenizer&      tokenizer,
+                   std::optional<bool>   disable_thinking,
+                   std::string_view      reasoning_effort)
+{
+  if (config.architecture == "Mistral3ForConditionalGeneration") {
+    return std::make_unique<MistralChatTemplate>(
+        tokenizer,
+        bag::text(config.extra, model_config::kDefaultSystemPrompt));
+  }
+  return make_chat_template(config.architecture, tokenizer,
+                            disable_thinking, reasoning_effort);
 }
 
 }

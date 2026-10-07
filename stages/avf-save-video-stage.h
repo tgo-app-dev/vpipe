@@ -49,6 +49,12 @@ private:
   bool        _keep_alpha = true;
   double      _quality = 0;
   std::int64_t _bitrate = 0;
+  std::int64_t _max_bitrate = 0;
+  int         _keyframe_interval = 0;
+  int         _frame_reordering = -1;   // -1: the encoder's
+  std::string _profile;
+  std::string _level;
+  std::string _entropy;
   int         _primaries = 0;    // 0 = from the frames
   int         _transfer = 0;
   int         _matrix = 0;

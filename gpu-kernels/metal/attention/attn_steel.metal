@@ -175,7 +175,12 @@ attention<bfloat, 32, 16, 64, 4, 1, bfloat, float>;
 //   0:q[Hq,n_q,D] 1:kpool 2:vpool 3:out[Hq,n_q,D] 4:scale 5:D 6:Hq 7:Hkv
 //   8:n_q 9:q_offset 10:page_tokens 11:n_pages 12:page_table{pid,nvalid,gstart}
 // grid (32*NQ, 4*Hq, 1); threadgroup (32,4,1) = 128 threads.
-kernel void attn_steel_paged_bd256(
+// Templated on the head dim: bd256 (Qwen3.5 full attention) and bd128
+// (Ministral-3 / Llama-shaped dense heads, whose long prompts otherwise
+// fell to the key-split sdpa_paged_flash). The figures in the comments
+// below are bd256's.
+template <int BD>
+[[kernel]] void attn_steel_paged(
     const device half*  q          [[buffer(0)]],
     const device half*  kpool      [[buffer(1)]],
     const device half*  vpool      [[buffer(2)]],
@@ -194,11 +199,11 @@ kernel void attn_steel_paged_bd256(
     uint  lid           [[thread_index_in_threadgroup]],
     uint3 tid           [[threadgroup_position_in_grid]])
 {
-  constexpr int BQ = 32, BK = 16, BD = 256, WM = 4, WN = 1, FS = 8;
+  constexpr int BQ = 32, BK = 16, WM = 4, WN = 1, FS = 8;
   constexpr int kNWarps = WM * WN;            // 4
   constexpr int TQ = BQ / (kNWarps * FS);     // 1
   constexpr int TK = BK / FS;                 // 2
-  constexpr int TD = BD / FS;                 // 32
+  constexpr int TD = BD / FS;                 // 32 (bd256), 16 (bd128)
   constexpr int NTHREADS = WM * WN * 32;      // 128
   constexpr short padH = 16 / sizeof(half);   // 8
   constexpr short LDQ = BD + padH;            // 264
@@ -341,7 +346,7 @@ kernel void attn_steel_paged_bd256(
     for (short i = 0; i < kRowsPT; ++i) {
       sum_score[i] = sum_score[i] * factor[i] + sum_tmp[i];
     }
-    Otile.row_bin_op<MulOp>(factor);
+    Otile.template row_bin_op<MulOp>(factor);
     // P @ V accumulate into the register O tile.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     STEEL_PRAGMA_UNROLL
@@ -360,16 +365,21 @@ kernel void attn_steel_paged_bd256(
   }
 
   // Normalize + store O [Hq, n_q, D].
-  Otile.row_bin_op<DivOp>(sum_score);
+  Otile.template row_bin_op<DivOp>(sum_score);
   threadgroup_barrier(mem_flags::mem_none);
   const int qL_rem = n_q - (n_q / BQ) * BQ;
   device half* O = out + ((uint)h * n_q + q_row0) * D + (tm + sm) * D + sn;
   if (qL_rem != 0 && qb == (n_q / BQ)) {
     const short2 dims = short2(BD - sn, (short)(qL_rem - (tm + sm)));
     if (dims.x > 0 && dims.y > 0) {
-      Otile.store_safe<half, 1, 1>(O, D, dims);
+      Otile.template store_safe<half, 1, 1>(O, D, dims);
     }
   } else {
-    Otile.store<half, 1, 1>(O, D);
+    Otile.template store<half, 1, 1>(O, D);
   }
 }
+
+template [[host_name("attn_steel_paged_bd256")]] [[kernel]]
+decltype(attn_steel_paged<256>) attn_steel_paged<256>;
+template [[host_name("attn_steel_paged_bd128")]] [[kernel]]
+decltype(attn_steel_paged<128>) attn_steel_paged<128>;

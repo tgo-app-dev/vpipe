@@ -492,6 +492,15 @@ builtin_catalog_()
      .variant = "ASR MLX 8-bit (mlx-community)",
      .hf_path = "mlx-community/Qwen3-ASR-0.6B-8bit",
      .model_type = "qwen3-asr", .needs_tokenizer_json = true},
+    // Ministral-3 14B Instruct (Mistral, Apache-2.0): a dense 40-layer
+    // decoder with YaRN RoPE and the Pixtral vision tower, run on the
+    // metal Qwen dense path. The repo's model.safetensors.index.json is
+    // the FP8 upstream's (four shards that are not there); the loader
+    // reads the two 4-bit shards it does carry. 8.4 GB.
+    {.family = "Ministral", .version = "3", .param_class = "14B",
+     .variant = "MLX 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Ministral-3-14B-Instruct-2512-4bit",
+     .model_type = "mistral3", .needs_tokenizer_json = false},
     {.family = "Gemma", .version = "4", .param_class = "E4B",
      .variant = "MLX 4-bit (mlx-community)",
      .hf_path = "mlx-community/gemma-4-e4b-it-4bit",
@@ -2367,6 +2376,9 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text", "image", "video"}, {"text"});
   } else if (mt == "qwen3-asr") {
     set({"audio"}, {"text"});
+  } else if (mt == "mistral3") {
+    // Ministral-3: text and images in (the Pixtral tower), text out.
+    set({"text", "image"}, {"text"});
   } else if (mt == "gemma4" || mt == "gemma4_unified") {
     // Both the effective (e4b) and the unified (12B/31B/26B-A4B) Gemma-4
     // models are multimodal-in / text-out.

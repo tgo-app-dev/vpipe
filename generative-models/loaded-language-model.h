@@ -33,6 +33,7 @@ class LlamaModelExec;
 class MetalAudioEncoder;
 class MetalGemma4AudioEncoder;
 class MetalGemma4VisionEncoder;
+class MetalPixtralVisionEncoder;
 class Gemma4UnifiedEmbedder;
 class MetalQwenVisionEncoder;
 class TokenMuxer;
@@ -165,6 +166,14 @@ public:
   // backend when a gemma4uv/gemma4ua mmproj was found. encode_image returns
   // host-f32 rows; spliced via the same owns_kv metal multimodal path.
   Gemma4UnifiedEmbedder* gemma4_unified_embedder() const noexcept;
+
+  // Metal-compute Pixtral tower + Mistral3 projector (Ministral-3).
+  // Non-null only on the metal backend for a Mistral3 checkpoint with a
+  // vision config. encode() returns native-f16 rows that INCLUDE the
+  // image's [IMG_BREAK] / [IMG_END] rows, so every [IMG] placeholder the
+  // chat template emits takes the next row; spliced with 1-D RoPE (this
+  // family has no mROPE: prefill_multimodal_metal ignores the grids).
+  MetalPixtralVisionEncoder* metal_pixtral_vision_encoder() const noexcept;
 
   // Host-float logits ([vocab]) of the last position predicted by the
   // metal backend's prefill/next_token. The MLX-free sampling source

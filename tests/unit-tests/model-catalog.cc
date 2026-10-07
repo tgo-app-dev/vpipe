@@ -1521,3 +1521,24 @@ TEST(model_catalog, dflash_drafters) {
     EXPECT_FALSE(e->needs_tokenizer_json);
   }
 }
+
+// Ministral-3 14B: catalogued under its own family, whole-repo fetch,
+// and a mistral3 registration (from disk or the catalogue) takes images
+// as well as text -- the Pixtral tower -- and answers in text.
+TEST(model_catalog, ministral3_present_with_vision) {
+  EXPECT_TRUE(has_(catalog_families(), "Ministral"));
+  const ModelCatalogEntry* e = catalog_by_path(
+      "mlx-community/Ministral-3-14B-Instruct-2512-4bit");
+  EXPECT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Ministral" && e->version == "3");
+  EXPECT_TRUE(e->param_class == "14B");
+  EXPECT_TRUE(e->model_type == "mistral3");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  EXPECT_TRUE(e->files.empty());
+  std::vector<std::string> in, out;
+  catalog_default_io("mistral3", in, out);
+  EXPECT_TRUE(has_(in, "text") && has_(in, "image"));
+  EXPECT_FALSE(has_(in, "audio"));
+  EXPECT_TRUE(out.size() == 1 && out[0] == "text");
+}

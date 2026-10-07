@@ -482,6 +482,65 @@ VideoWriter::~VideoWriter()
   }
 }
 
+// H.264's profile at a level, as VideoToolbox names them; null for one
+// it has not. "" is High, at the level the encoder picks.
+static CFStringRef
+h264_profile_level(const std::string& profile, const std::string& level)
+{
+  struct Row {
+    const char* profile;
+    const char* level;
+    CFStringRef value;
+  };
+  static const Row kRows[] = {
+    {"baseline", "", kVTProfileLevel_H264_Baseline_AutoLevel},
+    {"baseline", "3.0", kVTProfileLevel_H264_Baseline_3_0},
+    {"baseline", "3.1", kVTProfileLevel_H264_Baseline_3_1},
+    {"baseline", "3.2", kVTProfileLevel_H264_Baseline_3_2},
+    {"baseline", "4.0", kVTProfileLevel_H264_Baseline_4_0},
+    {"baseline", "4.1", kVTProfileLevel_H264_Baseline_4_1},
+    {"baseline", "4.2", kVTProfileLevel_H264_Baseline_4_2},
+    {"baseline", "5.0", kVTProfileLevel_H264_Baseline_5_0},
+    {"baseline", "5.1", kVTProfileLevel_H264_Baseline_5_1},
+    {"baseline", "5.2", kVTProfileLevel_H264_Baseline_5_2},
+    {"main", "", kVTProfileLevel_H264_Main_AutoLevel},
+    {"main", "3.0", kVTProfileLevel_H264_Main_3_0},
+    {"main", "3.1", kVTProfileLevel_H264_Main_3_1},
+    {"main", "3.2", kVTProfileLevel_H264_Main_3_2},
+    {"main", "4.0", kVTProfileLevel_H264_Main_4_0},
+    {"main", "4.1", kVTProfileLevel_H264_Main_4_1},
+    {"main", "4.2", kVTProfileLevel_H264_Main_4_2},
+    {"main", "5.0", kVTProfileLevel_H264_Main_5_0},
+    {"main", "5.1", kVTProfileLevel_H264_Main_5_1},
+    {"main", "5.2", kVTProfileLevel_H264_Main_5_2},
+    {"high", "", kVTProfileLevel_H264_High_AutoLevel},
+    {"high", "3.0", kVTProfileLevel_H264_High_3_0},
+    {"high", "3.1", kVTProfileLevel_H264_High_3_1},
+    {"high", "3.2", kVTProfileLevel_H264_High_3_2},
+    {"high", "4.0", kVTProfileLevel_H264_High_4_0},
+    {"high", "4.1", kVTProfileLevel_H264_High_4_1},
+    {"high", "4.2", kVTProfileLevel_H264_High_4_2},
+    {"high", "5.0", kVTProfileLevel_H264_High_5_0},
+    {"high", "5.1", kVTProfileLevel_H264_High_5_1},
+    {"high", "5.2", kVTProfileLevel_H264_High_5_2},
+  };
+  const std::string p = profile.empty() ? "high" : profile;
+  const std::string l = level == "auto" ? "" : level;
+  for (const Row& r : kRows) {
+    if (p == r.profile && l == r.level) { return r.value; }
+  }
+  return nullptr;
+}
+
+bool
+h264_settings_known(const std::string& profile, const std::string& level,
+                    const std::string& entropy)
+{
+  return h264_profile_level(profile, level) != nullptr &&
+         (entropy.empty() || entropy == "auto" || entropy == "cabac" ||
+          entropy == "cavlc");
+}
+
 bool
 VideoWriter::open(const std::string& path, const VideoWriteOptions& opt,
                   std::string* err)
@@ -547,13 +606,40 @@ VideoWriter::open(const std::string& path, const VideoWriteOptions& opt,
       comp[AVVideoProfileLevelKey] =
           (__bridge NSString*)kVTProfileLevel_HEVC_Main_AutoLevel;
     } else if (c == "h264") {
-      comp[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel;
+      CFStringRef pl = h264_profile_level(opt.profile, opt.level);
+      if (!pl) {
+        if (err) {
+          *err = "no H.264 profile '" + opt.profile + "' at level '" +
+                 opt.level + "'";
+        }
+        return false;
+      }
+      comp[AVVideoProfileLevelKey] = (__bridge NSString*)pl;
+      // Baseline has CAVLC alone; the others CABAC unless asked.
+      if (opt.profile != "baseline" && !opt.entropy.empty()) {
+        comp[AVVideoH264EntropyModeKey] = opt.entropy == "cavlc"
+            ? AVVideoH264EntropyModeCAVLC : AVVideoH264EntropyModeCABAC;
+      }
     }
     if (!is_prores(c)) {
       if (opt.bitrate > 0) { comp[AVVideoAverageBitRateKey] = @(opt.bitrate); }
       if (opt.quality > 0) {
         comp[(__bridge NSString*)kVTCompressionPropertyKey_Quality] =
             @(opt.quality);
+      }
+      // A peak: so many bytes in any one second.
+      if (opt.max_bitrate > 0) {
+        comp[(__bridge NSString*)kVTCompressionPropertyKey_DataRateLimits] =
+            @[ @(opt.max_bitrate / 8), @1 ];
+      }
+      if (opt.keyframe_interval > 0) {
+        comp[AVVideoMaxKeyFrameIntervalKey] = @(opt.keyframe_interval);
+      }
+      // Baseline has no B-frames: none, whatever was asked.
+      const bool baseline = c == "h264" && opt.profile == "baseline";
+      if (baseline || opt.frame_reordering >= 0) {
+        comp[AVVideoAllowFrameReorderingKey] =
+            @(!baseline && opt.frame_reordering > 0);
       }
     }
     if (c == "hevc" && t.is_hdr()) {

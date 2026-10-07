@@ -185,6 +185,7 @@ family_version_(const std::string& mt, std::string& family,
       {"gemma4_unified",         "Gemma",       "4"},
       {"gemma4-vision-encoder",  "Gemma",       "4"},
       {"llama3",                 "Llama",       "3"},
+      {"mistral3",               "Ministral",   "3"},
       {"krea2",                  "Krea",        "2"},
       {"krea2-lora",             "Krea",        "2"},
       {"flux2",                  "FLUX",        "2"},
@@ -275,6 +276,9 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   if (starts("yue2_vae"))          { return "yue2-vae"; }
   if (starts("yue2"))              { return "yue2"; }
   if (starts("llama"))             { return "llama3"; }
+  // Mistral3ForConditionalGeneration (Ministral-3): the Pixtral tower +
+  // a dense decoder, run on the metal Qwen path.
+  if (starts("mistral3"))          { return "mistral3"; }
   return {};
 }
 
@@ -641,7 +645,7 @@ bool
 io_trim_is_meaningful_(const std::string& mt)
 {
   return mt == "qwen3.5" || mt == "qwen3.6" || mt == "gemma4"
-         || mt == "gemma4_unified";
+         || mt == "gemma4_unified" || mt == "mistral3";
 }
 
 // Drop modalities the checkpoint plainly does not carry. The per-type

@@ -240,6 +240,24 @@ public:
     // T everywhere, H at 1+3k, W at 2+3k. Qwen2.5-VL (sectioned, classic HF
     // apply_multimodal_rotary_pos_emb): contiguous blocks [T..|H..|W..].
     bool  mrope_interleaved = true;
+    // YaRN RoPE (Ministral-3): with rope_yarn_factor > 1 the inv_freq
+    // table blends interpolated (/factor) and extrapolated frequencies
+    // across the [beta_fast, beta_slow] correction band of the ORIGINAL
+    // context, exactly as HF's _compute_yarn_parameters (truncate) and
+    // mlx-lm's YarnRoPE build it. Its attention factor (mscale over
+    // mscale_all_dim) must be 1 -- Ministral's is -- and load() refuses
+    // anything else rather than run without the cos/sin scale.
+    float rope_yarn_factor      = 1.0f;
+    int   rope_yarn_orig_ctx    = 0;
+    float rope_yarn_beta_fast   = 32.0f;
+    float rope_yarn_beta_slow   = 1.0f;
+    float rope_yarn_attn_factor = 1.0f;
+    // Llama-4 attention temperature (Ministral-3): queries scaled by
+    // 1 + beta * log(1 + floor(pos / orig)) after their RoPE, at each
+    // row's own position (rope_partial_qscale_f16). Exactly 1 below
+    // `orig`. beta 0 = off.
+    float attn_temp_beta = 0.0f;
+    int   attn_temp_orig = 0;
 
     int key_dim()   const { return gdn_k_heads * gdn_k_dim; }   // 2048
     int value_dim() const { return gdn_v_heads * gdn_v_dim; }   // 4096
@@ -983,6 +1001,15 @@ private:
     int q_offset = 0;
   };
 
+  // A long plain prefill in balanced pieces of at most prefill_piece_()
+  // rows, each run against the K/V the pieces before it wrote -- the
+  // mid-context path a second chat turn takes. Bounds the transient
+  // activations (Ministral-3's MLP alone is ~96 KB a row) by the piece,
+  // not the prompt. The last piece's logits.
+  std::vector<float> forward_pieces_(ContextId cid,
+                                     const metal_compute::SharedBuffer& x,
+                                     int n);
+  static int prefill_piece_();
   std::vector<float> forward_chunk_(
       ContextId cid, const metal_compute::SharedBuffer& x, int n,
       const metal_compute::SharedBuffer* mrope_cos,
@@ -1310,7 +1337,8 @@ private:
       _fn_qmv8, _fn_qmv8_add, _fn_qmm8, _fn_dequant8, _fn_qmv8_batch,
       _fn_requant_w8w4,
       _fn_transpose,
-      _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rms_rope,
+      _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rope_qscale,
+      _fn_rms_rope,
       _fn_mul_sigmoid, _fn_bias_add,
       _fn_head_slice, _fn_sdpa_paged, _fn_sdpa_paged_kvl,
       _fn_sdpa_paged_mb256, _fn_sdpa_paged_mb,
@@ -1321,7 +1349,7 @@ private:
       // MLX steel register-softmax flash with a paged K/V tg loader (mid-
       // context prefill, q_offset>0 -- no de-paged kfull scratch). No function
       // constants (bounds/causal handled in-kernel) -> a plain cached function.
-      _fn_steel_paged,
+      _fn_steel_paged, _fn_steel_paged128,
       // Shared-prefix batched decode attention (head_dim 256): phase A reads
       // the N branches' shared prefix once, phase B merges per-branch private.
       _fn_sdpa_shared_mb256, _fn_sdpa_merge_mb256,

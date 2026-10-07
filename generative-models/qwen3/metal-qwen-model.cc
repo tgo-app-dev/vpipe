@@ -12,9 +12,11 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/event.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/flex-bag.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <limits>
@@ -890,6 +892,9 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     // models; bf16 keeps the paged flash. No function constants -> bind once.
     m->_lib_attn = mc->load_library("attn_steel");
     m->_fn_steel_paged = m->_lib_attn.function("attn_steel_paged_bd256");
+    // The same kernel at head_dim 128 (Ministral-3 and the other dense
+    // 128-wide heads): their long prompts fell to the key-split flash.
+    m->_fn_steel_paged128 = m->_lib_attn.function("attn_steel_paged_bd128");
   }
   // 4-bit (Qwen3.5/Llama) vs 8-bit (Qwen3-ASR) quantized-linear kernels.
   const std::string g = cfg.quant_bits == 8 ? "w8g64" : "w4g64";
@@ -1051,6 +1056,18 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_transpose = m->_lib_elt.function("transpose_abd_f16");
   m->_fn_kv_write_paged = m->_lib_elt.function("kv_write_paged_f16");
   m->_fn_rope_partial = m->_lib_rope.function("rope_partial_f16");
+  // The queries' RoPE under the Llama-4 attention temperature.
+  if (cfg.attn_temp_beta != 0.0f) {
+    m->_fn_rope_qscale = m->_lib_rope.function("rope_partial_qscale_f16");
+    if (!m->_fn_rope_qscale.valid() || cfg.attn_temp_orig <= 0) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] the attention temperature's RoPE kernel "
+                    "(rope_partial_qscale_f16) did not load -- model not "
+                    "loaded"));
+      }
+      return nullptr;
+    }
+  }
   // Fused per-head RMSNorm + partial RoPE (decode): folds q_norm+rope_q
   // and k_norm+rope_k into one dispatch each. Optional -> falls back to
   // the separate rms + rope kernels.
@@ -1715,6 +1732,47 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     invf[i] = 1.0f / std::pow(cfg.rope_theta,
                               (2.0f * (float)i) / (float)cfg.rotary_dim);
   }
+  // YaRN (Ministral-3). The correction band [low, high] is in rotary
+  // pair index, from the dims that complete beta_fast / beta_slow turns
+  // over the ORIGINAL context; inside it the frequency ramps from
+  // extrapolated (unscaled) to interpolated (/factor). Built the way
+  // mlx-lm's YarnRoPE builds its `_freqs` (f32, then 1/freq as its rope
+  // kernel takes it), which is HF's inv_freq rearranged.
+  if (cfg.rope_yarn_factor > 1.0f) {
+    if (cfg.rope_yarn_orig_ctx <= 0
+        || std::fabs(cfg.rope_yarn_attn_factor - 1.0f) > 1e-6f) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] YaRN with attention factor {} / original "
+                    "context {} is not supported -- model not loaded",
+                    cfg.rope_yarn_attn_factor, cfg.rope_yarn_orig_ctx));
+      }
+      return nullptr;
+    }
+    const double dims = cfg.rotary_dim;
+    const double base = cfg.rope_theta;
+    auto corr_dim = [&](double rotations) {
+      return dims * std::log((double)cfg.rope_yarn_orig_ctx
+                             / (rotations * 2.0 * M_PI))
+          / (2.0 * std::log(base));
+    };
+    double low  = std::floor(corr_dim(cfg.rope_yarn_beta_fast));
+    double high = std::ceil(corr_dim(cfg.rope_yarn_beta_slow));
+    low  = std::max(low, 0.0);
+    high = std::min(high, dims - 1.0);
+    if (low == high) { high += 0.001; }   // HF/mlx: avoid the 0/0
+    const float f = cfg.rope_yarn_factor;
+    for (int i = 0; i < half; ++i) {
+      const float ramp = std::clamp(
+          (float)(((double)i - low) / (high - low)), 0.0f, 1.0f);
+      const float mask  = 1.0f - ramp;   // weight of extrapolation
+      const float extra = std::pow((float)base,
+                                   (2.0f * (float)i) / (float)dims);
+      const float inter = f * extra;
+      const float freq =
+          (inter * extra) / (inter * mask + extra * (1.0f - mask));
+      invf[i] = 1.0f / freq;
+    }
+  }
 
   // mROPE axis lookup over the rotary_dim/2 pairs. Two layouts:
   //  - interleaved (Qwen3-VL, mlx-vlm apply_interleaved_mrope): T everywhere,
@@ -2360,6 +2418,57 @@ MetalQwenModel::config_from(const ModelConfig& c)
   // decoders never approach it. This mirrors the MLX path, whose context
   // manager grows on demand with no fixed per-context cap.
   m.max_seq    = 16384;
+
+  // Mistral3 / Ministral-3: a plain dense decoder -- no q/k norm, no
+  // output gate, standard RMSNorm, full RoPE -- under "language_model.",
+  // with YaRN RoPE and the Llama-4 query temperature in rope_parameters.
+  if (c.architecture == "Mistral3ForConditionalGeneration") {
+    m.qk_norm            = false;
+    m.attn_output_gate   = false;
+    m.zero_centered_norm = false;
+    m.rotary_dim         = m.head_dim;
+    m.weight_prefix      = "language_model.";
+    const FlexData rp = bag::value(c.extra, model_config::kRopeParameters);
+    const std::string kind =
+        bag::text(rp, "rope_type", bag::text(rp, "type"));
+    if (kind == "yarn") {
+      const double factor = bag::real(rp, "factor", 1.0);
+      m.rope_yarn_factor   = (float)factor;
+      m.rope_yarn_orig_ctx = (int)bag::integer(
+          rp, "original_max_position_embeddings", 0);
+      m.rope_yarn_beta_fast = (float)bag::real(rp, "beta_fast", 32.0);
+      m.rope_yarn_beta_slow = (float)bag::real(rp, "beta_slow", 1.0);
+      // HF: attention_factor if stated, else get_mscale(factor, mscale) /
+      // get_mscale(factor, mscale_all_dim) when both are set, else
+      // get_mscale(factor).
+      auto get_mscale = [](double s, double ms) {
+        return s <= 1.0 ? 1.0 : 0.1 * ms * std::log(s) + 1.0;
+      };
+      const double ms  = bag::real(rp, "mscale", 0.0);
+      const double msa = bag::real(rp, "mscale_all_dim", 0.0);
+      double af = get_mscale(factor, 1.0);
+      if (bag::has(rp, "attention_factor")) {
+        af = bag::real(rp, "attention_factor", 1.0);
+      } else if (ms != 0.0 && msa != 0.0) {
+        af = get_mscale(factor, ms) / get_mscale(factor, msa);
+      }
+      m.rope_yarn_attn_factor = (float)af;
+    }
+    // The Llama-4 query temperature, q *= 1 + beta*log(1 + floor(pos /
+    // orig)) -- exactly 1 below `orig` (16384), 1.069 to 32767, 1.110 to
+    // 49151, ... -- applied with the queries' RoPE.
+    m.attn_temp_beta = (float)bag::real(rp, "llama_4_scaling_beta", 0.0);
+    m.attn_temp_orig = (int)bag::integer(
+        rp, "original_max_position_embeddings", 0);
+    if (m.attn_temp_orig <= 0) { m.attn_temp_beta = 0.0f; }
+    // The model's own context (262144) is the per-context cap. KV pages
+    // are still allocated as tokens arrive, up to the pool the caller
+    // sizes (max_pages * page_tokens), so a large cap costs nothing
+    // until it is used.
+    if (c.max_position_embeddings > m.max_seq) {
+      m.max_seq = c.max_position_embeddings;
+    }
+  }
   return m;
 }
 
@@ -3415,8 +3524,11 @@ MetalQwenModel::encode_decode_step_(
     enc.set_constant(7, gstride);
     enc.dispatch({(unsigned)(Hh * W), 1, 1}, {256, 1, 1});
   };
-  auto rope = [&](const SharedBuffer& xb, int heads, std::size_t xoff = 0) {
-    enc.set_function(_fn_rope_partial);
+  // `q`: these are queries, which take the attention temperature too.
+  const bool qtemp = c.attn_temp_beta != 0.0f;
+  auto rope = [&](const SharedBuffer& xb, int heads, std::size_t xoff = 0,
+                  bool q = false) {
+    enc.set_function(q && qtemp ? _fn_rope_qscale : _fn_rope_partial);
     enc.set_buffer(0, xb, xoff);  // in-place rotate
     enc.set_buffer(1, _inv_freq);
     enc.set_constant(2, heads);
@@ -3425,6 +3537,10 @@ MetalQwenModel::encode_decode_step_(
     enc.set_constant(4, D);
     enc.set_constant(5, c.rotary_dim);
     enc.set_constant(6, rpos);
+    if (q && qtemp) {
+      enc.set_constant(7, c.attn_temp_beta);
+      enc.set_constant(8, c.attn_temp_orig);
+    }
     enc.dispatch({(unsigned)(c.rotary_dim / 2), 1, (unsigned)heads},
                  {(unsigned)(c.rotary_dim / 2), 1, 1});
   };
@@ -3592,7 +3708,10 @@ MetalQwenModel::encode_decode_step_(
           hslice(_d_qfull, 0, _d_vbuf, 0, 1, Nfqkv, kd, qdo + kd);
         }
       });
-      if (_fn_rms_rope.valid() && dup < 0) {
+      if (!c.qk_norm) {
+        // No per-head q/k norm (Ministral-3): RoPE alone.
+        DUP(DC_ROPE, [&] { rope(_d_q3, Hq, 0, true); rope(kb, Hkv, kb_o); });
+      } else if (_fn_rms_rope.valid() && dup < 0 && !qtemp) {
         // Fused: q_norm+rope_q and k_norm+rope_k -> one dispatch each. (These
         // two are independent, but overlapping them under hybrid measured ~0 --
         // latency-bound tiny ops, encoder-switch cost cancels the gain.)
@@ -3603,7 +3722,7 @@ MetalQwenModel::encode_decode_step_(
           rms(_d_q3, 0, ly.q_norm, _d_q3, 0, Hq, D);
           rms(kb, kb_o, ly.k_norm, kb, kb_o, Hkv, D);
         });
-        DUP(DC_ROPE, [&] { rope(_d_q3, Hq); rope(kb, Hkv, kb_o); });
+        DUP(DC_ROPE, [&] { rope(_d_q3, Hq, 0, true); rope(kb, Hkv, kb_o); });
       }
       DUP(DC_MISC, [&] { kv_write(kb, kp, kb_o); kv_write(vb, vp, vb_o); });
       // Multi-simdgroup paged attention past the long-context threshold
@@ -4775,13 +4894,19 @@ MetalQwenModel::encode_batched_step_(
   // Partial RoPE on one branch's q or k block (offset `xoff` bytes, `heads`
   // head-rows of D), at that branch's own position `rp` -- so branches need
   // NOT share a seq_len. The norm is done batched beforehand (rms).
+  // `q`: queries also take the attention temperature at their position.
+  const bool qtemp = c.attn_temp_beta != 0.0f;
   auto rope = [&](const SharedBuffer& xb, std::size_t xoff, int heads,
-                  int rp) {
-    enc.set_function(_fn_rope_partial);
+                  int rp, bool q = false) {
+    enc.set_function(q && qtemp ? _fn_rope_qscale : _fn_rope_partial);
     enc.set_buffer(0, xb, xoff); enc.set_buffer(1, _inv_freq);
     enc.set_constant(2, heads); const int one = 1; enc.set_constant(3, one);
     enc.set_constant(4, D); enc.set_constant(5, c.rotary_dim);
     enc.set_constant(6, rp);
+    if (q && qtemp) {
+      enc.set_constant(7, c.attn_temp_beta);
+      enc.set_constant(8, c.attn_temp_orig);
+    }
     enc.dispatch({(unsigned)(c.rotary_dim / 2), 1, (unsigned)heads},
                  {(unsigned)(c.rotary_dim / 2), 1, 1});
   };
@@ -4830,8 +4955,10 @@ MetalQwenModel::encode_batched_step_(
       // Batched per-head q/k RMSNorm (position-independent). RoPE is applied
       // per branch below at its own position (no transpose: the decode SDPA
       // reads q/k head-major [Hq|Hkv, D]).
-      rms(bs.q3, 0, ly.q_norm, bs.q3, 0, N * Hq, D);
-      rms(bs.kbuf, 0, ly.k_norm, bs.kbuf, 0, N * Hkv, D);
+      if (c.qk_norm) {
+        rms(bs.q3, 0, ly.q_norm, bs.q3, 0, N * Hq, D);
+        rms(bs.kbuf, 0, ly.k_norm, bs.kbuf, 0, N * Hkv, D);
+      }
       // Per-branch RoPE at this branch's position + write K/V to its slot
       // (cheap, not weight-bound). Branches need NOT share a seq_len.
       //
@@ -4847,7 +4974,7 @@ MetalQwenModel::encode_batched_step_(
         const std::size_t qoff = (std::size_t)i * qd * 2;
         const std::size_t koff = (std::size_t)i * kd * 2;
         const int pos_i = slots[(std::size_t)i].position;
-        rope(bs.q3, qoff, Hq, rope_pos_v[(std::size_t)i]);
+        rope(bs.q3, qoff, Hq, rope_pos_v[(std::size_t)i], /*q=*/true);
         rope(bs.kbuf, koff, Hkv, rope_pos_v[(std::size_t)i]);
         // kv_write k_i, v_i.
         auto kvw = [&](const SharedBuffer& src, std::size_t soff,
@@ -5478,6 +5605,11 @@ MetalQwenModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
                                    _cfg.hidden * 2);
   }
   const bool tapping = !taps.empty();
+  // A long prompt goes in pieces -- unless the MTP seed or the DFlash taps
+  // need the whole of it in one forward.
+  if (!seed && !tapping && n > prefill_piece_()) {
+    return forward_pieces_(cid, x, n);
+  }
   std::vector<float> r =
       forward_chunk_(cid, x, n, nullptr, nullptr, false, nullptr, false,
                      nullptr, seed ? &allh : nullptr,
@@ -5591,7 +5723,47 @@ MetalQwenModel::prefill_embeddings_buf(ContextId cid, SharedBuffer&& x, int n)
   const int H = _cfg.hidden;
   if (n <= 0 || x.byte_size() < (std::size_t)n * H * 2) { return {}; }
   // Plain 1-D RoPE over sequential positions (nullptr mrope tables).
+  if (n > prefill_piece_()) { return forward_pieces_(cid, x, n); }
   return forward_chunk_(cid, x, n, nullptr, nullptr);
+}
+
+int
+MetalQwenModel::prefill_piece_()
+{
+  // 8192 rows keep a piece's activations near 1.5 GB on Ministral-3 and
+  // far above every attention kernel's crossover (2048).
+  // VPIPE_QWEN_PREFILL_CHUNK sets it; 0 disables the split.
+  static const int piece = []() {
+    const char* e = std::getenv("VPIPE_QWEN_PREFILL_CHUNK");
+    if (e != nullptr) {
+      const int v = std::atoi(e);
+      return v <= 0 ? std::numeric_limits<int>::max() : std::max(v, 512);
+    }
+    return 8192;
+  }();
+  return piece;
+}
+
+std::vector<float>
+MetalQwenModel::forward_pieces_(ContextId cid, const SharedBuffer& x, int n)
+{
+  // Balanced pieces, so the last is never a sliver (a 1-row piece would
+  // be a decode step's shape).
+  const int pieces = (n + prefill_piece_() - 1) / prefill_piece_();
+  const int size = (n + pieces - 1) / pieces;
+  const std::size_t rowb = (std::size_t)_cfg.hidden * 2;
+  std::vector<float> r;
+  for (int r0 = 0; r0 < n; r0 += size) {
+    const int m = std::min(size, n - r0);
+    SharedBuffer part = _mc->make_shared_buffer((std::size_t)m * rowb);
+    std::memcpy(part.contents(),
+                static_cast<const std::uint8_t*>(x.contents())
+                    + (std::size_t)r0 * rowb,
+                (std::size_t)m * rowb);
+    r = forward_chunk_(cid, part, m, nullptr, nullptr);
+    if (r.empty()) { return r; }
+  }
+  return r;
 }
 
 metal_compute::SharedBuffer
@@ -5951,10 +6123,12 @@ MetalQwenModel::calib_build_layer(const MetalLlamaWeights& wts, int L,
     ok = ok && fuse_f16({p + "self_attn.q_proj", p + "self_attn.k_proj",
                          p + "self_attn.v_proj"}, ly.qw);
     ok = ok && !(ly.ow = to_elt(p + "self_attn.o_proj.weight")).empty();
-    ly.q_norm = to_elt(p + "self_attn.q_norm.weight");
-    ly.k_norm = to_elt(p + "self_attn.k_norm.weight");
-    ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
-    add_one(ly.q_norm); add_one(ly.k_norm);
+    if (_cfg.qk_norm) {
+      ly.q_norm = to_elt(p + "self_attn.q_norm.weight");
+      ly.k_norm = to_elt(p + "self_attn.k_norm.weight");
+      ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
+      add_one(ly.q_norm); add_one(ly.k_norm);
+    }
   } else {
     ok = ok && fuse_f16({p + "linear_attn.in_proj_qkv",
                          p + "linear_attn.in_proj_z",
@@ -6138,12 +6312,17 @@ MetalQwenModel::calib_run_layer(int L, std::vector<SharedBuffer>& resid,
         enc.set_constant(2, A); enc.set_constant(3, Bd); enc.set_constant(4, D);
         enc.dispatch({(unsigned)D, (unsigned)Bd, (unsigned)A}, {(unsigned)D, 1, 1});
       };
-      auto rope = [&](const SharedBuffer& xb, int heads) {
-        enc.set_function(_fn_rope_partial);
+      const bool qtemp = c.attn_temp_beta != 0.0f;
+      auto rope = [&](const SharedBuffer& xb, int heads, bool q = false) {
+        enc.set_function(q && qtemp ? _fn_rope_qscale : _fn_rope_partial);
         enc.set_buffer(0, xb); enc.set_buffer(1, _inv_freq);
         enc.set_constant(2, heads); enc.set_constant(3, n);
         enc.set_constant(4, D); enc.set_constant(5, c.rotary_dim);
         enc.set_constant(6, q_offset);
+        if (q && qtemp) {
+          enc.set_constant(7, c.attn_temp_beta);
+          enc.set_constant(8, c.attn_temp_orig);
+        }
         enc.dispatch({(unsigned)(c.rotary_dim / 2), (unsigned)n,
                       (unsigned)heads}, {(unsigned)(c.rotary_dim / 2), 1, 1});
       };
@@ -6180,12 +6359,14 @@ MetalQwenModel::calib_run_layer(int L, std::vector<SharedBuffer>& resid,
         }
         hslice(qfull, kbuf, n, Nfqkv, kd, qdo);
         hslice(qfull, vbuf, n, Nfqkv, kd, qdo + kd);
-        rms(q3, 0, ly.q_norm, q3, 0, n * Hq, D);
-        rms(kbuf, 0, ly.k_norm, kbuf, 0, n * Hkv, D);
+        if (c.qk_norm) {
+          rms(q3, 0, ly.q_norm, q3, 0, n * Hq, D);
+          rms(kbuf, 0, ly.k_norm, kbuf, 0, n * Hkv, D);
+        }
         transpose(q3, qt, n, Hq);
         transpose(kbuf, kt, n, Hkv);
         transpose(vbuf, vt, n, Hkv);
-        rope(qt, Hq); rope(kt, Hkv);
+        rope(qt, Hq, /*q=*/true); rope(kt, Hkv);
         kv_write(kt, kp); kv_write(vt, vp);
         enc.set_function(_fn_sdpa_paged);
         enc.set_buffer(0, qt); enc.set_buffer(1, kp); enc.set_buffer(2, vp);
@@ -6712,8 +6893,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       enc.set_constant(4, D);
       enc.dispatch({(unsigned)D, (unsigned)Bd, (unsigned)A}, {(unsigned)D, 1, 1});
     };
-    auto rope = [&](const SharedBuffer& xb, int heads) {
-      enc.set_function(_fn_rope_partial);
+    // `q`: queries also take the attention temperature at their position.
+    const bool qtemp = c.attn_temp_beta != 0.0f;
+    auto rope = [&](const SharedBuffer& xb, int heads, bool q = false) {
+      enc.set_function(q && qtemp ? _fn_rope_qscale : _fn_rope_partial);
       enc.set_buffer(0, xb);
       enc.set_buffer(1, _inv_freq);
       enc.set_constant(2, heads);
@@ -6721,6 +6904,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
       enc.set_constant(4, D);
       enc.set_constant(5, c.rotary_dim);
       enc.set_constant(6, q_offset);
+      if (q && qtemp) {
+        enc.set_constant(7, c.attn_temp_beta);
+        enc.set_constant(8, c.attn_temp_orig);
+      }
       enc.dispatch({(unsigned)(c.rotary_dim / 2), (unsigned)n, (unsigned)heads},
                    {(unsigned)(c.rotary_dim / 2), 1, 1});
     };
@@ -6801,7 +6988,9 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
     // 2k-on-6k mid-context. half-only kernel -> f16 models (_lib_attn invalid
     // for bf16). Crossover ~1.5k -> default min 2048 (attention too small a
     // slice below it; the lighter key-split flash wins). VPIPE_QWEN_STEEL_ATTN=0
-    // forces the paged flash for A/B.
+    // forces the paged flash for A/B. Head dim 128 too (bd128): MEASURED on
+    // Ministral-3 at 33.8k tokens, prefill 385 -> 197 s (mlx-vlm 198) --
+    // the key-split flash had been ~1.5 TFLOP/s of attention there.
     bool steel_paged = false;
     {
       static const int kSteel = []() {
@@ -6812,8 +7001,11 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         const char* e = std::getenv("VPIPE_QWEN_STEEL_MIN");
         return (e && std::atoi(e) > 0) ? std::atoi(e) : 2048;
       }();
-      steel_paged = kSteel && _lib_attn.valid() && _fn_steel_paged.valid() &&
-          D == 256 && n >= kSteelMin && kSkipMode != 1;
+      const bool steel_d =
+          (D == 256 && _fn_steel_paged.valid())
+          || (D == 128 && _fn_steel_paged128.valid());
+      steel_paged = kSteel && _lib_attn.valid() && steel_d &&
+          page_tokens % 16 == 0 && n >= kSteelMin && kSkipMode != 1;
     }
     // PRIMARY: the prefill GQA attention SET picks steel/flash/qtile per the
     // chunk's n-regime (steel/flash crossover discovered at load). The legacy
@@ -6911,7 +7103,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         transpose(kbuf, kt, n, Hkv);
         transpose(vbuf, vt, n, Hkv);
         if (mrope_cos != nullptr) { mrope(qt, Hq); mrope(kt, Hkv); }
-        else { rope(qt, Hq); rope(kt, Hkv); }
+        else { rope(qt, Hq, /*q=*/true); rope(kt, Hkv); }
         kv_write(kt, kp);
         kv_write(vt, vp);
         if (key_valid_len > 0 && kSkipMode != 1) {
@@ -6946,7 +7138,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         } else if (steel_paged) {
           // MLX steel register-softmax flash, K/V staged from the paged pool
           // (serves fresh + mid-context; O written to at [Hq,n,D]).
-          enc.set_function(_fn_steel_paged);
+          enc.set_function(D == 128 ? _fn_steel_paged128 : _fn_steel_paged);
           enc.set_buffer(0, qt);
           enc.set_buffer(1, kp);
           enc.set_buffer(2, vp);
@@ -7970,12 +8162,18 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
     // offset so the verify uses the same rotary position the serial decode
     // would. Attention masking + KV writes still use the true slot (q_offset).
     const int rope_base = q_offset + rope_delta;
-    auto rope = [&](const SharedBuffer& xb, int heads) {
-      enc.set_function(_fn_rope_partial);
+    // `q`: queries also take the attention temperature at their position.
+    const bool qtemp = c.attn_temp_beta != 0.0f;
+    auto rope = [&](const SharedBuffer& xb, int heads, bool q = false) {
+      enc.set_function(q && qtemp ? _fn_rope_qscale : _fn_rope_partial);
       enc.set_buffer(0, xb); enc.set_buffer(1, _inv_freq);
       enc.set_constant(2, heads); enc.set_constant(3, n);
       enc.set_constant(4, D); enc.set_constant(5, c.rotary_dim);
       enc.set_constant(6, rope_base);
+      if (q && qtemp) {
+        enc.set_constant(7, c.attn_temp_beta);
+        enc.set_constant(8, c.attn_temp_orig);
+      }
       enc.dispatch({(unsigned)(c.rotary_dim / 2), (unsigned)n, (unsigned)heads},
                    {(unsigned)(c.rotary_dim / 2), 1, 1});
     };
@@ -8071,12 +8269,14 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
             hslice(qraw, q3, n, qdo, qd, 0, 0, 0);
           }
         }
-        rms(q3, 0, ly.q_norm, q3, 0, n * Hq, D);
-        rms(kbuf, 0, ly.k_norm, kbuf, 0, n * Hkv, D);
+        if (c.qk_norm) {
+          rms(q3, 0, ly.q_norm, q3, 0, n * Hq, D);
+          rms(kbuf, 0, ly.k_norm, kbuf, 0, n * Hkv, D);
+        }
         transpose(q3, qt, n, Hq);
         transpose(kbuf, kt, n, Hkv);
         transpose(vbuf, vt, n, Hkv);
-        rope(qt, Hq); rope(kt, Hkv);
+        rope(qt, Hq, /*q=*/true); rope(kt, Hkv);
         kv_write(kt, kp); kv_write(vt, vp);
         // Attention. The scalar paged kernel runs one simdgroup per (head,
         // query) scanning the WHOLE KV with 32 lanes -- fine at short KV, but

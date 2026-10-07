@@ -479,7 +479,12 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND NOT VPIPE_METAL_RUNTIME_COMPILE)
     set(_probe_lib ${CMAKE_BINARY_DIR}/plugin_probe.metallib)
     add_custom_command(
         OUTPUT ${_probe_lib}
-        COMMAND xcrun -sdk macosx metal -c ${_probe_src} -o ${_probe_air}
+        # Pinned like the kernel helpers: this fixture exists to mimic a
+        # plugin's own shaders, so it has to be built the way a plugin's
+        # are. Unpinned it records the build machine's OS instead.
+        COMMAND xcrun -sdk macosx metal
+                -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}
+                -c ${_probe_src} -o ${_probe_air}
         COMMAND xcrun -sdk macosx metallib ${_probe_air} -o ${_probe_lib}
         DEPENDS ${_probe_src}
         COMMENT "Compiling plugin_probe.metal -> plugin_probe.metallib (test)"

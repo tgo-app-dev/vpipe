@@ -6,6 +6,8 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -341,6 +343,224 @@ llama3_match_one_(const char* data, size_t len, size_t pos,
 }
 
 // ---------------------------------------------------------------------
+// Tekken pre-tokenizer scanner (Mistral: Ministral 3, Pixtral, Mistral
+// Small 3.x). The Split pattern is GPT-4o's minus the contractions, with
+// single digits and a trailing [\r\n/]*:
+//
+//     [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*
+//                       [\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+//   | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+
+//                       [\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+//   | \p{N}
+//   |  ?[^\s\p{L}\p{N}]+[\r\n/]*
+//   | \s*[\r\n]+
+//   | \s+(?!\S)
+//   | \s+
+//
+// It splits letter runs on CASE ("HelloWorld" -> "Hello" "World"), so
+// the coarse is_letter_cp_ above cannot serve it. The classes come from
+// CoreFoundation's Unicode tables, plus the Nl/No numbers (superscripts,
+// fractions, roman numerals...) it has no set for.
+// ---------------------------------------------------------------------
+
+enum class UCls : uint8_t {
+  Other,         // punctuation, symbols, controls
+  Upper,         // Lu, Lt
+  Lower,         // Ll
+  LetterOther,   // Lm, Lo -- in BOTH case classes of the pattern
+  Mark,          // M* -- in both case classes, but NOT \p{L}
+  Number,        // N*
+  Space,         // White_Space
+};
+
+// General category Nl + No (Unicode 16), which CoreFoundation's
+// decimal-digit set (Nd only) leaves out.
+constexpr uint32_t kNumberLetterOther[][2] = {
+  {0x00B2, 0x00B3}, {0x00B9, 0x00B9}, {0x00BC, 0x00BE}, {0x09F4, 0x09F9},
+  {0x0B72, 0x0B77}, {0x0BF0, 0x0BF2}, {0x0C78, 0x0C7E}, {0x0D58, 0x0D5E},
+  {0x0D70, 0x0D78}, {0x0F2A, 0x0F33}, {0x1369, 0x137C}, {0x16EE, 0x16F0},
+  {0x17F0, 0x17F9}, {0x19DA, 0x19DA}, {0x2070, 0x2070}, {0x2074, 0x2079},
+  {0x2080, 0x2089}, {0x2150, 0x2182}, {0x2185, 0x2189}, {0x2460, 0x249B},
+  {0x24EA, 0x24FF}, {0x2776, 0x2793}, {0x2CFD, 0x2CFD}, {0x3007, 0x3007},
+  {0x3021, 0x3029}, {0x3038, 0x303A}, {0x3192, 0x3195}, {0x3220, 0x3229},
+  {0x3248, 0x324F}, {0x3251, 0x325F}, {0x3280, 0x3289}, {0x32B1, 0x32BF},
+  {0xA6E6, 0xA6EF}, {0xA830, 0xA835}, {0x10107, 0x10133},
+  {0x10140, 0x10178}, {0x1018A, 0x1018B}, {0x102E1, 0x102FB},
+  {0x10320, 0x10323}, {0x10341, 0x10341}, {0x1034A, 0x1034A},
+  {0x103D1, 0x103D5}, {0x10858, 0x1085F}, {0x10879, 0x1087F},
+  {0x108A7, 0x108AF}, {0x108FB, 0x108FF}, {0x10916, 0x1091B},
+  {0x109BC, 0x109BD}, {0x109C0, 0x109CF}, {0x109D2, 0x109FF},
+  {0x10A40, 0x10A48}, {0x10A7D, 0x10A7E}, {0x10A9D, 0x10A9F},
+  {0x10AEB, 0x10AEF}, {0x10B58, 0x10B5F}, {0x10B78, 0x10B7F},
+  {0x10BA9, 0x10BAF}, {0x10CFA, 0x10CFF}, {0x10E60, 0x10E7E},
+  {0x10F1D, 0x10F26}, {0x10F51, 0x10F54}, {0x10FC5, 0x10FCB},
+  {0x11052, 0x11065}, {0x111E1, 0x111F4}, {0x1173A, 0x1173B},
+  {0x118EA, 0x118F2}, {0x11C5A, 0x11C6C}, {0x11FC0, 0x11FD4},
+  {0x12400, 0x1246E}, {0x16B5B, 0x16B61}, {0x16E80, 0x16E96},
+  {0x1D2C0, 0x1D2D3}, {0x1D2E0, 0x1D2F3}, {0x1D360, 0x1D378},
+  {0x1E8C7, 0x1E8CF}, {0x1EC71, 0x1ECAB}, {0x1ECAD, 0x1ECAF},
+  {0x1ECB1, 0x1ECB4}, {0x1ED01, 0x1ED2D}, {0x1ED2F, 0x1ED3D},
+  {0x1F100, 0x1F10C},
+};
+
+UCls
+uni_class_(uint32_t cp)
+{
+  if (cp < 0x80) {
+    if (cp >= 'a' && cp <= 'z') { return UCls::Lower; }
+    if (cp >= 'A' && cp <= 'Z') { return UCls::Upper; }
+    if (cp >= '0' && cp <= '9') { return UCls::Number; }
+    if (cp == ' ' || (cp >= 0x09 && cp <= 0x0D)) { return UCls::Space; }
+    return UCls::Other;
+  }
+  // The predefined sets are immutable singletons owned by CF.
+  static const CFCharacterSetRef ws =
+      CFCharacterSetGetPredefined(kCFCharacterSetWhitespaceAndNewline);
+  static const CFCharacterSetRef upper =
+      CFCharacterSetGetPredefined(kCFCharacterSetUppercaseLetter);
+  static const CFCharacterSetRef lower =
+      CFCharacterSetGetPredefined(kCFCharacterSetLowercaseLetter);
+  static const CFCharacterSetRef letter =
+      CFCharacterSetGetPredefined(kCFCharacterSetLetter);   // L* + M*
+  static const CFCharacterSetRef mark =
+      CFCharacterSetGetPredefined(kCFCharacterSetNonBase);  // M*
+  static const CFCharacterSetRef digit =
+      CFCharacterSetGetPredefined(kCFCharacterSetDecimalDigit);
+  const auto c = static_cast<UTF32Char>(cp);
+  if (CFCharacterSetIsLongCharacterMember(ws, c))     { return UCls::Space; }
+  if (CFCharacterSetIsLongCharacterMember(upper, c))  { return UCls::Upper; }
+  if (CFCharacterSetIsLongCharacterMember(lower, c))  { return UCls::Lower; }
+  if (CFCharacterSetIsLongCharacterMember(mark, c))   { return UCls::Mark; }
+  if (CFCharacterSetIsLongCharacterMember(letter, c)) {
+    return UCls::LetterOther;
+  }
+  if (CFCharacterSetIsLongCharacterMember(digit, c))  { return UCls::Number; }
+  for (const auto& r : kNumberLetterOther) {
+    if (cp < r[0]) { break; }
+    if (cp <= r[1]) { return UCls::Number; }
+  }
+  return UCls::Other;
+}
+
+// One leftmost-alternative match of the Tekken pattern at `pos`; the
+// byte length of the chunk, never 0 while pos < len.
+size_t
+tekken_match_one_(const char* data, size_t len, size_t pos)
+{
+  auto cls_at = [&](size_t p, size_t* cl) {
+    const uint32_t cp = utf8_next_(data, len, p, cl);
+    return std::make_pair(cp, uni_class_(cp));
+  };
+  auto in_u = [](UCls c) {
+    return c == UCls::Upper || c == UCls::LetterOther || c == UCls::Mark;
+  };
+  auto in_l = [](UCls c) {
+    return c == UCls::Lower || c == UCls::LetterOther || c == UCls::Mark;
+  };
+  auto is_l = [](UCls c) {   // \p{L}
+    return c == UCls::Upper || c == UCls::Lower || c == UCls::LetterOther;
+  };
+  // End of the maximal run of `pred` codepoints from `p`.
+  auto run = [&](size_t p, auto pred) {
+    while (p < len) {
+      size_t cl;
+      if (!pred(cls_at(p, &cl).second)) { break; }
+      p += cl;
+    }
+    return p;
+  };
+
+  // Optional lead [^\r\n\p{L}\p{N}] (greedy: tried consumed first).
+  size_t lead = 0;
+  {
+    size_t cl;
+    const auto [cp, c] = cls_at(pos, &cl);
+    if (cp != '\r' && cp != '\n' && !is_l(c) && c != UCls::Number) {
+      lead = cl;
+    }
+  }
+
+  // --- Alt 1: lead? U* L+ -------------------------------------------
+  // U* is greedy and gives codepoints back until L+ can start; only a
+  // codepoint in both classes (Lm/Lo/M) can start it inside the U run.
+  auto alt1 = [&](size_t s) -> size_t {
+    const size_t u_end = run(s, in_u);
+    size_t k = u_end;
+    while (true) {
+      const size_t l_end = run(k, in_l);
+      if (l_end > k) { return l_end; }
+      if (k == s) { return 0; }
+      // Step back one codepoint (to the start of the previous one).
+      do { --k; } while (k > s && (data[k] & 0xC0) == 0x80);
+    }
+  };
+  // --- Alt 2: lead? U+ L* -------------------------------------------
+  auto alt2 = [&](size_t s) -> size_t {
+    const size_t u_end = run(s, in_u);
+    return u_end > s ? run(u_end, in_l) : 0;
+  };
+  if (lead > 0) {
+    if (size_t e = alt1(pos + lead)) { return e - pos; }
+  }
+  if (size_t e = alt1(pos)) { return e - pos; }
+  if (lead > 0) {
+    if (size_t e = alt2(pos + lead)) { return e - pos; }
+  }
+  if (size_t e = alt2(pos)) { return e - pos; }
+
+  // --- Alt 3: \p{N} (one codepoint) ----------------------------------
+  {
+    size_t cl;
+    if (cls_at(pos, &cl).second == UCls::Number) { return cl; }
+  }
+
+  // --- Alt 4:  ?[^\s\p{L}\p{N}]+[\r\n/]* ------------------------------
+  {
+    auto punct = [&](UCls c) {
+      return c != UCls::Space && !is_l(c) && c != UCls::Number;
+    };
+    auto tail = [&](size_t e) {
+      while (e < len && (data[e] == '\r' || data[e] == '\n'
+                         || data[e] == '/')) {
+        ++e;
+      }
+      return e;
+    };
+    const size_t sp = (data[pos] == ' ') ? 1 : 0;
+    size_t e = run(pos + sp, punct);
+    if (e > pos + sp) { return tail(e) - pos; }
+    if (sp > 0) {
+      e = run(pos, punct);
+      if (e > pos) { return tail(e) - pos; }
+    }
+  }
+
+  // Whitespace run from pos (codepoints, Unicode White_Space).
+  const size_t wp = run(pos, [](UCls c) { return c == UCls::Space; });
+  if (wp > pos) {
+    // --- Alt 5: \s*[\r\n]+ -- up to the LAST newline in the run.
+    // ASCII bytes never occur inside a multi-byte sequence, so a byte
+    // scan backwards finds it.
+    for (size_t m = wp; m > pos; --m) {
+      if (data[m - 1] == '\r' || data[m - 1] == '\n') { return m - pos; }
+    }
+    // --- Alt 6: \s+(?!\S) -- all of it at the end of the text, else
+    // all but the last codepoint (which then precedes the \S).
+    if (wp >= len) { return wp - pos; }
+    size_t last = wp - 1;
+    while (last > pos && (data[last] & 0xC0) == 0x80) { --last; }
+    if (last > pos) { return last - pos; }
+    // --- Alt 7: \s+
+    return wp - pos;
+  }
+
+  // No alternative matched: advance one codepoint to make progress.
+  size_t cl;
+  (void)utf8_next_(data, len, pos, &cl);
+  return cl;
+}
+
+// ---------------------------------------------------------------------
 // Byte-level alphabet (the GPT-2 / HF byte_level mapping)
 // ---------------------------------------------------------------------
 //
@@ -491,6 +711,14 @@ private:
   // that walks the seven alternatives of that regex directly, with
   // best-effort Unicode property classification.
   bool                                                      _use_llama3_pre = false;
+  // Mistral's Tekken split pattern (case-aware letter runs, single
+  // digits, no contractions); pre_tokenize_ hands it to
+  // tekken_match_one_. Takes precedence over _use_llama3_pre.
+  bool                                                      _use_tekken_pre = false;
+  // BPE `ignore_merges` (Tekken sets it): a pre-token whose byte-level
+  // spelling is itself a vocab entry is emitted as that one token,
+  // without running the merges -- which need not reach it.
+  bool                                                      _ignore_merges = false;
   // Longest digit run the scanner keeps in one pre-token: the Llama-3
   // pattern spells \p{N}{1,3}, Qwen's spells a bare \p{N}. Left at 3
   // for tokenizer.json (whose Qwen vocabularies carry no digit merges,
@@ -662,6 +890,9 @@ Tokenizer::Impl::parse(const FlexData&            root,
     return false;
   }
   _unigram = (model_type == "Unigram");
+  if (model.contains("ignore_merges")) {
+    _ignore_merges = model.at("ignore_merges").as_bool(false);
+  }
 
   if (!model.contains("vocab")) {
     if (session) {
@@ -957,6 +1188,13 @@ Tokenizer::Impl::parse(const FlexData&            root,
     vector<string> patterns;
     collect_split_regexes_(pre, &patterns);
     for (const auto& p : patterns) {
+      // Mistral Tekken: the only pattern here that names the letter
+      // CASE classes (see tekken_match_one_).
+      if (p.find("\\p{Lu}") != string::npos
+          && p.find("\\p{Ll}") != string::npos) {
+        _use_tekken_pre = true;
+        continue;
+      }
       // Llama-3 / Qwen-2.5 family: \p{L}/\p{N} are not in
       // std::regex. Detect the pattern and hand the input to a
       // hand-coded scanner (see llama3_match_one_).
@@ -1287,6 +1525,13 @@ void
 Tokenizer::Impl::encode_chunk_(string_view chunk, vector<int32_t>* out) const
 {
   if (chunk.empty()) { return; }
+  if (_ignore_merges && !_metaspace) {
+    const auto it = _vocab.find(bytes_to_byte_level_(chunk));
+    if (it != _vocab.end()) {
+      out->push_back(it->second);
+      return;
+    }
+  }
   // Metaspace (Gemma): BPE on the raw UTF-8 (marker already substituted
   // for spaces); Llama/Qwen: GPT-2 byte-level encode first.
   auto pieces = _metaspace
@@ -1365,6 +1610,19 @@ Tokenizer::Impl::metaspace_decode_(const string& s) const
 vector<string>
 Tokenizer::Impl::pre_tokenize_(string_view text) const
 {
+  if (_use_tekken_pre) {
+    vector<string> out;
+    const char* data = text.data();
+    const size_t len = text.size();
+    size_t pos = 0;
+    while (pos < len) {
+      size_t n = tekken_match_one_(data, len, pos);
+      if (n == 0) { break; }
+      out.emplace_back(data + pos, n);
+      pos += n;
+    }
+    return out;
+  }
   if (_use_llama3_pre) {
     // Hand-coded scanner for the Llama-3 / Qwen-2.5 pre-tokenizer
     // regex. Walks the seven alternatives at each position; emits

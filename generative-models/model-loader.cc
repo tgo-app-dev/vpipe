@@ -3,6 +3,7 @@
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -13,6 +14,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -408,6 +410,29 @@ parse_config_(const FlexData& cfg, ModelConfig* out)
     }
   }
 
+  // A rope the struct cannot express (YaRN, the Llama-4 query
+  // temperature) travels whole in `extra` -- model_config::
+  // kRopeParameters. text_config's wins over the root's.
+  {
+    FlexData rp;
+    if (root.contains("text_config")) {
+      const FlexData tc = root.at("text_config");
+      if (tc.is_object() && tc.as_object().contains("rope_parameters")) {
+        rp = tc.as_object().at("rope_parameters");
+      }
+    }
+    if (!rp.is_object() && root.contains("rope_parameters")) {
+      rp = root.at("rope_parameters");
+    }
+    if (rp.is_object()) {
+      const string kind =
+          bag::text(rp, "rope_type", bag::text(rp, "type"));
+      if (!kind.empty() && kind != "default") {
+        bag::set(out->extra, model_config::kRopeParameters, rp);
+      }
+    }
+  }
+
   // MOSS-TTS-Local (model_type "moss_tts_local", arch "MossTTSLocalModel"):
   // a TTS model whose text backbone is a dense Qwen3 LM. The Qwen3 dims live
   // under `qwen3_config` (not the usual `text_config`), so parse them into the
@@ -583,6 +608,34 @@ parse_config_(const FlexData& cfg, ModelConfig* out)
           out->vision.image_std[i]  = 1.0f;
         }
       }
+
+      // ---- Pixtral (Mistral3 / Ministral-3) ----------------------------
+      // Gemma's key names again, the 2x2 merge at the config ROOT, the
+      // projector writing the text hidden, CLIP mean/std (the defaults).
+      if (out->architecture == "Mistral3ForConditionalGeneration") {
+        get_int_("num_hidden_layers",   out->vision.depth);
+        get_int_("num_attention_heads", out->vision.num_heads);
+        get_int_("head_dim",            out->vision.vit_head_dim);
+        get_int_("num_channels",        out->vision.in_channels);
+        out->vision.vit_rope_theta = 10000.0f;
+        if (vc.contains("rope_parameters")) {
+          const FlexData rp = vc.at("rope_parameters");
+          out->vision.vit_rope_theta = static_cast<float>(
+              bag::real(rp, "rope_theta", out->vision.vit_rope_theta));
+        } else if (vc.contains("rope_theta")) {
+          out->vision.vit_rope_theta = static_cast<float>(
+              vc.at("rope_theta").as_real(10000.0));
+        }
+        if (root.contains("spatial_merge_size")) {
+          out->vision.spatial_merge_size = static_cast<int>(
+              root.at("spatial_merge_size").as_int(2));
+        }
+        out->vision.out_hidden_size = out->hidden;
+        if (vc.contains("image_size")) {
+          bag::set_integer(out->extra, model_config::kVisionImageSize,
+                           vc.at("image_size").as_int(0));
+        }
+      }
     }
   }
 
@@ -723,6 +776,27 @@ apply_preprocessor_(const filesystem::path&    dir,
   }
   filesystem::path pp_path = dir / "preprocessor_config.json";
   auto pp_fd = read_json_file_(pp_path);
+  const char* pp_file = "preprocessor_config.json";
+  if ((!pp_fd || !pp_fd->is_object())
+      && config->architecture == "Mistral3ForConditionalGeneration") {
+    // Pixtral ships processor_config.json instead, its image settings
+    // under `image_processor` -- including the longest-edge budget.
+    // (Only here: other families that ship one -- the Gemma-4 e4b MLX
+    // pack -- have always run on their defaults.)
+    pp_file = "processor_config.json";
+    auto pc_fd = read_json_file_(dir / "processor_config.json");
+    if (!pc_fd || !pc_fd->is_object()
+        || !pc_fd->as_object().contains("image_processor")) {
+      return;
+    }
+    pp_fd = pc_fd->as_object().at("image_processor");
+    if (!pp_fd->is_object()) { return; }
+    const FlexData size = bag::value(*pp_fd, "size");
+    if (bag::has(size, "longest_edge")) {
+      bag::set_integer(config->extra, model_config::kVisionImageSize,
+                       bag::integer(size, "longest_edge"));
+    }
+  }
   if (!pp_fd || !pp_fd->is_object()) {
     return;
   }
@@ -741,10 +815,10 @@ apply_preprocessor_(const filesystem::path&    dir,
   read_triple_("image_std",  config->vision.image_std);
   if (session) {
     session->info(fmt(
-        "ModelLoader::load('{}'): preprocessor_config.json: "
+        "ModelLoader::load('{}'): {}: "
         "image_mean=[{:.4f}, {:.4f}, {:.4f}] "
         "image_std=[{:.4f}, {:.4f}, {:.4f}]",
-        dir_str,
+        dir_str, pp_file,
         config->vision.image_mean[0],
         config->vision.image_mean[1],
         config->vision.image_mean[2],
@@ -752,6 +826,39 @@ apply_preprocessor_(const filesystem::path&    dir,
         config->vision.image_std[1],
         config->vision.image_std[2]));
   }
+}
+
+// The default system message a Mistral chat template declares
+// (`{%- set default_system_message = '...' %}` in chat_template.jinja)
+// -> model_config::kDefaultSystemPrompt, unescaped from the Jinja
+// literal. It names the very checkpoint ("You are Ministral-3-14B-..."),
+// so it is read from the file rather than written into the renderer.
+// Missing file or no such assignment: nothing is set.
+void
+apply_chat_template_defaults_(const filesystem::path& dir,
+                              ModelConfig*            config)
+{
+  ifstream in(dir / "chat_template.jinja");
+  if (!in) { return; }
+  const string src((istreambuf_iterator<char>(in)),
+                   istreambuf_iterator<char>());
+  const string key = "default_system_message";
+  size_t p = src.find(key);
+  if (p == string::npos) { return; }
+  p = src.find_first_not_of(" \t=", p + key.size());
+  if (p == string::npos || (src[p] != '\'' && src[p] != '"')) { return; }
+  const char quote = src[p++];
+  string msg;
+  for (; p < src.size() && src[p] != quote; ++p) {
+    if (src[p] != '\\' || p + 1 >= src.size()) {
+      msg += src[p];
+      continue;
+    }
+    const char e = src[++p];
+    msg += (e == 'n') ? '\n' : (e == 't') ? '\t' : e;
+  }
+  if (p >= src.size()) { return; }   // unterminated literal
+  bag::set_text(config->extra, model_config::kDefaultSystemPrompt, msg);
 }
 
 }
@@ -909,6 +1016,7 @@ ModelLoader::load(string_view hf_dir) const
 
   // 3. preprocessor_config.json (optional, VLM normalisation mean/std).
   apply_preprocessor_(dir, dir_str, &out.config, session());
+  apply_chat_template_defaults_(dir, &out.config);
 
   // 4. gemma4_unified from RAW safetensors: unlike the GGUF variant (whose
   // adaptor lives in a sibling mmproj-*.gguf), the raw 12B carries the
@@ -987,6 +1095,7 @@ ModelLoader::load_config(string_view hf_dir) const
     return nullopt;
   }
   apply_preprocessor_(dir, dir_str, &config, session());
+  apply_chat_template_defaults_(dir, &config);
   return config;
 }
 
