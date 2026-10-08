@@ -1,7 +1,7 @@
 #pragma once
 
-// The PREFILL GQA attention kernel set (paged KV, head_dim 256). A family of
-// interchangeable full-attention kernels that all speak one protocol, autotune
+// The PREFILL GQA attention kernel set (paged KV, head_dim 256 or 128). A
+// family of interchangeable full-attention kernels that all speak one protocol, autotune
 // WITHIN the set per machine, and expose a unified dispatch(). Same idea as
 // DecodeGqaAttnSet, but keyed by the query count `n` (the prefill chunk size)
 // instead of a decode position -- so the steel/flash/qtile crossover threshold
@@ -16,7 +16,9 @@
 // planes, so the set first GATHERS the pool into contiguous [Hkv, kL, D] K/V it
 // owns (one dispatch, kv_gather_paged) and then runs the kernel over those.
 // MEASURED on the M5 Pro at Qwen3.5 shapes (16q/4kv, bd 256, f16, one page):
-// nax-split 1.5x the best paged member at 1k and 3.6-3.8x at 4k-16k. The model
+// nax-split 1.5x the best paged member at 1k and 3.6-3.8x at 4k-16k. At head
+// dim 128 (Ministral-3, Qwen3-ASR) the members are the bd128 entry points;
+// qtile and nax-split have none and are not offered. The model
 // keeps the Q/K/V projection, rope, transpose, gate + o_proj around the set's
 // dispatch(); the set just runs the SDPA (qt -> out).
 
@@ -65,11 +67,13 @@ class PrefillGqaAttnSet {
   // flash; lib_nax (may be null / invalid off M5) the NAX attentions, whose
   // bf16 twins are chosen by `bf16`. use_mma enables the M5 members. Returns
   // true if usable.
+  // `head_dim` (256 or 128) picks the members' entry points; prepare()'s
+  // Dims::D must match it.
   bool load(metal_compute::ComputeLibrary& lib_sdpa,
             metal_compute::ComputeLibrary* lib_attn,
             metal_compute::ComputeLibrary* lib_mma, bool use_mma,
             metal_compute::ComputeLibrary* lib_nax = nullptr,
-            bool bf16 = false);
+            bool bf16 = false, int head_dim = 256);
 
   // Autotune the kernel per n-regime for this GPU (the crossover thresholds fall
   // out of the per-regime winners). Appends timing to `rep`.
@@ -87,8 +91,16 @@ class PrefillGqaAttnSet {
   bool dispatch_member(metal_compute::ComputeEncoder& enc, const Attn& a,
                        std::string_view member) const;
 
+  // The shortest chunk the set serves: every one at head dim 256; at 128
+  // the regimes from 1536 rows, the ones whose tuner had something to add
+  // (on the M5 the NAX attention), so a short prompt keeps the kernels it
+  // always had. prepare() tunes only the regimes served.
+  int min_n() const;
+
   // Resolved member name for `n` (for the model's load-time debug log).
   const char* kernel_name(int n) const;
+  // Whether a named member loaded here ("nax", "steel", ...).
+  bool has(std::string_view member) const;
 
  private:
   enum Member {
@@ -105,6 +117,7 @@ class PrefillGqaAttnSet {
   // first use and kept.
   metal_compute::ComputeLibrary* _lib_nax = nullptr;
   bool _nax_bf16 = false;
+  int _head_dim = 256;                            // load()'s, 256 or 128
   metal_compute::ComputeFunction _fn_gather;
   metal_compute::MetalCompute* _mc = nullptr;
   mutable metal_compute::ComputeFunction _nax_fn[2][2][2];

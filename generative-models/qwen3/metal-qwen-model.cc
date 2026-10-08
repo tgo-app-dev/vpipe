@@ -1187,11 +1187,13 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   // The M5 NAX attentions (plain + MLX's head-dim split) for the head_dim-256
   // full-attention layers: strided K/V the set gathers from the pool, so they
   // serve fresh and mid-context prefill alike. Matrix-core GPUs only.
-  if (m->_use_mma && cfg.head_dim == 256) {
+  // Head dim 128 (Ministral-3, Qwen3-ASR) has the plain NAX entry too.
+  if (m->_use_mma && (cfg.head_dim == 256 || cfg.head_dim == 128)) {
     m->_lib_attn_nax = mc->load_library("attn_steel_nax");
   }
   m->_prefill_set.load(m->_lib_sdpa, &m->_lib_attn, &m->_lib_sdpa_mma,
-                       m->_use_mma, &m->_lib_attn_nax, cfg.use_bf16);
+                       m->_use_mma, &m->_lib_attn_nax, cfg.use_bf16,
+                       cfg.head_dim == 128 ? 128 : 256);
   // Pipelined-decode kernels (validated lazily in decode_pipelined, not
   // here, so non-pipelined model loads never depend on them).
   m->_fn_embed = m->_lib_elt.function(
@@ -2616,7 +2618,12 @@ MetalQwenModel::ensure_decode_scratch_()
     TuningReport tuning;
     const DecodeGqaAttnSet::Dims dd{c.head_dim, c.n_heads, c.n_kv_heads};
     _decode_set.prepare(_mc, dd, tuning);
-    _prefill_set.prepare(_mc, {c.head_dim, c.n_heads, c.n_kv_heads}, tuning);
+    // Head dim 128 tunes its prefill set at its first long chunk instead
+    // (tune_prefill_set_): most such models never see one.
+    if (c.head_dim == 256) {
+      _prefill_set.prepare(_mc, {c.head_dim, c.n_heads, c.n_kv_heads},
+                           tuning);
+    }
     // MoE grouped-GEMM GEMV->steel crossover. Left as a tunable member (default
     // 1024); the per-machine probe is deferred to an M5 session where matrix
     // cores make the win directly measurable. VPIPE_QWEN_MOE_STEEL_MIN overrides.
@@ -5727,6 +5734,41 @@ MetalQwenModel::prefill_embeddings_buf(ContextId cid, SharedBuffer&& x, int n)
   return forward_chunk_(cid, x, n, nullptr, nullptr);
 }
 
+bool
+MetalQwenModel::prefill_set_serves_(int n) const
+{
+  // The D=128 flash member needs 64-aligned pages, as the legacy one does.
+  return _prefill_set.ready() && n >= _prefill_set.min_n()
+      && (_cfg.head_dim == 256 || _ctx->page_tokens() % 64 == 0);
+}
+
+void
+MetalQwenModel::tune_prefill_set_(int n)
+{
+  // Head dim 128's probe (~0.3 s on an M4 Pro) is paid by the first chunk
+  // the set would serve, not at load: ASR, the conditioning encoders and
+  // most chat turns never reach one. Runs its own command streams, so the
+  // caller must have no encoder open.
+  if (_cfg.head_dim != 128 || n < _prefill_set.min_n()
+      || _prefill_set.ready()) {
+    return;
+  }
+  TuningReport tuning;
+  _prefill_set.prepare(_mc, {_cfg.head_dim, _cfg.n_heads, _cfg.n_kv_heads},
+                       tuning);
+  const SessionContextIntf* s = _mc ? _mc->session() : nullptr;
+  if (s != nullptr && !tuning.empty()) {
+    s->log_debug(fmt("[qwen] prefill attention tuning {}ms: {}",
+        (int)(tuning.total_ms() + 0.5), tuning.summary()));
+  }
+}
+
+const char*
+MetalQwenModel::prefill_attention_kernel(int n) const
+{
+  return prefill_set_serves_(n) ? _prefill_set.kernel_name(n) : "legacy";
+}
+
 int
 MetalQwenModel::prefill_piece_()
 {
@@ -6581,6 +6623,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   const float eps = c.rms_eps;
   const float scale = 1.0f / std::sqrt((float)D);
   ensure_decode_scratch_();   // also tunes the decode + prefill attention sets
+  tune_prefill_set_(n);       // ... or, for head dim 128, here
   // The int8 split's width, for prefill shapes an earlier chunk recorded.
   // HERE because it runs its own command streams and so needs no encoder
   // open, and because a decode step (n == 1) never reaches the i8 gate --
@@ -7009,8 +7052,9 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
     }
     // PRIMARY: the prefill GQA attention SET picks steel/flash/qtile per the
     // chunk's n-regime (steel/flash crossover discovered at load). The legacy
-    // steel/non-steel blocks below handle D!=256 or a not-ready set.
-    const bool use_pset = (D == 256) && _prefill_set.ready();
+    // steel/non-steel blocks below handle a chunk the set does not serve
+    // (prefill_set_serves_) or a not-ready set.
+    const bool use_pset = prefill_set_serves_(n);
 
     if (kLayerDump != nullptr) { tap(x, dbgEmbed, n * H); }
     // Raw-source streaming (metal-qwen-raw-layers.h): a streamed layer is

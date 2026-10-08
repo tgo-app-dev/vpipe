@@ -1342,6 +1342,11 @@ TEST(sdpa_mma, qwen_prefill_d256_vs_nax_split) {
 // the kernel's causal offset is live). The benchmark above uses one page and a
 // fresh prompt; this is the contract the model actually drives. On a GPU
 // without the NAX members they are simply refused.
+// Both head dims the set serves: Qwen3.5's (256, 16q/4kv) and Ministral-3's
+// (128, 32q/8kv), whose members are the bd128 entry points (no qtile, no
+// head-dim-split NAX). 192-token pages are 64-aligned, which the D=128
+// flash member needs. And both element types: a bf16 model (YuE2's AR
+// stack) reaches the bf16 NAX entries through the same set.
 TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
   Session sess;
   auto* mc = get_mc_(sess);
@@ -1350,12 +1355,30 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
   ComputeLibrary lib_attn = mc->load_library("attn_steel");
   ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
   ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  // A bf16 model hands the set the bf16 sdpa / sdpa_mma libraries and no
+  // steel (half-only), as MetalQwenModel does.
+  ComputeLibrary lib_sdpa_b = mc->load_library("sdpa_bf16");
+  ComputeLibrary lib_mma_b = mc->load_library("sdpa_mma_bf16");
   const bool m5 = mc->supports_matrix_cores();
-  const int D = 256, Hq = 16, Hkv = 4, page_tokens = 192;
+  auto enc16 = [](float v, bool bf16) -> std::uint16_t {
+    if (!bf16) { return f32_to_h(v); }
+    std::uint32_t u; std::memcpy(&u, &v, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto dec16 = [](std::uint16_t b, bool bf16) -> float {
+    if (!bf16) { return h_to_f32(b); }
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f; std::memcpy(&f, &u, 4); return f;
+  };
+  struct Layout { int D, Hq, Hkv; };
+  for (const bool bf16 : {false, true}) {
+  for (const Layout lay : {Layout{256, 16, 4}, Layout{128, 32, 8}}) {
+  const int D = lay.D, Hq = lay.Hq, Hkv = lay.Hkv, page_tokens = 192;
 
   ::setenv("VPIPE_QWEN_PREFILL_AUTOTUNE", "0", 1);
   genai::PrefillGqaAttnSet set;
-  set.load(lib_sdpa, &lib_attn, &lib_mma, m5, &lib_nax, false);
+  set.load(bf16 ? lib_sdpa_b : lib_sdpa, bf16 ? nullptr : &lib_attn,
+           bf16 ? &lib_mma_b : &lib_mma, m5, &lib_nax, bf16, D);
   genai::TuningReport rep;
   set.prepare(mc, {D, Hq, Hkv}, rep);
   ::unsetenv("VPIPE_QWEN_PREFILL_AUTOTUNE");
@@ -1381,7 +1404,7 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
     {
       auto* q = static_cast<std::uint16_t*>(qb.contents());
       for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
-        q[i] = f32_to_h(d(rng) * 0.2f);
+        q[i] = enc16(d(rng) * 0.2f, bf16);
       }
       std::memset(kb.contents(), 0, pool);
       std::memset(vb.contents(), 0, pool);
@@ -1398,8 +1421,8 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
             for (int e = 0; e < D; ++e) {
               const size_t i = (((size_t)pid * Hkv + h) * page_tokens + sl) * D
                                + e;
-              k[i] = f32_to_h(d(rng) * 0.2f);
-              v[i] = f32_to_h(d(rng) * 0.2f);
+              k[i] = enc16(d(rng) * 0.2f, bf16);
+              v[i] = enc16(d(rng) * 0.2f, bf16);
             }
           }
         }
@@ -1422,13 +1445,15 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
     SharedBuffer ref = mc->make_shared_buffer((size_t)Hq * n * D * 2);
     ASSERT_TRUE(run("flash", ref));
     const auto* r = static_cast<const std::uint16_t*>(ref.contents());
-    for (const char* member : {"steel", "nax", "nax-split"}) {
+    for (const char* member : {"steel", "nax", "nax-split", "mma"}) {
       SharedBuffer out = mc->make_shared_buffer((size_t)Hq * n * D * 2);
       const bool ran = run(member, out);
-      const bool expect = std::string(member) == "steel" ? lib_attn.valid()
-                                                         : m5;
+      const std::string mb(member);
+      const bool expect = mb == "steel" ? (!bf16 && lib_attn.valid())
+                        : mb == "nax-split" ? (m5 && D == 256)
+                        : m5;
       if (!expect) {
-        if (std::string(member) != "steel") { EXPECT_FALSE(ran); }
+        if (mb != "steel") { EXPECT_FALSE(ran); }
         continue;
       }
       ASSERT_TRUE(ran);
@@ -1436,15 +1461,20 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
       const auto* o = static_cast<const std::uint16_t*>(out.contents());
       double num = 0.0, den = 0.0;
       for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
-        const double x = h_to_f32(r[i]), y = h_to_f32(o[i]);
+        const double x = dec16(r[i], bf16), y = dec16(o[i], bf16);
         num += (x - y) * (x - y); den += x * x;
       }
       const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
-      std::printf("[qwen_set] n=%4d q_offset=%4d pages=%2d %-9s vs flash "
-                  "rel-L2 %.2e\n", n, qoff, n_pages, member, rel);
+      std::printf("[qwen_set] %s D=%d n=%4d q_offset=%4d pages=%2d %-9s vs "
+                  "flash rel-L2 %.2e\n", bf16 ? "bf16" : "f16 ", D, n, qoff,
+                  n_pages, member, rel);
+      // f16 lands 2-5e-4 from flash and bf16 1.2-2.2e-3 (its rounding
+      // floor) on the M5.
       EXPECT_TRUE(rel < 5e-3);
     }
   }
+  }  // layouts
+}  // dtypes
 }
 
 // Per-dispatch overhead probe: the Gemma-4 decode gap vs omlx is a context-

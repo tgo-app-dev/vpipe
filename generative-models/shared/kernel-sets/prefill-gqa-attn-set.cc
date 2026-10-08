@@ -49,18 +49,23 @@ bool
 PrefillGqaAttnSet::load(metal_compute::ComputeLibrary& lib_sdpa,
                         metal_compute::ComputeLibrary* lib_attn,
                         metal_compute::ComputeLibrary* lib_mma, bool use_mma,
-                        metal_compute::ComputeLibrary* lib_nax, bool bf16) {
+                        metal_compute::ComputeLibrary* lib_nax, bool bf16,
+                        int head_dim) {
+  if (head_dim != 256 && head_dim != 128) { return false; }
+  _head_dim = head_dim;
+  const bool d256 = head_dim == 256;
   _fn[kScalar] = lib_sdpa.function("sdpa_paged_causal_f16");
   _fn[kQtile] = lib_sdpa.function("sdpa_paged_qtile_f16");
   _fn[kFlash] = lib_sdpa.function("sdpa_paged_flash_f16");
   if (lib_mma != nullptr && lib_mma->valid()) {
-    _fn[kMma] = lib_mma->function("sdpa_mma_f16");
+    _fn[kMma] = lib_mma->function(d256 ? "sdpa_mma_f16" : "sdpa_mma_d128_f16");
   }
   if (lib_attn != nullptr && lib_attn->valid()) {
-    _fn[kSteel] = lib_attn->function("attn_steel_paged_bd256");
+    _fn[kSteel] = lib_attn->function(d256 ? "attn_steel_paged_bd256"
+                                          : "attn_steel_paged_bd128");
   }
   _have[kScalar] = _fn[kScalar].valid();
-  _have[kQtile] = _fn[kQtile].valid();
+  _have[kQtile] = d256 && _fn[kQtile].valid();   // a 256-wide kernel only
   _have[kFlash] = _fn[kFlash].valid();
   _have[kMma] = use_mma && _fn[kMma].valid();
   _have[kSteel] = _fn[kSteel].valid();
@@ -86,9 +91,22 @@ PrefillGqaAttnSet::regime_of(int n) const {
   return r;
 }
 
+int
+PrefillGqaAttnSet::min_n() const {
+  return _head_dim == 256 ? 0 : kRegimeLo[1];
+}
+
 const char*
 PrefillGqaAttnSet::kernel_name(int n) const {
   return kName[_member[regime_of(n)]];
+}
+
+bool
+PrefillGqaAttnSet::has(std::string_view member) const {
+  for (int m = 0; m < kMembers; ++m) {
+    if (member == kName[m]) { return _have[m]; }
+  }
+  return false;
 }
 
 const metal_compute::ComputeFunction&
@@ -99,8 +117,10 @@ PrefillGqaAttnSet::nax_fn(bool split, bool align_q, bool align_k) const {
     metal_compute::FunctionConstants fc;
     fc.set_bool(200, align_q).set_bool(201, align_k)
         .set_bool(300, false).set_bool(301, true).set_bool(302, false);
+    // The head-dim split exists at bd256 only; at 128 it is not offered.
+    if (split && _head_dim != 256) { return f; }
     std::string name = split ? "attn_steel_nax_dsplit_h_bd256"
-                             : "attn_steel_nax_h_bd256";
+                             : "attn_steel_nax_h_bd" + std::to_string(_head_dim);
     if (_nax_bf16) { name += "_bf16"; }
     f = _lib_nax->function(name, fc);
   }
@@ -238,7 +258,9 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     _member[i] = _have[kFlash] ? kFlash : kQtile;
   }
   const int D = dims.D, Hq = dims.Hq, Hkv = dims.Hkv;
-  if (mc == nullptr || D != 256 || Hkv <= 0 || Hq % Hkv != 0) { return; }
+  if (mc == nullptr || D != _head_dim || Hkv <= 0 || Hq % Hkv != 0) {
+    return;
+  }
   if (!_have[kFlash] && !_have[kQtile]) { return; }
   _ready = true;
 
@@ -327,6 +349,7 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     // mma}; the NAX members in every regime (their probe includes the pool
     // gather they need). Only the present members.
     const bool nax = _have[kNax] || _have[kNaxSplit];
+    if (ri < regime_of(min_n())) { continue; }   // never dispatched
     if (ri == kVeryLong && !nax) {
       _member[ri] = _member[ri - 1];
       continue;

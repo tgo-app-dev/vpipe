@@ -35,6 +35,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <deque>
 #include <unordered_map>
 #include <vector>
@@ -831,6 +832,14 @@ public:
   //   gqa_flash_decode  -- GQA flash-decode kernel (each kv-head read once for
   //                        all G query heads; default on for full-attn models).
   bool uses_matrix_cores() const noexcept { return _use_mma; }
+  // The prefill-attention kernel set: the member serving an n-row fresh
+  // prompt ("legacy" when the set does not serve it -- a 128-wide head
+  // under 1536 rows or before its first such prefill, or a head dim it has
+  // no members for), and whether a named member ("nax" on the M5) is
+  // loaded at all.
+  const char* prefill_attention_kernel(int n) const;
+  bool prefill_attention_has(std::string_view member) const
+  { return _prefill_set.has(member); }
   bool mma_flash_attn() const noexcept { return _fn_sdpa_mma.valid(); }
   bool gqa_flash_decode() const noexcept { return _gqa_vec; }
   // Dynamic-int8 accelerated PREFILL GEMMs (see shared/i8-gemm.h): LOSSY
@@ -1010,6 +1019,11 @@ private:
                                      const metal_compute::SharedBuffer& x,
                                      int n);
   static int prefill_piece_();
+  // Whether the prefill-attention set serves an n-row chunk: every 256-
+  // wide one; a 128-wide one from 1536 rows on 64-aligned pages, tuned by
+  // tune_prefill_set_ at the first such chunk rather than at load.
+  bool prefill_set_serves_(int n) const;
+  void tune_prefill_set_(int n);
   std::vector<float> forward_chunk_(
       ContextId cid, const metal_compute::SharedBuffer& x, int n,
       const metal_compute::SharedBuffer* mrope_cos,

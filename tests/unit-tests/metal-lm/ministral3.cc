@@ -782,3 +782,114 @@ TEST(ministral3, long_context_matches_reference)
   EXPECT_TRUE(f.decisive >= 5 && f.first_bad < 0);
   EXPECT_TRUE(text.find("4719-KESTREL") != std::string::npos);
 }
+
+// M5 matrix cores, engagement not speed: on a GPU that has them the
+// decoder's prefill GEMMs ride matmul2d (dequantised once), the int8 tier
+// engages when asked -- the checkpoint's own 4-bit codes into the int8
+// GEMM -- and the Pixtral tower runs matmul2d GEMMs and MLX's NAX
+// attention; on one without them every one of these is off and the steel
+// kernels serve. A silent fallback stays numerically right and only gets
+// slower, so it has to be asserted. int8 is LOSSY by design: its logits
+// are held to the reference's own distance, not to exactness.
+TEST(ministral3, matrix_core_paths_engage)
+{
+  const char* md = model_dir_();
+  const char* gd = golden_dir_();
+  if (!md || !gd) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr && mc->valid());
+  if (!mc) { return; }
+  const bool mx = mc->supports_matrix_cores();
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(md);
+  ASSERT_TRUE(cfg.has_value());
+  if (!cfg) { return; }
+
+  // The Pixtral tower (small, so first).
+  {
+    auto enc = genai::MetalPixtralVisionEncoder::load(
+        genai::WeightSet::open(md, nullptr), mc,
+        genai::MetalPixtralVisionEncoder::config_from(*cfg));
+    ASSERT_TRUE(enc != nullptr);
+    if (enc) {
+      std::printf("[ministral3.mx] matrix cores %d | tower matmul2d %d, "
+                  "NAX attention %d\n", mx ? 1 : 0,
+                  enc->uses_matrix_cores() ? 1 : 0,
+                  enc->uses_nax_attention() ? 1 : 0);
+      if (std::getenv("VPIPE_PIXTRAL_NO_MMA2") == nullptr) {
+        EXPECT_TRUE(enc->uses_matrix_cores() == mx);
+      }
+      if (std::getenv("VPIPE_PIXTRAL_NO_NAX_ATTN") == nullptr) {
+        EXPECT_TRUE(enc->uses_nax_attention() == mx);
+      }
+    }
+  }
+
+  // The decoder: the reference's text prompt, plain and with int8.
+  const FlexData g = read_json_(std::string(gd) + "/text.json");
+  ASSERT_TRUE(g.is_object());
+  if (!g.is_object()) { return; }
+  // The int8 tier declines under 1024 rows and the 128-wide prefill
+  // attention joins the tuned kernel set from 1536; repeat the turn's user
+  // text into a prompt that clears both.
+  auto tok = genai::Tokenizer::from_huggingface_json(
+      std::string(md) + "/tokenizer.json", &sess);
+  ASSERT_TRUE(tok != nullptr);
+  if (!tok) { return; }
+  std::string body;
+  const std::string user(g.as_object().at("user").as_string(""));
+  while (tok->encode(body).size() < 2100) { body += user + " "; }
+  std::vector<std::int32_t> ids{1};
+  const auto t = tok->encode(body);
+  ids.insert(ids.end(), t.begin(), t.end());
+
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.use_bf16 = false;
+  mcfg.page_tokens = 256;
+  mcfg.max_pages = 32;
+  auto model = genai::MetalQwenModel::load(md, mc, mcfg);
+  ASSERT_TRUE(model != nullptr);
+  if (!model) { return; }
+  if (std::getenv("VPIPE_QWEN_NO_MMA") == nullptr) {
+    EXPECT_TRUE(model->uses_matrix_cores() == mx);
+    // The M5's NAX attention is a member of the set; which member wins
+    // a length is the set's own per-machine tuning (NAX, 2.3-3.2x the
+    // steel kernel at these lengths on the M5).
+    EXPECT_TRUE(model->prefill_attention_has("nax") == mx);
+  }
+  auto* ctxm = model->context_manager();
+  auto prefill = [&]() {
+    auto root = ctxm->acquire_root();
+    auto lg = model->prefill(root, ids);
+    ctxm->release(root);
+    return lg;
+  };
+  const auto plain = prefill();
+  // The set tunes at the first forward, so ask it after one.
+  const char* attn = model->prefill_attention_kernel((int)ids.size());
+  EXPECT_TRUE(std::string(attn) != "legacy");
+  model->set_i8_gemm(true);
+  const bool i8_on = model->i8_gemm_enabled();
+  const auto i8 = prefill();
+  const std::uint64_t n_i8 = model->i8_gemm_count();
+  ASSERT_TRUE(!plain.empty() && i8.size() == plain.size());
+  const double rl = rel_l2_(i8.data(), plain.data(), plain.size());
+  auto argmax = [](const std::vector<float>& v) {
+    return std::max_element(v.begin(), v.end()) - v.begin();
+  };
+  std::printf("[ministral3.mx] %zu-token prefill | decoder matmul2d %d, "
+              "attention %s | int8 enabled %d, %llu GEMMs took it, logits "
+              "%.4f from the plain run, same argmax %d\n", ids.size(),
+              model->uses_matrix_cores() ? 1 : 0, attn, i8_on ? 1 : 0,
+              (unsigned long long)n_i8, rl,
+              argmax(i8) == argmax(plain) ? 1 : 0);
+  EXPECT_TRUE(i8_on == mx || std::getenv("VPIPE_I8_GEMM") != nullptr);
+  if (i8_on) {
+    // q/k/v/o, gate/up and down of 40 layers all clear the int8 floors.
+    EXPECT_TRUE(n_i8 >= 40);
+    EXPECT_TRUE(rl < 0.05);
+  } else {
+    EXPECT_TRUE(n_i8 == 0);
+  }
+}

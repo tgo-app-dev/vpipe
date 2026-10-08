@@ -16,7 +16,7 @@ quantization step.
 | | |
 |---|---|
 | **Machine** | Apple Silicon Mac (M-series). |
-| **Memory** | 24 GB or more. The weights take ~8.2 GB, and the conversation's K/V cache 160 MB per 1024 tokens on top -- ~5.4 GB at the shipped pipeline's 32k-token context; a 16 GB Mac has not been measured. |
+| **Memory** | 24 GB or more. The weights take ~8.2 GB, and the conversation's K/V cache 160 MB per 1024 tokens on top -- ~5.4 GB at the shipped pipeline's 32k-token context. A 16 GB MacBook Air M5 ran 2k-token prompts but swapped heavily from 4k. |
 | **Disk** | **~8.4 GB.** |
 | **Hugging Face** | Nothing. The repo is public and needs no account or token. |
 
@@ -89,6 +89,13 @@ unset, so a scene of frames stays inside the context.
   Llama-4-style query temperature); vpipe applies it as the reference does.
   A long paste is prefilled 8192 tokens at a time, so its working memory
   is bounded by that piece rather than growing with the paste.
+- **On an M5.** The GPU's matrix units take the prefill's matrix
+  multiplies and the vision tower and, from 1536 tokens on, the prefill's
+  attention as well -- about 3x the kernel an M4 runs there. Setting
+  `i8_prefill: true` on `text-chat` (or `visual-qa`, `realtime-vqa`) also
+  runs the prefill's matrix multiplies in int8, which is faster but not
+  exact: on a 2103-token prompt the logits moved 1.3% from the plain run
+  and the next token was the same. Off by default; an M4 ignores it.
 - **Tools** (`enable_tools`) are not available for this family yet: Mistral
   calls tools in its own `[TOOL_CALLS]` format, which `text-chat` does not
   parse.

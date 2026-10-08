@@ -113,6 +113,12 @@ public:
 
   const Config& config() const { return _cfg; }
 
+  // Which M5 matrix-core paths this encoder runs: the matmul2d dense
+  // GEMMs and MLX's NAX steel attention (both off on a GPU without
+  // matrix cores, or under VPIPE_PIXTRAL_NO_MMA2 / _NO_NAX_ATTN).
+  bool uses_matrix_cores() const noexcept { return _use_mma2; }
+  bool uses_nax_attention() const noexcept { return _use_attn_nax; }
+
   // Attach a session so encode() shows up on the profiler (vision-tower
   // lane) and logs; optional.
   void set_session(const SessionContextIntf* s) { _session = s; }
