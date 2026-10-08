@@ -2,14 +2,17 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/vpipe-format.h"
+#include "generative-models/flashvsr/flashvsr-lq-proj.h"
 #include "generative-models/flashvsr/metal-flashvsr-transformer.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-memory.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -155,8 +158,9 @@ class FlashVsrGenerator final : public VideoGenerator {
     r.seed = req.seed;
     r.params = params_from_config_(req.model_config);
     // One step at a fixed timestep, so the configured step count has
-    // nothing to select. Report a chunk per "step" instead, which is
-    // what the bar can actually follow.
+    // nothing to select. The bar follows the unit of work instead: a
+    // block's pass over the whole clip (block-outer, 30 of them, chunks
+    // within), or a chunk (chunk-outer, blocks within).
     r.progress = req.progress;
     r.block_progress = req.block_progress;
 
@@ -251,16 +255,30 @@ FlashVsrVideoFamily::size_grid(const std::string&, int* gh, int* gw) const
 std::vector<ResourceClaim>
 FlashVsrVideoFamily::declare_resources(const std::string& root) const
 {
-  return model_memory::weight_claims(denoiser_sets_(root));
+  // The denoiser STREAMS when the box is tight, so its claim carries the
+  // floor it streams at -- the claim is what the plan refuses a graph by.
+  const auto sets = denoiser_sets_(root);
+  const std::vector<StageHolding> h = declare_holdings(root);
+  if (h.empty() || h[0].floor >= h[0].preload) {
+    return model_memory::weight_claims(sets);
+  }
+  std::vector<ResourceClaim> out;
+  out.push_back(model_memory::weight_claim_streamable(sets[0], h[0].floor));
+  for (std::size_t i = 1; i < sets.size(); ++i) {
+    for (auto& c : model_memory::weight_claims({sets[i]})) {
+      out.push_back(std::move(c));
+    }
+  }
+  return out;
 }
 
 std::vector<StageHolding>
 FlashVsrVideoFamily::declare_holdings(const std::string& root) const
 {
-  // Nothing streams here: the checkpoint is ~3 GB at bf16, which fits
-  // every box this runs on, so preload and floor are the same number
-  // and claiming a floor it never reaches would be a promise (see
-  // docs/MODEL-MEMORY.md).
+  // THE FLOOR IS WHAT A STREAMING LOAD HOLDS -- the folds, two block
+  // slots and the narrowing scratch, ~0.3 GB -- and it is a promise kept:
+  // the load streams whenever the stage says the box is tight, which is
+  // the only time a floor is what a plan reads.
   // NAMED BY THE DENOISER'S OWN SET, not the root: this is the name the
   // stage releases by, and drop_weights matches a set's key exactly. The
   // published layout opens the denoiser by FILE, so a holding named for
@@ -271,6 +289,30 @@ FlashVsrVideoFamily::declare_holdings(const std::string& root) const
   h.source = denoiser_sets_(root).front();
   h.preload = model_memory::weight_footprint(nullptr, denoiser_sets_(root));
   h.floor = h.preload;
+  FlashVsrLayout layout;
+  MetalFlashVsrTransformer::Config cfg;
+  if (resolve_flashvsr_layout(root, &layout) &&
+      MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
+                                                       &cfg)) {
+    std::size_t floor =
+        (std::size_t)MetalFlashVsrTransformer::streaming_floor_bytes(cfg);
+    // A CONVERTED directory is one set: the projection and the fixed
+    // context live in it beside the denoiser, never stream, and are held
+    // for the whole run. The source encoder's holding names the same set,
+    // and same-named holdings merge by their LARGER floor -- so if this
+    // floor left them out, they were lost from every phase at the floor.
+    // MEASURED: the plan's floor read 302 MB while the set held 549 MB of
+    // projection on top of the streamed denoiser.
+    if (layout.source == layout.denoiser) {
+      floor += FlashVsrLqProj::weight_bytes(layout.source,
+                                            layout.source_prefix);
+    }
+    if (layout.context == layout.denoiser) {
+      floor += FlashVsrLqProj::weight_bytes(layout.context,
+                                            layout.context_name);
+    }
+    h.floor = std::min<std::size_t>(h.preload, floor);
+  }
   return {h};
 }
 
@@ -298,8 +340,17 @@ FlashVsrVideoFamily::denoise_scratch_bytes(const std::string& root, int width,
                                                         &cfg)) {
     return 0;
   }
+  // ...AND THE SOURCE PROJECTION'S, which a pipelined graph runs for the
+  // NEXT clip while this one denoises: the conditioning stage sees one
+  // clip at a time and cannot know the geometry before its first beat,
+  // and in steady state its working set is live in this phase, not only
+  // in its own. 901 MB at 1920x1152 x 25 that the plan did not have;
+  // MEASURED 748 MB above the weights on a first clip, before any peer
+  // had allocated.
   return (std::size_t)MetalFlashVsrTransformer::denoise_scratch_bytes(
-      cfg, height, width, frames, params_from_config_(model_config));
+             cfg, height, width, frames, params_from_config_(model_config)) +
+         FlashVsrLqProj::working_bytes(layout.source, layout.source_prefix,
+                                       height, width, frames);
 }
 
 std::unique_ptr<VideoGenerator>
@@ -346,6 +397,13 @@ FlashVsrVideoFamily::load(const VideoModelCreateArgs& args)
           "locality-constrained sparsity"));
     }
   }
+  // STREAM WHEN THE BOX IS TIGHT, which is the stage's verdict to give:
+  // every video model in the process answers the memory question the
+  // same way. VPIPE_FVSR_STREAM=1 / 0 overrules it for an A/B.
+  cfg.stream_blocks = args.prefer_streaming;
+  if (const char* e = std::getenv("VPIPE_FVSR_STREAM")) {
+    if (*e != '\0') { cfg.stream_blocks = std::string(e) != "0"; }
+  }
   auto ws = open_weight_set(layout.denoiser, args.session);
   if (ws == nullptr) { return fail("cannot open " + layout.denoiser); }
   auto ctx_ws = layout.context == layout.denoiser
@@ -363,6 +421,12 @@ FlashVsrVideoFamily::load(const VideoModelCreateArgs& args)
     // without the NAX entry, or either tier on a box with no matrix
     // cores, runs the plain kernels and says so here.
     args.session->log_normal(fmt("flashvsr: {}", dit->accel_summary()));
+    if (dit->streams_blocks()) {
+      args.session->log_normal(fmt(
+          "flashvsr: streaming its {} blocks from the checkpoint, one read "
+          "per block per clip; {} MB held", cfg.n_layers,
+          dit->resident_bytes() >> 20));
+    }
   }
   return std::make_unique<FlashVsrGenerator>(std::move(dit), args.session);
 }

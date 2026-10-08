@@ -97,6 +97,8 @@ public:
   // -- the denoiser stopped owning it when the projection moved here, so
   // a missing declaration here is a real hole rather than a duplicate.
   std::vector<ResourceClaim> declare_resources() const override;
+  // ...and on the memory plan, where it read 0 MB.
+  StageMemory declare_memory() const override;
 
   // Latch a `model-select` constant before the planning phase, so the
   // claim above is made against the model this graph will actually run

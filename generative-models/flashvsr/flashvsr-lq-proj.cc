@@ -48,67 +48,76 @@ to_bf16(float f)
   return (std::uint16_t)(u >> 16);
 }
 
-// Read a tensor as f32 regardless of how the checkpoint stores it.
-std::vector<float>
-read_f32(WeightSet& ws, MetalCompute* mc, const std::string& nm,
-         std::size_t* n_out)
+// One element of a raw tensor as f32, whatever the checkpoint stores it
+// as: F32 as is, BF16 widened, F16 by the plain bit-twiddle (no
+// <arm_fp16.h> here).
+inline float
+elem_f32(const void* p, int kind, std::size_t i)
 {
-  *n_out = 0;
-  const auto* info = ws.src().info(nm);
-  if (info == nullptr) { return {}; }
-  SharedBuffer b = ws.read(nm, mc, WeightSet::Residency::Copied);
-  if (b.empty()) { return {}; }
-  std::size_t n = 1;
-  for (const auto d : info->shape) { n *= (std::size_t)d; }
-  std::vector<float> out(n, 0.0f);
-  const void* p = b.contents();
-  if (info->dtype == "F32") {
-    std::memcpy(out.data(), p, n * 4);
-  } else if (info->dtype == "BF16") {
-    const auto* s = (const std::uint16_t*)p;
-    for (std::size_t i = 0; i < n; ++i) {
-      const std::uint32_t u = (std::uint32_t)s[i] << 16;
-      std::memcpy(&out[i], &u, 4);
-    }
-  } else if (info->dtype == "F16") {
-    const auto* s = (const std::uint16_t*)p;
-    for (std::size_t i = 0; i < n; ++i) {
-      // half -> float, the plain bit-twiddle form (no <arm_fp16.h> here).
-      const std::uint32_t h = s[i];
-      const std::uint32_t sign = (h & 0x8000u) << 16;
-      std::uint32_t exp = (h >> 10) & 0x1fu;
-      std::uint32_t man = h & 0x3ffu;
-      std::uint32_t f;
-      if (exp == 0) {
-        if (man == 0) { f = sign; }
-        else {
-          exp = 127 - 15 + 1;
-          while ((man & 0x400u) == 0) { man <<= 1; --exp; }
-          man &= 0x3ffu;
-          f = sign | (exp << 23) | (man << 13);
-        }
-      } else if (exp == 31) {
-        f = sign | 0x7f800000u | (man << 13);
-      } else {
-        f = sign | ((exp - 15 + 127) << 23) | (man << 13);
-      }
-      std::memcpy(&out[i], &f, 4);
-    }
-  } else {
-    return {};
+  float f = 0.0f;
+  if (kind == 0) {
+    std::memcpy(&f, (const std::uint8_t*)p + i * 4, 4);
+    return f;
   }
-  *n_out = n;
-  return out;
+  const std::uint16_t h = ((const std::uint16_t*)p)[i];
+  std::uint32_t u = 0;
+  if (kind == 1) {
+    u = (std::uint32_t)h << 16;
+  } else {
+    const std::uint32_t sign = (std::uint32_t)(h & 0x8000u) << 16;
+    std::uint32_t exp = (h >> 10) & 0x1fu;
+    std::uint32_t man = h & 0x3ffu;
+    if (exp == 0) {
+      if (man == 0) {
+        u = sign;
+      } else {
+        exp = 127 - 15 + 1;
+        while ((man & 0x400u) == 0) { man <<= 1; --exp; }
+        man &= 0x3ffu;
+        u = sign | (exp << 23) | (man << 13);
+      }
+    } else if (exp == 31) {
+      u = sign | 0x7f800000u | (man << 13);
+    } else {
+      u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+    }
+  }
+  std::memcpy(&f, &u, 4);
+  return f;
 }
 
+// A tensor straight to bf16 in a buffer of its own, element `d` taken
+// from source element `src_of(d)` -- WITHOUT an f32 copy on the host.
+//
+// The copy is the point. This loader widened every weight to a host
+// std::vector<float> (and the conv weights to a second, permuted one)
+// before narrowing to bf16, and on this OS a freed large heap block stays
+// in the process's footprint, dirty, until the process exits: MEASURED,
+// loading this 549 MB projection left the footprint at 2746 MB, with the
+// heap reporting 10 MB in use. On a 16 GB box that was the swap.
+template <class Map>
 SharedBuffer
-bf16_buf(MetalCompute* mc, const float* src, std::size_t n)
+read_bf16(WeightSet& ws, MetalCompute* mc, const std::string& nm,
+          Map src_of, std::size_t* n_out = nullptr)
 {
-  SharedBuffer b = mc->make_shared_buffer(n * 2);
-  if (b.empty()) { return b; }
-  auto* d = (std::uint16_t*)b.contents();
-  for (std::size_t i = 0; i < n; ++i) { d[i] = to_bf16(src[i]); }
-  return b;
+  const auto* info = ws.src().info(nm);
+  if (info == nullptr) { return {}; }
+  const int kind = info->dtype == "F32" ? 0 : info->dtype == "BF16" ? 1
+                 : info->dtype == "F16" ? 2 : -1;
+  if (kind < 0) { return {}; }
+  std::size_t n = 1;
+  for (const auto d : info->shape) { n *= (std::size_t)d; }
+  SharedBuffer raw = ws.read(nm, mc, WeightSet::Residency::Copied);
+  if (raw.empty()) { return {}; }
+  SharedBuffer out = mc->make_shared_buffer(n * 2);
+  if (out.empty()) { return {}; }
+  const void* p = raw.contents();
+  auto* d = (std::uint16_t*)out.contents();
+  for (std::size_t i = 0; i < n; ++i) {
+    d[i] = to_bf16(elem_f32(p, kind, src_of(i)));
+  }
+  if (n_out != nullptr) { *n_out = n; }
+  return out;
 }
 
 }  // namespace
@@ -291,27 +300,15 @@ FlashVsrLqProj::load_conv_(WeightSet& ws, const std::string& nm,
   c->cin = cin;
   c->cout = cout;
   c->w = ws.derived(kKey + std::string("conv|") + nm, [&]() -> SharedBuffer {
-    std::size_t n = 0;
-    const std::vector<float> src = read_f32(ws, _mc, nm + ".weight", &n);
-    if (src.empty()) { return {}; }
-    std::vector<float> flat((std::size_t)cout * kTaps * cin, 0.0f);
-    for (int o = 0; o < cout; ++o) {
-      for (int t = 0; t < kTapsT; ++t) {
-        for (int ky = 0; ky < 3; ++ky) {
-          for (int kx = 0; kx < 3; ++kx) {
-            const int tap = (t * 3 + ky) * 3 + kx;
-            for (int i = 0; i < cin; ++i) {
-              const std::size_t si =
-                  ((((std::size_t)o * cin + i) * kTapsT + t) * 3 + ky) * 3 + kx;
-              const std::size_t di =
-                  ((std::size_t)o * kTaps + tap) * cin + i;
-              flat[di] = src[si];
-            }
-          }
-        }
-      }
-    }
-    return bf16_buf(_mc, flat.data(), flat.size());
+    // Destination [cout][tap][cin], source [cout][cin][t][ky][kx]: the
+    // tap order im2col_hwc_4x3x3_rep_tiled emits.
+    const std::size_t taps = (std::size_t)kTaps, ci = (std::size_t)cin;
+    return read_bf16(ws, _mc, nm + ".weight", [&](std::size_t di) {
+      const std::size_t i = di % ci;
+      const std::size_t tap = (di / ci) % taps;
+      const std::size_t o = di / (ci * taps);
+      return (o * ci + i) * taps + tap;
+    });
   });
   if (c->w.empty()) {
     if (err != nullptr) { *err = nm + ".weight could not be materialised"; }
@@ -326,10 +323,7 @@ FlashVsrLqProj::load_vec_(WeightSet& ws, const std::string& nm)
 {
   if (!ws.has(nm)) { return {}; }
   return ws.derived(kKey + std::string("vec|") + nm, [&]() -> SharedBuffer {
-    std::size_t n = 0;
-    const std::vector<float> v = read_f32(ws, _mc, nm, &n);
-    if (v.empty()) { return {}; }
-    return bf16_buf(_mc, v.data(), v.size());
+    return read_bf16(ws, _mc, nm, [](std::size_t i) { return i; });
   });
 }
 
@@ -338,11 +332,67 @@ FlashVsrLqProj::load_mat_(WeightSet& ws, const std::string& nm)
 {
   if (!ws.has(nm + ".weight")) { return {}; }
   return ws.derived(kKey + std::string("mat|") + nm, [&]() -> SharedBuffer {
-    std::size_t n = 0;
-    const std::vector<float> v = read_f32(ws, _mc, nm + ".weight", &n);
-    if (v.empty()) { return {}; }
-    return bf16_buf(_mc, v.data(), v.size());
+    return read_bf16(ws, _mc, nm + ".weight", [](std::size_t i) { return i; });
   });
+}
+
+std::size_t
+FlashVsrLqProj::weight_bytes(const std::string& source,
+                             const std::string& prefix)
+{
+  auto ws = WeightSet::open(source, nullptr);
+  if (ws == nullptr) { return 0; }
+  std::size_t n = 0;
+  for (const std::string& nm : ws->src().tensor_names()) {
+    if (nm.compare(0, prefix.size(), prefix) != 0) { continue; }
+    const auto* info = ws->src().info(nm);
+    if (info == nullptr) { continue; }
+    std::size_t e = 1;
+    for (const auto d : info->shape) { e *= (std::size_t)d; }
+    n += e * 2;                                   // held as bf16
+  }
+  return n;
+}
+
+std::size_t
+FlashVsrLqProj::working_bytes(const std::string& source,
+                              const std::string& prefix, int height,
+                              int width, int frames)
+{
+  if (height <= 0 || width <= 0 || frames <= 0) { return 0; }
+  auto ws = WeightSet::open(source, nullptr);
+  if (ws == nullptr) { return 0; }
+  const auto* c1 = ws->src().info(prefix + "conv1.weight");
+  const auto* c2 = ws->src().info(prefix + "conv2.weight");
+  const auto* lo = ws->src().info(prefix + "linear_layers.0.weight");
+  if (c1 == nullptr || c2 == nullptr || lo == nullptr ||
+      c1->shape.size() != 5 || c2->shape.size() != 5 ||
+      lo->shape.size() != 2) {
+    return 0;
+  }
+  using U = std::size_t;
+  const Config cfg;
+  const U hw = (U)(height / cfg.shuffle_h) * (U)(width / cfg.shuffle_w);
+  const U C0 = (U)c1->shape[1], C1 = (U)c1->shape[0];
+  const U C2 = (U)c2->shape[0], out = (U)lo->shape[0];
+  // The call pattern stream_forward is driven with: four source frames a
+  // call, which conv1 (stride 2 over the carry) turns into two and conv2
+  // into one row frame.
+  constexpr U kIn = 4, kOut1 = 2, kOut2 = 1;
+  const U widest = (U)kTaps * std::max(C0, C1);
+  const U band = std::min(hw * widest, (U)(192u << 20) / 2) * 2;
+  const U src = kIn * 3 * (U)height * (U)width;          // u8 upload
+  const U unshuffled = kIn * hw * C0 * 2;
+  const U conv1 = 2 * kOut1 * hw * C1 * 2;               // and its norm
+  const U conv2 = 2 * kOut2 * hw * C2 * 2;
+  const U carries = (U)kCarry * hw * (C0 + C1) * 2;
+  // The clip's row frames, one per four source frames past the warmup --
+  // the latent's own count -- held as they come and then copied into the
+  // beat.
+  const int chunks = (frames - 1) / 8 - 2;
+  const U row_frames = chunks > 0 ? (U)(2 * chunks + 4) : 0;
+  const U rows = 2 * row_frames * hw * out * 2;
+  return band + src + unshuffled + conv1 + conv2 + carries + rows;
 }
 
 void

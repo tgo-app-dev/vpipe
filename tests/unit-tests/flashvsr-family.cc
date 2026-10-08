@@ -27,6 +27,7 @@
 #include "generative-models/flashvsr/flashvsr-family.h"
 #include "generative-models/flashvsr/flashvsr-lq-proj.h"
 #include "generative-models/flashvsr/metal-flashvsr-transformer.h"
+#include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/video-model-registry.h"
 #include "pipeline/stage-registry.h"
@@ -35,6 +36,8 @@
 #include "stages/flashvsr-src-encoder-stage.h"
 
 #include <cmath>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -171,19 +174,39 @@ TEST(flashvsr_family, the_window_is_declared_as_allocated)
   // kv_ratio + 1 windows, and never fewer than the opening chunk's three.
   EXPECT_TRUE(T::kv_windows(0.0) == 3 && T::kv_windows(1.0) == 3);
   EXPECT_TRUE(T::kv_windows(2.0) == 3 && T::kv_windows(3.0) == 4);
-  // A K and a V per block, bf16, at 1920x1152: a window is 2x72x120
-  // tokens. 25.5 GB before the ring, at kv_ratio 3.
+  // ...and a clip of ONE chunk never needs a slot past those three.
+  EXPECT_TRUE(T::ring_windows(25, 3.0) == 3 && T::ring_windows(33, 3.0) == 4);
+  EXPECT_TRUE(T::ring_windows(89, 2.0) == 3 && T::ring_windows(89, 3.0) == 4);
+  // ONE window, a K and a V, bf16, at 1920x1152: a window is 2x72x120
+  // tokens.
   const T::Config cfg;
-  EXPECT_TRUE(T::kv_window_bytes(cfg, 1152, 1920, 3.0) == 12740198400ull);
-  EXPECT_TRUE(T::kv_window_bytes(cfg, 1152, 1920, 2.0) == 9555148800ull);
+  EXPECT_TRUE(T::kv_ring_bytes(cfg, 1152, 1920, 4) == 424673280ull);
+  EXPECT_TRUE(T::kv_ring_bytes(cfg, 1152, 1920, 3) == 318504960ull);
+  // THE ORDER. Block-outer holds one window where chunk-outer held one
+  // per block -- 12.7 GB at kv_ratio 3 -- and gives it up only when
+  // every chunk's residual stream would outweigh thirty windows, which
+  // at this size is a clip of over ~1400 frames.
   T::Params p;
+  p.kv_ratio = 3.0;
+  const bool forced = std::getenv("VPIPE_FVSR_CHUNK_OUTER") != nullptr;
+  if (!forced) {
+    EXPECT_TRUE(T::blocks_outer(cfg, 1152, 1920, 25, p));
+    EXPECT_TRUE(T::blocks_outer(cfg, 1152, 1920, 89, p));
+    EXPECT_TRUE(T::blocks_outer(cfg, 1152, 1920, 1201, p));
+    EXPECT_FALSE(T::blocks_outer(cfg, 1152, 1920, 1601, p));
+    EXPECT_TRUE(T::kv_window_bytes(cfg, 1152, 1920, 89, p) == 424673280ull);
+    EXPECT_TRUE(T::kv_window_bytes(cfg, 1152, 1920, 1601, p) ==
+                30ull * 424673280ull);
+  }
   p.kv_ratio = 2.0;
   const std::uint64_t all = T::denoise_scratch_bytes(cfg, 1152, 1920, 89, p);
-  // The window plus the opening chunk's scratch, routing and the latent:
-  // more than the window, and not by more than a few GB.
-  EXPECT_TRUE(all > 9555148800ull && all < 9555148800ull + (4ull << 30));
+  // The window, the opening chunk's scratch, every chunk's residual
+  // stream, routing and the latent: more than the window, and under the
+  // 9.6 GB the windows alone were chunk-outer.
+  const std::uint64_t win = T::kv_window_bytes(cfg, 1152, 1920, 89, p);
+  EXPECT_TRUE(all > win && (forced || all < (4ull << 30)));
   std::printf("  1920x1152 x 89 frames, kv_ratio 2: window %.2f GB, "
-              "denoise scratch %.2f GB\n", 9555148800.0 / 1e9,
+              "denoise scratch %.2f GB\n", (double)win / 1e9,
               (double)all / 1e9);
 
   // The source: its keys, its category, the tag a model_config iport
@@ -389,8 +412,16 @@ TEST(flashvsr_family, generates_from_projected_rows)
   req.cond = cond.data();
   req.cond_rows = (int)(rows.size() * tok);
   req.cond_dim = dim;
-  int chunks_seen = 0;
-  req.progress = [&](int, int) { ++chunks_seen; return true; };
+  // The bar's unit is the family's unit of work: a CHUNK chunk-outer, a
+  // block's pass over the whole clip block-outer. Either way it must
+  // reach its own total.
+  int steps_seen = 0, last_step = 0, last_total = 0;
+  req.progress = [&](int step, int total) {
+    ++steps_seen;
+    last_step = step;
+    last_total = total;
+    return true;
+  };
 
   VideoGenResult res;
   const bool gok = gen->generate(req, &res);
@@ -399,10 +430,11 @@ TEST(flashvsr_family, generates_from_projected_rows)
   ASSERT_TRUE(res.video_shape.size() == 4);
   if (res.video_shape.size() != 4) { return; }
   std::printf("  family latent [%d,%d,%d,%d] from %zu row frames, "
-              "%d chunks reported\n", res.video_shape[0], res.video_shape[1],
-              res.video_shape[2], res.video_shape[3], rows.size(),
-              chunks_seen);
-  EXPECT_TRUE(chunks_seen == chunks);
+              "%d of %d steps reported (%d chunks)\n", res.video_shape[0],
+              res.video_shape[1], res.video_shape[2], res.video_shape[3],
+              rows.size(), steps_seen, last_total, chunks);
+  EXPECT_TRUE(steps_seen == last_total && last_step == last_total);
+  EXPECT_TRUE(last_total == chunks || last_total == 30);
   // The noise is DRAWN here rather than fed, so the latent cannot match
   // the golden -- but its shape, scale and spread must. A wrong split
   // shows up as the wrong shape or a dead output, not a small error.
@@ -464,4 +496,147 @@ TEST(flashvsr_family, source_encoder_surface)
   FlashVsrSrcEncoderStage s(&sess, "enc", std::vector<InEdge>{},
                             FlexData::make_object());
   EXPECT_TRUE(s.num_oports() == sp->oports.size());
+}
+
+// The plan's view of the source projection, against the real checkpoint.
+// Two holes this closes: the encoder declared NO holding (0 MB on the
+// memory plan), and in a converted directory -- one set for denoiser,
+// projection and context -- the denoiser's floor counted only its own
+// streamed trunk, so the merge (larger floor wins) lost the projection
+// from every phase at the floor.
+TEST(flashvsr_family, the_plan_holds_the_source_projection)
+{
+  const char* r = root_();
+  if (r == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  FlashVsrLayout layout;
+  ASSERT_TRUE(resolve_flashvsr_layout(r, &layout));
+  if (!resolve_flashvsr_layout(r, &layout)) { return; }
+
+  // The byte figure is what a loaded projection holds, carries apart.
+  const std::size_t wb =
+      FlashVsrLqProj::weight_bytes(layout.source, layout.source_prefix);
+  std::string err;
+  auto proj = FlashVsrLqProj::load(WeightSet::open(layout.source, nullptr),
+                                   mc, &err, layout.source_prefix);
+  ASSERT_TRUE(proj != nullptr);
+  if (proj == nullptr) { return; }
+  const std::uint64_t held = proj->resident_bytes();
+  std::printf("  projection: %.1f MB figured, %.1f MB held\n",
+              wb / 1048576.0, held / 1048576.0);
+  EXPECT_TRUE(wb > 0 && wb <= held && held - wb < (16u << 20));
+
+  // The working set the family books for it at 1080p, nonzero and a
+  // fraction of the denoise's own.
+  const std::size_t work = FlashVsrLqProj::working_bytes(
+      layout.source, layout.source_prefix, 1152, 1920, 25);
+  std::printf("  projection working set at 1920x1152 x 25: %.0f MB\n",
+              work / 1048576.0);
+  EXPECT_TRUE(work > (256u << 20) && work < (2048u << 20));
+
+  VideoModelFamily* fam = VideoModelRegistry::get().find("flashvsr");
+  ASSERT_TRUE(fam != nullptr);
+  if (fam == nullptr) { return; }
+  const auto hs = fam->declare_holdings(r);
+  ASSERT_TRUE(hs.size() == 1);
+  if (hs.size() != 1) { return; }
+  MetalFlashVsrTransformer::Config cfg;
+  ASSERT_TRUE(MetalFlashVsrTransformer::config_from_checkpoint(
+      layout.denoiser, &cfg));
+  const std::size_t trunk =
+      (std::size_t)MetalFlashVsrTransformer::streaming_floor_bytes(cfg);
+  std::printf("  family floor %.0f MB (trunk %.0f), preload %.0f MB\n",
+              hs[0].floor / 1048576.0, trunk / 1048576.0,
+              hs[0].preload / 1048576.0);
+  if (layout.source == layout.denoiser) {
+    EXPECT_TRUE(hs[0].floor >= trunk + wb);
+  } else {
+    EXPECT_TRUE(hs[0].floor >= trunk);
+  }
+  EXPECT_TRUE(hs[0].floor <= hs[0].preload);
+
+  // ...and the encoder holds it under the set it loads through.
+  FlexData c = FlexData::make_object();
+  c.as_object().insert_or_assign("hf_dir", FlexData::make_string(r));
+  FlashVsrSrcEncoderStage enc(&sess, "enc", std::vector<InEdge>{}, c);
+  const StageMemory m = enc.declare_memory();
+  ASSERT_TRUE(m.holdings.size() == 1);
+  if (m.holdings.size() == 1) {
+    EXPECT_TRUE(m.holdings[0].source == layout.source);
+    EXPECT_TRUE(m.holdings[0].preload == wb && m.holdings[0].floor == wb);
+  }
+}
+
+// DIAGNOSTIC, env-gated (VPIPE_FVSR_ENC_FOOTPRINT): what loading the source
+// projection leaves in the process's footprint, and how much of it is
+// heap the allocator merely kept.
+TEST(flashvsr_family, source_projection_load_footprint)
+{
+  const char* r = root_();
+  if (r == nullptr || std::getenv("VPIPE_FVSR_ENC_FOOTPRINT") == nullptr) {
+    return;
+  }
+  auto fp = []() -> double {
+    task_vm_info_data_t ti;
+    mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &c) !=
+        KERN_SUCCESS) {
+      return 0.0;
+    }
+    return (double)ti.phys_footprint / 1048576.0;
+  };
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  FlashVsrLayout layout;
+  ASSERT_TRUE(resolve_flashvsr_layout(r, &layout));
+  const double f0 = fp();
+  auto ws = WeightSet::open(layout.source, nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  if (ws == nullptr) { return; }
+  std::string err;
+  auto proj = FlashVsrLqProj::load(ws, mc, &err, layout.source_prefix);
+  ASSERT_TRUE(proj != nullptr);
+  const double f1 = fp();
+  malloc_statistics_t st{};
+  malloc_zone_statistics(nullptr, &st);
+  const std::size_t relieved = malloc_zone_pressure_relief(nullptr, 0);
+  const double f2 = fp();
+  // ...and the denoiser, streaming and resident, and the VAE.
+  for (const bool stream : {true, false}) {
+    MetalFlashVsrTransformer::Config dc;
+    if (!MetalFlashVsrTransformer::config_from_checkpoint(layout.denoiser,
+                                                          &dc)) {
+      break;
+    }
+    dc.stream_blocks = stream;
+    const double g0 = fp();
+    auto dws = WeightSet::open(layout.denoiser, nullptr);
+    auto cws = WeightSet::open(layout.context, nullptr);
+    auto dit = MetalFlashVsrTransformer::load(dws, cws, layout.context_name,
+                                              mc, dc, &err);
+    const double g1 = fp();
+    std::printf("  denoiser (%s): footprint +%.0f MB on load; it holds "
+                "%.0f MB\n", stream ? "streaming" : "resident", g1 - g0,
+                dit ? (double)dit->resident_bytes() / 1048576.0 : 0.0);
+  }
+  if (!layout.vae.empty()) {
+    MetalWanVae::Config vc;
+    std::string verr;
+    if (MetalWanVae::config_from_json(layout.vae, vc, &verr) ||
+        MetalWanVae::config_for_native_checkpoint(layout.vae, vc, &verr)) {
+      const double v0 = fp();
+      auto vae = MetalWanVae::load(layout.vae, mc, vc, false);
+      const double v1 = fp();
+      std::printf("  Wan VAE: footprint +%.0f MB on load\n", v1 - v0);
+    }
+  }
+  std::printf("  source projection: footprint %.0f -> %.0f MB on load, "
+              "%.0f MB after the allocator returned %zu MB; it holds %.0f "
+              "MB; malloc in use %zu MB of %zu MB allocated\n", f0, f1, f2,
+              relieved >> 20,
+              proj ? (double)proj->resident_bytes() / 1048576.0 : 0.0,
+              st.size_in_use >> 20, st.size_allocated >> 20);
 }

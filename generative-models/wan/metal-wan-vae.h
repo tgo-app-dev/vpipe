@@ -194,11 +194,21 @@ class MetalWanVae {
   // 1.0 untiled, and (tile + halo) / whole for a spatial tiling. It scales
   // only what runs below the last temporal upsample, because that is what
   // tiles: the blocks above it, and the mid attention among them, keep the
-  // whole plane. See decode()'s tiling and choose_tail_tiles_().
+  // whole plane. See decode_tile_outer_() and choose_tail_tiles_().
+  //
+  // `tail_frac` < 1 is the TILE-OUTER decode, which holds the clip's split-
+  // plane frames and RGB and so grows with its length: `latent_frames` is
+  // that length, and is read only then.
+  //
+  // `deep` is the tiling that starts below the MID ATTENTION rather than
+  // below the last temporal upsample: a wider halo, a far smaller store
+  // and head, for a box the shallow one does not fit.
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
   static std::size_t decode_peak_bytes(const Config& cfg, int h8, int w8,
                                        bool frame_split = true,
-                                       double tail_frac = 1.0) noexcept;
+                                       double tail_frac = 1.0,
+                                       int latent_frames = 1,
+                                       bool deep = false) noexcept;
 
   // How many tiles the TAIL (everything below the last temporal upsample)
   // is split into so a decode fits `headroom`, and the plane share one
@@ -211,13 +221,24 @@ class MetalWanVae {
   // nearest upsample, and a per-pixel RMS over channels -- all local -- so
   // a tile carrying `halo` pixels of real neighbourhood produces interior
   // pixels that do not know they were tiled.
+  //
+  // Two depths. SHALLOW tiles the tail below the last temporal upsample, on
+  // the split plane, with a halo of a few pixels. DEEP tiles everything
+  // below the mid attention, on the LATENT plane: the halo is wider (~12
+  // latent pixels of reach, 16 aligned) and so is the recompute, but the
+  // head shrinks to the mid block and the store to one latent frame of it
+  // per chunk -- what a box too small for the shallow floor needs.
   struct TailTiles {
     int    ty    = 1;
     int    tx    = 1;
-    int    bh    = 0;     // tile height in split-plane pixels, a multiple of 8
+    int    bh    = 0;     // tile height in tile-plane pixels, a multiple of 8
     int    bw    = 0;
-    int    halo  = 0;     // split-plane pixels of overlap per side, also 8s
-    double frac  = 1.0;   // (tile + halo) / whole, for decode_peak_bytes
+    int    halo  = 0;     // tile-plane pixels of overlap per side, also 8s
+    double frac  = 1.0;   // largest (tile + halo) / whole
+    bool   deep  = false; // tile plane = latent (deep) or split plane
+    // Laid out exactly as given (VPIPE_WAN_VAE_TILE), rather than planned
+    // a band at a time from what is free as the decode goes.
+    bool   forced = false;
   };
   // Tiles and halo are rounded UP TO 8 on purpose. The matrix-core 3x3
   // convolution tiles its destination 8x8 and declines a plane whose H or
@@ -230,12 +251,19 @@ class MetalWanVae {
   // `headroom`. When nothing does, the FINEST grid tried comes back with
   // `fits` false -- a refusal can then say what was already attempted
   // instead of quoting the whole-plane figure nobody was going to use.
+  // The `ty` x `tx` grid as the decode would cut it (8-aligned tiles and
+  // halo), or {1, 1} where that grid is all halo. VPIPE_WAN_VAE_TILE forces
+  // one; a test asks for the figure it will be held to.
+  TailTiles tail_tiles_for(int h8, int w8, int ty, int tx,
+                           bool deep = false) const noexcept;
   TailTiles choose_tail_tiles_(int h8, int w8, std::size_t headroom,
-                               bool frame_split,
+                               bool frame_split, int latent_frames,
                                bool* fits = nullptr) const noexcept;
   // Pixels of halo one tile needs so its interior is bit-exact: one per
-  // 3x3 conv below the split, each counted at its own resolution.
+  // 3x3 conv below the split, each counted at its own resolution. The deep
+  // one counts every conv below the mid block, in latent pixels.
   int tail_halo_() const noexcept;
+  int tail_halo_deep_() const noexcept;
   // The split-plane size (the tail's input) for a latent of this size.
   void tail_plane_(int h8, int w8, int* hs, int* ws) const noexcept;
 
@@ -265,6 +293,28 @@ class MetalWanVae {
   static int mma_row_chunk(int M, int N, int K, int max_m = kMmaMaxM);
 
  private:
+  // decode_peak_bytes in TERMS, by region: the mid block (with conv_in),
+  // the up blocks to the last temporal upsample, and the tail below it --
+  // so a whole, shallow-tiled or deep-tiled decode can each sum what it
+  // holds at once. `mode` 0 whole, 1 shallow, 2 deep; `frac` a tile's
+  // share of the plane where that mode tiles.
+  enum { kMid = 0, kUp = 1, kTail = 2 };
+  struct DecodeTerms {
+    std::size_t carries[3] = {0, 0, 0};
+    std::size_t pool[3]    = {0, 0, 0};
+    std::size_t mid_el   = 0;   // one mid-block frame, elements
+    std::size_t split_el = 0;   // one split-plane frame, elements
+    std::size_t out_hw   = 0;   // output pixels per frame
+    std::size_t t        = 1;   // frames in a steady chunk
+  };
+  static DecodeTerms decode_terms_(const Config& cfg, int h8, int w8,
+                                   bool frame_split, double frac,
+                                   int mode) noexcept;
+  // What ONE tile of share `frac` holds while it runs the clip, and the
+  // share of what is free one tile may take on a tight box.
+  static std::size_t tile_working_bytes_(const Config& cfg, int h8, int w8,
+                                         double frac, bool deep) noexcept;
+  static double tile_share_() noexcept;
   MetalWanVae() = default;
 
   // A convolution stored as a dense-GEMM weight [Cout, K] (+ bias [Cout]),
@@ -402,6 +452,10 @@ class MetalWanVae {
   // One output FRAME of a convolution, gathering its taps from `taps`
   // (kt frame views, each [hw, cin]) into the shared band scratch and
   // running the GEMM. Handles all four Conv shapes above.
+  // Where gather band `r0` of `rows` starts, so no band of a plane runs
+  // under matmul2d's row floor (see the definition).
+  std::size_t band_start_(std::size_t r0, std::size_t rows,
+                          std::size_t ohw) const noexcept;
   void conv_frame_(Ctx& cx, const Conv& c,
                    const metal_compute::SharedBuffer* const taps[3],
                    const std::size_t tap_off[3],
@@ -454,6 +508,37 @@ class MetalWanVae {
   metal_compute::SharedBuffer&
   time_down_(Ctx& cx, const Resample& rs, const metal_compute::SharedBuffer& x,
              int& t, std::size_t hw, int C, Carry* carry);
+
+  // The decode's two halves, either side of the last temporal upsample
+  // (`split_index_`): the head of one latent frame to the split plane,
+  // and the tail from there to RGB. Shared by the whole-plane decode and
+  // the tile-outer one, which only runs them in a different order.
+  std::size_t split_index_() const noexcept;
+  // The head in its two parts: the mid block (to the latent plane's one
+  // frame) and the up blocks to the split. A deep tile runs the second
+  // on its own patch of the first's output.
+  const metal_compute::SharedBuffer*
+  mid_chunk_(Ctx& cx, const metal_compute::SharedBuffer& z, int T, int f,
+             int h8, int w8, std::vector<Carry>& carry, std::size_t& ci);
+  const metal_compute::SharedBuffer*
+  up_to_split_(Ctx& cx, const metal_compute::SharedBuffer& in, int& t,
+               int& H, int& W, std::vector<Carry>& carry, std::size_t& ci);
+  const metal_compute::SharedBuffer*
+  head_chunk_(Ctx& cx, const metal_compute::SharedBuffer& z, int T, int f,
+              int h8, int w8, std::vector<Carry>& carry, std::size_t& ci,
+              int& t, int& H, int& W);
+  metal_compute::SharedBuffer*
+  tail_(Ctx& cx, const metal_compute::SharedBuffer& in, int nt, int& th,
+        int& tw, std::vector<Carry>& carry, std::size_t& ci);
+  // The tail over a chunk's `t` split-plane frames, a frame at a time.
+  metal_compute::SharedBuffer*
+  tail_frames_(Ctx& cx, const metal_compute::SharedBuffer& x, int t, int& H,
+               int& W, std::vector<Carry>& carry, std::size_t& ci);
+  // A decode whose tail does not fit whole: the head over the clip into a
+  // store, then each tile through every frame. See the definition.
+  bool decode_tile_outer_(const metal_compute::SharedBuffer& z, int T, int h8,
+                          int w8, const TailTiles& tiles, std::size_t col_cap,
+                          const FrameSink& on_frame, std::string* err);
 
   // Copy the trailing min(2, t) frames of `x` into `carry` for the next
   // chunk. A GPU-side copy: the frames are still only on the GPU timeline.

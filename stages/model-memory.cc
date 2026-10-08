@@ -848,6 +848,15 @@ public:
     // decide-pass REFINEMENT has to be buffered -- see decide().
     mgr->declare_weights(dir, b, phase, last_phase,
                          floor > 0 && floor < b ? floor : 0);
+    // VPIPE_PLAN_LOG: every checkpoint as the plan received it.
+    if (session != nullptr && std::getenv("VPIPE_PLAN_LOG") != nullptr) {
+      session->info(fmt("resource-plan: weights '{}' {} MB{} in {}", dir,
+                        b >> 20,
+                        floor > 0 && floor < b
+                            ? fmt(" (floor {} MB)", floor >> 20)()
+                            : std::string(),
+                        phase.empty() ? std::string("every phase") : phase));
+    }
     _declared.fetch_add(b, std::memory_order_relaxed);
     // A language model kept warm (text-chat's `keep_loaded`) that this
     // launch has not claimed goes NOW, at the first claim that is not it:
@@ -1247,6 +1256,15 @@ public:
     }
     if (bytes == 0) { return; }
     mgr->declare_scratch(key.substr(0, bar), bytes, phase, last_phase);
+    // VPIPE_PLAN_LOG: every arena as the plan received it.
+    if (session != nullptr && std::getenv("VPIPE_PLAN_LOG") != nullptr) {
+      session->info(fmt("resource-plan: arena '{}' {} MB in {}{}",
+                        key.substr(0, bar), bytes >> 20,
+                        phase.empty() ? std::string("every phase") : phase,
+                        last_phase.empty() || last_phase == phase
+                            ? std::string()
+                            : " .. " + last_phase));
+    }
     _total.fetch_add(bytes, std::memory_order_relaxed);
     _arenas.fetch_add(1, std::memory_order_relaxed);
   }

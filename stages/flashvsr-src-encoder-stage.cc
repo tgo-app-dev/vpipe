@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -130,6 +131,26 @@ FlashVsrSrcEncoderStage::declare_resources() const
     return model_memory::weight_claims({root});
   }
   return model_memory::weight_claims({layout.source});
+}
+
+StageMemory
+FlashVsrSrcEncoderStage::declare_memory() const
+{
+  // The projection, under the set it loads through -- the root when
+  // converted, where the denoiser's holding names it too and the two merge
+  // (that holding's floor counts the projection), and LQ_proj_in.ckpt as
+  // published. It does not stream, so its floor is what it weighs. Its
+  // WORKING SET is booked by the denoiser's family, which knows the clip
+  // geometry this stage only sees at its first beat.
+  StageMemory m;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (root.empty()) { return m; }
+  genai::FlashVsrLayout layout;
+  if (!genai::resolve_flashvsr_layout(root, &layout)) { return m; }
+  const std::size_t b = genai::FlashVsrLqProj::weight_bytes(
+      layout.source, layout.source_prefix);
+  m.hold(layout.source, b, b);
+  return m;
 }
 
 void
@@ -288,6 +309,13 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
         this->id(), err));
     co_return;
   }
+  if (std::getenv("VPIPE_FVSR_ENC_LOG") != nullptr) {
+    const auto ms = metal_compute::shared_buffer_memory_stats();
+    session()->info(fmt(
+        "FlashVsrSrcEncoderStage('{}'): after a {}-frame clip: live {} MB, "
+        "peak {} MB, {} row frames", this->id(), frames, ms.live_bytes >> 20,
+        ms.peak_bytes >> 20, rows.size()));
+  }
   if (rows.empty()) {
     session()->warn(fmt(
         "FlashVsrSrcEncoderStage('{}'): a {}-frame clip produced no rows -- "
@@ -330,6 +358,12 @@ FlashVsrSrcEncoderStage::process(RuntimeContext& ctx)
 
 std::vector<ResourceClaim>
 FlashVsrSrcEncoderStage::declare_resources() const
+{
+  return {};
+}
+
+StageMemory
+FlashVsrSrcEncoderStage::declare_memory() const
 {
   return {};
 }

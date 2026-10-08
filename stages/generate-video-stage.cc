@@ -2217,13 +2217,34 @@ GenerateVideoStage::ensure_expert_(int which)
         case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
         case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
         default: {
+          // A family that STREAMED holds a fraction of its checkpoint, so
+          // letting go of it after a clip frees next to nothing and costs
+          // a whole reload per clip -- for FlashVSR its load-time folds,
+          // ~5 s a clip warm at 1920x1152. Such a family is judged by what
+          // it holds, not by the checkpoint it streams from.
+          const std::size_t held =
+              (std::size_t)_plugin_gen->resident_bytes();
+          std::size_t full = 0;
+          for (const StageHolding& h :
+               _plugin_family->declare_holdings(_root)) {
+            full += h.preload;
+          }
+          const bool streamed = held != 0 && full != 0 && held * 4 < full;
           const std::size_t ram = model_memory::phys_ram();
           const std::size_t need =
-              model_memory::weight_footprint(session(), {_root}) +
+              (streamed ? held
+                        : model_memory::weight_footprint(session(), {_root})) +
               model_memory::scratch_footprint(session(),
                                               model_memory::kPhaseDecode) +
               model_memory::kHeadroom;
-          _unload_idle = args.prefer_streaming || (ram != 0 && ram < need);
+          // A box SHORT of that room still lets go, streamed or not. Not
+          // for the bytes -- a streamed holding is a few hundred MB -- but
+          // for the ORDER: the reload is what puts the next clip's denoise
+          // behind this clip's decode. MEASURED on a 16 GB M5 at 1920x1152:
+          // kept loaded, the next denoise took its scratch first and both
+          // decodes were refused; released, both ran (~2.5 GB of swap).
+          _unload_idle = (args.prefer_streaming && !streamed) ||
+                         (ram != 0 && ram < need);
           break;
         }
       }

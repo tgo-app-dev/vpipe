@@ -991,6 +991,26 @@ MetalWanVae::gemm_bias_(Ctx& cx, const SharedBuffer& x, const SharedBuffer& w,
 // before the start of the sequence). Rows are streamed in bands so the col
 // scratch stays bounded -- at 27 taps a full-res [H*W, 27*Cin] would be
 // several GB.
+// Where a gather band starts. Band `r0` of `rows`, except a LAST band that
+// would come in under matmul2d's row floor: that one starts _mma_min_m
+// rows from the end instead, recomputing a few rows its neighbour already
+// wrote -- with the same kernel, so the same values. Otherwise the plane's
+// size decides which rows a short tail band sends to the steel GEMM, and a
+// tile, whose planes are other sizes, rounds those rows differently: the
+// deep tiling measured 1.6 f16 ulps in the bottom 32 output rows on the M5
+// before this, and none after.
+std::size_t
+MetalWanVae::band_start_(std::size_t r0, std::size_t rows,
+                         std::size_t ohw) const noexcept
+{
+  const std::size_t floor_m = (std::size_t)_mma_min_m;
+  if (!_use_mma2 || r0 == 0 || ohw - r0 >= floor_m || rows < floor_m ||
+      ohw < floor_m) {
+    return r0;
+  }
+  return ohw - floor_m;
+}
+
 void
 MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
                          const SharedBuffer* const taps[3],
@@ -1023,12 +1043,13 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
     const SharedBuffer* any = taps[0] != nullptr ? taps[0]
                             : taps[1] != nullptr ? taps[1] : taps[2];
     for (std::size_t r0 = 0; r0 < ohw; r0 += rows) {
-      const int mc = (int)std::min(rows, ohw - r0);
+      const std::size_t b0 = band_start_(r0, rows, ohw);
+      const int mc = (int)std::min(rows, ohw - b0);
       enc.set_function(_fn_concat3);
       for (int t = 0; t < 3; ++t) {
         const SharedBuffer* b = taps[t] != nullptr ? taps[t] : any;
         const std::size_t off =
-            (taps[t] != nullptr) ? (tap_off[t] + r0 * (std::size_t)c.cin) : 0;
+            (taps[t] != nullptr) ? (tap_off[t] + b0 * (std::size_t)c.cin) : 0;
         enc.set_buffer((unsigned)t, *b, off * 2);
       }
       enc.set_buffer(3, cx.col);
@@ -1036,7 +1057,7 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
       enc.set_constant(6, mask);
       enc.dispatch({(unsigned)(3 * c.cin), (unsigned)mc, 1}, {64, 1, 1});
       gemm_bias_(cx, cx.col, c.w, c.b, out, mc, c.cout, c.k,
-                 (int)(out_row0 + r0));
+                 (int)(out_row0 + b0));
     }
     return;
   }
@@ -1058,7 +1079,8 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
   const SharedBuffer* any = taps[0] != nullptr ? taps[0]
                           : taps[1] != nullptr ? taps[1] : taps[2];
   for (std::size_t r0 = 0; r0 < ohw; r0 += rows) {
-    const int mc = (int)std::min(rows, ohw - r0);
+    const std::size_t b0 = band_start_(r0, rows, ohw);
+    const int mc = (int)std::min(rows, ohw - b0);
     if (c.kt == 3) {
       enc.set_function(_fn_im2col3d_tiled);
       for (int t = 0; t < 3; ++t) {
@@ -1069,7 +1091,7 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
       enc.set_buffer(3, cx.col);
       enc.set_constant(4, H); enc.set_constant(5, W);
       enc.set_constant(6, c.cin);
-      enc.set_constant(7, (int)r0); enc.set_constant(8, mc);
+      enc.set_constant(7, (int)b0); enc.set_constant(8, mc);
       enc.set_constant(9, mask);
       enc.dispatch({(unsigned)c.k, (unsigned)mc, 1}, {64, 1, 1});
     } else {
@@ -1080,11 +1102,11 @@ MetalWanVae::conv_frame_(Ctx& cx, const Conv& c,
       enc.set_buffer(1, cx.col);
       enc.set_constant(2, H); enc.set_constant(3, W);
       enc.set_constant(4, c.cin);
-      enc.set_constant(5, (int)r0); enc.set_constant(6, mc);
+      enc.set_constant(5, (int)b0); enc.set_constant(6, mc);
       enc.dispatch({(unsigned)(9 * c.cin), (unsigned)mc, 1}, {64, 1, 1});
     }
     gemm_bias_(cx, cx.col, c.w, c.b, out, mc, c.cout, c.k,
-               (int)(out_row0 + r0));
+               (int)(out_row0 + b0));
   }
 }
 
@@ -1504,12 +1526,23 @@ MetalWanVae::decode_peak_bytes(int h8, int w8) const noexcept
 // 4.3% and 3.3% above the measurement.
 //
 // The OUTPUT: the chunk's RGB twice, the pool's and the sink's.
-std::size_t
-MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
-                               bool frame_split, double tail_frac) noexcept
+//
+// TILED (`tail_frac` < 1) is a different decode with a different shape:
+// the head over the whole clip into a store of split-plane frames, then
+// each tile through every frame holding only ITS carries (see
+// decode_tile_outer_). So it is the store and the clip's RGB, plus the
+// larger of the two phases -- and it needs the clip length to say so.
+// An earlier tiling kept every tile's carries for the whole clip and was
+// booked as if it held one tile's: MEASURED on the M5 at 1024x1024, 2x2
+// held 6158 MB against 6272 whole while this figure said 2932.
+MetalWanVae::DecodeTerms
+MetalWanVae::decode_terms_(const Config& cfg, int h8, int w8,
+                           bool frame_split, double frac, int mode) noexcept
 {
-  if (h8 <= 0 || w8 <= 0) { return 0; }
+  DecodeTerms r;
+  if (h8 <= 0 || w8 <= 0) { return r; }
   constexpr std::size_t kSlots = 2;
+  const bool deep = mode == 2;
   const std::size_t hw8 = (std::size_t)h8 * w8;
   const std::size_t base = (std::size_t)cfg.base_dim;
   const std::size_t d[5] = {base * cfg.dim_mult[3], base * cfg.dim_mult[3],
@@ -1521,62 +1554,176 @@ MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
   for (int i = 0; i < 3; ++i) {
     if (tup[i]) { split_at = i; }
   }
-
-  // Below the split the tail may run on TILES, so everything there holds
-  // one tile's plane (plus its halo) rather than the whole one. Above it
-  // -- conv_in, the mid block with its whole-plane attention, and the
-  // blocks up to the split -- nothing tiles and the share is 1.
-  const double frac = (tail_frac > 0.0 && tail_frac < 1.0) ? tail_frac : 1.0;
+  if (mode == 0) { frac = 1.0; }
+  // What a TILE holds of a plane: below the mid attention when deep, below
+  // the last temporal upsample when shallow, nothing when whole.
   auto tiled = [&](std::size_t hw) {
     return (std::size_t)((double)hw * frac + 0.5);
   };
-
-  std::size_t carries = 0, pool = 0;
+  int region = kMid;
   auto keep = [&](std::size_t hw, std::size_t cin) {
-    carries += 2 * hw * cin * 2;
+    r.carries[region] += 2 * hw * cin * 2;
   };
   std::size_t level = hw8 * d[0];            // ELEMENTS, the level's largest
   auto next_level = [&](std::size_t opens) {
-    pool += kSlots * level * 2;
+    r.pool[region] += kSlots * level * 2;
     level = opens;
   };
-
+  r.mid_el = hw8 * d[0];
   keep(hw8, (std::size_t)cfg.z_dim);                     // conv_in
-  for (int r = 0; r < 4; ++r) { keep(hw8, d[0]); }       // mid, 2 x 2 convs
+  for (int r4 = 0; r4 < 4; ++r4) { keep(hw8, d[0]); }    // mid, 2 x 2 convs
   // `t` frames in the chunk; `nt` frames in each buffer, which drops to one
   // past the split.
   std::size_t hw = hw8, t = 1, nt = 1;
   for (int i = 0; i < 4; ++i) {
     const std::size_t in = (i > 0) ? d[i] / 2 : d[i];
     const std::size_t out = d[i + 1];
-    // The tail begins at the split block's SPATIAL half, so that block's
-    // resnets are still whole-plane and everything after them is not.
-    const std::size_t rhw = (i > split_at) ? tiled(hw) : hw;
-    for (int r = 0; r <= cfg.num_res_blocks; ++r) {
-      keep(rhw, r == 0 ? in : out);
+    if (i == 0 && deep) {
+      // Deep: the mid block's level is the head's alone, and block 0 opens
+      // the tile's first level. (Otherwise the two share one level, which
+      // is how the whole-chunk calibration was taken.)
+      next_level(0);
+    }
+    region = i > split_at ? kTail : kUp;
+    const bool tile_here = deep || i > split_at;
+    // The shallow tail begins at the split block's SPATIAL half, so that
+    // block's resnets are still whole-plane and everything after them is
+    // not.
+    const std::size_t rhw = tile_here ? tiled(hw) : hw;
+    for (int rr = 0; rr <= cfg.num_res_blocks; ++rr) {
+      keep(rhw, rr == 0 ? in : out);
       keep(rhw, out);
     }
     level = std::max(level, nt * rhw * std::max(in, out));
     if (i == 3) { break; }                   // the last block has no resample
     if (tup[i]) {
-      keep(hw, out);                         // its time_conv
-      level = std::max(level, nt * hw * 2 * out);
+      keep(deep ? tiled(hw) : hw, out);      // its time_conv
+      level = std::max(level, nt * (deep ? tiled(hw) : hw) * 2 * out);
       t *= 2;
       nt = (frame_split && i >= split_at) ? 1 : t;
     }
-    const std::size_t uhw = (i >= split_at) ? tiled(hw) : hw;
+    if (i == split_at) { r.split_el = hw * out; }
+    const std::size_t uhw = (deep || i >= split_at) ? tiled(hw) : hw;
     next_level(nt * 4 * uhw * out);
     hw *= 4;
   }
+  region = kTail;
   keep(tiled(hw), d[4]);                     // conv_out
   next_level(0);
-  // The chunk's RGB twice: the tile's (pooled) and the whole frame's, which
-  // the tiles are assembled into and the sink reads. Untiled the two are
-  // the same size, which is the `2 x` this term has always carried.
-  const std::size_t rgb_whole = 2 * t * hw * 3;
-  const std::size_t rgb_tile =
-      (std::size_t)((double)rgb_whole * frac + 0.5);
-  return carries + pool + rgb_whole + rgb_tile;
+  r.out_hw = hw;
+  r.t = t;
+  return r;
+}
+
+std::size_t
+MetalWanVae::tile_working_bytes_(const Config& cfg, int h8, int w8,
+                                 double frac, bool deep) noexcept
+{
+  // What ONE tile of share `frac` holds while it runs the clip: its
+  // carries, its pool, its input and its output. Read before each tile,
+  // so a decode can split a tile that no longer fits what is free.
+  const DecodeTerms r = decode_terms_(cfg, h8, w8, true, frac, deep ? 2 : 1);
+  auto tiled = [&](std::size_t n) {
+    return (std::size_t)((double)n * frac + 0.5);
+  };
+  if (!deep) {
+    return r.carries[kTail] + r.pool[kTail] + tiled(r.split_el) * 2 +
+           tiled(r.out_hw) * 3 * 2;
+  }
+  // Deep: everything below the mid block, one latent frame's chunk at a
+  // time -- so the chunk's RGB twice, as in a whole decode, at the tile's
+  // share.
+  constexpr double kTileSlots = 2.0;
+  const std::size_t pool = (std::size_t)(
+      (double)(r.pool[kUp] + r.pool[kTail]) * kTileSlots / 2.0 + 0.5);
+  return r.carries[kUp] + r.carries[kTail] + pool + tiled(r.mid_el) * 2 +
+         2 * tiled(r.t * r.out_hw * 3 * 2);
+}
+
+// Walks decode()'s topology for a STEADY chunk -- four output frames; the
+// first chunk is one, and smaller everywhere. Three terms, in f16 bytes.
+//
+// CARRIES, exact: two input frames of every causal conv, allocated by the
+// first chunk and held to the end of the clip. The estimate this replaced
+// had no such term and called itself per-chunk, which is how a 1920x1152
+// decode that holds ~10 GB of carries was booked at under 6 GB in total.
+//
+// The chunk POOL is first-fit and hands nothing back inside a chunk, and
+// the decoder only ever widens, so a level keeps the slots it grew while
+// the next adds its own: kSlots of each level's largest buffer, where a
+// level opens at the nearest-2x buffer that feeds it. kSlots is
+// CALIBRATED, not derived (flashvsr_vae.frame_split_is_exact_and_bounded):
+// the measured pool is 1.84 slots a level over the whole chunk and 1.74
+// split, identically at 256x256 and 512x512 -- the peaks scale by exactly
+// 4.0x, so nothing in them is a fixed overhead -- which puts this figure
+// 4.3% and 3.3% above the measurement.
+//
+// The OUTPUT: the chunk's RGB twice, the pool's and the sink's.
+//
+// TILED (`tail_frac` < 1) is a different decode with a different shape:
+// a head over the whole clip into a store, then each tile through every
+// frame holding only ITS carries (see decode_tile_outer_). So it is the
+// store and the clip's RGB, plus the larger of the two phases -- and it
+// needs the clip length to say so. SHALLOW tiles start below the last
+// temporal upsample and store split-plane frames; DEEP ones start below
+// the mid attention and store its output, one latent frame each, which is
+// a sixteenth of the bytes and leaves the head nothing but the mid block.
+// An earlier tiling kept every tile's carries for the whole clip and was
+// booked as if it held one tile's: MEASURED on the M5 at 1024x1024, 2x2
+// held 6158 MB against 6272 whole while this figure said 2932.
+std::size_t
+MetalWanVae::decode_peak_bytes(const Config& cfg, int h8, int w8,
+                               bool frame_split, double tail_frac,
+                               int latent_frames, bool deep) noexcept
+{
+  if (h8 <= 0 || w8 <= 0) { return 0; }
+  constexpr std::size_t kSlots = 2;
+  const bool tile_outer = tail_frac > 0.0 && tail_frac < 1.0;
+  if (!tile_outer) {
+    const DecodeTerms r = decode_terms_(cfg, h8, w8, frame_split, 1.0, 0);
+    // The chunk's RGB twice: the pool's and the sink's.
+    const std::size_t rgb_whole = 2 * r.t * r.out_hw * 3;
+    std::size_t sum = 2 * rgb_whole;
+    for (int k = 0; k < 3; ++k) { sum += r.carries[k] + r.pool[k]; }
+    return sum;
+  }
+  // TILE-OUTER: the store and the clip's RGB are held across both phases;
+  // the head's carries and pool only in the first, one tile's in the
+  // second.
+  const DecodeTerms r =
+      decode_terms_(cfg, h8, w8, true, tail_frac, deep ? 2 : 1);
+  const std::size_t T = (std::size_t)std::max(1, latent_frames);
+  const std::size_t F = (std::size_t)video_frames((int)T);
+  const std::size_t rgb = F * r.out_hw * 3 * 2;
+  // ...and the sink's channel-first copy of one chunk.
+  const std::size_t sink = 4 * r.out_hw * 3 * 2;
+  const std::size_t tile =
+      tile_working_bytes_(cfg, h8, w8, tail_frac, deep);
+  if (deep) {
+    // The mid block alone, over the whole plane, one latent frame at a
+    // time. Calibrated like the shallow head below: kMidSlots of its one
+    // level. MEASURED, see flashvsr_vae.tiled_tail_is_exact_and_smaller.
+    constexpr double kMidSlots = 2.0;
+    const std::size_t store = T * r.mid_el * 2;
+    const std::size_t head =
+        r.carries[kMid] +
+        (std::size_t)((double)r.pool[kMid] * kMidSlots / (double)kSlots +
+                      0.5);
+    return store + std::max(head, rgb + tile) + sink;
+  }
+  const std::size_t store = F * r.split_el * 2;
+  // The head ALONE keeps more of its pool than its share of a whole
+  // chunk's: 3.81-3.84 slots a level, MEASURED on the M5 at 256, 512 and
+  // 1024 square (the peaks scale by exactly 4x), where a whole chunk's
+  // calibration is 2 -- the tail's wider levels reuse what the head leaves
+  // there. 4.0 puts this ~3% above the measurement. Past ~2x2 the head is
+  // what a shallow-tiled decode peaks at, which is why there is a deep one.
+  constexpr double kHeadSlots = 4.0;
+  const std::size_t head =
+      r.carries[kMid] + r.carries[kUp] +
+      (std::size_t)((double)(r.pool[kMid] + r.pool[kUp]) * kHeadSlots /
+                        (double)kSlots + 0.5);
+  return store + std::max(head, rgb + tile) + sink;
 }
 
 // Pixels of real neighbourhood a tile must carry on each side so its
@@ -1613,6 +1760,27 @@ MetalWanVae::tail_halo_() const noexcept
   return (int)std::ceil(halo);
 }
 
+// The DEEP halo, in LATENT pixels: every 3x3 conv below the mid block,
+// each at its own resolution brought back to the latent plane. Wan 2.1's
+// decoder: six at 1x, a spatial conv and six at 2x, at 4x, and at 8x, and
+// conv_out -- 12.25 pixels of reach, 13 whole, 16 aligned.
+int
+MetalWanVae::tail_halo_deep_() const noexcept
+{
+  double halo = 0.0, scale = 1.0;
+  for (const UpBlock& ub : _up_blocks) {
+    // Every resblock is two 3x3 convs; the temporal taps -- the causal
+    // convs' and the time_conv's -- add no spatial reach.
+    halo += 2.0 * (double)ub.resnets.size() / scale;
+    if (ub.up.present) {
+      scale *= 2.0;                    // nearest upsample: no reach of its own
+      halo += 1.0 / scale;             // the block's spatial conv, after it
+    }
+  }
+  halo += 1.0 / scale;                 // conv_out
+  return (int)std::ceil(halo);
+}
+
 // The tail's input plane: the latent, doubled by every spatial upsample
 // that runs ABOVE the split.
 void
@@ -1633,8 +1801,42 @@ MetalWanVae::tail_plane_(int h8, int w8, int* hs, int* ws) const noexcept
 }
 
 MetalWanVae::TailTiles
+MetalWanVae::tail_tiles_for(int h8, int w8, int ty, int tx,
+                            bool deep) const noexcept
+{
+  TailTiles t;
+  int hs = h8, ws = w8;
+  if (!deep) { tail_plane_(h8, w8, &hs, &ws); }
+  const int halo = align8_(deep ? tail_halo_deep_() : tail_halo_());
+  const int bh = align8_((hs + ty - 1) / ty);
+  const int bw = align8_((ws + tx - 1) / tx);
+  if (ty < 1 || tx < 1 || bh <= halo || bw <= halo) { return t; }
+  t.ty = (hs + bh - 1) / bh;
+  t.tx = (ws + bw - 1) / bw;
+  t.bh = bh; t.bw = bw; t.halo = halo;
+  t.deep = deep;
+  if (t.ty <= 1 && t.tx <= 1) { return TailTiles{}; }
+  // The LARGEST tile the decode will cut, halo included -- what one tile's
+  // carries and pool are sized by. Not bh + 2*halo: a tile on an edge has
+  // halo on one side only, and in a 2-wide grid every tile is on an edge.
+  auto largest = [&](int n, int b, int whole) {
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+      const int a0 = std::max(0, i * b - halo);
+      const int a1 = std::min(whole, std::min(whole, (i + 1) * b) + halo);
+      m = std::max(m, a1 - a0);
+    }
+    return m;
+  };
+  t.frac = (double)largest(t.ty, bh, hs) * (double)largest(t.tx, bw, ws)
+         / ((double)hs * (double)ws);
+  return t;
+}
+
+MetalWanVae::TailTiles
 MetalWanVae::choose_tail_tiles_(int h8, int w8, std::size_t headroom,
-                                bool frame_split, bool* fits) const noexcept
+                                bool frame_split, int latent_frames,
+                                bool* fits) const noexcept
 {
   TailTiles t;
   if (fits != nullptr) { *fits = true; }
@@ -1643,38 +1845,704 @@ MetalWanVae::choose_tail_tiles_(int h8, int w8, std::size_t headroom,
     return t;                                  // the whole plane fits
   }
   TailTiles finest;                            // the last grid that is legal
-  int hs = 0, ws = 0;
-  tail_plane_(h8, w8, &hs, &ws);
-  const int halo = align8_(tail_halo_());
+  // ONE TILE NEVER TAKES THE BOX. A tiled decode is a tight box's answer,
+  // and on a tight box something else is usually running -- a pipeline's
+  // next clip denoises while this one decodes. A tile only gives room
+  // back when it ends (the re-cut acts between tiles), so a tile sized to
+  // everything that was free when it started is pushed into swap by the
+  // first allocation beside it: MEASURED on a 16 GB M5 at 1920x1152, a
+  // deep 2x2 tile of ~4.5 GB and the next clip's denoise put 1.5-1.8 GB
+  // into swap. So a tile's working set is held to tile_share_() of what is
+  // free, on top of the whole decode fitting.
   // Candidate grids in order of TILE COUNT, because the count is what the
   // tiling costs: every tile re-runs the tail's dispatch chain over a
-  // smaller plane. MEASURED at 1920x1152 on the M5 Pro, one chunk:
-  // 2x2 is 3% slower than whole and 5x5 is 26%, for 8.1 GB and 3.9 GB of
-  // footprint against 8.9. So take the COARSEST grid that fits and stop --
-  // a finer one buys memory nobody asked for at a price in time.
+  // smaller plane, and the halo is recomputed per tile. So take the
+  // COARSEST grid that fits and stop -- a finer one buys memory nobody
+  // asked for at a price in time. The figure each grid is held to is the
+  // tile-outer one, which grows with the clip: a long clip's split-plane
+  // store can outweigh every saving, and then nothing fits.
+  //
+  // SHALLOW FIRST, THEN DEEP. A shallow grid recomputes a few split-plane
+  // pixels of halo; a deep one recomputes ~16 latent pixels of every level
+  // below the mid block, which is where nearly all the arithmetic is. But
+  // the shallow head -- the whole plane down to the split, and its store
+  // -- is a floor no grid goes under (~5.9 GB at 1920x1152 x 21 frames),
+  // and the deep head is the mid block alone. So deep is what a tight box
+  // gets, at the coarsest grid that fits.
   static const int kGrids[][2] = {{1, 2}, {2, 1}, {2, 2}, {2, 3}, {3, 2},
                                   {3, 3}, {3, 4}, {4, 3}, {4, 4}, {4, 5},
                                   {5, 4}, {5, 5}, {6, 6}, {7, 7}, {8, 8}};
-  for (const auto& g : kGrids) {
-    const int bh = align8_((hs + g[0] - 1) / g[0]);
-    const int bw = align8_((ws + g[1] - 1) / g[1]);
-    // A tile smaller than its own halo is all overhead; skip rather than
-    // grind the plane into borders.
-    if (bh <= halo || bw <= halo) { continue; }
-    const int ty = (hs + bh - 1) / bh, tx = (ws + bw - 1) / bw;
-    if (ty <= 1 && tx <= 1) { continue; }
-    const double frac = (double)(bh + 2 * halo) * (double)(bw + 2 * halo)
-                      / ((double)hs * (double)ws);
-    if (frac >= 1.0) { continue; }
-    finest.ty = ty; finest.tx = tx; finest.bh = bh; finest.bw = bw;
-    finest.halo = halo; finest.frac = frac;
-    if (decode_peak_bytes(_cfg, h8, w8, frame_split, frac) <= headroom) {
-      return finest;
+  // The share is a PREFERENCE: a box where no grid leaves it still takes
+  // the coarsest that fits at all, rather than being told no.
+  const bool deep_off = std::getenv("VPIPE_WAN_VAE_NO_DEEP_TILES") != nullptr;
+  for (const bool shared : {true, false}) {
+    for (const bool deep : {false, true}) {
+      if (deep && deep_off) { break; }
+      for (const auto& g : kGrids) {
+        // A tile smaller than its own halo is all overhead: tail_tiles_for
+        // declines it rather than grind the plane into borders.
+        const TailTiles cand = tail_tiles_for(h8, w8, g[0], g[1], deep);
+        if (cand.ty <= 1 && cand.tx <= 1) { continue; }
+        if (cand.frac >= 1.0) { continue; }
+        finest = cand;
+        if (decode_peak_bytes(_cfg, h8, w8, frame_split, cand.frac,
+                              latent_frames, deep) > headroom) {
+          continue;
+        }
+        if (shared &&
+            (double)tile_working_bytes_(_cfg, h8, w8, cand.frac, deep) >
+                (double)headroom * tile_share_()) {
+          continue;
+        }
+        return cand;
+      }
     }
   }
   // Nothing fit. The finest grid tried is what the caller reports.
   if (fits != nullptr) { *fits = false; }
   return finest;
+}
+
+// The share of what is free one tile may hold: 0.7 unless
+// VPIPE_WAN_VAE_TILE_SHARE says otherwise (in (0, 1]). MEASURED on the 16
+// GB M5, flashvsr-upscale-1920x1088 over 46 frames, each decode beside the
+// next clip's denoise: unshared 4 m 33 s with 1.5 GB pushed to swap; 0.7
+// 5 m 57 s and 0.28 GB; 0.5 8 m 22 s and 0.13 GB -- smaller tiles,
+// recomputing more halo.
+double
+MetalWanVae::tile_share_() noexcept
+{
+  static const double share = []() {
+    if (const char* e = std::getenv("VPIPE_WAN_VAE_TILE_SHARE")) {
+      const double v = std::atof(e);
+      if (v > 0.0 && v <= 1.0) { return v; }
+    }
+    return 0.7;
+  }();
+  return share;
+}
+
+std::size_t
+MetalWanVae::split_index_() const noexcept
+{
+  // The LAST temporal upsample: past its spatial half nothing mixes
+  // frames except through a carry.
+  std::size_t split_at = 0;
+  for (std::size_t i = 0; i < _up_blocks.size(); ++i) {
+    if (_up_blocks[i].up.present && _up_blocks[i].up.temporal) {
+      split_at = i;
+    }
+  }
+  return split_at;
+}
+
+// The MID BLOCK for latent frame `f`: post_quant, conv_in, the two mid
+// resblocks and the whole-plane attention between them. One frame at the
+// latent plane, [h8 * w8, dims[0]].
+const SharedBuffer*
+MetalWanVae::mid_chunk_(Ctx& cx, const SharedBuffer& z, int T, int f, int h8,
+                        int w8, std::vector<Carry>& carry, std::size_t& ci)
+{
+  MetalCompute* mc = _mc;
+  const int Cz = _cfg.z_dim;
+  const std::size_t hw0 = (std::size_t)h8 * w8;
+  auto next_carry = [&]() -> Carry* {
+    if (ci >= carry.size()) { carry.resize(ci + 64); }
+    return &carry[ci++];
+  };
+  int t = 1, H = h8, W = w8;
+
+  // The latent frame, channel-first [Cz, T, h8, w8] -> channel-last
+  // [hw0, Cz] (host-side; the latent arrives from the sampler).
+  SharedBuffer& x0 = cx.alloc(mc, hw0 * Cz);
+  if (!cx.alloc_ok) { return nullptr; }
+  {
+    const auto* s = static_cast<const _Float16*>(z.contents());
+    auto* d = static_cast<_Float16*>(x0.contents());
+    for (int c = 0; c < Cz; ++c) {
+      const std::size_t src = ((std::size_t)c * T + f) * hw0;
+      for (std::size_t p = 0; p < hw0; ++p) {
+        d[p * Cz + c] = s[src + p];
+      }
+    }
+  }
+  // post_quant_conv (1x1), then the decoder proper.
+  SharedBuffer& pq = cx.alloc(mc, hw0 * Cz);
+  gemm_bias_(cx, x0, _post_quant.w, _post_quant.b, pq, (int)hw0, Cz, Cz);
+  cx.release(x0);
+
+  const SharedBuffer* x = &conv_chunk_(cx, _conv_in, pq, t, H, W, 1,
+                                       next_carry());
+  cx.release(pq);
+  auto step = [&](SharedBuffer& nx) { cx.release(*x); x = &nx; };
+
+  {
+    Carry* a = next_carry(); Carry* b = next_carry();
+    step(resblock_(cx, _mid_res0, *x, t, H, W, a, b));
+  }
+  step(attention_(cx, _mid_attn, *x, t, H, W));
+  {
+    Carry* a = next_carry(); Carry* b = next_carry();
+    step(resblock_(cx, _mid_res1, *x, t, H, W, a, b));
+  }
+  return cx.alloc_ok ? x : nullptr;
+}
+
+// The UP BLOCKS from the mid block's output to the split: every up block
+// to and including the last temporal upsample. `in` holds `t` frames at
+// H x W; leaves the split plane's frames, [t * H * W, up_dim]. `in` is
+// RELEASED to the pool as soon as the first block has consumed it, as
+// every intermediate is -- the pool's footprint, and so its calibration,
+// depend on that order -- so a caller must not touch it afterwards.
+const SharedBuffer*
+MetalWanVae::up_to_split_(Ctx& cx, const SharedBuffer& in, int& t, int& H,
+                          int& W, std::vector<Carry>& carry, std::size_t& ci)
+{
+  auto next_carry = [&]() -> Carry* {
+    if (ci >= carry.size()) { carry.resize(ci + 64); }
+    return &carry[ci++];
+  };
+  const SharedBuffer* x = &in;
+  auto step = [&](SharedBuffer& nx) { cx.release(*x); x = &nx; };
+  const std::size_t split_at = split_index_();
+  for (std::size_t i = 0; i <= split_at; ++i) {
+    const UpBlock& ub = _up_blocks[i];
+    for (const ResBlock& rb : ub.resnets) {
+      Carry* a = next_carry(); Carry* b = next_carry();
+      step(resblock_(cx, rb, *x, t, H, W, a, b));
+    }
+    if (ub.up.present && ub.up.temporal) {
+      SharedBuffer& up = time_up_(cx, ub.up, *x, t, (std::size_t)H * W,
+                                  ub.up_dim, next_carry());
+      if (&up != x) { step(up); }
+    }
+    if (!cx.alloc_ok) { return nullptr; }
+    if (i == split_at) { break; }
+    if (ub.up.present) {
+      step(upsample2x_(cx, *x, t, H, W, ub.up_dim));
+      H *= 2; W *= 2;
+      step(conv_chunk_(cx, ub.up.space, *x, t, H, W, 1, nullptr));
+    }
+  }
+  return cx.alloc_ok ? x : nullptr;
+}
+
+// The decode's HEAD for latent frame `f`: the mid block and the up blocks
+// to the split, over the whole plane. Leaves `t` frames at the split
+// plane, [t * H * W, up_dim], and `H` x `W` at that plane.
+const SharedBuffer*
+MetalWanVae::head_chunk_(Ctx& cx, const SharedBuffer& z, int T, int f, int h8,
+                         int w8, std::vector<Carry>& carry, std::size_t& ci,
+                         int& t, int& H, int& W)
+{
+  const SharedBuffer* m = mid_chunk_(cx, z, T, f, h8, w8, carry, ci);
+  if (m == nullptr) { return nullptr; }
+  t = 1;
+  H = h8;
+  W = w8;
+  return up_to_split_(cx, *m, t, H, W, carry, ci);
+}
+
+// The decode's TAIL: block `split_index_()`'s spatial half onward, over
+// `nt` frames of `in` at th x tw, which it advances to the output size.
+// Returns the clamped RGB, [nt*th*tw, 3]. Never releases `in`: the frame
+// split refills it for every frame.
+SharedBuffer*
+MetalWanVae::tail_(Ctx& cx, const SharedBuffer& in, int nt, int& th, int& tw,
+                   std::vector<Carry>& carry, std::size_t& ci)
+{
+  auto next_carry = [&]() -> Carry* {
+    if (ci >= carry.size()) { carry.resize(ci + 64); }
+    return &carry[ci++];
+  };
+  const int base = _cfg.base_dim;
+  const std::size_t split_at = split_index_();
+  ComputeEncoder& enc = *cx.enc;
+  const SharedBuffer* y = &in;
+  auto adv = [&](SharedBuffer& ny) {
+    if (y != &in) { cx.release(*y); }
+    y = &ny;
+  };
+  for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
+    const UpBlock& ub = _up_blocks[i];
+    if (i != split_at) {
+      for (const ResBlock& rb : ub.resnets) {
+        Carry* a = next_carry(); Carry* b = next_carry();
+        adv(resblock_(cx, rb, *y, nt, th, tw, a, b));
+      }
+    }
+    if (ub.up.present) {
+      adv(upsample2x_(cx, *y, nt, th, tw, ub.up_dim));
+      th *= 2; tw *= 2;
+      adv(conv_chunk_(cx, ub.up.space, *y, nt, th, tw, 1, nullptr));
+    }
+    if (!cx.alloc_ok) { return nullptr; }
+  }
+  const std::size_t rows = (std::size_t)nt * th * tw;
+  SharedBuffer& yn = normc_(cx, *y, rows, base, _norm_out_g);
+  if (y != &in) { cx.release(*y); }
+  silu_(cx, yn, rows * (std::size_t)base);
+  SharedBuffer& out = conv_chunk_(cx, _conv_out, yn, nt, th, tw, 1,
+                                  next_carry());
+  cx.release(yn);
+  if (!cx.alloc_ok) { return nullptr; }
+  const std::size_t n = rows * 3;
+  enc.set_function(_fn_clamp);
+  enc.set_buffer(0, out); enc.set_buffer(1, out);
+  enc.set_constant(2, (int)n);
+  enc.set_constant(3, -1.0f); enc.set_constant(4, 1.0f);
+  enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  return &out;
+}
+
+// The tail over a chunk's `t` split-plane frames, ONE FRAME AT A TIME
+// (VPIPE_WAN_VAE_NO_FRAME_SPLIT: the whole chunk at once): what follows
+// the split mixes frames only through a carry, so it is the same
+// arithmetic in the same order over a quarter of the working set -- and
+// it is where the resolution is. Returns the chunk's RGB, [t * oh * ow, 3]
+// with `H` x `W` advanced to the output size; never releases `x`.
+//
+// MEASURED at 1920x1152 (FlashVSR's 4x output) before the split: a 29.0
+// GB peak footprint on a 24 GB box, ~9.5 GB of swap, and a decode four
+// times longer than the denoise in front of it.
+SharedBuffer*
+MetalWanVae::tail_frames_(Ctx& cx, const SharedBuffer& x, int t, int& H,
+                          int& W, std::vector<Carry>& carry, std::size_t& ci)
+{
+  MetalCompute* mc = _mc;
+  ComputeEncoder& enc = *cx.enc;
+  const bool split =
+      t > 1 && std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr;
+  if (!split) { return tail_(cx, x, t, H, W, carry, ci); }
+  // The chunk's frames at the split, and where each one's RGB lands.
+  const std::size_t fel =
+      (std::size_t)H * W * (std::size_t)_up_blocks[split_index_()].up_dim;
+  int oh = H, ow = W;
+  for (std::size_t i = split_index_(); i < _up_blocks.size(); ++i) {
+    if (_up_blocks[i].up.present) { oh *= 2; ow *= 2; }
+  }
+  const std::size_t ofel = (std::size_t)oh * ow * 3;
+  SharedBuffer& all = cx.alloc(mc, (std::size_t)t * ofel);
+  SharedBuffer& one = cx.alloc(mc, fel);
+  const std::size_t ci0 = ci;
+  const int H0 = H, W0 = W;
+  bool ok = cx.alloc_ok;
+  for (int k = 0; k < t && ok; ++k) {
+    ci = ci0;                    // every frame walks the same carries
+    enc.set_function(_fn_copy);
+    enc.set_buffer(0, x, (std::size_t)k * fel * 2);
+    enc.set_buffer(1, one);
+    enc.set_constant(2, 0);
+    enc.set_constant(3, (int)fel);
+    enc.dispatch({(unsigned)fel, 1, 1}, {256, 1, 1});
+    H = H0; W = W0;
+    SharedBuffer* o = tail_(cx, one, 1, H, W, carry, ci);
+    ok = o != nullptr;
+    if (!ok) { break; }
+    enc.set_function(_fn_copy);
+    enc.set_buffer(0, *o);
+    enc.set_buffer(1, all);
+    enc.set_constant(2, (int)((std::size_t)k * ofel));
+    enc.set_constant(3, (int)ofel);
+    enc.dispatch({(unsigned)ofel, 1, 1}, {256, 1, 1});
+    cx.release(*o);
+  }
+  cx.release(one);
+  return ok ? &all : nullptr;
+}
+
+// THE TILED DECODE: TILE-OUTER over the clip.
+//
+// Tiling is only a memory bound if a tile's carries are the only ones
+// alive -- and a causal carry has to live from a tile's first frame to its
+// last. So the order is turned around: a HEAD runs over the whole clip
+// first and leaves what the tiles start from in a store; then each tile
+// runs through every frame with a fresh set of carries, and the clip's RGB
+// is assembled from the tiles' interiors; then the sink takes it in the
+// chunks it always has. Each tile sees its frames in the order and with
+// the halo an untiled decode gives them, so the pixels are the same.
+//
+// SHALLOW: the head runs to the last temporal upsample and stores split-
+// plane frames (106 MB a frame at 1920x1152); a tile is the tail below
+// it, a frame at a time. DEEP: the head is the mid block alone and stores
+// its output, one latent frame each (26 MB at 1920x1152); a tile is
+// everything below it, a latent frame's chunk at a time, behind a ~16
+// latent-pixel halo. Deep recomputes more and holds far less.
+//
+// THE FIT IS PURSUED, NOT DECIDED ONCE. Each tile runs the whole clip on
+// its own, so the plane can be cut differently tile by tile: before each
+// one the free memory is read again, and a tile that would not fit what
+// is free NOW is split -- the box a decode shares with the next clip's
+// denoise changes under it. Down to an 8-pixel body; past that it runs
+// and lets the OS absorb the rest.
+bool
+MetalWanVae::decode_tile_outer_(const SharedBuffer& z, int T, int h8, int w8,
+                                const TailTiles& tiles, std::size_t col_cap,
+                                const FrameSink& on_frame, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  MetalCompute* mc = _mc;
+  const bool deep = tiles.deep;
+  const bool use_pool = std::getenv("VPIPE_WAN_NO_VAE_POOL") == nullptr;
+  const std::size_t split_at = split_index_();
+  // The TILE PLANE: the latent (deep) or the split plane (shallow), and
+  // its channels and scale up to the output.
+  int hs = h8, ws = w8;
+  if (!deep) { tail_plane_(h8, w8, &hs, &ws); }
+  const int C = deep ? _cfg.base_dim * _cfg.dim_mult[3]
+                     : _up_blocks[split_at].up_dim;
+  const int F = video_frames(T);
+  const std::size_t fel = (std::size_t)hs * ws * C;
+  int up_mult = 1;
+  for (std::size_t i = deep ? 0 : split_at; i < _up_blocks.size(); ++i) {
+    if (_up_blocks[i].up.present) { up_mult *= 2; }
+  }
+  const int OH = hs * up_mult, OW = ws * up_mult;
+  const std::size_t ofel = (std::size_t)OH * OW * 3;
+  auto frame0_of = [](int f) { return f == 0 ? 0 : 1 + 4 * (f - 1); };
+  const std::size_t live0 =
+      metal_compute::shared_buffer_memory_stats().live_bytes;
+  const char* vl = std::getenv("VPIPE_WAN_VAE_LOG");
+  const bool vlog = vl != nullptr;
+  // VPIPE_WAN_VAE_LOG=2: each phase's own peak, which RESETS the process
+  // peak between them -- a diagnostic, since it hides the first phase from
+  // anything measuring the decode as a whole.
+  const bool vlog2 = vl != nullptr && std::string(vl) == "2";
+
+  // ---- 1. The head over the clip, into the store.
+  const int n_store = deep ? T : F;
+  SharedBuffer store = mc->make_shared_buffer((std::size_t)n_store * fel * 2);
+  if (store.empty()) { return fail("tile store allocation failed"); }
+  {
+    std::vector<Carry> carry(256);
+    for (int f = 0; f < T; ++f) {
+      std::size_t ci = 0;
+      CommandStream stream = mc->make_command_stream();
+      Ctx cx;
+      cx.use_pool = use_pool;
+      cx.col_cap = col_cap;
+      {
+        ComputeEncoder enc = stream.begin_compute();
+        cx.enc = &enc;
+        int t = 1, H = h8, W = w8;
+        const SharedBuffer* x =
+            deep ? mid_chunk_(cx, z, T, f, h8, w8, carry, ci)
+                 : head_chunk_(cx, z, T, f, h8, w8, carry, ci, t, H, W);
+        if (x == nullptr) { return fail("chunk allocation failed"); }
+        if (H != hs || W != ws) {
+          return fail("the tile plane is not where the tiles were cut");
+        }
+        // At a byte offset: a store passes int range at 1920x1152 by its
+        // fortieth split-plane frame, and the copy's offset is an int.
+        const std::size_t at = deep ? (std::size_t)f
+                                    : (std::size_t)frame0_of(f);
+        enc.set_function(_fn_copy);
+        enc.set_buffer(0, *x);
+        enc.set_buffer(1, store, at * fel * 2);
+        enc.set_constant(2, 0);
+        enc.set_constant(3, (int)((std::size_t)t * fel));
+        enc.dispatch({(unsigned)((std::size_t)t * fel), 1, 1}, {256, 1, 1});
+        cx.release(*x);
+      }
+      std::string gpu_err;
+      if (!stream.commit().wait_ok(&gpu_err)) {
+        return fail(gpu_err.empty() ? std::string("GPU video decode failed")
+                                    : gpu_err);
+      }
+    }
+  }   // the head's carries go here
+  if (vlog) {
+    const auto ms = metal_compute::shared_buffer_memory_stats();
+    std::fprintf(stderr, "[wan-vae] tile-outer %s head: peak %zu MB, store "
+                 "%zu MB\n", deep ? "deep" : "shallow",
+                 (ms.peak_bytes - live0) >> 20,
+                 ((std::size_t)n_store * fel * 2) >> 20);
+    if (vlog2) { metal_compute::shared_buffer_reset_peak(); }
+  }
+
+  // ---- 2. Each tile through every frame, with only its carries.
+  SharedBuffer rgb = mc->make_shared_buffer((std::size_t)F * ofel * 2);
+  if (rgb.empty()) { return fail("clip RGB allocation failed"); }
+  struct Rect { int y0, y1, x0, x1; };
+  std::deque<Rect> work;
+  const int halo = tiles.halo;
+  // A FORCED grid (VPIPE_WAN_VAE_TILE) is laid out whole, as asked. A
+  // chosen one is only the preflight's proof that SOME grid fits: the
+  // tiles themselves are planned a band at a time below, from what is
+  // free when each band's turn comes.
+  if (tiles.forced) {
+    const int bh = tiles.bh > 0 ? tiles.bh : (hs + tiles.ty - 1) / tiles.ty;
+    const int bw = tiles.bw > 0 ? tiles.bw : (ws + tiles.tx - 1) / tiles.tx;
+    for (int gy = 0; gy < tiles.ty; ++gy) {
+      for (int gx = 0; gx < tiles.tx; ++gx) {
+        const Rect r{gy * bh, std::min(hs, (gy + 1) * bh), gx * bw,
+                     std::min(ws, (gx + 1) * bw)};
+        if (r.y0 < r.y1 && r.x0 < r.x1) { work.push_back(r); }
+      }
+    }
+  }
+  auto padded = [&](const Rect& r, int* ey0, int* ey1, int* ex0, int* ex1) {
+    *ey0 = std::max(0, r.y0 - halo);
+    *ey1 = std::min(hs, r.y1 + halo);
+    *ex0 = std::max(0, r.x0 - halo);
+    *ex1 = std::min(ws, r.x1 + halo);
+  };
+  // What a rect needs while it runs, against what is free right now.
+  auto need_of = [&](const Rect& r) {
+    int ey0, ey1, ex0, ex1;
+    padded(r, &ey0, &ey1, &ex0, &ex1);
+    const double frac = (double)(ey1 - ey0) * (double)(ex1 - ex0) /
+                        ((double)hs * (double)ws);
+    return tile_working_bytes_(_cfg, h8, w8, frac, deep);
+  };
+  // Test hook: VPIPE_WAN_VAE_TILE_ROOM_MB caps what a tile is told is
+  // free, so the re-cut can be driven on a box with room to spare.
+  std::size_t room_cap = 0;
+  if (const char* e = std::getenv("VPIPE_WAN_VAE_TILE_ROOM_MB")) {
+    room_cap = (std::size_t)std::max(0L, std::atol(e)) << 20;
+  }
+  auto room_now = [&]() -> std::size_t {
+    const MetalCompute::MemoryBudget mb = mc->memory_budget();
+    if (mb.available_physical == 0) { return room_cap; }   // cannot tell
+    const std::size_t live =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    const std::size_t reusable =
+        mb.self_graphics > live ? mb.self_graphics - live : 0;
+    const std::size_t room = mb.available_physical + reusable;
+    return room_cap > 0 ? std::min(room, room_cap) : room;
+  };
+  // Halved along its longer side, on an 8-pixel boundary so every extent
+  // stays aligned for the hardware conv. False when a half would be under
+  // 8 pixels: that rect is as small as cutting makes sense.
+  auto split = [&](const Rect& r, Rect* a, Rect* b) {
+    const int h = r.y1 - r.y0, w = r.x1 - r.x0;
+    if (h >= w && h >= 16) {
+      const int m = r.y0 + align8_(h / 2);
+      if (m >= r.y1) { return false; }
+      *a = Rect{r.y0, m, r.x0, r.x1};
+      *b = Rect{m, r.y1, r.x0, r.x1};
+      return true;
+    }
+    if (w >= 16) {
+      const int m = r.x0 + align8_(w / 2);
+      if (m >= r.x1) { return false; }
+      *a = Rect{r.y0, r.y1, r.x0, m};
+      *b = Rect{r.y0, r.y1, m, r.x1};
+      return true;
+    }
+    return false;
+  };
+  const bool dynamic = std::getenv("VPIPE_WAN_VAE_NO_DYNAMIC_TILES") == nullptr;
+  // THE BAND PLANNER. The next horizontal band of tiles is laid out when
+  // the last one is done, from what is free THEN: of every band height and
+  // column count whose tile fits tile_share_() of it, the one with the
+  // largest tile body -- the least halo recomputed per pixel. So a decode
+  // that starts beside the next clip's denoise cuts small, and cuts large
+  // again once that denoise is done; a fixed grid kept the smallest cut
+  // the start ever needed for the whole clip (MEASURED on a 16 GB M5 at
+  // 1920x1152: deep 4x4 from start to end, 231 s for one clip).
+  int band_y = tiles.forced ? hs : 0;
+  int n_bands = 0;
+  auto plan_band = [&]() {
+    if (band_y >= hs) { return; }
+    const std::size_t room = room_now();
+    const double budget = room != 0 ? (double)room * tile_share_() : 0.0;
+    const int rest = hs - band_y;
+    int best_bh = 0, best_nx = 0;
+    long long best_body = -1;
+    for (int bh = rest; bh >= 8; bh -= 8) {
+      for (int nx = 1; nx <= 8; ++nx) {
+        const int bw = std::min(ws, align8_((ws + nx - 1) / nx));
+        if (bw < 8 || (nx > 1 && bw <= 0)) { continue; }
+        // The band's largest tile: an interior one, halo on every side
+        // the plane has room for.
+        const int py = std::min(hs, band_y + bh + halo) -
+                       std::max(0, band_y - halo);
+        const int px = std::min(ws, bw + 2 * halo);
+        const double frac = (double)py * (double)px /
+                            ((double)hs * (double)ws);
+        const double need = (double)tile_working_bytes_(_cfg, h8, w8, frac,
+                                                        deep);
+        if (budget > 0.0 && need > budget) { continue; }
+        const long long body = (long long)bh * bw;
+        if (body > best_body) {
+          best_body = body;
+          best_bh = bh;
+          best_nx = nx;
+        }
+        break;   // more columns only shrink the body at this height
+      }
+      if (budget <= 0.0 && best_bh > 0) { break; }   // cannot tell: take it
+    }
+    if (best_bh == 0) {
+      // Nothing fits even the finest band: the smallest one, and let the
+      // re-cut below take it as small as it goes.
+      best_bh = std::min(rest, 8);
+      best_nx = 8;
+    }
+    const int bw = std::min(ws, align8_((ws + best_nx - 1) / best_nx));
+    for (int x0 = 0; x0 < ws; x0 += bw) {
+      work.push_back(Rect{band_y, band_y + best_bh, x0, std::min(ws, x0 + bw)});
+    }
+    band_y += best_bh;
+    ++n_bands;
+  };
+  int n_split = 0, n_run = 0, n_over = 0;
+  constexpr int kGroup = 4;   // output frames per command buffer, roughly
+  while (!work.empty() || band_y < hs) {
+    if (work.empty()) { plan_band(); }
+    if (work.empty()) { break; }
+    const Rect r = work.front();
+    work.pop_front();
+    if (dynamic) {
+      const std::size_t room = room_now();
+      if (room != 0 && (double)need_of(r) > (double)room * tile_share_()) {
+        Rect a, b;
+        if (split(r, &a, &b)) {
+          work.push_front(b);
+          work.push_front(a);
+          ++n_split;
+          continue;
+        }
+        ++n_over;              // as small as it goes: run it regardless
+      }
+    }
+    ++n_run;
+    int ey0, ey1, ex0, ex1;
+    padded(r, &ey0, &ey1, &ex0, &ex1);
+    const int th0 = ey1 - ey0, tw0 = ex1 - ex0;
+    std::vector<Carry> carry(256);   // this tile's, and nobody else's
+    Ctx cx;
+    cx.use_pool = use_pool;
+    cx.col_cap = col_cap;
+    // The tile's INTERIOR from a tile-sized RGB `o` (rows of `tw` pixels)
+    // into the clip's frame `k`; the halo was only ever there to make the
+    // interior exact.
+    auto place = [&](ComputeEncoder& enc, const SharedBuffer& o,
+                     std::size_t o_off, int tw, int k) {
+      const int iy = (r.y0 - ey0) * up_mult, ix = (r.x0 - ex0) * up_mult;
+      const int rows = (r.y1 - r.y0) * up_mult;
+      const int cols = (r.x1 - r.x0) * up_mult;
+      enc.set_function(_fn_copy_rect);
+      enc.set_buffer(0, o, o_off);
+      enc.set_buffer(1, rgb, (std::size_t)k * ofel * 2);
+      enc.set_constant(2, (int)(((std::size_t)iy * tw + ix) * 3));
+      enc.set_constant(
+          3, (int)(((std::size_t)r.y0 * up_mult * OW + r.x0 * up_mult) * 3));
+      enc.set_constant(4, rows);
+      enc.set_constant(5, cols * 3);
+      enc.set_constant(6, tw * 3);
+      enc.set_constant(7, OW * 3);
+      enc.dispatch({(unsigned)((std::size_t)rows * cols * 3), 1, 1},
+                   {256, 1, 1});
+    };
+    auto cut = [&](ComputeEncoder& enc, std::size_t src_frame,
+                   SharedBuffer& tile) {
+      enc.set_function(_fn_copy_rect);
+      enc.set_buffer(0, store, src_frame * fel * 2);
+      enc.set_buffer(1, tile);
+      enc.set_constant(2, (int)(((std::size_t)ey0 * ws + ex0) * C));
+      enc.set_constant(3, 0);
+      enc.set_constant(4, th0);
+      enc.set_constant(5, tw0 * C);
+      enc.set_constant(6, ws * C);
+      enc.set_constant(7, tw0 * C);
+      enc.dispatch({(unsigned)((std::size_t)th0 * tw0 * C), 1, 1},
+                   {256, 1, 1});
+    };
+    // Deep walks LATENT frames (each a chunk of 1 or 4 output frames);
+    // shallow walks output frames. Either way a few output frames a
+    // command buffer.
+    const int n_steps = deep ? T : F;
+    const int per_cb = deep ? 1 : kGroup;
+    for (int k0 = 0; k0 < n_steps; k0 += per_cb) {
+      CommandStream stream = mc->make_command_stream();
+      {
+        ComputeEncoder enc = stream.begin_compute();
+        cx.enc = &enc;
+        for (int k = k0; k < std::min(n_steps, k0 + per_cb); ++k) {
+          SharedBuffer& tile =
+              cx.alloc(mc, (std::size_t)th0 * tw0 * (std::size_t)C);
+          if (!cx.alloc_ok) { return fail("tile allocation failed"); }
+          cut(enc, (std::size_t)k, tile);
+          std::size_t ci = 0;          // every chunk walks the same carries
+          int th = th0, tw = tw0;
+          if (deep) {
+            int t = 1;
+            const SharedBuffer* x =
+                up_to_split_(cx, tile, t, th, tw, carry, ci);
+            if (x == nullptr) { return fail("chunk allocation failed"); }
+            SharedBuffer* o = tail_frames_(cx, *x, t, th, tw, carry, ci);
+            if (o == nullptr) { return fail("chunk allocation failed"); }
+            if (x != &tile) { cx.release(*x); }
+            const std::size_t ofr = (std::size_t)th * tw * 3;
+            for (int j = 0; j < t; ++j) {
+              place(enc, *o, (std::size_t)j * ofr * 2, tw, frame0_of(k) + j);
+            }
+            cx.release(*o);
+          } else {
+            SharedBuffer* o = tail_(cx, tile, 1, th, tw, carry, ci);
+            if (o == nullptr) { return fail("chunk allocation failed"); }
+            place(enc, *o, 0, tw, k);
+            cx.release(*o);
+            cx.release(tile);
+          }
+        }
+      }
+      if (!cx.alloc_ok) {
+        return fail("a decode intermediate allocation failed (out of GPU "
+                    "memory)");
+      }
+      std::string gpu_err;
+      if (!stream.commit().wait_ok(&gpu_err)) {
+        return fail(gpu_err.empty() ? std::string("GPU video decode failed")
+                                    : gpu_err);
+      }
+    }
+  }
+  if (vlog) {
+    const auto ms = metal_compute::shared_buffer_memory_stats();
+    std::fprintf(stderr, "[wan-vae] tile-outer %s tiles: peak %zu MB (rgb %zu "
+                 "MB), %d bands, %d tiles run, %d splits, %d over\n",
+                 deep ? "deep" : "shallow", (ms.peak_bytes - live0) >> 20,
+                 ((std::size_t)F * ofel * 2) >> 20, n_bands, n_run, n_split,
+                 n_over);
+  }
+  if ((n_split > 0 || n_over > 0) && mc->session() != nullptr) {
+    mc->session()->log_normal(fmt(
+        "MetalWanVae: {} tile(s) re-cut to fit what was free when they ran "
+        "({} run in {} band(s){})", n_split, n_run, n_bands,
+        n_over > 0 ? fmt(", {} past what was free at the smallest cut",
+                         n_over)()
+                   : std::string()));
+  }
+  store = SharedBuffer{};
+
+  // ---- 3. The sink, in the chunks it has always had: one frame, then
+  // four. Channel-last [n*H*W, 3] -> channel-first [3, n, H, W].
+  const std::size_t hw = (std::size_t)OH * OW;
+  for (int f = 0; f < T; ++f) {
+    const int frame0 = frame0_of(f);
+    const int n = f == 0 ? 1 : 4;
+    SharedBuffer frames = mc->make_shared_buffer((std::size_t)3 * n * hw * 2);
+    if (frames.empty()) { return fail("frame buffer allocation failed"); }
+    const auto* s = static_cast<const _Float16*>(rgb.contents()) +
+                    (std::size_t)frame0 * ofel;
+    auto* d = static_cast<_Float16*>(frames.contents());
+    for (int ff = 0; ff < n; ++ff) {
+      for (std::size_t p = 0; p < hw; ++p) {
+        for (int c = 0; c < 3; ++c) {
+          d[((std::size_t)c * n + ff) * hw + p] =
+              s[((std::size_t)ff * hw + p) * 3 + c];
+        }
+      }
+    }
+    if (!on_frame(frames, frame0, n)) { return true; }   // sink stopped
+  }
+  return true;
 }
 
 bool
@@ -1714,23 +2582,21 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
   TailTiles tiles;
   {
     // Test hook: force a grid so the tiled path can be held against the
-    // whole-plane one at a size where both fit. "2x2", or "0" for off.
+    // whole-plane one at a size where both fit. "2x2" shallow, "d2x2"
+    // deep, or "0" for off.
+    // "d" / "s" alone: tiled at that depth, the tiles PLANNED a band at a
+    // time from what is free (with VPIPE_WAN_VAE_TILE_ROOM_MB, from what it
+    // says is free).
     const char* e = std::getenv("VPIPE_WAN_VAE_TILE");
     int ty = 0, tx = 0;
-    if (e != nullptr && std::sscanf(e, "%dx%d", &ty, &tx) == 2 &&
-        ty >= 1 && tx >= 1 && (ty > 1 || tx > 1)) {
-      int hs = 0, ws = 0;
-      tail_plane_(h8, w8, &hs, &ws);
-      const int halo = align8_(tail_halo_());
-      const int bh = align8_((hs + ty - 1) / ty);
-      const int bw = align8_((ws + tx - 1) / tx);
-      if (bh > halo && bw > halo) {
-        tiles.ty = (hs + bh - 1) / bh;
-        tiles.tx = (ws + bw - 1) / bw;
-        tiles.bh = bh; tiles.bw = bw; tiles.halo = halo;
-        tiles.frac = (double)(bh + 2 * halo) * (double)(bw + 2 * halo)
-                   / ((double)hs * (double)ws);
-      }
+    const bool deep = e != nullptr && *e == 'd';
+    if (e != nullptr && (std::string(e) == "d" || std::string(e) == "s")) {
+      tiles = tail_tiles_for(h8, w8, 2, 2, deep);
+    } else if (e != nullptr &&
+               std::sscanf(deep ? e + 1 : e, "%dx%d", &ty, &tx) == 2 &&
+               ty >= 1 && tx >= 1 && (ty > 1 || tx > 1)) {
+      tiles = tail_tiles_for(h8, w8, ty, tx, deep);
+      tiles.forced = tiles.ty > 1 || tiles.tx > 1;
     }
   }
   std::size_t headroom = 0;
@@ -1770,7 +2636,8 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
                            ? cur.available_physical + reusable
                            : 0;
     if (tiles.ty > 1 || tiles.tx > 1) {
-      need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac);
+      need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac, T,
+                             tiles.deep);
     }
     // AND WAIT FOR THE DENOISER'S PAGES BEFORE REFUSING. A decode runs
     // right behind the forward that produced its latent, and that forward's
@@ -1791,10 +2658,11 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     for (int i = 0; i < kWaitSteps && have != 0 && need > have; ++i) {
       bool fits = false;
       const TailTiles t =
-          choose_tail_tiles_(h8, w8, have, frame_split_on, &fits);
+          choose_tail_tiles_(h8, w8, have, frame_split_on, T, &fits);
       if (fits && (t.ty > 1 || t.tx > 1)) {
         tiles = t;
-        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac);
+        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac, T,
+                             tiles.deep);
         if (need <= have) { break; }
       }
       std::this_thread::sleep_for(
@@ -1824,10 +2692,11 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
       // is too small for this geometry reads differently from a moment
       // that was.
       const TailTiles finest =
-          choose_tail_tiles_(h8, w8, have, frame_split_on);
+          choose_tail_tiles_(h8, w8, have, frame_split_on, T);
       if (finest.ty > 1 || finest.tx > 1) {
         tiles = finest;
-        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, finest.frac);
+        need = decode_peak_bytes(_cfg, h8, w8, frame_split_on, finest.frac, T,
+                                finest.deep);
       }
       // Who holds the rest, since "not enough" alone cannot say whether
       // the box is full or this process is. The tile count says whether
@@ -1836,7 +2705,8 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
       // can be made.
       const std::string how =
           (tiles.ty > 1 || tiles.tx > 1)
-              ? fmt(" even with the tail tiled {}x{}", tiles.ty, tiles.tx)()
+              ? fmt(" even tiled {}x{} {}", tiles.ty, tiles.tx,
+                    tiles.deep ? "below the mid block" : "below the split")()
               : std::string();
       return fail(fmt(
           "insufficient free RAM for a {}x{} video decode{}: need ~{} MB, "
@@ -1849,11 +2719,15 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
 
   if ((tiles.ty > 1 || tiles.tx > 1) && mc->session() != nullptr) {
     mc->session()->log_normal(fmt(
-        "MetalWanVae: {}x{} decode runs the tail in {}x{} tiles (halo {} px, "
-        "~{} MB against ~{} MB whole) -- exact, the mid attention stays "
+        "MetalWanVae: {}x{} decode runs TILE-OUTER, {} in {}x{} tiles (halo "
+        "{} px, ~{} MB against ~{} MB whole): the head over the clip, then "
+        "each tile through every frame -- exact, the mid attention stays "
         "whole-plane",
-        Wout, Hout, tiles.ty, tiles.tx, tiles.halo,
-        decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac) >> 20,
+        Wout, Hout,
+        tiles.deep ? "deep (below the mid block)" : "below the split",
+        tiles.ty, tiles.tx, tiles.halo,
+        decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac, T,
+                             tiles.deep) >> 20,
         decode_peak_bytes(_cfg, h8, w8, frame_split_on, 1.0) >> 20));
   }
 
@@ -1869,7 +2743,8 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     // preflight chose tiles, or the band is sized against a reserve this
     // decode is not going to take and starves for room that is free.
     const std::size_t reserve =
-        decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac);
+        decode_peak_bytes(_cfg, h8, w8, frame_split_on, tiles.frac, T,
+                             tiles.deep);
     const std::size_t avail = headroom > reserve ? (headroom - reserve) / 2 : 0;
     col_cap = std::min(full_band, std::max(floor_band, avail));
   }
@@ -1891,16 +2766,20 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
                  (double)(col_cap / widest) / (double)Wout);
   }
 
+  // THE TILED DECODE IS ITS OWN SHAPE: the head over the whole clip into a
+  // store, then each tile through every frame with only its own carries.
+  // Tiling inside each frame, as this once did, kept every tile's carries
+  // for the whole clip and so held what the whole plane holds -- MEASURED
+  // on the M5 at 1024x1024, 6158 MB tiled 2x2 against 6272 whole.
+  if (tiles.ty > 1 || tiles.tx > 1) {
+    return decode_tile_outer_(z, T, h8, w8, tiles, col_cap, on_frame, err);
+  }
+
   // Per-conv carries, in traversal order. The count is fixed by the
   // topology, so index them by a counter reset at each chunk exactly as
   // the reference resets feat_idx.
-  std::vector<Carry> carry;
-  carry.resize(256);
+  std::vector<Carry> carry(256);
   std::size_t ci = 0;
-  auto next_carry = [&]() -> Carry* {
-    if (ci >= carry.size()) { carry.resize(ci + 64); }
-    return &carry[ci++];
-  };
 
   for (int f = 0; f < T; ++f) {
     ci = 0;
@@ -1917,271 +2796,12 @@ MetalWanVae::decode(const SharedBuffer& z, int T, int h8, int w8,
     {
       ComputeEncoder enc = stream.begin_compute();
       cx.enc = &enc;
+      const SharedBuffer* x =
+          head_chunk_(cx, z, T, f, h8, w8, carry, ci, t, H, W);
+      if (x == nullptr) { return fail("chunk allocation failed"); }
 
-      // The latent frame, channel-first [Cz, T, h8, w8] -> channel-last
-      // [hw0, Cz] (host-side; the latent arrives from the sampler).
-      SharedBuffer& x0 = cx.alloc(mc, hw0 * Cz);
-      if (!cx.alloc_ok) { return fail("chunk allocation failed"); }
-      {
-        const auto* s = static_cast<const _Float16*>(z.contents());
-        auto* d = static_cast<_Float16*>(x0.contents());
-        for (int c = 0; c < Cz; ++c) {
-          const std::size_t src = ((std::size_t)c * T + f) * hw0;
-          for (std::size_t p = 0; p < hw0; ++p) {
-            d[p * Cz + c] = s[src + p];
-          }
-        }
-      }
-      // post_quant_conv (1x1), then the decoder proper.
-      SharedBuffer& pq = cx.alloc(mc, hw0 * Cz);
-      gemm_bias_(cx, x0, _post_quant.w, _post_quant.b, pq, (int)hw0, Cz, Cz);
-      cx.release(x0);
-
-      const SharedBuffer* x = &conv_chunk_(cx, _conv_in, pq, t, H, W, 1,
-                                           next_carry());
-      cx.release(pq);
-      auto step = [&](SharedBuffer& nx) { cx.release(*x); x = &nx; };
-
-      {
-        Carry* a = next_carry(); Carry* b = next_carry();
-        step(resblock_(cx, _mid_res0, *x, t, H, W, a, b));
-      }
-      step(attention_(cx, _mid_attn, *x, t, H, W));
-      {
-        Carry* a = next_carry(); Carry* b = next_carry();
-        step(resblock_(cx, _mid_res1, *x, t, H, W, a, b));
-      }
-
-      // The whole chunk runs up to and including the LAST temporal
-      // upsample. What follows it -- that block's spatial half, every
-      // later block, the head -- mixes frames only through a carry, so it
-      // runs one frame at a time: the same arithmetic in the same order,
-      // over a quarter of the working set. It is also where the
-      // resolution is, so it is where the working set is.
-      //
-      // MEASURED at 1920x1152 (FlashVSR's 4x output) before this: a 29.0 GB
-      // peak footprint on a 24 GB box, ~9.5 GB of swap, and a decode four
-      // times longer than the denoise in front of it.
-      // VPIPE_WAN_VAE_NO_FRAME_SPLIT runs the tail over the whole chunk.
-      std::size_t split_at = 0;
-      for (std::size_t i = 0; i < _up_blocks.size(); ++i) {
-        if (_up_blocks[i].up.present && _up_blocks[i].up.temporal) {
-          split_at = i;
-        }
-      }
-      for (std::size_t i = 0; i <= split_at; ++i) {
-        const UpBlock& ub = _up_blocks[i];
-        for (const ResBlock& rb : ub.resnets) {
-          Carry* a = next_carry(); Carry* b = next_carry();
-          step(resblock_(cx, rb, *x, t, H, W, a, b));
-        }
-        if (ub.up.present && ub.up.temporal) {
-          SharedBuffer& up = time_up_(cx, ub.up, *x, t, (std::size_t)H * W,
-                                      ub.up_dim, next_carry());
-          if (&up != x) { step(up); }
-        }
-        if (!cx.alloc_ok) { return fail("chunk allocation failed"); }
-        if (i == split_at) { break; }
-        if (ub.up.present) {
-          step(upsample2x_(cx, *x, t, H, W, ub.up_dim));
-          H *= 2; W *= 2;
-          step(conv_chunk_(cx, ub.up.space, *x, t, H, W, 1, nullptr));
-        }
-      }
-
-      // Block `split_at`'s spatial half onward, over `nt` frames of `in`
-      // at th x tw, which it advances to the output size. Returns the
-      // clamped RGB, [nt*th*tw, 3]. Never releases `in`: the split path
-      // refills it for every frame.
-      auto tail = [&](const SharedBuffer& in, int nt, int& th,
-                      int& tw) -> SharedBuffer* {
-        const SharedBuffer* y = &in;
-        auto adv = [&](SharedBuffer& ny) {
-          if (y != &in) { cx.release(*y); }
-          y = &ny;
-        };
-        for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
-          const UpBlock& ub = _up_blocks[i];
-          if (i != split_at) {
-            for (const ResBlock& rb : ub.resnets) {
-              Carry* a = next_carry(); Carry* b = next_carry();
-              adv(resblock_(cx, rb, *y, nt, th, tw, a, b));
-            }
-          }
-          if (ub.up.present) {
-            adv(upsample2x_(cx, *y, nt, th, tw, ub.up_dim));
-            th *= 2; tw *= 2;
-            adv(conv_chunk_(cx, ub.up.space, *y, nt, th, tw, 1, nullptr));
-          }
-          if (!cx.alloc_ok) { return nullptr; }
-        }
-        const std::size_t rows = (std::size_t)nt * th * tw;
-        SharedBuffer& yn = normc_(cx, *y, rows, base, _norm_out_g);
-        if (y != &in) { cx.release(*y); }
-        silu_(cx, yn, rows * (std::size_t)base);
-        SharedBuffer& out = conv_chunk_(cx, _conv_out, yn, nt, th, tw, 1,
-                                        next_carry());
-        cx.release(yn);
-        if (!cx.alloc_ok) { return nullptr; }
-        const std::size_t n = rows * 3;
-        enc.set_function(_fn_clamp);
-        enc.set_buffer(0, out); enc.set_buffer(1, out);
-        enc.set_constant(2, (int)n);
-        enc.set_constant(3, -1.0f); enc.set_constant(4, 1.0f);
-        enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-        return &out;
-      };
-
-      // ---- the tail over spatial TILES ---------------------------------
-      //
-      // Only what runs below this point tiles, and that is the point: the
-      // mid-block attention above it is the one layer whose receptive
-      // field is the whole plane. Everything here is 3x3 convs, a nearest
-      // upsample and a per-pixel RMS over channels, so a tile that carries
-      // `halo` pixels of real neighbourhood on each interior side produces
-      // an interior identical to the untiled decode's -- the zero padding
-      // a tile edge would otherwise invent never reaches it.
-      //
-      // Each tile keeps its OWN carries: a carry holds the last two input
-      // frames at that conv's plane, so tiles sharing one would overwrite
-      // each other's temporal history (and `save_carry_` would reallocate
-      // on every size change, silently dropping it).
-      const int up_mult = [&] {
-        int m = 1;
-        for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
-          if (_up_blocks[i].up.present) { m *= 2; }
-        }
-        return m;
-      }();
-      const std::size_t ci_tail0 = ci;
-      std::size_t tail_stride = 0;
-      auto tail_tiled_one = [&](const SharedBuffer& in, int hin, int win,
-                                int& oh, int& ow) -> SharedBuffer* {
-        const int C = _up_blocks[split_at].up_dim;
-        oh = hin * up_mult;
-        ow = win * up_mult;
-        SharedBuffer& out = cx.alloc(mc, (std::size_t)oh * ow * 3);
-        if (!cx.alloc_ok) { return nullptr; }
-        const int bh = tiles.bh > 0 ? tiles.bh
-                                    : (hin + tiles.ty - 1) / tiles.ty;
-        const int bw = tiles.bw > 0 ? tiles.bw
-                                    : (win + tiles.tx - 1) / tiles.tx;
-        int idx = 0;
-        for (int gy = 0; gy < tiles.ty; ++gy) {
-          for (int gx = 0; gx < tiles.tx; ++gx, ++idx) {
-            const int y0 = gy * bh, y1 = std::min(hin, y0 + bh);
-            const int x0 = gx * bw, x1 = std::min(win, x0 + bw);
-            if (y0 >= y1 || x0 >= x1) { continue; }
-            const int ey0 = std::max(0, y0 - tiles.halo);
-            const int ey1 = std::min(hin, y1 + tiles.halo);
-            const int ex0 = std::max(0, x0 - tiles.halo);
-            const int ex1 = std::min(win, x1 + tiles.halo);
-            const int th0 = ey1 - ey0, tw0 = ex1 - ex0;
-            SharedBuffer& tile =
-                cx.alloc(mc, (std::size_t)th0 * tw0 * (std::size_t)C);
-            if (!cx.alloc_ok) { return nullptr; }
-            enc.set_function(_fn_copy_rect);
-            enc.set_buffer(0, in);
-            enc.set_buffer(1, tile);
-            enc.set_constant(2, (int)(((std::size_t)ey0 * win + ex0) * C));
-            enc.set_constant(3, 0);
-            enc.set_constant(4, th0);
-            enc.set_constant(5, tw0 * C);
-            enc.set_constant(6, win * C);
-            enc.set_constant(7, tw0 * C);
-            enc.dispatch({(unsigned)((std::size_t)th0 * tw0 * C), 1, 1},
-                         {256, 1, 1});
-
-            // This tile's carry block. The stride is the tail's own carry
-            // count, learned from the first tile and identical for every
-            // one after it -- the topology does not vary with the plane.
-            ci = ci_tail0 + (std::size_t)idx * tail_stride;
-            int th = th0, tw = tw0;
-            SharedBuffer* o = tail(tile, 1, th, tw);
-            if (o == nullptr) { return nullptr; }
-            if (tail_stride == 0) { tail_stride = ci - ci_tail0; }
-
-            const int iy = (y0 - ey0) * up_mult, ix = (x0 - ex0) * up_mult;
-            const int rows = (y1 - y0) * up_mult;
-            const int cols = (x1 - x0) * up_mult;
-            enc.set_function(_fn_copy_rect);
-            enc.set_buffer(0, *o);
-            enc.set_buffer(1, out);
-            enc.set_constant(2, (int)(((std::size_t)iy * tw + ix) * 3));
-            enc.set_constant(
-                3, (int)(((std::size_t)y0 * up_mult * ow + x0 * up_mult) * 3));
-            enc.set_constant(4, rows);
-            enc.set_constant(5, cols * 3);
-            enc.set_constant(6, tw * 3);
-            enc.set_constant(7, ow * 3);
-            enc.dispatch({(unsigned)((std::size_t)rows * cols * 3), 1, 1},
-                         {256, 1, 1});
-            cx.release(*o);
-            cx.release(tile);
-          }
-        }
-        return &out;
-      };
-      const bool tiled = tiles.ty > 1 || tiles.tx > 1;
-
-      const bool split =
-          t > 1 && std::getenv("VPIPE_WAN_VAE_NO_FRAME_SPLIT") == nullptr;
-      if (!split) {
-        if (tiled) {
-          // One frame in this chunk (the clip's first), so the same
-          // per-frame tiling serves; `t` > 1 always takes the split path.
-          int oh = 0, ow = 0;
-          rgb = tail_tiled_one(*x, H, W, oh, ow);
-          H = oh; W = ow;
-        } else {
-          rgb = tail(*x, t, H, W);
-        }
-        cx.release(*x);
-      } else {
-        // The chunk's frames at the split, and where each one's RGB lands.
-        const std::size_t fel =
-            (std::size_t)H * W * (std::size_t)_up_blocks[split_at].up_dim;
-        int oh = H, ow = W;
-        for (std::size_t i = split_at; i < _up_blocks.size(); ++i) {
-          if (_up_blocks[i].up.present) { oh *= 2; ow *= 2; }
-        }
-        const std::size_t ofel = (std::size_t)oh * ow * 3;
-        SharedBuffer& all = cx.alloc(mc, (std::size_t)t * ofel);
-        SharedBuffer& one = cx.alloc(mc, fel);
-        const std::size_t ci0 = ci;
-        const int H0 = H, W0 = W;
-        bool ok = cx.alloc_ok;
-        for (int k = 0; k < t && ok; ++k) {
-          ci = ci0;                    // every frame walks the same carries
-          enc.set_function(_fn_copy);
-          enc.set_buffer(0, *x, (std::size_t)k * fel * 2);
-          enc.set_buffer(1, one);
-          enc.set_constant(2, 0);
-          enc.set_constant(3, (int)fel);
-          enc.dispatch({(unsigned)fel, 1, 1}, {256, 1, 1});
-          H = H0; W = W0;
-          SharedBuffer* o = nullptr;
-          if (tiled) {
-            int oh = 0, ow = 0;
-            o = tail_tiled_one(one, H, W, oh, ow);
-            H = oh; W = ow;
-          } else {
-            o = tail(one, 1, H, W);
-          }
-          ok = o != nullptr;
-          if (!ok) { break; }
-          enc.set_function(_fn_copy);
-          enc.set_buffer(0, *o);
-          enc.set_buffer(1, all);
-          enc.set_constant(2, (int)((std::size_t)k * ofel));
-          enc.set_constant(3, (int)ofel);
-          enc.dispatch({(unsigned)ofel, 1, 1}, {256, 1, 1});
-          cx.release(*o);
-        }
-        cx.release(one);
-        cx.release(*x);
-        rgb = ok ? &all : nullptr;
-      }
+      rgb = tail_frames_(cx, *x, t, H, W, carry, ci);
+      cx.release(*x);
       if (rgb == nullptr) { return fail("chunk allocation failed"); }
     }
     if (!cx.alloc_ok) {

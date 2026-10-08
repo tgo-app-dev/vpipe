@@ -2,6 +2,7 @@
 
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/mma-splitk.h"
@@ -172,7 +173,56 @@ struct MetalFlashVsrTransformer::Block {
   SharedBuffer mod;                     // [6, dim], modulation + t_mod
 };
 
-MetalFlashVsrTransformer::~MetalFlashVsrTransformer() = default;
+// A STREAMING load's two block destinations and the scratch an F32
+// tensor is read into before it is narrowed into one.
+struct MetalFlashVsrTransformer::Streaming {
+  BlockSlots<Block>         slots;
+  std::vector<std::uint8_t> scratch;
+};
+
+namespace {
+
+// Every tensor of a block that is READ at run time, against the field it
+// lands in -- everything but what the load folds (the cross-attention
+// key and value, the modulation). The one list both the resident load
+// and the slots walk, so a field cannot be loaded one way and streamed
+// another.
+template <class B, class Fn>
+void
+each_run_tensor(int i, B& b, Fn&& fn)
+{
+  const std::string p = "blocks." + std::to_string(i) + ".";
+  fn(p + "self_attn.q.weight", b.q1);
+  fn(p + "self_attn.k.weight", b.k1);
+  fn(p + "self_attn.v.weight", b.v1);
+  fn(p + "self_attn.o.weight", b.o1);
+  fn(p + "self_attn.q.bias", b.q1b);
+  fn(p + "self_attn.k.bias", b.k1b);
+  fn(p + "self_attn.v.bias", b.v1b);
+  fn(p + "self_attn.o.bias", b.o1b);
+  fn(p + "self_attn.norm_q.weight", b.qn1);
+  fn(p + "self_attn.norm_k.weight", b.kn1);
+  fn(p + "cross_attn.q.weight", b.q2);
+  fn(p + "cross_attn.o.weight", b.o2);
+  fn(p + "cross_attn.q.bias", b.q2b);
+  fn(p + "cross_attn.o.bias", b.o2b);
+  fn(p + "cross_attn.norm_q.weight", b.qn2);
+  fn(p + "norm3.weight", b.n3w);
+  fn(p + "norm3.bias", b.n3b);
+  fn(p + "ffn.0.weight", b.ff_in);
+  fn(p + "ffn.0.bias", b.ff_in_b);
+  fn(p + "ffn.2.weight", b.ff_out);
+  fn(p + "ffn.2.bias", b.ff_out_b);
+}
+
+}  // namespace
+
+MetalFlashVsrTransformer::~MetalFlashVsrTransformer()
+{
+  // A read ahead may be in flight into a slot; it must land before the
+  // slots go.
+  if (_streaming) { _streaming->slots.join(); }
+}
 
 // ----------------------------------------------------------- geometry
 
@@ -215,23 +265,88 @@ MetalFlashVsrTransformer::kv_windows(double kv_ratio)
   return std::max(keep + 1, 3);
 }
 
-std::uint64_t
-MetalFlashVsrTransformer::kv_window_bytes(const Config& cfg, int height,
-                                          int width, double kv_ratio)
+int
+MetalFlashVsrTransformer::ring_windows(int frames, double kv_ratio)
 {
-  // WHAT forward_chunk_ ALLOCATES, which is the number a plan has to hold.
-  // This used to report the `kv_ratio` retained windows alone while the
-  // forward allocated one window more and a spare K and V per block on
-  // top -- 9.6 GB reported against 25.5 GB allocated at 1920x1152.
-  //
+  // The opening chunk writes three windows and attends them; only a
+  // SECOND chunk needs the slot past them that the ratio provides for.
+  const int chunks = (align_frames(frames) - 1) / 8 - 2;
+  return chunks <= 1 ? 3 : kv_windows(kv_ratio);
+}
+
+std::uint64_t
+MetalFlashVsrTransformer::kv_ring_bytes(const Config& cfg, int height,
+                                        int width, int windows)
+{
   // The token grid is the frame over 16 (VAE 8x, patch 2); one temporal
   // window is two latent frames of it.
   const std::uint64_t th = (std::uint64_t)(height / 16);
   const std::uint64_t tw = (std::uint64_t)(width / 16);
   const std::uint64_t window = 2 * th * tw;
-  return window * (std::uint64_t)kv_windows(kv_ratio) *
-         (std::uint64_t)cfg.hidden * 2u /* bf16 */ * 2u /* K and V */ *
-         (std::uint64_t)cfg.n_layers;
+  return window * (std::uint64_t)windows * (std::uint64_t)cfg.hidden *
+         2u /* bf16 */ * 2u /* K and V */;
+}
+
+bool
+MetalFlashVsrTransformer::blocks_outer(const Config& cfg, int height,
+                                       int width, int frames,
+                                       const Params& prm)
+{
+  if (const char* e = std::getenv("VPIPE_FVSR_CHUNK_OUTER")) {
+    if (*e != '\0' && std::string(e) != "0") { return false; }
+  }
+  using U = std::uint64_t;
+  const U tok = (U)(height / 16) * (U)(width / 16);
+  const int T = latent_frames(align_frames(frames));
+  // What each order holds that the other does not. Chunk-outer: a window
+  // per block, so n_layers - 1 more of them. Block-outer: the residual
+  // stream and the RoPE tables of every chunk, where chunk-outer holds
+  // one chunk's -- the opening one, six latent frames, is the largest.
+  const U ring = kv_ring_bytes(cfg, height, width,
+                               ring_windows(frames, prm.kv_ratio));
+  const U chunk_extra = (U)(cfg.n_layers - 1) * ring;
+  const U per_frame = tok * ((U)cfg.hidden * 2 + (U)cfg.head_dim * 4 * 2);
+  const U block_extra = (T > 6 ? (U)(T - 6) : 0) * per_frame;
+  return block_extra <= chunk_extra;
+}
+
+std::uint64_t
+MetalFlashVsrTransformer::kv_window_bytes(const Config& cfg, int height,
+                                          int width, int frames,
+                                          const Params& prm)
+{
+  // WHAT generate() ALLOCATES, which is the number a plan has to hold.
+  // It once reported the `kv_ratio` retained windows alone while the
+  // forward allocated a window more and a spare K and V per block on top
+  // -- 9.6 GB reported against 25.5 GB allocated at 1920x1152.
+  const std::uint64_t ring =
+      kv_ring_bytes(cfg, height, width, ring_windows(frames, prm.kv_ratio));
+  return blocks_outer(cfg, height, width, frames, prm)
+             ? ring
+             : ring * (std::uint64_t)cfg.n_layers;
+}
+
+std::uint64_t
+MetalFlashVsrTransformer::streaming_floor_bytes(const Config& cfg)
+{
+  using U = std::uint64_t;
+  const U D = (U)cfg.hidden, FF = (U)cfg.ffn, L = (U)cfg.n_layers;
+  // Folded, per block: the cross key and value over the fixed context,
+  // and the six modulation vectors.
+  const U folds = L * (2 * (U)cfg.text_tokens * D + 6 * D) * 2;
+  // One block's run-time weights, bf16: q/k/v/o, the cross q/o and the
+  // feed-forward, with their biases and norms -- and two of them.
+  const U block = (6 * D * D + 2 * D * FF + 13 * D + FF) * 2;
+  // The largest tensor as the checkpoint stores it (F32), which is what
+  // the narrowing scratch settles at.
+  const U scratch = D * FF * 4;
+  // The trunk: patch embedding and head, and the folded time vectors.
+  const U out_w = (U)(cfg.out_channels * cfg.patch_t * cfg.patch_h *
+                      cfg.patch_w);
+  const U in_w = (U)(cfg.in_channels * cfg.patch_t * cfg.patch_h *
+                     cfg.patch_w);
+  const U trunk = (D * in_w + D + out_w * D + out_w + 9 * D) * 2;
+  return folds + 2 * block + scratch + trunk;
 }
 
 std::uint64_t
@@ -242,20 +357,30 @@ MetalFlashVsrTransformer::denoise_scratch_bytes(const Config& cfg, int height,
   using U = std::uint64_t;
   const U th = (U)(height / 16), tw = (U)(width / 16);
   const U D = (U)cfg.hidden, NH = (U)cfg.n_heads, HD = (U)cfg.head_dim;
+  const int T = latent_frames(align_frames(frames));
   // THE OPENING CHUNK is the largest -- three windows, six latent frames
   // -- and the pool keeps what it grew to for the rest of the clip.
   const U seq = 6 * th * tw;
   const U n = seq * D * 2;                            // one [seq, D] bf16
   const U S = (th / 8) * (tw / 8);                    // blocks per window
-  const U cap_blocks = (U)kv_windows(prm.kv_ratio) * S;
+  const U cap_blocks = (U)ring_windows(frames, prm.kv_ratio) * S;
   const U out_w =
       (U)(cfg.out_channels * cfg.patch_t * cfg.patch_h * cfg.patch_w);
-  U b = kv_window_bytes(cfg, height, width, prm.kv_ratio);
-  // A block's five scratch tensors and its feed-forward; the residual,
-  // the chunk's tokens and its source rows; the head's output; RoPE.
+  U b = kv_window_bytes(cfg, height, width, frames, prm);
+  // A block's five scratch tensors and its feed-forward.
   b += 5 * n + seq * (U)cfg.ffn * 2;
-  b += 3 * n + seq * out_w * 2;
-  b += 2 * seq * HD * 4;
+  if (blocks_outer(cfg, height, width, frames, prm)) {
+    // Every chunk's residual stream and RoPE tables; the source rows of
+    // one chunk, at block 0; the head's output.
+    const U all = (T > 0 ? (U)T : 6) * th * tw;
+    b += all * D * 2 + all * HD * 4 * 2;
+    b += n + seq * out_w * 2;
+  } else {
+    // The residual, the chunk's tokens and its source rows; the head's
+    // output; RoPE.
+    b += 3 * n + seq * out_w * 2;
+    b += 2 * seq * HD * 4;
+  }
   // Routing: block means, scores, the keep map, and the span CSR sized
   // for the ALU entry's 32-query / 16-key tiles -- the finer, larger one.
   const U nq = 3 * S;
@@ -264,7 +389,6 @@ MetalFlashVsrTransformer::denoise_scratch_bytes(const Config& cfg, int height,
   b += NH * nq * cap_blocks * 4 + NH * nq * cap_blocks;
   b += NH * (NQ + 1) * 4 + NH * NQ * cap_blocks * (128 / 16) * 4;
   // The clip's noise and latent, f32 on the host.
-  const int T = latent_frames(align_frames(frames));
   if (T > 0) {
     b += 2 * (U)cfg.out_channels * (U)T * (U)(height / 8) * (U)(width / 8) *
          4;
@@ -450,12 +574,153 @@ MetalFlashVsrTransformer::load(std::shared_ptr<WeightSet> ws,
       std::string serr;
       m->_sage_x = MetalSageAttention::load(mc, /*bf16=*/true, &serr);
       if (!m->_sage_x) { return fail("sage_attn (cross): " + serr); }
+      // ...and a second of each for the OPENING chunk, whose three
+      // windows are a different shape from every later chunk's one.
+      // Block-outer runs both shapes inside every block, and a single
+      // object would rebuild its scratch twice per block.
+      m->_sage_open = MetalSageAttention::load(mc, /*bf16=*/true, &serr);
+      m->_sage_x_open = MetalSageAttention::load(mc, /*bf16=*/true, &serr);
+      if (!m->_sage_open || !m->_sage_x_open) {
+        return fail("sage_attn (opening chunk): " + serr);
+      }
     }
   }
 
   if (!m->fold_constants_(w, err)) { return nullptr; }
   if (!m->load_blocks_(w, err)) { return nullptr; }
+  if (cfg.stream_blocks) { m->configure_streaming_(); }
   return m;
+}
+
+// The slots' half of the contract: how a block of this checkpoint is
+// enumerated, built, copied and sized. BlockSlots owns the policy -- the
+// pair, the read ahead, the fallback.
+void
+MetalFlashVsrTransformer::configure_streaming_()
+{
+  _streaming = std::make_unique<Streaming>();
+  BlockSlots<Block>::Ops ops;
+  // kBf16: placed as-is when the checkpoint is bf16, and refused as
+  // UNSERVABLE when it is F32 -- this one is -- which is what routes the
+  // read through fill_unservable below rather than an allocation.
+  ops.each = [](int i, Block& b, const BlockSlots<Block>::TensorFn& fn) {
+    each_run_tensor(i, b, [&](const std::string& nm, SharedBuffer& d) {
+      fn(nm, d, Placement::kBf16);
+    });
+  };
+  ops.rebuild_one = [this](const std::string& nm, Placement) {
+    return _ws->stream_derived([&]() -> SharedBuffer {
+      const auto v = read_f32(*_ws, _mc, nm);
+      if (v.empty()) { return {}; }
+      return bf16_buf(_mc, v.data(), v.size());
+    });
+  };
+  // THE CHECKPOINT IS F32, twice the width of the slot, so a raw read has
+  // nowhere to land: pread into one scratch for the run and narrow out of
+  // it. The scratch settles at the largest tensor (the feed-forward's,
+  // 55 MB) on the first block. Only one read is ever in flight -- an
+  // acquire joins an outstanding prefetch before reading itself -- so one
+  // scratch serves both.
+  ops.fill_unservable = [this](const std::string& nm,
+                               const SharedBuffer& dst) {
+    const auto* info = _ws->src().info(nm);
+    if (info == nullptr || info->shape.empty()) { return false; }
+    std::size_t n = 1;
+    for (const auto d : info->shape) { n *= (std::size_t)d; }
+    if (dst.byte_size() < n * 2) { return false; }
+    auto& sc = _streaming->scratch;
+    if (sc.size() < (std::size_t)info->nbytes) {
+      sc.resize((std::size_t)info->nbytes);
+    }
+    if (!_ws->stream_into(nm, sc.data(), (std::size_t)info->nbytes)) {
+      return false;
+    }
+    auto* o = static_cast<std::uint16_t*>(dst.contents());
+    if (info->dtype == "F32") {
+      const auto* f = reinterpret_cast<const float*>(sc.data());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = to_bf16(f[i]); }
+      return true;
+    }
+    if (info->dtype == "BF16") {
+      std::memcpy(o, sc.data(), n * 2);
+      return true;
+    }
+    return false;
+  };
+  ops.build = [this](int i, Block& b) {
+    bool ok = true;
+    each_run_tensor(i, b, [&](const std::string& nm, SharedBuffer& d) {
+      if (!ok) { return; }
+      const auto v = read_f32(*_ws, _mc, nm);
+      d = v.empty() ? SharedBuffer{} : bf16_buf(_mc, v.data(), v.size());
+      if (d.empty()) { ok = false; }
+    });
+    return ok;
+  };
+  ops.clone = [this](const Block& src, Block& dst, bool copy) {
+    bool ok = true;
+    // Field by field over the same list, src and dst in step.
+    std::vector<const SharedBuffer*> from;
+    each_run_tensor(0, const_cast<Block&>(src),
+                    [&](const std::string&, SharedBuffer& b) {
+                      from.push_back(&b);
+                    });
+    std::size_t k = 0;
+    each_run_tensor(0, dst, [&](const std::string&, SharedBuffer& d) {
+      const SharedBuffer& s0 = *from[k++];
+      if (!ok || s0.empty()) { return; }
+      d = _mc->make_shared_buffer(s0.byte_size());
+      if (d.empty()) { ok = false; return; }
+      if (copy) { std::memcpy(d.contents(), s0.contents(), s0.byte_size()); }
+    });
+    return ok;
+  };
+  ops.bytes = [](const Block& b) {
+    std::size_t n = 0;
+    each_run_tensor(0, const_cast<Block&>(b),
+                    [&](const std::string&, SharedBuffer& d) {
+                      n += d.byte_size();
+                    });
+    return n;
+  };
+  ops.empty = [](const Block& b) { return b.q1.empty(); };
+  _streaming->slots.set_weight_set(_ws.get());
+  _streaming->slots.configure(_mc, std::move(ops), "MetalFlashVsrTransformer",
+                              "VPIPE_FVSR_NO_SLOTS");
+}
+
+bool
+MetalFlashVsrTransformer::acquire_block_(int bi, int next, const Block** out,
+                                         std::string* err)
+{
+  *out = nullptr;
+  if (!_streaming) { return true; }
+  const Block* b = _streaming->slots.acquire(bi);
+  if (b == nullptr) {
+    _streaming->slots.join();
+    if (err != nullptr) {
+      *err = fmt("block {} could not be read from the checkpoint", bi)();
+    }
+    return false;
+  }
+  // The other slot holds the block before this one, whose work has
+  // finished -- every block commits and waits -- so the read ahead can
+  // start now and run under ALL of this block's chunks.
+  _streaming->slots.prefetch(next);
+  *out = b;
+  return true;
+}
+
+bool
+MetalFlashVsrTransformer::streams_blocks() const noexcept
+{
+  return _streaming != nullptr;
+}
+
+int
+MetalFlashVsrTransformer::prefetch_hits() const noexcept
+{
+  return _streaming ? _streaming->slots.prefetch_hits() : 0;
 }
 
 // THE CONSTANTS THIS MODEL LETS US FOLD.
@@ -594,30 +859,19 @@ MetalFlashVsrTransformer::load_blocks_(WeightSet& w, std::string* err)
   _blocks.resize((std::size_t)_cfg.n_layers);
   for (int i = 0; i < _cfg.n_layers; ++i) {
     Block& b = _blocks[(std::size_t)i];
-    b.q1 = mat(blk(i, "self_attn.q.weight"));
-    b.k1 = mat(blk(i, "self_attn.k.weight"));
-    b.v1 = mat(blk(i, "self_attn.v.weight"));
-    b.o1 = mat(blk(i, "self_attn.o.weight"));
-    b.q1b = mat(blk(i, "self_attn.q.bias"));
-    b.k1b = mat(blk(i, "self_attn.k.bias"));
-    b.v1b = mat(blk(i, "self_attn.v.bias"));
-    b.o1b = mat(blk(i, "self_attn.o.bias"));
-    b.qn1 = mat(blk(i, "self_attn.norm_q.weight"));
-    b.kn1 = mat(blk(i, "self_attn.norm_k.weight"));
-    b.q2 = mat(blk(i, "cross_attn.q.weight"));
-    b.o2 = mat(blk(i, "cross_attn.o.weight"));
-    b.q2b = mat(blk(i, "cross_attn.q.bias"));
-    b.o2b = mat(blk(i, "cross_attn.o.bias"));
-    b.qn2 = mat(blk(i, "cross_attn.norm_q.weight"));
-    b.n3w = mat(blk(i, "norm3.weight"));
-    b.n3b = mat(blk(i, "norm3.bias"));
-    b.ff_in = mat(blk(i, "ffn.0.weight"));
-    b.ff_in_b = mat(blk(i, "ffn.0.bias"));
-    b.ff_out = mat(blk(i, "ffn.2.weight"));
-    b.ff_out_b = mat(blk(i, "ffn.2.bias"));
-    if (b.q1.empty() || b.o1.empty() || b.ff_in.empty() || b.n3w.empty()) {
-      return fail(fmt("block {} is incomplete", i)());
-    }
+    // A STREAMING load keeps none of these: the slots read them when the
+    // block runs. It still asks the checkpoint for every one, so a block
+    // that is incomplete is refused here and not mid-clip.
+    bool complete = true;
+    each_run_tensor(i, b, [&](const std::string& nm, SharedBuffer& dst) {
+      if (_cfg.stream_blocks) {
+        if (w.src().info(nm) == nullptr) { complete = false; }
+        return;
+      }
+      dst = mat(nm);
+      if (dst.empty()) { complete = false; }
+    });
+    if (!complete) { return fail(fmt("block {} is incomplete", i)()); }
 
     // modulation + t_mod, folded. Both are [6, dim] constants.
     const auto modw = read_f32(w, _mc, blk(i, "modulation"));
@@ -682,40 +936,6 @@ MetalFlashVsrTransformer::load_blocks_(WeightSet& w, std::string* err)
 
 // ------------------------------------------------------- the forward
 
-// The per-block key/value window, live for one clip.
-//
-// Head-major [H, cap_tokens, head_dim] per block, allocated for one
-// chunk more than the cache retains so an append never has to grow. The
-// steel parameters carry the ALLOCATION stride separately from the
-// logical length, which is what lets one buffer serve a growing cache
-// without a reallocation per chunk.
-struct MetalFlashVsrTransformer::Stream {
-  struct Cache {
-    // [H, cap_blocks * 128, HD] each, bf16: a RING of whole temporal
-    // windows, so a trim moves nothing and needs no spare. It used to
-    // shift the retained tail into a second K and V per block, which
-    // doubled the window -- the largest allocation this model makes.
-    metal_compute::SharedBuffer k, v;
-    int valid  = 0;                  // temporal windows held
-    int oldest = 0;                  // the slot holding the oldest of them
-  };
-  std::vector<Cache> per_block;
-  int cap_windows = 0;               // ring capacity, temporal windows
-  int cap_blocks = 0;                // ...in window blocks
-  int one_len = 0;                   // window blocks in a steady chunk
-  // RoPE tables, built in WINDOW-PERMUTED order so the permutation
-  // happens once on q/k/v rather than once per table lookup.
-  metal_compute::SharedBuffer rcos, rsin;
-  // The routing's own buffers, sized once per clip for the largest chunk
-  // so nothing is allocated per block.
-  metal_compute::SharedBuffer band, p, thr, flags;
-  // The span path's own buffers: the block-level decision, the CSR
-  // offsets and list, and the two parameter blocks attn_steel reads
-  // under has_spans.
-  metal_compute::SharedBuffer keep, qb_off, qb_blocks, sp_params, sp_bounds;
-  int f = 0, h = 0, w = 0, t_off = -1;
-};
-
 namespace {
 
 // Scratch pool, same shape as the projection's.
@@ -741,6 +961,70 @@ struct FwdCtx {
   }
   void release_all() { for (auto& s : pool) { s.used = false; } }
 };
+
+}  // namespace
+
+// What one generate() holds for the clip: the key/value windows, the
+// routing and span buffers, the RoPE tables and the block scratch.
+//
+// THE WINDOWS. Head-major [H, cap_tokens, head_dim] each, a RING of whole
+// temporal windows allocated for one chunk more than the cache retains,
+// so an append never has to grow and a trim moves nothing. The steel
+// parameters carry the ALLOCATION stride separately from the logical
+// length, which is what lets one buffer serve a growing cache without a
+// reallocation per chunk.
+//
+// HOW MANY is the ORDER's question. Run chunk-outer (every block of a
+// chunk, then the next chunk), every block's window has to survive until
+// that block's next chunk: thirty of them, 12.7 GB at 1920x1152. Run
+// block-outer (every chunk of a block, then the next block), a block's
+// window is finished with before the next block starts, so ONE serves
+// the whole stack. See generate().
+struct MetalFlashVsrTransformer::Stream {
+  struct Cache {
+    // [H, cap_blocks * 128, HD] each, bf16: a RING of whole temporal
+    // windows, so a trim moves nothing and needs no spare. It used to
+    // shift the retained tail into a second K and V per block, which
+    // doubled the window -- the largest allocation this model makes.
+    metal_compute::SharedBuffer k, v;
+    int valid  = 0;                  // temporal windows held
+    int oldest = 0;                  // the slot holding the oldest of them
+  };
+  std::vector<Cache> per_block;      // one per block, or one for all
+  int cap_windows = 0;               // ring capacity, temporal windows
+  int cap_blocks = 0;                // ...in window blocks
+  int one_len = 0;                   // window blocks in a steady chunk
+  int h = 0, w = 0;                  // the token grid
+  int topk = 0;                      // the routing's top-k, per clip
+  // RoPE tables, built in WINDOW-PERMUTED order so the permutation
+  // happens once on q/k/v rather than once per table lookup. One slot
+  // rebuilt per chunk chunk-outer; one per chunk, kept, block-outer --
+  // a rebuild is host trigonometry over the whole chunk.
+  struct Rope {
+    int f = -1, t_off = -1;
+    metal_compute::SharedBuffer cos, sin;
+  };
+  std::vector<Rope> rope;
+  // The routing's own buffers, sized once per clip for the largest chunk
+  // so nothing is allocated per block.
+  metal_compute::SharedBuffer band, p, thr, flags;
+  // The span path's own buffers: the block-level decision, the CSR
+  // offsets and list, and the two parameter blocks attn_steel reads
+  // under has_spans.
+  metal_compute::SharedBuffer keep, qb_off, qb_blocks, sp_params, sp_bounds;
+  // The block's scratch pool, the routing's block means and the
+  // attention's parameters, which every block reuses: each block commits
+  // and waits before the next is encoded.
+  FwdCtx cx;
+  metal_compute::SharedBuffer qm_buf, km_buf, params;
+  // VPIPE_FVSR_DIT_PROFILE, accumulated per section until reported.
+  bool prof = false;
+  double t_qkv = 0, t_prep = 0, t_route = 0, t_attn = 0, t_oproj = 0,
+         t_cross = 0, t_ffn = 0, t_elt = 0;
+  int kL_last = 0, seq_last = 0;
+};
+
+namespace {
 
 // Mirrors steel/attn/params.h. Restated because the vendored header is
 // a Metal source, not a C++ one.
@@ -1346,16 +1630,132 @@ MetalFlashVsrTransformer::block_self_attention(int bi, const float* x_tokens,
 // append never reallocates. The steel parameters carry the ALLOCATION
 // stride separately from the logical length, which is what lets a growing
 // cache live in one buffer.
+// ----------------------------------------------- the clip's state
+
 bool
-MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
-                                         int t_off, int chunk_idx,
-                                         const SharedBuffer& x_in,
-                                         const SharedBuffer* lq,
-                                         const Params& prm,
-                                         SharedBuffer* noise_out,
-                                         const Request& req, int max_blocks,
-                                         std::vector<float>* x_out,
-                                         std::string* err)
+MetalFlashVsrTransformer::begin_clip_(Stream& st, int h, int w, int f_max,
+                                      int cap_windows, int n_caches,
+                                      const Params& prm, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const int NH = _cfg.n_heads, HD = _cfg.head_dim;
+  const int A_BQ = attn_bq_(), A_BK = attn_bk_();
+  const int nh_blk = h / 8, nw_blk = w / 8;
+  const int S = nh_blk * nw_blk;
+  // The LARGEST chunk sizes everything per-chunk here: the opening one,
+  // three temporal windows, in every clip generate() runs.
+  const int wq_max = std::max(1, f_max / 2);
+  st.h = h;
+  st.w = w;
+  st.one_len = S;
+  st.cap_windows = std::max(cap_windows, wq_max);
+  st.cap_blocks = st.cap_windows * S;
+  const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
+  st.per_block.clear();
+  st.per_block.resize((std::size_t)n_caches);
+  for (auto& c : st.per_block) {
+    c.k = _mc->make_shared_buffer((std::size_t)NH * cap_tok * HD * 2);
+    c.v = _mc->make_shared_buffer((std::size_t)NH * cap_tok * HD * 2);
+    if (c.k.empty() || c.v.empty()) {
+      return fail("key/value window allocation failed");
+    }
+  }
+  const int nq_max = wq_max * S;
+  st.band = _mc->make_shared_buffer((std::size_t)S * S);
+  st.p = _mc->make_shared_buffer((std::size_t)NH * nq_max *
+                                 st.cap_blocks * 4);
+  st.thr = _mc->make_shared_buffer((std::size_t)NH * wq_max * 4);
+  // The per-KEY flags belong to the MASK path; the span path reads the
+  // block-level keep map and never these. They are hundreds of MB at
+  // full HD, so they exist only when something will read them.
+  if (!_use_spans) {
+    st.flags = _mc->make_shared_buffer(
+        (std::size_t)NH * ((nq_max * 128 + A_BQ - 1) / A_BQ) *
+        ((std::size_t)st.cap_blocks * 128));
+  }
+  if (st.band.empty() || st.p.empty() || st.thr.empty() ||
+      (!_use_spans && st.flags.empty())) {
+    return fail("routing buffer allocation failed");
+  }
+  build_band_(nh_blk, nw_blk, prm.local_range, st.band);
+  if (_use_spans) {
+    // In the ATTENTION ENTRY'S tiles, like everything the kernel reads.
+    const int NQ_max = (f_max * h * w + A_BQ - 1) / A_BQ;
+    st.keep = _mc->make_shared_buffer((std::size_t)NH * nq_max *
+                                      st.cap_blocks);
+    st.qb_off = _mc->make_shared_buffer((std::size_t)NH * (NQ_max + 1) * 4);
+    st.qb_blocks = _mc->make_shared_buffer(
+        (std::size_t)NH * NQ_max * st.cap_blocks * (128 / A_BK) * 4);
+    st.sp_params = _mc->make_shared_buffer(sizeof(AttnSpanParams));
+    st.sp_bounds = _mc->make_shared_buffer(sizeof(int) * 2);
+    if (st.keep.empty() || st.qb_off.empty() || st.qb_blocks.empty() ||
+        st.sp_params.empty() || st.sp_bounds.empty()) {
+      return fail("span buffer allocation failed");
+    }
+    // tokens_per_frame = 0 switches OFF the window mask attn_steel
+    // applies under has_spans: its `q_video` test is false for every
+    // row, so span_bounds is never dereferenced. The spans here are
+    // the whole selection.
+    auto* sp = static_cast<AttnSpanParams*>(st.sp_params.contents());
+    sp->video_start = 0;
+    sp->tokens_per_frame = 0;
+    sp->num_frames = 0;
+    sp->anchors = 0;
+    sp->qb_stride = 0;          // filled per block, in block_
+    std::memset(st.sp_bounds.contents(), 0, sizeof(int) * 2);
+  }
+  st.qm_buf = _mc->make_shared_buffer((std::size_t)NH * nq_max * HD * 2);
+  st.km_buf = _mc->make_shared_buffer((std::size_t)NH * st.cap_blocks * HD *
+                                      2);
+  st.params = _mc->make_shared_buffer(sizeof(SteelAttnParams));
+  if (st.qm_buf.empty() || st.km_buf.empty() || st.params.empty()) {
+    return fail("routing allocation failed");
+  }
+  const double topk_ratio =
+      prm.sparse_ratio * 768.0 * 1280.0 / ((double)(h * 16) * (w * 16));
+  st.topk = (int)((double)(S * S) * topk_ratio) - 1;
+  st.prof = std::getenv("VPIPE_FVSR_DIT_PROFILE") != nullptr;
+  return true;
+}
+
+bool
+MetalFlashVsrTransformer::rope_(Stream& st, int slot, int f, int t_off)
+{
+  if (slot < 0) { return false; }
+  if ((int)st.rope.size() <= slot) { st.rope.resize((std::size_t)slot + 1); }
+  Stream::Rope& rp = st.rope[(std::size_t)slot];
+  if (rp.f != f || rp.t_off != t_off || rp.cos.empty()) {
+    const std::size_t n = (std::size_t)f * st.h * st.w * _cfg.head_dim * 4;
+    rp.cos = _mc->make_shared_buffer(n);
+    rp.sin = _mc->make_shared_buffer(n);
+    if (rp.cos.empty() || rp.sin.empty()) {
+      rp = Stream::Rope{};
+      return false;
+    }
+    build_rope_(f, st.h, st.w, t_off, rp.cos, rp.sin);
+    rp.f = f;
+    rp.t_off = t_off;
+  }
+  return true;
+}
+
+// ----------------------------------------------------- one block
+
+// Block `bi` over one chunk's residual stream `x`, IN PLACE, against the
+// key/value window `cache_idx`, which this appends the chunk to and then
+// trims. Whichever ORDER drives it -- every block of a chunk before the
+// next chunk, or every chunk of a block before the next block -- a block
+// sees the same inputs: its own residual, and its own window holding the
+// same earlier chunks of the same block.
+bool
+MetalFlashVsrTransformer::block_(Stream& st, int bi, const Block* wb,
+                                 int cache_idx, int f, int t_off,
+                                 int rope_slot, SharedBuffer& x,
+                                 const SharedBuffer* lq, const Params& prm,
+                                 std::string* err)
 {
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
@@ -1363,98 +1763,42 @@ MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
   };
   const int D = _cfg.hidden, NH = _cfg.n_heads, HD = _cfg.head_dim;
   const int FF = _cfg.ffn;
+  const int h = st.h, w = st.w;
   const int seq = f * h * w;
   const int nb = seq / 128;
-  const int nh_blk = h / 8, nw_blk = w / 8;
-  const int S = nh_blk * nw_blk;
+  const int S = (h / 8) * (w / 8);              // window blocks per window
   const int sq = f / 2;
   const int T = _cfg.text_tokens;
   const int A_BQ = attn_bq_(), A_BK = attn_bk_();
-  const int out_w = _cfg.out_channels * _cfg.patch_t * _cfg.patch_h *
-                    _cfg.patch_w;
-
-  // The int8 split's width, for shapes an earlier chunk recorded. Here
-  // because it runs its own command streams and so needs no encoder open;
-  // the opening chunk's shapes are three times a later one's, so each is
-  // tuned at the next chunk that follows it.
-  if (_i8) { _i8->tune_pending(_mc); }
-
-  // ---- per-clip state, sized on the first chunk.
-  if (st.per_block.empty()) {
-    st.one_len = S;
-    st.cap_windows = kv_windows(prm.kv_ratio);
-    st.cap_blocks = st.cap_windows * S;
-    const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
-    st.per_block.resize((std::size_t)_cfg.n_layers);
-    for (auto& c : st.per_block) {
-      c.k = _mc->make_shared_buffer((std::size_t)NH * cap_tok * HD * 2);
-      c.v = _mc->make_shared_buffer((std::size_t)NH * cap_tok * HD * 2);
-      if (c.k.empty() || c.v.empty()) {
-        return fail("key/value window allocation failed");
-      }
-      c.valid = 0;
-      c.oldest = 0;
-    }
-    const int S = st.one_len;
-    const int nq_max = 3 * S;        // the opening chunk's three windows
-    st.band = _mc->make_shared_buffer((std::size_t)S * S);
-    st.p = _mc->make_shared_buffer((std::size_t)NH * nq_max *
-                                   st.cap_blocks * 4);
-    st.thr = _mc->make_shared_buffer((std::size_t)NH * 3 * 4);
-    // The per-KEY flags belong to the MASK path; the span path reads the
-    // block-level keep map and never these. They are hundreds of MB at
-    // full HD, so they exist only when something will read them.
-    if (!_use_spans) {
-      st.flags = _mc->make_shared_buffer(
-          (std::size_t)NH * ((nq_max * 128 + A_BQ - 1) / A_BQ) *
-          ((std::size_t)st.cap_blocks * 128));
-    }
-    if (st.band.empty() || st.p.empty() || st.thr.empty() ||
-        (!_use_spans && st.flags.empty())) {
-      return fail("routing buffer allocation failed");
-    }
-    build_band_(nh_blk, nw_blk, prm.local_range, st.band);
-    if (_use_spans) {
-      const int nq_max2 = 3 * S;
-      // In the ATTENTION ENTRY'S tiles, like everything the kernel reads.
-      const int NQ_max = (6 * h * w + A_BQ - 1) / A_BQ;
-      st.keep = _mc->make_shared_buffer((std::size_t)NH * nq_max2 *
-                                        st.cap_blocks);
-      st.qb_off = _mc->make_shared_buffer((std::size_t)NH * (NQ_max + 1) * 4);
-      st.qb_blocks = _mc->make_shared_buffer(
-          (std::size_t)NH * NQ_max * st.cap_blocks * (128 / A_BK) * 4);
-      st.sp_params = _mc->make_shared_buffer(sizeof(AttnSpanParams));
-      st.sp_bounds = _mc->make_shared_buffer(sizeof(int) * 2);
-      if (st.keep.empty() || st.qb_off.empty() || st.qb_blocks.empty() ||
-          st.sp_params.empty() || st.sp_bounds.empty()) {
-        return fail("span buffer allocation failed");
-      }
-      // tokens_per_frame = 0 switches OFF the window mask attn_steel
-      // applies under has_spans: its `q_video` test is false for every
-      // row, so span_bounds is never dereferenced. The spans here are
-      // the whole selection.
-      auto* sp = static_cast<AttnSpanParams*>(st.sp_params.contents());
-      sp->video_start = 0;
-      sp->tokens_per_frame = 0;
-      sp->num_frames = 0;
-      sp->anchors = 0;
-      sp->qb_stride = 0;          // filled per chunk, below
-      std::memset(st.sp_bounds.contents(), 0, sizeof(int) * 2);
-    }
-  }
+  const int topk = st.topk;
   const std::size_t cap_tok = (std::size_t)st.cap_blocks * 128;
-
-  if (st.f != f || st.h != h || st.w != w || st.t_off != t_off) {
-    st.rcos = _mc->make_shared_buffer((std::size_t)seq * HD * 4);
-    st.rsin = _mc->make_shared_buffer((std::size_t)seq * HD * 4);
-    if (st.rcos.empty() || st.rsin.empty()) { return fail("rope allocation"); }
-    build_rope_(f, h, w, t_off, st.rcos, st.rsin);
-    st.f = f; st.h = h; st.w = w; st.t_off = t_off;
+  const std::size_t n_tok = (std::size_t)seq * D;
+  // The Sage objects sized for THIS chunk's shape: the opening chunk's
+  // three windows, or a later chunk's one.
+  MetalSageAttention* sage_self =
+      (f > 2 && _sage_open) ? _sage_open.get() : _sage.get();
+  MetalSageAttention* sage_cross =
+      (f > 2 && _sage_x_open) ? _sage_x_open.get() : _sage_x.get();
+  if (cache_idx < 0 || cache_idx >= (int)st.per_block.size()) {
+    return fail("no key/value window for this block");
   }
-
-  const double topk_ratio =
-      prm.sparse_ratio * 768.0 * 1280.0 / ((double)(h * 16) * (w * 16));
-  const int topk = (int)((double)(S * S) * topk_ratio) - 1;
+  if (!rope_(st, rope_slot, f, t_off)) { return fail("rope allocation"); }
+  const Stream::Rope& rp = st.rope[(std::size_t)rope_slot];
+  FwdCtx& cx = st.cx;
+  SharedBuffer& qm_buf = st.qm_buf;
+  SharedBuffer& km_buf = st.km_buf;
+  SharedBuffer& params = st.params;
+  const bool prof = st.prof;
+  double& t_qkv = st.t_qkv;
+  double& t_prep = st.t_prep;
+  double& t_route = st.t_route;
+  double& t_attn = st.t_attn;
+  double& t_oproj = st.t_oproj;
+  double& t_cross = st.t_cross;
+  double& t_ffn = st.t_ffn;
+  double& t_elt = st.t_elt;
+  int& kL_last = st.kL_last;
+  st.seq_last = seq;
 
   // ---- CROSS-ATTENTION ON THE FLASH KERNEL.
   //
@@ -1506,7 +1850,7 @@ MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
   // ...and its int8-QK twin, for Sage. The context's key length is fixed,
   // so like the dense one it is settled once per chunk.
   metal_compute::ComputeFunction fn_xattn8;
-  if (_sage_x && use_steel_cross) {
+  if (sage_cross != nullptr && use_steel_cross) {
     metal_compute::FunctionConstants xfc8;
     xfc8.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (T % A_BK) == 0)
         .set_bool(300, false).set_bool(301, false).set_bool(302, false)
@@ -1514,391 +1858,401 @@ MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
     fn_xattn8 = attn_fn_(xfc8);
   }
 
-  FwdCtx cx;
-  const std::size_t n_tok = (std::size_t)seq * D;
-  SharedBuffer x = _mc->make_shared_buffer(n_tok * 2);
-  if (x.empty()) { return fail("residual stream allocation failed"); }
-  std::memcpy(x.contents(), x_in.contents(), n_tok * 2);
 
-  SharedBuffer qm_buf =
-      _mc->make_shared_buffer((std::size_t)NH * nb * HD * 2);
-  SharedBuffer km_buf =
-      _mc->make_shared_buffer((std::size_t)NH * st.cap_blocks * HD * 2);
-  SharedBuffer params = _mc->make_shared_buffer(sizeof(SteelAttnParams));
-  if (qm_buf.empty() || km_buf.empty() || params.empty()) {
-    return fail("routing allocation failed");
+  // The WEIGHTS from a slot when streaming; what the load FOLDED --
+  // modulation, cross key and value -- always from the resident block.
+  const Block& fb = _blocks[(std::size_t)bi];
+  const Block& b = wb != nullptr ? *wb : fb;
+  auto& cache = st.per_block[(std::size_t)cache_idx];
+  // THE WINDOW IS A RING of whole temporal windows. This chunk's keys
+  // go into the slot after the newest -- once the ring is full, the one
+  // the last trim released -- so nothing is ever shifted, and every
+  // attention still reads a VALID PREFIX: the ring is either filling
+  // from slot 0 or entirely full. The ORDER of the keys is free to
+  // change because nothing reads it: they are cached after RoPE at
+  // their absolute temporal positions, the routing thresholds a group
+  // rather than ranking positions, and the span list is ordered by
+  // slot, which is all the kernel asks.
+  const int nwin = nb / st.one_len;              // 3 opening, 1 steady
+  const int slot = (cache.oldest + cache.valid) % st.cap_windows;
+  if (nb % st.one_len != 0 || slot + nwin > st.cap_windows ||
+      (cache.oldest != 0 && cache.valid + nwin != st.cap_windows)) {
+    return fail("key/value window layout broken");
+  }
+  const int held = slot * st.one_len * 128;      // where this chunk goes
+  const int kL = (cache.valid + nwin) * st.one_len * 128;
+
+  // FIVE SCRATCH TENSORS A BLOCK. One encoder runs its dispatches in
+  // the order they were encoded, so a tensor is free for reuse the
+  // moment the dispatch that READS its value has been encoded; each
+  // hand-off is named where it happens. There were fourteen, 159 MB
+  // apiece in the opening chunk at 1920x1152.
+  SharedBuffer& y = cx.alloc(_mc, n_tok);
+  SharedBuffer& q = cx.alloc(_mc, n_tok);
+  SharedBuffer& k = cx.alloc(_mc, n_tok);
+  SharedBuffer& v = cx.alloc(_mc, n_tok);
+  SharedBuffer& a = cx.alloc(_mc, n_tok);
+  if (!cx.alloc_ok) { return fail("block scratch allocation failed"); }
+
+  // ---- params and the attention function are settled on the HOST
+  // first: kL is known before anything is dispatched, so nothing here
+  // has to wait for the GPU.
+  const int Nk = kL / 128;
+  const int NQ = (seq + A_BQ - 1) / A_BQ;
+  {
+    auto* pp = static_cast<SteelAttnParams*>(params.contents());
+    pp->B = 1; pp->H = NH; pp->D = HD;
+    pp->qL = seq; pp->kL = kL;
+    pp->gqa_factor = 1;
+    pp->scale = 1.0f / std::sqrt((float)HD);
+    pp->NQ = NQ;
+    pp->NK = (kL + A_BK - 1) / A_BK;
+    pp->NQ_aligned = seq / A_BQ;
+    pp->NK_aligned = kL / A_BK;
+    pp->qL_rem = seq - pp->NQ_aligned * A_BQ;
+    pp->kL_rem = kL - pp->NK_aligned * A_BK;
+    pp->qL_off = 0;
+    pp->Q_strides[0] = (std::int64_t)NH * seq * HD;
+    pp->Q_strides[1] = (std::int64_t)seq * HD;
+    pp->Q_strides[2] = HD;
+    // The ALLOCATION stride, not kL: the cache is one buffer that a
+    // growing logical length lives inside.
+    pp->K_strides[0] = (std::int64_t)NH * (std::int64_t)cap_tok * HD;
+    pp->K_strides[1] = (std::int64_t)cap_tok * HD;
+    pp->K_strides[2] = HD;
+    pp->V_strides[0] = pp->K_strides[0];
+    pp->V_strides[1] = pp->K_strides[1];
+    pp->V_strides[2] = HD;
+    pp->O_strides[0] = pp->Q_strides[0];
+    pp->O_strides[1] = pp->Q_strides[1];
+    pp->O_strides[2] = HD;
+  }
+  metal_compute::FunctionConstants fc;
+  fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
+      .set_bool(300, false).set_bool(301, false).set_bool(302, false);
+  // SPANS SKIP; THE MASK ONLY MASKS. Both say the same thing, and only
+  // one of them costs less than dense -- see flashvsr_route.metal.
+  if (_use_spans) { fc.set_bool(303, true); }
+  else            { fc.set_bool(305, true); }
+  metal_compute::ComputeFunction fn_attn =
+      attn_fn_(fc);
+  if (!fn_attn.valid()) { return fail("sparse steel attention unavailable"); }
+  // SAGE OVER THE ROUTED KEYS. The smoothing it applies to K stays exact
+  // under the routing: subtracting the key mean shifts every score in a
+  // row by the same <q, mean>, and a softmax over a SUBSET of a row's
+  // keys is as blind to that shift as one over all of them.
+  const bool sage_here =
+      sage_self != nullptr && _cfg.sage.enabled &&
+      bi >= _cfg.sage.dense_layers;
+  metal_compute::ComputeFunction fn_attn8;
+  if (sage_here) {
+    metal_compute::FunctionConstants fc8;
+    fc8.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(_use_spans ? 303 : 305, true)
+        .set_bool(sage::kQkInt8Constant, true);
+    fn_attn8 = attn_fn_(fc8);
+  }
+  if (_use_spans) {
+    static_cast<AttnSpanParams*>(st.sp_params.contents())->qb_stride =
+        NQ + 1;
   }
 
-  const int n_run = (max_blocks > 0 && max_blocks < _cfg.n_layers)
-                        ? max_blocks : _cfg.n_layers;
-  // ---- env-gated per-section GPU timing (VPIPE_FVSR_DIT_PROFILE).
-  //
-  // A block is ONE deferred stream, so there is nothing to time inside
-  // it without splitting: each psplit() ends the encoder, commits, waits
-  // and charges the slice to a bucket. That serialises the GPU and
-  // inflates the absolute time by the commit overhead times ~8 splits a
-  // block, so READ THE SHARE, not the total. Every buffer it touches is
-  // pool- or chunk-scoped and outlives a commit, so splitting changes
-  // nothing but the timing.
-  const bool prof = std::getenv("VPIPE_FVSR_DIT_PROFILE") != nullptr;
-  int kL_last = 0;
-  double t_qkv = 0, t_prep = 0, t_route = 0, t_attn = 0, t_oproj = 0,
-         t_cross = 0, t_ffn = 0, t_elt = 0;
-
-  for (int bi = 0; bi < n_run; ++bi) {
-    const Block& b = _blocks[(std::size_t)bi];
-    auto& cache = st.per_block[(std::size_t)bi];
-    // THE WINDOW IS A RING of whole temporal windows. This chunk's keys
-    // go into the slot after the newest -- once the ring is full, the one
-    // the last trim released -- so nothing is ever shifted, and every
-    // attention still reads a VALID PREFIX: the ring is either filling
-    // from slot 0 or entirely full. The ORDER of the keys is free to
-    // change because nothing reads it: they are cached after RoPE at
-    // their absolute temporal positions, the routing thresholds a group
-    // rather than ranking positions, and the span list is ordered by
-    // slot, which is all the kernel asks.
-    const int nwin = nb / st.one_len;              // 3 opening, 1 steady
-    const int slot = (cache.oldest + cache.valid) % st.cap_windows;
-    if (nb % st.one_len != 0 || slot + nwin > st.cap_windows ||
-        (cache.oldest != 0 && cache.valid + nwin != st.cap_windows)) {
-      return fail("key/value window layout broken");
-    }
-    const int held = slot * st.one_len * 128;      // where this chunk goes
-    const int kL = (cache.valid + nwin) * st.one_len * 128;
-
-    // FIVE SCRATCH TENSORS A BLOCK. One encoder runs its dispatches in
-    // the order they were encoded, so a tensor is free for reuse the
-    // moment the dispatch that READS its value has been encoded; each
-    // hand-off is named where it happens. There were fourteen, 159 MB
-    // apiece in the opening chunk at 1920x1152.
-    SharedBuffer& y = cx.alloc(_mc, n_tok);
-    SharedBuffer& q = cx.alloc(_mc, n_tok);
-    SharedBuffer& k = cx.alloc(_mc, n_tok);
-    SharedBuffer& v = cx.alloc(_mc, n_tok);
-    SharedBuffer& a = cx.alloc(_mc, n_tok);
-    if (!cx.alloc_ok) { return fail("block scratch allocation failed"); }
-
-    // ---- params and the attention function are settled on the HOST
-    // first: kL is known before anything is dispatched, so nothing here
-    // has to wait for the GPU.
-    const int Nk = kL / 128;
-    const int NQ = (seq + A_BQ - 1) / A_BQ;
-    {
-      auto* pp = static_cast<SteelAttnParams*>(params.contents());
-      pp->B = 1; pp->H = NH; pp->D = HD;
-      pp->qL = seq; pp->kL = kL;
-      pp->gqa_factor = 1;
-      pp->scale = 1.0f / std::sqrt((float)HD);
-      pp->NQ = NQ;
-      pp->NK = (kL + A_BK - 1) / A_BK;
-      pp->NQ_aligned = seq / A_BQ;
-      pp->NK_aligned = kL / A_BK;
-      pp->qL_rem = seq - pp->NQ_aligned * A_BQ;
-      pp->kL_rem = kL - pp->NK_aligned * A_BK;
-      pp->qL_off = 0;
-      pp->Q_strides[0] = (std::int64_t)NH * seq * HD;
-      pp->Q_strides[1] = (std::int64_t)seq * HD;
-      pp->Q_strides[2] = HD;
-      // The ALLOCATION stride, not kL: the cache is one buffer that a
-      // growing logical length lives inside.
-      pp->K_strides[0] = (std::int64_t)NH * (std::int64_t)cap_tok * HD;
-      pp->K_strides[1] = (std::int64_t)cap_tok * HD;
-      pp->K_strides[2] = HD;
-      pp->V_strides[0] = pp->K_strides[0];
-      pp->V_strides[1] = pp->K_strides[1];
-      pp->V_strides[2] = HD;
-      pp->O_strides[0] = pp->Q_strides[0];
-      pp->O_strides[1] = pp->Q_strides[1];
-      pp->O_strides[2] = HD;
-    }
-    metal_compute::FunctionConstants fc;
-    fc.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
-        .set_bool(300, false).set_bool(301, false).set_bool(302, false);
-    // SPANS SKIP; THE MASK ONLY MASKS. Both say the same thing, and only
-    // one of them costs less than dense -- see flashvsr_route.metal.
-    if (_use_spans) { fc.set_bool(303, true); }
-    else            { fc.set_bool(305, true); }
-    metal_compute::ComputeFunction fn_attn =
-        attn_fn_(fc);
-    if (!fn_attn.valid()) { return fail("sparse steel attention unavailable"); }
-    // SAGE OVER THE ROUTED KEYS. The smoothing it applies to K stays exact
-    // under the routing: subtracting the key mean shifts every score in a
-    // row by the same <q, mean>, and a softmax over a SUBSET of a row's
-    // keys is as blind to that shift as one over all of them.
-    const bool sage_here =
-        _sage && _cfg.sage.enabled && bi >= _cfg.sage.dense_layers;
-    metal_compute::ComputeFunction fn_attn8;
-    if (sage_here) {
-      metal_compute::FunctionConstants fc8;
-      fc8.set_bool(200, (seq % A_BQ) == 0).set_bool(201, (kL % A_BK) == 0)
-          .set_bool(300, false).set_bool(301, false).set_bool(302, false)
-          .set_bool(_use_spans ? 303 : 305, true)
-          .set_bool(sage::kQkInt8Constant, true);
-      fn_attn8 = attn_fn_(fc8);
-    }
-    if (_use_spans) {
-      static_cast<AttnSpanParams*>(st.sp_params.contents())->qb_stride =
-          NQ + 1;
-    }
-
-    // ---- ONE command stream for the whole block. The routing used to
-    // sit in the middle of this as a readback, which split it in two and
-    // drained the queue thirty times a chunk for arithmetic measured in
-    // kilobytes.
-    {
-      CommandStream stream = _mc->make_command_stream();
-      ComputeEncoder enc = stream.begin_compute();
-      cx.enc = &enc;
-      std::chrono::steady_clock::time_point mark =
-          std::chrono::steady_clock::now();
-      auto psplit = [&](double& acc) {
-        if (!prof) { return; }
-        enc.end();
-        stream.commit().wait();
-        acc += std::chrono::duration<double, std::milli>(
-                   std::chrono::steady_clock::now() - mark).count();
-        stream = _mc->make_command_stream();
-        enc = stream.begin_compute();
-        mark = std::chrono::steady_clock::now();
-      };
-      // The source projection enters the residual stream here. v1.1
-      // ships one output layer, so this fires at block 0 alone.
-      // THE SOURCE ENTERS AT BLOCK 0. v1.1's projection ships one
-      // output layer, so one row set reaches one block; a checkpoint
-      // with more would emit more row sets and the conditioner would
-      // say so on the beat.
-      if (lq != nullptr && bi == 0) {
-        enc.set_function(_fn_resadd);
-        enc.set_buffer(0, x); enc.set_buffer(1, *lq); enc.set_buffer(2, x);
-        enc.set_constant(3, (int)n_tok);
-        enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
-      }
-      enc.set_function(_fn_ln_mod);
-      enc.set_buffer(0, x);
-      enc.set_buffer(1, b.mod, (std::size_t)1 * D * 2);
-      enc.set_buffer(2, b.mod, 0);
-      enc.set_buffer(3, y);
-      enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
-      enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
-
-      gemm_(enc, y, b.q1, b.q1b, q, seq, D, D);
-      gemm_(enc, y, b.k1, b.k1b, k, seq, D, D);
-      gemm_(enc, y, b.v1, b.v1b, v, seq, D, D);
-      rms_(enc, q, b.qn1, q, seq, D);
-      rms_(enc, k, b.kn1, k, seq, D);
-      psplit(t_qkv);
-      // Each window-permuted through `a` and back: q becomes the RoPE'd
-      // head-major query, k and v the chunk's head-major keys and values.
-      permute_(enc, q, a, f, h, w, D, false);
-      trope_(enc, a, q, st.rcos, st.rsin, NH, seq, HD);
-      permute_(enc, k, a, f, h, w, D, false);
-      trope_(enc, a, k, st.rcos, st.rsin, NH, seq, HD);
-      permute_(enc, v, a, f, h, w, D, false);
-      enc.set_function(_fn_transpose);
-      enc.set_buffer(0, a); enc.set_buffer(1, v);
-      enc.set_constant(2, seq); enc.set_constant(3, NH);
-      enc.set_constant(4, HD);
-      enc.dispatch({(unsigned)HD, (unsigned)NH, (unsigned)seq},
-                   {(unsigned)HD, 1, 1});
-      append_cache_(enc, k, cache.k, NH, seq, HD, cap_tok, held);
-      append_cache_(enc, v, cache.v, NH, seq, HD, cap_tok, held);
-
-      psplit(t_prep);
-      blockmean_(enc, q, qm_buf, HD, seq, 128, NH, nb);
-      blockmean_(enc, cache.k, km_buf, HD, (int)cap_tok, 128, NH, Nk);
-      route_gpu_(enc, qm_buf, km_buf, st.band, st.p, st.thr, st.flags, nb, Nk,
-                 sq, S, topk, kL, NQ, A_BQ);
-      if (_use_spans) {
-        build_spans_(enc, st, nb, Nk, sq, NQ, A_BQ);
-      }
-      // VPIPE_FVSR_DENSE_ATTN: keep every key block, to measure what the
-      // sparsity actually BUYS in time. has_block_mask is a per-key
-      // flag, not a span list -- so the question is whether the kernel
-      // skips the excluded keys or merely zeroes them, and only the
-      // clock can answer it.
-      if (_dense_attn && !st.flags.empty()) {
-        std::memset(st.flags.contents(), 0,
-                    (std::size_t)NH * NQ * kL);
-      }
-      psplit(t_route);
-
-      // ---- the attention and the rest of the block, same stream.
-      SharedBuffer& ff = cx.alloc(_mc, (std::size_t)seq * FF);
-      if (!cx.alloc_ok) { return fail("block scratch allocation failed"); }
-
-      bool sage_ok = false;
-      if (sage_here && fn_attn8.valid()) {
-        // q is tight head-major; the cache is head-major at its ALLOCATION
-        // stride, so the head stride is passed and never derived from kL.
-        const MetalSageAttention::Operand qo{&q, 0, HD, seq * HD};
-        const MetalSageAttention::Operand ko{&cache.k, 0, HD,
-                                             (int)cap_tok * HD};
-        std::string serr;
-        sage_ok = _sage->prepare(enc, qo, ko, NH, NH, seq, kL, HD, A_BQ,
-                                 A_BK, _cfg.sage, &serr);
-      }
-      enc.set_function(sage_ok ? fn_attn8 : fn_attn);
-      enc.set_buffer(0, q); enc.set_buffer(1, cache.k);
-      enc.set_buffer(2, cache.v);
-      enc.set_buffer(3, a); enc.set_buffer(4, params);
-      if (_use_spans) {
-        enc.set_buffer(8, st.qb_off); enc.set_buffer(9, st.qb_blocks);
-        enc.set_buffer(10, st.sp_params); enc.set_buffer(11, st.sp_bounds);
-      } else {
-        enc.set_buffer(14, st.flags);
-      }
-      if (sage_ok) { _sage->bind(enc); }
-      enc.dispatch({32u * (unsigned)((seq + A_BQ - 1) / A_BQ),
-                    4u * (unsigned)NH, 1}, {32, 4, 1});
-
-      psplit(t_attn);
-      // Attention (a) -> token-major into v, whose values are in the ring
-      // now -> un-permuted back into a -> the output projection into k,
-      // whose keys are in the ring too.
-      enc.set_function(_fn_transpose);
-      enc.set_buffer(0, a); enc.set_buffer(1, v);
-      enc.set_constant(2, NH); enc.set_constant(3, seq);
-      enc.set_constant(4, HD);
-      enc.dispatch({(unsigned)HD, (unsigned)seq, (unsigned)NH},
-                   {(unsigned)HD, 1, 1});
-      permute_(enc, v, a, f, h, w, D, true);
-      gemm_(enc, a, b.o1, b.o1b, k, seq, D, D);
-
-      psplit(t_oproj);
-      // x = x + gate_msa * attn
-      enc.set_function(_fn_gated);
-      enc.set_buffer(0, x); enc.set_buffer(1, b.mod, (std::size_t)2 * D * 2);
-      enc.set_buffer(2, k);
-      enc.set_constant(3, D); enc.set_constant(4, (int)n_tok);
-      enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
-
-      // Cross-attention into the FOLDED constant: a query projection, an
-      // attention, an output projection. No key or value work at all.
-      // norm3 (y) -> query (q, its self-attention reader encoded) ->
-      // head-major (a) -> attention (v) -> token-major (q) -> o-proj (k).
-      enc.set_function(_fn_ln_aff);
-      enc.set_buffer(0, x); enc.set_buffer(1, b.n3w); enc.set_buffer(2, b.n3b);
-      enc.set_buffer(3, y);
-      enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
-      enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
-      gemm_(enc, y, b.q2, b.q2b, q, seq, D, D);
-      rms_(enc, q, b.qn2, q, seq, D);
-      enc.set_function(_fn_transpose);
-      enc.set_buffer(0, q); enc.set_buffer(1, a);
-      enc.set_constant(2, seq); enc.set_constant(3, NH);
-      enc.set_constant(4, HD);
-      enc.dispatch({(unsigned)HD, (unsigned)NH, (unsigned)seq},
-                   {(unsigned)HD, 1, 1});
-      if (use_steel_cross) {
-        bool xsage = false;
-        if (fn_xattn8.valid() && bi >= _cfg.sage.dense_layers) {
-          const MetalSageAttention::Operand qo{&a, 0, HD, seq * HD};
-          const MetalSageAttention::Operand ko{&b.ck, 0, HD, T * HD};
-          std::string serr;
-          xsage = _sage_x->prepare(enc, qo, ko, NH, NH, seq, T, HD, A_BQ,
-                                   A_BK, _cfg.sage, &serr);
-        }
-        enc.set_function(xsage ? fn_xattn8 : fn_xattn);
-        enc.set_buffer(0, a); enc.set_buffer(1, b.ck);
-        enc.set_buffer(2, b.cv);
-        enc.set_buffer(3, v); enc.set_buffer(4, xparams);
-        if (xsage) { _sage_x->bind(enc); }
-        enc.dispatch({32u * (unsigned)((seq + A_BQ - 1) / A_BQ),
-                      4u * (unsigned)NH, 1}, {32, 4, 1});
-      } else {
-        const float scale = 1.0f / std::sqrt((float)HD);
-        enc.set_function(_fn_sdpa);
-        enc.set_buffer(0, a); enc.set_buffer(1, b.ck);
-        enc.set_buffer(2, b.cv);
-        enc.set_buffer(3, v);
-        enc.set_constant(4, scale); enc.set_constant(5, T);
-        enc.set_constant(6, HD); enc.set_constant(7, NH);
-        enc.set_constant(8, NH);
-        enc.set_constant(9, seq); enc.set_constant(10, T);
-        enc.dispatch({32, (unsigned)NH, (unsigned)seq}, {32, 1, 1});
-      }
-      enc.set_function(_fn_transpose);
-      enc.set_buffer(0, v); enc.set_buffer(1, q);
-      enc.set_constant(2, NH); enc.set_constant(3, seq);
-      enc.set_constant(4, HD);
-      enc.dispatch({(unsigned)HD, (unsigned)seq, (unsigned)NH},
-                   {(unsigned)HD, 1, 1});
-      gemm_(enc, q, b.o2, b.o2b, k, seq, D, D);
+  // ---- ONE command stream for the whole block. The routing used to
+  // sit in the middle of this as a readback, which split it in two and
+  // drained the queue thirty times a chunk for arithmetic measured in
+  // kilobytes.
+  {
+    CommandStream stream = _mc->make_command_stream();
+    ComputeEncoder enc = stream.begin_compute();
+    cx.enc = &enc;
+    std::chrono::steady_clock::time_point mark =
+        std::chrono::steady_clock::now();
+    auto psplit = [&](double& acc) {
+      if (!prof) { return; }
+      enc.end();
+      stream.commit().wait();
+      acc += std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - mark).count();
+      stream = _mc->make_command_stream();
+      enc = stream.begin_compute();
+      mark = std::chrono::steady_clock::now();
+    };
+    // The source projection enters the residual stream here. v1.1
+    // ships one output layer, so this fires at block 0 alone.
+    // THE SOURCE ENTERS AT BLOCK 0. v1.1's projection ships one
+    // output layer, so one row set reaches one block; a checkpoint
+    // with more would emit more row sets and the conditioner would
+    // say so on the beat.
+    if (lq != nullptr && bi == 0) {
       enc.set_function(_fn_resadd);
-      enc.set_buffer(0, x); enc.set_buffer(1, k); enc.set_buffer(2, x);
+      enc.set_buffer(0, x); enc.set_buffer(1, *lq); enc.set_buffer(2, x);
       enc.set_constant(3, (int)n_tok);
       enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
-
-      psplit(t_cross);
-      // The feed-forward is UNGATED: one gelu between two linears.
-      enc.set_function(_fn_ln_mod);
-      enc.set_buffer(0, x);
-      enc.set_buffer(1, b.mod, (std::size_t)4 * D * 2);
-      enc.set_buffer(2, b.mod, (std::size_t)3 * D * 2);
-      enc.set_buffer(3, y);
-      enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
-      enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
-      gemm_(enc, y, b.ff_in, b.ff_in_b, ff, seq, FF, D);
-      enc.set_function(_fn_gelu);
-      enc.set_buffer(0, ff); enc.set_buffer(1, ff);
-      enc.set_constant(2, (int)((std::size_t)seq * FF));
-      enc.dispatch({(unsigned)((std::size_t)seq * FF), 1, 1}, {256, 1, 1});
-      gemm_(enc, ff, b.ff_out, b.ff_out_b, k, seq, D, FF);
-      psplit(t_ffn);
-      enc.set_function(_fn_gated);
-      enc.set_buffer(0, x); enc.set_buffer(1, b.mod, (std::size_t)5 * D * 2);
-      enc.set_buffer(2, k);
-      enc.set_constant(3, D); enc.set_constant(4, (int)n_tok);
-      enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
-      psplit(t_elt);
-      enc.end();
-      std::string ge;
-      if (!stream.commit().wait_ok(&ge)) {
-        return fail(fmt("block {} failed: {}", bi, ge)());
-      }
     }
-    // QUERY TILES THE ROUTING LEFT WITH NO KEY BLOCK AT ALL. The span
-    // kernel's softmax over nothing is 0/0, so each one is a NaN row that
-    // every later block's attention spreads. Counted from the CSR the
-    // block just used -- a few thousand ints, read after its stream has
-    // finished -- so a clip that goes non-finite can say whether this is
-    // why.
-    if (_use_spans && !st.qb_off.empty()) {
-      const int NQs = (seq + A_BQ - 1) / A_BQ;
-      const auto* off = (const int*)st.qb_off.contents();
-      for (int hh = 0; hh < NH; ++hh) {
-        for (int qb = 0; qb < NQs; ++qb) {
-          const int i0 = hh * (NQs + 1) + qb;
-          if (off[i0 + 1] == off[i0]) { ++_empty_tiles; }
-        }
-      }
-    }
+    enc.set_function(_fn_ln_mod);
+    enc.set_buffer(0, x);
+    enc.set_buffer(1, fb.mod, (std::size_t)1 * D * 2);
+    enc.set_buffer(2, fb.mod, 0);
+    enc.set_buffer(3, y);
+    enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
+    enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
 
-    // ---- the ring now holds this chunk too; trim to kv_ratio windows.
-    kL_last = kL;
-    cache.valid += nwin;
-    trim_cache_(st, bi, prm);
-    cx.release_all();
-    if (req.block_progress && !req.block_progress(bi + 1, _cfg.n_layers)) {
-      return fail("aborted");
+    gemm_(enc, y, b.q1, b.q1b, q, seq, D, D);
+    gemm_(enc, y, b.k1, b.k1b, k, seq, D, D);
+    gemm_(enc, y, b.v1, b.v1b, v, seq, D, D);
+    rms_(enc, q, b.qn1, q, seq, D);
+    rms_(enc, k, b.kn1, k, seq, D);
+    psplit(t_qkv);
+    // Each window-permuted through `a` and back: q becomes the RoPE'd
+    // head-major query, k and v the chunk's head-major keys and values.
+    permute_(enc, q, a, f, h, w, D, false);
+    trope_(enc, a, q, rp.cos, rp.sin, NH, seq, HD);
+    permute_(enc, k, a, f, h, w, D, false);
+    trope_(enc, a, k, rp.cos, rp.sin, NH, seq, HD);
+    permute_(enc, v, a, f, h, w, D, false);
+    enc.set_function(_fn_transpose);
+    enc.set_buffer(0, a); enc.set_buffer(1, v);
+    enc.set_constant(2, seq); enc.set_constant(3, NH);
+    enc.set_constant(4, HD);
+    enc.dispatch({(unsigned)HD, (unsigned)NH, (unsigned)seq},
+                 {(unsigned)HD, 1, 1});
+    append_cache_(enc, k, cache.k, NH, seq, HD, cap_tok, held);
+    append_cache_(enc, v, cache.v, NH, seq, HD, cap_tok, held);
+
+    psplit(t_prep);
+    blockmean_(enc, q, qm_buf, HD, seq, 128, NH, nb);
+    blockmean_(enc, cache.k, km_buf, HD, (int)cap_tok, 128, NH, Nk);
+    route_gpu_(enc, qm_buf, km_buf, st.band, st.p, st.thr, st.flags, nb, Nk,
+               sq, S, topk, kL, NQ, A_BQ);
+    if (_use_spans) {
+      build_spans_(enc, st, nb, Nk, sq, NQ, A_BQ);
+    }
+    // VPIPE_FVSR_DENSE_ATTN: keep every key block, to measure what the
+    // sparsity actually BUYS in time. has_block_mask is a per-key
+    // flag, not a span list -- so the question is whether the kernel
+    // skips the excluded keys or merely zeroes them, and only the
+    // clock can answer it.
+    if (_dense_attn && !st.flags.empty()) {
+      std::memset(st.flags.contents(), 0,
+                  (std::size_t)NH * NQ * kL);
+    }
+    psplit(t_route);
+
+    // ---- the attention and the rest of the block, same stream.
+    SharedBuffer& ff = cx.alloc(_mc, (std::size_t)seq * FF);
+    if (!cx.alloc_ok) { return fail("block scratch allocation failed"); }
+
+    bool sage_ok = false;
+    if (sage_here && fn_attn8.valid()) {
+      // q is tight head-major; the cache is head-major at its ALLOCATION
+      // stride, so the head stride is passed and never derived from kL.
+      const MetalSageAttention::Operand qo{&q, 0, HD, seq * HD};
+      const MetalSageAttention::Operand ko{&cache.k, 0, HD,
+                                           (int)cap_tok * HD};
+      std::string serr;
+      sage_ok = sage_self->prepare(enc, qo, ko, NH, NH, seq, kL, HD, A_BQ,
+                               A_BK, _cfg.sage, &serr);
+    }
+    enc.set_function(sage_ok ? fn_attn8 : fn_attn);
+    enc.set_buffer(0, q); enc.set_buffer(1, cache.k);
+    enc.set_buffer(2, cache.v);
+    enc.set_buffer(3, a); enc.set_buffer(4, params);
+    if (_use_spans) {
+      enc.set_buffer(8, st.qb_off); enc.set_buffer(9, st.qb_blocks);
+      enc.set_buffer(10, st.sp_params); enc.set_buffer(11, st.sp_bounds);
+    } else {
+      enc.set_buffer(14, st.flags);
+    }
+    if (sage_ok) { sage_self->bind(enc); }
+    enc.dispatch({32u * (unsigned)((seq + A_BQ - 1) / A_BQ),
+                  4u * (unsigned)NH, 1}, {32, 4, 1});
+
+    psplit(t_attn);
+    // Attention (a) -> token-major into v, whose values are in the ring
+    // now -> un-permuted back into a -> the output projection into k,
+    // whose keys are in the ring too.
+    enc.set_function(_fn_transpose);
+    enc.set_buffer(0, a); enc.set_buffer(1, v);
+    enc.set_constant(2, NH); enc.set_constant(3, seq);
+    enc.set_constant(4, HD);
+    enc.dispatch({(unsigned)HD, (unsigned)seq, (unsigned)NH},
+                 {(unsigned)HD, 1, 1});
+    permute_(enc, v, a, f, h, w, D, true);
+    gemm_(enc, a, b.o1, b.o1b, k, seq, D, D);
+
+    psplit(t_oproj);
+    // x = x + gate_msa * attn
+    enc.set_function(_fn_gated);
+    enc.set_buffer(0, x); enc.set_buffer(1, fb.mod, (std::size_t)2 * D * 2);
+    enc.set_buffer(2, k);
+    enc.set_constant(3, D); enc.set_constant(4, (int)n_tok);
+    enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
+
+    // Cross-attention into the FOLDED constant: a query projection, an
+    // attention, an output projection. No key or value work at all.
+    // norm3 (y) -> query (q, its self-attention reader encoded) ->
+    // head-major (a) -> attention (v) -> token-major (q) -> o-proj (k).
+    enc.set_function(_fn_ln_aff);
+    enc.set_buffer(0, x); enc.set_buffer(1, b.n3w); enc.set_buffer(2, b.n3b);
+    enc.set_buffer(3, y);
+    enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
+    enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
+    gemm_(enc, y, b.q2, b.q2b, q, seq, D, D);
+    rms_(enc, q, b.qn2, q, seq, D);
+    enc.set_function(_fn_transpose);
+    enc.set_buffer(0, q); enc.set_buffer(1, a);
+    enc.set_constant(2, seq); enc.set_constant(3, NH);
+    enc.set_constant(4, HD);
+    enc.dispatch({(unsigned)HD, (unsigned)NH, (unsigned)seq},
+                 {(unsigned)HD, 1, 1});
+    if (use_steel_cross) {
+      bool xsage = false;
+      if (fn_xattn8.valid() && bi >= _cfg.sage.dense_layers) {
+        const MetalSageAttention::Operand qo{&a, 0, HD, seq * HD};
+        const MetalSageAttention::Operand ko{&fb.ck, 0, HD, T * HD};
+        std::string serr;
+        xsage = sage_cross->prepare(enc, qo, ko, NH, NH, seq, T, HD, A_BQ,
+                                 A_BK, _cfg.sage, &serr);
+      }
+      enc.set_function(xsage ? fn_xattn8 : fn_xattn);
+      enc.set_buffer(0, a); enc.set_buffer(1, fb.ck);
+      enc.set_buffer(2, fb.cv);
+      enc.set_buffer(3, v); enc.set_buffer(4, xparams);
+      if (xsage) { sage_cross->bind(enc); }
+      enc.dispatch({32u * (unsigned)((seq + A_BQ - 1) / A_BQ),
+                    4u * (unsigned)NH, 1}, {32, 4, 1});
+    } else {
+      const float scale = 1.0f / std::sqrt((float)HD);
+      enc.set_function(_fn_sdpa);
+      enc.set_buffer(0, a); enc.set_buffer(1, fb.ck);
+      enc.set_buffer(2, fb.cv);
+      enc.set_buffer(3, v);
+      enc.set_constant(4, scale); enc.set_constant(5, T);
+      enc.set_constant(6, HD); enc.set_constant(7, NH);
+      enc.set_constant(8, NH);
+      enc.set_constant(9, seq); enc.set_constant(10, T);
+      enc.dispatch({32, (unsigned)NH, (unsigned)seq}, {32, 1, 1});
+    }
+    enc.set_function(_fn_transpose);
+    enc.set_buffer(0, v); enc.set_buffer(1, q);
+    enc.set_constant(2, NH); enc.set_constant(3, seq);
+    enc.set_constant(4, HD);
+    enc.dispatch({(unsigned)HD, (unsigned)seq, (unsigned)NH},
+                 {(unsigned)HD, 1, 1});
+    gemm_(enc, q, b.o2, b.o2b, k, seq, D, D);
+    enc.set_function(_fn_resadd);
+    enc.set_buffer(0, x); enc.set_buffer(1, k); enc.set_buffer(2, x);
+    enc.set_constant(3, (int)n_tok);
+    enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
+
+    psplit(t_cross);
+    // The feed-forward is UNGATED: one gelu between two linears.
+    enc.set_function(_fn_ln_mod);
+    enc.set_buffer(0, x);
+    enc.set_buffer(1, fb.mod, (std::size_t)4 * D * 2);
+    enc.set_buffer(2, fb.mod, (std::size_t)3 * D * 2);
+    enc.set_buffer(3, y);
+    enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
+    enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
+    gemm_(enc, y, b.ff_in, b.ff_in_b, ff, seq, FF, D);
+    enc.set_function(_fn_gelu);
+    enc.set_buffer(0, ff); enc.set_buffer(1, ff);
+    enc.set_constant(2, (int)((std::size_t)seq * FF));
+    enc.dispatch({(unsigned)((std::size_t)seq * FF), 1, 1}, {256, 1, 1});
+    gemm_(enc, ff, b.ff_out, b.ff_out_b, k, seq, D, FF);
+    psplit(t_ffn);
+    enc.set_function(_fn_gated);
+    enc.set_buffer(0, x); enc.set_buffer(1, fb.mod, (std::size_t)5 * D * 2);
+    enc.set_buffer(2, k);
+    enc.set_constant(3, D); enc.set_constant(4, (int)n_tok);
+    enc.dispatch({(unsigned)n_tok, 1, 1}, {256, 1, 1});
+    psplit(t_elt);
+    enc.end();
+    std::string ge;
+    if (!stream.commit().wait_ok(&ge)) {
+      return fail(fmt("block {} failed: {}", bi, ge)());
+    }
+  }
+  // QUERY TILES THE ROUTING LEFT WITH NO KEY BLOCK AT ALL. The span
+  // kernel's softmax over nothing is 0/0, so each one is a NaN row that
+  // every later block's attention spreads. Counted from the CSR the
+  // block just used -- a few thousand ints, read after its stream has
+  // finished -- so a clip that goes non-finite can say whether this is
+  // why.
+  if (_use_spans && !st.qb_off.empty()) {
+    const int NQs = (seq + A_BQ - 1) / A_BQ;
+    const auto* off = (const int*)st.qb_off.contents();
+    for (int hh = 0; hh < NH; ++hh) {
+      for (int qb = 0; qb < NQs; ++qb) {
+        const int i0 = hh * (NQs + 1) + qb;
+        if (off[i0 + 1] == off[i0]) { ++_empty_tiles; }
+      }
     }
   }
 
-  // A caller asking for fewer blocks than the stack wants the residual
-  // stream, not a noise prediction the head has no business making.
-  if (x_out != nullptr) {
-    x_out->assign(n_tok, 0.0f);
-    const auto* p = (const std::uint16_t*)x.contents();
-    for (std::size_t i = 0; i < n_tok; ++i) { (*x_out)[i] = from_bf16(p[i]); }
-  }
-  if (n_run < _cfg.n_layers) { return true; }
+  // ---- the ring now holds this chunk too; trim to kv_ratio windows.
+  kL_last = kL;
+  cache.valid += nwin;
+  trim_cache_(st, cache_idx, prm);
+  cx.release_all();
+  return true;
+}
 
-  if (prof && _use_spans && !st.qb_off.empty()) {
+// The head: the same modulate, then one projection to the patch.
+bool
+MetalFlashVsrTransformer::head_(Stream& st, const SharedBuffer& x, int seq,
+                                SharedBuffer* noise_out, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const int D = _cfg.hidden;
+  const int out_w = _cfg.out_channels * _cfg.patch_t * _cfg.patch_h *
+                    _cfg.patch_w;
+  const std::size_t n_tok = (std::size_t)seq * D;
+  FwdCtx& cx = st.cx;
+  SharedBuffer& yh = cx.alloc(_mc, n_tok);
+  if (noise_out->empty()) {
+    *noise_out = _mc->make_shared_buffer((std::size_t)seq * out_w * 2);
+  }
+  if (!cx.alloc_ok || noise_out->empty()) {
+    return fail("head allocation failed");
+  }
+  CommandStream stream = _mc->make_command_stream();
+  ComputeEncoder enc = stream.begin_compute();
+  cx.enc = &enc;
+  enc.set_function(_fn_ln_mod);
+  enc.set_buffer(0, x);
+  enc.set_buffer(1, _head_mod, (std::size_t)1 * D * 2);
+  enc.set_buffer(2, _head_mod, 0);
+  enc.set_buffer(3, yh);
+  enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
+  enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
+  gemm_(enc, yh, _head_w, _head_b, *noise_out, seq, out_w, D);
+  enc.end();
+  std::string ge;
+  const bool ok = stream.commit().wait_ok(&ge);
+  cx.release_all();
+  if (!ok) { return fail("head failed: " + ge); }
+  return true;
+}
+
+// VPIPE_FVSR_DIT_PROFILE: the per-section split since the last report,
+// then reset. Read the SHARE, not the total -- see block_.
+void
+MetalFlashVsrTransformer::report_prof_(Stream& st, const char* what,
+                                       int n_blocks)
+{
+  if (!st.prof) { return; }
+  if (_use_spans && !st.qb_off.empty() && st.seq_last > 0) {
     // What the spans actually SHORTENED. If the average list is close to
     // the dense block count, the routing is keeping everything and the
     // sparsity is notional.
-    const int NQ = (seq + A_BQ - 1) / A_BQ;
-    const int kb_lim = (kL_last + A_BK - 1) / A_BK;
+    const int A_BQ = attn_bq_(), A_BK = attn_bk_();
+    const int NQ = (st.seq_last + A_BQ - 1) / A_BQ;
+    const int kb_lim = (st.kL_last + A_BK - 1) / A_BK;
     const auto* off = (const int*)st.qb_off.contents();
     double sum = 0.0;
     for (int hh = 0; hh < _cfg.n_heads; ++hh) {
@@ -1912,44 +2266,97 @@ MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
                  "[fvsr-span] avg %.1f of %d key blocks visited (%.0f%%)\n",
                  avg, kb_lim, 100.0 * avg / (double)kb_lim);
   }
-  if (prof) {
-    const double tot = t_qkv + t_prep + t_route + t_attn + t_oproj + t_cross +
-                       t_ffn + t_elt;
+  const double tot = st.t_qkv + st.t_prep + st.t_route + st.t_attn +
+                     st.t_oproj + st.t_cross + st.t_ffn + st.t_elt;
+  if (tot > 0.0) {
     std::fprintf(stderr,
-                 "[fvsr-prof] chunk %d %d blocks %.0f ms: qkv %.0f%% prep "
+                 "[fvsr-prof] %s %d blocks %.0f ms: qkv %.0f%% prep "
                  "%.0f%% route %.0f%% attn %.0f%% oproj %.0f%% cross %.0f%% "
-                 "ffn %.0f%% elt %.0f%%\n", chunk_idx, n_run, tot,
-                 100 * t_qkv / tot, 100 * t_prep / tot, 100 * t_route / tot,
-                 100 * t_attn / tot, 100 * t_oproj / tot, 100 * t_cross / tot,
-                 100 * t_ffn / tot, 100 * t_elt / tot);
+                 "ffn %.0f%% elt %.0f%%\n", what, n_blocks, tot,
+                 100 * st.t_qkv / tot, 100 * st.t_prep / tot,
+                 100 * st.t_route / tot, 100 * st.t_attn / tot,
+                 100 * st.t_oproj / tot, 100 * st.t_cross / tot,
+                 100 * st.t_ffn / tot, 100 * st.t_elt / tot);
+  }
+  st.t_qkv = st.t_prep = st.t_route = st.t_attn = st.t_oproj = st.t_cross =
+      st.t_ffn = st.t_elt = 0.0;
+}
+
+// One chunk through the whole stack, then the head: the CHUNK-OUTER
+// order, which holds a key/value window per block for the whole clip.
+// generate() takes it only where it would hold less than the block-outer
+// one (see blocks_outer), and the test seams take it always.
+bool
+MetalFlashVsrTransformer::forward_chunk_(Stream& st, int f, int h, int w,
+                                         int t_off, int chunk_idx,
+                                         const SharedBuffer& x_in,
+                                         const SharedBuffer* lq,
+                                         const Params& prm,
+                                         SharedBuffer* noise_out,
+                                         const Request& req, int max_blocks,
+                                         std::vector<float>* x_out,
+                                         std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const int D = _cfg.hidden;
+  const int seq = f * h * w;
+  const std::size_t n_tok = (std::size_t)seq * D;
+
+  // The int8 split's width, for shapes an earlier chunk recorded. Here
+  // because it runs its own command streams and so needs no encoder open;
+  // the opening chunk's shapes are three times a later one's, so each is
+  // tuned at the next chunk that follows it.
+  if (_i8) { _i8->tune_pending(_mc); }
+
+  // A seam's lone chunk: a window per block at the ratio's capacity.
+  if (st.per_block.empty() &&
+      !begin_clip_(st, h, w, f, kv_windows(prm.kv_ratio), _cfg.n_layers, prm,
+                   err)) {
+    return false;
+  }
+  if (st.h != h || st.w != w ||
+      (int)st.per_block.size() != _cfg.n_layers) {
+    return fail("the chunk-outer order needs a window per block");
   }
 
-  // ---- the head: the same modulate, then one projection to the patch.
-  {
-    SharedBuffer& yh = cx.alloc(_mc, n_tok);
-    if (noise_out->empty()) {
-      *noise_out = _mc->make_shared_buffer((std::size_t)seq * out_w * 2);
+  SharedBuffer x = _mc->make_shared_buffer(n_tok * 2);
+  if (x.empty()) { return fail("residual stream allocation failed"); }
+  std::memcpy(x.contents(), x_in.contents(), n_tok * 2);
+
+  const int n_run = (max_blocks > 0 && max_blocks < _cfg.n_layers)
+                        ? max_blocks : _cfg.n_layers;
+  for (int bi = 0; bi < n_run; ++bi) {
+    const Block* wb = nullptr;
+    if (!acquire_block_(bi, (bi + 1) % _cfg.n_layers, &wb, err)) {
+      return false;
     }
-    if (!cx.alloc_ok || noise_out->empty()) {
-      return fail("head allocation failed");
+    // The source projection enters the residual stream at block 0.
+    if (!block_(st, bi, wb, bi, f, t_off, 0, x, bi == 0 ? lq : nullptr, prm,
+                err)) {
+      if (_streaming) { _streaming->slots.join(); }
+      return false;
     }
-    CommandStream stream = _mc->make_command_stream();
-    ComputeEncoder enc = stream.begin_compute();
-    cx.enc = &enc;
-    enc.set_function(_fn_ln_mod);
-    enc.set_buffer(0, x);
-    enc.set_buffer(1, _head_mod, (std::size_t)1 * D * 2);
-    enc.set_buffer(2, _head_mod, 0);
-    enc.set_buffer(3, yh);
-    enc.set_constant(4, D); enc.set_constant(5, _cfg.norm_eps);
-    enc.dispatch({256, (unsigned)seq, 1}, {256, 1, 1});
-    gemm_(enc, yh, _head_w, _head_b, *noise_out, seq, out_w, D);
-    enc.end();
-    std::string ge;
-    if (!stream.commit().wait_ok(&ge)) { return fail("head failed: " + ge); }
+    if (req.block_progress && !req.block_progress(bi + 1, _cfg.n_layers)) {
+      return fail("aborted");
+    }
   }
-  return true;
+
+  // A caller asking for fewer blocks than the stack wants the residual
+  // stream, not a noise prediction the head has no business making.
+  if (x_out != nullptr) {
+    x_out->assign(n_tok, 0.0f);
+    const auto* p = (const std::uint16_t*)x.contents();
+    for (std::size_t i = 0; i < n_tok; ++i) { (*x_out)[i] = from_bf16(p[i]); }
+  }
+  if (n_run < _cfg.n_layers) { return true; }
+  const std::string what = fmt("chunk {}", chunk_idx)();
+  report_prof_(st, what.c_str(), n_run);
+  return head_(st, x, seq, noise_out, err);
 }
+
 
 // Drop the oldest window when the cache is over its limit. The reference
 // drops exactly ONE window per chunk, never more, and the count it
@@ -2333,6 +2740,16 @@ MetalFlashVsrTransformer::generate(const Request& req,
                     req.row_frames, want_rf)());
   }
 
+  if (_streaming) { _streaming->slots.begin_forward(); }
+  const bool outer = blocks_outer(_cfg, req.height, req.width, req.frames,
+                                  req.params);
+  if (!begin_clip_(st, th, tw, 6, ring_windows(req.frames,
+                                               req.params.kv_ratio),
+                   outer ? 1 : _cfg.n_layers, req.params, err)) {
+    return false;
+  }
+  if (outer) { return generate_blocks_outer_(req, noise, st, latent, err); }
+
   for (int ci = 0; ci < chunks; ++ci) {
     const int f = (ci == 0) ? 6 : 2;
     const int t_off = (ci == 0) ? 0 : (4 + ci * 2);
@@ -2400,6 +2817,142 @@ MetalFlashVsrTransformer::generate(const Request& req,
     }
     if (req.progress && !req.progress(ci + 1, chunks)) {
       return fail("aborted");
+    }
+  }
+  return true;
+}
+
+// THE BLOCK-OUTER ORDER: every chunk through block 0, then every chunk
+// through block 1, and so on, then the head over each.
+//
+// Exactly the arithmetic of the chunk-outer loop above, reordered. A
+// block's work on a chunk reads two things -- that chunk's residual
+// stream, and the same block's key/value window over the chunks before
+// it -- and both are identical either way round. What changes is what
+// has to stay alive: chunk-outer, each block's window must survive until
+// that block's NEXT chunk, so all thirty are held at once (12.7 GB at
+// 1920x1152); block-outer, a block's window is done with before the next
+// block begins and ONE serves the stack. The price is the residual
+// stream and the RoPE tables of every chunk at once instead of one --
+// ~35 MB a latent frame at 1920x1152, against 425 MB per window.
+bool
+MetalFlashVsrTransformer::generate_blocks_outer_(
+    const Request& req, const std::vector<float>& noise, Stream& st,
+    std::vector<float>* latent, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const int C = _cfg.out_channels, D = _cfg.hidden;
+  const int h8 = req.height / 8, w8 = req.width / 8;
+  const int th = h8 / 2, tw = w8 / 2;
+  const int chunks = (req.frames - 1) / 8 - 2;
+  const int T = latent_frames(req.frames);
+  const std::size_t plane = (std::size_t)h8 * w8;
+  const std::size_t tok_per_frame = (std::size_t)th * tw;
+  auto chunk_f = [](int ci) { return ci == 0 ? 6 : 2; };
+  auto chunk_t = [](int ci) { return ci == 0 ? 0 : 4 + ci * 2; };
+
+  // Every chunk's noise, patchified into the residual stream it starts
+  // from. They are all live from here to the head.
+  std::vector<SharedBuffer> xs((std::size_t)chunks);
+  for (int ci = 0; ci < chunks; ++ci) {
+    const int f = chunk_f(ci), t_first = chunk_t(ci);
+    std::vector<float> slice((std::size_t)C * f * plane, 0.0f);
+    for (int c = 0; c < C; ++c) {
+      for (int t = 0; t < f; ++t) {
+        std::memcpy(slice.data() + ((std::size_t)c * f + t) * plane,
+                    noise.data() + ((std::size_t)c * T + (t_first + t)) * plane,
+                    plane * sizeof(float));
+      }
+    }
+    std::vector<float> tok;
+    if (!patchify_tokens(slice.data(), f, h8, w8, &tok, err)) { return false; }
+    xs[(std::size_t)ci] = _mc->make_shared_buffer(tok.size() * 2);
+    if (xs[(std::size_t)ci].empty()) { return fail("token allocation failed"); }
+    auto* p = (std::uint16_t*)xs[(std::size_t)ci].contents();
+    for (std::size_t i = 0; i < tok.size(); ++i) { p[i] = to_bf16(tok[i]); }
+  }
+
+  // The bar's unit is a BLOCK here -- a step of the stack over the whole
+  // clip -- and its sub-unit a chunk.
+  for (int bi = 0; bi < _cfg.n_layers; ++bi) {
+    // A fresh window for this block: the previous block's is finished.
+    Stream::Cache& cache = st.per_block[0];
+    cache.valid = 0;
+    cache.oldest = 0;
+    // Streaming, the block is read ONCE for the whole clip, and the next
+    // one -- block 0 again after the last, for the next clip -- under
+    // all of this block's chunks.
+    const Block* wb = nullptr;
+    if (!acquire_block_(bi, (bi + 1) % _cfg.n_layers, &wb, err)) {
+      return false;
+    }
+    for (int ci = 0; ci < chunks; ++ci) {
+      const int f = chunk_f(ci), t_first = chunk_t(ci);
+      const std::size_t seq = (std::size_t)f * tok_per_frame;
+      // The int8 split's width for shapes recorded since; no encoder is
+      // open here.
+      if (_i8) { _i8->tune_pending(_mc); }
+      // The source rows enter the residual stream at block 0, and only
+      // there -- so the slice exists for that one pass.
+      SharedBuffer lq;
+      if (bi == 0) {
+        lq = _mc->make_shared_buffer(seq * D * 2);
+        if (lq.empty()) { return fail("source row slice failed"); }
+        std::memcpy(lq.contents(),
+                    (const std::uint8_t*)req.rows +
+                        (std::size_t)t_first * tok_per_frame * D * 2,
+                    seq * D * 2);
+      }
+      if (!block_(st, bi, wb, 0, f, t_first, ci, xs[(std::size_t)ci],
+                  bi == 0 ? &lq : nullptr, req.params, err)) {
+        if (_streaming) { _streaming->slots.join(); }
+        return false;
+      }
+      if (req.block_progress && !req.block_progress(ci + 1, chunks)) {
+        return fail("aborted");
+      }
+    }
+    if (req.progress && !req.progress(bi + 1, _cfg.n_layers)) {
+      return fail("aborted");
+    }
+  }
+  report_prof_(st, "clip", _cfg.n_layers);
+  // The windows and the RoPE tables are done with; the head needs the
+  // residual streams and its own scratch.
+  st.per_block.clear();
+  st.rope.clear();
+
+  for (int ci = 0; ci < chunks; ++ci) {
+    const int f = chunk_f(ci), t_first = chunk_t(ci);
+    const int seq = f * th * tw;
+    SharedBuffer pred;
+    if (!head_(st, xs[(std::size_t)ci], seq, &pred, err)) { return false; }
+    xs[(std::size_t)ci] = SharedBuffer{};
+    std::vector<float> upd((std::size_t)C * f * plane, 0.0f);
+    if (!unpatchify_(pred, f, h8, w8, &upd, err)) { return false; }
+    // A NON-FINITE PREDICTION IS REFUSED, not decoded: the VAE turns it
+    // into a clip of black frames that looks like a finished run.
+    std::size_t bad = 0;
+    for (const float u : upd) {
+      if (!std::isfinite(u)) { ++bad; }
+    }
+    if (bad > 0) {
+      return fail(fmt("chunk {} of {} predicted {} non-finite values of {}; "
+                      "{} query tile(s) were routed to no key block at all",
+                      ci + 1, chunks, bad, upd.size(), _empty_tiles)());
+    }
+    for (int c = 0; c < C; ++c) {
+      for (int t = 0; t < f; ++t) {
+        const std::size_t src = ((std::size_t)c * f + t) * plane;
+        const std::size_t dst = ((std::size_t)c * T + (t_first + t)) * plane;
+        const float* nz = noise.data() + dst;
+        for (std::size_t i = 0; i < plane; ++i) {
+          (*latent)[dst + i] = nz[i] - upd[src + i];
+        }
+      }
     }
   }
   return true;
@@ -2624,6 +3177,13 @@ MetalFlashVsrTransformer::resident_bytes() const noexcept
     add(b.mod);
   }
   add(_t_vec); add(_t_mod); add(_head_mod);
+  // Streaming, the blocks above hold only what the load folded; the
+  // weights live in the slot pair, which a holding must count.
+  if (_streaming && _streaming->slots.on()) {
+    n += (std::uint64_t)_streaming->slots.last_bytes() *
+         (_streaming->slots.paired() ? 2u : 1u);
+    n += _streaming->scratch.size();
+  }
   return n;
 }
 

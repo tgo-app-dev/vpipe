@@ -112,6 +112,18 @@ class MetalFlashVsrTransformer {
     bool         i8_gemm = false;
     sage::Config sage;
 
+    // ---- residency: decided at load, by the box ----------------------
+    //
+    // STREAM THE BLOCKS: keep only what the load FOLDS (each block's
+    // modulation and cross-attention key/value, ~95 MB for the stack)
+    // and read every block's weights from the checkpoint when it runs,
+    // into two reused slots with the next block's read under the current
+    // block's GPU work. Block-outer, a block runs once per CLIP, so each
+    // is read once per clip. 2.84 GB of bf16 weights become ~0.3 GB. The
+    // checkpoint is F32, so a read lands in a scratch and is narrowed
+    // into its slot. VPIPE_FVSR_NO_SLOTS is the per-block-allocation A/B.
+    bool stream_blocks = false;
+
     // The 3-axis RoPE split, derived as Wan derives it: h = w =
     // 2*(head_dim/6), t takes the remainder. 44/42/42 at 128.
     int rope_h() const { return 2 * (head_dim / 6); }
@@ -232,19 +244,46 @@ class MetalFlashVsrTransformer {
   // retained plus the one being attended, and never fewer than the three
   // the OPENING chunk writes before anything is trimmed.
   static int kv_windows(double kv_ratio);
+  // ...for a clip of `frames`: a clip of ONE chunk never holds more than
+  // that chunk's three windows, whatever the ratio.
+  static int ring_windows(int frames, double kv_ratio);
 
-  // What one clip's key/value window ALLOCATES at this geometry: a K and
-  // a V per block over kv_windows() capacity. The largest term a denoise
-  // holds above ~512 px -- 9.6 GB at 1920x1152 and kv_ratio 2.
+  // THE ORDER generate() runs the stack in, and the one memory decision
+  // in this class. Chunk-outer (every block of a chunk, then the next
+  // chunk) holds a key/value window PER BLOCK for the whole clip;
+  // block-outer (every chunk of a block, then the next block) holds ONE,
+  // and the residual stream and RoPE tables of every chunk instead. The
+  // two compute the same function bit for bit. Block-outer is taken
+  // whenever it holds less -- at 1920x1152, for any clip under ~1400
+  // frames -- and VPIPE_FVSR_CHUNK_OUTER=1 forces the other (A/B).
+  static bool blocks_outer(const Config& cfg, int height, int width,
+                           int frames, const Params& params);
+
+  // ONE block's key/value window at this geometry: a K and a V over
+  // `windows` temporal windows, bf16. 425 MB at 1920x1152 and 4 windows.
+  static std::uint64_t kv_ring_bytes(const Config& cfg, int height,
+                                     int width, int windows);
+
+  // What one clip's key/value windows ALLOCATE: one ring, or one per
+  // block, as blocks_outer() decides. Was the largest term a denoise
+  // holds above ~512 px -- 12.7 GB at 1920x1152 and kv_ratio 3, chunk-
+  // outer -- and is 425 MB block-outer.
   static std::uint64_t kv_window_bytes(const Config& cfg, int height,
-                                       int width, double kv_ratio);
+                                       int width, int frames,
+                                       const Params& params);
+
+  // What a STREAMING load holds of the weights (Config::stream_blocks):
+  // what the load folds, the slot pair and the narrowing scratch. ~0.3 GB
+  // for the 1.3B, against 2.84 GB resident.
+  static std::uint64_t streaming_floor_bytes(const Config& cfg);
 
   // Everything a generate() of this geometry allocates beyond the
-  // weights: the window above, the opening chunk's activation scratch
-  // (the largest chunk: three windows), the routing and span buffers, and
-  // the clip's noise and latent. For the memory plan, so it is sized for
-  // the ALU entry's finer span list, which is the larger of the two; the
-  // opt-in int8 and Sage scratches are not in it.
+  // weights: the windows above, the opening chunk's activation scratch
+  // (the largest chunk: three windows), the routing and span buffers, the
+  // residual streams and RoPE tables the order keeps, and the clip's
+  // noise and latent. For the memory plan, so it is sized for the ALU
+  // entry's finer span list, which is the larger of the two; the opt-in
+  // int8 and Sage scratches are not in it.
   static std::uint64_t denoise_scratch_bytes(const Config& cfg, int height,
                                              int width, int frames,
                                              const Params& params);
@@ -260,6 +299,10 @@ class MetalFlashVsrTransformer {
   bool uses_attn_nax() const noexcept { return _use_attn_nax; }
   bool uses_i8_gemm() const noexcept;
   bool uses_sage() const noexcept;
+  // Whether this load streams its blocks (Config::stream_blocks), and
+  // how many block reads the last generate() found already prefetched.
+  bool streams_blocks() const noexcept;
+  int prefetch_hits() const noexcept;
   std::string accel_summary() const;
 
   // Test-only views of what the load FOLDED. They exist because these
@@ -303,6 +346,7 @@ class MetalFlashVsrTransformer {
 
   struct Block;
   struct Stream;   // the per-block KV window, live for one generate()
+  struct Streaming;   // the slot pair a streaming load reads blocks into
 
   bool fold_constants_(WeightSet& w, std::string* err);
   // The three-axis RoPE tables for one chunk, built in WINDOW-PERMUTED
@@ -335,6 +379,7 @@ class MetalFlashVsrTransformer {
   std::shared_ptr<WeightSet>   _ctx_ws;    // == _ws when converted
   std::string                  _ctx_name = "posi_context";
   std::vector<Block>           _blocks;
+  std::unique_ptr<Streaming>   _streaming;   // set when stream_blocks
 
   // ---- folded at load, because the timestep and the context are both
   // constants of this checkpoint. See the class comment.
@@ -362,6 +407,34 @@ class MetalFlashVsrTransformer {
  private:
   void build_spans_(metal_compute::ComputeEncoder& enc, Stream& st, int Nq,
                     int Nk, int sq, int NQ, int bq);
+  // Size the clip's state: `n_caches` key/value windows of `cap_windows`
+  // each, and every per-chunk buffer for the largest chunk, `f_max`
+  // latent frames.
+  bool begin_clip_(Stream& st, int h, int w, int f_max, int cap_windows,
+                   int n_caches, const Params& prm, std::string* err);
+  // The RoPE tables of a chunk, in `st.rope[slot]`, rebuilt only when the
+  // slot held another chunk's.
+  bool rope_(Stream& st, int slot, int f, int t_off);
+  // Block `bi` over one chunk's residual stream, in place, against key/
+  // value window `cache_idx`. The unit both orders are built from.
+  // `wb` is the block's WEIGHTS -- a slot when streaming, null for the
+  // resident block; what the load folded is always read from _blocks.
+  bool block_(Stream& st, int bi, const Block* wb, int cache_idx, int f,
+              int t_off, int rope_slot, metal_compute::SharedBuffer& x,
+              const metal_compute::SharedBuffer* lq, const Params& prm,
+              std::string* err);
+  // The weights block `bi` runs on: null when resident, a slot when
+  // streaming -- with block `next` read ahead into the other slot.
+  bool acquire_block_(int bi, int next, const Block** out,
+                      std::string* err);
+  void configure_streaming_();
+  bool head_(Stream& st, const metal_compute::SharedBuffer& x, int seq,
+             metal_compute::SharedBuffer* noise_out, std::string* err);
+  void report_prof_(Stream& st, const char* what, int n_blocks);
+  // The block-outer clip loop; see blocks_outer().
+  bool generate_blocks_outer_(const Request& req,
+                              const std::vector<float>& noise, Stream& st,
+                              std::vector<float>* latent, std::string* err);
   bool ensure_kernels_(std::string* err);
 
   // ---- matrix cores and the two opt-in tiers, decided at load --------
@@ -395,6 +468,9 @@ class MetalFlashVsrTransformer {
   // context) alternate -- so a shared object would reallocate its int8
   // operands twice per block, sixty times a chunk.
   std::unique_ptr<MetalSageAttention> _sage, _sage_x;
+  // ...and the same two for the OPENING chunk's shape, which block-outer
+  // runs inside every block beside the steady one.
+  std::unique_ptr<MetalSageAttention> _sage_open, _sage_x_open;
 
   struct FwdCtxFwd;   // unused placeholder; see the .cc's FwdCtx
   void gemm_(metal_compute::ComputeEncoder& enc,
@@ -424,7 +500,8 @@ class MetalFlashVsrTransformer {
                      const metal_compute::SharedBuffer& src,
                      const metal_compute::SharedBuffer& dst, int NH, int seq,
                      int HD, std::size_t cap_tok, int held);
-  // One chunk through the whole stack, then the head.
+  // One chunk through the whole stack, then the head: the chunk-outer
+  // order, and the test seams' path.
   bool forward_chunk_(Stream& st, int f, int h, int w, int t_off,
                       int chunk_idx,
                       const metal_compute::SharedBuffer& x_in,

@@ -87,6 +87,23 @@ class FlashVsrLqProj {
 
   ~FlashVsrLqProj();
 
+  // FOR THE MEMORY PLAN, from the checkpoint's header alone (no load).
+  //
+  // What the projection's weights hold, bf16: the tensors under `prefix`
+  // in the set at `source` -- which, in a converted directory, is the
+  // denoiser's own set, so its file size would be the wrong answer.
+  static std::size_t weight_bytes(const std::string& source,
+                                  const std::string& prefix);
+  // What projecting one clip of `frames` source frames at height x width
+  // holds beyond the weights: the im2col band, a call's activations (four
+  // source frames in, the reference's cadence), both convolutions'
+  // carries, and the clip's rows -- kept until the beat is assembled, and
+  // then copied into it. 741 MB at 1920x1152 x 25 against 748 MB of live
+  // buffers measured.
+  static std::size_t working_bytes(const std::string& source,
+                                   const std::string& prefix, int height,
+                                   int width, int frames);
+
   const Config& config() const noexcept { return _cfg; }
 
   // Drop the carries and return to the opening state. MUST be called

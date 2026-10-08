@@ -360,6 +360,13 @@ TEST(flashvsr_vae, tiled_tail_is_exact_and_smaller)
     for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)nd(rng); }
   }
 
+  // A fixed band, so what is measured is the decode and not the im2col
+  // scratch a box without the hardware conv sizes from its free memory
+  // (it shrank with the tiles and hid that tiling saved nothing).
+  const int band_rows = 16;
+  const std::size_t band_bytes = (std::size_t)band_rows * 27 *
+                                 cfg.base_dim * cfg.dim_mult[1] * 2;
+  ::setenv("VPIPE_WAN_VAE_BAND_ROWS", std::to_string(band_rows).c_str(), 1);
   const std::size_t hw = (std::size_t)g * 8 * g * 8;
   struct Arm {
     std::vector<std::uint16_t> px;
@@ -401,9 +408,85 @@ TEST(flashvsr_vae, tiled_tail_is_exact_and_smaller)
 
   const Arm whole = run(nullptr);
   const Arm tiled = run("2x2");
+  const Arm tiled3 = run("3x3");
+  // DEEP grids -- below the mid block, on the latent plane -- where the
+  // plane is wide enough for a tile past its 16-pixel halo: 2x2 from
+  // 512x512, 4x4 from 1024x1024. Skipped, and said so, below that.
+  struct Deep { const char* grid; int n; Arm a; bool ran = false; };
+  std::vector<Deep> deep = {{"d2x2", 2, {}}, {"d4x4", 4, {}}};
+  for (Deep& dd : deep) {
+    const auto tt = m->tail_tiles_for(g, g, dd.n, dd.n, /*deep=*/true);
+    if (tt.ty <= 1 && tt.tx <= 1) {
+      std::printf("  %s: no deep %dx%d grid at %dx%d (tiles under the "
+                  "halo)\n", dd.grid, dd.n, dd.n, g * 8, g * 8);
+      continue;
+    }
+    dd.a = run(dd.grid);
+    dd.ran = true;
+  }
+  // THE RE-CUT. Each tile runs the whole clip on its own, so a tile that
+  // no longer fits what is free when its turn comes is split then and
+  // there. Driven by telling the tiles there is only what a deep 2x2
+  // decode needs in all -- of which a tile may take tile_share_() -- so
+  // they must be cut finer, hold less, and stay exact.
+  Arm recut;
+  bool recut_ran = false;
+  const auto t22 = m->tail_tiles_for(g, g, 2, 2, /*deep=*/true);
+  if (t22.ty > 1 || t22.tx > 1) {
+    const std::size_t est22 =
+        MetalWanVae::decode_peak_bytes(cfg, g, g, true, t22.frac, T, true);
+    ::setenv("VPIPE_WAN_VAE_TILE_ROOM_MB",
+             std::to_string(est22 >> 20).c_str(), 1);
+    recut = run("d2x2");
+    recut_ran = true;
+  }
+  // THE BAND PLANNER, the same squeeze: the tiles are laid out a band at a
+  // time from what the hook says is free, rather than from a forced grid.
+  Arm planned;
+  bool planned_ran = false;
+  if (recut_ran) {
+    planned = run("d");
+    planned_ran = true;
+  }
+  ::unsetenv("VPIPE_WAN_VAE_TILE_ROOM_MB");
   ::unsetenv("VPIPE_WAN_VAE_TILE");
-  ASSERT_TRUE(whole.ok && tiled.ok);
-  if (!whole.ok || !tiled.ok) { return; }
+  ::unsetenv("VPIPE_WAN_VAE_BAND_ROWS");
+  ASSERT_TRUE(whole.ok && tiled.ok && tiled3.ok);
+  if (!whole.ok || !tiled.ok || !tiled3.ok) { return; }
+  if (planned_ran) {
+    ASSERT_TRUE(planned.ok);
+    if (planned.ok) {
+      EXPECT_TRUE(std::memcmp(whole.px.data(), planned.px.data(),
+                              whole.px.size() * 2) == 0);
+      std::printf("  %dx%d planned deep bands under the same squeeze: "
+                  "%.1f MB\n", g * 8, g * 8,
+                  (double)planned.peak / 1048576.0);
+      EXPECT_TRUE(planned.peak < whole.peak);
+    }
+  }
+  if (recut_ran) {
+    ASSERT_TRUE(recut.ok);
+    if (recut.ok) {
+      EXPECT_TRUE(std::memcmp(whole.px.data(), recut.px.data(),
+                              whole.px.size() * 2) == 0);
+      const Arm* d22 = nullptr;
+      for (const Deep& dd : deep) {
+        if (dd.ran && dd.n == 2) { d22 = &dd.a; }
+      }
+      if (d22 != nullptr) {
+        std::printf("  %dx%d d2x2 re-cut to fit its own figure, shared: "
+                    "%.1f MB against %.1f MB uncut\n", g * 8, g * 8,
+                    (double)recut.peak / 1048576.0,
+                    (double)d22->peak / 1048576.0);
+        EXPECT_TRUE(recut.peak < d22->peak);
+      }
+    }
+  }
+  for (const Deep& dd : deep) {
+    if (!dd.ran) { continue; }
+    ASSERT_TRUE(dd.a.ok);
+    if (!dd.a.ok) { return; }
+  }
 
   const bool exact = std::memcmp(whole.px.data(), tiled.px.data(),
                                  whole.px.size() * 2) == 0;
@@ -421,11 +504,79 @@ TEST(flashvsr_vae, tiled_tail_is_exact_and_smaller)
                 diff, whole.px.size(), first);
   }
   EXPECT_TRUE(exact);
-  std::printf("  %dx%d: whole %.1f MB, 2x2 tiled %.1f MB\n", g * 8, g * 8,
-              (double)whole.peak / 1048576.0,
-              (double)tiled.peak / 1048576.0);
-  // The point of the exercise: a tile holds less than the whole plane.
+  EXPECT_TRUE(std::memcmp(whole.px.data(), tiled3.px.data(),
+                          whole.px.size() * 2) == 0);
+  // THE POINT OF THE EXERCISE, and what the first tiling missed: a tiled
+  // decode HOLDS less -- each tile runs the clip with only its carries --
+  // and holds no more than the figure its chooser was told. That tiling
+  // kept every tile's carries for the clip and measured 2x2 at 98% of
+  // whole on the M5 while its estimate said 47%.
+  struct Row { const char* name; const Arm* a; int ty; bool deep; };
+  std::vector<Row> rows = {{"whole", &whole, 1, false},
+                           {"2x2", &tiled, 2, false},
+                           {"3x3", &tiled3, 3, false}};
+  for (const Deep& dd : deep) {
+    if (!dd.ran) { continue; }
+    // The deep pixels are the untiled ones too: every layer below the mid
+    // attention is local, so a 16-latent-pixel halo carries all of it.
+    const bool dsame = std::memcmp(whole.px.data(), dd.a.px.data(),
+                                   whole.px.size() * 2) == 0;
+    EXPECT_TRUE(dsame);
+    if (!dsame) {
+      // WHERE it differs says what leaked: a halo one short is a seam at
+      // the tile borders; a different kernel is noise everywhere.
+      const int W8 = g * 8;
+      std::size_t diff = 0;
+      double maxd = 0.0;
+      std::vector<std::size_t> per_row((std::size_t)W8, 0),
+          per_col((std::size_t)W8, 0), per_frame((std::size_t)F, 0);
+      for (std::size_t i = 0; i < whole.px.size(); ++i) {
+        if (whole.px[i] == dd.a.px[i]) { continue; }
+        ++diff;
+        const double a = (double)static_cast<_Float16>(0);
+        (void)a;
+        _Float16 x, y;
+        std::memcpy(&x, &whole.px[i], 2);
+        std::memcpy(&y, &dd.a.px[i], 2);
+        maxd = std::max(maxd, std::fabs((double)x - (double)y));
+        const std::size_t p = i % hw;
+        per_row[p / W8]++;
+        per_col[p % W8]++;
+        per_frame[(i / hw) % F]++;
+      }
+      std::printf("  %s differs in %zu of %zu samples, max |d| %.4g\n",
+                  dd.grid, diff, whole.px.size(), maxd);
+      std::printf("   rows:");
+      for (int y = 0; y < W8; y += 8) {
+        std::size_t c = 0;
+        for (int k = 0; k < 8; ++k) { c += per_row[(std::size_t)(y + k)]; }
+        std::printf(" %zu", c);
+      }
+      std::printf("\n   frames:");
+      for (int f = 0; f < F; ++f) { std::printf(" %zu", per_frame[f]); }
+      std::printf("\n");
+    }
+    rows.push_back({dd.grid, &dd.a, dd.n, true});
+  }
+  for (const Row& r : rows) {
+    const double frac =
+        r.ty > 1 ? m->tail_tiles_for(g, g, r.ty, r.ty, r.deep).frac : 1.0;
+    const std::size_t used =
+        r.a->peak > band_bytes ? r.a->peak - band_bytes : 0;
+    const std::size_t est =
+        MetalWanVae::decode_peak_bytes(cfg, g, g, true, frac, T, r.deep);
+    const double ratio = used > 0 ? (double)est / (double)used : 0.0;
+    std::printf("  %dx%d %s: measured %.1f MB (+%.1f MB band), estimate "
+                "%.1f MB (x%.2f)\n", g * 8, g * 8, r.name,
+                (double)used / 1048576.0, (double)band_bytes / 1048576.0,
+                (double)est / 1048576.0, ratio);
+    EXPECT_TRUE(est >= used);
+    EXPECT_TRUE(ratio < 1.15);
+  }
+  // Finer is never larger -- and past ~3x3 not smaller either: the head,
+  // which runs the whole plane, is then what the decode peaks at.
   EXPECT_TRUE(tiled.peak < whole.peak);
+  EXPECT_TRUE(tiled3.peak <= tiled.peak);
 }
 
 // A DECODE BENCH, not a check. VPIPE_WAN_VAE_BENCH="h8,w8,T" decodes a
