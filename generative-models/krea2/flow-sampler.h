@@ -76,15 +76,20 @@ struct FlowSchedulerSpec {
   bool        dynamic_shift  = false;
   double      base_shift     = 0.5;
   double      max_shift      = 0.9;
+  // Stretches the shifted schedule so its last nonzero sigma lands on
+  // it -- with dynamic_shift or without, as diffusers applies it.
   double      shift_terminal = 0.0;         // 0 = no terminal stretch
   int         base_seq       = 256;
   int         max_seq        = 8192;
   int         num_train      = 1000;        // num_train_timesteps
-  // dynamic_shift only: the RAW base sigmas -- the diffusers pipeline's
-  // `sigmas=` argument -- in place of linspace(1, 1/steps, steps), each
-  // then time-shifted and terminal-stretched as that grid is. Their
-  // number IS the step count, and `steps` must equal it. Empty = the
-  // default grid. What a few-step adapter ships its schedule as.
+  // The RAW base sigmas -- the diffusers pipeline's `sigmas=` argument
+  // -- in place of the base grid, each then time-shifted and
+  // terminal-stretched as that grid is: by the per-image mu when
+  // dynamic_shift, else by the static `shift` (shift_type "linear" is
+  // diffusers' static s' = shift*s / (1 + (shift-1)*s), so shift 1 uses
+  // them as written). Their number IS the step count, and `steps` must
+  // equal it. Empty = the default grid. What a few-step adapter or a
+  // distilled checkpoint ships its schedule as.
   std::vector<double> base_sigmas;
   // Per-image RUNTIME binding (packed grid_h*grid_w) -- NOT a config
   // choice: excluded from operator== and (de)serialization. The caller

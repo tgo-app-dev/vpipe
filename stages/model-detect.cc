@@ -2,8 +2,10 @@
 
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/detect-profile.h"
+#include "generative-models/image-model-registry.h"
+#include "generative-models/vae-model-registry.h"
+#include "generative-models/video-model-registry.h"
 
-#include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 
@@ -472,7 +474,6 @@ dit_component_tag_(const std::string& cls)
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
   if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21-dit"; }
   if (cls == "ZImageTransformer2DModel")     { return "z-image-dit"; }
-  if (cls == "MageFlow")                     { return "mage-flow-dit"; }
   if (cls == "BooguImageTransformer2DModel") { return "boogu-image-dit"; }
   // Either Wan expert on its own (a quantized transformer/ or
   // transformer_2/ output) is one DiT component; which noise band it
@@ -484,6 +485,11 @@ dit_component_tag_(const std::string& cls)
   // The same DiT in the diffusers naming (minimax-h3-diffusers-layout.h),
   // which the H3 loader reads as it is.
   if (cls == "MiniMaxH3Transformer3DModel")  { return "minimax-h3-dit"; }
+  // Last: a REGISTERED family's DiT, named after the model type its
+  // detect profile reports for the class -- asked after every built-in
+  // name, so a plugin cannot take a class this tree owns.
+  const std::string mt = genai::detect::model_type_for_class(cls, false);
+  if (!mt.empty()) { return mt + "-dit"; }
   return {};
 }
 
@@ -805,6 +811,31 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     }
   }
 
+  // ---- 2'. a checkpoint a REGISTERED FAMILY claims --------------------
+  // A plugin family's `claims()` is the structural test its own loader
+  // runs, which is a better identity than any class-name table: a
+  // detect profile can only match on `_class_name`, and a generic one
+  // ("DiffusionTransformer") would label every checkpoint that shares
+  // it. The registries are asked after the built-in tags, so a family
+  // can never relabel a checkpoint the host already knows. The family's
+  // detect profile, keyed by its tag, then supplies the labels and the
+  // modalities below.
+  if (d.model_type.empty() && d.is_dir) {
+    if (genai::ImageModelFamily* f =
+            genai::ImageModelRegistry::get().claim_for(nullptr, dir, "")) {
+      d.model_type  = std::string(f->tag());
+      d.detected_by = "family-claims";
+    } else if (genai::VideoModelFamily* v =
+                   genai::VideoModelRegistry::get().claim_for(nullptr, dir,
+                                                              "")) {
+      d.model_type  = std::string(v->tag());
+      d.detected_by = "family-claims";
+    }
+    if (!d.model_type.empty()) {
+      catalog_default_io(d.model_type, d.inputs, d.outputs);
+    }
+  }
+
   // ---- 2a. a Krea-2 DiT in Krea's own single-file layout --------------
   // What community fine-tunes ship: the DiT alone, one .safetensors in the
   // reference naming (usually FP8), with no config and no metadata -- the
@@ -1056,19 +1087,23 @@ resolve_vae_dir(const std::string& root)
       return vae.string();
     }
   }
-  // Mage-Flow's Comfy-Org repack: the MageVAE as ONE freely-named file
-  // under `vae/`, with no config anywhere -- the repack drops it and the
-  // original repositories that carry it are gated. Returned by FILE, as
-  // FlashVSR's is, so the decode opens the VAE and not the repository
-  // (a 290 MB VAE had been claimed at the repository's 18 GB), and the
-  // family comes from its tensors (vae_family_). Only a file the
-  // MageVAE probe recognises: another family's single-file `vae/` keeps
-  // resolving as it did.
+  // A repack keeping its VAE as ONE freely-named file under `vae/`, with
+  // no config anywhere, whose REGISTERED family names that file as its
+  // weights. Returned by FILE, as FlashVSR's is, so the decode opens the
+  // VAE and not the repository (a 290 MB VAE had been claimed at a
+  // repository's 18 GB). Only that exact case: every other `vae/` --
+  // another family's single file, or several files a family picks
+  // between through its own vae_path() -- keeps resolving as it did.
   {
     const std::string v = (fs::path(root) / "vae").string();
     const std::string only = resolve_vae_weights_path(v);
-    if (only != v && genai::MetalMageVae::is_native_checkpoint(only)) {
-      return only;
+    if (only != v) {
+      if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+              nullptr, root, v, "")) {
+        if (f->vae_path(root, genai::VaeModelFamily::kRoleVideo) == only) {
+          return only;
+        }
+      }
     }
   }
   return root;

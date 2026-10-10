@@ -2,8 +2,9 @@
 // BOTH element types against a double-precision CPU oracle.
 //
 // The tower gained a bf16 storage mode so it can reproduce a reference that
-// runs bf16 (Mage-Flow casts its whole text encoder). That mode is a second
-// compile of the same source with -DVPIPE_ELT=bfloat, and a silently-wrong
+// runs bf16 (a pipeline that casts its whole text encoder). That mode is a
+// second compile of the same source with -DVPIPE_ELT=bfloat, and a
+// silently-wrong
 // twin is exactly the kind of thing that shows up only as a slightly-off
 // end-to-end number -- so pin the kernels themselves here, where a failure
 // says WHICH kernel rather than "the tower drifted".

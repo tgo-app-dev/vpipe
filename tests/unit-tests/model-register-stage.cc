@@ -14,6 +14,7 @@
 #include "pipeline/stage-registry.h"
 #include "stages/model-catalog.h"
 #include "stages/model-detect.h"
+#include "generative-models/image-model-registry.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "stages/model-register-stage.h"
 #include "stages/model-registry.h"
@@ -21,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <streambuf>
 #include <cstdio>
@@ -1050,4 +1052,59 @@ TEST(model_register_stage, every_pinned_catalogue_entry_detects_as_itself)
   // everything, not against the catalogue growing.
   EXPECT_TRUE(checked >= 40);
   EXPECT_TRUE(wrong == 0);
+}
+
+// A REGISTERED IMAGE FAMILY'S CLAIM IS AN IDENTITY.
+//
+// A detect profile matches on the transformer's `_class_name` alone, so
+// a family with a generic one ("DiffusionTransformer") could not be
+// recognised safely through it: listing the name would label every
+// checkpoint that shares it. detect_model_dir now asks the family
+// registries after the built-in tags, with the structural test the
+// family's own loader runs -- so a directory the family claims is
+// detected as the family's tag, and a lookalike it does not claim stays
+// unknown.
+namespace {
+
+class ClaimingImageFamily final : public genai::ImageModelFamily {
+public:
+  ClaimingImageFamily(string tag, string root)
+      : _tag(std::move(tag)), _root(std::move(root)) {}
+  string_view tag() const noexcept override { return _tag; }
+  bool claims(const string& root, const string&) const override
+  {
+    return root == _root;
+  }
+  unique_ptr<genai::ImageGenerator>
+  load(const genai::ImageModelCreateArgs&) override
+  {
+    return nullptr;
+  }
+
+private:
+  string _tag, _root;
+};
+
+}  // namespace
+
+TEST(model_register, a_registered_family_claim_is_detected)
+{
+  TempDir td;
+  const filesystem::path mine = filesystem::path(td.path) / "acme" / "Mine";
+  const filesystem::path other = filesystem::path(td.path) / "acme" / "Other";
+  // Same generic class name on both; only the family's claim tells them
+  // apart.
+  const string cfg = R"({"_class_name": "DiffusionTransformer"})";
+  write_file_(mine, "transformer/config.json", cfg);
+  write_file_(other, "transformer/config.json", cfg);
+  static int n = 0;
+  const string tag = "test-detect-family-" + std::to_string(++n);
+  ASSERT_TRUE(genai::ImageModelRegistry::get().add(
+      std::make_unique<ClaimingImageFamily>(tag, mine.string())));
+
+  const DetectedModel a = detect_model_dir(mine.string(), "");
+  EXPECT_TRUE(a.model_type == tag);
+  EXPECT_TRUE(a.detected_by == "family-claims");
+  const DetectedModel b = detect_model_dir(other.string(), "");
+  EXPECT_TRUE(b.model_type.empty());
 }

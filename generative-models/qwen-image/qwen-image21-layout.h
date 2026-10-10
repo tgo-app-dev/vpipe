@@ -122,8 +122,7 @@ bool build_layout(const std::vector<std::uint8_t>& slot,
 // Here for the same reason the layout is: it is a FACT about the model
 // that needs no checkpoint to state and no GPU to check, and getting it
 // wrong is silent. Qwen-Image-2.1's system prompt is its own -- neither
-// "Describe the image by detailing..." (Krea-2, Mage-Flow,
-// Qwen-Image-2512) nor "Describe the key features of the input image"
+// "Describe the image by detailing..." (Krea-2, Qwen-Image-2512) nor "Describe the key features of the input image"
 // (Qwen-Image-Edit, Boogu) -- and a model conditioned on the wrong one
 // loads, runs and produces a picture.
 //

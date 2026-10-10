@@ -1810,17 +1810,17 @@ const STRINGS = {
       '提示词（外加可选的参考图像）-> 扩散 DiT 所需的条件嵌入。本阶段拥有分'
       + '词器 + 文本编码器 +（对能看图的模型）Qwen2.5-VL 视觉塔。它是 '
       + 'generate-image 拆分出来的编码器一半；请与同一个 hf_dir 上的 '
-      + 'generate-image 阶段配对使用。在 Mage-Flow 系列模型上，每条提示词（'
-      + '编辑任务还包括源图像）都会先经过模型自带的内容政策分类器筛查——这是'
-      + '强制的，没有配置项；被拒绝的提示词会得到一张空白图像而不是生成结果'
-      + '。',
+      + 'generate-image 阶段配对使用。若某模型族的检查点在文本编码器上带有'
+      + '内容政策分类器，则每条提示词（编辑任务还包括源图像）都会先经它筛查'
+      + '——这是强制的，没有配置项；被拒绝的提示词会得到一张空白图像而不是'
+      + '生成结果。',
       '提示詞（外加可選的參考影像）-> 擴散 DiT 所需的條件嵌入。本階段擁有斷'
       + '詞器 + 文字編碼器 +（對能看圖的模型）Qwen2.5-VL 視覺塔。它是 '
       + 'generate-image 拆分出來的編碼器一半；請與同一個 hf_dir 上的 '
-      + 'generate-image 階段配對使用。在 Mage-Flow 系列模型上，每條提示詞（'
-      + '編輯任務還包括來源影像）都會先經過模型自帶的內容政策分類器篩查——這'
-      + '是強制的，沒有設定項；被拒絕的提示詞會得到一張空白影像而不是生成結'
-      + '果。'],
+      + 'generate-image 階段配對使用。若某模型族的檢查點在文字編碼器上帶有'
+      + '內容政策分類器，則每條提示詞（編輯任務還包括來源影像）都會先經它篩'
+      + '查——這是強制的，沒有設定項；被拒絕的提示詞會得到一張空白影像而不'
+      + '是生成結果。'],
   'cfg.diffusion-conditioner.hf_dir': ['',
       '模型目录（text_encoder/、transformer/、tokenizer/）；由 transformer '
       + '的 _class_name 决定模型族与编码器。可选：model 输入端口上的 '
@@ -1899,25 +1899,25 @@ const STRINGS = {
       + '其精度）。能看圖的模型族（Qwen-Image-Edit）會把它送進 Qwen2.5-VL 視'
       + '覺塔；其餘模型族會忽略它。'],
   'port.diffusion-conditioner.ref_image2': ['',
-      '可选的第二张参考图像（格式相同）。Qwen-Image-Edit-2511 支持多参考，'
-      + 'Mage-Flow-Edit 的模板也是按参考逐段展开的，因此在这些模型族上视觉'
+      '可选的第二张参考图像（格式相同）。在支持多参考的模型族（'
+      + 'Qwen-Image-Edit-2511）上，或模板按参考逐段展开的模型族上，视觉'
       + '语言模型必须看到两张图（DiT 的 ref_latent1 只携带第二张的空间细节'
       + '）。每个参考各有自己的视觉块、mROPE 频带和 deepstack 运行。Krea-2 '
       + '的设计只支持单参考，会忽略它。',
-      '可選的第二張參考影像（格式相同）。Qwen-Image-Edit-2511 支援多參考，'
-      + 'Mage-Flow-Edit 的範本也是按參考逐段展開的，因此在這些模型族上視覺'
+      '可選的第二張參考影像（格式相同）。在支援多參考的模型族（'
+      + 'Qwen-Image-Edit-2511）上，或範本按參考逐段展開的模型族上，視覺'
       + '語言模型必須看到兩張圖（DiT 的 ref_latent1 只攜帶第二張的空間細節'
       + '）。每個參考各有自己的視覺區塊、mROPE 頻帶和 deepstack 執行。'
       + 'Krea-2 的設計只支援單參考，會忽略它。'],
   'port.diffusion-conditioner.model_config': ['',
       '可选的模型专属参数，来自常驻模型族自己的配置源（krea2-model-config、'
-      + 'mage-flow-model-config、boogu-image-model-config、'
-      + 'qwen-image-edit-model-config）。目前指的是参考图像如何为接地编码做'
+      + 'boogu-image-model-config、qwen-image-edit-model-config，或树外模型'
+      + '族自己的配置源）。目前指的是参考图像如何为接地编码做'
       + '准备：各模型族的参考管道对它的限制各不相同，数值之间不可互换。未接'
       + '时按该模型族自己的数值执行',
       '可選的模型專屬參數，來自常駐模型族自己的組態來源（krea2-model-config'
-      + '、mage-flow-model-config、boogu-image-model-config、'
-      + 'qwen-image-edit-model-config）。目前指的是參考影像如何為接地編碼做'
+      + '、boogu-image-model-config、qwen-image-edit-model-config，或樹外模'
+      + '型族自己的組態來源）。目前指的是參考影像如何為接地編碼做'
       + '準備：各模型族的參考管道對它的限制各不相同，數值之間不可互換。未接'
       + '時按該模型族自己的數值執行'],
   'port.diffusion-conditioner.ref_images': ['',
@@ -1934,10 +1934,12 @@ const STRINGS = {
   'port.diffusion-conditioner.conditioning': ['',
       '供 generate-image DiT 使用的条件张量（形状与类型随模型族而定：krea2 '
       + 'f16 [n,12,2560]；flux2 f16 [n,3*enc_hidden]；qwen-image-edit 看图'
-      + '模式 bf16 [n_real,3584]；mage-flow 看图模式 bf16 [n_real,2560]）',
+      + '模式 bf16 [n_real,3584]；经条件配置文件接入的模型族，按该配置文件'
+      + '决定的形状）',
       '供 generate-image DiT 使用的條件張量（形狀與型別隨模型族而定：krea2 '
       + 'f16 [n,12,2560]；flux2 f16 [n,3*enc_hidden]；qwen-image-edit 看圖'
-      + '模式 bf16 [n_real,3584]；mage-flow 看圖模式 bf16 [n_real,2560]）'],
+      + '模式 bf16 [n_real,3584]；經條件設定檔接入的模型族，按該設定檔決定'
+      + '的形狀）'],
   'port.diffusion-conditioner.neg_conditioning': ['',
       '负向提示词的条件（形状/类型相同）；仅在接了负向提示词时才发出',
       '負向提示詞的條件（形狀/型別相同）；僅在接了負向提示詞時才發出'],
@@ -2803,16 +2805,16 @@ const STRINGS = {
       + '第二個參考（RoPE 位置不同）；Krea-2 會忽略它'],
   'port.generate-image.model_config': ['',
       '可选的模型专属参数，来自常驻模型族自己的配置源——flux2-model-config（'
-      + 'klein-kv 配方及其 `lora`）、krea2-model-config（它的 `lora`），或 '
-      + 'mage-flow-model-config（来源水印）。这些参数原样传给该族自己的参数'
+      + 'klein-kv 配方及其 `lora`），或 krea2-model-config（它的 `lora`）。'
+      + '树外模型族自己的配置源也接在这里。这些参数原样传给该族自己的参数'
       + '结构，本阶段不解读，因此这里不设任何该类旋钮。接上它会把 DiT 的加'
       + '载推迟到第一个节拍，因为像 klein_kv 这样的配方——或者决定各 block '
       + '如何构建的适配器——必须在读取权重之前就确定。适配器相关的键只在这里'
       + '读取，别无他处：只接到 diffusion-conditioner 的 krea2-model-config'
       + ' 会送达它的 `vl_*` 各键，而它的 `lora` 则悄无声息地无处生效',
       '可選的模型專屬參數，來自常駐模型族自己的組態來源——flux2-model-config'
-      + '（klein-kv 配方及其 `lora`）、krea2-model-config（它的 `lora`），'
-      + '或 mage-flow-model-config（來源浮水印）。這些參數原樣傳給該族自己'
+      + '（klein-kv 配方及其 `lora`），或 krea2-model-config（它的 `lora`）'
+      + '。樹外模型族自己的組態來源也接在這裡。這些參數原樣傳給該族自己'
       + '的參數結構，本階段不解讀，因此這裡不設任何該類旋鈕。接上它會把 DiT'
       + ' 的載入延後到第一個節拍，因為像 klein_kv 這樣的配方——或者決定各 '
       + 'block 如何建構的轉接器——必須在讀取權重之前就確定。轉接器相關的鍵只'
@@ -3729,11 +3731,11 @@ const STRINGS = {
       + '真實影格而非空白影格填充，並截斷到這個長度，因為它所條件化的潛變數'
       + '形狀取自 DiT 階段的 `frames`，而不是取自參考素材'],
   'cfg.vae-encode.hf_dir': ['',
-      'Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow 模型目录（VAE 从'
-      + ' <hf_dir>/vae 读取）。可选：model 输入端口上的 model-select 源会覆'
+      'Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit 模型目录，或本阶段能读取其 '
+      + 'VAE 的其他模型目录（VAE 从 <hf_dir>/vae 读取）。可选：model 输入端口上的 model-select 源会覆'
       + '盖它',
-      'Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow 模型目錄（VAE 從'
-      + ' <hf_dir>/vae 讀取）。可選：model 輸入埠上的 model-select 來源會覆'
+      'Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit 模型目錄，或本階段能讀取其 '
+      + 'VAE 的其他模型目錄（VAE 從 <hf_dir>/vae 讀取）。可選：model 輸入埠上的 model-select 來源會覆'
       + '寫它'],
   'cfg.vae-encode.target_width': ['',
       '编码前先把输入按信箱模式缩放到这个宽度（须为 8 的倍数；需同时设置 '
@@ -4318,24 +4320,26 @@ const STRINGS = {
       + '跳過它的兩個 GEMM'],
   'cfg.qwen-image-21-model-config.sigmas': ['',
       '调度的「原始」sigma 节点，噪声最高者在前——即 diffusers 管线的 '
-      + '`sigmas=` 参数——用来取代 linspace(1, 1/steps, steps)；步数就是节'
-      + '点个数，随分辨率而变的时间偏移照常施加在这些节点上，与默认网格无异'
-      + '。这是少步适配器随附的东西：Viggle 的 turbo v0.2.1 是 [1.0, '
-      + '0.9375, 0.875, 0.75, 0.5, 0.25]，配 shift_terminal 0。未设置 => '
-      + '默认网格',
+      + '`sigmas=` 参数——用来取代检查点的网格（linspace(1, 1/steps, '
+      + 'steps)，或蒸馏检查点自带的节点）；步数就是节点个数，检查点的时间'
+      + '偏移照常施加在这些节点上，与它的网格无异（基础模型随分辨率而变，'
+      + '蒸馏模型则不偏移）。这是少步适配器随附的东西：Viggle 的 turbo '
+      + 'v0.2.1 是 [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]，配 '
+      + 'shift_terminal 0。未设置 => 检查点的网格',
       '排程的「原始」sigma 節點，雜訊最高者在前——即 diffusers 管線的 '
-      + '`sigmas=` 參數——用來取代 linspace(1, 1/steps, steps)；步數就是節'
-      + '點個數，隨解析度而變的時間偏移照常施加在這些節點上，與預設網格無異'
-      + '。這是少步轉接器隨附的東西：Viggle 的 turbo v0.2.1 是 [1.0, '
-      + '0.9375, 0.875, 0.75, 0.5, 0.25]，配 shift_terminal 0。未設定 => '
-      + '預設網格'],
+      + '`sigmas=` 參數——用來取代檢查點的網格（linspace(1, 1/steps, '
+      + 'steps)，或蒸餾檢查點自帶的節點）；步數就是節點個數，檢查點的時間'
+      + '偏移照常施加在這些節點上，與它的網格無異（基礎模型隨解析度而變，'
+      + '蒸餾模型則不偏移）。這是少步轉接器隨附的東西：Viggle 的 turbo '
+      + 'v0.2.1 是 [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]，配 '
+      + 'shift_terminal 0。未設定 => 檢查點的網格'],
   'cfg.qwen-image-21-model-config.shift_terminal': ['',
       '偏移后调度的最后一个非零 sigma 被拉伸到的位置。未设置 => 检查点自己'
-      + '的 0.02；0 = 不拉伸，这正是以 shift_terminal null 发布的调度所要求'
-      + '的',
+      + '的值（基础模型为 0.02，蒸馏模型不拉伸）；0 = 不拉伸，这正是以 '
+      + 'shift_terminal null 发布的调度所要求的',
       '偏移後排程的最後一個非零 sigma 被拉伸到的位置。未設定 => 檢查點自己'
-      + '的 0.02；0 = 不拉伸，這正是以 shift_terminal null 發佈的排程所要求'
-      + '的'],
+      + '的值（基礎模型為 0.02，蒸餾模型不拉伸）；0 = 不拉伸，這正是以 '
+      + 'shift_terminal null 發佈的排程所要求的'],
   'cfg.qwen-image-21-model-config.preview_vae': ['',
       '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
       + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'
@@ -4791,73 +4795,6 @@ const STRINGS = {
       + '鍵給 diffusion-conditioner 的 model_config 輸入埠（接地編碼），'
       + 'lora 與 preview 各鍵給 generate-image 的。請同時接到兩者——各自只讀'
       + '取屬於自己的部分'],
-
-  // ---- Mage-Flow Model Config (model-specific-config) ----
-  'stage.mage-flow-model-config.name': ['',
-      'Mage-Flow 模型配置',
-      'Mage-Flow 模型設定'],
-  'stage.mage-flow-model-config.doc': ['',
-      '源：Mage-Flow 专属参数——它的来源水印（本模型族独有），以及其参考管道'
-      + '对条件图像做接地时所用的分辨率。发一个节拍即结束；若接了 trigger '
-      + '输入端口，则每收到一个节拍发一次。',
-      '來源：Mage-Flow 專屬參數——它的來源浮水印（本模型族獨有），以及其參考'
-      + '管道對條件影像做接地時所用的解析度。發一個節拍即結束；若接了 '
-      + 'trigger 輸入埠，則每收到一個節拍發一次。'],
-  'cfg.mage-flow-model-config.no_watermark': ['',
-      '禁用初始噪声中的 Gaussian-Shading 来源水印。水印默认开启——参考实现无'
-      + '条件地施加它，且它保持分布不变，因此不损失画质。这里用否定式命名，'
-      + '是为了让安全的默认值不需要任何配置。被固定 init_latents 的运行会忽'
-      + '略它',
-      '停用初始雜訊中的 Gaussian-Shading 來源浮水印。浮水印預設開啟——參考實'
-      + '作無條件地施加它，且它保持分布不變，因此不損失畫質。這裡用否定式命'
-      + '名，是為了讓安全的預設值不需要任何設定。被固定 init_latents 的執行'
-      + '會忽略它'],
-  'cfg.mage-flow-model-config.watermark_key': ['',
-      'Gaussian-Shading 密钥：一个整数或一句口令。未设置 => 取 $'
-      + 'MAGEFLOW_GS_KEY，否则取 $MAGEFLOW_GS_KEY_FILE / ~/.mageflow/gs_key'
-      + '，再否则用公开的默认值。检测端需要使用相同的密钥',
-      'Gaussian-Shading 金鑰：一個整數或一句通行語。未設定 => 取 $'
-      + 'MAGEFLOW_GS_KEY，否則取 $MAGEFLOW_GS_KEY_FILE / ~/.mageflow/gs_key'
-      + '，再否則用公開的預設值。偵測端需要使用相同的金鑰'],
-  'cfg.mage-flow-model-config.vl_long_edge': ['',
-      '接地编码：送入视觉塔之前，参考图像最长边的上限。未设置 => 本模型族自'
-      + '己的 384（pipeline.py 的 vl_cond_long_edge）。调高会偏离接地 LoRA '
-      + '的训练分布',
-      '接地編碼：送入視覺塔之前，參考影像最長邊的上限。未設定 => 本模型族自'
-      + '己的 384（pipeline.py 的 vl_cond_long_edge）。調高會偏離接地 LoRA '
-      + '的訓練分布'],
-  'cfg.mage-flow-model-config.vl_pixel_budget': ['',
-      '接地编码：总像素数上限，与 vl_long_edge 一同生效。未设置 => 本模型族'
-      + '不设该上限',
-      '接地編碼：總像素數上限，與 vl_long_edge 一同生效。未設定 => 本模型族'
-      + '不設該上限'],
-  'cfg.mage-flow-model-config.vl_min_pixels': ['',
-      '接地编码：图像处理器的下界，正是它让过小或过于狭长的参考图在切 patch'
-      + ' 前被放大。未设置 => 本模型族自己的 65536（'
-      + 'preprocessor_config.json 的 shortest_edge），远高于 Qwen 默认的 '
-      + '3136',
-      '接地編碼：影像處理器的下界，正是它讓過小或過於狹長的參考影像在切 '
-      + 'patch 前被放大。未設定 => 本模型族自己的 65536（'
-      + 'preprocessor_config.json 的 shortest_edge），遠高於 Qwen 預設的 '
-      + '3136'],
-  'cfg.mage-flow-model-config.vl_max_pixels': ['',
-      '接地编码：图像处理器的上界。未设置 => 本模型族自己的 16777216',
-      '接地編碼：影像處理器的上界。未設定 => 本模型族自己的 16777216'],
-  'port.mage-flow-model-config.trigger': ['',
-      '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
-      + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
-      + '一次',
-      '可選的節拍，用於控制何時重新發出設定（chrono 滴答、提示詞來源、回饋'
-      + '迴路等）。負載內容不限——收到本身就是訊號。未接時，本階段每次執行只'
-      + '發一次'],
-  'port.mage-flow-model-config.model_config': ['',
-      'Mage-Flow 参数，作为一个 FlexData 对象 {model_family: mage-flow, '
-      + 'no_watermark, watermark_key, +vl_*}。请同时接到 generate-image（水'
-      + '印）和 diffusion-conditioner（接地编码）——一个检查点，一个配置源',
-      'Mage-Flow 參數，作為一個 FlexData 物件 {model_family: mage-flow, '
-      + 'no_watermark, watermark_key, +vl_*}。請同時接到 generate-image（浮'
-      + '水印）和 diffusion-conditioner（接地編碼）——一個檢查點，一個組態來'
-      + '源'],
 
   // ---- MiniMax-H3 Model Config (model-specific-config) ----
   'stage.minimax-h3-model-config.name': ['',

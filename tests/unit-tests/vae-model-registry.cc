@@ -113,8 +113,7 @@ TEST(vae_model_registry, refuses_a_built_in_family_name)
   // Dispatch in vae-decode is pointer-guarded, so a collision would
   // still run the right code -- but every log line would read as a
   // built-in, which is why the name is refused outright.
-  for (const char* built_in : {"wan", "minimax-h3", "flux2", "mage",
-                               "krea2"}) {
+  for (const char* built_in : {"wan", "minimax-h3", "flux2", "krea2"}) {
     EXPECT_FALSE(r.add(std::make_unique<StubFamily>(built_in, "/roots/x")));
   }
   EXPECT_TRUE(r.claim_for(nullptr, "/roots/x", "/roots/x", "") == nullptr);

@@ -2046,7 +2046,7 @@ TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
 // ---- WiredPool: the per-model window onto the pool -----------------------
 //
 // The state machine every streamed DiT now shares (MiniMax-H3, LTX-2.5,
-// FLUX.2, Krea-2, Qwen-Image-Edit/Mage-Flow, Boogu-Image). What it
+// FLUX.2, Krea-2, Qwen-Image-Edit, Boogu-Image). What it
 // decides is whether a block may be KEPT at all, so the properties worth
 // pinning are the ones that bound memory rather than the ones that make
 // it fast: the budget is never exceeded, a refusal STOPS admission, and

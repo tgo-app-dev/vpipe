@@ -56,7 +56,7 @@ namespace vpipe::genai {
 // (see vae-model-registry.h) needs no stage of its own for either half.
 //
 // The registry is consulted BEFORE the built-in flux2 / krea2 /
-// qwen-image-edit / boogu-image / mage-flow dispatch, mirroring how
+// qwen-image-edit / boogu-image dispatch, mirroring how
 // VideoModelRegistry sits in front of generate-video's two built-ins and
 // how ModelExecRegistry sits in front of LoadedLanguageModel's arch
 // if-chain. The built-in families are unchanged and unregistered: this
@@ -371,7 +371,7 @@ public:
   // The VAE's spatial compression, for the one thing the stage must
   // compute before the model exists: the output size INFERRED from a
   // reference latent when the graph set neither width nor height. 8 for
-  // Krea-2 and Qwen-Image-Edit, 16 for FLUX.2 and Mage-Flow. 0 means
+  // Krea-2 and Qwen-Image-Edit, 16 for FLUX.2. 0 means
   // "cannot say", and the stage then falls back to its default size
   // instead of guessing a family's ratio.
   virtual int latent_scale(const std::string& /*root*/) const { return 0; }

@@ -665,8 +665,7 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_gated     = m->_lib_elt.function("gated_residual_f16");
   // vec4 twins: same arithmetic per element (bit-identical), 3-4x throughput --
   // one element per thread leaves these at ~37-54 GB/s where the same bytes
-  // through a vec4 2-D grid run at 143-181. Serves Qwen-Image-Edit AND
-  // Mage-Flow (same class, different Config). VPIPE_NO_ELT_V4 reverts.
+  // through a vec4 2-D grid run at 143-181. VPIPE_NO_ELT_V4 reverts.
   if (std::getenv("VPIPE_NO_ELT_V4") == nullptr) {
     m->_fn_adaln4 = m->_lib_elt.function("adaln_modulate_v4_f16");
     m->_fn_gated4 = m->_lib_elt.function("gated_residual_v4_f16");
@@ -904,29 +903,9 @@ MetalQwenImageTransformer::time_proj_(float sigma) const
   const int C = _cfg.time_proj, half = C / 2;
   std::vector<float> out((std::size_t)C);
   const float sc = 1000.0f;
-  // Round-to-nearest-even down to bf16 (what torch's .to(bfloat16) does).
-  auto to_bf16 = [](float f) {
-    std::uint32_t u;
-    std::memcpy(&u, &f, 4);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    u &= 0xffff0000u;
-    float o;
-    std::memcpy(&o, &u, 4);
-    return o;
-  };
-  // Mage-Flow's forward does `timesteps = timesteps.to(img.dtype)` with the
-  // model in bf16, so the TIMESTEP is rounded before the angle is formed --
-  // the same trap as the frequency table below, and just as consequential:
-  // the angle reaches sigma*1000 ~ 950 rad, so bf16's ~2e-3 ulp near 1.0 is
-  // ~2 RADIANS of phase and moves temb by 30-40%. Only sigmas that are
-  // exactly representable in bf16 (1.0, 0.75, 0.5) are unaffected -- which is
-  // why a golden pinned at sigma 0.75 cannot see this, while the real
-  // FlowMatchEuler schedule (0.947, 0.857, 0.667) is wrong at every step but
-  // the first.
-  if (_cfg.bf16_timestep) { sigma = to_bf16(sigma); }
   for (int i = 0; i < half; ++i) {
-    float freq = std::exp(-std::log(10000.0f) * (float)i / (float)half);
-    if (_cfg.bf16_time_freqs) { freq = to_bf16(freq); }
+    const float freq =
+        std::exp(-std::log(10000.0f) * (float)i / (float)half);
     const float arg = sigma * sc * freq;
     out[(std::size_t)i] = std::cos(arg);
     out[(std::size_t)(half + i)] = std::sin(arg);
@@ -974,17 +953,8 @@ MetalQwenImageTransformer::build_rope_(int txt_seq,
       cb[o] = c; cb[o + 1] = c; sb[o] = s; sb[o + 1] = s;
     }
   };
-  // Text rows first: position = max_vid + tt on all axes. When the model
-  // leaves text unrotated (Mage-Flow), write the identity rotation instead
-  // -- cos 1 / sin 0 -- so the shared roped-attention path needs no branch.
+  // Text rows first: position = max_vid + tt on all axes.
   for (int tt = 0; tt < txt_seq; ++tt) {
-    if (!_cfg.rotate_txt) {
-      for (int j = 0; j < P; ++j) {
-        const std::size_t o = (std::size_t)tt * D + 2 * j;
-        cb[o] = 1.0f; cb[o + 1] = 1.0f; sb[o] = 0.0f; sb[o + 1] = 0.0f;
-      }
-      continue;
-    }
     const double p = (double)(max_vid + tt);
     fill(tt, p, p, p);
   }
@@ -1186,7 +1156,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   // output for the image rows BEFORE the output projection and gate, and -5
   // returns the timestep conditioning vector temb. Together they split a
   // mismatch into conditioning / attention / out-proj+gate -- which is how
-  // the Mage-Flow bf16-frequency bug was localized.
+  // a timestep-embedding mismatch is localized.
   bool dbg_att = false;          // stop_after_block == -4 fired
   std::size_t dbg_ioff = 0;
 
@@ -1197,11 +1167,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   // absolute step time inflates a little, but the RELATIVE breakdown is
   // faithful. Mirrors the Krea-2 / FLUX.2 DiT profilers.
   const bool prof = !_stream_blocks &&
-                    (std::getenv("VPIPE_QIE_DIT_PROFILE") != nullptr
-                     // Mage-Flow drives this same class, so accept a
-                     // Mage-named alias -- section timing for a Mage run
-                     // should not hide behind a QIE-named variable.
-                     || std::getenv("VPIPE_MAGE_DIT_PROFILE") != nullptr);
+                    std::getenv("VPIPE_QIE_DIT_PROFILE") != nullptr;
   // Measurement-only: skip the modulation GEMVs to isolate their bandwidth cost
   // (imod/tmod left stale -> output is garbage; timing only). VPIPE_QIE_SKIP_MOD.
   const bool skip_mod = std::getenv("VPIPE_QIE_SKIP_MOD") != nullptr;

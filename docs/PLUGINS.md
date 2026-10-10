@@ -231,7 +231,10 @@ Available by name include `dense_gemm_bf16` / `dense_gemm_mma_bf16`,
 `attn_steel`, and `llm_elementwise_bf16` — which alone carries adaLN
 modulation, gated residuals, gelu-tanh, bias-add, im2col and nearest-2x
 upsample. Note the entry points keep an `_f16` suffix in **both** dtype
-twins; the LIBRARY name is what selects bf16 or f16.
+twins; the LIBRARY name is what selects bf16 or f16. Revision 2 of the
+contract (`"kernel-contract/2"`) adds the f16 libraries' GEMMs, scalar
+attention and norm, for a model whose reference runs in f16 -- a codec,
+typically; everything elementwise it needs in f16 it copies.
 
 Write a kernel only for what is genuinely your model's own. The LTX-2.5
 plugin ships three entry points and reuses everything else.
@@ -300,6 +303,40 @@ dispatch, so a checkpoint whose `architecture` matches your key loads your
 exec. Reuse `ContextManager` by filling its `Spec` (Paged or Contiguous) —
 you do **not** create a new KV manager. v1 targets text-only models;
 multimodal encoders remain a built-in concern.
+
+### Driving a vision-language model from a stage
+
+A plugin stage that wants a VLM to look at frames -- to describe a clip,
+answer about a picture -- cannot reach the towers or the chat templates:
+they are each family's own and are not on the SDK. `genai::VideoTurn`
+(`generative-models/video-turn.h`, feature `video-turn/1`) is the part of
+them a stage needs. Load the model through the session's
+`GenerativeModelManager` as text-chat does (declare its weights in
+`declare_memory` / `declare_resources` first), then:
+
+```cpp
+#include "generative-models/video-turn.h"
+
+auto turn = vpipe::genai::VideoTurn::make(lm, session());  // null: no tower
+for (/* each frame: planar u8 RGB [3, h, w], `t` s into the clip */) {
+  turn->add_frame(rgb, h, w, t);  // through the model's own tower, now
+}
+std::string words = turn->reply(
+    /*before=*/"", /*after=*/"What happens in this part?",
+    sampler_spec,   // a sampler-select beat's FlexData, or null: greedy
+    /*max_tokens=*/256,
+    [&](std::string_view piece) { return !ctx.stop_requested(); });
+```
+
+The frames go into the family's own template as ONE video, each marked
+with its time (`<12.0 seconds>` for Qwen3-VL), between `before` and
+`after`; the reply is decoded with thinking off -- MTP- or DFlash-drafted
+where the model carries a drafter -- and the frames are dropped with it,
+so one turn serves scene after scene. With no frames, `reply` is a turn
+of words alone (a summary of the scenes' answers, say). A frame is
+~180 tokens at 576 x 320 on Qwen3.5: `tokens()` says what the next
+prefill holds. Register the stage only when
+`ctx->has_feature(VPIPE_FEATURE_VIDEO_TURN)`.
 
 ## Extension point 4 — video model families
 
@@ -582,9 +619,65 @@ Two things this domain deliberately cannot do:
   or a position scheme the host does not have, ship your own conditioner
   stage the way LTX-2.5 does.
 - **It cannot switch off a mandatory content screen.** Whether a
-  family's prompts are screened is decided by the host from the family
-  tag, never from a key in here. A profile that could omit the screen
-  would be a bypass, which is what the screen exists to prevent.
+  family's prompts are screened is decided by whether the family provides
+  a screen (below), never by a key in here. A profile that could omit the
+  screen would be a bypass, which is what the screen exists to prevent.
+
+#### A content screen on the conditioner's encoder
+
+Some checkpoints carry a policy classifier on their text encoder: the
+weights that produce the conditioning are asked, in a chat turn, whether
+the request is allowed. The classifier is your model's, so its policy is
+yours; the encoder it runs on is the conditioner's. Implement
+`vpipe::genai::screen::ContentScreen`
+(`generative-models/content-screen.h`) and hand it out from your image
+family's `query_extension`:
+
+```cpp
+#include "generative-models/content-screen.h"
+namespace sc = vpipe::genai::screen;
+
+class AcmeScreen final : public sc::ContentScreen {
+public:
+  sc::Verdict screen(sc::EncoderChat& chat,
+                     const sc::ScreenInput& in) override
+  {
+    sc::ChatRequest req;
+    req.parts = {{sc::ChatPart::Kind::Special, "<|im_start|>"},
+                 {sc::ChatPart::Kind::Text, "system\n" + kPolicy}, /* ... */};
+    if (in.images > 0) {
+      req.parts.push_back({sc::ChatPart::Kind::Image, {}});
+    }
+    req.stop = "<|im_end|>";
+    std::string text, why;
+    sc::Verdict v;                    // blocked by default
+    if (chat.generate(req, &text, &why)) { /* read text into v */ }
+    return v;
+  }
+};
+
+void*
+AcmeFamily::query_extension(std::string_view id) noexcept
+{
+  if (id == sc::kExtension) { return &_screen; }
+  return nullptr;
+}
+```
+
+`diffusion-conditioner` then runs it on every prompt, before encoding,
+on the encoder it already owns -- loaded with its output head whatever
+your profile's `backbone_only` says, because a screen that cannot
+generate can only refuse. What the host guarantees and you cannot turn
+off: every prompt is screened; with references wired the screen runs once
+per reference, each pass bound to that picture, and any refusal refuses
+the prompt; a screen that throws refuses; a refused prompt becomes the
+conditioner's refusal beat, which `generate-image` and `vae-decode` carry
+through as a blank picture of the requested size. The log says that a
+prompt was refused and never which category tripped. What is yours: the
+policy, the turn, the token cap, what an empty prompt means and how the
+answer is read. List `VPIPE_FEATURE_CONTENT_SCREEN` in
+`required_features`: a host without it would load your family and never
+screen.
 
 ### The acceleration settings, and what they are not
 
@@ -928,8 +1021,8 @@ under [Live previews](#live-previews), `req.output_wanted` /
 source names. That is the same path Krea-2's built-in previews take.
 
 The registry is consulted **before** the built-in `flux2` / `krea2` /
-`qwen-image-edit` / `qwen-image-21` / `boogu-image` / `z-image` /
-`mage-flow` dispatch. The built-ins
+`qwen-image-edit` / `qwen-image-21` / `boogu-image` / `z-image`
+dispatch. The built-ins
 are unchanged and unregistered: this adds a path, it does not reroute the
 existing ones.
 
@@ -951,11 +1044,41 @@ exists: it infers the output size from a reference latent when the graph
 set neither width nor height, and 0 means "cannot say", which makes it
 fall back to its default size rather than guess your ratio.
 
+What `generate-image` declares around your family, so you do not
+declare it twice or leave it out:
+
+- **The text encoder.** By default the stage books `root/mllm` (or
+  `root/text_encoder`) for the whole run on the conditioner's behalf —
+  the safe answer when nothing else declares it. A family whose
+  conditioner is its own stage, and which lets the encoder go after the
+  prompt, claims the encoder directory itself in `declare_resources`,
+  phased to `condition`; the stage then books nothing for it. An
+  unphased booking would hold the encoder through the denoise and push
+  the DiT into streaming for weights that are no longer there.
+- **The decode arena**, from `root/vae`'s config at the configured size,
+  in the `decode` phase. `vae-decode` revises it per image.
+- **Your DiT's working set, after every generation.** The stage asks
+  `ImageGenerator::resident_bytes()` and revises the holding named by
+  your first `declare_holdings` entry. A streaming DiT that promotes
+  blocks as it runs should report what it holds there, not its floor.
+- **Your ANE module's CoreML claim**, if you declare one
+  (`coreml_claims`, in units): kept only when the graph asked for
+  `ane_ffn`, relabelled to the stage, and its grant read before your
+  load -- a refusal arrives as `ane_ffn` off in the accel bag. The
+  label reaches your `load()` as `genai::create_args::kCoreMLLabel` in
+  `ImageModelCreateArgs::borrowed_extra`; revise what you actually hold
+  under it (`revise_scratch("coreml:" + label, bytes)`).
+- **The model pickers.** Registering the family puts its tag on the
+  shared-model channel (model-select offers it) AND on generate-image's
+  own `hf_dir` picker. A directory your `claims()` accepts is also what
+  model detection labels with your tag; give it a `detect` profile for
+  the labels and modalities.
+
 ## Extension point 4b — VAE families
 
 A family that generates latents needs something to turn them into frames,
 and `vae-decode` picks its built-in decoder from a hardcoded `_class_name`
-chain (`wan`, `minimax-h3`, `flux2`, `mage`, `krea2`) that an out-of-tree
+chain (`wan`, `minimax-h3`, `flux2`, `krea2`) that an out-of-tree
 family cannot join. `register_vae_family` is the counterpart to
 `register_video_family`: register **both** and your model needs a stage of
 its own for neither — its graphs use the stock `vae-decode`.
@@ -1345,6 +1468,7 @@ constant, never the spelling:
 | `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
 | speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |
 | the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |
+| what a stage tells a family it loads (`ImageModelCreateArgs` / `VideoModelCreateArgs` `borrowed_extra`: the CoreML label) | `genai::create_args` (`gen-input.h`) |
 | beats and TensorBeat sidebands | `beat`, `sideband` (`common/beat-keys.h`) |
 | `model_config` keys the host reads | `model_config::kFamilyKey` (`stages/model-config-source.h`), `genai::preview_key` (`gen-input.h`) |
 | family profiles | `genai::cond`, `quant`, `detect` (`*-profile.h`) |
@@ -1400,6 +1524,12 @@ be here.
 4. `model_memory::plan_streaming` takes a `phase` argument.
 5. If your plugin needs a feature to function, name it in
    `required_features`.
+
+Features added within ABI 8, after it first shipped:
+`"kernel-contract/2"` (the contract's revision-2 entries; a host with it
+still serves revision 1), `"content-screen/1"`
+(`generative-models/content-screen.h`) and `"video-turn/1"`
+(`generative-models/video-turn.h`).
 
 ## Where your stages show up
 

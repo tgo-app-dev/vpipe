@@ -9,6 +9,7 @@
 //   vpipe_test --filter '*model_select*'
 
 #include "minitest.h"
+#include "pipeline/stage-consumer-types.h"
 
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -216,9 +217,9 @@ TEST(model_select, apply_beat_parses_forms)
 // Every stage in the split diffusion flow shares ONE model, so a family the
 // consumers can run must be pickable at the SOURCE -- a model-select that
 // cannot pick a family the conditioner/DiT/VAE support is a dead end for the
-// user, and that is exactly how the Mage-Flow families were missed when they
-// were added to the other four, and later how minimax-h3-fl2va was missing
-// from model-select while a whole text-to-video graph ran it.
+// user, and that is exactly how two image families were once missed when
+// they were added to the other four, and later how minimax-h3-fl2va was
+// missing from model-select while a whole text-to-video graph ran it.
 //
 // This used to demand that all five lists be IDENTICAL, which held only
 // while every consumer ran every family. It stopped being true once the
@@ -317,6 +318,11 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
       for (const std::string& f : split(std::string(a.suggest_db_type))) {
         runnable.push_back(f);
       }
+      // ...plus the families registered into this stage's own registry,
+      // which its picker offers beside its static list.
+      for (const std::string& f : consumer_types(name)) {
+        runnable.push_back(f);
+      }
     }
   }
   for (const std::string& fam : offered) {
@@ -336,8 +342,7 @@ TEST(model_select, diffusion_pickers_offer_the_same_families)
   // whole model, so it reaches the source through the VAE stages alone
   // and nothing else in this graph would notice it going missing.
   for (const char* fam : {"krea2", "krea2-vae", "flux2", "qwen-image-edit",
-                          "mage-flow",
-                          "mage-flow-edit", "boogu-image", "boogu-image-edit",
+                          "boogu-image", "boogu-image-edit",
                           "wan-t2v", "wan-i2v", "minimax-h3-fl2va"}) {
     const bool present =
         std::find(offered.begin(), offered.end(), fam) != offered.end();

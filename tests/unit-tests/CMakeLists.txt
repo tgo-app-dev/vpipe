@@ -228,10 +228,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         train-lora-stage.cc
         minimax-h3-text-encoder.cc
         minimax-h3-refenc.cc
-        mage-vae.cc
-        mage-cond.cc
-        mage-t2i.cc
-        mage-screen.cc
+        content-refusal.cc
+        unclaimed-checkpoint.cc
         krea2-t2i.cc
         krea2-dit-quant.cc
         krea2-native-checkpoint.cc

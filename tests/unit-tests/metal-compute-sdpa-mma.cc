@@ -528,9 +528,10 @@ TEST(sdpa_mma, full_mma2_vae_tile_sweep) {
 // despite the shared name prefix: [n, Hq*D] INTERLEAVED layout (no q/k/v/o
 // transposes), BQ=32, one extra constant (q_offset at 10, kv_stride at 11), and
 // the caller pads q/k/v by BQ rows because the last K/V block is matmul-read
-// before it is masked. It carries the bf16 vision tower's attention (Mage-Flow
-// and Boogu cast their whole text encoder, and the steel/NAX flash kernels are
-// f16-only, so this is the DEFAULT there) and is opt-in in f16.
+// before it is masked. It carries the bf16 vision tower's attention (Boogu and
+// other wrapped checkpoints cast their whole text encoder, and the steel/NAX
+// flash kernels are f16-only, so this is the DEFAULT there) and is opt-in in
+// f16.
 TEST(sdpa_mma, full_mma2_d64_vit_matches_oracle) {
   Session sess;
   auto* mc = get_mc_(sess);

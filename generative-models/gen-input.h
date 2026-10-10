@@ -237,6 +237,24 @@ inline constexpr std::string_view kMaxEdge = "preview_max_edge";
 inline constexpr std::string_view kFrames  = "preview_frames";
 }  // namespace preview_key
 
+// ---- WHAT A STAGE TELLS A FAMILY IT LOADS ----------------------------
+//
+// Keys of ImageModelCreateArgs / VideoModelCreateArgs `borrowed_extra`.
+namespace create_args {
+
+// The LABEL the stage booked this family's CoreML claim under (a family
+// claims its ANE module with model_memory::coreml_claims; the stage
+// keeps it only when the graph asked for `ane_ffn`, and relabels it to
+// itself, since a family cannot know which stage it runs in and two
+// stages sharing a label would share one grant). The stage has already
+// read the grant: a refused tier arrives with `ane_ffn` off in the
+// accel bag. A family revises what it actually holds through
+// revise_scratch("coreml:" + label, bytes). Absent: the stage booked
+// nothing for the family, which keeps whatever label it chose itself.
+inline constexpr std::string_view kCoreMLLabel = "coreml_label";
+
+}  // namespace create_args
+
 }  // namespace vpipe::genai
 
 VPIPE_API_END

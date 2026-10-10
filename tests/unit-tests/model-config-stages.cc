@@ -125,7 +125,7 @@ TEST(model_config, every_source_stamps_its_family)
 // This is the property the whole design rests on and the one that is
 // easy to get wrong: the conditioner starts from the model layer's
 // per-family numbers, so a source that helpfully emitted its defaults
-// would overwrite Mage-Flow's 384 with a zero -- and the encode would
+// would overwrite a family's 384 with a zero -- and the encode would
 // still succeed, at a resolution the model was never trained against.
 TEST(model_config, unset_grounded_keys_are_not_emitted)
 {
@@ -163,9 +163,9 @@ TEST(model_config, unset_grounded_keys_are_not_emitted)
 // family another's produces a well-formed conditioning that lands where
 // its DiT was never trained -- an edit that mis-targets rather than a
 // failure, which is the expensive kind of wrong. In particular
-// Bougu-Image's long edge is DOUBLE Mage-Flow's while its area cap is
-// the same: the two bounds are not redundant and neither implies the
-// other.
+// Bougu-Image's long edge is DOUBLE a 384-edge family's while its area
+// cap is the same: the two bounds are not redundant and neither implies
+// the other.
 TEST(model_config, each_family_keeps_its_own_grounding_numbers)
 {
   using GP = genai::GroundedEncodeParams;
@@ -174,18 +174,15 @@ TEST(model_config, each_family_keeps_its_own_grounding_numbers)
   EXPECT_TRUE(k.pixel_budget == 0u);
   EXPECT_TRUE(k.min_pixels == 0u);       // the tower's own default stands
 
-  // Mage-Flow is NOT in this table any more. Its numbers moved into the
-  // family's own conditioning profile when the family left this tree,
-  // and the table now answers for it the way it answers for any family
-  // it does not implement -- with nothing. That is the point: a
-  // registered family's numbers arrive WITH it, so the host holds no
-  // stale copy to disagree with the plugin.
-  const GP m = GP::for_family("mage-flow");
+  // A family the host does not implement gets nothing from this table:
+  // a registered family's numbers arrive WITH it, in its conditioning
+  // profile, so the host holds no stale copy to disagree with the plugin.
+  const GP m = GP::for_family("ut-registered-family");
   EXPECT_TRUE(m.long_edge == 0);
   EXPECT_TRUE(m.min_pixels == 0u);
 
   const GP b = GP::for_family("boogu-image");
-  EXPECT_TRUE(b.long_edge == 768);       // NOT mage's 384
+  EXPECT_TRUE(b.long_edge == 768);       // NOT 384
   EXPECT_TRUE(b.pixel_budget == (std::size_t)384 * 384);
   EXPECT_TRUE(b.min_pixels == 65536u);
 
@@ -399,10 +396,6 @@ TEST(model_config, image_families_read_back_their_own_beats)
             s.resolved_config());
     EXPECT_FALSE(p.klein_kv);
   }
-  // Mage-Flow's own source -- and its provenance watermark, which was
-  // the other half of this case -- moved out of the tree with the
-  // family. Its equivalents live in the vpipe-mage-flow plugin's
-  // mage-watermark and mage-model-config tests.
 }
 
 // The consumer side of the seam: both diffusion stages take the config on

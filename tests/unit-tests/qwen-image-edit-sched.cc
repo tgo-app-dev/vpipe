@@ -168,3 +168,57 @@ TEST(qwen_image_edit_sched, raw_sigmas_match_diffusers)
   // And they are part of the spec's identity.
   EXPECT_TRUE(!(wrong == none));
 }
+
+// The same nodes with dynamic shifting OFF -- what a distilled checkpoint
+// ships (Qwen-Image-2.1-Turbo: scheduler_config use_dynamic_shifting
+// false, shift 1.0, shift_terminal null, and its nodes in model_index.json
+// `sample_sigmas`). diffusers then applies the STATIC shift
+// s' = shift*s / (1 + (shift-1)*s) -- the "linear" curve here -- and the
+// terminal stretch if one is configured. References from the REAL diffusers
+// 0.40 FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=..., mu=...),
+// whose mu the static branch ignores.
+TEST(qwen_image_edit_sched, raw_sigmas_static_match_diffusers)
+{
+  const std::vector<double> turbo = {1.0,      0.978453, 0.95418,
+                                     0.926626, 0.89508,  0.845148,
+                                     0.704534, 0.414568};
+  FlowSchedulerSpec s;
+  s.dynamic_shift = false;
+  s.shift_type = "linear";
+  s.shift = 1.0;
+  s.shift_terminal = 0.0;
+  s.steps = (int)turbo.size();
+  s.base_sigmas = turbo;
+  // Shift 1, no stretch: the nodes AS WRITTEN, then the terminal 0 --
+  // at any image size, since no mu is involved.
+  std::vector<double> want = turbo;
+  want.push_back(0.0);
+  EXPECT_TRUE(max_abs_diff(s.sigmas(1024), want) == 0.0);
+  EXPECT_TRUE(max_abs_diff(s.sigmas(16384), want) == 0.0);
+
+  const std::vector<double> nodes = {1.0, 0.9375, 0.875, 0.75, 0.5, 0.25};
+  const std::vector<double> ref_shift3 = {
+      1.0, 0.97826087, 0.95454544, 0.89999998, 0.75, 0.5, 0.0};
+  const std::vector<double> ref_shift3_term = {
+      1.0, 0.95739132, 0.91090906, 0.80399996, 0.50999999, 0.01999998, 0.0};
+  FlowSchedulerSpec t = s;
+  t.shift = 3.0;
+  t.steps = (int)nodes.size();
+  t.base_sigmas = nodes;
+  const double d1 = max_abs_diff(t.sigmas(4096), ref_shift3);
+  t.shift_terminal = 0.02;
+  const double d2 = max_abs_diff(t.sigmas(4096), ref_shift3_term);
+  std::printf("[qwen_image_edit_sched] static raw nodes max|d| vs diffusers: "
+              "shift3=%.2e shift3+terminal=%.2e\n", d1, d2);
+  EXPECT_TRUE(d1 < 1e-6);
+  EXPECT_TRUE(d2 < 1e-6);
+
+  // Without nodes and without a terminal, the static path is what it was:
+  // the simple grid, shifted.
+  FlowSchedulerSpec plain;
+  plain.steps = 8;
+  FlowSchedulerSpec with_term = plain;
+  with_term.shift_terminal = 0.0;
+  EXPECT_TRUE(max_abs_diff(plain.sigmas(4096), with_term.sigmas(4096)) ==
+              0.0);
+}

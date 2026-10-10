@@ -28,6 +28,7 @@ set(LOCAL_SOURCES
   model-loader.cc
   sampler.cc
   tokenizer.cc
+  video-turn.cc
   shared/ane-module.cc
   shared/ane-ffn.cc
   shared/ane-tier.cc
@@ -65,6 +66,7 @@ set(LOCAL_SOURCES
   gemma4/metal-gemma4-vision.cc
   qwen3/metal-audio-encoder.cc
   qwen3/metal-qwen-model.cc
+  qwen3/metal-qwen-encoder-chat.cc
   qwen3/metal-qwen-raw-layers.cc
   qwen3/metal-qwen-model-exec.cc
   qwen3/metal-qwen-vision.cc
@@ -103,9 +105,6 @@ set(LOCAL_SOURCES
   yue2/metal-yue2-model.cc
   yue2/metal-oobleck-decoder.cc
   yue2/yue2-vae-family.cc
-  mage/metal-mage-vae.cc
-  mage/mage-screen.cc
-  mage/mage-screen-policy.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc
@@ -169,6 +168,7 @@ set(LOCAL_HEADERS
   sampler.h
   token-muxer.h
   tokenizer.h
+  video-turn.h
   shared/comfy-checkpoint.h
   shared/comfy-output-config.h
   shared/gguf-convert.h
@@ -190,6 +190,7 @@ set(LOCAL_HEADERS
   gemma4/metal-gemma4-vision.h
   qwen3/metal-audio-encoder.h
   qwen3/metal-qwen-model.h
+  qwen3/metal-qwen-encoder-chat.h
   qwen3/metal-qwen-raw-layers.h
   qwen3/metal-qwen-model-exec.h
   qwen3/metal-qwen-vision.h
@@ -242,8 +243,6 @@ set(LOCAL_HEADERS
   minimax-h3/minimax-h3-denoise.h
   minimax-h3/minimax-h3-taomate.h
   minimax-h3/minimax-h3-stream-kv.h
-  mage/metal-mage-vae.h
-  mage/mage-screen.h
   train/train-ops.h
   train/lora-params.h
   train/optimizer.h

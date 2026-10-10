@@ -1,5 +1,6 @@
 #include "plugin/plugin-context.h"
 #include "plugin/plugin-abi.h"
+#include "pipeline/stage-consumer-types.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -14,6 +15,8 @@
 // registry call below carry the same gate metal libraries do.
 #include "generative-models/quantize-family-registry.h"
 #include "generative-models/vae-model-registry.h"
+#include "generative-models/conditioner-profile.h"
+#include "generative-models/detect-profile.h"
 #include "generative-models/family-profile.h"
 #include "generative-models/image-model-registry.h"
 #include "generative-models/video-model-registry.h"
@@ -61,6 +64,10 @@ host_features() noexcept
     VPIPE_FEATURE_NAMED_OUTPUTS,
     VPIPE_FEATURE_FAMILY_PROFILES,
     VPIPE_FEATURE_ACCEL_BAG,
+    // Added after ABI 8 first shipped.
+    VPIPE_FEATURE_KERNEL_CONTRACT_2,
+    VPIPE_FEATURE_CONTENT_SCREEN,
+    VPIPE_FEATURE_VIDEO_TURN,
   };
   return kFeatures;
 }
@@ -192,8 +199,23 @@ VpipePluginContext::register_family_profile(std::string domain,
   // same as a graph that never wired a conditioner.
   const std::string tag = family;
   const std::string dom = domain;
+  // Read before the move. A detect profile names the catalogue types
+  // the family's checkpoints are filed under, which the pickers filter
+  // on; a conditioning profile says `diffusion-conditioner` runs it.
+  std::string types;
+  if (dom == genai::detect::kDomain) {
+    for (std::string_view k :
+         {genai::detect::kModelType, genai::detect::kModelTypeEdit}) {
+      const std::string t = genai::profile::text(&profile, k, "");
+      if (!t.empty()) { types += (types.empty() ? "" : ",") + t; }
+    }
+  }
   const bool ok = genai::profile::Registry::get().add(
       std::move(domain), std::move(family), std::move(profile));
+  if (ok && !types.empty()) { register_type_aliases(tag, types); }
+  if (ok && dom == genai::cond::kDomain) {
+    register_consumer_types("diffusion-conditioner", tag);
+  }
   if (_session != nullptr) {
     if (ok) {
       _session->log_normal(fmt(

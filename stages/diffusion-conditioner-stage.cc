@@ -20,11 +20,13 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/conditioner-profile.h"
+#include "generative-models/content-screen.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/image-model-registry.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/qwen3/metal-qwen-encoder-chat.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/vosr/metal-dinov2-encoder.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
@@ -68,7 +70,6 @@ const ConfigKey kAttrs[] = {
           "model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
-       "mage-flow,mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
    .model_channel = "diffusion-model"},
@@ -133,9 +134,9 @@ const PortSpec kIports[] = {
                                "Qwen2.5-VL vision tower; others ignore it.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_image2", .doc = "OPTIONAL SECOND reference image (same format). "
-                                "Qwen-Image-Edit-2511 is multi-reference and "
-                                "Mage-Flow-Edit's template has a per-reference "
-                                "body, so on those families the VLM must see "
+                                "On a multi-reference family "
+                                "(Qwen-Image-Edit-2511), or one whose template "
+                                "has a per-reference body, the VLM must see "
                                 "BOTH pictures (the DiT's ref_latent1 only "
                                 "carries the second one's spatial detail). Each "
                                 "reference gets its own vision block, mROPE band "
@@ -144,8 +145,9 @@ const PortSpec kIports[] = {
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "model_config",
    .doc = "OPTIONAL model-specific parameters from the resident family's own "
-          "config source (krea2-model-config, mage-flow-model-config, "
-          "boogu-image-model-config, qwen-image-edit-model-config). Today "
+          "config source (krea2-model-config, boogu-image-model-config, "
+          "qwen-image-edit-model-config, or an out-of-tree family's own). "
+          "Today "
           "that means how a REFERENCE IMAGE is prepared for the grounded "
           "encode: each family's reference pipeline bounds it differently "
           "and the numbers are not interchangeable. Unwired, the family's "
@@ -171,8 +173,8 @@ const PortSpec kOports[] = {
   {.name = "conditioning",
    .doc = "conditioning tensor for the generate-image DiT (family-shaped + typed: "
           "krea2 f16 [n,12,2560]; flux2 f16 [n,3*enc_hidden]; qwen-image-edit "
-          "bf16 [n_real,3584] image-aware; mage-flow bf16 [n_real,2560] "
-          "image-aware)",
+          "bf16 [n_real,3584] image-aware; a family conditioned through "
+          "its conditioning profile, as that profile shapes it)",
    .type = &typeid(TensorBeatPayload), .tags = "conditioning", .clock_group = 0},
   {.name = "neg_conditioning",
    .doc = "conditioning for the negative prompt (same shape/type); emitted only "
@@ -185,11 +187,12 @@ const StageSpec kSpec = {
                "for a diffusion DiT. Owns the tokenizer + text encoder + (for "
                "image-aware models) the Qwen2.5-VL vision tower. The encoder "
                "half of the generate-image split; pair it with a generate-image "
-               "stage on the same hf_dir. On the Mage-Flow families every "
-               "prompt (and, for an edit, the source image) is first screened "
-               "by the model's own content-policy classifier -- mandatory, no "
-               "config key; a refused prompt yields a blank image instead of "
-               "a generation. Inputs pair the way generate-image's do: one "
+               "stage on the same hf_dir. A family whose checkpoint carries "
+               "a content-policy classifier on its text encoder has every "
+               "prompt (and, for an edit, the source image) screened by it "
+               "first -- mandatory, no config key; a refused prompt yields a "
+               "blank image instead of a generation. Inputs pair the way "
+               "generate-image's do: one "
                "beat and the end of its stream serves every conditioning, a "
                "stream that keeps sending is consumed a beat per "
                "conditioning -- so one prompt over a folder of pictures "
@@ -401,15 +404,14 @@ constexpr const char* kQiePrefix =
 constexpr const char* kQieSuffix = "<|im_end|>\n<|im_start|>assistant\n";
 constexpr int kQieDropPrefix = 64;
 
-// Mage-Flow reuses BOTH templates verbatim -- its models/utils.py
-// PROMPT_TEMPLATE["mage-flow"] is byte-identical to kPrefix + "{}" + kSuffix
-// (start_idx 34 == kDropPrefix) and PROMPT_TEMPLATE["mage-flow-edit"] to
-// kQiePrefix + "{}" + kQieSuffix (start_idx 64 == kQieDropPrefix); both
-// descend from the same Qwen-Image conventions. Only the multi-reference body
-// is its own: `Image {j}: <|vision_start|><|image_pad|><|vision_end|>` per
-// reference (no separator), then the instruction -- pipeline.py
-// _edit_prompt_body. Qwen-Image-Edit says "Picture {j}: " instead, and Boogu
-// uses bare unlabelled blocks; ref_blocks_() below renders all three.
+// A family conditioned through its profile that names no templates gets
+// these two -- the shared Qwen-Image conventions: kPrefix + "{}" + kSuffix
+// (drop 34 == kDropPrefix) and kQiePrefix + "{}" + kQieSuffix (drop 64 ==
+// kQieDropPrefix). Only the multi-reference body is the family's own: a
+// labelled `<label> {j}: <|vision_start|><|image_pad|><|vision_end|>` per
+// reference (no separator), then the instruction, the label coming from the
+// profile's `ref_label`. Qwen-Image-Edit says "Picture {j}: ", and Boogu uses
+// bare unlabelled blocks; ref_blocks_() below renders all three.
 // Boogu-Image's two system prompts, verbatim from BooguImagePipeline
 // (SYSTEM_PROMPT_4_T2I_UNIFIED / SYSTEM_PROMPT_4_TI2I_UNIFIED -- the latter is
 // byte-identical to the Qwen-Image-Edit one above). The pipeline picks between
@@ -435,7 +437,7 @@ constexpr const char* kBooguSuffix = "<|im_end|>\n";
 // ONE system prompt for both tasks -- unlike every other family here,
 // where the t2i and edit prompts differ. It is also unlike anything else
 // in this tree, so it is spelled out rather than adapted: "Describe the
-// image by detailing..." (Krea-2, Mage-Flow, Qwen-Image-2512) and
+// image by detailing..." (Krea-2, Qwen-Image-2512) and
 // "Describe the key features of the input image" (Qwen-Image-Edit,
 // Boogu) are BOTH wrong here, and a wrong system prompt loads, runs and
 // conditions the DiT on the wrong thing.
@@ -447,8 +449,9 @@ constexpr const char* kBooguSuffix = "<|im_end|>\n";
 
 // ---- multi-reference helpers -------------------------------------------
 // One vision block per reference, with the family's own label convention:
-// Qwen-Image-Edit says "Picture N: ", Mage-Flow "Image N: ", Boogu uses bare
-// back-to-back blocks (verified against the reference's rendered template).
+// Qwen-Image-Edit says "Picture N: ", a profile family its own `ref_label`,
+// Boogu uses bare back-to-back blocks (verified against the reference's
+// rendered template).
 // `label` nullptr/empty => unlabelled.
 std::string
 ref_blocks_(int n_ref, const char* label)
@@ -606,10 +609,6 @@ genai::MetalQwenModel::Config encoder_config_flux2_(const std::string& enc_dir)
   }
   return c;
 }
-// Mage-Flow's text encoder IS the same Qwen3-VL 4B krea2 drives; the only
-// difference is the checkpoint layout -- Mage-Flow wraps everything in
-// `model.` (398 LM tensors under "model.language_model.", 315 tower tensors
-// under "model.visual."), krea2 omits that wrapper.
 // A REGISTERED family's encoder, from its conditioning profile.
 //
 // The base is the Qwen3-VL every image family here drives; the profile
@@ -645,9 +644,9 @@ encoder_config_profile_(const FlexData* profile)
 }
 // Boogu-Image's mllm is a stock Qwen3VLForConditionalGeneration -- the 10B
 // ships an 8B Qwen3-VL (36L, hidden 4096, 32q/8kv, rope theta 5e6, UNTIED
-// embeddings) wrapped as `model.language_model.` / `model.visual.` like
-// Mage-Flow. Sized from mllm/config.json's text_config so one path serves any
-// Boogu size.
+// embeddings) wrapped as `model.language_model.` / `model.visual.` (the
+// Qwen3VLForConditionalGeneration wrapper). Sized from mllm/config.json's
+// text_config so one path serves any Boogu size.
 genai::MetalQwenModel::Config encoder_config_boogu_(const std::string& enc_dir)
 {
   genai::MetalQwenModel::Config c = encoder_config_krea2_();
@@ -728,6 +727,21 @@ genai::MetalQwenModel::Config encoder_config_qie_()
   return c;
 }
 
+// <transformer_dir>/config.json's `_class_name`, or empty when there is
+// none to read.
+std::string
+transformer_class_(const std::string& transformer_dir)
+{
+  namespace fs = std::filesystem;
+  std::ifstream in(fs::path(transformer_dir) / "config.json");
+  if (!in) { return {}; }
+  FlexData fd = FlexData::from_json(in);
+  if (!fd.is_object()) { return {}; }
+  auto obj = fd.as_object();
+  if (!obj.contains("_class_name")) { return {}; }
+  return std::string(obj.at("_class_name").as_string(""));
+}
+
 // The transformer family from <root>/transformer/config.json `_class_name`.
 std::string family_(const std::string& transformer_dir)
 {
@@ -742,10 +756,10 @@ std::string family_(const std::string& transformer_dir)
         if (cls == "Flux2Transformer2DModel") { return "flux2"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
         // Qwen-Image-2.1 -- a different network from the two above, and
-        // a different conditioning recipe. Named explicitly for the same
-        // reason Mage-Flow is: it rides the SAME Qwen3-VL the other
-        // families use, so an unrecognized repo would load and silently
-        // condition it with somebody else's system prompt.
+        // a different conditioning recipe. Named explicitly because it
+        // rides the SAME Qwen3-VL the other families use, so an
+        // unrecognized repo would load and silently condition it with
+        // somebody else's system prompt.
         if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21"; }
         // Z-Image. Named for the same reason the others are: its text
         // encoder is a stock Qwen3-4B, so an unrecognized repo would
@@ -753,16 +767,10 @@ std::string family_(const std::string& transformer_dir)
         // and system prompt instead of one un-normed tap of a bare
         // user turn.
         if (cls == "ZImageTransformer2DModel") { return "z-image"; }
-        // Mage-Flow (microsoft/Mage-Flow*). Named EXPLICITLY, never left to
-        // the "krea2" default: its text encoder is the same Qwen3-VL 4B krea2
-        // drives, so an unrecognized repo would LOAD and silently produce
-        // krea2's 12-tap conditioning instead of Mage-Flow's single
-        // last-hidden tap (and with the wrong weight prefix).
-        if (cls == "MageFlow") { return "mage-flow"; }
         // Boogu-Image. The t2i and edit repos ship the SAME transformer config
         // (only the weights differ), so there is one family string; the edit
-        // path turns on when a reference image is wired, exactly as Mage-Flow
-        // switches templates.
+        // path turns on when a reference image is wired, the way a profile
+        // family switches templates.
         if (cls == "BooguImageTransformer2DModel") { return "boogu-image"; }
         // Wan video. Its tower is a umT5-XXL ENCODER rather than a
         // decoder-only LM, so this must be named explicitly -- falling
@@ -1113,6 +1121,10 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       : _family == "z-image" ? encoder_config_z_image_(_enc_dir)
       : _profile != nullptr ? encoder_config_profile_(_profile)
       : encoder_config_krea2_();
+  // A family with a content screen GENERATES on these weights, so the
+  // head is loaded whatever its profile says: a screen that cannot
+  // generate can only refuse, which would block every prompt.
+  if (_screen != nullptr) { ecfg.backbone_only = false; }
   _enc_hidden = ecfg.hidden;
   // The encoder may be affine-quantized (model-quantize target=text_encoder).
   // The loader auto-detects quantized-vs-dense weights but needs the bit-width
@@ -1149,8 +1161,8 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // mechanism's definition: a streamed layer is built inside the
   // PREFILL and freed after it, so decode would re-read the stack per
   // token. Every conditioning encoder here taps hidden states and never
-  // decodes -- except mage-flow, whose content screen generates a
-  // verdict through the lm_head. MetalQwenModel::load refuses the
+  // decodes -- except a family with a content screen, which generates
+  // its verdict through the lm_head. MetalQwenModel::load refuses the
   // combination anyway; asking only when it can be served keeps a
   // warning off a path that is behaving correctly.
   if (ecfg.backbone_only) {
@@ -1233,8 +1245,9 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // to load here -- which is the point of asking for the head at all.
   // Probe it once: an encoder that cannot gather a token embedding can
   // neither condition nor run whatever it wanted the head for.
-  if (_profile != nullptr &&
-      !genai::cond::flag(_profile, genai::cond::kBackboneOnly, true)) {
+  if ((_profile != nullptr &&
+       !genai::cond::flag(_profile, genai::cond::kBackboneOnly, true)) ||
+      _screen != nullptr) {
     if (_encoder->embed_text_buf(std::vector<std::int32_t>{0}).empty()) {
       session()->error(fmt(
           "DiffusionConditionerStage('{}'): the '{}' encoder has no usable "
@@ -1645,11 +1658,48 @@ DiffusionConditionerStage::ensure_loaded_()
       apply_model_config_();
     }
   }
+  // A TRANSFORMER CLASS NOTHING HERE KNOWS, and no registered family
+  // claimed it. Refused rather than conditioned: the fall-through is
+  // "krea2", whose encoder is a Qwen3-VL several other families share,
+  // so an unknown checkpoint would LOAD and be conditioned with Krea-2's
+  // 12-tap stack and system prompt -- a different model at full cost.
+  // The usual cause is a family that lives in a plugin nobody loaded.
+  if (_family == "krea2") {
+    const std::string cls = transformer_class_(
+        (std::filesystem::path(root) / "transformer").string());
+    if (!cls.empty() && cls != "Krea2Transformer2DModel") {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): '{}' is a '{}' checkpoint, which "
+          "no built-in family conditions and no loaded plugin claims -- load "
+          "the plugin that provides it (vpipe --plugin <path>). The stage is "
+          "inert rather than conditioning it as a different model",
+          this->id(), root, cls));
+      return;
+    }
+  }
   // The family's own conditioning profile, if a plugin registered one.
   // Null for every built-in family, which is what the host's own
   // defaults below serve. See generative-models/conditioner-profile.h.
   _family_settled = true;
   _profile = genai::cond::find(_family);
+  // ...and its content screen, if its model family provides one. Built-in
+  // families never do; a registered family hands it out by extension id.
+  // See generative-models/content-screen.h.
+  _screen = nullptr;
+  if (genai::ImageModelFamily* f =
+          genai::ImageModelRegistry::get().find(_family)) {
+    _screen = static_cast<genai::screen::ContentScreen*>(
+        f->query_extension(genai::screen::kExtension));
+  } else if (genai::VideoModelFamily* v =
+                 genai::VideoModelRegistry::get().find(_family)) {
+    _screen = static_cast<genai::screen::ContentScreen*>(
+        v->query_extension(genai::screen::kExtension));
+  }
+  if (_screen != nullptr) {
+    session()->log_normal(fmt(
+        "DiffusionConditionerStage('{}'): the '{}' family screens every "
+        "prompt with its own content policy", this->id(), _family));
+  }
   if (_profile != nullptr) {
     // WHAT THIS HOST DOES NOT IMPLEMENT, said once and out loud.
     //
@@ -1758,8 +1808,9 @@ DiffusionConditionerStage::ensure_loaded_()
     tok_path = (fs::path(root) / "processor" / "tokenizer.json").string();
   }
   if (!fs::exists(tok_path)) {
-    // Mage-Flow ships no separate tokenizer/ or processor/ dir -- the
-    // Qwen3-VL tokenizer + processor configs live beside the weights.
+    // A checkpoint may ship no separate tokenizer/ or processor/ dir --
+    // a Qwen3-VL text encoder keeps its tokenizer and processor configs
+    // beside the weights.
     tok_path = (fs::path(_enc_dir) / "tokenizer.json").string();
   }
   _tokenizer = genai::Tokenizer::from_huggingface_json(tok_path, session());
@@ -2049,10 +2100,13 @@ DiffusionConditionerStage::reload_encoder_()
 // 3-tap concat. WHICH tap is per family and not implied by being here:
 // most take the post-final-norm last hidden, Qwen-Image-2.1 takes the
 // last layer un-normed, and Z-Image takes the SECOND to last.
+//
+// A family conditioned through its PROFILE is single-tap too: the profile
+// path taps the last hidden state only (see conditioner-profile.h).
 static bool
-single_tap_(const std::string& family)
+single_tap_(const std::string& family, const FlexData* profile)
 {
-  return family == "qwen-image-edit" || family == "mage-flow" ||
+  return profile != nullptr || family == "qwen-image-edit" ||
          family == "boogu-image" || family == "wan" ||
          family == "minimax-h3" || family == "qwen-image-21" ||
          family == "z-image";
@@ -2128,20 +2182,20 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
   // instruction is encoded WITH the source image (training-matched grounded
   // encode); the raw source RGB comes through the ref_image iport. The 315
   // visual.* tower tensors ship inside text_encoder/, so it loads from _enc_dir.
-  // Mage-Flow rides the SAME Qwen3-VL tower + deepstack path as krea2; only
-  // the checkpoint prefix ("model.visual." vs "visual."), the conditioning
-  // long-edge cap (384 vs 768) and the processor's min_pixels differ.
+  // A profile family rides the SAME Qwen3-VL tower + deepstack path as
+  // krea2; only the checkpoint prefix ("model.visual." vs "visual."), the
+  // conditioning long-edge cap and the processor's min_pixels differ.
   if (_family == "krea2" || _family == "boogu-image" ||
       _family == "qwen-image-21" || _profile != nullptr) {
-    // Boogu's mllm shares Mage-Flow's checkpoint wrapper ("model.visual."),
-    // its bf16 pipeline dtype and its preprocessor bounds (shortest_edge
-    // 65536), and its pipeline caps the VLM conditioning image at 384x384
-    // pixels -- so it takes the same branch.
+    // Boogu's mllm is a wrapped checkpoint ("model.visual.") with a bf16
+    // pipeline dtype and preprocessor bounds (shortest_edge 65536), and
+    // its pipeline caps the VLM conditioning image at 384x384 pixels -- so
+    // it takes the same branch.
     // Whether the tower's tensors carry the
     // Qwen3VLForConditionalGeneration wrapper ("model.visual.") or sit
     // bare ("visual."). Boogu's mllm is wrapped; a registered family
     // says so in its profile.
-    const bool mage =
+    const bool wrapped =
         _family == "boogu-image" || _family == "qwen-image-21" ||
         (_profile != nullptr &&
          genai::cond::text(_profile, genai::cond::kVisionPrefix,
@@ -2155,18 +2209,19 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
         return {};
       }
       auto vcfg = genai::MetalQwenVisionEncoder::config_from(*mcfg);
-      vcfg.weight_prefix = mage ? "model.visual." : "visual.";
-      // Mage-Flow's pipeline casts its whole text encoder -- the Qwen3-VL
-      // tower included -- to bf16, so the conditioning it was tuned against
-      // carries bf16 tower numerics. Match that here. (f16 is the more
-      // ACCURATE tower, ~3x closer to an fp32 oracle; this is fidelity to
-      // the reference, which is what the goldens measure and what the DiT
-      // was trained alongside.) Krea-2 stays f16 -- its own verified state.
-      vcfg.use_bf16 = mage;
+      vcfg.weight_prefix = wrapped ? "model.visual." : "visual.";
+      // A wrapped checkpoint's pipeline casts its whole text encoder -- the
+      // Qwen3-VL tower included -- to bf16, so the conditioning it was
+      // tuned against carries bf16 tower numerics. Match that here. (f16
+      // is the more ACCURATE tower, ~3x closer to an fp32 oracle; this is
+      // fidelity to the reference, which is what the goldens measure and
+      // what the DiT was trained alongside.) Krea-2 stays f16 -- its own
+      // verified state.
+      vcfg.use_bf16 = wrapped;
       // The processor bounds, from the model layer rather than from
       // literals here. `min_pixels` is what makes a small or very wide
       // reference get UPSCALED before patching: past ~2.25:1 aspect a
-      // 384-capped image falls under Mage-Flow's 65536 and the Qwen
+      // 384-capped image falls under a 65536 min_pixels and the Qwen
       // default of 3136 would silently skip that upscale. 0 means the
       // family did not set one, so the tower's own default stands.
       if (_ground.min_pixels > 0) { vcfg.min_pixels = _ground.min_pixels; }
@@ -2205,10 +2260,10 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
     for (int ri = 0; ri < use_refs; ++ri) {
     std::vector<std::uint8_t> capped;
     int rh = _ref_rgb_h[ri], rw = _ref_rgb_w[ri];
-    // Mage-Flow caps the VL conditioning image's long edge at 384 (its
-    // training preprocessing -- pipeline.py `vl_cond_long_edge`); the VAE
-    // reference path keeps the full target resolution. krea2's grounding
-    // node uses 768.
+    // A family may cap the VL conditioning image's long edge well below
+    // the output (a profile's `grounded_long_edge`, e.g. 384, from its
+    // training preprocessing); the VAE reference path keeps the full
+    // target resolution. krea2's grounding node uses 768.
     // The GEOMETRY comes from the model layer (_ground); the FILTER and
     // the alignment stay per-family code. That split is deliberate: a
     // bound is a number someone might reasonably tune for a fine-tune,
@@ -2255,8 +2310,9 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       const std::size_t ne = (std::size_t)r.n_tokens * _enc_hidden;
       SharedBuffer b = mc->make_shared_buffer(ne * 2);
       if (b.empty()) { _ds_feats.clear(); break; }
-      // The tower's element type is its own business (bf16 for Mage-Flow,
-      // f16 for Krea-2); the encoder residual is bf16 either way. When they
+      // The tower's element type is its own business (bf16 for a wrapped
+      // checkpoint, f16 for Krea-2); the encoder residual is bf16 either
+      // way. When they
       // already agree this is a straight copy.
       const auto* s = static_cast<const std::uint16_t*>(df.contents());
       auto* d = static_cast<std::uint16_t*>(b.contents());
@@ -2570,7 +2626,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     // and not by whether a reference is wired. QwenImageEditPlusPipeline
     // opens "Describe the key features of the input image";
     // QwenImagePipeline opens "Describe the image by detailing", which
-    // kPrefix already holds for Krea-2 and Mage-Flow. The edit model
+    // kPrefix already holds for Krea-2. The edit model
     // uses its own template even when it is run text-only -- that is
     // what its text-only golden pins -- so keying this on the reference
     // would have changed an answer that is already verified. Without the
@@ -2762,7 +2818,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     }
     // Boogu calls the STOCK Qwen3-VL forward, so the image rows carry the
     // normal 2-D mROPE grid (t=base, h=base+row, w=base+col; text resumes at
-    // base + max(mh,mw)) -- NOT Mage-Flow's flat arange override. Each
+    // base + max(mh,mw)) -- NOT a profile family's flat arange. Each
     // reference gets its OWN band.
     const bool use_mrope = grounded && !runs.empty() && img_mw_(0) > 0;
     std::vector<std::int32_t> pos;
@@ -3032,8 +3088,7 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
   // know about a model published after it.
   //
   // The defaults are the shared Qwen-Image conventions, which is what a
-  // profile that says nothing gets -- and what Mage-Flow's own templates
-  // are byte-identical to.
+  // profile that says nothing gets.
   if (_profile != nullptr) {
     namespace c_ = genai::cond;
     const int NL = _encoder->config().n_layers;
@@ -3063,8 +3118,9 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     const int n = (int)ids.size();
     const int n_real = n - drop;
     // Gather through the model's embed muxer (the same table, the same rows:
-    // a dense gather kernel where the other families memcpy). Mage-Flow is
-    // the one family that binds the muxer -- see encoder_config_mage_().
+    // a dense gather kernel where the other families memcpy). A profile
+    // that asked for the head binds the muxer -- see
+    // encoder_config_profile_().
     for (const std::int32_t id : ids) {
       if (id < 0 || id >= _encoder->config().vocab) { return {}; }
     }
@@ -3118,11 +3174,11 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         }
       }
     }
-    // NOTE: SEQUENTIAL positions, NOT the 2-D mROPE grid krea2 uses. Mage-Flow
-    // overrides position_ids with a per-sequence `torch.arange(length)`
-    // (text_encoder.py TextEncoder.forward), which the patched Qwen3-VL text
-    // model expands to three IDENTICAL axes -- so the image rows carry plain
-    // sequential positions even though the tower is multimodal.
+    // NOTE: SEQUENTIAL positions, NOT the 2-D mROPE grid krea2 uses -- the
+    // profile path's only kind. A reference that overrides position_ids
+    // with a per-sequence `torch.arange(length)` has the Qwen3-VL text
+    // model expand it to three IDENTICAL axes, so the image rows carry
+    // plain sequential positions even though the tower is multimodal.
     genai::ContextManager* cm = _encoder->context_manager();
     const genai::ContextId cid = cm->acquire_root();
     SharedBuffer taps;
@@ -3168,9 +3224,10 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
       }
     }
     n_real_out = n_real;
-    session()->log_debug(fmt("DiffusionConditionerStage('{}'): [{}] mage-flow "
-                             "-> [{}, {}] bf16{}", this->id(), which, n_real,
-                             EH, grounded ? ", image-grounded (edit)" : ""));
+    session()->log_debug(fmt("DiffusionConditionerStage('{}'): [{}] {} "
+                             "-> [{}, {}] bf16{}", this->id(), which,
+                             _family, n_real, EH,
+                             grounded ? ", image-grounded (edit)" : ""));
     return txt;
   }
 
@@ -3361,31 +3418,53 @@ blocked_beat_(int enc_hidden)
   return out;
 }
 
-genai::MageScreenVerdict
+genai::screen::Verdict
 DiffusionConditionerStage::screen_(const std::string& prompt,
                                    const SharedBuffer& vtok, int n_img) const
 {
-  // TEXT ONLY: the text-to-image policy, once.
+  // One pass, under the host's guarantees: a screen that throws refuses,
+  // and a generation that failed is said out loud whatever the screen
+  // made of it.
+  auto run = [&](const genai::ChatPicture* pic, int pass, int passes) {
+    genai::screen::ScreenInput in;
+    in.prompt = prompt;
+    in.images = pic != nullptr ? 1 : 0;
+    in.pass   = pass;
+    in.passes = passes;
+    genai::QwenEncoderChat chat(*_encoder, *_tokenizer, pic);
+    genai::screen::Verdict v;
+    try {
+      v = _screen->screen(chat, in);
+    } catch (...) {
+      v = genai::screen::Verdict{};
+      v.reason = "the family's screen threw";
+    }
+    if (!chat.last_error().empty()) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): the content screen's generation "
+          "failed ({}){}", this->id(), chat.last_error(),
+          v.blocked ? "; the prompt is refused" : ""));
+    }
+    return v;
+  };
+
+  // TEXT ONLY: one pass, no picture.
   if (n_img <= 0 || vtok.empty() || _img_n <= 0) {
-    genai::MageScreenRequest req;
-    req.prompt = prompt;
-    return genai::mage_screen(*_encoder, *_tokenizer, req, session());
+    return run(nullptr, 0, 1);
   }
 
   // ONE PASS PER REFERENCE, each with its own picture: its rows of the
   // tower output, its own merged grid and its own deepstack rows, with
   // the instruction every time -- and the prompt is blocked if ANY pass
-  // blocks. The classifier judges ONE source image per turn (the
-  // reference screen builds a single image item), so this is the policy
-  // applied to every picture rather than a new one, and a picture in the
-  // second slot cannot pass unscreened. Packing every reference into one
-  // image block under the FIRST reference's grid is what this replaced:
-  // the token count no longer matched the grid, the position build
-  // failed, and every multi-reference prompt was refused.
+  // blocks, so a picture in the second slot cannot pass unscreened.
+  // Packing every reference into one image block under the FIRST
+  // reference's grid is what this replaced: the token count no longer
+  // matched the grid, the position build failed, and every
+  // multi-reference prompt was refused.
   //
-  // The rows are COPIED into a buffer per pass: the screen reads a
-  // buffer from its first row, and a pass costs one reference's rows
-  // (a few MB) once per prompt.
+  // The rows are COPIED into a buffer per pass: the chat reads a buffer
+  // from its first row, and a pass costs one reference's rows (a few MB)
+  // once per prompt.
   metal_compute::MetalCompute* mc =
       session() != nullptr ? session()->services()->metal_compute() : nullptr;
   const std::size_t row_bytes = (std::size_t)_enc_hidden * 2;
@@ -3405,7 +3484,7 @@ DiffusionConditionerStage::screen_(const std::string& prompt,
     return b;
   };
 
-  genai::MageScreenVerdict last;
+  genai::screen::Verdict last;
   std::size_t row0 = 0;
   for (int i = 0; i < _img_n; ++i) {
     const int tok = i < (int)_img_tok.size() ? _img_tok[(std::size_t)i] : 0;
@@ -3419,27 +3498,25 @@ DiffusionConditionerStage::screen_(const std::string& prompt,
     }
     if (!ok) {
       // FAIL-CLOSED, like every other failure the screen can have.
-      genai::MageScreenVerdict blocked;
+      genai::screen::Verdict blocked;
       blocked.reason = "reference " + std::to_string(i) +
                        " could not be prepared for the screen";
       session()->error(fmt(
-          "DiffusionConditionerStage('{}'): mage_screen: {}; BLOCKING "
+          "DiffusionConditionerStage('{}'): content screen: {}; BLOCKING "
           "(fail-closed)", this->id(), blocked.reason));
       return blocked;
     }
-    genai::MageScreenRequest req;
-    req.prompt = prompt;
-    req.vision = &v;
-    req.n_img  = tok;
-    req.img_mh = img_mh_((std::size_t)i);
-    req.img_mw = img_mw_((std::size_t)i);
-    for (const SharedBuffer& f : ds) { req.deepstack.push_back(&f); }
-    genai::MageScreenVerdict verdict =
-        genai::mage_screen(*_encoder, *_tokenizer, req, session());
-    if (verdict.violates) {
+    genai::ChatPicture pic;
+    pic.vision = &v;
+    pic.rows   = tok;
+    pic.grid_h = img_mh_((std::size_t)i);
+    pic.grid_w = img_mw_((std::size_t)i);
+    for (const SharedBuffer& f : ds) { pic.deepstack.push_back(&f); }
+    genai::screen::Verdict verdict = run(&pic, i, _img_n);
+    if (verdict.blocked) {
       if (_img_n > 1) {
         session()->log_debug(fmt(
-            "DiffusionConditionerStage('{}'): mage_screen blocked on "
+            "DiffusionConditionerStage('{}'): content screen blocked on "
             "reference {} of {}", this->id(), i, _img_n));
       }
       return verdict;
@@ -3899,31 +3976,31 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   auto shape_for = [&](int rows) -> std::vector<std::int64_t> {
     if (_family == "krea2") { return {rows, 12, _enc_hidden}; }
     if (_family == "flux2") { return {rows, 3 * _enc_hidden}; }
-    return {rows, _enc_hidden};   // qwen-image-edit / mage-flow
+    return {rows, _enc_hidden};   // the single-tap families
   };
   // Element type the paired DiT consumes: krea2/flux2 -> f16, the single-tap
-  // families (qwen-image-edit / mage-flow) -> bf16.
-  const TensorBeat::DType cdt = single_tap_(_family) ? TensorBeat::DType::Bf16
+  // families (qwen-image-edit, a profile family, ...) -> bf16.
+  const TensorBeat::DType cdt = single_tap_(_family, _profile)
+                                    ? TensorBeat::DType::Bf16
                                                      : TensorBeat::DType::F16;
 
-  // ---- MANDATORY content screen (Mage-Flow) ----------------------------
-  // Runs on the encoder this stage already owns, on every prompt, with no
-  // config key to turn it off -- microsoft/Mage-Flow puts the classifier on
-  // the text encoder precisely so it cannot be skipped, and a graph that
-  // could omit it would be a bypass. FAIL-CLOSED: mage_screen() returns a
-  // BLOCKING verdict for every failure mode, so a classifier that will not
-  // run stops generation instead of waving it through.
-  if (_family == "mage-flow") {
-    const genai::MageScreenVerdict verdict = screen_(prompt, vtok, n_img);
-    if (verdict.violates) {
+  // ---- MANDATORY content screen ----------------------------------------
+  // When the family provides one: on the encoder this stage already owns,
+  // on every prompt, with no config key to turn it off -- a model that
+  // carries its classifier on its text encoder does so precisely so it
+  // cannot be skipped, and a graph that could omit it would be a bypass.
+  // FAIL-CLOSED: a verdict refuses unless the screen cleared the prompt.
+  if (_screen != nullptr) {
+    const genai::screen::Verdict verdict = screen_(prompt, vtok, n_img);
+    if (verdict.blocked) {
       ++_blocked;
       // Say THAT it was blocked, not WHICH category tripped: the reference
       // surfaces nothing at all (its refusal banner is deliberately empty)
       // because naming the category turns the gate into an oracle to probe
       // against. The full verdict stays at debug level for diagnosis.
       session()->warn(fmt(
-          "DiffusionConditionerStage('{}'): prompt blocked by the Mage-Flow "
-          "content policy; emitting a refusal", this->id()));
+          "DiffusionConditionerStage('{}'): prompt blocked by the '{}' "
+          "content policy; emitting a refusal", this->id(), _family));
       std::string cats;
       for (const auto& c : verdict.categories) {
         if (!cats.empty()) { cats += ","; }

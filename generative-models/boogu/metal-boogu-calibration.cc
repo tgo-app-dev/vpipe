@@ -48,8 +48,8 @@ inline float bf16_to_f32_(std::uint16_t b)
 // The Boogu mllm: a stock Qwen3VLForConditionalGeneration (the 10B ships an 8B
 // Qwen3-VL: 36 layers, hidden 4096, 32q/8kv GQA head_dim 128, rope theta 5e6,
 // UNTIED embeddings), checkpoint-wrapped as `model.language_model.` /
-// `model.visual.` like Mage-Flow. Sized from mllm/config.json's text_config so
-// one path serves any Boogu size. Mirrors the diffusion-conditioner's
+// `model.visual.`. Sized from mllm/config.json's text_config so one path
+// serves any Boogu size. Mirrors the diffusion-conditioner's
 // encoder_config_boogu_.
 MetalQwenModel::Config
 encoder_config_(const std::string& enc_dir)

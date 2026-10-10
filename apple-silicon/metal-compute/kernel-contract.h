@@ -5,7 +5,9 @@
 // name, and everything a dispatch depends on besides the name -- the
 // parameter block the steel attention kernel reads and the function
 // constants that specialise it. Feature VPIPE_FEATURE_KERNEL_CONTRACT
-// ("kernel-contract/1").
+// ("kernel-contract/1") for revision 1, and
+// VPIPE_FEATURE_KERNEL_CONTRACT_2 ("kernel-contract/2") for the entries
+// revision 2 added; a host with the second still serves the first.
 //
 // Resolving a host kernel by name is an ABI like any other, only a
 // string-level one: a renamed entry point resolves to an INVALID
@@ -36,7 +38,10 @@ namespace vpipe {
 namespace metal_compute {
 namespace contract {
 
-inline constexpr int kRevision = 1;
+// The newest revision this header describes. kKernels lists revision 1
+// first and then what revision 2 added; a plugin that resolves a
+// revision-2 entry requires "kernel-contract/2".
+inline constexpr int kRevision = 2;
 
 struct Kernel {
   std::string_view library;
@@ -85,6 +90,19 @@ inline constexpr Kernel kKernels[] = {
   {"attn_steel", "attn_steel_h_bd128_bf16"},
   {"attn_steel_nax", "attn_steel_nax_h_bd64_bf16"},
   {"attn_steel_nax", "attn_steel_nax_h_bd128_bf16"},
+
+  // ---- revision 2 ----
+  // y += scale * (x @ W^T): the accumulate twin runtime LoRA adds an
+  // adapter's up projection with on a box without matrix cores.
+  {"dense_gemm_bf16", "dense_gemm_t_bm64_acc_f16"},
+  // The f16 libraries, for a model that runs in f16 (a codec whose
+  // reference is f16): the GEMMs, the scalar attention and the norm
+  // that are not worth copying into a plugin.
+  {"dense_gemm", "dense_gemm_bias_f16"},
+  {"dense_gemm_mma", "dense_gemm_mma_t_n128_f16"},
+  {"dense_gemm_mma", "dense_gemm_mma_t_n128x256_f16"},
+  {"sdpa", "sdpa_full_f16"},
+  {"rms_norm", "rms_norm_fast_f16"},
 };
 
 // ---- the toolkit's kernels ------------------------------------------------

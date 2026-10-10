@@ -456,10 +456,6 @@ TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   EXPECT_TRUE(has_(e->files, "imatrix_unsloth.gguf_file"));
 }
 
-// The Mage-Flow family: six 4B entries in two instantiations -- Gen
-// (t2i, "mage-flow", text-in) and Edit ("mage-flow-edit", text+image-in),
-// each in Base / RL-aligned / Turbo. All six pin the SAME 18-file
-// non-asset layout.
 TEST(model_catalog, boogu_image_family_present) {
   struct Row { const char* path; const char* ver; const char* mt; };
   const Row rows[] = {
@@ -611,67 +607,48 @@ TEST(model_catalog, qwen_image_21_present) {
   EXPECT_TRUE(catalog_category(*e) == "model");
 }
 
-TEST(model_catalog, mage_flow_family_present) {
-  // The six Mage-Flow rows are NOT in kCatalog any more: they moved into
-  // the vpipe-mage-flow plugin, which registers them at load (see the
-  // "Mage-Flow: NOT HERE" note in model-catalog.cc). Without that plugin
-  // they are absent, and this test used to assert them straight into a
-  // null dereference at `*catalog_by_path(...)` below -- which did not
-  // fail the test, it SEGFAULTED the binary, so every model_catalog test
-  // alphabetically after this one stopped running and nobody could see
-  // that either. Assert them only when the plugin has registered them.
-  if (catalog_by_path("microsoft/Mage-Flow-Base") == nullptr) {
-    std::printf("[catalog] vpipe-mage-flow plugin not loaded; skipped\n");
-    return;
+// The Turbo checkpoint is the same family, model_type and code path as
+// the base -- and its own packing: ONE text-encoder file where the base
+// has four shards, and the transformers-5 processor/ with a consolidated
+// processor_config.json and no preprocessor_config.json. A file list
+// copied from the base row would fetch an index and shards that are not
+// there. It is a second VARIANT of the same version, offered beside the
+// base in the browser rather than replacing it.
+TEST(model_catalog, qwen_image_21_turbo_present) {
+  const ModelCatalogEntry* e = catalog_by_path("Qwen/Qwen-Image-2.1-Turbo");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Qwen-Image");
+  EXPECT_TRUE(e->version == "2.1");
+  EXPECT_TRUE(e->param_class == "7B");
+  EXPECT_TRUE(e->model_type == "qwen-image-21");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  // model_index.json carries the schedule (`sample_sigmas`), so it is not
+  // just packaging here.
+  EXPECT_TRUE(has_(e->files, "model_index.json"));
+  EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
+  EXPECT_TRUE(has_(e->files, "text_encoder/model.safetensors"));
+  EXPECT_FALSE(has_(e->files, "text_encoder/model.safetensors.index.json"));
+  EXPECT_FALSE(has_(e->files,
+                    "text_encoder/model-00001-of-00004.safetensors"));
+  EXPECT_TRUE(has_(e->files,
+                   "transformer/diffusion_pytorch_model-00002-of-00002."
+                   "safetensors"));
+  EXPECT_TRUE(has_(e->files, "processor/tokenizer.json"));
+  EXPECT_TRUE(has_(e->files, "processor/processor_config.json"));
+  EXPECT_FALSE(has_(e->files, "processor/preprocessor_config.json"));
+  // Showcase assets are 40 MB the model does not need.
+  for (const std::string& f : e->files) {
+    EXPECT_TRUE(f.rfind("assets/", 0) != 0);
   }
-  struct Row { const char* path; const char* ver; const char* mt; };
-  const Row rows[] = {
-      {"microsoft/Mage-Flow-Base", "Gen", "mage-flow"},
-      {"microsoft/Mage-Flow", "Gen", "mage-flow"},
-      {"microsoft/Mage-Flow-Turbo", "Gen", "mage-flow"},
-      {"microsoft/Mage-Flow-Edit-Base", "Edit", "mage-flow-edit"},
-      {"microsoft/Mage-Flow-Edit", "Edit", "mage-flow-edit"},
-      {"microsoft/Mage-Flow-Edit-Turbo", "Edit", "mage-flow-edit"}};
-  for (const Row& r : rows) {
-    const ModelCatalogEntry* e = catalog_by_path(r.path);
-    EXPECT_TRUE(e != nullptr);
-    if (e == nullptr) { continue; }
-    EXPECT_TRUE(e->family == "Mage-Flow");
-    EXPECT_TRUE(e->version == r.ver);
-    EXPECT_TRUE(e->param_class == "4B");
-    EXPECT_TRUE(e->model_type == r.mt);
-    EXPECT_FALSE(e->needs_tokenizer_json);
-    // Pinned layout: the split-stage sub-models, no assets/.
-    EXPECT_TRUE(e->files.size() == 18);
-    EXPECT_TRUE(has_(e->files, "model_index.json"));
-    EXPECT_TRUE(has_(e->files,
-                     "transformer/diffusion_pytorch_model.safetensors"));
-    EXPECT_TRUE(has_(e->files, "vae/diffusion_pytorch_model.safetensors"));
-    EXPECT_TRUE(has_(e->files,
-                     "text_encoder/model-00002-of-00002.safetensors"));
-    EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
-  }
-  // Both variants of each instantiation drill down under one family.
-  auto gen = catalog_variants("Mage-Flow", "Gen", "4B");
-  EXPECT_TRUE(gen.size() == 3);
-  EXPECT_TRUE(has_(gen, "Turbo 4-step distilled bf16 (microsoft)"));
-  auto edit = catalog_variants("Mage-Flow", "Edit", "4B");
-  EXPECT_TRUE(edit.size() == 3);
-  EXPECT_TRUE(has_(edit, "Turbo 4-step distilled bf16 (microsoft)"));
-
-  // Modalities: Edit is image-conditioned, Gen is not; both emit images.
-  FlexData ef = catalog_entry_to_flex(
-      *catalog_by_path("microsoft/Mage-Flow-Edit-Turbo"));
-  auto ein = flex_arr_(ef, "inputs");
-  EXPECT_TRUE(has_(ein, "text"));
-  EXPECT_TRUE(has_(ein, "image"));
-  EXPECT_TRUE(has_(flex_arr_(ef, "outputs"), "image"));
-  FlexData tf = catalog_entry_to_flex(
-      *catalog_by_path("microsoft/Mage-Flow-Turbo"));
-  auto tin = flex_arr_(tf, "inputs");
-  EXPECT_TRUE(tin.size() == 1);
-  EXPECT_TRUE(has_(tin, "text"));
-  EXPECT_TRUE(has_(flex_arr_(tf, "outputs"), "image"));
+  // Two variants of one version: the base and the Turbo.
+  const auto vs = catalog_variants("Qwen-Image", "2.1", "7B");
+  EXPECT_TRUE(vs.size() == 2);
+  FlexData f = catalog_entry_to_flex(*e);
+  auto in = flex_arr_(f, "inputs");
+  EXPECT_TRUE(has_(in, "text"));
+  EXPECT_TRUE(has_(in, "image"));
+  EXPECT_TRUE(has_(flex_arr_(f, "outputs"), "image"));
 }
 
 // Input/output modalities + derived category are exposed via

@@ -241,7 +241,11 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
   const double smax = 1.0, smin = 1.0 / (double)S;
 
   std::vector<double> base((std::size_t)S);
-  if (type == "karras") {
+  if ((int)base_sigmas.size() == S) {
+    // The caller's RAW nodes -- diffusers' `sigmas=` argument, which the
+    // static scheduler shifts the same way it would its own grid.
+    base = base_sigmas;
+  } else if (type == "karras") {
     const double mi = std::pow(smin, 1.0 / rho), ma = std::pow(smax, 1.0 / rho);
     for (int i = 0; i < S; ++i) {
       const double r = (S == 1) ? 0.0 : (double)i / (double)(S - 1);
@@ -264,6 +268,18 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
   std::vector<double> sig((std::size_t)S + 1);
   for (int i = 0; i < S; ++i) {
     sig[(std::size_t)i] = time_shift(base[(std::size_t)i], shift, expo);
+  }
+  // shift_terminal applies with dynamic shifting off too: diffusers
+  // stretches whatever the shift produced. 0 (every static schedule here
+  // but an explicit one) leaves the grid alone.
+  if (shift_terminal > 0.0 && S >= 1) {
+    const double last_omz = 1.0 - sig[(std::size_t)S - 1];
+    const double scale = last_omz / (1.0 - shift_terminal);
+    if (scale != 0.0) {
+      for (int i = 0; i < S; ++i) {
+        sig[(std::size_t)i] = 1.0 - (1.0 - sig[(std::size_t)i]) / scale;
+      }
+    }
   }
   sig[(std::size_t)S] = 0.0;   // terminal
   return sig;

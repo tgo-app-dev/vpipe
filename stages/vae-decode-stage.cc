@@ -133,9 +133,6 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,"
                       "qwen-image-edit,qwen-image-21,"
-                      ""
-       "mage-flow,"
-       "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-ref2va,"
        "minimax-h3-image-vae,vosr",
@@ -242,8 +239,9 @@ const StageSpec kSpec = {
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 // Detect the VAE family from the vae config.json `_class_name`:
-// "AutoencoderKLFlux2" -> "flux2"; "MageVAE" -> "mage"; anything else
-// (AutoencoderKLQwenImage) -> "krea2".
+// "AutoencoderKLFlux2" -> "flux2"; anything else (AutoencoderKLQwenImage)
+// -> "krea2". A registered family is asked before this (see
+// ensure_loaded_), so a VAE a plugin decodes never reaches it.
 std::string
 vae_family_(const std::string& vae_dir)
 {
@@ -258,10 +256,6 @@ vae_family_(const std::string& vae_dir)
                                        {"video_vae"}).empty()) {
     return "minimax-h3";
   }
-  // Mage-Flow's MageVAE by FILE, with no config to read a class name
-  // from (resolve_vae_dir() hands the Comfy-Org repack's back this way).
-  // Its tensors say what it is; the geometry is MetalMageVae's defaults.
-  if (genai::MetalMageVae::is_native_checkpoint(vae_dir)) { return "mage"; }
   std::ifstream in(fs::path(vae_dir) / "config.json");
   if (in) {
     FlexData fd = FlexData::from_json(in);
@@ -275,7 +269,6 @@ vae_family_(const std::string& vae_dir)
         // patch 1 with a scalar shift/scale whitening it IS a plain
         // AutoencoderKL. Same family string, so the branches below are shared.
         if (cls == "AutoencoderKL") { return "flux2"; }
-        if (cls == "MageVAE") { return "mage"; }
         // Qwen-Image-2.1's VAE. The SAME family string on purpose: it is
         // the same implementation, generalized -- five levels instead of
         // four, z 64, RGBA, and an asymmetric decoder, all of which come
@@ -283,6 +276,12 @@ vae_family_(const std::string& vae_dir)
         // anyway rather than left to the "krea2" fall-through below,
         // which would also catch a VAE nobody has read yet.
         if (cls == "AutoencoderKLQwenImage21") { return "krea2"; }
+        // The original: Krea-2's and Qwen-Image's VAE, and its RGBA
+        // form (4 channels by `input_channels`, a scalar
+        // scaling_factor in place of per-channel stats -- both read by
+        // MetalKrea2Vae::config_from_json). Named for the same reason as
+        // the line above, rather than reached only by the fall-through.
+        if (cls == "AutoencoderKLQwenImage") { return "krea2"; }
         // The VIDEO VAE. Same tensor names as the Qwen-Image one
         // (it IS the general form of it), so the class name is the
         // only thing that tells them apart -- and getting it wrong
@@ -310,30 +309,6 @@ vae_family_(const std::string& vae_dir)
   return "krea2";
 }
 
-// Mage-Flow's MageVAE geometry from vae/config.json (latent_channels 128,
-// downsample_factor 16). Everything else -- the DiCo trunk width, the CoD
-// decoder, the per-pixel MLP head -- is fixed by the checkpoint, not
-// configurable, so it stays on MetalMageVae::Config's defaults.
-genai::MetalMageVae::Config
-mage_vae_config_(const std::string& vae_dir)
-{
-  genai::MetalMageVae::Config c;
-  std::ifstream in(std::filesystem::path(vae_dir) / "config.json");
-  if (in) {
-    FlexData fd = FlexData::from_json(in);
-    if (fd.is_object()) {
-      auto o = fd.as_object();
-      if (o.contains("latent_channels")) {
-        c.latent_channels =
-            (int)o.at("latent_channels").as_int(c.latent_channels);
-      }
-      if (o.contains("downsample_factor")) {
-        c.patch = (int)o.at("downsample_factor").as_int(c.patch);
-      }
-    }
-  }
-  return c;
-}
 #endif
 }  // namespace
 
@@ -371,7 +346,7 @@ VaeDecodeStage::reset_run_state()
   // the tested pointers null, cleared the guard, and let the next
   // ensure_loaded_() build a second decoder ON TOP of the live one --
   // momentarily 2x peak, which for H3's 10.4 GB is 20.8 GB.
-  if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
+  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae &&
       !_plugin_dec) {
     _load_attempted = false;
     _unloaded       = false;
@@ -680,7 +655,7 @@ VaeDecodeStage::unload_vae_()
   // _wan_vae was in neither the guard nor the resets, so the idle policy
   // never unloaded a Wan VAE at all: with only _wan_vae held every
   // tested pointer was null and this returned early.
-  if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
+  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae &&
       !_plugin_dec) {
     return;
   }
@@ -692,7 +667,6 @@ VaeDecodeStage::unload_vae_()
   // was weak and there was nothing left to pool afterwards).
   _vae.reset();
   _flux2_vae.reset();
-  _mage_vae.reset();
   _wan_vae.reset();
   _h3_vae.reset();
   _plugin_dec.reset();
@@ -976,22 +950,6 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
 
-  if (_family == "mage") {
-    load_note_(fmt("VaeDecodeStage('{}'): loading MageVAE from '{}'",
-                        this->id(), vae_dir));
-    // Decode-only here: the encoder half (student.dconv_encoder.*) is the
-    // vae-encode stage's business, and skipping it saves ~67M params.
-    _mage_vae = genai::MetalMageVae::load(ws, mc,
-                                          mage_vae_config_(vae_dir),
-                                          /*with_encoder=*/false);
-    if (!_mage_vae) {
-      session()->error(fmt(
-          "VaeDecodeStage('{}'): failed to load the MageVAE from '{}'; inert",
-          this->id(), vae_dir));
-    }
-    return;
-  }
-
   genai::MetalKrea2Vae::Config cfg;   // Qwen-Image VAE defaults
   // Read the per-channel latent statistics (and z_dim / base_dim) from the
   // vae config.json; the un-whiten needs latents_mean / latents_std.
@@ -1195,7 +1153,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     co_return;
   }
   // ---- Content-policy refusal ------------------------------------------
-  // A prompt the Mage-Flow content screen refused never reaches a DiT, so
+  // A prompt a family's content screen refused never reaches a DiT, so
   // there is no latent to decode -- the upstream beat is a marker carrying
   // only the intended image size. Paint the reference's refusal image (a
   // plain white frame: no text, no category, nothing that would tell a
@@ -1304,8 +1262,6 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  // ---- Mage-Flow MageVAE: input [128, H/16, W/16]; decode straight to RGB in
-  // [-1,1] (no per-channel un-whiten -- MageVAE has no latents_mean/std). ----
   // ---- Wan video VAE: input [z_dim, T, h8, w8]; decode to
   // ---- MiniMax-H3: a ViT decoder over a 16x-compressed latent --------
   if (_family == "minimax-h3") {
@@ -1971,63 +1927,6 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-
-  if (_family == "mage") {
-    if (!_mage_vae) {
-      session()->warn(fmt(
-          "VaeDecodeStage('{}'): MageVAE not loaded; skipping", this->id()));
-      co_return;
-    }
-    const int Cz = (int)tbp->shape[0];
-    const int h = (int)tbp->shape[1], w = (int)tbp->shape[2];
-    const int P = _mage_vae->config().patch;
-    if (Cz != _mage_vae->config().latent_channels || h <= 0 || w <= 0) {
-      session()->warn(fmt(
-          "VaeDecodeStage('{}'): latent [{}, {}, {}] does not match "
-          "latent_channels {}; skipping", this->id(), Cz, h, w,
-          _mage_vae->config().latent_channels));
-      co_return;
-    }
-    const std::size_t nz = (std::size_t)Cz * h * w;
-    metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
-    if (z.empty()) { co_return; }
-    { auto* d = static_cast<_Float16*>(z.contents());
-      const float* s = tbp->as_f32();
-      for (std::size_t i = 0; i < nz; ++i) { d[i] = (_Float16)s[i]; } }
-    std::string derr;
-    metal_compute::SharedBuffer rgb;
-    {
-      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
-                         kPerfLlmVaeBegin, (std::uint64_t)(h * P) * (w * P));
-      rgb = _mage_vae->decode(z, h, w, &derr);
-    }
-    if (rgb.empty()) {
-      session()->warn(fmt(
-          "VaeDecodeStage('{}'): MageVAE decode failed ({}); skipping",
-          this->id(), derr.empty() ? "unknown error" : derr));
-      co_return;
-    }
-    const int H = h * P, W = w * P;
-    const std::size_t n = (std::size_t)3 * H * W;
-    auto out = std::make_unique<TensorBeatPayload>();
-    out->dtype = _out_dtype;
-    out->shape = {3, H, W};
-    out->resize_contiguous(n);
-    const auto* rp = static_cast<const _Float16*>(rgb.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      // MetalMageVae::decode does NOT clamp (the reference clamps at the PIL
-      // conversion, which is put_unit_'s).
-      put_unit_(*out, i, ((float)rp[i] + 1.0f) * 0.5f);
-    }
-    ++_images_emitted;
-    session()->log_debug(fmt(
-        "VaeDecodeStage('{}'): MageVAE decoded + emitted image #{} [3, {}, {}]",
-        this->id(), _images_emitted, H, W));
-    forward_model_name_(*tbp, *out);
-    if (_unload_idle) { unload_vae_(); }
-    co_await ctx.write(0, std::move(out));
-    co_return;
-  }
 
   if (!_vae) {
     session()->warn(fmt(

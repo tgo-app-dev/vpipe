@@ -75,16 +75,19 @@ const ConfigKey kAttrs[] = {
           "0 skips its two GEMMs", .def_real = 1.0},
   {.key = "sigmas", .type = ConfigType::Array, .required = false,
    .doc = "the schedule's RAW sigma nodes, highest noise first -- the "
-          "diffusers pipeline's `sigmas=` argument -- in place of "
-          "linspace(1, 1/steps, steps); the step count is their number, "
-          "and the resolution-dependent time shift is applied to them as "
-          "to the default grid. What a few-step adapter ships: Viggle's "
-          "turbo v0.2.1 is [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25] with "
-          "shift_terminal 0. Unset => the default grid"},
+          "diffusers pipeline's `sigmas=` argument -- in place of the "
+          "checkpoint's grid (linspace(1, 1/steps, steps), or a distilled "
+          "checkpoint's own nodes); the step count is their number, and "
+          "the checkpoint's time shift is applied to them as to its grid "
+          "(resolution-dependent on the base model, none on a distilled "
+          "one). What a few-step adapter ships: Viggle's turbo v0.2.1 is "
+          "[1.0, 0.9375, 0.875, 0.75, 0.5, 0.25] with shift_terminal 0. "
+          "Unset => the checkpoint's grid"},
   {.key = "shift_terminal", .type = ConfigType::Real, .required = false,
    .doc = "where the shifted schedule's last nonzero sigma is stretched "
-          "to. Unset => the checkpoint's own 0.02; 0 = no stretch, which "
-          "is what a schedule shipped with shift_terminal null asks for"},
+          "to. Unset => the checkpoint's own (0.02 on the base model, none "
+          "on a distilled one); 0 = no stretch, which is what a schedule "
+          "shipped with shift_terminal null asks for"},
   // The live-preview keys every family's config source shares; see
   // stages/latent-preview.h. Qwen-Image-2.1's TAE is madebyollin's
   // `taeqi2_1`: 16x, reading the DiT's 64-channel latent as it stands,

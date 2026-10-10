@@ -124,7 +124,7 @@ inline constexpr std::uint32_t kGvidLlmDit     = kPerfAuxGvidBase + 6u;
 // At 1024px the decode is seconds of GPU work that previously showed up
 // nowhere, so a run looked like a gap between the last denoise step and the
 // image. Recorded by the vae-encode / vae-decode STAGES, so it is
-// family-agnostic (Krea-2 / FLUX.2 / Qwen-Image / MageVAE alike).
+// family-agnostic (Krea-2 / FLUX.2 / Qwen-Image / a plugin's VAE alike).
 inline constexpr std::uint32_t kGvidLlmVae     = kPerfAuxGvidBase + 7u;
 
 // Per-activity begin type ids (end = begin + 1, per the parity

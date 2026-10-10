@@ -531,10 +531,8 @@ TEST(qwen_image_edit_dit, ref_block_bisect)
 }
 
 // vec4 adaLN / gate twins: same arithmetic per element, so the staged block-0
-// output must be BIT-IDENTICAL. This covers MAGE-FLOW too -- its DiT is this
-// same class under a different Config, so the adaln/gated call sites are shared
-// code. The guard is the plumbing: the (H, total) -> (H/4, total/H) rewrite and
-// the 4-alignment of every bound element offset, including the two-range image
+// output must be BIT-IDENTICAL. The guard is the plumbing: the
+// (H, total) -> (H/4, total/H) rewrite and the 4-alignment of every bound element offset, including the two-range image
 // gating (generated rows vs reference rows) that only this family does. An
 // unaligned vec4 access is undefined, so a wrong offset gives garbage, not a
 // rounding difference.

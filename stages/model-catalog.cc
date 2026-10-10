@@ -917,7 +917,7 @@ builtin_catalog_()
     // QwenImageEditPlusPipeline there -- and they condition through
     // DIFFERENT system prompts: the plain "Describe the image by
     // detailing ..." template (the one kPrefix / kDropPrefix already hold
-    // for Krea-2 and Mage-Flow) against the edit template that opens
+    // for Krea-2) against the edit template that opens
     // "Describe the key features of the input image". Typing this as the
     // edit model would load and run and quietly condition it on the wrong
     // prompt, which is the failure nothing downstream can see.
@@ -1044,6 +1044,51 @@ builtin_catalog_()
                "processor/chat_template.jinja",
                "processor/preprocessor_config.json",
                "processor/video_preprocessor_config.json",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // Qwen-Image-2.1-Turbo (Qwen): the same 7B DiT, 8B VL encoder and RGBA
+    // VAE as the row above -- byte-identical configs, so the same family,
+    // the same code path and the same model_type -- with weights
+    // distilled to EIGHT denoising steps, text-to-image and editing both.
+    // What differs is all in the files, and each one changes behaviour:
+    //   model_index.json carries `sample_sigmas`, the 8 raw sigma nodes
+    //     (excluding the terminal 0) the distillation was trained on.
+    //     They ARE the schedule and the step count; diffusers'
+    //     QwenImage21Pipeline uses them unless a call passes `sigmas`, and
+    //     ignores num_inference_steps (diffusers PR #14950).
+    //   scheduler_config.json turns dynamic shifting OFF (shift 1.0,
+    //     shift_terminal null), so those nodes are used exactly as written:
+    //     no per-resolution mu, no terminal stretch. Running them through
+    //     the base model's shifted, stretched grid is a different sampler.
+    //   Guidance is CFG 1 (the pipeline default), and the prefix KV cache
+    //     is on, as for the base model.
+    //   Packing: the text encoder is ONE 17.5 GB model.safetensors (no
+    //     index), the VAE is stored bf16 (675 MB against the base's F32
+    //     1.35 GB), and processor/ is the transformers-5 layout --
+    //     tokenizer.json, tokenizer_config.json, chat_template.jinja and a
+    //     consolidated processor_config.json, with no vocab/merges or
+    //     separate (video_)preprocessor_config.json.
+    // Qwen Research License, like the base. `files` pins the diffusers
+    // subfolders and processor/, skipping README/LICENSE and the 40 MB of
+    // showcase assets. ~32 GB.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "7B",
+     .variant = "Turbo 8-step bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-2.1-Turbo",
+     .model_type = "qwen-image-21",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
     // A tiny autoencoder for LIVE PREVIEWS of Qwen-Image-2.1
@@ -1382,14 +1427,13 @@ builtin_catalog_()
      .parent_model_type = "flux2",
      .files = {"taef2.safetensors"},
      .needs_tokenizer_json = false},
-    // ---- Mage-Flow: NOT HERE, and that is the point ------------------
-    // Its six records moved into the vpipe-mage-flow plugin, which
-    // registers them with register_catalog_entries. A model whose CODE
-    // is out of tree should have its catalogue row out of tree too, or
-    // the browser offers a checkpoint nothing in the process can load.
+    // A model whose CODE is out of tree has its catalogue rows out of
+    // tree too -- its plugin registers them with register_catalog_entries
+    // -- or the browser offers a checkpoint nothing in the process can
+    // load.
     // ---- Boogu-Image (text+image -> image, NextDiT lineage) -----------
     // Boogu-Image-0.1 (Boogu Team): a 10B flow-matching family in the same
-    // diffusers split-stage shape as Krea-2 / FLUX.2 / Mage-Flow (encoder ->
+    // diffusers split-stage shape as Krea-2 / FLUX.2 (encoder ->
     // DiT stage + separate VAE stages), but a NextDiT / Lumina-Image-2.0
     // topology rather than an MMDiT. Four repos share one architecture and one
     // code path: Base + Turbo are text-to-image ("boogu-image"), Edit +

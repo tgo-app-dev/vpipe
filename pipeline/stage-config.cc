@@ -1,4 +1,5 @@
 #include "pipeline/stage-config.h"
+#include "pipeline/stage-consumer-types.h"
 
 #include "pipeline/stage-registry.h"
 #include "pipeline/stage-spec.h"
@@ -63,6 +64,33 @@ split_into_(std::string_view csv, std::vector<std::string>* out)
   }
 }
 
+// Tag -> the catalogue model types it also stands for (see
+// register_type_aliases). Guarded by runtime_channel_mu_().
+std::vector<std::pair<std::string, std::vector<std::string>>>&
+type_aliases_()
+{
+  static std::vector<std::pair<std::string, std::vector<std::string>>> t;
+  return t;
+}
+
+// Append `t` and its aliases to `out`, skipping what is already there.
+// Caller holds runtime_channel_mu_().
+void
+append_with_aliases_(const std::string& t, std::vector<std::string>* out)
+{
+  if (find(out->begin(), out->end(), t) == out->end()) {
+    out->push_back(t);
+  }
+  for (const auto& [tag, more] : type_aliases_()) {
+    if (tag != t) { continue; }
+    for (const std::string& m : more) {
+      if (find(out->begin(), out->end(), m) == out->end()) {
+        out->push_back(m);
+      }
+    }
+  }
+}
+
 // The model_types offered by the SOURCE of a shared-model channel: the
 // union of what every registered CONSUMER of that channel declares.
 //
@@ -95,11 +123,7 @@ channel_union_(string_view channel)
     lock_guard<mutex> lk(runtime_channel_mu_());
     for (const auto& [ch, types] : runtime_channel_types_()) {
       if (ch != channel) { continue; }
-      for (const string& t : types) {
-        if (find(out.begin(), out.end(), t) == out.end()) {
-          out.push_back(t);
-        }
-      }
+      for (const string& t : types) { append_with_aliases_(t, &out); }
     }
   }
   string csv;
@@ -122,6 +146,55 @@ register_channel_types(string_view channel, string_view csv_model_types)
     if (ch == channel) { split_into_(csv_model_types, &types); return; }
   }
   tbl.push_back({string(channel), {}});
+  split_into_(csv_model_types, &tbl.back().second);
+}
+
+namespace {
+
+std::vector<std::pair<std::string, std::vector<std::string>>>&
+consumer_types_()
+{
+  static std::vector<std::pair<std::string, std::vector<std::string>>> t;
+  return t;
+}
+
+}  // namespace
+
+void
+register_consumer_types(string_view stage_type, string_view csv_model_types)
+{
+  if (stage_type.empty() || csv_model_types.empty()) { return; }
+  lock_guard<mutex> lk(runtime_channel_mu_());
+  auto& tbl = consumer_types_();
+  for (auto& [st, types] : tbl) {
+    if (st == stage_type) { split_into_(csv_model_types, &types); return; }
+  }
+  tbl.push_back({string(stage_type), {}});
+  split_into_(csv_model_types, &tbl.back().second);
+}
+
+vector<string>
+consumer_types(string_view stage_type)
+{
+  lock_guard<mutex> lk(runtime_channel_mu_());
+  vector<string> out;
+  for (const auto& [st, types] : consumer_types_()) {
+    if (st != stage_type) { continue; }
+    for (const string& t : types) { append_with_aliases_(t, &out); }
+  }
+  return out;
+}
+
+void
+register_type_aliases(string_view tag, string_view csv_model_types)
+{
+  if (tag.empty() || csv_model_types.empty()) { return; }
+  lock_guard<mutex> lk(runtime_channel_mu_());
+  auto& tbl = type_aliases_();
+  for (auto& [t, types] : tbl) {
+    if (t == tag) { split_into_(csv_model_types, &types); return; }
+  }
+  tbl.push_back({string(tag), {}});
   split_into_(csv_model_types, &tbl.back().second);
 }
 

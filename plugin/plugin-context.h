@@ -142,7 +142,7 @@ public:
   //
   // Takes ownership; the registry outlives every stage. First-wins on
   // `tag()`, and a tag colliding with a built-in family name
-  // ("wan", "minimax-h3", "flux2", "mage", "krea2") is refused outright:
+  // ("wan", "minimax-h3", "flux2", "krea2") is refused outright:
   // dispatch is pointer-guarded so it would still run the right code,
   // but every log line would read as a built-in.
   bool register_vae_family(std::unique_ptr<genai::VaeModelFamily> family);

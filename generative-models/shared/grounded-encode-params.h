@@ -14,9 +14,9 @@ namespace genai {
 // conditioning.
 //
 // These numbers come from each reference pipeline's own preprocessing and
-// they are not interchangeable: Mage-Flow's `vl_cond_long_edge` is 384
-// where Krea-2's grounding node uses 768, and Boogu-Image caps the long
-// side at 768 but the AREA at 384x384. Feeding one family another's
+// they are not interchangeable: a family trained at a 384 long edge
+// conditions differently from Krea-2's grounding node at 768, and
+// Boogu-Image caps the long side at 768 but the AREA at 384x384. Feeding one family another's
 // numbers produces a well-formed conditioning that lands somewhere the
 // DiT was never trained against -- an edit that mis-targets rather than a
 // failure, which is the expensive kind of wrong.
@@ -39,14 +39,14 @@ struct GroundedEncodeParams {
   std::size_t pixel_budget = 0;
   // The image processor's own bounds, passed to the vision tower's
   // config. 0 = keep the tower's default. `min_pixels` is what makes a
-  // small or very wide reference get UPSCALED before patching; the
-  // Mage-Flow families set it far above the Qwen default and a reference
-  // that falls under it is silently not upscaled without this.
+  // small or very wide reference get UPSCALED before patching; a family
+  // that sets it far above the Qwen default has a reference that falls
+  // under it silently not upscaled without this.
   std::size_t min_pixels = 0;
   std::size_t max_pixels = 0;
 
   // What `family` needs, before any config. The family vocabulary is the
-  // conditioner's own `_family` tag ("krea2", "mage-flow", "boogu-image",
+  // conditioner's own `_family` tag ("krea2", "boogu-image",
   // "qwen-image-edit"); anything else gets an all-zero set, which means
   // "no capping, tower defaults" -- the right answer for a family with no
   // grounded path at all.

@@ -1,6 +1,7 @@
 #include "generative-models/video-model-registry.h"
 
 #include "pipeline/stage-config.h"
+#include "pipeline/stage-consumer-types.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -39,6 +40,9 @@ VideoModelRegistry::add(std::unique_ptr<VideoModelFamily> f)
   // not exist. Telling the channel here means a plugin gets a working
   // model picker by registering a family, with nothing else to remember.
   register_channel_types("diffusion-model", tag);
+  // ...and on the picker of the stage that RUNS it, whose own list is
+  // a channel consumer's and does not see the channel's additions.
+  register_consumer_types("generate-video", tag);
   return true;
 }
 

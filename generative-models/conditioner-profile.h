@@ -24,9 +24,12 @@
 //
 // WHAT A PROFILE CANNOT DO, and this one is a policy rather than a
 // limitation: it cannot turn a mandatory content screen off. Whether a
-// family's prompts are screened is decided by the host from the family
-// tag, never from a key in here. A profile that could omit the screen
-// would be a bypass, which is exactly what the screen exists to prevent.
+// family's prompts are screened is decided by whether its model family
+// provides a screen (generative-models/content-screen.h), never by a key
+// in here -- and when one is provided, the encoder is loaded with its
+// head whatever `backbone_only` says. A profile that could omit the
+// screen would be a bypass, which is exactly what the screen exists to
+// prevent.
 //
 // A KEY THIS HOST DOES NOT KNOW COSTS NOTHING and is ignored, which is
 // what makes the bag open. A key it DOES know and cannot honour is
@@ -107,8 +110,9 @@ inline constexpr std::string_view kDropPrefix   = "drop_prefix";
 inline constexpr std::string_view kEditPrefix   = "edit_prefix";
 inline constexpr std::string_view kEditSuffix   = "edit_suffix";
 inline constexpr std::string_view kEditDrop     = "edit_drop_prefix";
-// The per-reference label inside the edit template: Mage-Flow renders
-// "Image N: ", Qwen-Image-Edit "Picture N: ", Boogu-Image nothing.
+// The per-reference label inside the edit template: "Image" renders
+// "Image N: " (the default), Qwen-Image-Edit uses "Picture N: ",
+// Boogu-Image nothing.
 inline constexpr std::string_view kRefLabel = "ref_label";
 
 // "sequential" -- plain arange positions, which a model that overrides

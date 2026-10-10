@@ -632,8 +632,7 @@ TEST(metal_sage_attention, grouped_kv_reads_the_kv_head)
 
 // THE TWO FLASH KERNELS AT QWEN-IMAGE'S SHAPE.
 //
-// Qwen-Image (and Mage-Flow, which is the same class under another name)
-// was the last DiT here still on the ALU steel attention everywhere; it
+// Qwen-Image was the last DiT here still on the ALU steel attention everywhere; it
 // now takes the matrix-core entry by default, as krea2, flux2 and boogu
 // already did. The model-level guard for that lives in
 // qwen_image_edit_dit.forward_nax_matches_alu -- and it needs a 20B

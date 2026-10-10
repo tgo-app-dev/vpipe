@@ -78,6 +78,18 @@
 #define VPIPE_FEATURE_FAMILY_PROFILES "family-profiles/1"
 #define VPIPE_FEATURE_ACCEL_BAG       "accel-bag/1"
 
+// Added since, inside ABI 8:
+//   kernel-contract/2  the contract's revision-2 entries (the f16
+//                      libraries' GEMM / attention / norm kernels and
+//                      the accumulate GEMM twin); revision 1 is kept
+//   content-screen     generative-models/content-screen.h: a family's
+//                      content screen, run by diffusion-conditioner
+//   video-turn         generative-models/video-turn.h: a vision-language
+//                      model a stage drives -- frames, a timed video turn
+#define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
+#define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
+#define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
+
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }
 extern "C" {

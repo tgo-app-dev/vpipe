@@ -40,7 +40,8 @@ inline constexpr std::string_view kDomain = "quantize";
 // ADD, NEVER RENAME OR REPURPOSE.
 
 // The `_class_name` this family's transformer/config.json carries, e.g.
-// "MageFlow". This is what lets the stage RECOGNISE a diffusers
+// "AcmeTransformer2DModel". This is what lets the stage RECOGNISE a
+// diffusers
 // checkpoint whose family it does not implement -- the built-in chain is
 // a closed switch over class names, and without this an out-of-tree
 // family falls through it and is quantized with someone else's leaf set

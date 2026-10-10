@@ -217,6 +217,51 @@ TEST(qwen_image_21_vae, config_defaults_are_unchanged_for_four_levels)
   EXPECT_TRUE(got.out_channels == 3);
 }
 
+// diffusers' AutoencoderKLQwenImage as an RGBA checkpoint publishes it: ONE
+// channel key (`input_channels`) for both ends, and a scalar
+// `scaling_factor` with null per-channel statistics. Both were read as
+// absent, which loaded the RGBA weights (the conv shapes come from the
+// tensors) and then decoded a 4-wide output at a stride of 3, and left
+// the stages inert for want of latents_mean/std.
+TEST(qwen_image_21_vae, config_reads_input_channels_and_scaling_factor)
+{
+  FlexData fd = FlexData::from_json(R"({
+      "_class_name": "AutoencoderKLQwenImage", "base_dim": 96,
+      "dim_mult": [1, 2, 4, 4], "z_dim": 16, "num_res_blocks": 2,
+      "input_channels": 4, "latents_mean": null, "latents_std": null,
+      "scaling_factor": 8.0064, "shift_factor": 0.0})");
+  MetalKrea2Vae::Config cfg;
+  MetalKrea2Vae::config_from_json(fd, &cfg);
+  EXPECT_TRUE(cfg.in_channels == 4 && cfg.out_channels == 4);
+  ASSERT_TRUE(cfg.latents_mean.size() == 16 &&
+              cfg.latents_std.size() == 16);
+  if (cfg.latents_std.size() == 16 && cfg.latents_mean.size() == 16) {
+    // z * std + mean == z / 8.0064 + 0, the reference's un-scale.
+    EXPECT_TRUE(cfg.latents_mean[0] == 0.0f && cfg.latents_mean[15] == 0.0f);
+    EXPECT_TRUE(std::fabs(cfg.latents_std[7] - 1.0f / 8.0064f) < 1e-9f);
+  }
+
+  // An explicit pair still wins over the shared key, and published
+  // statistics are never replaced by the scalar.
+  FlexData both = FlexData::from_json(R"({
+      "input_channels": 3, "in_channels": 4, "out_channels": 4,
+      "z_dim": 2, "latents_mean": [0.5, -0.5], "latents_std": [2.0, 3.0],
+      "scaling_factor": 8.0})");
+  MetalKrea2Vae::Config c2;
+  MetalKrea2Vae::config_from_json(both, &c2);
+  EXPECT_TRUE(c2.in_channels == 4 && c2.out_channels == 4);
+  EXPECT_TRUE(c2.latents_std.size() == 2 && c2.latents_std[1] == 3.0f);
+
+  // Krea-2's own config spells `input_channels: 3` beside real stats:
+  // unchanged.
+  FlexData krea = FlexData::from_json(R"({"input_channels": 3,
+      "z_dim": 1, "latents_mean": [0.1], "latents_std": [1.5]})");
+  MetalKrea2Vae::Config c3;
+  MetalKrea2Vae::config_from_json(krea, &c3);
+  EXPECT_TRUE(c3.in_channels == 3 && c3.out_channels == 3);
+  EXPECT_TRUE(c3.latents_std.size() == 1 && c3.latents_std[0] == 1.5f);
+}
+
 // ---- the shortcut kernels, against a CPU oracle ---------------------
 
 namespace {

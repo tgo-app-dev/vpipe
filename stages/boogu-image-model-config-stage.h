@@ -12,7 +12,7 @@ namespace vpipe {
 //
 // BooguImagePipeline bounds its VLM conditioning image TWICE --
 // long side 768 AND area 384x384 -- which is why its long edge is
-// double Mage-Flow's rather than equal to it. A reference that
+// double the 384 of a family that caps the edge alone. A reference that
 // satisfies one bound can fail the other, so neither implies the
 // other and both travel together.
 //

@@ -345,8 +345,9 @@ public:
   // last position; empty on failure.
   // `deepstack` (Qwen3-VL) injects the tower's per-layer features into the
   // image rows exactly as forward_embeddings_taps does -- the stock Qwen3-VL
-  // forward applies them, so a multimodal GENERATION (Mage-Flow's edit
-  // content screen) needs them to match the reference's .generate().
+  // forward applies them, so a multimodal GENERATION (a family's content
+  // screen judging an edit) needs them to match the reference's
+  // .generate().
   std::vector<float> prefill_multimodal_buf(
       ContextId cid, metal_compute::SharedBuffer&& x,
       const std::vector<std::int32_t>& position_ids, int n,

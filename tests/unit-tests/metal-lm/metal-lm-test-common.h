@@ -31,6 +31,7 @@
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/video-turn.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/shared/gguf-file.h"
 #include "apple-silicon/metal-compute/metal-compute.h"

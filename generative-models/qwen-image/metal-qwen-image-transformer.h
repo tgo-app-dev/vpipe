@@ -53,20 +53,6 @@ class MetalQwenImageTransformer {
     float norm_eps     = 1e-6f;
     int   rope_theta   = 10000;
     int   axes[3]      = {16, 56, 56};   // axes_dims_rope (sum = head_dim)
-    // Whether the TEXT stream is rotated. Qwen-Image-Edit gives text a
-    // contiguous position band above the image grid; Mage-Flow shares this
-    // exact topology but leaves text unrotated (its transformer config sets
-    // apply_text_rotary_emb=false), which is an identity rotation on the
-    // text rows. See metal-mage-flow-transformer.h.
-    bool  rotate_txt   = true;
-    // Round the sinusoidal timestep FREQUENCY table to bf16 before forming
-    // the angle. Qwen-Image follows diffusers and keeps fp32 frequencies
-    // (false); Mage-Flow vendors a get_timestep_embedding that downcasts the
-    // table to the timestep dtype, and was TRAINED with that rounding, so it
-    // needs true. It matters a lot: the angle reaches sigma*1000 ~ 750 rad,
-    // where a 0.4% frequency error is radians of phase -- leaving it fp32
-    // knocked temb 7.6% off and cascaded into every block's modulation.
-    bool  bf16_time_freqs = false;
     // Dynamic-int8 GEMMs for the block matmuls (LOSSY, opt-in). This
     // family reached matmul2d long before it reached int8, which is why
     // the key existed on the stage and did nothing here.
@@ -84,12 +70,6 @@ class MetalQwenImageTransformer {
     // only switch, and on an M4 it says so once and runs dense.
     // VPIPE_QIE_NO_ATTN_NAX turns both off together.
     sage::Config sage;
-    // Round the TIMESTEP itself to bf16 before forming the sinusoid angle --
-    // what `timesteps.to(img.dtype)` does when the model runs bf16. Separate
-    // from bf16_time_freqs (that is the frequency TABLE) because they are
-    // independent choices, and this one is invisible to any golden pinned at
-    // a bf16-exact sigma. See time_proj_.
-    bool  bf16_timestep = false;
     // config.json `zero_cond_t` (true for Qwen-Image-Edit-2511). When set, the
     // REFERENCE tokens are adaLN-modulated at timestep 0 -- they are clean, not
     // noisy -- while the generated tokens use the current sigma. diffusers does

@@ -2137,6 +2137,9 @@ GenerateVideoStage::ensure_expert_(int which)
     // so the family is told no, rather than holding a module the plan
     // left no room for. A family that implements the tier and booked
     // nothing is taken at its word.
+    // The label goes with the args (genai::create_args::kCoreMLLabel)
+    // so the family can revise what it really holds once its tier arms.
+    FlexData create_extra = FlexData::make_object();
     if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
       for (const ResourceClaim& c :
            _plugin_family->declare_resources(_root)) {
@@ -2145,6 +2148,9 @@ GenerateVideoStage::ensure_expert_(int which)
         if (!model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
           continue;
         }
+        create_extra.as_object().insert_or_assign(
+            genai::create_args::kCoreMLLabel,
+            FlexData::make_string(ane_claim_label_()));
         if (model_memory::coreml_grant(session(), ane_claim_label_(), ub,
                                        un) <= 0) {
           genai::accel::set_flag(&_accel, genai::accel::kAneFfn, false);
@@ -2166,6 +2172,9 @@ GenerateVideoStage::ensure_expert_(int which)
       if (planned_geometry_(_root, &gw, &gh, &gf)) {
         args.width = gw; args.height = gh; args.frames = gf;
       }
+    }
+    if (create_extra.as_object().size() > 0) {
+      args.borrowed_extra = &create_extra;
     }
     try {
       _plugin_gen = _plugin_family->load(args);

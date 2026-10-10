@@ -16,10 +16,12 @@
 
 #include "common/flex-data.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
+#include "stages/generate-image-stage.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -309,8 +311,7 @@ TEST(qwen_image_21_layout, matches_reference_metadata_and_rope)
 // Checked as a STRING against the reference's own rendered template,
 // because that is what decides the tokenization and every part of it is
 // silent when wrong: this model's system prompt is neither the
-// "Describe the image by detailing..." of Krea-2 / Mage-Flow /
-// Qwen-Image-2512 nor the "Describe the key features of the input
+// "Describe the image by detailing..." of Krea-2 / Qwen-Image-2512 nor the "Describe the key features of the input
 // image" of Qwen-Image-Edit / Boogu, it keeps a trailing generation
 // turn that Boogu drops, and it labels references `<imageN>` rather
 // than "Picture N: ".
@@ -374,4 +375,69 @@ TEST(qwen_image_21_layout, prompt_matches_the_reference_template)
   std::printf("[qwen_image_21_layout] prompt template matches the reference "
               "(t2i + 1/2/3 refs); drop %d tokens\n",
               (int)(o.contains("drop_idx") ? o.at("drop_idx").as_int(-1) : -1));
+}
+
+// THE SCHEDULE IS THE CHECKPOINT'S, read off its files. Qwen-Image-2.1
+// and Qwen-Image-2.1-Turbo are byte-identical networks; what separates
+// them is the scheduler_config (dynamic shift and a 0.02 terminal
+// stretch, against neither) and the `sample_sigmas` Turbo ships in
+// model_index.json, which ARE its schedule and step count. Hardcoding the
+// base model's would run Turbo's distilled weights on a grid it was not
+// distilled for, and it would still make a picture.
+TEST(qwen_image_21_layout, the_schedule_comes_from_the_checkpoint)
+{
+  namespace fs = std::filesystem;
+  using GIS = vpipe::GenerateImageStage;
+  const fs::path base = fs::temp_directory_path() / "vpipe-ut-qi21-sched";
+  fs::remove_all(base);
+  auto write = [](const fs::path& p, const std::string& text) {
+    fs::create_directories(p.parent_path());
+    std::ofstream(p) << text;
+  };
+
+  // Turbo's files, verbatim in the keys that matter.
+  const fs::path turbo = base / "turbo";
+  write(turbo / "scheduler" / "scheduler_config.json",
+        R"({"base_image_seq_len": 256, "base_shift": 0.5,
+            "max_image_seq_len": 8192, "max_shift": 0.9, "shift": 1.0,
+            "shift_terminal": null, "time_shift_type": "exponential",
+            "use_dynamic_shifting": false})");
+  write(turbo / "model_index.json",
+        R"({"_class_name": "QwenImage21Pipeline",
+            "sample_sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508,
+                              0.845148, 0.704534, 0.414568]})");
+  const GIS::Qi21Schedule t = GIS::qi21_checkpoint_schedule(turbo.string());
+  EXPECT_FALSE(t.dynamic);
+  EXPECT_TRUE(t.shift == 1.0);
+  EXPECT_TRUE(t.shift_terminal == 0.0);           // null = no stretch
+  EXPECT_TRUE(t.sample_sigmas.size() == 8);
+  EXPECT_TRUE(!t.sample_sigmas.empty() && t.sample_sigmas.back() == 0.414568);
+
+  // The base model's.
+  const fs::path b = base / "base";
+  write(b / "scheduler" / "scheduler_config.json",
+        R"({"base_image_seq_len": 256, "base_shift": 0.5,
+            "max_image_seq_len": 8192, "max_shift": 0.9, "shift": 1.0,
+            "shift_terminal": 0.02, "time_shift_type": "exponential",
+            "use_dynamic_shifting": true})");
+  write(b / "model_index.json", R"({"_class_name": "QwenImage21Pipeline"})");
+  const GIS::Qi21Schedule s = GIS::qi21_checkpoint_schedule(b.string());
+  EXPECT_TRUE(s.dynamic);
+  EXPECT_TRUE(s.shift_terminal == 0.02);
+  EXPECT_TRUE(s.shift_type == "exponential");
+  EXPECT_TRUE(s.sample_sigmas.empty());
+
+  // Neither file (a single-file DiT's root): the base model's values.
+  const GIS::Qi21Schedule none =
+      GIS::qi21_checkpoint_schedule((base / "nothing").string());
+  EXPECT_TRUE(none.dynamic);
+  EXPECT_TRUE(none.shift_terminal == 0.02);
+  EXPECT_TRUE(none.sample_sigmas.empty());
+
+  // A node outside (0, 1] is not half a schedule: all of it is dropped.
+  const fs::path bad = base / "bad";
+  write(bad / "model_index.json", R"({"sample_sigmas": [1.0, 1.5, 0.5]})");
+  EXPECT_TRUE(
+      GIS::qi21_checkpoint_schedule(bad.string()).sample_sigmas.empty());
+  fs::remove_all(base);
 }

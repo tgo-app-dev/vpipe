@@ -14,7 +14,6 @@
 #include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
-#include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
@@ -187,7 +186,8 @@ private:
 
   std::string _hf_dir;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
-  // "mage" (MageVAE) | "wan" (AutoencoderKLWan, the VIDEO one)
+  // "wan" (AutoencoderKLWan, the VIDEO one) | "minimax-h3" | a registered
+  // family's tag
   std::string _family;
   std::uint64_t _images_emitted = 0;
 
@@ -209,7 +209,6 @@ private:
   // inert (process() warns + emits nothing).
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
-  std::unique_ptr<genai::MetalMageVae>  _mage_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
   // MiniMax-H3's video VAE. Its decoder is a ViT rather than an
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole

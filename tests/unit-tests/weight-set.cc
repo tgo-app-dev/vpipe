@@ -1578,7 +1578,7 @@ TEST(weight_set, a_shard_over_max_buffer_length_still_maps)
 // tokenizer are fetched beside it. It opens as the file would, so
 // everything naming the DIRECTORY (config, tokenizer, the claim, the
 // release) names one checkpoint. Before, open_model() globbed only
-// model.safetensors and shards, and Mage-Flow's conditioner failed with
+// model.safetensors and shards, and a repack's conditioner failed with
 // "cannot open text encoder checkpoint".
 //
 // The near misses must keep failing: without a config it is no more a

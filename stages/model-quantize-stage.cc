@@ -164,7 +164,7 @@ dit_class_family_(const std::string& class_name)
   if (class_name == "MiniMaxH3DiTModel") { return "minimax-h3"; }
   // A REGISTERED family, asked last. The chain above is a closed switch
   // over the class names this tree implements, so a family published
-  // after it -- or one that left it, as Mage-Flow did -- falls through
+  // after it -- or one that lives in a plugin -- falls through
   // and is not recognised as a text-to-image DiT at all.
   //
   // Asked LAST so a class name this host owns cannot be taken away by a
@@ -671,8 +671,8 @@ dit_num_layers_(const std::string& src_dir)
         const int n = (int)obj.at("num_layers").as_int(0);
         if (n > 0) { return n; }
       }
-      // Mage-Flow's transformer/config.json is FLUX-shaped: the block count is
-      // `depth` (12), with no num_layers. Without this the mixed / AWQ
+      // A FLUX-shaped transformer/config.json names the block count
+      // `depth`, with no num_layers. Without this the mixed / AWQ
       // per-layer ranking would silently run over the default 28 blocks.
       if (obj.contains("depth")) {
         const int n = (int)obj.at("depth").as_int(0);
@@ -1346,8 +1346,6 @@ ModelQuantizeStage::quantize_dit_component_(
   // family it has never seen, and its modulation leaves are its own.
   const FlexData* qprof = genai::quant::find(family);
   const bool is_boogu = (family == "boogu-image");
-  // Mage-Flow shares Qwen-Image's block topology and tensor names, so the
-  // modulation handling below applies to it too.
   const bool is_qie   = (family == "qwen-image-edit");
   const bool awq = _awq;
 
@@ -1454,7 +1452,7 @@ ModelQuantizeStage::quantize_dit_component_(
     // and are kept bf16 by default because they are what the residual scale
     // rides on. This is the opt-in that quantizes them anyway, for a box that
     // cannot otherwise hold the DiT.
-    //   Qwen-Image-Edit / Mage-Flow: `*_mod.1`             -> leaf "1"
+    //   Qwen-Image-Edit: `*_mod.1`                         -> leaf "1"
     //   Boogu-Image: `norm1.linear` (refiners + single) and
     //     `img_norm{1,2,3}.linear` / `instruct_norm{1,2}.linear` (dual-stream)
     //                                                       -> leaf "linear"
@@ -2107,10 +2105,10 @@ ModelQuantizeStage::is_comfy_root_(const std::string& dir)
   // root never does -- it uses transformer/ (or unet/).
   //
   // The obvious-looking alternative, "scan_repo finds any component", is
-  // WRONG and was caught by model_quantize_stage.mage_flow_dit_quantizes:
+  // WRONG and was caught by a registered family's DiT quantize test:
   // scan_repo's role list includes `vae/`, which every diffusers root also
   // has, and a diffusers VAE's safetensors carries a `__metadata__` like
-  // any other -- so every Krea-2 / FLUX.2 / QIE / Mage / Wan checkpoint
+  // any other -- so every Krea-2 / FLUX.2 / QIE / Wan checkpoint
   // matched and got routed down the repack path, which then failed
   // looking for a diffusion_models/ that a diffusers tree never has.
   //

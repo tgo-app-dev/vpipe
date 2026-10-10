@@ -354,7 +354,12 @@ if(VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/i8-gemm.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sage-attention.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sol-attention.cc
-        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sol-attention.cc)
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sol-attention.cc
+        # Runtime LoRA: read an adapter, bind it by module name, add
+        # (x A^T) B^T * scale onto a projection's output after whichever
+        # GEMM route ran. Every kernel it dispatches is in the contract.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/lora-names.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/runtime-lora.cc)
     add_library(vpipe_toolkit STATIC ${VPIPE_TOOLKIT_SOURCES})
     # EXPORT_NAME: installed, it is vpipe::toolkit -- the name
     # vpipe_add_plugin looks for -- not vpipe::vpipe_toolkit.
@@ -584,6 +589,13 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/common/i18n.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/job.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/oport-policy.h
+    # The perf lane's ids and its RAII scope. perf-sink-intf.h (the
+    # record_perf_event_aux entry point) was already installed, but not
+    # the lane / event constants it is called with -- so a plugin model
+    # could not put its denoise on the LLM lane the built-ins use
+    # without hard-coding the numbers.
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-event.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-scope.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/session-member.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vertex.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vpipe-format.h
@@ -662,8 +674,10 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/speculative-decode.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/token-muxer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tokenizer.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-turn.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/vae-model-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/conditioner-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/content-screen.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/detect-profile.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/family-profile.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/gen-input.h
@@ -736,6 +750,10 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sol-attention.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sage-attention.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sage-attention.h
+        # Runtime LoRA (toolkit): the adapter reader / binder / applier,
+        # and the publisher-spelling map it binds module names with.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/lora-names.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/runtime-lora.h
         DESTINATION include/generative-models/shared)
     # The ANE tier (`ane_ffn` and whatever follows it), for a family that
     # splits its own blocks. ane-tier.h ALONE: it describes the work in

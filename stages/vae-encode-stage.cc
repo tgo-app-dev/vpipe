@@ -225,16 +225,14 @@ const ConfigKey kAttrs[] = {
           "`frames` and not from the reference's",
    .def_int = 81},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
-   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit / Mage-Flow model dir (VAE "
-          "read from <hf_dir>/vae). OPTIONAL: a model-select source on the "
+   .doc = "Krea-2-Turbo / FLUX.2 / Qwen-Image-Edit model dir, or another "
+          "whose VAE this stage reads (VAE read from <hf_dir>/vae). "
+          "OPTIONAL: a model-select source on the "
           "model iport overrides it. May also name a STANDALONE VAE "
           "(krea2-vae), whose encoder half is used the same way",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,krea2-vae,flux2,qwen-image,"
                       "qwen-image-edit,qwen-image-21,"
-                      ""
-       "mage-flow,"
-       "mage-flow-edit,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-image-vae,vosr",
    .model_channel = "diffusion-model"},
@@ -319,7 +317,7 @@ const StageSpec kSpec = {
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 // VAE family from the vae config.json `_class_name` ("AutoencoderKLFlux2" ->
-// "flux2"; "MageVAE" -> "mage"; else "krea2").
+// "flux2"; else "krea2"). A registered family is asked before this.
 std::string
 vae_family_(const std::string& vae_dir)
 {
@@ -341,10 +339,6 @@ vae_family_(const std::string& vae_dir)
                                        {"video_vae"}).empty()) {
     return "minimax-h3";
   }
-  // Mage-Flow's MageVAE by FILE, with no config to read a class name
-  // from (resolve_vae_dir() hands the Comfy-Org repack's back this way).
-  // Its tensors say what it is; the geometry is MetalMageVae's defaults.
-  if (genai::MetalMageVae::is_native_checkpoint(vae_dir)) { return "mage"; }
   std::ifstream in(fs::path(vae_dir) / "config.json");
   if (in) {
     FlexData fd = FlexData::from_json(in);
@@ -358,10 +352,12 @@ vae_family_(const std::string& vae_dir)
         // patch 1 with a scalar shift/scale whitening it IS a plain
         // AutoencoderKL. Same family string, so the branches below are shared.
         if (cls == "AutoencoderKL") { return "flux2"; }
-        if (cls == "MageVAE") { return "mage"; }
         // See the note in vae-decode-stage.cc: the same implementation,
         // generalized, so the same family string.
         if (cls == "AutoencoderKLQwenImage21") { return "krea2"; }
+        // Krea-2's / Qwen-Image's, and the RGBA form -- named rather than
+        // left to the fall-through below (see vae-decode-stage.cc).
+        if (cls == "AutoencoderKLQwenImage") { return "krea2"; }
         if (cls == "AutoencoderKLWan") { return "wan"; }
         if (cls == "MiniMaxH3VideoVAE") { return "minimax-h3"; }
       }
@@ -370,27 +366,6 @@ vae_family_(const std::string& vae_dir)
   return "krea2";
 }
 
-// MageVAE geometry from vae/config.json (see the vae-decode twin).
-genai::MetalMageVae::Config
-mage_vae_config_(const std::string& vae_dir)
-{
-  genai::MetalMageVae::Config c;
-  std::ifstream in(std::filesystem::path(vae_dir) / "config.json");
-  if (in) {
-    FlexData fd = FlexData::from_json(in);
-    if (fd.is_object()) {
-      auto o = fd.as_object();
-      if (o.contains("latent_channels")) {
-        c.latent_channels =
-            (int)o.at("latent_channels").as_int(c.latent_channels);
-      }
-      if (o.contains("downsample_factor")) {
-        c.patch = (int)o.at("downsample_factor").as_int(c.patch);
-      }
-    }
-  }
-  return c;
-}
 #endif
 }  // namespace
 
@@ -423,7 +398,7 @@ VaeEncodeStage::reset_run_state()
   // weights are still held we deliberately leave the guard set --
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
-  if (!_vae && !_flux2_vae && !_mage_vae) {
+  if (!_vae && !_flux2_vae) {
     _load_attempted = false;
     _unloaded       = false;
   }
@@ -553,7 +528,7 @@ VaeEncodeStage::unload_vae_()
   //
   // The decode twin carries the same list and the same note about
   // _wan_vae; the two are meant to be read together.
-  if (!_vae && !_flux2_vae && !_mage_vae && !_wan_vae && !_h3_vae &&
+  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae &&
       !_plugin_enc) {
     return;
   }
@@ -565,7 +540,6 @@ VaeEncodeStage::unload_vae_()
   // was weak and there was nothing left to pool afterwards).
   _vae.reset();
   _flux2_vae.reset();
-  _mage_vae.reset();
   _wan_vae.reset();
   _h3_vae.reset();
   _plugin_enc.reset();
@@ -783,21 +757,6 @@ VaeEncodeStage::ensure_loaded_()
       session()->error(fmt(
           "VaeEncodeStage('{}'): failed to load the Wan VAE from '{}'; inert",
           this->id(), vae_dir));
-    }
-    return;
-  }
-
-  if (_family == "mage") {
-    load_note_(fmt("VaeEncodeStage('{}'): loading MageVAE encoder from "
-                        "'{}'", this->id(), vae_dir));
-    _mage_vae = genai::MetalMageVae::load(ws, mc,
-                                          mage_vae_config_(vae_dir),
-                                          /*with_encoder=*/true);
-    if (!_mage_vae || !_mage_vae->has_encoder()) {
-      session()->error(fmt(
-          "VaeEncodeStage('{}'): failed to load the MageVAE encoder from '{}'; "
-          "inert", this->id(), vae_dir));
-      _mage_vae.reset();
     }
     return;
   }
@@ -1418,85 +1377,6 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     session()->log_debug(fmt(
         "VaeEncodeStage('{}'): AutoencoderKL encoded latent #{} [{}, {}, {}]",
         this->id(), _latents_emitted, Cdit, lh, lw));
-    return out;
-  }
-
-  // ---- Mage-Flow MageVAE: encode to [128, H/16, W/16] (16x, patch_size 1 in
-  // the DiT), so the image must be a multiple of 16. The posterior is NOT
-  // sampled (vae/config.json sample_posterior:false) -- encode returns the
-  // MEAN, so this is deterministic and needs no whitening. ----
-  if (_family == "mage") {
-    // An IMAGE VAE has no time axis; see the note on the flux2 branch.
-    if (stacked) {
-      session()->warn(fmt(
-          "VaeEncodeStage('{}'): a {}-frame clip arrived but the {} VAE is an "
-          "IMAGE encoder with no time axis; wire the frames without "
-          "temporal-stack, or use a video VAE. Skipping",
-          this->id(), in_frames, _family));
-      return nullptr;
-    }
-    if (!_mage_vae) {
-      session()->warn(fmt(
-          "VaeEncodeStage('{}'): MageVAE encoder not loaded; skipping",
-          this->id()));
-      return nullptr;
-    }
-    const int P = _mage_vae->config().patch;
-    const int sH = src_h, sW = src_w;
-    if (sH <= 0 || sW <= 0) { return nullptr; }
-    const bool resize = _target_w > 0 && _target_h > 0;
-    const int H = resize ? _target_h : sH;
-    const int W = resize ? _target_w : sW;
-    if ((H % P) != 0 || (W % P) != 0) {
-      session()->warn(fmt(
-          "VaeEncodeStage('{}'): MageVAE image [{}x{}] must be a positive "
-          "multiple of {} (or set target_width/height); skipping", this->id(),
-          W, H, P));
-      return nullptr;
-    }
-    auto* mc = session()->services()->metal_compute();
-    const auto img = tbp->materialize_contiguous();
-    const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
-    const float pad[3] = {
-      (float)_pad_r / 255.0f * 2.0f - 1.0f,
-      (float)_pad_g / 255.0f * 2.0f - 1.0f,
-      (float)_pad_b / 255.0f * 2.0f - 1.0f,
-    };
-    const std::vector<float> norm =
-        normalize_and_fit_(img.data(), is_u8, in_scale, in_off, 3, sH, sW,
-                           H, W, pad);
-    const std::size_t n = (std::size_t)3 * H * W;
-    metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
-    if (imgbuf.empty()) { return nullptr; }
-    { auto* d = static_cast<_Float16*>(imgbuf.contents());
-      for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)norm[i]; } }
-    std::string eerr;
-    metal_compute::SharedBuffer lat;
-    {
-      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
-                         kPerfLlmVaeBegin, (std::uint64_t)H * W);
-      lat = _mage_vae->encode(imgbuf, H, W, &eerr);
-    }
-    if (lat.empty()) {
-      session()->warn(fmt(
-          "VaeEncodeStage('{}'): MageVAE encode failed ({}); skipping",
-          this->id(), eerr.empty() ? "unknown error" : eerr));
-      return nullptr;
-    }
-    const int Cz = _mage_vae->config().latent_channels;
-    const int lh = H / P, lw = W / P;
-    const std::size_t nz = (std::size_t)Cz * lh * lw;
-    auto out = std::make_unique<TensorBeatPayload>();
-    out->dtype = TensorBeat::DType::F32;
-    out->shape = {Cz, lh, lw};
-    out->resize_contiguous(nz);
-    const auto* lp = static_cast<const _Float16*>(lat.contents());
-    float* op = out->as_f32();
-    for (std::size_t i = 0; i < nz; ++i) { op[i] = (float)lp[i]; }
-    ++_latents_emitted;
-    session()->log_debug(fmt(
-        "VaeEncodeStage('{}'): MageVAE encoded latent #{} [{}, {}, {}]",
-        this->id(), _latents_emitted, Cz, lh, lw));
     return out;
   }
 

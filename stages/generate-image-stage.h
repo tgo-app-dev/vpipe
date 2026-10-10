@@ -133,6 +133,26 @@ namespace genai { class ImageModelFamily; class ImageGenerator; }
 // there is no reference either.
 class GenerateImageStage final : public TypedStage<GenerateImageStage> {
 public:
+  // The CHECKPOINT's own schedule: its scheduler_config.json and the
+  // `sample_sigmas` a distilled checkpoint ships in model_index.json.
+  // Read when the DiT is resolved. The defaults are the base model's,
+  // for a root that carries neither file (a single-file DiT).
+  struct Qi21Schedule {
+    bool        dynamic = true;            // use_dynamic_shifting
+    std::string shift_type = "exponential";
+    double      shift = 1.0;               // the static shift
+    double      shift_terminal = 0.02;     // 0 = none (null)
+    double      base_shift = 0.5;
+    double      max_shift = 0.9;
+    int         base_seq = 256;
+    int         max_seq = 8192;
+    // The raw nodes, terminal excluded; empty = linspace(1, 1/S, S).
+    std::vector<double> sample_sigmas;
+  };
+  // Read from <root>/scheduler/scheduler_config.json and
+  // <root>/model_index.json; see the definition for why it is read.
+  static Qi21Schedule qi21_checkpoint_schedule(const std::string& root);
+
   static constexpr const char* kTypeName = "generate-image";
 
   GenerateImageStage(const SessionContextIntf* session,
@@ -398,6 +418,9 @@ private:
   };
   static constexpr int kLoraSlots = 2;
   std::array<LoraSlot, kLoraSlots> _lora;
+  // Config slot -> the model's adapter slot, as lora_specs_() packed them
+  // (-1: not loaded). Mutable: recorded by the const builder.
+  mutable std::array<int, kLoraSlots> _lora_model_slot{{0, 1}};
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
   bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
 
@@ -419,12 +442,20 @@ private:
   std::vector<Spec> lora_specs_() const
   {
     std::vector<Spec> out;
-    for (const LoraSlot& sl : _lora) {
+    // COMPACTED, so the model's slot is not the config's: `lora2` set
+    // alone is the model's slot 0. The mapping is recorded here, at the
+    // one place the list is built, and every live strength goes through
+    // it -- without it `lora2_scale` was sent to the model's EMPTY slot 1
+    // and silently ignored.
+    for (int i = 0; i < kLoraSlots; ++i) {
+      _lora_model_slot[(std::size_t)i] = -1;
+      const LoraSlot& sl = _lora[(std::size_t)i];
       if (sl.path.empty()) { continue; }
       Spec sp;
       sp.path = adapter_file_(sl.path);
       if (sp.path.empty()) { continue; }   // adapter_file_ warned
       sp.scale = (float)sl.scale;
+      _lora_model_slot[(std::size_t)i] = (int)out.size();
       out.push_back(std::move(sp));
     }
     return out;
@@ -519,10 +550,15 @@ private:
   // the reference; an unset key is "no opinion", not `false`.
   bool _qi21_use_kv_cache = true;
   // A few-step adapter's own schedule, off qwen-image-21-model-config:
-  // raw sigma nodes (empty = the default grid) and the terminal stretch
-  // (< 0 = the checkpoint's 0.02). Reset between runs.
+  // raw sigma nodes (empty = the checkpoint's grid) and the terminal
+  // stretch (< 0 = the checkpoint's). Reset between runs.
   std::vector<double> _qi21_sigmas;
   double _qi21_shift_terminal = -1.0;
+  // The checkpoint's own schedule (Qi21Schedule above), read when the
+  // DiT is resolved.
+  Qi21Schedule _qi21_ck;
+  // Whether the schedule notes have been said this run.
+  mutable bool _qi21_sched_noted = false;
   // The joint-sequence bookkeeping the CONDITIONER publishes on its
   // beat's sideband. Nothing here can reconstruct it: which conditioning
   // rows are image slots depends on where the tower's rows were spliced

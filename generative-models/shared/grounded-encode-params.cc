@@ -14,15 +14,13 @@ GroundedEncodeParams::for_family(const std::string& family)
     p.long_edge = 768;
     return p;
   }
-  // Mage-Flow's row is NOT here. Its numbers moved into the family's
-  // own conditioning profile when the family left this tree -- see
-  // generative-models/conditioner-profile.h. This table is for the
-  // families the host itself implements; a registered family's numbers
-  // arrive with it, which is the whole point of the profile.
+  // A REGISTERED family has no row here: its numbers arrive with it, in
+  // its own conditioning profile (generative-models/conditioner-profile.h).
+  // This table is for the families the host itself implements.
   if (family == "boogu-image") {
     // BooguImagePipeline's VLM preprocessing: max side 768, area capped
     // at 384x384. BOTH, not either -- which is why the long edge here is
-    // Mage-Flow's doubled rather than equal to it.
+    // double the 384 of a family that caps the edge alone.
     p.long_edge    = 768;
     p.pixel_budget = (std::size_t)384 * 384;
     p.min_pixels   = 65536;

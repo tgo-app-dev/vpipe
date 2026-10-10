@@ -51,6 +51,7 @@ generative-models/token-muxer.h
 generative-models/tokenizer.h
 generative-models/vae-model-registry.h
 generative-models/video-model-registry.h
+generative-models/video-turn.h
 generative-models/weight-registry.h
 generative-models/weight-set.h
 interfaces/fs-sandbox-intf.h
@@ -2722,6 +2723,15 @@ vpipe::genai::VideoModelRegistry::all() const
 vpipe::genai::VideoModelRegistry::claim_for(vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
 vpipe::genai::VideoModelRegistry::find(std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
 vpipe::genai::VideoModelRegistry::get()
+vpipe::genai::VideoTurn::VideoTurn(std::__1::unique_ptr<vpipe::genai::VideoTurn::Impl, std::__1::default_delete<vpipe::genai::VideoTurn::Impl>>)
+vpipe::genai::VideoTurn::add_frame(unsigned char const*, int, int, double)
+vpipe::genai::VideoTurn::clear()
+vpipe::genai::VideoTurn::frames() const
+vpipe::genai::VideoTurn::last_stats() const
+vpipe::genai::VideoTurn::make(std::__1::shared_ptr<vpipe::genai::LoadedLanguageModel>, vpipe::SessionContextIntf const*)
+vpipe::genai::VideoTurn::reply(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>, vpipe::FlexData const*, int, std::__1::function<bool (std::__1::basic_string_view<char, std::__1::char_traits<char>>)> const&)
+vpipe::genai::VideoTurn::tokens() const
+vpipe::genai::VideoTurn::~VideoTurn()
 vpipe::genai::WeightRegistry::Registration::reset()
 vpipe::genai::WeightRegistry::add(vpipe::genai::WeightOwner*)
 vpipe::genai::WeightRegistry::find_(vpipe::genai::WeightOwner*)

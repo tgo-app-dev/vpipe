@@ -623,6 +623,7 @@ Coverage, and what each family's plan-time bound is actually worth:
 | Z-Image | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Krea-2 | `AutoencoderKLQwenImage`, `base_dim` ×27 | generate-image, vae-decode | exact |
 | Qwen-Image-Edit | `AutoencoderKLQwenImage`, `base_dim` ×27 | vae-decode | exact |
+| an RGBA `AutoencoderKLQwenImage` (`input_channels` 4, scalar `scaling_factor`) | `base_dim` ×27 | generate-image, vae-decode | as above (4 channels change only `conv_out`) |
 | LTX-2.5 | rounded config geometry | vae-decode (family path) | exact |
 | MiniMax-H3 | rounded config geometry | vae-decode (video path) | exact |
 | wan | rounded config geometry | vae-decode (video path) | exact |

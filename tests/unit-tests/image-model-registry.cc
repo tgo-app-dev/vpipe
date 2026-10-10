@@ -16,11 +16,19 @@
 // and must cost only that family.
 
 #include "generative-models/image-model-registry.h"
+#include "common/flex-data.h"
+#include "common/session.h"
+#include "stages/generate-image-stage.h"
+#include "generative-models/conditioner-profile.h"
+#include "generative-models/detect-profile.h"
+#include "plugin/plugin-context.h"
+#include "stages/diffusion-conditioner-stage.h"
 #include "minitest.h"
 
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace vpipe;
 using namespace vpipe::genai;
@@ -153,4 +161,76 @@ TEST(image_model_registry, the_defaults_decline_rather_than_guess)
   EXPECT_TRUE(f.declare_resources("/nowhere").empty());
   EXPECT_TRUE(f.declare_holdings("/nowhere").empty());
   EXPECT_TRUE(f.latent_bytes("/nowhere", 1024, 1024) == 0);
+}
+
+// A REGISTERED FAMILY IS OFFERED BY THE STAGE THAT RUNS IT.
+//
+// generate-image's own `hf_dir` picker is a channel CONSUMER: it lists
+// the types it was compiled to run, so a plugin family it can now run
+// was offered only through model-select (the channel source). The
+// registry records the family against the stage it registers into, and
+// the stage's config form appends it -- once, by whole entry.
+TEST(image_model_registry, a_registered_family_is_offered_by_generate_image)
+{
+  const std::string t = tag_("picker");
+  EXPECT_TRUE(ImageModelRegistry::get().add(
+      std::make_unique<Fake>(t, "/models/picker")));
+  Session sess;
+  GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                           FlexData::make_object());
+  std::string types;
+  for (const auto& p : stage.config_params()) {
+    if (p.key == "hf_dir") { types = p.suggest_db_type; }
+  }
+  const std::string padded = "," + types + ",";
+  EXPECT_TRUE(padded.find("," + t + ",") != std::string::npos);
+  // Once, however many times the form is built.
+  std::size_t n = 0, at = 0;
+  while ((at = padded.find("," + t + ",", at)) != std::string::npos) {
+    ++n;
+    ++at;
+  }
+  EXPECT_TRUE(n == 1);
+  // The built-in list is still there, in front.
+  EXPECT_TRUE(types.find("krea2") != std::string::npos);
+}
+
+// A family is registered under ONE tag while its checkpoints are filed
+// under one catalogue type per instantiation -- a t2i and an edit repo of
+// one architecture -- and the pickers filter on the type. The detect
+// profile a plugin registers names those types, and a conditioning
+// profile says diffusion-conditioner runs the family; between them, every
+// stage that runs it offers BOTH types, with no host list naming them.
+TEST(image_model_registry, a_profile_puts_every_catalogue_type_on_the_pickers)
+{
+  const std::string t = tag_("aliases");
+  const std::string edit = t + "-edit";
+  EXPECT_TRUE(ImageModelRegistry::get().add(
+      std::make_unique<Fake>(t, "/models/aliases")));
+  Session sess;
+  VpipePluginContext ctx(&sess, "ut-aliases");
+  FlexData det = FlexData::make_object();
+  det.as_object().insert_or_assign(genai::detect::kModelType,
+                                   FlexData::make_string(t));
+  det.as_object().insert_or_assign(genai::detect::kModelTypeEdit,
+                                   FlexData::make_string(edit));
+  EXPECT_TRUE(ctx.register_family_profile(
+      std::string(genai::detect::kDomain), t, det));
+  EXPECT_TRUE(ctx.register_family_profile(
+      std::string(genai::cond::kDomain), t, FlexData::make_object()));
+
+  auto offered = [&](const Stage& st) {
+    for (const auto& p : st.config_params()) {
+      if (p.key == "hf_dir") { return "," + p.suggest_db_type + ","; }
+    }
+    return std::string();
+  };
+  GenerateImageStage gen(&sess, "t2i", std::vector<InEdge>{},
+                         FlexData::make_object());
+  DiffusionConditionerStage cond(&sess, "cond", std::vector<InEdge>{},
+                                 FlexData::make_object());
+  for (const std::string& types : {offered(gen), offered(cond)}) {
+    EXPECT_TRUE(types.find("," + t + ",") != std::string::npos);
+    EXPECT_TRUE(types.find("," + edit + ",") != std::string::npos);
+  }
 }

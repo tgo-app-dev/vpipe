@@ -11,8 +11,8 @@
 // per-family conditioning tensor the generate-image (DiT) stage consumes. This
 // is the from-scratch, MLX-free metal-compute path on the
 // VPIPE_BUILD_APPLE_SILICON axis; an inert stub off it.
+#include "generative-models/content-screen.h"
 #ifdef VPIPE_BUILD_APPLE_SILICON
-#include "generative-models/mage/mage-screen.h"
 #include "generative-models/qwen-image/metal-qwen25-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
@@ -61,15 +61,16 @@ namespace vpipe {
 //                          (identity-edit LoRA) via Qwen3-VL. FLUX.2 ignores it.
 //                          Latched once.
 //   iport4  ref_image2     OPTIONAL SECOND reference image, same format.
-//                          Qwen-Image-Edit-2511 is a MULTI-reference edit model
-//                          and Mage-Flow-Edit's template has a per-reference
-//                          body, so on those families both pictures have to be
-//                          understood by the VLM -- the DiT's ref_latent1 only
-//                          carries the second picture's spatial detail. Each
-//                          reference gets its own vision block (the family's own
-//                          convention: "Picture N: " for Qwen-Image-Edit,
-//                          "Image N: " for Mage-Flow, bare back-to-back blocks
-//                          for Boogu), its own 2-D mROPE band and its own
+//                          Qwen-Image-Edit-2511 is a MULTI-reference edit model,
+//                          and a family whose template has a per-reference body
+//                          needs the same, so on those families both pictures
+//                          have to be understood by the VLM -- the DiT's
+//                          ref_latent1 only carries the second picture's spatial
+//                          detail. Each reference gets its own vision block (the
+//                          family's own convention: "Picture N: " for
+//                          Qwen-Image-Edit, a profile's `ref_label`, bare
+//                          back-to-back blocks for Boogu), its own 2-D mROPE
+//                          band and its own
 //                          deepstack run. Krea-2 is single-reference by design
 //                          (ComfyUI-Krea2Edit) and ignores it with a warning.
 //   iport6  ref_images     OPTIONAL reference images as ONE LIST (load-image's
@@ -92,13 +93,13 @@ namespace vpipe {
 //                              special tokens, no padding)
 //   oport1  neg_conditioning  same shape, emitted only when a negative is set.
 //
-// MAGE-FLOW CONTENT SCREEN. On the `mage-flow` family every prompt is first
-// run through the model's own content-policy classifier (mage-screen.h) --
-// mandatory, no config key, no port to leave unwired. A refused prompt gets
-// a one-row conditioning beat tagged `content_blocked` on its sideband, which
-// generate-image turns into a skipped denoise and vae-decode into a blank
-// refusal image. With a reference image the classifier judges the SOURCE
-// PICTURE as well as the instruction. It fails CLOSED.
+// CONTENT SCREEN. A family that provides one (generative-models/
+// content-screen.h) has every prompt first judged by it, on this stage's
+// own encoder -- mandatory, no config key, no port to leave unwired. A
+// refused prompt gets a one-row conditioning beat tagged `content_blocked`
+// on its sideband, which generate-image turns into a skipped denoise and
+// vae-decode into a blank refusal image. With reference images every
+// SOURCE PICTURE is judged as well as the instruction. It fails CLOSED.
 //
 // Config (FlexData object):
 //   hf_dir     (string, OPTIONAL) -- the model dir (text_encoder/, transformer/,
@@ -145,7 +146,7 @@ public:
 
   const std::string& hf_dir() const noexcept { return _hf_dir; }
   std::uint64_t conditionings_emitted() const noexcept { return _emitted; }
-  // How many prompts the Mage-Flow content screen refused. Counted in the
+  // How many prompts the family's content screen refused. Counted in the
   // emitted total too: a refusal IS a conditioning beat (a blocked one).
   std::uint64_t blocked_by_policy() const noexcept { return _blocked; }
 
@@ -160,7 +161,8 @@ private:
   // every input here follows (stages/generation-input.h), which serves an
   // edit graph and a folder of pictures alike.
   GenerationInput::Mode _ref_mode = GenerationInput::Mode::kAuto;
-  // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
+  // krea2 | flux2 | qwen-image-edit | boogu-image | ... | a registered
+  // family's tag
   std::string _family = "krea2";
   // Within the qwen-image-edit family, WHICH of the two Qwen-Image
   // recipes this checkpoint takes. They are one architecture published
@@ -186,8 +188,13 @@ private:
   // that outlives every stage. See
   // generative-models/conditioner-profile.h.
   const FlexData* _profile = nullptr;
+  // The family's content screen, when it provides one through its model
+  // family's `query_extension`. Its presence is the whole decision: no
+  // key turns it off. BORROWED from the registry, which outlives every
+  // stage. See generative-models/content-screen.h.
+  genai::screen::ContentScreen* _screen = nullptr;
   std::uint64_t _emitted = 0;
-  std::uint64_t _blocked = 0;      // refused by the Mage-Flow content screen
+  std::uint64_t _blocked = 0;      // refused by the family's content screen
   // Image-aware families: always emit a grounded negative (empty prompt ok) on
   // oport1 so the DiT can run CFG>1 (Krea-2 edit deletion recipe). Config flag.
   bool _grounded_negative = false;
@@ -392,14 +399,14 @@ private:
   metal_compute::SharedBuffer vision_tokens_(metal_compute::MetalCompute* mc,
                                              int& n_img) const;
 
-  // Mage-Flow's MANDATORY content screen over the encoder this stage already
-  // owns (see generative-models/mage/mage-screen.h). With reference images
-  // the multimodal EDIT policy runs once PER REFERENCE -- it judges each
-  // source picture as well as the instruction, and blocks if any pass
-  // does. Never throws; blocks on every failure.
-  genai::MageScreenVerdict screen_(const std::string&                 prompt,
-                                   const metal_compute::SharedBuffer& vtok,
-                                   int                                n_img)
+  // The family's MANDATORY content screen over the encoder this stage
+  // already owns (see generative-models/content-screen.h). With reference
+  // images it runs once PER REFERENCE, each pass bound to that picture,
+  // and blocks if any pass does. Never throws; blocks on every failure
+  // it can see.
+  genai::screen::Verdict screen_(const std::string&                 prompt,
+                                 const metal_compute::SharedBuffer& vtok,
+                                 int                                n_img)
       const;
 #endif
 };

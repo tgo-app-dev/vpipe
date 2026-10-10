@@ -13,7 +13,6 @@
 #include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
-#include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
@@ -142,7 +141,7 @@ private:
   int _pad_r = 0;
   int _pad_g = 0;
   int _pad_b = 0;
-  std::string _family;   // "krea2" | "flux2" | "mage" | "wan"
+  std::string _family;   // "krea2" | "flux2" | "wan" | ... | a plugin's
   // Video frames the wan conditioning clip spans. Must match the
   // generate-video stage's `frames`: the conditioning latent is
   // the VAE encoding of image-then-blanks over exactly that many
@@ -174,7 +173,6 @@ private:
   // (process() warns + emits nothing).
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
-  std::unique_ptr<genai::MetalMageVae>  _mage_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
   // MiniMax-H3's video VAE, encoder half: a keyframe anchor for FL2VA.
   std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;

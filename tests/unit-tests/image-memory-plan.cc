@@ -31,6 +31,7 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "pipeline/pipeline.h"
+#include "generative-models/image-model-registry.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #include "stages/generate-image-stage.h"
 #include "stages/model-memory.h"
@@ -40,7 +41,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace vpipe;
@@ -513,4 +516,185 @@ TEST(image_memory_plan, ane_module_grant_by_box)
     mgr->clear_declarations();
   }
   ::unsetenv("VPIPE_RAM_LIMIT_MB");
+}
+
+// A REGISTERED FAMILY THAT CLAIMS THE ENCODER ANSWERS FOR IT.
+//
+// generate-image books the conditioning encoder (`mllm/` or
+// `text_encoder/`) on the conditioner's behalf, unphased -- the safe
+// default, since a hole in the ledger reads as room. But a family whose
+// conditioner is its OWN stage claims the encoder itself, phased to
+// `condition` when that stage lets it go after the prompt, and the
+// stage's unphased claim then booked it through the denoise anyway:
+// MEASURED with a plugin family, a released 32 GB MLLM still pushed its
+// 12 GB DiT into streaming on a 64 GB box. Both halves: a family that claims
+// the encoder suppresses the stage's claim (in both ledgers), and one
+// that does not still gets it.
+namespace {
+
+class EncoderClaimingFamily final : public genai::ImageModelFamily {
+public:
+  EncoderClaimingFamily(std::string tag, std::string root, bool claim_enc)
+      : _tag(std::move(tag)), _root(std::move(root)), _claim(claim_enc) {}
+  std::string_view tag() const noexcept override { return _tag; }
+  bool claims(const std::string& root, const std::string&) const override
+  {
+    return root == _root;
+  }
+  std::vector<ResourceClaim>
+  declare_resources(const std::string& root) const override
+  {
+    namespace fs = std::filesystem;
+    std::vector<ResourceClaim> out = model_memory::weight_claims(
+        {(fs::path(root) / "transformer").string()});
+    if (_claim) {
+      for (auto& c : model_memory::weight_claims_in_phase(
+               {(fs::path(root) / "mllm").string()},
+               model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+    return out;
+  }
+  std::unique_ptr<genai::ImageGenerator>
+  load(const genai::ImageModelCreateArgs&) override
+  {
+    return nullptr;
+  }
+
+private:
+  std::string _tag, _root;
+  bool _claim;
+};
+
+}  // namespace
+
+TEST(image_memory_plan, a_family_that_claims_the_encoder_answers_for_it)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  for (const bool claim : {true, false}) {
+    const fs::path root = fs::temp_directory_path() /
+        ("vpipe-encclaim-" + std::to_string((long)::getpid()) +
+         (claim ? "-a" : "-b"));
+    std::error_code ec;
+    fs::create_directories(root / "mllm", ec);
+    fs::create_directories(root / "transformer", ec);
+    // Weight bytes for the encoder to weigh: a zero-byte holding is not
+    // a holding at all, and would pass the second half vacuously.
+    std::ofstream(root / "mllm" / "model.safetensors")
+        << std::string(4096, 'x');
+    const std::string enc = (root / "mllm").string();
+    static int n = 0;
+    ASSERT_TRUE(genai::ImageModelRegistry::get().add(
+        std::make_unique<EncoderClaimingFamily>(
+            "test-encclaim-" + std::to_string(++n), root.string(), claim)));
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(root.string()));
+    GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                             std::move(cfg));
+    int unphased = 0, phased = 0;
+    bool arena = false;
+    for (const ResourceClaim& c : stage.declare_resources()) {
+      // A registered family's decode arena is declared too: without it
+      // vae-decode's per-beat revision has no label to correct.
+      if (c.kind == model_memory::kScratchKind &&
+          c.key.rfind("vae-decode", 0) == 0) {
+        arena = true;
+      }
+      if (c.key != enc) { continue; }
+      if (c.phase.empty()) { ++unphased; } else { ++phased; }
+    }
+    EXPECT_TRUE(arena);
+    bool held = false;
+    for (const auto& h : stage.declare_memory().holdings) {
+      if (h.source == enc) { held = true; }
+    }
+    if (claim) {
+      // The family's condition-phase claim, and nothing unphased.
+      EXPECT_TRUE(phased == 1 && unphased == 0);
+      EXPECT_FALSE(held);
+    } else {
+      EXPECT_TRUE(unphased == 1 && phased == 0);
+      EXPECT_TRUE(held);
+    }
+    fs::remove_all(root, ec);
+  }
+}
+
+// A REGISTERED FAMILY'S CoreML CLAIM IS THE STAGE'S TO BOOK.
+//
+// A family implementing `ane_ffn` claims its ANE module unconditionally
+// (it cannot see the graph's accel bag at plan time) under a label of
+// its own. generate-image passed that through as-is: booked even when
+// the graph did not ask for the tier -- peers then sized against a
+// module that never exists -- and under a label two stages would share.
+// Now it is kept only with `ane_ffn`, relabelled to the stage, as
+// generate-video does.
+namespace {
+
+class CoreMLClaimingFamily final : public genai::ImageModelFamily {
+public:
+  CoreMLClaimingFamily(std::string tag, std::string root)
+      : _tag(std::move(tag)), _root(std::move(root)) {}
+  std::string_view tag() const noexcept override { return _tag; }
+  bool claims(const std::string& root, const std::string&) const override
+  {
+    return root == _root;
+  }
+  std::vector<ResourceClaim>
+  declare_resources(const std::string&) const override
+  {
+    return model_memory::coreml_claims("family-own-label", 640u << 20, 1,
+                                       model_memory::kPhaseDenoise);
+  }
+  std::unique_ptr<genai::ImageGenerator>
+  load(const genai::ImageModelCreateArgs&) override
+  {
+    return nullptr;
+  }
+
+private:
+  std::string _tag, _root;
+};
+
+}  // namespace
+
+TEST(image_memory_plan, a_family_coreml_claim_follows_the_stage)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  const fs::path root = fs::temp_directory_path() /
+      ("vpipe-coreml-" + std::to_string((long)::getpid()));
+  std::error_code ec;
+  fs::create_directories(root / "transformer", ec);
+  static int n = 0;
+  ASSERT_TRUE(genai::ImageModelRegistry::get().add(
+      std::make_unique<CoreMLClaimingFamily>(
+          "test-coreml-" + std::to_string(++n), root.string())));
+  for (const bool ane : {false, true}) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(root.string()));
+    if (ane) { cfg.as_object().insert("ane_ffn", FlexData::make_bool(true)); }
+    GenerateImageStage stage(&sess, "t2i", std::vector<InEdge>{},
+                             std::move(cfg));
+    int coreml = 0;
+    std::string label;
+    for (const ResourceClaim& c : stage.declare_resources()) {
+      std::string l;
+      std::size_t ub = 0;
+      int un = 0;
+      if (model_memory::parse_coreml_claim(c, &l, &ub, &un)) {
+        ++coreml;
+        label = l;
+      }
+    }
+    if (ane) {
+      EXPECT_TRUE(coreml == 1);
+      EXPECT_TRUE(label == "ane-ffn/t2i");
+    } else {
+      EXPECT_TRUE(coreml == 0);
+    }
+  }
+  fs::remove_all(root, ec);
 }

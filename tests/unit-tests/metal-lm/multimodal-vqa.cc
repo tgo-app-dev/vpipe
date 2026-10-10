@@ -101,6 +101,135 @@ TEST(metal_lm_smoke, image_vqa_decode) {
   EXPECT_TRUE(!text.empty());
 }
 
+// VideoTurn (generative-models/video-turn.h) -- the turn a plugin stage
+// drives -- IS the turn built by hand from the model's own parts: the
+// frames through its tower, the template's timed video between the
+// words, one prefill, the plain greedy decode. Greedy, the reply is the
+// same token for token, its drafter included (the OptiQ checkpoint's MTP
+// head). Then a turn of words alone; the frames go with each reply.
+// Env: VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH (with a drafter), else
+// VPIPE_METAL_VQA_SMOKE_MODEL.
+TEST(metal_lm_smoke, video_turn_is_the_turn_built_by_hand) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { path = std::getenv("VPIPE_METAL_VQA_SMOKE_MODEL"); }
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 16;
+  spec.max_pages = 256;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  auto* vis = lm->metal_vision_encoder();
+  ASSERT_TRUE(vis != nullptr);
+  if (!vis) { return; }
+
+  // Two frames a second apart: gradients that differ.
+  const int H = 128, W = 192;
+  std::vector<std::vector<std::uint8_t>> frames(2);
+  for (int f = 0; f < 2; ++f) {
+    frames[f].resize((std::size_t)3 * H * W);
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          frames[f][((std::size_t)c * H + y) * W + x] =
+              (std::uint8_t)((x * (1 + f) + 2 * y + 70 * c) & 0xFF);
+        }
+      }
+    }
+  }
+  const std::string ask = "Describe what happens in this video.";
+  constexpr int kMax = 24;
+
+  auto turn = genai::VideoTurn::make(lm, &sess);
+  ASSERT_TRUE(turn != nullptr);
+  if (!turn) { return; }
+  for (int f = 0; f < 2; ++f) {
+    ASSERT_TRUE(turn->add_frame(frames[f].data(), H, W, (double)f));
+  }
+  EXPECT_TRUE(turn->frames() == 2);
+  const int tokens = turn->tokens();
+  const std::string via_turn = turn->reply("", ask, nullptr, kMax);
+  EXPECT_TRUE(turn->frames() == 0);
+  EXPECT_TRUE(turn->tokens() == 0);
+
+  // By hand.
+  auto tpl = genai::make_chat_template(lm->config(), lm->tokenizer(),
+                                       /*disable_thinking=*/true);
+  ASSERT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  const int S = std::max(1, vis->config().spatial_merge);
+  std::vector<genai::MetalQwenVisionEncoder::Result> enc;
+  std::vector<float> times;
+  std::vector<int> counts;
+  std::vector<std::pair<int, int>> grids;
+  for (int f = 0; f < 2; ++f) {
+    enc.push_back(vis->encode(frames[f].data(), H, W));
+    times.push_back((float)f);
+    counts.push_back(enc.back().n_tokens);
+    grids.emplace_back(enc.back().grid_h / S, enc.back().grid_w / S);
+  }
+  EXPECT_TRUE(counts[0] + counts[1] == tokens);
+  std::vector<std::int32_t> ids;
+  ASSERT_TRUE(tpl->render_video_prefix(times, counts, true, &ids));
+  ASSERT_TRUE(tpl->render_vlm_completion(ask, &ids));
+  const std::int32_t pad = tpl->video_pad_token_id();
+  std::vector<genai::TokenRef> refs;
+  std::size_t fi = 0;
+  int row = 0;
+  for (std::int32_t id : ids) {
+    genai::TokenRef r;
+    if (id == pad && fi < enc.size()) {
+      r.kind = genai::TokenRef::Kind::ImageTokens;
+      r.embeddings_buf = &enc[fi].embeddings;
+      r.image_token_offset = row++;
+      if (row >= enc[fi].n_tokens) { ++fi; row = 0; }
+    } else {
+      r.kind = genai::TokenRef::Kind::Text;
+      r.text_id = id;
+    }
+    refs.push_back(r);
+  }
+  ASSERT_TRUE(fi == enc.size());
+  auto ctx = lm->make_context();
+  std::int32_t cur = lm->prefill_multimodal_metal(
+      ctx, std::span<const genai::TokenRef>(refs),
+      std::span<const std::pair<int, int>>(grids));
+  ASSERT_TRUE(cur >= 0);
+  if (cur < 0) { return; }
+  auto sd = lm->tokenizer().make_stream_decoder();
+  std::string by_hand;
+  for (int n = 0; n < kMax && cur >= 0 && !tpl->is_stop_token(cur); ++n) {
+    by_hand += lm->tokenizer().step(sd, cur);
+    if (n + 1 >= kMax) { break; }
+    cur = lm->next_token(ctx);
+  }
+  by_hand = tpl->sanitize_output(std::move(by_hand));
+  std::printf("[metal_lm_smoke.video_turn] %d tokens, drafter '%s'\n"
+              "  turn:    '%s'\n  by hand: '%s'\n", tokens,
+              lm->spec_drafter().c_str(), via_turn.c_str(), by_hand.c_str());
+  EXPECT_TRUE(!via_turn.empty());
+  EXPECT_TRUE(via_turn == by_hand);
+
+  // Words alone.
+  const std::string words = turn->reply("Answer in one word.",
+                                        "What colour is the sky?", nullptr,
+                                        8);
+  EXPECT_TRUE(!words.empty());
+}
+
 // MULTIMODAL MTP token-exactness: the spec-decode path on a POST-IMAGE context
 // (rope_first >= 0, the mROPE-advanced position) MUST reproduce the serial
 // greedy loop the stages run without MTP -- this is what visual-qa /

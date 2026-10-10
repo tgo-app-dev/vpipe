@@ -150,6 +150,17 @@ MetalKrea2Vae::config_from_json(const FlexData& cfg_obj, Config* out)
   out->decoder_base_dim = get_int("decoder_base_dim", out->decoder_base_dim);
   out->z_dim            = get_int("z_dim", out->z_dim);
   out->num_res_blocks   = get_int("num_res_blocks", out->num_res_blocks);
+  // diffusers' AutoencoderKLQwenImage spells the image channel count
+  // `input_channels`, one key for BOTH ends (its encoder conv_in and its
+  // decoder conv_out); Qwen-Image-2.1's class spells the pair. Read the
+  // shared key first so an explicit pair still wins. Left unread, a
+  // 4-channel (RGBA) checkpoint loads -- the conv shapes come from the
+  // tensors -- and then decodes its 4-wide output at a stride of 3.
+  if (o.contains("input_channels")) {
+    const int ic = get_int("input_channels", out->in_channels);
+    out->in_channels = ic;
+    out->out_channels = ic;
+  }
   out->in_channels      = get_int("in_channels", out->in_channels);
   out->out_channels     = get_int("out_channels", out->out_channels);
   if (o.contains("is_residual")) {
@@ -197,6 +208,26 @@ MetalKrea2Vae::config_from_json(const FlexData& cfg_obj, Config* out)
   };
   read_vec("latents_mean", out->latents_mean);
   read_vec("latents_std", out->latents_std);
+  // NO PER-CHANNEL STATISTICS, ONE SCALAR. A checkpoint that publishes
+  // `latents_mean` / `latents_std` as null and a `scaling_factor` (and
+  // optional `shift_factor`) instead -- diffusers' AutoencoderKL
+  // convention, which an RGBA AutoencoderKLQwenImage checkpoint uses --
+  // un-whitens as z / scaling_factor + shift_factor. That IS the
+  // per-channel form with mean = shift and std = 1 / scale, so it is
+  // written as one and every un-whiten / whiten below stays a single
+  // code path.
+  const bool no_stats =
+      out->latents_mean.empty() && out->latents_std.empty();
+  if (no_stats && o.contains("scaling_factor") && out->z_dim > 0) {
+    const double sc = o.at("scaling_factor").as_real(0.0);
+    const double sh = o.contains("shift_factor")
+                          ? o.at("shift_factor").as_real(0.0)
+                          : 0.0;
+    if (sc > 0.0) {
+      out->latents_mean.assign((std::size_t)out->z_dim, (float)sh);
+      out->latents_std.assign((std::size_t)out->z_dim, (float)(1.0 / sc));
+    }
+  }
 }
 
 MetalKrea2Vae::Conv
@@ -810,6 +841,19 @@ MetalKrea2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   m->_norm_out_g = m->load_vec_(wts, "decoder.norm_out.gamma");
   m->_conv_out = m->load_conv3x3_(wts, "decoder.conv_out", true);
   ok = ok && !m->_norm_out_g.empty() && !m->_conv_out.w.empty();
+  // The output stride is the CONFIG's channel count and the conv's is the
+  // tensor's. When they disagree the decode does not fail -- it reads a
+  // C-wide output at the config's stride and scrambles every pixel -- so
+  // the disagreement is refused here instead.
+  if (ok && m->_conv_out.cout != cfg.out_channels) {
+    if (mc->session() != nullptr) {
+      mc->session()->warn(fmt(
+          "MetalKrea2Vae: decoder.conv_out writes {} channels but the "
+          "config says {}; refusing to decode at the wrong stride",
+          m->_conv_out.cout, cfg.out_channels));
+    }
+    return nullptr;
+  }
 
   if (!ok) { return nullptr; }
   if (with_encoder && !m->ensure_encoder()) { return nullptr; }
@@ -1972,6 +2016,17 @@ MetalKrea2Vae::load_encoder_(WeightSet& ws)
 
   // in_channels -> base
   _enc_conv_in = load_conv3x3_(wts, "encoder.conv_in", true);
+  // The decoder's conv_out guard, on the way in: an input read at the
+  // config's channel count must match what the conv was trained on.
+  if (!_enc_conv_in.w.empty() && _enc_conv_in.cin != _cfg.in_channels) {
+    if (_mc != nullptr && _mc->session() != nullptr) {
+      _mc->session()->warn(fmt(
+          "MetalKrea2Vae: encoder.conv_in reads {} channels but the config "
+          "says {}; refusing to encode at the wrong stride",
+          _enc_conv_in.cin, _cfg.in_channels));
+    }
+    return false;
+  }
   bool ok = !_enc_conv_in.w.empty();
 
   // THE NAMES DIFFER WITH is_residual, and this is the one place the two

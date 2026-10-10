@@ -187,9 +187,9 @@ add_vpipe_metal_kernel(sol_proxy_mma_bf16 SRC attention/sol_proxy_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(qwen3_5_vision SRC encoders/qwen3_5_vision.metal)
-# bf16 twin: the Mage-Flow reference runs its Qwen3-VL tower in bf16
-# (pipeline.py casts txt_enc, tower included), so the tower needs a bf16
-# storage path to reproduce the reference's numerics.
+# bf16 twin: a pipeline that casts its whole text encoder to bf16 runs
+# its Qwen3-VL tower in bf16 too, so the tower needs a bf16 storage path
+# to reproduce that reference's numerics.
 add_vpipe_metal_kernel(qwen3_5_vision_bf16 SRC encoders/qwen3_5_vision.metal
                        DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_encoder SRC encoders/audio_encoder.metal)

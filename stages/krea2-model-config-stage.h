@@ -13,8 +13,8 @@ namespace vpipe {
 //
 // Krea-2's grounded edit encodes the instruction WITH the source
 // image, and the ComfyUI-Krea2Edit node caps that image's long edge
-// at 768 before the Qwen3-VL tower sees it -- looser than the
-// Mage-Flow families' 384 and tighter than the tower's own ~1M-pixel
+// at 768 before the Qwen3-VL tower sees it -- looser than the 384
+// some families train at and tighter than the tower's own ~1M-pixel
 // limit. The number is the identity-edit LoRA's training
 // distribution, so it is the family's, not the stage's.
 //

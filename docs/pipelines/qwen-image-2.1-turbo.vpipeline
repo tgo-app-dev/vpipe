@@ -1,0 +1,81 @@
+{
+  "id": "qwen-image-2.1-turbo",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Qwen/Qwen-Image-2.1-Turbo"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A minimalist travel poster for the city of Kyoto at dusk: a five-storey pagoda silhouetted against a gradient sky of orange and violet, a few red maple leaves drifting in the foreground. Bold sans-serif title at the top reads \"KYOTO\", and a small line at the bottom reads \"Autumn Festival 2026\"."
+      }
+    },
+    {
+      "id": "qwen-image-21-model-config",
+      "type": "qwen-image-21-model-config",
+      "iports": [],
+      "config": {}
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "qwen-image-21-model-config", "oport": 0 }
+      ],
+      "config": {
+        "height": 2048,
+        "width": 2048,
+        "seed": 42
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "qwen-image-2.1-turbo.png",
+        "format": "png",
+        "compression": 6
+      }
+    }
+  ],
+  "subpipelines": []
+}

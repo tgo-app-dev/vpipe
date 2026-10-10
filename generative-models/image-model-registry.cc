@@ -1,6 +1,7 @@
 #include "generative-models/image-model-registry.h"
 
 #include "pipeline/stage-config.h"
+#include "pipeline/stage-consumer-types.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -41,6 +42,9 @@ ImageModelRegistry::add(std::unique_ptr<ImageModelFamily> f)
   // channel the video families join, because a model picker offering
   // "diffusion models" should not care which stage will run one.
   register_channel_types("diffusion-model", tag);
+  // ...and on the picker of the stage that RUNS it, whose own list is
+  // a channel consumer's and does not see the channel's additions.
+  register_consumer_types("generate-image", tag);
   return true;
 }
 

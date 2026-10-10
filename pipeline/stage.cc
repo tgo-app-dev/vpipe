@@ -1,4 +1,5 @@
 #include "pipeline/stage.h"
+#include "pipeline/stage-consumer-types.h"
 #include "common/job.h"
 #include "pipeline/stage-command.h"
 #include "common/path-sandbox.h"
@@ -216,7 +217,32 @@ Stage::perf_event_name(uint32_t type) const
 vector<ConfigParam>
 Stage::config_params() const
 {
-  return resolve_config_params(config_spec(), _st->config);
+  vector<ConfigParam> params = resolve_config_params(config_spec(),
+                                                     _st->config);
+  // A model picker that is a channel CONSUMER (it declares the types it
+  // runs) also offers the families a plugin registered into THIS stage's
+  // registry: its static list was compiled before they existed. A
+  // channel SOURCE already offers them through the channel union.
+  const vector<string> extra = consumer_types(spec().type_name);
+  if (!extra.empty()) {
+    const auto keys = config_spec();
+    for (size_t i = 0; i < params.size() && i < keys.size(); ++i) {
+      if (keys[i].model_channel.empty() ||
+          keys[i].suggest_db_type.empty()) {
+        continue;
+      }
+      string& csv = params[i].suggest_db_type;
+      for (const string& t : extra) {
+        // Whole-entry match: "foo" must not be taken as present because
+        // "foo-21" is.
+        const string padded = "," + csv + ",";
+        if (padded.find("," + t + ",") != string::npos) { continue; }
+        if (!csv.empty()) { csv += ','; }
+        csv += t;
+      }
+    }
+  }
+  return params;
 }
 
 FlexData

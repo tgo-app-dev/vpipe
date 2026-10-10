@@ -59,7 +59,7 @@ inline constexpr std::string_view kClassNames = "class_names";
 inline constexpr std::string_view kModelType     = "model_type";
 inline constexpr std::string_view kModelTypeEdit = "model_type_edit";
 
-// What to call it in a browser: "Mage-Flow" and "Edit". Cosmetic, and
+// What to call it in a browser: "Acme-Image" and "Edit". Cosmetic, and
 // the reason the table exists at all -- a model type is an identifier,
 // not a name a person reads.
 inline constexpr std::string_view kLabelFamily  = "label_family";

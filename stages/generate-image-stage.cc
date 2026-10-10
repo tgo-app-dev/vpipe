@@ -853,15 +853,16 @@ namespace {
 //   flux2                     [C,  H/16, W/16]   -> 16
 // (FLUX.2's VAE is 8x but vae-encode emits its 2x2-packed DiT latent, so the
 // pixels-per-cell figure is 16 there too.)
-// A checkpoint this stage RECOGNISES and no longer implements. Returns
-// the plugin that does, or empty when the root is not one of these.
+// A transformer class this stage does NOT run, or empty when the root's
+// class is one of its own (or there is no class to read).
 //
-// It exists so that removing a family from the tree costs a message
+// It exists so that a checkpoint nothing here implements costs a message
 // rather than a wrong model: `t2i_family_` falls through to "krea2", so
-// without this a Mage-Flow root would load the Krea-2 path at full cost
-// and denoise a 4B checkpoint through a 12B config.
+// without this a family that lives in a plugin nobody loaded would load
+// the Krea-2 path at full cost and denoise its checkpoint through a 12B
+// config.
 std::string
-unclaimed_family_(const std::string& transformer_dir)
+unclaimed_class_(const std::string& transformer_dir)
 {
   namespace fs = std::filesystem;
   std::ifstream in(fs::path(transformer_dir) / "config.json");
@@ -871,8 +872,15 @@ unclaimed_family_(const std::string& transformer_dir)
   auto obj = fd.as_object();
   if (!obj.contains("_class_name")) { return {}; }
   const std::string cls(obj.at("_class_name").as_string(""));
-  if (cls == "MageFlow") { return "vpipe-mage-flow"; }
-  return {};
+  for (const char* own : {"Krea2Transformer2DModel",
+                          "Flux2Transformer2DModel",
+                          "QwenImageTransformer2DModel",
+                          "QwenImage21Transformer2DModel",
+                          "ZImageTransformer2DModel",
+                          "BooguImageTransformer2DModel"}) {
+    if (cls == own) { return {}; }
+  }
+  return cls;
 }
 
 // Which built-in denoisers actually DISPATCH Sol-Attn -- verified
@@ -926,12 +934,11 @@ flux2_empirical_mu_(int image_seq_len, int num_steps)
 // "Flux2Transformer2DModel" -> "flux2"; "QwenImageTransformer2DModel" ->
 // "qwen-image-edit"; else "krea2".
 //
-// "MageFlow" is deliberately ABSENT and is handled by the registry
-// instead: that family moved out of this tree into the vpipe-mage-flow
-// plugin. It still has to be RECOGNISED, though -- see
-// unclaimed_family_() -- because the fall-through here is "krea2", and
-// silently loading a 12B Krea-2 config over a 4B Mage-Flow checkpoint
-// is the worst failure this stage has.
+// A family that lives in a plugin is handled by the registry instead, and
+// a class neither knows is refused before this -- see unclaimed_class_()
+// -- because the fall-through here is "krea2", and silently loading a 12B
+// Krea-2 config over another model's checkpoint is the worst failure this
+// stage has.
 std::string
 t2i_family_(const std::string& transformer_dir)
 {
@@ -974,6 +981,69 @@ t2i_family_(const std::string& transformer_dir)
 // Physical RAM + component weight bytes now live in stages/model-memory.h so
 // the conditioner and the VAE stages size the box the same way this one does.
 using model_memory::phys_ram;
+
+// A Qwen-Image-2.1 checkpoint's OWN schedule, which is not one thing:
+// the base model shifts linspace(1, 1/S, S) by a per-image mu and
+// stretches the tail onto 0.02 (use_dynamic_shifting), while a distilled
+// checkpoint -- Qwen-Image-2.1-Turbo -- turns dynamic shifting off and
+// ships its raw nodes as `sample_sigmas` in model_index.json, which
+// diffusers' QwenImage21Pipeline then uses as the schedule and the step
+// count. Read from the files rather than assumed, because the two are
+// byte-identical networks and only these files tell them apart. A file
+// that is absent keeps the base model's value.
+}  // namespace
+
+GenerateImageStage::Qi21Schedule
+GenerateImageStage::qi21_checkpoint_schedule(const std::string& root)
+{
+  namespace fs = std::filesystem;
+  GenerateImageStage::Qi21Schedule ck;
+  {
+    std::ifstream in(fs::path(root) / "scheduler" / "scheduler_config.json");
+    FlexData fd = in ? FlexData::from_json(in) : FlexData::make_null();
+    if (fd.is_object()) {
+      auto o = fd.as_object();
+      auto real = [&](const char* k, double d) {
+        if (!o.contains(k)) { return d; }
+        const FlexData v = o.at(k);
+        return v.is_null() ? 0.0 : v.as_real(d);   // null = off
+      };
+      auto num = [&](const char* k, int d) {
+        return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+      };
+      if (o.contains("use_dynamic_shifting")) {
+        ck.dynamic = o.at("use_dynamic_shifting").as_bool(ck.dynamic);
+      }
+      if (o.contains("time_shift_type")) {
+        ck.shift_type = std::string(o.at("time_shift_type").as_string(
+            ck.shift_type));
+      }
+      ck.shift = real("shift", ck.shift);
+      ck.shift_terminal = real("shift_terminal", ck.shift_terminal);
+      ck.base_shift = real("base_shift", ck.base_shift);
+      ck.max_shift = real("max_shift", ck.max_shift);
+      ck.base_seq = num("base_image_seq_len", ck.base_seq);
+      ck.max_seq = num("max_image_seq_len", ck.max_seq);
+    }
+  }
+  {
+    std::ifstream in(fs::path(root) / "model_index.json");
+    FlexData fd = in ? FlexData::from_json(in) : FlexData::make_null();
+    if (fd.is_object() && fd.as_object().contains("sample_sigmas")) {
+      FlexData a = fd.as_object().at("sample_sigmas");   // keep the owner
+      if (a.is_array()) {
+        for (const auto& v : a.as_array()) {
+          const double x = v.as_real(-1.0);
+          if (!(x > 0.0 && x <= 1.0)) { ck.sample_sigmas.clear(); break; }
+          ck.sample_sigmas.push_back(x);
+        }
+      }
+    }
+  }
+  return ck;
+}
+
+namespace {
 
 // The DiT weights directory for a checkpoint root, at PLANNING time --
 // before initialize() has resolved a family and while the two ledgers
@@ -1237,6 +1307,7 @@ GenerateImageStage::reset_run_state()
   // keep running it.
   _qi21_sigmas.clear();
   _qi21_shift_terminal = -1.0;
+  _qi21_sched_noted = false;
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The preview keys too: a relaunch whose graph no longer names a
   // preview VAE must not inherit one.
@@ -1282,6 +1353,10 @@ GenerateImageStage::dit_resident_bytes_() const
 {
   if (_qi21_dit) { return (std::size_t)_qi21_dit->resident_bytes(); }
   if (_zi_dit) { return (std::size_t)_zi_dit->resident_bytes(); }
+  // A registered family's generator answers the same question. Without
+  // it a streaming plugin DiT whose residency grows stayed declared at
+  // the floor its load reported -- the trunk -- for the whole run.
+  if (_plugin_gen) { return (std::size_t)_plugin_gen->resident_bytes(); }
   return 0;
 }
 
@@ -1332,6 +1407,23 @@ GenerateImageStage::correct_dit_holding_(const char* when) const
       h->preload >> 20, h->floor >> 20));
 }
 
+namespace {
+
+// Whether a registered family's own claims name `dir` -- the rule by
+// which a family answers for the conditioning encoder: it claimed it, so
+// the stage does not book it a second time on the family's behalf.
+bool
+family_claims_dir_(const genai::ImageModelFamily& fam,
+                   const std::string& root, const std::string& dir)
+{
+  for (const ResourceClaim& c : fam.declare_resources(root)) {
+    if (c.kind == model_memory::kWeightsKind && c.key == dir) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
 StageMemory
 GenerateImageStage::declare_memory() const
 {
@@ -1356,6 +1448,7 @@ GenerateImageStage::declare_memory() const
   // the text encoder is the conditioner's, and it is resident beside
   // whichever DiT this is.
   bool held_by_family = false;
+  bool enc_answered = false;
   if (genai::ImageModelFamily* fam =
           genai::ImageModelRegistry::get().claim_for(
               session(), root, resolve_model(session(), _hf_dir).model_type)) {
@@ -1368,12 +1461,13 @@ GenerateImageStage::declare_memory() const
       m.hold(h.source, h.preload, h.floor);
     }
     held_by_family = true;
+    enc_answered = family_claims_dir_(*fam, root, enc);
   }
   if (!held_by_family) {
     m.hold(dit, model_memory::dir_weights_bytes(dit),
            dit_floor_bytes_(root, dit));
   }
-  m.hold(enc, model_memory::dir_weights_bytes(enc));
+  if (!enc_answered) { m.hold(enc, model_memory::dir_weights_bytes(enc)); }
   // No unload policy on this stage: it holds both for the run. Freeing
   // the DiT for a decode that would not otherwise fit
   // (free_flux2_dit_for_decode_ and its siblings) is a TRANSIENT, not a
@@ -1412,7 +1506,27 @@ GenerateImageStage::declare_resources() const
   if (genai::ImageModelFamily* fam =
           genai::ImageModelRegistry::get().claim_for(
               session(), root, resolve_model(session(), _hf_dir).model_type)) {
-    std::vector<ResourceClaim> pout = fam->declare_resources(root);
+    // A family's CoreML claim -- the ANE module a family implementing
+    // `ane_ffn` holds -- is kept only when the graph asked for the tier,
+    // and under THIS stage's label: the family cannot know the stage's
+    // id, and two stages sharing a label would share one grant. The
+    // grant is read back at load, and the label handed to the family
+    // there (genai::create_args::kCoreMLLabel), as generate-video does.
+    const bool ane = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+    std::vector<ResourceClaim> pout;
+    for (auto& c : fam->declare_resources(root)) {
+      std::size_t ub = 0;
+      int un = 0;
+      if (model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
+        if (!ane) { continue; }
+        for (auto& r : model_memory::coreml_claims(ane_claim_label_(), ub,
+                                                   un, c.phase)) {
+          pout.push_back(std::move(r));
+        }
+        continue;
+      }
+      pout.push_back(std::move(c));
+    }
     // A registered family renders previews through the output seam, so
     // its preview is booked exactly as a built-in's is.
     for (auto& c : latent_preview_claims(
@@ -1422,7 +1536,30 @@ GenerateImageStage::declare_resources() const
              _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
       pout.push_back(std::move(c));
     }
-    for (auto& c : model_memory::weight_claims({enc})) {
+    // THE ENCODER, unless the family answered for it. A family whose
+    // conditioner is its OWN stage claims the encoder itself -- phased
+    // to `condition` when that stage lets it go after the prompt -- and
+    // an unphased claim added here would book it through the denoise
+    // regardless. MEASURED with a plugin family whose conditioner holds
+    // a 32 GB MLLM: the encoder was released after the prompt, yet this
+    // claim kept it in the denoise phase and the family's 12 GB DiT
+    // streamed from disk on a 64 GB box.
+    if (!family_claims_dir_(*fam, root, enc)) {
+      for (auto& c : model_memory::weight_claims({enc})) {
+        pout.push_back(std::move(c));
+      }
+    }
+    // THE DECODE ARENA, as for the built-ins below. This branch returned
+    // before it, so no registered family's decode ever reached the plan
+    // -- and vae-decode's per-beat revision cannot create a label that
+    // was never declared, so it stayed absent for the whole run. The
+    // size comes from root/vae's config like a built-in's; a VAE that
+    // config does not describe gets the presence marker to revise.
+    std::size_t parena =
+        model_memory::vae_decode_scratch_bytes(root, _width, _height);
+    if (parena == 0) { parena = model_memory::kUnknownArena; }
+    for (auto& c : model_memory::scratch_claims("vae-decode", parena,
+                                                model_memory::kPhaseDecode)) {
       pout.push_back(std::move(c));
     }
     return pout;
@@ -1648,7 +1785,10 @@ GenerateImageStage::apply_model_config_()
       }
       if (ls != sl.scale) {
         sl.scale = ls;
-        push_scale(i, (float)ls);
+        // Through the packing lora_specs_() recorded: config slot i is
+        // the model's slot _lora_model_slot[i], or none.
+        const int ms = _lora_model_slot[(std::size_t)i];
+        if (ms >= 0) { push_scale(ms, (float)ls); }
       }
     }
   };
@@ -1840,20 +1980,20 @@ GenerateImageStage::ensure_loaded_()
     _plugin_family = genai::ImageModelRegistry::get().claim_for(
         session(), dit_dir, resolve_model(session(), _hf_dir).model_type);
   }
-  // A CHECKPOINT THIS STAGE RECOGNISES AND NO LONGER IMPLEMENTS. Checked
-  // only once the registry has declined it, so a loaded plugin never
-  // sees this -- and refused rather than warned, because the fall-through
-  // below is "krea2": without it a Mage-Flow root would load a 12B
-  // Krea-2 config over a 4B checkpoint, spend minutes and emit noise.
+  // A CHECKPOINT NOTHING HERE RUNS. Checked only once the registry has
+  // declined it, so a loaded plugin never sees this -- and refused rather
+  // than warned, because the fall-through below is "krea2": without it a
+  // family whose plugin was not loaded would load a 12B Krea-2 config
+  // over its checkpoint, spend minutes and emit noise.
   if (_plugin_family == nullptr) {
-    const std::string plug = unclaimed_family_(dit_dir);
-    if (!plug.empty()) {
+    const std::string cls = unclaimed_class_(dit_dir);
+    if (!cls.empty()) {
       session()->error(fmt(
-          "GenerateImageStage('{}'): '{}' is a {} checkpoint, whose family "
-          "is no longer built in -- load the {} plugin (vpipe --plugin "
-          "<path>) and re-run. The stage is inert rather than guessing a "
-          "family, because the guess would be a different model at full "
-          "cost", this->id(), root, "Mage-Flow", plug));
+          "GenerateImageStage('{}'): '{}' is a '{}' checkpoint, which no "
+          "built-in family runs and no loaded plugin claims -- load the "
+          "plugin that provides it (vpipe --plugin <path>) and re-run. The "
+          "stage is inert rather than guessing a family, because the guess "
+          "would be a different model at full cost", this->id(), root, cls));
       return;
     }
   }
@@ -1916,9 +2056,51 @@ GenerateImageStage::ensure_loaded_()
     session()->info(fmt(
         "GenerateImageStage('{}'): loading the '{}' DiT from '{}' (an "
         "out-of-tree family)", this->id(), _family, root));
+    // This stage's own `lora` / `lora2` keys feed the BUILT-IN families'
+    // loaders. A registered family reads its adapters from its own
+    // model_config (its config stage), so keys set here would otherwise
+    // do nothing at all -- an adapter that silently never applies.
+    for (int i = 0; i < kLoraSlots; ++i) {
+      if (!_lora[(std::size_t)i].path.empty()) {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): `{}` is set on generate-image, but "
+            "'{}' is an out-of-tree family that takes adapters on its own "
+            "model-config stage -- set it there; it is IGNORED here",
+            this->id(), i == 0 ? "lora" : "lora2", _family));
+      }
+    }
     genai::ImageModelCreateArgs args;
     args.root       = root;
     args.model_type = resolve_model(session(), _hf_dir).model_type;
+    // THE ANE TIER'S GRANT, for a family that booked a module (see
+    // declare_resources). A refusal turns the key OFF in the bag, which
+    // the family and every later request carry, so it is told no rather
+    // than holding a module the plan left no room for. The label goes
+    // with the args so the family can revise what it really holds.
+    FlexData create_extra = FlexData::make_object();
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      for (const ResourceClaim& c : _plugin_family->declare_resources(root)) {
+        std::size_t ub = 0;
+        int un = 0;
+        if (!model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
+          continue;
+        }
+        create_extra.as_object().insert_or_assign(
+            genai::create_args::kCoreMLLabel,
+            FlexData::make_string(ane_claim_label_()));
+        if (model_memory::coreml_grant(session(), ane_claim_label_(), ub,
+                                       un) <= 0) {
+          genai::accel::set_flag(&_accel, genai::accel::kAneFfn, false);
+          session()->info(fmt(
+              "GenerateImageStage('{}'): the ANE feed-forward was requested "
+              "but the plan left no room for {}'s module ({} MB); the "
+              "family keeps its GPU feed-forward", this->id(), _family,
+              ub >> 20));
+        }
+        break;
+      }
+    }
+    args.borrowed_extra = &create_extra;
     // The DiT the graph NAMED, if it named one. Passed only when the
     // config actually set it: `dit_dir` defaults to <root>/transformer,
     // and handing a family that default would tell it the graph made a
@@ -1962,6 +2144,10 @@ GenerateImageStage::ensure_loaded_()
           "1/{} spatial", this->id(), _family,
           _plugin_gen->latent_channels(),
           _plugin_gen->spatial_compression()));
+      // The holding the per-generation correction revises: the family's
+      // own first holding, which is the name the plan merged it under.
+      const auto hs = _plugin_family->declare_holdings(root);
+      if (!hs.empty()) { _dit_holding_dir = hs.front().source; }
     }
     return;
   }
@@ -2151,7 +2337,7 @@ GenerateImageStage::ensure_loaded_()
     _qie_stream  = stream_blocks;
     // AutoencoderKLQwenImage, which is the SAME VAE Krea-2 runs (see
     // vae_family_ in vae-decode-stage.cc: anything that is not Flux2 /
-    // Mage / Wan / MiniMax-H3 opens as one). So it sizes from `base_dim`,
+    // Wan / MiniMax-H3 or a registered family opens as one). So it sizes from `base_dim`,
     // not from diffusers' block_out_channels -- reading it the FLUX.2 way
     // would have silently pinned the estimate to the 128 default on a
     // checkpoint whose base_dim is 96.
@@ -2177,6 +2363,20 @@ GenerateImageStage::ensure_loaded_()
     // The holding correct_dit_holding_ moves as residency grows.
     _dit_holding_dir = dit_dir;
     _qi21_stream = stream_blocks;
+    _qi21_ck = qi21_checkpoint_schedule(root);
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Qwen-Image-2.1 schedule from the "
+        "checkpoint: {}{}, {}", this->id(),
+        _qi21_ck.sample_sigmas.empty()
+            ? std::string("linspace grid")
+            : fmt("{} sigma nodes (sample_sigmas)",
+                  _qi21_ck.sample_sigmas.size())(),
+        _qi21_ck.dynamic
+            ? std::string(", per-image dynamic shift")
+            : fmt(", static shift {}", _qi21_ck.shift)(),
+        _qi21_ck.shift_terminal > 0.0
+            ? fmt("terminal stretch to {}", _qi21_ck.shift_terminal)()
+            : std::string("no terminal stretch")));
     // Its VAE is the Qwen-Image one generalized, so the same reader
     // serves it -- but the DECODER's base, which is 144 here against
     // the encoder's 96, because every peak this feeds is a decode.
@@ -3738,35 +3938,70 @@ GenerateImageStage::generate_qwen_image21_(
   }
 
   // ---- schedule ------------------------------------------------------
-  genai::FlowSchedulerSpec sched = _scheduler_spec;
-  if (!_scheduler_latched) {
-    // FlowMatchEulerDiscreteScheduler with dynamic shifting, straight
-    // off the checkpoint's scheduler_config: the base grid is
-    // linspace(1, 1/S, S) and shift_terminal stretches the tail to 0.02.
-    sched.dynamic_shift = true;
-    sched.shift_type = "exponential";
-    sched.base_shift = 0.5; sched.max_shift = 0.9;
-    sched.base_seq = 256; sched.max_seq = 8192;
-    sched.shift_terminal = 0.02;
-    sched.steps = _steps > 0 ? _steps : 40;
-    // A few-step adapter's own schedule, when the model config names one:
-    // its raw nodes replace the default grid and ARE the step count; the
-    // shift is applied to them all the same.
-    if (!_qi21_sigmas.empty()) {
-      sched.base_sigmas = _qi21_sigmas;
-      sched.steps = (int)_qi21_sigmas.size();
+  // FlowMatchEulerDiscreteScheduler as the CHECKPOINT configures it (see
+  // qi21_checkpoint_schedule): the base model shifts linspace(1, 1/S, S)
+  // per image and stretches the tail; a distilled checkpoint runs its own
+  // raw nodes unshifted.
+  //
+  // A wired scheduler contributes its STEP COUNT and nothing else.
+  // scheduler-select emits a curve (simple, shift 1.15) whatever it was
+  // set to, and taking it -- as this family once did -- ran every graph
+  // that pinned its steps that way on a schedule neither checkpoint was
+  // trained on.
+  const Qi21Schedule& ck = _qi21_ck;
+  genai::FlowSchedulerSpec sched;
+  sched.dynamic_shift = ck.dynamic;
+  // Static is diffusers' s' = shift*s / (1 + (shift-1)*s): the "linear"
+  // curve here, with the static shift as its parameter.
+  sched.shift_type = ck.dynamic ? ck.shift_type : "linear";
+  sched.shift = ck.shift;
+  sched.base_shift = ck.base_shift;
+  sched.max_shift = ck.max_shift;
+  sched.base_seq = ck.base_seq;
+  sched.max_seq = ck.max_seq;
+  sched.shift_terminal = ck.shift_terminal;
+  // The reference's num_inference_steps default is 40 -- this stage's
+  // own `steps` default (8) is for the turbo families.
+  const bool asked = _scheduler_latched || _steps_set;
+  const int want = _scheduler_latched && _scheduler_spec.steps > 0
+                       ? _scheduler_spec.steps
+                       : (_steps_set ? _steps : 40);
+  sched.steps = want;
+  if (!ck.sample_sigmas.empty()) {
+    // The checkpoint's nodes ARE the schedule and the count, as in the
+    // reference, which ignores num_inference_steps for them. A different
+    // grid goes on qwen-image-21-model-config's `sigmas`.
+    sched.base_sigmas = ck.sample_sigmas;
+    sched.steps = (int)ck.sample_sigmas.size();
+    if (asked && want != sched.steps && _qi21_sigmas.empty() &&
+        !_qi21_sched_noted) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): {} steps is IGNORED -- this "
+          "checkpoint is distilled to its own {}-node schedule, which "
+          "runs. Set `sigmas` on qwen-image-21-model-config to try "
+          "another grid", this->id(), want, sched.steps));
     }
-    if (_qi21_shift_terminal >= 0.0) {
-      sched.shift_terminal = _qi21_shift_terminal;
-    }
-  } else if (!_qi21_sigmas.empty() || _qi21_shift_terminal >= 0.0) {
-    // A wired scheduler beats the model config, as it does for steps --
-    // but a turbo adapter run on the default grid is a different
-    // sampler that still makes a picture, so say so.
-    session()->warn(fmt(
-        "GenerateImageStage('{}'): a scheduler is wired, so the model "
-        "config's `sigmas` / `shift_terminal` are IGNORED", this->id()));
   }
+  // A few-step adapter's own schedule, when the model config names one:
+  // its raw nodes replace the grid and ARE the step count; the
+  // checkpoint's shift is applied to them all the same.
+  if (!_qi21_sigmas.empty()) {
+    sched.base_sigmas = _qi21_sigmas;
+    sched.steps = (int)_qi21_sigmas.size();
+  }
+  if (_qi21_shift_terminal >= 0.0) {
+    sched.shift_terminal = _qi21_shift_terminal;
+  }
+  if (_scheduler_latched && !_qi21_sched_noted &&
+      (_scheduler_spec.type != "simple" ||
+       _scheduler_spec.dynamic_shift)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the wired scheduler's '{}' curve is not "
+        "used -- Qwen-Image-2.1 runs the checkpoint's own schedule and "
+        "takes only the scheduler's step count", this->id(),
+        _scheduler_spec.type));
+  }
+  _qi21_sched_noted = true;
   sched.img_seq_len = img_seq;
   genai::FlowSampler sampler(_sampler_spec, sched);
   const int S = sampler.steps();
@@ -4769,7 +5004,7 @@ void
 GenerateImageStage::tag_model_(TensorBeat& tb) const
 {
   // `_hf_dir` is the reference the user actually named (a registry key like
-  // "local/Mage-Flow-Edit-Turbo-8bit", or a path), which is the meaningful
+  // "local/Krea-2-Turbo-8bit", or a path), which is the meaningful
   // identity of the generator -- not the resolved directory.
   provenance::set_model_name(tb.sideband, _hf_dir);
 }
@@ -5211,8 +5446,8 @@ GenerateImageStage::process(RuntimeContext& ctx)
         gen_h, r0.empty() ? "no reference, default" : "from ref_latent0"));
   }
   // ---- Content-policy refusal ------------------------------------------
-  // The Mage-Flow conditioner screens every prompt against the model's own
-  // policy classifier and tags a refused one `content_blocked`. Honour it
+  // A family's content screen judges every prompt in the conditioner and
+  // tags a refused one `content_blocked`. Honour it
   // HERE, once the output size is known and before any DiT work: a refusal
   // costs no denoise. The beat carries the size explicitly so vae-decode can
   // paint the blank refusal image without interpreting a latent that was
@@ -5478,6 +5713,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "GenerateImageStage('{}'): '{}' latent {} floats ({} steps @ {}x{})",
         this->id(), _family, res.latent.size(), req.steps, gen_w, gen_h));
     bar.finish();
+    // What the DiT held WHILE it denoised, before any release below --
+    // the figure a peer sizes against. As for the built-in families.
+    correct_dit_holding_("after a generation");
     // ROOM FOR THE DECODE, on the same signal the built-in families use
     // -- and before the write, so the downstream vae-decode sees the
     // freed room rather than racing it.
