@@ -1,0 +1,19 @@
+{
+  "id": "prepare-qwen38-flash-next",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

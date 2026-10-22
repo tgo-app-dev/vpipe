@@ -1,0 +1,122 @@
+{
+  "id": "fibo2-masked-edit",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "briaai/Fibo-2.0-edit-turbo"
+      }
+    },
+    {
+      "id": "load-ref",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [ "./reference.png" ]
+      }
+    },
+    {
+      "id": "load-mask",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [ "./mask.png" ]
+      }
+    },
+    {
+      "id": "grey-out",
+      "type": "create-mask",
+      "iports": [
+        { "src": "load-ref", "oport": 0 },
+        { "src": "load-mask", "oport": 0 }
+      ],
+      "config": {
+        "interactive": false,
+        "output": "overlay",
+        "overlay_color": "#808080",
+        "overlay_opacity": 1.0,
+        "mask_threshold": 128
+      }
+    },
+    {
+      "id": "ref-resample",
+      "type": "image-resample",
+      "iports": [
+        { "src": "grey-out", "oport": 0 }
+      ],
+      "config": {
+        "width": 1024,
+        "height": 1024,
+        "fit": "crop",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "replace the jacket with a red leather one"
+      }
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        { "src": "ref-resample", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "ref-resample", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "vae-encode", "oport": 0 }
+      ],
+      "config": {
+        "seed": 0
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "fibo2-masked-edit.png",
+        "format": "png",
+        "compression": 6
+      }
+    }
+  ],
+  "subpipelines": []
+}

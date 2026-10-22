@@ -222,6 +222,8 @@ private:
   int          _cfg_w = 0, _cfg_h = 0;
   bool         _interactive      = true;
   bool         _input_normalized = true;
+  // Binary mode: an in-mask value at or above this is set.
+  std::uint8_t _mask_threshold   = 1;
   std::string  _title;
 
   // Reference image, packed RGB24 at its own size.
@@ -244,6 +246,9 @@ private:
   std::uint64_t _emitted = 0;   // beats emitted by commands this run
   bool _roles_resolved = false;
   bool _want_ref       = false;
+  // Headless: a mask beat not yet written (an overlay waiting for its
+  // first reference image).
+  bool _out_pending    = false;
   bool _want_mask      = false;
   bool _torn           = false;
   bool _warned_idle    = false;

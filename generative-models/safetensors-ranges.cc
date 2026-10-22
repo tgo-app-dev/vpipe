@@ -24,7 +24,7 @@ SafetensorsRanges::~SafetensorsRanges()
 
 std::unique_ptr<SafetensorsRanges>
 SafetensorsRanges::open(const std::string& dir, const MetalLlamaWeights& src,
-                        std::string* err)
+                        std::string* err, bool cached)
 {
   auto fail = [&](std::string m) -> std::unique_ptr<SafetensorsRanges> {
     if (err != nullptr) { *err = std::move(m); }
@@ -47,6 +47,7 @@ SafetensorsRanges::open(const std::string& dir, const MetalLlamaWeights& src,
     }
   }
   std::unique_ptr<SafetensorsRanges> r(new SafetensorsRanges());
+  r->_cached = cached;
   std::unordered_map<std::string, int> fidx;
   std::vector<std::uint64_t> base;
   auto file_index = [&](const std::string& f) -> int {
@@ -55,7 +56,7 @@ SafetensorsRanges::open(const std::string& dir, const MetalLlamaWeights& src,
     const std::string path = (fs::path(dir) / f).string();
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) { return -1; }
-    (void)::fcntl(fd, F_NOCACHE, 1);
+    if (!cached) { (void)::fcntl(fd, F_NOCACHE, 1); }
     std::uint64_t hlen = 0;
     if (::pread(fd, &hlen, 8, 0) != 8) {
       ::close(fd);
@@ -101,8 +102,18 @@ SafetensorsRanges::read(const std::string& name, std::size_t off,
   }
   if (n == 0) { return true; }
   const int fd = _fds[(std::size_t)it->second.file];
-  static const std::uint64_t page = (std::uint64_t)::sysconf(_SC_PAGESIZE);
   const std::uint64_t at = it->second.at + off;
+  if (_cached) {
+    auto* d = static_cast<std::uint8_t*>(dst);
+    std::size_t got = 0;
+    while (got < n) {
+      const ssize_t k = ::pread(fd, d + got, n - got, (off_t)(at + got));
+      if (k <= 0) { return false; }
+      got += (std::size_t)k;
+    }
+    return true;
+  }
+  static const std::uint64_t page = (std::uint64_t)::sysconf(_SC_PAGESIZE);
   const std::uint64_t a0 = at / page * page;
   const std::uint64_t a1 = (at + n + page - 1) / page * page;
   const std::size_t span = (std::size_t)(a1 - a0);

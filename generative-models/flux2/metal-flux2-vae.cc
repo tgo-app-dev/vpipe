@@ -482,6 +482,28 @@ MetalFlux2Vae::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       m->_fn_conv_hw_s2_c16 =
           m->_lib_convhw.function("conv2d_hw_3x3_s2_c16_f16");
     }
+    // The int8 twins and their quantizers, for set_accel; an invalid one
+    // leaves the route off (or its width on f16). The narrow tiles follow
+    // the f16 ones' knobs, so an A/B that declines a tile declines both.
+    m->_fn_conv_i8_s1 = m->_lib_convhw.function("conv2d_hw_3x3_s1_i8");
+    m->_fn_conv_i8_s2 = m->_lib_convhw.function("conv2d_hw_3x3_s2_i8");
+    if (std::getenv("VPIPE_VAE_NO_C32") == nullptr) {
+      m->_fn_conv_i8_s1_c32 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s1_c32_i8");
+      m->_fn_conv_i8_s2_c32 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s2_c32_i8");
+    }
+    if (std::getenv("VPIPE_VAE_NO_C16") == nullptr) {
+      m->_fn_conv_i8_s1_c16 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s1_c16_i8");
+      m->_fn_conv_i8_s2_c16 =
+          m->_lib_convhw.function("conv2d_hw_3x3_s2_c16_i8");
+    }
+    m->_fn_i8_zero = m->_lib_convhw.function("vae_i8_zero_u32");
+    m->_fn_i8_amax = m->_lib_convhw.function("vae_i8_chan_amax_f16");
+    m->_fn_i8_steps = m->_lib_convhw.function("vae_i8_steps_f16");
+    m->_fn_i8_quant = m->_lib_convhw.function("vae_i8_quant_chan_f16");
+    m->_fn_i8_fold = m->_lib_convhw.function("vae_i8_weight_fold_f16");
   }
 
   const int top = cfg.dec_block_out[3];           // 512 (384 small)
@@ -1136,6 +1158,167 @@ MetalFlux2Vae::conv3x3_hw_(ComputeEncoder& enc, const SharedBuffer& in,
 }
 
 void
+MetalFlux2Vae::set_accel(const Accel& a)
+{
+  // VPIPE_I8_GEMM overrides either way, as it does for every int8 GEMM.
+  bool on = a.i8_gemm;
+  if (const char* e = std::getenv("VPIPE_I8_GEMM")) { on = std::atoi(e) != 0; }
+  _i8_conv = on && _use_hwconv && _fn_conv_i8_s1.valid() &&
+             _fn_conv_i8_s2.valid() && _fn_i8_zero.valid() &&
+             _fn_i8_amax.valid() && _fn_i8_steps.valid() &&
+             _fn_i8_quant.valid() && _fn_i8_fold.valid();
+  // Accurate takes the resnet convs, whose inputs a GroupNorm has evened
+  // out; every other tier the residual stream's too.
+  // VPIPE_VAE_I8_ALL_CONVS (0 | 1) overrides, as on MetalKrea2Vae.
+  _i8_all_convs = _i8_conv && a.i8_tier != 0;
+  if (const char* e = std::getenv("VPIPE_VAE_I8_ALL_CONVS")) {
+    _i8_all_convs = _i8_conv && std::atoi(e) != 0;
+  }
+  if (const char* e = std::getenv("VPIPE_VAE_I8_ALPHA")) {
+    _i8_alpha = std::clamp((float)std::atof(e), 0.0f, 1.0f);
+  }
+}
+
+std::string
+MetalFlux2Vae::accel_note() const
+{
+  if (!_i8_conv) { return {}; }
+  return _i8_all_convs ? "int8: every 3x3 conv a channel at a time"
+                       : "int8: the resnet convs a channel at a time";
+}
+
+int
+MetalFlux2Vae::i8_tile_(int cout, int stride) const noexcept
+{
+  if (!_i8_conv || cout <= 0) { return 0; }
+  const bool s2 = stride == 2;
+  if ((cout % 64) == 0) { return 64; }
+  if ((cout % 32) == 0 &&
+      (s2 ? _fn_conv_i8_s2_c32 : _fn_conv_i8_s1_c32).valid()) {
+    return 32;
+  }
+  if ((cout % 16) == 0 &&
+      (s2 ? _fn_conv_i8_s2_c16 : _fn_conv_i8_s1_c16).valid()) {
+    return 16;
+  }
+  return 0;
+}
+
+bool
+MetalFlux2Vae::i8_conv_takes_(const Conv& c, int H, int W,
+                              int stride) const noexcept
+{
+  // The depth floor is MetalKrea2Vae's: below 9 * cin = 1024 the
+  // quantizers' passes cost what the int8 op saves (a 32-channel
+  // latent's conv_in, a 3-channel picture's). VPIPE_VAE_I8_MIN_K is the
+  // A/B.
+  static const int min_k = [] {
+    const char* e = std::getenv("VPIPE_VAE_I8_MIN_K");
+    return e != nullptr ? std::max(1, std::atoi(e)) : 1024;
+  }();
+  if (!_i8_conv || c.w.empty() || (c.cin % 4) != 0 || c.k < min_k) {
+    return false;
+  }
+  const int OH = H / stride, OW = W / stride;
+  if ((OW % 8) != 0 || (OH % 8) != 0 || i8_tile_(c.cout, stride) == 0) {
+    return false;
+  }
+  // The op's int32 byte addressing, as conv3x3_hw_ (the source is 1 byte
+  // an element here).
+  return tensor_op_operand_fits((std::size_t)c.cin * W * H, 1) &&
+         tensor_op_operand_fits((std::size_t)c.cout * OW * OH, 2);
+}
+
+void
+MetalFlux2Vae::i8_conv_scratch_(const Conv& c, std::size_t rows,
+                                std::size_t out[4]) noexcept
+{
+  // In f16 elements (the pool's unit): an int8 or a 4-byte buffer of n
+  // elements is n / 2 or 2n of them.
+  out[0] = (rows * (std::size_t)c.cin + 1) / 2;               // int8 x
+  out[1] = ((std::size_t)9 * c.cin * c.cout + 1) / 2;         // int8 w
+  out[2] = (std::size_t)c.cin * 2;                            // steps
+  out[3] = (std::size_t)c.cout * 2;                           // wscale
+}
+
+bool
+MetalFlux2Vae::conv3x3_i8_(ComputeEncoder& enc, const SharedBuffer& in,
+                           const Conv& c, const SharedBuffer& out, int H,
+                           int W, int stride, bool silu,
+                           const PoolAlloc& alloc, const PoolRelease& release)
+{
+  if (!i8_conv_takes_(c, H, W, stride)) { return false; }
+  const int OH = H / stride, OW = W / stride;
+  const bool s2 = stride == 2;
+  const int tile = i8_tile_(c.cout, stride);
+  const std::size_t rows = (std::size_t)H * W;
+  std::size_t need[4];
+  i8_conv_scratch_(c, rows, need);
+  // The picture-sized copy FIRST: the pool is first-fit, so small
+  // buffers asked for ahead of it would take the free large slots and
+  // leave it a fresh full-size allocation (MetalKrea2Vae measured it).
+  SharedBuffer& xq = alloc(need[0]);
+  SharedBuffer& wq = alloc(need[1]);
+  SharedBuffer& amax = alloc(need[2]);    // each channel's amax, then step
+  SharedBuffer& wscale = alloc(need[3]);
+  if (amax.empty() || wscale.empty() || wq.empty() || xq.empty()) {
+    release(xq); release(wq); release(wscale); release(amax);
+    return false;
+  }
+  const int cin4 = c.cin / 4;
+  const int sil = silu ? 1 : 0;
+  // 1. each channel's amax over the picture (an integer max over the f32
+  // bit patterns: order-free, so the same answer every run)
+  enc.set_function(_fn_i8_zero);
+  enc.set_buffer(0, amax); enc.set_constant(1, c.cin);
+  enc.dispatch({(unsigned)c.cin, 1, 1}, {64, 1, 1});
+  const int rows_per = 256;
+  enc.set_function(_fn_i8_amax);
+  enc.set_buffer(0, in); enc.set_buffer(1, amax);
+  enc.set_constant(2, c.cin); enc.set_constant(3, (int)rows);
+  enc.set_constant(4, rows_per); enc.set_constant(5, sil);
+  enc.dispatch({(unsigned)(cin4 * ((rows + rows_per - 1) / rows_per)), 1,
+                1}, {256, 1, 1});
+  // 2. each channel's step, SmoothQuant's migration
+  enc.set_function(_fn_i8_steps);
+  enc.set_buffer(0, amax); enc.set_constant(1, c.cin);
+  enc.set_constant(2, _i8_alpha);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  // 3. the weight, the activation's steps folded in
+  enc.set_function(_fn_i8_fold);
+  enc.set_buffer(0, c.w); enc.set_buffer(1, amax);
+  enc.set_buffer(2, wq); enc.set_buffer(3, wscale);
+  enc.set_constant(4, c.cin); enc.set_constant(5, c.cout);
+  enc.dispatch({(unsigned)c.cout * 256u, 1, 1}, {256, 1, 1});
+  // 4. the activation, a channel at its step
+  const unsigned n4 = (unsigned)(rows * (std::size_t)cin4);
+  enc.set_function(_fn_i8_quant);
+  enc.set_buffer(0, in); enc.set_buffer(1, xq); enc.set_buffer(2, amax);
+  enc.set_constant(3, c.cin); enc.set_constant(4, sil);
+  enc.set_constant(5, n4);
+  enc.dispatch({n4, 1, 1}, {256, 1, 1});
+  // 5. the conv, its scales and bias in its epilogue
+  enc.set_function(
+      s2 ? (tile == 16 ? _fn_conv_i8_s2_c16
+                       : tile == 32 ? _fn_conv_i8_s2_c32 : _fn_conv_i8_s2)
+         : (tile == 16 ? _fn_conv_i8_s1_c16
+                       : tile == 32 ? _fn_conv_i8_s1_c32 : _fn_conv_i8_s1));
+  enc.set_buffer(0, xq); enc.set_buffer(1, wq); enc.set_buffer(2, out);
+  enc.set_constant(3, W); enc.set_constant(4, H);
+  enc.set_constant(5, c.cin); enc.set_constant(6, c.cout);
+  enc.set_buffer(7, wscale);
+  enc.set_buffer(8, c.b.empty() ? wscale : c.b);
+  enc.set_constant(9, c.b.empty() ? 0 : 1);
+  // Stride 2: the asymmetric (0,1,0,1) downsample pad, as conv3x3_hw_.
+  enc.set_constant(10, 3);
+  enc.dispatch({(unsigned)((OW / 8) * 128), (unsigned)(OH / 8),
+                (unsigned)(c.cout / tile)}, {128, 1, 1});
+  release(xq); release(wq); release(wscale); release(amax);
+  ++_i8_convs;
+  return true;
+}
+
+void
 MetalFlux2Vae::conv_gemm_bias_(ComputeEncoder& enc, const SharedBuffer& x,
                                const SharedBuffer& w, const SharedBuffer& b,
                                const SharedBuffer& y, int M, int N, int K,
@@ -1467,6 +1650,11 @@ struct MetalFlux2Vae::Ops {
   // small request take a large buffer the next large request then lacks.
   bool best_fit = false;
   bool alloc_ok = true;
+  // The int8 route (set_accel) for the convs of a plane this pass sees
+  // WHOLE: decode() and the exact decode's head set it, a tile never
+  // does -- its activation scales would be the tile's own, and the
+  // exact decode would stop being the whole one.
+  bool use_i8 = false;
   std::size_t bytes = 0;               // everything the pool holds
   std::size_t max_elems = 0;           // its largest single request
   struct Slot { SharedBuffer buf; std::size_t cap; bool used; };
@@ -1534,13 +1722,39 @@ struct MetalFlux2Vae::Ops {
   }
   void clear() { pool.clear(); bytes = 0; }
 
-  SharedBuffer& conv3x3(const SharedBuffer& in, int H, int W, const Conv& c)
+  // `silu_in`: `in` is a norm's output and the conv reads its SiLU -- in
+  // the int8 route's quantizer when that takes the conv, else applied to
+  // `in` in place here.
+  SharedBuffer& conv3x3(const SharedBuffer& in, int H, int W, const Conv& c,
+                        bool silu_in = false)
   {
     const std::size_t hw = (std::size_t)H * W;
     SharedBuffer& out = alloc(hw * c.cout);
-    if (dry()) { return out; }
+    const bool i8 = use_i8 && (silu_in || v._i8_all_convs) &&
+                    v.i8_conv_takes_(c, H, W, /*stride=*/1);
+    if (dry()) {
+      // What the route asks of the pool, in its order, so a plan sizes
+      // the scratch the run allocates.
+      if (i8) {
+        std::size_t need[4];
+        v.i8_conv_scratch_(c, hw, need);
+        SharedBuffer* t[4];
+        for (int i = 0; i < 4; ++i) { t[i] = &alloc(need[i]); }
+        for (int i = 0; i < 4; ++i) { release(*t[i]); }
+      }
+      return out;
+    }
     // Whichever route runs it: an [H*W, 9*cin] x [9*cin, cout] product.
     v._flops.gemm((long long)hw, c.cout, 9LL * c.cin);
+    if (i8 &&
+        v.conv3x3_i8_(*enc, in, c, out, H, W, /*stride=*/1, silu_in,
+                      [&](std::size_t e) -> SharedBuffer& {
+                        return alloc(e);
+                      },
+                      [&](const SharedBuffer& b) { release(b); })) {
+      return out;
+    }
+    if (silu_in) { silu(in, hw * c.cin); }
     // NAX hardware conv when the shape tiles; else row-tiled im2col + GEMM
     // (streams the [hw, 9*cin] im2col in bands through `col`).
     if (v.conv3x3_hw_(*enc, in, c, out, H, W, /*stride=*/1)) { return out; }
@@ -1631,13 +1845,11 @@ struct MetalFlux2Vae::Ops {
   {
     const std::size_t hw = (std::size_t)H * W;
     SharedBuffer& t = gnorm(x, hw, rb.n1, s1);
-    silu(t, hw * rb.cin);
-    SharedBuffer& t1 = conv3x3(t, H, W, rb.c1);
+    SharedBuffer& t1 = conv3x3(t, H, W, rb.c1, /*silu_in=*/true);
     release(t);
     SharedBuffer& t2 = gnorm(t1, hw, rb.n2, s2);
     release(t1);
-    silu(t2, hw * rb.cout);
-    SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2);
+    SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2, /*silu_in=*/true);
     release(t2);
     if (rb.has_short) {
       SharedBuffer& h = conv1x1(x, hw, rb.shortcut);
@@ -1810,7 +2022,10 @@ MetalFlux2Vae::decode_exact_(const SharedBuffer& latent, int h8, int w8,
       return *x;
     };
     // Sized by a dry run of the same calls before anything is allocated.
+    // The head sees its planes whole, so it takes the int8 route (the
+    // tiles below do not); its dry run asks the same scratch.
     Ops dry(*this, nullptr);
+    dry.use_i8 = true;
     head(dry);
     if (dry.bytes + fixed > budget) {
       return fail(fmt("exact tiled decode: the mid block needs ~{} MB "
@@ -1821,6 +2036,7 @@ MetalFlux2Vae::decode_exact_(const SharedBuffer& latent, int h8, int w8,
     ComputeEncoder enc = stream.begin_compute();
     Ops ops(*this, &enc);
     ops.col = &col; ops.col_cap = col_cap;
+    ops.use_i8 = true;
     const SharedBuffer& x = head(ops);
     enc.end();
     _flops.flush(stream);
@@ -2683,6 +2899,7 @@ MetalFlux2Vae::decode(const SharedBuffer& z, int h16, int w16, std::string* err)
   Ops ops(*this, nullptr);
   ops.col = &im2col_scratch; ops.col_cap = im2col_cap;
   ops.use_pool = use_pool;
+  ops.use_i8 = true;           // every plane here is whole
   auto release = [&](const SharedBuffer& b) { ops.release(b); };
   _flops.begin();
   {
@@ -2909,10 +3126,25 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
   _flops.begin();
   {
     ComputeEncoder enc = stream.begin_compute();
-    auto conv3x3 = [&](const SharedBuffer& in, int H, int W,
-                       const Conv& c) -> SharedBuffer& {
+    auto silu = [&](const SharedBuffer& x, std::size_t n) {
+      enc.set_function(_fn_mul_sigmoid);
+      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
+      enc.set_constant(3, (int)n);
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    };
+    // `silu_in`: a norm's output, SiLU'd in the int8 route's quantizer
+    // when that takes the conv (set_accel; the encoder sees every plane
+    // whole), else in place here.
+    auto conv3x3 = [&](const SharedBuffer& in, int H, int W, const Conv& c,
+                       bool silu_in = false) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)H * W * c.cout);
       _flops.gemm((long long)H * W, c.cout, 9LL * c.cin);
+      if ((silu_in || _i8_all_convs) &&
+          conv3x3_i8_(enc, in, c, out, H, W, /*stride=*/1, silu_in, alloc,
+                      release)) {
+        return out;
+      }
+      if (silu_in) { silu(in, (std::size_t)H * W * c.cin); }
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/1)) { return out; }
       // Small cout (the final conv to 3 / 2*latent) never satisfies the
       // hardware conv's cout % 64; a direct pass beats materializing im2col.
@@ -2927,6 +3159,12 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
                           const Conv& c) -> SharedBuffer& {
       SharedBuffer& out = alloc((std::size_t)(H / 2) * (W / 2) * c.cout);
       _flops.gemm((long long)(H / 2) * (W / 2), c.cout, 9LL * c.cin);
+      // A downsample reads the residual stream: the non-accurate tiers'.
+      if (_i8_all_convs &&
+          conv3x3_i8_(enc, in, c, out, H, W, /*stride=*/2, false, alloc,
+                      release)) {
+        return out;
+      }
       if (conv3x3_hw_(enc, in, c, out, H, W, /*stride=*/2)) { return out; }
       tiled_conv3x3_(enc, in, out, H, W, c, /*stride=*/2, im2col_scratch,
                      im2col_cap);
@@ -2945,12 +3183,6 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
       group_norm_(enc, in, n.g, n.b, out, (int)hw, n.c, G, geps);
       return out;
     };
-    auto silu = [&](const SharedBuffer& x, std::size_t n) {
-      enc.set_function(_fn_mul_sigmoid);
-      enc.set_buffer(0, x); enc.set_buffer(1, x); enc.set_buffer(2, x);
-      enc.set_constant(3, (int)n);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-    };
     auto resadd = [&](const SharedBuffer& a, const SharedBuffer& b,
                       std::size_t n) -> SharedBuffer& {
       SharedBuffer& out = alloc(n);
@@ -2964,13 +3196,11 @@ MetalFlux2Vae::encode(const SharedBuffer& img, int H0, int W0)
         -> SharedBuffer& {
       const std::size_t hw = (std::size_t)H * W;
       SharedBuffer& t = gnorm(x, hw, rb.n1);
-      silu(t, hw * rb.cin);
-      SharedBuffer& t1 = conv3x3(t, H, W, rb.c1);
+      SharedBuffer& t1 = conv3x3(t, H, W, rb.c1, /*silu_in=*/true);
       release(t);
       SharedBuffer& t2 = gnorm(t1, hw, rb.n2);
       release(t1);
-      silu(t2, hw * rb.cout);
-      SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2);
+      SharedBuffer& t3 = conv3x3(t2, H, W, rb.c2, /*silu_in=*/true);
       release(t2);
       if (rb.has_short) {
         SharedBuffer& h = conv1x1(x, hw, rb.shortcut);

@@ -6,6 +6,7 @@
 #include "minitest.h"
 
 #include "common/flex-data.h"
+#include "common/media-line.h"
 #include "generative-models/shared/mcp/mcp-tools.h"
 
 #include <string>
@@ -176,4 +177,172 @@ TEST(mcp_tools, parse_skips_malformed_block)
   if (!calls.empty()) {
     EXPECT_TRUE(calls[0].name == "ok");
   }
+}
+
+// ---- the XML function form (Qwen3.5 / 3.6 / 3.8's own template) ------
+
+namespace {
+
+// add_text's spec as text-chat writes a tool a line.
+const char* kAddTextSpec =
+    "{\"type\":\"function\",\"function\":{\"name\":\"add_text\","
+    "\"description\":\"Put words on a page.\",\"parameters\":{\"type\":"
+    "\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"size\":"
+    "{\"type\":\"integer\"},\"bold\":{\"type\":\"boolean\"},\"box\":"
+    "{\"type\":\"array\"},\"opacity\":{\"type\":\"number\"},\"note\":"
+    "{\"type\":[\"string\",\"null\"]},\"style\":{\"description\":\"any\"}},"
+    "\"required\":[\"text\"]}}}";
+
+FlexData
+args_(const McpToolCall& c)
+{
+  return FlexData::from_json(c.arguments_json);
+}
+
+}  // namespace
+
+// Each value read by the type its schema gives it: the template writes
+// a string as it is and anything else as JSON, so "2026" is the words
+// where the schema says string, and a number where it says integer.
+TEST(mcp_tools, xml_call_is_typed_by_its_schema)
+{
+  const string reply =
+      "I'll put the year on the cover.\n\n<tool_call>\n"
+      "<function=add_text>\n"
+      "<parameter=text>\n2026\n</parameter>\n"
+      "<parameter=size>\n48\n</parameter>\n"
+      "<parameter=bold>\ntrue\n</parameter>\n"
+      "<parameter=box>\n[40, 30, 560, 120]\n</parameter>\n"
+      "<parameter=opacity>\n0.5\n</parameter>\n"
+      "<parameter=note>\nnull\n</parameter>\n"
+      "<parameter=style>\n{\"align\": \"center\"}\n</parameter>\n"
+      "</function>\n</tool_call>";
+  auto calls = parse_xml_tool_calls(reply, kAddTextSpec);
+  EXPECT_TRUE(calls.size() == 1);
+  if (calls.size() != 1) { return; }
+  EXPECT_TRUE(calls[0].name == "add_text");
+  const FlexData a = args_(calls[0]);
+  const auto o = a.as_object();
+  EXPECT_TRUE(o.at("text").is_string());
+  EXPECT_TRUE(o.at("text").as_string() == "2026");
+  EXPECT_TRUE(o.at("size").is_int() && o.at("size").as_int() == 48);
+  EXPECT_TRUE(o.at("bold").is_bool() && o.at("bold").as_bool());
+  EXPECT_TRUE(o.at("box").is_array() && o.at("box").as_array().size() == 4);
+  EXPECT_TRUE(o.at("opacity").as_real() == 0.5);
+  EXPECT_TRUE(o.at("note").is_null());
+  // Untyped in its schema: an object is taken as one.
+  EXPECT_TRUE(o.at("style").is_object());
+}
+
+// A string keeps its own line breaks and spaces; only the one break the
+// template puts either side of it goes. A number the schema calls a
+// string stays the words; one it does not name is a string too.
+TEST(mcp_tools, xml_string_keeps_its_lines)
+{
+  const string reply =
+      "<tool_call>\n<function=add_text>\n"
+      "<parameter=text>\n  Mercury\nVenus  \n</parameter>\n"
+      "<parameter=size>\nlarge\n</parameter>\n"
+      "<parameter=page>\n3\n</parameter>\n"
+      "</function>\n</tool_call>";
+  auto calls = parse_xml_tool_calls(reply, kAddTextSpec);
+  EXPECT_TRUE(calls.size() == 1);
+  if (calls.size() != 1) { return; }
+  const FlexData a = args_(calls[0]);
+  const auto o = a.as_object();
+  EXPECT_TRUE(o.at("text").as_string() == "  Mercury\nVenus  ");
+  // Not an integer: the words, for the tool to refuse by name.
+  EXPECT_TRUE(o.at("size").as_string() == "large");
+  EXPECT_TRUE(o.at("page").is_string() && o.at("page").as_string() == "3");
+}
+
+// Several calls, one block each or two in one; without a schema for the
+// tool a value that reads as JSON is JSON.
+TEST(mcp_tools, xml_calls_in_order_without_a_schema)
+{
+  const string reply =
+      "<tool_call>\n<function=get_project>\n</function>\n</tool_call>\n"
+      "<tool_call>\n<function=set_page>\n<parameter=page>\n2\n"
+      "</parameter>\n<parameter=title>\nOrbits\n</parameter>\n"
+      "</function>\n<function=view_page>\n<parameter=page>\n2\n"
+      "</parameter>\n</function>\n</tool_call>";
+  auto calls = parse_xml_tool_calls(reply, "");
+  EXPECT_TRUE(calls.size() == 3);
+  if (calls.size() != 3) { return; }
+  EXPECT_TRUE(calls[0].name == "get_project");
+  EXPECT_TRUE(calls[0].arguments_json == "{}");
+  EXPECT_TRUE(calls[1].name == "set_page");
+  const FlexData a = args_(calls[1]);
+  EXPECT_TRUE(a.as_object().at("page").is_int());
+  EXPECT_TRUE(a.as_object().at("title").as_string() == "Orbits");
+  EXPECT_TRUE(calls[2].name == "view_page");
+}
+
+// A decode cut off leaves its tags open: what was written is read.
+TEST(mcp_tools, xml_unclosed_tags_run_to_the_end)
+{
+  const string reply =
+      "<tool_call>\n<function=add_text>\n<parameter=size>\n32\n"
+      "<parameter=text>\nSolar System";
+  auto calls = parse_xml_tool_calls(reply, kAddTextSpec);
+  EXPECT_TRUE(calls.size() == 1);
+  if (calls.size() != 1) { return; }
+  const FlexData a = args_(calls[0]);
+  EXPECT_TRUE(a.as_object().at("size").as_int() == 32);
+  EXPECT_TRUE(a.as_object().at("text").as_string() == "Solar System");
+}
+
+// The Hermes JSON in a block, and the function form with no block round
+// it, are read too; a reply with neither has no calls.
+TEST(mcp_tools, xml_parser_takes_json_and_a_bare_function)
+{
+  auto json = parse_xml_tool_calls(
+      "<tool_call>\n{\"name\": \"get_project\", \"arguments\": {}}\n"
+      "</tool_call>", kAddTextSpec);
+  EXPECT_TRUE(json.size() == 1);
+  if (json.size() != 1) { return; }
+  EXPECT_TRUE(json[0].name == "get_project");
+  auto bare = parse_xml_tool_calls(
+      "<function=add_text>\n<parameter=text>\nHi\n</parameter>\n"
+      "</function>", kAddTextSpec);
+  EXPECT_TRUE(bare.size() == 1);
+  if (bare.size() != 1) { return; }
+  EXPECT_TRUE(args_(bare[0]).as_object().at("text").as_string() == "Hi");
+  EXPECT_TRUE(parse_xml_tool_calls("Done: 14 pages.", kAddTextSpec)
+                  .empty());
+  EXPECT_TRUE(parse_xml_tool_calls(
+                  "<tool_call>\nnot a call\n</tool_call>", "").empty());
+}
+
+// A call the model drafted, or only mentioned, while it reasoned is not
+// one it made: text-chat reads the calls of reply_without_thinking().
+// Over the whole reply, a mention made a call with no arguments and a
+// draft doubled the real one.
+TEST(mcp_tools, a_call_made_while_reasoning_is_not_read)
+{
+  const std::string tools =
+      "{\"type\":\"function\",\"function\":{\"name\":\"set_title\","
+      "\"parameters\":{\"type\":\"object\",\"properties\":{\"title\":"
+      "{\"type\":\"string\"}}}}}";
+  const std::string ts(vpipe::media_line::kThinkStart);
+  const std::string te(vpipe::media_line::kThinkEnd);
+  const std::string call =
+      "<tool_call>\n<function=set_title>\n<parameter=title>\nWater\n"
+      "</parameter>\n</function>\n</tool_call>";
+  const std::string mention =
+      ts + "I could use <function=set_title> but they only asked.\n" + te
+      + "\n\nIt would be \"Water\".";
+  const std::string draft = ts + "Draft:\n" + call + "\n" + te + "\n\n" + call;
+  auto read = [&](const std::string& reply) {
+    return vpipe::parse_xml_tool_calls(
+        vpipe::media_line::reply_without_thinking(reply), tools);
+  };
+  EXPECT_TRUE(vpipe::parse_xml_tool_calls(mention, tools).size() == 1);
+  EXPECT_TRUE(vpipe::parse_xml_tool_calls(draft, tools).size() == 2);
+  EXPECT_TRUE(read(mention).empty());
+  const auto calls = read(draft);
+  EXPECT_TRUE(calls.size() == 1);
+  if (calls.size() != 1) { return; }
+  EXPECT_TRUE(calls[0].name == "set_title"
+              && calls[0].arguments_json == "{\"title\":\"Water\"}");
 }

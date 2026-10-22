@@ -366,6 +366,15 @@ builtin_catalog_()
      .hf_path = "incoai/Qwen3.8-27B-DFlash2", .model_type = "dflash2",
      .parent_model_type = "qwen3.5", .parent_param_class = "27B",
      .needs_tokenizer_json = false},
+    // DFlash 2 for Qwen3.8-Flash-Next (Inco AI): the same five-layer shape
+    // at the target's width (2560), every layer a 2048-token window,
+    // block 8 -- 1.2 GB bf16. It conditions on the target's layers 5 / 15
+    // / 25 / 35 / 45, each averaged over the four hyper-connection streams.
+    {.family = "DFlash", .version = "2", .param_class = "Flash-Next",
+     .variant = "drafter for Qwen3.8-Flash-Next (incoai)",
+     .hf_path = "incoai/Qwen3.8-Flash-Next-DFlash2", .model_type = "dflash2",
+     .parent_model_type = "qwen3.8-flash", .parent_param_class = "Flash-Next",
+     .needs_tokenizer_json = false},
     // DFlash (z-lab): six layers, block 16, for Qwen3.5-4B.
     {.family = "DFlash", .version = "1", .param_class = "4B",
      .variant = "drafter for Qwen3.5-4B (z-lab)",
@@ -393,6 +402,19 @@ builtin_catalog_()
      .variant = "MLX OptiQ 4-bit (mlx-community)",
      .hf_path = "mlx-community/Qwen3.6-27B-OptiQ-4bit",
      .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // Qwen3.8-Flash-Next (model_type qwen4_exp, ~180B stored, ~6B active):
+    // the Qwen3.5-MoE backbone (36 gated-DeltaNet + 12 gated full-
+    // attention layers, 512 routed experts top-10) under HYPER-CONNECTIONS
+    // (4 residual streams), with a hashed 2/3-gram embedding (a 51B-
+    // parameter table, read by row) on one layer and a token indexer on
+    // the full layers (metal-qwen-hc.cc). The MLX oQ5e pack: experts w5,
+    // the rest 5/6/8-bit (re-encoded to w8 at load), 128.5 GB. On a box
+    // smaller than that the routed experts run from a cache and the n-gram
+    // table from disk. Abliterated; Qwen Community License 1.0.
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX oQ5e uncensored, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
@@ -1574,6 +1596,49 @@ builtin_catalog_()
                "vae/config.json",
                "vae/diffusion_pytorch_model.safetensors"},
      .needs_tokenizer_json = false},
+    // ---- Fibo 2.0 Edit Turbo (image editing, Bria) -----------------------
+    // briaai/Fibo-2.0-edit-turbo: an 8B DiT distilled to edit in 4 steps
+    // with no guidance. Sub-models:
+    //   transformer/  = BriaFibo2Transformer2DModel (bf16, 16.3 GB):
+    //     Z-Image's block, a Perceiver squeezing the text into 256..512
+    //     gist tokens, five blocks cross-attending their own text bundle.
+    //   text_encoder/ = Qwen3-VL-4B-Instruct (bf16, 8.9 GB), text AND the
+    //     pictures to edit; 15 hidden states in six bundles.
+    //   processor/    = its tokenizer and image processor.
+    //   vae/          = FLUX.2's AutoencoderKLFlux2.
+    //   fonts/        = the faces its pipeline draws a caption's text with.
+    // GATED, and CC BY-NC 4.0 (non-commercial): accept the terms on the
+    // repo page, then give model-fetch a token.
+    {.family = "Fibo", .version = "2.0", .param_class = "8B",
+     .variant = "Edit Turbo, bf16 (briaai, gated, non-commercial)",
+     .hf_path = "briaai/Fibo-2.0-edit-turbo",
+     .model_type = "fibo2",
+     .inputs = {"text", "image"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "README.md",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json",
+               "processor/tokenizer_config.json",
+               "processor/tokenizer.json",
+               "scheduler/scheduler_config.json",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "fonts/Aileron-Regular.otf",
+               "fonts/DejaVuSans.ttf",
+               "fonts/LICENSE-Aileron.txt",
+               "fonts/LICENSE-DejaVu.txt",
+               "fonts/README.md"},
+     .needs_tokenizer_json = false},
     // ---- MOSS-Image (text -> image, OpenMOSS) ----------------------------
     // A 5B single-stream flow-matching DiT. Sub-models:
     //   transformer/  = MOSSImageTransformer (bf16, 9.5 GB): two
@@ -2692,6 +2757,9 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   };
   if (mt == "qwen3.5" || mt == "qwen3.6") {
     set({"text", "image", "video"}, {"text"});
+  } else if (mt == "qwen3.8-flash") {
+    // Its vision tower is not wired yet: text in, text out.
+    set({"text"}, {"text"});
   } else if (mt == "qwen3-asr") {
     set({"audio"}, {"text"});
   } else if (mt == "mistral3") {
@@ -2714,7 +2782,7 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // A source separator: music in, one source and its complement out.
     set({"audio"}, {"audio"});
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
-             || mt == "flux3") {
+             || mt == "flux3" || mt == "fibo2") {
     set({"text", "image"}, {"image"});
   } else if (mt == "moss-image") {
     // Text to image only: no reference path in this family.

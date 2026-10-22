@@ -9,6 +9,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -565,8 +566,9 @@ VideoRefEncoderStage::declare_memory() const
   // nothing, since it deliberately knows bytes and not checkpoints.
   const bool destroys = _unload_cfg == model_memory::UnloadPolicy::kDestroy;
   const bool reclaims  = _unload_cfg == model_memory::UnloadPolicy::kAuto;
-  // The encoder streams its layers here (ecfg.lm.stream_layers), so it
-  // has a real floor; the VAE has none and counts at its size.
+  // The encoder streams its layers here (ecfg.lm.stream_decode, or
+  // stream_layers where that path cannot serve it), so it has a real
+  // floor; the VAE has none and counts at its size.
   m.hold(enc, model_memory::dir_weights_bytes(enc),
          genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc),
          destroys, reclaims);
@@ -799,20 +801,28 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
     const auto plan = model_memory::plan_streaming(
         session(), enc_w.empty() ? _enc_dir : enc_w, std::string(),
         model_memory::kStreamHeadroom, 0, model_memory::kPhaseCondition);
-    // ALWAYS STREAM -- see StreamPlan::stream. One prefill per prompt,
-    // then dropped; the plan is consulted only for the pinned prefix.
+    // ALWAYS STREAM -- see StreamPlan::stream. One prefill per request,
+    // then dropped. Through the raw-source slot pair, keeping what free
+    // memory allows (sized before every request, below); the plan's
+    // pin_frac is read only where the loader cannot take that path and
+    // pins a prefix instead -- as the conditioner's encoder does.
     ecfg.lm.stream_layers = true;
+    ecfg.lm.stream_decode = true;
     ecfg.lm.pin_frac      = plan.pin_frac;
+    if (const char* e = std::getenv("VPIPE_ENC_RESIDENCY")) {
+      ecfg.lm.stream_decode = std::atoi(e) != 0;
+    }
     if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
-      ecfg.lm.stream_layers = (std::atoi(e) != 0);
-      if (!ecfg.lm.stream_layers) { ecfg.lm.pin_frac = 0.0; }
+      if (std::atoi(e) == 0) {
+        ecfg.lm.stream_layers = false;
+        ecfg.lm.stream_decode = false;
+        ecfg.lm.pin_frac = 0.0;
+      }
     }
     session()->log_debug(fmt(
         "VideoRefEncoderStage('{}'): conditioner footprint {} GB (others {} "
-        "GB) -> {} ({:.0f}% of the prefix pinned)", this->id(),
-        plan.footprint >> 30, plan.others >> 30,
-        ecfg.lm.stream_layers ? "STREAM layers" : "PRELOAD",
-        ecfg.lm.pin_frac * 100.0));
+        "GB) -> {}", this->id(), plan.footprint >> 30, plan.others >> 30,
+        ecfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
   }
   _enc = genai::MiniMaxH3TextEncoder::load(
       _enc_dir, mc, const_cast<SessionContextIntf*>(session()), ecfg);
@@ -1623,6 +1633,16 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
       plan.patch_h = dcfg.patch_h;
       plan.patch_w = dcfg.patch_w;
     }
+  }
+
+  // The conditioner's measured residency, for this request's one pass --
+  // and the requests after it when the encoder is kept between them. The
+  // reserve is what the plan's other phases book (the DiT's forward, the
+  // decodes), which may allocate while the set is held.
+  if (_enc->streams_resident_set()) {
+    _enc->set_residency_reserve(model_memory::residency_reserve_beside(
+        session(), model_memory::kPhaseCondition));
+    _enc->set_residency_schedule(_unload_idle ? 1 : 4);
   }
 
   h3::ReferenceEncoders models;

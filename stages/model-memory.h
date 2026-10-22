@@ -483,16 +483,20 @@ struct StreamPlan {
   // bf16, MiniMax-H3's AdaLN bake). It also starts the GPU after the
   // first LAYER rather than after the whole read.
   bool        stream    = false;
-  // LM LAYER pinning ONLY. Every DiT that used this is retired: the five
-  // block-streaming families grow a resident set by measuring instead
-  // (BlockResidency), which is what a fraction of total RAM decided
-  // before the run could never do.
+  // LM LAYER pinning ONLY, and only where nothing better serves. Every
+  // DiT that used this is retired: the block-streaming families grow a
+  // resident set by measuring instead (BlockResidency), which is what a
+  // fraction of total RAM decided before the run could never do. So do
+  // the text encoders whose backbone the raw-source path streams
+  // (MetalQwenModel::Config::stream_decode): every Qwen3 / Qwen3-VL
+  // conditioner, MiniMax-H3's included, and the Qwen3.5 hybrid.
   //
-  // The prefill-only text encoders keep it: they pin a prefix of layers
-  // with no residency policy behind it, so removing this would leave them
-  // streaming everything with no way back. A decoding backbone that
-  // streams (MetalQwenModel::Config::stream_decode) grows a resident set
-  // by measurement instead and does not read this.
+  // Still read by a prefill-only encoder with no residency policy
+  // behind it -- one the raw-source path does not build (Qwen2.5-VL's
+  // attention biases, a pack of another width), and
+  // a plug-in's hidden-state encoder (HiddenStateEncoderArgs::pin_frac,
+  // the Gemma backbone) -- where removing it would leave the encoder
+  // streaming everything with no way back.
   double      pin_frac  = 0.0;
   std::size_t footprint = 0;   // DiT + encoder + everything resident
   std::size_t others    = 0;   // the same, minus the DiT's own bytes

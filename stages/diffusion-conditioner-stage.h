@@ -152,6 +152,13 @@ public:
   // Whether the text encoder was one kept warm, taken back (`keep_loaded`)
   // -- a test's proof the take ran rather than a load.
   bool encoder_taken_warm() const noexcept { return _enc_taken_warm; }
+  // How many of the encoder's layers were resident as the last prompt's
+  // encode began, where it grows a resident set (-1 where it does not):
+  // a test's proof the set was grown, kept and sized again.
+  int encoder_layers_resident_at_prompt() const noexcept
+  {
+    return _enc_resident_at_prompt;
+  }
 
 private:
   std::string _hf_dir;
@@ -371,10 +378,17 @@ private:
   // The encoder handed to the model manager to be kept warm
   // (`keep_loaded`), where the box does not want it destroyed.
   void keep_encoder_warm_();
+  // An encoder that streams through the raw-source slots grows a resident
+  // set by measurement, and growth is off until it is told what to leave
+  // clear. Before every prompt: the reserve (what the plan's other phases
+  // book) and the schedule (`passes` forwards this prompt -- two with a
+  // negative -- and more when the encoder outlives its beat).
+  void size_encoder_residency_(int passes);
   double      _keep_loaded = 0.0;
   // What it was built with, its warm hold's key; empty before.
   std::string _enc_warm_key;
   bool        _enc_taken_warm = false;   // see encoder_taken_warm()
+  int         _enc_resident_at_prompt = -1;
   bool reload_encoder_();
 
   // Encoder / DiT directories for this stage's model. Shared by both
@@ -403,6 +417,10 @@ private:
   static FlexData qi21_sideband_(const std::vector<std::uint8_t>& slots,
                                  int nref, const std::vector<int>& grid_h,
                                  const std::vector<int>& grid_w);
+  // The sideband for the encode that JUST ran, `rows` rows of it; null
+  // for any other family. Take it before the next encode_, which writes
+  // its own mask over this one.
+  FlexData qi21_beat_sideband_(int rows) const;
   // The prompts held back from a batch on a streamed encoder, encoded in
   // one layer-major pass and emitted in order.
   bool batchable_() const;

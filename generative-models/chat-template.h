@@ -386,8 +386,8 @@ public:
   // paragraph to the SYSTEM turn telling the model how much thinking to
   // spend. The template gates it on thinking being ON, and `medium`
   // resolves to no paragraph at all -- so a renderer that emits nothing
-  // is exactly the reference at `medium`, and the reference's own
-  // default is `xhigh`.
+  // is exactly the reference at `medium`. The reference's own default
+  // is `xhigh`; vpipe's is `medium` (make_chat_template).
   //
   // The paragraph is a system instruction, so it has to reach the model
   // in ONE system turn together with the tool advertisement when tools
@@ -415,6 +415,12 @@ public:
   // only see token ids cannot check it without round-tripping through
   // a tokenizer that may not carry the characters.
   virtual std::string_view reasoning_instructions() const noexcept
+  { return {}; }
+
+  // The effort this template renders ("xhigh" | "medium" | "low"), or
+  // empty where it renders none: a family, or a checkpoint, without the
+  // control.
+  virtual std::string_view reasoning_effort() const noexcept
   { return {}; }
 
   // ---- Tool / function calling (MCP) -------------------------------
@@ -462,11 +468,16 @@ public:
   // format, as name + JSON-arguments pairs the caller dispatches. The
   // default handles the Hermes/Qwen `<tool_call>{json}</tool_call>`
   // blocks (vpipe::parse_tool_calls); families with a different tool-
-  // call syntax (Gemma-4's `<|tool_call>call:NAME{...}<tool_call|>`)
-  // override. Empty when the turn made no tool calls.
+  // call syntax override: Gemma-4's `<|tool_call>call:NAME{...}
+  // <tool_call|>`, Qwen3.5's `<function=NAME><parameter=KEY>...`, whose
+  // values are typed by the tools' schemas -- `tools_json`, the specs
+  // the system turn advertised (render_tools_system_turn's). Empty when
+  // the turn made no tool calls.
   virtual std::vector<vpipe::McpToolCall>
-  parse_tool_calls(const std::string& assistant_text) const
+  parse_tool_calls(const std::string& assistant_text,
+                   std::string_view   tools_json = {}) const
   {
+    (void)tools_json;
     return vpipe::parse_tool_calls(assistant_text);
   }
 
@@ -483,6 +494,9 @@ public:
   // spec per line as tools_json() writes them; empty: none) advertised
   // in it -- one turn, as the family's published template merges them,
   // the reasoning instruction too (render_reasoning_system_turn).
+  // `text` is the conversation's system message, whatever it holds: a
+  // family may render even an empty one as a turn (Qwen3.5 / 3.6 do). A
+  // conversation with none and no tools takes the reasoning turn alone.
   virtual bool
   render_system_message(std::string_view           text,
                         std::string_view           tools_json,
@@ -613,6 +627,19 @@ protected:
   ChatTemplate() = default;
 };
 
+// Qwen3.5 / 3.6 / 3.8's tools system turn as their published
+// chat_template.jinja writes it, between `<|im_start|>` and
+// `<|im_end|>`: the reasoning instruction (empty: none), the tools --
+// `tools_json`, one function spec a line -- the XML call format it
+// teaches (`<function=NAME>`, a `<parameter=KEY>` an argument), its
+// reminder, then the host's system text, trimmed (empty: none). Text,
+// not ids, for the reason reasoning_instructions() is: the wording is
+// the contract, and a test's tokenizer may not carry its characters.
+std::string
+qwen3_5_tools_system_text(std::string_view reasoning,
+                          std::string_view tools_json,
+                          std::string_view system_text);
+
 // Factory: dispatches on the HF architecture string from
 // ModelConfig::architecture. Returns nullptr when the family is
 // unknown -- caller should log a warn and leave the LM without a
@@ -630,15 +657,20 @@ protected:
 //
 // `reasoning_effort` is Qwen3.8's control (see
 // ChatTemplate::render_reasoning_system_turn): "xhigh" | "medium" |
-// "low", or EMPTY for the default of emitting nothing.
+// "low", or EMPTY for the default. Whether the checkpoint takes one is
+// `effort_control` -- its own chat template says
+// (model_config::kReasoningEffortControl; the ModelConfig overload reads
+// it), since 3.5, 3.6 and 3.8 all declare model_type "qwen3_5" and 3.6
+// and 3.8 have field-identical configs:
 //
-// Empty is the default rather than the reference's own `xhigh` on
-// purpose. vpipe cannot tell a 3.8 checkpoint from a 3.5 or 3.6 one --
-// all three declare model_type "qwen3_5" and 3.6 and 3.8 have
-// field-identical configs -- so defaulting to xhigh would inject an
-// instruction into two families whose published templates never had
-// it. Unset renders exactly as before, and as the reference does at
-// `medium`; a caller that knows it is on 3.8 asks for xhigh.
+//   * true (3.8): the effort asked for, else `medium` -- vpipe's
+//     default, where the reference's own is `xhigh`. Medium is the
+//     un-instructed rendering, so the default sends no paragraph;
+//   * false (3.5 / 3.6): none, whatever was asked -- their published
+//     templates never had the instruction -- and render_system_message
+//     renders an empty system message as an empty turn, as theirs do;
+//   * unknown (no template was read): the effort asked for, none by
+//     default.
 //
 // Ignored, with nothing emitted, when thinking is off -- which is what
 // the reference template does too (its whole block is inside
@@ -647,12 +679,14 @@ std::unique_ptr<ChatTemplate>
 make_chat_template(const std::string&    architecture,
                    const Tokenizer&      tokenizer,
                    std::optional<bool>   disable_thinking = std::nullopt,
-                   std::string_view      reasoning_effort = {});
+                   std::string_view      reasoning_effort = {},
+                   std::optional<bool>   effort_control = std::nullopt);
 
 // The same dispatch from the parsed config, for the families whose
 // template reads more of the checkpoint than its architecture (Mistral:
-// the default system message its chat_template.jinja declares). Prefer
-// this overload wherever the config is at hand.
+// the default system message its chat_template.jinja declares; Qwen3.5 /
+// 3.8: whether that template takes a reasoning effort). Prefer this
+// overload wherever the config is at hand.
 std::unique_ptr<ChatTemplate>
 make_chat_template(const ModelConfig&    config,
                    const Tokenizer&      tokenizer,

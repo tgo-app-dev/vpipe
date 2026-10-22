@@ -7,6 +7,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -314,8 +315,10 @@ std::vector<ResourceClaim>
 VisualQaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return model_memory::weight_claims(
-      {resolve_model_dir(session(), _hf_dir)});
+  // The LM (streamable when it is a Mixture of Experts) and its vision
+  // tower at the largest picture the checkpoint admits.
+  return model_memory::lm_claims(
+      session(), resolve_model_dir(session(), _hf_dir), id());
 }
 
 Job
@@ -760,6 +763,7 @@ VisualQaStage::m_run_round_()
       genai::TokenRef r;
       if (id == image_pad && img_idx < _m_imgs.size()) {
         r.kind = genai::TokenRef::Kind::ImageTokens;
+        r.text_id = id;
         // gemma4_unified: host-f32 rows; else native-f16 SharedBuffer.
         if (!_m_imgs[img_idx].embeddings_host.empty()) {
           r.embeddings_host = &_m_imgs[img_idx].embeddings_host;

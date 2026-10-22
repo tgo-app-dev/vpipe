@@ -188,62 +188,365 @@ McpToolRegistry::dispatch(const McpToolCall& call) const
   return err.to_json(false);
 }
 
+namespace {
+
+constexpr string_view kCallOpen  = "<tool_call>";
+constexpr string_view kCallClose = "</tool_call>";
+
+// The body of each <tool_call> block, in order; an unclosed one runs to
+// the end of the text.
+vector<string_view>
+call_blocks_(string_view text)
+{
+  vector<string_view> blocks;
+  size_t pos = 0;
+  while (true) {
+    const size_t o = text.find(kCallOpen, pos);
+    if (o == string_view::npos) {
+      break;
+    }
+    const size_t b = o + kCallOpen.size();
+    const size_t c = text.find(kCallClose, b);
+    blocks.push_back(c == string_view::npos ? text.substr(b)
+                                            : text.substr(b, c - b));
+    pos = c == string_view::npos ? text.size() : c + kCallClose.size();
+  }
+  return blocks;
+}
+
+// One block's Hermes JSON, {"name": ..., "arguments": ...}. False when
+// it does not read as one.
+bool
+read_json_call_(string_view inner, McpToolCall* out)
+{
+  FlexData fd;
+  bool parsed = false;
+  const string_view body = trim_(inner);
+  try {
+    fd = FlexData::from_json(body);
+    parsed = true;
+  } catch (const std::exception&) {
+    // Retry once after repairing an unquoted function name.
+    try {
+      fd = FlexData::from_json(repair_unquoted_name_(string(body)));
+      parsed = true;
+    } catch (const std::exception&) {
+    }
+  }
+  if (!parsed || !fd.is_object()) {
+    return false;
+  }
+  auto obj = fd.as_object();
+  if (!obj.contains("name")) {
+    return false;
+  }
+  FlexData name = obj.at("name");
+  if (!name.is_string()) {
+    return false;
+  }
+  out->name = string(name.get_string());
+  out->arguments_json = "{}";
+  if (obj.contains("arguments")) {
+    FlexData a = obj.at("arguments");
+    if (a.is_object() || a.is_array()) {
+      out->arguments_json = a.to_json(false);
+    } else if (a.is_string()) {
+      out->arguments_json = string(a.get_string());
+    }
+  }
+  return true;
+}
+
+// What a parameter's schema says its value is. A union of a string and
+// null ("type": ["string", "null"]) is a string; any other union, JSON.
+enum class ArgKind { Unknown, String, Integer, Number, Boolean, Json };
+
+ArgKind
+arg_kind_(const FlexData& type)
+{
+  if (type.is_string()) {
+    const string_view t = type.get_string();
+    if (t == "string")  { return ArgKind::String; }
+    if (t == "integer") { return ArgKind::Integer; }
+    if (t == "number")  { return ArgKind::Number; }
+    if (t == "boolean") { return ArgKind::Boolean; }
+    if (t == "object" || t == "array") { return ArgKind::Json; }
+    return ArgKind::Unknown;
+  }
+  if (!type.is_array()) {
+    return ArgKind::Unknown;
+  }
+  const auto ta = type.as_array();
+  bool strings = false;
+  for (size_t i = 0; i < ta.size(); ++i) {
+    const FlexData t = ta[i];
+    const string_view s = t.as_string();
+    if (s == "string") {
+      strings = true;
+    } else if (s != "null") {
+      return ArgKind::Json;
+    }
+  }
+  return strings ? ArgKind::String : ArgKind::Json;
+}
+
+// Each tool's parameters by name, from tools_json's lines: the
+// OpenAI / Hermes {"type":"function","function":{...}} shape, or the
+// function object itself.
+using ToolKinds = vector<pair<string, ArgKind>>;
+using Schemas   = vector<pair<string, ToolKinds>>;
+
+Schemas
+schemas_(string_view tools_json)
+{
+  Schemas out;
+  size_t pos = 0;
+  while (pos < tools_json.size()) {
+    const size_t nl = tools_json.find('\n', pos);
+    const string_view line = tools_json.substr(
+        pos, nl == string_view::npos ? string_view::npos : nl - pos);
+    pos = nl == string_view::npos ? tools_json.size() : nl + 1;
+    if (trim_(line).empty()) {
+      continue;
+    }
+    try {
+      FlexData spec = FlexData::from_json(line);
+      if (!spec.is_object()) { continue; }
+      if (spec.as_object().contains("function")) {
+        spec = spec.as_object().at("function");
+        if (!spec.is_object()) { continue; }
+      }
+      const auto so = spec.as_object();
+      if (!so.contains("name") || !so.at("name").is_string()) { continue; }
+      ToolKinds kinds;
+      if (so.contains("parameters") && so.at("parameters").is_object()) {
+        const FlexData params = so.at("parameters");
+        const auto po = params.as_object();
+        if (po.contains("properties") && po.at("properties").is_object()) {
+          const FlexData props = po.at("properties");
+          for (const auto& [key, p] : props.as_object()) {
+            const bool typed = p.is_object()
+                && p.as_object().contains("type");
+            kinds.emplace_back(string(key),
+                typed ? arg_kind_(p.as_object().at("type"))
+                      : ArgKind::Unknown);
+          }
+        }
+      }
+      out.emplace_back(string(so.at("name").get_string()),
+                       std::move(kinds));
+    } catch (const std::exception&) {
+      continue;   // a malformed spec types nothing
+    }
+  }
+  return out;
+}
+
+// The text as JSON, or nothing when it is not JSON (trailing words
+// included).
+bool
+as_json_(string_view text, FlexData* out)
+{
+  const string_view t = trim_(text);
+  if (t.empty()) { return false; }
+  try {
+    *out = FlexData::from_json(t);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+bool
+iequals_(string_view a, string_view b)
+{
+  if (a.size() != b.size()) { return false; }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i]))
+        != std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A parameter's value, as its kind reads it. `known` is false when the
+// tool has no schema here, so the value's own shape decides.
+FlexData
+arg_value_(string_view value, ArgKind kind, bool known)
+{
+  const string_view t = trim_(value);
+  FlexData j;
+  if (iequals_(t, "null")) {
+    return FlexData::make_null();
+  }
+  switch (kind) {
+  case ArgKind::String:
+    return FlexData::make_string(value);
+  case ArgKind::Integer:
+  case ArgKind::Number:
+    if (as_json_(t, &j) && (j.is_int() || j.is_uint() || j.is_real())) {
+      return j;
+    }
+    return FlexData::make_string(value);
+  case ArgKind::Boolean:
+    if (iequals_(t, "true"))  { return FlexData::make_bool(true); }
+    if (iequals_(t, "false")) { return FlexData::make_bool(false); }
+    return FlexData::make_string(value);
+  case ArgKind::Json:
+    return as_json_(t, &j) ? j : FlexData::make_string(value);
+  case ArgKind::Unknown:
+    break;
+  }
+  // No type to go by: a tool without a schema here takes any JSON; a
+  // parameter its schema leaves untyped (or does not name) only an
+  // object or an array, the shapes no string is mistaken for.
+  if (!known) {
+    return as_json_(t, &j) ? j : FlexData::make_string(value);
+  }
+  if (!t.empty() && (t.front() == '{' || t.front() == '[')
+      && as_json_(t, &j) && (j.is_object() || j.is_array())) {
+    return j;
+  }
+  return FlexData::make_string(value);
+}
+
+// The template writes `<parameter=KEY>\nvalue\n</parameter>`: one line
+// break either side of the value is the template's, not the value's.
+string_view
+strip_breaks_(string_view v)
+{
+  if (!v.empty() && v.front() == '\n') { v.remove_prefix(1); }
+  if (!v.empty() && v.back() == '\n')  { v.remove_suffix(1); }
+  if (!v.empty() && v.back() == '\r')  { v.remove_suffix(1); }
+  return v;
+}
+
+// Every <function=NAME>...</function> in `text`, its parameters read
+// by the tool's schema. A function's body runs to its </function>, else
+// to the next <function=, else to the end; a parameter's value to its
+// </parameter>, else to the next <parameter=, else to the body's end.
+void
+read_xml_calls_(string_view           text,
+                const Schemas&        schemas,
+                vector<McpToolCall>*  out)
+{
+  static constexpr string_view kFn     = "<function=";
+  static constexpr string_view kFnEnd  = "</function>";
+  static constexpr string_view kPar    = "<parameter=";
+  static constexpr string_view kParEnd = "</parameter>";
+  size_t pos = 0;
+  while (true) {
+    const size_t f = text.find(kFn, pos);
+    if (f == string_view::npos) {
+      break;
+    }
+    const size_t name_at = f + kFn.size();
+    const size_t gt = text.find('>', name_at);
+    if (gt == string_view::npos) {
+      break;
+    }
+    const string name(trim_(text.substr(name_at, gt - name_at)));
+    size_t end = text.find(kFnEnd, gt + 1);
+    const size_t next = text.find(kFn, gt + 1);
+    if (end == string_view::npos || (next != string_view::npos
+                                     && next < end)) {
+      end = next == string_view::npos ? text.size() : next;
+      pos = end;
+    } else {
+      pos = end + kFnEnd.size();
+    }
+    const string_view body = text.substr(gt + 1, end - (gt + 1));
+    if (name.empty()) {
+      continue;
+    }
+    const ToolKinds* kinds = nullptr;
+    for (const auto& [tool, k] : schemas) {
+      if (tool == name) { kinds = &k; break; }
+    }
+    FlexData args = FlexData::make_object();
+    auto ao = args.as_object();
+    size_t p = 0;
+    while (true) {
+      const size_t a = body.find(kPar, p);
+      if (a == string_view::npos) {
+        break;
+      }
+      const size_t key_at = a + kPar.size();
+      const size_t kg = body.find('>', key_at);
+      if (kg == string_view::npos) {
+        break;
+      }
+      const string key(trim_(body.substr(key_at, kg - key_at)));
+      size_t v_end = body.find(kParEnd, kg + 1);
+      const size_t v_next = body.find(kPar, kg + 1);
+      size_t resume;
+      if (v_end == string_view::npos || (v_next != string_view::npos
+                                         && v_next < v_end)) {
+        v_end = v_next == string_view::npos ? body.size() : v_next;
+        resume = v_end;
+      } else {
+        resume = v_end + kParEnd.size();
+      }
+      const string_view value =
+          strip_breaks_(body.substr(kg + 1, v_end - (kg + 1)));
+      p = resume;
+      if (key.empty()) {
+        continue;
+      }
+      ArgKind kind = ArgKind::Unknown;
+      if (kinds != nullptr) {
+        for (const auto& [k, ak] : *kinds) {
+          if (k == key) { kind = ak; break; }
+        }
+      }
+      ao.insert_or_assign(key, arg_value_(value, kind, kinds != nullptr));
+    }
+    McpToolCall tc;
+    tc.name = name;
+    tc.arguments_json = args.to_json(false);
+    out->push_back(std::move(tc));
+  }
+}
+
+}  // namespace
+
 vector<McpToolCall>
 parse_tool_calls(const string& assistant_text)
 {
-  static constexpr string_view kOpen  = "<tool_call>";
-  static constexpr string_view kClose = "</tool_call>";
   vector<McpToolCall> calls;
-  size_t pos = 0;
-  while (true) {
-    const size_t o = assistant_text.find(kOpen, pos);
-    if (o == string::npos) {
-      break;
+  for (const string_view inner : call_blocks_(assistant_text)) {
+    McpToolCall tc;
+    if (read_json_call_(inner, &tc)) {
+      calls.push_back(std::move(tc));
     }
-    const size_t js = o + kOpen.size();
-    const size_t c  = assistant_text.find(kClose, js);
-    const string_view inner = (c == string::npos)
-        ? string_view(assistant_text).substr(js)
-        : string_view(assistant_text).substr(js, c - js);
-    pos = (c == string::npos) ? assistant_text.size() : c + kClose.size();
+    // A malformed block is skipped; the scan goes on.
+  }
+  return calls;
+}
 
-    FlexData fd;
-    bool parsed = false;
-    const string_view body = trim_(inner);
-    try {
-      fd = FlexData::from_json(body);
-      parsed = true;
-    } catch (const std::exception&) {
-      // Retry once after repairing an unquoted function name.
-      try {
-        fd = FlexData::from_json(repair_unquoted_name_(string(body)));
-        parsed = true;
-      } catch (const std::exception&) {
-      }
-    }
-    if (!parsed || !fd.is_object()) {
-      continue;   // still malformed -- skip, keep scanning
-    }
-    auto obj = fd.as_object();
-    if (!obj.contains("name")) {
-      continue;
-    }
-    FlexData name = obj.at("name");
-    if (!name.is_string()) {
+vector<McpToolCall>
+parse_xml_tool_calls(const string& assistant_text, string_view tools_json)
+{
+  static constexpr string_view kFn = "<function=";
+  const Schemas schemas = schemas_(tools_json);
+  vector<McpToolCall> calls;
+  const vector<string_view> blocks = call_blocks_(assistant_text);
+  if (blocks.empty()) {
+    // The model's form without its wrapper: read as its parser reads
+    // it (vLLM's Qwen3-Coder parser takes the whole reply then).
+    read_xml_calls_(assistant_text, schemas, &calls);
+    return calls;
+  }
+  for (const string_view inner : blocks) {
+    if (inner.find(kFn) != string_view::npos) {
+      read_xml_calls_(inner, schemas, &calls);
       continue;
     }
     McpToolCall tc;
-    tc.name = string(name.get_string());
-    tc.arguments_json = "{}";
-    if (obj.contains("arguments")) {
-      FlexData a = obj.at("arguments");
-      if (a.is_object() || a.is_array()) {
-        tc.arguments_json = a.to_json(false);
-      } else if (a.is_string()) {
-        tc.arguments_json = string(a.get_string());
-      }
+    if (read_json_call_(inner, &tc)) {
+      calls.push_back(std::move(tc));
     }
-    calls.push_back(std::move(tc));
   }
   return calls;
 }

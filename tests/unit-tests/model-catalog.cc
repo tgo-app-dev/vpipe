@@ -346,8 +346,19 @@ TEST(model_catalog, qwen36_optiq_variants_present) {
 TEST(model_catalog, qwen38_27b_family) {
   EXPECT_TRUE(has_(catalog_versions("Qwen"), "3.8"));
   auto p = catalog_param_classes("Qwen", "3.8");
-  EXPECT_TRUE(p.size() == 1);
+  // 27B and Flash-Next (its own runtime tag, below).
+  EXPECT_TRUE(p.size() == 2);
   EXPECT_TRUE(has_(p, "27B"));
+  EXPECT_TRUE(has_(p, "Flash-Next"));
+  {
+    const ModelCatalogEntry* e = catalog_by_path(
+        "mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp");
+    EXPECT_TRUE(e != nullptr);
+    if (e != nullptr) {
+      EXPECT_TRUE(e->model_type == "qwen3.8-flash");
+      EXPECT_TRUE(catalog_category(*e) == "model");
+    }
+  }
   EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 6);
 
   struct Row { const char* path; const char* variant; };
@@ -1507,11 +1518,14 @@ TEST(model_catalog, dflash_drafters) {
     const char* path;
     const char* type;
     const char* version;
+    const char* parent_type;
     const char* parent_class;
   };
   const Row rows[] = {
-      {"incoai/Qwen3.8-27B-DFlash2", "dflash2", "2", "27B"},
-      {"z-lab/Qwen3.5-4B-DFlash", "dflash", "1", "4B"},
+      {"incoai/Qwen3.8-27B-DFlash2", "dflash2", "2", "qwen3.5", "27B"},
+      {"incoai/Qwen3.8-Flash-Next-DFlash2", "dflash2", "2",
+       "qwen3.8-flash", "Flash-Next"},
+      {"z-lab/Qwen3.5-4B-DFlash", "dflash", "1", "qwen3.5", "4B"},
   };
   for (const Row& r : rows) {
     const ModelCatalogEntry* e = catalog_by_path(r.path);
@@ -1520,7 +1534,7 @@ TEST(model_catalog, dflash_drafters) {
     EXPECT_TRUE(e->family == "DFlash");
     EXPECT_TRUE(e->version == r.version);
     EXPECT_TRUE(e->model_type == r.type);
-    EXPECT_TRUE(e->parent_model_type == "qwen3.5");
+    EXPECT_TRUE(e->parent_model_type == r.parent_type);
     EXPECT_TRUE(e->parent_param_class == r.parent_class);
     EXPECT_TRUE(e->inputs.empty() && e->outputs.empty());
     EXPECT_FALSE(e->needs_tokenizer_json);

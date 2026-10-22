@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <thread>
 
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 // Matrix-core (M5+) prefill GEMM must be greedy token-exact with the steel
@@ -547,6 +548,156 @@ TEST(metal_lm_smoke, qwen35_moe_text_chat) {
   std::printf("[qwen35_moe] pipelined vs sync mismatches=%d/%zu\n",
               mism, pids.size());
   EXPECT_TRUE(mism == 0);
+}
+
+// The three MoE prefill tiers compute one function: a ~350-token turn of
+// real text (past the steel tier's density line of ~4 routed rows an
+// expert, short of the old 1024-row one) prefilled with each forced --
+// per-pair gather, the grouped GEMV, the steel grouped GEMM. The grouped
+// GEMV reads the same weights in the same order as the pair gather, so it
+// is BIT-IDENTICAL to it. The steel tile stages its dequantized weights
+// in f16 and accumulates in another order, so it lands at the model's own
+// rounding floor -- MEASURED 0.057 on the last row's logits, against
+// 0.065 between the pair gather in f16 and in bf16 -- and is held to that
+// floor, measured here, with the same pick everywhere. Those three run on
+// the steel kernels (VPIPE_QWEN_MOE_NAX=0); a fourth runs the steel tier
+// as a GPU with matrix cores does (the routed experts' NAX twins, the
+// shared expert on matmul2d): ENGAGED there and held to the same floor,
+// bit-identical to the steel arm everywhere else. On a box that cannot
+// hold the experts they live in the expert cache (bit-identical to
+// resident). VPIPE_QWEN35_MOE_TEST_MODEL_PATH (Qwen3.6-35B-A3B-4bit).
+TEST(metal_lm_smoke, qwen35_moe_prefill_tiers_agree) {
+  const char* path = std::getenv("VPIPE_QWEN35_MOE_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  if (!cfg.has_value()) { return; }
+  auto tok = genai::Tokenizer::from_huggingface_json(
+      std::string(path) + "/tokenizer.json", &sess);
+  ASSERT_TRUE(tok != nullptr);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(*cfg, *tok);
+  ASSERT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  std::string text =
+      "Summarize the following notes on memory planning in two sentences. ";
+  const char* para =
+      "A graph routinely asks one machine to hold several large models at "
+      "once: a diffusion transformer, its text encoder, a VAE, sometimes a "
+      "language model beside them. Weights are what a model holds; scratch "
+      "is what it allocates to run, and for a decode the second can dwarf "
+      "the first. Every stage declares what it will hold before anything "
+      "loads, so the plan is the same whichever stage loads first. ";
+  for (int i = 0; i < 4; ++i) { text += para; }
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(text, /*is_first_turn=*/true, &ids);
+  const int n = (int)ids.size();
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.page_tokens = 512;
+  mcfg.max_pages = 8;
+  ASSERT_TRUE(mcfg.is_moe());
+  ASSERT_TRUE(n >= 256 && n < 1024 && (long long)n * mcfg.top_k >=
+                                          4LL * mcfg.n_experts);
+  // A box under 48 GB keeps the experts in a 4 GB cache (a 16 GB M5).
+  std::uint64_t ram = 0;
+  std::size_t ram_len = sizeof(ram);
+  sysctlbyname("hw.memsize", &ram, &ram_len, nullptr, 0);
+  if (ram != 0 && ram < (48ull << 30)) {
+    mcfg.expert_cache_bytes = (std::size_t)4 << 30;
+  }
+  struct Arm {
+    const char* name;
+    const char* grouped;
+    const char* steel;
+    const char* nax;
+    bool        bf16;
+  };
+  // The f16 arms share one load; the bf16 pair gather, the floor, loads
+  // after it is released.
+  const Arm arms[] = {{"pair", "0", "0", "0", false},
+                      {"gemv", "1", "0", "0", false},
+                      {"steel", "1", "1", "0", false},
+                      {"nax", "1", "1", "1", false},
+                      {"pair bf16", "0", "0", "0", true}};
+  std::vector<std::vector<float>> out;
+  std::unique_ptr<genai::MetalQwenModel> model;
+  bool model_bf16 = false, matrix_cores = false;
+  std::uint64_t nax_gemms = 0, shared_mma = 0;
+  for (const Arm& a : arms) {
+    if (!model || model_bf16 != a.bf16) {
+      model.reset();
+      mc->memory_budget_settled();
+      mcfg.use_bf16 = a.bf16;
+      model = genai::MetalQwenModel::load(path, mc, mcfg);
+      model_bf16 = a.bf16;
+    }
+    ASSERT_TRUE(model != nullptr);
+    if (!model) { return; }
+    ::setenv("VPIPE_QWEN_MOE_GROUPED", a.grouped, 1);
+    ::setenv("VPIPE_QWEN_MOE_STEEL", a.steel, 1);
+    ::setenv("VPIPE_QWEN_MOE_NAX", a.nax, 1);
+    const std::uint64_t g0 = model->moe_nax_gemms();
+    const std::uint64_t s0 = model->moe_shared_mma_gemms();
+    const auto cid = model->context_manager()->acquire_root();
+    out.push_back(model->prefill(cid, ids));
+    model->context_manager()->release(cid);
+    if (std::string(a.name) == "nax") {
+      matrix_cores = model->uses_matrix_cores();
+      nax_gemms = model->moe_nax_gemms() - g0;
+      shared_mma = model->moe_shared_mma_gemms() - s0;
+    } else {
+      EXPECT_TRUE(model->moe_nax_gemms() == g0 &&
+                  model->moe_shared_mma_gemms() == s0);
+    }
+  }
+  ::unsetenv("VPIPE_QWEN_MOE_GROUPED");
+  ::unsetenv("VPIPE_QWEN_MOE_STEEL");
+  ::unsetenv("VPIPE_QWEN_MOE_NAX");
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double d = 0.0, r = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      d += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+      r += (double)a[i] * a[i];
+    }
+    return r > 0.0 ? std::sqrt(d / r) : 0.0;
+  };
+  auto argmax = [](const std::vector<float>& v) {
+    return (int)(std::max_element(v.begin(), v.end()) - v.begin());
+  };
+  for (const auto& o : out) {
+    ASSERT_TRUE(!o.empty() && o.size() == out[0].size());
+    if (o.empty() || o.size() != out[0].size()) { return; }
+  }
+  const double gp = rel(out[0], out[1]), sp = rel(out[0], out[2]);
+  const double np_ = rel(out[0], out[3]), ns = rel(out[2], out[3]);
+  const double floor = rel(out[0], out[4]);
+  std::printf("[qwen35_moe] %d-token prefill%s, last row from the per-pair "
+              "gather: grouped GEMV %.5f, steel %.5f, %s %.5f (from steel "
+              "%.5f; %llu NAX expert GEMMs, %llu shared on matmul2d); f16 vs "
+              "bf16 %.5f; picks %d %d %d %d %d\n", n,
+              mcfg.expert_cache_bytes ? " (experts cached)" : "", gp, sp,
+              matrix_cores ? "matrix cores" : "steel again", np_, ns,
+              (unsigned long long)nax_gemms, (unsigned long long)shared_mma,
+              floor, argmax(out[0]), argmax(out[1]), argmax(out[2]),
+              argmax(out[3]), argmax(out[4]));
+  EXPECT_TRUE(gp == 0.0);
+  EXPECT_TRUE(sp > 0.0);   // the steel tier engaged
+  EXPECT_TRUE(floor > 0.0 && sp < 1.25 * floor);
+  if (matrix_cores) {
+    // Every layer's two expert GEMMs and two shared ones, at least.
+    EXPECT_TRUE(nax_gemms >= 2ull * mcfg.n_layers);
+    EXPECT_TRUE(shared_mma >= 2ull * mcfg.n_layers);
+    EXPECT_TRUE(np_ > 0.0 && np_ < 1.25 * floor);
+  } else {
+    EXPECT_TRUE(ns == 0.0 && nax_gemms == 0 && shared_mma == 0);
+  }
+  for (int i = 1; i < 5; ++i) {
+    EXPECT_TRUE(argmax(out[0]) == argmax(out[i]));
+  }
 }
 
 // GGUF tokenizer scheme regression. Tokenizer::from_gguf must pick byte-level

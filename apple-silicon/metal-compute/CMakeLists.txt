@@ -78,6 +78,11 @@ add_vpipe_metal_kernel(rms_norm_bf16 SRC ops/rms_norm.metal
 add_vpipe_metal_kernel(llm_elementwise SRC ops/llm_elementwise.metal)
 add_vpipe_metal_kernel(llm_elementwise_bf16 SRC ops/llm_elementwise.metal
                        DEFINES VPIPE_ELT=bfloat)
+# Qwen3.8-Flash-Next (qwen4_exp): hyper-connections and the n-gram PLE
+# block (generative-models/qwen3/metal-qwen-hc.cc).
+add_vpipe_metal_kernel(qwen4_hc SRC ops/qwen4_hc.metal)
+add_vpipe_metal_kernel(qwen4_hc_bf16 SRC ops/qwen4_hc.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_vae_1d SRC ops/audio_vae_1d.metal)
 add_vpipe_metal_kernel(rope SRC ops/rope.metal)
 add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
@@ -215,11 +220,11 @@ set(STEEL_GEMM_HDRS
     vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
 add_vpipe_metal_kernel(affine_qmm_steel
                        SRC quant/affine_qmm_steel.metal
-                       DEPENDS ${STEEL_GEMM_HDRS})
+                       DEPENDS ${STEEL_GEMM_HDRS} quant/affine_qmm_loaders.h)
 add_vpipe_metal_kernel(affine_qmm_steel_bf16
                        SRC quant/affine_qmm_steel.metal
                        DEFINES VPIPE_ELT=bfloat
-                       DEPENDS ${STEEL_GEMM_HDRS})
+                       DEPENDS ${STEEL_GEMM_HDRS} quant/affine_qmm_loaders.h)
 # LoRA training: the backward's elementwise ops, loss and optimizers; the
 # GEMM shapes the forward's NT kernels do not cover (TN over the rows,
 # NN against a small factor); and the flash attention's backward.
@@ -248,6 +253,25 @@ add_vpipe_metal_kernel(affine_qmm_mma_bf16
                        SRC quant/affine_qmm_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
+# Matrix-core (M5+) MoE grouped expert GEMMs (NAX): the twins of
+# affine_qmm_steel's affine_qmm_grouped_* (same buffers and sorted-tile
+# contract), the weight tile staged by the shared QuantizedBlockLoader.
+# metal4.0 + MPP; bound only where the GPU has matrix cores.
+set(GROUPED_NAX_HDRS
+    quant/affine_qmm_loaders.h
+    vendored/mlx/backend/metal/kernels/steel/defines.h
+    vendored/mlx/backend/metal/kernels/steel/attn/nax.h
+    vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+    vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+add_vpipe_metal_kernel(affine_qmm_grouped_nax
+                       SRC quant/affine_qmm_grouped_nax.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
+add_vpipe_metal_kernel(affine_qmm_grouped_nax_bf16
+                       SRC quant/affine_qmm_grouped_nax.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
 # 4-bit -> dense weight expansion feeding the matrix-core dense GEMM
 # (dequant-once then dense_gemm_mma; faster than fused dequant-in-loop).
 add_vpipe_metal_kernel(affine_dequant SRC quant/affine_dequant.metal)

@@ -148,6 +148,23 @@ TEST(media_line, think_markers_render_plain) {
               == "no markers");
 }
 
+// What a reply says outside its thinking: a block cut start to end, one
+// the prompt opened cut up to its end marker, an unterminated one to the
+// end of the message, and an end marker no block opened dropped.
+TEST(media_line, reply_without_thinking_cuts_every_block) {
+  const std::string s(ml::kThinkStart), e(ml::kThinkEnd);
+  EXPECT_TRUE(ml::reply_without_thinking(s + "reason" + e + "\n\nanswer")
+              == "\n\nanswer");
+  EXPECT_TRUE(ml::reply_without_thinking("reason" + e + "answer")
+              == "answer");
+  EXPECT_TRUE(ml::reply_without_thinking("a" + s + "cut off") == "a");
+  EXPECT_TRUE(ml::reply_without_thinking(s + "r1" + e + "x" + s + "r2" + e
+                                         + "y" + e + "z")
+              == "xyz");
+  EXPECT_TRUE(ml::reply_without_thinking("plain") == "plain");
+  EXPECT_TRUE(ml::reply_without_thinking(s + "only reasoning").empty());
+}
+
 TEST(media_line, to_display_compresses_markers) {
   auto payload = bytes_({9, 9, 9});
   const std::string line =

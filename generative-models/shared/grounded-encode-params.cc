@@ -45,6 +45,15 @@ GroundedEncodeParams::for_family(const std::string& family)
     p.max_pixels   = 16777216;
     return p;
   }
+  if (family == "fibo2") {
+    // BriaFibo2ImageProcessor: Qwen3-VL sees each crop thumbnailed to at
+    // most 768 a side (the VAE takes the crop itself), and the checkpoint's
+    // processor bounds the smart-resize after it.
+    p.long_edge  = 768;
+    p.min_pixels = 3136;
+    p.max_pixels = 1605632;
+    return p;
+  }
   if (family == "qwen-image-edit") {
     // Qwen2.5-VL takes a pixel budget directly and does its own
     // smart-resize from it, so there is no separate long-edge cap.

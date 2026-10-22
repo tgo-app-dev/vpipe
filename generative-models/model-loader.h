@@ -35,11 +35,37 @@ inline constexpr std::string_view kRopeParameters = "rope_parameters";
 // int: the vision tower's largest input edge in pixels (Pixtral's
 // vision_config.image_size). Absent: the tower's own default.
 inline constexpr std::string_view kVisionImageSize = "vision.image_size";
+// int: the pixel-count bounds a Qwen-VL processor resizes a still
+// picture into -- preprocessor_config.json `size.shortest_edge` /
+// `size.longest_edge`, which that processor spells as AREAS (or its
+// older top-level `min_pixels` / `max_pixels`). Absent: the tower's own
+// defaults.
+inline constexpr std::string_view kVisionMinPixels = "vision.min_pixels";
+inline constexpr std::string_view kVisionMaxPixels = "vision.max_pixels";
+// int: the same for a clip, from video_preprocessor_config.json -- a
+// budget the frame count multiplies into.
+inline constexpr std::string_view kVisionVideoMinPixels =
+    "vision.video_min_pixels";
+inline constexpr std::string_view kVisionVideoMaxPixels =
+    "vision.video_max_pixels";
 // string: the system message the checkpoint's own chat template puts in
 // when the conversation brings none (Mistral's `default_system_message`),
 // verbatim -- placeholders such as {today} are left for the renderer.
 inline constexpr std::string_view kDefaultSystemPrompt =
     "default_system_prompt";
+// bool: whether the checkpoint's own chat template takes a reasoning
+// effort (Qwen3.8's `reasoning_effort`; Qwen3.5 and 3.6 -- the same
+// architecture and model_type -- take none). Set whenever a chat
+// template was read (chat_template.jinja, or a GGUF's
+// tokenizer.chat_template); absent, none was, and it is unknown.
+inline constexpr std::string_view kReasoningEffortControl =
+    "reasoning_effort_control";
+// object: the language model's section of config.json exactly as it is
+// spelled -- `text_config` when the LM is nested, else the root -- for a
+// family whose fields the struct has no member for (Qwen3.8-Flash-Next's
+// hyper-connections, n-gram embedding and token indexer). The member
+// names inside are Hugging Face's.
+inline constexpr std::string_view kTextConfig = "text_config";
 }  // namespace model_config
 
 // Parsed view of a Hugging Face `config.json`. Holds the subset of

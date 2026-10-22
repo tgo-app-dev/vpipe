@@ -148,6 +148,11 @@ On a target that small the drafter costs as much as the model's own
 verify, so it is no faster than plain decode on an M4. DFlash pays on big
 models.
 
+`incoai/Qwen3.8-Flash-Next-DFlash2` drafts for Qwen3.8-Flash-Next, the
+sparse mixture-of-experts model, through the same keys; see
+[its guide](QWEN38-FLASH-NEXT.md) for what it measures there (3.3 tokens a
+round at block 4, about 1.6x the plain decode).
+
 A model with an MTP head (`mtp`, the OptiQ packs) and a DFlash drafter
 are two answers to the same question. When `draft_model` is set, DFlash is
 used. MEASURED on the same prompt with Qwen3.8-27B's published MTP head

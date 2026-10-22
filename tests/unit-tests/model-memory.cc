@@ -25,6 +25,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "stages/vae-decode-stage.h"
@@ -2981,3 +2982,56 @@ TEST(model_memory, ane_modules_are_claimed_by_the_stages_that_build_them)
     }
   }
 }
+
+// A LANGUAGE-MODEL stage's claims, one rule for text-chat, visual-qa and
+// realtime-vqa (model_memory::lm_claims): a Mixture-of-Experts model held
+// at its streamable floor (Qwen3.8-Flash-Next: the rest of the model and a
+// layer of experts, its n-gram table no part of it), a dense one whole,
+// and a Qwen vision tower's scratch at the largest picture it admits --
+// ~5 GB at the 16.7 MP a Qwen3-VL repo states -- or at a live frame's
+// budget, or not at all. Env: VPIPE_QWEN4_EXP_TEST_MODEL_PATH and / or
+// VPIPE_QWEN35_TEST_MODEL_PATH (their configs only; nothing loads).
+TEST(model_memory, a_language_model_claims_its_floor_and_its_tower)
+{
+  const char* dirs[] = {std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH"),
+                        std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH")};
+  Session sess;
+  auto scratch = [](const std::vector<ResourceClaim>& cs) {
+    std::size_t b = 0;
+    for (const auto& c : cs) {
+      if (c.kind != model_memory::kScratchKind) { continue; }
+      const std::size_t bar = c.key.rfind('|');
+      if (bar != std::string::npos) {
+        b += (std::size_t)std::stoull(c.key.substr(bar + 1));
+      }
+    }
+    return b;
+  };
+  for (int i = 0; i < 2; ++i) {
+    if (dirs[i] == nullptr) { continue; }
+    const std::string d = dirs[i];
+    const auto all = model_memory::lm_claims(&sess, d, "t");
+    const auto frame =
+        model_memory::lm_claims(&sess, d, "t", 28LL * 28 * 1280);
+    const auto none = model_memory::lm_claims(&sess, d, "t", -1);
+    ASSERT_TRUE(!all.empty() && all[0].kind == model_memory::kWeightsKind);
+    if (all.empty()) { continue; }
+    const std::size_t disk = model_memory::dir_weights_bytes(d);
+    std::printf("[lm-claims] %s: weights %zu MB, floor %zu MB; vision "
+                "scratch %zu MB (largest picture), %zu MB (~1 MP frame)\n",
+                d.c_str(), disk >> 20, all[0].floor_bytes >> 20,
+                scratch(all) >> 20, scratch(frame) >> 20);
+    EXPECT_TRUE(scratch(none) == 0);
+    EXPECT_TRUE(scratch(frame) > 0 && scratch(frame) < scratch(all));
+    if (i == 0) {
+      // Flash-Next: streamable, under a tenth of its 128 GB; a 16.7 MP
+      // picture's tower (27 x 1152) ~5 GB.
+      EXPECT_TRUE(all[0].floor_bytes > 0 && all[0].floor_bytes < disk / 10);
+      EXPECT_TRUE(scratch(all) > ((std::size_t)4 << 30) &&
+                  scratch(all) < ((std::size_t)6 << 30));
+    } else {
+      EXPECT_TRUE(all[0].floor_bytes == 0);   // dense: held whole
+    }
+  }
+}
+

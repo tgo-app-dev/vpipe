@@ -69,7 +69,15 @@ namespace vpipe {
 //                                  read in the LAST user message only.
 //   tools      (array)           -- the HOST's tools, {name, description,
 //                                  parameters (JSON Schema)}, advertised
-//                                  in the system turn. Never run here: a
+//                                  in the system turn in the family's
+//                                  own form (Qwen3.5 / 3.6 / 3.8: the
+//                                  XML `<function=NAME>` calls their
+//                                  template teaches, each value read
+//                                  back by its parameter's type here).
+//                                  A call is read from the reply's
+//                                  answer, never its reasoning (a call
+//                                  only drafted there is not one made).
+//                                  Never run here: a
 //                                  reply calling them ENDS the turn, the
 //                                  calls going out on out-port 0, and the
 //                                  host sends their results as the next

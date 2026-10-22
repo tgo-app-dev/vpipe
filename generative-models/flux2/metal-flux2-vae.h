@@ -134,8 +134,54 @@ class MetalFlux2Vae {
 
   const Config& config() const { return _cfg; }
 
+  // ACCELERATED MODE (LOSSY), the stages' `i8_gemm` / `i8_gemm_tier`: the
+  // 3x3 convs on the hardware int8 convolution (conv2d_hw_3x3_*_i8), as
+  // MetalKrea2Vae runs them and on the same kernels -- an activation
+  // channel at a step of its own (a 3x3 window sums nine pixels in one
+  // pass, so no finer scale is possible there), folded into a per-call
+  // int8 copy of the weight by SmoothQuant's migration (alpha 0.25,
+  // VPIPE_VAE_I8_ALPHA), the scales and bias in the conv's epilogue. A
+  // resnet's conv reads GroupNorm -> SiLU, its pixels' magnitude already
+  // evened by the norm, and its SiLU goes into the quantizer.
+  //
+  //   THE TIER (0 accurate, 1 fast, 2 token, 3 token_plain -- the DiTs'
+  //   vocabulary): accurate takes the resnet convs alone; every other
+  //   tier also takes the 3x3s that read the unnormalized residual
+  //   stream (the up / downsamples, conv_in where it is wide enough).
+  //   The tiers differ in the convs they take, not in how: a conv's
+  //   quantization is per channel at every tier.
+  //
+  // Not the mid-block attention: on matrix cores its tuner picks a flash
+  // kernel, whose products are not GEMMs this route can take.
+  //
+  // THE EXACT TILED DECODE keeps its tiles f16: a per-call activation
+  // scale is a statistic of the plane the conv sees, so a tile would
+  // quantize by its own and the decode would stop being the whole one.
+  // Its head, which runs whole, takes the route.
+  //
+  // Off by default and for the reason vae-decode-stage gives: a codec is
+  // the last step before the pixels, with nothing after it to absorb an
+  // approximation. Set before decode() / encode(); cheap (flags only --
+  // the int8 weight is folded per call), and a GPU without matrix cores
+  // or the kernels quietly keeps f16.
+  struct Accel {
+    bool i8_gemm = false;
+    int  i8_tier = 0;
+  };
+  void set_accel(const Accel& a);
+  // What set_accel turned on, for the stage's log line ("" for nothing).
+  std::string accel_note() const;
+  // 3x3 convs the int8 route has run, counted as encoded. For a test to
+  // assert the route engaged.
+  int i8_convs() const noexcept { return _i8_convs; }
+
  private:
   MetalFlux2Vae() = default;
+
+  using PoolAlloc =
+      std::function<metal_compute::SharedBuffer&(std::size_t)>;
+  using PoolRelease =
+      std::function<void(const metal_compute::SharedBuffer&)>;
 
   // A conv weight stored as dense-gemm W[Cout, K]: 1x1 -> K=Cin; 3x3 -> K=9*Cin
   // flattened (ky,kx,cin) to pair with im2col_hwc_3x3. When the NAX hardware
@@ -519,6 +565,36 @@ class MetalFlux2Vae {
   metal_compute::ComputeFunction _fn_conv_hw_s1_c16, _fn_conv_hw_s2_c16;
   bool _use_hwconv = false;
   int _narrow_hw_convs = 0;   // see narrow_hw_convs()
+
+  // The int8 route (set_accel): the hardware int8 conv at each
+  // destination tile, and its four quantizers (conv2d_mma.metal).
+  metal_compute::ComputeFunction _fn_conv_i8_s1, _fn_conv_i8_s1_c32,
+      _fn_conv_i8_s1_c16, _fn_conv_i8_s2, _fn_conv_i8_s2_c32,
+      _fn_conv_i8_s2_c16;
+  metal_compute::ComputeFunction _fn_i8_zero, _fn_i8_amax, _fn_i8_steps,
+      _fn_i8_quant, _fn_i8_fold;
+  bool _i8_conv = false;         // the route is on
+  bool _i8_all_convs = false;    // ...for the residual stream's convs too
+  float _i8_alpha = 0.25f;       // SmoothQuant's migration
+  int _i8_convs = 0;             // see i8_convs()
+  // The int8 tile for this width (64, 32, 16), or 0 when it has none.
+  int i8_tile_(int cout, int stride) const noexcept;
+  // Whether conv3x3_i8_ takes this conv at this geometry -- the one
+  // predicate the real run and a dry run (Ops) both ask, so a plan sizes
+  // the scratch the run allocates.
+  bool i8_conv_takes_(const Conv& c, int H, int W, int stride) const noexcept;
+  // The scratch the route asks of the pool, in its order (f16 elements):
+  // the int8 activation, the int8 weight, the steps, the weight scales.
+  static void i8_conv_scratch_(const Conv& c, std::size_t rows,
+                               std::size_t out[4]) noexcept;
+  // One 3x3 conv on the int8 route; false (nothing encoded) when it does
+  // not take the conv. `silu`: the input is a norm's output, SiLU'd in
+  // the quantizer.
+  bool conv3x3_i8_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& in, const Conv& c,
+                   const metal_compute::SharedBuffer& out, int H, int W,
+                   int stride, bool silu, const PoolAlloc& alloc,
+                   const PoolRelease& release);
 };
 
 }  // namespace genai

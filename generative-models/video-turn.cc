@@ -334,6 +334,7 @@ VideoTurn::reply(std::string_view before, std::string_view after,
     TokenRef r;
     if (id == pad && fi < frames.size()) {
       r.kind = TokenRef::Kind::ImageTokens;
+      r.text_id = id;
       if (!frames[fi].embeddings_host.empty()) {
         r.embeddings_host = &frames[fi].embeddings_host;
       } else {

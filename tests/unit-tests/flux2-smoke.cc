@@ -716,6 +716,188 @@ TEST(flux2_smoke, vae_decode_exact_tiles_match_whole)
   ::unsetenv("VPIPE_VAE_BUDGET_MB");
 }
 
+// INT8 AGAINST F16, ON A REAL PICTURE (MetalFlux2Vae::set_accel): the 3x3
+// convs on the hardware int8 convolution, as the Qwen-Image codec runs
+// them. VPIPE_FLUX2_VAE_IMAGE names a picture as raw f32, channel-first
+// [3, H, H] in [-1, 1] (a side a multiple of 64 * patch);
+// VPIPE_FLUX2_TEST_MODEL_PATH the checkpoint (its vae/, or the VAE). The
+// picture is encoded and decoded in f16 -- the reference -- then decoded
+// at each tier: ENGAGED first (a GPU without the kernels runs f16 and
+// passes every numeric bar), then timed (best of two after a warm one)
+// and held to the reference by PSNR, and decoded again to the same
+// bytes. The int8 ENCODE is held by the picture its latent decodes to in
+// f16. And the exact tiled decode keeps its tiles f16 under int8: only
+// its head (the mid block, seen whole) takes the route. A real picture,
+// not noise: the activations' channel statistics are what the scales are
+// made of.
+TEST(flux2_smoke, vae_int8_against_f16)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const char* img_env = std::getenv("VPIPE_FLUX2_VAE_IMAGE");
+  if (root == nullptr || *root == '\0' || img_env == nullptr ||
+      *img_env == '\0') {
+    return;
+  }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[flux2_smoke] the int8 conv needs matrix cores (an M5); "
+                "skipped\n");
+    return;
+  }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{},
+                               /*with_encoder=*/true);
+  ASSERT_TRUE(m != nullptr && m->has_encoder());
+  if (m == nullptr || !m->has_encoder()) { return; }
+  const std::vector<float> img = read_f32_file_(img_env);
+  int H = 1;
+  while ((std::size_t)H * H * 3 < img.size()) { ++H; }
+  const int px = 8 * m->config().patch;
+  ASSERT_TRUE(!img.empty() && (std::size_t)H * H * 3 == img.size() &&
+              H % (8 * px) == 0);
+  if (img.empty() || (std::size_t)H * H * 3 != img.size() ||
+      H % (8 * px) != 0) {
+    return;
+  }
+  const int h16 = H / px;
+  SharedBuffer ib = mc->make_shared_buffer(img.size() * 2);
+  ASSERT_TRUE(!ib.empty());
+  if (ib.empty()) { return; }
+  {
+    auto* d = static_cast<_Float16*>(ib.contents());
+    for (std::size_t i = 0; i < img.size(); ++i) { d[i] = (_Float16)img[i]; }
+  }
+  const std::size_t n = (std::size_t)3 * H * H;
+  auto to_f32 = [&](const SharedBuffer& b) {
+    std::vector<float> v;
+    if (b.empty() || b.byte_size() < n * 2) { return v; }
+    v.resize(n);
+    const auto* p = static_cast<const _Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)p[i]; }
+    return v;
+  };
+  // PSNR over [-1, 1] (peak-to-peak 2).
+  auto psnr = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    double se = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double e = (double)a[i] - (double)b[i];
+      se += e * e;
+    }
+    return se > 0.0 ? 10.0 * std::log10(4.0 * (double)n / se) : 99.0;
+  };
+  std::string err;
+  auto timed = [&](const std::function<SharedBuffer()>& run, double* ms) {
+    SharedBuffer out = run();                     // warm
+    if (out.empty()) { return out; }
+    double best = 0.0;
+    for (int i = 0; i < 2; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      out = run();
+      const double t = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (out.empty()) { return out; }
+      if (best == 0.0 || t < best) { best = t; }
+    }
+    *ms = best;
+    return out;
+  };
+
+  // The f16 reference.
+  double enc16 = 0.0, ms16 = 0.0;
+  SharedBuffer lat = timed([&] { return m->encode(ib, H, H); }, &enc16);
+  ASSERT_TRUE(!lat.empty());
+  if (lat.empty()) { return; }
+  const std::vector<float> ref =
+      to_f32(timed([&] { return m->decode(lat, h16, h16, &err); }, &ms16));
+  ASSERT_TRUE(!ref.empty() && m->i8_convs() == 0);
+  if (ref.empty()) { return; }
+  std::printf("[flux2_smoke] %dx%d f16: encode %.0f ms, decode %.0f ms, "
+              "%.2f dB against the picture\n", H, H, enc16, ms16,
+              psnr(ref, img));
+
+  const char* tiers[] = {"accurate", "fast", "token", "token_plain"};
+  int per_decode[4] = {0, 0, 0, 0};
+  for (int t = 0; t < 4; ++t) {
+    m->set_accel({/*i8_gemm=*/true, /*i8_tier=*/t});
+    const int c0 = m->i8_convs();
+    SharedBuffer once = m->decode(lat, h16, h16, &err);
+    per_decode[t] = m->i8_convs() - c0;
+    double ms8 = 0.0;
+    const std::vector<float> got = to_f32(
+        timed([&] { return m->decode(lat, h16, h16, &err); }, &ms8));
+    ASSERT_TRUE(!got.empty());
+    if (got.empty()) { continue; }
+    const std::vector<float> first = to_f32(once);
+    const bool same = first.size() == got.size() &&
+                      std::memcmp(first.data(), got.data(),
+                                  got.size() * sizeof(float)) == 0;
+    const double p = psnr(got, ref);
+    std::printf("[flux2_smoke]   int8 %-11s decode %.0f ms (%.2fx), %d "
+                "convs, %.2f dB against f16, repeated %s [%s]\n", tiers[t],
+                ms8, ms16 / ms8, per_decode[t], p,
+                same ? "IDENTICAL" : "DIFFERS", m->accel_note().c_str());
+    EXPECT_TRUE(per_decode[t] > 0);
+    EXPECT_TRUE(same);
+    // Lossy by design, but a picture: an int8 route gone wrong (a scale
+    // misplaced, a channel dropped) lands far under this.
+    EXPECT_TRUE(p > 30.0);
+  }
+  // Accurate takes the resnet convs; the others the residual stream's too.
+  EXPECT_TRUE(per_decode[1] > per_decode[0]);
+  EXPECT_TRUE(per_decode[2] == per_decode[1] &&
+              per_decode[3] == per_decode[1]);
+
+  // The int8 ENCODE, decoded in f16: what an edit's reference latent
+  // loses.
+  for (int t = 0; t < 2; ++t) {
+    m->set_accel({true, t});
+    const int c0 = m->i8_convs();
+    double enc8 = 0.0;
+    SharedBuffer lat8 = timed([&] { return m->encode(ib, H, H); }, &enc8);
+    const int convs = (m->i8_convs() - c0) / 3;
+    ASSERT_TRUE(!lat8.empty());
+    if (lat8.empty()) { continue; }
+    m->set_accel({});
+    const std::vector<float> got8 = to_f32(m->decode(lat8, h16, h16, &err));
+    ASSERT_TRUE(!got8.empty());
+    if (got8.empty()) { continue; }
+    const double pe = psnr(got8, ref);
+    std::printf("[flux2_smoke]   int8 %-11s encode %.0f ms against %.0f "
+                "(%.2fx), %d convs, decoded in f16 %.2f dB against f16\n",
+                tiers[t], enc8, enc16, enc16 / enc8, convs, pe);
+    EXPECT_TRUE(convs > 0);
+    EXPECT_TRUE(pe > 30.0);
+  }
+
+  // The exact tiled decode under int8: its tiles stay f16, so only the
+  // head's resnet convs (the mid block's, at the latent's size) go int8.
+  m->set_accel({true, 0});
+  ::setenv("VPIPE_VAE_EXACT", "1", 1);
+  ::setenv("VPIPE_VAE_BUDGET_MB",
+           std::to_string((int)(m->decode_peak_bytes(h16, h16) >> 20) / 3)
+               .c_str(), 1);
+  const int c0 = m->i8_convs();
+  const std::vector<float> ex = to_f32(m->decode(lat, h16, h16, &err));
+  const int head = m->i8_convs() - c0;
+  const MetalFlux2Vae::DecodeReport rep = m->last_decode();
+  ::unsetenv("VPIPE_VAE_EXACT");
+  ::unsetenv("VPIPE_VAE_BUDGET_MB");
+  ASSERT_TRUE(!ex.empty());
+  if (ex.empty()) { return; }
+  const double pex = psnr(ex, ref);
+  std::printf("[flux2_smoke]   int8 accurate exact tiled: %d passes, %d "
+              "tiles, %d int8 convs (the head's), %.2f dB against f16\n",
+              rep.passes, rep.tiles, head, pex);
+  EXPECT_TRUE(rep.exact && rep.passes > 0);
+  EXPECT_TRUE(head == 4);      // mid_res0 and mid_res1, two convs each
+  EXPECT_TRUE(pex > 30.0);
+  m->set_accel({});
+}
+
 // The two-pass group norm must be a pure speedup: same normalization, only
 // split so both passes saturate the GPU. It is not bit-identical (the
 // partials are summed in a different order), so this is a rel-L2 bound -- if
@@ -1029,6 +1211,13 @@ TEST(flux2_smoke, vae_decode_bench)
   if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
   auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
   ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  // VPIPE_VAE_BENCH_I8_TIER=<0..3>: the int8 route at that tier, so its
+  // scratch is held to the booking below too.
+  if (const char* e = std::getenv("VPIPE_VAE_BENCH_I8_TIER")) {
+    m->set_accel({true, std::atoi(e)});
+    std::printf("[flux2_smoke] %s\n", m->accel_note().c_str());
+  }
   const int C = m->config().dit_channels();
   // Latent grids to bench, as {h16, w16} (image pixels / 16). Default 512
   // and 1024 square. VPIPE_VAE_DEC_HW=1024x768 benches one real, NON-SQUARE

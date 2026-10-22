@@ -251,13 +251,18 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         vae-i8-conv.cc
         qwen-image-21-layout.cc
         qwen-image-21-cond.cc
+        qwen-image-21-negative.cc
         qwen-image-21-dit.cc
         z-image-dit.cc
+        fibo2-dit.cc
+        fibo2-pipeline.cc
         moss-image-dit.cc
         moss-image-pipeline.cc
         yue2.cc
         bs-roformer.cc
         drama3.cc
+        qwen4-exp-kernels.cc
+        moe-grouped-nax.cc
         moe-expert-cache.cc
         qwen-image-edit-text.cc
         qwen-image-edit-dit.cc
@@ -266,6 +271,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-edit-t2i.cc
         qwen-image-edit-awq.cc
         flux2-smoke.cc
+        encoder-residency.cc
         flux3-dit.cc
         flux3-pipeline.cc
         image-memory-plan.cc

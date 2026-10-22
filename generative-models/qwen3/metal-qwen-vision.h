@@ -144,6 +144,16 @@ public:
 
   // Encode one RGB image: rgb is [3, H, W] U8 channel-first contiguous.
   Result encode(const std::uint8_t* rgb, int H, int W);
+  // The same with the picture held under `max_pixels` as well as the
+  // checkpoint's bound (a live frame's budget: realtime-vqa); <= 0 is the
+  // checkpoint's alone.
+  Result encode(const std::uint8_t* rgb, int H, int W,
+                std::int64_t max_pixels);
+  // What one encode allocates at its largest (a picture at `max_pixels`,
+  // <= 0 for the config's own bound): the GPU scratch the forward holds
+  // at once plus the host-side pixels and patches. For a memory plan.
+  static std::size_t encode_scratch_bytes(const Config& c,
+                                          std::int64_t max_pixels = 0);
 
   // Encode a CLIP: `rgb` is `n_frames` consecutive [3, H, W] U8 planes.
   //
@@ -179,7 +189,7 @@ private:
   // `n_frames == 1` is the image path: the single frame is tiled across
   // the temporal patch, which is what the reference does too.
   Result encode_(const std::uint8_t* rgb, int n_frames, int H, int W,
-                 bool video);
+                 bool video, std::int64_t max_pixels = 0);
 
   struct Block {
     metal_compute::SharedBuffer n1w, n1b, qkvw, qkvb, ow, ob;

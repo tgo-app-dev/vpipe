@@ -62,12 +62,16 @@ public:
 
   TensorBeat tb;
   int        count = 1;
+  int        delay_ms = 0;     // before the first beat
 
   Job process(RuntimeContext& ctx) override
   {
     if (_emitted >= count) {
       ctx.signal_done();
       co_return;
+    }
+    if (_emitted == 0 && delay_ms > 0) {
+      this_thread::sleep_for(chrono::milliseconds(delay_ms));
     }
     ++_emitted;
     co_await ctx.write(0, make_payload<TensorBeatPayload>(tb));
@@ -339,6 +343,106 @@ TEST(create_mask_stage, headless_overlay_paints_reference)
   // not. Planar, so the three channels are plane-strided.
   EXPECT_TRUE(p[0] == 255 && p[plane] == 0 && p[2 * plane] == 0);
   EXPECT_TRUE(p[31] == 0 && p[plane + 31] == 0 && p[2 * plane + 31] == 0);
+}
+
+// `mask_threshold` binarizes a SOFT inbound mask by Pillow's rule (set
+// from 128), which with a flat #808080 overlay at full opacity is exactly
+// the grey-out an edit model's pipeline applies (Fibo 2.0's grey_out).
+// The default (1) keeps any non-zero value -- a 0/1 mask still works.
+TEST(create_mask_stage, mask_threshold_binarizes_a_soft_mask)
+{
+  for (int threshold : {128, 1}) {
+    Session sess;
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto r_u = make_unique<RepeatSource>(&sess, "r", vector<InEdge>{},
+                                         FlexData::make_object());
+    r_u->tb = make_rgb_(24, 32, 0.0f);      // black reference
+    r_u->count = 4;
+    r_u->allocate_oports(1);
+    auto* r = static_cast<RepeatSource*>(pl->insert_stage(std::move(r_u)));
+    // Left half 128, right half 127: the two sides of Pillow's line.
+    TensorBeat mt = make_mask_(24, 32, 128);
+    for (int y = 0; y < 24; ++y) {
+      for (int x = 16; x < 32; ++x) { mt.as_u8()[y * 32 + x] = 127; }
+    }
+    auto m_u = make_unique<RepeatSource>(&sess, "m", vector<InEdge>{},
+                                         FlexData::make_object());
+    m_u->tb = mt;
+    m_u->count = 4;
+    m_u->allocate_oports(1);
+    auto* m = static_cast<RepeatSource*>(pl->insert_stage(std::move(m_u)));
+    auto k_u = make_unique<CreateMaskStage>(
+        &sess, "mk", vector<InEdge>{{r, 0}, {m, 0}},
+        cfg_({{"interactive", FlexData::make_bool(false)},
+              {"output", FlexData::make_string("overlay")},
+              {"overlay_color", FlexData::make_string("#808080")},
+              {"overlay_opacity", FlexData::make_real(1.0)},
+              {"mask_threshold", FlexData::make_int(threshold)}}));
+    auto* mk =
+        static_cast<CreateMaskStage*>(pl->insert_stage(std::move(k_u)));
+    auto c_u = make_unique<Collector>(&sess, "c", vector<InEdge>{{mk, 0}},
+                                      FlexData::make_object());
+    auto* col = static_cast<Collector*>(pl->insert_stage(std::move(c_u)));
+    PipelineRuntime rt(pl.get(), &sess);
+    rt.launch();
+    this_thread::sleep_for(chrono::milliseconds(800));
+    rt.stop();
+    ASSERT_TRUE(col->count() >= 1);
+    if (col->count() < 1) { continue; }
+    const TensorBeat out = col->last();
+    const uint8_t* p = out.as_u8();
+    const size_t plane = 24 * 32;
+    // 128 is set either way: flat (128, 128, 128).
+    EXPECT_TRUE(p[0] == 128 && p[plane] == 128 && p[2 * plane] == 128);
+    // 127 is set only under the default threshold.
+    const uint8_t want = threshold == 128 ? 0 : 128;
+    EXPECT_TRUE(p[31] == want && p[plane + 31] == want &&
+                p[2 * plane + 31] == want);
+  }
+}
+
+// THE TWO SOURCES RACE: a headless overlay whose mask arrives BEFORE its
+// reference image must wait for the image -- painted over black, an edit
+// graph greyed a box on nothing and lost the picture. One beat, over the
+// reference.
+TEST(create_mask_stage, a_headless_overlay_waits_for_its_reference)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto r_u = make_unique<RepeatSource>(&sess, "r", vector<InEdge>{},
+                                       FlexData::make_object());
+  r_u->tb = make_rgb_(24, 32, 1.0f);      // white reference, arriving late
+  r_u->delay_ms = 300;
+  r_u->allocate_oports(1);
+  auto* r = static_cast<RepeatSource*>(pl->insert_stage(std::move(r_u)));
+  auto m_u = make_unique<RepeatSource>(&sess, "m", vector<InEdge>{},
+                                       FlexData::make_object());
+  m_u->tb = make_mask_(24, 32, 255);
+  m_u->allocate_oports(1);
+  auto* m = static_cast<RepeatSource*>(pl->insert_stage(std::move(m_u)));
+  auto k_u = make_unique<CreateMaskStage>(
+      &sess, "mk", vector<InEdge>{{r, 0}, {m, 0}},
+      cfg_({{"interactive", FlexData::make_bool(false)},
+            {"output", FlexData::make_string("overlay")},
+            {"overlay_color", FlexData::make_string("#808080")},
+            {"overlay_opacity", FlexData::make_real(1.0)}}));
+  auto* mk = static_cast<CreateMaskStage*>(pl->insert_stage(std::move(k_u)));
+  auto c_u = make_unique<Collector>(&sess, "c", vector<InEdge>{{mk, 0}},
+                                    FlexData::make_object());
+  auto* col = static_cast<Collector*>(pl->insert_stage(std::move(c_u)));
+  PipelineRuntime rt(pl.get(), &sess);
+  rt.launch();
+  this_thread::sleep_for(chrono::milliseconds(1200));
+  rt.stop();
+  ASSERT_TRUE(col->count() == 1);
+  if (col->count() != 1) { return; }
+  const TensorBeat out = col->last();
+  const uint8_t* p = out.as_u8();
+  const size_t plane = 24 * 32;
+  // Grey where the mask is, the WHITE reference where it is not.
+  EXPECT_TRUE(p[0] == 128 && p[plane] == 128 && p[2 * plane] == 128);
+  EXPECT_TRUE(p[31] == 255 && p[plane + 31] == 255 &&
+              p[2 * plane + 31] == 255);
 }
 
 // A class map is an INDEX map: it must come back with the indices it

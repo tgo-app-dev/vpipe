@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vpipe {
@@ -73,6 +74,32 @@ private:
 // tool calls.
 std::vector<McpToolCall>
 parse_tool_calls(const std::string& assistant_text);
+
+// Extract the calls of the XML function form Qwen3.5 / 3.6 / 3.8's own
+// chat templates teach (Qwen3-Coder's):
+//
+//   <tool_call>
+//   <function=NAME>
+//   <parameter=KEY>
+//   value
+//   </parameter>
+//   </function>
+//   </tool_call>
+//
+// The template writes a string value as it is and anything else as
+// JSON, so a value is read back by the type its tool's schema gives the
+// parameter -- `tools_json`, one function spec a line as tools_json()
+// writes them: a string stays the words written ("2026" a string where
+// the schema says so), an integer, number or boolean is read as one, an
+// object or array as JSON, `null` as null. Without a schema for the
+// tool, a value that reads as JSON is taken as JSON. A <tool_call> block
+// holding no <function=...> is read as Hermes JSON (parse_tool_calls),
+// and a <function=...> written with no <tool_call> round it is read too.
+// Unclosed tags run to the end of what holds them, as a decode cut off
+// leaves them.
+std::vector<McpToolCall>
+parse_xml_tool_calls(const std::string& assistant_text,
+                     std::string_view   tools_json);
 
 // A registry seeded with the built-in tools -- currently just
 // get_current_time, which reports the host's current local date and

@@ -22,6 +22,7 @@
 #include "generative-models/z-image/metal-z-image-transformer.h"
 #include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/moss-image/metal-moss-image-transformer.h"
+#include "generative-models/fibo2/metal-fibo2-transformer.h"
 #include "generative-models/vosr/metal-vosr-transformer.h"
 #include "stages/generation-input.h"
 #include "stages/latent-preview.h"
@@ -642,6 +643,9 @@ private:
   // in, and an image row carries no token id.
   std::vector<std::uint8_t> _qi21_slots;
   std::vector<int> _qi21_ref_gh, _qi21_ref_gw;
+  // The NEGATIVE beat's own mask: its text is another length and its
+  // image slots sit at other rows, so it runs its own layout.
+  std::vector<std::uint8_t> _qi21_slots_neg;
   bool load_qwen_image21_dit_();
   void free_qwen_image21_dit_for_decode_(int gen_w, int gen_h);
   std::vector<float> generate_qwen_image21_(
@@ -699,6 +703,28 @@ private:
   // it jumps TO, which FlowSampler's denoise callback has no way to
   // pass.
   std::vector<float> generate_flux3_(
+      const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+      int gen_w, const std::vector<RefLatent>& refs,
+      const std::vector<float>* init_packed,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- Fibo 2.0 ---------------------------------------------------------
+  std::shared_ptr<genai::MetalFibo2Transformer> _fibo2_dit;
+  std::string _fibo2_dit_dir;
+  bool _fibo2_stream = false;
+  // The schedule the checkpoint states (scheduler/scheduler_config.json:
+  // the dynamic shift's base / max sequence and shift), read at load.
+  double _fibo2_base_shift = 0.5, _fibo2_max_shift = 1.15;
+  int _fibo2_base_seq = 256, _fibo2_max_seq = 4096;
+  // The distilled edit model's 4 steps; a graph's own count wins.
+  int _fibo2_steps = 4;
+  bool load_fibo2_dit_();
+  void free_fibo2_dit_for_decode_(int gen_w, int gen_h);
+  // Text bundles [6, n_rows, cap] (+ the pictures to edit, as latents)
+  // -> [128, H/16, W/16], FLUX.2's VAE's latent: the reference pipeline's
+  // loop (linspace sigmas dynamically shifted in f32, torch noise, f32
+  // Euler, no guidance).
+  std::vector<float> generate_fibo2_(
       const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
       int gen_w, const std::vector<RefLatent>& refs,
       const std::vector<float>* init_packed,

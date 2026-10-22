@@ -620,7 +620,7 @@ Coverage, and what each family's plan-time bound is actually worth:
 
 | family | declares from | revised by | bound vs truth |
 |---|---|---|---|
-| FLUX.2, FLUX.3 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
+| FLUX.2, FLUX.3, Fibo 2.0 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Boogu | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Z-Image | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
 | MOSS-Image | `AutoencoderKLFlux2`, `decoder_block_out` ×14 (its small decoder) | generate-image, vae-decode | exact |
@@ -1067,11 +1067,14 @@ there.
 > keeping anything resident. It is a record of a decision that was taken,
 > not a prediction.
 
-`StreamPlan::pin_frac` is **language-model layer pinning only.** Every DiT
-that used it is retired: the block-streaming families grow a resident set
-by measuring instead (mechanism 6), which is what a fraction of total RAM
-decided before the run could never do. The prefill-only text encoders keep
-it: they pin a prefix of layers with no residency policy behind it.
+`StreamPlan::pin_frac` is **language-model layer pinning, for the
+encoders nothing better serves.** The block-streaming DiTs grow a
+resident set by measuring instead (mechanism 6), which is what a fraction
+of total RAM decided before the run could never do — and so does every
+text encoder whose backbone the raw-source slots below can stream. A
+prefill-only encoder they cannot build (a backbone with attention biases,
+a pack of another width, a plug-in's hidden-state encoder) still pins a
+prefix of layers, with no residency policy behind it.
 
 **An autoregressive decoder streams like a DiT.** A dense full-attention
 backbone whose layers are built from the raw checkpoint (quantized in
@@ -1116,6 +1119,53 @@ head are read every token and are often a quarter of the checkpoint:
 model from 9983 MB to 8843 MB. Keep exact the rows read on every step
 (control tokens in, the tokens a constrained step ranks out), so the
 quantization reaches only what varies.
+
+**A conditioning encoder streams the same way.** A text encoder that only
+ever prefills — read for a stack of hidden states, never decoded — takes
+the same slots and the same measured residency through its tap forwards.
+Three things are its own:
+
+* **A forward ends at its deepest tap**, and the read issued under its
+  last layer wraps to the next forward's first streamed layer rather than
+  reading on past the tap into a layer nothing runs. The next forward is
+  the negative prompt, or the next prompt of an encoder kept between
+  them.
+* **Its floor is the slot PAIR.** What it holds at its least is the trunk
+  plus two slots, each a layer's sources plus the products built beside
+  them (in bf16, the fused q|k|v alone: the rest are the sources as
+  read). That is what its streamable claim states, read off the
+  checkpoint — and where the stack is one the slots cannot build, the
+  floor is the layer-at-a-time path's instead. The floor promised and the
+  slots held agree to the byte; check that in a test.
+* **Its reserve is the other phases' arenas.** It runs in the condition
+  phase, and what may allocate while it holds its set is the widest
+  scratch the plan books for any OTHER phase — a DiT forward and a VAE
+  decode of an earlier prompt run beside the next prompt's conditioning.
+  Its schedule tells one pass from several: a prompt with a negative is
+  two passes, an encoder kept past its prompt more, and a single pass
+  keeps nothing it will read again.
+
+Once every layer the taps run is resident, the slot pair is given back —
+at the top of the next forward, or when the encoder is handed to a warm
+hold.
+
+**A hybrid's two kinds of layer share one pair.** A stack that interleaves
+linear-attention (gated-DeltaNet) layers with full-attention ones holds
+different tensors in each kind, and a slot laid out for one kind would be
+rebuilt every time the other arrived — with the slots alternating and one
+layer in four full attention, every other read. So a hybrid's slot is a
+POOL laid out from the checkpoint: each projection takes a buffer of
+exactly its byte size (the k-th of a size in its layer, the k-th such
+buffer), so the pool holds the most of each size any layer needs; each
+small tensor (a norm, the convolution, the recurrence's parameters) has a
+buffer of its own role; and the fused projection is built into one arena
+of the wider kind's size. Either kind refills it in place. What the
+resident load derives rather than reads — a zero-centred norm with its 1
+folded in, the recurrence's parameters widened to f32 — is rebuilt on
+each refill through the same converters, so a streamed layer is the
+resident one byte for byte. The pool is what the floor counts: for a
+9B-class hybrid about 530 MiB a slot, against ~2 GiB for a pair per
+kind.
 
 ### Reading a streamed block
 

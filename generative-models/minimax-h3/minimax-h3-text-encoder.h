@@ -127,11 +127,36 @@ class MiniMaxH3TextEncoder {
 
   ~MiniMaxH3TextEncoder();
 
-  // Whether the backbone streams its layers through the prefill instead
-  // of holding them (Config::lm.stream_layers -- the 16 GB path), and
-  // how many leading layers stayed pinned. For the stage's log line.
+  // Whether the backbone streams its layers instead of holding them
+  // (Config::lm.stream_decode, or stream_layers where that path cannot
+  // serve the checkpoint), and how many leading layers a prefill-streamed
+  // one pinned. For the stage's log line.
   bool streaming() const { return _lm && _lm->streaming_layers(); }
   int  pinned_layers() const { return _lm ? _lm->pinned_layers() : 0; }
+  // The backbone's measured residency, where it streams through the
+  // raw-source slots (MetalQwenModel::streams_decode): growth is off
+  // until a reserve is set, and 0 is an answer.
+  bool streams_resident_set() const { return _lm && _lm->streams_decode(); }
+  void set_residency_reserve(std::size_t bytes)
+  {
+    if (_lm) { _lm->set_residency_reserve(bytes); }
+  }
+  void set_residency_schedule(int forwards)
+  {
+    if (_lm) { _lm->set_residency_schedule(forwards); }
+  }
+  int resident_layer_count() const
+  {
+    return _lm ? _lm->resident_layer_count() : 0;
+  }
+  std::uint64_t resident_bytes() const
+  {
+    return _lm ? _lm->resident_bytes() : 0;
+  }
+  std::size_t release_idle_slots()
+  {
+    return _lm ? _lm->release_idle_slots() : 0;
+  }
 
   // Tokenize VERBATIM -- no chat template, no special tokens.
   std::vector<std::int32_t> tokenize(std::string_view prompt) const;

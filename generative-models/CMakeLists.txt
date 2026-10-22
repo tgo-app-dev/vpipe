@@ -72,6 +72,7 @@ set(LOCAL_SOURCES
   gemma4/metal-gemma4-vision.cc
   qwen3/metal-audio-encoder.cc
   qwen3/metal-qwen-model.cc
+  qwen3/metal-qwen-hc.cc
   qwen3/metal-qwen-encoder-chat.cc
   qwen3/metal-qwen-raw-layers.cc
   qwen3/metal-qwen-model-exec.cc
@@ -107,6 +108,8 @@ set(LOCAL_SOURCES
   qwen-image/metal-qwen25-vision.cc
   z-image/z-image-layout.cc
   z-image/metal-z-image-transformer.cc
+  fibo2/fibo2-layout.cc
+  fibo2/metal-fibo2-transformer.cc
   moss-image/metal-moss-image-transformer.cc
   yue2/yue2-protocol.cc
   yue2/metal-yue2-model.cc
@@ -228,6 +231,8 @@ set(LOCAL_HEADERS
   qwen-image/qwen-image21-lora-trainer.h
   z-image/z-image-layout.h
   z-image/metal-z-image-transformer.h
+  fibo2/fibo2-layout.h
+  fibo2/metal-fibo2-transformer.h
   moss-image/metal-moss-image-transformer.h
   flux3/metal-flux3-transformer.h
   llama3/metal-llama-model.h

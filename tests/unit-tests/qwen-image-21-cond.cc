@@ -2,11 +2,11 @@
 //
 // The encoder is a Qwen3-VL 8B, and at bf16 it is 16 GB on disk -- more
 // than the DiT and more than a 16 GB machine has. The conditioner loads
-// it through the same layer-streaming rule the DiTs use
-// (model_memory::plan_streaming -> MetalQwenModel::Config::stream_layers),
-// which is exactly the right shape for it: a conditioning encoder only
-// ever PREFILLS, so there is no decode to make a streamed layer be read
-// twice.
+// it streamed, through the raw-source slot pair with a resident set
+// grown by measurement (MetalQwenModel::Config::stream_decode), which is
+// exactly the right shape for it: a conditioning encoder only ever
+// PREFILLS, so there is no decode to make a streamed layer be read once
+// per token.
 //
 // What this checks is that the bf16 checkpoint is reachable at all on
 // the box it is run on, and that the tap this family needs comes out of
@@ -142,6 +142,7 @@ TEST(qwen_image_21_cond, bf16_encoder_streams_and_taps)
   // what a 16 GB box actually takes.
   const char* nostream = std::getenv("VPIPE_QWEN_IMAGE21_ENC_NO_STREAM");
   cfg.stream_layers = !(nostream != nullptr && *nostream != '\0');
+  cfg.stream_decode = cfg.stream_layers;   // the conditioner's path
 
   const auto t_load = std::chrono::steady_clock::now();
   auto m = MetalQwenModel::load(dir, mc, cfg);
@@ -228,8 +229,10 @@ TEST(qwen_image_21_cond, a_batch_reads_the_stack_once_and_matches_alone)
   MetalQwenModel::Config cfg = encoder_config_(dir);
   const char* nostream = std::getenv("VPIPE_QWEN_IMAGE21_ENC_NO_STREAM");
   cfg.stream_layers = !(nostream != nullptr && *nostream != '\0');
+  cfg.stream_decode = cfg.stream_layers;   // the conditioner's path
   auto m = MetalQwenModel::load(dir, mc, cfg);
   Q21C_REQUIRE(m != nullptr);
+  Q21C_REQUIRE(m->streams_decode() == cfg.stream_decode);
 
   auto wts = MetalLlamaWeights::open_model(dir);
   Q21C_REQUIRE(wts.has_value());

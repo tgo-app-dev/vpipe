@@ -1174,7 +1174,7 @@ source names. That is the same path Krea-2's built-in previews take.
 
 The registry is consulted **before** the built-in `flux2` / `flux3` /
 `krea2` / `qwen-image-edit` / `qwen-image-21` / `boogu-image` /
-`z-image` / `moss-image` dispatch. The built-ins
+`z-image` / `moss-image` / `fibo2` dispatch. The built-ins
 are unchanged and unregistered: this adds a path, it does not reroute the
 existing ones.
 
@@ -1629,7 +1629,7 @@ constant, never the spelling:
 | the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
 | scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
 | `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
-| `ModelConfig::extra` (what config.json says that the struct has no field for: a YaRN / Llama-4 `rope_parameters`, a vision tower's input edge, a chat template's default system message) | `genai::model_config` (`generative-models/model-loader.h`) |
+| `ModelConfig::extra` (what config.json says that the struct has no field for: a YaRN / Llama-4 `rope_parameters`, a vision tower's input edge, a Qwen-VL processor's picture and clip pixel bounds, a chat template's default system message, whether that template takes a reasoning effort, the language model's whole config section as spelled) | `genai::model_config` (`generative-models/model-loader.h`) |
 | `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
 | speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |
 | the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |

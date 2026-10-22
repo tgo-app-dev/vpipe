@@ -184,6 +184,7 @@ family_version_(const std::string& mt, std::string& family,
   static const Row kRows[] = {
       {"qwen3.5",                "Qwen",        "3.5"},
       {"qwen3.6",                "Qwen",        "3.6"},
+      {"qwen3.8-flash",          "Qwen",        "3.8 Flash-Next"},
       {"qwen3-asr",              "Qwen",        "3-ASR"},
       {"qwen3.5-vision-encoder", "Qwen",        "3.5"},
       {"gemma4",                 "Gemma",       "4"},
@@ -198,6 +199,9 @@ family_version_(const std::string& mt, std::string& family,
       {"flux3",                  "FLUX",        "3 Image Klein"},
       {"flux3-dit",              "FLUX",        "3 Image Klein"},
       {"flux3-lora",             "FLUX",        "3 Image Klein"},
+      {"fibo2",                  "Fibo",        "2.0"},
+      {"fibo2-dit",              "Fibo",        "2.0"},
+      {"fibo2-lora",             "Fibo",        "2.0"},
       {"qwen-image",             "Qwen-Image",  "2512"},
       {"qwen-image-edit",        "Qwen-Image",  "Edit-2511"},
       {"qwen-image-21",          "Qwen-Image",  "2.1"},
@@ -269,6 +273,9 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   auto starts = [&](const char* p) { return mt.rfind(p, 0) == 0; };
 
   if (starts("qwen3_asr") || starts("qwen3asr")) { return "qwen3-asr"; }
+  // Qwen3.8-Flash-Next: the Qwen3.5-MoE backbone under hyper-connections
+  // (metal-qwen-hc.cc), a model_type of its own.
+  if (starts("qwen4_exp")) { return "qwen3.8-flash"; }
   if (starts("qwen3_5") || starts("qwen3_6")) {
     if (starts("qwen3_6") || has_(name_lc, "qwen3.6")
         || has_(name_lc, "qwen3_6")) {
@@ -348,6 +355,9 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
   // modes, a flow map), sharing only the VAE. One tag for text-to-image
   // and editing: a reference is an optional token mode of the same DiT.
   if (cls == "Flux3Transformer2DModel")      { return "flux3"; }
+  // Fibo 2.0 (Bria). One tag for the edit and generation checkpoints:
+  // the pictures to edit are an optional input of the same DiT.
+  if (cls == "BriaFibo2Transformer2DModel")  { return "fibo2"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit"; }
   // Qwen-Image-2.1. NOT split on `edit` the way Boogu is: one checkpoint
@@ -497,6 +507,7 @@ dit_component_tag_(const std::string& cls)
 {
   if (cls == "Flux2Transformer2DModel")      { return "flux2-dit"; }
   if (cls == "Flux3Transformer2DModel")      { return "flux3-dit"; }
+  if (cls == "BriaFibo2Transformer2DModel")  { return "fibo2-dit"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2-dit"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
   if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21-dit"; }

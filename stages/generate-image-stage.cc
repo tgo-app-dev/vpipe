@@ -91,7 +91,7 @@ constexpr SpecExtra kSeedSequenceExtra[] = {
 // until it has been fetched. (Z-Image has no catalogued adapter to
 // offer.)
 constexpr std::string_view kLoraTypes =
-    "krea2-lora,flux2-lora,flux3-lora,qwen-image-21-lora";
+    "krea2-lora,flux2-lora,flux3-lora,qwen-image-21-lora,fibo2-lora";
 // Slots 3..8 here: the shared doc, plus what is true only on this stage.
 constexpr std::string_view kLoraMoreDoc =
     "one more runtime LoRA slot, read exactly as `lora2` is: applied "
@@ -109,7 +109,7 @@ const ConfigKey kAttrs[] = {
           "overrides it",
    .suggest_db = kModelRegistryDb, .suggest_db_type =
        "krea2,flux2,qwen-image,qwen-image-edit,qwen-image-21,"
-       "boogu-image,boogu-image-edit,z-image,flux3,moss-image,vosr",
+       "boogu-image,boogu-image-edit,z-image,flux3,moss-image,fibo2,vosr",
    .model_channel = "diffusion-model"},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "override DiT dir (e.g. a quantized 4/8-bit DiT); else "
@@ -121,7 +121,7 @@ const ConfigKey kAttrs[] = {
    .suggest_db = kModelRegistryDb,
    .suggest_db_type =
        "krea2-dit,flux2-dit,qwen-image-edit-dit,qwen-image-21-dit,"
-       "boogu-image-dit,z-image-dit,flux3-dit,moss-image-dit",
+       "boogu-image-dit,z-image-dit,flux3-dit,moss-image-dit,fibo2-dit",
    .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "strength", .type = ConfigType::Real, .required = false,
    .doc = "img2img strength in [0,1]; 0 (default) = text-to-image from noise "
@@ -605,7 +605,7 @@ int8_layout_bytes_(const std::string& family, const std::string& dit)
 {
   Int8LayoutBytes out;
   std::vector<std::string_view> stems;
-  if (family == "z-image") {
+  if (family == "z-image" || family == "fibo2") {
     stems = {"noise_refiner.", "layers."};
   } else if (family == "moss-image") {
     stems = {"layers."};
@@ -629,6 +629,12 @@ int8_layout_bytes_(const std::string& family, const std::string& dit)
       if (nm.rfind(std::string(st), 0) == 0) { in_stack = true; }
     }
     if (!in_stack) { continue; }
+    // Fibo 2.0's injection blocks keep their cross-attention in the
+    // trunk, off the layout: it runs once a prompt, at the text's rows.
+    if (family == "fibo2" &&
+        nm.find(".cross_attention.") != std::string::npos) {
+      continue;
+    }
     // FLUX.2's double blocks keep their TEXT stream (add_*, to_add_out,
     // ff_context) off the layout -- it runs at the prompt's rows, under
     // the int8 floor -- so it neither grows nor needs scratch; counted,
@@ -719,6 +725,15 @@ dit_floor_bytes_(const std::string& root, const std::string& dit)
     genai::MetalMossImageTransformer::Config mc;
     if (genai::MetalMossImageTransformer::Config::read_dims(dit, &mc)) {
       return genai::MetalMossImageTransformer::streaming_floor_bytes(dit);
+    }
+  }
+  // FIBO 2.0 ANSWERS FOR ITSELF: one stack under two prefixes
+  // (noise_refiner then layers), its injection blocks' cross-attention
+  // and the Perceiver held in the trunk.
+  {
+    genai::MetalFibo2Transformer::Config bc;
+    if (genai::MetalFibo2Transformer::Config::read_dims(dit, &bc)) {
+      return genai::MetalFibo2Transformer::streaming_floor_bytes(dit);
     }
   }
   // FLUX.3 ANSWERS FOR ITSELF too: its four stacks (three per-mode, one
@@ -1087,6 +1102,7 @@ constexpr const char* kWarmQi21   = "qwen-image-21-dit";
 constexpr const char* kWarmZImage = "z-image-dit";
 constexpr const char* kWarmFlux3  = "flux3-dit";
 constexpr const char* kWarmMoss   = "moss-image-dit";
+constexpr const char* kWarmFibo2  = "fibo2-dit";
 
 }  // namespace
 
@@ -1107,6 +1123,7 @@ GenerateImageStage::keep_models_warm_()
   keep_warm_dit_(kWarmZImage, _zi_dit_dir, _zi_dit, "Z-Image");
   keep_warm_dit_(kWarmFlux3, _flux3_dit_dir, _flux3_dit, "FLUX.3");
   keep_warm_dit_(kWarmMoss, _moss_dit_dir, _moss_dit, "MOSS-Image");
+  keep_warm_dit_(kWarmFibo2, _fibo2_dit_dir, _fibo2_dit, "Fibo 2.0");
 }
 
 template <class Cfg, class Spec>
@@ -1298,6 +1315,7 @@ unclaimed_class_(const std::string& transformer_dir)
                           "ZImageTransformer2DModel",
                           "Flux3Transformer2DModel",
                           "MOSSImageTransformer",
+                          "BriaFibo2Transformer2DModel",
                           "BooguImageTransformer2DModel"}) {
     if (cls == own) { return {}; }
   }
@@ -1314,6 +1332,7 @@ family_implements_sol_(const std::string& family)
 {
   return family == "krea2" || family == "flux2" ||
          family == "qwen-image-21" || family == "z-image" ||
+         family == "fibo2" ||
          family == "flux3" || family == "moss-image";
 }
 
@@ -1331,8 +1350,10 @@ latent_scale_(const std::string& family)
   // would ask for twice the picture.
   // FLUX.3 takes FLUX.2's VAE unchanged, so its cell is 16 too, and so
   // does MOSS-Image (the small decoder changes widths, not strides).
+  // Fibo 2.0 takes FLUX.2's VAE too (its own 2x patch is the same one
+  // the VAE stage's latent already carries).
   if (family == "flux2" || family == "flux3" || family == "qwen-image-21" ||
-      family == "moss-image") {
+      family == "moss-image" || family == "fibo2") {
     return 16;
   }
   return 8;
@@ -1396,6 +1417,9 @@ t2i_family_(const std::string& transformer_dir)
         // MOSS-Image: a single-stream DiT on FLUX.2's VAE; named for the
         // same reason as the rest.
         if (cls == "MOSSImageTransformer") { return "moss-image"; }
+        // Fibo 2.0: Z-Image's block around a Perceiver and injection
+        // blocks, on FLUX.2's VAE.
+        if (cls == "BriaFibo2Transformer2DModel") { return "fibo2"; }
         if (cls == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
         // Qwen-Image-2.1. A DIFFERENT network from the line above --
         // single-stream, /16 VAE, RGBA -- and named here because the
@@ -1692,7 +1716,7 @@ GenerateImageStage::reset_run_state()
   // reloading on top of a resident copy is exactly what doubles peak
   // memory.
   if (!_dit && !_flux2_dit && !_qie_dit && !_boogu_dit && !_qi21_dit &&
-      !_zi_dit && !_flux3_dit && !_moss_dit) {
+      !_zi_dit && !_flux3_dit && !_moss_dit && !_fibo2_dit) {
     _load_attempted = false;
     _dit_unloaded   = false;
     // The holding correction describes a DiT that is no longer here. A
@@ -1817,6 +1841,7 @@ GenerateImageStage::dit_resident_bytes_() const
   if (_zi_dit) { return (std::size_t)_zi_dit->resident_bytes(); }
   if (_flux3_dit) { return (std::size_t)_flux3_dit->resident_bytes(); }
   if (_moss_dit) { return (std::size_t)_moss_dit->resident_bytes(); }
+  if (_fibo2_dit) { return (std::size_t)_fibo2_dit->resident_bytes(); }
   // Krea-2, FLUX.2, Boogu and Qwen-Image-Edit keep no total of their own:
   // what their set CACHED (the trunk, and every block when preloaded --
   // held int8 layouts included, which are derived entries) plus what
@@ -1889,6 +1914,7 @@ GenerateImageStage::release_idle_slots_()
   if (_zi_dit) { (void)_zi_dit->release_idle_slots(); }
   if (_flux3_dit) { (void)_flux3_dit->release_idle_slots(); }
   if (_moss_dit) { (void)_moss_dit->release_idle_slots(); }
+  if (_fibo2_dit) { (void)_fibo2_dit->release_idle_slots(); }
   if (_boogu_dit) { (void)_boogu_dit->release_idle_slots(); }
 }
 
@@ -2003,7 +2029,8 @@ GenerateImageStage::int8_slot_bytes_(const std::string& dit) const
     stacks = {{"transformer_blocks.0.", {}}};
   } else if (fam == "krea2") {
     stacks = {{"transformer_blocks.0.", {"scale_shift_table"}}};
-  } else if (fam == "z-image") {
+  } else if (fam == "z-image" || fam == "fibo2") {
+    // Fibo 2.0's first main block is a plain one (no cross-attention).
     stacks = {{"layers.0.", {"adaLN"}}};
   } else if (fam == "moss-image") {
     stacks = {{"layers.0.", {}}};
@@ -2386,6 +2413,39 @@ GenerateImageStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
+  // FIBO 2.0's ACTIVATIONS, for FLUX.3's reason. An edit attends over
+  // the picture AND its reference (one at the picture's size, as the
+  // shipped graphs wire it), beside a ~1k-token prompt (an edit's picture
+  // alone is 576 of them). An edit graph takes its size from the
+  // reference, which no plan can see; it books the edit the shipped
+  // graphs run -- 1024^2, the model's trained area, as ane_plan_seq
+  // assumes -- rather than the presence marker: this family only edits,
+  // so the marker left every launch-time decision blind to ~1 GB.
+  // generate_fibo2_ revises it to the edit's real rows.
+  if (t2i_family_(dit) == "fibo2") {
+    genai::MetalFibo2Transformer::Config bc;
+    std::size_t bytes = model_memory::kUnknownArena;
+    const int w = _width > 0 ? _width : 1024;
+    const int h = _height > 0 ? _height : 1024;
+    if (genai::MetalFibo2Transformer::Config::read_dims(dit, &bc)) {
+      bc.i8_gemm = _i8_gemm;
+      bc.i8_tier = _i8_tier;
+      bc.sage = _sage;
+      bc.sol = _sol;
+      auto* mcm = session() != nullptr
+                      ? session()->services()->metal_compute()
+                      : nullptr;
+      bytes = genai::MetalFibo2Transformer::forward_scratch_bytes(
+          bc, 2 * (w / 16) * (h / 16), 1024,
+          dit_config_quant_bits_(dit) > 0,
+          mcm != nullptr && mcm->supports_matrix_cores());
+    }
+    for (auto& c : model_memory::scratch_claims(
+             fmt("fibo2-dit:{}", this->id())(), bytes,
+             model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
   // MOSS-Image's ACTIVATIONS, for the same reason as FLUX.3's: a
   // streamed DiT holds little beside them. Sized at the picture with a
   // 512-token prompt (the reference allows 4096; a longer prompt grows
@@ -2487,6 +2547,22 @@ GenerateImageStage::declare_resources() const
              genai::MetalMossImageTransformer::ane_runtime_bytes(
                  mc, genai::MetalMossImageTransformer::ane_plan_seq(
                          _width, _height)),
+             1, model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // Fibo 2.0's tiers are Z-Image's: the main stack's feed-forward and,
+  // with ane_qkv, its q/k/v -- a module each.
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
+      t2i_family_(dit) == "fibo2") {
+    genai::MetalFibo2Transformer::Config bc;
+    (void)genai::MetalFibo2Transformer::Config::read_dims(dit, &bc);
+    bc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+    for (auto& c : model_memory::coreml_claims(
+             ane_claim_label_(),
+             genai::MetalFibo2Transformer::ane_runtime_bytes(
+                 bc, genai::MetalFibo2Transformer::ane_plan_seq(_width,
+                                                                _height)),
              1, model_memory::kPhaseDenoise)) {
       out.push_back(std::move(c));
     }
@@ -2706,6 +2782,13 @@ GenerateImageStage::apply_model_config_()
     adapter_keys("FLUX.3", _flux3_dit != nullptr, [&](int i, float s) {
       if (_flux3_dit && _flux3_dit->lora_modules(i) > 0) {
         _flux3_dit->set_lora_scale(i, s);
+      }
+    });
+  }
+  if (_family == "fibo2") {
+    adapter_keys("Fibo 2.0", _fibo2_dit != nullptr, [&](int i, float s) {
+      if (_fibo2_dit && _fibo2_dit->lora_modules(i) > 0) {
+        _fibo2_dit->set_lora_scale(i, s);
       }
     });
   }
@@ -3092,6 +3175,7 @@ GenerateImageStage::ensure_loaded_()
       // correctly. Two already did.
       _family == "flux2" ? "FLUX.2"
       : _family == "flux3" ? "FLUX.3 Image Klein"
+      : _family == "fibo2" ? "Fibo 2.0"
       : _family == "moss-image" ? "MOSS-Image single-stream"
       : _family == "qwen-image-edit" ? "Qwen-Image-Edit MMDiT"
       : _family == "qwen-image-21" ? "Qwen-Image-2.1 single-stream"
@@ -3511,6 +3595,71 @@ GenerateImageStage::ensure_loaded_()
           "'{}'; inert", this->id(), dit_dir));
       return;
     }
+  } else if (_family == "fibo2") {
+    // An 8B DiT (16 GB bf16) beside a Qwen3-VL-4B encoder (~9 GB). The
+    // one plan_streaming() rule; VPIPE_FIBO2_STREAM overrides.
+    const auto plan = model_memory::plan_streaming(
+        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom);
+    // STREAM, THEN RETAIN; `bounded` is the tight box's.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
+    if (const char* e = std::getenv("VPIPE_FIBO2_STREAM")) {
+      stream_blocks = (std::atoi(e) != 0);
+    }
+    const bool bounded = plan.stream && stream_blocks;
+    session()->log_debug(fmt(
+        "GenerateImageStage('{}'): Fibo 2.0 footprint {} GB (others {} GB) "
+        "+ {} GB headroom vs {} GB RAM -> {}", this->id(),
+        plan.footprint >> 30, plan.others >> 30,
+        model_memory::kStreamHeadroom >> 30, phys_ram() >> 30,
+        !stream_blocks ? "PRELOAD"
+        : bounded      ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
+    _fibo2_dit_dir = dit_dir;
+    _dit_holding_dir = dit_dir;
+    _fibo2_stream = stream_blocks;
+    // THE SCHEDULE THE CHECKPOINT STATES: the dynamic shift's ends.
+    {
+      namespace fs = std::filesystem;
+      std::ifstream in(fs::path(root) / "scheduler" /
+                       "scheduler_config.json");
+      if (in) {
+        try {
+          FlexData fd = FlexData::from_json(in);
+          if (fd.is_object()) {
+            auto o = fd.as_object();
+            auto getf = [&](const char* k, double d) {
+              return o.contains(k) ? o.at(k).as_real(d) : d;
+            };
+            auto geti = [&](const char* k, int d) {
+              return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+            };
+            _fibo2_base_shift = getf("base_shift", _fibo2_base_shift);
+            _fibo2_max_shift = getf("max_shift", _fibo2_max_shift);
+            _fibo2_base_seq = geti("base_image_seq_len", _fibo2_base_seq);
+            _fibo2_max_seq = geti("max_image_seq_len", _fibo2_max_seq);
+          }
+        } catch (...) {
+        }
+      }
+    }
+    // FLUX.2's VAE (AutoencoderKLFlux2), so FLUX.2's decode peak.
+    _vae_base = flux2_vae_base_(root);
+    _release_scratch = bounded;
+    _dit_bounded = bounded;
+    if (bounded) { revise_dit_declaration_(dit_dir); }
+    if (bounded) {
+      _dit_unloaded = true;
+      session()->info(fmt(
+          "GenerateImageStage('{}'): memory-bounded -- the Fibo 2.0 DiT "
+          "loads on the first conditioning beat (block streaming on) and is "
+          "freed for the vae-decode, so it never shares the box with the "
+          "text encoder", this->id()));
+    } else if (!load_fibo2_dit_()) {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): failed to load the Fibo 2.0 DiT from "
+          "'{}'; inert", this->id(), dit_dir));
+      return;
+    }
   } else if (_family == "moss-image") {
     // A 5B DiT (9.5 GB bf16) beside a Qwen3.5-9B encoder (~18 GB). The
     // one plan_streaming() rule; VPIPE_MOSS_IMAGE_STREAM overrides.
@@ -3761,7 +3910,7 @@ GenerateImageStage::ensure_loaded_()
   // and a graph that asked for fast deserves to know which it got.
   if (_i8_gemm && _i8_tier != 0 && _family != "qwen-image-21" &&
       _family != "krea2" && _family != "flux2" && _family != "z-image" &&
-      _family != "moss-image") {
+      _family != "moss-image" && _family != "fibo2") {
     session()->warn(fmt(
         "GenerateImageStage('{}'): i8_gemm_tier is '{}' and the built-in "
         "'{}' denoiser implements only the accurate tier, which it runs",
@@ -4185,6 +4334,80 @@ GenerateImageStage::free_flux3_dit_for_decode_(int gen_w, int gen_h)
     mgr->pool_weights(_flux3_dit_dir);
   }
   _flux3_dit.reset();
+  _dit_unloaded = true;
+}
+
+bool
+GenerateImageStage::load_fibo2_dit_()
+{
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr || _fibo2_dit_dir.empty()) { return false; }
+  genai::MetalFibo2Transformer::Config cfg;
+  if (!genai::MetalFibo2Transformer::Config::read_dims(_fibo2_dit_dir,
+                                                       &cfg)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): '{}' does not hold a "
+        "BriaFibo2Transformer2DModel config this build runs", this->id(),
+        _fibo2_dit_dir));
+    return false;
+  }
+  cfg.i8_gemm = _i8_gemm;
+  cfg.i8_tier = _i8_tier;
+  cfg.i8_hold_w4 = _i8_hold_w4;
+  cfg.sage = _sage;
+  cfg.sol = _sol;
+  cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  cfg.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  using Dit = genai::MetalFibo2Transformer;
+  if (cfg.ane_ffn &&
+      !ane_granted_(
+          Dit::ane_runtime_bytes(cfg, Dit::ane_plan_seq(_width, _height)),
+          "Fibo 2.0")) {
+    cfg.ane_ffn = false;
+    cfg.ane_qkv = false;
+  }
+  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
+                                            0);
+  cfg.ane_layers = (int)genai::accel::integer(&_accel,
+                                              genai::accel::kAneLayers, 0);
+  const auto loras = lora_specs_<Dit::LoraSpec>();
+  _fibo2_dit = take_warm_dit_<Dit>(kWarmFibo2, _fibo2_dit_dir,
+                                   warm_key_(cfg, _fibo2_stream, loras),
+                                   "Fibo 2.0");
+  if (_fibo2_dit) { return true; }
+  _fibo2_dit = Dit::load(weight_set_(_fibo2_dit_dir), mc, cfg, _fibo2_stream,
+                         loras);
+  if (_fibo2_dit && _fibo2_stream) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Fibo 2.0 DiT streaming its {} blocks; "
+        "the resident set grows as the box allows", this->id(),
+        _fibo2_dit->config().n_blocks()));
+  }
+  return (bool)_fibo2_dit;
+}
+
+void
+GenerateImageStage::free_fibo2_dit_for_decode_(int gen_w, int gen_h)
+{
+  if (!_fibo2_dit) { return; }
+  auto* mc = session() ? session()->services()->metal_compute() : nullptr;
+  if (mc == nullptr) { return; }
+  const std::size_t peak =
+      flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+  // SETTLED: the last forward's scratch is still on its way back to the
+  // system when this runs.
+  const std::size_t budget =
+      mc->memory_budget_settled().available_physical;
+  if (peak <= budget) { return; }
+  session()->info(fmt(
+      "GenerateImageStage('{}'): freeing the Fibo 2.0 DiT before a {}x{} "
+      "decode ({} MB wanted, {} MB free)", this->id(), gen_w, gen_h,
+      peak >> 20, budget >> 20));
+  publish_decode_arena_(peak);
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->pool_weights(_fibo2_dit_dir);
+  }
+  _fibo2_dit.reset();
   _dit_unloaded = true;
 }
 
@@ -5286,6 +5509,37 @@ GenerateImageStage::generate_qwen_image21_(
     return {};
   }
 
+  // ---- the NEGATIVE's joint sequence --------------------------------
+  //
+  // A sequence of its own, as the reference's is: its own mask (its text
+  // is another length, its image slots at other rows) with the same
+  // target slots appended, over the SAME image blocks -- so the latents
+  // are shared and only the text rows and positions differ.
+  const bool cfg = !txt_neg.empty() && n_real_neg > 0 &&
+                   _guidance_scale != 1.0;
+  genai::qi21::Layout lay_neg;
+  if (cfg) {
+    std::vector<std::uint8_t> nslot = _qi21_slots_neg;
+    if ((int)nslot.size() != n_real_neg) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): the NEGATIVE conditioning beat carries "
+          "a slot mask of {} for {} rows -- wire a qwen-image-21 "
+          "conditioner's oport1", this->id(), (int)nslot.size(),
+          n_real_neg));
+      return {};
+    }
+    nslot.insert(nslot.end(), (std::size_t)(img_seq / 4), 1);
+    if (!genai::qi21::build_layout(nslot, {}, blocks, &lay_neg, &lerr)) {
+      // Most often a negative encoded without the references the
+      // positive was (another conditioner, or none of its pictures).
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): the negative's joint sequence does not "
+          "add up: {} -- the negative must be encoded with the positive's "
+          "references", this->id(), lerr));
+      return {};
+    }
+  }
+
   // ---- schedule ------------------------------------------------------
   // FlowMatchEulerDiscreteScheduler as the CHECKPOINT configures it (see
   // qi21_checkpoint_schedule): the base model shifts linspace(1, 1/S, S)
@@ -5386,8 +5640,6 @@ GenerateImageStage::generate_qwen_image21_(
   }
   const std::size_t tgt_off = (std::size_t)(lay.image_len - img_seq) * IC;
 
-  const bool cfg = !txt_neg.empty() && n_real_neg > 0 &&
-                   _guidance_scale != 1.0;
   const float gscale = (float)_guidance_scale;
   bool dit_ok = true;
   UiProgress bar = session()->open_progress("denoise");
@@ -5435,19 +5687,21 @@ GenerateImageStage::generate_qwen_image21_(
   // The cache is on unless the graph's model-config turned it off. It
   // is exact rather than approximate, so there is no quality reason to
   // want it off -- the key exists for A/B and for the equivalence test.
-  const bool use_kv = _qi21_use_kv_cache && lay.prefix_len > 0;
+  // Each sequence decides for itself: its prefix is its own.
+  auto use_kv = [&](const genai::qi21::Layout& L) {
+    return _qi21_use_kv_cache && L.prefix_len > 0;
+  };
   int step_i = 0;
 
-  auto run = [&](const SharedBuffer& txt, int rows,
+  auto run = [&](const SharedBuffer& txt, const genai::qi21::Layout& L,
                  genai::MetalQwenImage21Transformer::KvCache* kv, float sigma)
       -> SharedBuffer {
-    (void)rows;
     genai::MetalQwenImage21Transformer::Request req;
     req.latents = &latbuf;
     req.txt = &txt;
-    req.layout = &lay;
+    req.layout = &L;
     req.timestep = sigma;
-    if (use_kv) {
+    if (use_kv(L)) {
       req.kv = kv;
       req.kv_mode = step_i == 0
           ? genai::MetalQwenImage21Transformer::KvMode::kFill
@@ -5476,7 +5730,7 @@ GenerateImageStage::generate_qwen_image21_(
     for (std::size_t k = 0; k < cand.size(); ++k) {
       lb[tgt_off + k] = f32_to_bf16_(cand[k]);
     }
-    SharedBuffer v = run(txt_pos, n_real, &kv_pos, (float)sigma);
+    SharedBuffer v = run(txt_pos, lay, &kv_pos, (float)sigma);
     if (!dit_ok || v.empty()) { return {}; }
     std::vector<float> out((std::size_t)img_seq * IC);
     const auto* vp = static_cast<const std::uint16_t*>(v.contents());
@@ -5485,7 +5739,7 @@ GenerateImageStage::generate_qwen_image21_(
     }
     prog.end_forward();
     if (cfg) {
-      SharedBuffer nv = run(txt_neg, n_real_neg, &kv_neg, (float)sigma);
+      SharedBuffer nv = run(txt_neg, lay_neg, &kv_neg, (float)sigma);
       if (!dit_ok || nv.empty()) { return {}; }
       const auto* np = static_cast<const std::uint16_t*>(nv.contents());
       for (std::size_t k = 0; k < out.size(); ++k) {
@@ -5533,9 +5787,12 @@ GenerateImageStage::generate_qwen_image21_(
       std::chrono::steady_clock::now() - t0).count();
   session()->info(fmt(
       "GenerateImageStage('{}'): Qwen-Image-2.1 latent generated in {:.2f}s "
-      "({} steps, joint {}, prefix {}{})", this->id(), secs, S,
+      "({} steps, joint {}, prefix {}{}{})", this->id(), secs, S,
       lay.joint_len, lay.prefix_len,
-      use_kv ? ", prefix KV cached" : ""));
+      cfg ? fmt("; negative joint {}, prefix {}", lay_neg.joint_len,
+                lay_neg.prefix_len)()
+          : std::string{},
+      use_kv(lay) ? ", prefix KV cached" : ""));
   return unpack(packed);
 }
 
@@ -5780,6 +6037,263 @@ GenerateImageStage::generate_z_image_(
       sched.shift,
       cfg ? "cfg " + std::to_string(_zi_guidance) : std::string("no cfg")));
   return unpack(packed);
+}
+
+// Fibo 2.0: the reference pipeline's loop (pipeline_bria_fibo2.py,
+// BriaFibo2Pipeline.__call__), where a bit matters:
+//   * the schedule: sigmas linspace(1, 1/S, S), shifted by
+//     calculate_shift(the image's tokens) exactly as FlowMatchEuler forms
+//     it -- in f32, NumPy's scalars narrowed to the array's type;
+//   * the DiT handed (sigma * 1000) / 1000, the scheduler's own round trip;
+//   * the noise: torch.randn((1, 32, H/8, W/8)) from a CPU generator
+//     seeded with the seed, f32, CHANNEL-major, then patched;
+//   * f32 Euler on the patch rows (elementwise, so the order is free);
+//   * the pictures to edit: vae-encode's normalized [128, h, w] latent
+//     IS this model's patch rows ((channel, dy, dx), FLUX.2's patchify),
+//     token-major, in bf16 as the pipeline casts them.
+// No guidance: the distilled edit model runs at 1.0.
+std::vector<float>
+GenerateImageStage::generate_fibo2_(
+    const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+    int gen_w, const std::vector<RefLatent>& refs,
+    const std::vector<float>* init_packed,
+    const std::function<void(const std::vector<float>&)>& emit_step) const
+{
+  auto* mc = session()->services()->metal_compute();
+  using metal_compute::SharedBuffer;
+  if (mc == nullptr || !_fibo2_dit) { return {}; }
+  const auto& dcfg = _fibo2_dit->config();
+  const int PD = dcfg.patch_dim();             // 128
+  const int LC = dcfg.in_channels;             // 32
+  if ((gen_h % 16) != 0 || (gen_w % 16) != 0 || gen_h <= 0 || gen_w <= 0) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): Fibo 2.0 needs a size that is a multiple "
+        "of 16 (got {}x{})", this->id(), gen_w, gen_h));
+    return {};
+  }
+  const int gh = gen_h / 16, gw = gen_w / 16;
+  const int img_seq = gh * gw;
+  std::string terr;
+  if (!_fibo2_dit->set_text(text, n_rows, &terr)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the Fibo 2.0 DiT wants [6, rows, {}] bf16 "
+        "conditioning (the diffusion-conditioner's fibo2 family): {}",
+        this->id(), dcfg.cap_dim, terr));
+    return {};
+  }
+
+  // ---- the pictures to edit, as patch rows after the image's ----------
+  std::vector<std::pair<int, int>> grids;
+  std::vector<const RefLatent*> used;
+  for (const RefLatent& r : refs) {
+    if (r.empty()) { continue; }
+    if (r.c != PD) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): a reference latent has {} channels, the "
+          "Fibo 2.0 DiT takes {} (FLUX.2's VAE through vae-encode); ignoring "
+          "it", this->id(), r.c, PD));
+      continue;
+    }
+    if ((int)used.size() >= genai::fibo2::kMaxImages) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): Fibo 2.0 edits at most {} pictures; "
+          "ignoring the rest", this->id(), genai::fibo2::kMaxImages));
+      break;
+    }
+    grids.emplace_back(r.h, r.w);
+    used.push_back(&r);
+  }
+  genai::fibo2::Layout lay;
+  {
+    std::string lerr;
+    if (!genai::fibo2::build_layout(gh, gw, grids, _fibo2_dit->gist_count(),
+                                    dcfg.max_gist, &lay, &lerr)) {
+      session()->warn(fmt("GenerateImageStage('{}'): Fibo 2.0 layout: {}",
+                          this->id(), lerr));
+      return {};
+    }
+  }
+  SharedBuffer latbuf =
+      mc->make_shared_buffer((std::size_t)lay.refiner_len() * PD * 2);
+  if (latbuf.empty()) { return {}; }
+  {
+    auto* d = static_cast<std::uint16_t*>(latbuf.contents()) +
+              (std::size_t)img_seq * PD;
+    for (const RefLatent* r : used) {
+      for (int y = 0; y < r->h; ++y) {
+        for (int x = 0; x < r->w; ++x) {
+          const std::size_t t = (std::size_t)y * r->w + x;
+          for (int c = 0; c < PD; ++c) {
+            d[t * PD + c] = f32_to_bf16_(
+                r->chw[((std::size_t)c * r->h + y) * r->w + x]);
+          }
+        }
+      }
+      d += (std::size_t)r->h * r->w * PD;
+    }
+  }
+  if (!used.empty()) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Fibo 2.0 editing {} picture(s)",
+        this->id(), used.size()));
+  }
+
+  // ---- the schedule ------------------------------------------------------
+  const int S = _scheduler_latched && _scheduler_spec.steps > 0
+                    ? _scheduler_spec.steps
+                    : (_steps_set ? _steps : _fibo2_steps);
+  if (S <= 0) { return {}; }
+  std::vector<float> sig((std::size_t)S + 1, 0.0f);
+  double mu = 0.0;
+  {
+#pragma clang fp contract(off)
+    const double m = (_fibo2_max_shift - _fibo2_base_shift) /
+                     (double)(_fibo2_max_seq - _fibo2_base_seq);
+    const double b = _fibo2_base_shift - m * (double)_fibo2_base_seq;
+    mu = (double)img_seq * m + b;
+    const float e = (float)std::exp(mu);
+    // np.linspace(1.0, 1 / S, S) in f64 -- start + k * step, the last
+    // node the stop itself -- then .astype(f32).
+    const double lo = 1.0 / (double)S;
+    const double step = S > 1 ? (lo - 1.0) / (double)(S - 1) : 0.0;
+    for (int k = 0; k < S; ++k) {
+      const double v = (k == S - 1 && S > 1) ? lo : 1.0 + (double)k * step;
+      const float t = (float)v;
+      const float q = 1.0f / t - 1.0f;
+      sig[(std::size_t)k] = e / (e + q);
+    }
+  }
+
+  // ---- the noise ---------------------------------------------------------
+  std::vector<float> x((std::size_t)img_seq * PD);
+  {
+    genai::TorchCpuRandn rng((std::uint64_t)_seed);
+    const std::vector<float> z = rng.randn(x.size());
+    if (z.size() != x.size()) { return {}; }
+    genai::fibo2::pack_latents(z.data(), LC, 2 * gh, 2 * gw, dcfg.patch,
+                               x.data());
+  }
+  if (init_packed != nullptr && init_packed->size() == x.size()) {
+    x = *init_packed;                  // supplied (repro / golden)
+  }
+
+  UiProgress bar = session()->open_progress("denoise");
+  DenoiseProgress prog(&bar, S, 1);
+  ScopedBlockProgress<std::remove_reference_t<decltype(*_fibo2_dit)>>
+      prog_guard(_fibo2_dit.get(), prog);
+
+  // ---- how much of the stack this run may KEEP --------------------------
+  if (_fibo2_dit->streaming()) {
+    const std::size_t peak =
+        flux2_decode_peak_(gen_w, gen_h, _vae_base > 0 ? _vae_base : 128);
+    const auto mb = mc->memory_budget();
+    const bool decode_runs_beside_us =
+        mb.recommended == 0 || (mb.fits(peak) && mb.fits_physical(peak));
+    _fibo2_dit->set_residency_reserve(decode_runs_beside_us ? peak : 0);
+    _fibo2_dit->set_residency_schedule(S);
+  }
+
+  bool ane_checked = false;
+  X0Tap tap;
+  // Patch rows -> [128, gh, gw]: FLUX.2's patchified latent, channel f
+  // = c * 4 + dy * 2 + dx, which vae-decode takes as it comes.
+  auto unpack = [&](const std::vector<float>& pk) {
+    std::vector<float> latent((std::size_t)PD * gh * gw);
+    for (int i = 0; i < gh; ++i) {
+      for (int j = 0; j < gw; ++j) {
+        const std::size_t t = (std::size_t)i * gw + j;
+        for (int c = 0; c < PD; ++c) {
+          latent[((std::size_t)c * gh + i) * gw + j] = pk[t * PD + c];
+        }
+      }
+    }
+    return latent;
+  };
+
+  // The forward's activations at the geometry this edit really has. An
+  // edit graph takes its size from the reference, so declare_resources()
+  // booked a 1024^2 edit; this is the real one (MEASURED: one forward's
+  // peak allocation within 0.1% of the figure,
+  // fibo2_dit.a_forward_allocates_what_the_plan_books). revise_scratch()
+  // refuses to create: a no-op with no plan.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(
+        fmt("fibo2-dit:{}", this->id())(),
+        genai::MetalFibo2Transformer::forward_scratch_bytes(
+            dcfg, lay.refiner_len(), n_rows, _fibo2_dit->quant_bits() > 0,
+            mc->supports_matrix_cores()));
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int k = 0; k < S; ++k) {
+    tap.arm(_preview && _preview->due(k + 1, S));
+    {
+      auto* lb = static_cast<std::uint16_t*>(latbuf.contents());
+      for (std::size_t i = 0; i < x.size(); ++i) {
+        lb[i] = f32_to_bf16_(x[i]);
+      }
+    }
+    genai::MetalFibo2Transformer::Request req;
+    req.latents = &latbuf;
+    req.layout = &lay;
+    {
+#pragma clang fp contract(off)
+      // timesteps = sigmas * 1000; the pipeline hands t / 1000.
+      const float tt = sig[(std::size_t)k] * 1000.0f;
+      req.timestep = tt / 1000.0f;
+    }
+    std::string e;
+    SharedBuffer v = _fibo2_dit->forward(req, &e);
+    prog.end_forward();
+    if (!ane_checked && _fibo2_dit->ane_attempted()) {
+      ane_checked = true;
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->revise_scratch(
+            "coreml:" + ane_claim_label_(),
+            _fibo2_dit->ane_armed()
+                ? genai::MetalFibo2Transformer::ane_runtime_bytes(
+                      dcfg, lay.joint_len())
+                : 0);
+      }
+    }
+    if (v.empty()) {
+      // A cooperative stop comes back empty with NO reason.
+      if (!e.empty()) {
+        session()->warn(fmt("GenerateImageStage('{}'): Fibo 2.0 forward "
+                            "failed: {}", this->id(), e));
+      }
+      return {};
+    }
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    std::vector<float> vel(x.size());
+    for (std::size_t i = 0; i < vel.size(); ++i) {
+      vel[i] = bf16_to_f32_(vp[i]);
+    }
+    tap.take(x, sig[(std::size_t)k], vel);
+    {
+#pragma clang fp contract(off)
+      const float dt = sig[(std::size_t)k + 1] - sig[(std::size_t)k];
+      for (std::size_t i = 0; i < x.size(); ++i) { x[i] += dt * vel[i]; }
+    }
+    if (emit_step) { emit_step(unpack(x)); }
+    if (tap.ready()) {
+      // taef2 reads FLUX.2's latent unpatchified and NOT un-normalized --
+      // the space this one is in.
+      std::vector<float> lat((std::size_t)LC * 2 * gh * 2 * gw);
+      genai::fibo2::unpack_latents(tap.x0.data(), LC, 2 * gh, 2 * gw,
+                                   dcfg.patch, lat.data());
+      _preview->submit(std::move(lat), LC, 1, 2 * gh, 2 * gw, k + 1, S);
+    }
+    prog.end_step(k);
+  }
+  const double secs = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  session()->info(fmt(
+      "GenerateImageStage('{}'): Fibo 2.0 latent generated in {:.2f}s ({} "
+      "steps, mu {:.3f}, {} text rows -> {} gist, {} image + {} context "
+      "rows)", this->id(), secs, S, mu, n_rows, lay.gist, img_seq,
+      lay.ctx_tokens));
+  return unpack(x);
 }
 
 // FLUX.3 Image Klein: the flow map's own loop.
@@ -7193,6 +7707,29 @@ GenerateImageStage::process(RuntimeContext& ctx)
       }
     }
   }
+  // And the NEGATIVE's own mask, off its own beat: the two prompts are
+  // two sequences, and laying the negative out with the positive's mask
+  // reads its rows at the wrong places (or past its end).
+  _qi21_slots_neg.clear();
+  if (_family == "qwen-image-21") {
+    const auto* ntb =
+        _neg_beat ? dynamic_cast<const TensorBeatPayload*>(_neg_beat.get())
+                  : nullptr;
+    if (ntb != nullptr && ntb->sideband.is_object()) {
+      FlexData sb = ntb->sideband;        // as_object() is a view: keep it
+      auto o = sb.as_object();
+      if (o.contains(genai::cond_sideband::kImgSlots)) {
+        const FlexData f = o.at(genai::cond_sideband::kImgSlots);
+        if (f.is_array()) {
+          auto a = f.as_array();
+          _qi21_slots_neg.reserve(a.size());
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            _qi21_slots_neg.push_back(a.at(i).as_int(0) != 0 ? 1 : 0);
+          }
+        }
+      }
+    }
+  }
   // A prior generation may have freed the FLUX.2 DiT to make room for the
   // vae-decode on a memory-bounded box; reload it now a new prompt arrived.
   if (_family == "flux2" && _dit_unloaded && !_flux2_dit) {
@@ -7225,6 +7762,12 @@ GenerateImageStage::process(RuntimeContext& ctx)
         "prompt", this->id()));
     if (load_z_image_dit_()) { _dit_unloaded = false; }
   }
+  if (_family == "fibo2" && _dit_unloaded && !_fibo2_dit) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): reloading the Fibo 2.0 DiT for the next "
+        "prompt", this->id()));
+    if (load_fibo2_dit_()) { _dit_unloaded = false; }
+  }
   if (_family == "flux3" && _dit_unloaded && !_flux3_dit) {
     session()->info(fmt(
         "GenerateImageStage('{}'): reloading the FLUX.3 DiT for the next "
@@ -7250,6 +7793,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
       : _family == "qwen-image-21" ? (bool)_qi21_dit
       : _family == "z-image" ? (bool)_zi_dit
       : _family == "flux3" ? (bool)_flux3_dit
+      : _family == "fibo2" ? (bool)_fibo2_dit
       : _family == "moss-image" ? (bool)_moss_dit
       : _family == "vosr" ? (bool)_vosr
       : (bool)_dit;
@@ -7965,6 +8509,58 @@ GenerateImageStage::process(RuntimeContext& ctx)
   // ---- FLUX.3: text (+ references) -> the flow map's 16 steps ->
   // [128, H/16, W/16], FLUX.2's VAE's own latent, which vae-decode takes
   // unchanged. ----
+  if (_family == "fibo2") {
+    // The conditioner's beat is [6, rows, 3 x hidden]: rows are its
+    // second axis, not its first.
+    if (ctb->shape.size() != 3 ||
+        ctb->shape[0] != _fibo2_dit->config().n_bundles() ||
+        ctb->shape[2] != _fibo2_dit->config().cap_dim ||
+        ctb->dtype != TensorBeat::DType::Bf16) {
+      session()->warn(fmt(
+          "GenerateImageStage('{}'): Fibo 2.0 wants the diffusion-"
+          "conditioner's fibo2 conditioning, [{}, rows, {}] bf16; dropping "
+          "beat", this->id(), _fibo2_dit->config().n_bundles(),
+          _fibo2_dit->config().cap_dim));
+      co_return;
+    }
+    const int rows = (int)ctb->shape[1];
+    const int PD = _fibo2_dit->config().patch_dim();
+    std::vector<RefLatent> frefs;
+    for (const RefLatent& r : _ref) { frefs.push_back(r); }
+    _fibo2_dit->set_stream_stop(stopping);
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         0.0, 0);
+    const int lh = gen_h / 16, lw = gen_w / 16;
+    const std::vector<float> fl =
+        generate_fibo2_(cond, rows, gen_h, gen_w, frefs, init_ptr,
+                        step_emitter({PD, lh, lw}));
+    _fibo2_dit->set_stream_stop({});
+    if (fl.empty()) {
+      session()->info(fmt(
+          "GenerateImageStage('{}'): Fibo 2.0 generation {}; dropping beat",
+          this->id(), ctx.stop_requested() ? "stopped" : "failed"));
+      co_return;
+    }
+    auto out = std::make_unique<TensorBeatPayload>();
+    out->dtype = TensorBeat::DType::F32;
+    out->shape = {PD, lh, lw};
+    out->resize_contiguous(fl.size());
+    std::memcpy(out->as_f32(), fl.data(), fl.size() * sizeof(float));
+    tag_output_(*out);
+    ++_latents_emitted;
+    session()->info(fmt(
+        "GenerateImageStage('{}'): Fibo 2.0 latent [{}, {}, {}] @ {}x{}",
+        this->id(), PD, lh, lw, gen_w, gen_h));
+    release_idle_slots_();
+    correct_dit_holding_("after a generation");
+    if (_release_scratch && _fibo2_dit) {
+      _fibo2_dit->release_forward_scratch();
+    }
+    free_fibo2_dit_for_decode_(gen_w, gen_h);
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
+
   if (_family == "flux3") {
     const int C3 = _flux3_dit->config().in_channels;
     std::vector<RefLatent> frefs;

@@ -5186,6 +5186,92 @@ const STRINGS = {
       + '+lora .. +lora8 與它們的強度，+preview_vae 與它的選項}，供 '
       + 'generate-image 的 model_config 輸入埠使用'],
 
+  // ---- Fibo 2.0 Model Config (model-specific-config) ----
+  'stage.fibo2-model-config.name': ['',
+      'Fibo 2.0 模型配置',
+      'Fibo 2.0 模型設定'],
+  'stage.fibo2-model-config.doc': ['',
+      '源：Fibo 2.0 的专属参数——编辑时 Qwen3-VL 所读图片的尺寸界限、运行时 '
+      + 'LoRA 槽位和实时预览。普通运行一个都不需要。发一个节拍即结束；若接了 '
+      + 'trigger 输入端口，则每收到一个节拍发一次。',
+      '來源：Fibo 2.0 的專屬參數——編輯時 Qwen3-VL 所讀圖片的尺寸界限、執行'
+      + '階段 LoRA 槽位和即時預覽。一般執行一個都不需要。發一個節拍即結束；'
+      + '若接了 trigger 輸入埠，則每收到一個節拍發一次。'],
+  'cfg.fibo2-model-config.vl_long_edge': ['',
+      '编辑：Qwen3-VL 看到的待编辑图片的最长边，按参考管线的方式生成缩略图'
+      + '（双三次插值、保持宽高比、从不放大）；VAE 使用图片本身。未设置 => '
+      + '本模型族自己的 768',
+      '編輯：Qwen3-VL 看到的待編輯圖片的最長邊，按參考管線的方式產生縮圖'
+      + '（雙三次插值、保持寬高比、從不放大）；VAE 使用圖片本身。未設定 => '
+      + '本模型族自己的 768'],
+  'cfg.fibo2-model-config.vl_min_pixels': ['',
+      '编辑：图像处理器对缩略图像素数的下界（不足时会放大到该值）。未设置 '
+      + '=> 检查点自己的 3136',
+      '編輯：影像處理器對縮圖像素數的下界（不足時會放大到該值）。未設定 '
+      + '=> 檢查點自己的 3136'],
+  'cfg.fibo2-model-config.vl_max_pixels': ['',
+      '编辑：图像处理器对缩略图像素数的上界。未设置 => 检查点自己的 1605632',
+      '編輯：影像處理器對縮圖像素數的上界。未設定 => 檢查點自己的 1605632'],
+  'cfg.fibo2-model-config.lora': ['',
+      '在运行时生效的 LoRA——每个被适配的投影计算 W x + scale * B (A x)。可'
+      + '以是一个已注册的模型、一个含单个 .safetensors 的目录，或指向该文件'
+      + '的路径。模块名采用检查点自身的写法（noise_refiner.N.attention.'
+      + 'to_q、layers.N.feed_forward.w1 等），可以带 `diffusion_model.` 或 '
+      + '`transformer.` 前缀；为其他模型准备的适配器一个都绑不上，并会明确'
+      + '报告。加载时生效：在 DiT 构建之前读取，之后再改的节拍只会被报告并'
+      + '忽略（强度仍可实时调整）',
+      '在執行階段生效的 LoRA——每個被套用的投影計算 W x + scale * B (A x)。'
+      + '可以是一個已註冊的模型、一個含單個 .safetensors 的目錄，或指向該檔'
+      + '案的路徑。模組名採用檢查點自身的寫法（noise_refiner.N.attention.'
+      + 'to_q、layers.N.feed_forward.w1 等），可以帶 `diffusion_model.` 或 '
+      + '`transformer.` 前綴；為其他模型準備的轉接器一個都綁不上，並會明確'
+      + '報告。載入時生效：在 DiT 建構之前讀取，之後再改的節拍只會被報告並'
+      + '忽略（強度仍可即時調整）'],
+  'cfg.fibo2-model-config.lora_scale': ['',
+      '适配器强度，按每次前向生效：可实时调整，无需重新加载即可扫参。1.0 '
+      + '= 与训练时一致；0 会跳过两个适配器 GEMM，所以关掉就是真的关掉',
+      '轉接器強度，按每次前向生效：可即時調整，無需重新載入即可掃參。1.0 '
+      + '= 與訓練時一致；0 會跳過兩個轉接器 GEMM，所以關掉就是真的關掉'],
+  'cfg.fibo2-model-config.preview_vae': ['',
+      '可选：用于实时预览的小型自编码器（TAE）。Fibo 2.0 用的是 FLUX.2 的 '
+      + 'VAE，所以 FLUX.2 的 TAE（madebyollin 的 taef2）可原样预览它。每走'
+      + '完一个去噪步，模型对成片的干净估计会由它解码，写到去噪阶段的 '
+      + '`preview` 输出端口。留空（默认）即关闭预览——那时什么都不加载、不'
+      + '解码',
+      '可選：用於即時預覽的小型自編碼器（TAE）。Fibo 2.0 用的是 FLUX.2 的 '
+      + 'VAE，所以 FLUX.2 的 TAE（madebyollin 的 taef2）可原樣預覽它。每走'
+      + '完一個去噪步，模型對成片的乾淨估計會由它解碼，寫到去噪階段的 '
+      + '`preview` 輸出埠。留空（預設）即關閉預覽——那時什麼都不載入、不'
+      + '解碼'],
+  'cfg.fibo2-model-config.preview_every': ['',
+      '每 N 个去噪步渲染一次预览；最后一步总会渲染。解码在单独的线程上进'
+      + '行，绝不让生成等待。它与去噪共用 GPU，所以 N 越大，还给去噪的 GPU '
+      + '时间越多。填 0 即关闭预览',
+      '每 N 個去噪步渲染一次預覽；最後一步總會渲染。解碼在單獨的執行緒上進'
+      + '行，絕不讓生成等待。它與去噪共用 GPU，所以 N 越大，還給去噪的 GPU '
+      + '時間越多。填 0 即關閉預覽'],
+  'cfg.fibo2-model-config.preview_max_edge': ['',
+      '预览画面的最长边（像素）；解码出的画面会按整数倍做盒式缩小，直到放'
+      + '得下。填 0 即按解码原样发送',
+      '預覽畫面的最長邊（像素）；解碼出的畫面會按整數倍做盒式縮小，直到放'
+      + '得下。填 0 即按解碼原樣傳送'],
+  'port.fibo2-model-config.trigger': ['',
+      '可选的节拍，用于控制何时重新发出配置（chrono 滴答、提示词源、反馈回'
+      + '路等）。负载内容不限——收到本身就是信号。未接时，本阶段每次运行只发'
+      + '一次',
+      '可選的節拍，用於控制何時重新發出設定（chrono 滴答、提示詞來源、回饋'
+      + '迴路等）。負載內容不限——收到本身就是訊號。未接時，本階段每次執行只'
+      + '發一次'],
+  'port.fibo2-model-config.model_config': ['',
+      'Fibo 2.0 参数，作为一个 FlexData 对象 {model_family: fibo2, '
+      + '+vl_long_edge / vl_min_pixels / vl_max_pixels，+lora .. +lora8 与'
+      + '它们的强度，+preview_vae 与它的选项}，供 generate-image 或 '
+      + 'diffusion-conditioner 的 model_config 输入端口使用',
+      'Fibo 2.0 參數，作為一個 FlexData 物件 {model_family: fibo2, '
+      + '+vl_long_edge / vl_min_pixels / vl_max_pixels，+lora .. +lora8 與'
+      + '它們的強度，+preview_vae 與它的選項}，供 generate-image 或 '
+      + 'diffusion-conditioner 的 model_config 輸入埠使用'],
+
   // ---- MOSS-Image Model Config (model-specific-config) ----
   'stage.moss-image-model-config.name': ['',
       'MOSS-Image 模型配置',
@@ -6710,19 +6796,17 @@ const STRINGS = {
       '要求模型思考多少："xhigh"、"medium" 或 "low"。这是 Qwen3.8 聊天模板'
       + '里的控制项——它会在系统回合前加上一段指令（启用工具时并入 tools 回'
       + '合），文本与官方模板逐字一致。"medium" 就是不加指令的渲染结果，正'
-      + '如参考实现所定义，因此它什么都不输出。留空（默认）同样什么都不输出'
-      + '，这也是此前每个 Qwen3 版本的行为——参考实现自己的默认值是 "xhigh"'
-      + '，但 vpipe 无法把 3.8 的检查点与 3.5/3.6 区分开（三者都声明 '
-      + 'model_type 为 "qwen3_5"），因此 xhigh 需要显式选择而不是默认假定。'
-      + '关闭思考时，或模型族没有推理力度这一概念时，本项会被忽略并给出警告',
+      + '如参考实现所定义，因此它什么都不输出。留空（默认）时，若检查点自身'
+      + '的聊天模板带有该控制项（Qwen3.8），即为 "medium"（参考实现自己的默'
+      + '认值是 "xhigh"）。关闭思考时，或检查点的模板没有这一控制项时'
+      + '（Qwen3.5/3.6），本项会被忽略并给出警告',
       '要求模型思考多少："xhigh"、"medium" 或 "low"。這是 Qwen3.8 聊天範本'
       + '裡的控制項——它會在系統回合前加上一段指令（啟用工具時併入 tools 回'
       + '合），文字與官方範本逐字一致。"medium" 就是不加指令的算繪結果，正'
-      + '如參考實作所定義，因此它什麼都不輸出。留空（預設）同樣什麼都不輸出'
-      + '，這也是此前每個 Qwen3 版本的行為——參考實作自己的預設值是 "xhigh"'
-      + '，但 vpipe 無法把 3.8 的檢查點與 3.5/3.6 區分開（三者都宣告 '
-      + 'model_type 為 "qwen3_5"），因此 xhigh 需要明確選擇而不是預設假定。'
-      + '關閉思考時，或模型族沒有推理力度這一概念時，本項會被忽略並給出警告'],
+      + '如參考實作所定義，因此它什麼都不輸出。留空（預設）時，若檢查點自身'
+      + '的聊天範本帶有該控制項（Qwen3.8），即為 "medium"（參考實作自己的預'
+      + '設值是 "xhigh"）。關閉思考時，或檢查點的範本沒有這一控制項時'
+      + '（Qwen3.5/3.6），本項會被忽略並給出警告'],
   'cfg.text-chat.enable_tools': ['',
       '启用 MCP 工具调用：向模型公布内置工具（get_current_time），执行模型'
       + '发出的任何 <tool_call>，并把结果回灌以进行下一轮解码（仅限 ChatML/'
@@ -6812,12 +6896,14 @@ const STRINGS = {
       '用于解码的 DFlash / DFlash 2 块起草器（模型库键名或其目录）：一个依据'
       + '目标模型隐藏状态一次起草一整块 token 的小模型，再由模型在一次前向中'
       + '验证——例如 incoai 的 Qwen3.8-27B-DFlash2 搭配 mlx-community 的 '
-      + 'Qwen3.8-27B-4bit。贪心输出就是模型自己的贪心输出（采样时即其逐位置'
+      + 'Qwen3.8-27B-4bit，其 Qwen3.8-Flash-Next-DFlash2 搭配 '
+      + 'Qwen3.8-Flash-Next。贪心输出就是模型自己的贪心输出（采样时即其逐位置'
       + '的采样结果）；只影响性能。设置后取代 mtp。留空：不使用',
       '用於解碼的 DFlash / DFlash 2 區塊起草器（模型庫鍵名或其目錄）：一個'
       + '依據目標模型隱藏狀態一次起草一整塊 token 的小模型，再由模型在一次前'
       + '向中驗證——例如 incoai 的 Qwen3.8-27B-DFlash2 搭配 mlx-community 的 '
-      + 'Qwen3.8-27B-4bit。貪婪輸出就是模型自己的貪婪輸出（取樣時即其逐位置'
+      + 'Qwen3.8-27B-4bit，其 Qwen3.8-Flash-Next-DFlash2 搭配 '
+      + 'Qwen3.8-Flash-Next。貪婪輸出就是模型自己的貪婪輸出（取樣時即其逐位置'
       + '的取樣結果）；只影響效能。設定後取代 mtp。留空：不使用'],
   'cfg.text-chat.draft_block_size': ['',
       '每轮 DFlash 验证的 token 数（锚点 + 草稿，从 2 到起草器训练时的块大'
@@ -7071,16 +7157,16 @@ const STRINGS = {
       '固定的 VLM 輸入高度；參見 vlm_input_width。0 = 原生尺寸。設定了 '
       + 'coreml_vision_path 時忽略。'],
   'cfg.realtime-vqa.vlm_max_soft_tokens': ['',
-      '每帧视觉软 token 的预算。0 = 沿用编码器静态图/默认的图像预算（细节最'
-      + '好）。设为正值可限制每帧的 token 数，用细节换取预填充速度。主要影'
-      + '响 Gemma-4（它的稠密视频预算约 64 token/帧，对宽画幅的摄像头画面过'
-      + '于粗糙）。例如填 64 即恢复 Gemma 旧的粗糙视频预算。设置了 '
-      + 'coreml_vision_path 时忽略（CoreML 模型输出的 token 数是固定的）。',
-      '每格視覺軟 token 的預算。0 = 沿用編碼器靜態圖/預設的影像預算（細節最'
-      + '好）。設為正值可限制每格的 token 數，用細節換取預填充速度。主要影'
-      + '響 Gemma-4（它的稠密影片預算約 64 token/格，對寬畫幅的攝影機畫面過'
-      + '於粗糙）。例如填 64 即恢復 Gemma 舊的粗糙影片預算。設定了 '
-      + 'coreml_vision_path 時忽略（CoreML 模型輸出的 token 數是固定的）。'],
+      '每帧视觉软 token 的预算。0 = 每帧的默认值：Gemma-4 沿用静态图的预算，'
+      + 'Qwen 视觉塔每帧约 1000 token（约 100 万像素），Pixtral 为 256。设为'
+      + '正值可限制每帧的 token 数，用细节换取预填充速度（例如填 64 即恢复 '
+      + 'Gemma 旧的粗糙视频预算）。设置了 coreml_vision_path 时忽略（CoreML '
+      + '模型输出的 token 数是固定的）。',
+      '每格視覺軟 token 的預算。0 = 每格的預設值：Gemma-4 沿用靜態圖的預算，'
+      + 'Qwen 視覺塔每格約 1000 token（約 100 萬像素），Pixtral 為 256。設為'
+      + '正值可限制每格的 token 數，用細節換取預填充速度（例如填 64 即恢復 '
+      + 'Gemma 舊的粗糙影片預算）。設定了 coreml_vision_path 時忽略（CoreML '
+      + '模型輸出的 token 數是固定的）。'],
   'cfg.realtime-vqa.max_frame_gap_ms': ['',
       '结束一个场景的帧间间隔（毫秒）',
       '結束一個場景的幀間間隔（毫秒）'],
@@ -7358,6 +7444,13 @@ const STRINGS = {
   'cfg.create-mask.overlay_opacity': ['',
       '遮罩绘制到参考图像上的强度，0..1',
       '遮罩繪製到參考影像上的強度，0..1'],
+  'cfg.create-mask.mask_threshold': ['',
+      'binary 模式：in-mask 的值（0..255）达到或超过它即视为选中。1（默认）'
+      + '接受任何非零值，因此 0/1 遮罩也能按原意生效；128 是 Pillow 对柔边或'
+      + '抗锯齿遮罩的规则（`point(lambda v: 255 if v >= 128 else 0)`）',
+      'binary 模式：in-mask 的值（0..255）達到或超過它即視為選取。1（預設）'
+      + '接受任何非零值，因此 0/1 遮罩也能按原意生效；128 是 Pillow 對柔邊或'
+      + '反鋸齒遮罩的規則（`point(lambda v: 255 if v >= 128 else 0)`）'],
   'cfg.create-mask.output_dtype': ['',
       '"u8"（0..255，或一个类别索引）或 "f32"（覆盖度，取值 [0,1]；类别索引'
       + '仍是索引）',

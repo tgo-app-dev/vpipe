@@ -250,7 +250,7 @@ const ConfigKey kAttrs[] = {
           "model iport overrides it. May also name a STANDALONE VAE "
           "(krea2-vae), whose encoder half is used the same way",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "krea2,krea2-vae,flux2,flux3,qwen-image,"
+   .suggest_db_type = "krea2,krea2-vae,flux2,flux3,fibo2,qwen-image,"
                       "qwen-image-edit,qwen-image-21,"
        "boogu-image,boogu-image-edit,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,minimax-h3-image-vae,vosr",
@@ -294,8 +294,11 @@ const ConfigKey kAttrs[] = {
           "convolution, an activation channel at a step of its own, and "
           "its materialized mid-block attention's two GEMMs -- MEASURED "
           "1.15x / 1.26x a 1024^2 decode at 'accurate' / 'fast', 52-60 / "
-          "50-57 dB from the f16 picture) and by a REGISTERED family; the "
-          "other built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+          "50-57 dB from the f16 picture), by the 2D AutoencoderKL (FLUX.2's "
+          "and FLUX.1's: FLUX.2, FLUX.3, Z-Image, MOSS-Image, Boogu, Fibo "
+          "2.0 -- its 3x3 convs the same way), and by a REGISTERED family; "
+          "the other built-in codecs ignore it. Env VPIPE_I8_GEMM "
+          "overrides",
    .def_bool = false},
   {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
    .doc = "which int8 i8_gemm runs, in generate-image's words: 'accurate' "
@@ -304,7 +307,8 @@ const ConfigKey kAttrs[] = {
           "'fast', 'token' and 'token_plain' take every 3x3 the route "
           "fits, the residual stream's too, and run the GEMMs at that "
           "tier (a depth its layout cannot take stays accurate). The "
-          "Qwen-Image codec only; others read 'accurate'",
+          "Qwen-Image codec and the 2D AutoencoderKL (convs only: its mid "
+          "attention runs a flash kernel); others read 'accurate'",
    .def_str = "accurate", .extra = kI8TierChoices},
 };
 const PortSpec kIports[] = {
@@ -571,7 +575,8 @@ VaeEncodeStage::reload_vae_()
 
 namespace {
 
-// The settled bag (the ctor's) as the Qwen-Image codec takes it.
+// The settled bag (the ctor's) as the codecs take it: the Qwen-Image
+// one, and the 2D AutoencoderKL through the same two fields.
 genai::MetalKrea2Vae::Accel
 krea2_accel_(const FlexData& bag)
 {
@@ -754,6 +759,13 @@ VaeEncodeStage::ensure_loaded_()
           "VaeEncodeStage('{}'): failed to load the AutoencoderKL encoder from "
           "'{}'; inert", this->id(), vae_dir));
       _flux2_vae.reset();
+      return;
+    }
+    // i8_gemm, settled in the ctor (see VaeDecodeStage).
+    const auto ka = krea2_accel_(_accel);
+    _flux2_vae->set_accel({ka.i8_gemm, ka.i8_tier});
+    if (const std::string note = _flux2_vae->accel_note(); !note.empty()) {
+      session()->log_normal(fmt("VaeEncodeStage('{}'): {}", this->id(), note));
     }
     return;
   }

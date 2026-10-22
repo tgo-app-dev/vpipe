@@ -147,6 +147,38 @@ render_think_markers_plain(string_view text)
   return out;
 }
 
+string
+reply_without_thinking(string_view text)
+{
+  string out;
+  size_t pos = 0;
+  // A reply that began inside a block (its opening was the prompt's):
+  // everything up to the first end marker, when no start marker comes
+  // before it.
+  {
+    const size_t s = text.find(kThinkStart);
+    const size_t e = text.find(kThinkEnd);
+    if (e != string_view::npos && (s == string_view::npos || e < s)) {
+      pos = e + kThinkEnd.size();
+    }
+  }
+  while (pos < text.size()) {
+    const size_t s = text.find(kThinkStart, pos);
+    out.append(text.substr(pos, s == string_view::npos ? string_view::npos
+                                                       : s - pos));
+    if (s == string_view::npos) { break; }
+    const size_t e = text.find(kThinkEnd, s + kThinkStart.size());
+    if (e == string_view::npos) { break; }   // runs to the end
+    pos = e + kThinkEnd.size();
+  }
+  // An end marker no block opened says nothing.
+  for (size_t p = out.find(kThinkEnd); p != string::npos;
+       p = out.find(kThinkEnd, p)) {
+    out.erase(p, kThinkEnd.size());
+  }
+  return out;
+}
+
 bool
 has_media_marker(string_view line)
 {

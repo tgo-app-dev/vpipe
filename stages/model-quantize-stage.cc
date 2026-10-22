@@ -154,6 +154,7 @@ dit_class_family_(const std::string& class_name)
     return "qwen-image-21";
   }
   if (class_name == "ZImageTransformer2DModel") { return "z-image"; }
+  if (class_name == "BriaFibo2Transformer2DModel") { return "fibo2"; }
   if (class_name == "MOSSImageTransformer") { return "moss-image"; }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
@@ -577,6 +578,15 @@ dit_quant_linears_(const std::string& family)
     // timestep MLP that feeds every modulation vector in the model,
     // and the final layer, through whose 64 rows every velocity value
     // leaves.
+    return {"to_q", "to_k", "to_v", "0", "w1", "w2", "w3"};
+  }
+  if (family == "fibo2") {
+    // Fibo 2.0's blocks are Z-Image's: the same seven Linears a block
+    // under the same names, and the adaLN's leaf "0" quantized with them
+    // (as Z-Image's is). The same leaves ALSO name the Perceiver's and the
+    // five injection blocks' cross-attention projections -- the text
+    // path, run once a prompt -- which the exclude list keeps dense with
+    // everything model-level.
     return {"to_q", "to_k", "to_v", "0", "w1", "w2", "w3"};
   }
   if (family == "moss-image") {
@@ -1487,17 +1497,17 @@ ModelQuantizeStage::quantize_dit_component_(
         "(*_stream_modulations.*.linear, norm_out.linear) at 8-bit; body "
         "stays {}-bit", this->id(), _bits));
   }
-  if (_quant_modulation && is_zimage) {
+  if (_quant_modulation && (is_zimage || family == "fibo2")) {
     // Z-Image's per-block adaLN is `adaLN_modulation.0` -> leaf "0",
     // which is ALSO attention.to_out.0 and is therefore already in the
     // quant set. So there is nothing to add here: asking to quantize
     // the modulation on this family is a no-op, and saying so is
     // better than looking like it did something.
     session()->warn(fmt(
-        "ModelQuantizeStage('{}'): z-image's adaLN_modulation.0 shares the "
+        "ModelQuantizeStage('{}'): {}'s adaLN_modulation.0 shares the "
         "leaf \"0\" with attention.to_out.0, so quant_modulation cannot "
         "separate them -- the modulation is quantized either way and this "
-        "key changes nothing", this->id()));
+        "key changes nothing", this->id(), family));
   }
   if (_quant_modulation && family == "moss-image") {
     // ONE shared Linear (113 MB) feeds every block's modulation; there is
@@ -1574,6 +1584,14 @@ ModelQuantizeStage::quantize_dit_component_(
     opt.quant_exclude = {"all_x_embedder", "cap_embedder", "t_embedder.",
                          "all_final_layer"};
   }
+  if (family == "fibo2") {
+    // Z-Image's model-level keeps, plus the TEXT PATH: the Perceiver
+    // (whose output is every gist row) and the injection blocks'
+    // cross-attention (keys and values off the 7680-wide text bundles),
+    // both run once a prompt. `t_embedder.` also shields the leaf "0".
+    opt.quant_exclude = {"x_embedder", "t_embedder.", "final_layer.",
+                         "perceiver.", ".cross_attention."};
+  }
   if (is_boogu) {
     // Keep the precision-sensitive heads out despite their shared leaf names
     // (see dit_quant_linears_): the final LuminaLayerNormContinuous projection
@@ -1612,6 +1630,10 @@ ModelQuantizeStage::quantize_dit_component_(
       if (genai::MetalFlux3Transformer::Config::read_dims(dit_dir, &fc)) {
         opt.n_layers = fc.n_single;
       }
+    } else if (family == "fibo2") {
+      // Rank the 44 main blocks (`layers.N`; n_layers counts only them);
+      // the two noise-refiner blocks keep the base width.
+      opt.layer_prefix = "layers.";
     } else if (family == "moss-image") {
       // Rank the 42 main blocks (`layers.N`; num_layers counts only
       // them). The two text blocks (`text_embedder.blocks.N`) keep the
@@ -1649,6 +1671,14 @@ ModelQuantizeStage::quantize_dit_component_(
           "ModelQuantizeStage('{}'): '{}' is a single-file DiT, so there is "
           "no text encoder beside it to calibrate AWQ with -- supply "
           "calib_dir, or drop awq", this->id(), dit_dir));
+      return false;
+    }
+    if (family == "fibo2") {
+      // Not even from a calib_dir: the generic DiT fold below reads
+      // Krea-2's tensor names, and no collector drives Fibo 2.0's encoder.
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): fibo2 has no AWQ fold or collector -- "
+          "refusing. Use plain or mixed quantization", this->id()));
       return false;
     }
     if (family == "moss-image") {

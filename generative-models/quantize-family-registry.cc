@@ -30,7 +30,7 @@ QuantizeFamilyRegistry::add(std::unique_ptr<QuantizableFamily> f)
   // while running the plugin's component list.
   for (const char* built_in : {"krea2", "flux2", "flux3", "wan", "boogu",
                                "qwen-image", "qwen-image-21", "z-image",
-                               "moss-image",
+                               "moss-image", "fibo2",
                                "minimax-h3"}) {
     if (tag == built_in) { return false; }
   }

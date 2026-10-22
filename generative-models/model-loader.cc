@@ -410,6 +410,14 @@ parse_config_(const FlexData& cfg, ModelConfig* out)
     }
   }
 
+  // The LM's own section, whole (model_config::kTextConfig).
+  if (root.contains("text_config") && root.at("text_config").is_object()) {
+    bag::set(out->extra, model_config::kTextConfig, root.at("text_config"));
+  } else {
+    bag::set(out->extra, model_config::kTextConfig,
+             used_thinker ? thinker_holder : cfg);
+  }
+
   // A rope the struct cannot express (YaRN, the Llama-4 query
   // temperature) travels whole in `extra` -- model_config::
   // kRopeParameters. text_config's wins over the root's.
@@ -813,6 +821,33 @@ apply_preprocessor_(const filesystem::path&    dir,
   };
   read_triple_("image_mean", config->vision.image_mean);
   read_triple_("image_std",  config->vision.image_std);
+  // A Qwen-VL processor's pixel-count bounds (merge_size and a temporal
+  // patch are what mark one: Pixtral's `size.longest_edge` is an EDGE in
+  // pixels, read above). The reference resizes into them; without them
+  // the tower keeps its own defaults.
+  auto qwen_bounds = [&](const FlexData& o, std::string_view lo_key,
+                         std::string_view hi_key) {
+    if (!o.is_object()) { return; }
+    const auto ob = o.as_object();
+    if (!ob.contains("merge_size") || !ob.contains("temporal_patch_size")) {
+      return;
+    }
+    const FlexData size = bag::value(o, "size");
+    const long long lo = bag::has(size, "shortest_edge")
+                             ? bag::integer(size, "shortest_edge")
+                             : bag::integer(o, "min_pixels", 0);
+    const long long hi = bag::has(size, "longest_edge")
+                             ? bag::integer(size, "longest_edge")
+                             : bag::integer(o, "max_pixels", 0);
+    if (lo > 0) { bag::set_integer(config->extra, lo_key, lo); }
+    if (hi > 0) { bag::set_integer(config->extra, hi_key, hi); }
+  };
+  qwen_bounds(*pp_fd, model_config::kVisionMinPixels,
+              model_config::kVisionMaxPixels);
+  if (auto vp = read_json_file_(dir / "video_preprocessor_config.json")) {
+    qwen_bounds(*vp, model_config::kVisionVideoMinPixels,
+                model_config::kVisionVideoMaxPixels);
+  }
   if (session) {
     session->info(fmt(
         "ModelLoader::load('{}'): {}: "
@@ -826,6 +861,17 @@ apply_preprocessor_(const filesystem::path&    dir,
         config->vision.image_std[1],
         config->vision.image_std[2]));
   }
+}
+
+// What a chat template's source says about the checkpoint that no
+// config.json field does: whether it takes a reasoning effort
+// (model_config::kReasoningEffortControl) -- the one difference between
+// Qwen3.8's template and 3.5 / 3.6's that the renderer acts on.
+void
+note_chat_template_(string_view src, ModelConfig* config)
+{
+  bag::set_flag(config->extra, model_config::kReasoningEffortControl,
+                src.find("reasoning_effort") != string_view::npos);
 }
 
 // The default system message a Mistral chat template declares
@@ -842,6 +888,7 @@ apply_chat_template_defaults_(const filesystem::path& dir,
   if (!in) { return; }
   const string src((istreambuf_iterator<char>(in)),
                    istreambuf_iterator<char>());
+  note_chat_template_(src, config);
   const string key = "default_system_message";
   size_t p = src.find(key);
   if (p == string::npos) { return; }
@@ -889,6 +936,9 @@ load_gguf_(const std::string& gguf_path, LoadedWeights* out,
           "ModelLoader: '{}' is not a supported gemma4 GGUF", gguf_path));
     }
     return false;
+  }
+  if (const auto t = g->get_string("tokenizer.chat_template")) {
+    note_chat_template_(*t, &out->config);
   }
   // gemma4_unified multimodal: the shallow vision/audio embedder weights
   // live in a SEPARATE mmproj GGUF (projector_type gemma4uv / gemma4ua).
@@ -1071,6 +1121,9 @@ ModelLoader::load_config(string_view hf_dir) const
             "ModelLoader::load_config('{}'): unsupported GGUF", dir_str));
       }
       return nullopt;
+    }
+    if (const auto t = g->get_string("tokenizer.chat_template")) {
+      note_chat_template_(*t, &config);
     }
     return config;
   }

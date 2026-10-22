@@ -256,8 +256,22 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
   auto secs = [](clk::duration d) {
     return std::chrono::duration<double>(d).count();
   };
-  auto synth = [](int n) {
+  // VPIPE_QWEN_CTX_IDS_DIR=<dir>: the prompt of length N is <dir>/ids_N.i32
+  // (raw int32) -- real text for a model whose cost depends on what the
+  // tokens are (a Mixture of Experts routes them), the same ids a reference
+  // is handed as text. Else a periodic synthetic sequence.
+  const char* ids_dir = std::getenv("VPIPE_QWEN_CTX_IDS_DIR");
+  auto synth = [ids_dir](int n) {
     std::vector<std::int32_t> v((std::size_t)n);
+    if (ids_dir != nullptr) {
+      std::ifstream in(std::string(ids_dir) + "/ids_" + std::to_string(n) +
+                           ".i32",
+                       std::ios::binary);
+      if (in.read(reinterpret_cast<char*>(v.data()),
+                  (std::streamsize)(v.size() * 4))) {
+        return v;
+      }
+    }
     for (int i = 0; i < n; ++i) {
       v[(std::size_t)i] = (std::int32_t)((i * 131 + 7) % 2000 + 10);
     }

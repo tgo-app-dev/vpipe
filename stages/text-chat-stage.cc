@@ -11,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -108,8 +109,15 @@ uint64_t
 setup_digest(const genai::ChatTemplate& tpl, const string& tools_json)
 {
   vector<int32_t> ids;
-  (void)tpl.render_system_message(string_view(), tools_json,
-                                  /*is_first_turn=*/true, &ids);
+  // With no system message: the tools turn, or the reasoning turn alone
+  // (render_system_message renders a conversation's message, an empty
+  // one too).
+  if (!tools_json.empty()) {
+    (void)tpl.render_system_message(string_view(), tools_json,
+                                    /*is_first_turn=*/true, &ids);
+  } else {
+    (void)tpl.render_reasoning_system_turn(&ids);
+  }
   (void)tpl.render_generation_prompt(&ids);
   ConvMessage m;
   m.role = "setup";
@@ -548,13 +556,11 @@ constexpr ConfigKey kAttrs[] = {
           "into the tools turn when tools are on), verbatim from the "
           "published template. \"medium\" is the un-instructed "
           "rendering, exactly as the reference defines it, so it emits "
-          "nothing. Empty (the default) also emits nothing, which is "
-          "what every earlier Qwen3 build did -- the reference's own "
-          "default is \"xhigh\", but vpipe cannot tell a 3.8 checkpoint "
-          "from a 3.5/3.6 one (all three declare model_type "
-          "\"qwen3_5\"), so asking for xhigh is opt-in rather than "
-          "assumed. Ignored, with a warning, when thinking is off or "
-          "the family has no reasoning-effort concept",
+          "nothing. Empty (the default) is \"medium\" on a checkpoint "
+          "whose own chat template takes the control (Qwen3.8; the "
+          "reference's own default is \"xhigh\"). Ignored, with a "
+          "warning, when thinking is off or the checkpoint's template "
+          "has no such control (Qwen3.5 / 3.6)",
    .def_str = ""},
   {.key = "enable_tools", .type = ConfigType::Bool,
    .doc = "enable MCP tool calling: advertise the built-in tools "
@@ -646,7 +652,8 @@ constexpr ConfigKey kAttrs[] = {
           "key or its directory): a small model that drafts a block of "
           "tokens from the target's hidden states, which the model then "
           "verifies in one forward -- incoai's Qwen3.8-27B-DFlash2 for "
-          "mlx-community's Qwen3.8-27B-4bit. Greedy output is the model's "
+          "mlx-community's Qwen3.8-27B-4bit, its Qwen3.8-Flash-Next-"
+          "DFlash2 for Qwen3.8-Flash-Next. Greedy output is the model's "
           "own (sampled: its own per-slot samples); perf only. Takes over "
           "from mtp when set. Empty: none",
    .def_str = "", .suggest_db = kModelRegistryDb},
@@ -880,32 +887,15 @@ TextChatStage::declare_resources() const
   if (!_draft_model.empty()) {
     dirs.push_back(resolve_model_dir(session(), _draft_model));
   }
-  std::vector<ResourceClaim> out = model_memory::weight_claims(dirs);
-#ifdef VPIPE_BUILD_APPLE_SILICON
-  // A Mixture-of-Experts LM is STREAMABLE: on a box too small for it the
-  // loader keeps its routed experts in a cache (MetalQwenModel::
-  // lm_expert_cache_bytes), so the least it holds is the rest of the
-  // model and one layer of experts -- the floor this claim states.
-  {
-    genai::ModelLoader loader(session());
-    const auto mcfg = loader.load_config(dirs[0]);
-    if (mcfg.has_value() && mcfg->hidden > 0) {
-      const auto qc = genai::MetalQwenModel::config_from(*mcfg);
-      auto w = qc.is_moe() ? genai::MetalLlamaWeights::open_model(dirs[0])
-                           : std::nullopt;
-      if (w.has_value()) {
-        const std::size_t ex =
-            genai::MetalQwenModel::routed_expert_bytes(*w, qc);
-        const std::size_t disk = model_memory::dir_weights_bytes(dirs[0]);
-        if (ex > 0 && disk > ex) {
-          out[0] = model_memory::weight_claim_streamable(
-              dirs[0],
-              disk - ex + ex / (std::size_t)std::max(1, qc.n_layers));
-        }
-      }
+  // The LM (streamable when it is a Mixture of Experts) and its vision
+  // tower at the largest picture a turn may bring; the drafter whole.
+  std::vector<ResourceClaim> out =
+      model_memory::lm_claims(session(), dirs[0], id());
+  if (dirs.size() > 1) {
+    for (auto& c : model_memory::weight_claims({dirs[1]})) {
+      out.push_back(std::move(c));
     }
   }
-#endif
   // A drafter's verify pools its scratch for the model's life (tens of
   // MB on a 27B: the long-context attention's partials, a block's
   // logits). Withdrawn at load when no drafter attaches.
@@ -1029,9 +1019,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
       _lm->config(), _lm->tokenizer(),
       _disable_thinking, _reasoning_effort);
   // An effort that reached no instruction is reported, not dropped: the
-  // two ways that happens -- thinking off, or a family with no such
-  // control -- both render identically to not asking, so silence would
-  // leave a configured knob looking like it worked.
+  // two ways that happens -- thinking off, or a checkpoint whose template
+  // has no such control -- both render identically to not asking, so
+  // silence would leave a configured knob looking like it worked.
   if (!_reasoning_effort.empty() && _reasoning_effort != "medium"
       && _chat_tpl) {
     std::vector<std::int32_t> probe;
@@ -1040,11 +1030,22 @@ TextChatStage::initialize(RuntimeContext& ctx)
           "TextChatStage('{}'): reasoning_effort '{}' has no effect here "
           "-- {}",
           this->id(), _reasoning_effort,
-          (_disable_thinking.has_value() && *_disable_thinking)
+          !_chat_tpl->assistant_prompt_opens_thinking()
               ? "thinking is off, and the reference template gates the "
                 "instruction on thinking being on"
-              : "this chat template has no reasoning-effort control"));
+              : "this checkpoint's chat template has no reasoning-effort "
+                "control"));
     }
+  }
+  // The effort a checkpoint that takes one gets when none was asked --
+  // vpipe's choice, not the reference's, so it is said.
+  if (_reasoning_effort.empty() && _chat_tpl
+      && !_chat_tpl->reasoning_effort().empty()) {
+    session()->info(fmt(
+        "TextChatStage('{}'): reasoning effort {}, the default for a "
+        "checkpoint whose chat template takes one (the reference's own is "
+        "xhigh; reasoning_effort sets another)",
+        this->id(), _chat_tpl->reasoning_effort()));
   }
   if (!_chat_tpl) {
     session()->warn(fmt(
@@ -2039,6 +2040,7 @@ TextChatStage::process(RuntimeContext& ctx)
       genai::TokenRef r;
       if (image_pad >= 0 && id == image_pad && ii < imgs.size()) {
         r.kind = genai::TokenRef::Kind::ImageTokens;
+        r.text_id = id;
         if (!imgs[ii]->embeddings_host.empty()) {
           r.embeddings_host = &imgs[ii]->embeddings_host;
         } else {
@@ -2113,20 +2115,28 @@ TextChatStage::process(RuntimeContext& ctx)
                              : s.substr(0, cap) + "...[+"
                                    + std::to_string(s.size() - cap) + "B]";
     };
+    // The specs the system turn advertised: what a call's values are
+    // typed by.
+    const string tools_json = _tools.tools_json();
     int tool_round = 0;
     while (true) {
       // An interrupted turn stops here too: running the tools the
       // model asked for -- and decoding another round on top -- is
       // exactly the work the user just asked us to abandon.
       if (interrupted()) { break; }
-      const int markers = count_markers(assistant_text);
-      auto calls = tpl->parse_tool_calls(assistant_text);
+      // The calls are the ANSWER's: one the model drafted, or only
+      // mentioned, while it reasoned is not a call it made.
+      const string answer = media_line::reply_without_thinking(assistant_text);
+      const int markers = count_markers(answer);
+      const int in_reasoning = count_markers(assistant_text) - markers;
+      auto calls = tpl->parse_tool_calls(answer, tools_json);
       // One trace per scan so a tool turn is always followed in the debug
       // log -- both when it fires and when it silently produces nothing.
       session()->log_debug(fmt(
           "TextChatStage('{}'): tool scan (round {}): {} tool-call "
-          "marker(s), {} parsed call(s), reply {} chars",
-          this->id(), tool_round, markers,
+          "marker(s) in the answer ({} in the reasoning, not read), {} "
+          "parsed call(s), reply {} chars",
+          this->id(), tool_round, markers, in_reasoning,
           static_cast<int>(calls.size()),
           static_cast<int>(assistant_text.size())));
       if (calls.empty()) {
@@ -2142,9 +2152,8 @@ TextChatStage::process(RuntimeContext& ctx)
               "is returned. Enable debug logging to see the payload (a "
               "common cause is malformed arguments).",
               this->id(), markers));
-          const size_t a = assistant_text.find(call_marker);
-          const string blk = (a == string::npos)
-              ? assistant_text : assistant_text.substr(a);
+          const size_t a = answer.find(call_marker);
+          const string blk = (a == string::npos) ? answer : answer.substr(a);
           session()->log_debug(fmt(
               "TextChatStage('{}'): unparsed tool-call payload: {}",
               this->id(), excerpt(blk, 2000)));
@@ -2298,7 +2307,10 @@ TextChatStage::process(RuntimeContext& ctx)
     conv_ctx_pos = current_ctx_pos();
     vector<McpToolCall> calls;
     if (!conv.tools_json.empty()) {
-      calls = tpl->parse_tool_calls(assistant_text);
+      // The answer's calls, not the reasoning's (as in the tool rounds).
+      calls = tpl->parse_tool_calls(
+          media_line::reply_without_thinking(assistant_text),
+          conv.tools_json);
     }
     {
       auto arr = conv_calls.as_array();

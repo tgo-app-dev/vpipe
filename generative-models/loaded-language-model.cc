@@ -408,6 +408,9 @@ LoadedLanguageModel::LoadedLanguageModel(
     const bool metal_llama = arch_be == "LlamaForCausalLM";
     const bool metal_qwen = arch_be == "Qwen3_5ForConditionalGeneration"
         || arch_be == "Qwen3_5MoeForConditionalGeneration"
+        // Qwen3.8-Flash-Next (qwen4_exp): the Qwen3.5-MoE backbone under
+        // hyper-connections, with the n-gram PLE and the QSA indexer.
+        || arch_be == "Qwen4ExpForConditionalGeneration"
         || arch_be == "Qwen3ASRForConditionalGeneration"
         // MOSS-TTS-Local-v1.5: TTS model with a dense Qwen3 TEXT backbone
         // (under "transformer.", tied text head). Loaded as a Qwen text LM
@@ -507,11 +510,17 @@ LoadedLanguageModel::LoadedLanguageModel(
         // A Mixture-of-Experts model too big for the box keeps its ROUTED
         // EXPERTS in a cache (the rest resident and wired, a missed expert
         // read from disk, the most-selected kept): the engine's call, on
-        // the same rule the stages size by. 2 GB set aside for the K/V and
-        // activations a conversation grows.
+        // the same rule the stages size by. Set aside for the K/V and
+        // activations a conversation grows: 2 GB, or a hyper-connection
+        // model's own figure at this pool's context (Qwen3.8-Flash-Next:
+        // ~3.6 GB at 64k tokens).
         if (mcfg.is_moe()) {
+          const std::size_t run = std::max<std::size_t>(
+              (std::size_t)2 << 30,
+              MetalQwenModel::hc_run_bytes(
+                  mcfg, (std::int64_t)page_tokens * (std::int64_t)max_pages));
           mcfg.expert_cache_bytes = MetalQwenModel::lm_expert_cache_bytes(
-              session, model_dir, mcfg, (std::size_t)2 << 30);
+              session, model_dir, mcfg, run);
           if (mcfg.expert_cache_bytes > 0 && session != nullptr) {
             session->info(fmt("LoadedLanguageModel('{}'): the routed "
                               "experts do not fit this box beside the rest "
@@ -1408,6 +1417,12 @@ LoadedLanguageModel::prefill_multimodal_metal(
 
   const int H = _impl->weights.config.hidden;
   const int n = (int)refs.size();
+  // A hyper-connection Qwen (Qwen3.8-Flash-Next) hashes the token ids in
+  // its n-gram PLE, so its splice goes WITH them -- each media row its
+  // placeholder's (TokenRef::text_id; the image pad where a caller left
+  // it 0) -- through the host-f32 assembly below.
+  auto* hcx = dynamic_cast<MetalQwenModelExec*>(_impl->exec.get());
+  const bool hc = hcx != nullptr && hcx->hc();
 
   // 3-axis mROPE positions when image grids are supplied (VQA); else
   // plain 1-D RoPE (audio / text).
@@ -1431,7 +1446,7 @@ LoadedLanguageModel::prefill_multimodal_metal(
   // (no host f32 round-trip, no cast). The image tokens dominate, so the
   // f16-only copy is the big win.
   auto* mc_dev = _impl->session ? _impl->session->services()->metal_compute() : nullptr;
-  if (mc_dev != nullptr && !_impl->metal_bf16) {
+  if (mc_dev != nullptr && !_impl->metal_bf16 && !hc) {
     bool all_buf = true;
     for (int i = 0; i < n; ++i) {
       if (refs[i].kind != TokenRef::Kind::Text
@@ -1551,6 +1566,33 @@ LoadedLanguageModel::prefill_multimodal_metal(
   }
 
   int32_t pred = -1;
+  if (hc) {
+    const std::int32_t pad =
+        _impl->tokenizer ? _impl->tokenizer->special_token_id("<|image_pad|>")
+                         : -1;
+    std::vector<int32_t> ids((std::size_t)n);
+    for (int i = 0; i < n; ++i) {
+      const TokenRef& r = refs[(std::size_t)i];
+      ids[(std::size_t)i] =
+          r.kind == TokenRef::Kind::Text || r.text_id != 0 ? r.text_id : pad;
+      if (ids[(std::size_t)i] < 0) { return -1; }
+    }
+    std::vector<int32_t> pos;
+    if (have_grids) {
+      pos.resize(3 * (std::size_t)n);
+      for (int t = 0; t < n; ++t) {
+        pos[t] = pos_t[t];
+        pos[n + t] = pos_h[t];
+        pos[2 * n + t] = pos_w[t];
+      }
+    }
+    pred = hcx->prefill_hc_spliced(ctx._id, emb, ids, pos, n);
+    if (pred >= 0) {
+      ctx._last_predicted = pred;
+      if (have_grids) { ctx._rope_next_position = rope_next; }
+    }
+    return pred;
+  }
   if (have_grids) {
     std::vector<int32_t> pos(3 * (std::size_t)n);
     for (int t = 0; t < n; ++t) {

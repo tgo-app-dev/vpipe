@@ -363,6 +363,21 @@ MetalQwenModelExec::prefill_embeddings_mrope_buf(
   return argmax_(_logits);
 }
 
+std::int32_t
+MetalQwenModelExec::prefill_hc_spliced(ContextId ctx,
+                                       const std::vector<float>& emb,
+                                       const std::vector<std::int32_t>& ids,
+                                       const std::vector<std::int32_t>& pos,
+                                       int n)
+{
+  if (_model == nullptr || n <= 0) { return -1; }
+  CtxState* st = state_for_(ctx);
+  if (st == nullptr) { return -1; }
+  _logits = _model->prefill_hc_spliced(st->metal_cid, emb, ids, pos, n);
+  if (_logits.empty()) { return -1; }
+  return argmax_(_logits);
+}
+
 metal_compute::SharedBuffer
 MetalQwenModelExec::embed_text_buf(std::span<const std::int32_t> ids)
 {
@@ -407,6 +422,7 @@ MetalQwenModelExec::release_context(ContextId ctx)
   // Return this context's KV pages to the pool (refcount drop; shared
   // prefix pages survive until the last brancher releases); the entry
   // is gone already, so a recycled ContextId re-acquires a fresh root.
+  _model->forget_context(cid);
   _model->context_manager()->release(cid);
 }
 

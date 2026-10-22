@@ -38,11 +38,13 @@
 //                          replaced it with shared/block-residency.h,
 //                          which grows a resident set by MEASURING and
 //                          sheds when it finds its own pages outside
-//                          RAM. The prefill-only text encoders
-//                          (metal-qwen-model, metal-gemma-model) keep
-//                          it; a decoding qwen backbone that streams
-//                          (Config::stream_decode) grows a resident set
-//                          by measurement and never reads it.
+//                          RAM. So does every qwen backbone streamed
+//                          through Config::stream_decode, a decoder's or
+//                          a conditioning encoder's, Qwen3.5's hybrid
+//                          included. The prefill-only encoders that path
+//                          does not build keep it (metal-qwen-model's
+//                          Qwen2.5-VL stack and other packs,
+//                          metal-gemma-model).
 //
 // ---- the pinned prefix ------------------------------------------------
 //

@@ -8,7 +8,10 @@
 #include "generative-models/tokenizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -118,6 +121,165 @@ trim_sv_(std::string_view s)
   const std::size_t e = s.find_last_not_of(" \t\r\n");
   return s.substr(b, e - b + 1);
 }
+
+// An added token of a vocab: its literal and id (-1: not in this one).
+struct AddedMark {
+  std::string_view text;
+  std::int32_t     id;
+};
+
+// A text run as HF's tokenizer reads it: the added tokens in it split
+// out as their single ids, each run between them encoded whole. vpipe's
+// encoder does not split added tokens itself, so a `<tool_call>` appended
+// as text reaches the model as `<`, `tool`, `_call`, `>` -- not the one
+// token it was trained on and decodes. A mark not in the vocab stays
+// text.
+void
+append_split_(const Tokenizer&             tok,
+              std::string_view             text,
+              std::span<const AddedMark>   marks,
+              std::vector<std::int32_t>*   dst)
+{
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    std::size_t      at  = std::string_view::npos;
+    const AddedMark* hit = nullptr;
+    for (const auto& m : marks) {
+      if (m.id < 0 || m.text.empty()) { continue; }
+      const std::size_t p = text.find(m.text, pos);
+      if (p < at) {
+        at  = p;
+        hit = &m;
+      }
+    }
+    if (hit == nullptr) {
+      append_text_(tok, text.substr(pos), dst);
+      return;
+    }
+    if (at > pos) {
+      append_text_(tok, text.substr(pos, at - pos), dst);
+    }
+    dst->push_back(hit->id);
+    pos = at + hit->text.size();
+  }
+}
+
+// A float as Python's repr spells it, which is json.dumps's: the
+// shortest digits that read back, in fixed notation from 1e-4 up to (not
+// including) 1e16 -- a whole number keeping its ".0" -- else d.ddde+XX.
+// FlexData writes the shortest of fixed and exponent, so 1.0 as `1` and
+// 1e15 as `1e+15`, where the template's `tojson` writes `1.0` and
+// `1000000000000000.0`.
+std::string
+py_float_repr_(double v)
+{
+  if (std::isnan(v)) { return "NaN"; }
+  if (std::isinf(v)) { return v < 0 ? "-Infinity" : "Infinity"; }
+  if (v == 0.0) { return std::signbit(v) ? "-0.0" : "0.0"; }
+  char buf[64];
+  const auto r = std::to_chars(buf, buf + sizeof(buf), v,
+                               std::chars_format::scientific);
+  std::string_view sci(buf, (std::size_t)(r.ptr - buf));   // -1.25e+03
+  std::string out;
+  if (sci.front() == '-') {
+    out.push_back('-');
+    sci.remove_prefix(1);
+  }
+  const std::size_t ep = sci.find('e');
+  std::string digits;
+  for (char c : sci.substr(0, ep)) {
+    if (c != '.') { digits.push_back(c); }
+  }
+  int e10 = 0;
+  std::from_chars(sci.data() + ep + 1 + (sci[ep + 1] == '+' ? 1 : 0),
+                  sci.data() + sci.size(), e10);
+  // The value is 0.<digits> x 10^decpt; Python's repr goes to an
+  // exponent when decpt <= -4 or decpt > 16.
+  const int decpt = e10 + 1;
+  const int nd = (int)digits.size();
+  if (decpt > -4 && decpt <= 16) {
+    if (decpt <= 0) {
+      out += "0.";
+      out.append((std::size_t)-decpt, '0');
+      out += digits;
+    } else if (decpt >= nd) {
+      out += digits;
+      out.append((std::size_t)(decpt - nd), '0');
+      out += ".0";
+    } else {
+      out.append(digits, 0, (std::size_t)decpt);
+      out.push_back('.');
+      out.append(digits, (std::size_t)decpt, std::string::npos);
+    }
+    return out;
+  }
+  out.push_back(digits[0]);
+  if (nd > 1) {
+    out.push_back('.');
+    out.append(digits, 1, std::string::npos);
+  }
+  const int x = decpt - 1;
+  out += x < 0 ? "e-" : "e+";
+  const std::string xs = std::to_string(x < 0 ? -x : x);
+  if (xs.size() < 2) { out.push_back('0'); }
+  out += xs;
+  return out;
+}
+
+// A JSON value as the HF chat templates' `tojson` writes it -- Python's
+// json.dumps with its default separators, `", "` and `": "` -- where
+// FlexData writes it compact. Strings, integers and the rest are
+// FlexData's own spelling, which is Python's; a float is Python's repr.
+void
+hf_tojson_(const FlexData& v, std::string* out)
+{
+  if (v.is_real()) {
+    out->append(py_float_repr_(v.get_real()));
+    return;
+  }
+  if (v.is_object()) {
+    out->push_back('{');
+    bool first = true;
+    for (const auto& [k, x] : v.as_object()) {
+      if (!first) { out->append(", "); }
+      first = false;
+      out->append(FlexData::make_string(k).to_json(false));
+      out->append(": ");
+      hf_tojson_(x, out);
+    }
+    out->push_back('}');
+    return;
+  }
+  if (v.is_array()) {
+    out->push_back('[');
+    const auto a = v.as_array();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (i > 0) { out->append(", "); }
+      hf_tojson_(a[i], out);
+    }
+    out->push_back(']');
+    return;
+  }
+  out->append(v.to_json(false));
+}
+
+// Qwen3.5 / 3.6 / 3.8's call format and its reminder, as their
+// published chat_template.jinja writes them after `</tools>`.
+constexpr std::string_view kQwen35ToolFormat =
+    "\n\nIf you choose to call a function ONLY reply in the following "
+    "format with NO suffix:\n\n<tool_call>\n<function=example_function_"
+    "name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second "
+    "parameter\nthat can span\nmultiple lines\n</parameter>\n</function>"
+    "\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST "
+    "follow the specified format: an inner <function=...></function> "
+    "block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n- You may provide optional "
+    "reasoning for your function call in natural language BEFORE the "
+    "function call, but NOT after\n- If there is no function call "
+    "available, answer the question like normal with your current "
+    "knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>";
 
 // Normalise a JSON-Schema `type` field to Gemma's upper-case type name.
 // `type` may be a string ("string") or, for a union type
@@ -1067,6 +1229,7 @@ public:
 protected:
   const Tokenizer& tok_() const noexcept { return _tok; }
   std::int32_t im_start_() const noexcept { return _im_start; }
+  std::int32_t im_end_() const noexcept { return _im_end; }
 
   // A complete standalone system turn:
   //   <|im_start|>system\n{text}<|im_end|>\n
@@ -1107,15 +1270,21 @@ private:
 // primarily trained / served with `<think>\n`.
 class Qwen3ChatTemplate : public ChatMLChatTemplate {
 public:
-  explicit Qwen3ChatTemplate(const Tokenizer& tok,
-                             bool             disable_thinking = true,
-                             std::string_view reasoning_effort = {})
+  explicit Qwen3ChatTemplate(const Tokenizer&    tok,
+                             bool                disable_thinking = true,
+                             std::string_view    reasoning_effort = {},
+                             std::optional<bool> effort_control = {})
     : ChatMLChatTemplate(tok)
     , _disable_thinking(disable_thinking)
-    , _reasoning(reasoning_instructions_(reasoning_effort,
-                                         disable_thinking))
+    , _effort(resolve_effort_(reasoning_effort, effort_control))
+    , _reasoning(reasoning_instructions_(_effort, disable_thinking))
+    , _empty_system_turn(effort_control.has_value() && !*effort_control)
     , _think_open (sp_(tok, "<think>"))
     , _think_close(sp_(tok, "</think>"))
+    , _call_open  (sp_(tok, "<tool_call>"))
+    , _call_close (sp_(tok, "</tool_call>"))
+    , _resp_open  (sp_(tok, "<tool_response>"))
+    , _resp_close (sp_(tok, "</tool_response>"))
   {}
 
   std::string_view family_name() const override { return "qwen3-chatml"; }
@@ -1124,6 +1293,12 @@ public:
 
   std::string_view reasoning_instructions() const noexcept override
   { return _reasoning; }
+
+  std::string_view reasoning_effort() const noexcept override
+  {
+    return _disable_thinking ? std::string_view()
+                             : std::string_view(_effort);
+  }
 
   bool
   render_reasoning_system_turn(
@@ -1134,46 +1309,137 @@ public:
     return true;
   }
 
-  // Tools + reasoning share ONE system turn, instruction first, exactly
-  // as the published template composes them. Overridden rather than
-  // emitted separately because two consecutive system turns is not what
-  // the model was trained to read.
+  // ---- Tool / function calling: the family's own XML form ----------
+  //
+  // Qwen3.5 / 3.6 / 3.8's published template teaches NOT the Hermes JSON
+  // the ChatML base advertises but Qwen3-Coder's XML -- `<function=NAME>`
+  // and a `<parameter=KEY>` an argument (qwen3_5_tools_system_text) --
+  // with the reasoning instruction first and the host's system text
+  // after the tools, all ONE system turn: two in a row is not what the
+  // model was trained to read. Taught the JSON, the 27B wrote its calls
+  // half in each (`["{"name": ...}"]`, `["add_text", {...}]`) and
+  // nothing parsed: an agent's first turn ended as a reply with no call
+  // in 2-4 of 5 tries.
   bool
   render_tools_system_turn(std::string_view              tools_json,
                            bool                          is_first_turn,
                            std::vector<std::int32_t>*    dst) const override
   {
-    if (_reasoning.empty()) {
-      return ChatMLChatTemplate::render_tools_system_turn(
-          tools_json, is_first_turn, dst);
-    }
-    // The base emits a complete system turn, so the instruction cannot
-    // simply be appended before it -- render the base into a scratch
-    // buffer and splice the paragraph in after the `system\n` header.
-    std::vector<std::int32_t> base;
-    if (!ChatMLChatTemplate::render_tools_system_turn(
-            tools_json, is_first_turn, &base)) {
-      return false;
-    }
-    // The header is `<|im_start|>` + the tokens of "system\n"; re-render
-    // that prefix so the split point is computed, not guessed.
-    std::vector<std::int32_t> head;
-    (void)push_sp_(im_start_(), &head);
-    append_text_(tok_(), "system\n", &head);
-    if (base.size() < head.size()
-        || !std::equal(head.begin(), head.end(), base.begin())) {
-      // The base changed shape under us. Emit the instruction as its own
-      // turn rather than splicing at a wrong offset -- a duplicated
-      // system turn is recoverable, a corrupted one is not.
-      render_system_turn_(_reasoning, dst);
-      dst->insert(dst->end(), base.begin(), base.end());
+    (void)is_first_turn;   // ChatML has no session-start token
+    render_tools_turn_(tools_json, std::string_view(), dst);
+    return true;
+  }
+
+  bool
+  render_system_message(std::string_view           text,
+                        std::string_view           tools_json,
+                        bool                       is_first_turn,
+                        std::vector<std::int32_t>* dst) const override
+  {
+    (void)is_first_turn;
+    if (!tools_json.empty()) {
+      render_tools_turn_(tools_json, text, dst);
       return true;
     }
-    dst->insert(dst->end(), base.begin(), base.begin() + head.size());
-    append_text_(tok_(), _reasoning, dst);
-    append_text_(tok_(), "\n\n", dst);
-    dst->insert(dst->end(), base.begin() + head.size(), base.end());
+    // No tools: the instruction, then the host's text, trimmed, as the
+    // template has them. A message that trims to nothing is the
+    // instruction alone (3.8), or an empty turn (3.5 / 3.6, whose
+    // templates render the message whatever it holds).
+    const std::string_view t = trim_sv_(text);
+    if (t.empty()) {
+      if (_empty_system_turn) {
+        render_system_turn_(std::string_view(), dst);
+        return true;
+      }
+      (void)render_reasoning_system_turn(dst);
+      return true;
+    }
+    std::string s;
+    if (!_reasoning.empty()) {
+      s = _reasoning;
+      s += "\n\n";
+    }
+    s.append(t);
+    render_system_turn_(s, dst);
     return true;
+  }
+
+  // The results in ONE user turn, each trimmed in `<tool_response>`
+  // tags as the template writes them -- the tags their added tokens --
+  // then the assistant's header to decode on.
+  bool
+  render_tool_results_turn(std::span<const std::string>  tool_names,
+                           std::span<const std::string>  results,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    (void)tool_names;   // keyed on the tags, not the function's name
+    if (!render_tool_results_message(results, dst)) { return false; }
+    return render_generation_prompt(dst);
+  }
+
+  bool
+  render_tool_results_message(std::span<const std::string>  results,
+                              std::vector<std::int32_t>*    dst) const override
+  {
+    if (results.empty()) { return false; }
+    std::string s = "user";
+    for (const auto& r : results) {
+      s += "\n<tool_response>\n";
+      s.append(trim_sv_(r));
+      s += "\n</tool_response>";
+    }
+    (void)push_sp_(im_start_(), dst);
+    append_split_(tok_(), s, marks_(), dst);
+    (void)push_sp_(im_end_(), dst);
+    append_text_(tok_(), "\n", dst);
+    return true;
+  }
+
+  // A conversation's message with its tags -- `<tool_call>`, `</think>`
+  // -- the single tokens HF's tokenizer makes of them: an assistant turn
+  // rendered again as the model decoded it, a user's (a host's note
+  // showing the call format) as the template's tokenizer reads it.
+  bool
+  render_message(std::string_view           role,
+                 std::string_view           content,
+                 bool                       is_first_turn,
+                 std::vector<std::int32_t>* dst) const override
+  {
+    if (role == "user") {
+      (void)push_sp_(im_start_(), dst);
+      append_text_(tok_(), "user\n", dst);
+      append_split_(tok_(), content, marks_(), dst);
+      (void)push_sp_(im_end_(), dst);
+      append_text_(tok_(), "\n", dst);
+      return true;
+    }
+    if (role != "assistant") {
+      return ChatMLChatTemplate::render_message(role, content,
+                                                is_first_turn, dst);
+    }
+    std::string text(content);
+    for (std::size_t p = text.find(media_line::kThinkStart);
+         p != std::string::npos; p = text.find(media_line::kThinkStart)) {
+      text.erase(p, media_line::kThinkStart.size());
+    }
+    for (std::size_t p = text.find(media_line::kThinkEnd);
+         p != std::string::npos; p = text.find(media_line::kThinkEnd)) {
+      text.replace(p, media_line::kThinkEnd.size(), "</think>");
+    }
+    (void)push_sp_(im_start_(), dst);
+    append_text_(tok_(), "assistant\n", dst);
+    append_assistant_extras_(dst);
+    append_split_(tok_(), text, marks_(), dst);
+    (void)push_sp_(im_end_(), dst);
+    append_text_(tok_(), "\n", dst);
+    return true;
+  }
+
+  std::vector<vpipe::McpToolCall>
+  parse_tool_calls(const std::string& assistant_text,
+                   std::string_view   tools_json = {}) const override
+  {
+    return vpipe::parse_xml_tool_calls(assistant_text, tools_json);
   }
 
   // Thinking-ON extras end with `<think>\n`, so generation starts
@@ -1227,6 +1493,17 @@ private:
   // branch for it, so medium IS the un-instructed rendering. Anything
   // unrecognised also resolves to nothing here; the stage validates the
   // spelling so a typo is a config error rather than a silent downgrade.
+  // The effort the checkpoint's template takes (make_chat_template):
+  // none where it has no control, medium -- vpipe's default -- where it
+  // has one and none was asked, what was asked where it is unknown.
+  static std::string
+  resolve_effort_(std::string_view asked, std::optional<bool> control)
+  {
+    if (control.has_value() && !*control) { return {}; }
+    if (control.has_value() && asked.empty()) { return "medium"; }
+    return std::string(asked);
+  }
+
   static std::string
   reasoning_instructions_(std::string_view effort, bool disable_thinking)
   {
@@ -1247,10 +1524,42 @@ private:
     return {};
   }
 
+  // The family's tool-calling turn: `<|im_start|>system\n`, its text,
+  // `<|im_end|>\n` -- the text's tags their added tokens.
+  void
+  render_tools_turn_(std::string_view           tools_json,
+                     std::string_view           system_text,
+                     std::vector<std::int32_t>* dst) const
+  {
+    (void)push_sp_(im_start_(), dst);
+    append_split_(tok_(),
+                  "system\n" + qwen3_5_tools_system_text(
+                                   _reasoning, tools_json, system_text),
+                  marks_(), dst);
+    (void)push_sp_(im_end_(), dst);
+    append_text_(tok_(), "\n", dst);
+  }
+
+  // The added tokens a tool-calling turn's text holds.
+  std::array<AddedMark, 6>
+  marks_() const noexcept
+  {
+    return {{{"<tool_call>", _call_open},   {"</tool_call>", _call_close},
+             {"<tool_response>", _resp_open},
+             {"</tool_response>", _resp_close},
+             {"<think>", _think_open},      {"</think>", _think_close}}};
+  }
+
   bool         _disable_thinking;
+  std::string  _effort;
   std::string  _reasoning;
+  bool         _empty_system_turn;   // Qwen3.5 / 3.6's empty message
   std::int32_t _think_open;
   std::int32_t _think_close;
+  std::int32_t _call_open;
+  std::int32_t _call_close;
+  std::int32_t _resp_open;
+  std::int32_t _resp_close;
 };
 
 // Qwen3-VL variant: ChatML scaffold + thinking-ENABLED assistant
@@ -1284,14 +1593,16 @@ private:
 // counts into render_user_turn_vlm.
 class Qwen3VLChatTemplate final : public Qwen3ChatTemplate {
 public:
-  explicit Qwen3VLChatTemplate(const Tokenizer& tok,
-                               bool             disable_thinking = false,
-                               std::string_view reasoning_effort = {})
+  explicit Qwen3VLChatTemplate(const Tokenizer&    tok,
+                               bool                disable_thinking = false,
+                               std::string_view    reasoning_effort = {},
+                               std::optional<bool> effort_control = {})
     // Qwen3-VL was primarily trained / served with thinking-ON; pass
     // the inverse default to the Qwen3 base so the family-default for
     // VLM users is `<think>\n`. The base class's
     // append_assistant_extras_ handles both modes uniformly.
-    : Qwen3ChatTemplate(tok, disable_thinking, reasoning_effort)
+    : Qwen3ChatTemplate(tok, disable_thinking, reasoning_effort,
+                        effort_control)
     , _vision_start(sp_(tok, "<|vision_start|>"))
     , _vision_end  (sp_(tok, "<|vision_end|>"))
     , _image_pad   (sp_(tok, "<|image_pad|>"))
@@ -2097,8 +2408,10 @@ public:
   }
 
   std::vector<vpipe::McpToolCall>
-  parse_tool_calls(const std::string& assistant_text) const override
+  parse_tool_calls(const std::string& assistant_text,
+                   std::string_view   tools_json = {}) const override
   {
+    (void)tools_json;
     return parse_gemma_tool_calls_(assistant_text);
   }
 
@@ -2286,11 +2599,50 @@ private:
 
 }
 
+std::string
+qwen3_5_tools_system_text(std::string_view reasoning,
+                          std::string_view tools_json,
+                          std::string_view system_text)
+{
+  std::string s;
+  if (!reasoning.empty()) {
+    s.append(reasoning);
+    s.append("\n\n");
+  }
+  s.append("# Tools\n\nYou have access to the following functions:\n\n"
+           "<tools>");
+  // A tool a line, each as the template's `tojson` writes it.
+  std::size_t pos = 0;
+  while (pos < tools_json.size()) {
+    const std::size_t nl = tools_json.find('\n', pos);
+    const std::string_view line = tools_json.substr(
+        pos, nl == std::string_view::npos ? std::string_view::npos
+                                          : nl - pos);
+    pos = nl == std::string_view::npos ? tools_json.size() : nl + 1;
+    if (trim_sv_(line).empty()) { continue; }
+    s.push_back('\n');
+    try {
+      hf_tojson_(FlexData::from_json(line), &s);
+    } catch (const std::exception&) {
+      s.append(line);   // not JSON: as the host wrote it
+    }
+  }
+  s.append("\n</tools>");
+  s.append(kQwen35ToolFormat);
+  const std::string_view t = trim_sv_(system_text);
+  if (!t.empty()) {
+    s.append("\n\n");
+    s.append(t);
+  }
+  return s;
+}
+
 std::unique_ptr<ChatTemplate>
 make_chat_template(const std::string&    architecture,
                    const Tokenizer&      tokenizer,
                    std::optional<bool>   disable_thinking,
-                   std::string_view      reasoning_effort)
+                   std::string_view      reasoning_effort,
+                   std::optional<bool>   effort_control)
 {
   // Only the Qwen3 family carries a reasoning-effort control; every
   // other branch below ignores it, and the stage warns when it was set
@@ -2344,7 +2696,9 @@ make_chat_template(const std::string&    architecture,
         tokenizer, /*thinking_variant=*/true, thinking_on);
   }
   if (architecture == "Qwen3_5ForConditionalGeneration"
-      || architecture == "Qwen3_5MoeForConditionalGeneration") {
+      || architecture == "Qwen3_5MoeForConditionalGeneration"
+      // Qwen3.8-Flash-Next: the same chat format as Qwen3.8.
+      || architecture == "Qwen4ExpForConditionalGeneration") {
     // VLM-capable when the tokenizer ships vision sentinel tokens.
     // Text-only Qwen3 checkpoints don't have <|vision_start|> in
     // their vocab; we fall back to plain Qwen3ChatTemplate so the
@@ -2356,11 +2710,13 @@ make_chat_template(const std::string&    architecture,
     if (is_vlm) {
       // Qwen3-VL family default: thinking-ON.
       return std::make_unique<Qwen3VLChatTemplate>(
-          tokenizer, disable_thinking.value_or(false), reasoning_effort);
+          tokenizer, disable_thinking.value_or(false), reasoning_effort,
+          effort_control);
     }
     // Qwen3 text-only family default: thinking-OFF.
     return std::make_unique<Qwen3ChatTemplate>(
-        tokenizer, disable_thinking.value_or(true), reasoning_effort);
+        tokenizer, disable_thinking.value_or(true), reasoning_effort,
+        effort_control);
   }
   return nullptr;
 }
@@ -2376,8 +2732,16 @@ make_chat_template(const ModelConfig&    config,
         tokenizer,
         bag::text(config.extra, model_config::kDefaultSystemPrompt));
   }
+  // Whether the checkpoint's own template takes a reasoning effort, when
+  // the loader read one.
+  std::optional<bool> effort_control;
+  if (bag::has(config.extra, model_config::kReasoningEffortControl)) {
+    effort_control =
+        bag::flag(config.extra, model_config::kReasoningEffortControl);
+  }
   return make_chat_template(config.architecture, tokenizer,
-                            disable_thinking, reasoning_effort);
+                            disable_thinking, reasoning_effort,
+                            effort_control);
 }
 
 }

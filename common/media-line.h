@@ -93,6 +93,14 @@ inline constexpr std::string_view kThinkEnd = "<|__vpipe_think_end__|>";
 // (`⟦think⟧` / `⟦/think⟧`) for text-only surfaces (stdio).
 std::string render_think_markers_plain(std::string_view text);
 
+// What a reply says OUTSIDE its thinking: each block from kThinkStart to
+// its kThinkEnd cut, an unterminated one to the end of the message, and
+// -- a reply that began inside a block whose opening never streamed --
+// everything before an end marker no start marker opened. A tool call
+// is read from this: one the model drafted, or only mentioned, while it
+// reasoned is not one it made.
+std::string reply_without_thinking(std::string_view text);
+
 // Standard-alphabet base64. decode tolerates '=' padding and ASCII
 // whitespace; returns nullopt on any other non-alphabet byte.
 std::string base64_encode(std::span<const std::uint8_t> bytes);

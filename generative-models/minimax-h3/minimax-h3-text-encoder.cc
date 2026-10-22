@@ -179,9 +179,14 @@ MiniMaxH3TextEncoder::streaming_floor_bytes(const std::string& enc_dir)
   // always stream their layers -- were planned whole (MOSS-Image's 16 GB
   // against a ~2.8 GB floor put a 16 GB box's conditioning phase over
   // its RAM).
+  //
+  // The floor the LOADER keeps, which depends on how it streams: a stack
+  // the raw-source path serves holds a slot pair of sources and products,
+  // anything else the prefill path's layer at a time
+  // (MetalQwenModel::stream_floor_bytes).
   for (const char* stem : {"model.language_model.layers.",
                            "model.layers.", "language_model.layers."}) {
-    const std::size_t f = stream_floor_bytes(*wts, stem);
+    const std::size_t f = MetalQwenModel::stream_floor_bytes(*wts, stem);
     if (f > 0) { return f; }
   }
   return 0;

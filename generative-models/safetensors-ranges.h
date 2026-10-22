@@ -28,9 +28,14 @@ class MetalLlamaWeights;
 
 class SafetensorsRanges {
 public:
+  // `cached`: read THROUGH the page cache instead -- plain descriptors, a
+  // read straight into its destination. For small reads the cache should
+  // keep: the rows of a table indexed by token (the n-gram embedding), a
+  // few hundred bytes each, many of them read again.
   static std::unique_ptr<SafetensorsRanges> open(const std::string& dir,
                                                  const MetalLlamaWeights& src,
-                                                 std::string* err = nullptr);
+                                                 std::string* err = nullptr,
+                                                 bool cached = false);
   ~SafetensorsRanges();
 
   // `n` bytes of tensor `name`, from byte `off` of its data, into `dst`.
@@ -58,6 +63,7 @@ private:
   };
   std::vector<int> _fds;
   std::unordered_map<std::string, Where> _where;
+  bool _cached = false;
 };
 
 }  // namespace vpipe::genai

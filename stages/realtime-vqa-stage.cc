@@ -11,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 #include "stages/trigger-beat.h"
@@ -61,6 +62,11 @@ namespace vpipe {
 namespace {
 
 constexpr int kMinIdleTicks = 2;
+// A live frame's pixel budget on a Qwen tower when vlm_max_soft_tokens is
+// unset: the Qwen2/3-VL processor's classic bound (28 * 28 * 1280), what
+// the tower applied to every picture before it took the checkpoint's own
+// -- about 1000 tokens a frame.
+constexpr std::int64_t kQwenFramePixels = 28LL * 28 * 1280;
 
 // Debug: when VPIPE_VQA_DUMP_FRAMES=<dir> is set, write the EXACT planar
 // [3,H,W] u8 RGB buffer the VLM encoder is about to consume to a P6 PPM
@@ -521,13 +527,13 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "fixed VLM input height; see vlm_input_width. 0 = native. "
           "Ignored when coreml_vision_path is set.", .def_int = 0},
   {.key = "vlm_max_soft_tokens", .type = ConfigType::Int,
-   .doc = "per-frame vision soft-token budget. 0 = encoder still/default "
-          "image budget (best detail). A positive value caps tokens/frame "
-          "to trade detail for prefill speed. Mainly affects Gemma-4 (its "
-          "dense-video budget ~64 tok/frame was too coarse for wide camera "
-          "frames). E.g. 64 restores the old coarse Gemma video budget. "
-          "Ignored when coreml_vision_path is set (the CoreML model's "
-          "output token count is fixed).",
+   .doc = "per-frame vision soft-token budget. 0 = the frame default: "
+          "Gemma-4's still-image budget, about 1000 tokens (~1 MP) a frame "
+          "on a Qwen tower, 256 on Pixtral. A positive value caps "
+          "tokens/frame to trade detail for prefill speed (e.g. 64 "
+          "restores the old coarse Gemma video budget). Ignored when "
+          "coreml_vision_path is set (the CoreML model's output token "
+          "count is fixed).",
    .def_int = 0},
   {.key = "max_frame_gap_ms", .type = ConfigType::Int,
    .doc = "inter-frame gap (ms) that closes a scene", .def_int = 10000},
@@ -719,8 +725,13 @@ std::vector<ResourceClaim>
 RealtimeVqaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return model_memory::weight_claims(
-      {resolve_model_dir(session(), _hf_dir)});
+  // The LM (streamable when it is a Mixture of Experts) and its GPU
+  // vision tower at a frame's budget (vlm_max_soft_tokens, else ~1 MP) --
+  // none when a CoreML tower stands in for it.
+  return model_memory::lm_claims(
+      session(), resolve_model_dir(session(), _hf_dir), id(),
+      _coreml_vision_path.empty() ? kQwenFramePixels : -1,
+      _coreml_vision_path.empty() ? _vlm_max_soft_tokens : 0);
 }
 
 Job
@@ -1347,8 +1358,18 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       }
     } else {
       // Metal MLX-free tower reports PRE-merger patches -> divide by S.
+      // A live frame keeps a budget of its own under the checkpoint's
+      // still-picture bound (16.7 MP on a Qwen3-VL repo, ~16k tokens):
+      // vlm_max_soft_tokens when set, else ~1 MP -- about 1000 tokens, a
+      // 1080p frame's worth, the size a scene of frames was tuned at.
       const int S = std::max(1, _mvis->config().spatial_merge);
-      auto r = _mvis->encode(urgb, uh, uw);
+      const std::int64_t cell =
+          (std::int64_t)_mvis->config().patch_size * S;
+      const std::int64_t frame_px =
+          _vlm_max_soft_tokens > 0
+              ? (std::int64_t)_vlm_max_soft_tokens * cell * cell
+              : kQwenFramePixels;
+      auto r = _mvis->encode(urgb, uh, uw, frame_px);
       m.embeddings = std::move(r.embeddings);
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h / S;
@@ -2078,6 +2099,7 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
       genai::TokenRef r;
       if (id == video_pad && img_idx < _m_imgs.size()) {
         r.kind = genai::TokenRef::Kind::ImageTokens;
+        r.text_id = id;
         // gemma4_unified: host-f32 rows; else native-f16 SharedBuffer.
         if (!_m_imgs[img_idx].embeddings_host.empty()) {
           r.embeddings_host = &_m_imgs[img_idx].embeddings_host;

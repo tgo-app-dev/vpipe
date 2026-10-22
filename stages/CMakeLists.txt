@@ -36,6 +36,7 @@ set(LOCAL_SOURCES
   flashvsr-src-encoder-stage.cc
   flux2-model-config-stage.cc
   flux3-model-config-stage.cc
+  fibo2-model-config-stage.cc
   moss-image-model-config-stage.cc
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
@@ -120,6 +121,7 @@ set(LOCAL_HEADERS
   flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h
   flux3-model-config-stage.h
+  fibo2-model-config-stage.h
   moss-image-model-config-stage.h
   krea2-model-config-stage.h
   boogu-image-model-config-stage.h

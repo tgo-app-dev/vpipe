@@ -5,9 +5,11 @@
 // metal-qwen-raw-layers.cc): the raw-source layers behind
 // Config::load_quant_bits and Config::stream_decode.
 //
-// A dense full-attention backbone whose layers are BUILT FROM THE RAW
-// CHECKPOINT by this model rather than read as they sit. Two features
-// share the mechanism because they share its hard part:
+// A backbone whose layers are BUILT FROM THE RAW CHECKPOINT by this model
+// rather than read as they sit: dense full attention, or (streaming bf16
+// only) a gated-DeltaNet HYBRID, whose two kinds of layer share one slot
+// pair through a pool (HybLayout). Two features share the mechanism
+// because they share its hard part:
 //
 //   IN-MEMORY QUANTIZATION (load_quant_bits = 8). An unquantized
 //   checkpoint's seven projections become affine w8 group-64 on the GPU
@@ -44,6 +46,7 @@
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/shared/wired-pool.h"
 
+#include <array>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -68,13 +71,57 @@ enum PackTensor : int {
   kPackCount = kPackDown + 3
 };
 
+// The tensors of one layer of a HYBRID stack (Qwen3.5: gated-DeltaNet
+// layers between gated full-attention ones), by role. Every layer has the
+// first five; a full-attention layer adds the self_attn six, a GDN layer
+// the linear_attn nine.
+enum HybRole : int {
+  kHInLn, kHPostLn, kHGate, kHUp, kHDown,
+  kHQ, kHK, kHV, kHO, kHQNorm, kHKNorm,
+  kHQkv, kHZ, kHA, kHB, kHOut, kHConv, kHALog, kHDtBias, kHGNorm,
+  kHRoleCount
+};
+
+// A hybrid slot's layout, off the checkpoint. Its two kinds of layer hold
+// different tensors, so a slot cannot be laid out by position as a dense
+// one is -- and one laid out for either kind would be rebuilt every other
+// read (the slots alternate; one in four layers is full attention). So a
+// slot is a POOL that serves both: a PROJECTION takes a buffer of exactly
+// its byte size, the k-th of that size in its layer the k-th such buffer,
+// so the pool holds the most of each size any layer needs (the MLP's
+// three, a qkv-or-q, two square ones, ...); a small tensor (a norm, the
+// conv, the recurrence's A_log / dt_bias) has a buffer of its own role. A
+// refill places bytes in buffers of the right size whichever kind it is.
+// The fused projection (q|k|v, or qkv|z|a|b) is built into one arena of
+// the wider kind's size.
+struct MetalQwenModel::HybLayout {
+  std::vector<std::size_t> pool;      // one slot's buffers, bytes each
+  // Per layer: each role's pool buffer, -1 where the layer has none.
+  std::vector<std::array<int, kHRoleCount>> pos;
+  std::vector<char>        full;      // per layer: full attention
+  std::vector<std::size_t> fused;     // per layer: its fused projection
+  std::vector<std::size_t> kept;      // per layer: what promotion keeps
+  std::size_t arena = 0;              // the widest fused projection
+  std::size_t raw = 0;                // the stack's bytes on disk
+  std::size_t slot() const
+  {
+    std::size_t n = arena;
+    for (std::size_t b : pool) { n += b; }
+    return n;
+  }
+};
+
 // One layer's raw checkpoint tensors and the products the forward binds.
 // A resident layer keeps only `prod` (whatever of `src` it aliases stays
 // alive through it); a streaming slot keeps both. `src` is in RawTensor
-// order for a raw checkpoint and in PackTensor order for a pack.
+// order for a raw checkpoint, in PackTensor order for a pack, and a
+// HybLayout pool for a hybrid -- which also carries the layer it holds
+// now and the arena its fused projection is built into.
 struct MetalQwenModel::RawLayer {
   std::vector<metal_compute::SharedBuffer> src;   // kRawCount, compute dtype
   Layer prod;
+  int   layer = -1;                    // hybrid: the layer `src` holds
+  metal_compute::SharedBuffer arena;   // hybrid: the fused projection
 };
 
 struct MetalQwenModel::RawStream {
@@ -98,8 +145,13 @@ struct MetalQwenModel::RawStream {
 
   // ---- the streamed forward ---------------------------------------------
   // Once per forward (one prefill chunk, one decode step): measure the
-  // resident set, shed what the box took back, wire the trunk.
-  void begin_forward();
+  // resident set, shed what the box took back, wire the trunk, and give
+  // the slot pair back once every layer it runs is resident and a whole
+  // forward has run without it. `end` is
+  // one past the last layer the forward runs -- a taps forward stops at
+  // its deepest tap -- and is where the prefetch wraps to the next
+  // forward's first streamed layer; -1 is the whole stack.
+  void begin_forward(int end = -1);
   bool streamed(int L) const
   {
     return streaming && L >= 0 && L < (int)held.size() && !held[(size_t)L];
@@ -117,6 +169,9 @@ struct MetalQwenModel::RawStream {
               metal_compute::ComputeEncoder& enc);
 
   // ---- residency + accounting --------------------------------------------
+  // The slot pair given back when every layer in [0, the last forward's
+  // end) is held. No forward may be running. Returns the bytes.
+  std::size_t release_if_saturated();
   std::size_t evict_tail();
   std::size_t resident_bytes() const;
   int resident_count() const;
@@ -127,9 +182,12 @@ struct MetalQwenModel::RawStream {
   const bool                         quant;
   const bool                         streaming;
   const bool                         pack;   // the source is a w8 pack
+  bool                               hyb = false;   // a hybrid stack
 
   int H = 0, qd = 0, qdo = 0, kd = 0, F = 0, D = 0;
-  std::size_t kept_bytes = 0;   // one built layer: what promotion KEEPS
+  // One built layer: what promotion KEEPS -- the widest kind's, where a
+  // hybrid's two differ (kept_(L) is the layer's own).
+  std::size_t kept_bytes = 0;
   std::size_t slot_bytes = 0;   // one slot: sources + their products
   bool        failed = false;   // a streamed read failed this forward
 
@@ -150,6 +208,28 @@ struct MetalQwenModel::RawStream {
   void encode_build_(metal_compute::ComputeEncoder& enc,
                      const RawLayer& r) const;
   int next_streamed_(int L) const;
+  std::size_t kept_(int L) const;
+  // Every buffer a raw-built layer can bind -- the dense fields (bf16, w8,
+  // a pack's) and the gated-DeltaNet ones -- for each walk that wires,
+  // counts, copies or aliases a layer, so none of them misses a kind.
+  static constexpr int kFields = 23;
+  static std::array<metal_compute::SharedBuffer*, kFields> fields_(Layer& y);
+  // A layer's distinct allocations, summed once: `arena` first (a fused
+  // projection is a window onto it), then the fields, then `src`.
+  static std::size_t layer_bytes_(
+      const Layer& y,
+      const std::vector<metal_compute::SharedBuffer>* src = nullptr,
+      const metal_compute::SharedBuffer* arena = nullptr);
+  // A hybrid role's field; null for a part of the fused projection.
+  static metal_compute::SharedBuffer* hyb_field_(Layer& y, int role);
+  // ---- a hybrid stack --------------------------------------------------
+  // Whether the slot holds `role` in a form the build derives rather than
+  // as it sits: a zero-centred norm (1 + w folded), A_log / dt_bias (f32
+  // for the recurrence) -- rebuilt per refill, as the resident load
+  // builds them, so the bytes are the same.
+  bool hyb_derived_(int role) const;
+  metal_compute::SharedBuffer hyb_read_(const std::string& name) const;
+  bool hyb_fill_(int L, RawLayer& r, bool whole_pool);
   std::size_t wire_layer_(Layer& y, bool on);
   std::size_t wire_trunk_(bool on);
   void resident_pages_(std::size_t* examined, std::size_t* incore,
@@ -160,11 +240,14 @@ struct MetalQwenModel::RawStream {
   metal_compute::ComputeFunction _fn_copy;    // copy_f16: bf16 q|k|v fuse
   metal_compute::ComputeFunction _fn_rows;    // copy_rows_u32: pack fuses
 
+  HybLayout            _hl;           // hybrid only
   BlockSlots<RawLayer> _slots;
   BlockResidency       _resid;
   WiredPool            _wire;
   std::vector<char>    held;          // streaming: L promoted resident
   int                  _pending = -1; // streamed L bound, not finished
+  int                  _end = 0;      // one past this forward's last layer
+  bool                 _used_slots = true;   // this forward acquired one
   bool                 _shut = false;
 
   friend class MetalQwenModel;

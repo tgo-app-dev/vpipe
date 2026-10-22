@@ -36,6 +36,16 @@ public:
                      const SessionContextIntf*     session);
 
   bool valid() const noexcept override { return _model != nullptr; }
+  // A hyper-connection model (Qwen3.8-Flash-Next): its spliced prefills
+  // carry the token ids (prefill_hc_spliced) -- the n-gram PLE hashes them.
+  bool hc() const noexcept
+  {
+    return _model != nullptr && _model->config().hc();
+  }
+  std::int32_t prefill_hc_spliced(ContextId ctx,
+                                  const std::vector<float>& emb,
+                                  const std::vector<std::int32_t>& ids,
+                                  const std::vector<std::int32_t>& pos, int n);
 
   // The metal exec owns its own KV-page pool keyed by ContextId.
   bool owns_kv() const noexcept override { return true; }

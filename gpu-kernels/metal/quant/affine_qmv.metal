@@ -65,10 +65,11 @@ inline U load_vector(const device T* x, thread U* x_thread) {
       x_thread[i + 2] = x[i + 2] / 256.0f;
       x_thread[i + 3] = x[i + 3] / 4096.0f;
     }
-  } else if (bits == 8) {
+  } else if (bits == 8 || bits == 5 || bits == 6) {
     // 8-bit weights are stored one byte per value (no nibble packing),
     // so no power-of-16 pre-division is needed; qdot multiplies the raw
-    // byte directly.
+    // byte directly. 5- and 6-bit codes are extracted WHOLE in qdot
+    // (shift and mask across their byte packs), so x stays unscaled too.
     for (int i = 0; i < values_per_thread; i++) {
       sum += x[i];
       x_thread[i] = x[i];
@@ -100,7 +101,7 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int valid) {
       x_thread[i + 2] = v2 / 256.0f;
       x_thread[i + 3] = v3 / 4096.0f;
     }
-  } else if (bits == 8) {
+  } else if (bits == 8 || bits == 5 || bits == 6) {
     for (int i = 0; i < values_per_thread; i++) {
       const U v = (i < valid) ? (U)x[i] : (U)0;
       sum += v;
@@ -124,13 +125,38 @@ inline U load_vector_tg(const threadgroup T* x, thread U* x_thread) {
       x_thread[i + 2] = x[i + 2] / 256.0f;
       x_thread[i + 3] = x[i + 3] / 4096.0f;
     }
-  } else if (bits == 8) {
+  } else if (bits == 8 || bits == 5 || bits == 6) {
     for (int i = 0; i < values_per_thread; i++) {
       sum += x[i];
       x_thread[i] = x[i];
     }
   }
   return sum;
+}
+
+// One 5- or 6-bit code pack -> its codes, low code first: MLX's affine
+// layout is a little-endian bit stream, 8 codes in 5 bytes (5-bit) or 4
+// codes in 3 bytes (6-bit). Byte loads -- a pack is not word-aligned.
+inline void unpack5_(const device uint8_t* b, thread uint* q) {
+  const uint lo = (uint)b[0] | ((uint)b[1] << 8) | ((uint)b[2] << 16) |
+                  ((uint)b[3] << 24);
+  const uint hi = (uint)b[4];
+  q[0] = lo & 31u;
+  q[1] = (lo >> 5) & 31u;
+  q[2] = (lo >> 10) & 31u;
+  q[3] = (lo >> 15) & 31u;
+  q[4] = (lo >> 20) & 31u;
+  q[5] = (lo >> 25) & 31u;
+  q[6] = ((lo >> 30) | (hi << 2)) & 31u;
+  q[7] = (hi >> 3) & 31u;
+}
+
+inline void unpack6_(const device uint8_t* b, thread uint* q) {
+  const uint v = (uint)b[0] | ((uint)b[1] << 8) | ((uint)b[2] << 16);
+  q[0] = v & 63u;
+  q[1] = (v >> 6) & 63u;
+  q[2] = (v >> 12) & 63u;
+  q[3] = (v >> 18) & 63u;
 }
 
 // Dot product of x with one dequantized weight row chunk:
@@ -168,6 +194,18 @@ inline U qdot(
   } else if (bits == 8) {
     for (int i = 0; i < values_per_thread; i++) {
       accum += x_thread[i] * w[i];
+    }
+  } else if (bits == 5) {
+    for (int i = 0; i < (values_per_thread / 8); i++) {
+      uint q[8];
+      unpack5_(w + 5 * i, q);
+      for (int j = 0; j < 8; j++) { accum += x_thread[8 * i + j] * (U)q[j]; }
+    }
+  } else if (bits == 6) {
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      uint q[4];
+      unpack6_(w + 3 * i, q);
+      for (int j = 0; j < 4; j++) { accum += x_thread[4 * i + j] * (U)q[j]; }
     }
   }
   return scale * accum + sum * bias;
@@ -237,15 +275,20 @@ METAL_FUNC void qmv_fast_impl(
     // tail lanes that fall past in_vec_size so they contribute 0.
     const int krem = in_vec_size - k;
     U sum;
+    // A lane wholly past the row's end in the last block reads no weights:
+    // its x is zero, so it adds nothing, and its weight / scale pointers lie
+    // past the row -- past the BUFFER on the last row of a tensor.
+    bool live = true;
     if (krem >= block_size) {
       sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
     } else {
       const int v = in_vec_size - (k + (int)simd_lid * values_per_thread);
+      live = v > 0;
       sum = load_vector_safe<T, U, values_per_thread, bits>(
           x, x_thread, v < 0 ? 0 : v);
     }
 
-    for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int row = 0; row < results_per_simdgroup && live; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T* sl = scales + row * in_vec_size_g;
 
@@ -855,14 +898,16 @@ METAL_FUNC void qmv_swiglu_impl(
     // tail lanes that fall past in_vec_size so they contribute 0.
     const int krem = in_vec_size - k;
     U sum;
+    bool live = true;   // see qmv_fast_impl
     if (krem >= block_size) {
       sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
     } else {
       const int v = in_vec_size - (k + (int)simd_lid * values_per_thread);
+      live = v > 0;
       sum = load_vector_safe<T, U, values_per_thread, bits>(
           x, x_thread, v < 0 ? 0 : v);
     }
-    for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int row = 0; row < results_per_simdgroup && live; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
@@ -1320,6 +1365,66 @@ kernel void affine_gather_down_qmv_w8g64(
       out_vec_size, t0, simd_gid, simd_lid);
 }
 
+// 5-bit twins of the two gathered expert GEMVs (MLX affine w5 g64: 8 codes
+// in 5 bytes, a row K*5/8 bytes). The expert's slab is offset in BYTES and
+// 64-bit -- a 5-bit row is not a whole number of packs per u32 word in
+// general, and a cache pool of slots can pass 4 GB. Same buffer layout as
+// the w4/w8 kernels; qmv_swiglu_impl / qmv_fast_impl are bit-generic.
+kernel void affine_gather_qmv_swiglu_w5g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, 2*inner, K/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // N = 2*inner
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    constant int& top_k             [[buffer(8)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const ulong e = (ulong)pair_eid[p];
+  const ulong N = (ulong)out_vec_size, K = (ulong)in_vec_size;
+  w = (const device uint32_t*)((const device uint8_t*)w + e * N * K * 5 / 8);
+  scales += e * N * (K / 64);
+  biases += e * N * (K / 64);
+  x      += (uint)(p / top_k) * (uint)in_vec_size;
+  y      += (uint)p * ((uint)out_vec_size / 2u);
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_swiglu_impl<VPIPE_ELT, 64, 5>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, t0,
+      simd_gid, simd_lid);
+}
+
+kernel void affine_gather_down_qmv_w5g64(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],   // [E, H, inner/64]
+    const device VPIPE_ELT* biases  [[buffer(2)]],   // [E, H, inner/64]
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, H]
+    constant int& in_vec_size       [[buffer(5)]],   // inner
+    constant int& out_vec_size      [[buffer(6)]],   // H
+    const device int* pair_eid      [[buffer(7)]],   // [npair] expert per pair
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tid.z;
+  const ulong e = (ulong)pair_eid[p];
+  const ulong N = (ulong)out_vec_size, K = (ulong)in_vec_size;
+  w = (const device uint32_t*)((const device uint8_t*)w + e * N * K * 5 / 8);
+  scales += e * N * (K / 64);
+  biases += e * N * (K / 64);
+  x      += (uint)p * (uint)in_vec_size;
+  y      += (uint)p * (uint)out_vec_size;
+  const uint3 t0 = uint3(0u, tid.y, 0u);
+  qmv_fast_impl<VPIPE_ELT, 64, 5, false>(
+      w, scales, biases, x, y, /*residual=*/nullptr, in_vec_size,
+      out_vec_size, t0, simd_gid, simd_lid);
+}
+
 // Shared-expert sigmoid gate (Qwen3.5-MoE): g[t] = sigmoid(dequant(w[1,K] w8)
 // . X[t]). One simdgroup per input row (tid.y = row); lane 0 writes the gate.
 // grid {32, M, 1}, tg {32,1,1}; decode is the M=1 case. The router gate and
@@ -1624,6 +1729,10 @@ METAL_FUNC void qmv_batch_impl(
     // tail lanes past in_vec_size so they contribute 0 (see load_vector_safe).
     const int krem = in_vec_size - k;
     const int kvalid = in_vec_size - (k + (int)simd_lid * values_per_thread);
+    // A lane wholly past the row's end reads no weights (qmv_fast_impl's
+    // rule): its scales lie past the row, and a stray NaN there times its
+    // zero x would still be NaN.
+    const bool live = krem >= block_size || kvalid > 0;
     U sum[MAXM];
     for (int m = 0; m < MAXM; m++) {
       sum[m] = (krem >= block_size)
@@ -1631,7 +1740,7 @@ METAL_FUNC void qmv_batch_impl(
           : load_vector_safe<T, U, values_per_thread, bits>(
                 xptr[m], x_thread[m], kvalid < 0 ? 0 : kvalid);
     }
-    for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int row = 0; row < results_per_simdgroup && live; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const U s = scales[row * in_vec_size_g];
       const U b = biases[row * in_vec_size_g];
@@ -2591,15 +2700,17 @@ METAL_FUNC void qmv_grouped_impl(
 
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
-  // expert slab strides (rows N * per-row entries)
-  w      += (uint)e * (uint)out_vec_size * (uint)(in_vec_size_w / bytes_per_pack);
-  scales += (uint)e * (uint)out_vec_size * (uint)in_vec_size_g;
-  biases += (uint)e * (uint)out_vec_size * (uint)in_vec_size_g;
+  // Expert slab strides (rows N * per-row entries), the weights' in BYTES:
+  // a 5- or 6-bit pack is not one u32, so a word count would land between
+  // experts. 64-bit, since a cache pool of slots can pass 4 GB.
+  const ulong wslab = (ulong)e * (ulong)out_vec_size * (ulong)in_vec_size_w;
+  scales += (ulong)e * (ulong)out_vec_size * (ulong)in_vec_size_g;
+  biases += (ulong)e * (ulong)out_vec_size * (ulong)in_vec_size_g;
 
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  const device uint8_t* ws = (const device uint8_t*)w +
+  const device uint8_t* ws = (const device uint8_t*)w + wslab +
       out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -2630,12 +2741,28 @@ METAL_FUNC void qmv_grouped_impl(
           : load_vector_safe<T, U, values_per_thread, bits>(
                 xptr[m], x_thread[m], kvalid < 0 ? 0 : kvalid);
     }
-    for (int row = 0; row < results_per_simdgroup; row++) {
+    // A lane wholly past K in the last block reads nothing (qmv_fast_impl).
+    const bool live = krem >= block_size || kvalid > 0;
+    for (int row = 0; row < results_per_simdgroup && live; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const U s = scales[row * in_vec_size_g];
       const U b = biases[row * in_vec_size_g];
       U acc[MAXM] = {0};
-      if (bits == 4) {
+      if (bits == 5 || bits == 6) {
+        // Codes extracted whole (unpack5_/unpack6_); x_thread is raw x.
+        constexpr int per = bits == 5 ? 8 : 4;
+        for (int i = 0; i < (values_per_thread / per); i++) {
+          uint q[8];
+          if (bits == 5) { unpack5_(wl + 5 * i, q); }
+          else { unpack6_(wl + 3 * i, q); }
+          for (int j = 0; j < per; j++) {
+            const U wv = (U)q[j];
+            for (int m = 0; m < MAXM; m++) {
+              acc[m] += x_thread[m][per * i + j] * wv;
+            }
+          }
+        }
+      } else if (bits == 4) {
         // 4-bit: x_thread is power-of-16 pre-divided (load_vector) so the
         // masked nibble (shifted) reconstructs the magnitude -- weight read
         // once across MAXM rows.
@@ -2717,6 +2844,8 @@ VPIPE_GROUPED(affine_grouped_swiglu_w4g64, 4, 2, true, true)
 VPIPE_GROUPED(affine_grouped_down_w4g64, 4, 2, false, false)
 VPIPE_GROUPED(affine_grouped_swiglu_w8g64, 8, 2, true, true)
 VPIPE_GROUPED(affine_grouped_down_w8g64, 8, 2, false, false)
+VPIPE_GROUPED(affine_grouped_swiglu_w5g64, 5, 2, true, true)
+VPIPE_GROUPED(affine_grouped_down_w5g64, 5, 2, false, false)
 
 // group_size=32 twin of VPIPE_QMV_BATCH (GGUF q4_0): identical to the
 // macro above but the impl group_size template arg is 32. The g64 macro

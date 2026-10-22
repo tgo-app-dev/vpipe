@@ -914,6 +914,43 @@ TEST(minimax_h3_text_enc, streaming_matches_resident)
   std::printf("[minimax_h3_text_enc] streamed re-encode: %zu words differ\n",
               diff2);
   EXPECT_TRUE(diff2 == 0);
+  sm.reset();
+
+  // THE PATH THE STAGES TAKE: the raw-source slot pair, with a resident
+  // set grown by measurement in place of the pinned prefix (asked for,
+  // and ignored). Three encodes: growth off (no reserve), then on, then
+  // again against what was kept -- each the resident answer exactly.
+  MiniMaxH3TextEncoder::Config rcfg = base;
+  rcfg.lm.stream_layers = true;
+  rcfg.lm.stream_decode = true;
+  rcfg.lm.pin_frac      = 0.5;
+  auto rm = MiniMaxH3TextEncoder::load(root, mc, &sess, rcfg);
+  ASSERT_TRUE(rm != nullptr);
+  if (rm == nullptr) { return; }
+  EXPECT_TRUE(rm->streams_resident_set());
+  EXPECT_TRUE(rm->pinned_layers() == 0);
+  std::size_t rdiff = 0;
+  int kept[3] = {0, 0, 0};
+  for (int pass = 0; pass < 3; ++pass) {
+    if (pass == 1) {
+      rm->set_residency_reserve(0);
+      rm->set_residency_schedule(4);
+    }
+    SharedBuffer r = rm->encode_ids(ids, &serr);
+    ASSERT_TRUE(!r.empty() && r.byte_size() == sh.byte_size());
+    if (r.empty() || r.byte_size() != sh.byte_size()) { return; }
+    const auto* g3 = static_cast<const std::uint16_t*>(r.contents());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      if (g3[i] != want[i]) { ++rdiff; }
+    }
+    kept[pass] = rm->resident_layer_count();
+  }
+  std::printf("[minimax_h3_text_enc] through the slots, three encodes: %zu "
+              "words differ; %d / %d / %d of %d layers kept\n", rdiff,
+              kept[0], kept[1], kept[2], gtap);
+  EXPECT_TRUE(rdiff == 0);
+  EXPECT_TRUE(kept[0] == 0);
+  EXPECT_TRUE(kept[1] > 0);
 }
 
 // THE WEIGHTS FROM A DRAW THINGS .ckpt (Config::weights), the config and

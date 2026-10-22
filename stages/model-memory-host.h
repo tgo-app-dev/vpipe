@@ -15,7 +15,10 @@
 #include "stages/model-memory.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace vpipe {
 class SessionContextIntf;
@@ -35,6 +38,36 @@ std::size_t moe_expert_cache(const SessionContextIntf* session,
                              std::size_t experts, std::size_t layer_experts,
                              std::size_t scratch,
                              std::size_t headroom = kStreamHeadroom);
+
+// THE CLAIMS OF A STAGE THAT HOLDS A LANGUAGE MODEL in `dir` (text-chat,
+// visual-qa, realtime-vqa), one rule for all of them:
+//   * its weights -- STREAMABLE at the routed-expert cache's floor for a
+//     Mixture-of-Experts model (the rest of the model and one layer of
+//     experts; a hyper-connection model's n-gram table, read by row, no
+//     part of it), else held whole;
+//   * a Qwen vision tower's activation scratch at the largest picture it
+//     admits -- `picture_pixels`, or the checkpoint's own bound (16.7 MP
+//     on a Qwen3-VL repo: ~5 GB) when 0, or `picture_tokens` merged
+//     tokens' worth when that is set, none when < 0 -- unphased and labelled
+//     "vision:<label>": per STAGE, since two stages encode at once.
+std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
+                                     const std::string& dir,
+                                     const std::string& label,
+                                     std::int64_t picture_pixels = 0,
+                                     int picture_tokens = 0);
+
+// THE RESIDENCY RESERVE of a model resident in `phase` that grows a
+// resident set by measurement -- a conditioning encoder streaming through
+// the raw-source slots (MetalQwenModel::Config::stream_decode): the widest
+// activation scratch the plan books for any OTHER phase. Those arenas are
+// what may allocate while the encoder still holds its set -- a DiT's
+// forward and a VAE decode of an earlier prompt run beside the next
+// prompt's conditioning, and an encoder kept past its beat (kept warm, a
+// `keep` policy) sits beside this one's -- and no reading of free memory
+// can see them coming. Its own phase is left out: what the encoder's
+// forward allocates is in its hands before it admits a layer.
+std::size_t residency_reserve_beside(const SessionContextIntf* session,
+                                     std::string_view phase);
 
 }  // namespace model_memory
 }  // namespace vpipe

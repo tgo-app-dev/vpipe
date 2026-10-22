@@ -6,6 +6,9 @@
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/model-loader.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/drawthings-store.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "generative-models/wan/metal-wan-vae.h"
@@ -365,8 +368,9 @@ plan_streaming(const SessionContextIntf* session, const std::string& dit_dir,
   // budgets against.
   //
   // Computed WHATEVER `stream` came out as, because the two answers are
-  // independent and only prefill-only text encoders read this field --
-  // no DiT does (see StreamPlan::pin_frac). Those encoders now stream
+  // independent and only prefill-only text encoders with no residency
+  // policy read this field -- no DiT does, nor an encoder the raw-source
+  // path streams (see StreamPlan::pin_frac). Those encoders now stream
   // unconditionally, so gating the prefix on the verdict gave exactly
   // the wrong shape: on a ROOMY box the verdict is "preload", pin_frac
   // stayed 0, and an encoder that streams anyway then streamed with
@@ -758,6 +762,66 @@ payload_claims(std::string label, std::size_t bytes,
   return {std::move(c)};
 }
 
+
+std::vector<ResourceClaim>
+lm_claims(const SessionContextIntf* session, const std::string& dir,
+          const std::string& label, std::int64_t picture_pixels,
+          int picture_tokens)
+{
+  std::vector<ResourceClaim> out = weight_claims({dir});
+  genai::ModelLoader loader(session);
+  const auto mcfg = loader.load_config(dir);
+  if (!mcfg.has_value() || mcfg->hidden <= 0) { return out; }
+  // A Mixture-of-Experts LM is STREAMABLE: on a box too small for it the
+  // loader keeps its routed experts in a cache (MetalQwenModel::
+  // lm_expert_cache_bytes), so the least it holds is the rest of the
+  // model and one layer of experts.
+  const auto qc = genai::MetalQwenModel::config_from(*mcfg);
+  if (qc.is_moe()) {
+    if (auto w = genai::MetalLlamaWeights::open_model(dir)) {
+      const std::size_t ex = genai::MetalQwenModel::routed_expert_bytes(*w, qc);
+      const std::size_t un = genai::MetalQwenModel::unheld_bytes(*w, qc);
+      const std::size_t disk = dir_weights_bytes(dir);
+      if (ex > 0 && disk > ex + un) {
+        out[0] = weight_claim_streamable(
+            dir, disk - ex - un + ex / (std::size_t)std::max(1, qc.n_layers));
+      }
+    }
+  }
+  // The Qwen vision tower's encode at its largest picture (not Pixtral's
+  // or Gemma's: their towers budget a picture on their own terms).
+  const std::string& arch = mcfg->architecture;
+  if (picture_pixels >= 0 && mcfg->vision.present &&
+      arch != "Mistral3ForConditionalGeneration" &&
+      arch.rfind("Gemma", 0) != 0) {
+    const auto vc = genai::MetalQwenVisionEncoder::config_from(*mcfg);
+    if (picture_tokens > 0) {
+      const std::int64_t cell =
+          (std::int64_t)vc.patch_size * vc.spatial_merge;
+      picture_pixels = (std::int64_t)picture_tokens * cell * cell;
+    }
+    const std::size_t b =
+        genai::MetalQwenVisionEncoder::encode_scratch_bytes(vc,
+                                                            picture_pixels);
+    for (auto& c : scratch_claims("vision:" + label, b, {})) {
+      out.push_back(std::move(c));
+    }
+  }
+  return out;
+}
+
+std::size_t
+residency_reserve_beside(const SessionContextIntf* session,
+                         std::string_view phase)
+{
+  std::size_t widest = 0;
+  for (int i = 0; i < phase_count(); ++i) {
+    const std::string_view p = phase_name(i);
+    if (p == phase) { continue; }
+    widest = std::max(widest, scratch_footprint(session, p));
+  }
+  return widest;
+}
 
 std::size_t
 scratch_footprint(const SessionContextIntf* session, std::string_view phase)

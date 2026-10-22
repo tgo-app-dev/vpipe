@@ -9,11 +9,17 @@
 #include <algorithm>
 #include "generative-models/chat-template.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/model-loader.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/session.h"
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <memory>
 #include <optional>
 #include <span>
@@ -1175,6 +1181,307 @@ TEST(llm_chat_template, chatml_tool_results_turn_opens_assistant)
   for (int32_t v : ids) { if (v == im_start) { ++starts; } }
   EXPECT_TRUE(starts >= 2);
   EXPECT_TRUE(contains_id_(ids, im_end));
+}
+
+// ---- Tool / function calling (Qwen3.5 / 3.6 / 3.8: the XML form) --
+
+namespace {
+
+// Two tools, a line each, as text-chat writes them (compact).
+const char* kQwenTools =
+    "{\"type\":\"function\",\"function\":{\"name\":\"get_current_time\","
+    "\"description\":\"Get the time.\",\"parameters\":{\"type\":\"object\","
+    "\"properties\":{},\"required\":[]}}}\n"
+    "{\"type\":\"function\",\"function\":{\"name\":\"set_title\","
+    "\"description\":\"Sets the slide's title.\",\"parameters\":{\"type\":"
+    "\"object\",\"properties\":{\"title\":{\"type\":\"string\"}},"
+    "\"required\":[\"title\"]}}}";
+
+// The published chat_template.jinja's tools system turn for those tools
+// and a system message "You edit slides.", written out by hand from the
+// template: the tools as its `tojson` writes them, the call format, the
+// reminder, then the system message.
+const char* kQwenToolsTurn =
+    "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+    "{\"type\": \"function\", \"function\": {\"name\": \"get_current_time\", "
+    "\"description\": \"Get the time.\", \"parameters\": {\"type\": "
+    "\"object\", \"properties\": {}, \"required\": []}}}\n"
+    "{\"type\": \"function\", \"function\": {\"name\": \"set_title\", "
+    "\"description\": \"Sets the slide's title.\", \"parameters\": "
+    "{\"type\": \"object\", \"properties\": {\"title\": {\"type\": "
+    "\"string\"}}, \"required\": [\"title\"]}}}\n</tools>\n\n"
+    "If you choose to call a function ONLY reply in the following format "
+    "with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second "
+    "parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n"
+    "</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow "
+    "the specified format: an inner <function=...></function> block must "
+    "be nested within <tool_call></tool_call> XML tags\n- Required "
+    "parameters MUST be specified\n- You may provide optional reasoning "
+    "for your function call in natural language BEFORE the function call, "
+    "but NOT after\n- If there is no function call available, answer the "
+    "question like normal with your current knowledge and do not tell the "
+    "user about function calls\n</IMPORTANT>\n\nYou edit slides.";
+
+}  // namespace
+
+// The text is the template's, word for word: the XML call format it
+// teaches, not the Hermes JSON a ChatML family's; the host's system
+// message after the tools; the reasoning instruction ahead of them.
+TEST(llm_chat_template, qwen3_5_tools_turn_is_its_templates)
+{
+  EXPECT_TRUE(genai::qwen3_5_tools_system_text(
+                  "", kQwenTools, "  You edit slides.\n")
+              == kQwenToolsTurn);
+  const string r = "Reasoning effort is set to low.";
+  EXPECT_TRUE(genai::qwen3_5_tools_system_text(r, kQwenTools,
+                                               "You edit slides.")
+              == r + "\n\n" + kQwenToolsTurn);
+  // No system message: the turn ends at the reminder.
+  const string bare = genai::qwen3_5_tools_system_text("", kQwenTools, "");
+  const string t = kQwenToolsTurn;
+  EXPECT_TRUE(bare == t.substr(0, t.size() - strlen("\n\nYou edit slides.")));
+}
+
+// The host's system message and the tools are ONE system turn, and a
+// Qwen3.5 template reads the XML calls it taught, typed by the schema.
+TEST(llm_chat_template, qwen3_5_tools_are_one_turn_and_read_back)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok, std::optional<bool>(true));
+  if (!tpl) { return; }
+  EXPECT_TRUE(tpl->supports_tools());
+  const int32_t im_start = tok->special_token_id("<|im_start|>");
+  const int32_t im_end   = tok->special_token_id("<|im_end|>");
+  vector<int32_t> ids;
+  EXPECT_TRUE(tpl->render_system_message("You edit slides.", kQwenTools,
+                                         true, &ids));
+  EXPECT_TRUE(std::count(ids.begin(), ids.end(), im_start) == 1);
+  EXPECT_TRUE(std::count(ids.begin(), ids.end(), im_end) == 1);
+
+  const string reply =
+      "<tool_call>\n<function=set_title>\n<parameter=title>\n2026\n"
+      "</parameter>\n</function>\n</tool_call>";
+  auto calls = tpl->parse_tool_calls(reply, kQwenTools);
+  EXPECT_TRUE(calls.size() == 1);
+  if (calls.size() != 1) { return; }
+  EXPECT_TRUE(calls[0].name == "set_title");
+  EXPECT_TRUE(calls[0].arguments_json == "{\"title\":\"2026\"}");
+  // Qwen2's ChatML still reads Hermes JSON only.
+  auto qwen2 = genai::make_chat_template("Qwen2ForCausalLM", *tok);
+  if (!qwen2) { return; }
+  EXPECT_TRUE(qwen2->parse_tool_calls(reply, kQwenTools).empty());
+}
+
+// Against the real tokenizer (VPIPE_QWEN35_TEST_MODEL_PATH, a Qwen3.5
+// checkpoint): the turn decodes to the template's text, and its tags --
+// <tool_call>, <tool_response> -- are the single added tokens the model
+// was trained on, not their characters, in the tools turn, the results
+// and an assistant turn rendered again.
+TEST(llm_chat_template, qwen3_5_tool_turns_use_the_added_tokens)
+{
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  auto tok = genai::Tokenizer::from_huggingface_json(
+      std::string(path) + "/tokenizer.json", &sess);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(
+      "Qwen3_5ForConditionalGeneration", *tok, std::optional<bool>(true));
+  if (!tpl) { return; }
+  const int32_t call_open  = tok->special_token_id("<tool_call>");
+  const int32_t call_close = tok->special_token_id("</tool_call>");
+  const int32_t resp_open  = tok->special_token_id("<tool_response>");
+  const int32_t resp_close = tok->special_token_id("</tool_response>");
+  EXPECT_TRUE(call_open >= 0 && call_close >= 0 && resp_open >= 0
+              && resp_close >= 0);
+
+  vector<int32_t> sys;
+  EXPECT_TRUE(tpl->render_system_message("You edit slides.", kQwenTools,
+                                         true, &sys));
+  EXPECT_TRUE(tok->decode(sys) == string("<|im_start|>system\n")
+                                      + kQwenToolsTurn + "<|im_end|>\n");
+  // The example's and the reminder's.
+  EXPECT_TRUE(std::count(sys.begin(), sys.end(), call_open) == 2);
+  EXPECT_TRUE(std::count(sys.begin(), sys.end(), call_close) == 2);
+  // Each run between the tags encoded whole, as HF's tokenizer does.
+  const string head = "system\n# Tools";
+  const vector<int32_t> want = tok->encode(head);
+  EXPECT_TRUE(sys.size() > want.size()
+              && std::equal(want.begin(), want.end() - 1, sys.begin() + 1));
+
+  vector<string> results{"  {\"ok\":true}\n"};
+  vector<int32_t> res;
+  EXPECT_TRUE(tpl->render_tool_results_message(
+      span<const string>(results.data(), results.size()), &res));
+  EXPECT_TRUE(tok->decode(res)
+              == "<|im_start|>user\n<tool_response>\n{\"ok\":true}\n"
+                 "</tool_response><|im_end|>\n");
+  EXPECT_TRUE(contains_id_(res, resp_open) && contains_id_(res, resp_close));
+
+  const string reply =
+      "<tool_call>\n<function=set_title>\n<parameter=title>\nWater\n"
+      "</parameter>\n</function>\n</tool_call>";
+  vector<int32_t> asst;
+  EXPECT_TRUE(tpl->render_message("assistant", reply, false, &asst));
+  EXPECT_TRUE(contains_id_(asst, call_open) && contains_id_(asst, call_close));
+  // (The decoder writes the empty thinking block as vpipe's markers.)
+  const string a = tok->decode(asst);
+  const string tail = reply + "<|im_end|>\n";
+  EXPECT_TRUE(a.rfind("<|im_start|>assistant\n", 0) == 0);
+  EXPECT_TRUE(a.size() > tail.size()
+              && a.compare(a.size() - tail.size(), tail.size(), tail) == 0);
+  // A host's note showing the format: its tags the tokens too.
+  vector<int32_t> note;
+  EXPECT_TRUE(tpl->render_message("user", "Write it as <tool_call>.",
+                                  false, &note));
+  EXPECT_TRUE(contains_id_(note, call_open));
+  EXPECT_TRUE(tok->decode(note)
+              == "<|im_start|>user\nWrite it as <tool_call>.<|im_end|>\n");
+}
+
+// A float in a tool's schema as the template's `tojson` writes it --
+// Python's repr: a whole number keeps its ".0", fixed notation from 1e-4
+// up to 1e16, an exponent of at least two digits past it -- where
+// FlexData writes the shortest form. The line is HF's own rendering of
+// this tool (transformers 5.17, Qwen3.5-4B's template); an integer stays
+// an integer.
+TEST(llm_chat_template, qwen3_5_tools_spell_floats_as_its_template)
+{
+  const char* tool =
+      "{\"type\":\"function\",\"function\":{\"name\":\"set_zoom\","
+      "\"description\":\"Zoom.\",\"parameters\":{\"type\":\"object\","
+      "\"properties\":{\"level\":{\"type\":\"number\",\"minimum\":0.0001,"
+      "\"maximum\":1e16,\"default\":1.0},\"step\":{\"type\":\"number\","
+      "\"default\":0.5,\"exclusiveMaximum\":1e15},\"tiny\":{\"type\":"
+      "\"number\",\"default\":1e-05},\"neg\":{\"type\":\"number\","
+      "\"default\":-2.50},\"count\":{\"type\":\"integer\",\"default\":3}}}}}";
+  const string hf =
+      "{\"type\": \"function\", \"function\": {\"name\": \"set_zoom\", "
+      "\"description\": \"Zoom.\", \"parameters\": {\"type\": \"object\", "
+      "\"properties\": {\"level\": {\"type\": \"number\", \"minimum\": "
+      "0.0001, \"maximum\": 1e+16, \"default\": 1.0}, \"step\": {\"type\": "
+      "\"number\", \"default\": 0.5, \"exclusiveMaximum\": "
+      "1000000000000000.0}, \"tiny\": {\"type\": \"number\", \"default\": "
+      "1e-05}, \"neg\": {\"type\": \"number\", \"default\": -2.5}, "
+      "\"count\": {\"type\": \"integer\", \"default\": 3}}}}}";
+  const string text = genai::qwen3_5_tools_system_text("", tool, "");
+  const string head = "<tools>\n";
+  const size_t a = text.find(head);
+  const size_t b = text.find("\n</tools>");
+  EXPECT_TRUE(a != string::npos && b != string::npos);
+  if (a == string::npos || b == string::npos) { return; }
+  EXPECT_TRUE(text.substr(a + head.size(), b - a - head.size()) == hf);
+}
+
+// Qwen3.5, 3.6 and 3.8 share an architecture and a model_type; only the
+// checkpoint's own chat template says whether it takes a reasoning effort
+// (model_config::kReasoningEffortControl). Taking one, it defaults to
+// medium -- the un-instructed rendering -- and renders what is asked;
+// without one, nothing, whatever is asked; unknown, what is asked.
+TEST(llm_chat_template, qwen3_8_defaults_to_medium_and_qwen3_5_takes_none)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  const optional<bool> on(false);   // thinking on: the effort applies
+  auto mk = [&](string_view effort, optional<bool> control) {
+    return genai::make_chat_template("Qwen3_5ForConditionalGeneration",
+                                     *tok, on, effort, control);
+  };
+  auto t38 = mk("", true);
+  EXPECT_TRUE(t38 && t38->reasoning_effort() == "medium");
+  EXPECT_TRUE(t38 && t38->reasoning_instructions().empty());
+  auto t38x = mk("xhigh", true);
+  EXPECT_TRUE(t38x && t38x->reasoning_effort() == "xhigh");
+  EXPECT_TRUE(t38x && t38x->reasoning_instructions().rfind(
+                          "Reasoning effort is set to xhigh.", 0) == 0);
+  auto t35 = mk("xhigh", false);
+  vector<int32_t> ids;
+  EXPECT_TRUE(t35 && t35->reasoning_effort().empty());
+  EXPECT_TRUE(t35 && !t35->render_reasoning_system_turn(&ids));
+  EXPECT_TRUE(ids.empty());
+  auto unknown = mk("", nullopt);
+  EXPECT_TRUE(unknown && unknown->reasoning_effort().empty());
+  auto asked = mk("low", nullopt);
+  EXPECT_TRUE(asked && asked->reasoning_effort() == "low");
+  // Thinking off: no effort renders, the control or not.
+  auto off = genai::make_chat_template("Qwen3_5ForConditionalGeneration",
+                                       *tok, optional<bool>(true), "", true);
+  EXPECT_TRUE(off && off->reasoning_effort().empty());
+  // The config overload reads the loader's key.
+  genai::ModelConfig cfg;
+  cfg.architecture = "Qwen3_5ForConditionalGeneration";
+  bag::set_flag(cfg.extra, genai::model_config::kReasoningEffortControl,
+                true);
+  auto from_cfg = genai::make_chat_template(cfg, *tok, on);
+  EXPECT_TRUE(from_cfg && from_cfg->reasoning_effort() == "medium");
+}
+
+// The loader says which: model_config::kReasoningEffortControl off the
+// checkpoint's chat_template.jinja -- true where it carries Qwen3.8's
+// `reasoning_effort`, false where it carries none, absent with no
+// template to read.
+TEST(llm_chat_template, the_loader_reads_the_effort_control)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() /
+                        ("vpipe-effort-" + std::to_string(::getpid()));
+  struct Arm { const char* name; const char* tmpl; int want; };
+  const Arm arms[] = {
+    {"q38", "{%- set r = reasoning_effort|default('xhigh') %}", 1},
+    {"q35", "{%- if tools %}{{- '<tools>' }}{%- endif %}", 0},
+    {"none", nullptr, -1},
+  };
+  for (const Arm& a : arms) {
+    const fs::path d = root / a.name;
+    fs::create_directories(d);
+    std::ofstream(d / "config.json")
+        << "{\"architectures\": [\"Qwen3_5ForConditionalGeneration\"], "
+           "\"model_type\": \"qwen3_5\"}";
+    if (a.tmpl != nullptr) {
+      std::ofstream(d / "chat_template.jinja") << a.tmpl;
+    }
+    genai::ModelLoader loader(nullptr);
+    const auto mc = loader.load_config(d.string());
+    EXPECT_TRUE(mc.has_value());
+    if (!mc) { continue; }
+    const bool has =
+        bag::has(mc->extra, genai::model_config::kReasoningEffortControl);
+    const bool on =
+        bag::flag(mc->extra, genai::model_config::kReasoningEffortControl);
+    EXPECT_TRUE(a.want < 0 ? !has : (has && on == (a.want == 1)));
+  }
+  std::error_code ec;
+  fs::remove_all(root, ec);
+}
+
+// A system message that trims to nothing, with no tools: Qwen3.5 / 3.6's
+// templates render it anyway, as an empty turn
+// (`<|im_start|>system\n<|im_end|>\n`); 3.8's renders only its reasoning
+// instruction, none at medium.
+TEST(llm_chat_template, qwen3_5_renders_an_empty_system_message)
+{
+  Session sess;
+  auto tok = make_tok_(kChatMLTokenizerJson, &sess);
+  if (!tok) { return; }
+  const optional<bool> on(false);
+  for (const char* text : {"", "  \n"}) {
+    auto t35 = genai::make_chat_template(
+        "Qwen3_5ForConditionalGeneration", *tok, on, "", false);
+    auto t38 = genai::make_chat_template(
+        "Qwen3_5ForConditionalGeneration", *tok, on, "", true);
+    if (!t35 || !t38) { return; }
+    vector<int32_t> a, b;
+    EXPECT_TRUE(t35->render_system_message(text, "", true, &a));
+    EXPECT_TRUE(tok->decode(a) == "<|im_start|>system\n<|im_end|>\n");
+    EXPECT_TRUE(t38->render_system_message(text, "", true, &b));
+    EXPECT_TRUE(b.empty());
+  }
 }
 
 // ---- Tool / function calling (Gemma-4 DSL) -------------------------

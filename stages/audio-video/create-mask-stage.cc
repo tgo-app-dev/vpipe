@@ -111,6 +111,12 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "overlay_opacity", .type = ConfigType::Real,
    .doc = "0..1 strength the mask is painted over the reference image with",
    .def_real = 0.5},
+  {.key = "mask_threshold", .type = ConfigType::Int,
+   .doc = "binary mode: an in-mask value (0..255) at or above this is SET. "
+          "1 (default) takes any non-zero value, so a 0/1 mask means what "
+          "it says; 128 is Pillow's rule for a soft or anti-aliased mask "
+          "(`point(lambda v: 255 if v >= 128 else 0)`)",
+   .def_int = 1},
   {.key = "output_dtype", .type = ConfigType::String,
    .doc = "\"u8\" (0..255, or a class index) or \"f32\" (coverage in [0,1]; "
           "a class index stays an index)", .def_str = "u8",
@@ -141,10 +147,12 @@ const PortSpec kIports[] = {
    .tags = "rgb-frames", .clock_group = 0},
   {.name = "in-mask",
    .doc = "mask to start from: planar TensorBeat [1,H,W] or [H,W] (F32 or "
-          "U8). Optional -- it seeds the editor, and is the whole input "
-          "when `interactive` is false.",
+          "U8), or a PICTURE [3,H,W] / [4,H,W] -- a mask PNG through "
+          "load-image -- read as its luminance by Pillow's convert(\"L\") "
+          "(alpha ignored). Optional -- it seeds the editor, and is the "
+          "whole input when `interactive` is false.",
    .type = &typeid(TensorBeatPayload),
-   .tags = "mask-frames", .clock_group = 1},
+   .tags = "mask-frames,rgb-frames", .clock_group = 1},
 };
 const PortSpec kOports[] = {
   {.name = "out",
@@ -288,6 +296,14 @@ CreateMaskStage::CreateMaskStage(const SessionContextIntf* s,
 
   _interactive      = attr_bool("interactive");
   _input_normalized = attr_bool("input_normalized");
+  {
+    const std::int64_t t = attr_int("mask_threshold");
+    if (t < 1 || t > 255) {
+      fail_config(fmt("create-mask('{}'): mask_threshold must be 1..255 "
+                      "(got {})", this->id(), t));
+    }
+    _mask_threshold = (std::uint8_t)std::clamp<std::int64_t>(t, 1, 255);
+  }
   _title            = attr_str("title");
 
   allocate_oports(spec().oports.size());
@@ -445,7 +461,10 @@ CreateMaskStage::unpack_mask_(const TensorBeat& tb, vector<uint8_t>* out,
 {
   int H = 0;
   int W = 0;
-  if (tb.shape.size() == 3 && tb.shape[0] == 1) {
+  int C = 1;
+  if (tb.shape.size() == 3 &&
+      (tb.shape[0] == 1 || tb.shape[0] == 3 || tb.shape[0] == 4)) {
+    C = static_cast<int>(tb.shape[0]);
     H = static_cast<int>(tb.shape[1]);
     W = static_cast<int>(tb.shape[2]);
   } else if (tb.shape.size() == 2) {
@@ -459,7 +478,33 @@ CreateMaskStage::unpack_mask_(const TensorBeat& tb, vector<uint8_t>* out,
   const size_t n = static_cast<size_t>(H) * W;
   out->assign(n, 0);
 
-  if (tb.dtype == TensorBeat::DType::U8) {
+  // A PICTURE as a mask: its luminance, by Pillow's integer rule for
+  // RGB(A) -> L (L24: 19595 R + 38470 G + 7471 B, rounded, >> 16), so a
+  // grey mask decoded to RGB comes back exactly; alpha is ignored as
+  // Pillow ignores it. A class map is not read from a picture.
+  if (C > 1) {
+    if (_mode == MaskEditorChannel::Mode::Class) { return false; }
+    vector<uint8_t> rgb(n * 3, 0);
+    if (tb.dtype == TensorBeat::DType::U8) {
+      AlignedVector<uint8_t> tmp = tb.materialize_contiguous();
+      if (tmp.size() < n * 3) { return false; }
+      std::memcpy(rgb.data(), tmp.data(), n * 3);
+    } else if (tb.dtype == TensorBeat::DType::F32) {
+      AlignedVector<float> tmp = tb.materialize_contiguous_as<float>();
+      if (tmp.size() < n * 3) { return false; }
+      const float scale = _input_normalized ? 255.0f : 1.0f;
+      for (size_t i = 0; i < n * 3; ++i) {
+        rgb[i] = clamp_byte_(tmp[i] * scale);
+      }
+    } else {
+      return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+      const uint32_t l = rgb[i] * 19595u + rgb[n + i] * 38470u +
+                         rgb[2 * n + i] * 7471u + 0x8000u;
+      (*out)[i] = static_cast<uint8_t>(l >> 16);
+    }
+  } else if (tb.dtype == TensorBeat::DType::U8) {
     const uint8_t*         src = nullptr;
     AlignedVector<uint8_t> tmp;
     if (tb.is_contiguous() && tb.byte_size() == n) {
@@ -490,10 +535,11 @@ CreateMaskStage::unpack_mask_(const TensorBeat& tb, vector<uint8_t>* out,
     return false;
   }
 
-  // Binary tolerates any non-zero input as "set", so a mask that came in
-  // as 0/1 rather than 0/255 still means what it says.
+  // Binary tolerates any non-zero input as "set" by default, so a mask
+  // that came in as 0/1 rather than 0/255 still means what it says;
+  // `mask_threshold` raises the line for a soft mask.
   if (_mode == MaskEditorChannel::Mode::Binary) {
-    for (uint8_t& v : *out) { v = v != 0 ? 255 : 0; }
+    for (uint8_t& v : *out) { v = v >= _mask_threshold ? 255 : 0; }
   }
   *w = W;
   *h = H;
@@ -950,9 +996,20 @@ CreateMaskStage::process(RuntimeContext& ctx)
   }
 
   // Headless is input-driven: every mask that arrives is one beat out.
-  if (!_interactive && mask_moved) {
-    if (auto out = make_output_()) {
-      co_await ctx.write(0, std::move(out));
+  // An OVERLAY with a reference wired waits for its first reference: the
+  // two sources race, and a mask that arrived first was painted over
+  // black -- an edit graph then greyed a box on nothing and the picture
+  // was lost. The held beat goes out once a reference arrives, or at the
+  // reference's end if none ever does.
+  if (!_interactive && mask_moved) { _out_pending = true; }
+  if (!_interactive && _out_pending) {
+    const bool waiting = _overlay_out && _want_ref && !_ref_valid &&
+                         !ctx.eos(0);
+    if (!waiting) {
+      _out_pending = false;
+      if (auto out = make_output_()) {
+        co_await ctx.write(0, std::move(out));
+      }
     }
   }
 

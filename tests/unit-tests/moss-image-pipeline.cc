@@ -356,12 +356,16 @@ TEST(moss_image_cond, conditioning_matches_the_reference)
 }
 
 // A text encoder kept warm (`keep_loaded`) is handed to the next graph
-// only if THAT graph's plan would build it alike: it streams with a
-// pinned prefix sized from the box, and one pinned for a roomier plan
-// holds more than this one admitted. Kept, taken back (the same
-// conditioning to the byte), then asked for under a smaller box
-// (VPIPE_RAM_LIMIT_MB, so fewer layers pin): built again, not taken.
-TEST(moss_image_cond, an_encoder_kept_warm_is_taken_only_as_this_plan_pins)
+// only if THAT graph's plan would build it alike. Streamed through the
+// raw-source slots -- this Qwen3.5 hybrid's path now -- it carries
+// nothing a plan sized (its resident set is measured again before every
+// prompt), so it is taken back even under a smaller box. Through the
+// pinned fallback (VPIPE_ENC_RESIDENCY=0) the prefix was sized from the
+// box, and one pinned for a roomier plan holds more than this one admits:
+// built again, not taken. Three graphs each way -- kept, taken back,
+// asked for under VPIPE_RAM_LIMIT_MB -- and the conditioning the same
+// bytes in all six.
+TEST(moss_image_cond, a_warm_encoder_is_taken_back_unless_it_pinned)
 {
   const std::string root = env_("VPIPE_MOSS_IMAGE_TEST_MODEL_PATH");
   const FlexData man = manifest_("text");
@@ -370,8 +374,9 @@ TEST(moss_image_cond, an_encoder_kept_warm_is_taken_only_as_this_plan_pins)
   const std::string prompt(pr.as_array().at(0).as_string(""));
   Session sess;
   if (sess.metal_compute() == nullptr) { return; }
-  // One graph: the prompt's conditioning, and whether it was taken.
-  auto run = [&](bool* taken) {
+  // One graph: the prompt's conditioning, whether it was taken, and how
+  // many layers were resident as the prompt began.
+  auto run = [&](bool* taken, int* resident) {
     std::vector<float> out;
     auto pl = std::make_unique<Pipeline>("moss-image-cond-warm", &sess);
     auto srcu = std::make_unique<SourceText>(&sess, "src",
@@ -398,31 +403,47 @@ TEST(moss_image_cond, an_encoder_kept_warm_is_taken_only_as_this_plan_pins)
     if (launched) { rt.wait_idle(); }
     rt.stop();
     *taken = cond->encoder_taken_warm();
+    *resident = cond->encoder_layers_resident_at_prompt();
     if (launched && pos->captured.size() == 1) {
       int rows = 0, cols = 0;
       out = beat_f32_(pos->captured[0].get(), &rows, &cols);
     }
     return out;   // the graph goes here, the encoder kept warm
   };
-  bool t0 = true, t1 = false, t2 = true;
-  const std::vector<float> first = run(&t0);
-  const std::vector<float> again = run(&t1);
-  setenv("VPIPE_RAM_LIMIT_MB", "32768", 1);
-  const std::vector<float> small = run(&t2);
-  unsetenv("VPIPE_RAM_LIMIT_MB");
-  MP_REQUIRE(!first.empty() && again.size() == first.size() &&
-             small.size() == first.size());
-  const bool same = std::memcmp(again.data(), first.data(),
-                                first.size() * 4) == 0;
-  const bool same_small = std::memcmp(small.data(), first.data(),
-                                      first.size() * 4) == 0;
-  std::printf("[moss_image_cond] taken back %d / %d / %d (the last under a "
-              "32 GB box); conditioning %s, %s under it\n", (int)t0,
-              (int)t1, (int)t2, same ? "byte-identical" : "DIFFERS",
-              same_small ? "byte-identical" : "DIFFERS");
-  EXPECT_TRUE(!t0 && t1 && !t2);
-  EXPECT_TRUE(same);
-  EXPECT_TRUE(same_small);   // a pinned prefix is not the arithmetic
+  std::vector<float> ref;
+  for (const bool pinned : {false, true}) {
+    if (pinned) { setenv("VPIPE_ENC_RESIDENCY", "0", 1); }
+    bool t[3] = {true, false, !pinned};
+    int r[3] = {0, 0, 0};
+    const std::vector<float> first = run(&t[0], &r[0]);
+    const std::vector<float> again = run(&t[1], &r[1]);
+    setenv("VPIPE_RAM_LIMIT_MB", "32768", 1);
+    const std::vector<float> small = run(&t[2], &r[2]);
+    unsetenv("VPIPE_RAM_LIMIT_MB");
+    if (pinned) { unsetenv("VPIPE_ENC_RESIDENCY"); }
+    MP_REQUIRE(!first.empty() && again.size() == first.size() &&
+               small.size() == first.size());
+    if (ref.empty()) { ref = first; }
+    auto same = [&](const std::vector<float>& v) {
+      return v.size() == ref.size() &&
+             std::memcmp(v.data(), ref.data(), ref.size() * 4) == 0;
+    };
+    std::printf("[moss_image_cond] %s: taken back %d / %d / %d (the last "
+                "under a 32 GB box); layers resident as each prompt began "
+                "%d / %d / %d; conditioning %s\n",
+                pinned ? "pinned prefix" : "residency", (int)t[0], (int)t[1],
+                (int)t[2], r[0], r[1], r[2],
+                same(first) && same(again) && same(small)
+                    ? "byte-identical throughout" : "DIFFERS");
+    EXPECT_TRUE(!t[0] && t[1] && t[2] == !pinned);
+    if (!pinned) {
+      // Residency engaged (not -1), grew in the first graph, and the set
+      // it grew came back with the encoder.
+      EXPECT_TRUE(r[0] == 0 && r[1] > 0 && r[2] > 0);
+    }
+    // Neither a pinned prefix nor a resident set is the arithmetic.
+    EXPECT_TRUE(same(first) && same(again) && same(small));
+  }
 }
 
 // The small decoder: every decoder level narrower than the encoder's,

@@ -10,6 +10,7 @@
 #include "common/flex-data.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
 #include "generative-models/z-image/z-image-layout.h"
+#include "generative-models/fibo2/fibo2-layout.h"
 #include "generative-models/moss-image/metal-moss-image-transformer.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
@@ -17,6 +18,7 @@
 #include "interfaces/session-services-intf.h"
 #include "stages/image-decode.h"
 #include "stages/model-config-source.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -73,7 +75,7 @@ const ConfigKey kAttrs[] = {
           "model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
    .suggest_db_type = "krea2,flux2,flux3,qwen-image,qwen-image-edit,"
-       "qwen-image-21,boogu-image,boogu-image-edit,"
+       "qwen-image-21,boogu-image,boogu-image-edit,fibo2,"
        "wan-t2v,wan-i2v,minimax-h3-fl2va,vosr",
    .model_channel = "diffusion-model"},
   {.key = "encoder_dir", .type = ConfigType::String, .required = false,
@@ -309,16 +311,26 @@ embed_table_(genai::WeightSet& ws, const std::string& nm,
 // filterscale, weights lanczos((k + 0.5 - center) / filterscale) normalised to
 // sum 1, and -- as Pillow does -- the horizontal pass is CLAMPED BACK TO U8
 // before the vertical pass, which is observable in the result.
+//
+// `bicubic` swaps the filter for Pillow's BICUBIC (a = -0.5, support 2),
+// what Image.thumbnail resamples with by default.
 void resize_lanczos_(const std::uint8_t* rgb, int H, int W, int nh, int nw,
-                     std::vector<std::uint8_t>& out)
+                     std::vector<std::uint8_t>& out, bool bicubic = false)
 {
-  auto lanczos = [](double x) {
+  auto lanczos = [bicubic](double x) {
     if (x < 0.0) { x = -x; }
+    if (bicubic) {
+      const double a = -0.5;
+      if (x < 1.0) { return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0; }
+      if (x < 2.0) { return (((x - 5.0) * x + 8.0) * x - 4.0) * a; }
+      return 0.0;
+    }
     if (x < 1e-9) { return 1.0; }
     if (x >= 3.0) { return 0.0; }
     const double px = M_PI * x;
     return (std::sin(px) / px) * (std::sin(px / 3.0) / (px / 3.0));
   };
+  const double kSupport = bicubic ? 2.0 : 3.0;
   // Per-output-pixel weight tables for one axis.
   struct Axis {
     std::vector<int> lo, hi;
@@ -328,7 +340,7 @@ void resize_lanczos_(const std::uint8_t* rgb, int H, int W, int nh, int nw,
     Axis ax;
     const double scale = (double)in / (double)outn;
     const double fs = scale < 1.0 ? 1.0 : scale;
-    const double support = 3.0 * fs;
+    const double support = kSupport * fs;
     ax.lo.resize((std::size_t)outn);
     ax.hi.resize((std::size_t)outn);
     ax.w.resize((std::size_t)outn);
@@ -451,6 +463,35 @@ void cap_longest_side_(const std::uint8_t* rgb, int H, int W, int cap,
   *oh = nh; *ow = nw;
 }
 
+// Pillow's Image.thumbnail((cap, cap)): never upscales; the size keeps
+// the aspect, the free side rounded to whichever integer keeps it best
+// (round_aspect); BICUBIC, with no reducing pass below a 4x reduction.
+void pil_thumbnail_(const std::uint8_t* rgb, int H, int W, int cap,
+                    std::vector<std::uint8_t>& out, int* oh, int* ow)
+{
+  *oh = H; *ow = W;
+  if (H <= 0 || W <= 0 || cap <= 0 || (W <= cap && H <= cap)) { return; }
+  const double aspect = (double)W / (double)H;
+  int x = cap, y = cap;
+  auto round_aspect = [](double v, auto key) {
+    const int lo = (int)std::floor(v), hi = (int)std::ceil(v);
+    const int pick = key(lo) <= key(hi) ? lo : hi;
+    return std::max(pick, 1);
+  };
+  if ((double)x / (double)y >= aspect) {
+    x = round_aspect((double)y * aspect, [&](int n) {
+      return std::fabs(aspect - (double)n / (double)y);
+    });
+  } else {
+    y = round_aspect((double)x / aspect, [&](int n) {
+      return n == 0 ? 0.0 : std::fabs(aspect - (double)x / (double)n);
+    });
+  }
+  if (x == W && y == H) { return; }
+  resize_lanczos_(rgb, H, W, y, x, out, /*bicubic=*/true);
+  *oh = y; *ow = x;
+}
+
 // ---- Prompt templates (shared with the generate-image stage) ----
 constexpr const char* kPrefix =
     "<|im_start|>system\nDescribe the image by detailing the color, shape, "
@@ -474,6 +515,9 @@ const int kFlux3Taps[8] = {4, 8, 12, 16, 20, 24, 28, 32};
 // The prompt is right-padded to a multiple of 80 with <|endoftext|>, and
 // the DiT attends to EVERY row it is given, pads included.
 constexpr int kFlux3PadMultiple = 80;
+// Fibo 2.0's prompt cap (the pipeline's tokenizer_max_length; truncation
+// keeps the first tokens).
+constexpr int kFibo2MaxTokens = 4096;
 
 constexpr const char* kQiePrefix =
     "<|im_start|>system\nDescribe the key features of the input image (color, "
@@ -789,6 +833,23 @@ encoder_config_flux3_(const std::string& enc_dir)
   return c;
 }
 
+// Fibo 2.0's text encoder is the same stock Qwen3-VL-4B, read the same
+// way -- Boogu's reader pointed at text_encoder/ -- and run only as deep
+// as its deepest tap (hidden_states[35], the output of layer 34), so the
+// last layer is not loaded.
+genai::MetalQwenModel::Config
+encoder_config_fibo2_(const std::string& enc_dir)
+{
+  genai::MetalQwenModel::Config c = encoder_config_boogu_(enc_dir);
+  int deepest = 0;
+  for (const auto& b : genai::fibo2::kBundleLayers) {
+    for (int k : b) { deepest = std::max(deepest, k); }
+  }
+  c.n_layers = std::min(c.n_layers, deepest);
+  c.max_seq = 8192;
+  return c;
+}
+
 // The prompt-length cap FLUX.3's checkpoint states for its encoder
 // (<root>/config.json text_encoder.max_tokens, 8192 in the published one),
 // which diffusers' pipeline also uses. 8192 when the file says nothing.
@@ -928,6 +989,10 @@ std::string family_(const std::string& transformer_dir)
         // default would refuse to read as a dense Qwen3-VL -- and its
         // recipe is the final norm over a templated user turn.
         if (cls == "MOSSImageTransformer") { return "moss-image"; }
+        // Fibo 2.0. Its encoder is a stock Qwen3-VL-4B that the "krea2"
+        // default would load -- and condition with Krea-2's 12 taps and
+        // system prompt instead of fifteen normalized taps in six bundles.
+        if (cls == "BriaFibo2Transformer2DModel") { return "fibo2"; }
         // Boogu-Image. The t2i and edit repos ship the SAME transformer config
         // (only the weights differ), so there is one family string; the edit
         // path turns on when a reference image is wired, the way a profile
@@ -1104,6 +1169,12 @@ DiffusionConditionerStage::keep_encoder_warm_()
   }
   auto* mgr = session()->services()->generative_model_manager();
   if (mgr == nullptr) { return; }
+  // What the hold keeps, for the next launch's fit test: the layers it
+  // built or kept and its embedding table. A slot pair with nothing left
+  // to serve goes first.
+  (void)_encoder->release_idle_slots();
+  const std::size_t bytes =
+      (std::size_t)_encoder->resident_bytes() + _embed.byte_size();
   auto w = std::make_shared<WarmEncoder>();
   w->ws = _enc_ws;
   w->encoder = std::move(_encoder);
@@ -1111,9 +1182,50 @@ DiffusionConditionerStage::keep_encoder_warm_()
   w->hidden = _enc_hidden;
   session()->log_debug(fmt(
       "DiffusionConditionerStage('{}'): the text encoder kept warm for "
-      "{:.0f} s", this->id(), _keep_loaded));
+      "{:.0f} s ({} MB)", this->id(), _keep_loaded, bytes >> 20));
   mgr->keep_model_warm(kWarmEncoderKind, _enc_dir, _enc_warm_key,
-                       std::move(w), 0, _keep_loaded);
+                       std::move(w), bytes, _keep_loaded);
+}
+
+void
+DiffusionConditionerStage::size_encoder_residency_(int passes)
+{
+  const bool qwen = _encoder && _encoder->streams_decode();
+  const bool h3 = _h3_enc && _h3_enc->streams_resident_set();
+  if (!qwen && !h3) { return; }
+  // What must stay clear: the arenas of the phases that are not this
+  // one, which may allocate while the set is held -- an earlier prompt's
+  // denoise and decode run beside this one's conditioning, and an
+  // encoder that outlives its beat sits beside this prompt's.
+  const std::size_t reserve = model_memory::residency_reserve_beside(
+      session(), model_memory::kPhaseCondition);
+  // How many forwards are coming: this prompt's passes, and -- for an
+  // encoder that outlives its beat (a batch until its end, `keep`, a
+  // warm hold) -- the prompts after it. A schedule tells one pass from
+  // several: a single pass reuses nothing it keeps, so it admits a layer
+  // a forward rather than paying a copy per layer for nothing.
+  const bool outlives =
+      _batch || _idle_action == model_memory::UnloadPolicy::kKeep ||
+      (_keep_loaded > 0 &&
+       _idle_action != model_memory::UnloadPolicy::kDestroy);
+  const int forwards = outlives ? std::max(passes, 1) * 4 : passes;
+  int kept = 0;
+  if (qwen) {
+    _encoder->set_residency_reserve(reserve);
+    _encoder->set_residency_schedule(forwards);
+    kept = _encoder->resident_layer_count();
+  } else {
+    _h3_enc->set_residency_reserve(reserve);
+    _h3_enc->set_residency_schedule(forwards);
+    kept = _h3_enc->resident_layer_count();
+  }
+  _enc_resident_at_prompt = kept;
+  session()->log_debug(fmt(
+      "DiffusionConditionerStage('{}'): encoder residency -- {} MB kept "
+      "clear for the other phases' arenas, {} pass{} this prompt{}, {} "
+      "layers resident before it", this->id(), reserve >> 20, passes,
+      passes == 1 ? "" : "es",
+      outlives ? ", and the encoder outlives it" : "", kept));
 }
 
 const StageSpec&
@@ -1290,23 +1402,30 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
           session(), ed, std::string(), model_memory::kStreamHeadroom,
           0, model_memory::kPhaseCondition);
       // ALWAYS STREAM -- see StreamPlan::stream. This encoder prefills
-      // once per prompt and is dropped; the plan is consulted only for
-      // how much of the prefix fits beside everything else.
+      // once per prompt (twice with a negative) and is dropped. Its
+      // Qwen3-VL stack is one the raw-source path serves, so it streams
+      // through a slot pair and keeps what free memory allows
+      // (size_encoder_residency_ before every prompt); the plan's
+      // pin_frac is read only where the loader cannot take that path (a
+      // pack of another width) and pins a prefix instead.
       h3cfg.lm.stream_layers = true;
+      h3cfg.lm.stream_decode = true;
       h3cfg.lm.pin_frac      = plan.pin_frac;
-      if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
-        h3cfg.lm.stream_layers = (std::atoi(e) != 0);
-        if (!h3cfg.lm.stream_layers) { h3cfg.lm.pin_frac = 0.0; }
+      if (const char* e = std::getenv("VPIPE_ENC_RESIDENCY")) {
+        h3cfg.lm.stream_decode = std::atoi(e) != 0;
       }
-      if (const char* e = std::getenv("VPIPE_H3_ENC_PIN_FRAC")) {
-        h3cfg.lm.pin_frac = std::atof(e);
+      if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
+        if (std::atoi(e) == 0) {
+          h3cfg.lm.stream_layers = false;
+          h3cfg.lm.stream_decode = false;
+          h3cfg.lm.pin_frac = 0.0;
+        }
       }
       session()->log_debug(fmt(
           "DiffusionConditionerStage('{}'): MiniMax-H3 encoder footprint "
-          "{} GB (others {} GB) -> {} ({:.0f}% of the prefix pinned)",
+          "{} GB (others {} GB) -> {}",
           this->id(), plan.footprint >> 30, plan.others >> 30,
-          h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD",
-          h3cfg.lm.pin_frac * 100.0));
+          h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
     }
     _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_cfg_dir, mc,
                                                 const_cast<SessionContextIntf*>(
@@ -1316,17 +1435,25 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
                            "encoder load failed: {}", this->id(), _enc_dir));
       return false;
     }
-    if (_h3_enc->streaming()) {
+    if (_h3_enc->streams_resident_set()) {
+      session()->info(fmt(
+          "DiffusionConditionerStage('{}'): MiniMax-H3 encoder streams its "
+          "{} layers through a slot pair, the next read under this layer's "
+          "GPU work; the layers it keeps grow into free memory as it runs",
+          this->id(), h3cfg.tap));
+    } else if (_h3_enc->streaming()) {
       session()->info(fmt(
           "DiffusionConditionerStage('{}'): MiniMax-H3 encoder streams its "
           "layers ({} of {} pinned) -- ~one layer resident instead of the "
           "stack, at one command buffer per layer per prompt",
           this->id(), _h3_enc->pinned_layers(), h3cfg.tap));
-      // Deliberately NOT revising the manager declaration down: unlike a
-      // DiT, an LM reads its tensors UNCACHED into its own buffers, so the
-      // weight set's stats report a fraction of what the model holds and
-      // would revise to a number that is wrong in the unsafe direction.
     }
+    // Deliberately NOT revising the manager declaration: unlike a DiT, an
+    // LM reads its tensors UNCACHED into its own buffers, so the weight
+    // set's stats report a fraction of what the model holds and would
+    // revise to a number that is wrong in the unsafe direction; and the
+    // layers residency keeps come out of measured free memory and leave
+    // with the encoder (see the Qwen families' load below).
     // The encoder owns its tokenizer and embedding table; nothing else
     // to bind here.
     return true;
@@ -1334,6 +1461,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   genai::MetalQwenModel::Config ecfg =
       _family == "flux2" ? encoder_config_flux2_(_enc_cfg_dir)
       : _family == "flux3" ? encoder_config_flux3_(_enc_cfg_dir)
+      : _family == "fibo2" ? encoder_config_fibo2_(_enc_cfg_dir)
       : _family == "qwen-image-edit" ? encoder_config_qie_()
       : _family == "boogu-image" ? encoder_config_boogu_(_enc_cfg_dir)
       : _family == "qwen-image-21"
@@ -1387,6 +1515,15 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // its verdict through the lm_head. MetalQwenModel::load refuses the
   // combination anyway; asking only when it can be served keeps a
   // warning off a path that is behaving correctly.
+  // One set for this checkpoint, shared with the vision tower and the
+  // embedding table below and with anything else naming the same dir.
+  // Opened FIRST: how the encoder streams is read off its tensors.
+  _enc_ws = genai::open_weight_set(_enc_dir, session());
+  if (!_enc_ws) {
+    session()->error(fmt("DiffusionConditionerStage('{}'): cannot open text "
+                         "encoder checkpoint: {}", this->id(), _enc_dir));
+    return false;
+  }
   if (ecfg.backbone_only) {
     // kPhaseCondition, not the default. This encoder is resident during
     // CONDITIONING and dropped before the denoise -- decide_resources()
@@ -1402,8 +1539,8 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     // `backbone_only` IS the prefill-only guarantee -- MetalQwenModel::
     // load refuses stream_layers without it, because "decode re-reading
     // the stack per token" is the case that makes streaming wrong. So
-    // this encoder runs ONE pass per prompt and is then dropped, and
-    // what streaming costs it is that single pass.
+    // this encoder runs one pass per prompt (two with a negative), and
+    // what streaming costs it is those passes.
     //
     // Against that: preload is an IRREVERSIBLE decision taken from an
     // on-disk size, and that size is wrong exactly when a loader
@@ -1412,47 +1549,71 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     // instead of after the whole read: 16.7 GB at ~4.5 GB/s is seconds
     // of dead time before any work.
     //
-    // The plan is still consulted for `pin_frac`, which is what makes
-    // this graceful -- on a roomy box the pinned prefix absorbs most of
-    // the stack and only the tail is re-read.
+    // HOW it streams is the checkpoint's. Where the raw-source path
+    // serves it (MetalQwenModel::streams_raw: a Qwen3 / Qwen3-VL stack,
+    // float or a uniform w8 pack, or a Qwen3.5 hybrid in float -- every
+    // family here but one) each
+    // layer is read through a slot pair, the next under this one's GPU
+    // work, and the RESIDENT SET GROWS BY MEASUREMENT: a layer is kept
+    // while free memory allows and given back when the box takes pages
+    // back, so the second pass (the negative, or the next prompt of an
+    // encoder that outlives its beat) reads only what was not kept.
+    // size_encoder_residency_() tells it how much to leave clear and how
+    // many passes are coming. Elsewhere -- Qwen2.5-VL's attention biases
+    // (Qwen-Image-Edit), a pack of another width -- each layer is built
+    // inside the prefill and freed, with a leading prefix pinned at the
+    // plan's pin_frac.
     ecfg.stream_layers = true;
-    ecfg.pin_frac      = plan.pin_frac;
+    ecfg.stream_decode = true;
+    // VPIPE_ENC_RESIDENCY=0 is the A/B: the prefill path and its prefix
+    // wherever this encoder streams.
+    if (const char* e = std::getenv("VPIPE_ENC_RESIDENCY")) {
+      ecfg.stream_decode = std::atoi(e) != 0;
+    }
+    if (!genai::MetalQwenModel::streams_raw(_enc_ws->src(), ecfg)) {
+      ecfg.stream_decode = false;
+      ecfg.pin_frac = plan.pin_frac;
+    }
     // A BATCH is the exception to "one pass per prompt": a dataset's
     // captions prefill hundreds or thousands of times in a row, and a
     // streamed encoder re-reads its stack for every one of them. Where
     // the box holds the encoder whole, the batch loads it resident.
     if (_resident_for_batch) {
       ecfg.stream_layers = false;
+      ecfg.stream_decode = false;
       ecfg.pin_frac = 0.0;
     }
     if (const char* e = std::getenv("VPIPE_ENC_STREAM")) {
-      ecfg.stream_layers = (std::atoi(e) != 0);
-      if (!ecfg.stream_layers) { ecfg.pin_frac = 0.0; }
+      if (std::atoi(e) == 0) {
+        ecfg.stream_layers = false;
+        ecfg.stream_decode = false;
+        ecfg.pin_frac = 0.0;
+      }
     }
     session()->log_debug(fmt(
         "DiffusionConditionerStage('{}'): text encoder footprint {} MB "
-        "(others {} MB) -> {} ({:.0f}% of the prefix pinned)", this->id(),
-        plan.footprint >> 20, plan.others >> 20,
-        ecfg.stream_layers ? "STREAM layers" : "PRELOAD",
-        ecfg.pin_frac * 100.0));
-  }
-  // One set for this checkpoint, shared with the vision tower and the
-  // embedding table below and with anything else naming the same dir.
-  _enc_ws = genai::open_weight_set(_enc_dir, session());
-  if (!_enc_ws) {
-    session()->error(fmt("DiffusionConditionerStage('{}'): cannot open text "
-                         "encoder checkpoint: {}", this->id(), _enc_dir));
-    return false;
+        "(others {} MB) -> {}", this->id(), plan.footprint >> 20,
+        plan.others >> 20,
+        ecfg.stream_decode
+            ? std::string("STREAM layers, residency grows the kept set")
+        : ecfg.stream_layers
+            ? fmt("STREAM layers, {:.0f}% of RAM for a pinned prefix",
+                  ecfg.pin_frac * 100.0)()
+            : std::string("PRELOAD")));
   }
   // Kept warm by an earlier conditioning (keep_encoder_warm_), under
   // what decides the build: the family's profile, the weights, a screen
-  // (which loads the head), a batch (resident) -- and, sized by THIS
-  // launch's plan, whether it streams and how many layers it pins: one
-  // pinned for a roomier box would hold more than this plan admitted.
-  _enc_warm_key = fmt("{}|{}|{}|screen {}|batch {}|stream {} pin {}",
+  // (which loads the head), a batch (resident) -- and how it streams. A
+  // resident set grown by measurement is no part of the key: it carries
+  // nothing this launch's plan sized, and size_encoder_residency_() sets
+  // the reserve again before every prompt. A pinned prefix IS: sized by
+  // THIS launch's plan, one pinned for a roomier box would hold more
+  // than this plan admitted.
+  _enc_warm_key = fmt("{}|{}|{}|screen {}|batch {}|stream {} {} pin {}",
                       _family, _enc_dir, _enc_cfg_dir,
                       _screen != nullptr ? 1 : 0, _resident_for_batch ? 1 : 0,
                       ecfg.stream_layers ? 1 : 0,
+                      ecfg.stream_decode ? "resident-set" : "prefill",
                       genai::MetalQwenModel::pinned_layer_count(
                           _enc_ws->src(), ecfg))();
   if (_keep_loaded > 0) {
@@ -1477,18 +1638,27 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
                          "failed: {}", this->id(), _enc_dir));
     return false;
   }
-  if (_encoder->streaming_layers()) {
+  if (_encoder->streams_decode()) {
+    session()->info(fmt(
+        "DiffusionConditionerStage('{}'): text encoder streams its layers "
+        "through a slot pair, the next read under this layer's GPU work; "
+        "the layers it keeps grow into free memory as it runs", this->id()));
+  } else if (_encoder->streaming_layers()) {
     session()->info(fmt(
         "DiffusionConditionerStage('{}'): text encoder streams its layers -- "
         "~one layer resident instead of the stack, rebuilt inside each "
-        "prefill", this->id()));
-    // Deliberately NOT revising the manager declaration down. An LM reads
-    // its tensors UNCACHED into its own buffers, so the weight set's
-    // stats report a fraction of what the model holds and a revision
-    // would move the declared figure in the unsafe direction. The
-    // streamable claim declare_resources() made already says what this
-    // reduces to; there is nothing to correct.
+        "prefill ({} leading layers pinned)", this->id(),
+        _encoder->pinned_layers()));
   }
+  // Deliberately NOT revising the manager declaration, either way. An LM
+  // reads its tensors UNCACHED into its own buffers, so the weight set's
+  // stats report a fraction of what the model holds and a revision down
+  // would move the declared figure in the unsafe direction. The
+  // streamable claim declare_resources() made already says what this
+  // reduces to. And the layers residency keeps are taken from MEASURED
+  // free memory, less the reserve the plan's other phases book, and go
+  // with the encoder at the end of its beat or back to the box under
+  // pressure -- what a plan has to count is the floor it can fall to.
   // A family whose profile asked for the OUTPUT HEAD takes its
   // embeddings from the model's own muxer, so there is no second table
   // to load here -- which is the point of asking for the head at all.
@@ -2126,6 +2296,7 @@ DiffusionConditionerStage::ensure_loaded_()
       this->id(), _family,
       _family == "flux2" ? "Qwen3 dense"
       : _family == "flux3" ? "Qwen3-VL, 8 taps"
+      : _family == "fibo2" ? "Qwen3-VL, 15 taps in 6 bundles"
       : _family == "qwen-image-edit" ? "Qwen2.5-VL"
       : _family == "boogu-image" ? "Qwen3-VL (mllm)"
       : _family == "wan" ? "umT5-XXL"
@@ -2478,7 +2649,8 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
   // krea2; only the checkpoint prefix ("model.visual." vs "visual."), the
   // conditioning long-edge cap and the processor's min_pixels differ.
   if (_family == "krea2" || _family == "boogu-image" ||
-      _family == "qwen-image-21" || _profile != nullptr) {
+      _family == "qwen-image-21" || _family == "fibo2" ||
+      _profile != nullptr) {
     // Boogu's mllm is a wrapped checkpoint ("model.visual.") with a bf16
     // pipeline dtype and preprocessor bounds (shortest_edge 65536), and
     // its pipeline caps the VLM conditioning image at 384x384 pixels -- so
@@ -2489,6 +2661,7 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
     // says so in its profile.
     const bool wrapped =
         _family == "boogu-image" || _family == "qwen-image-21" ||
+        _family == "fibo2" ||
         (_profile != nullptr &&
          genai::cond::text(_profile, genai::cond::kVisionPrefix,
                            "visual.") == "model.visual.");
@@ -2515,9 +2688,16 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       // reference get UPSCALED before patching: past ~2.25:1 aspect a
       // 384-capped image falls under a 65536 min_pixels and the Qwen
       // default of 3136 would silently skip that upscale. 0 means the
-      // family did not set one, so the tower's own default stands.
-      if (_ground.min_pixels > 0) { vcfg.min_pixels = _ground.min_pixels; }
-      if (_ground.max_pixels > 0) { vcfg.max_pixels = _ground.max_pixels; }
+      // family did not set one, so the tower's CLASSIC default stands --
+      // not the encoder checkpoint's processor bounds config_from now
+      // reads (16.7 MP on a Qwen3-VL repo): a family's grounding was
+      // verified at the bounds its profile names, and one that names none
+      // (Krea-2's edit) at 3136 .. 1003520.
+      const genai::MetalQwenVisionEncoder::Config classic;
+      vcfg.min_pixels = _ground.min_pixels > 0 ? (int)_ground.min_pixels
+                                               : classic.min_pixels;
+      vcfg.max_pixels = _ground.max_pixels > 0 ? (int)_ground.max_pixels
+                                               : classic.max_pixels;
       // Qwen3-VL normalizes images to [-1,1] (mean/std 0.5), NOT the OpenAI-CLIP
       // defaults the loader assumes when the repo ships no preprocessor_config.
       // With CLIP normalization the vision tokens -- hence the grounded image
@@ -2567,6 +2747,12 @@ DiffusionConditionerStage::vision_tokens_(metal_compute::MetalCompute* mc,
       cap_longest_side_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
                         _ground.long_edge, capped, &rh, &rw,
                         _ground.pixel_budget, 16, /*lanczos=*/true);
+    } else if (_family == "fibo2") {
+      // Pillow's thumbnail: Qwen3-VL sees each picture to edit at most
+      // `long_edge` (768) a side, bicubic -- BriaFibo2ImageProcessor's
+      // `text_encoder_image.thumbnail(...)`. The VAE takes the full crop.
+      pil_thumbnail_(_ref_rgb[ri].data(), _ref_rgb_h[ri], _ref_rgb_w[ri],
+                     _ground.long_edge, capped, &rh, &rw);
     } else if (_family == "qwen-image-21") {
       // LANCZOS (diffusers' VaeImageProcessor.resize defaults to it) and
       // aligned to 32, which is what calculate_dimensions rounds to.
@@ -2673,7 +2859,10 @@ DiffusionConditionerStage::qi21_ids_(const std::string& text, int nref,
                                      std::vector<std::int32_t>* ids,
                                      int* drop) const
 {
-  const std::string tmpl = genai::qi21::prompt_template(nref, text);
+  // An EMPTY prompt is read as one space, as the reference reads it --
+  // the case a grounded negative of no instruction lands in.
+  const std::string tmpl =
+      genai::qi21::prompt_template(nref, text.empty() ? " " : text);
   *ids = encode_with_specials_(*_tokenizer, tmpl);
   if (ids->empty()) { return false; }
   // How many leading tokens the reference drops. It derives the count
@@ -2743,6 +2932,15 @@ DiffusionConditionerStage::qi21_sideband_(
   o.insert_or_assign(genai::cond_sideband::kRefGridH, std::move(gh));
   o.insert_or_assign(genai::cond_sideband::kRefGridW, std::move(gw));
   return sb;
+}
+
+FlexData
+DiffusionConditionerStage::qi21_beat_sideband_(int rows) const
+{
+  if (_family != "qwen-image-21" || (int)_qi21_slots.size() != rows) {
+    return FlexData{};
+  }
+  return qi21_sideband_(_qi21_slots, _qi21_nref, _qi21_grid_h, _qi21_grid_w);
 }
 
 bool
@@ -3410,6 +3608,179 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         "DiffusionConditionerStage('{}'): [{}] moss-image -> [{}, {}] bf16 "
         "(final-normed last hidden)", this->id(), which, n, EH));
     return txt;
+  }
+
+  if (_family == "fibo2") {
+    // Fibo 2.0 (BriaFibo2Pipeline._get_qwen_prompt_embeds): fifteen of
+    // Qwen3-VL's hidden states, each scaled to unit RMS per token in f32
+    // and narrowed to bf16, bundled three by three into the six text
+    // inputs the transformer reads -- [6, rows, 3 x hidden]. Every row is
+    // kept: no system turn, no padding, the pictures' rows included.
+    //
+    // With pictures to edit the prompt is the edit JSON (a vision marker
+    // per picture, the result's caption, the instruction); without, a
+    // JSON caption in its trained form or the prompt as given.
+    const bool img_aware = (n_img > 0) && !vtok.empty();
+    const std::int32_t pad_id =
+        img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
+    const bool grounded = img_aware && pad_id >= 0;
+    const int nref = grounded ? _img_n : 0;
+    std::string body;
+    if (nref > 0) {
+      std::string perr;
+      if (!genai::fibo2::edit_prompt(text, nref, /*text_images=*/false,
+                                     &body, &perr)) {
+        session()->warn(fmt("DiffusionConditionerStage('{}'): {} prompt: {}",
+                            this->id(), which, perr));
+        return {};
+      }
+    } else {
+      body = genai::fibo2::generation_prompt(text);
+    }
+    std::vector<std::int32_t> ids = encode_with_specials_(
+        *_tokenizer, genai::fibo2::prompt_template(body));
+    if (ids.empty()) { return {}; }
+    std::vector<std::pair<int, int>> runs;
+    if (nref > 0) {
+      runs = expand_pads_(ids, pad_id, _img_tok.data(), nref);
+      if ((int)runs.size() != nref) {
+        session()->warn(fmt(
+            "DiffusionConditionerStage('{}'): the {} prompt placed {} of {} "
+            "pictures; dropping beat", this->id(), which, runs.size(), nref));
+        return {};
+      }
+    }
+    // truncation=True keeps the FIRST tokens -- which, past the cap, can
+    // cut a picture's rows; the reference would then fail its own splice.
+    if ((int)ids.size() > kFibo2MaxTokens) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): the {} prompt is {} tokens, past "
+          "Fibo 2.0's {}; dropping beat", this->id(), which, ids.size(),
+          kFibo2MaxTokens));
+      return {};
+    }
+    const int n = (int)ids.size();
+    SharedBuffer x = embed_rows_(ids);
+    if (x.empty()) { return {}; }
+    // Splice the tower rows over the image_pad embeddings, in prompt order.
+    int first_pad = -1;
+    if (grounded) {
+      const bool vt_bf16 = _vision3 && _vision3->is_bf16();
+      const auto* vt = static_cast<const std::uint16_t*>(vtok.contents());
+      auto* xh = static_cast<std::uint16_t*>(x.contents());
+      int j = 0;
+      for (int i = 0; i < n && j < n_img; ++i) {
+        if (ids[(std::size_t)i] != pad_id) { continue; }
+        if (first_pad < 0) { first_pad = i; }
+        const std::uint16_t* src = vt + (std::size_t)j * EH;
+        if (vt_bf16) {
+          std::memcpy(xh + (std::size_t)i * EH, src, (std::size_t)EH * 2);
+        } else {
+          for (int h = 0; h < EH; ++h) {
+            _Float16 hf; std::memcpy(&hf, &src[h], 2);
+            xh[(std::size_t)i * EH + h] = f32_to_bf16_((float)hf);
+          }
+        }
+        ++j;
+      }
+    }
+    genai::MetalQwenModel::DeepstackInject ds;
+    const bool use_ds = grounded && first_pad >= 0 && !_ds_feats.empty();
+    if (use_ds) {
+      for (int i = 0; i < (int)_ds_feats.size(); ++i) {
+        ds.feats.push_back(&_ds_feats[(std::size_t)i]);
+        ds.layers.push_back(i);
+      }
+      ds.row0 = first_pad;
+      ds.rows = n_img;
+      if (runs.size() > 1) {
+        int feat = 0;
+        for (const auto& rn : runs) {
+          ds.segs.push_back({rn.first, rn.second, feat});
+          feat += rn.second;
+        }
+      }
+    }
+    // The fifteen distinct layers, in HF's counting (hidden_states[k] is
+    // the output of layer k - 1), ascending; tap j is layer `uniq[j]`.
+    std::vector<int> uniq;
+    for (const auto& b : genai::fibo2::kBundleLayers) {
+      for (int k : b) { uniq.push_back(k); }
+    }
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    std::vector<int> taps_l;
+    for (int k : uniq) { taps_l.push_back(k - 1); }
+    const bool use_mrope = grounded && !runs.empty() && img_mw_(0) > 0;
+    std::vector<std::int32_t> pos;
+    if (use_mrope) {
+      pos = mrope_positions_(n, runs, _img_mh.data(), _img_mw.data());
+    }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer taps;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = use_mrope
+                 ? _encoder->forward_embeddings_taps_mrope(
+                       cid, x, n, pos, taps_l, /*key_valid_len=*/0,
+                       use_ds ? &ds : nullptr)
+                 : _encoder->forward_embeddings_taps(
+                       cid, x, n, taps_l, /*key_valid_len=*/0,
+                       use_ds ? &ds : nullptr);
+    }
+    cm->release(cid);
+    const int NT = (int)taps_l.size();
+    if (taps.empty() ||
+        taps.byte_size() < (std::size_t)NT * n * EH * 2) {
+      return {};
+    }
+    // Each tap scaled to unit RMS per token in f32 (eps 1e-6, no weight)
+    // and rounded to bf16 ONCE, as the reference's `.to(dtype)`; then
+    // each bundle's three side by side.
+    const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
+    std::vector<std::uint16_t> normed((std::size_t)NT * n * EH);
+    for (int j = 0; j < NT; ++j) {
+      for (int r = 0; r < n; ++r) {
+        const std::uint16_t* src = tp + ((std::size_t)j * n + r) * EH;
+        std::uint16_t* dst = normed.data() + ((std::size_t)j * n + r) * EH;
+        // The mean wide (torch reduces f32 pairwise, near-exact); the
+        // rsqrt and the product in f32, as there.
+        double ss = 0.0;
+        for (int h = 0; h < EH; ++h) {
+          const double v = (double)bf16_to_f32_(src[h]);
+          ss += v * v;
+        }
+        const float inv =
+            1.0f / std::sqrt((float)(ss / (double)EH) + 1e-6f);
+        for (int h = 0; h < EH; ++h) {
+          dst[h] = f32_to_bf16_(bf16_to_f32_(src[h]) * inv);
+        }
+      }
+    }
+    const int NB = genai::fibo2::kBundles;
+    SharedBuffer out =
+        mc->make_shared_buffer((std::size_t)NB * n * 3 * EH * 2);
+    if (out.empty()) { return {}; }
+    auto* op = static_cast<std::uint16_t*>(out.contents());
+    for (int b = 0; b < NB; ++b) {
+      for (int part = 0; part < 3; ++part) {
+        const int k = genai::fibo2::kBundleLayers[b][part];
+        const int j = (int)(std::lower_bound(uniq.begin(), uniq.end(), k) -
+                            uniq.begin());
+        for (int r = 0; r < n; ++r) {
+          std::memcpy(op + (((std::size_t)b * n + r) * 3 + part) * EH,
+                      normed.data() + ((std::size_t)j * n + r) * EH,
+                      (std::size_t)EH * 2);
+        }
+      }
+    }
+    n_real_out = n;
+    session()->log_debug(fmt(
+        "DiffusionConditionerStage('{}'): [{}] fibo2 -> [{}, {}, {}] bf16 "
+        "({} picture(s))", this->id(), which, NB, n, 3 * EH, nref));
+    return out;
   }
 
   if (_family == "qwen-image-21") {
@@ -4443,6 +4814,11 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // Shape helper for the family conditioning tensor.
   auto shape_for = [&](int rows) -> std::vector<std::int64_t> {
     if (_family == "krea2") { return {rows, 12, _enc_hidden}; }
+    // [bundle, row, 3 x hidden]: the six text inputs, bundle-major as the
+    // transformer reads them.
+    if (_family == "fibo2") {
+      return {genai::fibo2::kBundles, rows, 3 * _enc_hidden};
+    }
     if (_family == "flux2") { return {rows, 3 * _enc_hidden}; }
     if (_family == "flux3") { return {rows, 8 * _enc_hidden}; }
     return {rows, _enc_hidden};   // the single-tap families
@@ -4452,7 +4828,8 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // tap STACK and bf16: the reference hands its DiT the taps in bf16, and
   // Qwen3-VL's deep residuals are not guaranteed to sit inside f16's range.
   const TensorBeat::DType cdt =
-      (single_tap_(_family, _profile) || _family == "flux3")
+      (single_tap_(_family, _profile) || _family == "flux3" ||
+       _family == "fibo2")
           ? TensorBeat::DType::Bf16
           : TensorBeat::DType::F16;
 
@@ -4488,6 +4865,13 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     }
   }
 
+  // Whether a negative is encoded too (see below): one pass or two.
+  const bool emit_neg =
+      !_negative_prompt.empty()
+      || (_grounded_negative && n_img > 0 && !vtok.empty())
+      || _family == "moss-image";
+  size_encoder_residency_(emit_neg ? 2 : 1);
+
   int n_real = 0;
   SharedBuffer cond = encode_(prompt, "prompt", n_real, vtok, n_img);
   if (cond.empty()) {
@@ -4495,6 +4879,12 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
                         this->id()));
     co_return;
   }
+  // Qwen-Image-2.1's slot mask belongs to the encode that made it, so the
+  // positive's is taken NOW: the negative's encode below writes its own
+  // over it, and published after that, the positive carried the
+  // negative's mask -- refused downstream whenever the two prompts
+  // differed in length.
+  FlexData cond_sb = qi21_beat_sideband_(n_real);
   // Emit the negative conditioning (oport1) BEFORE the positive (oport0): the
   // generate-image stage blocks on iport0, so enqueuing the negative first
   // guarantees its paired beat is already in iport1's FIFO when the positive
@@ -4508,15 +4898,17 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // MOSS-Image's CFG is against the EMPTY prompt by default (its
   // reference encodes '' through the same template), so its negative is
   // emitted whether or not one was wired.
-  const bool emit_neg =
-      !_negative_prompt.empty()
-      || (_grounded_negative && n_img > 0 && !vtok.empty())
-      || _family == "moss-image";
   if (emit_neg) {
     int n_neg = 0;
     SharedBuffer nc = encode_(_negative_prompt, "negative", n_neg, vtok, n_img);
     if (!nc.empty()) {
-      co_await ctx.write(1, to_beat_(nc, shape_for(n_neg), cdt));
+      auto nb = to_beat_(nc, shape_for(n_neg), cdt);
+      // The negative is a sequence of its own -- its text a different
+      // length, its image slots (the same references, grounded) at
+      // other rows -- so it carries its own mask, as the reference's
+      // negative_image_pad_mask is its own.
+      nb->sideband = qi21_beat_sideband_(n_neg);
+      co_await ctx.write(1, std::move(nb));
     }
   }
   // Drop the encoder BEFORE the conditioning is published: the DiT stage starts
@@ -4535,11 +4927,7 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     //
     // The TARGET image's slots are not included -- the consumer knows
     // that geometry and this stage does not.
-    if (_family == "qwen-image-21" &&
-        (int)_qi21_slots.size() == n_real) {
-      beat->sideband = qi21_sideband_(_qi21_slots, _qi21_nref, _qi21_grid_h,
-                                      _qi21_grid_w);
-    }
+    if (!cond_sb.is_null()) { beat->sideband = std::move(cond_sb); }
     // Opt-in trace of the conditioning ITSELF. Two prompts that produce
     // the same downstream generation are ambiguous between "the encoder
     // emitted near-identical embeddings" and "the DiT ignored different

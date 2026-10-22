@@ -55,239 +55,9 @@ typedef metal::conditional<
     metal::is_same<VPIPE_ELT, bfloat>::value, float, half>::type
     VPIPE_ACC16_T;
 
-// ===================================================================
-// Quantized helpers -- verbatim from MLX quantized.h (affine path).
-// ===================================================================
-
-template <int bits, int wsize = 8>
-inline constexpr short get_pack_factor() {
-  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
-}
-
-template <int bits, int wsize = 8>
-inline constexpr short get_bytes_per_pack() {
-  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
-  return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
-}
-
-// `Compute` is the arithmetic type for the dequant scale*w+bias. It defaults
-// to the storage type U (so the half path is byte-identical to MLX), but the
-// bf16 loader passes Compute=float: Apple GPUs emulate scalar bfloat math by
-// widening to fp32 per op, so dequantizing in bfloat is markedly slower than
-// computing in fp32 and rounding to bfloat once on store.
-template <typename U, int N, int bits, typename Compute = U>
-inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
-  static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
-          bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
-
-  if (bits == 4) {
-    const Compute cs = static_cast<Compute>(scale);
-    const Compute cb = static_cast<Compute>(bias);
-    const Compute s[2] = {cs, cs / static_cast<Compute>(16.0f)};
-    for (int i = 0; i < (N / 2); i++) {
-      w_local[2 * i] =
-          static_cast<U>(s[0] * static_cast<Compute>(w[i] & 0x0f) + cb);
-      w_local[2 * i + 1] =
-          static_cast<U>(s[1] * static_cast<Compute>(w[i] & 0xf0) + cb);
-    }
-  }
-
-  else if (bits == 2) {
-    U s[4] = {
-        scale,
-        scale / static_cast<U>(4.0f),
-        scale / static_cast<U>(16.0f),
-        scale / static_cast<U>(64.0f)};
-    for (int i = 0; i < (N / 4); i++) {
-      w_local[4 * i] = s[0] * (w[i] & 0x03) + bias;
-      w_local[4 * i + 1] = s[1] * (w[i] & 0x0c) + bias;
-      w_local[4 * i + 2] = s[2] * (w[i] & 0x30) + bias;
-      w_local[4 * i + 3] = s[3] * (w[i] & 0xc0) + bias;
-    }
-  }
-
-  else if (bits == 3) {
-    for (int i = 0; i < (N / 8); i++) {
-      w_local += 8 * i;
-      w += 3 * i;
-
-      w_local[0] = (w[0] & 0x7) * scale + bias;
-      w_local[1] = ((w[0] & 0x38) >> 3) * scale + bias;
-      w_local[2] = (((w[0] & 0xc0) >> 6) + ((w[1] & 0x1) << 2)) * scale + bias;
-      w_local[3] = ((w[1] & 0xe) >> 1) * scale + bias;
-      w_local[4] = ((w[1] & 0x70) >> 4) * scale + bias;
-      w_local[5] = (((w[1] & 0x80) >> 7) + ((w[2] & 0x3) << 1)) * scale + bias;
-      w_local[6] = ((w[2] & 0x1c) >> 2) * scale + bias;
-      w_local[7] = ((w[2] & 0xe0) >> 5) * scale + bias;
-    }
-  }
-
-  else if (bits == 5) {
-    for (int i = 0; i < (N / 8); i++) {
-      w_local += 8 * i;
-      w += 5 * i;
-
-      w_local[0] = (w[0] & 0x1f) * scale + bias;
-      w_local[1] = (((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * scale + bias;
-      w_local[2] = ((w[1] & 0x7c) >> 2) * scale + bias;
-      w_local[3] = (((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * scale + bias;
-      w_local[4] = (((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * scale + bias;
-      w_local[5] = ((w[3] & 0x3e) >> 1) * scale + bias;
-      w_local[6] = (((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * scale + bias;
-      w_local[7] = ((w[4] & 0xf8) >> 3) * scale + bias;
-    }
-  }
-
-  else if (bits == 6) {
-    for (int i = 0; i < (N / 4); i++) {
-      w_local += 4 * i;
-      w += 3 * i;
-      w_local[0] = (w[0] & 0x3f) * scale + bias;
-      w_local[1] = (((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * scale + bias;
-      w_local[2] = (((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * scale + bias;
-      w_local[3] = ((w[2] >> 2) & 0x3f) * scale + bias;
-    }
-  }
-
-  else if (bits == 8) {
-    for (int i = 0; i < N; i++) {
-      w_local[i] = scale * w[i] + bias;
-    }
-  }
-}
-
-template <
-    typename T,
-    short BROWS,
-    short BCOLS,
-    short dst_ld,
-    short reduction_dim,
-    short tgp_size,
-    short group_size,
-    short bits>
-struct QuantizedBlockLoader {
-  static_assert(
-      BCOLS <= group_size,
-      "The group size should be larger than the columns");
-  static_assert(
-      group_size % BCOLS == 0,
-      "The group size should be divisible by the columns");
-  static_assert(
-      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
-          bits == 8,
-      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
-
-  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
-  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  // Dequant arithmetic type: fp32 for bf16 storage (scalar bf16 math is
-  // emulated on Apple GPUs), native otherwise. Half path stays byte-identical.
-  typedef typename metal::conditional<
-      metal::is_same<T, bfloat>::value, float, T>::type DeqCompute;
-  MLX_MTL_CONST short n_reads =
-      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short group_steps = group_size / BCOLS;
-
-  const int src_ld;
-  const int tile_stride;
-  short group_step_cnt;
-  const int group_stride;
-
-  const short thread_idx;
-  const short bi;
-  const short bj;
-
-  threadgroup T* dst;
-  const device uint8_t* src;
-  const device T* scales;
-  const device T* biases;
-
-  QuantizedBlockLoader(
-      const device uint8_t* src_,
-      const device T* scales_,
-      const device T* biases_,
-      const int src_ld_,
-      threadgroup T* dst_,
-      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
-      : src_ld(src_ld_),
-        tile_stride(
-            reduction_dim ? BCOLS_PACKED * bytes_per_pack
-                          : BROWS * src_ld * bytes_per_pack / pack_factor),
-        group_step_cnt(0),
-        group_stride(BROWS * src_ld / group_size),
-        thread_idx(simd_group_id * 32 + simd_lane_id),
-        bi(n_reads * thread_idx / BCOLS_PACKED),
-        bj((n_reads * thread_idx) % BCOLS_PACKED),
-        dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
-            bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
-
-  void load_unsafe() const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-
-    T scale = *scales;
-    T bias = *biases;
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits, DeqCompute>(
-          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
-    }
-  }
-
-  void load_safe(short2 src_tile_dim) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-
-    // bi is a tile ROW in either orientation and src_tile_dim.y is the rows
-    // present, so one test serves both (MLX #3912). The reduction_dim == 1
-    // arm compared bi against .x -- the BK columns, which bi never reaches
-    // -- so a ragged last N tile still read every row past num_outs.
-    if (bi >= src_tile_dim.y) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
-      }
-      return;
-    }
-
-    T scale = *scales;
-    T bias = *biases;
-    for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits, DeqCompute>(
-          (device uint8_t*)(src + i * bytes_per_pack),
-          scale,
-          bias,
-          dst + i * pack_factor);
-    }
-  }
-
-  void next() {
-    src += tile_stride;
-    if (reduction_dim == 1) {
-      if (group_steps > 1) {
-        group_step_cnt++;
-        if (group_step_cnt == group_steps) {
-          group_step_cnt = 0;
-          scales++;
-          biases++;
-        }
-      } else {
-        scales++;
-        biases++;
-      }
-    } else {
-      scales += group_stride;
-      biases += group_stride;
-    }
-  }
-};
+// The dequantizing tile loaders (QuantizedBlockLoader, the MoE row
+// gather) live in a header the matrix-core twins share.
+#include "quant/affine_qmm_loaders.h"
 
 // ===================================================================
 // qmm_t_impl -- verbatim from MLX quantized.h.
@@ -970,55 +740,6 @@ kernel void affine_qmm_swiglu_w4g64_bm64_rs_acc16(
       tid, simd_gid, simd_lid);
 }
 
-// Row-gathering block loader: a drop-in for mlx::steel::BlockLoader whose BM
-// rows are GATHERED from a base matrix via srow[] (row r of the tile reads
-// src[srow[base_slot + r], :]; srow < 0 -> zero-filled padding row). Lets the
-// grouped gate|up GEMM read its sorted rows straight from the hidden, fusing
-// away the explicit moe_gather_x copy (the ablation's #1 prefill overhead).
-// K is a multiple of BK for these GEMMs so only load (column-aligned) is
-// needed; load_safe falls back to it (padding rows masked by srow).
-template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size,
-          short n_reads = (BCOLS * BROWS) / tgp_size,
-          short TCOLS = BCOLS / n_reads, short TROWS = tgp_size / TCOLS>
-struct GatherBlockLoader {
-  STEEL_CONST short vec_size = n_reads;
-  const int src_ld;
-  const short bi;
-  const short bj;
-  threadgroup T* dst;
-  const device T* src;        // base hidden [M, K]
-  const device int* srow;     // [npad] gathered row per sorted slot (<0 = pad)
-  const int base_slot;        // tile's first sorted slot (= y_row)
-  int k_off;
-  struct alignas(sizeof(T) * vec_size) ReadVector {
-    uint8_t v[sizeof(T) * vec_size];
-  };
-  METAL_FUNC GatherBlockLoader(
-      const device T* src_, const int src_ld_, const device int* srow_,
-      const int base_slot_, threadgroup T* dst_, ushort simd_group_id,
-      ushort simd_lane_id)
-      : src_ld(src_ld_),
-        bi((short)((simd_group_id * 32 + simd_lane_id) / TCOLS)),
-        bj((short)(vec_size * ((simd_group_id * 32 + simd_lane_id) % TCOLS))),
-        dst(dst_ + bi * dst_ld + bj),
-        src(src_), srow(srow_), base_slot(base_slot_), k_off(0) {}
-  METAL_FUNC void load_unsafe() const {
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < BROWS; i += TROWS) {
-      const int r = srow[base_slot + bi + i];
-      if (r >= 0) {
-        *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
-            *((const device ReadVector*)(&src[(int64_t)r * src_ld + bj + k_off]));
-      } else {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < vec_size; j++) { dst[i * dst_ld + j] = T(0); }
-      }
-    }
-  }
-  METAL_FUNC void load_safe(short2) const { load_unsafe(); }
-  METAL_FUNC void next() { k_off += BCOLS; }
-};
-
 // ===================================================================
 // MoE GROUPED steel GEMM (Qwen3.5-MoE prefill -- the matrix-tiled expert
 // GEMM that closes the prefill gap vs MLX gather_qmm). The (token,expert)
@@ -1086,6 +807,33 @@ kernel void affine_qmm_grouped_w8g64(
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_grouped_down_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, sdst,
+      tid, simd_gid, simd_lid);
+}
+
+// 5-bit twin (MLX affine w5 g64): the impl's slab offset is in bytes and
+// 64-bit, and QuantizedBlockLoader reads one 5-byte pack per thread at
+// these tiles, so bits=5 instantiates it as it stands.
+kernel void affine_qmm_grouped_w5g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // sorted acts [npad,K]
+    device VPIPE_ELT*       y      [[buffer(4)]],   // partials [np,N] scattered
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* sdst         [[buffer(9)]],   // sorted-slot -> pair index
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_down_impl<VPIPE_ELT, 64, 5, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, sdst,
       tid, simd_gid, simd_lid);
 }
@@ -1358,6 +1106,31 @@ kernel void affine_qmm_grouped_swiglu_w8g64(
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_grouped_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
+      tid, simd_gid, simd_lid);
+}
+
+// 5-bit twin of affine_qmm_grouped_swiglu_w8g64 (see affine_qmm_grouped_w5g64).
+kernel void affine_qmm_grouped_swiglu_w5g64(
+    const device uint32_t* w       [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],   // hidden [M, K] (gathered)
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int& K          [[buffer(5)]],
+    const constant int& N          [[buffer(6)]],   // fused width = 2*inner
+    const constant int& M          [[buffer(7)]],
+    const device int* tile2e       [[buffer(8)]],
+    const device int* srow         [[buffer(9)]],   // sorted-slot -> hidden row
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_grouped_swiglu_impl<VPIPE_ELT, 64, 5, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,
       tid, simd_gid, simd_lid);
 }
