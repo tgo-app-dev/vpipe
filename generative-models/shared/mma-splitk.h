@@ -111,6 +111,9 @@ struct MmaSplitK {
   // enabling a depth nothing has measured. VPIPE_LM_SPLITK_MIN_K lowers it
   // for that experiment.
   static constexpr int kMinSplitK = 12288;
+  // ...or a model's own floor, where it measured one: Qwen3.8-Flash-Next's
+  // hyper-connection mixers contract 4 x 2560 = 10240 (S = 5 of kc 2048).
+  int min_k = kMinSplitK;
 
   // ...and below this many ROWS. The deficit a split fixes is a large-M
   // phenomenon: at 128-256 rows the whole GEMM is small enough that the
@@ -240,7 +243,7 @@ struct MmaSplitK {
         return best;
       }
     }
-    if (K < env_int_("VPIPE_LM_SPLITK_MIN_K", kMinSplitK)) { return best; }
+    if (K < env_int_("VPIPE_LM_SPLITK_MIN_K", min_k)) { return best; }
     if (M < env_int_("VPIPE_LM_SPLITK_MIN_M", kMinSplitM)) { return best; }
     const int target = env_int_("VPIPE_LM_SPLITK_TARGET_KC", kTargetKC);
     const int forced = env_int_("VPIPE_LM_SPLITK_S", 0);

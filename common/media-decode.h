@@ -100,10 +100,17 @@ struct DecodedVideo {
   std::vector<std::uint8_t> rgb;
 
   // The soundtrack, when the container has one. Planar, like
-  // DecodedAudio, and 0 channels when there is none.
+  // DecodedAudio, and 0 channels when there is none. Decoded WHOLE,
+  // whatever stopped the frames.
   int                audio_channels    = 0;
   int                audio_sample_rate = 0;
   std::vector<float> pcm;
+
+  // The frames stopped at a cap -- `max_seconds`, or the backstop
+  // (kMaxDecodedVideoFrames) on a whole-file decode -- rather than at
+  // the end of the stream, so the soundtrack may run past the last
+  // frame. (Also set when the stream happens to end exactly at the cap.)
+  bool cut_short = false;
 };
 
 std::optional<DecodedImage>
@@ -127,6 +134,10 @@ decode_audio_file(const FFmpegLibraries* libs,
                   int                    target_sample_rate,
                   std::string*           error    = nullptr,
                   int                    channels = 1);
+
+// The most frames a video decode reads, whatever `max_seconds` says: the
+// backstop for a whole-file decode (planar RGB is 6 MB a 1080p frame).
+inline constexpr int kMaxDecodedVideoFrames = 4096;
 
 // Decode a video file's frames, its frame rate and its soundtrack.
 //

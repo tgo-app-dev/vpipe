@@ -2957,7 +2957,8 @@ DiffusionConditionerStage::batchable_() const
 SharedBuffer
 DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                                    int& n_real_out,
-                                   const SharedBuffer& vtok, int n_img) const
+                                   const SharedBuffer& vtok, int n_img,
+                                   bool as_given) const
 {
   auto* mc = session()->services()->metal_compute();
   const int EH = _enc_hidden;
@@ -3619,14 +3620,17 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     //
     // With pictures to edit the prompt is the edit JSON (a vision marker
     // per picture, the result's caption, the instruction); without, a
-    // JSON caption in its trained form or the prompt as given.
-    const bool img_aware = (n_img > 0) && !vtok.empty();
+    // JSON caption in its trained form or the prompt as given. A negative
+    // is always text alone, as written (`as_given`).
+    const bool img_aware = (n_img > 0) && !vtok.empty() && !as_given;
     const std::int32_t pad_id =
         img_aware ? _tokenizer->special_token_id("<|image_pad|>") : -1;
     const bool grounded = img_aware && pad_id >= 0;
     const int nref = grounded ? _img_n : 0;
     std::string body;
-    if (nref > 0) {
+    if (as_given) {
+      body = text;
+    } else if (nref > 0) {
       std::string perr;
       if (!genai::fibo2::edit_prompt(text, nref, /*text_images=*/false,
                                      &body, &perr)) {
@@ -4866,10 +4870,17 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   }
 
   // Whether a negative is encoded too (see below): one pass or two.
+  // Fibo 2.0's is wanted by a GUIDED graph (Dev), which is the one that
+  // wires oport1 -- Edit Turbo runs without, and an unwired port saves
+  // the encode.
+  const bool fibo2_neg = _family == "fibo2" && ctx.num_oports() > 1 &&
+                         ctx.has_consumers(1);
   const bool emit_neg =
-      !_negative_prompt.empty()
-      || (_grounded_negative && n_img > 0 && !vtok.empty())
-      || _family == "moss-image";
+      _family == "fibo2"
+          ? fibo2_neg
+          : !_negative_prompt.empty()
+                || (_grounded_negative && n_img > 0 && !vtok.empty())
+                || _family == "moss-image";
   size_encoder_residency_(emit_neg ? 2 : 1);
 
   int n_real = 0;
@@ -4898,9 +4909,20 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   // MOSS-Image's CFG is against the EMPTY prompt by default (its
   // reference encodes '' through the same template), so its negative is
   // emitted whether or not one was wired.
+  // FIBO 2.0's negative is the text alone, as written -- the reference's
+  // encode_prompt(negative_prompt) is shown no pictures, even for an
+  // edit, and cleans nothing -- and defaults to the null caption it was
+  // trained with.
   if (emit_neg) {
     int n_neg = 0;
-    SharedBuffer nc = encode_(_negative_prompt, "negative", n_neg, vtok, n_img);
+    SharedBuffer nc =
+        _family == "fibo2"
+            ? encode_(_negative_prompt.empty()
+                          ? std::string(genai::fibo2::kNullCaption)
+                          : _negative_prompt,
+                      "negative", n_neg, SharedBuffer{}, 0,
+                      /*as_given=*/true)
+            : encode_(_negative_prompt, "negative", n_neg, vtok, n_img);
     if (!nc.empty()) {
       auto nb = to_beat_(nc, shape_for(n_neg), cdt);
       // The negative is a sequence of its own -- its text a different

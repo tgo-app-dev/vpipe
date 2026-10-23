@@ -1,38 +1,50 @@
-# Fibo 2.0 Edit Turbo: image editing
+# Fibo 2.0: image editing and text-to-image
 
-**Fibo 2.0 Edit Turbo** (Bria) edits a picture from an instruction. It takes
-one picture or several, plus a plain-language instruction or a structured
-JSON caption of the result, and returns the edited picture. It is distilled
-to edit in **4 steps with no classifier-free guidance**. vpipe runs the
-published **bf16** checkpoint on-device through its own Metal kernels.
+**Fibo 2.0** (Bria) edits a picture from an instruction and generates one
+from a caption. It takes one picture or several, plus a plain-language
+instruction or a structured JSON caption of the result, and returns the
+picture. Bria publishes it as two checkpoints of one architecture, and
+vpipe runs both from the published **bf16** weights on-device through its
+own Metal kernels:
+
+| | **Edit Turbo** | **Dev** |
+|---|---|---|
+| Hugging Face | `briaai/Fibo-2.0-edit-turbo` | `briaai/Fibo-2.0-dev` |
+| For | editing, fast | text-to-image **and** editing; the base to fine-tune |
+| Steps | 4 | 50 (the model card's; 30 is the reference pipeline's default) |
+| Guidance | none (1.0) | 5.0, against a negative prompt |
 
 | | |
 |---|---|
 | **Denoiser** | an 8B DiT (16.3 GB bf16): 2 noise-refiner blocks and 44 main blocks; a 2-layer Perceiver squeezes the text into 256–512 *gist* tokens; five main blocks also cross-attend their own text bundle |
 | **Text encoder** | Qwen3-VL-4B-Instruct (8.9 GB). It reads the instruction **and** the pictures to edit; fifteen of its hidden states, each scaled to unit RMS, become six text bundles |
 | **VAE** | FLUX.2's `AutoencoderKLFlux2` |
-| **Steps** | 4, no CFG (the checkpoint's own recipe) |
 | **Licence** | **CC BY-NC 4.0, non-commercial.** Read it on the model page |
 
-Turbo is for **editing**. Bria publishes text-to-image as a separate model,
-Fibo 2.0 Dev. vpipe does not run Dev yet: it needs a guided sampler
-(see "Not yet supported" below).
+The two checkpoints ship identical configuration files, so nothing in the
+files says which one a directory holds. **The graph says it**: a Dev graph
+sets `guidance_scale` on a `fibo2-model-config` stage and wires the
+conditioner's negative to generate-image (see "Fibo 2.0 Dev" below). With
+neither, a graph runs Edit Turbo's recipe.
 
 ## Getting the model
 
-The Hugging Face repo is **gated**. Accept the terms on
-[the model page](https://huggingface.co/briaai/Fibo-2.0-edit-turbo),
-create a **Read** access token, and put it in the `model-fetch` stage of
-[`prepare-fibo2-edit-turbo`](pipelines/prepare-fibo2-edit-turbo.vpipeline),
-or in the `hf_token` field of the stage in the web UI, which keeps the
-secret out of a file. The download is **~26 GB**: `transformer/`,
-`text_encoder/`, `processor/`, `scheduler/`, `vae/` and `fonts/`.
+Both Hugging Face repos are **gated**. Accept the terms on the model page
+([Edit Turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo),
+[Dev](https://huggingface.co/briaai/Fibo-2.0-dev)), create a **Read**
+access token, and put it in the `model-fetch` stage of
+[`prepare-fibo2-edit-turbo`](pipelines/prepare-fibo2-edit-turbo.vpipeline)
+or [`prepare-fibo2-dev`](pipelines/prepare-fibo2-dev.vpipeline), or in the
+`hf_token` field of the stage in the web UI, which keeps the secret out of
+a file. Each download is **~26 GB**: `transformer/`, `text_encoder/`,
+`processor/`, `scheduler/`, `vae/` and `fonts/`, and for Dev also
+`styles/`.
 
 You do not need to quantize. On a machine that cannot hold the DiT beside
 the encoder, vpipe **streams** the DiT's blocks from disk, and it decides
 this per run from the machine's memory.
 
-## The pipeline
+## The pipeline (Edit Turbo)
 
 [`fibo2-edit`](pipelines/fibo2-edit.vpipeline) takes a picture and an
 instruction and writes the edited picture.
@@ -123,6 +135,80 @@ bounds), carries:
 - the bounds of the pictures Qwen3-VL reads for an edit (`vl_long_edge`,
   768 by default; `vl_min_pixels` / `vl_max_pixels`).
 
+## Fibo 2.0 Dev
+
+Dev is the full, non-distilled model Edit Turbo is distilled from. It
+generates as well as edits, and it samples with **classifier-free
+guidance**: at every step the DiT runs twice, once on the prompt and once
+on a negative prompt, and the step follows `v_neg + g (v - v_neg)`. Two
+things in a graph turn that on, and both are needed:
+
+- a `fibo2-model-config` stage with `guidance_scale: 5`, wired to
+  generate-image's `model_config` port (generate-image's own
+  `guidance_scale` works too);
+- the conditioner's second output, `negative_conditioning`, wired to
+  generate-image's `neg_conditioning` port. The conditioner encodes the
+  negative only when that output is wired, so an Edit Turbo graph pays
+  nothing for it.
+
+Without a step count the run takes 30 steps (the reference pipeline's
+default); the shipped graphs ask for the model card's 50. A guidance of 1
+or below runs one forward a step whatever is wired, which is Edit Turbo's
+recipe.
+
+**The negative prompt.** Wire it to the conditioner's `negative` port.
+Without one the conditioner uses the *null caption* the model was trained
+with for guidance: every key of a structured caption with every value
+empty. That is what the model card uses for edits. For text-to-image the
+card uses a negative caption that steers away from soft, featureless,
+artifact-laden pictures; [`fibo2-dev-text-to-image`](pipelines/fibo2-dev-text-to-image.vpipeline)
+wires it from a second `text-prompt`. The negative is encoded exactly as
+the reference encodes it: the text as written (it is not cleaned the way
+a generation's caption is), and without the pictures an edit edits, even
+in an edit.
+
+**Memory.** A guided run holds two texts in the DiT, the prompt's and the
+negative's: each its gist tokens and the injection blocks' keys and
+values, about 5 MB for the null caption and 76 MB for a 1,024-token
+negative. The activations are those of whichever pass has the longer
+sequence. The memory plan books the negative when it can see the guidance
+before the run starts (a `fibo2-model-config` stage's `guidance_scale`, or
+generate-image's own), and corrects itself to the real lengths when the
+conditioning arrives. Measured beside a 512² edit, a guided step with a
+1,100-token negative allocated 387.2 MB at its peak against 387.0 MB
+booked.
+
+### Text-to-image
+
+[`fibo2-dev-text-to-image`](pipelines/fibo2-dev-text-to-image.vpipeline):
+
+```
+text-prompt -------> diffusion-conditioner =(prompt, negative)=> generate-image -> vae-decode -> save-image
+negative-prompt ----^                        fibo2-model-config --^
+```
+
+Set `width` and `height` on generate-image, multiples of 16 at about one
+megapixel, the area the model was trained at: 1024 × 1024 (the default
+when neither is set), 1424 × 800 (16:9), 1248 × 832 (3:2). The prompt is
+best a structured JSON caption. Bria's `bria-vgl` package writes one from
+a short prompt; a plain sentence works too and is used as given.
+
+### Editing
+
+[`fibo2-dev-edit`](pipelines/fibo2-dev-edit.vpipeline) is
+[`fibo2-edit`](pipelines/fibo2-edit.vpipeline) with the negative wired,
+`guidance_scale: 5` and 50 steps. Everything in "The pipeline" above
+(sizes, the prompt, several pictures, masked edits) holds for Dev too.
+
+### Styles
+
+The Dev repo carries five photographic looks under `styles/` (Boring
+Reality, Kodak Film, Hard Flash, Hazy / Dreamy, Lens Distortion). Each is a
+system and a user prompt for the caption writer, which vpipe does not run,
+and a `negative_prompt.json` to render with. To use a style's caption,
+write it with `bria-vgl` as the model card shows, and wire the style's
+negative prompt in place of the default.
+
 ## Accuracy
 
 Checked against the reference pipeline (diffusers' `BriaFibo2Pipeline`) in
@@ -151,6 +237,16 @@ Each of these holds:
   and at strength 0 it is the base model exactly;
 - a w8 pack lands at 0.021 from the reference, where bf16 is at 0.011;
 - every hold of a mixed w8/w4 pack is the same bytes.
+
+Dev's guided sampler is held to the reference pipeline's own `__call__`
+(6 steps at guidance 5, a small random model of the same architecture,
+the negative a shorter text so its gist count differs from the
+prompt's): text-to-image 0.0131 from the reference's fp32 run (its bf16
+0.0134), an edit 0.0119 (0.0128). The unguided sampler lands 1.5 away, so
+the comparison sees the guidance. The conditioner's null-caption negative,
+on Edit Turbo's text encoder, is 0.0084 from the reference's fp32 encoding
+(its bf16 0.0093), with the same 46 rows, both alone and beside an edit's
+picture.
 
 On an M5 (matrix-core GEMMs and attention, the DiT streamed on a 16 GB
 machine) the same checks pass: conditioning 0.146 / 0.121, the
@@ -234,5 +330,12 @@ and w4 costs visible quality on models of this kind.
   reference pipeline draws each text as a picture (with the fonts the repo
   ships) and lets Qwen3-VL read it. vpipe does not render them yet; the
   caption's text still reaches the model as text.
-- **Guidance and a negative prompt** (Fibo 2.0 Dev). Turbo runs without
-  them.
+- **Dev on its released weights.** Dev's sampler, conditioning and graphs
+  are verified against the reference on a small model of the same
+  architecture and with Edit Turbo's text encoder (above). Its own
+  checkpoint has not yet been run in vpipe, so no speed is quoted for it:
+  at 50 steps with two forwards each, expect about 25 times Edit Turbo's
+  4-step denoise.
+- **The style prompts** (`styles/`). They are prompts for a caption
+  writer (an LLM), which vpipe does not run; their negative prompts can be
+  wired as they are.

@@ -1425,10 +1425,104 @@ kernel void affine_gather_down_qmv_w5g64(
       out_vec_size, t0, simd_gid, simd_lid);
 }
 
+// Expert gathers at any (width, group) the impls take -- the w5 pair's
+// shape (byte offsets in 64 bits, so a cache pool past 4 GB and a width
+// that is not a u32 per pack both land on the expert), instantiated where
+// no hand-written twin exists: the group-32 packs (Qwen3.8-Flash-Next's
+// MLX 4-bit) and 6-bit experts.
+#define VPIPE_GATHER_SWIGLU_ANY(NAME, BITS, GS)                              \
+  kernel void NAME(                                                          \
+      const device uint32_t* w        [[buffer(0)]],                         \
+      const device VPIPE_ELT* scales  [[buffer(1)]],                         \
+      const device VPIPE_ELT* biases  [[buffer(2)]],                         \
+      const device VPIPE_ELT* x       [[buffer(3)]],                         \
+      device VPIPE_ELT*       y       [[buffer(4)]],                         \
+      constant int& in_vec_size       [[buffer(5)]],                         \
+      constant int& out_vec_size      [[buffer(6)]],                         \
+      const device int* pair_eid      [[buffer(7)]],                         \
+      constant int& top_k             [[buffer(8)]],                         \
+      uint3 tid      [[threadgroup_position_in_grid]],                       \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                     \
+      uint  simd_lid [[thread_index_in_simdgroup]]) {                        \
+    const int p = (int)tid.z;                                                \
+    const ulong e = (ulong)pair_eid[p];                                      \
+    const ulong N = (ulong)out_vec_size, K = (ulong)in_vec_size;             \
+    w = (const device uint32_t*)((const device uint8_t*)w +                  \
+                                 e * N * K * BITS / 8);                      \
+    scales += e * N * (K / GS);                                              \
+    biases += e * N * (K / GS);                                              \
+    x      += (uint)(p / top_k) * (uint)in_vec_size;                         \
+    y      += (uint)p * ((uint)out_vec_size / 2u);                           \
+    const uint3 t0 = uint3(0u, tid.y, 0u);                                   \
+    qmv_swiglu_impl<VPIPE_ELT, GS, BITS>(                                    \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, t0,              \
+        simd_gid, simd_lid);                                                 \
+  }
+#define VPIPE_GATHER_DOWN_ANY(NAME, BITS, GS)                                \
+  kernel void NAME(                                                          \
+      const device uint32_t* w        [[buffer(0)]],                         \
+      const device VPIPE_ELT* scales  [[buffer(1)]],                         \
+      const device VPIPE_ELT* biases  [[buffer(2)]],                         \
+      const device VPIPE_ELT* x       [[buffer(3)]],                         \
+      device VPIPE_ELT*       y       [[buffer(4)]],                         \
+      constant int& in_vec_size       [[buffer(5)]],                         \
+      constant int& out_vec_size      [[buffer(6)]],                         \
+      const device int* pair_eid      [[buffer(7)]],                         \
+      uint3 tid      [[threadgroup_position_in_grid]],                       \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                     \
+      uint  simd_lid [[thread_index_in_simdgroup]]) {                        \
+    const int p = (int)tid.z;                                                \
+    const ulong e = (ulong)pair_eid[p];                                      \
+    const ulong N = (ulong)out_vec_size, K = (ulong)in_vec_size;             \
+    w = (const device uint32_t*)((const device uint8_t*)w +                  \
+                                 e * N * K * BITS / 8);                      \
+    scales += e * N * (K / GS);                                              \
+    biases += e * N * (K / GS);                                              \
+    x      += (uint)p * (uint)in_vec_size;                                   \
+    y      += (uint)p * (uint)out_vec_size;                                  \
+    const uint3 t0 = uint3(0u, tid.y, 0u);                                   \
+    qmv_fast_impl<VPIPE_ELT, GS, BITS, false>(                               \
+        w, scales, biases, x, y, /*residual=*/nullptr, in_vec_size,          \
+        out_vec_size, t0, simd_gid, simd_lid);                               \
+  }
+VPIPE_GATHER_SWIGLU_ANY(affine_gather_qmv_swiglu_w4g32, 4, 32)
+VPIPE_GATHER_SWIGLU_ANY(affine_gather_qmv_swiglu_w5g32, 5, 32)
+VPIPE_GATHER_SWIGLU_ANY(affine_gather_qmv_swiglu_w6g32, 6, 32)
+VPIPE_GATHER_SWIGLU_ANY(affine_gather_qmv_swiglu_w8g32, 8, 32)
+VPIPE_GATHER_SWIGLU_ANY(affine_gather_qmv_swiglu_w6g64, 6, 64)
+VPIPE_GATHER_DOWN_ANY(affine_gather_down_qmv_w4g32, 4, 32)
+VPIPE_GATHER_DOWN_ANY(affine_gather_down_qmv_w5g32, 5, 32)
+VPIPE_GATHER_DOWN_ANY(affine_gather_down_qmv_w6g32, 6, 32)
+VPIPE_GATHER_DOWN_ANY(affine_gather_down_qmv_w8g32, 8, 32)
+VPIPE_GATHER_DOWN_ANY(affine_gather_down_qmv_w6g64, 6, 64)
+
 // Shared-expert sigmoid gate (Qwen3.5-MoE): g[t] = sigmoid(dequant(w[1,K] w8)
 // . X[t]). One simdgroup per input row (tid.y = row); lane 0 writes the gate.
 // grid {32, M, 1}, tg {32,1,1}; decode is the M=1 case. The router gate and
 // this shared gate are the only w8 tensors in the MoE block.
+// One row's shared-expert gate (affine_moe_gate_w8g64's and the fused MoE
+// launch's: the same code, the same bits).
+template <int GS = 64>
+inline void moe_gate_w8_row_(
+    const device uint32_t* w, const device VPIPE_ELT* scales,
+    const device VPIPE_ELT* biases, const device VPIPE_ELT* x,
+    device VPIPE_ELT* outg, int K, uint row, uint simd_lid)
+{
+  const device uint8_t* wb = (const device uint8_t*)w;   // K bytes (q in 0..255)
+  const device VPIPE_ELT* xr = x + row * (uint)K;
+  float acc = 0.0f;
+  for (int k = (int)simd_lid; k < K; k += SIMD_SIZE) {
+    const int g = k / GS;
+    const float s = (float)scales[g];
+    const float b = (float)biases[g];
+    acc += ((float)wb[k] * s + b) * (float)xr[k];
+  }
+  acc = simd_sum(acc);
+  if (simd_lid == 0) {
+    outg[row] = (VPIPE_ELT)(1.0f / (1.0f + metal::exp(-acc)));
+  }
+}
+
 kernel void affine_moe_gate_w8g64(
     const device uint32_t* w       [[buffer(0)]],   // [1, K/4] (w8 packed)
     const device VPIPE_ELT* scales [[buffer(1)]],   // [1, K/64]
@@ -1439,18 +1533,22 @@ kernel void affine_moe_gate_w8g64(
     uint3 tid     [[threadgroup_position_in_grid]],
     uint simd_lid [[thread_index_in_simdgroup]])
 {
-  const device uint8_t* wb = (const device uint8_t*)w;   // K bytes (q in 0..255)
-  const int K = in_vec_size;
-  const device VPIPE_ELT* xr = x + (uint)tid.y * (uint)K;
-  float acc = 0.0f;
-  for (int k = (int)simd_lid; k < K; k += SIMD_SIZE) {
-    const int g = k / 64;
-    const float s = (float)scales[g];
-    const float b = (float)biases[g];
-    acc += ((float)wb[k] * s + b) * (float)xr[k];
-  }
-  acc = simd_sum(acc);
-  if (simd_lid == 0) { outg[tid.y] = (VPIPE_ELT)(1.0f / (1.0f + metal::exp(-acc))); }
+  moe_gate_w8_row_(w, scales, biases, x, outg, in_vec_size, tid.y, simd_lid);
+}
+
+// Group-32 twin.
+kernel void affine_moe_gate_w8g32(
+    const device uint32_t* w       [[buffer(0)]],   // [1, K/4] (w8 packed)
+    const device VPIPE_ELT* scales [[buffer(1)]],   // [1, K/32]
+    const device VPIPE_ELT* biases [[buffer(2)]],   // [1, K/32]
+    const device VPIPE_ELT* x      [[buffer(3)]],   // [M, K]
+    device VPIPE_ELT*       outg   [[buffer(4)]],   // [M] = sigmoid(logit)
+    constant int&  in_vec_size     [[buffer(5)]],   // K
+    uint3 tid     [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+{
+  moe_gate_w8_row_<32>(w, scales, biases, x, outg, in_vec_size, tid.y,
+                       simd_lid);
 }
 
 // Fused GeGLU MLP GEMV (Gemma-4): identical to qmv_swiglu_impl but the
@@ -1843,6 +1941,193 @@ VPIPE_QMV_BATCH(affine_qmv_batch4_w4g64, 4)
   }
 VPIPE_QMV_BATCH_W8(affine_qmv_batch_w8g64, 2)
 VPIPE_QMV_BATCH_W8(affine_qmv_batch4_w8g64, 4)   // MTP verify n=3..4 (see w4)
+// Group-32 twin (a hyper-connection model whose projections come at group
+// 32, re-encoded to w8g32): the same impl at group_size 32.
+#define VPIPE_QMV_BATCH_W8G32(NAME, MAXM)                                    \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_impl<VPIPE_ELT, 32, 8, MAXM>(                                  \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_W8G32(affine_qmv_batch4_w8g32, 4)
+
+// ===================================================================
+// SPLIT-K w8 GEMV for a few rows over a LONG K (Qwen3.8-Flash-Next's
+// hyper-connection mixers read 4 x 2560 = 10240 wide). qmv walks K in
+// dependent blocks of 256 a simdgroup -- 40 for 10240, each a memory
+// latency -- so it costs 27-37 us there however few its outputs (the mixer's
+// injection has 4), and the batched GEMV 78-121 us at four rows (M5 Ultra).
+// Here KS simdgroups of a threadgroup share RPS output rows, each taking a
+// contiguous run of K's blocks; their partial sums meet in threadgroup
+// memory and are added in run order: 7.7 us at 320 outputs, 4.3 at 4 --
+// 6.5 / 10 at four rows. Deterministic, and an x row's sums are the same
+// whatever the batch (rows tiled by MAXM along grid.z, as the batched
+// GEMV's), so a speculative verify's rows are its decode's, bit for bit.
+//
+// Dispatch: grid {32, KS * ceil(N / RPS), ceil(M / MAXM)}, tg {32, KS, 1};
+// buffer(7) the batch's row count M.
+// ===================================================================
+template <typename T, int group_size, int RPS, int KS, int MAXM>
+METAL_FUNC void qmv_splitk_w8_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,                  // [m_total, K]
+    device T* y,                        // [m_total, N]
+    const constant int& in_vec_size,    // K
+    const constant int& out_vec_size,   // N
+    const constant int& m_total,
+    threadgroup float* part,            // [KS][RPS][MAXM]
+    uint3 tid, uint simd_gid, uint simd_lid) {
+  constexpr int bits = 8;
+  constexpr int packs_per_thread = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  static_assert(RPS * MAXM <= SIMD_SIZE, "one lane a sum to add up");
+  typedef float U;
+
+  const int base_row = (int)tid.z * MAXM;
+  if (base_row >= m_total) { return; }
+  const int m_rows = metal::min(MAXM, m_total - base_row);
+  const int K = in_vec_size, N = out_vec_size;
+  const int out_row = (int)tid.y * RPS;
+  const int rows_here = metal::min(RPS, N - out_row);
+
+  // This simdgroup's run of K, in whole blocks (the last may be partial).
+  const int nblocks = (K + block_size - 1) / block_size;
+  const int b0 = (int)simd_gid * nblocks / KS;
+  const int b1 = ((int)simd_gid + 1) * nblocks / KS;
+  const int k0 = b0 * block_size;
+
+  const int in_vec_size_w = K * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = K / group_size;
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + k0 * bytes_per_pack / pack_factor +
+      simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + k0 / group_size +
+            simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + k0 / group_size +
+            simd_lid / scale_step_per_thread;
+  const device T* xptr[MAXM];
+  for (int m = 0; m < MAXM; m++) {
+    const int mm = (m < m_rows) ? m : (m_rows - 1);   // pad -> last row
+    xptr[m] = x + (base_row + mm) * K + k0 + simd_lid * values_per_thread;
+  }
+
+  thread U x_thread[MAXM][values_per_thread];
+  thread U result[RPS][MAXM];
+  for (int r = 0; r < RPS; r++) {
+    for (int m = 0; m < MAXM; m++) { result[r][m] = 0; }
+  }
+  for (int b = b0; b < b1; b++) {
+    const int k = b * block_size;
+    const int krem = K - k;
+    const int kvalid = K - (k + (int)simd_lid * values_per_thread);
+    // A lane wholly past the row's end reads no weights (qmv's rule).
+    const bool live = krem >= block_size || kvalid > 0;
+    U sum[MAXM];
+    for (int m = 0; m < MAXM; m++) {
+      sum[m] = (krem >= block_size)
+          ? load_vector<T, U, values_per_thread, bits>(xptr[m], x_thread[m])
+          : load_vector_safe<T, U, values_per_thread, bits>(
+                xptr[m], x_thread[m], kvalid < 0 ? 0 : kvalid);
+    }
+    for (int row = 0; row < rows_here && live; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const U s = scales[row * in_vec_size_g];
+      const U bb = biases[row * in_vec_size_g];
+      U acc[MAXM] = {0};
+      for (int i = 0; i < values_per_thread; i++) {
+        const U wv = (U)wl[i];
+        for (int m = 0; m < MAXM; m++) { acc[m] += x_thread[m][i] * wv; }
+      }
+      for (int m = 0; m < MAXM; m++) {
+        result[row][m] += s * acc[m] + sum[m] * bb;
+      }
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    for (int m = 0; m < MAXM; m++) { xptr[m] += block_size; }
+  }
+  // Each run's sums, then the runs added in order.
+  for (int row = 0; row < RPS; row++) {
+    for (int m = 0; m < MAXM; m++) {
+      const U v = simd_sum(result[row][m]);
+      if (simd_lid == 0) {
+        part[((int)simd_gid * RPS + row) * MAXM + m] = v;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && (int)simd_lid < RPS * MAXM) {
+    const int row = (int)simd_lid / MAXM, m = (int)simd_lid % MAXM;
+    if (row < rows_here && m < m_rows) {
+      U t = 0;
+      for (int g = 0; g < KS; g++) { t += part[(g * RPS + row) * MAXM + m]; }
+      y[(base_row + m) * N + out_row + row] = (T)t;
+    }
+  }
+}
+
+#define VPIPE_QMV_SPLITK_W8(NAME, RPS, KS, MAXM)                             \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    threadgroup float part[KS * RPS * MAXM];                                 \
+    qmv_splitk_w8_impl<VPIPE_ELT, 64, RPS, KS, MAXM>(                        \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total, part,   \
+        tid, simd_gid, simd_lid);                                            \
+  }
+// 8 runs a row for many outputs (the mixer's down, 320), 16 for a few (its
+// injection, 4): measured best of 4 / 8 / 16 / 32 runs and 1 / 2 / 4 rows a
+// threadgroup on an M5 Ultra.
+VPIPE_QMV_SPLITK_W8(affine_qmv_splitk8_w8g64, 1, 8, 4)
+VPIPE_QMV_SPLITK_W8(affine_qmv_splitk16_w8g64, 1, 16, 4)
+// Group-32 twins (projections re-encoded to w8g32).
+#define VPIPE_QMV_SPLITK_W8G32(NAME, RPS, KS, MAXM)                          \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    threadgroup float part[KS * RPS * MAXM];                                 \
+    qmv_splitk_w8_impl<VPIPE_ELT, 32, RPS, KS, MAXM>(                        \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total, part,   \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_SPLITK_W8G32(affine_qmv_splitk8_w8g32, 1, 8, 4)
+VPIPE_QMV_SPLITK_W8G32(affine_qmv_splitk16_w8g32, 1, 16, 4)
 
 // ===================================================================
 // Batched GEMV, TALL tile with THREADGROUP-STAGED activations
@@ -2846,6 +3131,35 @@ VPIPE_GROUPED(affine_grouped_swiglu_w8g64, 8, 2, true, true)
 VPIPE_GROUPED(affine_grouped_down_w8g64, 8, 2, false, false)
 VPIPE_GROUPED(affine_grouped_swiglu_w5g64, 5, 2, true, true)
 VPIPE_GROUPED(affine_grouped_down_w5g64, 5, 2, false, false)
+// Group-32 and 6-bit twins (the impl takes the group as it takes the width).
+#define VPIPE_GROUPED_G(NAME, BITS, GS, MAXM, SW, GA)                        \
+  kernel void NAME(                                                          \
+      const device uint32_t* w       [[buffer(0)]],                          \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      const device int* srow     [[buffer(7)]],                              \
+      const device int* tile2e   [[buffer(8)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_grouped_impl<VPIPE_ELT, GS, BITS, MAXM, SW, GA>(                     \
+        w, scales, biases, x, y, srow, tile2e, in_vec_size, out_vec_size,    \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_GROUPED_G(affine_grouped_swiglu_w4g32, 4, 32, 2, true, true)
+VPIPE_GROUPED_G(affine_grouped_down_w4g32, 4, 32, 2, false, false)
+VPIPE_GROUPED_G(affine_grouped_swiglu_w5g32, 5, 32, 2, true, true)
+VPIPE_GROUPED_G(affine_grouped_down_w5g32, 5, 32, 2, false, false)
+VPIPE_GROUPED_G(affine_grouped_swiglu_w6g32, 6, 32, 2, true, true)
+VPIPE_GROUPED_G(affine_grouped_down_w6g32, 6, 32, 2, false, false)
+VPIPE_GROUPED_G(affine_grouped_swiglu_w8g32, 8, 32, 2, true, true)
+VPIPE_GROUPED_G(affine_grouped_down_w8g32, 8, 32, 2, false, false)
+VPIPE_GROUPED_G(affine_grouped_swiglu_w6g64, 6, 64, 2, true, true)
+VPIPE_GROUPED_G(affine_grouped_down_w6g64, 6, 64, 2, false, false)
 
 // group_size=32 twin of VPIPE_QMV_BATCH (GGUF q4_0): identical to the
 // macro above but the impl group_size template arg is 32. The g64 macro
@@ -3266,6 +3580,25 @@ kernel void affine_qmv_w8g64_add(
       in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// Group-32 twin (a hyper-connection model at group 32).
+kernel void affine_qmv_w8g32_add(
+    const device uint32_t* w            [[buffer(0)]],
+    const device VPIPE_ELT*     scales       [[buffer(1)]],
+    const device VPIPE_ELT*     biases       [[buffer(2)]],
+    const device VPIPE_ELT*     x            [[buffer(3)]],
+    device VPIPE_ELT*           y            [[buffer(4)]],
+    constant int&          in_vec_size  [[buffer(5)]],
+    constant int&          out_vec_size [[buffer(6)]],
+    const device VPIPE_ELT*     residual     [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_fast_impl<VPIPE_ELT, 32, 8, true>(
+      w, scales, biases, x, y, residual,
+      in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
 kernel void affine_qmv_swiglu_w8g64(
     const device uint32_t* w            [[buffer(0)]],
     const device VPIPE_ELT*     scales       [[buffer(1)]],
@@ -3279,6 +3612,24 @@ kernel void affine_qmv_swiglu_w8g64(
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
   qmv_swiglu_impl<VPIPE_ELT, 64, 8>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size,
+      tid, simd_gid, simd_lid);
+}
+
+// Group-32 twin (a w8g32 shared expert).
+kernel void affine_qmv_swiglu_w8g32(
+    const device uint32_t* w            [[buffer(0)]],
+    const device VPIPE_ELT*     scales       [[buffer(1)]],
+    const device VPIPE_ELT*     biases       [[buffer(2)]],
+    const device VPIPE_ELT*     x            [[buffer(3)]],
+    device VPIPE_ELT*           y            [[buffer(4)]],
+    constant int&          in_vec_size  [[buffer(5)]],
+    constant int&          out_vec_size [[buffer(6)]],   // N = 2*ffn
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_swiglu_impl<VPIPE_ELT, 32, 8>(
       w, scales, biases, x, y, in_vec_size, out_vec_size,
       tid, simd_gid, simd_lid);
 }
@@ -3521,3 +3872,429 @@ VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks3_add_w8g64, 3, 8)
 VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks4_add_w8g64, 4, 8)
 VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks6_add_w8g64, 6, 8)
 VPIPE_QMV_KSPLIT_ADD(affine_qmv_ks8_add_w8g64, 8, 8)
+
+
+// ===================================================================
+// A DECODE step's and a VERIFY's MoE in two launches after the routing
+// (Qwen3.8-Flash-Next: w5 experts, a w8 shared expert and gate). It was
+// five -- the routed gate | up, the shared gate | up, the shared gate, the
+// routed down, the shared down -- and moe_finalize_set_f16, each a
+// dependent dispatch. Every value is computed by the code that computed it
+// there (qmv_swiglu_impl, the qmv_fast_impl loop, moe_gate_w8_row_, the
+// finalize's sums), so a decode keeps its tokens and a verify's rows are a
+// decode's.
+// ===================================================================
+
+// The gate | up launch: threadgroup z < np runs pair z as
+// affine_gather_qmv_swiglu_w5g64 does, np + m the shared expert of row m
+// as affine_qmv_swiglu_w8g64 does (its row tid.x = m), np + M the shared
+// gates -- threadgroup y the row, simdgroup 0. grid {32, 2 Y, np + M + 1},
+// tg {32, 2, 1}, Y = max(2 I / 8, 2 Sh / 8, M) -- or z along x, grid
+// {32 (np + M + 1), 2 Y, 1}: one output block's pairs launched together,
+// so two rows' picks of one expert read its rows from the cache (a third
+// of a three-row verify's picks repeat another's).
+// The launch at any routed-expert format (EB bits, group EG) and shared
+// group SG: the w5g64 one's code with its constants named.
+template <int EB, int EG, int SG>
+kernel void moe_up_fused_t(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // 2*inner
+    const device int* pair_eid      [[buffer(7)]],
+    constant int& top_k             [[buffer(8)]],
+    const device uint32_t* sw       [[buffer(9)]],   // shared [2*Sh, K] w8
+    const device VPIPE_ELT* ss      [[buffer(10)]],
+    const device VPIPE_ELT* sb      [[buffer(11)]],
+    device VPIPE_ELT*       sy      [[buffer(12)]],  // [M, Sh]
+    constant int& s_out             [[buffer(13)]],  // 2*Sh
+    const device uint32_t* gw       [[buffer(14)]],  // shared gate [1, K] w8
+    const device VPIPE_ELT* gs      [[buffer(15)]],
+    const device VPIPE_ELT* gb      [[buffer(16)]],
+    device VPIPE_ELT*       gout    [[buffer(17)]],  // [M]
+    constant int& M                 [[buffer(18)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const int np = M * top_k;
+  const int z = (int)(tid.x + tid.z);     // whichever the grid lays it on
+  if (z < np) {
+    if ((int)tid.y >= out_vec_size / 8) { return; }
+    const ulong e = (ulong)pair_eid[z];
+    const ulong N = (ulong)out_vec_size, K = (ulong)in_vec_size;
+    w = (const device uint32_t*)((const device uint8_t*)w + e * N * K * EB / 8);
+    scales += e * N * (K / EG);
+    biases += e * N * (K / EG);
+    x      += (uint)(z / top_k) * (uint)in_vec_size;
+    y      += (uint)z * ((uint)out_vec_size / 2u);
+    const uint3 t0 = uint3(0u, tid.y, 0u);
+    qmv_swiglu_impl<VPIPE_ELT, EG, EB>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size, t0,
+        simd_gid, simd_lid);
+  } else if (z < np + M) {
+    if ((int)tid.y >= s_out / 8) { return; }
+    const uint3 t0 = uint3((uint)(z - np), tid.y, 0u);
+    qmv_swiglu_impl<VPIPE_ELT, SG, 8>(
+        sw, ss, sb, x, sy, in_vec_size, s_out, t0, simd_gid, simd_lid);
+  } else {
+    if (simd_gid != 0 || (int)tid.y >= M) { return; }
+    moe_gate_w8_row_<SG>(gw, gs, gb, x, gout, in_vec_size, tid.y,
+                         simd_lid);
+  }
+}
+
+
+template [[host_name("affine_moe_up_fused_w5g64")]] kernel void
+moe_up_fused_t<5, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // 2*inner
+    const device int* pair_eid      [[buffer(7)]],
+    constant int& top_k             [[buffer(8)]],
+    const device uint32_t* sw       [[buffer(9)]],   // shared [2*Sh, K] w8
+    const device VPIPE_ELT* ss      [[buffer(10)]],
+    const device VPIPE_ELT* sb      [[buffer(11)]],
+    device VPIPE_ELT*       sy      [[buffer(12)]],  // [M, Sh]
+    constant int& s_out             [[buffer(13)]],  // 2*Sh
+    const device uint32_t* gw       [[buffer(14)]],  // shared gate [1, K] w8
+    const device VPIPE_ELT* gs      [[buffer(15)]],
+    const device VPIPE_ELT* gb      [[buffer(16)]],
+    device VPIPE_ELT*       gout    [[buffer(17)]],  // [M]
+    constant int& M                 [[buffer(18)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_up_fused_w4g64")]] kernel void
+moe_up_fused_t<4, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // 2*inner
+    const device int* pair_eid      [[buffer(7)]],
+    constant int& top_k             [[buffer(8)]],
+    const device uint32_t* sw       [[buffer(9)]],   // shared [2*Sh, K] w8
+    const device VPIPE_ELT* ss      [[buffer(10)]],
+    const device VPIPE_ELT* sb      [[buffer(11)]],
+    device VPIPE_ELT*       sy      [[buffer(12)]],  // [M, Sh]
+    constant int& s_out             [[buffer(13)]],  // 2*Sh
+    const device uint32_t* gw       [[buffer(14)]],  // shared gate [1, K] w8
+    const device VPIPE_ELT* gs      [[buffer(15)]],
+    const device VPIPE_ELT* gb      [[buffer(16)]],
+    device VPIPE_ELT*       gout    [[buffer(17)]],  // [M]
+    constant int& M                 [[buffer(18)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_up_fused_w6g64")]] kernel void
+moe_up_fused_t<6, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // 2*inner
+    const device int* pair_eid      [[buffer(7)]],
+    constant int& top_k             [[buffer(8)]],
+    const device uint32_t* sw       [[buffer(9)]],   // shared [2*Sh, K] w8
+    const device VPIPE_ELT* ss      [[buffer(10)]],
+    const device VPIPE_ELT* sb      [[buffer(11)]],
+    device VPIPE_ELT*       sy      [[buffer(12)]],  // [M, Sh]
+    constant int& s_out             [[buffer(13)]],  // 2*Sh
+    const device uint32_t* gw       [[buffer(14)]],  // shared gate [1, K] w8
+    const device VPIPE_ELT* gs      [[buffer(15)]],
+    const device VPIPE_ELT* gb      [[buffer(16)]],
+    device VPIPE_ELT*       gout    [[buffer(17)]],  // [M]
+    constant int& M                 [[buffer(18)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_up_fused_w8g64")]] kernel void
+moe_up_fused_t<8, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // 2*inner
+    const device int* pair_eid      [[buffer(7)]],
+    constant int& top_k             [[buffer(8)]],
+    const device uint32_t* sw       [[buffer(9)]],   // shared [2*Sh, K] w8
+    const device VPIPE_ELT* ss      [[buffer(10)]],
+    const device VPIPE_ELT* sb      [[buffer(11)]],
+    device VPIPE_ELT*       sy      [[buffer(12)]],  // [M, Sh]
+    constant int& s_out             [[buffer(13)]],  // 2*Sh
+    const device uint32_t* gw       [[buffer(14)]],  // shared gate [1, K] w8
+    const device VPIPE_ELT* gs      [[buffer(15)]],
+    const device VPIPE_ELT* gb      [[buffer(16)]],
+    device VPIPE_ELT*       gout    [[buffer(17)]],  // [M]
+    constant int& M                 [[buffer(18)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_up_fused_w4g32_sg32")]] kernel void
+moe_up_fused_t<4, 32, 32>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, 2*inner, K*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [M, K] input rows
+    device VPIPE_ELT*       y       [[buffer(4)]],   // [npair, inner]
+    constant int& in_vec_size       [[buffer(5)]],   // K
+    constant int& out_vec_size      [[buffer(6)]],   // 2*inner
+    const device int* pair_eid      [[buffer(7)]],
+    constant int& top_k             [[buffer(8)]],
+    const device uint32_t* sw       [[buffer(9)]],   // shared [2*Sh, K] w8
+    const device VPIPE_ELT* ss      [[buffer(10)]],
+    const device VPIPE_ELT* sb      [[buffer(11)]],
+    device VPIPE_ELT*       sy      [[buffer(12)]],  // [M, Sh]
+    constant int& s_out             [[buffer(13)]],  // 2*Sh
+    const device uint32_t* gw       [[buffer(14)]],  // shared gate [1, K] w8
+    const device VPIPE_ELT* gs      [[buffer(15)]],
+    const device VPIPE_ELT* gb      [[buffer(16)]],
+    device VPIPE_ELT*       gout    [[buffer(17)]],  // [M]
+    constant int& M                 [[buffer(18)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+
+// qmv_fast_impl's loop (RPS 4, PPT 2, 2 simdgroups) for one simdgroup's
+// four rows from out_row, its sums back (lane 0's, rounded where the
+// kernel would store them).
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_fast_rows_(
+    const device uint32_t* w, const device T* scales, const device T* biases,
+    const device T* x, const int in_vec_size, const int out_row,
+    uint simd_lid, thread T* out) {
+  constexpr int packs_per_thread = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int krem = in_vec_size - k;
+    U sum;
+    bool live = true;
+    if (krem >= block_size) {
+      sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    } else {
+      const int v = in_vec_size - (k + (int)simd_lid * values_per_thread);
+      live = v > 0;
+      sum = load_vector_safe<T, U, values_per_thread, bits>(
+          x, x_thread, v < 0 ? 0 : v);
+    }
+    for (int row = 0; row < results_per_simdgroup && live; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      U s = sl[0];
+      U b = (U)(biases + row * in_vec_size_g)[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    out[row] = static_cast<T>(result[row]);
+  }
+}
+
+// The down launch: threadgroup (y, m) -- output rows y * 8 .. of row m.
+// Simdgroups 2 j and 2 j + 1 run pair m * top_k + j's rows as
+// affine_gather_down_qmv_w5g64 does, 2 top_k and 2 top_k + 1 the shared
+// expert's as affine_qmv_w8g64 does; then eight threads add them up as
+// moe_finalize_set_f16 does. top_k <= 15. grid {32, 2 (top_k + 1) H / 8,
+// M}, tg {32, 2 (top_k + 1), 1} -- or m along x, grid {32 M, 2 (top_k +
+// 1) H / 8, 1}: one output block's rows together, an expert two of them
+// picked read once from DRAM (the up launch's reason).
+template <int EB, int EG, int SG>
+kernel void moe_down_fused_t(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  threadgroup VPIPE_ELT part[16][8];
+  const int m = (int)(tid.x + tid.z);     // whichever the grid lays it on
+  const int j = (int)simd_gid / 2;
+  const int out_row = (int)tid.y * 8 + ((int)simd_gid % 2) * 4;
+  VPIPE_ELT r4[4];
+  if (j < top_k) {
+    const int p = m * top_k + j;
+    const ulong e = (ulong)pair_eid[p];
+    const ulong N = (ulong)H, K = (ulong)inner;
+    const device uint32_t* we =
+        (const device uint32_t*)((const device uint8_t*)w + e * N * K * EB / 8);
+    qmv_fast_rows_<VPIPE_ELT, EG, EB>(
+        we, scales + e * N * (K / EG), biases + e * N * (K / EG),
+        x + (uint)p * (uint)inner, inner, out_row, simd_lid, r4);
+  } else {
+    qmv_fast_rows_<VPIPE_ELT, SG, 8>(
+        sw, ss, sb, sx + (uint)m * (uint)Sh, Sh, out_row, simd_lid, r4);
+  }
+  if (simd_lid == 0) {
+    for (int r = 0; r < 4; ++r) {
+      part[j][((int)simd_gid % 2) * 4 + r] = r4[r];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid != 0 || simd_lid >= 8) { return; }
+  const int base = m * top_k;
+  float acc = 0.0f;
+  for (int s = 0; s < top_k; ++s) {
+    acc += (float)pw[base + s] * (float)part[s][simd_lid];
+  }
+  const float moe = (float)(VPIPE_ELT)acc;
+  const float g = (float)gate[m];
+  out[(ulong)m * H + tid.y * 8 + simd_lid] =
+      (VPIPE_ELT)(moe + (float)(VPIPE_ELT)(g * (float)part[top_k][simd_lid]));
+}
+
+template [[host_name("affine_moe_down_fused_w5g64")]] kernel void
+moe_down_fused_t<5, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_down_fused_w4g64")]] kernel void
+moe_down_fused_t<4, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_down_fused_w6g64")]] kernel void
+moe_down_fused_t<6, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_down_fused_w8g64")]] kernel void
+moe_down_fused_t<8, 64, 64>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);
+template [[host_name("affine_moe_down_fused_w4g32_sg32")]] kernel void
+moe_down_fused_t<4, 32, 32>(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*5/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]]);

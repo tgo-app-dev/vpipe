@@ -1274,6 +1274,13 @@ GenerateImageStage::apply_constant(unsigned iport, const FlexData& beat)
   // beat and the same parse, early enough that declare_resources()
   // sees the model. Bookkeeping only -- nothing loads here; the
   // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport == kModelCfgPort) {
+    // Planning only -- the live preview's TAE and Fibo 2.0's guidance
+    // (whether a negative's text is held beside the prompt's) are booked
+    // from it; the runtime latch parses the beat as before.
+    _plan_model_cfg = beat;
+    return;
+  }
   if (iport != kModelPort) { return; }
   apply_model_select_beat(beat, _hf_dir);
 }
@@ -1779,6 +1786,10 @@ GenerateImageStage::reset_run_state()
   // FLUX.3's schedule override: a graph that stops naming one must not
   // keep running it.
   _flux3_alpha_cfg = 0.0;
+  // Fibo 2.0's guidance: "no opinion" again; and the plan's copy of the
+  // model config, read by declare_resources, which has run by now.
+  _fibo2_guidance_cfg = -1.0;
+  _plan_model_cfg = FlexData{};
   // MOSS-Image's guidance, skipped blocks and shift: "no opinion" again.
   _moss_guidance_cfg = -1.0;
   _moss_skip_set = false;
@@ -2240,7 +2251,7 @@ GenerateImageStage::declare_resources() const
     // its preview is booked exactly as a built-in's is.
     for (auto& c : latent_preview_claims(
              session(), this->id(),
-             LatentPreviewSpec::from_model_config(_model_cfg),
+             LatentPreviewSpec::from_model_config(_plan_model_cfg),
              genai::MetalTaeDecoder::Trim::kLeading,
              _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
       pout.push_back(std::move(c));
@@ -2419,9 +2430,14 @@ GenerateImageStage::declare_resources() const
   // alone is 576 of them). An edit graph takes its size from the
   // reference, which no plan can see; it books the edit the shipped
   // graphs run -- 1024^2, the model's trained area, as ane_plan_seq
-  // assumes -- rather than the presence marker: this family only edits,
-  // so the marker left every launch-time decision blind to ~1 GB.
-  // generate_fibo2_ revises it to the edit's real rows.
+  // assumes -- rather than the presence marker, which left every
+  // launch-time decision blind to ~1 GB. A text-to-image graph (Dev)
+  // has no reference and is booked as an edit all the same: the plan
+  // cannot see the wiring, and over is the safe side. A GUIDED graph
+  // (Dev: its guidance above 1, from the model-config constant or this
+  // stage's own) holds a negative's text beside the prompt's, booked at
+  // the prompt's length. generate_fibo2_ revises it all to the real
+  // rows.
   if (t2i_family_(dit) == "fibo2") {
     genai::MetalFibo2Transformer::Config bc;
     std::size_t bytes = model_memory::kUnknownArena;
@@ -2435,10 +2451,20 @@ GenerateImageStage::declare_resources() const
       auto* mcm = session() != nullptr
                       ? session()->services()->metal_compute()
                       : nullptr;
+      double g = _guidance_scale;
+      if (_plan_model_cfg.is_object()) {
+        auto o = _plan_model_cfg.as_object();
+        const std::string fam = model_config::family_of(_plan_model_cfg);
+        if ((fam.empty() || fam == "fibo2") && o.contains("guidance_scale") &&
+            o.at("guidance_scale").as_real(-1.0) >= 0.0) {
+          g = o.at("guidance_scale").as_real(-1.0);
+        }
+      }
       bytes = genai::MetalFibo2Transformer::forward_scratch_bytes(
           bc, 2 * (w / 16) * (h / 16), 1024,
           dit_config_quant_bits_(dit) > 0,
-          mcm != nullptr && mcm->supports_matrix_cores());
+          mcm != nullptr && mcm->supports_matrix_cores(),
+          g > 1.0 ? 1024 : -1);
     }
     for (auto& c : model_memory::scratch_claims(
              fmt("fibo2-dit:{}", this->id())(), bytes,
@@ -2603,10 +2629,12 @@ GenerateImageStage::declare_resources() const
   // preview claims nothing. A list here would have to be kept in step
   // with the model-config stages that carry the key, and would fail
   // silently in the direction that under-books. The registered-family
-  // branch above asks the same way.
+  // branch above asks the same way. The spec is the model-config
+  // CONSTANT's (apply_constant): `_model_cfg` is the runtime latch, empty
+  // at a first launch's plan and the last run's at a relaunch's.
   for (auto& c : latent_preview_claims(
            session(), this->id(),
-           LatentPreviewSpec::from_model_config(_model_cfg),
+           LatentPreviewSpec::from_model_config(_plan_model_cfg),
            genai::MetalTaeDecoder::Trim::kLeading,
            _width > 0 ? _width : 1024, _height > 0 ? _height : 1024, 1)) {
     out.push_back(std::move(c));
@@ -2791,6 +2819,22 @@ GenerateImageStage::apply_model_config_()
         _fibo2_dit->set_lora_scale(i, s);
       }
     });
+    // guidance_scale: Dev's 5 (the model card's recipe, against the
+    // conditioner's negative on iport1), Edit Turbo's 1. Absent is "no
+    // opinion".
+    if (_model_cfg.is_object()) {
+      auto o = _model_cfg.as_object();
+      if (o.contains("guidance_scale")) {
+        const double g = o.at("guidance_scale").as_real(-1.0);
+        if (g >= 0.0) {
+          _fibo2_guidance_cfg = g;
+        } else {
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): model_config `guidance_scale` must "
+              "be >= 0; IGNORED", this->id()));
+        }
+      }
+    }
   }
   if (_family == "moss-image") {
     // guidance_scale (the reference's 3; 1 runs no negative at all),
@@ -6050,11 +6094,16 @@ GenerateImageStage::generate_z_image_(
 //   * f32 Euler on the patch rows (elementwise, so the order is free);
 //   * the pictures to edit: vae-encode's normalized [128, h, w] latent
 //     IS this model's patch rows ((channel, dy, dx), FLUX.2's patchify),
-//     token-major, in bf16 as the pipeline casts them.
-// No guidance: the distilled edit model runs at 1.0.
+//     token-major, in bf16 as the pipeline casts them;
+//   * GUIDANCE above 1 (Fibo 2.0 Dev; the distilled Edit Turbo runs at
+//     1.0): the negative's own forward at every step, on the same latent
+//     rows and pictures -- its text a sequence of its own, so its own
+//     gist count and layout -- and uncond + g (cond - uncond) on the two
+//     velocities as f32, three roundings as torch does them.
 std::vector<float>
 GenerateImageStage::generate_fibo2_(
-    const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+    const metal_compute::SharedBuffer& text, int n_rows,
+    const metal_compute::SharedBuffer& neg, int n_neg, int gen_h,
     int gen_w, const std::vector<RefLatent>& refs,
     const std::vector<float>* init_packed,
     const std::function<void(const std::vector<float>&)>& emit_step) const
@@ -6081,6 +6130,29 @@ GenerateImageStage::generate_fibo2_(
         this->id(), dcfg.cap_dim, terr));
     return {};
   }
+  // ---- guidance ------------------------------------------------------------
+  //
+  // The reference guides when the scale is ABOVE 1
+  // (do_classifier_free_guidance), so 1 and below run one pass.
+  const double g = _fibo2_guidance_cfg >= 0.0 ? _fibo2_guidance_cfg
+                                              : _guidance_scale;
+  const bool want_cfg = g > 1.0;
+  bool cfg = want_cfg && !neg.empty() && n_neg > 0;
+  if (want_cfg && !cfg) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): Fibo 2.0 guidance {} wants a negative "
+        "conditioning (the diffusion-conditioner emits one on oport1 when it "
+        "is wired -- connect it to iport1); running WITHOUT guidance",
+        this->id(), g));
+  }
+  if (cfg && !_fibo2_dit->set_text(neg, n_neg, &terr, 1)) {
+    session()->warn(fmt(
+        "GenerateImageStage('{}'): the Fibo 2.0 negative conditioning: {}",
+        this->id(), terr));
+    return {};
+  }
+  // A run with no negative drops the last one's text.
+  if (!cfg) { _fibo2_dit->clear_text(1); }
 
   // ---- the pictures to edit, as patch rows after the image's ----------
   std::vector<std::pair<int, int>> grids;
@@ -6103,11 +6175,16 @@ GenerateImageStage::generate_fibo2_(
     grids.emplace_back(r.h, r.w);
     used.push_back(&r);
   }
-  genai::fibo2::Layout lay;
+  // The negative's sequence: the same image and pictures, its own gist.
+  genai::fibo2::Layout lay, lay_neg;
   {
     std::string lerr;
     if (!genai::fibo2::build_layout(gh, gw, grids, _fibo2_dit->gist_count(),
-                                    dcfg.max_gist, &lay, &lerr)) {
+                                    dcfg.max_gist, &lay, &lerr) ||
+        (cfg && !genai::fibo2::build_layout(gh, gw, grids,
+                                            _fibo2_dit->gist_count(1),
+                                            dcfg.max_gist, &lay_neg,
+                                            &lerr))) {
       session()->warn(fmt("GenerateImageStage('{}'): Fibo 2.0 layout: {}",
                           this->id(), lerr));
       return {};
@@ -6141,7 +6218,9 @@ GenerateImageStage::generate_fibo2_(
   // ---- the schedule ------------------------------------------------------
   const int S = _scheduler_latched && _scheduler_spec.steps > 0
                     ? _scheduler_spec.steps
-                    : (_steps_set ? _steps : _fibo2_steps);
+                : _steps_set ? _steps
+                : want_cfg   ? _fibo2_guided_steps
+                             : _fibo2_steps;
   if (S <= 0) { return {}; }
   std::vector<float> sig((std::size_t)S + 1, 0.0f);
   double mu = 0.0;
@@ -6178,7 +6257,7 @@ GenerateImageStage::generate_fibo2_(
   }
 
   UiProgress bar = session()->open_progress("denoise");
-  DenoiseProgress prog(&bar, S, 1);
+  DenoiseProgress prog(&bar, S, cfg ? 2 : 1);
   ScopedBlockProgress<std::remove_reference_t<decltype(*_fibo2_dit)>>
       prog_guard(_fibo2_dit.get(), prog);
 
@@ -6221,7 +6300,7 @@ GenerateImageStage::generate_fibo2_(
         fmt("fibo2-dit:{}", this->id())(),
         genai::MetalFibo2Transformer::forward_scratch_bytes(
             dcfg, lay.refiner_len(), n_rows, _fibo2_dit->quant_bits() > 0,
-            mc->supports_matrix_cores()));
+            mc->supports_matrix_cores(), cfg ? n_neg : -1));
   }
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -6233,41 +6312,67 @@ GenerateImageStage::generate_fibo2_(
         lb[i] = f32_to_bf16_(x[i]);
       }
     }
-    genai::MetalFibo2Transformer::Request req;
-    req.latents = &latbuf;
-    req.layout = &lay;
+    float tstep = 0.0f;
     {
 #pragma clang fp contract(off)
       // timesteps = sigmas * 1000; the pipeline hands t / 1000.
       const float tt = sig[(std::size_t)k] * 1000.0f;
-      req.timestep = tt / 1000.0f;
+      tstep = tt / 1000.0f;
     }
-    std::string e;
-    SharedBuffer v = _fibo2_dit->forward(req, &e);
-    prog.end_forward();
-    if (!ane_checked && _fibo2_dit->ane_attempted()) {
-      ane_checked = true;
-      if (auto* mgr = session()->services()->generative_model_manager()) {
-        mgr->revise_scratch(
-            "coreml:" + ane_claim_label_(),
-            _fibo2_dit->ane_armed()
-                ? genai::MetalFibo2Transformer::ane_runtime_bytes(
-                      dcfg, lay.joint_len())
-                : 0);
+    // One pass: the prompt's (slot 0) or the negative's (slot 1) velocity,
+    // read back as f32 (the reference's `.float()`); empty on a failure
+    // or a cooperative stop.
+    auto pass = [&](int slot, const genai::fibo2::Layout& l) {
+      genai::MetalFibo2Transformer::Request req;
+      req.latents = &latbuf;
+      req.layout = &l;
+      req.timestep = tstep;
+      req.text_slot = slot;
+      std::string e;
+      SharedBuffer v = _fibo2_dit->forward(req, &e);
+      prog.end_forward();
+      if (!ane_checked && _fibo2_dit->ane_attempted()) {
+        ane_checked = true;
+        if (auto* mgr = session()->services()->generative_model_manager()) {
+          mgr->revise_scratch(
+              "coreml:" + ane_claim_label_(),
+              _fibo2_dit->ane_armed()
+                  ? genai::MetalFibo2Transformer::ane_runtime_bytes(
+                        dcfg, std::max(lay.joint_len(),
+                                       cfg ? lay_neg.joint_len() : 0))
+                  : 0);
+        }
       }
-    }
-    if (v.empty()) {
-      // A cooperative stop comes back empty with NO reason.
-      if (!e.empty()) {
-        session()->warn(fmt("GenerateImageStage('{}'): Fibo 2.0 forward "
-                            "failed: {}", this->id(), e));
+      std::vector<float> out;
+      if (v.empty()) {
+        // A cooperative stop comes back empty with NO reason.
+        if (!e.empty()) {
+          session()->warn(fmt("GenerateImageStage('{}'): Fibo 2.0 forward "
+                              "failed: {}", this->id(), e));
+        }
+        return out;
       }
-      return {};
-    }
-    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
-    std::vector<float> vel(x.size());
-    for (std::size_t i = 0; i < vel.size(); ++i) {
-      vel[i] = bf16_to_f32_(vp[i]);
+      const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+      out.resize(x.size());
+      for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = bf16_to_f32_(vp[i]);
+      }
+      return out;
+    };
+    std::vector<float> vel = pass(0, lay);
+    if (vel.empty()) { return {}; }
+    if (cfg) {
+      const std::vector<float> vu = pass(1, lay_neg);
+      if (vu.empty()) { return {}; }
+      {
+#pragma clang fp contract(off)
+        // torch's f32 scalar: the Python float narrowed to the tensor's
+        // type, then sub, mul and add, each rounded.
+        const float gs = (float)g;
+        for (std::size_t i = 0; i < vel.size(); ++i) {
+          vel[i] = vu[i] + gs * (vel[i] - vu[i]);
+        }
+      }
     }
     tap.take(x, sig[(std::size_t)k], vel);
     {
@@ -6290,9 +6395,12 @@ GenerateImageStage::generate_fibo2_(
       std::chrono::steady_clock::now() - t0).count();
   session()->info(fmt(
       "GenerateImageStage('{}'): Fibo 2.0 latent generated in {:.2f}s ({} "
-      "steps, mu {:.3f}, {} text rows -> {} gist, {} image + {} context "
-      "rows)", this->id(), secs, S, mu, n_rows, lay.gist, img_seq,
-      lay.ctx_tokens));
+      "steps, mu {:.3f}, {}, {} text rows -> {} gist, {} image + {} context "
+      "rows)", this->id(), secs, S, mu,
+      cfg ? fmt("guidance {} against {} negative rows -> {} gist", g, n_neg,
+                lay_neg.gist)()
+          : std::string("no guidance"),
+      n_rows, lay.gist, img_seq, lay.ctx_tokens));
   return unpack(x);
 }
 
@@ -7882,6 +7990,11 @@ GenerateImageStage::process(RuntimeContext& ctx)
             ih, s));
       }
     }
+    // Fibo 2.0's text-to-image, as its reference defaults it: the
+    // trained area, 1024^2 (default_sample_size 128 x the VAE's 8).
+    if ((gen_h <= 0 || gen_w <= 0) && _family == "fibo2") {
+      gen_h = 1024; gen_w = 1024;
+    }
     if (gen_h <= 0 || gen_w <= 0) { gen_h = 256; gen_w = 256; }
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): output size {}x{} ({})", this->id(), gen_w,
@@ -8525,15 +8638,31 @@ GenerateImageStage::process(RuntimeContext& ctx)
     }
     const int rows = (int)ctb->shape[1];
     const int PD = _fibo2_dit->config().patch_dim();
+    // The negative (iport1), the same shape: rows on its second axis too.
+    int rows_neg = 0;
+    if (!cond_neg.empty()) {
+      const auto* ntb = dynamic_cast<const TensorBeatPayload*>(
+          _neg_beat.get());
+      if (ntb != nullptr && ntb->shape.size() == 3 &&
+          ntb->shape[0] == ctb->shape[0] && ntb->shape[2] == ctb->shape[2] &&
+          ntb->dtype == TensorBeat::DType::Bf16) {
+        rows_neg = (int)ntb->shape[1];
+      } else {
+        session()->warn(fmt(
+            "GenerateImageStage('{}'): the Fibo 2.0 negative is not the "
+            "conditioner's fibo2 conditioning; ignoring it", this->id()));
+      }
+    }
     std::vector<RefLatent> frefs;
     for (const RefLatent& r : _ref) { frefs.push_back(r); }
     _fibo2_dit->set_stream_stop(stopping);
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
     const int lh = gen_h / 16, lw = gen_w / 16;
-    const std::vector<float> fl =
-        generate_fibo2_(cond, rows, gen_h, gen_w, frefs, init_ptr,
-                        step_emitter({PD, lh, lw}));
+    const metal_compute::SharedBuffer no_neg;
+    const std::vector<float> fl = generate_fibo2_(
+        cond, rows, rows_neg > 0 ? cond_neg : no_neg, rows_neg, gen_h, gen_w,
+        frefs, init_ptr, step_emitter({PD, lh, lw}));
     _fibo2_dit->set_stream_stop({});
     if (fl.empty()) {
       session()->info(fmt(

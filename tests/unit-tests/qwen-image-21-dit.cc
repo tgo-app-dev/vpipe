@@ -2409,6 +2409,181 @@ TEST(qwen_image_21_dit, mma_matches_reference_at_real_widths)
   EXPECT_TRUE(rel < 0.05);
 }
 
+// THE DENSE PATH AGAINST THE REFERENCE, ON REAL WEIGHTS. A released
+// transformer's trunk and first blocks, cut out by
+//   dump_qwen_image21_golden.py --what dit --dit-from <transformer>
+//       --dit-layers 8 --dit-grid 48 --dit-tag real8
+// with the reference run in fp32 AND in bf16 (`ref_bf16`, the bar a bf16
+// forward is held to). VPIPE_QWEN_IMAGE21_REAL_GOLDEN names the dir
+// (VPIPE_QWEN_IMAGE21_REAL_TAG the tag, real8 by default). A 48x48
+// target puts 2304 image rows in the joint, so every block projection
+// clears matmul2d's floor AND the int8 one -- the rows the two paths
+// differ on. Random weights cannot show a checkpoint's own magnitudes
+// and outlier channels; these can.
+//
+// Every arm runs the same bytes: dense (matmul2d + NAX on matrix cores,
+// steel elsewhere), then each i8_gemm tier where there are matrix cores.
+// Dense is held to the reference's own bf16 distance; an int8 arm is
+// asserted ENGAGED (not bit-identical to dense) and reported, since it
+// is a lossy tier by design.
+TEST(qwen_image_21_dit, real_weights_dense_and_int8_against_reference)
+{
+  const char* g = std::getenv("VPIPE_QWEN_IMAGE21_REAL_GOLDEN");
+  if (g == nullptr || *g == '\0') { return; }
+  const char* te = std::getenv("VPIPE_QWEN_IMAGE21_REAL_TAG");
+  const std::string tag = (te != nullptr && *te != '\0') ? te : "real8";
+  const std::filesystem::path gd(g);
+  std::ifstream mf(gd / (tag + ".json"));
+  if (!mf) { return; }
+  FlexData man;
+  try {
+    man = FlexData::from_json(mf);
+  } catch (...) {
+    return;
+  }
+  if (!man.is_object()) { return; }
+  auto o = man.as_object();
+  auto arr = [&](const char* k) {
+    std::vector<int> v;
+    if (!o.contains(k)) { return v; }
+    const FlexData f = o.at(k);
+    if (!f.is_array()) { return v; }
+    auto a = f.as_array();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      v.push_back((int)a.at(i).as_int(0));
+    }
+    return v;
+  };
+  const double bar = o.contains("ref_bf16") ? o.at("ref_bf16").as_real(0.0)
+                                            : 0.0;
+  Q21D_REQUIRE(bar > 0.0);
+  auto read_f32 = [&](const std::string& nm) {
+    std::ifstream in(gd / (nm + ".f32"), std::ios::binary);
+    std::vector<float> v;
+    if (!in) { return v; }
+    in.seekg(0, std::ios::end);
+    const std::streamoff nn = in.tellg();
+    in.seekg(0, std::ios::beg);
+    v.resize((std::size_t)nn / 4);
+    in.read(reinterpret_cast<char*>(v.data()), nn);
+    return v;
+  };
+  const std::vector<float> lat_f = read_f32(tag + "_latents");
+  const std::vector<float> txt_f = read_f32(tag + "_txt");
+  const std::vector<float> want = read_f32(tag + "_out");
+  const std::vector<float> want16 = read_f32(tag + "_out_bf16");
+  Q21D_REQUIRE(!lat_f.empty() && !txt_f.empty() && !want.empty() &&
+               want16.size() == want.size());
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::vector<int> slot_i = arr("slot");
+  const std::vector<int> shapes = arr("img_shapes");
+  Q21D_REQUIRE(!slot_i.empty() && shapes.size() % 3 == 0);
+  std::vector<std::uint8_t> slot(slot_i.begin(), slot_i.end());
+  std::vector<qi21::ImgBlock> blocks;
+  for (std::size_t i = 0; i + 2 < shapes.size(); i += 3) {
+    blocks.push_back(qi21::ImgBlock{shapes[i], shapes[i + 1], shapes[i + 2]});
+  }
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  Q21D_REQUIRE(lay.joint_len >= 1024);   // both floors cleared
+  auto up = [&](const std::vector<float>& v) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(v.size() * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      std::uint32_t u;
+      std::memcpy(&u, &v[i], 4);
+      const std::uint32_t r = (u >> 16) & 1u;
+      d[i] = (std::uint16_t)((u + 0x7fffu + r) >> 16);
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat = up(lat_f);
+  metal_compute::SharedBuffer txt = up(txt_f);
+  Q21D_REQUIRE(!lat.empty() && !txt.empty());
+  auto rel_to = [&](const std::vector<float>& a,
+                    const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < b.size(); ++i) {
+      const double e = (double)a[i] - (double)b[i];
+      num += e * e;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+  const std::string ckpt = (gd / tag).string();
+  // tier < 0: dense.
+  auto run = [&](int tier, std::string* what) {
+    std::vector<float> got;
+    MetalQwenImage21Transformer::Config cfg;
+    if (!MetalQwenImage21Transformer::Config::read_dims(ckpt, &cfg)) {
+      return got;
+    }
+    cfg.i8_gemm = tier >= 0;
+    cfg.i8_tier = tier < 0 ? 0 : tier;
+    auto m = MetalQwenImage21Transformer::load(ckpt, mc, cfg, false);
+    if (m == nullptr) { return got; }
+    if (tier >= 0 && !m->uses_i8_gemm()) { return got; }
+    *what = fmt("{}{}{}", m->uses_mma2() ? "matmul2d" : "steel",
+                m->uses_attn_nax() ? " + NAX attention" : "",
+                tier < 0 ? "" : " + i8")();
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = (float)(o.contains("timestep")
+                               ? o.at("timestep").as_real(0.75) : 0.75);
+    std::string ferr;
+    metal_compute::SharedBuffer out = m->forward(req, &ferr);
+    if (out.empty() || out.byte_size() < want.size() * 2) {
+      std::printf("[qwen_image_21_dit] forward failed: %s\n", ferr.c_str());
+      return got;
+    }
+    got.resize(want.size());
+    const auto* d = static_cast<const std::uint16_t*>(out.contents());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      const std::uint32_t u = (std::uint32_t)d[i] << 16;
+      std::memcpy(&got[i], &u, 4);
+    }
+    return got;
+  };
+  std::string what;
+  const std::vector<float> dense = run(-1, &what);
+  Q21D_REQUIRE(!dense.empty());
+  const double rd = rel_to(dense, want);
+  std::printf("[qwen_image_21_dit] real weights, %d blocks, joint %d: the "
+              "reference's own bf16 %.5f from its fp32\n",
+              (int)o.at("layers").as_int(0), lay.joint_len, bar);
+  std::printf("[qwen_image_21_dit]   dense (%s): %.5f from fp32, %.5f from "
+              "the reference's bf16\n", what.c_str(), rd,
+              rel_to(dense, want16));
+  // A bf16 forward at the reference's own bf16 distance, give or take
+  // the summation order of a different machine.
+  EXPECT_TRUE(rd <= 1.25 * bar);
+  if (!mc->supports_matrix_cores()) { return; }
+  const char* tiers[] = {"accurate", "fast", "token", "token_plain"};
+  for (int t = 0; t < 4; ++t) {
+    std::string w8;
+    const std::vector<float> got = run(t, &w8);
+    if (got.empty()) {
+      std::printf("[qwen_image_21_dit]   i8 %s: unavailable\n", tiers[t]);
+      continue;
+    }
+    const bool same = std::memcmp(got.data(), dense.data(),
+                                  got.size() * sizeof(float)) == 0;
+    const double r = rel_to(got, want);
+    std::printf("[qwen_image_21_dit]   i8 %-11s (%s): %.5f from fp32 "
+                "(%.2fx dense), %.5f from dense%s\n", tiers[t], w8.c_str(),
+                r, rd > 0.0 ? r / rd : 0.0, rel_to(got, dense),
+                same ? " -- IDENTICAL TO DENSE: NOT ENGAGED" : "");
+    EXPECT_TRUE(!same);
+  }
+}
+
 // A BOX WITHOUT MATRIX CORES MUST NOT LAND ON A SCALAR KERNEL.
 //
 // M5 and later take matmul2d for the GEMMs and the NAX flash kernel for

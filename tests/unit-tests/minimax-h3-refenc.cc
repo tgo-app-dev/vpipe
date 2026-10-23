@@ -519,6 +519,60 @@ TEST(minimax_h3_refenc, fit_reports_each_reduction_separately)
               "edge\n", i.canvas_w, i.canvas_h);
 }
 
+// A reference kept WHOLE is not cut to the generated length: its frames
+// all go on (here a clip of 90 at 24 fps against 39 generated), where
+// the same clip otherwise keeps the generated 39.
+TEST(minimax_h3_refenc, a_reference_kept_whole_is_not_truncated)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;
+  std::vector<h3::MediaReference> refs;
+  for (bool whole : {false, true}) {
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 90;
+    m.height     = 64;
+    m.width      = 64;
+    m.fps        = 24.0;
+    m.whole      = whole;
+    m.rgb.assign((std::size_t)90 * 3 * 64 * 64, 5);
+    refs.push_back(std::move(m));
+  }
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  h3::EncodedReferences enc;
+  std::string err;
+  ASSERT_TRUE(h3::encode_references(refs, "p", plan, models, &enc, &err));
+  ASSERT_TRUE(enc.fits.size() == 2);
+  std::printf("[minimax_h3_refenc] cut %d -> %d frames, whole %d -> %d\n",
+              enc.fits[0].rate_frames, enc.fits[0].used_frames,
+              enc.fits[1].rate_frames, enc.fits[1].used_frames);
+  EXPECT_TRUE(enc.fits[0].used_frames == 39);
+  EXPECT_TRUE(enc.fits[1].used_frames == 90);
+
+  // A soundtrack's cut, at its source rate, by the rule encode_references
+  // asks (audio_reference_seconds): 362 frames at 24 fps keep
+  // int(362 / 24 * 32000) samples; kept whole, every one, whatever the
+  // rounding.
+  const int n = 482667, sr = 32000;
+  for (bool whole : {false, true}) {
+    h3::MediaReference a;
+    a.kind        = h3::MediaReference::Kind::kAudio;
+    a.channels    = 2;
+    a.sample_rate = sr;
+    a.whole       = whole;
+    a.pcm.assign((std::size_t)2 * n, 0.25f);
+    std::vector<float> out;
+    int kept = 0;
+    ASSERT_TRUE(h3::normalize_audio_reference(
+        a.pcm.data(), 2, n, sr, h3::audio_reference_seconds(a, 362.0 / 24.0),
+        &out, &kept));
+    std::printf("[minimax_h3_refenc] a %d-sample soundtrack, %s: %d kept\n",
+                n, whole ? "kept whole" : "cut", kept);
+    EXPECT_TRUE(kept == (whole ? n : 482666));
+  }
+}
+
 TEST(minimax_h3_refenc, request_limits)
 {
   h3::ReferenceLimits lim;

@@ -401,6 +401,11 @@ private:
   // reads it is not known until the checkpoint resolves, and the two
   // beats arrive on different ports in either order.
   FlexData _model_cfg;
+  // The model-config beat as a CONSTANT (apply_constant), for
+  // declare_resources alone -- the runtime latch above stays the one
+  // every generation reads. Cleared by reset_run_state, which runs after
+  // the plan, so a relaunch without the source plans without it.
+  FlexData _plan_model_cfg;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The resident family's own parameters, as ITS model layer defines
@@ -716,16 +721,26 @@ private:
   // the dynamic shift's base / max sequence and shift), read at load.
   double _fibo2_base_shift = 0.5, _fibo2_max_shift = 1.15;
   int _fibo2_base_seq = 256, _fibo2_max_seq = 4096;
-  // The distilled edit model's 4 steps; a graph's own count wins.
+  // The step counts when the graph names none: the distilled Edit
+  // Turbo's 4, and a guided run's (Fibo 2.0 Dev) 30 -- the reference
+  // pipeline's default. A graph's own count wins.
   int _fibo2_steps = 4;
+  int _fibo2_guided_steps = 30;
+  // fibo2-model-config's `guidance_scale`; < 0 is "no opinion" (then the
+  // stage's own guidance_scale, 1 by default: Edit Turbo's). The two
+  // checkpoints cannot be told apart by their files, so guidance is the
+  // graph's decision, as on Z-Image.
+  double _fibo2_guidance_cfg = -1.0;
   bool load_fibo2_dit_();
   void free_fibo2_dit_for_decode_(int gen_w, int gen_h);
   // Text bundles [6, n_rows, cap] (+ the pictures to edit, as latents)
   // -> [128, H/16, W/16], FLUX.2's VAE's latent: the reference pipeline's
   // loop (linspace sigmas dynamically shifted in f32, torch noise, f32
-  // Euler, no guidance).
+  // Euler), guided against `neg` (its bundles, n_neg rows) when the
+  // guidance is above 1.
   std::vector<float> generate_fibo2_(
-      const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+      const metal_compute::SharedBuffer& text, int n_rows,
+      const metal_compute::SharedBuffer& neg, int n_neg, int gen_h,
       int gen_w, const std::vector<RefLatent>& refs,
       const std::vector<float>* init_packed,
       const std::function<void(const std::vector<float>&)>& emit_step) const;

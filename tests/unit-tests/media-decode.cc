@@ -382,6 +382,11 @@ TEST(media_decode, video_file_frames_rate_and_bound) {
   ASSERT_TRUE(cut.has_value());
   EXPECT_TRUE(cut->num_frames <= 5);
   EXPECT_TRUE(cut->num_frames >= 3);
+  // Which of the two stopped at a cap rather than at the stream's end --
+  // what tells a caller its soundtrack (decoded whole) may run past the
+  // last frame.
+  EXPECT_FALSE(v->cut_short);
+  EXPECT_TRUE(cut->cut_short);
   std::printf("[media_decode] y4m: %d frames at %.2f fps %dx%d; a 0.125 s "
               "bound reads %d\n", v->num_frames, v->fps, v->width, v->height,
               cut->num_frames);

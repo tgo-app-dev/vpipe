@@ -24,6 +24,7 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/session.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/moe-expert-cache.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/chat-template.h"
@@ -38,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -479,6 +481,174 @@ TEST(qwen4_exp_kernels, batched_w8_gemv_rows_are_qmv_rows)
                   "outputs differ between qmv rows and the batched one\n",
                   bf16 ? "bf16" : "f16", K, N, diff, M * N);
       EXPECT_TRUE(diff == 0);
+    }
+  }
+}
+
+// The sparse rows' attention, every kernel a row can take: the per-head
+// one (a decode's rows), the key-split one, and a prefill's group kernels
+// (simdgroup MMA; the matrix units' on an M5) -- over each row's selected
+// tokens gathered from a paged pool whose pages are out of order, at f16
+// and bf16, against f64 on the same rounded inputs; the per-head kernel
+// keeps P in f32, so its distance is the output's rounding and the others
+// are held to it. The values carry a common offset, as attention's do, so
+// a row's scale error shows -- though not finely: the group kernels round
+// P to the element type and divide by the sum of THOSE weights, and
+// dividing by the f32 sum instead reads only ~1% further here (M4 Pro,
+// M5). G = 12 is Flash-Next's (two 8-row bands overlapping), G = 8 one
+// band. MEASURED (both boxes): bf16 1.222e-3 per-head, 1.239e-3 group.
+TEST(qwen4_exp_kernels, qsa_attention_matches_f64)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using metal_compute::ComputeEncoder;
+  using metal_compute::SharedBuffer;
+  std::uint32_t rng = 11u;
+  auto next = [&]() {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  auto unif = [&]() { return (next() >> 8) * (1.0 / 16777216.0); };
+  constexpr int D = 256, Hkv = 2, PT = 256, NP = 12, T = PT * NP;
+  constexpr int W = 2112;                   // a row's selection width
+  const std::vector<int> nsel = {2051, 1203, 37, 1, 2112};
+  const int n = (int)nsel.size(), r0 = 0;
+  const float scale = 1.0f / 16.0f;
+  const bool nax = mc->supports_matrix_cores();
+  for (const bool bf16 : {false, true}) {
+    const std::string sfx = bf16 ? "_bf16" : "";
+    auto lhc = mc->load_library("qwen4_hc" + sfx);
+    auto lmm = mc->load_library("sdpa_mma" + sfx);
+    struct Arm { const char* name; metal_compute::ComputeFunction fn; };
+    std::vector<Arm> arms;
+    arms.push_back({"per-head", lhc.function("qsa_attn_f16")});
+    arms.push_back({"key-split", lhc.function("qsa_attn_split_f16")});
+    arms.push_back({"group mma", lhc.function("qsa_attn_mma_f16")});
+    if (nax) {
+      arms.push_back({"group nax", lmm.function("qsa_attn_nax_f16")});
+    }
+    for (const auto& a : arms) { ASSERT_TRUE(a.fn.valid()); }
+    auto el = [&](double d) {
+      return bf16 ? to_bf16_((float)d) : to_f16_(d);
+    };
+    auto de = [&](std::uint16_t u) {
+      return bf16 ? from_bf16_(u) : from_f16_(u);
+    };
+    for (const int G : {12, 8}) {
+      const int Hq = G * Hkv;
+      std::vector<std::uint16_t> q((std::size_t)Hq * n * D),
+          k((std::size_t)NP * Hkv * PT * D), v(k.size());
+      for (auto& x : q) { x = el(6.0 * (2.0 * unif() - 1.0)); }
+      for (auto& x : k) { x = el(2.0 * unif() - 1.0); }
+      for (auto& x : v) { x = el(0.4 + (2.0 * unif() - 1.0)); }
+      // Logical page i lives in physical page 5i mod 12.
+      std::vector<int> pt((std::size_t)NP * 3);
+      for (int i = 0; i < NP; ++i) {
+        pt[(std::size_t)i * 3 + 0] = (5 * i) % NP;
+        pt[(std::size_t)i * 3 + 1] = PT;
+        pt[(std::size_t)i * 3 + 2] = i * PT;
+      }
+      std::vector<int> sel((std::size_t)n * W, 0);
+      std::vector<int> perm(T);
+      for (int r = 0; r < n; ++r) {
+        for (int t = 0; t < T; ++t) { perm[(std::size_t)t] = t; }
+        for (int t = T - 1; t > 0; --t) {
+          std::swap(perm[(std::size_t)t],
+                    perm[(std::size_t)(next() % (std::uint32_t)(t + 1))]);
+        }
+        for (int j = 0; j < nsel[(std::size_t)r]; ++j) {
+          sel[(std::size_t)r * W + j] = perm[(std::size_t)j];
+        }
+      }
+      auto at = [&](int pos, int kvh) {
+        const int lp = pos / PT, slot = pos % PT;
+        const int pg = pt[(std::size_t)lp * 3];
+        return (((std::size_t)pg * Hkv + kvh) * PT + slot) * D;
+      };
+      // f64 on the rounded inputs.
+      std::vector<double> ref((std::size_t)Hq * n * D, 0.0);
+      for (int h = 0; h < Hq; ++h) {
+        for (int r = 0; r < n; ++r) {
+          const int m = nsel[(std::size_t)r], kvh = h / G;
+          const std::uint16_t* qr = &q[((std::size_t)h * n + r) * D];
+          std::vector<double> sc((std::size_t)m);
+          double mx = -1e300;
+          for (int j = 0; j < m; ++j) {
+            const std::size_t o = at(sel[(std::size_t)r * W + j], kvh);
+            double dot = 0.0;
+            for (int i = 0; i < D; ++i) {
+              dot += de(qr[i]) * de(k[o + (std::size_t)i]);
+            }
+            sc[(std::size_t)j] = dot * (double)scale;
+            mx = std::max(mx, sc[(std::size_t)j]);
+          }
+          double sum = 0.0;
+          for (auto& x : sc) { x = std::exp(x - mx); sum += x; }
+          double* orow = &ref[((std::size_t)h * n + r) * D];
+          for (int j = 0; j < m; ++j) {
+            const std::size_t o = at(sel[(std::size_t)r * W + j], kvh);
+            for (int i = 0; i < D; ++i) {
+              orow[i] += sc[(std::size_t)j] / sum * de(v[o + (std::size_t)i]);
+            }
+          }
+        }
+      }
+      auto up = [&](const void* p, std::size_t bytes) {
+        SharedBuffer b = mc->make_shared_buffer(bytes);
+        std::memcpy(b.contents(), p, bytes);
+        return b;
+      };
+      SharedBuffer bq = up(q.data(), q.size() * 2);
+      SharedBuffer bk = up(k.data(), k.size() * 2);
+      SharedBuffer bv = up(v.data(), v.size() * 2);
+      SharedBuffer bpt = up(pt.data(), pt.size() * 4);
+      SharedBuffer bsel = up(sel.data(), sel.size() * 4);
+      SharedBuffer bns = up(nsel.data(), nsel.size() * 4);
+      double err_head = 0.0;
+      for (const auto& a : arms) {
+        SharedBuffer bo = mc->make_shared_buffer(q.size() * 2);
+        std::memset(bo.contents(), 0xFF, q.size() * 2);   // NaN if unwritten
+        auto st = mc->make_command_stream();
+        {
+          ComputeEncoder enc = st.begin_compute();
+          enc.set_function(a.fn);
+          enc.set_buffer(0, bq); enc.set_buffer(1, bk);
+          enc.set_buffer(2, bv); enc.set_buffer(3, bo);
+          enc.set_buffer(4, bpt); enc.set_buffer(5, bsel);
+          enc.set_buffer(6, bns);
+          enc.set_constant(7, scale); enc.set_constant(8, D);
+          enc.set_constant(9, Hq); enc.set_constant(10, Hkv);
+          enc.set_constant(11, n); enc.set_constant(12, PT);
+          enc.set_constant(13, NP); enc.set_constant(14, W);
+          enc.set_constant(15, r0);
+          const std::string nm = a.name;
+          if (nm == "group mma" || nm == "group nax") {
+            enc.dispatch({256, (unsigned)Hkv, (unsigned)n}, {256, 1, 1});
+          } else if (nm == "key-split") {
+            enc.dispatch({32, 16u * (unsigned)Hq, (unsigned)n}, {32, 16, 1});
+          } else {
+            enc.dispatch({32, (unsigned)Hq, (unsigned)n}, {32, 1, 1});
+          }
+        }
+        ASSERT_TRUE(st.commit().wait_ok());
+        const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+          const double d = de(o[i]) - ref[i];
+          num += d * d;
+          den += ref[i] * ref[i];
+        }
+        const double e = std::sqrt(num / den);
+        if (std::string(a.name) == "per-head") { err_head = e; }
+        std::printf("[qwen4_exp_kernels] QSA attention %s G %d %s: rel-L2 "
+                    "%.3e from f64\n", bf16 ? "bf16" : "f16", G, a.name, e);
+        // The per-head kernel keeps P in f32: its error is the output's
+        // rounding. The others within 1.5x of it.
+        EXPECT_TRUE(std::isfinite(e));
+        EXPECT_TRUE(e < (bf16 ? 2.5e-3 : 4e-4));
+        EXPECT_TRUE(err_head > 0.0 && e < 1.5 * err_head);
+      }
     }
   }
 }
@@ -940,7 +1110,11 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
   ASSERT_TRUE(tpl != nullptr);
   if (tpl == nullptr) { return; }
   std::vector<std::int32_t> prompt;
+  // VPIPE_QWEN4_EXP_DFLASH_PROMPT: another prompt (a story runs longer
+  // than the arithmetic before its first near-tie).
+  const char* dpr = std::getenv("VPIPE_QWEN4_EXP_DFLASH_PROMPT");
   tpl->render_user_turn(
+      dpr != nullptr ? dpr :
       "Natalia sold clips to 48 of her friends in April, and then she sold "
       "half as many clips in May. How many clips did Natalia sell "
       "altogether in April and May? Explain your reasoning step by step.",
@@ -967,6 +1141,34 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
     return;
   }
   const int trained = d->config().block_size;
+  // The plain decode with no drafter attached: attaching one must change
+  // nothing of it (its prefill taps the drafter's layers -- dispatches of
+  // its own, which once moved an encoder split onto an op whose bindings
+  // did not survive it, and the plain decode departed 110 tokens in).
+  std::vector<std::int32_t> pre_plain;
+  {
+    auto am = [](const std::vector<float>& v) {
+      std::size_t a = 0;
+      for (std::size_t i = 1; i < v.size(); ++i) {
+        if (v[i] > v[a]) { a = i; }
+      }
+      return (std::int32_t)a;
+    };
+    const auto cx = m->context_manager()->acquire_root();
+    const std::int32_t first = am(m->prefill(cx, prompt));
+    pre_plain.push_back(first);
+    vpipe::genai::GpuSamplerParams g0;
+    if (m->pdecode_begin(cx, first, prompt, g0, N)) {
+      for (int i = 1; i < N; ++i) {
+        if (!m->pdecode_commit(cx)) { break; }
+        const std::int32_t t = m->pdecode_next(cx);
+        if (t < 0) { break; }
+        pre_plain.push_back(t);
+      }
+      m->pdecode_end(cx);
+    }
+    m->context_manager()->release(cx);
+  }
   ASSERT_TRUE(m->attach_dflash(std::move(d), &err));
   if (!m->has_dflash()) {
     std::printf("[qwen4_exp] attach: %s\n", err.c_str());
@@ -1022,6 +1224,16 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
   double cold_ms = 0.0, warm_ms = 0.0;
   const std::vector<std::int32_t> plain = run_plain(gs, N, &cold_ms);
   ASSERT_TRUE((int)plain.size() == N);
+  {
+    int same = 0;
+    while (same < (int)std::min(plain.size(), pre_plain.size()) &&
+           plain[(std::size_t)same] == pre_plain[(std::size_t)same]) {
+      ++same;
+    }
+    std::printf("[qwen4_exp] the plain decode with no drafter attached: "
+                "the first %d of %zu the same\n", same, plain.size());
+    EXPECT_TRUE(pre_plain == plain);
+  }
   std::printf("[qwen4_exp] DFlash 2: a %zu-token prompt, %d tokens: %s\n",
               prompt.size(), N, tok->decode(plain).c_str());
   struct Arm {
@@ -1135,6 +1347,141 @@ TEST(qwen4_exp, verify_rows_are_decode_rows)
     m->context_manager()->release(ca);
     m->context_manager()->release(cb);
   }
+}
+
+// A SPECULATIVE DECODE LEAVES THE PLAIN DECODE'S STATE. A round that keeps
+// fewer rows than it verified replays the kept ones into the GDN / PLE
+// state, and that state has to be the one a decode step a token leaves --
+// to the bit, or the tokens part at the first near-tie however long they
+// agreed. A token run sees a wrong state only at such a tie; this reads
+// the state itself: after the draft head's decode (and DFlash 2's, with
+// VPIPE_QWEN4_EXP_DFLASH), the next token's logits on that context against
+// a context that took the same tokens a decode step each. Rounds that
+// rejected a draft are required, or no replay ran (128 tokens: ~10
+// replays an arm). MUTATION: the replay's q / k norm eps x4 moves 237,966
+// of 248,320 logits.
+TEST(qwen4_exp, speculative_decodes_leave_the_plain_state)
+{
+  const char* mp = std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH");
+  if (mp == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using vpipe::genai::MetalQwenModel;
+  vpipe::genai::ModelLoader loader(&sess);
+  const auto mcfg = loader.load_config(mp);
+  ASSERT_TRUE(mcfg.has_value());
+  if (!mcfg.has_value()) { return; }
+  MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+  c.use_bf16 = std::getenv("VPIPE_QWEN4_EXP_F16") == nullptr;
+  c.page_tokens = 256;
+  c.max_pages = 64;
+  c.max_seq = 8192;
+  std::size_t cache_mb = 36864;
+  if (const char* e = std::getenv("VPIPE_QWEN4_EXP_CACHE_MB")) {
+    cache_mb = (std::size_t)std::atoll(e);
+  }
+  c.expert_cache_bytes = cache_mb << 20;
+  auto tok = vpipe::genai::Tokenizer::from_huggingface_json(
+      std::string(mp) + "/tokenizer.json", &sess);
+  ASSERT_TRUE(tok != nullptr);
+  if (tok == nullptr) { return; }
+  auto tpl = vpipe::genai::make_chat_template(*mcfg, *tok,
+                                              /*disable_thinking=*/true);
+  ASSERT_TRUE(tpl != nullptr);
+  if (tpl == nullptr) { return; }
+  std::vector<std::int32_t> prompt;
+  tpl->render_user_turn(
+      "Natalia sold clips to 48 of her friends in April, and then she sold "
+      "half as many clips in May. How many clips did Natalia sell "
+      "altogether in April and May? Explain your reasoning step by step.",
+      /*is_first_turn=*/true, &prompt);
+  auto m = MetalQwenModel::load(mp, mc, c);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  auto argmax = [](const std::vector<float>& v) {
+    std::size_t a = 0;
+    for (std::size_t i = 1; i < v.size(); ++i) {
+      if (v[i] > v[a]) { a = i; }
+    }
+    return (std::int32_t)a;
+  };
+  constexpr int N = 128;
+  // `spec` decodes N tokens on a prefilled context from its first token,
+  // reporting the drafts it offered and the ones it kept.
+  auto check = [&](const char* name,
+                   const std::function<bool(vpipe::genai::ContextId,
+                                            std::int32_t,
+                                            std::vector<std::int32_t>&,
+                                            long*, long*)>& spec) {
+    auto* cm = m->context_manager();
+    const auto cb = cm->acquire_root();
+    const std::int32_t first = argmax(m->prefill(cb, prompt));
+    std::vector<std::int32_t> out;
+    long drafted = 0, kept = 0;
+    const bool ok = spec(cb, first, out, &drafted, &kept);
+    // What the context took in: the prompt and the first `took` of `out`
+    // (out_ids starts with the first token). A decode that ends on a pick
+    // has ingested every token it returned; then the next is whatever the
+    // plain run picks after them.
+    const int took = cm->seq_len_of(cb) - (int)prompt.size();
+    ASSERT_TRUE(ok && !out.empty() && out[0] == first && took > 0 &&
+                took <= (int)out.size());
+    if (!ok || out.empty() || took <= 0 || took > (int)out.size()) {
+      cm->release(cb);
+      return;
+    }
+    const auto ca = cm->acquire_root();
+    std::vector<float> lp = m->prefill(ca, prompt);
+    for (int i = 0; i < took; ++i) {
+      lp = m->forward(ca, out[(std::size_t)i]);
+    }
+    const std::int32_t nxt =
+        took < (int)out.size() ? out[(std::size_t)took] : argmax(lp);
+    const std::vector<float> la = m->forward(ca, nxt);
+    const std::vector<float> lb = m->forward(cb, nxt);
+    std::size_t diff = 0;
+    for (std::size_t i = 0; i < la.size() && i < lb.size(); ++i) {
+      diff += la[i] != lb[i];
+    }
+    std::printf("[qwen4_exp] %s: %zu tokens, %ld of %ld drafts kept; the "
+                "next token's logits after it against %d decode steps: %zu "
+                "of %zu differ\n", name, out.size(), kept, drafted, took,
+                diff, la.size());
+    EXPECT_TRUE(drafted > kept);           // a rejected draft: a replay ran
+    EXPECT_TRUE(!la.empty() && la.size() == lb.size() && diff == 0);
+    cm->release(ca);
+    cm->release(cb);
+  };
+  check("draft head", [&](vpipe::genai::ContextId cx, std::int32_t first,
+                          std::vector<std::int32_t>& out, long* drafted,
+                          long* kept) {
+    vpipe::genai::MtpDecodeCtl ctl;
+    ctl.drafted = drafted;
+    long rounds = 0;
+    return m->mtp_decode(cx, first, N, out, 1, kept, &rounds, ctl);
+  });
+  const char* dp = std::getenv("VPIPE_QWEN4_EXP_DFLASH");
+  if (dp == nullptr) { return; }
+  vpipe::genai::MetalDFlashDrafter::Options opt;
+  opt.target_bf16 = c.use_bf16;
+  std::string err;
+  auto d = vpipe::genai::MetalDFlashDrafter::load(
+      vpipe::genai::WeightSet::open(dp, &sess), mc, opt, &err);
+  ASSERT_TRUE(d != nullptr);
+  if (d == nullptr) { return; }
+  ASSERT_TRUE(m->attach_dflash(std::move(d), &err));
+  if (!m->has_dflash()) { return; }
+  check("DFlash 2, block 4", [&](vpipe::genai::ContextId cx,
+                                 std::int32_t first,
+                                 std::vector<std::int32_t>& out,
+                                 long* drafted, long* kept) {
+    MetalQwenModel::SpecStats st;
+    const bool ok = m->dflash_decode(cx, first, N, out, {}, 4, &st);
+    *drafted = st.drafted;
+    *kept = st.accepted;
+    return ok;
+  });
 }
 
 // PAST THE QSA THRESHOLD: a ~2400-token prompt (VPIPE_QWEN4_EXP_LONG_GOLDEN,
@@ -1523,4 +1870,310 @@ TEST(qwen4_exp, image_turn_matches_reference)
       EXPECT_TRUE(off16 < 0 || off <= 2 * off16);
     }
   }
+}
+
+// THE PLAN BOOKS WHAT THE LOAD HOLDS: the routed-expert cache is sized,
+// and the LM's claim floored, at the checkpoint's bytes on disk less its
+// experts and n-gram table plus what re-encoding the non-expert
+// projections to w8 grows them by (held_growth_bytes). That figure against
+// the device memory a load allocates beside its expert cache -- the vision
+// tower, which the model does not hold but its stage does, set aside.
+TEST(qwen4_exp, the_plan_books_what_the_load_holds)
+{
+  const char* mp = std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH");
+  if (mp == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using vpipe::genai::MetalQwenModel;
+  vpipe::genai::ModelLoader loader(&sess);
+  const auto mcfg = loader.load_config(mp);
+  ASSERT_TRUE(mcfg.has_value());
+  if (!mcfg.has_value()) { return; }
+  MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+  c.use_bf16 = true;
+  c.page_tokens = 256;
+  c.max_pages = 16;
+  c.max_seq = 4096;
+  c.expert_cache_bytes = (std::size_t)2 << 30;
+  auto w = vpipe::genai::MetalLlamaWeights::open_model(mp);
+  ASSERT_TRUE(w.has_value());
+  if (!w.has_value()) { return; }
+  std::size_t disk = 0, vision = 0;
+  for (const std::string& nm : w->tensor_names()) {
+    const auto* ti = w->info(nm);
+    if (ti == nullptr) { continue; }
+    disk += (std::size_t)ti->nbytes;
+    if (nm.rfind("vision", 0) == 0 ||
+        nm.find(".visual.") != std::string::npos) {
+      vision += (std::size_t)ti->nbytes;
+    }
+  }
+  const std::size_t ex = MetalQwenModel::routed_expert_bytes(*w, c);
+  const std::size_t un = MetalQwenModel::unheld_bytes(*w, c);
+  const std::size_t gr = MetalQwenModel::held_growth_bytes(*w, c);
+  const std::size_t plan = disk - ex - un - vision + gr;
+  const std::size_t a0 = mc->memory_budget_settled().allocated;
+  auto m = MetalQwenModel::load(mp, mc, c);
+  ASSERT_TRUE(m != nullptr && m->expert_cache() != nullptr);
+  if (m == nullptr || m->expert_cache() == nullptr) { return; }
+  const std::size_t a1 = mc->memory_budget_settled().allocated;
+  const std::size_t held = a1 - a0 - m->expert_cache()->bytes();
+  std::printf("[qwen4_exp] %s: the plan books %.0f MB beside the experts "
+              "(disk %.0f less experts %.0f, n-gram table %.0f, vision "
+              "%.0f; re-encoded +%.0f); the load holds %.0f MB beside its "
+              "%.0f MB cache\n", m->hc_layout().c_str(), plan / 1e6,
+              disk / 1e6, ex / 1e6, un / 1e6, vision / 1e6, gr / 1e6,
+              held / 1e6, m->expert_cache()->bytes() / 1e6);
+  EXPECT_TRUE((double)held < 1.10 * (double)plan &&
+              (double)held > 0.85 * (double)plan);
+}
+
+// THE PACKS Qwen3.8-Flash-Next is published in, each a small synthetic
+// checkpoint in that pack's layout -- tools/make_qwen4_exp_synthetic.py
+// --recipe R --out <dir>/R, then tools/dump_qwen4_exp_golden.py --model
+// <dir>/R --out <dir>/R/golden --ids-file <dir>/R/ids.i32 --mtp -- under
+// VPIPE_QWEN4_EXP_FLAVORS = <dir> (no published pack fits a box's disk
+// beside another; the synthetic one is transformers' own modules at a size
+// that still takes every path: hidden 2560 for the fused hyper-connection
+// kernels, QSA past 67 tokens, the n-gram PLE, the MTP head). For each
+// recipe present: the layout the load reports, a prefill's logits and the
+// MTP head's against the fp32 reference (its bf16 run the bar), the decode
+// path over the last rows, the draft head's greedy decode against the
+// plain decode (token-exact, and its state the plain decode's to the bit),
+// and the routed-expert cache against resident (bit-identical).
+TEST(qwen4_exp_flavors, packs_match_reference)
+{
+  const char* fp = std::getenv("VPIPE_QWEN4_EXP_FLAVORS");
+  if (fp == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using vpipe::genai::MetalQwenModel;
+  struct Want {
+    const char* recipe;
+    int group;
+    const char* layout;    // what the load must report
+  };
+  const Want wants[] = {
+      {"4bit-mtp", 32,
+       "projections w8g32; router w8g32, experts w4g32, shared expert w8g32 "
+       "(fused decode); MTP head: fc dense, attention dense, router dense, "
+       "experts w4g32, shared expert dense"},
+      {"oq5e", 64,
+       "projections w8g64; router dense, experts w5g64, shared expert "
+       "w8g64 (fused decode); MTP head: fc w8, attention w8"},
+      {"mtplx", 32,
+       "projections w8g32 (hyper-connections dense); router w8g32, experts "
+       "w4g32"},
+      {"g64", 64, "projections w8g64; router w8g64, experts w4g64"},
+      {"w6", 64, "experts w6g64, shared expert w8g64 (fused decode)"},
+      {"w8", 64, "experts w8g64, shared expert w8g64 (fused decode)"},
+  };
+  auto argmax = [](const float* v, std::size_t n) {
+    std::size_t a = 0;
+    for (std::size_t i = 1; i < n; ++i) {
+      if (v[i] > v[a]) { a = i; }
+    }
+    return a;
+  };
+  int ran = 0;
+  const char* only = std::getenv("VPIPE_QWEN4_EXP_FLAVOR");   // one recipe
+  for (const Want& w : wants) {
+    if (only != nullptr && std::string(only) != w.recipe) { continue; }
+    const std::string mp = std::string(fp) + "/" + w.recipe;
+    const std::string g = mp + "/golden";
+    const auto ids = read_raw_<std::int32_t>(g + "/ids.i32");
+    const auto ref = read_raw_<float>(g + "/logits_f32.f32");
+    const auto ref16 = read_raw_<float>(g + "/logits_bf16.f32");
+    const auto mref = read_raw_<float>(g + "/mtp_logits_f32.f32");
+    const auto mref16 = read_raw_<float>(g + "/mtp_logits_bf16.f32");
+    const std::size_t T = ids.size();
+    if (T < 32 || ref.empty() || ref.size() % T != 0) { continue; }
+    ++ran;
+    const std::size_t V = ref.size() / T;
+    vpipe::genai::ModelLoader loader(&sess);
+    const auto mcfg = loader.load_config(mp);
+    ASSERT_TRUE(mcfg.has_value());
+    if (!mcfg.has_value()) { continue; }
+    MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+    c.use_bf16 = std::getenv("VPIPE_QWEN4_EXP_F16") == nullptr;
+    c.page_tokens = 256;
+    c.max_pages = 16;
+    c.max_seq = 4096;
+    c.expert_cache_bytes = 0;
+    EXPECT_TRUE(c.hc() && c.hc_group == w.group);
+    // What the plan books for it, held whole: the checkpoint less its
+    // n-gram table, plus the re-encode's growth.
+    std::size_t plan = 0;
+    if (auto wf = vpipe::genai::MetalLlamaWeights::open_model(mp)) {
+      for (const std::string& nm : wf->tensor_names()) {
+        if (const auto* ti = wf->info(nm)) { plan += (std::size_t)ti->nbytes; }
+      }
+      plan = plan - MetalQwenModel::unheld_bytes(*wf, c) +
+             MetalQwenModel::held_growth_bytes(*wf, c);
+    }
+    const std::size_t a0 = mc->memory_budget_settled().allocated;
+    auto m = MetalQwenModel::load(mp, mc, c);
+    ASSERT_TRUE(m != nullptr && m->has_mtp());
+    if (m == nullptr || !m->has_mtp()) { continue; }
+    const std::size_t held = mc->memory_budget_settled().allocated - a0;
+    const std::string lay = m->hc_layout();
+    std::printf("[qwen4_exp_flavors] %s: %s; the plan books %.1f MB, the "
+                "load holds %.1f\n", w.recipe, lay.c_str(), plan / 1e6,
+                held / 1e6);
+    EXPECT_TRUE(lay.find(w.layout) != std::string::npos);
+    EXPECT_TRUE((double)held < 1.10 * (double)plan &&
+                (double)held > 0.85 * (double)plan);
+
+    // A prefill's logits, and the MTP head's teacher-forced pairs.
+    const std::vector<std::int32_t> prompt(ids.begin(), ids.end());
+    std::vector<float> mgot;
+    const auto c0 = m->context_manager()->acquire_root();
+    const std::vector<float> got = m->prefill_all_logits(c0, prompt, &mgot);
+    m->context_manager()->release(c0);
+    ASSERT_TRUE(got.size() == ref.size() && mgot.size() == mref.size());
+    if (got.size() != ref.size() || mgot.size() != mref.size()) {
+      continue;
+    }
+    int decisive = 0, agree = 0;
+    for (std::size_t t = 0; t < T; ++t) {
+      const float* r = ref.data() + t * V;
+      const std::size_t a = argmax(r, V);
+      float second = -1e30f;
+      for (std::size_t v = 0; v < V; ++v) {
+        if (v != a) { second = std::max(second, r[v]); }
+      }
+      if (r[a] - second > 0.5f) {
+        ++decisive;
+        agree += argmax(got.data() + t * V, V) == a;
+      }
+    }
+    const double e = rel_l2_(ref.data(), got.data(), ref.size());
+    const double bar = rel_l2_(ref.data(), ref16.data(), ref.size());
+    const double me = rel_l2_(mref.data(), mgot.data(), mref.size());
+    const double mbar = rel_l2_(mref.data(), mref16.data(), mref.size());
+    std::printf("[qwen4_exp_flavors] %s: %zu-row prefill logits %.4f from "
+                "fp32 (its bf16 %.4f), decisive argmax %d/%d; MTP head "
+                "%.4f (%.4f)\n", w.recipe, T, e, bar, agree, decisive, me,
+                mbar);
+    EXPECT_TRUE(e < 1.5 * bar);
+    EXPECT_TRUE(agree == decisive);
+    EXPECT_TRUE(me < 1.5 * mbar);
+
+    // The decode path: the last 16 rows a step each.
+    {
+      const std::size_t P = T - 16;
+      const auto cd = m->context_manager()->acquire_root();
+      std::vector<float> step = m->prefill(
+          cd, std::vector<std::int32_t>(ids.begin(), ids.begin() + (long)P));
+      std::vector<float> dg((T - P + 1) * V);
+      ASSERT_TRUE(step.size() == V);
+      if (step.size() != V) { continue; }
+      std::memcpy(dg.data(), step.data(), V * 4);
+      for (std::size_t t = P; t < T; ++t) {
+        step = m->forward(cd, ids[t]);
+        ASSERT_TRUE(step.size() == V);
+        if (step.size() != V) { break; }
+        std::memcpy(dg.data() + (t - P + 1) * V, step.data(), V * 4);
+      }
+      m->context_manager()->release(cd);
+      const float* r0 = ref.data() + (P - 1) * V;
+      const float* b0 = ref16.data() + (P - 1) * V;
+      const double de = rel_l2_(r0, dg.data(), dg.size());
+      const double dbar = rel_l2_(r0, b0, dg.size());
+      // The row furthest from fp32 (a near-tie expert pick broken the
+      // other way moves one row, not every one), ours and the reference's.
+      double worst = 0.0, worst16 = 0.0;
+      std::size_t wr = 0;
+      for (std::size_t t = 0; t <= T - P; ++t) {
+        const double et = rel_l2_(r0 + t * V, dg.data() + t * V, V);
+        if (et > worst) { worst = et; wr = t; }
+        worst16 = std::max(worst16, rel_l2_(r0 + t * V, b0 + t * V, V));
+      }
+      std::printf("[qwen4_exp_flavors] %s: decode over %zu rows %.4f "
+                  "(%.4f); worst row %zu %.4f (its bf16's worst %.4f)\n",
+                  w.recipe, T - P, de, dbar, wr, worst, worst16);
+      // The reference's bf16 over 16 rows is one draw (w6's read 0.0088
+      // where its whole prompt reads 0.0136, ours 0.012-0.014 on every
+      // route and box -- f16 0.004): held to the larger of the two.
+      EXPECT_TRUE(de < 1.5 * std::max(dbar, bar));
+    }
+
+    // The draft head's greedy decode against the plain one, and the state
+    // it leaves (the next token's logits after it, to the bit).
+    {
+      constexpr int N = 32;
+      const std::vector<std::int32_t> pp(ids.begin(), ids.begin() + 48);
+      auto* cm = m->context_manager();
+      const auto ca = cm->acquire_root();
+      std::vector<float> l = m->prefill(ca, pp);
+      std::vector<std::int32_t> plain{(std::int32_t)argmax(l.data(), V)};
+      for (int i = 1; i <= N; ++i) {
+        l = m->forward(ca, plain.back());
+        plain.push_back((std::int32_t)argmax(l.data(), V));
+      }
+      const auto cb = cm->acquire_root();
+      const std::int32_t first =
+          (std::int32_t)argmax(m->prefill(cb, pp).data(), V);
+      std::vector<std::int32_t> out;
+      long kept = 0, rounds = 0;
+      vpipe::genai::MtpDecodeCtl ctl;
+      long drafted = 0;
+      ctl.drafted = &drafted;
+      const bool ok = m->mtp_decode(cb, first, N, out, 1, &kept, &rounds,
+                                    ctl);
+      ASSERT_TRUE(ok && (int)out.size() == N);
+      int same = 0;
+      for (int i = 0; i < (int)out.size() && i < N; ++i) {
+        same += out[(std::size_t)i] == plain[(std::size_t)i];
+      }
+      // ca has taken plain[0 .. N - 1] (N forwards), as cb has out; the
+      // next token's logits on both.
+      const std::int32_t nxt = plain[(std::size_t)N];
+      const int took_b = cm->seq_len_of(cb) - (int)pp.size();
+      std::size_t diff = 0;
+      if (took_b == N) {
+        const std::vector<float> la = m->forward(ca, nxt);
+        const std::vector<float> lb = m->forward(cb, nxt);
+        for (std::size_t i = 0; i < V; ++i) { diff += la[i] != lb[i]; }
+      }
+      std::printf("[qwen4_exp_flavors] %s: draft head %d of %d tokens the "
+                  "plain decode's, %ld of %ld drafts kept in %ld rounds; "
+                  "the next logits after it: %zu of %zu differ\n", w.recipe,
+                  same, N, kept, drafted, rounds, diff, V);
+      EXPECT_TRUE(same == N);
+      EXPECT_TRUE(took_b == N && diff == 0);
+      EXPECT_TRUE(drafted > kept);          // a rejected draft: a replay
+      cm->release(ca);
+      cm->release(cb);
+    }
+    m.reset();
+
+    // The routed experts from a cache a layer wide (every pick a read).
+    {
+      MetalQwenModel::Config cc = c;
+      cc.expert_cache_bytes = (std::size_t)1 << 20;
+      auto mx = MetalQwenModel::load(mp, mc, cc);
+      ASSERT_TRUE(mx != nullptr);
+      if (mx == nullptr) { continue; }
+      std::vector<float> mx_mtp;
+      const auto cx = mx->context_manager()->acquire_root();
+      const std::vector<float> xg =
+          mx->prefill_all_logits(cx, prompt, &mx_mtp);
+      mx->context_manager()->release(cx);
+      std::size_t diff = 0;
+      for (std::size_t i = 0; i < xg.size() && i < got.size(); ++i) {
+        diff += xg[i] != got[i];
+      }
+      for (std::size_t i = 0; i < mx_mtp.size() && i < mgot.size(); ++i) {
+        diff += mx_mtp[i] != mgot[i];
+      }
+      std::printf("[qwen4_exp_flavors] %s: experts cached: %zu logits of "
+                  "%zu differ from resident\n", w.recipe, diff,
+                  got.size() + mgot.size());
+      EXPECT_TRUE(xg.size() == got.size() && diff == 0);
+    }
+  }
+  ASSERT_TRUE(ran > 0);
 }

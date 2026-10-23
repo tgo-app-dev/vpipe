@@ -781,10 +781,12 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
     if (auto w = genai::MetalLlamaWeights::open_model(dir)) {
       const std::size_t ex = genai::MetalQwenModel::routed_expert_bytes(*w, qc);
       const std::size_t un = genai::MetalQwenModel::unheld_bytes(*w, qc);
+      const std::size_t gr = genai::MetalQwenModel::held_growth_bytes(*w, qc);
       const std::size_t disk = dir_weights_bytes(dir);
       if (ex > 0 && disk > ex + un) {
         out[0] = weight_claim_streamable(
-            dir, disk - ex - un + ex / (std::size_t)std::max(1, qc.n_layers));
+            dir, disk - ex - un + gr +
+                     ex / (std::size_t)std::max(1, qc.n_layers));
       }
     }
   }

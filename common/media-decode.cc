@@ -22,7 +22,7 @@ constexpr size_t kMaxAudioSeconds = 20 * 60;
 // planar RGB is 6 MB a 1080p frame, so a whole-file decode of a long
 // clip is measured in gigabytes. Callers that know their bound pass
 // `max_seconds`; these are the backstop for the ones that do not.
-constexpr int64_t kMaxVideoFrames          = 4096;
+constexpr int64_t kMaxVideoFrames          = kMaxDecodedVideoFrames;
 constexpr int64_t kMaxVideoPixelsPerFrame  = 4096LL * 4096LL;
 
 string
@@ -737,6 +737,7 @@ decode_video_impl_(const FFmpegLibraries* libs,
       if (out.num_frames >= frame_cap) { stop = true; break; }
     }
   }
+  out.cut_short = stop;
   if (out.num_frames == 0) {
     set_err_(error, "no frames decoded");
     return nullopt;

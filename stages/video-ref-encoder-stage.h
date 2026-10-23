@@ -28,6 +28,8 @@
 
 namespace vpipe {
 
+struct MediaProbe;
+
 // VideoRefEncoderStage: a list of reference media -> the conditioning
 // and the reference latent rows a reference-to-video-and-audio DiT
 // denoises against.
@@ -317,6 +319,28 @@ public:
   // reason already warned.
   bool conform_audio_rate(genai::minimax_h3::MediaReference* m, int n);
 
+  // What decoding a reference FILE WHOLE (`whole_references`) holds at
+  // once, from its probe alone -- no frame is read: the decoder's planar
+  // frames at the file's own size, to its backstop
+  // (kMaxDecodedVideoFrames; a length the container does not state is
+  // taken at it), the canvas copy the encoder makes beside them
+  // (`short_edge` / `max_pixels`, the video canvas), and the soundtrack
+  // at `audio_rate`, decoded and normalized. A truncated reference is
+  // bounded by the generated duration; one kept whole by nothing else,
+  // and every check downstream (the denoise's scratch preflight, the
+  // prompt cap) runs after this memory is spent. Public and static for
+  // a test that needs no model.
+  static std::size_t whole_decode_bytes(const MediaProbe& p, int short_edge,
+                                        std::int64_t max_pixels,
+                                        int audio_rate);
+
+  // A clip kept whole whose frames stopped at the decoder's backstop
+  // keeps a soundtrack decoded to the file's end: cut it to the frames'
+  // span, int(frames / fps * rate) samples a channel, planar kept
+  // planar -- the two streams share the layout's clock, so a soundtrack
+  // past the last frame would skew them. True when anything was cut.
+  static bool trim_soundtrack_to_frames(genai::minimax_h3::MediaReference* m);
+
 #endif
 
   // The short edge an IMAGE reference is put on: `configured` when the
@@ -379,6 +403,9 @@ private:
   // Reference iport numbers (1-based) whose audio is the SOUNDTRACK of
   // the reference before it. A beat's own `attach` sideband overrides.
   std::vector<int> _attach_audio;
+  // References kept whole (`whole_references`), by their number in the
+  // request.
+  std::vector<int> _whole_refs;
   double        _video_sample_fps = 2.0;
   double        _cond_noise_aug   = 0.999;
   int           _max_prompt_tokens = 16384;

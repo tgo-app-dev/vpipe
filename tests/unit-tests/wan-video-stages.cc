@@ -35,11 +35,14 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/wan/metal-wan-transformer.h"
 #include "generative-models/wan/metal-wan-vae.h"
+#include "common/media-decode.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
 #include "stages/generate-video-stage.h"
 #include "stages/video-ref-encoder-stage.h"
 #endif
 
 #include <cstdint>
+#include <limits>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -1347,6 +1350,110 @@ TEST(video_ref_encoder, attach_audio_names_reference_ports)
   }
   std::printf("[video_ref_encoder] attach_audio: 1..6 accepted, 0 and 7 "
               "refused at launch\n");
+}
+
+// A REFERENCE KEPT WHOLE (`whole_references`) is bounded by nothing the
+// generated duration sets, so the stage sizes a list file's whole decode
+// from its probe -- before a frame is read -- and, where the decoder
+// stops at its frame backstop, cuts the soundtrack (decoded to the file's
+// end) to the frames' span. Both halves without a model or a file.
+TEST(video_ref_encoder, a_reference_kept_whole_is_sized_and_kept_in_step)
+{
+  namespace h3 = genai::minimax_h3;
+  Session sess;
+  {
+    // Numbers from 1, in an array.
+    auto with = [&](FlexData v, const char* id) {
+      auto cfg = FlexData::make_object();
+      cfg.as_object().insert_or_assign("whole_references", std::move(v));
+      return std::string(
+          VideoRefEncoderStage(&sess, id, vector<InEdge>{}, cfg)
+              .config_error());
+    };
+    auto arr = [](std::vector<int> ns) {
+      auto a = FlexData::make_array();
+      for (int n : ns) { a.as_array().push_back(FlexData::make_int(n)); }
+      return a;
+    };
+    EXPECT_TRUE(with(arr({2}), "w1").empty());
+    EXPECT_TRUE(with(arr({1, 12}), "w2").empty());
+    EXPECT_FALSE(with(arr({0}), "w3").empty());
+    EXPECT_FALSE(with(FlexData::make_int(2), "w4").empty());
+  }
+
+  // ---- the decode, sized from the probe ---------------------------------
+  const int edge = 768;
+  const std::int64_t max_px = 768 * 1344;
+  MediaProbe p;
+  p.kind = MediaKind::Video;
+  p.has_video = true;
+  p.width = 1920;
+  p.height = 1080;
+  p.fps = 30.0;
+  p.duration_seconds = 120.0;
+  const std::size_t two_min =
+      VideoRefEncoderStage::whole_decode_bytes(p, edge, max_px, 0);
+  const std::size_t frame = (std::size_t)3 * 1920 * 1080;
+  // The source frames alone are 3600 x 6 MB; the canvas copy is on top.
+  EXPECT_TRUE(two_min > (std::size_t)3600 * frame);
+  int nf = 0, th = 0, tw = 0;
+  ASSERT_TRUE(h3::video_reference_geometry(
+      3600, 1080, 1920, 30.0, std::numeric_limits<int>::max(),
+      h3::ReferencePlan{}.canvas_multiple, edge, max_px, &nf, &th, &tw));
+  EXPECT_TRUE(two_min ==
+              (std::size_t)3600 * frame + (std::size_t)nf * 3 * th * tw);
+  // Ten minutes is read to the backstop, as is a length nobody states.
+  MediaProbe ten = p;
+  ten.duration_seconds = 600.0;
+  MediaProbe at_cap = p;
+  at_cap.nb_frames = kMaxDecodedVideoFrames;
+  MediaProbe unknown = p;
+  unknown.fps = 0.0;
+  unknown.duration_seconds = 0.0;
+  const std::size_t capped =
+      VideoRefEncoderStage::whole_decode_bytes(at_cap, edge, max_px, 0);
+  EXPECT_TRUE(VideoRefEncoderStage::whole_decode_bytes(ten, edge, max_px,
+                                                       0) == capped);
+  EXPECT_TRUE(VideoRefEncoderStage::whole_decode_bytes(unknown, edge,
+                                                       max_px, 0) >=
+              (std::size_t)kMaxDecodedVideoFrames * frame);
+  // A soundtrack adds its decoded and normalized stereo f32.
+  MediaProbe with_audio = p;
+  with_audio.has_audio = true;
+  const std::size_t sound =
+      VideoRefEncoderStage::whole_decode_bytes(with_audio, edge, max_px,
+                                               32000) - two_min;
+  EXPECT_TRUE(sound == (std::size_t)(120.0 * 32000) * 2 * 4 * 2);
+  std::printf("[video_ref_encoder] whole decode of 1080p30: 2 min %.1f GB, "
+              "10 min held at the %d-frame backstop %.1f GB; the 2-min "
+              "soundtrack %.0f MB\n", two_min / 1073741824.0,
+              kMaxDecodedVideoFrames, capped / 1073741824.0,
+              sound / 1048576.0);
+
+  // ---- the soundtrack kept in step with the frames ----------------------
+  // 100 frames at 25 fps are 4 s; a 10 s stereo soundtrack at 32 kHz
+  // keeps int(4 * 32000) = 128000 samples a channel, planar kept planar.
+  h3::MediaReference m;
+  m.kind = h3::MediaReference::Kind::kVideo;
+  m.num_frames = 100;
+  m.fps = 25.0;
+  m.channels = 2;
+  m.sample_rate = 32000;
+  const std::size_t S = 320000;
+  m.pcm.assign(2 * S, 0.25f);
+  for (std::size_t k = S; k < 2 * S; ++k) { m.pcm[k] = 0.5f; }
+  m.pcm[S] = 0.75f;   // the second channel's first sample
+  EXPECT_TRUE(VideoRefEncoderStage::trim_soundtrack_to_frames(&m));
+  ASSERT_TRUE(m.pcm.size() == 2u * 128000u);
+  if (m.pcm.size() == 2u * 128000u) {
+    EXPECT_TRUE(m.pcm[127999] == 0.25f);
+    EXPECT_TRUE(m.pcm[128000] == 0.75f);
+    EXPECT_TRUE(m.pcm[2 * 128000 - 1] == 0.5f);
+  }
+  // In step already: nothing to cut.
+  EXPECT_FALSE(VideoRefEncoderStage::trim_soundtrack_to_frames(&m));
+  std::printf("[video_ref_encoder] a 10 s soundtrack on 4 s of frames: "
+              "%zu samples a channel kept\n", m.pcm.size() / 2);
 }
 
 // A soundtrack that arrives on a PORT arrives at its producer's rate,

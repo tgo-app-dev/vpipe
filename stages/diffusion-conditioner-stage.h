@@ -400,10 +400,13 @@ private:
   // Encode `text` (+ the cached reference image, for image-aware families) into
   // the family conditioning tensor; returns the bf16 buffer + sets `n_real`.
   // `vtok`/`n_img` carry the (already-computed) vision tokens for QIE (empty
-  // for text-only). Empty buffer on failure.
+  // for text-only). `as_given`: the family's prompt rewriting skipped
+  // (Fibo 2.0's negative, which its reference encodes as written). Empty
+  // buffer on failure.
   metal_compute::SharedBuffer
   encode_(const std::string& text, const char* which, int& n_real,
-          const metal_compute::SharedBuffer& vtok, int n_img) const;
+          const metal_compute::SharedBuffer& vtok, int n_img,
+          bool as_given = false) const;
 
   // Qwen-Image-2.1: the template's ids for `text` and how many leading
   // ones the reference drops (the system turn).

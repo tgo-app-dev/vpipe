@@ -415,6 +415,33 @@ builtin_catalog_()
      .variant = "MLX oQ5e uncensored, MTP (mlx-community)",
      .hf_path = "mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
      .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // The same model in mlx-community's other packs. The loader reads any
+    // MLX affine layout of it: projections re-encoded to w8 at group 64, or
+    // 32 where a pack uses 32 (the plain 4-bit packs, ~1.8x their bytes on
+    // disk once held, which the plan books); routers dense or quantized;
+    // experts 4 / 5 / 6 / 8-bit at group 32 or 64; modules a pack left
+    // unquantized run dense. Not the 2- / 3-bit-expert packs (OptiQ-2bit,
+    // third parties' 3-bit), which the load refuses by name. 4-bit, group
+    // 32, its MTP head grafted in bf16 (113 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX 4-bit, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // ...without the MTP head (111.5 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-4bit",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // oQ at 6 bits: experts w6 g64, the rest 6 / 8-bit (150.5 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX oQ6e, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-oQ6e-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // oQ at 8 bits: experts w8 g64 (194.9 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX oQ8e, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
@@ -1638,6 +1665,64 @@ builtin_catalog_()
                "fonts/LICENSE-Aileron.txt",
                "fonts/LICENSE-DejaVu.txt",
                "fonts/README.md"},
+     .needs_tokenizer_json = false},
+    // ---- Fibo 2.0 Dev (text -> image and editing, Bria) -----------------
+    // briaai/Fibo-2.0-dev: the full, non-distilled base model Edit Turbo
+    // is distilled from -- the SAME architecture, its configs
+    // byte-identical to Turbo's -- run with classifier-free guidance: 50
+    // steps at guidance 5 by its model card, against the null caption it
+    // was trained with (an edit) or a negative caption (text-to-image).
+    // Its files cannot say which model they are, so the GRAPH does:
+    // fibo2-model-config `guidance_scale` and the conditioner's oport1
+    // wired to generate-image's iport1. styles/ holds five photographic
+    // looks -- a system and user prompt for a caption writer, and the
+    // negative to render with.
+    // GATED, and CC BY-NC 4.0 (non-commercial): accept the terms on the
+    // repo page, then give model-fetch a token.
+    {.family = "Fibo", .version = "2.0", .param_class = "8B",
+     .variant = "Dev, bf16 (briaai, gated, non-commercial)",
+     .hf_path = "briaai/Fibo-2.0-dev",
+     .model_type = "fibo2",
+     .inputs = {"text", "image"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "README.md",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json",
+               "processor/tokenizer_config.json",
+               "processor/tokenizer.json",
+               "scheduler/scheduler_config.json",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "fonts/Aileron-Regular.otf",
+               "fonts/DejaVuSans.ttf",
+               "fonts/LICENSE-Aileron.txt",
+               "fonts/LICENSE-DejaVu.txt",
+               "fonts/README.md",
+               "styles/boring_reality/negative_prompt.json",
+               "styles/boring_reality/system_prompt.txt",
+               "styles/boring_reality/user_prompt.txt",
+               "styles/hard_flash/negative_prompt.json",
+               "styles/hard_flash/system_prompt.txt",
+               "styles/hard_flash/user_prompt.txt",
+               "styles/hazy_dreamy/negative_prompt.json",
+               "styles/hazy_dreamy/system_prompt.txt",
+               "styles/hazy_dreamy/user_prompt.txt",
+               "styles/kodak_film/negative_prompt.json",
+               "styles/kodak_film/system_prompt.txt",
+               "styles/kodak_film/user_prompt.txt",
+               "styles/lens_distortion/negative_prompt.json",
+               "styles/lens_distortion/system_prompt.txt",
+               "styles/lens_distortion/user_prompt.txt"},
      .needs_tokenizer_json = false},
     // ---- MOSS-Image (text -> image, OpenMOSS) ----------------------------
     // A 5B single-stream flow-matching DiT. Sub-models:

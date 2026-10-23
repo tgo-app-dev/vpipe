@@ -4164,10 +4164,12 @@ const STRINGS = {
   'cfg.video-ref-encoder.frames': ['',
       '以 24 fps 计的生成帧数，向上取整到下一个 17n+5。必须与 '
       + 'generate-video 阶段的 `frames` 一致：所有参考都会被截断到这个时长'
-      + '，DiT 构建的布局也是按同一个数字定尺寸的',
+      + '（`whole_references` 保留的除外），DiT 构建的布局也是按同一个数字'
+      + '定尺寸的',
       '以 24 fps 計的生成影格數，向上取整到下一個 17n+5。必須與 '
       + 'generate-video 階段的 `frames` 一致：所有參考都會被截斷到這個長度'
-      + '，DiT 建構的版面也是按同一個數字定尺寸的'],
+      + '（`whole_references` 保留的除外），DiT 建構的版面也是按同一個數字'
+      + '定尺寸的'],
   'cfg.video-ref-encoder.reference_image_short_edge': ['',
       '图像参考的短边被缩放到多少（发布的 Ref2VA 检查点为 2048）。与目标画'
       + '布不同，这一项没有面积上限，且会放大小图——图像参考是按高细节读取的'
@@ -4237,6 +4239,23 @@ const STRINGS = {
       + '能來自 `references` 清單，因為清單是先讀的。之所以逐埠設定而不是一'
       + '個總開關，是因為一次請求完全可能既帶隨片配樂、又帶一段獨立音樂。節'
       + '拍自身的 `attach` 邊帶可針對該節拍覆寫此項'],
+  'cfg.video-ref-encoder.whole_references': ['',
+      '按请求中的编号（1..12：先是 `references` 列表，再按顺序是各输入端口，'
+      + '附加在片段上的配乐与该片段算作同一个）指定要保持完整的参考：不截断到'
+      + '生成时长，画面与配乐都不截。其余参考都会被截断，发布的配方会截断全部'
+      + '参考，所以这偏离了该配方——例如要把一首歌整首用上。保持完整的片段是 '
+      + 'DiT 每一步都要关注的一段行，并会沿共享时钟把生成的行往后推。列表中保'
+      + '持完整的文件最多读取 4096 帧（其配乐随之截断），若完整解码放不进内存'
+      + '，会在读取之前就被拒绝；放得下但过长的，之后会被提示词上限或去噪的暂'
+      + '存预检拒绝。图像没有时长可保留，会被忽略',
+      '按請求中的編號（1..12：先是 `references` 清單，再按順序是各輸入埠，'
+      + '附加在片段上的配樂與該片段算作同一個）指定要保持完整的參考：不截斷到'
+      + '產生長度，畫面與配樂都不截。其餘參考都會被截斷，發布的配方會截斷全部'
+      + '參考，所以這偏離了該配方——例如要把一首歌整首用上。保持完整的片段是 '
+      + 'DiT 每一步都要關注的一段列，並會沿共享時鐘把產生的列往後推。清單中保'
+      + '持完整的檔案最多讀取 4096 格（其配樂隨之截斷），若完整解碼放不進記憶'
+      + '體，會在讀取之前就被拒絕；放得下但過長的，之後會被提示詞上限或去雜訊'
+      + '的暫存預檢拒絕。影像沒有長度可保留，會被忽略'],
   'cfg.video-ref-encoder.video_sample_fps': ['',
       '条件生成读取视频参考所用的速率——每 24/该值 帧取一帧，两两合并成带时'
       + '间戳的视觉块。它不是 VAE 编码所用的速率，后者是完整的 24',
@@ -5191,12 +5210,25 @@ const STRINGS = {
       'Fibo 2.0 模型配置',
       'Fibo 2.0 模型設定'],
   'stage.fibo2-model-config.doc': ['',
-      '源：Fibo 2.0 的专属参数——编辑时 Qwen3-VL 所读图片的尺寸界限、运行时 '
-      + 'LoRA 槽位和实时预览。普通运行一个都不需要。发一个节拍即结束；若接了 '
-      + 'trigger 输入端口，则每收到一个节拍发一次。',
-      '來源：Fibo 2.0 的專屬參數——編輯時 Qwen3-VL 所讀圖片的尺寸界限、執行'
-      + '階段 LoRA 槽位和即時預覽。一般執行一個都不需要。發一個節拍即結束；'
-      + '若接了 trigger 輸入埠，則每收到一個節拍發一次。'],
+      '源：Fibo 2.0 的专属参数——引导强度（Dev 用 5；Edit Turbo 不需要）、'
+      + '编辑时 Qwen3-VL 所读图片的尺寸界限、运行时 LoRA 槽位和实时预览。'
+      + 'Edit Turbo 的运行一个都不需要。发一个节拍即结束；若接了 trigger 输入'
+      + '端口，则每收到一个节拍发一次。',
+      '來源：Fibo 2.0 的專屬參數——引導強度（Dev 用 5；Edit Turbo 不需要）、'
+      + '編輯時 Qwen3-VL 所讀圖片的尺寸界限、執行階段 LoRA 槽位和即時預覽。'
+      + 'Edit Turbo 的執行一個都不需要。發一個節拍即結束；若接了 trigger 輸入'
+      + '埠，則每收到一個節拍發一次。'],
+  'cfg.fibo2-model-config.guidance_scale': ['',
+      '无分类器引导：v = v_neg + g (v - v_neg)，相对 diffusion-conditioner '
+      + '在 oport1 接线时发出的负向条件（未接负向提示词时即模型训练时用的空'
+      + '结构化描述）。Fibo 2.0 Dev 用 5（其模型卡的配方，50 步；未设步数时 '
+      + '30 步）；Edit Turbo 蒸馏到 1，即每步只做一次前向、不跑负向分支。留空 '
+      + '=> generate-image 自己的 guidance_scale（默认 1）',
+      '無分類器引導：v = v_neg + g (v - v_neg)，相對 diffusion-conditioner '
+      + '在 oport1 接線時發出的負向條件（未接負向提示詞時即模型訓練時用的空'
+      + '結構化描述）。Fibo 2.0 Dev 用 5（其模型卡的配方，50 步；未設步數時 '
+      + '30 步）；Edit Turbo 蒸餾到 1，即每步只做一次前向、不跑負向分支。留空 '
+      + '=> generate-image 自己的 guidance_scale（預設 1）'],
   'cfg.fibo2-model-config.vl_long_edge': ['',
       '编辑：Qwen3-VL 看到的待编辑图片的最长边，按参考管线的方式生成缩略图'
       + '（双三次插值、保持宽高比、从不放大）；VAE 使用图片本身。未设置 => '
@@ -5264,13 +5296,13 @@ const STRINGS = {
       + '發一次'],
   'port.fibo2-model-config.model_config': ['',
       'Fibo 2.0 参数，作为一个 FlexData 对象 {model_family: fibo2, '
-      + '+vl_long_edge / vl_min_pixels / vl_max_pixels，+lora .. +lora8 与'
-      + '它们的强度，+preview_vae 与它的选项}，供 generate-image 或 '
-      + 'diffusion-conditioner 的 model_config 输入端口使用',
+      + '+guidance_scale，+vl_long_edge / vl_min_pixels / vl_max_pixels，'
+      + '+lora .. +lora8 与它们的强度，+preview_vae 与它的选项}，供 '
+      + 'generate-image 或 diffusion-conditioner 的 model_config 输入端口使用',
       'Fibo 2.0 參數，作為一個 FlexData 物件 {model_family: fibo2, '
-      + '+vl_long_edge / vl_min_pixels / vl_max_pixels，+lora .. +lora8 與'
-      + '它們的強度，+preview_vae 與它的選項}，供 generate-image 或 '
-      + 'diffusion-conditioner 的 model_config 輸入埠使用'],
+      + '+guidance_scale，+vl_long_edge / vl_min_pixels / vl_max_pixels，'
+      + '+lora .. +lora8 與它們的強度，+preview_vae 與它的選項}，供 '
+      + 'generate-image 或 diffusion-conditioner 的 model_config 輸入埠使用'],
 
   // ---- MOSS-Image Model Config (model-specific-config) ----
   'stage.moss-image-model-config.name': ['',

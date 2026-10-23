@@ -8,9 +8,36 @@ carries its own speculative-decoding head. vpipe runs all of it on-device
 through its **metal-compute** backend -- its own Metal kernels, no Python
 and no third-party tensor runtime in the forward pass.
 
-The checkpoint is `mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`,
-an MLX mixed-precision pack: the experts and the n-gram table at 5 bits,
-the rest at 5 to 8 bits, the vision tower in bf16. It is 128.5 GB.
+The checkpoint the pipelines name is
+`mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp`, an MLX
+mixed-precision pack: the experts and the n-gram table at 5 bits, the rest
+at 5 to 8 bits, the vision tower in bf16. It is 128.5 GB.
+
+## Other packs of the model
+
+vpipe reads the model's other MLX packs too; put the repo's name where the
+pipelines name the oQ5e one (`model_path` in the prepare pipeline, `hf_dir`
+in the chat pipeline).
+
+| Pack | Size | Its layout |
+|---|---|---|
+| `mlx-community/Qwen3.8-Flash-Next-4bit-mtp` | 113 GB | everything 4-bit at group 32, the routers 8-bit; its MTP head's attention and shared expert in bf16 |
+| `mlx-community/Qwen3.8-Flash-Next-4bit` | 112 GB | the same without the MTP head |
+| `mlx-community/Qwen3.8-Flash-Next-oQ6e-mtp` | 151 GB | as the oQ5e pack, the experts at 6 bits |
+| `mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp` | 195 GB | the experts at 8 bits |
+
+Any other MLX affine pack of it loads as well, whatever its widths and
+groups -- with two limits. Its routed experts must be 4, 5, 6 or 8-bit at
+group 32 or 64, one width throughout (the 2-bit OptiQ pack and 3-bit packs
+are refused, by name). And on a box too small to hold every expert, the
+expert cache needs one width and group across the layers; a pack that
+mixes them loads its experts resident instead.
+
+The 4-bit packs hold their attention and gating weights at 8 bits once
+loaded (the kernels' one width), about 6 GB where they take 3 on disk;
+vpipe sizes the expert cache with that in mind. The load reports the layout
+it found, e.g. `Qwen3.8-Flash-Next weights: projections w8g32; router w8g32,
+experts w4g32, shared expert w8g32 (fused decode); MTP head: fc dense, ...`.
 
 ## What you need
 
@@ -66,11 +93,20 @@ vision tower runs, which the chat books when it starts.
 ## Settings that matter
 
 - **Speculative decoding** (`mtp`, on by default). The model's own draft
-  head guesses three tokens ahead and the model checks them in one pass,
-  keeping the ones it agrees with -- about three tokens a pass. The
-  output is the model's own, token for token, greedy or sampled; only the
-  speed changes. The draft head is primed with the prompt as it is read
-  (`mtp_prefix_seed`, on by default).
+  head guesses ahead and the model checks the guesses in one pass,
+  keeping the ones it agrees with. It guesses three tokens where experts
+  come from the drive -- a check's extra rows are cheap beside the reads
+  -- and one where every expert is in memory, where each extra row costs
+  about a third of a step. The output is the model's own, token for
+  token, greedy or sampled; only the speed changes. The draft head is
+  primed with the prompt as it is read (`mtp_prefix_seed`, on by default).
+- **Context copy** (with the draft head; `VPIPE_QWEN_HC_COPY=0` turns it
+  off). When the reply's last six tokens occurred earlier in the
+  conversation, the next pass checks the tokens that followed them there
+  -- up to seven -- instead of the head's guess: a reply that quotes,
+  rewrites or re-emits what it was given goes several tokens a pass. Its
+  passes are timed against the head's, and while they cost more for each
+  token kept it stands aside. The output is still the model's own.
 - **Sampling.** The shipped pipeline uses the vendor's instruct-mode
   settings (temperature 0.7, top-p 0.8, top-k 20, presence penalty 1.5)
   with thinking off. For thinking mode the vendor recommends temperature
@@ -135,6 +171,21 @@ settles near 4.
 The decode's cost is the drive's: a token that picks an expert the cache
 lacks waits for a ~3 MB read. A machine whose memory holds every expert
 decodes several times faster.
+
+Measured on an **M5 Ultra, 256 GB**, every expert in memory (the oQ5e
+checkpoint, greedy, the draft head guessing one token a pass):
+
+| | plain decode | with the draft head |
+|---|---:|---:|
+| a 300-word story from a one-line prompt | 89.8 tok/s | 109 tok/s |
+| a summary of a 7,257-token document | 82.7 tok/s | 102.5 tok/s |
+| the same summary asked of that document four times over (29,000 tokens) | 81.0 tok/s | 104.2 tok/s |
+| copying a 3,000-character passage it was given, one word changed | 79.7 tok/s | 184.6 tok/s (118.0 without context copy) |
+
+A 29,000-token prompt is read at about 2,900 tok/s. The DFlash 2 drafter
+decodes the story at 89.4 tok/s and the 7,257-token summary at 66.2: with
+every expert in memory the draft head is the faster drafter, and the
+DFlash drafter's own attention over a long context costs it most.
 
 Correctness is checked against the reference implementation (transformers'
 `qwen4_exp`, its layers run one at a time from the same checkpoint;

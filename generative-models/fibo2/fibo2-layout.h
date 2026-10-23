@@ -109,6 +109,18 @@ bool edit_prompt(const std::string& prompt, int n_images, bool text_images,
 // -- and any other prompt as given.
 std::string generation_prompt(const std::string& prompt);
 
+// The NEGATIVE a guided run (Fibo 2.0 Dev) uses when none is given: the
+// null caption the model was trained with for classifier-free guidance,
+// every key of the structured caption with every value empty
+// (DEFAULT_NEGATIVE_PROMPT). A negative is encoded AS GIVEN -- neither
+// cleaned like a generation's caption nor shown the pictures an edit
+// edits -- which is how the reference's encode_prompt takes it.
+inline constexpr const char* kNullCaption =
+    "{\"short_description\":\"\",\"objects\":[],\"background_setting\":"
+    "\"\",\"lighting\":{},\"aesthetics\":{},\"photographic_"
+    "characteristics\":{},\"style_medium\":\"\",\"context\":\"\","
+    "\"artistic_style\":\"\"}";
+
 // The texts of the caption's text_render entries that have text, in
 // order -- the images a text-image renderer draws. Empty for a prompt
 // without a JSON caption.

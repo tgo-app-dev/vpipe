@@ -16,12 +16,15 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #endif
 
 #include <memory>
@@ -116,8 +119,9 @@ const ConfigKey kAttrs[] = {
   {.key = "frames", .type = ConfigType::Int, .required = false,
    .doc = "the GENERATED frame count at 24 fps, snapped up to the next "
           "17n+5. MUST MATCH the generate-video stage's `frames`: it is the "
-          "duration every reference is truncated to, and the layout the DiT "
-          "builds is sized from the same number",
+          "duration every reference is truncated to (but those "
+          "`whole_references` keeps), and the layout the DiT builds is "
+          "sized from the same number",
    .def_int = 121},
   {.key = "reference_image_short_edge", .type = ConfigType::Int,
    .required = false,
@@ -178,6 +182,21 @@ const ConfigKey kAttrs[] = {
           "and not a single switch, because a request may legitimately carry "
           "both an attached soundtrack and a standalone piece of music. A "
           "beat's own `attach` sideband overrides this for that beat",
+   .def_str = ""},
+  {.key = "whole_references", .type = ConfigType::Array, .required = false,
+   .doc = "references kept WHOLE, by their number in the request (1..12: "
+          "the `references` list first, then the iports in order, a "
+          "soundtrack attached to a clip counting with it): NOT truncated "
+          "to the generated duration, frames and soundtrack alike. Every "
+          "other reference is, as the released recipe truncates them all, "
+          "so this is off that recipe -- a song drawn on as a whole, say. "
+          "A kept clip is a block of rows the DiT attends to on every step "
+          "and moves the generated rows on along the shared clock. A list "
+          "file kept whole is read to at most 4096 frames (its soundtrack "
+          "cut to match) and refused, before it is read, when decoding it "
+          "whole would not fit in memory; a long one that does is refused "
+          "later by the prompt cap or the denoise's scratch preflight. A "
+          "picture has no duration to keep and is ignored",
    .def_str = ""},
   {.key = "video_sample_fps", .type = ConfigType::Real, .required = false,
    .doc = "the rate the CONDITIONER reads a video reference at -- every "
@@ -454,6 +473,31 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
         fail_config(fmt(
             "VideoRefEncoderStage('{}'): attach_audio must be an array of "
             "reference iport numbers", this->id()));
+      }
+    }
+    if (c.contains("whole_references")) {
+      FlexData v = c.at("whole_references");
+      if (v.is_array()) {
+        auto arr = v.as_array();
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+          const FlexData& e = arr[i];
+          const long long n = e.is_int()  ? e.as_int(0)
+                            : e.is_uint() ? (long long)e.as_uint(0) : -1;
+          if (n < 1) {
+            fail_config(fmt(
+                "VideoRefEncoderStage('{}'): whole_references[{}] is {}; it "
+                "must be a reference's number in the request, from 1",
+                this->id(), i,
+                e.is_int() || e.is_uint() ? std::to_string(n)
+                                          : std::string("not a number")));
+            break;
+          }
+          _whole_refs.push_back((int)n);
+        }
+      } else if (!v.is_null()) {
+        fail_config(fmt(
+            "VideoRefEncoderStage('{}'): whole_references must be an array "
+            "of reference numbers", this->id()));
       }
     }
   }
@@ -998,8 +1042,39 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
 
     // A video reference conditions on its own soundtrack when it has
     // one: the two came out of ONE open container, which is the only
-    // way their clocks stay in sync.
-    auto v = decode_video_file(libs, path, max_seconds,
+    // way their clocks stay in sync. One kept whole is read whole (the
+    // list comes first: its number is its place in it).
+    const bool whole = std::find(_whole_refs.begin(), _whole_refs.end(),
+                                 (int)i + 1) != _whole_refs.end();
+    if (whole) {
+      // READ WHOLE, NOTHING ELSE BOUNDS IT: the frames at the file's own
+      // size to the decoder's backstop, and the canvas copy beside them
+      // -- 25 GB of 1080p before the denoise's preflight or the prompt
+      // cap could refuse the rows. Sized from the probe, before a frame
+      // is read, against the box as it is now (a transient: freed once
+      // the reference is encoded) and never more than half of what it
+      // is believed to have (VPIPE_RAM_LIMIT_MB), the models beside it.
+      const std::size_t need = whole_decode_bytes(
+          *probe, _vid_short_edge, (std::int64_t)_vid_max_pixels,
+          probe->has_audio ? audio_rate : 0);
+      std::size_t room = model_memory::phys_ram() / 2;
+      if (auto* mc = session()->services()->metal_compute()) {
+        const std::size_t avail = mc->memory_budget().available_physical;
+        if (avail > 0) { room = room > 0 ? std::min(room, avail) : avail; }
+      }
+      if (room > 0 && need > room) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference {} ('{}') is kept whole "
+            "(whole_references), and decoding it whole would hold ~{} MB "
+            "({}x{}, {:.1f} s) against the {} MB this box can spare for "
+            "it; trim the file, or leave it out of whole_references to cut "
+            "it to the generated {:.2f} s", this->id(), i + 1, path,
+            need >> 20, probe->width, probe->height,
+            probe->duration_seconds, room >> 20, max_seconds));
+        return false;
+      }
+    }
+    auto v = decode_video_file(libs, path, whole ? 0.0 : max_seconds,
                                probe->has_audio ? audio_rate : 0, &derr);
     if (!v) {
       session()->warn(fmt(
@@ -1031,6 +1106,21 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
           "VideoRefEncoderStage('{}'): reference {} truncated to a single "
           "frame at {} frames; conditioning on it as a still", this->id(),
           i + 1, aligned));
+    }
+    // Kept whole, but the frames stopped at the decoder's backstop: the
+    // soundtrack (decoded to the file's end) is cut to the frames' span,
+    // or it would run on past the last frame along the shared clock.
+    if (whole && v->cut_short && m.kind == h3::MediaReference::Kind::kVideo) {
+      const double kept = m.fps > 0.0 ? (double)m.num_frames / m.fps : 0.0;
+      const bool cut = trim_soundtrack_to_frames(&m);
+      if (cut || probe->duration_seconds > kept + 0.5) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference {} ('{}') is kept whole, "
+            "but the decoder stops at {} frames: {:.2f} s of {:.2f} s{}",
+            this->id(), i + 1, path, m.num_frames, kept,
+            probe->duration_seconds,
+            cut ? "; its soundtrack is cut to match" : ""));
+      }
     }
     out->push_back(std::move(m));
   }
@@ -1180,6 +1270,64 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
   } else {
     out->fps = h3::kFps;
   }
+  return true;
+}
+
+std::size_t
+VideoRefEncoderStage::whole_decode_bytes(const MediaProbe& p, int short_edge,
+                                         std::int64_t max_pixels,
+                                         int audio_rate)
+{
+  if (p.width <= 0 || p.height <= 0) { return 0; }
+  // The frames the decoder will read: what the container claims, else
+  // its length at its rate, never past the backstop -- and the backstop
+  // itself when it says neither.
+  long long n = kMaxDecodedVideoFrames;
+  if (p.nb_frames > 0) {
+    n = p.nb_frames;
+  } else if (p.fps > 0.0 && p.duration_seconds > 0.0) {
+    n = (long long)std::ceil(p.duration_seconds * p.fps);
+  }
+  n = std::clamp<long long>(n, 1, kMaxDecodedVideoFrames);
+  const std::size_t px = (std::size_t)p.width * (std::size_t)p.height;
+  std::size_t bytes = (std::size_t)n * 3 * px;
+  // The canvas copy, by the resize's own rule: every frame at 24 fps.
+  const double fps = p.fps > 0.0 ? p.fps : h3::kFps;
+  int nf = 0, th = 0, tw = 0;
+  if (h3::video_reference_geometry((int)n, p.height, p.width, fps,
+                                   std::numeric_limits<int>::max(),
+                                   h3::ReferencePlan{}.canvas_multiple,
+                                   short_edge, max_pixels, &nf, &th, &tw)) {
+    bytes += (std::size_t)nf * 3 * (std::size_t)th * (std::size_t)tw;
+  }
+  // The soundtrack: stereo f32, decoded and then normalized.
+  if (p.has_audio && audio_rate > 0) {
+    const double secs = (double)n / fps;
+    bytes += (std::size_t)(secs * audio_rate) * 2 * sizeof(float) * 2;
+  }
+  return bytes;
+}
+
+bool
+VideoRefEncoderStage::trim_soundtrack_to_frames(h3::MediaReference* m)
+{
+  if (m == nullptr || m->channels <= 0 || m->sample_rate <= 0 ||
+      m->fps <= 0.0 || m->num_frames <= 0) {
+    return false;
+  }
+  const std::size_t C = (std::size_t)m->channels;
+  const std::size_t S = m->pcm.size() / C;
+  // The truncation's own rule: int(seconds * rate).
+  const std::size_t keep = (std::size_t)(
+      (double)m->num_frames / m->fps * (double)m->sample_rate);
+  if (keep >= S) { return false; }
+  // Planar: channel c moves from c * S to c * keep, in order, so no
+  // channel is overwritten before it is read.
+  for (std::size_t c = 1; c < C; ++c) {
+    std::memmove(m->pcm.data() + c * keep, m->pcm.data() + c * S,
+                 keep * sizeof(float));
+  }
+  m->pcm.resize(C * keep);
   return true;
 }
 
@@ -1605,6 +1753,26 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
         "denoises at full cost from the prompt alone; if that is the "
         "intent, say so with `references: []`. Skipping", this->id()));
     co_return;
+  }
+
+  // Those kept WHOLE, by their number in this request; every other one
+  // is truncated to the generated duration.
+  for (int n : _whole_refs) {
+    if (n > (int)refs.size()) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): whole_references names reference {} "
+          "but the request has {}; ignored", this->id(), n, refs.size()));
+      continue;
+    }
+    h3::MediaReference& r = refs[(std::size_t)n - 1];
+    if (r.kind == h3::MediaReference::Kind::kImage) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): whole_references names reference "
+          "{}, a picture: it has no duration to keep; ignored", this->id(),
+          n));
+      continue;
+    }
+    r.whole = true;
   }
 
   std::string verr;

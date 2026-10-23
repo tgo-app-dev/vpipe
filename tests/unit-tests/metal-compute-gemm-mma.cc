@@ -188,6 +188,164 @@ TEST(gemm_mma, correctness) {
   }
 }
 
+// THE PRODUCTION TILES AT A DiT's REAL DEPTHS, against f64. `correctness`
+// above holds only the 64x64 reference tile, at K <= 256, to 3e-2 --
+// while every image DiT's block projections run the 128-wide tiles at K
+// 3072..12288 and thousands of rows. Here each production tile at
+// Qwen-Image-2.1's shapes (hidden 4096, ffn 12288; 4160 joint rows at
+// 1024^2, a ragged last row tile): n128 at K 4096 (q / k / v, out,
+// ff-up), the deep n128x256 at K 12288 (ff-down), and tn2 at K 8192
+// (other families' middle depth), each dispatched as the model does --
+// beside the steel tile and the int8 accurate GEMM on the SAME operands.
+// The oracle is f64 from the bf16-rounded inputs over sampled rows: every
+// row tile's first and last row, the tail's, and random ones -- so a
+// tile, a row band or a column region that is wrong shows in the
+// per-row worst as well as the total. Activations carry outlier
+// channels, as a DiT's hidden states do.
+//
+// A bf16 GEMM is held to its output rounding (~1e-3 rel-L2); the int8
+// tier is ~7e-3, so a dense tile at or past the int8 GEMM's distance is
+// a defect, not a precision trade.
+TEST(gemm_mma, production_tiles_match_f64_at_dit_depths) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[gemm_mma] no matrix cores -- the production tiles do "
+                "not run here; skipped\n");
+    return;
+  }
+  ComputeLibrary lib = mc->load_library("dense_gemm_mma_bf16");
+  ComputeLibrary lib_steel = mc->load_library("dense_gemm_bf16");
+  ComputeFunction f_steel = lib_steel.function("dense_gemm_t_bm64bn64_f16");
+  vpipe::genai::I8GemmContext i8(mc, /*want=*/true, /*bf16=*/true);
+  i8.set_tier(vpipe::genai::I8GemmContext::Tier::kAccurate);
+  struct Arm { const char* fn; int rn; int M, N, K; const char* what; };
+  const Arm arms[] = {
+      {"dense_gemm_mma_t_n128_f16", 128, 4160, 12288, 4096, "qkv"},
+      {"dense_gemm_mma_t_n128_f16", 128, 4160, 4096, 4096, "out"},
+      {"dense_gemm_mma_t_n128x256_f16", 256, 4160, 4096, 12288, "ff-down"},
+      {"dense_gemm_mma_t_n128x256_tn2_f16", 512, 4160, 4096, 8192,
+       "mid depth"},
+  };
+  for (const Arm& a : arms) {
+    ComputeFunction fn = lib.function(a.fn);
+    ASSERT_TRUE(fn.valid());
+    if (!fn.valid()) { continue; }
+    const int M = a.M, N = a.N, K = a.K;
+    std::vector<std::uint16_t> x((std::size_t)M * K), W((std::size_t)N * K);
+    {
+      std::mt19937 rng(91 + N + K);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      // Eight outlier channels at 30x: a DiT's hidden states.
+      std::vector<float> cs((std::size_t)K, 1.0f);
+      for (int i = 0; i < 8; ++i) { cs[(std::size_t)(rng() % K)] = 30.0f; }
+      for (std::size_t i = 0; i < x.size(); ++i) {
+        x[i] = f32_to_bf16(nd(rng) * cs[i % (std::size_t)K]);
+      }
+      const float ws = 1.0f / std::sqrt((float)K);
+      for (auto& e : W) { e = f32_to_bf16(nd(rng) * ws); }
+    }
+    // Sampled rows: each 128-row tile's first and last, and 32 random.
+    std::vector<int> rows;
+    for (int m0 = 0; m0 < M; m0 += 128) {
+      rows.push_back(m0);
+      rows.push_back(std::min(M, m0 + 128) - 1);
+    }
+    {
+      std::mt19937 rng(7 + M);
+      for (int i = 0; i < 32; ++i) { rows.push_back((int)(rng() % M)); }
+    }
+    std::vector<double> ref(rows.size() * (std::size_t)N);
+    {
+      std::vector<double> xr((std::size_t)K), wr((std::size_t)N * K);
+      for (std::size_t i = 0; i < wr.size(); ++i) { wr[i] = bf16_to_f32(W[i]); }
+      for (std::size_t r = 0; r < rows.size(); ++r) {
+        const std::size_t m = (std::size_t)rows[r];
+        for (int k = 0; k < K; ++k) {
+          xr[(std::size_t)k] = bf16_to_f32(x[m * K + k]);
+        }
+        for (int n = 0; n < N; ++n) {
+          const double* wn = &wr[(std::size_t)n * K];
+          double acc = 0.0;
+          for (int k = 0; k < K; ++k) { acc += xr[(std::size_t)k] * wn[k]; }
+          ref[r * N + n] = acc;
+        }
+      }
+    }
+    SharedBuffer xb = mc->make_shared_buffer(x.size() * 2);
+    SharedBuffer wb = mc->make_shared_buffer(W.size() * 2);
+    SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * N * 2);
+    ASSERT_TRUE(!xb.empty() && !wb.empty() && !yb.empty());
+    if (xb.empty() || wb.empty() || yb.empty()) { continue; }
+    std::memcpy(xb.contents(), x.data(), x.size() * 2);
+    std::memcpy(wb.contents(), W.data(), W.size() * 2);
+    // rel-L2 over the sampled rows, and the worst single row's.
+    auto score = [&](double* worst) {
+      const auto* yp = static_cast<const std::uint16_t*>(yb.contents());
+      double num = 0.0, den = 0.0;
+      *worst = 0.0;
+      for (std::size_t r = 0; r < rows.size(); ++r) {
+        double rn = 0.0, rd = 0.0;
+        for (int n = 0; n < N; ++n) {
+          const double g = bf16_to_f32(yp[(std::size_t)rows[r] * N + n]);
+          const double e = g - ref[r * N + n];
+          rn += e * e;
+          rd += ref[r * N + n] * ref[r * N + n];
+        }
+        num += rn; den += rd;
+        *worst = std::max(*worst, rd > 0 ? std::sqrt(rn / rd) : 0.0);
+      }
+      return den > 0 ? std::sqrt(num / den) : 0.0;
+    };
+    auto run = [&](const std::function<bool(ComputeEncoder&)>& enc_fn,
+                   double* worst) {
+      std::memset(yb.contents(), 0xff, (std::size_t)M * N * 2);   // NaN
+      CommandStream st = mc->make_command_stream();
+      bool ok = false;
+      {
+        ComputeEncoder enc = st.begin_compute();
+        ok = enc_fn(enc);
+      }
+      st.commit().wait();
+      return ok ? score(worst) : -1.0;
+    };
+    double w_mma = 0.0, w_steel = 0.0, w_i8 = 0.0;
+    const double e_mma = run([&](ComputeEncoder& enc) {
+      enc.set_function(fn);
+      enc.set_buffer(0, xb); enc.set_buffer(1, wb); enc.set_buffer(2, wb);
+      enc.set_buffer(3, yb);
+      enc.set_constant(4, K); enc.set_constant(5, N); enc.set_constant(6, M);
+      enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + a.rn - 1) / a.rn) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+      return true;
+    }, &w_mma);
+    const double e_steel = !f_steel.valid() ? -1.0 : run(
+        [&](ComputeEncoder& enc) {
+          enc.set_function(f_steel);
+          enc.set_buffer(0, xb); enc.set_buffer(1, wb);
+          enc.set_buffer(2, wb); enc.set_buffer(3, yb);
+          enc.set_constant(4, K); enc.set_constant(5, N);
+          enc.set_constant(6, M); enc.set_constant(7, 0);
+          enc.dispatch({(unsigned)(((N + 63) / 64) * 32),
+                        (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+          return true;
+        }, &w_steel);
+    const double e_i8 = !i8.enabled() ? -1.0 : run(
+        [&](ComputeEncoder& enc) {
+          return i8.gemm(enc, xb, 0, wb, yb, 0, M, N, K);
+        }, &w_i8);
+    std::printf("[gemm_mma] %-9s M=%d N=%d K=%d %-33s rel-L2 %.3e (worst "
+                "row %.3e); steel %.3e (%.3e); int8 accurate %.3e (%.3e)\n",
+                a.what, M, N, K, a.fn, e_mma, w_mma, e_steel, w_steel, e_i8,
+                w_i8);
+    EXPECT_TRUE(e_mma >= 0.0 && e_mma < 2e-3 && w_mma < 4e-3);
+    if (e_steel >= 0.0) { EXPECT_TRUE(e_mma <= 1.5 * e_steel + 1e-4); }
+    if (e_i8 >= 0.0) { EXPECT_TRUE(e_mma < e_i8); }
+  }
+}
+
 // Split-K deep-reduction dense GEMM must match the single-op deep kernel
 // (dense_gemm_mma_t_n128x256_f16) within f16 double-rounding. Validates that
 // slice(k0,..) + a compile-time KC contraction extent reads the intended K

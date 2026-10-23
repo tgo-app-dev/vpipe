@@ -66,6 +66,13 @@ inline constexpr std::string_view kReasoningEffortControl =
 // hyper-connections, n-gram embedding and token indexer). The member
 // names inside are Hugging Face's.
 inline constexpr std::string_view kTextConfig = "text_config";
+// object: config.json's `quantization` section exactly as it is spelled --
+// MLX affine's `bits` and `group_size`, and an entry per module that
+// departs from them (an object of its own, or `false` for a module left
+// unquantized) -- for a family that needs the per-module layout before it
+// reads a tensor (Qwen3.8-Flash-Next picks its kernels' group by it).
+// Absent when the config has none.
+inline constexpr std::string_view kQuantization = "quantization";
 }  // namespace model_config
 
 // Parsed view of a Hugging Face `config.json`. Holds the subset of

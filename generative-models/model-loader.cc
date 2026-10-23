@@ -750,6 +750,7 @@ parse_config_(const FlexData& cfg, ModelConfig* out)
   if (outer.contains("quantization")) {
     auto q_fd = outer.at("quantization");
     if (q_fd.is_object()) {
+      bag::set(out->extra, model_config::kQuantization, q_fd);
       auto q = q_fd.as_object();
       if (q.contains("bits")) {
         out->quantization.bits =

@@ -191,5 +191,9 @@ VPIPE_GROUPED_NAX(affine_qmm_grouped_swiglu_nax_w8g64, 8, true)
 VPIPE_GROUPED_NAX(affine_qmm_grouped_nax_w4g64, 4, false)
 VPIPE_GROUPED_NAX(affine_qmm_grouped_nax_w5g64, 5, false)
 VPIPE_GROUPED_NAX(affine_qmm_grouped_nax_w8g64, 8, false)
+// 6-bit experts (the oQ6e packs); group 32 has no twin here (kBK 64 is one
+// group a K step), so a group-32 pack takes the steel GEMMs.
+VPIPE_GROUPED_NAX(affine_qmm_grouped_swiglu_nax_w6g64, 6, true)
+VPIPE_GROUPED_NAX(affine_qmm_grouped_nax_w6g64, 6, false)
 
 #endif  // __HAVE_TENSOR__

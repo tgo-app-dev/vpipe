@@ -742,6 +742,25 @@ kernel void dense_gemv_t_f16(
       x, W, y, K, N, tid, simd_gid, simd_lid);
 }
 
+// The same GEMV for a few rows in ONE dispatch: row r = tid.x (grid.x =
+// 32 * M), each computed exactly as dense_gemv_t_f16 computes it alone --
+// a speculative verify's router rows are its decode's, without a dispatch
+// (and a dispatch's latency) a row.
+kernel void dense_gemv_rows_t_f16(
+    const device VPIPE_ELT* x        [[buffer(0)]],   // [M, K]
+    const device VPIPE_ELT* W        [[buffer(1)]],
+    device VPIPE_ELT*       y        [[buffer(2)]],   // [M, N]
+    const constant int&     K        [[buffer(3)]],
+    const constant int&     N        [[buffer(4)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  dense_gemv_t_impl<VPIPE_ELT, /*RPS=*/4, /*VPT=*/8, /*NSG=*/2>(
+      x + (int64_t)tid.x * K, W, y + (int64_t)tid.x * N, K, N, tid,
+      simd_gid, simd_lid);
+}
+
 // ---- Dense f16 Mixture-of-Experts gather GEMVs (raw-HF bf16 MoE) ---------
 // The dense twins of affine_gather_qmv_swiglu_w4g64 / affine_gather_down /
 // affine_moe_gate: same on-GPU routing contract (pair_eid selects the expert

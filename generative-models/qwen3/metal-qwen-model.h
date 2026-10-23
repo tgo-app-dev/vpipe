@@ -298,6 +298,11 @@ public:
     int   hc_count   = 1;
     int   hc_lowrank = 0;
     bool  hc() const { return hc_count > 1; }
+    // The group every non-expert affine projection is re-encoded at (as
+    // w8): 64 where every such group the checkpoint uses is a multiple of
+    // 64 (oQ5e: 64 / 128), else 32 (MLX's 4-bit packs). Either is
+    // lossless; the experts and the n-gram table keep their own.
+    int   hc_group = 64;
     // The gated-DeltaNet output norm's gate: silu (Qwen3.5) or sigmoid
     // (qwen4_exp's output_gate_type).
     bool  gdn_gate_sigmoid = false;
@@ -548,6 +553,13 @@ public:
   // floor.
   static std::size_t unheld_bytes(const MetalLlamaWeights& wts,
                                   const Config& c);
+  // What a checkpoint's held bytes grow by on the way in: a hyper-
+  // connection model re-encodes its non-expert affine projections to w8
+  // at its group, so a 4-bit pack's hold ~1.8x their size on disk. 0 for
+  // every other model. Beside the two above, what sizes the cache and the
+  // claim's floor.
+  static std::size_t held_growth_bytes(const MetalLlamaWeights& wts,
+                                       const Config& c);
   // How many bytes of cache to give the routed experts of a checkpoint
   // with `experts` of them in a model holding `rest` besides, on a box
   // that may spend `budget` on the whole of it: 0 when all of it fits (keep
@@ -1263,9 +1275,11 @@ private:
   // injection weights ([hc, hc*H]; empty on the final mixer), all w8g64.
   struct HcBlock {
     metal_compute::SharedBuffer norm;
+    // down, and with `inject` the injection's S rows after its R: one
+    // [R + S, S*H] projection (one GEMV a decode step, one GEMM a prefill).
     metal_compute::SharedBuffer dw, ds, db;
     metal_compute::SharedBuffer uw, us, ub;
-    metal_compute::SharedBuffer iw, is, ib;
+    bool inject = false;
   };
 
   // Size-based quantized-matmul entrance: y[M,Nout] = x[M,K] @ dequant(w)^T,
@@ -1494,6 +1508,10 @@ private:
     int se_bits = 4;   // shared expert gate|up (interleaved, so they agree)
     int sd_bits = 4;   // shared expert down (its own tensor, own dispatch)
     int r_bits = 8;    // router (mlp.gate); w8 in every pack seen so far
+    // The routed experts' affine group (64, or 32 in MLX's 4-bit packs of
+    // Qwen3.8-Flash-Next): with the widths it picks their kernels
+    // (expert_fns_).
+    int e_group = 64;
     // Set when gate and up disagree in width: they cannot share one
     // interleaved slab, so each keeps its own [E, I, H] slab at its NATIVE
     // width and the mixed-width fused kernel widens in registers. Costs no
@@ -1583,6 +1601,9 @@ private:
       _fn_rms_rope,
       _fn_mul_sigmoid, _fn_bias_add,
       _fn_head_slice, _fn_sdpa_paged, _fn_sdpa_paged_kvl,
+      // A few rows' paged attention, each row's keys split across 16
+      // simdgroups (Qwen3.8-Flash-Next's decode and verify).
+      _fn_sdpa_paged_split,
       _fn_sdpa_paged_mb256, _fn_sdpa_paged_mb,
       _fn_sdpa_paged_qtile,
       // simdgroup_matrix key-split flash prefill (head_dim 256, drop-in for
@@ -1681,12 +1702,38 @@ private:
       // Hyper-connections + the n-gram PLE (qwen4_hc.metal) and the MoE
       // output written rather than added (metal-qwen-hc.cc).
       _fn_hc_rms, _fn_hc_act, _fn_hc_mix, _fn_hc_inject, _fn_hc_tile,
+      _fn_hc_rms8,   // a prefill's rows, 8 values a load
+      _fn_hc_act_fused,   // the down | inject output split and activated
+      // A decode's and a verify's mixer block in two launches, a row a
+      // grid slice: [RPS / HPS 1, 2, 4] (qwen4_hc.metal hcf_*).
+      _fn_hcf_pre[3], _fn_hcf_up[3],
+      // ...and its MoE in two launches after the routing (affine_qmv.metal
+      // affine_moe_*_fused_w5g64: w5 experts, a w8 shared expert).
+      _fn_moe_up_fused, _fn_moe_down_fused,
+      // ...and its GDN layers between the projections in two (the conv, the
+      // q / k norms, g / beta; the step, its norm and gate).
+      _fn_gdn_prework, _fn_gdn_step_ng,
+      // ...and its full-attention rows into the attention, and back.
+      _fn_hc_attn_prework, _fn_hc_attn_post,
+      // The GDN conv a (token, channel) a thread, then its state tail.
+      _fn_gdn_conv1d_rows, _fn_gdn_conv1d_tail,
       _fn_hc_stream_mean,   // a DFlash drafter's tap: the streams' mean
       _fn_moe_finalize_set, _fn_ple_gate, _fn_ple_conv, _fn_ple_state,
       _fn_hc_qmv8_b4,
+      // The mixers' 10240-wide projections, split along K (affine_qmv.metal
+      // qmv_splitk_w8_impl): 8 runs a row for many outputs, 16 for few.
+      _fn_hc_qmv8_sk8, _fn_hc_qmv8_sk16,
+      // A verify's few router rows in one dispatch (dense_gemm.metal).
+      _fn_hc_dense_gemv_rows,
       // The QSA token indexer (qwen4_hc.metal).
       _fn_qsa_store, _fn_qsa_pool, _fn_qsa_query, _fn_qsa_score,
       _fn_qsa_select, _fn_qsa_attn,
+      _fn_qsa_attn_split,   // a threadgroup a (head, row): 21x past 2051
+      _fn_qsa_attn_part, _fn_qsa_attn_comb,   // ...its keys in chunks
+      _fn_qsa_attn_mma,     // a prefill's rows: a kv head's q-heads as tiles
+      _fn_qsa_score_mma,    // a prefill's rows' block scores as tiles
+      _fn_qsa_score_simd,   // a few rows': a simdgroup a (block, row)
+      _fn_qsa_attn_nax,     // ... on the matrix units (M5, sdpa_mma.metal)
       // Dense f16 MoE gather GEMVs (raw-HF bf16 MoE): the dense twins of the
       // affine gather_swiglu / gather_down / moe_gate above.
       _fn_moe_gather_swiglu_dense, _fn_moe_gather_down_dense,
@@ -2051,7 +2098,12 @@ private:
   // Allocated once per mtp_decode and reused across rounds.
   struct GdnVerifyCache {
     std::vector<int>                         layers;
+    // `qkv` holds each row's pre-conv qkv, or -- `full`, the forward ran
+    // the fused layer (qwen3_5_gdn_prework / step_norm_gate) -- the in-
+    // projection's whole row (qkv | z | a | b), so the replay runs those
+    // same two kernels on the same bytes.
     std::vector<metal_compute::SharedBuffer> qkv, gbuf, betabuf;
+    bool                                     full = false;
   };
 
   // What the DFlash decode adds to mtp_verify_chunk_.
@@ -2407,6 +2459,7 @@ private:
   // per-expert tensors; the rest of the model wired through _xwire.
   bool _xstream = false;
   int _x_gb = 4, _x_db = 4;          // affine gate|up / down widths
+  int _x_group = 64;                 // ...and their group
   std::unique_ptr<MoeExpertCache> _xc;
   std::unique_ptr<SafetensorsRanges> _xranges;
   std::unique_ptr<WiredPool> _xwire;
@@ -2498,6 +2551,9 @@ private:
   static constexpr int kSampM = 64;
   static constexpr int kSampB = 1024;
   metal_compute::SharedBuffer _d_argmax_part;
+  metal_compute::SharedBuffer _hc_pick;   // HcRun::pick's id
+  // forward_hc_'s own scratch, a slot a call, kept between forwards.
+  std::vector<metal_compute::SharedBuffer> _hc_scratch;
   metal_compute::SharedBuffer _d_smp_maxpart, _d_smp_hpart, _d_smp_hist,
       _d_smp_maxl, _d_smp_wt, _d_smp_pickpart;
   // Flash-decode-GQA partials (f32): un-normalized O [Hq,split,D], m/l
@@ -2554,7 +2610,9 @@ private:
     std::string shard;                 // "<..>.shards." -- then i + ".weight"
     std::int64_t shard_rows = 0;       // rows per table shard
     int head_dim = 0;                  // values a row (ple_dim / heads)
-    int bits = 0, group = 0;           // the table's affine layout
+    int bits = 0, group = 0;           // the table's affine layout (bits
+                                       // 0: unquantized, dense_dtype)
+    std::string dense_dtype;
     std::size_t row_w = 0, row_s = 0;  // a row's code / scale bytes
     bool scales_bf16 = true;
     float scale = 1.0f;                // ngram_embedding.weight_scale
@@ -2611,6 +2669,14 @@ private:
     const std::vector<int>* tap_layers = nullptr;
     const metal_compute::SharedBuffer* taps = nullptr;
     int tap_row0 = 0;
+    // The last row's argmax (the host's: the lowest index of the largest)
+    // picked on the GPU and written here, in place of its logits read back
+    // (an MTP draft's: 248320 of them converted for one id).
+    std::int32_t* pick = nullptr;
+    // Encoded after the head, before the forward's one wait: a verify's
+    // picks at every row (argmax, or a sample), which a command buffer of
+    // their own, committed and waited for, cost each round.
+    std::function<void(metal_compute::ComputeEncoder&)> tail;
   };
   std::vector<float> forward_hc_(ContextId cid,
                                  std::span<const std::int32_t> ids,
@@ -2630,8 +2696,9 @@ private:
   struct HcMtp {
     Layer ly;
     HcBlock mix;
-    metal_compute::SharedBuffer few, fes, feb;   // fc_embedding, w8g64
-    metal_compute::SharedBuffer fhw, fhs, fhb;   // fc_hidden, w8g64
+    // fc_embedding, fc_hidden: w8 at the model's group, or dense
+    metal_compute::SharedBuffer few, fes, feb;
+    metal_compute::SharedBuffer fhw, fhs, fhb;
     metal_compute::SharedBuffer ne, nh;          // pre-fc norms, f32 1 + w
     std::unique_ptr<ContextManager> ctx;         // the head's KV + QSA keys
     // Per main context: the head's context, which pairs every main
@@ -2698,6 +2765,51 @@ private:
   bool hc_refuse_embeddings_();
   // An affine tensor's code width from its packed columns and input K.
   int affine_bits_of_(const std::string& base, int K) const;
+  int affine_group_of_(const std::string& base, int K) const;
+public:
+  // A hyper-connection model's weight layout as loaded, one line ("" for
+  // any other model): the projections' group, the router, the experts'
+  // format, the shared expert, whether the decode's fused MoE launch
+  // serves it, and the MTP head's where it differs. Logged at load; the
+  // flavor tests assert it.
+  std::string hc_layout() const;
+private:
+  // A hyper-connection model's token table or head [vocab, hidden]: w8 at
+  // its group, as its projections (lossless); dense where the pack left it
+  // unquantized (`s` empty).
+  bool load_hc_table_(const std::string& base, metal_compute::SharedBuffer& w,
+                      metal_compute::SharedBuffer& s,
+                      metal_compute::SharedBuffer& b, std::string* err);
+
+  // ---- Routed-expert kernels by format --------------------------------
+  // One routed-expert format's kernels (width, group): the pair gathers,
+  // the grouped GEMVs and steel GEMMs, and their NAX twins (null where
+  // none: group 32). The group-64 widths 4 / 5 / 8 name the handles
+  // above, so a model on them dispatches as it always did; the others
+  // load on first use (ensure_expert_fns_, at layer build) and are owned
+  // here. The hyper-connection decode's fused MoE launch is keyed by the
+  // shared expert's group too (fused_moe_fns_).
+  struct ExpertFns {
+    const metal_compute::ComputeFunction* gather_swiglu = nullptr;
+    const metal_compute::ComputeFunction* gather_down = nullptr;
+    const metal_compute::ComputeFunction* grouped_swiglu = nullptr;
+    const metal_compute::ComputeFunction* grouped_down = nullptr;
+    const metal_compute::ComputeFunction* qmm_swiglu = nullptr;
+    const metal_compute::ComputeFunction* qmm_down = nullptr;
+    const metal_compute::ComputeFunction* nax_swiglu = nullptr;
+    const metal_compute::ComputeFunction* nax_down = nullptr;
+  };
+  struct FusedMoeFns {
+    const metal_compute::ComputeFunction* up = nullptr;
+    const metal_compute::ComputeFunction* down = nullptr;
+  };
+  std::unordered_map<int, ExpertFns> _xfns;       // width * 1000 + group
+  std::unordered_map<int, FusedMoeFns> _xfused;   // see fused_moe_fns_
+  std::deque<metal_compute::ComputeFunction> _xfn_own;
+  // Null when the format has no kernels (a width the gathers do not take).
+  const ExpertFns* expert_fns_(int bits, int group) const;
+  bool ensure_expert_fns_(int bits, int group);
+  const FusedMoeFns* fused_moe_fns_(int bits, int group, int sgroup) const;
   // forward_hc_'s head output ([rows, vocab], compute dtype) -- kept for
   // the GPU sampler of a decode step -- and the once-per-model warning that
   // the QSA indexer is not run.

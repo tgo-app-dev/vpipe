@@ -1478,8 +1478,14 @@ MetalFibo2Transformer::build_rope_(const fibo2::Layout& lay,
 
 bool
 MetalFibo2Transformer::set_text(const SharedBuffer& bundles, int text_len,
-                                std::string* err)
+                                std::string* err, int slot)
 {
+  if (slot < 0 || slot >= kTextSlots) {
+    if (err != nullptr) {
+      *err = "fibo2 set_text: no text slot " + std::to_string(slot);
+    }
+    return false;
+  }
   const std::size_t need = (std::size_t)_cfg.n_bundles() *
                            (std::size_t)(text_len > 0 ? text_len : 0) *
                            (std::size_t)_cfg.cap_dim * 2;
@@ -1491,22 +1497,38 @@ MetalFibo2Transformer::set_text(const SharedBuffer& bundles, int text_len,
     }
     return false;
   }
+  TextState& ts = _txt[slot];
   // A handle on the caller's buffer, not a copy: a subview shares its
   // allocation.
-  _text = bundles.subview(0, need);
-  if (_text.empty()) {
+  ts.text = bundles.subview(0, need);
+  if (ts.text.empty()) {
     if (err != nullptr) { *err = "fibo2 set_text: no handle on the text"; }
     return false;
   }
-  _text_len = text_len;
-  _text_dirty = true;
-  _gist_n = fibo2::gist_count(text_len, _cfg.min_gist, _cfg.max_gist,
-                              _cfg.gist_step, _cfg.gist_min_text,
-                              _cfg.gist_max_text);
-  _gist = {};
-  _inj_k.clear();
-  _inj_v.clear();
+  ts.text_len = text_len;
+  ts.dirty = true;
+  ts.gist_n = fibo2::gist_count(text_len, _cfg.min_gist, _cfg.max_gist,
+                                _cfg.gist_step, _cfg.gist_min_text,
+                                _cfg.gist_max_text);
+  ts.gist = {};
+  ts.inj_k.clear();
+  ts.inj_v.clear();
   return true;
+}
+
+void
+MetalFibo2Transformer::clear_text(int slot)
+{
+  if (slot >= 0 && slot < kTextSlots) { _txt[slot] = TextState{}; }
+}
+
+std::size_t
+MetalFibo2Transformer::TextState::bytes() const
+{
+  std::size_t n = gist.byte_size();
+  for (const SharedBuffer& b : inj_k) { n += b.byte_size(); }
+  for (const SharedBuffer& b : inj_v) { n += b.byte_size(); }
+  return n;
 }
 
 // ---- forward --------------------------------------------------------
@@ -1522,14 +1544,19 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   if (req.layout == nullptr || req.latents == nullptr) {
     return fail("fibo2 forward: missing input");
   }
-  if (_text_len <= 0 || (_text_dirty && _text.empty())) {
+  if (req.text_slot < 0 || req.text_slot >= kTextSlots) {
+    return fail("fibo2 forward: no text slot " +
+                std::to_string(req.text_slot));
+  }
+  TextState& ts = _txt[req.text_slot];
+  if (ts.text_len <= 0 || (ts.dirty && ts.text.empty())) {
     return fail("fibo2 forward: no text was set (set_text)");
   }
   const fibo2::Layout& lay = *req.layout;
   const int H = _cfg.hidden, NH = _cfg.n_heads, Hd = _cfg.head_dim;
   const int FFI = _cfg.ffn_inner, PD = _cfg.patch_dim();
   const int JT = lay.joint_len(), RT = lay.refiner_len();
-  const int IMG = lay.img_tokens, G = lay.gist, T = _text_len;
+  const int IMG = lay.img_tokens, G = lay.gist, T = ts.text_len;
   const int CAP = _cfg.cap_dim;
   const int NM = _cfg.n_mod_blocks();
   if (JT <= 0 || IMG <= 0 || NH * Hd != H) {
@@ -1537,10 +1564,10 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   }
   // THE GIST COUNT IS THE TEXT'S, and the layout has to agree with it:
   // the gist rows are a function of the text alone.
-  if (G != _gist_n || (int)lay.pos_t.size() != JT) {
+  if (G != ts.gist_n || (int)lay.pos_t.size() != JT) {
     return fail("fibo2 forward: the layout's gist count (" +
                 std::to_string(G) + ") is not the text's (" +
-                std::to_string(_gist_n) + ")");
+                std::to_string(ts.gist_n) + ")");
   }
   if (!_steel_attn_ok) {
     return fail("fibo2 forward: the steel attention kernel is "
@@ -1614,22 +1641,22 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // The text's pass (see below): projections of a bundle, [T, H] each,
   // and what it leaves for every later forward.
   SharedBuffer tk, tv, tkh, tvh;
-  if (_text_dirty) {
+  if (ts.dirty) {
     tk = buf((std::size_t)T * H);
     tv = buf((std::size_t)T * H);
     tkh = buf((std::size_t)T * H);
     tvh = buf((std::size_t)T * H);
-    _gist = buf((std::size_t)G * H);
-    _inj_k.clear();
-    _inj_v.clear();
-    _inj_k.resize(_inject.size());
-    _inj_v.resize(_inject.size());
+    ts.gist = buf((std::size_t)G * H);
+    ts.inj_k.clear();
+    ts.inj_v.clear();
+    ts.inj_k.resize(_inject.size());
+    ts.inj_v.resize(_inject.size());
     bool ok = !tk.empty() && !tv.empty() && !tkh.empty() && !tvh.empty() &&
-              !_gist.empty();
+              !ts.gist.empty();
     for (std::size_t i = 0; ok && i < _inject.size(); ++i) {
-      _inj_k[i] = buf((std::size_t)T * H);
-      _inj_v[i] = buf((std::size_t)T * H);
-      ok = !_inj_k[i].empty() && !_inj_v[i].empty();
+      ts.inj_k[i] = buf((std::size_t)T * H);
+      ts.inj_v[i] = buf((std::size_t)T * H);
+      ok = !ts.inj_k[i].empty() && !ts.inj_v[i].empty();
     }
     if (!ok) { return fail("fibo2 forward: text scratch allocation failed"); }
   }
@@ -2228,7 +2255,7 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       lin(nrm, 0, in.ca.qw, qb, 0, rows, H, H);
       rms(qb, 0, in.ca.nq, qb, 0, rows * NH, Hd);
       transpose(qb, qh, rows, NH);
-      attend(qh, _inj_k[k], _inj_v[k], ao, rows, T);
+      attend(qh, ts.inj_k[k], ts.inj_v[k], ao, rows, T);
       transpose(ao, nrm, NH, rows);
       lin(nrm, 0, in.ca.ow, ob, 0, rows, H, H);
       rms(ob, 0, in.n2, ob, 0, rows, H);
@@ -2378,22 +2405,22 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // ONCE PER TEXT, on the first forward after set_text and on its
   // stream, ahead of its blocks: every one of these is a function of the
   // text alone, which the reference recomputes at every step.
-  if (_text_dirty) {
+  if (ts.dirty) {
     const std::size_t bstride = (std::size_t)T * CAP;
     // A cross-attention's keys (normed) and values over text bundle
     // `te`, head-major [NH, T, Hd].
     auto text_kv = [&](const CrossAttn& ca, std::size_t te,
                        const SharedBuffer& ko, const SharedBuffer& vo) {
-      lin(_text, te, ca.kw, tk, 0, T, H, CAP);
+      lin(ts.text, te, ca.kw, tk, 0, T, H, CAP);
       rms(tk, 0, ca.nk, tk, 0, T * NH, Hd);
       transpose(tk, ko, T, NH);
-      lin(_text, te, ca.vw, tv, 0, T, H, CAP);
+      lin(ts.text, te, ca.vw, tv, 0, T, H, CAP);
       transpose(tv, vo, T, NH);
     };
-    copy_rows(_queries, 0, _gist, 0, G, H, H, H);
+    copy_rows(_queries, 0, ts.gist, 0, G, H, H, H);
     for (const PerceiverLayer& l : _perceiver) {
       // Cross-attention to bundle 0.
-      rms(_gist, 0, l.n_ca, nrm, 0, G, H);
+      rms(ts.gist, 0, l.n_ca, nrm, 0, G, H);
       lin(nrm, 0, l.ca.qw, qb, 0, G, H, H);
       rms(qb, 0, l.ca.nq, qb, 0, G * NH, Hd);
       transpose(qb, qh, G, NH);
@@ -2401,9 +2428,9 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       attend(qh, tkh, tvh, ao, G, T);
       transpose(ao, nrm, NH, G);
       lin(nrm, 0, l.ca.ow, ob, 0, G, H, H);
-      resid(_gist, 0, ob, 0, G * H);
+      resid(ts.gist, 0, ob, 0, G * H);
       // Self-attention, no rotary.
-      rms(_gist, 0, l.n_sa, nrm, 0, G, H);
+      rms(ts.gist, 0, l.n_sa, nrm, 0, G, H);
       lin(nrm, 0, l.sq, qb, 0, G, H, H);
       lin(nrm, 0, l.sk, kb, 0, G, H, H);
       lin(nrm, 0, l.sv, vb, 0, G, H, H);
@@ -2415,20 +2442,20 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       attend(qh, kh, vh, ao, G, G);
       transpose(ao, nrm, NH, G);
       lin(nrm, 0, l.so, ob, 0, G, H, H);
-      resid(_gist, 0, ob, 0, G * H);
+      resid(ts.gist, 0, ob, 0, G * H);
       // SwiGLU.
-      rms(_gist, 0, l.n_ff, nrm, 0, G, H);
+      rms(ts.gist, 0, l.n_ff, nrm, 0, G, H);
       lin(nrm, 0, l.w1, ffg, 0, G, FFI, H);
       lin(nrm, 0, l.w3, ffu, 0, G, FFI, H);
       swiglu(ffg, ffu, ffg, G * FFI);
       lin(ffg, 0, l.w2, ob, 0, G, H, FFI);
-      resid(_gist, 0, ob, 0, G * H);
+      resid(ts.gist, 0, ob, 0, G * H);
     }
-    rms(_gist, 0, _p_norm_out, _gist, 0, G, H);
+    rms(ts.gist, 0, _p_norm_out, ts.gist, 0, G, H);
     for (std::size_t i = 0; i < _inject.size(); ++i) {
-      text_kv(_inject[i].ca, (i + 1) * bstride, _inj_k[i], _inj_v[i]);
+      text_kv(_inject[i].ca, (i + 1) * bstride, ts.inj_k[i], ts.inj_v[i]);
     }
-    trace("gist", _gist, (std::size_t)G * H);
+    trace("gist", ts.gist, (std::size_t)G * H);
     mark("text");
   }
 
@@ -2440,7 +2467,7 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // gist can take its place now.
   lin(*req.latents, 0, _x_in, joint, 0, RT, H, PD);
   bias(_x_in_b, joint, 0, RT, H);
-  copy_rows(_gist, 0, joint, (std::size_t)RT * H, G, H, H, H);
+  copy_rows(ts.gist, 0, joint, (std::size_t)RT * H, G, H, H, H);
   trace("embed", joint, (std::size_t)JT * H);
   mark("embed");
 
@@ -2545,15 +2572,21 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // and context rows, the main stack over those and the gist -- and a
   // prepare() at a new count rebuilt the scratch. Reserved at the
   // largest Sage will see, the smaller calls reuse it; a forward at the
-  // same size builds nothing. (The cross-attentions run dense.)
+  // same size builds nothing. (The cross-attentions run dense.) A GUIDED
+  // generation alternates two joint lengths, the prompt's gist and the
+  // negative's over the same rows, so the main stack is reserved at the
+  // longer of the texts held: reserved at its own, each pass rebuilt the
+  // scratch the other had just built.
   if (_sage && nax && _cfg.sage.enabled && _sage_reserve) {
     int big = 0;
     auto take = [&](int rows) {
       if (rows >= kSageMinSegment) { big = std::max(big, rows); }
     };
+    int gmax = G;
+    for (const TextState& t : _txt) { gmax = std::max(gmax, t.gist_n); }
     // The noise refiner is blocks 0 .. n_refiner - 1 to dense_layers.
     if (_cfg.sage.dense_layers < _cfg.n_refiner) { take(RT); }
-    if (_cfg.sage.dense_layers < NM) { take(JT); }
+    if (_cfg.sage.dense_layers < NM) { take(RT + gmax); }
     std::string rerr;
     if (big > 0 &&
         !_sage->reserve(NH, NH, big, big, Hd, A_BQ, A_BK,
@@ -2782,9 +2815,9 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   // The text's pass ran with this forward; the bundles are not read
   // again until the next set_text.
-  if (_text_dirty) {
-    _text_dirty = false;
-    _text = {};
+  if (ts.dirty) {
+    ts.dirty = false;
+    ts.text = {};
   }
   if (_fast_failed) {
     _fast_failed = false;
@@ -3429,11 +3462,10 @@ MetalFibo2Transformer::resident_bytes() const
     n += cross(in.ca) + in.n1.byte_size() + in.n2.byte_size() +
          in.gate.byte_size();
   }
-  // And what the text left for the forwards: the gist rows and every
-  // injection block's keys and values, a prompt's worth.
-  n += _gist.byte_size();
-  for (const SharedBuffer& b : _inj_k) { n += b.byte_size(); }
-  for (const SharedBuffer& b : _inj_v) { n += b.byte_size(); }
+  // And what the texts left for the forwards: the gist rows and every
+  // injection block's keys and values, a prompt's worth a slot (two
+  // under guidance).
+  for (const TextState& t : _txt) { n += t.bytes(); }
   // `_blocks` IS the answer in both modes, and adding the residency
   // ledger to it would double every promoted block. Preloaded, it holds
   // the whole stack and `_resid` is empty; streaming, it holds exactly
@@ -3456,7 +3488,8 @@ MetalFibo2Transformer::release_forward_scratch()
 std::size_t
 MetalFibo2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
                                               int txt_rows, bool packed,
-                                              bool matrix_cores)
+                                              bool matrix_cores,
+                                              int neg_txt_rows)
 {
   // Mirrors forward(): `img_rows` the image's and every context image's
   // rows (the refiner's), `txt_rows` the text's tokens (<= 0: the
@@ -3468,21 +3501,35 @@ MetalFibo2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
   // every injection block's keys and values. Held between forwards too:
   // a pack's dense stand-in, the int8 context, Sol's and Sage's scratch
   // (MetalZImageTransformer's notes; this is that class's arithmetic).
+  //
+  // A guided generation runs a second text, the negative, between the
+  // prompt's forwards: its pass leaves its own gist and keys and values
+  // beside the prompt's, and its forward's planes are the larger set
+  // when its gist is (the two forwards never overlap).
   if (img_rows <= 0) { return 0; }
-  const std::size_t T = txt_rows > 0 ? (std::size_t)txt_rows
-                                     : (std::size_t)c.gist_max_text;
-  const std::size_t G = (std::size_t)fibo2::gist_count(
-      (int)T, c.min_gist, c.max_gist, c.gist_step, c.gist_min_text,
-      c.gist_max_text);
+  auto rows_of = [&](int r) {
+    return r > 0 ? (std::size_t)r : (std::size_t)c.gist_max_text;
+  };
+  auto gist_of = [&](std::size_t t) {
+    return (std::size_t)fibo2::gist_count(
+        (int)t, c.min_gist, c.max_gist, c.gist_step, c.gist_min_text,
+        c.gist_max_text);
+  };
+  const bool guided = neg_txt_rows >= 0;
+  const std::size_t T = rows_of(txt_rows);
+  const std::size_t Tn = guided ? rows_of(neg_txt_rows) : 0;
+  const std::size_t G = gist_of(T);
+  const std::size_t Gn = guided ? gist_of(Tn) : 0;
   const std::size_t RT = (std::size_t)img_rows;
-  const std::size_t JT = RT + G;
+  const std::size_t JT = RT + std::max(G, Gn);
   const std::size_t H = (std::size_t)c.hidden;
   const std::size_t F = (std::size_t)c.ffn_inner;
   const std::size_t Hd = (std::size_t)c.head_dim;
   const std::size_t NI = c.injection_ids.size();
   std::size_t n = 10 * JT * H * 2 + 2 * JT * F * 2 + 2 * JT * Hd * 4 +
                   RT * (std::size_t)c.patch_dim() * 2;
-  n += 4 * T * H * 2 + G * H * 2 + 2 * NI * T * H * 2;
+  n += 4 * std::max(T, Tn) * H * 2 + G * H * 2 + 2 * NI * T * H * 2;
+  if (guided) { n += Gn * H * 2 + 2 * NI * Tn * H * 2; }
   if (packed) { n += F * H * 2; }
   const int NH = c.n_heads;
   // Sol on either arm: the matrix-core one's bf16 partial, or the ALU

@@ -113,6 +113,14 @@ struct MediaReference {
   // generator -- is telling the encoder to leave that one alone, and it
   // may be telling it about only one of nine.
   int short_edge = -1;
+
+  // Kept WHOLE: not truncated to the generated duration, as every other
+  // reference is -- its frames and its soundtrack alike, since the
+  // layout's clock moves on by the longer of the two and cutting one
+  // would skew them. Off the released recipe, which truncates them all:
+  // a caller's choice (a song drawn on as a whole), and a long clip so
+  // kept is a long block of rows on every step.
+  bool whole = false;
 };
 
 // What the encoder had to do to a reference to make it fit.
@@ -360,6 +368,12 @@ bool condition_frame_indices(int num_frames, double fps, double sample_fps,
 bool validate_reference_request(const std::vector<MediaReference>& refs,
                                 const ReferenceLimits& limits,
                                 std::string* err = nullptr);
+
+// The seconds a reference's soundtrack is cut to (at its own rate, by
+// normalize_audio_reference): `max_seconds`, the generated duration --
+// or, kept WHOLE, its own length and a second, so the int() of
+// seconds * rate takes every sample.
+double audio_reference_seconds(const MediaReference& m, double max_seconds);
 
 // Normalize and encode a whole `ref2va` request.
 //

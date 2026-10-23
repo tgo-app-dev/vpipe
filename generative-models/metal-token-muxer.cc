@@ -15,13 +15,16 @@ MetalTokenMuxer::MetalTokenMuxer(metal_compute::MetalCompute* mc,
                                  const SharedBuffer* w,
                                  const SharedBuffer* scales,
                                  const SharedBuffer* biases, int hidden,
-                                 bool bf16, int quant_bits)
+                                 bool bf16, int quant_bits, int group)
     : _mc(mc), _w(w), _scales(scales), _biases(biases), _hidden(hidden)
 {
-  if (mc != nullptr && mc->valid()) {
+  // A width / group no gather takes leaves _fn invalid (valid() says so).
+  const bool ok = group == 64 || (quant_bits == 8 && group == 32);
+  if (mc != nullptr && mc->valid() && ok) {
     _lib = mc->load_library(bf16 ? "llm_elementwise_bf16" : "llm_elementwise");
-    _fn = _lib.function(quant_bits == 8 ? "dequant_embed_gather_w8_f16"
-                                        : "dequant_embed_gather_f16");
+    _fn = _lib.function(quant_bits != 8 ? "dequant_embed_gather_f16"
+                        : group == 32   ? "dequant_embed_gather_w8_g32_f16"
+                                        : "dequant_embed_gather_w8_f16");
   }
 }
 

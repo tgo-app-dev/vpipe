@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace vpipe {
 namespace genai {
@@ -227,6 +228,14 @@ vae_frames_(bool video, int nf, const MetalMiniMaxH3VideoVae::Config& vc)
   return use;
 }
 
+// The frames a video reference is truncated to: the generated count, or
+// -- kept whole -- all it has.
+int
+target_frames_(const MediaReference& m, const ReferencePlan& plan)
+{
+  return m.whole ? std::numeric_limits<int>::max() : plan.target_frames;
+}
+
 // What one reference will cost, in the unit ReferenceEncoders::progress
 // counts: pixel-frames through the video VAE, padded to whole clips as
 // encode_video pads them (`vae`), plus one frame of the canvas for the
@@ -257,9 +266,10 @@ reference_work_(const MediaReference& m, const ReferencePlan& plan,
     const int edge =
         m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
     if (!video_reference_geometry(m.num_frames, m.height, m.width, m.fps,
-                                  plan.target_frames, plan.canvas_multiple,
-                                  edge, plan.canvas_max_pixels, &nf, &th,
-                                  &tw, kFps)) {
+                                  target_frames_(m, plan),
+                                  plan.canvas_multiple, edge,
+                                  plan.canvas_max_pixels, &nf, &th, &tw,
+                                  kFps)) {
       return 1;
     }
   }
@@ -383,6 +393,16 @@ validate_reference_request(const std::vector<MediaReference>& refs,
                 "image or video reference and cannot be used on its own");
   }
   return true;
+}
+
+double
+audio_reference_seconds(const MediaReference& m, double max_seconds)
+{
+  if (!m.whole || m.sample_rate <= 0 || m.channels <= 0) {
+    return max_seconds;
+  }
+  const double samples = (double)(m.pcm.size() / (std::size_t)m.channels);
+  return samples / (double)m.sample_rate + 1.0;
 }
 
 bool
@@ -530,8 +550,9 @@ encode_references(const std::vector<MediaReference>& refs,
       int kept = 0;
       std::string nerr;
       if (!normalize_audio_reference(m.pcm.data(), m.channels, n_samp,
-                                     m.sample_rate, max_seconds, &pcm, &kept,
-                                     &nerr)) {
+                                     m.sample_rate,
+                                     audio_reference_seconds(m, max_seconds),
+                                     &pcm, &kept, &nerr)) {
         return fail(where + ": " + nerr);
       }
       std::vector<float> lat;
@@ -634,7 +655,8 @@ encode_references(const std::vector<MediaReference>& refs,
         const int edge =
             m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
         if (!normalize_video_reference(m.rgb.data(), m.num_frames, m.height,
-                                       m.width, m.fps, plan.target_frames,
+                                       m.width, m.fps,
+                                       target_frames_(m, plan),
                                        plan.canvas_multiple, edge,
                                        plan.canvas_max_pixels, &px, &nf, &th,
                                        &tw, kFps, &nerr)) {

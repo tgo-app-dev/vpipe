@@ -1219,6 +1219,66 @@ METAL_FUNC void qmm_t_grouped_down_impl(
   }
 }
 
+// Group-32 and 6-bit twins of the grouped expert GEMMs (Qwen3.8-Flash-Next's
+// MLX 4-bit pack holds its experts at group 32; the oQ6e pack at 6 bits).
+// The impls take the group and the width as template arguments; BK 32 fits
+// a group of 32 (the loader's BCOLS <= group_size).
+#define VPIPE_QMM_GROUPED_ANY(NAME_SW, NAME_DN, BITS, GS)                     \
+  kernel void NAME_SW(                                                        \
+      const device uint32_t* w       [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                           \
+      const device VPIPE_ELT* biases [[buffer(2)]],                           \
+      const device VPIPE_ELT* x      [[buffer(3)]],                           \
+      device VPIPE_ELT*       y      [[buffer(4)]],                           \
+      const constant int& K          [[buffer(5)]],                           \
+      const constant int& N          [[buffer(6)]],                           \
+      const constant int& M          [[buffer(7)]],                           \
+      const device int* tile2e       [[buffer(8)]],                           \
+      const device int* srow         [[buffer(9)]],                           \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]]) {                         \
+    constexpr int BM = 32, BK = 32, BN = 32;                                  \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM * BK_padded];                                 \
+    threadgroup VPIPE_ELT Ws[BN * BK_padded];                                 \
+    qmm_t_grouped_swiglu_impl<VPIPE_ELT, GS, BITS, BM, BK, BN>(               \
+        w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, srow,               \
+        tid, simd_gid, simd_lid);                                             \
+  }                                                                           \
+  kernel void NAME_DN(                                                        \
+      const device uint32_t* w       [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                           \
+      const device VPIPE_ELT* biases [[buffer(2)]],                           \
+      const device VPIPE_ELT* x      [[buffer(3)]],                           \
+      device VPIPE_ELT*       y      [[buffer(4)]],                           \
+      const constant int& K          [[buffer(5)]],                           \
+      const constant int& N          [[buffer(6)]],                           \
+      const constant int& M          [[buffer(7)]],                           \
+      const device int* tile2e       [[buffer(8)]],                           \
+      const device int* sdst         [[buffer(9)]],                           \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]]) {                         \
+    constexpr int BM = 32, BK = 32, BN = 32;                                  \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM * BK_padded];                                 \
+    threadgroup VPIPE_ELT Ws[BN * BK_padded];                                 \
+    qmm_t_grouped_down_impl<VPIPE_ELT, GS, BITS, BM, BK, BN>(                 \
+        w, scales, biases, x, y, Xs, Ws, K, N, M, tile2e, sdst,               \
+        tid, simd_gid, simd_lid);                                             \
+  }
+VPIPE_QMM_GROUPED_ANY(affine_qmm_grouped_swiglu_w4g32,
+                      affine_qmm_grouped_w4g32, 4, 32)
+VPIPE_QMM_GROUPED_ANY(affine_qmm_grouped_swiglu_w5g32,
+                      affine_qmm_grouped_w5g32, 5, 32)
+VPIPE_QMM_GROUPED_ANY(affine_qmm_grouped_swiglu_w6g32,
+                      affine_qmm_grouped_w6g32, 6, 32)
+VPIPE_QMM_GROUPED_ANY(affine_qmm_grouped_swiglu_w8g32,
+                      affine_qmm_grouped_w8g32, 8, 32)
+VPIPE_QMM_GROUPED_ANY(affine_qmm_grouped_swiglu_w6g64,
+                      affine_qmm_grouped_w6g64, 6, 64)
+
 // Fused GeGLU MLP GEMM (Gemma-4 prefill): mirrors qmm_t_swiglu_impl
 // verbatim; only the activation in the store is gelu_pytorch_tanh (matches
 // geglu_f16) instead of silu. Interleaved [N=2*ffn, K] weight, output y
@@ -1488,6 +1548,29 @@ kernel void affine_qmm_swiglu_w8g64(
   threadgroup VPIPE_ELT Xs[BM * BK_padded];
   threadgroup VPIPE_ELT Ws[BN * BK_padded];
   qmm_t_swiglu_impl<VPIPE_ELT, 64, 8, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}
+
+// Group-32 twin (a w8g32 shared expert).
+kernel void affine_qmm_swiglu_w8g32(
+    const device uint32_t* w      [[buffer(0)]],
+    const device VPIPE_ELT*     scales [[buffer(1)]],
+    const device VPIPE_ELT*     biases [[buffer(2)]],
+    const device VPIPE_ELT*     x      [[buffer(3)]],
+    device VPIPE_ELT*           y      [[buffer(4)]],
+    const constant int&    K      [[buffer(5)]],
+    const constant int&    N      [[buffer(6)]],   // fused width = 2*ffn
+    const constant int&    M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 32, 8, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M,
       tid, simd_gid, simd_lid);
 }

@@ -1107,6 +1107,177 @@ SAW_INST("sdpa_full_mma2_d512_q32_f16", 512, 32, 128, 8)
 SAW_INST("sdpa_full_mma2_d512_q64_f16", 512, 64, 64, 16)
 #undef SAW_INST
 
+// The QSA (Qwen3.8-Flash-Next) sparse attention for a PREFILL's rows, on
+// the matrix units: a threadgroup a (kv head, row), the group's q-heads the
+// matmul's rows (16, those past the group zero), the row's selected keys
+// (qwen4_hc.metal's qsa_select) gathered from the paged pool BK at a time
+// into threadgroup memory -- the next BK fetched into registers while these
+// are used -- S = Q K^T and O += P V by matmul2d, the softmax online in f32
+// with O register-resident (a cooperative tensor). Each key is read once for
+// the group's 12 heads: the per-head simdgroup kernel read it 12 times, 61
+// ms a 2048-row layer on an M5 Ultra against this 9.4 -- where it moves
+// ~0.9 TB/s, the gathered K/V's own traffic. D == 256, Hq / Hkv <= 16.
+// grid {QN_SG * 32, Hkv, rows}, tg {QN_SG * 32, 1, 1}.
+#define QN_BK 16
+#define QN_SG 8
+namespace {
+struct QnLoc { int page; int slot; };
+inline QnLoc qn_locate_(const device int* pt, int n_pages, int pos) {
+  int lo = 0, hi = n_pages - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (pt[mid * 3 + 2] <= pos) { lo = mid; } else { hi = mid - 1; }
+  }
+  return {pt[lo * 3 + 0], pos - pt[lo * 3 + 2]};
+}
+inline ulong qn_pool_at_(const device int* pt, int n_pages, int pos,
+                         int page_tokens, int hkv, int D, int head) {
+  const QnLoc l = qn_locate_(pt, n_pages, pos);
+  return (((ulong)l.page * hkv + head) * page_tokens + l.slot) * (ulong)D;
+}
+}  // namespace
+
+kernel void qsa_attn_nax_f16(
+    const device VPIPE_ELT* qt    [[buffer(0)]],   // [Hq, n, D]
+    const device VPIPE_ELT* kp    [[buffer(1)]],
+    const device VPIPE_ELT* vp    [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],   // [Hq, n, D]
+    const device int*       pt    [[buffer(4)]],
+    const device int*       sel   [[buffer(5)]],
+    const device int*       nsel  [[buffer(6)]],
+    constant float& scale        [[buffer(7)]],
+    constant int& D              [[buffer(8)]],
+    constant int& Hq             [[buffer(9)]],
+    constant int& Hkv            [[buffer(10)]],
+    constant int& n              [[buffer(11)]],
+    constant int& page_tokens    [[buffer(12)]],
+    constant int& n_pages        [[buffer(13)]],
+    constant int& width          [[buffer(14)]],
+    constant int& r0             [[buffer(15)]],
+    uint3 tg   [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  constexpr int BK = QN_BK, BQ = 16, DD = 256, NT = QN_SG * 32;
+  threadgroup VPIPE_ELT qs[BQ * DD];
+  threadgroup VPIPE_ELT ks[BK * DD];
+  threadgroup VPIPE_ELT vs[BK * DD];
+  threadgroup float sf[BQ * BK];
+  threadgroup VPIPE_ELT ss[BQ * BK];
+  threadgroup float corr[BQ];
+  threadgroup float den[BQ];
+  const int kvh = (int)tg.y, r = (int)tg.z, row = r0 + r;
+  const int G = Hq / Hkv, h0 = kvh * G;
+  // The group's queries, rows past G zero.
+  for (int e = (int)lid; e < BQ * DD / 8; e += NT) {
+    const int hh = e / (DD / 8), d8 = (e % (DD / 8)) * 8;
+    uint4 v = uint4(0);
+    if (hh < G) {
+      v = *(const device uint4*)(qt + ((ulong)(h0 + hh) * n + row) * D + d8);
+    }
+    *(threadgroup uint4*)(qs + hh * DD + d8) = v;
+  }
+  const device int* srow = sel + (ulong)r * width;
+  const int m = nsel[r];
+  const int nch = (m + BK - 1) / BK;
+  // Staging: BK keys x 256 values x (K, V); NT threads, each `per` uint4s
+  // of K and of V.
+  constexpr int U4 = BK * DD / 8 / NT;       // uint4s a thread, each of K, V
+  constexpr int TPK = DD / 8 / U4;           // threads a key
+  const int st = (int)lid / TPK, so = ((int)lid % TPK) * U4 * 8;
+  uint4 kr[U4], vr[U4];
+  auto fetch = [&](int c) {
+    const int j = c * BK + st;
+    if (j < m) {
+      const ulong at =
+          qn_pool_at_(pt, n_pages, srow[j], page_tokens, Hkv, D, kvh) + so;
+      const device uint4* kq = (const device uint4*)(kp + at);
+      const device uint4* vq = (const device uint4*)(vp + at);
+      for (int u = 0; u < U4; ++u) { kr[u] = kq[u]; vr[u] = vq[u]; }
+    } else {
+      for (int u = 0; u < U4; ++u) { kr[u] = uint4(0); vr[u] = uint4(0); }
+    }
+  };
+  using TT = tensor<threadgroup VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  using TF = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+  constexpr auto qk = matmul2d_descriptor(BQ, BK, DD, false, true, false);
+  matmul2d<qk, execution_simdgroups<QN_SG>> opQK;
+  constexpr auto pv = matmul2d_descriptor(
+      BQ, DD, BK, false, false, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<pv, execution_simdgroups<QN_SG>> opPV;
+  TT tQ(qs, dextents<int32_t, 2>(DD, BQ));
+  TT tK(ks, dextents<int32_t, 2>(DD, BK));
+  TT tV(vs, dextents<int32_t, 2>(DD, BK));
+  TT tP(ss, dextents<int32_t, 2>(BK, BQ));
+  TF tS(sf, dextents<int32_t, 2>(BK, BQ));
+  auto cO = opPV.template get_destination_cooperative_tensor<TT, TT, float>();
+  for (auto it = cO.begin(); it != cO.end(); ++it) { *it = 0.0f; }
+  // The softmax: BQ rows x BK keys over NT threads.
+  constexpr int PER = BQ * BK / NT;          // keys a thread
+  constexpr int TPR = BK / PER;              // threads a row
+  const int sr = (int)lid / TPR, sc0 = ((int)lid % TPR) * PER;
+  float mrow = -INFINITY, lrow = 0.0f;
+  fetch(0);
+  for (int c = 0; c < nch; ++c) {
+    for (int u = 0; u < U4; ++u) {
+      *(threadgroup uint4*)(ks + st * DD + so + u * 8) = kr[u];
+      *(threadgroup uint4*)(vs + st * DD + so + u * 8) = vr[u];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (c + 1 < nch) { fetch(c + 1); }
+    auto cS = opQK.template get_destination_cooperative_tensor<TT, TT, float>();
+    opQK.run(tQ, tK, cS);
+    cS.store(tS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sv[PER];
+    float cm = -INFINITY;
+    for (int i = 0; i < PER; ++i) {
+      const int key = c * BK + sc0 + i;
+      sv[i] = key < m ? sf[sr * BK + sc0 + i] * scale : -INFINITY;
+      cm = metal::max(cm, sv[i]);
+    }
+    for (ushort o = TPR / 2; o > 0; o >>= 1) {
+      cm = metal::max(cm, simd_shuffle_xor(cm, o));
+    }
+    const float mnew = metal::max(mrow, cm);
+    const float cr = metal::exp(mrow - mnew);
+    // P enters the values' matmul in the element type, so the row's sum
+    // is taken over THOSE values (qsa_attn_mma_f16 likewise): the weights
+    // the output is built from sum to what it is divided by.
+    float psum = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+      const VPIPE_ELT pe = (VPIPE_ELT)metal::exp(sv[i] - mnew);
+      ss[sr * BK + sc0 + i] = pe;
+      psum += (float)pe;
+    }
+    for (ushort o = TPR / 2; o > 0; o >>= 1) {
+      psum += simd_shuffle_xor(psum, o);
+    }
+    lrow = lrow * cr + psum;
+    mrow = mnew;
+    if (sc0 == 0) { corr[sr] = cr; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (auto it = cO.begin(); it != cO.end(); ++it) {
+      if (!it.is_valid_element()) { continue; }
+      *it *= corr[it.get_multidimensional_index()[1]];
+    }
+    opPV.run(tP, tV, cO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (sc0 == 0) { den[sr] = lrow; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (auto it = cO.begin(); it != cO.end(); ++it) {
+    if (!it.is_valid_element()) { continue; }
+    const auto ij = it.get_multidimensional_index();
+    const int hh = (int)ij[1], dd = (int)ij[0];
+    if (hh < G) {
+      const float dv = den[hh];
+      const float inv = dv > 0.0f ? 1.0f / dv : 0.0f;
+      out[((ulong)(h0 + hh) * n + row) * D + dd] = (VPIPE_ELT)(*it * inv);
+    }
+  }
+}
+
 #else
 // Tensor ops unavailable for this target: stubs so the metallib still builds.
 kernel void sdpa_mma_f16(device VPIPE_ELT* out [[buffer(3)]],
@@ -1146,5 +1317,8 @@ kernel void sdpa_full_mma2_d64_f16(device VPIPE_ELT* out [[buffer(3)]],
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 kernel void sdpa_causal_mma2_d64_f16(device VPIPE_ELT* out [[buffer(3)]],
                                      uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void qsa_attn_nax_f16(device VPIPE_ELT* out [[buffer(3)]],
+                             uint t [[thread_position_in_grid]])
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 #endif

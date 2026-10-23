@@ -29,6 +29,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
+#include "stages/fibo2-model-config-stage.h"
 #include "stages/generate-image-stage.h"
 #include "stages/model-memory.h"
 #include "stages/vae-encode-stage.h"
@@ -397,15 +398,20 @@ conditioning_test_(const char* env)
 // arena above books -- beside the floor the plan declares for it.
 struct ScratchMeasure {
   bool streamed = false;
+  // > 0: a GUIDED step -- the prompt's forward, then a negative of this
+  // many rows (the prompt's rows tiled) in the second text slot, both
+  // under the one measurement.
+  int neg_rows = 0;
   std::size_t grew = 0;
   std::size_t booked = 0;
   std::size_t held = 0;
   std::size_t floor = 0;
+  int gist = 0, neg_gist = 0;
 };
 
-// `sm`: measure one forward instead of walking the steps -- preloaded for
-// the activations (a streamed one would count its slots and promoted
-// blocks too), streamed for the floor.
+// `sm`: measure one forward (or a guided step's two) instead of walking
+// the steps -- preloaded for the activations (a streamed one would count
+// its slots and promoted blocks too), streamed for the floor.
 Checks
 steps_test_(const char* env, ScratchMeasure* sm = nullptr)
 {
@@ -436,10 +442,30 @@ steps_test_(const char* env, ScratchMeasure* sm = nullptr)
     for (std::size_t i = 0; i < emb.size(); ++i) { d[i] = f2bf_(emb[i]); }
   }
   std::string err;
+  // A guided step's negative, made before the baseline (it is the test's
+  // own buffer): each bundle's rows tiled from the prompt's -- what is
+  // allocated depends on the row count alone.
+  const int TN = (sm != nullptr && !stream) ? sm->neg_rows : 0;
+  metal_compute::SharedBuffer nbuf;
+  if (TN > 0) {
+    const std::size_t row = 7680, tn = (std::size_t)TN;
+    const std::size_t tl = (std::size_t)G.text_len;
+    nbuf = mc->make_shared_buffer(6 * tn * row * 2);
+    FB_CHECK_OR_RETURN(c, !nbuf.empty());
+    const auto* src = static_cast<const std::uint16_t*>(tb.contents());
+    auto* dst = static_cast<std::uint16_t*>(nbuf.contents());
+    for (std::size_t b = 0; b < 6; ++b) {
+      for (std::size_t t = 0; t < tn; ++t) {
+        std::memcpy(dst + (b * tn + t) * row, src + (b * tl + t % tl) * row,
+                    row * 2);
+      }
+    }
+  }
   // Before the text: the text pass's products are the forward's to book.
   const std::size_t alloc0 =
       sm != nullptr ? mc->memory_budget_settled().allocated : 0;
   FB_CHECK_OR_RETURN(c, m->set_text(tb, G.text_len, &err));
+  if (TN > 0) { FB_CHECK_OR_RETURN(c, m->set_text(nbuf, TN, &err, 1)); }
   // Each picture's latent, in vae-encode's [128, h, w], is its patch rows.
   std::vector<std::pair<int, int>> grids;
   std::vector<std::vector<float>> ctx;
@@ -449,10 +475,15 @@ steps_test_(const char* env, ScratchMeasure* sm = nullptr)
     FB_CHECK_OR_RETURN(c, ctx.back().size() == (std::size_t)PD * ch * cw);
     grids.emplace_back(ch, cw);
   }
-  genai::fibo2::Layout lay;
+  genai::fibo2::Layout lay, lay_neg;
   FB_CHECK_OR_RETURN(
       c, genai::fibo2::build_layout(gh, gh, grids, m->gist_count(),
                                     cfg.max_gist, &lay, &err));
+  if (TN > 0) {
+    FB_CHECK_OR_RETURN(
+        c, genai::fibo2::build_layout(gh, gh, grids, m->gist_count(1),
+                                      cfg.max_gist, &lay_neg, &err));
+  }
   const std::size_t img = (std::size_t)gh * gh;
   metal_compute::SharedBuffer lat =
       mc->make_shared_buffer((std::size_t)lay.refiner_len() * PD * 2);
@@ -499,10 +530,25 @@ steps_test_(const char* env, ScratchMeasure* sm = nullptr)
       });
     }
     metal_compute::SharedBuffer v = m->forward(req, &err);
+    // The negative's pass, as generate_fibo2_ runs it: the same latent
+    // rows on its own layout, reading the second slot.
+    bool neg_ok = true;
+    if (TN > 0 && !v.empty()) {
+      genai::MetalFibo2Transformer::Request rn = req;
+      rn.layout = &lay_neg;
+      rn.text_slot = 1;
+      std::string en;
+      neg_ok = !m->forward(rn, &en).empty();
+      if (!neg_ok) {
+        std::printf("[fibo2_dit] the negative's pass failed: %s\n",
+                    en.c_str());
+      }
+    }
     if (sm != nullptr) {
       done.store(true);
       sampler.join();
     }
+    FB_CHECK_OR_RETURN(c, neg_ok);
     if (v.empty()) {
       std::printf("[fibo2_dit] step %d failed: %s\n", k, err.c_str());
     }
@@ -535,7 +581,9 @@ steps_test_(const char* env, ScratchMeasure* sm = nullptr)
       sm->grew = top - alloc0 - lat.byte_size();
       sm->booked = genai::MetalFibo2Transformer::forward_scratch_bytes(
           cfg, lay.refiner_len(), G.text_len, false,
-          mc->supports_matrix_cores());
+          mc->supports_matrix_cores(), TN > 0 ? TN : -1);
+      sm->gist = m->gist_count();
+      sm->neg_gist = TN > 0 ? m->gist_count(1) : 0;
       break;
     }
   }
@@ -714,6 +762,33 @@ TEST(fibo2_dit, a_forward_allocates_what_the_plan_books)
   }
 }
 
+// A GUIDED step holds two texts and runs two joint lengths: the plan
+// books the negative's gist and injection keys and values beside the
+// prompt's, and the planes at the longer sequence. A negative SHORTER
+// than the prompt (the null caption's 46 rows: a smaller gist) and one
+// LONGER (1100 rows: a larger gist, a longer text pass), each against
+// one measured prompt-then-negative step.
+TEST(fibo2_dit, a_guided_step_allocates_what_the_plan_books)
+{
+  for (int tn : {46, 1100}) {
+    ScratchMeasure sm;
+    sm.neg_rows = tn;
+    const Checks c = steps_test_("VPIPE_FIBO2_REAL_GOLDEN", &sm);
+    for (const auto& [ok, what] : c.items) { EXPECT_TRUE(ok); }
+    if (!c.ran || sm.booked == 0) { return; }
+    std::printf("[fibo2_dit] guided, %d negative rows (gist %d; the "
+                "prompt's %d): peak allocation %.1f MB; the plan books "
+                "%.1f MB (%.3fx)\n", tn, sm.neg_gist, sm.gist,
+                sm.grew / 1048576.0, sm.booked / 1048576.0,
+                sm.grew > 0 ? (double)sm.booked / (double)sm.grew : 0.0);
+    // Each arm on its side of the prompt's gist, or it tests one case.
+    EXPECT_TRUE(tn < 100 ? sm.neg_gist < sm.gist : sm.neg_gist > sm.gist);
+    EXPECT_TRUE(sm.grew > 0);
+    EXPECT_TRUE(sm.booked + (std::size_t(2) << 20) >= sm.grew);
+    EXPECT_TRUE((double)sm.booked <= 1.25 * (double)sm.grew);
+  }
+}
+
 TEST(fibo2_dit, real_steps_with_two_pictures_match_the_reference)
 {
   const Checks c = steps_test_("VPIPE_FIBO2_REAL2_GOLDEN");
@@ -782,4 +857,449 @@ TEST(fibo2_stage, a_second_edit_reproduces_the_first)
               "second prompt moved the latent %.4f\n", worst, moved);
   EXPECT_TRUE(worst == 0.0);
   EXPECT_TRUE(moved > 0.05);
+}
+
+// ---- Fibo 2.0 Dev: the guided sampler --------------------------------
+//
+// tools/dump_fibo2_golden.py `guided`: the SMALL random model in a repo
+// root generate-image loads, and the reference pipeline's own __call__
+// (output_type "latent") at guidance 5 against a negative of another
+// length -- its own gist count -- for a text-to-image and an edit, in
+// fp32 and in bf16 (the bar), and the same sampler unguided. Env:
+// VPIPE_FIBO2_GUIDED_GOLDEN. No checkpoint needed.
+
+namespace {
+
+// Emits the negative on oport1, THEN the prompt on oport0, as the
+// conditioner does (generate-image reads a positive's negative only if it
+// is already queued); each [bundles, rows, cap] bf16.
+class SourceCond : public TypedStage<SourceCond> {
+public:
+  static constexpr const char* kTypeName = "ut-source-cond-fibo2";
+  SourceCond(const SessionContextIntf* s, std::string id,
+             std::vector<InEdge> ip, FlexData c)
+    : TypedStage(s, std::move(id), std::move(ip), std::move(c))
+  { allocate_oports(2); }
+  std::vector<float> pos, neg;
+  int pos_rows = 0, neg_rows = 0, cap = 0, bundles = 6;
+  bool done = false;
+  std::unique_ptr<TensorBeatPayload>
+  beat_(const std::vector<float>& v, int rows, int cap) const
+  {
+    auto tb = std::make_unique<TensorBeatPayload>();
+    tb->dtype = TensorBeat::DType::Bf16;
+    tb->shape = {bundles, rows, cap};
+    tb->resize_contiguous(v.size());
+    auto* u = reinterpret_cast<std::uint16_t*>((void*)tb->as_u8());
+    for (std::size_t i = 0; i < v.size(); ++i) { u[i] = f2bf_(v[i]); }
+    return tb;
+  }
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    if (!done) {
+      done = true;
+      if (neg_rows > 0) { co_await ctx.write(1, beat_(neg, neg_rows, cap)); }
+      co_await ctx.write(0, beat_(pos, pos_rows, cap));
+    }
+    ctx.signal_done();
+    co_return;
+  }
+};
+
+// One f32 [C, H, W] beat (a vae-encode reference latent), then ends.
+class SourceLatent : public TypedStage<SourceLatent> {
+public:
+  static constexpr const char* kTypeName = "ut-source-latent-fibo2";
+  SourceLatent(const SessionContextIntf* s, std::string id,
+               std::vector<InEdge> ip, FlexData c)
+    : TypedStage(s, std::move(id), std::move(ip), std::move(c))
+  { allocate_oports(1); }
+  std::vector<float> chw;
+  int C = 0, H = 0, W = 0;
+  bool done = false;
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    if (!done) {
+      done = true;
+      auto tb = std::make_unique<TensorBeatPayload>();
+      tb->dtype = TensorBeat::DType::F32;
+      tb->shape = {C, H, W};
+      tb->resize_contiguous(chw.size());
+      std::memcpy(tb->as_f32(), chw.data(), chw.size() * sizeof(float));
+      co_await ctx.write(0, std::move(tb));
+    }
+    ctx.signal_done();
+    co_return;
+  }
+};
+
+struct GuidedRun {
+  double guidance = 1.0;
+  bool via_model_config = true;   // fibo2-model-config, else the stage key
+  bool wire_negative = true;
+};
+
+// One scenario of the guided golden through generate-image; empty on a
+// failure.
+std::vector<float>
+run_guided_(const fs::path& root, const FlexData& sc, int steps,
+            const GuidedRun& r)
+{
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return {}; }
+  const fs::path d = root / sc.as_object().at("name").as_string();
+  const int H = (int)sc.as_object().at("height").as_int(0);
+  const int W = (int)sc.as_object().at("width").as_int(0);
+  auto pl = std::make_unique<Pipeline>("fibo2-guided", &sess);
+  auto cu = std::make_unique<SourceCond>(&sess, "cond", std::vector<InEdge>{},
+                                         FlexData::make_object());
+  // The golden's [1, bundles, rows, cap].
+  const FlexData es = sc.as_object().at("files").as_object().at("enc");
+  cu->bundles = (int)es.as_array().at(1).as_int(0);
+  cu->cap = (int)es.as_array().at(3).as_int(0);
+  cu->pos = read_f32_(d / "enc.f32");
+  cu->pos_rows = (int)sc.as_object().at("text_len").as_int(0);
+  if (r.wire_negative) {
+    cu->neg = read_f32_(d / "neg.f32");
+    cu->neg_rows = (int)sc.as_object().at("neg_len").as_int(0);
+  }
+  const std::size_t row = (std::size_t)cu->bundles * cu->cap;
+  if (row == 0 || cu->pos.size() != row * cu->pos_rows ||
+      cu->neg.size() != row * cu->neg_rows) {
+    std::printf("[fibo2_stage] the golden's conditioning is not [%d, rows, "
+                "%d]\n", cu->bundles, cu->cap);
+    return {};
+  }
+  Stage* cond = pl->insert_stage(std::move(cu));
+  std::vector<InEdge> gin{{cond, 0}, {cond, 1}, InEdge{nullptr, 0},
+                          InEdge{nullptr, 0}, InEdge{nullptr, 0}};
+  const FlexData ctx = sc.as_object().at("context");
+  for (std::size_t k = 0; k < ctx.as_array().size(); ++k) {
+    const FlexData hw = ctx.as_array().at(k);
+    auto lu = std::make_unique<SourceLatent>(
+        &sess, "lat" + std::to_string(k), std::vector<InEdge>{},
+        FlexData::make_object());
+    lu->C = 128;
+    lu->H = (int)hw.as_array().at(0).as_int(0) / 2;
+    lu->W = (int)hw.as_array().at(1).as_int(0) / 2;
+    lu->chw = read_f32_(d / ("ctx" + std::to_string(k) + ".f32"));
+    if (lu->chw.size() != (std::size_t)128 * lu->H * lu->W) { return {}; }
+    gin.push_back({pl->insert_stage(std::move(lu)), 0});
+  }
+  while (gin.size() < 7) { gin.push_back(InEdge{nullptr, 0}); }
+  FlexData gc = FlexData::make_object();
+  if (r.via_model_config) {
+    FlexData mc = FlexData::make_object();
+    mc.as_object().insert("guidance_scale",
+                          FlexData::make_real(r.guidance));
+    gin.push_back({pl->insert_stage(std::make_unique<Fibo2ModelConfigStage>(
+                       &sess, "fibo2cfg", std::vector<InEdge>{},
+                       std::move(mc))),
+                   0});
+  } else {
+    gc.as_object().insert("guidance_scale",
+                          FlexData::make_real(r.guidance));
+  }
+  gc.as_object().insert("hf_dir", FlexData::make_string(root.string()));
+  gc.as_object().insert(
+      "seed", FlexData::make_int(sc.as_object().at("seed").as_int(0)));
+  gc.as_object().insert("steps", FlexData::make_int(steps));
+  gc.as_object().insert("width", FlexData::make_int(W));
+  gc.as_object().insert("height", FlexData::make_int(H));
+  auto* gen = static_cast<GenerateImageStage*>(pl->insert_stage(
+      std::make_unique<GenerateImageStage>(&sess, "gen", std::move(gin),
+                                           std::move(gc))));
+  if (!gen->config_error().empty()) {
+    std::printf("[fibo2_stage] generate-image: %s\n",
+                gen->config_error().c_str());
+    return {};
+  }
+  auto* sink = static_cast<SinkCapture*>(pl->insert_stage(
+      std::make_unique<SinkCapture>(&sess, "sink",
+                                    std::vector<InEdge>{{gen, 0}},
+                                    FlexData::make_object())));
+  PipelineRuntime rt(pl.get(), &sess);
+  if (!rt.launch()) {
+    std::printf("[fibo2_stage] the graph did not launch\n");
+    return {};
+  }
+  rt.wait_idle();
+  rt.stop();
+  if (sink->captured.size() != 1) {
+    std::printf("[fibo2_stage] %zu latents out\n", sink->captured.size());
+    return {};
+  }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(sink->captured[0].get());
+  if (tb == nullptr || tb->dtype != TensorBeat::DType::F32) { return {}; }
+  return std::vector<float>(tb->as_f32(), tb->as_f32() + tb->element_count());
+}
+
+}  // namespace
+
+// The guided sampler against the reference's: the negative's own
+// forward a step on its own gist count, uncond + g (cond - uncond), the
+// schedule and the noise -- for a text-to-image (guidance from
+// fibo2-model-config) and an edit (generate-image's own guidance_scale).
+// Held to 2x the reference's own bf16 distance over 6 steps at g 5, and
+// to a distance from the UNGUIDED reference that guidance must open.
+TEST(fibo2_stage, guided_sampler_matches_reference)
+{
+  const std::string gd = env_("VPIPE_FIBO2_GUIDED_GOLDEN");
+  if (gd.empty()) { return; }
+  FlexData man;
+  ASSERT_TRUE(read_json_(fs::path(gd) / "golden.json", &man));
+  if (!man.is_object()) { return; }
+  const int steps = (int)man.as_object().at("steps").as_int(0);
+  const double g = man.as_object().at("guidance").as_real(0.0);
+  const FlexData scs = man.as_object().at("scenarios");
+  ASSERT_TRUE(scs.as_array().size() == 2);
+  for (std::size_t i = 0; i < scs.as_array().size(); ++i) {
+    const FlexData sc = scs.as_array().at(i);
+    const std::string name(sc.as_object().at("name").as_string());
+    const fs::path d = fs::path(gd) / name;
+    const int H8 = (int)sc.as_object().at("height").as_int(0) / 8;
+    const int W8 = (int)sc.as_object().at("width").as_int(0) / 8;
+    GuidedRun r;
+    r.guidance = g;
+    r.via_model_config = (i == 0);
+    const std::vector<float> got = run_guided_(fs::path(gd), sc, steps, r);
+    const std::vector<float> want =
+        patchify_(read_f32_(d / "final.f32"), H8, W8);
+    const std::vector<float> ref16 =
+        patchify_(read_f32_(d / "final_bf16.f32"), H8, W8);
+    const std::vector<float> plain =
+        patchify_(read_f32_(d / "final_unguided.f32"), H8, W8);
+    ASSERT_TRUE(got.size() == want.size() && !want.empty());
+    if (got.size() != want.size() || want.empty()) { continue; }
+    const double rel = rel_l2_(got.data(), want.data(), want.size());
+    const double bar = rel_l2_(ref16.data(), want.data(), want.size());
+    const double away = rel_l2_(got.data(), plain.data(), plain.size());
+    std::printf("[fibo2_stage] guided %s (%d steps, g %g, guidance from %s): "
+                "latent rel-L2 %.5f (the reference's own bf16 %.5f); the "
+                "unguided reference %.4f away\n", name.c_str(), steps, g,
+                r.via_model_config ? "fibo2-model-config" : "the stage key",
+                rel, bar, away);
+    EXPECT_TRUE(rel <= 2.0 * bar);
+    EXPECT_TRUE(away > 10.0 * bar);
+  }
+}
+
+// Guidance 1 runs ONE forward a step, whatever is wired: a negative on
+// iport1 changes nothing (Edit Turbo's recipe), and the result is the
+// reference's unguided sampler.
+TEST(fibo2_stage, guidance_one_ignores_a_wired_negative)
+{
+  const std::string gd = env_("VPIPE_FIBO2_GUIDED_GOLDEN");
+  if (gd.empty()) { return; }
+  FlexData man;
+  ASSERT_TRUE(read_json_(fs::path(gd) / "golden.json", &man));
+  if (!man.is_object()) { return; }
+  const int steps = (int)man.as_object().at("steps").as_int(0);
+  const FlexData sc = man.as_object().at("scenarios").as_array().at(0);
+  const fs::path d = fs::path(gd) / sc.as_object().at("name").as_string();
+  const int H8 = (int)sc.as_object().at("height").as_int(0) / 8;
+  const int W8 = (int)sc.as_object().at("width").as_int(0) / 8;
+  GuidedRun with, without;
+  with.guidance = without.guidance = 1.0;
+  without.wire_negative = false;
+  const std::vector<float> a = run_guided_(fs::path(gd), sc, steps, with);
+  const std::vector<float> b = run_guided_(fs::path(gd), sc, steps, without);
+  const std::vector<float> plain =
+      patchify_(read_f32_(d / "final_unguided.f32"), H8, W8);
+  ASSERT_TRUE(a.size() == plain.size() && b.size() == plain.size());
+  if (a.size() != plain.size() || b.size() != plain.size()) { return; }
+  const double ab = rel_l2_(a.data(), b.data(), b.size());
+  const double rel = rel_l2_(a.data(), plain.data(), plain.size());
+  std::printf("[fibo2_stage] guidance 1: with a negative wired vs without "
+              "%g; vs the reference's unguided sampler %.5f\n", ab, rel);
+  EXPECT_TRUE(ab == 0.0);
+  EXPECT_TRUE(rel < 0.03);
+}
+
+// THE LAUNCH PLAN BOOKS A GUIDED NEGATIVE. declare_resources runs before
+// any beat, so the guidance it can see is the model-config CONSTANT
+// (apply_constant) or generate-image's own key: guided, the DiT's
+// activation claim holds a negative's text beside the prompt's (at the
+// prompt's planning length); unguided -- Edit Turbo's graphs -- it does
+// not; and a relaunch without the source (reset_run_state, which runs
+// after the plan) plans without it. The live preview the constant names
+// is booked the same way (it had been read from the runtime latch,
+// empty at a first launch's plan). Loads nothing. Env:
+// VPIPE_FIBO2_GUIDED_GOLDEN (its small repo root); the preview arm,
+// VPIPE_FIBO2_PREVIEW_VAE (a TAE directory, e.g. madebyollin/taef2).
+TEST(fibo2_stage, the_launch_plan_books_a_guided_negative)
+{
+  const std::string gd = env_("VPIPE_FIBO2_GUIDED_GOLDEN");
+  if (gd.empty()) { return; }
+  Session sess;
+  const fs::path root(gd);
+  genai::MetalFibo2Transformer::Config cfg;
+  ASSERT_TRUE(genai::MetalFibo2Transformer::Config::read_dims(
+      (root / "transformer").string(), &cfg));
+  auto* mc = sess.metal_compute();
+  const bool mx = mc != nullptr && mc->supports_matrix_cores();
+  // The claim's geometry: a 1024^2 edit (no width or height) beside a
+  // 1024-row prompt.
+  const int rows = 2 * (1024 / 16) * (1024 / 16);
+  const std::size_t one = genai::MetalFibo2Transformer::forward_scratch_bytes(
+      cfg, rows, 1024, false, mx);
+  const std::size_t two = genai::MetalFibo2Transformer::forward_scratch_bytes(
+      cfg, rows, 1024, false, mx, 1024);
+  ASSERT_TRUE(two > one);
+  // A scratch claim's key is "label|bytes".
+  auto booked = [](const GenerateImageStage& st) -> std::size_t {
+    for (const ResourceClaim& c : st.declare_resources()) {
+      if (c.key.rfind("fibo2-dit:", 0) == 0) {
+        return (std::size_t)std::stoull(c.key.substr(c.key.rfind('|') + 1));
+      }
+    }
+    return 0;
+  };
+  auto make = [&](double own) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string(root.string()));
+    if (own > 0.0) {
+      c.as_object().insert("guidance_scale", FlexData::make_real(own));
+    }
+    return std::make_unique<GenerateImageStage>(
+        &sess, "gen", std::vector<InEdge>{}, std::move(c));
+  };
+  auto model_cfg = [](double g) {
+    FlexData m = FlexData::make_object();
+    m.as_object().insert("model_family", FlexData::make_string("fibo2"));
+    m.as_object().insert("guidance_scale", FlexData::make_real(g));
+    return m;
+  };
+  constexpr unsigned kModelCfgPort = 7;   // generate-image's model_config
+  {
+    auto st = make(0.0);
+    ASSERT_TRUE(st->config_error().empty());
+    const std::size_t plain = booked(*st);
+    st->apply_constant(kModelCfgPort, model_cfg(5.0));
+    const std::size_t guided = booked(*st);
+    st->reset_run_state();
+    const std::size_t relaunched = booked(*st);
+    std::printf("[fibo2_stage] launch plan: unguided %.1f MB, guided by "
+                "the model config %.1f MB, relaunched without it %.1f MB\n",
+                plain / 1048576.0, guided / 1048576.0,
+                relaunched / 1048576.0);
+    EXPECT_TRUE(plain == one);
+    EXPECT_TRUE(guided == two);
+    EXPECT_TRUE(relaunched == one);
+  }
+  {
+    // The stage's own guidance books it; a model config saying 1 wins.
+    auto st = make(5.0);
+    EXPECT_TRUE(booked(*st) == two);
+    st->apply_constant(kModelCfgPort, model_cfg(1.0));
+    EXPECT_TRUE(booked(*st) == one);
+  }
+  const std::string tae = env_("VPIPE_FIBO2_PREVIEW_VAE");
+  if (tae.empty()) { return; }
+  {
+    // A weights claim on the TAE's file, under its directory.
+    auto previews = [&](const GenerateImageStage& st) {
+      int n = 0;
+      for (const ResourceClaim& c : st.declare_resources()) {
+        if (c.kind == model_memory::kWeightsKind &&
+            c.key.rfind(tae, 0) == 0) {
+          ++n;
+        }
+      }
+      return n;
+    };
+    auto st = make(0.0);
+    const int before = previews(*st);
+    FlexData m = model_cfg(1.0);
+    m.as_object().insert("preview_vae", FlexData::make_string(tae));
+    st->apply_constant(kModelCfgPort, m);
+    const int with = previews(*st);
+    st->reset_run_state();
+    const int after = previews(*st);
+    std::printf("[fibo2_stage] the preview's TAE claimed: before the "
+                "constant %d, with it %d, relaunched without it %d\n",
+                before, with, after);
+    EXPECT_TRUE(before == 0);
+    EXPECT_TRUE(with == 1);
+    EXPECT_TRUE(after == 0);
+  }
+}
+
+// THE NEGATIVE IS THE NULL CAPTION, AS WRITTEN, AND TEXT ALONE: the
+// conditioner's oport1, wired, against the reference's
+// encode_prompt(DEFAULT_NEGATIVE_PROMPT) -- uncleaned (cleaned, it would
+// be "{}"), and shown none of the pictures the prompt edits. Env:
+// VPIPE_FIBO2_TEST_MODEL_PATH (any Fibo 2.0 repo root) +
+// VPIPE_FIBO2_NEG_GOLDEN (`negative`, from the same text encoder);
+// VPIPE_FIBO2_REAL_GOLDEN adds an edit's picture, which must not reach
+// the negative.
+TEST(fibo2_cond, the_negative_is_the_null_caption_as_written)
+{
+  const std::string root = env_("VPIPE_FIBO2_TEST_MODEL_PATH");
+  const std::string nd = env_("VPIPE_FIBO2_NEG_GOLDEN");
+  if (root.empty() || nd.empty()) { return; }
+  FlexData man;
+  ASSERT_TRUE(read_json_(fs::path(nd) / "golden.json", &man));
+  if (!man.is_object()) { return; }
+  EXPECT_TRUE(man.as_object().at("negative").as_string() ==
+              std::string(genai::fibo2::kNullCaption));
+  const int T = (int)man.as_object().at("text_len").as_int(0);
+  const double bar = man.as_object().at("ref_bf16_rel").as_real(0.0);
+  const std::vector<float> want = read_f32_(fs::path(nd) / "neg.f32");
+  ASSERT_TRUE(T > 0 && want.size() == (std::size_t)6 * T * 7680);
+  if (want.size() != (std::size_t)6 * T * 7680) { return; }
+  Golden G = load_("VPIPE_FIBO2_REAL_GOLDEN");
+  for (const bool edit : {false, true}) {
+    if (edit && !G.ok) { continue; }
+    Session sess;
+    if (sess.metal_compute() == nullptr) { return; }
+    auto pl = std::make_unique<Pipeline>("fibo2-neg", &sess);
+    auto srcu = std::make_unique<SourceText>(&sess, "src",
+                                             std::vector<InEdge>{},
+                                             FlexData::make_object());
+    srcu->prompts = {edit ? G.prompt : std::string("a red bicycle")};
+    Stage* src = pl->insert_stage(std::move(srcu));
+    Golden R = G;
+    R.root = root;
+    const std::vector<Stage*> pics =
+        edit ? pictures_(pl.get(), sess, G) : std::vector<Stage*>{};
+    Stage* cond = conditioner_(pl.get(), sess, R, src, pics);
+    auto* sink = static_cast<SinkCapture*>(pl->insert_stage(
+        std::make_unique<SinkCapture>(&sess, "sink",
+                                      std::vector<InEdge>{{cond, 0}},
+                                      FlexData::make_object())));
+    auto* nsink = static_cast<SinkCapture*>(pl->insert_stage(
+        std::make_unique<SinkCapture>(&sess, "nsink",
+                                      std::vector<InEdge>{{cond, 1}},
+                                      FlexData::make_object())));
+    PipelineRuntime rt(pl.get(), &sess);
+    ASSERT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    ASSERT_TRUE(sink->captured.size() == 1 && nsink->captured.size() == 1);
+    if (nsink->captured.size() != 1) { continue; }
+    const auto* tb =
+        dynamic_cast<const TensorBeatPayload*>(nsink->captured[0].get());
+    ASSERT_TRUE(tb != nullptr && tb->shape.size() == 3);
+    if (tb == nullptr || tb->shape.size() != 3) { continue; }
+    std::printf("[fibo2_cond] %s: the negative [%lld, %lld, %lld] (the "
+                "reference's [6, %d, 7680])\n", edit ? "edit" : "text",
+                (long long)tb->shape[0], (long long)tb->shape[1],
+                (long long)tb->shape[2], T);
+    ASSERT_TRUE(tb->shape[0] == 6 && tb->shape[1] == T &&
+                tb->shape[2] == 7680);
+    if (tb->shape[1] != T) { continue; }
+    std::vector<float> got(want.size());
+    const auto* u =
+        reinterpret_cast<const std::uint16_t*>((const void*)tb->as_u8());
+    for (std::size_t k = 0; k < got.size(); ++k) { got[k] = bf2f_(u[k]); }
+    const double rel = rel_l2_(got.data(), want.data(), want.size());
+    std::printf("[fibo2_cond] %s: the negative's rel-L2 %.5f (the "
+                "reference's own bf16 %.5f)\n", edit ? "edit" : "text", rel,
+                bar);
+    EXPECT_TRUE(rel <= 1.25 * bar);
+  }
 }

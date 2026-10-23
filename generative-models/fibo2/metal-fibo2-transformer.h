@@ -69,7 +69,10 @@ class I8GemmContext;
 // THE TEXT IS FIXED FOR A GENERATION. The gist tokens and the injection
 // blocks' keys and values depend on the text alone, so set_text computes
 // them once and every forward reads them; a forward without a text set
-// is refused. The reference recomputes them every step.
+// is refused. The reference recomputes them every step. TWO TEXTS ARE
+// HELD (kTextSlots): a guided generation (Fibo 2.0 Dev) runs the prompt
+// and the negative at every step, each its own gist count, so each has
+// its own slot and neither pass recomputes the other's.
 //
 // STREAMING. The 46 blocks (refiner then layers) are one uniform stack;
 // the injection blocks' cross-attention, the perceiver and the model-level
@@ -161,21 +164,37 @@ class MetalFibo2Transformer {
     const fibo2::Layout* layout = nullptr;
     // SIGMA in [0, 1]: 1 pure noise. The model's input is sigma * t_scale.
     float timestep = 0.0f;
+    // Which text (set_text's slot) this forward reads; the layout's gist
+    // count must be that text's.
+    int text_slot = 0;
   };
 
-  // THE TEXT, for every forward until the next call: bundles [n_bundles,
-  // text_len, cap_dim] (bf16), the encoder's output, held by reference
-  // until the next forward has read it. That forward runs the Perceiver
-  // into `gist_count()` gist tokens and every injection block's keys and
+  // The prompt's slot and a guided generation's negative's.
+  static constexpr int kTextSlots = 2;
+
+  // THE TEXT of `slot`, for every forward that reads the slot until the
+  // next call: bundles [n_bundles, text_len, cap_dim] (bf16), the
+  // encoder's output, held by reference until the next forward of the
+  // slot has read it. That forward runs the Perceiver into
+  // `gist_count(slot)` gist tokens and every injection block's keys and
   // values, on its own stream; every later one reads them. False (with
-  // *err) on a buffer of the wrong size.
+  // *err) on a buffer of the wrong size or a slot out of range.
   bool set_text(const metal_compute::SharedBuffer& bundles, int text_len,
-                std::string* err = nullptr);
-  // The gist count of the text set (0 before one) -- what the layout's
-  // `gist` must be -- and the gist rows themselves [gist, hidden] once a
-  // forward has made them, for a test.
-  int gist_count() const { return _gist_n; }
-  const metal_compute::SharedBuffer& gist() const { return _gist; }
+                std::string* err = nullptr, int slot = 0);
+  // Forget a slot's text (and what its pass left): a generation with no
+  // negative drops the last one's, which is a prompt's worth of memory.
+  void clear_text(int slot);
+  // The gist count of the slot's text (0 before one) -- what the
+  // layout's `gist` must be -- and the gist rows themselves [gist,
+  // hidden] once a forward has made them, for a test.
+  int gist_count(int slot = 0) const
+  {
+    return slot >= 0 && slot < kTextSlots ? _txt[slot].gist_n : 0;
+  }
+  const metal_compute::SharedBuffer& gist(int slot = 0) const
+  {
+    return _txt[slot >= 0 && slot < kTextSlots ? slot : 0].gist;
+  }
 
   // ---- runtime LoRA --------------------------------------------------
   struct LoraSpec {
@@ -339,10 +358,13 @@ class MetalFibo2Transformer {
   // phase: img_rows image and context-image tokens beside a text of
   // txt_rows (<= 0: the longest), `packed` for a pack (the dense
   // stand-in), `matrix_cores` for the tiers that need them (int8, Sage,
-  // Sol).
+  // Sol). A guided generation's negative (neg_txt_rows; < 0 none, 0 the
+  // longest) adds what its pass leaves, and its forward's planes where
+  // its joint sequence is the longer.
   static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
                                            int txt_rows, bool packed,
-                                           bool matrix_cores);
+                                           bool matrix_cores,
+                                           int neg_txt_rows = -1);
   bool streaming() const { return _stream_blocks; }
   int quant_bits() const { return _quant_bits; }
 
@@ -581,17 +603,21 @@ class MetalFibo2Transformer {
   std::vector<PerceiverLayer> _perceiver;
   metal_compute::SharedBuffer _p_norm_out;
   bool load_cross_(WeightSet& ws, const std::string& p, CrossAttn& ca);
-  // What set_text leaves for the forwards: the gist rows and, per
-  // injection block, its keys and values head-major [NH, T, Hd] (normed),
-  // at text_len rows.
-  metal_compute::SharedBuffer _gist;
-  int _gist_n = 0;
-  std::vector<metal_compute::SharedBuffer> _inj_k, _inj_v;
-  int _text_len = 0;
-  // The bundles set_text was given, until a forward has run the text's
-  // pass over them.
-  metal_compute::SharedBuffer _text;
-  bool _text_dirty = false;
+  // What set_text leaves for the forwards, per slot: the gist rows and,
+  // per injection block, its keys and values head-major [NH, T, Hd]
+  // (normed), at text_len rows.
+  struct TextState {
+    metal_compute::SharedBuffer gist;
+    int gist_n = 0;
+    std::vector<metal_compute::SharedBuffer> inj_k, inj_v;
+    int text_len = 0;
+    // The bundles set_text was given, until a forward has run the text's
+    // pass over them.
+    metal_compute::SharedBuffer text;
+    bool dirty = false;
+    std::size_t bytes() const;
+  };
+  TextState _txt[kTextSlots];
 
   std::vector<Block> _blocks;               // the modulated stack
   bool _stream_blocks = false;

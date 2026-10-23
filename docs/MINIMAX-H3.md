@@ -984,6 +984,26 @@ Set the stage's `frames` to the **same value** as `generate-video`'s: it is
 the duration references are truncated to as well as the size of the sequence
 the transformer packs. They are checked against each other, not trusted.
 
+**Keeping a reference whole.** `whole_references` names references by their
+number in the request -- the `references` list first, then the ports, a
+soundtrack attached to a clip counting with it -- that are NOT truncated:
+`whole_references: [2]` keeps a song's every sample (its frames too, for a
+clip) where the generated duration would cut it. The released recipe
+truncates every reference, so this is off it -- a song drawn on as a whole,
+say. A kept clip is that many more rows on every step, and it moves the
+generated rows on along the shared clock past anything a truncated one could.
+
+Kept whole, a clip in the `references` list is decoded at its own size, which
+nothing downstream bounds: about 6 MB a 1080p frame, plus the resized copy the
+encoder makes. So the stage sizes the decode from the file's header first and
+refuses it, before reading a frame, when it would not fit in the memory the
+machine has free (and never more than half of what it has). The decoder still
+stops at 4096 frames; a clip longer than that keeps its first 4096, and its
+soundtrack is cut to match so the two stay in step. A clip that fits in memory
+can still be too long to use: its vision tokens may pass the encoder's
+`max_prompt_tokens`, or its rows the denoise's scratch preflight, and either
+refuses the request. Naming a picture does nothing (it has no duration).
+
 References never bind the generated geometry. An image is encoded at a short
 edge of its own (`reference_image_short_edge`, 2048), with no area cap and
 upscaling included; a clip goes onto the same canvas rule as the target

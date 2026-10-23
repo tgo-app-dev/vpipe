@@ -14,6 +14,15 @@ namespace vpipe {
 namespace {
 
 const ConfigKey kAttrs[] = {
+  {.key = "guidance_scale", .type = ConfigType::Real, .required = false,
+   .doc = "classifier-free guidance: v = v_neg + g (v - v_neg), against the "
+          "negative conditioning the diffusion-conditioner emits on oport1 "
+          "when that port is wired (the null caption the model was trained "
+          "with, unless a negative prompt is wired). Fibo 2.0 Dev runs at 5 "
+          "(its model card's recipe, 50 steps; 30 when no step count is "
+          "set); Edit Turbo is distilled to 1, which runs one forward a "
+          "step and no negative. Unset = generate-image's guidance_scale (1 "
+          "by default)"},
   {.key = "vl_long_edge", .type = ConfigType::Int, .required = false,
    .doc = "edit: the longest side Qwen3-VL sees a picture to edit at, "
           "thumbnailed as the reference pipeline does (bicubic, aspect "
@@ -72,7 +81,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "Fibo 2.0 parameters as one FlexData object {model_family: "
-          "fibo2, +vl_long_edge / vl_min_pixels / vl_max_pixels, +lora .. "
+          "fibo2, +guidance_scale, +vl_long_edge / vl_min_pixels / "
+          "vl_max_pixels, +lora .. "
           "+lora8 and their scales, +preview_vae and its knobs}, for a "
           "generate-image or diffusion-conditioner model_config iport",
    .type = &typeid(FlexDataPayload),
@@ -80,11 +90,11 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "fibo2-model-config",
-  .doc       = "Source: the Fibo 2.0 parameters -- the bounds of the "
-               "pictures Qwen3-VL reads for an edit, runtime LoRA slots and "
-               "the live preview. None is needed for an ordinary run. One "
-               "beat then done; with a trigger iport, one beat per inbound "
-               "beat.",
+  .doc       = "Source: the Fibo 2.0 parameters -- the guidance (Dev's "
+               "5; Edit Turbo needs none), the bounds of the pictures "
+               "Qwen3-VL reads for an edit, runtime LoRA slots and the live "
+               "preview. None is needed for an Edit Turbo run. One beat then "
+               "done; with a trigger iport, one beat per inbound beat.",
   .display_name = "Fibo 2.0 Model Config",
   .category  = StageCategory::ModelSpecificConfig,
   .iports    = kIports,
@@ -106,6 +116,14 @@ Fibo2ModelConfigStage::Fibo2ModelConfigStage(const SessionContextIntf* s,
     if (attr_int(k) < 0) {
       fail_config(fmt("Fibo2ModelConfigStage('{}'): {} must be >= 0 (got "
                       "{})", this->id(), k, attr_int(k)));
+    }
+  }
+  {
+    auto in = this->config().as_object();
+    if (in.contains("guidance_scale") &&
+        in.at("guidance_scale").as_real(-1.0) < 0.0) {
+      fail_config(fmt("Fibo2ModelConfigStage('{}'): guidance_scale must be "
+                      ">= 0", this->id()));
     }
   }
   _preview.vae      = attr_str(latent_preview::kVaeKey);
@@ -136,6 +154,9 @@ Fibo2ModelConfigStage::resolved_config() const
   {
     auto in = config().as_object();
     auto o  = fd.as_object();
+    if (in.contains("guidance_scale")) {
+      o.insert_or_assign("guidance_scale", in.at("guidance_scale"));
+    }
     for (int i = 0; i < lora_slots::kSlots; ++i) {
       for (std::string_view k :
            {lora_slots::kPath[i], lora_slots::kScale[i]}) {

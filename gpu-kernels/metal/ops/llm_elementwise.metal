@@ -164,7 +164,11 @@ kernel void moe_route_f16(
   logits  += (uint)tid.z * (uint)E;
   out_ids += (uint)tid.z * (uint)top_k;
   out_w   += (uint)tid.z * (uint)top_k;
-  const int PER = (E + 31) / 32;            // experts per lane (8 for E=256)
+  // Experts a lane: 16 whatever E (<= 512), the ones past E masked out --
+  // a bound known when compiled keeps lg / ex in registers (from E, the
+  // loops indexed them in memory). A masked one adds 0 to the sum, never
+  // wins a pick (its key is the start's -1), so every value is the same.
+  constexpr int PER = 16;
   float lg[16];                             // PER <= 16 (E <= 512)
   float lmax = -INFINITY;
   for (int j = 0; j < PER; ++j) {
@@ -184,6 +188,14 @@ kernel void moe_route_f16(
   }
   const float S = simd_sum(lsum);           // softmax denominator over all E
   float wsum = 0.0f;
+  // Lane k keeps pick k (its id, its weight as stored) and writes it at
+  // the end: the renorm read each weight back from out_w, a dependent
+  // device round trip a pick -- most of the kernel's 22 us a layer on an
+  // M5 Ultra (Qwen3.8-Flash-Next, top 10 of 512). Every lane adds the
+  // same picks in the same order, so each holds the same wsum.
+  const bool lanes = top_k <= 32;
+  int my_id = 0;
+  VPIPE_ELT my_w = (VPIPE_ELT)0.0f;
   for (int k = 0; k < top_k; ++k) {
     // local best among this lane's still-available experts
     float bv = -1.0f; int bi = -1;
@@ -203,9 +215,20 @@ kernel void moe_route_f16(
     }
     const float p = bv / S;                 // softmax prob of the selected expert
     wsum += p;
-    if (lid == 0) { out_ids[k] = bi; out_w[k] = (VPIPE_ELT)p; }
+    if (!lanes) {
+      if (lid == 0) { out_ids[k] = bi; out_w[k] = (VPIPE_ELT)p; }
+    } else if ((int)lid == k) {
+      my_id = bi;
+      my_w = (VPIPE_ELT)p;
+    }
   }
-  if (lid == 0 && norm_topk != 0 && wsum > 0.0f) {
+  const bool renorm = norm_topk != 0 && wsum > 0.0f;
+  if (lanes) {
+    if ((int)lid < top_k) {
+      out_ids[lid] = my_id;
+      out_w[lid] = renorm ? (VPIPE_ELT)((float)my_w / wsum) : my_w;
+    }
+  } else if (lid == 0 && renorm) {
     for (int k = 0; k < top_k; ++k) {
       out_w[k] = (VPIPE_ELT)((float)out_w[k] / wsum);
     }
