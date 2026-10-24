@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -387,6 +388,57 @@ TEST(weight_registry, a_built_model_is_kept_warm_by_key) {
     mgr->keep_model_warm("ut-dit", dir, "k", std::move(m), 1, 0.0);
   }
   EXPECT_TRUE(seen.expired());
+}
+
+// What is kept warm is REPORTED, for a host's view of its memory
+// (warm_report, SessionIntf::memory_report): each hold with its kind,
+// directory, bytes and the time it has left; gone from the report once
+// taken.
+TEST(weight_registry, what_is_kept_warm_is_reported) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  // A directory that exists, compared as the manager keys it: canonical
+  // (/tmp is /private/tmp on macOS), so the test holds whether or not
+  // it was there before.
+  const auto tmp =
+      std::filesystem::temp_directory_path() / "vpipe-warm-report-test";
+  std::filesystem::create_directories(tmp);
+  const std::string dir = std::filesystem::canonical(tmp).string();
+  mgr->keep_model_warm("ut-dit", dir, "k", std::make_shared<Payload>(1),
+                       4096, 60.0);
+  mgr->keep_model_warm("ut-vae", dir, "k", std::make_shared<Payload>(2),
+                       512, 30.0);
+  auto r = mgr->warm_report();
+  ASSERT_TRUE(r.size() == 2);
+  auto dit = std::find_if(r.begin(), r.end(),
+                          [](const auto& w) { return w.kind == "ut-dit"; });
+  auto vae = std::find_if(r.begin(), r.end(),
+                          [](const auto& w) { return w.kind == "ut-vae"; });
+  ASSERT_TRUE(dit != r.end() && vae != r.end());
+  if (dit == r.end() || vae == r.end()) { return; }
+  EXPECT_TRUE(dit->dir == dir);
+  EXPECT_TRUE(dit->bytes == 4096);
+  EXPECT_TRUE(dit->kv_bytes == 0);
+  EXPECT_TRUE(dit->seconds > 50.0 && dit->seconds <= 60.0);
+  EXPECT_TRUE(vae->dir == dir);
+  EXPECT_TRUE(vae->bytes == 512);
+  EXPECT_TRUE(vae->seconds > 20.0 && vae->seconds <= 30.0);
+
+  // The session's report carries them, as numbers.
+  const vpipe::SessionIntf& host = s;
+  const std::string json = host.memory_report().to_json();
+  EXPECT_TRUE(json.find("\"ut-dit\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"warm\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"weights\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"wired_limit\"") != std::string::npos);
+
+  // Taken, it is no longer reported.
+  EXPECT_TRUE(mgr->take_warm<Payload>("ut-dit", dir, "k") != nullptr);
+  EXPECT_TRUE(mgr->take_warm<Payload>("ut-vae", dir, "k") != nullptr);
+  EXPECT_TRUE(mgr->warm_report().empty());
+  std::error_code ec;
+  std::filesystem::remove(tmp, ec);
 }
 
 // A model still kept warm as the SESSION ends goes with the manager --

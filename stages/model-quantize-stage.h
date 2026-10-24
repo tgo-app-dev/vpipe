@@ -132,6 +132,7 @@ public:
   const std::string& output_name() const noexcept { return _output_name; }
   int  bits() const noexcept { return _bits; }
   int  group_size() const noexcept { return _group_size; }
+  const std::string& run_dtype() const noexcept { return _run_dtype; }
   bool skip_existing() const noexcept { return _skip_existing; }
   bool awq() const noexcept { return _awq; }
   bool mixed() const noexcept { return _mixed; }
@@ -262,6 +263,7 @@ private:
   std::string _target;   // krea2 component to quantize: dit|text_encoder|vae
   int         _bits{};
   int         _group_size{};
+  std::string _run_dtype;   // "" (as before) | bf16 | f16
   bool        _skip_existing{};
   // AWQ + mixed precision.
   bool        _awq{};

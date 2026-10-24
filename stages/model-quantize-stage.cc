@@ -46,6 +46,20 @@ namespace {
 std::string t2i_target_subdir_(const std::string& target);
 }
 
+namespace {
+
+// `run_dtype` as the quantizer takes it (validated in the constructor).
+genai::QuantizeOptions::RunDtype
+run_dtype_option_(const std::string& v)
+{
+  using R = genai::QuantizeOptions::RunDtype;
+  if (v == "bf16") { return R::kBf16; }
+  if (v == "f16" || v == "fp16") { return R::kF16; }
+  return R::kAsBefore;
+}
+
+}  // namespace
+
 ModelQuantizeStage::ModelQuantizeStage(
     const SessionContextIntf* s,
     std::string               id,
@@ -63,6 +77,7 @@ ModelQuantizeStage::ModelQuantizeStage(
   _target        = attr_str("target");
   _bits          = static_cast<int>(attr_uint("bits"));
   _group_size    = static_cast<int>(attr_uint("group_size"));
+  _run_dtype     = attr_str("run_dtype");
   _skip_existing = attr_bool("skip_existing");
   _awq           = attr_bool("awq");
   _awq_clip      = attr_bool("awq_clip");
@@ -108,6 +123,12 @@ ModelQuantizeStage::ModelQuantizeStage(
   if (_awq_clip && !_awq) {
     fail_config(fmt(
         "ModelQuantizeStage('{}'): awq_clip requires awq=true", this->id()));
+  }
+  if (!_run_dtype.empty() && _run_dtype != "bf16" && _run_dtype != "f16" &&
+      _run_dtype != "fp16") {
+    fail_config(fmt(
+        "ModelQuantizeStage('{}'): run_dtype must be bf16 or f16, or empty "
+        "for the original format (got '{}')", this->id(), _run_dtype));
   }
   // `target` is validated at run time: its valid values depend on the model
   // (Krea-2 components dit|text_encoder|vae vs a general-LLM submodule scope
@@ -746,6 +767,14 @@ constexpr ConfigKey kAttrs[] = {
    .def_uint = 8},
   {.key = "group_size", .type = ConfigType::Uint,
    .doc = "affine group size (32 | 64)", .def_uint = 64},
+  {.key = "run_dtype", .type = ConfigType::String,
+   .doc = "the dtype the quantized model will RUN in: bf16 | f16. Its "
+          "scales and biases are written in that dtype and the codes fit to "
+          "the rounded pair, so the dequant the model runs is the one the "
+          "codes were fit to. Empty (default): as before -- F16 scales, the "
+          "codes fit to the unrounded scale (MOSS-TTS: bf16), which a bf16 "
+          "model rounds again at load",
+   .def_str = ""},
   {.key = "arch", .type = ConfigType::String,
    .doc = "model family tag; empty => auto-detect from config.json model_type",
    .def_str = ""},
@@ -1275,6 +1304,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   }
 
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits  = _bits;
   opt.group = _group_size;
   // Standard LMs (Qwen/Llama/Gemma) quantize the embed table + lm_head (MLX
@@ -1402,6 +1432,7 @@ ModelQuantizeStage::quantize_dit_component_(
   // norm_offset stays off). dit_family lets the quantizer pick the flux2
   // AWQ-calib mapping + smoothing fold + two-prefix mixed ranking.
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits  = _bits;
   opt.group = _group_size;
   // The group size has to DIVIDE the projections' input width or the quantizer
@@ -1828,6 +1859,7 @@ ModelQuantizeStage::quantize_text_encoder_(
     }
   }
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits  = _bits;
   opt.group = _group_size;
   opt.quant_embeddings = false;
@@ -2375,6 +2407,7 @@ ModelQuantizeStage::quantize_registered_pipeline_(
   metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) { return false; }
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits              = _bits;
   opt.group             = _group_size;
   opt.quant_embeddings  = false;

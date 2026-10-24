@@ -396,7 +396,7 @@ void
 MetalKrea2Vae::attn_gemm_(ComputeEncoder& enc, const SharedBuffer& x,
                           std::size_t xe, const SharedBuffer& w,
                           const SharedBuffer& y, std::size_t ye, int M, int N,
-                          int K, const PoolAlloc& alloc,
+                          int K, bool probs, const PoolAlloc& alloc,
                           const PoolRelease& release)
 {
   if (_i8) {
@@ -416,7 +416,14 @@ MetalKrea2Vae::attn_gemm_(ComputeEncoder& enc, const SharedBuffer& x,
       release(sc); release(codes);
       if (ok) { return; }
     }
-    if (_i8->gemm(enc, x, xe, w, y, ye, M, N, K)) { return; }
+    // The accurate tier's groups are rotated by default, which loses on
+    // the probabilities: all positive, a group's values share an offset
+    // that the rotation gathers into one coefficient at 8x (I8GemmContext's
+    // class note). P.V keeps the plain groups.
+    if (probs ? _i8->gemm_unrotated(enc, x, xe, w, y, ye, M, N, K)
+              : _i8->gemm(enc, x, xe, w, y, ye, M, N, K)) {
+      return;
+    }
   }
   conv_gemm_bias_(enc, x.subview(xe * 2, (std::size_t)M * K * 2), w,
                   SharedBuffer{}, y, M, N, K, (int)(ye / (std::size_t)N));
@@ -595,7 +602,7 @@ MetalKrea2Vae::encode_mid_attn_(ComputeEncoder& enc, MidAttn kind,
       const int rows = std::min(bq, (int)hw - q0);
       // scores[rows, hw] = q[q0.., C] @ kc[hw, C]^T, already scaled
       attn_gemm_(enc, q, (std::size_t)q0 * C, kc, sc, 0, rows, (int)hw, C,
-                 alloc, release);
+                 /*probs=*/false, alloc, release);
       // A plain row softmax: q_offset = hw puts every key at or below the
       // causal bound, so the mask never fires.
       enc.set_function(_fn_softmax_rows);
@@ -608,7 +615,7 @@ MetalKrea2Vae::encode_mid_attn_(ComputeEncoder& enc, MidAttn kind,
       enc.dispatch({256u, (unsigned)rows, 1u}, {256u, 1, 1});
       // att[q0.., C] = P[rows, hw] @ vT[C, hw]^T
       attn_gemm_(enc, sc, 0, vT, att, (std::size_t)q0 * C, rows, C,
-                 (int)hw, alloc, release);
+                 (int)hw, /*probs=*/true, alloc, release);
     }
     release(sc); release(vT); release(kc); release(kpart); release(ksum);
     return;

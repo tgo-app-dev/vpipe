@@ -282,6 +282,43 @@ public:
   FlexData      reports() const;
   std::uint64_t reports_version() const;
 
+  // ---- Memory, for a host to show ---------------------------------
+  //
+  // What the session holds in memory NOW, by what holds it -- a host's
+  // "what is in RAM" view, numbers only:
+  //
+  //   {"warm":    [{"kind": s, "dir": s, "bytes": u, "kv_bytes": u,
+  //                 "seconds": f}, ...],
+  //    "weights": [{"dir": s, "bytes": u, "mapped_bytes": u,
+  //                 "holders": i, "parked": b}, ...],
+  //    "kv_bytes": u, "pooled_bytes": u,
+  //    "wired_used": u, "wired_limit": u, "gpu_allocated": u}
+  //
+  // `warm`: the models kept warm between runs, one a hold -- a language
+  // model kept loaded (`kind` "language-model": `bytes` its wired
+  // weights, 0 when it loaded unwired; `kv_bytes` its K/V, its parked
+  // conversations' too) or a model a stage built (its kind, "flux2-dit",
+  // "qwen-text-encoder", ...; `bytes` as the stage kept it, 0 where it
+  // said none) -- and the seconds before each goes unless used.
+  // `weights`: each checkpoint's weights resident through the model
+  // manager -- a language model's are not among them; `holders` what
+  // holds its set, the models using it and those kept warm alike (0:
+  // nothing does); `parked`: handed to the kernel as purgeable.
+  // `kv_bytes` every language model's K/V, the warm ones' included;
+  // `pooled_bytes` the checkpoints nothing holds, which the manager can
+  // drop now (a model kept warm holds its own, so letting it go frees
+  // its `warm` bytes, not these); the wired pool's use and limit;
+  // `gpu_allocated` this process's Metal allocations -- everything
+  // above and the stages' scratch alike -- where the session has a GPU.
+  //
+  // THE FIGURES OVERLAP, and only `gpu_allocated` is a total. A model a
+  // stage built keeps part of its checkpoint through the manager (a
+  // DiT's trunk, for one), so those bytes are in its `warm` entry AND in
+  // its checkpoint's `weights` entry: adding the two lists counts them
+  // twice. Only `{}` without a model manager. Safe from any thread.
+  // (Non-virtual, as reports() is.)
+  FlexData      memory_report() const;
+
   // ---- The session's log, for a host ------------------------------
   //
   // Every line the session reports -- its stages' errors, warnings and

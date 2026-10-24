@@ -243,7 +243,8 @@ const ConfigKey kAttrs[] = {
           "false; env VPIPE_I8_GEMM overrides"},
   {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
    .doc = "which int8 GEMM i8_gemm runs: 'accurate' (default; groups of 64 "
-          "on both operands), 'fast' (the block weights held as rotated "
+          "on both operands, Hadamard-rotated where a bf16 weight is "
+          "quantized per call), 'fast' (the block weights held as rotated "
           "int8 at a group of 512: faster on the M5's matrix cores, ~1.1x "
           "accurate on an Ultra), 'token' (int8 per weight row x per token "
           "after a 256-wide Hadamard rotation: the fastest, ~1.4x accurate "

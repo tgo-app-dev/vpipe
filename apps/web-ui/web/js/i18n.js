@@ -2708,7 +2708,8 @@ const STRINGS = {
       + '2 倍，精度即 int8 水準；沒有 NAX matmul2d（矩陣核心 GPU + 相應核心'
       + '）時會被忽略。預設 false；環境變數 VPIPE_I8_GEMM 可覆寫'],
   'cfg.generate-image.i8_gemm_tier': ['',
-      'i8_gemm 使用哪一档 int8 GEMM：accurate（默认；两侧操作数都按 64 分组）、'
+      'i8_gemm 使用哪一档 int8 GEMM：accurate（默认；两侧操作数都按 64 分组，'
+      + 'bf16 权重每次调用量化时各组先做 Hadamard 旋转）、'
       + 'fast（块权重以旋转后的 int8 按 512 分组存放：在 M5 的矩阵核心上'
       + '更快，在 Ultra 上约为 accurate 的 1.1 倍）、token（权重按行、激活按 '
       + 'token 各取一个 int8 尺度，先做 256 宽的 Hadamard 旋转：最快，在 M5 '
@@ -2721,7 +2722,8 @@ const STRINGS = {
       + '支持，其他模型'
       + '按 accurate 运行。环境变量 '
       + 'VPIPE_I8_TIER 可覆盖',
-      'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；兩側運算元都按 64 分組）、'
+      'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；兩側運算元都按 64 分組，'
+      + 'bf16 權重每次呼叫量化時各組先做 Hadamard 旋轉）、'
       + 'fast（區塊權重以旋轉後的 int8 按 512 分組存放：在 M5 的矩陣核心上'
       + '更快，在 Ultra 上約為 accurate 的 1.1 倍）、token（權重按列、活化按 '
       + 'token 各取一個 int8 尺度，先做 256 寬的 Hadamard 旋轉：最快，在 M5 '
@@ -3047,14 +3049,16 @@ const STRINGS = {
       + '，每段都由時鐘取一個；用過的每個種子都會記入日誌，且都能填回 `seed` '
       + '重跑。「keep」：每段都用 `seed`，適合在同一份雜訊上比較提示詞'],
   'cfg.generate-video.i8_gemm_tier': ['',
-      'i8_gemm 使用哪一档 int8 GEMM：accurate（默认；权重与激活每次调用时按 64 '
-      + '分组量化）、fast（块权重以旋转后的 int8 按粗分组存放）、token（权重按'
+      'i8_gemm 使用哪一档 int8 GEMM：accurate（默认；两侧操作数都按 64 分组，'
+      + 'bf16 权重每次调用量化时各组先做 Hadamard 旋转）、'
+      + 'fast（块权重以旋转后的 int8 按粗分组存放）、token（权重按'
       + '行、激活按 token 各取一个 int8 尺度，先做 256 宽的 Hadamard 旋转：最'
       + '快）或 token_plain（同上但不旋转，直接读取 Draw Things i8x 检查点的'
       + '原始编码）。minimax-h3 支持，其他模型按 accurate 运行。环境变量 '
       + 'VPIPE_I8_TIER 可覆盖',
-      'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；權重與活化每次呼叫時按 64 '
-      + '分組量化）、fast（區塊權重以旋轉後的 int8 按粗分組存放）、token（權重按'
+      'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；兩側運算元都按 64 分組，'
+      + 'bf16 權重每次呼叫量化時各組先做 Hadamard 旋轉）、'
+      + 'fast（區塊權重以旋轉後的 int8 按粗分組存放）、token（權重按'
       + '列、活化按 token 各取一個 int8 尺度，先做 256 寬的 Hadamard 旋轉：最'
       + '快）或 token_plain（同上但不旋轉，直接讀取 Draw Things i8x 檢查點的'
       + '原始編碼）。minimax-h3 支援，其他模型按 accurate 執行。環境變數 '
@@ -6526,6 +6530,15 @@ const STRINGS = {
   'cfg.model-quantize.group_size': ['',
       '仿射量化的分组大小（32 | 64）',
       '仿射量化的分組大小（32 | 64）'],
+  'cfg.model-quantize.run_dtype': ['',
+      '量化后的模型将以何种精度运行：bf16 | f16。缩放与偏置以该精度写出，'
+      + '编码按舍入后的这一对值拟合，使模型运行时的反量化正是编码所拟合的那个。'
+      + '留空（默认）：保持原有格式——F16 缩放，编码按未舍入的缩放拟合'
+      + '（MOSS-TTS 为 bf16），bf16 模型加载时会再舍入一次',
+      '量化後的模型將以何種精度執行：bf16 | f16。縮放與偏置以該精度寫出，'
+      + '編碼按捨入後的這一對值擬合，使模型執行時的反量化正是編碼所擬合的那個。'
+      + '留空（預設）：保持原有格式——F16 縮放，編碼按未捨入的縮放擬合'
+      + '（MOSS-TTS 為 bf16），bf16 模型載入時會再捨入一次'],
   'cfg.model-quantize.arch': ['',
       '模型族标签；留空 => 从 config.json 的 model_type 自动检测',
       '模型族標籤；留空 => 從 config.json 的 model_type 自動偵測'],

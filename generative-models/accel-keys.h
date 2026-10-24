@@ -27,10 +27,11 @@ namespace accel {
 // int8 GEMMs in the block. Bool; default false.
 inline constexpr std::string_view kI8Gemm = "i8_gemm";
 // ...and which TIER of them. String: "accurate" (groups of 64 on both
-// operands -- the default, and what an absent key means) or "fast"
-// (rotated int8 at a coarse group: fewer folds per contraction, more
-// error on outlier-free operands, less where a channel stands out). Read
-// only with kI8Gemm on; a family without the fast tier runs accurate.
+// operands, Hadamard-rotated where a bf16 weight is quantized per call
+// -- the default, and what an absent key means) or "fast" (rotated int8
+// at a coarse group: fewer folds per contraction, more error than the
+// rotated accurate tier). Read only with kI8Gemm on; a family without
+// the fast tier runs accurate.
 inline constexpr std::string_view kI8GemmTier = "i8_gemm_tier";
 inline constexpr std::string_view kI8TierAccurate = "accurate";
 inline constexpr std::string_view kI8TierFast = "fast";

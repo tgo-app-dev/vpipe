@@ -88,6 +88,17 @@ struct QuantizeOptions {
   // then come out byte-identical to that model's in-memory w8 build.
   bool bf16_scales = false;
 
+  // THE DTYPE THE PACK WILL RUN IN (model-quantize's `run_dtype`): every
+  // quantized tensor's scales and biases written in it -- BF16 or F16 --
+  // with the codes fit to that rounded pair (AffineQuantizer::Scales), so
+  // the dequant a model of that dtype runs is the one the codes were fit
+  // to. kAsBefore keeps the original format: F16, the codes fit to the
+  // unrounded scale (or bf16_scales' where that is set); a bf16 model then
+  // rounds the F16 pair again at load. Either target supersedes
+  // bf16_scales. MLX's affine format takes either dtype.
+  enum class RunDtype { kAsBefore, kBf16, kF16 };
+  RunDtype run_dtype = RunDtype::kAsBefore;
+
   // Zero-centered RMSNorm convention (the raw-HF Qwen3.5/3.6 family): the
   // checkpoint stores RMSNorm weights centered at 0 and the model applies
   // (1 + weight). vpipe's RMSNorm kernel multiplies by `weight` directly

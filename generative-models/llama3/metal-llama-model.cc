@@ -30,6 +30,38 @@ struct SteelAttnParams {
   int qL_rem, kL_rem, qL_off;
   std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
 };
+
+// A tensor read for the HALF kernels this model runs, in F16 whatever it
+// was stored in: a pack's scales and biases may be BF16 (MLX writes the
+// weight's own dtype; model-quantize's run_dtype bf16) and a norm BF16 or
+// F32. F16 is returned as read.
+SharedBuffer
+f16_read_(WeightSet& ws, const std::string& name,
+          metal_compute::MetalCompute* mc)
+{
+  SharedBuffer raw = ws.read(name, mc, WeightSet::Residency::Copied);
+  const auto* ti = ws.src().info(name);
+  if (raw.empty() || ti == nullptr || ti->dtype == "F16") { return raw; }
+  const bool bf16 = ti->dtype == "BF16";
+  if (!bf16 && ti->dtype != "F32") { return {}; }
+  const std::size_t n = raw.byte_size() / (bf16 ? 2 : 4);
+  SharedBuffer out = mc->make_shared_buffer(n * 2);
+  if (out.empty()) { return {}; }
+  auto* d = static_cast<_Float16*>(out.contents());
+  if (bf16) {
+    const auto* sp = static_cast<const std::uint16_t*>(raw.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t u = (std::uint32_t)sp[i] << 16;
+      float f = 0.0f;
+      std::memcpy(&f, &u, 4);
+      d[i] = (_Float16)f;
+    }
+  } else {
+    const auto* sp = static_cast<const float*>(raw.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)sp[i]; }
+  }
+  return out;
+}
 }  // namespace
 
 std::unique_ptr<MetalLlamaModel>
@@ -143,8 +175,8 @@ MetalLlamaModel::load(std::shared_ptr<WeightSet> ws_in,
     // the LMs (see the note in metal-qwen-model.cc's to_elt).
     const auto cp = WeightSet::Residency::Copied;
     w = wset.read(pfx + ".weight", mc, cp);
-    s = wset.read(pfx + ".scales", mc, cp);
-    b = wset.read(pfx + ".biases", mc, cp);
+    s = f16_read_(wset, pfx + ".scales", mc);
+    b = f16_read_(wset, pfx + ".biases", mc);
     return !w.empty() && !s.empty() && !b.empty();
   };
 
@@ -191,9 +223,8 @@ MetalLlamaModel::load(std::shared_ptr<WeightSet> ws_in,
   for (int L = 0; L < cfg.n_layers; ++L) {
     const std::string p = "model.layers." + std::to_string(L) + ".";
     Layer& ly = m->_layers[L];
-    const auto cp = WeightSet::Residency::Copied;
-    ly.in_ln = wset.read(p + "input_layernorm.weight", mc, cp);
-    ly.post_ln = wset.read(p + "post_attention_layernorm.weight", mc, cp);
+    ly.in_ln = f16_read_(wset, p + "input_layernorm.weight", mc);
+    ly.post_ln = f16_read_(wset, p + "post_attention_layernorm.weight", mc);
     bool ok = !ly.in_ln.empty() && !ly.post_ln.empty();
     ok = ok && qt(p + "self_attn.q_proj", ly.qw, ly.qs, ly.qb);
     ok = ok && qt(p + "self_attn.k_proj", ly.kw, ly.ks, ly.kb);
@@ -211,8 +242,7 @@ MetalLlamaModel::load(std::shared_ptr<WeightSet> ws_in,
 
   bool ok = qt("model.embed_tokens", m->_embed_w, m->_embed_s, m->_embed_b);
   ok = ok && qt("lm_head", m->_lm_w, m->_lm_s, m->_lm_b);
-  m->_final_ln = wset.read("model.norm.weight", mc,
-                           WeightSet::Residency::Copied);
+  m->_final_ln = f16_read_(wset, "model.norm.weight", mc);
   if (!ok || m->_final_ln.empty()) {
     return nullptr;
   }

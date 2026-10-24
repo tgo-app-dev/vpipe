@@ -2715,6 +2715,9 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
         if (info->dtype == "BF16") {
           const auto* s = static_cast<const std::uint16_t*>(raw.contents());
           for (std::size_t i = 0; i < n; ++i) { o[i] = to16(bf16_to_f32_(s[i])); }
+        } else if (info->dtype == "F16") {
+          const auto* s = static_cast<const _Float16*>(raw.contents());
+          for (std::size_t i = 0; i < n; ++i) { o[i] = to16((float)s[i]); }
         } else if (info->dtype == "F32") {
           const auto* s = static_cast<const float*>(raw.contents());
           for (std::size_t i = 0; i < n; ++i) { o[i] = to16(s[i]); }

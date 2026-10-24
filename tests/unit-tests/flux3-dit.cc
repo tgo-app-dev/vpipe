@@ -581,7 +581,8 @@ TEST(flux3_dit, a_mixed_pack_holds_agree)
 // layout_matches_native: every arm -- preloaded, streamed through the
 // slots, streamed without them, promoted -- BYTE-IDENTICAL, and within a
 // gross-error bar of the route this family took before (dequant +
-// requant; VPIPE_I8_SIGNED=0) in distance from the dense (i8 off)
+// requant, its groups unrotated;
+// VPIPE_I8_SIGNED=0 VPIPE_I8_ACC_ROT=0) in distance from the dense (i8 off)
 // forward. 1280 image rows; an
 // 80-row text stream (the signed dequant into matmul2d in its own mode
 // blocks) and an 8-row one (the steel tiles through the signed dequant).
@@ -614,8 +615,12 @@ TEST(flux3_dit, signed_layout_matches_native)
     bool engaged = true;
     auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots) {
       std::vector<float> out;
-      std::unique_ptr<Env> e1, e2;
-      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      std::unique_ptr<Env> e1, e2, e3;
+      if (!sgn) {
+        // The route it replaced: dequant + requant, its groups unrotated.
+        e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0");
+        e3 = std::make_unique<Env>("VPIPE_I8_ACC_ROT", "0");
+      }
       if (!slots) { e2 = std::make_unique<Env>("VPIPE_FLUX3_NO_SLOTS", "1"); }
       MetalFlux3Transformer::Config c = cfg;
       c.i8_gemm = i8;

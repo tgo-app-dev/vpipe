@@ -2254,7 +2254,24 @@ TEST(flux2_smoke, fast_tier_matches_accurate)
     const auto acc = run(dir, true, 0, false, false, true);
     ASSERT_TRUE(!dense.empty() && acc.size() == dense.size());
     if (dense.empty() || acc.size() != dense.size()) { continue; }
-    const double ra = rel_l2_(acc.data(), dense.data(), acc.size());
+    // The bars were set against the accurate tier with its groups
+    // unrotated; the rotation (on by default) lowers that yardstick where
+    // a channel stands out, so the bars hold against the larger of the
+    // two, and the rotated forward is held to a gross bar of the plain.
+    const double ra1 = rel_l2_(acc.data(), dense.data(), acc.size());
+    double ra0 = ra1;
+    {
+      Env plain("VPIPE_I8_ACC_ROT", "0");
+      const auto acc0 = run(dir, true, 0, false, false, true);
+      if (acc0.size() == dense.size()) {
+        ra0 = rel_l2_(acc0.data(), dense.data(), acc0.size());
+      }
+    }
+    std::printf("[flux2_smoke] %s, accurate tier vs the dense forward: "
+                "%.3e rotated, %.3e plain\n", is_pack ? "w8 pack" : "bf16",
+                ra1, ra0);
+    EXPECT_TRUE(ra1 <= 1.25 * ra0);
+    const double ra = std::max(ra1, ra0);
     for (int tier : {1, 2, 3}) {
       engaged = true;
       const auto pre = run(dir, true, tier, false, false, true);

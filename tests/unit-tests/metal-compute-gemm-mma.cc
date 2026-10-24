@@ -34,8 +34,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <memory>
 #include <random>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -5534,6 +5537,958 @@ TEST(gemm_i8, w8_against_bf16_routes) {
                   "%.2fx bf16  %.2fx bf16+i8\n", arms[a].name, med[a],
                   gflop / med[a], med[0] / med[a], med[1] / med[a]);
     }
+  }
+}
+
+// THE TIERS SIDE BY SIDE, as a DiT's projections pay them: Qwen-Image-
+// 2.1's block at 4096 rows (a 1024^2 picture) -- q/k/v/out, the feed-
+// forward up and down -- through the I8GemmContext calls the families
+// make, beside the dense bf16 matmul2d tile they pick by K. Each int8
+// arm is timed as a ROUTE (its activation quantizer, and the accurate
+// tier's per-call weight requant on a bf16 weight, plus the GEMM) and,
+// for the fast and token layouts, as the GEMM ALONE over one activation
+// quantized beforehand. Throughput is 2 M N K over the time whatever the
+// operand type. Before the timing, every route's error against f64 at
+// the int8 floor (1024 rows), on activations with outlier channels (1 in
+// 64 x24) -- where the tiers differ. Weights cycled so each call reads
+// cold; arms interleaved, the order reversed every round, medians kept.
+// VPIPE_I8_TIER_BENCH=1 runs it; VPIPE_I8_TIER_SHAPES="M:N:K,..."
+// picks other shapes; VPIPE_I8_TIER_ROUNDS / _ITERS shorten it (a
+// fanless box throttles within a minute).
+TEST(gemm_i8, tier_throughput) {
+  if (std::getenv("VPIPE_I8_TIER_BENCH") == nullptr) {
+    std::printf("[gemm_i8tier] VPIPE_I8_TIER_BENCH unset -- skip\n");
+    return;
+  }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) {
+    std::printf("[gemm_i8tier] no matrix cores -- skip\n");
+    return;
+  }
+  using Ctx = vpipe::genai::I8GemmContext;
+  ComputeLibrary lib_mma = mc->load_library("dense_gemm_mma_bf16");
+  ComputeFunction f_n128 = lib_mma.function("dense_gemm_mma_t_n128_f16");
+  ComputeFunction f_deep = lib_mma.function("dense_gemm_mma_t_n128x256_f16");
+  ComputeFunction f_tn2 =
+      lib_mma.function("dense_gemm_mma_t_n128x256_tn2_f16");
+  // One context a route, and one more for each GEMM-alone arm: a route's
+  // own quantizer resets what quantize_fast left.
+  Ctx acc(mc, true, true);
+  Ctx fast(mc, true, true), fastq(mc, true, true);
+  Ctx tok(mc, true, true), tokq(mc, true, true);
+  Ctx plain(mc, true, true), plainq(mc, true, true);
+  for (Ctx* c : {&fast, &fastq}) { c->set_tier(Ctx::Tier::kFast); }
+  for (Ctx* c : {&tok, &tokq, &plain, &plainq}) {
+    c->set_tier(Ctx::Tier::kToken);
+  }
+  for (Ctx* c : {&tok, &tokq}) { c->set_token_rotation(true); }
+  for (Ctx* c : {&plain, &plainq}) { c->set_token_rotation(false); }
+  if (!f_n128.valid() || !f_deep.valid() || !f_tn2.valid() ||
+      !acc.enabled() || !acc.signed_available(8) ||
+      fast.tier() != Ctx::Tier::kFast || tok.tier() != Ctx::Tier::kToken ||
+      !tok.token_rotated() || plain.token_rotated()) {
+    std::printf("[gemm_i8tier] a kernel is missing, or VPIPE_I8_TIER / "
+                "VPIPE_I8_TOKEN_ROT is set -- skip\n");
+    return;
+  }
+  std::printf("[gemm_i8tier] token kernel: %s\n", tok.token_kernel().c_str());
+  auto bf16 = [](float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (std::uint16_t)(u >> 16);
+  };
+  auto from_bf16 = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  // The family's dense tile by reduction depth (Qwen-Image-2.1's and
+  // FLUX.3's rule) -- or, `tile` 0 / 1 / 2, one forced, so the int8 arms
+  // can be held to the fastest dense tile as well as the one they replace.
+  auto dense = [&](ComputeEncoder& e, const SharedBuffer& x,
+                   const SharedBuffer& w, const SharedBuffer& y, int M,
+                   int N, int K, int tile = -1) {
+    const ComputeFunction* f = &f_deep;
+    int RN = 256;
+    if (tile < 0) { tile = K < 6144 ? 0 : (K < 12288 ? 1 : 2); }
+    if (tile == 0) { f = &f_n128; RN = 128; }
+    else if (tile == 1) { f = &f_tn2; RN = 512; }
+    e.set_function(*f);
+    e.set_buffer(0, x); e.set_buffer(1, w); e.set_buffer(2, w);
+    e.set_buffer(3, y);
+    e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+    e.set_constant(7, 0);
+    e.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
+                (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+  };
+  struct Lay { Ctx* ctx; int gc; const char* name; };
+  const SharedBuffer none;
+
+  // ---- accuracy against f64 at the floor -----------------------------
+  // Gaussian activations, then the same with outlier channels: the tiers
+  // rank differently on the two.
+  for (const bool outliers : {false, true}) {
+    const int M = 1024, N = 256, K = 4096;
+    std::mt19937 rng(2026u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> xh((std::size_t)M * K), wh((std::size_t)N * K);
+    for (std::size_t i = 0; i < xh.size(); ++i) {
+      const bool outlier = outliers && (i % K) % 64 == 0;
+      xh[i] = bf16(nd(rng) * 0.5f * (outlier ? 24.0f : 1.0f));
+    }
+    for (auto& v : wh) { v = bf16(nd(rng) * 0.02f); }
+    std::vector<double> truth((std::size_t)M * N);
+    double tn = 0.0;
+    {
+      std::vector<double> xd(xh.size()), wd(wh.size());
+      for (std::size_t i = 0; i < xh.size(); ++i) { xd[i] = from_bf16(xh[i]); }
+      for (std::size_t i = 0; i < wh.size(); ++i) { wd[i] = from_bf16(wh[i]); }
+      for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+          const double* a = xd.data() + (std::size_t)m * K;
+          const double* b = wd.data() + (std::size_t)n * K;
+          double t = 0.0;
+          for (int k = 0; k < K; ++k) { t += a[k] * b[k]; }
+          truth[(std::size_t)m * N + n] = t;
+          tn += t * t;
+        }
+      }
+    }
+    SharedBuffer x = mc->make_shared_buffer(xh.size() * 2);
+    SharedBuffer w = mc->make_shared_buffer(wh.size() * 2);
+    std::memcpy(x.contents(), xh.data(), xh.size() * 2);
+    std::memcpy(w.contents(), wh.data(), wh.size() * 2);
+    auto rel = [&](const SharedBuffer& y) {
+      const auto* p = static_cast<const std::uint16_t*>(y.contents());
+      double e = 0.0;
+      for (std::size_t i = 0; i < truth.size(); ++i) {
+        const double d = from_bf16(p[i]) - truth[i];
+        e += d * d;
+      }
+      return std::sqrt(e / tn);
+    };
+    const std::size_t yb = (std::size_t)M * N * 2;
+    SharedBuffer y_bf = mc->make_shared_buffer(yb);
+    SharedBuffer y_acc = mc->make_shared_buffer(yb);
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        dense(e, x, w, y_bf, M, N, K);
+        EXPECT_TRUE(acc.gemm(e, x, 0, w, y_acc, 0, M, N, K)); }
+      st.commit().wait(); }
+    std::printf("[gemm_i8tier] rel-L2 vs f64, %dx%dx%d, %s:\n", M, N, K,
+                outliers ? "outlier channels (1/64 x24)"
+                         : "gaussian activations");
+    std::printf("[gemm_i8tier]   %-24s %.3e\n", "bf16 matmul2d", rel(y_bf));
+    std::printf("[gemm_i8tier]   %-24s %.3e\n", "accurate (g64)",
+                rel(y_acc));
+    for (const Lay& l : {Lay{&fast, fast.fast_group(K), "fast (g512, rot)"},
+                         Lay{&tok, tok.fast_group(K), "token (rot)"},
+                         Lay{&plain, plain.fast_group(K), "token_plain"}}) {
+      SharedBuffer c = mc->make_shared_buffer((std::size_t)N * K);
+      SharedBuffer sc =
+          mc->make_shared_buffer(Ctx::fast_scale_bytes(N, K, l.gc));
+      SharedBuffer y = mc->make_shared_buffer(yb);
+      bool ok = l.gc > 0;
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          ok = ok && l.ctx->encode_quant_fast(e, w, c, sc, l.gc, N, K) &&
+               l.ctx->gemm_fast(e, x, 0, c, sc, l.gc, none, y, 0, M, N, K);
+        }
+        st.commit().wait(); }
+      EXPECT_TRUE(ok);
+      std::printf("[gemm_i8tier]   %-24s %.3e\n", l.name, ok ? rel(y) : -1.0);
+    }
+  }
+
+  // ---- throughput --------------------------------------------------
+  struct Shape { int M, N, K; const char* name; };
+  std::vector<Shape> shapes = {{4096, 4096, 4096, "q/k/v/out"},
+                               {4096, 12288, 4096, "ff up"},
+                               {4096, 4096, 12288, "ff down"}};
+  if (const char* e = std::getenv("VPIPE_I8_TIER_SHAPES")) {
+    shapes.clear();
+    const std::string want = e;
+    for (std::size_t b = 0; b < want.size();) {
+      std::size_t end = want.find(',', b);
+      if (end == std::string::npos) { end = want.size(); }
+      int m = 0, n = 0, k = 0;
+      if (std::sscanf(want.substr(b, end - b).c_str(), "%d:%d:%d", &m, &n,
+                      &k) == 3) {
+        shapes.push_back({m, n, k, "shape"});
+      }
+      b = end + 1;
+    }
+  }
+  auto env_int = [](const char* n, int d) {
+    const char* v = std::getenv(n);
+    return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : d;
+  };
+  const int kRounds = env_int("VPIPE_I8_TIER_ROUNDS", 5);
+  const int kIters = env_int("VPIPE_I8_TIER_ITERS", 6);
+  constexpr int kWeights = 4;   // cycled, so each call reads cold
+  for (const Shape& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K, G = K / 64;
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+    if (x.empty() || y.empty()) { continue; }
+    auto* px = static_cast<std::uint16_t*>(x.contents());
+    for (std::size_t j = 0; j < (std::size_t)M * K; ++j) {
+      px[j] = bf16(0.25f * (float)((int)(j % 7) - 3));
+    }
+    // Dense weights; a w8 pack in the signed layout (codes, scales, b');
+    // and each coarse layout converted from the dense weight, untimed.
+    std::vector<SharedBuffer> wd, wcs, ws, wb2;
+    std::vector<std::vector<SharedBuffer>> lc(3), ls(3);
+    const Lay lays[3] = {{&fast, fast.fast_group(K), "fast"},
+                         {&tok, tok.fast_group(K), "token"},
+                         {&plain, plain.fast_group(K), "token_plain"}};
+    bool ok = true;
+    for (int i = 0; i < kWeights && ok; ++i) {
+      wd.push_back(mc->make_shared_buffer((std::size_t)N * K * 2));
+      wcs.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      ws.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wb2.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      ok = !wd.back().empty() && !wcs.back().empty();
+      if (!ok) { break; }
+      auto* pd = static_cast<std::uint16_t*>(wd.back().contents());
+      for (std::size_t j = 0; j < (std::size_t)N * K; ++j) {
+        pd[j] = bf16(0.01f * (float)((int)((j + i) % 11) - 5));
+      }
+      std::memset(wcs.back().contents(), (0x5a + i) ^ 0x80,
+                  wcs.back().byte_size());
+      auto* ps = static_cast<std::uint16_t*>(ws.back().contents());
+      auto* pb = static_cast<std::uint16_t*>(wb2.back().contents());
+      for (std::size_t j = 0; j < (std::size_t)N * G; ++j) {
+        ps[j] = bf16(0.0005f);
+        pb[j] = bf16(-0.05f + 128.0f * 0.0005f);
+      }
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        for (int l = 0; l < 3 && ok; ++l) {
+          lc[l].push_back(mc->make_shared_buffer((std::size_t)N * K));
+          ls[l].push_back(mc->make_shared_buffer(
+              Ctx::fast_scale_bytes(N, K, lays[l].gc)));
+          ok = lays[l].gc > 0 && !lc[l].back().empty() &&
+               lays[l].ctx->encode_quant_fast(e, wd.back(), lc[l].back(),
+                                              ls[l].back(), lays[l].gc, N,
+                                              K);
+        } }
+      st.commit().wait();
+    }
+    if (!ok) {
+      std::printf("[gemm_i8tier] setup failed at %dx%dx%d -- skip\n", M, N,
+                  K);
+      continue;
+    }
+    // The GEMM-alone arms' activation, quantized once.
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        ok = fastq.quantize_fast(e, x, 0, M, K, lays[0].gc) &&
+             tokq.quantize_fast(e, x, 0, M, K, lays[1].gc) &&
+             plainq.quantize_fast(e, x, 0, M, K, lays[2].gc); }
+      st.commit().wait(); }
+    EXPECT_TRUE(ok);
+    struct Arm { const char* name; std::function<bool(ComputeEncoder&, int)>
+                 run; };
+    std::vector<Arm> arms = {
+        {"bf16 matmul2d",
+         [&](ComputeEncoder& e, int i) {
+           dense(e, x, wd[i], y, M, N, K);
+           return true;
+         }},
+        {"bf16, tile 128x128",
+         [&](ComputeEncoder& e, int i) {
+           dense(e, x, wd[i], y, M, N, K, 0);
+           return true;
+         }},
+        {"bf16, tile 128x256 tn2",
+         [&](ComputeEncoder& e, int i) {
+           dense(e, x, wd[i], y, M, N, K, 1);
+           return true;
+         }},
+        {"bf16, tile 128x256",
+         [&](ComputeEncoder& e, int i) {
+           dense(e, x, wd[i], y, M, N, K, 2);
+           return true;
+         }},
+        {"accurate, bf16 weight",
+         [&](ComputeEncoder& e, int i) {
+           return acc.gemm(e, x, 0, wd[i], y, 0, M, N, K);
+         }},
+        {"accurate, w8 signed",
+         [&](ComputeEncoder& e, int i) {
+           return acc.gemm_signed(e, x, 0, wcs[i], ws[i], wb2[i], 8, y, 0,
+                                  M, N, K);
+         }},
+        {"fast g512 rot",
+         [&](ComputeEncoder& e, int i) {
+           return fast.gemm_fast(e, x, 0, lc[0][i], ls[0][i], lays[0].gc,
+                                 none, y, 0, M, N, K);
+         }},
+        {"token rot",
+         [&](ComputeEncoder& e, int i) {
+           return tok.gemm_fast(e, x, 0, lc[1][i], ls[1][i], lays[1].gc,
+                                none, y, 0, M, N, K);
+         }},
+        {"token_plain",
+         [&](ComputeEncoder& e, int i) {
+           return plain.gemm_fast(e, x, 0, lc[2][i], ls[2][i], lays[2].gc,
+                                  none, y, 0, M, N, K);
+         }},
+        {"fast: GEMM alone",
+         [&](ComputeEncoder& e, int i) {
+           return fastq.gemm_fast_quantized(e, lc[0][i], ls[0][i],
+                                            lays[0].gc, none, y, 0, M, N, K);
+         }},
+        {"token: GEMM alone",
+         [&](ComputeEncoder& e, int i) {
+           return tokq.gemm_fast_quantized(e, lc[1][i], ls[1][i],
+                                           lays[1].gc, none, y, 0, M, N, K);
+         }},
+        {"token_plain: GEMM alone",
+         [&](ComputeEncoder& e, int i) {
+           return plainq.gemm_fast_quantized(e, lc[2][i], ls[2][i],
+                                             lays[2].gc, none, y, 0, M, N,
+                                             K);
+         }},
+    };
+    // One stream for every sample: a fresh queue's first commit costs
+    // a millisecond or two.
+    CommandStream st = mc->make_command_stream();
+    bool ran = true;
+    auto sample = [&](const Arm& a) {
+      const auto t0 = std::chrono::steady_clock::now();
+      { ComputeEncoder e = st.begin_compute();
+        for (int i = 0; i < kIters; ++i) {
+          ran = a.run(e, i % kWeights) && ran;
+        } }
+      st.commit().wait();
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count() / kIters;
+    };
+    for (const Arm& a : arms) { (void)sample(a); }   // warm, build scratch
+    std::vector<std::vector<double>> t(arms.size());
+    for (int r = 0; r < kRounds; ++r) {
+      for (std::size_t k = 0; k < arms.size(); ++k) {
+        const std::size_t a = (r % 2 == 0) ? k : arms.size() - 1 - k;
+        t[a].push_back(sample(arms[a]));
+      }
+    }
+    EXPECT_TRUE(ran);
+    const double gflop = 2.0 * M * (double)N * K * 1e-9;
+    std::printf("[gemm_i8tier] %s: M=%d N=%d K=%d (%.0f GFLOP a call; "
+                "medians of %d rounds x %d calls)\n", sh.name, M, N, K,
+                gflop, kRounds, kIters);
+    // The median, and the best sample (the coolest moment of the run).
+    double base = 0.0;
+    for (std::size_t a = 0; a < arms.size(); ++a) {
+      std::sort(t[a].begin(), t[a].end());
+      const double med = t[a][t[a].size() / 2], best = t[a].front();
+      if (a == 0) { base = med; }
+      std::printf("[gemm_i8tier]   %-24s %7.2f ms  %6.2f TFLOP/s (best "
+                  "%6.2f)  %.2fx bf16\n", arms[a].name, med, gflop / med,
+                  gflop / best, base / med);
+    }
+  }
+}
+
+// EVERY TIER'S OUTPUT ON GIVEN OPERANDS, for checking a restatement of
+// the tiers' arithmetic against the kernels: VPIPE_I8_ACC_DIR holds
+// <case>.shape ("M N K"), <case>.x (bf16 [M, K]) and <case>.w (bf16
+// [N, K]); the test writes <case>.y_<tier> (bf16 [M, N]) through the
+// I8GemmContext calls the families make -- accurate on a bf16 weight
+// (gemm), the others converted by encode_quant_fast, then gemm_fast --
+// and <case>.y_accurate_rot, the accurate tier with its groups rotated
+// (set_g64_rotation), where the host has those quantizers.
+TEST(gemm_i8, tier_outputs_from_files) {
+  const char* dir = std::getenv("VPIPE_I8_ACC_DIR");
+  if (dir == nullptr) {
+    std::printf("[gemm_i8acc] VPIPE_I8_ACC_DIR unset -- skip\n");
+    return;
+  }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) {
+    std::printf("[gemm_i8acc] no matrix cores -- skip\n");
+    return;
+  }
+  using Ctx = vpipe::genai::I8GemmContext;
+  Ctx acc(mc, true, true), fast(mc, true, true);
+  Ctx tok(mc, true, true), plain(mc, true, true), accr(mc, true, true);
+  fast.set_tier(Ctx::Tier::kFast);
+  tok.set_tier(Ctx::Tier::kToken);
+  plain.set_tier(Ctx::Tier::kToken);
+  tok.set_token_rotation(true);
+  plain.set_token_rotation(false);
+  (void)acc.set_g64_rotation(false);
+  const bool rot = accr.set_g64_rotation(true);
+  auto slurp = [](const std::string& p, std::size_t n, void* dst) {
+    FILE* f = std::fopen(p.c_str(), "rb");
+    if (f == nullptr) { return false; }
+    const bool ok = std::fread(dst, 1, n, f) == n;
+    std::fclose(f);
+    return ok;
+  };
+  auto spill = [](const std::string& p, const SharedBuffer& b,
+                  std::size_t n) {
+    if (FILE* f = std::fopen(p.c_str(), "wb")) {
+      std::fwrite(b.contents(), 1, n, f);
+      std::fclose(f);
+    }
+  };
+  const SharedBuffer none;
+  int cases = 0;
+  for (const auto& de : std::filesystem::directory_iterator(dir)) {
+    if (de.path().extension() != ".shape") { continue; }
+    const std::string stem =
+        (de.path().parent_path() / de.path().stem()).string();
+    int M = 0, N = 0, K = 0;
+    if (FILE* f = std::fopen(de.path().c_str(), "r")) {
+      if (std::fscanf(f, "%d %d %d", &M, &N, &K) != 3) { M = 0; }
+      std::fclose(f);
+    }
+    if (M <= 0) { continue; }
+    const std::size_t xb = (std::size_t)M * K * 2, wb = (std::size_t)N * K * 2;
+    const std::size_t yb = (std::size_t)M * N * 2;
+    SharedBuffer x = mc->make_shared_buffer(xb);
+    SharedBuffer w = mc->make_shared_buffer(wb);
+    // ASSERT_TRUE records and carries on: a case not read is skipped
+    // here, or its outputs would be written from whatever was there.
+    const bool read = !x.empty() && !w.empty() &&
+                      slurp(stem + ".x", xb, x.contents()) &&
+                      slurp(stem + ".w", wb, w.contents());
+    ASSERT_TRUE(read);
+    if (!read) { continue; }
+    SharedBuffer y = mc->make_shared_buffer(yb);
+    bool ok = false;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        ok = acc.gemm(e, x, 0, w, y, 0, M, N, K); }
+      st.commit().wait(); }
+    EXPECT_TRUE(ok);
+    if (ok) { spill(stem + ".y_accurate", y, yb); }
+    if (rot) {
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          ok = accr.gemm(e, x, 0, w, y, 0, M, N, K); }
+        st.commit().wait(); }
+      EXPECT_TRUE(ok);
+      if (ok) { spill(stem + ".y_accurate_rot", y, yb); }
+    }
+    struct Lay { Ctx* ctx; const char* name; };
+    for (const Lay& l : {Lay{&fast, "fast"}, Lay{&tok, "token"},
+                         Lay{&plain, "token_plain"}}) {
+      const int gc = l.ctx->fast_group(K);
+      SharedBuffer c = mc->make_shared_buffer((std::size_t)N * K);
+      SharedBuffer sc =
+          mc->make_shared_buffer(Ctx::fast_scale_bytes(N, K, gc));
+      ok = gc > 0;
+      { CommandStream st = mc->make_command_stream();
+        { ComputeEncoder e = st.begin_compute();
+          ok = ok && l.ctx->encode_quant_fast(e, w, c, sc, gc, N, K) &&
+               l.ctx->gemm_fast(e, x, 0, c, sc, gc, none, y, 0, M, N, K); }
+        st.commit().wait(); }
+      EXPECT_TRUE(ok);
+      if (ok) { spill(stem + ".y_" + l.name, y, yb); }
+      std::printf("[gemm_i8acc] %s %dx%dx%d %s gc %d: %s\n",
+                  de.path().stem().c_str(), M, N, K, l.name, gc,
+                  ok ? "written" : "FAILED");
+    }
+    ++cases;
+  }
+  std::printf("[gemm_i8acc] %d cases\n", cases);
+  EXPECT_TRUE(cases > 0);
+}
+
+// THE ACCURATE TIER'S QUANTIZERS, plain and rotated (set_g64_rotation),
+// each with its padded twin: codes and scales BIT-EXACT against a CPU
+// restatement -- per group of 64, the rotated pair's Walsh-Hadamard in
+// Sylvester order, strides ascending, each butterfly a + b / a - b in
+// f32, then x 1/8; amax; codes rint(v * 127 / amax) clamped to 127;
+// scale amax / 127 in bf16; a padded row's tail groups zero-filled --
+// and both ways' error against f64 at the int8 floor (1024 rows) through
+// gemm(): gaussian activations, where the rotation changes nothing;
+// outlier channels (1 in 64 x24), where it spreads each over its group;
+// the same at an unaligned K (the padded pair); and activations sharing
+// a large common offset, the case it LOSES -- the transform gathers a
+// group's mean into one coefficient, eight times the mean, which then
+// sets the group's scale. And gemm_unrotated (what a P.V GEMM takes) on
+// a rotated context BYTE-IDENTICAL to the plain route, even with
+// VPIPE_I8_ACC_ROT=1 forcing the rotation on.
+TEST(gemm_i8, g64_quantizers_match_their_restatement) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) {
+    std::printf("[gemm_i8rot] no matrix cores -- skip\n");
+    return;
+  }
+  using Ctx = vpipe::genai::I8GemmContext;
+  Ctx acc(mc, true, true), accr(mc, true, true);
+  (void)acc.set_g64_rotation(false);
+  const bool rot = accr.set_g64_rotation(true);
+  // A context the environment forces to rotate.
+  std::unique_ptr<Ctx> forced;
+  {
+    const char* was = std::getenv("VPIPE_I8_ACC_ROT");
+    const std::string keep = was != nullptr ? was : "";
+    ::setenv("VPIPE_I8_ACC_ROT", "1", 1);
+    forced = std::make_unique<Ctx>(mc, true, true);
+    (void)forced->set_g64_rotation(false);   // the environment wins
+    if (was != nullptr) {
+      ::setenv("VPIPE_I8_ACC_ROT", keep.c_str(), 1);
+    } else {
+      ::unsetenv("VPIPE_I8_ACC_ROT");
+    }
+  }
+  ComputeLibrary lib_q = mc->load_library("affine_dequant_bf16");
+  const ComputeFunction fns[4] = {
+      lib_q.function("quant_f16_i8_row_g64"),
+      lib_q.function("quant_f16_i8_row_g64_pad"),
+      lib_q.function("quant_f16_i8_row_g64_r"),
+      lib_q.function("quant_f16_i8_row_g64_r_pad")};
+  if (!acc.enabled() || !rot || acc.g64_rotated() ||
+      !forced->g64_rotated() || !fns[0].valid() || !fns[1].valid() ||
+      !fns[2].valid() || !fns[3].valid()) {
+    std::printf("[gemm_i8rot] a kernel is missing, or VPIPE_I8_ACC_ROT / "
+                "VPIPE_I8_GROUP is set -- skip\n");
+    return;
+  }
+  auto bf16 = [](float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (std::uint16_t)(u >> 16);
+  };
+  auto from_bf16 = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+
+  // ---- codes and scales against the CPU ------------------------------
+  const char* names[4] = {"plain", "plain, padded", "rotated",
+                          "rotated, padded"};
+  for (int k = 0; k < 4; ++k) {
+    const bool rotated = k >= 2, padded = (k & 1) != 0;
+    const int R = 256, Ks = padded ? 4000 : 4096;
+    const int Kp = (Ks + 63) / 64 * 64, G = Kp / 64;
+    std::mt19937 rng(7u + (unsigned)k);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> xh((std::size_t)R * Ks);
+    for (std::size_t i = 0; i < xh.size(); ++i) {
+      xh[i] = bf16(nd(rng) * ((i % Ks) % 64 == 0 ? 12.0f : 0.5f));
+    }
+    SharedBuffer x = mc->make_shared_buffer(xh.size() * 2);
+    SharedBuffer q = mc->make_shared_buffer((std::size_t)R * Kp);
+    SharedBuffer sc = mc->make_shared_buffer((std::size_t)R * G * 2);
+    ASSERT_TRUE(!x.empty() && !q.empty() && !sc.empty());
+    if (x.empty() || q.empty() || sc.empty()) { continue; }
+    std::memcpy(x.contents(), xh.data(), xh.size() * 2);
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        e.set_function(fns[k]);
+        e.set_buffer(0, x); e.set_buffer(1, q); e.set_buffer(2, sc);
+        e.set_constant(3, Ks);
+        if (padded) { e.set_constant(4, Kp); }
+        e.dispatch({256u, (unsigned)R, 1}, {256, 1, 1}); }
+      st.commit().wait(); }
+    const auto* qg = static_cast<const std::int8_t*>(q.contents());
+    const auto* sg = static_cast<const std::uint16_t*>(sc.contents());
+    std::size_t bad_q = 0, bad_s = 0;
+    for (int r = 0; r < R; ++r) {
+      for (int g = 0; g < G; ++g) {
+        float v[64];
+        for (int i = 0; i < 64; ++i) {
+          const int col = g * 64 + i;
+          v[i] = col < Ks ? from_bf16(xh[(std::size_t)r * Ks + col]) : 0.0f;
+        }
+        if (rotated) {
+          for (int h = 1; h < 64; h *= 2) {
+            for (int i = 0; i < 64; ++i) {
+              if ((i & h) != 0) { continue; }
+              const float a = v[i], b = v[i + h];
+              v[i] = a + b;
+              v[i + h] = a - b;
+            }
+          }
+          for (float& t : v) { t *= 0.125f; }
+        }
+        float am = 0.0f;
+        for (const float t : v) { am = std::max(am, std::fabs(t)); }
+        const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+        for (int i = 0; i < 64; ++i) {
+          const int c = std::clamp((int)std::nearbyint(v[i] * inv), -127,
+                                   127);
+          bad_q += qg[(std::size_t)r * Kp + g * 64 + i] != c;
+        }
+        bad_s += sg[(std::size_t)r * G + g] != bf16(am * (1.0f / 127.0f));
+      }
+    }
+    std::printf("[gemm_i8rot] %s quantizer vs CPU, %d rows x %d (%d): %zu "
+                "of %d codes and %zu of %d scales differ\n", names[k], R,
+                Ks, Kp, bad_q, R * Kp, bad_s, R * G);
+    EXPECT_TRUE(bad_q == 0 && bad_s == 0);
+  }
+
+  // ---- error against f64 at the floor --------------------------------
+  struct Case { int K; float outlier, offset; const char* name; };
+  for (const Case& c :
+       {Case{4096, 1.0f, 0.0f, "gaussian"},
+        Case{4096, 24.0f, 0.0f, "outlier channels (1/64 x24)"},
+        Case{4000, 24.0f, 0.0f, "outliers, K 4000 (padded)"},
+        Case{4096, 1.0f, 4.0f, "a common offset (4 sigma)"}}) {
+    const int M = 1024, N = 256, K = c.K;
+    std::mt19937 rng(2026u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::uint16_t> xh((std::size_t)M * K), wh((std::size_t)N * K);
+    for (std::size_t i = 0; i < xh.size(); ++i) {
+      const bool outlier = (i % K) % 64 == 0;
+      xh[i] = bf16(0.5f * (nd(rng) * (outlier ? c.outlier : 1.0f) +
+                           c.offset));
+    }
+    for (auto& v : wh) { v = bf16(nd(rng) * 0.02f); }
+    std::vector<double> truth((std::size_t)M * N);
+    double tn = 0.0;
+    {
+      std::vector<double> xd(xh.size()), wd(wh.size());
+      for (std::size_t i = 0; i < xh.size(); ++i) { xd[i] = from_bf16(xh[i]); }
+      for (std::size_t i = 0; i < wh.size(); ++i) { wd[i] = from_bf16(wh[i]); }
+      for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+          const double* a = xd.data() + (std::size_t)m * K;
+          const double* b = wd.data() + (std::size_t)n * K;
+          double t = 0.0;
+          for (int k = 0; k < K; ++k) { t += a[k] * b[k]; }
+          truth[(std::size_t)m * N + n] = t;
+          tn += t * t;
+        }
+      }
+    }
+    SharedBuffer x = mc->make_shared_buffer(xh.size() * 2);
+    SharedBuffer w = mc->make_shared_buffer(wh.size() * 2);
+    std::memcpy(x.contents(), xh.data(), xh.size() * 2);
+    std::memcpy(w.contents(), wh.data(), wh.size() * 2);
+    auto rel = [&](const SharedBuffer& y) {
+      const auto* p = static_cast<const std::uint16_t*>(y.contents());
+      double e = 0.0;
+      for (std::size_t i = 0; i < truth.size(); ++i) {
+        const double d = from_bf16(p[i]) - truth[i];
+        e += d * d;
+      }
+      return std::sqrt(e / tn);
+    };
+    const std::size_t yb = (std::size_t)M * N * 2;
+    SharedBuffer yp = mc->make_shared_buffer(yb);
+    SharedBuffer yr = mc->make_shared_buffer(yb);
+    SharedBuffer yu = mc->make_shared_buffer(yb);
+    SharedBuffer yf = mc->make_shared_buffer(yb);
+    bool ok = false;
+    { CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        ok = acc.gemm(e, x, 0, w, yp, 0, M, N, K) &&
+             accr.gemm(e, x, 0, w, yr, 0, M, N, K) &&
+             accr.gemm_unrotated(e, x, 0, w, yu, 0, M, N, K) &&
+             forced->gemm_unrotated(e, x, 0, w, yf, 0, M, N, K); }
+      st.commit().wait(); }
+    ASSERT_TRUE(ok);
+    if (!ok) { continue; }
+    const double ep = rel(yp), er = rel(yr);
+    const bool unrot =
+        std::memcmp(yu.contents(), yp.contents(), yb) == 0 &&
+        std::memcmp(yf.contents(), yp.contents(), yb) == 0;
+    std::printf("[gemm_i8rot] rel-L2 vs f64, %dx%dx%d, %s: plain %.3e, "
+                "rotated %.3e (%.2fx); unrotated calls %s\n", M, N, K,
+                c.name, ep, er, ep / er, unrot ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(unrot);
+    if (c.offset > 0.0f) {
+      // The trade, held to a gross bar: worse, but an int8 GEMM still.
+      EXPECT_TRUE(er < 0.05);
+    } else {
+      EXPECT_TRUE(c.outlier > 1.0f ? er < ep : er < 1.2 * ep);
+    }
+  }
+}
+
+// WHAT ROTATING THE ACCURATE TIER COSTS (set_g64_rotation): each group of
+// 64 Walsh-Hadamard transformed before its scale is taken, on both
+// operands -- only the quantizers change; the g64 GEMM is the same
+// kernel (gemm_i8.g64_quantizers_match_their_restatement holds the
+// codes and the error). At Qwen-Image-2.1's block shapes at 4096 rows,
+// arms interleaved with the order reversed every round, medians: the
+// accurate ROUTE on a bf16 weight --
+// both operands quantized per call, then the GEMM, which is what a bf16
+// checkpoint runs -- plain and rotated; the activation quantizer alone,
+// each way; the route with the weight quantized beforehand (what a HELD
+// int8 layout would pay), each way; the GEMM alone; and, for reference,
+// the dense bf16 tile the families pick and the signed w8 route a pack
+// takes (its codes are the pack's own, so no rotation reaches it). Last,
+// a Qwen-Image-2.1 block's seven projections summed (q, k, v and out at
+// 4096^3, gate and up at N 12288, down at K 12288), each way.
+// VPIPE_I8_G64ROT_BENCH=1 runs it; VPIPE_I8_TIER_ROUNDS / _ITERS shorten
+// it (a fanless box throttles within a minute).
+TEST(gemm_i8, g64_rotation_cost) {
+  if (std::getenv("VPIPE_I8_G64ROT_BENCH") == nullptr) {
+    std::printf("[gemm_i8rot] VPIPE_I8_G64ROT_BENCH unset -- skip\n");
+    return;
+  }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) {
+    std::printf("[gemm_i8rot] no matrix cores -- skip\n");
+    return;
+  }
+  using Ctx = vpipe::genai::I8GemmContext;
+  Ctx acc(mc, true, true), accr(mc, true, true);
+  (void)acc.set_g64_rotation(false);
+  const bool rot = accr.set_g64_rotation(true);
+  ComputeLibrary lib_q = mc->load_library("affine_dequant_bf16");
+  ComputeLibrary lib_g = mc->load_library("dense_gemm_mma_bf16");
+  ComputeFunction f_q = lib_q.function("quant_f16_i8_row_g64");
+  ComputeFunction f_qr = lib_q.function("quant_f16_i8_row_g64_r");
+  ComputeFunction f_g = lib_g.function("gemm_i8i8_sc_f16_n64_g64rs");
+  ComputeFunction f_n128 = lib_g.function("dense_gemm_mma_t_n128_f16");
+  ComputeFunction f_deep = lib_g.function("dense_gemm_mma_t_n128x256_f16");
+  ComputeFunction f_tn2 =
+      lib_g.function("dense_gemm_mma_t_n128x256_tn2_f16");
+  if (!acc.enabled() || !rot || acc.g64_rotated() ||
+      !acc.signed_available(8) || !f_q.valid() || !f_qr.valid() ||
+      !f_g.valid() || !f_n128.valid() || !f_deep.valid() ||
+      !f_tn2.valid()) {
+    std::printf("[gemm_i8rot] a kernel is missing, or VPIPE_I8_ACC_ROT / "
+                "VPIPE_I8_GROUP is set -- skip\n");
+    return;
+  }
+  auto bf16 = [](float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (std::uint16_t)(u >> 16);
+  };
+  // The quantizer and the GEMM as gemm() dispatches them.
+  auto quant = [&](ComputeEncoder& e, const ComputeFunction& f,
+                   const SharedBuffer& src, const SharedBuffer& q,
+                   const SharedBuffer& sc, int rows, int K) {
+    e.set_function(f);
+    e.set_buffer(0, src); e.set_buffer(1, q); e.set_buffer(2, sc);
+    e.set_constant(3, K);
+    e.dispatch({256u, (unsigned)rows, 1}, {256, 1, 1});
+  };
+  auto i8gemm = [&](ComputeEncoder& e, const SharedBuffer& xq,
+                    const SharedBuffer& wq, const SharedBuffer& as,
+                    const SharedBuffer& ws, const SharedBuffer& y, int M,
+                    int N, int K) {
+    e.set_function(f_g);
+    e.set_buffer(0, xq); e.set_buffer(1, wq); e.set_buffer(2, as);
+    e.set_buffer(3, ws); e.set_buffer(4, y);
+    e.set_constant(5, K); e.set_constant(6, N); e.set_constant(7, M);
+    e.set_buffer(8, ws); e.set_constant(9, 0);
+    e.dispatch({(unsigned)(((N + 63) / 64) * 128),
+                (unsigned)((M + 63) / 64), 1}, {128, 1, 1});
+  };
+  // The family's dense tile by reduction depth (Qwen-Image-2.1's rule).
+  auto dense = [&](ComputeEncoder& e, const SharedBuffer& x,
+                   const SharedBuffer& w, const SharedBuffer& y, int M,
+                   int N, int K) {
+    const ComputeFunction* f = &f_deep;
+    int RN = 256;
+    if (K < 6144) { f = &f_n128; RN = 128; }
+    else if (K < 12288) { f = &f_tn2; RN = 512; }
+    e.set_function(*f);
+    e.set_buffer(0, x); e.set_buffer(1, w); e.set_buffer(2, w);
+    e.set_buffer(3, y);
+    e.set_constant(4, K); e.set_constant(5, N); e.set_constant(6, M);
+    e.set_constant(7, 0);
+    e.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
+                (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+  };
+
+  // ---- throughput --------------------------------------------------
+  struct Shape { int M, N, K, per_block; const char* name; };
+  const std::vector<Shape> shapes = {{4096, 4096, 4096, 4, "q/k/v/out"},
+                                     {4096, 12288, 4096, 2, "gate, up"},
+                                     {4096, 4096, 12288, 1, "down"}};
+  auto env_int = [](const char* n, int d) {
+    const char* v = std::getenv(n);
+    return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : d;
+  };
+  const int kRounds = env_int("VPIPE_I8_TIER_ROUNDS", 5);
+  const int kIters = env_int("VPIPE_I8_TIER_ITERS", 6);
+  constexpr int kWeights = 4;   // cycled, so each call reads cold
+  constexpr int kArms = 9;
+  const char* names[kArms] = {
+      "bf16 matmul2d",          "accurate, plain",
+      "accurate, rotated",      "act quant, plain",
+      "act quant, rotated",     "held weight, plain",
+      "held weight, rotated",   "GEMM alone",
+      "signed w8 (a pack)"};
+  double block[kArms] = {};
+  bool all = true;
+  for (const Shape& sh : shapes) {
+    const int M = sh.M, N = sh.N, K = sh.K, G = K / 64;
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)M * K * 2);
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)M * N * 2);
+    SharedBuffer xq = mc->make_shared_buffer((std::size_t)M * K);
+    SharedBuffer as = mc->make_shared_buffer((std::size_t)M * G * 2);
+    if (x.empty() || y.empty() || xq.empty() || as.empty()) {
+      all = false;
+      continue;
+    }
+    {
+      std::mt19937 rng(11u);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      auto* px = static_cast<std::uint16_t*>(x.contents());
+      for (std::size_t j = 0; j < (std::size_t)M * K; ++j) {
+        px[j] = bf16(nd(rng) * ((j % K) % 64 == 0 ? 12.0f : 0.5f));
+      }
+    }
+    // Dense weights; each quantized plain and rotated beforehand; and a
+    // w8 pack in the signed layout (codes, scales, b').
+    std::vector<SharedBuffer> wd, wqp, wsp, wqr, wsr, wcs, ws8, wb8;
+    bool ok = true;
+    for (int i = 0; i < kWeights && ok; ++i) {
+      wd.push_back(mc->make_shared_buffer((std::size_t)N * K * 2));
+      wqp.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      wsp.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wqr.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      wsr.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wcs.push_back(mc->make_shared_buffer((std::size_t)N * K));
+      ws8.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      wb8.push_back(mc->make_shared_buffer((std::size_t)N * G * 2));
+      for (const SharedBuffer* b : {&wd.back(), &wqp.back(), &wqr.back(),
+                                    &wcs.back()}) {
+        ok = ok && !b->empty();
+      }
+      if (!ok) { break; }
+      auto* pd = static_cast<std::uint16_t*>(wd.back().contents());
+      for (std::size_t j = 0; j < (std::size_t)N * K; ++j) {
+        pd[j] = bf16(0.01f * (float)((int)((j + i) % 11) - 5));
+      }
+      std::memset(wcs.back().contents(), (0x5a + i) ^ 0x80,
+                  wcs.back().byte_size());
+      auto* ps = static_cast<std::uint16_t*>(ws8.back().contents());
+      auto* pb = static_cast<std::uint16_t*>(wb8.back().contents());
+      for (std::size_t j = 0; j < (std::size_t)N * G; ++j) {
+        ps[j] = bf16(0.0005f);
+        pb[j] = bf16(-0.05f + 128.0f * 0.0005f);
+      }
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder e = st.begin_compute();
+        quant(e, f_q, wd.back(), wqp.back(), wsp.back(), N, K);
+        quant(e, f_qr, wd.back(), wqr.back(), wsr.back(), N, K);
+        if (i == 0) { quant(e, f_q, x, xq, as, M, K); } }
+      st.commit().wait();
+    }
+    if (!ok) {
+      std::printf("[gemm_i8rot] setup failed at %dx%dx%d -- skip\n", M, N,
+                  K);
+      all = false;
+      continue;
+    }
+    using Run = std::function<bool(ComputeEncoder&, int)>;
+    const Run runs[kArms] = {
+        [&](ComputeEncoder& e, int i) {
+          dense(e, x, wd[i], y, M, N, K);
+          return true;
+        },
+        [&](ComputeEncoder& e, int i) {
+          return acc.gemm(e, x, 0, wd[i], y, 0, M, N, K);
+        },
+        [&](ComputeEncoder& e, int i) {
+          return accr.gemm(e, x, 0, wd[i], y, 0, M, N, K);
+        },
+        [&](ComputeEncoder& e, int) {
+          quant(e, f_q, x, xq, as, M, K);
+          return true;
+        },
+        [&](ComputeEncoder& e, int) {
+          quant(e, f_qr, x, xq, as, M, K);
+          return true;
+        },
+        [&](ComputeEncoder& e, int i) {
+          quant(e, f_q, x, xq, as, M, K);
+          i8gemm(e, xq, wqp[i], as, wsp[i], y, M, N, K);
+          return true;
+        },
+        [&](ComputeEncoder& e, int i) {
+          quant(e, f_qr, x, xq, as, M, K);
+          i8gemm(e, xq, wqr[i], as, wsr[i], y, M, N, K);
+          return true;
+        },
+        [&](ComputeEncoder& e, int i) {
+          i8gemm(e, xq, wqp[i], as, wsp[i], y, M, N, K);
+          return true;
+        },
+        [&](ComputeEncoder& e, int i) {
+          return acc.gemm_signed(e, x, 0, wcs[i], ws8[i], wb8[i], 8, y, 0,
+                                 M, N, K);
+        },
+    };
+    // One stream for every sample: a fresh queue's first commit costs
+    // a millisecond or two.
+    CommandStream st = mc->make_command_stream();
+    bool ran = true;
+    auto sample = [&](int a) {
+      const auto t0 = std::chrono::steady_clock::now();
+      { ComputeEncoder e = st.begin_compute();
+        for (int i = 0; i < kIters; ++i) {
+          ran = runs[a](e, i % kWeights) && ran;
+        } }
+      st.commit().wait();
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t0).count() / kIters;
+    };
+    for (int a = 0; a < kArms; ++a) { (void)sample(a); }   // warm
+    std::vector<std::vector<double>> t(kArms);
+    for (int r = 0; r < kRounds; ++r) {
+      for (int k = 0; k < kArms; ++k) {
+        const int a = (r % 2 == 0) ? k : kArms - 1 - k;
+        t[a].push_back(sample(a));
+      }
+    }
+    EXPECT_TRUE(ran);
+    const double gflop = 2.0 * M * (double)N * K * 1e-9;
+    // An activation quantizer reads M K bf16 and writes M K codes and
+    // M K / 64 bf16 scales.
+    const double qgb = ((double)M * K * 3 + (double)M * G * 2) * 1e-9;
+    std::printf("[gemm_i8rot] %s: M=%d N=%d K=%d (%.0f GFLOP a call; "
+                "medians of %d rounds x %d calls)\n", sh.name, M, N, K,
+                gflop, kRounds, kIters);
+    double med[kArms];
+    for (int a = 0; a < kArms; ++a) {
+      std::sort(t[a].begin(), t[a].end());
+      med[a] = t[a][t[a].size() / 2];
+      block[a] += sh.per_block * med[a];
+      if (a == 3 || a == 4) {
+        std::printf("[gemm_i8rot]   %-22s %7.3f ms  %6.1f GB/s\n", names[a],
+                    med[a], qgb / (med[a] * 1e-3));
+      } else {
+        std::printf("[gemm_i8rot]   %-22s %7.3f ms  %6.2f TFLOP/s  %.2fx "
+                    "bf16\n", names[a], med[a], gflop / med[a],
+                    med[0] / med[a]);
+      }
+    }
+    std::printf("[gemm_i8rot]   rotation: route %+.3f ms (%+.1f%%), "
+                "quantizer %+.3f ms a call, held %+.3f ms (%+.1f%%)\n",
+                med[2] - med[1], 100.0 * (med[2] / med[1] - 1.0),
+                med[4] - med[3], med[6] - med[5],
+                100.0 * (med[6] / med[5] - 1.0));
+  }
+  if (all) {
+    std::printf("[gemm_i8rot] a Qwen-Image-2.1 block's seven projections at "
+                "4096 rows:\n");
+    for (int a = 0; a < kArms; ++a) {
+      if (a == 3 || a == 4 || a == 7) { continue; }
+      std::printf("[gemm_i8rot]   %-22s %7.2f ms  %.3fx accurate plain\n",
+                  names[a], block[a], block[1] / block[a]);
+    }
+    std::printf("[gemm_i8rot]   rotation on the bf16 route: %+.2f ms a block "
+                "(%+.1f%%); held: %+.2f ms (%+.1f%%)\n", block[2] - block[1],
+                100.0 * (block[2] / block[1] - 1.0), block[6] - block[5],
+                100.0 * (block[6] / block[5] - 1.0));
   }
 }
 

@@ -539,11 +539,14 @@ class MetalKrea2Vae {
   int mat_attn_band_(std::size_t hw) const noexcept;
   // The attention's two GEMMs, y[M,N] = x[M,K] @ w[N,K]^T: int8 at the
   // tier where set_accel turned it on and the shape takes it, else f16.
+  // `probs`: x is the softmax's probabilities (P.V), which the accurate
+  // tier quantizes with its groups unrotated (I8GemmContext::
+  // gemm_unrotated).
   void attn_gemm_(metal_compute::ComputeEncoder& enc,
                   const metal_compute::SharedBuffer& x, std::size_t xe,
                   const metal_compute::SharedBuffer& w,
                   const metal_compute::SharedBuffer& y, std::size_t ye,
-                  int M, int N, int K, const PoolAlloc& alloc,
+                  int M, int N, int K, bool probs, const PoolAlloc& alloc,
                   const PoolRelease& release);
   // The interchangeable mid-block attention kernels, picked by MEASUREMENT at
   // load rather than from supports_matrix_cores(). See vae-mid-attn-tune.h:

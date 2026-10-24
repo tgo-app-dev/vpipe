@@ -249,6 +249,11 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"affine_dequant_bf16", "fp8_e5m2_dequant", false},
   {"affine_dequant_bf16", "fp8_e4m3_dequant_scaled", false},
   {"affine_dequant_bf16", "fp8_e5m2_dequant_scaled", false},
+  // The accurate tier's quantizers rotated (I8GemmContext::
+  // set_g64_rotation). Optional: a toolkit on a host older than these
+  // finds them invalid and keeps the plain pair (g64_rotated() false).
+  {"affine_dequant", "quant_f16_i8_row_g64_r"},
+  {"affine_dequant", "quant_f16_i8_row_g64_r_pad"},
 };
 
 // ---- quantized families ---------------------------------------------------

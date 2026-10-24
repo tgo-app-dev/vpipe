@@ -446,7 +446,8 @@ TEST(z_image_dit, matches_reference_on_a_small_model)
 // layout_matches_native: every arm -- preloaded, streamed through the
 // slots, streamed without them, promoted -- BYTE-IDENTICAL, and within a
 // gross-error bar of the route this family took before (dequant +
-// requant; VPIPE_I8_SIGNED=0) in distance from the dense (i8 off)
+// requant, its groups unrotated;
+// VPIPE_I8_SIGNED=0 VPIPE_I8_ACC_ROT=0) in distance from the dense (i8 off)
 // forward. 1280 image rows; a
 // 64-token caption (its refiner on the signed dequant into matmul2d,
 // under the int8 floor) and an 8-token one (the steel tiles through the
@@ -483,8 +484,12 @@ TEST(z_image_dit, signed_layout_matches_native)
     bool engaged = true;
     auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots) {
       std::vector<float> out;
-      std::unique_ptr<Env> e1, e2;
-      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      std::unique_ptr<Env> e1, e2, e3;
+      if (!sgn) {
+        // The route it replaced: dequant + requant, its groups unrotated.
+        e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0");
+        e3 = std::make_unique<Env>("VPIPE_I8_ACC_ROT", "0");
+      }
       if (!slots) {
         e2 = std::make_unique<Env>("VPIPE_Z_IMAGE_NO_SLOTS", "1");
       }
@@ -857,7 +862,22 @@ TEST(z_image_dit, fast_tier_matches_accurate)
     const auto acc = run(dir, true, 0, false, false, true);
     ASSERT_TRUE(!dense.empty() && acc.size() == dense.size());
     if (dense.empty() || acc.size() != dense.size()) { continue; }
-    const double ra = rel_l2_(acc, dense);
+    // The bars were set against the accurate tier with its groups
+    // unrotated; the rotation (on by default) lowers that yardstick where
+    // a channel stands out, so the bars hold against the larger of the
+    // two, and the rotated forward is held to a gross bar of the plain.
+    const double ra1 = rel_l2_(acc, dense);
+    double ra0 = ra1;
+    {
+      Env plain("VPIPE_I8_ACC_ROT", "0");
+      const auto acc0 = run(dir, true, 0, false, false, true);
+      if (acc0.size() == dense.size()) { ra0 = rel_l2_(acc0, dense); }
+    }
+    std::printf("[z_image_dit] %s, accurate tier vs the dense forward: "
+                "%.3e rotated, %.3e plain\n",
+                is_pack ? "w8 pack" : "checkpoint", ra1, ra0);
+    EXPECT_TRUE(ra1 <= 1.25 * ra0);
+    const double ra = std::max(ra1, ra0);
     for (int tier : {1, 2, 3}) {
       engaged = true;
       const auto pre = run(dir, true, tier, false, false, true);

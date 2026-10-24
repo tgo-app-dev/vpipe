@@ -21,6 +21,7 @@
 #include "generative-models/quantize/affine-quantizer.h"
 #include "generative-models/quantize/safetensors-writer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -159,6 +160,238 @@ TEST(model_quantize_roundtrip, affine_writer_reader_dequant)
     EXPECT_TRUE(err < tol);
   }
 
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
+// THE RUN DTYPE (QuantizeOptions::run_dtype, AffineQuantizer::Scales): a
+// pack meant for a bf16 run writes BF16 scales and biases, one for an f16
+// run F16 ones, and either fits its codes to that ROUNDED pair; the
+// original format writes F16 fit to the unrounded scale. For each width,
+// group and source dtype, and each format:
+//   - the codes are exactly clamp(round((w - b) / s)) on the pair as
+//     stored, restated on the CPU (the fitted formats) -- a code at a
+//     rounding tie may sit either side of it, the GPU's reciprocal being
+//     an ulp from the CPU's;
+//   - dequantized as the model that runs it holds the pair -- a bf16 model
+//     rounds an F16 pair to bf16 at load -- the fitted pack is no further
+//     from the source than the original one, for its own run;
+//   - the BF16 pair survives the safetensors writer and reader by dtype;
+//   - for w8 g64 from bf16 the bf16 fit is BYTE-IDENTICAL to the in-memory
+//     w8 build's kernel (affine_quant_rows_w8g64), which model-quantize
+//     uses there.
+TEST(model_quantize_roundtrip, a_run_dtype_fits_its_scales)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  AffineQuantizer q(mc);
+  ASSERT_TRUE(q.valid());
+  using Sc = AffineQuantizer::Scales;
+  auto bf16_bits = [](float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (std::uint16_t)(u >> 16);
+  };
+  auto from_bf16 = [](std::uint16_t h) {
+    const std::uint32_t u = (std::uint32_t)h << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto from_f16 = [](std::uint16_t h) {
+    _Float16 v;
+    std::memcpy(&v, &h, 2);
+    return (float)v;
+  };
+  const int N = 128, K = 512;
+  const fs::path tmp = fs::temp_directory_path() /
+                       ("vpipe-quant-rd-" + std::to_string(::getpid()));
+  for (const bool src_bf16 : {true, false}) {
+    // Weights spread as a DiT's are, with a few wide groups.
+    std::vector<float> wf((std::size_t)N * K);
+    for (int n = 0; n < N; ++n) {
+      for (int k = 0; k < K; ++k) {
+        double v = 0.02 * std::sin(0.37 * k + 1.3 * n) +
+                   0.01 * std::cos(0.11 * k * (n % 7 + 1));
+        if ((k * 13 + n) % 97 == 0) { v *= 9.0; }
+        wf[(std::size_t)n * K + k] = (float)v;
+      }
+    }
+    SharedBuffer w_in = mc->make_shared_buffer((std::size_t)N * K * 2);
+    ASSERT_TRUE(!w_in.empty());
+    if (w_in.empty()) { continue; }
+    auto* raw = static_cast<std::uint16_t*>(w_in.contents());
+    for (std::size_t i = 0; i < wf.size(); ++i) {
+      if (src_bf16) {
+        raw[i] = bf16_bits(wf[i]);
+        wf[i] = from_bf16(raw[i]);
+      } else {
+        const _Float16 h = (_Float16)wf[i];
+        std::memcpy(&raw[i], &h, 2);
+        wf[i] = (float)h;
+      }
+    }
+    for (const int bits : {8, 4}) {
+      for (const int group : {64, 32}) {
+        const int G = K / group, VPW = 32 / bits, QMAX = (1 << bits) - 1;
+        // The pack's values as a model of `run_bf16` holds its pair.
+        auto values = [&](const SharedBuffer& w, const SharedBuffer& sc,
+                          const SharedBuffer& bi, bool pair_bf16,
+                          bool run_bf16) {
+          const auto* wp = static_cast<const std::uint32_t*>(w.contents());
+          const auto* sp = static_cast<const std::uint16_t*>(sc.contents());
+          const auto* bp = static_cast<const std::uint16_t*>(bi.contents());
+          std::vector<float> out((std::size_t)N * K);
+          for (int n = 0; n < N; ++n) {
+            for (int g = 0; g < G; ++g) {
+              float s1 = pair_bf16 ? from_bf16(sp[n * G + g])
+                                   : from_f16(sp[n * G + g]);
+              float b1 = pair_bf16 ? from_bf16(bp[n * G + g])
+                                   : from_f16(bp[n * G + g]);
+              if (run_bf16 && !pair_bf16) {
+                s1 = from_bf16(bf16_bits(s1));
+                b1 = from_bf16(bf16_bits(b1));
+              }
+              for (int i = 0; i < group; ++i) {
+                const int k = g * group + i;
+                const std::uint32_t word =
+                    wp[(std::size_t)n * (K / VPW) + k / VPW];
+                const int code = (int)((word >> (bits * (k % VPW))) &
+                                       (std::uint32_t)QMAX);
+                out[(std::size_t)n * K + k] = (float)code * s1 + b1;
+              }
+            }
+          }
+          return out;
+        };
+        auto err = [&](const std::vector<float>& v) {
+          double e = 0.0, t = 0.0;
+          for (std::size_t i = 0; i < v.size(); ++i) {
+            const double d = (double)v[i] - wf[i];
+            e += d * d;
+            t += (double)wf[i] * wf[i];
+          }
+          return std::sqrt(e / t);
+        };
+        SharedBuffer w[3], sc[3], bi[3];
+        const Sc fmt[3] = {Sc::kF16, Sc::kFitF16, Sc::kFitBf16};
+        bool ok = true;
+        for (int f = 0; f < 3; ++f) {
+          ok = ok && q.quantize_linear(w_in, src_bf16, N, K, bits, group,
+                                       1.0f, w[f], sc[f], bi[f], fmt[f]);
+        }
+        ASSERT_TRUE(ok);
+        if (!ok) { continue; }
+        // The fitted codes, restated.
+        std::size_t bad = 0, ties = 0;
+        for (int f = 1; f < 3; ++f) {
+          const bool pb = fmt[f] == Sc::kFitBf16;
+          const auto* wp = static_cast<const std::uint32_t*>(w[f].contents());
+          const auto* sp = static_cast<const std::uint16_t*>(sc[f].contents());
+          const auto* bp = static_cast<const std::uint16_t*>(bi[f].contents());
+          for (int n = 0; n < N; ++n) {
+            for (int g = 0; g < G; ++g) {
+              const float s1 = pb ? from_bf16(sp[n * G + g])
+                                  : from_f16(sp[n * G + g]);
+              const float b1 = pb ? from_bf16(bp[n * G + g])
+                                  : from_f16(bp[n * G + g]);
+              const float inv = s1 > 0.0f ? 1.0f / s1 : 0.0f;
+              for (int i = 0; i < group; ++i) {
+                const int k = g * group + i;
+                const float v = wf[(std::size_t)n * K + k];
+                const float t = (v - b1) * inv;
+                const int want = std::clamp((int)std::round(t), 0, QMAX);
+                const std::uint32_t word =
+                    wp[(std::size_t)n * (K / VPW) + k / VPW];
+                const int got = (int)((word >> (bits * (k % VPW))) &
+                                      (std::uint32_t)QMAX);
+                // At a rounding tie the GPU's reciprocal (fast math, an
+                // ulp from the CPU's) may land either side.
+                const float frac = t - std::floor(t);
+                const bool tie = std::fabs(frac - 0.5f) < 1e-4f;
+                ties += got != want && tie && std::abs(got - want) == 1;
+                bad += got != want && !(tie && std::abs(got - want) == 1);
+              }
+            }
+          }
+        }
+        const double e_orig_f16 = err(values(w[0], sc[0], bi[0], false,
+                                             false));
+        const double e_orig_bf16 = err(values(w[0], sc[0], bi[0], false,
+                                              true));
+        const double e_fit_f16 = err(values(w[1], sc[1], bi[1], false,
+                                            false));
+        const double e_fit_bf16 = err(values(w[2], sc[2], bi[2], true,
+                                             true));
+        std::printf("[model_quantize_roundtrip] w%d g%d from %s: bf16 run "
+                    "%.3e original -> %.3e fit; f16 run %.3e -> %.3e; %zu "
+                    "codes off the restatement (%zu more at a tie)\n", bits,
+                    group, src_bf16 ? "bf16" : "f16", e_orig_bf16,
+                    e_fit_bf16, e_orig_f16, e_fit_f16, bad, ties);
+        EXPECT_TRUE(bad == 0);
+        EXPECT_TRUE(e_fit_bf16 <= e_orig_bf16);
+        EXPECT_TRUE(e_fit_f16 <= e_orig_f16 * 1.0001);
+        // The in-memory w8 build's kernel, where model-quantize uses it.
+        if (src_bf16 && bits == 8 && group == 64) {
+          ComputeLibrary lib = mc->load_library("affine_dequant_bf16");
+          ComputeFunction fn = lib.function("affine_quant_rows_w8g64");
+          ASSERT_TRUE(fn.valid());
+          SharedBuffer rw = mc->make_shared_buffer(w[2].byte_size());
+          SharedBuffer rs = mc->make_shared_buffer(sc[2].byte_size());
+          SharedBuffer rb = mc->make_shared_buffer(bi[2].byte_size());
+          CommandStream st = mc->make_command_stream();
+          {
+            ComputeEncoder enc = st.begin_compute();
+            const int one = 1, zero = 0;
+            enc.set_function(fn);
+            enc.set_buffer(0, w_in); enc.set_buffer(1, rw);
+            enc.set_buffer(2, rs); enc.set_buffer(3, rb);
+            enc.set_constant(4, K); enc.set_constant(5, N);
+            enc.set_constant(6, one); enc.set_constant(7, zero);
+            enc.dispatch({(unsigned)(K / 64), (unsigned)N, 1}, {32, 8, 1});
+          }
+          ASSERT_TRUE(st.commit().wait_ok());
+          EXPECT_TRUE(std::memcmp(rw.contents(), w[2].contents(),
+                                  rw.byte_size()) == 0 &&
+                      std::memcmp(rs.contents(), sc[2].contents(),
+                                  rs.byte_size()) == 0 &&
+                      std::memcmp(rb.contents(), bi[2].contents(),
+                                  rb.byte_size()) == 0);
+        }
+        // A BF16 pair through the writer and the reader, by its dtype.
+        if (bits == 8 && group == 64) {
+          const fs::path dir = tmp / (src_bf16 ? "bf16" : "f16");
+          {
+            SafetensorsWriter wr(dir.string());
+            const std::int64_t wcols = (std::int64_t)K * bits / 32;
+            ASSERT_TRUE(wr.add("t.weight", "U32", {N, wcols},
+                               w[2].contents(), w[2].byte_size()));
+            ASSERT_TRUE(wr.add("t.scales",
+                               AffineQuantizer::scale_dtype(Sc::kFitBf16),
+                               {N, G}, sc[2].contents(), sc[2].byte_size()));
+            ASSERT_TRUE(wr.add("t.biases",
+                               AffineQuantizer::scale_dtype(Sc::kFitBf16),
+                               {N, G}, bi[2].contents(), bi[2].byte_size()));
+            ASSERT_TRUE(wr.close());
+          }
+          auto wts = MetalLlamaWeights::open_model(dir.string());
+          ASSERT_TRUE(wts.has_value());
+          if (!wts.has_value()) { continue; }
+          const auto* si = wts->info("t.scales");
+          ASSERT_TRUE(si != nullptr && si->dtype == "BF16");
+          SharedBuffer fs_ = wts->load("t.scales", mc);
+          ASSERT_TRUE(!fs_.empty() &&
+                      fs_.byte_size() == sc[2].byte_size());
+          if (!fs_.empty() && fs_.byte_size() == sc[2].byte_size()) {
+            EXPECT_TRUE(std::memcmp(fs_.contents(), sc[2].contents(),
+                                    fs_.byte_size()) == 0);
+          }
+        }
+      }
+    }
+  }
   std::error_code ec;
   fs::remove_all(tmp, ec);
 }

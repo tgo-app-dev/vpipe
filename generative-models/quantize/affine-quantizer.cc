@@ -4,6 +4,8 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 
+#include <string>
+
 namespace vpipe::genai {
 
 using metal_compute::CommandStream;
@@ -36,27 +38,42 @@ AffineQuantizer::AffineQuantizer(MetalCompute* mc) : _mc(mc)
     _fn[1][bidx_(e.bits)][gidx_(e.group)] = _lib_bf16.function(e.name);
     ok = ok && _fn[0][bidx_(e.bits)][gidx_(e.group)].valid() &&
          _fn[1][bidx_(e.bits)][gidx_(e.group)].valid();
+    // The fitted twins, scales written f16 / bf16 (affine_quant_fit_*):
+    // checked when asked for, so a library without them still serves kF16.
+    const std::string fit =
+        std::string("affine_quant_fit_") + (e.name + 13);   // "w8_g64"
+    for (int sb = 0; sb < 2; ++sb) {
+      const std::string nm = fit + (sb ? "_bf16s" : "_f16s");
+      _fn_fit[0][bidx_(e.bits)][gidx_(e.group)][sb] =
+          _lib.function(nm.c_str());
+      _fn_fit[1][bidx_(e.bits)][gidx_(e.group)][sb] =
+          _lib_bf16.function(nm.c_str());
+    }
   }
   _ok = ok;
 }
 
 const ComputeFunction*
-AffineQuantizer::fn_(bool bf16, int bits, int group) const
+AffineQuantizer::fn_(bool bf16, int bits, int group, Scales sc) const
 {
   if ((bits != 8 && bits != 4) || (group != 64 && group != 32)) {
     return nullptr;
   }
-  return &_fn[bf16 ? 1 : 0][bidx_(bits)][gidx_(group)];
+  if (sc == Scales::kF16) {
+    return &_fn[bf16 ? 1 : 0][bidx_(bits)][gidx_(group)];
+  }
+  return &_fn_fit[bf16 ? 1 : 0][bidx_(bits)][gidx_(group)]
+                 [sc == Scales::kFitBf16 ? 1 : 0];
 }
 
 bool
 AffineQuantizer::quantize_linear(const SharedBuffer& w_in, bool src_bf16,
                                  int N, int K, int bits, int group, float clip,
                                  SharedBuffer& w_out, SharedBuffer& s_out,
-                                 SharedBuffer& b_out) const
+                                 SharedBuffer& b_out, Scales sc) const
 {
   if (!_ok || N <= 0 || K <= 0 || (K % group) != 0) { return false; }
-  const ComputeFunction* fn = fn_(src_bf16, bits, group);
+  const ComputeFunction* fn = fn_(src_bf16, bits, group, sc);
   if (fn == nullptr || !fn->valid()) { return false; }
 
   w_out = _mc->make_shared_buffer(weight_bytes(N, K, bits));

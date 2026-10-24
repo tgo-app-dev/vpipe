@@ -147,8 +147,8 @@ to_elt_(WeightSet& wts, MetalCompute* mc, const std::string& nm)
   return out;
 }
 
-// Expand an affine group-quantized linear <name> (U32 packed codes + F16
-// per-group scales/biases, w_deq = scale*q + bias) into a dense bf16 [N,K]
+// Expand an affine group-quantized linear <name> (U32 packed codes + F16 or
+// BF16 per-group scales/biases, w_deq = scale*q + bias) into a dense bf16 [N,K]
 // buffer. The vision tower runs dense bf16 -- it has no quantized-matmul
 // kernels -- so when model-quantize's text_encoder scope catches a visual
 // linear (e.g. mlp.gate_proj/up_proj), it is dequantized here at load. Returns
@@ -159,14 +159,33 @@ dequant_affine_(WeightSet& wts, MetalCompute* mc,
                 const std::string& base, int group)
 {
   // `base` is the linear name without the ".weight" suffix; the affine triple
-  // is base.weight (U32 codes) + base.scales + base.biases (F16).
+  // is base.weight (U32 codes) + base.scales + base.biases, the pair F16 or
+  // BF16 (model-quantize's run_dtype bf16) -- read by its stored dtype.
   const auto* ci =
       wts.src().info(base + ".weight");          // codes [N, K*bits/32] (U32)
-  const auto* si = wts.src().info(base + ".scales");   // [N, K/group] (F16)
-  if (ci == nullptr || si == nullptr || ci->shape.size() != 2 ||
-      si->shape.size() != 2 || group <= 0) {
+  const auto* si = wts.src().info(base + ".scales");   // [N, K/group]
+  const auto* bi = wts.src().info(base + ".biases");
+  if (ci == nullptr || si == nullptr || bi == nullptr ||
+      ci->shape.size() != 2 || si->shape.size() != 2 || group <= 0) {
     return {};
   }
+  auto pair_dtype_ok = [](const std::string& d) {
+    return d == "F16" || d == "BF16";
+  };
+  if (!pair_dtype_ok(si->dtype) || !pair_dtype_ok(bi->dtype)) { return {}; }
+  const bool s_bf16 = si->dtype == "BF16", b_bf16 = bi->dtype == "BF16";
+  // One element of the pair as f32, by its stored dtype.
+  auto elem = [](const std::uint16_t* p, std::int64_t i, bool is_bf16) {
+    if (is_bf16) {
+      const std::uint32_t u = (std::uint32_t)p[i] << 16;
+      float f = 0.0f;
+      std::memcpy(&f, &u, 4);
+      return f;
+    }
+    _Float16 h;
+    std::memcpy(&h, p + i, 2);
+    return (float)h;
+  };
   const std::int64_t N  = ci->shape[0];
   const std::int64_t cc = ci->shape[1];              // codes cols = K*bits/32
   const std::int64_t sc = si->shape[1];              // K / group
@@ -181,8 +200,8 @@ dequant_affine_(WeightSet& wts, MetalCompute* mc,
   SharedBuffer bib   = wts.read(base + ".biases", mc, cp);
   if (codes.empty() || scb.empty() || bib.empty()) { return {}; }
   const auto* cw = static_cast<const std::uint32_t*>(codes.contents());
-  const auto* sf = static_cast<const _Float16*>(scb.contents());   // F16
-  const auto* bf = static_cast<const _Float16*>(bib.contents());   // F16
+  const auto* sf = static_cast<const std::uint16_t*>(scb.contents());
+  const auto* bf = static_cast<const std::uint16_t*>(bib.contents());
   SharedBuffer out = mc->make_shared_buffer((std::size_t)N * K * 2);   // bf16
   if (out.empty()) { return {}; }
   auto* op = static_cast<std::uint16_t*>(out.contents());
@@ -190,8 +209,8 @@ dequant_affine_(WeightSet& wts, MetalCompute* mc,
   const std::int64_t Kw = K / vpw;                   // words per row
   const std::uint32_t mask = (bits == 8) ? 0xffu : 0xfu;
   for (std::int64_t n = 0; n < N; ++n) {
-    const _Float16* srow = sf + n * sc;
-    const _Float16* brow = bf + n * sc;
+    const std::uint16_t* srow = sf + n * sc;
+    const std::uint16_t* brow = bf + n * sc;
     const std::uint32_t* crow = cw + n * Kw;
     std::uint16_t* orow = op + n * K;
     for (std::int64_t w = 0; w < Kw; ++w) {
@@ -200,8 +219,8 @@ dequant_affine_(WeightSet& wts, MetalCompute* mc,
       for (int i = 0; i < vpw; ++i) {
         const std::int64_t k = k0 + i;
         const std::int64_t g = k / group;
-        const float s = (float)srow[g];
-        const float b = (float)brow[g];
+        const float s = elem(srow, g, s_bf16);
+        const float b = elem(brow, g, b_bf16);
         const std::uint32_t q = (packed >> (bits * i)) & mask;
         orow[k] = f32_to_bf16_(s * (float)q + b);
       }

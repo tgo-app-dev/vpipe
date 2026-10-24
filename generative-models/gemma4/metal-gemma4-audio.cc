@@ -227,7 +227,10 @@ MetalGemma4AudioEncoder::load(std::shared_ptr<WeightSet> ws_in,
         const auto* in2 = wts->src().info(nm);
         const std::size_t n = in2 ? numel_(in2->shape) : 0;
         SharedBuffer raw = wts->read(nm, mc, cp);
-        if (raw.empty()) { return {}; }
+        if (raw.empty() || in2 == nullptr) { return {}; }
+        // F16 as it is; BF16 (MLX's packs) converted.
+        if (in2->dtype == "F16") { return raw; }
+        if (in2->dtype != "BF16") { return {}; }
         SharedBuffer o = mc->make_shared_buffer(n * 2);
         auto* op = static_cast<_Float16*>(o.contents());
         const auto* sp = static_cast<const std::uint16_t*>(raw.contents());

@@ -1488,6 +1488,63 @@ SessionIntf::reports() const
   return o;
 }
 
+// SessionIntf's memory, by what holds it (the model manager's warm
+// holds and checkpoints, the wired pool, Metal's allocations).
+// Non-virtual, as reports() is.
+FlexData
+SessionIntf::memory_report() const
+{
+  FlexData o = FlexData::make_object();
+  const auto* s = dynamic_cast<const Session*>(this);
+  auto* mgr = s != nullptr ? s->generative_model_manager() : nullptr;
+  if (mgr == nullptr) {
+    return o;
+  }
+  auto oo = o.as_object();
+  FlexData warm = FlexData::make_array();
+  {
+    auto a = warm.as_array();
+    for (const auto& w : mgr->warm_report()) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("kind", FlexData::make_string(w.kind));
+      eo.insert("dir", FlexData::make_string(w.dir));
+      eo.insert("bytes", FlexData::make_uint(w.bytes));
+      eo.insert("kv_bytes", FlexData::make_uint(w.kv_bytes));
+      eo.insert("seconds", FlexData::make_real(w.seconds));
+      a.push_back(std::move(e));
+    }
+  }
+  oo.insert("warm", std::move(warm));
+  FlexData weights = FlexData::make_array();
+  {
+    auto a = weights.as_array();
+    for (const auto& w : mgr->weight_report()) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("dir", FlexData::make_string(w.dir));
+      eo.insert("bytes", FlexData::make_uint(w.bytes));
+      eo.insert("mapped_bytes", FlexData::make_uint(w.mapped_bytes));
+      eo.insert("holders", FlexData::make_int(w.holders));
+      eo.insert("parked", FlexData::make_bool(w.parked));
+      a.push_back(std::move(e));
+    }
+  }
+  oo.insert("weights", std::move(weights));
+  oo.insert("kv_bytes", FlexData::make_uint(mgr->resident_kv_bytes()));
+  oo.insert("pooled_bytes", FlexData::make_uint(mgr->pooled_bytes()));
+  oo.insert("wired_used", FlexData::make_uint(mgr->wired_pool_used()));
+  oo.insert("wired_limit", FlexData::make_uint(mgr->wired_pool_limit()));
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mc = s->metal_compute();
+  if (mc != nullptr && mc->valid()) {
+    oo.insert("gpu_allocated",
+              FlexData::make_uint(mc->memory_budget().allocated));
+  }
+#endif
+  return o;
+}
+
 uint64_t
 SessionIntf::reports_version() const
 {

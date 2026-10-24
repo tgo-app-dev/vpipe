@@ -776,7 +776,10 @@ that reads the bag reads it identically whichever one it plugs into.
 `generate-video` also carries `motion_cache`, a sampling-loop tier
 described [below](#motion_cache--whether-a-forward-runs-at-all).
 `generate-image` also carries `i8_gemm_tier` (`accel::kI8GemmTier`):
-`"accurate"` (the default, and what an absent key means), `"fast"`,
+`"accurate"` (the default, and what an absent key means: groups of 64
+on both operands, each Walsh-Hadamard rotated where `gemm()` quantizes
+a dense weight per call -- `set_g64_rotation`, on by default where the
+host has the rotated quantizers), `"fast"`,
 which `I8GemmContext::Tier::kFast` implements -- the block weights held
 as rotated int8 at a coarse group (`gemm_fast`, `encode_to_fast`) -- or
 `"token"` / `"token_plain"` (`kI8TierToken` / `kI8TierTokenPlain`),

@@ -83,6 +83,15 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16)
   const char* sk_name = nm->sk;
   _fn_quant = _lib_q.function(q_name);
   _fn_quant_pad = _lib_q.function(qp_name);
+  if (g64) {   // the rotated pair (set_g64_rotation); optional
+    _fn_quant_r = _lib_q.function("quant_f16_i8_row_g64_r");
+    _fn_quant_r_pad = _lib_q.function("quant_f16_i8_row_g64_r_pad");
+  }
+  if (const char* e = std::getenv("VPIPE_I8_ACC_ROT")) {
+    _g64_rot_env = std::atoi(e) != 0 ? 1 : 0;
+  }
+  // ON by default, where the host has the kernels (see the header).
+  (void)set_g64_rotation(true);
   _fn_gemm = _lib_g.function(g_name);
   _on = _fn_quant.valid() && _fn_gemm.valid();
   // The split-K twin and the fold it drains through. Both optional: a
@@ -248,6 +257,15 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16)
   if (_on) { _answers = tuning_cache(mc); }
 }
 
+bool
+I8GemmContext::set_g64_rotation(bool r)
+{
+  if (_g64_rot_env >= 0) { r = _g64_rot_env != 0; }
+  _g64_rot = r && _group == 64 && _fn_quant_r.valid() &&
+             _fn_quant_r_pad.valid();
+  return _g64_rot;
+}
+
 void
 I8GemmContext::set_token_kernel(bool double_buffered, bool wide_n)
 {
@@ -324,8 +342,17 @@ I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
                     const SharedBuffer& b, const SharedBuffer& y,
                     std::size_t ye, int M, int N, int K)
 {
+  return gemm_(enc, x, xe, w, b, y, ye, M, N, K, _g64_rot);
+}
+
+bool
+I8GemmContext::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
+                     std::size_t xe, const SharedBuffer& w,
+                     const SharedBuffer& b, const SharedBuffer& y,
+                     std::size_t ye, int M, int N, int K, bool rot)
+{
   const bool bias = !b.empty();
-  if (!accepts(M, N, K)) { return false; }
+  if (!accepts_(M, N, K, rot)) { return false; }
   settle_(Route::kRequant, 8, N, K, M);
   // A bias with no fold to add it in would be silently dropped on the
   // split path, so the split is refused rather than the bias.
@@ -351,8 +378,12 @@ I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
     return false;
   }
   const bool pad = (KP != K);
+  // The plain pair, or the rotated one: the GEMM below is the same.
+  const ComputeFunction& fq =
+      rot ? (pad ? _fn_quant_r_pad : _fn_quant_r)
+          : (pad ? _fn_quant_pad : _fn_quant);
   // Activation rows -> i8 + per-(row, group) scales.
-  enc.set_function(pad ? _fn_quant_pad : _fn_quant);
+  enc.set_function(fq);
   enc.set_buffer(0, x, xe * 2);
   enc.set_buffer(1, _xq);
   enc.set_buffer(2, _as);
@@ -363,7 +394,7 @@ I8GemmContext::gemm(ComputeEncoder& enc, const SharedBuffer& x,
   // scales. Re-quantized per call: one extra weight pass, no persistent
   // copy. Serial command streams + Metal's hazard tracking make the
   // shared scratches safe across back-to-back GEMMs.
-  enc.set_function(pad ? _fn_quant_pad : _fn_quant);
+  enc.set_function(fq);
   enc.set_buffer(0, w);
   enc.set_buffer(1, _wq);
   enc.set_buffer(2, _ws);

@@ -878,8 +878,9 @@ TEST(mlp_fuse, splitk_plan)
 // A contraction that is not a multiple of 512 has no whole chunk to sit in,
 // so I8GemmContext zero-fills up to the next one. That is only sound if the
 // padded run is INDISTINGUISHABLE from one where the caller had padded the
-// buffers itself -- zeros add nothing to a dot product, and cannot move a
-// group's absmax scale. So the two are compared bit for bit rather than
+// buffers itself -- zeros add nothing to a dot product, and the padded
+// group is exactly the one the caller's zeros make, rotated (the default)
+// or not. So the two are compared bit for bit rather than
 // within a tolerance: any difference means the tail group quantized
 // differently, which is the one way this can be subtly wrong.
 //

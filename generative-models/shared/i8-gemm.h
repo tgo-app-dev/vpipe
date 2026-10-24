@@ -25,19 +25,43 @@ namespace genai {
 // the matmul2d rate at qualifying shapes -- accumulating each group in f32
 // with its own pair of scales and storing the element type back.
 //
-// THE GROUP IS 64 on both operands (quant_f16_i8_row_g64 +
-// gemm_i8i8_sc_f16_n64_g64rs). It was 512, and the reason it could not be
-// finer was the kernel, not the quantization: the drained per-group kernel
-// paid a threadgroup round-trip per group, which MEASURED g64 at 6.4 TOP/s
-// against g512's 19.3 -- below f16. The register-resident kernel keeps the
-// partial in a cooperative tensor and stages each strip of scales once,
-// and at that design g64 runs 17.4 / 16.9 TOP/s (shallow / deep K) against
-// the same kernel's 21.3 / 19.3 at 512 -- so the finer group costs 12-18%
-// of the coarser one's rate and buys the precision a 64-wide group has
+// THE GROUP IS 64 on both operands (quant_f16_i8_row_g64, or its rotated twin
+// -- see below -- + gemm_i8i8_sc_f16_n64_g64rs). It was 512, and the reason it
+// could not be finer was the kernel, not the quantization: the drained
+// per-group kernel paid a threadgroup round-trip per group, which MEASURED g64
+// at 6.4 TOP/s against g512's 19.3 -- below f16. The register-resident kernel
+// keeps the partial in a cooperative tensor and stages each strip of scales
+// once, and at that design g64 runs 17.4 / 16.9 TOP/s (shallow / deep K)
+// against the same kernel's 21.3 / 19.3 at 512 -- so the finer group costs
+// 12-18% of the coarser one's rate and buys the precision a 64-wide group has
 // over a 512-wide one on every outlier channel (gemm_i8.group_size,
-// gemm_i8.g64_register_acc). VPIPE_I8_GROUP=512 selects the old pair for
-// an A/B, and 32 / 128 the same register design one step finer or
-// coarser; anything else is 64.
+// gemm_i8.g64_register_acc). VPIPE_I8_GROUP=512 selects the old pair for an
+// A/B, and 32 / 128 the same register design one step finer or coarser;
+// anything else is 64.
+//
+// THE GROUPS OF 64 ARE ROTATED (set_g64_rotation; on by default): each is
+// Walsh-Hadamard transformed on both operands before its scale is taken
+// (quant_f16_i8_row_g64_r), so an outlier channel's energy spreads over its
+// group instead of setting the group's scale. A group's dot product is the same
+// in the rotated basis, so the GEMM is unchanged. MEASURED on the base M5
+// (gemm_i8.g64_rotation_cost, Qwen-Image-2.1's block at 4096 rows, two runs):
+// free -- the seven projections 0.9-1.0% FASTER per call, the quantizer within
+// 0.01 ms either way. On real weights and activations captured from
+// Qwen-Image-2.1 (672 projections) and MiniMax-H3 FL2VA (600), the output's
+// rel-L2 from the exact product, median 6.27e-3 -> 5.04e-3 and 8.71e-3 ->
+// 7.22e-3, worst 2.13e-2 -> 1.12e-2 and 1.45e-2 -> 1.19e-2: under the fast tier
+// on both. The Qwen-Image-2.1 codec's attention GEMMs moved under 0.15 dB on
+// two 1024^2 pictures, every tier; its P.V is nonetheless kept plain
+// (gemm_unrotated -- the probabilities are all positive, the case below). THE
+// TRADE: a group whose values share a large common offset -- a mean several
+// times their spread -- reads WORSE rotated, since the transform gathers the
+// mean into one coefficient (eight times the mean), which then sets the scale
+// (gemm_i8.g64_quantizers_match_their_restatement: 2.5x at a 4 sigma offset).
+// Real block projections do not look like that; a new caller whose operand
+// might should measure. gemm() alone takes it: the signed and native routes
+// read a pack's own codes, which are in the weight's own basis, and rotating
+// those would round the weight twice (no gain measured: Qwen-Image-2.1 0.93x,
+// MiniMax-H3 1.02x the signed route's median). VPIPE_I8_ACC_ROT=0 is the A/B.
 //
 // THE WHOLE SET ON ONE DESIGN, MEASURED on the M5 (gemm_i8.group_size
 // at 4096x12288x4096 / 4096x4096x12288; gemm_i8.group_quality rel-L2
@@ -60,7 +84,8 @@ namespace genai {
 // default because 32 turns VOSR's int8 tier SLOWER than its plain
 // matrix-core tier and 128 gives back a third of the outlier-row
 // precision for 12% of rate. (Krea-2's 128 < 64 is a single forward's
-// rel-L2, not a trend; the unit rows are monotone.)
+// rel-L2, not a trend; the unit rows are monotone.) The table predates
+// the rotation below and was measured with the groups unrotated.
 //
 // The activation/weight/scale/output element type is chosen by `bf16`: the
 // f16 caller loads the `dense_gemm_mma`/`affine_dequant` metallibs, the bf16
@@ -101,11 +126,7 @@ class I8GemmContext {
   // for every K this gate admits, so the clause is dormant there.
   bool accepts(int M, int N, int K) const
   {
-    if (!_on || M < _min_m || K < 1024 || N < 16) { return false; }
-    const int KP = kpad_(K);
-    if (KP == K) { return true; }
-    if (!_fn_quant_pad.valid()) { return false; }
-    return (KP - K) * 100 <= K * _max_pad_pct;
+    return accepts_(M, N, K, _g64_rot);
   }
 
   // Encode act-quant + weight-quant + the i8 GEMM (element type = the ctor's
@@ -135,6 +156,21 @@ class I8GemmContext {
             const metal_compute::SharedBuffer& y, std::size_t ye,
             int M, int N, int K);
 
+  // ...and gemm() with its groups NEVER rotated, whatever the context's
+  // setting and VPIPE_I8_ACC_ROT say: for an operand whose groups share a
+  // large common offset, the case the rotation loses (the class note) --
+  // attention probabilities, all positive (a P.V GEMM: MetalKrea2Vae's
+  // materialized mid attention). Same shape gate as accepts().
+  bool gemm_unrotated(metal_compute::ComputeEncoder& enc,
+                      const metal_compute::SharedBuffer& x, std::size_t xe,
+                      const metal_compute::SharedBuffer& w,
+                      const metal_compute::SharedBuffer& y, std::size_t ye,
+                      int M, int N, int K)
+  {
+    return gemm_(enc, x, xe, w, metal_compute::SharedBuffer{}, y, ye, M, N,
+                 K, false);
+  }
+
   // ---- NATIVE affine consumption -----------------------------------
   //
   // The checkpoint's own codes -- MLX affine, w = s*q + b, group 64, w4
@@ -157,7 +193,8 @@ class I8GemmContext {
   //   w4  deep K       4096 x 4096 x 12288   0.83x
   //
   // and f32 quality 6.1e-3 against the round trip's 7.1e-3 at 256 x 512
-  // x 1024, both widths -- the weight is quantized once, not twice. The
+  // x 1024, both widths (its groups unrotated) -- the weight is quantized
+  // once, not twice. The
   // w4 loss is the matrix pipe's: uint8 x uint4 runs 17.6 TOP/s where
   // int8 x int8 runs 22.2 (gemm_i8.native_affine_kernel_arms), and that
   // 20% is more than the two passes it saves in isolation. A signed
@@ -244,7 +281,7 @@ class I8GemmContext {
   // FLUX.2 / Z-Image / FLUX.3 projections, bf16, splits off), per GEMM
   // against the same weight held bf16 under i8 (requant + g64rs):
   //
-  //   w8 dequant + requant   0.95-0.98x     rel-L2 vs f64  7.7e-3
+  //   w8 dequant + requant   0.95-0.98x     rel-L2 vs f64  7.7e-3 (plain)
   //   w8 native              0.95-1.00x                    6.3e-3
   //   w8 signed              1.03-1.06x                    6.6e-3
   //
@@ -308,7 +345,8 @@ class I8GemmContext {
   // ---- THE FAST TIER ---------------------------------------------
   //
   // Two tiers of int8 GEMM. ACCURATE (the default) is everything above:
-  // groups of 64 on both operands. FAST runs symmetric int8 at a COARSE
+  // groups of 64 on both operands, rotated where gemm() quantizes both
+  // (the class note). FAST runs symmetric int8 at a COARSE
   // group gc (512 by default) on both operands, so the per-group fold
   // runs once per gc instead of once per 64 and a group's contraction is
   // one matmul -- and it ROTATES each group with an orthonormal
@@ -317,7 +355,9 @@ class I8GemmContext {
   // of letting it set the group's scale. MEASURED (gemm_i8.coarse_tier,
   // 256x512x4096 against f64): with no outliers the fast tier is 1.30-
   // 1.45x the accurate tier's error; with outlier channels (1/64 x24,
-  // 1/512 x64) it is 0.5-0.6x of it, where unrotated it was 1.8-2.7x.
+  // 1/512 x64) it is 0.5-0.6x of it, where unrotated it was 1.8-2.7x --
+  // against the accurate tier's groups UNROTATED. Rotated, the accurate
+  // tier is under the fast one on real activations too (the class note).
   // MEASURED on Qwen-Image-2.1's cached step (forward_ab), against the
   // accurate tier with split-K off (the fast tier never splits, and the
   // split tuner's picks move the accurate tier 1-7% load to load): 1.041x
@@ -367,6 +407,16 @@ class I8GemmContext {
   void set_token_rotation(bool r) { _tok_rot = _tok_rot_env >= 0
                                                    ? _tok_rot_env != 0 : r; }
   bool token_rotated() const { return _tok_rot; }
+  // THE ACCURATE TIER'S ROTATION (see the class note; on by default):
+  // gemm()'s two quantizers Walsh-Hadamard transform each group of 64
+  // before its scale is taken (quant_f16_i8_row_g64_r), the GEMM the
+  // same kernel. Group 64 and gemm() alone -- the native and signed
+  // routes read a pack's own codes, which no rotation reaches.
+  // VPIPE_I8_ACC_ROT (0 | 1) overrides the caller. Returns whether it
+  // rotates now: never where the kernels are missing (an older host) or
+  // the group is not 64.
+  bool set_g64_rotation(bool r);
+  bool g64_rotated() const { return _g64_rot; }
   // The token tiers' GEMM kernel: its K loop -- MLX's blocked one (512
   // deep, a barrier each) or, double_buffered, one with no barrier that
   // loads the next step's operands under this step's matmuls -- and its
@@ -800,6 +850,22 @@ class I8GemmContext {
   int group() const { return _group; }
 
  private:
+  // accepts() and gemm() with the rotation decided per call: `rot`
+  // takes the rotated quantizers, else the plain pair.
+  bool accepts_(int M, int N, int K, bool rot) const
+  {
+    if (!_on || M < _min_m || K < 1024 || N < 16) { return false; }
+    const int KP = kpad_(K);
+    if (KP == K) { return true; }
+    if (!(rot ? _fn_quant_r_pad : _fn_quant_pad).valid()) { return false; }
+    return (KP - K) * 100 <= K * _max_pad_pct;
+  }
+  bool gemm_(metal_compute::ComputeEncoder& enc,
+             const metal_compute::SharedBuffer& x, std::size_t xe,
+             const metal_compute::SharedBuffer& w,
+             const metal_compute::SharedBuffer& b,
+             const metal_compute::SharedBuffer& y, std::size_t ye, int M,
+             int N, int K, bool rot);
   metal_compute::MetalCompute* _mc = nullptr;
   bool _on = false;
   bool _bf16 = false;
@@ -822,6 +888,9 @@ class I8GemmContext {
   bool _tok_kernel_env = false;      // VPIPE_I8_TOKEN_KERNEL / _TILE set
   bool _tok_rot = false;
   int _tok_rot_env = -1;             // VPIPE_I8_TOKEN_ROT; -1 = caller's
+  bool _g64_rot = false;             // gemm() takes the _r quantizers
+  int _g64_rot_env = -1;             // VPIPE_I8_ACC_ROT; -1 = caller's
+  metal_compute::ComputeFunction _fn_quant_r, _fn_quant_r_pad;
   int tok_wm_(int gc) const { return gc == kTokenGroup ? _tok_wm : 0; }
   const FastFns* fast_fns_(int gc) const;
   Tier _tier = Tier::kAccurate;
@@ -981,9 +1050,11 @@ class I8GemmContext {
   // K rounded up to a whole number of groups. The int8 GEMM contracts in
   // group-wide chunks, so a K that is not a multiple of the group has no
   // chunk to sit in; the quantizer zero-fills up to here instead, which is
-  // exact (zeros add nothing to the dot product and cannot move an absmax
-  // scale) and costs (kpad-K)/K extra int8 MACs -- 4.8% at H3's hidden
-  // 5376 under the 512 group, none at all under 64.
+  // exact -- the very group a caller padding its own buffers would hand
+  // over; zeros add nothing to the dot product, rotated or not, since both
+  // operands carry them in the same places -- and costs (kpad-K)/K extra
+  // int8 MACs: 4.8% at H3's hidden 5376 under the 512 group, none at all
+  // under 64.
   int kpad_(int K) const
   {
     return ((K + _group - 1) / _group) * _group;

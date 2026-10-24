@@ -232,6 +232,28 @@ public:
   // The bytes the models kept warm for `dir` hold (0: none).
   std::size_t warm_model_bytes(const std::string& dir) const;
 
+  // What each hold above keeps NOW, one entry a hold -- for a host's
+  // view of its memory (SessionIntf::memory_report). A language model's:
+  // `kind` "language-model", its directory, `bytes` what its load left
+  // WIRED (0 when it loaded unwired: an LM reads its weights into its
+  // own members, which nothing else counts), `kv_bytes` its K/V with its
+  // parked conversations'. A model a stage built: its kind, directory
+  // and the `bytes` it was kept with (0 where the stage said none) --
+  // which take in what it keeps through its checkpoint's weight set (a
+  // DiT's trunk), so they OVERLAP that set's weight_report() bytes.
+  // `seconds`: how long it stays unless it is used again.
+  //
+  // PLUGIN ABI 8: an ADDITION, as warm_model_bytes; WarmUsage is a new
+  // type of its own, no member of the class.
+  struct WarmUsage {
+    std::string kind;
+    std::string dir;
+    std::size_t bytes    = 0;
+    std::size_t kv_bytes = 0;
+    double      seconds  = 0;
+  };
+  std::vector<WarmUsage> warm_report() const;
+
   template <class T>
   std::shared_ptr<T>
   take_warm(const std::string& kind, const std::string& dir,

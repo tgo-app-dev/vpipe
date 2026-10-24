@@ -117,6 +117,29 @@ TEST(model_quantize_stage, config_defaults)
   EXPECT_TRUE(s.config_error().empty());
 }
 
+// run_dtype: empty by default (the original format), bf16 / f16 / fp16
+// taken, anything else refused at launch.
+TEST(model_quantize_stage, run_dtype_is_validated)
+{
+  Session sess;
+  CerrSilencer hush;
+  {
+    ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.run_dtype().empty());
+  }
+  for (const char* v : {"bf16", "f16", "fp16"}) {
+    FlexData cfg = basic_cfg_();
+    cfg.as_object().insert("run_dtype", FlexData::make_string(v));
+    ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.run_dtype() == v);
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  FlexData cfg = basic_cfg_();
+  cfg.as_object().insert("run_dtype", FlexData::make_string("f32"));
+  ModelQuantizeStage s(&sess, "mq", std::vector<InEdge>{}, std::move(cfg));
+  EXPECT_FALSE(s.config_error().empty());
+}
+
 TEST(model_quantize_stage, invalid_bits_deferred)
 {
   Session sess;

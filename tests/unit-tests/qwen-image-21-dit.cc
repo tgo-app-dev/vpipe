@@ -998,7 +998,8 @@ TEST(qwen_image_21_dit, a_mixed_pack_holds_agree)
 // only), as flux2_smoke.signed_layout_matches_native: every arm --
 // preloaded, streamed through the slots, streamed without them, promoted
 // -- BYTE-IDENTICAL, and within a gross-error bar of the route this
-// family took before (dequant + requant; VPIPE_I8_SIGNED=0) in distance
+// family took before (dequant + requant, its groups unrotated;
+// VPIPE_I8_SIGNED=0 VPIPE_I8_ACC_ROT=0) in distance
 // from the dense (i8 off) forward. One joint sequence -- this model has
 // no separate text stream -- at three lengths, one per route a signed
 // weight takes:
@@ -1048,8 +1049,12 @@ TEST(qwen_image_21_dit, signed_layout_matches_native)
     auto run = [&](bool sgn, bool i8, bool stream, bool grow, bool slots,
                    const std::string& dir = std::string()) {
       std::vector<std::uint16_t> v;
-      std::unique_ptr<Env> e1, e2;
-      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      std::unique_ptr<Env> e1, e2, e3;
+      if (!sgn) {
+        // The route it replaced: dequant + requant, its groups unrotated.
+        e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0");
+        e3 = std::make_unique<Env>("VPIPE_I8_ACC_ROT", "0");
+      }
       if (!slots) {
         e2 = std::make_unique<Env>("VPIPE_QWEN_IMAGE21_NO_SLOTS", "1");
       }
@@ -1305,8 +1310,23 @@ TEST(qwen_image_21_dit, fast_tier_matches_accurate)
   }
   const std::string bdir = dit_dir_();
   if (!bdir.empty()) {
+    // The bars were set against the accurate tier with its groups
+    // unrotated; the rotation (on by default) lowers that yardstick where
+    // a channel stands out, so the bars hold against the larger of the
+    // two, and the rotated forward is held to a gross bar of the plain.
     const auto bd = run(bdir, false, 0, false, false, true);
     const auto ba = run(bdir, true, 0, false, false, true);
+    double ba0 = rel(ba, bd);
+    {
+      Env plain("VPIPE_I8_ACC_ROT", "0");
+      const auto b0 = run(bdir, true, 0, false, false, true);
+      if (b0.size() == bd.size()) { ba0 = rel(b0, bd); }
+    }
+    std::printf("[qwen_image_21_dit]   bf16 checkpoint, accurate tier vs "
+                "its dense forward: %.3e rotated, %.3e plain\n",
+                rel(ba, bd), ba0);
+    EXPECT_TRUE(rel(ba, bd) <= 1.25 * ba0);
+    const double bay = std::max(rel(ba, bd), ba0);
     for (int tier : {1, 2, 3}) {
       engaged = true;
       const auto bf = run(bdir, true, tier, false, false, true);
@@ -1326,7 +1346,7 @@ TEST(qwen_image_21_dit, fast_tier_matches_accurate)
                   bn == bf ? "IDENTICAL" : "DIFFERENT",
                   bg == bf ? "IDENTICAL" : "DIFFERENT");
       EXPECT_TRUE(engaged);
-      EXPECT_TRUE(rel(bf, bd) <= bar[tier] * rel(ba, bd));
+      EXPECT_TRUE(rel(bf, bd) <= bar[tier] * bay);
       EXPECT_TRUE(bs == bf && bn == bf && bg == bf);
     }
   }
@@ -1434,7 +1454,16 @@ TEST(qwen_image_21_dit, drawthings_i8x_runs_native)
                pre.size() == dense.size() && deq.size() == dense.size() &&
                rot.size() == dense.size());
   EXPECT_TRUE(native);
-  const double ra = rel(acc, dense), rt = rel(pre, dense);
+  // The bars below were set against the bf16 accurate tier with its
+  // groups unrotated (see fast_tier_matches_accurate): the larger of the
+  // two is the yardstick.
+  double ra = rel(acc, dense);
+  {
+    Env plain("VPIPE_I8_ACC_ROT", "0");
+    const auto acc0 = run(bdir, true, 0, false, true);
+    if (acc0.size() == dense.size()) { ra = std::max(ra, rel(acc0, dense)); }
+  }
+  const double rt = rel(pre, dense);
   const double rd = rel(deq, dense), rr = rel(rot, dense);
   std::printf("[qwen_image_21_dit] Draw Things i8x, %d+%d rows: vs the "
               "bf16 forward native token %.3e, requantized rotated %.3e, "

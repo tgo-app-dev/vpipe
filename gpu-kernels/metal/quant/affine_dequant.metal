@@ -300,6 +300,80 @@ VPIPE_AFFINE_QUANT(affine_quant_w4_g64, 4, 64)
 VPIPE_AFFINE_QUANT(affine_quant_w8_g32, 8, 32)
 VPIPE_AFFINE_QUANT(affine_quant_w4_g32, 4, 32)
 
+// FIT TO THE STORED PAIR (model-quantize's run_dtype): the same affine
+// quantization as affine_quant_impl, but the scale and bias are rounded
+// to ST -- the type the model that runs the pack holds them in, half or
+// bfloat -- FIRST, written in it, and the codes fit to the rounded pair,
+// as affine_quant_rows_w8g64 does for the in-memory build. Fit to the f32
+// scale and stored rounded (affine_quant_impl), the codes sit up to ~half
+// a step off the scale the dequant uses (255 * 2^-9 relative for bfloat).
+// `clip` as there. One thread per group: grid {K/GROUP, N, 1}.
+template <int BITS, int GROUP, typename ST>
+static inline void
+affine_quant_fit_impl(const device VPIPE_ELT* x, device uint32_t* w,
+                      device ST* s, device ST* b, int K, int N, float clip,
+                      uint2 gid)
+{
+  const int grp = (int)gid.x;
+  const int n   = (int)gid.y;
+  const int KG  = K / GROUP;
+  if (n >= N || grp >= KG) { return; }
+  constexpr int VPW  = 32 / BITS;
+  constexpr int WPG  = GROUP / VPW;
+  constexpr int QMAX = (1 << BITS) - 1;
+  const int WPR = K * BITS / 32;
+
+  const device VPIPE_ELT* xp = x + (int64_t)n * K + (int64_t)grp * GROUP;
+  float mn = INFINITY, mx = -INFINITY;
+  for (int i = 0; i < GROUP; ++i) {
+    const float v = (float)xp[i];
+    mn = min(mn, v); mx = max(mx, v);
+  }
+  if (clip < 1.0f) {
+    const float mid = 0.5f * (mn + mx);
+    mn = mid + (mn - mid) * clip;
+    mx = mid + (mx - mid) * clip;
+  }
+  const ST se = (ST)((mx - mn) / (float)QMAX);
+  const ST be = (ST)mn;
+  s[(int64_t)n * KG + grp] = se;
+  b[(int64_t)n * KG + grp] = be;
+  const float sf  = (float)se;
+  const float bf  = (float)be;
+  const float inv = (sf > 0.0f) ? 1.0f / sf : 0.0f;
+
+  device uint32_t* wp = w + (int64_t)n * WPR + (int64_t)grp * WPG;
+  for (int wi = 0; wi < WPG; ++wi) {
+    uint32_t packed = 0;
+    for (int i = 0; i < VPW; ++i) {
+      const float v = (float)xp[wi * VPW + i];
+      const int q = clamp((int)round((v - bf) * inv), 0, QMAX);
+      packed |= ((uint32_t)q) << (BITS * i);
+    }
+    wp[wi] = packed;
+  }
+}
+
+#define VPIPE_AFFINE_QUANT_FIT(NAME, BITS, GROUP, ST)                      \
+  kernel void NAME(const device VPIPE_ELT* x [[buffer(0)]],               \
+                   device uint32_t*  w    [[buffer(1)]],                   \
+                   device ST*        s    [[buffer(2)]],                   \
+                   device ST*        b    [[buffer(3)]],                   \
+                   const constant int&   K    [[buffer(4)]],              \
+                   const constant int&   N    [[buffer(5)]],              \
+                   const constant float& clip [[buffer(6)]],              \
+                   uint2 gid [[thread_position_in_grid]])                  \
+  { affine_quant_fit_impl<BITS, GROUP, ST>(x, w, s, b, K, N, clip, gid); }
+
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w8_g64_f16s, 8, 64, half)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w4_g64_f16s, 4, 64, half)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w8_g32_f16s, 8, 32, half)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w4_g32_f16s, 4, 32, half)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w8_g64_bf16s, 8, 64, bfloat)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w4_g64_bf16s, 4, 64, bfloat)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w8_g32_bf16s, 8, 32, bfloat)
+VPIPE_AFFINE_QUANT_FIT(affine_quant_fit_w4_g32_bf16s, 4, 32, bfloat)
+
 // ---------------------------------------------------------------------------
 // IN-MEMORY affine w8 group-64 quantization, for a model that quantizes its
 // raw checkpoint at load (and re-quantizes a streamed layer per use) rather
@@ -1435,6 +1509,74 @@ I8C_QUANT_RB(16)
 I8C_QUANT_RB(64)
 I8C_QUANT_RB(128)
 I8C_QUANT_RB(256)
+
+// THE ACCURATE TIER ROTATED (suffix _r; I8GemmContext::set_g64_rotation):
+// quant_f16_i8_row_g64 / _pad with each group of 64 Walsh-Hadamard
+// transformed before its amax, on the activation and the weight alike.
+// The GEMM (gemm_i8i8_sc_f16_n64_g64rs) is the plain tier's: a group's
+// dot product is the same in the rotated basis. Same contract and
+// dispatch as the plain pair -- {256, M, 1} threads, eight simdgroups a
+// row, one a group -- and a lane holds two contiguous elements, so the
+// stride-1 butterfly runs in the lane and the other five are shuffles.
+// A padded group's zeros are rotated in as the other operand's are.
+template <bool PAD>
+static inline void quant_row_g64r_impl(
+    const device VPIPE_ELT* x, device char* q, device VPIPE_ELT* scales,
+    int Ksrc, int Kpad, uint2 tgid, uint sgid, uint lane)
+{
+  const int row = (int)tgid.y;
+  const int G = Kpad / 64;
+  for (int g = (int)sgid; g < G; g += 8) {
+    const int col = g * 64 + (int)lane * 2;
+    const int64_t src = (int64_t)row * Ksrc + col;
+    const int64_t dst = (int64_t)row * Kpad + col;
+    float h[2];
+    if (!PAD || col + 1 < Ksrc) {
+      const vec<VPIPE_ELT, 2> v =
+          *reinterpret_cast<const device vec<VPIPE_ELT, 2>*>(x + src);
+      h[0] = (float)v[0];
+      h[1] = (float)v[1];
+    } else {
+      h[0] = col < Ksrc ? (float)x[src] : 0.0f;
+      h[1] = col + 1 < Ksrc ? (float)x[src + 1] : 0.0f;
+    }
+    i8c_fwht<64>(h, lane);
+    const float am = simd_max(max(fabs(h[0]), fabs(h[1])));
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    vec<char, 2> o;
+    o[0] = (char)clamp((int)rint(h[0] * inv), -127, 127);
+    o[1] = (char)clamp((int)rint(h[1] * inv), -127, 127);
+    *reinterpret_cast<device vec<char, 2>*>(q + dst) = o;
+    if (lane == 0) {
+      scales[(int64_t)row * G + g] = (VPIPE_ELT)(am * (1.0f / 127.0f));
+    }
+  }
+}
+
+kernel void quant_f16_i8_row_g64_r(
+    const device VPIPE_ELT* x [[buffer(0)]],
+    device char* q [[buffer(1)]],
+    device VPIPE_ELT* scales [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  quant_row_g64r_impl<false>(x, q, scales, K, K, tgid, sgid, lane);
+}
+
+kernel void quant_f16_i8_row_g64_r_pad(
+    const device VPIPE_ELT* x [[buffer(0)]],
+    device char* q [[buffer(1)]],
+    device VPIPE_ELT* scales [[buffer(2)]],
+    const constant int& Ksrc [[buffer(3)]],
+    const constant int& Kpad [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  quant_row_g64r_impl<true>(x, q, scales, Ksrc, Kpad, tgid, sgid, lane);
+}
 
 // THE PER-TOKEN TIER's quantizers (gemm_i8pt_* in dense_gemm_mma): one
 // symmetric int8 scale per ROW over all of K, stored f32 -- the i8x

@@ -148,8 +148,9 @@ const ConfigKey kAttrs[] = {
           "on the same noise",
    .def_str = "increment", .extra = kSeedSequenceExtra},
   {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
-   .doc = "which int8 GEMM i8_gemm runs: 'accurate' (default; the "
-          "weight and activation quantized per call in groups of 64), "
+   .doc = "which int8 GEMM i8_gemm runs: 'accurate' (default; groups "
+          "of 64 on both operands, Hadamard-rotated where a bf16 weight is "
+          "quantized per call), "
           "'fast' (the block weights held as rotated int8 at a coarse "
           "group), 'token' (int8 per weight row x per token after a "
           "256-wide Hadamard rotation: the fastest) or 'token_plain' (the "

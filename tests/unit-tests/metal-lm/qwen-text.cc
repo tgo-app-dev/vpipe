@@ -841,6 +841,85 @@ TEST(metal_lm_smoke, language_model_wired_as_it_loads) {
   EXPECT_TRUE(mgr->wired_pool_used() == pool0);
 }
 
+// A language model KEPT WARM is REPORTED (warm_report,
+// SessionIntf::memory_report): `kind` "language-model", its canonical
+// directory, the bytes its load left wired, its K/V and the time it has
+// left. And a report polled while the hold expires -- it reads K/V from a
+// copy of the model, so it can be the one that lets it go -- leaves the
+// pool where it was without a planning pass. (The test cannot force that
+// interleaving; it checks the pool settles whichever thread frees the
+// model.) Gated on VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_warm_language_model_is_reported) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+  bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  const std::size_t pool0 = mgr->wired_pool_used();
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  const std::size_t charged = mgr->wired_pool_used() - pool0;
+  EXPECT_TRUE(charged > (std::size_t)4 << 30);
+  {
+    auto ctx = lm->make_context();
+    ASSERT_TRUE(ctx.valid());
+    const std::int32_t ids[4] = {9707, 11, 1879, 0};
+    EXPECT_TRUE(lm->prefill(ctx, std::span<const std::int32_t>(ids, 4)) >= 0);
+  }
+  const std::size_t kv = lm->kv_bytes();
+  EXPECT_TRUE(kv > 0);
+
+  mgr->keep_warm(lm, path, 60.0);
+  auto r = mgr->warm_report();
+  ASSERT_TRUE(r.size() == 1);
+  if (r.size() != 1) { return; }
+  EXPECT_TRUE(r[0].kind == "language-model");
+  EXPECT_TRUE(r[0].dir == std::filesystem::canonical(path).string());
+  EXPECT_TRUE(r[0].bytes == charged);
+  EXPECT_TRUE(r[0].kv_bytes == kv);
+  EXPECT_TRUE(r[0].seconds > 50.0 && r[0].seconds <= 60.0);
+  std::printf("[warm_report] %s: %zu MB wired, %zu KB of K/V, %.1f s\n",
+              r[0].dir.c_str(), r[0].bytes >> 20, r[0].kv_bytes >> 10,
+              r[0].seconds);
+  const vpipe::SessionIntf& host = sess;
+  const std::string json = host.memory_report().to_json();
+  EXPECT_TRUE(json.find("\"language-model\"") != std::string::npos);
+
+  // A short hold (renewing only lengthens one, so it is dropped first),
+  // the last user gone, a report polling as it expires.
+  mgr->keep_warm(lm, path, 0);
+  mgr->keep_warm(lm, path, 0.5);
+  lm.reset();
+  std::atomic<bool> stop{false};
+  std::atomic<int> polls{0};
+  std::thread poller([&] {
+    while (!stop.load()) {
+      (void)mgr->warm_report();
+      polls.fetch_add(1);
+    }
+  });
+  bool settled = false;
+  for (int i = 0; i < 100 && !settled; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    settled = mgr->warm_count() == 0 && mgr->wired_pool_used() == pool0;
+  }
+  stop.store(true);
+  poller.join();
+  std::printf("[warm_report] %d reports while the hold expired\n",
+              polls.load());
+  EXPECT_TRUE(polls.load() > 0);
+  EXPECT_TRUE(settled);
+  EXPECT_TRUE(mgr->cached_count() == 0);
+}
+
 // A CONTEXT SAVED to disk and read back decodes as the one it was saved
 // from, token for token (greedy, the same kernels either way); and a
 // conversation PARKED with a warm model is taken back by its key, or

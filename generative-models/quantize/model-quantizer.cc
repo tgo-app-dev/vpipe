@@ -432,6 +432,15 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   vpipe::UiProgress bar;
   if (S) { bar = S->open_progress("quantize"); }
   AffineQuantizer q(_mc);
+  // How every quantized tensor's scales are written (QuantizeOptions::
+  // run_dtype), and in which dtype.
+  using Scales = AffineQuantizer::Scales;
+  const Scales sc = opt.run_dtype == QuantizeOptions::RunDtype::kBf16
+                        ? Scales::kFitBf16
+                    : opt.run_dtype == QuantizeOptions::RunDtype::kF16
+                        ? Scales::kFitF16
+                        : Scales::kF16;
+  const char* sdt = AffineQuantizer::scale_dtype(sc);
   if (!q.valid()) {
     return fail("model-quantize: affine quant kernels unavailable");
   }
@@ -562,8 +571,13 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   std::sort(names.begin(), names.end());
   if (S) {
     S->log_normal(fmt(
-        "model-quantize: {} tensors -> {}-bit g{} ({} -> {})",
-        names.size(), opt.bits, opt.group, in_dir, out_dir));
+        "model-quantize: {} tensors -> {}-bit g{}, scales {} ({} -> {})",
+        names.size(), opt.bits, opt.group,
+        sc == Scales::kFitBf16  ? "BF16 fit for a bf16 run"
+        : sc == Scales::kFitF16 ? "F16 fit for an f16 run"
+        : opt.bf16_scales       ? "F16 (BF16 where the w8 build applies)"
+                                : "F16",
+        in_dir, out_dir));
   }
 
   SafetensorsWriter wr(out_dir, opt.shard_max_bytes);
@@ -622,16 +636,16 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     for (std::size_t i = 0; i < W.size(); ++i) { d[i] = (_Float16)W[i]; }
     SharedBuffer w, s, b;
     if (!q.quantize_linear(in, false, N, K, bits, opt.group, opt.clip,
-                           w, s, b)) {
+                           w, s, b, sc)) {
       return false;
     }
     const std::int64_t wcols = (std::int64_t)K * bits / 32;
     const std::int64_t gcols = (std::int64_t)K / opt.group;
     return wr.add(pfx + ".weight", "U32", {N, wcols}, w.contents(),
                   w.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {N, gcols}, s.contents(),
+           wr.add(pfx + ".scales", sdt, {N, gcols}, s.contents(),
                   s.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {N, gcols}, b.contents(),
+           wr.add(pfx + ".biases", sdt, {N, gcols}, b.contents(),
                   b.byte_size());
   };
   auto norm_write = [&](const std::string& nm, const std::vector<float>& v)
@@ -1448,10 +1462,14 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                                                  : dtype_raw;
     SharedBuffer w, s, b;
     bool ok;
-    if (opt.bf16_scales && bits == 8 && opt.group == 64 &&
-        dtype == "BF16" && col_scale == nullptr) {
+    const bool bf16_fit =
+        sc == Scales::kFitBf16 ||
+        (sc == Scales::kF16 && opt.bf16_scales);
+    if (bf16_fit && bits == 8 && opt.group == 64 && dtype == "BF16" &&
+        col_scale == nullptr) {
       // The in-memory w8 build's own kernel (bf16 library): bf16 scales,
-      // codes fit to them. See QuantizeOptions::bf16_scales.
+      // codes fit to them -- the arithmetic of affine_quant_fit_*'s, rows
+      // in place. See QuantizeOptions::bf16_scales / run_dtype.
       if (!quant_rows_bf16_(_mc, in, N, K, w, s, b)) { return false; }
       const std::int64_t wcols = (std::int64_t)K / 4;
       const std::int64_t gcols = (std::int64_t)K / 64;
@@ -1485,19 +1503,19 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
         }
       }
       ok = q.quantize_linear(f, false, N, K, bits, opt.group, opt.clip,
-                             w, s, b);
+                             w, s, b, sc);
     } else {
       ok = q.quantize_linear(in, dtype == "BF16", N, K, bits, opt.group,
-                             opt.clip, w, s, b);
+                             opt.clip, w, s, b, sc);
     }
     if (!ok) { return false; }
     const std::int64_t wcols = (std::int64_t)K * bits / 32;
     const std::int64_t gcols = (std::int64_t)K / opt.group;
     return wr.add(pfx + ".weight", "U32", {N, wcols}, w.contents(),
                   w.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {N, gcols}, s.contents(),
+           wr.add(pfx + ".scales", sdt, {N, gcols}, s.contents(),
                   s.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {N, gcols}, b.contents(),
+           wr.add(pfx + ".biases", sdt, {N, gcols}, b.contents(),
                   b.byte_size());
   };
 
@@ -1747,7 +1765,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                   (std::size_t)rows * K * 2);
       SharedBuffer w, s, b;
       if (!q.quantize_linear(slab, /*src_bf16=*/true, rows, K, bits, opt.group,
-                             opt.clip, w, s, b)) {
+                             opt.clip, w, s, b, sc)) {
         return false;
       }
       std::memcpy((char*)W.contents() + (std::size_t)e * we,
@@ -1759,9 +1777,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
     return wr.add(pfx + ".weight", "U32", {E, rows, wcols}, W.contents(),
                   W.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {E, rows, gcols}, S.contents(),
+           wr.add(pfx + ".scales", sdt, {E, rows, gcols}, S.contents(),
                   S.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {E, rows, gcols}, B.contents(),
+           wr.add(pfx + ".biases", sdt, {E, rows, gcols}, B.contents(),
                   B.byte_size());
   };
   // As quant_experts, but each expert's f32 [rows,K] slab is produced by a
@@ -1790,7 +1808,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       for (std::size_t i = 0; i < tmp.size(); ++i) { sd[i] = (_Float16)tmp[i]; }
       SharedBuffer w, s, b;
       if (!q.quantize_linear(slab, /*src_bf16=*/false, rows, K, bits,
-                             opt.group, opt.clip, w, s, b)) {
+                             opt.group, opt.clip, w, s, b, sc)) {
         return false;
       }
       std::memcpy((char*)W.contents() + (std::size_t)e * we,
@@ -1802,9 +1820,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
     return wr.add(pfx + ".weight", "U32", {E, rows, wcols}, W.contents(),
                   W.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {E, rows, gcols}, S.contents(),
+           wr.add(pfx + ".scales", sdt, {E, rows, gcols}, S.contents(),
                   S.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {E, rows, gcols}, B.contents(),
+           wr.add(pfx + ".biases", sdt, {E, rows, gcols}, B.contents(),
                   B.byte_size());
   };
   // Quantize a 2D fp linear [N,K] at a forced bit width (router mlp.gate +

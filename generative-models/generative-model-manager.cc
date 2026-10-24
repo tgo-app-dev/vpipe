@@ -2343,7 +2343,67 @@ GenerativeModelManager::warm_kv_bytes() const
   for (const auto& lm : lms) {
     if (lm) { bytes += lm->kv_bytes(); }
   }
+  // A hold that expired while its model was read above went with `lms`,
+  // on this thread, after the reaper had looked: what it wired goes back
+  // to the pool now, as the reaper would have given it. (The manager is
+  // never a const object; only this reader is const.)
+  lms.clear();
+  {
+    auto* self = const_cast<GenerativeModelManager*>(this);
+    lock_guard<mutex> lk(_warm_mu);
+    self->release_external_wired(gone_wired_bytes(self->_wired_lms));
+  }
   return bytes;
+}
+
+std::vector<GenerativeModelManager::WarmUsage>
+GenerativeModelManager::warm_report() const
+{
+  std::vector<WarmUsage> out;
+  // Each language model's place in `out`: its K/V is read outside the
+  // lock, as warm_kv_bytes reads it.
+  std::vector<std::pair<size_t, shared_ptr<LoadedLanguageModel>>> lms;
+  const auto now = std::chrono::steady_clock::now();
+  auto left = [&](std::chrono::steady_clock::time_point until) {
+    const double s = std::chrono::duration<double>(until - now).count();
+    return s > 0 ? s : 0.0;
+  };
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (const auto& w : _warm) {
+      WarmUsage u;
+      u.kind    = "language-model";
+      u.dir     = w.dir;
+      u.seconds = left(w.until);
+      for (const auto& x : _wired_lms) {
+        // Compared by owner: a lock() would take a reference to every
+        // wired model, and one whose last holder let go meanwhile
+        // would be freed here, under the lock.
+        if (w.lm && !x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
+          u.bytes += x.bytes;
+        }
+      }
+      lms.emplace_back(out.size(), w.lm);
+      out.push_back(std::move(u));
+    }
+    for (const auto& w : _warm_models) {
+      out.push_back({w.kind, w.dir, w.bytes, 0, left(w.until)});
+    }
+  }
+  for (const auto& [i, lm] : lms) {
+    if (lm) { out[i].kv_bytes = lm->kv_bytes(); }
+  }
+  // A hold that expired while its model was read above went with `lms`,
+  // on this thread, after the reaper had looked: what it wired goes back
+  // to the pool now, as the reaper would have given it. (The manager is
+  // never a const object; only this reader is const.)
+  lms.clear();
+  {
+    auto* self = const_cast<GenerativeModelManager*>(this);
+    lock_guard<mutex> lk(_warm_mu);
+    self->release_external_wired(gone_wired_bytes(self->_wired_lms));
+  }
+  return out;
 }
 
 void

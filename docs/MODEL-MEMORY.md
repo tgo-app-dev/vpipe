@@ -2266,6 +2266,30 @@ Sage, the ANE; the decoded frames) and each gate's need and room in the
 units the gate applies, margins included. A host reads
 `reports_version()` before it launches and the items above it after.
 
+**What is held, as numbers.** Between runs a host can ask what the
+session holds now and by what (`SessionIntf::memory_report()`): each
+model KEPT WARM -- a language model kept loaded, its wired weights and
+its K/V with its parked conversations; a DiT, an encoder or a VAE a
+stage built, under the kind the stage kept it as, with the bytes it
+gave -- and the seconds each has left (the manager's `warm_report()`);
+each checkpoint resident through the manager, what holds it (the models
+using it and those kept warm alike) and whether it is parked; every
+language model's K/V; the checkpoints nothing holds, which the manager
+can drop at once (`pooled_bytes` -- a model kept warm holds its own, so
+letting it go frees its warm bytes, not these); the wired pool's use and
+limit; and this process's Metal allocations, which take in everything
+above and the stages' scratch. A language model's weights are counted
+only where its load WIRED them (`wire_weights`): read into the model's
+own members, they are in no weight set. A stage that keeps a model with
+no bytes -- vae-decode does -- reports 0 for it.
+
+The figures OVERLAP, and only the Metal allocations are a total. A model
+a stage built keeps part of its checkpoint through the manager's weight
+set -- a DiT's trunk, for one -- so those bytes are in its warm entry and
+in its checkpoint's entry both, and the K/V of the language models kept
+warm is in the session-wide K/V figure too. Show each list for what it
+is; do not add them up.
+
 ---
 
 ## The plug-in surface

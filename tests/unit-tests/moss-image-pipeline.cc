@@ -1558,7 +1558,21 @@ TEST(moss_image_dit, bf16_int8_holds_agree)
   const std::vector<float> dense = run(false, 0, false, false, true);
   const std::vector<float> acc = run(true, 0, false, false, true);
   MP_REQUIRE(!dense.empty() && acc.size() == dense.size());
-  const double ra = rel_l2_(acc, dense);
+  // The bars were set against the accurate tier with its groups
+  // unrotated; the rotation (on by default) lowers that yardstick where
+  // a channel stands out, so the bars hold against the larger of the
+  // two, and the rotated forward is held to a gross bar of the plain.
+  const double ra1 = rel_l2_(acc, dense);
+  double ra0 = ra1;
+  {
+    Env plain("VPIPE_I8_ACC_ROT", "0");
+    const std::vector<float> acc0 = run(true, 0, false, false, true);
+    if (acc0.size() == dense.size()) { ra0 = rel_l2_(acc0, dense); }
+  }
+  std::printf("[moss_image_dit] bf16, accurate tier vs dense: %.3e "
+              "rotated, %.3e plain\n", ra1, ra0);
+  EXPECT_TRUE(ra1 <= 1.25 * ra0);
+  const double ra = std::max(ra1, ra0);
   const char* tname[4] = {"accurate", "fast", "token", "token_plain"};
   for (int tier = 1; tier < 4; ++tier) {
     engaged = true;
