@@ -1210,10 +1210,12 @@ class MetalMiniMaxH3Transformer {
     // Deliberately NOT `quantized`: there are no group scales, and every
     // path that reads an affine triple must not be handed one. A SCALED
     // weight carries `f8_scale`, f32 -- one value, or one per row when
-    // `f8_per_row` (shared/fp8-expand.h).
+    // `f8_per_row` (shared/fp8-expand.h). ComfyUI's INT8 rides here too
+    // (f8 kI8), `f8_rot` its ConvRot group, undone in the widening.
     fp8::Format f8 = fp8::Format::kNone;
     metal_compute::SharedBuffer f8_scale;
     bool f8_per_row = false;
+    int f8_rot = 0;
     // I8GemmContext's int8 LAYOUT (Config::i8_tier) when gc > 0: `codes`
     // int8 [n, k] and `cscales` its scales at group gc (kTokenGroup: f32
     // [n]) -- or, `pc`, a w4 pack's codes / scales / qbias as stored,

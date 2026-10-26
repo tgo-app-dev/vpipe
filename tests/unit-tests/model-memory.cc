@@ -26,6 +26,7 @@
 #include "pipeline/typed-stage.h"
 #include "stages/model-memory.h"
 #include "stages/model-memory-host.h"
+#include "generative-models/lm-run-memory.h"
 #include "stages/model-registry.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "stages/vae-decode-stage.h"
@@ -2996,10 +2997,15 @@ TEST(model_memory, a_language_model_claims_its_floor_and_its_tower)
   const char* dirs[] = {std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH"),
                         std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH")};
   Session sess;
-  auto scratch = [](const std::vector<ResourceClaim>& cs) {
+  // the scratch claims whose label starts `prefix`
+  auto scratch = [](const std::vector<ResourceClaim>& cs,
+                    const std::string& prefix = "vision:") {
     std::size_t b = 0;
     for (const auto& c : cs) {
-      if (c.kind != model_memory::kScratchKind) { continue; }
+      if (c.kind != model_memory::kScratchKind ||
+          c.key.rfind(prefix, 0) != 0) {
+        continue;
+      }
       const std::size_t bar = c.key.rfind('|');
       if (bar != std::string::npos) {
         b += (std::size_t)std::stoull(c.key.substr(bar + 1));
@@ -3007,13 +3013,24 @@ TEST(model_memory, a_language_model_claims_its_floor_and_its_tower)
     }
     return b;
   };
+  genai::LmRunShape run;
+  run.page_tokens = 512;
+  run.max_pages = 64;
+  run.kv_tokens = 512 * 64;
   for (int i = 0; i < 2; ++i) {
     if (dirs[i] == nullptr) { continue; }
     const std::string d = dirs[i];
-    const auto all = model_memory::lm_claims(&sess, d, "t");
+    const auto all = model_memory::lm_claims(&sess, d, "t", run);
     const auto frame =
-        model_memory::lm_claims(&sess, d, "t", 28LL * 28 * 1280);
-    const auto none = model_memory::lm_claims(&sess, d, "t", -1);
+        model_memory::lm_claims(&sess, d, "t", run, 28LL * 28 * 1280);
+    const auto none = model_memory::lm_claims(&sess, d, "t", run, -1);
+    // what it runs in: one claim, per checkpoint, at the family's figure
+    const std::size_t want = genai::lm_run_bytes(&sess, d, run);
+    std::printf("[lm-claims] %s: runs in %zu MB at a 32K-token pool\n",
+                d.c_str(), want >> 20);
+    EXPECT_TRUE(want > ((std::size_t)64 << 20));
+    EXPECT_TRUE(scratch(all, "lm:") == want &&
+                scratch(none, "lm:") == want);
     ASSERT_TRUE(!all.empty() && all[0].kind == model_memory::kWeightsKind);
     if (all.empty()) { continue; }
     const std::size_t disk = model_memory::dir_weights_bytes(d);

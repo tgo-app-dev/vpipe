@@ -1349,7 +1349,8 @@ namespace {
 // Run one prompt through a fresh {source -> text-chat -> sink} mini-
 // pipeline against `model_path` and return the collected turn texts.
 std::vector<std::string>
-run_chat_turn_(const std::string& model_path, const std::string& prompt)
+run_chat_turn_(const std::string& model_path, const std::string& prompt,
+               const FlexData& extra = FlexData())
 {
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
   Session  sess;
@@ -1369,6 +1370,11 @@ run_chat_turn_(const std::string& model_path, const std::string& prompt)
     o.insert("compute_dtype", FlexData::make_string("f16"));
     o.insert("max_new_tokens", FlexData::make_int(96));
     o.insert("max_pages", FlexData::make_int(8));
+    if (extra.is_object()) {
+      for (const auto& [k, v] : extra.as_object()) {
+        o.insert(std::string(k), v);
+      }
+    }
   }
   auto ch = make_unique<TextChatStage>(
       &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
@@ -1452,6 +1458,86 @@ TEST(text_chat_stage, metal_chat_media_image_turn) {
     if (lower_(t).find("red") != std::string::npos) { has_red = true; }
   }
   EXPECT_TRUE(has_red);
+}
+
+// DeepSeek-V4.1 (its synthetic checkpoint, tools/dump_deepseek_v41_golden.py
+// small): a picture through the stage -- the marker parsed, the picture
+// decoded, its span encoded by the DeepSeek tower and spliced with the ids
+// kept -- and a text turn after it in the same context. The weights are
+// random, so the replies are only required to exist.
+TEST(text_chat_stage, metal_chat_deepseek_v41_turns) {
+  const char* gd = std::getenv("VPIPE_DSV41_SMALL_GOLDEN");
+  if (!gd || !*gd) {
+    return;
+  }
+  const std::string model = std::string(gd) + "/model";
+  const std::string img = write_red_ppm_();
+  auto texts = run_chat_turn_(
+      model, "Look: " + vpipe::media_line::make_fs_marker(
+                            vpipe::media_line::Modality::Image, img) +
+                 " What colour is it?");
+  ASSERT_TRUE(!texts.empty());
+  std::size_t chars = 0;
+  for (const auto& t : texts) { chars += t.size(); }
+  std::printf("[text_chat_stage.deepseek_v41] %zu turn texts, %zu chars\n",
+              texts.size(), chars);
+  EXPECT_TRUE(chars > 0);
+}
+
+// DeepSeek-V4.1-Flash itself (VPIPE_DSV41_TEST_MODEL_PATH: the release or
+// an MLX pack): a picture turn and a text turn through the stage, each
+// answered in the model's chat mode.
+TEST(text_chat_stage, metal_chat_deepseek_v41_answers) {
+  const char* path = std::getenv("VPIPE_DSV41_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  const std::string img = write_red_ppm_();
+  auto texts = run_chat_turn_(
+      path, "Look at this image: " +
+                vpipe::media_line::make_fs_marker(
+                    vpipe::media_line::Modality::Image, img) +
+                " What is the dominant color of the image? Answer in one "
+                "word.");
+  bool has_red = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.deepseek_v41] picture: '%s'\n",
+                t.c_str());
+    has_red = has_red || lower_(t).find("red") != std::string::npos;
+  }
+  EXPECT_TRUE(has_red);
+  texts = run_chat_turn_(path, "What is the capital of France? Answer in "
+                               "one word.");
+  bool has_paris = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.deepseek_v41] text: '%s'\n", t.c_str());
+    has_paris = has_paris || lower_(t).find("paris") != std::string::npos;
+  }
+  EXPECT_TRUE(has_paris);
+}
+
+// DeepSeek-V4.1 with `mtp`: the stage loads the DSpark head (the model's
+// own directory named as its drafter) and decodes speculatively -- a
+// greedy reply the same text as without it.
+TEST(text_chat_stage, metal_chat_deepseek_v41_dspark_reply_is_the_same) {
+  const char* gd = std::getenv("VPIPE_DSV41_SMALL_GOLDEN");
+  if (!gd || !*gd) {
+    return;
+  }
+  const std::string model = std::string(gd) + "/model";
+  const std::string prompt = "Name three colours of the rainbow.";
+  // `mtp` is on by default: the plain turn turns it off
+  FlexData off = FlexData::make_object();
+  off.as_object().insert("mtp", FlexData::make_bool(false));
+  const auto plain = run_chat_turn_(model, prompt, off);
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert("mtp", FlexData::make_bool(true));
+  const auto spec = run_chat_turn_(model, prompt, extra);
+  ASSERT_TRUE(!plain.empty() && !spec.empty());
+  std::printf("[text_chat_stage.deepseek_v41] dspark reply %s the plain one "
+              "(%zu chars)\n", plain == spec ? "is" : "DIFFERS from",
+              plain.empty() ? 0 : plain[0].size());
+  EXPECT_TRUE(plain == spec);
 }
 
 // An attachment whose modality the model does not provide (audio on

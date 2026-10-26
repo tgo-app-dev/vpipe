@@ -123,15 +123,71 @@ untranslatable_tensor(const MetalLlamaWeights& w)
   return {};
 }
 
+namespace {
+
+// A regular file named `.safetensors`, in any case -- as config_from_json
+// takes a single file, so a file it opens is never refused here for the
+// spelling of its extension.
+bool
+safetensors_file_(const std::filesystem::path& p)
+{
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(p, ec) || ec) { return false; }
+  std::string ext = p.extension().string();
+  for (char& c : ext) { c = (char)std::tolower((unsigned char)c); }
+  return ext == ".safetensors";
+}
+
+// The ComfyUI prefix every tensor of `w` carries over an H3 DiT's names,
+// "" for none. Longest first: the second is the first's tail.
+std::string
+comfy_prefix_(const MetalLlamaWeights& w)
+{
+  const std::vector<std::string> names = w.tensor_names();
+  if (names.empty()) { return {}; }
+  for (const char* p : {"model.diffusion_model.", "diffusion_model."}) {
+    const std::string pre(p);
+    bool all = true;
+    for (const std::string& n : names) {
+      if (!n.starts_with(pre)) { all = false; break; }
+    }
+    if (all && w.has(pre + "blocks.0.attn.qkv_proj.weight") &&
+        w.has(pre + "audio_patch_proj.weight") &&
+        w.has(pre + "condition_proj.weight")) {
+      return pre;
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+std::size_t
+translate_comfy_prefix(MetalLlamaWeights& w)
+{
+  const std::string pre = comfy_prefix_(w);
+  if (pre.empty()) { return 0; }
+  const std::size_t n = w.tensor_names().size();
+  const bool ok = w.rename_tensors(
+      [&](const std::string& name, MetalLlamaWeights::TensorInfo&) {
+        return name.substr(pre.size());
+      });
+  return ok ? n : 0;
+}
+
+bool
+is_comfy_saved_dit_file(const std::string& path)
+{
+  if (!safetensors_file_(path)) { return false; }
+  // Opened RAW, with no translation, so the prefix is still there.
+  const auto w = MetalLlamaWeights::open(path);
+  return w.has_value() && !comfy_prefix_(*w).empty();
+}
+
 bool
 is_diffusers_dit_file(const std::string& path)
 {
-  std::error_code ec;
-  const std::filesystem::path p(path);
-  if (!std::filesystem::is_regular_file(p, ec) || ec ||
-      p.extension() != ".safetensors") {
-    return false;
-  }
+  if (!safetensors_file_(path)) { return false; }
   // Opened, so the translation has run: its assembled pieces are the
   // tell, and a file it could not place whole does not have them.
   const auto w = MetalLlamaWeights::open_model(path);

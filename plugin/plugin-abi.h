@@ -100,12 +100,18 @@
 //                      measured kept for the session, found by service
 //                      id -- null on a host without it, so never list
 //                      it as required (the toolkit's tuners ask for it)
+//   model-sources      stages/model-source.h installed, WEAK imports in
+//                      a plugin (model_sources_available()): the names
+//                      and labels of the sources model-fetch reads from,
+//                      a mirror's renames and absences -- a family's rows
+//                      added by register_mirror_repos
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
 #define VPIPE_FEATURE_PERF_FLOPS        "perf-flops/1"
 #define VPIPE_FEATURE_ANE_ADAPTERS      "ane-adapters/1"
 #define VPIPE_FEATURE_KERNEL_TUNING     "kernel-tuning/1"
+#define VPIPE_FEATURE_MODEL_SOURCES     "model-sources/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

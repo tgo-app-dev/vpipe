@@ -186,6 +186,9 @@ VisualQaStage::VisualQaStage(const SessionContextIntf* s,
 }
 
 namespace {
+// A question's turn beside its answer (max_new_tokens), in tokens: the
+// rendered user turn and the generation prompt, for what a branch adds.
+constexpr std::int64_t kQuestionTurnTokens = 256;
 // The compute precisions the LM loader accepts, for the editor's
 // dropdown; the loader stays the authority.
 constexpr SpecExtra kComputeDtypeChoices[] = {
@@ -315,10 +318,18 @@ std::vector<ResourceClaim>
 VisualQaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  // The LM (streamable when it is a Mixture of Experts) and its vision
-  // tower at the largest picture the checkpoint admits.
+  // The LM (streamable when it is a Mixture of Experts), what it runs in
+  // -- the picture's context in the page pool and a branch of it per
+  // question, its turn and answer -- and its vision tower at the largest
+  // picture the checkpoint admits.
+  genai::LmRunShape run;
+  run.page_tokens = _page_tokens;
+  run.max_pages = _max_pages;
+  run.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
+  run.contexts = 1 + (int)_questions.size();
+  run.branch_tokens = (std::int64_t)_max_new_tokens + kQuestionTurnTokens;
   return model_memory::lm_claims(
-      session(), resolve_model_dir(session(), _hf_dir), id());
+      session(), resolve_model_dir(session(), _hf_dir), id(), run);
 }
 
 Job

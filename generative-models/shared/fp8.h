@@ -21,6 +21,15 @@
 // multiplier beside it (`<name>.scale_weight`, `<name>.weight_scale`,
 // ComfyUI's `scaled_fp8` marker), means code * scale, and which scale
 // goes with which tensor is a matter of names -- shared/fp8-layout.h.
+//
+// INT8 rides the same machinery as a third format, kI8: ComfyUI's
+// `int8_tensorwise` (a comfy_quant record) stores signed codes with one
+// scale or one per row, value = code * scale. A code is its own small
+// integer, exact in bf16. It may also be ROTATED (ConvRot, the record's
+// `convrot`): the codes then quantize W * H^T, H a regular Hadamard over
+// groups of the input columns, undone on the codes by convrot_unrotate
+// below. kI8 is never a dtype -- an I8 tensor is int8 only where a record
+// says so.
 
 #include <array>
 #include <cstddef>
@@ -34,10 +43,10 @@
 
 namespace vpipe::genai::fp8 {
 
-enum class Format { kNone, kE4M3, kE5M2 };
+enum class Format { kNone, kE4M3, kE5M2, kI8 };
 
 // The FP8 format a safetensors dtype string names; kNone for any other
-// dtype.
+// dtype (I8 among them: see kI8 above).
 inline Format
 format_of(std::string_view safetensors_dtype)
 {
@@ -47,10 +56,11 @@ format_of(std::string_view safetensors_dtype)
 }
 
 // One code, as the float it stands for. NaN codes decode to a quiet NaN,
-// E5M2's infinities to infinities.
+// E5M2's infinities to infinities; an int8 code to its integer.
 inline float
 to_f32(std::uint8_t code, Format f)
 {
+  if (f == Format::kI8) { return (float)(std::int8_t)code; }
   const float sign = (code & 0x80u) ? -1.0f : 1.0f;
   if (f == Format::kE4M3) {
     const int e = (code >> 3) & 0xF;
@@ -113,7 +123,9 @@ bf16_table(Format f)
       detail::make_lut_(Format::kE4M3);
   static const std::array<std::uint16_t, 256> kE5M2 =
       detail::make_lut_(Format::kE5M2);
-  return f == Format::kE5M2 ? kE5M2 : kE4M3;
+  static const std::array<std::uint16_t, 256> kI8 =
+      detail::make_lut_(Format::kI8);
+  return f == Format::kE5M2 ? kE5M2 : f == Format::kI8 ? kI8 : kE4M3;
 }
 
 // The 256-entry code -> f32 table for a format. Built once.
@@ -129,7 +141,57 @@ f32_table(Format f)
   };
   static const std::array<float, 256> kE4M3 = make(Format::kE4M3);
   static const std::array<float, 256> kE5M2 = make(Format::kE5M2);
-  return f == Format::kE5M2 ? kE5M2 : kE4M3;
+  static const std::array<float, 256> kI8 = make(Format::kI8);
+  return f == Format::kE5M2 ? kE5M2 : f == Format::kI8 ? kI8 : kE4M3;
+}
+
+// Whether `g` is a ConvRot group: a power of four, 4 to 1024 (what
+// comfy_kitchen builds, and what one GPU threadgroup holds).
+inline bool
+convrot_group_ok(int g)
+{
+  return g >= 4 && g <= 1024 && (g & (g - 1)) == 0 &&
+         (__builtin_ctz((unsigned)g) % 2) == 0;
+}
+
+// ConvRot undone in place ON THE CODES: each group of `g` integer codes
+// of `v` (n of them, a multiple of g) multiplied by H^T * sqrt(g), H the
+// normalized REGULAR Hadamard comfy_kitchen rotates with -- kron powers
+// of
+//   [[ 1, 1, 1,-1], [ 1, 1,-1, 1], [ 1,-1, 1, 1], [-1, 1, 1, 1]] / 2.
+// H is symmetric and orthogonal, so the rotation is its own inverse. Each
+// base-4 digit of an index is one radix-4 stage: with s the four values
+// that differ in that digit summed, the d-th becomes s - 2 * the
+// (3 - d)-th. A row's scale is common to its groups, so it waits until
+// after: every value stays an integer of magnitude at most 128 * 1024 <
+// 2^24, so the sums are EXACT, in any order and even in f32, and the
+// weight is v * scale * convrot_norm(g), a product rounded once -- which
+// the GPU kernel (affine_dequant's i8_convrot_dequant) computes alike.
+inline void
+convrot_unrotate(std::int32_t* v, std::size_t n, int g)
+{
+  for (std::size_t g0 = 0; g0 + (std::size_t)g <= n; g0 += (std::size_t)g) {
+    std::int32_t* x = v + g0;
+    for (int st = 1; st < g; st *= 4) {
+      for (int q = 0; q < g / 4; ++q) {
+        const int base = (q / st) * st * 4 + q % st;
+        const std::int32_t a0 = x[base], a1 = x[base + st];
+        const std::int32_t a2 = x[base + 2 * st], a3 = x[base + 3 * st];
+        const std::int32_t s = a0 + a1 + a2 + a3;
+        x[base] = s - 2 * a3;
+        x[base + st] = s - 2 * a2;
+        x[base + 2 * st] = s - 2 * a1;
+        x[base + 3 * st] = s - 2 * a0;
+      }
+    }
+  }
+}
+
+// 1 / sqrt(g) for a ConvRot group, exact: g is a power of four.
+inline float
+convrot_norm(int g)
+{
+  return 1.0f / (float)(1 << (__builtin_ctz((unsigned)g) / 2));
 }
 
 // Decode `n` codes into bf16. `f` must not be kNone.

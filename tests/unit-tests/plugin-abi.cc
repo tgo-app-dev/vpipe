@@ -98,6 +98,8 @@ TEST(plugin_abi, features)
     EXPECT_TRUE(ctx.has_feature(f));
     EXPECT_TRUE(host_has_feature(f));
   }
+  // Added inside ABI 8: a plugin registering mirror rows asks for it.
+  EXPECT_TRUE(ctx.has_feature(VPIPE_FEATURE_MODEL_SOURCES));
   EXPECT_FALSE(ctx.has_feature("no-such-feature/1"));
   // A revision is part of the name: /2 is not /1.
   EXPECT_FALSE(host_has_feature("stage-commands/2"));

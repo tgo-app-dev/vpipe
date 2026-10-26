@@ -10,6 +10,7 @@
 #include "pipeline/stage-registry.h"
 #include "plugin/plugin-abi.h"
 #include "plugin/plugin-manager.h"
+#include "stages/model-source.h"
 
 #include <iostream>
 #include <streambuf>
@@ -60,6 +61,12 @@ TEST(plugin_loader, dlopen_register_instantiate)
 
   // Its StageSpec was attached by the plugin's register call.
   EXPECT_TRUE(StageRegistry::get().spec("plugin-echo") != nullptr);
+  // And the mirror row it added while it loaded: held, then admitted with
+  // it (the plugin reached the weak import).
+  std::string mirrored;
+  EXPECT_TRUE(mirror_repo("modelscope", "plugin-echo/echo-model", mirrored)
+              == MirrorStatus::Renamed);
+  EXPECT_TRUE(mirrored == "plugin-echo-cn/echo-model");
 
   // It reported the version it was built for, and it was recorded.
   bool recorded = false;
@@ -125,6 +132,11 @@ TEST(plugin_loader, a_missing_feature_is_refused_and_its_stages_withdrawn)
   EXPECT_TRUE(StageRegistry::get().create(
                   "plugin-handshake-missing-feature", &sess, "x", {}) ==
               nullptr);
+  // Its mirror row, added from a static initialiser, went with it.
+  std::string mirrored;
+  EXPECT_TRUE(mirror_repo("modelscope", "plugin-handshake/refused-model",
+                          mirrored) == MirrorStatus::Same);
+  EXPECT_TRUE(mirrored == "plugin-handshake/refused-model");
 }
 
 TEST(plugin_loader, bad_path_is_rejected)

@@ -261,6 +261,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         yue2.cc
         bs-roformer.cc
         drama3.cc
+        deepseek-v41.cc
+        lm-run-memory.cc
         qwen4-exp-kernels.cc
         moe-grouped-nax.cc
         moe-expert-cache.cc

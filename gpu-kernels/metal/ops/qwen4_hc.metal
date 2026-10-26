@@ -1423,6 +1423,305 @@ kernel void qsa_select_f16(
   }
 }
 
+// ---- qsa_select in two phases (a decode step's or a verify's few rows) --
+//
+// qsa_select gives a row one threadgroup, which a prefill's rows fill the
+// GPU with and a decode step's one does not: past ~128K tokens it walks
+// 32K-64K blocks on one core six times (77 us at 32K blocks, 165 at 64K on
+// an M4 Pro). Here a row's chunks of QSA_TOPK_CHUNK blocks each take their
+// own top k on their own core -- every block of the row's top k is one of
+// its chunk's: whatever beats it in the chunk beats it in the row -- then
+// one threadgroup takes the top k of their union: of the candidates at or
+// above a bound the row's k-th key cannot be under (the largest chunk's
+// k-th key, and the k-th largest of the chunks' top R: a subset's), few
+// above it. The same blocks as qsa_select, ties at the threshold to the
+// earliest, the same tokens out. (DeepSeek-V4.1's two-phase top-k,
+// dsv41_topk_chunk / _merge, on QSA's keys.)
+
+#define QSA_TOPK_CHUNK 4096
+
+// A threadgroup of NT's total of one value a thread, and each thread's
+// exclusive prefix in thread order (`part`, NT / 32 words, read after the
+// barrier: a caller does not write it again before another one).
+template <int NT>
+METAL_FUNC uint qsa_tg_scan_(uint v, threadgroup uint* part,
+                             thread uint& before, uint sg, uint lane)
+{
+  const uint x = simd_prefix_exclusive_sum(v);
+  if (lane == 31) { part[sg] = x + v; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint lo = 0, tot = 0;
+  for (uint j = 0; j < (uint)NT / 32; ++j) {
+    lo += j < sg ? part[j] : 0u;
+    tot += part[j];
+  }
+  before = lo + x;
+  return tot;
+}
+
+// The top K of the entries j < L whose key (keyf(j)) is at least lo, ties
+// at the K-th key taken lowest j first, each handed to emit(at, j) with
+// `at` ascending in j -- every such entry when there are K or fewer.
+// Returns how many, and the K-th key in kth (0 when every one was taken).
+// A radix select MSB first, 8 bits a pass, its histogram NH deep. Every
+// thread of a threadgroup of NT (256 or more) calls it.
+template <int NT, int NH, typename KeyF, typename Emit>
+METAL_FUNC uint qsa_select_(
+    int L, KeyF keyf, uint lo, int K, Emit emit, threadgroup atomic_uint* hist,
+    threadgroup uint* cnt, threadgroup uint* sums, threadgroup uint* sums2,
+    threadgroup uint* shv, thread uint& kth, uint tid, uint sg, uint lane)
+{
+  uint have = 0;
+  for (int j = (int)tid; j < L; j += NT) { have += keyf(j) >= lo ? 1u : 0u; }
+  uint ignore = 0;
+  const uint total = qsa_tg_scan_<NT>(have, sums, ignore, sg, lane);
+  uint thr = lo, ties = 0;
+  bool exact = false;
+  if (total > (uint)K) {
+    uint prefix = 0, need = (uint)K;
+    threadgroup atomic_uint* hp = hist + (sg % NH) * 256;
+    for (int pass = 0; pass < 4; ++pass) {
+      const int shift = 24 - 8 * pass;
+      const uint hi_mask = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
+      for (int b = (int)tid; b < NH * 256; b += NT) {
+        atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int j = (int)tid; j < L; j += NT) {
+        const uint k = keyf(j);
+        if (k >= lo && (k & hi_mask) == prefix) {
+          atomic_fetch_add_explicit(&hp[(k >> shift) & 0xFFu], 1u,
+                                    memory_order_relaxed);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int t = (int)tid; t < 256; t += NT) {
+        uint c = 0;
+        for (int j = 0; j < NH; ++j) {
+          c += atomic_load_explicit(&hist[j * 256 + t],
+                                    memory_order_relaxed);
+        }
+        cnt[t] = c;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // bins from the highest down: a thread's bin 255 - tid, and the
+      // count above it
+      const uint mine = tid < 256 ? cnt[255 - tid] : 0u;
+      uint above = 0;
+      (void)qsa_tg_scan_<NT>(mine, sums2, above, sg, lane);
+      if (tid < 256 && above < need && need <= above + mine) {
+        shv[0] = prefix | ((255u - tid) << shift);
+        shv[1] = need - above;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      prefix = shv[0];
+      need = shv[1];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    thr = prefix;
+    ties = need;
+    exact = true;
+  }
+  // compaction in index order, a contiguous range a thread
+  const int per = (L + NT - 1) / NT;
+  const int a = min(L, (int)tid * per), b = min(L, a + per);
+  uint gt = 0, eq = 0;
+  for (int j = a; j < b; ++j) {
+    const uint k = keyf(j);
+    gt += (exact ? k > thr : k >= lo) ? 1u : 0u;
+    eq += exact && k == thr ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);   // `sums` read above
+  uint gbefore = 0, ebefore = 0;
+  const uint gtot = qsa_tg_scan_<NT>(gt, sums, gbefore, sg, lane);
+  (void)qsa_tg_scan_<NT>(eq, sums2, ebefore, sg, lane);
+  uint erank = ebefore;
+  uint at = gbefore + min(erank, ties);
+  for (int j = a; j < b; ++j) {
+    const uint k = keyf(j);
+    bool take = exact ? k > thr : k >= lo;
+    if (exact && k == thr) {
+      take = erank < ties;
+      ++erank;
+    }
+    if (take && at < (uint)K) { emit(at++, j); }
+  }
+  kth = exact ? thr : 0u;
+  return exact ? (uint)K : min(gtot, (uint)K);
+}
+
+// QSA's key of a block's score: -1 (unseen) below every score (>= 0), a
+// score's bits ordering as the score does.
+inline uint qsa_key_(float v)
+{
+  return v < 0.0f ? 0u : as_type<uint>(v) + 1u;
+}
+
+// Phase one: chunk g of row r's top k of its seen blocks, keys into ck
+// and blocks into cp [rows, G, k] (key 0 and -1 past its last), its k-th
+// key into tk [rows, G] (0 when it holds k or fewer), and its top R keys,
+// in no order, into tr [rows, G, R] (0 past them). s [rows, nb_max] as
+// qsa_score* writes it. grid {256 * G, rows}, tg {256}.
+kernel void qsa_topk_chunk_f16(
+    const device float* s   [[buffer(0)]],
+    device uint*        ck  [[buffer(1)]],
+    device int*         cp  [[buffer(2)]],
+    device uint*        tk  [[buffer(3)]],
+    device uint*        tr  [[buffer(4)]],
+    constant int& nb_max    [[buffer(5)]],
+    constant int& k         [[buffer(6)]],
+    constant int& R         [[buffer(7)]],
+    constant int& ratio     [[buffer(8)]],
+    constant int& q_offset  [[buffer(9)]],
+    constant int& r0        [[buffer(10)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  constexpr int NT = 256, CH = QSA_TOPK_CHUNK, NH = 8;
+  threadgroup uint keys[CH];
+  threadgroup atomic_uint hist[NH * 256];
+  threadgroup uint cnt[256], sums[32], sums2[32], shv[2];
+  const int G = (nb_max + CH - 1) / CH;
+  const int g = (int)tg.x, r = (int)tg.y;
+  const int nb = (q_offset + r0 + r + 1) / ratio;    // the row's blocks
+  const int t0 = g * CH, L = clamp(nb - t0, 0, CH);
+  const device float* srow = s + (ulong)r * nb_max + t0;
+  for (int j = (int)tid; j < L; j += NT) { keys[j] = qsa_key_(srow[j]); }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup uint* kp = keys;
+  device uint* ok = ck + ((ulong)r * G + g) * k;
+  device int* op = cp + ((ulong)r * G + g) * k;
+  device uint* orr = tr + ((ulong)r * G + g) * R;
+  uint kth = 0;
+  const uint kept = qsa_select_<NT, NH>(
+      L, [kp](int j) { return kp[j]; }, 1u, k,
+      [kp, ok, op, t0](uint at, int j) {
+        ok[at] = kp[j];
+        op[at] = t0 + j;
+      },
+      hist, cnt, sums, sums2, shv, kth, tid, sg, lane);
+  for (int j = (int)kept + (int)tid; j < k; j += NT) {
+    ok[j] = 0u;
+    op[j] = -1;
+  }
+  if (tid == 0) { tk[(ulong)r * G + g] = kth; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);   // `sums` read above
+  uint rth = 0;
+  const uint rk = qsa_select_<NT, NH>(
+      L, [kp](int j) { return kp[j]; }, 1u, R,
+      [kp, orr](uint at, int j) { orr[at] = kp[j]; }, hist, cnt, sums,
+      sums2, shv, rth, tid, sg, lane);
+  for (int j = (int)rk + (int)tid; j < R; j += NT) { orr[j] = 0u; }
+}
+
+// Phase two: a row's top k of its chunks' candidates -- those at or above
+// the bound, gathered in order into threadgroup memory when they fit
+// (else read where they lie) -- and its tokens as qsa_select emits them:
+// every selected block's ratio tokens in block order, then the tail the
+// incomplete block holds; sel [rows, k * ratio + ratio - 1], nsel [rows].
+// G * R <= 3072. grid {256 * rows}, tg {256}.
+kernel void qsa_topk_merge_f16(
+    const device uint* ck   [[buffer(0)]],
+    const device int*  cp   [[buffer(1)]],
+    const device uint* tk   [[buffer(2)]],
+    const device uint* tr   [[buffer(3)]],
+    device int*        sel  [[buffer(4)]],
+    device int*        nsel [[buffer(5)]],
+    constant int& nb_max    [[buffer(6)]],
+    constant int& k         [[buffer(7)]],
+    constant int& R         [[buffer(8)]],
+    constant int& ratio     [[buffer(9)]],
+    constant int& q_offset  [[buffer(10)]],
+    constant int& r0        [[buffer(11)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  constexpr int NT = 256, CH = QSA_TOPK_CHUNK, NH = 4, CAP = 3072;
+  threadgroup uint lk[CAP];
+  threadgroup int lp[CAP];
+  threadgroup atomic_uint hist[NH * 256];
+  threadgroup uint cnt[256], sums[32], sums2[32], shv[2], tmax[32];
+  const int G = (nb_max + CH - 1) / CH, M = G * k, GR = G * R;
+  const device uint* rk = ck + (ulong)row * M;
+  const device int* rp = cp + (ulong)row * M;
+  const int p = q_offset + r0 + (int)row;
+  const int nb = (p + 1) / ratio;
+  const int width = k * ratio + ratio - 1;
+  device int* out = sel + (ulong)row * width;
+  // the bounds: the largest chunk k-th key ...
+  uint t = 0;
+  for (int g = (int)tid; g < G; g += NT) {
+    t = max(t, tk[(ulong)row * G + g]);
+  }
+  t = simd_max(t);
+  if (lane == 0) { tmax[sg] = t; }
+  // ... and the k-th largest of every chunk's top R
+  for (int j = (int)tid; j < GR; j += NT) {
+    lk[j] = tr[(ulong)row * GR + j];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint lo = 1u;
+  for (int j = 0; j < NT / 32; ++j) { lo = max(lo, tmax[j]); }
+  {
+    threadgroup uint* kp = lk;
+    uint uk = 0;
+    (void)qsa_select_<NT, NH>(GR, [kp](int j) { return kp[j]; }, 1u, k,
+                              [](uint, int) {}, hist, cnt, sums, sums2, shv,
+                              uk, tid, sg, lane);
+    lo = max(lo, uk);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);   // lk, `sums` reused
+  const int per = (M + NT - 1) / NT;
+  const int a = min(M, (int)tid * per), b = min(M, a + per);
+  uint mine = 0;
+  for (int j = a; j < b; ++j) { mine += rk[j] >= lo ? 1u : 0u; }
+  uint before = 0;
+  const uint total = qsa_tg_scan_<NT>(mine, sums, before, sg, lane);
+  uint kept = 0, kth = 0;
+  const int rt = ratio;
+  if (total <= (uint)CAP) {
+    uint at = before;
+    for (int j = a; j < b; ++j) {
+      const uint kk = rk[j];
+      if (kk >= lo) {
+        lk[at] = kk;
+        lp[at] = rp[j];
+        ++at;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup uint* kp = lk;
+    threadgroup int* pp = lp;
+    kept = qsa_select_<NT, NH>(
+        (int)total, [kp](int j) { return kp[j]; }, lo, k,
+        [out, pp, rt](uint at2, int j) {
+          for (int q = 0; q < rt; ++q) {
+            out[at2 * rt + q] = pp[j] * rt + q;
+          }
+        },
+        hist, cnt, sums, sums2, shv, kth, tid, sg, lane);
+  } else {
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // `sums` read above
+    kept = qsa_select_<NT, NH>(
+        M, [rk](int j) { return rk[j]; }, lo, k,
+        [out, rp, rt](uint at2, int j) {
+          for (int q = 0; q < rt; ++q) {
+            out[at2 * rt + q] = rp[j] * rt + q;
+          }
+        },
+        hist, cnt, sums, sums2, shv, kth, tid, sg, lane);
+  }
+  if (tid == 0) {
+    int c = (int)kept * ratio;
+    for (int q = nb * ratio; q <= p; ++q) { out[c++] = q; }
+    nsel[row] = c;
+  }
+}
+
 // qsa_attn_f16 for a FEW rows (a decode step, a speculative verify): the
 // same softmax over a row's selected tokens, a threadgroup of 16
 // simdgroups to a (head, row) where one simdgroup did it all -- a lane's

@@ -96,6 +96,15 @@ inline constexpr std::string_view kDraftBits = "draft_bits";
 // model lives. Absent: false. Not part of the cache key -- it changes how
 // the model is held, not what is loaded.
 inline constexpr std::string_view kWireWeights = "wire_weights";
+// int: the most the model may hold in all, MB -- its weights as held, a
+// Mixture of Experts' expert cache, a conversation's state and working
+// memory. A model whose routed experts can live in a cache (DeepSeek-
+// V4.1-Flash, a Qwen3.x MoE) sizes the cache within it, and a draft head
+// that loads only where every expert is resident loads only where they
+// all are within it; a dense model loads whole regardless. Absent / 0:
+// the box's memory alone. Not part of the cache key, as wire_weights: a
+// model loaded already is handed over at the size it was loaded at.
+inline constexpr std::string_view kMemoryLimitMb = "memory_limit_mb";
 }  // namespace load_spec
 
 // Session-shared cache of loaded language models. Two loads with the
@@ -586,6 +595,22 @@ public:
   // Declared scratch for `phase`; with an empty phase, the widest single
   // phase plus anything unphased -- the peak rule weights use.
   std::size_t scratch_bytes(const std::string& phase) const;
+
+  // One declared arena's bytes (0 when `label` was never declared) -- so a
+  // model sizing itself beside the plan can leave its OWN arena out of the
+  // peers it counts. Host-only: NOT exported (no plugin sizes a host
+  // model, and an exported method would be a new symbol a plugin built
+  // against this header fails to load without on an older ABI-8 host).
+  __attribute__((visibility("hidden"))) std::size_t
+  declared_scratch(const std::string& label) const;
+  // What the plan counts for `dir`'s weights -- the larger of what its
+  // set holds and what was declared, as phase_footprint() adds it; 0 when
+  // neither -- so a model sizing itself beside the plan leaves out
+  // exactly its own share (a checkpoint booked under its size on disk, as
+  // a limited expert cache's is, would otherwise take its peers' room
+  // with it). Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  planned_weight_bytes(const std::string& dir) const;
 
   // Correct a declared arena to its real size.
   //

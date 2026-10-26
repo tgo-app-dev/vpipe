@@ -2134,3 +2134,65 @@ VPIPE_FP8_DEQUANT(fp8_e5m2_dequant, fp8_e5m2_f_)
 
 VPIPE_FP8_DEQUANT_SCALED(fp8_e4m3_dequant_scaled, fp8_e4m3_f_)
 VPIPE_FP8_DEQUANT_SCALED(fp8_e5m2_dequant_scaled, fp8_e5m2_f_)
+
+// INT8 (ComfyUI's int8_tensorwise): a signed code, value = code * scale,
+// the same shape as scaled FP8 (shared/fp8.h's kI8).
+inline float
+i8_f_(uint c)
+{
+  return (float)as_type<char>((uchar)c);
+}
+
+VPIPE_FP8_DEQUANT_SCALED(i8_dequant_scaled, i8_f_)
+
+// INT8 CONVROT: the codes quantize W * H^T, H the normalized REGULAR
+// Hadamard -- kron powers of [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],
+// [-1,1,1,1]] / 2 -- over each `group` (a power of four, 4..1024) of a
+// row's inputs. H is symmetric and orthogonal, so the weight is
+// (code * scale) * H again, group by group. The scale is a row's, common
+// to its groups, so the CODES are un-rotated first, in integers: every
+// value stays under 128 * 1024 in magnitude, so the stages are exact,
+// and the weight is v * scale / sqrt(group), one product rounded ONCE
+// into VPIPE_ELT -- shared/fp8.h's convrot_unrotate and fp8::decode_bf16
+// to the bit. A threadgroup of 256 takes 1024 consecutive elements:
+// whole groups, since a group divides 1024 and each row. Each radix-4
+// stage is a quad a thread, the four values that differ in one base-4
+// digit of the index: with s their sum, the d-th becomes s - 2 * the
+// (3 - d)-th.
+//
+//   0:codes(uchar) 1:y(VPIPE_ELT) 2:n 3:scale(float) 4:div 5:group
+// grid {ceil(n / 1024) * 256, 1, 1}, tg {256, 1, 1}.
+kernel void i8_convrot_dequant(const device uchar* w      [[buffer(0)]],
+                               device VPIPE_ELT*   y      [[buffer(1)]],
+                               const constant uint& n     [[buffer(2)]],
+                               const device float* scale  [[buffer(3)]],
+                               const constant uint& div   [[buffer(4)]],
+                               const constant uint& group [[buffer(5)]],
+                               uint tg [[threadgroup_position_in_grid]],
+                               uint t  [[thread_index_in_threadgroup]])
+{
+  threadgroup int v[1024];
+  const uint e0 = tg * 1024u;
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = t * 4u + j, e = e0 + i;
+    v[i] = e < n ? (int)as_type<char>(w[e]) : 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint st = 1u; st < group; st *= 4u) {
+    const uint base = (t / st) * st * 4u + t % st;
+    const int a0 = v[base], a1 = v[base + st];
+    const int a2 = v[base + 2u * st], a3 = v[base + 3u * st];
+    const int s = a0 + a1 + a2 + a3;
+    v[base] = s - 2 * a3;
+    v[base + st] = s - 2 * a2;
+    v[base + 2u * st] = s - 2 * a1;
+    v[base + 3u * st] = s - 2 * a0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  // 1 / sqrt(group), exact: a power of two.
+  const float inv = 1.0f / (float)(1u << (ctz(group) / 2u));
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = t * 4u + j, e = e0 + i;
+    if (e < n) { y[e] = (VPIPE_ELT)((float)v[i] * scale[e / div] * inv); }
+  }
+}

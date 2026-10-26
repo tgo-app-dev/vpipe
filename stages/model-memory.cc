@@ -2,11 +2,14 @@
 #include "stages/model-memory-host.h"
 
 #include "common/host-report.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/drawthings-store.h"
@@ -16,6 +19,7 @@
 #include "interfaces/session-context-intf.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "interfaces/session-services-intf.h"
+#include "pipeline/resource-claim-delivery.h"
 
 #include <fcntl.h>
 #include <sys/sysctl.h>
@@ -765,10 +769,28 @@ payload_claims(std::string label, std::size_t bytes,
 
 std::vector<ResourceClaim>
 lm_claims(const SessionContextIntf* session, const std::string& dir,
-          const std::string& label, std::int64_t picture_pixels,
-          int picture_tokens)
+          const std::string& label, const genai::LmRunShape& run,
+          std::int64_t picture_pixels, int picture_tokens,
+          std::size_t memory_limit)
 {
+  const bool draft_head = run.draft_head;
   std::vector<ResourceClaim> out = weight_claims({dir});
+  // what it runs in, a claim per checkpoint
+  const std::size_t run_bytes = genai::lm_run_bytes(session, dir, run);
+  for (auto& c : scratch_claims(genai::lm_run_label(dir), run_bytes, {})) {
+    out.push_back(std::move(c));
+  }
+  // Under the host's limit a cached MoE holds what its cache, sized
+  // within the limit, leaves it: the limit less its run and `beside` (the
+  // working memory its loader counts in the limit with the run), at least
+  // its floor (the planner clamps it to the checkpoint).
+  auto held_under_limit = [&](ResourceClaim* c, std::size_t beside) {
+    if (memory_limit == 0) { return; }
+    const std::size_t used = run_bytes + beside;
+    const std::size_t left = memory_limit > used ? memory_limit - used : 0;
+    bag::set_integer(c->extra, kClaimHeldBytes,
+                     (std::int64_t)std::max(left, c->floor_bytes));
+  };
   genai::ModelLoader loader(session);
   const auto mcfg = loader.load_config(dir);
   if (!mcfg.has_value() || mcfg->hidden <= 0) { return out; }
@@ -776,6 +798,36 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
   // loader keeps its routed experts in a cache (MetalQwenModel::
   // lm_expert_cache_bytes), so the least it holds is the rest of the
   // model and one layer of experts.
+  // DeepSeek-V4.1-Flash: the same, from its own layout -- the rest of the
+  // model as it is held (the FP8 projections as their codes and scales), a
+  // layer's experts resident and a layer's transient, the cache's least.
+  if (mcfg->architecture == "DeepseekV41ForCausalLM") {
+    std::size_t ex = 0, rest = 0, vis = 0;
+    if (genai::MetalDeepseekV41ModelExec::expert_bytes(dir, &ex, &rest,
+                                                       &vis) &&
+        ex > 0) {
+      const int layers = std::max(1, mcfg->n_layers);
+      const std::size_t head =
+          draft_head ? genai::MetalDeepseekV41Model::dspark_bytes(dir) : 0;
+      out[0] = weight_claim_streamable(
+          dir, rest + vis + head + 2 * (ex / (std::size_t)layers));
+    }
+    // its vision tower's encode at the largest picture it admits -- which
+    // the cache's sizing counts in a limit beside the run
+    genai::DeepseekV41Config dc;
+    std::string err;
+    const std::size_t vis_scratch =
+        vis > 0 && genai::DeepseekV41Config::from_dir(dir, &dc, &err)
+            ? genai::MetalDeepseekV41Vision::encode_scratch_bytes(dc)
+            : 0;
+    if (ex > 0) { held_under_limit(&out[0], vis_scratch); }
+    if (picture_pixels >= 0) {
+      for (auto& c : scratch_claims("vision:" + label, vis_scratch, {})) {
+        out.push_back(std::move(c));
+      }
+    }
+    return out;
+  }
   const auto qc = genai::MetalQwenModel::config_from(*mcfg);
   if (qc.is_moe()) {
     if (auto w = genai::MetalLlamaWeights::open_model(dir)) {
@@ -787,6 +839,7 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
         out[0] = weight_claim_streamable(
             dir, disk - ex - un + gr +
                      ex / (std::size_t)std::max(1, qc.n_layers));
+        held_under_limit(&out[0], 0);
       }
     }
   }
@@ -1028,8 +1081,18 @@ public:
   {
     auto* mgr = manager(session);
     if (mgr == nullptr) { return; }
-    const std::size_t b = dir_weights_bytes(dir);
+    std::size_t b = dir_weights_bytes(dir);
     if (b == 0) { return; }        // absent component: nothing to hold
+    // What it will HOLD, when the claim says it is less than the
+    // checkpoint (kClaimHeldBytes: a MoE's cache sized within a host's
+    // limit) -- booked at that, never under its floor.
+    if (const ResourceClaim* c = DeliveringResourceClaim::current();
+        c != nullptr && c->key == dir) {
+      const std::int64_t held = bag::integer(c->extra, kClaimHeldBytes, 0);
+      if (held > 0 && (std::size_t)held < b) {
+        b = std::min(b, std::max((std::size_t)held, floor));
+      }
+    }
     // A floor bigger than the checkpoint is a caller mistake, and taking
     // it would report a streamed total ABOVE the preloaded one. Clamp
     // rather than trust: this figure decides whether a graph is refused.

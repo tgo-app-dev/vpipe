@@ -1639,6 +1639,19 @@ protected, which is strictly better than none — and giving the protection
 back on the way out only means competing for it again on the next block,
 against a pool that has just said no.
 
+**A language model's load is wired within the pool's room.** Asked with
+`wire_weights` (text-chat's), the manager wires what the load allocates as
+it allocates it (`WireOnAlloc`: weights read into fresh memory are
+compressed as they land otherwise) and charges it to the pool. The scope
+is opened with the pool's free ROOM -- its limit less what is in use -- and
+a buffer past it is left unwired, as a refused one is, and said in the
+load's line: `N MB left unwired -- the wired pool had M MB of room`. On
+the loading thread the pool counts what the load holds so far, so a model
+wiring the rest of itself mid-load (an expert cache's pass) does not take
+the room twice. Before, the load was charged whole whatever the pool said:
+a host's `wired_pool_mb` of 8 GB under a 16 GB helper was overdrawn with
+nothing said. `wired_pool_pct` 0 now wires nothing here either.
+
 ### The model's side of the pool
 
 `WiredPool` (`generative-models/shared/wired-pool.h`) is the per-model
@@ -2017,6 +2030,26 @@ buffers during a doubling) is the phased part. A generator also books
 the decode it feeds when only it knows the length — the VAE's arena and
 the samples it produces — as a video generator does for its soundtrack.
 
+**The host's language-model stages book a model's whole run this way.**
+`text-chat`, `visual-qa` and `realtime-vqa` claim, beside the weights and
+the vision tower, what the model allocates to RUN — its K/V at the
+capacity the stage's pool reaches, each context's recurrent state and
+sliding rings, a prefill's activations at the largest forward it takes
+(a piece of a long prompt, or the whole prompt where the family prefills
+in one pass), and the decode scratch — as one unphased arena per
+checkpoint, since the stages that name one directory share its loaded
+model. The stage says how it runs the model (its pool, how many contexts
+it keeps, whether they branch from one shared prefix and how many tokens
+each branch adds) and the family's own figure turns that into bytes.
+Measured against the device's peak allocation over a prompt that fills
+one 8,192-row prefill piece and a few decode steps, on an M4 Pro: a
+4-billion-parameter hybrid 1.06x, a 35-billion-parameter mixture of
+experts 1.06x (1.04x on an M5 with its experts cached), a 14-billion
+dense decoder 1.10x, a Gemma-4 e4b 1.24x (its persistent scratch is
+built by the load's warm-up, so the measurement starts after it). A
+mixture-of-experts model sizes its expert cache beside that same arena
+and does not count it a second time among its peers'.
+
 ---
 
 ## 11. The expert cache — a mixture of experts on a smaller box
@@ -2040,6 +2073,18 @@ purpose. A forward is a cyclic scan of its blocks, so recency predicts
 nothing there; a router is SKEWED — some experts are picked far more often
 than others, and which ones follows the content — so a cache kept by
 **selection frequency** gets far more than its share of hits.
+
+**A host may give it less than the box.** `memory_limit_mb` on text-chat
+(`load_spec::kMemoryLimitMb`) is the most the model may hold in all; the
+cache is what the limit leaves after the rest of the model and its run
+state, at least the floor below, so an agent's model on a 256 GB box can
+keep 64 GB and leave the rest to picture and video models. The stage's
+claim books the checkpoint at that size (the claim's `held_bytes`, which
+the weights planner takes over the size on disk, never under the floor),
+so the peers sizing against the plan see the room the limit leaves, and
+the cache, sized beside the plan, leaves out exactly what the plan counts
+for its own checkpoint. It sizes a load; a model kept warm is handed over
+at the size it loaded at.
 
 ### How it decides
 
@@ -2067,7 +2112,10 @@ than others, and which ones follows the content — so a cache kept by
   does not hold, behind this step's own misses and without waiting for
   them. The next step takes what has arrived, waits only for the reads it
   picks that are still under way, and drops those that have not started.
-  A read ahead never lands in a slot the current step uses.
+  A read ahead never lands in a slot the current step uses. A model may
+  read ahead for a step of a few rows as well -- a speculative verify,
+  each row's likeliest experts in turn (`Options::ahead_rows`, which
+  also counts those steps when widths are compared).
 - **How many to read ahead is measured.** It depends on the drive and the
   hit rate: where a decode's misses leave the drive idle, reading ahead
   hides most of each step's wait; where they keep it busy, every guess
@@ -2091,14 +2139,34 @@ than others, and which ones follows the content — so a cache kept by
 - **Reads.** Misses are read concurrently by a small thread pool, with
   `pread` on descriptors opened `F_NOCACHE` — the cache is the copy, and
   the file cache keeping a second one would compete with it for the same
-  memory. Page-aligned staging (an unaligned `F_NOCACHE` read silently
-  takes the cached path), and an expert whose tensors lie together in its
-  file is one read, not six.
+  memory. A reader keeps a descriptor a shard; a model can name the
+  tensors it serves so that only their shards open, and opening raises
+  the process's soft limit toward its hard one where the shards need it
+  (a process starts on macOS with room for 256 descriptors, and a
+  checkpoint can have nearly as many shards). Page-aligned staging (an
+  unaligned `F_NOCACHE` read silently takes the cached path), and an
+  expert whose tensors lie together in its file is one read, not six. An
+  expert whose pieces lie apart (an MLX pack's stacked tensors: six
+  ranges in six places) reads them at once, not in turn -- on an M5
+  Ultra's internal SSD 1.7 ms against 2.5 for one expert -- because what a
+  stalled step waits for is mostly a read already under way: its latency,
+  not the drive's bandwidth, is the cost.
 - **The sync.** The routes are on the GPU and the CPU has to see them: the
   model commits after the route kernel, waits, resolves, and reopens the
   stream in place (`CommandStream::sync_and_reopen`). That wait is also
   what makes overwriting a slot safe — the GPU has finished everything
-  before it.
+  before it. A commit and wait costs ~280 µs of an idle GPU, once a layer.
+  Where the GPU sees the CPU's stores while a command buffer runs (an M5
+  Ultra does; an M4 Pro and a base M5 do not, so it is probed at load), a
+  model can instead hand the picks over **inside** the running buffer: a
+  one-threadgroup kernel posts them to a mailbox and waits for the
+  resolved slots (~3 µs a layer). Every wait gives up when the CPU's
+  heartbeat stops (a process that is gone costs one wait, not the GPU),
+  both mailboxes are checksummed, and a forward the GPU gave up on is done
+  again the plain way. The CPU must never encode more than a few layers
+  ahead of the turns it has answered: a queue holds 64 command buffers in
+  flight, and a CPU blocked on the 65th while the GPU waits for its answer
+  is a deadlock that outlives the process.
 
 **Bit-identical to resident**: the arithmetic is the same, only the
 addressing changes. Every model wired to the cache is tested that way
@@ -2109,7 +2177,8 @@ addressing changes. Every model wired to the cache is tested that way
 There is no stage key for the cache's size. The loader applies the same
 rule `plan_streaming()` applies to a DiT, against TOTAL RAM so every stage
 answers the same way: when this model's full preload, its peers and its
-scratch fit with the irreversible cushion (`kStreamHeadroom`), every
+scratch (its run, as the stage's plan booked it — see "K/V grows during
+the run") fit with the irreversible cushion (`kStreamHeadroom`), every
 expert stays resident; otherwise the cache is the experts' bytes minus
 the shortfall, and never less than one layer's worth. The stages that
 hold such a model and the LM loader apply it inside the host; it is not
@@ -2130,7 +2199,12 @@ bit width across the experts). A dense bf16 MoE, k-quant GGUF, a
 mixed-width stack and the layer-streaming mode stay resident, and the
 load line says why. Every model built on that stack takes it: the MoE
 LLMs through the LM loader (`text-chat` and the other LLM stages) and
-Drama 3 through `text-to-speech`.
+Drama 3 through `text-to-speech`. DeepSeek-V4.1-Flash, a model of its
+own, takes the same cache for its FP4 experts (E2M1 codes with an E8M0
+scale per 32), read from the release's per-expert tensors or as ranges
+of an MLX pack's stacked ones; its cache is also held under 85% of the
+GPU's recommended working set, since past it the device pages the
+pools in and out of every command buffer.
 
 A pool is one buffer the kernels index by slot, so the slot count is
 capped where their offsets stop: the affine kernels take 32-bit expert

@@ -410,3 +410,39 @@ TEST(metal_compute_shared_buffer, wire_on_alloc_counts_its_own_live_buffers) {
   kept = SharedBuffer{};
   EXPECT_TRUE(scope.live_bytes() == 0);
 }
+
+// A scope's ROOM -- the wired pool's, for a language model's load: a buffer
+// that would take what the scope holds wired past it is left unwired and
+// counted as held back; one freed gives its room back; an inner scope's
+// smaller room is the one in force, the outer's again after it.
+TEST(metal_compute_shared_buffer, wire_on_alloc_wires_within_its_room) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  constexpr std::size_t kMB = std::size_t{1} << 20;
+  WireOnAlloc scope(12 * kMB);
+  SharedBuffer a = mc->make_shared_buffer(8 * kMB);
+  ASSERT_TRUE(!a.empty());
+  if (!a.is_wired()) { return; }   // mlock refused here: nothing to count
+  SharedBuffer over = mc->make_shared_buffer(8 * kMB);
+  EXPECT_TRUE(!over.empty());
+  EXPECT_TRUE(!over.is_wired());
+  SharedBuffer fits = mc->make_shared_buffer(4 * kMB);
+  EXPECT_TRUE(fits.is_wired());
+  EXPECT_TRUE(scope.live_bytes() == 12 * kMB);
+  EXPECT_TRUE(WireOnAlloc::live_now() == 12 * kMB);
+  EXPECT_TRUE(scope.held_back_bytes() == 8 * kMB);
+  a = SharedBuffer{};
+  SharedBuffer again = mc->make_shared_buffer(8 * kMB);
+  EXPECT_TRUE(again.is_wired());
+  {
+    WireOnAlloc inner(0);
+    SharedBuffer none = mc->make_shared_buffer(kMB);
+    EXPECT_TRUE(!none.is_wired());
+    EXPECT_TRUE(inner.held_back_bytes() == kMB);
+  }
+  fits = SharedBuffer{};
+  SharedBuffer after = mc->make_shared_buffer(4 * kMB);
+  EXPECT_TRUE(after.is_wired());
+  EXPECT_TRUE(scope.held_back_bytes() == 9 * kMB);
+}

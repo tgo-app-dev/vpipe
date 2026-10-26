@@ -83,6 +83,12 @@ add_vpipe_metal_kernel(llm_elementwise_bf16 SRC ops/llm_elementwise.metal
 add_vpipe_metal_kernel(qwen4_hc SRC ops/qwen4_hc.metal)
 add_vpipe_metal_kernel(qwen4_hc_bf16 SRC ops/qwen4_hc.metal
                        DEFINES VPIPE_ELT=bfloat)
+# DeepSeek-V4.1-Flash: hyper-connections with Sinkhorn, the compressed
+# sparse attention and its indexer, the FP4 experts, engram
+# (generative-models/deepseek-v41/).
+add_vpipe_metal_kernel(deepseek_v41 SRC ops/deepseek_v41.metal)
+add_vpipe_metal_kernel(deepseek_v41_bf16 SRC ops/deepseek_v41.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_vae_1d SRC ops/audio_vae_1d.metal)
 add_vpipe_metal_kernel(rope SRC ops/rope.metal)
 add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
@@ -269,6 +275,15 @@ add_vpipe_metal_kernel(affine_qmm_grouped_nax
                        DEPENDS ${GROUPED_NAX_HDRS})
 add_vpipe_metal_kernel(affine_qmm_grouped_nax_bf16
                        SRC quant/affine_qmm_grouped_nax.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
+# DeepSeek-V4.1's routed experts (affine 2-8 bits, MXFP4) as grouped GEMMs
+# on the matrix cores: the twins of deepseek_v41's _grouped kernels.
+add_vpipe_metal_kernel(deepseek_v41_nax SRC ops/deepseek_v41_nax.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
+add_vpipe_metal_kernel(deepseek_v41_nax_bf16 SRC ops/deepseek_v41_nax.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS}
                        DEPENDS ${GROUPED_NAX_HDRS})

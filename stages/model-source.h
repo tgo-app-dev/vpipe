@@ -1,116 +1,70 @@
 #ifndef STAGES_MODEL_SOURCE_H
 #define STAGES_MODEL_SOURCE_H
 
-#include "stages/model-catalog.h"
+#include "common/flex-data.h"
 
 #include <cstddef>
 #include <string>
 #include <vector>
 
-namespace vpipe {
+#include "common/vpipe-api.h"
 
-class FlexData;
-
-// Where a model's files are FETCHED from.
+// Where a model's files are FETCHED from: the part of it a plugin and a
+// host see. Installed with the SDK since feature "model-sources/1".
 //
 // The catalogue is written in HuggingFace terms -- `hf_path` is both the
 // download coordinate and the registry key -- because that is where these
 // models are published. It is not always where they can be REACHED:
 // huggingface.co is not routable from mainland China, and much of the
-// catalogue is mirrored on modelscope.cn instead. A source is the small
-// amount that actually differs between the two: how a repo's file list is
-// asked for, how that answer is parsed, and how one file's bytes are
-// addressed.
+// catalogue is mirrored on modelscope.cn instead. `model-fetch` reads from
+// either (its `source`, or $VPIPE_MODEL_SOURCE).
 //
 // WHAT A SOURCE DOES NOT CHANGE IS IDENTITY. A model fetched from a
 // mirror registers under the SAME key and lands in the SAME directory as
 // one fetched from HuggingFace, so nothing downstream -- model-select, a
 // stage's `model_path`, a registry record, a `.vpipeline` recipe -- can
 // tell which was used, and a user who switches sources does not acquire a
-// second copy of a model they already have. The registry record notes
-// which source the bytes came from; that is provenance, not identity.
+// second copy of a model they already have.
 //
-// The interface is small on purpose. Everything hard about a large
-// download -- the stall window, resume, the integrity check, the progress
-// report -- is source-independent and stays in resumable-fetch.h.
-class ModelSource
-{
-public:
-  virtual ~ModelSource() = default;
-
-  // Registry name; what `model-fetch`'s `source` attribute takes.
-  virtual const char* name() const = 0;
-  // How the source is spelled in a message to a human.
-  virtual const char* label() const = 0;
-
-  // The branch a repo is read from when the caller names none.
-  //
-  // HuggingFace says "main"; ModelScope says "master". Getting this wrong
-  // is not a clean failure on ModelScope: an unknown revision comes back
-  // HTTP 200 with `Code: 200` and an EMPTY file list, so "main" there
-  // reads as a repo that exists and holds nothing. MEASURED against
-  // Lightricks/LTX-2.5: Revision=master -> 24 entries, Revision=main and
-  // Revision=bogus-xyz -> 0 apiece.
-  virtual const char* default_revision() const = 0;
-
-  // Env vars consulted in order for a bearer token, most specific first.
-  virtual std::vector<std::string> token_env() const = 0;
-
-  // Where a human reads about the repo; the registry record's source_url.
-  virtual std::string web_url(const std::string& repo) const = 0;
-
-  // The file-listing request for `repo` at `rev`, and the parse of what
-  // comes back. Split so the transport (and its token, timeout and TLS
-  // policy) stays with the caller.
-  virtual std::string tree_url(const std::string& repo,
-                               const std::string& rev) const = 0;
-  virtual std::vector<HfFile> parse_tree(const FlexData& body) const = 0;
-
-  // One file's bytes.
-  virtual std::string file_url(const std::string& repo,
-                               const std::string& rev,
-                               const std::string& path) const = 0;
-
-  // Whether a file can be rebuilt from a content-addressed store
-  // (HuggingFace Xet). A mirror that has none streams every file, which
-  // is what the empty `XetSource` in a FetchRequest already means -- this
-  // is here so the caller does not have to know which sources those are.
-  virtual bool supports_xet() const { return false; }
-
-  // What an empty file list most likely means, in this source's terms.
-  // Worth a per-source sentence: on HuggingFace an empty listing is a
-  // private or misspelled repo, on ModelScope it is far more often a
-  // revision that does not exist (see default_revision above).
-  virtual std::string empty_tree_hint(const std::string& repo,
-                                      const std::string& rev) const = 0;
-};
-
-// Look a source up by name ("huggingface", "modelscope"); nullptr when
-// the name is not one.
-const ModelSource* model_source(const std::string& name);
-
-// The source a fetch uses when its config names none: $VPIPE_MODEL_SOURCE
-// when that names a known source, else HuggingFace. This is the knob a
-// user behind the Great Firewall sets ONCE, rather than per stage.
+// What is here: the sources' names and labels (a host offering its user a
+// choice), whether a source carries a repo and under what name, and the
+// rows a plugin adds for its own families' repos. How a source is asked
+// for a listing and a file -- the ModelSource interface -- is the host's
+// own (stages/model-source-host.h, not installed), so it can grow without
+// touching the plugin ABI.
 //
-// An unknown $VPIPE_MODEL_SOURCE falls back to HuggingFace; the fetch
-// stage warns about it, because silently ignoring the one setting that
-// makes downloads work at all is the wrong failure.
-const ModelSource& default_model_source();
+// OPTIONAL TO A PLUGIN. Outside libvpipe these functions are WEAK
+// imports: on a host built before them (no model-sources/1) they resolve
+// to null and model_sources_available() says false, so a plugin that adds
+// mirror rows when it can still loads there. One that cannot run without
+// them lists model-sources/1 in VpipePluginInfo::required_features, and
+// such a host refuses it by name -- which only works BECAUSE the imports
+// are weak: a strong one is a missing symbol, and dyld refuses the plugin
+// at dlopen, before its required_features are ever read.
 
-// Every registered source name, in registration order.
-std::vector<std::string> model_source_names();
+#if defined(VPIPE_BUILDING_LIBRARY)
+#define VPIPE_MODEL_SOURCES_IMPORT
+#else
+#define VPIPE_MODEL_SOURCES_IMPORT __attribute__((weak_import))
+#endif
 
-// Extract the downloadable files from a ModelScope
-// "/api/v1/models/<repo>/repo/files" answer -- the counterpart to
-// hf_tree_files, and the parse behind ModelScope's parse_tree(). Pure;
-// exposed so it can be tested against a captured page without a network.
-// Directories (Type "tree") and malformed entries are skipped.
-std::vector<HfFile> modelscope_tree_files(const FlexData& body);
+VPIPE_API_BEGIN
+
+namespace vpipe {
+
+// Every source name ("huggingface", "modelscope"), in registration order:
+// what `model-fetch`'s `source` attribute takes.
+VPIPE_MODEL_SOURCES_IMPORT std::vector<std::string> model_source_names();
+
+// How source `name` is spelled to a human ("ModelScope"); "" when the
+// name is not one.
+VPIPE_MODEL_SOURCES_IMPORT std::string
+model_source_label(const std::string& name);
 
 // ---- mirror paths ------------------------------------------------------
 
-// Whether a source carries a repo, and under what name.
+// Whether a source carries a repo, and under what name. A later host may
+// add a value; a caller treats one it does not know as Same.
 enum class MirrorStatus {
   Same,      // mirrored under the same owner/repo as HuggingFace
   Renamed,   // mirrored, but under a different path (see `out`)
@@ -123,7 +77,7 @@ enum class MirrorStatus {
 // The default is Same, and that is deliberate: ModelScope mirrors most of
 // this catalogue under the identical owner/repo, so requiring every entry
 // to declare a mapping would be a table that says "unchanged" a hundred
-// times and goes stale the moment a model is added. What the table below
+// times and goes stale the moment a model is added. What the table
 // records is only the DIFFERENCES -- the renames, and the repos a source
 // is known to lack -- so a repo that is simply not mirrored fails at the
 // listing step with that source's own 404, which is an honest answer.
@@ -131,42 +85,50 @@ enum class MirrorStatus {
 // Absent exists so the failure can be better than a 404 where we already
 // know the answer: three of the Krea-2 LoRAs are individual-author
 // uploads that have no ModelScope counterpart, and telling a user that
-// outright beats letting them read an HTTP code.
-MirrorStatus mirror_repo(const std::string& source_name,
-                         const std::string& hf_path, std::string& out);
+// outright beats letting them read an HTTP code. A host offering a choice
+// of source greys the choice for such a repo.
+VPIPE_MODEL_SOURCES_IMPORT MirrorStatus
+mirror_repo(const std::string& source_name, const std::string& hf_path,
+            std::string& out);
 
 // One mirror-table row. `path` empty marks the repo ABSENT on `source`.
 struct MirrorEntry {
   std::string source;    // "modelscope"
   std::string hf_path;   // "MiniMaxAI/MiniMax-H3"
   std::string path;      // "MiniMax/MiniMax-H3"; "" -> absent there
+  // A later field is a key here (lower_snake, a named constant; absent =
+  // today's behaviour), so the row's layout never changes. None yet.
+  FlexData extra;
 };
 
 // Contribute mirror rows from a PLUGIN, for a family whose catalogue
 // entries do not live in this tree.
 //
-// FIRST-WINS per (source, hf_path), and same lifetime rule as
-// register_catalog_entries: each call publishes a new snapshot and the
-// previous ones are retained, so a pointer or reference handed out
-// earlier never dangles. Returns how many rows were taken.
-std::size_t register_mirror_repos(std::vector<MirrorEntry> entries);
+// FIRST-WINS per (source, hf_path), built-ins included, and the same
+// lifetime rule as register_catalog_entries: each call publishes a new
+// snapshot and the previous ones are retained, so a pointer or reference
+// handed out earlier never dangles. Rows registered while a plugin LOADS
+// -- a static initialiser or vpipe_plugin_register alike -- are held back
+// until the host admits the plugin and dropped if it refuses it, as its
+// stage types are, so a refused plugin cannot claim a repo ahead of one
+// that loads. Returns how many rows were taken (held, during a load).
+VPIPE_MODEL_SOURCES_IMPORT std::size_t
+register_mirror_repos(std::vector<MirrorEntry> entries);
 
-// ---- user-typed references --------------------------------------------
-
-// Normalise a user-typed model reference to a bare "owner/repo", for
-// EITHER source's URL spelling:
-//   "https://huggingface.co/owner/repo"          -> "owner/repo"
-//   "https://modelscope.cn/models/owner/repo"    -> "owner/repo"
-//   "modelscope.cn/models/owner/repo/files"      -> "owner/repo"
-//   "owner/repo"                                 -> "owner/repo"
-// Returns "" when the input carries no owner/repo pair.
-//
-// ModelScope's web URL puts a "models/" segment ahead of the pair where
-// HuggingFace has none, so the two cannot share one blind "first two
-// segments" rule -- pasting a ModelScope URL into the HuggingFace-shaped
-// parser yields "models/<owner>", a repo that does not exist.
-std::string normalize_model_ref(const std::string& input);
-
+// Whether this host has the functions above: always inside libvpipe; in a
+// plugin, whether the weak imports resolved. Ask before calling them.
+inline bool
+model_sources_available() noexcept
+{
+#if defined(VPIPE_BUILDING_LIBRARY)
+  return true;
+#else
+  return &register_mirror_repos != nullptr;
+#endif
 }
+
+}  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

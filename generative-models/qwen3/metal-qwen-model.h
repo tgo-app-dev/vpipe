@@ -574,10 +574,11 @@ public:
   // models the manager holds or has declared beside this one with the
   // activation scratch the plan holds, the irreversible headroom, and
   // `scratch` (this model's K/V and activations). 0 for a dense model, or
-  // a MoE that fits.
+  // a MoE that fits. `limit` (bytes, 0 none): the most the model may hold
+  // in all, `scratch` in it (load_spec::kMemoryLimitMb).
   static std::size_t lm_expert_cache_bytes(
       const SessionContextIntf* session, const std::string& dir,
-      const Config& c, std::size_t scratch);
+      const Config& c, std::size_t scratch, std::size_t limit = 0);
   // How many leading layers a prefill-streamed load of `c` over `wts`
   // pins (0 unless it streams with a pin_frac, and 0 where streams_raw()
   // -- residency replaces the prefix there) -- the rule load() takes,
@@ -660,11 +661,35 @@ public:
                                           std::size_t* conditional = nullptr);
   // A hyper-connection model's (Qwen3.8-Flash-Next's) run beyond its
   // weights, for a plan made before it loads: one forward's activations
-  // at a prefill piece's rows, the K/V of `ctx_tokens` (its full layers,
-  // the QSA key layers, the MTP head's), and a context's recurrent state
-  // in the three ring slots a speculative decode keeps. 0 for any other
-  // model.
+  // at a prefill piece's rows (hc_piece_rows, or the prompt's when
+  // shorter), the K/V of `ctx_tokens` (its full layers, the QSA key
+  // layers, the MTP head's), and a context's recurrent state in the three
+  // ring slots a speculative decode keeps. 0 for any other model.
   static std::size_t hc_run_bytes(const Config& c, std::int64_t ctx_tokens);
+  // The most rows a hyper-connection prefill runs a piece: each piece
+  // reads every routed expert it picks that the cache lacks, so fewer,
+  // wider pieces read less -- 8192 where a forward's activations at that
+  // many rows fit a twelfth of the box (its believed RAM), else 4096,
+  // else 2048.
+  static int hc_piece_rows(const Config& c);
+  // One forward's activations at `n` rows (the part of hc_run_bytes that
+  // grows with them).
+  static std::size_t hc_forward_bytes(const Config& c, std::size_t n);
+  // Any model's working memory beside its weights, for the LM stages'
+  // plan (lm_run_bytes): a prompt of up to max_seq rows of `kv_tokens`, its
+  // embeddings (the muxer's and the copy) and a prefill piece through
+  // forward_chunk_ (its buffers, element by element; the whole prompt in
+  // one with `one_pass` -- an MTP seed, a DFlash drafter's taps; the
+  // matrix-core MLP's gate|up with `matrix_cores`; `plain_mlp`: a dense,
+  // mixed or k-quant checkpoint's second MLP buffer), the dequantized-
+  // weight scratch, the paged K/V of `kv_tokens` at the capacity the
+  // pool's doubling reaches (one layer's old pool beside the new while it
+  // copies), `contexts` contexts' recurrent state and the decode scratch.
+  // A hyper-connection model's is hc_run_bytes, its other contexts' state
+  // beside it.
+  static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens,
+                               int contexts, bool one_pass, bool plain_mlp,
+                               bool matrix_cores);
   std::size_t verify_scratch_held() const;
 
   // Sizes of a raw-source backbone, from the checkpoint alone -- for a
@@ -875,6 +900,8 @@ public:
 
   const Config& config() const { return _cfg; }
 
+  // The QSA selects a few rows ran in two phases (tests).
+  long qsa_two_phase_selects() const { return _qsa_two; }
   // ---- MTP speculative decode (Multi-Token Prediction) ----------------
   // Whether a bundled MTP head (mtp.safetensors: one full-attn decoder layer
   // + the eh-fusion `fc` and pre-norms) was loaded AND this model's layout
@@ -1220,6 +1247,9 @@ private:
                                      const metal_compute::SharedBuffer& x,
                                      int n);
   static int prefill_piece_();
+  // A hyper-connection prefill of n rows: its pieces' rows (balanced, at
+  // most hc_piece_rows).
+  int hc_piece_(int n) const;
   // Whether the prefill-attention set serves an n-row chunk: every 256-
   // wide one; a 128-wide one from 1536 rows on 64-aligned pages, tuned by
   // tune_prefill_set_ at the first such chunk rather than at load.
@@ -1733,6 +1763,7 @@ private:
       _fn_qsa_attn_mma,     // a prefill's rows: a kv head's q-heads as tiles
       _fn_qsa_score_mma,    // a prefill's rows' block scores as tiles
       _fn_qsa_score_simd,   // a few rows': a simdgroup a (block, row)
+      _fn_qsa_topk_chunk, _fn_qsa_topk_merge,   // ...their two-phase select
       _fn_qsa_attn_nax,     // ... on the matrix units (M5, sdpa_mma.metal)
       // Dense f16 MoE gather GEMVs (raw-HF bf16 MoE): the dense twins of the
       // affine gather_swiglu / gather_down / moe_gate above.
@@ -2463,13 +2494,15 @@ private:
   std::unique_ptr<MoeExpertCache> _xc;
   std::unique_ptr<SafetensorsRanges> _xranges;
   std::unique_ptr<WiredPool> _xwire;
-  // READING AHEAD (a decode step): the next layer's router logits over
-  // this layer's input, and the experts they rank highest -- the first
-  // _x_ahead of which the cache reads behind this step (0: off).
+  // READING AHEAD (a decode step, a verify's few rows): the next layer's
+  // router logits over this layer's input, a row each, and the experts
+  // they rank highest -- up to _x_ahead a row, which the cache reads
+  // behind this step (0: off).
   metal_compute::SharedBuffer _x_pred_logits;
-  std::vector<std::int32_t> _x_rank;
+  std::vector<std::int32_t> _x_rank, _x_ord;
   int _x_ahead = 0;
   bool _xc_failed = false;
+  static int x_ahead_rows_();
   bool setup_expert_cache_(std::string* err);
   void wire_for_experts_();
   // ...or whose routed experts are GPTQ int4 per expert (qweight + scales,
@@ -2607,7 +2640,11 @@ private:
     std::vector<std::int64_t> mult;              // per n-gram position
     std::vector<std::int64_t> sizes, offsets;    // per hashed head
     std::unique_ptr<SafetensorsRanges> rows;     // the table, cached reads
+    std::unique_ptr<SafetensorsRanges> rows_nc;  // ...and uncached
     std::string shard;                 // "<..>.shards." -- then i + ".weight"
+    // each table shard's tensors' names (codes, scales, biases)
+    std::vector<std::string> wname, sname, bname;
+    std::size_t lookups = 0, distinct = 0;     // the last call's
     std::int64_t shard_rows = 0;       // rows per table shard
     int head_dim = 0;                  // values a row (ple_dim / heads)
     int bits = 0, group = 0;           // the table's affine layout (bits
@@ -2643,8 +2680,28 @@ private:
     bool ring = false;                   // bind ring slots 0 -> 1
   };
   // What a forward runs beside the plain pass over the model's stack.
+  // A prefill piece's n-gram rows, read AHEAD under the piece before it
+  // (forward_hc_'s HcRun::ple_ahead): the ids they are for, the two tokens
+  // before them, and the read's state. Waits for its read when destroyed.
+  struct HcPleAhead {
+    std::vector<std::int32_t> ids;
+    std::int64_t h0 = 0, h1 = 0;
+    metal_compute::SharedBuffer rows;
+    std::string err;
+    bool ok = false;
+    void* group = nullptr;            // the read's dispatch group
+    void wait();
+    ~HcPleAhead() { wait(); }
+  };
+  static bool hc_ple_ahead_();
   struct HcRun {
     HcVerify* verify = nullptr;
+    // A prefill's n-gram rows read ahead: in, the rows of this forward's
+    // ids where `ple_ahead` holds them (else read here, as ever); out, the
+    // rows of `ple_next` (the next piece's ids) read into it once this
+    // forward's own are in.
+    HcPleAhead* ple_ahead = nullptr;
+    std::span<const std::int32_t> ple_next;
     // The residual streams before the final mixer, copied out [n, hc*H]
     // (what the MTP head reads).
     metal_compute::SharedBuffer* resid = nullptr;
@@ -2738,6 +2795,28 @@ private:
   bool mtp_decode_hc_(ContextId cid, std::int32_t first_token, int n_steps,
                       std::vector<std::int32_t>& out_ids, long* accepted_out,
                       long* rounds_out, const MtpDecodeCtl& ctl);
+  // HOW MANY DRAFTS A ROUND mtp_decode_hc_ verifies, measured on the run
+  // and kept across decodes: a verify's ms by its rows (a plain step's,
+  // and the others as their RATIO to it -- the two move together as the
+  // expert cache warms), a head pass's, and each draft position's kept
+  // share (halved every kHalve rounds).
+  struct HcDraftChoice {
+    static constexpr int kMax = 3;          // drafts a round, at most
+    static constexpr int kRows = 9;         // verify rows measured (copy's)
+    static constexpr int kExplore = 8;      // one round in this many tries
+    static constexpr int kHalve = 512;
+    double v[kRows + 1] = {};               // [1] ms; [r] ratio to [1]
+    int nv[kRows + 1] = {};
+    double d = 0.0;                         // a head pass's ms
+    int nd = 0;
+    double reached[kMax] = {}, kept[kMax] = {};
+    std::uint64_t rounds = 0;
+    // A verify of `rows` rows in ms (interpolated where unmeasured).
+    double verify_ms(int rows) const;
+    // The drafts of most tokens a ms, 0 to k_max.
+    int best(int k_max) const;
+  };
+  HcDraftChoice _hc_dc;
   // dflash_decode for a hyper-connection model: a round drafts on the GPU,
   // reads the drafts back (forward_hc_ takes host ids -- the PLE reads its
   // n-gram rows by them), verifies with forward_hc_ tapping the drafter's
@@ -2819,7 +2898,8 @@ private:
   metal_compute::SharedBuffer _hc_axis;
   bool _hc_qsa_warned = false;
   bool _hc_embed_warned = false;
-  double _hc_prof[3] = {0, 0, 0};       // VPIPE_QWEN_HC_PROFILE
+  double _hc_prof[4] = {0, 0, 0, 0};    // VPIPE_QWEN_HC_PROFILE
+  long _qsa_two = 0;                    // two-phase QSA selects run
   long _hc_prof_n = 0;
   // The PLE rows [n, ple_dim] (compute dtype) of `ids`, continuing the
   // context's hashed history (and advancing it).
@@ -2827,6 +2907,18 @@ private:
                   const metal_compute::SharedBuffer* state_out,
                   std::span<const std::int32_t> ids,
                   metal_compute::SharedBuffer& out, std::string* err);
+  // Its parts: the context's last two tokens (EOS for none), the rows of
+  // `ids` after them (no state touched -- what a read ahead runs), and
+  // the last two tokens after `ids` noted in the state.
+  bool ple_prev_(const metal_compute::SharedBuffer* state_in,
+                 const metal_compute::SharedBuffer* state_out,
+                 std::int64_t* h0, std::int64_t* h1, std::string* err) const;
+  bool ple_rows_(std::int64_t h0, std::int64_t h1,
+                 std::span<const std::int32_t> ids,
+                 metal_compute::SharedBuffer& out, std::string* err);
+  void ple_note_(const metal_compute::SharedBuffer* state_out,
+                 std::int64_t h0, std::int64_t h1,
+                 std::span<const std::int32_t> ids) const;
 
   // The checkpoint, held for this model's whole life. The weights are
   // owned copies rather than views, so this is the reference count that

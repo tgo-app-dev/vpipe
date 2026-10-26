@@ -13,6 +13,7 @@
 // generation runs on the metal-compute backend when MLX is off.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/chat-template.h"
+#include "generative-models/lm-run-memory.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/sampler.h"
 #endif
@@ -282,6 +283,12 @@ private:
   // drafter will run (0 when none will).
   static std::string spec_scratch_label_(const std::string& dir);
   std::size_t spec_scratch_bytes_(const std::string& dir) const;
+  // Whether `mtp` asks for a draft head the model carries but loads only
+  // when asked (DeepSeek-V4.1's DSpark).
+  // How this stage runs its LM, for the plan's figure of what it runs in
+  // (genai::lm_run_bytes).
+  genai::LmRunShape run_shape_(const std::string& dir) const;
+  bool own_draft_head_(const std::string& dir) const;
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _hf_dir;
@@ -297,6 +304,8 @@ private:
   double      _keep_loaded{};
   // Its buffers wired as they are allocated (config "wire_weights").
   bool        _wire_weights{};
+  // The most the model may hold, MB (load_spec::kMemoryLimitMb); 0 none.
+  std::int64_t _memory_limit_mb{};
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};
@@ -374,6 +383,7 @@ private:
   genai::MetalQwenVisionEncoder*   _mvis     = nullptr;
   genai::MetalGemma4VisionEncoder* _mgvis    = nullptr;
   genai::MetalPixtralVisionEncoder* _mpix    = nullptr;
+  genai::MetalDeepseekV41Vision*    _mds     = nullptr;
   genai::Gemma4UnifiedEmbedder*    _mguni    = nullptr;
   genai::MetalAudioEncoder*        _m_audio  = nullptr;
   genai::MetalGemma4AudioEncoder*  _mg_audio = nullptr;

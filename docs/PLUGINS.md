@@ -1406,17 +1406,39 @@ all:
 ```cpp
 #include "stages/model-source.h"
 
-vpipe::register_mirror_repos({
-    {.source = "modelscope", .hf_path = "acme/video-7b",
-     .path = "AcmeCN/video-7b"},        // mirrored under another name
-    {.source = "modelscope", .hf_path = "acme/lora-pack",
-     .path = ""},                       // not mirrored: refuse by name
-});
+// in vpipe_plugin_register (or anywhere the plugin runs while it loads)
+if (vpipe::model_sources_available()) {
+  vpipe::register_mirror_repos({
+      {.source = "modelscope", .hf_path = "acme/video-7b",
+       .path = "AcmeCN/video-7b"},      // mirrored under another name
+      {.source = "modelscope", .hf_path = "acme/lora-pack",
+       .path = ""},                     // not mirrored: refuse by name
+  });
+}
 ```
 
 First-wins, built-ins included, so a plugin cannot redirect a repo the tree
 already places. A row whose `path` is empty makes the fetch say the repo has no
-counterpart on that source, instead of relaying a bare 404.
+counterpart on that source, instead of relaying a bare 404. Rows added while
+the plugin loads are held back until the host admits it, as its stage types
+are, and dropped if it is refused -- a refused plugin claims no repo. A
+`MirrorEntry`'s later fields arrive as keys in its trailing `extra`, so the
+row's layout does not change.
+
+**It is optional, so check before calling.** The header is installed with the
+SDK since feature `"model-sources/1"`, and a plugin imports its functions
+WEAKLY: built against this SDK, it still loads on an older host, where
+`model_sources_available()` is false and the functions are null. A plugin that
+cannot work without its rows lists `"model-sources/1"` in `required_features`
+instead, and such a host refuses it by name. (The weak import is what makes
+that refusal possible at all: a missing STRONG import fails the plugin's
+`dlopen`, before its `required_features` are read.)
+
+A HOST offering its user a choice of source reads the same table before it
+fetches: `model_source_names()` and `model_source_label(name)` for the
+choice, `mirror_repo(source, hf_path, out)` for whether that source carries a
+repo -- `Absent` greys the choice instead of a fetch failing on it. How each
+source is asked for a listing is the host's own and not part of the SDK.
 
 ## Extension point 6 — CoreML
 
@@ -1709,7 +1731,11 @@ and `"kernel-tuning/1"` (the session's `KernelTuningCache`, found by
 service id: the answers kernel tuners measured, kept for the session so a
 model loaded again measures nothing -- the toolkit's tuners ask for it
 through `generative-models/shared/tuned-answers.h`, and a host without it
-answers null, so never list it as required).
+answers null, so never list it as required) and `"model-sources/1"`
+(`stages/model-source.h` installed, its functions weak imports outside the
+host: the sources' names and labels, the mirror table, `register_mirror_repos`
+for a family's rows; check `model_sources_available()`, or list it as
+required).
 
 ## Where your stages show up
 

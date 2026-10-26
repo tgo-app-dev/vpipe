@@ -145,11 +145,12 @@ to_bf16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   if (info == nullptr || info->shape.empty()) { return {}; }
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
-  // FP8, plain or scaled (or U8 codes a comfy_quant record calls FP8):
-  // decoded whole, scale applied, to the bits a dense conversion of the
-  // file holds. A U8 tensor no record claims fails here, as it should.
+  // FP8, plain or scaled (or U8 codes a comfy_quant record calls FP8), or
+  // ComfyUI's int8 (I8, its rotation undone): decoded whole, scale
+  // applied, to the bits a dense conversion of the file holds. A U8 or I8
+  // tensor no record claims fails here, as it should.
   if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
-      info->dtype == "U8") {
+      info->dtype == "U8" || info->dtype == "I8") {
     SharedBuffer out = mc->make_shared_buffer(n * 2);
     if (out.empty() ||
         !fp8::decode_tensor_bf16(
@@ -214,7 +215,7 @@ to_host_f32_(WeightSet& ws, MetalCompute* mc, const std::string& nm,
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
   if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
-      info->dtype == "U8") {
+      info->dtype == "U8" || info->dtype == "I8") {
     out.resize(n);
     return fp8::decode_tensor_f32(ws.src(), nm, out.data(), n, nullptr);
   }
@@ -566,21 +567,26 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
              (lower_(p.extension().string()) == ".safetensors" ||
               lower_(p.extension().string()) == ".ckpt")) {
     // ---- a single file with no config --------------------------------
-    // lightx2v's FP8 turbo DiT (the diffusers layout), or a Draw Things
+    // lightx2v's FP8 turbo DiT (the diffusers layout), a Draw Things
     // checkpoint (`.ckpt`, presented under the release's own names with
-    // qkv_proj fused per head -- shared/drawthings-store.h): the H3
-    // architecture's dimensions are read off the tensors, and everything
-    // the tensors cannot say (patch, rope, eps) keeps the architecture's
-    // defaults.
+    // qkv_proj fused per head -- shared/drawthings-store.h), or a DiT
+    // ComfyUI saved (H3's names under its `model.diffusion_model.`, the
+    // qkv flat -- minimax-h3-diffusers-layout.h): the H3 architecture's
+    // dimensions are read off the tensors, and everything the tensors
+    // cannot say (patch, rope, eps) keeps the architecture's defaults.
     auto w = MetalLlamaWeights::open_model(p.string());
     if (!w.has_value()) { return fail("cannot open " + p.string()); }
     const bool split = w->has("blocks.0.attn.qkv_proj.q.weight");
+    const bool comfy_saved =
+        !split && minimax_h3::is_comfy_saved_dit_file(p.string());
     const bool fused =
-        !split && lower_(p.extension().string()) == ".ckpt" &&
+        !split &&
+        (lower_(p.extension().string()) == ".ckpt" || comfy_saved) &&
         w->has("blocks.0.attn.qkv_proj.weight");
     if (!split && !fused) {
-      return fail(p.string() + " is neither a Comfy-Org H3 component nor an "
-                               "H3 DiT in the diffusers naming");
+      return fail(p.string() + " is neither a Comfy-Org H3 component, an "
+                               "H3 DiT ComfyUI saved, nor one in the "
+                               "diffusers naming");
     }
     auto dim = [&](const std::string& n, int axis) -> long {
       const auto* ti = w->info(n);
@@ -614,9 +620,9 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
         dim("time_embedder.proj_in.weight", 1),
         dim("time_embedder.proj_in.weight", 0),
         dim("time_embedder.proj_out.weight", 0))());
-    // The diffusers layout's assembled qkv is FLAT; the Draw Things one is
-    // gathered per head, as released.
-    diffusers = split;
+    // The diffusers layout's assembled qkv is FLAT, and so is ComfyUI's
+    // own; the Draw Things one is gathered per head, as released.
+    diffusers = split || comfy_saved;
   } else {
     if (fs::is_directory(p)) { p = p / "config.json"; }
     std::ifstream f(p);
@@ -923,6 +929,7 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     if (l.codes.empty() || !sok) { return Linear{}; }
     l.f8         = fw->format;
     l.f8_per_row = fw->per_row;
+    l.f8_rot     = fw->rot_group;
     return l;
   }
   l.w = weight_(ws, nm + ".weight", r);
@@ -1310,8 +1317,10 @@ MetalMiniMaxH3Transformer::assemble_(
     }
     K = ti->shape[1];
     rows += p.rows;
+    // int8 pieces are assembled dense (to_bf16_ decodes each with its
+    // rotation): stacked codes would mix their scales and groups.
     const fp8::Weight* fw = _f8.find(p.layer + ".weight");
-    if (fw == nullptr ||
+    if (fw == nullptr || fw->format == fp8::Format::kI8 ||
         (f != fp8::Format::kNone && fw->format != f)) {
       all_f8 = false;
     } else {
@@ -1478,6 +1487,7 @@ MetalMiniMaxH3Transformer::fp8_dense_(ComputeEncoder& enc, const Linear& l,
   c.format  = l.f8;
   c.scale   = &l.f8_scale;
   c.per_row = l.f8_per_row;
+  c.rot_group = l.f8_rot;
   if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
     _fp8_failed = true;
     return nullptr;
@@ -1670,6 +1680,7 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     d.gu_inter   = s.gu_inter;
     d.f8         = s.f8;
     d.f8_per_row = s.f8_per_row;
+    d.f8_rot     = s.f8_rot;
     d.gc         = s.gc;
     d.n          = s.n;
     d.k          = s.k;
@@ -3055,12 +3066,13 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       }
     }
   }
-  // The checkpoint's LAYOUT and its FP8 weights, surveyed before anything
-  // loads: linear_ asks the survey what it is reading. An encoding this
-  // build cannot decode (block scales, NVFP4, int8 codes) and a diffusers-
-  // named file with a tensor the translation cannot place are refused
-  // HERE, by name -- either would otherwise surface as a missing tensor
-  // several lines on, which names the wrong cause.
+  // The checkpoint's LAYOUT and its FP8 / int8 weights, surveyed before
+  // anything loads: linear_ asks the survey what it is reading. An
+  // encoding this build cannot decode (block scales, NVFP4, int8 with no
+  // record) and a diffusers-named file with a tensor the translation
+  // cannot place are refused HERE, by name -- either would otherwise
+  // surface as a missing tensor several lines on, which names the wrong
+  // cause.
   {
     const SessionContextIntf* sess = mc->session();
     const MetalLlamaWeights& src = ws.src();
@@ -3073,8 +3085,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       }
       return nullptr;
     }
+    // ComfyUI's int8 too (a community checkpoint saved by ComfyUI): every
+    // widening here carries its rotation (Linear::f8_rot), and the ANE's
+    // staging, which cannot, leaves those projections to the GPU.
     std::string ferr;
-    if (!fp8::scan(src, &m->_f8, &ferr)) {
+    if (!fp8::scan(src, &m->_f8, &ferr, /*int8=*/true)) {
       if (sess != nullptr) {
         sess->warn(fmt("minimax-h3: '{}': {}", ws.dir(), ferr));
       }
@@ -3088,23 +3103,50 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         }
         return nullptr;
       }
-      std::size_t fp8_bytes = 0, n_scaled = 0;
+      std::size_t fp8_bytes = 0, n_scaled = 0, n_i8 = 0, n_rot = 0;
+      int rot = 0;
+      std::string first_i8;
       for (const auto& [n, fw] : m->_f8.weights) {
         if (const auto* ti = src.info(n); ti != nullptr) {
           fp8_bytes += (std::size_t)ti->nbytes;
         }
         if (!fw.scale.empty()) { ++n_scaled; }
+        if (fw.format == fp8::Format::kI8) {
+          ++n_i8;
+          if (first_i8.empty()) { first_i8 = n; }
+        }
+        if (fw.rot_group > 0) {
+          ++n_rot;
+          rot = std::max(rot, fw.rot_group);
+        }
+      }
+      // The int8 widening kernels are optional host kernels: a host
+      // older than them runs FP8 and refuses int8 here, by name.
+      if (n_i8 > 0 && !m->_fp8x.int8_valid()) {
+        if (sess != nullptr) {
+          sess->warn(fmt("minimax-h3: '{}' stores int8 weights ('{}' among "
+                         "{}) and this host has no int8 widening kernels",
+                         ws.dir(), first_i8, n_i8));
+        }
+        return nullptr;
       }
       if (sess != nullptr) {
         sess->info(fmt(
-            "MetalMiniMaxH3Transformer: FP8 checkpoint{} -- {} tensors "
-            "({} MB){} kept as FP8 codes and widened per GEMM",
+            "MetalMiniMaxH3Transformer: {} checkpoint{} -- {} tensors "
+            "({} MB){} kept as {} codes and widened per GEMM{}",
+            n_i8 == m->_f8.weights.size() ? "int8"
+            : n_i8 > 0                    ? "FP8 / int8"
+                                          : "FP8",
             src.has("blocks.0.attn.qkv_proj.q.weight")
                 ? std::string(" (diffusers layout, read under H3's names)")
                 : std::string(),
             m->_f8.weights.size(), fp8_bytes >> 20,
             n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
-                         : std::string()));
+                         : std::string(),
+            n_i8 > 0 ? "8-bit" : "FP8",
+            n_rot > 0 ? fmt(" ({} ConvRot-rotated, groups up to {}, "
+                            "un-rotated as they widen)", n_rot, rot)()
+                      : std::string()));
       }
     }
   }
@@ -5518,7 +5560,8 @@ MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
     bool all = true;
     for (const auto& p : parts) {
       const fp8::Weight* fw = _f8.find(p.layer + ".weight");
-      if (fw == nullptr || (f != fp8::Format::kNone && fw->format != f)) {
+      if (fw == nullptr || fw->format == fp8::Format::kI8 ||
+          (f != fp8::Format::kNone && fw->format != f)) {
         all = false;
       } else {
         f = fw->format;
@@ -5532,7 +5575,7 @@ MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
   if (const fp8::Weight* fw = _f8.find(nm + ".weight"); fw != nullptr) {
     return l.is_fp8() && l.f8 == fw->format &&
            l.f8_scale.empty() == fw->scale.empty() &&
-           l.f8_per_row == fw->per_row;
+           l.f8_per_row == fw->per_row && l.f8_rot == fw->rot_group;
   }
   if (l.is_fp8()) { return false; }
   const bool ckpt_quant = _quant_bits > 0 && si != nullptr &&
@@ -6315,8 +6358,12 @@ MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
   // bf16 or 4/8-bit affine with all three parts. An adapter is merged into
   // the staged rows, which needs its rows in fc1's own order -- true of the
   // [gate; up] halves, not of the interleaved pairs.
+  // ComfyUI's int8 is not a source the staging reads (AneFfnSource takes
+  // FP8 codes, and a ConvRot weight is no elementwise code at all).
   auto stageable = [](const Linear& l) {
-    if (l.empty() || !l.b.empty()) { return false; }
+    if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8) {
+      return false;
+    }
     if (!l.quantized) { return true; }
     return (l.bits == 4 || l.bits == 8) && !l.scales.empty() &&
            !l.qbias.empty();
@@ -6330,6 +6377,8 @@ MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
         "feed-forward", L,
         adapted && b.fc1.gu_inter
             ? "has an adapter on an interleaved fc1"
+        : b.fc1.f8 == fp8::Format::kI8 || b.fc2.f8 == fp8::Format::kI8
+            ? "stores its feed-forward as int8"
             : "has no bias-free fp16 or 4/8-bit affine feed-forward"));
   }
   return ok;
@@ -6415,7 +6464,10 @@ MetalMiniMaxH3Transformer::ane_qkv_eligible_(int L, const Block& b)
                       : _cfg.n_layers;
   if (L >= cap) { return false; }
   const Linear& l = b.qkv;
-  if (l.empty() || !l.b.empty()) { return false; }
+  // int8 keeps the GPU, as in ane_eligible_.
+  if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8) {
+    return false;
+  }
   if (!l.quantized) { return true; }
   return (l.bits == 4 || l.bits == 8) && !l.scales.empty() &&
          !l.qbias.empty();

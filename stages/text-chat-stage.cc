@@ -23,6 +23,9 @@
 #include "generative-models/gemma4/metal-gemma4-vision.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/deepseek-v41/deepseek-v41-config.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
@@ -328,13 +331,22 @@ encode_image_item_(genai::MetalQwenVisionEncoder*    mvis,
                    genai::MetalGemma4VisionEncoder*  mgvis,
                    genai::Gemma4UnifiedEmbedder*     mguni,
                    genai::MetalPixtralVisionEncoder* mpix,
+                   genai::MetalDeepseekV41Vision*    mds,
                    const uint8_t*                    rgb,
                    int                               H,
                    int                               W)
 {
   MediaItem m;
   m.kind = genai::MediaChunk::Kind::Image;
-  if (mpix) {
+  if (mds) {
+    // DeepSeek-V4.1: the image's whole span (start, cells and row breaks,
+    // end) as host rows; 1-D positions.
+    auto r            = mds->encode(rgb, H, W);
+    m.embeddings_host = std::move(r.rows);
+    m.n_tokens        = r.n_tokens;
+    m.mh              = r.grid_h;
+    m.mw              = r.grid_w;
+  } else if (mpix) {
     // Rows include the image's [IMG_BREAK] / [IMG_END] rows; the grid
     // is informational (1-D RoPE family).
     auto r       = mpix->encode(rgb, H, W);
@@ -442,6 +454,11 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   }
   _keep_loaded   = attr_real("keep_loaded");
   _wire_weights  = attr_bool("wire_weights");
+  _memory_limit_mb = attr_int("memory_limit_mb");
+  if (_memory_limit_mb < 0) {
+    fail_config(fmt("TextChatStage('{}'): memory_limit_mb must be 0 (none) "
+                    "or more (got {})", this->id(), _memory_limit_mb));
+  }
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -633,6 +650,16 @@ constexpr ConfigKey kAttrs[] = {
           "seconds bringing them back. The GPU wires them at first use "
           "anyway; charged to the wired pool",
    .def_bool = true},
+  {.key = "memory_limit_mb", .type = ConfigType::Int,
+   .doc = "the most the model may hold in all, MB -- its weights as held, "
+          "an expert cache, a conversation's state and working memory: a "
+          "Mixture of Experts whose routed experts can live in a cache "
+          "(DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next) sizes the cache within "
+          "it, the rest of the box left to other models; DeepSeek's DSpark "
+          "head loads only where every expert is resident within it. A "
+          "dense model loads whole regardless. A model kept warm is handed "
+          "over at the size it was loaded at. 0: the box's memory",
+   .def_int = 0},
   {.key = "keep_loaded", .type = ConfigType::Real,
    .doc = "seconds to keep the model loaded after this stage lets it go "
           "(its graph unloaded): a chat that runs a graph per request "
@@ -847,12 +874,64 @@ TextChatStage::spec_scratch_label_(const std::string& dir)
   return "spec-verify:" + dir;
 }
 
+genai::LmRunShape
+TextChatStage::run_shape_(const std::string& dir) const
+{
+  // the page pool, a conversation's context and the one parked with the
+  // warm model; an MTP head's seed or a DFlash drafter's taps prefill the
+  // prompt in one forward
+  genai::LmRunShape r;
+  r.page_tokens = _page_tokens;
+  r.max_pages = _max_pages;
+  r.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
+  r.contexts = 2;
+  r.one_pass = _mtp_enabled || !_draft_model.empty();
+  r.draft_head = own_draft_head_(dir);
+  return r;
+}
+
+bool
+TextChatStage::own_draft_head_(const std::string& dir) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // DeepSeek-V4.1's DSpark (mtp.*): ~8 GB, loaded with `mtp` where it
+  // pays -- every expert resident (the model's own rule).
+  if (!_mtp_enabled || !_mtp_model.empty() || !_draft_model.empty()) {
+    return false;
+  }
+  genai::DeepseekV41Config dc;
+  std::string err;
+  if (!genai::DeepseekV41Config::from_dir(dir, &dc, &err) || dc.n_mtp <= 0 ||
+      dc.dspark_block <= 1) {
+    return false;
+  }
+  // what it runs in with the head, the plan's figure (run_shape_)
+  genai::LmRunShape r;
+  r.page_tokens = _page_tokens;
+  r.max_pages = _max_pages;
+  r.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
+  r.contexts = 2;
+  r.draft_head = true;
+  const std::size_t run = genai::lm_run_bytes(session(), dir, r);
+  const auto* sv = session() != nullptr ? session()->services() : nullptr;
+  return genai::MetalDeepseekV41ModelExec::dspark_pays(
+      session(), dir, run, sv != nullptr ? sv->metal_compute() : nullptr,
+      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20);
+#else
+  (void)dir;
+  return false;
+#endif
+}
+
 std::size_t
 TextChatStage::spec_scratch_bytes_(const std::string& dir) const
 {
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The rounds' widest: a DFlash block, or MTP's anchor + two drafts.
   if (_draft_model.empty() && !_mtp_enabled) { return 0; }
+  // DeepSeek's verify rows fit the forward's own scratch, which its
+  // weight claim books (a block's draft scratch with the head)
+  if (own_draft_head_(dir)) { return 0; }
   int rows = 0;
   bool mtp = false;
   genai::ModelLoader loader(session());
@@ -887,10 +966,13 @@ TextChatStage::declare_resources() const
   if (!_draft_model.empty()) {
     dirs.push_back(resolve_model_dir(session(), _draft_model));
   }
-  // The LM (streamable when it is a Mixture of Experts) and its vision
-  // tower at the largest picture a turn may bring; the drafter whole.
-  std::vector<ResourceClaim> out =
-      model_memory::lm_claims(session(), dirs[0], id());
+  // The LM (streamable when it is a Mixture of Experts; under
+  // memory_limit_mb booked at what its cache sized within it leaves it
+  // holding), what it runs in and its vision tower at the largest picture
+  // a turn may bring; the drafter whole.
+  std::vector<ResourceClaim> out = model_memory::lm_claims(
+      session(), dirs[0], id(), run_shape_(dirs[0]), 0, 0,
+      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20);
   if (dirs.size() > 1) {
     for (auto& c : model_memory::weight_claims({dirs[1]})) {
       out.push_back(std::move(c));
@@ -952,6 +1034,10 @@ TextChatStage::initialize(RuntimeContext& ctx)
   if (!_mtp_model.empty()) {
     bag::set_text(spec.extra, genai::load_spec::kMtpDir,
                   resolve_model_dir(session(), _mtp_model));
+  } else if (own_draft_head_(spec.hf_dir)) {
+    // a draft head the model carries but loads only when asked for: the
+    // model's own directory named as its MTP drafter
+    bag::set_text(spec.extra, genai::load_spec::kMtpDir, spec.hf_dir);
   }
   if (!_draft_model.empty()) {
     bag::set_text(spec.extra, genai::load_spec::kDraftDir,
@@ -960,6 +1046,10 @@ TextChatStage::initialize(RuntimeContext& ctx)
   }
   if (_wire_weights) {
     bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  }
+  if (_memory_limit_mb > 0) {
+    bag::set_integer(spec.extra, genai::load_spec::kMemoryLimitMb,
+                     _memory_limit_mb);
   }
   session()->info(fmt(
       "TextChatStage('{}'): loading model from '{}' "
@@ -997,6 +1087,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
   _mvis     = _lm->metal_vision_encoder();
   _mgvis    = _lm->metal_gemma4_vision_encoder();
   _mpix     = _lm->metal_pixtral_vision_encoder();
+  _mds      = _lm->metal_deepseek_v41_vision();
   _mguni    = _lm->gemma4_unified_embedder();
   _m_audio  = _lm->metal_audio_encoder();
   _mg_audio = _lm->metal_gemma4_audio_encoder();
@@ -1391,6 +1482,15 @@ TextChatStage::process(RuntimeContext& ctx)
     const size_t n = conv.messages.size();
     conv_tail_tool = conv.messages.back().role == "tool";
     const size_t end = conv_tail_tool ? n : n - 1;
+    // The conversation's last user message (a system message past the
+    // first counts as one, as DeepSeek-V4.1's encoding counts it): an
+    // assistant turn after it is a step of the reply being made, which a
+    // family may render apart (render_assistant_message).
+    size_t last_user = 0;
+    for (size_t j = 0; j < n; ++j) {
+      const string& r = conv.messages[j].role;
+      if (r == "user" || (r == "system" && j > 0)) { last_user = j; }
+    }
     size_t i = k;
     bool ok = true;
     if (k == 0) {
@@ -1413,8 +1513,12 @@ TextChatStage::process(RuntimeContext& ctx)
             span<const string>(results.data(), results.size()), &conv_ids);
         continue;
       }
-      ok = tpl->render_message(m.role, m.content,
-                               !_seeded && conv_ids.empty(), &conv_ids);
+      const bool first = !_seeded && conv_ids.empty();
+      ok = m.role == "assistant"
+               ? tpl->render_assistant_message(m.content, conv.tools_json,
+                                               i > last_user, first,
+                                               &conv_ids)
+               : tpl->render_message(m.role, m.content, first, &conv_ids);
       ++i;
     }
     if (ok && conv_tail_tool) {
@@ -1455,7 +1559,8 @@ TextChatStage::process(RuntimeContext& ctx)
       session()->warn(fmt("TextChatStage('{}'): {}", this->id(), e));
     }
     const bool image_ok = tpl->image_pad_token_id() >= 0
-        && (_mvis || _mgvis || _mpix || (_mguni && _mguni->has_vision()));
+        && (_mvis || _mgvis || _mpix || _mds ||
+            (_mguni && _mguni->has_vision()));
     const bool audio_ok = tpl->audio_pad_token_id() >= 0
         && (_m_audio || _mg_audio || (_mguni && _mguni->has_audio()));
     const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
@@ -1490,7 +1595,7 @@ TextChatStage::process(RuntimeContext& ctx)
                                       seg.bytes.size()),
                   &derr);
         if (img) {
-          item = encode_image_item_(_mvis, _mgvis, _mguni, _mpix,
+          item = encode_image_item_(_mvis, _mgvis, _mguni, _mpix, _mds,
                                     img->rgb.data(), img->height,
                                     img->width);
           if (!item) { derr = "vision encode failed"; }

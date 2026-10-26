@@ -1,4 +1,6 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
+
+#include "generative-models/lm-run-memory.h"
 #include "generative-models/qwen3/metal-qwen-raw-layers.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
@@ -21,6 +23,8 @@
 #include "common/flex-bag.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+
+#include <dispatch/dispatch.h>
 
 #include <algorithm>
 #include <cassert>
@@ -501,17 +505,23 @@ struct MetalQwenModel::LayerLoad {
   // read as a RANGE, gate|up interleaved by row as interleave_moe lays a
   // layer slab out, scales and biases in the compute dtype as to_elt
   // converts them. Thread-safe (scratch per thread; `rr` is).
+  // Its nine ranges are read AT ONCE (each lands in parts no other range
+  // writes): a miss is then the drive's wide reads, not one stream of
+  // nine -- DeepSeek-V4.1's experts read 1.47x faster so on an M5 Ultra.
+  // VPIPE_QWEN_SERIAL_READS=1 reads them in turn (an A/B).
   bool affine_expert(const SafetensorsRanges& rr, const std::string& p,
                      int e, int I, int H, int gb, int db,
                      std::uint8_t* const* dst, int group = 64) const {
-    thread_local std::vector<std::uint8_t> t0, t1;
     const std::size_t gw = (std::size_t)H * gb / 8;          // a gate row
     const std::size_t gg = (std::size_t)H / group;           // its groups
+    // A range of expert e's rows into the thread's own staging.
     auto slice = [&](const std::string& nm, std::size_t row_bytes,
-                     int rows, std::vector<std::uint8_t>& to) {
+                     int rows) -> const std::uint8_t* {
+      thread_local std::vector<std::uint8_t> to;
       const std::size_t n = row_bytes * (std::size_t)rows;
       if (to.size() < n) { to.resize(n); }
-      return rr.read(nm, (std::size_t)e * n, n, to.data());
+      return rr.read(nm, (std::size_t)e * n, n, to.data()) ? to.data()
+                                                           : nullptr;
     };
     // The compute dtype from a stored 16/32-bit scale (to_elt's rule).
     auto elt_rows = [&](const std::string& nm, std::size_t count,
@@ -520,11 +530,12 @@ struct MetalQwenModel::LayerLoad {
       const auto* ti = wts->info(nm);
       if (ti == nullptr) { return false; }
       const std::size_t esz = ti->dtype == "F32" ? 4 : 2;
-      if (!slice(nm, count * esz, rows, t0)) { return false; }
+      const std::uint8_t* t0 = slice(nm, count * esz, rows);
+      if (t0 == nullptr) { return false; }
       for (int r = 0; r < rows; ++r) {
         std::uint16_t* o =
             out + ((std::size_t)r0 + (std::size_t)stride * r) * count;
-        const std::uint8_t* src = t0.data() + (std::size_t)r * count * esz;
+        const std::uint8_t* src = t0 + (std::size_t)r * count * esz;
         for (std::size_t i = 0; i < count; ++i) {
           float f;
           if (ti->dtype == "F32") {
@@ -544,28 +555,50 @@ struct MetalQwenModel::LayerLoad {
       return true;
     };
     const std::string sw = p + "mlp.switch_mlp.";
-    for (int half = 0; half < 2; ++half) {
-      const std::string nm = sw + (half == 0 ? "gate_proj" : "up_proj");
-      if (!slice(nm + ".weight", gw, I, t1)) { return false; }
-      for (int g = 0; g < I; ++g) {
-        std::memcpy(dst[0] + ((std::size_t)2 * g + half) * gw,
-                    t1.data() + (std::size_t)g * gw, gw);
-      }
-      if (!elt_rows(nm + ".scales", gg, I,
-                    reinterpret_cast<std::uint16_t*>(dst[1]), 2, half) ||
-          !elt_rows(nm + ".biases", gg, I,
-                    reinterpret_cast<std::uint16_t*>(dst[2]), 2, half)) {
-        return false;
-      }
-    }
     const std::size_t dwb = (std::size_t)I * db / 8;
     const std::size_t dg = (std::size_t)I / group;
-    return rr.read(sw + "down_proj.weight", (std::size_t)e * H * dwb,
-                   (std::size_t)H * dwb, dst[3]) &&
-           elt_rows(sw + "down_proj.scales", dg, H,
-                    reinterpret_cast<std::uint16_t*>(dst[4]), 1, 0) &&
-           elt_rows(sw + "down_proj.biases", dg, H,
-                    reinterpret_cast<std::uint16_t*>(dst[5]), 1, 0);
+    // Range j: gate (0-2) and up (3-5) codes / scales / biases, each
+    // interleaved by row into the gate|up parts, then down's (6-8).
+    auto range = [&](int j) -> bool {
+      if (j < 6) {
+        const int half = j / 3, t = j % 3;
+        const std::string nm = sw + (half == 0 ? "gate_proj" : "up_proj");
+        if (t == 0) {
+          const std::uint8_t* t1 = slice(nm + ".weight", gw, I);
+          if (t1 == nullptr) { return false; }
+          for (int g = 0; g < I; ++g) {
+            std::memcpy(dst[0] + ((std::size_t)2 * g + half) * gw,
+                        t1 + (std::size_t)g * gw, gw);
+          }
+          return true;
+        }
+        return elt_rows(nm + (t == 1 ? ".scales" : ".biases"), gg, I,
+                        reinterpret_cast<std::uint16_t*>(dst[t]), 2, half);
+      }
+      if (j == 6) {
+        return rr.read(sw + "down_proj.weight", (std::size_t)e * H * dwb,
+                       (std::size_t)H * dwb, dst[3]);
+      }
+      return elt_rows(sw + (j == 7 ? "down_proj.scales" : "down_proj.biases"),
+                      dg, H, reinterpret_cast<std::uint16_t*>(dst[j - 3]), 1,
+                      0);
+    };
+    static const bool kSerial =
+        std::getenv("VPIPE_QWEN_SERIAL_READS") != nullptr;
+    std::atomic<bool> ok{true};
+    if (kSerial) {
+      for (int j = 0; j < 9 && ok.load(); ++j) {
+        if (!range(j)) { ok = false; }
+      }
+      return ok.load();
+    }
+    auto job = [&](std::size_t j) {
+      if (!range((int)j)) { ok = false; }
+    };
+    auto* const jp = &job;
+    dispatch_apply(9, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(std::size_t j) { (*jp)(j); });
+    return ok.load();
   }
   // One layer's block-FP8 routed experts (mlp.experts.<e>.<proj>.weight,
   // E4M3 [rows, cols], + .weight_scale_inv, f32 [rows/128, cols/128]) into
@@ -1555,6 +1588,10 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_qsa_score_mma = m->_lib_hc.function("qsa_score_mma_f16");
     m->_fn_qsa_score_simd = m->_lib_hc.function("qsa_score_simd_f16");
     m->_fn_qsa_select = m->_lib_hc.function("qsa_select_f16");
+    // A few rows' select in two phases past 8 chunks (optional: without
+    // them the one-threadgroup select).
+    m->_fn_qsa_topk_chunk = m->_lib_hc.function("qsa_topk_chunk_f16");
+    m->_fn_qsa_topk_merge = m->_lib_hc.function("qsa_topk_merge_f16");
     m->_fn_qsa_attn = m->_lib_hc.function("qsa_attn_f16");
     m->_fn_qsa_attn_split = m->_lib_hc.function("qsa_attn_split_f16");
     // ...and in chunks over many threadgroups, then combined (optional:
@@ -4101,6 +4138,19 @@ each_layer_buffer_(L& y, F&& f)
 
 }  // namespace
 
+int
+MetalQwenModel::x_ahead_rows_()
+{
+  // The most rows a step reads ahead for: a verify's (it computes each row
+  // as a decode step, at most eight; VPIPE_QWEN_AHEAD_ROWS=1 a decode
+  // step's alone).
+  static const int rows = [] {
+    const char* e = std::getenv("VPIPE_QWEN_AHEAD_ROWS");
+    return e != nullptr ? std::clamp(std::atoi(e), 1, 8) : 8;
+  }();
+  return rows;
+}
+
 bool
 MetalQwenModel::setup_expert_cache_(std::string* err)
 {
@@ -4205,11 +4255,14 @@ MetalQwenModel::setup_expert_cache_(std::string* err)
   if (const char* v = std::getenv("VPIPE_MOE_EXPERT_AHEAD")) {
     o.ahead_widths = {std::clamp(std::atoi(v), 0, E)};
   }
+  // A hyper-connection model's verify reads ahead for its few rows too.
+  o.ahead_rows = c.hc() ? x_ahead_rows_() : 1;
   _x_ahead = *std::max_element(o.ahead_widths.begin(), o.ahead_widths.end());
   _xc = MoeExpertCache::create(_mc, o, std::move(fill), err);
   if (!_xc) { return false; }
   if (_x_ahead > 0) {
-    _x_pred_logits = _mc->make_shared_buffer((std::size_t)E * 2);
+    _x_pred_logits =
+        _mc->make_shared_buffer((std::size_t)E * 2 * o.ahead_rows);
     _x_rank.resize((std::size_t)E);
     if (_x_pred_logits.empty()) {
       if (err != nullptr) { *err = "out of memory"; }
@@ -4426,7 +4479,8 @@ MetalQwenModel::held_growth_bytes(const MetalLlamaWeights& wts,
 std::size_t
 MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
                                       const std::string& dir,
-                                      const Config& c, std::size_t scratch)
+                                      const Config& c, std::size_t scratch,
+                                      std::size_t limit)
 {
   if (!c.is_moe()) { return 0; }
   const std::size_t ram = stream_physical_ram();
@@ -4440,25 +4494,32 @@ MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
   const std::size_t experts = routed_expert_bytes(*w, c);
   if (experts == 0) { return 0; }
   // Beside it: whatever the manager holds or was told is coming, without
-  // this checkpoint (counted at about its size on disk if declared).
+  // this checkpoint -- what the plan counts for it, which a host's limit
+  // books under its size on disk.
   std::size_t others = 0;
   auto* mgr = session != nullptr && session->services() != nullptr
                   ? session->services()->generative_model_manager()
                   : nullptr;
   if (mgr != nullptr) {
     others = mgr->phase_footprint(std::string());
-    if (mgr->accounts_for(dir)) { others -= std::min(others, disk); }
+    others -= std::min(others, mgr->planned_weight_bytes(dir));
     // And the activation scratch the plan holds -- the stages' own (a
     // vision tower's largest picture, a speculative verify's pools) and
-    // their peers'.
-    others += mgr->scratch_bytes(std::string());
+    // their peers' -- but this model's own run (`scratch`, which a stage's
+    // plan books under lm_run_label).
+    const std::size_t sc = mgr->scratch_bytes(std::string());
+    others += sc - std::min(sc, mgr->declared_scratch(lm_run_label(dir)));
   }
   // The irreversible headroom (model_memory::kStreamHeadroom): a cache
   // sized now is not resized while the model lives.
   constexpr std::size_t kHeadroom = (std::size_t)8 << 30;
-  const std::size_t budget =
+  std::size_t budget =
       ram > others + scratch + kHeadroom ? ram - others - scratch - kHeadroom
                                          : 0;
+  // The most the host lets it hold, its scratch in it.
+  if (limit > 0) {
+    budget = std::min(budget, limit > scratch ? limit - scratch : 0);
+  }
   const std::size_t unheld = unheld_bytes(*w, c);
   const std::size_t rest =
       (disk > experts + unheld ? disk - experts - unheld : 0) +
@@ -6109,6 +6170,44 @@ MetalQwenModel::encode_moe_mlp_(
   // ONE dispatch, a row a threadgroup column (grid.x = 32 * M), not one
   // dispatch a row (each a GEMV's latency: ~17 us the router's).
   const bool rowwise = _cfg.hc() && M > 1 && M <= 8;
+  // ROUTED EXPERTS IN A CACHE: the layer's index there (the MTP head's is
+  // the cache's layer past the model's own).
+  const bool xs = _xc != nullptr;
+  const int Lx = _hc_mtp != nullptr && &ly == &_hc_mtp->ly
+                     ? c.n_layers
+                     : (int)(&ly - _layers.data());
+  // READ AHEAD (a decode step, and a hyper-connection model's verify of a
+  // few rows): the NEXT layer's router over this layer's input -- the
+  // residual stream moves little between layers -- ranks what that layer
+  // will pick, and the cache reads the likeliest it does not hold while
+  // the GPU runs this one; a verify's rows as many for each, the rows'
+  // firsts, then their seconds, ... (DeepSeek-V4.1's rule).
+  // VPIPE_QWEN_AHEAD_ROWS=1 reads ahead for a decode step alone (an A/B).
+  const int arows = c.hc() ? x_ahead_rows_() : 1;
+  const int aw = xs && M <= arows ? std::min(_xc->ahead_width(), _x_ahead)
+                                  : 0;
+  const Layer* nx = aw > 0 && Lx + 1 < c.n_layers
+                        ? &_layers[(std::size_t)Lx + 1]
+                        : nullptr;
+  if (nx != nullptr && nx->rgw.empty()) { nx = nullptr; }
+  if (nx != nullptr) {
+    if ((_dense || nx->rgs.empty()) && M == 1) {
+      dense_gemv_(enc, nx->rgw, hn, 0, _x_pred_logits, 0, H, E);
+    } else if (_dense || nx->rgs.empty()) {
+      enc.set_function(_fn_hc_dense_gemv_rows);
+      enc.set_buffer(0, hn); enc.set_buffer(1, nx->rgw);
+      enc.set_buffer(2, _x_pred_logits);
+      enc.set_constant(3, H); enc.set_constant(4, E);
+      enc.dispatch({32u * (unsigned)M, (unsigned)(((E + 7) / 8) * 2), 1},
+                   {32, 2, 1});
+    } else {
+      enc.set_function(nx->r_bits == 8 ? _fn_qmv8 : _fn_qmv);
+      sb012(nx->rgw, nx->rgs, nx->rgb);
+      enc.set_buffer(3, hn); enc.set_buffer(4, _x_pred_logits);
+      enc.set_constant(5, H); enc.set_constant(6, E);
+      enc.dispatch({32u * (unsigned)M, (unsigned)(E / 4), 1}, {32, 2, 1});
+    }
+  }
   if (_dense || ly.rgs.empty()) {
     if (M == 1) {
       dense_gemv_(enc, ly.rgw, hn, 0, logits, 0, H, E);
@@ -6153,57 +6252,47 @@ MetalQwenModel::encode_moe_mlp_(
   // dispatches below bind the cache's pools where a resident model binds
   // the layer's slabs (the same layout, slot for expert), and the grouped
   // sort counts slots.
-  const bool xs = _xc != nullptr;
   if (xs) {
     std::string why;
-    // The MTP head's layer is the cache's layer past the model's own.
-    const int Lx = _hc_mtp != nullptr && &ly == &_hc_mtp->ly
-                       ? c.n_layers
-                       : (int)(&ly - _layers.data());
-    // READ AHEAD (a decode step): the NEXT layer's router over this
-    // layer's input -- the residual stream moves little between layers --
-    // ranks what that layer will pick, and the cache reads the likeliest it
-    // does not hold while the GPU runs this one.
-    const int aw = M == 1 ? std::min(_xc->ahead_width(), _x_ahead) : 0;
-    const Layer* nx = aw > 0 && Lx + 1 < c.n_layers
-                          ? &_layers[(std::size_t)Lx + 1]
-                          : nullptr;
-    if (nx != nullptr && nx->rgw.empty()) { nx = nullptr; }
-    if (nx != nullptr) {
-      if (_dense || nx->rgs.empty()) {
-        dense_gemv_(enc, nx->rgw, hn, 0, _x_pred_logits, 0, H, E);
-      } else {
-        enc.set_function(nx->r_bits == 8 ? _fn_qmv8 : _fn_qmv);
-        sb012(nx->rgw, nx->rgs, nx->rgb);
-        enc.set_buffer(3, hn); enc.set_buffer(4, _x_pred_logits);
-        enc.set_constant(5, H); enc.set_constant(6, E);
-        enc.dispatch({32, (unsigned)(E / 4), 1}, {32, 2, 1});
-      }
-    }
     auto* ids = static_cast<std::int32_t*>(eid.contents());
     MoeExpertCache::Ahead ah;
     if (metal_compute::CommandStream::sync_and_reopen(enc, &why) &&
         nx != nullptr) {
-      // Rank by logit (the softmax keeps the order): the first `aw`.
+      // Rank by logit (the softmax keeps the order): each row's first
+      // `aw`, interleaved, each expert once.
       const auto* lg =
           static_cast<const std::uint16_t*>(_x_pred_logits.contents());
       std::vector<float> v((std::size_t)E);
-      for (int e = 0; e < E; ++e) {
-        const std::uint16_t u = lg[e];
-        if (c.use_bf16) {
-          v[(std::size_t)e] = bf16_to_f32_(u);
-        } else {
-          _Float16 h;
-          std::memcpy(&h, &u, 2);
-          v[(std::size_t)e] = (float)h;
+      _x_ord.resize((std::size_t)E);
+      int na = 0;
+      std::vector<std::int32_t> top((std::size_t)M * aw);
+      for (int t = 0; t < M; ++t) {
+        for (int e = 0; e < E; ++e) {
+          const std::uint16_t u = lg[(std::size_t)t * E + (std::size_t)e];
+          if (c.use_bf16) {
+            v[(std::size_t)e] = bf16_to_f32_(u);
+          } else {
+            _Float16 h;
+            std::memcpy(&h, &u, 2);
+            v[(std::size_t)e] = (float)h;
+          }
+        }
+        for (int e = 0; e < E; ++e) { _x_ord[(std::size_t)e] = e; }
+        std::partial_sort(_x_ord.begin(), _x_ord.begin() + aw, _x_ord.end(),
+                          [&](std::int32_t a, std::int32_t b) {
+          return v[(std::size_t)a] > v[(std::size_t)b];
+        });
+        for (int k = 0; k < aw; ++k) {
+          top[(std::size_t)k * M + (std::size_t)t] = _x_ord[(std::size_t)k];
         }
       }
-      for (int e = 0; e < E; ++e) { _x_rank[(std::size_t)e] = e; }
-      std::partial_sort(_x_rank.begin(), _x_rank.begin() + aw,
-                        _x_rank.end(), [&](std::int32_t a, std::int32_t b) {
-        return v[(std::size_t)a] > v[(std::size_t)b];
-      });
-      ah = {Lx + 1, _x_rank.data(), aw};
+      for (const std::int32_t e : top) {
+        if (std::find(_x_rank.begin(), _x_rank.begin() + na, e) ==
+            _x_rank.begin() + na) {
+          _x_rank[(std::size_t)na++] = e;
+        }
+      }
+      ah = {Lx + 1, _x_rank.data(), na};
     }
     if (!why.empty() ||
         !_xc->resolve(Lx, ids, np, M, ids, &why,
@@ -7410,8 +7499,13 @@ MetalQwenModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
   const int n = (int)ids.size();
   if (n <= 0) { return {}; }
   if (_cfg.hc()) {
-    // In pieces: a piece's activations scale with its rows (the PLE and
-    // hyper-connection buffers are hc_count * hidden wide). With the MTP
+    // In pieces (hc_piece_): a piece's activations scale with its rows
+    // (the PLE and hyper-connection buffers are hc_count * hidden wide),
+    // and each piece reads the routed experts it picks that the cache
+    // lacks -- 512 of them top-10, so a few thousand rows pick most of
+    // every layer's. MEASURED on the M4 Pro (64 GB, a 36 GB expert cache),
+    // an 8192-token prompt: 2048-row pieces 43.1-43.7 s reading 55 GB,
+    // one of 8192 34.1-36.1 s reading 46. With the MTP
     // head and the prefix seed on, each piece's (residual, next token)
     // pairs prime the head's KV as it goes (omlx's prompt priming).
     // A DFlash drafter attached decodes instead of the head, which is then
@@ -7423,11 +7517,20 @@ MetalQwenModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
     SharedBuffer resid;
     HcRun run;
     if (prime) { run.resid = &resid; }
-    const int piece = std::min(prefill_piece_(), 2048);
+    const int piece = hc_piece_(n);
     const HcTaps taps = hc_taps_begin_(cid, n, piece);
+    // Each piece's n-gram rows read under the one before it
+    // (VPIPE_QWEN_PLE_AHEAD=0: each at its own forward, an A/B).
+    HcPleAhead ple_ahead;
+    run.ple_ahead = hc_ple_ahead_() ? &ple_ahead : nullptr;
     for (int i = 0; i < n; i += piece) {
       const int m = std::min(piece, n - i);
       const std::span<const std::int32_t> part(ids.data() + i, (std::size_t)m);
+      run.ple_next = i + m < n
+                         ? std::span<const std::int32_t>(
+                               ids.data() + i + m,
+                               (std::size_t)std::min(piece, n - i - m))
+                         : std::span<const std::int32_t>();
       hc_taps_piece_(taps, i, m, run);
       r = forward_hc_(cid, part, nullptr, nullptr, nullptr, -1, nullptr, &run);
       if (r.empty() || !hc_taps_ingest_(taps, i, m, run)) { return {}; }
@@ -7624,6 +7727,17 @@ const char*
 MetalQwenModel::prefill_attention_kernel(int n) const
 {
   return prefill_set_serves_(n) ? _prefill_set.kernel_name(n) : "legacy";
+}
+
+int
+MetalQwenModel::hc_piece_(int n) const
+{
+  // Balanced pieces of at most hc_piece_rows (VPIPE_QWEN_PREFILL_CHUNK's
+  // fewer, if set), so the last is never a sliver.
+  const int most =
+      std::max(1, std::min(prefill_piece_(), hc_piece_rows(_cfg)));
+  const int pieces = (std::max(n, 1) + most - 1) / most;
+  return (std::max(n, 1) + pieces - 1) / pieces;
 }
 
 int
@@ -8618,11 +8732,15 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   // npad is a multiple of the tile size and >= every expert block padded to
   // MAXM (= ceil(np/MAXM) real tiles + one pad tile per expert), so the
   // segmented dispatch (ceil(npad/MAXM) tiles) never indexes past tile2e.
-  // With the experts in a cache the sort runs over SLOTS: a step touches
-  // at most np of them, which bounds the tiles as the expert count does.
+  // With the experts in a cache the sort runs over SLOTS (the counts are
+  // sized by them), but an expert sits in one slot, so a layer's step
+  // fills at most n_experts of them -- an empty one takes no tile -- and
+  // the tiles keep the expert count's bound (counting slots there had a
+  // 16 GB box's cache, 2345 slots, pad 68 MB more at 8192 rows).
   const int moe_x = _xc ? _xc->slots() : c.n_experts;
   const int moe_maxtiles = moe_grouped
-      ? (moe_np + kMoeMAXM - 1) / kMoeMAXM + std::min(moe_x, moe_np) : 0;
+      ? (moe_np + kMoeMAXM - 1) / kMoeMAXM + std::min(c.n_experts, moe_np)
+      : 0;
   const int moe_npad = moe_maxtiles * kMoeMAXM;
   const std::size_t nE = (std::size_t)moe_x;
   const std::size_t npd = (std::size_t)moe_npad;

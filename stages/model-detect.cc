@@ -185,6 +185,7 @@ family_version_(const std::string& mt, std::string& family,
       {"qwen3.5",                "Qwen",        "3.5"},
       {"qwen3.6",                "Qwen",        "3.6"},
       {"qwen3.8-flash",          "Qwen",        "3.8 Flash-Next"},
+      {"deepseek-v4.1",          "DeepSeek",    "4.1"},
       {"qwen3-asr",              "Qwen",        "3-ASR"},
       {"qwen3.5-vision-encoder", "Qwen",        "3.5"},
       {"gemma4",                 "Gemma",       "4"},
@@ -276,6 +277,8 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   // Qwen3.8-Flash-Next: the Qwen3.5-MoE backbone under hyper-connections
   // (metal-qwen-hc.cc), a model_type of its own.
   if (starts("qwen4_exp")) { return "qwen3.8-flash"; }
+  // DeepSeek-V4.1-Flash (generative-models/deepseek-v41/).
+  if (starts("deepseek_v41")) { return "deepseek-v4.1"; }
   if (starts("qwen3_5") || starts("qwen3_6")) {
     if (starts("qwen3_6") || has_(name_lc, "qwen3.6")
         || has_(name_lc, "qwen3_6")) {

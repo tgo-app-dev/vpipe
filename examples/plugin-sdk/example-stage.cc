@@ -11,6 +11,7 @@
 #include "pipeline/typed-stage.h"
 #include "plugin/plugin-abi.h"
 #include "plugin/plugin-context.h"
+#include "stages/model-source.h"
 
 #include <string>
 #include <utility>
@@ -76,6 +77,15 @@ void
 plugin_register(vpipe::VpipePluginContext* ctx)
 {
   ctx->register_stage<ExampleEchoStage>(&kSpec);
+  // A family that ships models says where a mirror keeps them when it is
+  // not their HuggingFace owner/repo (docs/PLUGINS.md, "Mirrors"). An
+  // optional addition (model-sources/1), imported weakly: asked for first,
+  // so this plugin still loads on a host without it.
+  if (model_sources_available()) {
+    register_mirror_repos({{.source = "modelscope",
+                            .hf_path = "vpipe-example/echo-model",
+                            .path = ""}});      // not mirrored there
+  }
 }
 
 }  // namespace

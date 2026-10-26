@@ -58,6 +58,25 @@ std::string untranslatable_tensor(const MetalLlamaWeights& w);
 // lightx2v publishes, with no config and no metadata beside it.
 bool is_diffusers_dit_file(const std::string& path);
 
+// ---- a DiT ComfyUI SAVED ------------------------------------------------
+//
+// What ComfyUI writes when it saves a model -- a community fine-tune, a
+// merge, an int8 or FP8 requantization of one -- is its own model state:
+// H3's names under `model.diffusion_model.` (or `diffusion_model.`), no
+// config, no metadata, and the fused qkv in ComfyUI's FLAT order (the
+// Comfy-Org repack's, which ComfyUI's H3 splits by; VERIFIED on a
+// community int8 file against the released per-head rows). The prefix
+// is dropped at open (translate_comfy_prefix, in every open's
+// translations); is_comfy_saved_dit_file says a file is one, which is
+// what decides its grouping, since nothing after the rename can.
+
+// Drop the prefix in place, when EVERY tensor carries it and the names
+// under it are an H3 DiT's. Returns the number renamed; 0 otherwise.
+std::size_t translate_comfy_prefix(MetalLlamaWeights& w);
+
+// Whether `path` is a .safetensors H3 DiT under ComfyUI's prefix.
+bool is_comfy_saved_dit_file(const std::string& path);
+
 // One piece of a weight the checkpoint stores in pieces: rows
 // [row0, row0 + rows) of the layer `layer` (a name WITHOUT ".weight").
 struct Part {

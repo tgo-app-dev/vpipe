@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <format>
 #include <mutex>
@@ -113,7 +114,13 @@ MoeExpertCache::create(metal_compute::MetalCompute* mc, const Options& opt,
   c->_aw.width = c->_aw.widths.empty() ? 0 : c->_aw.widths[0];
   c->_aw.round = c->_aw.widths.size() > 1;            // else nothing to choose
   c->_workers = std::make_unique<Pool>();
-  const int nt = std::max(1, opt.threads - 1);   // the caller is one more
+  // VPIPE_MOE_EXPERT_THREADS=<n> sets the readers (an A/B: the drive
+  // decides how many requests in flight it answers best)
+  int threads = opt.threads;
+  if (const char* e = std::getenv("VPIPE_MOE_EXPERT_THREADS")) {
+    threads = std::clamp(std::atoi(e), 1, 64);
+  }
+  const int nt = std::max(1, threads - 1);       // the caller is one more
   for (int t = 0; t < nt; ++t) {
     c->_workers->threads.emplace_back([p = c.get()] { p->worker_(); });
   }
@@ -286,7 +293,8 @@ MoeExpertCache::note_step_(int L, int rows, double blocked_ms)
   AheadChooser& a = _aw;
   const int nw = (int)a.widths.size();
   if (nw < 2) { return; }
-  if (rows != 1) {                     // a prefill breaks the chain
+  if (rows < 1 || rows > std::max(1, _opt.ahead_rows)) {
+    // a prefill breaks the chain
     a.prev_layer = -2;
     return;
   }
@@ -557,6 +565,14 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
       }
     }
   };
+  if (_record) {
+    _blocked.clear();
+    for (const std::vector<int>* v : {&own, &claimed}) {
+      for (int s : *v) {
+        _blocked.push_back(_key[(std::size_t)s] % E);
+      }
+    }
+  }
   bool ok = true;
   double blocked = 0.0;
   if (!own.empty()) {

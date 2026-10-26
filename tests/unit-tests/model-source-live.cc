@@ -2,7 +2,7 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "stages/model-catalog.h"
-#include "stages/model-source.h"
+#include "stages/model-source-host.h"
 #include "stages/resumable-fetch.h"
 
 #include <cstdio>

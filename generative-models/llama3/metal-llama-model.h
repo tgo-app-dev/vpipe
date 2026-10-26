@@ -54,6 +54,13 @@ public:
 
   // Load + bind all weights from `model_dir`/model.safetensors.
   // Returns nullptr on failure.
+  // Its working memory beside its weights, for the LM stages' plan
+  // (lm_run_bytes): a prompt of up to max_seq rows prefilled in one
+  // forward (its buffers and, continuing a context, the whole context's
+  // K/V gathered), the decode scratch, and the paged K/V of `kv_tokens`
+  // at the capacity the pool's doubling reaches.
+  static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens);
+
   static std::unique_ptr<MetalLlamaModel> load(
       const std::string& model_dir,
       metal_compute::MetalCompute* mc,

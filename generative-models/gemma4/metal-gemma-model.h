@@ -186,6 +186,19 @@ public:
 
   // Derive the shape-affecting Config from a parsed ModelConfig.
   static Config config_from(const ModelConfig& c);
+  // Its working memory beside its weights, for the LM stages' plan
+  // (lm_run_bytes): a prompt of up to max_seq rows prefilled in ONE forward
+  // (prefill() grows the context's sliding ring to it), that forward's
+  // buffers (forward_chunk_, element by element; `plain_mlp`: a dense or
+  // mixed checkpoint's separate gate; `double_wide`: the KV-shared layers'
+  // 2x MLP; `matrix_cores`: the gate|up output, the dequantized weight and
+  // the head-dim-512 attention's gathered K/V), the scratch ensure_scratch_
+  // keeps (the materialized global scores among it), the full layers' paged
+  // pool at `kv_tokens` as its doubling reaches, and `contexts` contexts'
+  // sliding rings, one of them grown to the prompt.
+  static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens,
+                               int contexts, bool plain_mlp,
+                               bool double_wide, bool matrix_cores);
 
   // Decode one token: append to `cid`'s own KV and return [vocab] f32
   // logits at the new position. rope_pos<0 uses the KV slot position.

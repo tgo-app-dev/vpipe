@@ -2,7 +2,7 @@
 #include "stages/model-catalog.h"
 #include "stages/model-detect.h"
 #include "stages/model-registry.h"
-#include "stages/model-source.h"
+#include "stages/model-source-host.h"
 #include "stages/resumable-fetch.h"
 #include "stages/qwen-asr-tokenizer.h"
 

@@ -656,15 +656,18 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/typed-stage.h
     DESTINATION include/pipeline)
 # Stage-level SDK for a plugin that adds a MODEL FAMILY: the catalogue
-# entry type (so its models are fetchable), the config-source base (so
-# its knobs are a stage rather than dead keys on a shared one), and the
-# memory helpers every model-holding stage sizes itself with. See
+# entry type (so its models are fetchable) and where they are fetched from
+# (model-source.h: the sources' names, a mirror's renames; the host's side
+# of a source, model-source-host.h, is not installed), the config-source
+# base (so its knobs are a stage rather than dead keys on a shared one),
+# and the memory helpers every model-holding stage sizes itself with. See
 # docs/PLUGINS.md, "Model-specific configuration".
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-catalog.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-config-source.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-memory.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-registry.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-source.h
     DESTINATION include/stages)
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin-abi.h

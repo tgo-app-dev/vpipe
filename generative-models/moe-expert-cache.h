@@ -119,6 +119,10 @@ public:
     // The read-ahead widths a decode step chooses among (empty: never read
     // ahead; one: that width).
     std::vector<int> ahead_widths;
+    // The most rows a step may have and still be one the widths are
+    // compared on (a decode's 1; a speculative verify's few rows read
+    // ahead for each row, and the chain they form is a decode's).
+    int ahead_rows = 1;
   };
 
   struct Stats {
@@ -200,6 +204,18 @@ public:
   const Stats& stats() const { return _stats; }
   void reset_stats() { _stats = {}; }
 
+  // Debug (a study of what to read ahead): with record_steps(true), the
+  // experts that held the last step up -- read as its own, or read ahead
+  // and still under way when it came.
+  void record_steps(bool on) { _record = on; }
+  const std::vector<int>& last_blocked() const { return _blocked; }
+  // Whether a slot holds layer L's expert e, or is reading it.
+  bool holds(int L, int e) const
+  {
+    return L >= 0 && L < _opt.layers && e >= 0 && e < _opt.experts &&
+           _slot_of[(std::size_t)L * _opt.experts + (std::size_t)e] >= 0;
+  }
+
 private:
   MoeExpertCache() = default;
   struct Pool;                       // the reader threads
@@ -261,6 +277,8 @@ private:
   // The last read-ahead's experts and layer (for Stats::ahead_named).
   std::vector<std::int32_t> _named;
   int _named_layer = -1;
+  bool _record = false;
+  std::vector<int> _blocked;
   std::uint64_t _step = 0, _layer0_steps = 0;
   Stats _stats;
   std::unique_ptr<Pool> _workers;

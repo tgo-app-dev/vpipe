@@ -2,6 +2,7 @@
 
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/lm-memory-limit.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/tokenizer.h"
@@ -727,7 +728,11 @@ GenerativeModelManager::wired_pool_can_take(std::size_t bytes) const
 {
   const std::size_t lim = wired_pool_limit();
   if (lim == 0) { return false; }
-  return _pool_used.load(std::memory_order_relaxed) + bytes <= lim;
+  // A language model's load on this thread holds what it wired so far, not
+  // yet charged (it is, as the load ends): a model wiring the rest of
+  // itself mid-load -- an expert cache's pass -- would take the room twice.
+  return _pool_used.load(std::memory_order_relaxed) +
+             metal_compute::WireOnAlloc::live_now() + bytes <= lim;
 }
 
 namespace {
@@ -1117,6 +1122,23 @@ GenerativeModelManager::phase_index_(const string& p) const
     if (_phase_order[i] == p) { return (int)i; }
   }
   return -1;
+}
+
+size_t
+GenerativeModelManager::declared_scratch(const string& label) const
+{
+  lock_guard<mutex> lk(_ws_mu);
+  auto it = _scratch.find(label);
+  return it == _scratch.end() ? 0 : it->second.bytes;
+}
+
+size_t
+GenerativeModelManager::planned_weight_bytes(const string& dir) const
+{
+  if (dir.empty()) { return 0; }
+  const auto per_dir = per_dir_bytes_();
+  auto it = per_dir.find(canonicalize_(session(), dir));
+  return it == per_dir.end() ? 0 : it->second;
 }
 
 size_t
@@ -2074,12 +2096,30 @@ GenerativeModelManager::load(const LoadSpec& spec)
   // also what lets a WireOnAlloc scope on this thread see every buffer the
   // load makes (load_spec::kWireWeights).
   const bool wire = bag::flag(spec.extra, load_spec::kWireWeights);
+  // The most it may hold (load_spec::kMemoryLimitMb): read on this
+  // thread by the load, which sizes an expert cache within it.
+  const std::size_t limit = (std::size_t)std::max<std::int64_t>(
+      0, bag::integer(spec.extra, load_spec::kMemoryLimitMb, 0)) << 20;
   shared_ptr<LoadedLanguageModel> lm;
-  std::size_t wired = 0, wired_tmp = 0;
+  std::size_t wired = 0, wired_tmp = 0, held_back = 0, room = 0;
   {
     std::optional<metal_compute::WireOnAlloc> scope;
-    if (wire) { scope.emplace(); }
-    lm = build();
+    if (wire) {
+      // Within the pool's room, as every other model's wiring is: the
+      // pool's ceiling is the host's word on what this process makes
+      // unswappable, and a model wired whole past it -- a 16 GB helper
+      // under an 8 GB pool -- overdrew it with nothing said. What does not
+      // fit stays reclaimable. Two loads at once may each see the same
+      // room; what each charges after is what it holds.
+      const std::size_t lim  = wired_pool_limit();
+      const std::size_t used = wired_pool_used();
+      room = lim > used ? lim - used : 0;
+      scope.emplace(room);
+    }
+    {
+      LmMemoryLimit cap(limit);
+      lm = build();
+    }
     if (scope) {
       // What THIS load wired and still holds, counted on this thread --
       // not the process's wired size before and after, which also takes
@@ -2087,6 +2127,7 @@ GenerativeModelManager::load(const LoadSpec& spec)
       // meanwhile (wire-on-alloc.h).
       wired = scope->live_bytes();
       wired_tmp = scope->wired_bytes() - wired;
+      held_back = scope->held_back_bytes();
     }
   }
   if (!lm) {
@@ -2110,8 +2151,12 @@ GenerativeModelManager::load(const LoadSpec& spec)
       session()->info(fmt(
           "GenerativeModelManager::load('{}'): {} MB wired as it loaded "
           "(the compressor cannot take it; charged to the wired pool; {} MB "
-          "of load temporaries wired and freed)",
-          key.hf_dir, wired >> 20, wired_tmp >> 20));
+          "of load temporaries wired and freed){}",
+          key.hf_dir, wired >> 20, wired_tmp >> 20,
+          held_back > 0
+              ? fmt("; {} MB left unwired -- the wired pool had {} MB of "
+                    "room", held_back >> 20, room >> 20)()
+              : std::string()));
     }
   }
 

@@ -9,7 +9,8 @@
 //                              `vpipe_plugin_abi`: refused from the file.
 //   HANDSHAKE_MISSING_FEATURE  a current plugin requiring a feature this
 //                              host lacks: dlopen'd, refused after, and
-//                              its self-registered stage withdrawn.
+//                              its self-registered stage withdrawn -- and
+//                              the mirror row it added as it loaded.
 
 #include "common/flex-data.h"
 #include "common/job.h"
@@ -17,6 +18,7 @@
 #include "pipeline/typed-stage.h"
 #include "plugin/plugin-abi.h"
 #include "plugin/plugin-context.h"
+#include "stages/model-source.h"
 
 #include <string>
 #include <utility>
@@ -47,6 +49,19 @@ public:
 
 // Odr-use the id so the static registration really runs at load.
 const StageTypeId kId = TypedStage<HandshakeStage>::type_id();
+
+#if !defined(HANDSHAKE_OLD_ABI) && !defined(HANDSHAKE_NO_CONSTANT)
+// A mirror row, from a static initialiser too: the host must drop it with
+// the plugin (the table is first-wins, so a refused plugin's row would
+// otherwise outrank the next plugin's for good).
+[[maybe_unused]] const std::size_t kRows =
+    vpipe::model_sources_available()
+        ? vpipe::register_mirror_repos(
+              {{.source = "modelscope",
+                .hf_path = "plugin-handshake/refused-model",
+                .path = "plugin-handshake-cn/refused-model"}})
+        : 0;
+#endif
 
 void
 register_(VpipePluginContext* c)

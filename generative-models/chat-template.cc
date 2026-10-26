@@ -1989,6 +1989,424 @@ private:
 };
 
 // ---------------------------------------------------------------------
+// DeepSeek-V4.1 (the release's encoding/encoding.py, chat and thinking
+// modes, a conversation's tools):
+//
+//   <｜begin▁of▁sentence｜>[<｜System｜>{effort}{system}[\n\n{tools}]]
+//   <｜User｜>{user}<｜Assistant｜></think>{answer}<｜end▁of▁sentence｜>
+//   <｜User｜>{user}<｜Assistant｜>(</think> | <think>)
+//
+// No newlines anywhere: every marker is its own token, and a turn's
+// text follows it directly. Chat mode closes the (empty) reasoning
+// before the answer; thinking mode opens it, and the first message
+// carries the numeric reasoning effort -- "Reasoning Effort: N (range
+// 1-100, ...)" -- after a <｜System｜> of its own, whether or not the
+// conversation has a system message. An earlier assistant turn, in
+// thinking mode, keeps its reasoning -- <think>{reasoning}</think> after
+// the header -- where the conversation has tools (encoding.py renders it
+// with drop_thinking off then) or the turn follows the last user message
+// (a step of the reply being made); else, and always in chat mode, its
+// answer alone after </think>. A turn decoded into a context the stage
+// keeps holds what it was decoded with.
+//
+// TOOLS are DSML, the release's own: the system message's "## Tools"
+// section (its words, then each function's schema a line, as json.dumps
+// writes it), a call as
+//
+//   {answer}\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="NAME">\n
+//   <｜DSML｜ parameter name="KEY" string="true|false">VALUE</｜DSML｜
+//   parameter>\n...</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>
+//
+// -- a string as it is, anything else its JSON -- and the results as a
+// user turn of <tool_result>...</tool_result> blocks, "\n\n" between
+// them. `｜DSML｜`, `<think>` and `</think>` are added tokens wherever
+// the template's own text or a turn the model wrote holds them, as HF's
+// tokenizer splits them. One step from the reference: a user message
+// after a turn's results opens a <｜User｜> of its own, where
+// merge_tool_messages() would join it to theirs.
+
+#define VPIPE_DSML_ "\uff5cDSML\uff5c"
+
+// encoding.py's TOOLS_TEMPLATE, around the schemas.
+constexpr std::string_view kDsv41ToolsHead =
+    "## Tools\n\nYou have access to a set of tools to help answer the "
+    "user's question. You can invoke tools by writing a \"<" VPIPE_DSML_
+    " calls>\" block like the following:\n\n<" VPIPE_DSML_ " calls>\n<"
+    VPIPE_DSML_ " invoke name=\"$TOOL_NAME\">\n<" VPIPE_DSML_ " parameter "
+    "name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</"
+    VPIPE_DSML_ " parameter>\n...\n</" VPIPE_DSML_ " invoke>\n<" VPIPE_DSML_
+    " invoke name=\"$TOOL_NAME2\">\n...\n</" VPIPE_DSML_ " invoke>\n</"
+    VPIPE_DSML_ " calls>\n\nString parameters should be specified as is "
+    "and set `string=\"true\"`. For all other types (numbers, booleans, "
+    "arrays, objects), pass the value in JSON format and set "
+    "`string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by "
+    "<think>), you MUST output your complete reasoning inside "
+    "<think>...</think> BEFORE any tool calls or final response.\n\n"
+    "Otherwise, output directly after </think> with tool calls or final "
+    "response.\n\n### Available Tool Schemas\n\n";
+constexpr std::string_view kDsv41ToolsTail =
+    "\n\nYou MUST strictly follow the above defined tool name and "
+    "parameter schemas to invoke tool calls.\n";
+constexpr std::string_view kDsv41CallsOpen = "<" VPIPE_DSML_ " calls>";
+constexpr std::string_view kDsv41CallsClose = "</" VPIPE_DSML_ " calls>";
+constexpr std::string_view kDsv41Invoke = "<" VPIPE_DSML_ " invoke";
+constexpr std::string_view kDsv41InvokeEnd = "</" VPIPE_DSML_ " invoke>";
+constexpr std::string_view kDsv41Param = "<" VPIPE_DSML_ " parameter";
+constexpr std::string_view kDsv41ParamEnd = "</" VPIPE_DSML_ " parameter>";
+
+#undef VPIPE_DSML_
+
+// A tag's attribute: `key="value"` in `tag`; false when it has none.
+bool
+dsml_attr_(std::string_view tag, std::string_view key, std::string* out)
+{
+  const std::string k = std::string(key) + "=\"";
+  const std::size_t a = tag.find(k);
+  if (a == std::string_view::npos) { return false; }
+  const std::size_t b = tag.find('"', a + k.size());
+  if (b == std::string_view::npos) { return false; }
+  *out = std::string(tag.substr(a + k.size(), b - a - k.size()));
+  return true;
+}
+
+// The calls a DeepSeek-V4.1 turn wrote in DSML (encoding.py's
+// parse_tool_calls), read leniently: invokes outside a calls block, one
+// left open at the turn's end, a parameter without its `string` flag. A
+// value flagged a string is that string; any other is its JSON, or the
+// text as a string when it is not JSON. A parameter named twice: the
+// last.
+std::vector<vpipe::McpToolCall>
+parse_dsv41_tool_calls_(const std::string& text)
+{
+  constexpr auto npos = std::string::npos;
+  const std::string_view all(text);
+  std::vector<vpipe::McpToolCall> calls;
+  const std::size_t block = text.find(kDsv41CallsOpen);
+  std::size_t pos = block == npos ? 0 : block;
+  while (true) {
+    const std::size_t i = text.find(kDsv41Invoke, pos);
+    if (i == npos) { break; }
+    const std::size_t gt = text.find('>', i + kDsv41Invoke.size());
+    if (gt == npos) { break; }
+    const std::size_t end = text.find(kDsv41InvokeEnd, gt);
+    const std::size_t stop = end == npos ? text.size() : end;
+    pos = end == npos ? text.size() : end + kDsv41InvokeEnd.size();
+    std::string name;
+    if (!dsml_attr_(all.substr(i, gt - i), "name", &name) ||
+        trim_sv_(name).empty()) {
+      continue;
+    }
+    FlexData args = FlexData::make_object();
+    std::size_t p = gt + 1;
+    while (true) {
+      const std::size_t q = text.find(kDsv41Param, p);
+      if (q == npos || q >= stop) { break; }
+      const std::size_t qg = text.find('>', q + kDsv41Param.size());
+      if (qg == npos || qg >= stop) { break; }
+      const std::size_t qe = text.find(kDsv41ParamEnd, qg + 1);
+      const std::size_t vend = qe == npos || qe > stop ? stop : qe;
+      const std::string_view tag = all.substr(q, qg - q);
+      const std::string value = text.substr(qg + 1, vend - qg - 1);
+      p = vend == stop ? stop : vend + kDsv41ParamEnd.size();
+      std::string key, flag;
+      if (!dsml_attr_(tag, "name", &key) || key.empty()) { continue; }
+      const bool as_string = dsml_attr_(tag, "string", &flag) &&
+                             flag == "true";
+      FlexData v;
+      bool json = false;
+      if (!as_string) {
+        try {
+          v = FlexData::from_json(value);
+          json = true;
+        } catch (const std::exception&) {
+        }
+      }
+      if (!json) { v = FlexData::make_string(value); }
+      args.as_object().insert_or_assign(key, std::move(v));
+    }
+    vpipe::McpToolCall call;
+    call.name = std::string(trim_sv_(name));
+    call.arguments_json = args.to_json(false);
+    calls.push_back(std::move(call));
+  }
+  return calls;
+}
+
+class DeepseekV41ChatTemplate final : public ChatTemplate {
+public:
+  DeepseekV41ChatTemplate(const Tokenizer& tok, bool thinking,
+                          std::string_view effort)
+    : _tok(tok)
+    , _bos(sp_(tok, "<\uff5cbegin\u2581of\u2581sentence\uff5c>"))
+    , _eos(sp_(tok, "<\uff5cend\u2581of\u2581sentence\uff5c>"))
+    , _user(sp_(tok, "<\uff5cUser\uff5c>"))
+    , _assistant(sp_(tok, "<\uff5cAssistant\uff5c>"))
+    , _system(sp_(tok, "<\uff5cSystem\uff5c>"))
+    , _think(sp_(tok, "<think>"))
+    , _unthink(sp_(tok, "</think>"))
+    , _image(sp_(tok, "<\uff5cdeepseek_image\uff5c>"))
+    , _dsml(sp_(tok, "\uff5cDSML\uff5c"))
+    , _thinking(thinking)
+  {
+    // the reference's spellings: an int 1..100 or low / high / max (and
+    // Qwen's xhigh / medium, which the chat stages also pass)
+    int budget = 75;
+    if (effort == "low") {
+      budget = 50;
+    } else if (effort == "high" || effort == "medium") {
+      budget = 75;
+    } else if (effort == "max" || effort == "xhigh") {
+      budget = 100;
+    } else if (!effort.empty()) {
+      const int v = std::atoi(std::string(effort).c_str());
+      if (v >= 1 && v <= 100) { budget = v; }
+    }
+    _effort_text = "Reasoning Effort: " + std::to_string(budget) +
+                   " (range 1-100, the higher the value, the more "
+                   "thorough the reasoning)\n\n";
+    _effort = std::to_string(budget);
+  }
+
+  std::string_view family_name() const override { return "deepseek-v4.1"; }
+
+  void render_user_turn(std::string_view content, bool is_first_turn,
+                        std::vector<std::int32_t>* dst) const override
+  {
+    open_(is_first_turn, /*system=*/false, dst);
+    push_sp_(_user, dst);
+    append_text_(_tok, content, dst);
+    (void)render_generation_prompt(dst);
+  }
+
+  // A turn with images: the blocks joined by blank lines (encoding.py's
+  // "\n\n".join of the content blocks), each image its span's worth of
+  // <｜deepseek_image｜> -- the tower's rows replace them.
+  std::int32_t image_pad_token_id() const noexcept override { return _image; }
+  bool render_user_turn_media(std::span<const MediaChunk> chunks,
+                              bool is_first_turn,
+                              std::vector<std::int32_t>* dst) const override
+  {
+    for (const MediaChunk& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Audio ||
+          (c.kind == MediaChunk::Kind::Image &&
+           (_image < 0 || c.n_tokens <= 0))) {
+        return false;
+      }
+    }
+    open_(is_first_turn, false, dst);
+    push_sp_(_user, dst);
+    bool first = true;
+    for (const MediaChunk& c : chunks) {
+      if (!first) { append_text_(_tok, "\n\n", dst); }
+      first = false;
+      if (c.kind == MediaChunk::Kind::Text) {
+        append_text_(_tok, c.text, dst);
+      } else {
+        dst->insert(dst->end(), (std::size_t)c.n_tokens, _image);
+      }
+    }
+    (void)render_generation_prompt(dst);
+    return true;
+  }
+
+  // The system message, and with tools its "## Tools" section after a
+  // blank line -- each function's schema a line, as json.dumps writes it
+  // (the host's `{"type": "function", "function": {...}}` lines give the
+  // function alone, as tools_from_openai_format does).
+  bool render_system_message(std::string_view text,
+                             std::string_view tools_json,
+                             bool is_first_turn,
+                             std::vector<std::int32_t>* dst) const override
+  {
+    if (!tools_json.empty() && _dsml < 0) { return false; }
+    if (is_first_turn) {
+      open_(true, /*system=*/true, dst);
+    } else {
+      push_sp_(_system, dst);
+    }
+    std::string s(text);
+    if (!tools_json.empty()) {
+      s += "\n\n";
+      s += kDsv41ToolsHead;
+      bool first = true;
+      std::size_t pos = 0;
+      while (pos < tools_json.size()) {
+        const std::size_t nl = tools_json.find('\n', pos);
+        const std::string_view line = tools_json.substr(
+            pos, nl == std::string_view::npos ? std::string_view::npos
+                                              : nl - pos);
+        pos = nl == std::string_view::npos ? tools_json.size() : nl + 1;
+        if (trim_sv_(line).empty()) { continue; }
+        if (!first) { s.push_back('\n'); }
+        first = false;
+        try {
+          FlexData t = FlexData::from_json(line);
+          if (t.is_object() && t.as_object().contains("function")) {
+            t = t.as_object().at("function");
+          }
+          hf_tojson_(t, &s);
+        } catch (const std::exception&) {
+          s.append(line);   // not JSON: as the host wrote it
+        }
+      }
+      s += kDsv41ToolsTail;
+    }
+    append_marked_(s, dst);
+    return true;
+  }
+
+  // A turn's tool results, in call order: a user turn of <tool_result>
+  // blocks (encoding.py merges the tool messages into one so).
+  bool render_tool_results_message(
+      std::span<const std::string> results,
+      std::vector<std::int32_t>* dst) const override
+  {
+    if (results.empty()) { return false; }
+    push_sp_(_user, dst);
+    std::string s;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      if (i > 0) { s += "\n\n"; }
+      s += "<tool_result>";
+      s += results[i];
+      s += "</tool_result>";
+    }
+    append_text_(_tok, s, dst);
+    return true;
+  }
+
+  std::vector<vpipe::McpToolCall>
+  parse_tool_calls(const std::string& assistant_text,
+                   std::string_view tools_json = {}) const override
+  {
+    (void)tools_json;
+    return parse_dsv41_tool_calls_(assistant_text);
+  }
+  std::string_view tool_call_open_marker() const noexcept override
+  {
+    return kDsv41CallsOpen;
+  }
+  std::string_view tool_call_close_marker() const noexcept override
+  {
+    return kDsv41CallsClose;
+  }
+
+  bool render_reasoning_system_turn(
+      std::vector<std::int32_t>* dst) const override
+  {
+    // The effort rides the first message (open_); nothing on its own.
+    (void)dst;
+    return false;
+  }
+
+  bool render_message(std::string_view role, std::string_view content,
+                      bool is_first_turn,
+                      std::vector<std::int32_t>* dst) const override
+  {
+    if (role == "system") {
+      return render_system_message(content, {}, is_first_turn, dst);
+    }
+    if (role == "user") {
+      open_(is_first_turn, false, dst);
+      push_sp_(_user, dst);
+      append_text_(_tok, content, dst);
+      return true;
+    }
+    if (role == "assistant") {
+      return render_assistant_message(content, {}, false, is_first_turn,
+                                      dst);
+    }
+    return false;
+  }
+
+  // An earlier turn: the header, its reasoning kept (thinking mode, with
+  // tools or after the last user message) or closed, then the answer and
+  // its calls as it wrote them. `content` is the turn as the stage decoded
+  // it -- `{reasoning}</think>{answer}` in thinking mode -- or the answer
+  // alone, as a host may keep it (its reasoning then empty).
+  bool render_assistant_message(std::string_view content,
+                                std::string_view tools_json,
+                                bool after_last_user, bool is_first_turn,
+                                std::vector<std::int32_t>* dst)
+      const override
+  {
+    (void)is_first_turn;
+    std::string_view reasoning, answer = content;
+    const std::size_t e = content.find("</think>");
+    if (e != std::string_view::npos) {
+      reasoning = content.substr(0, e);
+      answer = content.substr(e + 8);
+      if (reasoning.starts_with("<think>")) { reasoning.remove_prefix(7); }
+    }
+    push_sp_(_assistant, dst);
+    if (_thinking && (!tools_json.empty() || after_last_user)) {
+      push_sp_(_think, dst);
+      append_marked_(reasoning, dst);
+    }
+    push_sp_(_unthink, dst);
+    append_marked_(answer, dst);
+    push_sp_(_eos, dst);
+    return true;
+  }
+
+  bool render_generation_prompt(
+      std::vector<std::int32_t>* dst) const override
+  {
+    push_sp_(_assistant, dst);
+    push_sp_(_thinking ? _think : _unthink, dst);
+    return true;
+  }
+
+  std::string_view reasoning_effort() const noexcept override
+  {
+    return _thinking ? std::string_view(_effort) : std::string_view();
+  }
+  std::string_view reasoning_instructions() const noexcept override
+  {
+    return _thinking ? std::string_view(_effort_text) : std::string_view();
+  }
+  std::int32_t assistant_close_token_id() const override { return _eos; }
+  bool is_stop_token(std::int32_t id) const override { return id == _eos; }
+  bool assistant_prompt_opens_thinking() const noexcept override
+  {
+    return _thinking;
+  }
+  std::string sanitize_output(std::string text) const override
+  {
+    const auto p = text.find("</think>");
+    if (p != std::string::npos) { text.erase(0, p + 8); }
+    return text;
+  }
+
+private:
+  // BOS once, and in thinking mode the effort after a <｜System｜> -- which
+  // a system message at index 0 shares (its text follows the effort).
+  void open_(bool first, bool system, std::vector<std::int32_t>* dst) const
+  {
+    if (!first) { return; }
+    push_sp_(_bos, dst);
+    if (_thinking || system) { push_sp_(_system, dst); }
+    if (_thinking) { append_text_(_tok, _effort_text, dst); }
+  }
+
+  // Text the template or the model wrote: its DSML and reasoning
+  // markers the single tokens HF's tokenizer splits them into.
+  void append_marked_(std::string_view text,
+                      std::vector<std::int32_t>* dst) const
+  {
+    const AddedMark marks[] = {{"\uff5cDSML\uff5c", _dsml},
+                               {"<think>", _think},
+                               {"</think>", _unthink}};
+    append_split_(_tok, text, marks, dst);
+  }
+
+  const Tokenizer& _tok;
+  const std::int32_t _bos, _eos, _user, _assistant, _system;
+  const std::int32_t _think, _unthink, _image, _dsml;
+  const bool _thinking;
+  std::string _effort_text, _effort;
+};
+
+// ---------------------------------------------------------------------
 // Gemma-4 chat template.
 //
 //   <bos>
@@ -2666,6 +3084,11 @@ make_chat_template(const std::string&    architecture,
     // No system message from the architecture alone; the ModelConfig
     // overload brings the checkpoint's default.
     return std::make_unique<MistralChatTemplate>(tokenizer, std::string());
+  }
+  if (architecture == "DeepseekV41ForCausalLM") {
+    // Chat mode by default, as the release's generate.py runs it.
+    return std::make_unique<DeepseekV41ChatTemplate>(
+        tokenizer, !disable_thinking.value_or(true), reasoning_effort);
   }
   if (architecture == "Qwen3ASRForConditionalGeneration") {
     // ASR is single-pass transcription -- no thinking flag.

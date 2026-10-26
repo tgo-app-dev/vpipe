@@ -521,6 +521,24 @@ public:
     return false;
   }
 
+  // An ASSISTANT turn of a conversation, told what frames it: the tools
+  // its system turn advertised (`tools_json`; empty: none) and whether it
+  // comes after the conversation's last user message (`after_last_user`:
+  // a step of the reply being made, between tool calls). A family whose
+  // published template renders such a turn otherwise overrides it --
+  // DeepSeek-V4.1 keeps a turn's reasoning in either case and drops it
+  // else. By default neither changes anything: render_message's turn.
+  virtual bool
+  render_assistant_message(std::string_view           content,
+                           std::string_view           tools_json,
+                           bool                       after_last_user,
+                           bool                       is_first_turn,
+                           std::vector<std::int32_t>* dst) const
+  {
+    (void)tools_json; (void)after_last_user;
+    return render_message("assistant", content, is_first_turn, dst);
+  }
+
   // The results of a turn's tool calls (consecutive tool messages, in
   // call order), complete: no assistant header after them.
   virtual bool

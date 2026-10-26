@@ -1,0 +1,19 @@
+{
+  "id": "prepare-deepseek-v41-flash",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-mtp",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

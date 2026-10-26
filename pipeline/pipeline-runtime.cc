@@ -12,6 +12,7 @@
 #include "pipeline/pipeline.h"
 #include "interfaces/session-services-intf.h"
 #include "pipeline/memory-plan.h"
+#include "pipeline/resource-claim-delivery.h"
 #include "pipeline/resource-plan.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
@@ -917,6 +918,9 @@ PipelineRuntime::launch_()
               _pipeline->id(), s->id(), c.kind));
           continue;
         }
+        // The claim itself for a host planner, which reads its `extra`
+        // (resource-claim-delivery.h).
+        DeliveringResourceClaim delivering(c);
         p->claim(session(), c.key, c.phase, c.last_phase, c.floor_bytes);
       }
     }

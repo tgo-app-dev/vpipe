@@ -2,13 +2,18 @@
 
 #include "generative-models/chat-template.h"
 #include "generative-models/context-io.h"
+#include "generative-models/lm-memory-limit.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
 #include "generative-models/gemma4/metal-gemma-model-exec.h"
 #include "generative-models/llama3/metal-llama-model-exec.h"
 #include "generative-models/qwen3/metal-qwen-model-exec.h"
 #include "generative-models/gemma4/metal-gemma4-audio.h"
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/gemma4/metal-gemma4-vision.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/lm-run-memory.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/model-exec.h"
@@ -75,6 +80,7 @@ struct LoadedLanguageModel::Impl {
   // owns_kv metal multimodal path. MLX-free.
   unique_ptr<MetalGemma4VisionEncoder> metal_gemma4_vision;
   unique_ptr<MetalPixtralVisionEncoder> metal_pixtral_vision;
+  unique_ptr<MetalDeepseekV41Vision> metal_dsv41_vision;
   // Image rows take 1-D RoPE positions: the grids a caller passes to
   // prefill_multimodal_metal are for mROPE families only (Mistral3).
   bool image_rope_1d = false;
@@ -154,6 +160,21 @@ auto dispatch_(MlxRuntime* rt, F&& f) -> std::invoke_result_t<F&>
 
 namespace {
 
+
+// What a model sizing itself beside the plan runs in: the figure the
+// stage's plan booked for it (model_memory::lm_claims, under
+// lm_run_label), else this pool's own -- a load outside a planned graph.
+std::size_t
+lm_run_booked_(const SessionContextIntf* session, const std::string& dir,
+               const LmRunShape& shape)
+{
+  auto* mgr = session != nullptr && session->services() != nullptr
+                  ? session->services()->generative_model_manager()
+                  : nullptr;
+  const std::size_t booked =
+      mgr != nullptr ? mgr->declared_scratch(lm_run_label(dir)) : 0;
+  return booked > 0 ? booked : lm_run_bytes(session, dir, shape);
+}
 
 // Map the parsed HF config to the metal Llama exec's Config (text
 // path; llama3 rope-scaling fields default to a no-op when absent).
@@ -405,27 +426,21 @@ LoadedLanguageModel::LoadedLanguageModel(
         session ? session->services()->metal_compute() : nullptr;
     const char* be_env = std::getenv("VPIPE_LLM_BACKEND");
     const std::string& arch_be = _impl->weights.config.architecture;
-    const bool metal_llama = arch_be == "LlamaForCausalLM";
-    const bool metal_qwen = arch_be == "Qwen3_5ForConditionalGeneration"
-        || arch_be == "Qwen3_5MoeForConditionalGeneration"
-        // Qwen3.8-Flash-Next (qwen4_exp): the Qwen3.5-MoE backbone under
-        // hyper-connections, with the n-gram PLE and the QSA indexer.
-        || arch_be == "Qwen4ExpForConditionalGeneration"
-        || arch_be == "Qwen3ASRForConditionalGeneration"
-        // MOSS-TTS-Local-v1.5: TTS model with a dense Qwen3 TEXT backbone
-        // (under "transformer.", tied text head). Loaded as a Qwen text LM
-        // so it emits [vocab] text logits for perplexity / text eval.
-        || arch_be == "MossTTSLocalModel"
-        // MOSS-TTS-Realtime: Qwen3-1.7B backbone under "language_model." with a
-        // tied text head (embed_tokens). Loaded as a Qwen text LM so it emits
-        // [vocab] logits. It has NO real text head (predicts audio), so
-        // absolute perplexity is meaningless -- use the A/B divergence mode.
-        || arch_be == "MossTTSRealtime"
-        // Mistral3 / Ministral-3: a plain dense decoder (no q/k norm, no
-        // output gate) with YaRN RoPE; the Pixtral tower feeds it below.
-        || arch_be == "Mistral3ForConditionalGeneration";
-    const bool metal_gemma = arch_be == "Gemma4ForConditionalGeneration"
-        || arch_be == "Gemma4UnifiedForConditionalGeneration";
+    // The built-in families, by the one list the run-memory figure keys on
+    // too (lm-run-memory.h).
+    const LmFamily family = lm_family(arch_be);
+    const bool metal_llama = family == LmFamily::kLlama;
+    // Qwen3.5 / 3.6 (dense, hybrid, MoE), Qwen3.8-Flash-Next (qwen4_exp:
+    // hyper-connections, the n-gram PLE, the QSA indexer), Qwen3-ASR's
+    // dense decoder, the MOSS-TTS Local-v1.5 / Realtime text backbones
+    // (dense Qwen3, tied text heads: text logits for evaluation) and
+    // Mistral3 / Ministral-3 (a plain dense decoder with YaRN; the Pixtral
+    // tower feeds it below).
+    const bool metal_qwen = family == LmFamily::kQwen;
+    const bool metal_gemma = family == LmFamily::kGemma;
+    // DeepSeek-V4.1-Flash: hyper-connections, compressed sparse attention,
+    // engram, FP4 experts through the expert cache.
+    const bool metal_dsv41 = family == LmFamily::kDeepseekV41;
     // A plugin may register a new arch -> ModelExec factory. Consulted
     // BEFORE the built-in cascade below so a plugin family is selectable
     // by its config.json `architecture` string.
@@ -441,7 +456,8 @@ LoadedLanguageModel::LoadedLanguageModel(
         be_env == nullptr || std::string(be_env) == "metal";
     const bool use_metal = backend_wants_metal && mc_be != nullptr &&
         mc_be->valid() && !model_dir.empty() &&
-        (metal_llama || metal_qwen || metal_gemma || metal_plugin);
+        (metal_llama || metal_qwen || metal_gemma || metal_dsv41 ||
+         metal_plugin);
     if (use_metal) {
       // Bookkeeping-only ctx_mgr (the metal exec owns its own KV).
       ContextManager::Spec s;
@@ -458,6 +474,40 @@ LoadedLanguageModel::LoadedLanguageModel(
             compute_dtype_in == ComputeDtype::BF16};
         _impl->exec = ModelExecRegistry::get().create(arch_be, a);
         _impl->metal_bf16 = (compute_dtype_in == ComputeDtype::BF16);
+      } else if (metal_dsv41) {
+        MetalDeepseekV41Model::Options o;
+        o.use_bf16 = true;   // the release runs bf16; f16 overflows
+        // Its DSpark draft head (the checkpoint's mtp.*) loads when the
+        // MTP drafter named is the model's own directory: ~8 GB, so only
+        // where speculative decode is wanted (text-chat's `mtp`).
+        {
+          std::error_code ec;
+          o.dspark = !mtp_dir.empty() &&
+                     std::filesystem::equivalent(mtp_dir, model_dir, ec);
+        }
+        // what it runs in beside the weights (run_bytes)
+        LmRunShape rs;
+        rs.kv_tokens = (std::int64_t)page_tokens * max_pages;
+        rs.page_tokens = page_tokens;
+        rs.max_pages = max_pages;
+        rs.draft_head = o.dspark;
+        const std::size_t run = lm_run_booked_(session, model_dir, rs);
+        // within the most the host lets it hold (lm-memory-limit.h)
+        const std::size_t limit = LmMemoryLimit::current();
+        o.expert_cache_bytes = MetalDeepseekV41ModelExec::
+            lm_expert_cache_bytes(session, model_dir, run, mc_be, o.dspark,
+                                  limit);
+        if (o.expert_cache_bytes > 0 && session != nullptr) {
+          session->info(fmt("LoadedLanguageModel('{}'): the routed experts "
+                            "do not fit {} beside the rest -- a {} MB "
+                            "expert cache", model_dir,
+                            limit > 0 ? fmt("its {} MB limit", limit >> 20)()
+                                      : std::string("this box"),
+                            o.expert_cache_bytes >> 20));
+        }
+        _impl->metal_bf16 = true;
+        _impl->exec = make_unique<MetalDeepseekV41ModelExec>(
+            model_dir, mc_be, o, session);
       } else if (metal_gemma) {
         MetalGemmaModel::Config mcfg =
             MetalGemmaModel::config_from(_impl->weights.config);
@@ -515,16 +565,22 @@ LoadedLanguageModel::LoadedLanguageModel(
         // model's own figure at this pool's context (Qwen3.8-Flash-Next:
         // ~3.6 GB at 64k tokens).
         if (mcfg.is_moe()) {
-          const std::size_t run = std::max<std::size_t>(
-              (std::size_t)2 << 30,
-              MetalQwenModel::hc_run_bytes(
-                  mcfg, (std::int64_t)page_tokens * (std::int64_t)max_pages));
+          LmRunShape rs;
+          rs.kv_tokens = (std::int64_t)page_tokens * max_pages;
+          rs.page_tokens = page_tokens;
+          rs.max_pages = max_pages;
+          rs.one_pass = !mtp_dir.empty();
+          const std::size_t run = lm_run_booked_(session, model_dir, rs);
+          const std::size_t limit = LmMemoryLimit::current();
           mcfg.expert_cache_bytes = MetalQwenModel::lm_expert_cache_bytes(
-              session, model_dir, mcfg, run);
+              session, model_dir, mcfg, run, limit);
           if (mcfg.expert_cache_bytes > 0 && session != nullptr) {
             session->info(fmt("LoadedLanguageModel('{}'): the routed "
-                              "experts do not fit this box beside the rest "
-                              "-- a {} MB expert cache", model_dir,
+                              "experts do not fit {} beside the rest -- a "
+                              "{} MB expert cache", model_dir,
+                              limit > 0
+                                  ? fmt("its {} MB limit", limit >> 20)()
+                                  : std::string("this box"),
                               mcfg.expert_cache_bytes >> 20));
           }
         }
@@ -580,6 +636,25 @@ LoadedLanguageModel::LoadedLanguageModel(
         if (_impl->metal_vision) {
           _impl->metal_vision->set_session(session);
           phase_log("metal_vision_encoder (load + bind, no MLX)");
+        }
+      }
+      // DeepSeek-V4.1's ViT + aligner: an image's whole span of rows
+      // (start, cells and row breaks, end), spliced with the token ids
+      // kept (prefill_multimodal_ids: the engram hashes them).
+      if (metal_dsv41) {
+        auto* dx = dynamic_cast<MetalDeepseekV41ModelExec*>(
+            _impl->exec.get());
+        if (dx != nullptr && dx->model() != nullptr &&
+            dx->model()->config().vis_layers > 0) {
+          std::string verr;
+          _impl->metal_dsv41_vision = MetalDeepseekV41Vision::load(
+              open_weight_set(model_dir, session), mc_be,
+              dx->model()->config(), true, &verr);
+          if (!_impl->metal_dsv41_vision && session) {
+            session->warn(fmt("LoadedLanguageModel: the DeepSeek-V4.1 vision "
+                              "tower did not load ({}); image input is "
+                              "unavailable", verr));
+          }
         }
       }
       // Metal Pixtral tower + Mistral3 projector (Ministral-3). Its rows
@@ -926,6 +1001,12 @@ MetalGemma4VisionEncoder*
 LoadedLanguageModel::metal_gemma4_vision_encoder() const noexcept
 {
   return _impl ? _impl->metal_gemma4_vision.get() : nullptr;
+}
+
+MetalDeepseekV41Vision*
+LoadedLanguageModel::metal_deepseek_v41_vision() const noexcept
+{
+  return _impl ? _impl->metal_dsv41_vision.get() : nullptr;
 }
 
 MetalPixtralVisionEncoder*
@@ -1358,6 +1439,41 @@ LoadedLanguageModel::prefill_multimodal_metal(
           "metal backend (VPIPE_LLM_BACKEND=metal)"));
     }
     return -1;
+  }
+
+  // DeepSeek-V4.1: the engram hashes the token ids, so a splice goes with
+  // them -- each media row at its placeholder (the image token), the rows
+  // the tower's host f32.
+  if (auto* dx =
+          dynamic_cast<MetalDeepseekV41ModelExec*>(_impl->exec.get())) {
+    const int Hh = _impl->weights.config.hidden;
+    const std::int32_t img_id =
+        dx->model() != nullptr ? dx->model()->config().image_token : 0;
+    std::vector<std::int32_t> ids;
+    std::vector<int> positions;
+    std::vector<float> mm_rows;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      const auto& r = refs[i];
+      if (r.kind != TokenRef::Kind::ImageTokens) {
+        ids.push_back(r.text_id);
+        continue;
+      }
+      ids.push_back(img_id);
+      positions.push_back((int)i);
+      const std::size_t o = (std::size_t)r.image_token_offset * Hh;
+      if (r.embeddings_host == nullptr ||
+          o + (std::size_t)Hh > r.embeddings_host->size()) {
+        return -1;
+      }
+      mm_rows.insert(mm_rows.end(), r.embeddings_host->begin() + (long)o,
+                     r.embeddings_host->begin() + (long)(o + Hh));
+    }
+    int32_t pred = dispatch_(_impl->runtime, [&]() -> int32_t {
+      return dx->prefill_multimodal_ids(ctx._id, ids, mm_rows,
+                                        (int)positions.size(), positions);
+    });
+    if (pred >= 0) { ctx._last_predicted = pred; }
+    return pred;
   }
 
   // owns_kv metal Gemma: PLE needs the raw ids + embed_scale lives inside

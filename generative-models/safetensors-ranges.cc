@@ -4,6 +4,9 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 
 #include <fcntl.h>
+#include <libproc.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -15,6 +18,35 @@ namespace vpipe::genai {
 
 namespace fs = std::filesystem;
 
+namespace {
+
+// Room for `more` descriptors beside those open now: the soft limit raised
+// toward the hard one -- and no further than the kernel's per-process
+// ceiling, past which setrlimit refuses.
+void
+fd_room_(std::size_t more)
+{
+  struct rlimit rl{};
+  if (::getrlimit(RLIMIT_NOFILE, &rl) != 0) { return; }
+  const int n = ::proc_pidinfo(::getpid(), PROC_PIDLISTFDS, 0, nullptr, 0);
+  const std::size_t open_now =
+      n > 0 ? (std::size_t)n / sizeof(struct proc_fdinfo) : 64;
+  const rlim_t need = (rlim_t)(open_now + more + 64);
+  if (need <= rl.rlim_cur) { return; }
+  rlim_t cap = rl.rlim_max;
+  int per_proc = 0;
+  std::size_t len = sizeof(per_proc);
+  if (::sysctlbyname("kern.maxfilesperproc", &per_proc, &len, nullptr, 0) ==
+          0 &&
+      per_proc > 0) {
+    cap = std::min(cap, (rlim_t)per_proc);
+  }
+  rl.rlim_cur = std::min(cap, std::max(need, std::min(cap, (rlim_t)4096)));
+  (void)::setrlimit(RLIMIT_NOFILE, &rl);
+}
+
+}  // namespace
+
 SafetensorsRanges::~SafetensorsRanges()
 {
   for (int fd : _fds) {
@@ -24,7 +56,8 @@ SafetensorsRanges::~SafetensorsRanges()
 
 std::unique_ptr<SafetensorsRanges>
 SafetensorsRanges::open(const std::string& dir, const MetalLlamaWeights& src,
-                        std::string* err, bool cached)
+                        std::string* err, bool cached,
+                        const std::function<bool(std::string_view)>& want)
 {
   auto fail = [&](std::string m) -> std::unique_ptr<SafetensorsRanges> {
     if (err != nullptr) { *err = std::move(m); }
@@ -68,16 +101,27 @@ SafetensorsRanges::open(const std::string& dir, const MetalLlamaWeights& src,
     fidx.emplace(f, i);
     return i;
   };
+  // the tensors served and their files, the files' count first: room for
+  // their descriptors before any opens
+  std::vector<std::pair<std::string, std::string>> served;
+  std::unordered_map<std::string, int> files;
   for (const std::string& nm : src.tensor_names()) {
     const auto* ti = src.info(nm);
     // A GGUF or Draw Things tensor is converted on the way out: no range.
     if (ti == nullptr || ti->shard < 0) { continue; }
+    if (want && !want(nm)) { continue; }
     std::string f = "model.safetensors";
     if (!file_of.empty()) {
       auto it = file_of.find(nm);
       if (it == file_of.end()) { continue; }   // a tensor the index omits
       f = it->second;
     }
+    files.emplace(f, 0);
+    served.emplace_back(nm, std::move(f));
+  }
+  fd_room_(files.size());
+  for (const auto& [nm, f] : served) {
+    const auto* ti = src.info(nm);
     const int i = file_index(f);
     if (i < 0) { return fail("safetensors ranges: cannot open " + f); }
     r->_where[nm] = {i, base[(std::size_t)i] + ti->offset, ti->nbytes};
@@ -114,8 +158,9 @@ SafetensorsRanges::read(const std::string& name, std::size_t off,
     return true;
   }
   static const std::uint64_t page = (std::uint64_t)::sysconf(_SC_PAGESIZE);
-  const std::uint64_t a0 = at / page * page;
-  const std::uint64_t a1 = (at + n + page - 1) / page * page;
+  const std::uint64_t al = _align > 0 ? (std::uint64_t)_align : page;
+  const std::uint64_t a0 = at / al * al;
+  const std::uint64_t a1 = (at + n + al - 1) / al * al;
   const std::size_t span = (std::size_t)(a1 - a0);
   // One page-aligned staging buffer per thread, grown as needed.
   thread_local std::vector<std::uint8_t> stage;
@@ -126,7 +171,7 @@ SafetensorsRanges::read(const std::string& name, std::size_t off,
   while (got < span) {
     const ssize_t k = ::pread(fd, buf + got, span - got, (off_t)(a0 + got));
     if (k <= 0) {
-      // The file ends inside the last page: what was asked is all there.
+      // The file ends inside the last block: what was asked is all there.
       if (k == 0 && a0 + got >= at + n) { break; }
       return false;
     }

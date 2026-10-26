@@ -15,6 +15,13 @@
 // rounded ONCE to bf16 -- what fp8::decode_bf16 computes on the host, so
 // running the file and running its dense conversion agree to the bit
 // (shared/fp8-layout.h). The scale is one value, or one per output row.
+//
+// An INT8 weight (fp8::Format::kI8, a model that opted in) widens the
+// same way, code x scale; a ConvRot one has its CODES un-rotated in the
+// same pass, exactly, before the scale and the one rounding
+// (fp8::convrot_unrotate's arithmetic, a threadgroup a 1024 elements --
+// whole groups, since a group is a power of four no larger than that
+// and divides each row).
 
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -46,24 +53,31 @@ struct Codes {
   Format                             format  = Format::kNone;
   const metal_compute::SharedBuffer* scale   = nullptr;  // f32: 1, or N
   bool                               per_row = false;
+  int                                rot_group = 0;      // int8 ConvRot
   bool any() const noexcept {
     return format != Format::kNone && codes != nullptr;
   }
   bool scaled() const noexcept { return scale != nullptr && !scale->empty(); }
 };
 
-// The four expansion kernels (fp8_{e4m3,e5m2}_dequant[_scaled] in the
-// affine_dequant library), loaded once per model.
+// The expansion kernels (fp8_{e4m3,e5m2}_dequant[_scaled], and int8's
+// i8_dequant_scaled / i8_convrot_dequant, in the affine_dequant
+// library), loaded once per model.
 class Expander {
  public:
-  // Load them from the bf16 library. False when any is missing -- which
-  // a model storing FP8 cannot run without, so it refuses at load.
+  // Load them from the bf16 library. False when an FP8 kernel is missing
+  // -- which a model storing FP8 cannot run without, so it refuses at
+  // load. The int8 pair is OPTIONAL (kernel-contract.h): a host older
+  // than them leaves int8_valid() false and FP8 working, and a model
+  // that reads int8 refuses an int8 checkpoint there by name.
   bool load(metal_compute::MetalCompute* mc);
   bool valid() const noexcept;
+  bool int8_valid() const noexcept;
 
   // Encode codes -> `dst`, [N, K] bf16, and return true. False, with
   // nothing encoded, when the buffers are short, the element count
-  // does not fit the kernels' 32-bit index, or the kernels are absent.
+  // does not fit the kernels' 32-bit index, or the kernels are absent
+  // (for int8, int8_valid()).
   bool encode(metal_compute::ComputeEncoder& enc, const Codes& w,
               const metal_compute::SharedBuffer& dst, std::size_t N,
               std::size_t K) const;
@@ -71,6 +85,7 @@ class Expander {
  private:
   metal_compute::ComputeLibrary  _lib;
   metal_compute::ComputeFunction _e4m3, _e5m2, _e4m3_s, _e5m2_s;
+  metal_compute::ComputeFunction _i8_s, _i8_rot;   // int8; and ConvRot
 };
 
 // The scale of the FP8 weight `name` as the f32 buffer Codes::scale is:

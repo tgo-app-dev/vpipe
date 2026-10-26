@@ -521,6 +521,33 @@ MetalLlamaModel::forward(ContextId cid, std::int32_t token_id)
   return out;
 }
 
+std::size_t
+MetalLlamaModel::run_bytes(const Config& c, std::int64_t kv_tokens)
+{
+  const std::size_t n = (std::size_t)std::max<std::int64_t>(
+      1, std::min<std::int64_t>(kv_tokens, c.max_seq));
+  const std::size_t H = c.hidden, D = c.head_dim, ffn = c.ffn_inner;
+  const std::size_t qd = (std::size_t)c.n_heads * D;
+  const std::size_t kd = (std::size_t)c.n_kv_heads * D;
+  // prefill()'s buffers (the muxer's rows among them), a continued
+  // context's gathered K/V, the decode step's buffers
+  std::size_t e2 = n * (2 * H + qd + 2 * kd + qd + 2 * kd + 2 * qd + H + ffn) +
+                   32 * D + (std::size_t)c.vocab;
+  e2 += 2 * kd * n;
+  e2 += 2 * (std::size_t)c.vocab + 4 * qd + 4 * kd + 2 * ffn + 6 * H;
+  std::size_t b = 2 * e2 + 4 * (std::size_t)c.n_heads * 64 * (D + 2);
+  // the paged pool: every layer, doubling toward max_pages
+  const std::size_t pt = (std::size_t)std::max(c.page_tokens, 1);
+  const std::size_t pages =
+      ((std::size_t)std::max<std::int64_t>(kv_tokens, 1) + pt - 1) / pt;
+  std::size_t cap = std::max(pages, pages > 1 ? 2 * pages - 2 : 1);
+  if (c.max_pages > 0) { cap = std::min(cap, (std::size_t)c.max_pages); }
+  const std::size_t page = (std::size_t)c.n_kv_heads * pt * D * 2;
+  b += ((std::size_t)c.n_layers + 1) * 2 * cap * page;
+  b += (std::size_t)std::max(c.max_pages, 0) * 3 * 4;
+  return b;
+}
+
 std::vector<float>
 MetalLlamaModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
 {

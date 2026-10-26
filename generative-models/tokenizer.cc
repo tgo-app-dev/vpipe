@@ -561,6 +561,212 @@ tekken_match_one_(const char* data, size_t len, size_t pos)
 }
 
 // ---------------------------------------------------------------------
+// DeepSeek-V3 / V4 pre-tokenizer: a Sequence of three Isolated splits,
+// each applied to every piece the one before produced (a piece's
+// unmatched gaps are pieces too):
+//
+//   1. \p{N}{1,3}                         numbers, three at a time
+//   2. [一-龥぀-ゟ゠-ヿ]+   CJK / kana runs
+//   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+//    | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+//    |  ?[\p{P}\p{S}]+[\r\n]*
+//    | \s*[\r\n]+
+//    | \s+(?!\S)
+//    | \s+
+//
+// then ByteLevel without its own regex. Stage 3 is matched leftmost-
+// first as the reference's (onig) regex does, against the end of its
+// PIECE, not the text.
+// ---------------------------------------------------------------------
+
+bool
+is_punct_sym_(uint32_t cp)
+{
+  if (cp < 0x80) {
+    return (cp >= 0x21 && cp <= 0x2F) || (cp >= 0x3A && cp <= 0x40) ||
+           (cp >= 0x5B && cp <= 0x60) || (cp >= 0x7B && cp <= 0x7E);
+  }
+  static const CFCharacterSetRef punct =
+      CFCharacterSetGetPredefined(kCFCharacterSetPunctuation);
+  static const CFCharacterSetRef sym =
+      CFCharacterSetGetPredefined(kCFCharacterSetSymbol);
+  const auto c = static_cast<UTF32Char>(cp);
+  return CFCharacterSetIsLongCharacterMember(punct, c) ||
+         CFCharacterSetIsLongCharacterMember(sym, c);
+}
+
+bool
+ds_cjk_(uint32_t cp)
+{
+  return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x309F) ||
+         (cp >= 0x30A0 && cp <= 0x30FF);
+}
+
+// Stage 3's match at `pos` of the piece [0, len): its byte length, 0 if
+// no alternative matches there.
+size_t
+deepseek_match_one_(const char* data, size_t len, size_t pos)
+{
+  auto at = [&](size_t p, size_t* cl) { return utf8_next_(data, len, p, cl); };
+  auto is_l = [](UCls c) {
+    return c == UCls::Upper || c == UCls::Lower || c == UCls::LetterOther;
+  };
+  auto is_lm = [&](uint32_t cp) {
+    const UCls c = uni_class_(cp);
+    return is_l(c) || c == UCls::Mark;
+  };
+  auto is_ws = [](uint32_t cp) { return uni_class_(cp) == UCls::Space; };
+  // the end of the maximal run of `pred` from p
+  auto run = [&](size_t p, auto pred) {
+    while (p < len) {
+      size_t cl;
+      if (!pred(at(p, &cl))) { break; }
+      p += cl;
+    }
+    return p;
+  };
+  size_t cl0;
+  const uint32_t c0 = at(pos, &cl0);
+  // A1: an ASCII punctuation mark, then ASCII letters
+  if (c0 < 0x80 && is_punct_sym_(c0)) {
+    const size_t e = run(pos + cl0, [](uint32_t c) {
+      return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    });
+    if (e > pos + cl0) { return e - pos; }
+  }
+  // A2: an optional lead (not CR / LF / L / P / S), then L / M
+  {
+    const UCls k0 = uni_class_(c0);
+    const bool lead = c0 != '\r' && c0 != '\n' && !is_l(k0) &&
+                      !is_punct_sym_(c0);
+    if (lead) {
+      const size_t e = run(pos + cl0, is_lm);
+      if (e > pos + cl0) { return e - pos; }
+    }
+    if (is_lm(c0)) { return run(pos, is_lm) - pos; }
+  }
+  // A3: an optional space, punctuation / symbols, then CR / LF
+  {
+    size_t p = pos;
+    if (c0 == ' ' && pos + 1 < len) {
+      size_t cl;
+      if (is_punct_sym_(at(pos + 1, &cl))) { p = pos + 1; }
+    }
+    const size_t e = run(p, [](uint32_t c) { return is_punct_sym_(c); });
+    if (e > p) {
+      return run(e, [](uint32_t c) { return c == '\r' || c == '\n'; }) -
+             pos;
+    }
+  }
+  if (!is_ws(c0)) { return 0; }
+  const size_t e = run(pos, is_ws);
+  // A4: whitespace through its last CR / LF
+  {
+    size_t last = std::string::npos;
+    for (size_t p = pos; p < e;) {
+      size_t cl;
+      const uint32_t c = at(p, &cl);
+      if (c == '\r' || c == '\n') { last = p + cl; }
+      p += cl;
+    }
+    if (last != std::string::npos) { return last - pos; }
+  }
+  // A5: whitespace not followed by a non-space: all of it at the piece's
+  // end, else all but its last character (if that leaves any)
+  if (e == len) { return e - pos; }
+  {
+    size_t prev = pos, p = pos;
+    while (p < e) {
+      size_t cl;
+      (void)at(p, &cl);
+      prev = p;
+      p += cl;
+    }
+    if (prev > pos) { return prev - pos; }
+  }
+  // A6
+  return e - pos;
+}
+
+vector<string>
+deepseek_pre_split_(string_view text)
+{
+  auto cps = [](string_view t, auto&& f) {
+    size_t p = 0;
+    while (p < t.size()) {
+      size_t cl;
+      const uint32_t c = utf8_next_(t.data(), t.size(), p, &cl);
+      f(p, cl, c);
+      p += cl;
+    }
+  };
+  // 1. numbers, isolated in runs of at most three
+  vector<string> s1;
+  {
+    string gap, num;
+    int nnum = 0;
+    cps(text, [&](size_t p, size_t cl, uint32_t c) {
+      if (uni_class_(c) == UCls::Number) {
+        if (!gap.empty()) { s1.push_back(std::move(gap)); gap.clear(); }
+        num.append(text.data() + p, cl);
+        if (++nnum == 3) {
+          s1.push_back(std::move(num));
+          num.clear();
+          nnum = 0;
+        }
+      } else {
+        if (!num.empty()) {
+          s1.push_back(std::move(num));
+          num.clear();
+          nnum = 0;
+        }
+        gap.append(text.data() + p, cl);
+      }
+    });
+    if (!gap.empty()) { s1.push_back(std::move(gap)); }
+    if (!num.empty()) { s1.push_back(std::move(num)); }
+  }
+  // 2. CJK / kana runs, isolated
+  vector<string> s2;
+  for (const string& piece : s1) {
+    string cur;
+    int kind = -1;                  // 1 inside a run, 0 outside
+    cps(piece, [&](size_t p, size_t cl, uint32_t c) {
+      const int k = ds_cjk_(c) ? 1 : 0;
+      if (k != kind && !cur.empty()) {
+        s2.push_back(std::move(cur));
+        cur.clear();
+      }
+      kind = k;
+      cur.append(piece.data() + p, cl);
+    });
+    if (!cur.empty()) { s2.push_back(std::move(cur)); }
+  }
+  // 3. the main split, matched per piece, gaps kept
+  vector<string> out;
+  for (const string& piece : s2) {
+    const char* d = piece.data();
+    const size_t n = piece.size();
+    size_t pos = 0, gap = 0;
+    while (pos < n) {
+      const size_t m = deepseek_match_one_(d, n, pos);
+      if (m == 0) {
+        size_t cl;
+        (void)utf8_next_(d, n, pos, &cl);
+        pos += cl;
+        continue;
+      }
+      if (pos > gap) { out.emplace_back(d + gap, pos - gap); }
+      out.emplace_back(d + pos, m);
+      pos += m;
+      gap = pos;
+    }
+    if (n > gap) { out.emplace_back(d + gap, n - gap); }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------
 // Byte-level alphabet (the GPT-2 / HF byte_level mapping)
 // ---------------------------------------------------------------------
 //
@@ -684,7 +890,9 @@ public:
 
   int32_t     vocab_size() const noexcept { return _vocab_size; }
   bool        has_pre_tokenizer() const noexcept
-  { return _use_llama3_pre || !_pre_regexes.empty(); }
+  {
+    return _use_llama3_pre || _use_deepseek_pre || !_pre_regexes.empty();
+  }
   size_t      merge_count() const noexcept { return _merge_priority.size(); }
   size_t      special_count() const noexcept { return _special_by_name.size(); }
 
@@ -715,6 +923,8 @@ private:
   // digits, no contractions); pre_tokenize_ hands it to
   // tekken_match_one_. Takes precedence over _use_llama3_pre.
   bool                                                      _use_tekken_pre = false;
+  // DeepSeek-V3 / V4's three-stage split (deepseek_pre_split_).
+  bool _use_deepseek_pre = false;
   // BPE `ignore_merges` (Tekken sets it): a pre-token whose byte-level
   // spelling is itself a vocab entry is emitted as that one token,
   // without running the merges -- which need not reach it.
@@ -1187,6 +1397,14 @@ Tokenizer::Impl::parse(const FlexData&            root,
     auto pre = rootobj.at("pre_tokenizer");
     vector<string> patterns;
     collect_split_regexes_(pre, &patterns);
+    // DeepSeek-V3 / V4: digits, then CJK runs, then the punctuation /
+    // symbol aware split -- the three as one hand-coded scanner.
+    if (patterns.size() == 3 && patterns[0] == "\\p{N}{1,3}" &&
+        patterns[1].rfind("[\u4e00-\u9fa5", 0) == 0 &&
+        patterns[2].find("[\\p{P}\\p{S}]") != string::npos) {
+      _use_deepseek_pre = true;
+      patterns.clear();
+    }
     for (const auto& p : patterns) {
       // Mistral Tekken: the only pattern here that names the letter
       // CASE classes (see tekken_match_one_).
@@ -1610,6 +1828,7 @@ Tokenizer::Impl::metaspace_decode_(const string& s) const
 vector<string>
 Tokenizer::Impl::pre_tokenize_(string_view text) const
 {
+  if (_use_deepseek_pre) { return deepseek_pre_split_(text); }
   if (_use_tekken_pre) {
     vector<string> out;
     const char* data = text.data();

@@ -11,6 +11,7 @@
 #include "pipeline/typed-stage.h"
 #include "plugin/plugin-abi.h"
 #include "plugin/plugin-context.h"
+#include "stages/model-source.h"
 
 #include <string>
 #include <utility>
@@ -78,6 +79,14 @@ void
 plugin_register(vpipe::VpipePluginContext* ctx)
 {
   ctx->register_stage<PluginEchoStage>(&kSpec);
+  // Where a mirror keeps this plugin's (fictional) model: registered
+  // while the plugin loads, so held until the host admits it -- the
+  // loader test reads it back afterwards. A weak import, so asked for.
+  if (vpipe::model_sources_available()) {
+    vpipe::register_mirror_repos({{.source = "modelscope",
+                                   .hf_path = "plugin-echo/echo-model",
+                                   .path = "plugin-echo-cn/echo-model"}});
+  }
 }
 
 }  // namespace

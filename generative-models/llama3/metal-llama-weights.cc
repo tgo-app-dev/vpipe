@@ -394,6 +394,10 @@ namespace {
 // checkpoint WHOLE or not at all.
 //
 //   krea2::translate_native    Krea-2 in Krea's own naming (single files)
+//   minimax_h3::translate_comfy_prefix
+//                              a MiniMax-H3 DiT ComfyUI saved: its
+//                              `model.diffusion_model.` prefix dropped
+//                              (single files)
 //   fp8::translate_torchao     torchao's `_weight_qdata`/`_weight_scale`
 //                              FP8 spelling -> the comfy_quant one
 //   minimax_h3::translate_diffusers
@@ -406,7 +410,10 @@ void
 translate_names_(std::optional<MetalLlamaWeights>& w, bool single_file)
 {
   if (!w.has_value()) { return; }
-  if (single_file) { (void)krea2::translate_native(*w); }
+  if (single_file) {
+    (void)krea2::translate_native(*w);
+    (void)minimax_h3::translate_comfy_prefix(*w);
+  }
   (void)fp8::translate_torchao(*w);
   (void)minimax_h3::translate_diffusers(*w);
   (void)minimax_h3::translate_diffusers_vae(*w);

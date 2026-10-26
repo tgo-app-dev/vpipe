@@ -442,6 +442,65 @@ builtin_catalog_()
      .variant = "MLX oQ8e, MTP (mlx-community)",
      .hf_path = "mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp",
      .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // DeepSeek-V4.1-Flash (model_type deepseek_v41; 552B backbone, 8B / 16B
+    // active in prefill / decode): hyper-connections, compressed sparse
+    // attention with a two-level indexer, engram n-gram tables (read by
+    // row), 384 FP4 experts a layer (289 GB, run from a cache on any box
+    // smaller than the model), the FP8 projections held as stored. MIT.
+    // oMLX's oQ4e pack of the 1017 update first (432 GB): that release's
+    // FP4 experts and FP8 projections (MXFP4 / MXFP8, the same codes), the
+    // n-gram tables affine at 4 bits (123 GB against 203).
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ4e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // oQ below 4 bits: the backbone's experts requantized to MLX's affine
+    // codes in groups of 64 -- 2 bits (oQ2e: 170 GB of experts, every one
+    // resident on a 256 GB box), 2 and 3 by layer (oQ2.5e: 199 GB), 3
+    // (oQ3e: 238 GB) -- and its FP8 projections to affine 4-8 bits; the
+    // DSpark head as oQ4e's. 313 / 343 / 380 GB.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2.5e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ3e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ3e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // Each pack's -ngram twin: the n-gram tables in the release's FP8 (203
+    // GB against 123; read by row, never resident): 393 / 423 / 460 / 512
+    // GB.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2.5e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ3e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ3e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ4e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // The releases as DeepSeek published them (FP8 n-gram tables): 510 GB
+    // each. 1017 is a minor update of the weights alone -- its code,
+    // config and tokenizer are the first release's, byte for byte.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, FP8 / FP4 (deepseek-ai)",
+     .hf_path = "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "FP8 / FP4 (deepseek-ai)",
+     .hf_path = "deepseek-ai/DeepSeek-V4.1-Flash",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
@@ -2843,6 +2902,9 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   if (mt == "qwen3.5" || mt == "qwen3.6") {
     set({"text", "image", "video"}, {"text"});
   } else if (mt == "qwen3.8-flash") {
+    // Its vision tower is not wired yet: text in, text out.
+    set({"text"}, {"text"});
+  } else if (mt == "deepseek-v4.1") {
     // Its vision tower is not wired yet: text in, text out.
     set({"text"}, {"text"});
   } else if (mt == "qwen3-asr") {

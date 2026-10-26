@@ -2,6 +2,7 @@
 #include "plugin/plugin-abi.h"
 #include "plugin/plugin-context.h"
 #include "pipeline/stage-registry.h"
+#include "stages/model-source-host.h"
 
 #include "common/library-handle.h"
 #include "common/vpipe-format.h"
@@ -234,11 +235,19 @@ PluginManager::load(const SessionContextIntf* session, std::string_view path)
   const StageTypeId first_type = StageRegistry::get().next_id();
 
   // And everything registered while it loads is QUARANTINED until the
-  // handshake below passes -- withdrawn on every path that refuses it.
+  // handshake below passes -- withdrawn on every path that refuses it:
+  // its stage types and specs, and the mirror rows it adds (a first-wins
+  // table, where a refused plugin's row would otherwise outrank the next
+  // plugin's for good).
   StageRegistry::get().begin_quarantine();
+  begin_mirror_quarantine();
   struct Quarantine {
     bool admit = false;
-    ~Quarantine() { StageRegistry::get().end_quarantine(admit); }
+    ~Quarantine()
+    {
+      StageRegistry::get().end_quarantine(admit);
+      end_mirror_quarantine(admit);
+    }
   } quarantine;
 
   // dlopen (Optional: warns + valid()==false on failure, never throws).

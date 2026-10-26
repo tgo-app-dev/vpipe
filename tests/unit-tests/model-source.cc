@@ -1,6 +1,7 @@
 #include "minitest.h"
 #include "stages/model-catalog.h"
-#include "stages/model-source.h"
+#include "stages/model-source-host.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 
 #include <algorithm>
@@ -216,6 +217,57 @@ TEST(model_source, mirror_registration_is_first_wins) {
   EXPECT_TRUE(mirror_repo("modelscope", "MiniMaxAI/MiniMax-H3", out)
               == MirrorStatus::Renamed);
   EXPECT_TRUE(out == "MiniMax/MiniMax-H3");
+}
+
+// Rows registered while a plugin loads are held until the host admits it
+// (the plugin manager brackets each load), dropped when it refuses it --
+// and first-wins still holds against what was published meanwhile.
+TEST(model_source, mirror_rows_wait_for_the_plugin) {
+  string out;
+  begin_mirror_quarantine();
+  EXPECT_TRUE(register_mirror_repos({
+      {.source = "modelscope", .hf_path = "example/refused-plugin",
+       .path = "mirror-owner/refused-plugin"},
+  }) == 1);
+  // held: not answered yet
+  EXPECT_TRUE(mirror_repo("modelscope", "example/refused-plugin", out)
+              == MirrorStatus::Same);
+  end_mirror_quarantine(false);
+  EXPECT_TRUE(mirror_repo("modelscope", "example/refused-plugin", out)
+              == MirrorStatus::Same);
+  EXPECT_TRUE(out == "example/refused-plugin");
+  // the next plugin may take the repo the refused one claimed
+  begin_mirror_quarantine();
+  EXPECT_TRUE(register_mirror_repos({
+      {.source = "modelscope", .hf_path = "example/refused-plugin",
+       .path = "other-owner/refused-plugin"},
+      {.source = "modelscope", .hf_path = "MiniMaxAI/MiniMax-H3",
+       .path = "hijacked/elsewhere"},      // built in: not taken
+  }) == 1);
+  end_mirror_quarantine(true);
+  EXPECT_TRUE(mirror_repo("modelscope", "example/refused-plugin", out)
+              == MirrorStatus::Renamed);
+  EXPECT_TRUE(out == "other-owner/refused-plugin");
+  EXPECT_TRUE(mirror_repo("modelscope", "MiniMaxAI/MiniMax-H3", out)
+              == MirrorStatus::Renamed);
+  EXPECT_TRUE(out == "MiniMax/MiniMax-H3");
+  // a row carrying keys the host does not know reads as one without them
+  FlexData extra;
+  bag::set_flag(extra, "future_key", true);
+  EXPECT_TRUE(register_mirror_repos({
+      {.source = "modelscope", .hf_path = "example/with-extra",
+       .path = "", .extra = extra},
+  }) == 1);
+  EXPECT_TRUE(mirror_repo("modelscope", "example/with-extra", out)
+              == MirrorStatus::Absent);
+}
+
+// What a host shows for each source it offers.
+TEST(model_source, labels_by_name) {
+  EXPECT_TRUE(model_source_label("huggingface") == "HuggingFace");
+  EXPECT_TRUE(model_source_label("modelscope") == "ModelScope");
+  EXPECT_TRUE(model_source_label("no-such-source").empty());
+  EXPECT_TRUE(model_sources_available());
 }
 
 // ModelScope's web URL carries a "models/" segment that HuggingFace's

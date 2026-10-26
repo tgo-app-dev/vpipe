@@ -56,6 +56,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Which Turbo adapters work](#which-turbo-adapters-work)
     - [Community LoRAs — Civitai, musubi-tuner, ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
   - [FP8 checkpoints — lightx2v's turbo DiT](#fp8-checkpoints--lightx2vs-turbo-dit)
+  - [int8 checkpoints — community DiTs saved by ComfyUI](#int8-checkpoints--community-dits-saved-by-comfyui)
   - [Eight steps — HyperFlow](#eight-steps--hyperflow)
     - [Fetch it, then name it](#fetch-it-then-name-it)
     - [What makes it different](#what-makes-it-different)
@@ -2086,6 +2087,75 @@ Not supported: Comfy-Org's `…_pruned_fp8_scaled` files. The FP8 in them
 reads, but *pruned* H3 is a different network (a table-driven AdaLN in
 place of the time embedder), and this build does not run it in any
 precision.
+
+### int8 checkpoints — community DiTs saved by ComfyUI
+
+A community fine-tune of H3 is usually one `.safetensors` that **ComfyUI
+saved**, often requantized to int8 on the way (silveroxides'
+`convert_to_quant --int8 --convrot --comfy_quant`). Such a file is
+ComfyUI's model state:
+
+- every name is this model's own, under `model.diffusion_model.`;
+- there is no config and no metadata;
+- the fused `qkv_proj` is in ComfyUI's **flat** order, `[all q | all k |
+  all v]`, in the main blocks and the token refiner alike. This was
+  checked row against row on a community int8 file, against the
+  released per-head DiT.
+
+Point `generate-video`'s `dit_dir` at the file, as for lightx2v's FP8 one.
+The prefix is dropped when the file is opened, the dimensions are read
+off the tensors, and the qkv is read flat. A file saved this way is
+recognised by its prefix. A fused, unprefixed file with no config is
+refused, because nothing in it says which order its qkv is in.
+
+**int8.** Each quantized projection is a `comfy_quant` record,
+`{"format": "int8_tensorwise", ...}`, over `I8` codes and their
+`weight_scale` (one value, or one per row). Its value is code × scale.
+With `"convrot": true` the codes quantize the weight **rotated**:
+comfy_kitchen's ConvRot. Each group of `convrot_groupsize` input columns
+(256; 64 where 256 does not divide them, as in the AdaLN projections) is
+multiplied by Hᵀ, where H is the normalized *regular* Hadamard: Kronecker
+powers of `[[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]`. Read as plain
+codes, a rotated row has the right length and the wrong direction
+(cosine about 0.05 with the weight it came from), so the rotation has to
+come off.
+
+The codes stay int8 in memory and are widened per GEMM, as FP8's are. The
+widening un-rotates the **codes** before it scales them: a row's scale is
+common to its groups, and integer codes stay integers through the
+rotation (under 2²⁴ in magnitude), so that part is exact. Each value is
+then code-sum × scale / √group, rounded once to bf16 — the host decode's
+bf16 bit for bit, and within one bf16 rounding of comfy_kitchen's
+`dequantize_int8_convrot_weight` (checked against the matrix built as
+comfy_kitchen builds it). A threadgroup takes 1024 elements, one radix-4
+stage per base-4 digit of the index. Run-time LoRAs apply over the
+widened weight. The ANE leaves int8 projections to the GPU, and the
+int8 GEMM tiers leave them on the accurate route, as they do FP8. Only
+models that opt in read int8; for every other reader, LoRA files
+included, it stays refused by name. A host built before these kernels
+runs FP8 checkpoints as before and refuses an int8 one by name.
+
+MEASURED on an M5 Pro (24 GB) with H3's **Ref2VA** DiT requantized this
+way (34.0 GB against 66.3 GB of bf16). The run was 832×480×39 at seed 7,
+8 steps with the Ref2VA 8-step LoRA and Sol + Sage + int8 GEMMs, the DiT
+streaming in both runs:
+
+- **Speed:** the denoise took the same time with either DiT: about 80 s
+  to reach 90%.
+- **Memory:** the resource plan's figure for the DiT dropped from
+  126.8 GB to 32.5 GB.
+- **Picture:** the clips are the same shot, framing and light, at 34.0 dB
+  mean PSNR (32.4 worst) frame for frame. The details move as two
+  samples' do. This is one seed: it shows the weights are H3's, not that
+  one rounding is closer than another. The same run with the codes
+  un-rotated in f32 after scaling gave 29.8 dB.
+
+The file's partition is its fine-tune's, and nothing in the file says
+which it is. `dit_dir` does not choose it: the graph's model record does,
+as for the released weights (see
+[The released weights, either partition](#the-released-weights-either-partition)).
+For a Ref2VA-based file, select a record registered with
+`model_type: minimax-h3-ref2va`; a bare path is taken as FL2VA.
 
 ### Eight steps — HyperFlow
 

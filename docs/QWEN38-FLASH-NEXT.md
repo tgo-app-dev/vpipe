@@ -94,12 +94,13 @@ vision tower runs, which the chat books when it starts.
 
 - **Speculative decoding** (`mtp`, on by default). The model's own draft
   head guesses ahead and the model checks the guesses in one pass,
-  keeping the ones it agrees with. It guesses three tokens where experts
-  come from the drive -- a check's extra rows are cheap beside the reads
-  -- and one where every expert is in memory, where each extra row costs
-  about a third of a step. The output is the model's own, token for
-  token, greedy or sampled; only the speed changes. The draft head is
-  primed with the prompt as it is read (`mtp_prefix_seed`, on by default).
+  keeping the ones it agrees with. How many it guesses (none to three) is
+  measured as it decodes: what each extra checked row costs against a
+  plain step, and how often a guess at each position is kept -- the
+  answer moves with the machine, how much of the model is in memory, and
+  the text. The output is the model's own, token for token, greedy or
+  sampled; only the speed changes. The draft head is primed with the
+  prompt as it is read (`mtp_prefix_seed`, on by default).
 - **Context copy** (with the draft head; `VPIPE_QWEN_HC_COPY=0` turns it
   off). When the reply's last six tokens occurred earlier in the
   conversation, the next pass checks the tokens that followed them there
@@ -143,12 +144,14 @@ drafter's forward and the check are two command buffers rather than one.
 ## What to expect
 
 Measured on an **M4 Pro, 64 GB**, the checkpoint on the internal SSD, the
-engine giving the expert cache ~50 GB:
+expert cache ~46 GB, 128 greedy tokens:
 
 | | |
 |---|---|
-| decode, a fresh conversation (the cache still filling) | 6.4 tok/s; 7.3 with the draft head |
-| decode, experts already cached | ~19 tok/s; ~23 with the draft head |
+| decode right after the first prompt (the cache still filling) | ~11 tok/s (88-97 ms a token); ~13 with the draft head |
+| decode, experts already cached | ~23 tok/s (44 ms a token); ~27-29 with the draft head |
+| an 8,192-token prompt, the cache empty | 34-38 s |
+| a 16,384-token prompt, the cache empty | 59 s |
 | a 982-token image turn: prefill | 28 s |
 
 With the DFlash 2 drafter, on a math word problem through the chat
@@ -173,7 +176,8 @@ lacks waits for a ~3 MB read. A machine whose memory holds every expert
 decodes several times faster.
 
 Measured on an **M5 Ultra, 256 GB**, every expert in memory (the oQ5e
-checkpoint, greedy, the draft head guessing one token a pass):
+checkpoint, greedy, the draft head pinned to one guess a pass -- the
+count that measured fastest there):
 
 | | plain decode | with the draft head |
 |---|---:|---:|

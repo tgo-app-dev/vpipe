@@ -28,6 +28,7 @@
 #include <deque>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -846,16 +847,27 @@ thread_local std::size_t t_wired      = 0;
 // buffer freed after the outermost one closes was the load's to keep.
 thread_local std::unordered_map<const void*, std::size_t> t_live;
 thread_local std::size_t t_live_bytes = 0;
+// The live total past which nothing more is wired (the rooms of the open
+// scopes, the smallest), and what that left unwired.
+constexpr std::size_t    kNoRoomEnd  = std::numeric_limits<std::size_t>::max();
+thread_local std::size_t t_room_end  = kNoRoomEnd;
+thread_local std::size_t t_held_back = 0;
 }  // namespace
 
-WireOnAlloc::WireOnAlloc() noexcept
-    : _start(t_wired), _start_live(t_live_bytes)
+WireOnAlloc::WireOnAlloc(std::size_t room) noexcept
+    : _start(t_wired), _start_live(t_live_bytes), _start_held(t_held_back),
+      _outer_end(t_room_end)
 {
   ++t_wire_depth;
+  const std::size_t end = room > kNoRoomEnd - t_live_bytes
+                              ? kNoRoomEnd
+                              : t_live_bytes + room;
+  if (end < t_room_end) { t_room_end = end; }
 }
 
 WireOnAlloc::~WireOnAlloc()
 {
+  t_room_end = _outer_end;
   if (--t_wire_depth == 0) {
     t_live.clear();
     t_live_bytes = 0;
@@ -866,6 +878,23 @@ bool
 WireOnAlloc::active() noexcept
 {
   return t_wire_depth > 0;
+}
+
+bool
+WireOnAlloc::may_wire(std::size_t bytes) noexcept
+{
+  if (t_wire_depth == 0) { return false; }
+  if (bytes <= t_room_end && t_live_bytes <= t_room_end - bytes) {
+    return true;
+  }
+  t_held_back += bytes;
+  return false;
+}
+
+std::size_t
+WireOnAlloc::live_now() noexcept
+{
+  return t_wire_depth > 0 ? t_live_bytes : 0;
 }
 
 void
@@ -903,6 +932,12 @@ WireOnAlloc::live_bytes() const noexcept
   // Clamped: an outer scope's buffer freed inside this one leaves the
   // total below where this scope started.
   return t_live_bytes > _start_live ? t_live_bytes - _start_live : 0;
+}
+
+std::size_t
+WireOnAlloc::held_back_bytes() const noexcept
+{
+  return t_held_back - _start_held;
 }
 
 SharedBuffer
@@ -979,8 +1014,10 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   // Inside a WireOnAlloc scope: wired before anything is written, so the
   // compressor never takes it (wire-on-alloc.h). Not a heap slice: its
   // pages are the heap's, shared with whatever else lives there.
+  // Within the scope's room (the wired pool's): past it, left unwired.
   if (WireOnAlloc::active() && !from_heap &&
-      byte_size >= WireOnAlloc::kMinBytes && out.set_wired(true)) {
+      byte_size >= WireOnAlloc::kMinBytes &&
+      WireOnAlloc::may_wire(byte_size) && out.set_wired(true)) {
     WireOnAlloc::note_wired(out.contents(), byte_size);
   }
   pool->release();

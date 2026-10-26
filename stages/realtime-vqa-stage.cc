@@ -725,11 +725,23 @@ std::vector<ResourceClaim>
 RealtimeVqaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  // The LM (streamable when it is a Mixture of Experts) and its GPU
-  // vision tower at a frame's budget (vlm_max_soft_tokens, else ~1 MP) --
-  // none when a CoreML tower stands in for it.
+  // The LM (streamable when it is a Mixture of Experts), what it runs in
+  // -- a scene's context (its frames' grids, at most max_frames_per_scene
+  // of them at a frame's budget) and a branch of it per question, its turn
+  // and answer -- and its GPU vision tower at a frame's budget
+  // (vlm_max_soft_tokens, else ~1 MP) -- none when a CoreML tower stands
+  // in for it.
+  const std::int64_t frame_tokens =
+      _vlm_max_soft_tokens > 0 ? _vlm_max_soft_tokens
+                               : kQwenFramePixels / (28 * 28);
+  genai::LmRunShape run;
+  run.page_tokens = _page_tokens;
+  run.max_pages = genai::LoadSpec{}.max_pages;   // the pool load() asks
+  run.kv_tokens = frame_tokens * _max_frames_per_scene + 1024;
+  run.contexts = 1 + (int)_questions.size();
+  run.branch_tokens = (std::int64_t)_max_new_tokens + 256;
   return model_memory::lm_claims(
-      session(), resolve_model_dir(session(), _hf_dir), id(),
+      session(), resolve_model_dir(session(), _hf_dir), id(), run,
       _coreml_vision_path.empty() ? kQwenFramePixels : -1,
       _coreml_vision_path.empty() ? _vlm_max_soft_tokens : 0);
 }

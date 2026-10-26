@@ -85,6 +85,7 @@ stages/model-catalog.h
 stages/model-config-source.h
 stages/model-memory.h
 stages/model-registry.h
+stages/model-source.h
 ui/ui-view-registry.h
 vpipe/pipeline-handle.h
 vpipe/session-intf.h
@@ -452,6 +453,14 @@ record vpipe::MemoryPlanStep
   40 | class vpipe::FlexData extra
   | [sizeof=48, dsize=48, align=8,
   | nvsize=48, nvalign=8]
+record vpipe::MirrorEntry
+  0 | struct vpipe::MirrorEntry
+  0 | std::string source
+  24 | std::string hf_path
+  48 | std::string path
+  72 | class vpipe::FlexData extra
+  | [sizeof=80, dsize=80, align=8,
+  | nvsize=80, nvalign=8]
 record vpipe::ModelCatalogEntry
   0 | struct vpipe::ModelCatalogEntry
   0 | std::string family
@@ -917,6 +926,15 @@ record vpipe::genai::GenerativeModelManager::SwapSupply
   32 | std::size_t spare
   | [sizeof=40, dsize=40, align=8,
   | nvsize=40, nvalign=8]
+record vpipe::genai::GenerativeModelManager::WarmUsage
+  0 | struct vpipe::genai::GenerativeModelManager::WarmUsage
+  0 | std::string kind
+  24 | std::string dir
+  48 | std::size_t bytes
+  56 | std::size_t kv_bytes
+  64 | double seconds
+  | [sizeof=72, dsize=72, align=8,
+  | nvsize=72, nvalign=8]
 record vpipe::genai::GenerativeModelManager::WeightUsage
   0 | struct vpipe::genai::GenerativeModelManager::WeightUsage
   0 | std::string dir
@@ -2442,6 +2460,7 @@ vpipe::RuntimeContext::~RuntimeContext()
 vpipe::SessionContextIntf::services() const
 vpipe::SessionIntf::drop_chat_context(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::SessionIntf::load_pipeline(vpipe::FlexData const&)
+vpipe::SessionIntf::memory_report() const
 vpipe::SessionIntf::progress() const
 vpipe::SessionIntf::progress_version() const
 vpipe::SessionIntf::release_idle_models()
@@ -2741,6 +2760,7 @@ vpipe::genai::GenerativeModelManager::warm_count() const
 vpipe::genai::GenerativeModelManager::warm_dirs() const
 vpipe::genai::GenerativeModelManager::warm_kv_bytes() const
 vpipe::genai::GenerativeModelManager::warm_model_bytes(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
+vpipe::genai::GenerativeModelManager::warm_report() const
 vpipe::genai::GenerativeModelManager::weight_report() const
 vpipe::genai::GenerativeModelManager::weight_set(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::GenerativeModelManager::weight_set_count() const
@@ -3128,6 +3148,7 @@ vpipe::metal_compute::account_alloc_(unsigned long)
 vpipe::metal_compute::account_free_(unsigned long)
 vpipe::metal_compute::shared_buffer_memory_stats()
 vpipe::metal_compute::shared_buffer_reset_peak()
+vpipe::mirror_repo(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>&)
 vpipe::model_catalog()
 vpipe::model_dir_available(vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::model_memory::bounded(vpipe::SessionContextIntf const*, std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>> const&, unsigned long)
@@ -3155,6 +3176,8 @@ vpipe::model_memory::weight_claim_streamable(std::__1::basic_string<char, std::_
 vpipe::model_memory::weight_claims(std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>)
 vpipe::model_memory::weight_claims_in_phase(std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::model_memory::weight_footprint(vpipe::SessionContextIntf const*, std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>> const&, std::__1::basic_string_view<char, std::__1::char_traits<char>>)
+vpipe::model_source_label(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
+vpipe::model_source_names()
 vpipe::normalize_hf_path(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::normalize_language(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::null_session_services()
@@ -3166,6 +3189,7 @@ vpipe::perf_flops::totals(vpipe::perf_flops::Unit)
 vpipe::port_tags_compatible(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::register_catalog_entries(std::__1::vector<vpipe::ModelCatalogEntry, std::__1::allocator<vpipe::ModelCatalogEntry>>)
 vpipe::register_channel_types(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>)
+vpipe::register_mirror_repos(std::__1::vector<vpipe::MirrorEntry, std::__1::allocator<vpipe::MirrorEntry>>)
 vpipe::resolve_adapter_file(vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::resolve_config_params(std::__1::span<vpipe::ConfigKey const, 18446744073709551615ul>, vpipe::FlexData const&)
 vpipe::resolve_model(vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
@@ -3223,6 +3247,9 @@ vpipe::genai::accel::kMotionCacheThreshold = "motion_cache_threshold"
 vpipe::genai::accel::kMotionCacheWarmup = "motion_cache_warmup"
 vpipe::genai::accel::kSageAttn = "sage_attn"
 vpipe::genai::accel::kSageDenseLayers = "sage_dense_layers"
+vpipe::genai::accel::kSagePv8 = "sage_pv8"
+vpipe::genai::accel::kSagePv8AllRows = "sage_pv8_all_rows"
+vpipe::genai::accel::kSagePv8FromStep = "sage_pv8_from_step"
 vpipe::genai::accel::kSolAttn = "sol_attn"
 vpipe::genai::accel::kSolDenseLayers = "sol_dense_layers"
 vpipe::genai::accel::kSolKeyBlock = "sol_key_block"
@@ -3307,11 +3334,19 @@ vpipe::genai::gpu_sampler::kPrime = "prime"
 vpipe::genai::kOutputPreviewX0 = "preview_x0"
 vpipe::genai::load_spec::kDraftBits = "draft_bits"
 vpipe::genai::load_spec::kDraftDir = "draft_dir"
+vpipe::genai::load_spec::kMemoryLimitMb = "memory_limit_mb"
 vpipe::genai::load_spec::kMtpDir = "mtp_dir"
 vpipe::genai::load_spec::kWireWeights = "wire_weights"
 vpipe::genai::model_config::kDefaultSystemPrompt = "default_system_prompt"
+vpipe::genai::model_config::kQuantization = "quantization"
+vpipe::genai::model_config::kReasoningEffortControl = "reasoning_effort_control"
 vpipe::genai::model_config::kRopeParameters = "rope_parameters"
+vpipe::genai::model_config::kTextConfig = "text_config"
 vpipe::genai::model_config::kVisionImageSize = "vision.image_size"
+vpipe::genai::model_config::kVisionMaxPixels = "vision.max_pixels"
+vpipe::genai::model_config::kVisionMinPixels = "vision.min_pixels"
+vpipe::genai::model_config::kVisionVideoMaxPixels = "vision.video_max_pixels"
+vpipe::genai::model_config::kVisionVideoMinPixels = "vision.video_min_pixels"
 vpipe::genai::named_tensor::kBf16 = "bf16"
 vpipe::genai::named_tensor::kDtype = "dtype"
 vpipe::genai::named_tensor::kF16 = "f16"

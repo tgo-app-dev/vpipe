@@ -23,6 +23,8 @@ Expander::load(MetalCompute* mc)
   _e5m2   = _lib.function("fp8_e5m2_dequant");
   _e4m3_s = _lib.function("fp8_e4m3_dequant_scaled");
   _e5m2_s = _lib.function("fp8_e5m2_dequant_scaled");
+  _i8_s   = _lib.function("i8_dequant_scaled");
+  _i8_rot = _lib.function("i8_convrot_dequant");
   return valid();
 }
 
@@ -31,6 +33,12 @@ Expander::valid() const noexcept
 {
   return _e4m3.valid() && _e5m2.valid() && _e4m3_s.valid() &&
          _e5m2_s.valid();
+}
+
+bool
+Expander::int8_valid() const noexcept
+{
+  return _i8_s.valid() && _i8_rot.valid();
 }
 
 bool
@@ -47,6 +55,33 @@ Expander::encode(ComputeEncoder& enc, const Codes& w, const SharedBuffer& dst,
     return false;
   }
   const bool e5 = w.format == Format::kE5M2;
+  if (w.format == Format::kI8) {
+    // int8 is always scaled (fp8-layout.h); ConvRot whole groups a
+    // threadgroup, a 1024 elements each, its group in a constant. The
+    // kernels are optional (int8_valid).
+    const std::size_t want = w.per_row ? N : 1;
+    if (!int8_valid() || !w.scaled() ||
+        w.scale->byte_size() < want * sizeof(float) ||
+        (w.rot_group > 0 &&
+         (!convrot_group_ok(w.rot_group) || K % w.rot_group != 0))) {
+      return false;
+    }
+    enc.set_function(w.rot_group > 0 ? _i8_rot : _i8_s);
+    enc.set_buffer(0, *w.codes);
+    enc.set_buffer(1, dst);
+    enc.set_constant(2, (std::uint32_t)n);
+    enc.set_buffer(3, *w.scale);
+    enc.set_constant(4, (std::uint32_t)(w.per_row ? K : n));
+    if (w.rot_group > 0) {
+      // Whole threadgroups of 256, one a chunk of 1024 elements.
+      enc.set_constant(5, (std::uint32_t)w.rot_group);
+      enc.dispatch({(unsigned)((n + 1023) / 1024 * 256), 1, 1},
+                   {256, 1, 1});
+    } else {
+      enc.dispatch({(unsigned)((n + 3) / 4), 1, 1}, {256, 1, 1});
+    }
+    return true;
+  }
   if (!w.scaled()) {
     enc.set_function(e5 ? _e5m2 : _e4m3);
   } else {
@@ -94,7 +129,9 @@ host_codes_(const MetalLlamaWeights& w, const std::string& name,
             std::vector<float>* scale, std::size_t* rows, std::string* err)
 {
   std::string e;
-  if (!resolve(w, name, x, &e)) {
+  // int8 too: a model whose scan refused it never asks for one, and the
+  // decode below carries its rotation.
+  if (!resolve(w, name, x, &e, /*int8=*/true)) {
     if (err != nullptr) {
       *err = e.empty() ? "'" + name + "' is not an FP8 tensor" : e;
     }
@@ -132,7 +169,7 @@ decode_tensor_bf16(const MetalLlamaWeights& w, const std::string& name,
     return false;
   }
   decode_bf16(codes.data(), dst, rows, rows > 0 ? n / rows : 0, x.format,
-              scale);
+              scale, x.rot_group);
   return true;
 }
 
@@ -153,7 +190,7 @@ decode_tensor_f32(const MetalLlamaWeights& w, const std::string& name,
   // stop agreeing to the bit. Unscaled codes are exact either way.
   std::vector<std::uint16_t> b(n);
   decode_bf16(codes.data(), b.data(), rows, rows > 0 ? n / rows : 0,
-              x.format, scale);
+              x.format, scale, x.rot_group);
   for (std::size_t i = 0; i < n; ++i) {
     const std::uint32_t u = (std::uint32_t)b[i] << 16;
     std::memcpy(&dst[i], &u, sizeof(float));

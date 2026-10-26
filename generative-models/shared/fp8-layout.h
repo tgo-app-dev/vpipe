@@ -28,9 +28,23 @@
 // The scale is one value for the tensor (what every ComfyUI writer
 // produces), or one per output row (torchao's per-row granularity).
 // Anything else is not FP8-with-a-scale and is REFUSED by name: block
-// scales, MXFP8, NVFP4, int8. So is a scale beside a weight that is
-// not FP8, and a second-stage scale (`weight_scale_2`, `pre_quant_scale`):
-// each means an encoding whose codes decode to garbage without it.
+// scales, MXFP8, NVFP4. So is a scale beside a weight that is not FP8
+// (or int8 below), and a second-stage scale (`weight_scale_2`,
+// `pre_quant_scale`): each means an encoding whose codes decode to
+// garbage without it.
+//
+// INT8, for a model that asks for it (`int8` on scan / resolve): a
+// comfy_quant record {"format": "int8_tensorwise"} over I8 codes and
+// their `weight_scale`, one value or one per row -- ComfyUI's int8 --
+// value = code * scale; with `"convrot": true` the codes quantize the
+// weight ROTATED, W * H^T over groups of `convrot_groupsize` input
+// columns (256 by default; H the regular Hadamard of fp8.h), and the
+// value is (code * scale) * H, group by group (Weight::rot_group; H is
+// symmetric, so H = H^T undoes the rotation).
+// Opt-in because the rotation is not elementwise: a reader that widens a
+// weight code by code, and every LoRA reader, would load a rotated one as
+// noise, so only a model whose widening carries rot_group takes it; to
+// any other int8 is refused as before, by name.
 //
 // `input_scale` / `scale_input` are ACTIVATION scales for an FP8 matmul.
 // A model that dequantizes its weights and multiplies in bf16 has no use
@@ -58,11 +72,12 @@ class MetalLlamaWeights;
 
 namespace vpipe::genai::fp8 {
 
-// How one FP8 tensor is stored.
+// How one FP8 (or int8) tensor is stored.
 struct Weight {
   Format      format  = Format::kNone;
   std::string scale;              // the scale tensor's name; "" = unscaled
   bool        per_row = false;    // one scale per output row (else one)
+  int         rot_group = 0;      // int8 ConvRot: its group; 0 = unrotated
 };
 
 // A whole checkpoint's FP8 tensors, and the tensors that belong to the
@@ -86,13 +101,16 @@ struct Layout {
 bool is_aux_name(const std::string& name) noexcept;
 
 // Survey `w`. False + *err for an encoding this build cannot read -- the
-// message names the tensor and the format.
-bool scan(const MetalLlamaWeights& w, Layout* out, std::string* err);
+// message names the tensor and the format. `int8`: ComfyUI's int8 weights
+// read too (see above); else refused by name.
+bool scan(const MetalLlamaWeights& w, Layout* out, std::string* err,
+          bool int8 = false);
 
 // One tensor. False with *out untouched (format kNone) when `name` is not
-// FP8; false + *err when it is FP8 in a form this build cannot read.
+// FP8; false + *err when it is FP8 in a form this build cannot read --
+// or int8 where `int8` is false.
 bool resolve(const MetalLlamaWeights& w, const std::string& name,
-             Weight* out, std::string* err);
+             Weight* out, std::string* err, bool int8 = false);
 
 // The scale of `x` as f32: one value, or `rows` of them. Empty for an
 // unscaled weight. False + *err when the scale tensor cannot be read.
@@ -112,12 +130,15 @@ std::size_t translate_torchao(MetalLlamaWeights& w);
 // one value; or one per row). Unscaled is EXACT. Scaled rounds once --
 // the f32 product to bf16, nearest-even -- which is what the GPU
 // expansion and ComfyUI compute, so a runtime expansion and a dense
-// conversion of the same file agree to the bit.
+// conversion of the same file agree to the bit. `rot_group` (int8 only,
+// ConvRot) un-rotates each row's CODES first, exactly (fp8.h's
+// convrot_unrotate), and then scales them: still one rounding.
 void decode_bf16(const std::uint8_t* codes, std::uint16_t* dst,
                  std::size_t rows, std::size_t cols, Format f,
-                 const std::vector<float>& scale);
+                 const std::vector<float>& scale, int rot_group = 0);
 void decode_f32(const std::uint8_t* codes, float* dst, std::size_t rows,
-                std::size_t cols, Format f, const std::vector<float>& scale);
+                std::size_t cols, Format f, const std::vector<float>& scale,
+                int rot_group = 0);
 
 }  // namespace vpipe::genai::fp8
 

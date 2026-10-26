@@ -658,6 +658,131 @@ TEST(qwen4_exp_kernels, qsa_attention_matches_f64)
 // GEMMs and the cache take) against the fp32 reference: every row's
 // logits, held to the reference's own bf16 distance, and every DECISIVE
 // row's argmax (fp32 top-2 margin > 0.5) the reference's.
+// QSA'S SELECT IN TWO PHASES (qsa_topk_chunk / _merge: chunks of 4096
+// blocks each their own top k, then a row's of theirs) against the one
+// threadgroup's (qsa_select): the same tokens and counts, row for row, at
+// 1 to 16 chunks -- scores on a coarse grid so ties sit at the threshold,
+// a verify's three rows each seeing its own blocks (the rows past one's
+// blocks read -1) -- and each one's time a decode row.
+TEST(qwen4_exp_kernels, qsa_two_phase_select_picks_the_same)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto lhc = mc->load_library("qwen4_hc");
+  auto one = lhc.function("qsa_select_f16");
+  auto chunk = lhc.function("qsa_topk_chunk_f16");
+  auto merge = lhc.function("qsa_topk_merge_f16");
+  ASSERT_TRUE(one.valid() && chunk.valid() && merge.valid());
+  if (!one.valid() || !chunk.valid() || !merge.valid()) { return; }
+  constexpr int ratio = 4, k = 512, CH = 4096;
+  const int width = k * ratio + ratio - 1;
+  std::uint32_t rng = 5u;
+  auto next = [&]() {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  auto stream = mc->make_command_stream();
+  for (const int rows : {1, 3}) {
+    for (const int nb0 : {3000, 9000, 32768, 40001, 65536}) {
+      const int r0 = 0;
+      const int q_offset = nb0 * ratio - 1 - (rows - 1);
+      const int nbm = (q_offset + r0 + rows) / ratio;
+      std::vector<float> sc((std::size_t)rows * nbm);
+      for (int r = 0; r < rows; ++r) {
+        const int nb = (q_offset + r0 + r + 1) / ratio;
+        for (int b = 0; b < nbm; ++b) {
+          sc[(std::size_t)r * nbm + b] =
+              b < nb ? (float)(next() % 4096) / 64.0f : -1.0f;
+        }
+      }
+      auto s = mc->make_shared_buffer(sc.size() * 4);
+      std::memcpy(s.contents(), sc.data(), sc.size() * 4);
+      const int G = (nbm + CH - 1) / CH;
+      const int R = std::clamp(3 * k / 2 / G, 1, std::min(k, 3072 / G));
+      auto sel1 = mc->make_shared_buffer((std::size_t)rows * width * 4);
+      auto ns1 = mc->make_shared_buffer((std::size_t)rows * 4);
+      auto sel2 = mc->make_shared_buffer((std::size_t)rows * width * 4);
+      auto ns2 = mc->make_shared_buffer((std::size_t)rows * 4);
+      auto ck = mc->make_shared_buffer((std::size_t)rows * G * k * 4);
+      auto cp = mc->make_shared_buffer((std::size_t)rows * G * k * 4);
+      auto tk = mc->make_shared_buffer((std::size_t)rows * G * 4);
+      auto tr = mc->make_shared_buffer((std::size_t)rows * G * R * 4);
+      std::memset(sel1.contents(), 0xff, sel1.byte_size());
+      std::memset(sel2.contents(), 0xee, sel2.byte_size());
+      auto enc_one = [&](metal_compute::ComputeEncoder& enc) {
+        enc.set_function(one);
+        enc.set_buffer(0, s); enc.set_buffer(1, sel1);
+        enc.set_buffer(2, ns1);
+        enc.set_constant(3, nbm); enc.set_constant(4, k);
+        enc.set_constant(5, ratio); enc.set_constant(6, q_offset);
+        enc.set_constant(7, r0);
+        enc.dispatch({256u * (unsigned)rows, 1, 1}, {256, 1, 1});
+      };
+      auto enc_two = [&](metal_compute::ComputeEncoder& enc) {
+        enc.set_function(chunk);
+        enc.set_buffer(0, s); enc.set_buffer(1, ck); enc.set_buffer(2, cp);
+        enc.set_buffer(3, tk); enc.set_buffer(4, tr);
+        enc.set_constant(5, nbm); enc.set_constant(6, k);
+        enc.set_constant(7, R); enc.set_constant(8, ratio);
+        enc.set_constant(9, q_offset); enc.set_constant(10, r0);
+        enc.dispatch({256u * (unsigned)G, (unsigned)rows, 1}, {256, 1, 1});
+        enc.set_function(merge);
+        enc.set_buffer(0, ck); enc.set_buffer(1, cp); enc.set_buffer(2, tk);
+        enc.set_buffer(3, tr); enc.set_buffer(4, sel2);
+        enc.set_buffer(5, ns2);
+        enc.set_constant(6, nbm); enc.set_constant(7, k);
+        enc.set_constant(8, R); enc.set_constant(9, ratio);
+        enc.set_constant(10, q_offset); enc.set_constant(11, r0);
+        enc.dispatch({256u * (unsigned)rows, 1, 1}, {256, 1, 1});
+      };
+      {
+        auto enc = stream.begin_compute();
+        enc_one(enc);
+        enc_two(enc);
+      }
+      ASSERT_TRUE(stream.commit().wait_ok());
+      const auto* a = static_cast<const std::int32_t*>(sel1.contents());
+      const auto* b = static_cast<const std::int32_t*>(sel2.contents());
+      const auto* na = static_cast<const std::int32_t*>(ns1.contents());
+      const auto* nb2 = static_cast<const std::int32_t*>(ns2.contents());
+      int bad = 0;
+      for (int r = 0; r < rows; ++r) {
+        if (na[r] != nb2[r]) { ++bad; continue; }
+        for (int i = 0; i < na[r]; ++i) {
+          bad += a[(std::size_t)r * width + i] !=
+                 b[(std::size_t)r * width + i];
+        }
+      }
+      // a decode row's time each way (rows 1)
+      double us[2] = {0.0, 0.0};
+      if (rows == 1) {
+        for (int arm = 0; arm < 2; ++arm) {
+          constexpr int N = 100;
+          const auto t0 = std::chrono::steady_clock::now();
+          {
+            auto enc = stream.begin_compute();
+            for (int i = 0; i < N; ++i) {
+              if (arm == 0) { enc_one(enc); } else { enc_two(enc); }
+            }
+          }
+          ASSERT_TRUE(stream.commit().wait_ok());
+          us[arm] = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - t0).count() / N;
+        }
+      }
+      std::printf("[qwen4_exp_kernels] QSA select, %d row(s), %d blocks (%d "
+                  "chunks): %d tokens differ%s", rows, nbm, G, bad,
+                  rows == 1 ? "" : "\n");
+      if (rows == 1) {
+        std::printf("; one threadgroup %.1f us, two phases %.1f us\n", us[0],
+                    us[1]);
+      }
+      EXPECT_TRUE(bad == 0);
+    }
+  }
+}
+
 TEST(qwen4_exp, prefill_matches_reference)
 {
   const char* mp = std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH");
@@ -1633,6 +1758,168 @@ TEST(qwen4_exp, long_context_matches_reference)
   }
 }
 
+// A PREFILL IN PIECES: the long golden's prompt but its last 48 rows
+// through prefill() -- one piece at hc_piece_rows (8192 on a 64 GB box),
+// and again in four calls on another context, pieces of ~600 rows each
+// run against the K/V, GDN state and PLE history the ones before left --
+// then those 48 rows by one forward continuing the context, their logits
+// against the fp32 reference's as long_context_matches_reference holds
+// its one forward (its bf16 x 1.15, the decisive picks); and the tail
+// decoded a row at a time. The tail crosses QSA's line (2051 visible
+// tokens). VPIPE_QWEN4_EXP_PIECE_BENCH=<tokens> first times a prefill of
+// that many synthetic tokens on the cold cache (VPIPE_QWEN4_EXP_PIECE_SEED
+// other tokens; VPIPE_QWEN_PREFILL_CHUNK=2048 the old pieces' arm).
+TEST(qwen4_exp, prefill_pieces_agree)
+{
+  const char* mp = std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH");
+  const char* gp = std::getenv("VPIPE_QWEN4_EXP_LONG_GOLDEN");
+  if (mp == nullptr || gp == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using vpipe::genai::MetalQwenModel;
+  vpipe::genai::ModelLoader loader(&sess);
+  const auto mcfg = loader.load_config(mp);
+  ASSERT_TRUE(mcfg.has_value());
+  if (!mcfg.has_value()) { return; }
+  MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+  c.use_bf16 = std::getenv("VPIPE_QWEN4_EXP_F16") == nullptr;
+  c.page_tokens = 256;
+  c.max_pages = 72;
+  c.max_seq = 16384;
+  std::size_t cache_mb = 36864;
+  if (const char* e = std::getenv("VPIPE_QWEN4_EXP_CACHE_MB")) {
+    cache_mb = (std::size_t)std::atoll(e);
+  }
+  c.expert_cache_bytes = cache_mb << 20;
+  const std::string g = gp;
+  const auto ids32 = read_raw_<std::int32_t>(g + "/ids.i32");
+  const auto ref = read_raw_<float>(g + "/logits_f32.f32");
+  const auto ref16 = read_raw_<float>(g + "/logits_bf16.f32");
+  constexpr std::size_t kRows = 48;
+  const std::size_t T = ids32.size();
+  ASSERT_TRUE(T > 2100 && ref.size() % kRows == 0 &&
+              ref16.size() == ref.size());
+  if (T <= 2100 || ref.size() % kRows != 0 || ref16.size() != ref.size()) {
+    return;
+  }
+  const std::size_t V = ref.size() / kRows;
+  const std::vector<std::int32_t> ids(ids32.begin(), ids32.end());
+  auto m = MetalQwenModel::load(mp, mc, c);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  // The bench first, on the cold cache.
+  if (const char* b = std::getenv("VPIPE_QWEN4_EXP_PIECE_BENCH")) {
+    const int n = std::max(1, std::atoi(b));
+    // VPIPE_QWEN4_EXP_PIECE_SEED: other tokens (n-gram rows no earlier run
+    // left in the page cache)
+    const char* sd = std::getenv("VPIPE_QWEN4_EXP_PIECE_SEED");
+    const long seed = sd != nullptr ? std::atol(sd) : 0;
+    std::vector<std::int32_t> syn((std::size_t)n);
+    for (int i = 0; i < n; ++i) {
+      syn[(std::size_t)i] =
+          1000 + (std::int32_t)((i * 7919L + seed * 104729L) % 50000);
+    }
+    const auto cx = m->context_manager()->acquire_root();
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto lg = m->prefill(cx, syn);
+    const double sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::printf("[qwen4_exp] piece bench: %d tokens prefilled in %.1f s "
+                "(%.0f tok/s)\n", n, sec, n / sec);
+    EXPECT_TRUE(!lg.empty());
+    m->forget_context(cx);
+    m->context_manager()->release(cx);
+  }
+  // The prompt but its last 48 rows in pieces, then those rows' logits by
+  // one forward continuing the context.
+  const std::size_t P = T - kRows;
+  const std::vector<std::int32_t> tail(ids.begin() + P, ids.end());
+  auto run = [&](std::size_t calls) {
+    const auto cx = m->context_manager()->acquire_root();
+    const std::size_t step = (P + calls - 1) / calls;
+    for (std::size_t i = 0; i < P; i += step) {
+      const std::size_t e = std::min(P, i + step);
+      if (m->prefill(cx, std::vector<std::int32_t>(ids.begin() + i,
+                                                   ids.begin() + e))
+              .empty()) {
+        return std::vector<float>{};
+      }
+    }
+    std::vector<float> lg = m->prefill_all_logits(cx, tail);
+    m->forget_context(cx);
+    m->context_manager()->release(cx);
+    return lg;
+  };
+  const std::vector<float> whole = run(1), parts = run(4);
+  ASSERT_TRUE(whole.size() == ref.size() && parts.size() == ref.size());
+  if (whole.size() != ref.size() || parts.size() != ref.size()) { return; }
+  // ...and the tail DECODED a row at a time after one piece: past 2051
+  // tokens each step's QSA select runs (in two phases with
+  // VPIPE_QWEN_QSA_TWO=2 -- the same blocks, so the same logits: compare
+  // the digest printed against a run with it 0).
+  std::vector<float> dec;
+  {
+    const auto cx = m->context_manager()->acquire_root();
+    ASSERT_TRUE(!m->prefill(cx, std::vector<std::int32_t>(
+                                    ids.begin(), ids.begin() + P)).empty());
+    for (const std::int32_t t : tail) {
+      const std::vector<float> lg = m->forward(cx, t);
+      ASSERT_TRUE(lg.size() == V);
+      if (lg.size() != V) { return; }
+      dec.insert(dec.end(), lg.begin(), lg.end());
+    }
+    m->forget_context(cx);
+    m->context_manager()->release(cx);
+  }
+  std::uint64_t digest = 1469598103934665603ull;
+  for (const float f : dec) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    digest = (digest ^ u) * 1099511628211ull;
+  }
+  const double ed = rel_l2_(ref.data(), dec.data(), ref.size());
+  std::printf("[qwen4_exp] the same %zu rows decoded a row at a time: %.4f "
+              "from fp32 (logits digest %016llx; %ld two-phase QSA "
+              "selects)\n", kRows, ed, (unsigned long long)digest,
+              m->qsa_two_phase_selects());
+  EXPECT_TRUE(ed < 1.15 * rel_l2_(ref.data(), ref16.data(), ref.size()));
+  auto argmax = [&](const float* x) {
+    std::size_t a = 0;
+    for (std::size_t v = 1; v < V; ++v) {
+      if (x[v] > x[a]) { a = v; }
+    }
+    return a;
+  };
+  // the fp32-decisive rows (margin > 0.5) each run and the reference's
+  // bf16 pick as fp32 does
+  int decisive = 0, aw = 0, ap = 0, a16 = 0;
+  for (std::size_t t = 0; t < kRows; ++t) {
+    const float* r = ref.data() + t * V;
+    const std::size_t a = argmax(r);
+    std::size_t b = a == 0 ? 1 : 0;
+    for (std::size_t v = 0; v < V; ++v) {
+      if (v != a && r[v] > r[b]) { b = v; }
+    }
+    if (r[a] - r[b] <= 0.5f) { continue; }
+    ++decisive;
+    aw += argmax(whole.data() + t * V) == a;
+    ap += argmax(parts.data() + t * V) == a;
+    a16 += argmax(ref16.data() + t * V) == a;
+  }
+  const double bar = rel_l2_(ref.data(), ref16.data(), ref.size());
+  const double ew = rel_l2_(ref.data(), whole.data(), ref.size());
+  const double ep = rel_l2_(ref.data(), parts.data(), ref.size());
+  std::printf("[qwen4_exp] a %zu-token prompt in pieces of up to %d rows, "
+              "its last %zu rows' logits %.4f from fp32, after four calls "
+              "%.4f (reference bf16 %.4f); decisive argmax %d / %d of %d "
+              "(reference bf16 %d)\n", P, m->hc_piece_rows(c), kRows, ew, ep,
+              bar, aw, ap, decisive, a16);
+  EXPECT_TRUE(ew < 1.15 * bar);
+  EXPECT_TRUE(ep < 1.15 * bar);
+  EXPECT_TRUE(aw + 3 >= a16 && ap + 3 >= a16);
+}
+
 // AN IMAGE TURN (VPIPE_QWEN4_EXP_IMAGE_GOLDEN: one or more of the dumper's
 // --image runs, ':'-separated, the same 512^2 picture: a short turn with
 // every row kept, and the picture before the long golden's ~2400-token
@@ -1706,168 +1993,186 @@ TEST(qwen4_exp, image_turn_matches_reference)
     EXPECT_TRUE(et < std::max(0.02, 1.5 * bt));
   }
 
-  MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
-  c.use_bf16 = std::getenv("VPIPE_QWEN4_EXP_F16") == nullptr;
-  c.page_tokens = 256;
-  c.max_pages = 64;
-  c.max_seq = 8192;
-  std::size_t cache_mb = 36864;
-  if (const char* e = std::getenv("VPIPE_QWEN4_EXP_CACHE_MB")) {
-    cache_mb = (std::size_t)std::atoll(e);
-  }
-  c.expert_cache_bytes = cache_mb << 20;
-  auto m = MetalQwenModel::load(mp, mc, c);
-  ASSERT_TRUE(m != nullptr);
-  if (m == nullptr) { return; }
-  for (const std::string& g : goldens) {
-    const auto ids = read_raw_<std::int32_t>(g + "/ids.i32");
-    const auto pos = read_raw_<std::int32_t>(g + "/position_ids.i32");
-    const auto img32 = read_raw_<float>(g + "/image_embeds_f32.f32");
-    const auto ref = read_raw_<float>(g + "/logits_f32.f32");
-    const auto ref16 = read_raw_<float>(g + "/logits_bf16.f32");
-    const std::size_t T = ids.size();
-    const std::size_t rows = V > 0 ? ref.size() / V : 0;
-    ASSERT_TRUE(T > 0 && pos.size() == 3 * T && !img32.empty() &&
-                img32.size() % (std::size_t)H == 0 && rows > 0 &&
-                rows <= T && ref.size() == rows * V);
-    if (T == 0 || pos.size() != 3 * T || img32.empty() || rows == 0 ||
-        rows > T || ref.size() != rows * V) {
-      continue;
+  // Both precisions -- bf16 the model's own, f16 the closer to fp32 and
+  // the tight check (VPIPE_QWEN4_EXP_F16=1: f16 alone).
+  std::vector<bool> precisions = {true, false};
+  if (std::getenv("VPIPE_QWEN4_EXP_F16") != nullptr) { precisions = {false}; }
+  for (const bool bf16 : precisions) {
+    MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+    c.use_bf16 = bf16;
+    c.page_tokens = 256;
+    c.max_pages = 64;
+    c.max_seq = 8192;
+    std::size_t cache_mb = 36864;
+    if (const char* e = std::getenv("VPIPE_QWEN4_EXP_CACHE_MB")) {
+      cache_mb = (std::size_t)std::atoll(e);
     }
-    const std::size_t n_img = img32.size() / (std::size_t)H;
-    // The rows: text from the embedding table, the image's placeholders
-    // the reference tower's rows in order.
-    std::vector<std::int32_t> tids;
-    for (const std::int32_t t : ids) {
-      if (t != kImagePad) { tids.push_back(t); }
-    }
-    ASSERT_TRUE(T - tids.size() == n_img);
-    if (T - tids.size() != n_img) { continue; }
-    const std::vector<float> trows = m->embed_text(tids);
-    ASSERT_TRUE(trows.size() == tids.size() * (std::size_t)H);
-    if (trows.size() != tids.size() * (std::size_t)H) { continue; }
-    std::vector<float> emb(T * (std::size_t)H);
-    for (std::size_t t = 0, ti = 0, ii = 0; t < T; ++t) {
-      const float* src = ids[t] == kImagePad ? img32.data() + (ii++) * H
-                                             : trows.data() + (ti++) * H;
-      std::memcpy(emb.data() + t * H, src, (std::size_t)H * 4);
-    }
-    // Prefilled in up to two calls, the kept rows' logits from the last.
-    const auto cx = m->context_manager()->acquire_root();
-    auto part = [&](std::size_t r0, std::size_t n, std::vector<float>* lg) {
-      std::vector<float> e(emb.begin() + (long)(r0 * H),
-                           emb.begin() + (long)((r0 + n) * H));
-      std::vector<std::int32_t> id(ids.begin() + (long)r0,
-                                   ids.begin() + (long)(r0 + n));
-      std::vector<std::int32_t> p(3 * n);
-      for (int a = 0; a < 3; ++a) {
-        for (std::size_t t = 0; t < n; ++t) {
-          p[(std::size_t)a * n + t] = pos[(std::size_t)a * T + r0 + t];
-        }
+    c.expert_cache_bytes = cache_mb << 20;
+    auto m = MetalQwenModel::load(mp, mc, c);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    for (const std::string& g : goldens) {
+      const auto ids = read_raw_<std::int32_t>(g + "/ids.i32");
+      const auto pos = read_raw_<std::int32_t>(g + "/position_ids.i32");
+      const auto img32 = read_raw_<float>(g + "/image_embeds_f32.f32");
+      const auto ref = read_raw_<float>(g + "/logits_f32.f32");
+      const auto ref16 = read_raw_<float>(g + "/logits_bf16.f32");
+      const std::size_t T = ids.size();
+      const std::size_t rows = V > 0 ? ref.size() / V : 0;
+      ASSERT_TRUE(T > 0 && pos.size() == 3 * T && !img32.empty() &&
+                  img32.size() % (std::size_t)H == 0 && rows > 0 &&
+                  rows <= T && ref.size() == rows * V);
+      if (T == 0 || pos.size() != 3 * T || img32.empty() || rows == 0 ||
+          rows > T || ref.size() != rows * V) {
+        continue;
       }
-      return m->prefill_hc_spliced(cx, e, id, p, (int)n, lg);
-    };
-    const std::size_t n0 = T - rows;
-    const auto t0 = std::chrono::steady_clock::now();
-    if (n0 > 0) { ASSERT_TRUE(!part(0, n0, nullptr).empty()); }
-    const std::string sel_path =
-        std::string(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR")
-                                                     : "/tmp") +
-        "/qwen4_exp_image_qsa_sel.i32";
-    std::remove(sel_path.c_str());
-    setenv("VPIPE_QWEN_QSA_DUMP", sel_path.c_str(), 1);
-    std::vector<float> got;
-    ASSERT_TRUE(!part(n0, rows, &got).empty());
-    unsetenv("VPIPE_QWEN_QSA_DUMP");
-    const double ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - t0).count();
-    m->forget_context(cx);
-    m->context_manager()->release(cx);
-    ASSERT_TRUE(got.size() == ref.size());
-    if (got.size() != ref.size()) { continue; }
-    int decisive = 0, agree = 0, agree16 = 0;
-    const bool has16 = ref16.size() == ref.size();
-    for (std::size_t t = 0; t < rows; ++t) {
-      const float* r = ref.data() + t * V;
-      const float* o = got.data() + t * V;
-      std::size_t a = 0, ao = 0, a16 = 0, b = 0;
-      for (std::size_t v = 1; v < V; ++v) {
-        if (r[v] > r[a]) { a = v; }
-        if (o[v] > o[ao]) { ao = v; }
-        if (has16 && ref16[t * V + v] > ref16[t * V + a16]) { a16 = v; }
+      const std::size_t n_img = img32.size() / (std::size_t)H;
+      // The rows: text from the embedding table, the image's placeholders
+      // the reference tower's rows in order.
+      std::vector<std::int32_t> tids;
+      for (const std::int32_t t : ids) {
+        if (t != kImagePad) { tids.push_back(t); }
       }
-      b = a == 0 ? 1 : 0;
-      for (std::size_t v = 0; v < V; ++v) {
-        if (v != a && r[v] > r[b]) { b = v; }
+      ASSERT_TRUE(T - tids.size() == n_img);
+      if (T - tids.size() != n_img) { continue; }
+      const std::vector<float> trows = m->embed_text(tids);
+      ASSERT_TRUE(trows.size() == tids.size() * (std::size_t)H);
+      if (trows.size() != tids.size() * (std::size_t)H) { continue; }
+      std::vector<float> emb(T * (std::size_t)H);
+      for (std::size_t t = 0, ti = 0, ii = 0; t < T; ++t) {
+        const float* src = ids[t] == kImagePad ? img32.data() + (ii++) * H
+                                               : trows.data() + (ti++) * H;
+        std::memcpy(emb.data() + t * H, src, (std::size_t)H * 4);
       }
-      if (r[a] - r[b] > 0.5f) {
-        ++decisive;
-        agree += ao == a;
-        agree16 += a16 == a;
-      }
-    }
-    const double e = rel_l2_(ref.data(), got.data(), ref.size());
-    const double bar =
-        has16 ? rel_l2_(ref.data(), ref16.data(), ref.size()) : 0.0;
-    // Past the QSA threshold, the last row's picks per full layer against
-    // the reference's.
-    int off = -1, off16 = -1;
-    const auto sel = read_raw_<std::int32_t>(sel_path);
-    const auto q32 = read_raw_<std::int32_t>(g + "/qsa_f32.i32");
-    const auto q16 = read_raw_<std::int32_t>(g + "/qsa_bf16.i32");
-    constexpr int kFull = 12;
-    const bool sparse = T > 2051;
-    if (sparse && !q32.empty() && q32.size() % kFull == 0) {
-      const std::size_t W = q32.size() / kFull;
-      auto picks = [&](const std::int32_t* p, std::size_t w) {
-        std::vector<char> on(T, 0);
-        for (std::size_t i = 0; i < w; ++i) {
-          if (p[i] >= 0 && (std::size_t)p[i] < T) {
-            on[(std::size_t)p[i]] = 1;
+      // Prefilled in up to two calls, the kept rows' logits from the last.
+      const auto cx = m->context_manager()->acquire_root();
+      auto part = [&](std::size_t r0, std::size_t n, std::vector<float>* lg) {
+        std::vector<float> e(emb.begin() + (long)(r0 * H),
+                             emb.begin() + (long)((r0 + n) * H));
+        std::vector<std::int32_t> id(ids.begin() + (long)r0,
+                                     ids.begin() + (long)(r0 + n));
+        std::vector<std::int32_t> p(3 * n);
+        for (int a = 0; a < 3; ++a) {
+          for (std::size_t t = 0; t < n; ++t) {
+            p[(std::size_t)a * n + t] = pos[(std::size_t)a * T + r0 + t];
           }
         }
-        return on;
+        return m->prefill_hc_spliced(cx, e, id, p, (int)n, lg);
       };
-      auto differ = [&](const std::vector<char>& x,
-                        const std::vector<char>& y) {
-        int d = 0;
-        for (std::size_t t = 0; t < T; ++t) { d += x[t] != y[t]; }
-        return d / 2;
-      };
-      if (sel.size() >= kFull * (W + 1)) {
-        off = 0;
-        off16 = q16.size() == q32.size() ? 0 : -1;
-        for (int f = 0; f < kFull; ++f) {
-          const std::int32_t cnt = sel[(std::size_t)f * (W + 1) + W];
-          const auto r = picks(q32.data() + (std::size_t)f * W, W);
-          off += differ(picks(sel.data() + (std::size_t)f * (W + 1),
-                              (std::size_t)std::max(cnt, 0)), r);
-          if (off16 >= 0) {
-            off16 += differ(picks(q16.data() + (std::size_t)f * W, W), r);
+      const std::size_t n0 = T - rows;
+      const auto t0 = std::chrono::steady_clock::now();
+      if (n0 > 0) { ASSERT_TRUE(!part(0, n0, nullptr).empty()); }
+      const std::string sel_path =
+          std::string(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR")
+                                                       : "/tmp") +
+          "/qwen4_exp_image_qsa_sel.i32";
+      std::remove(sel_path.c_str());
+      setenv("VPIPE_QWEN_QSA_DUMP", sel_path.c_str(), 1);
+      std::vector<float> got;
+      ASSERT_TRUE(!part(n0, rows, &got).empty());
+      unsetenv("VPIPE_QWEN_QSA_DUMP");
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      m->forget_context(cx);
+      m->context_manager()->release(cx);
+      ASSERT_TRUE(got.size() == ref.size());
+      if (got.size() != ref.size()) { continue; }
+      int decisive = 0, agree = 0, agree16 = 0;
+      const bool has16 = ref16.size() == ref.size();
+      for (std::size_t t = 0; t < rows; ++t) {
+        const float* r = ref.data() + t * V;
+        const float* o = got.data() + t * V;
+        std::size_t a = 0, ao = 0, a16 = 0, b = 0;
+        for (std::size_t v = 1; v < V; ++v) {
+          if (r[v] > r[a]) { a = v; }
+          if (o[v] > o[ao]) { ao = v; }
+          if (has16 && ref16[t * V + v] > ref16[t * V + a16]) { a16 = v; }
+        }
+        b = a == 0 ? 1 : 0;
+        for (std::size_t v = 0; v < V; ++v) {
+          if (v != a && r[v] > r[b]) { b = v; }
+        }
+        if (r[a] - r[b] > 0.5f) {
+          ++decisive;
+          agree += ao == a;
+          agree16 += a16 == a;
+        }
+      }
+      const double e = rel_l2_(ref.data(), got.data(), ref.size());
+      const double bar =
+          has16 ? rel_l2_(ref.data(), ref16.data(), ref.size()) : 0.0;
+      // Past the QSA threshold, the last row's picks per full layer against
+      // the reference's.
+      int off = -1, off16 = -1;
+      const auto sel = read_raw_<std::int32_t>(sel_path);
+      const auto q32 = read_raw_<std::int32_t>(g + "/qsa_f32.i32");
+      const auto q16 = read_raw_<std::int32_t>(g + "/qsa_bf16.i32");
+      constexpr int kFull = 12;
+      const bool sparse = T > 2051;
+      if (sparse && !q32.empty() && q32.size() % kFull == 0) {
+        const std::size_t W = q32.size() / kFull;
+        auto picks = [&](const std::int32_t* p, std::size_t w) {
+          std::vector<char> on(T, 0);
+          for (std::size_t i = 0; i < w; ++i) {
+            if (p[i] >= 0 && (std::size_t)p[i] < T) {
+              on[(std::size_t)p[i]] = 1;
+            }
+          }
+          return on;
+        };
+        auto differ = [&](const std::vector<char>& x,
+                          const std::vector<char>& y) {
+          int d = 0;
+          for (std::size_t t = 0; t < T; ++t) { d += x[t] != y[t]; }
+          return d / 2;
+        };
+        if (sel.size() >= kFull * (W + 1)) {
+          off = 0;
+          off16 = q16.size() == q32.size() ? 0 : -1;
+          for (int f = 0; f < kFull; ++f) {
+            const std::int32_t cnt = sel[(std::size_t)f * (W + 1) + W];
+            const auto r = picks(q32.data() + (std::size_t)f * W, W);
+            off += differ(picks(sel.data() + (std::size_t)f * (W + 1),
+                                (std::size_t)std::max(cnt, 0)), r);
+            if (off16 >= 0) {
+              off16 += differ(picks(q16.data() + (std::size_t)f * W, W), r);
+            }
           }
         }
       }
-    }
-    std::printf("[qwen4_exp] image turn, %zu tokens (%zu image rows, %s) in "
-                "%.0f ms: %zu rows' logits %.4f from fp32 (reference bf16 "
-                "%.4f); decisive argmax %d/%d (reference bf16 %d)",
-                T, n_img, c.use_bf16 ? "bf16" : "f16", ms, rows, e, bar,
-                agree, decisive, agree16);
-    if (sparse) {
-      std::printf("; QSA picks %d tokens off fp32's (its bf16 %d)", off,
-                  off16);
-    }
-    std::printf("\n");
-    if (sparse) { EXPECT_TRUE(off >= 0); }
-    if (has16) {
-      EXPECT_TRUE(e < 1.15 * bar);
-      // Within four decisive picks of the reference's bf16: the long
-      // turn's 41 decisive rows read 37 with the experts on the grouped
-      // GEMV and 36 on the steel GEMM a 581-row prefill piece takes (its
-      // staged bf16 weights; the logits 0.1060 -> 0.1114, the reference's
-      // bf16 0.1105 and 40 picks).
-      EXPECT_TRUE(agree + 4 >= agree16);
-      EXPECT_TRUE(off16 < 0 || off <= 2 * off16);
+      std::printf("[qwen4_exp] image turn, %zu tokens (%zu image rows, %s) in "
+                  "%.0f ms: %zu rows' logits %.4f from fp32 (reference bf16 "
+                  "%.4f); decisive argmax %d/%d (reference bf16 %d)",
+                  T, n_img, c.use_bf16 ? "bf16" : "f16", ms, rows, e, bar,
+                  agree, decisive, agree16);
+      if (sparse) {
+        std::printf("; QSA picks %d tokens off fp32's (its bf16 %d)", off,
+                    off16);
+      }
+      std::printf("\n");
+      if (sparse) { EXPECT_TRUE(off >= 0); }
+      if (has16) {
+        if (bf16) {
+          // bf16 the model's own, and a DRAW: the long turn's prefill laid
+          // out as one piece reads 0.1309 / 35 decisive / 280 picks off,
+          // as 2048 + 581 rows 0.1174 / 36 / 276 -- the same arithmetic,
+          // each row as it is in either, its rounding carried another way
+          // through 48 layers (in f16 the one piece is the closer: 0.0677
+          // against 0.0831). Before, the experts' tier moved it as much
+          // (grouped GEMV 0.1060 / 37, steel 0.1114 / 36).
+          EXPECT_TRUE(e < 1.25 * bar);
+          EXPECT_TRUE(agree + 5 >= agree16);
+          EXPECT_TRUE(off16 < 0 || off <= 2 * off16);
+        } else {
+          // f16 the tight check: far closer to fp32 than the reference's
+          // bf16 run. MUTATION, the indexer at text positions: the long
+          // turn 0.1070 / 208 picks off (correct 0.0677 / 156; bf16 0.1470
+          // against 0.1309).
+          EXPECT_TRUE(e < 0.8 * bar);
+          EXPECT_TRUE(agree + 4 >= agree16);
+          EXPECT_TRUE(off16 < 0 || 4 * off <= 3 * off16);
+        }
+      }
     }
   }
 }
@@ -2121,8 +2426,13 @@ TEST(qwen4_exp_flavors, packs_match_reference)
       vpipe::genai::MtpDecodeCtl ctl;
       long drafted = 0;
       ctl.drafted = &drafted;
+      // Three drafts a round, pinned: a random head's drafts are rarely
+      // kept, and the measured count would mostly draft none -- the
+      // replays of a partial accept are what this checks.
+      ::setenv("VPIPE_QWEN_HC_MTP_DEPTH", "3", 1);
       const bool ok = m->mtp_decode(cb, first, N, out, 1, &kept, &rounds,
                                     ctl);
+      ::unsetenv("VPIPE_QWEN_HC_MTP_DEPTH");
       ASSERT_TRUE(ok && (int)out.size() == N);
       int same = 0;
       for (int i = 0; i < (int)out.size() && i < N; ++i) {

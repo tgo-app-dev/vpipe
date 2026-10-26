@@ -20,6 +20,7 @@ set(LOCAL_SOURCES
   moe-expert-cache.cc
   safetensors-ranges.cc
   loaded-language-model.cc
+  lm-run-memory.cc
   metal-token-muxer.cc
   model-exec-registry.cc
   vae-model-registry.cc
@@ -119,6 +120,11 @@ set(LOCAL_SOURCES
   bs-roformer/metal-bs-roformer.cc
   drama3/drama3-prompt.cc
   drama3/metal-drama3-tower.cc
+  deepseek-v41/deepseek-v41-config.cc
+  deepseek-v41/deepseek-v41-engram.cc
+  deepseek-v41/metal-deepseek-v41-model.cc
+  deepseek-v41/metal-deepseek-v41-model-exec.cc
+  deepseek-v41/metal-deepseek-v41-vision.cc
   drama3/metal-drama3-model.cc
   drama3/metal-fish-codec.cc
   flux2/metal-flux2-transformer.cc
@@ -210,6 +216,11 @@ set(LOCAL_HEADERS
   bs-roformer/metal-bs-roformer.h
   drama3/drama3-prompt.h
   drama3/metal-drama3-tower.h
+  deepseek-v41/deepseek-v41-config.h
+  deepseek-v41/deepseek-v41-engram.h
+  deepseek-v41/metal-deepseek-v41-model.h
+  deepseek-v41/metal-deepseek-v41-model-exec.h
+  deepseek-v41/metal-deepseek-v41-vision.h
   drama3/metal-drama3-model.h
   drama3/metal-fish-codec.h
   gemma4/gemma4-audio-feature-extractor.h

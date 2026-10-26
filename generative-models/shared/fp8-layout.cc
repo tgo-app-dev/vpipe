@@ -29,9 +29,41 @@ layer_of_(const std::string& name)
 // The scale spellings, current first.
 constexpr const char* kScaleSuffixes[] = {".weight_scale", ".scale_weight"};
 
-// The format a comfy_quant record or the header metadata declares for
-// `layer`, "" when neither does. *err on a record that cannot be read.
-std::string
+// What a comfy_quant record or the header metadata declares for a layer:
+// its format, and an int8 one's ConvRot (comfy/ops.py writes `convrot`
+// and `convrot_groupsize` beside the format, or reads them under
+// `params`).
+struct Declared {
+  std::string format;
+  bool        convrot = false;
+  int         group   = 256;
+};
+
+Declared
+declared_of_(const FlexData& rec)
+{
+  Declared d;
+  if (!rec.is_object()) { return d; }
+  auto o = rec.as_object();
+  if (o.contains("format")) {
+    d.format = std::string(o.at("format").as_string(""));
+  }
+  auto take = [&](const FlexData& from) {
+    if (!from.is_object()) { return; }
+    auto f = from.as_object();
+    if (f.contains("convrot")) { d.convrot = f.at("convrot").as_bool(false); }
+    if (f.contains("convrot_groupsize")) {
+      d.group = (int)f.at("convrot_groupsize").as_int(256);
+    }
+  };
+  if (o.contains("params")) { take(o.at("params")); }
+  take(rec);
+  return d;
+}
+
+// The record for `layer`; an empty format when there is none. *err on a
+// record that cannot be read.
+Declared
 declared_format_(const MetalLlamaWeights& w, const std::string& layer,
                  std::string* err)
 {
@@ -45,7 +77,7 @@ declared_format_(const MetalLlamaWeights& w, const std::string& layer,
     try {
       const FlexData j = FlexData::from_json(txt);
       if (j.is_object() && j.as_object().contains("format")) {
-        return std::string(j.as_object().at("format").as_string(""));
+        return declared_of_(j);
       }
     } catch (...) {
     }
@@ -59,12 +91,23 @@ declared_format_(const MetalLlamaWeights& w, const std::string& layer,
     const FlexData j = FlexData::from_json(it->second);
     if (!j.is_object() || !j.as_object().contains("layers")) { return {}; }
     const FlexData layers = j.as_object().at("layers");
-    if (!layers.is_object() || !layers.as_object().contains(layer)) {
-      return {};
+    if (!layers.is_object()) { return {}; }
+    // Keyed as the FILE names its layers. A translation at open may have
+    // dropped ComfyUI's model prefix from the tensors (Krea-2's native
+    // names, an H3 DiT ComfyUI saved) and cannot rewrite the header, so
+    // the layer is looked for under that prefix too. A name that kept
+    // its prefix never matches the doubled spelling.
+    std::string key;
+    for (const char* pre : {"", "model.diffusion_model.", "diffusion_model."}) {
+      if (layers.as_object().contains(pre + layer)) {
+        key = pre + layer;
+        break;
+      }
     }
-    const FlexData one = layers.as_object().at(layer);
+    if (key.empty()) { return {}; }
+    const FlexData one = layers.as_object().at(key);
     if (one.is_object() && one.as_object().contains("format")) {
-      return std::string(one.as_object().at("format").as_string(""));
+      return declared_of_(one);
     }
   } catch (...) {
     if (err != nullptr) {
@@ -79,6 +122,7 @@ format_named_(const std::string& s)
 {
   if (s == "float8_e4m3fn" || s == "float8_e4m3") { return Format::kE4M3; }
   if (s == "float8_e5m2") { return Format::kE5M2; }
+  if (s == "int8_tensorwise") { return Format::kI8; }
   return Format::kNone;
 }
 
@@ -128,7 +172,7 @@ is_aux_name(const std::string& name) noexcept
 
 bool
 resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
-        std::string* err)
+        std::string* err, bool int8)
 {
   if (err != nullptr) { err->clear(); }
   const auto* ti = w.info(name);
@@ -136,32 +180,54 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
   const std::string layer = layer_of_(name);
   Format f = format_of(ti->dtype);
   // What the encoding records say about this layer, when anything does.
-  std::string declared;
+  Declared declared;
   if (!layer.empty()) {
     std::string e;
     declared = declared_format_(w, layer, &e);
     if (!e.empty()) { return fail_(err, e); }
   }
-  if (!declared.empty()) {
-    const Format df = format_named_(declared);
-    if (df == Format::kNone) {
+  int rot = 0;
+  if (!declared.format.empty()) {
+    const Format df = format_named_(declared.format);
+    if (df == Format::kNone || (df == Format::kI8 && !int8)) {
       return fail_(err, fmt("'{}' is stored as '{}', which this build does "
-                            "not read -- plain and scaled FP8 "
+                            "not read{} -- plain and scaled FP8 "
                             "(float8_e4m3fn / float8_e5m2) are",
-                            name, declared)());
+                            name, declared.format,
+                            df == Format::kI8 ? " for this model"
+                                              : "")());
     }
-    // The record wins over a U8 dtype (the legacy on-disk form); a real
-    // FP8 dtype has to agree with it.
-    if (f != Format::kNone && f != df) {
-      return fail_(err, fmt("'{}' is {} on disk but its record says '{}'",
-                            name, ti->dtype, declared)());
-    }
-    if (f == Format::kNone) {
-      if (ti->dtype != "U8") {
-        return fail_(err, fmt("'{}' is recorded as '{}' but stored as {}",
-                              name, declared, ti->dtype)());
+    if (df == Format::kI8) {
+      // Signed codes, the record the only thing that says what they are.
+      if (ti->dtype != "I8" || ti->shape.size() != 2) {
+        return fail_(err, fmt("'{}' is recorded as '{}' but stored as {} "
+                              "of {} dims", name, declared.format,
+                              ti->dtype, ti->shape.size())());
+      }
+      if (declared.convrot) {
+        rot = declared.group;
+        if (!convrot_group_ok(rot) || ti->shape[1] % rot != 0) {
+          return fail_(err, fmt("'{}': ConvRot group {} -- a power of four "
+                                "from 4 to 1024 dividing its {} columns is "
+                                "what this build reads", name, rot,
+                                ti->shape[1])());
+        }
       }
       f = df;
+    } else {
+      // The record wins over a U8 dtype (the legacy on-disk form); a real
+      // FP8 dtype has to agree with it.
+      if (f != Format::kNone && f != df) {
+        return fail_(err, fmt("'{}' is {} on disk but its record says '{}'",
+                              name, ti->dtype, declared.format)());
+      }
+      if (f == Format::kNone) {
+        if (ti->dtype != "U8") {
+          return fail_(err, fmt("'{}' is recorded as '{}' but stored as {}",
+                                name, declared.format, ti->dtype)());
+        }
+        f = df;
+      }
     }
   }
   std::string scale;
@@ -179,8 +245,8 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
   }
   if (f == Format::kNone) {
     // A scale beside a weight that is NOT FP8 means an encoding this
-    // cannot see (int8, a 4-bit pack): refused, since dropping the scale
-    // would load the codes as values.
+    // cannot see (int8 with no record, a 4-bit pack): refused, since
+    // dropping the scale would load the codes as values.
     if (!scale.empty()) {
       return fail_(err, fmt("'{}' is {} with a scale ('{}') beside it -- "
                             "not an FP8 encoding this build reads",
@@ -188,8 +254,14 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
     }
     return false;
   }
+  // An int8 code is an integer: its scale is the value's whole magnitude.
+  if (f == Format::kI8 && scale.empty()) {
+    return fail_(err, fmt("'{}' is int8 with no weight_scale beside it",
+                          name)());
+  }
   Weight x;
   x.format = f;
+  x.rot_group = rot;
   if (!scale.empty()) {
     const auto* si = w.info(scale);
     const std::size_t rows = ti->shape.empty() ? 0 : (std::size_t)ti->shape[0];
@@ -219,7 +291,7 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
 }
 
 bool
-scan(const MetalLlamaWeights& w, Layout* out, std::string* err)
+scan(const MetalLlamaWeights& w, Layout* out, std::string* err, bool int8)
 {
   Layout l;
   const std::vector<std::string> names = w.tensor_names();
@@ -227,7 +299,7 @@ scan(const MetalLlamaWeights& w, Layout* out, std::string* err)
     if (is_aux_name(n)) { continue; }
     Weight x;
     std::string e;
-    if (resolve(w, n, &x, &e)) {
+    if (resolve(w, n, &x, &e, int8)) {
       l.weights.emplace(n, std::move(x));
     } else if (!e.empty()) {
       return fail_(err, e);
@@ -317,41 +389,72 @@ translate_torchao(MetalLlamaWeights& w)
 
 void
 decode_f32(const std::uint8_t* codes, float* dst, std::size_t rows,
-           std::size_t cols, Format f, const std::vector<float>& scale)
+           std::size_t cols, Format f, const std::vector<float>& scale,
+           int rot_group)
 {
   const std::array<float, 256>& t = f32_table(f);
   const bool per_row = scale.size() > 1;
   const float s0 = scale.empty() ? 1.0f : scale[0];
+  std::vector<std::int32_t> row(rot_group > 0 ? cols : 0);
+  const float inv = rot_group > 0 ? convrot_norm(rot_group) : 1.0f;
   for (std::size_t r = 0; r < rows; ++r) {
     const float s = per_row ? scale[r] : s0;
     const std::uint8_t* c = codes + r * cols;
     float* d = dst + r * cols;
+    if (rot_group > 0) {
+      // ConvRot (int8 only): the row's codes un-rotated exactly, then
+      // scaled -- as decode_bf16 does, without its rounding to bf16.
+      for (std::size_t k = 0; k < cols; ++k) {
+        row[k] = (std::int8_t)c[k];
+      }
+      convrot_unrotate(row.data(), cols, rot_group);
+      for (std::size_t k = 0; k < cols; ++k) {
+        d[k] = (float)row[k] * s * inv;
+      }
+      continue;
+    }
     for (std::size_t k = 0; k < cols; ++k) { d[k] = t[c[k]] * s; }
   }
 }
 
 void
 decode_bf16(const std::uint8_t* codes, std::uint16_t* dst, std::size_t rows,
-            std::size_t cols, Format f, const std::vector<float>& scale)
+            std::size_t cols, Format f, const std::vector<float>& scale,
+            int rot_group)
 {
-  if (scale.empty()) {
+  if (scale.empty() && rot_group <= 0) {
     decode_bf16(codes, dst, rows * cols, f);   // exact
     return;
   }
   const std::array<float, 256>& t = f32_table(f);
   const bool per_row = scale.size() > 1;
+  std::vector<std::int32_t> row(rot_group > 0 ? cols : 0);
+  const float inv = rot_group > 0 ? convrot_norm(rot_group) : 1.0f;
   for (std::size_t r = 0; r < rows; ++r) {
-    const float s = per_row ? scale[r] : scale[0];
+    const float s = scale.empty() ? 1.0f : per_row ? scale[r] : scale[0];
     const std::uint8_t* c = codes + r * cols;
     std::uint16_t* d = dst + r * cols;
-    for (std::size_t k = 0; k < cols; ++k) {
-      const float v = t[c[k]] * s;
+    auto put = [&](std::size_t k, float v) {
       std::uint32_t u;
       std::memcpy(&u, &v, 4);
       // Round to nearest even -- the rounding every converter in this
       // tree uses. NaN cannot arise: no weight code is NaN.
       d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    };
+    if (rot_group > 0) {
+      // ConvRot (int8 only): the row's CODES un-rotated, exactly, then
+      // scaled -- one f32 product, rounded once to bf16. The GPU
+      // widening (i8_convrot_dequant) is this to the bit.
+      for (std::size_t k = 0; k < cols; ++k) {
+        row[k] = (std::int8_t)c[k];
+      }
+      convrot_unrotate(row.data(), cols, rot_group);
+      for (std::size_t k = 0; k < cols; ++k) {
+        put(k, (float)row[k] * s * inv);
+      }
+      continue;
     }
+    for (std::size_t k = 0; k < cols; ++k) { put(k, t[c[k]] * s); }
   }
 }
 

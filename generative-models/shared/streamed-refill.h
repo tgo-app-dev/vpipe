@@ -60,7 +60,9 @@
 //
 // U8 is served RAW only: it is how ComfyUI's comfy_quant writer stores
 // FP8 codes whose format lives in a record beside them, and the caller
-// that asks for its raw bytes is the one that read the record.
+// that asks for its raw bytes is the one that read the record. I8 alike:
+// ComfyUI's int8 codes, a ConvRot weight's not elementwise at all, so
+// only the model that read the record widens them (fp8-expand.h).
 //
 // FP8 (F8_E4M3 / F8_E5M2) is served under both, differently:
 //
@@ -160,7 +162,8 @@ refill_serves(WeightSet& ws, const std::string& name, RefillDst as)
   if (ti == nullptr) { return false; }
   return ti->dtype == "BF16" || ti->dtype == "U32" ||
          fp8::format_of(ti->dtype) != fp8::Format::kNone ||
-         (ti->dtype == "U8" && as == RefillDst::kRaw) ||
+         ((ti->dtype == "U8" || ti->dtype == "I8") &&
+          as == RefillDst::kRaw) ||
          (ti->dtype == "F16" && as == RefillDst::kBf16);
 }
 

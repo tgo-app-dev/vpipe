@@ -1,4 +1,4 @@
-#include "stages/model-source.h"
+#include "stages/model-source-host.h"
 
 #include "common/flex-data.h"
 
@@ -231,6 +231,68 @@ current_mirrors_()
   return mirror_snapshots_().back();
 }
 
+// A plugin load's quarantine (begin_mirror_quarantine): while it is open,
+// the rows a register_mirror_repos takes are held here, not published.
+// Under mirror_mutex_().
+bool&
+mirror_quarantine_()
+{
+  static bool q = false;
+  return q;
+}
+
+vector<MirrorEntry>&
+held_mirrors_()
+{
+  static vector<MirrorEntry> v;
+  return v;
+}
+
+// Whether (source, hf_path) already has a row: built in, published, or
+// (`held`) held by the load in quarantine. Under mirror_mutex_().
+bool
+mirror_taken_(const MirrorEntry& e, const vector<MirrorEntry>* published,
+              const vector<MirrorEntry>* held)
+{
+  auto same = [&](const MirrorEntry& m) {
+    return m.source == e.source && m.hf_path == e.hf_path;
+  };
+  for (const MirrorEntry& m : kMirrors) {
+    if (same(m)) { return true; }
+  }
+  for (const vector<MirrorEntry>* v : {published, held}) {
+    if (v == nullptr) { continue; }
+    for (const MirrorEntry& m : *v) {
+      if (same(m)) { return true; }
+    }
+  }
+  return false;
+}
+
+// Publish `entries` as a new snapshot (first-wins against what is there
+// already). Under mirror_mutex_().
+size_t
+publish_mirrors_(vector<MirrorEntry> entries)
+{
+  auto next = make_shared<vector<MirrorEntry>>();
+  if (!mirror_snapshots_().empty()) {
+    *next = *mirror_snapshots_().back();
+  }
+  size_t taken = 0;
+  for (MirrorEntry& e : entries) {
+    if (e.source.empty() || e.hf_path.empty() ||
+        mirror_taken_(e, next.get(), nullptr)) {
+      continue;
+    }
+    next->push_back(std::move(e));
+    ++taken;
+  }
+  if (taken > 0) {
+    mirror_snapshots_().push_back(next);
+  }
+  return taken;
+}
+
 }
 
 vector<HfFile>
@@ -313,6 +375,13 @@ default_model_source()
   return kHuggingFace;
 }
 
+string
+model_source_label(const string& name)
+{
+  const ModelSource* s = model_source(name);
+  return s != nullptr ? string(s->label()) : string();
+}
+
 vector<string>
 model_source_names()
 {
@@ -361,34 +430,45 @@ size_t
 register_mirror_repos(vector<MirrorEntry> entries)
 {
   std::lock_guard<std::mutex> lk(mirror_mutex_());
-  auto next = make_shared<vector<MirrorEntry>>();
-  if (!mirror_snapshots_().empty()) {
-    *next = *mirror_snapshots_().back();
+  // First-wins, built-ins included: a plugin cannot redirect a repo the
+  // tree already knows where to find.
+  if (!mirror_quarantine_()) {
+    return publish_mirrors_(std::move(entries));
   }
+  // A plugin is loading: held until the host admits it.
+  const vector<MirrorEntry>* published =
+      mirror_snapshots_().empty() ? nullptr
+                                  : mirror_snapshots_().back().get();
   size_t taken = 0;
   for (MirrorEntry& e : entries) {
-    if (e.source.empty() || e.hf_path.empty()) {
+    if (e.source.empty() || e.hf_path.empty() ||
+        mirror_taken_(e, published, &held_mirrors_())) {
       continue;
     }
-    // First-wins, built-ins included: a plugin cannot redirect a repo the
-    // tree already knows where to find.
-    bool dup = false;
-    for (const MirrorEntry& m : kMirrors) {
-      if (m.source == e.source && m.hf_path == e.hf_path) { dup = true; }
-    }
-    for (const MirrorEntry& m : *next) {
-      if (m.source == e.source && m.hf_path == e.hf_path) { dup = true; }
-    }
-    if (dup) {
-      continue;
-    }
-    next->push_back(std::move(e));
+    held_mirrors_().push_back(std::move(e));
     ++taken;
   }
-  if (taken > 0) {
-    mirror_snapshots_().push_back(next);
-  }
   return taken;
+}
+
+void
+begin_mirror_quarantine()
+{
+  std::lock_guard<std::mutex> lk(mirror_mutex_());
+  mirror_quarantine_() = true;
+  held_mirrors_().clear();
+}
+
+void
+end_mirror_quarantine(bool admit)
+{
+  std::lock_guard<std::mutex> lk(mirror_mutex_());
+  vector<MirrorEntry> held = std::move(held_mirrors_());
+  held_mirrors_().clear();
+  mirror_quarantine_() = false;
+  // admitted: first-wins again, against whatever the host published
+  // while the plugin loaded
+  if (admit) { publish_mirrors_(std::move(held)); }
 }
 
 string

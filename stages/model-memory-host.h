@@ -12,6 +12,7 @@
 #ifndef VPIPE_STAGES_MODEL_MEMORY_HOST_H
 #define VPIPE_STAGES_MODEL_MEMORY_HOST_H
 
+#include "generative-models/lm-run-memory.h"
 #include "stages/model-memory.h"
 
 #include <cstddef>
@@ -49,12 +50,36 @@ std::size_t moe_expert_cache(const SessionContextIntf* session,
 //     admits -- `picture_pixels`, or the checkpoint's own bound (16.7 MP
 //     on a Qwen3-VL repo: ~5 GB) when 0, or `picture_tokens` merged
 //     tokens' worth when that is set, none when < 0 -- unphased and labelled
-//     "vision:<label>": per STAGE, since two stages encode at once.
+//     "vision:<label>": per STAGE, since two stages encode at once;
+//   * with `run.draft_head`, the model's own draft head where loading it
+//     is optional (DeepSeek-V4.1's DSpark), held whole beside the weights;
+//   * what it RUNS in beside them -- its K/V and per-context state, a
+//     prefill's activations, the decode scratch -- as `run` shapes it
+//     (genai::lm_run_bytes), unphased and labelled lm_run_label(dir): per
+//     CHECKPOINT, as the stages naming one share its loaded model. The
+//     loader sizes a routed-expert cache beside that same figure.
+// `memory_limit` (bytes, 0 none) is the host's limit on what the model
+// holds (genai::load_spec::kMemoryLimitMb): a Mixture of Experts' weights
+// are then booked at what its cache sized within the limit leaves it
+// holding (kClaimHeldBytes), never under the floor, so the plan its peers
+// size against has the room the limit gives them. A dense model is booked
+// whole, as it loads.
 std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
                                      const std::string& dir,
                                      const std::string& label,
+                                     const genai::LmRunShape& run,
                                      std::int64_t picture_pixels = 0,
-                                     int picture_tokens = 0);
+                                     int picture_tokens = 0,
+                                     std::size_t memory_limit = 0);
+
+// int, on a weights claim's `extra`: the most the component will HOLD,
+// when that is less than its checkpoint weighs and it is not a floor -- a
+// Mixture of Experts whose routed-expert cache is sized within a host's
+// memory limit. The weights planner books the checkpoint at it (never
+// under the claim's floor, never over the checkpoint). Read through
+// DeliveringResourceClaim (pipeline/resource-claim-delivery.h). Host-only:
+// the host's language-model stages set it; no plugin is offered it yet.
+inline constexpr std::string_view kClaimHeldBytes = "held_bytes";
 
 // THE RESIDENCY RESERVE of a model resident in `phase` that grows a
 // resident set by measurement -- a conditioning encoder streaming through

@@ -249,6 +249,11 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"affine_dequant_bf16", "fp8_e5m2_dequant", false},
   {"affine_dequant_bf16", "fp8_e4m3_dequant_scaled", false},
   {"affine_dequant_bf16", "fp8_e5m2_dequant_scaled", false},
+  // ...and ComfyUI's int8, plain and ConvRot-rotated. Optional: a toolkit
+  // on a host older than these finds them invalid, keeps FP8, and an
+  // int8 checkpoint is refused by name (Expander::int8_valid() false).
+  {"affine_dequant_bf16", "i8_dequant_scaled", false},
+  {"affine_dequant_bf16", "i8_convrot_dequant", false},
   // The accurate tier's quantizers rotated (I8GemmContext::
   // set_g64_rotation). Optional: a toolkit on a host older than these
   // finds them invalid and keeps the plain pair (g64_rotated() false).

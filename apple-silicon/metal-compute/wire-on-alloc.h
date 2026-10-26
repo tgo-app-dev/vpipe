@@ -32,22 +32,37 @@
 // wired_bytes() either, which still counts the load's temporaries
 // (MEASURED 1.6-2.2 GB of them on a Qwen3.5-4B load).
 //
+// A scope has a ROOM: what it may hold wired at once, from what it held at
+// its start. A buffer that would take it past is left unwired, as a refused
+// one is, and counted (held_back_bytes()) -- the wired pool's free room, so
+// a language model's load is held to the pool's ceiling as every other
+// model is. Live bytes, so a temporary freed gives its room back. Nested,
+// the smaller room is the one in force.
+//
 // INTERNAL: not installed and not exported (libvpipe is hidden by default).
 // It is a host's load-time policy, not something a plugin calls.
 
 #include <cstddef>
+#include <limits>
 
 namespace vpipe::metal_compute {
 
 class WireOnAlloc {
 public:
-  WireOnAlloc() noexcept;
+  explicit WireOnAlloc(
+      std::size_t room = std::numeric_limits<std::size_t>::max()) noexcept;
   ~WireOnAlloc();
   WireOnAlloc(const WireOnAlloc&)            = delete;
   WireOnAlloc& operator=(const WireOnAlloc&) = delete;
 
   // A scope is open on this thread (they nest).
   static bool active() noexcept;
+  // Would `bytes` more stay within this thread's room? Asked before the
+  // mlock; false is noted as held back.
+  static bool may_wire(std::size_t bytes) noexcept;
+  // What this thread's open scopes hold wired now, not yet charged to
+  // anyone: what a pool asked mid-load must count as in use. 0 outside.
+  static std::size_t live_now() noexcept;
   // make_shared_buffer's report of a buffer it wired, by its contents.
   static void note_wired(const void* contents, std::size_t bytes) noexcept;
   // A wired buffer's teardown, where it unlocks: one an open scope on this
@@ -57,6 +72,8 @@ public:
   std::size_t wired_bytes() const noexcept;
   // What this scope wired that is still alive: what a load leaves held.
   std::size_t live_bytes() const noexcept;
+  // What its room left unwired, freed buffers included.
+  std::size_t held_back_bytes() const noexcept;
 
   // The smallest buffer worth a syscall: the wired pool's own minimum.
   static constexpr std::size_t kMinBytes = 64 * 1024;
@@ -64,6 +81,8 @@ public:
 private:
   std::size_t _start;
   std::size_t _start_live;
+  std::size_t _start_held;
+  std::size_t _outer_end;   // the room in force before this scope
 };
 
 }  // namespace vpipe::metal_compute

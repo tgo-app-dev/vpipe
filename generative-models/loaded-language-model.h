@@ -36,6 +36,7 @@ class MetalAudioEncoder;
 class MetalGemma4AudioEncoder;
 class MetalGemma4VisionEncoder;
 class MetalPixtralVisionEncoder;
+class MetalDeepseekV41Vision;
 class Gemma4UnifiedEmbedder;
 class MetalQwenVisionEncoder;
 class TokenMuxer;
@@ -176,6 +177,13 @@ public:
   // chat template emits takes the next row; spliced with 1-D RoPE (this
   // family has no mROPE: prefill_multimodal_metal ignores the grids).
   MetalPixtralVisionEncoder* metal_pixtral_vision_encoder() const noexcept;
+  // DeepSeek-V4.1's ViT + aligner (an image's whole span of rows), or
+  // null for any other model or when its tower did not load. Host-only:
+  // NOT exported (the tower's type is not in the SDK, so no plugin can use
+  // it, and an exported method would be a new symbol a plugin built
+  // against this header fails to load without on an older ABI-8 host).
+  __attribute__((visibility("hidden"))) MetalDeepseekV41Vision*
+  metal_deepseek_v41_vision() const noexcept;
 
   // Host-float logits ([vocab]) of the last position predicted by the
   // metal backend's prefill/next_token. The MLX-free sampling source

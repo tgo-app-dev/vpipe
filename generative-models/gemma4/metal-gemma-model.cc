@@ -1682,6 +1682,89 @@ MetalGemmaModel::config_from(const ModelConfig& c)
   return m;
 }
 
+std::size_t
+MetalGemmaModel::run_bytes(const Config& c, std::int64_t kv_tokens,
+                           int contexts, bool plain_mlp, bool double_wide,
+                           bool matrix_cores)
+{
+  const std::size_t ctxs = (std::size_t)std::max(contexts, 1);
+  const std::size_t prompt = (std::size_t)std::max<std::int64_t>(
+      1, std::min<std::int64_t>(kv_tokens, c.max_seq));
+  const std::size_t n = prompt;
+  const std::size_t H = c.hidden, nl = c.n_layers, hpli = c.hpli;
+  const std::size_t qd = (std::size_t)c.n_heads * c.head_dim_full;
+  const std::size_t kd = (std::size_t)c.n_kv_heads * c.head_dim_full;
+  const std::size_t ffn = (std::size_t)c.ffn_inner * (double_wide ? 2 : 1);
+  const std::size_t ple_w = nl * hpli;
+  // forward_chunk_'s buffers, two bytes an element but the int32 ones
+  std::size_t e2 = 0, e4 = 0;
+  e2 += n * (2 * H + qd + 2 * kd + qd + 2 * kd + 2 * qd + H) + 32 * qd;
+  e2 += n * (ffn + H) + (plain_mlp ? n * ffn : 0);
+  if (matrix_cores) { e2 += n * 2 * ffn; }           // gate|up
+  e2 += n * (3 * ple_w + nl * hpli + hpli + H);       // the PLE rows
+  e2 += (std::size_t)c.vocab;
+  e4 += n;                                            // the token ids
+  if (c.is_moe()) {
+    const std::size_t E = c.n_experts, K = c.top_k, I = c.moe_inner;
+    const std::size_t np = n * K;
+    e2 += n * E + np + np * I + np * H + 2 * n * H;
+    e4 += np;
+    if (n >= 64) {
+      const std::size_t tiles = (np + 31) / 32 + E, npad = tiles * 32;
+      e2 += npad * I;
+      e4 += 3 * E + tiles + 1 + 2 * npad;
+    }
+  }
+  // the dequantized weight a GEMM of many rows reads on the matrix cores,
+  // and the head-dim-512 attention's K/V gathered from the pool
+  if (matrix_cores) {
+    e2 += std::max(2 * ffn, qd + 2 * kd) * H;
+    e2 += 2 * kd * n;
+  }
+  // ensure_scratch_: the decode step's buffers, the PLE rows, the
+  // materialized global prefill's scores and V transpose
+  const std::size_t cap =
+      (std::size_t)std::min(c.max_seq, 16384);
+  e2 += cap * cap + kd * cap;
+  e2 += 2 * (std::size_t)c.vocab + 4 * qd + 4 * kd + 3 * ffn + 8 * H +
+        3 * ple_w;
+  e4 += (std::size_t)c.n_heads * 64 * (c.head_dim_full + 2);
+  std::size_t b = 2 * e2 + 4 * e4;
+  // The full layers' paged pool (256-token pages): it doubles toward its
+  // cap as pages are claimed, so it can reach twice the pages `kv_tokens`
+  // fill; while it grows, one layer's old pool beside the new. The
+  // sliding layers' rings, a context each (min(max_seq, window + chunk)
+  // slots and a window-long mirror tail), the prompt's grown to it.
+  const std::size_t pt = 256, max_pages = 4096;
+  const std::size_t pages =
+      ((std::size_t)std::max<std::int64_t>(kv_tokens, 1) + pt - 1) / pt;
+  std::size_t pcap = std::max(pages, pages > 1 ? 2 * pages - 2 : 1);
+  pcap = std::min(pcap, max_pages);
+  const std::size_t win = (std::size_t)std::max(c.sliding_window, 0);
+  std::size_t ring = std::min<std::size_t>(
+      (std::size_t)c.max_seq, win + (std::size_t)std::max(c.sliding_chunk, 0));
+  if (c.sliding_chunk <= 0) { ring = (std::size_t)c.max_seq; }
+  const std::size_t tail = ring < (std::size_t)c.max_seq && win > 1
+                               ? win - 1 : 0;
+  const std::size_t grown =
+      std::max(ring + tail, prompt + (prompt < (std::size_t)c.max_seq &&
+                                      win > 1 ? win - 1 : 0));
+  std::size_t full_page = 0;
+  for (int L = 0; L < c.first_shared(); ++L) {
+    const std::size_t nkv = (std::size_t)c.n_kv(L);
+    if (c.layer_is_full(L)) {
+      const std::size_t page = nkv * pt * c.head_dim_full * 2;
+      b += 2 * pcap * page;
+      full_page = std::max(full_page, page);
+    } else {
+      const std::size_t slot = nkv * c.head_dim_sliding * 2 * 2;
+      b += slot * (grown + (ctxs - 1) * (ring + tail));
+    }
+  }
+  b += 2 * pcap * full_page;   // one layer's pool while it grows
+  return b;
+}
+
 // Per-machine decode-attention SPLIT autotune (gtile-vec flash-decode). The
 // split count sp trades parallelism against the merge cost; the sweet spot is a
 // GPU property. Two regimes: the GLOBAL (head_dim_full, long-context) layers --
