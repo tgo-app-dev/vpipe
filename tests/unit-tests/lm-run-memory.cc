@@ -259,3 +259,102 @@ TEST(lm_run_memory, a_hosts_limit_reaches_the_plan)
   EXPECT_TRUE(alone > 0 && alone < ex / 4);
   EXPECT_TRUE(got == alone);
 }
+
+// The cache the host ASKS for (load_spec::kExpertCacheMb) on a Qwen MoE:
+// at most that, within the limit and the box -- every expert resident
+// where it holds them all, never under a layer's experts -- and the claim
+// booking the rest of the model and that cache (every expert at most),
+// the smaller under a limit, which the weights planner honours.
+// Env: VPIPE_QWEN35_MOE_TEST_MODEL_PATH (config and shard headers only;
+// a box that holds it whole -- 64 GB for the 35B-A3B 4-bit).
+TEST(lm_run_memory, the_cache_is_at_most_what_the_host_asks)
+{
+  const std::string dir = env_("VPIPE_QWEN35_MOE_TEST_MODEL_PATH");
+  if (dir.empty()) { return; }
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  if (mgr == nullptr) { return; }
+  ModelLoader loader(&sess);
+  const auto mcfg = loader.load_config(dir);
+  ASSERT_TRUE(mcfg.has_value());
+  if (!mcfg.has_value()) { return; }
+  MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+  ASSERT_TRUE(c.is_moe());
+  auto w = MetalLlamaWeights::open_model(dir);
+  ASSERT_TRUE(w.has_value());
+  if (!w.has_value()) { return; }
+  const std::size_t ex = MetalQwenModel::routed_expert_bytes(*w, c);
+  const std::size_t layer = ex / (std::size_t)std::max(1, c.n_layers);
+  LmRunShape shape;
+  shape.page_tokens = 512;
+  shape.max_pages = 64;
+  shape.kv_tokens = 512 * 64;
+  c.page_tokens = shape.page_tokens;
+  c.max_pages = (int)shape.max_pages;
+  const std::size_t run = lm_run_bytes(&sess, dir, shape);
+  auto cache = [&](std::size_t limit, std::size_t asked) {
+    return MetalQwenModel::lm_expert_cache_bytes(nullptr, dir, c, run,
+                                                 limit, asked);
+  };
+  const auto plain = model_memory::lm_claims(&sess, dir, "chat", shape, -1);
+  ASSERT_TRUE(!plain.empty() && plain[0].floor_bytes > layer);
+  if (plain.empty()) { return; }
+  const std::size_t floor = plain[0].floor_bytes;
+  const std::size_t rest = floor - layer;
+  if (cache(0, 0) != 0) {
+    std::printf("[lm-run] this box does not hold the model whole: the "
+                "loader's arms are skipped\n");
+  } else {
+    // what is asked, at most
+    EXPECT_TRUE(cache(0, ex / 2) == ex / 2);
+    EXPECT_TRUE(cache(0, ex / 4) == ex / 4);
+    // every expert, or more: all of them resident
+    EXPECT_TRUE(cache(0, ex) == 0);
+    EXPECT_TRUE(cache(0, 2 * ex) == 0);
+    // less than a layer's experts: a layer's
+    EXPECT_TRUE(cache(0, 1) == layer);
+    // within a limit leaving about a quarter of the experts: the smaller
+    // of the two
+    const std::size_t lim = run + floor + ex / 4;
+    const std::size_t tight = cache(lim, 0);
+    ASSERT_TRUE(tight > layer && tight < ex / 2);
+    EXPECT_TRUE(cache(lim, ex / 2) == tight);
+    EXPECT_TRUE(cache(lim, tight / 2) == tight / 2);
+  }
+  // the plan: the rest of the model and the cache asked for
+  auto booked = [&](std::size_t limit, std::size_t asked) {
+    return bag::integer(model_memory::lm_claims(&sess, dir, "chat", shape,
+                                                -1, 0, limit,
+                                                asked)[0].extra,
+                        model_memory::kClaimHeldBytes, -1);
+  };
+  EXPECT_TRUE(booked(0, 0) == -1);
+  EXPECT_TRUE(booked(0, ex / 2) == (std::int64_t)(rest + ex / 2));
+  EXPECT_TRUE(booked(0, 1) == (std::int64_t)floor);
+  EXPECT_TRUE(booked(0, 2 * ex) == (std::int64_t)(rest + ex));
+  // under a limit, the smaller
+  EXPECT_TRUE(booked(run + rest + ex * 3 / 4, ex / 2) ==
+              (std::int64_t)(rest + ex / 2));
+  EXPECT_TRUE(booked(run + rest + ex / 2, ex * 3 / 4) ==
+              (std::int64_t)(rest + ex / 2));
+  // delivered as the runtime does
+  const auto claims =
+      model_memory::lm_claims(&sess, dir, "chat", shape, -1, 0, 0, ex / 2);
+  auto& reg = ResourcePlannerRegistry::get();
+  for (std::string_view k :
+       {model_memory::kWeightsKind, model_memory::kScratchKind}) {
+    if (ResourcePlanner* p = reg.find(k)) { p->begin_plan(&sess); }
+  }
+  for (const ResourceClaim& cl : claims) {
+    if (ResourcePlanner* p = reg.find(cl.kind)) {
+      DeliveringResourceClaim d(cl);
+      p->claim(&sess, cl.key, cl.phase, cl.last_phase, cl.floor_bytes);
+    }
+  }
+  std::printf("[lm-run] half the experts asked: booked %zu MB (floor %zu, "
+              "experts %zu)\n", mgr->planned_weight_bytes(dir) >> 20,
+              floor >> 20, ex >> 20);
+  EXPECT_TRUE(mgr->planned_weight_bytes(dir) == rest + ex / 2);
+  mgr->clear_declarations();
+}

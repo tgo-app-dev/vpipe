@@ -2366,6 +2366,97 @@ TEST(deepseek_v41, the_cache_is_sized_within_the_hosts_limit)
   }
 }
 
+// The cache the host ASKS for (load_spec::kExpertCacheMb): at most that,
+// within the limit and the box as before -- the trade between a
+// conversation's room, the room left beside the model and decode speed,
+// made by the host. Every expert resident only where all of them fit in
+// it (the DSpark head only then), the floor below a layer's two, and the
+// plan booking the model at the rest of it and that cache.
+TEST(deepseek_v41, the_cache_is_at_most_what_the_host_asks)
+{
+  {
+    LmMemoryLimit a((std::size_t)64 << 30, (std::size_t)16 << 30);
+    EXPECT_TRUE(LmMemoryLimit::current() == (std::size_t)64 << 30);
+    EXPECT_TRUE(LmMemoryLimit::expert_cache() == (std::size_t)16 << 30);
+    {
+      LmMemoryLimit b(0);
+      EXPECT_TRUE(LmMemoryLimit::current() == 0);
+      EXPECT_TRUE(LmMemoryLimit::expert_cache() == 0);
+    }
+    EXPECT_TRUE(LmMemoryLimit::expert_cache() == (std::size_t)16 << 30);
+  }
+  EXPECT_TRUE(LmMemoryLimit::expert_cache() == 0);
+  const std::string gd = env_("VPIPE_DSV41_SMALL_GOLDEN");
+  if (gd.empty()) { return; }
+  const std::string md = (fs::path(gd) / "model").string();
+  ::unsetenv("VPIPE_DSV41_EXPERT_CACHE_MB");
+  ::unsetenv("VPIPE_DSV41_DSPARK");
+  std::size_t ex = 0, rest = 0, vis = 0, disk = 0;
+  ASSERT_TRUE(MetalDeepseekV41ModelExec::expert_bytes(md, &ex, &rest, &vis,
+                                                      &disk));
+  DeepseekV41Config cfg;
+  std::string err;
+  ASSERT_TRUE(DeepseekV41Config::from_dir(md, &cfg, &err));
+  const std::size_t run = MetalDeepseekV41Model::run_bytes(cfg, 2048, 4096);
+  const std::size_t held = rest + vis +
+                           MetalDeepseekV41Vision::encode_scratch_bytes(cfg);
+  auto cache = [&](std::size_t limit, std::size_t asked) {
+    return MetalDeepseekV41ModelExec::lm_expert_cache_bytes(
+        nullptr, md, run, nullptr, false, limit, asked);
+  };
+  // this box holds the small model whole: what is asked, at most
+  EXPECT_TRUE(cache(0, 0) == 0);
+  EXPECT_TRUE(cache(0, ex / 2) == ex / 2);
+  EXPECT_TRUE(cache(0, ex / 4) == ex / 4);
+  // every expert, or more: all of them resident
+  EXPECT_TRUE(cache(0, ex) == 0);
+  EXPECT_TRUE(cache(0, 2 * ex) == 0);
+  // less than a cache holds: its floor
+  EXPECT_TRUE(cache(0, 1) == 1);
+  // within the limit: the smaller of the two
+  EXPECT_TRUE(cache(run + held + ex / 2, ex / 4) == ex / 4);
+  EXPECT_TRUE(cache(run + held + ex / 4, ex / 2) == ex / 4);
+  EXPECT_TRUE(cache(run + held + ex, 2 * ex) == 0);
+  if (MetalDeepseekV41Model::dspark_bytes(md) > 0) {
+    EXPECT_TRUE(MetalDeepseekV41ModelExec::dspark_pays(
+        nullptr, md, run, nullptr, 0, 2 * ex));
+    EXPECT_TRUE(!MetalDeepseekV41ModelExec::dspark_pays(
+        nullptr, md, run, nullptr, 0, ex / 2));
+  }
+  // The plan: the rest of the model (its vision tower's encode a claim of
+  // its own) and the cache asked for -- under a limit, the smaller.
+  Session sess;
+  LmRunShape shape;
+  shape.kv_tokens = 4096;
+  shape.max_pages = 8;
+  std::size_t floor = 0;
+  auto booked = [&](std::size_t limit, std::size_t asked) {
+    const auto claims = model_memory::lm_claims(&sess, md, "chat", shape, -1,
+                                                0, limit, asked);
+    if (claims.empty()) { return (std::int64_t)-1; }
+    floor = claims[0].floor_bytes;
+    return bag::integer(claims[0].extra, model_memory::kClaimHeldBytes, -1);
+  };
+  // never under the claim's floor: two layers of experts
+  auto at_least = [&](std::size_t b) {
+    return (std::int64_t)std::max(b, floor);
+  };
+  EXPECT_TRUE(booked(0, 0) == -1);
+  const std::int64_t half = booked(0, ex / 2);
+  std::printf("[dsv41] asked half the experts: held %lld (floor %zu)\n",
+              (long long)half, floor);
+  EXPECT_TRUE(half == at_least(rest + vis + ex / 2));
+  const std::size_t lrun = lm_run_bytes(&sess, md, shape);
+  const std::size_t vs =
+      vis > 0 ? MetalDeepseekV41Vision::encode_scratch_bytes(cfg) : 0;
+  EXPECT_TRUE(booked(lrun + vs + rest + vis + ex * 3 / 4, ex / 2) ==
+              at_least(rest + vis + ex / 2));
+  EXPECT_TRUE(booked(lrun + vs + rest + vis + ex / 2, ex * 3 / 4) ==
+              at_least(rest + vis + ex / 2));
+  // past every expert: every one resident, not the ask
+  EXPECT_TRUE(booked(0, 2 * ex) == at_least(rest + vis + ex));
+}
+
 // The host's limit reaches the PLAN, which is what its peers size
 // against: an LM stage's claim books the checkpoint at what its cache,
 // sized within the limit, leaves it holding -- the limit less the run and
@@ -2458,6 +2549,210 @@ TEST(deepseek_v41, a_hosts_limit_reaches_the_plan)
               got, alone);
   EXPECT_TRUE(alone > 1 && alone < ex * 3 / 4);
   EXPECT_TRUE(got == alone);
+}
+
+// A model kept warm is weighed at what it HOLDS when a launch that does
+// not claim it asks whether it fits beside it: a Mixture of Experts its
+// cache, not the experts it reads from disk, and its runs the scratch they
+// grew. Weighed at its checkpoint, an agent's DeepSeek under a 32 GB cache
+// (41 GB held of 432) was unloaded for every picture on a 256 GB M5 Ultra
+// -- its conversation prefilled again after each. Kept on a box with room
+// for what it holds and short of its checkpoint; released on one short of
+// what it holds, its run state included, and where its wired bytes leave
+// the launch's weights no room in the wired pool (kept, under the box's
+// own cache, a Krea-2 picture beside it streamed every block, 2.4x
+// slower).
+TEST(deepseek_v41, a_warm_model_is_weighed_at_what_it_holds)
+{
+  const std::string gd = env_("VPIPE_DSV41_SMALL_GOLDEN");
+  if (gd.empty()) { return; }
+  const std::string md = (fs::path(gd) / "model").string();
+  ::unsetenv("VPIPE_DSV41_EXPERT_CACHE_MB");
+  ::unsetenv("VPIPE_DSV41_DSPARK");
+  std::size_t ex = 0, rest = 0, vis = 0, disk = 0;
+  ASSERT_TRUE(MetalDeepseekV41ModelExec::expert_bytes(md, &ex, &rest, &vis,
+                                                      &disk));
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  if (mgr == nullptr) { return; }
+  const std::size_t preload = model_memory::dir_weights_bytes(md);
+  // loaded as a host's chat loads it -- wired, its cache a quarter of its
+  // experts -- and kept warm: what it holds in weights, for its runs (its
+  // load's warm-up built the forward's scratch) and wired
+  struct Held {
+    std::size_t weights = 0, run = 0, wired = 0;
+  };
+  auto warm_up = [&]() {
+    Held h;
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    genai::LoadSpec spec;
+    spec.hf_dir = md;
+    spec.compute_dtype = "bf16";
+    spec.page_tokens = 512;
+    spec.max_pages = 16;
+    bag::set_flag(spec.extra, load_spec::kWireWeights, true);
+    bag::set_integer(spec.extra, load_spec::kExpertCacheMb,
+                     (std::int64_t)std::max<std::size_t>(1, (ex / 4) >> 20));
+    auto lm = mgr->load(spec);
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    if (lm == nullptr || !lm->valid()) { return h; }
+    const std::size_t own = lm->run_state_bytes();
+    mgr->keep_warm(lm, md, 600.0);
+    lm.reset();
+    h.weights = mgr->warm_held_bytes(md);
+    h.run = mgr->warm_run_bytes(md);
+    h.wired = mgr->warm_wired_bytes(md);
+    // the model's own figure, not a booking (nothing was planned)
+    EXPECT_TRUE(own > 0 && h.run == own);
+    return h;
+  };
+  Held h = warm_up();
+  ASSERT_TRUE(mgr->warm_count() == 1);
+  if (mgr->warm_count() != 1) { return; }
+  std::printf("[dsv41] kept warm under a quarter's cache: %zu MB held of a "
+              "%zu MB checkpoint, %.1f MB for its runs, %zu MB wired\n",
+              h.weights >> 20, preload >> 20, (double)h.run / (1 << 20),
+              h.wired >> 20);
+  EXPECT_TRUE(h.weights > rest && h.weights < preload);
+  EXPECT_TRUE(h.wired > 0 && h.wired <= h.weights);
+  EXPECT_TRUE(mgr->warm_held_bytes(md + "-another") == 0);
+  EXPECT_TRUE(mgr->warm_run_bytes(md + "-another") == 0);
+
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  const fs::path other = fs::temp_directory_path()
+      / ("vpipe-dsv41-warm-" + std::to_string(::getpid()));
+  fs::create_directories(other);
+  const std::size_t other_bytes = (std::size_t)1 << 20;
+  {
+    std::ofstream f(other / "model.safetensors", std::ios::binary);
+    const std::string blob(other_bytes, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  // what the box holds besides the warm model, as the planner weighs it
+  const std::size_t open = mgr->phase_footprint(std::string());
+  const std::size_t beside = open + mgr->scratch_bytes(std::string())
+      + mgr->resident_kv_bytes()
+      + model_memory::dir_weights_bytes(other.string())
+      + model_memory::kHeadroom;
+  // a launch claiming the other checkpoint on a `box`-byte box, the wired
+  // pool `pool` bytes (0: its share of the box)
+  auto launch = [&](std::size_t box, std::size_t pool) {
+    ::setenv("VPIPE_RAM_LIMIT_MB", std::to_string(box >> 20).c_str(), 1);
+    mgr->set_wired_pool_bytes(pool);
+    pl->begin_plan(&sess);
+    pl->claim(&sess, other.string(), "", "", 0);
+    pl->end_plan(&sess);
+    ::unsetenv("VPIPE_RAM_LIMIT_MB");
+    mgr->set_wired_pool_bytes(0);
+    return mgr->warm_count();
+  };
+  const std::size_t roomy = beside + h.weights + h.run +
+                            (preload - h.weights) / 2;
+  // room for what it holds, not for its checkpoint: kept
+  EXPECT_TRUE(launch(roomy, 0) == 1);
+  // a pool with room for its wired bytes beside the launch's weights: kept
+  const std::size_t weights = open + other_bytes;
+  EXPECT_TRUE(launch(roomy, h.wired + weights + ((std::size_t)4 << 20)) ==
+              1);
+  // a pool one short of that: released, the box's RAM roomy as above
+  EXPECT_TRUE(launch(roomy, h.wired + weights - other_bytes / 2) == 0);
+
+  // room for its weights and half its runs: released (the box is set in
+  // whole MB, so the half must clear one)
+  h = warm_up();
+  ASSERT_TRUE(mgr->warm_count() == 1);
+  if (h.run >= ((std::size_t)3 << 20)) {
+    EXPECT_TRUE(launch(beside + h.weights + h.run / 2, 0) == 0);
+  } else {
+    std::printf("[dsv41] its runs hold %zu bytes: too few for a box in MB "
+                "-- the run arm is skipped\n", h.run);
+    EXPECT_TRUE(launch(beside + h.weights / 2, 0) == 0);
+  }
+  // short of what it holds: released
+  h = warm_up();
+  ASSERT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(launch(beside + h.weights / 2, 0) == 0);
+  mgr->clear_declarations();
+  std::error_code ec;
+  fs::remove_all(other, ec);
+}
+
+// A launch that CLAIMS a model kept warm is handed it at the size it
+// loaded at -- neither memory_limit_mb nor expert_cache_mb is in the
+// manager's cache key -- so the weights planner books what it holds,
+// whatever the claim asks: a relaunch asking a 30,517 MB cache of a
+// DeepSeek loaded under the box's own would book 41 GB beside 185 held.
+TEST(deepseek_v41, a_claimed_warm_model_is_booked_at_what_it_holds)
+{
+  const std::string gd = env_("VPIPE_DSV41_SMALL_GOLDEN");
+  if (gd.empty()) { return; }
+  const std::string md = (fs::path(gd) / "model").string();
+  ::unsetenv("VPIPE_DSV41_EXPERT_CACHE_MB");
+  ::unsetenv("VPIPE_DSV41_DSPARK");
+  std::size_t ex = 0, rest = 0, vis = 0, disk = 0;
+  ASSERT_TRUE(MetalDeepseekV41ModelExec::expert_bytes(md, &ex, &rest, &vis,
+                                                      &disk));
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  if (mgr == nullptr) { return; }
+  LmRunShape shape;
+  shape.kv_tokens = 4096;
+  shape.max_pages = 8;
+  // a claim asking the least cache there is: booked at its floor
+  const auto claims = model_memory::lm_claims(&sess, md, "chat", shape, -1,
+                                              0, 0, 1);
+  ASSERT_TRUE(!claims.empty() && claims[0].key == md);
+  if (claims.empty()) { return; }
+  const std::size_t asked = (std::size_t)bag::integer(
+      claims[0].extra, model_memory::kClaimHeldBytes, 0);
+  EXPECT_TRUE(asked == claims[0].floor_bytes);
+  auto deliver = [&]() {
+    auto& reg = ResourcePlannerRegistry::get();
+    for (std::string_view k :
+         {model_memory::kWeightsKind, model_memory::kScratchKind}) {
+      if (ResourcePlanner* p = reg.find(k)) { p->begin_plan(&sess); }
+    }
+    for (const ResourceClaim& c : claims) {
+      if (ResourcePlanner* p = reg.find(c.kind)) {
+        DeliveringResourceClaim d(c);
+        p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+      }
+    }
+    return mgr->planned_weight_bytes(md);
+  };
+  // nothing loaded: as the claim says
+  EXPECT_TRUE(deliver() == asked);
+  // loaded under the box's own cache -- every expert resident on this box
+  // -- wired and kept warm: what it holds, never above the checkpoint
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  genai::LoadSpec spec;
+  spec.hf_dir = md;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 16;
+  bag::set_flag(spec.extra, load_spec::kWireWeights, true);
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (lm == nullptr || !lm->valid()) { return; }
+  mgr->keep_warm(lm, md, 600.0);
+  lm.reset();
+  const std::size_t held = mgr->warm_held_bytes(md);
+  const std::size_t whole = model_memory::dir_weights_bytes(md);
+  const std::size_t booked = deliver();
+  std::printf("[dsv41] a claim asking its floor (%zu MB) of a warm model "
+              "holding %zu MB: booked %zu MB (on disk %zu)\n", asked >> 20,
+              held >> 20, booked >> 20, whole >> 20);
+  ASSERT_TRUE(held > asked);
+  EXPECT_TRUE(booked == std::min(held, whole));
+  // kept: the launch claims it
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  mgr->clear_declarations();
 }
 
 // DSpark loads where it pays: only where every expert is resident (a

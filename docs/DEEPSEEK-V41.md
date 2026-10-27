@@ -270,6 +270,50 @@ loads only where every expert is resident within it. A model already
 loaded (kept warm by another stage) is handed over at the size it loaded
 at. 0, the default, sizes the cache to the box, as above.
 
+`expert_cache_mb` names the cache itself: at most that many megabytes,
+within the limit and the box as before, every expert resident (and
+DSpark loaded) only where all of them fit in it. It is the host's way to
+offer the trade a person makes between the conversation's room, the
+models kept beside this one, and speed -- a prompt's reading as much as
+the decode, since each of its tokens picks its own experts. Measured on
+the 256 GB M5 Ultra through a host (the oQ4e, a 139-token request asked
+twice in one process, a 157-token reply):
+
+| expert cache | the process at its peak | decode, cold / warm | the prompt, warm |
+|---|---|---|---|
+| the box's (175.0 GB) | 196 GB | 23.1 / 32.5 tokens a second | 0.7 s |
+| 61,035 MB asked | 76 GB | 13.3 / 17.3 | 6.5 s |
+| 30,517 MB asked | 44 GB | 8.4 / 9.1 | 8.4 s |
+
+The rest of the model is 10,551 MB wired beside the cache. The
+conversation itself is cheap: its compressed latents and index keys are
+3,200 bytes a token (the four layers that keep them -- three at ratio 2,
+one at 1 -- of 512 latent and 128 index columns in bf16), and the rotary
+tables 512 a position, each held at a power of two of the tokens; the
+indexer's scores grow with the context in chunks of 1 GiB at most. As the
+run is booked, that comes to about 7.9 KB a token beside about 7 GB of
+working memory: the box's cache was 175.0 GB at 131,072 tokens and 168.1
+GB at the whole 1,048,576, which took 7.3 GB from it. With that context
+booked, a 173,599-token prompt prefilled at 1,892 tokens a second (92 s)
+and decoded at 22.7, the process at 195 GB. A box gives the whole context
+wherever the cache's floor (two layers' experts, 14.4 GB of the oQ4e's),
+the rest and the working memory leave 8.3 GB for it -- by these figures
+from 64 GB, where the GPU keeps about 52 GB resident (53,084 MB on a 64 GB
+M4 Pro), its cache at about 18 GB then (not measured on such a box). Kept
+loaded between a host's turns, the model is weighed at what it holds --
+its weights and the scratch its turns grew -- when a picture's graph asks
+for the room, and released where its wiring leaves the picture's weights
+no room in the wired pool (docs/MODEL-MEMORY.md): under the 30,517 MB
+cache it stayed loaded beside a Krea-2 picture on the Ultra and the
+picture ran at its own speed; under the box's cache, 185 GB of it wired
+in a 192 GB pool, it is released for one, the picture at its speed (968
+ms a step) -- kept, the picture ran 2.4x slower beside it (2,266 ms),
+though a host's session of turns around one picture took 102 s kept
+against 139 released: loading the model again costs the turns more than
+the picture gains. A cache asked for under the floor loads the floor,
+and its load line says so ("a 13770 MB expert cache ... 7629 MB asked
+for, under the least it runs with").
+
 ## What is not here yet
 
 - **The stage's own tools** (`enable_tools`: Python, files, the web) are

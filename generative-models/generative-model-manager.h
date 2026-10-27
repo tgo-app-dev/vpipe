@@ -105,6 +105,17 @@ inline constexpr std::string_view kWireWeights = "wire_weights";
 // the box's memory alone. Not part of the cache key, as wire_weights: a
 // model loaded already is handed over at the size it was loaded at.
 inline constexpr std::string_view kMemoryLimitMb = "memory_limit_mb";
+// int: the routed experts' cache of a Mixture of Experts whose experts can
+// live in one (DeepSeek-V4.1-Flash, a Qwen3.x MoE), MB -- at most this,
+// within kMemoryLimitMb and the box as the model sizes it: smaller leaves
+// room for a longer context and for models beside it, larger decodes
+// faster (fewer experts read from disk). Every expert stays resident only
+// where all of them fit within it, and a draft head that loads only with
+// every expert resident (DeepSeek's DSpark) loads only then. A dense
+// model ignores it. Absent / 0: the model's own sizing. Not part of the
+// cache key, as kMemoryLimitMb: a model loaded already is handed over at
+// the size it was loaded at, and the plan books it at what it holds.
+inline constexpr std::string_view kExpertCacheMb = "expert_cache_mb";
 }  // namespace load_spec
 
 // Session-shared cache of loaded language models. Two loads with the
@@ -611,6 +622,26 @@ public:
   // with it). Host-only, as declared_scratch.
   __attribute__((visibility("hidden"))) std::size_t
   planned_weight_bytes(const std::string& dir) const;
+  // What the language models kept warm for `dir` hold in WEIGHTS, as
+  // their loads measured it (wired, or kept unwired by a full pool); 0
+  // when none was measured (a load not wired). A Mixture of Experts holds
+  // its expert cache, not the experts it reads from disk: DeepSeek-V4.1-
+  // Flash's oQ4e under a 32 GB cache ~41 GB of a 432 GB checkpoint.
+  // Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  warm_held_bytes(const std::string& dir) const;
+  // What they hold for their RUNS beside the weights and the K/V
+  // (resident_kv_bytes counts that): the forward's scratch, grown to the
+  // largest piece a turn needed and kept -- exact where the model says
+  // (LoadedLanguageModel::run_state_bytes), else the run arena the plan
+  // booked for it when it was let go (its K/V's capacity in it: a bound
+  // from above). Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  warm_run_bytes(const std::string& dir) const;
+  // What their loads left wired, charged to the wired pool while they
+  // live. Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  warm_wired_bytes(const std::string& dir) const;
 
   // Correct a declared arena to its real size.
   //
@@ -1249,19 +1280,26 @@ private:
   };
   // `parked` after `lm`: members go in reverse, so the contexts are
   // released while the model they live in is still there.
+  // `run_booked`: the run arena the plan booked for it (lm_run_label)
+  // when it was let go -- warm_run_bytes' figure where the model cannot
+  // say what its runs hold.
   struct Warm {
     std::shared_ptr<LoadedLanguageModel>  lm;
     std::string                           dir;
     std::chrono::steady_clock::time_point until;
     std::vector<Parked>                   parked;
+    std::size_t                           run_booked = 0;
   };
   // Models loaded with load_spec::kWireWeights and the bytes their load
   // left wired, charged to the pool; given back once the model is gone
-  // (checked at each load, keep_warm, release and expiry). Guarded by
-  // _warm_mu.
+  // (checked at each load, keep_warm, release and expiry). `held`: what
+  // it holds (warm_held_bytes) -- its wired bytes and what a full pool
+  // kept unwired, which counts the load's freed temporaries too: a bound
+  // from above. Guarded by _warm_mu.
   struct Wired {
     std::weak_ptr<LoadedLanguageModel> lm;
     std::size_t                        bytes;
+    std::size_t                        held = 0;
   };
   std::vector<Wired>       _wired_lms;
   mutable std::mutex       _warm_mu;

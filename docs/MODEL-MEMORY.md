@@ -2086,6 +2086,52 @@ the cache, sized beside the plan, leaves out exactly what the plan counts
 for its own checkpoint. It sizes a load; a model kept warm is handed over
 at the size it loaded at.
 
+**Or name the cache.** The limit leaves the cache what the run does not
+take, so a host booking a long context gets a smaller cache, and one that
+wants its model to stay loaded beside picture models has to find the
+limit by subtraction. `expert_cache_mb` on text-chat
+(`load_spec::kExpertCacheMb`) asks for the cache itself: it is at most
+that, within the limit and the box as above -- never more than the
+model's own sizing would take, since a cache past the GPU's working set
+is ruinous (`MetalDeepseekV41ModelExec::lm_expert_cache_bytes`) -- every
+expert resident only where all of them fit in it, and the floor below it
+as ever. The claim books the checkpoint at the rest of the model and that
+cache (under a limit, the smaller of the two). The trade it makes is the
+host's to offer: a smaller cache leaves room for a longer conversation
+and for the models beside it, a larger one reads prompts and decodes
+faster (DeepSeek-V4.1 on an M5 Ultra: 9.1 tok/s warm with a 30,517 MB
+cache, 17.3 with 61,035 MB, 32.5 with the box's 175 GB --
+docs/DEEPSEEK-V41.md).
+
+Kept warm (text-chat's `keep_loaded`), such a model is weighed at what
+it HOLDS when a launch that does not claim it asks whether it fits beside
+it, not at its checkpoint -- DeepSeek under that 30,517 MB cache holds 41
+GB of a 432 GB checkpoint, and weighed at the checkpoint no box would keep
+it beside a picture. What it holds is what its load left live
+(`GenerativeModelManager::warm_held_bytes`: wired, or kept unwired by a
+full pool) and what its runs keep beside the weights and the K/V
+(`warm_run_bytes`: the forward's scratch, grown to the largest piece a
+turn needed -- the model's own figure where it reports one, else the run
+arena the plan booked for it). A load that was not wired measured
+nothing, and is weighed at its checkpoint. Two more rules follow from
+the model staying loaded:
+
+- **It must leave the wired pool room.** Its load stays wired, charged
+  to the pool, so a launch can fit the RAM beside it and still find no
+  room to keep its own weights resident. The model is released when its
+  wired bytes and the launch's weights do not fit the pool together:
+  DeepSeek under the box's own cache, 185 GB wired of the Ultra's 192 GB
+  pool, would otherwise sit beside a Krea-2 picture that then streams
+  every block (measured: the picture 2.4x slower; released, it runs at
+  its speed and the model's next turn loads it again -- a host's session
+  around one picture 139 s against 102 kept, so a host that would rather
+  keep it names a smaller cache).
+- **A launch that claims it books what it holds.** Neither the limit nor
+  the cache asked for is in the manager's cache key, so a warm model is
+  handed over at the size it loaded at. The weights planner books it at
+  the larger of the claim's figure and `warm_held_bytes` -- a relaunch
+  asking a smaller cache would otherwise book 41 GB beside 185 held.
+
 ### How it decides
 
 - **Slots, laid out as the model's own expert slab.** Part *k* of slot *s*
@@ -2174,8 +2220,9 @@ addressing changes. Every model wired to the cache is tested that way
 
 ### Sizing — the engine decides
 
-There is no stage key for the cache's size. The loader applies the same
-rule `plan_streaming()` applies to a DiT, against TOTAL RAM so every stage
+The cache's size is the engine's unless the host names it
+(`expert_cache_mb`, above), and then at most that. The loader applies the
+same rule `plan_streaming()` applies to a DiT, against TOTAL RAM so every stage
 answers the same way: when this model's full preload, its peers and its
 scratch (its run, as the stage's plan booked it — see "K/V grows during
 the run") fit with the irreversible cushion (`kStreamHeadroom`), every

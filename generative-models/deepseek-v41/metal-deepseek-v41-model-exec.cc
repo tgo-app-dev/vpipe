@@ -147,7 +147,7 @@ std::size_t
 MetalDeepseekV41ModelExec::lm_expert_cache_bytes(
     const SessionContextIntf* session, const std::string& model_dir,
     std::size_t run, const metal_compute::MetalCompute* mc, bool dspark,
-    std::size_t limit)
+    std::size_t limit, std::size_t cache)
 {
   if (const char* e = std::getenv("VPIPE_DSV41_EXPERT_CACHE_MB")) {
     return (std::size_t)std::max(0LL, std::atoll(e)) << 20;
@@ -200,6 +200,8 @@ MetalDeepseekV41ModelExec::lm_expert_cache_bytes(
   }
   // The most the host lets it hold, the run in it.
   if (limit > 0) { budget = std::min(budget, limit > run ? limit - run : 0); }
+  // The cache the host asks for: the rest and that, at most.
+  if (cache > 0) { budget = std::min(budget, rest + cache); }
   if (rest + experts <= budget) { return 0; }
   // Whatever room is left; the cache itself never holds fewer than a
   // layer's experts resident plus a layer's transient (a prefill step may
@@ -213,14 +215,14 @@ MetalDeepseekV41ModelExec::dspark_pays(const SessionContextIntf* session,
                                        const std::string& model_dir,
                                        std::size_t run,
                                        const metal_compute::MetalCompute* mc,
-                                       std::size_t limit)
+                                       std::size_t limit, std::size_t cache)
 {
   if (const char* e = std::getenv("VPIPE_DSV41_DSPARK")) {
     return std::atoi(e) != 0;
   }
   if (MetalDeepseekV41Model::dspark_bytes(model_dir) == 0) { return false; }
-  return lm_expert_cache_bytes(session, model_dir, run, mc, true, limit) ==
-         0;
+  return lm_expert_cache_bytes(session, model_dir, run, mc, true, limit,
+                               cache) == 0;
 }
 
 std::int32_t

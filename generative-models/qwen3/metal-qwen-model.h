@@ -575,10 +575,13 @@ public:
   // activation scratch the plan holds, the irreversible headroom, and
   // `scratch` (this model's K/V and activations). 0 for a dense model, or
   // a MoE that fits. `limit` (bytes, 0 none): the most the model may hold
-  // in all, `scratch` in it (load_spec::kMemoryLimitMb).
+  // in all, `scratch` in it (load_spec::kMemoryLimitMb). `cache` (bytes, 0
+  // none): the cache the host asks for (load_spec::kExpertCacheMb) -- at
+  // most that, never past what the box and the limit leave.
   static std::size_t lm_expert_cache_bytes(
       const SessionContextIntf* session, const std::string& dir,
-      const Config& c, std::size_t scratch, std::size_t limit = 0);
+      const Config& c, std::size_t scratch, std::size_t limit = 0,
+      std::size_t cache = 0);
   // How many leading layers a prefill-streamed load of `c` over `wts`
   // pins (0 unless it streams with a pin_frac, and 0 where streams_raw()
   // -- residency replaces the prefix there) -- the rule load() takes,

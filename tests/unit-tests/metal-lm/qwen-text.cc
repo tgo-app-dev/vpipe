@@ -4,6 +4,7 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 #include "common/flex-bag.h"
+#include "generative-models/lm-run-memory.h"
 #include "pipeline/resource-plan.h"
 #include "stages/model-memory.h"
 
@@ -1166,7 +1167,9 @@ TEST(metal_lm_smoke, contexts_go_on_another_thread_while_it_decodes) {
 // A model kept warm that a launch does not claim STAYS when the launch
 // fits beside it and GOES when it does not -- decided by the weights
 // planner as a launch's claims reach it. A launch claiming the model
-// keeps it whatever the box. Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+// keeps it whatever the box. Its runs are weighed at the arena the plan
+// booked for them when it was let go: this exec cannot say what they
+// hold (warm_run_bytes). Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
 TEST(metal_lm_smoke, a_warm_model_stays_beside_a_launch_that_fits) {
   const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
   if (!path || !*path) { return; }
@@ -1181,9 +1184,15 @@ TEST(metal_lm_smoke, a_warm_model_stays_beside_a_launch_that_fits) {
   ::unsetenv("VPIPE_LLM_BACKEND");
   ASSERT_TRUE(lm != nullptr && lm->valid());
   if (!lm || !lm->valid()) { return; }
+  // the run arena a stage's plan books for it, declared as it is let go
+  const std::size_t booked = (std::size_t)64 << 20;
+  mgr->declare_scratch(genai::lm_run_label(path), booked, std::string());
+  EXPECT_TRUE(lm->run_state_bytes() == 0);
   mgr->keep_warm(lm, path, 600.0);
   lm.reset();
   ASSERT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->warm_run_bytes(path) == booked);
+  mgr->clear_declarations();
   ResourcePlanner* pl =
       ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
   ASSERT_TRUE(pl != nullptr);

@@ -771,7 +771,7 @@ std::vector<ResourceClaim>
 lm_claims(const SessionContextIntf* session, const std::string& dir,
           const std::string& label, const genai::LmRunShape& run,
           std::int64_t picture_pixels, int picture_tokens,
-          std::size_t memory_limit)
+          std::size_t memory_limit, std::size_t expert_cache)
 {
   const bool draft_head = run.draft_head;
   std::vector<ResourceClaim> out = weight_claims({dir});
@@ -782,14 +782,23 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
   }
   // Under the host's limit a cached MoE holds what its cache, sized
   // within the limit, leaves it: the limit less its run and `beside` (the
-  // working memory its loader counts in the limit with the run), at least
-  // its floor (the planner clamps it to the checkpoint).
-  auto held_under_limit = [&](ResourceClaim* c, std::size_t beside) {
-    if (memory_limit == 0) { return; }
-    const std::size_t used = run_bytes + beside;
-    const std::size_t left = memory_limit > used ? memory_limit - used : 0;
+  // working memory its loader counts in the limit with the run); with a
+  // cache asked for, `rest` (the model as held but its routed experts)
+  // and that cache at most -- `experts` at most, every one resident -- at
+  // least its floor either way (the planner clamps it to the checkpoint).
+  auto held_under_limit = [&](ResourceClaim* c, std::size_t beside,
+                              std::size_t rest, std::size_t experts) {
+    if (memory_limit == 0 && expert_cache == 0) { return; }
+    std::size_t held = SIZE_MAX;
+    if (memory_limit > 0) {
+      const std::size_t used = run_bytes + beside;
+      held = memory_limit > used ? memory_limit - used : 0;
+    }
+    if (expert_cache > 0) {
+      held = std::min(held, rest + std::min(expert_cache, experts));
+    }
     bag::set_integer(c->extra, kClaimHeldBytes,
-                     (std::int64_t)std::max(left, c->floor_bytes));
+                     (std::int64_t)std::max(held, c->floor_bytes));
   };
   genai::ModelLoader loader(session);
   const auto mcfg = loader.load_config(dir);
@@ -820,7 +829,16 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
         vis > 0 && genai::DeepseekV41Config::from_dir(dir, &dc, &err)
             ? genai::MetalDeepseekV41Vision::encode_scratch_bytes(dc)
             : 0;
-    if (ex > 0) { held_under_limit(&out[0], vis_scratch); }
+    if (ex > 0) {
+      // the rest held beside the cache: its encode's scratch is a claim
+      // of its own (below)
+      held_under_limit(&out[0], vis_scratch,
+                       rest + vis +
+                           (draft_head ? genai::MetalDeepseekV41Model::
+                                             dspark_bytes(dir)
+                                       : 0),
+                       ex);
+    }
     if (picture_pixels >= 0) {
       for (auto& c : scratch_claims("vision:" + label, vis_scratch, {})) {
         out.push_back(std::move(c));
@@ -839,7 +857,7 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
         out[0] = weight_claim_streamable(
             dir, disk - ex - un + gr +
                      ex / (std::size_t)std::max(1, qc.n_layers));
-        held_under_limit(&out[0], 0);
+        held_under_limit(&out[0], 0, disk - ex - un + gr, ex);
       }
     }
   }
@@ -945,7 +963,16 @@ namespace {
 //   * the K/V of every live language model, the warm ones' included --
 // plus the warm models' weights where none of that counts them (a warm
 // model this launch does not claim: its set holds little in cache, an
-// LM reading its weights into its own buffers), plus the headroom.
+// LM reading its weights into its own buffers) -- each at what it holds,
+// a Mixture of Experts its cache, not the experts it reads from disk --
+// and what a warm language model's runs hold beside them (the forward's
+// scratch, kept at the largest piece a turn needed), plus the headroom.
+// AND THE WIRED POOL: a warm language model's load stays wired, charged
+// to the pool, so beside it the launch's weights may fit the RAM and
+// still find no room to be kept resident -- a DeepSeek-V4.1-Flash under
+// the box's own cache, 185 GB wired of the Ultra's 192 GB pool, kept
+// beside a Krea-2 picture, ran the picture 2.4x slower. Released where
+// their wired bytes and the launch's weights do not fit the pool.
 // Asked at each claim, so the claim that tips it releases -- still
 // before any stage's decide_resources() sizes the box -- and again at
 // the end, when the scratch and every claim are in.
@@ -956,19 +983,29 @@ release_warm_unless_it_fits_(const SessionContextIntf* session,
   if (mgr == nullptr) { return; }
   const std::vector<std::string> dirs = mgr->warm_dirs();
   if (dirs.empty()) { return; }
-  const std::size_t held = mgr->phase_footprint(std::string())
-      + mgr->scratch_bytes(std::string()) + mgr->resident_kv_bytes();
-  std::size_t warm = 0;
+  const std::size_t weights = mgr->phase_footprint(std::string());
+  const std::size_t held = weights + mgr->scratch_bytes(std::string())
+      + mgr->resident_kv_bytes();
+  std::size_t warm = 0, wired = 0;
   for (const auto& d : dirs) {
     if (mgr->declares(d)) { continue; }
     // A model a stage built and keeps warm says what it holds (a DiT's
-    // int8 layout, a VAE's converted convs); a language model's
-    // directory is its weights.
+    // int8 layout, a VAE's converted convs); a language model, what its
+    // load left live -- DeepSeek-V4.1-Flash under a 32 GB expert cache
+    // 41 GB, not its 432 GB checkpoint, which no box under it would ever
+    // have kept beside a picture -- else its directory's weights; and a
+    // language model's runs beside them.
     const std::size_t built = mgr->warm_model_bytes(d);
-    warm += built > 0 ? built : dir_weights_bytes(d);
+    const std::size_t lm = built > 0 ? 0 : mgr->warm_held_bytes(d);
+    warm += (built > 0 ? built : lm > 0 ? lm : dir_weights_bytes(d)) +
+            mgr->warm_run_bytes(d);
+    wired += mgr->warm_wired_bytes(d);
   }
   const std::size_t ram = phys_ram();
-  if (ram != 0 && held + warm + kHeadroom <= ram) {
+  const std::size_t pool = mgr->wired_pool_limit();
+  const bool fits = ram != 0 && held + warm + kHeadroom <= ram;
+  const bool pooled = pool == 0 || wired == 0 || wired + weights <= pool;
+  if (fits && pooled) {
     if (session != nullptr) {
       session->log_debug(fmt(
           "resource-plan: kept warm beside this launch: {} MB warm + {} MB "
@@ -976,6 +1013,12 @@ release_warm_unless_it_fits_(const SessionContextIntf* session,
           held >> 20, kHeadroom >> 20, ram >> 20));
     }
     return;
+  }
+  if (fits && session != nullptr) {
+    session->info(fmt(
+        "resource-plan: the warm language models' {} MB wired leave this "
+        "launch's {} MB of weights no room in the {} MB wired pool",
+        wired >> 20, weights >> 20, pool >> 20));
   }
   mgr->release_warm_unclaimed();
 }
@@ -1083,9 +1126,11 @@ public:
     if (mgr == nullptr) { return; }
     std::size_t b = dir_weights_bytes(dir);
     if (b == 0) { return; }        // absent component: nothing to hold
+    const std::size_t whole = b;
     // What it will HOLD, when the claim says it is less than the
     // checkpoint (kClaimHeldBytes: a MoE's cache sized within a host's
-    // limit) -- booked at that, never under its floor.
+    // limit, or the cache it asks for) -- booked at that, never under its
+    // floor.
     if (const ResourceClaim* c = DeliveringResourceClaim::current();
         c != nullptr && c->key == dir) {
       const std::int64_t held = bag::integer(c->extra, kClaimHeldBytes, 0);
@@ -1093,6 +1138,14 @@ public:
         b = std::min(b, std::max((std::size_t)held, floor));
       }
     }
+    // A language model already loaded for it and kept warm is handed
+    // over at the size it LOADED at -- neither the limit nor the cache
+    // asked for is in the manager's cache key -- so it holds what it
+    // holds, whatever this claim's figure says: a relaunch asking a
+    // 30,517 MB cache of a DeepSeek loaded under the box's own would book
+    // 41 GB beside 185 held. Never above the checkpoint, as below.
+    const std::size_t warm = mgr->warm_held_bytes(dir);
+    if (warm > b) { b = std::min(warm, whole); }
     // A floor bigger than the checkpoint is a caller mistake, and taking
     // it would report a streamed total ABOVE the preloaded one. Clamp
     // rather than trust: this figure decides whether a graph is refused.

@@ -459,6 +459,12 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
     fail_config(fmt("TextChatStage('{}'): memory_limit_mb must be 0 (none) "
                     "or more (got {})", this->id(), _memory_limit_mb));
   }
+  _expert_cache_mb = attr_int("expert_cache_mb");
+  if (_expert_cache_mb < 0) {
+    fail_config(fmt("TextChatStage('{}'): expert_cache_mb must be 0 (the "
+                    "model's own) or more (got {})", this->id(),
+                    _expert_cache_mb));
+  }
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -659,6 +665,17 @@ constexpr ConfigKey kAttrs[] = {
           "head loads only where every expert is resident within it. A "
           "dense model loads whole regardless. A model kept warm is handed "
           "over at the size it was loaded at. 0: the box's memory",
+   .def_int = 0},
+  {.key = "expert_cache_mb", .type = ConfigType::Int,
+   .doc = "the routed experts' cache of a Mixture of Experts whose experts "
+          "can live in one (DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next), MB: "
+          "at most this, within memory_limit_mb and the box as the model "
+          "sizes it. Smaller leaves room for a longer context and for the "
+          "models beside it; larger decodes faster, fewer experts read "
+          "from disk. Every expert stays resident only where all of them "
+          "fit within it (DeepSeek's DSpark head with them). A dense model "
+          "ignores it; a model kept warm is handed over at the size it "
+          "was loaded at. 0: the model's own sizing",
    .def_int = 0},
   {.key = "keep_loaded", .type = ConfigType::Real,
    .doc = "seconds to keep the model loaded after this stage lets it go "
@@ -916,7 +933,8 @@ TextChatStage::own_draft_head_(const std::string& dir) const
   const auto* sv = session() != nullptr ? session()->services() : nullptr;
   return genai::MetalDeepseekV41ModelExec::dspark_pays(
       session(), dir, run, sv != nullptr ? sv->metal_compute() : nullptr,
-      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20);
+      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
+      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20);
 #else
   (void)dir;
   return false;
@@ -967,12 +985,13 @@ TextChatStage::declare_resources() const
     dirs.push_back(resolve_model_dir(session(), _draft_model));
   }
   // The LM (streamable when it is a Mixture of Experts; under
-  // memory_limit_mb booked at what its cache sized within it leaves it
-  // holding), what it runs in and its vision tower at the largest picture
-  // a turn may bring; the drafter whole.
+  // memory_limit_mb, or with expert_cache_mb, booked at what its cache
+  // leaves it holding), what it runs in and its vision tower at the
+  // largest picture a turn may bring; the drafter whole.
   std::vector<ResourceClaim> out = model_memory::lm_claims(
       session(), dirs[0], id(), run_shape_(dirs[0]), 0, 0,
-      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20);
+      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
+      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20);
   if (dirs.size() > 1) {
     for (auto& c : model_memory::weight_claims({dirs[1]})) {
       out.push_back(std::move(c));
@@ -1050,6 +1069,10 @@ TextChatStage::initialize(RuntimeContext& ctx)
   if (_memory_limit_mb > 0) {
     bag::set_integer(spec.extra, genai::load_spec::kMemoryLimitMb,
                      _memory_limit_mb);
+  }
+  if (_expert_cache_mb > 0) {
+    bag::set_integer(spec.extra, genai::load_spec::kExpertCacheMb,
+                     _expert_cache_mb);
   }
   session()->info(fmt(
       "TextChatStage('{}'): loading model from '{}' "

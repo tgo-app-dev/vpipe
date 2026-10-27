@@ -124,6 +124,13 @@ public:
   // Grows with the conversation, unlike the weights, so it is reported
   // separately -- see GenerativeModelManager::resident_kv_bytes().
   std::size_t kv_bytes() const;
+  // Bytes its runs hold beside the weights and the K/V above: the
+  // forward's scratch, grown to the largest piece a turn needed and kept,
+  // its rotary tables, the last logits. 0 where the exec cannot say
+  // (DeepSeek-V4.1 can). Host-only: NOT exported, as
+  // metal_deepseek_v41_vision.
+  __attribute__((visibility("hidden"))) std::size_t
+  run_state_bytes() const;
 
   const ModelConfig& config()    const noexcept;
   const Tokenizer&   tokenizer() const noexcept;

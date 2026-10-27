@@ -306,6 +306,9 @@ private:
   bool        _wire_weights{};
   // The most the model may hold, MB (load_spec::kMemoryLimitMb); 0 none.
   std::int64_t _memory_limit_mb{};
+  // Its routed experts' cache, MB (load_spec::kExpertCacheMb); 0 the
+  // model's own sizing.
+  std::int64_t _expert_cache_mb{};
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};

@@ -176,6 +176,28 @@ lm_run_booked_(const SessionContextIntf* session, const std::string& dir,
   return booked > 0 ? booked : lm_run_bytes(session, dir, shape);
 }
 
+// An expert cache's load line: what bounded it -- the host's limit or
+// the box -- and the cache the host asked for, when it asked. `bytes` is
+// what the cache will hold: never under its floor, which an ask below it
+// is raised to.
+std::string
+cache_line_(std::size_t limit, std::size_t asked, std::size_t bytes)
+{
+  const std::string box = limit > 0 ? fmt("its {} MB limit", limit >> 20)()
+                                    : std::string("this box");
+  if (asked == 0) {
+    return fmt("the routed experts do not fit {} beside the rest -- a {} "
+               "MB expert cache", box, bytes >> 20)();
+  }
+  if (bytes > asked) {
+    return fmt("a {} MB expert cache for the routed experts: {} MB asked "
+               "for, under the least it runs with", bytes >> 20,
+               asked >> 20)();
+  }
+  return fmt("a {} MB expert cache for the routed experts: {} MB asked "
+             "for, within {}", bytes >> 20, asked >> 20, box)();
+}
+
 // Map the parsed HF config to the metal Llama exec's Config (text
 // path; llama3 rope-scaling fields default to a no-op when absent).
 MetalLlamaModel::Config
@@ -492,18 +514,28 @@ LoadedLanguageModel::LoadedLanguageModel(
         rs.max_pages = max_pages;
         rs.draft_head = o.dspark;
         const std::size_t run = lm_run_booked_(session, model_dir, rs);
-        // within the most the host lets it hold (lm-memory-limit.h)
+        // within the most the host lets it hold, and the cache it asks
+        // for (lm-memory-limit.h)
         const std::size_t limit = LmMemoryLimit::current();
+        const std::size_t asked = LmMemoryLimit::expert_cache();
         o.expert_cache_bytes = MetalDeepseekV41ModelExec::
             lm_expert_cache_bytes(session, model_dir, run, mc_be, o.dspark,
-                                  limit);
+                                  limit, asked);
         if (o.expert_cache_bytes > 0 && session != nullptr) {
-          session->info(fmt("LoadedLanguageModel('{}'): the routed experts "
-                            "do not fit {} beside the rest -- a {} MB "
-                            "expert cache", model_dir,
-                            limit > 0 ? fmt("its {} MB limit", limit >> 20)()
-                                      : std::string("this box"),
-                            o.expert_cache_bytes >> 20));
+          // the cache never holds fewer than two layers' experts: a
+          // layer's resident and a layer's transient (MetalDeepseekV41
+          // Model's slots)
+          std::size_t ex = 0;
+          const std::size_t floor =
+              MetalDeepseekV41ModelExec::expert_bytes(model_dir, &ex,
+                                                      nullptr)
+                  ? 2 * (ex / (std::size_t)std::max(
+                                  1, _impl->weights.config.n_layers))
+                  : 0;
+          session->info(fmt(
+              "LoadedLanguageModel('{}'): {}", model_dir,
+              cache_line_(limit, asked,
+                          std::max(o.expert_cache_bytes, floor))));
         }
         _impl->metal_bf16 = true;
         _impl->exec = make_unique<MetalDeepseekV41ModelExec>(
@@ -572,16 +604,13 @@ LoadedLanguageModel::LoadedLanguageModel(
           rs.one_pass = !mtp_dir.empty();
           const std::size_t run = lm_run_booked_(session, model_dir, rs);
           const std::size_t limit = LmMemoryLimit::current();
+          const std::size_t asked = LmMemoryLimit::expert_cache();
           mcfg.expert_cache_bytes = MetalQwenModel::lm_expert_cache_bytes(
-              session, model_dir, mcfg, run, limit);
+              session, model_dir, mcfg, run, limit, asked);
           if (mcfg.expert_cache_bytes > 0 && session != nullptr) {
-            session->info(fmt("LoadedLanguageModel('{}'): the routed "
-                              "experts do not fit {} beside the rest -- a "
-                              "{} MB expert cache", model_dir,
-                              limit > 0
-                                  ? fmt("its {} MB limit", limit >> 20)()
-                                  : std::string("this box"),
-                              mcfg.expert_cache_bytes >> 20));
+            session->info(fmt("LoadedLanguageModel('{}'): {}", model_dir,
+                              cache_line_(limit, asked,
+                                          mcfg.expert_cache_bytes)));
           }
         }
         _impl->metal_bf16 = mcfg.use_bf16;
@@ -953,6 +982,20 @@ LoadedLanguageModel::kv_bytes() const
     return _impl->exec->kv_bytes();
   }
   return _impl->ctx_mgr ? _impl->ctx_mgr->resident_bytes() : 0;
+}
+
+std::size_t
+LoadedLanguageModel::run_state_bytes() const
+{
+  if (!_impl || !_impl->exec) { return 0; }
+  if (auto* dx =
+          dynamic_cast<MetalDeepseekV41ModelExec*>(_impl->exec.get())) {
+    if (const MetalDeepseekV41Model* m = dx->model()) {
+      const std::size_t held = m->run_held(), kv = m->kv_bytes();
+      return held > kv ? held - kv : 0;
+    }
+  }
+  return 0;
 }
 
 const ModelConfig&

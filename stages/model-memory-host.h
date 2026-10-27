@@ -63,14 +63,17 @@ std::size_t moe_expert_cache(const SessionContextIntf* session,
 // are then booked at what its cache sized within the limit leaves it
 // holding (kClaimHeldBytes), never under the floor, so the plan its peers
 // size against has the room the limit gives them. A dense model is booked
-// whole, as it loads.
+// whole, as it loads. `expert_cache` (bytes, 0 none) is the cache the host
+// asks for (genai::load_spec::kExpertCacheMb): the weights are booked at
+// the rest of the model and that cache at most, within the limit alike.
 std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
                                      const std::string& dir,
                                      const std::string& label,
                                      const genai::LmRunShape& run,
                                      std::int64_t picture_pixels = 0,
                                      int picture_tokens = 0,
-                                     std::size_t memory_limit = 0);
+                                     std::size_t memory_limit = 0,
+                                     std::size_t expert_cache = 0);
 
 // int, on a weights claim's `extra`: the most the component will HOLD,
 // when that is less than its checkpoint weighs and it is not a floor -- a

@@ -144,10 +144,14 @@ public:
   // `dspark`: the DSpark head loads beside it (Options::dspark).
   // `limit` (bytes, 0 none): the most the model may hold in all, `run`
   // in it (load_spec::kMemoryLimitMb) -- the cache what it leaves.
+  // `cache` (bytes, 0 none): the cache the host asks for
+  // (load_spec::kExpertCacheMb) -- at most that, so the rest of the model
+  // and the cache are the most it may take; never past what the box,
+  // the GPU and the limit leave.
   static std::size_t lm_expert_cache_bytes(
       const SessionContextIntf* session, const std::string& model_dir,
       std::size_t run, const metal_compute::MetalCompute* mc = nullptr,
-      bool dspark = false, std::size_t limit = 0);
+      bool dspark = false, std::size_t limit = 0, std::size_t cache = 0);
   // Whether the DSpark draft head pays on this box -- the engine's call,
   // which text-chat asks before loading the head: only where every expert
   // is resident. Where they are cached, a checked draft reads its own
@@ -161,11 +165,12 @@ public:
   // 22.1), but ten GSM8K questions in one process (3.1-3.3 tokens a
   // round) 39.3-39.6 against 51.5-52.8 (128 GB 27.0-27.4 against
   // 28.0-29.1). VPIPE_DSV41_DSPARK=0|1 pins it. Under a `limit` (the
-  // most the model may hold), every expert resident within it.
+  // most the model may hold), every expert resident within it; under a
+  // `cache` asked for, every expert within that.
   static bool dspark_pays(const SessionContextIntf* session,
                           const std::string& model_dir, std::size_t run,
                           const metal_compute::MetalCompute* mc = nullptr,
-                          std::size_t limit = 0);
+                          std::size_t limit = 0, std::size_t cache = 0);
 
 private:
   // ---- SpecDecodeExt -------------------------------------------------

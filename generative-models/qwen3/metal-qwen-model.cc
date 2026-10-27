@@ -4480,7 +4480,7 @@ std::size_t
 MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
                                       const std::string& dir,
                                       const Config& c, std::size_t scratch,
-                                      std::size_t limit)
+                                      std::size_t limit, std::size_t cache)
 {
   if (!c.is_moe()) { return 0; }
   const std::size_t ram = stream_physical_ram();
@@ -4524,6 +4524,8 @@ MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
   const std::size_t rest =
       (disk > experts + unheld ? disk - experts - unheld : 0) +
       held_growth_bytes(*w, c);
+  // The cache the host asks for: the rest and that, at most.
+  if (cache > 0) { budget = std::min(budget, rest + cache); }
   return expert_cache_plan(budget, rest, experts,
                            experts / (std::size_t)std::max(1, c.n_layers));
 }

@@ -17,6 +17,17 @@
 // run, at least a layer's experts (the floor any box runs at). A dense
 // model cannot hold less than itself: it loads whole, as without one.
 //
+// AND ITS EXPERT CACHE (load_spec::kExpertCacheMb). The limit leaves the
+// cache whatever the run does not take, so a host that books a long
+// context gets a smaller cache, and one that wants the model kept beside
+// its picture models must pick the limit by subtracting. A host asking
+// for the cache itself -- the trade between a conversation's room, the
+// room left beside the model, and decode speed, a person's to make --
+// names its size: the cache is at most that, within the limit and the
+// box as before (never more than the model's own sizing would take: a
+// cache past the GPU's working set is ruinous), and every expert resident
+// only where all of them fit within it.
+//
 // WHY A SCOPE. LoadedLanguageModel's constructors are in plugin ABI 8,
 // so the figure reaches the load the way a WireOnAlloc room does: on
 // the loading thread (the manager builds inline). The sizing functions
@@ -30,27 +41,33 @@ namespace vpipe::genai {
 
 class LmMemoryLimit {
 public:
-  // 0: no limit (an open scope of 0 lifts an outer one).
-  explicit LmMemoryLimit(std::size_t bytes) noexcept
+  // 0: no limit (an open scope of 0 lifts an outer one); `cache` the
+  // expert cache asked for, 0 the model's own sizing.
+  explicit LmMemoryLimit(std::size_t bytes, std::size_t cache = 0) noexcept
     : _outer(slot_())
   {
-    slot_() = bytes;
+    slot_() = {bytes, cache};
   }
   ~LmMemoryLimit() { slot_() = _outer; }
   LmMemoryLimit(const LmMemoryLimit&)            = delete;
   LmMemoryLimit& operator=(const LmMemoryLimit&) = delete;
 
   // The limit in force on this thread; 0 none.
-  static std::size_t current() noexcept { return slot_(); }
+  static std::size_t current() noexcept { return slot_().limit; }
+  // The expert cache asked for on this thread; 0 none.
+  static std::size_t expert_cache() noexcept { return slot_().cache; }
 
 private:
-  static std::size_t& slot_() noexcept
+  struct Held {
+    std::size_t limit = 0, cache = 0;
+  };
+  static Held& slot_() noexcept
   {
-    thread_local std::size_t bytes = 0;
-    return bytes;
+    thread_local Held held;
+    return held;
   }
 
-  std::size_t _outer;
+  Held _outer;
 };
 
 }  // namespace vpipe::genai

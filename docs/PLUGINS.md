@@ -1653,7 +1653,7 @@ constant, never the spelling:
 | a struct's `extra`: `NamedTensor` format, catalogue | `genai::named_tensor` (`gen-input.h`), `catalog_extra` (`stages/model-catalog.h`) |
 | the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
 | scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
-| `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
+| `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load; the most the model may hold; its routed experts' cache) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
 | `ModelConfig::extra` (what config.json says that the struct has no field for: a YaRN / Llama-4 `rope_parameters`, a vision tower's input edge, a Qwen-VL processor's picture and clip pixel bounds, a chat template's default system message, whether that template takes a reasoning effort, the language model's whole config section as spelled) | `genai::model_config` (`generative-models/model-loader.h`) |
 | `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
 | speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |

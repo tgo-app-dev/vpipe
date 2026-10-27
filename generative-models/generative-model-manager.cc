@@ -3,6 +3,7 @@
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/lm-memory-limit.h"
+#include "generative-models/lm-run-memory.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/tokenizer.h"
@@ -2100,6 +2101,9 @@ GenerativeModelManager::load(const LoadSpec& spec)
   // thread by the load, which sizes an expert cache within it.
   const std::size_t limit = (std::size_t)std::max<std::int64_t>(
       0, bag::integer(spec.extra, load_spec::kMemoryLimitMb, 0)) << 20;
+  // And its expert cache, when the host names one (kExpertCacheMb).
+  const std::size_t cache = (std::size_t)std::max<std::int64_t>(
+      0, bag::integer(spec.extra, load_spec::kExpertCacheMb, 0)) << 20;
   shared_ptr<LoadedLanguageModel> lm;
   std::size_t wired = 0, wired_tmp = 0, held_back = 0, room = 0;
   {
@@ -2117,7 +2121,7 @@ GenerativeModelManager::load(const LoadSpec& spec)
       scope.emplace(room);
     }
     {
-      LmMemoryLimit cap(limit);
+      LmMemoryLimit cap(limit, cache);
       lm = build();
     }
     if (scope) {
@@ -2145,7 +2149,7 @@ GenerativeModelManager::load(const LoadSpec& spec)
     charge_external_wired(wired);
     {
       lock_guard<mutex> lk(_warm_mu);
-      _wired_lms.push_back(Wired{lm, wired});
+      _wired_lms.push_back(Wired{lm, wired, wired + held_back});
     }
     if (session()) {
       session()->info(fmt(
@@ -2183,6 +2187,9 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
 {
   if (!lm) { return; }
   const string key = canonicalize_(session(), dir);
+  // what the plan booked for its runs, still declared as the stage lets
+  // it go (warm_run_bytes' bound where the model cannot say)
+  const std::size_t booked = declared_scratch(lm_run_label(dir));
   std::vector<Warm> dropped;   // freed outside the lock
   {
     lock_guard<mutex> lk(_warm_mu);
@@ -2200,8 +2207,9 @@ GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
               std::chrono::duration<double>(seconds));
       if (it != _warm.end()) {
         it->until = std::max(it->until, until);
+        it->run_booked = std::max(it->run_booked, booked);
       } else {
-        _warm.push_back(Warm{lm, key, until, {}});
+        _warm.push_back(Warm{lm, key, until, {}, booked});
       }
       if (!_warm_reaper.joinable()) {
         _warm_reaper = std::thread(_warm_reap);
@@ -2372,6 +2380,56 @@ GenerativeModelManager::warm_model_bytes(const string& dir) const
   lock_guard<mutex> lk(_warm_mu);
   for (const auto& w : _warm_models) {
     if (w.dir == cdir) { n += w.bytes; }
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_held_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) {
+    if (w.dir != cdir || !w.lm) { continue; }
+    for (const auto& x : _wired_lms) {
+      // by owner, as warm_report compares them
+      if (!x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
+        n += x.held;
+      }
+    }
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_run_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) {
+    if (w.dir != cdir || !w.lm) { continue; }
+    // idle while warm, so its buffers stand still
+    const size_t exact = w.lm->run_state_bytes();
+    n += exact > 0 ? exact : w.run_booked;
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_wired_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) {
+    if (w.dir != cdir || !w.lm) { continue; }
+    for (const auto& x : _wired_lms) {
+      if (!x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
+        n += x.bytes;
+      }
+    }
   }
   return n;
 }
