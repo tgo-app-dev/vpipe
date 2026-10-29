@@ -1,0 +1,19 @@
+{
+  "id": "prepare-minimax-music3",
+  "stages": [
+    {
+      "id": "fetch-minimax-music3",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "MiniMaxAI/MiniMax-Music3",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

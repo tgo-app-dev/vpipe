@@ -361,7 +361,11 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
         }
       }
     } else {
-      return {};
+      // A quantized projector (Q8_0 and the file's other block types):
+      // widened by the file's own dequantizer, then narrowed once.
+      std::vector<float> f(n);
+      if (!gg->dequant_all_f32(*t, f.data())) { return {}; }
+      for (std::size_t i = 0; i < n; ++i) { o[i] = enc_elt_(f[i], bf16); }
     }
     return out;
   };
@@ -445,11 +449,15 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
       // downstream widens, so an F16 projector in a bf16 run costs one
       // per-element register conversion at LOAD and then runs at
       // 16-bit width exactly like a BF16 one.
+      // Any other type (a quantized projector) is widened whole first.
+      std::vector<float> wide;
       if (tn->type != GgufFile::kF32 && tn->type != GgufFile::kF16
           && tn->type != GgufFile::kBF16) {
-        return {};
+        wide.resize((std::size_t)tn->numel());
+        if (!gg->dequant_all_f32(*tn, wide.data())) { return {}; }
       }
       auto elem = [&](std::size_t i) -> float {
+        if (!wide.empty()) { return wide[i]; }
         if (tn->type == GgufFile::kF32) {
           return reinterpret_cast<const float*>(tn->data)[i];
         }

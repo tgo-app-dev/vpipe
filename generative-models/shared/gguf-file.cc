@@ -58,6 +58,8 @@ blk_geom_(std::uint32_t type)
     case GgufFile::kQ4_K: return {256, 144};
     case GgufFile::kQ5_K: return {256, 176};
     case GgufFile::kQ6_K: return {256, 210};
+    case GgufFile::kPQ2_0:  return {128, 34};
+    case GgufFile::kPTQ1_0: return {128, 28};
     default: return {0, 0};
   }
 }
@@ -436,6 +438,22 @@ dequant_span_(std::uint32_t type, const std::uint8_t* src,
               std::int64_t n, float* out)
 {
   switch (type) {
+    case GgufFile::kPQ2_0:
+    case GgufFile::kPTQ1_0: {
+      const int bytes = type == GgufFile::kPQ2_0 ? 34 : 28;
+      std::uint8_t q[128];
+      std::uint16_t d16 = 0;
+      for (std::int64_t b = 0; b < n / 128; ++b) {
+        if (!GgufFile::ternary_block_codes(type, src + b * bytes, q, &d16)) {
+          return false;
+        }
+        const float d = f16_to_f32_(d16);
+        for (int j = 0; j < 128; ++j) {
+          out[b * 128 + j] = (float)((int)q[j] - 1) * d;
+        }
+      }
+      return true;
+    }
     case GgufFile::kF32:
       std::memcpy(out, src, static_cast<std::size_t>(n) * 4);
       return true;
@@ -588,6 +606,52 @@ row_stride_bytes_(std::uint32_t type, std::int64_t in)
   return (in / bg.elems) * bg.bytes;
 }
 }  // namespace
+
+bool
+GgufFile::ternary_block_codes(std::uint32_t type, const std::uint8_t* blk,
+                              std::uint8_t* codes, std::uint16_t* d)
+{
+  if (type == kPQ2_0) {
+    // {fp16 d; qs[32]}: value j at bits 2 (j % 4) of byte j / 4.
+    std::memcpy(d, blk, 2);
+    for (int j = 0; j < 128; ++j) {
+      codes[j] = (std::uint8_t)((blk[2 + j / 4] >> (2 * (j % 4))) & 3);
+    }
+    return true;
+  }
+  if (type == kPTQ1_0) {
+    // {qs[24]; qh[2]; fp16 d}: TQ1_0's base-3 packing at group 128, as
+    // the fork's dequantize_row_ptq1_0 reads it -- qs in runs of 16 then
+    // 8 bytes, five trits a byte, trit-major within a run (the n-th trit
+    // of every byte, then the next); then the four trits of qh's bytes.
+    // A trit is the high digit of byte * 3^n (mod 256) times 3.
+    static const std::uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    const std::uint8_t* qs = blk;
+    const std::uint8_t* qh = blk + 24;
+    std::memcpy(d, blk + 26, 2);
+    int o = 0;
+    std::size_t j = 0;
+    for (const std::size_t c : {std::size_t{32}, std::size_t{16},
+                                std::size_t{8}}) {
+      for (; j + c <= 24; j += c) {
+        for (int n = 0; n < 5; ++n) {
+          for (std::size_t m = 0; m < c; ++m) {
+            const std::uint8_t q = (std::uint8_t)(qs[j + m] * pow3[n]);
+            codes[o++] = (std::uint8_t)(((std::uint16_t)q * 3) >> 8);
+          }
+        }
+      }
+    }
+    for (int n = 0; n < 4; ++n) {
+      for (int h = 0; h < 2; ++h) {
+        const std::uint8_t q = (std::uint8_t)(qh[h] * pow3[n]);
+        codes[o++] = (std::uint8_t)(((std::uint16_t)q * 3) >> 8);
+      }
+    }
+    return o == 128;
+  }
+  return false;
+}
 
 bool
 GgufFile::dequant_row_f32(const Tensor& t, std::int64_t row,

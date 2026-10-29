@@ -259,6 +259,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         moss-image-dit.cc
         moss-image-pipeline.cc
         yue2.cc
+        minimax-music3.cc
+        bonsai.cc
         bs-roformer.cc
         drama3.cc
         deepseek-v41.cc

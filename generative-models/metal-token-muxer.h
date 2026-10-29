@@ -64,6 +64,12 @@ public:
 
   bool valid() const noexcept;
 
+  // A table stored ROTATED (Prism Hadamard v1, Ternary-Bonsai 2): every
+  // fetched row is taken back, h = s . (H z), before it is returned.
+  // `signs` is [hidden] f32 and must outlive the muxer. False when the
+  // kernel did not load (fetch_text is then unchanged).
+  bool set_inverse_rotation(const metal_compute::SharedBuffer* signs);
+
   // Gather + dequantize the rows for `ids` into a fresh [n, hidden]
   // f16 SharedBuffer. Empty buffer on failure / empty input.
   metal_compute::SharedBuffer
@@ -79,6 +85,8 @@ private:
   const metal_compute::SharedBuffer* _q6k_table = nullptr;
   metal_compute::ComputeLibrary      _lib;
   metal_compute::ComputeFunction     _fn;
+  const metal_compute::SharedBuffer* _rot_signs = nullptr;
+  metal_compute::ComputeFunction     _fn_rot;
 };
 
 }  // namespace vpipe::genai

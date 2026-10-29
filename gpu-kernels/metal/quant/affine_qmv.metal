@@ -57,7 +57,17 @@ inline constexpr short get_bytes_per_pack() {
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
   U sum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    // MLX's 2-bit form: four codes a byte, the masked fields carry their
+    // shift, cancelled by powers of 4 here.
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] / 4.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 64.0f;
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i]     = x[i];
@@ -89,7 +99,19 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector_safe(const device T* x, thread U* x_thread, int valid) {
   U sum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      const U v0 = (i + 0 < valid) ? (U)x[i + 0] : (U)0;
+      const U v1 = (i + 1 < valid) ? (U)x[i + 1] : (U)0;
+      const U v2 = (i + 2 < valid) ? (U)x[i + 2] : (U)0;
+      const U v3 = (i + 3 < valid) ? (U)x[i + 3] : (U)0;
+      sum += v0 + v1 + v2 + v3;
+      x_thread[i]     = v0;
+      x_thread[i + 1] = v1 / 4.0f;
+      x_thread[i + 2] = v2 / 16.0f;
+      x_thread[i + 3] = v3 / 64.0f;
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
       const U v0 = (i + 0 < valid) ? (U)x[i + 0] : (U)0;
       const U v1 = (i + 1 < valid) ? (U)x[i + 1] : (U)0;
@@ -117,7 +139,15 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int valid) {
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector_tg(const threadgroup T* x, thread U* x_thread) {
   U sum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      x_thread[i]     = x[i];
+      x_thread[i + 1] = x[i + 1] / 4.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 64.0f;
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i]     = x[i];
@@ -182,7 +212,15 @@ inline U qdot(
     U bias,
     U sum) {
   U accum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (x_thread[4 * i]     * (w[i] & 0x03) +
+           x_thread[4 * i + 1] * (w[i] & 0x0c) +
+           x_thread[4 * i + 2] * (w[i] & 0x30) +
+           x_thread[4 * i + 3] * (w[i] & 0xc0));
+    }
+  } else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -868,7 +906,10 @@ METAL_FUNC void qmv_swiglu_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  // Two packs a thread at every width, 2-bit included (MLX takes one
+  // there): the batched twins run two, so a batched row is this kernel's
+  // row bit for bit.
+  constexpr int packs_per_thread = 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -1567,7 +1608,10 @@ METAL_FUNC void qmv_geglu_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  // Two packs a thread at every width, 2-bit included (MLX takes one
+  // there): the batched twins run two, so a batched row is this kernel's
+  // row bit for bit.
+  constexpr int packs_per_thread = 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -1843,7 +1887,17 @@ METAL_FUNC void qmv_batch_impl(
       const U s = scales[row * in_vec_size_g];
       const U b = biases[row * in_vec_size_g];
       U acc[MAXM] = {0};
-      if (bits == 4) {
+      if (bits == 2) {
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const uint8_t p = wl[i];
+          const U w0 = (U)(p & 0x03), w1 = (U)(p & 0x0c);
+          const U w2 = (U)(p & 0x30), w3 = (U)(p & 0xc0);
+          for (int m = 0; m < MAXM; m++) {
+            acc[m] += x_thread[m][4 * i] * w0 + x_thread[m][4 * i + 1] * w1 +
+                      x_thread[m][4 * i + 2] * w2 + x_thread[m][4 * i + 3] * w3;
+          }
+        }
+      } else if (bits == 4) {
         const device uint16_t* w16 = (const device uint16_t*)wl;
         for (int i = 0; i < (values_per_thread / 4); i++) {
           const uint16_t p = w16[i];
@@ -3253,7 +3307,17 @@ METAL_FUNC void qmv_batch_swiglu_impl(
       const U s = scales[row * in_vec_size_g];
       const U b = biases[row * in_vec_size_g];
       U acc[MAXM] = {0};
-      if (bits == 4) {
+      if (bits == 2) {
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const uint8_t p = wl[i];
+          const U w0 = (U)(p & 0x03), w1 = (U)(p & 0x0c);
+          const U w2 = (U)(p & 0x30), w3 = (U)(p & 0xc0);
+          for (int m = 0; m < MAXM; m++) {
+            acc[m] += x_thread[m][4 * i] * w0 + x_thread[m][4 * i + 1] * w1 +
+                      x_thread[m][4 * i + 2] * w2 + x_thread[m][4 * i + 3] * w3;
+          }
+        }
+      } else if (bits == 4) {
         const device uint16_t* w16 = (const device uint16_t*)wl;
         for (int i = 0; i < (values_per_thread / 4); i++) {
           const uint16_t p = w16[i];
@@ -3313,6 +3377,27 @@ METAL_FUNC void qmv_batch_swiglu_impl(
   }
 VPIPE_QMV_BATCH_SWIGLU(affine_qmv_batch_swiglu_w4g64, 2)
 VPIPE_QMV_BATCH_SWIGLU(affine_qmv_batch4_swiglu_w4g64, 4)   // MTP verify n=3..4
+// 8-bit twin: the impl's bits==8 dot, the same epilogue. Lets a dense w8
+// stack (an LM quantized on load) step a few contexts with each weight
+// read once, as the w4 one does.
+#define VPIPE_QMV_BATCH_SWIGLU_W8(NAME, MAXM)                                \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],   /* N = 2*ffn */            \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_swiglu_impl<VPIPE_ELT, 64, 8, MAXM>(                           \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_SWIGLU_W8(affine_qmv_batch_swiglu_w8g64, 2)
 
 // Batched fused GeGLU MLP GEMV (Gemma-4): identical to the swiglu batch but
 // the activation is gelu_pytorch_tanh (matches affine_qmv_geglu_w4g64).
@@ -3382,7 +3467,17 @@ METAL_FUNC void qmv_batch_geglu_impl(
       const U s = scales[row * in_vec_size_g];
       const U b = biases[row * in_vec_size_g];
       U acc[MAXM] = {0};
-      if (bits == 4) {
+      if (bits == 2) {
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          const uint8_t p = wl[i];
+          const U w0 = (U)(p & 0x03), w1 = (U)(p & 0x0c);
+          const U w2 = (U)(p & 0x30), w3 = (U)(p & 0xc0);
+          for (int m = 0; m < MAXM; m++) {
+            acc[m] += x_thread[m][4 * i] * w0 + x_thread[m][4 * i + 1] * w1 +
+                      x_thread[m][4 * i + 2] * w2 + x_thread[m][4 * i + 3] * w3;
+          }
+        }
+      } else if (bits == 4) {
         const device uint16_t* w16 = (const device uint16_t*)wl;
         for (int i = 0; i < (values_per_thread / 4); i++) {
           const uint16_t p = w16[i];
@@ -4298,3 +4393,103 @@ moe_down_fused_t<4, 32, 32>(
     uint3 tid      [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]);
+
+// ====================================================================
+// 2-BIT, GROUP 128: the ternary packs (MLX affine 2-bit g128, as Bonsai's
+// MLX pack stores it and as its GGUF PQ2_0 / PTQ1_0 repack to). The w4g64
+// entries' impls at bits 2 -- load_vector / qdot and the batch
+// accumulators carry MLX's 2-bit form -- at two packs a thread like the
+// batched twins (MLX's qmv_fast takes one at 2 bits), so a batched row is
+// the one-row GEMV's bit for bit. Same buffers and dispatch as their w4g64
+// twins.
+// ====================================================================
+kernel void affine_qmv_w2g128(
+    const device uint32_t*  w            [[buffer(0)]],
+    const device VPIPE_ELT* scales       [[buffer(1)]],
+    const device VPIPE_ELT* biases       [[buffer(2)]],
+    const device VPIPE_ELT* x            [[buffer(3)]],
+    device VPIPE_ELT*       y            [[buffer(4)]],
+    constant int&           in_vec_size  [[buffer(5)]],
+    constant int&           out_vec_size [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_fast_impl<VPIPE_ELT, 128, 2, false>(
+      w, scales, biases, x, y, /*residual=*/nullptr,
+      in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmv_w2g128_add(
+    const device uint32_t*  w            [[buffer(0)]],
+    const device VPIPE_ELT* scales       [[buffer(1)]],
+    const device VPIPE_ELT* biases       [[buffer(2)]],
+    const device VPIPE_ELT* x            [[buffer(3)]],
+    device VPIPE_ELT*       y            [[buffer(4)]],
+    constant int&           in_vec_size  [[buffer(5)]],
+    constant int&           out_vec_size [[buffer(6)]],
+    const device VPIPE_ELT* residual     [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_fast_impl<VPIPE_ELT, 128, 2, true>(
+      w, scales, biases, x, y, residual,
+      in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmv_swiglu_w2g128(
+    const device uint32_t*  w            [[buffer(0)]],
+    const device VPIPE_ELT* scales       [[buffer(1)]],
+    const device VPIPE_ELT* biases       [[buffer(2)]],
+    const device VPIPE_ELT* x            [[buffer(3)]],
+    device VPIPE_ELT*       y            [[buffer(4)]],
+    constant int&           in_vec_size  [[buffer(5)]],
+    constant int&           out_vec_size [[buffer(6)]],   // N = 2*ffn
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  qmv_swiglu_impl<VPIPE_ELT, 128, 2>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size,
+      tid, simd_gid, simd_lid);
+}
+
+// The MAXM=2 batched GEMVs (a few contexts, each weight read once) at any
+// group and width the impls take.
+#define VPIPE_QMV_BATCH_GB(NAME, GROUP, BITS, MAXM)                          \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],                              \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_impl<VPIPE_ELT, GROUP, BITS, MAXM>(                            \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+#define VPIPE_QMV_BATCH_SWIGLU_GB(NAME, GROUP, BITS, MAXM)                   \
+  kernel void NAME(                                                          \
+      const device uint32_t* w      [[buffer(0)]],                           \
+      const device VPIPE_ELT* scales [[buffer(1)]],                          \
+      const device VPIPE_ELT* biases [[buffer(2)]],                          \
+      const device VPIPE_ELT* x      [[buffer(3)]],                          \
+      device VPIPE_ELT*       y      [[buffer(4)]],                          \
+      constant int& in_vec_size  [[buffer(5)]],                              \
+      constant int& out_vec_size [[buffer(6)]],   /* N = 2*ffn */            \
+      constant int& m_total      [[buffer(7)]],                              \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]) {                         \
+    qmv_batch_swiglu_impl<VPIPE_ELT, GROUP, BITS, MAXM>(                     \
+        w, scales, biases, x, y, in_vec_size, out_vec_size, m_total,         \
+        tid, simd_gid, simd_lid);                                            \
+  }
+VPIPE_QMV_BATCH_GB(affine_qmv_batch_w2g128, 128, 2, 2)
+VPIPE_QMV_BATCH_SWIGLU_GB(affine_qmv_batch_swiglu_w2g128, 128, 2, 2)

@@ -11,6 +11,8 @@
 #include <vector>
 
 namespace vpipe::genai {
+class MetalMusic3Ar;
+class MetalMusic3Dit;
 class MetalYue2Model;
 class Tokenizer;
 }
@@ -25,9 +27,19 @@ namespace vpipe {
 // independently of the generator (YuE2 ships two decoders for one
 // latent space).
 //
-// The model is picked from the checkpoint's config.json. Today that is
-// YuE2 (m-a-p/YuE2-3B, model_type "yue2"), which writes a song in three
-// passes over one checkpoint:
+// The model is picked from the checkpoint's config.json. Two families:
+//
+// MiniMax-Music3 (MiniMaxAI/MiniMax-Music3, model_type "minimax_music3",
+// its diffusers layout): a caption (`style`) and lyrics, both required.
+// Per 25 Hz frame a Qwen3-8B LM and a depth decoder pick the frame's eight
+// RVQ codes under guidance; a 2.4B DiT then solves 128-wide latents from
+// their hidden states in 8 s windows (generative-models/minimax-music3/
+// music3-protocol.h). It emits the song's stitched latent, [1, 128,
+// latents] at 44100 / 512 a second, for audio-vae-decode with the same
+// hf_dir (its vocoder/); no score.
+//
+// YuE2 (m-a-p/YuE2-3B, model_type "yue2") writes a song in three passes
+// over one checkpoint:
 //
 //   1. PLAN    an ABC score (melody, and chords for cot=full), unless the
 //              request supplies one or cot=off. Emitted on `score`.
@@ -71,14 +83,21 @@ public:
 
   // What one song costs beside the weights, as the claims book it:
   //   held       the AR pool and the NAR row scratch -- never given back,
-  //              so booked for the whole run
+  //              so booked for the whole run (MiniMax-Music3: its AR
+  //              half's, in the condition phase when the halves take
+  //              turns)
   //   transient  the flow matching's chunk K/V (denoise)
+  //   flow       MiniMax-Music3's flow-matching window, kept by its DiT
+  //              (denoise when the halves take turns)
+  //   handoff    MiniMax-Music3's hidden states, from the AR half to the
+  //              flow matching (condition .. denoise)
   //   decode     the downstream VAE decode's arena (decode-audio)
   //   pcm        the PCM that decode hands on (decode-audio)
   // The generator books the last two, as generate-video does for its
   // soundtrack: it is the stage that knows how long the song can be.
   struct SongBytes {
-    std::size_t held = 0, transient = 0, decode = 0, pcm = 0;
+    std::size_t held = 0, transient = 0, flow = 0, handoff = 0, decode = 0,
+                pcm = 0;
   };
 
   // Test-only.
@@ -90,6 +109,24 @@ public:
   // The claims' labels: one per stage instance, since two claims sharing
   // a label are counted once.
   std::string scratch_label_() const;
+
+  // Which generator hf_dir names, from its config.json.
+  enum class Family { kNone, kYue2, kMusic3 };
+  Family family() const;
+
+  // MiniMax-Music3 on a box too small for both halves at once -- the AR
+  // half (language_model/ + rvq_depth_decoder/) and the flow half
+  // (condition_encoder/ + transformer/): each is loaded for its part of a
+  // song and its bytes given back before the other loads, and the plan
+  // books them in their own phases (condition, denoise). Decided from
+  // this stage's own figures against the box's TOTAL RAM -- the four
+  // parts as they will be held, a song's working set and kHeadroom --
+  // so every pass of the plan, and initialize(), answer alike whatever
+  // else is in the graph. VPIPE_MUSIC3_SWAP=0|1 pins it.
+  bool music3_swaps() const;
+  // The DiT's int8 tier as the box will run it (-1 none): i8_gemm and
+  // i8_gemm_tier, where the matrix cores take them.
+  int music3_dit_tier() const;
 
 private:
   // Config. Defaults live in kSpec.attrs.
@@ -108,6 +145,7 @@ private:
   int _lm_quant_bits = 8;   // lm_quant: 8 = the AR stack w8 in memory
   // The flow matching's acceleration tiers, settled in the ctor.
   bool _i8_gemm{};
+  int _i8_tier = 0;         // i8_gemm_tier: accurate, fast, token, plain
   bool _ane_ffn{};
   double _ane_rows{};
   int _ane_layers{};
@@ -123,6 +161,25 @@ private:
 
   std::unique_ptr<genai::MetalYue2Model> _model;
   std::unique_ptr<genai::Tokenizer> _tok;
+  // MiniMax-Music3: its two halves and the tokenizer's added tokens.
+  std::unique_ptr<genai::MetalMusic3Ar> _m3_ar;
+  std::unique_ptr<genai::MetalMusic3Dit> _m3_dit;
+  std::vector<std::pair<std::string, std::int32_t>> _m3_added;
+  double _flow_cfg{};
+  // The directories a Music3 root's generator half reads (the vocoder is
+  // audio-vae-decode's).
+  std::vector<std::string> music3_dirs_() const;
+  void initialize_music3_(const std::string& root);
+  // Each half loaded (false with the reason logged) and let go: the model
+  // dropped, its checkpoints' bytes given back, the release reported and
+  // the freed memory settled before the next load.
+  bool load_music3_ar_();
+  bool load_music3_flow_();
+  void release_music3_ar_();
+  void release_music3_flow_();
+  void release_music3_dirs_(int first, int last);
+  std::string _m3_root;
+  bool _m3_swap = false;     // music3_swaps(), latched at initialize()
   bool _one_shot_done = false;
   std::uint64_t _songs = 0;
   std::string _last_score;

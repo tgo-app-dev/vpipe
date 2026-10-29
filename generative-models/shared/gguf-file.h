@@ -44,7 +44,18 @@ public:
     kQ5_K = 13,
     kQ6_K = 14,
     kBF16 = 30,
+    // PrismML's ternary types (their llama.cpp fork): {-1, 0, +1} times
+    // an fp16 scale a group of 128. PQ2_0 = {d; 2-bit codes}, PTQ1_0 =
+    // {24 bytes of 5 trits; 2 bytes of 4 trits; d}.
+    kPQ2_0  = 142,
+    kPTQ1_0 = 143,
   };
+  // One PQ2_0 / PTQ1_0 block of 128 into codes 0..3 (value = (code - 1)
+  // * d; PTQ1_0 never yields 3) and d's fp16 bits. False for any other
+  // type.
+  static bool ternary_block_codes(std::uint32_t type,
+                                  const std::uint8_t* blk,
+                                  std::uint8_t* codes, std::uint16_t* d);
 
   struct Tensor {
     std::string          name;

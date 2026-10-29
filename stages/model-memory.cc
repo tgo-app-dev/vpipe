@@ -5,6 +5,7 @@
 #include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
+#include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
@@ -13,6 +14,7 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/drawthings-store.h"
+#include "generative-models/shared/gguf-file.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "stages/model-detect.h"
@@ -93,6 +95,38 @@ phys_ram()
   return (std::size_t)mem;
 }
 
+namespace {
+
+// A GGUF weighs what it is SERVED at, not its file: the converter repacks
+// (Q8_0 to w8 at group 64, a ternary pack's trits to 2-bit affine -- a
+// 5.95 GB PTQ1_0 file holds 7.6 GB), and that presented layout is what
+// the model holds. The projector beside it (the mmproj the loader picks)
+// is read into the tower at the compute dtype's two bytes an element. 0
+// when `path` (a .gguf, or a directory holding one) opens as none.
+std::size_t
+gguf_served_bytes_(const std::string& path)
+{
+  namespace fs = std::filesystem;
+  auto w = genai::MetalLlamaWeights::open_model(path);
+  if (!w || !w->is_gguf()) { return 0; }
+  std::size_t served = 0;
+  for (const std::string& nm : w->tensor_names()) {
+    if (const auto* ti = w->info(nm)) { served += (std::size_t)ti->nbytes; }
+  }
+  std::error_code ec;
+  const fs::path p(path);
+  const std::string mm = genai::Gemma4UnifiedEmbedder::find_mmproj(
+      (fs::is_directory(p, ec) ? p : p.parent_path()).string());
+  if (auto g = mm.empty() ? std::nullopt : genai::GgufFile::open(mm)) {
+    for (const auto& t : g->tensors()) {
+      served += (std::size_t)t.numel() * 2;
+    }
+  }
+  return served;
+}
+
+}  // namespace
+
 std::size_t
 dir_weights_bytes(const std::string& dir)
 {
@@ -100,6 +134,10 @@ dir_weights_bytes(const std::string& dir)
   if (dir.empty()) { return 0; }
   std::size_t total = 0;
   std::error_code ec;
+  // A GGUF named by file (hf_dir takes one) or by its directory.
+  if (fs::path(dir).extension() == ".gguf") {
+    return gguf_served_bytes_(dir);
+  }
   // A checkpoint named by FILE, not by directory (a Comfy-Org repack:
   // one .safetensors per component). Without this the iterator below
   // just fails and reports 0 -- and a 66 GB DiT that sizes as free is
@@ -148,12 +186,15 @@ dir_weights_bytes(const std::string& dir)
     const std::uintmax_t n = fs::file_size(fs::path(dir), ec);
     return ec ? 0 : (std::size_t)n;
   }
+  bool gguf = false;
   for (fs::recursive_directory_iterator it(dir, ec), end; it != end;
        it.increment(ec)) {
     if (it->is_regular_file(ec) && it->path().extension() == ".safetensors") {
       total += (std::size_t)it->file_size(ec);
     }
+    gguf = gguf || it->path().extension() == ".gguf";
   }
+  if (total == 0 && gguf) { return gguf_served_bytes_(dir); }
   return total;
 }
 

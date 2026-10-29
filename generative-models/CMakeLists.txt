@@ -116,6 +116,10 @@ set(LOCAL_SOURCES
   yue2/metal-yue2-model.cc
   yue2/metal-oobleck-decoder.cc
   yue2/yue2-vae-family.cc
+  minimax-music3/music3-protocol.cc
+  minimax-music3/metal-music3-dit.cc
+  minimax-music3/metal-music3-ar.cc
+  minimax-music3/music3-vae-family.cc
   bs-roformer/bs-roformer-config.cc
   bs-roformer/metal-bs-roformer.cc
   drama3/drama3-prompt.cc

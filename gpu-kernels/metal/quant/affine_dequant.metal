@@ -228,6 +228,41 @@ kernel void affine_dequant_w4g32(
       vec<VPIPE_ELT, 4>(out[4], out[5], out[6], out[7]);
 }
 
+// 2-bit group-128 twin (the ternary packs): 16 codes a u32, little-endian
+// -- code k0+i at bits 2i, the order the qmv / steel loaders read -- so a
+// thread expands one word into 16 values with one scale/bias load (group
+// 128 is a multiple of 16). One thread per weight word: grid {K/16, N, 1}.
+kernel void affine_dequant_w2g128(
+    const device uint32_t*  w      [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    device VPIPE_ELT*       ydeq   [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int word = (int)gid.x;        // 0 .. K/16-1
+  const int n    = (int)gid.y;        // 0 .. N-1
+  if (n >= N || word >= (K >> 4)) { return; }
+  const int Kw = K >> 4;              // u32 words per weight row
+  const int Kg = K / 128;             // scale/bias entries per row
+  const int k0 = word << 4;
+  const int g = n * Kg + (k0 / 128);
+  const float s = (float)scales[g];
+  const float b = (float)biases[g];
+  const uint32_t packed = w[(int64_t)n * Kw + word];
+  device VPIPE_ELT* dst = ydeq + (int64_t)n * K + k0;
+  for (int q4 = 0; q4 < 4; ++q4) {
+    VPIPE_ELT o[4];
+    for (int i = 0; i < 4; ++i) {
+      const uint q = (packed >> (2 * (4 * q4 + i))) & 0x3;
+      o[i] = (VPIPE_ELT)(s * (float)q + b);
+    }
+    *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(dst + 4 * q4) =
+        vec<VPIPE_ELT, 4>(o[0], o[1], o[2], o[3]);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // FORWARD affine quantization: dense W[N,K] (VPIPE_ELT, row-major) -> packed
 // U32 codes + F16 scales + F16 biases, asymmetric per group:

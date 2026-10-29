@@ -59,6 +59,65 @@ MetalOobleckDecoder::Config::hop() const
   return h;
 }
 
+int
+MetalOobleckDecoder::Config::last_width() const
+{
+  if (layout == Layout::kDac) {
+    return std::max(1, hidden >> (int)strides.size());
+  }
+  return channels * (c_mults.empty() ? 1 : c_mults.front());
+}
+
+namespace {
+
+// MiniMax-Music3's diffusers vocoder/config.json (MiniMaxMusic3Vocoder).
+bool
+dac_config_(const FlexData& fd, MetalOobleckDecoder::Config* out,
+            std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  auto o = fd.as_object();
+  auto geti = [&](const char* k, int v) {
+    return o.contains(k) ? (int)o.at(k).as_int(v) : v;
+  };
+  MetalOobleckDecoder::Config c;
+  c.layout       = MetalOobleckDecoder::Layout::kDac;
+  c.latent_dim   = geti("latent_channels", 128);
+  c.streams      = 2;
+  c.in_proj      = geti("decoder_input_dim", 1024);
+  c.hidden       = geti("decoder_hidden_dim", 1536);
+  c.sample_rate  = geti("sampling_rate", 44100);
+  c.out_channels = 1;
+  c.final_tanh   = true;
+  c.channels     = 0;
+  c.c_mults.clear();
+  // upsampling_ratios run from the latent outwards; `strides` keeps the
+  // Oobleck order (from the waveform inwards), which is how init_ reads
+  // a block's rate.
+  std::vector<int> up = {8, 8, 4, 2};
+  if (o.contains("upsampling_ratios") &&
+      o.at("upsampling_ratios").is_array()) {
+    up.clear();
+    const FlexData ur = o.at("upsampling_ratios");
+    for (const FlexData& v : ur.as_array()) {
+      up.push_back((int)v.as_int());
+    }
+  }
+  if (up.empty() || c.latent_dim % 2 != 0 || c.in_proj <= 0 ||
+      c.hidden >> (int)up.size() <= 0) {
+    return fail("unsupported MiniMax-Music3 vocoder config");
+  }
+  c.strides.assign(up.rbegin(), up.rend());
+  c.c_mults.assign(up.size(), 1);
+  *out = c;
+  return true;
+}
+
+}  // namespace
+
 bool
 MetalOobleckDecoder::config_from_dir(const std::string& dir, Config* out,
                                      std::string* err)
@@ -77,6 +136,10 @@ MetalOobleckDecoder::config_from_dir(const std::string& dir, Config* out,
   }
   if (!fd.is_object()) { return fail("config.json is not an object"); }
   auto o = fd.as_object();
+  if (o.contains("_class_name") && o.at("_class_name").is_string() &&
+      o.at("_class_name").as_string() == "MiniMaxMusic3Vocoder") {
+    return dac_config_(fd, out, err);
+  }
   if (!o.contains("model_type") ||
       o.at("model_type").as_string() != "yue2_vae") {
     return fail("not a YuE2 VAE (model_type != \"yue2_vae\")");
@@ -138,7 +201,14 @@ bool
 MetalOobleckDecoder::is_oobleck_dir(const std::string& dir)
 {
   Config c;
-  return config_from_dir(dir, &c, nullptr);
+  return config_from_dir(dir, &c, nullptr) && c.layout == Layout::kOobleck;
+}
+
+bool
+MetalOobleckDecoder::is_music3_vocoder_dir(const std::string& dir)
+{
+  Config c;
+  return config_from_dir(dir, &c, nullptr) && c.layout == Layout::kDac;
 }
 
 MetalOobleckDecoder::~MetalOobleckDecoder() = default;
@@ -264,6 +334,33 @@ MetalOobleckDecoder::snake_(WeightSet& ws, const std::string& nm)
 {
   Snake s;
   std::vector<float> a, b;
+  const bool dac = _cfg.layout == Layout::kDac;
+  if (dac) {
+    // x + sin(a x)^2 / (a + 1e-9): the multiplier is alpha as stored and
+    // the divisor's reciprocal is taken here, in f32, as the reference
+    // takes it.
+    if (!read_f32_(ws, _mc, nm + ".alpha", &a) || a.empty()) { return s; }
+    s.c = (int)a.size();
+    s.ealpha = ws.derived(std::string(kKey) + "da|" + nm,
+                          [&]() -> SharedBuffer {
+      SharedBuffer o = _mc->make_shared_buffer(a.size() * 4);
+      if (o.empty()) { return {}; }
+      std::memcpy(o.contents(), a.data(), a.size() * 4);
+      return o;
+    });
+    s.rbeta = ws.derived(std::string(kKey) + "dr|" + nm,
+                         [&]() -> SharedBuffer {
+      SharedBuffer o = _mc->make_shared_buffer(a.size() * 4);
+      if (o.empty()) { return {}; }
+      auto* d = static_cast<float*>(o.contents());
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        d[i] = 1.0f / (a[i] + 1e-9f);
+      }
+      return o;
+    });
+    if (s.rbeta.empty()) { s.ealpha = {}; }
+    return s;
+  }
   if (!read_f32_(ws, _mc, nm + ".alpha", &a) ||
       !read_f32_(ws, _mc, nm + ".beta", &b) || a.size() != b.size() ||
       a.empty()) {
@@ -307,7 +404,47 @@ MetalOobleckDecoder::init_(const std::shared_ptr<WeightSet>& ws,
   _mc = mc;
   _cfg = cfg;
   WeightSet& w = *ws;
+  if (cfg.streams < 1 || cfg.latent_dim % cfg.streams != 0) {
+    return fail("the latent does not split into its streams");
+  }
+  if (!(cfg.layout == Layout::kDac ? init_dac_(w, err)
+                                   : init_oobleck_(w, err))) {
+    return false;
+  }
 
+  _lib_gemm = mc->load_library("dense_gemm");
+  _lib_elt  = mc->load_library("llm_elementwise");
+  _lib_avae = mc->load_library("audio_vae_1d");
+  _fn_gemm   = _lib_gemm.function("dense_gemm_t_bm64_f16");
+  _fn_im2col = _lib_avae.function("im2col_1d_tc_f16");
+  _fn_col2im = _lib_avae.function("col2im_1d_tc_f16");
+  _fn_snake  = _lib_avae.function("snake_beta_f16");
+  _fn_add    = _lib_elt.function("residual_add_f16");
+  if (!_fn_gemm.valid() || !_fn_im2col.valid() || !_fn_col2im.valid() ||
+      !_fn_snake.valid() || !_fn_add.valid()) {
+    return fail("an Oobleck kernel did not resolve");
+  }
+  // Gated on the hardware: matmul2d EMULATES without matrix cores.
+  if (mc->supports_matrix_cores() &&
+      std::getenv("VPIPE_YUE2_VAE_NO_MMA2") == nullptr) {
+    _lib_mma = mc->load_library("dense_gemm_mma");
+    _fn_mma = _lib_mma.function("dense_gemm_mma_t_n128_f16");
+    _fn_mma_deep = _lib_mma.function("dense_gemm_mma_t_n128x256_f16");
+    _fn_bias_rows = _lib_elt.function("bias_add_rows_f16");
+    _use_mma = _fn_mma.valid() && _fn_mma_deep.valid() &&
+               _fn_bias_rows.valid();
+  }
+  return true;
+}
+
+bool
+MetalOobleckDecoder::init_oobleck_(WeightSet& w, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const Config& cfg = _cfg;
   // decoder.layers: [0] the input conv, [1..n] the upsample blocks from
   // the widest down, [n+1] the closing SnakeBeta, [n+2] the output conv.
   const int nb = (int)cfg.strides.size();
@@ -344,28 +481,62 @@ MetalOobleckDecoder::init_(const std::shared_ptr<WeightSet>& ws,
       _conv_out.cout != cfg.out_channels) {
     return fail("the decoder's output stage is incomplete");
   }
+  return true;
+}
 
-  _lib_gemm = mc->load_library("dense_gemm");
-  _lib_elt  = mc->load_library("llm_elementwise");
-  _lib_avae = mc->load_library("audio_vae_1d");
-  _fn_gemm   = _lib_gemm.function("dense_gemm_t_bm64_f16");
-  _fn_im2col = _lib_avae.function("im2col_1d_tc_f16");
-  _fn_col2im = _lib_avae.function("col2im_1d_tc_f16");
-  _fn_snake  = _lib_avae.function("snake_beta_f16");
-  _fn_add    = _lib_elt.function("residual_add_f16");
-  if (!_fn_gemm.valid() || !_fn_im2col.valid() || !_fn_col2im.valid() ||
-      !_fn_snake.valid() || !_fn_add.valid()) {
-    return fail("an Oobleck kernel did not resolve");
+bool
+MetalOobleckDecoder::init_dac_(WeightSet& w, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const Config& cfg = _cfg;
+  const int zs = cfg.latent_dim / cfg.streams;
+  // dec_in_proj (1x1, bias, no weight norm) -> conv_in -> blocks.{i}
+  // (snake1, conv_t1, res_unit1..3) -> snake_out -> conv_out -> tanh.
+  _in_proj = conv_(w, "dec_in_proj", false, 1, 1);
+  if (_in_proj.empty() || _in_proj.cin != zs ||
+      _in_proj.cout != cfg.in_proj) {
+    return fail("dec_in_proj missing or of the wrong width");
   }
-  // Gated on the hardware: matmul2d EMULATES without matrix cores.
-  if (mc->supports_matrix_cores() &&
-      std::getenv("VPIPE_YUE2_VAE_NO_MMA2") == nullptr) {
-    _lib_mma = mc->load_library("dense_gemm_mma");
-    _fn_mma = _lib_mma.function("dense_gemm_mma_t_n128_f16");
-    _fn_mma_deep = _lib_mma.function("dense_gemm_mma_t_n128x256_f16");
-    _fn_bias_rows = _lib_elt.function("bias_add_rows_f16");
-    _use_mma = _fn_mma.valid() && _fn_mma_deep.valid() &&
-               _fn_bias_rows.valid();
+  _conv_in = conv_(w, "conv_in", false, 1, 1);
+  if (_conv_in.empty() || _conv_in.cin != cfg.in_proj ||
+      _conv_in.cout != cfg.hidden) {
+    return fail("conv_in missing or of the wrong width");
+  }
+  const int nb = (int)cfg.strides.size();
+  _blocks.resize((std::size_t)nb);
+  int width = cfg.hidden;
+  for (int bi = 0; bi < nb; ++bi) {
+    const std::string p = "blocks." + std::to_string(bi);
+    Block& b = _blocks[(std::size_t)bi];
+    b.rate = cfg.strides[(std::size_t)(nb - 1 - bi)];
+    b.act = snake_(w, p + ".snake1");
+    b.up = conv_(w, p + ".conv_t1", true, 1, b.rate);
+    if (b.act.empty() || b.up.empty() || b.up.k != 2 * b.rate ||
+        b.up.cin != width || b.up.cout != width / 2) {
+      return fail("vocoder block " + std::to_string(bi) +
+                  " is incomplete");
+    }
+    width /= 2;
+    for (int j = 0; j < 3; ++j) {
+      const std::string r = p + ".res_unit" + std::to_string(j + 1);
+      ResUnit& u = b.res[j];
+      u.a1 = snake_(w, r + ".snake1");
+      u.c1 = conv_(w, r + ".conv1", false, kDilations[j], 1);
+      u.a2 = snake_(w, r + ".snake2");
+      u.c2 = conv_(w, r + ".conv2", false, 1, 1);
+      if (u.a1.empty() || u.c1.empty() || u.a2.empty() || u.c2.empty()) {
+        return fail("residual unit " + r + " is incomplete");
+      }
+    }
+  }
+  _act_out = snake_(w, "snake_out");
+  _conv_out = conv_(w, "conv_out", false, 1, 1);
+  if (_act_out.empty() || _conv_out.empty() ||
+      _conv_out.cout != cfg.out_channels || _conv_out.cin != width) {
+    return fail("the vocoder's output stage is incomplete");
   }
   return true;
 }
@@ -388,7 +559,7 @@ MetalOobleckDecoder::decode_cost(int frames, std::size_t* pcm,
   std::size_t bound = 0;
   decode_cost(_cfg, _core, frames, &bound, arena);
   *pcm = (std::size_t)std::max(0, natural_length(frames)) *
-         (std::size_t)_cfg.out_channels * 4;
+         (std::size_t)_cfg.out_channels * (std::size_t)_cfg.streams * 4;
 }
 
 void
@@ -396,19 +567,20 @@ MetalOobleckDecoder::decode_cost(const Config& c, int core, int frames,
                                  std::size_t* pcm, std::size_t* arena)
 {
   *pcm = (std::size_t)std::max(0, frames) * (std::size_t)c.hop() *
-         (std::size_t)c.out_channels * 4;
+         (std::size_t)c.out_channels * (std::size_t)c.streams * 4;
   // A tile's widest activation is about hop * frames * channels at the
   // last stage; three of them, the pre-fold and the im2col band.
   const std::size_t tf = (std::size_t)(std::max(core, 1) + 2 * c.halo_frames);
   const std::size_t act =
-      tf * (std::size_t)c.hop() * (std::size_t)c.channels * 2;
+      tf * (std::size_t)c.hop() * (std::size_t)c.last_width() * 2;
   *arena = 5 * act + kColCap * 2;
 }
 
 std::size_t
 MetalOobleckDecoder::resident_bytes() const
 {
-  std::size_t b = _conv_in.w.byte_size() + _conv_out.w.byte_size();
+  std::size_t b = _conv_in.w.byte_size() + _conv_out.w.byte_size() +
+                  _in_proj.w.byte_size();
   for (const Block& k : _blocks) {
     b += k.up.w.byte_size();
     for (const ResUnit& u : k.res) {
@@ -424,7 +596,8 @@ MetalOobleckDecoder::ensure_scratch_(int frames)
   if (frames <= _tile_frames) { return true; }
   // The widest activation and pre-fold over every stage of this tile.
   std::size_t act = (std::size_t)frames *
-                    (std::size_t)std::max(_conv_in.cout, _cfg.latent_dim);
+                    (std::size_t)std::max({_conv_in.cout, _cfg.latent_dim,
+                                           _in_proj.cout});
   std::size_t pre = 0;
   int L = frames;
   for (const Block& b : _blocks) {
@@ -565,22 +738,25 @@ MetalOobleckDecoder::snake_run_(ComputeEncoder& enc, const Snake& s,
 }
 
 bool
-MetalOobleckDecoder::decode_tile_(const float* z, int frames, int f0, int f1,
-                                  std::vector<float>* tile, std::string* err)
+MetalOobleckDecoder::decode_tile_(const float* z, int frames, int stream,
+                                  int f0, int f1, std::vector<float>* tile,
+                                  std::string* err)
 {
   const int T = f1 - f0;
-  const int Z = _cfg.latent_dim;
+  const int Z = _cfg.latent_dim / _cfg.streams;
   if (!ensure_scratch_(T)) {
     if (err != nullptr) { *err = "VAE scratch allocation failed"; }
     return false;
   }
-  // Channel-major [Z, frames] -> time-major [T, Z] f16.
+  // Channel-major [Z, frames] (this stream's rows) -> time-major [T, Z]
+  // f16.
   {
+    const float* zs = z + (std::size_t)stream * Z * frames;
     auto* d = static_cast<_Float16*>(_b.contents());
     for (int t = 0; t < T; ++t) {
       for (int ch = 0; ch < Z; ++ch) {
         d[(std::size_t)t * Z + ch] =
-            (_Float16)z[(std::size_t)ch * frames + (std::size_t)(f0 + t)];
+            (_Float16)zs[(std::size_t)ch * frames + (std::size_t)(f0 + t)];
       }
     }
   }
@@ -589,7 +765,12 @@ MetalOobleckDecoder::decode_tile_(const float* z, int frames, int f0, int f1,
   int L = T;
   {
     ComputeEncoder enc = s.begin_compute();
-    conv_run_(enc, _conv_in, _b, _a, L);
+    if (!_in_proj.empty()) {
+      conv_run_(enc, _in_proj, _b, _c, L);
+      conv_run_(enc, _conv_in, _c, _a, L);
+    } else {
+      conv_run_(enc, _conv_in, _b, _a, L);
+    }
     for (const Block& b : _blocks) {
       const Conv& u = b.up;
       snake_run_(enc, b.act, _a, _b, L);
@@ -659,17 +840,22 @@ MetalOobleckDecoder::decode(const float* z, int frames,
   }
   const int hop = _cfg.hop();
   const int C = _cfg.out_channels;
+  const int S = _cfg.streams;
   const int halo = std::max(_cfg.halo_frames, 0);
   const int total = natural_length(frames);
-  pcm->assign((std::size_t)C * (std::size_t)total, 0.0f);
+  pcm->assign((std::size_t)S * C * (std::size_t)total, 0.0f);
   const int tiles = (frames + _core - 1) / _core;
   std::vector<float> tile;
-  for (int ti = 0; ti < tiles; ++ti) {
+  for (int tj = 0; tj < tiles * S; ++tj) {
+    const int st = tj / tiles;
+    const int ti = tj % tiles;
     const int start = ti * _core;
     const int end = std::min(frames, start + _core);
     const int left = std::max(0, start - halo);
     const int right = std::min(frames, end + halo);
-    if (!decode_tile_(z, frames, left, right, &tile, err)) { return false; }
+    if (!decode_tile_(z, frames, st, left, right, &tile, err)) {
+      return false;
+    }
     // Keep the core: [start * hop, min(end * hop, total)) of the song is
     // [(start - left) * hop, ...) of the tile.
     const int out0 = start * hop;
@@ -685,10 +871,10 @@ MetalOobleckDecoder::decode(const float* z, int frames,
       for (int ch = 0; ch < C; ++ch) {
         float v = tile[src + (std::size_t)ch];
         if (clamp) { v = std::clamp(v, -1.0f, 1.0f); }
-        (*pcm)[(std::size_t)ch * total + (std::size_t)t] = v;
+        (*pcm)[(std::size_t)(st * C + ch) * total + (std::size_t)t] = v;
       }
     }
-    if (progress && !progress(ti + 1, tiles)) {
+    if (progress && !progress(tj + 1, tiles * S)) {
       if (err != nullptr) { err->clear(); }
       return false;
     }

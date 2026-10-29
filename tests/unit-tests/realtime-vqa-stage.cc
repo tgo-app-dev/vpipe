@@ -999,9 +999,11 @@ TEST(realtime_vqa_stage, metal_stop_drops_unfinished_scene) {
   ::unsetenv("VPIPE_LLM_BACKEND");
 
   // Wait until the stage has captured the scene's frames (scene active),
-  // so stop() below drops a REAL in-progress scene, not a no-op.
+  // so stop() below drops a REAL in-progress scene, not a no-op. The
+  // stage loads its model inside this wait: a 27B one on a 16 GB M5
+  // takes 13.6-15 s (load, tower, warm-up).
   bool active = false;
-  for (int i = 0; i < 2000 && !active; ++i) {   // up to ~10 s
+  for (int i = 0; i < 12000 && !active; ++i) {   // up to ~60 s
     active = rvqa->scene_active_for_test();
     if (!active) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));

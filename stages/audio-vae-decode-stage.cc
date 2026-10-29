@@ -42,7 +42,7 @@ const ConfigKey kAttrs[] = {
    .doc = "model dir carrying an audio VAE (read from <hf_dir>/audio_vae). "
           "OPTIONAL: a model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-fl2va,yue2-vae",
+   .suggest_db_type = "minimax-h3-fl2va,yue2-vae,minimax-music3",
    .model_channel = "diffusion-model"},
   {.key = "vae_dir", .type = ConfigType::String, .required = false,
    .doc = "the audio VAE's WEIGHTS, when they are not hf_dir's own: a "

@@ -264,6 +264,27 @@ TEST(model_catalog, drama3_present) {
   }
 }
 
+// Ternary-Bonsai: the MLX pack whole, the GGUF repo's two packings of one
+// model each pinned with the BF16 projector, told apart by variant.
+TEST(model_catalog, ternary_bonsai_present) {
+  const ModelCatalogEntry* m =
+      catalog_by_path("prism-ml/Ternary-Bonsai-27B-mlx-2bit");
+  EXPECT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->model_type == "qwen3.5" && m->files.empty());
+  const auto all = catalog_all_by_path("prism-ml/Ternary-Bonsai-2-27B-gguf");
+  EXPECT_TRUE(all.size() == 2);
+  for (const char* v : {"PTQ1_0", "PQ2_0"}) {
+    const ModelCatalogEntry* e = catalog_pick_variant(all, v);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->model_type == "qwen3.5" && e->files.size() == 2);
+    EXPECT_TRUE(e->files[0] ==
+                std::string("Ternary-Bonsai-2-27B-") + v + ".gguf");
+    EXPECT_TRUE(e->files[1] == "Ternary-Bonsai-2-27B-mmproj-BF16.gguf");
+  }
+}
+
 // OptiQ 4-bit MLX variants for 2B/4B/9B; whole-repo fetch (no pin).
 TEST(model_catalog, optiq_variants_present) {
   EXPECT_TRUE(has_(catalog_variants("Qwen", "3.5", "9B"),

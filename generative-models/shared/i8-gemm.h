@@ -110,6 +110,22 @@ class I8GemmContext {
 
   bool enabled() const { return _on; }
 
+  // The row floor every route gates on: 1024 by default, the requant
+  // route's crossover, where the weight is quantized per call. A caller
+  // whose weights are HELD in the fast layout may lower it: that GEMM
+  // reads half the f16 route's weight bytes at any row count, and the
+  // dense route under the floor would have to dequantize the layout first
+  // (MEASURED on the base M5, MiniMax-Music3's DiT at 696 rows: token 175
+  // ms an evaluation on the int8 route, 376 dequantized, f16 318). Inline,
+  // no symbol; VPIPE_I8_GEMM_MIN_M, when set, wins.
+  void set_min_rows(int m)
+  {
+    if (std::getenv("VPIPE_I8_GEMM_MIN_M") == nullptr) {
+      _min_m = m > 1 ? m : 1;
+    }
+  }
+  int min_rows() const { return _min_m; }
+
   // Shape gate: the win regime is big-M compute-bound GEMMs (measured
   // crossover ~1k rows on M5). K must split into whole groups, OR the
   // padding quantizer must be available to make it so -- see kpad_() -- and

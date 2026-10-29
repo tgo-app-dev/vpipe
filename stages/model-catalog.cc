@@ -341,6 +341,37 @@ builtin_catalog_()
      .files = {"Qwen3.8-27B-Q8_0.gguf",    // main quant
                "mmproj-F16.gguf"},         // F16 multimodal projector
      .needs_tokenizer_json = false},
+    // ---- Ternary-Bonsai (Prism ML, Apache-2.0) --------------------------
+    //
+    // Ternary trainings of the Qwen hybrids: every language projection,
+    // the table and the head {-1, 0, +1} x an F16 scale per 128, run on
+    // the 2-bit group-128 affine kernels (a trit is code q - 1: scale s,
+    // bias -s). Bonsai 1 (Qwen3.6-27B) is an MLX pack, its tower dense in
+    // the file. Bonsai 2 (Qwen3.8-27B) is a GGUF in two packings of the
+    // SAME values (every tensor dequantizes identically): PTQ1_0, dense
+    // trits (5.9 GB), and PQ2_0, a trit a 2-bit slot (7.2 GB) -- both held
+    // at 2.25 bits a weight once loaded, so PTQ1_0 is the smaller fetch
+    // for the same model. Its projections were trained on a Hadamard-
+    // ROTATED input (the file's prism.hadamard metadata; GgufQwen35
+    // Converter checks it, MetalQwenModel rotates). The tower is the
+    // mmproj beside it, BF16 pinned (Q8_0 also reads). Run at f16: the
+    // scales are F16 (docs/BONSAI.md).
+    {.family = "Ternary-Bonsai", .version = "1", .param_class = "27B",
+     .variant = "MLX 2-bit ternary (prism-ml)",
+     .hf_path = "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    {.family = "Ternary-Bonsai", .version = "2", .param_class = "27B",
+     .variant = "PTQ1_0 GGUF +mmproj (prism-ml)",
+     .hf_path = "prism-ml/Ternary-Bonsai-2-27B-gguf", .model_type = "qwen3.5",
+     .files = {"Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+               "Ternary-Bonsai-2-27B-mmproj-BF16.gguf"},
+     .needs_tokenizer_json = false},
+    {.family = "Ternary-Bonsai", .version = "2", .param_class = "27B",
+     .variant = "PQ2_0 GGUF +mmproj (prism-ml)",
+     .hf_path = "prism-ml/Ternary-Bonsai-2-27B-gguf", .model_type = "qwen3.5",
+     .files = {"Ternary-Bonsai-2-27B-PQ2_0.gguf",
+               "Ternary-Bonsai-2-27B-mmproj-BF16.gguf"},
+     .needs_tokenizer_json = false},
     // mlx-community's plain 4-bit conversion: uniform group-affine like the
     // lmstudio one above (no MTP head; the tower in the shards). It is the
     // target the DFlash 2 drafter below was published against.
@@ -820,6 +851,46 @@ builtin_catalog_()
      .hf_path = "m-a-p/YuE2-Vae-legacy",
      .model_type = "yue2-vae",
      .files = {"config.json", "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = false},
+    // ---- MiniMax-Music3 (text-to-music: LM + depth decoder + DiT) ----
+    // The generate-audio stage's hf_dir (model_type "minimax-music3"): a
+    // Qwen3-8B LM and a 0.6B depth decoder pick a frame's eight RVQ codes
+    // at 25 Hz, a 2.4B DiT flow-matches 128-wide latents from their hidden
+    // states, and the repo's own DAC vocoder (audio-vae-decode, the same
+    // hf_dir) decodes them to 44.1 kHz stereo. PINNED to the diffusers
+    // layout (28.6 GB): the repo also carries the original layout's files
+    // (qwen_7B/, dav.pth, flowmatching_vae.pth -- the same weights again),
+    // demo audio and figures. MiniMax-Music3 Community License: commercial
+    // use must display "MiniMax-Music3"; past USD 20M a year, MiniMax's
+    // written authorization.
+    {.family = "MiniMax", .version = "Music3", .param_class = "11B",
+     .variant = "diffusers (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-Music3",
+     .model_type = "minimax-music3",
+     .files = {"config.json", "modular_model_index.json", "LICENSE",
+               "README.md",
+               "condition_encoder/config.json",
+               "condition_encoder/diffusion_pytorch_model.safetensors",
+               "language_model/config.json",
+               "language_model/generation_config.json",
+               "language_model/model.safetensors.index.json",
+               "language_model/model-00001-of-00004.safetensors",
+               "language_model/model-00002-of-00004.safetensors",
+               "language_model/model-00003-of-00004.safetensors",
+               "language_model/model-00004-of-00004.safetensors",
+               "rvq_depth_decoder/config.json",
+               "rvq_depth_decoder/diffusion_pytorch_model.safetensors",
+               "scheduler/scheduler_config.json",
+               "tokenizer/chat_template.jinja", "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "vocoder/config.json",
+               "vocoder/diffusion_pytorch_model.safetensors"},
      .needs_tokenizer_json = false},
     // ---- BS-RoFormer (music source separation) -----------------------
     // The audio-separate stage's hf_dir (model_type "bs-roformer"): an
@@ -2921,7 +2992,8 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"audio"});
   } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
     set({"audio"}, {"audio"});
-  } else if (mt == "yue2" || mt == "fish-drama3") {
+  } else if (mt == "yue2" || mt == "fish-drama3" ||
+             mt == "minimax-music3") {
     set({"text"}, {"audio"});
   } else if (mt == "yue2-vae") {
     set({"audio"}, {"audio"});

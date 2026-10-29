@@ -19,6 +19,20 @@
 //     the decode comes out 1920 * frames - 64 samples long, not
 //     1920 * frames.
 //
+// THE SAME CLASS DECODES MiniMax-Music3's vocoder (its diffusers
+// `vocoder/`, MiniMaxMusic3Vocoder: a DAC decoder), because it is the same
+// op graph -- weight-normed convolutions, an activation, transposed
+// convolutions padded ceil(stride / 2), residual units at dilations 1, 3,
+// 9 -- with four differences, each set by Layout::kDac:
+//
+//   * a plain Snake, x + sin(a x)^2 / (a + 1e-9), alpha stored as is (no
+//     log space, no separate beta);
+//   * a 1x1 projection (dec_in_proj, with a bias) ahead of the input conv;
+//   * STEREO AS TWO SEQUENCES: the 128 latent channels are two 64-wide
+//     streams, left then right, each decoded on its own to one channel;
+//   * a closing tanh, and every stride even, so a decode is exactly
+//     512 * frames samples long.
+//
 // Activations are f16 with f32 arithmetic in every kernel, as for the H3
 // decoder; the reference runs the whole decoder in fp32.
 //
@@ -52,8 +66,13 @@ class WeightSet;
 
 class MetalOobleckDecoder {
 public:
+  enum class Layout { kOobleck, kDac };
   struct Config {
+    Layout layout    = Layout::kOobleck;
+    // The beat's latent width; with `streams` > 1 it is split into that
+    // many equal sequences (kDac: 128 = left 64 + right 64).
     int latent_dim   = 64;
+    int streams      = 1;
     int channels     = 64;
     std::vector<int> c_mults = {1, 2, 4, 8, 16, 32};
     std::vector<int> strides = {2, 2, 4, 4, 5, 6};
@@ -62,14 +81,25 @@ public:
     bool final_tanh  = false;
     int core_frames  = 1024;     // the reference's tile; ours is smaller
     int halo_frames  = 16;
+    // kDac: the input projection's and the input conv's widths (each block
+    // halves the latter).
+    int in_proj      = 0;
+    int hidden       = 0;
     int hop() const;
+    // The narrowest -- last -- stage's width, which with the longest
+    // sequence makes the widest activation.
+    int last_width() const;
   };
 
   // config.json of a YuE2 VAE export (model_type "yue2_vae"): its
-  // decoder_config, sample_rate and decode halo.
+  // decoder_config, sample_rate and decode halo -- or of MiniMax-Music3's
+  // vocoder (_class_name MiniMaxMusic3Vocoder), as Layout::kDac.
   static bool config_from_dir(const std::string& dir, Config* out,
                               std::string* err = nullptr);
+  // A YuE2 VAE export (the Oobleck layout only).
   static bool is_oobleck_dir(const std::string& dir);
+  // MiniMax-Music3's vocoder directory (the DAC layout).
+  static bool is_music3_vocoder_dir(const std::string& dir);
 
   static std::unique_ptr<MetalOobleckDecoder> load(
       std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
@@ -109,9 +139,9 @@ public:
 
   // `z` is CHANNEL-major [latent_dim, frames] f32 (the reference's
   // [1, 64, T] without its batch axis). `pcm` comes back PLANAR
-  // [out_channels, natural_length(frames)] f32, clamped to [-1, 1] when
-  // `clamp` (the reference pipeline clamps after decoding; the VAE itself
-  // does not).
+  // [streams * out_channels, natural_length(frames)] f32, clamped to
+  // [-1, 1] when `clamp` (the reference pipeline clamps after decoding;
+  // the VAE itself does not).
   bool decode(const float* z, int frames, std::vector<float>* pcm,
               bool clamp = true, const ProgressFn& progress = {},
               std::string* err = nullptr);
@@ -153,13 +183,18 @@ private:
   bool init_(const std::shared_ptr<WeightSet>& ws,
              metal_compute::MetalCompute* mc, const Config& cfg,
              std::string* err);
+  // The two layouts' tensor names.
+  bool init_oobleck_(WeightSet& w, std::string* err);
+  bool init_dac_(WeightSet& w, std::string* err);
   Conv  conv_(WeightSet& ws, const std::string& nm, bool transposed,
               int dilation, int stride);
   Snake snake_(WeightSet& ws, const std::string& nm);
   metal_compute::SharedBuffer f16_(WeightSet& ws, const std::string& nm);
 
   bool ensure_scratch_(int frames);
-  bool decode_tile_(const float* z, int frames, int f0, int f1,
+  // One tile of stream `stream`: its latent rows are [stream * Zs,
+  // (stream + 1) * Zs) of `z`, Zs = latent_dim / streams.
+  bool decode_tile_(const float* z, int frames, int stream, int f0, int f1,
                     std::vector<float>* tile, std::string* err);
 
   bool gemm_mma_(metal_compute::ComputeEncoder& enc,
@@ -185,6 +220,7 @@ private:
   Config _cfg;
   std::shared_ptr<WeightSet> _ws;
 
+  Conv _in_proj;                 // kDac only
   Conv _conv_in, _conv_out;
   std::vector<Block> _blocks;
   Snake _act_out;

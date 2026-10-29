@@ -1,0 +1,74 @@
+{
+  "id": "ternary-bonsai-2-chat",
+  "stages": [
+    {
+      "id": "tx",
+      "type": "feedback-tx",
+      "config": {
+        "from": "rx"
+      }
+    },
+    {
+      "id": "sampler",
+      "type": "sampler-select",
+      "config": {
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 0.95,
+        "min_p": 0.05,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "seed": 0
+      }
+    },
+    {
+      "id": "input",
+      "type": "text-input",
+      "iports": [
+        {
+          "src": "tx",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "prompt": "you> ",
+        "count": 0,
+        "present_first_without_beat": true,
+        "media": true
+      }
+    },
+    {
+      "id": "chat",
+      "type": "text-chat",
+      "iports": [
+        {
+          "src": "input",
+          "oport": 0
+        },
+        {
+          "src": "sampler",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        "compute_dtype": "f16",
+        "page_tokens": 1024,
+        "max_pages": 32,
+        "max_new_tokens": 8192,
+        "enable_tools": false
+      }
+    },
+    {
+      "id": "rx",
+      "type": "feedback-rx",
+      "iports": [
+        {
+          "src": "chat",
+          "oport": 0
+        }
+      ]
+    }
+  ],
+  "subpipelines": []
+}

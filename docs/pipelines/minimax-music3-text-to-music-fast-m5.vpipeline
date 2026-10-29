@@ -1,0 +1,47 @@
+{
+  "id": "minimax-music3-text-to-music-fast-m5",
+  "stages": [
+    {
+      "id": "generate-audio",
+      "type": "generate-audio",
+      "iports": [],
+      "config": {
+        "hf_dir": "MiniMaxAI/MiniMax-Music3",
+        "style": "Global Metadata\nBasic Attributes: bpm is 96. key is C, and scale is major. Acoustic Pop / Singer-Songwriter.\nGlobal Emotional Progression: Warm and intimate from the first bars, the song builds gently through the verses and opens into a wide, glowing final chorus.\nSonics & Production Profile: A close, organic mix with a soft high end and a warm low-mid; light room reverb, natural dynamics.\nVocal Details\nVocal Gender & Timbre: Singer A (Female). A soft, breathy lead with a clear, gentle tone.\nVocal Style: Close and conversational in the verses, more open and sustained in the chorus.\nHarmony/Backing Vocals: Light stacked harmonies join in the chorus.\nArrangement\nInstrument Lifecycle Description (Primary/Secondary Layering):\nPrimary: Fingerpicked acoustic guitar carries the song from the intro to the outro.\nSecondary: Soft piano chords enter in the first verse; brushed drums and upright bass join in the chorus.\nGroove & Foundation Progression: A relaxed, steady pulse that lifts in the chorus.",
+        "lyrics": "[intro]\n[verse]\nMorning light filtering through the pine\nEvery quiet street is yours and mine\nCoffee steam and windows full of gold\nAll the little stories never told\n[chorus]\nSoftly the world begins to breathe\nHold on to the morning, never leave\nEvery road is open, every door\nThis is what the daylight's waiting for\n[verse]\nBicycles and bells along the square\nSongs we used to know are in the air\n[chorus]\nSoftly the world begins to breathe\nHold on to the morning, never leave\nEvery road is open, every door\nThis is what the daylight's waiting for\n[outro]",
+        "max_seconds": 120.0,
+        "seed": 7,
+        "i8_gemm": true,
+        "i8_gemm_tier": "token"
+      }
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "MiniMaxAI/MiniMax-Music3"
+      }
+    },
+    {
+      "id": "save-audio",
+      "type": "save-audio",
+      "iports": [
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_path": "minimax-music3-song-fast-m5.m4a",
+        "bitrate": 256000
+      }
+    }
+  ],
+  "subpipelines": []
+}

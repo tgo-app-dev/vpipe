@@ -1831,6 +1831,31 @@ kernel void dequant_embed_gather_f16(
   out[(uint)t * H + h] = VPIPE_ELT(s * float(nib) + b);
 }
 
+// 2-bit group-128 variant (the ternary packs' table): weight U32 [vocab,
+// H/16], code h at bits 2*(h%16) of word h/16; scales/biases [vocab,
+// H/128]. Same signature and grid as the 4-bit gather.
+kernel void dequant_embed_gather_w2_g128_f16(
+    const device int*       ids    [[buffer(0)]],
+    const device uint32_t*  w      [[buffer(1)]],
+    const device VPIPE_ELT* scales [[buffer(2)]],
+    const device VPIPE_ELT* biases [[buffer(3)]],
+    device VPIPE_ELT*       out    [[buffer(4)]],
+    constant int&           H      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int h = (int)gid.x;
+  if (h >= H) { return; }
+  const int t = (int)gid.y;
+  const int id = ids[t];
+  const int H_w = H / 16;
+  const int H_g = H / 128;
+  const uint32_t packed = w[(uint)id * H_w + h / 16];
+  const uint q = (packed >> (2 * (h % 16))) & 0x3;
+  const float s = float(scales[(uint)id * H_g + h / 128]);
+  const float b = float(biases[(uint)id * H_g + h / 128]);
+  out[(uint)t * H + h] = VPIPE_ELT(s * float(q) + b);
+}
+
 // 8-bit variant: weight U32 [vocab, H/4] (4 bytes per word, one byte per
 // value), scales/biases [vocab, H/64] group 64. Same affine dequant as
 // the 4-bit gather, byte-extracted instead of nibble. Used by the 8-bit
@@ -5552,4 +5577,93 @@ kernel void wavelet_blur_f32(
     }
   }
   y[(ulong)gid.z * plane + (ulong)gid.y * (uint)W + gid.x] = acc;
+}
+
+// A PRISM HADAMARD ROTATION (Bonsai 2's ternary packs): rows of a
+// [rows, K] activation transformed blockwise, 1024 values a block, by the
+// normalized Sylvester Walsh-Hadamard H (H[r][c] = (-1)^popcount(r & c) /
+// 32) and a sign vector s of length K. Forward -- a rotated linear's input
+// -- y = H(s * x); inverse -- an embedding row read in the rotated basis
+// -- y = s * (H x). F32 inside, as the packs were calibrated (one rounding,
+// at the store). H is symmetric and its own inverse, so the two compose to
+// the identity. In place is allowed (x == y): a block is read whole
+// before any of it is written.
+//
+// A threadgroup of 256 a (block, row): thread t holds the block's values
+// 4t .. 4t+3. The butterflies at distance 1 and 2 stay in its registers,
+// 4 .. 64 cross lanes of its simdgroup (shuffle by t ^ h/4), 128 .. 512
+// cross simdgroups through threadgroup memory.
+//
+// GROUPED INPUT (rep > 1): a gated-DeltaNet output in a GGUF's TILED
+// value-head order -- head j = r * nk + k -- read as the training's
+// GROUPED order, head k * rep + r, which is the order a rotated out_proj
+// was folded in (Prism's gdn_v_grouped). Position p of the row reads x at
+// (p % hd) + hd * ((p / (hd rep)) + nk ((p / hd) % rep)). Never in place.
+//
+//   0:x 1:y  2:signs (f32, K)  3:K (a multiple of 1024)  4:inverse (0|1)
+//   5:x_stride 6:y_stride (elements between rows)
+//   7:hd 8:nk 9:rep (rep <= 1: no permutation).
+//   grid {K/1024 * 256, rows, 1}, threadgroup {256, 1, 1}.
+kernel void prism_hadamard_rows_1024(
+    const device VPIPE_ELT* x       [[buffer(0)]],
+    device VPIPE_ELT*       y       [[buffer(1)]],
+    const device float*     signs   [[buffer(2)]],
+    constant int&           K       [[buffer(3)]],
+    constant int&           inverse [[buffer(4)]],
+    constant int&           xs      [[buffer(5)]],
+    constant int&           ys      [[buffer(6)]],
+    constant int&           hd      [[buffer(7)]],
+    constant int&           nk      [[buffer(8)]],
+    constant int&           rep     [[buffer(9)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  t    [[thread_index_in_threadgroup]])
+{
+  // K is a multiple of 1024 (the host's to check): every thread of a
+  // threadgroup reaches every barrier. The grid covers it exactly.
+  (void)K;
+  threadgroup float buf[1024];
+  const int k0 = (int)tg.x * 1024 + 4 * (int)t;
+  const device VPIPE_ELT* xr = x + (ulong)tg.y * (uint)xs;
+  float v[4];
+  for (int j = 0; j < 4; ++j) {
+    int src = k0 + j;
+    if (rep > 1) {
+      const int p = k0 + j;
+      src = (p % hd) + hd * ((p / (hd * rep)) + nk * ((p / hd) % rep));
+    }
+    v[j] = (float)xr[src];
+    if (inverse == 0) { v[j] *= signs[k0 + j]; }
+  }
+  // Distance 1 and 2: inside the thread.
+  {
+    const float a0 = v[0] + v[1], a1 = v[0] - v[1];
+    const float a2 = v[2] + v[3], a3 = v[2] - v[3];
+    v[0] = a0 + a2; v[2] = a0 - a2;
+    v[1] = a1 + a3; v[3] = a1 - a3;
+  }
+  // Distance 4 .. 64: lanes t ^ 1 .. t ^ 16 of the simdgroup.
+  for (ushort m = 1; m <= 16; m <<= 1) {
+    const bool upper = (t & m) != 0;
+    for (int j = 0; j < 4; ++j) {
+      const float p = simd_shuffle_xor(v[j], m);
+      v[j] = upper ? p - v[j] : v[j] + p;
+    }
+  }
+  // Distance 128 .. 512: threads t ^ 32 .. t ^ 128, through memory.
+  for (uint m = 32; m <= 128; m <<= 1) {
+    for (int j = 0; j < 4; ++j) { buf[4 * t + j] = v[j]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bool upper = (t & m) != 0;
+    for (int j = 0; j < 4; ++j) {
+      const float p = buf[4 * (t ^ m) + j];
+      v[j] = upper ? p - v[j] : v[j] + p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  device VPIPE_ELT* yr = y + (ulong)tg.y * (uint)ys + k0;
+  for (int j = 0; j < 4; ++j) {
+    float o = v[j] * 0.03125f;
+    if (inverse != 0) { o *= signs[k0 + j]; }
+    yr[j] = (VPIPE_ELT)o;
+  }
 }

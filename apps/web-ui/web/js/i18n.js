@@ -2380,29 +2380,45 @@ const STRINGS = {
   // ---- Generate Image (generative) ----
   'stage.generate-audio.name': ['', '生成音频', '生成音訊'],
   'stage.generate-audio.doc': ['',
-      '根据风格提示词和歌词生成歌曲（YuE2，metal）：先规划 ABC 乐谱，再写出歌'
-      + '曲的语义 token，最后用流匹配生成供 audio-vae-decode 解码的潜空间音频'
-      + '。',
-      '根據風格提示詞和歌詞生成歌曲（YuE2，metal）：先規劃 ABC 樂譜，再寫出歌'
-      + '曲的語義 token，最後用流匹配生成供 audio-vae-decode 解碼的潛空間音訊'
-      + '。'],
+      '根据风格提示词和歌词生成歌曲（YuE2 或 MiniMax-Music3'
+      + '，metal）：写出歌曲的 token——YuE2 会先规划 ABC 乐'
+      + '谱——再用流匹配生成供 audio-vae-decode 解码的潜空间音'
+      + '频。',
+      '根據風格提示詞和歌詞生成歌曲（YuE2 或 MiniMax-Music3'
+      + '，metal）：寫出歌曲的 token——YuE2 會先規劃 ABC 樂'
+      + '譜——再用流匹配生成供 audio-vae-decode 解碼的潛空間音'
+      + '訊。'],
   'cfg.generate-audio.hf_dir': ['',
-      '音频生成模型：models 数据库中的键或模型目录。目前支持 YuE2（m-a-p/YuE2'
-      + '-3B）。VAE 不在这里——请把 audio_latent 接到 audio-vae-decode，并在那'
-      + '里使用 m-a-p/YuE2-Vae',
-      '音訊生成模型：models 資料庫中的鍵或模型目錄。目前支援 YuE2（m-a-p/YuE2'
-      + '-3B）。VAE 不在這裡——請把 audio_latent 接到 audio-vae-decode，並在那'
-      + '裡使用 m-a-p/YuE2-Vae'],
+      '音频生成模型：models 数据库中的键或模型目录——YuE2（m-a-'
+      + 'p/YuE2-3B）或 MiniMax-Music3（MiniMaxAI'
+      + '/MiniMax-Music3）。VAE 不在这里——请把 audio_'
+      + 'latent 接到 audio-vae-decode，并在那里使用 m-'
+      + 'a-p/YuE2-Vae，或同一个 MiniMax-Music3 目录（'
+      + '其中的 vocoder/）',
+      '音訊生成模型：models 資料庫中的鍵或模型目錄——YuE2（m-a-'
+      + 'p/YuE2-3B）或 MiniMax-Music3（MiniMaxAI'
+      + '/MiniMax-Music3）。VAE 不在這裡——請把 audio_'
+      + 'latent 接到 audio-vae-decode，並在那裡使用 m-'
+      + 'a-p/YuE2-Vae，或同一個 MiniMax-Music3 目錄（'
+      + '其中的 vocoder/）'],
   'cfg.generate-audio.style': ['',
-      '风格提示词——曲风、情绪、乐器、人声（即 [Tags] 段）。提示节拍中的 "styl'
-      + 'e" 会覆盖它',
-      '風格提示詞——曲風、情緒、樂器、人聲（即 [Tags] 段）。提示節拍中的 "styl'
-      + 'e" 會覆蓋它'],
+      '风格提示词——曲风、情绪、乐器、人声（YuE2 的 [Tags] 段；M'
+      + 'iniMax-Music3 的音乐描述，在那里是必填项，最好写成结构化描'
+      + '述：整体信息、人声细节、编曲）。提示节拍中的 "style"（或 "ca'
+      + 'ption"）会覆盖它',
+      '風格提示詞——曲風、情緒、樂器、人聲（YuE2 的 [Tags] 段；M'
+      + 'iniMax-Music3 的音樂描述，在那裡是必填項，最好寫成結構化描'
+      + '述：整體資訊、人聲細節、編曲）。提示節拍中的 "style"（或 "ca'
+      + 'ption"）會覆蓋它'],
   'cfg.generate-audio.lyrics': ['',
-      '歌词，用 [Verse] / [Chorus] / [Bridge] / [Intro] / [Outro] 标题分段。'
-      + '提示节拍会覆盖它',
-      '歌詞，用 [Verse] / [Chorus] / [Bridge] / [Intro] / [Outro] 標題分段。'
-      + '提示節拍會覆蓋它'],
+      '歌词，用 [Verse] / [Chorus] / [Bridge] /'
+      + ' [Intro] / [Outro] 标题分段（MiniMax-Musi'
+      + 'c3：每个标题单独一行——与标题同一行的文字会被丢弃——且歌词为必填项）'
+      + '。提示节拍会覆盖它',
+      '歌詞，用 [Verse] / [Chorus] / [Bridge] /'
+      + ' [Intro] / [Outro] 標題分段（MiniMax-Musi'
+      + 'c3：每個標題單獨一行——與標題同一行的文字會被捨棄——且歌詞為必填項）'
+      + '。提示節拍會覆蓋它'],
   'cfg.generate-audio.abc': ['',
       '可选：ABC 记谱法的乐谱，用于翻唱或改编（需要 cot 为 melody 或 full）。'
       + '留空则由模型自行谱写',
@@ -2417,18 +2433,31 @@ const STRINGS = {
       'token 采样与流匹配噪声的随机种子',
       'token 取樣與流匹配雜訊的隨機種子'],
   'cfg.generate-audio.cfg_scale': ['',
-      '歌曲阶段的文本引导强度；< 0 表示沿用协议默认值（full/melody 为 1.0，of'
-      + 'f 为 1.01）。大于 1 时歌曲阶段的解码开销加倍',
-      '歌曲階段的文字引導強度；< 0 表示沿用協定預設值（full/melody 為 1.0，of'
-      + 'f 為 1.01）。大於 1 時歌曲階段的解碼成本加倍'],
+      '歌曲阶段的文本引导强度；< 0 表示沿用协议默认值（YuE2：full/'
+      + 'melody 为 1.0，off 为 1.01——大于 1 时歌曲阶段的'
+      + '解码开销加倍；MiniMax-Music3：1.5，它的编码始终带引导）',
+      '歌曲階段的文字引導強度；< 0 表示沿用協定預設值（YuE2：full/'
+      + 'melody 為 1.0，off 為 1.01——大於 1 時歌曲階段的'
+      + '解碼成本加倍；MiniMax-Music3：1.5，它的編碼始終帶引導）'],
+  'cfg.generate-audio.flow_cfg_scale': ['',
+      'MiniMax-Music3：流匹配相对全零条件的引导强度；< 0 表示'
+      + '沿用协议默认值 1.7',
+      'MiniMax-Music3：流匹配相對全零條件的引導強度；< 0 表示'
+      + '沿用協定預設值 1.7'],
   'cfg.generate-audio.ode_steps': ['',
-      '流匹配中点法步数（每步两次模型前向）；发布协议为 32',
-      '流匹配中點法步數（每步兩次模型前向）；發布協定為 32'],
+      '流匹配步数；0（默认）沿用模型的协议：YuE2 为 32 个中点法步（每'
+      + '步两次模型前向），MiniMax-Music3 为 30 个欧拉步（每个'
+      + ' 8 秒窗口每步一对带引导的前向）',
+      '流匹配步數；0（預設）沿用模型的協定：YuE2 為 32 個中點法步（每'
+      + '步兩次模型前向），MiniMax-Music3 為 30 個歐拉步（每個'
+      + ' 8 秒視窗每步一對帶引導的前向）'],
   'cfg.generate-audio.max_seconds': ['',
-      '歌曲长度上限（秒）；0 = 协议上限（9000 个 token，即 6 分钟）。模型会在'
-      + '此之前自行结束歌曲',
-      '歌曲長度上限（秒）；0 = 協定上限（9000 個 token，即 6 分鐘）。模型會在'
-      + '此之前自行結束歌曲'],
+      '歌曲长度上限（秒）；0 = 协议上限（9000 帧，即 6 分钟；Min'
+      + 'iMax-Music3 还受其 10240 个 token 的上下文限制'
+      + '）。模型会在此之前自行结束歌曲',
+      '歌曲長度上限（秒）；0 = 協定上限（9000 幀，即 6 分鐘；Min'
+      + 'iMax-Music3 還受其 10240 個 token 的上下文限制'
+      + '）。模型會在此之前自行結束歌曲'],
   'cfg.generate-audio.abc_temperature': ['', '乐谱采样温度', '樂譜取樣溫度'],
   'cfg.generate-audio.abc_top_p': ['',
       '乐谱的 nucleus（top-p）概率质量',
@@ -2450,14 +2479,22 @@ const STRINGS = {
       '歌曲 token 的重复惩罚，作用于最近 50 个 token',
       '歌曲 token 的重複懲罰，作用於最近 50 個 token'],
   'cfg.generate-audio.lm_quant': ['',
-      '自回归部分（写乐谱和歌曲 token 的那一半）如何驻留："w8"（默认）在载入'
-      + '时于内存中把它的投影量化为仿射 8 位 group-64——少占 1.26 GB，歌曲阶段'
-      + '也更快（每个 token 都要读一遍全部权重），与参考实现的 fp32 结果的接近'
-      + '程度和 bf16 相同；"bf16" 保持官方原样。流匹配部分始终是 bf16',
-      '自迴歸部分（寫樂譜和歌曲 token 的那一半）如何駐留："w8"（預設）在載入'
-      + '時於記憶體中把它的投影量化為仿射 8 位元 group-64——少佔 1.26 GB，歌曲'
-      + '階段也更快（每個 token 都要讀一遍全部權重），與參考實作的 fp32 結果的'
-      + '接近程度和 bf16 相同；"bf16" 保持官方原樣。流匹配部分始終是 bf16'],
+      '自回归部分（写歌曲 token 的那一半）如何驻留："w8"（默认）在加'
+      + '载时于内存中把它的投影量化为仿射 8 位 group-64；"bf16"'
+      + ' 保持官方原样。YuE2：少占 1.26 GB，歌曲阶段更快，与参考实现'
+      + ' fp32 结果的接近程度和 bf16 相同。MiniMax-Music'
+      + '3（语言模型与深度解码器两者）：在 M4 Pro 上 8.4 GB 对 '
+      + '15.5 GB、每帧约 58 毫秒对约 150 毫秒，与 fp32 的距离为'
+      + '参考实现自身 bf16 的 1.2-1.3 倍。流匹配部分保持原样（见 '
+      + 'i8_gemm_tier）',
+      '自迴歸部分（寫歌曲 token 的那一半）如何駐留："w8"（預設）在載'
+      + '入時於記憶體中把它的投影量化為仿射 8 位元 group-64；"bf1'
+      + '6" 保持官方原樣。YuE2：少佔 1.26 GB，歌曲階段更快，與參考'
+      + '實作 fp32 結果的接近程度和 bf16 相同。MiniMax-Mus'
+      + 'ic3（語言模型與深度解碼器兩者）：在 M4 Pro 上 8.4 GB '
+      + '對 15.5 GB、每幀約 58 毫秒對約 150 毫秒，與 fp32 的距'
+      + '離為參考實作自身 bf16 的 1.2-1.3 倍。流匹配部分維持原樣（見 '
+      + 'i8_gemm_tier）'],
   'cfg.generate-audio.i8_gemm': ['',
       '加速模式（有损）：流匹配中的大 GEMM 用动态 int8 的 matmul2d 计算，每个'
       + ' GEMM 约 1e-2 的误差。仅限矩阵核心——这是 M5 的路径；其他机器保持稠密'
@@ -2465,6 +2502,26 @@ const STRINGS = {
       '加速模式（有損）：流匹配中的大 GEMM 以動態 int8 的 matmul2d 計算，每個'
       + ' GEMM 約 1e-2 的誤差。僅限矩陣核心——這是 M5 的路徑；其他機器維持稠密'
       + '。環境變數 VPIPE_I8_GEMM 可覆蓋'],
+  'cfg.generate-audio.i8_gemm_tier': ['',
+      'i8_gemm 运行哪一种 int8 GEMM，仅用于 MiniMax-Music3（YuE2 始终为 '
+      + 'accurate）：accurate（默认；流匹配 transformer 保持 16 位，权重'
+      + '在每次调用时按 64 一组量化：在基础款 M5 上约为 16 位流匹配的 1.1 倍）'
+      + '、fast（其各块权重以旋转后的 int8、512 一组常驻：约 1.4 倍）、'
+      + 'token（256 宽 Hadamard 旋转后按权重行 × 按 token 的 int8：约 '
+      + '1.7 倍，整首歌离参考实现 fp32 结果仍比参考实现自身的 bf16 更近）或 '
+      + 'token_plain（同上但不旋转：不更快，且偏差大数倍）。后三者让 '
+      + 'transformer 只占 2.5 GB（16 位为 4.9 GB），在加载时从检查点存储的'
+      + '格式（F32、F16 或 BF16）一次转换而来。环境变量 VPIPE_I8_TIER 可覆盖',
+      'i8_gemm 執行哪一種 int8 GEMM，僅用於 MiniMax-Music3（YuE2 一律為 '
+      + 'accurate）：accurate（預設；流匹配 transformer 維持 16 位元，'
+      + '權重在每次呼叫時按 64 一組量化：在基本款 M5 上約為 16 位元流匹配的 '
+      + '1.1 倍）、fast（其各區塊權重以旋轉後的 int8、512 一組常駐：約 '
+      + '1.4 倍）、token（256 寬 Hadamard 旋轉後按權重列 × 按 token 的 '
+      + 'int8：約 1.7 倍，整首歌離參考實作 fp32 結果仍比參考實作自身的 bf16 '
+      + '更近）或 token_plain（同上但不旋轉：不更快，且偏差大數倍）。後'
+      + '三者讓 transformer 只佔 2.5 GB（16 位元為 4.9 GB），在載入時從檢查點'
+      + '儲存的格式（F32、F16 或 BF16）一次轉換而來。環境變數 VPIPE_I8_TIER '
+      + '可覆蓋'],
   'cfg.generate-audio.ane_ffn': ['',
       '加速前馈（fp16）：把流匹配阶段 SwiGLU 的各行在 Apple 神经网络引擎与 GP'
       + 'U 之间拆分并发运行——除 ANE 的 fp16 精度外完全等价（实测与参考 fp32 '
@@ -2510,17 +2567,25 @@ const STRINGS = {
       '查询所在块两侧始终精确计算的键块数',
       '查詢所在塊兩側始終精確計算的鍵塊數'],
   'port.generate-audio.prompt': ['',
-      '可选 FlexData：字符串（即歌词），或包含 style / tags、lyrics、abc、cot'
-      + '、seed、cfg_scale 中任意键的对象；缺少的键回退到配置。每个节拍生成一'
-      + '首歌。未连接时，本阶段按配置生成一首歌',
-      '選用 FlexData：字串（即歌詞），或包含 style / tags、lyrics、abc、cot、'
-      + 'seed、cfg_scale 中任意鍵的物件；缺少的鍵回退到設定。每個節拍生成一首'
-      + '歌。未連接時，本階段依設定生成一首歌'],
+      '可选 FlexData：字符串（即歌词），或包含 style / tag'
+      + 's / caption、lyrics、abc、cot、seed、cfg_'
+      + 'scale 中任意键的对象；缺少的键回退到配置。每个节拍生成一首歌。未连'
+      + '接时，本阶段按配置生成一首歌',
+      '選用 FlexData：字串（即歌詞），或包含 style / tags'
+      + ' / caption、lyrics、abc、cot、seed、cfg_s'
+      + 'cale 中任意鍵的物件；缺少的鍵回退到設定。每個節拍生成一首歌。未連接'
+      + '時，本階段依設定生成一首歌'],
   'port.generate-audio.audio_latent': ['',
-      'f32 潜空间音频 [1, 64, frames]，每秒 25 帧（sideband 中的 latents_per_'
-      + 'second）；用 audio-vae-decode 解码',
-      'f32 潛空間音訊 [1, 64, frames]，每秒 25 幀（sideband 中的 latents_per_'
-      + 'second）；用 audio-vae-decode 解碼'],
+      'f32 潜空间音频（sideband 中的 latents_per_se'
+      + 'cond）：YuE2 为 [1, 64, frames]，每秒 25 帧'
+      + '；MiniMax-Music3 为 [1, 128, latents]，'
+      + '每秒 44100 / 512 帧；用 audio-vae-decode '
+      + '解码',
+      'f32 潛空間音訊（sideband 中的 latents_per_se'
+      + 'cond）：YuE2 為 [1, 64, frames]，每秒 25 幀'
+      + '；MiniMax-Music3 為 [1, 128, latents]，'
+      + '每秒 44100 / 512 幀；用 audio-vae-decode '
+      + '解碼'],
   'port.generate-audio.score': ['',
       'FlexData 字符串：歌曲的 ABC 乐谱（模型规划的，或输入提供的）。cot=off '
       + '时不输出',

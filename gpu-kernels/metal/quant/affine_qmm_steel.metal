@@ -2015,3 +2015,53 @@ kernel void fp8_qmm_grouped_down_b128(
       w, scales, x, y, Xs, Ws, K, N, M, tile2e, sdst, tid, simd_gid,
       simd_lid);
 }
+
+// ===================================================================
+// 2-bit, group 128 (the ternary packs): the steel tile at bits 2 -- the
+// quantized block loader carries MLX's 2-bit dequant -- and its fused
+// SwiGLU twin. Same buffers and dispatch as the w4g64 32x32 entries.
+// ===================================================================
+kernel void affine_qmm_steel_w2g128(
+    const device uint32_t*  w      [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int&     K      [[buffer(5)]],
+    const constant int&     N      [[buffer(6)]],
+    const constant int&     M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  lid      [[thread_index_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_impl<VPIPE_ELT, 128, 2, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M, K,
+      /*tile2e=*/nullptr, tid, lid, simd_gid, simd_lid);
+}
+
+kernel void affine_qmm_swiglu_w2g128(
+    const device uint32_t*  w      [[buffer(0)]],
+    const device VPIPE_ELT* scales [[buffer(1)]],
+    const device VPIPE_ELT* biases [[buffer(2)]],
+    const device VPIPE_ELT* x      [[buffer(3)]],
+    device VPIPE_ELT*       y      [[buffer(4)]],
+    const constant int&     K      [[buffer(5)]],
+    const constant int&     N      [[buffer(6)]],   // fused width = 2*ffn
+    const constant int&     M      [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 32, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  qmm_t_swiglu_impl<VPIPE_ELT, 128, 2, BM, BK, BN>(
+      w, scales, biases, x, y, Xs, Ws, K, N, M,
+      tid, simd_gid, simd_lid);
+}

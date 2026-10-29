@@ -1,5 +1,9 @@
 #include "generative-models/shared/gguf-convert.h"
 
+#include <dispatch/dispatch.h>
+
+#include <set>
+
 #include "generative-models/shared/gguf-file.h"
 
 #include <algorithm>
@@ -186,8 +190,12 @@ gguf_to_qwen35_config_(const GgufFile& g, ModelConfig* out)
   const GgufFile::Tensor* probe = g.tensor("blk.0.ffn_gate.weight");
   if (probe == nullptr) { probe = g.tensor("blk.0.ffn_up.weight"); }
   const bool q8 = probe != nullptr && probe->type == GgufFile::kQ8_0;
-  out->quantization.bits = q8 ? 8 : 4;
-  out->quantization.group_size = q8 ? 64 : 0;
+  // PrismML's ternary files repack, all of them, to affine 2-bit group 128.
+  const bool tern = probe != nullptr &&
+                    (probe->type == GgufFile::kPQ2_0 ||
+                     probe->type == GgufFile::kPTQ1_0);
+  out->quantization.bits = q8 ? 8 : tern ? 2 : 4;
+  out->quantization.group_size = q8 ? 64 : tern ? 128 : 0;
   return out->n_layers > 0 && out->hidden > 0;
 }
 
@@ -540,6 +548,11 @@ GgufGemma4Converter::convert(const ConvertedTensorSpec& spec,
     case Op::kQ8Weight:
     case Op::kQ8Scales:
     case Op::kQ8Biases:
+    case Op::kTernWeight:
+    case Op::kTernScales:
+    case Op::kTernBiases:
+    case Op::kPrismSigns:
+    case Op::kPrismFlag:
       return false;   // qwen35-only ops; never produced by this converter
   }
   return false;
@@ -599,12 +612,42 @@ GgufQwen35Converter::build_specs_()
                       static_cast<std::uint64_t>(out) * (in / 64) * 2,
                       gname, Op::kQ8Biases});
   };
+  // PrismML's ternary blocks -> the MLX-affine 2-bit group-128 triple,
+  // EXACTLY: a block of 128 is (code - 1) * d, so code = the stored code,
+  // scale = d, bias = -d, both f16 as stored. PTQ1_0's denser packing is
+  // widened to two bits a value on the way (it has no kernel of its own).
+  auto add_tern_affine = [&](const std::string& gname,
+                             const std::string& base, std::int64_t in,
+                             std::int64_t out) {
+    if (in % 128 != 0) { return; }
+    _specs.push_back({base + ".weight", "U32", {out, in / 16},
+                      static_cast<std::uint64_t>(out) * (in / 16) * 4,
+                      gname, Op::kTernWeight});
+    _specs.push_back({base + ".scales", "F16", {out, in / 128},
+                      static_cast<std::uint64_t>(out) * (in / 128) * 2,
+                      gname, Op::kTernScales});
+    _specs.push_back({base + ".biases", "F16", {out, in / 128},
+                      static_cast<std::uint64_t>(out) * (in / 128) * 2,
+                      gname, Op::kTernBiases});
+  };
+  auto ternary = [](const GgufFile::Tensor* t) {
+    return t != nullptr && (t->type == GgufFile::kPQ2_0 ||
+                            t->type == GgufFile::kPTQ1_0);
+  };
   auto add_kq = [&](const std::string& gname, const std::string& hf) {
     const GgufFile::Tensor* t = _g->tensor(gname);
     if (t == nullptr || t->dims.size() != 2) { return; }
     const std::int64_t in = t->dims[0], out = t->dims[1];
     if (const char* dt = kquant_dtype_(t->type); dt != nullptr) {
       _specs.push_back({hf, dt, {out, in}, t->nbytes, gname, Op::kKQuantRaw});
+      return;
+    }
+    if (ternary(t)) {
+      const std::string base =
+          (hf.size() > 7 && hf.compare(hf.size() - 7, 7, ".weight") == 0)
+              ? hf.substr(0, hf.size() - 7)
+              : hf;
+      add_tern_affine(gname, base, in, out);
       return;
     }
     // Q8_0 -> MLX-affine 8-bit, group 64. A whole-file Q8_0 checkpoint
@@ -709,6 +752,8 @@ GgufQwen35Converter::build_specs_()
       // embed_tokens for `.scales` and reads its width per tensor), so
       // the gather and the tied-lm_head matvec both come for free.
       add_q8_affine("token_embd.weight", P + "embed_tokens", hidden, vocab);
+    } else if (ternary(emb)) {
+      add_tern_affine("token_embd.weight", P + "embed_tokens", hidden, vocab);
     }
   }
   // Untied lm_head: GGUF output.weight -> language_model.lm_head.weight, a raw
@@ -723,9 +768,12 @@ GgufQwen35Converter::build_specs_()
                         ow->nbytes, "output.weight", Op::kKQuantRaw});
     } else if (ow->type == GgufFile::kQ8_0) {
       add_q8_affine("output.weight", "language_model.lm_head", in, outd);
+    } else if (ternary(ow)) {
+      add_tern_affine("output.weight", "language_model.lm_head", in, outd);
     }
   }
   add_f32("output_norm.weight", P + "norm.weight");
+  add_prism_();
 
   for (int L = 0; L < _cfg.n_layers; ++L) {
     const std::string bp = "blk." + std::to_string(L) + ".";
@@ -789,11 +837,115 @@ GgufQwen35Converter::build_specs_()
   }
 }
 
+// PrismML's Hadamard contract (prism.hadamard.*): the activations of
+// every folded weight are rotated, blockwise, before the matmul, and a
+// latent embedding's rows after the lookup -- see the fork's
+// src/llama-graph.cpp (build_lora_mm, build_embd_rows). What the metal
+// Qwen implements is VERSION 1 exactly: an explicit head, blocks of 1024,
+// the normalized Sylvester transform along the input dimension, explicit
+// signs per input width, EVERY projection of the stack and the head
+// folded, the token embedding inverse-after-lookup. That is offered to the
+// loader as pseudo-tensors -- one f32 sign vector a width
+// (prism.hadamard.signs.<W>), and prism.hadamard.gdn_v_grouped when
+// out_proj's input kept the training order -- and any file whose contract
+// differs gets prism.hadamard.unsupported instead, which the loader
+// refuses by name (a rotated file run unrotated is garbage that loads).
+void
+GgufQwen35Converter::add_prism_()
+{
+  using Op = ConvertedTensorSpec::Op;
+  if (!_g->has("prism.hadamard.version")) { return; }
+  auto flag = [&](const std::string& name) {
+    _specs.push_back({name, "F32", {1}, 4, std::string(), Op::kPrismFlag});
+  };
+  const auto ver = _g->get_int("prism.hadamard.version");
+  const auto blk = _g->get_int("prism.hadamard.block_size");
+  const auto tr = _g->get_string("prism.hadamard.transform");
+  const auto ax = _g->get_string("prism.hadamard.axis");
+  const auto sm = _g->get_string("prism.hadamard.sign_mode");
+  const bool tied = _g->get_bool("prism.hadamard.tied_output").value_or(false);
+  const std::vector<std::int64_t> widths =
+      _g->get_int_array("prism.hadamard.sign_widths");
+  const std::vector<std::int64_t> signs =
+      _g->get_int_array("prism.hadamard.sign_values");
+  const std::vector<std::string> names =
+      _g->get_string_array("prism.hadamard.weight_names");
+  const std::vector<std::string> inv =
+      _g->get_string_array("prism.hadamard.inverse_weight_names");
+  bool ok = ver.value_or(0) == 1 && blk.value_or(0) == 1024 && !tied &&
+            tr.value_or("") == "normalized-sylvester-walsh-hadamard" &&
+            ax.value_or("") == "input-last-dimension" &&
+            sm.value_or("") == "explicit" && !widths.empty();
+  std::int64_t total = 0;
+  for (std::int64_t w : widths) {
+    ok = ok && w > 0 && w % 1024 == 0;
+    total += w;
+  }
+  ok = ok && total == (std::int64_t)signs.size();
+  for (std::int64_t v : signs) { ok = ok && (v == 1 || v == -1); }
+  // The folded set must be exactly what the loader rotates.
+  std::set<std::string> want = {"output.weight"};
+  for (int L = 0; L < _cfg.n_layers; ++L) {
+    const std::string bp = "blk." + std::to_string(L) + ".";
+    const bool linear = L < (int)_cfg.is_linear_layer.size() &&
+                        _cfg.is_linear_layer[(std::size_t)L];
+    for (const char* n : linear
+             ? std::initializer_list<const char*>{"attn_qkv", "attn_gate",
+                                                  "ssm_out"}
+             : std::initializer_list<const char*>{"attn_q", "attn_k",
+                                                  "attn_v",
+                                                  "attn_output"}) {
+      want.insert(bp + n + ".weight");
+    }
+    for (const char* n : {"ffn_gate", "ffn_up", "ffn_down"}) {
+      want.insert(bp + n + ".weight");
+    }
+  }
+  ok = ok && std::set<std::string>(names.begin(), names.end()) == want &&
+       names.size() == want.size() && inv.size() == 1 &&
+       inv[0] == "token_embd.weight";
+  if (!ok) {
+    flag("prism.hadamard.unsupported");
+    return;
+  }
+  for (std::int64_t w : widths) {
+    _specs.push_back({"prism.hadamard.signs." + std::to_string(w), "F32",
+                      {w}, (std::uint64_t)w * 4, std::string(),
+                      Op::kPrismSigns});
+  }
+  if (_g->get_bool("prism.hadamard.gdn_v_grouped").value_or(false)) {
+    flag("prism.hadamard.gdn_v_grouped");
+  }
+}
+
 bool
 GgufQwen35Converter::convert(const ConvertedTensorSpec& spec,
                              std::uint8_t* dst)
 {
   using Op = ConvertedTensorSpec::Op;
+  if (spec.op == Op::kPrismFlag) {
+    const float one = 1.0f;
+    std::memcpy(dst, &one, 4);
+    return true;
+  }
+  if (spec.op == Op::kPrismSigns) {
+    // The width's run of prism.hadamard.sign_values (runs in sign_widths'
+    // order).
+    const std::int64_t w = spec.shape.empty() ? 0 : spec.shape[0];
+    const auto widths = _g->get_int_array("prism.hadamard.sign_widths");
+    const auto vals = _g->get_int_array("prism.hadamard.sign_values");
+    std::int64_t off = 0;
+    for (std::int64_t x : widths) {
+      if (x == w) {
+        if (off + w > (std::int64_t)vals.size()) { return false; }
+        auto* o = reinterpret_cast<float*>(dst);
+        for (std::int64_t i = 0; i < w; ++i) { o[i] = (float)vals[off + i]; }
+        return true;
+      }
+      off += x;
+    }
+    return false;
+  }
   const GgufFile::Tensor* t = _g->tensor(spec.gguf_name);
   if (t == nullptr) { return false; }
   switch (spec.op) {
@@ -891,6 +1043,53 @@ GgufQwen35Converter::convert(const ConvertedTensorSpec& spec,
         }
       }
       return true;
+    }
+    case Op::kTernWeight:
+    case Op::kTernScales:
+    case Op::kTernBiases: {
+      if ((t->type != GgufFile::kPQ2_0 && t->type != GgufFile::kPTQ1_0) ||
+          t->dims.size() != 2 || t->dims[0] % 128 != 0) {
+        return false;
+      }
+      const std::int64_t K = t->dims[0], N = t->dims[1];
+      const std::int64_t nb = K / 128;
+      const std::int64_t bb = t->type == GgufFile::kPQ2_0 ? 34 : 28;
+      const std::uint32_t type = t->type;
+      const std::uint8_t* src = t->data;
+      const Op op = spec.op;
+      __block bool bad = false;
+      // Rows in parallel: a 27B's ternary weights are ~7 GB of blocks.
+      dispatch_apply((std::size_t)N,
+                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                     ^(std::size_t r) {
+        std::uint8_t q[128];
+        std::uint16_t d16 = 0;
+        const std::uint8_t* rp = src + (std::int64_t)r * nb * bb;
+        auto* w = reinterpret_cast<std::uint32_t*>(dst) +
+                  (std::int64_t)r * (K / 16);
+        auto* h = reinterpret_cast<std::uint16_t*>(dst) +
+                  (std::int64_t)r * nb;
+        for (std::int64_t b = 0; b < nb; ++b) {
+          if (!GgufFile::ternary_block_codes(type, rp + b * bb, q, &d16)) {
+            bad = true;
+            return;
+          }
+          if (op == Op::kTernScales) {
+            h[b] = d16;
+          } else if (op == Op::kTernBiases) {
+            h[b] = (std::uint16_t)(d16 ^ 0x8000u);   // -d, exactly
+          } else {
+            for (int k = 0; k < 8; ++k) {
+              std::uint32_t word = 0;
+              for (int i = 0; i < 16; ++i) {
+                word |= (std::uint32_t)q[k * 16 + i] << (2 * i);
+              }
+              w[b * 8 + k] = word;
+            }
+          }
+        }
+      });
+      return !bad;
     }
     default:
       return false;   // gemma-only ops

@@ -14,6 +14,7 @@
 
 #include "common/flex-data.h"
 #include "generative-models/shared/comfy-checkpoint.h"
+#include "generative-models/shared/gguf-file.h"
 #include "stages/model-catalog.h"
 #include "stages/model-registry.h"
 
@@ -228,6 +229,7 @@ family_version_(const std::string& mt, std::string& family,
       {"moss-codec-v2",          "MOSS",        "Audio-Tokenizer"},
       {"fish-drama3",            "Fish Audio",  "Drama 3"},
       {"yue2",                   "YuE",         "2"},
+      {"minimax-music3",         "MiniMax",     "Music3"},
       {"yue2-vae",               "YuE",         "2-Vae"},
       {"bs-roformer",            "BS-RoFormer", "MSST"},
       {"dflash",                 "DFlash",      "1"},
@@ -300,6 +302,8 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   // YuE2 names its VAE export "yue2_vae": test that first.
   if (starts("yue2_vae"))          { return "yue2-vae"; }
   if (starts("yue2"))              { return "yue2"; }
+  // MiniMax-Music3's diffusers root (generative-models/minimax-music3/).
+  if (starts("minimax_music3"))    { return "minimax-music3"; }
   if (starts("llama"))             { return "llama3"; }
   // Mistral3ForConditionalGeneration (Ministral-3): the Pixtral tower +
   // a dense decoder, run on the metal Qwen path.
@@ -1037,7 +1041,10 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
 
   // ---- 4. a GGUF checkpoint -------------------------------------------
   std::string gguf;
-  if (d.model_type.empty() && d.is_dir && has_ext_(root, ".gguf", &gguf)) {
+  const bool gguf_file =
+      !d.is_dir && lower_(root.extension().string()) == ".gguf";
+  if (d.model_type.empty() &&
+      (gguf_file || (d.is_dir && has_ext_(root, ".gguf", &gguf)))) {
     // The repo NAME carries the family + size ("Qwen3.5-4B-GGUF"); the
     // .gguf file only carries the quant label.
     d.param_class = param_class_from_name_(base);
@@ -1048,6 +1055,28 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     } else if (has_(base_lc, "gemma")) {
       d.model_type = (!d.param_class.empty() && d.param_class[0] == 'E')
                          ? "gemma4" : "gemma4_unified";
+    } else {
+      // A name that says neither (Ternary-Bonsai-2-27B-gguf): the
+      // model's own architecture, read off its header -- the first
+      // .gguf that is not a projector (those say "clip").
+      std::vector<fs::path> files;
+      if (gguf_file) { files.push_back(root); }
+      std::error_code ec;
+      for (const auto& e : fs::directory_iterator(
+               d.is_dir ? root : fs::path(), ec)) {
+        if (lower_(e.path().extension().string()) == ".gguf") {
+          files.push_back(e.path());
+        }
+      }
+      std::sort(files.begin(), files.end());
+      for (const auto& f : files) {
+        const auto g = genai::GgufFile::open(f.string());
+        const auto a = g ? g->get_string("general.architecture")
+                         : std::nullopt;
+        if (!a || *a == "clip") { continue; }
+        if (*a == "qwen35" || *a == "qwen35moe") { d.model_type = "qwen3.5"; }
+        break;
+      }
     }
     if (!d.model_type.empty()) { d.detected_by = "gguf"; }
   }

@@ -19,12 +19,15 @@ MetalTokenMuxer::MetalTokenMuxer(metal_compute::MetalCompute* mc,
     : _mc(mc), _w(w), _scales(scales), _biases(biases), _hidden(hidden)
 {
   // A width / group no gather takes leaves _fn invalid (valid() says so).
-  const bool ok = group == 64 || (quant_bits == 8 && group == 32);
+  const bool w2 = quant_bits == 2 && group == 128;
+  const bool ok = (group == 64 && quant_bits != 2) ||
+                  (quant_bits == 8 && group == 32) || w2;
   if (mc != nullptr && mc->valid() && ok) {
     _lib = mc->load_library(bf16 ? "llm_elementwise_bf16" : "llm_elementwise");
-    _fn = _lib.function(quant_bits != 8 ? "dequant_embed_gather_f16"
-                        : group == 32   ? "dequant_embed_gather_w8_g32_f16"
-                                        : "dequant_embed_gather_w8_f16");
+    _fn = _lib.function(w2               ? "dequant_embed_gather_w2_g128_f16"
+                        : quant_bits != 8 ? "dequant_embed_gather_f16"
+                        : group == 32     ? "dequant_embed_gather_w8_g32_f16"
+                                          : "dequant_embed_gather_w8_f16");
   }
 }
 
@@ -75,6 +78,16 @@ MetalTokenMuxer::valid() const noexcept
   return _w != nullptr && _scales != nullptr && _biases != nullptr;
 }
 
+bool
+MetalTokenMuxer::set_inverse_rotation(const SharedBuffer* signs)
+{
+  if (signs == nullptr || _hidden % 1024 != 0) { return false; }
+  _fn_rot = _lib.function("prism_hadamard_rows_1024");
+  if (!_fn_rot.valid()) { return false; }
+  _rot_signs = signs;
+  return true;
+}
+
 SharedBuffer
 MetalTokenMuxer::fetch_text(std::span<const std::int32_t> ids) const
 {
@@ -108,6 +121,23 @@ MetalTokenMuxer::fetch_text(std::span<const std::int32_t> ids) const
       enc.set_constant(5, _hidden);
     }
     enc.dispatch({(unsigned)_hidden, (unsigned)n, 1}, {256, 1, 1});
+    if (_rot_signs != nullptr) {
+      // prism_hadamard_rows_1024 in place, inverse, no permutation.
+      const int inv = 1, one = 1;
+      enc.set_function(_fn_rot);
+      enc.set_buffer(0, out);
+      enc.set_buffer(1, out);
+      enc.set_buffer(2, *_rot_signs);
+      enc.set_constant(3, _hidden);
+      enc.set_constant(4, inv);
+      enc.set_constant(5, _hidden);
+      enc.set_constant(6, _hidden);
+      enc.set_constant(7, one);
+      enc.set_constant(8, one);
+      enc.set_constant(9, one);
+      enc.dispatch({(unsigned)(_hidden / 1024 * 256), (unsigned)n, 1},
+                   {256, 1, 1});
+    }
   }
   stream.commit().wait();
   return out;

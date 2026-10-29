@@ -1,0 +1,17 @@
+{
+  "id": "prepare-ternary-bonsai-1",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

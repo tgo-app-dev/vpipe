@@ -9,6 +9,7 @@
 #include "common/perf-scope.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -340,14 +341,31 @@ Gemma4UnifiedEmbedder::load_safetensors(const std::shared_ptr<WeightSet>& ws,
 std::string
 Gemma4UnifiedEmbedder::find_mmproj(const std::string& model_dir)
 {
+  // `mmproj` anywhere in the name (llama.cpp's mmproj-<model>.gguf, and
+  // <model>-mmproj-<type>.gguf). Several -- one projector in several
+  // types -- take an unquantized one first (BF16 / F16 / F32 in the name),
+  // else the first by name: the same file every run.
   std::error_code ec;
   if (!fs::is_directory(model_dir, ec)) { return std::string(); }
+  std::vector<std::string> found;
   for (const auto& e : fs::directory_iterator(model_dir, ec)) {
     const fs::path p = e.path();
     if (p.extension() != ".gguf") { continue; }
-    if (p.filename().string().rfind("mmproj", 0) == 0) { return p.string(); }
+    std::string n = p.filename().string();
+    for (char& c : n) { c = (char)std::tolower((unsigned char)c); }
+    if (n.find("mmproj") != std::string::npos) { found.push_back(p.string()); }
   }
-  return std::string();
+  std::sort(found.begin(), found.end());
+  for (const auto& f : found) {
+    std::string n = fs::path(f).filename().string();
+    for (char& c : n) { c = (char)std::tolower((unsigned char)c); }
+    if (n.find("bf16") != std::string::npos ||
+        n.find("f16") != std::string::npos ||
+        n.find("f32") != std::string::npos) {
+      return f;
+    }
+  }
+  return found.empty() ? std::string() : found.front();
 }
 
 std::unique_ptr<Gemma4UnifiedEmbedder>

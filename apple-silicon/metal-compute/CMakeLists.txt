@@ -103,6 +103,12 @@ add_vpipe_metal_kernel(drama3_bf16 SRC ops/drama3.metal
 # Fish Audio's modded DAC (the S2 Pro / Drama 3 codec): its VQ, its
 # windowed transformers' q/k/v and its LayerScale residuals.
 add_vpipe_metal_kernel(fish_dac SRC ops/fish_dac.metal)
+# MiniMax-Music3's depth decoder: its K/V cache append, its causal
+# attention over a frame's few positions, its learned positions
+# (generative-models/minimax-music3/).
+add_vpipe_metal_kernel(minimax_music3 SRC ops/minimax_music3.metal)
+add_vpipe_metal_kernel(minimax_music3_bf16 SRC ops/minimax_music3.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(dflash SRC ops/dflash.metal)
 add_vpipe_metal_kernel(dflash_bf16 SRC ops/dflash.metal
                        DEFINES VPIPE_ELT=bfloat)

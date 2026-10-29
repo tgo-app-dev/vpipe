@@ -149,10 +149,13 @@ public:
     // norm, pre_fc_norm_*), its norms TRUE weights, its fc quantized.
     // Probed before the model's own head.
     std::string mtp_dir;
-    // Quantization bit-width of the linear weights: 4 (Qwen3.5/Llama) or
-    // 8 (Qwen3-ASR). Selects the affine_qmv/affine_qmm_steel w4g64 vs
-    // w8g64 kernel entry points and the packed-weight row stride.
+    // Quantization bit-width of the linear weights: 4 (Qwen3.5/Llama), 8
+    // (Qwen3-ASR) or 2 (the ternary packs, group 128). Selects the
+    // affine_qmv/affine_qmm_steel w4g64 / w8g64 / w2g128 kernel entry
+    // points and the packed-weight row stride.
     int   quant_bits  = 4;
+    // ... and the group the affine scales cover: 64, or 128 at 2 bits.
+    int   quant_group = 64;
     // Dense mode: every layer is full-attention (no gated-DeltaNet
     // layers). Used by the Qwen3-ASR text decoder, a plain Qwen3 dense
     // transformer.
@@ -689,10 +692,14 @@ public:
   // pool's doubling reaches (one layer's old pool beside the new while it
   // copies), `contexts` contexts' recurrent state and the decode scratch.
   // A hyper-connection model's is hc_run_bytes, its other contexts' state
-  // beside it.
+  // beside it. `prompt_rows` > 0: the longest prompt a context prefills,
+  // where that is less than the K/V -- several contexts each prefilled
+  // on its own (MiniMax-Music3's prompt and its guidance twin); else the
+  // prompt is the K/V's tokens up to max_seq.
   static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens,
                                int contexts, bool one_pass, bool plain_mlp,
-                               bool matrix_cores);
+                               bool matrix_cores,
+                               std::int64_t prompt_rows = 0);
   std::size_t verify_scratch_held() const;
 
   // Sizes of a raw-source backbone, from the checkpoint alone -- for a
@@ -870,6 +877,22 @@ public:
                            std::span<const std::int32_t>   in_tokens,
                            std::span<const std::int32_t>   rope_pos,
                            std::vector<float>&             out_logits);
+
+  // The batched counterpart of decode_embedding_hidden: each of the N
+  // contexts `cids` appends ONE position whose input row is row i of
+  // `emb` ([N, hidden], compute dtype), in one forward that reads every
+  // projection once for all N, and the N FINAL-NORMED hiddens come back
+  // in the returned [N, hidden] buffer (internal scratch, valid until the
+  // next batched call). No lm_head runs: the caller owns its heads, and
+  // `post_hidden` is appended to the same command buffer for them. Plain
+  // sequential RoPE (the KV slot position). Quantized stacks only (a
+  // dense one has no batched projections); nullptr otherwise or on
+  // failure.
+  const metal_compute::SharedBuffer* decode_batched_embedding_hidden(
+      std::span<const ContextId> cids, const metal_compute::SharedBuffer& emb,
+      const std::function<void(metal_compute::ComputeEncoder&,
+                               const metal_compute::SharedBuffer&)>*
+          post_hidden = nullptr);
 
   // Self-contained greedy batched decode (synchronous), built on
   // decode_batched_step: generate `n_steps` argmax tokens for each branch.
@@ -1458,6 +1481,8 @@ private:
   // branches share (identical page ids); when set and N>1 and head_dim==256,
   // the full-attn layers read that shared prefix once (phase A) and merge each
   // branch's private pages (phase B). 0 => the per-branch SDPA path.
+  // `head` false leaves the N final-normed hiddens in bs.hn and runs no
+  // lm_head (decode_batched_embedding_hidden).
   void encode_batched_step_(
       metal_compute::ComputeEncoder& enc, BScratch& bs,
       std::span<const ContextId> cids,
@@ -1465,7 +1490,7 @@ private:
       const std::vector<std::size_t>& page_offs,
       const std::vector<int>& n_pages_v,
       const std::vector<int>& rope_pos_v,
-      int shared_pages);
+      int shared_pages, bool head = true);
 
   struct Layer {
     bool is_full = false;
@@ -2019,6 +2044,15 @@ private:
                    const metal_compute::SharedBuffer& w,
                    const metal_compute::SharedBuffer& x,
                    const metal_compute::SharedBuffer& y, int K, int N, int M);
+  // Prism rotation of `rows` rows of width K (element offsets; x == y in
+  // place unless `grouped`): y = H (s . x), or x = s . (H y) with
+  // `inverse`; `grouped` reads a GDN output tiled -> grouped first.
+  void prism_rows_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xoff,
+                   const metal_compute::SharedBuffer& y, std::size_t yoff,
+                   int rows, int K, bool inverse = false,
+                   bool grouped = false) const;
+  const metal_compute::SharedBuffer* prism_signs_(int K) const;
   // Raw k-quant embed gather: out[t,:] = dequant(_embed_q6k[ids[t], :]).
   // Picks the Q4_K / Q6_K gather kernel by _embed_kqt (the _embed_q6k buffer
   // holds the raw table for either family).
@@ -2463,6 +2497,29 @@ private:
   // 0.196 rel vs the same model quantized from HF, against 0.011 for the
   // Q4_K_M sibling that got the strided flag.
   bool _gdn_strided_v = false;
+  // The gated-DeltaNet q / k normalization's eps, inside rsqrt(sum / Dk +
+  // eps) (MLX's rms form; the reference's l2norm adds its eps to the SUM).
+  float _gdn_qk_eps = 1e-6f;
+  // PRISM HADAMARD v1 (Ternary-Bonsai 2's GGUF; GgufQwen35Converter's
+  // prism.hadamard.* tensors): every ternary projection was trained on a
+  // ROTATED input, x' = H (s . x) -- H the normalized Sylvester Hadamard
+  // per block of 1024 of the input, s per-width signs -- and the token
+  // table holds the inverse, h = s . (H z). So each such projection's
+  // input is rotated first (prism_rows_; f32 inside, one rounding), the
+  // gathered text rows are taken back, and a GDN layer's dense a|b
+  // (which read the plain input in the file) are rotated ONCE at load so
+  // the whole in_proj reads one rotated row. _prism_grouped: the
+  // out_proj kept the training's grouped v-head order while the rest of
+  // the file is tiled (gdn_v_grouped), so its input is permuted as it is
+  // rotated.
+  bool _prism = false;
+  bool _prism_grouped = false;
+  std::vector<std::pair<int, metal_compute::SharedBuffer>> _prism_signs;
+  metal_compute::ComputeFunction _fn_prism;
+  // A GDN layer whose in_proj a|b are DENSE beside an affine q|k|v|z (the
+  // ternary GGUF: alpha / beta stored bf16): iqw holds q|k|v|z (Cd + vald
+  // rows), kqab the dense a|b [2 Hv, H].
+  bool _ab_dense = false;
   // q6_K decode qmv tuning: the loaded qmv_q6k_v2 variant's NSG (simdgroups/
   // threadgroup) and rows-per-threadgroup (RPS*NSG). Tuned to r2n8 (nsg=8,
   // rpt=16); fallbacks set nsg=2/rpt=8. Used by kqmv_'s q6_K dispatch.

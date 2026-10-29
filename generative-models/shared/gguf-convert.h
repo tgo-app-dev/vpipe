@@ -55,6 +55,11 @@ struct ConvertedTensorSpec {
     kQ8Weight,      // q8_0 source -> affine8 g64 packed u32 codes
     kQ8Scales,      // q8_0 source -> affine8 g64 scales (f16)
     kQ8Biases,      // q8_0 source -> affine8 g64 biases (f16)
+    kTernWeight,    // pq2_0 / ptq1_0 -> affine2 g128 packed u32 codes
+    kTernScales,    // pq2_0 / ptq1_0 -> affine2 g128 scales (f16, = d)
+    kTernBiases,    // pq2_0 / ptq1_0 -> affine2 g128 biases (f16, = -d)
+    kPrismSigns,    // prism.hadamard sign vector of one width -> f32
+    kPrismFlag,     // a prism.hadamard flag (or the refusal marker) -> f32 1
   };
   std::string               hf_name;
   std::string               dtype;     // "U32"/"F16"/"F32"/"Q4K"/"Q5K"/"Q6K"
@@ -164,6 +169,8 @@ public:
 
 private:
   void build_specs_();
+  // PrismML's Hadamard metadata as pseudo-tensors (see the .cc).
+  void add_prism_();
   const GgufFile*                  _g;
   ModelConfig                      _cfg;
   std::vector<ConvertedTensorSpec> _specs;

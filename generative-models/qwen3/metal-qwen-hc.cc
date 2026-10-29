@@ -818,7 +818,7 @@ MetalQwenModel::hc_run_bytes(const Config& c, std::int64_t ctx_tokens)
 std::size_t
 MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
                           int contexts, bool one_pass, bool plain_mlp,
-                          bool matrix_cores)
+                          bool matrix_cores, std::int64_t prompt_rows)
 {
   const std::size_t ctxs = (std::size_t)std::max(contexts, 1);
   // a context's recurrent state: every linear layer's conv tail (f16) and
@@ -837,7 +837,8 @@ MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
   // the prompt, and the rows a forward takes of it (balanced pieces of at
   // most prefill_piece_())
   const std::int64_t prompt = std::max<std::int64_t>(
-      1, std::min<std::int64_t>(kv_tokens, c.max_seq));
+      1, std::min<std::int64_t>(prompt_rows > 0 ? prompt_rows : kv_tokens,
+                                c.max_seq));
   const std::size_t n = (std::size_t)(
       one_pass ? prompt
                : std::min<std::int64_t>(prompt, prefill_piece_()));
