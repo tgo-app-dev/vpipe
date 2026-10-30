@@ -109,6 +109,13 @@ add_vpipe_metal_kernel(fish_dac SRC ops/fish_dac.metal)
 add_vpipe_metal_kernel(minimax_music3 SRC ops/minimax_music3.metal)
 add_vpipe_metal_kernel(minimax_music3_bf16 SRC ops/minimax_music3.metal
                        DEFINES VPIPE_ELT=bfloat)
+# Open-H3-Regenerate-2K: MiniMax-H3's latent upscaler (its folded-affine
+# GroupNorm, temporal depthwise conv and bilinear resize) and the LMS
+# Sharp curve branch on the DiT's AdaLN (generative-models/minimax-h3/).
+add_vpipe_metal_kernel(minimax_h3_regenerate SRC ops/minimax_h3_regenerate.metal)
+add_vpipe_metal_kernel(minimax_h3_regenerate_bf16
+                       SRC ops/minimax_h3_regenerate.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(dflash SRC ops/dflash.metal)
 add_vpipe_metal_kernel(dflash_bf16 SRC ops/dflash.metal
                        DEFINES VPIPE_ELT=bfloat)

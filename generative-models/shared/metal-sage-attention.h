@@ -179,6 +179,23 @@ class MetalSageAttention {
                int k_tokens, int d, int bq, int bk, const sage::Config& cfg,
                std::string* err, const Operand* v = nullptr);
 
+  // THE SAME PROLOGUE IN TWO HALVES, for a caller that attends BANDS of
+  // queries against one set of keys (MiniMax-H3's banded forward):
+  // prepare_keys() once -- K's mean and int8, and V's with cfg.pv8 --
+  // with the scratch sized for `q_tokens`, the widest band (reserve() it
+  // first, so a narrower last band reuses it); then prepare_queries() for
+  // each band of up to that many rows before the band's dispatch, and
+  // bind() as after prepare(). The same dispatches prepare() issues, so a
+  // band starting on a query block quantizes to exactly what prepare()
+  // makes of those rows: Q's scales are per block (or, with pv8, per
+  // token) and K's and V's the whole sequence's.
+  bool prepare_keys(metal_compute::ComputeEncoder& e, const Operand& k,
+                    int heads, int kv_heads, int q_tokens, int k_tokens,
+                    int d, int bq, int bk, const sage::Config& cfg,
+                    std::string* err, const Operand* v = nullptr);
+  bool prepare_queries(metal_compute::ComputeEncoder& e, const Operand& q,
+                       int q_tokens, std::string* err);
+
   // Bind the four operands at buffers 15..18 onto a dispatch whose
   // function was built with constant 306 true. Call AFTER set_function
   // and the caller's own binds, like any other bind.
@@ -316,6 +333,9 @@ class MetalSageAttention {
   int  _builds = 0;          // scratch builds, see scratch_builds()
   bool _ready = false;
   bool _pv8_ready = false;
+  // prepare_keys() has run (and with pv8's V): prepare_queries() may.
+  bool _keys_ready = false;
+  bool _keys_pv8 = false;
 };
 
 }  // namespace genai

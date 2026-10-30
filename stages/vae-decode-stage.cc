@@ -2,6 +2,7 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
 #include "common/host-report.h"
+#include "common/flex-bag.h"
 #include "common/beat-keys.h"
 
 #include <cstring>
@@ -18,11 +19,13 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-detect.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-provenance.h"
 #include "stages/model-registry.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -49,6 +52,7 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   _hf_dir    = attr_str("hf_dir");
   _keep_loaded = attr_real("keep_loaded");
   _vae_weights = attr_str("vae_dir");
+  _fast_decoder = attr_str("fast_decoder");
   // THE ACCELERATION BAG, built once and handed to a registered family
   // whole. Written whether the tier is on or off, and with the SETTLED
   // value, so no family repeats this stage's reading or reaches a
@@ -191,6 +195,26 @@ const ConfigKey kAttrs[] = {
           "the release's names. The config (latent statistics, geometry) "
           "still comes from hf_dir's VAE",
    .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
+  {.key = "fast_decoder", .type = ConfigType::String, .required = false,
+   .doc = "MiniMax-H3 only: decode through the FAST decoder Open-H3-"
+          "Regenerate-2K ships (vae_fast/, from NVIDIA's StreamRender-H3) "
+          "instead of the released one -- a registry key, its directory "
+          "or the .safetensors. LOSSY: the release puts it ~30 dB from "
+          "the released decoder. A 24-layer ViT over windows of 5 latent "
+          "frames x 16 x 16 tokens with no tiles and no overlap: MEASURED "
+          "88 s against 318 for a 2560x1440, 39-frame clip on an M4 "
+          "Pro. Holds 3.2 GB (bf16) where the released decoder holds "
+          "4.6, but its working set grows with the clip -- it keeps every "
+          "token between layers: 12.2 GB for 124 frames at 2K, besides "
+          "the clip it emits. The plan learns that at the first clip; "
+          "before it, it counts the released decoder's working set. "
+          "Takes i8_gemm / i8_gemm_tier (matrix cores) and "
+          "ane_ffn like the released one; the latent statistics still "
+          "come from hf_dir's VAE. A single latent frame (a picture) is "
+          "not its to decode",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "minimax-h3-fast-vae",
+   .is_path = true, .path_filter = "*.safetensors"},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on each decoded VIDEO frame's sideband when "
           "the latent does not carry one. A latent from generate-video does "
@@ -222,9 +246,11 @@ const ConfigKey kAttrs[] = {
           "1.15x / 1.26x a 1024^2 decode at 'accurate' / 'fast', 52-60 / "
           "50-57 dB from the f16 picture), by the 2D AutoencoderKL (FLUX.2's "
           "and FLUX.1's: FLUX.2, FLUX.3, Z-Image, MOSS-Image, Boogu, Fibo "
-          "2.0 -- its 3x3 convs the same way), and by a REGISTERED family; "
-          "the other built-in codecs ignore it. Env VPIPE_I8_GEMM "
-          "overrides",
+          "2.0 -- its 3x3 convs the same way), by MiniMax-H3's fast decoder "
+          "(fast_decoder: its block projections -- MEASURED 1.34x / 1.94x a "
+          "768P decode at 'accurate' / 'token' on a base M5) and by a "
+          "REGISTERED family; the other built-in codecs ignore it. Matrix "
+          "cores only. Env VPIPE_I8_GEMM overrides",
    .def_bool = false},
   {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
    .doc = "which int8 i8_gemm runs, in generate-image's words: 'accurate' "
@@ -234,7 +260,9 @@ const ConfigKey kAttrs[] = {
           "fits, the residual stream's too, and run the GEMMs at that "
           "tier (a depth its layout cannot take stays accurate). The "
           "Qwen-Image codec and the 2D AutoencoderKL (convs only: its mid "
-          "attention runs a flash kernel); others read 'accurate'",
+          "attention runs a flash kernel); MiniMax-H3's fast decoder holds "
+          "its block projections in the int8 layout from 'fast' up; others "
+          "read 'accurate'",
    .def_str = "accurate", .extra = kI8TierChoices},
   {.key = "keep_loaded", .type = ConfigType::Real, .required = false,
    .doc = "seconds to keep the VAE BUILT after this stage ends (its graph "
@@ -247,11 +275,13 @@ const ConfigKey kAttrs[] = {
   {.key = "ane_ffn", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated decode (LOSSY, fp16): split the decoder blocks' "
           "feed-forward between the GPU and the Apple Neural Engine by rows, "
-          "concurrently. MiniMax-H3's video VAE only: its decoder is a ViT "
-          "whose feed-forward is ~70% of the decode, and attention stays on "
-          "the GPU. One shared runtime-weight module (~0.3 GB), claimed from "
-          "the resource plan and staged per tile per block. Other families "
-          "ignore it",
+          "concurrently. MiniMax-H3's video VAE only, released or fast: its "
+          "decoder is a ViT whose feed-forward is ~70% of the decode, and "
+          "attention stays on the GPU. One shared runtime-weight module "
+          "(~0.3 GB), claimed from the resource plan and staged per tile "
+          "(the fast decoder: per layer) per block. MEASURED on an M4 Pro, "
+          "the fast decoder at 2560x1440 x 39 frames: 59 s against 88. "
+          "Other families ignore it",
    .def_bool = false},
   {.key = "ane_rows", .type = ConfigType::Real, .required = false,
    .doc = "the ANE's share of each feed-forward's rows, rounded to whole "
@@ -362,7 +392,7 @@ VaeDecodeStage::reset_run_state()
   // the tested pointers null, cleared the guard, and let the next
   // ensure_loaded_() build a second decoder ON TOP of the live one --
   // momentarily 2x peak, which for H3's 10.4 GB is 20.8 GB.
-  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae &&
+  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae && !_h3_fast &&
       !_plugin_dec) {
     _load_attempted = false;
     _unloaded       = false;
@@ -379,6 +409,7 @@ VaeDecodeStage::reset_run_state()
   if (!_tiny) { _tiny_tried = false; }
   _held.clear();
   _ref_port_noted = false;
+  _h3_cut_said = false;
 
   // Both are measurements of the PREVIOUS run's beats. The ratchet in
   // particular: a 2048^2 clip in run 1 must not keep this stage
@@ -447,9 +478,58 @@ VaeDecodeStage::declare_resources() const
   // Through the same resolver the release uses, so the claim and its
   // release cannot name different things -- and so a repack does not
   // claim its whole repository.
-  std::vector<ResourceClaim> out = model_memory::weight_claims_in_phase(
-      {vae_dir_for_release_()}, model_memory::kPhaseDecode);
+  //
+  // ONLY WHEN THE LOAD WAITS FOR A LATENT, which it does with a source on
+  // the model iport (every shipped graph; see initialize). Named by
+  // hf_dir alone the stage loads at initialize and holds the VAE from
+  // there, so that claim is unphased: a phase it does not keep would
+  // leave the condition and the denoise free of a VAE that is there --
+  // and a peer that lets the same checkpoint go after the condition
+  // (video-ref-encoder) would then have it counted in neither.
+  const std::string vdir = vae_dir_for_release_();
+  const bool waits = iport_edges().size() > kModelPort &&
+                     iport_edges()[kModelPort].v != nullptr;
+  std::vector<ResourceClaim> out =
+      waits ? model_memory::weight_claims_in_phase(
+                  {vdir}, model_memory::kPhaseDecode)
+            : model_memory::weight_claims({vdir});
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // MiniMax-H3's fast decoder: its f32 file held as bf16 (or the block
+  // projections' int8 layout), booked at that rather than at its size on
+  // disk; its ANE module the fast decoder's.
+  const std::string fast = fast_decoder_file_();
+  if (!fast.empty()) {
+    const std::size_t held =
+        genai::MetalMiniMaxH3FastVae::weight_bytes(fast, fast_i8_tier_());
+    for (ResourceClaim& c : out) {
+      if (held > 0) {
+        bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                         (std::int64_t)held);
+      }
+    }
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      genai::MetalMiniMaxH3FastVae::Config fc;
+      for (auto& c : model_memory::coreml_claims(
+               ane_claim_label_(),
+               genai::MetalMiniMaxH3FastVae::ane_runtime_bytes(fc), 1,
+               model_memory::kPhaseDecode)) {
+        out.push_back(std::move(c));
+      }
+    }
+    return out;
+  }
+  // MiniMax-H3's released VAE: at what the decode holds -- its decoder
+  // half, bf16 (4.6 GB) -- not the F32 file's 9.9 GB with the encoder.
+  if (builtin_vae_family(resolve_vae_dir(root)) == "minimax-h3") {
+    const std::size_t held = genai::MetalMiniMaxH3VideoVae::held_bytes(
+        vdir, genai::MetalMiniMaxH3VideoVae::Half::kDecoder);
+    for (ResourceClaim& c : out) {
+      if (held > 0 && c.key == vdir) {
+        bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                         (std::int64_t)held);
+      }
+    }
+  }
   // ANE RESIDENCY: one unit in the decode phase, for MiniMax-H3's VAE --
   // the only codec with the tier. CoreML holds the module's bytes where no
   // other ledger can see them. See ensure_loaded_ for the grant.
@@ -611,9 +691,20 @@ VaeDecodeStage::declare_memory() const
   }
 #endif
   // A VAE has no streaming form: it holds what it weighs, so `floor`
-  // stays 0 and is read as `preload`.
-  m.hold(vae_dir, model_memory::dir_weights_bytes(vae_dir), 0,
-         /*releases=*/true);
+  // stays 0 and is read as `preload`. The fast decoder holds its f32 file
+  // narrowed.
+  std::size_t held = 0;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (!fast_decoder_file_().empty()) {
+    held = genai::MetalMiniMaxH3FastVae::weight_bytes(vae_dir,
+                                                      fast_i8_tier_());
+  } else if (builtin_vae_family(resolve_vae_dir(root)) == "minimax-h3") {
+    held = genai::MetalMiniMaxH3VideoVae::held_bytes(
+        vae_dir, genai::MetalMiniMaxH3VideoVae::Half::kDecoder);
+  }
+#endif
+  m.hold(vae_dir, held > 0 ? held : model_memory::dir_weights_bytes(vae_dir),
+         0, /*releases=*/true);
   // The arena and the frames it produces are sized by the clip's
   // geometry, which arrives on a beat -- generate-video declares both,
   // because it is the stage that knows the geometry at plan time.
@@ -627,10 +718,62 @@ VaeDecodeStage::vae_weights_() const
   return resolve_model_dir(session(), _vae_weights);
 }
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+namespace {
+
+// The settled bag (the ctor's) as the codecs take it: the Qwen-Image
+// one, and the 2D AutoencoderKL through the same two fields.
+genai::MetalKrea2Vae::Accel
+krea2_accel_(const FlexData& bag)
+{
+  namespace ac = genai::accel;
+  const std::string t = ac::text(&bag, ac::kI8GemmTier);
+  return {ac::flag(&bag, ac::kI8Gemm),
+          t == ac::kI8TierTokenPlain ? 3
+          : t == ac::kI8TierToken    ? 2
+          : t == ac::kI8TierFast     ? 1 : 0};
+}
+
+}  // namespace
+#endif
+
+std::string
+VaeDecodeStage::fast_decoder_file_() const
+{
+  if (_fast_decoder.empty() || _hf_dir.empty()) { return {}; }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (builtin_vae_family(resolve_vae_dir(root)) != "minimax-h3") {
+    return {};
+  }
+  return genai::MetalMiniMaxH3FastVae::resolve_weights(
+      resolve_model_dir(session(), _fast_decoder));
+#else
+  return {};
+#endif
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+int
+VaeDecodeStage::fast_i8_tier_() const
+{
+  const auto ka = krea2_accel_(_accel);
+  auto* mc = session() != nullptr && session()->services() != nullptr
+                 ? session()->services()->metal_compute()
+                 : nullptr;
+  return genai::MetalMiniMaxH3FastVae::effective_i8_tier(
+      ka.i8_gemm ? ka.i8_tier : -1,
+      mc != nullptr && mc->supports_matrix_cores());
+}
+#endif
+
 std::string
 VaeDecodeStage::vae_dir_for_release_() const
 {
   if (_hf_dir.empty()) { return {}; }
+  // MiniMax-H3's fast decoder, when named, is the only checkpoint this
+  // stage then reads: the released VAE gives its config alone.
+  if (const std::string f = fast_decoder_file_(); !f.empty()) { return f; }
   // Weights named apart from the model (`vae_dir`) are what loads, so
   // they are what is claimed and released.
   if (const std::string w = vae_weights_(); !w.empty()) { return w; }
@@ -645,7 +788,12 @@ VaeDecodeStage::vae_dir_for_release_() const
   // So ask the family that CAN find its own single file. Only when the
   // generic answer degenerated, so a diffusers layout keeps taking the
   // path it always did.
-  if (generic != root) { return generic; }
+  //
+  // Through vae_claim_dir: MiniMax-H3's released VAE is claimed where
+  // its weights sit (`video_vae/source/`), as video-ref-encoder claims
+  // it. Claimed here as `video_vae`, the two NESTED, and the plan kept
+  // video-ref-encoder's condition alone, with this stage's decode lost.
+  if (generic != root) { return vae_claim_dir(generic); }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // A registered family first, for exactly the same reason the built-in
   // arm below exists: it is the only thing that knows where its own
@@ -687,7 +835,7 @@ VaeDecodeStage::unload_vae_()
   // _wan_vae was in neither the guard nor the resets, so the idle policy
   // never unloaded a Wan VAE at all: with only _wan_vae held every
   // tested pointer was null and this returned early.
-  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae &&
+  if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae && !_h3_fast &&
       !_plugin_dec && !_tiny) {
     return;
   }
@@ -701,6 +849,7 @@ VaeDecodeStage::unload_vae_()
   _flux2_vae.reset();
   _wan_vae.reset();
   _h3_vae.reset();
+  _h3_fast.reset();
   _plugin_dec.reset();
   // The tiny decoder's MemBlock memories are its scratch: an open stream
   // keeps it, and it goes with the stream's last beat.
@@ -813,22 +962,6 @@ VaeDecodeStage::ensure_tiny_()
   return true;
 }
 
-namespace {
-
-// The settled bag (the ctor's) as the codecs take it: the Qwen-Image
-// one, and the 2D AutoencoderKL through the same two fields.
-genai::MetalKrea2Vae::Accel
-krea2_accel_(const FlexData& bag)
-{
-  namespace ac = genai::accel;
-  const std::string t = ac::text(&bag, ac::kI8GemmTier);
-  return {ac::flag(&bag, ac::kI8Gemm),
-          t == ac::kI8TierTokenPlain ? 3
-          : t == ac::kI8TierToken    ? 2
-          : t == ac::kI8TierFast     ? 1 : 0};
-}
-
-}  // namespace
 
 void
 VaeDecodeStage::ensure_loaded_()
@@ -1077,6 +1210,76 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
 
+  if (_family == "minimax-h3" && !_fast_decoder.empty()) {
+    // THE FAST DECODER: its own weights, the released VAE's config (the
+    // latent statistics) and nothing else of it.
+    const std::string file = fast_decoder_file_();
+    std::string ferr;
+    if (file.empty()) {
+      genai::MetalMiniMaxH3FastVae::resolve_weights(
+          resolve_model_dir(session(), _fast_decoder), &ferr);
+      session()->error(fmt("VaeDecodeStage('{}'): fast_decoder '{}': {}; "
+                           "inert", this->id(), _fast_decoder, ferr));
+      return;
+    }
+    std::shared_ptr<genai::WeightSet> fws =
+        genai::open_weight_set(file, session());
+    genai::MetalMiniMaxH3FastVae::Config fcfg;
+    if (!fws ||
+        !genai::MetalMiniMaxH3FastVae::config_from(*fws, vae_dir, &fcfg,
+                                                   &ferr)) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): '{}' is not MiniMax-H3's fast decoder "
+          "({}); inert", this->id(), file,
+          ferr.empty() ? std::string("unreadable") : ferr));
+      return;
+    }
+    fcfg.i8_tier = fast_i8_tier_();
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      const std::size_t bytes =
+          genai::MetalMiniMaxH3FastVae::ane_runtime_bytes(fcfg);
+      if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes,
+                                     1) > 0) {
+        fcfg.ane_ffn    = true;
+        fcfg.ane_rows   =
+            (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
+        fcfg.ane_layers = (int)genai::accel::integer(
+            &_accel, genai::accel::kAneLayers, 0);
+        _ane_bytes = bytes;
+      } else {
+        session()->info(fmt(
+            "VaeDecodeStage('{}'): the ANE feed-forward was requested but "
+            "the plan left no room for its module ({} MB); keeping the GPU",
+            this->id(), bytes >> 20));
+      }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    _h3_fast = genai::MetalMiniMaxH3FastVae::load(fws, mc, fcfg, &ferr);
+    if (!_h3_fast) {
+      session()->error(fmt(
+          "VaeDecodeStage('{}'): failed to load MiniMax-H3's fast decoder "
+          "from '{}' ({}); inert", this->id(), file, ferr));
+      return;
+    }
+    const int tier = _h3_fast->i8_tier();
+    load_note_(fmt(
+        "VaeDecodeStage('{}'): MiniMax-H3's FAST decoder (lossy) from '{}' "
+        "in {:.1f} s -- {} layers, {} MB held; GEMMs {}{}, attention {}{}",
+        this->id(), file,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count(),
+        fcfg.n_layers, _h3_fast->weight_bytes() >> 20,
+        _h3_fast->matrix_cores() ? "matmul2d" : "steel",
+        tier < 0 ? std::string()
+                 : fmt(" + int8 {}", tier == 0   ? "accurate"
+                                     : tier == 1 ? "fast"
+                                     : tier == 2 ? "token"
+                                                 : "token_plain")(),
+        _h3_fast->nax_attention() ? "matrix-core flash" : "steel flash",
+        fcfg.ane_ffn ? ", the ANE taking a share of each feed-forward"
+                     : ""));
+    return;
+  }
   if (_family == "minimax-h3") {
     genai::MetalMiniMaxH3VideoVae::Config h3cfg;
     std::string h3err;
@@ -1245,6 +1448,32 @@ forward_model_name_(const TensorBeatPayload& src, TensorBeat& dst)
 // image-resample `pad_to_grid`, through vae-encode and generate-image)
 // says where it sits. Cut the decoded planar [C, H, W] canvas to it. A box
 // that is not a rectangle inside the picture is left alone. True if cut.
+// The same box as a rectangle of a W x H picture, for a caller that cuts
+// as it converts. False (the whole picture) when there is no box or it is
+// not a rectangle strictly inside the picture.
+bool
+crop_rect_(const TensorBeatPayload& lat, int W, int H, int* x0, int* y0,
+           int* cw, int* ch)
+{
+  *x0 = 0; *y0 = 0; *cw = W; *ch = H;
+  if (!lat.sideband.is_object()) { return false; }
+  FlexData sb = lat.sideband;            // as_object() is a view: keep it
+  auto so = sb.as_object();
+  if (!so.contains(sideband::kCropBox)) { return false; }
+  FlexData box = so.at(sideband::kCropBox);
+  if (!box.is_array() || box.as_array().size() != 4) { return false; }
+  int b[4];
+  for (int i = 0; i < 4; ++i) {
+    b[i] = (int)box.as_array()[(std::size_t)i].as_int(-1);
+  }
+  if (b[0] < 0 || b[1] < 0 || b[2] > W || b[3] > H || b[2] <= b[0] ||
+      b[3] <= b[1] || (b[2] - b[0] == W && b[3] - b[1] == H)) {
+    return false;
+  }
+  *x0 = b[0]; *y0 = b[1]; *cw = b[2] - b[0]; *ch = b[3] - b[1];
+  return true;
+}
+
 bool
 crop_to_box_(const TensorBeatPayload& lat,
              std::unique_ptr<TensorBeatPayload>& out)
@@ -1553,7 +1782,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   // ---- Wan video VAE: input [z_dim, T, h8, w8]; decode to
   // ---- MiniMax-H3: a ViT decoder over a 16x-compressed latent --------
   if (_family == "minimax-h3") {
-    if (!_h3_vae) {
+    if (!_h3_vae && !_h3_fast) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): MiniMax-H3 VAE not loaded; skipping",
           this->id()));
@@ -1566,16 +1795,23 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           tbp->shape.size()));
       co_return;
     }
-    const auto& vc = _h3_vae->config();
+    // The geometry from whichever decoder is loaded: the fast one takes
+    // the released VAE's.
+    const int vz = _h3_fast ? _h3_fast->config().z_channels
+                            : _h3_vae->config().z_channels;
+    const int vp = _h3_fast ? _h3_fast->config().patch
+                            : _h3_vae->config().patch;
+    const int vpt = _h3_fast ? _h3_fast->config().patch_t
+                             : _h3_vae->config().patch_t;
     const int Cz = (int)tbp->shape[0];
     const int LT = (int)tbp->shape[1];
     const int lh = (int)tbp->shape[2];
     const int lw = (int)tbp->shape[3];
-    if (Cz != vc.z_channels || LT <= 0 || lh <= 0 || lw <= 0) {
+    if (Cz != vz || LT <= 0 || lh <= 0 || lw <= 0) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): latent [{}, {}, {}, {}] does not match "
           "z_channels {}; skipping", this->id(), Cz, LT, lh, lw,
-          vc.z_channels));
+          vz));
       co_return;
     }
 
@@ -1586,6 +1822,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // into exactly 1. Only a checkpoint whose decoder was fine-tuned for
     // it can decode this, and it declares that itself.
     const bool one_frame = (LT == 1);
+    if (one_frame && _h3_fast) {
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): this is a single-frame latent (a picture), "
+          "and the fast decoder decodes clips; unset fast_decoder for it. "
+          "Skipping", this->id()));
+      co_return;
+    }
     if (one_frame && !_h3_vae->can_decode_image()) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): this is a single-frame latent and the "
@@ -1611,9 +1854,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // to a plausible but washed-out clip rather than to obvious noise.
     const std::size_t nz = (std::size_t)Cz * LT * lh * lw;
     const std::size_t vox = (std::size_t)LT * lh * lw;
-    metal_compute::SharedBuffer z = mc->make_shared_buffer(nz * 2);
-    if (z.empty()) { co_return; }
-    {
+    // The fast decoder takes the whitened f32 latent as it is: it folds
+    // the un-whitening into its embedding.
+    metal_compute::SharedBuffer z;
+    if (!_h3_fast) {
+      z = mc->make_shared_buffer(nz * 2);
+      if (z.empty()) { co_return; }
+      const auto& vc = _h3_vae->config();
       auto* d = static_cast<std::uint16_t*>(z.contents());
       const float* s2 = tbp->as_f32();
       const bool whiten = (int)vc.latents_mean.size() == Cz &&
@@ -1651,11 +1898,23 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // the refusal, not a size -- so the image path states its own 1
       // rather than preflighting an allocation of nothing.
       const std::size_t out_frames =
-          one_frame ? 1u : (std::size_t)_h3_vae->decoded_frames(LT);
-      const std::size_t px = (std::size_t)(lh * vc.patch) *
-                             (std::size_t)(lw * vc.patch) * out_frames;
-      const std::size_t need = px * 3 * 2      // decode output, bf16
-                             + px * 3;         // the stage's planar-U8 clip
+          one_frame ? 1u
+          : _h3_fast ? (std::size_t)_h3_fast->decoded_frames(LT)
+                     : (std::size_t)_h3_vae->decoded_frames(LT);
+      const std::size_t px = (std::size_t)(lh * vp) *
+                             (std::size_t)(lw * vp) * out_frames;
+      // The fast decoder's working set grows with the clip -- its f32
+      // stream holds every latent cell -- and is exact, its output
+      // included.
+      // The released decoder's clip (bf16) and the chunk it works in
+      // beside it -- its tiles, their stitch, its ViT scratch.
+      const std::size_t need =
+          (_h3_fast ? _h3_fast->scratch_bytes(LT, lh, lw)
+           : one_frame
+               ? px * 3 * 2
+               : genai::MetalMiniMaxH3VideoVae::decode_video_bytes(
+                     _h3_vae->config(), LT, lh, lw))
+          + px * 3;                    // the stage's planar-U8 clip
       // PHYSICAL pressure is the gate; the Metal working set is only
       // advisory here, and conflating the two refused work that fits.
       //
@@ -1696,7 +1955,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           session()->info(fmt(
               "VaeDecodeStage('{}'): parked ~{} MB to fit a {}-frame "
               "{}x{} decode (~{} MB of output)", this->id(), parked >> 20,
-              out_frames, lw * vc.patch, lh * vc.patch, need >> 20));
+              out_frames, lw * vp, lh * vp, need >> 20));
         } else {
           // For the host to act on (common/host-report.h).
           FlexData d = FlexData::make_object();
@@ -1705,8 +1964,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           o.insert("stage", FlexData::make_string(this->id()));
           o.insert("step", FlexData::make_string("decode"));
           o.insert("frames", u(out_frames));
-          o.insert("width", u((std::size_t)(lw * vc.patch)));
-          o.insert("height", u((std::size_t)(lh * vc.patch)));
+          o.insert("width", u((std::size_t)(lw * vp)));
+          o.insert("height", u((std::size_t)(lh * vp)));
           o.insert("need", u(need));
           FlexData parts = FlexData::make_array();
           for (const auto& [name, b] :
@@ -1738,7 +1997,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
               "reclaimable{}. Refusing rather than thrashing: wired Metal "
               "buffers cannot be paged out, so overcommitting takes the "
               "machine down rather than failing this stage",
-              this->id(), out_frames, lw * vc.patch, lh * vc.patch,
+              this->id(), out_frames, lw * vp, lh * vp,
               need >> 20, mb.available_physical >> 20,
               parked > 0 ? fmt(" after parking ~{} MB", parked >> 20)()
                          : std::string()));
@@ -1760,39 +2019,56 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     {
       PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
                          kPerfLlmVaeBegin,
-                         (std::uint64_t)LT * vc.patch_t *
-                             (std::uint64_t)(lh * vc.patch) *
-                             (std::uint64_t)(lw * vc.patch));
+                         (std::uint64_t)LT * vpt *
+                             (std::uint64_t)(lh * vp) *
+                             (std::uint64_t)(lw * vp));
       // A minute of a 2.4B ViT with nothing else to look at. The tile is
       // the only unit the decode passes through often enough to be worth
       // reporting, and it is what the bar counts.
       UiProgress bar = session()->open_progress("vae decode");
-      _h3_vae->set_tile_progress([&bar](int done, int total) {
-        bar.update((std::uint64_t)(done < 0 ? 0 : done),
-                   (std::uint64_t)(total < 0 ? 0 : total));
-      });
-      // The two agree on memory: `decode_video` emits channel-first
-      // [3, F, H, W] and `decode_image` [3, H, W], which at F == 1 is
-      // the same buffer. So only the call differs and every line below
-      // -- the u8 quantize, the per-frame beats, the diagnostics -- is
-      // the video path's, unchanged.
-      if (one_frame) {
-        rgb = _h3_vae->decode_image(z, lh, lw, &derr);
-        F = rgb.empty() ? 0 : 1;
+      if (_h3_fast) {
+        // A layer at a time over the whole clip; a stop lands between
+        // layers (each commits and waits).
+        _h3_fast->set_progress([&bar](int done, int total) {
+          bar.update((std::uint64_t)done, (std::uint64_t)total);
+        });
+        _h3_fast->set_stop([&ctx]() { return ctx.stop_requested(); });
+        rgb = _h3_fast->decode(tbp->as_f32(), LT, lh, lw, &derr);
+        F = rgb.empty() ? 0 : _h3_fast->decoded_frames(LT);
+        _h3_fast->set_progress(nullptr);
+        _h3_fast->set_stop(nullptr);
       } else {
-        rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
+        _h3_vae->set_tile_progress([&bar](int done, int total) {
+          bar.update((std::uint64_t)(done < 0 ? 0 : done),
+                     (std::uint64_t)(total < 0 ? 0 : total));
+        });
+        // The two agree on memory: `decode_video` emits channel-first
+        // [3, F, H, W] and `decode_image` [3, H, W], which at F == 1 is
+        // the same buffer. So only the call differs and every line below
+        // -- the u8 quantize, the per-frame beats, the diagnostics -- is
+        // the video path's, unchanged.
+        if (one_frame) {
+          rgb = _h3_vae->decode_image(z, lh, lw, &derr);
+          F = rgb.empty() ? 0 : 1;
+        } else {
+          rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
+        }
+        // Cleared before the bar it captures leaves scope -- the VAE
+        // outlives this call and would otherwise hold a dangling reference
+        // into the next decode.
+        _h3_vae->set_tile_progress(nullptr);
       }
-      // Cleared before the bar it captures leaves scope -- the VAE
-      // outlives this call and would otherwise hold a dangling reference
-      // into the next decode.
-      _h3_vae->set_tile_progress(nullptr);
       bar.finish();
       // Set the module booking to what is HELD after this decode: the
       // module's bytes when the tier armed, 0 when it declined. Both ways,
       // every clip, so the ledger follows a reload that arms after one that
       // did not.
-      if (_h3_vae->ane_attempted()) {
-        if (!_h3_vae->ane_armed()) { _ane_bytes = 0; }
+      const bool tried = _h3_fast ? _h3_fast->ane_attempted()
+                                  : _h3_vae->ane_attempted();
+      const bool armed = _h3_fast ? _h3_fast->ane_armed()
+                                  : _h3_vae->ane_armed();
+      if (tried) {
+        if (!armed) { _ane_bytes = 0; }
         if (auto* mgr = session()->services()->generative_model_manager()) {
           mgr->revise_scratch("coreml:" + ane_claim_label_(), _ane_bytes);
         }
@@ -1804,7 +2080,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           "skipping", this->id(), derr.empty() ? "unknown error" : derr));
       co_return;
     }
-    const int H = lh * vc.patch, W = lw * vc.patch;
+    const int H = lh * vp, W = lw * vp;
     const auto* rp = static_cast<const std::uint16_t*>(rgb.contents());
     const std::size_t plane = (std::size_t)H * W;
     // Diagnostic: the decoder's own pixels, before the u8 quantize and
@@ -1833,15 +2109,41 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // still would invent a one-frame clip where MiniMax-H3 itself makes
     // a real distinction between the two -- a reference image advances
     // its rotary clock by one integer slot, a one-frame video does not.
-    auto clip = one_frame ? nullptr : begin_clip_(ctx, F, H, W);
-    for (int f = 0; f < F; ++f) {
+    // How many of the decoded frames are real (sideband::kValidFrames: a
+    // refine of a 121-frame draft decodes 124), and the rectangle the
+    // picture is cut to (sideband::kCropBox: a 1080-row target computes
+    // at 1088). Both absent on a generation, which emits every frame
+    // whole as it always has.
+    int Fo = F;
+    if (tbp->sideband.is_object()) {
+      FlexData vsb = tbp->sideband;       // as_object() is a view: keep it
+      auto vo = vsb.as_object();
+      if (vo.contains(sideband::kValidFrames)) {
+        const auto v = vo.at(sideband::kValidFrames).as_int(-1);
+        if (v > 0 && v < F) { Fo = (int)v; }
+      }
+    }
+    int cx0 = 0, cy0 = 0, cw = W, chh = H;
+    const bool cropped = crop_rect_(*tbp, W, H, &cx0, &cy0, &cw, &chh);
+    if ((Fo != F || cropped) && !_h3_cut_said) {
+      _h3_cut_said = true;
+      session()->info(fmt(
+          "VaeDecodeStage('{}'): keeping {} of {} decoded frames{}",
+          this->id(), Fo, F,
+          cropped ? fmt(", cut to {}x{} at ({}, {}) of {}x{}", cw, chh, cx0,
+                        cy0, W, H)()
+                  : std::string()));
+    }
+    const std::size_t oplane = (std::size_t)cw * chh;
+    auto clip = one_frame ? nullptr : begin_clip_(ctx, Fo, chh, cw);
+    for (int f = 0; f < Fo; ++f) {
       auto out = std::make_unique<TensorBeatPayload>();
       out->dtype = _out_dtype;
-      out->shape = {3, H, W};
-      out->resize_contiguous(3 * plane);
+      out->shape = {3, chh, cw};
+      out->resize_contiguous(3 * oplane);
       for (int c = 0; c < 3; ++c) {
         const std::uint16_t* src = rp + ((std::size_t)c * F + f) * plane;
-        const std::size_t base = (std::size_t)c * plane;
+        const std::size_t base = (std::size_t)c * oplane;
         // The ViT decoder emits IMAGENET-NORMALIZED pixels, not [-1, 1]:
         // the encoder's first act is `(x + 1)/2` then `(. - mean)/std`,
         // and the reference decode undoes exactly that before clamping.
@@ -1851,18 +2153,23 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         // statistics, the result is a BLOCK GRID rather than an
         // obviously blown-out image.
         const float pm = kImagenetMean[c], ps = kImagenetStd[c];
-        for (std::size_t i = 0; i < plane; ++i) {
-          const std::uint32_t u = (std::uint32_t)src[i] << 16;
-          float x;
-          std::memcpy(&x, &u, 4);
-          put_unit_(*out, base + i, x * ps + pm);  // -> [0, 1]
+        for (int y = 0; y < chh; ++y) {
+          const std::uint16_t* srow =
+              src + (std::size_t)(cy0 + y) * W + (std::size_t)cx0;
+          const std::size_t drow = base + (std::size_t)y * cw;
+          for (int x0 = 0; x0 < cw; ++x0) {
+            const std::uint32_t u = (std::uint32_t)srow[x0] << 16;
+            float x;
+            std::memcpy(&x, &u, 4);
+            put_unit_(*out, drow + (std::size_t)x0, x * ps + pm);  // [0, 1]
+          }
         }
       }
       FlexData sb = FlexData::make_object();
       sb.as_object().insert_or_assign(sideband::kFrame,
                                       FlexData::make_int((std::int64_t)f));
       sb.as_object().insert_or_assign(sideband::kFrames,
-                                      FlexData::make_int((std::int64_t)F));
+                                      FlexData::make_int((std::int64_t)Fo));
       sb.as_object().insert_or_assign(sideband::kFps, FlexData::make_real(fps));
       out->sideband = std::move(sb);
       forward_model_name_(*tbp, *out);

@@ -230,8 +230,8 @@ distance in three scenarios: a generation (0.0129 vs 0.0127), one picture
 A wider one, built to engage every fast path, lands at 0.0126 (0.0114).
 Each of these holds:
 
-- a streamed DiT is byte-identical to a preloaded one, with or without its
-  slot pair;
+- a streamed DiT is byte-identical to one with every block resident, with
+  or without its slot pair;
 - a second edit in the same run reproduces the first byte for byte;
 - a runtime LoRA matches the same factors fused into the weights (0.0128),
   and at strength 0 it is the base model exactly;
@@ -273,7 +273,8 @@ pixels; a fourth, run beside another graph, did not.
 ## Speed
 
 An M4 Pro (64 GB) takes **100 s** for the 4 steps of a 1024² edit, with the
-DiT streaming its blocks (99 s preloaded); the whole run is 1 m 50 s. The
+DiT streaming its blocks (99 s with every block resident); the whole run
+is 1 m 50 s. The
 sequence the DiT attends over is the picture **and** the picture being
 edited, plus the gist: 8,512 rows at 1024². Peak memory was 18.9 GB. Of a
 step, the GEMMs are 66% (the feed-forward 45%) and attention 29%. Attention

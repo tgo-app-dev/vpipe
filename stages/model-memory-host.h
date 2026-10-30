@@ -78,10 +78,12 @@ std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
 // int, on a weights claim's `extra`: the most the component will HOLD,
 // when that is less than its checkpoint weighs and it is not a floor -- a
 // Mixture of Experts whose routed-expert cache is sized within a host's
-// memory limit. The weights planner books the checkpoint at it (never
-// under the claim's floor, never over the checkpoint). Read through
-// DeliveringResourceClaim (pipeline/resource-claim-delivery.h). Host-only:
-// the host's language-model stages set it; no plugin is offered it yet.
+// memory limit; an F32 file held narrowed or in an int8 layout; adapter
+// factors a streamed DiT spills. The weights planner books the
+// checkpoint at it (never under the claim's floor, never over the
+// checkpoint). Read through DeliveringResourceClaim
+// (pipeline/resource-claim-delivery.h). Host-only: host stages set it;
+// no plugin is offered it yet.
 inline constexpr std::string_view kClaimHeldBytes = "held_bytes";
 
 // THE RESIDENCY RESERVE of a model resident in `phase` that grows a

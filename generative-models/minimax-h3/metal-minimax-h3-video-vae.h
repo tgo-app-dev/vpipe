@@ -189,6 +189,25 @@ class MetalMiniMaxH3VideoVae {
 
   ~MetalMiniMaxH3VideoVae();
 
+  // What each half holds once it has loaded, off the checkpoint's headers
+  // (bf16, or a pack as stored). Each half loads at its first use -- the
+  // encoder at the first encode, the decoder at the first decode -- so a
+  // stage that only encodes holds the encoder alone.
+  enum class Half { kEncoder, kDecoder };
+  static std::size_t held_bytes(const std::string& vae_dir, Half half);
+
+  // What decode_video() allocates beside the weights for an LT x lh x lw
+  // latent, the clip it returns included: the clip ([out_channels,
+  // frames, H, W] bf16, written in place chunk by chunk), the padded
+  // latent, and one chunk's working set -- two rows of tile decodes (each
+  // tile is stitched as it finishes), the stitched chunk, the ViT scratch
+  // of the widest tile, the cross-fade partner. decode_working_bytes is that last part
+  // and the latent, without the clip.
+  static std::size_t decode_video_bytes(const Config& c, int LT, int lh,
+                                        int lw);
+  static std::size_t decode_working_bytes(const Config& c, int LT, int lh,
+                                          int lw);
+
   // Decode one latent grid. `z` is CHANNEL-FIRST [z_channels, T, h, w]
   // bf16 -- the layout the DiT's unpatchify produces -- and the result is
   // channel-first [out_channels, T*4, h*16, w*16] bf16.
@@ -316,6 +335,7 @@ class MetalMiniMaxH3VideoVae {
   // it started. 0 when `LT` is too short to form a chunk.
   int video_latent_frames(int T) const;
   int decoded_frames(int LT) const;
+  static int decoded_frames_for(const Config& c, int LT);
 
   const Config& config() const { return _cfg; }
 
@@ -446,6 +466,7 @@ class MetalMiniMaxH3VideoVae {
   // extent that route declines. Cached in the weight set.
   metal_compute::SharedBuffer gemm_weight_(const Conv3d& c);
   bool   load_encoder_(WeightSet& ws);
+  bool   load_decoder_(WeightSet& ws);
 
   void gemm_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t x_off,
@@ -586,6 +607,15 @@ class MetalMiniMaxH3VideoVae {
   stitch_(const std::vector<metal_compute::SharedBuffer>& tiles,
           const minimax_h3::TileSplit& ys, const minimax_h3::TileSplit& xs,
           int ratio, int C, int T, int out_h, int out_w);
+  // One tile of stitch_: its region of `dst` ([C, T, out_h, out_w]),
+  // cross-faded with the ORIGINAL bytes of the tile above and the one to
+  // its left (null where there is none) -- all a tile's region reads, so
+  // a tiled decode stitches each tile as it finishes.
+  void stitch_tile_(std::uint16_t* dst, const std::uint16_t* cur,
+                    const std::uint16_t* up, const std::uint16_t* lf, int i,
+                    int j, const minimax_h3::TileSplit& ys,
+                    const minimax_h3::TileSplit& xs, int ratio, int C,
+                    int T, int out_h, int out_w, std::vector<float>& tmp);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;

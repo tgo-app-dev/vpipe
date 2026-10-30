@@ -154,11 +154,22 @@ denoise(const DenoiseRequest& req, std::string* err)
   // grid the adapter was distilled on unless the caller named another.
   const bool two_time = req.dit->two_time_active();
   const MetalMiniMaxH3Transformer::FlowMap* fm = req.dit->flow_map();
+  const bool refine = !req.refine_sigmas.empty();
   const std::vector<float>* grid =
       !req.sigma_grid.empty() ? &req.sigma_grid
       : (two_time && fm != nullptr && !fm->sigmas.empty()) ? &fm->sigmas
                                                            : nullptr;
-  if (grid != nullptr) {
+  if (refine) {
+    if (two_time) {
+      return fail("denoise: a refine names its own sigmas and cannot run a "
+                  "flow-map adapter, whose (t, r) pairs follow its grid");
+    }
+    if (!sv.set_sigmas_as_run(req.refine_sigmas)) {
+      return fail(fmt("denoise: the refine's {} sigmas are not a strictly "
+                      "decreasing grid from at most 1 to exactly 0",
+                      req.refine_sigmas.size())());
+    }
+  } else if (grid != nullptr) {
     if (!sv.set_sigmas(*grid) || !sa.set_sigmas(*grid)) {
       return fail(fmt("denoise: the {} sigma grid ({} points) is not a "
                       "strictly decreasing 1 -> 0 grid under shifts "
@@ -178,8 +189,9 @@ denoise(const DenoiseRequest& req, std::string* err)
   // grid points ITS shift happens to collide -- so the two schedules can
   // come back with different lengths from the same request. Step i of
   // one has to pair with step i of the other, so run the shorter.
-  const int steps = std::min(sv.num_inference_steps(),
-                             sa.num_inference_steps());
+  const int steps = refine ? sv.num_inference_steps()
+                           : std::min(sv.num_inference_steps(),
+                                      sa.num_inference_steps());
   if (steps <= 0) { return fail("denoise: empty schedule"); }
 
   metal_compute::MetalCompute* mc = req.dit->metal_compute();
@@ -207,7 +219,9 @@ denoise(const DenoiseRequest& req, std::string* err)
   auto plan = [&](int i, std::vector<float>* u, std::vector<float>* ur,
                   std::vector<int>* ri) {
     const float tv = sv.timesteps()[(std::size_t)i];
-    const float ta = sa.timesteps()[(std::size_t)i];
+    // A refine's audio is clean at every step.
+    const float ta = refine ? req.condition_audio_timestep
+                            : sa.timesteps()[(std::size_t)i];
     if (two_time) {
       minimax_h3::build_row_time_pairs(
           L, tv, sv.endpoints()[(std::size_t)i], ta,
@@ -488,8 +502,9 @@ denoise(const DenoiseRequest& req, std::string* err)
         }
       }
       const bool vok =
-          res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
-                 : sv.step(vel.data(), i, vx, vel.size());
+          refine ? sv.step_plain(vel.data(), i, vx, vel.size())
+          : res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
+                   : sv.step(vel.data(), i, vx, vel.size());
       if (!vok) {
         return fail("denoise: video step " + std::to_string(i) + " failed");
       }
@@ -498,7 +513,7 @@ denoise(const DenoiseRequest& req, std::string* err)
       }
       xrms = vel.empty() ? 0.0 : std::sqrt(xrms / (double)vel.size());
     }
-    if (have_aud) {
+    if (have_aud && !refine) {
       // Only the generated tail is stepped, so both the velocity and the
       // state are read from `ncaud` on.
       std::vector<float>& vel = vel_a;

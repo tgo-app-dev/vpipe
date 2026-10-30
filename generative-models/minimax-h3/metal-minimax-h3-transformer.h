@@ -280,6 +280,12 @@ class MetalMiniMaxH3Transformer {
     // keeps the two modalities the same length by construction; a
     // positive value is for a clip whose audio is deliberately not.
     double audio_seconds = 0.0;
+    // A REFINE (generate-video's init_latent: Open-H3-Regenerate-2K):
+    // the noise the clip is put back to, and the shift its steps follow
+    // -- MiniMaxH3Scheduler::refine_sigmas. Negative start = the
+    // release's own grid for the step count (0.909375 at 3 steps).
+    double refine_start_sigma = -1.0;
+    double refine_shift       = 6.0;
 
     // Parse the `minimax-h3-model-config` beat. Absent keys keep the
     // defaults above; `err` collects what was ignored, and is not fatal.
@@ -441,6 +447,12 @@ class MetalMiniMaxH3Transformer {
   // How many projections carry a runtime adapter, summed over the slots
   // that bound (0 = none attached).
   int lora_modules() const;
+  // An AdaLN curve branch's input (see CurveSet) for each timestep, as
+  // the reference reads it: pos = t * (knots - 1), lo = floor(pos)
+  // clamped to knots - 2, torch.lerp(table[lo], table[lo + 1], pos - lo)
+  // -- its two-sided form, in f32. `table` is [knots, 8], `out` [t, 8].
+  static void curve_coords(const std::vector<float>& table, int knots,
+                           const std::vector<float>& t, float* out);
   // The same for ONE slot, so a caller can report which adapter took.
   int lora_modules(int slot) const;
   // Slots that bound. Indices below this are live; the rest are not.
@@ -451,6 +463,27 @@ class MetalMiniMaxH3Transformer {
   // Bytes every slot's GPU factors hold -- what attaching the adapters
   // costs in memory, which is not what they cost on disk.
   std::size_t lora_bytes() const;
+  // The width of the forward's [rows, rank] adapter scratch, every
+  // slot's widest projection together.
+  int lora_scratch_rank() const { return _lora_rank_total; }
+
+  // What an adapter FILE will cost before anything loads -- the plan's
+  // figure, off its header; lora_bytes() is the loaded model's. Every
+  // factor is held bf16 whatever the file stores. `whole`: all of them
+  // (a preloaded DiT). `streamed`: each main block's spilled to a file
+  // and the largest block's set held for the block being run, beside
+  // the rest (spill_lora_). `rank`: the widest the [rows, rank] scratch
+  // takes for this file, a block's q, k and v together as the bind fuses
+  // them. Main blocks at or past `n_layers` are not counted, as the bind
+  // skips them (0 counts every one). qkv bound BANDED, the default;
+  // VPIPE_H3_LORA_NO_BAND's block-diagonal B holds three of qkv's B.
+  struct LoraFootprint {
+    std::size_t whole    = 0;
+    std::size_t streamed = 0;
+    int         rank     = 0;
+  };
+  static LoraFootprint lora_footprint(const std::string& path,
+                                      int n_layers = 0);
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
@@ -864,8 +897,9 @@ class MetalMiniMaxH3Transformer {
   // wants left over. 0 disables growth entirely (pure streaming).
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
 
-  // Bytes currently held by promoted blocks, and how many there are.
-  // Reported so a run can say how much of the box it actually used.
+  // Bytes currently held by promoted blocks (the adapter factors kept
+  // with them included), and how many there are. Reported so a run can
+  // say how much of the box it actually used.
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
   // The streaming slot pair, while it exists.
@@ -875,9 +909,11 @@ class MetalMiniMaxH3Transformer {
   }
   // What a STREAMING model holds beyond its weight set's cached entries
   // (the trunk): the promoted blocks, the slot pair and the AdaLN tables
-  // the bake built. The figure a per-clip holding correction adds to the
-  // set's -- promoted blocks are this model's own buffers, which the set
-  // never sees. 0 for a preloaded model, whose blocks are the set's.
+  // the bake built -- not the adapter factors kept with promoted blocks,
+  // which the adapter file's own claim books. The figure a per-clip
+  // holding correction adds to the set's -- promoted blocks are this
+  // model's own buffers, which the set never sees. 0 for a preloaded
+  // model, whose blocks are the set's.
   std::size_t streamed_holding_bytes() const;
   // EVERY BLOCK KEPT: give the slot pair back -- two blocks a preload
   // never held. Call with no forward running; the next streamed block
@@ -940,7 +976,33 @@ class MetalMiniMaxH3Transformer {
   static std::size_t scratch_bytes(const Config& c, int seq, int n_text,
                                    int n_t, bool with_dequant,
                                    bool narrow_ff = false,
-                                   std::size_t arena_floor = 0);
+                                   std::size_t arena_floor = 0,
+                                   int band = 0);
+
+  // THE BANDED FORWARD. A long sequence's main blocks run a BAND of rows
+  // at a time: every row's residual and q / k / v are kept -- attention
+  // needs every key -- and one band of everything else (the normed rows,
+  // the qkv projection's output, the attention output, the feed-
+  // forward). 54 KB a row against 137 whole: at 2K x 121 frames (134k
+  // rows) 7.7 GiB of activations against 17. Each row's arithmetic is
+  // the whole forward's -- Sol, Sage and Sage's int8 P*V included: Sage
+  // quantizes K and V once a layer and each band's Q, Sol attends each
+  // band's queries over every key (a second Sol object for the last
+  // band). The rows a band takes for `seq` under `c` -- BALANCED: every
+  // band but the last that many, at most the configured band, the last
+  // long enough to clear every route's row floor -- or 0 for the whole
+  // sequence: under 2 bands' worth, and wherever a path needs the whole
+  // sequence's buffers -- the ANE tiers (and, at the forward, streaming
+  // attention, VDN's branch, the in-place q/k/v layout).
+  // VPIPE_H3_BAND_ROWS=<rows> sets the band (0: never).
+  static int band_rows(const Config& c, int seq);
+  static constexpr int kBandRows = 8192;
+  // The band the last forward ran its main blocks in (0: whole).
+  int last_band_rows() const { return _last_band; }
+  // ...and the one this model's forward takes at `seq` (band_rows under
+  // the load's kernels and branches; a request's streaming attention
+  // aside).
+  int forward_band(int seq) const;
 
   // What the per-forward scratch buffers ACTUALLY hold right now, and
   // what the matrix-core dequant scratch holds, kept apart because they
@@ -1482,6 +1544,14 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer txt, temb, mod, fmod;
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
+    // The banded layout's band of queries gathered head-major for Sol
+    // ([H, band, D], beside ob and oh); empty in the whole layout.
+    metal_compute::SharedBuffer qb;
+    // > 0: the BANDED layout (band_rows) -- x, the rope tables, the
+    // timestep indices and qh | kh | vh are the whole sequence's; nm,
+    // qkv, lora and ob | ff are one band's; proj (the final layer's, when
+    // the blocks are done) lies over qh | kh.
+    int band = 0;
   };
 
   // Choose the attention query tile for this model, ONCE, on the first
@@ -1493,7 +1563,7 @@ class MetalMiniMaxH3Transformer {
   void tune_attn_tile_(int seq, bool dense);   // arms the probe; see above
 
   bool ensure_scratch_(int seq, int n_text, int n_t,
-                       std::size_t arena_floor);
+                       std::size_t arena_floor, int band = 0);
   Scratch _s;
   int     _scratch_rebuilds = 0;
 
@@ -1613,6 +1683,10 @@ class MetalMiniMaxH3Transformer {
   bool _qmm_manual = false;       // set_qmm_tile/route called: tuning off
   int  _qmm_tune_count = 0;       // measurements taken, not cache hits
   GemmRoute _forced_route = GemmRoute::kAuto;
+  // The rows a GEMM's route is looked up at, when not its own: the
+  // banded forward's main blocks take the WHOLE sequence's routes (0:
+  // each GEMM its own M).
+  int _route_rows = 0;
   void tune_qmm_(int M);
   // The route for one projection: the forced one, else the tuned one,
   // else the fallback rule.
@@ -1755,6 +1829,23 @@ class MetalMiniMaxH3Transformer {
              !adaln.empty();
     }
   };
+  // An AdaLN CURVE BRANCH set -- LMS Sharp's, as Open-H3-Regenerate-2K
+  // ships it (`lora/sharp_curve_branches.safetensors`): per main block,
+  // `<block>.adaln_proj.linear.curve_A` [r, 8] and `.curve_B` [adaln_out,
+  // r], whose INPUT is not the projection's but an 8-D point c(t) read
+  // linearly off a 1025 x 8 table at the timestep (the table ComfyUI's
+  // pruned H3 replaces the AdaLN MLP with; `adaln_t_table`). The block's
+  // modulation gains slot.scale * B A c(t) for every distinct timestep of
+  // a forward. B A is formed once at bind, f32 [adaln_out, 8] -- 3.1 MB
+  // a block where B is 24.8 -- and stays resident when the blocks stream.
+  struct CurveSet {
+    std::vector<metal_compute::SharedBuffer> wc;   // per main block
+    std::vector<float> table;                      // [knots, 8]
+    int knots    = 0;
+    int branches = 0;
+    int rank     = 0;
+    bool empty() const { return branches == 0; }
+  };
   // One attached adapter. Slots are independent all the way down: their
   // own factors, their own live strength, and DISJOINT regions of the
   // shared [rows, rank] scratch, so the second adapter's first GEMM does
@@ -1768,6 +1859,8 @@ class MetalMiniMaxH3Transformer {
     // flow-map adapter's ENDPOINT embedder (empty for any other file).
     lora::HostFactors      time_in, time_out;
     lora::HostFactors      end_in, end_out;
+    // Set when the FILE carries AdaLN curve branches (see CurveSet).
+    CurveSet curve;
     // Set when the FILE is a flow-map adapter; load() then promotes it
     // to `_flow` with this slot's index.
     bool    two_time = false;
@@ -1847,6 +1940,15 @@ class MetalMiniMaxH3Transformer {
   // evicted block's given back.
   void keep_lora_(int layer);
   void drop_lora_(int layer);
+  // What keeping block `layer` keeps of its spilled factors (0 where
+  // nothing spilled) -- booked with the block by residency, wired with
+  // it, given back with it.
+  std::size_t lora_layer_bytes_(int layer) const;
+  std::size_t wire_lora_(int layer, bool on);
+  // Factor bytes residency holds for kept blocks: inside _resid.bytes(),
+  // and out of streamed_holding_bytes() -- they are the adapter's own
+  // declaration's, which books every factor.
+  std::size_t _lora_kept = 0;
 
   // The live adapters for one projection of one block, named by the
   // member that holds it. `refiner` picks which stack of blocks.
@@ -1898,6 +2000,21 @@ class MetalMiniMaxH3Transformer {
   // Read the adapter and bind its factors to the modules above. Called
   // from load() once the blocks exist.
   bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // A file of AdaLN curve branches into slot.curve (true, with `*took`
+  // set); `*took` false for a file that carries none.
+  bool bind_curves_(const std::string& path, LoraSlot& slot, bool* took,
+                    std::string* err);
+  // Add every live curve slot's delta to block L's modulation [n_t,
+  // adaln_out] in `mod`; false when none applies (nothing encoded).
+  bool curve_live_(int L) const;
+  void curve_apply_(metal_compute::ComputeEncoder& enc, int L,
+                    const metal_compute::SharedBuffer& mod, int n_t);
+  metal_compute::ComputeLibrary  _lib_regen;
+  metal_compute::ComputeFunction _fn_curve_add;
+  // This forward's c(t), [curve slot][n_t][8] f32, filled after the
+  // timestep embedding; `_curve_n_t` the n_t it holds.
+  metal_compute::SharedBuffer _curve_coords;
+  int _curve_n_t = 0;
   // The timestep-MLP half of a bind, both branches: the base embedder's
   // host factors for ANY adapter that carries them, then -- for a
   // flow-map adapter -- the endpoint embedder's and the header facts
@@ -2010,6 +2127,30 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_attn_main_i8_qk;
   metal_compute::SharedBuffer _attn_p_band;
   int _attn_band_nb = 0;
+  // The BANDED forward's (band_rows): its q / k / v written a band at a
+  // time into the whole-sequence head-major windows, and its attention a
+  // band of queries over every key -- one parameter block and pipeline
+  // for the full bands, one for the last; keyed by the sequence, the band
+  // and the kernel.
+  metal_compute::ComputeFunction _fn_trope_band;
+  // [full band | last band][0 dense, 1 int8 QK (per-block Q scales),
+  // 2 int8 QK (per-token Q: band 0's prompt and soundtrack rows under
+  // the int8 P*V), 3 int8 QK and P*V]; band 0's parameters past those
+  // rows (_attn_p_bandq_rest, as _attn_p_band is the whole sequence's).
+  metal_compute::ComputeFunction _fn_attn_bandv[2][4];
+  metal_compute::SharedBuffer _attn_p_bandq, _attn_p_bandq_tail;
+  metal_compute::SharedBuffer _attn_p_bandq_rest;
+  int _attn_bandq_seq = -1, _attn_bandq_rows = -1, _attn_bandq_nax = -1;
+  int _attn_bandq_sage = -1, _attn_bandq_nb = 0;
+  int _last_band = 0;
+  // Sol's last band: ONE band size per Sol object, whose parameter block
+  // and scratch are per object -- a narrower call on the same object
+  // would rewrite the parameters the full bands' encoded dispatches
+  // read, and rebuild the scratch they use.
+  std::unique_ptr<MetalSolAttention> _sol_tail;
+  // Sol's routed key blocks over the last forward's calls, for its
+  // report (a banded layer makes several calls).
+  long long _sol_routed_total = 0;
   // The streaming attention's two parameter blocks (text over text, media
   // over [cache ; text ; media]) and its pipelines, one per alignment
   // pair -- qL and kL move every chunk, so they are built on demand and

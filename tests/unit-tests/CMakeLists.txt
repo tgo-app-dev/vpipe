@@ -214,6 +214,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-diffusers-vae.cc
         minimax-h3-layout.cc
         minimax-h3-taomate.cc
+        minimax-h3-regenerate.cc
         vdn-geometry.cc
         vdn-delta-solve.cc
         vdn-linear-features.cc

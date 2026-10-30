@@ -142,6 +142,14 @@ std::string hf_path_from_local(const std::string& dir);
 // caller's existing "no checkpoint here" error still fires.
 std::string resolve_vae_dir(const std::string& root);
 
+// WHAT A CLAIM ON THE VAE in `vae_dir` (as resolve_vae_dir returns it)
+// NAMES: the directory itself -- except a released MiniMax-H3
+// `video_vae/`, whose weights sit in `source/`, which is what every H3
+// stage that opens the net names (video-ref-encoder, generate-video's
+// sizing). Named both ways, two claims on one VAE NEST, and the plan
+// keeps a nested pair's inner phase alone.
+std::string vae_claim_dir(const std::string& vae_dir);
+
 // Which BUILT-IN decoder runs the VAE in `vae_dir` (as resolve_vae_dir
 // returns it): "krea2", "flux2", "wan" or "minimax-h3", read off its
 // config.json `_class_name` (or a Comfy-Org file's `__metadata__`).

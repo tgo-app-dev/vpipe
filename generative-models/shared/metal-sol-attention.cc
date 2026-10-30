@@ -154,8 +154,11 @@ void
 sol_scratch_plan_(std::size_t H, std::size_t KVH, std::size_t T,
                   std::size_t D, std::size_t nq, std::size_t nk,
                   std::size_t tp, std::size_t bk, bool nax,
-                  std::vector<std::size_t>* out)
+                  std::vector<std::size_t>* out, std::size_t KT = 0)
 {
+  // A BAND attends T queries against KT keys (the square call: KT == T):
+  // the per-row buffers follow the queries, the key block list the keys.
+  if (KT == 0) { KT = T; }
   out->clear();
   // WHICH HEAD COUNT EACH BUFFER CARRIES, and it is not one of them.
   // The routing is decided per QUERY head -- flags, kept, the CSR, both
@@ -175,7 +178,7 @@ sol_scratch_plan_(std::size_t H, std::size_t KVH, std::size_t T,
   // The block LIST is worst-cased: one entry per key block of the exact
   // kernel per query block per head, because nothing bounds what the
   // routing keeps until it has run.
-  out->push_back(H * nq * (T / bk + 1) * 4);         // qb_blk
+  out->push_back(H * nq * (KT / bk + 1) * 4);        // qb_blk
   out->push_back(H * T * 4);                         // m_a
   out->push_back(H * T * 4);                         // l_a
   out->push_back(H * T * D * 2);                     // o_e
@@ -223,6 +226,42 @@ sol_geometry_(int heads, int kv_heads, int tokens, int d, int key_block,
 }
 
 }  // namespace
+
+std::size_t
+MetalSolAttention::band_private_bytes(int heads, int kv_heads, int q_tokens,
+                                      int k_tokens, int d, int key_block,
+                                      bool nax, std::size_t lend_a,
+                                      std::size_t lend_b)
+{
+  std::size_t H, KVH, T, D, nq, nk, tp, bk;
+  if (k_tokens <= 0 ||
+      !sol_geometry_(heads, kv_heads, q_tokens, d, key_block, nax, &H, &KVH,
+                     &T, &D, &nq, &nk, &tp, &bk)) {
+    return 0;
+  }
+  // The keys' blocks, as ensure_scratch_ counts them for a band.
+  const int blk = key_block > 0 ? key_block : sol::kBlock;
+  nk = (std::size_t)((k_tokens + blk - 1) / blk);
+  std::vector<std::size_t> plan;
+  sol_scratch_plan_(H, KVH, T, D, nq, nk, tp, bk, nax, &plan,
+                    (std::size_t)k_tokens);
+  const std::size_t cap[2] = {lend_a, lend_b};
+  std::size_t used[2] = {0, 0};
+  std::size_t priv = pinned_bytes();
+  for (std::size_t b : plan) {
+    bool placed = false;
+    for (int i = 0; i < 2 && !placed; ++i) {
+      if (cap[i] == 0) { continue; }
+      const std::size_t off = (used[i] + kCarveAlign - 1) & ~(kCarveAlign - 1);
+      if (off < cap[i] && b <= cap[i] - off) {
+        used[i] = off + b;
+        placed = true;
+      }
+    }
+    if (!placed) { priv += b; }
+  }
+  return priv;
+}
 
 std::size_t
 MetalSolAttention::scratch_bytes(int heads, int tokens, int d, int key_block,

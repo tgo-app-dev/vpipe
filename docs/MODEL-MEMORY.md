@@ -303,7 +303,9 @@ return { model_memory::weight_claim_streamable(_dit_dir, floor_bytes) };
 
 The floor is what a block-streaming DiT holds when it streams — its trunk
 plus the in-flight slots, not the checkpoint. The planner reports both
-columns (`N MB preloaded / M MB if every streamable component streams`),
+columns — everything held whole, and everything streamable at its floor
+(`N MB preloaded / M MB if every streamable component streams`, as the
+log words it),
 and a floor above the checkpoint's own size is clamped. Declaring one
 matters more than it looks: the refusal check in mechanism 7 runs against
 the floor column, so a streamable component that declares none is counted
@@ -846,7 +848,8 @@ MyStage::declare_memory() const
 
 Four things a stage says, and one it does not:
 
-- **`preload`** — what this holding costs when the box has room.
+- **`preload`** — what this holding comes to held whole: a streaming
+  DiT's whole checkpoint, which it converges on when the box has room.
 - **`floor`** — the least it can be held at while still being held: a
   streaming DiT's trunk plus its slots. Zero reads as `preload`.
 - **`releases`** — gone when this stage finishes, rather than held for the
@@ -954,7 +957,7 @@ most useful diagnostic on the page.
 > turned away. A model claimed with `weight_claims()` instead of
 > `weight_claim_streamable()` is judged at its full on-disk size however
 > carefully the plan describes its floor, so "everything streamable at
-> its floor" reads identically to "everything preloaded". MEASURED on a
+> its floor" reads identically to "everything held whole". MEASURED on a
 > two-model image graph: **15064 MB / 15064 MB before, 15064 MB / 2902 MB
 > after**, same graph, same box.
 >
@@ -975,32 +978,32 @@ model.
 Take the decision from `plan_streaming()`, never by hand. It also records
 the fact that streaming was chosen, which peers depend on (below).
 
-### Stream, then retain — the default on every box
+### Stream, then retain — on every box
 
 `plan_streaming()`'s `stream` is a verdict on the BOX: it is tight. The
 mechanism is a separate choice, `stream_blocks_by_default(plan)`, and it
 streams on a box with room too. The first forward reads each block as it
 needs it and block residency (mechanism 6) keeps it — with the wired pool
 on, the schedule's probe is the whole stack, so every block the first pass
-reads is kept. One forward in, the model holds what a preload would,
-having measured the box rather than trusted an estimate, without reading
-the checkpoint before the first step, and without holding it beside a
-text encoder that lets go after the prompt. `VPIPE_PRELOAD=1` preloads
-instead, for an A/B.
+reads is kept. One forward in, the model holds its whole stack, having
+measured the box rather than trusted an estimate, without reading the
+checkpoint before the first step, and without holding it beside a text
+encoder that lets go after the prompt.
 
 Keep the two apart in a stage. What only a TIGHT box wants keys on the
 verdict: deferring the load past the conditioning, revising the
 declaration down to the trunk, releasing the forward's scratch after a
 generation, and the streaming signal peers read. On a box with room the
-declaration stays at the preload, which is what the model converges to;
-the per-generation correction books it as it grows.
+declaration stays at the whole checkpoint (`preload`), which is what the
+model converges to; the per-generation correction books it as it grows.
 
-**A streamed block must BE the preloaded one** — the same weight layout,
-so the same kernels and the same bytes out. Where the preload transforms
-a weight at load (an int8 layout quantized from a dense weight, a w4
-pack's layout held), the slot keeps the raw source as its refill target
-and converts after every refill, and a promotion keeps what the preload
-keeps — the source dropped, a held layout converted. Ask admission and
+**A streamed block must BE the block it is when kept** — the same weight
+layout, so the same kernels and the same bytes out. Where the kept block
+holds a transform of its weights (an int8 layout quantized from a dense
+weight, a w4 pack's layout held), the slot keeps the raw source as its
+refill target and converts after every refill, and a promotion keeps
+what the kept block keeps — the source dropped, a held layout converted. Ask
+admission and
 the wired pool for that KEPT size, not the slot's. And run that keep step
 after EVERY promotion, not only inside the slot's clone: without slots
 (or when a slot cannot be allocated) `promote_into` MOVES the per-block
@@ -1011,10 +1014,11 @@ nothing left to serve and is given back
 generations; an eviction later rebuilds it).
 
 MEASURED on an M5 Ultra (256 GB), Qwen-Image-2.1 bf16 at 1024^2: a
-steady forward 562.1 ms streamed-then-kept against 561.5 preloaded,
-bit-identical, both holding 13571 MB; load + first forward 0.09 + 1.97 s
-against 4.5-5.0 + 0.57 s; a 20-step generation 18.85 s wall against
-18.0-19.6, at a peak RSS of 16.3 GB against 28.3. On the token int8
+steady forward 562.1 ms streamed-then-kept against 561.5 with the whole
+checkpoint read before the first step, bit-identical, both holding 13571
+MB; load + first forward 0.09 + 1.97 s against 4.5-5.0 + 0.57 s; a
+20-step generation 18.85 s wall against 18.0-19.6, at a peak RSS of 16.3
+GB against 28.3. On the token int8
 tier, the bf16 checkpoint and a w4 pack holding its layout are
 pixel-identical both ways (13.4 s against 14.2; 12.5-12.6 against 12.8).
 
@@ -1033,7 +1037,7 @@ text-to-speech backbone held as affine w8 group-64 keeps ~53% of its
 projections' bf16 bytes: MEASURED on an 8B, 9983 MB held against
 16193 MB on disk, with its logits as close to an fp32 reference as the
 reference's own bf16 run (rel-L2 0.0075 against 0.0070). Book the held
-size in `StageMemory::hold()` from the start — the plan's preload column
+size in `StageMemory::hold()` from the start — the plan's `preload` column
 is a stage's own statement — while the claims ledger, which sizes from
 disk, is corrected by `revise_declaration()` once the model has loaded.
 
@@ -1918,7 +1922,7 @@ Two things fall out of that:
   sets until `want` bytes have been given back.
 
 In plan terms (mechanism 4) this is what `reclaimable` means: floor zero,
-preload full. On a tight box it costs nothing; on a roomy one it costs
+`preload` full. On a tight box it costs nothing; on a roomy one it costs
 `preload` and saves the reload.
 
 > **Trap: pool BEFORE you drop the last reference.** `pool_weights()`
@@ -2223,7 +2227,7 @@ addressing changes. Every model wired to the cache is tested that way
 The cache's size is the engine's unless the host names it
 (`expert_cache_mb`, above), and then at most that. The loader applies the
 same rule `plan_streaming()` applies to a DiT, against TOTAL RAM so every stage
-answers the same way: when this model's full preload, its peers and its
+answers the same way: when this whole model, its peers and its
 scratch (its run, as the stage's plan booked it — see "K/V grows during
 the run") fit with the irreversible cushion (`kStreamHeadroom`), every
 expert stays resident; otherwise the cache is the experts' bytes minus
@@ -2232,8 +2236,9 @@ hold such a model and the LM loader apply it inside the host; it is not
 a call in the SDK.
 
 The claim follows: `weight_claim_streamable(dir, floor)` with the floor at
-`preload − experts + one layer of experts`, since that is the smallest
-cache the model runs with. `VPIPE_RAM_LIMIT_MB` simulates a smaller box;
+the whole model less its experts plus one layer of them, since that is
+the smallest cache the model runs with. `VPIPE_RAM_LIMIT_MB` simulates a
+smaller box;
 `VPIPE_MOE_EXPERT_CACHE_MB` overrides the size for an A/B (0 = resident).
 
 ### What it covers
@@ -2489,7 +2494,7 @@ holding in the memory plan:
 
 - **The floor** is set at load: the larger of what you report and the
   floor you declared. It stays there for the rest of the launch.
-- **The preload** follows each later read, as the resident set grows or
+- **`preload`** follows each later read, as the resident set grows or
   sheds. It never goes below that floor.
 
 A block-streaming family usually builds its slot pair on the first
@@ -2630,7 +2635,8 @@ If it streams blocks:
 - [ ] The `env_off` A/B has actually been RUN. It is the only thing that
       exercises the no-slot path, and a defect there is a GPU fault
       partway down the stack rather than a wrong answer.
-- [ ] Streamed output is **byte-identical** to preloaded output. Every
+- [ ] Streamed output is **byte-identical** to the output with every
+      block kept. Every
       transform after a read — a permutation, a split, a fold — is silent
       when it is wrong, so closeness is not a bar.
 - [ ] `set_residency_reserve()` is actually called — with a real figure, or

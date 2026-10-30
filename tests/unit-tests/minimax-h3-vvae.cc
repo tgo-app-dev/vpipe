@@ -47,6 +47,7 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
+#include "generative-models/weight-set.h"
 
 #include <algorithm>
 #include <chrono>
@@ -340,6 +341,301 @@ TEST(minimax_h3_vvae, encode_matches_golden)
 // meaningful -- but a transposed axis or a mismatched frame count
 // destroys the correlation outright, which is the failure being looked
 // for.
+// Each half loads at its first use and holds what the plan books for it
+// (held_bytes, off the headers): a load holds neither, an encode adds the
+// encoder alone, a decode the decoder. An encoding stage held the 4.6 GB
+// decoder before, never running it.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_vvae, each_half_loads_at_its_first_use)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+  auto ws = genai::WeightSet::open(
+      MetalMiniMaxH3VideoVae::resolve_vae_dir(root), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  if (!ws) { return; }
+  auto m = MetalMiniMaxH3VideoVae::load(ws, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (!m) { return; }
+  const std::size_t at_load = ws->stats().bytes;
+  const int T = 5, H = 256, W = 256, IC = cfg.in_channels;
+  const std::size_t n = (std::size_t)IC * T * H * W;
+  SharedBuffer xb = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!xb.empty());
+  std::memset(xb.contents(), 0, n * 2);
+  SharedBuffer mom = m->encode(xb, T, H, W, &err);
+  ASSERT_TRUE(!mom.empty());
+  const std::size_t after_enc = ws->stats().bytes;
+  const int lt = m->encoded_frames(T);
+  const int lh = H / cfg.patch, lw = W / cfg.patch;
+  SharedBuffer zb = mc->make_shared_buffer(
+      (std::size_t)lt * lh * lw * cfg.z_channels * 2);
+  std::memcpy(zb.contents(), mom.contents(), zb.byte_size());
+  SharedBuffer rgb = m->decode(zb, lt, lh, lw, &err);
+  ASSERT_TRUE(!rgb.empty());
+  const std::size_t after_dec = ws->stats().bytes;
+  using Half = MetalMiniMaxH3VideoVae::Half;
+  const std::size_t enc = MetalMiniMaxH3VideoVae::held_bytes(root,
+                                                             Half::kEncoder);
+  const std::size_t dec = MetalMiniMaxH3VideoVae::held_bytes(root,
+                                                             Half::kDecoder);
+  std::printf("[minimax_h3_vvae] held: at load %zu, encoder %zu (booked "
+              "%zu), decoder %zu (booked %zu)\n", at_load,
+              after_enc - at_load, enc, after_dec - after_enc, dec);
+  EXPECT_TRUE(at_load == 0);
+  EXPECT_TRUE(after_enc - at_load == enc);
+  EXPECT_TRUE(after_dec - after_enc == dec);
+}
+
+// decode_video writes each chunk into ONE clip as it goes, where it once
+// kept every chunk's piece and copied them into a second whole clip at the
+// end (two copies of the decode at the peak). The clip must be the old
+// one to the bit: restated here as it was -- every chunk through decode()
+// (a frame that fits one tile is not tiled), pieces kept, each chunk's
+// head cross-faded with the previous chunk's tail, concatenated, the pad
+// trimmed -- over a clip of several chunks.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_vvae, decode_video_is_its_chunks_in_place)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  // tile 0: the checkpoint's 256-pixel tile over a frame it covers whole;
+  // else that tile size (overlap a quarter) over a 2 x 2 grid of tiles.
+  for (const int tile : {0, 64}) {
+    MetalMiniMaxH3VideoVae::Config c;
+    std::string err;
+    ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, c, &err));
+    if (tile > 0) {
+      c.tile_size = tile;
+      c.tile_overlap_min = tile / 4;
+    }
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, c);
+    ASSERT_TRUE(m != nullptr);
+    if (!m) { return; }
+    const int LT = 14, lh = tile > 0 ? 6 : 4, lw = tile > 0 ? 8 : 6;
+    const int ZC = c.z_channels, OC = c.out_channels;
+    const std::size_t lplane = (std::size_t)lh * lw;
+    std::vector<std::uint16_t> zv((std::size_t)ZC * LT * lplane);
+    for (std::size_t i = 0; i < zv.size(); ++i) {
+      zv[i] = f32_to_bf16_(std::sin(0.37f * (float)i) * 0.9f);
+    }
+    SharedBuffer zb = mc->make_shared_buffer(zv.size() * 2);
+    std::memcpy(zb.contents(), zv.data(), zv.size() * 2);
+    int F = 0;
+    SharedBuffer got = m->decode_video(zb, LT, lh, lw, &F, &err);
+    ASSERT_TRUE(!got.empty());
+    if (got.empty()) { return; }
+
+    // ---- the old algorithm ----
+    const int tcs = c.tokens_per_chunk(), td = c.token_drop, tr = c.patch_t;
+    const int tov = c.token_overlap(), fpp = c.frame_pre_pad();
+    const int fov = c.frame_overlap(), cnf = tcs * tr;
+    const int nt = LT + td;
+    const int pad = ((-nt % tcs) + tcs) % tcs;
+    const int chunks = (nt + pad) / tcs - (td > 0 ? 1 : 0);
+    const int zt = LT + pad, span = tcs + tov, cf = span * tr;
+    const std::size_t plane = (std::size_t)lh * c.patch * lw * c.patch;
+    struct Piece { std::vector<std::uint16_t> v; int n = 0; };
+    std::vector<Piece> pieces;
+    Piece overlap;
+    for (int i = 0; i < chunks; ++i) {
+      SharedBuffer sub = mc->make_shared_buffer((std::size_t)ZC * span *
+                                                lplane * 2);
+      auto* d = static_cast<std::uint16_t*>(sub.contents());
+      for (int ch = 0; ch < ZC; ++ch) {
+        for (int t = 0; t < span; ++t) {
+          const int st = std::min(std::min(i * tcs + t, zt - 1), LT - 1);
+          std::memcpy(d + ((std::size_t)ch * span + t) * lplane,
+                      zv.data() + ((std::size_t)ch * LT + st) * lplane,
+                      lplane * 2);
+        }
+      }
+      // The tiled decode as it was: every tile decoded and kept, then each
+      // cross-faded with the ORIGINAL tile above, then the one to its left,
+      // and its region written.
+      const int H = lh * c.patch, W = lw * c.patch;
+      const auto ys = minimax_h3::split_tiles(H, c.tile_size,
+                                              c.tile_overlap_min, c.patch);
+      const auto xs = minimax_h3::split_tiles(W, c.tile_size,
+                                              c.tile_overlap_min, c.patch);
+      const int rows = (int)ys.start.size(), cols = (int)xs.start.size();
+      std::vector<std::uint16_t> chunk((std::size_t)OC * cf * plane);
+      if (rows <= 1 && cols <= 1) {
+        SharedBuffer one = m->decode(sub, span, lh, lw, &err);
+        ASSERT_TRUE(!one.empty());
+        if (one.empty()) { return; }
+        std::memcpy(chunk.data(), one.contents(), chunk.size() * 2);
+      } else {
+        std::vector<std::vector<std::uint16_t>> tl;
+        for (int ti = 0; ti < rows; ++ti) {
+          for (int tj = 0; tj < cols; ++tj) {
+            const int y0 = ys.start[ti] / c.patch, th = ys.length[ti] / c.patch;
+            const int x0 = xs.start[tj] / c.patch, tw = xs.length[tj] / c.patch;
+            SharedBuffer st = mc->make_shared_buffer((std::size_t)ZC * span *
+                                                     th * tw * 2);
+            auto* sd = static_cast<std::uint16_t*>(st.contents());
+            for (int ch = 0; ch < ZC; ++ch) {
+              for (int t = 0; t < span; ++t) {
+                for (int r = 0; r < th; ++r) {
+                  std::memcpy(sd + (((std::size_t)ch * span + t) * th + r) * tw,
+                              d + ((std::size_t)ch * span + t) * lplane +
+                                  (std::size_t)(y0 + r) * lw + x0,
+                              (std::size_t)tw * 2);
+                }
+              }
+            }
+            SharedBuffer dt = m->decode(st, span, th, tw, &err);
+            ASSERT_TRUE(!dt.empty());
+            if (dt.empty()) { return; }
+            const auto* dp = static_cast<const std::uint16_t*>(dt.contents());
+            tl.emplace_back(dp, dp + (std::size_t)OC * cf * th * c.patch * tw *
+                                         c.patch);
+          }
+        }
+        std::vector<float> tmp;
+        for (int ti = 0; ti < rows; ++ti) {
+          const int th = ys.length[ti], oy = ys.start[ti];
+          for (int tj = 0; tj < cols; ++tj) {
+            const int tw = xs.length[tj], ox = xs.start[tj];
+            const auto& cur = tl[(std::size_t)(ti * cols + tj)];
+            const std::size_t tp = (std::size_t)th * tw;
+            tmp.resize((std::size_t)OC * cf * tp);
+            for (std::size_t k = 0; k < tmp.size(); ++k) {
+              tmp[k] = bf16_to_f32_(cur[k]);
+            }
+            if (ti > 0) {
+              const int ph = ys.length[ti - 1];
+              const int ext = std::min(std::min(ys.overlap[ti - 1], ph), th);
+              const auto& up = tl[(std::size_t)((ti - 1) * cols + tj)];
+              for (int q = 0; q < OC * cf; ++q) {
+                for (int r = 0; r < ext; ++r) {
+                  const float wb = (float)r / (float)ext;
+                  for (int x = 0; x < tw; ++x) {
+                    const std::size_t k = (std::size_t)q * tp + r * tw + x;
+                    tmp[k] = (1.0f - wb) *
+                                 bf16_to_f32_(up[(std::size_t)q * ph * tw +
+                                                 (ph - ext + r) * tw + x]) +
+                             wb * tmp[k];
+                  }
+                }
+              }
+            }
+            if (tj > 0) {
+              const int pw = xs.length[tj - 1];
+              const int ext = std::min(std::min(xs.overlap[tj - 1], pw), tw);
+              const auto& lf = tl[(std::size_t)(ti * cols + tj - 1)];
+              for (int q = 0; q < OC * cf; ++q) {
+                for (int r = 0; r < th; ++r) {
+                  for (int x = 0; x < ext; ++x) {
+                    const float wb = (float)x / (float)ext;
+                    const std::size_t k = (std::size_t)q * tp + r * tw + x;
+                    tmp[k] = (1.0f - wb) *
+                                 bf16_to_f32_(lf[(std::size_t)q * th * pw +
+                                                 r * pw + (pw - ext + x)]) +
+                             wb * tmp[k];
+                  }
+                }
+              }
+            }
+            const int wh = ti + 1 < rows ? th - ys.overlap[ti] : th;
+            const int ww = tj + 1 < cols ? tw - xs.overlap[tj] : tw;
+            for (int q = 0; q < OC * cf; ++q) {
+              for (int r = 0; r < wh; ++r) {
+                for (int x = 0; x < ww; ++x) {
+                  chunk[(std::size_t)q * plane + (oy + r) * W + (ox + x)] =
+                      f32_to_bf16_(tmp[(std::size_t)q * tp + r * tw + x]);
+                }
+              }
+            }
+          }
+        }
+      }
+      const std::uint16_t* cd = chunk.data();
+      for (int j = 0; j < (td > 0 ? 2 : 1); ++j) {
+        const int fs = j * cnf, avail = cf - fs;
+        if (avail <= fpp) { continue; }
+        Piece p;
+        p.n = std::min(cnf, avail) - fpp;
+        p.v.resize((std::size_t)OC * p.n * plane);
+        for (int ch = 0; ch < OC; ++ch) {
+          std::memcpy(p.v.data() + (std::size_t)ch * p.n * plane,
+                      cd + ((std::size_t)ch * cf + fs + fpp) * plane,
+                      (std::size_t)p.n * plane * 2);
+        }
+        if (j == 0) {
+          if (overlap.n > 0) {
+            const int ext = std::min(std::min(overlap.n, p.n), fov);
+            for (int ch = 0; ch < OC; ++ch) {
+              for (int f = 0; f < ext; ++f) {
+                const float wb = (float)f / (float)ext;
+                const std::size_t pb = ((std::size_t)ch * p.n + f) * plane;
+                const std::size_t ob = ((std::size_t)ch * overlap.n +
+                                        (overlap.n - ext + f)) * plane;
+                for (std::size_t q = 0; q < plane; ++q) {
+                  p.v[pb + q] = f32_to_bf16_(
+                      (1.0f - wb) * bf16_to_f32_(overlap.v[ob + q]) +
+                      wb * bf16_to_f32_(p.v[pb + q]));
+                }
+              }
+            }
+            overlap = Piece{};
+          }
+          pieces.push_back(std::move(p));
+        } else {
+          overlap = std::move(p);
+        }
+      }
+    }
+    if (overlap.n > 0) { pieces.push_back(std::move(overlap)); }
+    int frames = 0;
+    for (const Piece& p : pieces) { frames += p.n; }
+    int drop = 0;
+    for (int k = 0; k < pad; ++k) {
+      const int intra = c.clip_length % tr;
+      drop += (intra != 0 && (LT + k) % tcs == 0) ? intra : tr;
+    }
+    const int keep = frames - drop;
+    std::vector<std::uint16_t> want((std::size_t)OC * keep * plane);
+    int at = 0;
+    for (const Piece& p : pieces) {
+      for (int f = 0; f < p.n && at + f < keep; ++f) {
+        for (int ch = 0; ch < OC; ++ch) {
+          std::memcpy(want.data() + ((std::size_t)ch * keep + at + f) * plane,
+                      p.v.data() + ((std::size_t)ch * p.n + f) * plane,
+                      plane * 2);
+        }
+      }
+      at += p.n;
+    }
+    const bool same = F == keep && got.byte_size() >= want.size() * 2 &&
+                      std::memcmp(got.contents(), want.data(),
+                                  want.size() * 2) == 0;
+    const int ty = (int)minimax_h3::split_tiles(lh * c.patch, c.tile_size,
+                                                c.tile_overlap_min, c.patch)
+                       .start.size();
+    const int tx = (int)minimax_h3::split_tiles(lw * c.patch, c.tile_size,
+                                                c.tile_overlap_min, c.patch)
+                       .start.size();
+    std::printf("[minimax_h3_vvae] %d latents in %d chunks -> %d frames, "
+                "%d x %d tiles: the in-place clip %s the kept pieces'\n",
+                LT, chunks, F, ty, tx, same ? "IS" : "is NOT");
+    EXPECT_TRUE(tile == 0 || ty * tx > 1);
+    EXPECT_TRUE(chunks >= 2);
+    EXPECT_TRUE(same);
+  }
+}
+
 TEST(minimax_h3_vvae, encode_decode_round_trip)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");

@@ -160,6 +160,8 @@ set(LOCAL_SOURCES
   minimax-h3/metal-minimax-h3-transformer.cc
   minimax-h3/metal-minimax-h3-video-vae.cc
   minimax-h3/metal-minimax-h3-audio-vae.cc
+  minimax-h3/metal-minimax-h3-fast-vae.cc
+  minimax-h3/metal-minimax-h3-latent-upscaler.cc
   minimax-h3/minimax-h3-scheduler.cc
   minimax-h3/minimax-h3-text-encoder.cc
   minimax-h3/minimax-h3-denoise.cc

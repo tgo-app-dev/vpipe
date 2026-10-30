@@ -1168,7 +1168,11 @@ TEST(generate_video, family_generic_surface)
   EXPECT_TRUE(std::string(sp.iports[8].name) == "ref_audio_rows");
   EXPECT_TRUE(std::string(sp.iports[9].name) == "model_config");
   EXPECT_TRUE(std::string(sp.iports[10].name) == "audio_conditioning");
-  EXPECT_TRUE(sp.iports.size() == 11);
+  EXPECT_TRUE(sp.iports.size() == 12);
+  if (sp.iports.size() == 12) {
+    // A MiniMax-H3 refine's clip (Open-H3-Regenerate-2K).
+    EXPECT_TRUE(std::string(sp.iports[11].name) == "init_latent");
+  }
   // The tag is the whole compatibility check between a config source and
   // this port: the composer offers a source only if it matches.
   EXPECT_TRUE(port_tags_compatible("model-config",

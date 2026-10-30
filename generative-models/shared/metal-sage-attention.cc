@@ -361,6 +361,7 @@ MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
   // them.
   drop_residency_();
   _ready = false;
+  _keys_ready = false;
 
   const std::size_t H = (std::size_t)heads, D = (std::size_t)d;
   const std::size_t KH = (std::size_t)kv_heads;
@@ -432,6 +433,184 @@ MetalSageAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
 }
 
 bool
+MetalSageAttention::prepare_keys(ComputeEncoder& e, const Operand& k,
+                                 int heads, int kv_heads, int q_tokens,
+                                 int k_tokens, int d, int bq, int bk,
+                                 const sage::Config& cfg, std::string* err,
+                                 const Operand* v)
+{
+  _ready = false;
+  _pv8_ready = false;
+  _keys_ready = false;
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  if (_mc == nullptr) { return fail("sage_attn not loaded"); }
+  const std::string bad =
+      check_geometry_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk);
+  if (!bad.empty()) { return fail(bad); }
+  if (k.buf == nullptr || k.buf->empty()) {
+    return fail("sage_attn: no k");
+  }
+  if (k.row <= 0 || k.head <= 0) {
+    return fail("sage_attn: k strides must be positive");
+  }
+  const bool pv8 = pv8_for(cfg) && v != nullptr && v->buf != nullptr &&
+                   !v->buf->empty();
+  if (pv8 && (v->row <= 0 || v->head <= 0)) {
+    return fail("sage_attn: v strides must be positive");
+  }
+  if (!ensure_scratch_(heads, kv_heads, q_tokens, k_tokens, d, bq, bk, pv8,
+                       /*exact=*/false, err)) {
+    return false;
+  }
+  const unsigned D = (unsigned)d;
+  const unsigned KH = (unsigned)kv_heads;
+  const int chunks = sage::kMeanChunks;
+  const int nk = sage::key_blocks(k_tokens, bk);
+  if (cfg.smooth_k) {
+    e.set_function(_fn_sum);
+    e.set_buffer(0, *k.buf);
+    e.set_buffer(1, _kmp);
+    e.set_constant(2, k_tokens);
+    e.set_constant(3, d);
+    e.set_constant(4, k.row);
+    e.set_constant(5, (unsigned)k.off);
+    e.set_constant(6, chunks);
+    e.set_constant(7, k.head);
+    e.dispatch({D, KH, (unsigned)chunks}, {D, 1, 1});
+
+    e.set_function(_fn_reduce);
+    e.set_buffer(0, _kmp);
+    e.set_buffer(1, _km);
+    e.set_constant(2, k_tokens);
+    e.set_constant(3, d);
+    e.set_constant(4, chunks);
+    e.dispatch({D, KH, 1}, {D, 1, 1});
+  }
+  e.set_function(_fn_quant);
+  e.set_buffer(0, *k.buf);
+  e.set_buffer(1, _km);
+  e.set_buffer(2, _k8);
+  e.set_buffer(3, _ks);
+  e.set_constant(4, k_tokens);
+  e.set_constant(5, d);
+  e.set_constant(6, k.row);
+  e.set_constant(7, (unsigned)k.off);
+  e.set_constant(8, bk);
+  e.set_constant(9, cfg.smooth_k ? 1 : 0);
+  e.set_constant(10, k.head);
+  e.dispatch({256u, KH, (unsigned)nk}, {256, 1, 1});
+  if (pv8) {
+    e.set_function(_fn_sum);
+    e.set_buffer(0, *v->buf);
+    e.set_buffer(1, _vmp);
+    e.set_constant(2, k_tokens);
+    e.set_constant(3, d);
+    e.set_constant(4, v->row);
+    e.set_constant(5, (unsigned)v->off);
+    e.set_constant(6, chunks);
+    e.set_constant(7, v->head);
+    e.dispatch({D, KH, (unsigned)chunks}, {D, 1, 1});
+
+    e.set_function(_fn_reduce);
+    e.set_buffer(0, _vmp);
+    e.set_buffer(1, _vm);
+    e.set_constant(2, k_tokens);
+    e.set_constant(3, d);
+    e.set_constant(4, chunks);
+    e.dispatch({D, KH, 1}, {D, 1, 1});
+
+    e.set_function(_fn_vam);
+    e.set_buffer(0, *v->buf);
+    e.set_buffer(1, _vm);
+    e.set_buffer(2, _vmp);
+    e.set_constant(3, k_tokens);
+    e.set_constant(4, d);
+    e.set_constant(5, v->row);
+    e.set_constant(6, (unsigned)v->off);
+    e.set_constant(7, chunks);
+    e.set_constant(8, v->head);
+    e.dispatch({D, KH, (unsigned)chunks}, {D, 1, 1});
+
+    e.set_function(_fn_var);
+    e.set_buffer(0, _vmp);
+    e.set_buffer(1, _vs);
+    e.set_constant(2, d);
+    e.set_constant(3, chunks);
+    e.dispatch({D, KH, 1}, {D, 1, 1});
+
+    e.set_function(_fn_vq8);
+    e.set_buffer(0, *v->buf);
+    e.set_buffer(1, _vm);
+    e.set_buffer(2, _vs);
+    e.set_buffer(3, _v8);
+    e.set_constant(4, k_tokens);
+    e.set_constant(5, d);
+    e.set_constant(6, v->row);
+    e.set_constant(7, (unsigned)v->off);
+    e.set_constant(8, v->head);
+    e.dispatch({D, KH, (unsigned)((k_tokens + 7) / 8)}, {D, 1, 1});
+  }
+  _keys_pv8 = pv8;
+  _keys_ready = true;
+  return true;
+}
+
+bool
+MetalSageAttention::prepare_queries(ComputeEncoder& e, const Operand& q,
+                                    int q_tokens, std::string* err)
+{
+  _ready = false;
+  _pv8_ready = false;
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  if (!_keys_ready) { return fail("sage_attn: queries before keys"); }
+  if (q_tokens <= 0 || q_tokens > _qt) {
+    return fail("sage_attn: a band wider than the keys' prologue sized");
+  }
+  if (q.buf == nullptr || q.buf->empty() || q.row <= 0 || q.head <= 0) {
+    return fail("sage_attn: no q, or q strides not positive");
+  }
+  const unsigned H = (unsigned)_heads;
+  if (_keys_pv8) {
+    e.set_function(_fn_qtok);
+    e.set_buffer(0, *q.buf);
+    e.set_buffer(1, _q8);
+    e.set_buffer(2, _qs);
+    e.set_constant(3, q_tokens);
+    e.set_constant(4, _d);
+    e.set_constant(5, q.row);
+    e.set_constant(6, (unsigned)q.off);
+    e.set_constant(7, q.head);
+    e.set_buffer(8, _km);
+    e.set_constant(9, 0);
+    e.dispatch({256u, H, (unsigned)((q_tokens + 63) / 64)}, {256, 1, 1});
+  } else {
+    e.set_function(_fn_quant);
+    e.set_buffer(0, *q.buf);
+    e.set_buffer(1, _km);
+    e.set_buffer(2, _q8);
+    e.set_buffer(3, _qs);
+    e.set_constant(4, q_tokens);
+    e.set_constant(5, _d);
+    e.set_constant(6, q.row);
+    e.set_constant(7, (unsigned)q.off);
+    e.set_constant(8, _bq);
+    e.set_constant(9, 0);
+    e.set_constant(10, q.head);
+    e.dispatch({256u, H, (unsigned)sage::query_blocks(q_tokens, _bq)},
+               {256, 1, 1});
+  }
+  _ready = true;
+  _pv8_ready = _keys_pv8;
+  return true;
+}
+
+bool
 MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
                             const Operand& k, int heads, int kv_heads,
                             int q_tokens, int k_tokens, int d, int bq, int bk,
@@ -440,6 +619,7 @@ MetalSageAttention::prepare(ComputeEncoder& e, const Operand& q,
 {
   _ready = false;
   _pv8_ready = false;
+  _keys_ready = false;
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
     return false;

@@ -473,7 +473,7 @@ Rounds were interleaved, with the order reversed in the second:
 | converted, 8-bit | 17.9 / 17.9 | 22.0 GB | 4.09 / 4.08 | 16.4 GB |
 | converted, bf16 | 16.8 / 16.9 | 28.1 GB | 4.01 / 3.94 | 17.2–18.0 GB |
 
-The M4 Pro ran GPU-only with the DiT preloaded. The M5 Pro ran the stock
+The M4 Pro ran GPU-only with every DiT block resident. The M5 Pro ran the stock
 graph (`i8_gemm` on, blocks streamed from its internal SSD). The expansion
 costs 0–4% against bf16 on the M4, and nothing measurable on the M5. The
 file runs no slower than its 8-bit conversion on either box, and holds the

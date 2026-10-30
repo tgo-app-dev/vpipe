@@ -100,6 +100,15 @@ struct DenoiseRequest {
   // upstream's loader configures the pipeline from the file -- and
   // `num_steps` is ignored. An explicit grid here still wins.
   std::vector<float> sigma_grid;
+  // A REFINE -- Open-H3-Regenerate-2K's: the video's sigmas AS RUN (no
+  // shift, overriding `num_steps` and `sigma_grid`), stepped by the
+  // reference's plain Euler (MiniMaxH3Scheduler::step_plain), and the
+  // AUDIO HELD CLEAN: every audio row rides at `condition_audio_timestep`
+  // and none is stepped -- the release conditions its refine on a fixed
+  // encoded silence. The caller puts the re-noised state in `video`
+  // itself, (1 - sigma[0]) x + sigma[0] noise. A flow-map adapter is
+  // refused: its (t, r) pairs follow a schedule this replaces.
+  std::vector<double> refine_sigmas;
   // Leading steps whose attention runs DENSE with Sol-Attn on (see
   // Step::dense_attention). 0 routes every step.
   int sol_dense_steps = 0;

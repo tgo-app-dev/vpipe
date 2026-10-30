@@ -111,6 +111,7 @@ public:
   // The VAE this stage loads. Small next to the DiT and the encoder,
   // but it is resident during a decode and nothing else declares it.
   std::vector<ResourceClaim> declare_resources() const override;
+  std::vector<ResourceClaim> decide_resources() const override;
   // See Stage::declare_memory.
   StageMemory declare_memory() const override;
 
@@ -158,6 +159,9 @@ private:
   // frames, and the DiT concatenates it channel-wise onto a noise
   // latent of that shape.
   int _frames = 81;
+  // `posterior: sample` (a MiniMax-H3 clip) and its seed.
+  bool _posterior_sample = false;
+  std::uint64_t _posterior_seed = 42;
   // How to read an F32 RGB beat's values -- see kInputRangeDoc. Held as
   // the scale/offset that map a raw sample to the VAE's [-1, 1], so the
   // string is parsed once at config time and never at a pixel.
@@ -214,6 +218,7 @@ private:
   bool _quiet_reload  = false;   // reload logs at debug, not info
   void load_note_(const VpipeFormat& msg) const;
   void unload_vae_();
+  std::size_t h3_held_bytes_(const std::string& vae_dir) const;
   void reload_vae_();
 #endif
   // The acceleration settings as a BAG, for a registered VAE family.

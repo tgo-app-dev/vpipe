@@ -65,6 +65,39 @@ class MiniMaxH3Scheduler {
   // diffusers' own check on a grid handed to set_timesteps(sigmas=).
   bool set_sigmas(const std::vector<float>& raw);
 
+  // A schedule given AS RUN: `sigmas` installed verbatim, no shift --
+  // Open-H3-Regenerate-2K's refine names its sigmas outright. Strictly
+  // decreasing from at most 1 to exactly 0. Each timestep is 1 - sigma
+  // taken in double and rounded once, as the reference's Python-float
+  // sigmas give it.
+  bool set_sigmas_as_run(const std::vector<double>& sigmas);
+
+  // Open-H3-Regenerate-2K's refine sigmas (open_h3/sigmas.py), in
+  // double as the reference holds them. `start` < 0 is the release's
+  // own choice: 3 steps run {0.909375, 6/7, 2/3, 0} (the shift-6 points
+  // of a 4-step grid from 1, started at 0.909375), 2 steps run
+  // shifted_grid(0.7, 2), any other count shifted_grid(0.909375, steps).
+  // A `start` in (0, 1] runs shifted_grid(start, steps):
+  //
+  //   raw = start / (shift - (shift - 1) start)
+  //   [start] + [shift x / (1 + (shift - 1) x), x = raw (1 - i / steps),
+  //              i = 1 .. steps - 1] + [0]
+  //
+  // Empty when steps < 1 or start > 1.
+  static std::vector<double> refine_sigmas(int steps, double start = -1.0,
+                                           double shift = 6.0);
+
+  // The plain Euler step a loop over Python-float sigmas takes:
+  //
+  //   x += float(sigma[i] - sigma[i+1]) * v
+  //
+  // the product rounded before the add (torch's two ops), with the
+  // difference taken in double -- the release's refine. Not step()'s
+  // ratio form, which is the same step in exact arithmetic and rounds
+  // differently. Needs set_sigmas_as_run().
+  bool step_plain(const float* velocity, int step_index, float* x,
+                  std::size_t n) const;
+
   // torch.linspace(1, 0, num_points) in float32, at torch's rounding --
   // the RAW grid set_timesteps shifts. Exposed for a distillation that
   // keeps a SUBSET of a longer schedule (TaoMate-H3 runs points 0, 16,
@@ -139,6 +172,8 @@ class MiniMaxH3Scheduler {
   std::vector<float> _sigmas;
   std::vector<float> _timesteps;
   std::vector<float> _endpoints;
+  // set_sigmas_as_run's sigmas as given; empty otherwise.
+  std::vector<double> _sigmas_d;
 
   // timesteps / endpoints from `_sigmas`, float32 as the reference does.
   void derive_();

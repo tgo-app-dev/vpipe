@@ -343,6 +343,13 @@ private:
   // there -- the denoise phase's scratch in both ledgers.
   int h3_plan_seq_() const;
   std::size_t h3_forward_scratch_bytes_(const std::string& dit) const;
+  // The runtime adapters the model config names, resolved as the load
+  // resolves them -- read off the pre-launch constant, so the plan books
+  // their factors and their scratch before anything loads.
+  std::vector<std::string> h3_plan_lora_files_() const;
+  // The graph refines a clip (init_latent wired): no soundtrack leaves
+  // the stage, and the silence it holds is encoded at the denoise.
+  bool refines_() const;
   void apply_h3_ane_();
   int           _height = 480;
   int           _width  = 832;
@@ -394,10 +401,11 @@ private:
   // one, so it is read with each fresh conditioning and held with it.
   GenerationInput _cond_in, _sampler_in, _scheduler_in, _cfg_in;
   GenerationInput _ref0_in, _ref1_in, _ref_video_in, _ref_audio_in,
-                  _audio_cond_in;
+                  _audio_cond_in, _init_in;
   std::unique_ptr<BeatPayloadIntf> _cond_beat, _neg_beat;
   std::unique_ptr<BeatPayloadIntf> _ref0_beat, _ref1_beat, _ref_video_beat,
-                                   _ref_audio_beat, _audio_cond_beat;
+                                   _ref_audio_beat, _audio_cond_beat,
+                                   _init_beat;
 
   // The last model-config beat, held UNPARSED. Which family's parser
   // reads it is not known until the checkpoint resolves, and a config
@@ -625,10 +633,33 @@ private:
                             const class TensorBeatPayload* audio_rows,
                             H3References* out) const;
 
+  // A REFINE request (iport11, Open-H3-Regenerate-2K): the clip to put
+  // back to `sigmas[0]` and denoise again, [z, T, lh, lw] whitened, the
+  // frame count its latents stand for, the soundtrack it is conditioned
+  // on (encoded silence, held clean) and the sigmas as run.
+  struct H3Refine {
+    const float* latent = nullptr;
+    int lt = 0, lh = 0, lw = 0;
+    int frames = 0;                  // aligned pixel frames (17n + 5)
+    std::vector<float>  audio_rows;  // [2 * alat, 32], DiT space
+    std::vector<double> sigmas;
+  };
   bool run_h3_(const void* cond, int text_rows, const float* ref,
                int ref_frames, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
-               std::vector<float>* audio_out, std::vector<int>* audio_shape);
+               std::vector<float>* audio_out, std::vector<int>* audio_shape,
+               const H3Refine* refine = nullptr);
+  // The soundtrack a refine is conditioned on: `frames` frames of
+  // silence at `fps` through the checkpoint's audio VAE (its posterior
+  // mean), whitened into DiT rows -- what the release's encode_silence
+  // makes. Cached per length; the VAE is loaded for it and let go.
+  bool h3_silence_rows_(int frames, double fps, std::vector<float>* rows,
+                        int* alat);
+  bool _refine_ref2va_said = false, _refine_audio_said = false;
+  std::vector<float> _h3_silence;
+  int    _h3_silence_frames = 0;
+  double _h3_silence_fps    = 0.0;
+  int    _h3_silence_alat   = 0;
 
   // TaoMate-H3's streaming method (generative-models/minimax-h3/
   // minimax-h3-taomate.h): the base model's soundtrack, then the
@@ -660,6 +691,8 @@ private:
   // that method is const by the Stage contract and this is a note to
   // self, not state the plan reads back.
   mutable std::string _dit_dir_declared_;
+  // The adapter files decide_resources() phased with it.
+  mutable std::vector<std::string> _lora_files_declared_;
   bool _unload_idle     = false;
   bool _unload_resolved = false;
 #endif

@@ -1161,6 +1161,20 @@ released_h3_video_vae_(const std::string& root)
 }  // namespace
 
 std::string
+vae_claim_dir(const std::string& vae_dir)
+{
+  // released_h3_video_vae_'s test, one level in: the outer config and
+  // the weights a level down.
+  std::error_code ec;
+  const fs::path p(vae_dir);
+  if (fs::exists(p / "source" / "model.safetensors", ec) &&
+      fs::exists(p / "config.json", ec)) {
+    return (p / "source").string();
+  }
+  return vae_dir;
+}
+
+std::string
 resolve_vae_dir(const std::string& root)
 {
   const std::string h3 = released_h3_video_vae_(root);

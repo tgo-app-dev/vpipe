@@ -83,6 +83,8 @@ private:
   double _cond_timestep = 1.0;
   double _cond_audio_timestep = 1.0;
   double _audio_seconds = 0.0;
+  double _refine_start  = -1.0;
+  double _refine_shift  = 6.0;
   // The VDN-H3 release root, or empty for the stock attention.
   std::string _linear_branch;
   // The runtime-LoRA slots, `lora` .. `lora8` (stages/lora-slots.h).

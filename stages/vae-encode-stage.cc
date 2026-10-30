@@ -2,6 +2,7 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-encode-stage.h"
 #include "common/beat-keys.h"
+#include "common/flex-bag.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -10,10 +11,12 @@
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/comfy-checkpoint.h"
+#include "generative-models/shared/torch-randn.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-detect.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 
 #include <algorithm>
@@ -96,6 +99,15 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
           "VaeEncodeStage('{}'): input_range must be unit, byte or signed "
           "(got '{}')", this->id(), r));
     }
+  }
+  {
+    const std::string pm = attr_str("posterior");
+    if (pm != "" && pm != "mean" && pm != "sample") {
+      fail_config(fmt("VaeEncodeStage('{}'): posterior must be mean or "
+                      "sample (got '{}')", this->id(), pm));
+    }
+    _posterior_sample = pm == "sample";
+    _posterior_seed = (std::uint64_t)attr_int("posterior_seed");
   }
   _target_w = (int)attr_int("target_width");
   _target_h = (int)attr_int("target_height");
@@ -227,6 +239,9 @@ constexpr SpecExtra kUnloadChoices[] = {
 constexpr SpecExtra kI8TierChoices[] = {
   {spec_key::kChoices, "accurate,fast,token,token_plain"},
 };
+constexpr SpecExtra kPosteriorChoices[] = {
+  {spec_key::kChoices, "mean,sample"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "input_range", .type = ConfigType::String, .required = false,
    .doc = kInputRangeDoc, .def_str = "unit"},
@@ -282,6 +297,17 @@ const ConfigKey kAttrs[] = {
           "parking is the manager's to do and needs this stage's borrow "
           "to end first -- only diffusion-conditioner does that today",
    .def_str = "auto", .extra = kUnloadChoices},
+  {.key = "posterior", .type = ConfigType::String, .required = false,
+   .doc = "MINIMAX-H3 CLIPS: which latent of the posterior. 'mean' "
+          "(default) -- what a keyframe anchor wants, exact. 'sample' -- "
+          "mean + std * noise, the noise torch's CPU generator draws at "
+          "`posterior_seed` for the latent's [1, z, T, H, W]: what "
+          "Open-H3-Regenerate-2K encodes a draft with. A picture always "
+          "takes the mean",
+   .def_str = "mean", .extra = kPosteriorChoices},
+  {.key = "posterior_seed", .type = ConfigType::Int, .required = false,
+   .doc = "the seed of `posterior: sample` (the release's --vae-seed, 42)",
+   .def_int = 42},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
           "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "
@@ -424,7 +450,10 @@ VaeEncodeStage::vae_dir_for_release_() const
   // repository to a VAE -- the trap vae-decode fell into, where a 5 GB
   // component was credited 117 GB of DiT and text encoder. Empty is the
   // honest answer when the component cannot be located.
-  if (vae_dir != root) { return vae_dir; }
+  //
+  // Named as vae-decode names it (vae_claim_dir: MiniMax-H3's released
+  // VAE by its `source/`), so the two claims on one VAE are one key.
+  if (vae_dir != root) { return vae_claim_dir(vae_dir); }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Unless a registered family can say where its own file is, which is
   // the one thing that turns "cannot be located" into a real answer on
@@ -454,11 +483,51 @@ VaeEncodeStage::declare_memory() const
   if (_hf_dir.empty()) { return m; }
   const std::string vae_dir = vae_dir_for_release_();
   if (vae_dir.empty()) { return m; }
-  // A VAE holds what it weighs: no streaming form, so no floor.
-  m.hold(vae_dir, model_memory::dir_weights_bytes(vae_dir), 0,
+  // A VAE holds what it weighs: no streaming form, so no floor. MiniMax-
+  // H3's holds its encoder half alone here (h3_held_bytes_).
+  const std::size_t h3 = h3_held_bytes_(vae_dir);
+  m.hold(vae_dir, h3 > 0 ? h3 : model_memory::dir_weights_bytes(vae_dir), 0,
          _unload_cfg == model_memory::UnloadPolicy::kDestroy,
          _unload_cfg == model_memory::UnloadPolicy::kAuto);
   return m;
+}
+
+// MiniMax-H3's video VAE builds each half at its first use, and this stage
+// only encodes: it holds the encoder (0.36 GB of a 9.9 GB F32 file). 0 for
+// every other family.
+std::size_t
+VaeEncodeStage::h3_held_bytes_(const std::string& vae_dir) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (_hf_dir.empty() || vae_dir.empty()) { return 0; }
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (builtin_vae_family(resolve_vae_dir(root)) != "minimax-h3") {
+    return 0;
+  }
+  return genai::MetalMiniMaxH3VideoVae::held_bytes(
+      vae_dir, genai::MetalMiniMaxH3VideoVae::Half::kEncoder);
+#else
+  (void)vae_dir;
+  return 0;
+#endif
+}
+
+// The CONDITION phase's, when the policy lets go of the VAE after every
+// beat (`destroy`): references and drafts are encoded before the denoise,
+// and unphased the claim was counted through it -- MiniMax-H3's at 9.9 GB.
+// `auto` resolves at the first beat against peers this cannot see yet,
+// so it stays unphased, as generate-video's DiT does.
+std::vector<ResourceClaim>
+VaeEncodeStage::decide_resources() const
+{
+  if (_hf_dir.empty() ||
+      _unload_cfg != model_memory::UnloadPolicy::kDestroy) {
+    return {};
+  }
+  const std::string rel = vae_dir_for_release_();
+  if (rel.empty()) { return {}; }
+  return model_memory::weight_claims_in_phase({rel},
+                                              model_memory::kPhaseCondition);
 }
 
 std::vector<ResourceClaim>
@@ -475,7 +544,16 @@ VaeEncodeStage::declare_resources() const
   // 1.4 GB, and the DiT's streaming decision sized against 149 GB of
   // "peers".
   const std::string rel = vae_dir_for_release_();
-  if (!rel.empty()) { return model_memory::weight_claims({rel}); }
+  if (!rel.empty()) {
+    std::vector<ResourceClaim> out = model_memory::weight_claims({rel});
+    if (const std::size_t h3 = h3_held_bytes_(rel); h3 > 0) {
+      for (ResourceClaim& c : out) {
+        bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                         (std::int64_t)h3);
+      }
+    }
+    return out;
+  }
   // Nothing names it that way: the root IS the checkpoint (a standalone
   // VAE directory holding a model.safetensors, which the release
   // resolver cannot tell from a repository), or nothing under it loads
@@ -554,6 +632,8 @@ VaeEncodeStage::unload_vae_()
     const std::string vdir = vae_dir_for_release_();
     if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
       mgr->drop_weights(vdir);
+      // The other half of the condition-phase claim (decide_resources).
+      mgr->note_phase_released(vdir);
     } else {
       mgr->pool_weights(vdir);
     }
@@ -1547,10 +1627,25 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     // The MEAN half of the moments, then WHITENED into the normalized
     // space the DiT generates in -- the same transform vae-decode
     // undoes. Sampling the posterior instead would put noise into an
-    // anchor whose whole job is to be exact.
+    // anchor whose whole job is to be exact -- so a clip samples only
+    // when asked (`posterior: sample`, a draft for a refine).
     const int Cz = vc.z_channels;
     const int lh = H / vc.patch, lw = W / vc.patch;
     const std::size_t vox = (std::size_t)lf * lh * lw;
+    // diffusers' DiagonalGaussianDistribution over the moments [mean |
+    // logvar]: std = exp(0.5 clamp(logvar, -30, 20)), noise from torch's
+    // CPU generator for the whole [1, z, T, H, W] (randn_tensor draws on
+    // the CPU when the generator is).
+    std::vector<float> noise;
+    if (_posterior_sample && stacked) {
+      genai::TorchCpuRandn g(_posterior_seed);
+      noise = g.randn((std::size_t)Cz * vox);
+      if (noise.empty()) {
+        session()->warn(fmt("VaeEncodeStage('{}'): the posterior noise "
+                            "could not be drawn; taking the mean",
+                            this->id()));
+      }
+    }
     auto out = std::make_unique<TensorBeatPayload>();
     out->dtype = TensorBeat::DType::F32;
     out->shape = {Cz, lf, lh, lw};
@@ -1567,6 +1662,14 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
         const std::uint32_t u = (std::uint32_t)mp[k] << 16;
         float x;
         std::memcpy(&x, &u, 4);
+        if (!noise.empty()) {
+          const std::uint32_t ul =
+              (std::uint32_t)mp[(std::size_t)Cz * vox + k] << 16;
+          float lv;
+          std::memcpy(&lv, &ul, 4);
+          lv = std::min(std::max(lv, -30.0f), 20.0f);
+          x = x + std::exp(0.5f * lv) * noise[k];
+        }
         op[k] = sd != 0.0f ? (x - mu) / sd : (x - mu);
       }
     }

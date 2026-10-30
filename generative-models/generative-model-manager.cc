@@ -891,6 +891,36 @@ GenerativeModelManager::unwire_from_pool(metal_compute::SharedBuffer& b)
       was, was > n ? was - n : 0, std::memory_order_relaxed)) {}
 }
 
+namespace {
+
+// Phases a..b (running-order positions) into `key`'s bits. A position
+// past the mask's 64 is not recorded; the hull then answers alone.
+void
+add_phase_bits(std::unordered_map<std::string, std::uint64_t>& bits,
+               const std::string& key, int a, int b)
+{
+  std::uint64_t m = 0;
+  for (int i = std::max(0, a); i <= b && i < 64; ++i) {
+    m |= std::uint64_t{1} << i;
+  }
+  if (m != 0) { bits[key] |= m; }
+}
+
+// Whether `bits` has `key` alive at position `p`: nullopt when no phased
+// statement recorded it, so the caller falls back to the hull.
+std::optional<bool>
+phase_bit(const std::unordered_map<std::string, std::uint64_t>& bits,
+          const std::string& key, int p)
+{
+  const auto it = bits.find(key);
+  if (it == bits.end() || it->second == 0 || p < 0 || p >= 64) {
+    return std::nullopt;
+  }
+  return ((it->second >> p) & 1u) != 0;
+}
+
+}  // namespace
+
 void
 GenerativeModelManager::declare_weights(const string& dir,
                                         std::size_t   expected_bytes,
@@ -936,6 +966,7 @@ GenerativeModelManager::declare_weights(const string& dir,
         as->second.first = std::min(as->second.first, a);
         as->second.second = std::max(as->second.second, b);
       }
+      add_phase_bits(_phase_bits, key, a, std::max(a, b));
     }
   }
   // The interval's END takes the LATER of two claims, mirroring how the
@@ -968,8 +999,11 @@ GenerativeModelManager::set_declaration_phase(const string& dir,
     // ...unless another stage asserted a phase for these same bytes at
     // declare time: then the refinement WIDENS to cover both, earliest
     // start to latest end, rather than replacing what that stage said.
+    // (The bits keep the two apart: what lies between them is in the
+    // hull, not in either claim -- see _phase_bits.)
     const auto as = _phase_asserted.find(key);
     const int p = phase_index_(phase);
+    if (p >= 0) { add_phase_bits(_phase_bits, key, p, p); }
     if (as != _phase_asserted.end() && p >= 0 &&
         (as->second.first != p || as->second.second != p)) {
       const int lo = std::min(as->second.first, p);
@@ -1064,6 +1098,10 @@ GenerativeModelManager::clear_declarations()
   // without that stage must not inherit its claim.
   _phase.clear();
   _phase_asserted.clear();
+  _phase_bits.clear();
+  // ...and the interval's end with them: kept, a relaunch's claim of the
+  // same checkpoint inherited the last run's end phase.
+  _phase_last.clear();
   _released.clear();
   // Cleared with the declarations, and for the same reason: it is a fact
   // about THIS run's sizing. A relaunch at a different resolution, or
@@ -1424,12 +1462,14 @@ GenerativeModelManager::phase_peak(
   const auto per_dir = per_dir_bytes_(/*use_floor=*/true);
 
   std::unordered_map<string, string> first_of, last_of;
+  std::unordered_map<string, std::uint64_t> bits;
   std::unordered_map<string, ScratchClaim> scratch;
   std::vector<string> order;
   {
     lock_guard<mutex> lk(_ws_mu);
     first_of = _phase;
     last_of  = _phase_last;
+    bits     = _phase_bits;
     scratch  = _scratch;
     order    = _phase_order;
   }
@@ -1441,7 +1481,7 @@ GenerativeModelManager::phase_peak(
   // bytes with a lifetime -- so they are walked together rather than
   // summed separately and added, which is what made a latent alive
   // across three phases impossible to express.
-  struct Live { std::size_t bytes; int first; int last; };
+  struct Live { std::size_t bytes; int first; int last; string dir; };
   std::vector<Live> live;
   live.reserve(per_dir.size() + scratch.size());
 
@@ -1466,22 +1506,29 @@ GenerativeModelManager::phase_peak(
     if (b == 0) { continue; }
     auto it = first_of.find(dir);
     auto lt = last_of.find(dir);
-    const auto [a, z] = span(it == first_of.end() ? string() : it->second,
-                             lt == last_of.end() ? string() : lt->second);
-    live.push_back({b, a, z});
+    const string f = it == first_of.end() ? string() : it->second;
+    const auto [a, z] =
+        span(f, lt == last_of.end() ? string() : lt->second);
+    // A phased checkpoint is alive where its claims put it (_phase_bits),
+    // not across the hull of them; unphased is the whole run.
+    live.push_back({b, a, z, f.empty() ? string() : dir});
   }
   for (const auto& [label, c] : scratch) {
     (void)label;
     if (c.bytes == 0) { continue; }
     const auto [a, z] = span(c.phase, c.last_phase);
-    live.push_back({c.bytes, a, z});
+    live.push_back({c.bytes, a, z, string()});
   }
 
   std::size_t peak = 0;
   for (int p = 0; p < (int)order.size(); ++p) {
     std::size_t at = 0;
     for (const Live& l : live) {
-      if (l.first <= p && p <= l.last) { at += l.bytes; }
+      const std::optional<bool> on =
+          l.dir.empty() ? std::nullopt : phase_bit(bits, l.dir, p);
+      if (on.has_value() ? *on : (l.first <= p && p <= l.last)) {
+        at += l.bytes;
+      }
     }
     if (by_phase != nullptr) { by_phase->emplace_back(order[(std::size_t)p], at); }
     if (at > peak) { peak = at; }
@@ -1495,11 +1542,13 @@ GenerativeModelManager::phase_footprint_(const string& phase,
 {
   const auto per_dir = per_dir_bytes_(use_floor);
   std::unordered_map<string, string> phase_of, last_of;
+  std::unordered_map<string, std::uint64_t> bits;
   std::vector<string> order;
   {
     lock_guard<mutex> lk(_ws_mu);
     phase_of = _phase;
     last_of  = _phase_last;
+    bits     = _phase_bits;
     order    = _phase_order;
   }
   auto index_of = [&](const string& p) {
@@ -1525,6 +1574,16 @@ GenerativeModelManager::phase_footprint_(const string& phase,
     // it: counted in its first phase alone, a component alive across
     // two (one store holding both a decode-audio and a decode VAE) was
     // missing from the second.
+    // Where its claims put it, when they were recorded (_phase_bits):
+    // not the phases between two holders that let go in between.
+    if (phase_bit(bits, dir, 0).has_value()) {
+      for (int i = 0; i < (int)order.size(); ++i) {
+        if (phase_bit(bits, dir, i).value_or(false)) {
+          by_phase[order[(std::size_t)i]] += b;
+        }
+      }
+      continue;
+    }
     const auto lt = last_of.find(dir);
     const int a = index_of(it->second);
     const int z = lt != last_of.end() ? index_of(lt->second) : a;

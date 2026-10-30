@@ -1336,6 +1336,15 @@ private:
   };
   std::vector<WarmModel>   _warm_models;
   std::function<void()>    _warm_reap;
+
+  // canonical dir -> every phase a PHASED statement placed it in (bit i
+  // = position i of the running order), declared or decided: what a
+  // phased checkpoint is counted in. `_phase` / `_phase_last` keep the
+  // hull, and the hull is wrong for a checkpoint two stages hold apart --
+  // MiniMax-H3's video VAE, encoding references in the condition and
+  // decoding in the decode, put 5 GB into a denoise neither holds it in.
+  // Unphased (`_phase` empty) still means the whole run. Last, as above.
+  std::unordered_map<std::string, std::uint64_t> _phase_bits;
 };
 
 }

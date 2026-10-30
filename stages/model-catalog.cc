@@ -2483,6 +2483,58 @@ builtin_catalog_()
      .files = {"minimax_h3_turbo_4step_ema_ckpt850.safetensors"},
      .needs_tokenizer_json = false,
      .name = "larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema"},
+    // Open-H3-Regenerate-2K (NVIDIA, Efficient-Large-Model): a REFINE of
+    // an existing clip rather than a generation -- a 768P draft encoded,
+    // its latent enlarged by the H3 latent upscaler and re-noised to
+    // sigma 0.909, then three Euler steps of the FL2VA DiT under ONE
+    // merged adapter (their refiner + lightx2v's FL2VA Turbo v1.2 + LMS
+    // Sharp v1.0, rank 576 on every projection, alpha == rank) with the
+    // soundtrack held at an encoded silence. generate-video's init_latent
+    // iport is the refine; latent-upscale is the enlargement.
+    //
+    // Three records over ONE repo, each pinning what it is: the adapter,
+    // the upscaler, and `vae_fast/` -- StreamRender-H3's FAST decoder
+    // (non-causal, 24 layers, LOSSY; vae-decode's `fast_decoder`), its own
+    // record because it is 6.5 GB that the release's default decode does
+    // not use. NOT fetched: `base_model/` (MiniMax-H3's own diffusers
+    // components, which the MiniMaxAI entries above already hold) and
+    // `lora/sharp_curve_branches` -- LMS Sharp's AdaLN curve branches,
+    // which the release installs and which are exactly zero (every
+    // curve_B), so they add nothing.
+    // MiniMax H3 Community License for the refiner and base; the
+    // upscaler is MIT, Turbo and Sharp their own.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Open-H3-Regenerate-2K refine, rank 576 merged (NVIDIA)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"lora/open_h3_regenerate_2k_lora.safetensors",
+               "lora/lora_config.json", "lora/module_ranks.json",
+               "lora/MERGE_VERIFY.json", "README.md", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-lora"},
+    {.family = "MiniMax", .version = "H3-FL2VA",
+     .param_class = "latent upscaler",
+     .variant = "H3 latent upscaler 3D-conv v1 (Open-H3-Regenerate-2K)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K",
+     .model_type = "minimax-h3-latent-upscaler",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"latent_upsampler/"
+               "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+               "latent_upsampler/LICENSE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-upscaler"},
+    {.family = "MiniMax", .version = "H3-FL2VA",
+     .param_class = "video decoder",
+     .variant = "fast H3 VAE decoder, non-causal 24-layer (StreamRender-H3, "
+                "lossy)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K",
+     .model_type = "minimax-h3-fast-vae",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"vae_fast/fast_h3_vae_noncausal_24l.safetensors",
+               "README.md", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-fast-vae"},
     // TaoLiveAIGC's TaoMate-H3: a 3-step adapter for a STREAMING method,
     // not a few-step LoRA for the ordinary denoise. generate-video knows
     // it by its tensors and runs that method -- the base model's

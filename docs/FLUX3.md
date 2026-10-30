@@ -94,7 +94,7 @@ model, not by the pipeline.
 
 ## Speed
 
-MEASURED on an M4 Pro (64 GB), 1024x1024, 16 steps, the DiT preloaded:
+MEASURED on an M4 Pro (64 GB), 1024x1024, 16 steps, every DiT block resident:
 
 | | denoise | vs dense |
 |---|---|---|

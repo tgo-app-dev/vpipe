@@ -44,6 +44,18 @@ const ConfigKey kAttrs[] = {
    .doc = "soundtrack duration; 0 derives it from the video's frames / fps, "
           "which is what keeps the two modalities the same length by "
           "construction", .def_real = 0.0},
+  {.key = "refine_start_sigma", .type = ConfigType::Real, .required = false,
+   .doc = "a REFINE only (generate-video's init_latent wired -- "
+          "Open-H3-Regenerate-2K): the noise level the clip is put back "
+          "to, in (0, 1]. Default (-1): the release's own grid for the "
+          "step count -- 3 steps run 0.909375, 0.857, 0.667; 2 run 0.7, "
+          "0.494. Lower keeps more of the input; the steps after it follow "
+          "`refine_shift`",
+   .def_real = -1.0},
+  {.key = "refine_shift", .type = ConfigType::Real, .required = false,
+   .doc = "a REFINE only: the shift its steps follow from "
+          "`refine_start_sigma`, s x / (1 + (s - 1) x) over evenly spaced "
+          "unshifted sigmas. 6 is the release's", .def_real = 6.0},
   {.key = "linear_branch", .type = ConfigType::String, .required = false,
    .doc = "OPTIONAL VDN-H3 release root -- the directory holding its "
           "config.json and linear_branch/. Given one, every main block's "
@@ -210,8 +222,9 @@ const PortSpec kOports[] = {
    .doc = "MiniMax-H3 generation parameters as one FlexData object "
           "{model_family: minimax-h3, video_shift, audio_shift, "
           "condition_timestep, condition_audio_timestep, audio_seconds, "
-          "+lora .. +lora8 and their scales, +taomate, +preview_vae and its "
-          "three knobs}, for a generate-video model_config iport",
+          "refine_start_sigma, refine_shift, +lora .. +lora8 and their "
+          "scales, +taomate, +preview_vae and its three knobs}, for a "
+          "generate-video model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -247,6 +260,8 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _cond_timestep = attr_real("condition_timestep");
   _cond_audio_timestep = attr_real("condition_audio_timestep");
   _audio_seconds = attr_real("audio_seconds");
+  _refine_start  = attr_real("refine_start_sigma");
+  _refine_shift  = attr_real("refine_shift");
   _linear_branch = attr_str("linear_branch");
   for (int i = 0; i < lora_slots::kSlots; ++i) {
     LoraSlot& sl = _lora[(std::size_t)i];
@@ -302,6 +317,13 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
         "derives it from the video (got {:.3f})", this->id(),
         _audio_seconds));
   }
+  if (_refine_start > 1.0 || _refine_start == 0.0 ||
+      !(_refine_shift > 0.0)) {
+    fail_config(fmt(
+        "MiniMaxH3ModelConfigStage('{}'): refine_start_sigma must be in "
+        "(0, 1] (or negative for the release's grid) and refine_shift > 0 "
+        "(got {:.4f} / {:.3f})", this->id(), _refine_start, _refine_shift));
+  }
   allocate_oports(spec().oports.size());
 }
 
@@ -323,6 +345,9 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   o.insert_or_assign("condition_audio_timestep",
                      FlexData::make_real(_cond_audio_timestep));
   o.insert_or_assign("audio_seconds", FlexData::make_real(_audio_seconds));
+  o.insert_or_assign("refine_start_sigma",
+                     FlexData::make_real(_refine_start));
+  o.insert_or_assign("refine_shift", FlexData::make_real(_refine_shift));
   // Emitted only when SET, for the reason the LoRA keys are: an empty
   // string would read as "the graph asked for no branch", which is
   // indistinguishable at the consumer from "the graph said nothing",

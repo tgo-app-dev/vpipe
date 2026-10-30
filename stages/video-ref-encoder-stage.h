@@ -489,6 +489,13 @@ private:
   void resolve_unload_policy_();
   void unload_models_();
   bool reload_models_();
+  // The encoder and video VAE this stage loads, as its claims and their
+  // releases name them: `encoder_dir` / `vae_dir` when set, else the
+  // model's own.
+  struct ClaimedDirs {
+    std::string enc, vvae;
+  };
+  ClaimedDirs claimed_dirs_() const;
 #endif
 };
 

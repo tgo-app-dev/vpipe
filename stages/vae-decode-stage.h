@@ -15,6 +15,7 @@
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flashvsr/flashvsr-tiny-decoder.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-fast-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
@@ -197,6 +198,13 @@ private:
   std::string _vae_weights;
   // `_vae_weights` resolved (a registry key or a path); empty when unset.
   std::string vae_weights_() const;
+  // `fast_decoder`: MiniMax-H3's FAST decoder (Open-H3-Regenerate-2K's
+  // vae_fast/) in place of the released one -- a registry key, its
+  // directory or the file. Empty: the released decoder.
+  std::string _fast_decoder;
+  // The file it names, when the model is MiniMax-H3; empty otherwise (no
+  // other family reads it).
+  std::string fast_decoder_file_() const;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
   // "wan" (AutoencoderKLWan, the VIDEO one) | "minimax-h3" | a registered
   // family's tag
@@ -245,6 +253,7 @@ private:
   // and whether a missing color_reference input has been said.
   std::unique_ptr<WaveletColorFix> _wavelet;
   bool _ref_port_noted = false;
+  bool _h3_cut_said = false;     // one note per run of a trim / crop
   // FlashVSR's TINY decoder (sideband::kDecoder "tiny"), loaded at the
   // first latent that asks for it, and its stream: the MemBlocks'
   // memories live in the decoder's scratch, so an idle unload leaves it
@@ -264,6 +273,12 @@ private:
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole
   // clip at once instead of streaming chunks through a sink.
   std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
+  // ...or its fast decoder, when `fast_decoder` names one: the released
+  // VAE's weights are then never read, only its config.
+  std::unique_ptr<genai::MetalMiniMaxH3FastVae> _h3_fast;
+  // The i8 tier the fast decoder runs at on this box (-1 none), as the
+  // plan books it.
+  int fast_i8_tier_() const;
 
   // ---- an out-of-tree family (VaeModelRegistry) -------------------------
   // Consulted BEFORE the built-in `_class_name` chain, mirroring how

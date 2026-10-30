@@ -962,6 +962,55 @@ kernel void transpose_rope_half_part_ftab_f16(
       VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
 }
 
+// The same transpose, for a ROW BAND of the sequence: the band's rows
+// written into a whole-sequence head-major buffer [H, out_rows, D] from
+// row `out_row0`. The cos/sin tables are bound at the band's first row,
+// so `t` indexes them band-locally, as it does the input. MiniMax-H3's
+// banded forward writes every band's q / k / v this way and attends each
+// band's queries against every row's keys.
+//
+//   0..10 as transpose_rope_half_part_ftab_f16 (5:S = the band's rows),
+//   11:out_rows 12:out_row0. grid {D, S, H}, tg {D, 1, 1}.
+kernel void transpose_rope_half_part_ftab_band_f16(
+    const device VPIPE_ELT* in   [[buffer(0)]],
+    device VPIPE_ELT*       out  [[buffer(1)]],
+    const device float*     cosb [[buffer(2)]],
+    const device float*     sinb [[buffer(3)]],
+    constant int&      H         [[buffer(4)]],
+    constant int&      S         [[buffer(5)]],
+    constant int&      D         [[buffer(6)]],
+    constant int&      rot       [[buffer(7)]],
+    constant int&      in_stride [[buffer(8)]],
+    constant int&      in_off    [[buffer(9)]],
+    constant int&      in_head_stride [[buffer(10)]],
+    constant int&      out_rows  [[buffer(11)]],
+    constant int&      out_row0  [[buffer(12)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  if (d >= D) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  if (h >= H || t >= S) { return; }
+  const uint src = (uint)t * (uint)in_stride + (uint)in_off +
+                   (uint)h * (uint)in_head_stride;
+  const uint dst =
+      ((uint)h * (uint)out_rows + (uint)out_row0 + (uint)t) * (uint)D;
+  if (d >= rot) {
+    out[dst + (uint)d] = in[src + (uint)d];
+    return;
+  }
+  const int half_r = rot / 2;
+  const int i = (d < half_r) ? d : (d - half_r);
+  const uint cb = (uint)t * (uint)half_r + (uint)i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const float x1 = float(in[src + (uint)(d < half_r ? d : d - half_r)]);
+  const float x2 = float(in[src + (uint)(d < half_r ? d + half_r : d)]);
+  out[dst + (uint)d] =
+      VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
+}
+
 // The same partial rotate-half RoPE as above, IN PLACE on the fused qkv
 // projection and with NO transpose.
 //

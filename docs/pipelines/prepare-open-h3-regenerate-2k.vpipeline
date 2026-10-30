@@ -1,0 +1,30 @@
+{
+  "id": "prepare-open-h3-regenerate-2k",
+  "stages": [
+    {
+      "id": "fetch-lora",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-lora",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-upscaler",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-upscaler",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

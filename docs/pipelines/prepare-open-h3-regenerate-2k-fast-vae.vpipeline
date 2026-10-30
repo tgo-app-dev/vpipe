@@ -1,0 +1,18 @@
+{
+  "id": "prepare-open-h3-regenerate-2k-fast-vae",
+  "stages": [
+    {
+      "id": "fetch-fast-vae",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-fast-vae",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

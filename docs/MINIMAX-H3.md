@@ -62,6 +62,10 @@ arrives in **8–16 steps** instead of 30+.
     - [What makes it different](#what-makes-it-different)
     - [What it costs](#what-it-costs-1)
   - [Three steps, streamed — TaoMate-H3](#three-steps-streamed--taomate-h3)
+  - [A draft at 2K — Open-H3-Regenerate-2K](#a-draft-at-2k--open-h3-regenerate-2k)
+    - [Get it, then run it](#get-it-then-run-it)
+    - [What it costs](#what-it-costs-2)
+    - [Against the release](#against-the-release)
   - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
     - [Get it and run it](#get-it-and-run-it)
     - [What it saves](#what-it-saves)
@@ -190,6 +194,19 @@ you want to see the model work before spending the hours and the 115 GB.
   the soundtrack from the base model, the video in chunks that remember the
   ones before them, in whole 5-second requests (see
   [Three steps, streamed](#three-steps-streamed--taomate-h3)).
+- **[`prepare-open-h3-regenerate-2k.vpipeline`](pipelines/prepare-open-h3-regenerate-2k.vpipeline)**
+  / **[`minimax-h3-regenerate-2k.vpipeline`](pipelines/minimax-h3-regenerate-2k.vpipeline)**
+  — fetch NVIDIA's **Open-H3-Regenerate-2K** and regenerate a 768P draft at
+  **2560 × 1440** in three steps: the draft encoded, its latent enlarged
+  without decoding, re-noised and refined by the FL2VA weights under the
+  release's merged LoRA (see
+  [A draft at 2K](#a-draft-at-2k--open-h3-regenerate-2k)).
+  **[`minimax-h3-regenerate-2k-fast-m4.vpipeline`](pipelines/minimax-h3-regenerate-2k-fast-m4.vpipeline)**
+  / **[`-fast-m5`](pipelines/minimax-h3-regenerate-2k-fast-m5.vpipeline)**
+  are the same graph on the box's lossy tiers — the Neural Engine on an M4,
+  int8 on an M5's matrix cores — and the release's **fast decoder**, which
+  [`prepare-open-h3-regenerate-2k-fast-vae.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-fast-vae.vpipeline)
+  fetches.
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -2069,7 +2086,8 @@ from its base. The weights **stay FP8 in memory**. Each projection is
 widened to bf16 on the GPU just before it is used, so a streamed block is
 half the size it is in bf16 (367 MB against 735). That computes exactly
 what a bf16 copy of the file would, checked bit for bit, streamed and
-preloaded. So is the translation itself: the publisher's bf16 diffusers
+with every block resident. So is the translation itself: the publisher's bf16
+diffusers
 checkpoint (`MiniMaxAI/MiniMax-H3-diffusers`) now loads the same way, and
 matches the native release to the bit.
 
@@ -2245,7 +2263,7 @@ lightx2v's split files. It is applied at runtime, as every adapter here is.
 
 #### What it costs
 
-Measured on an M4 Pro (64 GB) with the 8-bit FL2VA checkpoint preloaded, at
+Measured on an M4 Pro (64 GB) with the 8-bit FL2VA checkpoint resident, at
 640 × 352 × 56 frames (3943 rows), one after the other in one sitting:
 
 | | forwards | per forward | denoise |
@@ -2385,8 +2403,9 @@ So **about 3½ minutes per 5 seconds** of video there, decode included
 minutes 42 seconds: 34.5 s a chunk forward, with ~10 GB compressed and 3 GB of
 swap.
 
-On a Mac mini M4 Pro, 64 GB, the 8-bit checkpoint preloaded from an external
-SSD at 864 × 480 (the cache in memory): 3.2 s a soundtrack forward, 37 s a
+On a Mac mini M4 Pro, 64 GB, the 8-bit checkpoint read from an external
+SSD and held resident, at 864 × 480 (the cache in memory): 3.2 s a soundtrack
+forward, 37 s a
 chunk forward — about 10½ minutes per 5 seconds, and a 10-second clip 28
 minutes from launch to file.
 
@@ -2422,6 +2441,215 @@ or this port is not known yet.
 - **The exact 5.000-second delivery.** Upstream squeezes 124 native frames into
   120 and time-stretches the sound to match; vpipe writes the native 124 frames
   and the soundtrack at its own length.
+
+### A draft at 2K — Open-H3-Regenerate-2K
+
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+(NVIDIA, [project page](https://nvlabs.github.io/Sana/Open-H3-Regenerate-2K/))
+does not generate a clip: it **regenerates one you already have at a larger
+size**. A 768P H3 draft (1344 × 768, 124 frames) comes back at 2560 × 1440
+from **three** steps of the FL2VA weights, against MiniMax's closed
+H3-Regenerate-2K service. Drafts from other video models work too — encode
+them at 1024 × 576.
+
+What runs, and the stage that runs it:
+
+1. **Encode the draft** — `vae-encode`, H3's video VAE, with
+   `posterior: sample` (`posterior_seed: 42`): the release samples the
+   draft's posterior rather than taking its mean, with noise drawn by torch's
+   CPU generator, which vpipe draws bit for bit.
+2. **Enlarge the latent** — `latent-upscale`, the
+   [H3 latent upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+   (a 3D-conv network the release ships in `latent_upsampler/`): 48 × 84
+   latent cells to 90 × 160, without decoding. A height that is not whole
+   32-pixel cells computes at the next — 1080 at 1088, 2160 at 2176 — and
+   the latent carries a crop box that `vae-decode` cuts the picture back to.
+   Above 1440 rows it runs twice, through 2K, as the release does for 4K.
+3. **Regenerate** — `generate-video` with the latent on its **`init_latent`**
+   iport. The clip is put back to sigma 0.909 and denoised in three Euler
+   steps (0.909 → 0.857 → 0.667 → 0) under **one merged LoRA** — the
+   refiner NVIDIA trained, lightx2v's FL2VA Turbo v1.2 and LMS Sharp v1.0,
+   concatenated along the rank axis (rank 576 on every projection) — with
+   the soundtrack held at an **encoded silence**, as the release conditions
+   it. Keyframe and reference inputs are ignored in this mode.
+4. **Decode** — `vae-decode`, the released H3 video VAE, keeping as many
+   frames as the draft had (all 124 of an H3 draft's) — or, with
+   `fast_decoder` set, the release's fast decoder (see
+   [Faster](#faster--the-boxs-tiers-and-the-fast-decoder)).
+
+The regenerated clip has no soundtrack of its own (it was made against
+silence); the pipeline muxes the draft's.
+
+#### Get it, then run it
+
+[`prepare-open-h3-regenerate-2k.vpipeline`](pipelines/prepare-open-h3-regenerate-2k.vpipeline)
+fetches the two pieces vpipe uses — the merged LoRA (12.5 GB, f32) and the
+upscaler (0.7 GB) — and registers them as
+`Efficient-Large-Model/Open-H3-Regenerate-2K-lora` and
+`…-upscaler`. It does not fetch the rest of the repository: `base_model/`
+is MiniMax-H3's own diffusers components (the FL2VA checkpoint from
+[Step 1](#step-1--prepare-the-model) serves), `vae_fast/` is a faster,
+lossier decoder (6.5 GB, its own prepare step — see
+[Faster](#faster--the-boxs-tiers-and-the-fast-decoder)), and
+`lora/sharp_curve_branches` — LMS
+Sharp's AdaLN "curve" branches, which the release installs beside the LoRA
+— is **all zeros** (every `curve_B`), so it adds nothing and is not loaded.
+(vpipe reads such branches when a file carries trained ones; a file of zero
+ones binds as an exact no-op.)
+
+[`minimax-h3-regenerate-2k.vpipeline`](pipelines/minimax-h3-regenerate-2k.vpipeline)
+then takes `minimax-h3-768p-draft.mp4` and its prompt and writes
+`minimax-h3-regenerate-2k.mp4`. Set the draft on `load-draft` and
+`load-audio`, its prompt on `text-prompt`. The draft is fit the way the
+release fits it: resampled to 24 fps (`draft-24fps`, ffmpeg's `fps`
+filter, as the release's), cover-scaled (bilinear) and centre-cropped to
+the encode size, cut to 124 frames — 17 × 7 + 5, the length H3's video
+VAE encodes whole (37 latent frames), which is what an H3 clip is made of.
+The release cuts its drafts to 121 and pads the encode to 124 with three
+copies of the last frame; taking the draft's own last three costs nothing
+(the same 37 latent frames) and keeps them real. A shorter draft makes a
+shorter clip (the encode pads it with its last frame).
+
+| to get | `draft-fit` | `latent-upscale` | `generate-video` |
+|---|---|---|---|
+| 2K from an H3 768P draft (the release) | 1344 × 768 | 2560 × 1440 | 2560 × 1440 |
+| 2K from another model's draft | 1024 × 576 | 2560 × 1440 | 2560 × 1440 |
+| 1080p | 1344 × 768 | 1920 × 1080 | 1920 × 1088 |
+| 4K | 1344 × 768 | 3840 × 2160 | 3840 × 2176 |
+| 768P, refine only | 1344 × 768 | 1344 × 768 (passes through) | 1344 × 768 |
+
+`generate-video`'s width / height size the memory plan; the clip runs at
+the latent's own geometry. Fewer steps: `steps: 2` runs 0.7 → 0.494 → 0,
+about a third faster and softer on fine texture; `refine_start_sigma` on
+`minimax-h3-model-config` lowers the noise the clip is put back to (more of
+the draft kept), with the steps after it on `refine_shift` (6).
+
+#### What it costs
+
+The refine is a full-size forward of the 33B DiT, three times, at the
+**output's** size — 2560 × 1440 is 3.4× the rows of the 768P draft, and
+attention grows with their square. MEASURED on an M4 Pro (64 GB), the
+FL2VA weights read off an external drive, the release's LoRA and three
+steps:
+
+| clip | rows | upscale | refine (3 steps) | decode | whole run |
+|---|---:|---:|---:|---:|---:|
+| 22 frames, 1024 × 576 → 1920 × 1080 | 14,371 | 5.0 s | 6.7 min | 1.5 min | 12 min |
+| 39 frames, 1344 × 768 → 2560 × 1440 | 43,200 | 14.8 s | 36 min | 5.3 min | 48 min |
+| 124 frames, 768P → 2K (the release's length) | 133,200 | 46 s | ~4 h (est.) | ~16 min (est.) | |
+
+The third row is extrapolated (attention is four fifths of a 2K forward
+there); a Mac with GPU matrix cores runs it several times faster. The
+release quotes 22 s on one B200.
+
+Memory: the upscaler holds 0.7 GB and its pass 1.6 GB at 768P → 2K (37
+latent frames). The refine's activations are the large term, and a long
+clip's refine keeps for every row of its sequence only what attention
+needs there — each row's queries, keys and values — working through the
+rest a band of up to 8,192 rows at a time: about 54 KB a row, 7.7 GB at the
+full 2K clip's 134,000 rows (17 GB if every row's activations were kept;
+the arithmetic is the same either way, to the bit). The video VAE loads
+each half where it is used — the draft's encode holds the 0.4 GB encoder,
+the decode the 4.6 GB decoder — and the decode builds its clip once,
+stitching each tile as it finishes. At 2K × 124 frames the memory plan
+puts the peak at 13.1 GB, within a 16 GB Mac (planned, not
+yet run on one; there the DiT reads its blocks from the drive every
+step, so expect hours), and 24 GB is comfortable. Sol-Attn and Sage
+(its int8 P·V too) work a band at a time as well, with exactly the
+results they give on the whole sequence; only the Neural Engine tiers
+keep every row's activations — on a smaller Mac use the plain graph or
+`-fast-m5`, not `-fast-m4`. The merged LoRA is 6.2 GB
+at 16 bits. Each block's factors are set aside in a file and read with
+the block, and a block the DiT keeps keeps its factors too: a small Mac
+holds 342 MB of them, a large one converges on all 6.2 GB, and the plan
+books both figures. Loading it passes through all 6.2 GB once.
+
+#### Faster — the box's tiers and the fast decoder
+
+Two variants of the graph trade some accuracy for speed, each on what the
+machine has. All of it is **lossy** and opt-in; the plain graph is the
+release's own arithmetic.
+
+| | [`-fast-m4`](pipelines/minimax-h3-regenerate-2k-fast-m4.vpipeline) | [`-fast-m5`](pipelines/minimax-h3-regenerate-2k-fast-m5.vpipeline) |
+|---|---|---|
+| refine (`generate-video`) | `ane_ffn` + `ane_qkv`: the Neural Engine takes a share of every block's feed-forward and qkv rows, the LoRA folded into its staged weights | `i8_gemm`, tier `token`: the block projections in int8, the LoRA on top |
+| `latent-upscale` | — | `i8_gemm`, tier `token` |
+| `vae-decode` | `fast_decoder` + `ane_ffn` | `fast_decoder` + `i8_gemm`, tier `token` |
+
+Run [`prepare-open-h3-regenerate-2k-fast-vae.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-fast-vae.vpipeline)
+first: it fetches the fast decoder (6.5 GB) and registers it as
+`Efficient-Large-Model/Open-H3-Regenerate-2K-fast-vae`.
+
+**The fast decoder** is the one the release ships in `vae_fast/`, from
+NVIDIA's [StreamRender-H3](https://nvlabs.github.io/Sana/Sol-Engine/StreamRender-H3/):
+24 of the released decoder's 36 layers, distilled, run over the whole clip
+at once — attention in windows of 5 latent frames × 16 × 16 tokens, every
+second layer's windows shifted, with five global tokens per block of 5
+latent frames — where the released decoder decodes overlapping 256-pixel
+tiles and 7-frame chunks and cross-fades them — 3.6× faster on an M4 Pro
+(below); the release puts its pictures ~30 dB from the released
+decoder's. It is
+`vae-decode`'s `fast_decoder` key on any H3 graph, and the release's own
+default is the released decoder, as is this guide's plain graph. It holds
+3.2 GB (the released one 4.6 GB) but its working set grows with the clip,
+because it keeps every token of it between layers: 12.2 GB for 124 frames
+at 2K, with the 1.4 GB clip it hands on (2.9 GB at 1080p × 22). The memory
+plan learns that figure at the first clip; before it, it counts the
+released decoder's (5.1 GB at 2K × 124), so give a long 2K clip the room
+yourself.
+
+MEASURED, the fast decoder alone (`minimax_h3_regenerate.fast_vae_bench`):
+
+| box | clip | released | fast | fast + its tier |
+|---|---|---:|---:|---:|
+| M4 Pro | 2560 × 1440 × 39 frames | 318 s | 88 s | 59 s (`ane_ffn`) |
+| M5 (base, 10-core GPU) | 1344 × 768 × 22 frames | | 9.6 s | 5.0 s (`token`); `accurate` 7.2, `fast` 8.2 |
+
+End to end on the M4 Pro, the 22-frame 1080p clip of the table above with
+`-fast-m4`'s settings: the refine 5.2 min (6.7 GPU-only), the whole run 10
+min (12). Decoded both ways from that one refine, the fast decoder's clip
+is 40.2 dB from the released decoder's (luma 38.6), with no seam at its
+window edges.
+
+The upscaler on the base M5, 768P → 2K × 9 frames: 9.3 s, `token` 7.8 s
+(1.2×; `accurate` and `fast` buy nothing). The refine's tiers are
+H3's own (see the tier sections above); with the release's LoRA they stay
+far inside its effect — two real blocks at 4,096 video rows, distance from
+the dense forward against the adapter's own move of 0.34: Neural Engine
+feed-forward 0.004, + qkv 0.005 (M4 Pro); int8 `accurate` 0.007, `fast`
+0.008, `token` 0.008, `token_plain` 0.016 (M5).
+
+#### Against the release
+
+Every piece that is not H3 itself is checked against the release:
+
+- **The upscaler** against a restatement of its node in fp32 (CPU), on the
+  release's own file: rel-L2 0.00055 and 0.00084 at two geometries (one a
+  non-integer ratio), against the release's own bf16's 0.0072 and 0.0100.
+  The release normalizes the whitened latent **again** with H3's statistics
+  before the network (its node expects ComfyUI's raw latents); that is what
+  its results were made with, so it is the default —
+  `normalization: once` is the node's own intent.
+- **The schedule** — the release's sigmas to the digit, its timesteps
+  (1 − sigma in double, rounded once) and its Euler step
+  (`x + float(σ − σ') · v`).
+- **The LoRA** binds all 312 projections through the diffusers
+  decomposition (q / k / v fused per head for the released weights,
+  banded), alpha = rank.
+- **The fast decoder** against a restatement of its architecture in fp32
+  (CPU), on the release's own file, at two geometries that cut windows at
+  every edge (7 and 12 latent frames): rel-L2 0.0037 / 0.0037 (M4 Pro),
+  0.0041 / 0.0040 (M5, matrix-core attention), against the release's own
+  bf16's 0.0044 / 0.0042; the same frame count as the released decoder (5
+  latent frames, 17 frames). Its int8 tiers on the M5: 0.008 (`accurate`)
+  to 0.010 (`token`), 0.024 (`token_plain`); the Neural Engine 0.0038.
+
+What is not the release's: the refine's noise (the release draws it on the
+GPU with CUDA's generator, which no Mac reproduces), and its forward
+(`standard_fwd` there is dense bf16 attention; vpipe's is the H3 forward
+every other graph here runs). The release itself warns that same-seed PSNR
+is not a metric for this model — rounding-level changes move its 3-step
+output a lot — so judge by eye.
 
 ### Faster attention — the VDN linear branch
 
@@ -3011,8 +3239,9 @@ leaving RAM.
 **This is where more memory pays.** The resident set is bounded by free RAM
 and nothing else, so a 32 or 64 GB machine holds proportionally more of the
 model between steps and re-reads proportionally less. On a large enough
-machine it stops streaming altogether and simply preloads. Nothing needs
-configuring for this — it is measured at load and adapts as the run proceeds.
+machine the first step keeps every block it reads, and from the second on
+nothing is read at all. Nothing needs configuring for this — it is measured
+as the run proceeds and adapts to it.
 
 **One heavy job at a time.** Metal buffers are wired and cannot be paged out,
 so a second large model running alongside this one does not slow the machine

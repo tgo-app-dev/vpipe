@@ -150,6 +150,13 @@ class MetalSolAttention {
   static std::size_t private_bytes(int heads, int kv_heads, int tokens,
                                    int d, int key_block, bool nax,
                                    std::size_t lend_a, std::size_t lend_b);
+  // ...for a BAND (encode's Band form): `q_tokens` queries against
+  // `k_tokens` keys -- what a banded forward's calls each leave private.
+  static std::size_t band_private_bytes(int heads, int kv_heads,
+                                        int q_tokens, int k_tokens, int d,
+                                        int key_block, bool nax,
+                                        std::size_t lend_a,
+                                        std::size_t lend_b);
 
   // Encode summaries -> stats -> threshold -> forward into `enc`.
   //

@@ -35,6 +35,11 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-encode-stage.h"
+#include "stages/audio-vae-decode-stage.h"
+#include "stages/model-select-stage.h"
+#include "stages/video-ref-encoder-stage.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "pipeline/resource-claim-delivery.h"
 
 #include <cstdlib>
 #include <functional>
@@ -43,6 +48,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace vpipe;
@@ -2661,6 +2667,87 @@ TEST(model_memory, a_refinement_widens_to_another_stage_s_phase)
   fs::remove_all(root, ec);
 }
 
+// TWO HOLDERS APART: one checkpoint held in the condition by one stage
+// and in the decode by another, and by neither between. MiniMax-H3's video
+// VAE: video-ref-encoder encodes references through it and drops it
+// (decide: condition), vae-decode loads it at its first latent (claim:
+// decode). Counted over the HULL, condition..decode, the 5 GB VAE sat in
+// a denoise neither holds it in, and on a 16 GB M4 that left the DiT's
+// ANE module (1.9 GB) no room: granted 0 of 1 where it had run.
+TEST(model_memory, two_holders_apart_leave_the_phase_between_free)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-apart";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  put("transformer/dit.safetensors", 8000);
+  put("video_vae/source/model.safetensors", 3000);
+  const std::string dit = (root / "transformer").string();
+  const std::string vae = (root / "video_vae" / "source").string();
+  const std::string den(model_memory::kPhaseDenoise);
+  const std::string cond(model_memory::kPhaseCondition);
+  const std::string dec(model_memory::kPhaseDecode);
+  const std::string deca(model_memory::kPhaseDecodeAudio);
+
+  // Released after the condition: the gap is free.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, dec, "", 0);        // vae-decode
+  pl->claim(&s, vae, "", "", 0);         // video-ref-encoder, pass one
+  pl->decide(&s, vae, cond);             // ...and it lets go
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(cond) == 11000u);
+  EXPECT_TRUE(mgr->phase_footprint(den) == 8000u);
+  EXPECT_TRUE(mgr->phase_footprint(deca) == 8000u);
+  EXPECT_TRUE(mgr->phase_footprint(dec) == 11000u);
+  std::vector<std::pair<std::string, std::size_t>> by;
+  EXPECT_TRUE(mgr->phase_peak(&by) == 11000u);
+  bool saw = false;
+  for (const auto& [p, b] : by) {
+    if (p == den) {
+      saw = true;
+      EXPECT_TRUE(b == 8000u);
+    }
+  }
+  EXPECT_TRUE(saw);
+
+  // Kept by the encoder (no refinement): held the whole run, as before.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, dec, "", 0);
+  pl->claim(&s, vae, "", "", 0);
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(den) == 11000u);
+  EXPECT_TRUE(mgr->phase_peak(nullptr) == 11000u);
+
+  // One claim's interval still reads as one interval -- and a relaunch
+  // does not inherit the last one's END: the second launch claims the
+  // condition alone, and the decode must not carry it.
+  pl->begin_plan(&s);
+  pl->claim(&s, vae, cond, dec, 0);
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(den) == 3000u);
+  pl->begin_plan(&s);
+  pl->claim(&s, vae, cond, "", 0);
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(cond) == 3000u);
+  EXPECT_TRUE(mgr->phase_footprint(dec) == 0u);
+  fs::remove_all(root, ec);
+}
+
 namespace {
 
 // RAII for VPIPE_RAM_LIMIT_MB, which every memory decision reads to
@@ -2981,6 +3068,149 @@ TEST(model_memory, ane_modules_are_claimed_by_the_stages_that_build_them)
       VaeDecodeStage on(&sess, "dec", std::vector<InEdge>{}, cfg_of(k, true));
       EXPECT_TRUE(coreml(on.declare_resources()).units == 0);
     }
+  }
+}
+
+// THE GRAPH OF A REPORT, planned as the runtime plans it: MiniMax-H3
+// Ref2VA at 896x832 with ane_ffn + ane_qkv on a 16 GB box
+// (VPIPE_RAM_LIMIT_MB). Since the denoise booked the DiT's activations
+// (3.5-3.8 GB there) the video VAE -- counted through the denoise though
+// video-ref-encoder drops it after the condition and vae-decode loads it
+// at its first latent -- left the ANE module no room: "granted 0 of 1",
+// where the release before had run it on a 16 GB M4 Mac mini. With the
+// encoder letting go, the denoise must carry neither it nor the VAE (the
+// difference against the encoder KEPT is exactly the two), the decode
+// must still carry the VAE, and the module is granted. Env:
+// VPIPE_MINIMAX_H3_TEST_MODEL_PATH (a repo holding Ref2VA/, or the
+// partition itself) and / or VPIPE_MINIMAX_H3_REPACK_PATH (Comfy-Org's
+// single-file repack -- the report's layout: there the plan before this
+// granted 0, denoise 12460 MB against 7493); configs and sizes only,
+// nothing loads.
+TEST(model_memory, h3_ref2va_leaves_the_denoise_room_for_its_ane_module)
+{
+  namespace fs = std::filesystem;
+  auto plan_on_16gb = [&](const std::string& root) {
+    Session sess;
+    auto* mgr = sess.generative_model_manager();
+    if (mgr == nullptr) { return; }
+    ::setenv("VPIPE_RAM_LIMIT_MB", "16384", 1);
+
+    using KV = std::vector<std::pair<std::string, FlexData>>;
+    auto cfg = [&](const KV& kv) {
+      FlexData c = FlexData::make_object();
+      c.as_object().insert("hf_dir", FlexData::make_string(root));
+      for (const auto& [k, v] : kv) { c.as_object().insert(k, v); }
+      return c;
+    };
+    // What PipelineRuntime does: every planner bracketed, every claim
+    // delivered, then every decision. Returns {denoise, decode}.
+    auto plan = [&](const std::vector<Stage*>& stages) {
+      const auto planners = ResourcePlannerRegistry::get().all();
+      for (ResourcePlanner* p : planners) { p->begin_plan(&sess); }
+      for (Stage* st : stages) {
+        for (const ResourceClaim& c : st->declare_resources()) {
+          ResourcePlanner* p = ResourcePlannerRegistry::get().find(c.kind);
+          if (c.key.empty() || p == nullptr) { continue; }
+          DeliveringResourceClaim delivering(c);
+          p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+        }
+      }
+      for (Stage* st : stages) {
+        for (const ResourceClaim& c : st->decide_resources()) {
+          ResourcePlanner* p = ResourcePlannerRegistry::get().find(c.kind);
+          if (c.key.empty() || p == nullptr) { continue; }
+          p->decide(&sess, c.key, c.phase);
+        }
+      }
+      for (ResourcePlanner* p : planners) { p->end_plan(&sess); }
+      std::vector<std::pair<std::string, std::size_t>> by;
+      mgr->phase_peak(&by);
+      std::size_t den = 0, dec = 0;
+      for (const auto& [ph, b] : by) {
+        if (ph == model_memory::kPhaseDenoise) { den = b; }
+        if (ph == model_memory::kPhaseDecode) { dec = b; }
+      }
+      return std::pair<std::size_t, std::size_t>{den, dec};
+    };
+    struct Run {
+      std::size_t den = 0, dec = 0, unit = 0;
+      int granted = -1;
+    };
+    auto run = [&](const char* unload) {
+      ModelSelectStage sel(&sess, "sel", std::vector<InEdge>{}, cfg({}));
+      VideoRefEncoderStage enc(
+          &sess, "enc", std::vector<InEdge>{},
+          cfg({{"frames", FlexData::make_int(121)},
+               {"unload_when_idle", FlexData::make_string(unload)}}));
+      GenerateVideoStage gen(
+          &sess, "gen", std::vector<InEdge>{},
+          cfg({{"width", FlexData::make_int(896)},
+               {"height", FlexData::make_int(832)},
+               {"frames", FlexData::make_int(121)},
+               {"fps", FlexData::make_real(24.0)},
+               {"ane_ffn", FlexData::make_bool(true)},
+               {"ane_qkv", FlexData::make_bool(true)}}));
+      // A model-select on the model iport, as every shipped graph has: the
+      // VAE then loads at the first latent.
+      VaeDecodeStage dec(&sess, "dec",
+                         std::vector<InEdge>{{nullptr, 0}, {&sel, 0}}, cfg({}));
+      AudioVaeDecodeStage adec(&sess, "adec", std::vector<InEdge>{}, cfg({}));
+      Run r;
+      std::tie(r.den, r.dec) = plan({&sel, &enc, &gen, &dec, &adec});
+      for (const ResourceClaim& c : gen.declare_resources()) {
+        int units = 0;
+        if (model_memory::parse_coreml_claim(c, nullptr, &r.unit, &units)) {
+          break;
+        }
+      }
+      if (r.unit > 0) {
+        r.granted = model_memory::coreml_grant(&sess, "ane-ffn/gen", r.unit, 1);
+      }
+      return r;
+    };
+    const Run rel = run("auto");
+    const Run keep = run("keep");
+    ::unsetenv("VPIPE_RAM_LIMIT_MB");
+
+    const std::string enc_dir =
+        genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+    const std::size_t enc_floor =
+        genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc_dir);
+    // The VAE at what its holders hold: video-ref-encoder its encoder
+    // half, vae-decode its decoder half -- each half loads at its first
+    // use -- and the manager keeps one figure a checkpoint, the larger.
+    using Half = genai::MetalMiniMaxH3VideoVae::Half;
+    const std::string vdir =
+        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
+    const std::size_t vae = std::max(
+        genai::MetalMiniMaxH3VideoVae::held_bytes(vdir, Half::kEncoder),
+        genai::MetalMiniMaxH3VideoVae::held_bytes(vdir, Half::kDecoder));
+    std::printf("[model_memory] H3 Ref2VA at 16 GB: denoise %zu MB (encoder "
+                "kept %zu MB), decode %zu MB; VAE %zu MB, encoder floor %zu "
+                "MB; ANE module %zu MB granted %d (encoder kept: %d)\n",
+                rel.den >> 20, keep.den >> 20, rel.dec >> 20, vae >> 20,
+                enc_floor >> 20, rel.unit >> 20, rel.granted, keep.granted);
+    EXPECT_TRUE(vae > 0 && enc_floor > 0 && rel.unit > 0);
+    // The grant is booked into the denoise too (end_plan's `coreml:`
+    // scratch), so it is taken back out before the weights are compared.
+    EXPECT_TRUE(rel.granted == 1 && keep.granted == 0);
+    EXPECT_TRUE(keep.den + rel.unit == rel.den + enc_floor + vae);
+    // The decode holds the VAE either way; kept, the encoder as well.
+    EXPECT_TRUE(rel.dec >= vae && keep.dec == rel.dec + enc_floor);
+  };
+  if (const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+      h3 != nullptr && *h3 != '\0') {
+    std::string root = h3;
+    if (fs::exists(fs::path(h3) / "Ref2VA" / "video_vae")) {
+      root = (fs::path(h3) / "Ref2VA").string();
+    }
+    if (fs::exists(fs::path(root) / "video_vae")) {
+      plan_on_16gb(root);
+    }
+  }
+  if (const char* r = std::getenv("VPIPE_MINIMAX_H3_REPACK_PATH");
+      r != nullptr && *r != '\0') {
+    plan_on_16gb(r);
   }
 }
 

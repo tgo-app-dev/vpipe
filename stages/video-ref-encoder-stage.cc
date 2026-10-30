@@ -1,5 +1,6 @@
 #include "stages/video-ref-encoder-stage.h"
 #include "generative-models/gen-input.h"
+#include "generative-models/generative-model-manager.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -9,6 +10,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "common/flex-bag.h"
 #include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 
@@ -591,19 +593,8 @@ VideoRefEncoderStage::declare_memory() const
 {
   StageMemory m;
   if (_hf_dir.empty()) { return m; }
-  namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _hf_dir);
-  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
-  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
-  std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
-  if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
   // Weights named apart are what loads, so they are what is held.
-  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
-    enc = w;
-  }
-  if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
-    vvae = w;
-  }
+  const auto [enc, vvae] = claimed_dirs_();
   // ONLY what this stage HOLDS. The DiT belongs to generate-video, which
   // declares it -- here as in declare_resources -- and counting it here
   // as well would charge the graph for it twice: this plan dedups by
@@ -624,18 +615,7 @@ std::vector<ResourceClaim>
 VideoRefEncoderStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _hf_dir);
-  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
-  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
-  std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
-  if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
-  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
-    enc = w;
-  }
-  if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
-    vvae = w;
-  }
+  const auto [enc, vvae] = claimed_dirs_();
 
   // THE ENCODER IS CLAIMED WITH ITS FLOOR, and that is not the same
   // thing as declare_memory() already knowing the floor.
@@ -651,19 +631,27 @@ VideoRefEncoderStage::declare_resources() const
   std::vector<ResourceClaim> out;
   out.push_back(model_memory::weight_claim_streamable(
       enc, genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc)));
-  // The video VAE stays UNPHASED on purpose. This stage holds it during
-  // the CONDITION phase (references are encoded through it) and
-  // vae-decode holds it during DECODE, so its true interval spans both
-  // and an unphased claim already says that. Phasing it here would make
-  // the answer depend on which of the two stages the flattener emitted
-  // first -- condition..decode one way, decode..decode the other, and
-  // the second is an UNDER-count that misses the use this stage makes
-  // of it.
+  // The video VAE is UNPHASED here: pass one describes. This stage holds
+  // it during the CONDITION phase (references are encoded through it)
+  // and vae-decode during the DECODE; decide_resources() says which of
+  // the two this stage's own is, when it lets go between them.
   //
   // NOT THE DiT: generate-video declares the one it loads (its
   // partition, or its `dit_dir`), and naming the release's copy here put
   // a DiT nothing loads in the plan whenever the two differ.
+  // At what it holds: the VAE builds each half at its first use, and this
+  // stage only encodes -- the encoder half (0.36 GB of a 9.9 GB F32
+  // file). Not a store `vae_dir` names, which carries the audio VAE too.
+  const std::size_t enc_half =
+      weights_path_(_vae_weights).empty()
+          ? genai::MetalMiniMaxH3VideoVae::held_bytes(
+                vvae, genai::MetalMiniMaxH3VideoVae::Half::kEncoder)
+          : 0;
   for (auto& c : model_memory::weight_claims({vvae})) {
+    if (enc_half > 0) {
+      bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                       (std::int64_t)enc_half);
+    }
     out.push_back(std::move(c));
   }
   return out;
@@ -689,28 +677,55 @@ VideoRefEncoderStage::declare_resources() const
 // bounded() is unphased on purpose and is COMPLETE by this point: every
 // stage has declared and no refinement has been applied, so every stage
 // deciding gets the same answer.
+//
+// THE VIDEO VAE GOES WITH IT, by the same rule: unload_models_() drops
+// both, so this stage holds the VAE in the condition only -- and
+// vae-decode, which loads it at its first latent, in the decode. Left
+// unphased it was counted through the DENOISE as well, the largest term
+// beside the DiT there (4966 MB, Comfy-Org's fp16): on a 16 GB box that
+// pushed the phase past what the DiT's ANE module could be granted, and
+// the tier stayed off. The manager keeps the two claims apart
+// (_phase_bits), so condition + decode does not read as condition..decode.
+//
+// Not a VAE `vae_dir` names: that is a Draw Things store carrying the
+// AUDIO VAE too, which audio-vae-decode claims for the whole run.
 std::vector<ResourceClaim>
 VideoRefEncoderStage::decide_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _hf_dir);
-  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
-  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
   // The encoder this stage LOADS -- `encoder_dir` when set, as
   // declare_resources claims it. Phasing the release's copy left the
   // claimed one (a 32B Draw Things .ckpt) persistent through the denoise.
-  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
-    enc = w;
-  }
+  const auto [enc, vvae] = claimed_dirs_();
 
   const bool releases =
       _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
       (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
        model_memory::bounded(session(), {enc}, model_memory::kHeadroom));
   if (!releases) { return {}; }
+  std::vector<std::string> dirs{enc};
+  if (weights_path_(_vae_weights).empty()) { dirs.push_back(vvae); }
   return model_memory::weight_claims_in_phase(
-      {enc}, model_memory::kPhaseCondition);
+      dirs, model_memory::kPhaseCondition);
+}
+
+VideoRefEncoderStage::ClaimedDirs
+VideoRefEncoderStage::claimed_dirs_() const
+{
+  namespace fs = std::filesystem;
+  ClaimedDirs d;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  d.enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+  if (d.enc.empty()) { d.enc = (fs::path(root) / "text_encoder").string(); }
+  d.vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
+  if (d.vvae.empty()) { d.vvae = (fs::path(root) / "video_vae").string(); }
+  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
+    d.enc = w;
+  }
+  if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
+    d.vvae = w;
+  }
+  return d;
 }
 
 Job
@@ -1491,6 +1506,14 @@ VideoRefEncoderStage::unload_models_()
   _video_vae.reset();
   _audio_vae.reset();
   _unloaded = true;
+  // The phase claims' other half (decide_resources): the release they
+  // promised, which the manager audits at the end of the launch. A dir
+  // left unphased is not audited, so naming it costs nothing.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    const ClaimedDirs d = claimed_dirs_();
+    mgr->note_phase_released(d.enc);
+    mgr->note_phase_released(d.vvae);
+  }
 }
 
 bool

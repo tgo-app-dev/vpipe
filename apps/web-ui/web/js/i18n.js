@@ -2014,6 +2014,98 @@ const STRINGS = {
       '负向提示词的条件（形状/类型相同）；仅在接了负向提示词时才发出',
       '負向提示詞的條件（形狀/型別相同）；僅在接了負向提示詞時才發出'],
 
+  // ---- Latent Upscale (generative) ----
+  'stage.latent-upscale.name': ['', '潜在放大', '潛在放大'],
+  'stage.latent-upscale.doc': ['',
+      '不经解码直接放大 MiniMax-H3 的视频潜在：用 H3 潜在放大器（一个 3D 卷'
+      + '积网络）——这正是 Open-H3-Regenerate-2K 在编码草稿与在更大尺寸上精'
+      + '修之间执行的那一步（768P -> 2K）。',
+      '不經解碼直接放大 MiniMax-H3 的影片潛在：用 H3 潛在放大器（一個 3D 卷'
+      + '積網路）——這正是 Open-H3-Regenerate-2K 在編碼草稿與在更大尺寸上精'
+      + '修之間執行的那一步（768P -> 2K）。'],
+  'cfg.latent-upscale.hf_dir': ['',
+      '潜在放大器：模型库键、Open-H3-Regenerate-2K 发布'
+      + '（Efficient-Large-Model/Open-H3-Regenerate-2K：其 latent_upsampler/）'
+      + '、放大器自己的仓库，或 .safetensors 文件本身。可选：模型输入端口上的 '
+      + 'model-select 来源会覆盖它',
+      '潛在放大器：模型庫鍵、Open-H3-Regenerate-2K 發布'
+      + '（Efficient-Large-Model/Open-H3-Regenerate-2K：其 latent_upsampler/）'
+      + '、放大器自己的儲存庫，或 .safetensors 檔案本身。可選：模型輸入埠上的 '
+      + 'model-select 來源會覆蓋它'],
+  'cfg.latent-upscale.width': ['',
+      '目标宽度，单位为像素（与 `height` 一起）。按放大器节点自己的规则取整'
+      + '：先对齐到 `align`，再对齐到完整的 16 像素潜在格',
+      '目標寬度，單位為像素（與 `height` 一起）。按放大器節點自己的規則取整'
+      + '：先對齊到 `align`，再對齊到完整的 16 像素潛在格'],
+  'cfg.latent-upscale.height': ['',
+      '目标高度，单位为像素。若不是完整的 32 像素格，就按下一个完整格计算'
+      + '（1080 -> 1088，2160 -> 2176），潜在上带一个居中的裁剪框，'
+      + 'vae-decode 据此把画面裁回去',
+      '目標高度，單位為像素。若不是完整的 32 像素格，就按下一個完整格計算'
+      + '（1080 -> 1088，2160 -> 2176），潛在上帶一個置中的裁切框，'
+      + 'vae-decode 據此把畫面裁回去'],
+  'cfg.latent-upscale.scale': ['',
+      '以输入自身像素尺寸的倍数给出目标，代替 width / height。0（默认）使用 '
+      + 'width / height',
+      '以輸入自身像素尺寸的倍數給出目標，代替 width / height。0（預設）使用 '
+      + 'width / height'],
+  'cfg.latent-upscale.align': ['',
+      '目标的像素对齐；32（节点的取值）可使潜在两边都为偶数，满足 DiT 的 2x2 '
+      + 'patch',
+      '目標的像素對齊；32（節點的取值）可使潛在兩邊都為偶數，滿足 DiT 的 2x2 '
+      + 'patch'],
+  'cfg.latent-upscale.two_pass_above': ['',
+      '目标比这个行数更高时分两趟完成，先到这个高度，每一趟都在网络训练过'
+      + '的范围之内——即发布版的 4K 做法。0 表示从不拆分',
+      '目標比這個列數更高時分兩趟完成，先到這個高度，每一趟都在網路訓練過'
+      + '的範圍之內——即發布版的 4K 做法。0 表示從不拆分'],
+  'cfg.latent-upscale.normalization': ['',
+      "'release'（默认）：网络看到的是已白化的潜在再按 H3 的统计量归一化一"
+      + '次，这正是 Open-H3-Regenerate-2K 调用它的方式（其节点预期的是 '
+      + "ComfyUI 的原始潜在）——其结果就是这样做出来的。'once'：把已白化的潜"
+      + '在直接作为网络输入，这才是节点对原始潜在的本意',
+      "'release'（預設）：網路看到的是已白化的潛在再按 H3 的統計量正規化一"
+      + '次，這正是 Open-H3-Regenerate-2K 呼叫它的方式（其節點預期的是 '
+      + "ComfyUI 的原始潛在）——其結果就是這樣做出來的。'once'：把已白化的潛"
+      + '在直接作為網路輸入，這才是節點對原始潛在的本意'],
+  'cfg.latent-upscale.frames': ['',
+      '仅用于规划：在任何潜在出现之前，内存规划按这个片段长度为本阶段的激'
+      + '活值记账。真正到来的潜在才说了算',
+      '僅用於規劃：在任何潛在出現之前，記憶體規劃按這個片段長度為本階段的激'
+      + '活值記帳。真正到來的潛在才說了算'],
+  'cfg.latent-upscale.i8_gemm': ['',
+      '加速模式（有损）：卷积的 GEMM 改用动态 int8，仅 M5 矩阵核心（其他机'
+      + '器上忽略）。默认关闭——放大器只占精修的百分之几——之所以可设，是为了'
+      + '让这个取舍能被测量。环境变量 VPIPE_I8_GEMM 可覆盖',
+      '加速模式（失真）：卷積的 GEMM 改用動態 int8，僅 M5 矩陣核心（其他機'
+      + '器上忽略）。預設關閉——放大器只占精修的百分之幾——之所以可設，是為了'
+      + '讓這個取捨能被測量。環境變數 VPIPE_I8_GEMM 可覆寫'],
+  'cfg.latent-upscale.i8_gemm_tier': ['',
+      "i8_gemm 运行哪一档 int8，用 generate-image 的说法：'accurate'（默认）"
+      + "每次调用时把各卷积的权重量化；'fast'、'token' 与 'token_plain' 把 "
+      + "3x3x3 卷积的权重以 int8 布局常驻（字节减半）",
+      "i8_gemm 執行哪一檔 int8，用 generate-image 的說法：'accurate'（預設）"
+      + "每次呼叫時把各卷積的權重量化；'fast'、'token' 與 'token_plain' 把 "
+      + "3x3x3 卷積的權重以 int8 布局常駐（位元組減半）"],
+  'cfg.latent-upscale.unload_when_idle': ['',
+      "'auto'（默认）与 'destroy' 在每个潜在之后释放网络——它重新加载很快，"
+      + "而随后的 DiT 需要这块空间；'keep' 在整次运行中一直保留",
+      "'auto'（預設）與 'destroy' 在每個潛在之後釋放網路——它重新載入很快，"
+      + "而隨後的 DiT 需要這塊空間；'keep' 在整次執行中一直保留"],
+  'port.latent-upscale.in.latent': ['',
+      'f32 [24, T, h, w] 已白化的 MiniMax-H3 视频潜在（来自 vae-encode、'
+      + 'generate-video）',
+      'f32 [24, T, h, w] 已白化的 MiniMax-H3 影片潛在（來自 vae-encode、'
+      + 'generate-video）'],
+  'port.latent-upscale.in.model': ['',
+      '可选的共享模型引用，来自 model-select 来源；覆盖 hf_dir',
+      '可選的共享模型參照，來自 model-select 來源；覆蓋 hf_dir'],
+  'port.latent-upscale.out.latent': ['',
+      'f32 [24, T, H, W]，已白化，带着输入的边带；当所要的尺寸不是完整格时'
+      + '另加一个 `crop_box`',
+      'f32 [24, T, H, W]，已白化，帶著輸入的邊帶；當所要的尺寸不是完整格時'
+      + '另加一個 `crop_box`'],
+
   // ---- LoRA training (generative) ----
   'stage.training-dataset.name': ['', '训练数据集', '訓練資料集'],
   'stage.training-dataset.doc': ['',
@@ -3524,6 +3616,21 @@ const STRINGS = {
       + '同一個節拍會讓這種拆分淪為約定而非型別。未接時，這類模型族只產生影'
       + '片並明確說明；它絕不能自行編造一個全零的條件——那等於在說「靜音」，'
       + '而不是「沒有」。不接受第二路條件的模型族會忽略它'],
+  'port.generate-video.init_latent': ['',
+      '可选：要精修而非从噪声生成的片段（MiniMax-H3：Open-H3-Regenerate-2K）'
+      + '：f32 [z, T, H/16, W/16]，已白化——草稿的 vae-encode，或其 '
+      + 'latent-upscale 结果。片段被送回精修的第一个 sigma，再在它自己的几何'
+      + '（潜在的，而非本阶段的 width / height）上重新去噪，以提示词和一段编'
+      + '码后的静音为条件；关键帧与参考输入会被忽略。调度由模型配置的 '
+      + '`refine_start_sigma` / `refine_shift` 在本阶段的 `steps` 上给出——3 '
+      + '即发布版的取值。请在模型配置上接上发布版的合并 LoRA',
+      '可選：要精修而非從雜訊產生的片段（MiniMax-H3：Open-H3-Regenerate-2K）'
+      + '：f32 [z, T, H/16, W/16]，已白化——草稿的 vae-encode，或其 '
+      + 'latent-upscale 結果。片段被送回精修的第一個 sigma，再在它自己的幾何'
+      + '（潛在的，而非本階段的 width / height）上重新去噪，以提示詞和一段編'
+      + '碼後的靜音為條件；關鍵影格與參考輸入會被忽略。排程由模型設定的 '
+      + '`refine_start_sigma` / `refine_shift` 在本階段的 `steps` 上給出——3 '
+      + '即發布版的取值。請在模型設定上接上發布版的合併 LoRA'],
   'port.generate-video.latent': ['',
       'f32 潜在视频 [z, T, H/r, W/r]（已白化），边带 {fps, frames}。z/r 即'
       + '常驻模型族的 VAE 几何参数',
@@ -3961,6 +4068,31 @@ const STRINGS = {
       + '或單個檔案——Draw Things 的 .ckpt（Qwen-Image-2.1 的 VAE、MiniMax-H3'
       + ' 的影片 VAE），按原版的名稱讀取。設定（潛變數統計量、幾何結構）仍取'
       + '自 hf_dir 的 VAE'],
+  'cfg.vae-decode.fast_decoder': ['',
+      '仅 MiniMax-H3：改用 Open-H3-Regenerate-2K 附带的快速解码器（vae_fast/，'
+      + '出自 NVIDIA 的 StreamRender-H3）来解码，而不是原版解码器——可以是注册'
+      + '表键、它所在的目录或 .safetensors 文件。有损：发布方给出的结果约比原'
+      + '版解码器低 30 dB。一个 24 层的 ViT，在 5 个潜在帧 x 16 x 16 个 token '
+      + '的窗口上运算，不分块、不重叠：在 M4 Pro 上实测 '
+      + '2560x1440、39 帧的片段 88 秒，对比原版 318 秒。它持有 3.2 GB（bf16），'
+      + '原版解码器持有 4.6 GB，但它的工作集随片段增长——它在层与层之间保留'
+      + '片段的每个 token：2K 的 124 帧为 12.2 GB，另加它输出的片段。内存规划'
+      + '在第一个片段时才得知这一数字；在此之前，它计入的是原版解码器的工作集。'
+      + '像原版一样读取 i8_gemm / '
+      + 'i8_gemm_tier（矩阵核心）与 ane_ffn；潜在统计量仍取自 hf_dir 的 VAE。'
+      + '单个潜在帧（一张图片）不归它解码',
+      '僅 MiniMax-H3：改用 Open-H3-Regenerate-2K 附帶的快速解碼器（vae_fast/，'
+      + '出自 NVIDIA 的 StreamRender-H3）來解碼，而不是原版解碼器——可以是登錄'
+      + '檔鍵、它所在的目錄或 .safetensors 檔案。失真：發佈方給出的結果約比原'
+      + '版解碼器低 30 dB。一個 24 層的 ViT，在 5 個潛在影格 x 16 x 16 個 token '
+      + '的視窗上運算，不分塊、不重疊：在 M4 Pro 上實測 '
+      + '2560x1440、39 影格的片段 88 秒，對比原版 318 秒。它持有 3.2 GB（bf16），'
+      + '原版解碼器持有 4.6 GB，但它的工作集隨片段增長——它在層與層之間保留'
+      + '片段的每個 token：2K 的 124 影格為 12.2 GB，另加它輸出的片段。記憶體'
+      + '規劃在第一個片段時才得知這一數字；在此之前，它計入的是原版解碼器的工作集。'
+      + '像原版一樣讀取 i8_gemm / '
+      + 'i8_gemm_tier（矩陣核心）與 ane_ffn；潛在統計量仍取自 hf_dir 的 VAE。'
+      + '單個潛在影格（一張圖片）不歸它解碼'],
   'cfg.vae-decode.fps': ['',
       '当潜变量本身没有携带帧率时，打在每个解码出的视频帧边带上的帧率。来自'
       + ' generate-video 的潜变量是携带的，因此这只是从别处读入时的后备值。'
@@ -3980,29 +4112,45 @@ const STRINGS = {
       + '預設）根據實體記憶體與管線的權重位元組數自行判斷；"always" / "'
       + 'never" 可強制'],
   'cfg.vae-decode.i8_gemm': ['',
-      '加速模式（有损）：编解码器的大块矩阵乘改用动态 int8 GEMM。默认关闭，而'
-      + '且是出于质量上的理由，不是因为没实现：编解码器是潜变量与人眼所见像素'
-      + '之间的最后一环，它里面的近似没有地方可以被吸收——而 DiT 内部同样的取'
-      + '舍，后面还跟着几十个 block 和一次解码。之所以可设，是为了让这个取舍能'
-      + '被测量。只有已注册的模型族会读取它；内置的编解码器会忽略。环境变量 '
-      + 'VPIPE_I8_GEMM 可覆盖',
-      '加速模式（失真）：編解碼器的大塊矩陣乘改用動態 int8 GEMM。預設關閉，而'
-      + '且是出於品質上的理由，不是因為沒實作：編解碼器是潛變數與人眼所見像素'
-      + '之間的最後一環，它裡面的近似沒有地方可以被吸收——而 DiT 內部同樣的取'
-      + '捨，後面還跟著幾十個 block 和一次解碼。之所以可設，是為了讓這個取捨能'
-      + '被測量。只有已註冊的模型族會讀取它；內建的編解碼器會忽略。環境變數 '
-      + 'VPIPE_I8_GEMM 可覆寫'],
+      '加速模式（有损）：编解码器的大块矩阵乘改用动态 int8。默认关闭，而且是'
+      + '出于质量上的理由，不是因为没实现：编解码器是潜变量与人眼所见像素之间'
+      + '的最后一环，它里面的近似没有地方可以被吸收——而 DiT 内部同样的取舍，'
+      + '后面还跟着几十个 block 和一次解码。之所以可设，是为了让这个取舍能被测'
+      + '量。读取它的有：Qwen-Image 编解码器（Krea-2、Qwen-Image-2.1 的：3x3 '
+      + '卷积走 int8 硬件卷积，激活按通道各有步长，物化的中间块注意力的两个 '
+      + 'GEMM 也走 int8——实测 1024^2 解码在 accurate / fast 下 1.15x / '
+      + '1.26x，与 f16 画面相差 52-60 / 50-57 dB）、2D AutoencoderKL（FLUX.2 '
+      + '与 FLUX.1 的：FLUX.2、FLUX.3、Z-Image、MOSS-Image、Boogu、Fibo 2.0——'
+      + '同样是 3x3 卷积）、MiniMax-H3 的快速解码器（fast_decoder：其 block '
+      + '投影——在基础款 M5 上实测 768P 解码 accurate / token 下 1.34x / '
+      + '1.94x），以及已注册的模型族；其余内置编解码器忽略它。仅矩阵核心。环'
+      + '境变量 VPIPE_I8_GEMM 可覆盖',
+      '加速模式（失真）：編解碼器的大塊矩陣乘改用動態 int8。預設關閉，而且是'
+      + '出於品質上的理由，不是因為沒實作：編解碼器是潛變數與人眼所見像素之間'
+      + '的最後一環，它裡面的近似沒有地方可以被吸收——而 DiT 內部同樣的取捨，'
+      + '後面還跟著幾十個 block 和一次解碼。之所以可設，是為了讓這個取捨能被測'
+      + '量。讀取它的有：Qwen-Image 編解碼器（Krea-2、Qwen-Image-2.1 的：3x3 '
+      + '卷積走 int8 硬體卷積，激活按通道各有步長，具體化的中間塊注意力的兩個 '
+      + 'GEMM 也走 int8——實測 1024^2 解碼在 accurate / fast 下 1.15x / '
+      + '1.26x，與 f16 畫面相差 52-60 / 50-57 dB）、2D AutoencoderKL（FLUX.2 '
+      + '與 FLUX.1 的：FLUX.2、FLUX.3、Z-Image、MOSS-Image、Boogu、Fibo 2.0——'
+      + '同樣是 3x3 卷積）、MiniMax-H3 的快速解碼器（fast_decoder：其 block '
+      + '投影——在基礎款 M5 上實測 768P 解碼 accurate / token 下 1.34x / '
+      + '1.94x），以及已註冊的模型族；其餘內建編解碼器忽略它。僅矩陣核心。環'
+      + '境變數 VPIPE_I8_GEMM 可覆寫'],
   'cfg.vae-decode.ane_ffn': ['',
       '加速解码（有损，fp16）：把解码器各 block 的前馈按行切分给 GPU 与 Apple '
-      + '神经引擎并发执行。仅 MiniMax-H3 的视频 VAE：它的解码器是一个 ViT，前'
-      + '馈约占解码的 70%，而注意力仍留在 GPU 上。共用一个运行时权重模块（约 '
-      + '0.3 GB），从资源计划中申请，并按每个 tile、每个 block 暂存。其余模型'
-      + '族会忽略它',
+      + '神经引擎并发执行。仅 MiniMax-H3 的视频 VAE（原版或快速解码器）：它的'
+      + '解码器是一个 ViT，前馈约占解码的 70%，而注意力仍留在 GPU 上。共用一个'
+      + '运行时权重模块（约 0.3 GB），从资源计划中申请，并按每个 tile（快速解'
+      + '码器：每一层）、每个 block 暂存。在 M4 Pro 上实测快速解码器 2560x1440 '
+      + 'x 39 帧：59 秒，对比 88 秒。其余模型族会忽略它',
       '加速解碼（失真，fp16）：把解碼器各 block 的前饋按行切分給 GPU 與 Apple '
-      + '神經引擎並行執行。僅 MiniMax-H3 的影片 VAE：它的解碼器是一個 ViT，前'
-      + '饋約占解碼的 70%，而注意力仍留在 GPU 上。共用一個執行階段權重模組（約'
-      + ' 0.3 GB），從資源計畫中申請，並按每個 tile、每個 block 暫存。其餘模型'
-      + '族會忽略它'],
+      + '神經引擎並行執行。僅 MiniMax-H3 的影片 VAE（原版或快速解碼器）：它的'
+      + '解碼器是一個 ViT，前饋約占解碼的 70%，而注意力仍留在 GPU 上。共用一個'
+      + '執行階段權重模組（約 0.3 GB），從資源計畫中申請，並按每個 tile（快速解'
+      + '碼器：每一層）、每個 block 暫存。在 M4 Pro 上實測快速解碼器 2560x1440 '
+      + 'x 39 影格：59 秒，對比 88 秒。其餘模型族會忽略它'],
   'cfg.vae-decode.ane_rows': ['',
       'ANE 在每个前馈的行中所占的比例，按整块取整；0（默认）按两个引擎的实测'
       + '耗时来平衡',
@@ -4128,6 +4276,19 @@ const STRINGS = {
       + '）釋放掉，正是讓一個大 DiT 能在同一台機器上跑起來的關鍵。"auto"（'
       + '預設）根據實體記憶體與管線的權重位元組數自行判斷；"always" / "'
       + 'never" 可強制'],
+  'cfg.vae-encode.posterior': ['',
+      "MINIMAX-H3 片段：取后验的哪一个潜在。'mean'（默认）——关键帧锚点要的"
+      + "就是它，精确无噪。'sample'——均值 + 标准差 * 噪声，噪声由 torch 的 "
+      + 'CPU 生成器按 `posterior_seed` 为潜在的 [1, z, T, H, W] 抽取：'
+      + 'Open-H3-Regenerate-2K 编码草稿时就是这样做的。单张图片总是取均值',
+      "MINIMAX-H3 片段：取後驗的哪一個潛在。'mean'（預設）——關鍵影格錨點要"
+      + "的就是它，精確無雜訊。'sample'——平均值 + 標準差 * 雜訊，雜訊由 "
+      + 'torch 的 CPU 產生器按 `posterior_seed` 為潛在的 [1, z, T, H, W] 抽'
+      + '取：Open-H3-Regenerate-2K 編碼草稿時就是這樣做的。單張圖片總是取平'
+      + '均值'],
+  'cfg.vae-encode.posterior_seed': ['',
+      '`posterior: sample` 的种子（发布版的 --vae-seed，42）',
+      '`posterior: sample` 的種子（發布版的 --vae-seed，42）'],
   'cfg.vae-encode.i8_gemm': ['',
       '加速模式（有损）：编解码器的大块矩阵乘改用动态 int8 GEMM。默认关闭，而'
       + '且是出于质量上的理由，不是因为没实现：编解码器是潜变量与人眼所见像素'
@@ -5645,6 +5806,20 @@ const STRINGS = {
       '配乐时长；0 表示由视频的帧数 / 帧率推导，这样两种模态在构造上就等长',
       '配樂長度；0 表示由影片的影格數 / 影格率推導，這樣兩種模態在結構上就'
       + '等長'],
+  'cfg.minimax-h3-model-config.refine_start_sigma': ['',
+      '仅用于精修（接了 generate-video 的 init_latent——'
+      + 'Open-H3-Regenerate-2K）：片段被送回的噪声水平，取值 (0, 1]。默认'
+      + '（-1）：发布版针对该步数自己的网格——3 步为 0.909375、0.857、0.667；'
+      + '2 步为 0.7、0.494。越低保留的输入越多；其后的步按 `refine_shift` 排',
+      '僅用於精修（接了 generate-video 的 init_latent——'
+      + 'Open-H3-Regenerate-2K）：片段被送回的雜訊水準，取值 (0, 1]。預設'
+      + '（-1）：發布版針對該步數自己的網格——3 步為 0.909375、0.857、0.667；'
+      + '2 步為 0.7、0.494。越低保留的輸入越多；其後的步按 `refine_shift` 排'],
+  'cfg.minimax-h3-model-config.refine_shift': ['',
+      '仅用于精修：从 `refine_start_sigma` 往后各步所遵循的 shift，即在均匀'
+      + '间隔的未平移 sigma 上取 s x / (1 + (s - 1) x)。6 为发布版的取值',
+      '僅用於精修：從 `refine_start_sigma` 往後各步所遵循的 shift，即在均勻'
+      + '間隔的未平移 sigma 上取 s x / (1 + (s - 1) x)。6 為發布版的取值'],
   'cfg.minimax-h3-model-config.linear_branch': ['',
       '可选：VDN-H3 的发布根目录——也就是放着它的 config.json 与 '
       + 'linear_branch/ 的那个目录。给了它，每个主 block 的注意力就变成混合式'
@@ -5820,12 +5995,14 @@ const STRINGS = {
   'port.minimax-h3-model-config.model_config': ['',
       'MiniMax-H3 生成参数，作为一个 FlexData 对象 {model_family: '
       + 'minimax-h3, video_shift, audio_shift, condition_timestep, '
-      + 'condition_audio_timestep, audio_seconds，以及可选的 lora、lora2 '
+      + 'condition_audio_timestep, audio_seconds, refine_start_sigma, '
+      + 'refine_shift，以及可选的 lora、lora2 '
       + '与它们的强度，可选的 preview_vae 与它的三个选项}，供 generate-video '
       + '的 model_config 输入端口使用',
       'MiniMax-H3 生成參數，作為一個 FlexData 物件 {model_family: '
       + 'minimax-h3, video_shift, audio_shift, condition_timestep, '
-      + 'condition_audio_timestep, audio_seconds，以及可選的 lora、lora2 '
+      + 'condition_audio_timestep, audio_seconds, refine_start_sigma, '
+      + 'refine_shift，以及可選的 lora、lora2 '
       + '與它們的強度，可選的 preview_vae 與它的三個選項}，供 generate-video '
       + '的 model_config 輸入埠使用'],
 
