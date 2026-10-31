@@ -1,0 +1,178 @@
+{
+  "id": "pika-h3-flex-reference-to-video",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "local/MiniMax-H3-Ref2VA-8bit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "References: @Image1 is the character sheet (front, three-quarter and back views of ONE character). @Image2 is the environment. @Video1 is the motion reference only. Make a new video of the character from @Image1, inside the environment from @Image2, performing exactly the body motion, choreography, timing and camera movement of the person in @Video1. Take NOTHING else from @Video1 - not the person's face, body, clothes, props, location, background, colours or photographic look. Keep the character exactly as designed in @Image1 - same face, proportions, outfit, colours - and render the whole video in the exact art style of @Image1 and @Image2, never photoreal. Only ONE character in frame. Style: vintage pop-art fashion illustration with black ink outlines, flat colour blocks, halftone and risograph grain, exactly as @Image1 and @Image2. Desmond dances on the terracotta checkerboard floor of his record shop from @Image2: the same whirling spins, flung arms and kicks as in @Video1, his mustard suit jacket flaring with each turn. Where the person in @Video1 holds the potted fern overhead, Desmond holds his vinyl record high above his head like a dance partner. He ends with arms wide and a little deadpan bow. Audio: an original upbeat 1960s-style soul groove playing from the turntable, loafers tapping and squeaking on the floor, a soft record-crackle. Normal real-time speed, NO slow motion. No text, no captions, no logos."
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12.0,
+        "audio_shift": 3.0,
+        "audio_seconds": 0.0,
+        "lora": "Pika-Labs/Pika-H3-Flex-ref2va",
+        "lora_scale": 1.0
+      }
+    },
+    {
+      "id": "video-ref-encoder",
+      "type": "video-ref-encoder",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "references": [
+          "character.jpg",
+          "environment.jpg",
+          "motion.mp4"
+        ],
+        "frames": 124,
+        "reference_image_short_edge": 1024,
+        "reference_video_short_edge": 480,
+        "reference_video_max_pixels": 399360,
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "video-ref-encoder",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "video-ref-encoder",
+          "oport": 1
+        },
+        {
+          "src": "video-ref-encoder",
+          "oport": 2
+        },
+        {
+          "src": "minimax-h3-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "height": 480,
+        "width": 832,
+        "frames": 124,
+        "fps": 24,
+        "steps": 6,
+        "seed": 42,
+        "i8_gemm": true,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 1
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "pika-h3-flex-reference-to-video.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

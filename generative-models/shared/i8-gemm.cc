@@ -180,6 +180,7 @@ I8GemmContext::I8GemmContext(MetalCompute* mc, bool want, bool bf16)
     _fast[4].to_fast = _lib_q.function("affine_to_i8pt_w8_r");
     _fast[4].to_fast4 = _lib_q.function("affine_to_i8pt_w4_r");
     _fast[4].dequant = _lib_q.function("i8pt_dequant_r");
+    _fn_tok_cr = _lib_q.function("quant_i8_tok_cr");
     set_token_kernel(false, false);
     bool db = false, wide = false, env = false;
     if (const char* e = std::getenv("VPIPE_I8_TOKEN_TILE")) {
@@ -952,6 +953,39 @@ I8GemmContext::quantize_fast(ComputeEncoder& enc, const SharedBuffer& x,
   _fq_m = M;
   _fq_k = K;
   _fq_gc = gc;
+  return true;
+}
+
+bool
+I8GemmContext::quantize_token_convrot(ComputeEncoder& enc,
+                                      const SharedBuffer& x, std::size_t xe,
+                                      int M, int K)
+{
+  _fq_m = _fq_k = _fq_gc = 0;
+  if (!_fn_tok_cr.valid() || fast_fns_(kTokenGroup) == nullptr || M <= 0 ||
+      K <= 0 || K % 256 != 0 || fast_group(K) != kTokenGroup) {
+    return false;
+  }
+  auto need = [&](SharedBuffer& sb, std::size_t bytes) {
+    if (sb.empty() || sb.byte_size() < bytes) {
+      sb = _mc->make_shared_buffer(bytes);
+    }
+    return !sb.empty();
+  };
+  if (!need(_xq, (std::size_t)M * K) ||
+      !need(_as, fast_scale_bytes(M, K, kTokenGroup))) {
+    return false;
+  }
+  enc.set_function(_fn_tok_cr);
+  enc.set_buffer(0, x, xe * 2);
+  enc.set_buffer(1, _xq);
+  enc.set_buffer(2, _as);
+  enc.set_constant(3, K);
+  // The rotated quantizers' geometry: a simdgroup a 256-block or two.
+  encode_rows_gc_(enc, M, K, kTokenGroup, false, /*rot=*/true);
+  _fq_m = M;
+  _fq_k = K;
+  _fq_gc = kTokenGroup;
   return true;
 }
 

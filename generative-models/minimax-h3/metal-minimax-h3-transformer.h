@@ -131,6 +131,20 @@ class MetalMiniMaxH3Transformer {
     int freq_dim      = 256;      // sinusoidal timestep width
     int time_hidden   = 5376;
     int time_dim      = 2688;     // AdaLN projection input
+    // ComfyUI's PRUNED form (its "curve form", community DiTs saved
+    // pruned): no timestep MLP. A `adaln_t_table` [curve_grid, time_dim]
+    // (1025 x 8) holds points of the time-embedding curve, lerped at
+    // t * (curve_grid - 1), and every AdaLN projection is [D, time_dim]
+    // over that point, with no silu, in f32. 0 = the released form.
+    int curve_grid    = 0;
+    bool pruned() const { return curve_grid > 0; }
+    // PRUNED only: a checkpoint that carries the RELEASED timestep MLP
+    // (`time_embedder.*`; the graph's own partition), for what needs
+    // the full embedding on a pruned DiT -- a full-model adapter's AdaLN
+    // modules, ported onto the curve, and an adapted or flow-map
+    // embedding, projected onto it (see CurveBasis). Empty: those are
+    // skipped (AdaLN modules) or refused (a flow map), as before.
+    std::string time_mlp_dir;
     int rope_freq_dim = 16;       // per AXIS; 3 axes, doubled -> rot 96
     // Only for a checkpoint with no `rope.inv_freq` tensor (the
     // diffusers layout), which the table is then computed from.
@@ -466,6 +480,9 @@ class MetalMiniMaxH3Transformer {
   // The width of the forward's [rows, rank] adapter scratch, every
   // slot's widest projection together.
   int lora_scratch_rank() const { return _lora_rank_total; }
+  // GEMMs run on ComfyUI's int8 ConvRot (or W4A8) codes as stored, on the
+  // token tier (Linear::cr), since load -- engagement, for a test.
+  std::uint64_t convrot_native_gemms() const { return _cr_gemms; }
 
   // What an adapter FILE will cost before anything loads -- the plan's
   // figure, off its header; lora_bytes() is the loaded model's. Every
@@ -482,8 +499,23 @@ class MetalMiniMaxH3Transformer {
     std::size_t streamed = 0;
     int         rank     = 0;
   };
+  // `pruned`: the DiT's config when it is ComfyUI's pruned form. Its
+  // AdaLN modules are then held as f32 deltas [D * 9] (bind_pruned_
+  // adaln_) rather than as factors -- ComfyUI `.diff` / `.diff_b`
+  // patches too, which a released DiT does not read -- and take no
+  // [rows, rank] scratch; an adapter on the timestep MLP adds that MLP,
+  // read to the host from `pruned->time_mlp_dir`.
   static LoraFootprint lora_footprint(const std::string& path,
-                                      int n_layers = 0);
+                                      int n_layers = 0,
+                                      const Config* pruned = nullptr);
+  // Whether an adapter FILE moves a pruned DiT's timestep embedding (it
+  // adapts the timestep MLP, or is a flow map), so the forward needs the
+  // off-curve tables bake_adaln builds (off_curve_bytes).
+  static bool moves_time_embedding(const std::string& path);
+  // What a pruned DiT holds to run such an adapter for `max_rows`
+  // schedule rows: the tables, one released AdaLN block read while they
+  // are built, and the released MLP on the host.
+  static std::size_t off_curve_bytes(const Config& c, int max_rows);
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
@@ -546,11 +578,60 @@ class MetalMiniMaxH3Transformer {
   // model is exactly the base again.
   bool two_time_active() const;
 
+  // A few-step adapter's SAMPLING CONTRACT, stated in a `manifest.json`
+  // BESIDE its file rather than in it -- Pika H3 Flex's (Pika-Labs/
+  // Pika-H3-Flex, `fl2va/` and `ref2va/`):
+  //
+  //   "trunk": "transformer" | "transformer_ref",
+  //   "numerics_policy": "bf16_conditioning_v1" | "fp32_conditioning_v1",
+  //   "sampling": {"knots": [1000, 750, 500, 250, 100, 40, 0],
+  //                "video_shift": 12.0, "audio_shift": 3.0,
+  //                "method": "renoise"}
+  //
+  // The knots over 1000 are a RAW grid each modality pushes through its
+  // own shift, in double and then rounded to float32 (diffusers'
+  // `shift_provided_sigmas`). "renoise" is the update the adapter was
+  // trained for: each step takes the clean estimate x0 = x + sigma v and
+  // puts it at the next sigma with FRESH noise, (1 - s') x0 + s' n --
+  // not an Euler step, which the release says outright is not
+  // equivalent. What the file decides, as a flow-map adapter's header
+  // does: denoise() runs it unless the caller names a grid of its own.
+  struct SamplingContract {
+    std::string release;               // `release_id`
+    std::string task;                  // "fl2va" / "ref2va"
+    std::string trunk;                 // "transformer" / "transformer_ref"
+    std::vector<double> sigmas;        // knots / 1000, raw, 1 -> 0
+    double video_shift = 0.0;          // 0 = unstated
+    double audio_shift = 0.0;
+    bool   renoise = false;            // method "renoise"
+    // `bf16_conditioning_v1`: the keyframe latents are rounded to bf16
+    // before they are noised and packed.
+    bool   bf16_conditioning = false;
+    int    slot = -1;                  // which adapter slot states it
+  };
+  // The contract an adapter FILE states, read from the `manifest.json`
+  // in its directory. False with `err` empty when there is none (no
+  // manifest, or one without `sampling`); false with a reason when one
+  // is there and does not parse -- a malformed contract is refused, not
+  // read as "no contract", since the run would then be the generic
+  // sampler the release warns against.
+  static bool sampling_contract_of(const std::string& adapter_file,
+                                   SamplingContract* out, std::string* err);
+  // The partition a contract's `trunk` names ("fl2va" / "ref2va"), or
+  // empty for a trunk this model does not know.
+  static std::string contract_partition(const SamplingContract& c);
+  // The contract of the slot that stated one while its strength is not
+  // 0; null otherwise. At 0 the adapter is off, and so is its sampler.
+  const SamplingContract* sampling_contract() const;
+
   // The timestep MLP's output BEFORE the silu, in f32, for each
   // `timesteps[i]` (and, when `endpoints` is given and a flow-map
   // adapter is live, blended with the endpoint embedding of
   // `endpoints[i]`). What the forward rounds to bf16 after its silu;
   // public so a test can hold it against the reference's own module.
+  // PRUNED (Config::curve_grid), the point of `adaln_t_table` each
+  // timestep lands on (curve_coords, t clamped to [0, 1]), which the
+  // AdaLN projections read as it is: no MLP and no silu.
   bool time_embedding(const std::vector<float>& timesteps,
                       const std::vector<float>* endpoints,
                       std::vector<float>* out) const;
@@ -674,6 +755,14 @@ class MetalMiniMaxH3Transformer {
     // early, structure-deciding steps exact (HyperFlow's published Sol
     // recipe keeps the first two of eight dense) says so step by step.
     bool dense_attention = false;
+    // This forward's Sol-Attn ROUTING in place of the config's: its tau
+    // and threshold form, where `sol_routing` is set. Per forward like
+    // dense_attention -- a sampler that routes its steps differently
+    // says so step by step. Neither changes what Sol holds: the
+    // threshold's buffers are the call's own dead scratch.
+    bool  sol_routing = false;
+    float sol_tau     = 1.0f;
+    bool  sol_exact   = false;
     // Sage's int8 P*V (sage::Config::pv8) off for this forward -- the
     // int8 QK alone -- as the loop's sage_pv8_from_step says.
     bool sage_pv8_off = false;
@@ -973,11 +1062,24 @@ class MetalMiniMaxH3Transformer {
   // branch costs this model the amount by which its need exceeds an
   // arena the attention was going to hold anyway -- nothing at all at
   // both geometries measured.
+  // `widen` floors the dequant scratch at what an FP8 / int8 / W4A8
+  // checkpoint widens into it per GEMM (fp8_widen_bytes), on EVERY GPU
+  // and including projections the four above do not cover (a released
+  // AdaLN, 2,688 wide, at the bake).
   static std::size_t scratch_bytes(const Config& c, int seq, int n_text,
                                    int n_t, bool with_dequant,
                                    bool narrow_ff = false,
                                    std::size_t arena_floor = 0,
-                                   int band = 0);
+                                   int band = 0, std::size_t widen = 0);
+
+  // The widest projection an FP8 / int8 / W4A8 checkpoint widens to bf16
+  // ahead of its GEMM (into the dequant scratch), N x K x 2 -- the fused
+  // q|k|v of a file that stores it split included; 0 for a checkpoint
+  // with none. Off the headers (`dit_dir` as config_from_json takes it),
+  // or, for a loaded model, off what it read.
+  static std::size_t fp8_widen_bytes(const std::string& dit_dir,
+                                     const Config& c);
+  std::size_t fp8_widen_bytes() const { return _f8_widen; }
 
   // THE BANDED FORWARD. A long sequence's main blocks run a BAND of rows
   // at a time: every row's residual and q / k / v are kept -- attention
@@ -1060,6 +1162,14 @@ class MetalMiniMaxH3Transformer {
   // real carve and not a subtraction; see
   // MetalSolAttention::private_bytes.
   std::size_t sol_scratch_bytes(int seq) const;
+  // The share of key blocks Sol-Attn's routing kept exact over the LAST
+  // forward's routed layers: valid once forward() has returned, until
+  // the next one starts (which reports and resets it). -1 where nothing
+  // was routed.
+  double sol_kept_fraction() const;
+  // What the Sol objects hold of their own -- pinned, unlent scratch and
+  // the prepared keys -- which is what sol_scratch_bytes() books.
+  std::size_t sol_held_bytes() const;
 
   // ...and SageAttention's, which a preflight needs for the same reason
   // and did not have: its int8 twins of q and k are H * seq * head_dim
@@ -1278,6 +1388,11 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer f8_scale;
     bool f8_per_row = false;
     int f8_rot = 0;
+    // W4A8 (f8 kW4A8): `codes` the [N, K / 2] nibbles, `f8_scale` the
+    // row scale, these the E4M3 relative scales [N, K / f8_qgroup] and
+    // the codebook (16 f32; empty: code - 8).
+    metal_compute::SharedBuffer f8_srel, f8_cb;
+    int f8_qgroup = 0;
     // I8GemmContext's int8 LAYOUT (Config::i8_tier) when gc > 0: `codes`
     // int8 [n, k] and `cscales` its scales at group gc (kTokenGroup: f32
     // [n]) -- or, `pc`, a w4 pack's codes / scales / qbias as stored,
@@ -1288,6 +1403,13 @@ class MetalMiniMaxH3Transformer {
     int n = 0, k = 0;
     metal_compute::SharedBuffer cscales;
     bool i8x = false;
+    // ComfyUI's int8 CONVROT codes run as stored on the token tier (gc ==
+    // kTokenGroup): `cr` their group (256), the activation rotated alike
+    // (I8GemmContext::quantize_token_convrot); `cscales` the row scale.
+    // `cr_w4`: a W4A8 weight's nibbles (`codes`, with f8_srel / f8_cb /
+    // f8_qgroup), decoded to those int8 codes per GEMM.
+    int cr = 0;
+    bool cr_w4 = false;
     // The w4 pack kept as stored and converted per projection (gemm_);
     // false for a layout held (Config::i8_hold_w4), w4 or w8.
     bool pc = false;
@@ -1519,8 +1641,17 @@ class MetalMiniMaxH3Transformer {
                    metal_compute::SharedBuffer& out) const;
   // One row of the MLP: sinusoid(t) -> proj_in -> silu -> proj_out, with
   // every live slot's host adapter on each projection. `endpoint` picks
-  // the ENDPOINT embedder's adapters (the base weights are shared).
-  void time_mlp_row_(double t, bool endpoint, float* out) const;
+  // the ENDPOINT embedder's adapters (the base weights are shared);
+  // `base_only` takes none (the pruned curve's basis is fit to the base).
+  void time_mlp_row_(double t, bool endpoint, float* out,
+                     bool base_only = false) const;
+  // The released MLP's embedding before the silu, every live adapter on
+  // it and a flow map's blend: time_embedding() for a released DiT, and
+  // what a pruned one projects (and bakes the rest of) when an adapter
+  // moves it.
+  bool mlp_embedding_(const std::vector<float>& timesteps,
+                      const std::vector<float>* endpoints,
+                      std::vector<float>* out) const;
 
   struct Scratch {
     int seq = -1, n_text = -1, n_t = -1;
@@ -1865,6 +1996,17 @@ class MetalMiniMaxH3Transformer {
     // to `_flow` with this slot's index.
     bool    two_time = false;
     FlowMap flow;
+    // Set when a manifest beside the FILE states a sampling contract;
+    // load() then promotes it to `_contract` with this slot's index.
+    bool             has_contract = false;
+    SamplingContract contract;
+    // PRUNED: what this adapter adds to the AdaLN, per main block and
+    // the final layer, f32 [D * 8 + D] = (dW, db) at strength 1 --
+    // ComfyUI `.diff` / `.diff_b` patches as the file stores them, and a
+    // full-model adapter's AdaLN modules ported onto the curve basis.
+    // Empty buffer: nothing for that projection.
+    std::vector<metal_compute::SharedBuffer> pdelta;
+    metal_compute::SharedBuffer              pdelta_final;
     int   modules  = 0;
     int   banded   = 0;
     int   max_rank = 0;
@@ -1877,6 +2019,9 @@ class MetalMiniMaxH3Transformer {
   std::vector<LoraSlot> _lora;
   // The flow-map adapter's header facts; `slot` < 0 when there is none.
   FlowMap _flow;
+  // The sampling contract an adapter's manifest states; `slot` < 0 when
+  // there is none.
+  SamplingContract _contract;
   // Summed max ranks: what the [seq, rank] scratch has to hold for all
   // of them at once, and the stride that turns a rank prefix into an
   // offset.
@@ -2011,6 +2156,75 @@ class MetalMiniMaxH3Transformer {
                     const metal_compute::SharedBuffer& mod, int n_t);
   metal_compute::ComputeLibrary  _lib_regen;
   metal_compute::ComputeFunction _fn_curve_add;
+  // The PRUNED form's AdaLN (Config::curve_grid): `adaln_t_table` on the
+  // host in f32, every projection AS STORED in the trunk -- [D, 8] and
+  // [D], `dtype` 0 F32 / 1 F16 / 2 BF16, widened exactly in the kernel
+  // -- and this forward's points, [n_t][8] f32, fresh every forward as
+  // `_curve_coords` is.
+  struct PrunedAdaln {
+    metal_compute::SharedBuffer w, b;
+    int dtype = 0;
+  };
+  std::vector<float>       _adaln_t_table;
+  std::vector<PrunedAdaln> _padaln;          // one a main block
+  PrunedAdaln              _final_padaln;
+  metal_compute::SharedBuffer    _pcoords;
+  metal_compute::ComputeFunction _fn_pruned_mod;
+  metal_compute::ComputeFunction _fn_pruned_patch;
+  // The projection's modulation into `out` [n_t, D]; `L` the main block,
+  // -1 the final layer, whose live slots' deltas are added to the
+  // weight in f32 first (into `_padaln_patch`).
+  // `res` (and `res_off`, bytes): the baked off-curve rows to add, when
+  // an adapter moves the embedding (bake_adaln).
+  void pruned_mod_(metal_compute::ComputeEncoder& enc,
+                   const PrunedAdaln& p, int L,
+                   const metal_compute::SharedBuffer& out, int n_t, int D,
+                   const metal_compute::SharedBuffer* res = nullptr,
+                   std::size_t res_off = 0);
+  metal_compute::ComputeFunction _fn_pruned_res;
+  // A native W4A8 weight's int8 codes for the GEMM running (gemm_), from
+  // w4a8_to_i8; and that kernel.
+  metal_compute::SharedBuffer    _cr_codes;
+  // fp8_widen_bytes() for what this model read.
+  std::size_t _f8_widen = 0;
+  metal_compute::SharedBuffer convrot_row_scales_(
+      const MetalLlamaWeights& src, const fp8::Weight& fw, int N);
+  std::uint64_t                  _cr_gemms = 0;
+  metal_compute::ComputeLibrary  _lib_dq;
+  metal_compute::ComputeFunction _fn_w4a8_i8;
+  metal_compute::SharedBuffer _padaln_patch;
+  // The pruned curve's affine basis in the RELEASED embedding, fit at
+  // the first need from Config::time_mlp_dir's MLP over the table:
+  //   silu(temb(t)) ~ U c(t) + m       (U [mlp, 8], m [mlp])
+  // `pinv` [8, mlp] = (U^T U)^-1 U^T takes an embedding back onto the
+  // curve's coordinates. `residual` is the fit's relative residual.
+  struct CurveBasis {
+    std::vector<float> u, m, pinv;
+    int    mlp = 0;
+    double residual = 0.0;
+    bool empty() const { return mlp == 0; }
+  };
+  CurveBasis _basis;
+  // Read the released MLP and fit the basis; false + *err when there is
+  // no time_mlp_dir, it cannot be read, or it does not span the table.
+  bool ensure_curve_basis_(std::string* err);
+  // The MLP's output width: the AdaLN input released, the basis's pruned.
+  int mlp_dim_() const { return _cfg.pruned() ? _basis.mlp : _cfg.time_dim; }
+  // Whether this forward's points come from the MLP projected onto the
+  // basis (a live adapter on the timestep MLP, or a flow map) rather
+  // than straight off the table.
+  bool pruned_projects_() const;
+  // A pruned adapter's AdaLN deltas: `.diff` / `.diff_b` read off the
+  // file, then the full-model AdaLN modules `ad` binds ported through
+  // the basis. Fills slot.pdelta / pdelta_final.
+  bool bind_pruned_adaln_(lora::Adapter* ad, const std::string& path,
+                          bool diffusers, LoraSlot& slot, std::string* err);
+  // bake_adaln for a pruned DiT whose embedding an adapter moves: the
+  // rows (`all`, and a flow map's endpoints) the curve cannot carry,
+  // through the released AdaLN, into _adaln_tab / _final_adaln_tab.
+  bool bake_pruned_off_curve_(const std::vector<float>& all,
+                              const std::vector<float>* all_r,
+                              std::string* err);
   // This forward's c(t), [curve slot][n_t][8] f32, filled after the
   // timestep embedding; `_curve_n_t` the n_t it holds.
   metal_compute::SharedBuffer _curve_coords;
@@ -2151,6 +2365,9 @@ class MetalMiniMaxH3Transformer {
   // Sol's routed key blocks over the last forward's calls, for its
   // report (a banded layer makes several calls).
   long long _sol_routed_total = 0;
+  // The Sol config this forward routes with: the load's, or the Step's
+  // own tau and threshold (Step::sol_routing).
+  sol::Config _sol_fwd;
   // The streaming attention's two parameter blocks (text over text, media
   // over [cache ; text ; media]) and its pipelines, one per alignment
   // pair -- qL and kL move every chunk, so they are built on demand and

@@ -44,6 +44,9 @@ namespace {
 // a score at the protocol's planning budget unless cot=off (no score).
 // Plan-time only; a song whose real prefix is longer revises the claims
 // before it runs.
+constexpr SpecExtra kSolThreshChoices[] = {
+  {spec_key::kChoices, "diag,exact"},
+};
 constexpr SpecExtra kI8TierChoices[] = {
   {spec_key::kChoices, "accurate,fast,token,token_plain"},
 };
@@ -200,6 +203,11 @@ const ConfigKey kAttrs[] = {
   {.key = "sol_local_radius", .type = ConfigType::Int,
    .doc = "key blocks either side of a query's own that are always exact",
    .def_int = 1},
+  {.key = "sol_threshold", .type = ConfigType::String,
+   .doc = "the routing threshold's spread estimate: 'diag' (default) or "
+          "'exact' (the key centroids' full covariance); one tau keeps "
+          "different fractions under the two",
+   .def_str = "diag", .extra = kSolThreshChoices},
 };
 const PortSpec kIports[] = {
   {.name = "prompt",
@@ -311,6 +319,15 @@ GenerateAudioStage::GenerateAudioStage(const SessionContextIntf* s,
       (int)std::max<std::int64_t>(0, attr_int("sol_dense_layers"));
   _sol_local_radius =
       (int)std::max<std::int64_t>(-1, attr_int("sol_local_radius"));
+  {
+    const std::string t = attr_str("sol_threshold");
+    genai::sol::Threshold th = genai::sol::Threshold::kDiag;
+    if (!t.empty() && !genai::sol::parse_threshold(t, &th)) {
+      fail_config(fmt("GenerateAudioStage('{}'): sol_threshold must be "
+                      "'diag' or 'exact' (got '{}')", this->id(), t));
+    }
+    _sol_exact = th == genai::sol::Threshold::kExact;
+  }
   {
     const std::int64_t kb = attr_int("sol_key_block");
     _sol_key_block = (kb == 32 || kb == 64) ? (int)kb : 0;
@@ -763,6 +780,8 @@ GenerateAudioStage::initialize(RuntimeContext& ctx)
     a.sol.dense_layers = _sol_dense_layers;
     a.sol.key_block    = _sol_key_block;
     a.sol.local_radius = _sol_local_radius;
+    a.sol.thresh = _sol_exact ? genai::sol::Threshold::kExact
+                              : genai::sol::Threshold::kDiag;
     // WHETHER the ANE runs is the plan's grant, read here where it exists.
     if (a.ane_ffn) {
       const std::size_t bytes = genai::MetalYue2Model::ane_runtime_bytes();

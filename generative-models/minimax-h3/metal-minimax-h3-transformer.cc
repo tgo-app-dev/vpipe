@@ -22,6 +22,7 @@
 #include <chrono>
 #include <future>
 #include <map>
+#include <set>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include <filesystem>
 #include <cctype>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -593,8 +595,17 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
     auto w = MetalLlamaWeights::open_model(p.string());
     if (!w.has_value()) { return fail("cannot open " + p.string()); }
     const bool split = w->has("blocks.0.attn.qkv_proj.q.weight");
+    // ComfyUI's own: under its model prefix (a DiT ComfyUI saved), or
+    // BARE but in its PRUNED form -- an `adaln_t_table` exists only in
+    // ComfyUI's curve-form model (Comfy-Org's official pruned files carry
+    // no prefix and no metadata). Either way its qkv is ComfyUI's FLAT
+    // order -- MEASURED on Comfy-Org's minimax_h3_fl2va_pruned_int8_
+    // convrot: per-row scale R^2 0.140 / 0.037 / 0.207 grouped flat
+    // against 0.001 / 0.001 / 0.004 per head (blocks 0 / 25 / 49).
     const bool comfy_saved =
-        !split && minimax_h3::is_comfy_saved_dit_file(p.string());
+        !split && (minimax_h3::is_comfy_saved_dit_file(p.string()) ||
+                   (w->has("adaln_t_table") &&
+                    w->has("blocks.0.attn.qkv_proj.weight")));
     const bool fused =
         !split &&
         (lower_(p.extension().string()) == ".ckpt" || comfy_saved) &&
@@ -606,9 +617,16 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
     }
     auto dim = [&](const std::string& n, int axis) -> long {
       const auto* ti = w->info(n);
-      return ti != nullptr && (int)ti->shape.size() > axis
-                 ? (long)ti->shape[(std::size_t)axis]
-                 : -1;
+      if (ti == nullptr || (int)ti->shape.size() <= axis) { return -1; }
+      long v = (long)ti->shape[(std::size_t)axis];
+      // A W4A8 weight's codes are nibbles, two a byte: its logical width
+      // is twice the stored one (its relative scales beside it say so).
+      if (axis == 1 && ti->dtype == "I8" && n.size() > 7 &&
+          n.compare(n.size() - 7, 7, ".weight") == 0 &&
+          w->has(n.substr(0, n.size() - 7) + ".weight_s_rel")) {
+        v *= 2;
+      }
+      return v;
     };
     auto count = [&](const std::string& pre) {
       int n = 0;
@@ -620,22 +638,33 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
     if (hidden <= 0 || vin <= 0 || vin % 4 != 0) {
       return fail(p.string() + ": cannot read the H3 dimensions off it");
     }
+    // ComfyUI's PRUNED form has no timestep MLP: the AdaLN input is the
+    // width of its `adaln_t_table` (Config::curve_grid). The MLP's two
+    // other widths are then the architecture's, and nothing reads them.
+    const long grid = dim("adaln_t_table", 0);
+    const long tdim = grid > 0 ? dim("adaln_t_table", 1)
+                               : dim("time_embedder.proj_out.weight", 0);
+    if (grid > 0 && dim("blocks.0.adaln_proj.linear.weight", 1) != tdim) {
+      return fail(p.string() + ": its AdaLN projections do not read its "
+                               "adaln_t_table's width");
+    }
+    auto or_def = [](long v, long d) { return v > 0 ? v : d; };
     cfg = FlexData::from_json(fmt(
         "{{\"hidden_size\": {}, \"num_attention_heads\": {}, "
         "\"num_layers\": {}, \"token_refiner_num_layers\": {}, "
         "\"ffn_hidden_size\": {}, \"latents_dim\": {}, "
         "\"audio_latents_dim\": {}, \"text_dim\": {}, "
         "\"timestep_input_dim\": {}, \"time_embed_hidden_size\": {}, "
-        "\"time_embed_dim\": {}}}",
+        "\"time_embed_dim\": {}, \"adaln_curve_grid\": {}}}",
         hidden,
         split ? dim("blocks.0.attn.qkv_proj.q.weight", 0) / 128
               : dim("blocks.0.attn.qkv_proj.weight", 0) / (3 * 128),
         count("blocks."), count("token_refiner.blocks."),
         dim("blocks.0.mlp.fc2.weight", 1), vin / 4,
         dim("audio_patch_proj.weight", 1), dim("condition_proj.weight", 1),
-        dim("time_embedder.proj_in.weight", 1),
-        dim("time_embedder.proj_in.weight", 0),
-        dim("time_embedder.proj_out.weight", 0))());
+        or_def(dim("time_embedder.proj_in.weight", 1), 256),
+        or_def(dim("time_embedder.proj_in.weight", 0), hidden),
+        tdim, grid > 0 ? grid : 0)());
     // The diffusers layout's assembled qkv is FLAT, and so is ComfyUI's
     // own; the Draw Things one is gathered per head, as released.
     diffusers = split || comfy_saved;
@@ -714,6 +743,7 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
   out.freq_dim       = gi("timestep_input_dim", 256);
   out.time_hidden    = gi("time_embed_hidden_size", 5376);
   out.time_dim       = gi("time_embed_dim", 2688);
+  out.curve_grid     = std::max(0, gi("adaln_curve_grid", 0));
   out.rope_freq_dim  = gi("rope_inv_freq_len", 16);
   out.rope_theta     = gf("rope_theta", 10000.0f);
   out.norm_eps       = gf("norm_eps", 1e-5f);
@@ -746,6 +776,13 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
   }
   if (out.patch_t != 1) {
     return fail("only patch_size[0] == 1 (no temporal patching) is supported");
+  }
+  // The pruned AdaLN kernel reads points of 8 (h3_adaln_pruned_f16), the
+  // width every pruned checkpoint seen carries.
+  if (out.pruned() && (out.time_dim != 8 || out.curve_grid < 2)) {
+    return fail(fmt("a pruned AdaLN of {} x {} (adaln_t_table) is not the "
+                    "8-wide curve this model reads", out.curve_grid,
+                    out.time_dim)());
   }
   if (out.head_dim != 128) {
     return fail("only attention_head_dim 128 is supported (the steel "
@@ -825,6 +862,48 @@ adaln_table_budget_()
   return (std::size_t)(v > 0 ? v : 1536) << 20;
 }
 
+namespace {
+
+// fp8_widen_bytes off a surveyed checkpoint: the widest of its FP8 /
+// int8 / W4A8 weights as bf16 (a W4A8 weight's K is twice its stored
+// width), and the fused q|k|v when a block's projections are among them
+// -- a file that stores q, k and v apart is widened fused, as it loads.
+std::size_t
+widen_of_(const MetalLlamaWeights& w, const fp8::Layout& lay,
+          const MetalMiniMaxH3Transformer::Config& c)
+{
+  std::size_t n = 0;
+  bool block = false;
+  for (const auto& [nm, fw] : lay.weights) {
+    const auto* ti = w.info(nm);
+    if (ti == nullptr || ti->shape.size() != 2) { continue; }
+    const std::size_t k = (std::size_t)ti->shape[1] *
+                          (fw.format == fp8::Format::kW4A8 ? 2 : 1);
+    n = std::max(n, (std::size_t)ti->shape[0] * k);
+    block = block || nm.compare(0, 7, "blocks.") == 0;
+  }
+  if (block) {
+    n = std::max(n, (std::size_t)3 * (std::size_t)c.inner() *
+                        (std::size_t)c.hidden);
+  }
+  return n * 2;
+}
+
+}  // namespace
+
+std::size_t
+MetalMiniMaxH3Transformer::fp8_widen_bytes(const std::string& dit_dir,
+                                           const Config& c)
+{
+  auto w = MetalLlamaWeights::open_model(
+      resolve_dit_dir(dit_dir, c.partition));
+  if (!w.has_value()) { return 0; }
+  fp8::Layout lay;
+  std::string err;
+  if (!fp8::scan(*w, &lay, &err, /*int8=*/true) || !lay.any()) { return 0; }
+  return widen_of_(*w, lay, c);
+}
+
 std::size_t
 MetalMiniMaxH3Transformer::streaming_floor_bytes(const std::string& dit_dir)
 {
@@ -833,7 +912,19 @@ MetalMiniMaxH3Transformer::streaming_floor_bytes(const std::string& dit_dir)
   // AdaLN excluded: the bake retires it before the first forward, so a
   // slot never carries it for long and counting it would make the floor
   // 1.6x what the model settles at.
-  return stream_floor_bytes(*wts, "blocks.", "adaln");
+  const std::size_t f = stream_floor_bytes(*wts, "blocks.", "adaln");
+  // PRUNED, nothing is baked: the projections (77 MB at bf16) are held
+  // in the trunk as stored, from load, so the floor carries them.
+  if (f == 0 || !wts->has("adaln_t_table")) { return f; }
+  std::size_t pruned = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.rfind("blocks.", 0) != 0 ||
+        nm.find("adaln_proj") == std::string::npos) {
+      continue;
+    }
+    if (const auto* ti = wts->info(nm)) { pruned += (std::size_t)ti->nbytes; }
+  }
+  return f + pruned;
 }
 
 std::size_t
@@ -841,6 +932,8 @@ MetalMiniMaxH3Transformer::adaln_retired_bytes(const std::string& dit_dir)
 {
   auto wts = MetalLlamaWeights::open_model(dit_dir);
   if (!wts.has_value()) { return 0; }
+  // Pruned, there is no bake (bake_adaln refuses it) and nothing retires.
+  if (wts->has("adaln_t_table")) { return 0; }
   std::size_t n = 0;
   for (const std::string& nm : wts->tensor_names()) {
     if (nm.find("adaln_proj") == std::string::npos) { continue; }
@@ -853,7 +946,7 @@ MetalMiniMaxH3Transformer::adaln_retired_bytes(const std::string& dit_dir)
 bool
 MetalMiniMaxH3Transformer::adaln_bake_certain(const Config& cfg, int max_rows)
 {
-  if (max_rows <= 0) { return false; }
+  if (max_rows <= 0 || cfg.pruned()) { return false; }
   if (std::getenv("VPIPE_H3_NO_ADALN_BAKE") != nullptr) { return false; }
   // The same arithmetic bake_adaln refuses on, with the caller's WORST
   // case for the row count. Certain only when even that fits.
@@ -946,10 +1039,45 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     l.f8         = fw->format;
     l.f8_per_row = fw->per_row;
     l.f8_rot     = fw->rot_group;
+    // W4A8: its relative scales beside the codes (held as they are, the
+    // same way), and the codebook, 16 f32.
+    if (fw->format == fp8::Format::kW4A8) {
+      l.f8_qgroup = fw->qgroup;
+      l.f8_srel = r == Retain::Streamed
+                      ? ws.stream_tensor(fw->s_rel, _mc, res)
+                      : ws.tensor(fw->s_rel, _mc, res);
+      if (l.f8_srel.empty()) { return Linear{}; }
+      if (!fw->codebook.empty()) {
+        l.f8_cb = _mc->make_shared_buffer(16 * sizeof(float));
+        if (l.f8_cb.empty() ||
+            !src.read_into(fw->codebook, l.f8_cb.contents(),
+                           16 * sizeof(float))) {
+          return Linear{};
+        }
+      }
+    }
     return l;
   }
   l.w = weight_(ws, nm + ".weight", r);
   return l;
+}
+
+// A ConvRot weight's row scales as the token GEMM reads them: f32, one a
+// row -- a per-tensor scale repeated. Empty when they cannot be read.
+SharedBuffer
+MetalMiniMaxH3Transformer::convrot_row_scales_(const MetalLlamaWeights& src,
+                                               const fp8::Weight& fw, int N)
+{
+  std::vector<float> v;
+  if (!fp8::read_scale(src, fw, (std::size_t)N, &v, nullptr) || v.empty()) {
+    return {};
+  }
+  if (v.size() == 1) { v.assign((std::size_t)N, v[0]); }
+  if (v.size() != (std::size_t)N) { return {}; }
+  SharedBuffer b = _mc->make_shared_buffer(v.size() * sizeof(float));
+  if (b.empty()) { return {}; }
+  std::memcpy(b.contents(), v.data(), v.size() * sizeof(float));
+  return b;
 }
 
 MetalMiniMaxH3Transformer::Linear
@@ -999,6 +1127,57 @@ MetalMiniMaxH3Transformer::i8_linear_(WeightSet& ws, const std::string& nm,
     }
     if (l.codes.empty() || l.cscales.empty()) { return Linear{}; }
     return l;
+  }
+  // ComfyUI's int8 CONVROT -- and its W4A8 -- on the TOKEN tier, as
+  // stored: the codes already ARE the token layout (int8 per output row
+  // over all of K) in ConvRot's basis, so the activation is rotated alike
+  // (I8GemmContext::quantize_token_convrot) and nothing is converted; a
+  // W4A8 weight's nibbles become those codes per GEMM (gemm_).
+  // VPIPE_H3_CONVROT_NATIVE=0 keeps them widened per GEMM, for an A/B.
+  if (const fp8::Weight* fw = _f8.find(nm + ".weight");
+      fw != nullptr && fw->rot_group == 256 &&
+      (fw->format == fp8::Format::kI8 || fw->format == fp8::Format::kW4A8) &&
+      _i8->convrot_available() &&
+      !(std::getenv("VPIPE_H3_CONVROT_NATIVE") != nullptr &&
+        std::atoi(std::getenv("VPIPE_H3_CONVROT_NATIVE")) == 0)) {
+    const auto* wi = src.info(nm + ".weight");
+    const bool w4 = fw->format == fp8::Format::kW4A8;
+    const int N = wi != nullptr && wi->shape.size() == 2 ? (int)wi->shape[0]
+                                                          : 0;
+    const int K = wi != nullptr && wi->shape.size() == 2
+                      ? (int)wi->shape[1] * (w4 ? 2 : 1)
+                      : 0;
+    if (N >= 16 && N % 4 == 0 && K % 256 == 0 &&
+        _i8->fast_group(K) == I8GemmContext::kTokenGroup) {
+      Linear l;
+      l.gc = I8GemmContext::kTokenGroup;
+      l.n = N;
+      l.k = K;
+      l.cr = fw->rot_group;
+      l.cr_w4 = w4;
+      const auto res = kept_residency_(_stream_blocks, _wire.on());
+      l.codes = r == Retain::Streamed
+                    ? ws.stream_tensor(nm + ".weight", _mc, res)
+                    : ws.tensor(nm + ".weight", _mc, res);
+      l.cscales = convrot_row_scales_(src, *fw, N);
+      if (w4) {
+        l.f8_qgroup = fw->qgroup;
+        l.f8_srel = r == Retain::Streamed
+                        ? ws.stream_tensor(fw->s_rel, _mc, res)
+                        : ws.tensor(fw->s_rel, _mc, res);
+        if (!fw->codebook.empty()) {
+          l.f8_cb = _mc->make_shared_buffer(16 * sizeof(float));
+          if (l.f8_cb.empty() ||
+              !src.read_into(fw->codebook, l.f8_cb.contents(),
+                             16 * sizeof(float))) {
+            return Linear{};
+          }
+        }
+        if (l.f8_srel.empty() || !_fn_w4a8_i8.valid()) { return Linear{}; }
+      }
+      if (l.codes.empty() || l.cscales.empty()) { return Linear{}; }
+      return l;
+    }
   }
   // Anything else is CONVERTED: once, into the entry a kept block holds,
   // straight from the source (a read, so no bf16 copy stays beside it);
@@ -1211,7 +1390,8 @@ MetalMiniMaxH3Transformer::kept_block_bytes_(const Block& b) const
     }
     return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
            l.scales.byte_size() + l.qbias.byte_size() +
-           l.f8_scale.byte_size() + l.cscales.byte_size();
+           l.f8_scale.byte_size() + l.f8_srel.byte_size() +
+           l.f8_cb.byte_size() + l.cscales.byte_size();
   };
   return b.n1.byte_size() + b.n2.byte_size() + b.qn.byte_size() +
          b.kn.byte_size() + kl(b.qkv) + kl(b.out) + kl(b.fc1) + kl(b.fc2) +
@@ -1351,6 +1531,11 @@ MetalMiniMaxH3Transformer::assemble_(
     // int8 pieces are assembled dense (to_bf16_ decodes each with its
     // rotation): stacked codes would mix their scales and groups.
     const fp8::Weight* fw = _f8.find(p.layer + ".weight");
+    // W4A8 pieces are not assembled: their nibble rows are half a row,
+    // and no layout stores it in pieces.
+    if (fw != nullptr && fw->format == fp8::Format::kW4A8) {
+      return Linear{};
+    }
     if (fw == nullptr || fw->format == fp8::Format::kI8 ||
         (f != fp8::Format::kNone && fw->format != f)) {
       all_f8 = false;
@@ -1442,6 +1627,17 @@ MetalMiniMaxH3Transformer::refill_linear_(WeightSet& ws,
       }
       std::memcpy(l.f8_scale.contents(), v.data(), l.f8_scale.byte_size());
     }
+    if (l.f8 == fp8::Format::kW4A8) {
+      const fp8::Weight* fw = _f8.find(nm + ".weight");
+      if (fw == nullptr || l.f8_srel.empty() ||
+          refill_streamed_tensor(ws, fw->s_rel, l.f8_srel,
+                                 RefillDst::kRaw) != Refill::kFilled ||
+          (!l.f8_cb.empty() &&
+           !src.read_into(fw->codebook, l.f8_cb.contents(),
+                          16 * sizeof(float)))) {
+        return false;
+      }
+    }
     if (!l.b.empty() &&
         refill_streamed_tensor(ws, nm + ".bias", l.b, RefillDst::kBf16) !=
             Refill::kFilled) {
@@ -1519,6 +1715,9 @@ MetalMiniMaxH3Transformer::fp8_dense_(ComputeEncoder& enc, const Linear& l,
   c.scale   = &l.f8_scale;
   c.per_row = l.f8_per_row;
   c.rot_group = l.f8_rot;
+  c.s_rel    = &l.f8_srel;
+  c.codebook = &l.f8_cb;
+  c.qgroup   = l.f8_qgroup;
   if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
     _fp8_failed = true;
     return nullptr;
@@ -1544,8 +1743,21 @@ MetalMiniMaxH3Transformer::i8_dense_(ComputeEncoder& enc, const Linear& l,
     _w_deq = _mc->make_shared_buffer(need);
     if (_w_deq.empty()) { return nullptr; }
   }
-  if (_i8 == nullptr ||
-      !_i8->encode_dequant_fast(enc, codes, cscales, l.gc, _w_deq, N, K)) {
+  if (l.cr > 0) {
+    // ConvRot codes: widened as the int8 checkpoint is, the rotation
+    // undone (the token layout's own dequant would take Sylvester's).
+    fp8::Codes c;
+    c.codes = &codes;
+    c.format = fp8::Format::kI8;
+    c.scale = &cscales;
+    c.per_row = true;
+    c.rot_group = l.cr;
+    if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
+      return nullptr;
+    }
+  } else if (_i8 == nullptr ||
+             !_i8->encode_dequant_fast(enc, codes, cscales, l.gc, _w_deq, N,
+                                       K)) {
     return nullptr;
   }
   view = Linear{};
@@ -1712,7 +1924,10 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     d.f8         = s.f8;
     d.f8_per_row = s.f8_per_row;
     d.f8_rot     = s.f8_rot;
+    d.f8_qgroup  = s.f8_qgroup;
     d.gc         = s.gc;
+    d.cr         = s.cr;
+    d.cr_w4      = s.cr_w4;
     d.n          = s.n;
     d.k          = s.k;
     d.i8x        = s.i8x;
@@ -1732,6 +1947,8 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     one(pack_dead ? kNone : s.scales, d.scales);
     one(pack_dead ? kNone : s.qbias, d.qbias);
     one(s.f8_scale, d.f8_scale);
+    one(s.f8_srel, d.f8_srel);
+    one(s.f8_cb, d.f8_cb);
   };
   one(src.n1, dst.n1);
   one(src.n2, dst.n2);
@@ -1813,6 +2030,30 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
       if (!l.pc) { convert.push_back(&l); }
       return;
     }
+    // ConvRot codes as stored (cr): the codes -- or a W4A8 weight's
+    // nibbles and relative scales -- refilled raw by name; the row scales
+    // and the codebook rebuilt, as Draw Things' are.
+    if (l.gc > 0 && l.cr > 0) {
+      const fp8::Weight* fw = _f8.find(nm + ".weight");
+      if (fw == nullptr ||
+          refill_streamed_tensor(ws, nm + ".weight", l.codes,
+                                 RefillDst::kRaw) != Refill::kFilled ||
+          (l.cr_w4 &&
+           refill_streamed_tensor(ws, fw->s_rel, l.f8_srel,
+                                  RefillDst::kRaw) != Refill::kFilled)) {
+        ok = false;
+        return;
+      }
+      if (!l.f8_cb.empty() &&
+          !ws.src().read_into(fw->codebook, l.f8_cb.contents(),
+                              16 * sizeof(float))) {
+        ok = false;
+        return;
+      }
+      l.cscales = convrot_row_scales_(ws.src(), *fw, l.n);
+      if (l.cscales.empty()) { ok = false; }
+      return;
+    }
     if (l.gc > 0) {
       if (!l.i8x) { ok = false; return; }
       if (refill_streamed_tensor(ws, nm + ".i8x", l.codes,
@@ -1864,7 +2105,10 @@ MetalMiniMaxH3Transformer::refill_block_(WeightSet& ws,
   lin(prefix + "attn.out_proj", b.out);
   lin(prefix + "mlp.fc1", b.fc1);
   lin(prefix + "mlp.fc2", b.fc2);
-  if (with_adaln) { lin(prefix + "adaln_proj.linear", b.adaln); }
+  // Pruned, the AdaLN lives in the trunk (_padaln), never in a block.
+  if (with_adaln && !_cfg.pruned()) {
+    lin(prefix + "adaln_proj.linear", b.adaln);
+  }
   if (ok && !convert.empty()) {
     if (!_cvt_stream.valid()) { _cvt_stream = _mc->make_command_stream(); }
     bool enc_ok = true;
@@ -1920,7 +2164,8 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
                 : linear_(ws, prefix + "mlp.fc1", false, r);
   }
   b.fc2 = proj(prefix + "mlp.fc2");
-  if (with_adaln) {
+  // Pruned, the AdaLN lives in the trunk (_padaln), never in a block.
+  if (with_adaln && !_cfg.pruned()) {
     b.adaln = linear_(ws, prefix + "adaln_proj.linear", true, r);
     if (b.adaln.empty() || b.adaln.b.empty()) { return false; }
   }
@@ -2435,11 +2680,62 @@ adapter_main_block_(const std::string& n, std::size_t* end)
 
 MetalMiniMaxH3Transformer::LoraFootprint
 MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
-                                          int n_layers)
+                                          int n_layers, const Config* pruned)
 {
   LoraFootprint fp;
   auto wts = MetalLlamaWeights::open_model(path);
   if (!wts.has_value()) { return fp; }
+  // A PRUNED DiT's AdaLN modules: one f32 [D * 9] delta a projection,
+  // whether the file carries factors or `.diff` / `.diff_b` -- held in
+  // the trunk, streamed or not -- plus the patch scratch once.
+  auto adaln_ = [](const std::string& n) {
+    return n.find("adaln_proj.linear") != std::string::npos ||
+           n.find("norm_out.linear") != std::string::npos;
+  };
+  std::set<std::string> deltas;
+  if (pruned != nullptr && pruned->pruned()) {
+    for (const std::string& nm : wts->tensor_names()) {
+      if (!adaln_(nm)) { continue; }
+      const std::size_t p = nm.find(".lora_") != std::string::npos
+                                ? nm.find(".lora_")
+                            : nm.find(".diff") != std::string::npos
+                                ? nm.find(".diff")
+                                : std::string::npos;
+      if (p == std::string::npos) { continue; }
+      std::size_t end = 0;
+      const int L = adapter_main_block_(nm, &end);
+      if (L >= 0 && n_layers > 0 && L >= n_layers) { continue; }
+      deltas.insert(nm.substr(0, p));
+    }
+    for (const std::string& mod : deltas) {
+      const bool fin = mod.find("final_layer") != std::string::npos ||
+                       mod.find("norm_out") != std::string::npos;
+      const std::size_t d =
+          (std::size_t)(fin ? 2 * pruned->hidden : pruned->adaln_out());
+      fp.whole += d * 9 * 4;
+    }
+    if (!deltas.empty()) {
+      fp.whole += (std::size_t)std::max(pruned->adaln_out(),
+                                        2 * pruned->hidden) * 9 * 4;
+    }
+    // The released MLP, to the host in f32, for an adapter that moves
+    // the embedding (its tables are the denoise's: off_curve_bytes).
+    if (moves_time_embedding(path) && !pruned->time_mlp_dir.empty()) {
+      if (auto m = MetalLlamaWeights::open_model(pruned->time_mlp_dir)) {
+        for (const char* nm : {"time_embedder.proj_in.weight",
+                               "time_embedder.proj_in.bias",
+                               "time_embedder.proj_out.weight",
+                               "time_embedder.proj_out.bias"}) {
+          if (const auto* ti = m->info(nm)) {
+            std::size_t n = 1;
+            for (auto x : ti->shape) { n *= (std::size_t)x; }
+            fp.whole += n * 4;
+          }
+        }
+      }
+    }
+  }
+  const bool skip_adaln = pruned != nullptr && pruned->pruned();
   // A factor is `<module><mark>...weight`: peft's `.lora_A.[x.]weight`,
   // kohya's `.lora_down.weight`; an FP8 factor's scale is not one.
   static const char* const kA[] = {".lora_A.", ".lora_down.", ".lora_a."};
@@ -2465,6 +2761,7 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
                                ? mark(nm, kB, std::size(kB))
                                : std::string::npos;
     if (pa == std::string::npos && pb == std::string::npos) { continue; }
+    if (skip_adaln && adaln_(nm)) { continue; }   // counted above
     std::size_t end = 0;
     const int L = adapter_main_block_(nm, &end);
     if (L >= 0 && n_layers > 0 && L >= n_layers) { continue; }
@@ -2492,6 +2789,30 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
   for (const auto& [role, b] : per_role) { set += b; }
   fp.streamed = main > 0 ? fp.whole - main + set : fp.whole;
   return fp;
+}
+
+bool
+MetalMiniMaxH3Transformer::moves_time_embedding(const std::string& path)
+{
+  for (const char* m : {"time_embedder.linear_", "time_embedder.proj_",
+                        "endpoint_time_embedder"}) {
+    if (lora::Adapter::file_touches(path, m)) { return true; }
+  }
+  return false;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::off_curve_bytes(const Config& c, int max_rows)
+{
+  if (!c.pruned() || max_rows <= 0) { return 0; }
+  const std::size_t T = (std::size_t)max_rows;
+  const std::size_t D = (std::size_t)c.adaln_out();
+  const std::size_t FD = (std::size_t)(2 * c.hidden);
+  // The released embedding's width: the architecture's, 2688 on H3.
+  const std::size_t M = 2688;
+  return T * D * 2 * (std::size_t)c.n_layers + T * FD * 2 +   // tables
+         D * M * 2 +                                          // one block
+         T * M * 2;                                           // the rows
 }
 
 int
@@ -2779,7 +3100,9 @@ MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
   }
   cs.knots = (int)(cs.table.size() / 8);
   if (!_fn_curve_add.valid()) {
-    _lib_regen = _mc->load_library("minimax_h3_regenerate_bf16");
+    if (!_lib_regen.valid()) {
+      _lib_regen = _mc->load_library("minimax_h3_regenerate_bf16");
+    }
     _fn_curve_add = _lib_regen.function("h3_adaln_curve_add_f16");
     if (!_fn_curve_add.valid()) {
       return no("h3_adaln_curve_add_f16 is missing from this build");
@@ -2834,6 +3157,539 @@ MetalMiniMaxH3Transformer::curve_apply_(ComputeEncoder& enc, int L,
   }
 }
 
+void
+MetalMiniMaxH3Transformer::pruned_mod_(ComputeEncoder& enc,
+                                       const PrunedAdaln& p, int L,
+                                       const SharedBuffer& out, int n_t,
+                                       int D, const SharedBuffer* res,
+                                       std::size_t res_off)
+{
+  // The live slots' deltas for this projection, added to the weight and
+  // the bias in f32, slot by slot, into the patch scratch -- which the
+  // projection then reads as F32. Serial dispatches on one encoder, so a
+  // block's patch is read before the next block's overwrites it.
+  const std::size_t nw = (std::size_t)D * 8;
+  bool first = true;
+  for (const LoraSlot& sl : _lora) {
+    const SharedBuffer* dp =
+        L < 0 ? &sl.pdelta_final
+              : (std::size_t)L < sl.pdelta.size() ? &sl.pdelta[(std::size_t)L]
+                                                  : nullptr;
+    if (dp == nullptr || dp->empty() || sl.scale == 0.0f ||
+        _padaln_patch.empty()) {
+      continue;
+    }
+    const SharedBuffer& d = *dp;
+    for (int part = 0; part < 2; ++part) {
+      const int n = part == 0 ? (int)nw : D;
+      const std::size_t off = part == 0 ? 0 : nw * 4;
+      enc.set_function(_fn_pruned_patch);
+      enc.set_buffer(0, _padaln_patch, off);
+      enc.set_buffer(1, part == 0 ? p.w : p.b);
+      enc.set_buffer(2, d, off);
+      enc.set_constant(3, n);
+      enc.set_constant(4, p.dtype);
+      enc.set_constant(5, sl.scale);
+      enc.set_constant(6, first ? 1 : 0);
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    }
+    first = false;
+  }
+  enc.set_function(res != nullptr ? _fn_pruned_res : _fn_pruned_mod);
+  enc.set_buffer(0, out);
+  if (res != nullptr) { enc.set_buffer(7, *res, res_off); }
+  if (first) {
+    enc.set_buffer(1, p.w);
+    enc.set_buffer(2, p.b);
+  } else {
+    enc.set_buffer(1, _padaln_patch);
+    enc.set_buffer(2, _padaln_patch, nw * 4);
+  }
+  enc.set_buffer(3, _pcoords);
+  enc.set_constant(4, D);
+  enc.set_constant(5, n_t);
+  enc.set_constant(6, first ? p.dtype : 0);
+  enc.dispatch({(unsigned)D, (unsigned)n_t, 1}, {256, 1, 1});
+  _flops.add(2ull * (std::uint64_t)D * 8 * (std::uint64_t)n_t);
+}
+
+namespace {
+
+// silu(e) rounded to bf16, as the released forward hands it to the AdaLN
+// (time_embed_), back in f32.
+float
+silu_bf16_(float e)
+{
+  const std::uint32_t u = (std::uint32_t)f32_to_bf16_(e / (1.0f + std::exp(-e)))
+                          << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+// A in place, the n x n SPD system's Cholesky factor, then B (n x nrhs,
+// row-major) solved in place. False when A is not positive definite.
+bool
+chol_solve_(std::vector<double>& A, int n, double* B, int nrhs)
+{
+  for (int j = 0; j < n; ++j) {
+    double d = A[(std::size_t)j * n + j];
+    for (int k = 0; k < j; ++k) {
+      d -= A[(std::size_t)j * n + k] * A[(std::size_t)j * n + k];
+    }
+    if (!(d > 0.0)) { return false; }
+    const double l = std::sqrt(d);
+    A[(std::size_t)j * n + j] = l;
+    for (int i = j + 1; i < n; ++i) {
+      double v = A[(std::size_t)i * n + j];
+      for (int k = 0; k < j; ++k) {
+        v -= A[(std::size_t)i * n + k] * A[(std::size_t)j * n + k];
+      }
+      A[(std::size_t)i * n + j] = v / l;
+    }
+  }
+  for (int c = 0; c < nrhs; ++c) {
+    for (int i = 0; i < n; ++i) {        // L y = b
+      double v = B[(std::size_t)i * nrhs + c];
+      for (int k = 0; k < i; ++k) {
+        v -= A[(std::size_t)i * n + k] * B[(std::size_t)k * nrhs + c];
+      }
+      B[(std::size_t)i * nrhs + c] = v / A[(std::size_t)i * n + i];
+    }
+    for (int i = n - 1; i >= 0; --i) {   // L^T x = y
+      double v = B[(std::size_t)i * nrhs + c];
+      for (int k = i + 1; k < n; ++k) {
+        v -= A[(std::size_t)k * n + i] * B[(std::size_t)k * nrhs + c];
+      }
+      B[(std::size_t)i * nrhs + c] = v / A[(std::size_t)i * n + i];
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+// The pruned curve's basis in the RELEASED embedding. A pruned file kept
+// only the AdaLN's response along the curve t -> silu(temb(t)), which the
+// released MLP traces in an 8-dimensional affine span -- MEASURED on
+// MiniMax-H3 FL2VA and Ref2VA: under 3e-9 of the curve's energy outside
+// 8 dimensions, and a community pruned file's table spans either
+// partition's curve to a relative residual of 1.5e-5 / 2.1e-5. So
+// least squares over the table recovers U and m, and with them a
+// full-model adapter's AdaLN delta B A silu(temb(t)) is (B A U) c(t) +
+// B A m: an 8-wide weight delta and a bias delta, exact to that residual.
+bool
+MetalMiniMaxH3Transformer::ensure_curve_basis_(std::string* err)
+{
+  auto no = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (!_basis.empty()) { return true; }
+  if (!_cfg.pruned()) { return no("not a pruned DiT"); }
+  if (_cfg.time_mlp_dir.empty()) {
+    return no("no checkpoint with the released timestep MLP was named "
+              "(Config::time_mlp_dir; generate-video names the graph's "
+              "own partition)");
+  }
+  std::shared_ptr<WeightSet> ws = WeightSet::open(_cfg.time_mlp_dir, nullptr);
+  if (!ws) { return no("cannot open '" + _cfg.time_mlp_dir + "'"); }
+  const auto* in = ws->src().info("time_embedder.proj_in.weight");
+  const auto* ou = ws->src().info("time_embedder.proj_out.weight");
+  if (in == nullptr || ou == nullptr || in->shape.size() != 2 ||
+      ou->shape.size() != 2 || ou->shape[1] != in->shape[0]) {
+    return no("'" + _cfg.time_mlp_dir + "' carries no timestep MLP");
+  }
+  if (!to_host_f32_(*ws, _mc, "time_embedder.proj_in.weight", _time_in_w) ||
+      !to_host_f32_(*ws, _mc, "time_embedder.proj_in.bias", _time_in_b) ||
+      !to_host_f32_(*ws, _mc, "time_embedder.proj_out.weight",
+                    _time_out_w) ||
+      !to_host_f32_(*ws, _mc, "time_embedder.proj_out.bias", _time_out_b)) {
+    return no("cannot read the timestep MLP of '" + _cfg.time_mlp_dir + "'");
+  }
+  _cfg.freq_dim = (int)in->shape[1];
+  _cfg.time_hidden = (int)in->shape[0];
+  const int M = (int)ou->shape[0];
+  _basis.mlp = M;   // time_mlp_row_ reads the width through mlp_dim_()
+  // S = silu(temb(t)) at every 4th knot (257 points: the curve is smooth
+  // and its span 8-dimensional), the base MLP alone, in parallel.
+  const int G = _cfg.curve_grid, step = 4;
+  std::vector<int> knots;
+  for (int g = 0; g < G; g += step) { knots.push_back(g); }
+  if (knots.back() != G - 1) { knots.push_back(G - 1); }
+  const int n = (int)knots.size();
+  std::vector<float> S((std::size_t)n * M);
+  {
+    const int parts = 8;
+    std::vector<std::future<void>> fs;
+    for (int pi = 0; pi < parts; ++pi) {
+      fs.push_back(std::async(std::launch::async, [&, pi]() {
+        for (int i = pi; i < n; i += parts) {
+          float* row = S.data() + (std::size_t)i * M;
+          time_mlp_row_((double)knots[(std::size_t)i] / (double)(G - 1),
+                        false, row, /*base_only=*/true);
+          for (int j = 0; j < M; ++j) {
+            row[j] = row[j] / (1.0f + std::exp(-row[j]));
+          }
+        }
+      }));
+    }
+    for (auto& f : fs) { f.get(); }
+  }
+  // Least squares, S ~ [T | 1] X: the 9 x 9 normal matrix, X [9, M].
+  std::vector<double> A(81, 0.0), X((std::size_t)9 * M, 0.0);
+  for (int i = 0; i < n; ++i) {
+    double ta[9];
+    for (int k = 0; k < 8; ++k) {
+      ta[k] = _adaln_t_table[(std::size_t)knots[(std::size_t)i] * 8 + k];
+    }
+    ta[8] = 1.0;
+    for (int a = 0; a < 9; ++a) {
+      for (int b = 0; b < 9; ++b) {
+        A[(std::size_t)a * 9 + b] += ta[a] * ta[b];
+      }
+      const float* row = S.data() + (std::size_t)i * M;
+      double* x = X.data() + (std::size_t)a * M;
+      for (int j = 0; j < M; ++j) { x[j] += ta[a] * (double)row[j]; }
+    }
+  }
+  if (!chol_solve_(A, 9, X.data(), M)) {
+    _basis = CurveBasis{};
+    return no("the curve table is degenerate");
+  }
+  double rr = 0.0, ss = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const float* row = S.data() + (std::size_t)i * M;
+    for (int j = 0; j < M; ++j) {
+      double fit = X[(std::size_t)8 * M + j];
+      for (int k = 0; k < 8; ++k) {
+        fit += _adaln_t_table[(std::size_t)knots[(std::size_t)i] * 8 + k] *
+               X[(std::size_t)k * M + j];
+      }
+      rr += (row[j] - fit) * (row[j] - fit);
+      ss += (double)row[j] * row[j];
+    }
+  }
+  const double residual = ss > 0.0 ? std::sqrt(rr / ss) : 1.0;
+  if (residual > 1e-3) {
+    _basis = CurveBasis{};
+    return no(fmt("the timestep MLP of '{}' does not trace this file's "
+                  "curve (relative residual {:.3g} over {} knots)",
+                  _cfg.time_mlp_dir, residual, n)());
+  }
+  CurveBasis b;
+  b.mlp = M;
+  b.residual = residual;
+  b.u.resize((std::size_t)M * 8);
+  b.m.resize((std::size_t)M);
+  for (int j = 0; j < M; ++j) {
+    for (int k = 0; k < 8; ++k) {
+      b.u[(std::size_t)j * 8 + k] = (float)X[(std::size_t)k * M + j];
+    }
+    b.m[(std::size_t)j] = (float)X[(std::size_t)8 * M + j];
+  }
+  // pinv = (U^T U)^-1 U^T, [8, M].
+  std::vector<double> G8(64, 0.0), Ut((std::size_t)8 * M);
+  for (int j = 0; j < M; ++j) {
+    for (int a = 0; a < 8; ++a) {
+      Ut[(std::size_t)a * M + j] = X[(std::size_t)a * M + j];
+      for (int c = 0; c < 8; ++c) {
+        G8[(std::size_t)a * 8 + c] +=
+            X[(std::size_t)a * M + j] * X[(std::size_t)c * M + j];
+      }
+    }
+  }
+  if (!chol_solve_(G8, 8, Ut.data(), M)) {
+    _basis = CurveBasis{};
+    return no("the curve's basis is degenerate");
+  }
+  b.pinv.assign(Ut.begin(), Ut.end());
+  _basis = std::move(b);
+  if (_mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: the pruned curve's basis fit from the "
+        "timestep MLP of '{}' ({} -> {} -> {}): relative residual {:.2g} "
+        "over {} knots", _cfg.time_mlp_dir, _cfg.freq_dim, _cfg.time_hidden,
+        M, residual, n));
+  }
+  return true;
+}
+
+// A PRUNED DiT under an adapter that moves its timestep embedding (one
+// on the MLP, or a flow map's blend): the curve carries the embedding's
+// projection c = pinv (s - m), s = silu(e), and the rest, (I - P)(s - m),
+// is what the file's AdaLN cannot see -- MEASURED for HyperFlow's 8-step
+// grid, 5-36% of the embedding and 6-49% of block 0's modulation. So the
+// RELEASED AdaLN (Config::time_mlp_dir's blocks) projects that remainder
+// once per schedule row, W (I - P)(s - m), into tables the projection
+// adds (h3_adaln_pruned_res_f16): exact where the file's AdaLN is the
+// released one pruned (W8 = W U, b8 = b + W m), and the released AdaLN's
+// view of the remainder where the file merged another. One block's
+// weight in memory at a time.
+bool
+MetalMiniMaxH3Transformer::bake_pruned_off_curve_(
+    const std::vector<float>& all, const std::vector<float>* all_r,
+    std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = "minimax-h3 bake_adaln (pruned): " + m; }
+    _adaln_row0.clear();
+    _adaln_nt.clear();
+    _adaln_tab.clear();
+    _final_adaln_tab = SharedBuffer{};
+    return false;
+  };
+  const Config& c = _cfg;
+  const int T = (int)all.size(), M = _basis.mlp;
+  const int D = c.adaln_out(), FD = 2 * c.hidden;
+  std::vector<float> e;
+  if (!mlp_embedding_(all, all_r, &e)) {
+    return fail("the released embedding could not be computed");
+  }
+  // The remainder rows, [T, M] bf16.
+  SharedBuffer R = _mc->make_shared_buffer((std::size_t)T * M * 2);
+  if (R.empty()) { return fail("allocation"); }
+  auto* rp = static_cast<std::uint16_t*>(R.contents());
+  double off = 0.0, tot = 0.0;
+  std::vector<double> d((std::size_t)M);
+  for (int t = 0; t < T; ++t) {
+    const float* er = e.data() + (std::size_t)t * M;
+    for (int j = 0; j < M; ++j) {
+      d[(std::size_t)j] =
+          (double)silu_bf16_(er[j]) - (double)_basis.m[(std::size_t)j];
+    }
+    double cc[8];
+    for (int k = 0; k < 8; ++k) {
+      const float* pk = _basis.pinv.data() + (std::size_t)k * M;
+      double acc = 0.0;
+      for (int j = 0; j < M; ++j) { acc += (double)pk[j] * d[(std::size_t)j]; }
+      cc[k] = acc;
+    }
+    for (int j = 0; j < M; ++j) {
+      double r = d[(std::size_t)j];
+      for (int k = 0; k < 8; ++k) {
+        r -= (double)_basis.u[(std::size_t)j * 8 + k] * cc[k];
+      }
+      off += r * r;
+      tot += d[(std::size_t)j] * d[(std::size_t)j];
+      rp[(std::size_t)t * M + j] = f32_to_bf16_((float)r);
+    }
+  }
+  std::shared_ptr<WeightSet> ws = WeightSet::open(_cfg.time_mlp_dir, nullptr);
+  if (!ws) { return fail("cannot open '" + _cfg.time_mlp_dir + "'"); }
+  // One projection's weight, as bf16, [n, M] -- unquantized only: this
+  // reads it whole, and a packed one has no single format to read it in.
+  auto weight = [&](const std::string& nm, int n) -> SharedBuffer {
+    const auto* ti = ws->src().info(nm);
+    if (ti == nullptr || ti->shape.size() != 2 || ti->shape[0] != n ||
+        ti->shape[1] != M ||
+        (ti->dtype != "BF16" && ti->dtype != "F16" && ti->dtype != "F32")) {
+      return {};
+    }
+    return ti->dtype == "BF16"
+               ? ws->read(nm, _mc, WeightSet::Residency::Copied)
+               : to_bf16_(ws->src(), _mc, nm);
+  };
+  _adaln_tab.clear();
+  _adaln_tab.resize((std::size_t)c.n_layers);
+  CommandStream cs = _mc->make_command_stream();
+  for (int L = -1; L < c.n_layers; ++L) {
+    const std::string nm = L < 0 ? std::string("final_layer.adaln_proj."
+                                               "linear.weight")
+                                 : blk_("blocks.", L,
+                                        "adaln_proj.linear.weight");
+    const int n = L < 0 ? FD : D;
+    Linear lw;
+    lw.w = weight(nm, n);
+    if (lw.w.empty()) {
+      return fail(fmt("'{}' has no unquantized {} [{}, {}] (BF16 / F16 / "
+                      "F32) to project the off-curve rows through",
+                      _cfg.time_mlp_dir, nm, n, M)());
+    }
+    SharedBuffer tab = _mc->make_shared_buffer((std::size_t)T * n * 2);
+    if (tab.empty()) { return fail("table allocation"); }
+    {
+      ComputeEncoder enc = cs.begin_compute();
+      gemm_(enc, R, 0, lw, tab, 0, T, n, M);
+    }
+    _flops.flush(cs);
+    if (!cs.commit().wait_ok(nullptr)) { return fail("the table GEMM"); }
+    (L < 0 ? _final_adaln_tab : _adaln_tab[(std::size_t)L]) = std::move(tab);
+  }
+  if (_mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: pruned AdaLN under an adapted timestep "
+        "embedding -- {} rows, {:.1f}% of the silu'd embedding off the "
+        "curve, projected through the released AdaLN of '{}' ({} MB of "
+        "tables)", T, 100.0 * std::sqrt(off / std::max(tot, 1e-30)),
+        _cfg.time_mlp_dir, adaln_table_bytes() >> 20));
+  }
+  return true;
+}
+
+bool
+MetalMiniMaxH3Transformer::pruned_projects_() const
+{
+  if (!_cfg.pruned() || _basis.empty()) { return false; }
+  if (two_time_active()) { return true; }
+  for (const LoraSlot& sl : _lora) {
+    if (sl.scale != 0.0f && (!sl.time_in.empty() || !sl.time_out.empty())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A pruned adapter's AdaLN deltas (LoraSlot::pdelta): ComfyUI's `.diff`
+// / `.diff_b` patches as the file stores them, then any full-model AdaLN
+// module ported through the curve's basis -- both at strength 1, summed
+// where a projection has both.
+bool
+MetalMiniMaxH3Transformer::bind_pruned_adaln_(lora::Adapter* ad,
+                                              const std::string& path,
+                                              bool diffusers, LoraSlot& slot,
+                                              std::string* err)
+{
+  const Config& c = _cfg;
+  const int D = c.adaln_out(), FD = 2 * c.hidden;
+  slot.pdelta.clear();
+  slot.pdelta.resize((std::size_t)c.n_layers);
+  slot.pdelta_final = SharedBuffer{};
+  auto delta = [&](int L) -> float* {
+    SharedBuffer& b = L < 0 ? slot.pdelta_final : slot.pdelta[(std::size_t)L];
+    const std::size_t d = (std::size_t)(L < 0 ? FD : D);
+    if (b.empty()) {
+      b = _mc->make_shared_buffer(d * 9 * 4);
+      if (b.empty()) { return nullptr; }
+      std::memset(b.contents(), 0, d * 9 * 4);
+    }
+    return static_cast<float*>(b.contents());
+  };
+  int diffs = 0, ported = 0, skipped = 0;
+  // ---- ComfyUI weight patches, `<layer>.diff` / `<layer>.diff_b` -----
+  if (lora::Adapter::file_touches(path, "adaln_proj.linear.diff")) {
+    std::shared_ptr<WeightSet> ws = WeightSet::open(path, nullptr);
+    if (!ws) {
+      if (err != nullptr) { *err = "minimax-h3 lora: cannot open " + path; }
+      return false;
+    }
+    const std::string kW = ".adaln_proj.linear.diff";
+    const std::string kB = ".adaln_proj.linear.diff_b";
+    for (const std::string& nm : ws->src().tensor_names()) {
+      auto ends = [&](const std::string& x) {
+        return nm.size() > x.size() &&
+               nm.compare(nm.size() - x.size(), x.size(), x) == 0;
+      };
+      const bool is_b = ends(kB), is_w = !is_b && ends(kW);
+      if (!is_w && !is_b) { continue; }
+      std::string k = nm.substr(0, nm.size() - (is_w ? kW : kB).size());
+      for (const char* pre : {"model.diffusion_model.", "diffusion_model.",
+                              "transformer."}) {
+        const std::string ps(pre);
+        if (k.compare(0, ps.size(), ps) == 0) { k = k.substr(ps.size()); }
+      }
+      int L = -2;
+      if (k == "final_layer") {
+        L = -1;
+      } else if (k.compare(0, 7, "blocks.") == 0 &&
+                 k.size() > 7 &&
+                 k.find_first_not_of("0123456789", 7) == std::string::npos) {
+        L = std::atoi(k.c_str() + 7);
+        if (L >= c.n_layers) { L = -2; }
+      }
+      const auto* ti = ws->src().info(nm);
+      const int d = L == -1 ? FD : D;
+      const bool shape_ok =
+          ti != nullptr &&
+          (is_w ? (ti->shape.size() == 2 && ti->shape[0] == d &&
+                   ti->shape[1] == 8)
+                : (ti->shape.size() == 1 && ti->shape[0] == d));
+      std::vector<float> v;
+      if (L == -2 || !shape_ok || !to_host_f32_(*ws, _mc, nm, v)) {
+        ++skipped;
+        continue;
+      }
+      float* dst = delta(L);
+      if (dst == nullptr) { return false; }
+      dst += is_w ? 0 : (std::size_t)d * 8;
+      for (std::size_t i = 0; i < v.size(); ++i) { dst[i] += v[i]; }
+      ++diffs;
+    }
+  }
+  // ---- a full-model adapter's AdaLN modules, ported ------------------
+  // dW = B (A U), db = B (A m): the delta the module adds on the released
+  // curve, B A silu(temb(t)), carried by the curve's coordinates.
+  if (ad != nullptr) {
+    std::string berr;
+    bool basis = false, asked = false;
+    for (int L = -1; L < c.n_layers; ++L) {
+      const std::string mod =
+          L < 0 ? (diffusers ? "norm_out.linear"
+                             : "final_layer.adaln_proj.linear")
+                : diffusers ? "transformer_blocks." + std::to_string(L) +
+                                  ".adaln_proj.linear"
+                            : blk_("blocks.", L, "adaln_proj.linear");
+      if (!ad->has(mod)) { continue; }
+      if (!asked) {
+        asked = true;
+        basis = ensure_curve_basis_(&berr);
+      }
+      lora::HostFactors hf;
+      const int d = L < 0 ? FD : D;
+      if (!basis || !ad->bind_host(mod, d, _basis.mlp, &hf) || hf.empty()) {
+        ++skipped;
+        continue;
+      }
+      const int r = hf.rank, M = _basis.mlp;
+      std::vector<double> au((std::size_t)r * 8, 0.0), am((std::size_t)r, 0.0);
+      for (int q = 0; q < r; ++q) {
+        const float* a = hf.a.data() + (std::size_t)q * M;
+        for (int j = 0; j < M; ++j) {
+          const float* u = _basis.u.data() + (std::size_t)j * 8;
+          for (int k = 0; k < 8; ++k) {
+            au[(std::size_t)q * 8 + k] += a[j] * u[k];
+          }
+          am[(std::size_t)q] += (double)a[j] * _basis.m[(std::size_t)j];
+        }
+      }
+      float* dst = delta(L);
+      if (dst == nullptr) { return false; }
+      for (int j = 0; j < d; ++j) {
+        const float* bj = hf.b.data() + (std::size_t)j * r;
+        double w[8] = {0}, bb = 0.0;
+        for (int q = 0; q < r; ++q) {
+          for (int k = 0; k < 8; ++k) {
+            w[k] += bj[q] * au[(std::size_t)q * 8 + k];
+          }
+          bb += bj[q] * am[(std::size_t)q];
+        }
+        for (int k = 0; k < 8; ++k) {
+          dst[(std::size_t)j * 8 + k] += (float)w[k];
+        }
+        dst[(std::size_t)d * 8 + j] += (float)bb;
+      }
+      ++ported;
+    }
+    if (asked && !basis && _mc->session() != nullptr) {
+      _mc->session()->warn(fmt(
+          "MetalMiniMaxH3Transformer: '{}' adapts the AdaLN of a full-model "
+          "DiT, and this DiT is ComfyUI's pruned form; its AdaLN modules are "
+          "skipped: {}", path, berr));
+    }
+  }
+  slot.modules += diffs + ported;
+  if ((diffs > 0 || ported > 0 || skipped > 0) && _mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: '{}' on the pruned AdaLN: {} ComfyUI "
+        "weight diff tensor(s), {} full-model module(s) ported onto the "
+        "curve{}{}", path, diffs, ported,
+        ported > 0 ? fmt(" (basis residual {:.2g})", _basis.residual)()
+                   : std::string(),
+        skipped > 0 ? fmt(", {} skipped", skipped)() : std::string()));
+  }
+  return true;
+}
+
 // Read the adapter and bind its factors to the modules they name.
 //
 // The module names are the MODEL's own -- blocks.N.attn.qkv_proj,
@@ -2856,10 +3712,37 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   // model -- a family that shared that would bind an adapter to the
   // wrong projections and produce plausible wrong output.
   slot.scale = spec.scale;
+  // The sampler a manifest beside the file states (SamplingContract),
+  // whichever spelling its factors take. Read first, so a malformed one
+  // refuses the adapter with its path before anything is bound.
+  {
+    std::string cerr;
+    if (sampling_contract_of(spec.path, &slot.contract, &cerr)) {
+      slot.has_contract = true;
+    } else if (!cerr.empty()) {
+      if (err != nullptr) { *err = "minimax-h3 lora: " + cerr; }
+      return false;
+    }
+  }
   // AdaLN curve branches first: a file of them alone (Open-H3-
   // Regenerate-2K's) is a slot with no LoRA factors at all.
   bool curved = false;
   if (!bind_curves_(spec.path, slot, &curved, err)) { return false; }
+  // ComfyUI WEIGHT DIFFS on the AdaLN (`adaln_proj.linear.diff` /
+  // `.diff_b`, added to the weight and the bias) are how the pruned
+  // form's Turbo ports carry that half of the distillation, [D, 8] --
+  // applied on a pruned DiT (bind_pruned_adaln_). On a released one they
+  // fit nothing, and the rest of the adapter would run without them and
+  // look like a weaker adapter: said, not skipped quietly.
+  if (!_cfg.pruned() &&
+      lora::Adapter::file_touches(spec.path, "adaln_proj.linear.diff") &&
+      _mc->session() != nullptr) {
+    _mc->session()->warn(fmt(
+        "MetalMiniMaxH3Transformer: '{}' carries ComfyUI weight diffs on "
+        "the AdaLN (adaln_proj.linear.diff / .diff_b) -- the pruned form's "
+        "-- and this DiT is the released one, which does not apply them; "
+        "its LoRA factors bind without them", spec.path));
+  }
   if (curved && !lora::Adapter::file_touches(spec.path, ".lora_")) {
     // Curves alone: a slot with no factors, kept so the next adapter's
     // strength still lands on ITS slot (a slot is its index).
@@ -3015,6 +3898,11 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     slot.modules  = ad->modules() + slot.curve.branches;
     slot.banded   = banded;
     slot.max_rank = ad->max_rank();
+    if (c.pruned() &&
+        !bind_pruned_adaln_(ad.get(), spec.path, /*diffusers=*/true, slot,
+                            err)) {
+      return false;
+    }
     if (slot.modules == 0) {
       if (err != nullptr) {
         *err = "minimax-h3 lora: '" + spec.path +
@@ -3067,6 +3955,13 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
 
   slot.modules  = ad->modules() + slot.curve.branches;
   slot.max_rank = ad->max_rank();
+  // PRUNED: the AdaLN's `.diff` patches and full-model modules, as f32
+  // deltas on the trunk's projections (counted into `modules`).
+  if (c.pruned() &&
+      !bind_pruned_adaln_(ad.get(), spec.path, /*diffusers=*/false, slot,
+                          err)) {
+    return false;
+  }
   if (slot.modules == 0) {
     // NAME what would have matched. "none of this model's modules" is
     // the whole of what a user sees when a trainer's naming is one this
@@ -3143,6 +4038,108 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   return true;
 }
 
+bool
+MetalMiniMaxH3Transformer::sampling_contract_of(const std::string& file,
+                                                SamplingContract* out,
+                                                std::string* err)
+{
+  namespace fs = std::filesystem;
+  if (err != nullptr) { err->clear(); }
+  std::error_code ec;
+  const fs::path mp = fs::path(file).parent_path() / "manifest.json";
+  if (!fs::is_regular_file(mp, ec)) { return false; }
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = "'" + mp.string() + "': " + m; }
+    return false;
+  };
+  std::ifstream f(mp);
+  std::stringstream ss;
+  ss << f.rdbuf();
+  const FlexData doc = FlexData::from_json(ss.str());
+  if (!doc.is_object()) { return false; }   // someone else's manifest
+  const auto o = doc.as_object();   // a view: `doc` owns it
+  if (!o.contains("sampling")) { return false; }
+  const FlexData smp = o.at("sampling");
+  if (!smp.is_object()) { return fail("`sampling` is not an object"); }
+  const auto so = smp.as_object();
+  auto str = [](const FlexData& d) {
+    return d.is_string() ? std::string(d.as_string("")) : std::string();
+  };
+  SamplingContract c;
+  if (o.contains("release_id")) { c.release = str(o.at("release_id")); }
+  if (o.contains("task")) { c.task = str(o.at("task")); }
+  if (o.contains("trunk")) { c.trunk = str(o.at("trunk")); }
+  if (so.contains("knots") && so.at("knots").is_array()) {
+    const FlexData kn = so.at("knots");
+    const auto ka = kn.as_array();
+    for (std::size_t i = 0; i < ka.size(); ++i) {
+      c.sigmas.push_back(ka[i].as_real(-1.0) / 1000.0);
+    }
+  }
+  // diffusers' own check on a grid it is handed: strictly decreasing,
+  // at most 1, ending at exactly 0.
+  bool ok = c.sigmas.size() >= 2 && c.sigmas.front() <= 1.0 &&
+            c.sigmas.back() == 0.0;
+  for (std::size_t i = 1; ok && i < c.sigmas.size(); ++i) {
+    ok = c.sigmas[i] < c.sigmas[i - 1];
+  }
+  if (!ok) {
+    return fail("`sampling.knots` is not a grid strictly decreasing from "
+                "at most 1000 to exactly 0");
+  }
+  auto num = [&](const char* k) {
+    return so.contains(k) ? so.at(k).as_real(0.0) : 0.0;
+  };
+  c.video_shift = num("video_shift");
+  c.audio_shift = num("audio_shift");
+  const std::string method =
+      so.contains("method") ? str(so.at("method")) : std::string();
+  if (method == "renoise") {
+    c.renoise = true;
+  } else if (!method.empty() && method != "euler") {
+    // A sampler this loop does not implement is refused BY NAME: run as
+    // Euler it would be exactly the generic sampling the release warns
+    // is not equivalent.
+    return fail("`sampling.method` '" + method + "' is not one this "
+                "sampler implements (renoise, euler)");
+  }
+  const std::string np =
+      o.contains("numerics_policy") ? str(o.at("numerics_policy"))
+                                    : std::string();
+  if (np == "bf16_conditioning_v1") {
+    c.bf16_conditioning = true;
+  } else if (!np.empty() && np != "fp32_conditioning_v1") {
+    return fail("`numerics_policy` '" + np + "' is not one this model "
+                "implements (bf16_conditioning_v1, fp32_conditioning_v1)");
+  }
+  if (!c.trunk.empty() && contract_partition(c).empty()) {
+    return fail("`trunk` '" + c.trunk + "' names no MiniMax-H3 DiT "
+                "(transformer, transformer_ref)");
+  }
+  if (out != nullptr) { *out = std::move(c); }
+  return true;
+}
+
+std::string
+MetalMiniMaxH3Transformer::contract_partition(const SamplingContract& c)
+{
+  // The diffusers pipeline's two DiT folders: `transformer/` is FL2VA's,
+  // `transformer_ref/` Ref2VA's (minimax-h3-diffusers-layout.h).
+  if (c.trunk == "transformer") { return "fl2va"; }
+  if (c.trunk == "transformer_ref") { return "ref2va"; }
+  return {};
+}
+
+const MetalMiniMaxH3Transformer::SamplingContract*
+MetalMiniMaxH3Transformer::sampling_contract() const
+{
+  if (_contract.slot < 0 || (std::size_t)_contract.slot >= _lora.size() ||
+      _lora[(std::size_t)_contract.slot].scale == 0.0f) {
+    return nullptr;
+  }
+  return &_contract;
+}
+
 // HyperFlow's file layout, which is the only flow-map adapter there is:
 //
 //   header   hyperflow = "true", hyperflow_gate, hyperflow_sigmas (JSON
@@ -3167,6 +4164,36 @@ MetalMiniMaxH3Transformer::bind_flow_map_(lora::Adapter& ad,
     return false;
   };
   const Config& c = _cfg;
+  // PRUNED (Config::curve_grid) the file has no timestep MLP. One that
+  // an adapter adapts -- or a flow-map adapter's two -- runs on the
+  // RELEASED MLP (Config::time_mlp_dir) and is projected onto the
+  // curve's coordinates, the part it moves OFF the curve baked from the
+  // released AdaLN (bake_adaln). Without that MLP its modules are
+  // skipped and a flow map refused.
+  if (c.pruned()) {
+    const bool flow = ad.metadata("hyperflow") == "true" ||
+                      ad.has("endpoint_time_embedder.linear_1") ||
+                      ad.has("endpoint_time_embedder.proj_in");
+    const bool mlp_mods = ad.has("time_embedder.linear_1") ||
+                          ad.has("time_embedder.linear_2") ||
+                          ad.has("time_embedder.proj_in") ||
+                          ad.has("time_embedder.proj_out");
+    if (!flow && !mlp_mods) { return true; }
+    std::string berr;
+    if (!ensure_curve_basis_(&berr)) {
+      if (flow) {
+        return fail("a flow-map adapter blends two timestep MLPs, and this "
+                    "DiT is ComfyUI's pruned form, which has none: " + berr);
+      }
+      if (_mc->session() != nullptr) {
+        _mc->session()->warn(fmt(
+            "MetalMiniMaxH3Transformer: '{}' adapts the timestep MLP, and "
+            "this DiT is ComfyUI's pruned form; those modules are skipped: "
+            "{}", path, berr));
+      }
+      return true;
+    }
+  }
   // The timestep MLP, whichever adapter this is: diffusers' names
   // (`linear_1/2`) or this checkpoint's own (`proj_in/out`). It runs on
   // the host in f32 (see time_embed_), so these factors stay f32 on the
@@ -3178,7 +4205,7 @@ MetalMiniMaxH3Transformer::bind_flow_map_(lora::Adapter& ad,
                            ad.has(pre + "linear_2");
     ad.bind_host(pre + (diffusers ? "linear_1" : "proj_in"), c.time_hidden,
                  c.freq_dim, in);
-    ad.bind_host(pre + (diffusers ? "linear_2" : "proj_out"), c.time_dim,
+    ad.bind_host(pre + (diffusers ? "linear_2" : "proj_out"), mlp_dim_(),
                  c.time_hidden, out);
   };
   mlp("time_embedder.", &slot.time_in, &slot.time_out);
@@ -3205,7 +4232,7 @@ MetalMiniMaxH3Transformer::bind_flow_map_(lora::Adapter& ad,
                     "{} -> {} -> {} MLP",
                     !slot.time_in.empty(), !slot.time_out.empty(),
                     !slot.end_in.empty(), !slot.end_out.empty(),
-                    c.freq_dim, c.time_hidden, c.time_dim)());
+                    c.freq_dim, c.time_hidden, mlp_dim_())());
   }
   FlowMap f;
   try {
@@ -3523,6 +4550,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       return nullptr;
     }
     if (m->_f8.any()) {
+      m->_f8_widen = widen_of_(src, m->_f8, m->_cfg);
+      // A native W4A8 weight's per-GEMM decode (gemm_); optional, as the
+      // ConvRot quantizer is: without it W4A8 widens per GEMM instead.
+      m->_lib_dq = mc->load_library("affine_dequant_bf16");
+      m->_fn_w4a8_i8 = m->_lib_dq.function("w4a8_to_i8");
       if (!m->_fp8x.load(mc)) {
         if (sess != nullptr) {
           sess->warn(fmt("minimax-h3: '{}' stores FP8 weights and the FP8 "
@@ -3531,8 +4563,9 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         return nullptr;
       }
       std::size_t fp8_bytes = 0, n_scaled = 0, n_i8 = 0, n_rot = 0;
+      std::size_t n_w4 = 0;
       int rot = 0;
-      std::string first_i8;
+      std::string first_i8, first_w4;
       for (const auto& [n, fw] : m->_f8.weights) {
         if (const auto* ti = src.info(n); ti != nullptr) {
           fp8_bytes += (std::size_t)ti->nbytes;
@@ -3541,6 +4574,15 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         if (fw.format == fp8::Format::kI8) {
           ++n_i8;
           if (first_i8.empty()) { first_i8 = n; }
+        }
+        if (fw.format == fp8::Format::kW4A8) {
+          ++n_w4;
+          if (first_w4.empty()) { first_w4 = n; }
+          for (const std::string& a : {fw.s_rel, fw.codebook}) {
+            if (const auto* ai = src.info(a); ai != nullptr) {
+              fp8_bytes += (std::size_t)ai->nbytes;
+            }
+          }
         }
         if (fw.rot_group > 0) {
           ++n_rot;
@@ -3557,12 +4599,21 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         }
         return nullptr;
       }
+      if (n_w4 > 0 && !m->_fp8x.w4a8_valid()) {
+        if (sess != nullptr) {
+          sess->warn(fmt("minimax-h3: '{}' stores W4A8 weights ('{}' among "
+                         "{}) and this host has no W4A8 widening kernel",
+                         ws.dir(), first_w4, n_w4));
+        }
+        return nullptr;
+      }
       if (sess != nullptr) {
         sess->info(fmt(
             "MetalMiniMaxH3Transformer: {} checkpoint{} -- {} tensors "
             "({} MB){} kept as {} codes and widened per GEMM{}",
-            n_i8 == m->_f8.weights.size() ? "int8"
-            : n_i8 > 0                    ? "FP8 / int8"
+            n_w4 == m->_f8.weights.size() ? "W4A8"
+            : n_i8 == m->_f8.weights.size() ? "int8"
+            : n_i8 + n_w4 > 0             ? "FP8 / int8"
                                           : "FP8",
             src.has("blocks.0.attn.qkv_proj.q.weight")
                 ? std::string(" (diffusers layout, read under H3's names)")
@@ -3570,7 +4621,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
             m->_f8.weights.size(), fp8_bytes >> 20,
             n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
                          : std::string(),
-            n_i8 > 0 ? "8-bit" : "FP8",
+            n_w4 > 0 ? "4-bit" : n_i8 > 0 ? "8-bit" : "FP8",
             n_rot > 0 ? fmt(" ({} ConvRot-rotated, groups up to {}, "
                             "un-rotated as they widen)", n_rot, rot)()
                       : std::string()));
@@ -3742,9 +4793,21 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
                     !cfg.ane_ffn && m->_i8->fast_group(cfg.hidden) > 0;
     if (m->_i8_layout && mc->session() != nullptr) {
       const int fg = m->_i8->fast_group(cfg.hidden);
+      // ComfyUI ConvRot-256 codes the token tier runs as stored (the
+      // test i8_linear_ makes per projection).
+      std::size_t n_cr = 0;
+      if (fg == I8GemmContext::kTokenGroup && m->_i8->convrot_available() &&
+          !(std::getenv("VPIPE_H3_CONVROT_NATIVE") != nullptr &&
+            std::atoi(std::getenv("VPIPE_H3_CONVROT_NATIVE")) == 0)) {
+        for (const auto& [n, fw] : m->_f8.weights) {
+          n_cr += n.compare(0, 7, "blocks.") == 0 && fw.rot_group == 256 &&
+                  (fw.format == fp8::Format::kI8 ||
+                   fw.format == fp8::Format::kW4A8);
+        }
+      }
       mc->session()->info(fmt(
           "MetalMiniMaxH3Transformer: the main blocks' projections take the "
-          "{} int8 tier ({})",
+          "{} int8 tier ({}){}",
           fg == I8GemmContext::kTokenGroup ? "TOKEN" : "FAST",
           fg != I8GemmContext::kTokenGroup
               ? fmt("rotated, group {}", fg)()
@@ -3752,7 +4815,10 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
               ? "per channel x per token, Hadamard-256 rotated; " +
                     m->_i8->token_kernel() + " GEMM"
           : "per channel x per token; a Draw Things i8x checkpoint's "
-            "codes as stored; " + m->_i8->token_kernel() + " GEMM"));
+            "codes as stored; " + m->_i8->token_kernel() + " GEMM",
+          n_cr > 0 ? fmt("; {} ComfyUI ConvRot projection(s) run their "
+                         "codes as stored", n_cr)()
+                   : std::string()));
     }
     // Deep-K split for the FF down projection. bf16 libraries: the fold
     // writes this DiT's element type.
@@ -3833,19 +4899,82 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_audio_patch = m->linear_(ws, "audio_patch_proj", true, r);
   m->_cond_proj   = m->linear_(ws, "condition_proj", true, r);
   m->_final_norm  = m->weight_(ws, "final_layer.norm.weight", r);
-  m->_final_adaln = m->linear_(ws, "final_layer.adaln_proj.linear", true, r);
+  if (!cfg.pruned()) {
+    m->_final_adaln =
+        m->linear_(ws, "final_layer.adaln_proj.linear", true, r);
+  }
   m->_video_out   = m->linear_(ws, "final_layer.video_out", true, r);
   m->_audio_out   = m->linear_(ws, "final_layer.audio_out", true, r);
   m->_refiner_final_norm = m->weight_(ws, "token_refiner.final_norm.weight", r);
   if (m->_video_patch.empty() || m->_audio_patch.empty() ||
       m->_cond_proj.empty() || m->_final_norm.empty() ||
-      m->_final_adaln.empty() || m->_video_out.empty() ||
+      (m->_final_adaln.empty() && !cfg.pruned()) || m->_video_out.empty() ||
       m->_audio_out.empty() || m->_refiner_final_norm.empty()) {
     return nullptr;
   }
 
-  // The timestep MLP goes to the HOST in f32 -- see time_embed_.
-  if (!to_host_f32_(ws, mc, "time_embedder.proj_in.weight", m->_time_in_w) ||
+  if (cfg.pruned()) {
+    // ComfyUI's PRUNED form: the curve table to the host (time_embed_
+    // reads points off it per forward) and every AdaLN projection held
+    // AS STORED in the trunk -- 1.5 MB a block, read once, never
+    // streamed; the kernel widens it exactly, as ComfyUI casts it to
+    // f32 (h3_adaln_pruned_f16).
+    if (!to_host_f32_(ws, mc, "adaln_t_table", m->_adaln_t_table) ||
+        m->_adaln_t_table.size() !=
+            (std::size_t)cfg.curve_grid * (std::size_t)cfg.time_dim) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(
+            fmt("MetalMiniMaxH3Transformer: the pruned DiT's adaln_t_table "
+                "cannot be read"));
+      }
+      return nullptr;
+    }
+    const auto res = kept_residency_(m->_stream_blocks, m->_wire.on());
+    auto held = [&](const std::string& nm, int D, PrunedAdaln& p) {
+      const auto* wi = ws.src().info(nm + ".weight");
+      const auto* bi = ws.src().info(nm + ".bias");
+      if (wi == nullptr || bi == nullptr || wi->dtype != bi->dtype ||
+          wi->shape.size() != 2 || wi->shape[0] != D ||
+          wi->shape[1] != cfg.time_dim || bi->shape.size() != 1 ||
+          bi->shape[0] != D) {
+        return false;
+      }
+      p.dtype = wi->dtype == "F32"   ? 0
+                : wi->dtype == "F16" ? 1
+                : wi->dtype == "BF16" ? 2
+                                      : -1;
+      if (p.dtype < 0) { return false; }
+      p.w = ws.tensor(nm + ".weight", mc, res);
+      p.b = ws.tensor(nm + ".bias", mc, res);
+      return !p.w.empty() && !p.b.empty();
+    };
+    m->_padaln.resize((std::size_t)cfg.n_layers);
+    bool ok = held("final_layer.adaln_proj.linear", 2 * cfg.hidden,
+                   m->_final_padaln);
+    for (int i = 0; ok && i < cfg.n_layers; ++i) {
+      ok = held(blk_("blocks.", i, "adaln_proj.linear"), cfg.adaln_out(),
+                m->_padaln[(std::size_t)i]);
+    }
+    if (ok && !m->_lib_regen.valid()) {
+      m->_lib_regen = mc->load_library("minimax_h3_regenerate_bf16");
+    }
+    m->_fn_pruned_mod = m->_lib_regen.function("h3_adaln_pruned_f16");
+    m->_fn_pruned_patch = m->_lib_regen.function("h3_adaln_patch_f32");
+    m->_fn_pruned_res = m->_lib_regen.function("h3_adaln_pruned_res_f16");
+    if (!ok || !m->_fn_pruned_mod.valid() || !m->_fn_pruned_patch.valid() ||
+        !m->_fn_pruned_res.valid()) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(fmt(
+            "MetalMiniMaxH3Transformer: the pruned DiT's AdaLN projections "
+            "{}", ok ? "cannot run: h3_adaln_pruned_f16 / _patch_f32 are "
+                       "missing from this build"
+                     : "are not [D, 8] F32 / F16 / BF16 pairs"));
+      }
+      return nullptr;
+    }
+  } else if (
+      // The timestep MLP goes to the HOST in f32 -- see time_embed_.
+      !to_host_f32_(ws, mc, "time_embedder.proj_in.weight", m->_time_in_w) ||
       !to_host_f32_(ws, mc, "time_embedder.proj_in.bias", m->_time_in_b) ||
       !to_host_f32_(ws, mc, "time_embedder.proj_out.weight", m->_time_out_w) ||
       !to_host_f32_(ws, mc, "time_embedder.proj_out.bias", m->_time_out_b)) {
@@ -3982,7 +5111,64 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       m->_flow = slot.flow;
       m->_flow.slot = (int)m->_lora.size();
     }
+    // A sampling contract names THE sampler, so two of them -- or one
+    // beside a flow-map adapter, which names its own grid -- cannot both
+    // hold. And the adapter was trained on one of the two DiTs: a FL2VA
+    // adapter on the Ref2VA weights is a different model that runs.
+    if (slot.has_contract) {
+      const SamplingContract& sc = slot.contract;
+      std::string why;
+      if (m->_contract.slot >= 0) {
+        why = fmt("slot {} already states a sampling contract",
+                  m->_contract.slot)();
+      } else if (m->_flow.slot >= 0) {
+        why = fmt("slot {} is a flow-map adapter, which names its own "
+                  "grid", m->_flow.slot)();
+      } else {
+        const std::string want = contract_partition(sc);
+        if (!want.empty() && !cfg.partition.empty() &&
+            want != cfg.partition) {
+          why = fmt("it was trained on the {} DiT (`{}`) and this is the "
+                    "{} one", want, sc.trunk, cfg.partition)();
+        }
+      }
+      if (!why.empty()) {
+        if (mc->session() != nullptr) {
+          mc->session()->error(fmt(
+              "MetalMiniMaxH3Transformer: '{}' ({}) is refused: {}",
+              sp.path, sc.release, why));
+        }
+        return nullptr;
+      }
+      m->_contract = sc;
+      m->_contract.slot = (int)m->_lora.size();
+      if (mc->session() != nullptr) {
+        mc->session()->info(fmt(
+            "MetalMiniMaxH3Transformer: '{}' states a sampling contract "
+            "({}): {} steps on its own grid, {}, shifts {:.4g}/{:.4g}{}",
+            sp.path, sc.release.empty() ? "unnamed" : sc.release,
+            (int)sc.sigmas.size() - 1,
+            sc.renoise ? "fresh noise each step" : "Euler",
+            sc.video_shift, sc.audio_shift,
+            sc.bf16_conditioning ? ", keyframes rounded to bf16" : ""));
+      }
+    }
     m->_lora.push_back(std::move(slot));
+  }
+  // PRUNED: the scratch a patched projection is built in (pruned_mod_),
+  // the widest of a block's and the final layer's [D * 8 + D] in f32.
+  if (cfg.pruned()) {
+    bool deltas = false;
+    for (const LoraSlot& sl : m->_lora) {
+      deltas = deltas || !sl.pdelta_final.empty();
+      for (const SharedBuffer& d : sl.pdelta) { deltas = deltas || !d.empty(); }
+    }
+    if (deltas) {
+      const std::size_t D =
+          (std::size_t)std::max(cfg.adaln_out(), 2 * cfg.hidden);
+      m->_padaln_patch = mc->make_shared_buffer(D * 9 * 4);
+      if (m->_padaln_patch.empty()) { return nullptr; }
+    }
   }
   // A streamed DiT's adapter factors stream with their blocks.
   if (stream_blocks) { (void)m->spill_lora_(); }
@@ -4539,6 +5725,25 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
   // for the dense stand-in below, which widens the same values).
   const SharedBuffer* fc = &wl->codes;
   const SharedBuffer* fcs = &wl->cscales;
+  // A native W4A8 weight's int8 codes, decoded ONCE for all the bands.
+  if (wl->gc > 0 && wl->cr_w4) {
+    const std::size_t n = (std::size_t)N * (std::size_t)K;
+    if (_cr_codes.empty() || _cr_codes.byte_size() < n) {
+      _cr_codes = _mc->make_shared_buffer(n);
+      if (_cr_codes.empty()) { _fp8_failed = true; return; }
+    }
+    const bool cb = !wl->f8_cb.empty();
+    enc.set_function(_fn_w4a8_i8);
+    enc.set_buffer(0, wl->codes);
+    enc.set_buffer(1, _cr_codes);
+    enc.set_constant(2, (std::uint32_t)n);
+    enc.set_buffer(3, wl->f8_srel);
+    enc.set_buffer(4, cb ? wl->f8_cb : wl->cscales);
+    enc.set_constant(5, (std::uint32_t)wl->f8_qgroup);
+    enc.set_constant(6, (std::uint32_t)(cb ? 1 : 0));
+    enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    fc = &_cr_codes;
+  }
   if (wl->gc > 0 && wl->pc) {
     if (!_i8 || !_i8->encode_to_fast_scratch(enc, wl->codes, wl->scales,
                                              wl->qbias, wl->gc, N, K)) {
@@ -4594,10 +5799,18 @@ MetalMiniMaxH3Transformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
     // THE INT8 LAYOUT (Linear::gc): I8GemmContext, its scratch, nothing
     // to fold. A band it declines -- the int8 route's row floor -- runs
     // dense from the layout widened into the dequant scratch.
+    // ConvRot codes (cr): the activation rotated alike, then the same
+    // token GEMM over the codes as stored.
     if (wl->gc > 0 && _i8 &&
-        _i8->gemm_fast(enc, x, xo, *fc, *fcs, wl->gc, SharedBuffer{}, y, yo,
-                       rows, N, K)) {
-      // done
+        (wl->cr > 0
+             ? _i8->fast_accepts(rows, N, K) &&
+                   _i8->quantize_token_convrot(enc, x, xo, rows, K) &&
+                   _i8->gemm_fast_quantized(enc, *fc, *fcs, wl->gc,
+                                            SharedBuffer{}, y, yo, rows, N,
+                                            K)
+             : _i8->gemm_fast(enc, x, xo, *fc, *fcs, wl->gc, SharedBuffer{},
+                              y, yo, rows, N, K))) {
+      if (wl->cr > 0) { ++_cr_gemms; }
     } else {
       const Linear* dl = wl;
       if (wl->gc > 0) {
@@ -5223,9 +6436,9 @@ MetalMiniMaxH3Transformer::build_rope_(const h3::PackedLayout& L,
 
 void
 MetalMiniMaxH3Transformer::time_mlp_row_(double t, bool endpoint,
-                                         float* out) const
+                                         float* out, bool base_only) const
 {
-  const int F = _cfg.freq_dim, H = _cfg.time_hidden, D = _cfg.time_dim;
+  const int F = _cfg.freq_dim, H = _cfg.time_hidden, D = mlp_dim_();
   std::vector<float> row((std::size_t)F), h1((std::size_t)H);
   const int half = F / 2;
   // Diagnostic: the scale the sinusoidal grid sees. At t in [0, 1] every
@@ -5256,7 +6469,7 @@ MetalMiniMaxH3Transformer::time_mlp_row_(double t, bool endpoint,
   // Each live slot's adapter on proj_in, PRE-activation. The endpoint
   // embedder is the flow-map slot's own copy and takes only its own
   // factors (see bind_flow_map_).
-  for (std::size_t si = 0; si < _lora.size(); ++si) {
+  for (std::size_t si = 0; !base_only && si < _lora.size(); ++si) {
     const LoraSlot& sl = _lora[si];
     if (endpoint) {
       if ((int)si == _flow.slot) {
@@ -5276,7 +6489,7 @@ MetalMiniMaxH3Transformer::time_mlp_row_(double t, bool endpoint,
     for (int i = 0; i < H; ++i) { acc += w[i] * h1[(std::size_t)i]; }
     out[o] = acc;
   }
-  for (std::size_t si = 0; si < _lora.size(); ++si) {
+  for (std::size_t si = 0; !base_only && si < _lora.size(); ++si) {
     const LoraSlot& sl = _lora[si];
     if (endpoint) {
       if ((int)si == _flow.slot) {
@@ -5294,9 +6507,54 @@ MetalMiniMaxH3Transformer::time_embedding(const std::vector<float>& timesteps,
                                           std::vector<float>* out) const
 {
   const int n_t = (int)timesteps.size();
-  const int F = _cfg.freq_dim, H = _cfg.time_hidden, D = _cfg.time_dim;
+  const int D = mlp_dim_();
   if (out == nullptr || n_t <= 0) { return false; }
-  if ((int)_time_in_w.size() != H * F || (int)_time_out_w.size() != D * H) {
+  // PRUNED: the point of the curve each timestep lands on, t clamped to
+  // [0, 1] as ComfyUI clamps it (a no-op for every timestep H3 makes) --
+  // unless an adapter moves the embedding (pruned_projects_), which is
+  // then the released one, projected below.
+  const bool project = pruned_projects_();
+  if (_cfg.pruned() && !project) {
+    std::vector<float> t(timesteps);
+    for (float& v : t) { v = std::min(1.0f, std::max(0.0f, v)); }
+    out->assign((std::size_t)n_t * 8, 0.0f);
+    curve_coords(_adaln_t_table, _cfg.curve_grid, t, out->data());
+    return true;
+  }
+  if (!mlp_embedding_(timesteps, endpoints, out)) { return false; }
+  if (project) {
+    // The released embedding, silu'd and rounded to bf16 as the released
+    // AdaLN reads it (time_embed_), onto the curve's coordinates:
+    // c = pinv (s - m). What it leaves off the curve is the bake's
+    // (bake_adaln, pruned) -- of the same rounded s, so the two parts
+    // add up to the released W s + b.
+    std::vector<float> pts((std::size_t)n_t * 8);
+    for (int t = 0; t < n_t; ++t) {
+      const float* e = out->data() + (std::size_t)t * D;
+      for (int k = 0; k < 8; ++k) {
+        const float* pk = _basis.pinv.data() + (std::size_t)k * D;
+        double acc = 0.0;
+        for (int j = 0; j < D; ++j) {
+          acc += (double)pk[j] *
+                 ((double)silu_bf16_(e[j]) - (double)_basis.m[(std::size_t)j]);
+        }
+        pts[(std::size_t)t * 8 + k] = (float)acc;
+      }
+    }
+    *out = std::move(pts);
+  }
+  return true;
+}
+
+bool
+MetalMiniMaxH3Transformer::mlp_embedding_(
+    const std::vector<float>& timesteps, const std::vector<float>* endpoints,
+    std::vector<float>* out) const
+{
+  const int n_t = (int)timesteps.size();
+  const int F = _cfg.freq_dim, H = _cfg.time_hidden, D = mlp_dim_();
+  if (out == nullptr || n_t <= 0 || (int)_time_in_w.size() != H * F ||
+      (int)_time_out_w.size() != D * H) {
     return false;
   }
   // The flow-map blend, or the plain embedder. Off at strength 0 in
@@ -5346,7 +6604,11 @@ MetalMiniMaxH3Transformer::time_embed_(const std::vector<float>& timesteps,
     // step, which then accumulates coherently down the denoising
     // trajectory instead of averaging out.
     const float acc = temb[i];
-    dst[i] = f32_to_bf16_(acc / (1.0f + std::exp(-acc)));
+    // Pruned, the projections read the point as it is (no silu); this
+    // copy is what an adapter's AdaLN modules read (pruned_mod_ reads
+    // the f32 point).
+    dst[i] = f32_to_bf16_(_cfg.pruned() ? acc
+                                        : acc / (1.0f + std::exp(-acc)));
   }
   return true;
 }
@@ -5424,6 +6686,14 @@ MetalMiniMaxH3Transformer::bake_adaln(
   if (schedule.empty()) { return fail("empty schedule"); }
   if (_mc == nullptr || _ws == nullptr) { return fail("no weights"); }
   const Config& c = _cfg;
+  // Pruned, a projection is [D, 8] -- 1.5 MB, read once at load and held
+  // -- so a table of its rows would hold more than it retires. What IS
+  // baked there is the part an adapted embedding leaves off the curve
+  // (below), which only an adapter on the timestep MLP makes.
+  if (c.pruned() && !pruned_projects_()) {
+    return fail("the pruned AdaLN reads 8 columns and is held from load; "
+                "nothing to bake");
+  }
   const int D = c.adaln_out();
   const int FD = 2 * c.hidden;
 
@@ -5475,6 +6745,10 @@ MetalMiniMaxH3Transformer::bake_adaln(
                     schedule.size(), want >> 20, kBudget >> 20)());
   }
 
+  if (c.pruned()) {
+    return bake_pruned_off_curve_(all, two ? &all_r : nullptr, err);
+  }
+
   // The timestep MLP for EVERY row at once, on the host in f32 exactly
   // as a single step would do it.
   SharedBuffer temb =
@@ -5501,7 +6775,8 @@ MetalMiniMaxH3Transformer::bake_adaln(
   auto lin_bytes = [](const Linear& l) {
     return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
            l.scales.byte_size() + l.qbias.byte_size() +
-           l.f8_scale.byte_size();
+           l.f8_scale.byte_size() + l.f8_srel.byte_size() +
+           l.f8_cb.byte_size();
   };
   std::size_t freed = 0;
   _adaln_tab.clear();
@@ -5829,11 +7104,39 @@ std::size_t
 MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
                                          int n_t, bool with_dequant,
                                          bool narrow_ff,
-                                         std::size_t arena_floor, int band)
+                                         std::size_t arena_floor, int band,
+                                         std::size_t widen)
 {
   if (seq <= 0) { return 0; }
   const std::size_t S = (std::size_t)seq;
   const std::size_t T = (std::size_t)(n_text > 0 ? n_text : 0);
+  // _w_deq is grown to the WIDEST projection that actually reaches
+  // gemm_mma_, and kept.
+  //
+  // Only the four whose M is the SEQUENCE length count. The two
+  // modulation projections are wider on paper -- the per-block AdaLN is
+  // [adaln_out, time_dim] = 496 MB against fc1's 294 -- but their M is
+  // the distinct-TIMESTEP count, a handful of rows, so they never clear
+  // the tile minimum and always run steel. Including them over-stated
+  // this by 212 MB.
+  //
+  // (That is also the shape of a bug this file had: gemm_mma_ once took
+  // the mma path for steel routes too, and the M=2 AdaLN really did
+  // dequantize 496 MB to multiply two rows. If _mma_min_m is dropped
+  // below the timestep count by hand, this estimate under-states again
+  // -- scratch_estimate_matches_allocation pins the default.)
+  //
+  // An FP8 / int8 / W4A8 weight is widened into the same scratch ahead
+  // of EVERY route, on every GPU, the AdaLN's included: `widen` is that.
+  const auto dequant = [&]() -> std::size_t {
+    const std::size_t H = (std::size_t)c.hidden;
+    const std::size_t I = (std::size_t)c.inner();
+    const std::size_t F = (std::size_t)c.ffn;
+    const std::size_t four =
+        with_dequant ? std::max({3 * I * H, H * I, 2 * F * H, H * F}) * 2
+                     : 0;
+    return std::max(four, widen);
+  };
   if (band > 0 && band < seq) {
     // The banded layout (ensure_scratch_): per row of the sequence the
     // rope tables, x, qh | kh | vh and the two indices; per row of a band
@@ -5850,11 +7153,7 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
                          2 * sizeof(int));
     b += B * (H + 3 * I + std::max(3 * I, ff)) * 2;
     b += T * H * 2 + N * ((std::size_t)c.time_dim + c.adaln_out() + 2 * H) * 2;
-    if (with_dequant) {
-      const std::size_t F = (std::size_t)c.ffn;
-      b += std::max({3 * I * H, H * I, 2 * F * H, H * F}) * 2;
-    }
-    return b;
+    return b + dequant();
   }
   // THE SLOT FLOOR, applied HERE and not left to the caller. The scratch
   // allocates max(n_t, kTimestepSlots) timestep slots so that the key in
@@ -5880,35 +7179,7 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
   // they are not.
   const std::size_t arena = S * attn_arena_elems_(c, narrow_ff) * 2;
   if (arena_floor > arena) { total += arena_floor - arena; }
-  if (with_dequant) {
-    // _w_deq is grown to the WIDEST projection that actually reaches
-    // gemm_mma_, and kept.
-    //
-    // Only the four whose M is the SEQUENCE length count. The two
-    // modulation projections are wider on paper -- the per-block AdaLN is
-    // [adaln_out, time_dim] = 496 MB against fc1's 294 -- but their M is
-    // the distinct-TIMESTEP count, a handful of rows, so they never clear
-    // the tile minimum and always run steel. Including them over-stated
-    // this by 212 MB.
-    //
-    // (That is also the shape of a bug this file had: gemm_mma_ once took
-    // the mma path for steel routes too, and the M=2 AdaLN really did
-    // dequantize 496 MB to multiply two rows. If _mma_min_m is dropped
-    // below the timestep count by hand, this estimate under-states again
-    // -- scratch_estimate_matches_allocation pins the default.)
-    const std::size_t H = (std::size_t)c.hidden;
-    const std::size_t I = (std::size_t)c.inner();
-    const std::size_t F = (std::size_t)c.ffn;
-    const std::size_t cand[] = {
-        3 * I * H,   // qkv
-        H * I,       // out
-        2 * F * H,   // fc1 -- the widest of these
-        H * F,       // fc2
-    };
-    std::size_t widest = 0;
-    for (std::size_t v : cand) { widest = std::max(widest, v); }
-    total += widest * 2;
-  }
+  total += dequant();
   return total;
 }
 
@@ -5984,7 +7255,9 @@ MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
       &b.adaln.qbias,
       &b.qkv.f8_scale, &b.out.f8_scale, &b.fc1.f8_scale, &b.fc2.f8_scale,
       &b.adaln.f8_scale, &b.qkv.cscales, &b.out.cscales, &b.fc1.cscales,
-      &b.fc2.cscales, &b.adaln.cscales};
+      &b.fc2.cscales, &b.adaln.cscales,
+      &b.qkv.f8_srel, &b.out.f8_srel, &b.fc1.f8_srel, &b.fc2.f8_srel,
+      &b.qkv.f8_cb, &b.out.f8_cb, &b.fc1.f8_cb, &b.fc2.f8_cb};
   std::size_t n = 0;
   for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
   return n;
@@ -6069,7 +7342,9 @@ MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
   if (const fp8::Weight* fw = _f8.find(nm + ".weight"); fw != nullptr) {
     return l.is_fp8() && l.f8 == fw->format &&
            l.f8_scale.empty() == fw->scale.empty() &&
-           l.f8_per_row == fw->per_row && l.f8_rot == fw->rot_group;
+           l.f8_per_row == fw->per_row && l.f8_rot == fw->rot_group &&
+           l.f8_qgroup == fw->qgroup &&
+           l.f8_cb.empty() == fw->codebook.empty();
   }
   if (l.is_fp8()) { return false; }
   const bool ckpt_quant = _quant_bits > 0 && si != nullptr &&
@@ -6119,7 +7394,9 @@ MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
       &b.adaln.qbias,
       &b.qkv.f8_scale, &b.out.f8_scale, &b.fc1.f8_scale, &b.fc2.f8_scale,
       &b.adaln.f8_scale, &b.qkv.cscales, &b.out.cscales, &b.fc1.cscales,
-      &b.fc2.cscales, &b.adaln.cscales};
+      &b.fc2.cscales, &b.adaln.cscales,
+      &b.qkv.f8_srel, &b.out.f8_srel, &b.fc1.f8_srel, &b.fc2.f8_srel,
+      &b.qkv.f8_cb, &b.out.f8_cb, &b.fc1.f8_cb, &b.fc2.f8_cb};
   std::size_t changed = 0;
   for (metal_compute::SharedBuffer* p : all) {
     const std::size_t n = _wire.wire_one(_mc, *p, on);
@@ -6501,6 +7778,32 @@ MetalMiniMaxH3Transformer::forward_band(int seq) const
   return band_rows(_cfg, seq);
 }
 
+double
+MetalMiniMaxH3Transformer::sol_kept_fraction() const
+{
+  if (!_sol) { return -1.0; }
+  const long long layers = _cfg.n_layers - _cfg.sol.dense_layers;
+  const long long tot =
+      _sol_routed_total > 0
+          ? _sol_routed_total
+          : _sol->total_blocks() * (layers > 0 ? layers : 1);
+  const long long got =
+      _sol->exact_blocks() + (_sol_tail ? _sol_tail->exact_blocks() : 0);
+  return tot > 0 && got > 0 ? (double)got / (double)tot : -1.0;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::sol_held_bytes() const
+{
+  std::size_t n = 0;
+  for (const MetalSolAttention* o : {_sol.get(), _sol_tail.get()}) {
+    if (o != nullptr) {
+      n += o->resident_bytes() + MetalSolAttention::pinned_bytes();
+    }
+  }
+  return n;
+}
+
 std::size_t
 MetalMiniMaxH3Transformer::sol_scratch_bytes(int seq) const
 {
@@ -6521,6 +7824,10 @@ MetalMiniMaxH3Transformer::sol_scratch_bytes(int seq) const
           _cfg.n_heads, _cfg.n_heads, seq % band, seq, _cfg.head_dim,
           _cfg.sol.key_block, _sol->uses_matrix_cores(), lend, 0);
     }
+    // ...and the layer's keys, summarised once for every band's call
+    // (MetalSolAttention::prepare_keys): the first object's own.
+    n += MetalSolAttention::prepared_keys_bytes(
+        _cfg.n_heads, seq, _cfg.head_dim, _cfg.sol.key_block);
     return n;
   }
   const std::size_t win = (std::size_t)seq * I * 2;
@@ -6922,7 +8229,8 @@ MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
   // ComfyUI's int8 is not a source the staging reads (AneFfnSource takes
   // FP8 codes, and a ConvRot weight is no elementwise code at all).
   auto stageable = [](const Linear& l) {
-    if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8) {
+    if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8 ||
+        l.f8 == fp8::Format::kW4A8) {
       return false;
     }
     if (!l.quantized) { return true; }
@@ -6938,8 +8246,10 @@ MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
         "feed-forward", L,
         adapted && b.fc1.gu_inter
             ? "has an adapter on an interleaved fc1"
-        : b.fc1.f8 == fp8::Format::kI8 || b.fc2.f8 == fp8::Format::kI8
-            ? "stores its feed-forward as int8"
+        : b.fc1.f8 == fp8::Format::kI8 || b.fc2.f8 == fp8::Format::kI8 ||
+                  b.fc1.f8 == fp8::Format::kW4A8 ||
+                  b.fc2.f8 == fp8::Format::kW4A8
+            ? "stores its feed-forward as int8 / W4A8"
             : "has no bias-free fp16 or 4/8-bit affine feed-forward"));
   }
   return ok;
@@ -7026,7 +8336,8 @@ MetalMiniMaxH3Transformer::ane_qkv_eligible_(int L, const Block& b)
   if (L >= cap) { return false; }
   const Linear& l = b.qkv;
   // int8 keeps the GPU, as in ane_eligible_.
-  if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8) {
+  if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8 ||
+      l.f8 == fp8::Format::kW4A8) {
     return false;
   }
   if (!l.quantized) { return true; }
@@ -7292,7 +8603,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // A stack residency has kept whole needs its slots no more.
   (void)release_idle_slots();
   _resid.note_reserve_allocated(
-      scratch_bytes(c, seq, n_text, n_t, uses_dequant_scratch()));
+      scratch_bytes(c, seq, n_text, n_t, uses_dequant_scratch(), false, 0,
+                    0, _f8_widen));
   const auto mbudget = _mc->memory_budget();
   _resid.begin_forward(mbudget, [this]() -> std::size_t {
     return evict_tail_block_();
@@ -7372,6 +8684,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                     "timesteps (the schedule has {})", in.schedule_index,
                     n_t, _adaln_row0.size())());
   }
+  // The step's first row in every baked table.
+  const std::size_t brow =
+      baked ? (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] : 0;
   // ALWAYS, even baked. Baking removes the AdaLN projection's need for
   // it, but not the adaln ADAPTER's: that is applied per forward (so
   // lora_scale stays live) and reads temb as its input. Skipping it here
@@ -7379,8 +8694,26 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // produced plausible numbers, not a crash, and showed up only as the
   // baked and unbaked paths disagreeing once an adapter was attached.
   // It costs a host pass over n_t rows, which is nothing.
+  // An adapted embedding on a PRUNED DiT is only half on the curve; the
+  // rest is the bake's, and without it the model runs a different AdaLN.
+  if (c.pruned() && pruned_projects_() && !baked) {
+    return fail("an adapter moves this pruned DiT's timestep embedding off "
+                "its curve, and that part comes from a baked schedule "
+                "(bake_adaln), which this step does not name");
+  }
   if (!time_embed_(*in.timesteps, in.endpoints, s.temb)) {
     return fail("timestep embedding failed");
+  }
+  // PRUNED: the curve points the AdaLN projections read, in f32 -- fresh
+  // every forward, as the curve branches' are below.
+  if (c.pruned()) {
+    std::vector<float> pts;
+    if (!time_embedding(*in.timesteps, in.endpoints, &pts)) {
+      return fail("pruned AdaLN points failed");
+    }
+    _pcoords = _mc->make_shared_buffer(pts.size() * 4);
+    if (_pcoords.empty()) { return fail("pruned AdaLN points allocation"); }
+    std::memcpy(_pcoords.contents(), pts.data(), pts.size() * 4);
   }
   // The curve branches' c(t), one block of n_t rows per curve slot. The
   // buffer is fresh every forward: the last one's command buffers may
@@ -7495,6 +8828,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // to mean "unchanged model", not "same answer, different kernel".
   const bool sol_on = (bool)_sol && !vdn_linear && !in.dense_attention &&
                       c.sol.dense_layers < c.n_layers && !sattn;
+  _sol_fwd = c.sol;
+  if (in.sol_routing) {
+    _sol_fwd.tau = in.sol_tau;
+    _sol_fwd.thresh =
+        in.sol_exact ? sol::Threshold::kExact : sol::Threshold::kDiag;
+  }
   // SAGE IS A KERNEL VARIANT, not a second attention: it needs the
   // matrix-core steel entry, because the int8 fragment MMA only exists
   // there. `_attn_nax` is resolved further down, so this is re-tested at
@@ -8331,7 +9670,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // be read exactly. Rounded outward to whole blocks inside the
         // kernel, so a ragged boundary keeps one extra block exact
         // rather than half a block approximate.
-        sol::Config sc = c.sol;
+        sol::Config sc = _sol_fwd;
         sc.sink_start  = 0;
         sc.sink_tokens = main ? L.video_start : 0;
         std::string serr;
@@ -9118,6 +10457,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             &vo);
         if (!keys_ok && sol_err.empty()) { sol_err = "sage_attn: " + gerr; }
       }
+      // ...and Sol's: its key summaries, their statistics and the exact
+      // threshold's covariance once for the layer -- every band attends
+      // the same keys -- read by each band's call through Band::keys
+      // (both Sol objects: the last band's reads the first's set).
+      bool sol_keys = false;
+      if (sol_here) {
+        std::string kerr;
+        sol_keys = _sol->prepare_keys(enc, s.kh, s.vh, NH, seq, seq, HD,
+                                      _sol_fwd, &kerr);
+        if (!sol_keys && sol_err.empty()) { sol_err = "sol_attn: " + kerr; }
+      }
       for (int r0 = 0; r0 < seq; r0 += band) {
         const int n = std::min(band, seq - r0);
         const bool full = n == band;
@@ -9151,7 +10501,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           enc.set_constant(6, seq * HD);
           enc.set_constant(7, n * HD);
           enc.dispatch({(unsigned)(NH * n * HD), 1, 1}, {256, 1, 1});
-          sol::Config sc = c.sol;
+          sol::Config sc = _sol_fwd;
           sc.sink_start  = 0;
           sc.sink_tokens = L.video_start;
           so->set_sage(sage_ok ? _sage.get() : nullptr);
@@ -9162,6 +10512,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           bd.k_rows   = seq;
           bd.q_off    = r0;
           bd.q_row0   = 0;
+          bd.keys     = sol_keys ? _sol.get() : nullptr;
           std::string serr;
           if (!so->encode(enc, s.qb, s.kh, s.vh, s.oh, NH, NH, bd, HD, scale,
                           sc, &serr)) {
@@ -9554,7 +10905,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       const LoraStack ada_lo =
           lora_stack_(/*refiner=*/false, Lx, &BlockLora::adaln);
       const bool curved = curve_live_(Lx);
-      if (baked) {
+      if (baked && !c.pruned()) {
         const std::size_t row0 =
             (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] *
             (std::size_t)c.adaln_out();
@@ -9585,8 +10936,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       } else {
         mod_buf = &s.mod;
         mod_off = 0;
-        gemm_(enc, s.temb, 0, b.adaln, s.mod, 0, n_t, c.adaln_out(),
-              c.time_dim);
+        if (c.pruned()) {
+          // Baked, a pruned DiT's tables are the rows an adapted
+          // embedding leaves off the curve, added in the projection.
+          pruned_mod_(enc, _padaln[(std::size_t)Lx], Lx, s.mod, n_t,
+                      c.adaln_out(),
+                      baked ? &_adaln_tab[(std::size_t)Lx] : nullptr,
+                      brow * (std::size_t)c.adaln_out() * 2);
+        } else {
+          gemm_(enc, s.temb, 0, b.adaln, s.mod, 0, n_t, c.adaln_out(),
+                c.time_dim);
+        }
         lora_apply_(enc, s.temb, 0, ada_lo, s.mod, 0, n_t, c.adaln_out(),
                     c.time_dim);
         if (curved) { curve_apply_(enc, Lx, s.mod, n_t); }
@@ -9932,7 +11292,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     const SharedBuffer* fmod_buf = &s.fmod;
     std::size_t fmod_off = 0;
     const LoraStack fin_lo = lora_stack_final_();
-    if (baked) {
+    if (baked && !c.pruned()) {
       const std::size_t row0 =
           (std::size_t)_adaln_row0[(std::size_t)in.schedule_index] *
           (std::size_t)(2 * H);
@@ -9951,7 +11311,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                     c.time_dim);
       }
     } else {
-      gemm_(enc, s.temb, 0, _final_adaln, s.fmod, 0, n_t, 2 * H, c.time_dim);
+      if (c.pruned()) {
+        pruned_mod_(enc, _final_padaln, -1, s.fmod, n_t, 2 * H,
+                    baked ? &_final_adaln_tab : nullptr,
+                    brow * (std::size_t)(2 * H) * 2);
+      } else {
+        gemm_(enc, s.temb, 0, _final_adaln, s.fmod, 0, n_t, 2 * H,
+              c.time_dim);
+      }
       lora_apply_(enc, s.temb, 0, fin_lo, s.fmod, 0, n_t, 2 * H,
                   c.time_dim);
     }

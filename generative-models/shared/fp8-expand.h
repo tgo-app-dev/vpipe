@@ -54,6 +54,12 @@ struct Codes {
   const metal_compute::SharedBuffer* scale   = nullptr;  // f32: 1, or N
   bool                               per_row = false;
   int                                rot_group = 0;      // int8 ConvRot
+  // W4A8 (Format::kW4A8; `codes` [N, K / 2] nibbles, `scale` s_channel):
+  // the E4M3 relative scales [N, K / qgroup] and the codebook (16 f32,
+  // or null: code - 8).
+  const metal_compute::SharedBuffer* s_rel    = nullptr;
+  const metal_compute::SharedBuffer* codebook = nullptr;
+  int                                qgroup   = 0;
   bool any() const noexcept {
     return format != Format::kNone && codes != nullptr;
   }
@@ -73,6 +79,8 @@ class Expander {
   bool load(metal_compute::MetalCompute* mc);
   bool valid() const noexcept;
   bool int8_valid() const noexcept;
+  // W4A8's kernel (w4a8_convrot_dequant), optional as int8's are.
+  bool w4a8_valid() const noexcept { return _w4a8.valid(); }
 
   // Encode codes -> `dst`, [N, K] bf16, and return true. False, with
   // nothing encoded, when the buffers are short, the element count
@@ -86,6 +94,7 @@ class Expander {
   metal_compute::ComputeLibrary  _lib;
   metal_compute::ComputeFunction _e4m3, _e5m2, _e4m3_s, _e5m2_s;
   metal_compute::ComputeFunction _i8_s, _i8_rot;   // int8; and ConvRot
+  metal_compute::ComputeFunction _w4a8;           // W4A8
 };
 
 // The scale of the FP8 weight `name` as the f32 buffer Codes::scale is:

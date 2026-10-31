@@ -3,6 +3,7 @@
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/shared/motion-cache.h"
 #include "generative-models/shared/sage-attention.h"
+#include "common/perf-flops.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -159,15 +161,37 @@ denoise(const DenoiseRequest& req, std::string* err)
       !req.sigma_grid.empty() ? &req.sigma_grid
       : (two_time && fm != nullptr && !fm->sigmas.empty()) ? &fm->sigmas
                                                            : nullptr;
+  // An adapter's SAMPLING CONTRACT: its grid, shifted in double, and its
+  // update. Below an explicit grid and a flow map (load() refuses a
+  // contract beside one). VPIPE_H3_RENOISE=0 keeps the grid and steps it
+  // by Euler, for the A/B the release says is not equivalent.
+  const MetalMiniMaxH3Transformer::SamplingContract* sc =
+      grid == nullptr ? req.dit->sampling_contract() : nullptr;
+  bool renoise = sc != nullptr && sc->renoise;
+  if (const char* e = std::getenv("VPIPE_H3_RENOISE")) {
+    renoise = renoise && std::atoi(e) != 0;
+  }
   if (refine) {
     if (two_time) {
       return fail("denoise: a refine names its own sigmas and cannot run a "
                   "flow-map adapter, whose (t, r) pairs follow its grid");
     }
+    if (sc != nullptr) {
+      return fail("denoise: a refine names its own sigmas and cannot run "
+                  "an adapter's sampling contract (" + sc->release + ")");
+    }
     if (!sv.set_sigmas_as_run(req.refine_sigmas)) {
       return fail(fmt("denoise: the refine's {} sigmas are not a strictly "
                       "decreasing grid from at most 1 to exactly 0",
                       req.refine_sigmas.size())());
+    }
+  } else if (sc != nullptr) {
+    if (!sv.set_sigmas_shifted(sc->sigmas) ||
+        !sa.set_sigmas_shifted(sc->sigmas)) {
+      return fail(fmt("denoise: the sampling contract's grid ({} points) "
+                      "is not a strictly decreasing 1 -> 0 grid under "
+                      "shifts {:.4g}/{:.4g}", sc->sigmas.size(),
+                      req.video_shift, req.audio_shift)());
     }
   } else if (grid != nullptr) {
     if (!sv.set_sigmas(*grid) || !sa.set_sigmas(*grid)) {
@@ -340,6 +364,74 @@ denoise(const DenoiseRequest& req, std::string* err)
 
   // A preview's clean estimate, filled only on a step that renders one.
   std::vector<float> preview_x0;
+  // The re-noising sampler's FRESH NOISE: a stream of its own off the
+  // request's seed (the initial noise a caller drew from the same seed
+  // is not repeated), drawn each step but the last -- the video's
+  // generated rows, then the audio's, as the reference draws them.
+  std::mt19937_64 rn_rng;
+  {
+    std::seed_seq ss{(std::uint32_t)req.seed,
+                     (std::uint32_t)(req.seed >> 32), 0x72656e6fu};
+    rn_rng.seed(ss);
+  }
+  std::normal_distribution<float> rn_nd(0.0f, 1.0f);
+  std::vector<float> rn_v, rn_a;
+  auto draw = [&](std::vector<float>* out, std::size_t n) {
+    out->resize(n);
+    for (float& v : *out) { v = rn_nd(rn_rng); }
+  };
+  // A DEV PROBE of Sol-Attn's routing, step by step and TEACHER-FORCED:
+  // VPIPE_H3_SOL_PROBE="diag:1,1.5,2;exact:1.5,1.75,2" runs every step
+  // dense (the trajectory the run keeps), then the same step's input
+  // again under each (threshold, tau) arm, and logs each arm's
+  // generated-video velocity against the dense one, the share of key
+  // blocks it kept and its forward's wall time. The DiT has to have been
+  // loaded with sol_attn on (its dense_layers and key block are the
+  // config's). Not a mode: a measurement.
+  struct SolArm { bool exact; float tau; };
+  std::vector<SolArm> sol_probe;
+  if (const char* e = std::getenv("VPIPE_H3_SOL_PROBE")) {
+    const std::string spec(e);
+    std::size_t p0 = 0;
+    while (p0 < spec.size()) {
+      std::size_t p1 = spec.find(';', p0);
+      if (p1 == std::string::npos) { p1 = spec.size(); }
+      const std::string part = spec.substr(p0, p1 - p0);
+      const std::size_t colon = part.find(':');
+      if (colon != std::string::npos) {
+        const bool ex = part.compare(0, colon, "exact") == 0;
+        std::size_t q0 = colon + 1;
+        while (q0 < part.size()) {
+          std::size_t q1 = part.find(',', q0);
+          if (q1 == std::string::npos) { q1 = part.size(); }
+          sol_probe.push_back(
+              {ex, std::strtof(part.substr(q0, q1 - q0).c_str(), nullptr)});
+          q0 = q1 + 1;
+        }
+      }
+      p0 = p1 + 1;
+    }
+    if (sess != nullptr) {
+      sess->info(fmt("h3-denoise: Sol probe -- every step dense, then {} "
+                     "routed arm(s) on the same input", sol_probe.size()));
+    }
+  }
+  if (!req.sol_tau_steps.empty() && sess != nullptr &&
+      req.dit->config().sol.enabled) {
+    std::string taus;
+    for (std::size_t k = 0; k < req.sol_tau_steps.size(); ++k) {
+      taus += fmt("{}{:.2f}", k > 0 ? ", " : "",
+                  (double)req.sol_tau_steps[k])();
+    }
+    sess->info(fmt("h3-denoise: Sol-Attn tau by step {} (the last for any "
+                   "step past it), threshold '{}'", taus,
+                   sol::threshold_name(req.dit->config().sol.thresh)));
+  }
+  if (renoise && sess != nullptr) {
+    sess->info(fmt("h3-denoise: {} steps RE-NOISED on the sampling "
+                   "contract's grid ({}): x0 at each sigma, then fresh "
+                   "noise to the next", steps, sc->release));
+  }
   for (int i = 0; i < steps; ++i) {
     // Every row's timestep, this step. The conditioning rows keep their
     // own value while the generated video and audio rows walk their two
@@ -391,6 +483,13 @@ denoise(const DenoiseRequest& req, std::string* err)
         mcache.armed() && mcache.decide(sigma_v, vx, naud > 0 ? ax : nullptr);
     bool have_aud = false;
     const auto t_fwd0 = std::chrono::steady_clock::now();
+    // The GPU's credited work over the forward, for the profile's rate
+    // (credited at retire, and the forward has retired by the time its
+    // velocity is read).
+    const std::uint64_t gpu_f0 =
+        prof && perf_flops::available()
+            ? perf_flops::totals(perf_flops::kGpu).flops
+            : 0;
     if (reuse) {
       mcache.predict(vx, vel_v.data(), cached_audio ? ax : nullptr,
                      cached_audio ? vel_a.data() : nullptr);
@@ -423,7 +522,14 @@ denoise(const DenoiseRequest& req, std::string* err)
       st.row_timestep_index = &row_idx;
       st.endpoints          = two_time ? &uniq_r : nullptr;
       st.schedule_index     = baked ? i : -1;
-      st.dense_attention    = i < req.sol_dense_steps;
+      st.dense_attention    = i < req.sol_dense_steps || !sol_probe.empty();
+      if (!req.sol_tau_steps.empty()) {
+        st.sol_routing = true;
+        st.sol_tau = req.sol_tau_steps[std::min<std::size_t>(
+            (std::size_t)i, req.sol_tau_steps.size() - 1)];
+        st.sol_exact =
+            req.dit->config().sol.thresh == sol::Threshold::kExact;
+      }
       st.sage_pv8_off       = i < pv8_from;
       st.video_grid_h       = req.video_grid_h;
       st.video_grid_w       = req.video_grid_w;
@@ -453,6 +559,49 @@ denoise(const DenoiseRequest& req, std::string* err)
         }
         have_aud = true;
       }
+      // The probe's arms, on the input the dense forward just read (the
+      // buffers are uploaded once a step and not written by a forward).
+      if (!sol_probe.empty() && sess != nullptr) {
+        sess->info(fmt("[sol-probe] step {} sigma {:.4f} dense: {:.0f} ms",
+                       i, (double)sigma_v,
+                       std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t_fwd0)
+                           .count()));
+      }
+      for (const SolArm& arm : sol_probe) {
+        MetalMiniMaxH3Transformer::Step sp = st;
+        sp.dense_attention = false;
+        sp.sol_routing = true;
+        sp.sol_tau = arm.tau;
+        sp.sol_exact = arm.exact;
+        const auto t0 = std::chrono::steady_clock::now();
+        MetalMiniMaxH3Transformer::Velocity pv = req.dit->forward(sp, &ferr);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        if (pv.empty()) {
+          return fail("denoise: Sol probe at step " + std::to_string(i) +
+                      ": " + ferr);
+        }
+        const auto* g = static_cast<const std::uint16_t*>(
+                            pv.video.contents()) +
+                        (std::size_t)ncond * PE;
+        double dd = 0.0, nn = 0.0;
+        for (std::size_t k = 0; k < vel_v.size(); ++k) {
+          const double a = (double)bf16_to_f32_(g[k]) - (double)vel_v[k];
+          dd += a * a;
+          nn += (double)vel_v[k] * (double)vel_v[k];
+        }
+        if (sess != nullptr) {
+          sess->info(fmt("[sol-probe] step {} sigma {:.4f} {} tau {:.2f}: "
+                         "video velocity {:.4f} from dense, kept {:.1f}% of "
+                         "key blocks, {:.0f} ms",
+                         i, (double)sigma_v, arm.exact ? "exact" : "diag",
+                         (double)arm.tau,
+                         nn > 0.0 ? std::sqrt(dd / nn) : 0.0,
+                         100.0 * req.dit->sol_kept_fraction(), ms));
+        }
+      }
       // With the state the forward ran ON -- the scheduler has not
       // stepped it yet.
       if (mcache.armed()) {
@@ -462,6 +611,10 @@ denoise(const DenoiseRequest& req, std::string* err)
       }
     }
     const auto t_fwd1 = std::chrono::steady_clock::now();
+    const std::uint64_t gpu_f1 =
+        prof && perf_flops::available()
+            ? perf_flops::totals(perf_flops::kGpu).flops
+            : 0;
 
     // Step ONLY the generated tail. The conditioning rows lead the video
     // block precisely so this is a contiguous slice -- writing them
@@ -501,8 +654,13 @@ denoise(const DenoiseRequest& req, std::string* err)
           preview_x0.clear();
         }
       }
+      const bool vlast = sv.sigmas()[(std::size_t)i + 1] == 0.0f;
+      if (renoise && !vlast) { draw(&rn_v, vel.size()); }
       const bool vok =
           refine ? sv.step_plain(vel.data(), i, vx, vel.size())
+          : renoise ? sv.step_renoise(vel.data(), i, vx,
+                                      vlast ? nullptr : rn_v.data(),
+                                      vel.size())
           : res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
                    : sv.step(vel.data(), i, vx, vel.size());
       if (!vok) {
@@ -539,9 +697,14 @@ denoise(const DenoiseRequest& req, std::string* err)
             std::sqrt(sxx) * std::sqrt((double)vel.size()) * arms;
         axcorr = den > 0.0 ? sxy / den : 0.0;
       }
+      const bool alast = sa.sigmas()[(std::size_t)i + 1] == 0.0f;
+      if (renoise && !alast) { draw(&rn_a, vel.size()); }
       const bool aok =
-          res_ms ? sa.step_res(vel.data(), i, ax, vel.size(), &aprev)
-                 : sa.step(vel.data(), i, ax, vel.size());
+          renoise ? sa.step_renoise(vel.data(), i, ax,
+                                    alast ? nullptr : rn_a.data(),
+                                    vel.size())
+          : res_ms ? sa.step_res(vel.data(), i, ax, vel.size(), &aprev)
+                   : sa.step(vel.data(), i, ax, vel.size());
       if (!aok) {
         return fail("denoise: audio step " + std::to_string(i) + " failed");
       }
@@ -575,13 +738,16 @@ denoise(const DenoiseRequest& req, std::string* err)
                     mcache.last_score(), mcache.accumulated())();
         }
       }
+      const double tf = (double)(gpu_f1 - gpu_f0) * 1e-12;
       sess->info(fmt(
           "h3-denoise step {:2}/{}  sigma {:.4f} -> {:.4f}  fwd {:7.1f} ms  "
-          "total {:7.1f} ms  |v_vid| {:.5f}  |x_vid| {:.5f} "
+          "total {:7.1f} ms  GPU {:.2f} TFLOP ({:.1f} TFLOP/s)  "
+          "|v_vid| {:.5f}  |x_vid| {:.5f} "
           "corr_vid {:+.5f}  |  |v_aud| {:.5f}  |x_aud| {:.5f} "
           "corr_aud {:+.5f}{}",
           i + 1, steps, sv.sigmas()[(std::size_t)i],
-          sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, vrms, xrms,
+          sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, tf,
+          fwd_ms > 0.0 ? tf / (fwd_ms * 1e-3) : 0.0, vrms, xrms,
           vxcorr, arms, xarms, axcorr, mc));
     }
 
@@ -596,6 +762,7 @@ denoise(const DenoiseRequest& req, std::string* err)
     req.report->forwards = forwards;
     req.report->reused   = reused_steps;
     req.report->motion_cache = mcache.armed();
+    req.report->renoise  = renoise;
   }
   // The one line that says whether the setting did anything. The ratio
   // is of FORWARDS, the dominant cost of a step, not of wall time.

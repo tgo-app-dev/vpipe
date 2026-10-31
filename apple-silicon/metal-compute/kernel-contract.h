@@ -208,6 +208,11 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"affine_dequant", "affine_to_i8pt_w8"},
   {"affine_dequant", "i8pt_dequant"},
   {"affine_dequant", "quant_i8_tok_r"},
+  // The token tier's ConvRot activation quantizer, for ComfyUI's int8
+  // ConvRot weights run as stored (I8GemmContext::quantize_token_convrot).
+  // Optional: on an older host convrot_available() is false and such a
+  // weight is widened per GEMM as before.
+  {"affine_dequant", "quant_i8_tok_cr", false},
   {"affine_dequant", "swiglu_quant_i8_tok_r"},
   {"affine_dequant", "affine_to_i8pt_w8_r"},
   {"affine_dequant", "i8pt_dequant_r"},
@@ -243,6 +248,14 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"sol_attn_mma", "sol_approx_mma"},
   {"sol_attn_mma", "sol_merge_mma"},
   {"sol_attn_mma", "sol_merge_ml_mma"},
+  // ...and its "exact" threshold: the key centroids' covariance, the
+  // thresholds, and the two routes that read them. Optional: a toolkit
+  // on a host older than these finds them invalid and refuses "exact" by
+  // name (MetalSolAttention::exact_available() false), "diag" unchanged.
+  {"sol_attn_mma", "sol_kc_cov_mma"},
+  {"sol_attn_mma", "sol_thr_exact_mma"},
+  {"sol_attn_mma", "sol_route_t_mma"},
+  {"sol_attn_mma", "sol_route_pt_mma"},
   {"sol_proxy_mma", "sol_proxy_mma"},
   // FP8 expansion (shared/fp8-expand.h): the bf16 library only.
   {"affine_dequant_bf16", "fp8_e4m3_dequant", false},
@@ -254,6 +267,10 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   // int8 checkpoint is refused by name (Expander::int8_valid() false).
   {"affine_dequant_bf16", "i8_dequant_scaled", false},
   {"affine_dequant_bf16", "i8_convrot_dequant", false},
+  // ...and its W4A8 (four-bit codes over the same int8 grid). Optional
+  // alike: an older host refuses a W4A8 checkpoint by name
+  // (Expander::w4a8_valid() false).
+  {"affine_dequant_bf16", "w4a8_convrot_dequant", false},
   // The accurate tier's quantizers rotated (I8GemmContext::
   // set_g64_rotation). Optional: a toolkit on a host older than these
   // finds them invalid and keeps the plain pair (g64_rotated() false).

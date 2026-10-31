@@ -1963,22 +1963,25 @@ const STRINGS = {
       '可选的原始参考图像（平面 RGB TensorBeat [3,H,W]，即 load-image 的'
       + '格式；U8，或 0..1 的 F16 / F32——为视觉塔舍入到 8 位，VAE 仍保留其'
       + '精度）。能看图的模型族（Qwen-Image-Edit）会把它送进 Qwen2.5-VL 视'
-      + '觉塔；其余模型族会忽略它。',
+      + '觉塔；其余模型族会忽略它。在 MiniMax-H3 上它是首个关键帧，以 '
+      + '"<Picture 1>: " 的形式放在提示词之前给 Qwen3-VL 看。',
       '可選的原始參考影像（平面 RGB TensorBeat [3,H,W]，即 load-image 的'
       + '格式；U8，或 0..1 的 F16 / F32——為視覺塔捨入到 8 位元，VAE 仍保留'
       + '其精度）。能看圖的模型族（Qwen-Image-Edit）會把它送進 Qwen2.5-VL 視'
-      + '覺塔；其餘模型族會忽略它。'],
+      + '覺塔；其餘模型族會忽略它。在 MiniMax-H3 上它是首個關鍵影格，以 '
+      + '"<Picture 1>: " 的形式放在提示詞之前給 Qwen3-VL 看。'],
   'port.diffusion-conditioner.ref_image2': ['',
       '可选的第二张参考图像（格式相同）。在支持多参考的模型族（'
       + 'Qwen-Image-Edit-2511）上，或模板按参考逐段展开的模型族上，视觉'
       + '语言模型必须看到两张图（DiT 的 ref_latent1 只携带第二张的空间细节'
       + '）。每个参考各有自己的视觉块、mROPE 频带和 deepstack 运行。Krea-2 '
-      + '的设计只支持单参考，会忽略它。',
+      + '的设计只支持单参考，会忽略它。在 MiniMax-H3 上它是最后一个关键帧。',
       '可選的第二張參考影像（格式相同）。在支援多參考的模型族（'
       + 'Qwen-Image-Edit-2511）上，或範本按參考逐段展開的模型族上，視覺'
       + '語言模型必須看到兩張圖（DiT 的 ref_latent1 只攜帶第二張的空間細節'
       + '）。每個參考各有自己的視覺區塊、mROPE 頻帶和 deepstack 執行。'
-      + 'Krea-2 的設計只支援單參考，會忽略它。'],
+      + 'Krea-2 的設計只支援單參考，會忽略它。在 MiniMax-H3 上它是最後一個'
+      + '關鍵影格。'],
   'port.diffusion-conditioner.model_config': ['',
       '可选的模型专属参数，来自常驻模型族自己的配置源（krea2-model-config、'
       + 'boogu-image-model-config、qwen-image-edit-model-config，或树外模型'
@@ -2658,6 +2661,11 @@ const STRINGS = {
   'cfg.generate-audio.sol_local_radius': ['',
       '查询所在块两侧始终精确计算的键块数',
       '查詢所在塊兩側始終精確計算的鍵塊數'],
+  'cfg.generate-audio.sol_threshold': ['',
+      '路由阈值的离散度估计：diag（默认）或 exact（key 质心的完整协方差）；'
+      + '同一个 tau 在两者下保留的比例不同',
+      '路由閾值的離散度估計：diag（預設）或 exact（key 質心的完整共變異數）；'
+      + '同一個 tau 在兩者下保留的比例不同'],
   'port.generate-audio.prompt': ['',
       '可选 FlexData：字符串（即歌词），或包含 style / tag'
       + 's / caption、lyrics、abc、cot、seed、cfg_'
@@ -2987,6 +2995,17 @@ const STRINGS = {
       + '也就是說 32 做了更多的精確計算、更慢，同時也是兩者中更準確的那個，'
       + '因為一個質心概括 32 個 key 比概括 64 個更貼切。64 是速度的選擇，32 '
       + '是保真度的選擇。更大的塊測過，兩項都更差，所以不提供'],
+  'cfg.generate-image.sol_threshold': ['',
+      'Sol-Attn 的路由如何估计一个 query 块代理分数的离散度（sol_tau 以它为'
+      + '单位）：diag（默认）取 key 质心的逐通道方差，exact 取它们的完整协方差'
+      + '——即已发布的 Sol-Attn 的两种形式。同一个 tau 在两者下保留的 key 块比'
+      + '例不同，所以为其中一种选定的 tau 不能直接沿用到另一种。'
+      + 'Open-H3-Regenerate-2K 自己的引擎在精修阶段使用 exact',
+      'Sol-Attn 的路由如何估計一個 query 塊代理分數的離散度（sol_tau 以它為'
+      + '單位）：diag（預設）取 key 質心的逐通道變異數，exact 取它們的完整共變'
+      + '異數——即已發佈的 Sol-Attn 的兩種形式。同一個 tau 在兩者下保留的 key '
+      + '塊比例不同，所以為其中一種選定的 tau 不能直接沿用到另一種。'
+      + 'Open-H3-Regenerate-2K 自己的引擎在精修階段使用 exact'],
   'cfg.generate-image.sol_local_radius': ['',
       '在 query 自身所在块的两侧，各有多少个 key 块始终精确、从不被路由。块'
       + '质心最不具代表性的地方，恰恰就是 query 区分度最高的地方，所以对角线'
@@ -3185,10 +3204,12 @@ const STRINGS = {
   'cfg.generate-video.steps': ['',
       '去噪步数，每步是模型的一次前向（开启无分类器引导 CFG 时是两次）——'
       + '与 diffusers 的 num_inference_steps 和 ComfyUI 的 steps 计数方式相'
-      + '同。自带网格的模型族（flow-map 适配器）按它自己的网格运行',
+      + '同。自带网格的模型族按它自己的网格运行：flow-map 适配器，或在 '
+      + 'manifest 中声明采样约定的适配器（Pika H3 Flex 的六步）',
       '去噪步數，每步是模型的一次前向（開啟無分類器引導 CFG 時是兩次）——'
       + '與 diffusers 的 num_inference_steps 和 ComfyUI 的 steps 計數方式相'
-      + '同。自帶網格的模型族（flow-map 適配器）按它自己的網格執行'],
+      + '同。自帶網格的模型族按它自己的網格執行：flow-map 適配器，或在 '
+      + 'manifest 中宣告取樣約定的適配器（Pika H3 Flex 的六步）'],
   'cfg.generate-video.seed': ['',
       '初始噪声的随机种子（默认 0）。一次运行的第一段视频用它；之后各段用什么，'
       + '由 `seed_sequence` 决定',
@@ -3423,6 +3444,21 @@ const STRINGS = {
       + '時間軸上的對應項。最前面的幾步決定片段的大致結構，路由近似在這裡代價'
       + '最大。0（預設）表示每一步都路由。HyperFlow 為它的 8 步網格發布的 Sol '
       + '配方是這裡取 2，配合 sol_dense_layers 2 與 sol_tau 1.0。僅 minimax-h3'],
+  'cfg.generate-video.sol_tau_steps': ['',
+      '按去噪步给出的 Sol-Attn tau，用逗号分隔（"1.0,1.5,2.0"）：第 i 项用于'
+      + '第 i 步，列表之后的每一步沿用最后一项；为空（默认）时用 sol_tau。它之于'
+      + ' sol_tau，正如 sol_dense_steps 之于 sol_dense_layers：同一个 tau 下一步的'
+      + '误差随噪声减小而下降，所以靠后的步可以保留更少的分块。在 Open-H3-'
+      + 'Regenerate-2K 的 3 步精修上实测（2K x 39 帧，与同一输入下稠密前向的速度场'
+      + '对比）：diag tau 1.0 在三步上的误差为 0.176 / 0.107 / 0.074。被 '
+      + 'sol_dense_steps 设为稠密的步仍保持稠密。仅 minimax-h3',
+      '按去噪步給出的 Sol-Attn tau，用逗號分隔（"1.0,1.5,2.0"）：第 i 項用於'
+      + '第 i 步，列表之後的每一步沿用最後一項；為空（預設）時用 sol_tau。它之於'
+      + ' sol_tau，正如 sol_dense_steps 之於 sol_dense_layers：同一個 tau 下一步的'
+      + '誤差隨雜訊減小而下降，所以靠後的步可以保留更少的分塊。在 Open-H3-'
+      + 'Regenerate-2K 的 3 步精修上實測（2K x 39 幀，與同一輸入下稠密前向的速度場'
+      + '對比）：diag tau 1.0 在三步上的誤差為 0.176 / 0.107 / 0.074。被 '
+      + 'sol_dense_steps 設為稠密的步仍保持稠密。僅 minimax-h3'],
   'cfg.generate-video.sol_key_block': ['',
       '由一个质心概括多少个 key，也就是路由所依据的单位。只能是 32 或 64；'
       + '0（默认）取 64，也就是已发布的取值。两者是相互权衡而不是一方压倒另一'
@@ -3442,6 +3478,17 @@ const STRINGS = {
       + '另一個的 0.0082-0.0091），因為一個質心概括 32 個 key 比概括 64 個更貼'
       + '切。64 是速度的選擇，32 是保真度的選擇。更大的塊測過，兩項都更差'
       + '（128 -> 3.33 倍，256 -> 2.47 倍，且都保留得更多），所以不提供'],
+  'cfg.generate-video.sol_threshold': ['',
+      'Sol-Attn 的路由如何估计一个 query 块代理分数的离散度（sol_tau 以它为'
+      + '单位）：diag（默认）取 key 质心的逐通道方差，exact 取它们的完整协方差'
+      + '——即已发布的 Sol-Attn 的两种形式。同一个 tau 在两者下保留的 key 块比'
+      + '例不同，所以为其中一种选定的 tau 不能直接沿用到另一种。'
+      + 'Open-H3-Regenerate-2K 自己的引擎在精修阶段使用 exact',
+      'Sol-Attn 的路由如何估計一個 query 塊代理分數的離散度（sol_tau 以它為'
+      + '單位）：diag（預設）取 key 質心的逐通道變異數，exact 取它們的完整共變'
+      + '異數——即已發佈的 Sol-Attn 的兩種形式。同一個 tau 在兩者下保留的 key '
+      + '塊比例不同，所以為其中一種選定的 tau 不能直接沿用到另一種。'
+      + 'Open-H3-Regenerate-2K 自己的引擎在精修階段使用 exact'],
   'cfg.generate-video.sol_local_radius': ['',
       '在 query 自身所在块的两侧，各有多少个 key 块始终精确、从不被路由。块'
       + '质心最不具代表性的地方，恰恰就是 query 区分度最高的地方，所以对角线'

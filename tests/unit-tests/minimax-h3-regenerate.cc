@@ -21,6 +21,7 @@
 
 #include "minitest.h"
 #include "residency-reserve.h"
+#include "minimax-h3-block-run.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
@@ -76,33 +77,6 @@ namespace h3 = vpipe::genai::minimax_h3;
 
 namespace {
 
-std::uint16_t
-to_bf16_(float f)
-{
-  std::uint32_t u;
-  std::memcpy(&u, &f, 4);
-  return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-}
-
-float
-from_bf16_(std::uint16_t b)
-{
-  const std::uint32_t u = (std::uint32_t)b << 16;
-  float f;
-  std::memcpy(&f, &u, 4);
-  return f;
-}
-
-metal_compute::SharedBuffer
-bf16_buf_(MetalCompute* mc, const std::vector<float>& v)
-{
-  metal_compute::SharedBuffer b = mc->make_shared_buffer(v.size() * 2);
-  if (b.empty()) { return b; }
-  auto* d = static_cast<std::uint16_t*>(b.contents());
-  for (std::size_t i = 0; i < v.size(); ++i) { d[i] = to_bf16_(v[i]); }
-  return b;
-}
-
 std::vector<float>
 read_f32_(const std::string& path)
 {
@@ -122,26 +96,6 @@ read_json_(const std::string& path)
   std::stringstream ss;
   ss << f.rdbuf();
   return FlexData::from_json(ss.str());
-}
-
-double
-rel_l2_(const std::vector<float>& a, const std::vector<float>& b)
-{
-  if (a.size() != b.size() || a.empty()) { return 1e9; }
-  double num = 0.0, den = 0.0;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const double d = (double)a[i] - (double)b[i];
-    num += d * d;
-    den += (double)b[i] * (double)b[i];
-  }
-  return std::sqrt(num / std::max(den, 1e-30));
-}
-
-std::string
-env_(const char* k)
-{
-  const char* v = std::getenv(k);
-  return v != nullptr ? std::string(v) : std::string();
 }
 
 }  // namespace
@@ -456,127 +410,90 @@ TEST(minimax_h3_regenerate, curve_kernel_adds_its_delta)
   EXPECT_TRUE(off == 0);
 }
 
-namespace {
-
-// Two real blocks of the DiT through one forward, with the adapter specs
-// given; the video velocity back as f32.
-struct BlockRun {
-  std::string root;
-  MetalMiniMaxH3Transformer::Config cfg;
-  h3::PackedLayout L;
-  std::vector<float> uniq;
-  std::vector<int> row_idx;
-  metal_compute::SharedBuffer vb, ab, tb;
-  int n_video = 0;
-
-  bool
-  setup(MetalCompute* mc, const std::string& r, int layers, int T = 2,
-        int h = 12, int w = 20, int audio = 8)
-  {
-    root = r;
-    std::string cerr;
-    if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
-      std::printf("  config: %s\n", cerr.c_str());
-      return false;
-    }
-    cfg.n_layers = layers;
-    const std::vector<int> tags(8, h3::kTextTag);
-    if (!h3::build_packed_sequence(tags, T, h, w, audio, cfg.patch_h,
-                                   cfg.patch_w, h3::kAudioChannels, {}, &L)) {
-      return false;
-    }
-    // The refine's plan: the video at 1 - 0.909375, the audio clean.
-    h3::build_row_timesteps(L, 0.090625f, 1.0f, 1.0f, &uniq, &row_idx);
-    n_video = (int)L.video_indices.size();
-    auto ramp = [](std::size_t n, float k) {
-      std::vector<float> v(n);
-      for (std::size_t i = 0; i < n; ++i) {
-        v[i] = std::sin((float)i * k) * 0.5f;
+// ComfyUI's PRUNED AdaLN (h3_adaln_pruned_f16): mod = b + sum_k w c, in
+// f32 off the projection AS STORED -- F32, F16 or BF16, widened exactly
+// -- and rounded once into bf16. Bit for bit against the same sum on the
+// host, fma by fma in the kernel's order.
+TEST(minimax_h3_regenerate, pruned_adaln_kernel_is_its_linear)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  if (mc == nullptr) { return; }
+  auto lib = mc->load_library("minimax_h3_regenerate_bf16");
+  auto fn = lib.function("h3_adaln_pruned_f16");
+  ASSERT_TRUE(fn.valid());
+  if (!fn.valid()) { return; }
+  const int D = 1000, n_t = 3;
+  std::mt19937 rng(11);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> cc((std::size_t)n_t * 8);
+  for (auto& v : cc) { v = nd(rng); }
+  auto cb = mc->make_shared_buffer(cc.size() * 4);
+  std::memcpy(cb.contents(), cc.data(), cc.size() * 4);
+  for (int dt = 0; dt < 3; ++dt) {
+    // The stored projection, and the f32 each element widens to.
+    std::vector<float> wf((std::size_t)D * 8), bf((std::size_t)D);
+    const std::size_t es = dt == 0 ? 4 : 2;
+    auto wb = mc->make_shared_buffer(wf.size() * es);
+    auto bb = mc->make_shared_buffer(bf.size() * es);
+    auto store = [&](std::vector<float>& v, metal_compute::SharedBuffer& b,
+                     float s) {
+      for (std::size_t i = 0; i < v.size(); ++i) {
+        const float x = s * nd(rng);
+        if (dt == 0) {
+          static_cast<float*>(b.contents())[i] = v[i] = x;
+        } else if (dt == 1) {
+          const _Float16 h = (_Float16)x;
+          std::memcpy(static_cast<std::uint8_t*>(b.contents()) + 2 * i, &h,
+                      2);
+          v[i] = (float)h;
+        } else {
+          const std::uint16_t u = to_bf16_(x);
+          static_cast<std::uint16_t*>(b.contents())[i] = u;
+          v[i] = from_bf16_(u);
+        }
       }
-      return v;
     };
-    vb = bf16_buf_(mc, ramp((std::size_t)n_video * cfg.video_patch_elems(),
-                            0.017f));
-    ab = bf16_buf_(mc, ramp((std::size_t)L.num_audio_rows *
-                                cfg.audio_channels, 0.031f));
-    tb = bf16_buf_(mc, ramp(tags.size() * (std::size_t)cfg.text_dim, 0.005f));
-    return !vb.empty() && !ab.empty() && !tb.empty();
-  }
-
-  // `with`: the config to load with (the tiers), else `cfg`; `routes`:
-  // the engine's GEMM routes, else steel's 32-row tile pinned.
-  bool
-  run(MetalCompute* mc,
-      const std::vector<MetalMiniMaxH3Transformer::LoraSpec>& specs,
-      std::vector<float>* out, int* mods, float turn_to = -1.0f,
-      bool baked = false,
-      const MetalMiniMaxH3Transformer::Config* with = nullptr,
-      bool routes = false,
-      std::unique_ptr<MetalMiniMaxH3Transformer>* keep = nullptr)
-  {
-    auto m = MetalMiniMaxH3Transformer::load(
-        root, mc, with != nullptr ? *with : cfg, false, specs);
-    if (m == nullptr) { return false; }
-    if (!routes) {
-      m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
-    }
-    if (mods != nullptr) { *mods = m->lora_modules(); }
-    if (turn_to >= 0.0f) { m->set_lora_scale(0, turn_to); }
-    MetalMiniMaxH3Transformer::Step step;
-    step.video = &vb;  step.audio = &ab;  step.text = &tb;
-    step.layout = &L;  step.timesteps = &uniq;
-    step.row_timestep_index = &row_idx;
-    // The denoise's route: the modulation baked for the schedule, the
-    // curve added to the baked slice per forward.
-    if (baked) {
-      std::string berr;
-      if (!m->bake_adaln({uniq}, &berr)) {
-        std::printf("  bake: %s\n", berr.c_str());
-        return false;
+    store(wf, wb, 0.1f);
+    store(bf, bb, 0.5f);
+    auto mb = mc->make_shared_buffer((std::size_t)n_t * D * 2);
+    {
+      auto st = mc->make_command_stream();
+      {
+        auto enc = st.begin_compute();
+        enc.set_function(fn);
+        enc.set_buffer(0, mb);
+        enc.set_buffer(1, wb);
+        enc.set_buffer(2, bb);
+        enc.set_buffer(3, cb);
+        enc.set_constant(4, D);
+        enc.set_constant(5, n_t);
+        enc.set_constant(6, dt);
+        enc.dispatch({(unsigned)D, (unsigned)n_t, 1}, {256, 1, 1});
       }
-      step.schedule_index = 0;
+      ASSERT_TRUE(st.commit().wait_ok());
     }
-    std::string ferr;
-    const auto v = m->forward(step, &ferr);
-    if (v.empty()) {
-      std::printf("  forward: %s\n", ferr.c_str());
-      return false;
+    const auto* d = static_cast<const std::uint16_t*>(mb.contents());
+    int off = 0;
+    for (int t = 0; t < n_t; ++t) {
+      for (int j = 0; j < D; ++j) {
+        float acc = 0.0f;
+        for (int k = 0; k < 8; ++k) {
+          acc = std::fma(wf[(std::size_t)j * 8 + k],
+                         cc[(std::size_t)t * 8 + k], acc);
+        }
+        const std::uint16_t want = to_bf16_(acc + bf[(std::size_t)j]);
+        off += d[(std::size_t)t * D + j] != want ? 1 : 0;
+      }
     }
-    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
-    out->resize(n);
-    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
-    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
-    if (keep != nullptr) { *keep = std::move(m); }
-    return true;
+    std::printf("[minimax_h3_regenerate] pruned AdaLN kernel, weights %s: "
+                "%d of %d off\n", dt == 0 ? "F32" : dt == 1 ? "F16" : "BF16",
+                off, n_t * D);
+    EXPECT_TRUE(off == 0);
   }
+}
 
-  // One more forward on a model run() kept; its wall clock in `ms`.
-  bool
-  forward_on(MetalMiniMaxH3Transformer& m, std::vector<float>* out,
-             double* ms)
-  {
-    MetalMiniMaxH3Transformer::Step step;
-    step.video = &vb;  step.audio = &ab;  step.text = &tb;
-    step.layout = &L;  step.timesteps = &uniq;
-    step.row_timestep_index = &row_idx;
-    std::string ferr;
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto v = m.forward(step, &ferr);
-    *ms = std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - t0).count();
-    if (v.empty()) {
-      std::printf("  forward: %s\n", ferr.c_str());
-      return false;
-    }
-    const std::size_t n = (std::size_t)n_video * cfg.video_patch_elems();
-    out->resize(n);
-    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
-    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = from_bf16_(p[i]); }
-    return true;
-  }
-};
-
-}  // namespace
 
 // Curve branches through two real blocks: the release's file (every B
 // zero) binds nothing and is the base forward to the bit; a TRAINED
@@ -773,6 +690,7 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
     std::vector<float> v;
     int band = -1;
     std::size_t resident = 0, booked = 0;
+    std::size_t sol_held = 0, sol_booked = 0;
   };
   auto arm = [&](const char* band, bool routes, Arm* a,
                  const MetalMiniMaxH3Transformer::Config* with = nullptr) {
@@ -780,6 +698,11 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
     std::unique_ptr<MetalMiniMaxH3Transformer> keep;
     const bool ok = br.run(mc, {Spec{lp, 1.0f}}, &a->v, nullptr, -1.0f,
                            false, with, routes, &keep);
+    // Sol's booking at THIS arm's band (read before the band is unset).
+    if (ok && keep) {
+      a->sol_held = keep->sol_held_bytes();
+      a->sol_booked = keep->sol_scratch_bytes(br.L.seq_len);
+    }
     ::unsetenv("VPIPE_H3_BAND_ROWS");
     if (!ok || !keep) { return false; }
     a->band = keep->last_band_rows();
@@ -822,11 +745,14 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
   // bit: Sol (a second Sol for the 24-row last band), Sage (K quantized
   // once a layer, each band's Q), Sage's int8 P*V (band 0's prompt and
   // soundtrack rows on the int8 QK alone, as the whole sequence's), Sol
-  // with Sage on its exact half. Each must also MOVE the dense forward,
+  // with Sage on its exact half; Sol on the "exact" threshold (its
+  // covariance and thresholds are a band's own keys' -- every key, so a
+  // band's routes as the whole's). Each must also MOVE the dense forward,
   // or the arm compared two dense runs. Sage needs matrix cores.
-  struct Tier { const char* name; bool sol, sage, pv8; };
+  struct Tier { const char* name; bool sol, sage, pv8, exact = false; };
   const bool mx = mc->supports_matrix_cores();
   for (const Tier& t : {Tier{"sol", true, false, false},
+                        Tier{"sol exact", true, false, false, true},
                         Tier{"sage", false, true, false},
                         Tier{"sage + int8 P*V", false, true, true},
                         Tier{"sol + sage", true, true, false}}) {
@@ -837,6 +763,7 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
     MetalMiniMaxH3Transformer::Config tc = br.cfg;
     tc.sol.enabled = t.sol;
     tc.sol.dense_layers = 0;
+    tc.sol.thresh = t.exact ? sol::Threshold::kExact : sol::Threshold::kDiag;
     tc.sage.enabled = t.sage;
     tc.sage.dense_layers = 0;
     tc.sage.pv8 = t.pv8;
@@ -851,6 +778,15 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
     EXPECT_TRUE(tw.band == 0 && tb.band == banded.band);
     EXPECT_TRUE(tb.v == tw.v);
     EXPECT_TRUE(moved_t > 0.0);
+    // Sol's own memory -- the banded arm's prepared keys included --
+    // held as booked, whole and banded.
+    if (t.sol) {
+      std::printf("    Sol held %zu / booked %zu B whole, %zu / %zu B "
+                  "banded\n", tw.sol_held, tw.sol_booked, tb.sol_held,
+                  tb.sol_booked);
+      EXPECT_TRUE(tw.sol_held == tw.sol_booked);
+      EXPECT_TRUE(tb.sol_held == tb.sol_booked);
+    }
   }
 }
 
@@ -1762,4 +1698,69 @@ TEST(minimax_h3_regenerate, fast_vae_bench)
                 booked >> 20);
     EXPECT_TRUE(booked + (std::size_t(8) << 20) >= grew);
   }
+}
+
+// A FORWARD ROUTES WITH ITS OWN TAU AND THRESHOLD (Step::sol_routing):
+// what generate-video's `sol_tau_steps` and the denoise's Sol probe both
+// rest on. Two real blocks under the merged LoRA, Sol loaded at tau 1.0
+// on "diag" over every layer; one model, forwards one after another:
+// the config's own tau and form set per step is the config's forward to
+// the bit; a higher tau keeps fewer blocks and moves the output; "exact"
+// at the same tau is another routing; and the next forward with nothing
+// set is the config's again (nothing latched).
+TEST(minimax_h3_regenerate, a_step_routes_with_its_own_tau)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string rel = env_("VPIPE_OPEN_H3_TEST_MODEL_PATH");
+  if (h3root.empty() || rel.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / "
+                "VPIPE_OPEN_H3_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  BlockRun br;
+  ASSERT_TRUE(br.setup(mc, h3root, 2, 8, 32, 64));
+  if (br.vb.empty()) { return; }
+  using Spec = MetalMiniMaxH3Transformer::LoraSpec;
+  using Step = MetalMiniMaxH3Transformer::Step;
+  const std::string lp = rel + "/lora/open_h3_regenerate_2k_lora.safetensors";
+  MetalMiniMaxH3Transformer::Config tc = br.cfg;
+  tc.sol.enabled = true;
+  tc.sol.dense_layers = 0;
+  tc.sol.tau = 1.0f;
+  std::vector<float> base;
+  std::unique_ptr<MetalMiniMaxH3Transformer> m;
+  ASSERT_TRUE(br.run(mc, {Spec{lp, 1.0f}}, &base, nullptr, -1.0f, false,
+                     &tc, false, &m));
+  if (!m) { return; }
+  const double kept_cfg = m->sol_kept_fraction();
+  auto fwd = [&](float tau, bool exact, bool set, double* kept) {
+    std::vector<float> o;
+    double ms = 0.0;
+    const bool ok = br.forward_on(*m, &o, &ms, [&](Step& s) {
+      s.sol_routing = set;
+      s.sol_tau = tau;
+      s.sol_exact = exact;
+    });
+    if (kept != nullptr) { *kept = m->sol_kept_fraction(); }
+    return ok ? o : std::vector<float>{};
+  };
+  double k_same = 0.0, k_hi = 0.0, k_ex = 0.0, k_after = 0.0;
+  const auto same = fwd(1.0f, false, true, &k_same);
+  const auto hi = fwd(2.0f, false, true, &k_hi);
+  const auto ex = fwd(1.0f, true, true, &k_ex);
+  const auto after = fwd(0.0f, false, false, &k_after);
+  std::printf("  config tau 1.0 diag kept %.1f%%; the step's own: tau 1.0 "
+              "diag %s (kept %.1f%%), tau 2.0 diag %.3e from it (kept "
+              "%.1f%%), tau 1.0 exact %.3e (kept %.1f%%); then nothing "
+              "set %s\n", 100.0 * kept_cfg,
+              same == base ? "IDENTICAL" : "DIFFERENT", 100.0 * k_same,
+              rel_l2_(hi, base), 100.0 * k_hi, rel_l2_(ex, base),
+              100.0 * k_ex, after == base ? "IDENTICAL" : "DIFFERENT");
+  EXPECT_TRUE(!base.empty() && same == base && k_same == kept_cfg);
+  EXPECT_TRUE(!hi.empty() && hi != base && k_hi < k_same);
+  EXPECT_TRUE(!ex.empty() && ex != base && k_ex != k_same);
+  EXPECT_TRUE(after == base);
 }

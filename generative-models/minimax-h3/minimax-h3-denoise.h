@@ -47,6 +47,9 @@ struct DenoiseReport {
   int  forwards     = 0;
   int  reused       = 0;
   bool motion_cache = false;
+  // The steps re-noised (an adapter's sampling contract) rather than
+  // stepped by Euler.
+  bool renoise      = false;
 };
 
 struct DenoiseRequest {
@@ -98,7 +101,9 @@ struct DenoiseRequest {
   // Left empty, a live FLOW-MAP adapter on the DiT supplies its own --
   // the grid it was distilled on is a property of its weights, the way
   // upstream's loader configures the pipeline from the file -- and
-  // `num_steps` is ignored. An explicit grid here still wins.
+  // `num_steps` is ignored. So does an adapter's SAMPLING CONTRACT
+  // (its grid shifted in double, and its update: re-noising, see
+  // `seed`). An explicit grid here still wins, stepped by Euler.
   std::vector<float> sigma_grid;
   // A REFINE -- Open-H3-Regenerate-2K's: the video's sigmas AS RUN (no
   // shift, overriding `num_steps` and `sigma_grid`), stepped by the
@@ -109,9 +114,20 @@ struct DenoiseRequest {
   // itself, (1 - sigma[0]) x + sigma[0] noise. A flow-map adapter is
   // refused: its (t, r) pairs follow a schedule this replaces.
   std::vector<double> refine_sigmas;
+  // The seed of the FRESH NOISE a re-noising sampler draws each step
+  // (MetalMiniMaxH3Transformer::SamplingContract): the video's
+  // generated rows, then the audio's, every step but the last. Its own
+  // stream, so the initial noise a caller drew from the same seed is not
+  // repeated. Unused by the Euler samplers.
+  std::uint64_t seed = 0;
   // Leading steps whose attention runs DENSE with Sol-Attn on (see
   // Step::dense_attention). 0 routes every step.
   int sol_dense_steps = 0;
+  // Sol-Attn's tau STEP BY STEP (Step::sol_routing): entry i for step i,
+  // the last for every step past the list; the threshold form stays the
+  // DiT's. Empty: the DiT's own tau every step. A step sol_dense_steps
+  // leaves dense stays dense.
+  std::vector<float> sol_tau_steps;
   // The acceleration bag (shared/accel-settings.h), for the tiers the
   // SAMPLING LOOP implements rather than the transformer -- MotionCache
   // (shared/motion-cache.h), which decides per step whether to run the

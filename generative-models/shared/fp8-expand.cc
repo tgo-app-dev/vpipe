@@ -25,6 +25,7 @@ Expander::load(MetalCompute* mc)
   _e5m2_s = _lib.function("fp8_e5m2_dequant_scaled");
   _i8_s   = _lib.function("i8_dequant_scaled");
   _i8_rot = _lib.function("i8_convrot_dequant");
+  _w4a8   = _lib.function("w4a8_convrot_dequant");
   return valid();
 }
 
@@ -50,10 +51,41 @@ Expander::encode(ComputeEncoder& enc, const Codes& w, const SharedBuffer& dst,
   // One launch expands the whole [N, K], four codes a thread, so the
   // count has to fit the kernels' 32-bit index: 4 G elements, far past
   // any single weight these models carry.
-  if (n == 0 || n > 0xFFFFFFFFull || w.codes->byte_size() < n ||
-      dst.byte_size() < n * 2) {
+  if (n == 0 || n > 0xFFFFFFFFull || dst.byte_size() < n * 2) {
     return false;
   }
+  if (w.format == Format::kW4A8) {
+    // Nibbles, two a byte; the int8 pass after the decode (a 1024-element
+    // threadgroup, whole rotation groups -- 1 when unrotated).
+    const int g = w.rot_group > 0 ? w.rot_group : 1;
+    if (!w4a8_valid() || !w.scaled() || w.s_rel == nullptr ||
+        w.qgroup <= 0 || K % 2 != 0 || K % (std::size_t)w.qgroup != 0 ||
+        w.codes->byte_size() < n / 2 ||
+        w.s_rel->byte_size() < n / (std::size_t)w.qgroup ||
+        w.scale->byte_size() < N * sizeof(float) ||
+        (w.codebook != nullptr && !w.codebook->empty() &&
+         w.codebook->byte_size() < 16 * sizeof(float)) ||
+        (w.rot_group > 0 &&
+         (!convrot_group_ok(w.rot_group) || K % w.rot_group != 0))) {
+      return false;
+    }
+    const bool cb = w.codebook != nullptr && !w.codebook->empty();
+    enc.set_function(_w4a8);
+    enc.set_buffer(0, *w.codes);
+    enc.set_buffer(1, dst);
+    enc.set_constant(2, (std::uint32_t)n);
+    enc.set_buffer(3, *w.scale);
+    enc.set_constant(4, (std::uint32_t)K);
+    enc.set_constant(5, (std::uint32_t)g);
+    enc.set_buffer(6, *w.s_rel);
+    // The codebook slot is bound either way; without one it is not read.
+    enc.set_buffer(7, cb ? *w.codebook : *w.scale);
+    enc.set_constant(8, (std::uint32_t)w.qgroup);
+    enc.set_constant(9, (std::uint32_t)(cb ? 1 : 0));
+    enc.dispatch({(unsigned)((n + 1023) / 1024 * 256), 1, 1}, {256, 1, 1});
+    return true;
+  }
+  if (w.codes->byte_size() < n) { return false; }
   const bool e5 = w.format == Format::kE5M2;
   if (w.format == Format::kI8) {
     // int8 is always scaled (fp8-layout.h); ConvRot whole groups a
@@ -155,12 +187,61 @@ host_codes_(const MetalLlamaWeights& w, const std::string& name,
   return read_scale(w, *x, *rows, scale, err);
 }
 
+// A W4A8 tensor decoded on the host: `n` the LOGICAL element count.
+bool
+w4a8_host_(const MetalLlamaWeights& w, const std::string& name,
+           const Weight& x, std::uint16_t* dst, std::size_t n,
+           std::string* err)
+{
+  const auto* ti = w.info(name);
+  const auto* ri = w.info(x.s_rel);
+  if (ti == nullptr || ri == nullptr || ti->shape.size() != 2) {
+    if (err != nullptr) { *err = "'" + name + "' is not a W4A8 tensor"; }
+    return false;
+  }
+  const std::size_t rows = (std::size_t)ti->shape[0];
+  const std::size_t cols = (std::size_t)ti->shape[1] * 2;
+  if (rows * cols != n) {
+    if (err != nullptr) {
+      *err = fmt("'{}' holds {} values, not {}", name, rows * cols, n)();
+    }
+    return false;
+  }
+  std::vector<std::uint8_t> codes((std::size_t)ti->nbytes),
+      sr((std::size_t)ri->nbytes);
+  std::vector<float> cb, scale;
+  if (!w.read_into(name, codes.data(), codes.size()) ||
+      !w.read_into(x.s_rel, sr.data(), sr.size()) ||
+      !read_scale(w, x, rows, &scale, err)) {
+    if (err != nullptr && err->empty()) { *err = "cannot read " + name; }
+    return false;
+  }
+  if (!x.codebook.empty()) {
+    cb.resize(16);
+    if (!w.read_into(x.codebook, cb.data(), 16 * sizeof(float))) {
+      if (err != nullptr) { *err = "cannot read '" + x.codebook + "'"; }
+      return false;
+    }
+  }
+  decode_w4a8_bf16(codes.data(), sr.data(), cb.empty() ? nullptr : cb.data(),
+                   scale, rows, cols, x.qgroup, x.rot_group, dst);
+  return true;
+}
+
 }  // namespace
 
 bool
 decode_tensor_bf16(const MetalLlamaWeights& w, const std::string& name,
                    std::uint16_t* dst, std::size_t n, std::string* err)
 {
+  {
+    Weight x;
+    std::string e;
+    if (resolve(w, name, &x, &e, /*int8=*/true) &&
+        x.format == Format::kW4A8) {
+      return w4a8_host_(w, name, x, dst, n, err);
+    }
+  }
   Weight x;
   std::vector<std::uint8_t> codes;
   std::vector<float> scale;
@@ -177,6 +258,20 @@ bool
 decode_tensor_f32(const MetalLlamaWeights& w, const std::string& name,
                   float* dst, std::size_t n, std::string* err)
 {
+  {
+    Weight x;
+    std::string e;
+    if (resolve(w, name, &x, &e, /*int8=*/true) &&
+        x.format == Format::kW4A8) {
+      std::vector<std::uint16_t> b(n);
+      if (!w4a8_host_(w, name, x, b.data(), n, err)) { return false; }
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t u = (std::uint32_t)b[i] << 16;
+        std::memcpy(&dst[i], &u, sizeof(float));
+      }
+      return true;
+    }
+  }
   Weight x;
   std::vector<std::uint8_t> codes;
   std::vector<float> scale;

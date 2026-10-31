@@ -279,6 +279,14 @@ private:
   // rather than run to its last hidden state, which is why it is its own
   // class rather than another encoder_config_*() over _encoder.
   std::unique_ptr<genai::MiniMaxH3TextEncoder>   _h3_enc;
+  // Its config, kept for the vision tower (`_vision3`), which loads at
+  // the first KEYFRAME a ref_image port brings: an FL2VA request shows
+  // each keyframe to Qwen3-VL ("<Picture i>: " + a vision block) ahead
+  // of the prompt, as both references do.
+  genai::MiniMaxH3TextEncoder::Config _h3_enc_cfg;
+  // The last H3 encode's per-row modality tags (a vision block's rows
+  // are video); empty for a prompt alone. Published on the beat.
+  mutable std::vector<int> _h3_tags;
   std::unique_ptr<genai::Tokenizer>               _tokenizer;
   // VOSR's conditioner: a DINOv2 ViT-L/14 and nothing else. It is the
   // WHOLE conditioning -- there is no prompt, no tokenizer and no text
@@ -424,6 +432,17 @@ private:
   // for any other family. Take it before the next encode_, which writes
   // its own mask over this one.
   FlexData qi21_beat_sideband_(int rows) const;
+  // A picture is wired to ref_image / ref_image2 (a MiniMax-H3 keyframe,
+  // on that family), read off the graph before anything loads.
+  bool h3_keyframe_wired_() const;
+  // What a keyframe's vision encode is booked at: H3's widest canvas.
+  static constexpr std::int64_t kH3KeyframeBookPixels = 1920LL * 1088LL;
+  // MiniMax-H3's FL2VA presentation: every reference picture (the
+  // keyframes) through the vision tower, then "<Picture i>: " + its
+  // block per picture ahead of the prompt; tags into `_h3_tags`.
+  metal_compute::SharedBuffer
+  h3_keyframes_(const std::string& text, int* n_tokens,
+                std::string* err) const;
   // The prompts held back from a batch on a streamed encoder, encoded in
   // one layer-major pass and emitted in order.
   bool batchable_() const;

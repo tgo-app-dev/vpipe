@@ -2731,6 +2731,41 @@ builtin_catalog_()
                ".safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui"},
+    // Pika H3 Flex (Pika Labs / Mellis, Inc.): a six-step post-training
+    // of both DiTs, published as two rank-128 FP32 adapters in the
+    // diffusers decomposition (fused here for the DiT actually loaded),
+    // each with a `manifest.json` beside it stating its SAMPLING
+    // CONTRACT -- the knots 1000/750/500/250/100/40/0 shifted 12 / 3,
+    // and a re-noising update (x0, then fresh noise to the next sigma),
+    // which the release says a generic six-step Euler is not. The
+    // manifest is what the DiT reads that from
+    // (MetalMiniMaxH3Transformer::SamplingContract), so it is fetched
+    // with the adapter; a record per partition, each pinning its folder,
+    // and each refused on the other DiT. NOT fetched: the bundled
+    // MiniMax-H3 base (~210 GB; the MiniMaxAI entries above hold the
+    // same weights) and `comfy/loras/` (bf16 copies converted for the
+    // flat q|k|v layout; carry no contract). MiniMax H3 Community
+    // License.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Pika H3 Flex 6-step FL2VA (t2va / i2va / l2va / fl2va), "
+                "rank 128 (Pika Labs)",
+     .hf_path = "Pika-Labs/Pika-H3-Flex",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"fl2va/adapter.safetensors", "fl2va/manifest.json",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Pika-Labs/Pika-H3-Flex-fl2va"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Pika H3 Flex 6-step Ref2VA (omni-reference), rank 128 "
+                "(Pika Labs)",
+     .hf_path = "Pika-Labs/Pika-H3-Flex",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"ref2va/adapter.safetensors", "ref2va/manifest.json",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Pika-Labs/Pika-H3-Flex-ref2va"},
     // Video Rebirth's HyperFlow: an 8-step FLOW-MAP self-distillation,
     // and not a Turbo adapter in the sense of the entries above. Beside
     // the ordinary per-block factors it carries an ENDPOINT timestep

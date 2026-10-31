@@ -65,6 +65,12 @@ class MiniMaxH3Scheduler {
   // diffusers' own check on a grid handed to set_timesteps(sigmas=).
   bool set_sigmas(const std::vector<float>& raw);
 
+  // The same, for a grid named in DOUBLE and shifted in double before
+  // the float32 cast -- diffusers' `shift_provided_sigmas`, which is how
+  // a few-step adapter's sampling contract builds its schedule (Pika H3
+  // Flex: knots / 1000). Same checks as set_sigmas.
+  bool set_sigmas_shifted(const std::vector<double>& raw);
+
   // A schedule given AS RUN: `sigmas` installed verbatim, no shift --
   // Open-H3-Regenerate-2K's refine names its sigmas outright. Strictly
   // decreasing from at most 1 to exactly 0. Each timestep is 1 - sigma
@@ -135,6 +141,19 @@ class MiniMaxH3Scheduler {
   // False when `step_index` is out of range or the sizes disagree.
   bool step(const float* velocity, int step_index, float* x,
             std::size_t n) const;
+
+  // One RE-NOISING step, in place: the clean estimate off the GRID sigma,
+  // put at the next sigma with fresh noise --
+  //
+  //   x0     = x + sigma[i] * v
+  //   x_next = (1 - sigma[i+1]) * x0 + sigma[i+1] * noise
+  //
+  // every operation in float32, so the last step (sigma[i+1] = 0)
+  // returns x0 exactly. diffusers' MiniMaxH3Scheduler with
+  // `stochastic_sampling`, the update Pika H3 Flex's adapters were
+  // trained for. `noise` may be null on that last step only.
+  bool step_renoise(const float* velocity, int step_index, float* x,
+                    const float* noise, std::size_t n) const;
 
   // The x0 above on its own, into `out`: the model's CLEAN ESTIMATE at
   // this step, which is what a latent preview decodes. Both samplers take

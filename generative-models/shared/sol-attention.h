@@ -133,6 +133,14 @@ config_from_flex(const FlexData* bag)
   c.local_radius =
       (int)accel::integer(bag, accel::kSolLocalRadius, c.local_radius);
   c.key_block = (int)accel::integer(bag, accel::kSolKeyBlock, c.key_block);
+  {
+    Threshold t = c.thresh;
+    if (parse_threshold(accel::text(bag, accel::kSolThreshold,
+                                    threshold_name(c.thresh)),
+                        &t)) {
+      c.thresh = t;
+    }
+  }
   // The SINK is not in the bag and cannot be: it is where a family's own
   // sequence stops being the modality the routing is summarising, and
   // only the family knows that. H3 fills it from its packed layout; a

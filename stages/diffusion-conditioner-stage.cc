@@ -1,7 +1,9 @@
 #include "stages/diffusion-conditioner-stage.h"
 #include "generative-models/flux3/metal-flux3-transformer.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/gen-input.h"
+#include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "common/beat-keys.h"
 #include <chrono>
 
@@ -152,7 +154,10 @@ const PortSpec kIports[] = {
                                "rounded to 8 bits for the tower (the VAE "
                                "keeps them deep). Image-aware families "
                                "(Qwen-Image-Edit) run it through the "
-                               "Qwen2.5-VL vision tower; others ignore it.",
+                               "Qwen2.5-VL vision tower; others ignore it. "
+                               "On MiniMax-H3 it is the FIRST KEYFRAME, "
+                               "shown to Qwen3-VL as \"<Picture 1>: \" "
+                               "ahead of the prompt.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_image2", .doc = "OPTIONAL SECOND reference image (same format). "
                                 "On a multi-reference family "
@@ -162,7 +167,8 @@ const PortSpec kIports[] = {
                                 "carries the second one's spatial detail). Each "
                                 "reference gets its own vision block, mROPE band "
                                 "and deepstack run. Krea-2 is single-reference "
-                                "by design and ignores it.",
+                                "by design and ignores it. On MiniMax-H3 it "
+                                "is the LAST keyframe.",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "model_config",
    .doc = "OPTIONAL model-specific parameters from the resident family's own "
@@ -1427,6 +1433,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
           this->id(), plan.footprint >> 30, plan.others >> 30,
           h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
     }
+    _h3_enc_cfg = h3cfg;
     _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_cfg_dir, mc,
                                                 const_cast<SessionContextIntf*>(
                                                     session()), h3cfg);
@@ -1849,6 +1856,26 @@ DiffusionConditionerStage::declare_resources() const
   if (!enc.empty()) {
     out.push_back(model_memory::weight_claim_streamable(enc, enc_floor));
   }
+  // MiniMax-H3 KEYFRAMES on a ref_image port: the vision tower runs on
+  // each before the prompt is encoded (h3_keyframes_). Its weights are
+  // in the floor above; its working set is booked here, in the
+  // condition phase, at the largest canvas H3 generates on (1920 x
+  // 1088) -- a keyframe is put on the canvas before it arrives.
+  // Pictures are encoded one at a time.
+  if (!enc.empty() && h3_keyframe_wired_()) {
+    genai::MetalMiniMaxH3Transformer::Config probe;
+    genai::MiniMaxH3TextEncoder::Config ec;
+    if (genai::MetalMiniMaxH3Transformer::config_from_json(
+            resolve_model_dir(session(), _hf_dir), probe, nullptr) &&
+        genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr)) {
+      const std::size_t vb = genai::MetalQwenVisionEncoder::
+          encode_scratch_bytes(ec.vision, kH3KeyframeBookPixels);
+      for (auto& c : model_memory::scratch_claims(
+               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
   // NOT THE DiT. The stage that loads it declares the one it loads --
   // generate-image's `dit_dir`, generate-video's partition -- and naming
   // the release's `transformer/` here as well put a DiT nothing loads in
@@ -1883,6 +1910,17 @@ DiffusionConditionerStage::declare_memory() const
   // by an amount smaller than its own rounding. The revise path is
   // where this belongs once declare_memory has one.
   return m;
+}
+
+bool
+DiffusionConditionerStage::h3_keyframe_wired_() const
+{
+  for (unsigned p : {3u, 4u}) {
+    if (iport_edges().size() > p && iport_edges()[p].v != nullptr) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::vector<ResourceClaim>
@@ -2955,6 +2993,70 @@ DiffusionConditionerStage::batchable_() const
 }
 
 SharedBuffer
+DiffusionConditionerStage::h3_keyframes_(const std::string& text,
+                                         int* n_tokens,
+                                         std::string* err) const
+{
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !_h3_enc) {
+    if (err != nullptr) { *err = "no encoder"; }
+    return {};
+  }
+  // The tower over the encoder's own checkpoint, loaded at the first
+  // keyframe (a text-only graph never builds it) and dropped with the
+  // encoder. Its weights are inside the encoder's streaming floor --
+  // everything outside the decoder layers -- so the claim already holds
+  // them.
+  if (!_vision3) {
+    std::string verr;
+    _vision3 = genai::MiniMaxH3TextEncoder::load_vision(_enc_cfg_dir, mc,
+                                                        _h3_enc_cfg, &verr);
+    if (!_vision3) {
+      if (err != nullptr) {
+        *err = "the vision tower failed to load (" + verr +
+               "); the keyframes cannot be shown to the conditioner";
+      }
+      return {};
+    }
+    _vision3->set_session(session());
+  }
+  // The pictures as the graph sized them (on the canvas, as the
+  // references resize their keyframes before the processor), at the
+  // processor's own bounds.
+  std::vector<genai::MetalQwenVisionEncoder::Result> res((std::size_t)_n_ref);
+  for (int i = 0; i < _n_ref; ++i) {
+    res[(std::size_t)i] = _vision3->encode(_ref_rgb[(std::size_t)i].data(),
+                                           _ref_rgb_h[(std::size_t)i],
+                                           _ref_rgb_w[(std::size_t)i]);
+    if (res[(std::size_t)i].embeddings.empty()) {
+      if (err != nullptr) {
+        *err = "the vision tower produced nothing for keyframe " +
+               std::to_string(i + 1);
+      }
+      return {};
+    }
+  }
+  std::vector<genai::MiniMaxH3TextEncoder::Reference> refs;
+  refs.reserve(res.size());
+  for (const auto& r : res) {
+    genai::MiniMaxH3TextEncoder::Reference p;
+    p.kind = genai::MiniMaxH3TextEncoder::Reference::Kind::kImage;
+    p.vision = &r;
+    refs.push_back(std::move(p));
+  }
+  SharedBuffer h = _h3_enc->encode_references(refs, text, &_h3_tags,
+                                              n_tokens, err);
+  int vis = 0;
+  for (int t : _h3_tags) { vis += t != genai::minimax_h3::kTextTag; }
+  session()->info(fmt(
+      "DiffusionConditionerStage('{}'): MiniMax-H3 presentation -- {} "
+      "keyframe{} shown to the conditioner (\"<Picture i>: \" + {} vision "
+      "rows) ahead of the prompt, {} rows in all", this->id(), _n_ref,
+      _n_ref == 1 ? "" : "s", vis, n_tokens != nullptr ? *n_tokens : 0));
+  return h;
+}
+
+SharedBuffer
 DiffusionConditionerStage::encode_(const std::string& text, const char* which,
                                    int& n_real_out,
                                    const SharedBuffer& vtok, int n_img,
@@ -3012,7 +3114,13 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
     if (!_h3_enc) { return {}; }
     int n = 0;
     std::string eerr;
-    SharedBuffer h = _h3_enc->encode(text, &n, &eerr);
+    _h3_tags.clear();
+    // KEYFRAMES on the ref_image ports: FL2VA's presentation shows each
+    // to Qwen3-VL ahead of the prompt -- diffusers' FL2VA text encoder
+    // and ComfyUI's tokenize(prompt, images=...) both do. Without a
+    // picture the presentation is the prompt alone, as before.
+    SharedBuffer h = _n_ref > 0 ? h3_keyframes_(text, &n, &eerr)
+                                : _h3_enc->encode(text, &n, &eerr);
     if (h.empty()) {
       session()->warn(fmt("DiffusionConditionerStage('{}'): MiniMax-H3 {} "
                           "encode: {}", this->id(), which, eerr));
@@ -4950,6 +5058,20 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     // The TARGET image's slots are not included -- the consumer knows
     // that geometry and this stage does not.
     if (!cond_sb.is_null()) { beat->sideband = std::move(cond_sb); }
+    // MiniMax-H3's per-row modality tags, when the presentation showed
+    // the conditioner a keyframe: which rows are a vision block is known
+    // only here, and the DiT's layout tags them video.
+    if (_family == "minimax-h3" && (int)_h3_tags.size() == n_real) {
+      FlexData tags = FlexData::make_array();
+      for (int t : _h3_tags) {
+        tags.as_array().push_back(FlexData::make_int(t));
+      }
+      if (!beat->sideband.is_object()) {
+        beat->sideband = FlexData::make_object();
+      }
+      beat->sideband.as_object().insert_or_assign(
+          genai::cond_sideband::kTokenTags, std::move(tags));
+    }
     // Opt-in trace of the conditioning ITSELF. Two prompts that produce
     // the same downstream generation are ambiguous between "the encoder
     // emitted near-identical embeddings" and "the DiT ignored different

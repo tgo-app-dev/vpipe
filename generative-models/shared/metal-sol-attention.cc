@@ -38,6 +38,10 @@ constexpr int kApproxBQ = 32;
 // allocation used to give it.
 constexpr std::size_t kCarveAlign = 16384;
 constexpr int kProxyTile = 64;
+// The exact threshold's passes: covariance rows a threadgroup owns and
+// query blocks a threshold threadgroup owns (SOL_COV_ROWS, SOL_THR_QB).
+constexpr int kCovRows = 16;
+constexpr int kThrQB   = 32;
 constexpr unsigned kProxySg = 4;
 
 // The layout AttnParams has, restated because the vendored header is a
@@ -113,6 +117,12 @@ MetalSolAttention::load(MetalCompute* mc, bool bf16, std::string* err)
       s->_fn_route_p = s->_lib.function("sol_route_p_mma");
     }
   }
+  // THE EXACT THRESHOLD'S KERNELS, OPTIONAL: a host built before them
+  // runs "diag" and refuses "exact" by name (exact_available()).
+  s->_fn_cov      = s->_lib.function("sol_kc_cov_mma");
+  s->_fn_thr      = s->_lib.function("sol_thr_exact_mma");
+  s->_fn_route_t  = s->_lib.function("sol_route_t_mma");
+  s->_fn_route_pt = s->_lib.function("sol_route_pt_mma");
   s->_fn_sum    = s->_lib.function("sol_summaries_mma");
   s->_fn_stats  = s->_lib.function("sol_kc_stats_mma");
   s->_fn_route  = s->_lib.function("sol_route_mma");
@@ -193,6 +203,14 @@ sol_scratch_plan_(std::size_t H, std::size_t KVH, std::size_t T,
   (void)tp;
   out->push_back(H * T * 4);                         // m_e
   out->push_back(H * T * 4);                         // l_e
+  // The exact threshold's covariance lives in o_e, which is dead until
+  // the routing is done -- unless o_e is too small for it (fewer than
+  // 2 * D query rows), when it has a buffer of its own. Planned and
+  // allocated whatever the threshold, so the two always agree; it is
+  // a few MB at most, and only on calls of a handful of rows.
+  if (KVH * D * D * 4 > H * T * D * 2) {
+    out->push_back(KVH * D * D * 4);                 // cov (exact)
+  }
 }
 
 // The geometry the plan is written against, or false when the key block
@@ -336,12 +354,114 @@ MetalSolAttention::scratch_buffers_()
   // pinned four are NOT here: they are not carved and not released.
   return {&_qc, &_kc, &_vc, &_mean, &_var, &_flags, &_proxy, &_kept,
           &_qb_off, &_qb_blk, &_o_a, &_m_a, &_l_a, &_o_e, &_o_an, &_m_e,
-          &_l_e};
+          &_l_e, &_cov_own};
 }
 
 MetalSolAttention::~MetalSolAttention()
 {
   drop_residency_();
+  drop_prepared_residency_();
+}
+
+void
+MetalSolAttention::drop_prepared_residency_()
+{
+  if (!_pk_res || _mc == nullptr) { return; }
+  _pk_res = false;
+  for (const SharedBuffer* b :
+       {&_pk_kc, &_pk_vc, &_pk_mean, &_pk_var, &_pk_cov}) {
+    if (!b->empty()) { _mc->residency_remove(*b); }
+  }
+  _mc->residency_commit();
+}
+
+std::size_t
+MetalSolAttention::prepared_keys_bytes(int kv_heads, int k_tokens, int d,
+                                       int key_block)
+{
+  if (kv_heads <= 0 || k_tokens <= 0 || d <= 0) { return 0; }
+  const std::size_t blk =
+      (std::size_t)(key_block > 0 ? key_block : sol::kBlock);
+  const std::size_t KVH = (std::size_t)kv_heads, D = (std::size_t)d;
+  const std::size_t nk = ((std::size_t)k_tokens + blk - 1) / blk;
+  return 2 * KVH * nk * D * 2 + 2 * KVH * D * 4 + KVH * D * D * 4;
+}
+
+bool
+MetalSolAttention::prepare_keys(ComputeEncoder& enc, const SharedBuffer& k,
+                                const SharedBuffer& v, int kv_heads,
+                                int k_tokens, int k_rows, int d,
+                                const sol::Config& cfg, std::string* err)
+{
+  auto fail = [&](const char* m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  if (kv_heads <= 0 || k_tokens <= 0 || d <= 0 || k_rows < k_tokens) {
+    return fail("sol_attn: prepare_keys needs keys inside their buffer");
+  }
+  if (d != 64 && d != kHeadDim) {
+    return fail("sol_attn needs head_dim 64 or 128");
+  }
+  const bool exact = cfg.thresh == sol::Threshold::kExact;
+  if (exact && !exact_available()) {
+    return fail("sol_attn: this host's kernels predate the 'exact' "
+                "threshold; 'diag' is what it runs");
+  }
+  const int blk = cfg.key_block > 0 ? cfg.key_block : sol::kBlock;
+  if (blk % _bk != 0 || blk < _bk) {
+    return fail("the Sol key block must be a whole number of the exact "
+                "kernel's key blocks");
+  }
+  const int nk = (k_tokens + blk - 1) / blk;
+  if (_pk_kc.empty() || _pk_kvh != kv_heads || _pk_tok != k_tokens ||
+      _pk_d != d || _pk_blk != blk) {
+    drop_prepared_residency_();
+    const std::size_t KVH = (std::size_t)kv_heads, D = (std::size_t)d;
+    _pk_kc   = _mc->make_shared_buffer(KVH * (std::size_t)nk * D * 2);
+    _pk_vc   = _mc->make_shared_buffer(KVH * (std::size_t)nk * D * 2);
+    _pk_mean = _mc->make_shared_buffer(KVH * D * 4);
+    _pk_var  = _mc->make_shared_buffer(KVH * D * 4);
+    _pk_cov  = _mc->make_shared_buffer(KVH * D * D * 4);
+    if (_pk_kc.empty() || _pk_vc.empty() || _pk_mean.empty() ||
+        _pk_var.empty() || _pk_cov.empty()) {
+      _pk_kc = SharedBuffer{};
+      return fail("sol_attn: prepared keys allocation failed");
+    }
+    for (const SharedBuffer* b :
+         {&_pk_kc, &_pk_vc, &_pk_mean, &_pk_var, &_pk_cov}) {
+      _mc->residency_add(*b);
+    }
+    _mc->residency_commit();
+    _pk_res = true;
+    _pk_kvh = kv_heads; _pk_tok = k_tokens; _pk_d = d; _pk_blk = blk;
+  }
+  // The same three passes encode() runs for its keys, into these.
+  enc.set_function(_fn_sum);
+  enc.set_buffer(0, k); enc.set_buffer(1, k); enc.set_buffer(2, v);
+  enc.set_buffer(3, _pk_kc); enc.set_buffer(4, _pk_kc);
+  enc.set_buffer(5, _pk_vc);
+  enc.set_constant(6, k_tokens); enc.set_constant(7, d);
+  enc.set_constant(8, nk); enc.set_constant(9, blk);
+  enc.set_constant(10, 6);        // k | v
+  enc.set_constant(11, k_rows);
+  enc.dispatch({(unsigned)d, (unsigned)kv_heads, (unsigned)nk},
+               {(unsigned)d, 1, 1});
+  enc.set_function(_fn_stats);
+  enc.set_buffer(0, _pk_kc); enc.set_buffer(1, _pk_mean);
+  enc.set_buffer(2, _pk_var);
+  enc.set_constant(3, d); enc.set_constant(4, nk);
+  enc.dispatch({(unsigned)d, (unsigned)kv_heads, 1}, {(unsigned)d, 1, 1});
+  if (exact) {
+    enc.set_function(_fn_cov);
+    enc.set_buffer(0, _pk_kc); enc.set_buffer(1, _pk_mean);
+    enc.set_buffer(2, _pk_cov);
+    enc.set_constant(3, d); enc.set_constant(4, nk);
+    enc.dispatch({(unsigned)(d * (d / kCovRows)), (unsigned)kv_heads, 1},
+                 {(unsigned)d, 1, 1});
+  }
+  _pk_exact = exact;
+  return true;
 }
 
 void
@@ -593,6 +713,16 @@ MetalSolAttention::ensure_scratch_(int heads, int kv_heads, int q_tokens,
   }
   _m_e = mk(H * (std::size_t)tokens * 4);
   _l_e = mk(H * (std::size_t)tokens * 4);
+  // The exact threshold's covariance, in sol_scratch_plan_'s place.
+  if (KVH * D * D * 4 > H * (std::size_t)tokens * D * 2) {
+    _cov_own = mk(KVH * D * D * 4);
+    if (_cov_own.empty()) {
+      if (err != nullptr) { *err = "sol_attn scratch allocation failed"; }
+      return false;
+    }
+  } else {
+    _cov_own = SharedBuffer{};
+  }
   // ZEROED AT BIRTH. The counter is an atomic the route kernel ADDS to,
   // and it is read at the start of the NEXT forward -- so whatever the
   // allocator handed over is reported as the first forward's routing.
@@ -876,13 +1006,25 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
     return fail("VPIPE_SOL_NO_MASKED_APPROX is head_dim 128 only -- "
                 "sol_approx_mma's output tile is built around it");
   }
-  if (cfg.thresh != sol::Threshold::kDiag) {
-    return fail("sol_attn on metal implements the 'diag' threshold only");
+  const bool exact = cfg.thresh == sol::Threshold::kExact;
+  if (exact && !exact_available()) {
+    return fail("sol_attn: this host's kernels predate the 'exact' "
+                "threshold; 'diag' is what it runs");
   }
   _blk = cfg.key_block > 0 ? cfg.key_block : sol::kBlock;
   if (_blk % _bk != 0 || _blk < _bk) {
     return fail("the Sol key block must be a whole number of the exact "
                 "kernel's key blocks");
+  }
+  // KEYS FROM A PREPARED SET (Band::keys) must be THESE keys' at this
+  // call's geometry, or the routing reads another layout's centroids.
+  const MetalSolAttention* pk = band.keys;
+  if (pk != nullptr &&
+      (pk->_pk_kc.empty() || pk->_pk_kvh != kv_heads ||
+       pk->_pk_tok != k_tokens || pk->_pk_d != d || pk->_pk_blk != _blk ||
+       (exact && !pk->_pk_exact))) {
+    return fail("sol_attn: the prepared keys are not this call's (kv "
+                "heads, key extent, head dim or key block differ)");
   }
   if (!ensure_scratch_(heads, kv_heads, q_tokens, k_tokens, d, err)) {
     return false;
@@ -941,7 +1083,12 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // q_off + h*q_rows + r -- the band, read in place.
   const std::size_t q_boff =
       (std::size_t)band.q_row0 * (std::size_t)d * 2;
-  if ((skip & 1) == 0) {
+  // The key-side buffers this call reads: its own, or a prepared set's.
+  const SharedBuffer& kcb = pk != nullptr ? pk->_pk_kc : _kc;
+  const SharedBuffer& vcb = pk != nullptr ? pk->_pk_vc : _vc;
+  const SharedBuffer& meanb = pk != nullptr ? pk->_pk_mean : _mean;
+  const SharedBuffer& varb = pk != nullptr ? pk->_pk_var : _var;
+  if ((skip & 1) == 0 && pk == nullptr) {
   enc.set_function(_fn_sum);
   enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
   enc.set_buffer(3, _qc); enc.set_buffer(4, _kc); enc.set_buffer(5, _vc);
@@ -954,6 +1101,8 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // no kernel change, and the q pass below is untouched at `heads`.
   enc.dispatch({(unsigned)d, (unsigned)kv_heads, (unsigned)nk},
                {(unsigned)d, 1, 1});
+  }
+  if ((skip & 1) == 0) {
   enc.set_function(_fn_sum);
   enc.set_buffer(0, q, q_boff); enc.set_buffer(1, q, q_boff);
   enc.set_buffer(2, q, q_boff);
@@ -967,12 +1116,36 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   }
 
   // 2. the key centroids' spread, per head.
-  if ((skip & 2) == 0) {
+  if ((skip & 2) == 0 && pk == nullptr) {
   enc.set_function(_fn_stats);
   enc.set_buffer(0, _kc); enc.set_buffer(1, _mean); enc.set_buffer(2, _var);
   enc.set_constant(3, d); enc.set_constant(4, nk);
   // The spread of the KEY centroids, so per KV head like the centroids.
   enc.dispatch({(unsigned)d, (unsigned)kv_heads, 1}, {(unsigned)d, 1, 1});
+  }
+  // ...and, for the "exact" threshold, their covariance and the
+  // thresholds it gives -- into buffers the routing does not touch and
+  // nothing has written yet this call (the exact half's output, the
+  // approximate half's row maxima), so they cost nothing to hold.
+  const SharedBuffer& cov = pk != nullptr ? pk->_pk_cov
+                            : _cov_own.empty() ? _o_e : _cov_own;
+  const SharedBuffer& thr = _m_a;
+  if (exact && (skip & 2) == 0 && pk == nullptr) {
+  enc.set_function(_fn_cov);
+  enc.set_buffer(0, _kc); enc.set_buffer(1, _mean); enc.set_buffer(2, cov);
+  enc.set_constant(3, d); enc.set_constant(4, nk);
+  enc.dispatch({(unsigned)(d * (d / kCovRows)), (unsigned)kv_heads, 1},
+               {(unsigned)d, 1, 1});
+  }
+  if (exact && (skip & 4) == 0) {
+  enc.set_function(_fn_thr);
+  enc.set_buffer(0, _qc); enc.set_buffer(1, meanb); enc.set_buffer(2, cov);
+  enc.set_buffer(3, thr);
+  enc.set_constant(4, scale); enc.set_constant(5, cfg.tau);
+  enc.set_constant(6, d); enc.set_constant(7, nq); enc.set_constant(8, gqa);
+  const unsigned tiles = (unsigned)((nq + kThrQB - 1) / kThrQB);
+  enc.dispatch({(unsigned)d * tiles, (unsigned)heads, 1},
+               {(unsigned)d, 1, 1});
   }
 
   // 3-5. route, scan, emit -- the CSR the steel kernel walks.
@@ -981,20 +1154,24 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // [NQ, D] x [D, NK] per head instead of NQ * NK simdgroup dot
   // products, each of which re-read a key centroid. MEASURED at 8 heads
   // x 20036 rows: 2.7 ms of the routing became 0.6.
+  // Under "exact" the proxy route has to read the thresholds, so its
+  // twin must be there too; the fused route serves otherwise.
   const bool proxy_gemm = !_proxy.empty() && _fn_proxy.valid() &&
-                          _fn_route_p.valid();
+                          _fn_route_p.valid() &&
+                          (!exact || _fn_route_pt.valid());
   if ((skip & 4) == 0 && proxy_gemm) {
   enc.set_function(_fn_proxy);
-  enc.set_buffer(0, _qc); enc.set_buffer(1, _kc); enc.set_buffer(2, _proxy);
+  enc.set_buffer(0, _qc); enc.set_buffer(1, kcb); enc.set_buffer(2, _proxy);
   enc.set_constant(3, nq); enc.set_constant(4, nk); enc.set_constant(5, d);
   enc.set_constant(6, gqa);
   const unsigned mt = (unsigned)((nq + kProxyTile - 1) / kProxyTile);
   const unsigned nt = (unsigned)((nk + kProxyTile - 1) / kProxyTile);
   enc.dispatch({32u * kProxySg * nt, mt, (unsigned)heads},
                {32u * kProxySg, 1, 1});
-  enc.set_function(_fn_route_p);
+  enc.set_function(exact ? _fn_route_pt : _fn_route_p);
   enc.set_buffer(0, _proxy); enc.set_buffer(1, _qc);
-  enc.set_buffer(2, _mean); enc.set_buffer(3, _var);
+  if (exact) { enc.set_buffer(2, thr); }
+  else       { enc.set_buffer(2, meanb); enc.set_buffer(3, varb); }
   enc.set_buffer(4, _flags); enc.set_buffer(5, _kept);
   enc.set_buffer(6, _counts);
   enc.set_constant(7, scale); enc.set_constant(8, cfg.tau);
@@ -1008,9 +1185,11 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   enc.set_constant(20, q_off);
   enc.dispatch({32, (unsigned)heads, (unsigned)nq}, {32, 1, 1});
   } else if ((skip & 4) == 0) {
-  enc.set_function(_fn_route);
-  enc.set_buffer(0, _qc); enc.set_buffer(1, _kc); enc.set_buffer(2, _mean);
-  enc.set_buffer(3, _var); enc.set_buffer(4, _flags); enc.set_buffer(5, _kept);
+  enc.set_function(exact ? _fn_route_t : _fn_route);
+  enc.set_buffer(0, _qc); enc.set_buffer(1, kcb);
+  if (exact) { enc.set_buffer(2, thr); }
+  else       { enc.set_buffer(2, meanb); enc.set_buffer(3, varb); }
+  enc.set_buffer(4, _flags); enc.set_buffer(5, _kept);
   enc.set_buffer(6, _counts);
   enc.set_constant(7, scale); enc.set_constant(8, cfg.tau);
   enc.set_constant(9, d); enc.set_constant(10, nk); enc.set_constant(11, nq);
@@ -1051,14 +1230,14 @@ MetalSolAttention::encode(ComputeEncoder& enc, const SharedBuffer& q,
   // on the simdgroup kernel, at 1/64 of the dense work.
   if ((skip & 32) == 0 && _masked) {
   enc.set_function(_fn_approx_masked);
-  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
+  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, kcb); enc.set_buffer(2, vcb);
   enc.set_buffer(3, _o_an); enc.set_buffer(4, _params_a);
   enc.set_buffer(12, _m_a); enc.set_buffer(13, _l_a);
   enc.set_buffer(14, _flags);
   enc.dispatch({32u * (unsigned)nq, 4u * (unsigned)heads, 1}, {32, 4, 1});
   } else if ((skip & 32) == 0) {
   enc.set_function(_fn_approx);
-  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, _kc); enc.set_buffer(2, _vc);
+  enc.set_buffer(0, q, q_boff); enc.set_buffer(1, kcb); enc.set_buffer(2, vcb);
   enc.set_buffer(3, _flags); enc.set_buffer(4, _o_a); enc.set_buffer(5, _m_a);
   enc.set_buffer(6, _l_a);
   enc.set_constant(7, scale); enc.set_constant(8, tokens);
@@ -1119,8 +1298,9 @@ long long
 MetalSolAttention::exact_blocks() const
 {
   if (_counts.empty()) { return 0; }
+  // Two words, the route kernels carrying into the second (see them).
   const auto* c = static_cast<const std::uint32_t*>(_counts.contents());
-  return (long long)c[0];
+  return (long long)(((std::uint64_t)c[1] << 32) | (std::uint64_t)c[0]);
 }
 
 void
@@ -1128,6 +1308,13 @@ MetalSolAttention::reset_counts()
 {
   if (_counts.empty()) { return; }
   std::memset(_counts.contents(), 0, _counts.byte_size());
+  // A TEST HOOK: VPIPE_SOL_COUNT_SEED starts the low word there, so a
+  // test can cross 2^32 with a geometry that keeps a few thousand
+  // blocks (sol_attention_mma.the_kept_count_carries_past_32_bits).
+  if (const char* e = std::getenv("VPIPE_SOL_COUNT_SEED")) {
+    static_cast<std::uint32_t*>(_counts.contents())[0] =
+        (std::uint32_t)std::strtoul(e, nullptr, 0);
+  }
 }
 
 std::size_t
@@ -1140,6 +1327,10 @@ MetalSolAttention::resident_bytes() const
   for (SharedBuffer* b :
        const_cast<MetalSolAttention*>(this)->scratch_buffers_()) {
     if (b->is_owned()) { n += b->byte_size(); }
+  }
+  for (const SharedBuffer* b :
+       {&_pk_kc, &_pk_vc, &_pk_mean, &_pk_var, &_pk_cov}) {
+    n += b->byte_size();
   }
   return n;
 }

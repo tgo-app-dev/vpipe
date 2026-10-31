@@ -219,6 +219,13 @@ class MetalSolAttention {
     // stream -- which is the common case and exactly why conflating
     // them survives every test that does not separate them.
     int q_row0   = 0;
+    // KEYS PREPARED ONCE FOR MANY CALLS (prepare_keys): that object's
+    // summaries of THESE keys -- the centroids, their statistics and,
+    // for "exact", their covariance -- and this call skips its own key
+    // passes. The calls of a banded forward share one set of keys, so
+    // without it every band summarised the same K and V again. Null:
+    // the call summarises its keys itself, as it always has.
+    const MetalSolAttention* keys = nullptr;
   };
 
   bool encode(metal_compute::ComputeEncoder& enc,
@@ -228,6 +235,22 @@ class MetalSolAttention {
               metal_compute::SharedBuffer& out, int heads, int kv_heads,
               const Band& band, int d, float scale, const sol::Config& cfg,
               std::string* err);
+
+  // THE KEY PASSES ON THEIR OWN, for calls that share keys (Band::keys):
+  // K and V summarised at the routing block, the centroids' statistics
+  // and, under "exact", their covariance -- into buffers of this
+  // object's OWN (never carved from a lend: they must outlive the calls
+  // between). Encode it ahead of the calls that read it; run it again
+  // whenever the keys change. `cfg` supplies the key block and the
+  // threshold form, and must be the calls' own.
+  bool prepare_keys(metal_compute::ComputeEncoder& enc,
+                    const metal_compute::SharedBuffer& k,
+                    const metal_compute::SharedBuffer& v, int kv_heads,
+                    int k_tokens, int k_rows, int d, const sol::Config& cfg,
+                    std::string* err);
+  // ...and what it holds for that geometry, for a planner.
+  static std::size_t prepared_keys_bytes(int kv_heads, int k_tokens, int d,
+                                         int key_block);
 
   // Blocks kept exact by the LAST completed encode, and the total the
   // routing chose from. Valid only after the command buffer has run.
@@ -338,6 +361,15 @@ class MetalSolAttention {
   // compares against dense has to run the SAME kernel dense or it is
   // measuring the port and calling it the approximation.
   bool uses_matrix_cores() const { return _nax; }
+  // Whether this host's kernels take the "exact" threshold
+  // (sol::Threshold::kExact): the key centroids' covariance and the
+  // thresholds it gives, computed ahead of a route that reads them. A
+  // host older than those entries runs "diag" alone and refuses exact
+  // by name.
+  bool exact_available() const
+  {
+    return _fn_cov.valid() && _fn_thr.valid() && _fn_route_t.valid();
+  }
   int  query_block() const { return _bq; }
   int  key_block_unit() const { return _bk; }
 
@@ -414,6 +446,11 @@ class MetalSolAttention {
   // units a separate proxy matrix would be pure extra traffic.
   metal_compute::ComputeLibrary  _lib_proxy;
   metal_compute::ComputeFunction _fn_proxy, _fn_route_p;
+  // The "exact" threshold: the covariance, the thresholds, and the two
+  // routes that read a threshold computed ahead of them. Optional (see
+  // exact_available()).
+  metal_compute::ComputeFunction _fn_cov, _fn_thr, _fn_route_t;
+  metal_compute::ComputeFunction _fn_route_pt;
   int _steel_seq = -1, _steel_nk = -1;
   int _steel_qseq = -1;                // the QUERY extent; _steel_seq keys
   // THE EXACT HALF'S KERNEL, AND ITS TILE. On a matrix-core GPU the
@@ -434,6 +471,18 @@ class MetalSolAttention {
   metal_compute::SharedBuffer _qc, _kc, _vc, _mean, _var;
   metal_compute::SharedBuffer _flags, _kept, _qb_off, _qb_blk;
   metal_compute::SharedBuffer _o_a, _m_a, _l_a, _o_e, _m_e, _l_e;
+  // The exact threshold's covariance where the exact half's output --
+  // dead until the routing is done, and its usual home -- is too small
+  // to hold it (fewer than 2 * head_dim query rows). In the scratch plan
+  // either way, so booked == allocated whatever the threshold.
+  metal_compute::SharedBuffer _cov_own;
+  // prepare_keys()'s own: the key centroids, value means, statistics and
+  // covariance, and the geometry they were built for.
+  metal_compute::SharedBuffer _pk_kc, _pk_vc, _pk_mean, _pk_var, _pk_cov;
+  int  _pk_kvh = 0, _pk_tok = 0, _pk_d = 0, _pk_blk = 0;
+  bool _pk_res = false;   // in the residency set
+  bool _pk_exact = false; // the covariance was built ("exact")
+  void drop_prepared_residency_();
   // The flash approximate half's output: the tensor dtype and the plain
   // [H, T, D] shape, against sol_approx_mma's fp32 [H, TPAD, D].
   metal_compute::SharedBuffer _o_an, _params_a;

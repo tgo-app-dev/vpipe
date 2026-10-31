@@ -11,6 +11,7 @@
 //   sol_summaries_mma   per-block centroids and value MEANS
 //   sol_kc_stats_mma    the key centroids' spread, for the threshold
 //   sol_route_mma       proxy scores -> threshold -> CSR block list
+//   sol_kc_cov_mma      + sol_thr_exact_mma: the "exact" threshold
 //   sol_approx_mma      a flash attention over the SUMMARY sequence
 //   sol_merge_mma       the two partial softmaxes into one output
 //
@@ -164,58 +165,16 @@ kernel void sol_kc_stats_mma(
 // granularity or two steel blocks would share one CSR entry. Query and
 // key block sizes are independent here; only the KEY size is what the
 // method calls its block.
-//
-//   0:qc (VPIPE_ELT [H,NQ,D]) 1:kc (VPIPE_ELT [H,NK,D])
-//   2:mean 3:var (float [H,D])  4:flags (uchar [H,NQ,NK])
-//   5:kept (uint [H,NQ])  6:counts (atomic_uint[2])
-//   7:scale 8:tau (float) 9:D 10:NK 11:NQ 12:BLK 13:BQ
-//   14:radius 15:sink_lo 16:sink_hi (int; radius/sink in KEY blocks)
-// grid (32, H, NQ) THREADS; threadgroup (32,1,1).
-kernel void sol_route_mma(
-    const device VPIPE_ELT* qc      [[buffer(0)]],
-    const device VPIPE_ELT* kc      [[buffer(1)]],
-    const device float*     mean    [[buffer(2)]],
-    const device float*     var     [[buffer(3)]],
-    device uchar*           flags   [[buffer(4)]],
-    device uint*            kept    [[buffer(5)]],
-    device atomic_uint*     counts  [[buffer(6)]],
-    constant float&         scale   [[buffer(7)]],
-    constant float&         tau     [[buffer(8)]],
-    constant int&           D       [[buffer(9)]],
-    constant int&           NK      [[buffer(10)]],
-    constant int&           NQ      [[buffer(11)]],
-    constant int&           BLK     [[buffer(12)]],
-    constant int&           BQ      [[buffer(13)]],
-    constant int&           radius  [[buffer(14)]],
-    // The GLOBAL row of this segment's first query. The local band is
-    // around the key block the query sits in, and a segment that starts
-    // part-way down the sequence sits somewhere else -- zero for a
-    // whole-sequence call.
-    constant int&           QOFF    [[buffer(20)]],
-    constant int&           sink_lo [[buffer(15)]],
-    constant int&           sink_hi [[buffer(16)]],
-    constant int&           per     [[buffer(17)]],
-    constant int&           NKS     [[buffer(18)]],
-    constant int&           GQA     [[buffer(19)]],
-    uint3 tid  [[threadgroup_position_in_grid]],
-    uint  lane [[thread_index_in_simdgroup]])
-{
-  const int h  = (int)tid.y;
-  const int qb = (int)tid.z;
-  // GQA. The routing is decided per QUERY head -- the flags, the kept
-  // count and the CSR are all indexed by `h` -- but the key centroids
-  // and their statistics are summarised per KV head, because that is
-  // what K and V have. So a query head reads the group it belongs to.
-  //
-  // GQA 1 makes `hk` exactly `h`, which is what every caller before
-  // this did implicitly: the MHA path is unchanged, not a special case
-  // layered on top.
-  const int hk = (GQA > 1) ? (h / GQA) : h;
-  const float ls = scale * SOL_LOG2E;
-  const device VPIPE_ELT* qbar = qc + ((uint)h * NQ + qb) * D;
-  const device float* mh = mean + (uint)hk * D;
-  const device float* vh = var  + (uint)hk * D;
 
+// THE DIAG THRESHOLD of one query block, which both route kernels took
+// inline: mean + tau * sd of its proxy score over the key blocks, the
+// variance from the key centroids' per-channel spread alone. One
+// simdgroup; every lane returns it.
+static inline float sol_thr_diag_(const device VPIPE_ELT* qbar,
+                                  const device float* mh,
+                                  const device float* vh, int D, uint lane,
+                                  float ls, float tau)
+{
   float rm = 0.0f, rv = 0.0f;
   for (int i = (int)lane; i < D; i += 32) {
     const float qi = float(qbar[i]);
@@ -224,8 +183,20 @@ kernel void sol_route_mma(
   }
   rm = simd_sum(rm) * ls;
   rv = max(simd_sum(rv), 0.0f) * ls * ls;
-  const float thr = rm + tau * sqrt(rv + 1.0e-6f);
+  return rm + tau * sqrt(rv + 1.0e-6f);
+}
 
+// sol_route_mma's walk over the key blocks, at threshold `thr`: the
+// proxy dots computed here, the decision, the flag row and the kept
+// count. Shared by the diag kernel and the one that reads a threshold
+// computed ahead of it (sol_route_t_mma).
+static inline void sol_route_walk_(
+    const device VPIPE_ELT* qbar, const device VPIPE_ELT* kc,
+    device uchar* flags, device uint* kept, device atomic_uint* counts,
+    float thr, int h, int hk, int qb, int D, int NK, int NQ, int BLK,
+    int BQ, int radius, int QOFF, int sink_lo, int sink_hi, int per,
+    int NKS, float ls, uint lane)
+{
   // The local band is in KEY blocks around the key block this QUERY
   // block sits in, which is where the two granularities meet.
   const int qk = (QOFF + qb * BQ) / BLK;
@@ -275,7 +246,118 @@ kernel void sol_route_mma(
   if (lane == 0) {
     kept[(uint)h * NQ + qb] = n_keep;
     if (counts != nullptr) {
-      atomic_fetch_add_explicit(&counts[0], n_keep, memory_order_relaxed);
+      // 64 BITS AS TWO WORDS: a forward's kept blocks pass 2^32 at video
+      // geometry (2K x 124 frames keeping 22% is 4.7e9), so the add that
+      // crosses the line carries into counts[1] -- exactly one add
+      // crosses each multiple of 2^32, so the pair is the exact sum.
+      const uint old = atomic_fetch_add_explicit(&counts[0], n_keep,
+                                                 memory_order_relaxed);
+      if (old > 0xffffffffu - n_keep) {
+        atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
+      }
+    }
+  }
+}
+
+//   0:qc (VPIPE_ELT [H,NQ,D]) 1:kc (VPIPE_ELT [H,NK,D])
+//   2:mean 3:var (float [H,D])  4:flags (uchar [H,NQ,NK])
+//   5:kept (uint [H,NQ])  6:counts (atomic_uint[2])
+//   7:scale 8:tau (float) 9:D 10:NK 11:NQ 12:BLK 13:BQ
+//   14:radius 15:sink_lo 16:sink_hi (int; radius/sink in KEY blocks)
+// grid (32, H, NQ) THREADS; threadgroup (32,1,1).
+kernel void sol_route_mma(
+    const device VPIPE_ELT* qc      [[buffer(0)]],
+    const device VPIPE_ELT* kc      [[buffer(1)]],
+    const device float*     mean    [[buffer(2)]],
+    const device float*     var     [[buffer(3)]],
+    device uchar*           flags   [[buffer(4)]],
+    device uint*            kept    [[buffer(5)]],
+    device atomic_uint*     counts  [[buffer(6)]],
+    constant float&         scale   [[buffer(7)]],
+    constant float&         tau     [[buffer(8)]],
+    constant int&           D       [[buffer(9)]],
+    constant int&           NK      [[buffer(10)]],
+    constant int&           NQ      [[buffer(11)]],
+    constant int&           BLK     [[buffer(12)]],
+    constant int&           BQ      [[buffer(13)]],
+    constant int&           radius  [[buffer(14)]],
+    // The GLOBAL row of this segment's first query. The local band is
+    // around the key block the query sits in, and a segment that starts
+    // part-way down the sequence sits somewhere else -- zero for a
+    // whole-sequence call.
+    constant int&           QOFF    [[buffer(20)]],
+    constant int&           sink_lo [[buffer(15)]],
+    constant int&           sink_hi [[buffer(16)]],
+    constant int&           per     [[buffer(17)]],
+    constant int&           NKS     [[buffer(18)]],
+    constant int&           GQA     [[buffer(19)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int h  = (int)tid.y;
+  const int qb = (int)tid.z;
+  // GQA. The routing is decided per QUERY head -- the flags, the kept
+  // count and the CSR are all indexed by `h` -- but the key centroids
+  // and their statistics are summarised per KV head, because that is
+  // what K and V have. So a query head reads the group it belongs to.
+  //
+  // GQA 1 makes `hk` exactly `h`, which is what every caller before
+  // this did implicitly: the MHA path is unchanged, not a special case
+  // layered on top.
+  const int hk = (GQA > 1) ? (h / GQA) : h;
+  const float ls = scale * SOL_LOG2E;
+  const device VPIPE_ELT* qbar = qc + ((uint)h * NQ + qb) * D;
+  const float thr = sol_thr_diag_(qbar, mean + (uint)hk * D,
+                                  var + (uint)hk * D, D, lane, ls, tau);
+  sol_route_walk_(qbar, kc, flags, kept, counts, thr, h, hk, qb, D, NK,
+                  NQ, BLK, BQ, radius, QOFF, sink_lo, sink_hi, per, NKS,
+                  ls, lane);
+}
+
+// sol_route_p_mma's walk over a row of the precomputed proxy, at
+// threshold `thr`; shared with sol_route_pt_mma.
+static inline void sol_route_p_walk_(
+    const device float* proxy, device uchar* flags, device uint* kept,
+    device atomic_uint* counts, float thr, int h, int qb, int NK, int NQ,
+    int BLK, int BQ, int radius, int QOFF, int sink_lo, int sink_hi,
+    int per, int NKS, float ls, uint lane)
+{
+  const int qk = (QOFF + qb * BQ) / BLK;
+  const device float* pr = proxy + ((uint)h * NQ + qb) * NK;
+  device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
+  // ONE LANE PER KEY BLOCK now that the dot is a load: the row is
+  // walked 32 blocks at a time and the kept count is a simd sum, where
+  // the fused kernel had all 32 lanes cooperate on one block's dot and
+  // step one block at a time.
+  uint n_keep = 0;
+  for (int n0 = 0; n0 < NK; n0 += 32) {
+    const int n = n0 + (int)lane;
+    uint mine = 0;
+    if (n < NK) {
+      const float dot = pr[n] * ls;
+      const bool tail  = (n == NK - 1);   // see the file header
+      const bool local = abs(qk - n) <= radius;
+      const bool sink  = (n >= sink_lo && n < sink_hi);
+      const bool keep  = (dot > thr) || local || sink || tail;
+      fl[n] = keep ? (uchar)1 : (uchar)0;
+      const int lo = n * per;
+      const int hi = min(lo + per, NKS);
+      mine = keep ? (uint)max(0, hi - lo) : 0u;
+    }
+    n_keep += simd_sum(mine);
+  }
+  if (lane == 0) {
+    kept[(uint)h * NQ + qb] = n_keep;
+    if (counts != nullptr) {
+      // 64 BITS AS TWO WORDS: a forward's kept blocks pass 2^32 at video
+      // geometry (2K x 124 frames keeping 22% is 4.7e9), so the add that
+      // crosses the line carries into counts[1] -- exactly one add
+      // crosses each multiple of 2^32, so the pair is the exact sum.
+      const uint old = atomic_fetch_add_explicit(&counts[0], n_keep,
+                                                 memory_order_relaxed);
+      if (old > 0xffffffffu - n_keep) {
+        atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
+      }
     }
   }
 }
@@ -342,49 +424,221 @@ kernel void sol_route_p_mma(
   const int hk = (GQA > 1) ? (h / GQA) : h;
   const float ls = scale * SOL_LOG2E;
   const device VPIPE_ELT* qbar = qc + ((uint)h * NQ + qb) * D;
-  const device float* mh = mean + (uint)hk * D;
-  const device float* vh = var  + (uint)hk * D;
+  const float thr = sol_thr_diag_(qbar, mean + (uint)hk * D,
+                                  var + (uint)hk * D, D, lane, ls, tau);
+  sol_route_p_walk_(proxy, flags, kept, counts, thr, h, qb, NK, NQ, BLK,
+                    BQ, radius, QOFF, sink_lo, sink_hi, per, NKS, ls, lane);
+}
 
-  float rm = 0.0f, rv = 0.0f;
-  for (int i = (int)lane; i < D; i += 32) {
-    const float qi = float(qbar[i]);
-    rm += qi * mh[i];
-    rv += qi * qi * vh[i];
-  }
-  rm = simd_sum(rm) * ls;
-  rv = max(simd_sum(rv), 0.0f) * ls * ls;
-  const float thr = rm + tau * sqrt(rv + 1.0e-6f);
+// THE EXACT THRESHOLD ("exact" in the published Sol-Attn): the spread of
+// a query block's proxy score over the key blocks taken with the key
+// centroids' FULL covariance, q^T C q, where diag keeps only C's
+// diagonal. Two passes ahead of the route, which then reads one
+// threshold per query block (sol_route_t_mma / sol_route_pt_mma):
+//
+//   sol_kc_cov_mma     C per KV head, [D, D] f32
+//   sol_thr_exact_mma  mean + tau * sqrt(q^T C q) per query block
+//
+// THE COVARIANCE IS CENTRED AS IT IS SUMMED. The published form takes
+// the raw second moment M = mean_b kc_b kc_b^T as a bf16 matmul and
+// subtracts (q . mu)^2 at the end; when the keys share a large common
+// offset that subtraction cancels most of M and its bf16 rounding is
+// what is left. Summing (kc_b - mu)(kc_b - mu)^T in f32 gives the same
+// quantity without the cancellation -- the same decisions up to
+// rounding, and closer to the exact value than either reference.
 
-  const int qk = (QOFF + qb * BQ) / BLK;
-  const device float* pr = proxy + ((uint)h * NQ + qb) * NK;
-  device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
-  // ONE LANE PER KEY BLOCK now that the dot is a load: the row is
-  // walked 32 blocks at a time and the kept count is a simd sum, where
-  // the fused kernel had all 32 lanes cooperate on one block's dot and
-  // step one block at a time.
-  uint n_keep = 0;
-  for (int n0 = 0; n0 < NK; n0 += 32) {
-    const int n = n0 + (int)lane;
-    uint mine = 0;
-    if (n < NK) {
-      const float dot = pr[n] * ls;
-      const bool tail  = (n == NK - 1);   // see the file header
-      const bool local = abs(qk - n) <= radius;
-      const bool sink  = (n >= sink_lo && n < sink_hi);
-      const bool keep  = (dot > thr) || local || sink || tail;
-      fl[n] = keep ? (uchar)1 : (uchar)0;
-      const int lo = n * per;
-      const int hi = min(lo + per, NKS);
-      mine = keep ? (uint)max(0, hi - lo) : 0u;
+#define SOL_COV_ROWS  16    // covariance rows a threadgroup owns
+#define SOL_COV_CHUNK 32    // key blocks staged per pass
+#define SOL_THR_QB    32    // query blocks a threshold threadgroup owns
+
+//   0:kc (VPIPE_ELT [H,N,D]) 1:mean (float [H,D]) 2:cov (float [H,D,D])
+//   3:D 4:N (int)
+// grid (D * D / SOL_COV_ROWS, H, 1) THREADS; threadgroup (D,1,1): one
+// threadgroup owns SOL_COV_ROWS rows of one head's matrix, each thread
+// one column of them.
+kernel void sol_kc_cov_mma(
+    const device VPIPE_ELT* kc   [[buffer(0)]],
+    const device float*     mean [[buffer(1)]],
+    device float*           cov  [[buffer(2)]],
+    constant int&           D    [[buffer(3)]],
+    constant int&           N    [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint  j  [[thread_index_in_threadgroup]])
+{
+  threadgroup float xs[SOL_COV_CHUNK * SOL_D];
+  const int h  = (int)tg.y;
+  const int i0 = (int)tg.x * SOL_COV_ROWS;
+  const bool live = (int)j < D;
+  const device VPIPE_ELT* kh = kc + (uint)h * N * D;
+  const float mj = live ? mean[(uint)h * D + j] : 0.0f;
+  float acc[SOL_COV_ROWS];
+  for (int r = 0; r < SOL_COV_ROWS; ++r) { acc[r] = 0.0f; }
+  for (int b0 = 0; b0 < N; b0 += SOL_COV_CHUNK) {
+    const int nb = min(SOL_COV_CHUNK, N - b0);
+    if (live) {
+      for (int c = 0; c < nb; ++c) {
+        xs[c * D + (int)j] = float(kh[(uint)(b0 + c) * D + j]) - mj;
+      }
     }
-    n_keep += simd_sum(mine);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live) {
+      for (int c = 0; c < nb; ++c) {
+        const float xj = xs[c * D + (int)j];
+        const threadgroup float* xr = xs + c * D + i0;
+        for (int r = 0; r < SOL_COV_ROWS; ++r) { acc[r] += xr[r] * xj; }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (lane == 0) {
-    kept[(uint)h * NQ + qb] = n_keep;
-    if (counts != nullptr) {
-      atomic_fetch_add_explicit(&counts[0], n_keep, memory_order_relaxed);
+  if (!live || N <= 0) { return; }
+  const float inv = 1.0f / float(N);
+  for (int r = 0; r < SOL_COV_ROWS; ++r) {
+    const int i = i0 + r;
+    if (i < D) { cov[((uint)h * D + i) * D + j] = acc[r] * inv; }
+  }
+}
+
+//   0:qc (VPIPE_ELT [H,NQ,D]) 1:mean (float [KVH,D])
+//   2:cov (float [KVH,D,D]) 3:thr (float [H,NQ])
+//   4:scale 5:tau (float) 6:D 7:NQ 8:GQA (int)
+// grid (D * ceil(NQ / SOL_THR_QB), H, 1) THREADS; threadgroup (D,1,1):
+// one threadgroup owns SOL_THR_QB query blocks of one head; thread j
+// forms column j of q^T C for each and its share of the two dots.
+kernel void sol_thr_exact_mma(
+    const device VPIPE_ELT* qc    [[buffer(0)]],
+    const device float*     mean  [[buffer(1)]],
+    const device float*     cov   [[buffer(2)]],
+    device float*           thr   [[buffer(3)]],
+    constant float&         scale [[buffer(4)]],
+    constant float&         tau   [[buffer(5)]],
+    constant int&           D     [[buffer(6)]],
+    constant int&           NQ    [[buffer(7)]],
+    constant int&           GQA   [[buffer(8)]],
+    uint3 tg   [[threadgroup_position_in_grid]],
+    uint  j    [[thread_index_in_threadgroup]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float qs[SOL_THR_QB * SOL_D];
+  threadgroup float part[2][SOL_D / 32][SOL_THR_QB];
+  const int h  = (int)tg.y;
+  const int hk = (GQA > 1) ? (h / GQA) : h;
+  const int r0 = (int)tg.x * SOL_THR_QB;
+  const int nr = min(SOL_THR_QB, NQ - r0);
+  const bool live = (int)j < D;
+  if (live) {
+    for (int r = 0; r < SOL_THR_QB; ++r) {
+      qs[r * D + (int)j] =
+          r < nr ? float(qc[((uint)h * NQ + r0 + r) * D + j]) : 0.0f;
     }
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float acc[SOL_THR_QB];
+  for (int r = 0; r < SOL_THR_QB; ++r) { acc[r] = 0.0f; }
+  if (live) {
+    const device float* ch = cov + (uint)hk * D * D;
+    for (int i = 0; i < D; ++i) {
+      const float c = ch[(uint)i * D + j];
+      for (int r = 0; r < SOL_THR_QB; ++r) { acc[r] += qs[r * D + i] * c; }
+    }
+  }
+  const float mj = live ? mean[(uint)hk * D + j] : 0.0f;
+  for (int r = 0; r < SOL_THR_QB; ++r) {
+    const float qj = live ? qs[r * D + (int)j] : 0.0f;
+    const float pv = simd_sum(acc[r] * qj);
+    const float pm = simd_sum(qj * mj);
+    if (lane == 0) {
+      part[0][sg][r] = pv;
+      part[1][sg][r] = pm;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if ((int)j < nr) {
+    const int r = (int)j;
+    float rv = 0.0f, rm = 0.0f;
+    for (int g = 0; g < (D + 31) / 32; ++g) {
+      rv += part[0][g][r];
+      rm += part[1][g][r];
+    }
+    const float ls = scale * SOL_LOG2E;
+    rm *= ls;
+    rv = max(rv, 0.0f) * ls * ls;
+    thr[(uint)h * NQ + r0 + r] = rm + tau * sqrt(rv + 1.0e-6f);
+  }
+}
+
+// sol_route_mma at a threshold computed ahead of it (sol_thr_exact_mma):
+// the same walk, `thr` in place of the diag statistics.
+//
+//   0:qc (VPIPE_ELT [H,NQ,D]) 1:kc (VPIPE_ELT [H,NK,D])
+//   2:thr (float [H,NQ])  4:flags 5:kept 6:counts, and 7..20 as
+//   sol_route_mma's (8:tau unread).
+// grid (32, H, NQ) THREADS; threadgroup (32,1,1).
+kernel void sol_route_t_mma(
+    const device VPIPE_ELT* qc      [[buffer(0)]],
+    const device VPIPE_ELT* kc      [[buffer(1)]],
+    const device float*     thr_in  [[buffer(2)]],
+    device uchar*           flags   [[buffer(4)]],
+    device uint*            kept    [[buffer(5)]],
+    device atomic_uint*     counts  [[buffer(6)]],
+    constant float&         scale   [[buffer(7)]],
+    constant int&           D       [[buffer(9)]],
+    constant int&           NK      [[buffer(10)]],
+    constant int&           NQ      [[buffer(11)]],
+    constant int&           BLK     [[buffer(12)]],
+    constant int&           BQ      [[buffer(13)]],
+    constant int&           radius  [[buffer(14)]],
+    constant int&           QOFF    [[buffer(20)]],
+    constant int&           sink_lo [[buffer(15)]],
+    constant int&           sink_hi [[buffer(16)]],
+    constant int&           per     [[buffer(17)]],
+    constant int&           NKS     [[buffer(18)]],
+    constant int&           GQA     [[buffer(19)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int h  = (int)tid.y;
+  const int qb = (int)tid.z;
+  const int hk = (GQA > 1) ? (h / GQA) : h;
+  const float ls = scale * SOL_LOG2E;
+  const device VPIPE_ELT* qbar = qc + ((uint)h * NQ + qb) * D;
+  const float thr = thr_in[(uint)h * NQ + qb];
+  sol_route_walk_(qbar, kc, flags, kept, counts, thr, h, hk, qb, D, NK,
+                  NQ, BLK, BQ, radius, QOFF, sink_lo, sink_hi, per, NKS,
+                  ls, lane);
+}
+
+// sol_route_p_mma at a threshold computed ahead of it.
+//
+//   0:proxy (float [H,NQ,NK])  2:thr (float [H,NQ])  4:flags 5:kept
+//   6:counts, and 7..20 as sol_route_p_mma's (8:tau unread).
+// grid (32, H, NQ) THREADS; threadgroup (32,1,1).
+kernel void sol_route_pt_mma(
+    const device float*     proxy   [[buffer(0)]],
+    const device float*     thr_in  [[buffer(2)]],
+    device uchar*           flags   [[buffer(4)]],
+    device uint*            kept    [[buffer(5)]],
+    device atomic_uint*     counts  [[buffer(6)]],
+    constant float&         scale   [[buffer(7)]],
+    constant int&           NK      [[buffer(10)]],
+    constant int&           NQ      [[buffer(11)]],
+    constant int&           BLK     [[buffer(12)]],
+    constant int&           BQ      [[buffer(13)]],
+    constant int&           radius  [[buffer(14)]],
+    constant int&           QOFF    [[buffer(20)]],
+    constant int&           sink_lo [[buffer(15)]],
+    constant int&           sink_hi [[buffer(16)]],
+    constant int&           per     [[buffer(17)]],
+    constant int&           NKS     [[buffer(18)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int h  = (int)tid.y;
+  const int qb = (int)tid.z;
+  const float ls = scale * SOL_LOG2E;
+  const float thr = thr_in[(uint)h * NQ + qb];
+  sol_route_p_walk_(proxy, flags, kept, counts, thr, h, qb, NK, NQ, BLK,
+                    BQ, radius, QOFF, sink_lo, sink_hi, per, NKS, ls, lane);
 }
 
 // The prefix sum, into steel's [H][NQ + 1] qb_off.

@@ -1881,6 +1881,77 @@ kernel void quant_i8_tok_r(
                          scales + tgid.y, K, tgid.y, T2.x, sgid, lane, sm);
 }
 
+// THE CONVROT TOKEN QUANTIZER: the activation rotated as ComfyUI's int8
+// ConvRot rotates it -- x H over each 256-block, H comfy_kitchen's
+// normalized REGULAR Hadamard, kron^4 of [[1,1,1,-1],[1,1,-1,1],
+// [1,-1,1,1],[-1,1,1,1]] / 2 -- then quantized per row as quant_i8_tok,
+// so the token GEMM runs a ConvRot weight's codes as they are stored.
+// The regular matrix is a SIGNED PERMUTATION of the Sylvester one this
+// file transforms with: per base-4 digit, H_reg4 = P D H_syl4 D, D
+// negating digit value 3 and P exchanging values 1 and 2 (the digit's two
+// bits). So: negate the inputs whose index has an odd count of 3-digits,
+// i8c_fwht<256>, and write Sylvester output s to index P(s), negated by
+// the same rule (P keeps the count). Dispatch, buffers and limits are
+// quant_i8_tok_r's (K % 256 == 0).
+static inline float
+convrot_sign_(uint k)
+{
+  return (popcount(k & (k >> 1) & 0x55u) & 1u) != 0u ? -1.0f : 1.0f;
+}
+
+kernel void quant_i8_tok_cr(
+    const device VPIPE_ELT* x [[buffer(0)]],
+    device char* q [[buffer(1)]],
+    device float* scales [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    I8PT_ARGS)
+{
+  threadgroup float sm[32];
+  const int G = K / 256, S = (int)T2.x / 32;
+  const int64_t base = (int64_t)tgid.y * K;
+  float v[2][8];
+  float am = 0.0f;
+#pragma clang loop unroll(full)
+  for (int nb = 0; nb < 2; ++nb) {
+    const int b = (int)sgid + nb * S;
+    const int64_t at = base + b * 256 + (int)lane * 8;
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) { v[nb][i] = 0.0f; }
+    if (b < G) {
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; i += 4) {
+        const float4 a = float4(
+            *reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(x + at + i));
+        v[nb][i]     = a.x * convrot_sign_(lane * 8u + (uint)i);
+        v[nb][i + 1] = a.y * convrot_sign_(lane * 8u + (uint)i + 1u);
+        v[nb][i + 2] = a.z * convrot_sign_(lane * 8u + (uint)i + 2u);
+        v[nb][i + 3] = a.w * convrot_sign_(lane * 8u + (uint)i + 3u);
+      }
+      i8c_fwht<256>(v[nb], lane);
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; ++i) { am = max(am, fabs(v[nb][i])); }
+    }
+  }
+  am = i8pt_row_amax(am, sgid, lane, (T2.x + 31) / 32, sm);
+  const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+#pragma clang loop unroll(full)
+  for (int nb = 0; nb < 2; ++nb) {
+    const int b = (int)sgid + nb * S;
+    if (b < G) {
+      const int64_t at = base + b * 256;
+#pragma clang loop unroll(full)
+      for (int i = 0; i < 8; ++i) {
+        const uint s = lane * 8u + (uint)i;
+        const uint p = ((s & 0x55u) << 1) | ((s & 0xAAu) >> 1);
+        const int r = clamp((int)rint(v[nb][i] * convrot_sign_(s) * inv),
+                            -127, 127);
+        q[at + p] = (char)r;
+      }
+    }
+  }
+  if (sgid == 0 && lane == 0) { scales[tgid.y] = am * (1.0f / 127.0f); }
+}
+
 kernel void swiglu_quant_i8_tok_r(
     const device VPIPE_ELT* gate [[buffer(0)]],
     const device VPIPE_ELT* up [[buffer(1)]],
@@ -2230,4 +2301,86 @@ kernel void i8_convrot_dequant(const device uchar* w      [[buffer(0)]],
     const uint i = t * 4u + j, e = e0 + i;
     if (e < n) { y[e] = (VPIPE_ELT)((float)v[i] * scale[e / div] * inv); }
   }
+}
+
+// W4A8 (ComfyUI's asym_w4a8_int8): int8 STORED at four bits. Element e's
+// nibble is byte e / 2 (low when e is even), its value codebook[code] --
+// or code - 8 with no codebook -- times its group's E4M3 relative scale
+// s_rel[e / qgroup], rounded to nearest-even and clamped to +-127: an
+// int8 code, exactly the one ComfyUI's runtime multiplies. From there
+// i8_convrot_dequant's pass: the codes un-rotated in integers (group 1:
+// no stages, for an unrotated weight), times the row scale and
+// 1 / sqrt(group), rounded once -- shared/fp8-layout.cc's
+// decode_w4a8_bf16 to the bit.
+//
+//   0:packed(uchar) 1:y(VPIPE_ELT) 2:n 3:scale(float, s_channel) 4:div
+//   5:group 6:s_rel(uchar, E4M3) 7:codebook(float[16]) 8:qgroup 9:has_cb
+// grid {ceil(n / 1024) * 256, 1, 1}, tg {256, 1, 1}.
+kernel void w4a8_convrot_dequant(const device uchar* w       [[buffer(0)]],
+                                 device VPIPE_ELT*   y       [[buffer(1)]],
+                                 const constant uint& n      [[buffer(2)]],
+                                 const device float* scale   [[buffer(3)]],
+                                 const constant uint& div    [[buffer(4)]],
+                                 const constant uint& group  [[buffer(5)]],
+                                 const device uchar* s_rel   [[buffer(6)]],
+                                 const device float* cb      [[buffer(7)]],
+                                 const constant uint& qgroup [[buffer(8)]],
+                                 const constant uint& has_cb [[buffer(9)]],
+                                 uint tg [[threadgroup_position_in_grid]],
+                                 uint t  [[thread_index_in_threadgroup]])
+{
+  threadgroup int v[1024];
+  const uint e0 = tg * 1024u;
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = t * 4u + j, e = e0 + i;
+    int q = 0;
+    if (e < n) {
+      const uint b = w[e / 2u];
+      const uint c = (e & 1u) ? (b >> 4) : (b & 15u);
+      const float val = has_cb != 0u ? cb[c] : (float)c - 8.0f;
+      const float p = val * fp8_e4m3_f_(s_rel[e / qgroup]);
+      q = (int)clamp(rint(p), -127.0f, 127.0f);
+    }
+    v[i] = q;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint st = 1u; st < group; st *= 4u) {
+    const uint base = (t / st) * st * 4u + t % st;
+    const int a0 = v[base], a1 = v[base + st];
+    const int a2 = v[base + 2u * st], a3 = v[base + 3u * st];
+    const int s = a0 + a1 + a2 + a3;
+    v[base] = s - 2 * a3;
+    v[base + st] = s - 2 * a2;
+    v[base + 2u * st] = s - 2 * a1;
+    v[base + 3u * st] = s - 2 * a0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float inv = 1.0f / (float)(1u << (ctz(group) / 2u));
+  for (uint j = 0; j < 4u; ++j) {
+    const uint i = t * 4u + j, e = e0 + i;
+    if (e < n) { y[e] = (VPIPE_ELT)((float)v[i] * scale[e / div] * inv); }
+  }
+}
+
+// W4A8 into the token layout's int8 codes for one GEMM: element e's
+// nibble through the codebook (or code - 8), times its E4M3 relative
+// scale, rounded to nearest-even and clamped -- w4a8_convrot_dequant's
+// int8 code, NOT un-rotated: the ConvRot quantizer above rotates the
+// activation to meet it. One element a thread. 0:packed 1:q 2:n 3:s_rel
+// 4:codebook 5:qgroup 6:has_cb; grid {n}.
+kernel void w4a8_to_i8(const device uchar* w       [[buffer(0)]],
+                       device char*        q       [[buffer(1)]],
+                       const constant uint& n      [[buffer(2)]],
+                       const device uchar* s_rel   [[buffer(3)]],
+                       const device float* cb      [[buffer(4)]],
+                       const constant uint& qgroup [[buffer(5)]],
+                       const constant uint& has_cb [[buffer(6)]],
+                       uint e [[thread_position_in_grid]])
+{
+  if (e >= n) { return; }
+  const uint b = w[e / 2u];
+  const uint c = (e & 1u) ? (b >> 4) : (b & 15u);
+  const float val = has_cb != 0u ? cb[c] : (float)c - 8.0f;
+  const float p = val * fp8_e4m3_f_(s_rel[e / qgroup]);
+  q[e] = (char)(int)clamp(rint(p), -127.0f, 127.0f);
 }

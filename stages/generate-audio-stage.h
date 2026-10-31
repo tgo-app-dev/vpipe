@@ -156,6 +156,7 @@ private:
   int _sol_dense_layers{};
   int _sol_key_block{};
   int _sol_local_radius{};
+  bool _sol_exact = false;   // sol_threshold "exact"
   // The plan books the ANE module under this label and grants it here.
   std::string ane_claim_label_() const;
 

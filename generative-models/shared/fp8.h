@@ -30,6 +30,16 @@
 // groups of the input columns, undone on the codes by convrot_unrotate
 // below. kI8 is never a dtype -- an I8 tensor is int8 only where a record
 // says so.
+//
+// W4A8 (kW4A8; ComfyUI's `asym_w4a8_int8`) is int8 STORED at four bits: a
+// row's codes are nibbles, two a byte (the even column low), each the
+// index of a 16-entry codebook (or, with none, code - 8); a group of
+// `group_size` (16) columns carries an E4M3 relative scale, and
+// round(codebook[code] * s_rel), clamped to +-127, IS an int8 code --
+// rotated (ConvRot) and scaled by its row (`s_channel`) exactly as kI8's.
+// Not elementwise: the code tables below do not apply to it
+// (fp8-layout.h's decode_w4a8_bf16 does).
+
 
 #include <array>
 #include <cstddef>
@@ -43,7 +53,7 @@
 
 namespace vpipe::genai::fp8 {
 
-enum class Format { kNone, kE4M3, kE5M2, kI8 };
+enum class Format { kNone, kE4M3, kE5M2, kI8, kW4A8 };
 
 // The FP8 format a safetensors dtype string names; kNone for any other
 // dtype (I8 among them: see kI8 above).

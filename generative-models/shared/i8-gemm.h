@@ -526,6 +526,17 @@ class I8GemmContext {
                            const metal_compute::SharedBuffer& b,
                            const metal_compute::SharedBuffer& y,
                            std::size_t ye, int M, int N, int K);
+  // ComfyUI's int8 CONVROT weights on the TOKEN tier, run as stored: the
+  // activation rotated as they were -- comfy_kitchen's normalized regular
+  // Hadamard over each 256-block of K -- and quantized per row into the
+  // scratch gemm_fast_quantized(gc = kTokenGroup) then reads, with the
+  // weight's codes and its row scales. False, nothing encoded, where the
+  // tier is not token, K % 256 != 0, or the kernel is missing (an older
+  // host: convrot_available() false).
+  bool quantize_token_convrot(metal_compute::ComputeEncoder& enc,
+                              const metal_compute::SharedBuffer& x,
+                              std::size_t xe, int M, int K);
+  bool convrot_available() const { return _fn_tok_cr.valid(); }
   // ...the down projection of a SwiGLU from its two halves, as
   // gemm_signed_swiglu (the product rounded to the element type first).
   bool gemm_fast_swiglu(metal_compute::ComputeEncoder& enc,
@@ -915,6 +926,7 @@ class I8GemmContext {
   int _fast_bm = 128, _fast_bn = 64; // the coarse GEMM's tile
   // What quantize_fast last left in the scratch (0 = nothing usable).
   int _fq_m = 0, _fq_k = 0, _fq_gc = 0;
+  metal_compute::ComputeFunction _fn_tok_cr;   // quant_i8_tok_cr
   metal_compute::ComputeFunction _fn_dq_s8, _fn_dq_s4;
   metal_compute::ComputeFunction _fn_s8_w8, _fn_s8_w4;
   metal_compute::ComputeFunction _fn_s8_w8_sk, _fn_s8_w4_sk;

@@ -364,6 +364,8 @@ private:
   genai::sol::Config _sol{};
   // Leading denoising steps Sol leaves dense (minimax-h3's loop only).
   int _sol_dense_steps = 0;
+  // `sol_tau_steps`: Sol-Attn's tau per denoising step; empty = sol_tau.
+  std::vector<float> _sol_tau_steps;
   // SageAttention, family-agnostic beside _sol and _i8_gemm. Carried to
   // plugin families too (VideoModelCreateArgs::sage), because the
   // families out of tree run the same flash kernel.
@@ -570,6 +572,17 @@ private:
   // this is read from the packaging -- see
   // MetalMiniMaxH3Transformer::partition_of.
   std::string _h3_partition;
+  // A PRUNED DiT's released timestep MLP: `root`'s own DiT for the
+  // partition, when it carries one (Config::time_mlp_dir); "" else.
+  std::string h3_time_mlp_dir_(
+      const std::string& root, const std::string& partition,
+      const genai::MetalMiniMaxH3Transformer::Config& dit) const;
+
+  // The per-row modality tags a KEYFRAME presentation's conditioning
+  // carries (diffusion-conditioner showed Qwen3-VL the keyframes, whose
+  // vision rows MiniMax-H3 tags video), read per beat; empty for a
+  // prompt alone, which is text throughout.
+  std::vector<int> _h3_cond_tags;
 
   // The `ref2va` conditioning that arrives beside the prompt embeds,
   // from a `video-ref-encoder`. It is one request split over three

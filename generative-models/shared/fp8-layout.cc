@@ -4,6 +4,8 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string_view>
 
@@ -37,6 +39,7 @@ struct Declared {
   std::string format;
   bool        convrot = false;
   int         group   = 256;
+  int         qgroup  = 16;   // W4A8's `group_size`
 };
 
 Declared
@@ -54,6 +57,9 @@ declared_of_(const FlexData& rec)
     if (f.contains("convrot")) { d.convrot = f.at("convrot").as_bool(false); }
     if (f.contains("convrot_groupsize")) {
       d.group = (int)f.at("convrot_groupsize").as_int(256);
+    }
+    if (f.contains("group_size")) {
+      d.qgroup = (int)f.at("group_size").as_int(16);
     }
   };
   if (o.contains("params")) { take(o.at("params")); }
@@ -123,6 +129,7 @@ format_named_(const std::string& s)
   if (s == "float8_e4m3fn" || s == "float8_e4m3") { return Format::kE4M3; }
   if (s == "float8_e5m2") { return Format::kE5M2; }
   if (s == "int8_tensorwise") { return Format::kI8; }
+  if (s == "asym_w4a8_int8") { return Format::kW4A8; }
   return Format::kNone;
 }
 
@@ -139,6 +146,67 @@ fail_(std::string* err, const std::string& m)
 {
   if (err != nullptr) { *err = m; }
   return false;
+}
+
+// A W4A8 layer (fp8.h): its packed codes and the three tensors beside
+// them, each checked against the codes' shape.
+bool
+resolve_w4a8_(const MetalLlamaWeights& w, const std::string& name,
+              const MetalLlamaWeights::TensorInfo& ti,
+              const std::string& layer, const Declared& d, Weight* out,
+              std::string* err)
+{
+  if (ti.dtype != "I8" || ti.shape.size() != 2) {
+    return fail_(err, fmt("'{}' is recorded as 'asym_w4a8_int8' but stored "
+                          "as {} of {} dims", name, ti.dtype,
+                          ti.shape.size())());
+  }
+  const std::int64_t N = ti.shape[0], K = ti.shape[1] * 2;
+  const std::string sr = layer + ".weight_s_rel";
+  const std::string sc = layer + ".weight_s_channel";
+  const std::string cb = layer + ".weight_codebook";
+  if (w.has(layer + ".weight_correction")) {
+    return fail_(err, fmt("'{}' carries a weight_correction (the asymmetric "
+                          "W4A8 form), which this build does not read",
+                          name)());
+  }
+  const auto* ri = w.info(sr);
+  const auto* ci = w.info(sc);
+  const int g = d.qgroup;
+  if (g < 4 || K % g != 0 || ri == nullptr || ri->dtype != "F8_E4M3" ||
+      ri->shape.size() != 2 || ri->shape[0] != N || ri->shape[1] != K / g) {
+    return fail_(err, fmt("'{}': W4A8 wants '{}' E4M3 [{}, {}] beside its "
+                          "[{}, {}] nibble codes", name, sr, N,
+                          g > 0 ? K / g : 0, N, K / 2)());
+  }
+  if (ci == nullptr || numel_(*ci) != (std::size_t)N ||
+      (ci->dtype != "F32" && ci->dtype != "BF16" && ci->dtype != "F16")) {
+    return fail_(err, fmt("'{}': W4A8 wants '{}', a float row scale of {}",
+                          name, sc, N)());
+  }
+  Weight x;
+  x.format = Format::kW4A8;
+  x.scale = sc;
+  x.per_row = true;
+  x.s_rel = sr;
+  x.qgroup = g;
+  if (const auto* bi = w.info(cb)) {
+    if (bi->dtype != "F32" || numel_(*bi) != 16) {
+      return fail_(err, fmt("'{}': its codebook '{}' is not 16 F32 values",
+                            name, cb)());
+    }
+    x.codebook = cb;
+  }
+  if (d.convrot) {
+    if (!convrot_group_ok(d.group) || K % d.group != 0) {
+      return fail_(err, fmt("'{}': ConvRot group {} -- a power of four "
+                            "from 4 to 1024 dividing its {} columns is what "
+                            "this build reads", name, d.group, K)());
+    }
+    x.rot_group = d.group;
+  }
+  *out = x;
+  return true;
 }
 
 }  // namespace
@@ -164,7 +232,9 @@ is_aux_name(const std::string& name) noexcept
 {
   for (const char* suf : {".weight_scale", ".scale_weight", ".input_scale",
                           ".scale_input", ".comfy_quant", ".weight_scale_2",
-                          ".pre_quant_scale", ".scaled_fp8"}) {
+                          ".pre_quant_scale", ".scaled_fp8",
+                          ".weight_s_rel", ".weight_s_channel",
+                          ".weight_codebook", ".weight_correction"}) {
     if (ends_(name, suf)) { return true; }
   }
   return name == "scaled_fp8";
@@ -189,13 +259,24 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
   int rot = 0;
   if (!declared.format.empty()) {
     const Format df = format_named_(declared.format);
-    if (df == Format::kNone || (df == Format::kI8 && !int8)) {
+    if (declared.format == "w6a8_int8") {
+      return fail_(err, fmt("'{}' is stored as 'w6a8_int8' (6-bit codes), "
+                            "which this build does not read; "
+                            "asym_w4a8_int8 and int8_tensorwise are",
+                            name)());
+    }
+    if (df == Format::kW4A8 && int8) {
+      return resolve_w4a8_(w, name, *ti, layer, declared, out, err);
+    }
+    if (df == Format::kNone || (df != Format::kE4M3 &&
+                                df != Format::kE5M2 && !int8)) {
       return fail_(err, fmt("'{}' is stored as '{}', which this build does "
                             "not read{} -- plain and scaled FP8 "
                             "(float8_e4m3fn / float8_e5m2) are",
                             name, declared.format,
-                            df == Format::kI8 ? " for this model"
-                                              : "")());
+                            df == Format::kI8 || df == Format::kW4A8
+                                ? " for this model"
+                                : "")());
     }
     if (df == Format::kI8) {
       // Signed codes, the record the only thing that says what they are.
@@ -455,6 +536,46 @@ decode_bf16(const std::uint8_t* codes, std::uint16_t* dst, std::size_t rows,
       continue;
     }
     for (std::size_t k = 0; k < cols; ++k) { put(k, t[c[k]] * s); }
+  }
+}
+
+std::int32_t
+w4a8_code(std::uint8_t nibble, float s_rel, const float* codebook)
+{
+  const float v =
+      codebook != nullptr ? codebook[nibble & 15u] : (float)(nibble & 15u) - 8;
+  // torch.round: to nearest, ties to even -- the default rounding mode.
+  const float q = std::nearbyint(v * s_rel);
+  return (std::int32_t)std::max(-127.0f, std::min(127.0f, q));
+}
+
+void
+decode_w4a8_bf16(const std::uint8_t* packed, const std::uint8_t* s_rel,
+                 const float* codebook, const std::vector<float>& scale,
+                 std::size_t rows, std::size_t cols, int qgroup,
+                 int rot_group, std::uint16_t* dst)
+{
+  std::vector<std::int32_t> row(cols);
+  const float inv = rot_group > 0 ? convrot_norm(rot_group) : 1.0f;
+  for (std::size_t r = 0; r < rows; ++r) {
+    const std::uint8_t* c = packed + r * (cols / 2);
+    const std::uint8_t* sr = s_rel + r * (cols / (std::size_t)qgroup);
+    for (std::size_t k = 0; k < cols; ++k) {
+      const std::uint8_t b = c[k / 2];
+      row[k] = w4a8_code((k & 1u) ? (std::uint8_t)(b >> 4) : b,
+                         to_f32(sr[k / (std::size_t)qgroup], Format::kE4M3),
+                         codebook);
+    }
+    if (rot_group > 0) { convrot_unrotate(row.data(), cols, rot_group); }
+    const float s = scale.empty() ? 1.0f : scale.size() > 1 ? scale[r]
+                                                              : scale[0];
+    std::uint16_t* d = dst + r * cols;
+    for (std::size_t k = 0; k < cols; ++k) {
+      const float v = (float)row[k] * s * inv;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
   }
 }
 

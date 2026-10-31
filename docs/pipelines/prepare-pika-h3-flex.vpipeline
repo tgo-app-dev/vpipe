@@ -1,0 +1,30 @@
+{
+  "id": "prepare-pika-h3-flex",
+  "stages": [
+    {
+      "id": "fetch-fl2va",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Pika-Labs/Pika-H3-Flex",
+        "model_variant": "Pika-Labs/Pika-H3-Flex-fl2va",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-ref2va",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Pika-Labs/Pika-H3-Flex",
+        "model_variant": "Pika-Labs/Pika-H3-Flex-ref2va",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

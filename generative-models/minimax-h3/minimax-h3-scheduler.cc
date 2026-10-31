@@ -102,6 +102,60 @@ MiniMaxH3Scheduler::set_sigmas(const std::vector<float>& raw)
 }
 
 bool
+MiniMaxH3Scheduler::set_sigmas_shifted(const std::vector<double>& raw)
+{
+#pragma clang fp contract(off)   // torch's float64 ops, each rounded
+  _sigmas_d.clear();
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  if (!(_shift > 0.0) || raw.size() < 2) { return false; }
+  if (raw.front() > 1.0 || raw.back() != 0.0) { return false; }
+  // `shift * sigmas / (1 + (shift - 1) * sigmas)` over a float64 tensor
+  // with Python-float scalars, then `.to(torch.float32)`.
+  std::vector<float> g;
+  g.reserve(raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    if (i > 0 && !(raw[i] < raw[i - 1])) { return false; }
+    const double s = _shift * raw[i] / (1.0 + (_shift - 1.0) * raw[i]);
+    g.push_back((float)s);
+  }
+  for (std::size_t i = 1; i < g.size(); ++i) {
+    if (!(g[i] < g[i - 1])) { return false; }
+  }
+  if (g.back() != 0.0f) { return false; }
+  _sigmas = std::move(g);
+  derive_();
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::step_renoise(const float* velocity, int step_index,
+                                 float* x, const float* noise,
+                                 std::size_t n) const
+{
+#pragma clang fp contract(off)   // torch's separate f32 ops
+  if (velocity == nullptr || x == nullptr) { return false; }
+  if (step_index < 0 || step_index >= (int)_timesteps.size()) { return false; }
+  const float sigma = _sigmas[(std::size_t)step_index];
+  const float sn = _sigmas[(std::size_t)step_index + 1];
+  if (noise == nullptr && sn != 0.0f) { return false; }
+  const float keep = 1.0f - sn;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float sv = sigma * velocity[i];
+    const float x0 = x[i] + sv;
+    if (sn == 0.0f) {
+      x[i] = x0;
+      continue;
+    }
+    const float a = keep * x0;
+    const float b = sn * noise[i];
+    x[i] = a + b;
+  }
+  return true;
+}
+
+bool
 MiniMaxH3Scheduler::set_sigmas_as_run(const std::vector<double>& sigmas)
 {
 #pragma clang fp contract(off)

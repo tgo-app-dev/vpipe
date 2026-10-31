@@ -1373,14 +1373,22 @@ TEST(sol_attention_mma, the_scratch_estimate_matches_the_allocation)
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr || !mc->valid()) { return; }
-  const int H = 8, T = 8192;
+  const int H = 8;
 
+  // T 128 puts the "exact" threshold's covariance in a buffer of its own
+  // (the exact half's output, its usual home, is too small there); the
+  // plan carries it whatever the threshold, so both are checked.
   for (int arm = 0; arm < 2; ++arm) {
     const bool want_nax = arm == 1;
     if (want_nax && !mc->supports_matrix_cores()) { break; }
     if (!want_nax) { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
     else           { ::unsetenv("VPIPE_SOL_NO_NAX"); }
-    for (const int blk : {32, 64}) {
+    struct Case { int T; bool exact; int blk; };
+    for (const Case cs : {Case{8192, false, 32}, Case{8192, false, 64},
+                          Case{8192, true, 32}, Case{8192, true, 64},
+                          Case{128, false, 64}, Case{128, true, 64}}) {
+      const int T = cs.T, blk = cs.blk;
+      const bool exact = cs.exact;
       std::string err;
       std::unique_ptr<MetalSolAttention> sol =
           MetalSolAttention::load(mc, /*bf16=*/true, &err);
@@ -1394,6 +1402,7 @@ TEST(sol_attention_mma, the_scratch_estimate_matches_the_allocation)
       cfg.enabled = true;
       cfg.tau = 1.0f;
       cfg.key_block = blk;
+      cfg.thresh = exact ? sol::Threshold::kExact : sol::Threshold::kDiag;
       {
         CommandStream st = mc->make_command_stream();
         {
@@ -1408,10 +1417,10 @@ TEST(sol_attention_mma, the_scratch_estimate_matches_the_allocation)
       const std::size_t want =
           MetalSolAttention::scratch_bytes(H, T, kD, blk, want_nax);
       const std::size_t got = sol->resident_bytes();
-      std::printf("[sol_mem] %-3s blk %3d: estimate %7.1f MB, allocated "
-                  "%7.1f MB%s\n", want_nax ? "nax" : "alu", blk,
-                  (double)want / 1048576.0, (double)got / 1048576.0,
-                  want == got ? "" : "   MISMATCH");
+      std::printf("[sol_mem] %-3s T %5d %-5s blk %3d: estimate %7.1f MB, "
+                  "allocated %7.1f MB%s\n", want_nax ? "nax" : "alu", T,
+                  exact ? "exact" : "diag", blk, (double)want / 1048576.0,
+                  (double)got / 1048576.0, want == got ? "" : "   MISMATCH");
       // EXACT, not a bound: any difference is a buffer one of them knows
       // about and the other does not, which is the whole failure this
       // catches.
@@ -1996,4 +2005,277 @@ TEST(sol_attention_mma, head_dim_64_is_a_supported_width)
                 want_nax ? "nax" : "alu", r2);
     EXPECT_TRUE(std::isfinite(r2) && r2 > 0.0 && r2 < 0.5);
   }
+}
+
+namespace {
+
+// The GPU's routing restated on the CPU, for the THRESHOLD's sake: the
+// centroids at its own block sizes rounded as it stores them (f16), the
+// threshold in either form -- "diag" from the key centroids' per-channel
+// variance, "exact" from their centred covariance -- the keep rule
+// (proxy over threshold, the local band, the tail block), and the count
+// it reports, in the exact kernel's key blocks.
+long long
+route_count_(const std::vector<float>& q, const std::vector<float>& k, int H,
+             int T, int BQ, int BLK, int BK, float scale, float tau,
+             bool exact)
+{
+  const int D = kD;
+  const int NQ = (T + BQ - 1) / BQ, NK = (T + BLK - 1) / BLK;
+  const int per = BLK / BK, NKS = (T + BK - 1) / BK;
+  const float ls = scale * 1.44269504088896340736f;
+  auto r16 = [](float x) { return (float)(_Float16)x; };
+  auto centroid = [&](const std::vector<float>& x, int h, int t0, int len,
+                      float* out) {
+    for (int d = 0; d < D; ++d) {
+      float s = 0.0f;
+      for (int t = t0; t < t0 + len; ++t) {
+        s += r16(x[((std::size_t)h * T + t) * D + d]);
+      }
+      out[d] = r16(s * (1.0f / (float)len));
+    }
+  };
+  long long kept = 0;
+  std::vector<float> kc((std::size_t)NK * D), qb((std::size_t)D);
+  std::vector<double> mu((std::size_t)D), var((std::size_t)D);
+  std::vector<double> cov((std::size_t)D * D);
+  for (int h = 0; h < H; ++h) {
+    for (int n = 0; n < NK; ++n) {
+      const int t0 = n * BLK;
+      centroid(k, h, t0, std::min(BLK, T - t0), kc.data() + (std::size_t)n * D);
+    }
+    for (int d = 0; d < D; ++d) {
+      double s = 0.0, s2 = 0.0;
+      for (int n = 0; n < NK; ++n) {
+        const double x = kc[(std::size_t)n * D + d];
+        s += x; s2 += x * x;
+      }
+      mu[(std::size_t)d] = s / NK;
+      var[(std::size_t)d] = std::max(s2 / NK - mu[d] * mu[d], 0.0);
+    }
+    if (exact) {
+      for (int i = 0; i < D; ++i) {
+        for (int j = 0; j < D; ++j) {
+          double s = 0.0;
+          for (int n = 0; n < NK; ++n) {
+            s += ((double)kc[(std::size_t)n * D + i] - mu[(std::size_t)i]) *
+                 ((double)kc[(std::size_t)n * D + j] - mu[(std::size_t)j]);
+          }
+          cov[(std::size_t)i * D + j] = s / NK;
+        }
+      }
+    }
+    for (int b = 0; b < NQ; ++b) {
+      const int t0 = b * BQ;
+      centroid(q, h, t0, std::min(BQ, T - t0), qb.data());
+      double rm = 0.0, rv = 0.0;
+      for (int i = 0; i < D; ++i) { rm += qb[(std::size_t)i] * mu[(std::size_t)i]; }
+      if (exact) {
+        for (int i = 0; i < D; ++i) {
+          double p = 0.0;
+          for (int j = 0; j < D; ++j) {
+            p += cov[(std::size_t)i * D + j] * qb[(std::size_t)j];
+          }
+          rv += qb[(std::size_t)i] * p;
+        }
+      } else {
+        for (int i = 0; i < D; ++i) {
+          rv += (double)qb[(std::size_t)i] * qb[(std::size_t)i] *
+                var[(std::size_t)i];
+        }
+      }
+      const double thr = rm * ls + tau * std::sqrt(std::max(rv, 0.0) *
+                                                       ls * ls + 1.0e-6);
+      const int qk = (b * BQ) / BLK;
+      for (int n = 0; n < NK; ++n) {
+        double dot = 0.0;
+        for (int i = 0; i < D; ++i) {
+          dot += (double)qb[(std::size_t)i] * kc[(std::size_t)n * D + i];
+        }
+        const bool keep = dot * ls > thr || std::abs(qk - n) <= 1 ||
+                          n == NK - 1;
+        if (keep) {
+          const int lo = n * per;
+          kept += std::max(0, std::min(lo + per, NKS) - lo);
+        }
+      }
+    }
+  }
+  return kept;
+}
+
+}  // namespace
+
+// THE "exact" THRESHOLD ROUTES AS ITS DEFINITION SAYS.
+//
+// The published Sol-Attn's second form: a query block's proxy spread
+// over the key blocks taken with the key centroids' FULL covariance,
+// q^T C q, where "diag" keeps only C's diagonal. On the GPU it is two
+// passes ahead of the route (sol_kc_cov_mma, sol_thr_exact_mma) and a
+// route that reads the thresholds; here every arm is held to the routing
+// restated on the CPU (route_count_), and so is "diag", which is what
+// says the restatement is the GPU's.
+//
+// THE KEYS ARE BUILT SO THE TWO FORMS DISAGREE: a common offset (which
+// a raw second moment would have to cancel, as the published bf16 form
+// does) and two directions the block centroids move along together, so
+// C is far from diagonal. Queries lean on one of them. On data whose C
+// were diagonal the two would route alike and this would prove nothing.
+//
+// Arms: the ALU kernel; on matrix cores the GEMM proxy and the fused
+// route (VPIPE_SOL_NO_PROXY_GEMM). And at tau = -inf, every block kept
+// either way, exact and diag are the same bytes.
+TEST(sol_attention_mma, the_exact_threshold_routes_as_its_definition)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 4, T = 4096, BLK = 64;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 12, 0.35f, 0x5eedc0deu);
+  {
+    std::uint32_t s = 0xc0ffee11u;
+    std::vector<float> off((std::size_t)kD), u((std::size_t)kD),
+        w((std::size_t)kD);
+    for (auto& x : off) { x = 0.6f * uni_(s); }
+    for (auto& x : u) { x = uni_(s); }
+    for (auto& x : w) { x = uni_(s); }
+    for (int h = 0; h < H; ++h) {
+      for (int t = 0; t < T; ++t) {
+        const float a = std::sin(0.0021f * (float)t + 0.7f * (float)h);
+        const float b = std::cos(0.0013f * (float)t + 0.3f * (float)h);
+        float* kr = k.data() + ((std::size_t)h * T + t) * kD;
+        float* qr = q.data() + ((std::size_t)h * T + t) * kD;
+        for (int i = 0; i < kD; ++i) {
+          kr[i] += off[(std::size_t)i] + 0.35f * a * u[(std::size_t)i] +
+                   0.25f * b * w[(std::size_t)i];
+          qr[i] += 0.3f * u[(std::size_t)i];
+        }
+      }
+    }
+  }
+  const float scale = 1.0f / std::sqrt((float)kD);
+  struct Arm { const char* name; bool nax; bool fused; };
+  const Arm arms[] = {{"alu", false, true}, {"nax-gemm", true, false},
+                      {"nax-fused", true, true}};
+  for (const Arm& a : arms) {
+    if (a.nax && !mc->supports_matrix_cores()) { continue; }
+    if (!a.nax) { ::setenv("VPIPE_SOL_NO_NAX", "1", 1); }
+    else        { ::unsetenv("VPIPE_SOL_NO_NAX"); }
+    if (a.fused) { ::setenv("VPIPE_SOL_NO_PROXY_GEMM", "1", 1); }
+    else         { ::unsetenv("VPIPE_SOL_NO_PROXY_GEMM"); }
+    std::string err;
+    std::unique_ptr<MetalSolAttention> sol =
+        MetalSolAttention::load(mc, /*bf16=*/false, &err);
+    ASSERT_TRUE(sol != nullptr);
+    if (!sol) { std::printf("[sol-mma] %s\n", err.c_str()); return; }
+    ASSERT_TRUE(sol->exact_available());
+    const SharedBuffer qb = up_(mc, q, false), kb = up_(mc, k, false),
+                       vb = up_(mc, v, false);
+    SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+    ASSERT_TRUE(!qb.empty() && !o.empty());
+    auto route = [&](bool exact, float tau, std::vector<float>* out) {
+      sol::Config cfg;
+      cfg.enabled = true;
+      cfg.tau = tau;
+      cfg.local_radius = 1;
+      cfg.key_block = BLK;
+      cfg.thresh = exact ? sol::Threshold::kExact : sol::Threshold::kDiag;
+      sol->reset_counts();
+      CommandStream st = mc->make_command_stream();
+      {
+        ComputeEncoder e = st.begin_compute();
+        if (!sol->encode(e, qb, kb, vb, o, H, T, kD, scale, cfg, &err)) {
+          std::printf("[sol-mma] encode: %s\n", err.c_str());
+          return -1LL;
+        }
+      }
+      if (!st.commit().wait_ok(&err)) { return -1LL; }
+      if (out != nullptr) {
+        const auto* p = static_cast<const _Float16*>(o.contents());
+        out->assign(p, p + (std::size_t)H * T * kD);
+      }
+      return sol->exact_blocks();
+    };
+    const int BQ = sol->query_block(), BK = sol->key_block_unit();
+    const long long total =
+        (long long)H * ((T + BQ - 1) / BQ) * ((T + BK - 1) / BK);
+    for (const float tau : {0.5f, 1.0f, 1.75f}) {
+      const long long gd = route(false, tau, nullptr);
+      const long long ge = route(true, tau, nullptr);
+      const long long cd =
+          route_count_(q, k, H, T, BQ, BLK, BK, scale, tau, false);
+      const long long ce =
+          route_count_(q, k, H, T, BQ, BLK, BK, scale, tau, true);
+      std::printf("[sol-mma] %-9s tau %.2f: diag kept %lld (cpu %lld), "
+                  "exact kept %lld (cpu %lld) of %lld -- %.1f%% vs "
+                  "%.1f%%\n", a.name, (double)tau, gd, cd, ge, ce, total,
+                  100.0 * (double)gd / (double)total,
+                  100.0 * (double)ge / (double)total);
+      // Near-ties aside -- summation orders differ -- the GPU keeps what
+      // the definition keeps, in both forms.
+      const long long tol = std::max<long long>(8, total / 500);
+      EXPECT_TRUE(gd > 0 && std::llabs(gd - cd) <= tol);
+      EXPECT_TRUE(ge > 0 && std::llabs(ge - ce) <= tol);
+      // ...and the two forms are different routings on these keys.
+      EXPECT_TRUE(std::llabs(ce - cd) > 5 * tol);
+    }
+    std::vector<float> od, oe;
+    route(false, -1.0e30f, &od);
+    route(true, -1.0e30f, &oe);
+    EXPECT_TRUE(!od.empty() && od == oe);
+  }
+  ::unsetenv("VPIPE_SOL_NO_NAX");
+  ::unsetenv("VPIPE_SOL_NO_PROXY_GEMM");
+}
+
+// THE KEPT COUNT CARRIES PAST 32 BITS. The route kernels add each query
+// block's kept blocks to one counter that a forward reads back -- and at
+// video geometry a forward keeps more than 2^32 (2K x 124 frames at 22%
+// is 4.7e9), which wrapped to a few per cent and reported a higher tau
+// keeping MORE. The add that crosses the line now carries into the
+// second word. Started just under 2^32 (VPIPE_SOL_COUNT_SEED, the test
+// hook), one call must land exactly the seed plus what it keeps from 0.
+TEST(sol_attention_mma, the_kept_count_carries_past_32_bits)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const int H = 4, T = 4096;
+  std::vector<float> q, k, v;
+  clustered_(q, k, v, H, T, 12, 0.35f, 0x0ca77135u);
+  std::string err;
+  std::unique_ptr<MetalSolAttention> sol =
+      MetalSolAttention::load(mc, /*bf16=*/false, &err);
+  ASSERT_TRUE(sol != nullptr);
+  if (!sol) { return; }
+  const SharedBuffer qb = up_(mc, q, false), kb = up_(mc, k, false),
+                     vb = up_(mc, v, false);
+  SharedBuffer o = mc->make_shared_buffer((std::size_t)H * T * kD * 2);
+  ASSERT_TRUE(!qb.empty() && !o.empty());
+  sol::Config cfg;
+  cfg.enabled = true;
+  cfg.tau = 1.0f;
+  auto run = [&]() {
+    sol->reset_counts();
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      if (!sol->encode(e, qb, kb, vb, o, H, T, kD, 0.088f, cfg, &err)) {
+        return -1LL;
+      }
+    }
+    return st.commit().wait_ok(&err) ? sol->exact_blocks() : -1LL;
+  };
+  ASSERT_TRUE(run() >= 0);   // the scratch, before its counter is read
+  ::unsetenv("VPIPE_SOL_COUNT_SEED");
+  const long long plain = run();
+  const long long seed = 0xffffff00LL;
+  ::setenv("VPIPE_SOL_COUNT_SEED", "0xffffff00", 1);
+  const long long carried = run();
+  ::unsetenv("VPIPE_SOL_COUNT_SEED");
+  std::printf("[sol-mma] kept %lld from 0; from 0x%llx, %lld (seed + kept "
+              "%lld)\n", plain, seed, carried, seed + plain);
+  EXPECT_TRUE(plain > 256 && carried == seed + plain);
+  EXPECT_TRUE(carried > 0xffffffffLL);
 }

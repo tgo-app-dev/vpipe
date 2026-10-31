@@ -74,6 +74,14 @@ inline constexpr std::string_view kSolKeyBlock = "sol_key_block";
 inline constexpr std::string_view kSolDenseLayers = "sol_dense_layers";
 // Key blocks either side of the query's own, kept exact. Int; default 1.
 inline constexpr std::string_view kSolLocalRadius = "sol_local_radius";
+// How the routing threshold estimates the spread of a query block's
+// proxy scores: "diag" (default) from the key centroids' per-channel
+// variance, "exact" from their full covariance -- the published
+// Sol-Attn's two forms. Text; a host whose kernels predate "exact"
+// refuses it by name.
+inline constexpr std::string_view kSolThreshold = "sol_threshold";
+inline constexpr std::string_view kSolThreshDiag = "diag";
+inline constexpr std::string_view kSolThreshExact = "exact";
 
 // ---- MotionCache ----------------------------------------------------
 //

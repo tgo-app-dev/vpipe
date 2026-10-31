@@ -46,6 +46,14 @@
 // noise, so only a model whose widening carries rot_group takes it; to
 // any other int8 is refused as before, by name.
 //
+// W4A8, under the same opt-in: a record {"format": "asym_w4a8_int8",
+// "group_size": 16, "convrot": ...} over I8 nibble codes [N, K / 2] and
+// `<layer>.weight_s_rel` (E4M3, [N, K / group_size]),
+// `<layer>.weight_s_channel` (the row scale, [N]) and an optional
+// `<layer>.weight_codebook` ([16]); fp8.h says how they make an int8
+// code. A `weight_correction` (the asymmetric form) and the 6-bit
+// `w6a8_int8` are refused by name.
+//
 // `input_scale` / `scale_input` are ACTIVATION scales for an FP8 matmul.
 // A model that dequantizes its weights and multiplies in bf16 has no use
 // for them, so they are bookkeeping here, exactly like the markers.
@@ -78,6 +86,10 @@ struct Weight {
   std::string scale;              // the scale tensor's name; "" = unscaled
   bool        per_row = false;    // one scale per output row (else one)
   int         rot_group = 0;      // int8 ConvRot: its group; 0 = unrotated
+  // W4A8: the relative scales' and the codebook's names ("" = none: code
+  // - 8), and the columns a relative scale covers. `scale` is s_channel.
+  std::string s_rel, codebook;
+  int         qgroup = 0;
 };
 
 // A whole checkpoint's FP8 tensors, and the tensors that belong to the
@@ -136,6 +148,20 @@ std::size_t translate_torchao(MetalLlamaWeights& w);
 void decode_bf16(const std::uint8_t* codes, std::uint16_t* dst,
                  std::size_t rows, std::size_t cols, Format f,
                  const std::vector<float>& scale, int rot_group = 0);
+// W4A8 (kW4A8) to bf16, [rows, cols] with `cols` the LOGICAL width:
+// each code to its int8 code (fp8.h), un-rotated exactly, times the row
+// scale and convrot_norm, rounded once -- kI8's decode of the same
+// codes, and the GPU widening (w4a8_convrot_dequant) to the bit.
+// `packed` [rows, cols / 2], `s_rel` E4M3 [rows, cols / qgroup],
+// `codebook` 16 floats or null.
+void decode_w4a8_bf16(const std::uint8_t* packed, const std::uint8_t* s_rel,
+                      const float* codebook, const std::vector<float>& scale,
+                      std::size_t rows, std::size_t cols, int qgroup,
+                      int rot_group, std::uint16_t* dst);
+// One code's int8 value: round(codebook[c] * s_rel), clamped to +-127.
+std::int32_t w4a8_code(std::uint8_t nibble, float s_rel,
+                       const float* codebook);
+
 void decode_f32(const std::uint8_t* codes, float* dst, std::size_t rows,
                 std::size_t cols, Format f, const std::vector<float>& scale,
                 int rot_group = 0);

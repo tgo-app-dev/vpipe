@@ -230,6 +230,15 @@ struct ReferencePlan {
   std::uint64_t condition_noise_seed = 0;
 };
 
+// The CONDITION NOISE AUGMENTATION on `n` packed values in place:
+// `aug*z + (1-aug)*noise`, the noise a stream of its own from `seed`
+// (one stream per condition, restarted at the same seed, as ComfyUI's
+// is -- so a condition packs the same rows wherever it sits). `aug` at
+// or above 1 leaves them. The keyframe anchors generate-video packs and
+// the references this encoder packs take the same rule.
+void augment_condition_values(float* v, std::size_t n, double aug,
+                              std::uint64_t seed);
+
 // What the encoders produced, in packed order.
 struct EncodedReferences {
   // One entry per reference, in read order -- what

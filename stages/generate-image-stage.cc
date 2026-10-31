@@ -79,6 +79,9 @@ bf16_to_f32_(std::uint16_t b)
 constexpr SpecExtra kReferenceModeChoices[] = {
   {spec_key::kChoices, "auto,latch,per_beat"},
 };
+constexpr SpecExtra kSolThreshChoices[] = {
+  {spec_key::kChoices, "diag,exact"},
+};
 constexpr SpecExtra kI8TierChoices[] = {
   {spec_key::kChoices, "accurate,fast,token,token_plain"},
 };
@@ -365,6 +368,15 @@ const ConfigKey kAttrs[] = {
           "blocks were measured and are worse on both counts, so they "
           "are not offered",
    .def_int = 0},
+  {.key = "sol_threshold", .type = ConfigType::String, .required = false,
+   .doc = "how Sol-Attn's routing estimates the spread of a query block's "
+          "proxy scores, which sol_tau counts in: 'diag' (default) from "
+          "the key centroids' per-channel variance, 'exact' from their "
+          "full covariance -- the published Sol-Attn's two forms. The two "
+          "keep different fractions of the key blocks at one tau, so a "
+          "tau chosen for one does not carry over to the other. "
+          "Open-H3-Regenerate-2K's own engine runs its refine on 'exact'",
+   .def_str = "diag", .extra = kSolThreshChoices},
   {.key = "sol_local_radius", .type = ConfigType::Int, .required = false,
    .doc = "key blocks either side of a query's own block that are always "
           "exact, never routed. A block centroid is least representative "
@@ -938,6 +950,16 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
                             _sol.dense_layers);
   genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
                             _sol.local_radius);
+  {
+    const std::string t = attr_str("sol_threshold");
+    genai::sol::Threshold th = genai::sol::Threshold::kDiag;
+    if (!t.empty() && !genai::sol::parse_threshold(t, &th)) {
+      fail_config(fmt("GenerateImageStage('{}'): sol_threshold must be 'diag' or "
+                      "'exact' (got '{}')", this->id(), t));
+    }
+    genai::accel::set_text(&_accel, genai::accel::kSolThreshold,
+                           genai::sol::threshold_name(th));
+  }
   // The ANE tier. An empty `ane_templates` does NOT disable it: a family
   // that can emit its own graph needs no template, and only the family
   // knows whether it can, so the decision belongs there and not here.

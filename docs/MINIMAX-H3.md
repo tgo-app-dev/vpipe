@@ -61,6 +61,13 @@ arrives in **8–16 steps** instead of 30+.
     - [Fetch it, then name it](#fetch-it-then-name-it)
     - [What makes it different](#what-makes-it-different)
     - [What it costs](#what-it-costs-1)
+  - [Six steps, any reference — Pika H3 Flex](#six-steps-any-reference--pika-h3-flex)
+    - [Get the two adapters](#get-the-two-adapters)
+    - [What the manifest decides](#what-the-manifest-decides)
+    - [The rest of the release's recipe](#the-rest-of-the-releases-recipe)
+    - [Where vpipe differs from the release](#where-vpipe-differs-from-the-release)
+    - [What six steps cost](#what-six-steps-cost)
+    - [Checked without the release](#checked-without-the-release)
   - [Three steps, streamed — TaoMate-H3](#three-steps-streamed--taomate-h3)
   - [A draft at 2K — Open-H3-Regenerate-2K](#a-draft-at-2k--open-h3-regenerate-2k)
     - [Get it, then run it](#get-it-then-run-it)
@@ -188,6 +195,14 @@ you want to see the model work before spending the hours and the 115 GB.
   — joins those four parts into one 40-second file through the concat
   demuxer, with no model and no hand-written ffmpeg. The one lossy encode in
   the chain.
+- **[`prepare-pika-h3-flex.vpipeline`](pipelines/prepare-pika-h3-flex.vpipeline)**
+  / **[`pika-h3-flex-text-to-video.vpipeline`](pipelines/pika-h3-flex-text-to-video.vpipeline)**,
+  **[`…-first-frame-to-video`](pipelines/pika-h3-flex-first-frame-to-video.vpipeline)**,
+  **[`…-reference-to-video`](pipelines/pika-h3-flex-reference-to-video.vpipeline)**
+  — fetch Pika Labs' **six-step** adapters for both partitions and run text,
+  an opening frame, or references through them, each on the schedule its
+  adapter's manifest names (see
+  [Six steps, any reference](#six-steps-any-reference--pika-h3-flex)).
 - **[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)**
   / **[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline)**
   — fetch TaoLiveAIGC's **3-step** adapter and run its **streaming** method:
@@ -660,6 +675,17 @@ fetch the adapter first (see [Fewer steps](#fewer-steps--the-turbo-lora)).
 If you would rather not, delete the `lora` and `lora_scale` keys from
 `minimax-h3-model-config` and put `steps` back up to 8; everything else in
 the graph is the same.
+
+**Show the keyframes to the conditioner too.** Both references hand Qwen3-VL
+each keyframe ahead of the prompt — `<Picture 1>: ` and a vision block for the
+first frame, `<Picture 2>: ` for the last — so a prompt can say "the woman in
+image 1" and mean something. Wire the same resized picture into
+`diffusion-conditioner`'s `ref_image` port (port 3) and the last frame into
+`ref_image2` (port 4). The conditioner then loads its vision tower, the
+presentation gains the pictures' tokens (390 at 832 × 480, 1008 at
+1344 × 768), and `generate-video` tags those rows as video, as the model
+expects. Leave the ports unwired and the conditioning is the prompt alone,
+as this example has it.
 
 `frames` is **124**, not the 120 the text-to-video examples use, because H3
 chunks video 17 frames at a time keeping 5 latents — any count is rounded up
@@ -2101,10 +2127,9 @@ rather than applied at runtime, move the details a little.
 adapter runs exactly what its bf16 decode does. Prefer the scaled form,
 because plain FP8 flushes the small values a LoRA is made of.
 
-Not supported: Comfy-Org's `…_pruned_fp8_scaled` files. The FP8 in them
-reads, but *pruned* H3 is a different network (a table-driven AdaLN in
-place of the time embedder), and this build does not run it in any
-precision.
+Comfy-Org's `…_pruned_fp8_scaled` files read too: they are H3 in
+ComfyUI's *pruned* form, described under [Pruned files](#pruned-files)
+below.
 
 ### int8 checkpoints — community DiTs saved by ComfyUI
 
@@ -2123,8 +2148,10 @@ ComfyUI's model state:
 Point `generate-video`'s `dit_dir` at the file, as for lightx2v's FP8 one.
 The prefix is dropped when the file is opened, the dimensions are read
 off the tensors, and the qkv is read flat. A file saved this way is
-recognised by its prefix. A fused, unprefixed file with no config is
-refused, because nothing in it says which order its qkv is in.
+recognised by its prefix, or, saved with bare names as Comfy-Org's own
+files are, by the pruned form's `adaln_t_table`, which only ComfyUI
+writes. Any other fused, unprefixed file with no config is refused,
+because nothing in it says which order its qkv is in.
 
 **int8.** Each quantized projection is a `comfy_quant` record,
 `{"format": "int8_tensorwise", ...}`, over `I8` codes and their
@@ -2148,10 +2175,27 @@ bf16 bit for bit, and within one bf16 rounding of comfy_kitchen's
 comfy_kitchen builds it). A threadgroup takes 1024 elements, one radix-4
 stage per base-4 digit of the index. Run-time LoRAs apply over the
 widened weight. The ANE leaves int8 projections to the GPU, and the
-int8 GEMM tiers leave them on the accurate route, as they do FP8. Only
-models that opt in read int8; for every other reader, LoRA files
-included, it stays refused by name. A host built before these kernels
-runs FP8 checkpoints as before and refuses an int8 one by name.
+int8 GEMM tiers leave them on the accurate route, as they do FP8 — with
+one exception, below. Only models that opt in read int8; for every other
+reader, LoRA files included, it stays refused by name. A host built
+before these kernels runs FP8 checkpoints as before and refuses an int8
+one by name.
+
+**On the `token` tier, the codes run as stored.** A ConvRot-256 file's
+codes are already the token tier's layout — int8, one scale per output
+row over the whole input — only in ConvRot's basis. So on a Mac with
+matrix cores (the M5 family), with `i8_gemm` on at `i8_gemm_tier: token`,
+nothing is widened or converted: the activation is rotated the same way
+before it is quantized per token, and the int8 GEMM runs over the file's
+codes. ConvRot's regular Hadamard is a signed permutation of the
+Sylvester one the tier already rotates by, so the rotation costs no more
+than the tier's own. The load line counts the projections that do
+("… ComfyUI ConvRot projection(s) run their codes as stored").
+MEASURED on a base M5 at H3's widths (two blocks, 5248 rows): a forward
+**1.37×** faster than widening per GEMM. On a small test model its
+output is 1.4% from the same weights run dense, closer than the token
+tier comes on a bf16 checkpoint (1.9%): the file's codes need no second
+quantization. On an M4 the codes are widened per GEMM as before.
 
 MEASURED on an M5 Pro (24 GB) with H3's **Ref2VA** DiT requantized this
 way (34.0 GB against 66.3 GB of bf16). The run was 832×480×39 at seed 7,
@@ -2174,6 +2218,85 @@ as for the released weights (see
 [The released weights, either partition](#the-released-weights-either-partition)).
 For a Ref2VA-based file, select a record registered with
 `model_type: minimax-h3-ref2va`; a bare path is taken as FL2VA.
+
+#### Pruned files
+
+Many community files are saved in ComfyUI's *pruned* form (named
+`…_pruned`), and so are Comfy-Org's own (`…_pruned_bf16`,
+`…_pruned_fp8_scaled`, `…_pruned_int8_convrot`); another example is
+[Winnougan/Cobijada_Minimax-H3_Hybrid_Pruned_ComfyUI](https://huggingface.co/Winnougan/Cobijada_Minimax-H3_Hybrid_Pruned_ComfyUI),
+in BF16, int8 ConvRot and W4A8. The timestep MLP is gone. In its place
+is a table, `adaln_t_table` (1025 × 8), of points along the
+time-embedding curve, and every AdaLN projection reads an 8-wide point
+instead of the 2,688-wide embedding: `[96768, 8]` a block, where the
+released form's is `[96768, 2688]`.
+
+- **The point:** for a timestep t (clamped to 0…1), the lerp of the
+  table's two rows around t × 1024.
+- **The modulation:** the projection applied to that point with no SiLU,
+  summed in f32 and rounded once to bf16, as ComfyUI computes it. The
+  projections are held for the whole run as the file stores them (about
+  77 MB at bf16), so the AdaLN bake does not run: it would hold more than
+  it retires.
+
+Point `dit_dir` at the file as for any other ComfyUI file. Comfy-Org's
+`…_pruned_w6a8` files (6-bit codes) are refused by name.
+
+**W4A8** (`"format": "asym_w4a8_int8"`). Each projection is 4-bit codes,
+two to a byte (the even column in the low nibble), read through a
+16-entry codebook when the file carries one (`weight_codebook`) or as
+code − 8 when it does not. Each group of 16 columns has an E4M3 relative
+scale (`weight_s_rel`), and each row has a scale (`weight_s_channel`).
+The code times its relative scale, rounded half to even and clamped to
+±127, is an int8 code. Those int8 codes are ConvRot-rotated, as an int8
+file's are, and widen the same way: un-rotated exactly in integers, then
+times the row scale over √256, rounded once. The weights stay 4-bit in
+memory: the W4A8 file above is 12.5 GB, its int8 twin 21.0 GB. On the
+`token` tier with matrix cores, the int8 codes are made from the nibbles
+before each GEMM and run as stored (above): MEASURED **1.34×** a forward
+against widening, on the same base M5 geometry. On an M4 Pro, image to
+video at 832×480×124 under a six-step adapter, the W4A8 file ran as fast
+as the int8 one (18.9 minutes end to end each) with a 17.2 GB peak
+against 26.0, and its clip followed the int8 clip beat for beat. A file
+with a weight correction (`weight_correction`) is refused by name.
+
+**LoRAs.** Every kind applies; what differs is how much of the released
+model it needs.
+
+- **Converted for the pruned form.** Applies as written. Its AdaLN
+  modules are 8 wide, or come as ComfyUI weight diffs
+  (`adaln_proj.linear.diff` / `.diff_b`, the form some pruned Turbo
+  conversions use). A diff is added to the projection at the adapter's
+  strength, as ComfyUI adds it.
+- **Trained on the full model.** Its AdaLN modules are 2,688 wide, and
+  ComfyUI skips them. vpipe carries them onto the curve instead. The
+  pruned form reads the point c(t) where the released form read
+  SiLU(emb(t)), and the two are related by a fixed 2,688 × 8 basis U and
+  a mean m, SiLU(emb(t)) ≈ U c(t) + m. The table is the time
+  embedding's principal subspace: 8 dimensions hold all but about
+  2 × 10⁻⁹ of its energy, and the fit leaves a residual of about
+  2 × 10⁻⁵. So a module's B·A becomes B·(A U) on the projection and
+  B·(A m) on its bias. U and m are fitted once from the released timestep
+  MLP, so this needs the **released checkpoint under the model root**:
+  the graph's own partition of `hf_dir`. Without it the modules are
+  skipped, with a warning.
+- **Changing the time embedding itself.** A full-model LoRA's
+  `time_embedder` modules, or a flow-map adapter such as
+  [HyperFlow](#eight-steps--hyperflow), which blends two timestep MLPs.
+  The pruned file has no MLP for them to change, so vpipe runs them on the
+  released checkpoint's and puts the result on the curve. Their
+  embeddings do not stay on it: HyperFlow puts 5–36% of the embedding
+  off the curve, moving block 0's modulation by 6–49%. That remainder is
+  added back through the released checkpoint's AdaLN projections, once
+  per run, for the rows the schedule uses. The pass reads the released
+  AdaLN weights (about 26 GB at bf16, one block at a time) and keeps a
+  small table per row (booked in the resource plan). It needs an
+  unquantized released checkpoint under the model root. Without one, a
+  flow map is refused and a LoRA's `time_embedder` modules are skipped,
+  with a warning. MEASURED on an M4 Pro with HyperFlow (832×480×60, 8
+  steps, the int8 pruned file): 7.6% of the run's embedding off the
+  curve, 147 MB of tables, and the run as long as on the released DiT
+  (820 s end to end each) at a 26.7 GB peak against 46.4.
 
 ### Eight steps — HyperFlow
 
@@ -2289,6 +2412,217 @@ vpipe that is `sol_dense_steps: 2`, `sol_dense_layers: 2` and `sol_tau: 1.0` on
 unrouted model exactly, but the combination's picture quality has not been
 measured here — judge it on a seed you know. See
 [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing).
+
+### Six steps, any reference — Pika H3 Flex
+
+[Pika H3 Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex) (Pika Labs) is
+a post-training of both H3 transformers for **six sampling steps**,
+published as two rank-128 adapters: `fl2va/` for the FL2VA weights (text,
+first frame, last frame, both) and `ref2va/` for the Ref2VA weights (up to
+twelve image, video and audio references). It generates at 480p and 768p,
+5 to 15 seconds at 24 fps, with the soundtrack, the way the base model does.
+
+Each adapter comes with a `manifest.json` that pins **how it must be
+sampled**, and that is most of what is different about it. The release says
+outright that a generic six-step Euler run is not equivalent; vpipe reads the
+manifest and runs what it says (see below).
+
+#### Get the two adapters
+
+[`prepare-pika-h3-flex.vpipeline`](pipelines/prepare-pika-h3-flex.vpipeline)
+fetches both adapters with their manifests (2.8 GB each) and registers them
+as `Pika-Labs/Pika-H3-Flex-fl2va` and `Pika-Labs/Pika-H3-Flex-ref2va`:
+
+```sh
+vpipe --launch docs/pipelines/prepare-pika-h3-flex.vpipeline
+```
+
+Not fetched: the copy of MiniMax-H3 the repository bundles (about 210 GB —
+the MiniMaxAI weights from [Step 1](#step-1--prepare-the-model) are the same
+ones) and `comfy/loras/`, bf16 conversions that carry no manifest.
+
+Three graphs use them, each the matching step-2 graph with the adapter named
+on the config stage, at 832 × 480 and 124 frames:
+
+- [`pika-h3-flex-text-to-video.vpipeline`](pipelines/pika-h3-flex-text-to-video.vpipeline)
+  — a prompt (`t2va`).
+- [`pika-h3-flex-first-frame-to-video.vpipeline`](pipelines/pika-h3-flex-first-frame-to-video.vpipeline)
+  — a prompt and an opening frame (`i2va`); drop a `reference.jpg` beside it.
+  Add a last frame as in [More than text in](#more-than-text-in) for `fl2va`.
+- [`pika-h3-flex-reference-to-video.vpipeline`](pipelines/pika-h3-flex-reference-to-video.vpipeline)
+  — the release's own Ref2VA example on the Ref2VA weights (`ref2va`): a
+  character sheet, an environment and a motion clip with its sound, under the
+  release's prompt. Copy `character.jpg`, `environment.jpg` and `motion.mp4`
+  from the repository's `examples/assets/ref2va/` beside it.
+
+```json
+"lora": "Pika-Labs/Pika-H3-Flex-fl2va",
+"lora_scale": 1.0
+```
+
+**You do not set a step count.** While the adapter is live its manifest's
+schedule runs and the graph's `steps` is not used; the log says so:
+
+```
+MetalMiniMaxH3Transformer: '.../fl2va/adapter.safetensors' states a
+sampling contract (pika-flex-fl2va-v1): 6 steps on its own grid, fresh
+noise each step, shifts 12/3, keyframes rounded to bf16
+```
+
+Keep `lora_scale` at **1.0**. At 0 the model is the base again, and so is its
+sampler: Euler on the graph's `steps`. The FL2VA adapter is **refused** on the
+Ref2VA weights and the Ref2VA adapter on the FL2VA weights — each was trained
+on one — and so is a second adapter that names its own sampler (another
+manifest, or HyperFlow). Style adapters can share the other seven slots.
+
+#### What the manifest decides
+
+```json
+"sampling": {"knots": [1000, 750, 500, 250, 100, 40, 0],
+             "video_shift": 12.0, "audio_shift": 3.0,
+             "method": "renoise"}
+```
+
+**The grid.** The knots over 1000 are a raw grid that each modality pushes
+through its own shift, in double precision and then rounded to float — so the
+six steps sit at these noise levels:
+
+| step | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| video (shift 12) | 1.0 | 0.9730 | 0.9231 | 0.8000 | 0.5714 | 0.3333 |
+| audio (shift 3) | 1.0 | 0.9000 | 0.7500 | 0.5000 | 0.2500 | 0.1111 |
+
+**The update.** `renoise` is not an Euler step. Each step takes the model's
+clean estimate `x0 = x + sigma * v` and puts it at the next noise level with
+**fresh noise**, `(1 - sigma') x0 + sigma' n`; the last step returns `x0`. The
+fresh noise follows the clip's `seed` — the video's rows, then the audio's,
+each step — so a seed still reproduces its clip.
+`VPIPE_H3_RENOISE=0` keeps the grid and steps it by Euler, for an A/B.
+
+**The keyframes.** The FL2VA manifest's `bf16_conditioning_v1` rounds each
+keyframe's latent to bf16 before it is noised to the anchors' level (Ref2VA's
+`fp32_conditioning_v1` leaves them alone).
+
+#### The rest of the release's recipe
+
+The manifest does not cover these. They are graph settings, and the shipped
+graphs set them:
+
+- **Canvas.** 832 × 480 at 480p and 1344 × 768 at 768p for 16:9; the release
+  has eleven aspect ratios per tier, from 21:9 to 9:21. `frames` 124 is five
+  seconds; 362 is fifteen (every count rounds up to the next `17n + 5`).
+- **Keyframes.** The release centre-crops a keyframe to the canvas's aspect
+  and resizes the crop onto it, the first frame and the last alike:
+  `image-resample` with `fit: crop` and `algorithm: lanczos`.
+- **Keyframes shown to the conditioner.** Each keyframe is also put on
+  `diffusion-conditioner`'s `ref_image` port (see
+  [More than text in](#more-than-text-in)). The release's prompts refer to
+  "image 1", and this is where image 1 comes from.
+- **References by tier.** A Ref2VA reference is sized by the tier of the clip
+  it conditions. Below 768p, a picture's short edge is 1024 and a clip goes on
+  the 480p canvas rule; from 768p up, 2048 and 1344 × 768.
+
+  | `video-ref-encoder` key | 480p | 768p |
+  |---|---:|---:|
+  | `reference_image_short_edge` | 1024 | 2048 |
+  | `reference_video_short_edge` | 480 | 768 |
+  | `reference_video_max_pixels` | 399360 | 1032192 |
+
+  These keys size the files named in `references`, which is how the shipped
+  graph passes them; a video file brings its own soundtrack. A picture handed
+  to the stage on a reference **port** is encoded at the size it arrives, so
+  size it on the way (`image-resample`, short edge 1024 or 2048). Pika's
+  example pictures are 2816 × 1584: unsized, each would be 4,400 rows of the
+  sequence instead of 1,824.
+
+  The release accepts up to nine pictures, three clips and three soundtracks,
+  each clip or soundtrack 2–15 seconds; vpipe does not enforce those limits.
+
+#### Where vpipe differs from the release
+
+- **The noise is vpipe's own.** The release draws its noise from CUDA's
+  generator, so the same seed is a different sample here, as with every
+  model in this guide.
+- **A keyframe is encoded at the VAE posterior's mean.** The release samples
+  the posterior with a fixed seed and rounds the sample to float16 first.
+- **The base weights are whatever vpipe loads.** The adapters were trained on
+  MiniMax-H3's bf16 transformers; the shipped graphs run them on the 8-bit
+  packs from step 1, as every other example here does.
+
+#### What six steps cost
+
+Measured on an M4 Pro (64 GB) with the bf16 FL2VA weights read from an
+external drive and streamed, an opening frame and Pika's own example prompt
+trimmed to five seconds, at 832 × 480 × 124 frames (15,395 rows):
+
+| | time |
+|---|---:|
+| conditioning, keyframe encode, loads | ~2.7 min |
+| **denoise, 6 forwards** | **14.7 min** (~2.45 min each) |
+| video + audio decode | ~2 min |
+| whole run | 19.5 min |
+
+The adapter does not make a forward cheaper; what it buys is the count. The
+base model wants 20 or more forwards for a clip like this, which at the same
+~2.45 minutes is 50 minutes of denoise. The clip followed the prompt shot for
+shot and kept the keyframe's drawing style throughout, with a soundtrack.
+
+Showing the keyframe to the conditioner as well adds its 390 vision tokens to
+the conditioning (559 rows in all here) and about 40 seconds to the run
+(20.2 minutes): the vision tower runs once, and the denoise carries 15,793
+rows instead of 15,395.
+
+The Ref2VA example is a longer sequence: the shipped
+[`pika-h3-flex-reference-to-video.vpipeline`](pipelines/pika-h3-flex-reference-to-video.vpipeline)
+on the bf16 Ref2VA weights, read the same way, at 832 × 480 × 124 frames.
+Its two pictures (1824 × 1024 each), the five-second motion clip and its
+sound add 18,078 rows of references and 6,393 of conditioning, for 39,729 in
+all:
+
+| | time |
+|---|---:|
+| references encoded (the clip's VAE encode is 4.1 min of it) | 6.0 min |
+| **denoise, 6 forwards** | **61.5 min** (~10.3 min each) |
+| video + audio decode | 2.4 min |
+| whole run | 70.8 min |
+
+The clip put the character from the sheet in the shop from the second picture
+and followed the motion clip's dance pose for pose, the fern swapped for the
+record as the prompt asks, with a soundtrack. The same request with the
+pictures left at their 2816 × 1584 (see
+[The rest of the release's recipe](#the-rest-of-the-releases-recipe)) carried
+50,033 rows and took 89.8 minutes of denoise.
+
+The memory plan is drawn before any reference or keyframe is read, so it
+sizes the denoise from the canvas and 512 rows of conditioning: 15,929 rows
+for this clip against the 39,729 it runs. The first forward knows the real
+sequence, and the plan takes that forward's figure then, so what is sized
+afterwards (the decode, a next prompt) sees it; the log says so when it is
+larger. The same example at 22 frames runs 13,659 rows, whose activations
+take about 1.8 GB where the launch had booked 0.5 GB.
+
+
+#### Checked without the release
+
+There is nothing to run the release against on a Mac (its package needs an
+80 GB NVIDIA GPU), so each piece was checked on its own:
+
+- **The adapter's names.** The FP32 files are in diffusers' decomposition —
+  split `to_q` / `to_k` / `to_v`, value-first `ff.net.0.proj` — which vpipe
+  fuses for the weights it loads. Pika's own ComfyUI conversion of the same
+  adapter was compared tensor by tensor with that fusion (blocks 0 and 49):
+  identical after rounding to bf16, the q|k|v blocks and the swapped
+  feed-forward halves included.
+- **The schedule.** The grid's float bits match the release's arithmetic,
+  shifted in double; shifting in float would land one bit off at the 0.04
+  knot under both shifts.
+- **The update.** One re-noising step matches its restatement bit for bit, and
+  the last step is the clean estimate exactly.
+- **The adapter on the real weights.** Two blocks of the FL2VA transformer:
+  the adapter binds every module of them, moves the output, and at strength 0
+  gives the base output to the bit. The six-step loop runs re-noised and
+  reproduces itself from a seed; another seed or Euler moves it. The plan
+  books what the load holds, to the byte.
 
 ### Three steps, streamed — TaoMate-H3
 
@@ -3004,7 +3338,9 @@ was measured at.
 | `sol_key_block` | `64` | **32 or 64 only.** 32 does more exact work, is slower and is more faithful — a centroid over 32 keys stands in for them better, while halving the block doubles both the routing and the summary sequence. Larger blocks were measured and lose on both counts, so they are declined with a warning and a fall back to 64. |
 | `sol_dense_layers` | `1` | Leading blocks left dense. The first block is where the residual stream is least redundant, and it is one of 50. |
 | `sol_dense_steps` | `0` | Leading denoising steps left dense — the time-axis twin of `sol_dense_layers`. The first steps decide a clip's coarse structure. HyperFlow's published recipe uses 2 of its 8. |
+| `sol_tau_steps` | empty | `sol_tau` step by step, comma-separated (`"1.0,1.5,1.75"`): entry *i* for step *i*, the last for every step after. A step's error at one tau falls as the noise does — measured on the 2K refine, about 0.6× at the second step and 0.5× at the third — so the later steps can keep fewer blocks. |
 | `sol_local_radius` | `1` | Blocks either side of the query's own kept exact whatever the routing says. |
+| `sol_threshold` | `diag` | How the routing measures the spread `sol_tau` counts in: `diag` from the key centroids' per-channel variance, `exact` from their full covariance — the published method's two forms. One tau keeps a different share of blocks under each, so a tau tuned on one does not carry to the other. |
 
 It composes with the [Turbo LoRA](#fewer-steps--the-turbo-lora) and with
 `i8_gemm`, and the second is worth being precise about, since both are
@@ -3300,6 +3636,25 @@ you accept on its Hugging Face page before downloading:
 - Weights (FL2VA + Ref2VA): <https://huggingface.co/MiniMaxAI/MiniMax-H3>
 - Repack used as a second opinion on the qkv grouping:
   <https://huggingface.co/Comfy-Org/MiniMax-H3>
+
+**Pika H3 Flex** — the six-step adapters of
+[Six steps, any reference](#six-steps-any-reference--pika-h3-flex) — is by
+Pika Labs (Mellis, Inc.). The adapters are Model Derivatives of MiniMax H3,
+distributed under the same **MiniMax H3 Community Licence Agreement**, with
+the required notice in the repository's `NOTICE`, which the prepare graph
+fetches beside them.
+
+- Weights: <https://huggingface.co/Pika-Labs/Pika-H3-Flex>
+- Technical deep dive: <https://pika.art/blog/pika-h3-flex-research>
+
+```bibtex
+@misc{pika2026flex,
+  title  = {Pika H3 Flex Technical Deep Dive},
+  author = {{Pika Research}},
+  year   = {2026},
+  howpublished = {\url{https://pika.art/blog/pika-h3-flex-research}}
+}
+```
 
 **VideoDeltaNet on MiniMax H3 (VDN-H3)** — the hybrid attention of
 [Faster attention](#faster-attention--the-vdn-linear-branch) — is by Haocheng

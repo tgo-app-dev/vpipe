@@ -1,7 +1,8 @@
 // minimax_h3_regenerate.metal -- the kernels Open-H3-Regenerate-2K needs
 // beside MiniMax-H3's own: the latent upscaler's (generative-models/
-// minimax-h3/metal-minimax-h3-latent-upscaler.h) and the LMS Sharp curve
-// branch on the DiT's AdaLN modulation.
+// minimax-h3/metal-minimax-h3-latent-upscaler.h), the LMS Sharp curve
+// branch on the DiT's AdaLN modulation, and that modulation itself in
+// ComfyUI's pruned form.
 //
 // The upscaler's activations are channel-last per latent FRAME, frames
 // contiguous: [T, rows (= H * W), C]. Its 3x3x3 convs are the Wan VAE's
@@ -11,8 +12,8 @@
 // other net in the tree has.
 //
 // Element (storage) type: half by default; -DVPIPE_ELT=bfloat builds the
-// bf16 variant (minimax_h3_regenerate_bf16), which the DiT's curve add
-// needs. Every reduction and every parameter is f32.
+// bf16 variant (minimax_h3_regenerate_bf16), which the DiT's curve
+// kernels need. Every reduction and every parameter is f32.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -155,6 +156,102 @@ kernel void h3_adaln_curve_add_f16(
   const float d = dot(w4[0], c4[0]) + dot(w4[1], c4[1]);
   const long idx = (long)t * D + j;
   mod[idx] = VPIPE_ELT(float(mod[idx]) + scale * d);
+}
+
+// One element of a projection stored F32 (wdt 0), F16 (1) or BF16 (2),
+// widened exactly.
+static inline float
+h3_stored_f32_(const device void* p, long i, int wdt)
+{
+  if (wdt == 0) { return ((const device float*)p)[i]; }
+  const ushort u = ((const device ushort*)p)[i];
+  return wdt == 1 ? float(as_type<half>(u)) : as_type<float>(uint(u) << 16);
+}
+
+// ComfyUI's PRUNED MiniMax-H3 (its "curve form"): no timestep MLP. Every
+// AdaLN projection reads the 8-D point of `adaln_t_table` its timestep
+// lands on, with no silu, as a linear in f32:
+//
+//   mod[t, j] = b[j] + sum_k w[j, k] coords[t, k]
+//
+// `w` [D, 8] and `b` [D] as STORED (`wdt` above), the sum in f32 and
+// rounded once into the DiT's element type -- ComfyUI casts the
+// projection to f32 and the row to the stream's dtype where it is used,
+// the same single rounding.
+//   0:mod[n_t, D] 1:w 2:b 3:coords[n_t, 8] 4:D 5:n_t 6:wdt
+//   grid {D, n_t}
+kernel void h3_adaln_pruned_f16(
+    device VPIPE_ELT*   mod    [[buffer(0)]],
+    const device void*  w      [[buffer(1)]],
+    const device void*  b      [[buffer(2)]],
+    const device float* coords [[buffer(3)]],
+    constant int&       D      [[buffer(4)]],
+    constant int&       n_t    [[buffer(5)]],
+    constant int&       wdt    [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int j = (int)gid.x, t = (int)gid.y;
+  if (j >= D || t >= n_t) { return; }
+  const device float* c = coords + (long)t * 8;
+  float acc = 0.0f;
+  for (int k = 0; k < 8; ++k) {
+    acc = fma(h3_stored_f32_(w, (long)j * 8 + k, wdt), c[k], acc);
+  }
+  mod[(long)t * D + j] = VPIPE_ELT(acc + h3_stored_f32_(b, j, wdt));
+}
+
+// The same with a row of `res` added in the f32 sum before the one
+// rounding: the part of an adapted embedding the curve cannot carry,
+// baked from the RELEASED AdaLN (W (I - P)(silu(e) - m); see the DiT's
+// bake_adaln), one row a timestep at `res`'s offset.
+//   0:mod[n_t, D] 1:w 2:b 3:coords[n_t, 8] 4:D 5:n_t 6:wdt 7:res[n_t, D]
+//   grid {D, n_t}
+kernel void h3_adaln_pruned_res_f16(
+    device VPIPE_ELT*       mod    [[buffer(0)]],
+    const device void*      w      [[buffer(1)]],
+    const device void*      b      [[buffer(2)]],
+    const device float*     coords [[buffer(3)]],
+    constant int&           D      [[buffer(4)]],
+    constant int&           n_t    [[buffer(5)]],
+    constant int&           wdt    [[buffer(6)]],
+    const device VPIPE_ELT* res    [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int j = (int)gid.x, t = (int)gid.y;
+  if (j >= D || t >= n_t) { return; }
+  const device float* c = coords + (long)t * 8;
+  float acc = 0.0f;
+  for (int k = 0; k < 8; ++k) {
+    acc = fma(h3_stored_f32_(w, (long)j * 8 + k, wdt), c[k], acc);
+  }
+  const long idx = (long)t * D + j;
+  mod[idx] =
+      VPIPE_ELT(acc + h3_stored_f32_(b, j, wdt) + float(res[idx]));
+}
+
+// A pruned AdaLN projection (weight or bias) with an adapter's delta
+// added, in f32, before h3_adaln_pruned_f16 reads it (as F32):
+//
+//   dst[i] = (first ? src[i] : dst[i]) + scale * delta[i]      (one fma)
+//
+// `src` as stored (`wdt`), widened exactly; one call a live slot, the
+// first from the stored projection -- ComfyUI's weight patch, added in
+// the order the slots are named.
+//   0:dst[n] 1:src 2:delta[n] 3:n 4:wdt 5:scale 6:first   grid {n}
+kernel void h3_adaln_patch_f32(
+    device float*       dst   [[buffer(0)]],
+    const device void*  src   [[buffer(1)]],
+    const device float* delta [[buffer(2)]],
+    constant int&       n     [[buffer(3)]],
+    constant int&       wdt   [[buffer(4)]],
+    constant float&     scale [[buffer(5)]],
+    constant int&       first [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int i = (int)gid;
+  if (i >= n) { return; }
+  const float base = first != 0 ? h3_stored_f32_(src, i, wdt) : dst[i];
+  dst[i] = fma(scale, delta[i], base);
 }
 
 // ---- the FAST decoder (vae_fast/; generative-models/minimax-h3/

@@ -2054,18 +2054,19 @@ TEST(video_ref_encoder, the_encoder_is_phased_and_claimed_at_its_floor)
   for (const ResourceClaim& c : declared) {
     EXPECT_TRUE(c.phase.empty());
   }
-  // Pass 2 is where the encoder's phase lives, and it is `condition`.
-  // The COUNT is asserted, not just the contents: "every decided claim
-  // is phased" is vacuously true of a stage that decides nothing, which
-  // is exactly the bug this test exists to catch.
-  EXPECT_TRUE(decided.size() == 1);
-  if (decided.size() == 1) {
-    EXPECT_TRUE(decided[0].phase == model_memory::kPhaseCondition);
-    // It is ONE of the three declared components that gets the phase,
-    // and the same key pass 1 named -- not a fourth path invented here.
+  // Pass 2 is where the encoder's phase lives, and it is `condition` --
+  // the video VAE's too, which the stage drops with its encoder once a
+  // request is encoded. The COUNT is asserted, not just the contents:
+  // "every decided claim is phased" is vacuously true of a stage that
+  // decides nothing, which is exactly the bug this test exists to catch.
+  EXPECT_TRUE(decided.size() == 2);
+  for (const ResourceClaim& d : decided) {
+    EXPECT_TRUE(d.phase == model_memory::kPhaseCondition);
+    // Each is one of the declared components, under the same key pass
+    // 1 named -- not a path invented here.
     bool named_in_declare = false;
     for (const ResourceClaim& c : declared) {
-      if (c.key == decided[0].key) { named_in_declare = true; }
+      if (c.key == d.key) { named_in_declare = true; }
     }
     EXPECT_TRUE(named_in_declare);
   }

@@ -33,6 +33,7 @@
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "stages/diffusion-conditioner-stage.h"
+#include "stages/generate-video-stage.h"
 #include "stages/model-detect.h"
 #include "stages/model-quantize-stage.h"
 
@@ -166,20 +167,33 @@ fresh_(const char* name)
   return r;
 }
 
-// The checkpoint directories a diffusion-conditioner pointed at `root`
-// claims for the planning phase.
+// The keys a stage of type `St` pointed at `root` claims for the
+// planning phase.
+template <class St>
 std::vector<std::string>
-conditioner_claims_(const std::string& root)
+claims_of_(const std::string& root)
 {
   Session sess;
   FlexData cfg = FlexData::make_object();
   cfg.as_object().insert("hf_dir", FlexData::make_string(root));
-  DiffusionConditionerStage st(&sess, "c", {}, std::move(cfg));
+  St st(&sess, "s", std::vector<InEdge>{}, std::move(cfg));
   std::vector<std::string> keys;
   for (const ResourceClaim& c : st.declare_resources()) {
     keys.push_back(c.key);
   }
   return keys;
+}
+
+std::vector<std::string>
+conditioner_claims_(const std::string& root)
+{
+  return claims_of_<DiffusionConditionerStage>(root);
+}
+
+std::vector<std::string>
+generator_claims_(const std::string& root)
+{
+  return claims_of_<GenerateVideoStage>(root);
 }
 
 bool
@@ -264,13 +278,18 @@ TEST(minimax_h3_diffusers_root, a_full_checkout_takes_the_released_partitions)
                  (r / "Ref2VA/transformer").string());
   // Two models in one directory: only a record can name one.
   EXPECT_TRUE(detect_model_dir(root, "local/h3-full").model_type.empty());
-  // The conditioner declares the DiT it is paired with -- the one
-  // generate-video loads, not the root's copy beside it, or the plan
-  // carries a second 63 GB DiT that nothing loads.
+  // The plan carries the DiT generate-video loads -- the released
+  // partition's -- and never the root's copy beside it, or it holds a
+  // second 63 GB DiT nothing loads. The stage that loads a DiT is the one
+  // that claims it; the conditioner claims its encoder and no DiT at all.
   {
-    const auto keys = conditioner_claims_(root);
-    EXPECT_TRUE(claims_(keys, r / "FL2VA/transformer"));
-    EXPECT_FALSE(claims_(keys, r / "transformer"));
+    const auto gen = generator_claims_(root);
+    EXPECT_TRUE(claims_(gen, r / "FL2VA/transformer"));
+    EXPECT_FALSE(claims_(gen, r / "transformer"));
+    EXPECT_FALSE(claims_(gen, r / "transformer_ref"));
+    const auto cond = conditioner_claims_(root);
+    EXPECT_FALSE(claims_(cond, r / "FL2VA/transformer"));
+    EXPECT_FALSE(claims_(cond, r / "transformer"));
   }
 
   // Holding only FL2VA's partition, a Ref2VA graph takes the root's
@@ -334,9 +353,10 @@ TEST(minimax_h3_diffusers_root, the_pipeline_alone_answers_by_partition)
       "minimax-h3-text-encoder");
 
   {
-    const auto keys = conditioner_claims_(root);
-    EXPECT_TRUE(claims_(keys, r / "transformer"));
-    EXPECT_TRUE(claims_(keys, r / "text_encoder"));
+    EXPECT_TRUE(claims_(generator_claims_(root), r / "transformer"));
+    const auto cond = conditioner_claims_(root);
+    EXPECT_TRUE(claims_(cond, r / "text_encoder"));
+    EXPECT_FALSE(claims_(cond, r / "transformer"));
   }
 
   // model-quantize does not take a DiT whose qkv it would read as one
