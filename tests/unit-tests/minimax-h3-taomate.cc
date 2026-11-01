@@ -663,9 +663,6 @@ TEST(minimax_h3_taomate, stream_kv_retains_and_drops_audio)
   Session sess;
   metal_compute::MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  metal_compute::ComputeFunction copy_rect =
-      mc->load_library("llm_elementwise_bf16").function("copy_rect_f16");
-  ASSERT_TRUE(copy_rect.valid());
   const int H = 2, D = 64;
 
   auto bf = [](float f) {
@@ -716,8 +713,8 @@ TEST(minimax_h3_taomate, stream_kv_retains_and_drops_audio)
       {
         metal_compute::CommandStream cs = mc->make_command_stream();
         metal_compute::ComputeEncoder enc = cs.begin_compute();
-        kv.encode_gather(enc, copy_rect, 0, k, v, seq);
-        if (commit) { kv.encode_commit(enc, copy_rect, 0, plan, seq); }
+        kv.encode_gather(enc, 0, k, v, seq);
+        if (commit) { kv.encode_commit(enc, 0, plan, seq); }
         enc.end();
         std::string gerr;
         if (!cs.commit().wait_ok(&gerr)) { return false; }

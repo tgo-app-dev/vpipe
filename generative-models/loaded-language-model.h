@@ -37,6 +37,7 @@ class MetalGemma4AudioEncoder;
 class MetalGemma4VisionEncoder;
 class MetalPixtralVisionEncoder;
 class MetalDeepseekV41Vision;
+class MetalLfm3VisionEncoder;
 class Gemma4UnifiedEmbedder;
 class MetalQwenVisionEncoder;
 class TokenMuxer;
@@ -63,10 +64,13 @@ enum class ComputeDtype { F16, BF16, F32 };
 // (the per-layer pass). Text input takes the fast path; the muxer
 // is wired for image-token mixing once a vision encoder lands.
 //
-// Thread safety: prefill / next_token / branch / make_context are
-// internally serialised on a single mutex. MLX is single-stream
-// per device, so this matches the underlying compute reality; the
-// future batch-decode path will relax the serialisation.
+// Thread safety: the forward calls (prefill / next_token / branch /
+// make_context and the decode loops) take no lock -- the metal backends
+// run their GPU work inline on the caller's thread -- and every load of
+// one spec shares ONE instance (GenerativeModelManager::load, a model
+// kept warm), so its users must not drive it at the same time. The
+// int8-prefill setters below are serialised among themselves, not
+// against a forward.
 class LoadedLanguageModel {
   VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
@@ -191,6 +195,11 @@ public:
   // against this header fails to load without on an older ABI-8 host).
   __attribute__((visibility("hidden"))) MetalDeepseekV41Vision*
   metal_deepseek_v41_vision() const noexcept;
+  // LFM3-VL's vision tower + projector, or null for any other model or
+  // when it did not load: native-f16 rows, one an <|image|> placeholder,
+  // 1-D positions. Host-only (hidden), as metal_deepseek_v41_vision.
+  __attribute__((visibility("hidden"))) MetalLfm3VisionEncoder*
+  metal_lfm3_vision() const noexcept;
 
   // Host-float logits ([vocab]) of the last position predicted by the
   // metal backend's prefill/next_token. The MLX-free sampling source
@@ -505,13 +514,28 @@ public:
   std::span<const std::int32_t> base_suppressed_tokens() const noexcept;
 
   // Dynamic-int8 accelerated PREFILL GEMMs ("accelerated mode"): the big
-  // prompt-time matmuls run on the matrix units' int8 pipe (~2x the f16
-  // rate) with on-the-fly per-(row, 512-group) activation quantization.
-  // LOSSY (int8, ~1e-2 rel per GEMM -- prefill is NOT token-exact with
-  // this on) and strictly opt-in; decode is untouched. No-op on backends
-  // without the route (only the metal Qwen exec implements it today).
+  // prompt-time matmuls run on the matrix units' int8 pipe with the
+  // activations quantized on the fly, from 1024 rows, on matrix-core
+  // GPUs. LOSSY (int8, ~1e-2 rel per GEMM -- prefill is NOT token-exact
+  // with this on) and strictly opt-in; decode is untouched. No-op on
+  // backends without the route (the metal Qwen and LFM3 execs have it).
   // Env VPIPE_I8_GEMM=0|1 overrides. Set after load, before prefill.
+  //
+  // The flag is the MODEL's, and the model is shared (the note above): a
+  // stage states ITS preference with request_i8_prefill; this sets the
+  // flag outright, whoever else holds the model.
   void set_i8_prefill(bool on);
+  // A stage's preference in launch `epoch` (GenerativeModelManager::
+  // launch_epoch()). The first request of a launch sets the flag; later
+  // ones of the same launch only turn it on -- on if ANY stage of the
+  // launch asked, whatever order their initialize() ran in -- and a model
+  // kept warm comes to a launch that does not ask in 16 bits again. A
+  // request that leaves the flag as it was rebuilds nothing. Host-only.
+  __attribute__((visibility("hidden"))) void
+  request_i8_prefill(bool on, std::uint64_t epoch);
+  // Where the flag stands -- what was asked, whether or not the backend
+  // runs it (it needs matrix cores). Host-only (tests).
+  __attribute__((visibility("hidden"))) bool i8_prefill_requested() const;
 
   // Speculative decode via the MTP head: token-exact vs the serial decode, but
   // the drafter lets the verifier accept multiple tokens per forward.

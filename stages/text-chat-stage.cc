@@ -26,6 +26,7 @@
 #include "generative-models/deepseek-v41/deepseek-v41-config.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
@@ -332,13 +333,22 @@ encode_image_item_(genai::MetalQwenVisionEncoder*    mvis,
                    genai::Gemma4UnifiedEmbedder*     mguni,
                    genai::MetalPixtralVisionEncoder* mpix,
                    genai::MetalDeepseekV41Vision*    mds,
+                   genai::MetalLfm3VisionEncoder*    mlfm,
                    const uint8_t*                    rgb,
                    int                               H,
                    int                               W)
 {
   MediaItem m;
   m.kind = genai::MediaChunk::Kind::Image;
-  if (mds) {
+  if (mlfm) {
+    // LFM3-VL: one row an <|image|> placeholder (f16), 1-D positions;
+    // the processor's own pixel bounds.
+    auto r       = mlfm->encode(rgb, H, W);
+    m.embeddings = std::move(r.embeddings);
+    m.n_tokens   = r.n_tokens;
+    m.mh         = r.grid_h;
+    m.mw         = r.grid_w;
+  } else if (mds) {
     // DeepSeek-V4.1: the image's whole span (start, cells and row breaks,
     // end) as host rows; 1-D positions.
     auto r            = mds->encode(rgb, H, W);
@@ -904,6 +914,7 @@ TextChatStage::run_shape_(const std::string& dir) const
   r.contexts = 2;
   r.one_pass = _mtp_enabled || !_draft_model.empty();
   r.draft_head = own_draft_head_(dir);
+  r.i8_prefill = _i8_prefill;
   return r;
 }
 
@@ -1102,7 +1113,11 @@ TextChatStage::initialize(RuntimeContext& ctx)
   if (_mtp_enabled) { _lm->set_mtp_prefix_seed(_mtp_prefix_seed); }
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs. No-op on
   // backends without the route; env VPIPE_I8_GEMM overrides either way.
-  if (_i8_prefill) { _lm->set_i8_prefill(true); }
+  // Asked off too: a model kept warm is handed over as the last stage left
+  // it, so a stage asking for 16 bits after one that asked for int8 would
+  // otherwise read in int8. Tagged with the launch: within one, the model
+  // runs int8 if ANY stage sharing it asked, whatever the init order.
+  _lm->request_i8_prefill(_i8_prefill, mgr->launch_epoch());
   // Cache whichever media-encoder towers this checkpoint carries; the
   // media-line turn path (attachment markers in the user line) uses
   // them to splice image/audio embeddings into the prefill. All null
@@ -1111,6 +1126,7 @@ TextChatStage::initialize(RuntimeContext& ctx)
   _mgvis    = _lm->metal_gemma4_vision_encoder();
   _mpix     = _lm->metal_pixtral_vision_encoder();
   _mds      = _lm->metal_deepseek_v41_vision();
+  _mlfm     = _lm->metal_lfm3_vision();
   _mguni    = _lm->gemma4_unified_embedder();
   _m_audio  = _lm->metal_audio_encoder();
   _mg_audio = _lm->metal_gemma4_audio_encoder();
@@ -1582,7 +1598,7 @@ TextChatStage::process(RuntimeContext& ctx)
       session()->warn(fmt("TextChatStage('{}'): {}", this->id(), e));
     }
     const bool image_ok = tpl->image_pad_token_id() >= 0
-        && (_mvis || _mgvis || _mpix || _mds ||
+        && (_mvis || _mgvis || _mpix || _mds || _mlfm ||
             (_mguni && _mguni->has_vision()));
     const bool audio_ok = tpl->audio_pad_token_id() >= 0
         && (_m_audio || _mg_audio || (_mguni && _mguni->has_audio()));
@@ -1619,6 +1635,7 @@ TextChatStage::process(RuntimeContext& ctx)
                   &derr);
         if (img) {
           item = encode_image_item_(_mvis, _mgvis, _mguni, _mpix, _mds,
+                                    _mlfm,
                                     img->rgb.data(), img->height,
                                     img->width);
           if (!item) { derr = "vision encode failed"; }

@@ -34,6 +34,7 @@
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/tokenizer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/tensor-beat-bridge.h"
@@ -740,6 +741,7 @@ RealtimeVqaStage::declare_resources() const
   run.kv_tokens = frame_tokens * _max_frames_per_scene + 1024;
   run.contexts = 1 + (int)_questions.size();
   run.branch_tokens = (std::int64_t)_max_new_tokens + 256;
+  run.i8_prefill = _i8_prefill;
   return model_memory::lm_claims(
       session(), resolve_model_dir(session(), _hf_dir), id(), run,
       _coreml_vision_path.empty() ? kQwenFramePixels : -1,
@@ -779,7 +781,9 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   _lm->set_mtp_prefix_seed(false);
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs -- a good
   // fit here (per-scene re-prefill). No-op on backends without the route.
-  if (_i8_prefill) { _lm->set_i8_prefill(true); }
+  // Asked off too: a warm model comes as the last stage left it
+  // (text-chat's note).
+  _lm->request_i8_prefill(_i8_prefill, mgr->launch_epoch());
   _chat_tpl = genai::make_chat_template(
       _lm->config(), _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
@@ -823,10 +827,11 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   _mvis = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
   _mpix  = _lm->metal_pixtral_vision_encoder();
+  _mlfm  = _lm->metal_lfm3_vision();
   _mgaud = _lm->metal_gemma4_audio_encoder();
   _mguni = _lm->gemma4_unified_embedder();
   if (_mguni && !_mguni->has_vision()) { _mguni = nullptr; }
-  if (!_mvis && !_mgvis && !_mpix && !_mguni) {
+  if (!_mvis && !_mgvis && !_mpix && !_mlfm && !_mguni) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): [metal] no metal vision tower "
         "(model has no vision config?); frames will be dropped",
@@ -1245,7 +1250,8 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
                                   std::uint64_t ts_us, bool ts_present,
                                   const metal_compute::SharedBuffer* src_buf)
 {
-  if (!_lm || (!_mvis && !_m_coreml && !_mgvis && !_mpix && !_mguni)) {
+  if (!_lm || (!_mvis && !_m_coreml && !_mgvis && !_mpix && !_mlfm
+               && !_mguni)) {
     if (!_m_vision_warned) {
       session()->warn(fmt(
           "RealtimeVqaStage('{}'): [metal] vision tower unavailable; "
@@ -1345,6 +1351,21 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h;
       m.mw         = r.grid_w;
+    } else if (_mlfm) {
+      // LFM3-VL: a frame at vlm_max_soft_tokens' area when set, else the
+      // ~1 MP a live frame gets on the Qwen towers (~980 tokens), within
+      // the processor's own bounds; one row a token, 1-D positions.
+      const std::int64_t cell = (std::int64_t)_mlfm->config().patch *
+                                _mlfm->config().merge;
+      const std::int64_t frame_px =
+          _vlm_max_soft_tokens > 0
+              ? (std::int64_t)_vlm_max_soft_tokens * cell * cell
+              : kQwenFramePixels;
+      auto r = _mlfm->encode(urgb, uh, uw, frame_px);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
     } else if (_mpix) {
       // Pixtral sizes a frame by its own longest-edge rule, which at
       // camera resolutions is ~1200 tokens a frame -- a scene of them
@@ -1394,6 +1415,7 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
                         _m_coreml ? "coreml"
                                   : _mgvis ? "metal-gemma4"
                                   : _mpix  ? "metal-pixtral"
+                                  : _mlfm  ? "metal-lfm3"
                                   : _mguni ? "gemma4-unified"
                                            : "metal-tower",
                         eff_w, eff_h, enc_s);

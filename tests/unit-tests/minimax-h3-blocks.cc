@@ -36,6 +36,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/mma-tile.h"
@@ -4020,4 +4021,341 @@ TEST(minimax_h3_blocks, fc1_destination_past_2gb_banded)
   std::printf("  banded     bad %d  first bad row %d  worst |err| %.4f\n",
               bad, first_bad, worst);
   EXPECT_TRUE(bad == 0);
+}
+
+// A LONG SEQUENCE'S WHOLE-SEQUENCE BUFFERS, ADDRESSED PAST 2^32 ELEMENTS.
+// The banded forward keeps every row's q / k / v head-major, [56, rows,
+// 128], which passes 2^32 elements at 599,186 rows -- a 2560 x 1440
+// refine past ~566 frames. The kernels that write and read those windows
+// computed their offsets in 32 bits, so the later heads landed on the
+// earlier ones: the band's transpose-rope that writes them, Sage's
+// quantizers and Sol's summaries that read every key, the head-major
+// transpose back; and the residual stream's RMS norm passes 2^32 at
+// 798,915 rows of 5,376. Each runs here at a geometry just past the
+// line, its LAST head's rows checked against the CPU -- 32-bit
+// arithmetic puts them somewhere else.
+TEST(minimax_h3_blocks, a_long_sequences_heads_are_addressed_past_2_32)
+{
+  if (std::getenv("VPIPE_H3_BIG_SEQ") == nullptr) {
+    std::printf("[ SKIP     ] set VPIPE_H3_BIG_SEQ=1 (allocates ~30 GB)\n");
+    return;
+  }
+  auto session = std::make_shared<Session>();
+  MetalCompute* mc = session->metal_compute();
+  if (mc == nullptr) { EXPECT_TRUE(false); return; }
+  ComputeLibrary lrope = mc->load_library("rope_bf16");
+  ComputeLibrary lsage = mc->load_library("sage_quant_bf16");
+  ComputeLibrary lsol  = mc->load_library("sol_attn_mma_bf16");
+  ComputeLibrary lelt  = mc->load_library("llm_elementwise_bf16");
+  ComputeLibrary lrms  = mc->load_library("rms_norm_bf16");
+  ComputeFunction trope = lrope.function(
+      "transpose_rope_half_part_ftab_band_f16");
+  ComputeFunction qtok = lsage.function("sage_quant_token");
+  ComputeFunction summ = lsol.function("sol_summaries_mma");
+  ComputeFunction tabd = lelt.function("transpose_abd_f16");
+  ComputeFunction rms  = lrms.function("rms_norm_fast_f16");
+  if (!trope.valid() || !qtok.valid() || !summ.valid() || !tabd.valid() ||
+      !rms.valid()) {
+    EXPECT_TRUE(false);
+    return;
+  }
+  const int NH = 56, HD = 128, I = NH * HD;
+  const int S = 610048;               // 64 * 9532: H * S * D > 2^32
+  const int n = 128, r0 = S - n;      // the last band
+  const int rot = 64;
+  const std::size_t win = (std::size_t)NH * S * HD;
+  std::printf("  window [%d, %d, %d] = %.3f G elements\n", NH, S, HD,
+              (double)win / 1e9);
+  // The band's fused q|k|v rows, [n, 3*I], heads D apart; k is read.
+  auto val = [](int t, int j) {
+    return (float)(((t * 31 + j * 7) % 251) - 125) / 64.0f;
+  };
+  SharedBuffer qkv = mc->make_shared_buffer((std::size_t)n * 3 * I * 2);
+  SharedBuffer cs = mc->make_shared_buffer((std::size_t)n * (rot / 2) * 4);
+  SharedBuffer sn = mc->make_shared_buffer((std::size_t)n * (rot / 2) * 4);
+  SharedBuffer kh = mc->make_shared_buffer(win * 2);
+  if (qkv.empty() || cs.empty() || sn.empty() || kh.empty()) {
+    std::printf("  allocation failed -- not enough memory for this test\n");
+    EXPECT_TRUE(false);
+    return;
+  }
+  {
+    auto* p = static_cast<std::uint16_t*>(qkv.contents());
+    for (int t = 0; t < n; ++t) {
+      for (int j = 0; j < 3 * I; ++j) {
+        p[(std::size_t)t * 3 * I + j] = to_bf16_(val(t, j));
+      }
+    }
+    // The identity rotation: the rope branch runs, the values come
+    // through as they were.
+    auto* c = static_cast<float*>(cs.contents());
+    auto* s = static_cast<float*>(sn.contents());
+    for (int i = 0; i < n * (rot / 2); ++i) { c[i] = 1.0f; s[i] = 0.0f; }
+    std::memset(kh.contents(), 0, win * 2);
+  }
+  // What a 32-bit offset made of head 55's first written row.
+  const std::size_t wrap =
+      (((std::size_t)(NH - 1) * S + r0) * HD) & 0xffffffffull;
+  CommandStream stream = mc->make_command_stream();
+  {
+    ComputeEncoder enc = stream.begin_compute();
+    enc.set_function(trope);
+    enc.set_buffer(0, qkv); enc.set_buffer(1, kh);
+    enc.set_buffer(2, cs); enc.set_buffer(3, sn);
+    enc.set_constant(4, NH);
+    enc.set_constant(5, n);
+    enc.set_constant(6, HD);
+    enc.set_constant(7, rot);
+    enc.set_constant(8, 3 * I);
+    enc.set_constant(9, I);
+    enc.set_constant(10, HD);
+    enc.set_constant(11, S);
+    enc.set_constant(12, r0);
+    enc.dispatch({(unsigned)HD, (unsigned)n, (unsigned)NH},
+                 {(unsigned)HD, 1, 1});
+    enc.end();
+  }
+  stream.commit().wait();
+  const auto* kp = static_cast<const std::uint16_t*>(kh.contents());
+  auto kref = [&](int h, int t, int d) {
+    return to_bf16_(val(t, I + h * HD + d));
+  };
+  int bad = 0;
+  for (int h : {0, 33, NH - 1}) {
+    for (int t = 0; t < n; ++t) {
+      for (int d = 0; d < HD; ++d) {
+        const std::size_t at = ((std::size_t)h * S + r0 + t) * HD + d;
+        if (kp[at] != kref(h, t, d)) { ++bad; }
+      }
+    }
+  }
+  int clobbered = 0;
+  for (int d = 0; d < HD; ++d) { clobbered += kp[wrap + d] != 0; }
+  std::printf("  transpose-rope band  bad %d  wrapped row written %d\n", bad,
+              clobbered);
+  EXPECT_TRUE(bad == 0 && clobbered == 0);
+  // The readers below see the keys where they belong, placed by the CPU:
+  // read through the same wrong 32-bit offset the old transpose wrote
+  // through, a reader would find them and pass.
+  {
+    auto* w = static_cast<std::uint16_t*>(kh.contents());
+    std::memset(w, 0, win * 2);
+    for (int h = 0; h < NH; ++h) {
+      for (int t = 0; t < n; ++t) {
+        for (int d = 0; d < HD; ++d) {
+          w[((std::size_t)h * S + r0 + t) * HD + d] = kref(h, t, d);
+        }
+      }
+    }
+  }
+
+  // Sol's band gather: the band's rows of every head out of the whole
+  // window into [H, n, D], through the copy the banded forward hands Sol
+  // its queries with (HeadRowCopy, the same call). A 32-bit product of
+  // the head stride is negative from head 28 here (from head 44 at 2560
+  // x 1440 x 362 frames, ~387k rows) and reads before the buffer; the
+  // class loads its own 64-bit kernel, so no caller can pass that one.
+  {
+    genai::minimax_h3::HeadRowCopy rows;
+    SharedBuffer qb = mc->make_shared_buffer((std::size_t)NH * n * HD * 2);
+    if (!rows.load(mc) || qb.empty()) { EXPECT_TRUE(false); return; }
+    std::memset(qb.contents(), 0xff, (std::size_t)NH * n * HD * 2);
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      rows.encode(enc, kh, (std::size_t)r0 * HD * 2, S, 0, qb, 0, n, 0, NH,
+                  HD, n);
+      enc.end();
+    }
+    st.commit().wait();
+    const auto* g = static_cast<const std::uint16_t*>(qb.contents());
+    int gbad = 0;
+    for (int h = 0; h < NH; ++h) {
+      for (int t = 0; t < n; ++t) {
+        for (int d = 0; d < HD; ++d) {
+          gbad += g[((std::size_t)h * n + t) * HD + d] != kref(h, t, d);
+        }
+      }
+    }
+    std::printf("  band gather (wide)  bad %d\n", gbad);
+    EXPECT_TRUE(gbad == 0);
+  }
+
+  // Sage's per-token quantizer over every row's keys: one scale a row.
+  {
+    SharedBuffer q8 = mc->make_shared_buffer(win);
+    SharedBuffer sc = mc->make_shared_buffer((std::size_t)NH * S * 4);
+    SharedBuffer mean = mc->make_shared_buffer((std::size_t)NH * HD * 4);
+    if (q8.empty() || sc.empty() || mean.empty()) {
+      EXPECT_TRUE(false);
+      return;
+    }
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      enc.set_function(qtok);
+      enc.set_buffer(0, kh); enc.set_buffer(1, q8); enc.set_buffer(2, sc);
+      enc.set_constant(3, S);
+      enc.set_constant(4, HD);
+      enc.set_constant(5, HD);
+      enc.set_constant(6, (unsigned)0);
+      enc.set_constant(7, S * HD);
+      enc.set_buffer(8, mean);
+      enc.set_constant(9, 0);
+      enc.dispatch({256u, (unsigned)NH, (unsigned)((S + 63) / 64)},
+                   {256, 1, 1});
+      enc.end();
+    }
+    st.commit().wait();
+    const auto* qp = static_cast<const std::int8_t*>(q8.contents());
+    const auto* sp = static_cast<const float*>(sc.contents());
+    int qbad = 0;
+    const int h = NH - 1;
+    for (int t = 0; t < n; ++t) {
+      float am = 0.0f;
+      for (int d = 0; d < HD; ++d) {
+        am = std::max(am, std::fabs(from_bf16_(kref(h, t, d))));
+      }
+      const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+      const std::size_t row = (std::size_t)h * S + r0 + t;
+      if (std::fabs(sp[row] - am / 127.0f) > 1e-6f) { ++qbad; }
+      for (int d = 0; d < HD; ++d) {
+        const float want = std::clamp(
+            std::nearbyint(from_bf16_(kref(h, t, d)) * inv), -127.0f,
+            127.0f);
+        if (std::abs((int)qp[row * HD + d] - (int)want) > 1) { ++qbad; }
+      }
+    }
+    std::printf("  sage per-token quant  bad %d\n", qbad);
+    EXPECT_TRUE(qbad == 0);
+  }
+
+  // Sol's key summaries: a block's mean, per head, over every row.
+  {
+    const int BLK = 64, NK = S / BLK;
+    SharedBuffer kc = mc->make_shared_buffer((std::size_t)NH * NK * HD * 2);
+    if (kc.empty()) { EXPECT_TRUE(false); return; }
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      enc.set_function(summ);
+      enc.set_buffer(0, kh); enc.set_buffer(1, kh); enc.set_buffer(2, kh);
+      enc.set_buffer(3, kc); enc.set_buffer(4, kc); enc.set_buffer(5, kc);
+      enc.set_constant(6, S);
+      enc.set_constant(7, HD);
+      enc.set_constant(8, NK);
+      enc.set_constant(9, BLK);
+      enc.set_constant(10, 2);    // k
+      enc.set_constant(11, S);
+      enc.dispatch({(unsigned)HD, (unsigned)NH, (unsigned)NK},
+                   {(unsigned)HD, 1, 1});
+      enc.end();
+    }
+    st.commit().wait();
+    const auto* cp = static_cast<const std::uint16_t*>(kc.contents());
+    int sbad = 0;
+    double worst = 0.0;
+    const int h = NH - 1;
+    for (int b = r0 / BLK; b < NK; ++b) {
+      for (int d = 0; d < HD; ++d) {
+        double m = 0.0;
+        for (int t = 0; t < BLK; ++t) {
+          m += from_bf16_(kref(h, b * BLK + t - r0, d));
+        }
+        m /= BLK;
+        const double got =
+            from_bf16_(cp[((std::size_t)h * NK + b) * HD + d]);
+        const double e = std::fabs(got - m);
+        worst = std::max(worst, e);
+        if (e > 0.02) { ++sbad; }
+      }
+    }
+    std::printf("  sol key summaries  bad %d  worst %.4f\n", sbad, worst);
+    EXPECT_TRUE(sbad == 0);
+  }
+
+  // The head-major window back to row-major [rows, heads, D].
+  {
+    SharedBuffer rm = mc->make_shared_buffer(win * 2);
+    if (rm.empty()) { EXPECT_TRUE(false); return; }
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      enc.set_function(tabd);
+      enc.set_buffer(0, kh); enc.set_buffer(1, rm);
+      enc.set_constant(2, NH);
+      enc.set_constant(3, S);
+      enc.set_constant(4, HD);
+      enc.dispatch({(unsigned)HD, (unsigned)S, (unsigned)NH},
+                   {(unsigned)HD, 1, 1});
+      enc.end();
+    }
+    st.commit().wait();
+    const auto* rp = static_cast<const std::uint16_t*>(rm.contents());
+    int tbad = 0;
+    for (int h : {0, NH - 1}) {
+      for (int t = 0; t < n; ++t) {
+        for (int d = 0; d < HD; ++d) {
+          const std::size_t at =
+              ((std::size_t)(r0 + t) * NH + h) * HD + d;
+          if (rp[at] != kref(h, t, d)) { ++tbad; }
+        }
+      }
+    }
+    std::printf("  head-major transpose  bad %d\n", tbad);
+    EXPECT_TRUE(tbad == 0);
+  }
+  kh = SharedBuffer{};
+
+  // The residual stream's RMS norm: [R, 5376] past 2^32 elements.
+  {
+    const int W = 5376, R = 800000, tail = 4;
+    const std::size_t e = (std::size_t)R * W;
+    SharedBuffer x = mc->make_shared_buffer(e * 2);
+    SharedBuffer y = mc->make_shared_buffer(e * 2);
+    SharedBuffer g = mc->make_shared_buffer((std::size_t)W * 2);
+    if (x.empty() || y.empty() || g.empty()) {
+      EXPECT_TRUE(false);
+      return;
+    }
+    auto* xp = static_cast<std::uint16_t*>(x.contents());
+    std::memset(xp, 0, e * 2);
+    for (int r = R - tail; r < R; ++r) {
+      for (int c = 0; c < W; ++c) {
+        xp[(std::size_t)r * W + c] = to_bf16_(val(r, c));
+      }
+    }
+    auto* gp = static_cast<std::uint16_t*>(g.contents());
+    for (int c = 0; c < W; ++c) { gp[c] = to_bf16_(1.0f); }
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder enc = st.begin_compute();
+      enc.set_function(rms);
+      enc.set_buffer(0, x); enc.set_buffer(1, g); enc.set_buffer(2, y);
+      enc.set_constant(3, W);
+      enc.set_constant(4, 1e-6f);
+      enc.dispatch({256, (unsigned)R, 1}, {256, 1, 1});
+      enc.end();
+    }
+    st.commit().wait();
+    const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+    int nbad = 0;
+    for (int r = R - tail; r < R; ++r) {
+      double ss = 0.0;
+      for (int c = 0; c < W; ++c) {
+        const double v = from_bf16_(xp[(std::size_t)r * W + c]);
+        ss += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(ss / W + 1e-6);
+      for (int c = 0; c < W; ++c) {
+        const double want = from_bf16_(xp[(std::size_t)r * W + c]) * inv;
+        const double got = from_bf16_(yp[(std::size_t)r * W + c]);
+        if (std::fabs(got - want) > 0.02 * std::max(1.0, std::fabs(want))) {
+          ++nbad;
+        }
+      }
+    }
+    std::printf("  rms norm past 2^32  bad %d\n", nbad);
+    EXPECT_TRUE(nbad == 0);
+  }
 }

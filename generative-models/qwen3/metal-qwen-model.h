@@ -1957,6 +1957,7 @@ private:
   // Dynamic-int8 accelerated prefill GEMMs (set_i8_gemm); null when off.
   std::unique_ptr<I8GemmContext> _i8;
   std::uint64_t _i8_count = 0;
+  int _i8_want = -1;   // the last set_i8_gemm's `on` (-1: none yet)
   // Split-K for the very deep down_proj contraction (Qwen3.6-27B, K=17408).
   // Inert on every other checkpoint -- it keys on the exact depth.
   MmaSplitK _splitk;

@@ -1053,6 +1053,12 @@ GenerativeModelManager::revise_declaration(const string& dir,
   it->second = bytes;
 }
 
+std::uint64_t
+GenerativeModelManager::launch_epoch() const noexcept
+{
+  return _launch_epoch.load(std::memory_order_relaxed);
+}
+
 void
 GenerativeModelManager::clear_declarations()
 {
@@ -1093,6 +1099,8 @@ GenerativeModelManager::clear_declarations()
   lock_guard<mutex> lk(_ws_mu);
   _declared.clear();
   _declared_floor.clear();
+  // A new launch: its stages' requests to shared models start afresh.
+  _launch_epoch.fetch_add(1, std::memory_order_relaxed);
   // Same scope, same reason as the declarations they qualify: a phase
   // is stated per launch from the owning stage's policy, and a graph
   // without that stage must not inherit its claim.

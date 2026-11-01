@@ -109,6 +109,10 @@ add_vpipe_metal_kernel(fish_dac SRC ops/fish_dac.metal)
 add_vpipe_metal_kernel(minimax_music3 SRC ops/minimax_music3.metal)
 add_vpipe_metal_kernel(minimax_music3_bf16 SRC ops/minimax_music3.metal
                        DEFINES VPIPE_ELT=bfloat)
+# LFM3 / LFM3-VL: the gated short convolution, the vision tower's gated
+# 3x3 depthwise conv, the per-head attention gate and a few-row GEMV
+# (generative-models/lfm3/).
+add_vpipe_metal_kernel(lfm3 SRC ops/lfm3.metal)
 # Open-H3-Regenerate-2K: MiniMax-H3's latent upscaler (its folded-affine
 # GroupNorm, temporal depthwise conv and bilinear resize) and the LMS
 # Sharp curve branch on the DiT's AdaLN (generative-models/minimax-h3/).

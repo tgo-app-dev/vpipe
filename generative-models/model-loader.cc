@@ -786,8 +786,12 @@ apply_preprocessor_(const filesystem::path&    dir,
   filesystem::path pp_path = dir / "preprocessor_config.json";
   auto pp_fd = read_json_file_(pp_path);
   const char* pp_file = "preprocessor_config.json";
+  const bool lfm3 =
+      config->architecture == "Lfm3VlForConditionalGeneration";
+  FlexData video_pp;
   if ((!pp_fd || !pp_fd->is_object())
-      && config->architecture == "Mistral3ForConditionalGeneration") {
+      && (config->architecture == "Mistral3ForConditionalGeneration"
+          || lfm3)) {
     // Pixtral ships processor_config.json instead, its image settings
     // under `image_processor` -- including the longest-edge budget.
     // (Only here: other families that ship one -- the Gemma-4 e4b MLX
@@ -800,8 +804,11 @@ apply_preprocessor_(const filesystem::path&    dir,
     }
     pp_fd = pc_fd->as_object().at("image_processor");
     if (!pp_fd->is_object()) { return; }
+    // LFM3-VL's processor is a Qwen-VL one (pixel-count bounds, read
+    // below), its video settings beside the image's.
+    if (lfm3) { video_pp = bag::value(*pc_fd, "video_processor"); }
     const FlexData size = bag::value(*pp_fd, "size");
-    if (bag::has(size, "longest_edge")) {
+    if (!lfm3 && bag::has(size, "longest_edge")) {
       bag::set_integer(config->extra, model_config::kVisionImageSize,
                        bag::integer(size, "longest_edge"));
     }
@@ -847,6 +854,9 @@ apply_preprocessor_(const filesystem::path&    dir,
               model_config::kVisionMaxPixels);
   if (auto vp = read_json_file_(dir / "video_preprocessor_config.json")) {
     qwen_bounds(*vp, model_config::kVisionVideoMinPixels,
+                model_config::kVisionVideoMaxPixels);
+  } else if (video_pp.is_object()) {
+    qwen_bounds(video_pp, model_config::kVisionVideoMinPixels,
                 model_config::kVisionVideoMaxPixels);
   }
   if (session) {

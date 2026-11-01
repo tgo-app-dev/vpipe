@@ -1700,6 +1700,104 @@ TEST(minimax_h3_regenerate, fast_vae_bench)
   }
 }
 
+// A LONG CLIP DECODES ITS BEGINNING AS A SHORT ONE DOES. The fast
+// decoder attends within windows of neighbouring latent frames and its
+// blocks' global tokens, so the first frames of a long clip are those of
+// the same latent cut short -- up to the last blocks before the cut, which
+// see past it. A long decode whose early frames come out otherwise has
+// lost track of where it is (an offset past 2^31: the stream is [cells,
+// 2048], 3.16G elements at 2560 x 1440 x 362 frames, 1.24G at 141).
+// VPIPE_OPEN_H3_FVAE_LONG=T,h,w (107,90,160: 2560 x 1440 x 362 frames),
+// cut at VPIPE_OPEN_H3_FVAE_CUT latent frames (42), int8 tier
+// VPIPE_OPEN_H3_FVAE_I8 (none).
+TEST(minimax_h3_regenerate, fast_vae_long_clip_keeps_its_prefix)
+{
+  const std::string root = env_("VPIPE_OPEN_H3_TEST_MODEL_PATH");
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string geo = env_("VPIPE_OPEN_H3_FVAE_LONG");
+  if (root.empty() || h3root.empty() || geo.empty()) {
+    std::printf("  SKIP: VPIPE_OPEN_H3_FVAE_LONG unset\n");
+    return;
+  }
+  int T = 107, h = 90, w = 160;
+  if (geo != "1") { std::sscanf(geo.c_str(), "%d,%d,%d", &T, &h, &w); }
+  const std::string cut_s = env_("VPIPE_OPEN_H3_FVAE_CUT");
+  const int Tc = cut_s.empty() ? 42 : std::atoi(cut_s.c_str());
+  ASSERT_TRUE(Tc > 10 && Tc < T);
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  std::string err;
+  auto ws = WeightSet::open(MetalMiniMaxH3FastVae::resolve_weights(root),
+                            nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  if (!ws) { return; }
+  MetalMiniMaxH3FastVae::Config cfg;
+  ASSERT_TRUE(MetalMiniMaxH3FastVae::config_from(
+      *ws, MetalMiniMaxH3VideoVae::resolve_vae_dir(h3root), &cfg, &err));
+  if (!env_("VPIPE_OPEN_H3_FVAE_I8").empty()) {
+    cfg.i8_tier = std::atoi(env_("VPIPE_OPEN_H3_FVAE_I8").c_str());
+  }
+  auto vae = MetalMiniMaxH3FastVae::load(ws, mc, cfg, &err);
+  ASSERT_TRUE(vae != nullptr);
+  if (!vae) { std::printf("  load: %s\n", err.c_str()); return; }
+  // A smooth latent, varying in time and space, so a wrong row is seen.
+  const std::size_t plane = (std::size_t)h * w;
+  auto zval = [&](int c, int t, std::size_t i) {
+    const double y = (double)(i / w), x = (double)(i % w);
+    return (float)(0.8 * std::sin(0.11 * x + 0.07 * y + 0.5 * c +
+                                  0.21 * t));
+  };
+  std::vector<float> zl((std::size_t)24 * T * plane);
+  std::vector<float> zs((std::size_t)24 * Tc * plane);
+  for (int c = 0; c < 24; ++c) {
+    for (int t = 0; t < T; ++t) {
+      for (std::size_t i = 0; i < plane; ++i) {
+        const float v = zval(c, t, i);
+        zl[((std::size_t)c * T + t) * plane + i] = v;
+        if (t < Tc) { zs[((std::size_t)c * Tc + t) * plane + i] = v; }
+      }
+    }
+  }
+  metal_compute::SharedBuffer pl = vae->decode(zl.data(), T, h, w, &err);
+  ASSERT_TRUE(!pl.empty());
+  if (pl.empty()) { std::printf("  long: %s\n", err.c_str()); return; }
+  metal_compute::SharedBuffer ps = vae->decode(zs.data(), Tc, h, w, &err);
+  ASSERT_TRUE(!ps.empty());
+  if (ps.empty()) { std::printf("  short: %s\n", err.c_str()); return; }
+  const int Fl = vae->decoded_frames(T), Fs = vae->decoded_frames(Tc);
+  const std::size_t fp = (std::size_t)h * 16 * w * 16;
+  const auto* a = static_cast<const std::uint16_t*>(pl.contents());
+  const auto* b = static_cast<const std::uint16_t*>(ps.contents());
+  // Frames clear of the cut: two blocks of 5 latents (~34 frames) back.
+  const int upto = std::max(1, Fs - 40);
+  int worst_f = -1;
+  double worst = 0.0;
+  for (int f = 0; f < upto; ++f) {
+    double se = 0.0;
+    for (int c = 0; c < 3; ++c) {
+      const std::size_t oa = ((std::size_t)c * Fl + f) * fp;
+      const std::size_t ob = ((std::size_t)c * Fs + f) * fp;
+      for (std::size_t i = 0; i < fp; i += 7) {
+        const double d =
+            (double)from_bf16_(a[oa + i]) - (double)from_bf16_(b[ob + i]);
+        se += d * d;
+      }
+    }
+    const double rms = std::sqrt(se / (double)(3 * ((fp + 6) / 7)));
+    if (rms > worst) { worst = rms; worst_f = f; }
+    if (f % 20 == 0 || rms > 0.05) {
+      std::printf("  frame %3d  rms %.5f\n", f, rms);
+    }
+  }
+  std::printf("  [24, %d, %d, %d] -> %d frames against its first %d "
+              "latents -> %d: frames 0..%d, worst rms %.5f at %d "
+              "(%.2fG stream elements)\n", T, h, w, Fl, Tc, Fs, upto - 1,
+              worst, worst_f,
+              (double)T * plane * cfg.dim / 1e9);
+  EXPECT_TRUE(worst < 0.02);
+}
+
 // A FORWARD ROUTES WITH ITS OWN TAU AND THRESHOLD (Step::sol_routing):
 // what generate-video's `sol_tau_steps` and the denoise's Sol probe both
 // rest on. Two real blocks under the merged LoRA, Sol loaded at tau 1.0

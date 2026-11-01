@@ -1226,6 +1226,109 @@ TEST(metal_lm_smoke, a_warm_model_stays_beside_a_launch_that_fits) {
   fs::remove_all(other, ec);
 }
 
+// The int8 prefill's flag follows the LAUNCH, not the last stage. Every
+// load of one spec shares one model -- a launch's stages naming one
+// checkpoint, and a later launch handed a model kept warm -- so a stage
+// states its preference with request_i8_prefill, tagged with the
+// manager's launch epoch (bumped where every launch's plan begins): in
+// a launch the model runs int8 if ANY stage asked, whatever order their
+// initialize() ran in, and a new launch starts afresh -- a warm model
+// handed to a stage that does not ask is in 16 bits again. Requests from
+// stages initializing together are serialised. The flag as asked, not as
+// run (that needs matrix cores), so this holds on any GPU.
+// Env VPIPE_QWEN35_TEST_MODEL_PATH and / or VPIPE_LFM3_TEST_MODEL_PATH
+// (the two execs with the int8 route).
+TEST(metal_lm_smoke, i8_prefill_follows_the_launch_not_the_last_stage) {
+  const char* envs[] = {"VPIPE_QWEN35_TEST_MODEL_PATH",
+                        "VPIPE_LFM3_TEST_MODEL_PATH"};
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  for (const char* e : envs) {
+    const char* path = std::getenv(e);
+    if (!path || !*path) { continue; }
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    Session sess;
+    auto* mgr = sess.generative_model_manager();
+    ASSERT_TRUE(mgr != nullptr);
+    if (mgr == nullptr) { return; }
+    genai::LoadSpec spec;
+    spec.hf_dir = path;
+    spec.page_tokens = 256;
+    spec.max_pages = 8;
+    auto lm = mgr->load(spec);
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    ASSERT_TRUE(lm != nullptr && lm->valid());
+    if (!lm || !lm->valid()) { continue; }
+    // A launch as the runtime opens one: its plan (claiming the model,
+    // so a warm one is kept), then the stages' initialize().
+    auto launch = [&]() {
+      pl->begin_plan(&sess);
+      pl->claim(&sess, path, "", "", 0);
+      pl->end_plan(&sess);
+      return mgr->launch_epoch();
+    };
+    auto asked = [&]() { return lm->i8_prefill_requested(); };
+    // Launch 1: a stage asks, a second sharing the model does not.
+    const std::uint64_t e1 = launch();
+    lm->request_i8_prefill(true, e1);
+    const bool one = asked();
+    lm->request_i8_prefill(false, e1);
+    const bool both = asked();
+    // Kept warm and handed to the next load: the flag rides along...
+    genai::LoadedLanguageModel* const raw = lm.get();
+    mgr->keep_warm(lm, path, 600.0);
+    lm.reset();
+    lm = mgr->load(spec);
+    ASSERT_TRUE(lm.get() == raw);
+    if (lm.get() != raw) { return; }
+    const bool carried = asked();
+    // ...and launch 2's stage, which does not ask, puts it back.
+    const std::uint64_t e2 = launch();
+    lm->request_i8_prefill(false, e2);
+    const bool handed = asked();
+    // Launch 3: the same two stages in the other order.
+    const std::uint64_t e3 = launch();
+    lm->request_i8_prefill(false, e3);
+    lm->request_i8_prefill(true, e3);
+    const bool reversed = asked();
+    // Launch 4: eight stages initializing together, one asking; launch
+    // 5: none asking.
+    auto together = [&](std::uint64_t ep, int asker) {
+      std::vector<std::thread> ts;
+      for (int i = 0; i < 8; ++i) {
+        ts.emplace_back([&, i] { lm->request_i8_prefill(i == asker, ep); });
+      }
+      for (auto& t : ts) { t.join(); }
+      return asked();
+    };
+    const bool four = together(launch(), 5);
+    const bool five = together(launch(), -1);
+    // set_i8_prefill sets it outright; the next launch starts afresh.
+    lm->set_i8_prefill(true);
+    const bool outright = asked();
+    lm->request_i8_prefill(false, launch());
+    const bool after = asked();
+    std::printf("[i8-flag] %s: launch 1 asked %d, + a stage not asking %d; "
+                "handed over warm %d, launch 2 not asking %d; launch 3 in "
+                "the other order %d; 8 together, one asking %d, none %d; "
+                "outright %d, then a launch not asking %d (epochs %llu.."
+                "%llu)\n", path, one, both, carried, handed, reversed, four,
+                five, outright, after, (unsigned long long)e1,
+                (unsigned long long)mgr->launch_epoch());
+    EXPECT_TRUE(e2 > e1 && e3 > e2);
+    EXPECT_TRUE(one && both);
+    EXPECT_TRUE(carried);
+    EXPECT_TRUE(!handed);
+    EXPECT_TRUE(reversed);
+    EXPECT_TRUE(four && !five);
+    EXPECT_TRUE(outright && !after);
+    mgr->keep_warm(lm, path, 0.0);
+    mgr->clear_declarations();
+  }
+}
+
 // A long prefill onto a BRANCHED context answers as the same tokens fed to
 // an unbranched one. branch() freezes the parent's partial tail page, so
 // the child's next page starts mid-sequence; the steel prefill attention

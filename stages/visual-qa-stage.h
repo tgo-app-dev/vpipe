@@ -308,6 +308,7 @@ private:
   // Pixtral tower + Mistral3 projector (borrowed; its family's only
   // tower). Rows include the image's [IMG_BREAK] / [IMG_END] rows.
   genai::MetalPixtralVisionEncoder*           _mpix = nullptr;  // borrowed
+  genai::MetalLfm3VisionEncoder*              _mlfm = nullptr;  // borrowed
   // The tower encode() runs, by the same priority, for logs.
   const char* tower_name_() const;
   // Gemma-4-12B "unified" encoder-less shallow embedder (borrowed; host-f32

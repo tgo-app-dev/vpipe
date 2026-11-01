@@ -194,6 +194,8 @@ family_version_(const std::string& mt, std::string& family,
       {"gemma4-vision-encoder",  "Gemma",       "4"},
       {"llama3",                 "Llama",       "3"},
       {"mistral3",               "Ministral",   "3"},
+      {"lfm3-vl",                "LFM",         "3-VL"},
+      {"lfm3",                   "LFM",         "3"},
       {"krea2",                  "Krea",        "2"},
       {"krea2-lora",             "Krea",        "2"},
       {"flux2",                  "FLUX",        "2"},
@@ -308,6 +310,9 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   // Mistral3ForConditionalGeneration (Ministral-3): the Pixtral tower +
   // a dense decoder, run on the metal Qwen path.
   if (starts("mistral3"))          { return "mistral3"; }
+  // Liquid AI's LFM3 (generative-models/lfm3/): the VL checkpoint first.
+  if (starts("lfm3_vl"))           { return "lfm3-vl"; }
+  if (starts("lfm3"))              { return "lfm3"; }
   return {};
 }
 
@@ -697,7 +702,7 @@ bool
 io_trim_is_meaningful_(const std::string& mt)
 {
   return mt == "qwen3.5" || mt == "qwen3.6" || mt == "gemma4"
-         || mt == "gemma4_unified" || mt == "mistral3";
+         || mt == "gemma4_unified" || mt == "mistral3" || mt == "lfm3-vl";
 }
 
 // Drop modalities the checkpoint plainly does not carry. The per-type

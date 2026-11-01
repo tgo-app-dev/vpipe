@@ -175,6 +175,9 @@ you want to see the model work before spending the hours and the 115 GB.
 - **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
   — the same, anchored to an image at both ends (see
   [More than text in](#more-than-text-in)).
+- **[`minimax-h3-last-frame-to-video.vpipeline`](pipelines/minimax-h3-last-frame-to-video.vpipeline)**
+  — the same, but the clip *ends* on the image instead (see
+  [More than text in](#more-than-text-in)).
 - **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
   — the **Ref2VA** partition instead: reference images, clips and soundtracks
   in, `.mp4` out, each one prepared to a size you choose (see
@@ -627,6 +630,18 @@ The checkpoint is named **FL2VA** — *first-and-last to video and audio*. Feed
 anchored to it as the opening frame; add a second `vae-encode` on port 6 and
 the model interpolates between two stills. Both anchors must be encoded at
 the same resolution the clip is generated at.
+
+Port 6 also works **on its own**: wire the `vae-encode` there and leave
+port 5 empty, and the clip is generated *up to* that picture — it ends on
+it instead of starting from it (last frame to video). Write the prompt for a
+shot that arrives at the picture rather than one that leaves it, and show it
+to the conditioner on `ref_image` (port 3), where it is `<Picture 1>`. The
+log's anchor line says which end each anchor pins (`1 keyframe anchor (last
+frame)`).
+[`minimax-h3-last-frame-to-video.vpipeline`](pipelines/minimax-h3-last-frame-to-video.vpipeline)
+is that graph: one `reference.jpg`, centre-cropped to 960x544 and encoded
+once, and a prompt that glides in and settles on it. It runs the way the
+graph below does.
 
 [`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)
 is that graph, worked through. Drop a `reference.jpg` beside it and run it the
@@ -3070,10 +3085,8 @@ outside the window, and the linear half never sees them.
 
 vpipe gives those rows the same treatment, so the graphs in
 [More than text in](#more-than-text-in) take the branch as they are: one anchor
-for an opening frame, two for first and last. A last frame on its own is the one mode upstream has
-that this graph does not wire — `generate-video` ignores a last-frame anchor
-with no first, and says so. The log notes the keyframe count once per
-geometry.
+for an opening frame, two for first and last, and port 6 alone for a last
+frame. The log notes the keyframe count once per geometry.
 
 Nothing checks the partition for you, though. It is chosen on `model-select`
 and the branch on `minimax-h3-model-config`, two different stages, and a

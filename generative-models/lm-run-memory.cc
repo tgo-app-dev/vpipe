@@ -9,11 +9,13 @@
 #include "generative-models/deepseek-v41/deepseek-v41-config.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-model.h"
 #include "generative-models/gemma4/metal-gemma-model.h"
+#include "generative-models/lfm3/metal-lfm3-model.h"
 #include "generative-models/llama3/metal-llama-model.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <system_error>
 
@@ -77,6 +79,9 @@ lm_family(const std::string& a)
     return LmFamily::kGemma;
   }
   if (a == "DeepseekV41ForCausalLM") { return LmFamily::kDeepseekV41; }
+  if (a == "Lfm3VlForConditionalGeneration" || a == "Lfm3ForCausalLM") {
+    return LmFamily::kLfm3;
+  }
   return LmFamily::kNone;
 }
 
@@ -144,6 +149,20 @@ lm_run_bytes(const SessionContextIntf* session, const std::string& dir,
                                               shape.draft_head) +
              (std::size_t)(ctxs - 1) *
                  MetalDeepseekV41Model::context_bytes(dc, 0);
+    }
+    case LmFamily::kLfm3: {
+      // as LoadedLanguageModel loads it (MetalLfm3ModelExec)
+      MetalLfm3Model::Config c;
+      if (!MetalLfm3Model::Config::from_dir(dir, &c, nullptr)) { return 0; }
+      c.page_tokens = shape.page_tokens;
+      c.max_pages = (int)shape.max_pages;
+      // the int8 prefill as its context decides (VPIPE_I8_GEMM wins)
+      bool i8 = shape.i8_prefill;
+      if (const char* e = std::getenv("VPIPE_I8_GEMM")) {
+        i8 = std::atoi(e) != 0;
+      }
+      return MetalLfm3Model::run_bytes(c, kv_bound_(shape, c.max_seq), ctxs,
+                                       i8 && cores);
     }
     case LmFamily::kNone:
       break;

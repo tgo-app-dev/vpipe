@@ -341,6 +341,22 @@ builtin_catalog_()
      .files = {"Qwen3.8-27B-Q8_0.gguf",    // main quant
                "mmproj-F16.gguf"},         // F16 multimodal projector
      .needs_tokenizer_json = false},
+    // ---- LFM3-VL (Liquid AI, LFM Open License v1.0) ---------------------
+    //
+    // A 1.73B LFM3 language model -- 13 gated short convolutions, 5
+    // sliding-window and 6 global attention layers -- under a 164M vision
+    // tower of gated 3x3 convolutions and bidirectional attention, a token
+    // a 32 x 32 pixel block (generative-models/lfm3/). BF16, run at F16.
+    // The repo's Python (trust_remote_code) is not fetched: nothing here
+    // runs it. 3.8 GB.
+    {.family = "LFM", .version = "3-VL", .param_class = "2B",
+     .variant = "BF16 (Liquid AI)",
+     .hf_path = "LiquidAI/LFM3-VL-2B", .model_type = "lfm3-vl",
+     .files = {"config.json", "generation_config.json",
+               "chat_template.jinja", "processor_config.json",
+               "tokenizer.json", "tokenizer_config.json",
+               "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = true},
     // ---- Ternary-Bonsai (Prism ML, Apache-2.0) --------------------------
     //
     // Ternary trainings of the Qwen hybrids: every language projection,
@@ -3067,6 +3083,12 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"text"});
   } else if (mt == "qwen3-asr") {
     set({"audio"}, {"text"});
+  } else if (mt == "lfm3-vl") {
+    // LFM3-VL: text and images in (its own tower), text out; video as
+    // frames.
+    set({"text", "image", "video"}, {"text"});
+  } else if (mt == "lfm3") {
+    set({"text"}, {"text"});
   } else if (mt == "mistral3") {
     // Ministral-3: text and images in (the Pixtral tower), text out.
     set({"text", "image"}, {"text"});

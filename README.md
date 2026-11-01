@@ -124,7 +124,7 @@ speed claim. [^3]
 | --- | --- |
 | Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
 | Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9B / 9b-kv:** 4-bit reference image editing and two-reference composition, 4-step default pipelines and compare-image UI on Apple Silicon; the -kv variant trades a little quality for speed. **FLUX.3 Image Klein:** text-to-image and reference editing on the published bf16 weights in 16 steps, the joint blocks' feed-forward on the ANE (1.6x on an M4 Pro). |
-| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. **Ministral 3 14B:** text and image chat (Pixtral vision tower) on the MLX 4-bit weights. **DeepSeek-V4.1-Flash:** text and image chat with the 552B MoE on a 64 GB Mac, its routed experts served from a cache sized to the machine, with its own DSpark speculative decoding on a machine that holds every expert. |
+| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. **Ministral 3 14B:** text and image chat (Pixtral vision tower) on the MLX 4-bit weights. **LFM3-VL 2B:** Liquid AI's convolution / attention hybrid, text and image chat and live-video questions (realtime-vqa) on the published bf16 weights. **DeepSeek-V4.1-Flash:** text and image chat with the 552B MoE on a 64 GB Mac, its routed experts served from a cache sized to the machine, with its own DSpark speculative decoding on a machine that holds every expert. |
 
 See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
 settings, caveats, and Turbo LoRA notes; **[docs/KREA-2.md](docs/KREA-2.md)**
@@ -133,8 +133,8 @@ for text-to-image, the tuned 8-step schedule and the live denoising preview;
 and **[docs/KLEIN.md](docs/KLEIN.md)** and
 **[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
 workflows, **[docs/MINISTRAL3.md](docs/MINISTRAL3.md)** for Ministral 3
-chat with pictures, and **[docs/DEEPSEEK-V41.md](docs/DEEPSEEK-V41.md)** for
-DeepSeek-V4.1-Flash.
+chat with pictures, **[docs/LFM3-VL.md](docs/LFM3-VL.md)** for LFM3-VL, and
+**[docs/DEEPSEEK-V41.md](docs/DEEPSEEK-V41.md)** for DeepSeek-V4.1-Flash.
 
 [^3]: These are matched MiniMax H3 runs, not a general speed claim.
 

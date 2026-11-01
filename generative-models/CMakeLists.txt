@@ -129,6 +129,9 @@ set(LOCAL_SOURCES
   deepseek-v41/metal-deepseek-v41-model.cc
   deepseek-v41/metal-deepseek-v41-model-exec.cc
   deepseek-v41/metal-deepseek-v41-vision.cc
+  lfm3/metal-lfm3-model.cc
+  lfm3/metal-lfm3-model-exec.cc
+  lfm3/metal-lfm3-vision.cc
   drama3/metal-drama3-model.cc
   drama3/metal-fish-codec.cc
   flux2/metal-flux2-transformer.cc
@@ -227,6 +230,10 @@ set(LOCAL_HEADERS
   deepseek-v41/metal-deepseek-v41-model.h
   deepseek-v41/metal-deepseek-v41-model-exec.h
   deepseek-v41/metal-deepseek-v41-vision.h
+  lfm3/lfm3-weights.h
+  lfm3/metal-lfm3-model.h
+  lfm3/metal-lfm3-model-exec.h
+  lfm3/metal-lfm3-vision.h
   drama3/metal-drama3-model.h
   drama3/metal-fish-codec.h
   gemma4/gemma4-audio-feature-extractor.h

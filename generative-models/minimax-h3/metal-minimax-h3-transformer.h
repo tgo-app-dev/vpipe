@@ -8,6 +8,7 @@
 #include "generative-models/minimax-h3/metal-vdn-branch.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 #include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/shared/wired-pool.h"
@@ -2133,8 +2134,9 @@ class MetalMiniMaxH3Transformer {
   // directly instead of gathering.
   std::vector<int> _adaln_row0, _adaln_nt;
   metal_compute::ComputeFunction _fn_copy;
-  // copy_rect_f16: the streaming attention's K/V gathers.
-  metal_compute::ComputeFunction _fn_copy_rect;
+  // The per-head row copies, 64-bit: the streaming attention's K/V and
+  // the banded forward's Sol query gather.
+  minimax_h3::HeadRowCopy _head_rows;
 
   bool _lora_mma_off = false;    // VPIPE_H3_NO_LORA_MMA
   bool _lora_fuse_off = false;   // VPIPE_H3_NO_LORA_FUSE

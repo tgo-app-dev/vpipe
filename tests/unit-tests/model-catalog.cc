@@ -1583,6 +1583,28 @@ TEST(model_catalog, ministral3_present_with_vision) {
   EXPECT_TRUE(out.size() == 1 && out[0] == "text");
 }
 
+// LFM3-VL: catalogued with its file list (the repo's Python is not
+// fetched), text / image / video in, text out.
+TEST(model_catalog, lfm3_vl_present_with_vision) {
+  EXPECT_TRUE(has_(catalog_families(), "LFM"));
+  const ModelCatalogEntry* e = catalog_by_path("LiquidAI/LFM3-VL-2B");
+  EXPECT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "LFM" && e->version == "3-VL");
+  EXPECT_TRUE(e->param_class == "2B");
+  EXPECT_TRUE(e->model_type == "lfm3-vl");
+  EXPECT_TRUE(has_(e->files, "model.safetensors"));
+  EXPECT_TRUE(has_(e->files, "processor_config.json"));
+  for (const auto& f : e->files) {
+    EXPECT_TRUE(f.find(".py") == std::string::npos);
+  }
+  std::vector<std::string> in, out;
+  catalog_default_io("lfm3-vl", in, out);
+  EXPECT_TRUE(has_(in, "text") && has_(in, "image"));
+  EXPECT_FALSE(has_(in, "audio"));
+  EXPECT_TRUE(out.size() == 1 && out[0] == "text");
+}
+
 // FlashVSR+ publishes Turbo and Base as FOLDERS of one repository around
 // files they share, and the folder is the model -- the two are the same
 // tensors and differ only in how the family drives them. So each entry

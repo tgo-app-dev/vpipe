@@ -4800,6 +4800,10 @@ MetalQwenModel::set_i8_gemm(bool on)
   // shared/i8-gemm.h). The context self-gates on matrix cores + kernels;
   // VPIPE_I8_GEMM overrides the flag either way. The i8 kernels must match the
   // model's element type (bf16 backbones -- QIE / MOSS -- feed bf16 buffers).
+  // Asked again for the same state (every stage a shared model is handed
+  // to asks): the context, its scratch and its settled shapes stay.
+  if (_i8_want == (on ? 1 : 0)) { return; }
+  _i8_want = on ? 1 : 0;
   auto i8 = std::make_unique<I8GemmContext>(_mc, on, _cfg.use_bf16);
   _i8 = i8->enabled() ? std::move(i8) : nullptr;
 }

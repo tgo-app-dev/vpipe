@@ -47,6 +47,11 @@ using namespace metal;
 // grid (D, BH, CH) THREADS; threadgroup (D, 1, 1). One thread per
 // channel, so a threadgroup reads one whole row at a time.
 //
+// 64-BIT OFFSETS throughout: a long sequence's keys -- a MiniMax-H3
+// refine's [56, rows, 128] past 599,186 rows, or its fused [rows, 21504]
+// projection past 199,728 -- pass 2^32 elements, and in 32 bits the
+// later heads were read from, and quantized into, the earlier ones.
+//
 // HEAD STRIDE IS ITS OWN NUMBER, not L * row_stride. That identity
 // holds for a head-major [H, L, D] tensor and fails for every DiT in
 // this tree, because they read q/k IN PLACE inside a fused [rows, 3*I]
@@ -70,12 +75,13 @@ kernel void sage_k_sum_chunk(
   const int ch = (int)tid.z;
   const int per = (L + chunks - 1) / chunks;
   const int t0 = ch * per, t1 = min(L, t0 + per);
-  const device VPIPE_ELT* src = k + base_off + (uint)bh * head_stride;
+  const device VPIPE_ELT* src =
+      k + (ulong)base_off + (ulong)bh * (ulong)head_stride;
   // fp32 accumulation: the sum of 100k values around 1 is ~1e5, where
   // f16 would have stopped resolving the addend long before.
   float acc = 0.0f;
   for (int t = t0; t < t1; ++t) {
-    acc += (float)src[(uint)t * row_stride + c];
+    acc += (float)src[(ulong)t * (ulong)row_stride + c];
   }
   partial[((uint)bh * chunks + ch) * D + c] = acc;
 }
@@ -143,9 +149,10 @@ kernel void sage_quant_block(
   const int r1 = min(L, r0 + block);
   if (r0 >= L) { return; }
 
-  const device VPIPE_ELT* src = x + base_off + (uint)bh * head_stride;
+  const device VPIPE_ELT* src =
+      x + (ulong)base_off + (ulong)bh * (ulong)head_stride;
   const device float* mn = mean + (uint)bh * D;
-  device char* dst = q + (uint)bh * L * D;
+  device char* dst = q + (ulong)bh * (ulong)L * (ulong)D;
 
   // ONE DEVICE READ. The absmax has to see the whole block before a
   // single element can be written, so the naive shape reads the source
@@ -158,7 +165,7 @@ kernel void sage_quant_block(
   float am = 0.0f;
   for (int i = (int)lid; i < n; i += kThreads) {
     const int r = r0 + i / D, c = i - (i / D) * D;
-    float v = (float)src[(uint)r * row_stride + c];
+    float v = (float)src[(ulong)r * (ulong)row_stride + c];
     if (sub_mean != 0) { v -= mn[c]; }
     stage[i] = (VPIPE_ELT)v;
     am = max(am, fabs(v));
@@ -222,12 +229,13 @@ kernel void sage_quant_token(
   const int per = (D + 3) / 4;
   const int c0 = part * per;
   const int n = max(0, min(per, D - c0));
-  const device VPIPE_ELT* src = x + base_off + (uint)bh * head_stride;
+  const device VPIPE_ELT* src =
+      x + (ulong)base_off + (ulong)bh * (ulong)head_stride;
   float am = 0.0f;
   float v[32];
   if (r < L) {
     for (int c = 0; c < n; ++c) {
-      v[c] = (float)src[(uint)r * row_stride + c0 + c];
+      v[c] = (float)src[(ulong)r * (ulong)row_stride + (ulong)(c0 + c)];
       if (sub_mean != 0) { v[c] -= mean[(uint)bh * D + c0 + c]; }
       am = max(am, fabs(v[c]));
     }
@@ -239,7 +247,8 @@ kernel void sage_quant_token(
   if (r >= L) { return; }
   const float inv = am > 0.0f ? 127.0f / am : 0.0f;
   if (part == 0) { scale[(uint)bh * L + r] = am / 127.0f; }
-  device char* dst = q + ((uint)bh * L + r) * D + c0;
+  device char* dst =
+      q + ((ulong)bh * (ulong)L + (ulong)r) * (ulong)D + (ulong)c0;
   for (int c = 0; c < n; ++c) {
     dst[c] = (char)clamp(rint(v[c] * inv), -127.0f, 127.0f);
   }
@@ -273,11 +282,12 @@ kernel void sage_v_absmax_chunk(
   const int bh = (int)tid.y, ch = (int)tid.z;
   const int per = (L + chunks - 1) / chunks;
   const int t0 = ch * per, t1 = min(L, t0 + per);
-  const device VPIPE_ELT* src = v + base_off + (uint)bh * head_stride;
+  const device VPIPE_ELT* src =
+      v + (ulong)base_off + (ulong)bh * (ulong)head_stride;
   const float mu = mean[(uint)bh * D + c];
   float am = 0.0f;
   for (int t = t0; t < t1; ++t) {
-    am = max(am, fabs((float)src[(uint)t * row_stride + c] - mu));
+    am = max(am, fabs((float)src[(ulong)t * (ulong)row_stride + c] - mu));
   }
   partial[((uint)bh * chunks + ch) * D + c] = am;
 }
@@ -322,13 +332,15 @@ kernel void sage_quant_v_channel_u8(
   if ((int)c >= D) { return; }
   const int bh = (int)tid.y;
   const int t0 = (int)tid.z * 8, t1 = min(L, t0 + 8);
-  const device VPIPE_ELT* src = v + base_off + (uint)bh * head_stride;
+  const device VPIPE_ELT* src =
+      v + (ulong)base_off + (ulong)bh * (ulong)head_stride;
   const float s = scale[(uint)bh * D + c];
   const float inv = s > 0.0f ? 1.0f / s : 0.0f;
   const float mu = mean[(uint)bh * D + c];
   for (int t = t0; t < t1; ++t) {
-    const float x = (float)src[(uint)t * row_stride + c] - mu;
+    const float x = (float)src[(ulong)t * (ulong)row_stride + c] - mu;
     const int qi = (int)clamp(rint(x * inv), -127.0f, 127.0f);
-    q[((uint)bh * L + t) * D + c] = (uchar)(qi + 128);
+    q[((ulong)bh * (ulong)L + (ulong)t) * (ulong)D + c] =
+        (uchar)(qi + 128);
   }
 }

@@ -500,6 +500,13 @@ public:
   // Drop every declaration. PipelineRuntime calls this at the start of
   // each launch, so one run's estimates never leak into the next.
   void clear_declarations();
+  // Launches seen: clear_declarations() counts one, and every launch's
+  // plan opens with it, before any stage initializes. A stage tags its
+  // request to a SHARED model with it (LoadedLanguageModel::
+  // request_i8_prefill), so a request of an earlier launch -- one a warm
+  // model still carries -- is told from this launch's. Host-only.
+  __attribute__((visibility("hidden"))) std::uint64_t
+  launch_epoch() const noexcept;
 
   // True when `dir` is already accounted for -- open, or declared. The
   // question a footprint calculation asks before adding a directory's
@@ -1345,6 +1352,9 @@ private:
   // decoding in the decode, put 5 GB into a denoise neither holds it in.
   // Unphased (`_phase` empty) still means the whole run. Last, as above.
   std::unordered_map<std::string, std::uint64_t> _phase_bits;
+
+  // launch_epoch(): bumped by clear_declarations(). Last, as above.
+  std::atomic<std::uint64_t> _launch_epoch{0};
 };
 
 }

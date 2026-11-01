@@ -387,6 +387,7 @@ private:
   genai::MetalGemma4VisionEncoder* _mgvis    = nullptr;
   genai::MetalPixtralVisionEncoder* _mpix    = nullptr;
   genai::MetalDeepseekV41Vision*    _mds     = nullptr;
+  genai::MetalLfm3VisionEncoder*    _mlfm    = nullptr;
   genai::Gemma4UnifiedEmbedder*    _mguni    = nullptr;
   genai::MetalAudioEncoder*        _m_audio  = nullptr;
   genai::MetalGemma4AudioEncoder*  _mg_audio = nullptr;

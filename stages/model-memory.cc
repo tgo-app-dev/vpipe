@@ -11,6 +11,7 @@
 #include "generative-models/model-loader.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/drawthings-store.h"
@@ -882,6 +883,26 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
     }
     if (picture_pixels >= 0) {
       for (auto& c : scratch_claims("vision:" + label, vis_scratch, {})) {
+        out.push_back(std::move(c));
+      }
+    }
+    return out;
+  }
+  // LFM3-VL: its own tower's encode at the largest picture (or a frame's
+  // budget), a token a merge x merge block of patches.
+  if (mcfg->architecture == "Lfm3VlForConditionalGeneration") {
+    genai::MetalLfm3VisionEncoder::Config vc;
+    if (picture_pixels >= 0 &&
+        genai::MetalLfm3VisionEncoder::Config::from_dir(dir, &vc,
+                                                        nullptr)) {
+      if (picture_tokens > 0) {
+        const std::int64_t cell = (std::int64_t)vc.patch * vc.merge;
+        picture_pixels = (std::int64_t)picture_tokens * cell * cell;
+      }
+      const std::size_t b =
+          genai::MetalLfm3VisionEncoder::encode_scratch_bytes(
+              vc, picture_pixels);
+      for (auto& c : scratch_claims("vision:" + label, b, {})) {
         out.push_back(std::move(c));
       }
     }

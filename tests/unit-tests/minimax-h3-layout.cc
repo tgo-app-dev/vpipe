@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace vpipe::genai;
@@ -1468,6 +1469,69 @@ TEST(minimax_h3_layout, packed_sequence)
     ASSERT_TRUE((int)uniq.size() == c.n_uniq);
     for (int i = 0; i < c.n_uniq; ++i) { EXPECT_TRUE(uniq[i] == c.uniq[i]); }
   }
+}
+
+// A LAST frame alone (`l2va`) against the reference's own numbers. The
+// reference packs every anchor independently -- "last" at the same time
+// whatever else is there, every target row on a clock that starts where
+// the text ends -- so [text | last | audio | video] is fl2va_both's
+// layout with its FIRST block cut out: its text rows, then its second
+// block's rows, then its audio and video rows, row for row. The golden
+// arrays are the reference's, so this holds the lone anchor to them
+// without a golden of its own.
+TEST(minimax_h3_layout, a_last_frame_alone_is_first_and_last_less_the_first)
+{
+  const std::vector<PackedCase> cases = packed_cases();
+  const PackedCase& both = cases[2];
+  ASSERT_TRUE(std::string(both.name) == "fl2va_both");
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_packed_sequence(both.text_tags, both.nlat, both.lh,
+                                        both.lw, both.naud, 2, 2,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kLast}, &L));
+  const int rpf = (both.lh / 2) * (both.lw / 2);
+  const int nt = (int)both.text_tags.size();
+  EXPECT_TRUE(L.num_condition_rows == rpf);
+  // Row r of this layout is row src(r) of fl2va_both's.
+  auto src = [&](int r) { return r < nt ? r : r + rpf; };
+  double worst = 0.0;
+  int tag_bad = 0, ada_bad = 0;
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 0.75f, &uniq, &row_idx);
+  const std::vector<int> adaln = h3::build_adaln_indices(L, row_idx);
+  for (int r = 0; r < L.seq_len; ++r) {
+    for (int a = 0; a < 3; ++a) {
+      worst = std::max(
+          worst, std::fabs(L.position_ids[(std::size_t)r * 3 + a] -
+                           both.pos[(std::size_t)src(r) * 3 + a]));
+    }
+    if (L.token_tags[(std::size_t)r] != both.tags[src(r)]) { ++tag_bad; }
+    if (adaln[(std::size_t)r] != both.adaln[src(r)]) { ++ada_bad; }
+  }
+  // Its video rows are fl2va_both's less the first block's, each one
+  // block earlier.
+  int idx_bad = 0;
+  for (std::size_t i = 0; i < L.video_indices.size(); ++i) {
+    if (L.video_indices[i] != both.vidx[(std::size_t)rpf + i] - rpf) {
+      ++idx_bad;
+    }
+  }
+  EXPECT_TRUE(L.seq_len + rpf ==
+              nt + 2 * rpf + both.naud * h3::kAudioChannels +
+                  both.nlat * rpf);
+  EXPECT_TRUE(worst < 1e-12);
+  EXPECT_TRUE(tag_bad == 0);
+  EXPECT_TRUE(ada_bad == 0);
+  EXPECT_TRUE(idx_bad == 0);
+  // And it is NOT the first frame's time: a lone last anchor that fell
+  // back to "first" would sit where the text ends.
+  EXPECT_TRUE(L.position_ids[(std::size_t)nt * 3] > (double)nt + 1.0);
+  std::printf("[minimax_h3_layout] l2va seq=%d: the last block at t %.4f, "
+              "pos diff=%.3e tags=%d adaln=%d vidx=%d against fl2va_both "
+              "less its first block\n", L.seq_len,
+              L.position_ids[(std::size_t)nt * 3], worst, tag_bad, ada_bad,
+              idx_bad);
 }
 
 TEST(minimax_h3_layout, packed_sequence_rejects_bad_geometry)

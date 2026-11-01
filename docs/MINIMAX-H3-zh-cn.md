@@ -152,6 +152,8 @@ Ref2VA 那一行指的是**整个模型**，而不只是它的 transformer，这
   ——同上，外加片段逐步成形的**实时预览**（见[看着它成形](#watching-it-form--live-previews)）。
 - **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
   ——同上，但首尾两端都锚定到一张图片（见[不止文本输入](#more-than-text-in)）。
+- **[`minimax-h3-last-frame-to-video.vpipeline`](pipelines/minimax-h3-last-frame-to-video.vpipeline)**
+  ——同上，但改为让片段以这张图片*结尾*（见[不止文本输入](#more-than-text-in)）。
 - **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
   ——改用 **Ref2VA** 模式：输入参考图片、片段和音轨，输出 `.mp4`，每一项都会按你
   选择的尺寸预处理（见[以参考素材作为条件](#conditioning-on-references-ref2va)）。
@@ -517,6 +519,15 @@ Hugging Face 上，模型目录知道去哪里取。它解出的帧数与真正�
 音频）。给 `generate-video` 的端口 5 喂一张图片的 `vae-encode`，生成就会以它为开头
 帧被锚定；再在端口 6 上加第二个 `vae-encode`，模型就会在两张静态图之间做插值。两个
 锚点都必须按片子生成时所用的同一分辨率来编码。
+
+端口 6 也可以**单独使用**：把 `vae-encode` 接在那里、端口 5 留空，片子就会被生成到
+那张图*为止*——以它结尾，而不是从它开始（末帧生成视频）。提示词要写成一个最终抵达
+这张图的镜头，而不是从它出发的镜头；同时把它通过 `ref_image`（端口 3）交给条件编码
+器，它在那里是 `<Picture 1>`。日志里的锚点那一行会写明每个锚点钉住的是哪一端
+（`1 keyframe anchor (last frame)`）。
+[`minimax-h3-last-frame-to-video.vpipeline`](pipelines/minimax-h3-last-frame-to-video.vpipeline)
+就是这样一张图：一张 `reference.jpg`，居中裁切到 960x544 后只编码一次，配一段镜头
+缓缓推进、最终停在这张图上的提示词。运行方式与下面那张图相同。
 
 [`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)
 就是这张图，并且已经走通了。在它旁边放一张 `reference.jpg`，然后像你运行文本生成
@@ -2109,9 +2120,8 @@ Ref2VA 分支，所以本节和 **Ref2VA 模型文件**是二选一，而不是�
 而线性那一半根本看不到它们。
 
 vpipe 对这些行的处理与此相同，所以[不只是文本输入](#more-than-text-in)一节里的
-图可以原样挂上分支：一个锚定帧对应开场帧，两个对应首帧和末帧。只给末帧是上游
-有、而这个图没有接上的唯一一种模式——`generate-video` 会忽略没有首帧的末帧锚定，
-并说明这一点。日志会针对每种几何尺寸记录一次关键帧的数量。
+图可以原样挂上分支：一个锚定帧对应开场帧，两个对应首帧和末帧，单独接端口 6 则对应
+末帧。日志会针对每种几何尺寸记录一次关键帧的数量。
 
 不过，模式不会替你检查。模式在 `model-select` 上选择，分支在
 `minimax-h3-model-config` 上选择，是两个不同的 stage；把分支挂到 Ref2VA 模式的

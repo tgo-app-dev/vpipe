@@ -93,22 +93,27 @@ kernel void sol_summaries_mma(
   const int len = min(BLK, T - t0);
   const uint o = ((uint)h * N + b) * D + d;
   const float inv = 1.0f / float(len);
+  // 64-BIT HEAD BASES: the operands are a whole sequence's [H, HS, D],
+  // which passes 2^32 elements at 599,186 rows of 56 x 128 heads (a long
+  // MiniMax-H3 refine's keys); in 32 bits the later heads summarised the
+  // earlier heads' rows. A summary [H, N, D] is 1/BLK of that: 32 bits.
+  const ulong hb = ((ulong)h * (ulong)HS + (ulong)t0) * (ulong)D;
   // One loop per destination rather than one loop over three, so the
   // mask is tested once and an unwanted tensor is never read.
   if ((which & 1) != 0) {
-    const device VPIPE_ELT* qh = q + ((uint)h * HS + t0) * D;
+    const device VPIPE_ELT* qh = q + hb;
     float s = 0.0f;
     for (int t = 0; t < len; ++t) { s += float(qh[(uint)t * D + d]); }
     qc[o] = VPIPE_ELT(s * inv);
   }
   if ((which & 2) != 0) {
-    const device VPIPE_ELT* kh = k + ((uint)h * HS + t0) * D;
+    const device VPIPE_ELT* kh = k + hb;
     float s = 0.0f;
     for (int t = 0; t < len; ++t) { s += float(kh[(uint)t * D + d]); }
     kc[o] = VPIPE_ELT(s * inv);
   }
   if ((which & 4) != 0) {
-    const device VPIPE_ELT* vh = v + ((uint)h * HS + t0) * D;
+    const device VPIPE_ELT* vh = v + hb;
     float s = 0.0f;
     for (int t = 0; t < len; ++t) { s += float(vh[(uint)t * D + d]); }
     vc[o] = VPIPE_ELT(s * inv);
@@ -200,7 +205,9 @@ static inline void sol_route_walk_(
   // The local band is in KEY blocks around the key block this QUERY
   // block sits in, which is where the two granularities meet.
   const int qk = (QOFF + qb * BQ) / BLK;
-  device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
+  // 64-bit: [H, NQ, NK] passes 2^32 on a whole long sequence.
+  device uchar* fl =
+      flags + ((ulong)h * (ulong)NQ + (ulong)qb) * (ulong)NK;
   // THE QUERY CENTROID IS LOOP-INVARIANT and was being re-read from
   // device memory once per key block -- the same four elements, NK
   // times, for a kernel whose inner loop is four multiplies. Hoisted
@@ -323,8 +330,9 @@ static inline void sol_route_p_walk_(
     int per, int NKS, float ls, uint lane)
 {
   const int qk = (QOFF + qb * BQ) / BLK;
-  const device float* pr = proxy + ((uint)h * NQ + qb) * NK;
-  device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
+  const ulong pf = ((ulong)h * (ulong)NQ + (ulong)qb) * (ulong)NK;
+  const device float* pr = proxy + pf;
+  device uchar* fl = flags + pf;
   // ONE LANE PER KEY BLOCK now that the dot is a load: the row is
   // walked 32 blocks at a time and the kept count is a simd sum, where
   // the fused kernel had all 32 lanes cooperate on one block's dot and
@@ -732,7 +740,8 @@ kernel void sol_emit_mma(
 {
   const int h  = (int)tid.y;
   const int qb = (int)tid.z;
-  const device uchar* fl = flags + ((uint)h * NQ + qb) * NK;
+  const device uchar* fl =
+      flags + ((ulong)h * (ulong)NQ + (ulong)qb) * (ulong)NK;   // 64-bit
   int w = qb_off[h * (NQ + 1) + qb];
   // ASCENDING and duplicate-free: steel's loaders only ever move
   // forward, so a repeat would read the wrong bytes for the rest of the
@@ -826,14 +835,17 @@ kernel void sol_approx_mma(
   const int q0 = (int)tid.z * BQ;
   if (q0 >= T || D != SOL_D) { return; }
 
-  const device VPIPE_ELT* qh = q + (uint)h * T * D;
+  // 64-bit bases: [H, T, D] and [H, NQ, N] pass 2^32 elements on a whole
+  // long sequence (see sol_summaries_mma).
+  const device VPIPE_ELT* qh = q + (ulong)h * (ulong)T * (ulong)D;
   // WHICH FLAG ROW THESE 32 ROWS OBEY. Routing is taken at the exact
   // half's query block so that qb_off is one entry per block of its
   // own, and that block is 32 rows on the ALU kernel and 64 on the
   // matrix-core one -- so this is q0 / BQR and not tid.z. Two tiles
   // sharing a flag row is exactly right: both halves of a 64-row
   // routing block were routed together.
-  const device uchar* fl = flags + ((uint)h * NQ + (q0 / BQR)) * N;
+  const device uchar* fl =
+      flags + ((ulong)h * (ulong)NQ + (ulong)(q0 / BQR)) * (ulong)N;
 
   const uint tflat = ltid.y * 32 + ltid.x;
   for (int i = (int)tflat; i < BQ * SOL_D; i += 128) {
@@ -947,7 +959,9 @@ kernel void sol_approx_mma(
   // T are written and then never read, rather than guarded per element.
   for (int c = 0; c < SOL_D / 8; ++c) {
     simdgroup_store(
-        Of[c], o_a + ((uint)h * TPAD + q0 + (int)sg * 8) * SOL_D + c * 8,
+        Of[c],
+        o_a + ((ulong)h * (ulong)TPAD + (ulong)(q0 + (int)sg * 8)) *
+                  (ulong)SOL_D + (ulong)(c * 8),
         SOL_D);
   }
   if (lane < 8) {
@@ -985,8 +999,10 @@ kernel void sol_merge_mma(
   const int h = (int)tid.y;
   const int t = (int)tid.z;
   if ((int)d >= D || t >= T) { return; }
-  const uint r = (uint)h * T + t;
-  const uint ro = (uint)h * OS + t;
+  // 64-bit: r * D and ro * D index [H, T|OS, D], which pass 2^32
+  // elements on a whole long sequence.
+  const ulong r = (ulong)h * (ulong)T + (ulong)t;
+  const ulong ro = (ulong)h * (ulong)OS + (ulong)t;
   const float me = m_e[r], le = l_e[r];
   const float ma = m_a[r], la = l_a[r];
   // Either half can be empty: a query block whose routing kept nothing
@@ -1000,7 +1016,8 @@ kernel void sol_merge_mma(
   // numerator at the merged scale; o_a was never divided.
   const float ne = (we > 0.0f) ? float(o_e[r * D + d]) * we : 0.0f;
   const float na = (wa > 0.0f)
-                       ? o_a[((uint)h * TPAD + t) * D + d] *
+                       ? o_a[((ulong)h * (ulong)TPAD + (ulong)t) *
+                                 (ulong)D + (ulong)d] *
                              (la > 0.0f ? wa / la : 0.0f)
                        : 0.0f;
   out[ro * D + d] = VPIPE_ELT(den > 0.0f ? (ne + na) / den : 0.0f);
@@ -1058,8 +1075,10 @@ kernel void sol_merge_ml_mma(
   const int h = (int)tid.y;
   const int t = (int)tid.z;
   if ((int)d >= D || t >= T) { return; }
-  const uint r = (uint)h * T + t;
-  const uint ro = (uint)h * OS + t;
+  // 64-bit: r * D and ro * D index [H, T|OS, D], which pass 2^32
+  // elements on a whole long sequence.
+  const ulong r = (ulong)h * (ulong)T + (ulong)t;
+  const ulong ro = (ulong)h * (ulong)OS + (ulong)t;
   const float me = m_e[r], le = l_e[r];
   const float ma_raw = m_a[r], la = l_a[r];
   const bool  a_live = (ma_raw > -1.0e30f) && (la > 0.0f);

@@ -474,7 +474,8 @@ public:
   // rate) with on-the-fly per-(row, 512-group) activation quantization.
   // LOSSY (int8, ~1e-2 rel per GEMM -- NOT token-exact) and strictly
   // opt-in; decode is untouched. Default no-op; execs whose model
-  // implements the route (the metal Qwen exec) override.
+  // implements the route (the metal Qwen and LFM3 execs) override. The
+  // model keeps its context when asked for the state it is already in.
   virtual void set_i8_gemm(bool on) { (void)on; }
 
 

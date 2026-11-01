@@ -21,7 +21,7 @@ namespace vpipe::genai {
 // The built-in families a config.json `architecture` loads as (the one
 // list LoadedLanguageModel picks its exec by); kNone for any other -- a
 // plugin's arch, or one no exec takes.
-enum class LmFamily { kNone, kQwen, kGemma, kLlama, kDeepseekV41 };
+enum class LmFamily { kNone, kQwen, kGemma, kLlama, kDeepseekV41, kLfm3 };
 LmFamily lm_family(const std::string& architecture);
 
 // HOW A STAGE RUNS its language model -- what moves the figure.
@@ -47,6 +47,9 @@ struct LmRunShape {
   bool one_pass = false;
   // DeepSeek-V4.1's own draft head (DSpark) loaded.
   bool draft_head = false;
+  // The stage's i8_prefill: the int8 prefill GEMMs' scratch, where the
+  // family runs them (LFM3) and the GPU has matrix cores.
+  bool i8_prefill = false;
 };
 
 // The bytes a load of `dir` allocates to run in `shape` -- its K/V and

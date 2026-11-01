@@ -1873,6 +1873,375 @@ private:
 };
 
 // ---------------------------------------------------------------------
+// LFM3-VL (Liquid AI), as its chat_template.jinja renders a conversation:
+//
+//   <|startoftext|>                         the conversation's first
+//   <|im_start|>system\n{system}[\n\n<tools>\n{fn}\n...</tools>]<|im_end|>\n
+//   <|im_start|>user\n[<|vision_start|><|image|>x N<|vision_end|>]
+//     {text}<|im_end|>\n
+//   <|im_start|>assistant\n<think>          thinking on (the default)
+//   <|im_start|>assistant\n<think></think>  thinking off
+//
+// No default system turn (the template writes one only when there is
+// text or a tool). A tool is the bare function, json.dumps-spelled, one a
+// line (a `defer_loading` one left out); a result is a `tool` turn of its
+// own in <tool_response> tags; a call is Qwen3-Coder's XML, parsed as
+// Qwen3's is. Video frames take the same vision blocks behind each
+// frame's `<t seconds>` marker (the placeholder an image or a video row
+// stands in is replaced by the tower's row either way).
+class Lfm3ChatTemplate final : public Qwen3ChatTemplate {
+public:
+  Lfm3ChatTemplate(const Tokenizer& tok, bool disable_thinking)
+    : Qwen3ChatTemplate(tok, disable_thinking, std::string_view(),
+                        std::optional<bool>(false))
+    , _bos         (sp_(tok, "<|startoftext|>"))
+    , _vision_start(sp_(tok, "<|vision_start|>"))
+    , _vision_end  (sp_(tok, "<|vision_end|>"))
+    , _image       (sp_(tok, "<|image|>"))
+    , _think_open  (sp_(tok, "<think>"))
+    , _think_close (sp_(tok, "</think>"))
+    , _resp_open   (sp_(tok, "<tool_response>"))
+    , _resp_close  (sp_(tok, "</tool_response>"))
+  {}
+
+  std::string_view family_name() const override { return "lfm3"; }
+
+  std::int32_t image_pad_token_id() const noexcept override
+  { return _image; }
+
+  void render_user_turn(std::string_view           content,
+                        bool                       is_first_turn,
+                        std::vector<std::int32_t>* dst) const override
+  {
+    bos_(is_first_turn, dst);
+    Qwen3ChatTemplate::render_user_turn(content, false, dst);
+  }
+
+  bool
+  render_user_turn_media(std::span<const MediaChunk>   chunks,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    if (_image < 0) { return false; }
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Audio) { return false; }
+    }
+    bos_(is_first_turn, dst);
+    open_user_(dst);
+    for (const auto& c : chunks) {
+      if (c.kind == MediaChunk::Kind::Text) {
+        if (!c.text.empty()) { append_text_(tok_(), c.text, dst); }
+      } else if (c.n_tokens > 0) {
+        image_block_(c.n_tokens, dst);
+      }
+    }
+    close_user_(dst);
+    return render_generation_prompt(dst);
+  }
+
+  void
+  render_user_turn_vlm(std::string_view              content,
+                       std::span<const int>          image_token_counts,
+                       bool                          is_first_turn,
+                       std::vector<std::int32_t>*    dst) const override
+  {
+    (void)render_vlm_prefix(image_token_counts, is_first_turn, dst);
+    (void)render_vlm_completion(content, dst);
+  }
+
+  bool
+  render_vlm_prefix(std::span<const int>          image_token_counts,
+                    bool                          is_first_turn,
+                    std::vector<std::int32_t>*    dst) const override
+  {
+    bos_(is_first_turn, dst);
+    open_user_(dst);
+    for (int n : image_token_counts) { image_block_(n, dst); }
+    return true;
+  }
+
+  bool
+  render_vlm_completion(std::string_view              content,
+                        std::vector<std::int32_t>*    dst) const override
+  {
+    append_text_(tok_(), content, dst);
+    close_user_(dst);
+    return render_generation_prompt(dst);
+  }
+
+  bool
+  render_vlm_prefix_ex(std::span<const int>          image_token_counts,
+                       bool                          is_first_turn,
+                       std::string_view              pre_image_prompt,
+                       std::string_view              post_image_prompt,
+                       bool                          close_turn,
+                       std::vector<std::int32_t>*    dst) const override
+  {
+    bos_(is_first_turn, dst);
+    open_user_(dst);
+    if (!pre_image_prompt.empty()) {
+      append_text_(tok_(), pre_image_prompt, dst);
+    }
+    for (int n : image_token_counts) { image_block_(n, dst); }
+    if (!post_image_prompt.empty()) {
+      append_text_(tok_(), post_image_prompt, dst);
+    }
+    if (close_turn) {
+      close_user_(dst);
+      (void)render_generation_prompt(dst);
+    }
+    return true;
+  }
+
+  void
+  render_user_turn_video(std::string_view              content,
+                         std::span<const float>        frame_timestamps_seconds,
+                         std::span<const int>          image_token_counts,
+                         bool                          is_first_turn,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    render_user_turn_video(content, frame_timestamps_seconds,
+                           image_token_counts, is_first_turn,
+                           std::string_view{}, dst);
+  }
+
+  void
+  render_user_turn_video(std::string_view              content,
+                         std::span<const float>        frame_timestamps_seconds,
+                         std::span<const int>          image_token_counts,
+                         bool                          is_first_turn,
+                         std::string_view              pre_image_prompt,
+                         std::vector<std::int32_t>*    dst) const override
+  {
+    if (!render_video_prefix(frame_timestamps_seconds, image_token_counts,
+                             is_first_turn, pre_image_prompt, dst)) {
+      render_user_turn_vlm(content, image_token_counts, is_first_turn, dst);
+      return;
+    }
+    (void)render_vlm_completion(content, dst);
+  }
+
+  bool
+  render_video_prefix(std::span<const float>        frame_timestamps_seconds,
+                      std::span<const int>          image_token_counts,
+                      bool                          is_first_turn,
+                      std::vector<std::int32_t>*    dst) const override
+  {
+    return render_video_prefix(frame_timestamps_seconds, image_token_counts,
+                               is_first_turn, std::string_view{}, dst);
+  }
+
+  // The processor's video layout: `<{t:.1f} seconds>` then the frame's
+  // vision block, a frame at a time.
+  bool
+  render_video_prefix(std::span<const float>        frame_timestamps_seconds,
+                      std::span<const int>          image_token_counts,
+                      bool                          is_first_turn,
+                      std::string_view              pre_image_prompt,
+                      std::vector<std::int32_t>*    dst) const override
+  {
+    if (frame_timestamps_seconds.size() != image_token_counts.size()) {
+      return false;
+    }
+    bos_(is_first_turn, dst);
+    open_user_(dst);
+    if (!pre_image_prompt.empty()) {
+      append_text_(tok_(), pre_image_prompt, dst);
+    }
+    for (std::size_t i = 0; i < image_token_counts.size(); ++i) {
+      if (image_token_counts[i] <= 0) { continue; }
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "<%.1f seconds>",
+                    static_cast<double>(frame_timestamps_seconds[i]));
+      append_text_(tok_(), buf, dst);
+      image_block_(image_token_counts[i], dst);
+    }
+    return true;
+  }
+
+  bool
+  render_tools_system_turn(std::string_view              tools_json,
+                           bool                          is_first_turn,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    return render_system_message(std::string_view(), tools_json,
+                                 is_first_turn, dst);
+  }
+
+  // The system message, then the tools: `{system}\n\n<tools>\n...</tools>`
+  // in ONE system turn, the tools' tags their added tokens. Nothing when
+  // both are empty (the template writes no system turn then).
+  bool
+  render_system_message(std::string_view           text,
+                        std::string_view           tools_json,
+                        bool                       is_first_turn,
+                        std::vector<std::int32_t>* dst) const override
+  {
+    std::string s(text);
+    const std::string tools = tools_block_(tools_json);
+    if (!tools.empty()) {
+      if (!s.empty()) { s += "\n\n"; }
+      s += tools;
+    }
+    bos_(is_first_turn, dst);
+    if (s.empty()) { return true; }
+    (void)push_sp_(im_start_(), dst);
+    append_text_(tok_(), "system\n", dst);
+    append_split_(tok_(), s, marks_(), dst);
+    (void)push_sp_(im_end_(), dst);
+    append_text_(tok_(), "\n", dst);
+    return true;
+  }
+
+  bool
+  render_message(std::string_view           role,
+                 std::string_view           content,
+                 bool                       is_first_turn,
+                 std::vector<std::int32_t>* dst) const override
+  {
+    if (role == "system") {
+      return render_system_message(content, std::string_view(),
+                                   is_first_turn, dst);
+    }
+    bos_(is_first_turn, dst);
+    return Qwen3ChatTemplate::render_message(role, content, false, dst);
+  }
+
+  // Each result a `tool` turn: <|im_start|>tool\n<tool_response>\n{r}
+  // \n</tool_response><|im_end|>\n.
+  bool
+  render_tool_results_message(std::span<const std::string>  results,
+                              std::vector<std::int32_t>*    dst) const override
+  {
+    if (results.empty()) { return false; }
+    for (const auto& r : results) {
+      (void)push_sp_(im_start_(), dst);
+      append_text_(tok_(), "tool\n", dst);
+      (void)push_sp_(_resp_open, dst);
+      append_text_(tok_(), "\n", dst);
+      append_text_(tok_(), r, dst);
+      append_text_(tok_(), "\n", dst);
+      (void)push_sp_(_resp_close, dst);
+      (void)push_sp_(im_end_(), dst);
+      append_text_(tok_(), "\n", dst);
+    }
+    return true;
+  }
+
+  bool
+  render_tool_results_turn(std::span<const std::string>  tool_names,
+                           std::span<const std::string>  results,
+                           std::vector<std::int32_t>*    dst) const override
+  {
+    (void)tool_names;
+    if (!render_tool_results_message(results, dst)) { return false; }
+    return render_generation_prompt(dst);
+  }
+
+protected:
+  // `<think>` opens the reply (thinking on); `<think></think>` closes an
+  // empty one (off). No newlines: the template writes none.
+  void
+  append_assistant_extras_(std::vector<std::int32_t>* dst) const override
+  {
+    if (_think_open < 0 || _think_close < 0) {
+      append_text_(tok_(), thinking_disabled() ? "<think></think>"
+                                               : "<think>", dst);
+      return;
+    }
+    dst->push_back(_think_open);
+    if (thinking_disabled()) { dst->push_back(_think_close); }
+  }
+
+private:
+  void bos_(bool first, std::vector<std::int32_t>* dst) const
+  {
+    if (first && _bos >= 0) { dst->push_back(_bos); }
+  }
+  void open_user_(std::vector<std::int32_t>* dst) const
+  {
+    (void)push_sp_(im_start_(), dst);
+    append_text_(tok_(), "user\n", dst);
+  }
+  void close_user_(std::vector<std::int32_t>* dst) const
+  {
+    (void)push_sp_(im_end_(), dst);
+    append_text_(tok_(), "\n", dst);
+  }
+  void image_block_(int n, std::vector<std::int32_t>* dst) const
+  {
+    if (n <= 0) { return; }
+    (void)push_sp_(_vision_start, dst);
+    if (_image >= 0) { dst->insert(dst->end(), (std::size_t)n, _image); }
+    (void)push_sp_(_vision_end, dst);
+  }
+  // `<tools>\n{fn}\n...\n</tools>`: each host line's function (the
+  // `function` object of an OpenAI-style tool, else the line itself), its
+  // `defer_loading` key dropped, json.dumps-spelled; a tool marked
+  // defer_loading left out. Empty when no tool remains.
+  static std::string tools_block_(std::string_view tools_json)
+  {
+    std::string lines;
+    std::size_t pos = 0;
+    while (pos < tools_json.size()) {
+      const std::size_t nl = tools_json.find('\n', pos);
+      const std::string_view line = tools_json.substr(
+          pos, nl == std::string_view::npos ? std::string_view::npos
+                                            : nl - pos);
+      pos = nl == std::string_view::npos ? tools_json.size() : nl + 1;
+      if (trim_sv_(line).empty()) { continue; }
+      std::string one;
+      try {
+        const FlexData t = FlexData::from_json(line);
+        FlexData fn = bag::has(t, "function") ? bag::value(t, "function")
+                                              : t;
+        if (bag::flag(fn, "defer_loading", false)
+            || bag::flag(t, "defer_loading", false)) {
+          continue;
+        }
+        if (fn.is_object()) {
+          one.push_back('{');
+          bool first = true;
+          for (const auto& [k, v] : fn.as_object()) {
+            if (k == "defer_loading") { continue; }
+            if (!first) { one.append(", "); }
+            first = false;
+            one.append(FlexData::make_string(k).to_json(false));
+            one.append(": ");
+            hf_tojson_(v, &one);
+          }
+          one.push_back('}');
+        } else {
+          hf_tojson_(fn, &one);
+        }
+      } catch (const std::exception&) {
+        one.assign(line);   // not JSON: as the host wrote it
+      }
+      if (!lines.empty()) { lines.push_back('\n'); }
+      lines += one;
+    }
+    if (lines.empty()) { return {}; }
+    return "<tools>\n" + lines + "\n</tools>";
+  }
+  std::array<AddedMark, 4> marks_() const noexcept
+  {
+    return {{{"<tool_response>", _resp_open},
+             {"</tool_response>", _resp_close},
+             {"<think>", _think_open},
+             {"</think>", _think_close}}};
+  }
+
+  const std::int32_t _bos;
+  const std::int32_t _vision_start;
+  const std::int32_t _vision_end;
+  const std::int32_t _image;
+  const std::int32_t _think_open;
+  const std::int32_t _think_close;
+  const std::int32_t _resp_open;
+  const std::int32_t _resp_close;
+};
+
+// ---------------------------------------------------------------------
 // Qwen3-ASR template.
 //
 // Single-turn audio-conditioned chat. The published template emits:
@@ -3084,6 +3453,12 @@ make_chat_template(const std::string&    architecture,
     // No system message from the architecture alone; the ModelConfig
     // overload brings the checkpoint's default.
     return std::make_unique<MistralChatTemplate>(tokenizer, std::string());
+  }
+  if (architecture == "Lfm3VlForConditionalGeneration"
+      || architecture == "Lfm3ForCausalLM") {
+    // Thinking on by default, as the checkpoint's template renders it.
+    return std::make_unique<Lfm3ChatTemplate>(
+        tokenizer, disable_thinking.value_or(false));
   }
   if (architecture == "DeepseekV41ForCausalLM") {
     // Chat mode by default, as the release's generate.py runs it.

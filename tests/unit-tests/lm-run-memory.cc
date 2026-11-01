@@ -57,14 +57,16 @@ env_(const char* k)
 // PATH (MoE), VPIPE_MINISTRAL3_TEST_MODEL_PATH (dense, head dim 128),
 // VPIPE_GEMMA4_TEST_MODEL_PATH (one-pass prefill, sliding rings),
 // VPIPE_QWEN4_EXP_TEST_MODEL_PATH (hyper-connections; its pieces as wide
-// as the box allows, hc_piece_rows).
+// as the box allows, hc_piece_rows), VPIPE_LFM3_TEST_MODEL_PATH (LFM3:
+// conv state, 2048-row pieces).
 TEST(lm_run_memory, a_prefill_allocates_what_the_plan_books)
 {
   const char* envs[] = {"VPIPE_QWEN35_TEST_MODEL_PATH",
                         "VPIPE_QWEN35_MOE_TEST_MODEL_PATH",
                         "VPIPE_MINISTRAL3_TEST_MODEL_PATH",
                         "VPIPE_GEMMA4_TEST_MODEL_PATH",
-                        "VPIPE_QWEN4_EXP_TEST_MODEL_PATH"};
+                        "VPIPE_QWEN4_EXP_TEST_MODEL_PATH",
+                        "VPIPE_LFM3_TEST_MODEL_PATH"};
   ::setenv("VPIPE_QWEN_GQA_AUTOTUNE", "0", 1);
   ::setenv("VPIPE_QWEN_PREFILL_AUTOTUNE", "0", 1);
   ::setenv("VPIPE_GEMMA_ATTN_AUTOTUNE", "0", 1);

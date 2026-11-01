@@ -3025,7 +3025,11 @@ kernel void transpose_abd_f16(
   if (d >= D) { return; }
   const int b = (int)gid.y;
   const int a = (int)gid.z;
-  out[((uint)b * A + a) * D + d] = in[((uint)a * B + b) * D + d];
+  // 64-bit: [A, B, D] passes 2^32 elements at a long sequence's heads
+  // (MiniMax-H3's 56 x 128 at 599,186 rows) -- in 32 bits the later
+  // heads read and wrote over the earlier ones.
+  out[((ulong)b * (ulong)A + (ulong)a) * (ulong)D + (ulong)d] =
+      in[((ulong)a * (ulong)B + (ulong)b) * (ulong)D + (ulong)d];
 }
 
 // transpose_abd with an output ROW-STRIDE: writes out[b*out_rs + a*D + d] so the
@@ -3045,7 +3049,9 @@ kernel void transpose_abd_rs_f16(
   const int b = (int)gid.y;
   const int a = (int)gid.z;
   const int rs = out_rs > 0 ? out_rs : A * D;
-  out[(uint)b * rs + a * D + d] = in[((uint)a * B + b) * D + d];
+  // 64-bit, as transpose_abd_f16.
+  out[(ulong)b * (ulong)rs + (ulong)(a * D + d)] =
+      in[((ulong)a * (ulong)B + (ulong)b) * (ulong)D + (ulong)d];
 }
 
 // transpose_abd with a PADDED output head-dim: [A, B, D] -> [B, A, Dp] where

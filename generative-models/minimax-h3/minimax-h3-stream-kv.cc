@@ -118,6 +118,9 @@ StreamKv::init(metal_compute::MetalCompute* mc, int layers, int heads,
       capacity <= 0) {
     return fail("stream kv: bad geometry");
   }
+  if (!_copy.load(mc)) {
+    return fail("stream kv: copy_rect_wide_f16 is missing");
+  }
   for (int s = 0; s < 2; ++s) { (void)join_(s); }
   _mc = mc;
   _layers = 0;
@@ -189,6 +192,9 @@ StreamKv::init(metal_compute::MetalCompute* mc, int layers, int heads,
   if (st.bits != 16 && (st.bits != 8 || head_dim % 64 != 0)) {
     return fail(fmt("stream kv: {} bits over a head of {} (16, or 8 over "
                     "a multiple of 64)", st.bits, head_dim)());
+  }
+  if (!_copy.load(mc)) {
+    return fail("stream kv: copy_rect_wide_f16 is missing");
   }
   _mc = mc;
   _heads = heads;
@@ -460,38 +466,59 @@ StreamKv::plan_commit(int n_text, int audio, int video, CommitPlan* out,
   return true;
 }
 
-void
-StreamKv::copy_rows_(ComputeEncoder& enc, const ComputeFunction& copy_rect,
-                     const SharedBuffer& src, std::size_t src_off,
-                     int src_rows, int src_row0, const SharedBuffer& dst,
-                     std::size_t dst_off, int dst_rows, int dst_row0,
-                     int n) const
+bool
+HeadRowCopy::load(metal_compute::MetalCompute* mc)
 {
-  if (n <= 0) { return; }
-  // Each HEAD is one "row" of the rect copy: n * head_dim contiguous
-  // elements, a head's whole stride apart in each buffer.
-  const int row_elems = n * _hd;
-  enc.set_function(copy_rect);
-  enc.set_buffer(0, src, src_off);
-  enc.set_buffer(1, dst, dst_off);
-  enc.set_constant(2, src_row0 * _hd);
-  enc.set_constant(3, dst_row0 * _hd);
-  enc.set_constant(4, _heads);
-  enc.set_constant(5, row_elems);
-  enc.set_constant(6, src_rows * _hd);
-  enc.set_constant(7, dst_rows * _hd);
-  enc.dispatch({(unsigned)(_heads * row_elems), 1, 1}, {256, 1, 1});
+  if (mc == nullptr) { return false; }
+  // A 16-bit copy: the bf16 library's twin is the same bits.
+  _fn = mc->load_library("llm_elementwise_bf16")
+            .function("copy_rect_wide_f16");
+  return _fn.valid();
 }
 
 void
-StreamKv::load_part_(ComputeEncoder& enc, const ComputeFunction& copy_rect,
-                     const SharedBuffer& buf, std::size_t off, int rows,
-                     int row0, int n, const SharedBuffer& dst, int dst_rows,
+HeadRowCopy::encode(ComputeEncoder& enc, const SharedBuffer& src,
+                    std::size_t src_off, int src_rows, int src_row0,
+                    const SharedBuffer& dst, std::size_t dst_off,
+                    int dst_rows, int dst_row0, int heads, int head_dim,
+                    int n) const
+{
+  if (n <= 0 || heads <= 0) { return; }
+  // Each HEAD is one "row" of the rect copy: n * head_dim contiguous
+  // elements, a head's whole stride apart in each buffer; the offsets
+  // and strides in 64 bits, the grid {row elements, heads}.
+  const int row_elems = n * head_dim;
+  enc.set_function(_fn);
+  enc.set_buffer(0, src, src_off);
+  enc.set_buffer(1, dst, dst_off);
+  enc.set_constant(2, (long long)src_row0 * head_dim);
+  enc.set_constant(3, (long long)dst_row0 * head_dim);
+  enc.set_constant(4, heads);
+  enc.set_constant(5, row_elems);
+  enc.set_constant(6, (long long)src_rows * head_dim);
+  enc.set_constant(7, (long long)dst_rows * head_dim);
+  enc.dispatch({(unsigned)row_elems, (unsigned)heads, 1}, {256, 1, 1});
+}
+
+void
+StreamKv::copy_rows_(ComputeEncoder& enc, const SharedBuffer& src,
+                     std::size_t src_off, int src_rows, int src_row0,
+                     const SharedBuffer& dst, std::size_t dst_off,
+                     int dst_rows, int dst_row0, int n) const
+{
+  _copy.encode(enc, src, src_off, src_rows, src_row0, dst, dst_off,
+               dst_rows, dst_row0, _heads, _hd, n);
+}
+
+void
+StreamKv::load_part_(ComputeEncoder& enc, const SharedBuffer& buf,
+                     std::size_t off, int rows, int row0, int n,
+                     const SharedBuffer& dst, int dst_rows,
                      int dst_row0) const
 {
   if (n <= 0) { return; }
   if (_bits != 8) {
-    copy_rows_(enc, copy_rect, buf, off, rows, row0, dst, 0, dst_rows,
+    copy_rows_(enc, buf, off, rows, row0, dst, 0, dst_rows,
                dst_row0, n);
     return;
   }
@@ -511,13 +538,13 @@ StreamKv::load_part_(ComputeEncoder& enc, const ComputeFunction& copy_rect,
 }
 
 void
-StreamKv::store_part_(ComputeEncoder& enc, const ComputeFunction& copy_rect,
-                      const SharedBuffer& src, int src_rows, int src_row0,
-                      int n, const SharedBuffer& buf, std::size_t off) const
+StreamKv::store_part_(ComputeEncoder& enc, const SharedBuffer& src,
+                      int src_rows, int src_row0, int n,
+                      const SharedBuffer& buf, std::size_t off) const
 {
   if (n <= 0) { return; }
   if (_bits != 8) {
-    copy_rows_(enc, copy_rect, src, 0, src_rows, src_row0, buf, off, n, 0,
+    copy_rows_(enc, src, 0, src_rows, src_row0, buf, off, n, 0,
                n);
     return;
   }
@@ -536,9 +563,9 @@ StreamKv::store_part_(ComputeEncoder& enc, const ComputeFunction& copy_rect,
 }
 
 void
-StreamKv::encode_gather(ComputeEncoder& enc, const ComputeFunction& copy_rect,
-                        int layer, const SharedBuffer& kh,
-                        const SharedBuffer& vh, int seq) const
+StreamKv::encode_gather(ComputeEncoder& enc, int layer,
+                        const SharedBuffer& kh, const SharedBuffer& vh,
+                        int seq) const
 {
   const int R = rows();
   const int SR = R + seq;
@@ -552,9 +579,9 @@ StreamKv::encode_gather(ComputeEncoder& enc, const ComputeFunction& copy_rect,
       const int n = c.audio + c.video;
       const int row0 = c.audio_dropped ? c.audio : 0;
       const int e = c.effective();
-      load_part_(enc, copy_rect, slot, _slot_off[i], n, row0, e, _sk, SR,
+      load_part_(enc, slot, _slot_off[i], n, row0, e, _sk, SR,
                  dst);
-      load_part_(enc, copy_rect, slot, _slot_off[i] + part_bytes_(n), n,
+      load_part_(enc, slot, _slot_off[i] + part_bytes_(n), n,
                  row0, e, _sv, SR, dst);
       dst += e;
     }
@@ -562,9 +589,9 @@ StreamKv::encode_gather(ComputeEncoder& enc, const ComputeFunction& copy_rect,
     // The effective cache rows, skipping any whose audio is dropped.
     int phys = 0, dst = 0;
     auto both = [&](int src_row0, int dst_row0, int n) {
-      copy_rows_(enc, copy_rect, _k[(std::size_t)layer], 0, _cap, src_row0,
+      copy_rows_(enc, _k[(std::size_t)layer], 0, _cap, src_row0,
                  _sk, 0, SR, dst_row0, n);
-      copy_rows_(enc, copy_rect, _v[(std::size_t)layer], 0, _cap, src_row0,
+      copy_rows_(enc, _v[(std::size_t)layer], 0, _cap, src_row0,
                  _sv, 0, SR, dst_row0, n);
     };
     int run_src = 0, run_dst = 0, run_n = 0;
@@ -593,13 +620,13 @@ StreamKv::encode_gather(ComputeEncoder& enc, const ComputeFunction& copy_rect,
     if (run_n > 0) { flush(); }
   }
   // This forward's own rows, after them.
-  copy_rows_(enc, copy_rect, kh, 0, seq, 0, _sk, 0, SR, R, seq);
-  copy_rows_(enc, copy_rect, vh, 0, seq, 0, _sv, 0, SR, R, seq);
+  copy_rows_(enc, kh, 0, seq, 0, _sk, 0, SR, R, seq);
+  copy_rows_(enc, vh, 0, seq, 0, _sv, 0, SR, R, seq);
 }
 
 void
-StreamKv::encode_commit(ComputeEncoder& enc, const ComputeFunction& copy_rect,
-                        int layer, const CommitPlan& plan, int seq) const
+StreamKv::encode_commit(ComputeEncoder& enc, int layer,
+                        const CommitPlan& plan, int seq) const
 {
   const int SR = rows() + seq;
   if (_disk) {
@@ -607,16 +634,16 @@ StreamKv::encode_commit(ComputeEncoder& enc, const ComputeFunction& copy_rect,
     // already, and the ones let go are simply not read again.
     const SharedBuffer& slot = _slot[layer & 1];
     const int n = plan.new_audio + plan.new_video;
-    store_part_(enc, copy_rect, _sk, SR, plan.new_src, n, slot, _new_off);
-    store_part_(enc, copy_rect, _sv, SR, plan.new_src, n, slot,
+    store_part_(enc, _sk, SR, plan.new_src, n, slot, _new_off);
+    store_part_(enc, _sv, SR, plan.new_src, n, slot,
                 _new_off + part_bytes_(n));
     return;
   }
   int dst = 0;
   for (const CommitPlan::Range& r : plan.ranges) {
-    copy_rows_(enc, copy_rect, _sk, 0, SR, r.src, _k[(std::size_t)layer], 0,
+    copy_rows_(enc, _sk, 0, SR, r.src, _k[(std::size_t)layer], 0,
                _cap, dst, r.n);
-    copy_rows_(enc, copy_rect, _sv, 0, SR, r.src, _v[(std::size_t)layer], 0,
+    copy_rows_(enc, _sv, 0, SR, r.src, _v[(std::size_t)layer], 0,
                _cap, dst, r.n);
     dst += r.n;
   }

@@ -257,6 +257,18 @@ public:
   static int h3_anchor_count(bool have_references, bool have_keyframe,
                              int ref_frames, bool* ignored);
 
+  // Which end of the clip each of those anchors pins, in packed order
+  // (anchor k is conditioning frame k of the keyframe latent): none,
+  // {first}, {first, last}, or {last} when `last_only` -- a LAST frame
+  // with no first, the `l2va` request both references take (diffusers'
+  // `last_image` alone, vllm-omni's keyframe signature (-1,)). A lone
+  // last frame is ONE anchor whatever its latent's frame count.
+  enum class H3AnchorEnd { kFirst, kLast };
+  static std::vector<H3AnchorEnd> h3_anchor_ends(bool have_references,
+                                                 int ref_frames,
+                                                 bool last_only,
+                                                 bool* ignored);
+
   // How many `ref2va` reference rows a row beat carries: its row count,
   // or -1 when a NON-EMPTY beat is not `want_elems` wide. `*data` points
   // at the rows when there are any, else null. A missing or non-matrix
@@ -657,8 +669,9 @@ private:
     std::vector<float>  audio_rows;  // [2 * alat, 32], DiT space
     std::vector<double> sigmas;
   };
+  // `ref_last_only`: `ref` holds a LAST-frame anchor alone (l2va).
   bool run_h3_(const void* cond, int text_rows, const float* ref,
-               int ref_frames, const H3References* r2v,
+               int ref_frames, bool ref_last_only, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
                std::vector<float>* audio_out, std::vector<int>* audio_shape,
                const H3Refine* refine = nullptr);

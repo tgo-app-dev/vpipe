@@ -2181,6 +2181,38 @@ TEST(generate_video, ref2va_takes_no_keyframe_anchor_and_reports_it)
               "reported, no keyframe 0 and silent\n");
 }
 
+// WHICH END each anchor pins. A last frame with no first is `l2va`, the
+// clip generated up to a frame -- one anchor at the LAST frame's time
+// whatever its latent's frame count, never a first-frame one. It had
+// been dropped with a warning, on the reading that FL2VA was not
+// trained for it; both references take it (diffusers' `last_image`
+// alone, vllm-omni's keyframe signature (-1,)).
+TEST(generate_video, a_last_frame_alone_anchors_the_end)
+{
+  using E = GenerateVideoStage::H3AnchorEnd;
+  bool ignored = false;
+  auto ends = [&](bool refs, int frames, bool last_only) {
+    ignored = false;
+    return GenerateVideoStage::h3_anchor_ends(refs, frames, last_only,
+                                              &ignored);
+  };
+  EXPECT_TRUE(ends(false, 0, false).empty());
+  EXPECT_TRUE(ends(false, 1, false) == std::vector<E>{E::kFirst});
+  EXPECT_TRUE(ends(false, 2, false) ==
+              (std::vector<E>{E::kFirst, E::kLast}));
+  // l2va: one anchor, at the end -- also from a latent of several
+  // frames, which first-only would have read as first AND last.
+  EXPECT_TRUE(ends(false, 1, true) == std::vector<E>{E::kLast});
+  EXPECT_TRUE(ends(false, 3, true) == std::vector<E>{E::kLast});
+  EXPECT_FALSE(ignored);
+  // References still take no keyframe, the last one included, and say
+  // so.
+  EXPECT_TRUE(ends(true, 1, true).empty());
+  EXPECT_TRUE(ignored);
+  std::printf("[generate_video] anchor ends: first, first+last, and a "
+              "last frame alone at the end (l2va)\n");
+}
+
 // NO REFERENCES IS TWO REQUESTS, and only one of them is a mistake
 // (issue #37). A conditioning with no `references` key at all did not
 // come from a video-ref-encoder -- a diffusion-conditioner feeding a

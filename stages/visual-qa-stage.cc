@@ -18,6 +18,7 @@
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/tokenizer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/tensor-beat-bridge.h"
@@ -278,6 +279,7 @@ VisualQaStage::tower_name_() const
   if (_m_coreml) { return "coreml"; }
   if (_mgvis)    { return "metal-gemma4"; }
   if (_mpix)     { return "metal-pixtral"; }
+  if (_mlfm)     { return "metal-lfm3"; }
   if (_mguni)    { return "gemma4-unified"; }
   if (_mvis)     { return "metal-tower"; }
   return "none";
@@ -328,6 +330,7 @@ VisualQaStage::declare_resources() const
   run.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
   run.contexts = 1 + (int)_questions.size();
   run.branch_tokens = (std::int64_t)_max_new_tokens + kQuestionTurnTokens;
+  run.i8_prefill = _i8_prefill;
   return model_memory::lm_claims(
       session(), resolve_model_dir(session(), _hf_dir), id(), run);
 }
@@ -364,8 +367,9 @@ VisualQaStage::initialize(RuntimeContext& ctx)
     co_return;
   }
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs. No-op
-  // on backends without the route; env VPIPE_I8_GEMM overrides.
-  if (_i8_prefill) { _lm->set_i8_prefill(true); }
+  // on backends without the route; env VPIPE_I8_GEMM overrides. Asked off
+  // too: a warm model comes as the last stage left it (text-chat's note).
+  _lm->request_i8_prefill(_i8_prefill, mgr->launch_epoch());
   _chat_tpl = genai::make_chat_template(
       _lm->config(), _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
@@ -376,9 +380,10 @@ VisualQaStage::initialize(RuntimeContext& ctx)
   _mvis  = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
   _mpix  = _lm->metal_pixtral_vision_encoder();
+  _mlfm  = _lm->metal_lfm3_vision();
   _mguni = _lm->gemma4_unified_embedder();
   if (_mguni && !_mguni->has_vision()) { _mguni = nullptr; }
-  if (!_mvis && !_mgvis && !_mpix && !_mguni) {
+  if (!_mvis && !_mgvis && !_mpix && !_mlfm && !_mguni) {
     session()->warn(fmt(
         "VisualQaStage('{}'): [metal] no metal vision tower (model has "
         "no vision config?); every round will drop", this->id()));
@@ -465,7 +470,7 @@ VisualQaStage::process(RuntimeContext& ctx)
   }
   const int H = static_cast<int>(tbp->shape[1]);
   const int W = static_cast<int>(tbp->shape[2]);
-  if (_m_coreml || _mvis || _mgvis || _mpix || _mguni) {
+  if (_m_coreml || _mvis || _mgvis || _mpix || _mlfm || _mguni) {
     if (_video_enabled && !_m_video_warned) {
       session()->warn(fmt(
           "VisualQaStage('{}'): [metal] video 2:1 temporal merge is not "
@@ -513,6 +518,13 @@ VisualQaStage::process(RuntimeContext& ctx)
       auto r = _mgvis->encode(
           rgb, H, W,
           _video_enabled ? _mgvis->video_soft_token_budget() : -1);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
+    } else if (_mlfm) {
+      // LFM3-VL: one row an <|image|> placeholder, 1-D positions.
+      auto r = _mlfm->encode(rgb, H, W);
       m.embeddings = std::move(r.embeddings);
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h;

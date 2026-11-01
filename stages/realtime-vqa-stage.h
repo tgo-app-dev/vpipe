@@ -403,6 +403,7 @@ private:
   // Pixtral tower + Mistral3 projector (borrowed; its family's only
   // tower). Rows include each frame's [IMG_BREAK] / [IMG_END] rows.
   genai::MetalPixtralVisionEncoder*           _mpix = nullptr;  // borrowed
+  genai::MetalLfm3VisionEncoder*              _mlfm = nullptr;  // borrowed
   // Gemma-4 e4b metal USM audio encoder (borrowed; host-f32 rows). Encodes
   // scene PCM to soft tokens when the iport2 input is PCM (vs audio tags).
   genai::MetalGemma4AudioEncoder*             _mgaud = nullptr; // borrowed

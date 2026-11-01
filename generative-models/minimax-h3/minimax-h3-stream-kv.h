@@ -15,6 +15,33 @@ namespace vpipe {
 namespace genai {
 namespace minimax_h3 {
 
+// Rows of every head of a head-major [heads, rows, head_dim] plane copied
+// into rows of another such plane -- through copy_rect_wide_f16, whose
+// offsets and strides are 64-bit: a whole sequence's head stride puts the
+// last heads past 2^31 elements from ~300k rows (56 heads of 128), where
+// copy_rect_f16's int products went negative and read before the buffer.
+// The banded forward's Sol query gather and StreamKv's copies both go
+// through it, and it loads its own kernel, so neither can be handed the
+// 32-bit one.
+class HeadRowCopy {
+public:
+  // The kernel, from the elementwise library; false when it is absent.
+  bool load(metal_compute::MetalCompute* mc);
+  bool valid() const noexcept { return _fn.valid(); }
+  // Rows [src_row0, src_row0 + n) of the [heads, src_rows, head_dim]
+  // plane at `src` (+ `src_off` bytes) into rows [dst_row0, dst_row0 + n)
+  // of the [heads, dst_rows, head_dim] plane at `dst` (+ `dst_off`).
+  void encode(metal_compute::ComputeEncoder& enc,
+              const metal_compute::SharedBuffer& src, std::size_t src_off,
+              int src_rows, int src_row0,
+              const metal_compute::SharedBuffer& dst, std::size_t dst_off,
+              int dst_rows, int dst_row0, int heads, int head_dim,
+              int n) const;
+
+private:
+  metal_compute::ComputeFunction _fn;
+};
+
 // The persistent CLEAN audio/video key-value cache of TaoMate-H3's
 // streaming method (upstream streaming/cache.py CleanAVKVCache), one
 // pair per main block.
@@ -172,13 +199,11 @@ public:
   // GPU, per main block: fill staging from the cache and the forward's
   // head-major [heads, seq, head_dim] keys and values.
   void encode_gather(metal_compute::ComputeEncoder& enc,
-                     const metal_compute::ComputeFunction& copy_rect,
                      int layer, const metal_compute::SharedBuffer& kh,
                      const metal_compute::SharedBuffer& vh, int seq) const;
   // GPU, per main block of a CLEAN forward, after its attention: rewrite
   // the layer's pair from staging per `plan`.
   void encode_commit(metal_compute::ComputeEncoder& enc,
-                     const metal_compute::ComputeFunction& copy_rect,
                      int layer, const CommitPlan& plan, int seq) const;
   // Host, once the clean forward has COMPLETED on the GPU (and, on disk,
   // end_forward has joined its writes).
@@ -212,7 +237,6 @@ private:
   // One [heads, n, head_dim] row block between two head-major buffers,
   // each from a byte offset.
   void copy_rows_(metal_compute::ComputeEncoder& enc,
-                  const metal_compute::ComputeFunction& copy_rect,
                   const metal_compute::SharedBuffer& src,
                   std::size_t src_off, int src_rows, int src_row0,
                   const metal_compute::SharedBuffer& dst,
@@ -228,14 +252,12 @@ private:
   // Rows [row0, row0 + n) of a stored part (at `off` in `buf`, `rows`
   // rows a head) into staging rows from `dst_row0`, either width.
   void load_part_(metal_compute::ComputeEncoder& enc,
-                  const metal_compute::ComputeFunction& copy_rect,
                   const metal_compute::SharedBuffer& buf, std::size_t off,
                   int rows, int row0, int n,
                   const metal_compute::SharedBuffer& dst, int dst_rows,
                   int dst_row0) const;
   // And back: staging rows [src_row0, src_row0 + n) into a stored part.
   void store_part_(metal_compute::ComputeEncoder& enc,
-                   const metal_compute::ComputeFunction& copy_rect,
                    const metal_compute::SharedBuffer& src, int src_rows,
                    int src_row0, int n,
                    const metal_compute::SharedBuffer& buf,
@@ -248,6 +270,7 @@ private:
   std::vector<metal_compute::SharedBuffer> _k, _v;
   metal_compute::SharedBuffer _sk, _sv;
   int _staging_rows = 0;
+  HeadRowCopy _copy;
   std::vector<Commit> _commits;
 
   // ---- on disk -------------------------------------------------------

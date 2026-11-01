@@ -942,23 +942,28 @@ kernel void transpose_rope_half_part_ftab_f16(
   // the grid up to a threadgroup multiple would otherwise write past
   // `out` rather than be clamped.
   if (h >= H) { return; }
-  const uint src = (uint)t * (uint)in_stride + (uint)in_off +
-                   (uint)h * (uint)in_head_stride;
-  const uint dst = ((uint)h * (uint)S + (uint)t) * (uint)D;
+  // 64-BIT OFFSETS. The source is a whole sequence's fused [S, 3*H*D]
+  // projection and the destination [H, S, D]: at S rows a 32-bit offset
+  // wraps once S * in_stride or H * S * D passes 2^32 -- 199,728 rows at
+  // MiniMax-H3's 21,504-wide q|k|v, 599,186 at its 56 x 128 heads -- and
+  // the loads and stores land elsewhere in the same buffer, silently.
+  const ulong src = (ulong)t * (ulong)in_stride + (ulong)in_off +
+                    (ulong)h * (ulong)in_head_stride;
+  const ulong dst = ((ulong)h * (ulong)S + (ulong)t) * (ulong)D;
   if (d >= rot) {
-    out[dst + (uint)d] = in[src + (uint)d];   // pass-through tail
+    out[dst + (ulong)d] = in[src + (ulong)d];   // pass-through tail
     return;
   }
   const int half_r = rot / 2;
   // Angles repeat across the two halves, so both halves index [0, half_r).
   const int i = (d < half_r) ? d : (d - half_r);
-  const uint cb = (uint)t * (uint)half_r + (uint)i;
+  const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
   const float c = cosb[cb];
   const float s = sinb[cb];
-  const float x1 = float(in[src + (uint)(d < half_r ? d : d - half_r)]);
-  const float x2 = float(in[src + (uint)(d < half_r ? d + half_r : d)]);
+  const float x1 = float(in[src + (ulong)(d < half_r ? d : d - half_r)]);
+  const float x2 = float(in[src + (ulong)(d < half_r ? d + half_r : d)]);
   // rotate_half: out[:half] = x1*c - x2*s, out[half:] = x2*c + x1*s.
-  out[dst + (uint)d] =
+  out[dst + (ulong)d] =
       VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
 }
 
@@ -992,22 +997,27 @@ kernel void transpose_rope_half_part_ftab_band_f16(
   const int t = (int)gid.y;
   const int h = (int)gid.z;
   if (h >= H || t >= S) { return; }
-  const uint src = (uint)t * (uint)in_stride + (uint)in_off +
-                   (uint)h * (uint)in_head_stride;
-  const uint dst =
-      ((uint)h * (uint)out_rows + (uint)out_row0 + (uint)t) * (uint)D;
+  // 64-BIT OFFSETS, as above: the destination is the WHOLE sequence's
+  // [H, out_rows, D], which passes 2^32 elements at 599,186 rows of
+  // MiniMax-H3's 56 x 128 heads (a 2560 x 1440 refine past ~566 frames).
+  // In 32 bits the later heads' rows wrapped onto the earlier heads'.
+  const ulong src = (ulong)t * (ulong)in_stride + (ulong)in_off +
+                    (ulong)h * (ulong)in_head_stride;
+  const ulong dst =
+      ((ulong)h * (ulong)out_rows + (ulong)out_row0 + (ulong)t) *
+      (ulong)D;
   if (d >= rot) {
-    out[dst + (uint)d] = in[src + (uint)d];
+    out[dst + (ulong)d] = in[src + (ulong)d];
     return;
   }
   const int half_r = rot / 2;
   const int i = (d < half_r) ? d : (d - half_r);
-  const uint cb = (uint)t * (uint)half_r + (uint)i;
+  const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
   const float c = cosb[cb];
   const float s = sinb[cb];
-  const float x1 = float(in[src + (uint)(d < half_r ? d : d - half_r)]);
-  const float x2 = float(in[src + (uint)(d < half_r ? d + half_r : d)]);
-  out[dst + (uint)d] =
+  const float x1 = float(in[src + (ulong)(d < half_r ? d : d - half_r)]);
+  const float x2 = float(in[src + (ulong)(d < half_r ? d + half_r : d)]);
+  out[dst + (ulong)d] =
       VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
 }
 
@@ -1062,20 +1072,22 @@ kernel void rope_half_part_ftab_inplace_f16(
   // written after it, so `live` gates the work and never the barrier.
   const bool live = d < D && t < S && h < H && d < rot;
   const int half_r = rot / 2;
-  const uint src = (uint)t * (uint)stride + (uint)off +
-                   (uint)h * (uint)head_stride;
+  // 64-bit: a whole sequence's fused projection passes 2^32 elements at
+  // 199,728 rows of a 21,504-wide q|k|v.
+  const ulong src = (ulong)t * (ulong)stride + (ulong)off +
+                    (ulong)h * (ulong)head_stride;
   float x1 = 0.0f, x2 = 0.0f, c = 0.0f, s = 0.0f;
   if (live) {
     const int i = (d < half_r) ? d : (d - half_r);
-    const uint cb = (uint)t * (uint)half_r + (uint)i;
+    const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
     c = cosb[cb];
     s = sinb[cb];
-    x1 = float(x[src + (uint)(d < half_r ? d : d - half_r)]);
-    x2 = float(x[src + (uint)(d < half_r ? d + half_r : d)]);
+    x1 = float(x[src + (ulong)(d < half_r ? d : d - half_r)]);
+    x2 = float(x[src + (ulong)(d < half_r ? d + half_r : d)]);
   }
   threadgroup_barrier(mem_flags::mem_device);
   if (live) {
-    x[src + (uint)d] =
+    x[src + (ulong)d] =
         VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
   }
 }
@@ -1111,8 +1123,9 @@ kernel void rms_norm_heads_strided_f16(
   if (row >= S * H) { return; }
   const int t = row / H;
   const int h = row % H;
-  device VPIPE_ELT* r = x + (uint)t * (uint)stride + (uint)off +
-                        (uint)h * (uint)head_stride;
+  // 64-bit, as the rope passes: a whole sequence's fused projection.
+  device VPIPE_ELT* r = x + (ulong)t * (ulong)stride + (ulong)off +
+                        (ulong)h * (ulong)head_stride;
   const uint lid = ltid.x;
   float acc = 0.0f;
   for (int i = (int)lid; i < D; i += 32) {

@@ -186,8 +186,10 @@ kernel void rms_norm_fast_f16(
   const uint lid = ltid.x;
   const uint tg = tptg.x;
   const uint nsg = tg / 32;               // actual simdgroups (8@256, 16@512)
-  const device VPIPE_ELT* xr = x + (uint)row * H;
-  device VPIPE_ELT* outr = out + (uint)row * H;
+  // 64-bit row offsets: a long sequence's residual stream passes 2^32
+  // elements (MiniMax-H3's 5,376 wide at 798,915 rows).
+  const device VPIPE_ELT* xr = x + (ulong)row * (ulong)H;
+  device VPIPE_ELT* outr = out + (ulong)row * (ulong)H;
   float acc = 0.0f;
   for (uint i = lid; i < (uint)H; i += tg) {
     const float v = float(xr[i]); acc += v * v;

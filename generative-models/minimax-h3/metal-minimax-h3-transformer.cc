@@ -4432,7 +4432,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_bias_add  = m->_lib_elt.function("bias_add_rows_f16");
   // The blit a baked AdaLN needs when an adapter has to be added on top.
   m->_fn_copy      = m->_lib_elt.function("copy_f16");
-  m->_fn_copy_rect = m->_lib_elt.function("copy_rect_f16");
+  // The per-head row copies (Sol's band gather, the streaming K/V).
+  (void)m->_head_rows.load(mc);
   m->_fn_nan_trip  = m->_lib_elt.function("nan_tripwire_f16");
   {
     m->_lib_sdpa = mc->load_library("sdpa_bf16");
@@ -8501,9 +8502,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       return fail("streaming attention needs a [text | audio | video] "
                   "layout with no conditioning rows");
     }
-    if (!_steel_ok || !_fn_copy_rect.valid()) {
+    if (!_steel_ok || !_head_rows.valid()) {
       return fail("streaming attention needs the steel flash kernel and "
-                  "copy_rect_f16");
+                  "copy_rect_wide_f16");
     }
     // Staging lives in the q|k|v scratch (StreamKv::adopt_staging) when
     // nothing else writes that scratch inside the attention window -- the
@@ -8561,6 +8562,22 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // a head-major output, no steel kernels.
   int band = forward_band(seq);
   if (sattn || n_text > band) { band = 0; }
+  // THE WHOLE-SEQUENCE BLOCK COUNTS ITS ELEMENTS IN 32 BITS: its
+  // modulation, gate and residual passes (and VDN's) take rows * hidden
+  // as an int and dispatch it as one grid, so past 2^31 elements of the
+  // residual stream -- 399,457 rows of 5,376 -- they read and write the
+  // wrong rows. The banded block addresses any length; a request that
+  // keeps the whole sequence (the Neural Engine's share, VDN's branch,
+  // streaming attention) is refused here rather than run wrong.
+  if (band == 0 &&
+      (std::size_t)seq * (std::size_t)H > (std::size_t)INT32_MAX) {
+    return fail("a " + std::to_string(seq) + "-row sequence is too long "
+                "for the whole-sequence blocks this request runs (at "
+                "most " + std::to_string(INT32_MAX / H) + " rows): "
+                "without the Neural Engine's share, VDN's branch and "
+                "streaming attention its blocks run in row bands, which "
+                "take any length");
+  }
   _last_band = band;
   if (!ensure_scratch_(seq, n_text, n_t, vdn_arena, band)) {
     return fail("activation allocation failed (out of GPU memory)");
@@ -9631,7 +9648,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                          (long long)n_text * n_text +
                              (long long)s_media * (s_rows + seq),
                          HD);
-        skv->encode_gather(enc, _fn_copy_rect, layer, s.kh, s.vh, rows);
+        skv->encode_gather(enc, layer, s.kh, s.vh, rows);
         const std::size_t kv_text = (std::size_t)s_rows * HD * 2;
         const std::size_t q_media = (std::size_t)n_text * HD * 2;
         // Text rows over the text keys alone: staging rows past the cache.
@@ -9656,7 +9673,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // come after both attentions have read it -- which the encoder's
         // order guarantees.
         if (stream_commit) {
-          skv->encode_commit(enc, _fn_copy_rect, layer, splan, rows);
+          skv->encode_commit(enc, layer, splan, rows);
         }
         return;
       }
@@ -10489,18 +10506,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         }
         if (sol_here) {
           // Sol reads and writes a band's rows in ONE layout, so the
-          // band's queries are gathered into their own [H, n, D].
+          // band's queries are gathered into their own [H, n, D]. 64-bit
+          // offsets (HeadRowCopy): a head's start in the whole window is
+          // h * seq * HD, past 2^31 for the last heads from ~305k rows
+          // (2560 x 1440 x ~290 frames) -- a 32-bit product turned
+          // negative there and those heads attended with another
+          // buffer's rows.
           MetalSolAttention* so = full ? _sol.get() : _sol_tail.get();
-          enc.set_function(_fn_copy_rect);
-          enc.set_buffer(0, s.qh, (std::size_t)r0 * HD * 2);
-          enc.set_buffer(1, s.qb);
-          enc.set_constant(2, 0);
-          enc.set_constant(3, 0);
-          enc.set_constant(4, NH);
-          enc.set_constant(5, n * HD);
-          enc.set_constant(6, seq * HD);
-          enc.set_constant(7, n * HD);
-          enc.dispatch({(unsigned)(NH * n * HD), 1, 1}, {256, 1, 1});
+          _head_rows.encode(enc, s.qh, (std::size_t)r0 * HD * 2, seq, 0,
+                            s.qb, 0, n, 0, NH, HD, n);
           sol::Config sc = _sol_fwd;
           sc.sink_start  = 0;
           sc.sink_tokens = L.video_start;
@@ -11322,12 +11336,32 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       lora_apply_(enc, s.temb, 0, fin_lo, s.fmod, 0, n_t, 2 * H,
                   c.time_dim);
     }
-    rms(s.x, 0, _final_norm, s.proj, 0, seq, H, c.final_norm_eps);
     // The final modulation is indexed by the bare TIMESTEP index, not by
     // the AdaLN index: this norm is modality-independent. Its two halves
     // are shift then scale, the order the Wan and LTX output layers use.
-    modulate(s.proj, *fmod_buf, fmod_off * 2, s.tstep_idx, s.proj, seq,
-             2 * H, H, 0);
+    //
+    // IN ROW BANDS, whatever the blocks ran: the norm and the modulation
+    // are per row, and one pass over a long sequence's [seq, H] counts
+    // past 2^31 elements (the modulation's int total: 399,457 rows, a
+    // 2560 x 1440 refine past ~379 frames) and 2^32 (a grid's threads),
+    // past which the rows were modulated from the wrong channels, and
+    // then not at all.
+    for (int r0 = 0; r0 < seq; r0 += kBandRows) {
+      const int n = std::min(kBandRows, seq - r0);
+      const std::size_t e0 = (std::size_t)r0 * H;
+      rms(s.x, e0, _final_norm, s.proj, e0, n, H, c.final_norm_eps);
+      enc.set_function(_fn_modulate);
+      enc.set_buffer(0, s.proj, e0 * 2);
+      enc.set_buffer(1, *fmod_buf, fmod_off * 2);
+      enc.set_buffer(2, s.tstep_idx, (std::size_t)r0 * sizeof(int));
+      enc.set_buffer(3, s.proj, e0 * 2);
+      enc.set_constant(4, H);
+      enc.set_constant(5, 2 * H);
+      enc.set_constant(6, H);
+      enc.set_constant(7, 0);
+      enc.set_constant(8, n * H);
+      enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
+    }
     // The inverse gather, run by run, so the velocity comes back in the
     // same row order the caller handed the latents in.
     {

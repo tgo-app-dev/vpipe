@@ -195,10 +195,20 @@ attention<bfloat, 32, 16, 64, 4, 1, bfloat, float>;
 //
 //   0:q[Hq,n_q,D] 1:kpool 2:vpool 3:out[Hq,n_q,D] 4:scale 5:D 6:Hq 7:Hkv
 //   8:n_q 9:q_offset 10:page_tokens 11:n_pages 12:page_table{pid,nvalid,gstart}
+//   13:window (WIN only)
 // page_tokens % BK == 0, so a block never leaves its page's allocation.
 // grid (32*NQ, 4*Hq, WN); threadgroup (32,4,WN): 128 threads at bd128,
 // 256 at bd256 (attn_steel_paged_bk / _wn in prefill-gqa-attn-set.h).
-template <int BD, int BK, int WN>
+//
+// WIN: a TRAILING SLIDING WINDOW (LFM3's sliding_attention layers) -- a
+// query at position p reads keys (p - window, p]. Blocks below the lowest
+// row's window are skipped (uniform per tile) and the rest masked per
+// key. A row's first blocks can be wholly outside its own window while
+// its running max is still finite_min; they add exp2(0) terms that the
+// first in-window key's rescale (exp2(finite_min - max) = 0) erases, so
+// every row ends on its own window alone (its own key is always in it).
+// WIN false is the kernel it was, buffer 13 unread.
+template <int BD, int BK, int WN, bool WIN = false>
 [[kernel]] void attn_steel_paged(
     const device half*  q          [[buffer(0)]],
     const device half*  kpool      [[buffer(1)]],
@@ -213,6 +223,7 @@ template <int BD, int BK, int WN>
     constant int&       page_tokens[[buffer(10)]],
     constant int&       n_pages    [[buffer(11)]],
     const device int*   page_table [[buffer(12)]],
+    constant int&       window     [[buffer(13)]],
     uint  simd_group_id [[simdgroup_index_in_threadgroup]],
     uint  simd_lane_id  [[thread_index_in_simdgroup]],
     uint  lid           [[thread_index_in_threadgroup]],
@@ -319,17 +330,21 @@ template <int BD, int BK, int WN>
 
   // Causal: the highest global query pos in this tile bounds the key scan.
   const int q_tile_max = q_offset + min(q_row0 + BQ - 1, n_q - 1);
+  // Window: the lowest query pos in this tile bounds it from below.
+  const int win_lo = WIN ? q_offset + q_row0 - window + 1 : 0;
 
   for (int pg = 0; pg < n_pages; ++pg) {
     const int gstart = page_table[pg * 3 + 2];
     if (gstart > q_tile_max) { break; }       // past the tile (uniform)
     const int pid    = page_table[pg * 3 + 0];
     const int nvalid = page_table[pg * 3 + 1];
+    if (WIN && gstart + nvalid <= win_lo) { continue; }   // uniform
     const device half* kpage = kpool + (uint)pid * page_stride + head_off;
     const device half* vpage = vpool + (uint)pid * page_stride + head_off;
   for (int local0 = 0; local0 < nvalid; local0 += BK) {
     const int gbs = gstart + local0;          // global key block start
     if (gbs > q_tile_max) { break; }          // uniform
+    if (WIN && gbs + BK <= win_lo) { continue; }          // uniform
     // page_tokens % BK == 0 -> the block lies inside the page's allocation,
     // so load_unsafe never faults. Slots past nvalid (and keys past t_kv)
     // are read stale and masked to -inf below.
@@ -397,7 +412,8 @@ template <int BD, int BK, int WN>
         for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; ++jj) {
           const int lc = lc0 + jj;
           const int gk = gstart + lc;
-          if (lc >= nvalid || gk >= t_kv || row_pos < gk) {
+          if (lc >= nvalid || gk >= t_kv || row_pos < gk ||
+              (WIN && gk <= row_pos - window)) {
             Stile.frag_at(i, j)[jj] = Limits<float>::finite_min;
           }
         }
@@ -465,3 +481,6 @@ template [[host_name("attn_steel_paged_bd256")]] [[kernel]]
 decltype(attn_steel_paged<256, 32, 2>) attn_steel_paged<256, 32, 2>;
 template [[host_name("attn_steel_paged_bd128")]] [[kernel]]
 decltype(attn_steel_paged<128, 16, 1>) attn_steel_paged<128, 16, 1>;
+template [[host_name("attn_steel_paged_win_bd128")]] [[kernel]]
+decltype(attn_steel_paged<128, 16, 1, true>)
+    attn_steel_paged<128, 16, 1, true>;

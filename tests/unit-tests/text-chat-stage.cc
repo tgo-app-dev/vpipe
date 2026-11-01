@@ -1516,6 +1516,49 @@ TEST(text_chat_stage, metal_chat_deepseek_v41_answers) {
   EXPECT_TRUE(has_paris);
 }
 
+// LFM3-VL (VPIPE_LFM3_TEST_MODEL_PATH): a picture turn and a text turn
+// through the stage, thinking off, each answered; and a thinking turn,
+// whose answer follows its reasoning.
+TEST(text_chat_stage, metal_chat_lfm3_answers) {
+  const char* path = std::getenv("VPIPE_LFM3_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  FlexData off = FlexData::make_object();
+  off.as_object().insert("disable_thinking", FlexData::make_bool(true));
+  const std::string img = write_red_ppm_();
+  auto texts = run_chat_turn_(
+      path, "Look at this image: " +
+                vpipe::media_line::make_fs_marker(
+                    vpipe::media_line::Modality::Image, img) +
+                " What is the dominant color of the image? Answer in one "
+                "word.", off);
+  bool has_red = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.lfm3] picture: '%s'\n", t.c_str());
+    has_red = has_red || lower_(t).find("red") != std::string::npos;
+  }
+  EXPECT_TRUE(has_red);
+  texts = run_chat_turn_(path, "What is the capital of France? Answer in "
+                               "one word.", off);
+  bool has_paris = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.lfm3] text: '%s'\n", t.c_str());
+    has_paris = has_paris || lower_(t).find("paris") != std::string::npos;
+  }
+  EXPECT_TRUE(has_paris);
+  FlexData think = FlexData::make_object();
+  think.as_object().insert("max_new_tokens", FlexData::make_int(400));
+  texts = run_chat_turn_(path, "What is 17 * 23? Answer with the number.",
+                         think);
+  bool has_391 = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.lfm3] thinking: '%s'\n", t.c_str());
+    has_391 = has_391 || t.find("391") != std::string::npos;
+  }
+  EXPECT_TRUE(has_391);
+}
+
 // DeepSeek-V4.1 with `mtp`: the stage loads the DSpark head (the model's
 // own directory named as its drafter) and decodes speculatively -- a
 // greedy reply the same text as without it.

@@ -6,6 +6,7 @@
 #include "generative-models/gemma4/metal-gemma4-vision.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
@@ -60,6 +61,7 @@ struct TurnState {
   MetalQwenVisionEncoder*              qwen = nullptr;
   MetalGemma4VisionEncoder*            gemma = nullptr;
   MetalPixtralVisionEncoder*           pixtral = nullptr;
+  MetalLfm3VisionEncoder*              lfm3 = nullptr;
   Gemma4UnifiedEmbedder*               unified = nullptr;
   std::vector<Frame>                   frames;
   int                                  tokens = 0;
@@ -93,6 +95,15 @@ encode(TurnState& m, const std::uint8_t* rgb, int h, int w, Frame* out)
     out->mw         = r.grid_w;
   } else if (m.pixtral) {
     auto r = m.pixtral->encode(rgb, h, w, kPixtralFrameTokens);
+    out->embeddings = std::move(r.embeddings);
+    out->n_tokens   = r.n_tokens;
+    out->mh         = r.grid_h;
+    out->mw         = r.grid_w;
+  } else if (m.lfm3) {
+    // A frame at the Pixtral frames' budget (a token a 32 x 32 cell).
+    const std::int64_t cell =
+        (std::int64_t)m.lfm3->config().patch * m.lfm3->config().merge;
+    auto r = m.lfm3->encode(rgb, h, w, kPixtralFrameTokens * cell * cell);
     out->embeddings = std::move(r.embeddings);
     out->n_tokens   = r.n_tokens;
     out->mh         = r.grid_h;
@@ -200,11 +211,13 @@ VideoTurn::make(std::shared_ptr<LoadedLanguageModel> lm,
   impl->qwen    = lm->metal_vision_encoder();
   impl->gemma   = lm->metal_gemma4_vision_encoder();
   impl->pixtral = lm->metal_pixtral_vision_encoder();
+  impl->lfm3    = lm->metal_lfm3_vision();
   impl->unified = lm->gemma4_unified_embedder();
   if (impl->unified && !impl->unified->has_vision()) {
     impl->unified = nullptr;
   }
-  if (!impl->qwen && !impl->gemma && !impl->pixtral && !impl->unified) {
+  if (!impl->qwen && !impl->gemma && !impl->pixtral && !impl->lfm3
+      && !impl->unified) {
     if (session) {
       session->warn(fmt("VideoTurn: '{}' has no vision tower on the "
                         "metal backend", lm->config().architecture));

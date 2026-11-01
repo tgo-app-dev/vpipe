@@ -8,6 +8,8 @@
 #include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
 #include "generative-models/gemma4/metal-gemma-model-exec.h"
 #include "generative-models/llama3/metal-llama-model-exec.h"
+#include "generative-models/lfm3/metal-lfm3-model-exec.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/qwen3/metal-qwen-model-exec.h"
 #include "generative-models/gemma4/metal-gemma4-audio.h"
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
@@ -81,6 +83,13 @@ struct LoadedLanguageModel::Impl {
   unique_ptr<MetalGemma4VisionEncoder> metal_gemma4_vision;
   unique_ptr<MetalPixtralVisionEncoder> metal_pixtral_vision;
   unique_ptr<MetalDeepseekV41Vision> metal_dsv41_vision;
+  unique_ptr<MetalLfm3VisionEncoder> metal_lfm3_vision;
+  // The int8 prefill's flag (set_i8_prefill / request_i8_prefill): what
+  // was asked, and the launch the requests were in.
+  std::mutex    i8_mu;
+  bool          i8_on = false;
+  bool          i8_tagged = false;
+  std::uint64_t i8_epoch = 0;
   // Image rows take 1-D RoPE positions: the grids a caller passes to
   // prefill_multimodal_metal are for mROPE families only (Mistral3).
   bool image_rope_1d = false;
@@ -463,6 +472,9 @@ LoadedLanguageModel::LoadedLanguageModel(
     // DeepSeek-V4.1-Flash: hyper-connections, compressed sparse attention,
     // engram, FP4 experts through the expert cache.
     const bool metal_dsv41 = family == LmFamily::kDeepseekV41;
+    // LFM3 / LFM3-VL: gated short convolutions, sliding and global
+    // attention (generative-models/lfm3/).
+    const bool metal_lfm3 = family == LmFamily::kLfm3;
     // A plugin may register a new arch -> ModelExec factory. Consulted
     // BEFORE the built-in cascade below so a plugin family is selectable
     // by its config.json `architecture` string.
@@ -479,7 +491,7 @@ LoadedLanguageModel::LoadedLanguageModel(
     const bool use_metal = backend_wants_metal && mc_be != nullptr &&
         mc_be->valid() && !model_dir.empty() &&
         (metal_llama || metal_qwen || metal_gemma || metal_dsv41 ||
-         metal_plugin);
+         metal_lfm3 || metal_plugin);
     if (use_metal) {
       // Bookkeeping-only ctx_mgr (the metal exec owns its own KV).
       ContextManager::Spec s;
@@ -496,6 +508,11 @@ LoadedLanguageModel::LoadedLanguageModel(
             compute_dtype_in == ComputeDtype::BF16};
         _impl->exec = ModelExecRegistry::get().create(arch_be, a);
         _impl->metal_bf16 = (compute_dtype_in == ComputeDtype::BF16);
+      } else if (metal_lfm3) {
+        // F16 throughout: the residual stays under ~30 on real prompts.
+        _impl->metal_bf16 = false;
+        _impl->exec = make_unique<MetalLfm3ModelExec>(
+            model_dir, mc_be, page_tokens, max_pages, session);
       } else if (metal_dsv41) {
         MetalDeepseekV41Model::Options o;
         o.use_bf16 = true;   // the release runs bf16; f16 overflows
@@ -684,6 +701,26 @@ LoadedLanguageModel::LoadedLanguageModel(
                               "tower did not load ({}); image input is "
                               "unavailable", verr));
           }
+        }
+      }
+      // LFM3-VL's tower + projector: one row an <|image|> placeholder,
+      // 1-D positions like text.
+      if (metal_lfm3 && _impl->weights.config.vision.present) {
+        _impl->image_rope_1d = true;
+        MetalLfm3VisionEncoder::Config vc;
+        std::string verr;
+        if (MetalLfm3VisionEncoder::Config::from_dir(model_dir, &vc,
+                                                     &verr)) {
+          _impl->metal_lfm3_vision = MetalLfm3VisionEncoder::load(
+              open_weight_set(model_dir, session), mc_be, vc, &verr);
+        }
+        if (_impl->metal_lfm3_vision) {
+          _impl->metal_lfm3_vision->set_session(session);
+          phase_log("metal_lfm3_vision_encoder (load + bind, no MLX)");
+        } else if (session) {
+          session->warn(fmt("LoadedLanguageModel: the LFM3-VL vision tower "
+                            "did not load ({}); image input is unavailable",
+                            verr));
         }
       }
       // Metal Pixtral tower + Mistral3 projector (Ministral-3). Its rows
@@ -1050,6 +1087,12 @@ MetalDeepseekV41Vision*
 LoadedLanguageModel::metal_deepseek_v41_vision() const noexcept
 {
   return _impl ? _impl->metal_dsv41_vision.get() : nullptr;
+}
+
+MetalLfm3VisionEncoder*
+LoadedLanguageModel::metal_lfm3_vision() const noexcept
+{
+  return _impl ? _impl->metal_lfm3_vision.get() : nullptr;
 }
 
 MetalPixtralVisionEncoder*
@@ -2185,7 +2228,35 @@ LoadedLanguageModel::base_suppressed_tokens() const noexcept
 void
 LoadedLanguageModel::set_i8_prefill(bool on)
 {
-  if (_impl && _impl->exec) { _impl->exec->set_i8_gemm(on); }
+  if (!_impl) { return; }
+  std::lock_guard<std::mutex> lk(_impl->i8_mu);
+  _impl->i8_on = on;
+  _impl->i8_tagged = false;   // the next request starts a launch afresh
+  if (_impl->exec) { _impl->exec->set_i8_gemm(on); }
+}
+
+void
+LoadedLanguageModel::request_i8_prefill(bool on, std::uint64_t epoch)
+{
+  if (!_impl) { return; }
+  std::lock_guard<std::mutex> lk(_impl->i8_mu);
+  if (!_impl->i8_tagged || _impl->i8_epoch != epoch) {
+    _impl->i8_tagged = true;
+    _impl->i8_epoch = epoch;
+    _impl->i8_on = on;
+  } else {
+    _impl->i8_on = _impl->i8_on || on;
+  }
+  // The models keep their context when the flag does not move.
+  if (_impl->exec) { _impl->exec->set_i8_gemm(_impl->i8_on); }
+}
+
+bool
+LoadedLanguageModel::i8_prefill_requested() const
+{
+  if (!_impl) { return false; }
+  std::lock_guard<std::mutex> lk(_impl->i8_mu);
+  return _impl->i8_on;
 }
 
 bool

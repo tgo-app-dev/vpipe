@@ -514,7 +514,8 @@ const PortSpec kIports[] = {
    .doc = "OPTIONAL LAST-frame keyframe anchor from a second vae-encode, "
           "for a family that anchors on keyframes rather than on one "
           "clip-shaped latent. With ref_latent0 this is the first-and-last "
-          "mode",
+          "mode; alone, the clip is generated up to this frame "
+          "(last-frame-to-video)",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_video_rows",
    .doc = "OPTIONAL reference VIDEO rows from a video-ref-encoder: f32 "
@@ -980,9 +981,27 @@ GenerateVideoStage::h3_anchor_count(bool have_references, bool have_keyframe,
     return 0;
   }
   // One anchor is first-frame image-to-video; two is the first AND last
-  // the FL2VA partition is named for. A LAST frame with no first is
-  // caught upstream, where the beat is read.
+  // the FL2VA partition is named for. A LAST frame with no first is one
+  // anchor too, and h3_anchor_ends says which end it pins.
   return ref_frames >= 2 ? 2 : 1;
+}
+
+// See the declaration. Outside the Apple-Silicon guard for the same
+// reason as h3_anchor_count.
+std::vector<GenerateVideoStage::H3AnchorEnd>
+GenerateVideoStage::h3_anchor_ends(bool have_references, int ref_frames,
+                                   bool last_only, bool* ignored)
+{
+  const int n = h3_anchor_count(have_references, ref_frames > 0,
+                                ref_frames, ignored);
+  if (n == 0) { return {}; }
+  // l2va: the clip generated UP TO a frame. Both references pack it as
+  // a single block at the last frame's rotary time -- the time the last
+  // anchor of a first-and-last request takes -- with nothing at the
+  // first.
+  if (last_only) { return {H3AnchorEnd::kLast}; }
+  if (n == 1) { return {H3AnchorEnd::kFirst}; }
+  return {H3AnchorEnd::kFirst, H3AnchorEnd::kLast};
 }
 
 // See the declaration. Outside the Apple-Silicon guard for the same
@@ -3839,7 +3858,8 @@ GenerateVideoStage::h3_silence_rows_(int frames, double fps,
 
 bool
 GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
-                            int ref_frames, const H3References* r2v,
+                            int ref_frames, bool ref_last_only,
+                            const H3References* r2v,
                             std::vector<float>* video_out,
                             std::vector<int>* video_shape,
                             std::vector<float>* audio_out,
@@ -3910,7 +3930,8 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   }
   // One latent frame per anchor. No ref => text-to-video-and-audio; one
   // => a first-frame anchor; two => first AND last, which is what the
-  // FL2VA partition is named for.
+  // FL2VA partition is named for; a last frame alone => one anchor at
+  // the last frame's time (l2va), the clip generated up to it.
   //
   // A request carrying REFERENCES takes none of them, and that is
   // structural rather than a policy: build_ref2va_packed_sequence() has
@@ -3924,16 +3945,16 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // the latent then goes nowhere -- and the symptom is a clip whose
   // subject and wardrobe transferred while its opening frame did not,
   // which reads as the model disobeying rather than as a mode that does
-  // not exist. The neighbouring case (a last frame with no first) has
-  // always warned; this one had the same claim on one.
+  // not exist.
   bool kf_ignored = false;
-  const int n_anchor =
-      refine != nullptr ? 0
-                        : h3_anchor_count(r2v != nullptr, ref != nullptr,
-                                          ref_frames, &kf_ignored);
   std::vector<h3::Anchor> anchors;
-  if (n_anchor >= 1) { anchors.push_back(h3::Anchor::kFirst); }
-  if (n_anchor >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  if (refine == nullptr && ref != nullptr) {
+    for (H3AnchorEnd e : h3_anchor_ends(r2v != nullptr, ref_frames,
+                                        ref_last_only, &kf_ignored)) {
+      anchors.push_back(e == H3AnchorEnd::kFirst ? h3::Anchor::kFirst
+                                                 : h3::Anchor::kLast);
+    }
+  }
   if (kf_ignored && !_kf_on_ref2va_said) {
     _kf_on_ref2va_said = true;
     // A prompt-only Ref2VA request lands here too: it lists no
@@ -4183,10 +4204,15 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
           vid.data() + k * per_anchor, per_anchor,
           _h3_params.condition_timestep, 0);
     }
+    std::string ends;
+    for (h3::Anchor a : anchors) {
+      ends += ends.empty() ? "" : " + ";
+      ends += a == h3::Anchor::kFirst ? "first" : "last";
+    }
     session()->info(fmt(
-        "GenerateVideoStage('{}'): {} keyframe anchor{}{}, noised to t "
-        "{:.4g}", this->id(), anchors.size(),
-        anchors.size() == 1 ? "" : "s",
+        "GenerateVideoStage('{}'): {} keyframe anchor{} ({} frame){}, "
+        "noised to t {:.4g}", this->id(), anchors.size(),
+        anchors.size() == 1 ? "" : "s", ends,
         sc != nullptr && sc->bf16_conditioning
             ? " rounded to bf16 (the adapter's conditioning policy)" : "",
         _h3_params.condition_timestep));
@@ -5039,21 +5065,33 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // vae-encodes, not one that somehow emits two latent frames. They
     // are concatenated here, on the frame axis, into the [z, k, lh, lw]
     // block run_h3_ patchifies (anchor k -> conditioning frame k).
+    //
+    // A LAST frame with NO first-frame beat is `l2va`: the clip
+    // generated up to that frame, one anchor at the last frame's time.
+    // Both references take it (diffusers' `last_image` alone,
+    // vllm-omni's keyframe signature (-1,)). A first frame that WAS
+    // wired and did not fit is a different case -- the graph asked for
+    // first-and-last -- and is not quietly turned into l2va.
     std::vector<float> stacked;
+    bool last_only = false;
     if (ref1 != nullptr) {
-      if (refp == nullptr) {
-        // Dropping it silently would run a plain t2v while the graph
-        // says otherwise. L2V is not a partition this model was
-        // trained for, so the honest move is to name what was ignored.
-        session()->warn(fmt(
-            "GenerateVideoStage('{}'): a LAST-frame anchor on iport{} needs "
-            "a FIRST-frame anchor on iport{} too; ignoring it", this->id(),
-            kRefPort1, kRefPort));
-      } else if (!anchor_ok(ref1)) {
+      if (!anchor_ok(ref1)) {
         session()->warn(fmt(
             "GenerateVideoStage('{}'): last-frame keyframe latent does not "
-            "match [{}, n, {}, {}]; generating with the first frame only",
-            this->id(), _h3_cfg.video_channels, lh0, lw0));
+            "match [{}, n, {}, {}]; generating {}", this->id(),
+            _h3_cfg.video_channels, lh0, lw0,
+            refp != nullptr ? "with the first frame only"
+                            : "without it"));
+      } else if (ref == nullptr) {
+        refp = ref1->as_f32();
+        ref_frames = (int)ref1->shape[1];
+        last_only = true;
+      } else if (refp == nullptr) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the first-frame anchor on iport{} "
+            "was unusable, so the last-frame anchor on iport{} is ignored "
+            "too (wire iport{} alone for a clip that ends on a frame)",
+            this->id(), kRefPort, kRefPort1, kRefPort1));
       } else {
         const int ZC = _h3_cfg.video_channels;
         const int n1 = (int)ref1->shape[1];
@@ -5148,6 +5186,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
             "inputs are IGNORED", this->id()));
         refp = nullptr;
         ref_frames = 0;
+        last_only = false;
         have_r2v = false;
       }
       if (_h3_partition == "ref2va" && !_refine_ref2va_said) {
@@ -5182,7 +5221,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
             ? run_h3_taomate_(cond->data.data(), (int)cond->shape[0],
                               tm_slot, &vlat, &vshape, &alat_out, &ashape)
             : run_h3_(cond->data.data(), (int)cond->shape[0], refp,
-                      ref_frames, have_r2v ? &r2v : nullptr,
+                      ref_frames, last_only, have_r2v ? &r2v : nullptr,
                       &vlat, &vshape, &alat_out, &ashape, rp);
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
     // What the DiT held WHILE it denoised, before any drop below -- the
