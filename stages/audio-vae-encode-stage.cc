@@ -1,6 +1,7 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/audio-vae-encode-stage.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
+#include "generative-models/weight-set.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -87,7 +88,10 @@ const PortSpec kOports[] = {
   {.name = "latent",
    .doc = "the encoded soundtrack as an f32 TensorBeat in the ENCODER's own "
           "latent shape -- [rows, dim] for a family feeding generate-video's "
-          "ref_audio_rows. ONE beat per run, at drain",
+          "ref_audio_rows; MiniMax-H3's (built in) [2, 32, frames], "
+          "whitened, as generate-video's audio_latent oport writes it and "
+          "its guide_audio_latent port takes it. ONE beat per run, at "
+          "drain",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
 };
@@ -105,6 +109,120 @@ const StageSpec kSpec = {
   .oports    = kOports,
   .attrs     = kAttrs,
 };
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// MiniMax-H3's own audio VAE, BUILT IN: a soundtrack encoded into the
+// DiT's rows as generate-video lays its own -- the posterior mean,
+// whitened, [2, channels, frames] as its `audio_latent` oport writes it
+// -- which is what its `guide_audio_latent` port takes. Every other
+// family is a plugin's; this one ships with the model it serves.
+class H3AudioEncoder final : public genai::AudioVaeEncoder {
+public:
+  // Through the MANAGER, as audio-vae-decode loads the same VAE: the dir
+  // overload builds a private set no other holder can share, and the
+  // plan counts this checkpoint once whoever holds it.
+  static std::unique_ptr<H3AudioEncoder>
+  load(const std::string& dir, metal_compute::MetalCompute* mc,
+       const SessionContextIntf* session, std::string* err)
+  {
+    auto e = std::unique_ptr<H3AudioEncoder>(new H3AudioEncoder());
+    if (!genai::MetalMiniMaxH3AudioVae::config_from_json(dir, e->_cfg,
+                                                         err)) {
+      return nullptr;
+    }
+    // The whitening IS the DiT's latent space. Without it an encode
+    // still runs and lands at the wrong per-channel scale and offset, so
+    // refuse, as audio-vae-decode does.
+    const int AC = e->_cfg.latent_channels;
+    if ((int)e->_cfg.latents_mean.size() != AC ||
+        (int)e->_cfg.latents_std.size() != AC) {
+      if (err != nullptr) {
+        *err = "its config has " +
+               std::to_string(e->_cfg.latents_mean.size()) + "/" +
+               std::to_string(e->_cfg.latents_std.size()) +
+               " latents_mean/std for " + std::to_string(AC) +
+               " latent channels";
+      }
+      return nullptr;
+    }
+    e->_vae = genai::MetalMiniMaxH3AudioVae::load(
+        genai::open_weight_set(dir, session), mc, e->_cfg);
+    if (!e->_vae) {
+      if (err != nullptr) { *err = "the audio VAE did not load"; }
+      return nullptr;
+    }
+    e->_bytes = model_memory::dir_weights_bytes(dir);
+    return e;
+  }
+  int sample_rate() const override { return _cfg.sample_rate; }
+  int channels() const override { return 2; }
+  std::uint64_t resident_bytes() const override { return _bytes; }
+  bool
+  encode(const genai::AudioVaeEncodeRequest& req, std::vector<float>* out,
+         std::vector<int>* shape, std::string* err) override
+  {
+    if (req.pcm == nullptr || req.n_samples <= 0 || req.channels <= 0) {
+      if (err != nullptr) { *err = "no samples"; }
+      return false;
+    }
+    // Stereo, planar: a mono soundtrack is heard in both ears.
+    const std::size_t n = (std::size_t)req.n_samples;
+    std::vector<float> pcm(2 * n);
+    for (int c = 0; c < 2; ++c) {
+      const int from = std::min(c, req.channels - 1);
+      std::memcpy(pcm.data() + (std::size_t)c * n,
+                  req.pcm + (std::size_t)from * n, n * sizeof(float));
+    }
+    std::vector<float> rows;
+    int frames = 0;
+    if (!_vae->encode(pcm.data(), 2, req.n_samples, &rows, &frames, err) ||
+        frames <= 0) {
+      return false;
+    }
+    // [2 * frames, AC] rows, whitened, transposed to [2, AC, frames].
+    const int AC = _cfg.latent_channels;
+    out->assign((std::size_t)2 * AC * frames, 0.0f);
+    for (int c = 0; c < 2; ++c) {
+      for (int i = 0; i < frames; ++i) {
+        const float* row = rows.data() + ((std::size_t)c * frames + i) * AC;
+        for (int k = 0; k < AC; ++k) {
+          const float mu = _cfg.latents_mean[(std::size_t)k];
+          const float sd = _cfg.latents_std[(std::size_t)k];
+          (*out)[((std::size_t)c * AC + k) * frames + i] =
+              sd != 0.0f ? (row[k] - mu) / sd : (row[k] - mu);
+        }
+      }
+    }
+    *shape = {2, AC, frames};
+    return true;
+  }
+
+private:
+  H3AudioEncoder() = default;
+  genai::MetalMiniMaxH3AudioVae::Config         _cfg;
+  std::unique_ptr<genai::MetalMiniMaxH3AudioVae> _vae;
+  std::uint64_t                                  _bytes = 0;
+};
+
+// MiniMax-H3's audio VAE under `root` -- the directory (or Comfy-Org
+// single file) its config reads from -- or "" where the checkpoint keeps
+// none. The ONE test for the built-in encoder: the claim, the
+// declaration and the load all ask it, so the stage books exactly what
+// it loads, `hf_dir` naming the root, a partition or audio_vae/ itself.
+std::string
+h3_audio_vae_(const std::string& root)
+{
+  const std::string h3 =
+      genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  genai::MetalMiniMaxH3AudioVae::Config probe;
+  if (h3.empty() ||
+      !genai::MetalMiniMaxH3AudioVae::config_from_json(h3, probe,
+                                                        nullptr)) {
+    return {};
+  }
+  return h3;
+}
+#endif
 
 }  // namespace
 
@@ -273,8 +391,13 @@ AudioVaeEncodeStage::declare_memory() const
     const std::string a =
         f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
     if (!a.empty()) { vae = a; }
+    if (vae.empty() || vae == root) { return m; }
+  } else {
+    // MiniMax-H3's, built in: where ensure_loaded_ loads it, `hf_dir`
+    // naming audio_vae/ itself included.
+    vae = h3_audio_vae_(root);
+    if (vae.empty()) { return m; }
   }
-  if (vae.empty() || vae == root) { return m; }
   // No streaming form; a VAE holds what it weighs.
   //
   // NEITHER `releases` NOR `reclaimable`, whatever the config says, and
@@ -307,6 +430,9 @@ AudioVaeEncodeStage::declare_resources() const
     // VAE a checkpoint with one codec for both uses.
     return f->declare_resources(root, root);
   }
+  // MiniMax-H3's, built in -- where ensure_loaded_ would load it.
+  const std::string h3 = h3_audio_vae_(root);
+  if (!h3.empty()) { return model_memory::weight_claims({h3}); }
   return {};
 }
 
@@ -340,10 +466,29 @@ AudioVaeEncodeStage::ensure_loaded_()
         session(), root, root, model_type);
   }
   if (_vae_family == nullptr) {
+    // MiniMax-H3's, built in (H3AudioEncoder): its audio VAE where the
+    // checkpoint keeps one.
+    const std::string h3 = h3_audio_vae_(root);
+    if (!h3.empty()) {
+      std::string err;
+      auto e = H3AudioEncoder::load(h3, mc, session(), &err);
+      if (!e) {
+        session()->error(fmt(
+            "AudioVaeEncodeStage('{}'): MiniMax-H3's audio VAE in '{}' did "
+            "not load ({}); inert", this->id(), h3, err));
+        return;
+      }
+      _family = "minimax-h3";
+      _plugin_enc = std::move(e);
+      session()->info(fmt(
+          "AudioVaeEncodeStage('{}'): MiniMax-H3's audio VAE (built in) -- "
+          "wants {} Hz stereo, emits [2, channels, frames] whitened",
+          this->id(), _plugin_enc->sample_rate()));
+      return;
+    }
     session()->error(fmt(
-        "AudioVaeEncodeStage('{}'): no registered VAE family claims '{}'. "
-        "This stage has NO built-in encoder -- every audio encoder comes "
-        "from a plugin -- so there is nothing to fall back to; inert",
+        "AudioVaeEncodeStage('{}'): no registered VAE family claims '{}', "
+        "and it is not MiniMax-H3, the one encoder built in; inert",
         this->id(), root));
     return;
   }

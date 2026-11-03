@@ -38,8 +38,8 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "axis", .type = ConfigType::Int, .required = false,
    .doc = "which axis `start`/`count` slice. 0 is the outermost. A "
           "MiniMax-H3 video latent is [z, T, H, W], so its TIME axis is "
-          "1; an audio latent is [channels, latents], so time is 1 there "
-          "too", .def_int = 0},
+          "1; its audio latent is [2, channels, latents] (generate-video's "
+          "audio_latent oport), so time is 2 there", .def_int = 0},
   {.key = "start", .type = ConfigType::Int, .required = false,
    .doc = "first index on `axis`. NEGATIVE counts from the end, so -5 is "
           "\"the last five\" without knowing the extent -- the spelling "

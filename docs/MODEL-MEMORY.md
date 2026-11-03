@@ -1337,6 +1337,28 @@ read that is faster for every block that is *not* promoted.
 `promote_into()` makes the choice for you, because it is also the case
 where getting it wrong is a use-after-free rather than a slowdown.
 
+**...and it can run under the NEXT block.** The copy and the wiring are
+host work. Done between a block's wait and the next block's encode,
+they leave the GPU idle for both: ~60 ms for a 735 MB block on an M5
+Ultra, ~3 s of a first forward that keeps 50 blocks — a quarter of
+that forward at a small geometry. So commit the next block first and
+promote under its GPU work. Two orders then decide whether it is still
+correct:
+
+- **The copy empties the slot the next read wants.** Either move the
+  block into a spare first (the slot takes the spare's buffers, and the
+  read starts at once — one block of memory, for the forward), or copy
+  before any read is issued into that slot. Copying first puts the copy
+  in front of every read, which costs exactly where the read is the
+  bottleneck.
+- **Keep what the slot shares with the next block AT THE WAIT.** A
+  streamed adapter's factors live in one set that the next block's fill
+  overwrites; kept after that fill, the block is kept without its
+  adapter, silently.
+
+MiniMax-H3 promotes this way (`VPIPE_H3_PROMOTE_INLINE=1` is the A/B);
+`promote_into()`'s callers still promote in line.
+
 > **Trap: join before every early return.** A read may be in flight into
 > a slot, and freeing or reading that slot while a reader thread writes
 > into it is a use-after-free. A forward returns from many places — a

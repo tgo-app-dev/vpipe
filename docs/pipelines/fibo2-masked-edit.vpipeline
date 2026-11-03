@@ -47,9 +47,8 @@
         { "src": "grey-out", "oport": 0 }
       ],
       "config": {
-        "width": 1024,
-        "height": 1024,
-        "fit": "crop",
+        "fit": "crop_to_area",
+        "megapixels": 1,
         "algorithm": "lanczos"
       }
     },

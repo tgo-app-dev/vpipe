@@ -378,6 +378,11 @@ private:
   int _sol_dense_steps = 0;
   // `sol_tau_steps`: Sol-Attn's tau per denoising step; empty = sol_tau.
   std::vector<float> _sol_tau_steps;
+  // VDN's softmax window, in chunks either side (`vdn_range`; -1: the
+  // checkpoint's).
+  int _vdn_range = -1;
+  // `vdn_range_steps`: the reach per denoising step; empty = vdn_range.
+  std::vector<int> _vdn_range_steps;
   // SageAttention, family-agnostic beside _sol and _i8_gemm. Carried to
   // plugin families too (VideoModelCreateArgs::sage), because the
   // families out of tree run the same flash kernel.
@@ -415,11 +420,12 @@ private:
   // one, so it is read with each fresh conditioning and held with it.
   GenerationInput _cond_in, _sampler_in, _scheduler_in, _cfg_in;
   GenerationInput _ref0_in, _ref1_in, _ref_video_in, _ref_audio_in,
-                  _audio_cond_in, _init_in;
+                  _audio_cond_in, _init_in, _guide_in, _guide_audio_in;
   std::unique_ptr<BeatPayloadIntf> _cond_beat, _neg_beat;
   std::unique_ptr<BeatPayloadIntf> _ref0_beat, _ref1_beat, _ref_video_beat,
                                    _ref_audio_beat, _audio_cond_beat,
-                                   _init_beat;
+                                   _init_beat, _guide_beat,
+                                   _guide_audio_beat;
 
   // The last model-config beat, held UNPARSED. Which family's parser
   // reads it is not known until the checkpoint resolves, and a config
@@ -669,12 +675,34 @@ private:
     std::vector<float>  audio_rows;  // [2 * alat, 32], DiT space
     std::vector<double> sigmas;
   };
+  // A GUIDE (iport12 / iport13): latent frames and their soundtrack,
+  // pinned from pixel frame `frame` of the clip (minimax_h3::Guide).
+  // Borrowed from the beats. `video` f32 [z, frames, lh, lw]; `audio`
+  // f32 [2, channels, audio_stride] of which the first `audio_latents`
+  // are read -- the beat cut where the generated soundtrack ends.
+  struct H3Guide {
+    int frame = 0;
+    const float* video = nullptr;
+    int frames = 0;
+    const float* audio = nullptr;
+    int audio_latents = 0;
+    int audio_stride  = 0;
+  };
+  // Read the guide beats against this clip: `frame` resolved (negative
+  // from the end), the latent's geometry checked, the audio cut to the
+  // soundtrack. False when there is no usable guide, after warning for
+  // one that is malformed.
+  bool parse_h3_guide_(const class TensorBeatPayload* video,
+                       const class TensorBeatPayload* audio,
+                       H3Guide* out);
   // `ref_last_only`: `ref` holds a LAST-frame anchor alone (l2va).
   bool run_h3_(const void* cond, int text_rows, const float* ref,
                int ref_frames, bool ref_last_only, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
                std::vector<float>* audio_out, std::vector<int>* audio_shape,
-               const H3Refine* refine = nullptr);
+               const H3Refine* refine = nullptr,
+               const H3Guide* guide = nullptr);
+  bool _guide_ignored_said = false;
   // The soundtrack a refine is conditioned on: `frames` frames of
   // silence at `fps` through the checkpoint's audio VAE (its posterior
   // mean), whitened into DiT rows -- what the release's encode_silence

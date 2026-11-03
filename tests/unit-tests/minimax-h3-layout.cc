@@ -1534,6 +1534,192 @@ TEST(minimax_h3_layout, a_last_frame_alone_is_first_and_last_less_the_first)
               idx_bad);
 }
 
+// A GUIDE's rows lie where the frames they stand for lie: a latent
+// frame of it at the rotary time, height and width of the target frame
+// it is pinned over, its audio on the target soundtrack's clock -- so a
+// guide at frame 0 sits exactly on the clip's first frames (a
+// continuation's overlap) and one at frame 17 on the second chunk's.
+// Conditioning rows both: the video at the keyframe level, the audio at
+// the reference soundtrack's; the generated rows untouched behind them.
+TEST(minimax_h3_layout, a_guide_lies_where_it_is_pinned)
+{
+  const std::vector<int> tags(5, h3::kTextTag);
+  const int nt = 5, lt = 12, lh = 4, lw = 6;
+  const int naud = h3::audio_latent_num_frames(39);
+  const int rpf = (lh / 2) * (lw / 2);
+  ASSERT_TRUE(h3::guide_pixel_frames(7) == 22);
+  ASSERT_TRUE(h3::guide_pixel_frames(lt) == 39);
+  for (int frame : {0, 17}) {
+    const int m = frame == 0 ? 37 : 36;
+    h3::PackedLayout L;
+    ASSERT_TRUE(h3::build_packed_sequence(
+        tags, lt, lh, lw, naud, 2, 2, h3::kAudioChannels,
+        {h3::Anchor::kFirst}, &L, {{frame, 7, m}}));
+    EXPECT_TRUE(L.num_condition_rows == 8 * rpf);
+    EXPECT_TRUE(L.num_condition_audio_rows == 2 * m);
+    EXPECT_TRUE(L.audio_start == nt + 8 * rpf + 2 * m);
+    EXPECT_TRUE(L.video_start == L.audio_start + 2 * naud);
+    EXPECT_TRUE(L.seq_len == nt + 8 * rpf + 2 * m + 2 * naud + lt * rpf);
+    EXPECT_TRUE(L.video_runs.size() == 2 &&
+                L.video_runs[0].count == 8 * rpf);
+    EXPECT_TRUE(L.audio_runs.size() == 1 &&
+                L.audio_runs[0].start == nt + 8 * rpf &&
+                L.audio_runs[0].count == 2 * (m + naud));
+    auto P = [&](int row, int a) {
+      return L.position_ids[(std::size_t)row * 3 + (std::size_t)a];
+    };
+    // Guide frame f is target frame (frame's latent + f), cell by cell.
+    const int first = frame == 0 ? 0 : 5;
+    double worst = 0.0;
+    for (int f = 0; f < 7; ++f) {
+      for (int r = 0; r < rpf; ++r) {
+        const int g = nt + (1 + f) * rpf + r;
+        const int t = L.video_start + (first + f) * rpf + r;
+        for (int a = 0; a < 3; ++a) {
+          worst = std::max(worst, std::fabs(P(g, a) - P(t, a)));
+        }
+      }
+    }
+    // Its audio on the target's clock from the same origin: 5/3 latents
+    // a pixel frame, so at frame 17 a third of a latent off the grid.
+    double aworst = 0.0;
+    const int ga = nt + 8 * rpf;
+    for (int ch = 0; ch < 2; ++ch) {
+      for (int i = 0; i < m; ++i) {
+        const int g = ga + ch * m + i;
+        const int t = L.audio_start + ch * naud + i;
+        aworst = std::max(aworst,
+                          std::fabs(P(g, 0) - (P(t, 0) + 5.0 / 3.0 * frame)));
+        aworst = std::max(aworst, std::fabs(P(g, 2) - P(t, 2)));
+        EXPECT_TRUE(L.token_tags[(std::size_t)g] == h3::kAudioTag);
+      }
+    }
+    std::vector<float> uniq;
+    std::vector<int> ri;
+    h3::build_row_timesteps(L, 0.25f, 0.5f, 0.75f, &uniq, &ri, 0.875f);
+    auto ts = [&](int row) { return uniq[(std::size_t)ri[(std::size_t)row]]; };
+    EXPECT_TRUE(ts(nt + 3 * rpf) == 0.75f);              // guide video
+    EXPECT_TRUE(ts(ga) == 0.875f && ts(ga + 2 * m - 1) == 0.875f);
+    EXPECT_TRUE(ts(L.audio_start) == 0.5f);               // generated
+    EXPECT_TRUE(ts(L.video_start) == 0.25f);
+    std::printf("[minimax_h3_layout] a guide at frame %d: video pos diff "
+                "%.3e, audio %.3e, seq %d\n", frame, worst, aworst,
+                L.seq_len);
+    EXPECT_TRUE(worst < 1e-12);
+    EXPECT_TRUE(aworst < 1e-12);
+  }
+  // Outside the clip: past its last frame, its audio past the
+  // soundtrack, nothing in it.
+  h3::PackedLayout L;
+  EXPECT_FALSE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                         h3::kAudioChannels, {}, &L,
+                                         {{18, 7, 0}}));
+  EXPECT_FALSE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                         h3::kAudioChannels, {}, &L,
+                                         {{17, 0, 37}}));
+  EXPECT_FALSE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                         h3::kAudioChannels, {}, &L,
+                                         {{0, 0, 0}}));
+  // Audio alone is a guide too.
+  EXPECT_TRUE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                        h3::kAudioChannels, {}, &L,
+                                        {{0, 0, naud}}));
+  EXPECT_TRUE(L.num_condition_rows == 0 &&
+              L.num_condition_audio_rows == 2 * naud);
+}
+
+// THE ROW ORDER generate-video packs a guide (and an anchor) in, and
+// reads its output back through, is the layout's: cell r of a frame is
+// the (patch_h, patch_w) block at height r / gw, width r % gw of every
+// channel -- the cell build_packed_sequence gives (h_grid[r / pw],
+// w_grid[r % pw]). So a guide's frame t holds exactly the rows the clip
+// it came from had at that frame, and reads back as that latent. Audio
+// the same: the first m columns of [2, channels, stride], channel-major.
+TEST(minimax_h3_layout, guide_rows_are_the_rows_of_the_clip_they_came_from)
+{
+  const int z = 4, T = 7, lh = 6, lw = 8, ph = 2, pw = 2;
+  const int gw = lw / pw, rpf = (lh / ph) * gw, PE = z * ph * pw;
+  std::vector<float> clip((std::size_t)z * T * lh * lw);
+  for (std::size_t i = 0; i < clip.size(); ++i) {
+    clip[i] = std::sin(0.37f * (float)i) + 0.001f * (float)i;
+  }
+  // The whole clip's rows, and its last 3 frames packed as a guide.
+  std::vector<float> all((std::size_t)T * rpf * PE);
+  h3::patchify_latent_frames(clip.data(), z, T, 0, T, lh, lw, ph, pw,
+                             all.data());
+  std::vector<float> guide((std::size_t)3 * rpf * PE);
+  h3::patchify_latent_frames(clip.data(), z, T, T - 3, 3, lh, lw, ph, pw,
+                             guide.data());
+  EXPECT_TRUE(std::memcmp(guide.data(),
+                          all.data() + (std::size_t)(T - 3) * rpf * PE,
+                          guide.size() * sizeof(float)) == 0);
+  // Cell by definition: frame 5, cell 7 (block row 1, column 3).
+  int bad_cell = 0;
+  {
+    const int t = 5, r = 7, by = (r / gw) * ph, bx = (r % gw) * pw;
+    const float* row = all.data() + ((std::size_t)t * rpf + r) * PE;
+    for (int ch = 0; ch < z; ++ch) {
+      for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+          const float want =
+              clip[(((std::size_t)ch * T + t) * lh + by + y) * lw + bx + x];
+          if (row[(ch * ph + y) * pw + x] != want) { ++bad_cell; }
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(bad_cell == 0);
+  // And the guide reads back as the latent frames it was cut from.
+  std::vector<float> back;
+  h3::unpatchify_latent_rows(guide.data(), 3 * rpf, z, 3, lh, lw, ph, pw,
+                             &back);
+  int bad_back = 0;
+  for (int ch = 0; ch < z; ++ch) {
+    for (int t = 0; t < 3; ++t) {
+      for (int i = 0; i < lh * lw; ++i) {
+        if (back[((std::size_t)ch * 3 + t) * lh * lw + i] !=
+            clip[((std::size_t)ch * T + (T - 3 + t)) * lh * lw + i]) {
+          ++bad_back;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(bad_back == 0);
+
+  // Audio: the first 5 of 9 latents of [2, 3, 9], channel-major.
+  const int AC = 3, stride = 9, m = 5;
+  std::vector<float> aud((std::size_t)2 * AC * stride);
+  for (std::size_t i = 0; i < aud.size(); ++i) { aud[i] = (float)i; }
+  std::vector<float> arows((std::size_t)2 * m * AC);
+  h3::pack_audio_latent_rows(aud.data(), AC, stride, m, arows.data());
+  int bad_audio = 0;
+  for (int s = 0; s < 2; ++s) {
+    for (int i = 0; i < m; ++i) {
+      for (int k = 0; k < AC; ++k) {
+        if (arows[((std::size_t)s * m + i) * AC + k] !=
+            aud[((std::size_t)s * AC + k) * stride + i]) {
+          ++bad_audio;
+        }
+      }
+    }
+  }
+  std::vector<float> aback;
+  h3::unpack_audio_latent_rows(arows.data(), AC, m, &aback);
+  for (int s = 0; s < 2; ++s) {
+    for (int k = 0; k < AC; ++k) {
+      for (int i = 0; i < m; ++i) {
+        if (aback[((std::size_t)s * AC + k) * m + i] !=
+            aud[((std::size_t)s * AC + k) * stride + i]) {
+          ++bad_audio;
+        }
+      }
+    }
+  }
+  std::printf("[minimax_h3_layout] guide rows: cell %d, read back %d, "
+              "audio %d values off\n", bad_cell, bad_back, bad_audio);
+  EXPECT_TRUE(bad_audio == 0);
+}
+
 TEST(minimax_h3_layout, packed_sequence_rejects_bad_geometry)
 {
   h3::PackedLayout L;

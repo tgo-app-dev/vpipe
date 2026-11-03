@@ -128,6 +128,11 @@ struct DenoiseRequest {
   // DiT's. Empty: the DiT's own tau every step. A step sol_dense_steps
   // leaves dense stays dense.
   std::vector<float> sol_tau_steps;
+  // VDN's REACH step by step (Step::vdn_radius): entry i for step i, the
+  // last for every step past the list, -1 the checkpoint's. Empty: the
+  // DiT's own (set_vdn_radius) every step. Without a linear branch,
+  // nothing.
+  std::vector<int> vdn_range_steps;
   // The acceleration bag (shared/accel-settings.h), for the tiers the
   // SAMPLING LOOP implements rather than the transformer -- MotionCache
   // (shared/motion-cache.h), which decides per step whether to run the

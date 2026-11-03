@@ -1,0 +1,108 @@
+{
+  "id": "fibo2-edit-4mp",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "briaai/Fibo-2.0-edit-turbo"
+      }
+    },
+    {
+      "id": "load-ref",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [ "./reference.png" ]
+      }
+    },
+    {
+      "id": "ref-resample",
+      "type": "image-resample",
+      "iports": [
+        { "src": "load-ref", "oport": 0 }
+      ],
+      "config": {
+        "fit": "crop_to_area",
+        "megapixels": 4,
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "replace the jacket with a red leather one"
+      }
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        { "src": "ref-resample", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        { "src": "text-prompt", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "ref-resample", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "fibo2-model-config",
+      "type": "fibo2-model-config",
+      "iports": [],
+      "config": {
+        "megapixels": 4
+      }
+    },
+    {
+      "id": "generate-image",
+      "type": "generate-image",
+      "iports": [
+        { "src": "diffusion-conditioner", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "model-select", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "vae-encode", "oport": 0 },
+        { "src": "", "oport": 0 },
+        { "src": "fibo2-model-config", "oport": 0 }
+      ],
+      "config": {
+        "seed": 0
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        { "src": "generate-image", "oport": 0 },
+        { "src": "model-select", "oport": 0 }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        { "src": "vae-decode", "oport": 0 }
+      ],
+      "config": {
+        "path": "fibo2-edit-4mp.png",
+        "format": "png",
+        "compression": 6
+      }
+    }
+  ],
+  "subpipelines": []
+}

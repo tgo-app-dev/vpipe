@@ -8,6 +8,7 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/size-about-area.h"
 #include "common/oport-policy.h"
 #include "common/vpipe-format.h"
 #include "generative-models/image-model-registry.h"
@@ -1812,6 +1813,7 @@ GenerateImageStage::reset_run_state()
   // Fibo 2.0's guidance: "no opinion" again; and the plan's copy of the
   // model config, read by declare_resources, which has run by now.
   _fibo2_guidance_cfg = -1.0;
+  _fibo2_megapixels = 0.0;
   _plan_model_cfg = FlexData{};
   // MOSS-Image's guidance, skipped blocks and shift: "no opinion" again.
   _moss_guidance_cfg = -1.0;
@@ -2464,8 +2466,11 @@ GenerateImageStage::declare_resources() const
   if (t2i_family_(dit) == "fibo2") {
     genai::MetalFibo2Transformer::Config bc;
     std::size_t bytes = model_memory::kUnknownArena;
-    const int w = _width > 0 ? _width : 1024;
-    const int h = _height > 0 ? _height : 1024;
+    // Unsized, at the model config's area (the edit's picture is cropped
+    // to it; a text-to-image is made at it).
+    const auto def = fibo2_default_size_(fibo2_plan_megapixels_());
+    const int w = _width > 0 ? _width : def.first;
+    const int h = _height > 0 ? _height : def.second;
     if (genai::MetalFibo2Transformer::Config::read_dims(dit, &bc)) {
       bc.i8_gemm = _i8_gemm;
       bc.i8_tier = _i8_tier;
@@ -2607,11 +2612,13 @@ GenerateImageStage::declare_resources() const
     genai::MetalFibo2Transformer::Config bc;
     (void)genai::MetalFibo2Transformer::Config::read_dims(dit, &bc);
     bc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+    const auto def = fibo2_default_size_(fibo2_plan_megapixels_());
     for (auto& c : model_memory::coreml_claims(
              ane_claim_label_(),
              genai::MetalFibo2Transformer::ane_runtime_bytes(
-                 bc, genai::MetalFibo2Transformer::ane_plan_seq(_width,
-                                                                _height)),
+                 bc, genai::MetalFibo2Transformer::ane_plan_seq(
+                         _width > 0 ? _width : def.first,
+                         _height > 0 ? _height : def.second)),
              1, model_memory::kPhaseDenoise)) {
       out.push_back(std::move(c));
     }
@@ -2844,9 +2851,19 @@ GenerateImageStage::apply_model_config_()
     });
     // guidance_scale: Dev's 5 (the model card's recipe, against the
     // conditioner's negative on iport1), Edit Turbo's 1. Absent is "no
-    // opinion".
+    // opinion". megapixels likewise.
     if (_model_cfg.is_object()) {
       auto o = _model_cfg.as_object();
+      if (o.contains("megapixels")) {
+        const double mp = o.at("megapixels").as_real(0.0);
+        if (mp > 0.0) {
+          _fibo2_megapixels = mp;
+        } else {
+          session()->warn(fmt(
+              "GenerateImageStage('{}'): model_config `megapixels` must be "
+              "> 0; IGNORED", this->id()));
+        }
+      }
       if (o.contains("guidance_scale")) {
         const double g = o.at("guidance_scale").as_real(-1.0);
         if (g >= 0.0) {
@@ -6106,6 +6123,26 @@ GenerateImageStage::generate_z_image_(
   return unpack(packed);
 }
 
+std::pair<int, int>
+GenerateImageStage::fibo2_default_size_(double megapixels)
+{
+  const double mp = megapixels > 0.0 ? megapixels : 1.0;
+  return size_about_area(1.0, std::llround(mp * 1048576.0), 16);
+}
+
+double
+GenerateImageStage::fibo2_plan_megapixels_() const
+{
+  if (!_plan_model_cfg.is_object()) { return 0.0; }
+  FlexData cfg = _plan_model_cfg;          // as_object() returns a VIEW
+  auto o = cfg.as_object();
+  const std::string fam = model_config::family_of(cfg);
+  if ((!fam.empty() && fam != "fibo2") || !o.contains("megapixels")) {
+    return 0.0;
+  }
+  return o.at("megapixels").as_real(0.0);
+}
+
 // Fibo 2.0: the reference pipeline's loop (pipeline_bria_fibo2.py,
 // BriaFibo2Pipeline.__call__), where a bit matters:
 //   * the schedule: sigmas linspace(1, 1/S, S), shifted by
@@ -8014,9 +8051,11 @@ GenerateImageStage::process(RuntimeContext& ctx)
       }
     }
     // Fibo 2.0's text-to-image, as its reference defaults it: the
-    // trained area, 1024^2 (default_sample_size 128 x the VAE's 8).
+    // trained area, 1024^2 (default_sample_size 128 x the VAE's 8) --
+    // or 1:1 about the area the model config names.
     if ((gen_h <= 0 || gen_w <= 0) && _family == "fibo2") {
-      gen_h = 1024; gen_w = 1024;
+      const auto [w, h] = fibo2_default_size_(_fibo2_megapixels);
+      gen_w = w; gen_h = h;
     }
     if (gen_h <= 0 || gen_w <= 0) { gen_h = 256; gen_w = 256; }
     session()->log_debug(fmt(

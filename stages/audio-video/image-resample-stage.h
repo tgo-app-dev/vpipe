@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -46,6 +47,13 @@ namespace metal_compute { class MetalCompute; }
 //                 result generated on the canvas can be cut back to it.
 //   crop_to_grid  scale down (sides floored) to at most `max_pixels`, then
 //                 centre-crop each side down to the grid.
+// And one sizes it about an AREA, for a model trained on a bucket of
+// sizes about one (Fibo 2.0; Bria's get_image_size, common/
+// size-about-area.h):
+//   crop_to_area  the size on the grid within 10% of `megapixels` x
+//                 1024^2 whose aspect crops least from the picture's;
+//                 cover it and centre-crop (`crop`'s geometry). Up or
+//                 down, as the reference resizes.
 // `algorithm` selects the interpolation: lanczos (default), bilinear,
 // bicubic.
 class ImageResampleStage final : public TypedStage<ImageResampleStage> {
@@ -78,6 +86,10 @@ public:
                    int x0 = 0, y0 = 0; };
   GridFit grid_fit(int in_w, int in_h) const noexcept;
 
+  // What crop_to_area makes of an in_w x in_h source: {0, 0} when no
+  // size on the grid lies within 10% of the area.
+  std::pair<int, int> area_fit(int in_w, int in_h) const noexcept;
+
   // Resolve the configured target against a concrete source size: a
   // dimension left at 0 (or negative) is inferred from the other so the
   // source aspect ratio is preserved. Both configured -> used verbatim.
@@ -87,7 +99,9 @@ public:
 private:
   int          _out_w{}, _out_h{};  // 0 on either axis = infer from AR
   int          _mode{};            // 0 pad, 1 crop, 2 stretch, 3 manual,
-                                   // 4 pad_to_grid, 5 crop_to_grid
+                                   // 4 pad_to_grid, 5 crop_to_grid,
+                                   // 6 crop_to_area
+  double       _megapixels{1.0};   // crop_to_area's area / 1024^2
   int          _grid{16};          // the grid fits' side multiple
   std::int64_t _max_pixels{};      // their pixel cap
   int          _min_side{}, _max_side{};   // pad_to_grid's side bounds
@@ -104,8 +118,13 @@ private:
   std::size_t _stage_bytes = 0;
 
   // The geometry the resamplers run: a grid fit resamples to its `fit`
-  // size exactly, which is a stretch to a size of the same aspect.
-  int geom_mode_() const noexcept { return _mode >= 4 ? 2 : _mode; }
+  // size exactly, which is a stretch to a size of the same aspect; an
+  // area fit covers its size and centre-crops, which is `crop`.
+  int
+  geom_mode_() const noexcept
+  {
+    return _mode == 6 ? 1 : _mode >= 4 ? 2 : _mode;
+  }
 
   // Resample `tin` to out_w x out_h in the configured algorithm; null when
   // nothing could (a GPU miss falls back to the CPU first).

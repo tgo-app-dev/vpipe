@@ -66,6 +66,12 @@ constexpr const char* kRefPortDoc =
     "audio beat to override the stage's `attach_audio` for that beat -- "
     "true to make it the SOUNDTRACK "
     "of the preceding reference, false to decline where the config asked. "
+    "`latent: true` says the beat is ALREADY ENCODED -- generate-video's "
+    "own oports, cut by a load-tensor: f32 [z, frames, h, w] video rows "
+    "(with `attach: true` it folds onto the clip before it, whose pixels "
+    "still feed the conditioner) or f32 [2, channels, latents] soundtrack "
+    "rows (attached: that clip's soundtrack; else an audio reference) -- "
+    "the VAE skipped, the latent taken at its own length. "
     "A WIRED port must beat every request -- an empty tensor is how "
     "you say \"nothing this time\", because a silent port would renumber "
     "every reference after it and quietly change the request";
@@ -1207,10 +1213,27 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
       return fail("a carried latent must be f32, got " +
                   std::string(TensorBeat::name_of(tb.dtype)));
     }
+    // A SOUNDTRACK latent: [2, channels, latents], as generate-video's
+    // audio_latent oport writes it -- an audio reference of its own, or
+    // (attached) the soundtrack of the clip before it.
+    if (rank == 3) {
+      const int st = (int)sh[0], ac = (int)sh[1], na = (int)sh[2];
+      if (st != 2 || ac <= 0 || na <= 0) {
+        return fail("a carried soundtrack latent is [2, channels, "
+                    "latents]; got [" + std::to_string(st) + ", " +
+                    std::to_string(ac) + ", " + std::to_string(na) + "]");
+      }
+      out->kind                  = h3::MediaReference::Kind::kAudio;
+      out->audio_latent_channels = ac;
+      out->audio_latent_frames   = na;
+      out->audio_latent.assign(tb.as_f32(),
+                               tb.as_f32() + (std::size_t)st * ac * na);
+      return true;
+    }
     if (rank != 4) {
-      return fail("a carried VIDEO latent is rank 4 [z, frames, h, w]; "
-                  "got rank " + std::to_string(rank) + ". Audio latents "
-                  "are not carried yet");
+      return fail("a carried latent is rank 4 [z, frames, h, w] (video) "
+                  "or rank 3 [2, channels, latents] (a soundtrack); got "
+                  "rank " + std::to_string(rank));
     }
     const int z = (int)sh[0], lt = (int)sh[1];
     const int lh = (int)sh[2], lw = (int)sh[3];
@@ -1719,6 +1742,38 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
       continue;
     }
 
+    // A carried SOUNDTRACK latent attached: the soundtrack of the clip
+    // before it, as attached PCM is -- its rows from the latent, the
+    // audio VAE skipped. Unattached it is an audio reference of its own.
+    if (m.has_audio_latent() && attach) {
+      if (refs.empty() ||
+          refs.back().kind == h3::MediaReference::Kind::kAudio) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its soundtrack latent but {}; skipping", this->id(), refno,
+            refs.empty() ? "nothing precedes it"
+                         : "the reference before it is a sound"));
+        co_return;
+      }
+      h3::MediaReference& prev = refs.back();
+      if (prev.has_soundtrack()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its soundtrack latent but reference {} already carries a "
+            "soundtrack; skipping", this->id(), refno, refs.size()));
+        co_return;
+      }
+      prev.audio_latent          = std::move(m.audio_latent);
+      prev.audio_latent_channels = m.audio_latent_channels;
+      prev.audio_latent_frames   = m.audio_latent_frames;
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): reference {} takes its soundtrack "
+          "rows from a carried latent [2x{}x{}] -- the audio VAE is "
+          "skipped", this->id(), refs.size(), prev.audio_latent_channels,
+          prev.audio_latent_frames));
+      continue;
+    }
+
     if (m.kind == h3::MediaReference::Kind::kAudio && attach) {
       if (refs.empty()) {
         session()->warn(fmt(
@@ -1728,7 +1783,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
         co_return;
       }
       h3::MediaReference& prev = refs.back();
-      if (prev.has_audio()) {
+      if (prev.has_soundtrack()) {
         session()->warn(fmt(
             "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
             "its audio but reference {} already carries a soundtrack; "

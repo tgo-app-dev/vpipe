@@ -3,9 +3,12 @@
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
 
+#include <dispatch/dispatch.h>
+
 #include "apple-silicon/coreml/ane-worker.h"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/fp8.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/perf-flops.h"
@@ -22,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 namespace vpipe {
@@ -108,15 +112,106 @@ f32_of_bf16_(std::uint16_t v)
   return f;
 }
 
+bool
+filled_(const metal_compute::SharedBuffer* b)
+{
+  return b != nullptr && !b->empty() && b->contents() != nullptr;
+}
+
+// [0, n) in `n` calls of body(i), spread over every core by dispatch's
+// own pool -- safe beside the ANE worker's convert pool and beside a
+// second module staging at once, which AneWorker::parallel_for (one
+// caller at a time, 4 threads) is not.
+void
+par_for_(std::size_t n, const std::function<void(std::size_t)>& body)
+{
+  if (n == 0) { return; }
+  if (n == 1) { body(0); return; }
+  const std::function<void(std::size_t)>* bp = &body;
+  dispatch_apply(n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                 ^(std::size_t i) { (*bp)(i); });
+}
+
+// ConvRot undone in place on a row of integer codes: fp8.h's
+// convrot_unrotate, the same quads in the same stages (integer sums, so
+// exact in any order), with each stage's quads walked as runs of `st`
+// consecutive elements -- which vectorizes -- rather than through a
+// division and a remainder per quad.
+void
+unrotate_(std::int32_t* v, std::size_t n, int g)
+{
+  const std::size_t G = (std::size_t)g;
+  for (std::size_t g0 = 0; g0 + G <= n; g0 += G) {
+    std::int32_t* x = v + g0;
+    for (std::size_t st = 1; st < G; st *= 4) {
+      for (std::size_t b = 0; b < G; b += 4 * st) {
+        std::int32_t* p0 = x + b;
+        std::int32_t* p1 = p0 + st;
+        std::int32_t* p2 = p1 + st;
+        std::int32_t* p3 = p2 + st;
+        for (std::size_t j = 0; j < st; ++j) {
+          const std::int32_t a0 = p0[j], a1 = p1[j], a2 = p2[j], a3 = p3[j];
+          const std::int32_t s = a0 + a1 + a2 + a3;
+          p0[j] = s - 2 * a3;
+          p1[j] = s - 2 * a2;
+          p2[j] = s - 2 * a1;
+          p3[j] = s - 2 * a0;
+        }
+      }
+    }
+  }
+}
+
+bool
+integer_source_(const AneFfnSource& q)
+{
+  return !q.quantized &&
+         (q.bits == AneFfnSource::kInt8 || q.bits == AneFfnSource::kW4A8);
+}
+
 }  // namespace
 
 bool
 AneFfnSource::stageable() const noexcept
 {
+  if (bits == kInt8 || bits == kW4A8) {
+    if (quantized || !filled_(w) || !filled_(scales)) { return false; }
+    if (rot != 0 && !fp8::convrot_group_ok(rot)) { return false; }
+    if (bits == kInt8) { return true; }
+    return qgroup > 0 && filled_(srel) &&
+           (codebook == nullptr || codebook->empty() ||
+            codebook->byte_size() >= 16 * sizeof(float));
+  }
   if (!quantized) { return w != nullptr && !w->empty(); }
   return (bits == 4 || bits == 8) && codes != nullptr && !codes->empty() &&
          scales != nullptr && !scales->empty() && qbias != nullptr &&
          !qbias->empty();
+}
+
+struct AneFeedForward::StageQueue {
+  dispatch_queue_t q = nullptr;
+  dispatch_group_t g = nullptr;
+  StageQueue()
+    : q(dispatch_queue_create("vpipe.ane.stage", DISPATCH_QUEUE_SERIAL)),
+      g(dispatch_group_create())
+  {
+  }
+  ~StageQueue()
+  {
+    if (g != nullptr) {
+      dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+      dispatch_release(g);
+    }
+    if (q != nullptr) { dispatch_release(q); }
+  }
+};
+
+void
+AneFeedForward::wait_stage_() const
+{
+  if (_sq != nullptr && _sq->g != nullptr) {
+    dispatch_group_wait(_sq->g, DISPATCH_TIME_FOREVER);
+  }
 }
 
 std::unique_ptr<AneFeedForward>
@@ -219,6 +314,7 @@ AneFeedForward::create(const Options& o)
     return nullptr;
   }
   f->_session = ss;
+  f->_sq      = std::make_unique<StageQueue>();
   f->_mc      = o.mc;
   f->_tag     = tag;
   f->_hidden  = o.hidden;
@@ -264,6 +360,7 @@ AneFeedForward::~AneFeedForward()
 {
   // A job may still be reading a block's weights or writing the ANE's
   // rows; neither may outlive the buffers it was handed.
+  wait_stage_();
   if (_session == nullptr) { return; }
   worker().join();
   // Give the wired pool back what this tier was charged: the host rows it
@@ -289,6 +386,15 @@ AneFeedForward::host_bytes() const noexcept
 
 int AneFeedForward::chunk() const noexcept { return _chunk; }
 int AneFeedForward::rows_per_block() const noexcept { return _rows_per_block; }
+
+int
+AneFeedForward::planned_rows(int seq) const noexcept
+{
+  // Whole chunks, and the GPU keeps at least one row: a later forward may
+  // be shorter than the one the share was set from.
+  const int max_rows = seq > 0 ? ((seq - 1) / _chunk) * _chunk : 0;
+  return std::max(0, std::min(_rows_per_block, max_rows));
+}
 bool AneFeedForward::timing() const noexcept { return _auto || _profile; }
 bool AneFeedForward::needs_barrier() const noexcept { return _barrier; }
 int AneFeedForward::lost_row0() const noexcept { return _lost_row0; }
@@ -373,10 +479,43 @@ void
 AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
                        int group)
 {
-  AneWorker& w = worker();
+  // Staging rewrites the slots this module's predict reads, so one still
+  // in flight -- begin() without its finish() -- is waited for first.
+  if (_a_rows > 0) { worker().join(); }
+  _queued = layer;
+  // RETAINED VIEWS of every buffer the job reads, so the bytes outlive a
+  // caller that lets its block go before the job has run (a family staging
+  // a block ahead of its turn). Reserved up front: the sources are
+  // repointed into it.
+  auto keep = std::make_shared<std::vector<metal_compute::SharedBuffer>>();
+  keep->reserve(sources.size() *
+                (7 + 2 * (std::size_t)AneFfnSource::kMaxDeltas));
+  auto hold = [&](const metal_compute::SharedBuffer*& p) {
+    if (p == nullptr || p->empty()) { return; }
+    keep->push_back(p->subview(0, p->byte_size()));
+    p = &keep->back();
+  };
+  for (AneFfnSource& s : sources) {
+    hold(s.w);
+    hold(s.codes);
+    hold(s.scales);
+    hold(s.qbias);
+    hold(s.bias);
+    hold(s.srel);
+    hold(s.codebook);
+    for (int di = 0; di < s.deltas && di < AneFfnSource::kMaxDeltas; ++di) {
+      hold(s.delta[di].a);
+      hold(s.delta[di].b);
+    }
+  }
   const std::size_t nsrc = sources.size();
   const std::size_t G = (std::size_t)std::max(1, group);
-  w.dispatch([this, &w, src = std::move(sources), nsrc, layer, G]() {
+  // The up projection's fp16 headroom scale as it stands now (see
+  // _up_scale): written only by this module's predict, which is not in
+  // flight.
+  const float up_scale = _up_scale;
+  auto job = [this, src = std::move(sources), keep, nsrc, layer, G,
+              up_scale]() {
     const auto t0 = Clk::now();
     // The module declares its weights [out,in] -- the checkpoint's own
     // layout -- so every source row maps to one slot row. MEASURED on one
@@ -385,6 +524,7 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
     // bit-exact -- against 116 ms for the per-element transposing convert
     // that first made staging ~500 ms a block.
     const std::uint16_t* lut = bf16_to_f16_lut_();
+    const std::array<float, 256>& e4m3 = fp8::f32_table(fp8::Format::kE4M3);
     bool ok = true;
     for (std::size_t i = 0; i < nsrc && ok; ++i) {
       const AneFfnSource& q = src[i];
@@ -398,8 +538,7 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       // The up projection carries the fp16 headroom scale; see _up_scale.
       // A scaled or adapted row is built in f32 rather than through the
       // table.
-      const float mul = (!_matmul && i == _scaled) ? 1.0f / _up_scale
-                                                   : 1.0f;
+      const float mul = (!_matmul && i == _scaled) ? 1.0f / up_scale : 1.0f;
       const bool f32path = q.deltas > 0 || mul != 1.0f;
       ok = q.stageable() && rows > 0 && q.deltas >= 0 &&
            q.deltas <= AneFfnSource::kMaxDeltas &&
@@ -409,17 +548,32 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       // The last source row read, plus one.
       const std::size_t srows = q.offset + (rows - 1) * q.stride + 1;
       const fp8::Format f8 = dense_fp8_(q);
-      // A scaled FP8 source's f32 scale: one value, or one per SOURCE row.
+      // INTEGER codes (ComfyUI's int8, W4A8): a row decoded to int32,
+      // un-rotated, then scaled -- see int_row below.
+      const bool ints = integer_source_(q);
+      // A scaled FP8 or integer source's f32 scale: one value, or one per
+      // SOURCE row.
       const float* f8s = nullptr;
       bool f8s_row = false;
-      if (f8 != fp8::Format::kNone && q.scales != nullptr &&
+      if ((f8 != fp8::Format::kNone || ints) && q.scales != nullptr &&
           !q.scales->empty()) {
         const std::size_t ns = q.scales->byte_size() / sizeof(float);
         f8s = static_cast<const float*>(q.scales->contents());
         f8s_row = ns > 1;
         ok = ok && (ns == 1 || ns >= srows);
       }
-      if (!q.quantized) {
+      const std::size_t qg = (std::size_t)std::max(1, q.qgroup);
+      if (ints) {
+        ok = ok && f8s != nullptr &&
+             (q.rot == 0 || cols % (std::size_t)q.rot == 0);
+        if (q.bits == AneFfnSource::kInt8) {
+          ok = ok && q.w->byte_size() >= srows * cols;
+        } else {
+          ok = ok && cols % 2 == 0 && cols % qg == 0 &&
+               q.w->byte_size() >= srows * (cols / 2) &&
+               q.srel->byte_size() >= srows * (cols / qg);
+        }
+      } else if (!q.quantized) {
         // One byte an element for FP8, two for bf16.
         const std::size_t eb = f8 != fp8::Format::kNone ? 1 : 2;
         ok = ok && q.w->contents() != nullptr &&
@@ -459,9 +613,57 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       const std::size_t per = q.quantized ? 32 / bits : 1;
       const std::size_t groups = cols / G;
       const unsigned mask = q.quantized ? (1u << bits) - 1u : 0u;
+      const float* cb =
+          (ints && q.codebook != nullptr && !q.codebook->empty())
+              ? static_cast<const float*>(q.codebook->contents())
+              : nullptr;
+      const float inv = q.rot > 0 ? fp8::convrot_norm(q.rot) : 1.0f;
+      // An integer source's row `sr` as its int8 codes, un-rotated -- the
+      // integers fp8-layout.h's decoders scale. A W4A8 nibble's code is
+      // round(codebook[c] * s_rel) clamped to +-127 (fp8::w4a8_code), one
+      // table of its 16 values a group.
+      auto int_row = [&](std::size_t sr, std::int32_t* v) {
+        if (q.bits == AneFfnSource::kInt8) {
+          const auto* c =
+              static_cast<const std::int8_t*>(q.w->contents()) + sr * cols;
+          for (std::size_t k = 0; k < cols; ++k) { v[k] = c[k]; }
+        } else {
+          const auto* p =
+              static_cast<const std::uint8_t*>(q.w->contents()) +
+              sr * (cols / 2);
+          const auto* rs =
+              static_cast<const std::uint8_t*>(q.srel->contents()) +
+              sr * (cols / qg);
+          std::int32_t tbl[16];
+          for (std::size_t g0 = 0; g0 < cols; g0 += qg) {
+            const float s = e4m3[rs[g0 / qg]];
+            for (std::uint8_t c = 0; c < 16; ++c) {
+              tbl[c] = fp8::w4a8_code(c, s, cb);
+            }
+            for (std::size_t k = g0; k < g0 + qg; k += 2) {
+              const std::uint8_t b = p[k / 2];
+              v[k]     = tbl[b & 15u];
+              v[k + 1] = tbl[b >> 4];
+            }
+          }
+        }
+        if (q.rot > 0) { unrotate_(v, cols, q.rot); }
+      };
       // Source row `sr` straight to fp16: bf16 through the table, 4-bit
       // through a per-group table of its 16 values, 8-bit computed directly.
-      auto direct_row = [&](std::size_t sr, std::uint8_t* dr) {
+      auto direct_row = [&](std::size_t sr, std::uint8_t* dr,
+                            std::int32_t* iv) {
+        if (ints) {
+          // code * scale * convrot_norm, one f32 product rounded ONCE to
+          // bf16 -- the GPU widening's value -- then to fp16.
+          int_row(sr, iv);
+          const float s = f8s[f8s_row ? sr : 0];
+          for (std::size_t cc = 0; cc < cols; ++cc) {
+            const std::uint16_t hv = lut[bf16_rne_((float)iv[cc] * s * inv)];
+            std::memcpy(dr + cc * 2, &hv, sizeof(hv));
+          }
+          return;
+        }
         if (f8 != fp8::Format::kNone) {
           const std::uint8_t* s =
               static_cast<const std::uint8_t*>(q.w->contents()) + sr * cols;
@@ -530,7 +732,16 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
         }
       };
       // Source row `sr` into f32, for the rows that are scaled or adapted.
-      auto decode_row = [&](std::size_t sr, float* acc) {
+      auto decode_row = [&](std::size_t sr, float* acc, std::int32_t* iv) {
+        if (ints) {
+          // Through bf16, for the reason direct_row gives.
+          int_row(sr, iv);
+          const float s = f8s[f8s_row ? sr : 0];
+          for (std::size_t cc = 0; cc < cols; ++cc) {
+            acc[cc] = f32_of_bf16_(bf16_rne_((float)iv[cc] * s * inv));
+          }
+          return;
+        }
         if (f8 != fp8::Format::kNone) {
           const std::uint8_t* s =
               static_cast<const std::uint8_t*>(q.w->contents()) + sr * cols;
@@ -576,15 +787,24 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       };
       ok = _w->fill(slot, [&](void* base, std::size_t bpr) {
         auto* d = static_cast<std::uint8_t*>(base);
-        // In row BANDS, so an adapter's delta is one BLAS product per band
-        // -- scale * B[band] A, rows x rank x cols on the AMX -- rather than
-        // rank row-axpys per row. MEASURED as the per-row loop: 270 ms a
-        // MiniMax-H3 block on an M5 Pro and 355-395 on an M4 Pro, which on
-        // the M5 is longer than the attention it is meant to hide under.
-        constexpr std::size_t kBand = 1024;
-        std::vector<float> delta, bsel;
-        for (std::size_t b0 = 0; b0 < rows; b0 += kBand) {
-          const std::size_t n = std::min(kBand, rows - b0);
+        // In PIECES of rows, spread over every core. With adapters a piece
+        // is a band whose delta is one BLAS product -- scale * B[band] A,
+        // rows x rank x cols on the AMX -- rather than rank row-axpys per
+        // row (MEASURED as the per-row loop: 270 ms a MiniMax-H3 block on
+        // an M5 Pro and 355-395 on an M4 Pro); the bands run at once, so
+        // each core cluster's AMX takes its share, and 64 rows keep a
+        // band's f32 delta a few MB however many are in flight. Without,
+        // a piece is ~256K elements.
+        const std::size_t piece =
+            q.deltas > 0 ? 64
+                         : std::max<std::size_t>(8, (std::size_t)262144 / cols);
+        const std::size_t np = (rows + piece - 1) / piece;
+        par_for_(np, [&](std::size_t pi) {
+          const std::size_t b0 = pi * piece;
+          const std::size_t n = std::min(piece, rows - b0);
+          std::vector<float> delta, bsel;
+          std::vector<float> acc(f32path ? cols : 0);
+          std::vector<std::int32_t> iv(ints ? cols : 0);
           if (q.deltas > 0) {
             delta.assign(n * cols, 0.0f);
             for (int di = 0; di < q.deltas; ++di) {
@@ -612,7 +832,7 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
               }
               // Banded: one product per run of rows that share a part,
               // each against that part's rows of A. A run is at least a
-              // group long except where the band cuts it.
+              // group long except where the piece cuts it.
               auto part_of = [&](std::size_t j) {
                 const std::size_t br =
                     (b0 + j) * std::max<std::size_t>(1, dl.b_stride) +
@@ -634,34 +854,25 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
               }
             }
           }
-          // Row-granular slices over an ELEMENT count: each row goes to the
-          // slice holding its first element, so every row is done once, and
-          // the pool's inline threshold -- in elements -- is not tripped by
-          // a small row count.
-          w.parallel_for(n * cols, [&](std::size_t lo, std::size_t hi) {
-            const std::size_t r0 = (lo + cols - 1) / cols;
-            const std::size_t r1 = std::min(n, (hi + cols - 1) / cols);
-            std::vector<float> acc(f32path ? cols : 0);
-            for (std::size_t j = r0; j < r1; ++j) {
-              const std::size_t r = b0 + j;
-              const std::size_t sr = r * q.stride + q.offset;
-              std::uint8_t* dr = d + (srow + r) * bpr;
-              if (!f32path) {
-                direct_row(sr, dr);
-                continue;
-              }
-              decode_row(sr, acc.data());
-              if (q.deltas > 0) {
-                const float* dp = delta.data() + j * cols;
-                for (std::size_t cc = 0; cc < cols; ++cc) { acc[cc] += dp[cc]; }
-              }
-              for (std::size_t cc = 0; cc < cols; ++cc) {
-                const _Float16 hv = (_Float16)(acc[cc] * mul);
-                std::memcpy(dr + cc * 2, &hv, sizeof(hv));
-              }
+          for (std::size_t j = 0; j < n; ++j) {
+            const std::size_t r = b0 + j;
+            const std::size_t sr = r * q.stride + q.offset;
+            std::uint8_t* dr = d + (srow + r) * bpr;
+            if (!f32path) {
+              direct_row(sr, dr, iv.data());
+              continue;
             }
-          });
-        }
+            decode_row(sr, acc.data(), iv.data());
+            if (q.deltas > 0) {
+              const float* dp = delta.data() + j * cols;
+              for (std::size_t cc = 0; cc < cols; ++cc) { acc[cc] += dp[cc]; }
+            }
+            for (std::size_t cc = 0; cc < cols; ++cc) {
+              const _Float16 hv = (_Float16)(acc[cc] * mul);
+              std::memcpy(dr + cc * 2, &hv, sizeof(hv));
+            }
+          }
+        });
       });
     }
     // The biases, when the module has them: slot 3 + i, one row of the
@@ -669,8 +880,7 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
     for (std::size_t i = 0; i < nsrc && ok && _w->count() > nsrc; ++i) {
       const AneFfnSource& q = src[i];
       const std::size_t n = (std::size_t)_w->cols(nsrc + i);
-      const float mul = (!_matmul && i == _scaled) ? 1.0f / _up_scale
-                                                   : 1.0f;
+      const float mul = (!_matmul && i == _scaled) ? 1.0f / up_scale : 1.0f;
       const bool have = q.bias != nullptr && !q.bias->empty();
       ok = !have || (q.bias->contents() != nullptr &&
                      q.bias->byte_size() >=
@@ -690,8 +900,18 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       });
     }
     _staged   = ok ? layer : -1;
-    if (ok) { _slot_scale = _up_scale; }
+    if (ok) { _slot_scale = up_scale; }
     _stage_ms = ms_since_(t0);
+  };
+  if (_sq == nullptr) {
+    job();
+    return;
+  }
+  auto* fn = new std::function<void()>(std::move(job));
+  dispatch_group_async_f(_sq->g, _sq->q, fn, [](void* c) {
+    std::unique_ptr<std::function<void()>> f(
+        static_cast<std::function<void()>*>(c));
+    (*f)();
   });
 }
 
@@ -773,13 +993,37 @@ AneFeedForward::decide_()
 bool
 AneFeedForward::join_stage(int layer)
 {
-  worker().join();
+  wait_stage_();
   return _staged == layer;
+}
+
+bool
+AneFeedForward::queued(int layer) const noexcept
+{
+  return _queued == layer;
+}
+
+void
+AneFeedForward::forget_staged()
+{
+  wait_stage_();
+  _queued = -1;
+  _staged = -1;
+}
+
+bool
+AneFeedForward::may_split_next() const noexcept
+{
+  if (_gpu_only) { return false; }
+  if (!_auto || _blocks_seen < 6 || !_gpu_mode) { return true; }
+  // Unsplit for good, but for the re-probe every kReprobeBlocks.
+  return _since_probe + 1 >= kReprobeBlocks;
 }
 
 void
 AneFeedForward::join()
 {
+  wait_stage_();
   worker().join();
 }
 
@@ -794,13 +1038,13 @@ int
 AneFeedForward::begin(const metal_compute::SharedBuffer& in,
                       const std::vector<OutSeg>& outs, int seq)
 {
+  // The slots this predict reads are whole: a staging job still running
+  // writes them (the family joins it first; this is the guard).
+  wait_stage_();
   _ok = false;
   _lost_row0 = -1;
   _t_cin = _t_pred = _t_cout = 0.0;
-  // Whole chunks, and the GPU keeps at least one row: a later forward may
-  // be shorter than the one the share was set from.
-  const int max_rows = seq > 0 ? ((seq - 1) / _chunk) * _chunk : 0;
-  const int a = std::min(_rows_per_block, max_rows);
+  const int a = planned_rows(seq);
   _a_rows = 0;
   if (a <= 0) { return 0; }
   // ONE CHUNK of host buffer at each width, reused chunk by chunk. Sized to

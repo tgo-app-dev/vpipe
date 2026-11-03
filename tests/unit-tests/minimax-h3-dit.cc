@@ -36,6 +36,7 @@
 #include "minitest.h"
 #include "residency-reserve.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "generative-models/shared/riffle-rows.h"
 #include "generative-models/shared/streamed-refill.h"
@@ -3239,6 +3240,7 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
   struct Arm {
     std::vector<float> video, audio;
     double best_ms = 0.0;
+    double gpu_ms  = 0.0;    // GPU busy in that forward (VPIPE_MC_GPU_TIME)
     bool   armed   = false;
   };
   auto run = [&](bool ane) {
@@ -3252,11 +3254,15 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
     // Iteration 0 is the warm-up: scratch, pipeline binding and, for the
     // ANE arm, the module build. Its output is the one compared.
     for (int i = 0; i <= iters; ++i) {
+      double busy0 = 0.0, busy1 = 0.0;
+      unsigned long long nb = 0;
+      metal_compute::CommandStream::gpu_time_stats(&busy0, &nb);
       const auto t0 = std::chrono::steady_clock::now();
       std::string ferr;
       MetalMiniMaxH3Transformer::Velocity out = m->forward(step, &ferr);
       const double ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0).count();
+      metal_compute::CommandStream::gpu_time_stats(&busy1, &nb);
       if (out.empty()) {
         std::printf("[minimax_h3_dit] forward: %s\n", ferr.c_str());
         return Arm{};
@@ -3266,6 +3272,7 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
         arm.audio = to_f32(out.audio);
       } else if (arm.best_ms == 0.0 || ms < arm.best_ms) {
         arm.best_ms = ms;
+        arm.gpu_ms  = busy1 - busy0;
       }
     }
     arm.armed = m->ane_armed();
@@ -3298,12 +3305,38 @@ TEST(minimax_h3_dit, forward_ane_matches_gpu)
               stream ? " (streamed)" : "", loras.empty() ? "" : " +LoRA",
               rv, ra, gpu.best_ms, ane.best_ms,
               ane.best_ms > 0.0 ? gpu.best_ms / ane.best_ms : 0.0);
+  // With VPIPE_MC_GPU_TIME=1: how much of each arm's forward the GPU was
+  // busy -- the ANE arm's idle is its staging, drains and exposed ANE.
+  if (gpu.gpu_ms > 0.0 && ane.gpu_ms > 0.0) {
+    std::printf("[minimax_h3_dit] GPU busy: GPU-only %.1f of %.1f ms "
+                "(%.1f%% idle), ANE split %.1f of %.1f ms (%.1f%% idle)\n",
+                gpu.gpu_ms, gpu.best_ms,
+                100.0 * (1.0 - gpu.gpu_ms / gpu.best_ms), ane.gpu_ms,
+                ane.best_ms, 100.0 * (1.0 - ane.gpu_ms / ane.best_ms));
+  }
   EXPECT_TRUE(ane.armed);
   // fp16 on the ANE's rows: small, and not zero -- zero means no row
   // reached the ANE at all.
   EXPECT_TRUE(rv < 0.02 && ra < 0.02);
   EXPECT_TRUE(rv > 0.0);
   if (!ane.armed) { return; }
+
+  // STAGING A BLOCK AHEAD CHANGES NOTHING. With the share pinned the
+  // split is the same every block, so the q|k|v weights staged a block
+  // ahead (under the previous block's attention) and staged at the
+  // block's own start must give the same bytes. Auto-balanced, the split
+  // follows the timing, which is why this arm needs a pinned share.
+  if (rr != nullptr && std::getenv("VPIPE_MINIMAX_H3_ANE_QKV") != nullptr &&
+      std::getenv("VPIPE_H3_ANE_NO_AHEAD") == nullptr) {
+    setenv("VPIPE_H3_ANE_NO_AHEAD", "1", 1);
+    const Arm turn = run(true);
+    unsetenv("VPIPE_H3_ANE_NO_AHEAD");
+    const bool same = turn.video == ane.video && turn.audio == ane.audio;
+    std::printf("[minimax_h3_dit] staged ahead vs in turn (pinned share): "
+                "%s | in turn %.1f ms\n",
+                same ? "IDENTICAL" : "DIFFERENT", turn.best_ms);
+    EXPECT_TRUE(same);
+  }
 
   // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
   // first forward builds them), the feed-forward and q/k/v at once. The

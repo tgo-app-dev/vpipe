@@ -236,6 +236,82 @@ TEST(minimax_h3_refenc, an_empty_request_encodes_to_no_rows)
   EXPECT_TRUE(!said.empty() && said.back() == "done");
 }
 
+// A clip continued from its own LATENTS: the video rows carried, and
+// now its SOUNDTRACK too -- [2, channels, latents] as generate-video's
+// audio_latent oport writes it, laid channel-major as the audio VAE's
+// rows are, no VAE. Attached to the clip it is that clip's soundtrack,
+// its rows packed before the clip's video rows; alone it is an audio
+// reference. Every model pointer null: nothing here may need one.
+TEST(minimax_h3_refenc, a_carried_soundtrack_latent_packs_its_rows)
+{
+  const int z = 3, T = 2, Hh = 4, Ww = 6, AC = 4, n = 5, n2 = 3;
+  h3::MediaReference clip;
+  clip.kind = h3::MediaReference::Kind::kVideo;
+  clip.latent_z = z;
+  clip.latent_frames = T;
+  clip.latent_height = Hh;
+  clip.latent_width = Ww;
+  clip.video_latent.assign((std::size_t)z * T * Hh * Ww, 0.25f);
+  clip.audio_latent_channels = AC;
+  clip.audio_latent_frames = n;
+  clip.audio_latent.resize((std::size_t)2 * AC * n);
+  for (std::size_t i = 0; i < clip.audio_latent.size(); ++i) {
+    clip.audio_latent[i] = (float)i;
+  }
+  h3::MediaReference sound;
+  sound.kind = h3::MediaReference::Kind::kAudio;
+  sound.audio_latent_channels = AC;
+  sound.audio_latent_frames = n2;
+  sound.audio_latent.assign((std::size_t)2 * AC * n2, -1.0f);
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  plan.condition_noise_aug = 1.0;        // the rows exactly as carried
+  h3::ReferenceEncoders models;
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references({clip, sound}, "a prompt", plan,
+                                        models, &enc, &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  ASSERT_TRUE(enc.layout.size() == 2);
+  EXPECT_TRUE(enc.layout[0].kind == h3::Reference::Kind::kVideo);
+  EXPECT_TRUE(enc.layout[0].num_latent_frames == T);
+  EXPECT_TRUE(enc.layout[0].num_audio_latents == n);
+  EXPECT_TRUE(enc.layout[1].kind == h3::Reference::Kind::kAudio);
+  EXPECT_TRUE(enc.layout[1].num_audio_latents == n2);
+  EXPECT_TRUE(enc.audio_row_elems == AC);
+  ASSERT_TRUE(enc.audio_rows.size() == (std::size_t)2 * AC * (n + n2));
+  // Row (ch * n + i) is the latent's column i of channel pair ch.
+  int bad = 0;
+  for (int ch = 0; ch < 2; ++ch) {
+    for (int i = 0; i < n; ++i) {
+      for (int k = 0; k < AC; ++k) {
+        const float want = clip.audio_latent[((std::size_t)ch * AC + k) *
+                                             n + i];
+        if (enc.audio_rows[((std::size_t)ch * n + i) * AC + k] != want) {
+          ++bad;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(bad == 0);
+  EXPECT_TRUE(enc.audio_rows.back() == -1.0f);
+  // And the layout takes them: the clip's soundtrack before its frames,
+  // the sound after, every row counted.
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      std::vector<int>(8, h3::kTextTag), enc.layout, 7, 4, 6, 12, 2, 2,
+      h3::kAudioChannels, &L));
+  EXPECT_TRUE(L.num_condition_audio_rows == 2 * (n + n2));
+  EXPECT_TRUE(L.audio_runs.size() == 3);
+  EXPECT_TRUE(L.audio_runs[0].start == 8 && L.audio_runs[0].count == 2 * n);
+  std::printf("[minimax_h3_refenc] carried soundtrack: %d of %d values "
+              "misplaced; %d reference audio rows\n", bad, 2 * AC * n,
+              L.num_condition_audio_rows);
+}
+
 TEST(minimax_h3_refenc, progress_is_weighed_by_work_planned_up_front)
 {
   h3::ReferencePlan plan;

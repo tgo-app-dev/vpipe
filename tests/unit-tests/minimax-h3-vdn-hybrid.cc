@@ -381,6 +381,183 @@ TEST(minimax_h3_vdn, a_window_that_covers_the_clip_turns_the_linear_half_off)
   EXPECT_TRUE(bad == 0);
 }
 
+TEST(minimax_h3_vdn, the_window_s_reach_is_set_per_request)
+{
+  // vdn_range (set_vdn_radius): the softmax half's reach, in chunks either
+  // side, in place of the checkpoint's. Per request on one built model,
+  // so the window cached at a geometry has to follow it -- at the SAME
+  // geometry, which is the case a stale tag would miss.
+  //
+  // Nine frames, the clip the test above runs: the released radius (1)
+  // covers it and the linear half is off. Radius 0 is the query's own
+  // chunk alone -- frames 5..8 lie outside frame 0's window -- so the
+  // linear half must run on every block, and the answer must move. Back
+  // to the checkpoint's, it is off again and the answer is the first.
+  //
+  // And PER STEP (Step::vdn_radius, what vdn_range_steps rests on): a
+  // forward's own reach in place of the request's -- 0 set on the step is
+  // the request's 0 to the bit; the next forward with none set is the
+  // request's again (nothing latched); a step's -1 is the checkpoint's
+  // whatever the request says.
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  if (!MetalMiniMaxH3Transformer::config_from_json(root, cfg, &cerr)) {
+    return;
+  }
+  cfg.n_layers = 2;
+
+  const int latf = 9, lath = 16, latw = 16, naud = 18, ntext = 16;
+  h3::PackedLayout L;
+  const std::vector<int> text_tags((std::size_t)ntext, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(
+      text_tags, latf, lath, latw, naud, cfg.patch_h, cfg.patch_w,
+      h3::kAudioChannels, {h3::Anchor::kFirst}, &L));
+  const int gh = lath / cfg.patch_h, gw = latw / cfg.patch_w;
+
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.7f, 0.5f, 0.0f, &uniq, &row_idx);
+  const SharedBuffer vb = ramp_(
+      mc, (std::size_t)L.video_indices.size() * cfg.video_patch_elems(),
+      0.017f);
+  const SharedBuffer ab = ramp_(
+      mc, (std::size_t)L.audio_indices.size() * cfg.audio_channels, 0.031f);
+  const SharedBuffer tb =
+      ramp_(mc, (std::size_t)ntext * cfg.text_dim, 0.005f);
+  ASSERT_TRUE(!vb.empty() && !ab.empty() && !tb.empty());
+
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  std::string aerr;
+  if (!m->attach_linear_branch(vdn_root_(), &aerr)) {
+    std::printf("[h3_vdn] attach: %s -- SKIPPED\n", aerr.c_str());
+    return;
+  }
+  EXPECT_TRUE(m->vdn_radius() == m->vdn_checkpoint_radius());
+
+  MetalMiniMaxH3Transformer::Step step;
+  step.video  = &vb;
+  step.audio  = &ab;
+  step.text   = &tb;
+  step.layout = &L;
+  step.timesteps = &uniq;
+  step.row_timestep_index = &row_idx;
+  step.video_grid_h = gh;
+  step.video_grid_w = gw;
+
+  auto run = [&](int radius, std::vector<float>* out,
+                 int per_step = MetalMiniMaxH3Transformer::Step::
+                     kVdnRadiusUnset) {
+    m->set_vdn_radius(radius);
+    MetalMiniMaxH3Transformer::Step st = step;
+    st.vdn_radius = per_step;
+    std::string ferr;
+    MetalMiniMaxH3Transformer::Velocity v = m->forward(st, &ferr);
+    if (v.empty()) { std::printf("[h3_vdn] range: %s\n", ferr.c_str()); }
+    if (v.empty()) { return false; }
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    out->resize(v.video.byte_size() / 2);
+    for (std::size_t i = 0; i < out->size(); ++i) { (*out)[i] = bf16_(p[i]); }
+    return true;
+  };
+  std::vector<float> own, narrow, again;
+  ASSERT_TRUE(run(-1, &own));
+  const bool own_covers = m->linear_window_covers_all();
+  const unsigned own_blocks = m->linear_blocks_run();
+  const std::size_t own_floor = m->vdn_arena_floor_asked();
+  ASSERT_TRUE(run(0, &narrow));
+  const bool narrow_covers = m->linear_window_covers_all();
+  const unsigned narrow_blocks = m->linear_blocks_run();
+  const std::size_t narrow_floor = m->vdn_arena_floor_asked();
+  ASSERT_TRUE(run(-1, &again));
+
+  double moved = 0.0, back = 0.0;
+  std::size_t bad = 0;
+  for (std::size_t i = 0; i < own.size(); ++i) {
+    if (!std::isfinite(narrow[i])) { ++bad; }
+    moved = std::max(moved, (double)std::fabs(narrow[i] - own[i]));
+    back  = std::max(back, (double)std::fabs(again[i] - own[i]));
+  }
+  std::printf("[h3_vdn] radius %d: covers %d, linear %u; radius 0: covers "
+              "%d, linear %u, max |dv| %.4f; back: max |dv| %.4f\n",
+              m->vdn_checkpoint_radius(), (int)own_covers, own_blocks,
+              (int)narrow_covers, narrow_blocks, moved, back);
+  EXPECT_TRUE(own_covers && own_blocks == 0u);
+  EXPECT_TRUE(!narrow_covers && narrow_blocks == (unsigned)cfg.n_layers);
+  EXPECT_TRUE(bad == 0);
+  EXPECT_TRUE(moved > 0.0);
+  EXPECT_TRUE(back == 0.0);
+  // The branch's carve out of the attention arena: owed where the linear
+  // half runs, not where the window covers the clip.
+  EXPECT_TRUE(own_floor == 0 && narrow_floor > 0);
+
+  // Per step: the request at the checkpoint's, the step at 0; then the
+  // request alone; then the request at 0, the step at -1. The arena's
+  // floor is asked at the STEP's reach: a step that turns the linear
+  // half on under a request whose window covers the clip still owes the
+  // carve (asked at the request's, it would ask for none).
+  std::vector<float> step0, unset, step_own;
+  ASSERT_TRUE(run(-1, &step0, 0));
+  const unsigned step0_blocks = m->linear_blocks_run();
+  const std::size_t step0_floor = m->vdn_arena_floor_asked();
+  ASSERT_TRUE(run(-1, &unset));
+  const unsigned unset_blocks = m->linear_blocks_run();
+  const std::size_t unset_floor = m->vdn_arena_floor_asked();
+  ASSERT_TRUE(run(0, &step_own, -1));
+  const unsigned own_step_blocks = m->linear_blocks_run();
+  const std::size_t own_step_floor = m->vdn_arena_floor_asked();
+  m->set_vdn_radius(-1);
+  std::printf("[h3_vdn] per step: radius 0 %s the request's 0 (linear "
+              "%u); none set %s the checkpoint's (linear %u); -1 over a "
+              "request of 0 %s the checkpoint's (linear %u)\n",
+              step0 == narrow ? "IS" : "is NOT", step0_blocks,
+              unset == own ? "IS" : "is NOT", unset_blocks,
+              step_own == own ? "IS" : "is NOT", own_step_blocks);
+  std::printf("[h3_vdn] arena floor asked: request 0 %zu, step 0 under "
+              "the checkpoint's %zu, none set %zu, step -1 under 0 %zu\n",
+              narrow_floor, step0_floor, unset_floor, own_step_floor);
+  EXPECT_TRUE(step0 == narrow && step0_blocks == (unsigned)cfg.n_layers);
+  EXPECT_TRUE(unset == own && unset_blocks == 0u);
+  EXPECT_TRUE(step_own == own && own_step_blocks == 0u);
+  EXPECT_TRUE(step0_floor == narrow_floor);
+  EXPECT_TRUE(unset_floor == 0 && own_step_floor == 0);
+
+  // A reach past the cap reads as the cap, which covers this clip as
+  // any reach from 1 does -- through the request and through a step.
+  // Uncapped, 500,000,000 chunks wrap the window's bounds, (chunk +- r)
+  // * 5 in an int, into an EMPTY window -- and a forward over it HUNG
+  // the GPU (a command buffer that never completed), so the cap is
+  // checked first and an uncapped reach is never run.
+  constexpr int kHuge = 500000000;
+  const int cap = MetalMiniMaxH3Transformer::kVdnMaxRadius;
+  m->set_vdn_radius(kHuge);
+  const int huge_reach = m->vdn_radius();
+  const int huge_step_reach = m->vdn_radius_of(kHuge);
+  m->set_vdn_radius(-1);
+  std::printf("[h3_vdn] reach %d asked: the request runs %d, a step %d "
+              "(cap %d)\n", kHuge, huge_reach, huge_step_reach, cap);
+  EXPECT_TRUE(huge_reach == cap && huge_step_reach == cap);
+  if (huge_reach != cap || huge_step_reach != cap) { return; }
+  std::vector<float> huge, huge_step;
+  ASSERT_TRUE(run(kHuge, &huge));
+  const bool huge_covers = m->linear_window_covers_all();
+  ASSERT_TRUE(run(-1, &huge_step, kHuge));
+  const bool huge_step_covers = m->linear_window_covers_all();
+  std::printf("[h3_vdn] reach %d: covers %d / %d, %s / %s the "
+              "checkpoint's answer\n", cap, (int)huge_covers,
+              (int)huge_step_covers, huge == own ? "IS" : "is NOT",
+              huge_step == own ? "IS" : "is NOT");
+  EXPECT_TRUE(huge_covers && huge == own);
+  EXPECT_TRUE(huge_step_covers && huge_step == own);
+}
+
 TEST(minimax_h3_vdn, the_turbo_adapter_binds_its_adaln_projections)
 {
   // VDN's turbo adapter is the only one in this tree that adapts the

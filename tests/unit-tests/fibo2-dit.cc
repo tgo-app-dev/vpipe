@@ -364,6 +364,18 @@ TEST(fibo2_layout, image_sizes_are_the_trained_buckets)
     }
     EXPECT_TRUE(s.first == c.w && s.second == c.h);
   }
+  // The same rule about 4 MP (Bria's service's larger size): the
+  // reference's get_image_size(aspect, area=4 * 1024 ** 2).
+  const Case four[] = {
+      {1.0, 2048, 2048},        {4.0 / 3.0, 2368, 1776},
+      {3.0 / 4.0, 1776, 2368},  {1.5, 2496, 1664},
+      {2.0 / 3.0, 1664, 2496},  {5.0 / 4.0, 2320, 1856},
+      {4.0 / 5.0, 1856, 2320},  {16.0 / 9.0, 2816, 1584},
+      {9.0 / 16.0, 1584, 2816}};
+  for (const Case& c : four) {
+    const auto s = fibo2::image_size(c.ar, 4LL * 1024 * 1024);
+    EXPECT_TRUE(s.first == c.w && s.second == c.h);
+  }
 }
 
 TEST(fibo2_layout, edit_prompt_is_the_reference_json)

@@ -19,7 +19,11 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 #include "generative-models/vae-model-registry.h"
+#include "generative-models/weight-set.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/typed-stage.h"
@@ -30,6 +34,9 @@
 #include "stages/audio-vae-encode-stage.h"
 #include "stages/model-memory.h"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -388,4 +395,202 @@ TEST(audio_vae_encode, the_claim_names_the_audio_vae)
   EXPECT_TRUE(audio);
   EXPECT_FALSE(video);
   g_two_vae_root.clear();
+}
+
+// MINIMAX-H3'S AUDIO VAE, BUILT IN, IS THE MANAGER'S. The stage encodes
+// a guide's soundtrack through the same checkpoint audio-vae-decode and
+// video-ref-encoder hold, so it must hold it through the session's
+// weight sets -- a private set is a second copy the plan counts once,
+// and nothing can drop, park or pool it. And it claims and declares the
+// VAE wherever it would load it: `hf_dir` naming the model root and
+// naming audio_vae/ itself alike (the second claimed nothing before).
+// The latent it emits is the VAE's posterior mean, whitened,
+// [2, channels, frames] -- the encoder's own rows transposed, compared
+// bit for bit.
+namespace {
+
+class H3LatentSink : public TypedStage<H3LatentSink> {
+public:
+  static constexpr const char* kTypeName = "ut-aenc-h3-sink";
+  using TypedStage::TypedStage;
+
+  int beats = 0;
+  std::vector<std::int64_t> shape;
+  std::vector<float> data;
+
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    auto in = co_await ctx.read(0);
+    if (!in) { ctx.signal_done(); co_return; }
+    if (const auto* tb = dynamic_cast<const TensorBeatPayload*>(in.get())) {
+      ++beats;
+      shape.assign(tb->shape.begin(), tb->shape.end());
+      data.assign(tb->as_f32(), tb->as_f32() + tb->element_count());
+    }
+  }
+
+  const StageSpec&
+  spec() const noexcept override
+  {
+    static const PortSpec ip[] = {
+      {.name = "latent", .doc = "", .type = &typeid(TensorBeatPayload)}};
+    static const StageSpec s = {.type_name = "ut-aenc-h3-sink", .doc = "",
+                                .display_name = "", .iports = ip};
+    return s;
+  }
+};
+
+class Tones : public TypedStage<Tones> {
+public:
+  static constexpr const char* kTypeName = "ut-aenc-h3-tones";
+  using TypedStage::TypedStage;
+  const std::vector<float>* pcm = nullptr;
+  int n = 0, per_beat = 0, rate = 0, emitted = 0;
+  Job
+  process(RuntimeContext& ctx) override
+  {
+    if (emitted * per_beat >= n) { ctx.signal_done(); co_return; }
+    auto b = std::make_unique<TensorBeatPayload>();
+    b->dtype = TensorBeat::DType::F32;
+    b->shape = {2, (std::int64_t)per_beat};
+    b->resize_contiguous((std::size_t)2 * per_beat);
+    for (int c = 0; c < 2; ++c) {
+      std::memcpy(b->as_f32() + (std::size_t)c * per_beat,
+                  pcm->data() + (std::size_t)c * n +
+                      (std::size_t)emitted * per_beat,
+                  (std::size_t)per_beat * sizeof(float));
+    }
+    FlexData sb = FlexData::make_object();
+    sb.as_object().insert_or_assign(
+        "sample_rate", FlexData::make_int((std::int64_t)rate));
+    b->sideband = std::move(sb);
+    ++emitted;
+    co_await ctx.write(0, std::move(b));
+  }
+  const StageSpec&
+  spec() const noexcept override
+  {
+    static const PortSpec op[] = {
+      {.name = "pcm", .doc = "", .type = &typeid(TensorBeatPayload)}};
+    static const StageSpec s = {.type_name = "ut-aenc-h3-tones",
+                                .doc = "", .display_name = "",
+                                .oports = op};
+    return s;
+  }
+};
+
+}  // namespace
+
+TEST(audio_vae_encode, minimax_h3_encodes_through_the_manager)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  using genai::MetalMiniMaxH3AudioVae;
+  const std::string vae = MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  MetalMiniMaxH3AudioVae::Config acfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(vae, acfg, &err));
+  if (!err.empty()) { std::printf("  config: %s\n", err.c_str()); }
+
+  // The claim and the declaration, naming the root and audio_vae/.
+  for (const std::string& hf : {std::string(root), vae}) {
+    Session sess;
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(hf));
+    AudioVaeEncodeStage stage(&sess, "aenc", std::vector<InEdge>{},
+                              std::move(cfg));
+    int claimed = 0, held = 0;
+    for (const ResourceClaim& c : stage.declare_resources()) {
+      if (c.key == vae) { ++claimed; }
+    }
+    for (const StageHolding& h : stage.declare_memory().holdings) {
+      if (h.source == vae && h.preload > 0) { ++held; }
+    }
+    std::printf("  hf_dir %s: claimed %d, declared %d\n", hf.c_str(),
+                claimed, held);
+    EXPECT_TRUE(claimed == 1);
+    EXPECT_TRUE(held == 1);
+  }
+
+  // A stereo second of two tones, in beats, at the VAE's own rate.
+  const int rate = acfg.sample_rate;
+  const int per_beat = rate / 4, n_beats = 4;
+  const int n = per_beat * n_beats;
+  std::vector<float> pcm((std::size_t)2 * n);
+  for (int c = 0; c < 2; ++c) {
+    for (int i = 0; i < n; ++i) {
+      pcm[(std::size_t)c * n + i] =
+          0.3f * std::sin(6.2831853f * (c == 0 ? 220.0f : 330.0f) * i /
+                          (float)rate);
+    }
+  }
+
+  Session sess;
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto src_u = std::make_unique<Tones>(&sess, "src", std::vector<InEdge>{},
+                                       FlexData::make_object());
+  src_u->pcm = &pcm;
+  src_u->n = n;
+  src_u->per_beat = per_beat;
+  src_u->rate = rate;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<Tones*>(pl->insert_stage(std::move(src_u)));
+  auto cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(root));
+  auto* enc = static_cast<AudioVaeEncodeStage*>(pl->insert_stage(
+      std::make_unique<AudioVaeEncodeStage>(
+          &sess, "aenc", std::vector<InEdge>{{src, 0}}, cfg)));
+  auto* sink = static_cast<H3LatentSink*>(pl->insert_stage(
+      std::make_unique<H3LatentSink>(&sess, "sink",
+                                     std::vector<InEdge>{{enc, 0}},
+                                     FlexData::make_object())));
+  PipelineRuntime rt(pl.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  auto* mgr = sess.services()->generative_model_manager();
+  const bool managed = mgr != nullptr && mgr->holds_weights(vae);
+  std::printf("  family '%s', %d beat(s), the VAE %s\n",
+              enc->family().c_str(), sink->beats,
+              managed ? "held through the session's weight sets"
+                      : "NOT in the session's weight sets");
+  EXPECT_TRUE(enc->family() == "minimax-h3");
+  EXPECT_TRUE(managed);
+  ASSERT_TRUE(sink->beats == 1 && sink->shape.size() == 3);
+  if (sink->shape.size() != 3) { return; }
+
+  // The reference: the encoder's rows, whitened and transposed here.
+  auto* mc = sess.services()->metal_compute();
+  auto ref = MetalMiniMaxH3AudioVae::load(genai::open_weight_set(vae, &sess),
+                                          mc, acfg);
+  ASSERT_TRUE(ref != nullptr);
+  if (ref == nullptr) { return; }
+  std::vector<float> rows;
+  int frames = 0;
+  ASSERT_TRUE(ref->encode(pcm.data(), 2, n, &rows, &frames, &err));
+  const int AC = acfg.latent_channels;
+  EXPECT_TRUE(sink->shape[0] == 2 && sink->shape[1] == AC &&
+              sink->shape[2] == frames &&
+              frames == ref->encoded_frames(n));
+  int off = 0;
+  for (int c = 0; c < 2 && sink->shape[2] == frames; ++c) {
+    for (int i = 0; i < frames; ++i) {
+      for (int k = 0; k < AC; ++k) {
+        const float z = rows[((std::size_t)c * frames + i) * AC + k];
+        const float want =
+            (z - acfg.latents_mean[(std::size_t)k]) /
+            acfg.latents_std[(std::size_t)k];
+        if (sink->data[((std::size_t)c * AC + k) * frames + i] != want) {
+          ++off;
+        }
+      }
+    }
+  }
+  std::printf("  [2, %d, %d] latent, %d of %d values off the whitened "
+              "encoder rows\n", AC, frames, off, 2 * AC * frames);
+  EXPECT_TRUE(off == 0);
 }

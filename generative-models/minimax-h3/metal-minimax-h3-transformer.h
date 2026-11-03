@@ -680,10 +680,18 @@ class MetalMiniMaxH3Transformer {
   }
 
   // Bytes the ANE feed-forward tier holds for a `seq`-row forward of this
-  // shape; see AneFeedForward::runtime_bytes. Static because the PLAN asks
-  // before anything loads.
+  // shape (and the qkv one's, when `c` asks for it); see
+  // AneFeedForward::runtime_bytes. Static because the PLAN asks before
+  // anything loads. ane_held_bytes() is what the ARMED modules hold -- the
+  // qkv tier may have declined where the plan asked for it.
   static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
-  // Rows per ANE predict: VPIPE_H3_ANE_CHUNK or the default.
+  std::size_t ane_held_bytes() const noexcept;
+  // Rows per ANE predict: VPIPE_H3_ANE_CHUNK or the default (2048).
+  // MEASURED against 1024 (M4 Pro, int8 ConvRot, ffn + qkv, 9.4k rows, 4
+  // blocks, three interleaved rounds): a tie, 3977 against 3988 ms. The
+  // finer chunk took the GPU's idle from ~11% of the forward (waiting for
+  // the ANE's last chunk) to under 1% -- but the ANE runs ~6% slower a
+  // row there, so the balancer hands the GPU those rows instead.
   static int ane_chunk_rows() noexcept;
   // Whether the tier tried to arm, and whether it did: a plan that booked
   // the module can release the booking when it did not.
@@ -764,6 +772,14 @@ class MetalMiniMaxH3Transformer {
     bool  sol_routing = false;
     float sol_tau     = 1.0f;
     bool  sol_exact   = false;
+    // This forward's VDN REACH in place of set_vdn_radius()'s: the
+    // softmax half's window, the query's chunk and this many chunks
+    // either side (-1 the checkpoint's). Per forward like sol_tau -- a
+    // sampler that widens or narrows the window as the noise falls says
+    // so step by step; nothing is latched, the next forward without one
+    // is set_vdn_radius()'s again. kVdnRadiusUnset: not set.
+    static constexpr int kVdnRadiusUnset = -2;
+    int   vdn_radius  = kVdnRadiusUnset;
     // Sage's int8 P*V (sage::Config::pv8) off for this forward -- the
     // int8 QK alone -- as the loop's sage_pv8_from_step says.
     bool sage_pv8_off = false;
@@ -835,6 +851,53 @@ class MetalMiniMaxH3Transformer {
   // zero still runs the stock stack.
   bool attach_linear_branch(const std::string& dir, std::string* err);
   bool has_linear_branch() const { return (bool)_vdn; }
+
+  // How far the softmax half of the hybrid reaches: the query's chunk
+  // and `r` whole chunks either side of it, the linear half carrying
+  // every frame beyond -- the checkpoint's `softmax_attention.radius`
+  // (1 in the released configs), or this in its place. The SHARE of the
+  // keys each half sees, and so where the cost and the exactness go: a
+  // wider window is more of the original attention and costs more of
+  // its time, a narrower one hands more to the linear branch. The two
+  // halves still PARTITION the keys at any radius -- the linear branch
+  // reads its complement off the same bounds -- but the gate and the
+  // branch were TRAINED at the checkpoint's, so another radius is a
+  // tuning outside it, not a setting of it. -1 (the default): the
+  // checkpoint's. Per request, read by the next plan and forward -- a
+  // forward's Step::vdn_radius, where set, in its place (a reach by
+  // step); the window's spans are rebuilt when it changes.
+  //
+  // AT MOST kVdnMaxRadius, and more reads as that: the window's bounds
+  // are (chunk +- r) * chunk_frames in an int, which wraps past ~4.3e8
+  // chunks (5 frames a chunk) into an EMPTY window -- garbage, not a
+  // wide one. 1024 chunks either side is 10,245 latent frames, past any
+  // clip the whole-sequence blocks VDN runs in can hold.
+  static constexpr int kVdnMaxRadius = 1024;
+  void set_vdn_radius(int r)
+  {
+    _vdn_radius = r < 0 ? -1 : std::min(r, kVdnMaxRadius);
+  }
+  int vdn_radius() const
+  {
+    return _vdn_radius >= 0 ? _vdn_radius : _vdn_cfg.radius;
+  }
+  int vdn_checkpoint_radius() const { return _vdn_cfg.radius; }
+  // The reach a forward runs at `r` -- a Step::vdn_radius: itself
+  // (capped), -1 the checkpoint's, kVdnRadiusUnset set_vdn_radius()'s.
+  int vdn_radius_of(int r) const
+  {
+    if (r >= 0) { return std::min(r, kVdnMaxRadius); }
+    if (r == -1) { return _vdn_cfg.radius; }
+    return vdn_radius();
+  }
+  int vdn_radius_of(const Step& s) const
+  {
+    return vdn_radius_of(s.vdn_radius);
+  }
+  // The attention-arena floor the LAST forward asked for the branch's
+  // carve (vdn_scratch_bytes at that forward's reach); 0 where the
+  // linear half did not run or no branch is attached.
+  std::size_t vdn_arena_floor_asked() const { return _vdn_arena_asked; }
 
   // Non-zero if any of the branch's per-frame I + A was not positive
   // definite on the last forward. READ IT: the solve returns a NaN
@@ -1146,9 +1209,13 @@ class MetalMiniMaxH3Transformer {
   // smaller by however much the arena covers.
   //
   // `grid_h`/`grid_w` are the PATCH grid, the same numbers Step carries.
+  // `radius` is a Step::vdn_radius (vdn_radius_of): the reach decides
+  // whether the window covers the clip, and so whether any of this is
+  // owed -- a forward asks at its STEP's reach, not the request's.
   std::size_t vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
                                 int grid_h, int grid_w, int n_text,
-                                std::size_t* arena_floor = nullptr) const;
+                                std::size_t* arena_floor = nullptr,
+                                int radius = Step::kVdnRadiusUnset) const;
 
   // What SOL-ATTN will also want at this sequence length, or 0 when it
   // is off. The same shape of question as vdn_scratch_bytes above and
@@ -1276,6 +1343,14 @@ class MetalMiniMaxH3Transformer {
   // when nothing streamed.
   int prefetch_started() const { return _pf_started; }
   int prefetch_hits() const { return _pf_hit; }
+  // Blocks the last forward promoted UNDER THE NEXT BLOCK'S GPU WORK --
+  // copied out of their slot, kept and wired after that block's commit
+  // rather than between their own wait and its encode. Zero with
+  // VPIPE_H3_PROMOTE_INLINE=1 (the A/B), or when nothing was promoted.
+  int deferred_promotions() const { return _promote_deferred; }
+  // Of those, the ones copied out of the SPARE, so the slot's next read
+  // did not wait for the copy (VPIPE_H3_NO_PROMOTE_SPARE=1: none).
+  int spared_promotions() const { return _promote_spared; }
   // Whether the last streamed forward ran with TWO reusable block slots.
   // False means single-slot (the budget refused the second, or
   // VPIPE_H3_SINGLE_SLOT asked for it) and is a distinct third path from
@@ -1514,6 +1589,11 @@ class MetalMiniMaxH3Transformer {
   // the next read -- so the residency set, its growth and its ratchet all
   // work exactly as before.
   Block _slot[2];
+  // A block a promotion is still to copy, swapped out of its slot so the
+  // slot's next read need not wait for the copy -- the slot takes this
+  // one's buffers. Lives for one forward (given back at its end), and
+  // only where a promotion is under way and the box takes one more block.
+  Block _slot_spare;
   // Which slot holds the block the forward is currently running. The
   // prefetch always targets the other one.
   int   _slot_cur = 0;
@@ -1763,6 +1843,11 @@ class MetalMiniMaxH3Transformer {
   int _attn_sage_built = -1;
   int _attn_pv8_built = -1;   // ...and its int8 P*V (sage::Config::pv8)
   int _vdn_frames = 0, _vdn_tpf = 0, _vdn_vstart = 0, _vdn_seq = 0;
+  // set_vdn_radius()'s value (-1: the checkpoint's), and the radius the
+  // cached window was built at -- a fifth tag beside the geometry's.
+  int _vdn_radius = -1, _vdn_built_radius = -1;
+  // The arena floor the last forward asked for (vdn_arena_floor_asked).
+  std::size_t _vdn_arena_asked = 0;
   // A window wide enough to reach every frame IS the original attention,
   // and then the linear half must NOT run: it carries the window's
   // COMPLEMENT, and the complement of everything is nothing. Left on it
@@ -1938,9 +2023,14 @@ class MetalMiniMaxH3Transformer {
   bool ane_qkv_eligible_(int L, const Block& b);
   void ane_qkv_stage_(int L, const Block& b, const LoraStack& lora);
   bool ane_setup_(int seq);        // false == tier off
-  // Whether block L's feed-forward can go to the ANE: under the cap, no
-  // bias, fc1/fc2 dense bf16 or 4/8-bit affine, and not an adapted fc1 in
-  // the interleaved layout (the adapter's rows are [gate; up]).
+  // A projection the ANE's staging reads: no bias, and dense bf16, FP8,
+  // ComfyUI's int8 (ConvRot or not), W4A8, or 4/8-bit affine.
+  static bool ane_stageable_(const Linear& l);
+  // Its source for the staging, before any stride, offset or adapter.
+  static AneFfnSource ane_source_(const Linear& l);
+  // Whether block L's feed-forward can go to the ANE: under the cap,
+  // fc1/fc2 stageable, and not an adapted fc1 in the interleaved layout
+  // (the adapter's rows are [gate; up]).
   bool ane_eligible_(int L, const Block& b, bool adapted);
   // Dispatch block L's gate/up/down into the module's slots and return at
   // once, so the conversion runs under the block's attention. fc1 is
@@ -2100,6 +2190,10 @@ class MetalMiniMaxH3Transformer {
   // member that holds it. `refiner` picks which stack of blocks.
   LoraStack lora_stack_(bool refiner, int layer,
                         LoraFactors BlockLora::* which) const;
+  // Whether every adapter's factors for that projection of main block
+  // `layer` are in memory now: false while any is SPILLED and read only
+  // with its block (fill_lora_) -- lora_stack_ drops it until then.
+  bool lora_resident_(int layer, LoraFactors BlockLora::* which) const;
   // The same for final_layer.adaln_proj.linear, which is not in a block.
   LoraStack lora_stack_final_() const;
   metal_compute::ComputeFunction _fn_gemm_acc;
@@ -2435,6 +2529,7 @@ class MetalMiniMaxH3Transformer {
   // VPIPE_H3_TUNE_ROWS.
   int _tune_ceiling = 4096;
   int _pf_started = 0, _pf_hit = 0;
+  int _promote_deferred = 0, _promote_spared = 0;
   int _attn_seq = -1, _attn_text = -1;
   // Which layout the cached AttnParams describe. Tracked apart from the
   // sequence lengths so set_fused_attention() re-fills the params

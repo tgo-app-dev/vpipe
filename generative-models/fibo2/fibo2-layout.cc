@@ -1,6 +1,7 @@
 #include "generative-models/fibo2/fibo2-layout.h"
 
 #include "common/flex-data.h"
+#include "common/size-about-area.h"
 
 #include <algorithm>
 #include <charconv>
@@ -126,38 +127,7 @@ unpack_latents(const float* rows, int C, int H, int W, int p, float* z)
 std::pair<int, int>
 image_size(double aspect, long long area, int multiple)
 {
-  const int min_side = 4 * multiple;
-  std::pair<int, int> best{0, 0};
-  double best_crop = 0.0;
-  long long best_dist = 0;
-  bool have = false;
-  for (long long w = min_side; w < 2 * area / min_side; w += multiple) {
-    for (long long h = min_side; h < 2 * area / w; h += multiple) {
-      const long long a = w * h;
-      if (!(0.9 * (double)area <= (double)a &&
-            (double)a <= 1.1 * (double)area)) {
-        continue;
-      }
-      const double ratio = (double)w / (double)h;
-      // round(crop, 9): the reference compares crops at 9 decimals.
-      const double crop = std::nearbyint(
-          (1.0 - std::min(ratio / aspect, aspect / ratio)) * 1e9) / 1e9;
-      const long long dist = std::llabs(a - area);
-      // min over (crop, |a - area|, -w): the wider wins the last tie.
-      const bool better =
-          !have || crop < best_crop ||
-          (crop == best_crop &&
-           (dist < best_dist ||
-            (dist == best_dist && w > (long long)best.first)));
-      if (better) {
-        best = {(int)w, (int)h};
-        best_crop = crop;
-        best_dist = dist;
-        have = true;
-      }
-    }
-  }
-  return best;
+  return size_about_area(aspect, area, multiple);
 }
 
 namespace {

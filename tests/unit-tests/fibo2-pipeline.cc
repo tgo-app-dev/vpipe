@@ -1119,6 +1119,74 @@ TEST(fibo2_stage, guidance_one_ignores_a_wired_negative)
   EXPECT_TRUE(rel < 0.03);
 }
 
+// THE MODEL CONFIG'S AREA IS WHAT AN UNSIZED GRAPH BOOKS. An edit takes
+// its picture's size, which no plan can see, so it is booked at the area
+// fibo2-model-config names (`megapixels`; unset 1, the trained 1024^2) --
+// 4 books the 2048^2 edit a crop_to_area at 4 megapixels feeds it -- and
+// a relaunch without the constant books 1 again. Width / height on the
+// stage win. Loads nothing. Env: VPIPE_FIBO2_TEST_MODEL_PATH (the
+// repository root; its configs only) or VPIPE_FIBO2_GUIDED_GOLDEN.
+TEST(fibo2_stage, the_launch_plan_books_the_model_config_s_area)
+{
+  std::string gd = env_("VPIPE_FIBO2_TEST_MODEL_PATH");
+  if (gd.empty()) { gd = env_("VPIPE_FIBO2_GUIDED_GOLDEN"); }
+  if (gd.empty()) { return; }
+  Session sess;
+  const fs::path root(gd);
+  genai::MetalFibo2Transformer::Config cfg;
+  ASSERT_TRUE(genai::MetalFibo2Transformer::Config::read_dims(
+      (root / "transformer").string(), &cfg));
+  auto* mc = sess.metal_compute();
+  const bool mx = mc != nullptr && mc->supports_matrix_cores();
+  auto edit = [&](int side) {
+    return genai::MetalFibo2Transformer::forward_scratch_bytes(
+        cfg, 2 * (side / 16) * (side / 16), 1024, false, mx);
+  };
+  auto booked = [](const GenerateImageStage& st) -> std::size_t {
+    for (const ResourceClaim& c : st.declare_resources()) {
+      if (c.key.rfind("fibo2-dit:", 0) == 0) {
+        return (std::size_t)std::stoull(c.key.substr(c.key.rfind('|') + 1));
+      }
+    }
+    return 0;
+  };
+  auto make = [&](int side) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string(root.string()));
+    if (side > 0) {
+      c.as_object().insert("width", FlexData::make_int(side));
+      c.as_object().insert("height", FlexData::make_int(side));
+    }
+    return std::make_unique<GenerateImageStage>(
+        &sess, "gen", std::vector<InEdge>{}, std::move(c));
+  };
+  auto area = [](double mp) {
+    FlexData m = FlexData::make_object();
+    m.as_object().insert("model_family", FlexData::make_string("fibo2"));
+    m.as_object().insert("megapixels", FlexData::make_real(mp));
+    return m;
+  };
+  constexpr unsigned kModelCfgPort = 7;
+  auto st = make(0);
+  ASSERT_TRUE(st->config_error().empty());
+  const std::size_t one = booked(*st);
+  st->apply_constant(kModelCfgPort, area(4.0));
+  const std::size_t four = booked(*st);
+  st->reset_run_state();
+  const std::size_t again = booked(*st);
+  auto sized = make(1024);
+  sized->apply_constant(kModelCfgPort, area(4.0));
+  const std::size_t own = booked(*sized);
+  std::printf("[fibo2_stage] unsized: %.1f MB at 1 MP, %.1f MB at 4 MP, "
+              "%.1f MB relaunched without it; 1024^2 named on the stage "
+              "beside 4 MP %.1f MB\n", one / 1048576.0, four / 1048576.0,
+              again / 1048576.0, own / 1048576.0);
+  EXPECT_TRUE(one == edit(1024));
+  EXPECT_TRUE(four == edit(2048));
+  EXPECT_TRUE(again == one);
+  EXPECT_TRUE(own == one);
+}
+
 // THE LAUNCH PLAN BOOKS A GUIDED NEGATIVE. declare_resources runs before
 // any beat, so the guidance it can see is the model-config CONSTANT
 // (apply_constant) or generate-image's own key: guided, the DiT's

@@ -3498,6 +3498,38 @@ const STRINGS = {
       + '質心最不具代表性的地方，恰恰就是 query 區分度最高的地方，所以對角線'
       + '附近不拿去投票。-1 連 query 自己所在的塊也路由，那是一個消融實驗，'
       + '而不是一個設定'],
+  'cfg.generate-video.vdn_range': ['',
+      '仅限挂接了 VDN `linear_branch` 的 MiniMax-H3：混合注意力的 SOFTMAX '
+      + '一半能看多远——query 帧所在的块（5 个潜变量帧）以及它两侧各这么多个'
+      + '整块——更远的每一帧都由 LINEAR 一半承担。这就是 softmax/linear 的'
+      + '划分：越宽，保留的原始注意力越多，精确但更慢（窗口覆盖整个片段时，'
+      + '线性一半关闭）；越窄，交给 delta rule 的越多。任何取值下两半仍然把 '
+      + 'key 分给彼此，但分支和它的门控是在检查点的 '
+      + '`softmax_attention.radius`（1）下训练的，所以别的取值是训练范围之外'
+      + '的调参。-1（默认）：检查点自己的值；最多 1024，足以覆盖任何片段（更'
+      + '大的值按 1024 处理）。按请求生效——无需重新加载——没有分支时忽略',
+      '僅限掛接了 VDN `linear_branch` 的 MiniMax-H3：混合注意力的 SOFTMAX '
+      + '一半能看多遠——query 影格所在的塊（5 個潛在影格）以及它兩側各這麼多'
+      + '個整塊——更遠的每一個影格都由 LINEAR 一半承擔。這就是 softmax/linear '
+      + '的劃分：越寬，保留的原始注意力越多，精確但更慢（視窗覆蓋整個片段時，'
+      + '線性一半關閉）；越窄，交給 delta rule 的越多。任何取值下兩半仍然把 '
+      + 'key 分給彼此，但分支和它的閘控是在檢查點的 '
+      + '`softmax_attention.radius`（1）下訓練的，所以別的取值是訓練範圍之外'
+      + '的調參。-1（預設）：檢查點自己的值；最多 1024，足以覆蓋任何片段（更'
+      + '大的值按 1024 處理）。按請求生效——無需重新載入——沒有分支時忽略'],
+  'cfg.generate-video.vdn_range_steps': ['',
+      '按去噪步给出的 vdn_range，用逗号分隔（"2,1,1"）：第 i 项用于第 i 步，'
+      + '列表之后的每一步沿用最后一项，取值 -1 到 1024，-1 表示检查点自己的'
+      + '值；为空（默认）时用 vdn_range。它之于 vdn_range，正如 sol_tau_steps '
+      + '之于 sol_tau：前面那些决定结构的步可以保留更多原始注意力，后面的步把'
+      + '更多交给线性一半。显存预检按最窄那一步的窗口预留（留给线性一半的最'
+      + '多）。仅限带 VDN 分支的 MiniMax-H3',
+      '按去噪步給出的 vdn_range，用逗號分隔（"2,1,1"）：第 i 項用於第 i 步，'
+      + '列表之後的每一步沿用最後一項，取值 -1 到 1024，-1 表示檢查點自己的'
+      + '值；為空（預設）時用 vdn_range。它之於 vdn_range，正如 sol_tau_steps '
+      + '之於 sol_tau：前面那些決定結構的步可以保留更多原始注意力，後面的步把'
+      + '更多交給線性一半。記憶體預檢按最窄那一步的視窗預留（留給線性一半的最'
+      + '多）。僅限帶 VDN 分支的 MiniMax-H3'],
   'cfg.generate-video.motion_cache': ['',
       '加速采样（有损）：MotionCache 跳过整次去噪前向。预热之后，每一步都'
       + '预测模型输出自上一次实际运行的前向以来移动了多少——用最近两次计算出'
@@ -5488,10 +5520,12 @@ const STRINGS = {
       'Fibo 2.0 模型設定'],
   'stage.fibo2-model-config.doc': ['',
       '源：Fibo 2.0 的专属参数——引导强度（Dev 用 5；Edit Turbo 不需要）、'
+      + '生成图片所用的面积（1 或 4 百万像素）、'
       + '编辑时 Qwen3-VL 所读图片的尺寸界限、运行时 LoRA 槽位和实时预览。'
       + 'Edit Turbo 的运行一个都不需要。发一个节拍即结束；若接了 trigger 输入'
       + '端口，则每收到一个节拍发一次。',
       '來源：Fibo 2.0 的專屬參數——引導強度（Dev 用 5；Edit Turbo 不需要）、'
+      + '生成圖片所用的面積（1 或 4 百萬像素）、'
       + '編輯時 Qwen3-VL 所讀圖片的尺寸界限、執行階段 LoRA 槽位和即時預覽。'
       + 'Edit Turbo 的執行一個都不需要。發一個節拍即結束；若接了 trigger 輸入'
       + '埠，則每收到一個節拍發一次。'],
@@ -5506,6 +5540,19 @@ const STRINGS = {
       + '結構化描述）。Fibo 2.0 Dev 用 5（其模型卡的配方，50 步；未設步數時 '
       + '30 步）；Edit Turbo 蒸餾到 1，即每步只做一次前向、不跑負向分支。留空 '
       + '=> generate-image 自己的 guidance_scale（預設 1）'],
+  'cfg.fibo2-model-config.megapixels': ['',
+      '生成图片所用的面积，以 1024 x 1024 为单位：未设 width / height 的'
+      + '文生图的尺寸（该面积附近的 1:1：1 -> 1024 x 1024，4 -> 2048 x '
+      + '2048），以及图片到达之前启动计划为编辑预留的尺寸。编辑的结果与其'
+      + '图片同尺寸，所以要把图片裁到同一面积——image-resample 的 `fit: '
+      + 'crop_to_area` 配同样的 megapixels。模型在约 1 百万像素上训练；Bria '
+      + '的服务也提供 4。未设置 => 1',
+      '生成圖片所用的面積，以 1024 x 1024 為單位：未設 width / height 的'
+      + '文生圖的尺寸（該面積附近的 1:1：1 -> 1024 x 1024，4 -> 2048 x '
+      + '2048），以及圖片到達之前啟動計畫為編輯預留的尺寸。編輯的結果與其'
+      + '圖片同尺寸，所以要把圖片裁到同一面積——image-resample 的 `fit: '
+      + 'crop_to_area` 配同樣的 megapixels。模型在約 1 百萬像素上訓練；Bria '
+      + '的服務也提供 4。未設定 => 1'],
   'cfg.fibo2-model-config.vl_long_edge': ['',
       '编辑：Qwen3-VL 看到的待编辑图片的最长边，按参考管线的方式生成缩略图'
       + '（双三次插值、保持宽高比、从不放大）；VAE 使用图片本身。未设置 => '
@@ -5573,11 +5620,13 @@ const STRINGS = {
       + '發一次'],
   'port.fibo2-model-config.model_config': ['',
       'Fibo 2.0 参数，作为一个 FlexData 对象 {model_family: fibo2, '
-      + '+guidance_scale，+vl_long_edge / vl_min_pixels / vl_max_pixels，'
+      + '+guidance_scale，+megapixels，+vl_long_edge / vl_min_pixels / '
+      + 'vl_max_pixels，'
       + '+lora .. +lora8 与它们的强度，+preview_vae 与它的选项}，供 '
       + 'generate-image 或 diffusion-conditioner 的 model_config 输入端口使用',
       'Fibo 2.0 參數，作為一個 FlexData 物件 {model_family: fibo2, '
-      + '+guidance_scale，+vl_long_edge / vl_min_pixels / vl_max_pixels，'
+      + '+guidance_scale，+megapixels，+vl_long_edge / vl_min_pixels / '
+      + 'vl_max_pixels，'
       + '+lora .. +lora8 與它們的強度，+preview_vae 與它的選項}，供 '
       + 'generate-image 或 diffusion-conditioner 的 model_config 輸入埠使用'],
 
@@ -7984,14 +8033,18 @@ const STRINGS = {
   'stage.image-resample.doc': ['',
       '把 rgb-frames 重采样到固定的宽 x 高，宽高比的处理方式（填充 / 裁剪 /'
       + ' 拉伸 / 手动）与填充色均可配置——或用 pad_to_grid / crop_to_grid 按源'
-      + '图自身的宽高比落到边长网格上（FLUX.3 的参考图规则）。'
+      + '图自身的宽高比落到边长网格上（FLUX.3 的参考图规则），或用 '
+      + 'crop_to_area 落到某个面积附近、按其宽高比裁掉最少的尺寸（Fibo 2.0 '
+      + '的训练尺寸）。'
       + '默认使用 Lanczos-3 重采样；\'bilinear\''
       + ' 更省，\'bicubic\' 与 PIL 一致。f16 与 f32 帧（RGB 或 RGBA）以任一滤'
       + '波器在 GPU 上重采样；u8 RGB 帧用 bilinear 或 lanczos 时走 GPU；其余'
       + '走 CPU。输入端口与输出端口同属一个时钟域（1:1）。',
       '把 rgb-frames 重新取樣到固定的寬 x 高，長寬比的處理方式（填充 / 裁剪'
       + ' / 拉伸 / 手動）與填充色均可設定——或用 pad_to_grid / crop_to_grid '
-      + '依來源自身的長寬比落到邊長網格上（FLUX.3 的參考圖規則）。'
+      + '依來源自身的長寬比落到邊長網格上（FLUX.3 的參考圖規則），或用 '
+      + 'crop_to_area 落到某個面積附近、依其長寬比裁掉最少的尺寸（Fibo 2.0 '
+      + '的訓練尺寸）。'
       + '預設使用 Lanczos-3 重新取樣；'
       + '\'bilinear\' 更省，\'bicubic\' 與 PIL 一致。f16 與 f32 影格（RGB 或 '
       + 'RGBA）以任一濾波器在 GPU 上重新取樣；u8 RGB 影格用 bilinear 或 '
@@ -8015,7 +8068,9 @@ const STRINGS = {
       + '填充到画布；图像所在矩形以 `crop_box` 随附，vae-decode 据此把编辑结'
       + '果裁回——FLUX.3 的单参考图编辑）| crop_to_grid（缩小到不超过 '
       + 'max_pixels，每边向下取整到 `grid` 并居中裁剪——FLUX.3 对多张参考图'
-      + '中每一张的规则）',
+      + '中每一张的规则）| crop_to_area（在 `grid` 上、与 `megapixels` 相差 '
+      + '10% 以内、按图片宽高比裁掉最少的尺寸，覆盖后居中裁剪，可放大也可'
+      + '缩小——Fibo 2.0 的训练尺寸，即 Bria 的 get_image_size）',
       '長寬比處理方式：pad（對齊長邊並用 pad_color 填充）| crop（對齊短邊並'
       + '置中裁剪）| stretch（改變長寬比）| manual（從 src_x,src_y 起按 '
       + 'scale 取樣，其餘填充）。另有兩種依來源決定輸出尺寸、忽略 '
@@ -8024,12 +8079,21 @@ const STRINGS = {
       + '填補到畫布；影像所在矩形以 `crop_box` 隨附，vae-decode 據此把編輯結'
       + '果裁回——FLUX.3 的單參考圖編輯）| crop_to_grid（縮小到不超過 '
       + 'max_pixels，每邊向下取整到 `grid` 並置中裁剪——FLUX.3 對多張參考圖'
-      + '中每一張的規則）'],
+      + '中每一張的規則）| crop_to_area（在 `grid` 上、與 `megapixels` 相差 '
+      + '10% 以內、依圖片長寬比裁掉最少的尺寸，覆蓋後置中裁剪，可放大也可'
+      + '縮小——Fibo 2.0 的訓練尺寸，即 Bria 的 get_image_size）'],
   'cfg.image-resample.grid': ['',
-      'pad_to_grid / crop_to_grid：每条输出边都落在其倍数上（16：一个 FLUX '
-      + 'VAE 潜变量格）',
-      'pad_to_grid / crop_to_grid：每條輸出邊都落在其倍數上（16：一個 FLUX '
-      + 'VAE 潛變量格）'],
+      'pad_to_grid / crop_to_grid / crop_to_area：每条输出边都落在其倍数上'
+      + '（16：一个 FLUX VAE 潜变量格）',
+      'pad_to_grid / crop_to_grid / crop_to_area：每條輸出邊都落在其倍數上'
+      + '（16：一個 FLUX VAE 潛變量格）'],
+  'cfg.image-resample.megapixels': ['',
+      'crop_to_area：选取尺寸所依据的面积，以 1024 x 1024 为单位。Fibo 2.0 '
+      + '在约 1 上训练；Bria 的服务也提供 4（1:1 为 2048 x 2048，16:9 为 '
+      + '2816 x 1584）',
+      'crop_to_area：選取尺寸所依據的面積，以 1024 x 1024 為單位。Fibo 2.0 '
+      + '在約 1 上訓練；Bria 的服務也提供 4（1:1 為 2048 x 2048，16:9 為 '
+      + '2816 x 1584）'],
   'cfg.image-resample.max_pixels': ['',
       'pad_to_grid / crop_to_grid：输出最多的像素数（pad_to_grid 计入填充后'
       + '的画布）。FLUX.3 单张参考图用 4194304（4 MiB），多张时每张用 '

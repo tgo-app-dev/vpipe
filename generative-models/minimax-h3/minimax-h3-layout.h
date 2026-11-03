@@ -90,6 +90,30 @@ std::vector<double> temporal_position_grid(int num_latent_frames,
 // Which end of the clip a keyframe conditioning block is anchored to.
 enum class Anchor { kFirst, kLast };
 
+// A GUIDE: a stretch of clip already in the DiT's latent space -- video
+// latent frames, a soundtrack's audio latents, or both -- pinned WHERE
+// IT LIES in the clip being generated, from pixel frame `frame` on.
+//
+// The keyframe anchor generalized, as ComfyUI's H3 guides are: one
+// keyframe is a guide of one latent frame at frame 0, and a
+// continuation is the previous clip's last latent frames and audio at
+// frame 0, the new clip generated through them. Each latent frame keeps
+// its own rotary time -- `frame` * 5/3 past the text, then the latents'
+// own (1, 4, 4, 4, 4) spans -- which the anchor's one-frame block never
+// had to say.
+//
+// The rows are conditioning, never stepped: the video's at the keyframe
+// level, the audio's at a reference soundtrack's.
+struct Guide {
+  int frame             = 0;   // the target's pixel frame it starts at
+  int num_latent_frames = 0;   // its video latent frames; 0: audio only
+  int num_audio_latents = 0;   // per stereo channel; 0: video only
+};
+
+// The pixel frames `num_latent_frames` consecutive latent frames cover,
+// starting at a chunk's first: 1 + 4 + 4 + 4 + 4 a chunk (7 -> 22).
+int guide_pixel_frames(int num_latent_frames);
+
 // A contiguous destination range of one modality's rows.
 //
 // `t2va` / `fl2va` give every modality ONE range (video two: the
@@ -137,23 +161,23 @@ struct PackedLayout {
   // them in this order.
   std::vector<int> video_indices;
 
-  // The same for audio, reference rows first. `t2va` / `fl2va` have no
-  // reference audio, so this is just [audio_start, +num_audio_rows) --
-  // it is materialized anyway so that everything downstream reads ONE
-  // shape whichever task built the layout.
+  // The same for audio, conditioning rows first. A `t2va` / `fl2va`
+  // request with no guide audio has none, so this is just
+  // [audio_start, +num_audio_rows) -- materialized anyway so that
+  // everything downstream reads ONE shape whichever task built it.
   std::vector<int> audio_indices;
 
   // Each modality's rows as contiguous runs, in the order the indices
   // above list them. Video is {conditioning, target} for `fl2va` and
   // one run per image/video reference plus the target for `ref2va`;
-  // audio is a single target run for `fl2va`.
+  // audio is a single run for `fl2va`, any guide audio leading it.
   std::vector<RowRun> video_runs;
   std::vector<RowRun> audio_runs;
 
   // How many LEADING entries of the index vectors are conditioning
   // rather than generated rows. `num_condition_video_rows` is
   // `num_condition_rows` under the name the general path uses; audio
-  // conditioning exists only in `ref2va`.
+  // conditioning is `ref2va`'s soundtracks or an `fl2va` guide's audio.
   int num_condition_video_rows = 0;
   int num_condition_audio_rows = 0;
 
@@ -203,14 +227,53 @@ struct Reference {
 // than a count: the caller building the prompt is the only thing that
 // knows where the vision blocks are.
 //
+// `guides` are packed after the anchors: every guide's video rows, then
+// every guide's audio rows, so the video conditioning stays ONE run
+// leading the video buffer and the audio conditioning leads the audio
+// buffer beside the generated audio -- the shape the denoise loop
+// already steps (TaoMate lays its reference audio the same way). The
+// order is [text | anchors | guide video | guide audio | target audio |
+// target video]; with no guides, exactly as before.
+//
 // False on an inconsistent request (non-positive geometry, a latent
-// size not divisible by the patch).
+// size not divisible by the patch, a guide outside the clip: its frames
+// past the last, its audio past the soundtrack's end).
 bool build_packed_sequence(const std::vector<int>& text_token_tags,
                            int num_latent_frames, int latent_height,
                            int latent_width, int num_audio_latents,
                            int patch_h, int patch_w, int audio_channels,
                            const std::vector<Anchor>& keyframe_anchors,
-                           PackedLayout* out);
+                           PackedLayout* out,
+                           const std::vector<Guide>& guides = {});
+
+// The buffers' row order, in one place. Every video row of the packed
+// sequence -- a keyframe anchor's, a guide's, a reference's, a generated
+// frame's -- is one (1, patch_h, patch_w) cell of every latent channel,
+// [z, patch_h, patch_w] flattened, and a frame's cells run row-major;
+// every audio run is channel-major, stereo channel s's latent i at row
+// s * latents + i. generate-video packs its conditioning and reads its
+// output through these, so a conditioning row cannot be laid out
+// differently from the generated row it stands over.
+//
+// Frames [first, first + count) of an f32 [z, total_frames, lh, lw]
+// latent into `rows`: count * (lh / patch_h) * (lw / patch_w) rows.
+void patchify_latent_frames(const float* latent, int z, int total_frames,
+                            int first, int count, int lh, int lw,
+                            int patch_h, int patch_w, float* rows);
+
+// The inverse: `n_rows` rows back to an f32 [z, frames, lh, lw] grid
+// (`out` resized; rows past `frames` frames are not read).
+void unpatchify_latent_rows(const float* rows, int n_rows, int z,
+                            int frames, int lh, int lw, int patch_h,
+                            int patch_w, std::vector<float>* out);
+
+// The first `latents` columns of an f32 [2, channels, stride] audio
+// latent -- generate-video's audio_latent oport -- into 2 * latents rows
+// of `channels`; and back, rows into [2, channels, latents].
+void pack_audio_latent_rows(const float* audio, int channels, int stride,
+                            int latents, float* rows);
+void unpack_audio_latent_rows(const float* rows, int channels, int latents,
+                              std::vector<float>* out);
 
 // Build the `[text | reference blocks | target audio | target video]`
 // layout of the `ref2va` task.
@@ -254,9 +317,9 @@ bool build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
 // per-row into it, which is exactly what the AdaLN table indexes with.
 //
 // `condition_audio_timestep` is the level a `ref2va` REFERENCE
-// soundtrack sits at -- it is conditioning the model reads rather than
-// a stream it denoises, so it never moves. It is unused by `t2va` /
-// `fl2va`, which have no reference audio rows at all.
+// soundtrack -- or an `fl2va` guide's audio -- sits at: conditioning
+// the model reads rather than a stream it denoises, so it never moves.
+// Unused by a layout with no conditioning audio rows.
 void build_row_timesteps(const PackedLayout& layout, float video_timestep,
                          float audio_timestep, float condition_video_timestep,
                          std::vector<float>* timesteps_out,

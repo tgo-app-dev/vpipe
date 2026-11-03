@@ -32,6 +32,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -2342,6 +2343,18 @@ MetalMiniMaxH3Transformer::lora_stack_(bool refiner, int layer,
   return st;
 }
 
+bool
+MetalMiniMaxH3Transformer::lora_resident_(
+    int layer, LoraFactors BlockLora::* which) const
+{
+  for (const LoraSlot& sl : _lora) {
+    if (layer < 0 || (std::size_t)layer >= sl.blocks.size()) { continue; }
+    const LoraFactors& f = sl.blocks[(std::size_t)layer].*which;
+    if (f.empty() && f.rank > 0) { return false; }
+  }
+  return true;
+}
+
 // ---- adapter factors streamed with their block (see the header) ------
 
 MetalMiniMaxH3Transformer::SpillFile::~SpillFile()
@@ -4541,8 +4554,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
       return nullptr;
     }
     // ComfyUI's int8 too (a community checkpoint saved by ComfyUI): every
-    // widening here carries its rotation (Linear::f8_rot), and the ANE's
-    // staging, which cannot, leaves those projections to the GPU.
+    // widening here carries its rotation (Linear::f8_rot), and so does
+    // the ANE's staging (AneFfnSource::kInt8 / kW4A8).
     std::string ferr;
     if (!fp8::scan(src, &m->_f8, &ferr, /*int8=*/true)) {
       if (sess != nullptr) {
@@ -7904,7 +7917,8 @@ std::size_t
 MetalMiniMaxH3Transformer::vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
                                              int grid_h, int grid_w,
                                              int n_text,
-                                             std::size_t* arena_floor) const
+                                             std::size_t* arena_floor,
+                                             int radius) const
 {
   if (arena_floor != nullptr) { *arena_floor = 0; }
   if (!_vdn || grid_h <= 0 || grid_w <= 0) { return 0; }
@@ -7926,7 +7940,7 @@ MetalMiniMaxH3Transformer::vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
   // Asked BEFORE ensure_vdn_ has run, though, so the cover has to be
   // recomputed rather than read off _vdn_full_cover.
   const std::vector<minimax_h3::vdn::Bound> bounds =
-      minimax_h3::vdn::window_bounds(g.frames, _vdn_cfg.radius,
+      minimax_h3::vdn::window_bounds(g.frames, vdn_radius_of(radius),
                                      _vdn_cfg.chunk);
   bool covers = true;
   for (const minimax_h3::vdn::Bound& b : bounds) {
@@ -7965,19 +7979,22 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
     return fail("the video grid does not divide the video rows");
   }
   const int frames = L.num_video_rows / tpf;
+  // This forward's reach: its step's own, else the request's.
+  const int radius = vdn_radius_of(in);
 
   // THE WINDOW FIRST, because whether the linear half runs at all
   // decides whether its buffers are worth allocating -- and at
   // production geometry they are gigabytes.
   if (_vdn_frames != frames || _vdn_tpf != tpf
-      || _vdn_vstart != L.video_start || _vdn_seq != L.seq_len) {
+      || _vdn_vstart != L.video_start || _vdn_seq != L.seq_len
+      || _vdn_built_radius != radius) {
     minimax_h3::vdn::WindowMask mask;
     mask.seq_len          = L.seq_len;
     mask.video_start      = L.video_start;
     mask.num_frames       = frames;
     mask.tokens_per_frame = tpf;
     mask.anchors          = _vdn_cfg.anchors;
-    mask.bounds = minimax_h3::vdn::window_bounds(frames, _vdn_cfg.radius,
+    mask.bounds = minimax_h3::vdn::window_bounds(frames, radius,
                                                  _vdn_cfg.chunk);
     const minimax_h3::vdn::WindowSpans sp =
         minimax_h3::vdn::build_window_spans(mask);
@@ -8008,6 +8025,11 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
     _vdn_tpf    = tpf;
     _vdn_vstart = L.video_start;
     _vdn_seq    = L.seq_len;
+    _vdn_built_radius = radius;
+    // The block list and the kernel's bounds below are this window's
+    // too: a radius changed at the same geometry leaves their tag as it
+    // was, and they would walk the old window.
+    _vdn_bspan_seq = -1;
   }
   if (_vdn_full_cover) { return true; }
 
@@ -8216,6 +8238,62 @@ MetalMiniMaxH3Transformer::ane_setup_(int seq)
 }
 
 bool
+MetalMiniMaxH3Transformer::ane_stageable_(const Linear& l)
+{
+  // The module has no bias: a projection carrying one keeps the GPU.
+  if (l.empty() || !l.b.empty()) { return false; }
+  // ComfyUI's int8 (ConvRot or not) and W4A8: staged as the bf16 values
+  // the GPU's widening holds (AneFfnSource::kInt8 / kW4A8). Per-row or
+  // per-tensor f32 scales; a rotation a power of four dividing the row.
+  if (l.f8 == fp8::Format::kI8 || l.f8 == fp8::Format::kW4A8) {
+    if (l.f8_scale.empty() ||
+        (l.f8_rot != 0 && !fp8::convrot_group_ok(l.f8_rot))) {
+      return false;
+    }
+    return l.f8 == fp8::Format::kI8 ||
+           (l.f8_qgroup > 0 && !l.f8_srel.empty());
+  }
+  // Dense bf16, FP8, or 4/8-bit affine with all three parts.
+  if (!l.quantized) { return true; }
+  return (l.bits == 4 || l.bits == 8) && !l.scales.empty() &&
+         !l.qbias.empty();
+}
+
+AneFfnSource
+MetalMiniMaxH3Transformer::ane_source_(const Linear& l)
+{
+  AneFfnSource s;
+  s.w         = &l.w;
+  s.codes     = &l.codes;
+  s.scales    = &l.scales;
+  s.qbias     = &l.qbias;
+  s.quantized = l.quantized;
+  s.bits      = l.bits;
+  if (l.f8 == fp8::Format::kI8 || l.f8 == fp8::Format::kW4A8) {
+    // The codes (one a byte, or two nibbles a byte), the f32 row scale,
+    // the rotation; W4A8's relative scales and codebook beside them.
+    s.w      = &l.codes;
+    s.bits   = l.f8 == fp8::Format::kI8 ? AneFfnSource::kInt8
+                                        : AneFfnSource::kW4A8;
+    s.scales = &l.f8_scale;
+    s.rot    = l.f8_rot;
+    if (l.f8 == fp8::Format::kW4A8) {
+      s.srel     = &l.f8_srel;
+      s.codebook = l.f8_cb.empty() ? nullptr : &l.f8_cb;
+      s.qgroup   = l.f8_qgroup;
+    }
+  } else if (l.is_fp8()) {
+    // FP8: the codes, one per element, and the f32 scale in `scales`,
+    // which a dense source has no other use for (shared/ane-ffn.h).
+    s.w      = &l.codes;
+    s.bits   = l.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
+                                          : AneFfnSource::kFp8E4M3;
+    s.scales = l.f8_scale.empty() ? nullptr : &l.f8_scale;
+  }
+  return s;
+}
+
+bool
 MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
 {
   if (_ane == nullptr) { return false; }
@@ -8223,23 +8301,11 @@ MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
                       ? std::min(_cfg.ane_layers, _cfg.n_layers)
                       : _cfg.n_layers;
   if (L >= cap) { return false; }
-  // The module has no bias: a projection carrying one keeps the GPU. Dense
-  // bf16 or 4/8-bit affine with all three parts. An adapter is merged into
-  // the staged rows, which needs its rows in fc1's own order -- true of the
-  // [gate; up] halves, not of the interleaved pairs.
-  // ComfyUI's int8 is not a source the staging reads (AneFfnSource takes
-  // FP8 codes, and a ConvRot weight is no elementwise code at all).
-  auto stageable = [](const Linear& l) {
-    if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8 ||
-        l.f8 == fp8::Format::kW4A8) {
-      return false;
-    }
-    if (!l.quantized) { return true; }
-    return (l.bits == 4 || l.bits == 8) && !l.scales.empty() &&
-           !l.qbias.empty();
-  };
-  const bool ok = !(adapted && b.fc1.gu_inter) && stageable(b.fc1) &&
-                  stageable(b.fc2);
+  // An adapter is merged into the staged rows, which needs its rows in
+  // fc1's own order -- true of the [gate; up] halves, not of the
+  // interleaved pairs.
+  const bool ok = !(adapted && b.fc1.gu_inter) && ane_stageable_(b.fc1) &&
+                  ane_stageable_(b.fc2);
   if (!ok && !_ane_skip_warned && _mc->session() != nullptr) {
     _ane_skip_warned = true;
     _mc->session()->warn(fmt(
@@ -8247,11 +8313,8 @@ MetalMiniMaxH3Transformer::ane_eligible_(int L, const Block& b, bool adapted)
         "feed-forward", L,
         adapted && b.fc1.gu_inter
             ? "has an adapter on an interleaved fc1"
-        : b.fc1.f8 == fp8::Format::kI8 || b.fc2.f8 == fp8::Format::kI8 ||
-                  b.fc1.f8 == fp8::Format::kW4A8 ||
-                  b.fc2.f8 == fp8::Format::kW4A8
-            ? "stores its feed-forward as int8 / W4A8"
-            : "has no bias-free fp16 or 4/8-bit affine feed-forward"));
+            : "has no bias-free feed-forward the ANE can stage (bf16, "
+              "FP8, int8, W4A8 or 4/8-bit affine)"));
   }
   return ok;
 }
@@ -8263,21 +8326,7 @@ MetalMiniMaxH3Transformer::ane_stage_(int L, const Block& b,
 {
   auto view = [](const Linear& l, std::size_t stride, std::size_t offset,
                  const LoraStack& st) {
-    AneFfnSource s;
-    s.w         = &l.w;
-    s.codes     = &l.codes;
-    s.scales    = &l.scales;
-    s.qbias     = &l.qbias;
-    s.quantized = l.quantized;
-    s.bits      = l.bits;
-    // FP8: the codes, one per element, and the f32 scale in `scales`,
-    // which a dense source has no other use for (shared/ane-ffn.h).
-    if (l.is_fp8()) {
-      s.w         = &l.codes;
-      s.bits      = l.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
-                                               : AneFfnSource::kFp8E4M3;
-      s.scales    = l.f8_scale.empty() ? nullptr : &l.f8_scale;
-    }
+    AneFfnSource s = ane_source_(l);
     s.stride    = stride;
     s.offset    = offset;
     // B is [out rows, rank] in the weight's own row order, so the source
@@ -8335,34 +8384,14 @@ MetalMiniMaxH3Transformer::ane_qkv_eligible_(int L, const Block& b)
                       ? std::min(_cfg.ane_layers, _cfg.n_layers)
                       : _cfg.n_layers;
   if (L >= cap) { return false; }
-  const Linear& l = b.qkv;
-  // int8 keeps the GPU, as in ane_eligible_.
-  if (l.empty() || !l.b.empty() || l.f8 == fp8::Format::kI8 ||
-      l.f8 == fp8::Format::kW4A8) {
-    return false;
-  }
-  if (!l.quantized) { return true; }
-  return (l.bits == 4 || l.bits == 8) && !l.scales.empty() &&
-         !l.qbias.empty();
+  return ane_stageable_(b.qkv);
 }
 
 void
 MetalMiniMaxH3Transformer::ane_qkv_stage_(int L, const Block& b,
                                           const LoraStack& lora)
 {
-  AneFfnSource s;
-  s.w         = &b.qkv.w;
-  s.codes     = &b.qkv.codes;
-  s.scales    = &b.qkv.scales;
-  s.qbias     = &b.qkv.qbias;
-  s.quantized = b.qkv.quantized;
-  s.bits      = b.qkv.bits;
-  if (b.qkv.is_fp8()) {
-    s.w      = &b.qkv.codes;
-    s.bits   = b.qkv.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
-                                              : AneFfnSource::kFp8E4M3;
-    s.scales = b.qkv.f8_scale.empty() ? nullptr : &b.qkv.f8_scale;
-  }
+  AneFfnSource s = ane_source_(b.qkv);
   // The qkv adapter's B rows were permuted to the projection's own head
   // grouping at bind, so they map 1:1 (the Delta defaults).
   for (int i = 0; i < lora.n && s.deltas < AneFfnSource::kMaxDeltas; ++i) {
@@ -8390,6 +8419,21 @@ MetalMiniMaxH3Transformer::ane_runtime_bytes(const Config& c, int seq) noexcept
   if (c.ane_qkv || std::getenv("VPIPE_H3_ANE_QKV") != nullptr) {
     n += AneFeedForward::matmul_runtime_bytes(c.hidden, 3 * c.inner(), seq,
                                               ane_chunk_rows());
+  }
+  return n;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::ane_held_bytes() const noexcept
+{
+  std::size_t n = 0;
+  if (_ane != nullptr) {
+    n += AneFeedForward::runtime_bytes(_cfg.hidden, _cfg.ffn, 0,
+                                       _ane->chunk());
+  }
+  if (_ane_qkv != nullptr) {
+    n += AneFeedForward::matmul_runtime_bytes(_cfg.hidden, 3 * _cfg.inner(),
+                                              0, _ane_qkv->chunk());
   }
   return n;
 }
@@ -8551,10 +8595,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // the arena has to be sized for it -- and HERE is the only place that
   // can still happen, since the next line allocates it. Zero with no
   // branch, with no video grid, and when the window covers the clip and
-  // the linear half does not run.
+  // the linear half does not run. At THIS forward's reach: a step's own
+  // (vdn_range_steps) decides the cover, and the request's would leave a
+  // step that turns the linear half on with no floor at all.
   std::size_t vdn_arena = 0;
   (void)vdn_scratch_bytes(L, in.video_grid_h, in.video_grid_w, n_text,
-                          &vdn_arena);
+                          &vdn_arena, in.vdn_radius);
+  _vdn_arena_asked = vdn_arena;
   // A LONG SEQUENCE'S MAIN BLOCKS RUN IN ROW BANDS (band_rows): every
   // row's residual and q / k / v held, one band of the rest. Decided here,
   // with the layout: a path that needs the whole sequence's buffers keeps
@@ -9394,6 +9441,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   double sp_read_ms = 0, sp_gpu_ms = 0;
   std::size_t sp_read_bytes = 0;
   int sp_blocks = 0;
+  // The host's share of a streamed block, which the GPU waits out: the
+  // block's encode (adapter factors read back included, `fill` apart),
+  // and a promotion's copy out of the slot, keep pass, adapter factors
+  // and wiring.
+  double sp_enc_ms = 0, sp_fill_ms = 0;
+  double sp_clone_ms = 0, sp_keep_ms = 0, sp_klora_ms = 0, sp_wire_ms = 0;
+  int sp_promoted = 0;
+  auto sp_ms = [](std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+  };
   const double sp_alloc0 = sprof && _ws ? _ws->stats().streamed_alloc_ms : 0.0;
   const double sp_fetch0 = sprof && _ws ? _ws->stats().streamed_fetch_ms : 0.0;
   const auto t_begin = std::chrono::steady_clock::now();
@@ -9924,6 +9982,39 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         (_cfg.ane_qkv ||
          (!_ane_disabled && std::getenv("VPIPE_H3_ANE_QKV") != nullptr)) &&
         ane_qkv_setup_(seq);
+    // Nothing staged by an earlier forward is taken for this one's: an
+    // adapter's strength may have moved between the two.
+    if (ane_on) { _ane->forget_staged(); }
+    if (qkv_on) { _ane_qkv->forget_staged(); }
+    // THE QKV TIER STAGES A BLOCK AHEAD. Its weights are needed before
+    // the block's attention, so staged at the block's start they had
+    // little GPU work to hide under: on the ANE worker's 4 threads the
+    // CPU converted while the GPU idled -- MEASURED on the M4 Pro at 9.4k
+    // rows, 16 ms a block for bf16 and 61-69 with lightx2v's Turbo LoRA
+    // folded in. Block L+1's are staged instead as soon as block L's qkv
+    // split is done with the slots, under L's attention and feed-forward.
+    // (Staging on every core, as it now does, already hides most of it
+    // behind the previous block's tail there; the slower CPU of a base M4
+    // is where this matters.) A RESIDENT next block only: a streamed one
+    // is not read yet, and an adapter whose factors stream with their
+    // block (spilled) is not either -- staged without them, the ANE's rows
+    // would silently lose the adapter. VPIPE_H3_ANE_NO_AHEAD=1 is the
+    // A/B.
+    const bool ahead_on =
+        qkv_on && std::getenv("VPIPE_H3_ANE_NO_AHEAD") == nullptr;
+    auto qkv_stage_ahead = [&](int nx) {
+      if (!ahead_on || nx < 0 || nx >= c.n_layers ||
+          (std::size_t)nx >= _blocks.size() ||
+          _ane_qkv->queued(nx) || !_ane_qkv->may_split_next()) {
+        return;
+      }
+      const Block& nb = _blocks[(std::size_t)nx];
+      if (nb.qkv.empty() || !ane_qkv_eligible_(nx, nb) ||
+          !lora_resident_(nx, &BlockLora::qkv)) {
+        return;
+      }
+      ane_qkv_stage_(nx, nb, lora_stack_(false, nx, &BlockLora::qkv));
+    };
     std::function<void()> ane_on_commit;
     // The GPU's feed-forward over rows [r0, r0 + n) of s.nm, IN PLACE: its
     // share of a split, a band of the banded block (from row 0 of its
@@ -10041,7 +10132,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         mark = std::chrono::steady_clock::now();
       }
       if (qkv_block) {
-        ane_qkv_stage_(lora_layer, b, lo_qkv);
+        // Unless it was staged a block ahead (qkv_stage_ahead).
+        if (!_ane_qkv->queued(lora_layer)) {
+          ane_qkv_stage_(lora_layer, b, lo_qkv);
+        }
       } else if (ane_block) {
         ane_stage_(lora_layer, b, lo_fc1, lo_fc2);
       }
@@ -10056,64 +10150,95 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       psplit(t_elt);
       // ---- the qkv split: the ANE's rows of s.nm into the tail of s.qkv,
       // the GPU's head rows beside them, joined before anything reads it.
-      int q_rows = 0;
-      double q_drain_ms = 0.0;
-      if (qkv_block || qkv_probe) {
+      //
+      // THE GPU'S ROWS ARE COMMITTED FIRST: the normed input alone (the
+      // ANE's input once it lands), the GPU's head rows straight behind it,
+      // and only then is the staging joined and the ANE started -- the
+      // rows begin() takes are known beforehand (planned_rows), so the GPU
+      // never waits on the CPU. A block staged ahead (qkv_stage_ahead)
+      // costs nothing either way; one staged at its own start -- a
+      // streamed block, which is not read until its turn -- had the GPU
+      // idle for the whole conversion, which now runs under its rows.
+      if (qkv_block) {
+        const int planned = _ane_qkv->planned_rows(rows);
+        const int g_end = rows - planned;    // the GPU's rows: [0, g_end)
         const auto t_q0 = std::chrono::steady_clock::now();
         enc.end();
         _flops.flush(stream);
         metal_compute::CommandStream::Fence qfence = stream.commit();
-        const bool staged = qkv_block && _ane_qkv->join_stage(lora_layer);
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
+        enc = stream.begin_compute();
+        gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, g_end, 3 * I, H, &lo_qkv);
+        enc.end();
+        _flops.flush(stream);
+        metal_compute::CommandStream::Fence gfence = stream.commit();
+        const bool staged = _ane_qkv->join_stage(lora_layer);
         qfence.wait();
-        q_drain_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_q0).count();
+        int q_rows = 0;
         if (staged) {
           q_rows = _ane_qkv->begin(s.nm, s.qkv, rows);
-        } else if (qkv_block && _mc->session() != nullptr) {
+        } else if (_mc->session() != nullptr) {
           _mc->session()->warn(fmt(
               "minimax-h3: staging block {}'s qkv for the ANE failed; it "
               "keeps the GPU", lora_layer));
         }
-        // The same stream: a fresh one is a new queue, and its first
-        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-        // stream_per_commit_costs).
+        gfence.wait();
+        // The section so far, and the GPU's own time for its rows (its
+        // buffer's execution window): the balancer's rate is the latter,
+        // the on/off measurement the whole section (see finish()).
+        const double sect = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_q0).count();
+        double g_ms = gfence.gpu_times().gpu_s * 1000.0;
+        if (!(g_ms > 0.0) || g_ms > sect) { g_ms = sect; }
+        int q_lost = -1;
+        if (q_rows > 0 &&
+            !_ane_qkv->finish(lora_layer, rows, g_ms, sect - g_ms)) {
+          q_lost = _ane_qkv->lost_row0();
+        }
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
-      }
-      const auto t_qg0 = std::chrono::steady_clock::now();
-      gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows - q_rows, 3 * I, H,
-            &lo_qkv);
-      if (q_rows > 0 || qkv_probe) {
+        // THE GPU FALLBACK: `s.nm` is only the tier's input, so what the
+        // ANE did not write -- rows it lost, or the planned ones it never
+        // took -- is projected from it before anything reads s.qkv.
+        auto qkv_gpu = [&](int r0, int r1) {
+          if (r1 <= r0) { return; }
+          gemm_(enc, s.nm, (std::size_t)r0 * H, b.qkv, s.qkv,
+                (std::size_t)r0 * 3 * I, r1 - r0, 3 * I, H, &lo_qkv);
+        };
+        qkv_gpu(g_end, rows - q_rows);
+        if (q_lost >= 0) { qkv_gpu(std::max(q_lost, rows - q_rows), rows); }
+      } else if (qkv_probe) {
+        // The GPU over every row, drained, for the on/off measurement.
+        const auto t_q0 = std::chrono::steady_clock::now();
         enc.end();
         _flops.flush(stream);
         stream.commit().wait();
-        const double qg_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_qg0).count();
-        int q_lost = -1;
-        if (q_rows > 0) {
-          if (!_ane_qkv->finish(lora_layer, rows, qg_ms, q_drain_ms)) {
-            q_lost = _ane_qkv->lost_row0();
-          }
-        } else {
-          _ane_qkv->note_probe(q_drain_ms, qg_ms);
-        }
-        // The same stream: a fresh one is a new queue, and its first
-        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-        // stream_per_commit_costs).
+        const double q_drain_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_q0).count();
+        enc = stream.begin_compute();
+        const auto t_qg0 = std::chrono::steady_clock::now();
+        gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows, 3 * I, H, &lo_qkv);
+        enc.end();
+        _flops.flush(stream);
+        stream.commit().wait();
+        _ane_qkv->note_probe(q_drain_ms,
+                             std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_qg0)
+                                 .count());
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
-        // THE GPU FALLBACK: `s.nm` is only the tier's input, so the rows it
-        // lost are projected again from it before anything reads s.qkv.
-        if (q_lost >= 0 && q_lost < rows) {
-          const std::size_t r0 = (std::size_t)q_lost;
-          gemm_(enc, s.nm, r0 * H, b.qkv, s.qkv, r0 * 3 * I, rows - q_lost,
-                3 * I, H, &lo_qkv);
-        }
+      } else {
+        gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, rows, 3 * I, H, &lo_qkv);
       }
       // The FF's staging, deferred from the block start when qkv split.
       if (qkv_block && ane_block) {
         ane_stage_(lora_layer, b, lo_fc1, lo_fc2);
       }
+      // The qkv slots are free again (this block's split has finished, or
+      // never ran): the next block's qkv, under this block's attention.
+      if (modulated) { qkv_stage_ahead(lora_layer + 1); }
       bdump("qkv", s.qkv, 3 * I);
       trip(trip_blk, 2, s.qkv, (std::size_t)rows * 3 * I);
       psplit(t_qkv);
@@ -10300,76 +10425,91 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // The ANE starts once s.nm is readable and BEFORE the GPU's half is
       // encoded, so it hides behind that whole half -- MEASURED on Krea-2,
       // encoding the GPU's gate/up first left only 48-62% of it hidden.
-      int a_rows = 0;
-      double ane_drain_ms = 0.0;
-      if (ane_block || ane_probe) {
+      //
+      // AND THE GPU'S HALF IS COMMITTED BEFORE ANYTHING WAITS, as the qkv
+      // split's is -- in a buffer of its OWN behind the attention's, so the
+      // ANE still starts the moment the attention's retires (the Krea-2
+      // loss above had the half in the attention's buffer, holding the ANE
+      // back by all of it). A staging job running late, or begin()'s
+      // dispatch and the encode behind it, no longer hold the GPU's rows
+      // back.
+      // The block feed-forward over rows [r0, r0 + n) (ff_gpu).
+      auto gpu_ff = [&](int r0, int n) {
+        ff_gpu(b, lo_fc1, lo_fc2, r0, n);
+      };
+      if (ane_block) {
+        const int planned = _ane->planned_rows(rows);
+        const int g_end = rows - planned;    // the GPU's rows: [0, g_end)
         const auto t_d0 = std::chrono::steady_clock::now();
         enc.end();
         _flops.flush(stream);
         metal_compute::CommandStream::Fence afence = stream.commit();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
+        enc = stream.begin_compute();
+        gpu_ff(0, g_end);
+        enc.end();
+        _flops.flush(stream);
+        metal_compute::CommandStream::Fence gfence = stream.commit();
         // A streamed block issues its successor's read here, under this
         // block's attention and both halves of its feed-forward -- at the
         // block's end it would hide behind little more than the gated add.
         // Safe for the reason that one is: it lands in the OTHER slot.
         if (ane_on_commit) { ane_on_commit(); }
-        const bool staged = ane_block && _ane->join_stage(lora_layer);
+        const bool staged = _ane->join_stage(lora_layer);
         afence.wait();
-        ane_drain_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_d0).count();
+        int a_rows = 0;
         if (staged) {
           a_rows = _ane->begin(s.nm, s.nm, rows);
-        } else if (ane_block && _mc->session() != nullptr) {
+        } else if (_mc->session() != nullptr) {
           _mc->session()->warn(fmt(
               "minimax-h3: staging block {}'s weights for the ANE failed; "
               "it keeps the GPU feed-forward", lora_layer));
         }
-        // The same stream: a fresh one is a new queue, and its first
-        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-        // stream_per_commit_costs).
+        gfence.wait();
+        // As the qkv split's: the GPU's own time for its rows is the
+        // balancer's rate, the section so far the on/off measurement.
+        const double sect = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_d0).count();
+        double g_ms = gfence.gpu_times().gpu_s * 1000.0;
+        if (!(g_ms > 0.0) || g_ms > sect) { g_ms = sect; }
+        const bool ane_ok =
+            a_rows <= 0 || _ane->finish(lora_layer, rows, g_ms, sect - g_ms);
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
-      }
-      // The block feed-forward over rows [r0, r0 + n) (ff_gpu).
-      auto gpu_ff = [&](int r0, int n) {
-        ff_gpu(b, lo_fc1, lo_fc2, r0, n);
-      };
-      // The ANE always leaves the GPU at least one row.
-      const int g_rows = rows - a_rows;
-      const auto t_g0 = std::chrono::steady_clock::now();
-      gpu_ff(0, g_rows);
-      if (a_rows > 0) {
-        // The GPU's half, drained, then the ANE joined behind it.
+        // THE GPU FALLBACK, in place: the planned rows the ANE never took,
+        // and the rows it lost -- which still hold their input, because
+        // the ANE writes a chunk back only once all of it came out finite.
+        gpu_ff(g_end, planned - a_rows);
+        const int lost = ane_ok ? -1 : _ane->lost_row0();
+        if (lost >= 0 && lost < rows) {
+          const int r0 = std::max(lost, rows - a_rows);
+          gpu_ff(r0, rows - r0);
+        }
+      } else if (ane_probe) {
+        const auto t_d0 = std::chrono::steady_clock::now();
         enc.end();
         _flops.flush(stream);
-        stream.commit().wait();
-        const double t_gpu =
-            _ane->timing()
-                ? std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - t_g0).count()
-                : 0.0;
-        const bool ane_ok =
-            _ane->finish(lora_layer, rows, t_gpu, ane_drain_ms);
-        // The same stream: a fresh one is a new queue, and its first
-        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-        // stream_per_commit_costs).
+        metal_compute::CommandStream::Fence afence = stream.commit();
+        if (ane_on_commit) { ane_on_commit(); }
+        afence.wait();
+        const double ane_drain_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_d0).count();
         enc = stream.begin_compute();
-        mark = std::chrono::steady_clock::now();
-        // THE GPU FALLBACK, in place over the rows the ANE lost.
-        const int lost = ane_ok ? -1 : _ane->lost_row0();
-        if (lost >= 0 && lost < rows) { gpu_ff(lost, rows - lost); }
-      } else if (ane_probe) {
         // The GPU over every row, drained, for the on/off measurement.
+        const auto t_g0 = std::chrono::steady_clock::now();
+        gpu_ff(0, rows);
         enc.end();
         _flops.flush(stream);
         stream.commit().wait();
         _ane->note_probe(ane_drain_ms,
                          std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - t_g0).count());
-        // The same stream: a fresh one is a new queue, and its first
-        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-        // stream_per_commit_costs).
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
+      } else {
+        gpu_ff(0, rows);
       }
       bdump("fc2", s.nm, H);
       trip(trip_blk, 8, s.nm, (std::size_t)rows * H);
@@ -10601,6 +10741,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
     };
 
+    // Block 0's qkv, under the embeddings, the refiner and the modulation
+    // encoded below (qkv_stage_ahead).
+    qkv_stage_ahead(0);
+
     // ---- 1. project each modality into the packed sequence -----------
     // Every modality's rows are CONTIGUOUS in the FL2VA layout, so the
     // reference's three index_copy scatters are plain destination
@@ -10696,6 +10840,139 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       return -1;
     };
 
+    // PROMOTION UNDER THE NEXT BLOCK. A block residency keeps is copied
+    // out of its slot, kept and wired: ~60 ms of host work a 735 MB block
+    // on the M5 Ultra (copy 39, mlock 21), which sat between the block's
+    // wait and the next block's encode with the GPU idle -- 3.1 s of a
+    // first forward, a fifth of it at 1344x768. Now the next block is
+    // encoded and committed FIRST and the promotion runs under its GPU
+    // work. Two orders hold it together. The COPY empties the slot, and
+    // the next block's read wants that slot back -- so the block moves
+    // into a SPARE at the wait (_slot_spare; the slot takes the spare's
+    // buffers) and is copied from there beside the read. Without a spare
+    // (the box will not take one more block, or VPIPE_H3_NO_PROMOTE_SPARE)
+    // the copy runs out of the slot before anything refills it: the read
+    // issue_prefetch starts (from the block's end or the ANE split), a
+    // synchronous refill, a slot rebuild or teardown -- and at 640x352 x
+    // 124 that put the copy in front of every read (43 ms of a 131 ms
+    // block). And the adapter factors are kept AT THE WAIT, while the
+    // streamed set still holds this block's: the next block's fill_lora_
+    // overwrites it, and keep_lora_ after that would keep nothing,
+    // silently -- the block kept without its adapter.
+    // VPIPE_H3_PROMOTE_INLINE=1 promotes in line (the A/B).
+    struct PendingKeep {
+      int layer = -1;
+      Block* src = nullptr;   // the spare, or the block's slot
+      std::size_t nb = 0;     // booked: the kept block + its factors
+      std::size_t nl = 0;     // of which the factors
+      bool copied = false;
+    } pk;
+    const bool pk_on = std::getenv("VPIPE_H3_PROMOTE_INLINE") == nullptr;
+    const bool pk_spare =
+        std::getenv("VPIPE_H3_NO_PROMOTE_SPARE") == nullptr;
+    int pk_deferred = 0, pk_spared = 0;
+    // An early return (stop, a GPU error) leaves no half promotion: the
+    // block is not kept, its factors go back, nothing was booked.
+    struct PendingUndo {
+      MetalMiniMaxH3Transformer* m;
+      PendingKeep* p;
+      ~PendingUndo()
+      {
+        m->_slot_spare = Block{};
+        if (p->layer < 0) { return; }
+        if (p->copied) { m->_blocks[(std::size_t)p->layer] = Block{}; }
+        m->drop_lora_(p->layer);
+      }
+    } pk_undo{this, &pk};
+    // The rest of a promotion once the block is in _blocks: the keep
+    // pass, the fc1 weave, its adapters' factors (unless kept at the
+    // wait), the wiring, the booking.
+    auto keep_rest = [&](int L, std::size_t nb, std::size_t nl,
+                         bool lora_kept) {
+      Block& kb = _blocks[(std::size_t)L];
+      auto tp = std::chrono::steady_clock::now();
+      // What a preloaded block holds, cloned or MOVED: the move brings
+      // the fallback's refill sources and per-call pack. A held layout
+      // that cannot be built leaves the pack converting per projection,
+      // which is still the same values.
+      (void)keep_block_(kb);
+      // Now that it is KEPT, the fc1 interleave is paid once instead of
+      // per forward, so every later step takes the fused FF for this
+      // block. The scratch stays wide (it was sized for a streaming run
+      // and blocks below this one may still be unfused), so the two
+      // paths coexist.
+      if (_fuse_ff) { interleave_gu_(kb.fc1); }
+      if (sprof) {
+        sp_keep_ms += sp_ms(tp);
+        tp = std::chrono::steady_clock::now();
+      }
+      // Its adapters' factors stay with it.
+      if (!lora_kept) { keep_lora_(L); }
+      if (sprof) {
+        sp_klora_ms += sp_ms(tp);
+        tp = std::chrono::steady_clock::now();
+      }
+      // Wired LAST, after every write this block will ever get: mlock
+      // pins the pages that exist now, and interleave_gu_ above replaces
+      // buffers outright.
+      if (_wire.on()) {
+        _wire.note_wired(_mc, wire_block_(kb, true) + wire_lora_(L, true),
+                         nb);
+      }
+      if (sprof) {
+        sp_wire_ms += sp_ms(tp);
+        ++sp_promoted;
+      }
+      _resid.note_admitted(nb);
+      _lora_kept += nl;
+      if (_mc->session() != nullptr) {
+        const auto mb = _mc->memory_budget();
+        _mc->session()->log_debug(fmt(
+            "MetalMiniMaxH3Transformer: block {} resident ({} of {}, {} MB, "
+            "{} MB wired; {} MB idle, {} MB compressed, {} MB swap, "
+            "reserve {} MB)", L, _resid.count(), c.n_layers,
+            _resid.bytes() >> 20, _wire.wired_bytes() >> 20,
+            mb.free_physical >> 20, mb.compressed >> 20,
+            mb.swap_used >> 20, _resid.reserve() >> 20));
+      }
+    };
+    // The pending block out of its slot. A failed copy is simply not a
+    // promotion: the forward has already run the block, the next step
+    // streams it again, and its factors go back.
+    auto pk_copy = [&]() {
+      if (pk.layer < 0 || pk.copied) { return; }
+      // A test's hook: hold the copy back, so a read issued into the
+      // slot before it would land under it.
+      if (const char* d = std::getenv("VPIPE_H3_TEST_PROMOTE_DELAY_MS")) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            std::atoi(d)));
+      }
+      const auto tp = std::chrono::steady_clock::now();
+      Block& kb = _blocks[(std::size_t)pk.layer];
+      if (clone_block_(*pk.src, kb, true)) {
+        pk.copied = true;
+      } else {
+        kb = Block{};
+        drop_lora_(pk.layer);
+        pk = PendingKeep{};
+      }
+      if (sprof) { sp_clone_ms += sp_ms(tp); }
+    };
+    // Before a slot is refilled, rebuilt or freed: the pending block out
+    // of it, if it is still there rather than in the spare.
+    auto pk_free_slot = [&]() {
+      if (pk.layer >= 0 && pk.src != &_slot_spare) { pk_copy(); }
+    };
+    // True when a promotion was pending and is now done.
+    auto pk_finish = [&]() {
+      pk_copy();
+      if (pk.layer < 0) { return false; }
+      const PendingKeep p = pk;
+      pk = PendingKeep{};
+      keep_rest(p.layer, p.nb, p.nl, /*lora_kept=*/true);
+      return true;
+    };
+
     // ---- 3. the block stack ------------------------------------------
     // A streaming attention whose cache is ON DISK reads block L's rows
     // while the GPU runs block L - 1, so every block -- resident ones too
@@ -10738,16 +11015,25 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       const bool held = Lx < (int)_blocks.size() &&
                         !_blocks[(std::size_t)Lx].qkv.empty();
       const bool streaming = _stream_blocks && !held;
+      // A held block commits nothing of its own to hide a promotion
+      // under, so the one pending is finished now, as it was before.
+      if (!streaming && !kv_io) { pk_finish(); }
       // The per-block allocation, used only when the slots cannot serve
       // this checkpoint. Empty in the ordinary case.
       Block streamed;
       // Declared after `streamed`, so it destroys FIRST: a block that exits
       // between staging its weights for the ANE and the split that joins
       // them must not free what the staging job is still reading.
+      // Both tiers: each stages on its own queue.
       struct AneJoin {
         AneFeedForward* a;
-        ~AneJoin() { if (a != nullptr) { a->join(); } }
-      } ane_join{_ane != nullptr ? _ane.get() : _ane_qkv.get()};
+        AneFeedForward* q;
+        ~AneJoin()
+        {
+          if (a != nullptr) { a->join(); }
+          if (q != nullptr) { q->join(); }
+        }
+      } ane_join{_ane.get(), _ane_qkv.get()};
       // Whichever destination this block ended up in.
       const Block* bp = nullptr;
       if (streaming) {
@@ -10771,6 +11057,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           _slots_off = std::getenv("VPIPE_H3_NO_SLOTS") != nullptr;
         }
         if (!_slots_off && (!_slots_ready || _slots_adaln != !baked)) {
+          // The pending block out of its slot or the spare before either
+          // goes; the spare was built for the old tensor set.
+          pk_copy();
+          _slot_spare = Block{};
           _slot[0] = Block{};
           _slot[1] = Block{};
           _slot_pair = false;
@@ -10841,8 +11131,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             }
             else { ++pf_hit; }
           } else {
-            // Never the slot an outstanding read is writing into.
+            // Never the slot an outstanding read is writing into -- and
+            // never one a pending promotion has still to copy out of.
             use = pf.slot >= 0 ? (pf.slot ^ 1) : _slot_cur;
+            pk_free_slot();
             if (!refill_block_(*_ws, blk_("blocks.", Lx, ""), _slot[use],
                                !baked)) {
               // A dtype or a shape no raw read can place. Sticky, and
@@ -10872,6 +11164,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             if (pf.fut.valid()) { (void)pf.fut.get(); }
             pf.layer   = -1;
             pf.slot    = -1;
+            pk_copy();
+            _slot_spare = Block{};
             _slot[0]   = Block{};
             _slot[1]   = Block{};
             _slot_pair = false;
@@ -10904,8 +11198,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         }
       }
       const Block& b = streaming ? *bp : _blocks[(std::size_t)Lx];
+      const auto t_ready = std::chrono::steady_clock::now();
       // Its adapters' factors, spilled at load, read in beside it.
       if (streaming && !fill_lora_(Lx)) { return {}; }
+      if (sprof && streaming) { sp_fill_ms += sp_ms(t_ready); }
       // The modulation table for this block: [n_t, 6*H*3], which is the
       // same bytes as [n_t*3, 6*H] -- the layout `timestep_index * 3 +
       // tag` addresses. M is the number of DISTINCT timesteps, so this
@@ -11009,6 +11305,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // end of this block, or earlier from the ANE split, which commits the
       // attention mid-block. A no-op while a read is outstanding.
       auto issue_prefetch = [&]() {
+        // The read goes into the other slot -- the one a pending
+        // promotion is still to be copied out of, unless it moved to the
+        // spare.
+        pk_free_slot();
         if (pf_on && pf.layer < 0) {
           const int nxt = pf_next(Lx + 1);
           const bool slots = _slots_ready && !_slots_off && _slot_pair;
@@ -11118,6 +11418,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // wall time to whichever tile it ran, and one clock read per block is
         // nothing beside the block.
         const auto gp0 = std::chrono::steady_clock::now();
+        if (sprof && streaming) {
+          sp_enc_ms += std::chrono::duration<double, std::milli>(
+              gp0 - t_ready).count();
+        }
         metal_compute::CommandStream::Fence fence = stream.commit();
         // The cache's next block, into the slot block Lx - 1 used.
         if (kv_io) { skv->prefetch(Lx + 1); }
@@ -11132,6 +11436,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // decompress. Asked per block and never queued, so the moment it
         // stops being affordable the next iteration is serial again.
         if (streaming) { issue_prefetch(); }
+        // The block before this one, kept under this one's GPU work (its
+        // copy already made, if a read was issued into its slot).
+        if (pk_finish()) { ++pk_deferred; }
         if (!fence.wait_ok(&blk_err)) {
           return fail("streamed block " + std::to_string(Lx) + ": " +
                       (blk_err.empty() ? std::string("GPU error") : blk_err));
@@ -11181,62 +11488,60 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             // streamer's own destination and the next read needs it back.
             // A move would hand it away and leave the stream writing into
             // the resident set. Paid at most once per block for a whole
-            // run, against the per-step read it retires.
+            // run, against the per-step read it retires -- and under the
+            // NEXT block's GPU work (PendingKeep above), its factors kept
+            // now, while the streamed set still holds them.
             //
             // The fallback path owns its block outright, so it still
-            // moves.
-            bool kept = true;
-            if (bp == &streamed) {
-              _blocks[(std::size_t)Lx] = std::move(streamed);
-            } else {
-              kept = clone_block_(*bp, _blocks[(std::size_t)Lx], true);
-              if (!kept) { _blocks[(std::size_t)Lx] = Block{}; }
-            }
-            // What a preloaded block holds, cloned or MOVED: the move
-            // brings the fallback's refill sources and per-call pack. A
-            // held layout that cannot be built leaves the pack converting
-            // per projection, which is still the same values.
-            if (kept) { (void)keep_block_(_blocks[(std::size_t)Lx]); }
-            // A failed copy is simply not a promotion: the slot still
-            // holds the block, the forward has already run it, and the
-            // next step streams it again. Nothing is booked.
-            if (kept) {
-              // Now that it is KEPT, the fc1 interleave is paid once
-              // instead of per forward, so every later step takes the
-              // fused FF for this block. The scratch stays wide (it was
-              // sized for a streaming run and blocks below this one may
-              // still be unfused), so the two paths coexist.
-              if (_fuse_ff) { interleave_gu_(_blocks[(std::size_t)Lx].fc1); }
-              // Its adapters' factors stay with it.
+            // moves, here.
+            if (bp != &streamed && pk_on) {
+              pk_finish();   // none is pending: this block's commit ran it
+              const auto tp = std::chrono::steady_clock::now();
               keep_lora_(Lx);
-              // Wired LAST, after every write this block will ever get:
-              // mlock pins the pages that exist now, and interleave_gu_
-              // above replaces buffers outright.
-              if (_wire.on()) {
-                _wire.note_wired(
-                    _mc,
-                    wire_block_(_blocks[(std::size_t)Lx], true) +
-                        wire_lora_(Lx, true),
-                    nb);
+              if (sprof) { sp_klora_ms += sp_ms(tp); }
+              Block& slot = _slot[bp == &_slot[0] ? 0 : 1];
+              // Into the spare, and the slot takes the spare's buffers --
+              // the same tensors, which the next read refills.
+              bool spared = false;
+              if (pk_spare && _slot_spare.qkv.empty()) {
+                const auto mbs = _mc->memory_budget();
+                if (mbs.recommended != 0 &&
+                    mbs.fits_growth(block_bytes_(slot))) {
+                  (void)clone_block_(slot, _slot_spare, false);
+                }
               }
-              _resid.note_admitted(nb);
-              _lora_kept += nl;
-              if (_mc->session() != nullptr) {
-                const auto mb = _mc->memory_budget();
-                _mc->session()->log_debug(fmt(
-                    "MetalMiniMaxH3Transformer: block {} resident ({} of {}, "
-                    "{} MB, {} MB wired; {} MB idle, {} MB compressed, "
-                    "{} MB swap, reserve {} MB)", Lx,
-                    _resid.count(), c.n_layers, _resid.bytes() >> 20,
-                    _wire.wired_bytes() >> 20,
-                    mb.free_physical >> 20, mb.compressed >> 20,
-                    mb.swap_used >> 20, _resid.reserve() >> 20));
+              if (pk_spare && !_slot_spare.qkv.empty()) {
+                std::swap(slot, _slot_spare);
+                spared = true;
+                ++pk_spared;
               }
+              pk.layer = Lx;
+              pk.src = spared ? &_slot_spare : &slot;
+              pk.nb = nb;
+              pk.nl = nl;
+              pk.copied = false;
+            } else {
+              bool kept = true;
+              const auto tp = std::chrono::steady_clock::now();
+              if (bp == &streamed) {
+                _blocks[(std::size_t)Lx] = std::move(streamed);
+              } else {
+                kept = clone_block_(*bp, _blocks[(std::size_t)Lx], true);
+                if (!kept) { _blocks[(std::size_t)Lx] = Block{}; }
+              }
+              if (sprof) { sp_clone_ms += sp_ms(tp); }
+              // A failed copy is simply not a promotion: the slot still
+              // holds the block, the forward has already run it, and the
+              // next step streams it again. Nothing is booked.
+              if (kept) { keep_rest(Lx, nb, nl, /*lora_kept=*/false); }
             }
           }
         }
       }
     }
+    // The last block's promotion has no block after it to hide under.
+    pk_finish();
+    _slot_spare = Block{};
 
     // Every read and write of the cache's files, joined: a clean
     // forward's chunk is whole on disk before finish_commit names it.
@@ -11274,6 +11579,13 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         sp_fetch_ms > 0.0
             ? (double)sp_read_bytes / (sp_fetch_ms / 1000.0) / 1e9
             : 0.0));
+      // The host work the GPU waits for between streamed blocks.
+      _mc->session()->log_normal(fmt(
+          "MetalMiniMaxH3Transformer: host between streamed blocks -- "
+          "encode {:.0f} ms, adapter factors read {:.0f} ms; {} promoted: "
+          "copy {:.0f} ms, keep {:.0f} ms, adapter factors {:.0f} ms, "
+          "wire {:.0f} ms", sp_enc_ms - sp_fill_ms, sp_fill_ms, sp_promoted,
+          sp_clone_ms, sp_keep_ms, sp_klora_ms, sp_wire_ms));
     }
 
     // What the prefetch actually managed this pass, kept so a test can
@@ -11283,6 +11595,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // the rest of the forward.
     _pf_started = pf_started;
     _pf_hit     = pf_hit;
+    _promote_deferred = pk_deferred;
+    _promote_spared = pk_spared;
     // THE FIRE-AND-FORGET TALLY. The encoder splits every 50 dispatches
     // and commits those buffers without waiting, so nothing else is in a
     // position to see one fail; a completion handler latches it and

@@ -86,7 +86,8 @@ void unpack_latents(const float* rows, int channels, int lat_h, int lat_w,
 // The (width, height) the model was trained at for an aspect ratio: of
 // the sizes divisible by `multiple`, at least 4 of it a side and within
 // 10% of `area`, the one cropping least from a picture of that aspect,
-// then the one closest to `area`, then the wider (get_image_size).
+// then the one closest to `area`, then the wider (get_image_size;
+// common/size-about-area.h, which image-resample's crop_to_area runs).
 std::pair<int, int> image_size(double aspect, long long area = 1024 * 1024,
                                int multiple = 16);
 

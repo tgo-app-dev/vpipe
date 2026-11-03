@@ -43,22 +43,41 @@ namespace genai {
 //
 // A DENSE source may also be FP8: `bits` set to kFp8E4M3 / kFp8E5M2 with
 // `quantized` false says `*w` holds one FP8 code per element rather than
-// bf16. Spelled as a NEGATIVE bits value, not a new field, on purpose:
-// this struct crosses the plugin boundary, a field would move its layout,
-// and no producer has ever handed a dense source a negative width -- they
-// pass 0, or a quantized weight's 4 / 8 -- so the value cannot collide.
-// A SCALED FP8 source puts its f32 scale in `scales` -- one value, or
-// one per source row -- which a dense source has no other use for; an
-// unscaled one leaves it null or empty.
+// bf16. A negative bits value names a dense CODE format; no producer
+// hands a dense source a negative width otherwise -- they pass 0, or a
+// quantized weight's 4 / 8. A SCALED FP8 source puts its f32 scale in
+// `scales` -- one value, or one per source row -- which a dense source
+// has no other use for; an unscaled one leaves it null or empty.
+//
+// ComfyUI's INT8 (kInt8, `int8_tensorwise`): `*w` one signed code per
+// element, `scales` its f32 scale (one value, or one per source row), and
+// `rot` the ConvRot group the codes were quantized in (a power of four;
+// 0 unrotated). W4A8 (kW4A8, `asym_w4a8_int8`): `*w` the nibbles, two a
+// byte (the even column low), `srel` the E4M3 relative scales, one per
+// `qgroup` columns of a row, `codebook` 16 f32 (null: code - 8), `scales`
+// the f32 row scale and `rot` as kI8's. Both stage the bf16 value the
+// GPU's widening holds (shared/fp8-layout.h's decode_bf16 /
+// decode_w4a8_bf16, to the bit), narrowed to fp16.
+//
+// Not part of the plugin ABI: this header is not installed (ane-tier.h,
+// which describes weights by name, is the plugin's surface), so a field
+// here moves nothing a plugin was built against.
 struct AneFfnSource {
   static constexpr int kFp8E4M3 = -1;
   static constexpr int kFp8E5M2 = -2;
+  static constexpr int kInt8    = -3;
+  static constexpr int kW4A8    = -4;
   const metal_compute::SharedBuffer* w      = nullptr;
   const metal_compute::SharedBuffer* codes  = nullptr;
   const metal_compute::SharedBuffer* scales = nullptr;
   const metal_compute::SharedBuffer* qbias  = nullptr;
   bool        quantized = false;
   int         bits      = 0;
+  // kInt8 / kW4A8 only (see above).
+  int         rot       = 0;
+  const metal_compute::SharedBuffer* srel     = nullptr;
+  const metal_compute::SharedBuffer* codebook = nullptr;
+  int         qgroup    = 0;
   std::size_t stride    = 1;
   std::size_t offset    = 0;
   // The projection's bias, bf16, indexed like its rows: element
@@ -187,6 +206,11 @@ class AneFeedForward {
   // binary that passed every check.
   int  chunk() const noexcept;
   int  rows_per_block() const noexcept;
+  // The rows begin() takes of a `seq`-row forward when it runs -- whole
+  // chunks of the share, the GPU keeping at least one row -- so a family
+  // can commit the GPU's head rows BEFORE the ANE starts (and before its
+  // staging is joined) and still split exactly where begin() will.
+  int  planned_rows(int seq) const noexcept;
   bool timing() const noexcept;
 
   // runtime_bytes() for a GELU module (Options::gelu): two projections and
@@ -196,10 +220,20 @@ class AneFeedForward {
   std::size_t host_bytes() const noexcept;
   AneWorker& worker() const;
 
-  // Dispatch `layer`'s gate, up and down into the slots on the ANE worker
-  // and return at once, so the conversion runs under the GPU's attention
-  // for the same block. The sources' buffers must outlive join_stage().
+  // Convert `layer`'s gate, up and down into the slots and return at once,
+  // so the conversion runs under the GPU's attention for the same block.
   // `group` is the affine group size of a quantized source.
+  //
+  // ON THIS MODULE'S OWN QUEUE, not the ANE worker: a staging job is CPU
+  // work (spread over every core), and on the worker it queued behind
+  // whatever predict another module had in flight -- and a dispatch
+  // behind it blocked the caller until it ran. Its own queue lets a
+  // family stage the NEXT block's weights while the ANE runs this one's
+  // other module, and lets two modules stage at once. The job keeps the
+  // sources' buffers alive itself (a retained view of each), so a block
+  // released before it ran is still read safely; a predict of THIS
+  // module still in flight is waited for first, since staging rewrites
+  // the slots it reads.
   void stage(int layer, const AneFfnSource& gate, const AneFfnSource& up,
              const AneFfnSource& down, int group);
   // The matmul tier's one projection.
@@ -209,8 +243,19 @@ class AneFeedForward {
   void stage(int layer, const std::vector<AneFfnSource>& parts, int group);
   // Wait for staging; true when `layer`'s weights are in the slots.
   bool join_stage(int layer);
-  // Wait for whatever job is outstanding. For an early exit between
-  // stage() and join_stage(), before the block's buffers go away.
+  // Whether `layer` was the last stage() asked of this module -- a family
+  // that staged a block AHEAD (before its turn) skips staging it again.
+  bool queued(int layer) const noexcept;
+  // Forget what was staged ahead: the next block stages afresh. At a
+  // forward's start, where an adapter's strength may have moved since.
+  void forget_staged();
+  // Whether the NEXT plan_block() may split -- the hint a family stages
+  // ahead on. False once the tier is GPU-only, and while it runs unsplit
+  // with no re-probe due.
+  bool may_split_next() const noexcept;
+  // Wait for whatever job is outstanding, staging and predict. For an
+  // early exit between stage() and join_stage(), before the block's
+  // buffers go away.
   void join();
 
   // Whether to split this block, asked at its start and before staging.
@@ -279,6 +324,12 @@ class AneFeedForward {
  private:
   AneFeedForward() = default;
   void stage_(int layer, std::vector<AneFfnSource> src, int group);
+  // This module's staging queue (dispatch's serial queue and the group a
+  // join waits on); see stage().
+  struct StageQueue;
+  std::unique_ptr<StageQueue> _sq;
+  void wait_stage_() const;
+  int  _queued = -1;                       // the last stage()'s layer
 
   const SessionContextIntf*       _session = nullptr;
   metal_compute::MetalCompute*    _mc      = nullptr;
@@ -316,7 +367,9 @@ class AneFeedForward {
   // Running rates the balancer predicts with.
   double _gpu_row_ms = 0.0;
   double _chunk_ms   = 0.0;
-  // Written by jobs on the ANE worker; read only after joining it.
+  // Written by a staging job (this module's queue: _staged, _stage_ms,
+  // _slot_scale) or a predict job (the ANE worker: the rest); read only
+  // after joining the one that writes it.
   int    _staged   = -1;
   double _stage_ms = 0.0;
   bool   _ok       = false;
@@ -364,7 +417,10 @@ class AneFeedForward {
   // arithmetic on the GPU side of the boundary. The scale starts at 1 and
   // only grows: a chunk that comes back non-finite has its up slot divided
   // by 4 in place and is predicted again, and later blocks stage at the new
-  // scale. Written only by jobs on the ANE worker.
+  // scale. Written by this module's jobs alone -- a predict on the ANE
+  // worker, a staging job on its queue (_slot_scale) -- which never run
+  // at once: stage() waits for a predict in flight, begin() for staging.
+  // stage() reads _up_scale on the caller's thread for the same reason.
   static constexpr float kMaxUpScale = 4096.0f;
   float _up_scale   = 1.0f;    // the next staging divides up by this
   float _slot_scale = 1.0f;    // what the up slot is divided by now

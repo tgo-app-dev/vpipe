@@ -50,9 +50,9 @@ this per run from the machine's memory.
 instruction and writes the edited picture.
 
 ```
-load-image -> image-resample (crop) -+-> vae-encode -----------+
-                                     +-> diffusion-conditioner -+-> generate-image -> vae-decode -> save-image
-text-prompt ---------------------------^
+load-image -> image-resample (crop_to_area) -+-> vae-encode -----------+
+                                              +-> diffusion-conditioner -+-> generate-image -> vae-decode -> save-image
+text-prompt ------------------------------------^
 ```
 
 The **same resampled picture** has to feed both `vae-encode` and the
@@ -63,19 +63,40 @@ conditioner makes the thumbnail itself). Leave `width` / `height` unset on
 
 ### Sizes
 
-The model was trained at about one megapixel, sides multiple of 16, and its
-own pipeline picks the trained size closest to the picture's aspect. Then it
-scales the picture to cover that size and crops the centre. Set
-`image-resample`'s `width` / `height` to the size for your picture's aspect,
-with `fit: crop`:
+The model was trained at about one megapixel, sides multiples of 16. Its
+own pipeline picks the trained size for the picture's aspect, scales the
+picture to cover it and crops the centre. `image-resample`'s
+`fit: crop_to_area` does exactly that (Bria's rule, the same sizes to
+the pixel): the shipped edit graphs set it with `megapixels: 1`. A wider
+or taller picture keeps its shape:
 
-| aspect | size |
-|---|---|
-| 1:1 | 1024 × 1024 |
-| 4:3 / 3:4 | 1152 × 864 / 864 × 1152 |
-| 3:2 / 2:3 | 1248 × 832 / 832 × 1248 |
-| 16:9 / 9:16 | 1424 × 800 / 800 × 1424 |
-| 21:9 | 1568 × 672 |
+| aspect | 1 megapixel | 4 megapixels |
+|---|---|---|
+| 1:1 | 1024 × 1024 | 2048 × 2048 |
+| 4:3 / 3:4 | 1152 × 864 / 864 × 1152 | 2368 × 1776 / 1776 × 2368 |
+| 3:2 / 2:3 | 1248 × 832 / 832 × 1248 | 2496 × 1664 / 1664 × 2496 |
+| 5:4 / 4:5 | 1120 × 896 / 896 × 1120 | 2320 × 1856 / 1856 × 2320 |
+| 16:9 / 9:16 | 1424 × 800 / 800 × 1424 | 2816 × 1584 / 1584 × 2816 |
+| 21:9 | 1568 × 672 | 3136 × 1344 |
+
+**Four megapixels.** Bria's hosted service (and ComfyUI's Bria node,
+which calls it) offers 4 MP beside 1 MP.
+[`fibo2-edit-4mp`](pipelines/fibo2-edit-4mp.vpipeline) is `fibo2-edit`
+at 4 MP: `megapixels: 4` on `image-resample`, and the same on a
+`fibo2-model-config` wired to `generate-image`, which books the larger
+edit before the picture arrives. Any size works the same way: the
+picture's own size is the result's, a multiple of 16 a side, up to 8192
+a side (the model's position tables). The model was trained about 1
+megapixel, so judge a larger picture by eye.
+
+Measured on an M4 Pro (64 GB) with Edit Turbo, a 2:3 photo and the
+instruction *"make her beret blue"*: at 1 MP an 832 × 1248 result, 4,056
+image rows and as many of the picture, 102 s for the 4 steps; at 4 MP
+1664 × 2496, 16,224 rows of each, 726 s (7.1×: attention grows with the
+square of the rows). Both edits are clean and keep the scene; the 4 MP
+one carries detail the 1 MP one does not (the beret's knit, the leaves).
+The plan booked the 4 MP edit's 3.6 GB of activations before the picture
+arrived (1.0 GB at 1 MP).
 
 ### The prompt
 
@@ -102,8 +123,10 @@ image_1 next to the panda from image_2"*. Wire them in order to the
 conditioner's `ref_image`, `ref_image2` and `ref_images` ports, and the same
 pictures, through `vae-encode`, to `generate-image`'s `ref_latent0`,
 `ref_latent1` and `ref_latents` ports. The reference crops each picture to
-the trained size for its own aspect (the table above). The result takes the
-first picture's size unless `width` / `height` say otherwise.
+the trained size for its own aspect (the table above, at 1 megapixel even
+when the result is larger): an `image-resample` with `fit: crop_to_area`
+on each. The result takes the first picture's size unless `width` /
+`height` say otherwise.
 
 ### Masked edits
 
@@ -189,7 +212,9 @@ negative-prompt ----^                        fibo2-model-config --^
 
 Set `width` and `height` on generate-image, multiples of 16 at about one
 megapixel, the area the model was trained at: 1024 × 1024 (the default
-when neither is set), 1424 × 800 (16:9), 1248 × 832 (3:2). The prompt is
+when neither is set), 1424 × 800 (16:9), 1248 × 832 (3:2), or a size
+from the 4 megapixel column of the table above. `megapixels: 4` on the
+`fibo2-model-config` makes the unset default 2048 × 2048. The prompt is
 best a structured JSON caption. Bria's `bria-vgl` package writes one from
 a short prompt; a plain sentence works too and is used as given.
 

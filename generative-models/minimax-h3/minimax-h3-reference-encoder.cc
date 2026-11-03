@@ -546,7 +546,40 @@ encode_references(const std::vector<MediaReference>& refs,
     // Its rows are packed immediately before this reference's video
     // rows, so it is encoded in that order too -- one traversal, one
     // order, nothing to keep in step afterwards.
-    if (m.has_audio()) {
+    //
+    // A CARRIED soundtrack latent is already the DiT's rows, whitened:
+    // laid channel-major as the VAE's would be, no VAE, no resample --
+    // the audio half of the round trip the carried video latent skips.
+    if (m.has_audio_latent()) {
+      const int AC = m.audio_latent_channels;
+      const int n  = m.audio_latent_frames;
+      if (models.audio_vae != nullptr &&
+          models.audio_vae->config().latent_channels != AC) {
+        return fail(where + ": a carried soundtrack latent is " +
+                    std::to_string(AC) + " wide where the audio VAE's is " +
+                    std::to_string(
+                        models.audio_vae->config().latent_channels));
+      }
+      if (r.audio_row_elems == 0) { r.audio_row_elems = AC; }
+      if (AC != r.audio_row_elems) {
+        return fail(where + ": a carried soundtrack latent is " +
+                    std::to_string(AC) + " wide where the other "
+                    "soundtracks' rows are " +
+                    std::to_string(r.audio_row_elems));
+      }
+      const std::size_t need = (std::size_t)2 * AC * n;
+      if (m.audio_latent.size() < need) {
+        return fail(where + ": a carried soundtrack latent is shorter "
+                            "than its own shape");
+      }
+      const std::size_t base = r.audio_rows.size();
+      r.audio_rows.resize(base + need);
+      pack_audio_latent_rows(m.audio_latent.data(), AC, n, n,
+                             r.audio_rows.data() + base);
+      fit.audio_kept_seconds = (double)n / (double)kAudioLatentsPerSecond;
+      fit.audio_src_seconds  = fit.audio_kept_seconds;
+      L.num_audio_latents = n;
+    } else if (m.has_audio()) {
       if (models.audio_vae == nullptr) {
         return fail(where + " carries a soundtrack but no audio VAE is "
                             "loaded");
@@ -878,7 +911,7 @@ encode_references(const std::vector<MediaReference>& refs,
                : refs[i].kind == MediaReference::Kind::kVideo
                    ? MiniMaxH3TextEncoder::Reference::Kind::kVideo
                    : MiniMaxH3TextEncoder::Reference::Kind::kAudio;
-      p.has_audio = refs[i].has_audio();
+      p.has_audio = refs[i].has_soundtrack();
       const int vi = vision_of[i];
       if (vi >= 0) {
         p.vision = &vision[(std::size_t)vi];

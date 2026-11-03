@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <utility>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -1044,4 +1045,67 @@ TEST(image_resample_stage, pad_to_grid_resamples_past_the_cap)
   int off = 0;
   for (size_t i = 0; i < px.size(); i += 997) { off += px[i] != 90; }
   EXPECT_TRUE(off == 0);
+}
+
+// crop_to_area: Bria's size for the picture's own aspect about an area
+// (common/size-about-area.h, Fibo 2.0's get_image_size) -- at 1 megapixel
+// the trained table, at 4 Bria's 4 MP sizes -- and then exactly `crop`
+// at that size, up or down. An area no size on the grid comes near is
+// refused at construction.
+TEST(image_resample_stage, crop_to_area_is_crop_at_bria_s_size)
+{
+  Session sess;
+  auto area = [](double mp) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("fit", FlexData::make_string("crop_to_area"));
+    c.as_object().insert("megapixels", FlexData::make_real(mp));
+    return c;
+  };
+  ImageResampleStage one(&sess, "one", {}, area(1.0));
+  ImageResampleStage four(&sess, "four", {}, area(4.0));
+  ASSERT_TRUE(one.fit_mode() == 6 && one.config_error().empty());
+  ASSERT_TRUE(four.config_error().empty());
+  struct Want { int w, h, w1, h1, w4, h4; };
+  const Want cases[] = {
+    {1000, 1000, 1024, 1024, 2048, 2048},
+    {4000, 3000, 1152, 864, 2368, 1776},
+    {3000, 2000, 1248, 832, 2496, 1664},
+    {1920, 1080, 1424, 800, 2816, 1584},
+    {1080, 1920, 800, 1424, 1584, 2816},
+    {2100, 900, 1568, 672, 3136, 1344},
+  };
+  int bad = 0;
+  for (const Want& c : cases) {
+    const auto a = one.area_fit(c.w, c.h);
+    const auto b = four.area_fit(c.w, c.h);
+    if (a != std::make_pair(c.w1, c.h1) || b != std::make_pair(c.w4, c.h4)) {
+      std::printf("[area] %dx%d: 1 MP %dx%d, 4 MP %dx%d\n", c.w, c.h,
+                  a.first, a.second, b.first, b.second);
+      ++bad;
+    }
+  }
+  EXPECT_TRUE(bad == 0);
+  // The pixels: a 300x400 picture to a quarter megapixel is `crop` at
+  // the size the rule picks.
+  ImageResampleStage quarter(&sess, "q", {}, area(0.25));
+  const auto [qw, qh] = quarter.area_fit(400, 300);
+  auto got = run_where(sess, 300, 400, area(0.25));
+  FlexData crop = FlexData::make_object();
+  crop.as_object().insert("fit", FlexData::make_string("crop"));
+  crop.as_object().insert("width", FlexData::make_int(qw));
+  crop.as_object().insert("height", FlexData::make_int(qh));
+  auto want = run_where(sess, 300, 400, std::move(crop));
+  ASSERT_TRUE(got.size() == 1 && want.size() == 1);
+  if (got.size() == 1 && want.size() == 1) {
+    EXPECT_TRUE(got[0].shape == (std::vector<int64_t>{ 3, qh, qw }));
+    EXPECT_TRUE(got[0].materialize_contiguous() ==
+                want[0].materialize_contiguous());
+    std::printf("[area] 400x300 at 0.25 MP -> %dx%d, %s fit:crop\n", qw,
+                qh,
+                got[0].materialize_contiguous() ==
+                        want[0].materialize_contiguous()
+                    ? "identical to" : "DIFFERENT from");
+  }
+  ImageResampleStage none(&sess, "none", {}, area(0.0));
+  EXPECT_FALSE(none.config_error().empty());
 }

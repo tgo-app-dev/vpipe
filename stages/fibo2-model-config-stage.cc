@@ -23,6 +23,15 @@ const ConfigKey kAttrs[] = {
           "set); Edit Turbo is distilled to 1, which runs one forward a "
           "step and no negative. Unset = generate-image's guidance_scale (1 "
           "by default)"},
+  {.key = "megapixels", .type = ConfigType::Real, .required = false,
+   .doc = "the area a picture is made at, in units of 1024 x 1024: the "
+          "size of a text-to-image whose width / height are unset (1:1 "
+          "about that area: 1 -> 1024 x 1024, 4 -> 2048 x 2048), and the "
+          "edit the launch plan books before the picture arrives. An edit "
+          "is the size of its picture, so crop that to the same area -- "
+          "image-resample `fit: crop_to_area` with these megapixels. The "
+          "model was trained about 1; Bria's service also offers 4. Unset "
+          "=> 1"},
   {.key = "vl_long_edge", .type = ConfigType::Int, .required = false,
    .doc = "edit: the longest side Qwen3-VL sees a picture to edit at, "
           "thumbnailed as the reference pipeline does (bicubic, aspect "
@@ -81,7 +90,8 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "Fibo 2.0 parameters as one FlexData object {model_family: "
-          "fibo2, +guidance_scale, +vl_long_edge / vl_min_pixels / "
+          "fibo2, +guidance_scale, +megapixels, +vl_long_edge / "
+          "vl_min_pixels / "
           "vl_max_pixels, +lora .. "
           "+lora8 and their scales, +preview_vae and its knobs}, for a "
           "generate-image or diffusion-conditioner model_config iport",
@@ -91,7 +101,8 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "fibo2-model-config",
   .doc       = "Source: the Fibo 2.0 parameters -- the guidance (Dev's "
-               "5; Edit Turbo needs none), the bounds of the pictures "
+               "5; Edit Turbo needs none), the area pictures are made at "
+               "(1 or 4 megapixels), the bounds of the pictures "
                "Qwen3-VL reads for an edit, runtime LoRA slots and the live "
                "preview. None is needed for an Edit Turbo run. One beat then "
                "done; with a trigger iport, one beat per inbound beat.",
@@ -125,6 +136,11 @@ Fibo2ModelConfigStage::Fibo2ModelConfigStage(const SessionContextIntf* s,
       fail_config(fmt("Fibo2ModelConfigStage('{}'): guidance_scale must be "
                       ">= 0", this->id()));
     }
+    if (in.contains("megapixels") &&
+        !(in.at("megapixels").as_real(0.0) > 0.0)) {
+      fail_config(fmt("Fibo2ModelConfigStage('{}'): megapixels must be "
+                      "> 0", this->id()));
+    }
   }
   _preview.vae      = attr_str(latent_preview::kVaeKey);
   _preview.every    = (int)attr_int(latent_preview::kEveryKey);
@@ -154,8 +170,8 @@ Fibo2ModelConfigStage::resolved_config() const
   {
     auto in = config().as_object();
     auto o  = fd.as_object();
-    if (in.contains("guidance_scale")) {
-      o.insert_or_assign("guidance_scale", in.at("guidance_scale"));
+    for (const char* k : {"guidance_scale", "megapixels"}) {
+      if (in.contains(k)) { o.insert_or_assign(k, in.at(k)); }
     }
     for (int i = 0; i < lora_slots::kSlots; ++i) {
       for (std::string_view k :

@@ -85,8 +85,12 @@ struct MediaReference {
   // and every resample between them.
   //
   // `video_latent` is [z, frames, height, width] row-major; the extents
-  // are the LATENT's, not the picture's. `audio_latent` is
-  // [channels, latents].
+  // are the LATENT's, not the picture's. `audio_latent` is [2, channels,
+  // latents] -- the stereo pair outer, as generate-video's audio_latent
+  // oport writes it -- `audio_latent_channels` the latent's width (32)
+  // and `audio_latent_frames` its length. Both are taken at their own
+  // length: a carried latent was cut by its producer (a load-tensor
+  // window), so the generated duration does not cut it again.
   std::vector<float> video_latent;
   int latent_z      = 0;
   int latent_frames = 0;
@@ -100,8 +104,11 @@ struct MediaReference {
     return !video_latent.empty() && latent_z > 0 && latent_frames > 0;
   }
   bool has_audio_latent() const {
-    return !audio_latent.empty() && audio_latent_channels > 0;
+    return !audio_latent.empty() && audio_latent_channels > 0 &&
+           audio_latent_frames > 0;
   }
+  // A soundtrack either way: PCM for the audio VAE, or its latent.
+  bool has_soundtrack() const { return has_audio() || has_audio_latent(); }
 
   // This reference's own canvas short edge, overriding the plan's for
   // this one reference. Negative uses the plan's; 0 takes the clip at

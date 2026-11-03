@@ -64,11 +64,13 @@ namespace vpipe {
 //   max_seconds  (real, default 30) — refuse to buffer more than this
 //   unload_when_idle (string)       — auto|always|never
 //
-// THERE IS NO BUILT-IN FAMILY. Every audio encoder reachable from here
-// comes from `VaeModelFamily::load_audio_encoder`, i.e. from a plugin.
-// The stage says so plainly when nothing claims the checkpoint rather
-// than falling back to something that would encode at the wrong latent
-// geometry.
+// ONE BUILT-IN FAMILY: MiniMax-H3's audio VAE, whose latents its own
+// generate-video takes back as a guide's soundtrack -- [2, 32, frames],
+// whitened, its audio_latent oport's layout. Every other audio encoder
+// comes from `VaeModelFamily::load_audio_encoder`, i.e. from a plugin,
+// which is asked first. The stage says so plainly when nothing claims
+// the checkpoint rather than falling back to something that would encode
+// at the wrong latent geometry.
 class AudioVaeEncodeStage final : public TypedStage<AudioVaeEncodeStage> {
 public:
   static constexpr const char* kTypeName = "audio-vae-encode";

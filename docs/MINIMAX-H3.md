@@ -1626,6 +1626,85 @@ rather than 40.5. It is optional.
   [Which Turbo adapters work](#which-turbo-adapters-work) lists the rest
   with theirs. An adapter for the other partition is refused, not applied.
 
+#### Carrying a part's own latents
+
+The chain above hands each part the previous one as **decoded pixels**, and
+the VAE's encoder is not its decoder's inverse: `encode(decode(z))`
+recovers `z` at correlation 0.875 with a 0.86 gain. A part can keep what
+`generate-video` made and hand THAT on instead:
+
+```
+generate-video ─0─> save-tensor(part-latent.vpt)        (the video latent)
+               ─1─> save-tensor(part-audio-latent.vpt)  (its soundtrack)
+```
+
+Two ways to continue from them:
+
+- **Ref2VA, beside the pixels.** Keep the guide's pixel port (the vision
+  tower reads it, writing `<Video 1>` into the prompt) and add a
+  `load-tensor` window of each latent on the next ports, their `sideband`
+  `{latent: true, attach: true}`: the video rows fold onto the clip (its
+  VAE encode skipped), the soundtrack's take the place of its PCM port
+  (the audio VAE skipped). Time is axis 1 of the video latent
+  `[z, T, H/16, W/16]` and axis 2 of the audio latent `[2, 32, n]`; 90
+  frames are the last 27 latent frames and 150 audio latents.
+- **FL2VA, through the tail — a GUIDE.** `generate-video`'s ports 12
+  (`guide_latent`) and 13 (`guide_audio_latent`) pin latent frames and
+  their soundtrack where they lie in the clip being made, from pixel
+  frame `frame` of the beat's sideband (0 by default): each latent frame
+  at the rotary time of the target frame it stands over. Hand it the
+  last 7 latent frames (22 pixel frames) of the part before and the
+  audio latents of those frames (36 or 37, at 5/3 a frame), make the new
+  part 22 frames longer, and its first 22
+  frames REDO that tail — conditioned, not generated — before it goes
+  on; drop them when you join. No reference encoder: the prompt is
+  FL2VA's own. With no latents kept, a `vae-encode` of the tail's frames
+  (fitted to the part's size) and an `audio-vae-encode` of its sound
+  make the same two beats — `audio-vae-encode` encodes MiniMax H3's
+  soundtracks itself.
+
+The layout these pack is `[text | anchors | guide video | guide audio |
+target audio | target video]`; a guide's rows are conditioning, held at
+the keyframe level and the reference soundtrack's, and a request with
+references (whose layout has no slot) ignores one, saying so. ComfyUI's
+`MiniMaxH3AddGuide` places its guides the same way.
+
+Measured on an M4 Pro: an int8 FL2VA checkpoint with a 6-step Turbo
+adapter at 640x352, a 39-frame part continued by a 39-frame part (22
+frames redone, 17 new), one prompt and one seed for every arm. Each arm is
+compared against the last 22 frames of the part before:
+
+| part 2 | first 7 latent frames, rel-L2 | redone frames, PSNR | the join | soundtrack, PCM correlation |
+|---|---:|---:|---:|---:|
+| guided by the kept latents | 0.088 | 30.1 dB | 23.2 dB | 0.857 |
+| guided by the tail re-encoded | 0.246 | 30.6 dB | 23.3 dB | 0.658 |
+| no guide | 0.898 | 11.4 dB | 11.0 dB | 0.206 |
+
+"The join" is the PSNR from the earlier part's last frame to the new
+part's first new frame. An ordinary frame step of this clip reads
+20–21 dB, so the cut moves the picture less than a frame of its own
+motion does. The PCM correlation is taken at the best shift within
+±1200 samples.
+
+Either guide redoes the tail, and the parts join without a visible cut.
+In the picture the two routes are equal: what `encode(decode(z))` loses
+(0.97 correlation on this clip) is mostly what the decoder does not show.
+The soundtrack is where keeping the latent pays. The audio VAE's round
+trip is poor — the re-encoded tail correlates under 0.5 with the
+latents it came from — so the re-encoded soundtrack is redone less
+faithfully.
+
+Two things move the soundtrack by a fraction of a latent:
+
+- **The tail's start frame.** A tail starting at pixel frame `s` lies at
+  audio latent `5s/3`, and a window of whole latents is exact only when
+  `s` is a multiple of 3. The 22-frame tail of a 17n+5-frame part starts
+  at frame 17(n − 1), so parts of 73, 124 and 175 frames line up exactly.
+  A 39-frame part is a third of a latent (8 ms) off.
+- **`load-audio` is packet-accurate.** Re-encoding the tail's sound from
+  a file starts at the packet that holds `start_s`. That was 68 ms early
+  here (ALAC, 4096-sample packets). Keeping the audio latent avoids this.
+
 ### The released weights, either partition
 
 Both partitions are also catalogued from **`MiniMaxAI/MiniMax-H3`**, the
@@ -2189,9 +2268,11 @@ bf16 bit for bit, and within one bf16 rounding of comfy_kitchen's
 `dequantize_int8_convrot_weight` (checked against the matrix built as
 comfy_kitchen builds it). A threadgroup takes 1024 elements, one radix-4
 stage per base-4 digit of the index. Run-time LoRAs apply over the
-widened weight. The ANE leaves int8 projections to the GPU, and the
-int8 GEMM tiers leave them on the accurate route, as they do FP8 — with
-one exception, below. Only models that opt in read int8; for every other
+widened weight. The Neural Engine tiers (`ane_ffn`, `ane_qkv`) take
+int8 projections as they take any other: the codes are un-rotated and
+scaled on the CPU into the same bf16 values the GPU's widening makes,
+and handed to the ANE in fp16. The int8 GEMM tiers leave them on the
+accurate route, as they do FP8 — with one exception, below. Only models that opt in read int8; for every other
 reader, LoRA files included, it stays refused by name. A host built
 before these kernels runs FP8 checkpoints as before and refuses an int8
 one by name.
@@ -2273,7 +2354,12 @@ against widening, on the same base M5 geometry. On an M4 Pro, image to
 video at 832×480×124 under a six-step adapter, the W4A8 file ran as fast
 as the int8 one (18.9 minutes end to end each) with a 17.2 GB peak
 against 26.0, and its clip followed the int8 clip beat for beat. A file
-with a weight correction (`weight_correction`) is refused by name.
+with a weight correction (`weight_correction`) is refused by name. The
+Neural Engine tiers take W4A8 projections as they take int8 ones (above).
+MEASURED on the M4 Pro, four blocks at 9,382 rows with `ane_ffn` +
+`ane_qkv`, both Winnougan files: a forward **1.47–1.54×** faster than
+the GPU alone, the ANE's rows 0.4% from the GPU's (rel-L2), as for the
+released bf16 weights.
 
 **LoRAs.** Every kind applies; what differs is how much of the released
 model it needs.
@@ -3127,6 +3213,44 @@ because a graph that silently ran without it would produce a perfectly
 plausible video from weights trained for a different attention — there is no
 output anyone could look at and tell.
 
+#### How far the softmax half reaches — `vdn_range`
+
+The window is **whole chunks**: a query frame's own chunk of 5 latent frames
+and the chunks either side of it, `softmax_attention.radius` of them in the
+checkpoint's config — **1** in both released stages, so a query sees 15 latent
+frames exactly (about 2 s of video) and the linear half carries the rest.
+`generate-video`'s **`vdn_range`** sets that reach for a request in place of
+the checkpoint's — the **softmax/linear split**:
+
+| `vdn_range` | the softmax half sees | the linear half carries |
+|---|---|---|
+| `-1` (default) | the checkpoint's: the query's chunk ± 1 | every frame beyond |
+| `0` | the query's own chunk alone | everything else |
+| `2`, `3`, … | ± 2, ± 3 chunks | less, and nothing once the window covers the clip |
+
+Wider is more of the original attention — exact, and as costly as the dense
+attention it replaces over the frames it covers; narrower hands more to the
+delta rule. The two halves still **partition** the keys at any value: the
+linear branch reads its complement off the same bounds the window is built
+from. But the branch and its softmax gate were **trained at the checkpoint's
+radius**, so another value is a tuning outside what was trained, to be judged
+by eye. It is **per request** — no reload; the window's spans are rebuilt when
+it changes — and ignored without a branch. The stage logs the reach it runs
+when one is asked for. The reach is **at most 1024** chunks either side, which
+covers any clip; a larger value reads as 1024.
+
+**Step by step — `vdn_range_steps`.** As `sol_tau_steps` is to `sol_tau`:
+comma-separated whole numbers from `-1` to 1024, entry *i* for denoising step
+*i*, the last for every step past the list, `-1` the checkpoint's —
+`"2,1,1"` keeps more of the original attention for the first,
+structure-deciding step and hands more to the linear half after. Each forward carries its own reach
+(`Step::vdn_radius`; nothing latched, a forward without one runs the
+request's), so the window is rebuilt only where the reach changes from one
+step to the next. The memory preflight books the **narrowest** step's window —
+the least the softmax half covers is the most the linear half's buffers come
+to — and a step whose window covers the clip runs no linear half. The loop
+logs the schedule it runs.
+
 **What it costs in memory: the weights, and at 544p nothing else.** The branch
 is the ~5 GB of extra weights above, streamed block by block on the same terms
 as the DiT's own. Its *working* memory is larger than that sounds — over a
@@ -3538,9 +3662,14 @@ frames land ~35 dB PSNR apart, which is what an fp16 path costs.
   geometry: relative L2 **0.0035** on the video output and **0.00045** on the
   audio. An activation that overflows fp16 is detected, and the chunk is
   recomputed at a smaller scale rather than passed on.
-- **8-bit and 4-bit checkpoints work**, and so do runtime LoRAs: each block's
-  weights are dequantized, with any adapter merged in, into buffers the ANE
-  reads, one block at a time.
+- **8-bit, 4-bit, FP8 and ComfyUI int8 / W4A8 checkpoints work**, and so
+  do runtime LoRAs: each block's weights are dequantized, with any adapter
+  merged in, into buffers the ANE reads, one block at a time. That work is
+  done on the CPU **while the GPU computes**: a block's feed-forward weights
+  under its own attention, its q|k|v weights a block early, under the
+  previous block's attention. A block streamed from disk is read only at its
+  turn, so its q|k|v weights are prepared while the GPU computes its own
+  share of those rows.
 - **It costs memory, planned before the run.** Each tier holds one shared
   module however many blocks use it, and the resource plan books both
   together: **1922 MB** at 124 frames of 960 × 544, **2711 MB** at 328 frames

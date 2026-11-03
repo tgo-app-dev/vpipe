@@ -23,6 +23,8 @@
 
 #include "generative-models/shared/ane-module.h"
 #include "generative-models/shared/ane-ffn.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "apple-silicon/coreml/ane-emitter.h"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "interfaces/session-services-intf.h"
@@ -3507,6 +3509,283 @@ TEST(ane_tier, credits_its_predicts_to_the_flops_meter)
     EXPECT_TRUE(t1.flops - t0.flops == (std::uint64_t)a * per_row);
     EXPECT_TRUE(t1.records - t0.records == (std::uint64_t)(a / chunk));
   }
+}
+
+// INTEGER SOURCES STAGE AS THEIR WIDENING. ComfyUI's int8 (per-tensor or
+// per-row scale, ConvRot or not) and W4A8 (with a codebook and without)
+// staged straight from their codes must put in the slots EXACTLY what a
+// dense bf16 source holding the GPU's widening of the same codes puts
+// there (fp8-layout.h's decoders are that widening to the bit) -- so the
+// ANE's rows come out bit-identical. The f32 path too: an adapter folded
+// into both arms. And the control that keeps it from passing vacuously:
+// the same codes staged as if unrotated come out different.
+TEST(ane_tier, integer_sources_stage_as_their_widening)
+{
+  namespace fp8 = vpipe::genai::fp8;
+  using vpipe::genai::AneFeedForward;
+  using vpipe::genai::AneFfnSource;
+  using vpipe::metal_compute::SharedBuffer;
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  // K 1024: every ConvRot group up to 1024 divides it.
+  constexpr int K = 1024, N = 512, seq = 768, chunk = 256;
+  std::mt19937 rng(11);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto bf16_of = [](float f) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return (std::uint16_t)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+  };
+  auto bf16 = [&](std::size_t n, float sc) {
+    SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { p[i] = bf16_of(nd(rng) * sc); }
+    return b;
+  };
+  auto bytes = [&](std::size_t n, int lo, int hi) {
+    SharedBuffer b = mc->make_shared_buffer(n);
+    std::uniform_int_distribution<int> d(lo, hi);
+    auto* p = static_cast<std::uint8_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { p[i] = (std::uint8_t)d(rng); }
+    return b;
+  };
+  auto floats = [&](const std::vector<float>& v) {
+    SharedBuffer b = mc->make_shared_buffer(v.size() * sizeof(float));
+    std::memcpy(b.contents(), v.data(), v.size() * sizeof(float));
+    return b;
+  };
+  const SharedBuffer x = bf16((std::size_t)seq * K, 0.5f);
+  const SharedBuffer la = bf16((std::size_t)8 * K, 0.05f);   // A [8, K]
+  const SharedBuffer lb = bf16((std::size_t)N * 8, 0.05f);   // B [N, 8]
+
+  AneFeedForward::Options o;
+  o.session = &sess;
+  o.mc      = mc;
+  o.tag     = "int-src";
+  o.hidden  = K;
+  o.ffn     = N;
+  o.seq     = seq;
+  o.rows    = 1.0f;
+  o.chunk   = chunk;
+  o.matmul  = true;
+  auto mm = AneFeedForward::create(o);
+  if (mm == nullptr) { return; }                 // no ANE on this box
+  int layer = 0;
+  // The ANE's rows of a forward with `s` staged.
+  auto run = [&](AneFfnSource s, bool adapted) {
+    if (adapted) {
+      s.deltas = 1;
+      s.delta[0].a = &la;
+      s.delta[0].b = &lb;
+      s.delta[0].rank = 8;
+      s.delta[0].scale = 0.75f;
+    }
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)seq * N * 2);
+    std::memset(y.contents(), 0, y.byte_size());
+    mm->stage(++layer, s, 0);
+    std::vector<std::uint16_t> out;
+    if (!mm->join_stage(layer)) { return out; }
+    const int a = mm->begin(x, y, seq);
+    if (!mm->finish(layer, seq, 0.0, 0.0) || a <= 0) { return out; }
+    const auto* p = static_cast<const std::uint16_t*>(y.contents());
+    out.assign(p + (std::size_t)(seq - a) * N, p + (std::size_t)seq * N);
+    return out;
+  };
+  struct Case {
+    const char* name;
+    bool w4a8;
+    int  rot;
+    bool per_row;
+    int  qgroup;
+    bool codebook;
+  };
+  const Case cases[] = {
+      {"int8 per-tensor, unrotated", false, 0, false, 0, false},
+      {"int8 per-row, ConvRot 64", false, 64, true, 0, false},
+      {"int8 per-row, ConvRot 256", false, 256, true, 0, false},
+      {"int8 per-tensor, ConvRot 1024", false, 1024, false, 0, false},
+      {"W4A8 codebook, group 16, ConvRot 256", true, 256, true, 16, true},
+      {"W4A8 code - 8, group 32, ConvRot 64", true, 64, true, 32, false},
+      {"W4A8 codebook, group 16, unrotated", true, 0, true, 16, true},
+  };
+  for (const Case& c : cases) {
+    std::uniform_real_distribution<float> us(0.0005f, 0.004f);
+    std::vector<float> sc(c.per_row ? (std::size_t)N : 1);
+    for (float& v : sc) { v = us(rng); }
+    const SharedBuffer scb = floats(sc);
+    std::vector<std::uint16_t> wide((std::size_t)N * K);
+    SharedBuffer codes, srel, cbb;
+    std::vector<float> cbv;
+    if (!c.w4a8) {
+      codes = bytes((std::size_t)N * K, 0, 255);
+      // -128 is not a code ComfyUI writes; +-127 is the range.
+      auto* cp = static_cast<std::uint8_t*>(codes.contents());
+      for (std::size_t i = 0; i < (std::size_t)N * K; ++i) {
+        if (cp[i] == 0x80) { cp[i] = 0x81; }
+      }
+      fp8::decode_bf16(cp, wide.data(), N, K, fp8::Format::kI8, sc, c.rot);
+    } else {
+      codes = bytes((std::size_t)N * K / 2, 0, 255);
+      // E4M3 relative scales from 2^-3 to ~2^4: codes 0x20..0x58.
+      srel = bytes((std::size_t)N * (K / c.qgroup), 0x20, 0x58);
+      if (c.codebook) {
+        std::uniform_real_distribution<float> uc(-8.0f, 8.0f);
+        cbv.resize(16);
+        for (float& v : cbv) { v = uc(rng); }
+        cbb = floats(cbv);
+      }
+      fp8::decode_w4a8_bf16(
+          static_cast<const std::uint8_t*>(codes.contents()),
+          static_cast<const std::uint8_t*>(srel.contents()),
+          c.codebook ? cbv.data() : nullptr, sc, N, K, c.qgroup, c.rot,
+          wide.data());
+    }
+    SharedBuffer dense = mc->make_shared_buffer(wide.size() * 2);
+    std::memcpy(dense.contents(), wide.data(), wide.size() * 2);
+    AneFfnSource ref;
+    ref.w = &dense;
+    AneFfnSource src;
+    src.w        = &codes;
+    src.bits     = c.w4a8 ? AneFfnSource::kW4A8 : AneFfnSource::kInt8;
+    src.scales   = &scb;
+    src.rot      = c.rot;
+    src.srel     = c.w4a8 ? &srel : nullptr;
+    src.codebook = c.codebook ? &cbb : nullptr;
+    src.qgroup   = c.qgroup;
+    ASSERT_TRUE(src.stageable());
+    for (bool adapted : {false, true}) {
+      const std::vector<std::uint16_t> want = run(ref, adapted);
+      const std::vector<std::uint16_t> got  = run(src, adapted);
+      ASSERT_TRUE(!want.empty() && want.size() == got.size());
+      const bool same = !want.empty() && want == got;
+      std::printf("  %-38s%s: %s\n", c.name, adapted ? " +adapter" : "",
+                  same ? "identical" : "DIFFERENT");
+      EXPECT_TRUE(same);
+    }
+    if (c.rot > 0) {
+      AneFfnSource unrot = src;
+      unrot.rot = 0;
+      const std::vector<std::uint16_t> want = run(ref, false);
+      const std::vector<std::uint16_t> got  = run(unrot, false);
+      EXPECT_TRUE(!got.empty() && want != got);
+    }
+  }
+  // Refused, not misread: a rotation that is not a power of four, a W4A8
+  // source without its relative scales, an int8 one without its scale.
+  AneFfnSource bad;
+  SharedBuffer c8 = bytes((std::size_t)N * K, 0, 255);
+  SharedBuffer s1 = floats({0.01f});
+  bad.w = &c8;
+  bad.bits = AneFfnSource::kInt8;
+  bad.scales = &s1;
+  bad.rot = 128;
+  EXPECT_FALSE(bad.stageable());
+  bad.rot = 0;
+  EXPECT_TRUE(bad.stageable());
+  bad.scales = nullptr;
+  EXPECT_FALSE(bad.stageable());
+  bad.scales = &s1;
+  bad.bits = AneFfnSource::kW4A8;
+  bad.qgroup = 16;
+  EXPECT_FALSE(bad.stageable());
+}
+
+// STAGING HAS ITS OWN QUEUE. A module stages while another module's
+// predict runs on the ANE worker, and a block staged ahead is the block
+// the split reads: stage() returns without waiting for the other
+// module's predict, queued() names the block, and a block staged
+// before a predict of its own module is waited for, not raced.
+TEST(ane_tier, staging_runs_beside_the_other_module)
+{
+  using vpipe::genai::AneFeedForward;
+  using vpipe::genai::AneFfnSource;
+  using vpipe::metal_compute::SharedBuffer;
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  constexpr int K = 512, N = 1536, seq = 2048, chunk = 512;
+  std::mt19937 rng(13);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto bf16 = [&](std::size_t n, float sc) {
+    SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      const float f = nd(rng) * sc;
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &f, sizeof(bits));
+      p[i] = (std::uint16_t)(bits >> 16);
+    }
+    return b;
+  };
+  const SharedBuffer x = bf16((std::size_t)seq * K, 0.5f);
+  const SharedBuffer w1 = bf16((std::size_t)N * K, 0.05f);
+  const SharedBuffer w2 = bf16((std::size_t)N * K, 0.05f);
+  AneFeedForward::Options o;
+  o.session = &sess;
+  o.mc      = mc;
+  o.hidden  = K;
+  o.ffn     = N;
+  o.seq     = seq;
+  o.rows    = 0.75f;
+  o.chunk   = chunk;
+  o.matmul  = true;
+  o.tag     = "stage-a";
+  auto a = AneFeedForward::create(o);
+  o.tag     = "stage-b";
+  auto b = AneFeedForward::create(o);
+  if (a == nullptr || b == nullptr) { return; }
+  auto out = [&]() {
+    SharedBuffer y = mc->make_shared_buffer((std::size_t)seq * N * 2);
+    std::memset(y.contents(), 0, y.byte_size());
+    return y;
+  };
+  AneFfnSource s1, s2;
+  s1.w = &w1;
+  s2.w = &w2;
+  // Reference: each module alone, staged and run in turn.
+  a->stage(1, s1, 0);
+  ASSERT_TRUE(a->join_stage(1));
+  SharedBuffer ya = out();
+  const int ra = a->begin(x, ya, seq);
+  ASSERT_TRUE(a->finish(1, seq, 0.0, 0.0) && ra > 0);
+  b->stage(1, s2, 0);
+  ASSERT_TRUE(b->join_stage(1));
+  SharedBuffer yb = out();
+  const int rb = b->begin(x, yb, seq);
+  ASSERT_TRUE(b->finish(1, seq, 0.0, 0.0) && rb > 0);
+  // Overlapped: b's next block staged while a's predict runs, then a
+  // staged AHEAD of its turn while b predicts, each joined at its split.
+  a->stage(2, s1, 0);
+  ASSERT_TRUE(a->join_stage(2));
+  SharedBuffer ya2 = out(), yb2 = out();
+  ASSERT_TRUE(a->begin(x, ya2, seq) == ra);
+  b->stage(2, s2, 0);                    // beside a's predict
+  EXPECT_TRUE(b->queued(2) && !b->queued(1));
+  ASSERT_TRUE(a->finish(2, seq, 0.0, 0.0));
+  ASSERT_TRUE(b->join_stage(2));
+  ASSERT_TRUE(b->begin(x, yb2, seq) == rb);
+  a->stage(3, s2, 0);                    // ahead, beside b's predict
+  ASSERT_TRUE(b->finish(2, seq, 0.0, 0.0));
+  // a's slots now hold w2: its next split computes b's projection.
+  ASSERT_TRUE(a->join_stage(3) && a->queued(3));
+  SharedBuffer ya3 = out();
+  ASSERT_TRUE(a->begin(x, ya3, seq) == ra);
+  ASSERT_TRUE(a->finish(3, seq, 0.0, 0.0));
+  const std::size_t bytes_n = (std::size_t)seq * N * 2;
+  EXPECT_TRUE(std::memcmp(ya.contents(), ya2.contents(), bytes_n) == 0);
+  EXPECT_TRUE(std::memcmp(yb.contents(), yb2.contents(), bytes_n) == 0);
+  EXPECT_TRUE(std::memcmp(yb.contents(), ya3.contents(), bytes_n) == 0);
+  // Staged into a module whose predict is in flight: waited for, so the
+  // predict reads the weights it began with (w2), not the new ones.
+  SharedBuffer ya4 = out();
+  ASSERT_TRUE(a->begin(x, ya4, seq) == ra);
+  a->stage(4, s1, 0);
+  ASSERT_TRUE(a->finish(3, seq, 0.0, 0.0));
+  EXPECT_TRUE(std::memcmp(yb.contents(), ya4.contents(), bytes_n) == 0);
+  ASSERT_TRUE(a->join_stage(4));
+  a->forget_staged();
+  EXPECT_FALSE(a->queued(4));
 }
 
 // THE GPU FALLBACK'S CONTRACT, through the described surface a plugin

@@ -427,6 +427,18 @@ denoise(const DenoiseRequest& req, std::string* err)
                    "step past it), threshold '{}'", taus,
                    sol::threshold_name(req.dit->config().sol.thresh)));
   }
+  if (!req.vdn_range_steps.empty() && sess != nullptr &&
+      req.dit->has_linear_branch()) {
+    std::string rs;
+    for (std::size_t k = 0; k < req.vdn_range_steps.size(); ++k) {
+      const int r = req.vdn_range_steps[k];
+      rs += fmt("{}{}", k > 0 ? ", " : "",
+                r < 0 ? req.dit->vdn_checkpoint_radius() : r)();
+    }
+    sess->info(fmt("h3-denoise: VDN softmax window by step {} chunk(s) "
+                   "either side (the last for any step past it), the "
+                   "linear half beyond", rs));
+  }
   if (renoise && sess != nullptr) {
     sess->info(fmt("h3-denoise: {} steps RE-NOISED on the sampling "
                    "contract's grid ({}): x0 at each sigma, then fresh "
@@ -529,6 +541,11 @@ denoise(const DenoiseRequest& req, std::string* err)
             (std::size_t)i, req.sol_tau_steps.size() - 1)];
         st.sol_exact =
             req.dit->config().sol.thresh == sol::Threshold::kExact;
+      }
+      if (!req.vdn_range_steps.empty()) {
+        const std::size_t k = std::min<std::size_t>(
+            (std::size_t)i, req.vdn_range_steps.size() - 1);
+        st.vdn_radius = std::max(-1, req.vdn_range_steps[k]);
       }
       st.sage_pv8_off       = i < pv8_from;
       st.video_grid_h       = req.video_grid_h;

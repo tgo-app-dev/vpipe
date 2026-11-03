@@ -1015,6 +1015,115 @@ TEST(minimax_h3_regenerate, kept_blocks_keep_their_factors_booked)
   EXPECT_TRUE(lora.v == pre);
 }
 
+// PROMOTION UNDER THE NEXT BLOCK: four real blocks streamed through the
+// slot pair, an adapter whose factors stream with them, every block kept
+// by the first forward. Each block but the last is copied, kept and wired
+// after the NEXT block's commit (deferred_promotions), and both forwards
+// -- the streamed one and the one run from what the promotions kept --
+// are the preloaded model's to the bit. Each block waits for its copy in
+// the SPARE (spared_promotions), so its slot's next read does not.
+// Beside it: the promotion in line (VPIPE_H3_PROMOTE_INLINE=1, the order
+// before), the same bytes and the same holding; and the copy held back
+// 300 ms (VPIPE_H3_TEST_PROMOTE_DELAY_MS), with the spare and without
+// (VPIPE_H3_NO_PROMOTE_SPARE=1, the copy out of the slot itself) --
+// under which a read issued into a slot before the copy that empties it
+// would land first and keep block L + 2's weights as block L's. The
+// order's other trap, the factors kept after the next block's fill has
+// replaced them, keeps the block without its adapter; both read here as
+// a second forward that is not the preloaded one.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_MINIMAX_H3_TURBO_LORA.
+TEST(minimax_h3_regenerate, a_promotion_runs_under_the_next_block)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string lp = env_("VPIPE_MINIMAX_H3_TURBO_LORA");
+  if (h3root.empty() || lp.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / "
+                "VPIPE_MINIMAX_H3_TURBO_LORA unset\n");
+    return;
+  }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  for (const char* k : {"VPIPE_H3_LORA_RESIDENT", "VPIPE_H3_PROMOTE_INLINE",
+                        "VPIPE_H3_TEST_PROMOTE_DELAY_MS",
+                        "VPIPE_H3_NO_PROMOTE_SPARE",
+                        "VPIPE_H3_NO_PREFETCH", "VPIPE_H3_NO_SLOTS"}) {
+    ::unsetenv(k);
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  constexpr int kLayers = 4;
+  BlockRun br;
+  ASSERT_TRUE(br.setup(mc, h3root, kLayers, 4, 16, 32));
+  if (br.vb.empty()) { return; }
+  using Spec = MetalMiniMaxH3Transformer::LoraSpec;
+  const std::vector<Spec> specs{Spec{lp, 1.0f}};
+  struct Out {
+    std::vector<float> v1, v2;
+    int kept = -1, deferred = -1, spared = -1, hits = -1;
+    std::size_t resid = 0, lora = 0;
+  };
+  auto streamed = [&](Out* o) {
+    auto m = MetalMiniMaxH3Transformer::load(br.root, mc, br.cfg, true,
+                                             specs);
+    if (m == nullptr) { return false; }
+    m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+    m->set_residency_reserve(test_residency_reserve(2ull << 30));
+    double ms = 0.0;
+    if (!br.forward_on(*m, &o->v1, &ms)) { return false; }
+    o->deferred = m->deferred_promotions();
+    o->spared = m->spared_promotions();
+    o->hits = m->prefetch_hits();
+    o->kept = m->resident_block_count();
+    if (!br.forward_on(*m, &o->v2, &ms)) { return false; }
+    o->resid = m->resident_block_bytes();
+    o->lora = m->lora_bytes();
+    return true;
+  };
+  Out pipe, inl, slow, bare;
+  ASSERT_TRUE(streamed(&pipe));
+  {
+    Env e("VPIPE_H3_PROMOTE_INLINE", "1");
+    ASSERT_TRUE(streamed(&inl));
+  }
+  {
+    Env e("VPIPE_H3_TEST_PROMOTE_DELAY_MS", "300");
+    ASSERT_TRUE(streamed(&slow));
+    Env n("VPIPE_H3_NO_PROMOTE_SPARE", "1");
+    ASSERT_TRUE(streamed(&bare));
+  }
+  std::vector<float> pre;
+  ASSERT_TRUE(br.run(mc, specs, &pre, nullptr));
+  auto say = [&](const Out& o) {
+    return (o.v1 == pre && o.v2 == pre) ? "IS" : "is NOT";
+  };
+  const Out* arms[] = {&pipe, &inl, &slow, &bare};
+  std::printf("  pipelined / in line / copy held back / held back, no "
+              "spare:\n");
+  for (const Out* o : arms) {
+    std::printf("    kept %d of %d after one forward; promoted under the "
+                "next block %d (out of the spare %d); prefetch hits %d; "
+                "residency %zu MB, factors %zu MB; both forwards %s the "
+                "preloaded model's\n", o->kept, kLayers, o->deferred,
+                o->spared, o->hits, o->resid >> 20, o->lora >> 20, say(*o));
+  }
+  for (const Out* o : arms) {
+    EXPECT_TRUE(o->kept == kLayers && o->hits == kLayers - 1);
+    EXPECT_TRUE(o->resid == inl.resid && o->lora == inl.lora);
+    EXPECT_TRUE(o->v1 == pre && o->v2 == pre);
+  }
+  EXPECT_TRUE(inl.deferred == 0 && inl.spared == 0);
+  // Every block's promotion moves to the spare; all but the last run
+  // under the next block.
+  EXPECT_TRUE(pipe.deferred == kLayers - 1 && pipe.spared == kLayers);
+  EXPECT_TRUE(slow.deferred == kLayers - 1 && slow.spared == kLayers);
+  EXPECT_TRUE(bare.deferred == kLayers - 1 && bare.spared == 0);
+}
+
 // The refine's memory plan, off the stage before anything loads: the
 // merged LoRA booked at every factor a streamed DiT's kept blocks
 // converge on, streamable to the streamed block's set (its header's

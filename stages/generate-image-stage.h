@@ -731,6 +731,15 @@ private:
   // checkpoints cannot be told apart by their files, so guidance is the
   // graph's decision, as on Z-Image.
   double _fibo2_guidance_cfg = -1.0;
+  // fibo2-model-config's `megapixels`; <= 0 is "no opinion" (1, the
+  // trained area). The size of a text-to-image left unsized, and the area
+  // the plan books an edit at.
+  double _fibo2_megapixels = 0.0;
+  // The 1:1 size about `megapixels` (<= 0: 1) -- the reference's own
+  // default size, 1024 x 1024, at 1.
+  static std::pair<int, int> fibo2_default_size_(double megapixels);
+  // The plan's copy of `megapixels` (the model-config constant), else 0.
+  double fibo2_plan_megapixels_() const;
   bool load_fibo2_dit_();
   void free_fibo2_dit_for_decode_(int gen_w, int gen_h);
   // Text bundles [6, n_rows, cap] (+ the pictures to edit, as latents)

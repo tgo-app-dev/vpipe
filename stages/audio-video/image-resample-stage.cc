@@ -6,6 +6,7 @@
 #include "common/beat-keys.h"
 #include "common/flex-data.h"
 #include "common/job.h"
+#include "common/size-about-area.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -60,6 +61,7 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   _max_pixels = attr_int("max_pixels");
   _min_side   = static_cast<int>(attr_int("min_side"));
   _max_side   = static_cast<int>(attr_int("max_side"));
+  _megapixels = attr_real("megapixels");
 
   const string fit = attr_str("fit");
   if      (fit == "crop")         { _mode = 1; }
@@ -67,6 +69,7 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   else if (fit == "manual")       { _mode = 3; }
   else if (fit == "pad_to_grid")  { _mode = 4; }
   else if (fit == "crop_to_grid") { _mode = 5; }
+  else if (fit == "crop_to_area") { _mode = 6; }
   else                            { _mode = 0; }   // pad (default)
 
   const string alg = attr_str("algorithm");
@@ -80,7 +83,18 @@ ImageResampleStage::ImageResampleStage(const SessionContextIntf* session,
   // Deferred validation: the ctor never throws (Stage::fail_config).
   // At least one of width / height must be positive; a missing (<= 0)
   // axis is inferred per-frame from the source aspect ratio.
-  if (_mode >= 4) {
+  if (_mode == 6) {
+    // Sized from the source too. A grid and an area no size fits are
+    // refused here rather than as a dropped beat.
+    const long long area = std::llround(_megapixels * 1048576.0);
+    if (_grid <= 0 || !(_megapixels > 0.0) ||
+        size_about_area(1.0, area, _grid).first <= 0) {
+      fail_config(fmt("ImageResampleStage('{}'): fit 'crop_to_area' wants "
+                      "grid > 0 and megapixels > 0 with sizes on the grid "
+                      "near that area (got grid {}, megapixels {})",
+                      this->id(), _grid, _megapixels));
+    }
+  } else if (_mode >= 4) {
     // The grid fits size the output from the source; width / height are
     // not read, so nothing about them can be wrong.
     if (_grid <= 0 || _max_pixels <= 0 || _min_side < 0 ||
@@ -113,7 +127,8 @@ namespace {
 // These must agree with the ctor's own branch chains above, which stay
 // the authority on what is accepted.
 constexpr SpecExtra kFitChoices[] = {
-  {spec_key::kChoices, "pad,crop,stretch,manual,pad_to_grid,crop_to_grid"},
+  {spec_key::kChoices,
+   "pad,crop,stretch,manual,pad_to_grid,crop_to_grid,crop_to_area"},
 };
 constexpr SpecExtra kAlgorithmChoices[] = {
   {spec_key::kChoices, "lanczos,bilinear,bicubic"},
@@ -139,12 +154,20 @@ constexpr ConfigKey kAttrs[] = {
           "the edited result back to it -- FLUX.3's single-reference edit) "
           "| crop_to_grid (scale down to at most max_pixels, centre-crop "
           "each side DOWN to `grid` -- FLUX.3's rule for each of several "
-          "references)",
+          "references) | crop_to_area (the size on `grid` within 10% of "
+          "`megapixels` whose aspect crops least from the picture's, "
+          "covered and centre-cropped, up or down -- Fibo 2.0's trained "
+          "sizes, Bria's get_image_size)",
    .def_str = "pad", .extra = kFitChoices},
   {.key = "grid", .type = ConfigType::Int,
-   .doc = "pad_to_grid / crop_to_grid: the multiple every output side "
-          "lands on (16: a FLUX VAE latent cell)",
+   .doc = "pad_to_grid / crop_to_grid / crop_to_area: the multiple every "
+          "output side lands on (16: a FLUX VAE latent cell)",
    .def_int = 16},
+  {.key = "megapixels", .type = ConfigType::Real,
+   .doc = "crop_to_area: the area the size is chosen about, in units of "
+          "1024 x 1024. Fibo 2.0 was trained about 1; Bria's service also "
+          "offers 4 (1:1 2048 x 2048, 16:9 2816 x 1584)",
+   .def_real = 1.0},
   {.key = "max_pixels", .type = ConfigType::Int,
    .doc = "pad_to_grid / crop_to_grid: the most pixels the output may "
           "have (pad_to_grid counts the padded canvas). FLUX.3 uses "
@@ -209,7 +232,9 @@ const StageSpec kSpec = {
                "configurable aspect-ratio fit (pad / crop / stretch / "
                "manual) and pad colour -- or, with pad_to_grid / "
                "crop_to_grid, to the source's own aspect on a side grid "
-               "(FLUX.3's reference rules). Resamples with Lanczos-3 by "
+               "(FLUX.3's reference rules), or with crop_to_area to the "
+               "size about an area its aspect crops least to (Fibo 2.0's "
+               "trained sizes). Resamples with Lanczos-3 by "
                "default; 'bilinear' is cheaper and 'bicubic' matches PIL. "
                "f16 and f32 frames, RGB or RGBA, resample on the GPU with "
                "every filter; u8 RGB with bilinear or lanczos; the rest on "
@@ -280,7 +305,7 @@ ImageResampleStage::cpu_resample_(const uint8_t* src, int in_w, int in_h,
 {
   const metal_compute::ResampleGeom g =
       metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
-          _mode, _src_x, _src_y, static_cast<float>(_scale));
+          geom_mode_(), _src_x, _src_y, static_cast<float>(_scale));
   const int planeS = in_w * in_h;
   const int planeD = out_w * out_h;
   const float div = is_f32 ? 255.0f : 1.0f;   // f32 frames are 0..1
@@ -337,7 +362,7 @@ ImageResampleStage::cpu_lanczos_(const uint8_t* src, int in_w, int in_h,
 {
   const metal_compute::ResampleGeom g =
       metal_compute::compute_resample_geom(in_w, in_h, out_w, out_h,
-          _mode, _src_x, _src_y, static_cast<float>(_scale));
+          geom_mode_(), _src_x, _src_y, static_cast<float>(_scale));
   const int planeS = in_w * in_h;
   const int planeD = out_w * out_h;
   const float div = is_f32 ? 255.0f : 1.0f;   // f32 frames are 0..1
@@ -428,6 +453,24 @@ ImageResampleStage::process(RuntimeContext& ctx)
   const int in_h = static_cast<int>(tin->shape[1]);
   const int in_w = static_cast<int>(tin->shape[2]);
   if (in_w <= 0 || in_h <= 0) { co_return; }
+
+  if (_mode == 6) {
+    const auto [aw, ah] = area_fit(in_w, in_h);
+    if (aw <= 0 || ah <= 0) {
+      session()->warn(fmt(
+          "ImageResampleStage('{}'): no size on the {}-pixel grid lies "
+          "within 10% of {} megapixels for a {}x{} picture; dropping beat",
+          this->id(), _grid, _megapixels, in_w, in_h));
+      co_return;
+    }
+    auto out = resample_(*tin, aw, ah);
+    if (!out) { co_return; }
+    if (out->sideband.is_object()) {
+      out->sideband.as_object().erase(sideband::kCropBox);
+    }
+    co_await ctx.write(0, std::move(out));
+    co_return;
+  }
 
   if (_mode < 4) {
     // Resolve the output size against this frame: an axis left at 0 is
@@ -537,6 +580,14 @@ ImageResampleStage::process(RuntimeContext& ctx)
       "({}, {})", this->id(), in_w, in_h, g.fit_w, g.fit_h, g.out_w,
       g.out_h, g.x0, g.y0));
   co_await ctx.write(0, std::move(out));
+}
+
+std::pair<int, int>
+ImageResampleStage::area_fit(int in_w, int in_h) const noexcept
+{
+  if (in_w <= 0 || in_h <= 0) { return {0, 0}; }
+  return size_about_area((double)in_w / (double)in_h,
+                         std::llround(_megapixels * 1048576.0), _grid);
 }
 
 ImageResampleStage::GridFit
