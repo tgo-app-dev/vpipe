@@ -143,6 +143,14 @@ class MetalKrea2Transformer {
     // wide) with its own auto share and on/off controller. Needs `session`
     // like the rest of the tier. VPIPE_KREA2_ANE_QKV=1 also turns it on.
     bool  ane_qkv    = false;
+    // The ANE's modules in ROTATED INT8 (W8A8; AneFeedForward::Options::
+    // int8): generate-image's `ane_int8`. LOSSY -- the GPU token tier's
+    // arithmetic on the ANE's rows; a module that cannot take it keeps
+    // fp16 and says so. VPIPE_ANE_INT8 overrides it.
+    bool  ane_int8   = false;
+    // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
+    // `ane_int8_tier: token_plain`). Only with ane_int8.
+    bool  ane_int8_plain = false;
 
     int   text_head_dim() const { return text_hidden / text_heads; }  // 128
   };
@@ -376,6 +384,16 @@ class MetalKrea2Transformer {
   // eligibility -- so a caller revising what the plan booked has to ask
   // about both.
   bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
+  // How many of the armed modules run int8 (Config::ane_int8, where the
+  // module and the OS could take it): rotated per token, or with `plain`
+  // unrotated (Config::ane_int8_plain).
+  int ane_int8_modules(bool plain = false) const noexcept
+  {
+    auto is = [plain](const AneFeedForward* a) {
+      return a != nullptr && a->int8() && a->int8_plain() == plain ? 1 : 0;
+    };
+    return is(_ane.get()) + is(_ane_qkv.get());
+  }
   // Whether a tier LOST rows on some block and has stayed on the GPU
   // since (AneFeedForward::gpu_only): the rows were recomputed on
   // the GPU, and no later block split.

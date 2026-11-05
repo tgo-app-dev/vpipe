@@ -13,6 +13,7 @@
 // VPIPE_FLUX2_GOLDEN = the golden dir (for flux2_golden.*). VPIPE_FLUX2_E2E set
 // = run the end-to-end pipeline test. Unset => the relevant tier skips.
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 #include "residency-reserve.h"
 
@@ -1552,12 +1553,14 @@ TEST(flux2_smoke, forward_dit_ane_matches_gpu)
     std::vector<float> vel;
     double ms = 0.0;
     bool armed = false;
+    int int8 = 0;              // modules that ran rotated int8
   };
-  auto run = [&](bool ane) {
+  auto run = [&](bool ane, bool int8 = false) {
     Arm out;
     MetalFlux2Transformer::Config cfg;
     if (ane) {
       cfg.session  = &sess;
+      cfg.ane_int8 = int8;
       // _ROWS: the ANE's share (0 = measured balance); _LAYERS: cap the
       // blocks, double then single -- the double count isolates them.
       // Default: the tier's own share and chunk, which is what a graph gets.
@@ -1599,6 +1602,7 @@ TEST(flux2_smoke, forward_dit_ane_matches_gpu)
       if (it > 0 && (out.ms == 0.0 || ms < out.ms)) { out.ms = ms; }
     }
     out.armed = m->ane_armed();
+    out.int8 = m->ane_int8_modules();
     const std::size_t n = (std::size_t)img_seq * c.out_channels;
     if (vel.byte_size() < n * 2) { return out; }
     // The DiT runs bf16: the top half of an f32.
@@ -1650,6 +1654,30 @@ TEST(flux2_smoke, forward_dit_ane_matches_gpu)
   EXPECT_TRUE(r > 0.0);
   EXPECT_TRUE(std::isfinite(r) && r < 0.10);
   if (!ane.armed) { return; }
+  if (ane_int8_env_free()) { EXPECT_TRUE(ane.int8 == 0); }
+
+  // ROTATED INT8 (ane_int8): every tier again in the GPU token tier's
+  // arithmetic -- the double feed-forward and the single projection (and
+  // q|k|v where asked) ENGAGED, then the same bar.
+  {
+    const Arm a8 = run(true, /*int8=*/true);
+    ASSERT_TRUE(a8.vel.size() == gpu.vel.size());
+    if (a8.vel.size() != gpu.vel.size()) { return; }
+    double n8 = 0.0, d8 = 0.0;
+    for (std::size_t i = 0; i < gpu.vel.size(); ++i) {
+      const double d = (double)a8.vel[i] - (double)gpu.vel[i];
+      n8 += d * d;
+      d8 += (double)gpu.vel[i] * (double)gpu.vel[i];
+    }
+    const double r8 = d8 > 0.0 ? std::sqrt(n8 / d8) : 0.0;
+    std::printf("[flux2_smoke] ... in rotated int8 (%d modules int8): "
+                "velocity rel-L2 %.3e\n", a8.int8, r8);
+    if (ane_int8_expected()) {
+      const bool qkv = std::getenv("VPIPE_FLUX2_ANE_QKV") != nullptr;
+      EXPECT_TRUE(a8.armed && a8.int8 == (qkv ? 3 : 2));
+      EXPECT_TRUE(std::isfinite(r8) && r8 < 0.10);
+    }
+  }
 
   // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
   // first forward builds them), all three tiers at once -- the double

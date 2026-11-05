@@ -5,6 +5,8 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-references.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
+#include "generative-models/shared/torch-randn.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 
 #include <algorithm>
@@ -193,6 +195,42 @@ pack_condition_rows_raw_(const std::uint16_t* mp, int z,
   }
 }
 
+// The posterior SAMPLED, as the reference's encode_vae_condition draws
+// it: DiagonalGaussianDistribution's sample under a fresh torch CPU
+// generator at `seed` -- noise drawn over the whole [1, z, lt, lh, lw]
+// latent in C order -- the logvar clamped to [-30, 20], the sample
+// rounded to float16, then whitened. Into an f32 [z, lt, lh, lw] latent.
+bool
+sample_condition_latent_(const std::uint16_t* mp, int z, int lt, int lh,
+                         int lw, std::uint64_t seed,
+                         const std::vector<float>& mean,
+                         const std::vector<float>& std_,
+                         std::vector<float>* out)
+{
+  const std::size_t vox = (std::size_t)lt * lh * lw;
+  const std::size_t n = (std::size_t)z * vox;
+  TorchCpuRandn rng(seed);
+  const std::vector<float> eps = rng.randn(n);
+  if (eps.size() != n) { return false; }
+  const bool whiten = (int)mean.size() == z && (int)std_.size() == z;
+  out->resize(n);
+  for (int c = 0; c < z; ++c) {
+    const float mu = whiten ? mean[(std::size_t)c] : 0.0f;
+    const float sd = whiten ? std_[(std::size_t)c] : 1.0f;
+    for (std::size_t i = 0; i < vox; ++i) {
+      const std::size_t k = (std::size_t)c * vox + i;
+      const float m = bf16_to_f32_(mp[k]);
+      const float lv =
+          std::min(std::max(bf16_to_f32_(mp[n + k]), -30.0f), 20.0f);
+      const float stdv = std::exp(0.5f * lv);
+      const float smp = m + stdv * eps[k];
+      const float h = (float)(_Float16)smp;
+      (*out)[k] = sd != 0.0f ? (h - mu) / sd : (h - mu);
+    }
+  }
+  return true;
+}
+
 // How many of a normalized reference's `nf` frames the video VAE
 // encodes. A clip is snapped DOWN to `17n + 5` so it encodes without
 // padding -- which only bites when the reference is SHORTER than the
@@ -237,7 +275,14 @@ reference_work_(const MediaReference& m, const ReferencePlan& plan,
   if (m.kind == MediaReference::Kind::kAudio) { return 1; }
   if (m.has_video_latent() && m.rgb.empty()) { return 1; }
   int nf = 0, th = 0, tw = 0;
-  if (m.kind == MediaReference::Kind::kImage) {
+  if (m.kind == MediaReference::Kind::kImage && plan.area_min_pixels > 0) {
+    // P-H3-Image's rule; the first picture's floor is a few percent of
+    // the bar, not worth carrying the index for.
+    ph3::size_in_area_range(m.width, m.height, plan.area_min_pixels,
+                            plan.area_max_pixels, plan.canvas_multiple, &tw,
+                            &th);
+    nf = 1;
+  } else if (m.kind == MediaReference::Kind::kImage) {
     const int edge = m.short_edge >= 0 ? m.short_edge
                                        : plan.reference_image_short_edge;
     if (!resolve_reference_image_size(m.height, m.width, edge,
@@ -682,7 +727,26 @@ encode_references(const std::vector<MediaReference>& refs,
       if (timing) { (void)tick(); }
       // A reference's own short edge wins over the plan's. Negative
       // means it did not state one.
-      if (m.kind == MediaReference::Kind::kImage) {
+      if (m.kind == MediaReference::Kind::kImage &&
+          plan.area_min_pixels > 0) {
+        // P-H3-Image's area range, the first picture -- the one edited --
+        // held at the canvas floor when the plan names one.
+        std::int64_t lo = plan.area_min_pixels;
+        if (i == 0 && plan.first_min_pixels > 0) {
+          lo = std::max(lo, plan.first_min_pixels);
+        }
+        ph3::size_in_area_range(m.width, m.height, lo, plan.area_max_pixels,
+                                plan.canvas_multiple, &tw, &th);
+        if (th == m.height && tw == m.width) {
+          px = m.rgb;
+        } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                              m.width, th, tw, &px)) {
+          return fail(where + ": the resize to " + std::to_string(tw) + "x" +
+                      std::to_string(th) + " failed");
+        }
+        nf = 1;
+        fit.rate_frames = 1;
+      } else if (m.kind == MediaReference::Kind::kImage) {
         const int edge = m.short_edge >= 0 ? m.short_edge
                                            : plan.reference_image_short_edge;
         if (!normalize_image_reference(m.rgb.data(), m.height, m.width, edge,
@@ -736,7 +800,22 @@ encode_references(const std::vector<MediaReference>& refs,
         if (timing) { (void)tick(); }
         MetalQwenVisionEncoder::Result res;
         std::vector<float> secs;
-        if (m.kind == MediaReference::Kind::kImage) {
+        if (m.kind == MediaReference::Kind::kImage &&
+            plan.vision_pixels > 0) {
+          // The tower's OWN copy (P-H3-Image): resized from the picture
+          // as it arrived, not from the VAE's.
+          int vw = 0, vh = 0;
+          ph3::size_at_area(m.width, m.height, plan.vision_pixels,
+                            plan.canvas_multiple, &vw, &vh);
+          std::vector<std::uint8_t> vpx;
+          if (vh == m.height && vw == m.width) {
+            vpx = m.rgb;
+          } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                                m.width, vh, vw, &vpx)) {
+            return fail(where + ": the vision resize failed");
+          }
+          res = models.vision->encode(vpx.data(), vh, vw);
+        } else if (m.kind == MediaReference::Kind::kImage) {
           res = models.vision->encode(px.data(), th, tw);
         } else {
           std::vector<int> idx;
@@ -852,9 +931,22 @@ encode_references(const std::vector<MediaReference>& refs,
                       "divide");
         }
         const std::size_t before = r.video_rows.size();
-        pack_condition_rows_(mom, vc.z_channels, lf, lh, lw, plan.patch_h,
-                             plan.patch_w, vc.latents_mean, vc.latents_std,
-                             &r.video_rows);
+        if (plan.posterior_seed >= 0) {
+          std::vector<float> lat;
+          if (!sample_condition_latent_(
+                  static_cast<const std::uint16_t*>(mom.contents()),
+                  vc.z_channels, lf, lh, lw,
+                  (std::uint64_t)plan.posterior_seed, vc.latents_mean,
+                  vc.latents_std, &lat)) {
+            return fail(where + ": the posterior sample failed");
+          }
+          pack_latent_rows_(lat.data(), vc.z_channels, lf, lh, lw,
+                            plan.patch_h, plan.patch_w, &r.video_rows);
+        } else {
+          pack_condition_rows_(mom, vc.z_channels, lf, lh, lw, plan.patch_h,
+                               plan.patch_w, vc.latents_mean, vc.latents_std,
+                               &r.video_rows);
+        }
         augment_condition_rows_(&r.video_rows, before,
                                 plan.condition_noise_aug,
                                 plan.condition_noise_seed);

@@ -3232,6 +3232,157 @@ kernel void gemm_i8i8_coop_probe(
   }
 }
 
+
+// ---- Qwen3.8-Flash-Next's hyper-connection GEMMs, their elementwise
+// passes in the store (a prefill's rows; qwen4_hc.metal holds the model) --
+//
+// DOWN: d [M, R] = silu(elt(hcn [M, SH] @ Wd [R, SH]^T) / S) -- the
+// reference rounds the projection, then divides by the stream count
+// (exact: a power of two) and applies silu, rounded again: hc_act_f16's
+// arithmetic, in the register tile. Tiles BN wide: R = 320 is five of 64,
+// where the deep-K 128 x 256 tile computed 512 columns in 106 threadgroups.
+// The threadgroups of the first column tile also finish the injection
+// weights from hc_group_rms8_pre_f16's partials: inj[m, j] =
+// 2 sigmoid(elt(sum_s part[m, s, j]) / S), hc_act_f16's rounding.
+template <int BM, int BN, int SG>
+static inline void hc_down_silu_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device VPIPE_ELT* y, int K, int N, int M, int S,
+    const device float* part, device float* inj, int with_inject,
+    uint3 tgid, uint lid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM, n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  if (with_inject != 0 && tgid.x == 0) {
+    for (int e = (int)lid; e < BM * S; e += SG * 32) {
+      const int m = m0 + e / S, j = e % S;
+      if (m >= M) { continue; }
+      float acc = 0.0f;
+      for (int sp = 0; sp < S; ++sp) {
+        acc += part[((ulong)m * S + sp) * S + j];
+      }
+      const float v = (float)(VPIPE_ELT)acc / (float)S;
+      inj[(ulong)m * S + j] =
+          (float)(VPIPE_ELT)(2.0f / (1.0f + metal::exp(-v)));
+    }
+  }
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  op.run(mX, mW, cT);
+  for (auto it = cT.begin(); it != cT.end(); ++it) {
+    if (!it.is_valid_element()) { continue; }
+    const float v = (float)*it / (float)S;
+    *it = (VPIPE_ELT)(v / (1.0f + metal::exp(-v)));
+  }
+  cT.store(tY.slice(n0, m0));
+}
+
+// UP + MIX: out [M, H] = (1/S) sum_s elt(sigmoid(u_s)) * n_s, u_s =
+// elt(d [M, R] @ Wu[s H .. s H + H)^T) -- the four streams' up rows of one
+// BN-wide hidden tile as four products into four register tiles of one
+// layout, so a lane's element i is the same (row, hidden) in each, and the
+// mix runs in the store: [M, S * H] of up output is never written and
+// re-read (hc_mix_f16's arithmetic, stream order and roundings).
+// S == 4 (the model's hc_count).
+template <int BM, int BN, int SG>
+static inline void hc_up_mix_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* hn, device VPIPE_ELT* out, int K, int H, int M,
+    uint3 tgid)
+{
+  constexpr int S = 4;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, S * H));
+  TX tO(out, dextents<int32_t, 2>(H, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM, h0 = (int)tgid.x * BN;
+  if (m0 >= M || h0 >= H) { return; }
+  auto mX = tX.slice(0, m0);
+  auto w0 = tW.slice(0, 0 * H + h0);
+  auto w1 = tW.slice(0, 1 * H + h0);
+  auto w2 = tW.slice(0, 2 * H + h0);
+  auto w3 = tW.slice(0, 3 * H + h0);
+  auto c0 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w0), VPIPE_ELT>();
+  auto c1 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w1), VPIPE_ELT>();
+  auto c2 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w2), VPIPE_ELT>();
+  auto c3 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w3), VPIPE_ELT>();
+  op.run(mX, w0, c0);
+  op.run(mX, w1, c1);
+  op.run(mX, w2, c2);
+  op.run(mX, w3, c3);
+  const ulong SH = (ulong)S * (ulong)H;
+  auto i1 = c1.begin(), i2 = c2.begin(), i3 = c3.begin();
+  for (auto i0 = c0.begin(); i0 != c0.end(); ++i0, ++i1, ++i2, ++i3) {
+    if (!i0.is_valid_element()) { continue; }
+    const auto ij = i0.get_multidimensional_index();
+    const ulong h = (ulong)(h0 + (int)ij[0]);
+    const device VPIPE_ELT* nr = hn + (ulong)(m0 + (int)ij[1]) * SH + h;
+    const VPIPE_ELT u[S] = {*i0, *i1, *i2, *i3};
+    float acc = 0.0f;
+    for (int st = 0; st < S; ++st) {
+      const float mw =
+          (float)(VPIPE_ELT)(1.0f / (1.0f + metal::exp(-(float)u[st])));
+      acc += (float)(VPIPE_ELT)(mw * (float)nr[(ulong)st * H]);
+    }
+    *i0 = (VPIPE_ELT)(acc / (float)S);
+  }
+  c0.store(tO.slice(h0, m0));
+}
+
+#define HC_DOWN(NAME, BM, BN, SG)                                        \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      device VPIPE_ELT* y [[buffer(2)]],                                 \
+      const constant int& K [[buffer(3)]],                              \
+      const constant int& N [[buffer(4)]],                              \
+      const constant int& M [[buffer(5)]],                              \
+      const constant int& S [[buffer(6)]],                              \
+      const device float* part [[buffer(7)]],                            \
+      device float* inj [[buffer(8)]],                                   \
+      const constant int& with_inject [[buffer(9)]],                    \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    hc_down_silu_impl<BM, BN, SG>(x, W, y, K, N, M, S, part, inj,        \
+                                  with_inject, tgid, lid);               \
+  }
+#define HC_UP(NAME, BM, BN, SG)                                          \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* hn [[buffer(2)]],                          \
+      device VPIPE_ELT* out [[buffer(3)]],                               \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& H [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    hc_up_mix_impl<BM, BN, SG>(x, W, hn, out, K, H, M, tgid);            \
+  }
+// MEASURED on the M5 Ultra, a block at 6667 rows (H 2560, R 320, w8 g64;
+// qwen4_exp_kernels.hc_prefill_fusion_agrees, VPIPE_HC_FUSE_BENCH): the
+// seven passes 3.06 ms; these with the fused norm 1.92 (1.59x). Down 64 x 64
+// tiles 2.03, up 128-row tiles 1.96, 32-wide 2.00.
+HC_DOWN(hc_down_silu_mma_m128_f16, 128, 64, 8)
+HC_UP(hc_up_mix_mma_m64_f16, 64, 64, 4)
+#undef HC_DOWN
+#undef HC_UP
+
 #else
 // Tensor ops unavailable for this target: emit stubs so the metallib
 // still builds. The loader never binds these on a non-tensor GPU.
@@ -3348,4 +3499,6 @@ DGV_STUB(dense_gemm_mma_splitk32_n128x256_k4352_f16)
 DGV_STUB(dense_gemm_mma_splitk32_n128x256_k5376_f16)
 DGV_STUB(dense_gemm_mma_splitk32_n128x256_k2304_f16)
 DGV_STUB(dense_gemm_mma_t_qkcausal_n128_f16)
+DGV_STUB(hc_down_silu_mma_m128_f16)
+DGV_STUB(hc_up_mix_mma_m64_f16)
 #endif

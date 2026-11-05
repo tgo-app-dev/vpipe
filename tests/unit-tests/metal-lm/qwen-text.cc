@@ -801,6 +801,67 @@ TEST(metal_lm_smoke, language_model_kept_warm) {
   EXPECT_TRUE(mgr->cached_count() == 0);
 }
 
+// A language model kept warm and asked for again under OTHER SETTINGS (its
+// K/V pages here: a host that changed how it loads it): the warm one goes
+// before the load, not kept beside the new one -- two copies of one
+// model's weights resident until the old hold ran out. One still in use
+// stays, its parked conversation with it. Gated on
+// VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_warm_model_under_other_settings_is_let_go) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  mgr->keep_warm(lm, path, 60.0);
+  lm.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+
+  // The same settings: handed the warm one, which stays.
+  auto same = mgr->load(spec);
+  ASSERT_TRUE(same != nullptr);
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->cached_count() == 1);
+  same.reset();
+
+  // Other pages: the warm one let go first -- one copy, the new one.
+  genai::LoadSpec more = spec;
+  more.max_pages = 16;
+  auto other = mgr->load(more);
+  ASSERT_TRUE(other != nullptr && other->valid());
+  EXPECT_TRUE(mgr->warm_count() == 0);
+  EXPECT_TRUE(mgr->cached_count() == 1);
+
+  // Kept warm in its turn: the one hold.
+  mgr->keep_warm(other, path, 60.0);
+  other.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+
+  // IN USE when a load under other settings comes (a peer stage on the
+  // folder): letting it go would free nothing, so its hold stays, and the
+  // conversation parked on it with no file to go to.
+  auto in_use = mgr->load(more);
+  ASSERT_TRUE(in_use != nullptr);
+  mgr->park_context("conv-a", in_use, in_use->make_context(), "held", "");
+  auto peer = mgr->load(spec);
+  ASSERT_TRUE(peer != nullptr && peer->valid());
+  EXPECT_TRUE(peer != in_use);
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->cached_count() == 2);
+  genai::LoadedLanguageModel::Context taken;
+  std::string meta;
+  EXPECT_TRUE(mgr->take_context("conv-a", in_use, &taken, &meta));
+  EXPECT_TRUE(meta == "held");
+}
+
 // A language model WIRED AS IT LOADS (load_spec::kWireWeights, text-chat's
 // `wire_weights`): its buffers mlock'd as they are allocated, so the
 // compressor cannot take the weights mid-read; what the load left wired is

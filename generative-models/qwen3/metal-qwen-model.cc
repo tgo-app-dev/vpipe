@@ -1551,6 +1551,7 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_moe_ifill = m->_lib_elt.function("moe_ifill_i32");
   m->_fn_moe_hist = m->_lib_elt.function("moe_hist_i32");
   m->_fn_moe_sort_setup = m->_lib_elt.function("moe_sort_setup_i32");
+  m->_fn_moe_tile_items = m->_lib_elt.function("moe_tile_items_i32");
   m->_fn_moe_scatter = m->_lib_elt.function("moe_scatter_i32");
   m->_fn_moe_scatter_back = m->_lib_elt.function("moe_scatter_back_f16");
   m->_fn_moe_qmm_grouped = m->_lib_qmm.function("affine_qmm_grouped_w4g64");
@@ -1612,6 +1613,7 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_lib_hc = mc->load_library("qwen4_hc" + sfx);
     m->_fn_hc_rms = m->_lib_hc.function("hc_group_rms_f16");
     m->_fn_hc_rms8 = m->_lib_hc.function("hc_group_rms8_f16");
+    m->_fn_hc_rms8_pre = m->_lib_hc.function("hc_group_rms8_pre_f16");
     m->_fn_hc_act = m->_lib_hc.function("hc_act_f16");
     m->_fn_hc_act_fused = m->_lib_hc.function("hc_act_fused_f16");
     m->_fn_hc_mix = m->_lib_hc.function("hc_mix_f16");
@@ -1819,6 +1821,11 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_dense_mma = m->_lib_dense_mma.function("dense_gemm_mma_t_n128_f16");
     m->_fn_dense_mma_deep =
         m->_lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
+    if (cfg.hc()) {
+      m->_fn_hc_down_silu =
+          m->_lib_dense_mma.function("hc_down_silu_mma_m128_f16");
+      m->_fn_hc_up_mix = m->_lib_dense_mma.function("hc_up_mix_mma_m64_f16");
+    }
     m->_fn_swiglu_inter = m->_lib_elt.function("swiglu_interleaved_f16");
     m->_use_mma = m->_fn_dequant.valid() && m->_fn_dense_mma.valid() &&
                   m->_fn_dense_mma_deep.valid() &&
@@ -1834,6 +1841,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
       // The QSA prefill rows' attention on the matrix units (qwen4_exp).
       if (cfg.qsa_heads > 0) {
         m->_fn_qsa_attn_nax = m->_lib_sdpa_mma.function("qsa_attn_nax_f16");
+        m->_fn_qsa_attn_nax2 =
+            m->_lib_sdpa_mma.function("qsa_attn_nax2_f16");
       }
     }
     if (const char* e = std::getenv("VPIPE_QWEN_MMA_MIN_M")) {
@@ -1873,6 +1882,11 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_moe_nax_down_w4 = fn("affine_qmm_grouped_nax_w4g64");
     m->_fn_moe_nax_down_w5 = fn("affine_qmm_grouped_nax_w5g64");
     m->_fn_moe_nax_down_w8 = fn("affine_qmm_grouped_nax_w8g64");
+    // The formats registered before the library loaded take their 64-row
+    // items' twins now.
+    for (auto& [key, f] : m->_xfns) {
+      m->attach_nax64_fns_(key / 1000, key % 1000, f);
+    }
   }
   // The prefill GQA attention set loads its members now that mma/use_mma are
   // resolved (it's tuned later in ensure_decode_scratch_).
@@ -4278,6 +4292,11 @@ MetalQwenModel::LayerLoad::build_layer(int L)
 
 MetalQwenModel::~MetalQwenModel()
 {
+  // The n-gram table's fill reads through the weight set: it stops first.
+  if (_ple) {
+    _ple->res_stop.store(true);
+    if (_ple->res_fill.joinable()) { _ple->res_fill.join(); }
+  }
   // Give the wired pool back and join any streamed read BEFORE the layers
   // go: only unwire_from_pool decrements the pool's counter.
   if (_rs) { _rs->shutdown(); }
@@ -4666,23 +4685,34 @@ MetalQwenModel::held_growth_bytes(const MetalLlamaWeights& wts,
   return grown;
 }
 
-std::size_t
-MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
-                                      const std::string& dir,
-                                      const Config& c, std::size_t scratch,
-                                      std::size_t limit, std::size_t cache)
+namespace {
+
+// What lm_expert_cache_bytes and lm_ngram_resident size a MoE in: the
+// budget the box, the plan beside it and the host's limit leave the model,
+// its parts as held (the experts, the n-gram table, the rest), and the
+// cache the host asks for (0 none).
+struct LmHold {
+  bool ok = false;
+  std::size_t budget = 0, rest = 0, experts = 0, unheld = 0;
+};
+
+LmHold
+lm_hold_(const SessionContextIntf* session, const std::string& dir,
+         const MetalQwenModel::Config& c, std::size_t scratch,
+         std::size_t limit)
 {
-  if (!c.is_moe()) { return 0; }
+  LmHold h;
+  if (!c.is_moe()) { return h; }
   const std::size_t ram = stream_physical_ram();
-  if (ram == 0) { return 0; }
+  if (ram == 0) { return h; }
   auto w = MetalLlamaWeights::open_model(dir);
-  if (!w.has_value()) { return 0; }
+  if (!w.has_value()) { return h; }
   std::size_t disk = 0;
   for (const std::string& nm : w->tensor_names()) {
     if (const auto* ti = w->info(nm)) { disk += (std::size_t)ti->nbytes; }
   }
-  const std::size_t experts = routed_expert_bytes(*w, c);
-  if (experts == 0) { return 0; }
+  h.experts = MetalQwenModel::routed_expert_bytes(*w, c);
+  if (h.experts == 0) { return h; }
   // Beside it: whatever the manager holds or was told is coming, without
   // this checkpoint -- what the plan counts for it, which a host's limit
   // books under its size on disk.
@@ -4703,21 +4733,51 @@ MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
   // The irreversible headroom (model_memory::kStreamHeadroom): a cache
   // sized now is not resized while the model lives.
   constexpr std::size_t kHeadroom = (std::size_t)8 << 30;
-  std::size_t budget =
+  h.budget =
       ram > others + scratch + kHeadroom ? ram - others - scratch - kHeadroom
                                          : 0;
   // The most the host lets it hold, its scratch in it.
   if (limit > 0) {
-    budget = std::min(budget, limit > scratch ? limit - scratch : 0);
+    h.budget = std::min(h.budget, limit > scratch ? limit - scratch : 0);
   }
-  const std::size_t unheld = unheld_bytes(*w, c);
-  const std::size_t rest =
-      (disk > experts + unheld ? disk - experts - unheld : 0) +
-      held_growth_bytes(*w, c);
+  h.unheld = MetalQwenModel::unheld_bytes(*w, c);
+  h.rest = (disk > h.experts + h.unheld ? disk - h.experts - h.unheld : 0) +
+           MetalQwenModel::held_growth_bytes(*w, c);
+  h.ok = true;
+  return h;
+}
+
+}  // namespace
+
+std::size_t
+MetalQwenModel::lm_expert_cache_bytes(const SessionContextIntf* session,
+                                      const std::string& dir,
+                                      const Config& c, std::size_t scratch,
+                                      std::size_t limit, std::size_t cache)
+{
+  LmHold h = lm_hold_(session, dir, c, scratch, limit);
+  if (!h.ok) { return 0; }
+  // A table held in memory is held beside the experts (lm_ngram_resident
+  // takes it only where every one of them is resident too).
+  if (c.ple_resident) { h.rest += h.unheld; }
   // The cache the host asks for: the rest and that, at most.
-  if (cache > 0) { budget = std::min(budget, rest + cache); }
-  return expert_cache_plan(budget, rest, experts,
-                           experts / (std::size_t)std::max(1, c.n_layers));
+  if (cache > 0) { h.budget = std::min(h.budget, h.rest + cache); }
+  return expert_cache_plan(h.budget, h.rest, h.experts,
+                           h.experts / (std::size_t)std::max(1, c.n_layers));
+}
+
+bool
+MetalQwenModel::lm_ngram_resident(const SessionContextIntf* session,
+                                  const std::string& dir, const Config& c,
+                                  std::size_t scratch, std::size_t limit,
+                                  std::size_t cache)
+{
+  const LmHold h = lm_hold_(session, dir, c, scratch, limit);
+  if (!h.ok || h.unheld == 0) { return false; }
+  // Every expert resident first (a cache asked for must hold them all),
+  // then the table beside them.
+  if (cache > 0 && cache < h.experts) { return false; }
+  return h.rest + h.experts + h.unheld <= h.budget;
 }
 
 std::size_t
@@ -6696,6 +6756,7 @@ MetalQwenModel::encode_moe_mlp_(
       enc.set_constant(5, np); enc.set_constant(6, K);
       enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
     }
+    if (_moe_prof != nullptr) { (*_moe_prof)(0); }
     if (grp->steel && _fp8_experts) {
       // The block-FP8 twins: the same sorted tiles, row gather and scatter
       // store, the weight read as codes + block scales.
@@ -6731,6 +6792,49 @@ MetalQwenModel::encode_moe_mlp_(
         const bool nax = nax_on && nsw != nullptr && ndn != nullptr &&
                          nsw->valid() && ndn->valid() && grp->maxm == 32 &&
                          (2 * I) % 64 == 0 && H % 64 == 0 && I % 64 == 0;
+        // ...over 64-row work items, two tiles of one expert a threadgroup
+        // (the same bits; its weight tile dequantized once for 64 rows).
+        // VPIPE_QWEN_MOE_NAX64=0 is the A/B.
+        static const bool kNax64 = [] {
+          const char* e = std::getenv("VPIPE_QWEN_MOE_NAX64");
+          return e == nullptr || std::atoi(e) != 0;
+        }();
+        const ComputeFunction* n64s = xf_up->nax64_swiglu;
+        const ComputeFunction* n64d = xf_dn->nax64_down;
+        const bool nax64 = nax && kNax64 && grp->items != nullptr &&
+                           n64s != nullptr && n64d != nullptr &&
+                           n64s->valid() && n64d->valid() &&
+                           _fn_moe_tile_items.valid();
+        if (nax64) {
+          // At most (tiles + experts used) / 2 items: an expert's tiles
+          // two at a time.
+          const int ni = std::min(mt, (mt + std::min(E, np) + 1) / 2);
+          enc.set_function(_fn_moe_tile_items);
+          enc.set_buffer(0, *grp->hist); enc.set_buffer(1, *grp->boff);
+          enc.set_buffer(2, *grp->items);
+          const int per = 2;
+          enc.set_constant(3, Ex); enc.set_constant(4, grp->maxm);
+          enc.set_constant(5, ni); enc.set_constant(6, per);
+          enc.dispatch({1, 1, 1}, {1, 1, 1});
+          enc.set_function(*n64s);
+          sb012(XGW, XGS, XGB);
+          enc.set_buffer(3, hn); enc.set_buffer(4, *grp->gact);
+          enc.set_constant(5, H); enc.set_constant(6, 2 * I);
+          enc.set_constant(7, npad); enc.set_buffer(8, *grp->t2e);
+          enc.set_buffer(9, *grp->srow); enc.set_buffer(10, *grp->items);
+          enc.dispatch({(unsigned)((2 * I / 64) * 32), 8u * (unsigned)ni, 1},
+                       {32, 8, 1});
+          enc.set_function(*n64d);
+          sb012(XDW, XDS, XDB);
+          enc.set_buffer(3, *grp->gact); enc.set_buffer(4, part);
+          enc.set_constant(5, I); enc.set_constant(6, H);
+          enc.set_constant(7, npad); enc.set_buffer(8, *grp->t2e);
+          enc.set_buffer(9, *grp->sdst); enc.set_buffer(10, *grp->items);
+          enc.dispatch({(unsigned)((H / 64) * 32), 8u * (unsigned)ni, 1},
+                       {32, 8, 1});
+          _moe_nax_gemms += 2;
+          _moe_nax64_gemms += 2;
+        } else {
         // gate|up+SwiGLU steel: gact[npad, I] = gather(hn,srow) @ eguw_e^T
         enc.set_function(nax ? *nsw : *xf_up->qmm_swiglu);
         sb012(XGW, XGS, XGB);
@@ -6753,6 +6857,7 @@ MetalQwenModel::encode_moe_mlp_(
                           : (unsigned)(((H + 31) / 32) * 32), my, 2},
                      {32, 2, 2});
         if (nax) { _moe_nax_gemms += 2; }
+        }
       }
     } else {
       // Bandwidth GEMV grouping (MAXM=2 tiles; medium prefill).
@@ -6778,6 +6883,7 @@ MetalQwenModel::encode_moe_mlp_(
       enc.dispatch({(unsigned)(npad * H), 1, 1}, {256, 1, 1});
     }
   }
+  if (_moe_prof != nullptr) { (*_moe_prof)(1); }
   // combine -> moe_out[M, H]. Fused into finalize below (one dispatch + barrier
   // less per layer) unless VPIPE_QWEN_MOE_FUSE_FINAL=0.
   static const int kFuseFinal = []() {
@@ -6964,6 +7070,7 @@ MetalQwenModel::encode_moe_mlp_(
     enc.set_buffer(3, gate); enc.set_constant(4, H);
     enc.dispatch({(unsigned)(M * H), 1, 1}, {256, 1, 1});
   }
+  if (_moe_prof != nullptr) { (*_moe_prof)(2); }
 }
 
 void
@@ -9035,6 +9142,8 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
   };
   SharedBuffer moe_hist = gi(nE), moe_boff = gi(nE), moe_curs = gi(nE);
   SharedBuffer moe_t2e = gi((std::size_t)moe_maxtiles), moe_ntile = gi(1);
+  SharedBuffer moe_items = moe_steel ? gi((std::size_t)moe_maxtiles)
+                                     : SharedBuffer{};
   SharedBuffer moe_srow = gi(npd), moe_sdst = gi(npd);
   SharedBuffer moe_gact  = moe_grouped
       ? buf((std::size_t)moe_npad * c.moe_inner) : SharedBuffer{};
@@ -9739,6 +9848,7 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
           grp.sdst = &moe_sdst; grp.gact = &moe_gact; grp.gdout = &moe_gdout;
           grp.npad = moe_npad; grp.maxtiles = moe_maxtiles; grp.maxm = kMoeMAXM;
           grp.steel = moe_steel;
+          grp.items = moe_steel ? &moe_items : nullptr;
           if (const char* a = std::getenv("VPIPE_MOE_ABL")) {
             const std::string s(a);
             grp.abl_sort   = s.find("sort")   != std::string::npos;

@@ -18,6 +18,7 @@
 // writes. Without it the numeric tests skip vacuously, so check that
 // they RAN.
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -1104,8 +1105,13 @@ TEST(fibo2_dit, ane_tiers_rows_are_right)
   FB_REQUIRE(MetalFibo2Transformer::Config::read_dims(ckpt_(G), &cfg));
   FB_REQUIRE(wide_floors_(G, cfg));
   const std::string lp = (G.dir / "lora.safetensors").string();
-  enum Arm { kGpu, kFf, kQkv, kArms };
-  const char* const kName[kArms] = {"GPU-only", "ANE ff", "ANE ff+qkv"};
+  // The last arm is ff+qkv in ROTATED INT8 (ane_int8): ENGAGED (both
+  // modules), then held to the GPU bar; its distance from the reference
+  // is reported, not barred -- it is the GPU token tier's arithmetic, not
+  // the reference's bf16.
+  enum Arm { kGpu, kFf, kQkv, kI8, kArms };
+  const char* const kName[kArms] = {"GPU-only", "ANE ff", "ANE ff+qkv",
+                                    "ANE ff+qkv int8"};
   for (int with_lora = 0; with_lora < 2; ++with_lora) {
     std::vector<MetalFibo2Transformer::LoraSpec> specs;
     if (with_lora) { specs.push_back({lp, 1.0f}); }
@@ -1113,7 +1119,8 @@ TEST(fibo2_dit, ane_tiers_rows_are_right)
     for (int a = 0; a < kArms; ++a) {
       MetalFibo2Transformer::Config c = cfg;
       c.ane_ffn = a != kGpu;
-      c.ane_qkv = a == kQkv;
+      c.ane_qkv = a == kQkv || a == kI8;
+      c.ane_int8 = a == kI8;
       c.ane_rows = a != kGpu ? 1 : 0;
       auto m = MetalFibo2Transformer::load(ckpt_(G), mc, c, false, specs);
       FB_REQUIRE(m != nullptr);
@@ -1126,7 +1133,10 @@ TEST(fibo2_dit, ane_tiers_rows_are_right)
       }
       if (a != kGpu) {
         EXPECT_TRUE(m->ane_armed() && !m->ane_gpu_only());
-        EXPECT_TRUE((a == kQkv) == m->ane_qkv_armed());
+        EXPECT_TRUE((a != kFf) == m->ane_qkv_armed());
+      }
+      if (a == kI8 ? ane_int8_expected() : ane_int8_env_free()) {
+        EXPECT_TRUE(m->ane_int8_modules() == (a == kI8 ? 2 : 0));
       }
     }
     const std::vector<float>& want =
@@ -1138,7 +1148,7 @@ TEST(fibo2_dit, ane_tiers_rows_are_right)
                   "GPU-only %.5f\n", kName[a], with_lora ? " + LoRA" : "",
                   r, g);
       EXPECT_TRUE(g < 0.05);
-      EXPECT_TRUE(r < 3.0 * G.sc[0].ref_bf16);
+      if (a != kI8) { EXPECT_TRUE(r < 3.0 * G.sc[0].ref_bf16); }
     }
   }
 }

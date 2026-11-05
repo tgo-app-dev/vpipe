@@ -82,6 +82,26 @@ inline constexpr std::string_view kChunk = "chunk";
 inline constexpr std::string_view kTile = "tile";
 inline constexpr std::string_view kProfile = "profile";    // a line per block
 inline constexpr std::string_view kTag = "tag";            // the log prefix
+// The module in ROTATED INT8 (W8A8) rather than fp16 [false]: each staged
+// weight row Walsh-Hadamard rotated per 256 of its input and quantized to
+// int8, each projection's input rotated and quantized per token inside the
+// module -- LOSSY, the GPU token tier's arithmetic. The accel bag's
+// accel::kAneInt8 (generate-image / generate-video `ane_int8`) is the
+// graph's ask. Taken by a swiglu ffn or a matmul without biases whose
+// input (and inner) widths are multiples of 256, on macOS 26 and later;
+// anything else builds fp16 and says so in the log. info()'s `int8` says
+// which was built; a host older than the key ignores it and builds fp16,
+// and its info() carries no `int8`.
+inline constexpr std::string_view kInt8 = "int8";
+// With kInt8, which int8 [kInt8TierToken]: "token" (rotated per 256 of
+// the input, quantized per token, the arithmetic above) or "token_plain"
+// (unrotated: each row quantized as stored, each input per token as it
+// is -- the GPU token_plain tier's arithmetic, no width rule). Any other
+// value is refused by name. info()'s `int8_tier` names what was built; a
+// host older than the key builds "token" and its info() carries none.
+inline constexpr std::string_view kInt8Tier = "int8_tier";
+inline constexpr std::string_view kInt8TierToken = "token";
+inline constexpr std::string_view kInt8TierTokenPlain = "token_plain";
 
 // ---- stage(): PARAMS and BUFFER bindings -----------------------------
 //
@@ -144,7 +164,9 @@ inline constexpr std::string_view kDrainMs = "drain_ms";
 // ---- info() ----------------------------------------------------------
 //
 //   kind, activation, chunk, rows_per_block, timing (bool), host_bytes,
-//   error (the last refusal, empty when none), lost_row0, gpu_only
+//   error (the last refusal, empty when none), lost_row0, gpu_only,
+//   int8 (bool: the module runs int8; see kInt8), int8_tier (with int8:
+//   which, kInt8Tier's values)
 inline constexpr std::string_view kInfoRowsPerBlock = "rows_per_block";
 inline constexpr std::string_view kInfoTiming = "timing";
 inline constexpr std::string_view kInfoHostBytes = "host_bytes";

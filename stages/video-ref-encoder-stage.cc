@@ -660,6 +660,27 @@ VideoRefEncoderStage::declare_resources() const
     }
     out.push_back(std::move(c));
   }
+  // P-H3-Image's connector beside the encoder (f32, held whole), phased
+  // and released with it -- and the tower's work: it reads its own copy
+  // of each picture at about the manifest's vision_pixels (at most 1.2x:
+  // size_at_area keeps a gridded picture within 20%), one at a time.
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  if (const std::string cd = genai::ph3::connector_dir(root); !cd.empty()) {
+    for (auto& c : model_memory::weight_claims({cd})) {
+      out.push_back(std::move(c));
+    }
+    genai::ph3::Manifest man;
+    genai::MiniMaxH3TextEncoder::Config ec;
+    if (genai::ph3::read_manifest(root, &man, nullptr) &&
+        genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr)) {
+      const std::size_t vb = genai::MetalQwenVisionEncoder::
+          encode_scratch_bytes(ec.vision, man.vision_pixels * 6 / 5);
+      for (auto& c : model_memory::scratch_claims(
+               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
   return out;
 }
 
@@ -711,6 +732,11 @@ VideoRefEncoderStage::decide_resources() const
   if (!releases) { return {}; }
   std::vector<std::string> dirs{enc};
   if (weights_path_(_vae_weights).empty()) { dirs.push_back(vvae); }
+  if (const std::string cd =
+          genai::ph3::connector_dir(resolve_model_dir(session(), _hf_dir));
+      !cd.empty()) {
+    dirs.push_back(cd);
+  }
   return model_memory::weight_claims_in_phase(
       dirs, model_memory::kPhaseCondition);
 }
@@ -810,6 +836,21 @@ VideoRefEncoderStage::ensure_loaded_()
     _root = rm.dir;
     _partition = genai::MetalMiniMaxH3Transformer::partition_of_model_type(
         rm.model_type);
+  }
+  // P-H3-Image's EDIT, by its manifest: the same encoders (its Qwen3-VL-4B
+  // with the connector, H3's VAE encoder), its own picture rules.
+  _ph3 = genai::ph3::is_root(_root);
+  if (_ph3) {
+    std::string merr;
+    if (!genai::ph3::read_manifest(_root, &_ph3_manifest, &merr)) {
+      session()->error(fmt("VideoRefEncoderStage('{}'): {}; inert",
+                           this->id(), merr));
+      return;
+    }
+    _limits.max_images = genai::ph3::kMaxEditImages;
+    _limits.max_videos = 0;
+    _limits.max_audios = 0;
+    _limits.max_references = genai::ph3::kMaxEditImages;
   }
   if (!load_models_(mc)) {
     session()->error(fmt(
@@ -949,7 +990,7 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
             : genai::MetalMiniMaxH3AudioVae::load(
                   genai::open_weight_set(vae_w, session()), mc, acfg);
   }
-  if (!_audio_vae) {
+  if (!_audio_vae && !_ph3) {
     // NOT fatal: a request of images and silent clips never touches it.
     // A soundtrack that then arrives is refused by name rather than
     // dropped, which is what encode_references does.
@@ -1483,6 +1524,15 @@ VideoRefEncoderStage::report_fits_(const h3::EncodedReferences& enc)
       if (k > 0) { joined += ", "; }
       joined += notes[k];
     }
+    // P-H3-Image sizes its pictures by its own area rules -- the one to
+    // edit scaled up to the canvas floor is the recipe, not a loss -- so
+    // what it did is said, not warned about.
+    if (_ph3) {
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): picture {} sized by P-H3-Image's "
+          "rules -- {}", this->id(), i + 1, joined));
+      continue;
+    }
     session()->warn(fmt(
         "VideoRefEncoderStage('{}'): reference {} fitted -- {}", this->id(),
         i + 1, joined));
@@ -1536,6 +1586,11 @@ VideoRefEncoderStage::unload_models_()
     const ClaimedDirs d = claimed_dirs_();
     mgr->note_phase_released(d.enc);
     mgr->note_phase_released(d.vvae);
+    if (const std::string cd = genai::ph3::connector_dir(
+            resolve_model_dir(session(), _hf_dir));
+        !cd.empty()) {
+      mgr->note_phase_released(cd);
+    }
   }
 }
 
@@ -1936,10 +1991,37 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     models.stopping = [&ctx]() { return ctx.stop_requested(); };
   }
 
+  // P-H3-Image's edit: its pictures by the manifest's area rules (the
+  // first, the one edited, at least at the canvas floor -- it IS the
+  // canvas when the generator names none), the tower's own ~1 MP copy,
+  // the posterior sampled at the reference's seed, the rows noised to
+  // the level they are held at, and the instruction as the encoder reads
+  // it. A request naming no picture is not an edit and is refused.
+  std::string ph3_prompt;
+  if (_ph3) {
+    if (refs.empty()) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): a P-H3-Image edit needs a picture "
+          "to edit; text-to-image goes through diffusion-conditioner. "
+          "Skipping", this->id()));
+      co_return;
+    }
+    plan.area_min_pixels  = _ph3_manifest.reference_min_pixels;
+    plan.area_max_pixels  = _ph3_manifest.reference_max_pixels;
+    plan.first_min_pixels = _ph3_manifest.canvas_min_pixels;
+    plan.vision_pixels    = _ph3_manifest.vision_pixels;
+    plan.canvas_multiple  = genai::ph3::kCanvasMultiple;
+    plan.posterior_seed   = (std::int64_t)genai::ph3::kConditionEncodeSeed;
+    if (!this->config().as_object().contains("condition_noise_aug")) {
+      plan.condition_noise_aug = genai::ph3::kConditionNoiseAug;
+    }
+    ph3_prompt = genai::ph3::edit_prompt(prompt);
+  }
   h3::EncodedReferences enc;
   std::string eerr;
-  const bool encoded = h3::encode_references(refs, prompt, plan, models,
-                                             &enc, &eerr);
+  const bool encoded = h3::encode_references(
+      refs, _ph3 ? std::string_view(ph3_prompt) : std::string_view(prompt),
+      plan, models, &enc, &eerr);
   // Before the warn, so a failure does not leave a part-filled bar
   // sitting under the message that explains it.
   bar.finish();

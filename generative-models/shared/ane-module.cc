@@ -462,12 +462,16 @@ AneWeightSlots::create(const AneGraphSpec& spec)
   for (std::size_t i = 1; i < f.size() && ok; ++i) {
     const int rows = (int)f[i].shape[0], cols = (int)f[i].shape[1];
     CVPixelBufferRef pb = nullptr;
+    // An int8 input (a rotated int8 graph's matrices) is an 8-bit pixel
+    // buffer, which CoreML reads as MLMultiArrayDataTypeInt8.
     ok = CVPixelBufferCreate(kCFAllocatorDefault, (size_t)cols, (size_t)rows,
-                             kCVPixelFormatType_OneComponent16Half, attrs,
-                             &pb) == kCVReturnSuccess &&
+                             f[i].int8 ? kCVPixelFormatType_OneComponent8
+                                       : kCVPixelFormatType_OneComponent16Half,
+                             attrs, &pb) == kCVReturnSuccess &&
          pb != nullptr && CVPixelBufferGetIOSurface(pb) != nullptr;
     if (pb != nullptr) {
       s->_pb.push_back(pb);
+      s->_i8.push_back(f[i].int8);
       s->_rows.push_back(rows);
       s->_cols.push_back(cols);
     }
@@ -489,7 +493,7 @@ AneWeightSlots::bytes() const noexcept
 {
   std::size_t n = 0;
   for (std::size_t i = 0; i < _pb.size(); ++i) {
-    n += (std::size_t)_rows[i] * (std::size_t)_cols[i] * 2;
+    n += (std::size_t)_rows[i] * (std::size_t)_cols[i] * (_i8[i] ? 1 : 2);
   }
   return n;
 }

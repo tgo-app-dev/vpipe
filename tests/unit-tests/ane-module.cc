@@ -25,9 +25,11 @@
 #include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/fp8.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "apple-silicon/coreml/ane-emitter.h"
 #include "apple-silicon/coreml/coreml-model-manager.h"
 #include "interfaces/session-services-intf.h"
+#include "common/flex-data.h"
 #include "common/perf-flops.h"
 #include "common/session.h"
 
@@ -35,12 +37,15 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <thread>
 #include <functional>
 #include <fstream>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <memory>
 #include <algorithm>
@@ -3153,6 +3158,2450 @@ TEST(ane_module, ffn_tier_shape_bench)
               best > 0.0 ? flop / best / 1e9 : 0.0);
 }
 
+// HOW MUCH OF THE NEURAL ENGINE does one runtime-weight module reach? The
+// tier drives ONE module from ONE thread (AneWorker), and an M5 Ultra is
+// two dies, each with its own engine -- so whether one predict runs on
+// both, or a second module on a second thread adds the other, is a
+// property of the machine. This runs N instances of the tier's own graph
+// (MiniMax-H3's feed-forward by default), each its own CoreML model, from
+// N threads at once, alone and beside a GPU GEMM load, and prints the
+// rate each engine achieved. Every instance holds the same weights and
+// input, so their outputs must agree bit for bit.
+//
+//   VPIPE_ANE_PROBE=1               run it
+//   VPIPE_ANE_PROBE_HID / _FFN      the graph's widths (5376 / 14336)
+//   VPIPE_ANE_PROBE_CHUNK / _TILE   rows a predict, in-graph tile
+//   VPIPE_ANE_PROBE_MATMUL=1        one projection, hidden -> ffn
+//   VPIPE_ANE_PROBE_MAX             the most instances (4)
+//   VPIPE_ANE_PROBE_SECS            seconds an arm (3)
+//   VPIPE_ANE_PROBE_ROUNDS          rounds, every other one reversed (2)
+//   VPIPE_ANE_PROBE_NO_GPU=1        skip the arms with a GPU load
+//   VPIPE_ANE_PROBE_GPU             the load: bf16 (a dense GEMM), or
+//                                   token / token_plain -- one H3
+//                                   block's four projections on the
+//                                   per-token int8 tier, rotated or not
+TEST(ane_module, concurrent_engines_probe)
+{
+  if (env_or_null_("VPIPE_ANE_PROBE") == nullptr) { return; }
+  namespace mcx = vpipe::metal_compute;
+  using vpipe::genai::AneModule;
+  using vpipe::genai::AneWeightSlots;
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int  H      = envi("VPIPE_ANE_PROBE_HID", 5376);
+  const int  F      = envi("VPIPE_ANE_PROBE_FFN", 14336);
+  const int  chunk  = envi("VPIPE_ANE_PROBE_CHUNK", 2048);
+  const int  tile   = envi("VPIPE_ANE_PROBE_TILE", 1024);
+  const bool mm     = envi("VPIPE_ANE_PROBE_MATMUL", 0) != 0;
+  const int  nmax   = std::max(1, envi("VPIPE_ANE_PROBE_MAX", 4));
+  const double secs = std::max(1, envi("VPIPE_ANE_PROBE_SECS", 3));
+  const int  rounds = std::max(1, envi("VPIPE_ANE_PROBE_ROUNDS", 2));
+  const bool gpu_arms = envi("VPIPE_ANE_PROBE_NO_GPU", 0) == 0;
+  vpipe::Session sess;
+  mcx::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!AneModule::emitter_usable(&sess)) { return; }
+  using Clk = std::chrono::steady_clock;
+  auto sec_since = [](Clk::time_point t) {
+    return std::chrono::duration<double>(Clk::now() - t).count();
+  };
+
+  vpipe::AneGraphSpec spec;
+  spec.kind = mm ? vpipe::AneGraphSpec::Kind::Matmul
+                 : vpipe::AneGraphSpec::Kind::SwiGluFfn;
+  spec.M  = chunk;
+  spec.K  = H;
+  spec.N  = F;
+  spec.bk = tile;
+  spec.bn = tile;
+  spec.runtime_weights = true;
+  spec.weights_out_in  = true;      // as AneFeedForward builds it
+  ASSERT_TRUE(spec.valid());
+  if (!spec.valid()) { return; }
+  const double flop = 2.0 * chunk * (double)H * (double)F * (mm ? 1.0 : 3.0);
+
+  // A cheap generator: the bytes only have to be the same everywhere.
+  std::uint32_t lcg = 0x9e3779b9u;
+  auto uni = [&]() {
+    lcg = lcg * 1664525u + 1013904223u;
+    return (float)(lcg >> 8) * (2.0f / 16777216.0f) - 1.0f;
+  };
+  auto f16 = [](float v) {
+    const _Float16 h = (_Float16)v;
+    std::uint16_t w = 0;
+    std::memcpy(&w, &h, 2);
+    return w;
+  };
+
+  struct Inst {
+    std::unique_ptr<AneModule>      m;
+    std::unique_ptr<AneWeightSlots> w;
+    mcx::SharedBuffer x, y;
+    double build_ms = 0.0, first_ms = 0.0;
+  };
+  std::vector<Inst> inst((std::size_t)nmax);
+  std::vector<std::vector<std::uint16_t>> wsrc;   // slot k's rows
+  std::vector<std::uint16_t> xsrc;
+  const std::string tmp = std::filesystem::temp_directory_path().string();
+  const long long run =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          Clk::now().time_since_epoch())
+          .count();
+  for (int i = 0; i < nmax; ++i) {
+    Inst& s = inst[(std::size_t)i];
+    // A path of its own, so the manager loads ANOTHER model rather than
+    // handing back the first (it caches by path); the compiled program
+    // is cached on the graph's content, so only the first compiles.
+    const std::string dir = tmp + "/vpipe-ane-probe-" +
+                            std::to_string(run) + "-" + std::to_string(i) +
+                            ".mlmodelc";
+    const auto t0 = Clk::now();
+    s.m = AneModule::build_runtime(&sess, spec, dir);
+    s.build_ms = sec_since(t0) * 1e3;
+    s.w = AneWeightSlots::create(spec);
+    ASSERT_TRUE(s.m != nullptr && s.w != nullptr);
+    if (s.m == nullptr || s.w == nullptr) { return; }
+    if (wsrc.empty()) {
+      for (std::size_t k = 0; k < s.w->count(); ++k) {
+        const std::size_t rows = (std::size_t)s.w->rows(k);
+        const std::size_t cols = (std::size_t)s.w->cols(k);
+        const float a = 1.0f / std::sqrt((float)cols);   // [out, in]
+        std::vector<std::uint16_t> v(rows * cols);
+        for (auto& e : v) { e = f16(uni() * a); }
+        wsrc.push_back(std::move(v));
+      }
+      xsrc.resize(s.m->input_elems());
+      for (auto& e : xsrc) { e = f16(uni()); }
+    }
+    for (std::size_t k = 0; k < s.w->count(); ++k) {
+      const std::size_t rows = (std::size_t)s.w->rows(k);
+      const std::size_t cols = (std::size_t)s.w->cols(k);
+      const std::uint16_t* src = wsrc[k].data();
+      const bool ok = s.w->fill(k, [&](void* base, std::size_t bpr) {
+        for (std::size_t r = 0; r < rows; ++r) {
+          std::memcpy(static_cast<std::uint8_t*>(base) + r * bpr,
+                      src + r * cols, cols * 2);
+        }
+      });
+      ASSERT_TRUE(ok);
+    }
+    s.x = mc->make_shared_buffer(s.m->input_elems() * 2);
+    s.y = mc->make_shared_buffer(s.m->output_elems() * 2);
+    std::memcpy(s.x.contents(), xsrc.data(), xsrc.size() * 2);
+    const auto t1 = Clk::now();
+    const bool ok = s.m->run(s.x, 0, s.y, 0, *s.w);
+    s.first_ms = sec_since(t1) * 1e3;
+    ASSERT_TRUE(ok);
+    if (!ok) { return; }
+    std::printf("[ane_probe] instance %d: built in %.0f ms, first predict "
+                "%.1f ms\n", i, s.build_ms, s.first_ms);
+  }
+  std::printf("[ane_probe] %s %dx%d, %d rows a predict, tile %d: %.1f "
+              "GFLOP a predict, %zu MB of weights an instance\n",
+              mm ? "matmul" : "swiglu ffn", H, F, chunk, tile, flop / 1e9,
+              (std::size_t)inst[0].w->bytes() >> 20);
+
+  // The GPU load: a bf16 GEMM, on matrix cores where there are some.
+  const bool mx = mc->supports_matrix_cores();
+  const int GM = 8192, GN = 14336, GK = 5376;
+  const char* gmode_env = env_or_null_("VPIPE_ANE_PROBE_GPU");
+  const std::string gmode = gmode_env != nullptr ? gmode_env : "bf16";
+  const bool tok = gmode == "token" || gmode == "token_plain";
+  // ...or the per-token int8 tier: q|k|v, out, fc1 and fc2 of a
+  // MiniMax-H3 block at GM rows, each weight held in the token layout and
+  // each GEMM quantizing its own activation (gemm_fast), as the DiT's
+  // route runs them.
+  using I8 = vpipe::genai::I8GemmContext;
+  I8 i8(mc, tok, /*bf16=*/true);
+  struct Proj {
+    int N = 0, K = 0, gc = 0;
+    mcx::SharedBuffer codes, scales, x, y;
+  };
+  std::vector<Proj> projs;
+  double unit_flop = 2.0 * 2.0 * GM * (double)GN * GK;   // two GEMMs
+  if (tok) {
+    ASSERT_TRUE(i8.enabled());
+    if (!i8.enabled()) { return; }
+    i8.set_tier(I8::Tier::kToken);
+    i8.set_token_rotation(gmode == "token");
+    const int shapes[4][2] = {
+        {21504, 5376}, {5376, 7168}, {28672, 5376}, {5376, 14336}};
+    unit_flop = 0.0;
+    mcx::CommandStream st = mc->make_command_stream();
+    std::vector<mcx::SharedBuffer> dense;
+    {
+      mcx::ComputeEncoder enc = st.begin_compute();
+      for (const auto& s : shapes) {
+        Proj p;
+        p.N  = s[0];
+        p.K  = s[1];
+        p.gc = i8.fast_group(p.K);
+        ASSERT_TRUE(p.gc == I8::kTokenGroup &&
+                    i8.fast_accepts(GM, p.N, p.K));
+        const std::size_t nw = (std::size_t)p.N * p.K;
+        mcx::SharedBuffer w = mc->make_shared_buffer(nw * 2);
+        auto* wp = static_cast<std::uint16_t*>(w.contents());
+        const float a = 1.0f / std::sqrt((float)p.K);
+        for (std::size_t i = 0; i < nw; ++i) {
+          const float f = uni() * a;
+          std::uint32_t bits = 0;
+          std::memcpy(&bits, &f, 4);
+          wp[i] = (std::uint16_t)(bits >> 16);
+        }
+        p.codes  = mc->make_shared_buffer(nw);
+        p.scales =
+            mc->make_shared_buffer(I8::fast_scale_bytes(p.N, p.K, p.gc));
+        ASSERT_TRUE(i8.encode_quant_fast(enc, w, p.codes, p.scales, p.gc,
+                                         p.N, p.K));
+        dense.push_back(std::move(w));
+        const std::size_t nx = (std::size_t)GM * p.K;
+        p.x = mc->make_shared_buffer(nx * 2);
+        auto* xp = static_cast<std::uint16_t*>(p.x.contents());
+        for (std::size_t i = 0; i < nx; ++i) {
+          const float f = uni();
+          std::uint32_t bits = 0;
+          std::memcpy(&bits, &f, 4);
+          xp[i] = (std::uint16_t)(bits >> 16);
+        }
+        p.y = mc->make_shared_buffer((std::size_t)GM * p.N * 2);
+        unit_flop += 2.0 * GM * (double)p.N * p.K;
+        projs.push_back(std::move(p));
+      }
+    }
+    ASSERT_TRUE(st.commit().wait_ok());
+    std::printf("[ane_probe] GPU load: per-token int8 (%s, %s), one H3 "
+                "block of 4 projections at %d rows = %.2f TFLOP a "
+                "unit\n", i8.token_rotated() ? "rotated" : "plain",
+                i8.token_kernel().c_str(), GM, unit_flop / 1e12);
+  } else {
+    std::printf("[ane_probe] GPU load: bf16 %s GEMM %dx%dx%d, two a "
+                "unit\n", mx ? "matrix-core" : "steel", GM, GN, GK);
+  }
+  mcx::ComputeLibrary glib =
+      mc->load_library(mx ? "dense_gemm_mma_bf16" : "dense_gemm_bf16");
+  mcx::ComputeFunction gfn = glib.function(
+      mx ? "dense_gemm_mma_t_n128x256_f16" : "dense_gemm_t_bm64bn64_f16");
+  ASSERT_TRUE(!gpu_arms || gfn.valid());
+  mcx::SharedBuffer gx = mc->make_shared_buffer((std::size_t)GM * GK * 2);
+  mcx::SharedBuffer gw = mc->make_shared_buffer((std::size_t)GN * GK * 2);
+  mcx::SharedBuffer gy = mc->make_shared_buffer((std::size_t)GM * GN * 2);
+  {
+    auto fill = [](mcx::SharedBuffer& b, std::size_t n) {
+      auto* p = static_cast<std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < n; ++i) {
+        p[i] = (std::uint16_t)(0x3c80u + (i % 7));   // ~1/64, bf16
+      }
+    };
+    fill(gx, (std::size_t)GM * GK);
+    fill(gw, (std::size_t)GN * GK);
+  }
+  auto gemm = [&](mcx::ComputeEncoder& enc) {
+    enc.set_function(gfn);
+    enc.set_buffer(0, gx);
+    enc.set_buffer(1, gw);
+    enc.set_buffer(2, gw);
+    enc.set_buffer(3, gy);
+    enc.set_constant(4, GK);
+    enc.set_constant(5, GN);
+    enc.set_constant(6, GM);
+    enc.set_constant(7, 0);
+    if (mx) {
+      enc.dispatch({(unsigned)(((GN + 255) / 256) * 256),
+                    (unsigned)((GM + 127) / 128), 1}, {256, 1, 1});
+    } else {
+      enc.dispatch({(unsigned)(((GN + 63) / 64) * 32),
+                    (unsigned)(((GM + 63) / 64) * 2), 2}, {32, 2, 2});
+    }
+  };
+  std::atomic<bool> gstop{false};
+  std::atomic<long> gdone{0};
+  std::atomic<bool> gbad{false};
+  std::thread gthr;
+  const mcx::SharedBuffer no_bias{};
+  auto gpu_unit = [&](mcx::ComputeEncoder& enc) {
+    if (!tok) {
+      gemm(enc);
+      gemm(enc);
+      return true;
+    }
+    bool ok = true;
+    for (const Proj& p : projs) {
+      ok = i8.gemm_fast(enc, p.x, 0, p.codes, p.scales, p.gc, no_bias, p.y,
+                        0, GM, p.N, p.K) && ok;
+    }
+    return ok;
+  };
+  auto gpu_start = [&]() {
+    gstop = false;
+    gthr = std::thread([&]() {
+      mcx::CommandStream st = mc->make_command_stream();
+      while (!gstop.load()) {
+        bool ok = false;
+        {
+          mcx::ComputeEncoder enc = st.begin_compute();
+          ok = gpu_unit(enc);
+        }
+        if (!st.commit().wait_ok() || !ok) { gbad = true; }
+        ++gdone;
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  };
+  auto gpu_stop = [&]() {
+    gstop = true;
+    if (gthr.joinable()) { gthr.join(); }
+  };
+
+  // n threads predicting until the deadline, on n instances or (shared)
+  // all on the first. Returns predicts a second.
+  auto ane = [&](int n, bool shared, double* ms_each) {
+    std::vector<long> cnt((std::size_t)n, 0);
+    std::atomic<int>  ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<bool> bad{false};
+    Clk::time_point end;
+    std::vector<std::thread> th;
+    for (int t = 0; t < n; ++t) {
+      th.emplace_back([&, t]() {
+        Inst& s = inst[shared ? 0 : (std::size_t)t];
+        ++ready;
+        while (!go.load()) { std::this_thread::yield(); }
+        while (Clk::now() < end) {
+          if (!s.m->run(s.x, 0, s.y, 0, *s.w)) { bad = true; }
+          ++cnt[(std::size_t)t];
+        }
+      });
+    }
+    while (ready.load() < n) { std::this_thread::yield(); }
+    const auto t0 = Clk::now();
+    end = t0 + std::chrono::milliseconds((long)(secs * 1000.0));
+    go = true;
+    for (auto& x : th) { x.join(); }
+    const double wall = sec_since(t0);
+    ASSERT_TRUE(!bad.load());
+    long total = 0;
+    for (long c : cnt) { total += c; }
+    *ms_each = total > 0 ? wall * 1e3 * n / (double)total : 0.0;
+    return (double)total / wall;
+  };
+
+  struct Arm { int n; bool shared; bool gpu; };
+  std::vector<Arm> arms;
+  for (int n = 1; n <= nmax; n = (n < 2 ? 2 : n * 2)) {
+    arms.push_back({n, false, false});
+  }
+  if (nmax >= 2) { arms.push_back({2, true, false}); }
+  if (gpu_arms && gfn.valid()) {
+    arms.push_back({0, false, true});
+    for (int n = 1; n <= nmax; n = (n < 2 ? 2 : n * 2)) {
+      arms.push_back({n, false, true});
+    }
+  }
+  for (int r = 0; r < rounds; ++r) {
+    std::vector<Arm> order = arms;
+    if (r % 2 == 1) { std::reverse(order.begin(), order.end()); }
+    for (const Arm& a : order) {
+      if (a.gpu) { gpu_start(); }
+      const long g0 = gdone.load();
+      const auto tg = Clk::now();
+      double per_s = 0.0, ms_each = 0.0;
+      if (a.n > 0) {
+        per_s = ane(a.n, a.shared, &ms_each);
+      } else {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds((long)(secs * 1000.0)));
+      }
+      const double gs = sec_since(tg);
+      const long g1 = gdone.load();
+      if (a.gpu) { gpu_stop(); }
+      char what[64];
+      std::snprintf(what, sizeof(what), "%d %s x %d thr%s", a.n,
+                    a.shared ? "shared inst" : "inst", a.n,
+                    a.gpu ? " + GPU" : "");
+      if (a.n == 0) { std::snprintf(what, sizeof(what), "GPU alone"); }
+      std::printf("[ane_probe] round %d  %-26s ANE %6.2f TFLOP/s "
+                  "(%5.1f predicts/s, %6.1f ms a predict a thread)  GPU "
+                  "%6.1f TFLOP/s\n", r, what, per_s * flop / 1e12, per_s,
+                  ms_each,
+                  a.gpu ? (double)(g1 - g0) * unit_flop / gs / 1e12 : 0.0);
+      std::fflush(stdout);
+    }
+  }
+  ASSERT_TRUE(!gbad.load());
+
+  // Every instance computed the same thing.
+  int differ = 0;
+  for (int i = 1; i < nmax; ++i) {
+    if (std::memcmp(inst[(std::size_t)i].y.contents(), inst[0].y.contents(),
+                    inst[0].y.byte_size()) != 0) {
+      ++differ;
+    }
+  }
+  std::size_t nonfinite = 0;
+  {
+    const auto* p = static_cast<const _Float16*>(inst[0].y.contents());
+    for (std::size_t i = 0; i < inst[0].m->output_elems(); ++i) {
+      if (!std::isfinite((float)p[i])) { ++nonfinite; }
+    }
+  }
+  std::printf("[ane_probe] outputs: %d of %d instances differ from the "
+              "first, %zu non-finite\n", differ, nmax - 1, nonfinite);
+  EXPECT_TRUE(differ == 0);
+  EXPECT_TRUE(nonfinite == 0);
+}
+
+// WHAT THE NEURAL ENGINE RUNS WELL, OP BY OP. One projection stated three
+// ways -- a matmul over [rows, K], a 1x1 convolution over a 64x64 grid in
+// NCHW, and the same convolution fed NHWC, transposed in and out inside
+// the graph (the layout a DiT's token-major rows already have) -- and a
+// 3x3 convolution in both orders. Each with fp16 weights; with int8
+// weights dequantized by the graph (constexpr_blockwise_shift_scale per
+// output channel, the form coremltools' linear_quantize_weights writes:
+// W8A16); and with those plus every op's input quantized at a CONSTANT
+// per-tensor scale (quantize -> dequantize: W8A8 -- a scale taken per
+// token at run time is not expressible). One op and a chain of L, so the
+// marginal op's rate is read apart from the predict's I/O. Every graph's
+// output is checked on sampled pixels against a double-precision
+// restatement of the same quantized arithmetic, and the bundles are kept
+// so CoreML's compute plan can say where each op ran.
+//
+//   VPIPE_ANE_OPS_PROBE=1     run it
+//   VPIPE_ANE_OPS_DIR         where the bundles go (kept)
+//   VPIPE_ANE_OPS_ITERS       timed predicts an arm (12)
+//   VPIPE_ANE_OPS_ONLY        only the arms whose name contains this
+TEST(ane_module, ops_probe)
+{
+  if (env_or_null_("VPIPE_ANE_OPS_PROBE") == nullptr) { return; }
+  vpipe::Session sess;
+  auto* svc = sess.services();
+  auto* mgr = svc != nullptr ? svc->coreml_model_manager() : nullptr;
+  if (mgr == nullptr) { return; }
+  namespace fs = std::filesystem;
+  using Clk = std::chrono::steady_clock;
+  auto ms_since = [](Clk::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clk::now() - t).count();
+  };
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const char* od = env_or_null_("VPIPE_ANE_OPS_DIR");
+  const std::string root =
+      od != nullptr ? std::string(od)
+                    : (fs::temp_directory_path() / "vpipe-ane-ops").string();
+  std::error_code ec;
+  fs::create_directories(root, ec);
+  const int iters = std::max(3, envi("VPIPE_ANE_OPS_ITERS", 12));
+  const char* only = env_or_null_("VPIPE_ANE_OPS_ONLY");
+
+  struct Arm {
+    std::string op;      // mm | c1 | c3
+    bool        nhwc;
+    std::string q;       // f16 | w8 | w8a8
+    int K, N, H, W, L;
+  };
+  std::vector<Arm> arms;
+  for (int C : {512, 1024, 2048, 4096}) {
+    for (int L : {1, 8}) {
+      for (const char* q : {"f16", "w8", "w8a8"}) {
+        arms.push_back({"mm", false, q, C, C, 64, 64, L});
+        arms.push_back({"c1", false, q, C, C, 64, 64, L});
+        arms.push_back({"c1", true, q, C, C, 64, 64, L});
+      }
+    }
+  }
+  for (int C : {256, 512}) {
+    for (int L : {1, 4}) {
+      for (const char* q : {"f16", "w8", "w8a8"}) {
+        arms.push_back({"c3", false, q, C, C, 64, 64, L});
+        arms.push_back({"c3", true, q, C, C, 64, 64, L});
+      }
+    }
+  }
+  // Half of a MiniMax-H3 fc1, untiled: far past the weight buffer.
+  for (const char* q : {"f16", "w8"}) {
+    arms.push_back({"mm", false, q, 5376, 14336, 64, 64, 1});
+    arms.push_back({"c1", false, q, 5376, 14336, 64, 64, 1});
+    arms.push_back({"c1", true, q, 5376, 14336, 64, 64, 1});
+  }
+
+  std::uint32_t lcg = 0x2545f491u;
+  auto uni = [&]() {
+    lcg = lcg * 1664525u + 1013904223u;
+    return (float)(lcg >> 8) * (2.0f / 16777216.0f) - 1.0f;
+  };
+  auto h16 = [](float v) { return (float)(_Float16)v; };
+  auto bits16 = [](float v) {
+    const _Float16 h = (_Float16)v;
+    std::uint16_t w = 0;
+    std::memcpy(&w, &h, 2);
+    return w;
+  };
+  auto dims = [](std::initializer_list<long long> d) {
+    std::string s = "[";
+    bool first = true;
+    for (long long v : d) {
+      s += (first ? "" : ", ") + std::to_string(v);
+      first = false;
+    }
+    return s + "]";
+  };
+  auto blob = [](const std::string& ty, const std::string& d,
+                 std::size_t off) {
+    return "tensor<" + ty + ", " + d + ">(BLOBFILE(path = string(\"" +
+           "@model_path/weights/weight.bin\"), offset = uint64(" +
+           std::to_string(off) + ")))";
+  };
+  // W8A8's activation step, as stored: fp16.
+  const float a_step = h16(3.0f / 127.0f);
+  auto qd = [&](double v) {
+    const double q = std::clamp(std::nearbyint(v / a_step), -128.0, 127.0);
+    return q * a_step;
+  };
+
+  std::map<std::string, double> one_op_ms;    // L = 1, by arm key
+  for (const Arm& a : arms) {
+    const bool conv = a.op != "mm";
+    const int kk = a.op == "c3" ? 3 : 1;
+    const int H = a.H, W = a.W, M = H * W, K = a.K, N = a.N, L = a.L;
+    const bool w8 = a.q != "f16", a8 = a.q == "w8a8";
+    const std::string key = a.op +
+                            (conv ? (a.nhwc ? "-nhwc" : "-nchw") : "") +
+                            "-" + a.q + "-" + std::to_string(K) + "x" +
+                            std::to_string(N);
+    const std::string name = key + "-L" + std::to_string(L);
+    if (only != nullptr && name.find(only) == std::string::npos) {
+      continue;
+    }
+    if (L > 1 && K != N) { continue; }
+
+    // The weights as the reference reads them: fp16-rounded, or the int8
+    // codes times their fp16 per-channel step.
+    const std::size_t per = (std::size_t)K * N * kk * kk;
+    std::vector<std::vector<float>> wv((std::size_t)L);
+    std::vector<std::vector<unsigned char>> slab;
+    std::vector<std::uint32_t> code;   // the blob's dtype: 1 fp16, 4 int8
+    for (int l = 0; l < L; ++l) {
+      std::vector<float> w(per);
+      const float amp = std::sqrt(3.0f / (float)(K * kk * kk));
+      for (auto& e : w) { e = uni() * amp; }
+      // mm's weight is [K, N] (column n), a conv's [N, K, kk, kk].
+      auto chan = [&](std::size_t i) {
+        return conv ? (int)(i / ((std::size_t)K * kk * kk))
+                    : (int)(i % (std::size_t)N);
+      };
+      if (!w8) {
+        std::vector<unsigned char> b(per * 2);
+        for (std::size_t i = 0; i < per; ++i) {
+          const std::uint16_t v = bits16(w[i]);
+          std::memcpy(b.data() + i * 2, &v, 2);
+          w[i] = h16(w[i]);
+        }
+        slab.push_back(std::move(b));
+        code.push_back(1);
+      } else {
+        std::vector<float> s((std::size_t)N, 0.0f);
+        for (std::size_t i = 0; i < per; ++i) {
+          float& m = s[(std::size_t)chan(i)];
+          m = std::max(m, std::fabs(w[i]));
+        }
+        for (auto& e : s) { e = h16(std::max(e, 1e-6f) / 127.0f); }
+        std::vector<unsigned char> qb(per), sb((std::size_t)N * 2);
+        for (std::size_t i = 0; i < per; ++i) {
+          const float st = s[(std::size_t)chan(i)];
+          const int q = (int)std::clamp(std::nearbyint(w[i] / st), -127.0f,
+                                        127.0f);
+          qb[i] = (unsigned char)(std::int8_t)q;
+          w[i] = (float)q * st;
+        }
+        for (int n = 0; n < N; ++n) {
+          const std::uint16_t v = bits16(s[(std::size_t)n]);
+          std::memcpy(sb.data() + (std::size_t)n * 2, &v, 2);
+        }
+        slab.push_back(std::move(qb));
+        code.push_back(4);
+        slab.push_back(std::move(sb));
+        code.push_back(1);
+      }
+      wv[(std::size_t)l] = std::move(w);
+    }
+    std::vector<std::size_t> sizes;
+    for (const auto& b : slab) { sizes.push_back(b.size()); }
+    const std::vector<std::size_t> off =
+        vpipe::AneEmitter::blob_offsets(sizes);
+
+    // The graph.
+    const std::string in_d = !conv  ? dims({M, K})
+                           : a.nhwc ? dims({1, H, W, K})
+                                    : dims({1, K, H, W});
+    const std::string out_d = !conv  ? dims({M, N})
+                            : a.nhwc ? dims({1, H, W, N})
+                                     : dims({1, N, H, W});
+    std::ostringstream o;
+    o << vpipe::AneEmitter::mil_preamble() << "    func main<ios18>("
+      << "tensor<fp16, " << in_d << "> x) {\n";
+    auto line = [&](const std::string& s) {
+      o << "            " << s << ";\n";
+    };
+    auto cst = [&](const std::string& ty, const std::string& nm,
+                   const std::string& val) {
+      line(ty + " " + nm + " = const()[name = string(\"" + nm +
+           "\"), val = " + val + "]");
+    };
+    if (!conv) {
+      cst("bool", "ftx", "bool(false)");
+      cst("bool", "fty", "bool(false)");
+    } else {
+      const std::string p = std::to_string(kk / 2);
+      cst("tensor<int32, [2]>", "cst", "tensor<int32, [2]>([1, 1])");
+      cst("tensor<int32, [2]>", "cdl", "tensor<int32, [2]>([1, 1])");
+      cst("int32", "cgr", "int32(1)");
+      cst("string", "cpt", "string(\"custom\")");
+      cst("tensor<int32, [4]>", "cpd",
+          "tensor<int32, [4]>([" + p + ", " + p + ", " + p + ", " + p +
+              "])");
+    }
+    if (a8) {
+      char sv[32];
+      std::snprintf(sv, sizeof(sv), "fp16(%.9g)", (double)a_step);
+      cst("fp16", "asc", sv);
+      cst("string", "adt", "string(\"int8\")");
+    }
+    std::string cur = "x";
+    if (conv && a.nhwc) {
+      cst("tensor<int32, [4]>", "pin", "tensor<int32, [4]>([0, 3, 1, 2])");
+      line("tensor<fp16, " + dims({1, K, H, W}) +
+           "> xt = transpose(perm = pin, x = x)[name = string(\"xt\")]");
+      cur = "xt";
+    }
+    const std::string act_d = !conv ? dims({M, K}) : dims({1, K, H, W});
+    const std::string y_d = !conv ? dims({M, N}) : dims({1, N, H, W});
+    const std::string w_d = !conv ? dims({K, N}) : dims({N, K, kk, kk});
+    const std::string s_d = !conv ? dims({1, N}) : dims({N, 1, 1, 1});
+    std::size_t si = 0;
+    for (int l = 0; l < L; ++l) {
+      const std::string ls = std::to_string(l);
+      const std::string wn = "w" + ls;
+      if (!w8) {
+        cst("tensor<fp16, " + w_d + ">", wn, blob("fp16", w_d, off[si]));
+        si += 1;
+      } else {
+        line("tensor<fp16, " + w_d + "> " + wn +
+             " = constexpr_blockwise_shift_scale(data = " +
+             blob("int8", w_d, off[si]) + ", scale = " +
+             blob("fp16", s_d, off[si + 1]) + ")[name = string(\"" + wn +
+             "\")]");
+        si += 2;
+      }
+      std::string in = cur;
+      if (a8) {
+        line("tensor<int8, " + act_d + "> q" + ls + " = quantize(input = " +
+             in + ", output_dtype = adt, scale = asc)[name = string(\"q" +
+             ls + "\")]");
+        line("tensor<fp16, " + act_d + "> d" + ls + " = dequantize(input = q" +
+             ls + ", scale = asc)[name = string(\"d" + ls + "\")]");
+        in = "d" + ls;
+      }
+      const std::string y = "y" + ls;
+      if (!conv) {
+        line("tensor<fp16, " + y_d + "> " + y +
+             " = matmul(transpose_x = ftx, transpose_y = fty, x = " + in +
+             ", y = " + wn + ")[name = string(\"" + y + "\")]");
+      } else {
+        line("tensor<fp16, " + y_d + "> " + y +
+             " = conv(dilations = cdl, groups = cgr, pad = cpd, pad_type = "
+             "cpt, strides = cst, weight = " + wn + ", x = " + in +
+             ")[name = string(\"" + y + "\")]");
+      }
+      cur = y;
+    }
+    if (conv && a.nhwc) {
+      cst("tensor<int32, [4]>", "pout",
+          "tensor<int32, [4]>([0, 2, 3, 1])");
+      line("tensor<fp16, " + out_d + "> yo = transpose(perm = pout, x = " +
+           cur + ")[name = string(\"yo\")]");
+      cur = "yo";
+    }
+    o << "        } -> (" << cur << ");\n}";
+
+    auto shape_of = [&](bool in) {
+      std::vector<std::int64_t> s;
+      const int C = in ? K : N;
+      if (!conv) {
+        s = {M, C};
+      } else if (a.nhwc) {
+        s = {1, H, W, C};
+      } else {
+        s = {1, C, H, W};
+      }
+      return s;
+    };
+    const vpipe::AneEmitter::Feature fin{"x", shape_of(true)};
+    const vpipe::AneEmitter::Feature fout{cur, shape_of(false)};
+    std::vector<vpipe::AneBlobSlab> bs;
+    for (const auto& b : slab) { bs.push_back({b.data(), b.size()}); }
+    const std::string dir = root + "/" + name + ".mlmodelc";
+    std::string err;
+    if (!vpipe::AneEmitter::write_bundle(dir, o.str(), {&fin, 1}, {&fout, 1},
+                                         bs, &err)) {
+      std::printf("[ane_ops] %-30s NOT WRITTEN: %s\n", name.c_str(),
+                  err.c_str());
+      continue;
+    }
+    // write_bundle labels every slab fp16; the int8 ones say so.
+    {
+      std::fstream f(dir + "/weights/weight.bin",
+                     std::ios::in | std::ios::out | std::ios::binary);
+      for (std::size_t i = 0; i < code.size(); ++i) {
+        if (code[i] == 1) { continue; }
+        f.seekp((std::streamoff)(off[i] + 4));
+        f.write(reinterpret_cast<const char*>(&code[i]), 4);
+      }
+    }
+    slab.clear();
+    const auto t0 = Clk::now();
+    auto m = mgr->load(dir, 3);
+    const double compile_ms = ms_since(t0);
+    if (m == nullptr || !m->valid()) {
+      std::printf("[ane_ops] %-30s DID NOT LOAD\n", name.c_str());
+      continue;
+    }
+
+    // Input: token-major values, laid out as the graph declares them.
+    std::vector<float> xt((std::size_t)M * K);
+    for (auto& e : xt) { e = h16(uni()); }
+    std::vector<std::uint16_t> xb(xt.size()), yb((std::size_t)M * N);
+    for (int p = 0; p < M; ++p) {
+      for (int c = 0; c < K; ++c) {
+        const std::size_t d = conv && !a.nhwc
+                                  ? (std::size_t)c * M + p
+                                  : (std::size_t)p * K + c;
+        xb[d] = bits16(xt[(std::size_t)p * K + c]);
+      }
+    }
+    vpipe::CoreMLPredictInput in;
+    in.name  = "x";
+    in.data  = xb.data();
+    in.dtype = vpipe::CoreMLDType::F16;
+    in.shape = shape_of(true);
+    vpipe::CoreMLPredictOutput out;
+    out.name          = cur;
+    out.want          = vpipe::CoreMLDType::F16;
+    out.backing       = yb.data();
+    out.backing_elems = yb.size();
+    const auto t1 = Clk::now();
+    bool ok = m->predict({&in, 1}, {&out, 1});
+    const double first_ms = ms_since(t1);
+    std::vector<double> t;
+    for (int i = 0; i < iters && ok; ++i) {
+      const auto ti = Clk::now();
+      ok = m->predict({&in, 1}, {&out, 1});
+      t.push_back(ms_since(ti));
+    }
+    if (!ok || t.empty()) {
+      std::printf("[ane_ops] %-30s PREDICT FAILED\n", name.c_str());
+      ASSERT_TRUE(false);
+      continue;
+    }
+    std::sort(t.begin(), t.end());
+    const double med = t[t.size() / 2];
+
+    // The reference at four pixels: corners, an edge, the middle.
+    double num = 0.0, den = 0.0;
+    const int samples[4][2] = {{0, 0}, {0, W - 1}, {H / 2, W / 2 + 7},
+                               {H - 1, W - 1}};
+    for (const auto& sp : samples) {
+      const int h0 = sp[0], w0 = sp[1];
+      // Values of the current layer's input over the window it needs.
+      std::map<int, std::vector<double>> curv;
+      const int R = kk == 3 ? L : 0;
+      for (int dh = -R; dh <= R; ++dh) {
+        for (int dw = -R; dw <= R; ++dw) {
+          const int h = h0 + dh, w = w0 + dw;
+          if (h < 0 || h >= H || w < 0 || w >= W) { continue; }
+          std::vector<double> v((std::size_t)K);
+          for (int c = 0; c < K; ++c) {
+            v[(std::size_t)c] = xt[(std::size_t)(h * W + w) * K + c];
+          }
+          curv[h * W + w] = std::move(v);
+        }
+      }
+      for (int l = 0; l < L; ++l) {
+        if (a8) {
+          for (auto& kv : curv) {
+            for (double& e : kv.second) { e = qd(e); }
+          }
+        }
+        const std::vector<float>& wl = wv[(std::size_t)l];
+        const int r = kk == 3 ? L - 1 - l : 0;
+        std::map<int, std::vector<double>> nxt;
+        for (int dh = -r; dh <= r; ++dh) {
+          for (int dw = -r; dw <= r; ++dw) {
+            const int h = h0 + dh, w = w0 + dw;
+            if (h < 0 || h >= H || w < 0 || w >= W) { continue; }
+            std::vector<double> y((std::size_t)N, 0.0);
+            for (int ky = 0; ky < kk; ++ky) {
+              for (int kx = 0; kx < kk; ++kx) {
+                const int hh = h + ky - kk / 2, ww = w + kx - kk / 2;
+                if (hh < 0 || hh >= H || ww < 0 || ww >= W) { continue; }
+                const std::vector<double>& v = curv.at(hh * W + ww);
+                // Each layout's weights read in order: mm's [K, N] by
+                // row, a conv's [N, K, kk, kk] by filter.
+                if (!conv) {
+                  for (int c = 0; c < K; ++c) {
+                    const float* wr = wl.data() + (std::size_t)c * N;
+                    const double vc = v[(std::size_t)c];
+                    for (int n = 0; n < N; ++n) {
+                      y[(std::size_t)n] += (double)wr[n] * vc;
+                    }
+                  }
+                  continue;
+                }
+                for (int n = 0; n < N; ++n) {
+                  double acc = 0.0;
+                  for (int c = 0; c < K; ++c) {
+                    const std::size_t wi =
+                        (((std::size_t)n * K + c) * kk + ky) * kk + kx;
+                    acc += (double)wl[wi] * v[(std::size_t)c];
+                  }
+                  y[(std::size_t)n] += acc;
+                }
+              }
+            }
+            nxt[h * W + w] = std::move(y);
+          }
+        }
+        curv = std::move(nxt);
+      }
+      const std::vector<double>& ref = curv.at(h0 * W + w0);
+      const int p = h0 * W + w0;
+      for (int n = 0; n < N; ++n) {
+        const std::size_t d = conv && !a.nhwc
+                                  ? (std::size_t)n * M + p
+                                  : (std::size_t)p * N + n;
+        _Float16 hv;
+        std::memcpy(&hv, &yb[d], 2);
+        const double e = (double)hv - ref[(std::size_t)n];
+        num += e * e;
+        den += ref[(std::size_t)n] * ref[(std::size_t)n];
+      }
+    }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    const double op_flop = 2.0 * M * (double)K * N * kk * kk;
+    std::printf("[ane_ops] %-30s compile %7.0f ms, first %7.1f ms, "
+                "median %8.2f ms = %6.2f TOP/s, rel %.1e", name.c_str(),
+                compile_ms, first_ms, med, L * op_flop / med / 1e9, rel);
+    if (L == 1) {
+      one_op_ms[key] = med;
+    } else if (one_op_ms.count(key) != 0) {
+      const double marg = (med - one_op_ms[key]) / (L - 1);
+      std::printf(", marginal op %.2f ms = %.2f TOP/s", marg,
+                  marg > 0.0 ? op_flop / marg / 1e9 : 0.0);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+    EXPECT_TRUE(rel < (a8 ? 5e-2 : 2e-2));
+  }
+}
+
+// INT8 WITHOUT BAKING. macOS 26 gave CoreML int8 arrays
+// (MLMultiArrayDataTypeInt8, which an IOSurface-backed OneComponent8
+// pixel buffer can carry), so a projection's int8 codes can be a model
+// INPUT -- one compiled program for every block, as the runtime-weight
+// tier's fp16 slots are -- dequantized inside the graph. What a graph
+// cannot take at run time is a quantizer's SCALE (quantize / dequantize
+// want constants), so every scale that is not known when the graph is
+// compiled multiplies the product's OUTPUT instead: a weight's per
+// output channel, and an activation's per token. Constant power-of-two
+// scales (1/128) keep the int8 products inside fp16. A chain of L
+// projections y = x W^T, W [N, K] as a checkpoint stores it, each layer
+// its own weight input, in eight forms:
+//
+//   f16-rt          fp16 weights as inputs (the tier's form)
+//   w8-cast-rt      int8 weight inputs, cast to fp16, x s_w at the output
+//   w8-dq-rt        the same through dequantize (scale 1/128)
+//   w8a8-static-rt  + every input quantized at a constant per-tensor step
+//   w8a8-dyn-rt     + every input quantized PER TOKEN, the scale computed
+//                   in the graph (max |x| a row / 127), x s_a at the
+//                   output -- the GPU's token tier's arithmetic
+//   w8a8-in-rt      the first layer's input given as int8 codes and per-
+//                   token scales (what the GPU's token quantizer writes),
+//                   the later layers as w8a8-dyn-rt
+//   w8a8-dyn1-rt    w8a8-dyn-rt with each activation dequantized at the
+//   w8a8-in1-rt     step it was quantized with (1; the 1/128 on the
+//                   weight side) -- the M5 compiler takes only such pairs
+//   w8a8-dynr-rt    w8a8-dyn1-rt dividing by a row's scale as a multiply
+//                   by its reciprocal
+//   f16-baked       fp16 weights as constants
+//   w8a8-baked      int8 constants, constant per-tensor activation step
+//
+// Each graph's output is checked on sampled rows against a double
+// restatement of the same arithmetic; the bundles stay under
+// VPIPE_ANE_RTQ_DIR for CoreML's compute plan.
+//
+//   VPIPE_ANE_RTQ_PROBE=1   run it
+//   VPIPE_ANE_RTQ_DIR       where the bundles go (kept)
+//   VPIPE_ANE_RTQ_ITERS     timed predicts an arm (10)
+//   VPIPE_ANE_RTQ_ONLY      only the arms whose name contains this
+TEST(ane_module, runtime_int8_probe)
+{
+  if (env_or_null_("VPIPE_ANE_RTQ_PROBE") == nullptr) { return; }
+  vpipe::Session sess;
+  auto* svc = sess.services();
+  auto* mgr = svc != nullptr ? svc->coreml_model_manager() : nullptr;
+  if (mgr == nullptr) { return; }
+  namespace fs = std::filesystem;
+  using Clk = std::chrono::steady_clock;
+  auto ms_since = [](Clk::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clk::now() - t).count();
+  };
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const char* od = env_or_null_("VPIPE_ANE_RTQ_DIR");
+  const std::string root =
+      od != nullptr ? std::string(od)
+                    : (fs::temp_directory_path() / "vpipe-ane-rtq").string();
+  std::error_code ec;
+  fs::create_directories(root, ec);
+  const int iters = std::max(3, envi("VPIPE_ANE_RTQ_ITERS", 10));
+  const char* only = env_or_null_("VPIPE_ANE_RTQ_ONLY");
+
+  std::uint32_t lcg = 0x6c8e9cf5u;
+  auto uni = [&]() {
+    lcg = lcg * 1664525u + 1013904223u;
+    return (float)(lcg >> 8) * (2.0f / 16777216.0f) - 1.0f;
+  };
+  auto h16 = [](double v) { return (double)(_Float16)v; };
+  auto bits16 = [](double v) {
+    const _Float16 h = (_Float16)v;
+    std::uint16_t w = 0;
+    std::memcpy(&w, &h, 2);
+    return w;
+  };
+  auto dims = [](long long a, long long b) {
+    return "[" + std::to_string(a) + ", " + std::to_string(b) + "]";
+  };
+  auto blob = [](const std::string& ty, const std::string& d,
+                 std::size_t off) {
+    return "tensor<" + ty + ", " + d + ">(BLOBFILE(path = string(\"" +
+           "@model_path/weights/weight.bin\"), offset = uint64(" +
+           std::to_string(off) + ")))";
+  };
+  // An IOSurface-backed pixel buffer of fp16 or int8 elements, rows x
+  // cols, filled row by row (a pixel buffer may pad its rows).
+  auto make_pb = [](int rows, int cols, bool i8, const void* src) {
+    CFDictionaryRef empty = CFDictionaryCreate(
+        kCFAllocatorDefault, nullptr, nullptr, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void* keys[] = {kCVPixelBufferIOSurfacePropertiesKey};
+    const void* vals[] = {empty};
+    CFDictionaryRef attrs = CFDictionaryCreate(
+        kCFAllocatorDefault, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CVPixelBufferRef pb = nullptr;
+    const CVReturn rc = CVPixelBufferCreate(
+        kCFAllocatorDefault, (size_t)cols, (size_t)rows,
+        i8 ? kCVPixelFormatType_OneComponent8
+           : kCVPixelFormatType_OneComponent16Half,
+        attrs, &pb);
+    CFRelease(attrs);
+    CFRelease(empty);
+    if (rc != kCVReturnSuccess || pb == nullptr) { return pb; }
+    const std::size_t es = i8 ? 1 : 2;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    auto* dst = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddress(pb));
+    const std::size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    for (int r = 0; r < rows; ++r) {
+      std::memcpy(dst + (std::size_t)r * bpr,
+                  static_cast<const std::uint8_t*>(src) +
+                      (std::size_t)r * cols * es,
+                  (std::size_t)cols * es);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+  };
+
+  struct Cfg { int M, K, L; };          // N == K, so the layers chain
+  const Cfg cfgs[] = {{2048, 2048, 4}, {2048, 4096, 2}, {2048, 4096, 1}};
+  const char* modes[] = {"f16-rt",         "w8-cast-rt",  "w8-dq-rt",
+                         "w8a8-static-rt", "w8a8-dyn-rt", "w8a8-in-rt",
+                         "w8a8-dyn1-rt",   "w8a8-dynr-rt", "w8a8-in1-rt",
+                         "f16-baked",      "w8a8-baked"};
+  const double a_step = h16(3.0 / 127.0);    // the static activation step
+  const double i127   = h16(1.0 / 127.0);
+  for (const Cfg& cf : cfgs) {
+    const int M = cf.M, K = cf.K, N = cf.K, L = cf.L;
+    // The weights, the inputs and every arm's reference share these.
+    std::vector<std::vector<float>> wf((std::size_t)L);
+    std::vector<std::vector<std::uint16_t>> w16((std::size_t)L);
+    std::vector<std::vector<std::int8_t>> w8((std::size_t)L);
+    std::vector<std::vector<double>> sw((std::size_t)L);   // fp16 steps
+    for (int l = 0; l < L; ++l) {
+      const std::size_t n = (std::size_t)N * K;
+      const float amp = std::sqrt(3.0f / (float)K);
+      wf[(std::size_t)l].resize(n);
+      w16[(std::size_t)l].resize(n);
+      w8[(std::size_t)l].resize(n);
+      sw[(std::size_t)l].assign((std::size_t)N, 0.0);
+      for (std::size_t i = 0; i < n; ++i) {
+        wf[(std::size_t)l][i] = uni() * amp;
+        w16[(std::size_t)l][i] = bits16(wf[(std::size_t)l][i]);
+      }
+      for (int r = 0; r < N; ++r) {
+        double m = 0.0;
+        for (int c = 0; c < K; ++c) {
+          m = std::max(m, (double)std::fabs(
+                              wf[(std::size_t)l][(std::size_t)r * K + c]));
+        }
+        const double s = h16(std::max(m, 1e-6) / 127.0);
+        sw[(std::size_t)l][(std::size_t)r] = s;
+        for (int c = 0; c < K; ++c) {
+          const std::size_t i = (std::size_t)r * K + c;
+          w8[(std::size_t)l][i] = (std::int8_t)std::clamp(
+              std::nearbyint(wf[(std::size_t)l][i] / s), -127.0, 127.0);
+        }
+      }
+    }
+    std::vector<double> xf((std::size_t)M * K);
+    std::vector<std::uint16_t> x16(xf.size());
+    for (std::size_t i = 0; i < xf.size(); ++i) {
+      xf[i] = h16(uni());
+      x16[i] = bits16(xf[i]);
+    }
+    // The first input as the GPU's token quantizer would hand it over.
+    std::vector<std::int8_t> x8(xf.size());
+    std::vector<double> xs((std::size_t)M);
+    for (int m = 0; m < M; ++m) {
+      double a = 0.0;
+      for (int c = 0; c < K; ++c) {
+        a = std::max(a, std::fabs(xf[(std::size_t)m * K + c]));
+      }
+      xs[(std::size_t)m] = h16(std::max(a, 1e-6) / 127.0);
+      for (int c = 0; c < K; ++c) {
+        const std::size_t i = (std::size_t)m * K + c;
+        x8[i] = (std::int8_t)std::clamp(
+            std::nearbyint(xf[i] / xs[(std::size_t)m]), -127.0, 127.0);
+      }
+    }
+
+    for (const char* mode_c : modes) {
+      const std::string mode = mode_c;
+      const std::string name = mode + "-" + std::to_string(K) + "x" +
+                               std::to_string(N) + "-L" + std::to_string(L);
+      if (only != nullptr && name.find(only) == std::string::npos) {
+        continue;
+      }
+      const bool rt     = mode.size() > 3 &&
+                          mode.compare(mode.size() - 3, 3, "-rt") == 0;
+      const bool w_i8   = rt && mode != "f16-rt";
+      const bool baked8 = mode == "w8a8-baked";
+      const bool a_stat = mode == "w8a8-static-rt" || baked8;
+      const bool pair1  = mode == "w8a8-dyn1-rt" || mode == "w8a8-dynr-rt" ||
+                          mode == "w8a8-in1-rt";
+      const bool recip  = mode == "w8a8-dynr-rt";
+      const bool a_dyn  = mode == "w8a8-dyn-rt" || mode == "w8a8-in-rt" ||
+                          pair1;
+      const bool x_in8  = mode == "w8a8-in-rt" || mode == "w8a8-in1-rt";
+      const bool cast   = mode == "w8-cast-rt";
+
+      // Baked weight slabs (blob dtype 1 fp16, 4 int8).
+      std::vector<std::vector<unsigned char>> slab;
+      std::vector<std::uint32_t> code;
+      if (!rt) {
+        for (int l = 0; l < L; ++l) {
+          const std::size_t n = (std::size_t)N * K;
+          if (!baked8) {
+            std::vector<unsigned char> b(n * 2);
+            std::memcpy(b.data(), w16[(std::size_t)l].data(), n * 2);
+            slab.push_back(std::move(b));
+            code.push_back(1);
+          } else {
+            std::vector<unsigned char> q(n), s((std::size_t)N * 2);
+            std::memcpy(q.data(), w8[(std::size_t)l].data(), n);
+            for (int r = 0; r < N; ++r) {
+              const std::uint16_t v = bits16(sw[(std::size_t)l][(size_t)r]);
+              std::memcpy(s.data() + (std::size_t)r * 2, &v, 2);
+            }
+            slab.push_back(std::move(q));
+            code.push_back(4);
+            slab.push_back(std::move(s));
+            code.push_back(1);
+          }
+        }
+      }
+      std::vector<std::size_t> sizes;
+      for (const auto& b : slab) { sizes.push_back(b.size()); }
+      const std::vector<std::size_t> off =
+          vpipe::AneEmitter::blob_offsets(sizes);
+
+      // The interface, in declaration order; which features are int8.
+      std::vector<vpipe::AneEmitter::Feature> ins;
+      std::vector<bool> ins_i8;
+      if (x_in8) {
+        ins.push_back({"x8", {M, K}});
+        ins_i8.push_back(true);
+        ins.push_back({"sa", {M, 1}});
+        ins_i8.push_back(false);
+      } else {
+        ins.push_back({"x", {M, K}});
+        ins_i8.push_back(false);
+      }
+      if (rt) {
+        for (int l = 0; l < L; ++l) {
+          ins.push_back({"w" + std::to_string(l), {N, K}});
+          ins_i8.push_back(w_i8);
+          if (w_i8) {
+            ins.push_back({"s" + std::to_string(l), {1, N}});
+            ins_i8.push_back(false);
+          }
+        }
+      }
+      const std::string MK = dims(M, K), MN = dims(M, N), NK = dims(N, K);
+      const std::string M1 = dims(M, 1);
+
+      auto mil_for = [&](const std::string& opset) {
+        std::ostringstream o;
+        o << vpipe::AneEmitter::mil_preamble() << "    func main<" << opset
+          << ">(";
+        for (std::size_t i = 0; i < ins.size(); ++i) {
+          o << (i ? ", " : "") << "tensor<" << (ins_i8[i] ? "int8" : "fp16")
+            << ", " << dims(ins[i].shape[0], ins[i].shape[1]) << "> "
+            << ins[i].name;
+        }
+        o << ") {\n";
+        auto line = [&](const std::string& s) {
+          o << "            " << s << ";\n";
+        };
+        auto cst = [&](const std::string& ty, const std::string& nm,
+                       const std::string& val) {
+          line(ty + " " + nm + " = const()[name = string(\"" + nm +
+               "\"), val = " + val + "]");
+        };
+        auto fp = [](double v) {
+          char b[48];
+          std::snprintf(b, sizeof(b), "fp16(%.9g)", v);
+          return std::string(b);
+        };
+        cst("bool", "ftx", "bool(false)");
+        cst("bool", "tty", "bool(true)");
+        cst("fp16", "c128", fp(1.0 / 128.0));
+        cst("fp16", "f128", fp(128.0));
+        cst("fp16", "one", fp(1.0));
+        cst("fp16", "asc", fp(a_step));
+        cst("fp16", "i127", fp(i127));
+        cst("fp16", "eps", fp(1e-4));
+        cst("string", "adt", "string(\"int8\")");
+        cst("string", "dt16", "string(\"fp16\")");
+        cst("tensor<int32, [1]>", "rax", "tensor<int32, [1]>([1])");
+        cst("bool", "kd", "bool(true)");
+        std::string cur = "x";
+        std::size_t si = 0;
+        for (int l = 0; l < L; ++l) {
+          const std::string ls = std::to_string(l);
+          // The weight as the matmul reads it.
+          std::string wl = "w" + ls;
+          if (cast) {
+            line("tensor<fp16, " + NK + "> wh" + ls + " = cast(dtype = dt16, "
+                 "x = w" + ls + ")[name = string(\"wh" + ls + "\")]");
+            wl = "wh" + ls;
+          } else if (w_i8) {
+            line("tensor<fp16, " + NK + "> wh" + ls + " = dequantize(input = "
+                 "w" + ls + ", scale = c128)[name = string(\"wh" + ls +
+                 "\")]");
+            wl = "wh" + ls;
+          } else if (!rt && !baked8) {
+            cst("tensor<fp16, " + NK + ">", wl, blob("fp16", NK, off[si]));
+            si += 1;
+          } else if (baked8) {
+            line("tensor<fp16, " + NK + "> " + wl +
+                 " = constexpr_blockwise_shift_scale(data = " +
+                 blob("int8", NK, off[si]) + ", scale = " +
+                 blob("fp16", dims(N, 1), off[si + 1]) +
+                 ")[name = string(\"" + wl + "\")]");
+            si += 2;
+          }
+          // The activation as the matmul reads it, and the per-token
+          // multiplier its output then takes (empty: none).
+          std::string a = cur, tok;
+          // pair1: dequantize at the step it quantized with (1), the
+          // 1/128 left on the weight side; the multiplier then s_a alone.
+          const std::string dqs = pair1 ? "one" : "c128";
+          if (x_in8 && l == 0) {
+            line("tensor<fp16, " + MK + "> d0 = dequantize(input = x8, "
+                 "scale = " + dqs + ")[name = string(\"d0\")]");
+            a   = "d0";
+            tok = "sa";
+          } else if (a_dyn) {
+            line("tensor<fp16, " + MK + "> ab" + ls + " = abs(x = " + cur +
+                 ")[name = string(\"ab" + ls + "\")]");
+            line("tensor<fp16, " + M1 + "> am" + ls + " = reduce_max(axes = "
+                 "rax, keep_dims = kd, x = ab" + ls + ")[name = string(\"am" +
+                 ls + "\")]");
+            line("tensor<fp16, " + M1 + "> sc" + ls + " = mul(x = am" + ls +
+                 ", y = i127)[name = string(\"sc" + ls + "\")]");
+            line("tensor<fp16, " + M1 + "> sa" + ls + " = maximum(x = sc" +
+                 ls + ", y = eps)[name = string(\"sa" + ls + "\")]");
+            if (recip) {
+              line("tensor<fp16, " + M1 + "> rs" + ls + " = real_div(x = one"
+                   ", y = sa" + ls + ")[name = string(\"rs" + ls + "\")]");
+              line("tensor<fp16, " + MK + "> xs" + ls + " = mul(x = " + cur +
+                   ", y = rs" + ls + ")[name = string(\"xs" + ls + "\")]");
+            } else {
+              line("tensor<fp16, " + MK + "> xs" + ls + " = real_div(x = " +
+                   cur + ", y = sa" + ls + ")[name = string(\"xs" + ls +
+                   "\")]");
+            }
+            line("tensor<int8, " + MK + "> q" + ls + " = quantize(input = xs" +
+                 ls + ", output_dtype = adt, scale = one)[name = string(\"q" +
+                 ls + "\")]");
+            line("tensor<fp16, " + MK + "> d" + ls + " = dequantize(input = q" +
+                 ls + ", scale = " + dqs + ")[name = string(\"d" + ls +
+                 "\")]");
+            a = "d" + ls;
+            if (pair1) {
+              tok = "sa" + ls;
+            } else {
+              line("tensor<fp16, " + M1 + "> sb" + ls + " = mul(x = sa" + ls +
+                   ", y = f128)[name = string(\"sb" + ls + "\")]");
+              tok = "sb" + ls;
+            }
+          } else if (a_stat) {
+            line("tensor<int8, " + MK + "> q" + ls + " = quantize(input = " +
+                 cur + ", output_dtype = adt, scale = asc)[name = string(\"q" +
+                 ls + "\")]");
+            line("tensor<fp16, " + MK + "> d" + ls + " = dequantize(input = q" +
+                 ls + ", scale = asc)[name = string(\"d" + ls + "\")]");
+            a = "d" + ls;
+          }
+          std::string y = "y" + ls;
+          line("tensor<fp16, " + MN + "> " + y + " = matmul(transpose_x = "
+               "ftx, transpose_y = tty, x = " + a + ", y = " + wl +
+               ")[name = string(\"" + y + "\")]");
+          if (!tok.empty()) {
+            line("tensor<fp16, " + MN + "> yt" + ls + " = mul(x = " + y +
+                 ", y = " + tok + ")[name = string(\"yt" + ls + "\")]");
+            y = "yt" + ls;
+          }
+          if (w_i8) {
+            line("tensor<fp16, " + MN + "> ys" + ls + " = mul(x = " + y +
+                 ", y = s" + ls + ")[name = string(\"ys" + ls + "\")]");
+            y = "ys" + ls;
+          }
+          cur = y;
+        }
+        o << "        } -> (" << cur << ");\n}";
+        return std::make_pair(o.str(), cur);
+      };
+
+      // Write, relabel and load, trying the int8-capable target first.
+      // The iOS 26 generation's opset is named by its internal number:
+      // `ios19` parses, `ios26` is "not in blocks". The header's 9 stays:
+      // written as 10, the model loads and every int8 INPUT is refused at
+      // predict ("Invalid multi-array data type: 00020008").
+      std::shared_ptr<vpipe::CoreMLLoadedModel> m;
+      std::string out_name, how, dir;
+      double compile_ms = 0.0;
+      const char* opsets[] = {"ios19", "ios18"};
+      const std::uint32_t specs[] = {9, 10};
+      for (const char* os : opsets) {
+        for (std::uint32_t sv : specs) {
+          if (m != nullptr) { break; }
+          auto mo = mil_for(os);
+          out_name = mo.second;
+          dir = root + "/" + name + "-" + os + "-v" + std::to_string(sv) +
+                ".mlmodelc";
+          const vpipe::AneEmitter::Feature fout{out_name, {M, N}};
+          std::vector<vpipe::AneBlobSlab> bs;
+          for (const auto& b : slab) { bs.push_back({b.data(), b.size()}); }
+          std::string err;
+          if (!vpipe::AneEmitter::write_bundle(dir, mo.first, ins,
+                                               {&fout, 1}, bs, &err)) {
+            std::printf("[ane_rtq] %s: not written (%s)\n", name.c_str(),
+                        err.c_str());
+            continue;
+          }
+          for (std::size_t i = 0; i < code.size(); ++i) {
+            if (code[i] == 1) { continue; }
+            std::fstream f(dir + "/weights/weight.bin",
+                           std::ios::in | std::ios::out | std::ios::binary);
+            f.seekp((std::streamoff)(off[i] + 4));
+            f.write(reinterpret_cast<const char*>(&code[i]), 4);
+          }
+          // coremldata.bin: the spec version, and each int8 feature's
+          // array type (FLOAT16 65552 -> INT8 131080, both three-byte
+          // varints after the field's tag 0x10, in feature order).
+          {
+            std::fstream f(dir + "/coremldata.bin",
+                           std::ios::in | std::ios::out | std::ios::binary);
+            std::string b((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+            std::memcpy(&b[0x04], &sv, 4);
+            std::memcpy(&b[0x2b], &sv, 4);
+            const char pat[4] = {'\x10', '\x90', '\x80', '\x04'};
+            std::size_t pos = 0, k = 0;
+            while ((pos = b.find(std::string(pat, 4), pos)) !=
+                   std::string::npos) {
+              if (k < ins_i8.size() && ins_i8[k]) {
+                b[pos + 1] = '\x88';
+                b[pos + 2] = '\x80';
+                b[pos + 3] = '\x08';
+              }
+              ++k;
+              pos += 4;
+            }
+            ASSERT_TRUE(k == ins.size() + 1);
+            f.clear();
+            f.seekp(0);
+            f.write(b.data(), (std::streamsize)b.size());
+          }
+          const auto t0 = Clk::now();
+          m = mgr->load(dir, 3);
+          compile_ms = ms_since(t0);
+          if (m != nullptr && !m->valid()) { m = nullptr; }
+          how = std::string(os) + "/spec " + std::to_string(sv);
+          if (m == nullptr) {
+            std::printf("[ane_rtq] %s: %s did not load\n", name.c_str(),
+                        how.c_str());
+          }
+        }
+      }
+      slab.clear();
+      if (m == nullptr) {
+        std::printf("[ane_rtq] %-24s LOADED UNDER NO TARGET\n",
+                    name.c_str());
+        continue;
+      }
+
+      // Bind: x on the host, every weight an IOSurface of its type.
+      std::vector<CVPixelBufferRef> pbs;
+      std::vector<vpipe::CoreMLPredictInput> pin;
+      std::vector<std::vector<std::uint16_t>> host;   // scales
+      host.reserve(2 * (std::size_t)L + 1);
+      for (std::size_t i = 0; i < ins.size(); ++i) {
+        vpipe::CoreMLPredictInput in;
+        in.name  = ins[i].name;
+        in.dtype = vpipe::CoreMLDType::F16;
+        in.shape = ins[i].shape;
+        const std::string& nm = ins[i].name;
+        if (nm == "x") {
+          in.data = x16.data();
+        } else if (nm == "x8") {
+          pbs.push_back(make_pb(M, K, true, x8.data()));
+          in.pixel_buffer = pbs.back();
+        } else if (nm == "sa") {
+          std::vector<std::uint16_t> v((std::size_t)M);
+          for (int r = 0; r < M; ++r) {
+            v[(std::size_t)r] =
+                bits16(xs[(std::size_t)r] * (pair1 ? 1.0 : 128.0));
+          }
+          host.push_back(std::move(v));
+          in.data = host.back().data();
+        } else if (nm[0] == 'w') {
+          const int l = std::atoi(nm.c_str() + 1);
+          const void* src = w_i8
+                                ? (const void*)w8[(std::size_t)l].data()
+                                : (const void*)w16[(std::size_t)l].data();
+          pbs.push_back(make_pb(N, K, w_i8, src));
+          in.pixel_buffer = pbs.back();
+        } else {                                   // s<l>
+          const int l = std::atoi(nm.c_str() + 1);
+          const double k = cast ? 1.0 : 128.0;
+          std::vector<std::uint16_t> v((std::size_t)N);
+          for (int r = 0; r < N; ++r) {
+            v[(std::size_t)r] = bits16(sw[(std::size_t)l][(size_t)r] * k);
+          }
+          host.push_back(std::move(v));
+          in.data = host.back().data();
+        }
+        pin.push_back(std::move(in));
+      }
+      std::vector<std::uint16_t> yb((std::size_t)M * N);
+      vpipe::CoreMLPredictOutput out;
+      out.name          = out_name;
+      out.want          = vpipe::CoreMLDType::F16;
+      out.backing       = yb.data();
+      out.backing_elems = yb.size();
+      bool ok = m->predict(pin, {&out, 1});
+      std::vector<double> t;
+      for (int i = 0; i < iters && ok; ++i) {
+        const auto ti = Clk::now();
+        ok = m->predict(pin, {&out, 1});
+        t.push_back(ms_since(ti));
+      }
+      for (CVPixelBufferRef pb : pbs) {
+        if (pb != nullptr) { CVPixelBufferRelease(pb); }
+      }
+      if (!ok || t.empty()) {
+        std::printf("[ane_rtq] %-24s PREDICT FAILED (%s)\n", name.c_str(),
+                    how.c_str());
+        ASSERT_TRUE(false);
+        continue;
+      }
+      std::sort(t.begin(), t.end());
+      const double med = t[t.size() / 2];
+
+      // The reference: the same arithmetic in double on four rows -- and,
+      // for what a model would see, the UNQUANTIZED product (the float
+      // weights, the input as given), whose distance is the mode's real
+      // cost.
+      double num = 0.0, den = 0.0, enum_ = 0.0, eden = 0.0;
+      for (const int r : {0, 1, M / 2, M - 1}) {
+        std::vector<double> v((std::size_t)K), ve((std::size_t)K);
+        for (int c = 0; c < K; ++c) {
+          v[(std::size_t)c] =
+              x_in8 ? (double)x8[(std::size_t)r * K + c] *
+                          xs[(std::size_t)r]
+                    : xf[(std::size_t)r * K + c];
+          ve[(std::size_t)c] = xf[(std::size_t)r * K + c];
+        }
+        for (int l = 0; l < L; ++l) {
+          std::vector<double> yex((std::size_t)N, 0.0);
+          for (int n = 0; n < N; ++n) {
+            const float* wr = wf[(std::size_t)l].data() + (std::size_t)n * K;
+            double acc = 0.0;
+            for (int c = 0; c < K; ++c) {
+              acc += (double)wr[c] * ve[(std::size_t)c];
+            }
+            yex[(std::size_t)n] = acc;
+          }
+          ve = std::move(yex);
+          if (a_stat) {
+            for (double& e : v) {
+              e = std::clamp(std::nearbyint(e / a_step), -128.0, 127.0) *
+                  a_step;
+            }
+          } else if (a_dyn && !(x_in8 && l == 0)) {
+            double am = 0.0;
+            for (double e : v) { am = std::max(am, std::fabs(h16(e))); }
+            const double s = std::max(h16(am * i127), 1e-4);
+            for (double& e : v) {
+              e = std::clamp(std::nearbyint(e / s), -128.0, 127.0) * s;
+            }
+          }
+          std::vector<double> y((std::size_t)N, 0.0);
+          for (int n = 0; n < N; ++n) {
+            const std::size_t o = (std::size_t)n * K;
+            double acc = 0.0;
+            if (w_i8 || baked8) {
+              for (int c = 0; c < K; ++c) {
+                acc += (double)w8[(std::size_t)l][o + c] * v[(std::size_t)c];
+              }
+              acc *= sw[(std::size_t)l][(std::size_t)n];
+            } else {
+              for (int c = 0; c < K; ++c) {
+                _Float16 hw;
+                std::memcpy(&hw, &w16[(std::size_t)l][o + c], 2);
+                acc += (double)hw * v[(std::size_t)c];
+              }
+            }
+            y[(std::size_t)n] = acc;
+          }
+          v = std::move(y);
+        }
+        for (int n = 0; n < N; ++n) {
+          _Float16 hv;
+          std::memcpy(&hv, &yb[(std::size_t)r * N + n], 2);
+          const double e = (double)hv - v[(std::size_t)n];
+          num += e * e;
+          den += v[(std::size_t)n] * v[(std::size_t)n];
+          const double ee = (double)hv - ve[(std::size_t)n];
+          enum_ += ee * ee;
+          eden += ve[(std::size_t)n] * ve[(std::size_t)n];
+        }
+      }
+      const double rel = std::sqrt(num / std::max(den, 1e-30));
+      const double erel = std::sqrt(enum_ / std::max(eden, 1e-30));
+      const double flop = 2.0 * L * (double)M * K * N;
+      std::printf("[ane_rtq] %-24s %-13s compile %6.0f ms, median %7.2f ms "
+                  "= %6.2f TOP/s, rel %.1e (from unquantized %.1e)\n",
+                  name.c_str(), how.c_str(), compile_ms, med,
+                  flop / med / 1e9, rel, erel);
+      std::fflush(stdout);
+      EXPECT_TRUE(rel < 5e-2);
+    }
+  }
+}
+
+// THE TIER'S FEED-FORWARD WITH INT8 INPUTS (see runtime_int8_probe for the
+// mechanism). One SwiGLU chunk at MiniMax-H3's widths, tiled as
+// AneEmitter tiles the tier's own graph (x sliced along K, each weight
+// tile sliced out of the whole [out, in] input, matmul with transpose_y,
+// summed over K, concatenated over N), the int8 variants slicing the int8
+// tensors and dequantizing each tile right before its matmul:
+//
+//   tier       the tier's module itself (AneModule::build_runtime)
+//   f16        this generator, fp16 -- must equal the tier
+//   w8a16      int8 weight inputs for all three projections
+//   a8gu-in    W8A8 gate|up from int8 codes + per-token scales given as
+//              inputs (what the GPU's token quantizer writes), W8A16 down
+//   a8gu-dyn   the same with x quantized per token inside the graph
+//   a8all-in   gate|up as a8gu-in, the down projection's input quantized
+//              per token inside the graph (one in-graph quantization)
+//   a8all-dyn  both quantized inside the graph
+//
+// and each again ROTATED (the GPU's `token` tier's arithmetic): every
+// weight row Walsh-Hadamard transformed per 256-block of K before its
+// int8 (or fp16) step, and every activation by the same transform inside
+// the graph -- [M, K] reshaped to [M, K/256, 256] and multiplied by the
+// orthonormal Hadamard, a model input -- before it is quantized (the
+// gate|up input given as the GPU's rotated quantizer writes it):
+//   f16-rot, w8a16-rot, a8gu-rot-in, a8all-rot-in, a8all-rot-dyn
+//
+// beside two CPU emulations of the GPU's token tiers over the same
+// weights and rows -- token_plain (per-token activations, per-row
+// weights, all three projections) and token (the same after a
+// Walsh-Hadamard rotation of every 256-block of K) -- for scale.
+//
+// On SYNTHETIC data by default (random weights and inputs: no outlier
+// channels), or on REAL data: VPIPE_ANE_RTQF_REAL names a directory of
+// feed-forward inputs a forward saved (VPIPE_H3_FF_CAPTURE: ff_in_<L>.bf16,
+// [rows, hidden]) and VPIPE_ANE_RTQF_CKPT the checkpoint that forward ran
+// (a single safetensors file, blocks.<L>.mlp.fc1 / fc2), the rows
+// repeated to fill the chunk. Each form is scored on sampled rows against
+// a double restatement of its own arithmetic and of the unquantized
+// feed-forward.
+//
+//   VPIPE_ANE_RTQF_PROBE=1         run it
+//   VPIPE_ANE_RTQF_REAL / _CKPT    real data (above)
+//   VPIPE_ANE_RTQF_BLOCKS          real blocks ("0,12,24,36,49")
+//   VPIPE_ANE_RTQF_UPSHIFT         up projection / 2^k (fp16 headroom)
+//   VPIPE_ANE_RTQF_HID / _FFN      synthetic widths (5376 / 14336)
+//   VPIPE_ANE_RTQF_ROWS / _TILE    rows a chunk (2048), tile (1024)
+//   VPIPE_ANE_RTQF_ITERS           timed predicts an arm (8)
+//   VPIPE_ANE_RTQF_ONLY / _DIR     arms whose name contains this; bundles
+TEST(ane_module, runtime_int8_ffn_probe)
+{
+  if (env_or_null_("VPIPE_ANE_RTQF_PROBE") == nullptr) { return; }
+  namespace mcx = vpipe::metal_compute;
+  vpipe::Session sess;
+  auto* svc = sess.services();
+  auto* mgr = svc != nullptr ? svc->coreml_model_manager() : nullptr;
+  mcx::MetalCompute* mc = sess.metal_compute();
+  if (mgr == nullptr || mc == nullptr || !mc->valid()) { return; }
+  namespace fs = std::filesystem;
+  using Clk = std::chrono::steady_clock;
+  auto ms_since = [](Clk::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clk::now() - t).count();
+  };
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const char* real = env_or_null_("VPIPE_ANE_RTQF_REAL");
+  const char* ckpt = env_or_null_("VPIPE_ANE_RTQF_CKPT");
+  const bool is_real = real != nullptr && ckpt != nullptr;
+  int H = envi("VPIPE_ANE_RTQF_HID", 5376);
+  int F = envi("VPIPE_ANE_RTQF_FFN", 14336);
+  const int M = envi("VPIPE_ANE_RTQF_ROWS", 2048);
+  const int T = envi("VPIPE_ANE_RTQF_TILE", 1024);
+  const int iters = std::max(3, envi("VPIPE_ANE_RTQF_ITERS", 8));
+  const char* only = env_or_null_("VPIPE_ANE_RTQF_ONLY");
+  const char* od = env_or_null_("VPIPE_ANE_RTQF_DIR");
+  const std::string root =
+      od != nullptr ? std::string(od)
+                    : (fs::temp_directory_path() / "vpipe-ane-rtqf").string();
+  std::error_code ec;
+  fs::create_directories(root, ec);
+
+  std::uint32_t lcg = 0x1b873593u;
+  auto uni = [&]() {
+    lcg = lcg * 1664525u + 1013904223u;
+    return (float)(lcg >> 8) * (2.0f / 16777216.0f) - 1.0f;
+  };
+  auto h16 = [](double v) { return (double)(_Float16)v; };
+  auto bits16 = [](double v) {
+    const _Float16 h = (_Float16)v;
+    std::uint16_t w = 0;
+    std::memcpy(&w, &h, 2);
+    return w;
+  };
+  auto bf16f = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto make_pb = [](int rows, int cols, bool i8, const void* src) {
+    CFDictionaryRef empty = CFDictionaryCreate(
+        kCFAllocatorDefault, nullptr, nullptr, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void* keys[] = {kCVPixelBufferIOSurfacePropertiesKey};
+    const void* vals[] = {empty};
+    CFDictionaryRef attrs = CFDictionaryCreate(
+        kCFAllocatorDefault, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CVPixelBufferRef pb = nullptr;
+    const CVReturn rc = CVPixelBufferCreate(
+        kCFAllocatorDefault, (size_t)cols, (size_t)rows,
+        i8 ? kCVPixelFormatType_OneComponent8
+           : kCVPixelFormatType_OneComponent16Half,
+        attrs, &pb);
+    CFRelease(attrs);
+    CFRelease(empty);
+    if (rc != kCVReturnSuccess || pb == nullptr) { return pb; }
+    const std::size_t es = i8 ? 1 : 2;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    auto* dst = static_cast<std::uint8_t*>(CVPixelBufferGetBaseAddress(pb));
+    const std::size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    for (int r = 0; r < rows; ++r) {
+      std::memcpy(dst + (std::size_t)r * bpr,
+                  static_cast<const std::uint8_t*>(src) +
+                      (std::size_t)r * cols * es,
+                  (std::size_t)cols * es);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+  };
+  // Orthonormal Walsh-Hadamard over every 256-block of v (the GPU token
+  // tier's rotation; self-inverse).
+  auto fwht256 = [](double* v, std::size_t n) {
+    for (std::size_t b0 = 0; b0 + 256 <= n; b0 += 256) {
+      double* p = v + b0;
+      for (int h = 1; h < 256; h <<= 1) {
+        for (int i = 0; i < 256; i += 2 * h) {
+          for (int j = i; j < i + h; ++j) {
+            const double a = p[j], c = p[j + h];
+            p[j] = a + c;
+            p[j + h] = a - c;
+          }
+        }
+      }
+      for (int i = 0; i < 256; ++i) { p[i] *= 1.0 / 16.0; }
+    }
+  };
+
+  // A weight, [out, in] as a checkpoint stores it: float, fp16, int8 per
+  // output row with its fp16 step, and (for the rotated emulation) int8
+  // per row of the rotated rows.
+  struct Wt {
+    int rows = 0, cols = 0;
+    std::vector<float> f;
+    std::vector<std::uint16_t> h, hr;     // hr: the rotated rows, fp16
+    std::vector<std::int8_t> q, qr;
+    std::vector<double> s, sr;
+  };
+  auto quantize_w = [&](Wt& w) {
+    const std::size_t n = (std::size_t)w.rows * w.cols;
+    w.h.resize(n);
+    w.q.resize(n);
+    w.s.resize((std::size_t)w.rows);
+    w.qr.resize(n);
+    w.hr.resize(n);
+    w.sr.resize((std::size_t)w.rows);
+    std::vector<double> row((std::size_t)w.cols);
+    for (int r = 0; r < w.rows; ++r) {
+      const std::size_t o = (std::size_t)r * w.cols;
+      double m = 0.0;
+      for (int c = 0; c < w.cols; ++c) {
+        w.h[o + c] = bits16(w.f[o + c]);
+        m = std::max(m, (double)std::fabs(w.f[o + c]));
+        row[(std::size_t)c] = w.f[o + c];
+      }
+      const double s = h16(std::max(m, 1e-8) / 127.0);
+      w.s[(std::size_t)r] = s;
+      for (int c = 0; c < w.cols; ++c) {
+        w.q[o + c] = (std::int8_t)std::clamp(std::nearbyint(w.f[o + c] / s),
+                                             -127.0, 127.0);
+      }
+      fwht256(row.data(), row.size());
+      double mr = 0.0;
+      for (double e : row) { mr = std::max(mr, std::fabs(e)); }
+      const double sr = h16(std::max(mr, 1e-12) / 127.0);
+      w.sr[(std::size_t)r] = sr;
+      for (int c = 0; c < w.cols; ++c) {
+        w.hr[o + c] = bits16(row[(std::size_t)c]);
+        w.qr[o + c] = (std::int8_t)std::clamp(
+            std::nearbyint(row[(std::size_t)c] / sr), -127.0, 127.0);
+      }
+    }
+  };
+
+  // The cases: synthetic, or each real block asked for.
+  struct Case {
+    std::string name;
+    Wt wg, wu, wd;
+    int R = 0;                          // distinct input rows
+    std::vector<double> xr;             // [R, H], bf16-exact
+  };
+  std::vector<int> blocks;
+  if (is_real) {
+    const char* bl = env_or_null_("VPIPE_ANE_RTQF_BLOCKS");
+    std::stringstream ss(bl != nullptr ? bl : "0,12,24,36,49");
+    std::string t;
+    while (std::getline(ss, t, ',')) { blocks.push_back(std::atoi(t.c_str())); }
+  } else {
+    blocks.push_back(-1);
+  }
+  // The checkpoint's header, once.
+  vpipe::FlexData hdr;
+  std::uint64_t data0 = 0;
+  if (is_real) {
+    std::ifstream f(ckpt, std::ios::binary);
+    std::uint64_t n = 0;
+    f.read(reinterpret_cast<char*>(&n), 8);
+    std::string js(n, '\0');
+    f.read(js.data(), (std::streamsize)n);
+    ASSERT_TRUE(f.good());
+    if (!f.good()) { return; }
+    hdr = vpipe::FlexData::from_json(js);
+    data0 = 8 + n;
+  }
+  auto read_bf16 = [&](const std::string& name, int* rows, int* cols,
+                       std::vector<float>* out) {
+    auto o = hdr.as_object();
+    if (!o.contains(name)) { return false; }
+    const vpipe::FlexData t = o.at(name);
+    auto to = t.as_object();
+    const vpipe::FlexData shape = to.at("shape");
+    const vpipe::FlexData offs = to.at("data_offsets");
+    auto sa = shape.as_array();
+    auto oa = offs.as_array();
+    *rows = (int)sa.at(0).as_int();
+    *cols = (int)sa.at(1).as_int();
+    const std::uint64_t b = (std::uint64_t)oa.at(0).as_int();
+    const std::size_t n = (std::size_t)(*rows) * (std::size_t)(*cols);
+    std::vector<std::uint16_t> raw(n);
+    std::ifstream f(ckpt, std::ios::binary);
+    f.seekg((std::streamoff)(data0 + b));
+    f.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)(n * 2));
+    if (!f.good()) { return false; }
+    out->resize(n);
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = bf16f(raw[i]); }
+    return true;
+  };
+
+  const double i127 = h16(1.0 / 127.0);
+  // Per-mode flags; the emulations are CPU only.
+  struct Mode {
+    const char* name;
+    bool w8;
+    int  a_gu;     // 0 fp16, 1 codes given, 2 quantized in the graph
+    int  a_d;      // 0 fp16, 2 quantized in the graph
+    bool rot;      // the rotated emulation
+  };
+  const Mode modes[] = {{"f16", false, 0, 0, false},
+                        {"w8a16", true, 0, 0, false},
+                        {"a8gu-in", true, 1, 0, false},
+                        {"a8gu-dyn", true, 2, 0, false},
+                        {"a8all-in", true, 1, 2, false},
+                        {"a8all-dyn", true, 2, 2, false},
+                        {"f16-rot", false, 0, 0, true},
+                        {"w8a16-rot", true, 0, 0, true},
+                        {"a8gu-rot-in", true, 1, 0, true},
+                        {"a8all-rot-in", true, 1, 2, true},
+                        {"a8all-rot-dyn", true, 2, 2, true}};
+  const Mode emu_plain{"emu-token-plain", true, 2, 2, false};
+  const Mode emu_rot{"emu-token-rot", true, 2, 2, true};
+
+  // The compiled forms, built at the first case and reused.
+  struct Built {
+    std::shared_ptr<vpipe::CoreMLLoadedModel> m;
+    std::vector<vpipe::AneEmitter::Feature> ins;
+    std::string out;
+    double compile_ms = 0.0;
+  };
+  std::map<std::string, Built> built;
+  // The orthonormal Hadamard, fp16 (every entry +-1/16, exact). A MODEL
+  // INPUT, not a constant: a graph with no weight file is cached on its
+  // content, one with a weight file on the file -- re-emitted at every
+  // load, it would recompile cold (11-14 s for these graphs) each process.
+  std::vector<std::uint16_t> hmat(256 * 256);
+  for (std::size_t i = 0; i < hmat.size(); ++i) {
+    const int r = (int)(i / 256), c = (int)(i % 256);
+    hmat[i] = bits16((__builtin_popcount(r & c) & 1) ? -1.0 / 16.0
+                                                     : 1.0 / 16.0);
+  }
+  std::unique_ptr<vpipe::genai::AneModule> tier;
+  std::unique_ptr<vpipe::genai::AneWeightSlots> tier_slots;
+  double tier_ms = 0.0;
+
+  for (const int blk : blocks) {
+    Case cs;
+    if (blk < 0) {
+      cs.name = "synthetic";
+      auto fill = [&](Wt& w, int r, int c) {
+        w.rows = r;
+        w.cols = c;
+        w.f.resize((std::size_t)r * c);
+        const float amp = std::sqrt(3.0f / (float)c);
+        for (auto& e : w.f) { e = uni() * amp; }
+      };
+      fill(cs.wg, F, H);
+      fill(cs.wu, F, H);
+      fill(cs.wd, H, F);
+      cs.R = M;
+      cs.xr.resize((std::size_t)M * H);
+      for (auto& e : cs.xr) { e = (double)(float)(_Float16)uni(); }
+    } else {
+      cs.name = "block " + std::to_string(blk);
+      const std::string p = "blocks." + std::to_string(blk) + ".mlp.";
+      std::vector<float> fc1;
+      int r1 = 0, c1 = 0, r2 = 0, c2 = 0;
+      ASSERT_TRUE(read_bf16(p + "fc1.weight", &r1, &c1, &fc1));
+      ASSERT_TRUE(read_bf16(p + "fc2.weight", &r2, &c2, &cs.wd.f));
+      if (fc1.empty() || cs.wd.f.empty()) { continue; }
+      H = c1;
+      F = r1 / 2;
+      // fc1 is [gate; up], gate first.
+      cs.wg.rows = cs.wu.rows = F;
+      cs.wg.cols = cs.wu.cols = H;
+      cs.wg.f.assign(fc1.begin(), fc1.begin() + (std::ptrdiff_t)F * H);
+      cs.wu.f.assign(fc1.begin() + (std::ptrdiff_t)F * H, fc1.end());
+      cs.wd.rows = r2;
+      cs.wd.cols = c2;
+      const std::string xp =
+          std::string(real) + "/ff_in_" + std::to_string(blk) + ".bf16";
+      std::ifstream xf(xp, std::ios::binary | std::ios::ate);
+      ASSERT_TRUE(xf.good());
+      if (!xf.good()) { continue; }
+      const std::size_t bytes = (std::size_t)xf.tellg();
+      cs.R = (int)(bytes / ((std::size_t)H * 2));
+      std::vector<std::uint16_t> raw((std::size_t)cs.R * H);
+      xf.seekg(0);
+      xf.read(reinterpret_cast<char*>(raw.data()),
+              (std::streamsize)(raw.size() * 2));
+      cs.xr.resize(raw.size());
+      for (std::size_t i = 0; i < raw.size(); ++i) {
+        cs.xr[i] = bf16f(raw[i]);
+      }
+    }
+    // fp16 HEADROOM, as the tier takes it: the up projection divided by
+    // 2^k (VPIPE_ANE_RTQF_UPSHIFT), so silu(gate) * up stays inside fp16
+    // on a block whose activations reach past it (H3's last). Every score
+    // is relative and every reference reads the same weights, so the
+    // output's scale cancels.
+    if (const int k = envi("VPIPE_ANE_RTQF_UPSHIFT", 0); k > 0) {
+      for (float& e : cs.wu.f) { e = std::ldexp(e, -k); }
+    }
+    quantize_w(cs.wg);
+    quantize_w(cs.wu);
+    quantize_w(cs.wd);
+
+    // The chunk's rows: the case's rows repeated. Its inputs as each form
+    // reads them -- fp16 values (bf16 is exact in fp16 only in range, so
+    // the narrowing is part of every ANE form), and int8 codes per token.
+    std::vector<double> xf((std::size_t)M * H);
+    for (int m = 0; m < M; ++m) {
+      for (int c = 0; c < H; ++c) {
+        xf[(std::size_t)m * H + c] =
+            h16(cs.xr[(std::size_t)(m % cs.R) * H + c]);
+      }
+    }
+    std::vector<std::uint16_t> x16(xf.size());
+    for (std::size_t i = 0; i < xf.size(); ++i) { x16[i] = bits16(xf[i]); }
+    std::vector<std::int8_t> x8(xf.size());
+    std::vector<double> xs((std::size_t)M);
+    for (int m = 0; m < M; ++m) {
+      double a = 0.0;
+      for (int c = 0; c < H; ++c) {
+        a = std::max(a, std::fabs(xf[(std::size_t)m * H + c]));
+      }
+      xs[(std::size_t)m] = h16(std::max(a, 1e-6) / 127.0);
+      for (int c = 0; c < H; ++c) {
+        const std::size_t i = (std::size_t)m * H + c;
+        x8[i] = (std::int8_t)std::clamp(
+            std::nearbyint(xf[i] / xs[(std::size_t)m]), -127.0, 127.0);
+      }
+    }
+    // ...and as the GPU's ROTATED token quantizer writes them: each row
+    // Walsh-Hadamard rotated per 256-block, then quantized per token.
+    std::vector<std::int8_t> x8r(xf.size());
+    std::vector<double> xsr((std::size_t)M);
+    {
+      std::vector<double> row((std::size_t)H);
+      for (int m = 0; m < M; ++m) {
+        for (int c = 0; c < H; ++c) {
+          row[(std::size_t)c] = xf[(std::size_t)m * H + c];
+        }
+        fwht256(row.data(), row.size());
+        double a = 0.0;
+        for (double e : row) { a = std::max(a, std::fabs(e)); }
+        xsr[(std::size_t)m] = h16(std::max(a, 1e-6) / 127.0);
+        for (int c = 0; c < H; ++c) {
+          x8r[(std::size_t)m * H + c] = (std::int8_t)std::clamp(
+              std::nearbyint(row[(std::size_t)c] / xsr[(std::size_t)m]),
+              -127.0, 127.0);
+        }
+      }
+    }
+    // How heavy the input's tails are: per-channel amax over the rows,
+    // max against median, and the largest |x|.
+    {
+      std::vector<double> ch((std::size_t)H, 0.0);
+      double mx = 0.0;
+      for (int r = 0; r < cs.R; ++r) {
+        for (int c = 0; c < H; ++c) {
+          const double a = std::fabs(cs.xr[(std::size_t)r * H + c]);
+          ch[(std::size_t)c] = std::max(ch[(std::size_t)c], a);
+          mx = std::max(mx, a);
+        }
+      }
+      std::vector<double> sorted = ch;
+      std::sort(sorted.begin(), sorted.end());
+      std::printf("[ane_rtqf] %s: %d rows x %d -> %d, max |x| %.3g, "
+                  "channel amax max / median %.1f\n", cs.name.c_str(),
+                  cs.R, H, F, mx,
+                  sorted.back() / std::max(sorted[sorted.size() / 2], 1e-30));
+    }
+
+    // Sampled rows: spread over the case's distinct rows.
+    std::vector<int> rows;
+    const int ns = blk < 0 ? 4 : 12;
+    for (int i = 0; i < ns; ++i) {
+      rows.push_back((int)std::lround((double)i * (cs.R - 1) / (ns - 1)));
+    }
+    auto ref_row = [&](int r, const Mode* md, std::vector<double>* out) {
+      const bool exact = md == nullptr;
+      std::vector<double> v((std::size_t)H);
+      for (int c = 0; c < H; ++c) {
+        const std::size_t i = (std::size_t)r * H + c;
+        v[(std::size_t)c] =
+            exact             ? cs.xr[i]
+            : md->a_gu != 1   ? xf[i]
+            : md->rot         ? (double)x8r[i] * xsr[(std::size_t)r]
+                              : (double)x8[i] * xs[(std::size_t)r];
+      }
+      // An emulation of the GPU's tiers takes f32 scales; the ANE's graph
+      // computes its in fp16.
+      const bool gpu = !exact && md->name[0] == 'e';
+      auto dynq = [&](std::vector<double>& a) {
+        double am = 0.0;
+        for (double e : a) { am = std::max(am, std::fabs(gpu ? e : h16(e))); }
+        const double s = gpu ? std::max(am, 1e-12) / 127.0
+                             : std::max(h16(am * i127), 1e-4);
+        for (double& e : a) {
+          e = std::clamp(std::nearbyint(e / s), -128.0, 127.0) * s;
+        }
+      };
+      if (!exact && md->rot && md->a_gu != 1) {
+        fwht256(v.data(), v.size());
+      }
+      if (!exact && md->a_gu == 2) { dynq(v); }
+      auto proj = [&](const std::vector<double>& a, const Wt& w) {
+        std::vector<double> y((std::size_t)w.rows, 0.0);
+        for (int n = 0; n < w.rows; ++n) {
+          const std::size_t o = (std::size_t)n * w.cols;
+          double acc = 0.0;
+          if (exact) {
+            for (int c = 0; c < w.cols; ++c) {
+              acc += (double)w.f[o + c] * a[(std::size_t)c];
+            }
+          } else if (md->rot && md->w8) {
+            for (int c = 0; c < w.cols; ++c) {
+              acc += (double)w.qr[o + c] * a[(std::size_t)c];
+            }
+            acc *= w.sr[(std::size_t)n];
+          } else if (md->rot) {
+            for (int c = 0; c < w.cols; ++c) {
+              _Float16 hw;
+              std::memcpy(&hw, &w.hr[o + c], 2);
+              acc += (double)hw * a[(std::size_t)c];
+            }
+          } else if (md->w8) {
+            for (int c = 0; c < w.cols; ++c) {
+              acc += (double)w.q[o + c] * a[(std::size_t)c];
+            }
+            acc *= w.s[(std::size_t)n];
+          } else {
+            for (int c = 0; c < w.cols; ++c) {
+              _Float16 hw;
+              std::memcpy(&hw, &w.h[o + c], 2);
+              acc += (double)hw * a[(std::size_t)c];
+            }
+          }
+          y[(std::size_t)n] = acc;
+        }
+        return y;
+      };
+      const std::vector<double> g = proj(v, cs.wg), u = proj(v, cs.wu);
+      std::vector<double> hh((std::size_t)F);
+      for (int n = 0; n < F; ++n) {
+        const double gg = g[(std::size_t)n];
+        hh[(std::size_t)n] = gg / (1.0 + std::exp(-gg)) * u[(std::size_t)n];
+      }
+      if (!exact && md->rot) { fwht256(hh.data(), hh.size()); }
+      if (!exact && md->a_d == 2) { dynq(hh); }
+      *out = proj(hh, cs.wd);
+    };
+    std::vector<std::vector<double>> exact(rows.size());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      ref_row(rows[i], nullptr, &exact[i]);
+    }
+    // ANE output (or an emulation's rows) against both references.
+    auto score = [&](const std::vector<std::uint16_t>* y, const Mode& md,
+                     double* rel, double* erel) {
+      double n1 = 0, d1 = 0, n2 = 0, d2 = 0;
+      for (std::size_t i = 0; i < rows.size(); ++i) {
+        std::vector<double> ref;
+        ref_row(rows[i], &md, &ref);
+        for (int n = 0; n < H; ++n) {
+          double a = ref[(std::size_t)n];
+          if (y != nullptr) {
+            _Float16 hv;
+            std::memcpy(&hv, &(*y)[(std::size_t)rows[i] * H + n], 2);
+            a = (double)hv;
+          }
+          const double r = ref[(std::size_t)n];
+          n1 += (a - r) * (a - r);
+          d1 += r * r;
+          const double e = exact[i][(std::size_t)n];
+          n2 += (a - e) * (a - e);
+          d2 += e * e;
+        }
+      }
+      *rel = std::sqrt(n1 / std::max(d1, 1e-30));
+      *erel = std::sqrt(n2 / std::max(d2, 1e-30));
+    };
+    const double flop = 6.0 * (double)M * H * F;
+    auto report = [&](const std::string& name, double compile_ms,
+                      double med, double rel, double erel) {
+      if (med > 0.0) {
+        std::printf("[ane_rtqf] %-9s %-15s compile %6.0f ms, median %7.2f ms "
+                    "= %6.2f TOP/s, rel %.1e, from unquantized %.2e\n",
+                    cs.name.c_str(), name.c_str(), compile_ms, med,
+                    flop / med / 1e9, rel, erel);
+      } else {
+        std::printf("[ane_rtqf] %-9s %-15s (CPU emulation)%49s from "
+                    "unquantized %.2e\n", cs.name.c_str(), name.c_str(), "",
+                    erel);
+      }
+      std::fflush(stdout);
+    };
+
+    // ---- the tier's own module -------------------------------------------
+    if (only == nullptr ||
+        std::string("tier").find(only) != std::string::npos) {
+      if (tier == nullptr) {
+        vpipe::AneGraphSpec spec;
+        spec.kind = vpipe::AneGraphSpec::Kind::SwiGluFfn;
+        spec.M  = M;
+        spec.K  = H;
+        spec.N  = F;
+        spec.bk = T;
+        spec.bn = T;
+        spec.runtime_weights = true;
+        spec.weights_out_in  = true;
+        const auto t0 = Clk::now();
+        tier = vpipe::genai::AneModule::build_runtime(
+            &sess, spec, root + "/tier.mlmodelc");
+        tier_ms = ms_since(t0);
+        tier_slots = vpipe::genai::AneWeightSlots::create(spec);
+        ASSERT_TRUE(tier != nullptr && tier_slots != nullptr);
+      }
+      if (tier != nullptr && tier_slots != nullptr) {
+        const Wt* ws[3] = {&cs.wg, &cs.wu, &cs.wd};
+        for (std::size_t k = 0; k < 3; ++k) {
+          const Wt& w = *ws[k];
+          tier_slots->fill(k, [&](void* base, std::size_t bpr) {
+            for (int r = 0; r < w.rows; ++r) {
+              std::memcpy(static_cast<std::uint8_t*>(base) + r * bpr,
+                          w.h.data() + (std::size_t)r * w.cols,
+                          (std::size_t)w.cols * 2);
+            }
+          });
+        }
+        mcx::SharedBuffer xb = mc->make_shared_buffer(x16.size() * 2);
+        mcx::SharedBuffer yb = mc->make_shared_buffer((std::size_t)M * H * 2);
+        std::memcpy(xb.contents(), x16.data(), x16.size() * 2);
+        bool ok = tier->run(xb, 0, yb, 0, *tier_slots);
+        std::vector<double> t;
+        for (int i = 0; i < iters && ok; ++i) {
+          const auto ti = Clk::now();
+          ok = tier->run(xb, 0, yb, 0, *tier_slots);
+          t.push_back(ms_since(ti));
+        }
+        ASSERT_TRUE(ok);
+        if (ok) {
+          std::sort(t.begin(), t.end());
+          std::vector<std::uint16_t> y((std::size_t)M * H);
+          std::memcpy(y.data(), yb.contents(), y.size() * 2);
+          double rel = 0, erel = 0;
+          score(&y, modes[0], &rel, &erel);
+          report("tier", tier_ms, t[t.size() / 2], rel, erel);
+          tier_ms = 0.0;
+        }
+      }
+    }
+
+    // ---- the generated forms ---------------------------------------------
+    for (const Mode& md : modes) {
+      const std::string name = md.name;
+      if (only != nullptr && name.find(only) == std::string::npos) {
+        continue;
+      }
+      if (built.count(name) == 0) {
+        Built bt;
+        std::vector<bool> ins_i8;
+        auto add_in = [&](const std::string& nm, long long r, long long c,
+                          bool i8) {
+          bt.ins.push_back({nm, {r, c}});
+          ins_i8.push_back(i8);
+        };
+        if (md.a_gu == 1) {
+          add_in("x8", M, H, true);
+          add_in("sa", M, 1, false);
+        } else {
+          add_in("x", M, H, false);
+        }
+        add_in("wg", F, H, md.w8);
+        add_in("wu", F, H, md.w8);
+        add_in("wd", H, F, md.w8);
+        if (md.w8) {
+          add_in("sgw", 1, F, false);
+          add_in("suw", 1, F, false);
+          add_in("sdw", 1, H, false);
+        }
+        // VPIPE_ANE_RTQF_HINLINE=1: the Hadamard as a constant written
+        // INLINE in model.mil (no weight file) rather than an input.
+        const bool hinline = envi("VPIPE_ANE_RTQF_HINLINE", 0) != 0;
+        if (md.rot && !hinline) { add_in("hmat", 256, 256, false); }
+        std::ostringstream o;
+        o << vpipe::AneEmitter::mil_preamble() << "    func main<ios19>(";
+        for (std::size_t i = 0; i < bt.ins.size(); ++i) {
+          o << (i ? ", " : "") << "tensor<" << (ins_i8[i] ? "int8" : "fp16")
+            << ", [" << bt.ins[i].shape[0] << ", " << bt.ins[i].shape[1]
+            << "]> " << bt.ins[i].name;
+        }
+        o << ") {\n";
+        auto line = [&](const std::string& s) {
+          o << "            " << s << ";\n";
+        };
+        auto cst = [&](const std::string& ty, const std::string& nm,
+                       const std::string& val) {
+          line(ty + " " + nm + " = const()[name = string(\"" + nm +
+               "\"), val = " + val + "]");
+        };
+        auto fp = [](double v) {
+          char b[48];
+          std::snprintf(b, sizeof(b), "fp16(%.9g)", v);
+          return std::string(b);
+        };
+        auto ty = [](bool i8, long long r, long long c) {
+          return std::string("tensor<") + (i8 ? "int8" : "fp16") + ", [" +
+                 std::to_string(r) + ", " + std::to_string(c) + "]>";
+        };
+        auto i2 = [](long long a, long long b) {
+          return "tensor<int32, [2]>([" + std::to_string(a) + ", " +
+                 std::to_string(b) + "])";
+        };
+        cst("bool", "ftx", "bool(false)");
+        cst("bool", "tty", "bool(true)");
+        cst("fp16", "c128", fp(1.0 / 128.0));
+        cst("fp16", "one", fp(1.0));
+        cst("fp16", "i127", fp(i127));
+        cst("fp16", "eps", fp(1e-4));
+        cst("string", "adt", "string(\"int8\")");
+        cst("tensor<int32, [1]>", "rax", "tensor<int32, [1]>([1])");
+        cst("bool", "kd", "bool(true)");
+        cst("int32", "cax", "int32(1)");
+        cst("bool", "cil", "bool(false)");
+        int uid = 0;
+        auto nid = [&](const char* p) { return p + std::to_string(uid++); };
+        auto slice = [&](const std::string& src, bool i8, long long r0,
+                         long long c0, long long r1, long long c1) {
+          const std::string b = nid("sb"), e = nid("se"), s = nid("sl");
+          cst("tensor<int32, [2]>", b, i2(r0, c0));
+          cst("tensor<int32, [2]>", e, i2(r1, c1));
+          line(ty(i8, r1 - r0, c1 - c0) + " " + s +
+               " = slice_by_index(begin = " + b + ", end = " + e + ", x = " +
+               src + ")[name = string(\"" + s + "\")]");
+          return s;
+        };
+        auto proj = [&](const std::string& src, bool src8, int K, int N,
+                        const std::string& w, bool w8) {
+          const int nk = (K + T - 1) / T, nn = (N + T - 1) / T;
+          std::vector<std::string> cols;
+          for (int j = 0; j < nn; ++j) {
+            const int n0 = j * T, n = std::min(T, N - n0);
+            std::string acc;
+            for (int t = 0; t < nk; ++t) {
+              const int k0 = t * T, k = std::min(T, K - k0);
+              std::string xin = nk > 1 ? slice(src, src8, 0, k0, M, k0 + k)
+                                       : src;
+              if (src8) {
+                const std::string d = nid("xd");
+                line(ty(false, M, k) + " " + d + " = dequantize(input = " +
+                     xin + ", scale = one)[name = string(\"" + d + "\")]");
+                xin = d;
+              }
+              std::string wt = slice(w, w8, n0, k0, n0 + n, k0 + k);
+              if (w8) {
+                const std::string d = nid("wq");
+                line(ty(false, n, k) + " " + d + " = dequantize(input = " +
+                     wt + ", scale = c128)[name = string(\"" + d + "\")]");
+                wt = d;
+              }
+              const std::string mm = nid("mm");
+              line(ty(false, M, n) + " " + mm + " = matmul(transpose_x = "
+                   "ftx, transpose_y = tty, x = " + xin + ", y = " + wt +
+                   ")[name = string(\"" + mm + "\")]");
+              if (acc.empty()) {
+                acc = mm;
+              } else {
+                const std::string ad = nid("ad");
+                line(ty(false, M, n) + " " + ad + " = add(x = " + acc +
+                     ", y = " + mm + ")[name = string(\"" + ad + "\")]");
+                acc = ad;
+              }
+            }
+            cols.push_back(acc);
+          }
+          if (cols.size() == 1u) { return cols[0]; }
+          const std::string cc = nid("cc");
+          std::string vals;
+          for (std::size_t i = 0; i < cols.size(); ++i) {
+            vals += (i ? ", " : "") + cols[i];
+          }
+          line(ty(false, M, N) + " " + cc + " = concat(axis = cax, "
+               "interleave = cil, values = (" + vals + "))[name = string(\"" +
+               cc + "\")]");
+          return cc;
+        };
+        auto dynq = [&](const std::string& src, int K, std::string* sa) {
+          const std::string ab = nid("ab"), am = nid("am"), sc = nid("sc");
+          const std::string s = nid("sa"), xs_ = nid("xs"), q = nid("q");
+          line(ty(false, M, K) + " " + ab + " = abs(x = " + src +
+               ")[name = string(\"" + ab + "\")]");
+          line(ty(false, M, 1) + " " + am + " = reduce_max(axes = rax, "
+               "keep_dims = kd, x = " + ab + ")[name = string(\"" + am +
+               "\")]");
+          line(ty(false, M, 1) + " " + sc + " = mul(x = " + am +
+               ", y = i127)[name = string(\"" + sc + "\")]");
+          line(ty(false, M, 1) + " " + s + " = maximum(x = " + sc +
+               ", y = eps)[name = string(\"" + s + "\")]");
+          line(ty(false, M, K) + " " + xs_ + " = real_div(x = " + src +
+               ", y = " + s + ")[name = string(\"" + xs_ + "\")]");
+          line(ty(true, M, K) + " " + q + " = quantize(input = " + xs_ +
+               ", output_dtype = adt, scale = one)[name = string(\"" + q +
+               "\")]");
+          *sa = s;
+          return q;
+        };
+        // The rotation: [M, K] -> [M, K/256, 256], times the orthonormal
+        // Hadamard (an input, see hmat), back to [M, K].
+        if (md.rot && hinline) {
+          std::string lit = "tensor<fp16, [256, 256]>([";
+          for (int r = 0; r < 256; ++r) {
+            lit += (r ? ", [" : "[");
+            for (int c = 0; c < 256; ++c) {
+              lit += (c ? ", " : "");
+              lit += (__builtin_popcount(r & c) & 1) ? "-0x1p-4" : "0x1p-4";
+            }
+            lit += "]";
+          }
+          lit += "])";
+          cst("tensor<fp16, [256, 256]>", "hmat", lit);
+        }
+        auto rot = [&](const std::string& src, int K) {
+          const std::string s3 = nid("r3"), a = nid("ra"), r = nid("rb");
+          const std::string s2 = nid("r2"), c = nid("rc");
+          const std::string d3 = "[" + std::to_string(M) + ", " +
+                                 std::to_string(K / 256) + ", 256]";
+          cst("tensor<int32, [3]>", s3, "tensor<int32, [3]>(" + d3 + ")");
+          line("tensor<fp16, " + d3 + "> " + a + " = reshape(shape = " + s3 +
+               ", x = " + src + ")[name = string(\"" + a + "\")]");
+          line("tensor<fp16, " + d3 + "> " + r + " = matmul(transpose_x = "
+               "ftx, transpose_y = ftx, x = " + a + ", y = hmat)[name = "
+               "string(\"" + r + "\")]");
+          cst("tensor<int32, [2]>", s2, i2(M, K));
+          line(ty(false, M, K) + " " + c + " = reshape(shape = " + s2 +
+               ", x = " + r + ")[name = string(\"" + c + "\")]");
+          return c;
+        };
+        auto scale_by = [&](const std::string& src, int N,
+                            const std::string& by) {
+          const std::string y = nid("ys");
+          line(ty(false, M, N) + " " + y + " = mul(x = " + src + ", y = " +
+               by + ")[name = string(\"" + y + "\")]");
+          return y;
+        };
+        const std::string x0 = md.rot && md.a_gu != 1 ? rot("x", H) : "x";
+        std::string src = x0, tok;
+        bool src8 = false;
+        if (md.a_gu == 1) {
+          src = "x8";
+          src8 = true;
+          tok = "sa";
+        } else if (md.a_gu == 2) {
+          src = dynq(x0, H, &tok);
+          src8 = true;
+        }
+        std::string g = proj(src, src8, H, F, "wg", md.w8);
+        std::string u = proj(src, src8, H, F, "wu", md.w8);
+        if (!tok.empty()) {
+          g = scale_by(g, F, tok);
+          u = scale_by(u, F, tok);
+        }
+        if (md.w8) {
+          g = scale_by(g, F, "sgw");
+          u = scale_by(u, F, "suw");
+        }
+        // SiLU as the tier's graph states it (the stable two-path form).
+        {
+          cst("fp16", "s_zero", fp(0.0));
+          cst("fp16", "s_onef", fp(1.0));
+          cst("fp16", "s_neg", fp(-1.0));
+          const std::string TT = ty(false, M, F) + " ";
+          line(TT + "s_min = minimum(x = " + g + ", y = s_zero)[name = "
+               "string(\"s_min\")]");
+          line(TT + "s_num = exp(x = s_min)[name = string(\"s_num\")]");
+          line(TT + "s_abs = abs(x = " + g + ")[name = string(\"s_abs\")]");
+          line(TT + "s_nab = mul(x = s_abs, y = s_neg)[name = "
+               "string(\"s_nab\")]");
+          line(TT + "s_e = exp(x = s_nab)[name = string(\"s_e\")]");
+          line(TT + "s_den = add(x = s_e, y = s_onef)[name = "
+               "string(\"s_den\")]");
+          line(TT + "sgm = real_div(x = s_num, y = s_den)[name = "
+               "string(\"sgm\")]");
+          line(TT + "sg = mul(x = " + g + ", y = sgm)[name = string(\"sg\")]");
+          line(TT + "hh = mul(x = sg, y = " + u + ")[name = string(\"hh\")]");
+        }
+        const std::string h0 = md.rot ? rot("hh", F) : "hh";
+        std::string dsrc = h0, dtok;
+        bool d8 = false;
+        if (md.a_d == 2) {
+          dsrc = dynq(h0, F, &dtok);
+          d8 = true;
+        }
+        bt.out = proj(dsrc, d8, F, H, "wd", md.w8);
+        if (!dtok.empty()) { bt.out = scale_by(bt.out, H, dtok); }
+        if (md.w8) { bt.out = scale_by(bt.out, H, "sdw"); }
+        o << "        } -> (" << bt.out << ");\n}";
+
+        const vpipe::AneEmitter::Feature fout{bt.out, {M, H}};
+        const std::string dir = root + "/" + name + ".mlmodelc";
+        std::string err;
+        if (!vpipe::AneEmitter::write_bundle(dir, o.str(), bt.ins,
+                                             {&fout, 1}, {}, &err)) {
+          std::printf("[ane_rtqf] %s: not written (%s)\n", name.c_str(),
+                      err.c_str());
+          continue;
+        }
+        // Each int8 feature's array type, in feature order (FLOAT16 65552
+        // -> INT8 131080, three-byte varints after the field's tag 0x10).
+        {
+          std::fstream f(dir + "/coremldata.bin",
+                         std::ios::in | std::ios::out | std::ios::binary);
+          std::string b((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+          const std::string pat("\x10\x90\x80\x04", 4);
+          std::size_t pos = 0, k = 0;
+          while ((pos = b.find(pat, pos)) != std::string::npos) {
+            if (k < ins_i8.size() && ins_i8[k]) {
+              b[pos + 1] = '\x88';
+              b[pos + 2] = '\x80';
+              b[pos + 3] = '\x08';
+            }
+            ++k;
+            pos += 4;
+          }
+          ASSERT_TRUE(k == bt.ins.size() + 1);
+          f.clear();
+          f.seekp(0);
+          f.write(b.data(), (std::streamsize)b.size());
+        }
+        const auto t0 = Clk::now();
+        bt.m = mgr->load(dir, 3);
+        bt.compile_ms = ms_since(t0);
+        if (bt.m == nullptr || !bt.m->valid()) {
+          std::printf("[ane_rtqf] %-10s DID NOT LOAD\n", name.c_str());
+          continue;
+        }
+        built[name] = std::move(bt);
+      }
+      Built& bt = built[name];
+
+      std::vector<CVPixelBufferRef> pbs;
+      std::vector<vpipe::CoreMLPredictInput> pin;
+      std::vector<std::vector<std::uint16_t>> host;
+      host.reserve(8);
+      auto steps = [&](const std::vector<double>& s, double k) {
+        std::vector<std::uint16_t> v(s.size());
+        for (std::size_t i = 0; i < s.size(); ++i) {
+          v[i] = bits16(s[i] * k);
+        }
+        host.push_back(std::move(v));
+        return (const void*)host.back().data();
+      };
+      for (const auto& f : bt.ins) {
+        vpipe::CoreMLPredictInput in;
+        in.name  = f.name;
+        in.dtype = vpipe::CoreMLDType::F16;
+        in.shape = f.shape;
+        const Wt* w = f.name == "wg"   ? &cs.wg
+                      : f.name == "wu" ? &cs.wu
+                      : f.name == "wd" ? &cs.wd
+                                       : nullptr;
+        if (f.name == "x") {
+          in.data = x16.data();
+        } else if (f.name == "hmat") {
+          in.data = hmat.data();
+        } else if (f.name == "x8") {
+          pbs.push_back(make_pb(M, H, true, md.rot ? x8r.data() : x8.data()));
+          in.pixel_buffer = pbs.back();
+        } else if (f.name == "sa") {
+          in.data = steps(md.rot ? xsr : xs, 1.0);
+        } else if (w != nullptr) {
+          const void* src = md.w8 ? (md.rot ? (const void*)w->qr.data()
+                                             : (const void*)w->q.data())
+                                  : (md.rot ? (const void*)w->hr.data()
+                                            : (const void*)w->h.data());
+          pbs.push_back(make_pb(w->rows, w->cols, md.w8, src));
+          in.pixel_buffer = pbs.back();
+        } else {                    // sgw / suw / sdw: the step x 128
+          const Wt& sw = f.name == "sgw"   ? cs.wg
+                         : f.name == "suw" ? cs.wu
+                                           : cs.wd;
+          in.data = steps(md.rot ? sw.sr : sw.s, 128.0);
+        }
+        pin.push_back(std::move(in));
+      }
+      std::vector<std::uint16_t> yb((std::size_t)M * H);
+      vpipe::CoreMLPredictOutput outp;
+      outp.name          = bt.out;
+      outp.want          = vpipe::CoreMLDType::F16;
+      outp.backing       = yb.data();
+      outp.backing_elems = yb.size();
+      bool ok = bt.m->predict(pin, {&outp, 1});
+      std::vector<double> t;
+      for (int i = 0; i < iters && ok; ++i) {
+        const auto ti = Clk::now();
+        ok = bt.m->predict(pin, {&outp, 1});
+        t.push_back(ms_since(ti));
+      }
+      for (CVPixelBufferRef pb : pbs) {
+        if (pb != nullptr) { CVPixelBufferRelease(pb); }
+      }
+      if (!ok || t.empty()) {
+        std::printf("[ane_rtqf] %-9s %-15s PREDICT FAILED\n",
+                    cs.name.c_str(), name.c_str());
+        continue;
+      }
+      std::sort(t.begin(), t.end());
+      double rel = 0, erel = 0;
+      score(&yb, md, &rel, &erel);
+      report(name, bt.compile_ms, t[t.size() / 2], rel, erel);
+      bt.compile_ms = 0.0;
+      EXPECT_TRUE(rel < 5e-2);
+    }
+
+    // ---- the GPU's token tiers, emulated over the same rows --------------
+    for (const Mode* em : {&emu_plain, &emu_rot}) {
+      if (only != nullptr && std::string(em->name).find(only) ==
+                                 std::string::npos) {
+        continue;
+      }
+      double rel = 0, erel = 0;
+      score(nullptr, *em, &rel, &erel);
+      report(em->name, 0.0, 0.0, rel, erel);
+    }
+  }
+}
+
 // WHICH GELU the ANE's gelu(mode = TANH_APPROXIMATION) computes. Identity
 // projections and zero biases make every output element gelu() of a known
 // input, swept over [-6, 6], so the max error against each candidate form
@@ -3306,12 +5755,54 @@ TEST(ane_tier, refuses_what_it_cannot_build)
   EXPECT_TRUE(ane::create(&sess, mc, noseq, &why) == nullptr);
   EXPECT_TRUE(!why.empty());
 
+  // An int8 tier this host does not offer is refused by name, never
+  // built as another (the grouped module is the machinery's, not the
+  // spec's).
+  if (mc != nullptr && mc->valid()) {
+    why.clear();
+    auto fast = tier_spec_("ffn", "", 256, 512, 768, 256);
+    acc::set_flag(&fast, ane::kInt8, true);
+    acc::set_text(&fast, ane::kInt8Tier, "fast");
+    EXPECT_TRUE(ane::create(&sess, mc, fast, &why) == nullptr);
+    EXPECT_TRUE(why.find("unknown int8_tier 'fast'") != std::string::npos);
+  }
+
   // The byte counts are the machinery's own, per kind.
   EXPECT_TRUE(ane::runtime_bytes(
                   tier_spec_("ffn", "gelu_tanh", 64, 256, 768, 256)) ==
               vpipe::genai::AneFeedForward::gelu_runtime_bytes(64, 256, 256));
   EXPECT_TRUE(ane::runtime_bytes(tier_spec_("ffn", "", 64, 256, 768, 256)) ==
               vpipe::genai::AneFeedForward::runtime_bytes(64, 256, 768, 256));
+}
+
+// The spec's int8 tier reaches the module and info() names it back:
+// "token" (the default) rotated, "token_plain" unrotated -- where the OS
+// takes int8 arrays (macOS 26); elsewhere both build fp16 and info() says
+// int8 false.
+TEST(ane_tier, the_spec_names_its_int8_tier)
+{
+  namespace ane = vpipe::genai::ane;
+  namespace acc = vpipe::genai::accel;
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  for (const char* t : {"", "token", "token_plain"}) {
+    auto spec = tier_spec_("ffn", "", 1024, 2048, 1040, 512);
+    acc::set_flag(&spec, ane::kInt8, true);
+    if (*t != '\0') { acc::set_text(&spec, ane::kInt8Tier, std::string(t)); }
+    std::string why;
+    auto tier = ane::create(&sess, mc, spec, &why);
+    if (tier == nullptr) { return; }                // no ANE on this box
+    const vpipe::FlexData inf = tier->info();
+    if (!acc::flag(&inf, ane::kInt8)) {
+      std::printf("[ane_tier] no int8 arrays here: int8 tiers skipped\n");
+      EXPECT_TRUE(!acc::has(&inf, ane::kInt8Tier));
+      return;
+    }
+    const std::string want =
+        std::string(t) == "token_plain" ? "token_plain" : "token";
+    EXPECT_TRUE(acc::text(&inf, ane::kInt8Tier) == want);
+  }
 }
 
 // The surface is a translation, not a second implementation: the same
@@ -3691,6 +6182,767 @@ TEST(ane_tier, integer_sources_stage_as_their_widening)
   EXPECT_FALSE(bad.stageable());
 }
 
+// THE ROTATED INT8 TIER (Options::int8). A SwiGLU and a single projection
+// with OUTLIER channels planted in their inputs and weights -- what makes
+// the rotation matter -- through the tier's own stage / begin / finish,
+// against double restatements of the graph's arithmetic (rows rotated per
+// 256-block and quantized per row, inputs rotated and quantized per token
+// in fp16), of the same WITHOUT the rotation, and of the unquantized
+// result. Then an input large enough to overflow fp16 inside the graph:
+// the headroom retry rescales the up projection's steps, not its codes,
+// and the rows still match. Skips where CoreML has no int8 arrays (before
+// macOS 26), as create() falls back to fp16 there.
+TEST(ane_tier, rotated_int8_runs_the_token_tiers_arithmetic)
+{
+  using vpipe::genai::AneFeedForward;
+  using vpipe::genai::AneFfnSource;
+  using vpipe::metal_compute::SharedBuffer;
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  constexpr int K = 1024, chunk = 512, seq = 2 * chunk + 16;
+  std::mt19937 rng(23);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto bf16_of = [](float f) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return (std::uint16_t)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+  };
+  auto f32_of = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto h16 = [](double v) { return (double)(_Float16)v; };
+  // [rows, cols] bf16, N(0, sc), the first four columns `boost` times
+  // larger: the outlier channels.
+  auto mat = [&](int rows, int cols, float sc, float boost) {
+    SharedBuffer b = mc->make_shared_buffer((std::size_t)rows * cols * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (int r = 0; r < rows; ++r) {
+      for (int c = 0; c < cols; ++c) {
+        p[(std::size_t)r * cols + c] =
+            bf16_of(nd(rng) * sc * (c % 251 < 4 ? boost : 1.0f));
+      }
+    }
+    return b;
+  };
+  auto fwht = [](double* v, std::size_t n) {
+    for (std::size_t b0 = 0; b0 + 256 <= n; b0 += 256) {
+      double* p = v + b0;
+      for (std::size_t h = 1; h < 256; h <<= 1) {
+        for (std::size_t i = 0; i < 256; i += 2 * h) {
+          for (std::size_t j = i; j < i + h; ++j) {
+            const double a = p[j], c = p[j + h];
+            p[j] = a + c;
+            p[j + h] = a - c;
+          }
+        }
+      }
+      for (std::size_t i = 0; i < 256; ++i) { p[i] /= 16.0; }
+    }
+  };
+  // A weight as the graph reads it: rows (rotated or not) quantized per
+  // row, each code times its fp16 step (128 x the step, over 128).
+  auto wq = [&](const SharedBuffer& w, int rows, int cols, bool rot) {
+    const auto* p = static_cast<const std::uint16_t*>(w.contents());
+    std::vector<double> out((std::size_t)rows * cols), row((std::size_t)cols);
+    for (int r = 0; r < rows; ++r) {
+      double am = 0.0;
+      for (int c = 0; c < cols; ++c) {
+        row[(std::size_t)c] = f32_of(p[(std::size_t)r * cols + c]);
+      }
+      if (rot) { fwht(row.data(), row.size()); }
+      for (double v : row) { am = std::max(am, std::fabs(v)); }
+      const double st = (double)(float)((float)am / 127.0f);
+      const double st128 = h16(st * 128.0) / 128.0;
+      for (int c = 0; c < cols; ++c) {
+        const double q =
+            std::clamp(std::nearbyint(row[(std::size_t)c] / st), -127.0,
+                       127.0);
+        out[(std::size_t)r * cols + c] = q * st128;
+      }
+    }
+    return out;
+  };
+  // An activation as the graph quantizes it: per token, its step in fp16.
+  // (Past fp16's range the graph has rescaled the up projection by then,
+  // and the quantizer does not care about scale: the max stays exact.)
+  auto aq = [&](std::vector<double>& v) {
+    double am = 0.0;
+    for (double e : v) {
+      am = std::max(am, std::fabs(e) < 6.0e4 ? std::fabs(h16(e))
+                                             : std::fabs(e));
+    }
+    const double sc = am / 127.0 < 6.0e4 ? h16(am * h16(1.0 / 127.0))
+                                         : am / 127.0;
+    const double st = std::max(sc, h16(1e-4));
+    for (double& e : v) {
+      e = std::clamp(std::nearbyint(e / st), -128.0, 127.0) * st;
+    }
+  };
+  auto proj = [](const std::vector<double>& v, const std::vector<double>& w,
+                 int rows, int cols) {
+    std::vector<double> y((std::size_t)rows, 0.0);
+    for (int n = 0; n < rows; ++n) {
+      double acc = 0.0;
+      for (int c = 0; c < cols; ++c) {
+        acc += w[(std::size_t)n * cols + c] * v[(std::size_t)c];
+      }
+      y[(std::size_t)n] = acc;
+    }
+    return y;
+  };
+  auto rel = [](const std::vector<std::vector<double>>& a,
+                const std::vector<std::vector<double>>& b) {
+    double n = 0.0, d = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      for (std::size_t j = 0; j < a[i].size(); ++j) {
+        const double e = a[i][j] - b[i][j];
+        n += e * e;
+        d += b[i][j] * b[i][j];
+      }
+    }
+    return std::sqrt(n / std::max(d, 1e-300));
+  };
+
+  int layer = 0;
+  for (const bool mm : {false, true}) {
+    const int F = mm ? 1536 : 2048;          // the output / inner width
+    AneFeedForward::Options o;
+    o.session = &sess;
+    o.mc      = mc;
+    o.tag     = mm ? "i8-mm" : "i8-ffn";
+    o.hidden  = K;
+    o.ffn     = F;
+    o.seq     = seq;
+    o.rows    = 1.0f;
+    o.chunk   = chunk;
+    o.matmul  = mm;
+    o.int8    = true;
+    auto ff = AneFeedForward::create(o);
+    if (ff == nullptr) { return; }                 // no ANE on this box
+    if (!ff->int8()) {
+      std::printf("[ane_tier] no int8 arrays here: rotated int8 skipped\n");
+      return;
+    }
+    const float a = 1.0f / std::sqrt((float)K);
+    const SharedBuffer wg = mat(F, K, a, 8.0f), wu = mat(F, K, a, 8.0f);
+    const SharedBuffer wd = mat(K, F, 1.0f / std::sqrt((float)F), 8.0f);
+    AneFfnSource sg, su, sd;
+    sg.w = &wg;
+    su.w = &wu;
+    sd.w = &wd;
+    const int Nout = mm ? F : K;
+    // The references' weights, rotated and not.
+    const std::vector<double> rg = wq(wg, F, K, true), ru = wq(wu, F, K, true);
+    const std::vector<double> ng = wq(wg, F, K, false);
+    const std::vector<double> nu = wq(wu, F, K, false);
+    const std::vector<double> rd = mm ? std::vector<double>{}
+                                      : wq(wd, K, F, true);
+    const std::vector<double> nd_ = mm ? std::vector<double>{}
+                                       : wq(wd, K, F, false);
+    // 6: the hidden state reaches ~3e5, past fp16 until the up
+    // projection is rescaled (by 16).
+    for (const float xs : {0.5f, 6.0f}) {
+      const SharedBuffer x = mat(seq, K, xs, 24.0f);
+      SharedBuffer y = mc->make_shared_buffer((std::size_t)seq * Nout * 2);
+      std::memset(y.contents(), 0, y.byte_size());
+      if (mm) {
+        ff->stage(++layer, sg, 0);
+      } else {
+        ff->stage(++layer, sg, su, sd, 0);
+      }
+      ASSERT_TRUE(ff->join_stage(layer));
+      const int an = ff->begin(x, y, seq);
+      const bool ok = ff->finish(layer, seq, 0.0, 0.0);
+      ASSERT_TRUE(ok && an > 0);
+      if (!ok || an <= 0) { return; }
+      const auto* xp = static_cast<const std::uint16_t*>(x.contents());
+      const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+      std::vector<std::vector<double>> got, rot, plain, exact;
+      for (int i = 0; i < 6; ++i) {
+        const int r = seq - an + i * (an - 1) / 5;
+        std::vector<double> xe((std::size_t)K);
+        for (int c = 0; c < K; ++c) {
+          xe[(std::size_t)c] = f32_of(xp[(std::size_t)r * K + c]);
+        }
+        std::vector<double> g8;
+        for (int c = 0; c < Nout; ++c) {
+          g8.push_back(f32_of(yp[(std::size_t)r * Nout + c]));
+        }
+        got.push_back(g8);
+        // The three arithmetics over this row.
+        auto run = [&](int mode) {             // 0 exact, 1 rotated, 2 plain
+          std::vector<double> v((std::size_t)K);
+          for (int c = 0; c < K; ++c) {
+            v[(std::size_t)c] = mode == 0 ? xe[(std::size_t)c]
+                                          : h16(xe[(std::size_t)c]);
+          }
+          std::vector<double> wgx, wux, wdx;
+          if (mode == 0) {
+            auto dense = [&](const SharedBuffer& w, int rr, int cc) {
+              const auto* p = static_cast<const std::uint16_t*>(w.contents());
+              std::vector<double> o2((std::size_t)rr * cc);
+              for (std::size_t k = 0; k < o2.size(); ++k) {
+                o2[k] = f32_of(p[k]);
+              }
+              return o2;
+            };
+            wgx = dense(wg, F, K);
+            if (!mm) {
+              wux = dense(wu, F, K);
+              wdx = dense(wd, K, F);
+            }
+          }
+          const std::vector<double>& G = mode == 0 ? wgx : mode == 1 ? rg : ng;
+          const std::vector<double>& U = mode == 0 ? wux : mode == 1 ? ru : nu;
+          const std::vector<double>& D = mode == 0 ? wdx : mode == 1 ? rd : nd_;
+          if (mode == 1) { fwht(v.data(), v.size()); }
+          if (mode != 0) { aq(v); }
+          std::vector<double> g = proj(v, G, F, K);
+          if (mm) { return g; }
+          const std::vector<double> u = proj(v, U, F, K);
+          for (int n = 0; n < F; ++n) {
+            const double gg = g[(std::size_t)n];
+            g[(std::size_t)n] = gg / (1.0 + std::exp(-gg)) * u[(std::size_t)n];
+          }
+          if (mode == 1) { fwht(g.data(), g.size()); }
+          if (mode != 0) { aq(g); }
+          return proj(g, D, K, F);
+        };
+        exact.push_back(run(0));
+        rot.push_back(run(1));
+        plain.push_back(run(2));
+      }
+      const double own = rel(got, rot), e_ane = rel(got, exact);
+      const double e_rot = rel(rot, exact), e_plain = rel(plain, exact);
+      std::printf("[ane_tier] rotated int8 %s, x * %.1f: against its "
+                  "arithmetic %.2e; from unquantized ANE %.2e, rotated "
+                  "%.2e, unrotated %.2e\n", mm ? "matmul" : "SwiGLU", xs,
+                  own, e_ane, e_rot, e_plain);
+      // The graph computes what was restated (fp16 inside, so not to the
+      // bit); the rotation is worth something on outlier channels; and
+      // the ANE adds little to the rotated arithmetic's own error.
+      EXPECT_TRUE(own < 2.5e-2);
+      EXPECT_TRUE(e_rot < 0.7 * e_plain);
+      EXPECT_TRUE(e_ane < 1.3 * e_rot + 3e-3);
+      if (mm) { break; }          // a single matmul has no headroom retry
+    }
+  }
+}
+
+// THE INT8 TIER AGAINST THE GPU'S INT8 TIERS, on real activations. The
+// tier's rotated int8 module, its unrotated twin (Options::int8_plain), its
+// grouped one (Options::int8_group, the `fast` tier's arithmetic) and its
+// fp16 module run real feed-forward inputs (a forward's capture,
+// VPIPE_H3_FF_CAPTURE) through a real block's weights, beside the GPU's
+// `token` and `token_plain` tiers restated as their kernels compute
+// (quant_i8_tok / quant_i8_tok_r and the weight converters: f32 values,
+// the 256-block Walsh-Hadamard in f32, a row's step am / 127 in f32, codes
+// rint and clamped to +-127, one integer sum a dot product times the two
+// f32 steps, every projection's output and the SwiGLU's hidden state
+// rounded to bf16 -- the restatement gemm_i8.per_token pins to the
+// kernels) and the unquantized feed-forward in double. "Close" is the
+// ANE's distance from its GPU tier against that tier's own distance from
+// exact: the same arithmetic, rounded in fp16 where the GPU keeps f32.
+// The `fast` tier restated as its kernels compute too (quant_i8_row_gc*_r,
+// gemm_i8c_*): each group of K rotated whole, a step per (row, group)
+// stored in the element type, a group's integer sum times both steps
+// folded in f32. Each module's second predict is timed.
+//
+// Env: VPIPE_ANE_I8_VS_GPU=1; VPIPE_ANE_RTQF_REAL (the capture's
+// directory: ff_in_<L>.bf16, [rows, hidden]) and VPIPE_ANE_RTQF_CKPT (the
+// checkpoint that forward ran, one safetensors file with
+// blocks.<L>.mlp.fc1 = [gate; up] and fc2); _BLOCKS ("0,12,24,36,49"),
+// _ROWS (rows compared a block, 48).
+TEST(ane_tier, int8_rows_against_the_gpu_token_tiers)
+{
+  using vpipe::genai::AneFeedForward;
+  using vpipe::genai::AneFfnSource;
+  using vpipe::metal_compute::SharedBuffer;
+  if (env_or_null_("VPIPE_ANE_I8_VS_GPU") == nullptr) { return; }
+  const char* real = env_or_null_("VPIPE_ANE_RTQF_REAL");
+  const char* ckpt = env_or_null_("VPIPE_ANE_RTQF_CKPT");
+  if (real == nullptr || ckpt == nullptr) {
+    std::printf("[ane_i8_vs_gpu] needs VPIPE_ANE_RTQF_REAL and _CKPT\n");
+    return;
+  }
+  vpipe::Session sess;
+  vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const char* bl = env_or_null_("VPIPE_ANE_RTQF_BLOCKS");
+  std::vector<int> blocks;
+  {
+    std::stringstream ss(bl != nullptr ? bl : "0,12,24,36,49");
+    std::string t;
+    while (std::getline(ss, t, ',')) {
+      if (!t.empty()) { blocks.push_back(std::atoi(t.c_str())); }
+    }
+  }
+  const char* rs = env_or_null_("VPIPE_ANE_RTQF_ROWS");
+  const int want_rows = rs != nullptr ? std::max(1, std::atoi(rs)) : 48;
+
+  vpipe::FlexData hdr;
+  std::uint64_t data0 = 0;
+  {
+    std::ifstream f(ckpt, std::ios::binary);
+    std::uint64_t n = 0;
+    f.read(reinterpret_cast<char*>(&n), 8);
+    std::string js(n, '\0');
+    f.read(js.data(), (std::streamsize)n);
+    ASSERT_TRUE(f.good());
+    if (!f.good()) { return; }
+    hdr = vpipe::FlexData::from_json(js);
+    data0 = 8 + n;
+  }
+  // A bf16 tensor's bytes as stored, [rows, cols].
+  auto raw16 = [&](const std::string& name, int* rows, int* cols) {
+    std::vector<std::uint16_t> raw;
+    auto o = hdr.as_object();
+    if (!o.contains(name)) { return raw; }
+    const vpipe::FlexData t = o.at(name);
+    auto to = t.as_object();
+    const vpipe::FlexData shape = to.at("shape");
+    const vpipe::FlexData offs = to.at("data_offsets");
+    auto sa = shape.as_array();
+    auto oa = offs.as_array();
+    *rows = (int)sa.at(0).as_int();
+    *cols = (int)sa.at(1).as_int();
+    raw.resize((std::size_t)(*rows) * (std::size_t)(*cols));
+    std::ifstream f(ckpt, std::ios::binary);
+    f.seekg((std::streamoff)(data0 + (std::uint64_t)oa.at(0).as_int()));
+    f.read(reinterpret_cast<char*>(raw.data()),
+           (std::streamsize)(raw.size() * 2));
+    if (!f.good()) { raw.clear(); }
+    return raw;
+  };
+  auto bf = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto rbf = [&](float f) {      // f rounded to bf16, nearest-even
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+    float r;
+    std::memcpy(&r, &u, 4);
+    return r;
+  };
+  // ...or to f16: the token tier on an f16 model rounds there instead.
+  auto rh = [](float f) { return (float)(_Float16)f; };
+  // The orthonormal Walsh-Hadamard over every block of b (256 the token
+  // tier's), in f32.
+  auto fwht = [](float* v, std::size_t n, int b = 256) {
+    const float norm = 1.0f / std::sqrt((float)b);
+    for (std::size_t b0 = 0; b0 + (std::size_t)b <= n; b0 += b) {
+      float* p = v + b0;
+      for (int h = 1; h < b; h <<= 1) {
+        for (int i = 0; i < b; i += 2 * h) {
+          for (int j = i; j < i + h; ++j) {
+            const float a = p[j], c = p[j + h];
+            p[j] = a + c;
+            p[j + h] = a - c;
+          }
+        }
+      }
+      for (int i = 0; i < b; ++i) { p[i] *= norm; }
+    }
+  };
+  // A row to its codes and per-group steps (am / 127, unrounded: the
+  // element type rounds them at use), as quant_i8_row_gc*_r writes it.
+  auto qrow_g = [&](std::vector<float> v, int gc, std::int8_t* q,
+                    float* st) {
+    fwht(v.data(), v.size(), gc);
+    for (std::size_t g0 = 0, gi = 0; g0 < v.size(); g0 += gc, ++gi) {
+      float am = 0.0f;
+      for (std::size_t k = g0; k < g0 + gc; ++k) {
+        am = std::max(am, std::fabs(v[k]));
+      }
+      const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+      for (std::size_t k = g0; k < g0 + gc; ++k) {
+        q[k] = (std::int8_t)std::clamp((int)std::rint(v[k] * inv), -127,
+                                       127);
+      }
+      st[gi] = am * (1.0f / 127.0f);
+    }
+  };
+  // A row to its codes and step, as the token quantizers write it.
+  auto qrow = [&](std::vector<float> v, bool rot, std::int8_t* q) {
+    if (rot) { fwht(v.data(), v.size()); }
+    float am = 0.0f;
+    for (float e : v) { am = std::max(am, std::fabs(e)); }
+    const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+    for (std::size_t k = 0; k < v.size(); ++k) {
+      q[k] = (std::int8_t)std::clamp((int)std::rint(v[k] * inv), -127, 127);
+    }
+    return am * (1.0f / 127.0f);
+  };
+  auto par = [](int n, const std::function<void(int)>& fn) {
+    const int T = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> th;
+    std::atomic<int> next{0};
+    for (int t = 0; t < T; ++t) {
+      th.emplace_back([&]() {
+        for (int i = next++; i < n; i = next++) { fn(i); }
+      });
+    }
+    for (auto& t : th) { t.join(); }
+  };
+  // A weight's codes and steps, rotated or not (per row), or per group
+  // of gc (s then [rows, cols / gc]).
+  struct Q {
+    std::vector<std::int8_t> c;
+    std::vector<float> s;
+  };
+  auto qmat_g = [&](const std::uint16_t* w, int rows, int cols, int gc) {
+    Q m;
+    m.c.resize((std::size_t)rows * cols);
+    m.s.resize((std::size_t)rows * (cols / gc));
+    par(rows, [&](int r) {
+      std::vector<float> v((std::size_t)cols);
+      for (int k = 0; k < cols; ++k) {
+        v[(std::size_t)k] = bf(w[(std::size_t)r * cols + k]);
+      }
+      qrow_g(std::move(v), gc, m.c.data() + (std::size_t)r * cols,
+             m.s.data() + (std::size_t)r * (cols / gc));
+    });
+    return m;
+  };
+  auto qmat = [&](const std::uint16_t* w, int rows, int cols, bool rot) {
+    Q m;
+    m.c.resize((std::size_t)rows * cols);
+    m.s.resize((std::size_t)rows);
+    par(rows, [&](int r) {
+      std::vector<float> v((std::size_t)cols);
+      for (int k = 0; k < cols; ++k) {
+        v[(std::size_t)k] = bf(w[(std::size_t)r * cols + k]);
+      }
+      m.s[(std::size_t)r] = qrow(std::move(v), rot,
+                                 m.c.data() + (std::size_t)r * cols);
+    });
+    return m;
+  };
+  auto rel = [](const std::vector<std::vector<double>>& a,
+                const std::vector<std::vector<double>>& b) {
+    double n = 0.0, d = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      for (std::size_t j = 0; j < a[i].size(); ++j) {
+        const double e = a[i][j] - b[i][j];
+        n += e * e;
+        d += b[i][j] * b[i][j];
+      }
+    }
+    return std::sqrt(n / std::max(d, 1e-300));
+  };
+
+  int layer = 0;
+  for (const int blk : blocks) {
+    const std::string p = "blocks." + std::to_string(blk) + ".mlp.";
+    int r1 = 0, c1 = 0, r2 = 0, c2 = 0;
+    const std::vector<std::uint16_t> fc1 = raw16(p + "fc1.weight", &r1, &c1);
+    const std::vector<std::uint16_t> fc2 = raw16(p + "fc2.weight", &r2, &c2);
+    ASSERT_TRUE(!fc1.empty() && !fc2.empty());
+    if (fc1.empty() || fc2.empty()) { return; }
+    const int H = c1, F = r1 / 2;
+    ASSERT_TRUE(r2 == H && c2 == F);
+    std::vector<std::uint16_t> xr;
+    {
+      const std::string xp =
+          std::string(real) + "/ff_in_" + std::to_string(blk) + ".bf16";
+      std::ifstream xf(xp, std::ios::binary | std::ios::ate);
+      ASSERT_TRUE(xf.good());
+      if (!xf.good()) { return; }
+      xr.resize((std::size_t)xf.tellg() / 2);
+      xf.seekg(0);
+      xf.read(reinterpret_cast<char*>(xr.data()),
+              (std::streamsize)(xr.size() * 2));
+    }
+    const int R = (int)(xr.size() / (std::size_t)H);
+    // fc1 is [gate; up], gate first.
+    auto buf = [&](const std::uint16_t* s, std::size_t n) {
+      SharedBuffer b = mc->make_shared_buffer(n * 2);
+      std::memcpy(b.contents(), s, n * 2);
+      return b;
+    };
+    const std::size_t FH = (std::size_t)F * H;
+    const SharedBuffer wg = buf(fc1.data(), FH), wu = buf(fc1.data() + FH, FH);
+    const SharedBuffer wd = buf(fc2.data(), FH);
+    constexpr int kChunk = 2048;
+    const int seq = kChunk + 64;
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)seq * H * 2);
+    for (int r = 0; r < seq; ++r) {
+      std::memcpy(static_cast<std::uint8_t*>(x.contents()) +
+                      (std::size_t)r * H * 2,
+                  xr.data() + (std::size_t)(r % R) * H, (std::size_t)H * 2);
+    }
+    // The modules: rotated int8, unrotated int8, grouped int8, fp16.
+    enum { kRot, kPlain, kFast, kF16, kMods };
+    const char* const kName[kMods] = {"rotated int8", "unrotated int8",
+                                      "grouped int8", "fp16"};
+    constexpr int kTarget = 512;     // the fast tier's default group
+    double ms[kMods] = {};
+    std::vector<std::vector<double>> got[kMods];
+    std::vector<int> sample;
+    bool ran[kMods] = {};
+    for (int m = 0; m < kMods; ++m) {
+      AneFeedForward::Options o;
+      o.session    = &sess;
+      o.mc         = mc;
+      o.tag        = std::string("i8-vs-gpu-") + std::to_string(m);
+      o.hidden     = H;
+      o.ffn        = F;
+      o.seq        = seq;
+      o.rows       = 1.0f;
+      o.chunk      = kChunk;
+      o.int8       = m != kF16;
+      o.int8_plain = m == kPlain;
+      o.int8_group = m == kFast ? kTarget : 0;
+      auto ff = AneFeedForward::create(o);
+      if (ff == nullptr) { return; }            // no ANE on this box
+      if (m != kF16 && (!ff->int8() || ff->int8_plain() != (m == kPlain) ||
+                        ff->int8_group() != o.int8_group)) {
+        std::printf("[ane_i8_vs_gpu] %s did not build here; skipped\n",
+                    kName[m]);
+        continue;
+      }
+      AneFfnSource sg, su, sd;
+      sg.w = &wg;
+      su.w = &wu;
+      sd.w = &wd;
+      SharedBuffer y = mc->make_shared_buffer((std::size_t)seq * H * 2);
+      int an = 0;
+      for (int rep = 0; rep < 2; ++rep) {      // the second is timed
+        ff->stage(++layer, sg, su, sd, 0);
+        ASSERT_TRUE(ff->join_stage(layer));
+        const auto t0 = std::chrono::steady_clock::now();
+        an = ff->begin(x, y, seq);
+        const bool ok = ff->finish(layer, seq, 0.0, 0.0);
+        ms[m] = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+        ASSERT_TRUE(ok && an > 0);
+        if (!ok || an <= 0) { return; }
+      }
+      if (sample.empty()) {
+        // Distinct captured rows inside the ANE's span.
+        const int span = std::min(R, an), S = std::min(want_rows, span);
+        for (int i = 0; i < S; ++i) {
+          sample.push_back(seq - an + i * (span / S));
+        }
+      }
+      const auto* yp = static_cast<const std::uint16_t*>(y.contents());
+      for (const int r : sample) {
+        std::vector<double> v((std::size_t)H);
+        for (int c = 0; c < H; ++c) {
+          v[(std::size_t)c] = bf(yp[(std::size_t)r * H + c]);
+        }
+        got[m].push_back(std::move(v));
+      }
+      ran[m] = true;
+    }
+    ASSERT_TRUE(!sample.empty());
+    if (sample.empty()) { return; }
+
+    // The GPU tiers' weights, and the references over the sampled rows.
+    const Q gr = qmat(fc1.data(), F, H, true);
+    const Q ur = qmat(fc1.data() + FH, F, H, true);
+    const Q dr = qmat(fc2.data(), H, F, true);
+    const Q gp = qmat(fc1.data(), F, H, false);
+    const Q up = qmat(fc1.data() + FH, F, H, false);
+    const Q dp = qmat(fc2.data(), H, F, false);
+    const int g1 = vpipe::AneGraphSpec::group_for(kTarget, H);
+    const int g2 = vpipe::AneGraphSpec::group_for(kTarget, F);
+    const Q gf = qmat_g(fc1.data(), F, H, g1);
+    const Q uf = qmat_g(fc1.data() + FH, F, H, g1);
+    const Q df = qmat_g(fc2.data(), H, F, g2);
+    const int S = (int)sample.size();
+    // tok / plain: the tiers on a bf16 model, as H3 runs them; tok16 /
+    // plain16: on an f16 model -- the same arithmetic rounded where the
+    // ANE rounds, which says how much of the distance is that alone.
+    std::vector<std::vector<double>> exact((std::size_t)S), tok((std::size_t)S),
+        plain((std::size_t)S), tok16((std::size_t)S), plain16((std::size_t)S),
+        fast((std::size_t)S), fast16((std::size_t)S);
+    par(S, [&](int i) {
+      const std::uint16_t* xs = xr.data() + (std::size_t)(sample[i] % R) * H;
+      std::vector<float> xv((std::size_t)H);
+      for (int c = 0; c < H; ++c) { xv[(std::size_t)c] = bf(xs[c]); }
+      // Unquantized, in double.
+      std::vector<double> h((std::size_t)F), out((std::size_t)H);
+      for (int n = 0; n < F; ++n) {
+        double g = 0.0, u = 0.0;
+        const std::uint16_t* gw = fc1.data() + (std::size_t)n * H;
+        const std::uint16_t* uw = gw + FH;
+        for (int c = 0; c < H; ++c) {
+          g += (double)bf(gw[c]) * xv[(std::size_t)c];
+          u += (double)bf(uw[c]) * xv[(std::size_t)c];
+        }
+        h[(std::size_t)n] = g / (1.0 + std::exp(-g)) * u;
+      }
+      for (int k = 0; k < H; ++k) {
+        double a = 0.0;
+        const std::uint16_t* dw = fc2.data() + (std::size_t)k * F;
+        for (int n = 0; n < F; ++n) {
+          a += (double)bf(dw[n]) * h[(std::size_t)n];
+        }
+        out[(std::size_t)k] = a;
+      }
+      exact[(std::size_t)i] = out;
+      // The GPU's token tiers.
+      for (int arm = 0; arm < 4; ++arm) {
+        const bool rot = arm % 2 == 0, f16 = arm >= 2;
+        auto rd = [&](float f) { return f16 ? rh(f) : rbf(f); };
+        const Q& G = rot ? gr : gp;
+        const Q& U = rot ? ur : up;
+        const Q& D = rot ? dr : dp;
+        std::vector<std::int8_t> qx((std::size_t)H), qh((std::size_t)F);
+        const float sx = qrow(xv, rot, qx.data());
+        std::vector<float> hv((std::size_t)F);
+        for (int n = 0; n < F; ++n) {
+          std::int32_t ag = 0, au = 0;
+          const std::int8_t* gc = G.c.data() + (std::size_t)n * H;
+          const std::int8_t* uc = U.c.data() + (std::size_t)n * H;
+          for (int c = 0; c < H; ++c) {
+            ag += (std::int32_t)gc[c] * qx[(std::size_t)c];
+            au += (std::int32_t)uc[c] * qx[(std::size_t)c];
+          }
+          const float g = rd((float)ag * (sx * G.s[(std::size_t)n]));
+          const float u = rd((float)au * (sx * U.s[(std::size_t)n]));
+          hv[(std::size_t)n] = rd(g / (1.0f + std::exp(-g)) * u);
+        }
+        const float sh = qrow(hv, rot, qh.data());
+        std::vector<double> o2((std::size_t)H);
+        for (int k = 0; k < H; ++k) {
+          std::int32_t a = 0;
+          const std::int8_t* dc = D.c.data() + (std::size_t)k * F;
+          for (int n = 0; n < F; ++n) {
+            a += (std::int32_t)dc[n] * qh[(std::size_t)n];
+          }
+          o2[(std::size_t)k] = rd((float)a * (sh * D.s[(std::size_t)k]));
+        }
+        auto& dst = f16 ? (rot ? tok16 : plain16) : (rot ? tok : plain);
+        dst[(std::size_t)i] = std::move(o2);
+      }
+      // The GPU's fast tier: steps in the element type, the groups folded
+      // in f32 as gemm_i8c_impl folds them.
+      for (const bool f16 : {false, true}) {
+        auto rd = [&](float f) { return f16 ? rh(f) : rbf(f); };
+        auto gemm = [&](const std::int8_t* qa, const float* sa, const Q& W,
+                        int k, int gc, int n) {
+          float acc = 0.0f;
+          const std::int8_t* wc = W.c.data() + (std::size_t)n * k;
+          const float* ws = W.s.data() + (std::size_t)n * (k / gc);
+          for (int g = 0; g < k / gc; ++g) {
+            std::int32_t dot = 0;
+            for (int c = g * gc; c < (g + 1) * gc; ++c) {
+              dot += (std::int32_t)wc[c] * qa[c];
+            }
+            acc = std::fma((float)dot * rd(ws[g]), rd(sa[g]), acc);
+          }
+          return rd(acc);
+        };
+        std::vector<std::int8_t> qx((std::size_t)H), qh((std::size_t)F);
+        std::vector<float> sx((std::size_t)(H / g1)), sh((std::size_t)(F / g2));
+        qrow_g(xv, g1, qx.data(), sx.data());
+        std::vector<float> hv((std::size_t)F);
+        for (int n = 0; n < F; ++n) {
+          const float g = gemm(qx.data(), sx.data(), gf, H, g1, n);
+          const float u = gemm(qx.data(), sx.data(), uf, H, g1, n);
+          hv[(std::size_t)n] = rd(g / (1.0f + std::exp(-g)) * u);
+        }
+        qrow_g(hv, g2, qh.data(), sh.data());
+        std::vector<double> o2((std::size_t)H);
+        for (int k = 0; k < H; ++k) {
+          o2[(std::size_t)k] = gemm(qh.data(), sh.data(), df, F, g2, k);
+        }
+        (f16 ? fast16 : fast)[(std::size_t)i] = std::move(o2);
+      }
+    });
+    const double e_tok = rel(tok, exact), e_plain = rel(plain, exact);
+    const double e_fast = rel(fast, exact);
+    std::printf("[ane_i8_vs_gpu] block %d (%d x %d, %d rows of %d): from "
+                "exact -- GPU token %.3e, GPU token_plain %.3e; the tiers "
+                "on bf16 vs on f16: token %.3e, token_plain %.3e\n", blk, H,
+                F, S, R, e_tok, e_plain, rel(tok, tok16),
+                rel(plain, plain16));
+    std::printf("[ane_i8_vs_gpu]   GPU fast (groups %d / %d) from exact "
+                "%.3e; on bf16 vs on f16 %.3e\n", g1, g2, e_fast,
+                rel(fast, fast16));
+    for (int m = 0; m < kMods; ++m) {
+      if (!ran[m]) { continue; }
+      const double ex = rel(got[m], exact);
+      const double vt = rel(got[m], tok), vp = rel(got[m], plain);
+      const double vf = rel(got[m], fast);
+      std::printf("[ane_i8_vs_gpu]   ANE %-15s %6.1f ms a chunk, from exact "
+                  "%.3e | from GPU token %.3e (%.2fx its error; on f16 "
+                  "%.3e), token_plain %.3e (%.2fx; on f16 %.3e), fast %.3e "
+                  "(%.2fx; on f16 %.3e)\n", kName[m], ms[m], ex, vt,
+                  vt / e_tok, rel(got[m], tok16), vp, vp / e_plain,
+                  rel(got[m], plain16), vf, vf / e_fast,
+                  rel(got[m], fast16));
+    }
+    // THE SAME ERROR, ROUNDED ELSEWHERE. Each per-token module lands as far
+    // from exact as its GPU tier (within 1% on H3's blocks 0/12/24/36/49),
+    // and nearer that tier than the other one -- the rotation is what
+    // separates them -- but not ON it: 0.57-0.73x the token tier's error
+    // from it (unrotated 0.32-0.47x from token_plain), where the GPU tier
+    // itself moves 0.4-0.5x between a bf16 model and an f16 one. The ANE
+    // rotates, scales and sums its tiles in fp16. MEASURED, M4 Pro.
+    if (ran[kRot]) {
+      const double d = rel(got[kRot], tok);
+      EXPECT_TRUE(rel(got[kRot], exact) < 1.05 * e_tok);
+      EXPECT_TRUE(d < 0.8 * e_tok);
+      EXPECT_TRUE(d < 0.3 * rel(got[kRot], plain));
+    }
+    if (ran[kPlain]) {
+      const double d = rel(got[kPlain], plain);
+      EXPECT_TRUE(rel(got[kPlain], exact) < 1.05 * e_plain);
+      EXPECT_TRUE(d < 0.6 * e_plain);
+      EXPECT_TRUE(d < 0.5 * rel(got[kPlain], tok));
+    }
+    // Grouped, against the fast tier: 3-5% nearer exact than it (fp16
+    // steps where the GPU stores bf16), 0.64-0.83x its error from it --
+    // about the tier's own spread between a bf16 and an f16 model -- and
+    // well nearer it than the token tier. MEASURED, M4 Pro.
+    if (ran[kFast]) {
+      const double d = rel(got[kFast], fast);
+      EXPECT_TRUE(rel(got[kFast], exact) < 1.05 * e_fast);
+      EXPECT_TRUE(d < 0.9 * e_fast);
+      EXPECT_TRUE(d < 0.6 * rel(got[kFast], tok));
+    }
+  }
+}
+
+// The rotated int8 graph written out for inspection (VPIPE_ANE_EMIT_DIR):
+// a SwiGLU at VPIPE_ANE_EMIT_HID x _FFN (1024 x 2048), _ROWS (512) rows,
+// 1024 tiles, as AneFeedForward emits it.
+TEST(ane_module, emit_int8_graph_for_inspection)
+{
+  const char* dir = env_or_null_("VPIPE_ANE_EMIT_DIR");
+  if (dir == nullptr) { return; }
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  vpipe::AneGraphSpec spec;
+  spec.kind = vpipe::AneGraphSpec::Kind::SwiGluFfn;
+  spec.M  = envi("VPIPE_ANE_EMIT_ROWS", 512);
+  spec.K  = envi("VPIPE_ANE_EMIT_HID", 1024);
+  spec.N  = envi("VPIPE_ANE_EMIT_FFN", 2048);
+  spec.bk = 1024;
+  spec.bn = 1024;
+  spec.runtime_weights = true;
+  spec.weights_out_in  = true;
+  spec.int8 = true;
+  std::string err;
+  const bool ok = vpipe::AneEmitter::emit(spec, {}, std::string(dir) +
+                                          "/int8-ffn.mlmodelc", &err);
+  if (!ok) { std::printf("[ane_module] emit: %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+}
+
 // STAGING HAS ITS OWN QUEUE. A module stages while another module's
 // predict runs on the ANE worker, and a block staged ahead is the block
 // the split reads: stage() returns without waiting for the other
@@ -3921,6 +7173,9 @@ TEST(ane_tier, memory_it_holds_and_where)
   // _MATMUL: one projection _HID -> _FFN instead (e.g. FLUX.2-klein-9B's
   // single-block to_qkv_mlp_proj, 4096 -> 36864).
   const bool matmul = std::getenv("VPIPE_ANE_MEM_PROBE_MATMUL") != nullptr;
+  // _INT8: the module in rotated int8 (ane::kInt8; a swiglu or a matmul,
+  // so set _GELU=0 for a feed-forward).
+  const bool int8 = std::getenv("VPIPE_ANE_MEM_PROBE_INT8") != nullptr;
   vpipe::Session sess;
   vpipe::metal_compute::MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr || !mc->valid()) { return; }
@@ -3964,6 +7219,7 @@ TEST(ane_tier, memory_it_holds_and_where)
                          chunk);
   acc::set_flag(&spec, ane::kBiases, gelu && !matmul);
   acc::set_real(&spec, ane::kRows, 0.75);
+  acc::set_flag(&spec, ane::kInt8, int8);
   if (matmul) {
     acc::set_text(&spec, ane::kKind, std::string(ane::kKindMatmul));
     acc::set_integer(&spec, ane::kInWidth, H);
@@ -4014,9 +7270,10 @@ TEST(ane_tier, memory_it_holds_and_where)
   snap("destroyed");
 
   auto mb = [](std::size_t v) { return (long long)(v >> 20); };
-  std::printf("[ane_tier] mem probe %s %dx%d, seq %d, chunk %d, %d ANE rows; "
-              "tier estimate %lld MB (host rows %lld MB)\n",
-              matmul ? "matmul" : gelu ? "gelu" : "swiglu", H, F, seq, chunk,
+  std::printf("[ane_tier] mem probe %s%s %dx%d, seq %d, chunk %d, %d ANE "
+              "rows; tier estimate %lld MB (host rows %lld MB)\n",
+              matmul ? "matmul" : gelu ? "gelu" : "swiglu",
+              acc::flag(&inf, ane::kInt8) ? " int8" : "", H, F, seq, chunk,
               a,
               mb(ane::runtime_bytes(spec)),
               (long long)(acc::integer(&inf, ane::kInfoHostBytes, 0) >> 20));

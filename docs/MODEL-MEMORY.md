@@ -2129,6 +2129,29 @@ faster (DeepSeek-V4.1 on an M5 Ultra: 9.1 tok/s warm with a 30,517 MB
 cache, 17.3 with 61,035 MB, 32.5 with the box's 175 GB --
 docs/DEEPSEEK-V41.md).
 
+**A table read by row can be held too.** Qwen3.8-Flash-Next's n-gram
+embedding table (38 GB in the oQ5e pack) is never held by default: a
+prompt reads its rows from disk, a few hundred thousand small reads.
+`ngram_resident` on text-chat (`load_spec::kNgramResident`) asks for it in
+memory. The loader takes it only where the rest of the model, EVERY
+routed expert and the table fit what the cache above is sized in -- the
+box beside the plan, the irreversible headroom, the host's limit, and a
+cache asked for that holds every expert (`MetalQwenModel::
+lm_ngram_resident`): the experts come first, since a cached expert costs a
+read on every token and a row of the table only once a prompt. Held, the
+table is filled AFTER the load, a shard at a time, each tensor a derived
+entry of the weight set read by `pread` uncached (through the shard's
+mmap the pages would sit in the page cache beside the copy, tens of GB at
+once); a row whose shard is in is read from memory, the rest from disk, so
+loading takes no longer and the rows are the same bytes either way. The
+claim books the table with the rest under a limit or a cache asked for
+(`held_bytes`) -- not under a cache that cannot hold every expert, where
+the loader never takes it; a model kept warm is handed over as it loaded,
+and is weighed with its table (below): the table is filled on a thread of
+its own, so the wired load's count of what it allocated leaves it out,
+and the manager adds it (`LoadedLanguageModel::filled_after_load_bytes`).
+It is held UNWIRED: the wired pool is not charged for it.
+
 Kept warm (text-chat's `keep_loaded`), such a model is weighed at what
 it HOLDS when a launch that does not claim it asks whether it fits beside
 it, not at its checkpoint -- DeepSeek under that 30,517 MB cache holds 41
@@ -2139,7 +2162,7 @@ full pool) and what its runs keep beside the weights and the K/V
 (`warm_run_bytes`: the forward's scratch, grown to the largest piece a
 turn needed -- the model's own figure where it reports one, else the run
 arena the plan booked for it). A load that was not wired measured
-nothing, and is weighed at its checkpoint. Two more rules follow from
+nothing, and is weighed at its checkpoint. Three more rules follow from
 the model staying loaded:
 
 - **It must leave the wired pool room.** Its load stays wired, charged
@@ -2157,6 +2180,18 @@ the model staying loaded:
   handed over at the size it loaded at. The weights planner books it at
   the larger of the claim's figure and `warm_held_bytes` -- a relaunch
   asking a smaller cache would otherwise book 41 GB beside 185 held.
+- **A load under other settings lets it go first.** What IS in the key --
+  the folder, the dtype, the page size and count (the context), the
+  drafters -- decides whether a load is handed the warm model, while a
+  launch claims a warm model by its folder. So a load of the same folder
+  under another key lets the warm one go before it loads, its
+  conversations saved as its expiry saves them: a host that changed the
+  context it asks for held both copies resident until the old hold ran
+  out (two of an 88 GB model on a 256 GB box). The one the key is handed
+  stays, and so does one still in use -- a peer stage on the folder under
+  its own settings: letting it go would free nothing and lose the
+  conversations parked on it. Test
+  `metal_lm_smoke.a_warm_model_under_other_settings_is_let_go`.
 
 ### How it decides
 
@@ -2428,15 +2463,21 @@ letting it go frees its warm bytes, not these); the wired pool's use and
 limit; and this process's Metal allocations, which take in everything
 above and the stages' scratch. A language model's weights are counted
 only where its load WIRED them (`wire_weights`): read into the model's
-own members, they are in no weight set. A stage that keeps a model with
-no bytes -- vae-decode does -- reports 0 for it.
+own members, they are in no weight set. Such a load's entry also carries
+`held_bytes`, all that hold keeps as a launch weighs it beside itself --
+its wired bytes, what a full wired pool left unwired, and what it filled
+after loading (an n-gram table held in memory, which is never wired) --
+each hold its own, so two loads of one model under other settings are
+two figures; an unwired load carries none. A stage that keeps a model
+with no bytes -- vae-decode does -- reports 0 for it.
 
 The figures OVERLAP, and only the Metal allocations are a total. A model
 a stage built keeps part of its checkpoint through the manager's weight
 set -- a DiT's trunk, for one -- so those bytes are in its warm entry and
-in its checkpoint's entry both, and the K/V of the language models kept
-warm is in the session-wide K/V figure too. Show each list for what it
-is; do not add them up.
+in its checkpoint's entry both; a language model's `held_bytes` likewise
+takes in what it keeps through its set (that n-gram table); and the K/V
+of the language models kept warm is in the session-wide K/V figure too.
+Show each list for what it is; do not add them up.
 
 ---
 

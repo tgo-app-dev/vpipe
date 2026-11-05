@@ -309,6 +309,9 @@ private:
   // Its routed experts' cache, MB (load_spec::kExpertCacheMb); 0 the
   // model's own sizing.
   std::int64_t _expert_cache_mb{};
+  // Its n-gram table held in memory where it fits (load_spec::
+  // kNgramResident; config "ngram_resident").
+  bool        _ngram_resident{};
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};

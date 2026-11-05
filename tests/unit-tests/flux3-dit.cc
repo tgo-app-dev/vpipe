@@ -20,6 +20,7 @@
 // that the tests actually RAN (they print what they measured).
 // VPIPE_FLUX3_STREAM=1 streams the real DiT's blocks (needed on 16 GB).
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -1607,10 +1608,13 @@ TEST(flux3_dit, ane_feed_forward_rows_are_right)
   for (auto& x : text) { x *= 4.0f; }
   using Specs = std::vector<MetalFlux3Transformer::LoraSpec>;
   int bound = -1;
-  auto run = [&](bool ane, bool* armed,
-                 const Specs& loras = {}) -> std::vector<float> {
+  auto run = [&](bool ane, bool* armed, const Specs& loras = {},
+                 bool int8 = false, int* n8 = nullptr,
+                 bool plain = false) -> std::vector<float> {
     MetalFlux3Transformer::Config c = cfg;
     c.ane_ffn = ane;
+    c.ane_int8 = int8;
+    c.ane_int8_plain = int8 && plain;
     auto m = MetalFlux3Transformer::load(dir, mc, c, false, loras);
     if (m == nullptr) { return {}; }
     if (!loras.empty()) { bound = m->lora_modules(0); }
@@ -1630,6 +1634,7 @@ TEST(flux3_dit, ane_feed_forward_rows_are_right)
     if (armed != nullptr) {
       *armed = m->ane_armed() && !m->ane_gpu_only();
     }
+    if (n8 != nullptr) { *n8 = m->ane_int8_modules(plain); }
     return from_bf16_(v, img.size());
   };
   bool armed = false;
@@ -1644,6 +1649,23 @@ TEST(flux3_dit, ane_feed_forward_rows_are_right)
   std::printf("[flux3_dit] ANE feed-forward on 3 joint blocks at %d rows: "
               "rel-L2 vs the GPU %.6f\n", txt + gh * gw, d);
   EXPECT_TRUE(d > 0.0 && d < 0.02);
+
+  // ROTATED INT8 (ane_int8): the feed-forward again in the GPU token
+  // tier's arithmetic, ENGAGED before measured, inside the same bar.
+  // And unrotated (ane_int8_tier: token_plain), at a looser bar.
+  for (const bool plain : {false, true}) {
+    bool armed8 = false;
+    int n8 = -1;
+    const std::vector<float> a8 = run(true, &armed8, {}, true, &n8, plain);
+    F3_REQUIRE(a8.size() == gpu.size());
+    const double d8 = rel_l2_(a8, gpu);
+    std::printf("[flux3_dit] ... in %s int8 (%d module int8): rel-L2 vs "
+                "the GPU %.6f\n", plain ? "unrotated" : "rotated", n8, d8);
+    if (ane_int8_expected()) {
+      EXPECT_TRUE(armed8 && n8 == 1);
+      EXPECT_TRUE(d8 > 0.0 && d8 < (plain ? 0.04 : 0.02));
+    }
+  }
 
   // AND UNDER A LoRA. The ANE stages the adapter beside the weight, and
   // linear_in is [gate | up] in one matrix, so the up half's B rows are

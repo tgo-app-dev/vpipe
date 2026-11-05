@@ -105,6 +105,35 @@ struct AneGraphSpec {
   // bu [1,N] and bd [1,K], each added to its projection's output -- for a
   // feed-forward whose Linears carry biases.
   bool biases = false;
+  // ROTATED INT8 (W8A8), with runtime_weights and weights_out_in, for
+  // Matmul and SwiGluFfn without biases, every reduction width a multiple
+  // of 256. Each weight is an int8 INPUT [out, in] whose rows were
+  // Walsh-Hadamard rotated per 256-block of their K and quantized each to
+  // its own step, beside an fp16 input [1, out] of 128 x those steps
+  // (input_features names them); each projection's input is rotated by
+  // the same transform INSIDE the graph and quantized per token there --
+  // the GPU's `token` tier's arithmetic. x and the output stay fp16. The
+  // graph uses the iOS 26 generation's opset (`ios19`), so it loads only
+  // where CoreML takes int8 arrays (macOS 26 and later). MEASURED on
+  // MiniMax-H3's feed-forward (5376 -> 14336, 2048 rows, 1024 tiles), M4
+  // Pro: 14.3 TOP/s against the fp16 form's 9.6, and on real activations
+  // the GPU token tier's error to two digits.
+  bool int8 = false;
+  // With int8: no rotation -- the weights quantized per row as stored and
+  // each input per token as it is, the GPU's `token_plain` arithmetic.
+  // The widths need not be multiples of 256 then.
+  bool int8_plain = false;
+  // With int8: GROUPED along K -- the GPU's `fast` tier's arithmetic --
+  // at this target group (256, 512 or 1024; 0 = per token). Each
+  // projection takes group_for(int8_group, its K): the largest of 1024 /
+  // 512 / 256 no larger than the target that divides K. Each group of
+  // an input is rotated whole and quantized at its own step, the
+  // weights the same per (row, group) -- their steps the [K/g, out]
+  // inputs -- and a group's product is scaled by both steps before the
+  // groups are summed: one matmul a group. Rotated (not with
+  // int8_plain).
+  int  int8_group = 0;
+  static int group_for(int target, int K) noexcept;
 
   bool valid() const;
 };
@@ -125,10 +154,12 @@ class AneEmitter {
   static const char* input_name() noexcept { return "x"; }
   static std::string output_name(const AneGraphSpec& s);
 
-  // One fp16 array in a model's interface.
+  // One array in a model's interface: fp16, or int8 (CoreML's
+  // MLMultiArrayDataTypeInt8, macOS 26 and later).
   struct Feature {
     std::string               name;
     std::vector<std::int64_t> shape;
+    bool                      int8 = false;
   };
 
   // Where write_bundle() puts each slab's ENTRY HEADER, for slabs of
@@ -156,7 +187,9 @@ class AneEmitter {
   // The model's inputs in declaration order: `x` [M,K], then for a
   // runtime-weight graph one matrix per projection, [in,out] -- Matmul
   // `w` [K,N]; SwiGluFfn `wg` [K,N], `wu` [K,N], `wd` [N,K] -- or each of
-  // those transposed when weights_out_in.
+  // those transposed when weights_out_in. An int8 graph's matrices are
+  // int8 and followed, in the same order, by one fp16 [1, out] row of
+  // steps a projection: `w_s`, or `wg_s`, `wu_s`, `wd_s`.
   static std::vector<Feature> input_features(const AneGraphSpec& s);
 
   // Write a complete .mlmodelc into `dir` (created, replacing any

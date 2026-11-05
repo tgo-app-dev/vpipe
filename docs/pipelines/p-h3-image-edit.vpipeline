@@ -1,0 +1,140 @@
+{
+  "id": "p-h3-image-edit",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "PrunaAI/P-H3-Image-no-dit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "Put the cat on a red velvet armchair in a sunlit library, keeping its face, fur and pose."
+      }
+    },
+    {
+      "id": "load-picture",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": "minimax-h3-reference-subject.jpg"
+      }
+    },
+    {
+      "id": "video-ref-encoder",
+      "type": "video-ref-encoder",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "load-picture",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "lora": "PrunaAI/P-H3-Image-lora",
+        "lora_scale": 1.0
+      }
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "video-ref-encoder",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "video-ref-encoder",
+          "oport": 1
+        },
+        {
+          "src": "video-ref-encoder",
+          "oport": 2
+        },
+        {
+          "src": "minimax-h3-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "seed": 42,
+        "i8_gemm": true,
+        "dit_dir": "local/MiniMax-H3-FL2VA-8bit",
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "p-h3-image-edit.png"
+      }
+    }
+  ],
+  "subpipelines": []
+}

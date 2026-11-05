@@ -87,6 +87,8 @@ model, not by the pipeline.
 | `generate-image` | `seed` | a seed reproduces BFL's own reference sampler's noise bit for bit |
 | `generate-image` | `steps` | default: the checkpoint's 16 |
 | `generate-image` | `ane_ffn` | the joint blocks' feed-forward on the ANE — see below |
+| `generate-image` | `ane_int8` | that feed-forward in rotated int8 rather than fp16: the ANE runs faster, its rows lossier; needs `ane_ffn` and macOS 26 |
+| `generate-image` | `ane_int8_tier` | which int8: `token` (default) or `token_plain`, unrotated, lossier still |
 | `generate-image` | `sol_attn` | approximate sparse attention — see below |
 | `flux3-model-config` | `alpha` | the schedule's shape, `t = a s / (1 + (a - 1) s)`; default the checkpoint's 6.93 |
 | `flux3-model-config` | `lora` .. `lora8` | runtime LoRA, live strengths; diffusers module names |

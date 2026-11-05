@@ -2219,6 +2219,8 @@ MetalFlux3Transformer::ane_setup_(int seq)
   o.seq     = seq;
   o.rows    = _cfg.ane_rows;
   o.chunk   = ane_chunk_rows();
+  o.int8    = _cfg.ane_int8;
+  o.int8_plain = _cfg.ane_int8_plain;
   o.profile = std::getenv("VPIPE_FLUX3_ANE_PROFILE") != nullptr;
   _ane = AneFeedForward::create(o);
   return _ane != nullptr;

@@ -1908,8 +1908,16 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // included.
       // The released decoder's clip (bf16) and the chunk it works in
       // beside it -- its tiles, their stitch, its ViT scratch.
+      // A single-frame-only decoder (P-H3-Image's) states its picture's
+      // working set -- the tiles, their stitch, a tile's ViT scratch --
+      // which is the figure generate-video's plan booked for it.
+      const bool image_only =
+          !_h3_fast && !_h3_vae->config().decodes_video();
       const std::size_t need =
           (_h3_fast ? _h3_fast->scratch_bytes(LT, lh, lw)
+           : image_only
+               ? genai::MetalMiniMaxH3VideoVae::decode_working_bytes(
+                     _h3_vae->config(), 1, lh, lw)
            : one_frame
                ? px * 3 * 2
                : genai::MetalMiniMaxH3VideoVae::decode_video_bytes(

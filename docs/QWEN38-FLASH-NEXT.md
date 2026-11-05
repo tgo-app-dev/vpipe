@@ -44,7 +44,7 @@ experts w4g32, shared expert w8g32 (fused decode); MTP head: fc dense, ...`.
 | | |
 |---|---|
 | **Machine** | Apple Silicon Mac (M-series). |
-| **Memory** | 64 GB is comfortable. The model never holds all of itself: the n-gram table is read a row at a time from disk, and the routed experts (83 GB) live in a cache sized to the box -- the most-selected kept, the rest read from disk when a token picks them. Everything else is ~6 GB. |
+| **Memory** | 64 GB is comfortable. The model need not hold all of itself: the n-gram table is read a row at a time from disk (or held in memory with `ngram_resident` where everything fits), and the routed experts (83 GB) live in a cache sized to the box -- the most-selected kept, the rest read from disk when a token picks them. Everything else is ~6 GB. |
 | **Disk** | **~130 GB**, on the internal SSD: a token that misses the expert cache reads from the drive, so the drive's speed is the decode's speed. |
 | **Hugging Face** | Nothing. The repo is public and needs no account or token. |
 
@@ -120,6 +120,16 @@ vision tower runs, which the chat books when it starts.
 - **Precision.** `compute_dtype: bf16` is the model's own. `f16` measured
   closer to the full-precision reference on every check here (its values
   stay far inside f16's range).
+- **The n-gram table in memory** (`ngram_resident`, off by default). A
+  prompt's n-gram rows are read from disk: a few hundred thousand small
+  reads, most of them hidden under the GPU's work, but the first part of a
+  long prompt waits for its own. With `ngram_resident: true` the table
+  (38 GB in the oQ5e pack) is held in memory instead -- filled after the
+  model loads, so loading takes no longer -- and the rows come from there.
+  It is taken only where the model with every expert in memory and the
+  table fit the machine (and `memory_limit_mb` / `expert_cache_mb`, when
+  set); otherwise the rows stay on disk, and the load says which. The
+  output is the same either way.
 
 ## Faster decoding: the DFlash 2 drafter
 
@@ -186,7 +196,18 @@ count that measured fastest there):
 | the same summary asked of that document four times over (29,000 tokens) | 81.0 tok/s | 104.2 tok/s |
 | copying a 3,000-character passage it was given, one word changed | 79.7 tok/s | 184.6 tok/s (118.0 without context copy) |
 
-A 29,000-token prompt is read at about 2,900 tok/s. The DFlash 2 drafter
+Reading a prompt there (bf16, the prompt's tokens real text):
+
+| prompt | the n-gram table from disk | `ngram_resident: true` |
+|---:|---:|---:|
+| 4,096 tokens | 2,924 tok/s | 4,648 tok/s |
+| 8,192 tokens | 3,196 tok/s | 5,012 tok/s |
+| 16,384 tokens | 3,920 tok/s | 4,951 tok/s |
+| 20,000 tokens | 4,037 tok/s | 4,879 tok/s |
+| 32,768 tokens | 4,360 tok/s | 4,967 tok/s |
+
+The table in memory adds 36 GB to what the model holds (86 -> 122 GB
+there) and fills in about 10 s after the load. The DFlash 2 drafter
 decodes the story at 89.4 tok/s and the 7,257-token summary at 66.2: with
 every expert in memory the draft head is the faster drafter, and the
 DFlash drafter's own attention over a long context costs it most.

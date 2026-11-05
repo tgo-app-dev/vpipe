@@ -2680,6 +2680,8 @@ MetalFlux2Transformer::ane_setup_(int image_rows, int joint_rows)
     o.rows    = _cfg.ane_rows;
     o.chunk   = ane_chunk_for_(rows, _cfg.ane_rows);
     o.matmul  = matmul;
+    o.int8    = _cfg.ane_int8;
+    o.int8_plain = _cfg.ane_int8_plain;
     o.profile = prof;
     return AneFeedForward::create(o);
   };

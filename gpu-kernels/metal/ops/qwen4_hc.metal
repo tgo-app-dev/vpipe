@@ -175,6 +175,105 @@ kernel void hc_group_rms8_f16(
   }
 }
 
+// hc_group_rms8_f16 with the two passes beside it in a PREFILL folded in
+// (dense_gemm_mma.metal's hc_down_silu / hc_up_mix GEMMs run the rest):
+//   * the last sublayer's PENDING injection, X += inj * y (hc_inject_f16's
+//     arithmetic), written back as the row is read -- X is read once;
+//   * the block's INJECT projection, a partial a stream: part[m, s, j] =
+//     sum over this stream's H of n[h] * Wi[j, s H + h], Wi the w8 inject
+//     rows (scale * code + bias in f32, as a GEMV reads them), the f32 sums
+//     in this kernel's order -- hc_down_silu finishes them. The normed rows
+//     are not read again for it.
+// grid {64, S, M}, tg {64, 1, 1}. H % 8 == 0, H <= 64 * 8 * kRms8.
+kernel void hc_group_rms8_pre_f16(
+    device VPIPE_ELT*        x    [[buffer(0)]],   // X [M, S*H]
+    const device float*      w    [[buffer(1)]],   // [S*H] = 1 + weight
+    device VPIPE_ELT*        y    [[buffer(2)]],   // n [M, S*H]
+    constant int&            H    [[buffer(3)]],
+    constant int&            S    [[buffer(4)]],
+    constant float&          eps  [[buffer(5)]],
+    const device VPIPE_ELT*  py   [[buffer(6)]],   // pending y [M, H]
+    const device float*      pinj [[buffer(7)]],   // its weights [M, S]
+    constant int&            pend [[buffer(8)]],
+    const device uint8_t*    iw   [[buffer(9)]],   // inject rows [S, S*H]
+    const device VPIPE_ELT*  is   [[buffer(10)]],  // [S, S*H / G]
+    const device VPIPE_ELT*  ib   [[buffer(11)]],
+    device float*            part [[buffer(12)]],  // [M, S, S]
+    constant int&            with_inject [[buffer(13)]],
+    constant int&            G    [[buffer(14)]],
+    uint3 tg   [[threadgroup_position_in_grid]],
+    uint3 tp   [[thread_position_in_threadgroup]],
+    uint  sid  [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  constexpr int NT = 64;
+  threadgroup float red[32];
+  threadgroup float red4[2][8];
+  const uint tid = tp.x;
+  const int m = (int)tg.z, s = (int)tg.y;
+  const ulong base = ((ulong)m * (ulong)S + (ulong)s) * (ulong)H;
+  const device float* ws = w + (ulong)s * (ulong)H;
+  const int nv = H / 8;
+  vec<VPIPE_ELT, 8> v[kRms8];
+  const float wj = pend != 0 ? pinj[(ulong)m * S + s] : 0.0f;
+  float ss = 0.0f;
+  for (int j = 0; j < kRms8; ++j) {
+    const int i = (int)tid + j * NT;
+    if (i < nv) {
+      v[j] = *(const device vec<VPIPE_ELT, 8>*)(x + base + (ulong)i * 8);
+      if (pend != 0) {
+        const vec<VPIPE_ELT, 8> yv = *(const device vec<VPIPE_ELT, 8>*)(
+            py + (ulong)m * H + (ulong)i * 8);
+        for (int c = 0; c < 8; ++c) {
+          const float add = (float)(VPIPE_ELT)(wj * (float)yv[c]);
+          v[j][c] = (VPIPE_ELT)((float)v[j][c] + add);
+        }
+        *(device vec<VPIPE_ELT, 8>*)(x + base + (ulong)i * 8) = v[j];
+      }
+      for (int c = 0; c < 8; ++c) {
+        const float f = (float)v[j][c];
+        ss += f * f;
+      }
+    }
+  }
+  const float tot = tg_sum_(ss, red, tid, sid, lane, NT / 32);
+  const float r = metal::rsqrt(tot / (float)H + eps);
+  const ulong SH = (ulong)S * (ulong)H;
+  float ip[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  for (int j = 0; j < kRms8; ++j) {
+    const int i = (int)tid + j * NT;
+    if (i < nv) {
+      vec<VPIPE_ELT, 8> o;
+      for (int c = 0; c < 8; ++c) {
+        o[c] = (VPIPE_ELT)((float)v[j][c] * r * ws[i * 8 + c]);
+      }
+      *(device vec<VPIPE_ELT, 8>*)(y + base + (ulong)i * 8) = o;
+      if (with_inject != 0) {
+        const ulong k0 = (ulong)s * H + (ulong)i * 8;   // within a row
+        for (int jo = 0; jo < S; ++jo) {
+          const ulong g = ((ulong)jo * SH + k0) / (ulong)G;
+          const float sc = (float)is[g], bi = (float)ib[g];
+          const device uint8_t* q = iw + (ulong)jo * SH + k0;
+          float a = 0.0f;
+          for (int c = 0; c < 8; ++c) {
+            a += (float)o[c] * (sc * (float)q[c] + bi);
+          }
+          ip[jo] += a;
+        }
+      }
+    }
+  }
+  if (with_inject == 0) { return; }
+  for (int jo = 0; jo < S; ++jo) {
+    const float t = simd_sum(ip[jo]);
+    if (lane == 0) { red4[sid][jo] = t; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < (uint)S) {
+    part[((ulong)m * S + s) * S + tid] = red4[0][tid] + red4[1][tid];
+  }
+}
+
 // The down output d [M, R] <- silu(d / S) in place (the up projection's
 // input), and the injection weights inj[m, s] = 2 sigmoid(ir[m, s] / S) in
 // f32 from the inject output ir [M, S] (empty on the final mixer: S rows of

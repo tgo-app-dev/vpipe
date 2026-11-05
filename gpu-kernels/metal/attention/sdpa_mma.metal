@@ -1278,6 +1278,266 @@ kernel void qsa_attn_nax_f16(
   }
 }
 
+// qsa_attn_nax_f16 built for OCCUPANCY (after omlx's qsa_nax.py, Apache-2.0:
+// one query a threadgroup, two simdgroups splitting the head dim, 32 keys a
+// step). The kernel above stages each BK keys through 24 KB of threadgroup
+// memory behind four barriers, one threadgroup a core at a time: the key
+// walk is latency-bound, ~0.9 TB/s of gathered K/V on an M5 Ultra. Here a
+// threadgroup is 64 threads holding 8 KB: each simdgroup owns 128 of the 256
+// dims of Q K^T and of P V (MLX's head-dim split), each lane reads its four
+// key rows of K and V straight from the paged pool into the matmul's
+// operand registers, and the halves' partial scores meet in threadgroup
+// memory -- double-buffered, one barrier a step. Q is re-read each step
+// (L1) rather than held, S and O stay in cooperative tensors, and O is
+// rescaled only when a row's max moved. P enters P V in the element type
+// and the row's sum is taken over THOSE values, as above. The grid runs a
+// kv head's ROWS consecutively: neighbouring rows pick mostly the same
+// keys, so threadgroups in flight together share them in the caches --
+// worth 1.4x by itself (2048 rows, base M5: 39.2 ms kv heads fastest, 28.0
+// rows fastest, against the kernel above's 67.4; Q held in registers
+// instead of re-read lost 5% there).
+//
+// The registers are MLX's NAX fragments (steel/attn/nax.h): a lane holds
+// rows fm, fm + 8 x columns fn .. fn + 3 of a 16x16 fragment, a tensor's
+// fragments N-fastest. Its rows are the group's q-heads (those past G
+// zero), S's columns this step's keys. Head dims are permuted per lane --
+// a 32-dim chunk's K (or N) index fn + j is dim 2 fn + j, 16 + fn + j is
+// 2 fn + 4 + j -- so one 16-byte load feeds both fragments; Q and K share
+// the permutation (only the sum's order moves) and O's store undoes V's.
+//
+// uniform: every page of the table full and in position order but the last
+// (a key's page is pos / page_tokens), else 0 (a search a key).
+// grid {64, rows, Hkv}, tg {64, 1, 1}. D == 256, Hq / Hkv <= 16.
+kernel void qsa_attn_nax2_f16(
+    const device VPIPE_ELT* qt    [[buffer(0)]],   // [Hq, n, D]
+    const device VPIPE_ELT* kp    [[buffer(1)]],
+    const device VPIPE_ELT* vp    [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],   // [Hq, n, D]
+    const device int*       pt    [[buffer(4)]],
+    const device int*       sel   [[buffer(5)]],
+    const device int*       nsel  [[buffer(6)]],
+    constant float& scale        [[buffer(7)]],
+    constant int& D              [[buffer(8)]],
+    constant int& Hq             [[buffer(9)]],
+    constant int& Hkv            [[buffer(10)]],
+    constant int& n              [[buffer(11)]],
+    constant int& page_tokens    [[buffer(12)]],
+    constant int& n_pages        [[buffer(13)]],
+    constant int& width          [[buffer(14)]],
+    constant int& r0             [[buffer(15)]],
+    constant int& uniform        [[buffer(16)]],
+    uint3  tg   [[threadgroup_position_in_grid]],
+    ushort sg   [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+  using T = VPIPE_ELT;
+  using V8 = vec<T, 8>;
+  constexpr int SB = 32;                  // keys a step
+  threadgroup float xchg[2][2][16 * 32];  // [step parity][simdgroup]
+  const int r = (int)tg.y, kvh = (int)tg.z, row = r0 + r;
+  const int G = Hq / Hkv;
+  const short qid = (short)(lane >> 2);
+  const short fm = (qid & 4) | ((short)(lane >> 1) & 3);
+  const short fn = ((qid & 2) | ((short)lane & 1)) * 4;
+  const bool q0_ok = fm < G, q1_ok = fm + 8 < G;
+  const int dh = (int)sg * 128 + 2 * fn;
+  const device T* qp0 =
+      qt + ((ulong)(kvh * G + (q0_ok ? fm : 0)) * n + row) * D + dh;
+  const device T* qp1 =
+      qt + ((ulong)(kvh * G + (q1_ok ? fm + 8 : 0)) * n + row) * D + dh;
+  const device int* srow = sel + (ulong)r * width;
+  const int m = nsel[r];
+  const int nsteps = (m + SB - 1) / SB;
+  // A key's K / V row for this lane's dims; past the list it re-reads the
+  // last key (P = 0 must never meet unwritten V: 0 * NaN).
+  auto row_at = [&](int j) -> ulong {
+    const int p = srow[min(j, m - 1)];
+    int page, slot;
+    if (uniform != 0) {
+      const int lp = p / page_tokens;
+      page = pt[lp * 3];
+      slot = p - lp * page_tokens;
+    } else {
+      const QnLoc l = qn_locate_(pt, n_pages, p);
+      page = l.page;
+      slot = l.slot;
+    }
+    return (((ulong)page * Hkv + kvh) * page_tokens + slot) * (ulong)D + dh;
+  };
+  constexpr auto qk_desc = matmul2d_descriptor(
+      16, 32, 32, false, true, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<qk_desc, execution_simdgroup> qk_op;
+  constexpr auto pv_desc = matmul2d_descriptor(
+      16, 32, 32, false, false, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<pv_desc, execution_simdgroup> pv_op;
+  auto qa_ct = qk_op.template get_left_input_cooperative_tensor<T, T, float>();
+  auto kb_ct = qk_op.template get_right_input_cooperative_tensor<T, T, float>();
+  using qa_t = remove_addrspace_t<decltype(qa_ct)>;
+  using kb_t = remove_addrspace_t<decltype(kb_ct)>;
+  auto pa_ct = pv_op.template get_left_input_cooperative_tensor<T, T, float>();
+  auto vb_ct = pv_op.template get_right_input_cooperative_tensor<T, T, float>();
+  using pa_t = remove_addrspace_t<decltype(pa_ct)>;
+  using vb_t = remove_addrspace_t<decltype(vb_ct)>;
+  // O over this half's 128 dims: o<c> the c-th 32-dim chunk.
+  using o_t = decltype(
+      pv_op.template get_destination_cooperative_tensor<pa_t, vb_t, float>());
+  o_t o0 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t,
+                                                             float>();
+  o_t o1 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t,
+                                                             float>();
+  o_t o2 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t,
+                                                             float>();
+  o_t o3 = pv_op.template get_destination_cooperative_tensor<pa_t, vb_t,
+                                                             float>();
+  for (short i = 0; i < 16; ++i) {
+    o0[i] = 0.0f; o1[i] = 0.0f; o2[i] = 0.0f; o3[i] = 0.0f;
+  }
+  const float scale2 = scale * 1.44269504089f;
+  float mrow[2] = {-INFINITY, -INFINITY};
+  float lrow[2] = {0.0f, 0.0f};
+  // This lane's key rows of a step: keys fm, fm + 8, fm + 16, fm + 24.
+  ulong ko[4] = {0, 0, 0, 0};
+  if (nsteps > 0) {
+    for (short k = 0; k < 4; ++k) { ko[k] = row_at(fm + 8 * k); }
+  }
+  for (int c = 0; c < nsteps; ++c) {
+    ulong kc[4];
+    for (short k = 0; k < 4; ++k) { kc[k] = ko[k]; }
+    if (c + 1 < nsteps) {
+      for (short k = 0; k < 4; ++k) {
+        ko[k] = row_at((c + 1) * SB + fm + 8 * k);
+      }
+    }
+    // S = Q K^T over this half: a 16x32x32 op a 32-dim chunk.
+    auto s_ct =
+        qk_op.template get_destination_cooperative_tensor<qa_t, kb_t, float>();
+    for (short i = 0; i < 16; ++i) { s_ct[i] = 0.0f; }
+    for (short jj = 0; jj < 4; ++jj) {
+      const V8 qa = q0_ok ? *(const device V8*)(qp0 + 32 * jj) : V8(0);
+      const V8 qb = q1_ok ? *(const device V8*)(qp1 + 32 * jj) : V8(0);
+      V8 a[4];
+      for (short k = 0; k < 4; ++k) {
+        a[k] = *(const device V8*)(kp + kc[k] + 32 * jj);
+      }
+      for (short j = 0; j < 4; ++j) {
+        qa_ct[j] = qa[j];
+        qa_ct[4 + j] = qb[j];
+        qa_ct[8 + j] = qa[4 + j];
+        qa_ct[12 + j] = qb[4 + j];
+        kb_ct[j] = a[0][j];
+        kb_ct[4 + j] = a[1][j];
+        kb_ct[8 + j] = a[2][j];
+        kb_ct[12 + j] = a[3][j];
+        kb_ct[16 + j] = a[0][4 + j];
+        kb_ct[20 + j] = a[1][4 + j];
+        kb_ct[24 + j] = a[2][4 + j];
+        kb_ct[28 + j] = a[3][4 + j];
+      }
+      qk_op.run(qa_ct, kb_ct, s_ct);
+    }
+    // The other half's partial scores (a + b == b + a: both simdgroups
+    // hold the same S).
+    threadgroup float* mine = xchg[c & 1][sg];
+    const threadgroup float* peer = xchg[c & 1][sg ^ 1];
+    for (short i = 0; i < 16; ++i) { mine[i * 32 + lane] = s_ct[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s[16];
+    for (short i = 0; i < 16; ++i) {
+      // Element i: fragment i / 8 (keys 16 (i / 8) ..), row i % 8 / 4 (fm
+      // or fm + 8), column fn + i % 4.
+      const int key = c * SB + 16 * (i >> 3) + fn + (i & 3);
+      s[i] = key < m ? (s_ct[i] + peer[i * 32 + lane]) * scale2 : -INFINITY;
+    }
+    float fac[2];
+    for (short h = 0; h < 2; ++h) {
+      float cm = -INFINITY;
+      for (short f = 0; f < 2; ++f) {
+        for (short j = 0; j < 4; ++j) {
+          cm = metal::max(cm, s[8 * f + 4 * h + j]);
+        }
+      }
+      cm = metal::max(cm, simd_shuffle_xor(cm, (ushort)1));
+      cm = metal::max(cm, simd_shuffle_xor(cm, (ushort)8));
+      const float mnew = metal::max(mrow[h], cm);
+      float rs = 0.0f;
+      for (short f = 0; f < 2; ++f) {
+        for (short j = 0; j < 4; ++j) {
+          const int i = 8 * f + 4 * h + j;
+          const T pe = (T)metal::exp2(s[i] - mnew);
+          pa_ct[i] = pe;
+          rs += (float)pe;
+        }
+      }
+      rs += simd_shuffle_xor(rs, (ushort)1);
+      rs += simd_shuffle_xor(rs, (ushort)8);
+      fac[h] = metal::exp2(mrow[h] - mnew);
+      mrow[h] = mnew;
+      lrow[h] = lrow[h] * fac[h] + rs;
+    }
+    if (simd_any(fac[0] != 1.0f || fac[1] != 1.0f)) {
+      for (short f = 0; f < 2; ++f) {
+        for (short j = 0; j < 4; ++j) {
+          o0[8 * f + j] *= fac[0]; o0[8 * f + 4 + j] *= fac[1];
+          o1[8 * f + j] *= fac[0]; o1[8 * f + 4 + j] *= fac[1];
+          o2[8 * f + j] *= fac[0]; o2[8 * f + 4 + j] *= fac[1];
+          o3[8 * f + j] *= fac[0]; o3[8 * f + 4 + j] *= fac[1];
+        }
+      }
+    }
+    // O += P V: per 32-dim chunk one 16x32x32 op over the step's keys.
+    for (short id = 0; id < 4; ++id) {
+      V8 b[4];
+      for (short k = 0; k < 4; ++k) {
+        b[k] = *(const device V8*)(vp + kc[k] + 32 * id);
+      }
+      for (short j = 0; j < 4; ++j) {
+        vb_ct[j] = b[0][j];
+        vb_ct[4 + j] = b[1][j];
+        vb_ct[8 + j] = b[0][4 + j];
+        vb_ct[12 + j] = b[1][4 + j];
+        vb_ct[16 + j] = b[2][j];
+        vb_ct[20 + j] = b[3][j];
+        vb_ct[24 + j] = b[2][4 + j];
+        vb_ct[28 + j] = b[3][4 + j];
+      }
+      if (id == 0) {
+        pv_op.run(pa_ct, vb_ct, o0);
+      } else if (id == 1) {
+        pv_op.run(pa_ct, vb_ct, o1);
+      } else if (id == 2) {
+        pv_op.run(pa_ct, vb_ct, o2);
+      } else {
+        pv_op.run(pa_ct, vb_ct, o3);
+      }
+    }
+  }
+  for (short h = 0; h < 2; ++h) {
+    if (!(h == 0 ? q0_ok : q1_ok)) { continue; }
+    const float inv = lrow[h] > 0.0f ? 1.0f / lrow[h] : 0.0f;
+    device T* op = out + ((ulong)(kvh * G + fm + 8 * h) * n + row) * D + dh;
+    for (short id = 0; id < 4; ++id) {
+      V8 w;
+      for (short j = 0; j < 4; ++j) {
+        float e0, e1;
+        if (id == 0) {
+          e0 = o0[4 * h + j]; e1 = o0[8 + 4 * h + j];
+        } else if (id == 1) {
+          e0 = o1[4 * h + j]; e1 = o1[8 + 4 * h + j];
+        } else if (id == 2) {
+          e0 = o2[4 * h + j]; e1 = o2[8 + 4 * h + j];
+        } else {
+          e0 = o3[4 * h + j]; e1 = o3[8 + 4 * h + j];
+        }
+        w[j] = (T)(e0 * inv);
+        w[4 + j] = (T)(e1 * inv);
+      }
+      *(device V8*)(op + 32 * id) = w;
+    }
+  }
+}
+
 #else
 // Tensor ops unavailable for this target: stubs so the metallib still builds.
 kernel void sdpa_mma_f16(device VPIPE_ELT* out [[buffer(3)]],
@@ -1320,5 +1580,8 @@ kernel void sdpa_causal_mma2_d64_f16(device VPIPE_ELT* out [[buffer(3)]],
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 kernel void qsa_attn_nax_f16(device VPIPE_ELT* out [[buffer(3)]],
                              uint t [[thread_position_in_grid]])
+{ if (t == 0) { out[0] = (VPIPE_ELT)0; } }
+kernel void qsa_attn_nax2_f16(device VPIPE_ELT* out [[buffer(3)]],
+                              uint t [[thread_position_in_grid]])
 { if (t == 0) { out[0] = (VPIPE_ELT)0; } }
 #endif

@@ -19,6 +19,7 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/wan/metal-wan-transformer.h"
 #include "stages/latent-preview.h"
@@ -470,6 +471,15 @@ private:
   // would describe neither.
   genai::MetalWanTransformer::GenerationParams _wan_params;
   genai::MetalMiniMaxH3Transformer::GenerationParams _h3_params;
+  // P-H3-Image (generative-models/minimax-h3/p-h3-image.h): an H3 IMAGE
+  // model -- one latent frame, two discarded audio latents, the
+  // manifest's grid unshifted, no soundtrack out. Set by resolve_config_
+  // from the root's manifest.
+  bool _ph3 = false;
+  genai::ph3::Manifest _ph3_manifest;
+  // Whether the graph named a canvas (`width` / `height`): P-H3-Image
+  // defaults text-to-image to 2912x2912 and an edit to its picture's.
+  bool _size_set = false;
   // Re-parse `_model_cfg` into the family that is now resident, and
   // reconcile it with what the checkpoint itself says. Called whenever
   // either input changes -- a new config beat, or a model that just

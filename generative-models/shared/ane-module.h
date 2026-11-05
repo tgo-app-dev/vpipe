@@ -130,7 +130,8 @@ parse_weight_blob(const std::string&          weight_bin_path,
                   std::string*                err);
 
 // The IOSurface-backed fp16 buffers a RUNTIME-weight module reads its
-// matrices from, one per declared weight input, shaped to match.
+// matrices from, one per declared weight input, shaped to match -- int8
+// (8-bit pixel buffers) for a rotated int8 graph's matrices.
 //
 // Why pixel buffers rather than host memory: the module stages its
 // weight inputs into wired memory either way (a fixed cost per MODEL, not
@@ -153,9 +154,11 @@ class AneWeightSlots {
   std::size_t count() const noexcept { return _pb.size(); }
   int rows(std::size_t i) const noexcept { return _rows[i]; }
   int cols(std::size_t i) const noexcept { return _cols[i]; }
+  // Whether slot i holds int8 elements (else fp16).
+  bool int8(std::size_t i) const noexcept { return _i8[i]; }
   // Opaque CVPixelBufferRef for slot i.
   void* pixel_buffer(std::size_t i) const noexcept { return _pb[i]; }
-  // fp16 bytes across every slot.
+  // Element bytes across every slot.
   std::size_t bytes() const noexcept;
 
   // Lock slot i and hand `fill` its base address and BYTES PER ROW,
@@ -169,6 +172,7 @@ class AneWeightSlots {
   AneWeightSlots() = default;
   std::vector<void*> _pb;
   std::vector<int>   _rows, _cols;
+  std::vector<bool>  _i8;
 };
 
 class AneModule {

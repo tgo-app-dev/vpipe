@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -116,6 +117,15 @@ inline constexpr std::string_view kMemoryLimitMb = "memory_limit_mb";
 // cache key, as kMemoryLimitMb: a model loaded already is handed over at
 // the size it was loaded at, and the plan books it at what it holds.
 inline constexpr std::string_view kExpertCacheMb = "expert_cache_mb";
+// bool: a model with an n-gram embedding table read by row from disk
+// (Qwen3.8-Flash-Next's, tens of GB) holds it in memory instead -- filled
+// after the load, so loading takes no longer, and a prompt's rows then
+// come from memory rather than a few hundred thousand disk reads. Taken
+// only where the model with every routed expert resident and the table
+// fit (within kMemoryLimitMb and kExpertCacheMb as well); otherwise the
+// rows are read from disk as without it. Absent / false: from disk. Not
+// part of the cache key, as kMemoryLimitMb.
+inline constexpr std::string_view kNgramResident = "ngram_resident";
 }  // namespace load_spec
 
 // Session-shared cache of loaded language models. Two loads with the
@@ -273,6 +283,17 @@ public:
     double      seconds  = 0;
   };
   std::vector<WarmUsage> warm_report() const;
+  // The same report, with what each hold HOLDS beside it in `held`, one
+  // entry an entry of the report and in its order: a language model's
+  // whole hold as a launch weighs it beside itself (warm_held_bytes, but
+  // of THIS hold -- two loads of one directory under other settings are
+  // two holds) -- its wired bytes, what a full pool left unwired, what it
+  // filled after its load (an n-gram table held in memory, never wired);
+  // nullopt where nothing counted it (a model that loaded unwired) and
+  // for a model a stage built. Taken under the one lock the report is.
+  // Host-only, as warm_held_bytes: no symbol, the report's type unchanged.
+  __attribute__((visibility("hidden"))) std::vector<WarmUsage>
+  warm_report(std::vector<std::optional<std::size_t>>* held) const;
 
   template <class T>
   std::shared_ptr<T>
@@ -1300,9 +1321,10 @@ private:
   // Models loaded with load_spec::kWireWeights and the bytes their load
   // left wired, charged to the pool; given back once the model is gone
   // (checked at each load, keep_warm, release and expiry). `held`: what
-  // it holds (warm_held_bytes) -- its wired bytes and what a full pool
-  // kept unwired, which counts the load's freed temporaries too: a bound
-  // from above. Guarded by _warm_mu.
+  // it holds (warm_held_bytes) -- its wired bytes, what a full pool
+  // kept unwired, which counts the load's freed temporaries too (a bound
+  // from above), and what it fills after the load
+  // (LoadedLanguageModel::filled_after_load_bytes). Guarded by _warm_mu.
   struct Wired {
     std::weak_ptr<LoadedLanguageModel> lm;
     std::size_t                        bytes;

@@ -47,6 +47,13 @@ public:
                                   const std::vector<std::int32_t>& ids,
                                   const std::vector<std::int32_t>& pos, int n);
 
+  // What the model fills after its load returns (the n-gram table held
+  // in memory: MetalQwenModel::ple_table_bytes).
+  std::size_t filled_after_load_bytes() const
+  {
+    return _model != nullptr ? _model->ple_table_bytes() : 0;
+  }
+
   // The metal exec owns its own KV-page pool keyed by ContextId.
   bool owns_kv() const noexcept override { return true; }
 

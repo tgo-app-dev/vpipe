@@ -14,6 +14,7 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/weight-set.h"
 #include "stages/generation-input.h"
@@ -482,6 +483,12 @@ private:
   // A repo holding both partitions resolves by FILENAME otherwise, and
   // the filename prefers fl2va.
   std::string _partition;
+  // P-H3-Image (generative-models/minimax-h3/p-h3-image.h): an EDIT --
+  // pictures only, at most 8, sized by the manifest's area rules, the
+  // tower given its own ~1 MP copy, the posterior sampled, and the
+  // instruction prefixed "Edit <Picture 1>. ". Set at initialize.
+  bool _ph3 = false;
+  genai::ph3::Manifest _ph3_manifest;
   // The dirs the idle-unload heuristic weighs: this stage's own
   // components plus the DiT it is paired with. Filled at load.
   std::vector<std::string> _peer_dirs;

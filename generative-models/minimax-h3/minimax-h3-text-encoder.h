@@ -89,6 +89,18 @@ class MiniMaxH3TextEncoder {
     // names). Empty reads them from the encoder directory, as ever; the
     // config and the tokenizer always come from there.
     std::string weights;
+
+    // P-H3-Image's conditioning (generative-models/minimax-h3/
+    // p-h3-image.h): SEVERAL taps mapped to `text_dim` by a CONNECTOR.
+    // `taps` are HF `output_hidden_states` indices in the order their
+    // rows are concatenated -- i the output of layer i, `total_layers`
+    // the FINAL NORMED state (the model's own norm applied), never 0 --
+    // and `tap` is their deepest, the layers that run. `connector` is
+    // the PH3ImageTextConnector directory (`text_connector/`) beside the
+    // encoder, read by config_from_json. Both empty: MiniMax-H3's one
+    // raw `tap`, no connector.
+    std::vector<int> taps;
+    std::string connector;
   };
 
   // `path` may be the `text_encoder` directory, the partition root, or
@@ -273,8 +285,28 @@ class MiniMaxH3TextEncoder {
 
   const Config& config() const { return _cfg; }
 
+  // Whether this encoder conditions through a connector (P-H3-Image).
+  bool has_connector() const { return !_cfg.connector.empty(); }
+
+  // The connector over taps a caller already has -- [taps.size()][n]
+  // [hidden] bf16, the taps forward's layout, the last of them RAW when
+  // it is the normed state (it is normed here) -- into [n, text_dim]
+  // bf16. Public so a test can pin it on the reference's own hidden
+  // states. Empty on failure, with `err`.
+  metal_compute::SharedBuffer
+  connect(const metal_compute::SharedBuffer& taps, int n,
+          std::string* err = nullptr) const;
+
  private:
   MiniMaxH3TextEncoder() = default;
+
+  // The taps forward's layer list (0-indexed, after layer k) for
+  // `_cfg.tap` / `_cfg.taps`.
+  std::vector<int> tap_layers_() const;
+  // The forward's taps, as the DiT reads them: H3's one tap as it is,
+  // P-H3-Image's through the connector.
+  metal_compute::SharedBuffer
+  finish_(metal_compute::SharedBuffer h, int n, std::string* err) const;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -282,6 +314,13 @@ class MiniMaxH3TextEncoder {
   std::unique_ptr<MetalQwenModel> _lm;
   std::unique_ptr<Tokenizer> _tok;
   metal_compute::SharedBuffer _embed;
+  // P-H3-Image's connector (all f32, as stored) and the encoder's final
+  // norm, which the normed tap needs. `_conn_ws` is the connector's
+  // checkpoint, held for the buffers' lifetime.
+  std::shared_ptr<WeightSet> _conn_ws;
+  metal_compute::SharedBuffer _in_mean, _in_std, _proj, _out_mean, _out_std,
+      _sink;
+  std::vector<float> _final_norm;
 };
 
 }  // namespace genai

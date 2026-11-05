@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -136,6 +137,16 @@ class MetalMiniMaxH3VideoVae {
     // is free to park the picture somewhere else.
     bool t1_direct       = false;
     int  t1_output_slice = 0;
+    // An IMAGE-ONLY decoder (P-H3-Image's `AutoencoderKLPH3Image`): the
+    // released encoder -- byte for byte, so the latent space is H3's --
+    // with a ViT decoder retrained to expand a token into ONE pixel
+    // frame rather than `patch_t`, its rotary time PINNED where a
+    // 7-token chunk's first token sits (2 * (0.5 / 7) - 1) instead of
+    // normalized over the frames it is handed. `dec_patch_t` 0 is the
+    // video decoder's (`patch_t`); `t1_time` NaN normalizes as ever.
+    // Such a checkpoint decodes single frames only (decode_image).
+    int    dec_patch_t = 0;
+    double t1_time     = std::numeric_limits<double>::quiet_NaN();
 
     // Derived temporal-chunk geometry. `clip_length` is deliberately
     // NOT a multiple of `patch_t`, so a chunk's leading `frame_pre_pad`
@@ -165,9 +176,16 @@ class MetalMiniMaxH3VideoVae {
     // then duplicated, so the table needs rope_dim/2 entries per row.
     int rope_dim() const { return (int)((double)head_dim * rope_dim_ratio); }
     int rope_freqs() const { return rope_dim() / 6; }
+    // The pixel frames one decoder token expands to.
+    int out_patch_t() const
+    {
+      return dec_patch_t > 0 ? dec_patch_t : patch_t;
+    }
+    // Whether the decoder is the video one (decode_video runs).
+    bool decodes_video() const { return out_patch_t() == patch_t; }
     int patch_elems() const
     {
-      return out_channels * patch_t * patch * patch;   // 3072
+      return out_channels * out_patch_t() * patch * patch;   // 3072
     }
   };
 

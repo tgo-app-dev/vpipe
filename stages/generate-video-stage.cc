@@ -105,6 +105,9 @@ constexpr SpecExtra kSolThreshChoices[] = {
 constexpr SpecExtra kI8TierChoices[] = {
   {spec_key::kChoices, "accurate,fast,token,token_plain"},
 };
+constexpr SpecExtra kAneInt8TierChoices[] = {
+  {spec_key::kChoices, "token,token_plain"},
+};
 constexpr SpecExtra kSeedSequenceExtra[] = {
   {spec_key::kChoices, kSeedSequenceChoices},
 };
@@ -221,6 +224,34 @@ const ConfigKey kAttrs[] = {
           "per block, and a runtime LoRA on the feed-forward is merged "
           "into them. Implemented by MiniMax-H3; other families ignore "
           "it"},
+  {.key = "ane_int8", .type = ConfigType::Bool, .required = false,
+   .doc = "the ANE's modules in ROTATED INT8 (LOSSY, W8A8) rather than "
+          "fp16: each staged weight row Walsh-Hadamard rotated and "
+          "quantized to int8, each projection's input rotated and "
+          "quantized per token inside the module -- the arithmetic of "
+          "i8_gemm_tier `token`, on the ANE's rows. On MiniMax-H3's "
+          "feed-forward the ANE runs ~1.5x faster (M4 Pro), and its rows "
+          "come out 2.5-9x further from exact than fp16's (0.6-2.1e-2 "
+          "against 2.2-2.5e-3 on real blocks, the GPU token tier's "
+          "figure). Needs macOS 26; where the module cannot run it, the "
+          "tier keeps fp16 and says so. REQUIRES ane_ffn. Implemented by "
+          "MiniMax-H3, and handed to a registered family in its accel "
+          "settings (ane_int8_tier says which int8); VPIPE_ANE_INT8 (0 | 1 | "
+          "plain) overrides it",
+   .def_bool = false},
+  {.key = "ane_int8_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 ane_int8 runs, named as i8_gemm_tier names the "
+          "GPU's: 'token' (default; each weight row and each "
+          "projection's input Walsh-Hadamard rotated per 256 and "
+          "quantized per row / per token) or 'token_plain' (the same "
+          "unrotated: ~3x token's error on a block's output, ~1.7x on "
+          "MiniMax-H3's video, at token's speed -- the arithmetic of the "
+          "GPU's token_plain, which reads a Draw Things i8x checkpoint's "
+          "codes as stored). On a Mac with "
+          "no GPU matrix cores (the M4 series), where i8_gemm does not "
+          "run, these are the int8 flavours there are. Needs ane_int8; "
+          "VPIPE_ANE_INT8=plain forces token_plain",
+   .def_str = "token", .extra = kAneInt8TierChoices},
   {.key = "ane_qkv", .type = ConfigType::Bool, .required = false,
    .doc = "the fused q|k|v projection on the ANE too, as a SECOND module "
           "beside the feed-forward's, split the same way and sharing the "
@@ -721,6 +752,13 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _h3_lora_model_slot.fill(-1);
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Named by the GRAPH, not defaulted: the spec's 832 x 480 is what an
+  // unset key reads as.
+  _size_set = this->config().is_object() &&
+              (this->config().as_object().contains("height") ||
+               this->config().as_object().contains("width"));
+#endif
   _frames = (int)attr_int("frames");
   _fps    = attr_real("fps");
   _steps  = (int)attr_int("steps");
@@ -935,6 +973,21 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
     // Only with the feed-forward: the two modules are one booking.
     genai::accel::set_flag(&_accel, genai::accel::kAneQkv,
                            on && attr_bool("ane_qkv"));
+    genai::accel::set_flag(&_accel, genai::accel::kAneInt8,
+                           on && attr_bool("ane_int8"));
+    {
+      namespace a = genai::accel;
+      const std::string t = attr_str("ane_int8_tier");
+      const bool plain = t == a::kI8TierTokenPlain;
+      if (!t.empty() && !plain && t != a::kI8TierToken) {
+        fail_config(fmt("GenerateVideoStage('{}'): ane_int8_tier must be "
+                        "'token' or 'token_plain' (got '{}')", this->id(),
+                        t));
+      }
+      a::set_text(&_accel, a::kAneInt8Tier,
+                  std::string(plain ? a::kI8TierTokenPlain
+                                    : a::kI8TierToken));
+    }
     genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
     genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
     genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
@@ -1256,8 +1309,19 @@ GenerateVideoStage::planned_geometry_(const std::string& root, int* out_w,
     const std::string part =
         genai::MetalMiniMaxH3Transformer::partition_of_model_type(
             resolve_model(session(), _hf_dir).model_type);
-    if (genai::MetalMiniMaxH3Transformer::config_from_json(root, h3, &err,
-                                                           part)) {
+    if (genai::ph3::is_root(root)) {
+      // P-H3-Image (resolve_config_'s rule): one frame, the canvas named
+      // or 8 MP, rounded to the nearest 32. An edit's canvas is its
+      // picture's, at most the manifest's 8 MP -- which this covers.
+      frames = 1;
+      if (!_size_set) {
+        h = genai::ph3::kDefaultSide;
+        w = genai::ph3::kDefaultSide;
+      }
+      genai::ph3::round_canvas(h, w, genai::ph3::kCanvasMultiple, &h, &w);
+      known = true;
+    } else if (genai::MetalMiniMaxH3Transformer::config_from_json(
+                   root, h3, &err, part)) {
       // 17-frame chunks keeping 5 latents each, so only 17n+5 has a
       // latent form -- 9 becomes 22, which is the whole of the 2.4x.
       frames = genai::minimax_h3::align_num_frames(frames, 17, 5);
@@ -1327,10 +1391,37 @@ int
 GenerateVideoStage::h3_plan_seq_() const
 {
   int w = _width, h = _height, f = _frames;
-  (void)planned_geometry_(resolve_model_dir(session(), _hf_dir), &w, &h, &f);
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  (void)planned_geometry_(root, &w, &h, &f);
   const genai::MetalMiniMaxH3VideoVae::Config vc;
   const genai::MetalMiniMaxH3Transformer::Config tc;
   constexpr int kCondFrames = 2, kTextRows = 512;
+  // P-H3-Image: the picture, its two audio latents a channel, and -- an
+  // edit, its references wired -- the picture to edit at the canvas and
+  // its vision block in the presentation (the tower reads a ~1 MP copy:
+  // ~1000 tokens; 1061 rows MEASURED with a short instruction). More
+  // pictures are the runtime preflight's to book, at their size.
+  //
+  // THE PICTURE IS NOT ALWAYS AT THE CANVAS: video-ref-encoder holds the
+  // one edited at least at the manifest's canvas floor (4 MP) whatever
+  // canvas generate-video names -- it cannot see it -- so a smaller
+  // named canvas still carries a 4 MP picture's rows. MEASURED: a 1024^2
+  // canvas edit ran 6185 rows where the canvas alone booked 2,1xx.
+  if (genai::ph3::is_root(root)) {
+    constexpr int kPictureTokens = 1024;
+    const int gh = std::max(1, h / genai::ph3::kCanvasMultiple);
+    const int gw = std::max(1, w / genai::ph3::kCanvasMultiple);
+    const bool edit = iport_edges().size() > kRefVideoRowsPort &&
+                      iport_edges()[kRefVideoRowsPort].v != nullptr;
+    genai::ph3::Manifest man;
+    (void)genai::ph3::read_manifest(root, &man, nullptr);
+    const int cell = genai::ph3::kCanvasMultiple * genai::ph3::kCanvasMultiple;
+    const int picture =
+        std::max(gh * gw, (int)(man.canvas_min_pixels / cell));
+    return gh * gw + (edit ? picture + kPictureTokens : 0) +
+           genai::minimax_h3::kAudioChannels * genai::ph3::kAudioLatents +
+           kTextRows;
+  }
   const int lf = genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(
       vc, std::max(1, f));
   const int gh = std::max(1, (h + vc.patch - 1) / vc.patch / tc.patch_h);
@@ -1478,8 +1569,10 @@ void
 GenerateVideoStage::apply_h3_ane_()
 {
   namespace a = genai::accel;
-  _h3_cfg.ane_ffn = false;
-  _h3_cfg.ane_qkv = false;
+  _h3_cfg.ane_ffn  = false;
+  _h3_cfg.ane_qkv  = false;
+  _h3_cfg.ane_int8 = false;
+  _h3_cfg.ane_int8_plain = false;
   if (!a::flag(&_accel, a::kAneFfn)) { return; }
   const std::size_t bytes = h3_ane_bytes_();
   if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes, 1) <=
@@ -1494,6 +1587,10 @@ GenerateVideoStage::apply_h3_ane_()
   // Granted as one unit with the feed-forward, so it rides the same
   // grant rather than asking again.
   _h3_cfg.ane_qkv    = a::flag(&_accel, a::kAneQkv);
+  _h3_cfg.ane_int8   = a::flag(&_accel, a::kAneInt8);
+  _h3_cfg.ane_int8_plain =
+      _h3_cfg.ane_int8 &&
+      a::text(&_accel, a::kAneInt8Tier) == a::kI8TierTokenPlain;
   _h3_cfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
   _h3_cfg.ane_layers =
       (int)std::max<long long>(0, a::integer(&_accel, a::kAneLayers, 0));
@@ -1667,7 +1764,8 @@ GenerateVideoStage::declare_resources() const
     bool has_audio = false;
     // A MiniMax-H3 refine writes no soundtrack: it is held at the
     // silence it was conditioned on, and nothing decodes one.
-    if (_fps > 0.0 && !(fam == nullptr && refines_())) {
+    if (_fps > 0.0 &&
+        !(fam == nullptr && (refines_() || genai::ph3::is_root(root)))) {
       if (fam != nullptr) {
         has_audio = fam->audio_cost(root, af, _fps, &alat, &pcm, &aarena);
       } else {
@@ -1962,7 +2060,7 @@ GenerateVideoStage::declare_memory() const
   // describe different clips.
   m.outputs.resize(2, 0);
   m.outputs[0] = genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
-  if (_fps > 0.0 && !refines_()) {
+  if (_fps > 0.0 && !refines_() && !genai::ph3::is_root(root)) {
     const int alf = genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
         (double)af / _fps);
     std::size_t pcm = 0, aarena = 0;
@@ -2159,9 +2257,25 @@ GenerateVideoStage::resolve_config_()
   const std::string want_partition =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           _resolved.model_type);
-  if (genai::MetalMiniMaxH3Transformer::config_from_json(_root, _h3_cfg,
-                                                         &h3err,
-                                                         want_partition)) {
+  // P-H3-Image, by its manifest: an H3 IMAGE model. Its root may carry
+  // no DiT -- FL2VA's runs in its place under PrunaAI's adapter -- and
+  // then `dit_dir` names the one that runs.
+  const bool ph3 = genai::ph3::is_root(_root);
+  bool h3_found = genai::MetalMiniMaxH3Transformer::config_from_json(
+      _root, _h3_cfg, &h3err, want_partition);
+  if (!h3_found && ph3) {
+    if (_dit_dir.empty()) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): '{}' is P-H3-Image without its "
+          "transformer/: name MiniMax-H3's FL2VA DiT in dit_dir and "
+          "PrunaAI's P-H3-Image adapter in the model config's `lora`, or "
+          "fetch the transformer; inert", this->id(), _root));
+      return;
+    }
+    h3_found = genai::MetalMiniMaxH3Transformer::config_from_json(
+        h3_dit_(_root, want_partition), _h3_cfg, &h3err, want_partition);
+  }
+  if (h3_found) {
     _family = "minimax-h3";
     // A DiT named on its own is what runs, so ITS config is the one the
     // forward, the scratch and the plan are sized from. The root still
@@ -2202,6 +2316,20 @@ GenerateVideoStage::resolve_config_()
     // purpose (Ref2VA's prompt-only form).
     _h3_partition =
         genai::MetalMiniMaxH3Transformer::partition_of(_root, want_partition);
+    // P-H3-Image's DiT is FL2VA's (merged, or under the adapter): its
+    // text-to-image is t2va's layout, its edit the reference layout of
+    // Ref2VA-like (references on the FL2VA weights).
+    if (ph3) {
+      std::string merr;
+      if (!genai::ph3::read_manifest(_root, &_ph3_manifest, &merr)) {
+        session()->error(fmt("GenerateVideoStage('{}'): {}; inert",
+                             this->id(), merr));
+        _family.clear();
+        return;
+      }
+      _ph3 = true;
+      if (_h3_partition.empty()) { _h3_partition = "fl2va"; }
+    }
     // Which partition, and on whose authority. Worth a line: when a
     // directory holds both, "probed" and "the models DB" can disagree,
     // and the DB is the one that knows.
@@ -2215,7 +2343,32 @@ GenerateVideoStage::resolve_config_()
     // Now that the family is known, round the frame count UP to H3's own
     // rule (see the constructor): the video VAE takes 17-frame clips and
     // keeps 5 latents from each, so only 17n+5 has a latent form.
-    align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
+    if (_ph3) {
+      // ONE latent frame -- the picture -- whatever `frames` said.
+      _frames = 1;
+      // Text-to-image's canvas when the graph names none: 8 megapixels,
+      // 1:1, where the model works best. An edit takes its picture's
+      // instead, when the conditioning arrives (run_h3_).
+      if (!_size_set) {
+        _height = genai::ph3::kDefaultSide;
+        _width  = genai::ph3::kDefaultSide;
+      }
+      // A named canvas is rounded to the NEAREST multiples, as the
+      // reference rounds it (align_size_ below would round up).
+      int rh = 0, rw = 0;
+      genai::ph3::round_canvas(_height, _width, genai::ph3::kCanvasMultiple,
+                               &rh, &rw);
+      if (rh != _height || rw != _width) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): {}x{} -> {}x{}, P-H3-Image's sides "
+            "are multiples of {}", this->id(), _width, _height, rw, rh,
+            genai::ph3::kCanvasMultiple));
+        _height = rh;
+        _width  = rw;
+      }
+    } else {
+      align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
+    }
     // ...and the same for the frame SIZE. H3's video VAE is 16x spatial
     // and the DiT patches 2x on top, so the legal grid is 32 -- one
     // factor coarser than the multiple-of-16 a caller naturally reaches
@@ -2233,6 +2386,14 @@ GenerateVideoStage::resolve_config_()
     // NOTE: the idle-unload policy is NOT decided here. It needs the
     // streaming verdict, which only exists after the load -- see
     // resolve_unload_policy_h3_().
+    if (_ph3) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): P-H3-Image (MiniMax-H3, one latent "
+          "frame) at {}x{}, {} steps on the checkpoint's grid, no guidance",
+          this->id(), _width, _height,
+          (int)_ph3_manifest.sample_sigmas.size() - 1));
+      return;
+    }
     session()->info(fmt(
         "GenerateVideoStage('{}'): MiniMax-H3 (video+audio) at {}x{}x{} "
         "frames, {} steps, shifts {:.1f}/{:.1f}", this->id(), _width, _height,
@@ -2327,6 +2488,19 @@ GenerateVideoStage::apply_model_config_()
     _h3_params =
         genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
             _model_cfg, &perr);
+    // P-H3-Image's grid is FINAL -- the reference never shifts it
+    // (`shift_provided_sigmas` false), whatever a model config's shifts
+    // say: minimax-h3-model-config emits every key it has, so its 12 / 3
+    // defaults would read as asked for. An edit's picture rows sit at the
+    // level they were noised to, where the beat names none.
+    if (_ph3) {
+      _h3_params.video_shift = 1.0;
+      _h3_params.audio_shift = 1.0;
+      if (!_model_cfg.is_object() ||
+          !_model_cfg.as_object().contains("condition_timestep")) {
+        _h3_params.condition_timestep = genai::ph3::kConditionNoiseAug;
+      }
+    }
     // The LoRA is read here but consumed at LOAD, so a beat that names
     // one after the DiT is already built cannot take effect -- say so
     // rather than run the un-adapted model while the graph claims
@@ -4068,8 +4242,22 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // Latent geometry. The video VAE compresses 16x spatially and 4x in
   // time with the causal round-UP the encoder does, so the frame count
   // is not a plain division. A refine's is the latent's own.
-  const int lh = refine != nullptr ? refine->lh : _height / 16;
-  const int lw = refine != nullptr ? refine->lw : _width / 16;
+  int lh = refine != nullptr ? refine->lh : _height / 16;
+  int lw = refine != nullptr ? refine->lw : _width / 16;
+  // A P-H3-Image edit with no canvas named renders at its picture's size
+  // -- the first reference, which video-ref-encoder put on the canvas
+  // rule (at least the manifest's canvas_min_pixels).
+  if (_ph3 && !_size_set && refine == nullptr && r2v != nullptr &&
+      !r2v->refs.empty() && r2v->refs.front().latent_height > 0 &&
+      r2v->refs.front().latent_width > 0) {
+    lh = r2v->refs.front().latent_height;
+    lw = r2v->refs.front().latent_width;
+    if (lh * 16 != _height || lw * 16 != _width) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): the edit renders at its picture's "
+          "{}x{}", this->id(), lw * 16, lh * 16));
+    }
+  }
   // The video VAE encodes in 17-frame clips that yield 5 latent frames
   // each and then drops 3, so a request has to be snapped UP to a length
   // the chunking can actually produce. These two are the released
@@ -4077,15 +4265,17 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // changed them would want them read from video_vae/config.json rather
   // than assumed here.
   constexpr int kFramesPerChunk = 17, kLatentsPerChunk = 5;
+  // P-H3-Image's picture is ONE latent frame -- no pixel-frame count
+  // has that latent form -- beside a fixed two audio latents.
   const int aligned =
-      refine != nullptr
-          ? refine->frames
+      refine != nullptr ? refine->frames
+      : _ph3            ? 1
           : h3::align_num_frames(_frames, kFramesPerChunk, kLatentsPerChunk);
   const int lt =
-      refine != nullptr
-          ? refine->lt
-          : h3::video_latent_num_frames(aligned, kFramesPerChunk,
-                                        kLatentsPerChunk);
+      refine != nullptr ? refine->lt
+      : _ph3            ? 1
+                        : h3::video_latent_num_frames(aligned, kFramesPerChunk,
+                                                      kLatentsPerChunk);
   if (lh <= 0 || lw <= 0 || lt <= 0) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): {}x{}x{} does not give a usable "
@@ -4101,7 +4291,8 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
       refine != nullptr
           ? (int)(refine->audio_rows.size() /
                   ((std::size_t)h3::kAudioChannels * c.audio_channels))
-          : _h3_params.audio_latents(aligned, _fps);
+      : _ph3 ? genai::ph3::kAudioLatents
+             : _h3_params.audio_latents(aligned, _fps);
 
   h3::PackedLayout L;
   // Text rows are tagged 1 EXCEPT the rows of a vision block, which
@@ -4496,6 +4687,13 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   if (contract != nullptr) {
     req.num_steps = (int)contract->sigmas.size() - 1;
   }
+  // P-H3-Image's grid, AS RUN (its shifts are 1: see apply_model_config_)
+  // -- 8 forwards, whatever `steps` says. An adapter's contract or a
+  // refine would name another; neither rides this model.
+  if (_ph3 && refine == nullptr && contract == nullptr) {
+    req.sigma_grid = _ph3_manifest.sample_sigmas;
+    req.num_steps = (int)req.sigma_grid.size() - 1;
+  }
   // The re-noising sampler's fresh noise follows the clip's seed.
   req.seed = _seed;
   // VDN's hybrid attention needs the target's grid; without a branch
@@ -4521,7 +4719,8 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // forward per step. A live flow-map adapter runs its own grid, so the
   // bar starts at THAT count rather than jumping to it after step one.
   int bar_steps =
-      refine != nullptr || contract != nullptr ? req.num_steps : _steps;
+      refine != nullptr || contract != nullptr || _ph3 ? req.num_steps
+                                                       : _steps;
   if (refine == nullptr && _h3_dit->two_time_active() &&
       _h3_dit->flow_map() != nullptr &&
       !_h3_dit->flow_map()->sigmas.empty()) {
@@ -5227,7 +5426,16 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // clip that ignores its references while looking perfectly ordinary
     // -- so the log says which mode ran rather than leaving the reader
     // to infer it from the graph.
-    if (!r2v.refs.empty() && _h3_partition == "fl2va") {
+    // P-H3-Image's EDIT: the same packing, but the task its weights were
+    // trained for -- no zero-shot about it.
+    if (!r2v.refs.empty() && _ph3 && !_ref2va_like_said) {
+      _ref2va_like_said = true;
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): a P-H3-Image edit -- {} picture{} "
+          "packed ahead of the generated one, the first the one edited",
+          this->id(), r2v.refs.size(), r2v.refs.size() == 1 ? "" : "s"));
+    }
+    if (!r2v.refs.empty() && _h3_partition == "fl2va" && !_ph3) {
       if (!_ref2va_like_said) {
         _ref2va_like_said = true;
         session()->info(fmt(
@@ -5609,6 +5817,9 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       }
       co_return;
     }
+    // P-H3-Image's two audio latents are scaffolding the model was
+    // trained with, not a soundtrack: thrown away, as the reference does.
+    if (_ph3) { co_return; }
     if (ctx.num_oports() > 1 && !alat_out.empty()) {
       auto aout = std::make_unique<TensorBeatPayload>();
       aout->dtype = TensorBeat::DType::F32;

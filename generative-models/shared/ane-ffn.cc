@@ -132,6 +132,32 @@ par_for_(std::size_t n, const std::function<void(std::size_t)>& body)
                  ^(std::size_t i) { (*bp)(i); });
 }
 
+// The orthonormal Walsh-Hadamard transform over every 256-block of v,
+// in place: Sylvester's ordering (y_i = sum_j (-1)^popcount(i & j) x_j /
+// 16), the matrix the rotated int8 graph multiplies its activations by.
+// Butterflies on runs of `h` consecutive elements, which vectorize.
+void
+fwht_(float* v, std::size_t n, std::size_t b)
+{
+  // 1 / sqrt(b): 1/16 exactly at 256, the per-token tiers' block.
+  const float norm = 1.0f / std::sqrt((float)b);
+  for (std::size_t b0 = 0; b0 + b <= n; b0 += b) {
+    float* p = v + b0;
+    for (std::size_t h = 1; h < b; h <<= 1) {
+      for (std::size_t i = 0; i < b; i += 2 * h) {
+        float* a = p + i;
+        float* c = a + h;
+        for (std::size_t j = 0; j < h; ++j) {
+          const float x = a[j], y = c[j];
+          a[j] = x + y;
+          c[j] = x - y;
+        }
+      }
+    }
+    for (std::size_t i = 0; i < b; ++i) { p[i] *= norm; }
+  }
+}
+
 // ConvRot undone in place on a row of integer codes: fp8.h's
 // convrot_unrotate, the same quads in the same stages (integer sums, so
 // exact in any order), with each stage's quads walked as runs of `st`
@@ -276,18 +302,64 @@ AneFeedForward::create(const Options& o)
   spec.runtime_weights = true;
   spec.weights_out_in  = true;    // staging copies rows as they are
   spec.biases          = o.biases && !o.matmul;
+  // ROTATED INT8 (Options::int8; VPIPE_ANE_INT8 = 0 | 1 over it, the A/B):
+  // a SwiGLU or one projection, no biases, every width the rotation runs
+  // along a multiple of 256. Anything else keeps fp16, said once.
+  bool int8 = o.int8, plain = o.int8_plain;
+  int group = o.int8_group;
+  if (const char* e = std::getenv("VPIPE_ANE_INT8")) {
+    plain = std::strcmp(e, "plain") == 0;
+    group = std::strncmp(e, "fast", 4) == 0
+                ? (e[4] != '\0' ? std::atoi(e + 4) : 512) : 0;
+    int8 = plain || group > 0 || std::atoi(e) != 0;
+  }
+  if (plain) { group = 0; }
+  if (int8) {
+    const char* why =
+        o.gelu   ? "a GELU feed-forward has no rotated int8 form"
+        : o.situ ? "a SITU feed-forward has no rotated int8 form"
+        : spec.biases ? "its projections carry biases"
+        : (!plain &&
+           (o.hidden % 256 != 0 || (!o.matmul && o.ffn % 256 != 0)))
+            ? "its reduction widths are not multiples of 256"
+        : (group > 0 &&
+           (AneGraphSpec::group_for(group, o.hidden) == 0 ||
+            (!o.matmul && AneGraphSpec::group_for(group, o.ffn) == 0)))
+            ? "no group of 256 / 512 / 1024 under its target divides "
+              "its widths"
+            : nullptr;
+    if (why != nullptr) {
+      ss->info(fmt("{}: rotated int8 takes a SwiGLU feed-forward or one "
+                   "projection, without biases, its reduction widths "
+                   "multiples of 256 -- and {} ({} x {}); keeping fp16",
+                   tag, why, o.hidden, o.ffn));
+      int8 = false;
+    }
+  }
+  spec.int8 = int8;
+  spec.int8_plain = int8 && plain;
+  spec.int8_group = int8 && !plain ? group : 0;
   if (!spec.valid()) {
     ss->warn(fmt("{}: a {}x{} feed-forward has no valid ANE graph at tile "
                  "{}; keeping the GPU feed-forward", tag, o.hidden, o.ffn,
                  o.tile));
     return nullptr;
   }
-  char work[360];
-  std::snprintf(work, sizeof(work), "%s/vpipe-ane-%s-rt-%dx%dx%d-t%d.mlmodelc",
-                std::filesystem::temp_directory_path().c_str(),
-                o.matmul ? "mm" : o.gelu ? "gelu" : o.situ ? "situ" : "ffn",
-                chunk, o.hidden,
-                o.ffn, o.tile);
+  auto work_dir = [&]() {
+    char work[360];
+    std::snprintf(work, sizeof(work),
+                  "%s/vpipe-ane-%s%s-rt-%dx%dx%d-t%d.mlmodelc",
+                  std::filesystem::temp_directory_path().c_str(),
+                  o.matmul ? "mm" : o.gelu ? "gelu" : o.situ ? "situ" : "ffn",
+                  !spec.int8 ? ""
+                  : spec.int8_plain ? "-i8p"
+                  : spec.int8_group > 0
+                      ? (spec.int8_group == 256 ? "-i8g256"
+                         : spec.int8_group == 512 ? "-i8g512" : "-i8g1024")
+                      : "-i8",
+                  chunk, o.hidden, o.ffn, o.tile);
+    return std::string(work);
+  };
   // System-wide wired and the pool's own use BEFORE CoreML builds anything:
   // the growth at the first predict, less the pool's, is what the module
   // wired. See _ext_wired.
@@ -301,12 +373,56 @@ AneFeedForward::create(const Options& o)
   f->_estimate = o.matmul ? matmul_runtime_bytes(o.hidden, o.ffn, o.seq, chunk)
                : o.gelu   ? gelu_runtime_bytes(o.hidden, o.ffn, chunk)
                           : runtime_bytes(o.hidden, o.ffn, o.seq, chunk);
-  f->_rt = AneModule::build_runtime(ss, spec, work);
+  f->_rt = AneModule::build_runtime(ss, spec, work_dir());
   f->_w  = AneWeightSlots::create(spec);
-  const double build_ms = ms_since_(t0);
   const std::size_t elems = (std::size_t)chunk * (std::size_t)o.hidden;
   const std::size_t oelems =
       (std::size_t)chunk * (std::size_t)(o.matmul ? o.ffn : o.hidden);
+  // The int8 graph needs CoreML's int8 arrays (macOS 26 and later), and a
+  // host that loads it but cannot bind them only says so at the first
+  // predict -- which would take the whole tier off the ANE at the first
+  // block. So it predicts once here, zero weights over a zero chunk, and
+  // the fp16 module is built instead when that fails.
+  if (spec.int8) {
+    bool runs = f->_rt != nullptr && f->_w != nullptr &&
+                f->_rt->input_elems() == elems &&
+                f->_rt->output_elems() == oelems;
+    if (runs) {
+      for (std::size_t k = 0; k < f->_w->count(); ++k) {
+        const std::size_t h = (std::size_t)f->_w->rows(k);
+        f->_w->fill(k, [&](void* base, std::size_t bpr) {
+          std::memset(base, 0, h * bpr);
+        });
+      }
+      metal_compute::SharedBuffer x = o.mc->make_shared_buffer(elems * 2);
+      metal_compute::SharedBuffer y = o.mc->make_shared_buffer(oelems * 2);
+      runs = !x.empty() && !y.empty();
+      if (runs) {
+        std::memset(x.contents(), 0, elems * 2);
+        runs = f->_rt->run(x, 0, y, 0, *f->_w);
+        const auto* yp = static_cast<const _Float16*>(y.contents());
+        for (std::size_t i = 0; runs && i < oelems; ++i) {
+          runs = (float)yp[i] == 0.0f;
+        }
+      }
+    }
+    if (!runs) {
+      ss->warn(fmt("{}: the rotated int8 module did not run here (CoreML "
+                   "takes int8 arrays from macOS 26); building the fp16 "
+                   "one", tag));
+      spec.int8 = false;
+      spec.int8_plain = false;
+      spec.int8_group = 0;
+      // Released BEFORE the fp16 build: assigned over, the int8 module and
+      // its slots would live beside the new ones until it returned -- two
+      // modules where the plan booked one.
+      f->_w.reset();
+      f->_rt.reset();
+      f->_rt = AneModule::build_runtime(ss, spec, work_dir());
+      f->_w  = AneWeightSlots::create(spec);
+    }
+  }
+  const double build_ms = ms_since_(t0);
   if (f->_rt == nullptr || f->_w == nullptr ||
       f->_rt->input_elems() != elems || f->_rt->output_elems() != oelems) {
     ss->warn(fmt("{}: the ANE feed-forward module could not be built; "
@@ -314,6 +430,9 @@ AneFeedForward::create(const Options& o)
     return nullptr;
   }
   f->_session = ss;
+  f->_int8    = spec.int8;
+  f->_plain   = spec.int8_plain;
+  f->_group   = spec.int8_group;
   f->_sq      = std::make_unique<StageQueue>();
   f->_mc      = o.mc;
   f->_tag     = tag;
@@ -347,10 +466,14 @@ AneFeedForward::create(const Options& o)
       }
     }
   }
-  ss->info(fmt("{}: ANE {} armed (runtime weights, {} MB IOSurface "
+  ss->info(fmt("{}: ANE {} armed (runtime weights{}, {} MB IOSurface "
                "slots, module ready in {:.0f} ms), {} of {} rows per block "
                "in {} chunks of {} (GPU takes {})",
                tag, o.matmul ? "projection" : "feed-forward",
+               !f->_int8    ? ""
+               : f->_plain ? ", unrotated int8 (W8A8)"
+               : f->_group > 0 ? ", grouped int8 (W8A8, the fast tier's)"
+                               : ", rotated int8 (W8A8)",
                f->_w->bytes() >> 20, build_ms, rows, o.seq,
                rows / chunk, chunk, o.seq - rows));
   return f;
@@ -399,6 +522,9 @@ bool AneFeedForward::timing() const noexcept { return _auto || _profile; }
 bool AneFeedForward::needs_barrier() const noexcept { return _barrier; }
 int AneFeedForward::lost_row0() const noexcept { return _lost_row0; }
 bool AneFeedForward::gpu_only() const noexcept { return _gpu_only; }
+bool AneFeedForward::int8() const noexcept { return _int8; }
+bool AneFeedForward::int8_plain() const noexcept { return _plain; }
+int AneFeedForward::int8_group() const noexcept { return _group; }
 
 std::size_t
 AneFeedForward::gelu_runtime_bytes(int hidden, int ffn, int chunk) noexcept
@@ -539,7 +665,20 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
       // A scaled or adapted row is built in f32 rather than through the
       // table.
       const float mul = (!_matmul && i == _scaled) ? 1.0f / up_scale : 1.0f;
-      const bool f32path = q.deltas > 0 || mul != 1.0f;
+      // A rotated int8 module always builds its rows in f32: each is
+      // rotated and quantized after it is decoded.
+      const bool f32path = _int8 || q.deltas > 0 || mul != 1.0f;
+      // ...and keeps each row's step (x 128, the graph's weight scale) for
+      // the projection's step slot, filled once the codes are in.
+      // Per token, every 256-block rotated and the row one group; grouped
+      // (the fast tier's), each group of ig rotated whole and stepped.
+      const std::size_t ig =
+          _group > 0
+              ? (std::size_t)AneGraphSpec::group_for(_group, (int)cols)
+              : cols;
+      const std::size_t rotb = _group > 0 ? ig : 256;
+      const std::size_t ng = _int8 && ig > 0 ? cols / ig : 0;
+      std::vector<float> steps(rows * ng);
       ok = q.stageable() && rows > 0 && q.deltas >= 0 &&
            q.deltas <= AneFfnSource::kMaxDeltas &&
            slot < _w->count() &&
@@ -867,6 +1006,28 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
               const float* dp = delta.data() + j * cols;
               for (std::size_t cc = 0; cc < cols; ++cc) { acc[cc] += dp[cc]; }
             }
+            if (_int8) {
+              // Rotated, then int8 at the row's own step (each group's,
+              // grouped); the headroom scale rides the steps, not the
+              // codes.
+              if (!_plain) { fwht_(acc.data(), cols, rotb); }
+              auto* c8 = reinterpret_cast<std::int8_t*>(dr);
+              for (std::size_t gi = 0; gi < ng; ++gi) {
+                const std::size_t c0 = gi * ig;
+                float am = 0.0f;
+                for (std::size_t cc = c0; cc < c0 + ig; ++cc) {
+                  am = std::max(am, std::fabs(acc[cc]));
+                }
+                const float st = am > 0.0f ? am / 127.0f : 1.0f;
+                const float ist = 1.0f / st;
+                for (std::size_t cc = c0; cc < c0 + ig; ++cc) {
+                  const float v = std::nearbyint(acc[cc] * ist);
+                  c8[cc] = (std::int8_t)std::clamp(v, -127.0f, 127.0f);
+                }
+                steps[r * ng + gi] = am > 0.0f ? st * 128.0f * mul : 0.0f;
+              }
+              continue;
+            }
             for (std::size_t cc = 0; cc < cols; ++cc) {
               const _Float16 hv = (_Float16)(acc[cc] * mul);
               std::memcpy(dr + cc * 2, &hv, sizeof(hv));
@@ -874,10 +1035,31 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
           }
         });
       });
+      // An int8 module's steps: the matrices' slots, then one [1, out] row
+      // of steps each ([groups, out] grouped) -- this source's columns of
+      // it, so the parts stacked in one slot (Krea-2's q, k, v, gate) each
+      // write their own.
+      if (_int8 && ok) {
+        const std::size_t ss = slot + (_matmul ? 1u : 3u);
+        ok = ss < _w->count() && (std::size_t)_w->rows(ss) == ng &&
+             (std::size_t)_w->cols(ss) >= srow + rows &&
+             _w->fill(ss, [&](void* base, std::size_t bpr) {
+               auto* d = static_cast<std::uint8_t*>(base);
+               for (std::size_t gi = 0; gi < ng; ++gi) {
+                 for (std::size_t r = 0; r < rows; ++r) {
+                   const _Float16 hv = (_Float16)steps[r * ng + gi];
+                   std::memcpy(d + gi * bpr + (srow + r) * 2, &hv,
+                               sizeof(hv));
+                 }
+               }
+             });
+      }
     }
     // The biases, when the module has them: slot 3 + i, one row of the
-    // projection's output width.
-    for (std::size_t i = 0; i < nsrc && ok && _w->count() > nsrc; ++i) {
+    // projection's output width. (An int8 module's slots past the
+    // matrices are their steps, written above.)
+    for (std::size_t i = 0; i < nsrc && ok && !_int8 && _w->count() > nsrc;
+         ++i) {
       const AneFfnSource& q = src[i];
       const std::size_t n = (std::size_t)_w->cols(nsrc + i);
       const float mul = (!_matmul && i == _scaled) ? 1.0f / up_scale : 1.0f;
@@ -1104,12 +1286,18 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
     const auto* o16 = static_cast<const _Float16*>(_out.contents());
     const auto* src = static_cast<const std::uint16_t*>(in_p);
     const std::size_t ow = (std::size_t)_out_w;
+    // An output past fp16's range. A rotated int8 module's graph saturates
+    // instead of overflowing, and marks a row whose hidden state ran out of
+    // headroom by pushing it to fp16's limit (see the int8 graph), so there
+    // anything at half the range or past it counts too.
+    const float lim = _int8 ? 32768.0f : INFINITY;
     auto non_finite = [&]() {
       std::atomic<std::size_t> bad{0};
       w.parallel_for(cout_n, [&](std::size_t lo, std::size_t hi) {
         std::size_t n = 0;
         for (std::size_t i = lo; i < hi; ++i) {
-          if (!std::isfinite((float)o16[i])) { ++n; }
+          const float v = (float)o16[i];
+          if (!std::isfinite(v) || std::fabs(v) >= lim) { ++n; }
         }
         bad += n;
       });
@@ -1118,6 +1306,25 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
     // Divide the scaled slot (and its bias) by 4 in place: the fp16
     // headroom retry. See _up_scale.
     auto rescale = [&]() {
+      // A rotated int8 module carries the scale in the up projection's
+      // STEPS (slot 3 + 1), which is all that moves: its codes stay.
+      if (_int8) {
+        const std::size_t ss = 3 + _scaled;
+        const std::size_t sn = (std::size_t)_w->cols(ss);
+        const std::size_t sr = (std::size_t)_w->rows(ss);   // groups
+        return _w->fill(ss, [&](void* base, std::size_t bpr) {
+          auto* d = static_cast<std::uint8_t*>(base);
+          for (std::size_t rr = 0; rr < sr; ++rr) {
+            for (std::size_t cc = 0; cc < sn; ++cc) {
+              _Float16 v;
+              std::uint8_t* at = d + rr * bpr + cc * 2;
+              std::memcpy(&v, at, sizeof(v));
+              v = (_Float16)((float)v * 0.25f);
+              std::memcpy(at, &v, sizeof(v));
+            }
+          }
+        });
+      }
       // The scaled slot is up (1) in a SwiGLU {gate, up, down}, down (1) in
       // a GELU {up, down} and down (2) in a SITU {gate, up, down} -- the
       // one input the activation is linear in, or past it; its bias

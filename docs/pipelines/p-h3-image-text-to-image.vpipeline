@@ -1,0 +1,134 @@
+{
+  "id": "p-h3-image-text-to-image",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "PrunaAI/P-H3-Image-no-dit"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A German Expressionist oil painting of a Berlin street at night in the manner of Ernst Ludwig Kirchner, with gaunt figures hurrying past a glowing gas lamp."
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "lora": "PrunaAI/P-H3-Image-lora",
+        "lora_scale": 1.0
+      }
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "minimax-h3-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "height": 2912,
+        "width": 2912,
+        "seed": 42,
+        "i8_gemm": true,
+        "dit_dir": "local/MiniMax-H3-FL2VA-8bit",
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "p-h3-image-text-to-image.png"
+      }
+    }
+  ],
+  "subpipelines": []
+}

@@ -6,6 +6,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/shared/tuned-answers.h"
@@ -259,6 +260,16 @@ finish_config_(MetalMiniMaxH3VideoVae::Config& out, std::string* err)
 // the diffusers class has no other form of, so there is nothing to
 // check for them; what it states as numbers is read, and what this
 // decoder hard-codes is refused when it differs.
+// The two diffusers classes over this net: H3's own and P-H3-Image's
+// (the same encoder; a single-frame decoder -- see Config::dec_patch_t).
+bool
+video_vae_dir_(const std::string& dir)
+{
+  return minimax_h3::is_diffusers_vae_dir(
+             dir, minimax_h3::kDiffusersVideoVaeClass) ||
+         minimax_h3::is_diffusers_vae_dir(dir, ph3::kVaeClass);
+}
+
 bool
 diffusers_config_(const std::string& dir,
                   MetalMiniMaxH3VideoVae::Config& out, std::string* err)
@@ -370,6 +381,20 @@ diffusers_config_(const std::string& dir,
   // vae_tile_size / vae_tile_overlap_min are not stated; the defaults
   // are the released 256 / 64, which this class and the reference's
   // diffusers wrapper share.
+  //
+  // P-H3-Image's class: the decoder expands a token into ONE pixel
+  // frame (its proj_out is 3 x 16 x 16 wide, which load checks) at the
+  // pinned rotary time of PH3ImageViTDecoder, and decodes nothing else.
+  // The class is the statement; nothing in the file says it otherwise.
+  if (o.contains("_class_name")) {
+    const FlexData c = o.at("_class_name");   // a VIEW: bind it
+    if (c.is_string() && c.as_string("") == ph3::kVaeClass) {
+      out.dec_patch_t     = 1;
+      out.t1_direct       = true;
+      out.t1_output_slice = 0;
+      out.t1_time         = ph3::kFramePosition;
+    }
+  }
   return true;
 }
 
@@ -396,8 +421,7 @@ MetalMiniMaxH3VideoVae::resolve_vae_dir(const std::string& path)
     return p.string();                                 // already source/
   }
   // The diffusers VAE named directly: its weights sit beside its config.
-  if (minimax_h3::is_diffusers_vae_dir(p.string(),
-                                       minimax_h3::kDiffusersVideoVaeClass)) {
+  if (video_vae_dir_(p.string())) {
     return p.string();
   }
   if (fs::exists(p / "source" / "model.safetensors")) {
@@ -417,8 +441,7 @@ MetalMiniMaxH3VideoVae::resolve_vae_dir(const std::string& path)
   // that also holds a partition has just answered with the released
   // copy, the one every graph already shares (the same numbers; see
   // minimax-h3-diffusers-layout.h).
-  if (minimax_h3::is_diffusers_vae_dir((p / "vae").string(),
-                                       minimax_h3::kDiffusersVideoVaeClass)) {
+  if (video_vae_dir_((p / "vae").string())) {
     return (p / "vae").string();
   }
   return path;
@@ -434,8 +457,7 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
     return false;
   };
   fs::path p(resolve_vae_dir(vae_dir));
-  if (minimax_h3::is_diffusers_vae_dir(p.string(),
-                                       minimax_h3::kDiffusersVideoVaeClass)) {
+  if (video_vae_dir_(p.string())) {
     return diffusers_config_(p.string(), out, err) &&
            finish_config_(out, err);
   }
@@ -895,6 +917,20 @@ MetalMiniMaxH3VideoVae::load_decoder_(WeightSet& ws)
       _norm_out_b.empty()) {
     return false;
   }
+  // The output projection's width is the decoder's temporal patch made
+  // visible: a single-frame decoder's (P-H3-Image's, 768) read as a
+  // video one (3072), or the reverse, is a picture of the wrong thing.
+  if (const auto* po = ws.src().info("decoder.proj_out.weight");
+      po != nullptr && po->shape.size() == 2 &&
+      po->shape[0] != (std::int64_t)cfg.patch_elems()) {
+    if (_mc != nullptr && _mc->session() != nullptr) {
+      _mc->session()->warn(fmt(
+          "MetalMiniMaxH3VideoVae: decoder.proj_out is {} wide where this "
+          "config expects {} ({} pixel frame(s) a token); refusing it",
+          po->shape[0], cfg.patch_elems(), cfg.out_patch_t()));
+    }
+    return false;
+  }
   _blocks.clear();
   _blocks.resize((std::size_t)cfg.n_layers);
   for (int i = 0; i < cfg.n_layers; ++i) {
@@ -955,6 +991,39 @@ MetalMiniMaxH3VideoVae::decode_working_bytes(const Config& c, int LT, int lh,
 {
   const int tcs = c.tokens_per_chunk();
   if (LT <= 0 || lh <= 0 || lw <= 0 || tcs <= 0) { return 0; }
+  // A single-frame decoder (decode_image): no chunk, no cross-fade --
+  // the picture's tiles, a row of them kept until stitched, beside the
+  // widest tile's ViT scratch and the stitched picture.
+  if (!c.decodes_video()) {
+    const std::size_t ZC = (std::size_t)c.z_channels;
+    const std::size_t OC = (std::size_t)c.out_channels;
+    const std::size_t H = (std::size_t)lh * c.patch;
+    const std::size_t W = (std::size_t)lw * c.patch;
+    const auto ys = minimax_h3::split_tiles((int)H, c.tile_size,
+                                            c.tile_overlap_min, c.patch);
+    const auto xs = minimax_h3::split_tiles((int)W, c.tile_size,
+                                            c.tile_overlap_min, c.patch);
+    std::size_t row_most = 0, widest = 0;
+    for (int th : ys.length) {
+      std::size_t row = 0;
+      for (int tw : xs.length) {
+        row += OC * (std::size_t)th * tw * 2;
+        widest = std::max(widest, (std::size_t)th * tw);
+      }
+      row_most = std::max(row_most, row);
+    }
+    const std::size_t voxels = widest / ((std::size_t)c.patch * c.patch);
+    const std::size_t R = voxels + (std::size_t)c.n_register + 1;
+    const std::size_t D = (std::size_t)c.dim, F = (std::size_t)c.ffn_inner;
+    std::size_t b = ZC * (std::size_t)lh * lw * 2;        // the latent
+    b += 2 * row_most + ZC * voxels * 2;                   // tiles, a sub
+    b += OC * H * W * 2;                                   // the stitch
+    b += R * (std::size_t)(3 * c.rope_freqs()) * sizeof(float) * 2;
+    b += R * D * 2 * 7;
+    b += R * std::max(3 * D, F) * 2 + R * 2 * F * 2;
+    b += R * (std::size_t)c.patch_elems() * 2 + voxels * ZC * 2;
+    return b;
+  }
   const int td = c.token_drop, tr = c.patch_t;
   const int span = tcs + c.token_overlap();
   const int num_tokens = LT + td;
@@ -1405,6 +1474,10 @@ MetalMiniMaxH3VideoVae::build_rope_(int T, int h, int w, SharedBuffer& cos_out,
   // can be attributed to the rope or to the rest of the block.
   const bool no_rope = std::getenv("VPIPE_H3_VVAE_NO_ROPE") != nullptr;
   const int sizes[3] = {T, h, w};
+  // A single-frame decoder with a PINNED time (P-H3-Image's: a 7-token
+  // chunk's first token) puts every voxel there; normalized over one
+  // frame it would sit at 0, a place that decoder never trained at.
+  const bool pinned = T == 1 && !std::isnan(_cfg.t1_time);
   for (int r = 0; r < rows; ++r) {
     double coord[3] = {0.0, 0.0, 0.0};
     if (r < voxels) {
@@ -1412,6 +1485,7 @@ MetalMiniMaxH3VideoVae::build_rope_(int T, int h, int w, SharedBuffer& cos_out,
       for (int a = 0; a < 3; ++a) {
         coord[a] = 2.0 * (((double)idx[a] + 0.5) / (double)sizes[a]) - 1.0;
       }
+      if (pinned) { coord[0] = _cfg.t1_time; }
     }
     // The register tokens and the trailing zero token all sit at
     // position 0, which is what `coord` already is.
@@ -1871,7 +1945,7 @@ MetalMiniMaxH3VideoVae::decode(const SharedBuffer& z, int T, int h, int w,
   // Unpatchify: each row is (out_channels, patch_t, patch, patch) with
   // the CHANNEL slowest, so the pixel index is
   // ((ch*pt + kt)*p + ky)*p + kx.
-  const int PT = c.patch_t, P = c.patch, OC = c.out_channels;
+  const int PT = c.out_patch_t(), P = c.patch, OC = c.out_channels;
   const int oh = h * P, ow = w * P, ot = T * PT;
   SharedBuffer out =
       _mc->make_shared_buffer((std::size_t)OC * ot * oh * ow * 2);
@@ -2918,7 +2992,7 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
   // tile above and the one to its left (stitch_tile_), so the previous
   // row of tiles and this one are all that is held -- where every tile
   // of the clip was kept until the end.
-  const int OC = c.out_channels, OT = LT * c.patch_t;
+  const int OC = c.out_channels, OT = LT * c.out_patch_t();
   const int rows = (int)ys.start.size(), cols = (int)xs.start.size();
   SharedBuffer out =
       _mc->make_shared_buffer((std::size_t)OC * OT * H * W * 2);
@@ -3171,6 +3245,12 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
   if (LT <= 0 || lh <= 0 || lw <= 0 || tcs <= 0) {
     return fail("empty latent video");
   }
+  if (!c.decodes_video()) {
+    return fail("this checkpoint's decoder decodes single frames (it "
+                "expands a token into " + std::to_string(c.out_patch_t()) +
+                " pixel frame, not " + std::to_string(c.patch_t) + "): a "
+                "clip needs the video VAE");
+  }
   const int td = c.token_drop, tr = c.patch_t;
   const int tov = c.token_overlap(), fpp = c.frame_pre_pad();
   const int fov = c.frame_overlap(), cnf = tcs * tr;
@@ -3365,10 +3445,10 @@ MetalMiniMaxH3VideoVae::decode_image(const SharedBuffer& z, int h, int w,
   const int slice = c.t1_output_slice;
   // config_from_json bounds this, but decode_image is public and a Config
   // can also be hand-built, so the read is checked where it is used.
-  if (slice < 0 || slice >= c.patch_t) {
+  if (slice < 0 || slice >= c.out_patch_t()) {
     return fail("t1_output_slice " + std::to_string(slice) + " is not one of "
-                "the " + std::to_string(c.patch_t) + " pixel frames a latent "
-                "frame decodes to");
+                "the " + std::to_string(c.out_patch_t()) + " pixel frames a "
+                "latent frame decodes to");
   }
 
   SharedBuffer out = _mc->make_shared_buffer((std::size_t)OC * plane * 2);
@@ -3377,7 +3457,7 @@ MetalMiniMaxH3VideoVae::decode_image(const SharedBuffer& z, int h, int w,
   auto*       dst = static_cast<std::uint16_t*>(out.contents());
   for (int ch = 0; ch < OC; ++ch) {
     std::memcpy(dst + (std::size_t)ch * plane,
-                src + ((std::size_t)ch * c.patch_t + slice) * plane,
+                src + ((std::size_t)ch * c.out_patch_t() + slice) * plane,
                 plane * 2);
   }
   return out;

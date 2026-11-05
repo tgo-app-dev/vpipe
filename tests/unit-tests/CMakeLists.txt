@@ -213,6 +213,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-comfy.cc
         minimax-h3-diffusers-root.cc
         minimax-h3-diffusers-vae.cc
+        p-h3-image.cc
         minimax-h3-layout.cc
         minimax-h3-taomate.cc
         minimax-h3-regenerate.cc

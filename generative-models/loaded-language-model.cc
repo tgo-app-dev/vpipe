@@ -622,6 +622,21 @@ LoadedLanguageModel::LoadedLanguageModel(
           const std::size_t run = lm_run_booked_(session, model_dir, rs);
           const std::size_t limit = LmMemoryLimit::current();
           const std::size_t asked = LmMemoryLimit::expert_cache();
+          // An n-gram table asked for in memory, where it fits beside
+          // every expert (load_spec::kNgramResident).
+          if (LmMemoryLimit::ngram_resident() && mcfg.hc()) {
+            mcfg.ple_resident = MetalQwenModel::lm_ngram_resident(
+                session, model_dir, mcfg, run, limit, asked);
+            if (session != nullptr) {
+              session->info(fmt(
+                  "LoadedLanguageModel('{}'): the n-gram table {}",
+                  model_dir,
+                  mcfg.ple_resident
+                      ? "is held in memory (filled after the load)"
+                      : "stays on disk: it and every expert do not fit "
+                        "the box beside the rest (or the host's limit)"));
+            }
+          }
           mcfg.expert_cache_bytes = MetalQwenModel::lm_expert_cache_bytes(
               session, model_dir, mcfg, run, limit, asked);
           if (mcfg.expert_cache_bytes > 0 && session != nullptr) {
@@ -1031,6 +1046,16 @@ LoadedLanguageModel::run_state_bytes() const
       const std::size_t held = m->run_held(), kv = m->kv_bytes();
       return held > kv ? held - kv : 0;
     }
+  }
+  return 0;
+}
+
+std::size_t
+LoadedLanguageModel::filled_after_load_bytes() const
+{
+  if (!_impl || !_impl->exec) { return 0; }
+  if (auto* qx = dynamic_cast<MetalQwenModelExec*>(_impl->exec.get())) {
+    return qx->filled_after_load_bytes();
   }
   return 0;
 }

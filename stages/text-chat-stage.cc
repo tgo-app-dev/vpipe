@@ -475,6 +475,7 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
                     "model's own) or more (got {})", this->id(),
                     _expert_cache_mb));
   }
+  _ngram_resident = attr_bool("ngram_resident");
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -687,6 +688,18 @@ constexpr ConfigKey kAttrs[] = {
           "ignores it; a model kept warm is handed over at the size it "
           "was loaded at. 0: the model's own sizing",
    .def_int = 0},
+  {.key = "ngram_resident", .type = ConfigType::Bool,
+   .doc = "a model with an n-gram embedding table read by row from disk "
+          "(Qwen3.8-Flash-Next's, tens of GB) holds it in memory instead: "
+          "filled after the load, so loading takes no longer, and a "
+          "prompt's rows then come from memory -- the first part of a "
+          "long prompt no longer waits on a few hundred thousand disk "
+          "reads. Taken only where the model with every expert resident "
+          "and the table fit (within memory_limit_mb and expert_cache_mb "
+          "too); otherwise the rows are read from disk. Every other model "
+          "ignores it; a model kept warm is handed over as it was loaded. "
+          "false: from disk",
+   .def_bool = false},
   {.key = "keep_loaded", .type = ConfigType::Real,
    .doc = "seconds to keep the model loaded after this stage lets it go "
           "(its graph unloaded): a chat that runs a graph per request "
@@ -1002,7 +1015,8 @@ TextChatStage::declare_resources() const
   std::vector<ResourceClaim> out = model_memory::lm_claims(
       session(), dirs[0], id(), run_shape_(dirs[0]), 0, 0,
       (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
-      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20);
+      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20,
+      _ngram_resident);
   if (dirs.size() > 1) {
     for (auto& c : model_memory::weight_claims({dirs[1]})) {
       out.push_back(std::move(c));
@@ -1084,6 +1098,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
   if (_expert_cache_mb > 0) {
     bag::set_integer(spec.extra, genai::load_spec::kExpertCacheMb,
                      _expert_cache_mb);
+  }
+  if (_ngram_resident) {
+    bag::set_flag(spec.extra, genai::load_spec::kNgramResident, true);
   }
   session()->info(fmt(
       "TextChatStage('{}'): loading model from '{}' "

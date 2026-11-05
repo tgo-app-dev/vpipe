@@ -8,6 +8,7 @@
 // Env: VPIPE_KREA2_TEST_MODEL_PATH = the Krea-2-Turbo model root (uses
 // <root>/transformer), VPIPE_KREA2_GOLDEN = the golden dir. Skips if unset.
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -647,13 +648,16 @@ TEST(krea2_dit, forward_dit_ane_matches_gpu)
   const std::size_t n = (std::size_t)seq * HID;
 
   const char* lora_path = std::getenv("VPIPE_KREA2_ANE_LORA");
-  auto run = [&](bool ane, bool with_lora) {
+  const bool qkv = std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr;
+  auto run = [&](bool ane, bool with_lora, bool int8 = false,
+                 int* n8 = nullptr) {
     MetalKrea2Transformer::Config cfg = base;
     if (ane) {
       cfg.session       = &sess;
       cfg.ane_rows      = 0.5f;     // 544 of 1088
       cfg.ane_layers    = stop + 1;
-      cfg.ane_qkv = std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr;
+      cfg.ane_qkv = qkv;
+      cfg.ane_int8 = int8;
     }
     std::vector<float> out;
     // VPIPE_KREA2_ANE_LORA: a runtime adapter on BOTH arms. The GPU applies
@@ -670,6 +674,7 @@ TEST(krea2_dit, forward_dit_ane_matches_gpu)
     if (m == nullptr) { return out; }
     SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
                                     img_seq, grid, grid, 0.5f, stop);
+    if (n8 != nullptr) { *n8 = m->ane_int8_modules(); }
     if (o.empty() || o.byte_size() < n * 2) { return out; }
     out.resize(n);
     const auto* p = static_cast<const _Float16*>(o.contents());
@@ -690,6 +695,21 @@ TEST(krea2_dit, forward_dit_ane_matches_gpu)
   // would pass.
   EXPECT_TRUE(r > 0.0);
   EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  // ROTATED INT8 (ane_int8): the same tiers in the GPU token tier's
+  // arithmetic, ENGAGED (each module that armed) before measured.
+  {
+    int n8 = -1;
+    const std::vector<float> v8 = run(true, true, true, &n8);
+    ASSERT_TRUE(v8.size() == v_gpu.size());
+    if (v8.size() != v_gpu.size()) { return; }
+    const double r8 = rel_l2_(v8.data(), v_gpu.data(), v8.size());
+    std::printf("[krea2_dit] ... in rotated int8 (%d modules int8): "
+                "rel-L2 = %.6g\n", n8, r8);
+    if (ane_int8_expected()) {
+      EXPECT_TRUE(n8 == (qkv ? 2 : 1));
+      EXPECT_TRUE(r8 > 0.0 && std::isfinite(r8) && r8 < 0.10);
+    }
+  }
   // With an adapter, the CONTROLS: how far the adapter itself moves the
   // GPU's output, and the ANE's fp16 floor on the same run WITHOUT it. An
   // ANE whose rows dropped the adapter adds roughly that effect (over its

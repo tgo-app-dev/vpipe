@@ -131,6 +131,15 @@ create(const SessionContextIntf* session, metal_compute::MetalCompute* mc,
   o.chunk   = chunk_of(spec);
   o.tile    = int_of(spec, kTile, AneFeedForward::kTile);
   o.profile = acc::flag(&spec, kProfile);
+  o.int8    = acc::flag(&spec, kInt8);
+  {
+    const std::string t =
+        acc::text(&spec, kInt8Tier, std::string(kInt8TierToken));
+    if (t != kInt8TierToken && t != kInt8TierTokenPlain) {
+      return refuse("unknown int8_tier '" + t + "'");
+    }
+    o.int8_plain = o.int8 && t == kInt8TierTokenPlain;
+  }
   if (s == Shape::kMatmul) {
     o.matmul = true;
     o.hidden = int_of(spec, kInWidth);
@@ -322,6 +331,12 @@ Tier::info() const
   acc::set_text(&f, kInfoError, _p->error);
   acc::set_integer(&f, kInfoLostRow0, _p->ff->lost_row0());
   acc::set_flag(&f, kInfoGpuOnly, _p->ff->gpu_only());
+  acc::set_flag(&f, kInt8, _p->ff->int8());
+  if (_p->ff->int8()) {
+    acc::set_text(&f, kInt8Tier,
+                  std::string(_p->ff->int8_plain() ? kInt8TierTokenPlain
+                                                   : kInt8TierToken));
+  }
   return f;
 }
 

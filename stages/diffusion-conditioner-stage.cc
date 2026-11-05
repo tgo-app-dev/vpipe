@@ -4,6 +4,7 @@
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/gen-input.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "common/beat-keys.h"
 #include <chrono>
 
@@ -1856,6 +1857,15 @@ DiffusionConditionerStage::declare_resources() const
   if (!enc.empty()) {
     out.push_back(model_memory::weight_claim_streamable(enc, enc_floor));
   }
+  // P-H3-Image's connector, held whole beside the encoder (f32, 256 MB)
+  // -- and with it: decide_resources phases it, unload_encoder_ lets go.
+  if (const std::string cd =
+          genai::ph3::connector_dir(resolve_model_dir(session(), _hf_dir));
+      !cd.empty()) {
+    for (auto& c : model_memory::weight_claims({cd})) {
+      out.push_back(std::move(c));
+    }
+  }
   // MiniMax-H3 KEYFRAMES on a ref_image port: the vision tower runs on
   // each before the prompt is encoded (h3_keyframes_). Its weights are
   // in the floor above; its working set is booked here, in the
@@ -1959,8 +1969,15 @@ DiffusionConditionerStage::decide_resources() const
       (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
        model_memory::bounded(session(), {enc}, model_memory::kHeadroom));
   if (!releases) { return {}; }
+  std::vector<std::string> dirs{enc};
+  // P-H3-Image's connector goes with the encoder that holds it.
+  if (const std::string cd =
+          genai::ph3::connector_dir(resolve_model_dir(session(), _hf_dir));
+      !cd.empty()) {
+    dirs.push_back(cd);
+  }
   return model_memory::weight_claims_in_phase(
-      {enc}, model_memory::kPhaseCondition);
+      dirs, model_memory::kPhaseCondition);
 }
 
 Job
@@ -2090,6 +2107,15 @@ DiffusionConditionerStage::ensure_loaded_()
       _family = "minimax-h3";
       apply_model_config_();
     }
+  }
+  // P-H3-Image, by its manifest: an H3 image model whose root may carry
+  // no DiT at all (FL2VA and PrunaAI's adapter run in its place), and
+  // whose stock Qwen3-VL-4B encoder the "krea2" default would load and
+  // condition with Krea-2's recipe -- where it conditions through the
+  // connector beside it (MiniMaxH3TextEncoder::Config::taps).
+  if (_family != "minimax-h3" && genai::ph3::is_root(root)) {
+    _family = "minimax-h3";
+    apply_model_config_();
   }
   // VOSR, on the same terms: it ships no diffusers tree at all -- an
   // args.json beside a `checkpoints/` directory -- so nothing above can
@@ -2340,7 +2366,11 @@ DiffusionConditionerStage::ensure_loaded_()
       : _family == "wan" ? "umT5-XXL"
       : _family == "z-image" ? "Qwen3 dense"
       : _family == "moss-image" ? "Qwen3.5 hybrid, final norm"
-      : _family == "minimax-h3" ? "Qwen3-VL-32B (layer-50 tap)" : "Qwen3-VL",
+      : _family == "minimax-h3"
+          ? (_h3_enc && _h3_enc->has_connector()
+                 ? "Qwen3-VL, 5 taps through P-H3-Image's connector"
+                 : "Qwen3-VL-32B (layer-50 tap)")
+          : "Qwen3-VL",
       _enc_hidden));
 
   // The component dirs the idle-unload decision sizes against. The
@@ -2523,12 +2553,19 @@ DiffusionConditionerStage::unload_encoder_()
   // is next doing work. `destroy` is the caller asking for the bytes
   // back, which parking does not do; anything else keeps the checkpoint
   // for the next prompt, purgeable.
+  // P-H3-Image's connector is the encoder's (its set went with _h3_enc),
+  // so it is settled, revised and released with it.
+  const std::string conn =
+      genai::ph3::connector_dir(resolve_model_dir(session(), _hf_dir));
   if (!_enc_dir.empty()) {
     if (auto* mgr = session()->services()->generative_model_manager()) {
-      if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
-        mgr->drop_weights(_enc_dir);
-      } else {
-        mgr->pool_weights(_enc_dir);
+      for (const std::string& d : {_enc_dir, conn}) {
+        if (d.empty()) { continue; }
+        if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+          mgr->drop_weights(d);
+        } else {
+          mgr->pool_weights(d);
+        }
       }
     }
   }
@@ -2561,6 +2598,10 @@ DiffusionConditionerStage::unload_encoder_()
       // see GenerativeModelManager::clear_declarations -- because a DiT
       // has already spent an irreversible decision on it.
       mgr->note_phase_released(_enc_dir);
+      if (!conn.empty()) {
+        mgr->revise_declaration(conn, 0);
+        mgr->note_phase_released(conn);
+      }
     }
   }
   session()->log_debug(fmt(

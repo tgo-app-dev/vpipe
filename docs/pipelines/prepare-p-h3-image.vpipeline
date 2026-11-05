@@ -1,0 +1,30 @@
+{
+  "id": "prepare-p-h3-image",
+  "stages": [
+    {
+      "id": "fetch-p-h3-image",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "PrunaAI/P-H3-Image",
+        "model_variant": "PrunaAI/P-H3-Image-no-dit",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-p-h3-image-lora",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "PrunaAI/P-H3-Image-Comfy",
+        "model_variant": "PrunaAI/P-H3-Image-lora",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

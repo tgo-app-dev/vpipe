@@ -157,6 +157,14 @@ class MetalFlux2Transformer {
     float ane_rows   = 0.0f;
     int   ane_layers = 0;
     bool  ane_qkv    = false;
+    // The ANE's modules in ROTATED INT8 (W8A8; AneFeedForward::Options::
+    // int8): generate-image's `ane_int8`. LOSSY -- the GPU token tier's
+    // arithmetic on the ANE's rows; a module that cannot take it keeps
+    // fp16 and says so. VPIPE_ANE_INT8 overrides it.
+    bool  ane_int8   = false;
+    // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
+    // `ane_int8_tier: token_plain`). Only with ane_int8.
+    bool  ane_int8_plain = false;
   };
 
   // What the ANE tiers hold for `cfg`, summed over the ones it turns on: the
@@ -211,6 +219,18 @@ class MetalFlux2Transformer {
     return (_ane_dff != nullptr && _ane_dff->gpu_only()) ||
            (_ane_dqkv != nullptr && _ane_dqkv->gpu_only()) ||
            (_ane_sproj != nullptr && _ane_sproj->gpu_only());
+  }
+  // How many of the armed modules run int8 (Config::ane_int8, where the
+  // module and the OS could take it): rotated per token, or with `plain`
+  // unrotated (Config::ane_int8_plain).
+  int ane_int8_modules(bool plain = false) const noexcept
+  {
+    int n = 0;
+    for (const auto* a : {_ane_dff.get(), _ane_dqkv.get(),
+                          _ane_sproj.get()}) {
+      n += a != nullptr && a->int8() && a->int8_plain() == plain ? 1 : 0;
+    }
+    return n;
   }
 
   // What a CALLER chooses for a FLUX.2 run, as against Config, which is

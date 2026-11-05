@@ -73,6 +73,11 @@ arrives in **8–16 steps** instead of 30+.
     - [Get it, then run it](#get-it-then-run-it)
     - [What it costs](#what-it-costs-2)
     - [Against the release](#against-the-release)
+  - [Pictures — P-H3-Image](#pictures--p-h3-image)
+    - [Get it, then run it](#get-it-then-run-it-1)
+    - [What is read off the checkpoint](#what-is-read-off-the-checkpoint)
+    - [What it costs](#what-it-costs-3)
+    - [Checked against the reference](#checked-against-the-reference)
   - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
     - [Get it and run it](#get-it-and-run-it)
     - [What it saves](#what-it-saves)
@@ -225,6 +230,13 @@ you want to see the model work before spending the hours and the 115 GB.
   int8 on an M5's matrix cores — and the release's **fast decoder**, which
   [`prepare-open-h3-regenerate-2k-fast-vae.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-fast-vae.vpipeline)
   fetches.
+- **[`prepare-p-h3-image.vpipeline`](pipelines/prepare-p-h3-image.vpipeline)**
+  / **[`p-h3-image-text-to-image.vpipeline`](pipelines/p-h3-image-text-to-image.vpipeline)**,
+  **[`p-h3-image-edit.vpipeline`](pipelines/p-h3-image-edit.vpipeline)**
+  — **pictures**, not clips: PrunaAI's **P-H3-Image** on your FL2VA weights
+  under PrunaAI's adapter, text-to-image at 8 megapixels and editing a
+  picture with up to seven more as references, in eight steps (see
+  [Pictures](#pictures--p-h3-image)).
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -3086,6 +3098,119 @@ every other graph here runs). The release itself warns that same-seed PSNR
 is not a metric for this model — rounding-level changes move its 3-step
 output a lot — so judge by eye.
 
+### Pictures — P-H3-Image
+
+[PrunaAI/P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) is an
+**image** model built on MiniMax-H3: text-to-image, and instruction editing
+of a picture with up to seven more beside it as references. It renders in
+**eight steps** with no guidance and no negative prompt, and works best at
+**8 megapixels** for text-to-image (2912 × 2912 at 1:1) and 4–8 for edits.
+
+It is H3's own DiT — FL2VA's weights with a rank-128 adapter trained on top —
+so it runs on everything above: streaming, the int8 tiers, Sol, Sage. The
+picture is **one latent frame**, denoised in H3's packed sequence beside two
+audio latents that are thrown away. What is new is around the DiT:
+
+- the **text encoder** is a Qwen3-VL-4B (not H3's 32B), conditioning through
+  a small **connector** that maps five of its layers onto the width H3
+  reads;
+- the **VAE** is H3's encoder byte for byte with a decoder retrained to turn
+  one latent frame into one picture — the same idea as Mamad8's
+  single-frame H3 VAE, with its own weights.
+
+#### Get it, then run it
+
+You need FL2VA (step 1's `local/MiniMax-H3-FL2VA-8bit`, or Comfy-Org's bf16
+file) and P-H3-Image's encoder, connector and VAE —
+[`prepare-p-h3-image.vpipeline`](pipelines/prepare-p-h3-image.vpipeline)
+fetches those (~15 GB) and PrunaAI's adapter (~2 GB), and **not** the
+repository's merged DiT, which is another 66 GB of what FL2VA plus the
+adapter already is:
+
+```sh
+vpipe --launch docs/pipelines/prepare-p-h3-image.vpipeline
+```
+
+Then:
+
+- [`p-h3-image-text-to-image.vpipeline`](pipelines/p-h3-image-text-to-image.vpipeline)
+  — the prompt in `text-prompt`, the canvas in generate-video's `width` /
+  `height` (multiples of 32; anything else is rounded to the nearest). The
+  model reads the prompt **as written**, and it was trained on long,
+  detailed ones.
+- [`p-h3-image-edit.vpipeline`](pipelines/p-h3-image-edit.vpipeline) — the
+  picture to edit on video-ref-encoder's first reference port, up to seven
+  more after it (`<Picture 2>` … in the instruction), the instruction in
+  `text-prompt`. The instruction is read as `Edit <Picture 1>. …` (added
+  when it does not start that way). With no `width` / `height` on
+  generate-video the edit renders at its picture's size, scaled into
+  4–8 megapixels; every other picture keeps its size inside 1–8.
+
+If you fetched the whole repository instead (`PrunaAI/P-H3-Image`, the
+merged DiT included), drop generate-video's `dit_dir` and the model config's
+`lora`: the root's own `transformer/` then runs.
+
+#### What is read off the checkpoint
+
+Everything P-H3-Image does differently from H3 comes from its files, not
+from the graph:
+
+- `modular_model_index.json` names the pipeline and carries the **sampling
+  grid** — eight steps run exactly as listed, **unshifted** (the model
+  config's `video_shift` / `audio_shift` are not used for it) — and the
+  edit's sizing rules;
+- `text_connector/` names the encoder's taps — hidden states 13, 19, 25, 31
+  and the last, normed one — and the projection that maps them;
+- `vae/` names the single-frame decoder (`AutoencoderKLPH3Image`), which
+  decodes only one latent frame — a video graph pointed at it is refused,
+  not decoded wrong.
+
+An edit's pictures are encoded the reference's way: the VAE's posterior
+**sampled** under its own seed (42) and rounded to float16, the rows then
+noised to t = 0.999 and held there; the vision tower reads its own copy of
+each at about one megapixel.
+
+#### What it costs
+
+MEASURED on the M4 Pro (64 GB), FL2VA **bf16** from the internal SSD under
+the adapter, i8 off:
+
+| | rows a forward | first forward | the next seven | whole graph |
+|---|---:|---:|---:|---:|
+| text-to-image 1024 × 1024 | 1,061 | 61 s (reads the DiT) | 6.7 s each | 2 m 48 s |
+| text-to-image 2912 × 2912 (8 MP) | 8,318 | 68 s | 67 s each | 10 m 49 s |
+| edit, 1024² picture → 2048 × 2048 | 9,257 | 80 s | 77 s each | 12 m 16 s |
+
+The first forward pays for reading 66 GB of DiT; every block is kept for the
+rest. Peak resident 45–47 GB. An edit carries its picture's rows beside the
+ones it generates (4,096 + 4,096 at 2048², plus 1,061 of presentation), and
+the vision tower and VAE encode of the picture took 33 s of it.
+
+#### Checked against the reference
+
+The connector, the encoder, the edit's presentation and the image decoder are
+held to `tools/dump_p_h3_image_golden.py` (transformers' Qwen3-VL for the
+encoder; the connector, the decoder and its tiling restated from diffusers'
+`p_h3_image`), fp32 the truth and the reference's own bf16 the bar:
+
+- the connector on the reference's own taps: **bit-identical**;
+- text conditioning 0.0050 / 0.0049 from fp32 (the reference's bf16 0.0060 /
+  0.0054); an edit's presentation — ids and tags equal — 0.0095 (0.0093);
+- the image decoder 0.015 on one tile, 0.034 on a 2 × 3 tiling (0.012 /
+  0.031).
+
+One difference from the reference's edit: naming a `width` / `height` on
+generate-video sets the canvas, but video-ref-encoder still holds the
+picture being edited at the 4-megapixel floor (it cannot see the canvas),
+where the reference keeps a small picture at its own size when a canvas is
+named. Leave the canvas unset — the shipped graph does — for the reference's
+behaviour.
+
+Not ported: the **prompt upsampler** (a Qwen3.5-9B that rewrites a short
+request into the long prompt the model renders best from; on by default in
+PrunaAI's pipeline) — write the full prompt yourself. And the noise is
+vpipe's own, so a seed does not reproduce a picture made elsewhere.
+
 ### Faster attention — the VDN linear branch
 
 The Turbo LoRA above cuts how many steps a clip costs. This cuts what a step
@@ -3682,10 +3807,54 @@ frames land ~35 dB PSNR apart, which is what an fp16 path costs.
   each build once) and **per macOS version**, so an OS update pays it once
   more. Resolution and clip length never trigger a rebuild.
 
+#### Faster and lossier: `ane_int8`
+
+`ane_int8` runs both modules in **int8** (W8A8) instead of fp16. It is how
+int8 reaches a Mac with no GPU matrix cores, the M4 series, where `i8_gemm`
+does not run. It comes in the two flavours `i8_gemm_tier` names on the GPU,
+chosen by `ane_int8_tier`:
+
+- **`token`** (the default): each weight row is rotated (a Walsh-Hadamard
+  transform over every 256 values) and quantized to int8 as it is prepared,
+  and each projection's input is rotated and quantized per token inside the
+  module. The rotation keeps outlier channels from setting a whole row's
+  step.
+- **`token_plain`**: the same without the rotation, the arithmetic of the
+  GPU's `token_plain`.
+
+MEASURED on a **MacBook Pro (M4 Pro)**, two real blocks at 9382 rows, one
+sitting:
+
+| | ANE split vs GPU alone | video relative L2 |
+|---|---|---|
+| `ane_ffn` | 1.26× | 0.0034 |
+| `ane_ffn` + `ane_int8` | 1.36× | 0.0045 |
+| `ane_ffn` + `ane_int8`, `token_plain` | 1.36× | 0.0079 |
+| `ane_ffn` + `ane_qkv` | 1.41× | 0.0035 |
+| `ane_ffn` + `ane_qkv` + `ane_int8` | **1.65×** | 0.0048 |
+| `ane_ffn` + `ane_qkv` + `ane_int8`, `token_plain` | 1.67× | 0.0081 |
+
+On a block's output, measured against the GPU's own int8 arithmetic on the
+same weights and inputs, each flavour is exactly as far from the exact
+result as the GPU tier it is named after (within 1%): `token` 0.6–2.1e-2,
+`token_plain` 1.9–6.1e-2, against 2.2–2.5e-3 for fp16. So `token_plain`
+buys almost no speed for ~1.7× the error in the video; it is there to run
+the same arithmetic as a GPU on `token_plain`. Judge either by eye, as you
+would the int8 GEMM tiers.
+
+- It needs **macOS 26** or later. Where the module cannot run int8, the tier
+  builds the fp16 one and says so.
+- The first build is a little longer (about **15 s** for the feed-forward
+  and **7 s** for q|k|v on an M4 Pro), then cached like the fp16 one.
+- An overflow inside the module is caught as in fp16 and the chunk is
+  recomputed at a smaller scale; in int8 that costs no precision.
+
 | key | default | notes |
 |---|---|---|
 | `ane_ffn` | `false` | The feed-forward on the ANE. |
 | `ane_qkv` | `false` | The q\|k\|v projection too, as a second module. **Requires `ane_ffn`**; the two are planned and granted together, so the plan may decline the pair where it would have granted the feed-forward alone. |
+| `ane_int8` | `false` | Both modules in rotated int8 (lossy, faster). **Requires `ane_ffn`** and macOS 26. See [Faster and lossier](#faster-and-lossier-ane_int8). |
+| `ane_int8_tier` | `token` | Which int8: `token` (rotated) or `token_plain` (unrotated, lossier, the same speed). Needs `ane_int8`. |
 | `ane_rows` | `0` | The ANE's share of the rows, from 0 to 1. `0` balances automatically; a fixed share is for benchmarking. |
 | `ane_layers` | `0` | Cap on how many blocks use it; `0` is all of them. Not a memory setting: every block shares one module. |
 

@@ -317,6 +317,11 @@ The acceleration tiers, same edit and box, denoise seconds:
 Every picture is clean. Sol is approximate by design: its edit is the same
 but the details are drawn a little differently, so judge it by eye. The ANE
 tiers are for the M4 series.
+`ane_int8: true` beside them runs both ANE modules in rotated int8 (W8A8)
+rather than fp16, with the arithmetic of `i8_gemm_tier: token` on the
+ANE's rows: faster there, and lossier. It needs macOS 26; anywhere else
+the modules stay fp16 and the log says so. `ane_int8_tier: token_plain`
+leaves out the rotation, as the GPU's `token_plain` does: lossier still.
 
 On an M5 the GEMMs and attention run on the matrix cores, and the int8 tiers
 (`i8_gemm: true`, `i8_gemm_tier`) and `sage_attn` are the levers. A base M5

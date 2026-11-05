@@ -135,6 +135,12 @@ public:
   // metal_deepseek_v41_vision.
   __attribute__((visibility("hidden"))) std::size_t
   run_state_bytes() const;
+  // Bytes it holds that its load did not allocate: filled after the
+  // constructor returns, on a thread of its own (Qwen3.8-Flash-Next's
+  // n-gram table under load_spec::kNgramResident), so a scope counting
+  // the load's allocations misses them. Host-only, as run_state_bytes.
+  __attribute__((visibility("hidden"))) std::size_t
+  filled_after_load_bytes() const;
 
   const ModelConfig& config()    const noexcept;
   const Tokenizer&   tokenizer() const noexcept;

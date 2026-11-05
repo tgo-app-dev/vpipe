@@ -2041,6 +2041,47 @@ GenerativeModelManager::load(const LoadSpec& spec)
     key.draft_bits = (int)bag::integer(spec.extra, load_spec::kDraftBits, 8);
   }
 
+  // A model kept warm from this FOLDER under another key -- other pages,
+  // dtype or drafter: a host that changed how it loads its model -- is
+  // let go first, its conversations saved as its expiry saves them. The
+  // load would otherwise make a second copy beside it, both resident
+  // until the old hold ran out (two of an 88 GB model on a 256 GB Mac).
+  // The one this key is handed is kept, and so is one still IN USE -- a
+  // peer stage on the folder under its own settings, another graph: the
+  // hold is not its only owner, so letting it go would free nothing and
+  // only lose the conversations parked on it.
+  {
+    shared_ptr<LoadedLanguageModel> same;
+    {
+      lock_guard<mutex> lk(_mu);
+      if (auto it = _cache.find(key); it != _cache.end()) {
+        same = it->second.lock();
+      }
+    }
+    std::vector<Warm> other;
+    {
+      lock_guard<mutex> lk(_warm_mu);
+      for (auto w = _warm.begin(); w != _warm.end();) {
+        if (w->dir == key.hf_dir && w->lm != same
+            && w->lm.use_count() == 1) {
+          other.push_back(std::move(*w));
+          w = _warm.erase(w);
+        } else {
+          ++w;
+        }
+      }
+    }
+    // Freed outside the locks, as the reaper frees a hold.
+    for (auto& w : other) {
+      spill_parked(w, session());
+      if (session()) {
+        session()->info(fmt(
+            "GenerativeModelManager::load('{}'): kept warm under other "
+            "settings -- unloaded before this load", w.dir));
+      }
+    }
+  }
+
   // Models wired by an earlier load that are gone give their bytes back
   // to the pool before this one sizes anything.
   {
@@ -2171,6 +2212,8 @@ GenerativeModelManager::load(const LoadSpec& spec)
   // And its expert cache, when the host names one (kExpertCacheMb).
   const std::size_t cache = (std::size_t)std::max<std::int64_t>(
       0, bag::integer(spec.extra, load_spec::kExpertCacheMb, 0)) << 20;
+  // And whether its n-gram table is asked for in memory (kNgramResident).
+  const bool ngram = bag::flag(spec.extra, load_spec::kNgramResident);
   shared_ptr<LoadedLanguageModel> lm;
   std::size_t wired = 0, wired_tmp = 0, held_back = 0, room = 0;
   {
@@ -2188,7 +2231,7 @@ GenerativeModelManager::load(const LoadSpec& spec)
       scope.emplace(room);
     }
     {
-      LmMemoryLimit cap(limit, cache);
+      LmMemoryLimit cap(limit, cache, ngram);
       lm = build();
     }
     if (scope) {
@@ -2214,19 +2257,27 @@ GenerativeModelManager::load(const LoadSpec& spec)
   // every model sizing its resident set plans around it.
   if (wire) {
     charge_external_wired(wired);
+    // What it fills after the load, on a thread of its own (an n-gram
+    // table held in memory): held, unwired, and not seen by the scope --
+    // without it a warm model read tens of GB lighter than it is.
+    const std::size_t later = lm->filled_after_load_bytes();
     {
       lock_guard<mutex> lk(_warm_mu);
-      _wired_lms.push_back(Wired{lm, wired, wired + held_back});
+      _wired_lms.push_back(Wired{lm, wired, wired + held_back + later});
     }
     if (session()) {
       session()->info(fmt(
           "GenerativeModelManager::load('{}'): {} MB wired as it loaded "
           "(the compressor cannot take it; charged to the wired pool; {} MB "
-          "of load temporaries wired and freed){}",
+          "of load temporaries wired and freed){}{}",
           key.hf_dir, wired >> 20, wired_tmp >> 20,
           held_back > 0
               ? fmt("; {} MB left unwired -- the wired pool had {} MB of "
                     "room", held_back >> 20, room >> 20)()
+              : std::string(),
+          later > 0
+              ? fmt("; {} MB more filled after the load, unwired",
+                    later >> 20)()
               : std::string()));
     }
   }
@@ -2529,6 +2580,14 @@ GenerativeModelManager::warm_kv_bytes() const
 std::vector<GenerativeModelManager::WarmUsage>
 GenerativeModelManager::warm_report() const
 {
+  return warm_report(nullptr);
+}
+
+std::vector<GenerativeModelManager::WarmUsage>
+GenerativeModelManager::warm_report(
+    std::vector<std::optional<std::size_t>>* held) const
+{
+  if (held != nullptr) { held->clear(); }
   std::vector<WarmUsage> out;
   // Each language model's place in `out`: its K/V is read outside the
   // lock, as warm_kv_bytes reads it.
@@ -2545,19 +2604,23 @@ GenerativeModelManager::warm_report() const
       u.kind    = "language-model";
       u.dir     = w.dir;
       u.seconds = left(w.until);
+      std::optional<std::size_t> h;
       for (const auto& x : _wired_lms) {
         // Compared by owner: a lock() would take a reference to every
         // wired model, and one whose last holder let go meanwhile
         // would be freed here, under the lock.
         if (w.lm && !x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
           u.bytes += x.bytes;
+          h = h.value_or(0) + x.held;
         }
       }
+      if (held != nullptr) { held->push_back(h); }
       lms.emplace_back(out.size(), w.lm);
       out.push_back(std::move(u));
     }
     for (const auto& w : _warm_models) {
       out.push_back({w.kind, w.dir, w.bytes, 0, left(w.until)});
+      if (held != nullptr) { held->push_back(std::nullopt); }
     }
   }
   for (const auto& [i, lm] : lms) {

@@ -813,7 +813,8 @@ std::vector<ResourceClaim>
 lm_claims(const SessionContextIntf* session, const std::string& dir,
           const std::string& label, const genai::LmRunShape& run,
           std::int64_t picture_pixels, int picture_tokens,
-          std::size_t memory_limit, std::size_t expert_cache)
+          std::size_t memory_limit, std::size_t expert_cache,
+          bool ngram_resident)
 {
   const bool draft_head = run.draft_head;
   std::vector<ResourceClaim> out = weight_claims({dir});
@@ -919,7 +920,14 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
         out[0] = weight_claim_streamable(
             dir, disk - ex - un + gr +
                      ex / (std::size_t)std::max(1, qc.n_layers));
-        held_under_limit(&out[0], 0, disk - ex - un + gr, ex);
+        // The table asked for in memory is held with the rest where it
+        // fits (the loader's lm_ngram_resident): booked as if it will be,
+        // but not under a cache asked for that cannot hold every expert
+        // -- the loader never takes it there.
+        const bool table = ngram_resident &&
+                           (expert_cache == 0 || expert_cache >= ex);
+        held_under_limit(&out[0], 0, disk - ex - (table ? 0 : un) + gr,
+                         ex);
       }
     }
   }

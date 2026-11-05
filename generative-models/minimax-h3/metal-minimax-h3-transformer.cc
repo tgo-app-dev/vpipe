@@ -8227,6 +8227,8 @@ MetalMiniMaxH3Transformer::ane_setup_(int seq)
   o.session = _mc->session();
   o.mc      = _mc;
   o.tag     = "minimax-h3";
+  o.int8    = _cfg.ane_int8;
+  o.int8_plain = _cfg.ane_int8_plain;
   o.hidden  = _cfg.hidden;
   o.ffn     = _cfg.ffn;
   o.seq     = seq;
@@ -8363,6 +8365,8 @@ MetalMiniMaxH3Transformer::ane_qkv_setup_(int seq)
   o.session = _mc->session();
   o.mc      = _mc;
   o.tag     = "minimax-h3-qkv";
+  o.int8    = _cfg.ane_int8;
+  o.int8_plain = _cfg.ane_int8_plain;
   o.hidden  = _cfg.hidden;
   o.ffn     = 3 * _cfg.inner();          // output width
   o.seq     = seq;
@@ -9563,6 +9567,31 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
+    // THE FEED-FORWARD INPUT, SAVED: with VPIPE_H3_FF_CAPTURE=<dir>, each
+    // main block's [rows, H] fc1 input -- norm 2 and the modulation
+    // applied -- goes to <dir>/ff_in_<block>.bf16 as raw bf16, once (a
+    // file already there is kept, so the first forward's stays). Real
+    // activations for the ANE tier's numerics studies; it drains the GPU
+    // at every block, so it is a diagnostic only.
+    static const char* const kffcap = std::getenv("VPIPE_H3_FF_CAPTURE");
+    auto bsave = [&](const SharedBuffer& buf, int nrows, int width) {
+      if (kffcap == nullptr || *kffcap == '\0' || trip_blk < 0) { return; }
+      const std::string path = std::string(kffcap) + "/ff_in_" +
+                               std::to_string(trip_blk) + ".bf16";
+      if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        std::fclose(f);
+        return;
+      }
+      enc.end();
+      _flops.flush(stream);
+      stream.commit().wait();
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(buf.contents(), 2, (std::size_t)nrows * width, f);
+        std::fclose(f);
+      }
+      enc = stream.begin_compute();
+      mark = std::chrono::steady_clock::now();
+    };
     // THE TRIPWIRE. One dispatch per checked tensor, no drain, so it can
     // run on EVERY op of EVERY block without changing the timing that
     // this bug turned out to depend on. `tag` is block * 16 + op, and the
@@ -10411,6 +10440,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                  6 * H, 4 * H, 3 * H);
       }
       bdump("n2+mod", s.nm, H);
+      bsave(s.nm, rows, H);
       psplit(t_elt);
       // ---- the ANE split ----------------------------------------------
       //

@@ -30,12 +30,14 @@
 #include "apple-silicon/metal-compute/event.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <deque>
 #include <unordered_map>
 #include <vector>
@@ -255,6 +257,14 @@ public:
     // expert resident. The engine decides (expert_cache_plan); the output
     // is the resident model's, byte for byte.
     std::size_t expert_cache_bytes = 0;
+    // QWEN3.8-FLASH-NEXT: hold the n-gram PLE table (tens of GB) in memory,
+    // filled on a thread of its own after the load, its rows then read
+    // from there rather than from disk at every prompt (a shard at a time:
+    // a row of a shard not yet in memory is read from disk as without it).
+    // The host's choice (load_spec::kNgramResident) where the model, every
+    // expert and the table fit (lm_ngram_resident); the same rows either
+    // way, bit for bit.
+    bool ple_resident = false;
     // Weight-name root prepended before "model." / "lm_head." Qwen3.5-VL
     // nests the LM under "language_model."; Qwen3-ASR is at the root ("").
     std::string weight_prefix = "language_model.";
@@ -585,6 +595,26 @@ public:
       const SessionContextIntf* session, const std::string& dir,
       const Config& c, std::size_t scratch, std::size_t limit = 0,
       std::size_t cache = 0);
+  // Whether a host asking for the n-gram table in memory (load_spec::
+  // kNgramResident) gets it: where the model with EVERY expert resident
+  // and the table fits what lm_expert_cache_bytes sizes the model in --
+  // the box beside the manager's other models and scratch, the
+  // irreversible headroom, `limit` and a `cache` asked for (which must
+  // hold every expert). The experts come first: on a box that must cache
+  // them, the table stays on disk. False for every model without one.
+  static bool lm_ngram_resident(const SessionContextIntf* session,
+                                const std::string& dir, const Config& c,
+                                std::size_t scratch, std::size_t limit = 0,
+                                std::size_t cache = 0);
+  // Bytes of the n-gram table held in memory so far (0 when it is read
+  // from disk), and whether its fill is done -- for the plan and tests.
+  std::size_t ple_resident_bytes() const;
+  bool ple_resident_done() const;
+  // The whole table's bytes when it is held in memory (Config::
+  // ple_resident), however far its fill has got; 0 when it is read from
+  // disk. The load returns before the fill is done, and on another
+  // thread, so what the load allocated leaves this out.
+  std::size_t ple_table_bytes() const;
   // How many leading layers a prefill-streamed load of `c` over `wts`
   // pins (0 unless it streams with a pin_frac, and 0 where streams_raw()
   // -- residency replaces the prefix there) -- the rule load() takes,
@@ -1086,6 +1116,12 @@ public:
   std::uint64_t moe_nax_gemms() const noexcept { return _moe_nax_gemms; }
   std::uint64_t moe_shared_mma_gemms() const noexcept
   { return _moe_shared_mma_gemms; }
+  // ...and over 64-row work items (two sorted tiles of one expert), the
+  // hyper-connection blocks a prefill fused on the matrix units (hc_pre's
+  // three launches), and the QSA prefill attention on two simdgroups a row.
+  std::uint64_t moe_nax64_gemms() const noexcept { return _moe_nax64_gemms; }
+  std::uint64_t hc_fused_blocks() const noexcept { return _hc_fused_blocks; }
+  std::uint64_t qsa_nax2_layers() const noexcept { return _qsa_nax2_layers; }
   // The prefill-attention kernel set: the member serving an n-row fresh
   // prompt ("legacy" when the set does not serve it -- a 128-wide head
   // under 1536 rows or before its first such prefill, or a head dim it has
@@ -1376,6 +1412,9 @@ private:
     const metal_compute::SharedBuffer *hist = nullptr, *boff = nullptr,
         *curs = nullptr, *t2e = nullptr, *ntile = nullptr, *srow = nullptr,
         *sdst = nullptr, *gact = nullptr, *gdout = nullptr;
+    // The matrix-core twins' 64-row work items (maxtiles ints; the steel
+    // tier on an M5).
+    const metal_compute::SharedBuffer* items = nullptr;
     int npad = 0, maxtiles = 0, maxm = 4;
     // steel: matrix-tiled grouped GEMM (BM=maxm=32 tiles) for large prefill;
     // else the bandwidth GEMV grouping (maxm=2). The steel tier fuses the
@@ -1736,6 +1775,7 @@ private:
       // reads each expert's weight once per tile instead of once per token.
       _fn_moe_grouped_swiglu, _fn_moe_grouped_down, _fn_moe_ifill,
       _fn_moe_hist, _fn_moe_sort_setup, _fn_moe_scatter, _fn_moe_scatter_back,
+      _fn_moe_tile_items,   // the NAX twins' 64-row items over the tiles
       // Steel (matrix-tiled) grouped expert GEMM + the sorted-row gather.
       _fn_moe_qmm_grouped, _fn_moe_qmm_grouped_swiglu,
       // 8-bit twins of the routed-expert kernels above (selected at dispatch
@@ -1762,6 +1802,11 @@ private:
       _fn_hc_rms, _fn_hc_act, _fn_hc_mix, _fn_hc_inject, _fn_hc_tile,
       _fn_hc_rms8,   // a prefill's rows, 8 values a load
       _fn_hc_act_fused,   // the down | inject output split and activated
+      // A prefill's block on the matrix units in three launches: the norm
+      // with the pending injection and the inject projection (qwen4_hc.metal
+      // hc_group_rms8_pre_f16), then the down GEMM with silu and the up
+      // GEMM with the stream mix in their stores (dense_gemm_mma.metal).
+      _fn_hc_rms8_pre, _fn_hc_down_silu, _fn_hc_up_mix,
       // A decode's and a verify's mixer block in two launches, a row a
       // grid slice: [RPS / HPS 1, 2, 4] (qwen4_hc.metal hcf_*).
       _fn_hcf_pre[3], _fn_hcf_up[3],
@@ -1793,6 +1838,7 @@ private:
       _fn_qsa_score_simd,   // a few rows': a simdgroup a (block, row)
       _fn_qsa_topk_chunk, _fn_qsa_topk_merge,   // ...their two-phase select
       _fn_qsa_attn_nax,     // ... on the matrix units (M5, sdpa_mma.metal)
+      _fn_qsa_attn_nax2,    // ... two simdgroups a row, for occupancy
       // Dense f16 MoE gather GEMVs (raw-HF bf16 MoE): the dense twins of the
       // affine gather_swiglu / gather_down / moe_gate above.
       _fn_moe_gather_swiglu_dense, _fn_moe_gather_down_dense,
@@ -1954,6 +2000,12 @@ private:
   // on steel (the A/B, read per forward).
   bool _moe_nax = false;
   std::uint64_t _moe_nax_gemms = 0, _moe_shared_mma_gemms = 0;
+  std::uint64_t _moe_nax64_gemms = 0, _hc_fused_blocks = 0;
+  std::uint64_t _qsa_nax2_layers = 0;
+  // A section profile's mark (VPIPE_QWEN_HC_PROFILE=2): encode_moe_mlp_
+  // calls it after the routing (0), the routed experts (1) and the shared
+  // expert with the combine (2). Null otherwise.
+  const std::function<void(int)>* _moe_prof = nullptr;
   // Dynamic-int8 accelerated prefill GEMMs (set_i8_gemm); null when off.
   std::unique_ptr<I8GemmContext> _i8;
   std::uint64_t _i8_count = 0;
@@ -2719,8 +2771,19 @@ private:
     // the conv history [hist, hc*H], then the last two token ids (+1; 0 =
     // none, which reads as EOS).
     std::size_t hist_off = 0, ids_off = 0;
+    // The table in memory (Config::ple_resident): each shard's codes,
+    // scales and biases as stored (the weight set's derived entries, so
+    // the manager sees them), filled in shard order by `res_fill`; the
+    // rows of shards below `res_ready` read from here.
+    std::vector<metal_compute::SharedBuffer> res_w, res_s, res_b;
+    std::atomic<int> res_ready{0};
+    std::atomic<bool> res_stop{false};
+    std::thread res_fill;
+    ~Ple();   // stops and joins res_fill
   };
   std::unique_ptr<Ple> _ple;
+  // Fill _ple's table in memory (the res_fill thread's body).
+  void ple_fill_();
   // Build layer L of a hyper-connection model / its model-level tensors
   // (final mixer, PLE); every non-expert projection re-encoded to w8g64.
   bool build_layer_hc_(int L, std::string* err);
@@ -2938,6 +3001,9 @@ private:
     const metal_compute::ComputeFunction* qmm_down = nullptr;
     const metal_compute::ComputeFunction* nax_swiglu = nullptr;
     const metal_compute::ComputeFunction* nax_down = nullptr;
+    // ... over 64-row work items (two tiles of one expert)
+    const metal_compute::ComputeFunction* nax64_swiglu = nullptr;
+    const metal_compute::ComputeFunction* nax64_down = nullptr;
   };
   struct FusedMoeFns {
     const metal_compute::ComputeFunction* up = nullptr;
@@ -2949,6 +3015,7 @@ private:
   // Null when the format has no kernels (a width the gathers do not take).
   const ExpertFns* expert_fns_(int bits, int group) const;
   bool ensure_expert_fns_(int bits, int group);
+  void attach_nax64_fns_(int bits, int group, ExpertFns& f);
   const FusedMoeFns* fused_moe_fns_(int bits, int group, int sgroup) const;
   // forward_hc_'s head output ([rows, vocab], compute dtype) -- kept for
   // the GPU sampler of a decode step -- and the once-per-model warning that

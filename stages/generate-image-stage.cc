@@ -86,6 +86,9 @@ constexpr SpecExtra kSolThreshChoices[] = {
 constexpr SpecExtra kI8TierChoices[] = {
   {spec_key::kChoices, "accurate,fast,token,token_plain"},
 };
+constexpr SpecExtra kAneInt8TierChoices[] = {
+  {spec_key::kChoices, "token,token_plain"},
+};
 constexpr SpecExtra kSeedSequenceExtra[] = {
   {spec_key::kChoices, kSeedSequenceChoices},
 };
@@ -173,6 +176,34 @@ const ConfigKey kAttrs[] = {
           "module fits. A 4/8-bit affine checkpoint is dequantized "
           "into those buffers per block. Ignored by families that do "
           "not implement it -- they say so in the log"},
+  {.key = "ane_int8", .type = ConfigType::Bool, .required = false,
+   .doc = "the ANE's modules in ROTATED INT8 (LOSSY, W8A8) rather than "
+          "fp16: each staged weight row Walsh-Hadamard rotated and "
+          "quantized to int8, each projection's input rotated and "
+          "quantized per token inside the module -- the arithmetic of "
+          "i8_gemm_tier `token`, on the ANE's rows. A SwiGLU "
+          "feed-forward or a q/k/v matmul takes it where its widths are "
+          "multiples of 256; anything else keeps fp16 and the log says "
+          "so (MOSS-Image's SITU feed-forward does; its q/k/v takes "
+          "int8). Needs macOS 26. REQUIRES ane_ffn. Implemented by "
+          "Krea-2, FLUX.2, FLUX.3, Qwen-Image-2.1, Z-Image, MOSS-Image "
+          "and Fibo 2.0, and handed to a registered family in its accel "
+          "settings (ane_int8_tier says which int8); VPIPE_ANE_INT8 (0 | 1 | "
+          "plain) overrides it",
+   .def_bool = false},
+  {.key = "ane_int8_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 ane_int8 runs, named as i8_gemm_tier names the "
+          "GPU's: 'token' (default; each weight row and each "
+          "projection's input Walsh-Hadamard rotated per 256 and "
+          "quantized per row / per token) or 'token_plain' (the same "
+          "unrotated: ~3x token's error on a block's output, ~1.7x on "
+          "MiniMax-H3's video, at token's speed -- the arithmetic of the "
+          "GPU's token_plain, which reads a Draw Things i8x checkpoint's "
+          "codes as stored). On a Mac with "
+          "no GPU matrix cores (the M4 series), where i8_gemm does not "
+          "run, these are the int8 flavours there are. Needs ane_int8; "
+          "VPIPE_ANE_INT8=plain forces token_plain",
+   .def_str = "token", .extra = kAneInt8TierChoices},
   {.key = "ane_qkv", .type = ConfigType::Bool, .required = false,
    .doc = "the fused q|k|v projection on the ANE too, as a SECOND module "
           "beside the feed-forward's, split the same way and sharing the "
@@ -976,6 +1007,21 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
     // Only with the feed-forward: the two modules are one booking.
     genai::accel::set_flag(&_accel, genai::accel::kAneQkv,
                            on && attr_bool("ane_qkv"));
+    genai::accel::set_flag(&_accel, genai::accel::kAneInt8,
+                           on && attr_bool("ane_int8"));
+    {
+      namespace a = genai::accel;
+      const std::string t = attr_str("ane_int8_tier");
+      const bool plain = t == a::kI8TierTokenPlain;
+      if (!t.empty() && !plain && t != a::kI8TierToken) {
+        fail_config(fmt("GenerateImageStage('{}'): ane_int8_tier must be "
+                        "'token' or 'token_plain' (got '{}')", this->id(),
+                        t));
+      }
+      a::set_text(&_accel, a::kAneInt8Tier,
+                  std::string(plain ? a::kI8TierTokenPlain
+                                    : a::kI8TierToken));
+    }
     genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
     genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
     genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
@@ -1071,6 +1117,19 @@ GenerateImageStage::ane_claim_label_() const
   return "ane-ffn/" + std::string(this->id());
 }
 
+namespace {
+
+// Whether ane_int8 runs unrotated (`ane_int8_tier: token_plain`).
+bool
+ane_int8_plain_(const FlexData& accel)
+{
+  namespace a = genai::accel;
+  return a::flag(&accel, a::kAneInt8) &&
+         a::text(&accel, a::kAneInt8Tier) == a::kI8TierTokenPlain;
+}
+
+}  // namespace
+
 template <typename Cfg>
 void
 GenerateImageStage::apply_ane_(Cfg& cfg) const
@@ -1083,6 +1142,8 @@ GenerateImageStage::apply_ane_(Cfg& cfg) const
   // Before the bytes below, which must cover BOTH modules or the grant
   // is for less than the family will build.
   cfg.ane_qkv       = a::flag(&_accel, a::kAneQkv);
+  cfg.ane_int8      = a::flag(&_accel, a::kAneInt8);
+  cfg.ane_int8_plain = ane_int8_plain_(_accel);
   // WHETHER the tier runs is the plan's call; HOW MANY blocks use it is
   // not a memory question.
   //
@@ -1194,6 +1255,14 @@ GenerateImageStage::warm_key_(const Cfg& c, bool stream,
   }
   if constexpr (requires { c.ane_qkv; }) {
     k += fmt(" {}", c.ane_qkv ? 1 : 0)();
+  }
+  // Which arithmetic the modules run: a warm DiT keeps the modules it
+  // built, so one built fp16 is not the int8 one a launch asked for.
+  if constexpr (requires { c.ane_int8; }) {
+    k += fmt(" i8 {}", c.ane_int8 ? 1 : 0)();
+  }
+  if constexpr (requires { c.ane_int8_plain; }) {
+    k += fmt(" {}", c.ane_int8_plain ? "plain" : "rot")();
   }
   if constexpr (requires { c.ane_rows; }) { k += fmt(" {}", c.ane_rows)(); }
   if constexpr (requires { c.ane_layers; }) {
@@ -3340,6 +3409,8 @@ GenerateImageStage::ensure_loaded_()
                            session(), ane_claim_label_(), bytes, 1) > 0) {
         fcfg.session    = session();
         fcfg.ane_qkv    = a::flag(&_accel, a::kAneQkv);
+        fcfg.ane_int8   = a::flag(&_accel, a::kAneInt8);
+        fcfg.ane_int8_plain = ane_int8_plain_(_accel);
         fcfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
         fcfg.ane_layers = (int)std::max<long long>(
             0, a::integer(&_accel, a::kAneLayers, 0));
@@ -4226,6 +4297,9 @@ GenerateImageStage::load_qwen_image21_dit_()
     cfg.ane_ffn = false;
     cfg.ane_qkv = false;
   }
+  cfg.ane_int8 =
+      cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
+  cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
@@ -4299,6 +4373,9 @@ GenerateImageStage::load_z_image_dit_()
     cfg.ane_ffn = false;
     cfg.ane_qkv = false;
   }
+  cfg.ane_int8 =
+      cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
+  cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
@@ -4376,6 +4453,9 @@ GenerateImageStage::load_flux3_dit_()
     cfg.ane_ffn = false;
     cfg.ane_qkv = false;
   }
+  cfg.ane_int8 =
+      cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
+  cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
@@ -4450,6 +4530,9 @@ GenerateImageStage::load_fibo2_dit_()
     cfg.ane_ffn = false;
     cfg.ane_qkv = false;
   }
+  cfg.ane_int8 =
+      cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
+  cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
@@ -4523,6 +4606,9 @@ GenerateImageStage::load_moss_image_dit_()
     cfg.ane_ffn = false;
     cfg.ane_qkv = false;
   }
+  cfg.ane_int8 =
+      cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
+  cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
   cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
                                             0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,

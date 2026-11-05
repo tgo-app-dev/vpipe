@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1504,12 +1505,21 @@ SessionIntf::memory_report() const
   FlexData warm = FlexData::make_array();
   {
     auto a = warm.as_array();
-    for (const auto& w : mgr->warm_report()) {
+    // Each hold's own whole hold, beside the report and in its order.
+    std::vector<std::optional<std::size_t>> held;
+    const auto report = mgr->warm_report(&held);
+    for (std::size_t i = 0; i < report.size(); ++i) {
+      const auto& w = report[i];
       FlexData e = FlexData::make_object();
       auto eo = e.as_object();
       eo.insert("kind", FlexData::make_string(w.kind));
       eo.insert("dir", FlexData::make_string(w.dir));
       eo.insert("bytes", FlexData::make_uint(w.bytes));
+      // A language model's whole hold, where its load counted it (it
+      // loaded wired): absent otherwise, never a 0 that reads as empty.
+      if (i < held.size() && held[i].has_value()) {
+        eo.insert("held_bytes", FlexData::make_uint(*held[i]));
+      }
       eo.insert("kv_bytes", FlexData::make_uint(w.kv_bytes));
       eo.insert("seconds", FlexData::make_real(w.seconds));
       a.push_back(std::move(e));

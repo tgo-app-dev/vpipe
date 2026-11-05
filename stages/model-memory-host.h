@@ -66,6 +66,9 @@ std::size_t moe_expert_cache(const SessionContextIntf* session,
 // whole, as it loads. `expert_cache` (bytes, 0 none) is the cache the host
 // asks for (genai::load_spec::kExpertCacheMb): the weights are booked at
 // the rest of the model and that cache at most, within the limit alike.
+// `ngram_resident`: the host asks for an n-gram table read by row to be
+// held (genai::load_spec::kNgramResident) -- booked with the rest then,
+// as it may be.
 std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
                                      const std::string& dir,
                                      const std::string& label,
@@ -73,7 +76,8 @@ std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
                                      std::int64_t picture_pixels = 0,
                                      int picture_tokens = 0,
                                      std::size_t memory_limit = 0,
-                                     std::size_t expert_cache = 0);
+                                     std::size_t expert_cache = 0,
+                                     bool ngram_resident = false);
 
 // int, on a weights claim's `extra`: the most the component will HOLD,
 // when that is less than its checkpoint weighs and it is not a floor -- a

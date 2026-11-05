@@ -6,12 +6,18 @@
 #include "common/vpipe-format.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -150,6 +156,76 @@ comfy_config_(const std::string& file, MiniMaxH3TextEncoder::Config& out,
   // values, which is what this checkpoint is a repack of.
   c.rope_theta = 5.0e6f;
   c.rms_eps    = 1e-6f;
+  return true;
+}
+
+// P-H3-Image's connector beside the encoder (`text_connector/`, a
+// PH3ImageTextConnector): the taps it reads and the width it writes. No
+// such directory is no connector -- MiniMax-H3's own conditioning -- and
+// true; a connector this encoder cannot feed is false, with `err`.
+bool
+connector_config_(const std::filesystem::path& cd,
+                  MiniMaxH3TextEncoder::Config& out, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  std::ifstream in(cd / "config.json");
+  if (!in) { return true; }
+  FlexData cfg;
+  try {
+    cfg = FlexData::from_json(in);
+  } catch (...) {
+    return fail("cannot parse " + (cd / "config.json").string());
+  }
+  if (!cfg.is_object()) { return true; }
+  auto o = cfg.as_object();
+  {
+    const FlexData c =
+        o.contains("_class_name") ? o.at("_class_name") : FlexData();
+    if (!c.is_string() || c.as_string("") != ph3::kConnectorClass) {
+      return true;
+    }
+  }
+  std::vector<int> taps = {13, 19, 25, 31, 36};   // the class's default
+  if (o.contains("hidden_state_indices")) {
+    FlexData a = o.at("hidden_state_indices");
+    if (a.is_array()) {
+      taps.clear();
+      for (auto e : a.as_array()) { taps.push_back((int)e.as_int(-1)); }
+    }
+  }
+  const int hidden = o.contains("text_hidden_size")
+                         ? (int)o.at("text_hidden_size").as_int(0)
+                         : out.lm.hidden;
+  const int width = o.contains("out_channels")
+                        ? (int)o.at("out_channels").as_int(0)
+                        : 5120;
+  if (taps.empty() || hidden != out.lm.hidden || width <= 0) {
+    return fail(cd.string() + ": the connector reads " +
+                std::to_string(taps.size()) + " taps of " +
+                std::to_string(hidden) + " where the encoder is " +
+                std::to_string(out.lm.hidden) + " wide");
+  }
+  for (std::size_t i = 0; i < taps.size(); ++i) {
+    const int t = taps[i];
+    // 0 is the embedding output, which the taps forward does not give;
+    // the forward takes its layers in order, once each.
+    if (i > 0 && t <= taps[i - 1]) {
+      return fail(cd.string() + ": the connector's taps are not strictly "
+                  "increasing");
+    }
+    if (t < 1 || t > out.total_layers) {
+      return fail(cd.string() + ": tap " + std::to_string(t) +
+                  " is outside the encoder's 1 .. " +
+                  std::to_string(out.total_layers));
+    }
+  }
+  out.taps      = taps;
+  out.tap       = *std::max_element(taps.begin(), taps.end());
+  out.text_dim  = width;
+  out.connector = cd.string();
   return true;
 }
 
@@ -345,6 +421,11 @@ MiniMaxH3TextEncoder::config_from_json(const std::string& enc_dir, Config& out,
       if (b == 4 || b == 8) { c.quant_bits = b; out.quantized = true; }
     }
   }
+  // P-H3-Image: a connector beside the encoder names its taps (and the
+  // width the DiT reads). The encoder is a stock Qwen3-VL either way.
+  if (!connector_config_(dir.parent_path() / "text_connector", out, err)) {
+    return false;
+  }
   if (out.tap <= 0 || out.tap > out.total_layers) {
     return fail("tap layer " + std::to_string(out.tap) + " is outside the "
                 "checkpoint's " + std::to_string(out.total_layers) +
@@ -529,6 +610,68 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
     return nullptr;
   }
 
+  // P-H3-Image's connector, every tensor f32 as stored and cached in the
+  // connector's own set (the manager sees them), and the encoder's final
+  // norm when a tap is the normed state -- read, not kept as a tensor:
+  // the normed tap is a host pass.
+  if (!m->_cfg.connector.empty()) {
+    const auto& cc = m->_cfg;
+    m->_conn_ws = open_weight_set(cc.connector, session);
+    if (!m->_conn_ws) { return nullptr; }
+    const std::size_t in = cc.taps.size() * (std::size_t)cc.lm.hidden;
+    const std::size_t outw = (std::size_t)cc.text_dim;
+    auto f32 = [&](const char* nm, std::size_t n) -> SharedBuffer {
+      const auto* ti = m->_conn_ws->src().info(nm);
+      if (ti == nullptr || ti->dtype != "F32" ||
+          (std::size_t)ti->nbytes != n * 4) {
+        if (session != nullptr) {
+          session->warn(fmt("MiniMaxH3TextEncoder: the connector's '{}' is "
+                            "missing or not {} f32 values", nm, n));
+        }
+        return {};
+      }
+      return m->_conn_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    };
+    m->_in_mean  = f32("input_mean", in);
+    m->_in_std   = f32("input_std", in);
+    m->_proj     = f32("proj.weight", in * outw);
+    m->_out_mean = f32("output_mean", outw);
+    m->_out_std  = f32("output_std", outw);
+    m->_sink     = f32("sink_embedding", outw);
+    if (m->_in_mean.empty() || m->_in_std.empty() || m->_proj.empty() ||
+        m->_out_mean.empty() || m->_out_std.empty() || m->_sink.empty()) {
+      return nullptr;
+    }
+    if (std::find(cc.taps.begin(), cc.taps.end(), cc.total_layers) !=
+        cc.taps.end()) {
+      for (const char* nm : {"model.language_model.norm.weight",
+                             "model.norm.weight"}) {
+        const auto* ti = m->_ws->src().info(nm);
+        if (ti == nullptr) { continue; }
+        SharedBuffer raw = m->_ws->read(nm, mc, WeightSet::Residency::Copied);
+        const std::size_t H = (std::size_t)cc.lm.hidden;
+        if (raw.empty() || ti->dtype != "BF16" || raw.byte_size() < H * 2) {
+          break;
+        }
+        const auto* b = static_cast<const std::uint16_t*>(raw.contents());
+        m->_final_norm.resize(H);
+        for (std::size_t i = 0; i < H; ++i) {
+          const std::uint32_t u = (std::uint32_t)b[i] << 16;
+          std::memcpy(&m->_final_norm[i], &u, 4);
+        }
+        break;
+      }
+      if (m->_final_norm.empty()) {
+        if (session != nullptr) {
+          session->warn(fmt("MiniMaxH3TextEncoder: the connector reads the "
+                            "normed last state and the encoder has no bf16 "
+                            "final norm"));
+        }
+        return nullptr;
+      }
+    }
+  }
+
   if (session != nullptr) {
     session->log_debug(
         fmt("MiniMaxH3TextEncoder: Qwen3-VL hidden {} x {} heads ({} kv), "
@@ -585,15 +728,141 @@ MiniMaxH3TextEncoder::encode_ids(const std::vector<std::int32_t>& ids,
   // The tap is 0-INDEXED over layers; HF's output_hidden_states[k] is
   // the residual after layer k-1. So conditioning on hidden_states[50]
   // means tapping after 0-indexed layer 49.
-  const std::vector<int> taps{_cfg.tap - 1};
+  const std::vector<int> taps = tap_layers_();
   ContextManager* cm = _lm->context_manager();
   if (cm == nullptr) { return fail("encoder has no context manager"); }
   const ContextId cid = cm->acquire_root();
   SharedBuffer h = _lm->forward_embeddings_taps(cid, x, n, taps);
   cm->release(cid);
   if (h.empty()) { return fail("encoder forward failed"); }
-  return h;
+  return finish_(std::move(h), n, err);
 }
+
+std::vector<int>
+MiniMaxH3TextEncoder::tap_layers_() const
+{
+  if (_cfg.taps.empty()) { return {_cfg.tap - 1}; }
+  // HF index t is the output of 0-indexed layer t - 1; the normed state
+  // (t == total_layers) is the last layer's output, normed afterwards.
+  std::vector<int> out;
+  for (int t : _cfg.taps) { out.push_back(t - 1); }
+  return out;
+}
+
+SharedBuffer
+MiniMaxH3TextEncoder::finish_(SharedBuffer h, int n, std::string* err) const
+{
+  if (!has_connector()) { return h; }
+  return connect(h, n, err);
+}
+
+// PH3ImageTextConnector.forward, in its own precision: the taps (bf16,
+// as the encoder emits them) widened to f32 and concatenated per row,
+// standardized, projected by one f32 GEMM, destandardized, the first
+// row replaced by the sink, rounded to bf16 once -- the reference's
+// `.to(text_encoder.dtype)`. The normed tap is the encoder's own
+// Qwen3VLTextRMSNorm: f32 statistics, the normed value rounded to bf16,
+// times the bf16 weight, rounded again. No FMA contraction anywhere a
+// reference op rounds between a multiply and an add.
+#pragma clang fp contract(off)
+SharedBuffer
+MiniMaxH3TextEncoder::connect(const SharedBuffer& taps, int n,
+                              std::string* err) const
+{
+  auto fail = [&](std::string m) -> SharedBuffer {
+    if (err != nullptr) { *err = std::move(m); }
+    return {};
+  };
+  if (!has_connector() || _proj.empty()) {
+    return fail("this encoder has no connector");
+  }
+  const std::size_t T = _cfg.taps.size();
+  const std::size_t H = (std::size_t)_cfg.lm.hidden;
+  const std::size_t IN = T * H, OUT = (std::size_t)_cfg.text_dim;
+  if (n <= 0 || taps.byte_size() < T * (std::size_t)n * H * 2) {
+    return fail("the taps are smaller than " + std::to_string(T) + " x " +
+                std::to_string(n) + " x " + std::to_string(H));
+  }
+  auto bf = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto rne = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  const auto* src = static_cast<const std::uint16_t*>(taps.contents());
+  const float eps = _cfg.lm.rms_eps;
+  for (std::size_t t = 0; t < T; ++t) {
+    if (_cfg.taps[t] == _cfg.total_layers && _final_norm.size() != H) {
+      return fail("the normed tap needs the encoder's final norm");
+    }
+  }
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)n * OUT * 2);
+  if (out.empty()) { return fail("conditioning allocation failed"); }
+  const float* mu = static_cast<const float*>(_in_mean.contents());
+  const float* sd = static_cast<const float*>(_in_std.contents());
+  const float* om = static_cast<const float*>(_out_mean.contents());
+  const float* os = static_cast<const float*>(_out_std.contents());
+  const float* sk = static_cast<const float*>(_sink.contents());
+  auto* d = static_cast<std::uint16_t*>(out.contents());
+  // A BLOCK of rows at a time: the concatenated input is 51 KB a row and
+  // the projection's output 20 KB, so a whole edit presentation (~10k
+  // rows) held at once was ~0.7 GB of host memory no plan books. Rows are
+  // independent; the block changes nothing but the footprint.
+  constexpr int kBlock = 256;
+  std::vector<float> x((std::size_t)kBlock * IN);
+  std::vector<float> y((std::size_t)kBlock * OUT);
+  for (int r0 = 0; r0 < n; r0 += kBlock) {
+    const int nb = std::min(kBlock, n - r0);
+    for (std::size_t t = 0; t < T; ++t) {
+      const bool normed = _cfg.taps[t] == _cfg.total_layers;
+      for (int j = 0; j < nb; ++j) {
+        const std::uint16_t* row =
+            src + (t * (std::size_t)n + (std::size_t)(r0 + j)) * H;
+        float* dst = x.data() + (std::size_t)j * IN + t * H;
+        if (!normed) {
+          for (std::size_t i = 0; i < H; ++i) { dst[i] = bf(row[i]); }
+          continue;
+        }
+        double ss = 0.0;
+        for (std::size_t i = 0; i < H; ++i) {
+          const double v = bf(row[i]);
+          ss += v * v;
+        }
+        const float var = (float)(ss / (double)H);
+        const float rs = 1.0f / std::sqrt(var + eps);
+        for (std::size_t i = 0; i < H; ++i) {
+          const float v = bf(rne(bf(row[i]) * rs));
+          dst[i] = bf(rne(_final_norm[i] * v));
+        }
+      }
+    }
+    for (int j = 0; j < nb; ++j) {
+      float* row = x.data() + (std::size_t)j * IN;
+      for (std::size_t i = 0; i < IN; ++i) {
+        row[i] = (row[i] - mu[i]) / sd[i];
+      }
+    }
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nb, (int)OUT,
+                (int)IN, 1.0f, x.data(), (int)IN,
+                static_cast<const float*>(_proj.contents()), (int)IN, 0.0f,
+                y.data(), (int)OUT);
+    for (int j = 0; j < nb; ++j) {
+      const int r = r0 + j;
+      for (std::size_t o = 0; o < OUT; ++o) {
+        const float scaled = y[(std::size_t)j * OUT + o] * os[o];
+        const float v = r == 0 ? sk[o] : scaled + om[o];
+        d[(std::size_t)r * OUT + o] = rne(v);
+      }
+    }
+  }
+  return out;
+}
+#pragma clang fp contract(on)
 
 std::vector<float>
 MiniMaxH3TextEncoder::video_block_seconds(int num_sampled_frames,
@@ -897,7 +1166,7 @@ MiniMaxH3TextEncoder::encode_references(const std::vector<Reference>& refs,
   }
 
   // ---- 5. the tap ------------------------------------------------------
-  const std::vector<int> taps{_cfg.tap - 1};
+  const std::vector<int> taps = tap_layers_();
   ContextManager* cm = _lm->context_manager();
   if (cm == nullptr) { return fail("encoder has no context manager"); }
   const ContextId cid = cm->acquire_root();
@@ -906,6 +1175,8 @@ MiniMaxH3TextEncoder::encode_references(const std::vector<Reference>& refs,
       ds.feats.empty() ? nullptr : &ds);
   cm->release(cid);
   if (h.empty()) { return fail("encoder forward failed"); }
+  h = finish_(std::move(h), n, err);
+  if (h.empty()) { return {}; }
 
   if (token_tags != nullptr) { *token_tags = std::move(P.tags); }
   if (n_tokens != nullptr) { *n_tokens = n; }

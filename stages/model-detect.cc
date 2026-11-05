@@ -9,6 +9,7 @@
 
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/wan/metal-wan-vae.h"
 
@@ -224,6 +225,7 @@ family_version_(const std::string& mt, std::string& family,
       {"minimax-h3-ref2va",      "MiniMax",     "H3-Ref2VA"},
       {"minimax-h3-dit",         "MiniMax",     "H3-FL2VA"},
       {"minimax-h3-text-encoder", "MiniMax",    "H3-FL2VA"},
+      {"p-h3-image",             "P-H3",        "Image"},
       {"moss-tts",               "MOSS",        "TTS"},
       {"moss-tts-local",         "MOSS",        "TTS-Local"},
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
@@ -843,8 +845,16 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   }
 
   // ---- 2. a diffusers pipeline (transformer/ + vae/) ------------------
+  // P-H3-Image first, by its manifest: its transformer/ (when it carries
+  // one) is an H3 DiT with no partition named, which the probe below
+  // would leave untagged -- and the root may carry no DiT at all.
+  if (d.is_dir && genai::ph3::is_root(dir)) {
+    d.model_type  = "p-h3-image";
+    d.detected_by = "p-h3-image-manifest";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
   const FlexData dit_cfg = read_json_(root / "transformer" / "config.json");
-  if (dit_cfg.is_object()) {
+  if (dit_cfg.is_object() && d.model_type.empty()) {
     // as_object() returns a VIEW, so the manifest has to outlive the
     // lookup -- bind it to a local rather than chaining off the call.
     const FlexData  mi = read_json_(root / "model_index.json");
@@ -1305,6 +1315,9 @@ constexpr VaeClass kVaeClasses[] = {
     // latent voxel, each projecting a whole 4x16x16 pixel block.
     {"MiniMaxH3VideoVAE", "minimax-h3"},
     {genai::minimax_h3::kDiffusersVideoVaeClass, "minimax-h3"},
+    // P-H3-Image's: H3's encoder with a decoder for one latent frame,
+    // which the same class runs (Config::dec_patch_t).
+    {genai::ph3::kVaeClass, "minimax-h3"},
 };
 
 }  // namespace

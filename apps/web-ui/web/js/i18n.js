@@ -2778,6 +2778,38 @@ const STRINGS = {
       + 'Krea-2 的前饋上實測 10.4 TOPS。該模組是否放得下由資源計畫決定。4/8 '
       + '位元仿射檢查點會按 block 反量化進這些緩衝。不實作它的模型族會忽略該'
       + '項——它們會在日誌裡說明'],
+  'cfg.generate-image.ane_int8': ['',
+      '让 ANE 上的模块以旋转 INT8（有损，W8A8）而非 fp16 运行：暂存的每一行'
+      + '权重先做 Walsh-Hadamard 旋转再量化为 int8，每个投影的输入在模块内旋转'
+      + '并按 token 量化——即 i8_gemm_tier `token` 的算法，用在 ANE 承担的行'
+      + '上。SwiGLU 前馈或 q/k/v 矩阵乘在宽度为 256 的倍数时采用它；其余的保持 '
+      + 'fp16，并在日志里说明（MOSS-Image 的 SITU 前馈即如此，它的 q/k/v 则用 '
+      + 'int8）。需要 macOS 26。需要 ane_ffn。已由 Krea-2、FLUX.2、FLUX.3、'
+      + 'Qwen-Image-2.1、Z-Image、MOSS-Image 与 Fibo 2.0 实现，并通过加速设置'
+      + '交给已注册的模型族（ane_int8_tier 指定哪种 int8）；环境变量 VPIPE_ANE_INT8（0 | 1 | plain）可覆盖',
+      '讓 ANE 上的模組以旋轉 INT8（有損，W8A8）而非 fp16 執行：暫存的每一列'
+      + '權重先做 Walsh-Hadamard 旋轉再量化為 int8，每個投影的輸入在模組內旋轉'
+      + '並按 token 量化——即 i8_gemm_tier `token` 的演算法，用在 ANE 承擔的列'
+      + '上。SwiGLU 前饋或 q/k/v 矩陣乘在寬度為 256 的倍數時採用它；其餘的維持 '
+      + 'fp16，並在日誌裡說明（MOSS-Image 的 SITU 前饋即如此，它的 q/k/v 則用 '
+      + 'int8）。需要 macOS 26。需要 ane_ffn。已由 Krea-2、FLUX.2、FLUX.3、'
+      + 'Qwen-Image-2.1、Z-Image、MOSS-Image 與 Fibo 2.0 實作，並透過加速設定'
+      + '交給已註冊的模型族（ane_int8_tier 指定哪種 int8）；環境變數 VPIPE_ANE_INT8（0 | 1 | plain）可覆寫'],
+  'cfg.generate-image.ane_int8_tier': ['',
+      'ane_int8 运行哪种 int8，命名与 i8_gemm_tier 对 GPU 的命名一致：'
+      + '\'token\'（默认；每一行权重和每个投影的输入按 256 做 Walsh-Hadamard '
+      + '旋转，再按行 / 按 token 量化）或 \'token_plain\'（同样的算法但不旋转：'
+      + '块输出的误差约为 token 的 3 倍、MiniMax-H3 视频约 1.7 倍，速度与 token 相同；即 GPU 上 '
+      + 'token_plain 的算法，它按原样读取 Draw Things i8x 检查点的码）。在没有 '
+      + 'GPU 矩阵核心的 Mac（M4 系列）上 i8_gemm 不运行，这两种就是可用的 int8 '
+      + '形式。需要 ane_int8；环境变量 VPIPE_ANE_INT8=plain 强制 token_plain',
+      'ane_int8 執行哪種 int8，命名與 i8_gemm_tier 對 GPU 的命名一致：'
+      + '\'token\'（預設；每一列權重和每個投影的輸入按 256 做 Walsh-Hadamard '
+      + '旋轉，再按列 / 按 token 量化）或 \'token_plain\'（同樣的演算法但不旋轉：'
+      + '區塊輸出的誤差約為 token 的 3 倍、MiniMax-H3 視訊約 1.7 倍，速度與 token 相同；即 GPU 上 '
+      + 'token_plain 的演算法，它按原樣讀取 Draw Things i8x 檢查點的碼）。在沒有 '
+      + 'GPU 矩陣核心的 Mac（M4 系列）上 i8_gemm 不執行，這兩種就是可用的 int8 '
+      + '形式。需要 ane_int8；環境變數 VPIPE_ANE_INT8=plain 強制 token_plain'],
   'cfg.generate-image.ane_qkv': ['',
       '把融合的 q|k|v 投影也放到 ANE 上，作为前馈模块之外的第二个模块，切分方'
       + '式相同，并共用同一个 ANE worker。需要 ane_ffn：资源计划把两个模块作为'
@@ -3288,6 +3320,38 @@ const STRINGS = {
       + '一個整體來預訂，要給就一起給。它在前饋之外還要占用自己的權重槽位與暫'
       + '存，因此在只有前饋時會被核准的場合，成對申請仍可能被拒。由 MiniMax-H3 '
       + '實作；環境變數 VPIPE_H3_ANE_QKV=1 同樣可以開啟'],
+  'cfg.generate-video.ane_int8': ['',
+      '让 ANE 上的模块以旋转 INT8（有损，W8A8）而非 fp16 运行：暂存的每一行'
+      + '权重先做 Walsh-Hadamard 旋转再量化为 int8，每个投影的输入在模块内旋转'
+      + '并按 token 量化——即 i8_gemm_tier `token` 的算法，用在 ANE 承担的行'
+      + '上。在 MiniMax-H3 的前馈上，ANE 约快 1.5 倍（M4 Pro），其输出行与精确'
+      + '值的距离约为 fp16 的 2.5–9 倍（真实块上 0.6-2.1e-2，对 2.2-2.5e-3，与 GPU '
+      + 'token 档相同）。需要 macOS 26；模块无法以此运行时，该档保持 fp16 并给'
+      + '出提示。需要 ane_ffn。由 MiniMax-H3 实现，并通过加速设置交给已注册的'
+      + '模型族（ane_int8_tier 指定哪种 int8）；环境变量 VPIPE_ANE_INT8（0 | 1 | plain）可覆盖',
+      '讓 ANE 上的模組以旋轉 INT8（有損，W8A8）而非 fp16 執行：暫存的每一列'
+      + '權重先做 Walsh-Hadamard 旋轉再量化為 int8，每個投影的輸入在模組內旋轉'
+      + '並按 token 量化——即 i8_gemm_tier `token` 的演算法，用在 ANE 承擔的列'
+      + '上。在 MiniMax-H3 的前饋上，ANE 約快 1.5 倍（M4 Pro），其輸出列與精確'
+      + '值的距離約為 fp16 的 2.5–9 倍（真實區塊上 0.6-2.1e-2，對 2.2-2.5e-3，與 '
+      + 'GPU token 檔相同）。需要 macOS 26；模組無法以此執行時，該檔維持 fp16 '
+      + '並給出提示。需要 ane_ffn。由 MiniMax-H3 實作，並透過加速設定交給已註'
+      + '冊的模型族（ane_int8_tier 指定哪種 int8）；環境變數 VPIPE_ANE_INT8（0 | 1 | plain）可覆寫'],
+  'cfg.generate-video.ane_int8_tier': ['',
+      'ane_int8 运行哪种 int8，命名与 i8_gemm_tier 对 GPU 的命名一致：'
+      + '\'token\'（默认；每一行权重和每个投影的输入按 256 做 Walsh-Hadamard '
+      + '旋转，再按行 / 按 token 量化）或 \'token_plain\'（同样的算法但不旋转：'
+      + '块输出的误差约为 token 的 3 倍、MiniMax-H3 视频约 1.7 倍，速度与 token 相同；即 GPU 上 '
+      + 'token_plain 的算法，它按原样读取 Draw Things i8x 检查点的码）。在没有 '
+      + 'GPU 矩阵核心的 Mac（M4 系列）上 i8_gemm 不运行，这两种就是可用的 int8 '
+      + '形式。需要 ane_int8；环境变量 VPIPE_ANE_INT8=plain 强制 token_plain',
+      'ane_int8 執行哪種 int8，命名與 i8_gemm_tier 對 GPU 的命名一致：'
+      + '\'token\'（預設；每一列權重和每個投影的輸入按 256 做 Walsh-Hadamard '
+      + '旋轉，再按列 / 按 token 量化）或 \'token_plain\'（同樣的演算法但不旋轉：'
+      + '區塊輸出的誤差約為 token 的 3 倍、MiniMax-H3 視訊約 1.7 倍，速度與 token 相同；即 GPU 上 '
+      + 'token_plain 的演算法，它按原樣讀取 Draw Things i8x 檢查點的碼）。在沒有 '
+      + 'GPU 矩陣核心的 Mac（M4 系列）上 i8_gemm 不執行，這兩種就是可用的 int8 '
+      + '形式。需要 ane_int8；環境變數 VPIPE_ANE_INT8=plain 強制 token_plain'],
   'cfg.generate-video.ane_rows': ['',
       '前馈中分给 ANE 的行的比例，其余由 GPU 并发承担（前馈里各行相互独立，所'
       + '以这个切分是精确的——没有部分和，也没有接缝）。0（默认）让模型族按两'
@@ -7268,6 +7332,21 @@ const STRINGS = {
       + 'false 则强制走标准解码路径',
       '模型自帶 MTP 推測解碼頭時使用它（token 精確；只影響效能）；設為 '
       + 'false 則強制走標準解碼路徑'],
+  'cfg.text-chat.ngram_resident': ['',
+      '模型若有按行从磁盘读取的 n-gram 嵌入表（Qwen3.8-Flash-Next 的，'
+      + '数十 GB），改为把它常驻内存：加载完成后再填充，加载不变慢；之后'
+      + '提示词的行从内存读取——长提示词的第一段不再等待几十万次磁盘读取。'
+      + '只在模型连同全部专家常驻、再加上这张表都放得下时才采用（也受 '
+      + 'memory_limit_mb 与 expert_cache_mb 约束）；否则仍从磁盘读取。'
+      + '其他模型忽略此项；保温中的模型按其加载时的方式交接。false：从磁'
+      + '盘读取',
+      '模型若有按行從磁碟讀取的 n-gram 嵌入表（Qwen3.8-Flash-Next 的，'
+      + '數十 GB），改為把它常駐記憶體：載入完成後再填充，載入不變慢；之後'
+      + '提示詞的行從記憶體讀取——長提示詞的第一段不再等待幾十萬次磁碟讀取。'
+      + '只在模型連同全部專家常駐、再加上這張表都放得下時才採用（也受 '
+      + 'memory_limit_mb 與 expert_cache_mb 約束）；否則仍從磁碟讀取。'
+      + '其他模型忽略此項；保溫中的模型按其載入時的方式交接。false：從磁'
+      + '碟讀取'],
   'cfg.text-chat.mtp_prefix_seed': ['',
       '解码开始时用提示词为 MTP 起草器的 KV 预热：草稿接受率/解码吞吐更高，'
       + '代价是少量额外预填充（token 精确；只影响性能）。默认开启（聊天是解'

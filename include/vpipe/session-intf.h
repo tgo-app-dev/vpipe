@@ -287,8 +287,8 @@ public:
   // What the session holds in memory NOW, by what holds it -- a host's
   // "what is in RAM" view, numbers only:
   //
-  //   {"warm":    [{"kind": s, "dir": s, "bytes": u, "kv_bytes": u,
-  //                 "seconds": f}, ...],
+  //   {"warm":    [{"kind": s, "dir": s, "bytes": u, "held_bytes": u,
+  //                 "kv_bytes": u, "seconds": f}, ...],
   //    "weights": [{"dir": s, "bytes": u, "mapped_bytes": u,
   //                 "holders": i, "parked": b}, ...],
   //    "kv_bytes": u, "pooled_bytes": u,
@@ -296,14 +296,23 @@ public:
   //
   // `warm`: the models kept warm between runs, one a hold -- a language
   // model kept loaded (`kind` "language-model": `bytes` its wired
-  // weights, 0 when it loaded unwired; `kv_bytes` its K/V, its parked
-  // conversations' too) or a model a stage built (its kind, "flux2-dit",
-  // "qwen-text-encoder", ...; `bytes` as the stage kept it, 0 where it
-  // said none) -- and the seconds before each goes unless used.
+  // weights, 0 when it loaded unwired; `held_bytes`, where its load
+  // counted it (it loaded wired; absent otherwise), all that hold keeps
+  // as a launch weighs it beside itself -- the wired bytes, what a full
+  // wired pool left unwired, and what it filled after its load (an
+  // n-gram table held in memory, never wired); `kv_bytes` its K/V, its
+  // parked conversations' too) or a model a stage built (its kind,
+  // "flux2-dit", "qwen-text-encoder", ...; `bytes` as the stage kept it,
+  // 0 where it said none) -- and the seconds before each goes unless
+  // used. A hold's `bytes` and `held_bytes` say WHOSE the memory is; they
+  // are not additive with `weights` below, which counts what a model
+  // keeps through its checkpoint's weight set (that n-gram table, a
+  // DiT's trunk) too.
   // `weights`: each checkpoint's weights resident through the model
-  // manager -- a language model's are not among them; `holders` what
-  // holds its set, the models using it and those kept warm alike (0:
-  // nothing does); `parked`: handed to the kernel as purgeable.
+  // manager -- a language model's own are not among them, only what it
+  // keeps through its set; `holders` what holds its set, the models
+  // using it and those kept warm alike (0: nothing does); `parked`:
+  // handed to the kernel as purgeable.
   // `kv_bytes` every language model's K/V, the warm ones' included;
   // `pooled_bytes` the checkpoints nothing holds, which the manager can
   // drop now (a model kept warm holds its own, so letting it go frees

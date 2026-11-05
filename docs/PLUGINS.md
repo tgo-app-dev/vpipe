@@ -1223,6 +1223,19 @@ declare it twice or leave it out:
   label reaches your `load()` as `genai::create_args::kCoreMLLabel` in
   `ImageModelCreateArgs::borrowed_extra`; revise what you actually hold
   under it (`revise_scratch("coreml:" + label, bytes)`).
+- **`ane_int8`**, the graph's ask for the ANE's modules in rotated int8
+  (W8A8, lossy), arrives in the same bag as `accel::kAneInt8` -- true only
+  beside `ane_ffn`, on generate-image and generate-video alike. A family on
+  `ane::Tier` passes it on as the spec's `ane::kInt8`; the tier builds the
+  int8 module where it can (a SwiGLU or a matmul without biases, widths
+  multiples of 256, macOS 26) and fp16 otherwise, saying why in the log,
+  and `info()`'s `int8` says which it built. Which int8 arrives as
+  `accel::kAneInt8Tier` (`ane_int8_tier`: `token`, the default, or
+  `token_plain`, unrotated); pass it on as the spec's `ane::kInt8Tier`,
+  and `info()`'s `int8_tier` names what was built. An unknown tier is
+  refused by name. A host older than these keys ignores them -- fp16 for
+  `int8`, `token` for the tier -- and its `info()` carries neither. Book
+  the fp16 module's bytes either way: the int8 one holds less.
 - **The model pickers.** Registering the family puts its tag on the
   shared-model channel (model-select offers it) AND on generate-image's
   own `hf_dir` picker. A directory your `claims()` accepts is also what

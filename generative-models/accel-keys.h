@@ -178,6 +178,27 @@ inline constexpr std::string_view kAneLayers = "ane_layers";
 // the moment a graph turns this on.
 inline constexpr std::string_view kAneQkv = "ane_qkv";
 
+// The ANE tiers in ROTATED INT8 (W8A8) rather than fp16: each staged
+// weight row Walsh-Hadamard rotated per 256-block and quantized to its own
+// step, each projection's input rotated and quantized per token inside
+// the module -- the GPU token tier's arithmetic on the ANE's rows. Bool;
+// default false. LOSSY, hence a key: 2.5-9x the fp16 tier's error on a
+// MiniMax-H3 feed-forward's output (0.6-2.1e-2 against 2.2-2.5e-3), for
+// ~1.5x the ANE's rate. Needs macOS 26 (CoreML's int8 arrays); a module
+// that cannot run it keeps fp16. Meaningful only with kAneFfn. A plugin
+// family on ane::Tier passes it on as the spec's ane::kInt8.
+inline constexpr std::string_view kAneInt8 = "ane_int8";
+
+// WHICH int8 kAneInt8 runs, named as the GPU's kI8GemmTier names it: text,
+// kI8TierToken ("token", the default: rotated per 256-block, quantized
+// per token -- the arithmetic above) or kI8TierTokenPlain ("token_plain":
+// no rotation -- ~3x the error on a block's output, ~1.7x on MiniMax-H3's
+// video, at token's speed: the GPU token_plain tier's arithmetic, e.g.
+// beside it on a native i8x file).
+// Meaningful only with kAneInt8. A plugin on ane::Tier passes it on as
+// the spec's ane::kInt8Tier.
+inline constexpr std::string_view kAneInt8Tier = "ane_int8_tier";
+
 }  // namespace accel
 }  // namespace genai
 }  // namespace vpipe

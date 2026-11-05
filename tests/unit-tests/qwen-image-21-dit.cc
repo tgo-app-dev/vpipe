@@ -17,6 +17,7 @@
 //
 // Env: VPIPE_QWEN_IMAGE21_TEST_MODEL_PATH (uses <root>/transformer).
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 #include "residency-reserve.h"
 
@@ -3433,10 +3434,12 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
                                       : (float)std::atof(v.c_str() + c + 1);
     loras.push_back(sp);
   }
-  auto make = [&](int arm) {
+  auto make = [&](int arm, bool int8 = false, bool plain = false) {
     MetalQwenImage21Transformer::Config c = cfg;
     c.ane_ffn = arm != kGpu;
     c.ane_qkv = arm == kQkv;
+    c.ane_int8 = int8;
+    c.ane_int8_plain = int8 && plain;
     return MetalQwenImage21Transformer::load(dir, mc, c, stream, loras);
   };
   auto fwd = [&](MetalQwenImage21Transformer* m, std::vector<float>* outv) {
@@ -3502,6 +3505,29 @@ TEST(qwen_image_21_dit, ane_feed_forward_rows_are_right)
   // they add rounding and nothing else.
   EXPECT_TRUE(r_ff < 0.05);
   EXPECT_TRUE(r_qkv < 0.05);
+
+  // ROTATED INT8 (ane_int8): both modules again, in the GPU token tier's
+  // arithmetic. ENGAGED first -- a module that cannot take it builds fp16
+  // and would pass as itself -- then the same bar.
+  if (ane_int8_env_free()) {
+    EXPECT_TRUE(m[kQkv]->ane_int8_modules() == 0);
+  }
+  // And unrotated (ane_int8_tier: token_plain), at a looser gross bar.
+  for (const bool plain : {false, true}) {
+    auto m8 = make(kQkv, /*int8=*/true, plain);
+    Q21D_REQUIRE(m8 != nullptr);
+    std::vector<float> o8;
+    Q21D_REQUIRE(fwd(m8.get(), &o8));
+    const int n8 = m8->ane_int8_modules(plain);
+    const double r8 = rel(o8, out[kGpu]);
+    std::printf("[qwen_image_21_dit] ANE ff+qkv in %s int8 (%d of 2 "
+                "modules): rel-L2 %.4e against GPU-only (fp16 %.4e)\n",
+                plain ? "unrotated" : "rotated", n8, r8, r_qkv);
+    if (ane_int8_expected()) {
+      EXPECT_TRUE(n8 == 2 && m8->ane_int8_modules(!plain) == 0);
+      EXPECT_TRUE(r8 < (plain ? 0.10 : 0.05));
+    }
+  }
 
   // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
   // first forward builds them). Two cases, both tiers at once:

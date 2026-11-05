@@ -119,6 +119,14 @@ class MetalMossImageTransformer {
     int  ane_rows   = 0;    // 0 = balance from the two engines' rates
     int  ane_layers = 0;    // 0 = every main block
     bool ane_qkv    = false;
+    // The ANE's modules in ROTATED INT8 (W8A8; AneFeedForward::Options::
+    // int8): generate-image's `ane_int8`. LOSSY -- the GPU token tier's
+    // arithmetic on the ANE's rows; a module that cannot take it keeps
+    // fp16 and says so. VPIPE_ANE_INT8 overrides it.
+    bool ane_int8   = false;
+    // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
+    // `ane_int8_tier: token_plain`). Only with ane_int8.
+    bool ane_int8_plain = false;
 
     // Read <dir>/config.json. False when the file is absent or names a
     // different class, or the shape is one this does not run.
@@ -233,6 +241,16 @@ class MetalMossImageTransformer {
   bool ane_armed() const noexcept { return _ane != nullptr; }
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_qkv_armed() const noexcept { return _ane_qkv != nullptr; }
+  // How many of the armed modules run int8 (Config::ane_int8, where the
+  // module and the OS could take it): rotated per token, or with `plain`
+  // unrotated (Config::ane_int8_plain).
+  int ane_int8_modules(bool plain = false) const noexcept
+  {
+    auto is = [plain](const AneFeedForward* a) {
+      return a != nullptr && a->int8() && a->int8_plain() == plain ? 1 : 0;
+    };
+    return is(_ane.get()) + is(_ane_qkv.get());
+  }
   bool ane_gpu_only() const noexcept
   {
     return _ane != nullptr && _ane->gpu_only();

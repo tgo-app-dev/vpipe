@@ -235,6 +235,27 @@ struct ReferencePlan {
   // reference implementation's does.
   double        condition_noise_aug  = 0.999;
   std::uint64_t condition_noise_seed = 0;
+
+  // ---- P-H3-Image's picture rules (generative-models/minimax-h3/
+  // p-h3-image.h), on when `area_min_pixels` > 0; images only. --------
+  // A picture keeps its size inside [area_min_pixels, area_max_pixels]
+  // (else is scaled to the nearer end at its own aspect), both sides
+  // rounded to `canvas_multiple`; the FIRST -- the picture an edit edits
+  // -- at least at `first_min_pixels` when that is set, which makes it
+  // the edit's canvas. The short-edge rule above does not apply.
+  std::int64_t area_min_pixels  = 0;
+  std::int64_t area_max_pixels  = 0;
+  std::int64_t first_min_pixels = 0;
+  // The vision tower reads its OWN copy of each picture, resized from the
+  // picture as it arrived to about this many pixels (0: the VAE's copy,
+  // MiniMax-H3's rule).
+  std::int64_t vision_pixels = 0;
+  // The VAE posterior SAMPLED rather than its mean: a fresh torch CPU
+  // generator per picture at this seed (the reference's
+  // `keyframe_encode_seed`), the sample rounded to float16, then
+  // whitened -- encode_vae_condition, bit for bit in the noise. Negative:
+  // the mean, as MiniMax-H3's references take it here.
+  std::int64_t posterior_seed = -1;
 };
 
 // The CONDITION NOISE AUGMENTATION on `n` packed values in place:

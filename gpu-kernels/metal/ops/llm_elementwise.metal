@@ -326,6 +326,33 @@ kernel void moe_sort_setup_i32(
   ntiles_out[0] = off / MAXM;
 }
 
+// The work items of the matrix-core grouped GEMMs over the sorted MAXM-row
+// tiles: each expert's tiles `per` (<= 4) at a time, its last item what is
+// left -- items[i] = 4 * first tile + (tiles - 1), -1 past the last. An
+// item is one expert, so a threadgroup dequantizes its weight tile once for
+// per * MAXM rows without the segments padded to that. Single thread,
+// after moe_sort_setup_i32.
+kernel void moe_tile_items_i32(
+    const device int* hist [[buffer(0)]],  // [E]
+    const device int* boff [[buffer(1)]],  // [E]
+    device int* items      [[buffer(2)]],  // [maxitems]
+    constant int& E        [[buffer(3)]],
+    constant int& MAXM     [[buffer(4)]],
+    constant int& maxitems [[buffer(5)]],
+    constant int& per      [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid != 0) { return; }
+  int ni = 0;
+  for (int e = 0; e < E; ++e) {
+    const int k = (hist[e] + MAXM - 1) / MAXM, t0 = boff[e] / MAXM;
+    for (int j = 0; j < k && ni < maxitems; j += per) {
+      items[ni++] = 4 * (t0 + j) + (min(per, k - j) - 1);
+    }
+  }
+  for (; ni < maxitems; ++ni) { items[ni] = -1; }
+}
+
 // Scatter pairs into sorted per-expert slots. grid(np). srow[slot]=token row,
 // sdst[slot]=orig pair index (pad slots keep -1). Order within a bucket is
 // arbitrary but irrelevant -- combine sums per token in slot order via sdst.

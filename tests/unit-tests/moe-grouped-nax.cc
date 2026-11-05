@@ -5,12 +5,14 @@
 // at two experts' shapes (Qwen3.6-35B-A3B: hidden 2048 into 512;
 // Qwen3.8-Flash-Next: 2560 into 640). Gate|up are interleaved by feature,
 // as the loader lays a layer's slab; several experts with ragged pair
-// counts, so pad slots and a pad tile are exercised.
+// counts, so pad slots and a pad tile are exercised. The NAX twins over
+// 64-row work items (two tiles of one expert a threadgroup) are held to
+// the 32-row ones bit for bit, and the items kernel to the host's rule.
 //
 // No checkpoint. Skips (and says so) on a GPU without matrix cores.
 // VPIPE_MOE_NAX_BENCH=1 adds a timing of both twins at the 35B's real
-// geometry (256 experts, top-8, 128..2048 tokens): interleaved arms, the
-// median of 7 rounds, the expert GEMMs' TFLOP/s.
+// geometry (256 experts, top-8, 128..2048 tokens), =2 at Flash-Next's:
+// interleaved arms, the median of 7 rounds, the expert GEMMs' TFLOP/s.
 
 #include "minitest.h"
 
@@ -126,12 +128,33 @@ sort_pairs_(const std::vector<std::int32_t>& eid, int E, int topk)
   return s;
 }
 
+// The 64-row work items over the sorted tiles (moe_tile_items_i32's rule):
+// each expert's tiles two at a time, an odd last one alone; -1 after.
+std::vector<std::int32_t>
+items_(const std::vector<std::int32_t>& t2e, int per = 2)
+{
+  std::vector<std::int32_t> it;
+  for (std::size_t t = 0; t < t2e.size();) {
+    std::size_t u = t;
+    while (u < t2e.size() && t2e[u] == t2e[t]) { ++u; }
+    if (t2e[t] >= 0) {
+      for (std::size_t j = t; j < u; j += (std::size_t)per) {
+        const int nt = (int)std::min<std::size_t>((std::size_t)per, u - j);
+        it.push_back((std::int32_t)(4 * j + (std::size_t)(nt - 1)));
+      }
+    }
+    t = u;
+  }
+  it.resize(t2e.size(), -1);
+  return it;
+}
+
 struct Twins {
-  ComputeFunction gu_steel, dn_steel, gu_nax, dn_nax;
+  ComputeFunction gu_steel, dn_steel, gu_nax, dn_nax, gu_nax64, dn_nax64;
   bool valid() const
   {
     return gu_steel.valid() && dn_steel.valid() && gu_nax.valid() &&
-           dn_nax.valid();
+           dn_nax.valid() && gu_nax64.valid() && dn_nax64.valid();
   }
 };
 
@@ -145,7 +168,9 @@ load_twins_(MetalCompute* mc, int bits, bool bf16)
   return {ls.function("affine_qmm_grouped_swiglu" + w),
           ls.function("affine_qmm_grouped" + w),
           ln.function("affine_qmm_grouped_swiglu_nax" + w),
-          ln.function("affine_qmm_grouped_nax" + w)};
+          ln.function("affine_qmm_grouped_nax" + w),
+          ln.function("affine_qmm_grouped_swiglu_nax64" + w),
+          ln.function("affine_qmm_grouped_nax64" + w)};
 }
 
 // The two grouped GEMMs of one layer, as encode_moe_mlp_ dispatches them.
@@ -182,6 +207,37 @@ encode_pair_(ComputeEncoder& enc, const ComputeFunction& gu,
   enc.dispatch({nax ? (unsigned)((H / 64) * 32)
                     : (unsigned)(((H + 31) / 32) * 32), my, 2},
                {32, 2, 2});
+}
+
+// The same pair over the 64-row items, WM simdgroups down an item's rows.
+void
+encode_pair64_(ComputeEncoder& enc, const ComputeFunction& gu,
+               const ComputeFunction& dn, int wm, const Layer& w,
+               const SharedBuffer& x, const SharedBuffer& gact,
+               const SharedBuffer& part, const SharedBuffer& srow,
+               const SharedBuffer& sdst, const SharedBuffer& t2e,
+               const SharedBuffer& items, int H, int I, int npad,
+               int nitems)
+{
+  const unsigned ty = 2u * (unsigned)wm;
+  enc.set_function(gu);
+  enc.set_buffer(0, w.wgu); enc.set_buffer(1, w.sgu);
+  enc.set_buffer(2, w.bgu); enc.set_buffer(3, x);
+  enc.set_buffer(4, gact);
+  enc.set_constant(5, H); enc.set_constant(6, 2 * I);
+  enc.set_constant(7, npad); enc.set_buffer(8, t2e);
+  enc.set_buffer(9, srow); enc.set_buffer(10, items);
+  enc.dispatch({(unsigned)((2 * I / 64) * 32), (unsigned)nitems * ty, 1},
+               {32, ty, 1});
+  enc.set_function(dn);
+  enc.set_buffer(0, w.wdn); enc.set_buffer(1, w.sdn);
+  enc.set_buffer(2, w.bdn); enc.set_buffer(3, gact);
+  enc.set_buffer(4, part);
+  enc.set_constant(5, I); enc.set_constant(6, H);
+  enc.set_constant(7, npad); enc.set_buffer(8, t2e);
+  enc.set_buffer(9, sdst); enc.set_buffer(10, items);
+  enc.dispatch({(unsigned)((H / 64) * 32), (unsigned)nitems * ty, 1},
+               {32, ty, 1});
 }
 
 }  // namespace
@@ -276,6 +332,8 @@ TEST(moe_grouped_nax, twins_match_steel_and_f64)
       const SharedBuffer bsrow = upload(st.srow.data(), st.srow.size() * 4),
                          bsdst = upload(st.sdst.data(), st.sdst.size() * 4),
                          bt2e = upload(st.t2e.data(), st.t2e.size() * 4);
+      const std::vector<std::int32_t> its = items_(st.t2e);
+      const SharedBuffer bits_ = upload(its.data(), its.size() * 4);
       for (const bool bf16 : {false, true}) {
         auto conv = [&](const std::vector<std::uint16_t>& v) {
           std::vector<std::uint16_t> o(v.size());
@@ -320,10 +378,16 @@ TEST(moe_grouped_nax, twins_match_steel_and_f64)
         SharedBuffer ga_s = mc->make_shared_buffer(ga_bytes),
                      pt_s = mc->make_shared_buffer(pt_bytes),
                      ga_n = mc->make_shared_buffer(ga_bytes),
-                     pt_n = mc->make_shared_buffer(pt_bytes);
+                     pt_n = mc->make_shared_buffer(pt_bytes),
+                     pt_6 = mc->make_shared_buffer(pt_bytes);
         // Poison the NAX outputs: a row the kernel never writes reads NaN.
+        // (The 64-row items' gact keeps the 32-row kernel's: every slot
+        // the down GEMM reads is one they write alike.)
         std::memset(ga_n.contents(), 0xff, ga_bytes);
         std::memset(pt_n.contents(), 0xff, pt_bytes);
+        std::memset(pt_6.contents(), 0xff, pt_bytes);
+        SharedBuffer ga_6 = mc->make_shared_buffer(ga_bytes);
+        std::memset(ga_6.contents(), 0xff, ga_bytes);
         CommandStream cs = mc->make_command_stream();
         {
           ComputeEncoder enc = cs.begin_compute();
@@ -331,6 +395,9 @@ TEST(moe_grouped_nax, twins_match_steel_and_f64)
                        pt_s, bsrow, bsdst, bt2e, H, I, npad);
           encode_pair_(enc, tw.gu_nax, tw.dn_nax, true, w, bx, ga_n, pt_n,
                        bsrow, bsdst, bt2e, H, I, npad);
+          encode_pair64_(enc, tw.gu_nax64, tw.dn_nax64, 4, w, bx, ga_6, pt_6,
+                         bsrow, bsdst, bt2e, bits_, H, I, npad,
+                         (int)its.size());
         }
         ASSERT_TRUE(cs.commit().wait_ok());
         // rel-L2 of a [pairs, W] output against a reference indexed the
@@ -374,6 +441,16 @@ TEST(moe_grouped_nax, twins_match_steel_and_f64)
         const double na = rel(act_ref, ga_n, I, &st.sdst);
         const double np_ = rel(part_ref, pt_n, H, nullptr);
         const double ns = rel_bufs(pt_s, pt_n, (std::size_t)NP * H);
+        // The 64-row items: the 32-row kernel's arithmetic row for row (one
+        // dequantized tile, the same fragments in the same K order).
+        int diff64 = 0;
+        {
+          const auto* a = static_cast<const std::uint16_t*>(pt_n.contents());
+          const auto* b = static_cast<const std::uint16_t*>(pt_6.contents());
+          for (std::size_t i = 0; i < (std::size_t)NP * H; ++i) {
+            diff64 += a[i] != b[i];
+          }
+        }
         // Pad slots of the NAX gate|up are written (zeros), as steel's are.
         int pad_bad = 0;
         const auto* gn = static_cast<const std::uint16_t*>(ga_n.contents());
@@ -386,8 +463,9 @@ TEST(moe_grouped_nax, twins_match_steel_and_f64)
         }
         std::printf("[moe_nax] %s w%d %s vs f64: steel act %.2e part %.2e, "
                     "NAX act %.2e part %.2e; NAX vs steel %.2e; pad slots "
-                    "not zero %d\n", sh.name, bits, bf16 ? "bf16" : "f16",
-                    sa, sp, na, np_, ns, pad_bad);
+                    "not zero %d; 64-row items differ at %d\n", sh.name,
+                    bits, bf16 ? "bf16" : "f16", sa, sp, na, np_, ns,
+                    pad_bad, diff64);
         // Storage rounding of act / part is ~2e-3 at bf16 and ~3e-4 at
         // f16; a wrong code, slab, row or lane is O(1).
         const double bar = bf16 ? 6e-3 : 1.5e-3;
@@ -395,9 +473,61 @@ TEST(moe_grouped_nax, twins_match_steel_and_f64)
         EXPECT_TRUE(na < bar && np_ < bar);
         EXPECT_TRUE(ns < bar);
         EXPECT_TRUE(pad_bad == 0);
+        EXPECT_TRUE(diff64 == 0);
       }
     }
   }
+}
+
+// moe_tile_items_i32 from a sort's histogram and offsets against the host
+// rule, over ragged counts (0, 1, a whole tile, odd and even tile counts).
+TEST(moe_grouped_nax, tile_items_pair_each_experts_tiles)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto lib = mc->load_library("llm_elementwise");
+  auto fn = lib.function("moe_tile_items_i32");
+  ASSERT_TRUE(fn.valid());
+  if (!fn.valid()) { return; }
+  const std::vector<int> cnt = {0, 1, 32, 33, 64, 65, 97, 0, 130, 31};
+  const int E = (int)cnt.size(), MAXM = 32;
+  std::vector<std::int32_t> hist(cnt.begin(), cnt.end()), boff(E), t2e;
+  int off = 0;
+  for (int e = 0; e < E; ++e) {
+    boff[e] = off;
+    const int k = (cnt[e] + MAXM - 1) / MAXM;
+    for (int t = 0; t < k; ++t) { t2e.push_back(e); }
+    off += k * MAXM;
+  }
+  t2e.push_back(-1);
+  const std::vector<std::int32_t> want = items_(t2e);
+  const int maxitems = (int)t2e.size();
+  auto up = [&](const std::vector<std::int32_t>& v) {
+    SharedBuffer b = mc->make_shared_buffer(v.size() * 4);
+    std::memcpy(b.contents(), v.data(), v.size() * 4);
+    return b;
+  };
+  SharedBuffer bh = up(hist), bb = up(boff);
+  SharedBuffer bi = mc->make_shared_buffer((std::size_t)maxitems * 4);
+  std::memset(bi.contents(), 0x55, (std::size_t)maxitems * 4);
+  CommandStream cs = mc->make_command_stream();
+  {
+    ComputeEncoder enc = cs.begin_compute();
+    enc.set_function(fn);
+    enc.set_buffer(0, bh); enc.set_buffer(1, bb); enc.set_buffer(2, bi);
+    const int per = 2;
+    enc.set_constant(3, E); enc.set_constant(4, MAXM);
+    enc.set_constant(5, maxitems); enc.set_constant(6, per);
+    enc.dispatch({1, 1, 1}, {1, 1, 1});
+  }
+  ASSERT_TRUE(cs.commit().wait_ok());
+  const auto* got = static_cast<const std::int32_t*>(bi.contents());
+  int bad = 0;
+  for (int i = 0; i < maxitems; ++i) { bad += got[i] != want[(size_t)i]; }
+  std::printf("[moe_nax] %d tiles -> items, %d differ from the host rule\n",
+              (int)t2e.size(), bad);
+  EXPECT_TRUE(bad == 0);
 }
 
 // VPIPE_MOE_NAX_BENCH=1: both twins at Qwen3.6-35B-A3B's geometry (256
@@ -412,7 +542,11 @@ TEST(moe_grouped_nax, bench_against_steel)
     std::printf("[moe_nax] bench SKIP: no matrix cores\n");
     return;
   }
-  constexpr int E = 256, TOPK = 8, H = 2048, I = 512, BITS = 4;
+  // VPIPE_MOE_NAX_BENCH=2: Qwen3.8-Flash-Next's (512 experts top-10, 2560
+  // into 640, w5) at a prefill piece's rows. Both: the 64-row items too.
+  const bool fnx = std::atoi(on) == 2;
+  const int E = fnx ? 512 : 256, TOPK = fnx ? 10 : 8;
+  const int H = fnx ? 2560 : 2048, I = fnx ? 640 : 512, BITS = fnx ? 5 : 4;
   std::uint32_t rng = 7u;
   auto next = [&]() {
     rng = rng * 1664525u + 1013904223u;
@@ -441,7 +575,9 @@ TEST(moe_grouped_nax, bench_against_steel)
   const Twins tw = load_twins_(mc, BITS, false);
   ASSERT_TRUE(tw.valid());
   if (!tw.valid()) { return; }
-  for (const int M : {128, 256, 512, 2048}) {
+  const std::vector<int> Ms = fnx ? std::vector<int>{512, 2048, 6667}
+                                  : std::vector<int>{128, 256, 512, 2048};
+  for (const int M : Ms) {
     const int NP = M * TOPK;
     std::vector<std::int32_t> eid(NP);
     for (int t = 0; t < M; ++t) {
@@ -465,18 +601,28 @@ TEST(moe_grouped_nax, bench_against_steel)
     };
     const SharedBuffer srow = up(st.srow), sdst = up(st.sdst),
                        t2e = up(st.t2e);
+    const std::vector<std::int32_t> its = items_(st.t2e);
+    const SharedBuffer items = up(its);
+    int nlive = 0;
+    for (const int v : its) { nlive += v >= 0; }
     const SharedBuffer x = scal((std::size_t)M * H, -1.0f, 2.0f);
     SharedBuffer gact = mc->make_shared_buffer((std::size_t)npad * I * 2),
                  part = mc->make_shared_buffer((std::size_t)NP * H * 2);
     CommandStream cs = mc->make_command_stream();
     constexpr int kReps = 8;
-    auto time_arm = [&](bool nax) {
+    // arm 0 steel, 1 NAX, 2 NAX over 64-row items
+    auto time_arm = [&](int arm) {
       {
         ComputeEncoder enc = cs.begin_compute();
         for (int r = 0; r < kReps; ++r) {
-          encode_pair_(enc, nax ? tw.gu_nax : tw.gu_steel,
-                       nax ? tw.dn_nax : tw.dn_steel, nax, w, x, gact, part,
-                       srow, sdst, t2e, H, I, npad);
+          if (arm == 2) {
+            encode_pair64_(enc, tw.gu_nax64, tw.dn_nax64, 4, w, x, gact,
+                           part, srow, sdst, t2e, items, H, I, npad, nlive);
+          } else {
+            encode_pair_(enc, arm == 1 ? tw.gu_nax : tw.gu_steel,
+                         arm == 1 ? tw.dn_nax : tw.dn_steel, arm == 1, w, x,
+                         gact, part, srow, sdst, t2e, H, I, npad);
+          }
         }
       }
       const auto t0 = std::chrono::steady_clock::now();
@@ -485,24 +631,23 @@ TEST(moe_grouped_nax, bench_against_steel)
                             std::chrono::steady_clock::now() - t0).count();
       return ok ? ms / kReps : -1.0;
     };
-    time_arm(false);
-    time_arm(true);                       // warm both
-    std::vector<double> ts, tn;
+    constexpr int narm = 3;
+    for (int a = 0; a < narm; ++a) { time_arm(a); }   // warm
+    std::vector<double> tt[narm];
     for (int round = 0; round < 7; ++round) {
-      if (round % 2 == 0) {
-        ts.push_back(time_arm(false));
-        tn.push_back(time_arm(true));
-      } else {
-        tn.push_back(time_arm(true));
-        ts.push_back(time_arm(false));
+      for (int k = 0; k < narm; ++k) {
+        const int a = round % 2 == 0 ? k : narm - 1 - k;
+        tt[a].push_back(time_arm(a));
       }
     }
-    std::sort(ts.begin(), ts.end());
-    std::sort(tn.begin(), tn.end());
+    for (auto& v : tt) { std::sort(v.begin(), v.end()); }
     const double flop = 2.0 * NP * (2.0 * I * H + (double)H * I);
-    std::printf("[moe_nax] bench %4d tokens (%5d pairs, %4d tiles): steel "
-                "%.3f ms (%.2f TFLOP/s), NAX %.3f ms (%.2f TFLOP/s), %.2fx\n",
-                M, NP, (int)st.t2e.size(), ts[3], flop / ts[3] * 1e-9,
-                tn[3], flop / tn[3] * 1e-9, ts[3] / tn[3]);
+    std::printf("[moe_nax] bench %4d tokens (%5d pairs, %4d tiles, %4d "
+                "items): steel %.3f ms (%.2f TFLOP/s), NAX %.3f ms (%.2f), "
+                "64-row items %.3f ms (%.2f, %.2fx NAX)", M, NP,
+                (int)st.t2e.size(), nlive, tt[0][3], flop / tt[0][3] * 1e-9,
+                tt[1][3], flop / tt[1][3] * 1e-9, tt[2][3],
+                flop / tt[2][3] * 1e-9, tt[1][3] / tt[2][3]);
+    std::printf("\n");
   }
 }

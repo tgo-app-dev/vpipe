@@ -161,6 +161,140 @@ grouped_nax_impl(const device uint32_t* w, const device T* scales,
   }
 }
 
+// The same GEMMs over BM-row WORK ITEMS (moe_tile_items_i32, BM / 32 tiles
+// an item): an item is one expert's sorted 32-row tiles two at a time, or
+// its odd last one, so the threadgroup dequantizes each 64 x 64 weight tile
+// once for 64 rows where the kernel above does it for 32 (MLX's gather_qmm
+// takes BM = 64 where the rows an expert are many). WM simdgroups down the
+// rows, WN = 2 across; a simdgroup whose rows are past the item, or whose
+// first row is a pad (a segment fills its slots from the first), skips its
+// matmuls and its store but still loads and waits with the rest. Every row
+// the others compute, pads included, comes out of the same fragments in the
+// same K order as above: the outputs are the 32-row kernel's bit for bit.
+// MEASURED, base M5, the expert pair at Flash-Next's shape (512 experts
+// top-10, 2560 into 640, w5): 2048 tokens 36.0 -> 27.0 ms (1.33x), 6667
+// 89.2 -> 75.2 (1.19x: 130 rows an expert, so a third of the items hold a
+// last tile of a few rows); 128-row items (four tiles) 0.92-1.21x.
+// dispatch (threads): {N/BN * 32, maxitems * WM * WN, 1}, tg {32, WM*WN, 1}.
+template <typename T, int group_size, int bits, bool kSwiglu, int BM, int WM>
+METAL_FUNC void
+grouped_nax64_impl(const device uint32_t* w, const device T* scales,
+                   const device T* biases, const device T* x, device T* y,
+                   threadgroup T* Ws, const int K, const int N,
+                   const device int* tile2e, const device int* rows,
+                   const device int* items, uint3 tid, uint sgid, uint slid)
+{
+  constexpr int BN = kBN, BK = kBK, WN = kWN;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = BK + 16 / sizeof(T);
+  constexpr short SM = BM / WM, SN = BN / WN, SK = 32;
+  constexpr short TM = SM / 16, TN = SN / 16, TK = SK / 16;
+  static_assert(TN % 2 == 0, "tile_matmad_nax wants even TN");
+
+  const int it = items[tid.y];
+  if (it < 0) { return; }
+  const int t = it >> 2, rows_in = ((it & 3) + 1) * kBM;
+  const int e = tile2e[t];
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = t * kBM;                       // the sort's 32-row tile
+  const int y_col = (int)tid.x * BN;
+  const int64_t wrow0 = (int64_t)e * N + y_col;
+  auto wl = (const device uint8_t*)w + wrow0 * K_w;
+  scales += wrow0 * K_g;
+  biases += wrow0 * K_g;
+
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * 32, group_size, bits>;
+  loader_w_t loader_w(wl, scales, biases, K, Ws, (ushort)sgid, (ushort)slid);
+
+  const short tm = SM * (short)(sgid / WN);
+  const short tn = SN * (short)(sgid % WN);
+  const bool act = tm < rows_in && rows[y_row + tm] >= 0;
+  const short2 sc = BaseNAXFrag::get_coord();
+  // Each row fragment's two thread rows (fm, fm + 8) and their sources.
+  const device T* xr[TM][2];
+  bool on[TM][2];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < TM; ++i) {
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < 2; ++h) {
+      const int s = y_row + tm + i * 16 + sc.y + h * 8;
+      const int r = !act ? -1 : kSwiglu ? rows[s] : s;
+      on[i][h] = r >= 0;
+      xr[i][h] = x + (int64_t)max(r, 0) * K + sc.x;
+    }
+  }
+
+  NAXTile<float, TM, TN> Dt;
+  Dt.clear();
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (act) {
+      STEEL_PRAGMA_NO_UNROLL
+      for (short kk = 0; kk < BK; kk += SK) {
+        NAXTile<T, TM, TK> At;
+        NAXTile<T, TN, TK> Bt;
+        volatile int compiler_barrier;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < TM; ++i) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < TK; ++j) {
+            thread auto& f = At.frag_at(i, j);
+            const int k = k0 + kk + j * 16;
+            const vec<T, 4> a0 = on[i][0]
+                ? *(const device vec<T, 4>*)(xr[i][0] + k) : vec<T, 4>(0);
+            const vec<T, 4> a1 = on[i][1]
+                ? *(const device vec<T, 4>*)(xr[i][1] + k) : vec<T, 4>(0);
+            STEEL_PRAGMA_UNROLL
+            for (short c = 0; c < 4; ++c) {
+              f[c] = a0[c];
+              f[4 + c] = a1[c];
+            }
+          }
+        }
+        Bt.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk);
+        tile_matmad_nax(Dt, At, metal::bool_constant<false>{}, Bt,
+                        metal::bool_constant<true>{});
+        (void)compiler_barrier;
+      }
+    }
+    loader_w.next();
+  }
+  if (!act) { return; }
+
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < TM; ++i) {
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < TN; ++j) {
+      const thread auto& f = Dt.frag_at(i, j);
+      const int col = y_col + tn + j * 16 + sc.x;
+      STEEL_PRAGMA_UNROLL
+      for (short h = 0; h < 2; ++h) {
+        const int slot = y_row + tm + i * 16 + sc.y + h * 8;
+        if (kSwiglu) {
+          const int outN = N / 2;
+          device T* o = y + (int64_t)slot * outN + (col >> 1);
+          STEEL_PRAGMA_UNROLL
+          for (short c = 0; c < 4; c += 2) {
+            const float ga = f[h * 4 + c], up = f[h * 4 + c + 1];
+            o[c >> 1] = (T)(ga / (1.0f + metal::exp(-ga)) * up);
+          }
+        } else {
+          const int dr = rows[slot];
+          if (dr < 0) { continue; }
+          device T* o = y + (int64_t)dr * N + col;
+          STEEL_PRAGMA_UNROLL
+          for (short c = 0; c < 4; ++c) { o[c] = (T)f[h * 4 + c]; }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 
 #define VPIPE_GROUPED_NAX(name, bits, swiglu)                               \
@@ -195,5 +329,38 @@ VPIPE_GROUPED_NAX(affine_qmm_grouped_nax_w8g64, 8, false)
 // group a K step), so a group-32 pack takes the steel GEMMs.
 VPIPE_GROUPED_NAX(affine_qmm_grouped_swiglu_nax_w6g64, 6, true)
 VPIPE_GROUPED_NAX(affine_qmm_grouped_nax_w6g64, 6, false)
+
+#define VPIPE_GROUPED_NAX64(name, bits, swiglu, bm, wm)                    \
+  kernel void name(                                                         \
+      const device uint32_t* w       [[buffer(0)]],                         \
+      const device VPIPE_ELT* scales [[buffer(1)]],                         \
+      const device VPIPE_ELT* biases [[buffer(2)]],                         \
+      const device VPIPE_ELT* x      [[buffer(3)]],                         \
+      device VPIPE_ELT*       y      [[buffer(4)]],                         \
+      const constant int& K          [[buffer(5)]],                         \
+      const constant int& N          [[buffer(6)]],                         \
+      const constant int& M          [[buffer(7)]],                         \
+      const device int* tile2e       [[buffer(8)]],                         \
+      const device int* rows         [[buffer(9)]],                         \
+      const device int* items        [[buffer(10)]],                        \
+      uint3 tid  [[threadgroup_position_in_grid]],                          \
+      uint  sgid [[simdgroup_index_in_threadgroup]],                        \
+      uint  slid [[thread_index_in_simdgroup]])                             \
+  {                                                                         \
+    (void)M;                                                                \
+    threadgroup VPIPE_ELT Ws[kBN * (kBK + 16 / sizeof(VPIPE_ELT))];         \
+    grouped_nax64_impl<VPIPE_ELT, 64, bits, swiglu, bm, wm>(                \
+        w, scales, biases, x, y, Ws, K, N, tile2e, rows, items, tid, sgid,  \
+        slid);                                                              \
+  }
+
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_swiglu_nax64_w4g64, 4, true, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_swiglu_nax64_w5g64, 5, true, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_swiglu_nax64_w6g64, 6, true, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_swiglu_nax64_w8g64, 8, true, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_nax64_w4g64, 4, false, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_nax64_w5g64, 5, false, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_nax64_w6g64, 6, false, 64, 4)
+VPIPE_GROUPED_NAX64(affine_qmm_grouped_nax64_w8g64, 8, false, 64, 4)
 
 #endif  // __HAVE_TENSOR__

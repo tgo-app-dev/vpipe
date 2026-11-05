@@ -2595,6 +2595,8 @@ MetalMossImageTransformer::ane_setup_(int seq)
   o.rows    = (float)_cfg.ane_rows;
   o.chunk   = ane_chunk_rows();
   o.situ    = true;
+  o.int8    = _cfg.ane_int8;
+  o.int8_plain = _cfg.ane_int8_plain;
   o.profile = std::getenv("VPIPE_MOSS_IMAGE_ANE_PROFILE") != nullptr;
   _ane = AneFeedForward::create(o);
   return _ane != nullptr;
@@ -2695,6 +2697,8 @@ MetalMossImageTransformer::ane_qkv_setup_(int seq)
   o.rows    = (float)_cfg.ane_rows;
   o.chunk   = ane_chunk_rows();
   o.matmul  = true;
+  o.int8    = _cfg.ane_int8;
+  o.int8_plain = _cfg.ane_int8_plain;
   o.profile = std::getenv("VPIPE_MOSS_IMAGE_ANE_PROFILE") != nullptr;
   _ane_qkv = AneFeedForward::create(o);
   return _ane_qkv != nullptr;

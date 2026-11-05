@@ -19,6 +19,7 @@
 // check that the tests actually RAN.
 
 #include "minitest.h"
+#include "ane-int8-expected.h"
 #include "residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -1966,10 +1967,13 @@ TEST(z_image_dit, ane_tiers_rows_are_right)
   enum Arm { kGpu, kFf, kQkv, kArms };
   const char* const kName[kArms] = {"GPU-only", "ANE ff", "ANE ff+qkv"};
   auto make = [&](int arm,
-                  const std::vector<MetalZImageTransformer::LoraSpec>& lo) {
+                  const std::vector<MetalZImageTransformer::LoraSpec>& lo,
+                  bool int8 = false, bool plain = false) {
     MetalZImageTransformer::Config c = cfg;
     c.ane_ffn = arm != kGpu;
     c.ane_qkv = arm == kQkv;
+    c.ane_int8 = int8;
+    c.ane_int8_plain = int8 && plain;
     auto m = MetalZImageTransformer::load(dir, mc, c, stream, lo);
     // A streamed stack admits nothing until a reserve is DECLARED; 0 is
     // the answer that keeps every block on the read path, in every arm.
@@ -2037,6 +2041,32 @@ TEST(z_image_dit, ane_tiers_rows_are_right)
                 r_ff, r_qkv);
     EXPECT_TRUE(r_ff < 0.05);
     EXPECT_TRUE(r_qkv < 0.05);
+
+    // ROTATED INT8 (ane_int8): both modules again, in the GPU token
+    // tier's arithmetic. ENGAGED first -- a module that cannot take it
+    // builds fp16 and would pass as itself -- then the same bar: the
+    // fp16 rows already read ~4e-2 through this chaotic stack, and the
+    // int8 rows' own error (~1e-2 on real blocks) is under it.
+    if (ane_int8_env_free()) {
+      EXPECT_TRUE(m[kQkv]->ane_int8_modules() == 0);
+    }
+    // And UNROTATED (ane_int8_tier: token_plain): lossier, so a looser
+    // gross bar; ENGAGED as plain modules, none rotated.
+    for (const bool plain : {false, true}) {
+      auto m8 = make(kQkv, {}, /*int8=*/true, plain);
+      ZI_REQUIRE(m8 != nullptr);
+      std::vector<float> o8;
+      ZI_REQUIRE(fwd(m8.get(), &o8));
+      const int n8 = m8->ane_int8_modules(plain);
+      const double r8 = rel(o8, out[kGpu]);
+      std::printf("[z_image_dit] ANE ff+qkv in %s int8 (%d of 2 modules): "
+                  "rel-L2 %.4e against GPU-only (fp16 %.4e)\n",
+                  plain ? "unrotated" : "rotated", n8, r8, r_qkv);
+      if (ane_int8_expected()) {
+        EXPECT_TRUE(n8 == 2 && m8->ane_int8_modules(!plain) == 0);
+        EXPECT_TRUE(r8 < (plain ? 0.10 : 0.05));
+      }
+    }
 
     // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when
     // the first forward builds them), both tiers at once. The FIRST

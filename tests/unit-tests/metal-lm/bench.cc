@@ -5,6 +5,10 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 
+#include "common/flex-bag.h"
+
+#include <thread>
+
 // ---- Decode/prefill throughput bench (env-gated) -----------------
 //
 // Times prefill + an N-token decode loop on the metal backend under two
@@ -234,7 +238,12 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
   if (!mgr) { ::unsetenv("VPIPE_LLM_BACKEND"); return; }
   genai::LoadSpec spec;
   spec.hf_dir = path;
-  spec.compute_dtype = "f16";
+  // VPIPE_QWEN_CTX_DTYPE: bf16 | f16 (default) | f32 -- text-chat's own
+  // default is bf16.
+  {
+    const char* dt = std::getenv("VPIPE_QWEN_CTX_DTYPE");
+    spec.compute_dtype = dt != nullptr && *dt ? dt : "f16";
+  }
   spec.page_tokens = 512;
   // The pipelined-decode path keeps the timed context AND the pdecode context
   // live at once, so the KV pool must fit 2 * (max ctx + decode) + slack. Size
@@ -248,9 +257,19 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
         (max_ctx + dec + 64 + spec.page_tokens - 1) / spec.page_tokens;
     spec.max_pages = std::max(32, 2 * per_ctx_pages + 4);
   }
+  // VPIPE_QWEN_CTX_NGRAM=1: Qwen3.8-Flash-Next's n-gram table asked for
+  // in memory (load_spec::kNgramResident); VPIPE_QWEN_CTX_SETTLE_S=<s>
+  // waits that long after the load (its fill runs after it).
+  if (const char* e = std::getenv("VPIPE_QWEN_CTX_NGRAM");
+      e != nullptr && std::atoi(e) != 0) {
+    bag::set_flag(spec.extra, genai::load_spec::kNgramResident, true);
+  }
   auto lm = mgr->load(spec);
   ::unsetenv("VPIPE_LLM_BACKEND");
   ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (const char* e = std::getenv("VPIPE_QWEN_CTX_SETTLE_S")) {
+    std::this_thread::sleep_for(std::chrono::seconds(std::atoi(e)));
+  }
 
   using clk = std::chrono::steady_clock;
   auto secs = [](clk::duration d) {
@@ -299,13 +318,19 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
     const auto t1 = clk::now();
     ASSERT_TRUE(pred >= 0);
     int produced = 0;
+    std::string toks = std::to_string(pred);
     const auto d0 = clk::now();
     for (int i = 0; i < dec; ++i) {
       const std::int32_t nx = step(ctx);
       if (nx < 0) { break; }
       ++produced;
+      toks += " " + std::to_string(nx);
     }
     const auto d1 = clk::now();
+    // VPIPE_QWEN_CTX_TOKENS=1: the greedy continuation, for comparing arms.
+    if (std::getenv("VPIPE_QWEN_CTX_TOKENS") != nullptr) {
+      std::printf("[BENCH-CTX] ctx=%d tokens: %s\n", N, toks.c_str());
+    }
     const double ps = secs(t1 - t0);
     const double ds = secs(d1 - d0);
 

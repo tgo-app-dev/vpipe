@@ -168,6 +168,30 @@ class AneFeedForward {
     // NEITHER input of the activation is linear in it, so the fp16
     // headroom rides the DOWN projection (slot 2).
     bool  situ    = false;
+    // ROTATED INT8 (W8A8), opt-in: the module's matrices int8 -- each
+    // staged row Walsh-Hadamard rotated per 256-block of its K, then
+    // quantized to its own step -- and every projection's input rotated
+    // and quantized per token inside the graph: the GPU's `token` tier's
+    // arithmetic (AneGraphSpec::int8). A SwiGLU or a matmul tier without
+    // biases, its reduction widths multiples of 256; anything else keeps
+    // fp16. VPIPE_ANE_INT8 = 0 | 1 overrides it. Needs CoreML's int8
+    // arrays (macOS 26): elsewhere create() builds the fp16 module and says
+    // so. MEASURED on MiniMax-H3's feed-forward at 2048 rows, M4 Pro: 14.3
+    // TOP/s against 9.6, the error of real blocks' outputs 0.6-2.1e-2 (the
+    // GPU token tier's) against fp16's 2.2-2.5e-3. LOSSY -- a numerics
+    // choice, hence opt-in.
+    bool  int8    = false;
+    // With int8: UNROTATED -- each row quantized as stored, each input per
+    // token as it is: the GPU's `token_plain` arithmetic. No width rule.
+    // VPIPE_ANE_INT8=plain turns both on.
+    bool  int8_plain = false;
+    // With int8: GROUPED along K, the GPU's `fast` tier's arithmetic, at
+    // this target group (256 / 512 / 1024; 0 per token): each projection
+    // at AneGraphSpec::group_for(target, its K), every group rotated whole
+    // and quantized at its own step on both operands. Rotated; a width
+    // no group divides keeps fp16. VPIPE_ANE_INT8=fast (512) or
+    // fast<group> turns it on.
+    int   int8_group = 0;
   };
 
   // Builds the module and its weight slots, or explains at warn/info why
@@ -212,6 +236,13 @@ class AneFeedForward {
   // staging is joined) and still split exactly where begin() will.
   int  planned_rows(int seq) const noexcept;
   bool timing() const noexcept;
+  // Whether the module runs rotated int8 (Options::int8, and the host
+  // could run it).
+  bool int8() const noexcept;
+  // ...and whether unrotated (Options::int8_plain), or grouped at which
+  // target (Options::int8_group; 0 per token).
+  bool int8_plain() const noexcept;
+  int  int8_group() const noexcept;
 
   // runtime_bytes() for a GELU module (Options::gelu): two projections and
   // their biases rather than three. Independent of the sequence, like it.
@@ -336,6 +367,9 @@ class AneFeedForward {
   std::string                     _tag;
   int _hidden = 0, _ffn = 0, _chunk = kChunkDefault;
   bool _matmul = false;
+  bool _int8   = false;      // rotated int8 slots: matrices, then steps
+  bool _plain  = false;      // ...unrotated (int8_plain)
+  int  _group  = 0;          // ...grouped at this target (int8_group)
   bool _gelu   = false;      // {up, down}: the headroom rides slot 1 = down
   // The slot the fp16 headroom scale divides: 1 (SwiGLU's up, GELU's
   // down), or 2 (SITU's down).

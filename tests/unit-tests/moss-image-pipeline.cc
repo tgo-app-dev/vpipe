@@ -11,6 +11,7 @@
 // Env: VPIPE_MOSS_IMAGE_TEST_MODEL_PATH (the repo ROOT) and
 // VPIPE_MOSS_IMAGE_GOLDEN. Each test skips vacuously without them.
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 #include "residency-reserve.h"
 
@@ -1666,6 +1667,32 @@ TEST(moss_image_dit, ane_tiers_rows_are_right)
               "rel-L2 vs the GPU %.6f, + q/k/v %.6f\n", gh * gw + T, d1, d2);
   EXPECT_TRUE(d1 > 0.0 && d1 < 0.02);
   EXPECT_TRUE(d2 > 0.0 && d2 < 0.02);
+
+  // ROTATED INT8 (ane_int8): the SITU feed-forward has no rotated form
+  // and keeps fp16 (said in the log); q/k/v take int8. ENGAGED before
+  // measured -- exactly the one module.
+  // And unrotated (ane_int8_tier: token_plain): q/k/v again, plain.
+  for (const bool plain : {false, true}) {
+    MetalMossImageTransformer::Config c = cfg;
+    c.ane_ffn = c.ane_qkv = c.ane_int8 = true;
+    c.ane_int8_plain = plain;
+    c.ane_rows = 1;
+    auto m8 = MetalMossImageTransformer::load(tdir, mc, c, false, {});
+    MP_REQUIRE(m8 != nullptr);
+    std::vector<float> o8 = random_forward_(m8.get(), mc, gh, gw, T, 77u);
+    o8 = random_forward_(m8.get(), mc, gh, gw, T, 77u);
+    MP_REQUIRE(o8.size() == gpu.size());
+    const int n8 = m8->ane_int8_modules(plain);
+    const double d8 = rel_l2_(o8, gpu);
+    std::printf("[moss_image_dit] ... + q/k/v in %s int8 (%d module "
+                "int8): rel-L2 vs the GPU %.6f\n",
+                plain ? "unrotated" : "rotated", n8, d8);
+    if (ane_int8_expected()) {
+      EXPECT_TRUE(n8 == 1 && m8->ane_int8_modules(!plain) == 0);
+      EXPECT_TRUE(m8->ane_armed() && m8->ane_qkv_armed());
+      EXPECT_TRUE(d8 > 0.0 && d8 < (plain ? 0.04 : 0.02));
+    }
+  }
 
   // AND UNDER A LoRA: rank 8 on all six projections of the three blocks.
   const int R = 8, H = cfg.hidden, F = cfg.ffn_inner;

@@ -159,6 +159,7 @@ set(LOCAL_SOURCES
   minimax-h3/vdn-config.cc
   minimax-h3/metal-vdn-branch.cc
   minimax-h3/minimax-h3-references.cc
+  minimax-h3/p-h3-image.cc
   minimax-h3/minimax-h3-reference-encoder.cc
   minimax-h3/metal-minimax-h3-transformer.cc
   minimax-h3/metal-minimax-h3-video-vae.cc
@@ -293,6 +294,7 @@ set(LOCAL_HEADERS
   minimax-h3/vdn-config.h
   minimax-h3/metal-vdn-branch.h
   minimax-h3/minimax-h3-references.h
+  minimax-h3/p-h3-image.h
   minimax-h3/minimax-h3-reference-encoder.h
   minimax-h3/metal-minimax-h3-transformer.h
   minimax-h3/metal-minimax-h3-video-vae.h

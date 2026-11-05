@@ -2855,6 +2855,87 @@ builtin_catalog_()
      .weight_format = "comfyui",
      .needs_tokenizer_json = false,
      .name = "Mamad8/MiniMax-H3-Image-VAE"},
+    // P-H3-Image (PrunaAI): an IMAGE model on MiniMax-H3 -- text-to-image
+    // and instruction editing with up to 8 pictures, 8 steps, no CFG
+    // (generative-models/minimax-h3/p-h3-image.h). Its DiT is FL2VA's
+    // with a rank-128 adapter merged in; its text encoder a Qwen3-VL-4B
+    // conditioning through a connector; its VAE H3's encoder with a
+    // single-frame decoder. Three records over two repos:
+    //   * the whole diffusers pipeline, the merged DiT included;
+    //   * the same repo WITHOUT its DiT -- for a box that already holds
+    //     MiniMax-H3's FL2VA, which runs P-H3-Image under PrunaAI's
+    //     adapter (next) where the merged DiT would be 66 GB more;
+    //   * that adapter (the Comfy repo's), on FL2VA.
+    // The prompt upsampler (a Qwen3.5-9B) is its own record below.
+    // MiniMax H3 Community License; the Qwen3-VL parts Apache-2.0.
+    {.family = "P-H3", .version = "Image", .param_class = "33B",
+     .variant = "diffusers, bf16 (PrunaAI)",
+     .hf_path = "PrunaAI/P-H3-Image",
+     .model_type = "p-h3-image",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = {"LICENSE", "LICENSE-APACHE", "NOTICE", "README.md",
+               "modular_model_index.json",
+               "scheduler/scheduler_config.json",
+               "audio_scheduler/scheduler_config.json",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json", "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "tokenizer/chat_template.jinja", "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "text_connector/config.json",
+               "text_connector/diffusion_pytorch_model.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "vae/config.json", "vae/diffusion_pytorch_model.safetensors",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00004-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00005-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00006-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00007-of-00007"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "PrunaAI/P-H3-Image"},
+    {.family = "P-H3", .version = "Image", .param_class = "4B",
+     .variant = "encoder, connector and VAE -- the DiT is MiniMax-H3's "
+                "FL2VA under PrunaAI's adapter (PrunaAI)",
+     .hf_path = "PrunaAI/P-H3-Image",
+     .model_type = "p-h3-image",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = {"LICENSE", "LICENSE-APACHE", "NOTICE", "README.md",
+               "modular_model_index.json",
+               "scheduler/scheduler_config.json",
+               "audio_scheduler/scheduler_config.json",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json", "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "tokenizer/chat_template.jinja", "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "text_connector/config.json",
+               "text_connector/diffusion_pytorch_model.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "vae/config.json", "vae/diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "PrunaAI/P-H3-Image-no-dit"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "P-H3-Image on FL2VA, rank 128 (PrunaAI)",
+     .hf_path = "PrunaAI/P-H3-Image-Comfy",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"loras/p-h3-image_lora_bf16.safetensors", "LICENSE",
+               "LICENSE-APACHE", "NOTICE", "README.md"},
+     .needs_tokenizer_json = false,
+     .name = "PrunaAI/P-H3-Image-lora"},
     // A tiny autoencoder for LIVE PREVIEWS: it decodes a denoise step's
     // clean estimate onto generate-video's `preview` port at a small
     // fraction of the video VAE's cost. Named on minimax-h3-model-config's
