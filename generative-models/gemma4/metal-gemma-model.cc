@@ -2078,7 +2078,8 @@ MetalGemmaModel::ensure_scratch_()
   }
   // Autotune the decode-attention split for THIS GPU first -- the partials
   // below derive from _gtile_split, so the probe must set it beforehand.
-  if (_gtile_attn || _gqa_attn || _pgqa_attn) {
+  // Untuned (Config::autotune), the default split stands.
+  if (_cfg.autotune && (_gtile_attn || _gqa_attn || _pgqa_attn)) {
     TuningReport tuning;
     tune_decode_attn_(tuning);
     if (std::getenv("VPIPE_GEMMA_AUTOTUNE_LOG") && !tuning.empty()) {

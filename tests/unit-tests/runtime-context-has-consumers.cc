@@ -53,3 +53,26 @@ TEST(runtime_context_has_consumers, out_of_range_is_false_not_throw)
   // bounds-checking themselves.
   EXPECT_FALSE(ctx.has_consumers(999));
 }
+
+// A consumer whose stage ended LEFT (OportBuffer::leave_cursor): the
+// oport has consumers while one still reads, none once all have left.
+TEST(runtime_context_has_consumers, consumers_that_left_report_false)
+{
+  Session     s;
+  OportBuffer buf0(&s);
+  const unsigned a = buf0.attach_cursor();
+  const unsigned b = buf0.attach_cursor();
+  atomic<bool> stop{false};
+
+  vector<OportBuffer*> out_bufs{&buf0};
+  RuntimeContext ctx({}, std::move(out_bufs), &stop);
+
+  EXPECT_TRUE(ctx.has_consumers(0));
+  buf0.leave_cursor(a);
+  EXPECT_TRUE(ctx.has_consumers(0));
+  EXPECT_FALSE(buf0.abandoned());
+  buf0.leave_cursor(b);
+  buf0.leave_cursor(b);   // idempotent
+  EXPECT_FALSE(ctx.has_consumers(0));
+  EXPECT_TRUE(buf0.abandoned());
+}

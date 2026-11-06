@@ -253,3 +253,95 @@ TEST(thread_pool, job_quiescence_follows_the_frame) {
   EXPECT_TRUE(j.quiescent());        // empty now -- nothing to wait for
   EXPECT_FALSE(j.valid());
 }
+
+// ---- Job::Awaiter's tag -----------------------------------------------
+//
+// An untagged Job awaited by a Job takes its caller's tag (so a resume
+// of it after a wait is still the caller's stage); awaited by a
+// coroutine of another promise type it stays untagged -- that caller's
+// promise is never read as a Job's.
+
+namespace {
+
+// Hands the awaiting coroutine its own handle and goes straight on.
+struct OwnHandle {
+  std::coroutine_handle<>* out;
+
+  bool await_ready() const noexcept { return false; }
+
+  bool
+  await_suspend(std::coroutine_handle<> h) const noexcept
+  {
+    *out = h;
+    return false;
+  }
+
+  void await_resume() const noexcept {}
+};
+
+vpipe::Job
+read_own_tag(std::uint32_t* tag)
+{
+  std::coroutine_handle<> self;
+  co_await OwnHandle{&self};
+  *tag = vpipe::perf_tag_of(self);
+}
+
+vpipe::Job
+job_awaiting(std::uint32_t* tag)
+{
+  co_await read_own_tag(tag);
+}
+
+// Not a Job. Its promise is laid out as a Job's, so a reader taking it
+// for one would find 42 where the tag sits.
+struct OtherCoroutine {
+  struct promise_type {
+    void*         not_a_continuation = nullptr;
+    void*         not_an_exception   = nullptr;
+    std::uint32_t not_a_tag          = 42;
+
+    OtherCoroutine
+    get_return_object() noexcept
+    {
+      return OtherCoroutine{
+          std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
+
+    std::suspend_never  initial_suspend() noexcept { return {}; }
+    std::suspend_always final_suspend() noexcept { return {}; }
+    void                return_void() noexcept {}
+    void                unhandled_exception() noexcept {}
+  };
+
+  std::coroutine_handle<promise_type> h;
+
+  ~OtherCoroutine()
+  {
+    if (h) { h.destroy(); }
+  }
+};
+
+OtherCoroutine
+other_awaiting(std::uint32_t* tag)
+{
+  co_await read_own_tag(tag);
+}
+
+}
+
+TEST(thread_pool, an_awaited_job_takes_a_job_callers_tag_only) {
+  std::uint32_t tag = 0;
+  vpipe::Job j = job_awaiting(&tag);
+  j.set_perf_tag(5);
+  j.handle().resume();
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(tag == 5);
+
+  tag = 0;
+  {
+    OtherCoroutine c = other_awaiting(&tag);  // runs at once
+    EXPECT_TRUE(c.h.done());
+  }
+  EXPECT_TRUE(tag == vpipe::kNoPerfTag);
+}

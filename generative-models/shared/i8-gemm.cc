@@ -481,8 +481,8 @@ I8GemmContext::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
 void
 I8GemmContext::settle_(Route route, int bits, int N, int K, int M)
 {
-  if (_answers == nullptr || !split_available() || bypass_split ||
-      force_splits != 0) {
+  if (_answers == nullptr || !_autotune || !split_available() ||
+      bypass_split || force_splits != 0) {
     return;
   }
   const int key = m_key_(M);
@@ -506,7 +506,10 @@ I8GemmContext::settle_(Route route, int bits, int N, int K, int M)
 void
 I8GemmContext::record_(Pending p)
 {
-  if (!split_available() || bypass_split || force_splits != 0) { return; }
+  if (!_autotune || !split_available() || bypass_split ||
+      force_splits != 0) {
+    return;
+  }
   const int key = m_key_(p.M);
   for (const Tuned& t : _tuned) {
     if (t.N == p.N && t.K == p.K && t.M == key) { return; }
@@ -1309,7 +1312,10 @@ I8GemmContext::encode_tuned_(ComputeEncoder& enc, const Pending& p, int M,
 void
 I8GemmContext::tune_pending(MetalCompute* mc)
 {
-  if (_pending.empty() || mc == nullptr || !split_available()) { return; }
+  if (_pending.empty() || mc == nullptr || !split_available() ||
+      !_autotune) {
+    return;
+  }
   std::vector<Pending> todo;
   todo.swap(_pending);
   for (const Pending& p : todo) {

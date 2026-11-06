@@ -112,6 +112,13 @@ constexpr SpecExtra kSeedSequenceExtra[] = {
   {spec_key::kChoices, kSeedSequenceChoices},
 };
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "video model root. The layout is the resident family's own -- an "
           "upstream tree of per-component directories, or a repack that "
@@ -997,7 +1004,12 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   // where it stops being true rather than three plugins away.
   _sol  = genai::sol::config_from_flex(&_accel);
   _sage = genai::sage::config_from_flex(&_accel);
+  // The kernel tuners (kAutotune): into the accel the families read,
+  // and back out below for the Configs this stage fills itself.
+  genai::accel::set_flag(&_accel, genai::accel::kAutotune,
+                         attr_bool("autotune"));
   _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
+  _autotune = genai::accel::flag(&_accel, genai::accel::kAutotune, true);
   {
     const std::string t =
         genai::accel::text(&_accel, genai::accel::kI8GemmTier);
@@ -3090,6 +3102,7 @@ GenerateVideoStage::ensure_expert_(int which)
         : plan.stream  ? "STREAM blocks"
                        : "STREAM blocks, kept as the box allows"));
     _h3_cfg.i8_gemm = _i8_gemm;
+    _h3_cfg.autotune = _autotune;
     _h3_cfg.sol     = _sol;
     _h3_cfg.sage    = _sage;
     // A W4 PACK'S INT8 LAYOUT on the int8 tiers: held where the box has

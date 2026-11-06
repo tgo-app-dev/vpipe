@@ -285,9 +285,11 @@ MetalQwenModelExec::mtp_generate(
   }
   c.prime      = prime;
   std::vector<std::int32_t> out;
+  // draft_len 0: the depth measured a round (MtpDepthChoice)
   const bool ok = _model->mtp_decode(st->metal_cid, first_token, max_tokens,
-                                     out, /*draft_len=*/1, /*accepted_out=*/
-                                     nullptr, /*rounds_out=*/nullptr, c);
+                                     out, /*draft_len=*/0,
+                                     /*accepted_out=*/nullptr,
+                                     /*rounds_out=*/nullptr, c);
   if (produced) { *produced = static_cast<int>(out.size()); }
   return ok;
 }
@@ -579,7 +581,8 @@ MetalQwenModelExec::generate(const SpecDecodeRequest& rq,
   } else if (_model->has_mtp()) {
     long acc = 0, rounds = 0;
     ok = _model->mtp_decode(st->metal_cid, rq.first_token, rq.max_tokens,
-                            ids, /*draft_len=*/1, &acc, &rounds, c);
+                            ids, /*draft_len (measured)=*/0, &acc, &rounds,
+                            c);
     r.rounds = rounds;
     r.accepted = acc;
   }

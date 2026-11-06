@@ -174,6 +174,9 @@ private:
   std::vector<StageMemory>                     _plan_mem;
   MemoryPlan                                   _plan;
   bool                                         _plan_live = false;
+  // The stages' tags given an owner for the pool to put on their resumes
+  // (common/memory-owner.h): cleared as the launch ends.
+  std::vector<std::uint32_t>                   _memory_tags;
 
   std::vector<std::unique_ptr<OportBuffer>>    _oport_bufs;
   std::vector<std::unique_ptr<EdgeReader>>     _readers;

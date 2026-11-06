@@ -210,6 +210,7 @@ private:
   // the same rule the DiT and conditioner stages use.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   bool _unload_idle   = false;
+  bool _autotune      = true;     // kernel tuners measure (kAutotune)
   // The pictures say they are a series (beat::kBatch in the sideband):
   // hold the VAE until end of stream rather than per beat.
   bool _batch         = false;

@@ -685,6 +685,7 @@ FlashVsrVideoFamily::load(const VideoModelCreateArgs& args)
   // create args, which the stage fills from the same config as the
   // per-generation bag.
   cfg.i8_gemm = accel::flag(args.accel, accel::kI8Gemm, cfg.i8_gemm);
+  cfg.autotune = accel::flag(args.accel, accel::kAutotune, cfg.autotune);
   cfg.sage = sage::config_from_flex(args.accel);
   // SOL IS NOT A TIER THIS FAMILY TAKES, and a graph that asked for it
   // is told so rather than left to read a wall clock. The self-attention

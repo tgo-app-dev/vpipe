@@ -1,4 +1,5 @@
 #include "generative-models/z-image/metal-z-image-transformer.h"
+#include "common/memory-owner.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -552,6 +553,8 @@ bool
 MetalZImageTransformer::load_block_(WeightSet& ws, const std::string& p,
                                     bool with_ada, Block& b, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   // The modulated blocks (with_ada) are the ones at the image's rows; the
   // context refiner's run at the caption's.
   b.qw = load_qw_(ws, p + "attention.to_q", r, true, with_ada);
@@ -688,6 +691,8 @@ bool
 MetalZImageTransformer::clone_block_(const Block& src, Block& dst,
                                      bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   // A PROMOTION keeps what a preloaded block keeps (see
   // kept_block_bytes_): a w4 pack whose layout is held (Config::
@@ -754,6 +759,8 @@ MetalZImageTransformer::clone_block_(const Block& src, Block& dst,
 bool
 MetalZImageTransformer::keep_block_(Block& b) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const bool hold = _cfg.i8_hold_w4 && _i8 != nullptr;
   CommandStream cs;
   bool ok = true;
@@ -821,6 +828,8 @@ MetalZImageTransformer::kept_block_bytes_(const Block& b) const
 SharedBuffer
 MetalZImageTransformer::rebuild_one_(const std::string& nm, Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (_ws == nullptr) { return {}; }
   if (how == Placement::kRaw) {
     return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
@@ -1189,6 +1198,7 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   if (const char* e = std::getenv("VPIPE_Z_IMAGE_SOL")) {
@@ -1202,7 +1212,7 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
     m->_cfg.ane_ffn = std::atoi(e) != 0;
   }
   if (const char* e = std::getenv("VPIPE_Z_IMAGE_ANE_ROWS")) {
-    m->_cfg.ane_rows = std::atoi(e);
+    m->_cfg.ane_rows = (float)std::atof(e);
   }
   if (const char* e = std::getenv("VPIPE_Z_IMAGE_ANE_QKV")) {
     m->_cfg.ane_qkv = std::atoi(e) != 0;

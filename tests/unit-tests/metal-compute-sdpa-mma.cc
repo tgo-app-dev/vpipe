@@ -1539,6 +1539,198 @@ TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
 }  // dtypes
 }
 
+// Long-context PREFILL attention through PrefillGqaAttnSet as the model
+// drives it: Qwen3.8-27B's heads (24 q / 4 kv, head_dim 256, f16), 512-token
+// pages, a piece of `n` rows at q_offset into the prompt -- what each
+// 8192-row piece of a 32k prompt runs. Each member's time and causal
+// TFLOP/s (4 Hq D sum over rows of the keys it sees), and the set's pick,
+// which it tunes on fresh pieces. VPIPE_QWEN_ATTN_LONG_BENCH=1.
+TEST(sdpa_mma, qwen_prefill_set_long_context) {
+  if (std::getenv("VPIPE_QWEN_ATTN_LONG_BENCH") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib_sdpa = mc->load_library("sdpa");
+  ComputeLibrary lib_attn = mc->load_library("attn_steel");
+  ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
+  ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  const bool m5 = mc->supports_matrix_cores();
+  const int D = 256, Hq = 24, Hkv = 4, page_tokens = 512;
+  genai::PrefillGqaAttnSet set;
+  set.load(lib_sdpa, &lib_attn, &lib_mma, m5, &lib_nax, false, D);
+  genai::TuningReport rep;
+  set.prepare(mc, {D, Hq, Hkv}, rep);
+  ASSERT_TRUE(set.ready());
+  if (!set.ready()) { return; }
+  struct Case { int n, q_offset; };
+  const Case cases[] = {{4096, 0}, {8192, 0}, {8192, 8192}, {8192, 24576}};
+  std::mt19937 rng(17);
+  std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+  for (const Case& cs : cases) {
+    const int n = cs.n, qoff = cs.q_offset, kL = qoff + n;
+    const int n_pages = (kL + page_tokens - 1) / page_tokens;
+    const size_t pool = (size_t)n_pages * Hkv * page_tokens * D * 2;
+    SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    SharedBuffer kb = mc->make_shared_buffer(pool);
+    SharedBuffer vb = mc->make_shared_buffer(pool);
+    SharedBuffer ptb = mc->make_shared_buffer((size_t)n_pages * 3 * 4);
+    SharedBuffer out = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    if (qb.empty() || kb.empty() || vb.empty() || out.empty()) { continue; }
+    auto fill = [&](SharedBuffer& b, size_t elems) {
+      auto* h = static_cast<std::uint16_t*>(b.contents());
+      std::uint16_t lut[256];
+      for (int i = 0; i < 256; ++i) { lut[i] = f32_to_h(d(rng) * 0.2f); }
+      std::uint32_t x = 2463534242u;
+      for (size_t i = 0; i < elems; ++i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        h[i] = lut[x & 255u];
+      }
+    };
+    fill(qb, (size_t)Hq * n * D);
+    fill(kb, pool / 2);
+    fill(vb, pool / 2);
+    auto* pt = static_cast<std::int32_t*>(ptb.contents());
+    for (int p = 0; p < n_pages; ++p) {
+      pt[p * 3] = p;
+      pt[p * 3 + 1] = std::min(page_tokens, kL - p * page_tokens);
+      pt[p * 3 + 2] = p * page_tokens;
+    }
+    genai::PrefillGqaAttnSet::Attn a;
+    a.qt = &qb; a.kpool = &kb; a.vpool = &vb; a.page_table = &ptb;
+    a.out = &out; a.n = n; a.q_offset = qoff; a.page_tokens = page_tokens;
+    a.n_pages = n_pages; a.scale = 1.0f / std::sqrt((float)D);
+    const double flop = 4.0 * Hq * D *
+        ((double)n * qoff + (double)n * (n + 1) / 2.0);
+    CommandStream st = mc->make_command_stream();
+    auto time_ms = [&](const char* member) {
+      std::vector<double> ms;
+      for (int r = 0; r < 4; ++r) {
+        bool ok = true;
+        { ComputeEncoder enc = st.begin_compute();
+          if (member == nullptr) { set.dispatch(enc, a); }
+          else { ok = set.dispatch_member(enc, a, member); } }
+        CommandStream::Fence f = st.commit();
+        f.wait();
+        if (!ok) { return -1.0; }
+        if (r > 0) { ms.push_back(f.gpu_times().gpu_s * 1e3); }
+      }
+      std::sort(ms.begin(), ms.end());
+      return ms[ms.size() / 2];
+    };
+    std::printf("[qwen_long] n=%d q_offset=%5d set picks %-9s",
+                n, qoff, set.kernel_name(n));
+    const double tset = time_ms(nullptr);
+    std::printf(" %.1f ms %.1f TF |", tset, flop / tset * 1e-9);
+    for (const char* m : {"flash", "steel", "mma", "nax", "nax-split"}) {
+      const double t = time_ms(m);
+      if (t > 0.0) {
+        std::printf(" %s %.1f ms %.1f TF |", m, t, flop / t * 1e-9);
+      }
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+  }
+}
+
+// The dense matmul2d prefill GEMMs at Qwen3.8-27B's shapes, by row count,
+// in one dispatch and in row bands over the same buffers (what
+// MetalQwenModel::tune_mma_band_ chooses between). GPU time, TFLOP/s; the
+// banded output must be the whole dispatch's byte for byte. M5 only.
+// VPIPE_QWEN_GEMM_ROWS=1.
+TEST(sdpa_mma, qwen27_prefill_gemm_rows) {
+  if (std::getenv("VPIPE_QWEN_GEMM_ROWS") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("dense_gemm_mma");
+  ComputeFunction f128 = lib.function("dense_gemm_mma_t_n128_f16");
+  ComputeFunction f256 = lib.function("dense_gemm_mma_t_n128x256_f16");
+  ASSERT_TRUE(f128.valid() && f256.valid());
+  struct Shape { const char* name; int N, K; };
+  const Shape shapes[] = {{"gate|up", 34816, 5120}, {"qkv", 14336, 5120},
+                          {"gdn_in", 16480, 5120}, {"o_proj", 5120, 6144},
+                          {"down", 5120, 17408}};
+  const int Ms[] = {2048, 3072, 4096, 6144, 8192};
+  auto fill = [](SharedBuffer& b, std::size_t elems, std::uint32_t seed) {
+    auto* h = static_cast<std::uint16_t*>(b.contents());
+    std::uint32_t x = seed;
+    for (std::size_t i = 0; i < elems; ++i) {
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      h[i] = f32_to_h(((float)(x & 1023u) / 1023.0f - 0.5f) * 0.1f);
+    }
+  };
+  CommandStream st = mc->make_command_stream();
+  for (const Shape& sh : shapes) {
+    const bool deep = sh.K >= 6144;
+    const int BN = deep ? 256 : 128;
+    SharedBuffer w = mc->make_shared_buffer((size_t)sh.N * sh.K * 2);
+    fill(w, (size_t)sh.N * sh.K, 7);
+    std::printf("[gemm_rows] %-8s N=%5d K=%5d tile 128x%d |", sh.name, sh.N,
+                sh.K, BN);
+    std::printf("\n");
+    for (const int M : Ms) {
+      SharedBuffer x = mc->make_shared_buffer((size_t)M * sh.K * 2);
+      SharedBuffer y = mc->make_shared_buffer((size_t)M * sh.N * 2);
+      SharedBuffer y0 = mc->make_shared_buffer((size_t)M * sh.N * 2);
+      fill(x, (size_t)M * sh.K, 11);
+      std::printf("[gemm_rows]   M=%5d |", M);
+      {
+        std::vector<double> ms;
+        for (int r = 0; r < 4; ++r) {
+          { ComputeEncoder enc = st.begin_compute();
+            enc.set_function(deep ? f256 : f128);
+            enc.set_buffer(0, x); enc.set_buffer(1, w);
+            enc.set_buffer(2, w); enc.set_buffer(3, y0);
+            enc.set_constant(4, sh.K); enc.set_constant(5, sh.N);
+            enc.set_constant(6, M); enc.set_constant(7, 0);
+            enc.dispatch({(unsigned)(((sh.N + BN - 1) / BN) * 256),
+                          (unsigned)((M + 127) / 128), 1}, {256, 1, 1}); }
+          CommandStream::Fence f = st.commit();
+          f.wait();
+          if (r > 0) { ms.push_back(f.gpu_times().gpu_s * 1e3); }
+        }
+        std::sort(ms.begin(), ms.end());
+        const double t = ms[ms.size() / 2];
+        const double tf = 2.0 * M * sh.N * (double)sh.K / t * 1e-9;
+        std::printf(" whole %6.2f ms %5.1f TF |", t, tf);
+      }
+      // the plain order in row BANDS of B rows: dispatches over offsets of
+      // the same buffers, one command buffer
+      for (const int B : {2048, 3072, 4096}) {
+        if (B >= M) { continue; }
+        std::vector<double> ms;
+        for (int r = 0; r < 4; ++r) {
+          { ComputeEncoder enc = st.begin_compute();
+            for (int r0 = 0; r0 < M; r0 += B) {
+              const int rows = std::min(B, M - r0);
+              enc.set_function(deep ? f256 : f128);
+              enc.set_buffer(0, x, (size_t)r0 * sh.K * 2);
+              enc.set_buffer(1, w); enc.set_buffer(2, w);
+              enc.set_buffer(3, y, (size_t)r0 * sh.N * 2);
+              enc.set_constant(4, sh.K); enc.set_constant(5, sh.N);
+              enc.set_constant(6, rows); enc.set_constant(7, 0);
+              enc.dispatch({(unsigned)(((sh.N + BN - 1) / BN) * 256),
+                            (unsigned)((rows + 127) / 128), 1},
+                           {256, 1, 1});
+            } }
+          CommandStream::Fence f = st.commit();
+          f.wait();
+          if (r > 0) { ms.push_back(f.gpu_times().gpu_s * 1e3); }
+        }
+        // a tile is a tile wherever its band starts: bit-identical
+        EXPECT_TRUE(std::memcmp(y.contents(), y0.contents(),
+                                (size_t)M * sh.N * 2) == 0);
+        std::sort(ms.begin(), ms.end());
+        const double t = ms[ms.size() / 2];
+        const double tf = 2.0 * M * sh.N * (double)sh.K / t * 1e-9;
+        std::printf(" band%d %6.2f ms %5.1f TF |", B, t, tf);
+      }
+      std::printf("\n");
+    }
+    std::fflush(stdout);
+  }
+}
+
 // Per-dispatch overhead probe: the Gemma-4 decode gap vs omlx is a context-
 // INDEPENDENT fixed offset (~4ms), concentrated in the small non-GEMV ops
 // (norm/ple/sliding) whose per-token cost is launch + inter-dispatch drain,

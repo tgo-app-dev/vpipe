@@ -145,6 +145,7 @@ private:
   int _lm_quant_bits = 8;   // lm_quant: 8 = the AR stack w8 in memory
   // The flow matching's acceleration tiers, settled in the ctor.
   bool _i8_gemm{};
+  bool _autotune = true;       // kernel tuners measure (kAutotune)
   int _i8_tier = 0;         // i8_gemm_tier: accurate, fast, token, plain
   bool _ane_ffn{};
   double _ane_rows{};

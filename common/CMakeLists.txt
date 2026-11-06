@@ -20,6 +20,7 @@ set(LOCAL_SOURCES
   media-decode.cc
   image-metadata.cc
   media-line.cc
+  memory-owner.cc
   mini-http.cc
   onvif-soap.cc
   os-sandbox.cc

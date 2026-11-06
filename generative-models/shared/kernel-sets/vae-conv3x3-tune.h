@@ -74,6 +74,19 @@ inline const char* name(Kind k)
   return (k == Kind::kOnChip) ? "on-chip-gather" : "im2col+gemm";
 }
 
+// The route believed fastest WITHOUT timing one -- what a caller takes for
+// every shape when its model's tuners are off (the accel key `autotune`,
+// accel-keys.h): one answer per GPU, never a guess per shape that a timing
+// could overturn. With matrix units the im2col arm, which feeds them: the
+// Krea-2 VAE's answer at every shape on an M5, and FLUX.2's from cout 256
+// up by as much as 1.95x, at the price of ~10% at its 128-wide convs.
+// Without them the on-chip gather, which beat the round trip outright on
+// an M4 Pro. A caller without an on-chip member keeps im2col.
+inline Kind believed(bool matrix_cores)
+{
+  return matrix_cores ? Kind::kIm2col : Kind::kOnChip;
+}
+
 // Pick between the members by timing them, interleaved, on the caller's probe.
 // `fallback` comes back when the tune is skipped or fewer than two members are
 // available. Keyed by (tag, cin, cout, stride): per SHAPE because cout swings

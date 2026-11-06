@@ -146,6 +146,13 @@ public:
     // loads the *_bf16 kernel metallibs and keeps the checkpoint's bf16
     // scales/norms/conv raw (no load-time conversion).
     bool  use_bf16    = false;
+    // Whether the kernel tuners MEASURE -- the decode and prefill
+    // attention sets, the batched-GEMV ladder, the int8 split (the accel
+    // key `autotune`, accel-keys.h). False takes the choice believed
+    // fastest on this GPU, timing nothing and reading no kept answer:
+    // what a generating model's backbone (a TTS, a song's, a conditioning
+    // encoder) is given for a run that must repeat. A chat keeps it.
+    bool  autotune    = true;
     // A SEPARATE MTP drafter's directory (LoadSpec::mtp_dir): its
     // model.safetensors carries the head under bare names (fc, layers.0,
     // norm, pre_fc_norm_*), its norms TRUE weights, its fc quantized.
@@ -1820,6 +1827,9 @@ private:
       _fn_hc_attn_prework, _fn_hc_attn_post,
       // The GDN conv a (token, channel) a thread, then its state tail.
       _fn_gdn_conv1d_rows, _fn_gdn_conv1d_tail,
+      // A verify's rows on the GDN ring in one conv and one step, each
+      // row's state to its slot.
+      _fn_gdn_conv1d_ring, _fn_gdn_step_ring,
       _fn_hc_stream_mean,   // a DFlash drafter's tap: the streams' mean
       _fn_moe_finalize_set, _fn_ple_gate, _fn_ple_conv, _fn_ple_state,
       _fn_hc_qmv8_b4,
@@ -2112,6 +2122,25 @@ private:
   void embed_q6k_(metal_compute::ComputeEncoder& enc,
                   const metal_compute::SharedBuffer& ids, std::size_t ioff,
                   const metal_compute::SharedBuffer& out, int n);
+  // The token embedding of `n` ids (int32 at byte `ids_off`) into `out`
+  // [n, hidden], encoded into the caller's encoder -- the muxer's table
+  // and kernel, so the same rows as its fetch_text, without a command
+  // buffer (and a queue) of its own. False, nothing encoded, where the
+  // kernel did not load.
+  bool encode_embed_ids_(metal_compute::ComputeEncoder& enc,
+                         const metal_compute::SharedBuffer& ids,
+                         std::size_t ids_off,
+                         const metal_compute::SharedBuffer& out, int n);
+  bool embed_in_stream_ok_() const;
+  // The rows a prefill's matmul2d GEMM takes in one dispatch at a piece of
+  // `n` rows; 0 the whole piece. Measured per box by tune_mma_band_ (its
+  // own command streams: call it with no encoder open).
+  int mma_band_rows_(int n) const;
+  void tune_mma_band_(int n);
+  static constexpr int kMmaBand = 4096;
+  // tune_mma_band_'s answers by row bucket (up to 6144, past it): -1 not
+  // measured, 0 whole, else the band.
+  int _mma_band[2] = {-1, -1};
 
   // ---- Mixed-precision affine (OptiQ) dispatch ------------------------
   // Dequant ONE affine projection part (`bits` 4 or 8, group 64) into the
@@ -2168,13 +2197,27 @@ private:
   // round), so it never perturbs the main model's KV. All linears here are
   // 4-bit affine (uniform) regardless of the main model's mixed precision.
   struct MtpHead {
+    // Its context's one page, in tokens: the prompt it is seeded with (at
+    // most the newest three quarters of a page) and the decode after it.
+    // 2048 had left a 4k prompt's seed 16 slots of room, so a few rounds
+    // in, the overflow wiped it -- prompt and all -- and the head drafted
+    // from the decode alone. 4 KB a token on the 27B (32 MB).
+    static constexpr int kCtxTokens = 8192;
     bool ok = false;
     Layer lyr;                                 // the full-attn decoder layer
     // The eh-fusion fc, [H, 2H], split at load into its embedding/hidden
     // halves (each [H, H], contiguous): combined = fc_e @ norm_e(emb) +
     // fc_h @ norm_h(hidden). Splitting avoids interleaving the two normed
     // inputs into a [n, 2H] buffer (rms can't write a strided sub-row).
+    // Dense (fc_e, fc_h), or -- an affine drafter's, fc_bits its width --
+    // the halves' codes, scales and biases (fc_e*, fc_h*); mtp_fc_ runs
+    // either.
     metal_compute::SharedBuffer fc_e, fc_h;
+    metal_compute::SharedBuffer fc_ew, fc_es, fc_eb, fc_hw, fc_hs, fc_hb;
+    int fc_bits = 0;
+    // Matrix cores: the head's width's dequant (affine_dequant_w<bits>g64)
+    // for the prompt seed's thousands of rows (head_qmm_).
+    metal_compute::ComputeFunction deq;
     metal_compute::SharedBuffer prenorm_e;     // pre_fc_norm_embedding [H]
     metal_compute::SharedBuffer prenorm_h;     // pre_fc_norm_hidden    [H]
     metal_compute::SharedBuffer final_norm;    // mtp.norm [H]
@@ -2246,6 +2289,9 @@ private:
     // on the GPU by the prologue (seen_rows_from_ids), in place of the
     // host's _mtp_seen_rows.
     const metal_compute::SharedBuffer* seen_rows = nullptr;
+    // The MTP head's THIRD chained application (depth 3, with mtp_preds2):
+    // its drafts at each row. Not under Leviathan-Chen (no third q).
+    std::vector<std::int32_t>* mtp_preds3 = nullptr;
   };
 
   // Re-advance every GDN layer from ring slot 0 to slot 1 over the first
@@ -2294,8 +2340,10 @@ private:
   // rounds: on a NEW queue the driver spent ~5.5 ms on a round's first
   // command buffer before the GPU could start it (an M5 Ultra; ~0.05 ms
   // on the buffers after it), the GPU idle meanwhile -- every round, as
-  // the verify made a stream a call. Each user commits and waits before
-  // the next encodes, so they never share an open buffer.
+  // the verify made a stream a call. The synchronous decode steps take
+  // it too (decode_step_fast, forward, decode_batched_step), which made a
+  // queue a token. Each user commits and waits before the next encodes,
+  // so they never share an open buffer.
   metal_compute::CommandStream& spec_stream_();
   // The RMSNorm kernel for a row of Hd at these byte offsets: the vector
   // one (rms_norm_vec_f16) for a hidden-size row -- 1024 <= Hd <= 8192,
@@ -2382,6 +2430,23 @@ private:
              const metal_compute::SharedBuffer& b, int bits,
              const metal_compute::SharedBuffer& xin,
              const metal_compute::SharedBuffer& y, int K, int N);
+  // An affine MTP-head projection over m rows: vqmm_, or -- from
+  // _mma_min_m rows on matrix cores, the prompt seed's -- dequantized into
+  // _w_deq for the dense matmul2d, as the prefill's projections are.
+  void head_qmm_(metal_compute::ComputeEncoder& enc, int m,
+                 const metal_compute::SharedBuffer& w,
+                 const metal_compute::SharedBuffer& s,
+                 const metal_compute::SharedBuffer& b, int bits,
+                 const metal_compute::SharedBuffer& xin,
+                 const metal_compute::SharedBuffer& y, int K, int N);
+  // The MTP head's fc over m rows: fc_e @ ne into `out`, fc_h @ nh into
+  // `tmp` (the caller adds them). Dense halves on dense_gemm_, affine ones
+  // on head_qmm_.
+  void mtp_fc_(metal_compute::ComputeEncoder& enc, int m,
+               const metal_compute::SharedBuffer& ne,
+               const metal_compute::SharedBuffer& nh,
+               const metal_compute::SharedBuffer& out,
+               const metal_compute::SharedBuffer& tmp);
   // Single-token flash-decode attention via the MLX sdpa_vector 2-pass kernels
   // (vec2 pass-1 + coalesced merge2), shared by the single-token decode, the
   // MTP per-draft verify loop, and the batched per-branch fallback. Writes the
@@ -2716,6 +2781,38 @@ private:
   // accuracy (0.63->0.88) on a fixed sequence, the whole vpipe->reference gap.
   // Set per-decode from VPIPE_MTP_NO_PERSIST in mtp_decode (default ON).
   bool _mtp_persist = false;
+  // HOW DEEP mtp_decode chains the head a round -- 1 to 3 applications,
+  // the next round's drafts -- measured on the run and kept across
+  // decodes: a round's ms at each depth (steady rounds only, those whose
+  // verify had that depth's drafts) and each draft position's kept share
+  // (halved every kHalve rounds). A block of kBlock rounds in every kEvery
+  // runs another depth, so every one stays measured -- and the depth
+  // past the best, never measured, gets its block as soon as the best has
+  // been.
+  struct MtpDepthChoice {
+    static constexpr int kMax = 3;
+    static constexpr int kEvery = 64;
+    static constexpr int kBlock = 3;
+    static constexpr int kHalve = 512;
+    double ms[kMax + 1] = {};
+    int nms[kMax + 1] = {};
+    // steady rounds seen at each depth: the first is not timed (its new
+    // row count's first dispatches cost more than every later one's)
+    int seen[kMax + 1] = {};
+    double reached[kMax] = {}, kept[kMax] = {};
+    std::uint64_t rounds = 0;
+    // an exploring block under way: its depth and the rounds left of it
+    int explore_depth = 0, explore_left = 0;
+    // The depth of most tokens a ms, at most `cap`.
+    int best(int cap) const;
+    // This round's depth, at most `cap`: the best, or another inside an
+    // exploring block (counts the round).
+    int next(int cap);
+    // A finished round: `rows` verified (drafts + 1), `depth` chained,
+    // `run` = 1 + the drafts the verifier agreed with, `ms` its time.
+    void note(int rows, int depth, int run, double ms);
+  };
+  MtpDepthChoice _mtp_dc;
   // Penalised speculative sampling: the verify's per-position seen-sets
   // ([n, vocab] uint8), set by mtp_decode for one verify; empty otherwise.
   std::vector<std::uint8_t> _mtp_seen_rows;

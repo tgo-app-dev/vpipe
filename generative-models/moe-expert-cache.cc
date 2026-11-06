@@ -1,6 +1,7 @@
 #include "generative-models/moe-expert-cache.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/memory-owner.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -81,6 +82,9 @@ MoeExpertCache::create(metal_compute::MetalCompute* mc, const Options& opt,
   c->_resident = opt.resident;
   c->_transient = opt.transient;
   const int slots = opt.resident + opt.transient;
+  // Its model's experts (common/memory-owner.h), under whatever owns the
+  // load that makes it.
+  MemoryUseScope use(MemoryUse::kExperts);
   for (std::size_t b : opt.part_bytes) {
     c->_slot_bytes += b;
     SharedBuffer p = mc->make_shared_buffer(b * (std::size_t)slots);

@@ -310,6 +310,7 @@ private:
   // the same rule the DiT and conditioner stages use.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   bool _unload_idle   = false;
+  bool _autotune      = true;     // kernel tuners measure (kAutotune)
   // `dtype`: the pictures this emits. U8 (the default) quantizes the
   // decoder's samples to 8 bits; F16 keeps them (0..1, clamped) -- for
   // a 16-bit or OpenEXR file, or a 10-bit video, nothing is lost here.

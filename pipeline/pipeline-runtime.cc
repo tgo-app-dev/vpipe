@@ -1,5 +1,6 @@
 #include "pipeline/pipeline-runtime.h"
 #include "common/graph.h"
+#include "common/memory-owner.h"
 #include "common/thread-pool.h"
 #include "common/vertex.h"
 #include "common/vpipe-format.h"
@@ -880,6 +881,11 @@ PipelineRuntime::launch_()
     }
   }
 
+  // Whose each stage's memory is (common/memory-owner.h), from what it
+  // declares below: its largest checkpoint -- a DiT beside its LoRAs, a
+  // chat's model -- and its type; a stage holding none, its type alone.
+  std::vector<MemoryOwnerId> stage_owners(stages.size(), kNoMemoryOwner);
+
   // Phase 4: resource planning, then spawn drivers.
   //
   // This has to happen BEFORE any driver starts, because initialize() is
@@ -968,6 +974,17 @@ PipelineRuntime::launch_()
         if (!m.holdings.empty() || m.scratch > 0 || !m.outputs.empty()) {
           any = true;
         }
+        const StageHolding* big = nullptr;
+        for (const StageHolding& h : m.holdings) {
+          if (!h.source.empty() && (big == nullptr ||
+                                    h.preload > big->preload)) {
+            big = &h;
+          }
+        }
+        stage_owners[mem.size() - 1] = memory_owner(
+            big != nullptr ? std::string_view(big->source)
+                           : std::string_view(),
+            s->type_name());
       }
       if (any) {
         // KEPT for the launch, not computed and dropped. Half of what
@@ -1034,8 +1051,14 @@ PipelineRuntime::launch_()
                                _init_barrier.get(),
                                &_completed, &_done_mu, &_done_cv);
     // Tag the driver coroutine with the stage's gvid so its first
-    // resume-slice (and any later ones) attribute to the stage.
-    driver.set_perf_tag(VertexGraphAccess::gvid(stages[i]));
+    // resume-slice (and any later ones) attribute to the stage -- its
+    // time, and the memory it allocates to its owner.
+    const std::uint32_t tag = VertexGraphAccess::gvid(stages[i]);
+    if (stage_owners[i] != kNoMemoryOwner) {
+      set_tag_memory_owner(session(), tag, stage_owners[i]);
+      _memory_tags.push_back(tag);
+    }
+    driver.set_perf_tag(tag);
     auto h = driver.handle();
     _drivers.push_back(std::move(driver));
     session()->thread_pool()->schedule(h);
@@ -1095,6 +1118,10 @@ PipelineRuntime::stop()
     StageLifecycleAccess::set_memory_sink(s, nullptr);
     StageLifecycleAccess::set_command_inbox(s, nullptr);
   }
+  for (const std::uint32_t tag : _memory_tags) {
+    clear_tag_memory_owner(session(), tag);
+  }
+  _memory_tags.clear();
   close_plan();
   // HOW LONG IT RAN, at INFO and once per launch.
   //
@@ -1290,6 +1317,10 @@ stage_driver_(Stage*                    stage,
   // cancel any it left open, so no caller waits on a stage that ended.
   ctx->shut_commands(fmt("stage '{}' has finished", stage->id())());
   ctx->close_outputs();
+  // And it reads no more: a producer still writing to it -- the stage
+  // failed mid-run -- is not held back by it (OportBuffer::
+  // leave_cursor), so the pipeline can end.
+  ctx->leave_inputs();
 
   {
     lock_guard<mutex> lk(*done_mu);

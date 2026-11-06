@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "common/memory-owner.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 
@@ -839,6 +840,8 @@ MetalFlux2Transformer::clone_single_(const SingleBlock& src, SingleBlock& dst,
 SharedBuffer
 MetalFlux2Transformer::rebuild_one_(const std::string& nm, P how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (!_ws) { return {}; }
   if (how == P::kRaw) {
     // Quantized CODES, which load_qw_ reads as the checkpoint's own
@@ -1525,6 +1528,7 @@ MetalFlux2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
     // SAY WHICH WAY IT WENT, on the same terms as the Sol-Attn lines
     // below: the context gates itself on matrix cores and on its

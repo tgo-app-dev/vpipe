@@ -92,6 +92,7 @@ private:
   // i8_gemm / i8_gemm_tier: -1 off, 0 accurate .. 3 token_plain; and what
   // it settles to on this box, for the plan.
   int _i8_tier = -1;
+  bool _autotune = true;       // its int8 split timed (kAutotune)
   int effective_i8_tier_() const;
   // A pass's activations at the planned geometry, for both ledgers; and
   // the real figure, published once a latent says what it is.

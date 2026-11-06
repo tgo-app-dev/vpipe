@@ -141,6 +141,69 @@ build_pipeline(vpipe::Session& sess, unsigned target,
 
 }
 
+namespace {
+
+// A sink that FAILS mid-run: it reads `before` beats, then throws -- as a
+// writer refused by its encoder does.
+class FailingSink : public vpipe::TypedStage<FailingSink> {
+public:
+  static constexpr const char* kTypeName = "ut-failing-sink";
+  using TypedStage::TypedStage;
+
+  unsigned              before = 0;
+  std::atomic<unsigned> read{0};
+
+  vpipe::Job
+  process(vpipe::RuntimeContext& ctx) override
+  {
+    if (read.load(std::memory_order_relaxed) >= before) {
+      throw std::runtime_error("the sink refused a beat");
+    }
+    auto t = co_await ctx.read(0);
+    if (!t) {
+      ctx.signal_done();
+      co_return;
+    }
+    read.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+VPIPE_REGISTER_STAGE(FailingSink)
+
+}  // namespace
+
+// A stage that fails mid-run LEAVES its inputs (RuntimeContext::
+// leave_inputs): its producer, held to a ring of one, is not left
+// suspended on what it no longer reads -- the source runs out, and the
+// pipeline ends. It used to wait for good: the failed stage's cursor
+// stayed where it stopped, so the ring stayed full.
+TEST(pipeline_runtime, a_stage_that_fails_lets_its_producers_go) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("p", &sess);
+  auto src_u = std::make_unique<CountingSource>(
+    &sess, "src", std::vector<vpipe::InEdge>{});
+  src_u->allocate_oports(1);
+  src_u->target = 200;
+  auto* src = static_cast<CountingSource*>(
+    pl->insert_stage(std::move(src_u)));
+  auto sink_u = std::make_unique<FailingSink>(
+    &sess, "sink", std::vector<vpipe::InEdge>{{src, 0}});
+  sink_u->before = 3;
+  auto* sink = static_cast<FailingSink*>(
+    pl->insert_stage(std::move(sink_u)));
+  src->set_oport_policy(
+    0, vpipe::OportPolicy{1, vpipe::OverrunPolicy::Backpressure});
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  const bool idle = rt.wait_idle(5000);
+  EXPECT_TRUE(idle);
+  // The sink took its three, then failed; the source made all it was
+  // asked for -- the rest dropped, nobody reading them.
+  EXPECT_TRUE(sink->read.load() == 3u);
+  EXPECT_TRUE(src->next.load() == 200u);
+  rt.stop();
+}
+
 TEST(pipeline_runtime, passthrough_basic) {
   vpipe::Session sess;
   auto w = build_pipeline(sess, 100);

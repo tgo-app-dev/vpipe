@@ -171,6 +171,7 @@ private:
   // `encoder_dir`: VOSR's DINOv2 checkpoint (not under _hf_dir), or any
   // other family's encoder weights. Empty until initialize() resolves it.
   std::string _venc_dir;
+  bool        _autotune = true;   // kernel tuners measure (kAutotune)
   // How a reference image pairs with the prompts: the `reference_mode`
   // config key, as the mode of each reference input. "auto" is the rule
   // every input here follows (stages/generation-input.h), which serves an

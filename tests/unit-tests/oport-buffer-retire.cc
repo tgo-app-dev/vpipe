@@ -205,3 +205,40 @@ TEST(oport_buffer_retire, slowest_cursor_acquires_others_clone)
   // Buffer is empty now -- both cursors advanced past the slot.
   EXPECT_TRUE(buf.size() == 0);
 }
+
+// A reader that LEFT holds the writer back no more: a full Backpressure
+// ring takes the next write once its only reader has left (dropped,
+// nobody reading it); with two readers, the one still reading is the
+// slowest and the one that governs the room.
+TEST(oport_buffer_retire, a_reader_that_left_holds_nothing_back)
+{
+  Session s;
+  {
+    OportBuffer buf(&s, backpressure_policy(2));
+    const unsigned c = buf.attach_cursor();
+    EXPECT_TRUE(sync_write(buf, 1));
+    EXPECT_TRUE(sync_write(buf, 2));
+    // Full: the next write would suspend.
+    EXPECT_FALSE(sync_write(buf, 3));
+    buf.leave_cursor(c);
+    EXPECT_TRUE(buf.abandoned());
+    EXPECT_TRUE(sync_write(buf, 3));
+    EXPECT_TRUE(sync_write(buf, 4));
+    EXPECT_TRUE(buf.push_sync(make_payload<test::IntPayload>(5)));
+  }
+  {
+    OportBuffer buf(&s, backpressure_policy(2));
+    const unsigned slow = buf.attach_cursor();
+    const unsigned fast = buf.attach_cursor();
+    EdgeReader rf(&buf, fast);
+    EXPECT_TRUE(sync_write(buf, 1));
+    EXPECT_TRUE(sync_write(buf, 2));
+    EXPECT_FALSE(sync_write(buf, 3));    // the slow one holds it
+    buf.leave_cursor(slow);
+    EXPECT_FALSE(buf.abandoned());
+    // The fast reader has read nothing yet: still full for it.
+    EXPECT_FALSE(sync_write(buf, 3));
+    EXPECT_TRUE(sync_read(rf) == 1);
+    EXPECT_TRUE(sync_write(buf, 3));
+  }
+}

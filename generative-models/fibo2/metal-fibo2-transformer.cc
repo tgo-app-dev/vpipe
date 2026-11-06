@@ -1,4 +1,5 @@
 #include "generative-models/fibo2/metal-fibo2-transformer.h"
+#include "common/memory-owner.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -532,6 +533,8 @@ bool
 MetalFibo2Transformer::load_block_(WeightSet& ws, const std::string& p,
                                     bool with_ada, Block& b, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   // Every block of this family is modulated (with_ada); the flag stays
   // for the shape the streaming machinery shares with Z-Image.
   b.qw = load_qw_(ws, p + "attention.to_q", r, true, with_ada);
@@ -734,6 +737,8 @@ bool
 MetalFibo2Transformer::clone_block_(const Block& src, Block& dst,
                                      bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   // A PROMOTION keeps what a preloaded block keeps (see
   // kept_block_bytes_): a w4 pack whose layout is held (Config::
@@ -800,6 +805,8 @@ MetalFibo2Transformer::clone_block_(const Block& src, Block& dst,
 bool
 MetalFibo2Transformer::keep_block_(Block& b) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const bool hold = _cfg.i8_hold_w4 && _i8 != nullptr;
   CommandStream cs;
   bool ok = true;
@@ -867,6 +874,8 @@ MetalFibo2Transformer::kept_block_bytes_(const Block& b) const
 SharedBuffer
 MetalFibo2Transformer::rebuild_one_(const std::string& nm, Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (_ws == nullptr) { return {}; }
   if (how == Placement::kRaw) {
     return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
@@ -1235,6 +1244,7 @@ MetalFibo2Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   if (const char* e = std::getenv("VPIPE_FIBO2_SOL")) {
@@ -1248,7 +1258,7 @@ MetalFibo2Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
     m->_cfg.ane_ffn = std::atoi(e) != 0;
   }
   if (const char* e = std::getenv("VPIPE_FIBO2_ANE_ROWS")) {
-    m->_cfg.ane_rows = std::atoi(e);
+    m->_cfg.ane_rows = (float)std::atof(e);
   }
   if (const char* e = std::getenv("VPIPE_FIBO2_ANE_QKV")) {
     m->_cfg.ane_qkv = std::atoi(e) != 0;

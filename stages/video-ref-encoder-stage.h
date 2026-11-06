@@ -374,6 +374,7 @@ private:
   // none.
   std::string   _enc_weights;
   std::string   _vae_weights;
+  bool          _autotune = true;   // kernel tuners measure (kAutotune)
   // Either one resolved (a registry key or a path); empty when unset.
   std::string   weights_path_(const std::string& ref) const;
   std::string   _enc_dir;

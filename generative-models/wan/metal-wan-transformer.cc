@@ -1,4 +1,5 @@
 #include "generative-models/wan/metal-wan-transformer.h"
+#include "common/memory-owner.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -259,6 +260,8 @@ MetalWanTransformer::linear_(WeightSet& ws, const std::string& nm)
 bool
 MetalWanTransformer::load_block_(WeightSet& ws, int i, Block& b)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   b.q1 = linear_(ws, blk_(i, "attn1.to_q"));
   b.k1 = linear_(ws, blk_(i, "attn1.to_k"));
   b.v1 = linear_(ws, blk_(i, "attn1.to_v"));

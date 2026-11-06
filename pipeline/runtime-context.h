@@ -101,8 +101,9 @@ public:
   unsigned num_oports() const noexcept;
 
   // True iff the named oport has at least one consumer wired up at
-  // pipeline launch time. The graph is frozen after launch so the
-  // answer is stable for the life of the stage.
+  // pipeline launch time and still reading: it turns false once every
+  // consumer's stage has ended (OportBuffer::leave_cursor), and a
+  // producer may stop making what nobody reads.
   bool has_consumers(unsigned out_port) const noexcept;
 
   // Compat one-shot read. Returns null on EOS.
@@ -201,6 +202,13 @@ public:
   // Close every downstream OportBuffer. Called by the driver after
   // the stage signals done or after an exception.
   void close_outputs();
+
+  // Leave every upstream OportBuffer (EdgeReader::leave): the stage
+  // reads no more, so no producer waits on it. Called by the driver
+  // beside close_outputs -- a stage that FAILED mid-run left its
+  // producers suspended on its full inputs, and the pipeline never
+  // ended.
+  void leave_inputs();
 
 private:
   // Every method is out of line, so this layout is the host's alone: a

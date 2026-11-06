@@ -107,6 +107,11 @@ class MetalMiniMaxH3VideoVae {
     // module; VPIPE_H3_VVAE_ANE_CHUNK / VPIPE_H3_VVAE_ANE_PROFILE for tuning.
     bool  ane_ffn    = false;
     float ane_rows   = 0.0f;
+    // Whether the encoder's GEMM tile, split-K and hardware conv tile are
+    // chosen by timing (the accel key `autotune`, accel-keys.h): false
+    // keeps each one's rule -- the wide tile from K 6144, MmaSplitK's
+    // plan, the c128 conv tile -- timing nothing.
+    bool  autotune   = true;
     int   ane_layers = 0;
     // Per-channel latent whitening. The DiT works in NORMALIZED latent
     // space -- `(z - mean) / std` -- so a decode has to undo it first.

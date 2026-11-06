@@ -292,6 +292,43 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
     _weight_bytes += c->w.byte_size();
     return !c->w.empty();
   };
+  // A 1x1's bias [cout], when the file carries one.
+  auto bias1 = [&](const std::string& nm, Conv* c) -> bool {
+    if (!src.has(nm)) { return true; }
+    const auto sh = shape_of(nm);
+    if (sh.size() != 1 || sh[0] != c->cout) { return false; }
+    _info.params += (std::size_t)c->cout;
+    _weight_bytes += (std::size_t)2 * c->cout;
+    if (!read) { return true; }
+    if (!read_host_(*_ws, mc, nm, &host, &shp)) { return false; }
+    c->b = f16_buf_(mc, host);
+    return !c->b.empty();
+  };
+  // A depthwise 7x7 [n, 1, 7, 7], held TAP-major [49, n] -- the layout
+  // dwconv7x7_hwc_f16 reads, a tap's channels side by side.
+  auto dw7 = [&](const std::string& nm, int n, Conv* c) -> bool {
+    shp = shape_of(nm);
+    if (shp.size() != 4 || shp[0] != n || shp[1] != 1 || shp[2] != 7 ||
+        shp[3] != 7) {
+      return false;
+    }
+    c->cout = n;
+    c->cin = c->cin_file = 1;
+    c->k3 = false;
+    c->depthwise = true;
+    _info.params += (std::size_t)n * 49;
+    _weight_bytes += (std::size_t)2 * n * 49;
+    if (!read) { return true; }
+    if (!read_host_(*_ws, mc, nm, &host, &shp)) { return false; }
+    std::vector<float> tm((std::size_t)49 * n);
+    for (int ch = 0; ch < n; ++ch) {
+      for (int t = 0; t < 49; ++t) {
+        tm[(std::size_t)t * n + ch] = host[(std::size_t)ch * 49 + t];
+      }
+    }
+    c->w = f16_buf_(mc, tm);
+    return !c->w.empty();
+  };
 
   for (int i = 0; i <= max_idx; ++i) {
     const std::string nm = _prefix + std::to_string(i);
@@ -304,10 +341,38 @@ MetalTaeDecoder::parse_(const MetalLlamaWeights& src, bool read,
         return fail(fmt("{}: a block whose first conv is not 4-D", nm)());
       }
       if (inf->shape[2] != 3) {
-        // The Super decoder's blocks open with a depthwise 7x7.
-        return fail(fmt("{}: a {}x{} block conv -- a Super decoder "
-                        "(`*_super`), which this reader does not run",
-                        nm, inf->shape[2], inf->shape[3])());
+        // TAESD's SuperBlock (taesd.py; TAEQI2.1-Tinier's 256- and
+        // 128-wide stages): x + c2(relu(c1(dw7x7(x)))), with no ReLU
+        // after the sum -- a 2D block, read by its depthwise [C, 1, 7, 7]
+        // first conv. A TAEHV Super decoder's temporal blocks are depthwise
+        // too but read [x, past], and stay refused.
+        const bool super = C > 0 && inf->shape[0] == C &&
+                           inf->shape[1] == 1 && inf->shape[2] == 7 &&
+                           inf->shape[3] == 7;
+        if (!super) {
+          return fail(fmt("{}: a {}x{} block conv over {} channels a group "
+                          "-- a TAEHV Super decoder (`*_super`), which "
+                          "this reader does not run", nm, inf->shape[2],
+                          inf->shape[3], inf->shape[1])());
+        }
+        std::string bad;
+        if (!only(i, {"conv.0.weight", "conv.1.weight", "conv.1.bias",
+                      "conv.3.weight"}, &bad)) {
+          return fail(fmt("{}: a SuperBlock tensor '{}' this reader does "
+                          "not run", nm, bad)());
+        }
+        op.kind = Op::kSuperBlock;
+        if (!dw7(nm + ".conv.0.weight", C, &op.c0) ||
+            !conv1(nm + ".conv.1.weight", &op.c1) ||
+            !bias1(nm + ".conv.1.bias", &op.c1) ||
+            !conv1(nm + ".conv.3.weight", &op.c2) || op.c1.cin != C ||
+            op.c2.cin != op.c1.cout || op.c2.cout != C) {
+          return fail(fmt("{}: SuperBlock convs are not [{}, 1, 7, 7] / "
+                          "[e, {}] / [{}, e]", nm, C, C, C)());
+        }
+        op.out_ch = C;
+        _ops.push_back(std::move(op));
+        continue;
       }
       const int cin0 = (int)inf->shape[1];
       if (C > 0 && cin0 == 2 * C) {
@@ -600,6 +665,30 @@ MetalTaeDecoder::build_kernels_(std::string* err)
   _fn_gn_stats  = _lib_elt.function("group_norm_chan_stats_f16");
   _fn_gn_reduce = _lib_elt.function("group_norm_group_stats_f32");
   _fn_gn_apply  = _lib_elt.function("group_norm_apply_f16");
+  bool super = false;
+  for (const Op& o : _ops) { super = super || o.kind == Op::kSuperBlock; }
+  if (super) {
+    _fn_dw7 = _lib_gemm.function("dwconv7x7_hwc_f16");
+    _fn_gemm_relu_bm64 = _lib_gemm.function("dense_gemm_t_bm64_relu_f16");
+    _fn_gemm_relu_bm64bn64 =
+        _lib_gemm.function("dense_gemm_t_bm64bn64_relu_f16");
+    _fn_gemm_acc = _lib_gemm.function("dense_gemm_t_bm64_acc_f16");
+    const std::pair<const char*, const metal_compute::ComputeFunction*>
+        sneed[] = {
+            {"dwconv7x7_hwc_f16", &_fn_dw7},
+            {"dense_gemm_t_bm64_relu_f16", &_fn_gemm_relu_bm64},
+            {"dense_gemm_t_bm64bn64_relu_f16", &_fn_gemm_relu_bm64bn64},
+            {"dense_gemm_t_bm64_acc_f16", &_fn_gemm_acc},
+        };
+    for (const auto& [name, fn] : sneed) {
+      if (!fn->valid()) {
+        if (err != nullptr) {
+          *err = fmt("kernel {} did not load", name)();
+        }
+        return false;
+      }
+    }
+  }
   // Everything the forward can reach. An unresolved name binds nothing
   // and the op it serves would run its predecessor's kernel again -- the
   // loader refuses rather than find out at decode.
@@ -670,6 +759,12 @@ MetalTaeDecoder::scratch_for_(int h, int w) const
         break;
       case Op::kTGrow:
         z.op_out[i] = m_in * op.out_ch;
+        break;
+      case Op::kSuperBlock:
+        // The depthwise output in _tmp0 and the bottleneck's E channels
+        // in _tmp1; the residual is the op's own output.
+        z.op_out[i] = m_in * op.out_ch;
+        z.tmp = std::max(z.tmp, m_in * op.c1.cout);
         break;
       case Op::kMemBlock:
         z.mem[(std::size_t)op.mem] = m_in * op.in_ch;
@@ -928,25 +1023,57 @@ MetalTaeDecoder::conv3_(ComputeEncoder& enc, const Conv& c,
 void
 MetalTaeDecoder::conv1_(ComputeEncoder& enc, const Conv& c,
                         std::size_t w_row0, int rows, const SharedBuffer& in,
-                        const SharedBuffer& out, int M)
+                        const SharedBuffer& out, int M, Gemm1 mode)
 {
   // y[M, rows] = x[M, cin] @ w[w_row0 : w_row0 + rows, cin]^T. The row
   // offset is how a TGrow's sub-frame k takes its channel block without a
   // reshape: the block IS a contiguous band of the weight.
+  //   kRelu: relu(. + bias), one rounding (a SuperBlock's up projection).
+  //   kAcc:  out += ., folded into the accumulator before the rounding
+  //          (its down projection, onto the residual already in `out`).
+  // A bias rides only a whole weight (no TGrow band has one).
   _flops.gemm(M, rows, c.cin_file);
-  const bool wide = rows >= 64 && _fn_gemm_bm64bn64.valid();
+  const bool bias = !c.b.empty() && w_row0 == 0;
+  const bool wide = rows >= 64 && mode != Gemm1::kAcc;
   const int bn = wide ? 64 : 32;
-  enc.set_function(wide ? _fn_gemm_bm64bn64 : _fn_gemm_bm64);
+  const metal_compute::ComputeFunction& fn =
+      mode == Gemm1::kAcc  ? _fn_gemm_acc
+      : mode == Gemm1::kRelu ? (wide ? _fn_gemm_relu_bm64bn64
+                                     : _fn_gemm_relu_bm64)
+      : wide ? _fn_gemm_bm64bn64 : _fn_gemm_bm64;
+  enc.set_function(fn);
   enc.set_buffer(0, in);
   enc.set_buffer(1, c.w, w_row0 * (std::size_t)c.cin * 2);
-  enc.set_buffer(2, c.w);
+  enc.set_buffer(2, bias ? c.b : c.w);
   enc.set_buffer(3, out);
   enc.set_constant(4, c.cin);
   enc.set_constant(5, rows);
   enc.set_constant(6, M);
-  enc.set_constant(7, 0);
+  enc.set_constant(7, bias ? 1 : 0);
+  if (mode == Gemm1::kAcc) { enc.set_constant(8, 1.0f); }
   dispatch_(enc, "conv1x1", {(unsigned)(((rows + bn - 1) / bn) * 32),
                 (unsigned)(((M + 63) / 64) * 2), 2}, {32, 2, 2});
+}
+
+void
+MetalTaeDecoder::dwconv_(ComputeEncoder& enc, const Conv& c,
+                         const SharedBuffer& in, const SharedBuffer& out,
+                         const SharedBuffer* copy_to, int H, int W)
+{
+  // A conv counts 2 * outputs * cout * taps * cin, and a depthwise one's
+  // cin is 1.
+  _flops.gemm(H * W, c.cout, 49);
+  enc.set_function(_fn_dw7);
+  enc.set_buffer(0, in);
+  enc.set_buffer(1, c.w);
+  enc.set_buffer(2, out);
+  enc.set_buffer(3, copy_to != nullptr ? *copy_to : out);
+  enc.set_constant(4, H);
+  enc.set_constant(5, W);
+  enc.set_constant(6, c.cout);
+  enc.set_constant(7, copy_to != nullptr ? 1 : 0);
+  dispatch_(enc, "dwconv7x7", {(unsigned)c.cout, (unsigned)W, (unsigned)H},
+            {(unsigned)std::min(c.cout, 64), 4, 1});
 }
 
 // Every dispatch goes through here so that VPIPE_TAE_PROFILE can time it.
@@ -1070,6 +1197,16 @@ MetalTaeDecoder::run_(ComputeEncoder& enc, std::size_t i,
           run_(enc, i + 1, _op_out[i], H, W, raw * op.stride + k, slot_of);
         }
         return;
+      }
+      case Op::kSuperBlock: {
+        // dw7x7(x) into _tmp0 and x itself into the output, then the
+        // bottleneck up with its ReLU, then the down projection ADDED
+        // onto that x in its accumulator: x + c2(relu(c1(dw(x)))).
+        dwconv_(enc, op.c0, *cur, _tmp0, &_op_out[i], H, W);
+        conv1_(enc, op.c1, 0, op.c1.cout, _tmp0, _tmp1, M, Gemm1::kRelu);
+        conv1_(enc, op.c2, 0, op.out_ch, _tmp1, _op_out[i], M, Gemm1::kAcc);
+        cur = &_op_out[i];
+        break;
       }
       case Op::kBlock:
       case Op::kMemBlock: {

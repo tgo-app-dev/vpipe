@@ -243,7 +243,9 @@ TEST(metal_lm_smoke, uniform_mtp_drafter_token_exact) {
   auto mcfg = genai::MetalQwenModel::config_from(*cfg);
   mcfg.use_bf16 = false;
   mcfg.page_tokens = 512;
-  int kGen = 32;
+  // 96 tokens: the measured depth's ~36 rounds pass an exploring block
+  // (the last 3 of every 32 rounds run the other depth).
+  int kGen = 96;
   if (const char* e = std::getenv("VPIPE_MTP_GEN_TOKENS")) {
     const int v = std::atoi(e);
     if (v > 0) { kGen = v; }
@@ -281,7 +283,12 @@ TEST(metal_lm_smoke, uniform_mtp_drafter_token_exact) {
       model->context_manager()->branch(model->root_context());
   const genai::ContextId child3 =
       model->context_manager()->branch(model->root_context());
-  ASSERT_TRUE(child1.valid() && child2.valid() && child3.valid());
+  const genai::ContextId child4 =
+      model->context_manager()->branch(model->root_context());
+  const genai::ContextId child5 =
+      model->context_manager()->branch(model->root_context());
+  ASSERT_TRUE(child1.valid() && child2.valid() && child3.valid() &&
+              child4.valid() && child5.valid());
 
   // Every row the serial and the MTP runs compute is hashed, to hold the
   // speculative rows to the serial ones byte for byte.
@@ -334,7 +341,11 @@ TEST(metal_lm_smoke, uniform_mtp_drafter_token_exact) {
   };
   run_mtp(child1, /*draft_len=*/1, "depth-1");
   run_mtp(child2, /*draft_len=*/2, "depth-2");
-  EXPECT_TRUE(verify_scratch_planned(*model, 3, /*mtp_head=*/true));
+  run_mtp(child5, /*draft_len=*/3, "depth-3");
+  // The depth measured a round (0), as the exec decodes: both depths run,
+  // a round's drafts verified at the depth the round before chose.
+  run_mtp(child4, /*draft_len=*/0, "measured");
+  EXPECT_TRUE(verify_scratch_planned(*model, 4, /*mtp_head=*/true));
 }
 
 // The same drafter through the MODEL MANAGER, as text-chat loads it

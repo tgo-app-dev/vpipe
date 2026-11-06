@@ -205,7 +205,10 @@ struct HiddenStateEncoderArgs {
   std::string*                 err = nullptr;
 
   // Anything this struct has no field for: see common/flex-bag.h.
-  // (`config` above is the MODEL's config, not this.)
+  // (`config` above is the MODEL's config, not this.) Read today:
+  // genai::accel::kAutotune (bool, accel-keys.h) -- false asks the
+  // encoder's kernel tuners to measure nothing and read no kept answer,
+  // for a run that repeats; absent means true.
   FlexData                     extra;
 };
 

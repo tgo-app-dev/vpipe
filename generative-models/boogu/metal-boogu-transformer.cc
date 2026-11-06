@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "common/memory-owner.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
 
@@ -477,6 +478,8 @@ MetalBooguTransformer::load_block_(WeightSet& ws,
                                    const std::string& pre, Block& b,
                                    bool modulated, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   b.modulated = modulated;
   b.q = load_qw_(ws, pre + "attn.to_q", r);
   b.k = load_qw_(ws, pre + "attn.to_k", r);
@@ -896,6 +899,8 @@ metal_compute::SharedBuffer
 MetalBooguTransformer::rebuild_one_(const std::string& nm,
                                         vpipe::genai::Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (!_ws) { return {}; }
   if (how == P::kRaw) {
     // The same residency load_qw_ uses for a STREAMED read, which is
@@ -1235,6 +1240,7 @@ MetalBooguTransformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   }
   {
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   // Fuse the SwiGLU FF (default on EXCEPT on the matmul2d path, where the

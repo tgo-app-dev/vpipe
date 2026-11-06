@@ -79,7 +79,17 @@ class PrefillGqaAttnSet {
   // out of the per-regime winners). Appends timing to `rep`.
   // VPIPE_QWEN_PREFILL_ATTN=<member> pins every regime to that member when it
   // is available (A/B).
-  void prepare(metal_compute::MetalCompute* mc, Dims dims, TuningReport& rep);
+  //
+  // `measure` false (the accel key `autotune`, accel-keys.h): nothing is
+  // timed or read from the session's answers, and every regime takes the
+  // member believed fastest here -- the NAX attention where the GPU has it
+  // (nax-split 1.5x the best paged member at 1k and 3.6-3.8x at 4k-16k on
+  // the M5 Pro at bd 256, and the tuner's pick there down to 768 rows; nax
+  // 3.8 ms against steel's 10.8 at 2048 rows, bd 128) -- else the defaults:
+  // flash (qtile) short, steel (mma) past it. The same members every load,
+  // so the same rounding.
+  void prepare(metal_compute::MetalCompute* mc, Dims dims, TuningReport& rep,
+               bool measure = true);
 
   bool ready() const { return _ready; }
 

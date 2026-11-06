@@ -54,6 +54,13 @@ constexpr int kPlanTextTokens  = 1024;
 constexpr int kPlanScoreTokens = 4096;
 
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "the audio generator: a models-DB key or a model dir -- YuE2 "
           "(m-a-p/YuE2-3B) or MiniMax-Music3 (MiniMaxAI/MiniMax-Music3). "
@@ -296,6 +303,7 @@ GenerateAudioStage::GenerateAudioStage(const SessionContextIntf* s,
   // The tiers, SETTLED: an out-of-range value is the one it falls back
   // to, said once, so the model never re-checks.
   _i8_gemm = attr_bool("i8_gemm");
+  _autotune = attr_bool("autotune");
   {
     const std::string t = attr_str("i8_gemm_tier");
     _i8_tier = t == "token_plain" ? 3 : t == "token" ? 2 : t == "fast" ? 1
@@ -750,6 +758,7 @@ GenerateAudioStage::initialize(RuntimeContext& ctx)
     co_return;
   }
   cfg.ar_quant_bits = _lm_quant_bits;
+  cfg.autotune = _autotune;
   _tok = genai::Tokenizer::from_tiktoken(
       (std::filesystem::path(dir) / "qwen.tiktoken").string(),
       genai::yue2::tiktoken_specials(), session());
@@ -770,6 +779,7 @@ GenerateAudioStage::initialize(RuntimeContext& ctx)
   {
     genai::MetalYue2Model::Accel a;
     a.i8_gemm    = _i8_gemm;
+    a.autotune   = _autotune;
     a.ane_ffn    = _ane_ffn;
     a.ane_rows   = (float)_ane_rows;
     a.ane_layers = _ane_layers;
@@ -888,6 +898,7 @@ GenerateAudioStage::load_music3_ar_()
   }
   ac.lm_quant_bits = _lm_quant_bits;
   ac.depth_quant_bits = _lm_quant_bits;
+  ac.autotune = _autotune;
   const auto dirs = music3_dirs_();
   const auto t0 = std::chrono::steady_clock::now();
   _m3_ar = genai::MetalMusic3Ar::load(
@@ -929,6 +940,7 @@ GenerateAudioStage::load_music3_flow_()
     return false;
   }
   dc.i8_tier = _i8_gemm ? _i8_tier : -1;
+  dc.autotune = _autotune;
   const auto dirs = music3_dirs_();
   const auto t0 = std::chrono::steady_clock::now();
   _m3_dit = genai::MetalMusic3Dit::load(

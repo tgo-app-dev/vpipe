@@ -70,6 +70,9 @@ struct MossTtsLoadOptions {
   // free text phase see the w8 values. The audio heads and audio
   // embeddings stay bf16: small, and read for every code.
   bool trunk_w8 = true;
+  // Whether the backbone's kernel tuners measure (the accel key
+  // `autotune`; MetalQwenModel::Config::autotune).
+  bool autotune = true;
 };
 
 class MetalMossTtsModel {

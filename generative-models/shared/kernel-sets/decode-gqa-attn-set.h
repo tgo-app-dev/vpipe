@@ -63,7 +63,11 @@ class DecodeGqaAttnSet {
 
   // Allocate the set's own partial scratch (O/m/l) and autotune kernel+split per
   // regime for this GPU. Idempotent. Appends timing to `rep`.
-  void prepare(metal_compute::MetalCompute* mc, Dims dims, TuningReport& rep);
+  // `measure` false (the accel key `autotune`, accel-keys.h): nothing timed or
+  // read from the session's answers -- vec2 at its own split in every regime,
+  // the default the probe starts from.
+  void prepare(metal_compute::MetalCompute* mc, Dims dims, TuningReport& rep,
+               bool measure = true);
 
   bool ready() const { return _ready; }
 

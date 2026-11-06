@@ -291,6 +291,8 @@ public:
   //                 "kv_bytes": u, "seconds": f}, ...],
   //    "weights": [{"dir": s, "bytes": u, "mapped_bytes": u,
   //                 "holders": i, "parked": b}, ...],
+  //    "owned":   [{"dir": s, "kind": s, "use": s, "bytes": u}, ...],
+  //    "unowned_bytes": u,
   //    "kv_bytes": u, "pooled_bytes": u,
   //    "wired_used": u, "wired_limit": u, "gpu_allocated": u}
   //
@@ -313,6 +315,20 @@ public:
   // keeps through its set; `holders` what holds its set, the models
   // using it and those kept warm alike (0: nothing does); `parked`:
   // handed to the kernel as purgeable.
+  // `owned`: WHOSE the Metal allocations are, as they were made -- each
+  // owner's live bytes by use. An owner is a checkpoint's `dir` and what
+  // holds it (`kind`): a stage's type for what a stage allocates as it
+  // runs (its largest declared checkpoint's dir; none for a stage holding
+  // none), "language-model" for a load the model manager makes, "weights"
+  // for what a weight set reads. `use`: "weights" (a tensor kept),
+  // "blocks" (read as a model streams, kept or in flight), "experts" (a
+  // mixture of experts' cache), "kv" (a context's K/V and recurrent
+  // state), "scratch" (all else -- activations, arenas, slots). Additive
+  // with each other, and the same bytes as `warm` and `weights` where
+  // those name them: one model's memory is its dirs' entries summed,
+  // never these and those added. `unowned_bytes`: what was made on a
+  // thread nothing owned (a model's own reader thread, a host's call).
+  // Counted process-wide, every session's together.
   // `kv_bytes` every language model's K/V, the warm ones' included;
   // `pooled_bytes` the checkpoints nothing holds, which the manager can
   // drop now (a model kept warm holds its own, so letting it go frees

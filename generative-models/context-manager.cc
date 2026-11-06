@@ -1,6 +1,7 @@
 #include "generative-models/context-manager.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/memory-owner.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -18,6 +19,19 @@
 using namespace std;
 
 namespace vpipe::genai {
+
+namespace {
+
+// A context's K/V or recurrent state: its model's (common/memory-owner.h),
+// under whatever owns the run that grows it.
+metal_compute::SharedBuffer
+kv_buffer(const metal_compute::MetalCompute* mc, std::size_t n)
+{
+  MemoryUseScope use(MemoryUse::kKv);
+  return mc->make_shared_buffer(n);
+}
+
+}  // namespace
 
 struct ContextManager::Impl {
   Spec spec;
@@ -267,8 +281,8 @@ struct ContextManager::Impl {
           continue;
         }
         const size_t n = contig_bytes_(*c, L);
-        c->c_k[(size_t)L] = mc->make_shared_buffer(n);
-        c->c_v[(size_t)L] = mc->make_shared_buffer(n);
+        c->c_k[(size_t)L] = kv_buffer(mc, n);
+        c->c_v[(size_t)L] = kv_buffer(mc, n);
         if (c->c_k[(size_t)L].empty() || c->c_v[(size_t)L].empty()) {
           return false;
         }
@@ -301,8 +315,8 @@ struct ContextManager::Impl {
             continue;
           }
           const size_t n = contig_bytes_(parent, L);
-          child->c_k[(size_t)L] = mc->make_shared_buffer(n);
-          child->c_v[(size_t)L] = mc->make_shared_buffer(n);
+          child->c_k[(size_t)L] = kv_buffer(mc, n);
+          child->c_v[(size_t)L] = kv_buffer(mc, n);
         }
       }
       for (int L = 0; L < spec.n_layers; ++L) {
@@ -369,8 +383,8 @@ struct ContextManager::Impl {
       if (!pool_owns_(L)) {
         continue;   // linear / sliding / shared layer: no paged K/V here
       }
-      metal_compute::SharedBuffer nk = mc->make_shared_buffer(new_bytes);
-      metal_compute::SharedBuffer nv = mc->make_shared_buffer(new_bytes);
+      metal_compute::SharedBuffer nk = kv_buffer(mc, new_bytes);
+      metal_compute::SharedBuffer nv = kv_buffer(mc, new_bytes);
       if (nk.empty() || nv.empty()) {
         return false;
       }
@@ -400,8 +414,8 @@ struct ContextManager::Impl {
       if (!is_linear_(L)) {
         continue;
       }
-      c->m_conv_state[L] = mc->make_shared_buffer(m_conv_bytes);
-      c->m_ssm_state[L]  = mc->make_shared_buffer(m_ssm_bytes);
+      c->m_conv_state[L] = kv_buffer(mc, m_conv_bytes);
+      c->m_ssm_state[L]  = kv_buffer(mc, m_ssm_bytes);
       if (c->m_conv_state[L].empty() || c->m_ssm_state[L].empty()) {
         return false;
       }
@@ -1389,8 +1403,8 @@ ContextManager::gdn_ring_begin(ContextId id, int depth)
     auto& cs = ctx->m_conv_shadow[static_cast<size_t>(L)];
     auto& ss = ctx->m_ssm_shadow[static_cast<size_t>(L)];
     while (cs.size() < want) {
-      auto cb = _impl->mc->make_shared_buffer(_impl->m_conv_bytes);
-      auto sb = _impl->mc->make_shared_buffer(_impl->m_ssm_bytes);
+      auto cb = kv_buffer(_impl->mc, _impl->m_conv_bytes);
+      auto sb = kv_buffer(_impl->mc, _impl->m_ssm_bytes);
       if (cb.empty() || sb.empty()) { return false; }
       std::memset(cb.contents(), 0, _impl->m_conv_bytes);
       std::memset(sb.contents(), 0, _impl->m_ssm_bytes);
@@ -1692,8 +1706,8 @@ ContextManager::ensure_sliding_capacity(ContextId id, int need)
         (win > 1 && want < _impl->spec.max_seq) ? (win - 1) : 0;
     const size_t n = (size_t)nkv * (size_t)(want + tail)
                      * (size_t)_impl->c_hd[(size_t)L] * 2;
-    auto k = _impl->mc->make_shared_buffer(n);
-    auto v = _impl->mc->make_shared_buffer(n);
+    auto k = kv_buffer(_impl->mc, n);
+    auto v = kv_buffer(_impl->mc, n);
     if (k.empty() || v.empty()) {
       return false;
     }

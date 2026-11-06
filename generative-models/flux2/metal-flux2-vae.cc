@@ -836,7 +836,7 @@ MetalFlux2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
              const vae_mid_attn::Alloc& al, const vae_mid_attn::Release& re) {
         encode_mid_attn_(enc, kind, qq, kk, vv, oo, hw, c, sc, al, re);
       },
-      &detail);
+      &detail, /*verify=*/true, /*measure=*/_cfg.autotune);
   const double tune_ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
   if (mc->session() != nullptr && !detail.empty()) {
@@ -964,6 +964,11 @@ MetalFlux2Vae::autotune_conv3x3_(MetalCompute* mc)
   const auto t0 = std::chrono::steady_clock::now();
   for (const auto& sh : shapes) {
     const int cin = sh.first, cout = sh.second;
+    // Untuned: the route believed fastest here, nothing timed.
+    if (!_cfg.autotune) {
+      _conv_pick[sh] = vae_conv3x3::believed(mc->supports_matrix_cores());
+      continue;
+    }
     const int top = _cfg.dec_block_out[3] > 0 ? _cfg.dec_block_out[3] : cout;
     const int H = std::min(256, std::max(probe_base,
                                          probe_base * (top / std::max(1, cout))));

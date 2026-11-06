@@ -526,7 +526,7 @@ MetalMiniMaxH3LatentUpscaler::load_entry_(WeightSet& ws,
 std::unique_ptr<MetalMiniMaxH3LatentUpscaler>
 MetalMiniMaxH3LatentUpscaler::load(std::shared_ptr<WeightSet> ws,
                                    MetalCompute* mc, std::string* err,
-                                   int i8_tier)
+                                   int i8_tier, bool autotune)
 {
   auto no = [&](std::string m) {
     if (err != nullptr && err->empty()) { *err = std::move(m); }
@@ -546,6 +546,7 @@ MetalMiniMaxH3LatentUpscaler::load(std::shared_ptr<WeightSet> ws,
   // when an f16 pass comes back non-finite.
   m->_bf16 = std::getenv("VPIPE_H3UP_BF16") != nullptr;
   m->_i8_want = i8_tier;
+  m->_autotune = autotune;
   if (!m->bind_kernels_()) {
     return no("a kernel the upscaler needs is missing from this build");
   }
@@ -641,6 +642,7 @@ MetalMiniMaxH3LatentUpscaler::bind_kernels_()
   _i8.reset();
   _i8_tier = -1;
   auto i8 = std::make_unique<I8GemmContext>(mc, _i8_want >= 0, _bf16);
+  i8->set_autotune(_autotune);
   i8->set_tier(_i8_want >= 2   ? I8GemmContext::Tier::kToken
                : _i8_want == 1 ? I8GemmContext::Tier::kFast
                                : I8GemmContext::Tier::kAccurate);

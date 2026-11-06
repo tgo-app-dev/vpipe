@@ -1,4 +1,5 @@
 #include "generative-models/flux3/metal-flux3-transformer.h"
+#include "common/memory-owner.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -415,6 +416,8 @@ MetalFlux3Transformer::load_qw_(WeightSet& ws, const std::string& name,
 bool
 MetalFlux3Transformer::load_block_(WeightSet& ws, int L, Block& b, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const std::string p = prefix_(L);
   b.q = load_qw_(ws, p + "attn.to_q", r, true);
   b.k = load_qw_(ws, p + "attn.to_k", r, true);
@@ -528,6 +531,8 @@ bool
 MetalFlux3Transformer::clone_block_(const Block& src, Block& dst,
                                     bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   auto cq = [&](const QWeight& s, QWeight& d) {
     d.quantized = s.quantized;
@@ -549,6 +554,8 @@ MetalFlux3Transformer::clone_block_(const Block& src, Block& dst,
 SharedBuffer
 MetalFlux3Transformer::rebuild_one_(const std::string& nm, Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (_ws == nullptr) { return {}; }
   if (how == Placement::kRaw) {
     return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
@@ -817,6 +824,7 @@ MetalFlux3Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   {
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm,
                                               /*bf16=*/true);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   if (const char* e = std::getenv("VPIPE_FLUX3_SOL")) {
@@ -830,7 +838,7 @@ MetalFlux3Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
     m->_cfg.ane_ffn = std::atoi(e) != 0;
   }
   if (const char* e = std::getenv("VPIPE_FLUX3_ANE_ROWS")) {
-    m->_cfg.ane_rows = std::atoi(e);
+    m->_cfg.ane_rows = (float)std::atof(e);
   }
   if (const char* e = std::getenv("VPIPE_FLUX3_ANE_QKV")) {
     m->_cfg.ane_qkv = std::atoi(e) != 0;

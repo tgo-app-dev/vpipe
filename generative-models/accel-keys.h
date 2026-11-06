@@ -143,6 +143,11 @@ inline constexpr std::string_view kAneFfn = "ane_ffn";
 // engines' measured rates (~12.6 TOPS ANE against ~7 TFLOP/s GPU puts
 // the balance near 0.64).
 //
+// A share set (> 0) is PINNED: rounded down to whole chunks of the
+// module's rows, never probed or rebalanced -- the split a run takes is
+// the next run's, which is what a reproducible generation needs (the
+// ANE's rows run fp16, so a split that moves moves the output).
+//
 // 1.0 gives the whole FFN to the ANE and leaves the GPU idle for its
 // duration, which is the right setting only when the GPU has other work
 // to overlap. The crossing itself is free -- measured at -0.3 to -1.0 ms
@@ -198,6 +203,24 @@ inline constexpr std::string_view kAneInt8 = "ane_int8";
 // Meaningful only with kAneInt8. A plugin on ane::Tier passes it on as
 // the spec's ane::kInt8Tier.
 inline constexpr std::string_view kAneInt8Tier = "ane_int8_tier";
+
+// Whether a model's KERNEL TUNERS measure. Bool; default true. Many
+// families choose a kernel, a tile, a route or a split by timing the
+// candidates when they load or first run (shared/kernel-autotune.h): the
+// i8 GEMMs' split-K, MiniMax-H3's GEMM routes and attention tile, its
+// video VAE's tiles, a VAE's 3x3 conv route and mid-block attention, a
+// Qwen backbone's attention sets and GEMV ladder. The candidates are not
+// numerically interchangeable, and a timing that lands the other way
+// makes the next run differ: two identical MiniMax-H3 runs measured 21 dB
+// apart. False: nothing is timed, nothing is read from the session's kept
+// answers (they were measured), and each takes the choice believed
+// fastest on this GPU -- which may be what a tune would pick, or not: the
+// price of a run that repeats. With kAneRows pinned too, a generation
+// repeats bit for bit (the ANE's balancer moves its split by timing).
+// A host passes it to every stage that builds such a model -- the
+// generating stages, the VAE and conditioning stages -- and the families
+// key a model kept warm by it, so a tuned one is not reused untuned.
+inline constexpr std::string_view kAutotune = "autotune";
 
 }  // namespace accel
 }  // namespace genai

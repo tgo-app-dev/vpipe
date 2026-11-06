@@ -99,10 +99,16 @@ class MetalFlux3Transformer {
 
     // Accel tiers, read from accel-settings.h by the caller.
     bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     sage::Config sage;
     sol::Config  sol;
     bool ane_ffn   = false;
-    int  ane_rows  = 0;    // 0 = balance from the two engines' rates
+    // The ANE's share of the rows in [0,1] (accel-keys.h kAneRows): 0
+    // balances from the two engines' rates, a share set is pinned.
+    float ane_rows = 0.0f;
     int  ane_layers = 0;   // 0 = every joint block
     bool ane_qkv   = false;
     // The ANE's modules in ROTATED INT8 (W8A8; AneFeedForward::Options::

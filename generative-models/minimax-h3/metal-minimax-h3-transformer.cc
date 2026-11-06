@@ -1,4 +1,5 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "common/memory-owner.h"
 #include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 
 #include "common/flex-data.h"
@@ -1402,6 +1403,8 @@ MetalMiniMaxH3Transformer::kept_block_bytes_(const Block& b) const
 bool
 MetalMiniMaxH3Transformer::keep_block_(Block& b) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   // Conversions land in fresh buffers, swapped in after the wait: the
   // encoder reads the pack until then.
   struct Swap {
@@ -1909,6 +1912,8 @@ bool
 MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
                                         bool copy_bytes) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   auto one = [&](const SharedBuffer& s, SharedBuffer& d) {
     if (!ok || s.empty()) { d = SharedBuffer{}; return; }
@@ -2138,6 +2143,8 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
                                        const std::string& prefix, Block& b,
                                        bool main, bool with_adaln, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   b.n1  = weight_(ws, prefix + "norm1.weight", r);
   b.n2  = weight_(ws, prefix + "norm2.weight", r);
   // A MAIN block's projections in the int8 layout where the tier asks
@@ -4798,6 +4805,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
     // The int8 LAYOUT for the main blocks (see Config::i8_tier), decided
     // here because load_block_ reads it. Not under the ANE tier, whose
@@ -5986,6 +5994,15 @@ MetalMiniMaxH3Transformer::tune_attn_tile_(int seq, bool dense)
     _attn_tile_latched = true;              // BQ 64 stands, unmeasured
     return;
   }
+  // Untuned (Config::autotune): the wide tile, unmeasured -- here, past
+  // kAttnBqMinRows on the NAX attention, it gained on both M5s measured
+  // (1.13-1.22x on the Pro, 8-13% on the Air from 19k rows), and the
+  // tiles are bit-identical, so the choice moves the time alone.
+  if (!_cfg.autotune) {
+    _attn_bq = 128;
+    _attn_tile_latched = true;
+    return;
+  }
   // What an earlier load of this model measured at a length like this
   // one (tuned-answers.h): the probe's six blocks run half of them on the
   // losing tile, so a model reloaded for every clip lost that each time.
@@ -6045,6 +6062,7 @@ MetalMiniMaxH3Transformer::note_attn_tile_(double block_ms)
   const int a = _attn_tile_probing;
   _attn_tile_probing = -1;
   if (a < 0 || a > 1 || block_ms <= 0.0) { return; }
+  note_autotune_sample();          // a timed sample, as a probe's is
   _attn_tile_ms[a][_attn_tile_n[a] % kTileRing] = block_ms;
   ++_attn_tile_n[a];
   if (_attn_tile_n[0] < kTileRing || _attn_tile_n[1] < kTileRing) { return; }
@@ -6092,6 +6110,12 @@ MetalMiniMaxH3Transformer::tune_qmm_(int M)
   // This runs once per (model, sequence length); a getenv is nothing
   // beside the sweep it guards.
   if (std::getenv("VPIPE_H3_NO_QMM_AUTOTUNE") != nullptr) { return; }
+  // Untuned (Config::autotune): gemm_route_'s fallback rule, which is the
+  // answer believed fastest without a timing -- matmul2d at every shape on
+  // a GPU with matrix units (1.7-4.0x steel), the wide tile where K is
+  // deep -- and the split-K plans' own rules (MmaSplitK::plan, the i8
+  // context's unsplit default), none of them measured.
+  if (!_cfg.autotune) { return; }
 
   // A resident block to borrow weights from. With streaming and no
   // pinned prefix the main stack is not in memory here, but the token

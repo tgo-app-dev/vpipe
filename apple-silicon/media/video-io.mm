@@ -203,6 +203,28 @@ describe(NSError* e)
   return e ? std::string(e.localizedDescription.UTF8String) : "unknown";
 }
 
+// An encoder's refusal says little ("The operation could not be
+// completed"): what it was asked for beside it, and the code under it.
+std::string
+describe_refusal(NSError* e, const VideoWriteOptions& o)
+{
+  std::string asked = o.codec;
+  if (o.codec == "h264") {
+    asked += " " + (o.profile.empty() ? std::string("high") : o.profile);
+    asked += o.level.empty() || o.level == "auto"
+        ? std::string(" at its own level")
+        : " at level " + o.level;
+  }
+  asked += ", " + std::to_string(o.width) + "x" + std::to_string(o.height);
+  std::string out = "(" + asked + "): " + describe(e);
+  NSError* under = e ? e.userInfo[NSUnderlyingErrorKey] : nil;
+  if (under) {
+    out += " (" + std::string(under.domain.UTF8String) + " " +
+           std::to_string((long long)under.code) + ")";
+  }
+  return out;
+}
+
 void
 load_keys(id<AVAsynchronousKeyValueLoading> obj, NSArray<NSString*>* keys)
 {
@@ -782,8 +804,10 @@ VideoWriter::write(const TensorBeat& pic, std::int64_t index,
                                   withPresentationTime:t];
     CVPixelBufferRelease(pb);
     if (!appended) {
-      if (err) { *err = "the encoder refused a frame: " +
-                        describe(w.writer.error); }
+      if (err) {
+        *err = "the encoder refused a frame " +
+               describe_refusal(w.writer.error, w.opt);
+      }
       return false;
     }
     return true;

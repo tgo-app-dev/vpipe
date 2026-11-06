@@ -167,6 +167,7 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
   }
   _lm_quant_bits = _lm_quant == "bf16" ? 0 : 8;
   _i8_gemm = attr_bool("i8_gemm");
+  _autotune = attr_bool("autotune");
   _text_normalizer = attr_str("text_normalizer");
   if (_text_normalizer.empty()) { _text_normalizer = "auto"; }
   if (_text_normalizer != "auto" && _text_normalizer != "robust" &&
@@ -295,6 +296,13 @@ TextToSpeechStage::TextToSpeechStage(const SessionContextIntf* s,
 
 namespace {
 constexpr ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "TTS LM model: a models-DB key (registered by model-fetch / "
           "model-quantize) or an HF-style model dir; a DB key wins over a "
@@ -1138,6 +1146,7 @@ TextToSpeechStage::load_drama3_(const std::string& lm_dir,
   // ceiling costs nothing until a prompt reaches it.
   genai::MetalDrama3Model::LoadOptions lo;
   lo.max_rows = genai::drama3::kMaxPromptRows + _max_frames;
+  lo.autotune = _autotune;
   // The routed experts cached when the whole model does not fit beside
   // its peers (the engine's call; VPIPE_MOE_EXPERT_CACHE_MB the A/B).
   {
@@ -1459,6 +1468,8 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
     cfg.backbone.stream_decode   = _lm_streams;
     cfg.local    = rt_qwen_cfg_(lm_dir, "local_transformer.", "model.", 4, 32,
                                 32);
+    cfg.backbone.autotune = _autotune;
+    cfg.local.autotune    = _autotune;
     _lm_rt = genai::MetalMossRtModel::load(
         genai::open_weight_set(lm_dir, session()), mc, cfg);
     if (_lm_rt) { backbone = _lm_rt->backbone(); }
@@ -1467,6 +1478,7 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
     cfg.backbone = v15_backbone_cfg_(lm_dir);
     cfg.backbone.load_quant_bits = qbits;
     cfg.backbone.stream_decode   = _lm_streams;
+    cfg.backbone.autotune        = _autotune;
     _lm_v15 = genai::MetalMossV15Model::load(
         genai::open_weight_set(lm_dir, session()), mc, cfg);
     if (_lm_v15) { backbone = _lm_v15->backbone(); }
@@ -1474,6 +1486,7 @@ TextToSpeechStage::initialize(RuntimeContext& ctx)
     genai::MossTtsLoadOptions opts;
     opts.quant_bits = qbits;
     opts.stream     = _lm_streams;
+    opts.autotune   = _autotune;
     _lm = genai::MetalMossTtsModel::load(
         genai::open_weight_set(lm_dir, session()), mc, opts);
     if (_lm && !_lm->valid()) { _lm.reset(); }

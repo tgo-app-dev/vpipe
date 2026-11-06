@@ -1,5 +1,6 @@
 #include "common/thread-pool.h"
 #include "common/job.h"
+#include "common/memory-owner.h"
 #include "common/perf-event.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -200,10 +201,16 @@ ThreadPool::worker_loop(unsigned my_idx)
     // the log-delegate consumer). The tag is read BEFORE resume because
     // the handle may be at final_suspend afterwards.
     const bool          prof = _session && _session->profiling_enabled();
-    const std::uint32_t tag  = prof ? perf_tag_of(h) : kNoPerfTag;
+    const std::uint32_t tag  = perf_tag_of(h);
     if (prof && tag != kNoPerfTag) {
       _session->record_perf_event(tag, kPerfSchedule, 0);
     }
+    // WHOSE what it allocates is (common/memory-owner.h): the owner the
+    // pipeline registered for the stage this coroutine is -- its model --
+    // for this slice alone, the thread's own back after it.
+    MemoryOwnerScope owner(tag == kNoPerfTag
+                               ? kNoMemoryOwner
+                               : tag_memory_owner(_session, tag));
     // Resume must not propagate exceptions out of a worker. The
     // coroutine's promise captures any unhandled exception in
     // promise_type::unhandled_exception(); the only way exceptions

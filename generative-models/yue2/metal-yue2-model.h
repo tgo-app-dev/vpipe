@@ -60,6 +60,9 @@ class WeightSet;
 class MetalYue2Model {
 public:
   struct Config {
+    // Whether the AR backbone's kernel tuners measure (the accel key
+    // `autotune`; MetalQwenModel::Config::autotune).
+    bool  autotune   = true;
     int   n_layers   = 28;
     int   hidden     = 2048;
     int   n_heads    = 16;
@@ -190,6 +193,10 @@ public:
   //             ~1e-2 per GEMM). Declines below its row and depth gates.
   struct Accel {
     bool  i8_gemm    = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     bool  ane_ffn    = false;
     float ane_rows   = 0.0f;      // the ANE's share; <= 0 balances itself
     int   ane_layers = 0;         // cap on split layers; 0 = all 28

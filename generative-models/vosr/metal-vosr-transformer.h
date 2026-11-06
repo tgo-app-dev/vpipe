@@ -78,6 +78,10 @@ class MetalVosrTransformer {
     // (ALU 32/16, NAX 64/32), so nothing about the geometry changes,
     // but Sol had asserted head_dim 128 since it shipped.
     bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     sage::Config sage;
     sol::Config  sol;
   };

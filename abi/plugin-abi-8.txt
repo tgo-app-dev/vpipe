@@ -1799,7 +1799,8 @@ record vpipe::metal_compute::SharedBuffer
   176 | _Bool _wired
   177 | _Bool _accounted
   178 | _Bool _inactive
-  184 | std::uintptr_t[2] _reserved
+  184 | std::uintptr_t _owner_slot
+  192 | std::uintptr_t[1] _reserved
   | [sizeof=200, dsize=200, align=8,
   | nvsize=200, nvalign=8]
 record vpipe::metal_compute::SharedBuffer::PageResidency
@@ -2279,6 +2280,7 @@ vpipe::EdgeReader::at_eos() const
 vpipe::EdgeReader::backlog() const
 vpipe::EdgeReader::deregister_multi(std::__1::shared_ptr<vpipe::MultiReadWaiter> const&)
 vpipe::EdgeReader::dropped() const
+vpipe::EdgeReader::leave()
 vpipe::EdgeReader::readable_now() const
 vpipe::EdgeReader::register_multi(std::__1::shared_ptr<vpipe::MultiReadWaiter> const&)
 vpipe::EdgeReader::release_read(unsigned int)
@@ -2403,6 +2405,8 @@ vpipe::OportBuffer::OportBuffer(vpipe::SessionContextIntf const*, vpipe::OportPo
 vpipe::OportBuffer::WriteAwaiter::await_ready()
 vpipe::OportBuffer::WriteAwaiter::await_resume()
 vpipe::OportBuffer::WriteAwaiter::await_suspend(std::__1::coroutine_handle<void>)
+vpipe::OportBuffer::abandoned() const
+vpipe::OportBuffer::abandoned_locked_() const
 vpipe::OportBuffer::acquire_locked_(unsigned int)
 vpipe::OportBuffer::active_count_relaxed_() const
 vpipe::OportBuffer::attach_cursor()
@@ -2411,6 +2415,7 @@ vpipe::OportBuffer::closed() const
 vpipe::OportBuffer::deregister_reader_multi_waiter_(unsigned int, std::__1::shared_ptr<vpipe::MultiReadWaiter> const&)
 vpipe::OportBuffer::dropped() const
 vpipe::OportBuffer::dropped_for_cursor(unsigned int) const
+vpipe::OportBuffer::leave_cursor(unsigned int)
 vpipe::OportBuffer::num_cursors() const
 vpipe::OportBuffer::peek_locked_(unsigned int, unsigned int) const
 vpipe::OportBuffer::push_locked_(std::__1::unique_ptr<vpipe::BeatPayloadIntf, std::__1::default_delete<vpipe::BeatPayloadIntf>>&)
@@ -2442,6 +2447,7 @@ vpipe::RuntimeContext::eos(unsigned int) const
 vpipe::RuntimeContext::has_commands() const
 vpipe::RuntimeContext::has_consumers(unsigned int) const
 vpipe::RuntimeContext::iport_connected(unsigned int) const
+vpipe::RuntimeContext::leave_inputs()
 vpipe::RuntimeContext::next_command()
 vpipe::RuntimeContext::num_iports() const
 vpipe::RuntimeContext::num_oports() const
@@ -3227,10 +3233,13 @@ vpipe::catalog_extra::kUrlFiles = "url_files"
 vpipe::genai::VaeModelFamily::kRoleAudio = "audio"
 vpipe::genai::VaeModelFamily::kRoleVideo = "video"
 vpipe::genai::accel::kAneFfn = "ane_ffn"
+vpipe::genai::accel::kAneInt8 = "ane_int8"
+vpipe::genai::accel::kAneInt8Tier = "ane_int8_tier"
 vpipe::genai::accel::kAneLayers = "ane_layers"
 vpipe::genai::accel::kAneQkv = "ane_qkv"
 vpipe::genai::accel::kAneRows = "ane_rows"
 vpipe::genai::accel::kAneTemplates = "ane_templates"
+vpipe::genai::accel::kAutotune = "autotune"
 vpipe::genai::accel::kI8Gemm = "i8_gemm"
 vpipe::genai::accel::kI8GemmTier = "i8_gemm_tier"
 vpipe::genai::accel::kI8TierAccurate = "accurate"
@@ -3255,6 +3264,9 @@ vpipe::genai::accel::kSolDenseLayers = "sol_dense_layers"
 vpipe::genai::accel::kSolKeyBlock = "sol_key_block"
 vpipe::genai::accel::kSolLocalRadius = "sol_local_radius"
 vpipe::genai::accel::kSolTau = "sol_tau"
+vpipe::genai::accel::kSolThreshDiag = "diag"
+vpipe::genai::accel::kSolThreshExact = "exact"
+vpipe::genai::accel::kSolThreshold = "sol_threshold"
 vpipe::genai::ane::kActGeluTanh = "gelu_tanh"
 vpipe::genai::ane::kActSwiglu = "swiglu"
 vpipe::genai::ane::kActivation = "activation"
@@ -3272,6 +3284,10 @@ vpipe::genai::ane::kInfoLostRow0 = "lost_row0"
 vpipe::genai::ane::kInfoRowsPerBlock = "rows_per_block"
 vpipe::genai::ane::kInfoTiming = "timing"
 vpipe::genai::ane::kInner = "inner"
+vpipe::genai::ane::kInt8 = "int8"
+vpipe::genai::ane::kInt8Tier = "int8_tier"
+vpipe::genai::ane::kInt8TierToken = "token"
+vpipe::genai::ane::kInt8TierTokenPlain = "token_plain"
 vpipe::genai::ane::kIoIn = "in"
 vpipe::genai::ane::kIoOut = "out"
 vpipe::genai::ane::kKind = "kind"
@@ -3337,6 +3353,7 @@ vpipe::genai::load_spec::kDraftDir = "draft_dir"
 vpipe::genai::load_spec::kExpertCacheMb = "expert_cache_mb"
 vpipe::genai::load_spec::kMemoryLimitMb = "memory_limit_mb"
 vpipe::genai::load_spec::kMtpDir = "mtp_dir"
+vpipe::genai::load_spec::kNgramResident = "ngram_resident"
 vpipe::genai::load_spec::kWireWeights = "wire_weights"
 vpipe::genai::model_config::kDefaultSystemPrompt = "default_system_prompt"
 vpipe::genai::model_config::kQuantization = "quantization"

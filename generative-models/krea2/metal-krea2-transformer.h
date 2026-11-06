@@ -69,6 +69,10 @@ class MetalKrea2Transformer {
     // Accelerated mode (LOSSY, opt-in): dynamic-int8 GEMMs for the big
     // block matmuls (see shared/i8-gemm.h). VPIPE_I8_GEMM overrides.
     bool  i8_gemm         = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     // ...and its tier (I8GemmContext::Tier): 0 accurate (groups of 64),
     // 1 fast (the main blocks' projections held as rotated int8 at a
     // coarse group), 2 token (int8 per channel x per token, both

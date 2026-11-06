@@ -1,5 +1,6 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/wire-on-alloc.h"
+#include "common/memory-owner.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -1011,6 +1012,11 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   // MTL::Buffer by refcount and are deliberately not counted again).
   out._accounted = true;
   account_alloc_(byte_size);
+  // And WHOSE: the owner and use in force on this thread
+  // (common/memory-owner.h), counted out when the handle goes.
+  const std::uint32_t slot = memory_slot_now();
+  out._owner_slot = slot;
+  memory_slot_add(slot, byte_size);
   // Inside a WireOnAlloc scope: wired before anything is written, so the
   // compressor never takes it (wire-on-alloc.h). Not a heap slice: its
   // pages are the heap's, shared with whatever else lives there.

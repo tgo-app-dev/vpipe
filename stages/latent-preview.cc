@@ -79,17 +79,24 @@ latent_preview_shrink(int w, int h, int max_edge)
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
-namespace {
-
 // The TAE a `preview_vae` names: a direct file, a registered model's
-// pinned checkpoint, or a directory with one .safetensors in it. Wider
-// than resolve_adapter_file() on purpose, and only here: madebyollin
-// publishes some TAEs as torch `.pth` only (taeqi2_1), which the
-// checkpoint reader maps like any shard, while an ADAPTER field
-// accepting .pth would change what every LoRA picker resolves to.
+// pinned checkpoint, or a directory with one .safetensors in it -- or,
+// of several, the one NAMED AFTER the directory. Wider than
+// resolve_adapter_file() on purpose, and only here: madebyollin
+// publishes some TAEs as torch `.pth` only (taeqi2_1's GitHub copy),
+// which the checkpoint reader maps like any shard, while an ADAPTER
+// field accepting .pth would change what every LoRA picker resolves to.
+//
+// The name rule is the publisher's: the Hub repo madebyollin/taeqi2_1
+// held taeqi2_1.safetensors alone, then gained taeqi2_1_tinier
+// .safetensors beside it (a smaller variant), and a preview naming the
+// folder stopped loading. The file carrying the repo's name is its
+// main checkpoint; the variants carry a suffix. Any other ambiguity is
+// still refused (resolve_adapter_file names the files) -- madebyollin/
+// taehv holds several TAEs, none of them `taehv`.
 std::string
-resolve_tae_file_(const SessionContextIntf* session, const std::string& ref,
-                  std::string* err)
+latent_preview_tae_file(const SessionContextIntf* session,
+                        const std::string& ref, std::string* err)
 {
   namespace fs = std::filesystem;
   std::error_code ec;
@@ -105,10 +112,14 @@ resolve_tae_file_(const SessionContextIntf* session, const std::string& ref,
       }
     }
   }
+  fs::path dir(rm.dir);
+  if (dir.filename().empty()) { dir = dir.parent_path(); }  // "a/b/"
+  if (!dir.empty() && fs::is_directory(dir, ec)) {
+    const fs::path own = dir / (dir.filename().string() + ".safetensors");
+    if (fs::is_regular_file(own, ec)) { return own.string(); }
+  }
   return resolve_adapter_file(session, ref, err);
 }
-
-}  // namespace
 
 std::vector<ResourceClaim>
 latent_preview_claims(const SessionContextIntf* session,
@@ -118,7 +129,7 @@ latent_preview_claims(const SessionContextIntf* session,
 {
   if (!spec.enabled() || w <= 0 || h <= 0 || frames <= 0) { return {}; }
   std::string err;
-  const std::string file = resolve_tae_file_(session, spec.vae, &err);
+  const std::string file = latent_preview_tae_file(session, spec.vae, &err);
   if (file.empty()) { return {}; }
   std::vector<ResourceClaim> out = model_memory::weight_claims({file});
   using Tae = genai::MetalTaeDecoder;
@@ -209,7 +220,7 @@ LatentPreviewer::configure(const LatentPreviewSpec& spec,
 bool
 LatentPreviewer::load_(std::string* err)
 {
-  std::string file = resolve_tae_file_(_session, _spec.vae, err);
+  std::string file = latent_preview_tae_file(_session, _spec.vae, err);
   if (file.empty()) { return false; }
   auto* mc = _session->services()->metal_compute();
   if (mc == nullptr) {

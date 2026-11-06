@@ -743,6 +743,7 @@ MetalFlashVsrTransformer::load(std::shared_ptr<WeightSet> ws,
   {
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm,
                                               /*bf16=*/true);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   {

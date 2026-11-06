@@ -1,6 +1,7 @@
 #include "generative-models/weight-set.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/memory-owner.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
@@ -267,6 +268,22 @@ WeightSet::has(const string& name) const
   return _wts->has(name);
 }
 
+namespace {
+
+// Whose what a set reads is (common/memory-owner.h): its checkpoint's,
+// whichever model asked -- kept, its weights; read as a model streams,
+// its blocks. A plain read() is a language model's weights read into its
+// own members as much as a DiT's block: blocks only where its caller is
+// loading one (stream_tensor, a model's block loader).
+struct OwnedRead {
+  MemoryOwnerScope owner;
+  MemoryUseScope   use;
+  OwnedRead(const string& dir, MemoryUse u) : owner(dir, "weights"), use(u)
+  {}
+};
+
+}  // namespace
+
 metal_compute::SharedBuffer
 WeightSet::alias_(const Entry& e) const
 {
@@ -290,6 +307,7 @@ WeightSet::tensor(const string& name, metal_compute::MetalCompute* mc,
   auto it = _cache.find(name);
   if (it != _cache.end()) { return alias_(it->second); }
 
+  OwnedRead own(_dir, MemoryUse::kWeights);
   metal_compute::SharedBuffer buf =
       res == Residency::Mapped ? _wts->load_mapped(name, mc)
                                : _wts->load(name, mc);
@@ -317,6 +335,9 @@ WeightSet::read(const string& name, metal_compute::MetalCompute* mc,
                 Residency res)
 {
   if (mc == nullptr) { return {}; }
+  OwnedRead own(_dir, memory_use_now() == MemoryUse::kBlocks
+                          ? MemoryUse::kBlocks
+                          : MemoryUse::kWeights);
   {
     lock_guard<recursive_mutex> lk(_mu);
     if (_mc == nullptr) { _mc = mc; }
@@ -354,6 +375,7 @@ metal_compute::SharedBuffer
 WeightSet::stream_tensor(const string& name, metal_compute::MetalCompute* mc,
                          Residency res)
 {
+  MemoryUseScope use(MemoryUse::kBlocks);
   metal_compute::SharedBuffer buf = read(name, mc, res);
   if (!buf.empty()) {
     _streamed_reads.fetch_add(1, std::memory_order_relaxed);
@@ -403,6 +425,7 @@ WeightSet::stream_derived(
     const function<metal_compute::SharedBuffer()>& build)
 {
   if (!build) { return {}; }
+  OwnedRead own(_dir, MemoryUse::kBlocks);
   metal_compute::SharedBuffer buf = build();
   if (buf.empty()) { return buf; }
   _streamed_reads.fetch_add(1, std::memory_order_relaxed);
@@ -421,6 +444,7 @@ WeightSet::derived(const string&                                  key,
   if (it != _cache.end()) { return alias_(it->second); }
   if (!build) { return {}; }
 
+  OwnedRead own(_dir, MemoryUse::kWeights);
   metal_compute::SharedBuffer buf = build();
   if (buf.empty()) { return {}; }
 

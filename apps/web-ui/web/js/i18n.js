@@ -1885,6 +1885,15 @@ const STRINGS = {
       + '內容政策分類器，則每條提示詞（編輯任務還包括來源影像）都會先經它篩'
       + '查——這是強制的，沒有設定項；被拒絕的提示詞會得到一張空白影像而不'
       + '是生成結果。'],
+  'cfg.diffusion-conditioner.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.diffusion-conditioner.hf_dir': ['',
       '模型目录（text_encoder/、transformer/、tokenizer/）；由 transformer '
       + '的 _class_name 决定模型族与编码器。可选：model 输入端口上的 '
@@ -2026,6 +2035,15 @@ const STRINGS = {
       '不經解碼直接放大 MiniMax-H3 的影片潛在：用 H3 潛在放大器（一個 3D 卷'
       + '積網路）——這正是 Open-H3-Regenerate-2K 在編碼草稿與在更大尺寸上精'
       + '修之間執行的那一步（768P -> 2K）。'],
+  'cfg.latent-upscale.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.latent-upscale.hf_dir': ['',
       '潜在放大器：模型库键、Open-H3-Regenerate-2K 发布'
       + '（Efficient-Large-Model/Open-H3-Regenerate-2K：其 latent_upsampler/）'
@@ -2483,6 +2501,15 @@ const STRINGS = {
       + '，metal）：寫出歌曲的 token——YuE2 會先規劃 ABC 樂'
       + '譜——再用流匹配生成供 audio-vae-decode 解碼的潛空間音'
       + '訊。'],
+  'cfg.generate-audio.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.generate-audio.hf_dir': ['',
       '音频生成模型：models 数据库中的键或模型目录——YuE2（m-a-'
       + 'p/YuE2-3B）或 MiniMax-Music3（MiniMaxAI'
@@ -2699,6 +2726,15 @@ const STRINGS = {
       '擴散 DiT 去噪器：條件（來自 diffusion-conditioner 階段）-> 模型族的 '
       + 'MMDiT -> FlowMatchEuler -> 潛變數，執行在 metal-compute 後端。這是'
       + '拆分出來的去噪器一半（下游接 vae-decode）。'],
+  'cfg.generate-image.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.generate-image.hf_dir': ['',
       'Krea-2-Turbo / FLUX.2 模型目录（text_encoder/、transformer/、'
       + 'tokenizer/）；可以是原版管道，也可以是经 model-quantize 处理过的自'
@@ -3191,6 +3227,15 @@ const STRINGS = {
       + '在其 transformer 上的取樣器 -> 一段潛在影片；對會產生配樂的模型族'
       + '，還會輸出一段潛在音軌。執行在 metal-compute 後端。下游接 '
       + 'vae-decode（以及 audio-vae-decode）。'],
+  'cfg.generate-video.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.generate-video.hf_dir': ['',
       '视频模型根目录。目录结构由常驻模型族自己决定——可能是上游那套按组件分'
       + '目录的树，也可能是命名不同的重打包版本——每个已注册的模型族会认领它'
@@ -3930,6 +3975,15 @@ const STRINGS = {
       + '"moss_tts_realtime"（24 kHz 單聲道）或 "fish_omni"（Fish Audio '
       + 'Drama 3：說話者標籤、行內表演提示、用音訊加其文字稿複製音色 -> '
       + '44.1 kHz 單聲道）。'],
+  'cfg.text-to-speech.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.text-to-speech.hf_dir': ['',
       '语音合成语言模型：models 数据库中的键（由 model-fetch / '
       + 'model-quantize 注册）或 HF 风格的模型目录；同名时数据库键优先于路'
@@ -4188,6 +4242,15 @@ const STRINGS = {
       + '格一個節拍，好讓下游沿用既有的逐格機制（save-image、rgb-to-video -'
       + '> save-video、預覽），也可以在 1 號輸出埠以單個節拍取回整段片段。'
       + '具體執行哪個解碼器取決於常駐模型族；由外掛註冊的模型族自行解碼。'],
+  'cfg.vae-decode.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.vae-decode.dtype': ['',
       'u8 | f16：发出的图片格式。u8（默认）把解码器的样本量化为 8 位，是多数'
       + '消费端读取的格式。f16 保留它们（0..1）——用于 16 位 PNG/TIFF、'
@@ -4351,6 +4414,15 @@ const STRINGS = {
       '在 metal-compute 後端把 RGB 影像編碼為 Krea-2-Turbo（Qwen-Image VAE'
       + '）的白化潛變數。它是 vae-decode 的鏡像；下游接 generate-image 的 `'
       + 'latent` 埠（圖生圖）。'],
+  'cfg.vae-encode.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.vae-encode.input_range': ['',
       '仅对 F32 输入有效（U8 恒为 0..255，F16 恒为 0..1）：采样值代表什么。"unit"（默认）'
       + '是 [0,1]——即 video-to-rgb 打开 `normalize` 时发出的范围，也是预览'
@@ -4496,6 +4568,15 @@ const STRINGS = {
       + '段配對使用。兩個分割都可以：參考是 Ref2VA 訓練過的任務，而 FL2VA '
       + '權重同樣能接收參考，即上游的 Ref2VA-like 模式——在那裡只用圖片，而'
       + '且短邊取 768 而不是 2048。'],
+  'cfg.video-ref-encoder.autotune': ['',
+      '模型的内核调优器是否实测（int8 split-K、GEMM 路由与分块、VAE 的卷积'
+      + '路由与中间块注意力、骨干网络的注意力内核组）：false 时什么都不计时，'
+      + '也不读取会话里保存的调优结果，直接采用这块 GPU 上被认为最快的选择，'
+      + '因此一次运行可以原样重现（accel-keys.h kAutotune）。默认 true',
+      '模型的核心調校器是否實測（int8 split-K、GEMM 路由與分塊、VAE 的卷積'
+      + '路由與中間塊注意力、骨幹網路的注意力核心組）：false 時什麼都不計時，'
+      + '也不讀取工作階段裡保存的調校結果，直接採用這塊 GPU 上被認為最快的選'
+      + '擇，因此一次執行可以原樣重現（accel-keys.h kAutotune）。預設 true'],
   'cfg.video-ref-encoder.references': ['',
       '参考文件，按模型应当读取的顺序给出：一个路径，或一个路径数组。顺序决'
       + '定它们在呈现中的标号（<Picture 1>、<Video 2>…），也决定它们在共享'

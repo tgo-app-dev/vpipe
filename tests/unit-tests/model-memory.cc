@@ -23,6 +23,7 @@
 #include "pipeline/resource-plan.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
+#include "common/thread-pool.h"
 #include "pipeline/typed-stage.h"
 #include "stages/model-memory.h"
 #include "stages/model-memory-host.h"
@@ -40,6 +41,8 @@
 #include "stages/video-ref-encoder-stage.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "pipeline/resource-claim-delivery.h"
+#include "common/memory-owner.h"
+#include "common/vertex.h"
 
 #include <cstdlib>
 #include <functional>
@@ -644,6 +647,186 @@ TEST(model_memory, the_runtime_declares_before_init_and_clears_after)
   EXPECT_TRUE(stage->ran_process);
   EXPECT_TRUE(stage->saw_in_process == 4096u);
   fs::remove_all(root, ec);
+}
+
+// WHOSE a buffer is (common/memory-owner.h): counted under the owner and
+// use in force on its thread as it is made -- nested scopes their own,
+// the outer's back after -- carried with the buffer through a move, and
+// counted out where it was counted in when it goes. Made where nothing
+// owns its thread, it is no one's.
+TEST(model_memory, each_buffer_is_counted_as_its_owners)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto bytes = [](const std::string& dir, MemoryUse use) {
+    std::uint64_t n = 0;
+    for (const OwnedMemory& m : owned_memory()) {
+      if (m.dir == dir && m.use == use) { n += m.bytes; }
+    }
+    return n;
+  };
+  const std::string dir = "/ut/owned-model";
+  const std::string other = "/ut/other-model";
+  constexpr std::size_t kMb = std::size_t{1} << 20;
+  metal_compute::SharedBuffer kept;
+  {
+    MemoryOwnerScope own(dir, "ut-stage");
+    metal_compute::SharedBuffer a = mc->make_shared_buffer(kMb);
+    {
+      MemoryUseScope use(MemoryUse::kBlocks);
+      metal_compute::SharedBuffer b = mc->make_shared_buffer(2 * kMb);
+      EXPECT_TRUE(bytes(dir, MemoryUse::kBlocks) == 2 * kMb);
+    }
+    // Gone, counted out.
+    EXPECT_TRUE(bytes(dir, MemoryUse::kBlocks) == 0);
+    {
+      MemoryUseScope use(MemoryUse::kExperts);
+      kept = mc->make_shared_buffer(3 * kMb);
+      {
+        // Another owner inside: its own scratch, then the outer's back.
+        MemoryOwnerScope inner(other, "language-model");
+        metal_compute::SharedBuffer c = mc->make_shared_buffer(kMb);
+        EXPECT_TRUE(bytes(other, MemoryUse::kScratch) == kMb);
+        EXPECT_TRUE(memory_use_now() == MemoryUse::kScratch);
+      }
+      EXPECT_TRUE(memory_owner_now() == memory_owner(dir, "ut-stage"));
+      EXPECT_TRUE(memory_use_now() == MemoryUse::kExperts);
+    }
+    EXPECT_TRUE(bytes(dir, MemoryUse::kScratch) == kMb);
+  }
+  EXPECT_TRUE(memory_owner_now() == kNoMemoryOwner);
+  EXPECT_TRUE(bytes(dir, MemoryUse::kScratch) == 0);
+  EXPECT_TRUE(bytes(other, MemoryUse::kScratch) == 0);
+  // Moved, still its owner's -- and the session says so.
+  metal_compute::SharedBuffer moved = std::move(kept);
+  EXPECT_TRUE(bytes(dir, MemoryUse::kExperts) == 3 * kMb);
+  const vpipe::SessionIntf& host = sess;
+  const std::string json = host.memory_report().to_json();
+  EXPECT_TRUE(json.find("\"owned\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"/ut/owned-model\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"experts\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"unowned_bytes\"") != std::string::npos);
+  moved = metal_compute::SharedBuffer{};
+  EXPECT_TRUE(bytes(dir, MemoryUse::kExperts) == 0);
+  // Owned by no one.
+  std::uint64_t before = 0, during = 0;
+  (void)owned_memory(&before);
+  {
+    metal_compute::SharedBuffer z = mc->make_shared_buffer(kMb);
+    (void)owned_memory(&during);
+  }
+  EXPECT_TRUE(during - before == kMb);
+}
+
+namespace {
+
+// Parks the awaiting coroutine on the session's pool, as an edge's wake
+// does (OportBuffer schedules its waiter there): what follows runs in a
+// resume slice of its own, the pool's scope taken from THAT handle.
+struct ParkOnPool {
+  ThreadPool* pool;
+  bool*       parked;
+
+  bool await_ready() const noexcept { return false; }
+
+  void
+  await_suspend(std::coroutine_handle<> h) const noexcept
+  {
+    // Locals first: the pool may resume the handle at once.
+    ThreadPool* p = pool;
+    *parked = true;
+    p->schedule(h);
+  }
+
+  void await_resume() const noexcept {}
+};
+
+// A stage that holds a checkpoint and allocates as it runs -- in its own
+// process() and in a Job it awaits, after that Job has waited.
+class OwningStage : public TypedStage<OwningStage> {
+public:
+  static constexpr const char* kTypeName = "ut-owning-stage";
+  using TypedStage::TypedStage;
+
+  std::string                   dir;
+  metal_compute::MetalCompute*  mc = nullptr;
+  metal_compute::SharedBuffer   made, made_inside;
+  std::uint32_t                 tag = kNoPerfTag;
+  bool                          parked = false;
+
+  StageMemory declare_memory() const override
+  {
+    StageMemory m;
+    m.hold(dir + "/lora", 1024);
+    m.hold(dir, 8192);
+    return m;
+  }
+
+  Job inside()
+  {
+    co_await ParkOnPool{session()->thread_pool(), &parked};
+    made_inside = mc->make_shared_buffer(std::size_t{2} << 20);
+    co_return;
+  }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (made.empty()) {
+      tag = VertexGraphAccess::gvid(this);
+      made = mc->make_shared_buffer(std::size_t{1} << 20);
+      co_await inside();
+    }
+    ctx.signal_done();
+    co_return;
+  }
+};
+
+}  // namespace
+
+// A stage's memory is its model's: the pool puts on each of its resumes
+// the owner the runtime registered for it -- its largest declared
+// checkpoint and its type -- so what it allocates running, and what a
+// Job it awaits allocates once the pool resumes that Job (its own
+// handle, tagged by Job::Awaiter), is that checkpoint's; cleared as the
+// launch ends.
+TEST(model_memory, a_stage_allocates_as_its_models)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  Pipeline pl("owning-test", &sess);
+  auto st = std::make_unique<OwningStage>(
+      &sess, "own", std::vector<InEdge>{}, FlexData::make_object());
+  st->dir = "/ut/owning-model";
+  st->mc = mc;
+  st->allocate_oports(0);
+  auto* stage = static_cast<OwningStage*>(pl.insert_stage(std::move(st)));
+  {
+    PipelineRuntime rt(&pl, &sess);
+    ASSERT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  ASSERT_TRUE(!stage->made.empty() && !stage->made_inside.empty());
+  EXPECT_TRUE(stage->parked);
+  std::uint64_t scratch = 0, lora = 0;
+  std::string kind;
+  for (const OwnedMemory& m : owned_memory()) {
+    if (m.dir == "/ut/owning-model" && m.use == MemoryUse::kScratch) {
+      scratch += m.bytes;
+      kind = m.kind;
+    }
+    if (m.dir == "/ut/owning-model/lora") { lora += m.bytes; }
+  }
+  EXPECT_TRUE(scratch == (std::size_t{3} << 20));
+  EXPECT_TRUE(kind == "ut-owning-stage");
+  EXPECT_TRUE(lora == 0);
+  // The launch over, its tag is no one's.
+  EXPECT_TRUE(tag_memory_owner(stage->session(), stage->tag) ==
+              kNoMemoryOwner);
+  stage->made = metal_compute::SharedBuffer{};
+  stage->made_inside = metal_compute::SharedBuffer{};
 }
 
 namespace {

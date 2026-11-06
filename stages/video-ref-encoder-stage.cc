@@ -85,6 +85,13 @@ constexpr SpecExtra kUnloadChoices[] = {
   {spec_key::kChoices, "auto,destroy,keep"},
 };
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "references", .type = ConfigType::Any, .required = false,
    .doc = "the reference files IN THE ORDER THE MODEL SHOULD READ THEM: one "
           "path, or an array of paths. The order labels them in the "
@@ -388,6 +395,7 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   _hf_dir           = attr_str("hf_dir");
   _enc_weights      = attr_str("encoder_dir");
   _vae_weights      = attr_str("vae_dir");
+  _autotune         = attr_bool("autotune");
   // One path or a list of them. The composer's file browser appends
   // into a JSON array, and a single pick left as a bare string is what
   // a hand-written pipeline looks like -- both are the same request, so
@@ -885,6 +893,7 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   // globally, because the pool is KV for 50 layers of a 32B model and a
   // text-only conditioner should not pay for it.
   if (_max_prompt_tokens > 0) { ecfg.lm.max_seq = _max_prompt_tokens; }
+  ecfg.lm.autotune = _autotune;
   // The weights from `encoder_dir` when it names them; the config above
   // and the tokenizer from the model's own encoder either way.
   const std::string enc_w = weights_path_(_enc_weights);
@@ -964,6 +973,7 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
     return false;
   }
   const std::string vae_w = weights_path_(_vae_weights);
+  vcfg.autotune = _autotune;
   _video_vae =
       vae_w.empty()
           ? genai::MetalMiniMaxH3VideoVae::load(vdir.empty() ? _root : vdir,

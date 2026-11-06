@@ -362,6 +362,50 @@ TEST(tae_decoder, taeqi2_1_matches_the_reference)
   EXPECT_TRUE(o.got.channels == 4);
 }
 
+// The same TAE as the Hub repo madebyollin/taeqi2_1 ships it:
+// diffusers' names (`decoder.layers.<i>`, the Clamp implicit) in a
+// .safetensors -- bit-identical weights to the .pth above, read through
+// the other layout.
+TEST(tae_decoder, taeqi2_1_hub_matches_the_reference)
+{
+  MetalTaeDecoder::Info want;
+  want.layout = "diffusers";
+  want.latent_channels = 64;
+  want.spatial = 16;
+  want.patch = 2;
+  want.time_upscale = 1;
+  want.temporal = false;
+  const Outcome o = decode_case_("taeqi2_1_hub");
+  if (!o.ran) { return; }
+  CHECK_CASE_(o, want, 0.02);
+  EXPECT_TRUE(o.info.image_channels == 4);
+}
+
+// TAEQI2.1-Tinier, the repo's second file: its 256- and 128-wide stages
+// are SuperBlocks (taesd.py's ConvNeXt-style block: a depthwise 7x7, a
+// 2x 1x1 bottleneck with a ReLU, a 1x1 back, added to the input with no
+// ReLU after). The golden is a restatement of taesd.py's F16 decoder,
+// itself held exactly to the taeqi2_1 golden taesd.py wrote. That the
+// six SuperBlocks RAN as such is the fused-forward test's (six depthwise
+// dispatches); here, the smaller network (4.1M params in the repo,
+// encoder included).
+TEST(tae_decoder, taeqi2_1_tinier_matches_the_reference)
+{
+  MetalTaeDecoder::Info want;
+  want.layout = "diffusers";
+  want.latent_channels = 64;
+  want.spatial = 16;
+  want.patch = 2;
+  want.time_upscale = 1;
+  want.temporal = false;
+  const Outcome o = decode_case_("taeqi2_1_tinier");
+  if (!o.ran) { return; }
+  CHECK_CASE_(o, want, 0.02);
+  EXPECT_TRUE(o.info.image_channels == 4);
+  EXPECT_TRUE(o.got.channels == 4);
+  EXPECT_TRUE(o.info.params > 1000000 && o.info.params < 3000000);
+}
+
 // An RGBA shrink is PREMULTIPLIED. Judged the way a viewer sees it --
 // colour TIMES alpha, since colour under a clear pixel is arbitrary and
 // dividing by a near-zero alpha only amplifies rounding. The golden's
@@ -438,7 +482,8 @@ TEST(tae_decoder, an_rgba_shrink_is_premultiplied)
 TEST(tae_decoder, the_plan_is_what_a_decode_allocates)
 {
   for (const char* name : {"taeh3_22", "kijai2d", "taew2_1", "taef1",
-                           "taef2", "taeqi2_1"}) {
+                           "taef2", "taeqi2_1", "taeqi2_1_hub",
+                           "taeqi2_1_tinier"}) {
     const std::string dir = golden_(name);
     Case c;
     if (dir.empty() || !load_case_(dir, &c)) { continue; }
@@ -478,7 +523,8 @@ TEST(tae_decoder, the_plan_is_what_a_decode_allocates)
 // ReLU and add.
 TEST(tae_decoder, the_fused_forward_is_the_one_that_runs)
 {
-  for (const char* name : {"taeh3_22", "taew2_1", "taef1", "taeqi2_1"}) {
+  for (const char* name : {"taeh3_22", "taew2_1", "taef1", "taeqi2_1",
+                           "taeqi2_1_tinier"}) {
     const std::string dir = golden_(name);
     Case c;
     if (dir.empty() || !load_case_(dir, &c)) { continue; }
@@ -512,10 +558,16 @@ TEST(tae_decoder, the_fused_forward_is_the_one_that_runs)
               ? cat.substr(0, cat.size() - 3) : cat;
       stray = stray || !(base == "conv3x3" || base == "conv3x3+up" ||
                          base == "head" || base == "conv1x1" ||
-                         base == "copy");
+                         base == "copy" || base == "dwconv7x7");
     }
     std::printf("[tae] %s dispatches:%s\n", name, seen.c_str());
     EXPECT_FALSE(stray);
+    // A SuperBlock is its depthwise conv and two 1x1s, its ReLU in the
+    // up projection's epilogue and its residual in the down's: the
+    // tinier decoder's six run six depthwise dispatches, no ReLU pass.
+    const auto dw = dec->profile().find("dwconv7x7");
+    const int n_dw = dw != dec->profile().end() ? dw->second.dispatches : 0;
+    EXPECT_TRUE(n_dw == (std::string(name) == "taeqi2_1_tinier" ? 6 : 0));
     // And the fusions that CAN engage did: every one of these layouts
     // upsamples, so a fused upsample-conv must have run.
     EXPECT_TRUE(dec->profile().count("conv3x3+up") == 1);
@@ -584,14 +636,19 @@ tae_flops_(const std::string& file, int T, int h, int w, Trim trim)
     if (src->has(nm + ".conv.0.weight")) {
       const auto* c0 = src->info(nm + ".conv.0.weight");
       const bool mem = c0->shape[1] == 2 * C;
-      std::uint64_t per = 2 * (mk(nm + ".conv.0.weight") +
-                               mk(nm + ".conv.2.weight") +
-                               mk(nm + ".conv.4.weight"));
-      for (const char* t : {".skip.weight", ".pool.0.weight",
-                            ".pool.3.weight"}) {
-        if (src->has(nm + t)) { per += 2 * mk(nm + t); }
+      // A Block's three 3x3s at .conv.{0,2,4}; a SuperBlock's depthwise
+      // 7x7 and two 1x1s at .conv.{0,1,3} (a depthwise conv's cin is 1,
+      // which its [c, 1, 7, 7] shape already says). Absent ones count 0.
+      std::uint64_t per = 0;
+      for (const char* t : {".conv.0.weight", ".conv.1.weight",
+                            ".conv.2.weight", ".conv.3.weight",
+                            ".conv.4.weight", ".skip.weight",
+                            ".pool.0.weight", ".pool.3.weight"}) {
+        per += 2 * mk(nm + t);
       }
-      C = src->info(nm + ".conv.4.weight")->shape[0];
+      if (src->has(nm + ".conv.4.weight")) {
+        C = src->info(nm + ".conv.4.weight")->shape[0];
+      }
       ops.push_back({'b', per, 1, mem});
     } else if (src->has(nm + ".conv.weight")) {
       const auto* g = src->info(nm + ".conv.weight");
@@ -667,7 +724,8 @@ TEST(tae_decoder, a_preview_counts_its_flops)
 {
   namespace pf = vpipe::perf_flops;
   for (const char* name : {"taeh3_22", "kijai2d", "taew2_1", "taef1",
-                           "taef2", "taeqi2_1"}) {
+                           "taef2", "taeqi2_1", "taeqi2_1_hub",
+                           "taeqi2_1_tinier"}) {
     const std::string dir = golden_(name);
     Case c;
     if (dir.empty() || !load_case_(dir, &c)) { continue; }
@@ -749,7 +807,7 @@ TEST(tae_decoder, preview_cost)
   const bool profile = std::getenv("VPIPE_TAE_PROFILE") != nullptr;
   const char* only = std::getenv("VPIPE_TAE_BENCH_ONLY");
   for (const char* name : {"taeh3_22", "taew2_1_image", "taef1", "taef2",
-                           "taeqi2_1"}) {
+                           "taeqi2_1", "taeqi2_1_tinier"}) {
     if (only != nullptr && std::string(only) != name) { continue; }
     const std::string dir = golden_(name);
     Case c;

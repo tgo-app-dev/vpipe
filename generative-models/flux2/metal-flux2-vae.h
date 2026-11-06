@@ -49,6 +49,10 @@ class MetalFlux2Vae {
   struct Config {
     int in_channels     = 3;
     int latent_channels = 32;
+    // Whether its kernel tuners MEASURE (the 3x3 conv route, the mid-block
+    // attention, the int8 split): false takes the choice believed fastest
+    // on this GPU, timing nothing -- the accel key `autotune`.
+    bool autotune = true;
     int block_out[4]    = {128, 256, 512, 512};
     // The DECODER's widths, when they differ from the encoder's:
     // `decoder_block_out_channels`, the FLUX.2 "small decoder" MOSS-Image

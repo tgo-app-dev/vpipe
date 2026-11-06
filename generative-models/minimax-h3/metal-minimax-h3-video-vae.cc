@@ -2450,7 +2450,7 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
   // it is measured per shape here, so raising col_cap (or a level's band)
   // flips these decisions automatically instead of needing this comment to
   // be re-read.
-  if (_use_mma2 && _splitk.enabled) {
+  if (_use_mma2 && _splitk.enabled && _cfg.autotune) {
     KernelTuningCache* const answers = tuning_cache(_mc);
     int tt = T, hh = H, ww = W;
     for (const EncLevel& lv : _enc_levels) {
@@ -2519,7 +2519,7 @@ MetalMiniMaxH3VideoVae::encode(const SharedBuffer& x, int T, int H, int W,
     (void)tt;
   }
   // The hardware conv's tile, per shape, before the stream opens.
-  if (_use_hwconv) {
+  if (_use_hwconv && _cfg.autotune) {
     int tt = T, hh = H, ww = W;
     if (hw_route_(_enc_conv_in, hh, ww, 1, false)) {
       c3_tune_(_enc_conv_in, tt, hh, ww, 1, 1);

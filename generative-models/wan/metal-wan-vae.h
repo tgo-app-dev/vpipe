@@ -71,6 +71,9 @@ class MetalWanVae {
     // used by unwhiten(); the pipeline applies latents = latents*std + mean.
     std::vector<float> latents_mean;
     std::vector<float> latents_std;
+    // Whether its mid-block attention is chosen by timing: false takes the
+    // member believed fastest on this GPU -- the accel key `autotune`.
+    bool autotune = true;
   };
 
   // Read a Config out of a diffusers `vae/config.json`. False when the

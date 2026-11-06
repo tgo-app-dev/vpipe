@@ -147,6 +147,10 @@ public:
     // the prefix has to coexist with is whatever else the run holds.
     bool   stream_layers  = false;
     double pin_frac       = 0.0;
+    // Whether the decode-attention tuner MEASURES (the accel key
+    // `autotune`, accel-keys.h): false keeps its default split, timing
+    // nothing and reading no kept answer.
+    bool   autotune       = true;
     int   page_tokens     = 256;    // bookkeeping ctx manager
     int   max_pages       = 0;
     // Per-layer attention kind (true = full_attention). Size == n_layers.

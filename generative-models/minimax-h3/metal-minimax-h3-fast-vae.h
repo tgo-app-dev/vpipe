@@ -95,6 +95,10 @@ class MetalMiniMaxH3FastVae {
     // i8_gemm: -1 off, 0 accurate, 1 fast, 2 token, 3 token_plain (the
     // stages' tier names, by number). Matrix cores only.
     int   i8_tier    = -1;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     // The ANE tier (LOSSY, fp16): its share of every feed-forward's rows,
     // 0 auto-balancing; `ane_layers` caps the blocks, 0 all.
     bool  ane_ffn    = false;

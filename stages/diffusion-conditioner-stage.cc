@@ -72,6 +72,13 @@ constexpr SpecExtra kReferenceModeChoices[] = {
   {spec_key::kChoices, "auto,latch,per_beat"},
 };
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "model dir (text_encoder/, transformer/, tokenizer/); the "
           "transformer's _class_name selects the family + encoder. OPTIONAL: a "
@@ -1104,6 +1111,7 @@ DiffusionConditionerStage::DiffusionConditionerStage(
   // (when iport connectivity is known), not at construction.
   _hf_dir    = attr_str("hf_dir");
   _venc_dir  = attr_str("encoder_dir");
+  _autotune  = attr_bool("autotune");
   if (const char* e = std::getenv("VPIPE_COND_BATCH")) {
     _batch_max = std::max(1, std::atoi(e));
   }
@@ -1434,6 +1442,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
           this->id(), plan.footprint >> 30, plan.others >> 30,
           h3cfg.lm.stream_layers ? "STREAM layers" : "PRELOAD"));
     }
+    h3cfg.lm.autotune = _autotune;
     _h3_enc_cfg = h3cfg;
     _h3_enc = genai::MiniMaxH3TextEncoder::load(_enc_cfg_dir, mc,
                                                 const_cast<SessionContextIntf*>(
@@ -1483,6 +1492,7 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // head is loaded whatever its profile says: a screen that cannot
   // generate can only refuse, which would block every prompt.
   if (_screen != nullptr) { ecfg.backbone_only = false; }
+  ecfg.autotune = _autotune;
   _enc_hidden = ecfg.hidden;
   // The encoder may be affine-quantized (model-quantize target=text_encoder).
   // The loader auto-detects quantized-vs-dense weights but needs the bit-width
@@ -1617,13 +1627,17 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
   // the reserve again before every prompt. A pinned prefix IS: sized by
   // THIS launch's plan, one pinned for a roomier box would hold more
   // than this plan admitted.
-  _enc_warm_key = fmt("{}|{}|{}|screen {}|batch {}|stream {} {} pin {}",
+  // Whether its tuners measured: a tuned encoder kept warm is not handed
+  // to a run that must repeat.
+  _enc_warm_key = fmt("{}|{}|{}|screen {}|batch {}|stream {} {} pin {}|"
+                      "tune {}",
                       _family, _enc_dir, _enc_cfg_dir,
                       _screen != nullptr ? 1 : 0, _resident_for_batch ? 1 : 0,
                       ecfg.stream_layers ? 1 : 0,
                       ecfg.stream_decode ? "resident-set" : "prefill",
                       genai::MetalQwenModel::pinned_layer_count(
-                          _enc_ws->src(), ecfg))();
+                          _enc_ws->src(), ecfg),
+                      ecfg.autotune ? 1 : 0)();
   if (_keep_loaded > 0) {
     if (auto* mgr = session()->services()->generative_model_manager()) {
       if (auto w = mgr->take_warm<WarmEncoder>(kWarmEncoderKind, _enc_dir,

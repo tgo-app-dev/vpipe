@@ -1,5 +1,6 @@
 #include "common/session.h"
 #include "common/host-report.h"
+#include "common/memory-owner.h"
 #include "common/db-log-delegate.h"
 #include "common/diagnostic-capture.h"
 #include "common/ffmpeg-libraries.h"
@@ -1541,6 +1542,24 @@ SessionIntf::memory_report() const
     }
   }
   oo.insert("weights", std::move(weights));
+  // WHOSE the Metal allocations are (common/memory-owner.h): each owner's
+  // live bytes, use by use; and those made where nothing owned them.
+  {
+    std::uint64_t none = 0;
+    FlexData owned = FlexData::make_array();
+    auto a = owned.as_array();
+    for (const OwnedMemory& m : owned_memory(&none)) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("dir", FlexData::make_string(m.dir));
+      eo.insert("kind", FlexData::make_string(m.kind));
+      eo.insert("use", FlexData::make_string(memory_use_name(m.use)));
+      eo.insert("bytes", FlexData::make_uint(m.bytes));
+      a.push_back(std::move(e));
+    }
+    oo.insert("owned", std::move(owned));
+    oo.insert("unowned_bytes", FlexData::make_uint(none));
+  }
   oo.insert("kv_bytes", FlexData::make_uint(mgr->resident_kv_bytes()));
   oo.insert("pooled_bytes", FlexData::make_uint(mgr->pooled_bytes()));
   oo.insert("wired_used", FlexData::make_uint(mgr->wired_pool_used()));

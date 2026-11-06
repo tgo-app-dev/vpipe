@@ -741,6 +741,7 @@ class I8GemmContext {
            std::string_view caller = {})
   {
     if (!_on || mc == nullptr || !split_available()) { return 0; }
+    if (!_autotune) { return plan_(M, N, K); }
     const int key = m_key_(M);
     for (const Tuned& t : _tuned) {
       if (t.N == N && t.K == K && t.M == key) { return t.splits; }
@@ -799,6 +800,16 @@ class I8GemmContext {
   // Cheap and idempotent: returns immediately when nothing is pending.
   // Call it between forwards, or at the end of one.
   void tune_pending(metal_compute::MetalCompute* mc);
+
+  // NO TUNING (the accel key `autotune` false, shared/kernel-autotune.h):
+  // every shape runs the untuned split -- the single op, which won at
+  // every shape measured from the i8 floor (split_min_k() says where) --
+  // and nothing is measured, recorded, or read from the session's
+  // answers: an answer kept there was measured, and two runs that read
+  // different ones round differently (a split is a reassociation). Set
+  // before the first forward.
+  void set_autotune(bool on) { _autotune = on; }
+  bool autotune() const { return _autotune; }
 
   // Whether the split kernels loaded at all (the fold lives in a different
   // metallib, so it can be absent independently).
@@ -969,6 +980,7 @@ class I8GemmContext {
   int _max_splits = 16;              // VPIPE_I8_SPLITK_MAX_S; 0 disables
   int _split_min_k = 9216;           // VPIPE_I8_SPLIT_MIN_K; see above
   int _untuned_split = 0;            // VPIPE_I8_UNTUNED_SPLIT (A/B)
+  bool _autotune = true;             // set_autotune
   metal_compute::SharedBuffer _planes;
 
   struct Tuned { int N, K, M, splits; };

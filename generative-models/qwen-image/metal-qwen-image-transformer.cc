@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "common/memory-owner.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
@@ -274,6 +275,8 @@ bool
 MetalQwenImageTransformer::clone_block_(const Block& src, Block& dst,
                                         bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   auto one = [&](const metal_compute::SharedBuffer& s,
                  metal_compute::SharedBuffer& d) {
@@ -317,6 +320,8 @@ metal_compute::SharedBuffer
 MetalQwenImageTransformer::rebuild_one_(const std::string& nm,
                                         vpipe::genai::Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (_ws == nullptr) { return {}; }
   if (how == P::kRaw) {
     return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
@@ -567,6 +572,8 @@ bool
 MetalQwenImageTransformer::load_block_(WeightSet& ws, int L,
                                        Block& b, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const std::string p = "transformer_blocks." + std::to_string(L) + ".";
   bool ok = true;
   // AdaLN modulation: dense bf16 by default, or affine-quantized when the
@@ -739,6 +746,7 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
   {
     auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm,
                                               /*bf16=*/true);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   {

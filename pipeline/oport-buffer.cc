@@ -132,6 +132,53 @@ OportBuffer::attach_cursor()
   return idx;
 }
 
+void
+OportBuffer::leave_cursor(unsigned cursor_idx)
+{
+  optional<coroutine_handle<>> writer;
+  {
+    lock_guard<mutex> lk(_mu);
+    if (cursor_idx >= _cursors.size()) {
+      return;
+    }
+    Cursor& c = *_cursors[cursor_idx];
+    c.left.store(true, memory_order_relaxed);
+    c.waiter.reset();
+    c.multi.reset();
+    // Whatever held the writer back may have been this reader: with
+    // every reader gone its next push drops, else the ring may have
+    // room for the ones still reading.
+    if (_writer_waiter && (abandoned_locked_() ||
+                           active_count_relaxed_() < _hard_cap)) {
+      writer = std::exchange(_writer_waiter, nullopt);
+    }
+  }
+  if (writer) {
+    session()->thread_pool()->schedule(*writer);
+  }
+}
+
+bool
+OportBuffer::abandoned() const
+{
+  lock_guard<mutex> lk(_mu);
+  return abandoned_locked_();
+}
+
+bool
+OportBuffer::abandoned_locked_() const noexcept
+{
+  if (_cursors.empty()) {
+    return false;
+  }
+  for (auto& c : _cursors) {
+    if (!c->left.load(memory_order_relaxed)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool
 OportBuffer::closed() const noexcept
 {
@@ -177,6 +224,8 @@ OportBuffer::active_count_relaxed_() const noexcept
   uint32_t min_seq = wp;
   bool any = false;
   for (auto& c : _cursors) {
+    // A reader that left holds nothing back.
+    if (c->left.load(memory_order_relaxed)) { continue; }
     uint32_t s = c->next_seq.load(memory_order_relaxed);
     if (!any || (wp - s) > (wp - min_seq)) {
       min_seq = s;
@@ -184,7 +233,7 @@ OportBuffer::active_count_relaxed_() const noexcept
     }
   }
   if (!any) {
-    return 0;          // no cursors -> producer drops silently
+    return 0;          // no reading cursors -> producer drops silently
   }
   return wp - min_seq;
 }
@@ -197,9 +246,9 @@ OportBuffer::push_locked_(unique_ptr<BeatPayloadIntf>& v)
     r.closed = true;
     return r;
   }
-  if (_cursors.empty()) {
-    // No consumer wired: drop silently (preserves the historical
-    // "disconnected oport: no-op" semantic).
+  if (_cursors.empty() || abandoned_locked_()) {
+    // No consumer wired -- or every one has left: drop silently
+    // (preserves the historical "disconnected oport: no-op" semantic).
     r.success = true;
     v.reset();
     return r;
@@ -313,6 +362,8 @@ OportBuffer::acquire_locked_(unsigned cursor_idx)
   // out once, so the last reader (strictly slowest) takes it.
   for (auto& cc : _cursors) {
     if (cc.get() == &c) { continue; }
+    // One that left reads nothing more: never the slowest.
+    if (cc->left.load(memory_order_relaxed)) { continue; }
     uint32_t s = cc->next_seq.load(memory_order_relaxed);
     // (cursor_sq - s) mod 2^32 interpretation:
     //   == 0           -> tied; another cursor is at the same seq;

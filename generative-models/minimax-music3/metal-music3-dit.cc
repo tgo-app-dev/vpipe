@@ -490,6 +490,7 @@ MetalMusic3Dit::init_(const std::shared_ptr<WeightSet>& dit,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) {
       _i8 = std::move(i8);
       _i8_tier = _i8->tier() == I8GemmContext::Tier::kAccurate ? 0

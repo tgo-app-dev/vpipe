@@ -36,6 +36,12 @@ class WeightSet;           // generative-models/weight-set.h
 //   <i>.conv.{0,2,4}.weight (+ .skip)   a Block, or a MemBlock when the
 //                                       first conv reads TWICE the
 //                                       channels: [x, past]
+//   <i>.conv.{0,1,3}.weight             a SuperBlock (TAESD's ConvNeXt-
+//                                       style block, TAEQI2.1-Tinier):
+//                                       [c, 1, 7, 7] depthwise, [e, c]
+//                                       (+ bias) then ReLU, [c, e], all
+//                                       added to the input -- no ReLU
+//                                       after the sum
 //   <i>.conv.weight [s*c, c, 1, 1]      TGrow: 1x1 conv, then the channel
 //                                       blocks become s frames in time
 //   (nothing)                           index 0 is the input Clamp
@@ -44,9 +50,9 @@ class WeightSet;           // generative-models/weight-set.h
 //                                       Upsample
 //
 // That last rule is the one the KJNodes loader states, and it holds for
-// every published file. What the rule cannot read is a Super decoder
-// (`*_super`), whose blocks are depthwise 7x7; those are REFUSED at
-// load, by shape, rather than half-run.
+// every published file. What the rule cannot read is a TAEHV Super
+// decoder (`*_super`), whose TEMPORAL blocks are depthwise 7x7 over
+// [x, past]; those are REFUSED at load, by shape, rather than half-run.
 //
 // THE LATENT SPACE is the diffusion model's own: a TAE decodes exactly
 // what the DiT produces, with no shift or scale. For MiniMax-H3 that is
@@ -62,9 +68,9 @@ class WeightSet;           // generative-models/weight-set.h
 // `time_upscale` frames per latent frame; which of them are real is the
 // FAMILY's temporal rule, not the decoder's, hence Trim.
 //
-// Runs in f16. All the kernels are existing ones (the on-chip-gather
-// 3x3 conv, the simdgroup GEMM for the 1x1s, the VAE elementwise ops),
-// so no kernel is specific to this class.
+// Runs in f16. The kernels are shared ones (the on-chip-gather 3x3 conv,
+// the simdgroup GEMM for the 1x1s, the VAE elementwise ops) but for the
+// SuperBlock's depthwise 7x7, `dwconv7x7_hwc_f16`.
 class MetalTaeDecoder {
 public:
   // How the raw frames map onto the clip the real VAE would decode.
@@ -237,11 +243,18 @@ private:
     int  cin_file = 0;
     int  cout = 0;
     bool k3   = true;
+    // A depthwise 7x7 (a SuperBlock's first conv): `w` is TAP-major
+    // [49, cout], cin 1.
+    bool depthwise = false;
   };
   struct Op {
-    enum Kind { kConv, kRelu, kUpsample, kTGrow, kBlock, kMemBlock } kind;
+    enum Kind {
+      kConv, kRelu, kUpsample, kTGrow, kBlock, kMemBlock, kSuperBlock
+    } kind;
     Conv c;                  // kConv; kTGrow's 1x1 [stride * C, C]
-    Conv c0, c1, c2;         // blocks
+    // Blocks: three 3x3s. A SuperBlock: c0 the depthwise 7x7, c1 the 1x1
+    // up [E, C] with its bias, c2 the 1x1 down [C, E].
+    Conv c0, c1, c2;
     Conv skip;               // blocks, when n_in != n_out
     bool has_skip = false;
     // TAESD's mid-block pool (taef2): 1x1 up, GroupNorm, ReLU, 1x1 down,
@@ -262,6 +275,8 @@ private:
   };
   // A gather conv's fused epilogue.
   enum class Epi { kNone, kRelu, kAddRelu };
+  // A 1x1's: plain (+ bias), + bias then ReLU, or added onto `out`.
+  enum class Gemm1 { kPlain, kRelu, kAcc };
 
   MetalTaeDecoder() = default;
 
@@ -328,7 +343,14 @@ private:
   void conv1_(metal_compute::ComputeEncoder& enc, const Conv& c,
               std::size_t w_row0, int rows,
               const metal_compute::SharedBuffer& in,
-              const metal_compute::SharedBuffer& out, int M);
+              const metal_compute::SharedBuffer& out, int M,
+              Gemm1 mode = Gemm1::kPlain);
+  // A depthwise 7x7 of an `H` x `W` map into `out`; `copy_to`, when
+  // given, also receives the input itself (the block's residual).
+  void dwconv_(metal_compute::ComputeEncoder& enc, const Conv& c,
+               const metal_compute::SharedBuffer& in,
+               const metal_compute::SharedBuffer& out,
+               const metal_compute::SharedBuffer* copy_to, int H, int W);
   void relu_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t n);
   // `hw` splits the profile row: a conv that took the hardware op is
@@ -369,6 +391,10 @@ private:
   metal_compute::ComputeFunction _fn_gemm_bm64, _fn_gemm_bm64bn64, _fn_relu,
       _fn_add, _fn_upsample, _fn_copy, _fn_gn_stats,
       _fn_gn_reduce, _fn_gn_apply;
+  // The SuperBlock's: the depthwise 7x7, the 1x1 + ReLU twins, and the
+  // accumulating 1x1 its down projection adds onto the residual with.
+  metal_compute::ComputeFunction _fn_dw7, _fn_gemm_relu_bm64,
+      _fn_gemm_relu_bm64bn64, _fn_gemm_acc;
   // The MPP convolution2d op with the decoder's own epilogue fused into
   // its cooperative tensor, indexed by Epi. ~3x the gather conv on an
   // M5 at every shape it accepts, epilogue included. Off without matrix

@@ -293,6 +293,7 @@ private:
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
+  bool        _autotune = true;      // kernel tuners measure (kAutotune)
   double      _keep_loaded{};        // s a built DiT is kept warm after
   void        keep_models_warm_();
   // ---- a DiT kept WARM between graphs (`keep_loaded`) ---------------

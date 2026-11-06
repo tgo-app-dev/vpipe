@@ -256,6 +256,10 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
     const int per_ctx_pages =
         (max_ctx + dec + 64 + spec.page_tokens - 1) / spec.page_tokens;
     spec.max_pages = std::max(32, 2 * per_ctx_pages + 4);
+    // VPIPE_QWEN_CTX_PAGES=<n>: the pool's page cap, whatever the list.
+    if (const char* e = std::getenv("VPIPE_QWEN_CTX_PAGES")) {
+      spec.max_pages = std::max(1, std::atoi(e));
+    }
   }
   // VPIPE_QWEN_CTX_NGRAM=1: Qwen3.8-Flash-Next's n-gram table asked for
   // in memory (load_spec::kNgramResident); VPIPE_QWEN_CTX_SETTLE_S=<s>
@@ -263,6 +267,18 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
   if (const char* e = std::getenv("VPIPE_QWEN_CTX_NGRAM");
       e != nullptr && std::atoi(e) != 0) {
     bag::set_flag(spec.extra, genai::load_spec::kNgramResident, true);
+  }
+  // VPIPE_QWEN_CTX_MTP_DIR=<dir>: a separate MTP head (text-chat's
+  // `mtp_model`), for VPIPE_QWEN_CTX_MTP. VPIPE_QWEN_CTX_DRAFT_DIR=<dir>:
+  // a DFlash drafter (text-chat's `draft_model`), timed per ctx through
+  // spec_generate at VPIPE_QWEN_CTX_DRAFT_BLOCK (0 = the tuner's choice).
+  if (const char* e = std::getenv("VPIPE_QWEN_CTX_MTP_DIR");
+      e != nullptr && *e) {
+    bag::set_text(spec.extra, genai::load_spec::kMtpDir, e);
+  }
+  const char* draft_dir = std::getenv("VPIPE_QWEN_CTX_DRAFT_DIR");
+  if (draft_dir != nullptr && *draft_dir) {
+    bag::set_text(spec.extra, genai::load_spec::kDraftDir, draft_dir);
   }
   auto lm = mgr->load(spec);
   ::unsetenv("VPIPE_LLM_BACKEND");
@@ -275,6 +291,51 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
   auto secs = [](clk::duration d) {
     return std::chrono::duration<double>(d).count();
   };
+  // VPIPE_MC_GPU_TIME=1: each timed phase's GPU busy time beside its wall
+  // time -- the difference is the GPU idle while the host works.
+  const bool gpu_t = std::getenv("VPIPE_MC_GPU_TIME") != nullptr;
+  auto gpu_busy = []() {
+    double ms = 0.0;
+    metal_compute::CommandStream::gpu_time_stats(&ms, nullptr);
+    return ms;
+  };
+  // VPIPE_MC_GPU_TIME=2: per step (marks[i] .. marks[i + 1]), the median
+  // of: the last commit (the host's encode), the GPU's first start, its
+  // busy time, its idle between buffers, and the tail after the last end.
+  using metal_compute::CommandStream;
+  auto span_report = [](const char* what, int N,
+                        const std::vector<double>& marks) {
+    if (marks.size() < 2) { return; }
+    const auto sp = CommandStream::take_gpu_spans();
+    std::vector<double> enc, first, busy, idle, tail, nbuf;
+    for (std::size_t i = 0; i + 1 < marks.size(); ++i) {
+      const double a = marks[i], b = marks[i + 1];
+      double lc = a, fs = 1e30, le = a, bz = 0.0;
+      int nb = 0;
+      for (const auto& g : sp) {
+        if (g.commit < a || g.commit >= b) { continue; }
+        lc = std::max(lc, g.commit);
+        fs = std::min(fs, g.start);
+        le = std::max(le, g.end);
+        bz += g.end - g.start;
+        ++nb;
+      }
+      if (nb == 0) { continue; }
+      enc.push_back(lc - a); first.push_back(fs - a); busy.push_back(bz);
+      idle.push_back((le - fs) - bz); tail.push_back(b - le);
+      nbuf.push_back(nb);
+    }
+    auto med = [](std::vector<double> v) {
+      if (v.empty()) { return 0.0; }
+      std::sort(v.begin(), v.end());
+      return v[v.size() / 2];
+    };
+    std::printf("[BENCH-CTX-SPAN] ctx=%d %s ms: encode %.2f gpu_first %.2f "
+                "busy %.2f idle %.2f tail %.2f buffers %.0f\n", N, what,
+                1e3 * med(enc), 1e3 * med(first), 1e3 * med(busy),
+                1e3 * med(idle), 1e3 * med(tail), med(nbuf));
+  };
+  const bool spans = gpu_t && std::atoi(std::getenv("VPIPE_MC_GPU_TIME")) >= 2;
   // VPIPE_QWEN_CTX_IDS_DIR=<dir>: the prompt of length N is <dir>/ids_N.i32
   // (raw int32) -- real text for a model whose cost depends on what the
   // tokens are (a Mixture of Experts routes them), the same ids a reference
@@ -313,20 +374,51 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
     auto wired = lm->wired_scope();
     auto ctx = lm->make_context();
     ASSERT_TRUE(ctx.valid());
+    if (spans) { (void)CommandStream::take_gpu_spans(); }
     const auto t0 = clk::now();
     const std::int32_t pred = lm->prefill(ctx, ids);
     const auto t1 = clk::now();
+    // VPIPE_MC_GPU_TIME=2: the prefill's command buffers, each one's GPU ms
+    // and the GPU's idle before it, in commit order.
+    if (spans) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const auto sp = CommandStream::take_gpu_spans();
+      std::string line;
+      double busy = 0.0, idle = 0.0, prev_end = 0.0;
+      char b[48];
+      for (const auto& g : sp) {
+        const double gap = prev_end > 0.0 ? g.start - prev_end : 0.0;
+        busy += g.end - g.start;
+        idle += std::max(gap, 0.0);
+        prev_end = g.end;
+        std::snprintf(b, sizeof(b), " %.1f", 1e3 * (g.end - g.start));
+        line += b;
+      }
+      std::printf("[BENCH-CTX-PSPAN] ctx=%d buffers %zu busy %.1f ms idle "
+                  "%.1f ms |%s\n", N, sp.size(), 1e3 * busy, 1e3 * idle,
+                  line.c_str());
+    }
     ASSERT_TRUE(pred >= 0);
     int produced = 0;
     std::string toks = std::to_string(pred);
+    const double dg0 = gpu_busy();
+    std::vector<double> marks;
+    if (spans) { (void)CommandStream::take_gpu_spans(); }
     const auto d0 = clk::now();
     for (int i = 0; i < dec; ++i) {
+      if (spans) { marks.push_back(CommandStream::host_seconds()); }
       const std::int32_t nx = step(ctx);
       if (nx < 0) { break; }
       ++produced;
       toks += " " + std::to_string(nx);
     }
     const auto d1 = clk::now();
+    const double dec_gpu = gpu_busy() - dg0;
+    if (spans) {
+      marks.push_back(CommandStream::host_seconds());
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      span_report("sync", N, marks);
+    }
     // VPIPE_QWEN_CTX_TOKENS=1: the greedy continuation, for comparing arms.
     if (std::getenv("VPIPE_QWEN_CTX_TOKENS") != nullptr) {
       std::printf("[BENCH-CTX] ctx=%d tokens: %s\n", N, toks.c_str());
@@ -350,6 +442,7 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
             if (lm->pdecode_next(cd) < 0) { break; }
           }
           int pp = 0;
+          const double pg0 = gpu_busy();
           const auto p0 = clk::now();
           for (int k = 0; k < dec; ++k) {
             if (!lm->pdecode_commit(cd)) { break; }
@@ -358,6 +451,11 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
           }
           const double pds = secs(clk::now() - p0);
           pipe_tps = (pds > 0.0) ? (double)pp / pds : 0.0;
+          if (gpu_t && pp > 0) {
+            std::printf("[BENCH-CTX-GPU] ctx=%d pipe ms/tok wall %.2f "
+                        "gpu %.2f\n", N, 1e3 * pds / pp,
+                        (gpu_busy() - pg0) / pp);
+          }
           lm->pdecode_end(cd);
         }
       }
@@ -369,7 +467,23 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
         "decode_pipe_tps=%.2f\n",
         backend.c_str(), greedy_fast ? 1 : 0, N, ps, N / ps, produced, ds,
         produced / ds, pipe_tps);
+    if (gpu_t && produced > 0) {
+      std::printf("[BENCH-CTX-GPU] ctx=%d sync ms/tok wall %.2f gpu %.2f\n",
+                  N, 1e3 * ds / produced, dec_gpu / produced);
+    }
+    std::fflush(stdout);
     EXPECT_TRUE(produced >= 1);
+
+    // VPIPE_QWEN_CTX_SAMPLE="temp,top_p,top_k[,seed]": the speculative arms
+    // sample (speculative sampling) instead of verifying greedily -- an
+    // omlx benchmark's own sampler (0.6,0.95,20 for Qwen3.8 with thinking).
+    genai::SamplerParams spec_sp;
+    if (const char* e = std::getenv("VPIPE_QWEN_CTX_SAMPLE")) {
+      unsigned long long sd = 1234;
+      std::sscanf(e, "%f,%f,%d,%llu", &spec_sp.temperature, &spec_sp.top_p,
+                  &spec_sp.top_k, &sd);
+      spec_sp.seed = sd;
+    }
 
     // Greedy MTP speculative decode at the SAME depth N (OptiQ + MTP head).
     // A fresh context prefilled with the same ids so the spec decode starts at
@@ -393,7 +507,7 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
           std::int32_t wf = lm->prefill(wctx, ids);
           int wp = 0, wr = 0;
           if (wf >= 0) {
-            lm->mtp_generate(wctx, wf, 8, genai::SamplerParams{}, no_stop,
+            lm->mtp_generate(wctx, wf, 8, spec_sp, no_stop,
                              count_round(&wp, &wr));
           }
         }
@@ -404,9 +518,25 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
       const std::int32_t mf = lm->prefill(mctx, ids);
       ASSERT_TRUE(mf >= 0);
       int mprod = 0, mrounds = 0;
+      const double mg0 = gpu_busy();
+      std::vector<double> mmarks;
+      if (spans) {
+        (void)CommandStream::take_gpu_spans();
+        mmarks.push_back(CommandStream::host_seconds());
+      }
       const auto m0 = clk::now();
-      const bool mok = lm->mtp_generate(mctx, mf, dec, genai::SamplerParams{},
-                                        no_stop, count_round(&mprod, &mrounds));
+      const auto on_round = [&](std::span<const std::int32_t> t) {
+        mprod += (int)t.size();
+        mrounds += 1;
+        if (spans) { mmarks.push_back(CommandStream::host_seconds()); }
+        return true;
+      };
+      const bool mok = lm->mtp_generate(mctx, mf, dec, spec_sp, no_stop,
+                                        on_round);
+      if (spans) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        span_report("mtp", N, mmarks);
+      }
       const auto m1 = clk::now();
       const double mds = secs(m1 - m0);
       if (mok && mprod > 0 && mds > 0.0) {
@@ -417,6 +547,49 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
             backend.c_str(), N, mprod, mds, mprod / mds,
             mrounds > 0 ? (double)mprod / (double)mrounds : 0.0,
             (ds > 0.0) ? (mprod / mds) / (produced / ds) : 0.0);
+        if (gpu_t && mrounds > 0) {
+          std::printf("[BENCH-CTX-GPU] ctx=%d mtp ms/round wall %.2f "
+                      "gpu %.2f\n", N, 1e3 * mds / mrounds,
+                      (gpu_busy() - mg0) / mrounds);
+        }
+      }
+      std::fflush(stdout);
+    }
+
+    if (draft_dir != nullptr && *draft_dir && lm->spec_decode_available()
+        && lm->spec_drafter() != "mtp") {
+      const int block = std::getenv("VPIPE_QWEN_CTX_DRAFT_BLOCK")
+          ? std::atoi(std::getenv("VPIPE_QWEN_CTX_DRAFT_BLOCK")) : 0;
+      const std::function<bool(std::int32_t)> no_stop;
+      const auto keep = [](std::span<const std::int32_t>) { return true; };
+      {                                       // warm the verify kernels
+        auto wctx = lm->make_context();
+        const std::int32_t wf = wctx.valid() ? lm->prefill(wctx, ids) : -1;
+        if (wf >= 0) {
+          lm->spec_generate(wctx, wf, 8, spec_sp, no_stop, keep, nullptr,
+                            nullptr, {}, block);
+        }
+      }
+      auto swired = lm->wired_scope();
+      auto sctx = lm->make_context();
+      ASSERT_TRUE(sctx.valid());
+      const std::int32_t sf = lm->prefill(sctx, ids);
+      ASSERT_TRUE(sf >= 0);
+      genai::SpecDecodeResult st;
+      int sprod = 0;
+      const auto s0 = clk::now();
+      const bool sok = lm->spec_generate(sctx, sf, dec, spec_sp, no_stop,
+                                         keep, &sprod, nullptr, {}, block,
+                                         &st);
+      const double sds = secs(clk::now() - s0);
+      if (sok && sprod > 0 && sds > 0.0) {
+        std::printf(
+            "[BENCH-CTX-DRAFT] drafter=%s ctx=%d block=%d decode_n=%d "
+            "decode_s=%.4f decode_tps=%.2f tok_per_round=%.2f "
+            "speedup=%.2f\n",
+            lm->spec_drafter().c_str(), N, block, sprod, sds, sprod / sds,
+            st.rounds > 0 ? (double)sprod / (double)st.rounds : 0.0,
+            (ds > 0.0) ? (sprod / sds) / (produced / ds) : 0.0);
       }
     }
   }

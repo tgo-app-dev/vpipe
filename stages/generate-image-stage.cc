@@ -109,6 +109,13 @@ constexpr std::string_view kLoraMoreDoc =
     "is still read once. The same key on the family's model-config beat "
     "OVERRIDES this";
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "Krea-2-Turbo / FLUX.2 model dir (text_encoder/, transformer/, "
           "tokenizer/); an original or model-quantize'd (self-contained) "
@@ -1029,9 +1036,14 @@ GenerateImageStage::GenerateImageStage(const SessionContextIntf* s,
   // ...and back out, which is the half that makes it one decision. If a
   // key is ever written under one name and read under another, this is
   // where it stops being true rather than three plugins away.
+  // The kernel tuners (kAutotune): into the accel the families read,
+  // and back out below for the Configs this stage fills itself.
+  genai::accel::set_flag(&_accel, genai::accel::kAutotune,
+                         attr_bool("autotune"));
   _sage    = genai::sage::config_from_flex(&_accel);
   _sol     = genai::sol::config_from_flex(&_accel);
   _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
+  _autotune = genai::accel::flag(&_accel, genai::accel::kAutotune, true);
   {
     const std::string t =
         genai::accel::text(&_accel, genai::accel::kI8GemmTier);
@@ -1273,6 +1285,11 @@ GenerateImageStage::warm_key_(const Cfg& c, bool stream,
   }
   if constexpr (requires { c.klein_kv; }) {
     k += fmt("|kv {}", c.klein_kv ? 1 : 0)();
+  }
+  // Whether its tuners measured: a model kept warm from a tuned run holds
+  // its timed answers, which an untuned one must not be handed.
+  if constexpr (requires { c.autotune; }) {
+    k += fmt("|tune {}", c.autotune ? 1 : 0)();
   }
   // The adapters by file: a strength is live (set_lora_scale), set again
   // on every take -- see take_warm_dit_.
@@ -2542,6 +2559,7 @@ GenerateImageStage::declare_resources() const
     const int h = _height > 0 ? _height : def.second;
     if (genai::MetalFibo2Transformer::Config::read_dims(dit, &bc)) {
       bc.i8_gemm = _i8_gemm;
+      bc.autotune = _autotune;
       bc.i8_tier = _i8_tier;
       bc.sage = _sage;
       bc.sol = _sol;
@@ -2579,6 +2597,7 @@ GenerateImageStage::declare_resources() const
     if (_width > 0 && _height > 0 &&
         genai::MetalMossImageTransformer::Config::read_dims(dit, &mc)) {
       mc.i8_gemm = _i8_gemm;
+      mc.autotune = _autotune;
       mc.i8_tier = _i8_tier;
       mc.sage = _sage;
       mc.sol = _sol;
@@ -2617,6 +2636,7 @@ GenerateImageStage::declare_resources() const
       genai::MetalQwenImage21Transformer::Config c;
       if (genai::MetalQwenImage21Transformer::Config::read_dims(dit, &c)) {
         c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+        c.autotune = _autotune;
         c.sage = _sage; c.sol = _sol;
         bytes = genai::MetalQwenImage21Transformer::forward_scratch_bytes(
             c, img, 512, /*cfg=*/true, bits > 0, mx);
@@ -2625,6 +2645,7 @@ GenerateImageStage::declare_resources() const
       genai::MetalZImageTransformer::Config c;
       if (genai::MetalZImageTransformer::Config::read_dims(dit, &c)) {
         c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+        c.autotune = _autotune;
         c.sage = _sage; c.sol = _sol;
         bytes = genai::MetalZImageTransformer::forward_scratch_bytes(
             c, img, 512, bits > 0, mx);
@@ -2632,6 +2653,7 @@ GenerateImageStage::declare_resources() const
     } else if (img > 0 && fam == "krea2") {
       genai::MetalKrea2Transformer::Config c;   // Turbo's dims
       c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+      c.autotune = _autotune;
       c.sage = _sage; c.sol = _sol;
       bytes = genai::MetalKrea2Transformer::forward_scratch_bytes(
           c, img, 512, mx);
@@ -2639,6 +2661,7 @@ GenerateImageStage::declare_resources() const
       genai::MetalFlux2Transformer::Config c;
       if (genai::MetalFlux2Transformer::read_dims(dit, &c)) {
         c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
+        c.autotune = _autotune;
         c.sage = _sage; c.sol = _sol;
         bytes = genai::MetalFlux2Transformer::forward_scratch_bytes(
             c, img, 512, bits, mx);
@@ -3388,6 +3411,7 @@ GenerateImageStage::ensure_loaded_()
     _dit_bounded = bounded;
     genai::MetalFlux2Transformer::Config fcfg;
     fcfg.i8_gemm = _i8_gemm;
+    fcfg.autotune = _autotune;
     fcfg.i8_tier = _i8_tier;
     fcfg.i8_hold_w4 = _i8_hold_w4;
     fcfg.sage = _sage;
@@ -3501,6 +3525,7 @@ GenerateImageStage::ensure_loaded_()
     genai::MetalQwenImageTransformer::Config qcfg;
     qcfg.sage    = _sage;
     qcfg.i8_gemm = _i8_gemm;
+    qcfg.autotune = _autotune;
     _qie_dit = genai::MetalQwenImageTransformer::load(
         weight_set_(dit_dir), mc, qcfg, stream_blocks);
     if (!_qie_dit) {
@@ -3976,6 +4001,7 @@ GenerateImageStage::ensure_loaded_()
     }
     genai::MetalKrea2Transformer::Config kcfg;
     kcfg.i8_gemm = _i8_gemm;
+    kcfg.autotune = _autotune;
     kcfg.i8_tier = _i8_tier;
     kcfg.i8_hold_w4 = _i8_hold_w4;
     kcfg.sage = _sage;
@@ -4121,6 +4147,7 @@ GenerateImageStage::load_flux2_dit_()
   if (mc == nullptr || _flux2_dit_dir.empty()) { return false; }
   genai::MetalFlux2Transformer::Config fcfg;
   fcfg.i8_gemm = _i8_gemm;
+  fcfg.autotune = _autotune;
   fcfg.i8_tier = _i8_tier;
   fcfg.i8_hold_w4 = _i8_hold_w4;
   fcfg.sage = _sage;
@@ -4257,6 +4284,7 @@ GenerateImageStage::load_vosr_dit_()
   // which is what Sol had to be generalised for.
   genai::MetalVosrTransformer::Config vcfg = _vosr_cfg;
   vcfg.i8_gemm = _i8_gemm;
+  vcfg.autotune = _autotune;
   vcfg.sage    = _sage;
   vcfg.sol     = _sol;
   std::string err;
@@ -4283,6 +4311,7 @@ GenerateImageStage::load_qwen_image21_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.autotune = _autotune;
   cfg.i8_tier = _i8_tier;
   cfg.i8_hold_w4 = _i8_hold_w4;
   cfg.sage = _sage;
@@ -4300,8 +4329,8 @@ GenerateImageStage::load_qwen_image21_dit_()
   cfg.ane_int8 =
       cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
   cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
-  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
-                                            0);
+  cfg.ane_rows =
+      (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
   const auto loras = lora_specs_<Dit::LoraSpec>();
@@ -4359,6 +4388,7 @@ GenerateImageStage::load_z_image_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.autotune = _autotune;
   cfg.i8_tier = _i8_tier;
   cfg.i8_hold_w4 = _i8_hold_w4;
   cfg.sage = _sage;
@@ -4376,8 +4406,8 @@ GenerateImageStage::load_z_image_dit_()
   cfg.ane_int8 =
       cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
   cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
-  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
-                                            0);
+  cfg.ane_rows =
+      (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
   const auto loras = lora_specs_<Dit::LoraSpec>();
@@ -4441,6 +4471,7 @@ GenerateImageStage::load_flux3_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.autotune = _autotune;
   cfg.sage = _sage;
   cfg.sol = _sol;
   cfg.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
@@ -4456,8 +4487,8 @@ GenerateImageStage::load_flux3_dit_()
   cfg.ane_int8 =
       cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
   cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
-  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
-                                            0);
+  cfg.ane_rows =
+      (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
   const auto loras = lora_specs_<Dit::LoraSpec>();
@@ -4516,6 +4547,7 @@ GenerateImageStage::load_fibo2_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.autotune = _autotune;
   cfg.i8_tier = _i8_tier;
   cfg.i8_hold_w4 = _i8_hold_w4;
   cfg.sage = _sage;
@@ -4533,8 +4565,8 @@ GenerateImageStage::load_fibo2_dit_()
   cfg.ane_int8 =
       cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
   cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
-  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
-                                            0);
+  cfg.ane_rows =
+      (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
   const auto loras = lora_specs_<Dit::LoraSpec>();
@@ -4592,6 +4624,7 @@ GenerateImageStage::load_moss_image_dit_()
     return false;
   }
   cfg.i8_gemm = _i8_gemm;
+  cfg.autotune = _autotune;
   cfg.i8_tier = _i8_tier;
   cfg.i8_hold_w4 = _i8_hold_w4;
   cfg.sage = _sage;
@@ -4609,8 +4642,8 @@ GenerateImageStage::load_moss_image_dit_()
   cfg.ane_int8 =
       cfg.ane_ffn && genai::accel::flag(&_accel, genai::accel::kAneInt8);
   cfg.ane_int8_plain = cfg.ane_int8 && ane_int8_plain_(_accel);
-  cfg.ane_rows = (int)genai::accel::integer(&_accel, genai::accel::kAneRows,
-                                            0);
+  cfg.ane_rows =
+      (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
   const auto loras = lora_specs_<Dit::LoraSpec>();
@@ -4664,6 +4697,7 @@ GenerateImageStage::load_boogu_dit_()
   if (mc == nullptr || _boogu_dit_dir.empty()) { return false; }
   genai::MetalBooguTransformer::Config bcfg;
   bcfg.i8_gemm = _i8_gemm;
+  bcfg.autotune = _autotune;
   // NOT boogu, deliberately. Its attention pads head_dim 120 to the
   // bd128 kernel and memoizes a specialised function per DISTINCT
   // sequence length -- the refiners, the image self-attention and the
@@ -4761,6 +4795,7 @@ GenerateImageStage::load_qie_dit_()
   genai::MetalQwenImageTransformer::Config qcfg;
   qcfg.sage    = _sage;
   qcfg.i8_gemm = _i8_gemm;
+  qcfg.autotune = _autotune;
   _qie_dit = genai::MetalQwenImageTransformer::load(
       weight_set_(_qie_dit_dir), mc, qcfg, _qie_stream);
   return (bool)_qie_dit;
@@ -4829,6 +4864,7 @@ GenerateImageStage::load_krea2_dit_()
   if (mc == nullptr || _krea2_dit_dir.empty()) { return false; }
   genai::MetalKrea2Transformer::Config kcfg;
   kcfg.i8_gemm = _i8_gemm;
+  kcfg.autotune = _autotune;
   kcfg.i8_tier = _i8_tier;
   kcfg.i8_hold_w4 = _i8_hold_w4;
   kcfg.sage = _sage;

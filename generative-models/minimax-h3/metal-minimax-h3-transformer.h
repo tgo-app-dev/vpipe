@@ -180,6 +180,10 @@ class MetalMiniMaxH3Transformer {
     // hand) at a cost of 4.8% extra int8 MACs, inside its 10% cap.
     // Set from generate-video's `i8_gemm`; VPIPE_I8_GEMM overrides.
     bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     // ...and which int8 GEMM (I8GemmContext::Tier, generate-video's
     // `i8_gemm_tier`): 0 accurate (the per-call route above), 1 fast,
     // 2 token, 3 token unrotated. The last three HOLD the 50 main

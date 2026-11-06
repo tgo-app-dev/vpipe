@@ -296,6 +296,7 @@ MetalDrama3Model::init_(std::string* err)
   MetalQwenModel::Config q = c.backbone;
   q.max_seq = _opt.max_rows + 256;
   q.expert_cache_bytes = _opt.expert_cache_bytes;
+  q.autotune = _opt.autotune;
   _lm = MetalQwenModel::load(_ws, mc, q);
   if (!_lm) { return fail("the backbone did not load"); }
   std::string terr;

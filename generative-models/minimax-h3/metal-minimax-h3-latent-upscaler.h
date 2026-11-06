@@ -89,10 +89,11 @@ class MetalMiniMaxH3LatentUpscaler {
 
   // `i8_tier`: -1 off, 0 accurate, 1 fast, 2 token, 3 token_plain;
   // declined without matrix cores (and VPIPE_I8_GEMM / VPIPE_I8_TIER
-  // override it, as everywhere).
+  // override it, as everywhere). `autotune` false: its int8 split is
+  // the untuned one, timing nothing (the accel key `autotune`).
   static std::unique_ptr<MetalMiniMaxH3LatentUpscaler>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       std::string* err = nullptr, int i8_tier = -1);
+       std::string* err = nullptr, int i8_tier = -1, bool autotune = true);
 
   // The tier a load with `i8_tier` runs at on a box with (or without)
   // matrix cores -- the int8 context's own reading -- for a plan.
@@ -235,6 +236,7 @@ class MetalMiniMaxH3LatentUpscaler {
                                  _fn_dwconv, _fn_resize, _fn_residual;
   std::unique_ptr<I8GemmContext> _i8;
   int _i8_want  = -1;          // the tier load() was asked for
+  bool _autotune = true;       // ...and whether its split is timed
   int _i8_tier  = -1;          // ...and the one that engaged
   long long _i8_gemms = 0;
   metal_compute::SharedBuffer _wdeq;   // a held layout widened

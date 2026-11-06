@@ -15,6 +15,14 @@ EdgeReader::EdgeReader(OportBuffer* parent, unsigned cursor_idx)
 {
 }
 
+void
+EdgeReader::leave()
+{
+  if (_parent) {
+    _parent->leave_cursor(_cursor_idx);
+  }
+}
+
 // A null parent marks a DISCONNECTED iport (an optional input the graph
 // left unwired). It has no producer, so it behaves as a permanently
 // closed edge: no backlog, immediate EOS, and every awaiter resolves to

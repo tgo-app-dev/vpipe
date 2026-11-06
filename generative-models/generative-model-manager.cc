@@ -9,6 +9,7 @@
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
 #include "common/flex-bag.h"
+#include "common/memory-owner.h"
 #include "common/vpipe-format.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/wire-on-alloc.h"
@@ -2232,6 +2233,11 @@ GenerativeModelManager::load(const LoadSpec& spec)
     }
     {
       LmMemoryLimit cap(limit, cache, ngram);
+      // Whose its load is (common/memory-owner.h): this model's -- its
+      // weights, and what marks its own use as it allocates (an expert
+      // cache, its K/V) -- whatever stage asked for it.
+      MemoryOwnerScope owner(key.hf_dir, "language-model");
+      MemoryUseScope use(MemoryUse::kWeights);
       lm = build();
     }
     if (scope) {

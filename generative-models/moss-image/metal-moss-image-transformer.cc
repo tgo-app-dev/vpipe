@@ -1,4 +1,5 @@
 #include "generative-models/moss-image/metal-moss-image-transformer.h"
+#include "common/memory-owner.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -604,6 +605,8 @@ bool
 MetalMossImageTransformer::load_block_(WeightSet& ws, int L, Block& b,
                                        Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const std::string p = prefix_(L);
   // Every projection of a main block runs at the joint sequence's rows,
   // so all six take the signed and fast layouts when they are on.
@@ -770,6 +773,8 @@ bool
 MetalMossImageTransformer::clone_block_(const Block& src, Block& dst,
                                         bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   // A PROMOTION keeps what a preloaded block keeps (see
   // kept_block_bytes_): a w4 pack whose layout is held (Config::
@@ -831,6 +836,8 @@ MetalMossImageTransformer::clone_block_(const Block& src, Block& dst,
 bool
 MetalMossImageTransformer::keep_block_(Block& b) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const bool hold = _cfg.i8_hold_w4 && _i8 != nullptr;
   CommandStream cs;
   bool ok = true;
@@ -879,6 +886,8 @@ MetalMossImageTransformer::keep_block_(Block& b) const
 SharedBuffer
 MetalMossImageTransformer::rebuild_one_(const std::string& nm, Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (_ws == nullptr) { return {}; }
   if (how == Placement::kRaw) {
     return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
@@ -1223,13 +1232,14 @@ MetalMossImageTransformer::load(std::shared_ptr<WeightSet> ws,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_ANE")) {
     m->_cfg.ane_ffn = std::atoi(e) != 0;
   }
   if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_ANE_ROWS")) {
-    m->_cfg.ane_rows = std::atoi(e);
+    m->_cfg.ane_rows = (float)std::atof(e);
   }
   if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_ANE_QKV")) {
     m->_cfg.ane_qkv = std::atoi(e) != 0;

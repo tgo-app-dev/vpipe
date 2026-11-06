@@ -913,7 +913,7 @@ MetalWanVae::autotune_mid_attn_(MetalCompute* mc, int C)
              const vae_mid_attn::Alloc&, const vae_mid_attn::Release&) {
         encode_mid_attn_(enc, kind, qq, kk, vv, oo, hw, c, sc);
       },
-      &detail);
+      &detail, /*verify=*/true, /*measure=*/_cfg.autotune);
   const double tune_ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
   if (mc->session() != nullptr && !detail.empty()) {

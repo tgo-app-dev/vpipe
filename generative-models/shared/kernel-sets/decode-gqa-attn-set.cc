@@ -161,7 +161,7 @@ DecodeGqaAttnSet::dispatch(metal_compute::ComputeEncoder& enc,
 
 void
 DecodeGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
-                          TuningReport& rep) {
+                          TuningReport& rep, bool measure) {
   _dims = dims;
   for (int i = 0; i < kRegimes; ++i) {
     _kernel[i] = 1;
@@ -181,6 +181,10 @@ DecodeGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
   _ready = true;
 
   // Skip the probe under an explicit override / disabled autotune.
+  if (!measure) {
+    rep.add("decode-attn", 0.0, "untuned vec2");
+    return;
+  }
   if (std::getenv("VPIPE_QWEN_GQA_VEC2")) { return; }
   if (const char* e = std::getenv("VPIPE_QWEN_GQA_AUTOTUNE")) {
     if (std::atoi(e) == 0) { return; }

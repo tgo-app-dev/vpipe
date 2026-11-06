@@ -91,6 +91,10 @@ class MetalQwenImage21Transformer {
 
     // Accel tiers, read from accel-settings.h by the caller.
     bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     // The int8 GEMM's tier (I8GemmContext::Tier): 0 accurate (groups
     // of 64), 1 fast (the block projections held as rotated int8 at a
     // coarse group), 2 token (int8 per channel x per token, both
@@ -112,7 +116,9 @@ class MetalQwenImage21Transformer {
     // feed-forward is row-independent, so the ANE takes a contiguous
     // band of rows and the GPU the rest, concurrently and exactly.
     bool ane_ffn   = false;
-    int  ane_rows  = 0;    // 0 = balance from the two engines' rates
+    // The ANE's share of the rows in [0,1] (accel-keys.h kAneRows): 0
+    // balances from the two engines' rates, a share set is pinned.
+    float ane_rows = 0.0f;
     int  ane_layers = 0;   // 0 = every block
     // The q/k/v projections on the ANE too, as a SECOND module (one
     // matmul hidden -> 3*hidden, the three weights stacked into its slot)

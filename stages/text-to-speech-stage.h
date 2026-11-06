@@ -294,6 +294,7 @@ private:
   std::string _lm_quant;
   int         _lm_quant_bits{};
   bool        _i8_gemm{};   // the backbone's int8 prefill tier (M5)
+  bool        _autotune = true;  // its kernel tuners measure (kAutotune)
   std::uint64_t _i8_seen{};   // engagement count at the last revision
   int _kept_seen{-1};          // resident layers at the last revision
 

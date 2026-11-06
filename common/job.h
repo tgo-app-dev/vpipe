@@ -5,6 +5,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <exception>
+#include <type_traits>
 #include <utility>
 
 #include "common/vpipe-api.h"
@@ -43,6 +44,17 @@ inline constexpr std::uint32_t kNoPerfTag = 0xFFFFFFFFu;
 // WHEN THE DESTROYER IS A DIFFERENT THREAD, that check is
 // `quiescent()`, never `done()` -- see the comment on quiescent(). The
 // distinction is a real use-after-free, not a formality.
+//
+// ONLY JOBS RUN ON THE SESSION THREADPOOL -- a hard rule, for plugins
+// too. The pool reads every handle it resumes as a Job's (perf_tag_of),
+// on EVERY resume: the tag names the stage for the profiler and the
+// model whose memory the slice allocates (common/memory-owner.h). So a
+// coroutine of any other promise type that reaches the pool -- handed
+// to schedule(), or parked on an edge, a command or a timer, whose
+// wakes all schedule the waiter there -- is undefined behaviour. Write
+// stage work, and anything that awaits a pipeline awaiter, as Job.
+// Awaiting a Job from another coroutine type is safe: the Awaiter
+// passes a tag on only from a Job caller.
 //
 // Thread safety: a Job object is not internally synchronized; it is
 // owned by one thread at a time. The coroutine state itself may move
@@ -206,11 +218,23 @@ public:
     bool await_ready() const noexcept { return !_h || _h.done(); }
 
     // Record the caller as the continuation, then symmetric-transfer
-    // to the inner coroutine to start it.
+    // to the inner coroutine to start it. An untagged Job awaited by a
+    // Job takes its caller's tag: a resume of it -- after it waited on
+    // an edge -- is still that stage's, for the profiler and for whose
+    // memory it allocates (common/memory-owner.h). The caller's promise
+    // type is the template's, so a caller of any other type is never
+    // read as a Job: its Job stays untagged.
+    template <class CallerPromise>
     std::coroutine_handle<>
-    await_suspend(std::coroutine_handle<> caller) noexcept
+    await_suspend(std::coroutine_handle<CallerPromise> caller) noexcept
     {
-      _h.promise()._continuation = caller;
+      auto& p = _h.promise();
+      p._continuation = caller;
+      if constexpr (std::is_same_v<CallerPromise, promise_type>) {
+        if (p._perf_tag == kNoPerfTag && caller) {
+          p._perf_tag = caller.promise()._perf_tag;
+        }
+      }
       return _h;
     }
 
@@ -235,10 +259,12 @@ private:
   handle_t _h{};
 };
 
-// Read the profiling tag of a pool-scheduled handle. Every coroutine
-// that runs on the Session ThreadPool is a Job (see the Job class
-// comment), so reinterpreting the handle's promise as Job::promise_type
-// is valid. Returns kNoPerfTag for a null handle or an untagged Job.
+// Read the profiling tag of a pool-scheduled handle. It reinterprets
+// the handle's promise as Job::promise_type, which is valid only
+// because every coroutine on the Session ThreadPool is a Job -- the
+// rule in the Job class comment; nothing checks it. The pool calls this
+// on every resume. Returns kNoPerfTag for a null handle or an untagged
+// Job.
 inline std::uint32_t
 perf_tag_of(std::coroutine_handle<> h) noexcept
 {

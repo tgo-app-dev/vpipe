@@ -175,6 +175,10 @@ class MetalFlashVsrTransformer {
     // are the graph's choice. Sage rides on the NAX flash entry and is
     // dropped, with a log line, where that entry is unavailable.
     bool         i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     sage::Config sage;
 
     // ---- residency: decided at load, by the box ----------------------

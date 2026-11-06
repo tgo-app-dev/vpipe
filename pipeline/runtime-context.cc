@@ -58,9 +58,11 @@ RuntimeContext::num_oports() const noexcept
 bool
 RuntimeContext::has_consumers(unsigned out_port) const noexcept
 {
+  // Wired, and some reader still reading (a stage that ended left).
   return out_port < _out_bufs.size()
       && _out_bufs[out_port]
-      && _out_bufs[out_port]->num_cursors() > 0;
+      && _out_bufs[out_port]->num_cursors() > 0
+      && !_out_bufs[out_port]->abandoned();
 }
 
 EdgeReader::ReadAwaiter
@@ -229,6 +231,14 @@ RuntimeContext::close_outputs()
 {
   for (auto* buf : _out_bufs) {
     if (buf) { buf->close(); }
+  }
+}
+
+void
+RuntimeContext::leave_inputs()
+{
+  for (auto* r : _in_readers) {
+    if (r) { r->leave(); }
   }
 }
 

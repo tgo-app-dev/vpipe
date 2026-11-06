@@ -260,7 +260,7 @@ PrefillGqaAttnSet::dispatch_member(metal_compute::ComputeEncoder& enc,
 
 void
 PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
-                           TuningReport& rep) {
+                           TuningReport& rep, bool measure) {
   _dims = dims;
   _mc = mc;
   for (int i = 0; i < kRegimes; ++i) {
@@ -302,6 +302,15 @@ PrefillGqaAttnSet::prepare(metal_compute::MetalCompute* mc, Dims dims,
     return false;
   };
   if (pin()) { return; }
+  if (!measure) {
+    const int nax = _have[kNaxSplit] ? kNaxSplit : _have[kNax] ? kNax : -1;
+    if (nax >= 0) {
+      for (int i = 0; i < kRegimes; ++i) { _member[i] = nax; }
+    }
+    rep.add("prefill-attn", 0.0,
+            std::string("untuned ") + kName[_member[kRegimes - 1]]);
+    return;
+  }
   if (std::getenv("VPIPE_QWEN_STEEL_MIN")) { return; }
   if (const char* e = std::getenv("VPIPE_QWEN_PREFILL_AUTOTUNE")) {
     if (std::atoi(e) == 0) { return; }

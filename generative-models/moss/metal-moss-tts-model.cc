@@ -249,6 +249,7 @@ MetalMossTtsModel::load(std::shared_ptr<WeightSet> ws,
   // streaming through decode when the plan said the box cannot hold it.
   bc.load_quant_bits   = opts.quant_bits == 8 ? 8 : 0;
   bc.stream_decode     = opts.stream;
+  bc.autotune          = opts.autotune;
 
   self->_backbone = MetalQwenModel::load(ws, mc, bc);
   if (!self->_backbone) {

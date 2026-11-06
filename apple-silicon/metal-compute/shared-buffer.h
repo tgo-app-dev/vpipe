@@ -204,10 +204,14 @@ private:
   // subviews heavily would report several times its real footprint.
   bool         _accounted = false;
   bool         _inactive  = false;   // parked via mark_inactive
+  // Whose these bytes are (common/memory-owner.h): the owner and use
+  // they are counted under, set by the handle that put them on the books
+  // and given back with them. Taken from the reserved slots below.
+  std::uintptr_t _owner_slot = 0;
   // RESERVED for the next field (plugin ABI): a plugin holds this type BY
   // VALUE, so its size is compiled into every plugin in the support
   // window. A new member takes a reserved slot instead of growing it.
-  std::uintptr_t _reserved[2] = {};
+  std::uintptr_t _reserved[1] = {};
 };
 
 // ---- Process-wide SharedBuffer accounting -------------------------------

@@ -55,6 +55,10 @@ class MetalKrea2Vae {
     // which is natively RGBA and reads/writes 4.
     int in_channels    = 3;
     int out_channels   = 3;
+    // Whether its kernel tuners MEASURE (the 3x3 conv route, the mid-block
+    // attention, the int8 split): false takes the choice believed fastest
+    // on this GPU, timing nothing -- the accel key `autotune`.
+    bool autotune = true;
     // The parameter-free residual shortcut AutoencoderKLQwenImage21 puts
     // around each down/up block: group-average the channels after a
     // space-to-depth on the way down, repeat them before a depth-to-space

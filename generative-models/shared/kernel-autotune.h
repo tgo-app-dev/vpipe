@@ -7,7 +7,9 @@
 // candidate i's fixed GPU work and returns wall-seconds (it owns the buffers /
 // command stream). See MetalQwenModel::autotune_decode_attn_ for a user.
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -17,6 +19,30 @@
 // by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
 
 namespace vpipe::genai {
+
+// HOW MANY TIMED SAMPLES this binary's tuners have taken: every
+// autotune_time / autotune_time_on call is one, and a tuner that times
+// some other way (a forward's own command buffers) counts its samples
+// with note_autotune_sample(). It is the evidence that a run asked to time
+// nothing (the accel key `autotune` false, accel-keys.h) timed nothing: a
+// test reads it before and after a load. Per binary -- a plugin, which
+// compiles this header into itself, counts its own.
+inline std::atomic<std::uint64_t>&
+autotune_sample_counter_()
+{
+  static std::atomic<std::uint64_t> n{0};
+  return n;
+}
+inline std::uint64_t
+autotune_samples()
+{
+  return autotune_sample_counter_().load(std::memory_order_relaxed);
+}
+inline void
+note_autotune_sample()
+{
+  autotune_sample_counter_().fetch_add(1, std::memory_order_relaxed);
+}
 
 // Pick the fastest of `n_cands` candidates. bench(i) runs candidate i's fixed
 // work and returns wall-seconds; it is called INTERLEAVED across candidates
@@ -85,6 +111,7 @@ autotune_vote(int n_cands, int rounds, int reps_for_us, Bench&& bench,
 template <class Mc, class Disp>
 inline double
 autotune_time(Mc* mc, int reps, Disp&& disp) {
+  note_autotune_sample();
   const auto t0 = std::chrono::steady_clock::now();
   {
     auto st = mc->make_command_stream();
@@ -108,6 +135,7 @@ autotune_time(Mc* mc, int reps, Disp&& disp) {
 template <class Stream, class Disp>
 inline double
 autotune_time_on(Stream& st, int reps, Disp&& disp) {
+  note_autotune_sample();
   const auto t0 = std::chrono::steady_clock::now();
   {
     auto enc = st.begin_compute();
@@ -117,6 +145,20 @@ autotune_time_on(Stream& st, int reps, Disp&& disp) {
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now() - t0)
       .count();
+}
+
+// Run `reps` invocations of `disp` in a fresh stream and wait, timing
+// nothing: for a tuner's CORRECTNESS gate, which compares the candidates'
+// outputs and is not a sample (an untuned load still runs it).
+template <class Mc, class Disp>
+inline void
+autotune_run(Mc* mc, int reps, Disp&& disp) {
+  auto st = mc->make_command_stream();
+  {
+    auto enc = st.begin_compute();
+    for (int r = 0; r < reps; ++r) { disp(enc); }
+  }
+  st.commit().wait();
 }
 
 // Accumulates each tuner's wall-time + a one-line detail for a load-time

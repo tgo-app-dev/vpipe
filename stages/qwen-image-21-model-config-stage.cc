@@ -99,7 +99,8 @@ const ConfigKey kAttrs[] = {
   // The live-preview keys every family's config source shares; see
   // stages/latent-preview.h. Qwen-Image-2.1's TAE is madebyollin's
   // `taeqi2_1`: 16x, reading the DiT's 64-channel latent as it stands,
-  // RGBA out like the real VAE -- a torch .pth, fetched by URL.
+  // RGBA out like the real VAE -- a torch .pth, fetched by URL -- or its
+  // `taeqi2_1_tinier` twin from the Hub.
   {.key = latent_preview::kVaeKey, .type = ConfigType::String,
    .required = false, .doc = latent_preview::kVaeDoc,
    .suggest_db = kModelRegistryDb,

@@ -122,6 +122,11 @@ public:
   // Drop `w` from this cursor's pending multi-waiter slot iff still set.
   void deregister_multi(const std::shared_ptr<MultiReadWaiter>& w);
 
+  // This reader reads no more -- its stage has ended: its cursor
+  // leaves the buffer (OportBuffer::leave_cursor), so the producer is
+  // not held back by it. No-op on a parent-less (EOS) reader.
+  void leave();
+
   OportBuffer* parent() const noexcept { return _parent; }
   unsigned     cursor_idx() const noexcept { return _cursor_idx; }
 

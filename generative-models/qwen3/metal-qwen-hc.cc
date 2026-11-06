@@ -888,10 +888,23 @@ MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
   }
   // the prompt's embeddings: the muxer's rows, the copy, a piece's rows
   e2 += 2 * (std::size_t)prompt * H + n * H;
+  // (tune_mma_band_'s probe needs nothing here: its weight is the dequant
+  // scratch above, and its rows and output are freed before the forward
+  // that called it grows its own, which at those rows is far larger --
+  // MEASURED on the 27B, an M5 Ultra, the peak the same tuned or pinned.)
   // the decode scratch: a step's buffers and the GQA partials
   e2 += 2 * (std::size_t)c.vocab + 2 * Nfq + 2 * Nf + 4 * ffn + 8 * H;
   e4 += (std::size_t)c.n_heads * 64 * (D + 2);
   std::size_t b = 2 * e2 + 4 * e4;
+  // the split-K matmul2d's f32 partial planes (MmaSplitK, kept with the
+  // model): a down projection deep enough to split, from its row floor on,
+  // in row blocks inside its plane budget. MEASURED, the 27B's at 8192
+  // rows on an M5 Ultra: 8 planes of 3200 rows, 500 MB -- the run's peak.
+  if (matrix_cores && n >= (std::size_t)MmaSplitK::kMinSplitM &&
+      ffn >= (std::size_t)MmaSplitK::kMinSplitK) {
+    b += std::min(MmaSplitK::budget_bytes(),
+                  n * H * 4 * (std::size_t)MmaSplitK::kMaxS);
+  }
   // the paged K/V: the pool doubles toward max_pages as pages are claimed
   // (each step at least what is needed), so it can reach twice the pages
   // `kv_tokens` fill; while it grows, one layer's old pool beside the new
@@ -904,7 +917,17 @@ MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
   const std::size_t page = (std::size_t)c.n_kv_heads * pt * D * 2;
   b += ((std::size_t)full + 1) * 2 * cap * page;
   b += (std::size_t)std::max(c.max_pages, 0) * 3 * 4;   // the page table
-  return b + ctxs * state;
+  // A speculative decode (one_pass: an MTP head or a drafter) arms the GDN
+  // ring of the context it decodes, and the context keeps its shadow
+  // slots until it goes: the dense MTP at its deepest (verify rows + 1
+  // slots, the cursor's own among them) -- DFlash's double buffer fewer.
+  // And an MTP head's own context, one page of K/V.
+  const std::size_t ring =
+      one_pass ? (std::size_t)MtpDepthChoice::kMax + 1 : 0;
+  if (one_pass) {
+    b += (std::size_t)MtpHead::kCtxTokens * c.n_kv_heads * D * 2 * 2;
+  }
+  return b + ctxs * state * (1 + ring);
 }
 
 void

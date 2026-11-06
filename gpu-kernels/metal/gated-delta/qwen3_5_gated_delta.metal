@@ -130,12 +130,19 @@ kernel void qwen3_5_gated_delta_step_f16(
 // ~2x slower, masking any amortization. Math per dv is byte-identical to v1
 // (same accumulation + simd_sum) -> token-exact.
 //   ...buffers 0-10 as v1...   Dispatch: grid {32, Dv/NDV, Hv}, tg {32,4,1}.
-template <int NDV>
+// RING (the speculative verify's GDN ring): the state after row t goes to
+// state_out of row t -- state_out, so1, so2, so3 for t = 0..3 (T <= 4) --
+// so every intermediate state survives for a rollback by cursor, as T
+// one-row dispatches over the ring's slots leave them; read once, each row's
+// arithmetic theirs (the state round-trips f32 there).
+template <int NDV, bool RING = false>
 static inline void gdn_step_ndv_impl(
     const device VPIPE_ELT* q, const device VPIPE_ELT* k,
     const device VPIPE_ELT* v, const device float* g, const device float* beta,
     const device float* state_in, device VPIPE_ELT* y, device float* state_out,
-    int T, int Hk, int Hv, uint3 tpig, uint3 tpit, uint silid)
+    int T, int Hk, int Hv, uint3 tpig, uint3 tpit, uint silid,
+    device float* so1 = nullptr, device float* so2 = nullptr,
+    device float* so3 = nullptr)
 {
   const uint Hku = (uint)(Hk < 0 ? -Hk : Hk), Hvu = (uint)Hv;
   const uint n = tpig.z;
@@ -188,11 +195,22 @@ static inline void gdn_step_ndv_impl(
       out = simd_sum(out);
       if (silid == 0) { y_[dv_base + d] = (VPIPE_ELT)out; }
     }
+    if (RING) {
+      device float* sot =
+          t == 0 ? state_out : (t == 1 ? so1 : (t == 2 ? so2 : so3));
+      for (int d = 0; d < NDV; ++d) {
+        device float* os = sot + (n * GDN_DV + dv_base + d) * GDN_DK;
+        for (int i = 0; i < GDN_NPT; ++i) {
+          os[GDN_NPT * dk_idx + i] = state[d][i];
+        }
+      }
+    }
     q_ += Hku * GDN_DK; k_ += Hku * GDN_DK;
     v_ += Hvu * GDN_DV; y_ += Hvu * GDN_DV;
     g_ += Hvu; beta_ += Hvu;
   }
 
+  if (RING) { return; }
   for (int d = 0; d < NDV; ++d) {
     device float* os = state_out + (n * GDN_DV + dv_base + d) * GDN_DK;
     for (int i = 0; i < GDN_NPT; ++i) {
@@ -223,6 +241,29 @@ static inline void gdn_step_ndv_impl(
 GDN_STEP_NDV(qwen3_5_gated_delta_step_ndv2_f16, 2)
 GDN_STEP_NDV(qwen3_5_gated_delta_step_ndv4_f16, 4)
 GDN_STEP_NDV(qwen3_5_gated_delta_step_ndv8_f16, 8)
+
+// ndv4 over a verify's T <= 4 rows on the GDN ring: buffer 7 takes the
+// state after row 0, 11..13 after rows 1..3 (gdn_step_ndv_impl's RING).
+kernel void qwen3_5_gated_delta_step_ndv4_ring_f16(
+    const device VPIPE_ELT* q [[buffer(0)]],
+    const device VPIPE_ELT* k [[buffer(1)]],
+    const device VPIPE_ELT* v [[buffer(2)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
+    const device float* state_in [[buffer(5)]],
+    device VPIPE_ELT* y [[buffer(6)]],
+    device float* state_out [[buffer(7)]],
+    constant int& T [[buffer(8)]], constant int& Hk [[buffer(9)]],
+    constant int& Hv [[buffer(10)]],
+    device float* so1 [[buffer(11)]],
+    device float* so2 [[buffer(12)]],
+    device float* so3 [[buffer(13)]],
+    uint3 tpig [[thread_position_in_grid]],
+    uint3 tpit [[thread_position_in_threadgroup]],
+    uint silid [[thread_index_in_simdgroup]]) {
+  gdn_step_ndv_impl<4, true>(q, k, v, g, beta, state_in, y, state_out,
+                             T, Hk, Hv, tpig, tpit, silid, so1, so2, so3);
+}
 
 // Depthwise causal conv1d + SiLU for the GDN block, with the conv_state
 // concat AND the state shift folded in -- no inwin materialization, no
@@ -300,6 +341,63 @@ kernel void qwen3_5_gdn_conv1d_silu_f16(
   }
   for (int i = 0; i < k - 1; ++i) {
     conv_state_out[(uint)i * C + c] = (VPIPE_ELT)ns[i];
+  }
+}
+
+// qwen3_5_gdn_conv1d_silu_f16 over a verify's n <= 4 rows on the GDN
+// ring: the outputs as there, and the state after row t -- the last k - 1
+// window rows through it -- into conv_state_out (buffer 9) for t = 0 and
+// buffers 10..12 for t = 1..3, as n one-row calls over the ring's slots
+// leave them (the same values, the same sums).
+kernel void qwen3_5_gdn_conv1d_silu_ring_f16(
+    device VPIPE_ELT*        conv_state [[buffer(0)]],
+    const device VPIPE_ELT*  x          [[buffer(1)]],
+    const device VPIPE_ELT*  w          [[buffer(2)]],
+    device VPIPE_ELT*        out        [[buffer(3)]],
+    constant int&       n          [[buffer(4)]],
+    constant int&       C          [[buffer(5)]],
+    constant int&       k          [[buffer(6)]],
+    constant int&       x_stride   [[buffer(7)]],
+    constant int&       keyd       [[buffer(8)]],
+    device VPIPE_ELT*        cs0 [[buffer(9)]],
+    device VPIPE_ELT*        cs1 [[buffer(10)]],
+    device VPIPE_ELT*        cs2 [[buffer(11)]],
+    device VPIPE_ELT*        cs3 [[buffer(12)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)C) { return; }
+  const uint c = gid;
+  const int vald = C - 2 * keyd;
+  uint o_base, o_stride;
+  if (keyd <= 0) {
+    o_base = c; o_stride = (uint)C;
+  } else if ((int)c < keyd) {
+    o_base = c; o_stride = (uint)keyd;
+  } else if ((int)c < 2 * keyd) {
+    o_base = (uint)n * keyd + (c - keyd); o_stride = (uint)keyd;
+  } else {
+    o_base = 2u * (uint)n * keyd + (c - 2 * keyd); o_stride = (uint)vald;
+  }
+  for (int t = 0; t < n; ++t) {
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+      const int r = t + j;
+      const float v = (r < k - 1)
+          ? (float)conv_state[(uint)r * C + c]
+          : (float)x[(uint)(r - (k - 1)) * x_stride + c];
+      acc += v * (float)w[c * (uint)k + j];
+    }
+    out[o_base + (uint)t * o_stride] =
+        (VPIPE_ELT)(acc / (1.0f + metal::exp(-acc)));
+  }
+  for (int t = 0; t < n; ++t) {
+    device VPIPE_ELT* cs = t == 0 ? cs0 : (t == 1 ? cs1 : (t == 2 ? cs2 : cs3));
+    for (int i = 0; i < k - 1; ++i) {
+      const int r = t + 1 + i;
+      cs[(uint)i * C + c] =
+          (r < k - 1) ? conv_state[(uint)r * C + c]
+                      : x[(uint)(r - (k - 1)) * x_stride + c];
+    }
   }
 }
 

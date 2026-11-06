@@ -91,16 +91,59 @@ using EncodeFn = std::function<void(
 // 2048 picks the optimum for ~0.1 s, the same order as the LM autotuners.
 inline constexpr int kProbeN = 2048;
 
+// The members in the order believed fastest WITHOUT timing them (the accel
+// key `autotune` false, accel-keys.h). On a GPU with matrix units the
+// matmul2d flash, query tile 32 first -- it beat the materialized GEMM at
+// every size measured on an M5 (1.46x at 16k mid tokens, 1.17x at 66k), a
+// sweep there picked the tile, and the simdgroup-matrix flash ran ~10x
+// slower. Before them the materialized banded GEMM -- 9.1x the flash on
+// an M4 Pro -- then the simdgroup flash. The scalar member last, always.
+inline std::vector<Kind> believed_order(bool matrix_cores)
+{
+  if (matrix_cores) {
+    return {Kind::kWide32, Kind::kWide16, Kind::kWide64, Kind::kMma8,
+            Kind::kMat, Kind::kSmm, Kind::kScalar};
+  }
+  return {Kind::kMat, Kind::kSmm, Kind::kMma8, Kind::kWide32,
+          Kind::kWide16, Kind::kWide64, Kind::kScalar};
+}
+
 // Time every candidate and return the winner. `fallback` comes back unchanged
 // when the tune cannot run (allocation refused, fewer than two candidates, or
 // VPIPE_VAE_ATTN_NO_AUTOTUNE). `detail` (optional) receives the per-candidate
 // timings for a load-time log line.
+//
+// `measure` false (the accel key `autotune`): NOTHING IS TIMED and the
+// process's memo of timed answers is neither read nor written -- the
+// correctness gate still runs, being a comparison and not a race, and the
+// first member of believed_order() that passes it is the answer. The same
+// member every load, so the same rounding.
 template <class Mc, class Enc>
 inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
                      Kind fallback, const EncodeFn& encode,
-                     std::string* detail = nullptr, bool verify = true)
+                     std::string* detail = nullptr, bool verify = true,
+                     bool measure = true)
 {
-  if (std::getenv("VPIPE_VAE_ATTN_NO_AUTOTUNE") != nullptr) { return fallback; }
+  // Untimed: the believed order over what the gate passes.
+  auto believed = [&](const std::vector<Kind>& passed) {
+    for (Kind k : believed_order(mc->supports_matrix_cores())) {
+      for (Kind c : passed) {
+        if (c == k) {
+          if (detail != nullptr) {
+            *detail += std::string("untuned ") + name(k);
+          }
+          return k;
+        }
+      }
+    }
+    return passed.empty() ? fallback : passed.front();
+  };
+  if (!measure && cands.size() < 2) {
+    return cands.empty() ? fallback : cands.front();
+  }
+  if (measure && std::getenv("VPIPE_VAE_ATTN_NO_AUTOTUNE") != nullptr) {
+    return fallback;
+  }
   if (cands.size() < 2) { return fallback; }
   // PROCESS-LEVEL MEMO, keyed by the shape and the candidate set. Two loads in
   // one process MUST land on the same member: the members agree only to ~1e-3,
@@ -114,7 +157,7 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
   const auto key = std::make_pair((std::uint64_t)C, mask);
   static std::mutex memo_mu;
   static std::map<std::pair<std::uint64_t, std::uint64_t>, Kind> memo;
-  {
+  if (measure) {
     std::lock_guard<std::mutex> lk(memo_mu);
     const auto it = memo.find(key);
     if (it != memo.end()) { return it->second; }
@@ -129,7 +172,9 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
   metal_compute::SharedBuffer k = mc->make_shared_buffer(n * 2);
   metal_compute::SharedBuffer v = mc->make_shared_buffer(n * 2);
   metal_compute::SharedBuffer att = mc->make_shared_buffer(n * 2);
-  if (q.empty() || k.empty() || v.empty() || att.empty()) { return fallback; }
+  if (q.empty() || k.empty() || v.empty() || att.empty()) {
+    return measure ? fallback : believed(cands);
+  }
   // Values are written by fill_probe below -- non-degenerate, because a
   // constant input makes the softmax uniform and every member agrees.
   // Scratch is REUSED across bench calls, not reallocated: these buffers are
@@ -205,7 +250,7 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
     auto capture = [&](Kind kind, std::vector<float>* out) {
       next = 0;
       std::memset(att.contents(), 0, n * 2);
-      autotune_time(mc, 1, [&](Enc& enc) {
+      autotune_run(mc, 1, [&](Enc& enc) {
         encode(enc, kind, q, k, v, att, hw, C, scale, alloc, rel);
       });
       const auto* pa = static_cast<const _Float16*>(att.contents());
@@ -251,6 +296,7 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
       }
     }
     fill_probe(0.0f);            // back to the timing probe's values
+    if (!measure) { return believed(live); }
     if (live.size() < 2) {
       const Kind won = live.empty() ? fallback : live[0];
       std::lock_guard<std::mutex> lk(memo_mu);
@@ -258,6 +304,7 @@ inline Kind autotune(Mc* mc, int C, const std::vector<Kind>& cands,
       return won;
     }
   }
+  if (!measure) { return believed(live); }       // no gate asked for
   auto bench = [&](int i) -> double {
     if (!alloc_ok) { return 0.0; }
     next = 0;                                  // rewind the scratch ring

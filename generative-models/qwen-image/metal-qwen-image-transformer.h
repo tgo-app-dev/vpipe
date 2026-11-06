@@ -63,6 +63,10 @@ class MetalQwenImageTransformer {
     // biasless int8 GEMM plus that existing pass is the same shape
     // flux2 and krea2 use.
     bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
 
     // SageAttention: the QK^T product in int8. It rides on the
     // matrix-core flash entry, which this family takes by default

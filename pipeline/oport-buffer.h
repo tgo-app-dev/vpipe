@@ -64,6 +64,15 @@ namespace vpipe {
 // write. Use RuntimeContext::has_consumers() if the producer wants
 // to skip the data production work too.
 //
+// A reader that LEAVES (leave_cursor: its stage has ended -- finished,
+// or failed and drained) holds the writer back no more and is never
+// the slowest. Once every attached reader has left, a push is dropped
+// as with none attached, and has_consumers() is false. Before this, a
+// stage that failed mid-run left its cursor where it stopped: a
+// Backpressure producer feeding it filled the ring and suspended for
+// good -- the pipeline never ended, and a host waiting on that
+// producer waited with it.
+//
 // Thread safety: hot-path advances (wp store, cursor.next_seq
 // fetch_add) are atomic. _mu guards waiter slots, slot writes, the
 // slot-unique_ptr move on acquire, DropOldest's cursor snap,
@@ -157,6 +166,12 @@ public:
   // already attached.
   unsigned attach_cursor();
 
+  // The reader at `cursor_idx` reads no more (see the class comment):
+  // a writer suspended on it is woken. Idempotent.
+  void leave_cursor(unsigned cursor_idx);
+  // Every attached reader has left (false with none attached).
+  bool abandoned() const;
+
   bool          closed() const noexcept;
   unsigned      capacity() const noexcept { return _hard_cap; }
   OverrunPolicy mode()     const noexcept { return _mode; }
@@ -171,6 +186,9 @@ private:
   struct Cursor {
     std::atomic<std::uint32_t>             next_seq{0};
     std::atomic<std::uint32_t>             dropped{0};
+    // Its reader has left (leave_cursor): skipped by backpressure and
+    // the slowest-reader test.
+    std::atomic<bool>                      left{false};
     // Guarded by _mu. `waiter` (single-port read/peek/acquire) and
     // `multi` (read_any) are mutually exclusive -- a cursor has one
     // consumer coroutine, so only one wait is pending at a time. Both
@@ -180,11 +198,13 @@ private:
     std::uint32_t                          waiter_seq = 0;
   };
 
-  // Computes (wp - min(cursor.next_seq)) using relaxed loads of
-  // cursor seqs. Stale reads under-estimate progress (cursors only
-  // advance), so the returned count is a safe upper bound on
-  // active.
+  // Computes (wp - min(cursor.next_seq)) over the cursors still
+  // reading, using relaxed loads of cursor seqs. Stale reads
+  // under-estimate progress (cursors only advance), so the returned
+  // count is a safe upper bound on active.
   std::uint32_t active_count_relaxed_() const noexcept;
+  // Every cursor has left (caller holds _mu; false with none).
+  bool abandoned_locked_() const noexcept;
 
   // Locked helpers (caller holds _mu).
   struct PushResult {

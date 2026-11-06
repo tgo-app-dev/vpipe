@@ -181,7 +181,10 @@ template <
     // to contract over, so B is stored [N, K] with no zeros and the tile
     // picks the matching window of t = x A^T. The caller guarantees a
     // BN-wide tile never straddles a group (band_group % BN == 0).
-    const bool BAND = false>
+    const bool BAND = false,
+    // RELU applies max(., 0) to the accumulator after the bias, before
+    // the one rounding store: a 1x1 conv followed by a ReLU in one pass.
+    const bool RELU = false>
 METAL_FUNC void dense_gemm_t_impl(
     const device T* x,
     const device T* W,
@@ -299,6 +302,7 @@ METAL_FUNC void dense_gemm_t_impl(
       ScaleAddEpilogue op{acc_scale};
       mma_op.apply_epilogue_safe(y, N, 1, short2(num_outs, num_els), op);
     }
+    if (RELU) { mma_op.apply_epilogue(ReluEpilogue()); }
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
   } else {
     if (has_bias) {
@@ -309,6 +313,7 @@ METAL_FUNC void dense_gemm_t_impl(
       ScaleAddEpilogue op{acc_scale};
       mma_op.apply_epilogue(y, N, 1, op);
     }
+    if (RELU) { mma_op.apply_epilogue(ReluEpilogue()); }
     mma_op.store_result(y, N);
   }
 }
@@ -1771,3 +1776,100 @@ VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_cat_relu_f16,
                                64, 64, 1, 1, 1)
 VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_cat_relu_f16,
                                64, 32, 1, 1, 1)
+
+// ---- the tiny autoencoders' ConvNeXt-style block ---------------------------
+//
+// TAESD's SuperBlock (taeqi2_1_tinier's low-resolution stages):
+//   y = x + W_down relu(W_up dw7x7(x) + b_up)
+// over a channel-LAST [H * W, C] map. The two 1x1s are the GEMMs above
+// (the up projection with its ReLU in the epilogue, the down one
+// accumulating onto y); this is the depthwise conv in front of them.
+
+// The 1x1 conv + ReLU twins of dense_gemm_t_bm64_f16 / _bm64bn64_f16:
+// relu(x @ W^T + bias), one rounding. Same buffers, grid and tile.
+kernel void dense_gemm_t_bm64_relu_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/false, /*BAND=*/false, /*RELU=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void dense_gemm_t_bm64bn64_relu_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/false, /*BAND=*/false, /*RELU=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid);
+}
+
+// Depthwise 7x7, zero padding 3, no bias: y[p, c] = sum over the 49 taps
+// of w[tap, c] * x[p + tap offset, c], in f32 with one rounding. `w` is
+// TAP-major [49, C], so a tap's weights for neighbouring channels are
+// neighbours, as the activation's are. One thread a (pixel, channel),
+// the channels fastest: a simdgroup reads 32 consecutive halves of each
+// neighbour row. With `copy` set it also writes x itself into `xc` --
+// the block's residual, which the down projection then accumulates onto
+// (it reads the centre tap here anyway).
+//
+//   0:x[H*W, C]  1:w[49, C]  2:y[H*W, C]  3:xc[H*W, C]
+//   4:H  5:W  6:C  7:copy
+// grid (C, W, H) threads.
+kernel void dwconv7x7_hwc_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    const device VPIPE_ELT* w    [[buffer(1)]],
+    device VPIPE_ELT*       y    [[buffer(2)]],
+    device VPIPE_ELT*       xc   [[buffer(3)]],
+    const constant int&     H    [[buffer(4)]],
+    const constant int&     W    [[buffer(5)]],
+    const constant int&     C    [[buffer(6)]],
+    const constant int&     copy [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x, px = (int)gid.y, py = (int)gid.z;
+  if (c >= C || px >= W || py >= H) { return; }
+  float acc = 0.0f;
+  for (int ky = 0; ky < 7; ++ky) {
+    const int iy = py + ky - 3;
+    if (iy < 0 || iy >= H) { continue; }
+    for (int kx = 0; kx < 7; ++kx) {
+      const int ix = px + kx - 3;
+      if (ix < 0 || ix >= W) { continue; }
+      acc = fma((float)x[((ulong)iy * W + ix) * C + c],
+                (float)w[(ulong)(ky * 7 + kx) * C + c], acc);
+    }
+  }
+  const ulong o = ((ulong)py * W + px) * C + c;
+  y[o] = (VPIPE_ELT)acc;
+  if (copy != 0) { xc[o] = x[o]; }
+}

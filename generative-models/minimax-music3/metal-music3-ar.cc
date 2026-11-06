@@ -233,6 +233,7 @@ MetalQwenModel::Config
 MetalMusic3Ar::qwen_config_(const Config& cfg)
 {
   MetalQwenModel::Config q;
+  q.autotune   = cfg.autotune;
   q.n_layers   = cfg.layers;
   q.hidden     = cfg.hidden;
   q.n_heads    = cfg.heads;

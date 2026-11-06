@@ -1,5 +1,6 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "apple-silicon/metal-compute/wire-on-alloc.h"
+#include "common/memory-owner.h"
 
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
@@ -153,7 +154,9 @@ SharedBuffer::SharedBuffer(SharedBuffer&& o) noexcept
     // Same reasoning for the parked flag: lose it and reactivate() on
     // the destination reports "intact" for a buffer the kernel may
     // already have discarded, which reads as silent garbage.
-    _inactive(std::exchange(o._inactive, false))
+    _inactive(std::exchange(o._inactive, false)),
+    // And whose they are: counted out where they were counted in.
+    _owner_slot(std::exchange(o._owner_slot, 0))
 {
   o._view = {};
 }
@@ -173,6 +176,7 @@ SharedBuffer::operator=(SharedBuffer&& o) noexcept
   _wired     = std::exchange(o._wired, false);
   _accounted = std::exchange(o._accounted, false);
   _inactive  = std::exchange(o._inactive, false);
+  _owner_slot = std::exchange(o._owner_slot, 0);
   o._view    = {};
   return *this;
 }
@@ -202,7 +206,9 @@ SharedBuffer::teardown_() noexcept
   if (_buf != nullptr) {
     if (_accounted) {
       account_free_(_byte_size);
+      memory_slot_sub(static_cast<std::uint32_t>(_owner_slot), _byte_size);
       _accounted = false;
+      _owner_slot = 0;
     }
     _buf->release();
     _buf = nullptr;

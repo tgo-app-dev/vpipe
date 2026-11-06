@@ -45,6 +45,13 @@ constexpr SpecExtra kI8TierChoices[] = {
 };
 
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the latent upscaler: a models-DB key, the Open-H3-Regenerate-2K "
           "release (Efficient-Large-Model/Open-H3-Regenerate-2K: its "
@@ -162,6 +169,7 @@ LatentUpscaleStage::LatentUpscaleStage(const SessionContextIntf* s,
   const std::string nm = attr_str("normalization");
   _norm_once = nm == "once";
   _unload = attr_str("unload_when_idle");
+  _autotune = attr_bool("autotune");
   {
     const std::string t = attr_str("i8_gemm_tier");
     _i8_tier = !attr_bool("i8_gemm") ? -1
@@ -370,7 +378,7 @@ LatentUpscaleStage::ensure_loaded_()
   }
   const auto t0 = std::chrono::steady_clock::now();
   _ws = genai::open_weight_set(file, session());
-  if (_ws) { _model = Upscaler::load(_ws, mc, &err, _i8_tier); }
+  if (_ws) { _model = Upscaler::load(_ws, mc, &err, _i8_tier, _autotune); }
   if (!_model) {
     _ws.reset();
     session()->error(fmt("LatentUpscaleStage('{}'): '{}': {}", this->id(),

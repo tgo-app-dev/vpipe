@@ -79,6 +79,9 @@ public:
     // from disk on a miss and kept by how often they are selected
     // (MetalQwenModel::Config::expert_cache_bytes); 0 = all resident.
     std::size_t expert_cache_bytes = 0;
+    // Whether the backbone's kernel tuners measure (the accel key
+    // `autotune`; MetalQwenModel::Config::autotune).
+    bool autotune = true;
   };
 
   static std::unique_ptr<MetalDrama3Model> load(

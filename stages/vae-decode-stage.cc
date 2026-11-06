@@ -77,6 +77,10 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
                                  : std::string(genai::accel::kI8TierAccurate));
   }
   genai::accel::set_flag(&_accel, genai::accel::kAneFfn, attr_bool("ane_ffn"));
+  // The kernel tuners (kAutotune): in the accel, so a warm hold's key --
+  // which reads it -- tells a tuned VAE from an untuned one.
+  _autotune = attr_bool("autotune");
+  genai::accel::set_flag(&_accel, genai::accel::kAutotune, _autotune);
   {
     double rows = attr_real("ane_rows");
     if (!(rows >= 0.0)) { rows = 0.0; }
@@ -166,6 +170,13 @@ constexpr SpecExtra kDtypeChoices[] = {
   {spec_key::kChoices, "u8,f16"},
 };
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "dtype", .type = ConfigType::String, .required = false,
    .doc = "u8 | f16: the pictures this emits. u8 (the default) quantizes "
           "the decoder's samples to 8 bits, what most consumers read. f16 "
@@ -916,6 +927,7 @@ VaeDecodeStage::ensure_wan_vae_()
   load_note_(fmt("VaeDecodeStage('{}'): loading Wan video VAE from '{}'",
                  this->id(), vae_dir));
   // Decode-only: the encoder half is the vae-encode stage's business.
+  wcfg.autotune = _autotune;
   _wan_vae = genai::MetalWanVae::load(ws, mc, wcfg, /*with_encoder=*/false);
   if (!_wan_vae) {
     session()->error(fmt(
@@ -1167,11 +1179,13 @@ VaeDecodeStage::ensure_loaded_()
         }
       }
     }
-    _vae_warm_key = fmt("flux2|{}|{}|{} {} {} {} {} {} {} {}", vae_dir,
+    fcfg.autotune = _autotune;
+    _vae_warm_key = fmt("flux2|{}|{}|{} {} {} {} {} {} {} {}|tune {}", vae_dir,
                         ws_dir, fcfg.patch, fcfg.latent_channels,
                         fcfg.norm_groups, fcfg.block_out[0],
                         fcfg.block_out[1], fcfg.block_out[2],
-                        fcfg.block_out[3], fcfg.layers_per_block)();
+                        fcfg.block_out[3], fcfg.layers_per_block,
+                        fcfg.autotune ? 1 : 0)();
     // i8_gemm, settled in the ctor: flags on the model, no weights of its
     // own (the int8 weight is folded per call), so a warm model takes
     // this graph's setting as a fresh one does.
@@ -1254,6 +1268,7 @@ VaeDecodeStage::ensure_loaded_()
       }
     }
     const auto t0 = std::chrono::steady_clock::now();
+    fcfg.autotune = _autotune;
     _h3_fast = genai::MetalMiniMaxH3FastVae::load(fws, mc, fcfg, &ferr);
     if (!_h3_fast) {
       session()->error(fmt(
@@ -1311,6 +1326,7 @@ VaeDecodeStage::ensure_loaded_()
     }
     load_note_(fmt("VaeDecodeStage('{}'): loading the MiniMax-H3 video VAE "
                    "from '{}'", this->id(), vae_dir));
+    h3cfg.autotune = _autotune;
     _h3_vae = ws_override.empty()
                   ? genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg)
                   : genai::MetalMiniMaxH3VideoVae::load(ws, mc, h3cfg);
@@ -1410,6 +1426,7 @@ VaeDecodeStage::ensure_loaded_()
   load_note_(fmt(
       "VaeDecodeStage('{}'): loading Qwen-Image VAE from '{}'", this->id(),
       vae_dir));
+  cfg.autotune = _autotune;
   _vae = genai::MetalKrea2Vae::load(ws, mc, cfg);
   if (!_vae) {
     session()->error(fmt(

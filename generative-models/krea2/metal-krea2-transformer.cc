@@ -1,4 +1,5 @@
 #include "generative-models/shared/mma-tile.h"
+#include "common/memory-owner.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/shared/fp8-layout.h"
@@ -428,6 +429,8 @@ MetalKrea2Transformer::load_block_(WeightSet& ws,
                                    bool main_block, Retain r,
                                    bool keep_split)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (main_block) {
     b.sst = elt_(ws, pre + "scale_shift_table", r);
     if (b.sst.empty()) { return false; }
@@ -609,6 +612,8 @@ bool
 MetalKrea2Transformer::clone_block_(const Block& src, Block& dst,
                                     bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   const auto one = [&](const SharedBuffer& s, SharedBuffer& d) {
     if (!ok || s.empty()) { d = SharedBuffer{}; return; }
@@ -740,6 +745,8 @@ MetalKrea2Transformer::keep_weights_(std::initializer_list<QWeight*> ws) const
 bool
 MetalKrea2Transformer::keep_block_(Block& b) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   // The split gate|up the fused weight was woven from: the forward reads
   // only the fusion, and the slot keeps its own copies for the next
   // refill.
@@ -754,6 +761,8 @@ MetalKrea2Transformer::keep_block_(Block& b) const
 SharedBuffer
 MetalKrea2Transformer::rebuild_one_(const std::string& nm, P how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (!_ws) { return {}; }
   // An FP8 SCALE: the f32 multiplier of the weight it sits beside.
   if (fp8::is_aux_name(nm)) {
@@ -1439,6 +1448,7 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
     // SAY WHICH WAY IT WENT, on the same terms as the Sol-Attn lines
     // below: the context gates itself on matrix cores and on its

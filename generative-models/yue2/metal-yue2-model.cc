@@ -180,6 +180,7 @@ MetalYue2Model::init_(const std::shared_ptr<WeightSet>& ws, MetalCompute* mc,
 
   // ---- the AR backbone: a plain Qwen3 dense stack under these names --
   MetalQwenModel::Config q;
+  q.autotune   = cfg.autotune;
   q.n_layers   = cfg.n_layers;
   q.hidden     = cfg.hidden;
   q.n_heads    = cfg.n_heads;
@@ -684,6 +685,7 @@ MetalYue2Model::set_accel(const Accel& a, std::string* err)
   if (a.i8_gemm) {
     // Declines itself without matrix cores, and VPIPE_I8_GEMM overrides.
     auto i8 = std::make_unique<I8GemmContext>(_mc, true, /*bf16=*/true);
+    i8->set_autotune(a.autotune);
     if (i8->enabled()) {
       _i8 = std::move(i8);
     } else if (ss != nullptr) {

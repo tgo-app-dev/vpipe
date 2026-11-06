@@ -991,6 +991,36 @@ when a config asked for the int8 P·V and the host could not give it. Pass
 uint8 copy and Q's per-token scales; a family that turns it on part way
 through a run calls `reserve_pv8(true)` so the scratch is built once.
 
+#### `autotune` — whether your kernel tuners measure
+
+`accel::kAutotune` (bool, default true) is the graph asking for a run
+that REPEATS. A family that picks a kernel, a tile, a route or a split by
+timing its candidates -- at load, or at a first forward -- picks by a
+race, and the candidates agree to rounding, not to the bit: two runs
+whose races land differently produce different pictures from the same
+seed. False means time nothing, read nothing the session kept
+(`find_tuned`: an answer there was measured, and a run that reads one
+rounds as that measurement did), and take one fixed choice per GPU --
+the one believed fastest without a timing, which may or may not be what
+a tune would have picked. The toolkit's tuners take it directly:
+
+- `I8GemmContext::set_autotune(false)`, before the first forward: every
+  shape runs the untuned split, and nothing is recorded or read.
+- `vae_mid_attn::autotune(..., /*verify=*/true, /*measure=*/false)`: the
+  correctness gate still runs -- it is a comparison, not a race -- and
+  the first member of `believed_order()` that passes it is the answer.
+- `vae_conv3x3::believed(matrix_cores)` in place of a conv-route tune.
+
+Key a model you keep warm across launches by it, so a tuned one is not
+handed to a run that asked for none. An automatic ANE share is balanced
+by timing too: a run that must repeat also pins `ane_rows`. A host
+older than the key never sends it, and the reader's default -- true --
+is the behaviour it had.
+
+A plug-in stage that opens a conditioning encoder through
+`HiddenStateEncoderRegistry` passes the same key in
+`HiddenStateEncoderArgs::extra`; the host's encoders honour it there.
+
 #### `sol_attn` — which key blocks are attended at all
 
 Where Sage changes how a key block is *computed*, [**Sol-Attn**](https://nvlabs.github.io/Sana/Sol-Attn/)
@@ -1665,6 +1695,7 @@ constant, never the spelling:
 |---|---|
 | a struct's `extra`: `NamedTensor` format, catalogue | `genai::named_tensor` (`gen-input.h`), `catalog_extra` (`stages/model-catalog.h`) |
 | the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
+| `HiddenStateEncoderArgs::extra` (whether the encoder's kernel tuners measure) | `genai::accel::kAutotune` (`generative-models/accel-keys.h`) |
 | scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
 | `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load; the most the model may hold; its routed experts' cache) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
 | `ModelConfig::extra` (what config.json says that the struct has no field for: a YaRN / Llama-4 `rope_parameters`, a vision tower's input edge, a Qwen-VL processor's picture and clip pixel bounds, a chat template's default system message, whether that template takes a reasoning effort, the language model's whole config section as spelled) | `genai::model_config` (`generative-models/model-loader.h`) |

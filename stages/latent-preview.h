@@ -119,6 +119,17 @@ int latent_preview_shrink(int w, int h, int max_edge);
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
+// The ONE checkpoint file a `preview_vae` reference names: a file (a
+// .safetensors or a torch .pth), a registry key's pinned file, or a
+// directory -- its one .safetensors, or of several the one carrying the
+// directory's own name (a Hub repo's main checkpoint beside variants:
+// madebyollin/taeqi2_1 holds taeqi2_1 and taeqi2_1_tinier). Any other
+// directory of several is refused, the files named in *err. Empty on
+// failure.
+std::string
+latent_preview_tae_file(const SessionContextIntf* session,
+                        const std::string& ref, std::string* err);
+
 // What previewing a `w` x `h` output (`frames` of it, 1 for an image)
 // books in the plan, for a denoiser's declare_resources(): the TAE's
 // weights, and its decode scratch plus the host's frame buffers for the

@@ -1,4 +1,5 @@
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
+#include "common/memory-owner.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -786,6 +787,8 @@ bool
 MetalQwenImage21Transformer::load_block_(WeightSet& ws, int L, Block& b,
                                          Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const std::string p = block_pre_(L);
   b.qw = load_qw_(ws, p + "attn.to_q", r, true);
   b.kw = load_qw_(ws, p + "attn.to_k", r, true);
@@ -940,6 +943,8 @@ bool
 MetalQwenImage21Transformer::clone_block_(const Block& src, Block& dst,
                                           bool copy) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   bool ok = true;
   // A PROMOTION keeps what a preloaded block keeps (see
   // kept_block_bytes_): a w4 pack whose layout is held (Config::
@@ -1005,6 +1010,8 @@ MetalQwenImage21Transformer::clone_block_(const Block& src, Block& dst,
 bool
 MetalQwenImage21Transformer::keep_block_(Block& b) const
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   // Conversions land in fresh buffers and are swapped in after the wait:
   // the encoder reads the pack's codes until then.
   struct Swap {
@@ -1081,6 +1088,8 @@ MetalQwenImage21Transformer::kept_block_bytes_(const Block& b) const
 SharedBuffer
 MetalQwenImage21Transformer::rebuild_one_(const std::string& nm, Placement how)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (_ws == nullptr) { return {}; }
   // A Draw Things i8x weight's row scales, widened to f32.
   {
@@ -1482,6 +1491,7 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
                  : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                     : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(cfg.i8_tier == 2);
+    i8->set_autotune(cfg.autotune);
     if (i8->enabled()) { m->_i8 = std::move(i8); }
   }
   // SAGE: int8 Q/K for the QK^T half of attention, which is the half
@@ -1508,7 +1518,7 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
     m->_cfg.ane_ffn = std::atoi(e) != 0;
   }
   if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_ANE_ROWS")) {
-    m->_cfg.ane_rows = std::atoi(e);
+    m->_cfg.ane_rows = (float)std::atof(e);
   }
   if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_ANE_QKV")) {
     m->_cfg.ane_qkv = std::atoi(e) != 0;

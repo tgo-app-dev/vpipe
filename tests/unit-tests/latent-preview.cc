@@ -15,6 +15,7 @@
 #include "generative-models/gen-input.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/video-model-registry.h"
+#include "generative-models/weight-set.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
@@ -979,4 +980,114 @@ TEST(latent_preview, the_github_hosted_tae_is_fetched_by_url)
   const auto back = catalog_url_files(x);
   EXPECT_TRUE(back.size() == 1 && back[0].second == "b");
   EXPECT_TRUE(catalog_url_files(ModelCatalogEntry{}).empty());
+}
+
+// A preview naming a FOLDER of several TAEs. madebyollin's Hub repo
+// taeqi2_1 held taeqi2_1.safetensors alone, then gained
+// taeqi2_1_tinier.safetensors beside it, and a preview_vae naming the
+// folder stopped loading ("holds 2 .safetensors and nothing says which
+// one is meant"). The file carrying the folder's own name is the repo's
+// main checkpoint; only that rule is added -- a folder of several
+// WITHOUT one so named is still refused, its files listed.
+TEST(latent_preview, a_folder_of_tae_variants_resolves_to_its_namesake)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-tae-folders";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto touch = [](const fs::path& p) {
+    fs::create_directories(p.parent_path());
+    std::ofstream f(p);
+    f << "x";
+  };
+  auto resolve = [](const fs::path& p, std::string* err) {
+    return fs::path(latent_preview_tae_file(nullptr, p.string(), err));
+  };
+  std::string err;
+
+  // The old layout: one file.
+  const fs::path one = root / "old" / "taeqi2_1";
+  touch(one / "taeqi2_1.safetensors");
+  EXPECT_TRUE(resolve(one, &err) == one / "taeqi2_1.safetensors");
+
+  // The new layout: the namesake and its variant, spelled with and
+  // without a trailing separator.
+  const fs::path two = root / "new" / "taeqi2_1";
+  touch(two / "taeqi2_1.safetensors");
+  touch(two / "taeqi2_1_tinier.safetensors");
+  err.clear();
+  EXPECT_TRUE(resolve(two, &err) == two / "taeqi2_1.safetensors");
+  err.clear();
+  const std::string slash = two.string() + "/";
+  EXPECT_TRUE(fs::path(latent_preview_tae_file(nullptr, slash, &err)) ==
+              two / "taeqi2_1.safetensors");
+  // Naming the variant's file still takes the variant.
+  err.clear();
+  EXPECT_TRUE(resolve(two / "taeqi2_1_tinier.safetensors", &err) ==
+              two / "taeqi2_1_tinier.safetensors");
+
+  // One file NOT named after its folder is still the answer.
+  const fs::path lone = root / "lone";
+  touch(lone / "taef2.safetensors");
+  err.clear();
+  EXPECT_TRUE(resolve(lone, &err) == lone / "taef2.safetensors");
+
+  // Several, none the namesake (madebyollin/taehv's shape): refused,
+  // both named.
+  const fs::path many = root / "taehv";
+  touch(many / "taeh3.safetensors");
+  touch(many / "taew2_1.safetensors");
+  err.clear();
+  EXPECT_TRUE(resolve(many, &err).empty());
+  EXPECT_TRUE(err.find("taeh3.safetensors") != std::string::npos &&
+              err.find("taew2_1.safetensors") != std::string::npos);
+  fs::remove_all(root, ec);
+}
+
+// The Hub repo's own files load (VPIPE_TAEQI2_1_HUB_DIR = a folder named
+// taeqi2_1 holding madebyollin/taeqi2_1's two .safetensors): the folder
+// resolves to the full TAE, and the tinier one named as a file loads
+// too -- both Qwen-Image-2.1's RGBA 16x decoder over its 64-channel
+// latent, the tinier at about a quarter of the parameters.
+TEST(latent_preview, the_taeqi2_1_hub_folder_loads_its_main_tae)
+{
+  const char* dir = std::getenv("VPIPE_TAEQI2_1_HUB_DIR");
+  if (dir == nullptr) { return; }
+  Session sess;
+  auto* mc = sess.services()->metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  if (mc == nullptr) { return; }
+  std::string err;
+  const std::string file = latent_preview_tae_file(&sess, dir, &err);
+  if (file.empty()) { std::printf("[latent-preview] %s\n", err.c_str()); }
+  ASSERT_TRUE(std::filesystem::path(file).filename() ==
+              "taeqi2_1.safetensors");
+  if (file.empty()) { return; }
+  auto dec = genai::MetalTaeDecoder::load(
+      genai::open_weight_set(file, &sess), mc, &err);
+  if (dec == nullptr) { std::printf("[latent-preview] %s\n", err.c_str()); }
+  ASSERT_TRUE(dec != nullptr);
+  if (dec == nullptr) { return; }
+  const auto& in = dec->info();
+  std::printf("[latent-preview] %s: %s, %d latent channels, %dx, %d "
+              "image channels, %.2fM params\n", file.c_str(),
+              in.layout.c_str(), in.latent_channels, in.spatial,
+              in.image_channels, (double)in.params / 1e6);
+  EXPECT_TRUE(in.latent_channels == 64 && in.spatial == 16 &&
+              in.image_channels == 4 && in.time_upscale == 1);
+
+  const std::string tin =
+      (std::filesystem::path(dir) / "taeqi2_1_tinier.safetensors").string();
+  err.clear();
+  ASSERT_TRUE(latent_preview_tae_file(&sess, tin, &err) == tin);
+  auto small = genai::MetalTaeDecoder::load(
+      genai::open_weight_set(tin, &sess), mc, &err);
+  if (small == nullptr) { std::printf("[latent-preview] %s\n", err.c_str()); }
+  ASSERT_TRUE(small != nullptr);
+  if (small == nullptr) { return; }
+  const auto& ts = small->info();
+  std::printf("[latent-preview] %s: %s, %.2fM params\n", tin.c_str(),
+              ts.layout.c_str(), (double)ts.params / 1e6);
+  EXPECT_TRUE(ts.latent_channels == 64 && ts.spatial == 16 &&
+              ts.image_channels == 4 && ts.params * 3 < in.params);
 }

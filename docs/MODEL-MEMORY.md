@@ -104,6 +104,7 @@ than supplying one that is merely small.
 | 9 | The removable pool | May the *next launch* have what I finished with? | per weight set | at release |
 | 10 | The memory cap | What does the process insist on holding? | process-wide | from config |
 | 11 | The expert cache | Which of a mixture-of-experts model's experts do I keep? | per (layer, expert) | at load; refilled every step |
+| 12 | Ownership | Whose are these bytes, and what are they for? | per buffer | at allocation, from the thread's owner |
 
 Mechanisms 1–4 are mandatory for every model. 5–7 apply to models too big
 for the machine, and 11 is their counterpart for a mixture of experts.
@@ -2478,6 +2479,44 @@ in its checkpoint's entry both; a language model's `held_bytes` likewise
 takes in what it keeps through its set (that n-gram table); and the K/V
 of the language models kept warm is in the session-wide K/V figure too.
 Show each list for what it is; do not add them up.
+
+**Whose it is, while it runs.** The Metal total is everything; the lists
+above name only what is kept between runs. What a model holds while it
+RUNS -- a streaming DiT's kept blocks, an expert cache, a context's K/V,
+a forward's activations -- was the total less those, nobody's: 100.7 GB
+of 106.8 on a 128 GB Mac making a MiniMax H3 clip. So every buffer
+`MetalCompute::make_shared_buffer` makes is counted under the OWNER in
+force on its thread as it is made, and counted out there when its owning
+handle goes (`common/memory-owner.h`; the handle carries its slot in a
+reserved word, so its size is the same). An owner is a checkpoint's
+directory and what holds it:
+
+| Who sets it | Owner | Use |
+|---|---|---|
+| the thread pool, on each resume of a stage's coroutine | the stage's largest declared checkpoint (`declare_memory`) and its type -- registered by the runtime at launch, cleared at stop | scratch, unless marked below |
+| the model manager, around a language model's load | its directory, `language-model` | weights |
+| a weight set, around a read | its directory, `weights` | weights (`tensor`, `derived`: kept; `read`, a language model's weights read into its own members) or blocks (`stream_tensor`, `stream_derived`, and `read` inside a block's load) |
+| a DiT's block loader (`load_block_`, `keep_block_`, `clone_block_`, `rebuild_one_`, in every family that streams) | the stage's | blocks -- its conversions too (int8 codes, dequantized copies) |
+| `MoeExpertCache::create` | the load's | experts |
+| a context's K/V and recurrent state (`ContextManager`) | the run's | kv |
+
+A Job a stage awaits takes its caller's tag (`Job::Awaiter`), so a resume
+of it after it waited is still the stage's -- for the profiler as for its
+memory. A buffer made on a thread no scope covers (a model's own reader
+threads; a host calling in) is no one's (`unowned_bytes`). Mapped tensors
+and wrapped memory are not allocations and are not counted. The report's
+`owned` lists each owner's live bytes by use: additive among themselves,
+and the same bytes as `warm` and `weights` where those name them -- one
+model's memory is its directories' `owned` entries, with the warm and
+weight lists for what is kept and parked. The counters are the
+process's, every session's together. Its cost on a resume: a map
+lookup under a shared lock (none while no stage is registered).
+MEASURED on a 24 GB M5 Pro, `owned` read mid-run: a Krea 2 Turbo 1024²
+picture 13.8 of 14.5 GB its own -- 11.6 GB blocks, 1.3 GB weights, 0.9
+GB scratch -- 0.67 GB no one's; a MiniMax H3 FL2VA clip, 832x480x39,
+15.8 of 15.9 GB -- 12.5 GB blocks, 1.7 GB weights, 1.6 GB scratch -- and
+its VAE's 4.7 GB as it decodes; Qwen3.5 9B writing, 8.4 GB weights, 212
+MB of K/V, 0.3 GB scratch.
 
 ---
 

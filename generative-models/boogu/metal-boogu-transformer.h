@@ -100,6 +100,9 @@ class MetalBooguTransformer {
     // Accelerated mode (LOSSY, opt-in): dynamic-int8 GEMMs for the big block
     // matmuls (see shared/i8-gemm.h). Env VPIPE_I8_GEMM=0|1 overrides.
     bool  i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false runs the int8 split untuned, timing nothing.
+    bool autotune = true;
 
     int x_in() const { return patch * patch * in_channels; }
   };

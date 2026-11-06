@@ -371,6 +371,7 @@ private:
   int           _steps  = 40;
   // LOSSY dynamic-int8 block GEMMs (opt-in; minimax-h3 only)
   bool        _i8_gemm{};
+  bool        _autotune = true;      // kernel tuners measure (kAutotune)
   int         _i8_tier{};            // i8_gemm_tier: 0 accurate, 1 fast,
                                      // 2 token, 3 token_plain
   // Sol-Attn, family-agnostic beside _i8_gemm; see the config docs.

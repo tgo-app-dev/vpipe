@@ -78,6 +78,10 @@ public:
     // 3 token_plain -- generate-image's i8_gemm_tier, by number. Not read
     // from config.json.
     int i8_tier = -1;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
     int dim() const { return heads * head_dim; }
     int concat() const { return 2 * in_channels + cond_dim; }
   };

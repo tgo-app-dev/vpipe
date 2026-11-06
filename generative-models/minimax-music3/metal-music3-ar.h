@@ -50,6 +50,9 @@ class WeightSet;
 class MetalMusic3Ar {
 public:
   struct Config {
+    // Whether the LM's kernel tuners measure (the accel key `autotune`;
+    // MetalQwenModel::Config::autotune).
+    bool  autotune   = true;
     // The global LM (language_model/config.json).
     int   layers     = 36;
     int   hidden     = 4096;

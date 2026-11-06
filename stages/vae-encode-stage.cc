@@ -63,6 +63,7 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
   // so the "no model at all" case is reported at initialize()/process() time.
   _hf_dir    = attr_str("hf_dir");
   _vae_weights = attr_str("vae_dir");
+  _autotune  = attr_bool("autotune");
   // THE ACCELERATION BAG, built once and handed to a registered family
   // whole. Written whether the tier is on or off, and with the SETTLED
   // value, so no family repeats this stage's reading or reaches a
@@ -86,6 +87,9 @@ VaeEncodeStage::VaeEncodeStage(const SessionContextIntf* s,
                            known ? t
                                  : std::string(genai::accel::kI8TierAccurate));
   }
+  // The kernel tuners (kAutotune), for a registered family as for the
+  // built-in codecs' configs.
+  genai::accel::set_flag(&_accel, genai::accel::kAutotune, _autotune);
 
   // Optional letterbox resize: target_width + target_height (both required
   // together, both multiples of 8 -- the VAE downsamples by 8, and the
@@ -243,6 +247,13 @@ constexpr SpecExtra kPosteriorChoices[] = {
   {spec_key::kChoices, "mean,sample"},
 };
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "input_range", .type = ConfigType::String, .required = false,
    .doc = kInputRangeDoc, .def_str = "unit"},
   {.key = "frames", .type = ConfigType::Int, .required = false,
@@ -832,6 +843,7 @@ VaeEncodeStage::ensure_loaded_()
     load_note_(fmt(
         "VaeEncodeStage('{}'): loading AutoencoderKL encoder from '{}'", this->id(),
         vae_dir));
+    fcfg.autotune = _autotune;
     _flux2_vae = genai::MetalFlux2Vae::load(ws, mc, fcfg,
                                             /*with_encoder=*/true);
     if (!_flux2_vae || !_flux2_vae->has_encoder()) {
@@ -861,6 +873,7 @@ VaeEncodeStage::ensure_loaded_()
     }
     load_note_(fmt("VaeEncodeStage('{}'): loading the MiniMax-H3 video VAE "
                    "(encoder) from '{}'", this->id(), vae_dir));
+    h3cfg.autotune = _autotune;
     _h3_vae = ws_override.empty()
                   ? genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg)
                   : genai::MetalMiniMaxH3VideoVae::load(ws, mc, h3cfg);
@@ -882,6 +895,7 @@ VaeEncodeStage::ensure_loaded_()
     }
     load_note_(fmt("VaeEncodeStage('{}'): loading Wan video VAE (encoder) "
                    "from '{}'", this->id(), vae_dir));
+    wcfg.autotune = _autotune;
     _wan_vae = genai::MetalWanVae::load(ws, mc, wcfg, /*with_encoder=*/true);
     if (!_wan_vae) {
       session()->error(fmt(
@@ -920,6 +934,7 @@ VaeEncodeStage::ensure_loaded_()
   load_note_(fmt(
       "VaeEncodeStage('{}'): loading Qwen-Image VAE encoder from '{}'",
       this->id(), vae_dir));
+  cfg.autotune = _autotune;
   _vae = genai::MetalKrea2Vae::load(ws, mc, cfg, /*with_encoder=*/true);
   if (!_vae || !_vae->has_encoder()) {
     session()->error(fmt(

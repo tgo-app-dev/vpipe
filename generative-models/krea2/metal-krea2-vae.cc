@@ -263,6 +263,7 @@ MetalKrea2Vae::set_accel(const Accel& a)
                  : a.i8_tier == 1 ? I8GemmContext::Tier::kFast
                                   : I8GemmContext::Tier::kAccurate);
     i8->set_token_rotation(a.i8_tier == 2);
+    i8->set_autotune(_cfg.autotune);
     // Kept only if it turned itself on (the kernels, the matrix cores).
     if (i8->enabled()) { _i8 = std::move(i8); }
   }
@@ -725,7 +726,7 @@ MetalKrea2Vae::autotune_mid_attn_(MetalCompute* mc, int C)
              const vae_mid_attn::Alloc& al, const vae_mid_attn::Release& re) {
         encode_mid_attn_(enc, kind, qq, kk, vv, oo, hw, c, sc, al, re);
       },
-      &detail);
+      &detail, /*verify=*/true, /*measure=*/_cfg.autotune);
   const double tune_ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
   if (mc->session() != nullptr && !detail.empty()) {
@@ -1570,6 +1571,11 @@ MetalKrea2Vae::autotune_conv3x3_(MetalCompute* mc,
   for (const auto& sh : shapes) {
     const int cin = std::get<0>(sh), cout = std::get<1>(sh);
     const int stride = std::get<2>(sh);
+    // Untuned: the route believed fastest here, nothing timed.
+    if (!_cfg.autotune) {
+      _conv_pick[sh] = vae_conv3x3::believed(mc->supports_matrix_cores());
+      continue;
+    }
     int H = std::min(256, std::max(probe_base,
                                    probe_base * (top / std::max(1, cout))));
     H -= H % (8 * stride);                       // whole 8x8 dest tiles

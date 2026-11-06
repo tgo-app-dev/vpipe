@@ -1405,6 +1405,21 @@ builtin_catalog_()
            "taeqi2_1_decoder.pth",
            "taeqi2_1_decoder.pth"}}),
      .name = "madebyollin/taeqi2_1"},
+    // TAEQI2.1-Tinier: the same latent space and RGBA head at about a
+    // quarter of the parameters (2.0M in the decoder against 7.6M) -- its
+    // 256- and 128-wide stages are ConvNeXt-style SuperBlocks, a
+    // depthwise 7x7 and a 1x1 bottleneck. Published on the Hub beside the
+    // full TAE's .safetensors; the repo calls it slightly faster and
+    // slightly lower in quality. Named apart: the key above is the full
+    // TAE's.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "TAE",
+     .variant = "taeqi2_1_tinier RGBA preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taeqi2_1",
+     .model_type = "qwen-image-21-tae",
+     .parent_model_type = "qwen-image-21",
+     .files = {"taeqi2_1_tinier.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "madebyollin/taeqi2_1_tinier"},
     // Qwen-Image-2.1's PROMPT REWRITERS: QwenLM's own instructions for
     // turning a request into a prompt (text-to-image) or an edit
     // instruction, for an assistant model to follow -- text, not weights,
