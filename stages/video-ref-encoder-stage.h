@@ -85,7 +85,12 @@ struct MediaProbe;
 //                        (`fps`, `sr`), which are REQUIRED and never
 //                        defaulted. Optional sideband: `short_edge`
 //                        for this one reference, `attach` to override
-//                        the stage's `attach_audio` for this beat. A
+//                        the stage's `attach_audio` for this beat,
+//                        `present: false` to give the DiT its rows
+//                        alone (no label, the prompt never reading it
+//                        -- a carried latent with no pixels so), and
+//                        on a one-frame carried latent `image: true`
+//                        (a still on the clock, not a clip). A
 //                        WIRED port beats every request; an empty
 //                        tensor is how it says "nothing this time".
 //
@@ -297,6 +302,23 @@ public:
   static bool
   media_from_beat(const TensorBeatPayload& tb, int n,
                   genai::minimax_h3::MediaReference* out, std::string* err);
+
+  // What a port beat carrying a VIDEO latent and NO PIXELS becomes. The
+  // conditioner presents a visual reference out of the vision tower's
+  // tokens, so a presented one has nothing to show it and must fold onto
+  // the reference before it (`attach`); not presented (`present: false`)
+  // it is a reference of its own, the DiT's alone. An attaching beat's
+  // `present` is not read: the reference it folds onto keeps its own.
+  // Public and static, as media_from_beat is, for a test with no model.
+  enum class CarriedLatent {
+    kNone,      // pixels, or no video latent: not this decision
+    kOwn,       // the DiT's alone, a reference of its own
+    kAttach,    // folds onto the reference before it
+    kRefused,   // presented, unattached: nothing for the tower to read
+  };
+  static CarriedLatent
+  carried_latent_route(const genai::minimax_h3::MediaReference& m,
+                       bool attach);
 
   // Bring a PORT-SOURCED soundtrack onto the audio VAE's sample rate.
   //

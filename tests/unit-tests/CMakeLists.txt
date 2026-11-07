@@ -219,6 +219,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-regenerate.cc
         minimax-h3-guide.cc
         pika-h3-flex.cc
+        minimax-h3-sampler.cc
         minimax-h3-pruned.cc
         vdn-geometry.cc
         vdn-delta-solve.cc

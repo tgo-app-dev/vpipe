@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <shared_mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -51,6 +52,39 @@ next_id_counter()
   return c;
 }
 
+// The innermost FfmpegLogCapture open on this thread, if any.
+thread_local FfmpegLogCapture* t_capture = nullptr;
+
+// AV_LOG_WARNING; this file is FFmpeg-header-free.
+constexpr int kAvLogWarning = 24;
+
+}
+
+FfmpegLogCapture::FfmpegLogCapture() noexcept : _prev(t_capture)
+{
+  t_capture = this;
+}
+
+FfmpegLogCapture::~FfmpegLogCapture()
+{
+  t_capture = _prev;
+}
+
+std::string
+FfmpegLogCapture::suffix() const
+{
+  return _text.empty() ? std::string() : " (FFmpeg: " + _text + ")";
+}
+
+void
+FfmpegLogCapture::note(int level, std::string_view tag,
+                       std::string_view msg)
+{
+  if (level > kAvLogWarning || _text.size() >= kMax) { return; }
+  std::string line = std::string(tag) + ": " + std::string(msg);
+  if (!_text.empty()) { _text += "; "; }
+  _text += line;
+  if (_text.size() > kMax) { _text.resize(kMax); }
 }
 
 LogTapHandle
@@ -95,6 +129,7 @@ ffmpeg_log_tap_dispatch(int              level,
   // still run in parallel (shared lock). The tap contract forbids
   // re-entering install / remove / dispatch, so holding the lock across
   // the callbacks cannot deadlock.
+  if (t_capture != nullptr) { t_capture->note(level, tag, msg); }
   std::shared_lock<std::shared_mutex> g(registry_mutex());
   for (const auto& e : registry()) {
     e.tap(level, tag, msg);

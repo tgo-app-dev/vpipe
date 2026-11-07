@@ -45,6 +45,10 @@ namespace vpipe {
 //   audio_seconds (real) -- soundtrack duration; 0 derives it from the
 //                              video's frames / fps, which is what keeps
 //                              the two modalities the same length
+//   sigmas (string) -- the VIDEO's sigmas as run, comma-separated, in
+//                              place of `steps` and the shifts' grid; the
+//                              audio's mapped through the two shifts, as
+//                              ComfyUI's DiT maps them
 //   linear_branch (string) -- VDN-H3 release root; turns every main
 //                              block's attention into the hybrid. A
 //                              SECOND checkpoint beside the DiT, not a
@@ -85,6 +89,8 @@ private:
   double _audio_seconds = 0.0;
   double _refine_start  = -1.0;
   double _refine_shift  = 6.0;
+  // The video's sigmas as run (`sigmas`); empty for the model's own grid.
+  std::vector<double> _sigmas;
   // The VDN-H3 release root, or empty for the stock attention.
   std::string _linear_branch;
   // The runtime-LoRA slots, `lora` .. `lora8` (stages/lora-slots.h).

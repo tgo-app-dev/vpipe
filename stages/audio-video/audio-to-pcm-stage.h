@@ -164,9 +164,12 @@ private:
   // Returns true on success.
   bool ensure_decoder_(const EncodedSegment& seg);
   // (Re-)allocate the swr context when input format changes.
+  // `in_layout` is the frame's own channel layout (may be null): taken
+  // past two channels where it is well-formed (ffmpeg_channel_layout).
   bool ensure_resampler_(int             in_sample_rate,
                          int             in_channels,
-                         enum AVSampleFormat in_fmt);
+                         enum AVSampleFormat in_fmt,
+                         const AVChannelLayout* in_layout);
   void teardown_decoder_();
   void teardown_resampler_();
 

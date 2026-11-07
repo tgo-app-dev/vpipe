@@ -77,6 +77,40 @@ write_wav_(int rate, int n, const char* name = "vpipe-ut-load-audio.wav")
   return p.string();
 }
 
+// The same sine on every one of `channels` channels, plain PCM: past
+// two channels a WAV with no speaker mask, whose layout nothing names.
+std::string
+write_wav_channels_(int rate, int n, int channels, const char* name)
+{
+  namespace fs = std::filesystem;
+  const fs::path p = fs::temp_directory_path() / name;
+  std::ofstream f(p, std::ios::binary);
+  if (!f) { return {}; }
+  auto u32 = [&](std::uint32_t v) { f.write((const char*)&v, 4); };
+  auto u16 = [&](std::uint16_t v) { f.write((const char*)&v, 2); };
+  const std::uint32_t data_bytes = (std::uint32_t)n * channels * 2;
+  f.write("RIFF", 4);
+  u32(36 + data_bytes);
+  f.write("WAVE", 4);
+  f.write("fmt ", 4);
+  u32(16);
+  u16(1);                                         // PCM
+  u16((std::uint16_t)channels);
+  u32((std::uint32_t)rate);
+  u32((std::uint32_t)rate * channels * 2);        // byte rate
+  u16((std::uint16_t)(channels * 2));             // block align
+  u16(16);
+  f.write("data", 4);
+  u32(data_bytes);
+  for (int i = 0; i < n; ++i) {
+    const double t = (double)i / rate;
+    const auto s = (std::int16_t)(12000.0 * std::sin(2.0 * M_PI * 440.0 * t));
+    for (int c = 0; c < channels; ++c) { u16((std::uint16_t)s); }
+  }
+  f.close();
+  return p.string();
+}
+
 class SegSink : public TypedStage<SegSink> {
 public:
   static constexpr const char* kTypeName = "ut-la-seg-sink";
@@ -423,6 +457,57 @@ TEST(audio_to_pcm, small_chunks_wait_for_a_slow_reader)
   EXPECT_TRUE(sink->samples + 512 >= (std::size_t)kSamples &&
               sink->samples <= (std::size_t)kSamples + 512);
   std::filesystem::remove(path);
+}
+
+// A source of more than two channels decodes, downmixed to the
+// stage's `channels`. Both the decoder's layout and the resampler's
+// input were MONO with the count overwritten -- a NATIVE layout naming
+// one channel -- and avcodec_open2 refused the decoder outright
+// ("Invalid channel layout", -22): no 5.1 file reached the resampler.
+TEST(audio_to_pcm, a_source_of_more_than_two_channels_decodes)
+{
+  const int kRate = 48000, kSamples = kRate;           // one second
+  for (const int channels : {6, 3}) {
+    const std::string name =
+        "vpipe-ut-a2p-" + std::to_string(channels) + "ch.wav";
+    const std::string path =
+        write_wav_channels_(kRate, kSamples, channels, name.c_str());
+    if (path.empty()) { return; }
+    Session sess;
+    auto pl = std::make_unique<Pipeline>("p", &sess);
+    auto lcfg = FlexData::make_object();
+    lcfg.as_object().insert_or_assign("input_url",
+                                      FlexData::make_string(path));
+    auto* la = static_cast<LoadAudioStage*>(pl->insert_stage(
+        std::make_unique<LoadAudioStage>(&sess, "la", std::vector<InEdge>{},
+                                         lcfg)));
+    auto pcfg = FlexData::make_object();
+    pcfg.as_object().insert_or_assign("output_sample_rate",
+                                      FlexData::make_int(16000));
+    pcfg.as_object().insert_or_assign("channels", FlexData::make_int(2));
+    pcfg.as_object().insert_or_assign("flush_on_eos",
+                                      FlexData::make_bool(true));
+    auto* tp = static_cast<AudioToPcmStage*>(pl->insert_stage(
+        std::make_unique<AudioToPcmStage>(&sess, "to-pcm",
+                                          std::vector<InEdge>{{la, 0}},
+                                          pcfg)));
+    auto* sink = static_cast<PcmSink*>(pl->insert_stage(
+        std::make_unique<PcmSink>(&sess, "sink",
+                                  std::vector<InEdge>{{tp, 0}},
+                                  FlexData::make_object())));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    // One second at 16 kHz, two channels.
+    std::printf("[audio_to_pcm] a %d-channel WAV: %zu samples (%d chunk(s)), "
+                "peak %.3f\n", channels, sink->samples, sink->beats,
+                sink->peak);
+    EXPECT_TRUE(sink->samples + 1024 >= (std::size_t)2 * 16000 &&
+                sink->samples <= (std::size_t)2 * 16000 + 1024);
+    EXPECT_TRUE(sink->peak > 0.1);
+    std::filesystem::remove(path);
+  }
 }
 
 // ---- start_s / duration_s: a WINDOW of a long file ------------------

@@ -73,6 +73,10 @@ inline constexpr std::string_view kDpmpp2m  = "dpmpp_2m";
 inline constexpr std::string_view kDpmppSde = "dpmpp_sde";
 inline constexpr std::string_view kDmd      = "dmd";
 inline constexpr std::string_view kUnipc    = "unipc";
+// ComfyUI's res_multistep: second order in log-sigma off the previous
+// step's x0, one forward a step. MiniMax-H3 runs it; the built-in
+// samplers of the other families do not, and run euler.
+inline constexpr std::string_view kResMultistep = "res_multistep";
 
 inline constexpr std::string_view kEta    = "eta";      // real
 inline constexpr std::string_view kSNoise = "s_noise";  // real

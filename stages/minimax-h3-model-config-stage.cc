@@ -7,6 +7,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-config-source.h"
+#include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 
 #include <string>
 #include <utility>
@@ -56,6 +57,24 @@ const ConfigKey kAttrs[] = {
    .doc = "a REFINE only: the shift its steps follow from "
           "`refine_start_sigma`, s x / (1 + (s - 1) x) over evenly spaced "
           "unshifted sigmas. 6 is the release's", .def_real = 6.0},
+  {.key = "sigmas", .type = ConfigType::String, .required = false,
+   .doc = "the VIDEO's sigmas AS RUN, in place of the grid `steps` and "
+          "the shifts make -- comma-separated, terminal 0 included, "
+          "strictly falling from at most 1: \"1, 0.9844, 0.9627, 0.9304, "
+          "0.878, 0.7579, 0.5527, 0.2369, 0\". A ComfyUI SIGMAS list pastes "
+          "as it is (brackets allowed): ComfyUI's are the video's too. One "
+          "forward per sigma but the last, so the list sets the step count "
+          "and generate-video's `steps` is not used. The audio's sigmas "
+          "follow as ComfyUI's DiT maps them: each taken back to the "
+          "shared unshifted grid through `video_shift`, then out through "
+          "`audio_shift`. Wins over an adapter's own grid (a flow map, a "
+          "sampling contract); on a refine they are its sigmas, the first "
+          "the level the clip is re-noised to. How each step is taken is "
+          "the sampler port's (diffusion-sampler-select), Euler by "
+          "default. A distillation was fitted to the grid it was trained "
+          "on, so a few-step adapter on another grid is off its training. "
+          "Empty (default): the model's own grid",
+   .def_str = ""},
   {.key = "linear_branch", .type = ConfigType::String, .required = false,
    .doc = "OPTIONAL VDN-H3 release root -- the directory holding its "
           "config.json and linear_branch/. Given one, every main block's "
@@ -222,9 +241,9 @@ const PortSpec kOports[] = {
    .doc = "MiniMax-H3 generation parameters as one FlexData object "
           "{model_family: minimax-h3, video_shift, audio_shift, "
           "condition_timestep, condition_audio_timestep, audio_seconds, "
-          "refine_start_sigma, refine_shift, +lora .. +lora8 and their "
-          "scales, +taomate, +preview_vae and its three knobs}, for a "
-          "generate-video model_config iport",
+          "refine_start_sigma, refine_shift, +sigmas (an array of reals), "
+          "+lora .. +lora8 and their scales, +taomate, +preview_vae and "
+          "its three knobs}, for a generate-video model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -263,6 +282,16 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _refine_start  = attr_real("refine_start_sigma");
   _refine_shift  = attr_real("refine_shift");
   _linear_branch = attr_str("linear_branch");
+  {
+    const std::string t = attr_str("sigmas");
+    std::string why;
+    if (!t.empty() &&
+        !genai::MiniMaxH3Scheduler::parse_sigmas(t, &_sigmas, &why)) {
+      fail_config(fmt(
+          "MiniMaxH3ModelConfigStage('{}'): sigmas: {} (got \"{}\")",
+          this->id(), why, t));
+    }
+  }
   for (int i = 0; i < lora_slots::kSlots; ++i) {
     LoraSlot& sl = _lora[(std::size_t)i];
     sl.path  = attr_str(lora_slots::kPath[i]);
@@ -348,6 +377,13 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   o.insert_or_assign("refine_start_sigma",
                      FlexData::make_real(_refine_start));
   o.insert_or_assign("refine_shift", FlexData::make_real(_refine_shift));
+  // Emitted only when SET: absent is the model's own grid.
+  if (!_sigmas.empty()) {
+    FlexData sg = FlexData::make_array();
+    auto a = sg.as_array();
+    for (double v : _sigmas) { a.push_back(FlexData::make_real(v)); }
+    o.insert_or_assign("sigmas", std::move(sg));
+  }
   // Emitted only when SET, for the reason the LoRA keys are: an empty
   // string would read as "the graph asked for no branch", which is
   // indistinguishable at the consumer from "the graph said nothing",
@@ -398,10 +434,18 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
     adapters += fmt("{} {} at {:.2f}", adapters.empty() ? ", runtime" : ",",
                     lora_slots::kPath[i], sl.scale)();
   }
+  std::string grid;
+  if (!_sigmas.empty()) {
+    for (double v : _sigmas) {
+      grid += fmt("{}{:.4g}", grid.empty() ? "" : ", ", v)();
+    }
+    grid = fmt(", the video's {} steps on sigmas [{}]", _sigmas.size() - 1,
+               grid)();
+  }
   session()->info(fmt(
-      "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}, condition "
+      "MiniMaxH3ModelConfigStage('{}'): shifts {:.1f}/{:.1f}{}, condition "
       "t {:.3f}/{:.3f}, audio {}{}{}", this->id(), _video_shift,
-      _audio_shift,
+      _audio_shift, grid,
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()
                            : std::string("as long as the video"),

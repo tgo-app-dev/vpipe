@@ -1,6 +1,7 @@
 #include "common/media-decode.h"
 
 #include "common/ffmpeg-libraries.h"
+#include "common/ffmpeg-log-tap.h"
 
 #include <algorithm>
 #include <cstring>
@@ -178,6 +179,9 @@ open_input_(const FFmpegLibraries*  libs,
             string*                 error)
 {
   in->libs = libs;
+  // A refusal's reason in FFmpeg's own words ("Invalid sample rate: 0"),
+  // which it states through av_log and not in its return code.
+  FfmpegLogCapture said;
   int rc = 0;
   if (path) {
     rc = libs->avformat().api.open_input(&in->fctx, path->c_str(),
@@ -212,12 +216,14 @@ open_input_(const FFmpegLibraries*  libs,
   }
   if (rc < 0) {
     // On failure open_input freed the AVFormatContext and nulled it.
-    set_err_(error, "open_input failed: " + av_err_(libs, rc));
+    set_err_(error, "open_input failed: " + av_err_(libs, rc) +
+                        said.suffix());
     return false;
   }
   rc = libs->avformat().api.find_stream_info(in->fctx, nullptr);
   if (rc < 0) {
-    set_err_(error, "find_stream_info failed: " + av_err_(libs, rc));
+    set_err_(error, "find_stream_info failed: " + av_err_(libs, rc) +
+                        said.suffix());
     return false;
   }
   return true;
@@ -260,9 +266,11 @@ open_decoder_(const FFmpegLibraries* libs,
     cctx.reset();
     return CctxPtr(nullptr, CctxDeleter{libs});
   }
+  FfmpegLogCapture said;
   rc = libs->avcodec().api.open2(cctx.get(), codec, nullptr);
   if (rc < 0) {
-    set_err_(error, "avcodec_open2 failed: " + av_err_(libs, rc));
+    set_err_(error, "avcodec_open2 failed: " + av_err_(libs, rc) +
+                        said.suffix());
     cctx.reset();
     return CctxPtr(nullptr, CctxDeleter{libs});
   }
@@ -459,17 +467,24 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
       return true;
     }
     swr.reset();
-    AVChannelLayout in_layout = AV_CHANNEL_LAYOUT_MONO;
-    if (f->ch_layout.nb_channels == 2) {
-      in_layout = AV_CHANNEL_LAYOUT_STEREO;
-    } else if (f->ch_layout.nb_channels > 2) {
-      in_layout.nb_channels = f->ch_layout.nb_channels;
-    }
-    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
-    if (out_channels == 2) {
-      const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-      out_layout = stereo;
-    }
+    // Past two channels the frame's own layout (ffmpeg_channel_layout):
+    // MONO with its count overwritten was refused, so a 5.1 source never
+    // decoded.
+    AVChannelLayout in_layout =
+        ffmpeg_channel_layout(f->ch_layout.nb_channels, &f->ch_layout);
+    AVChannelLayout out_layout = ffmpeg_channel_layout(out_channels);
+    // What swr was handed, and why it refused in FFmpeg's own words.
+    FfmpegLogCapture said;
+    auto refused = [&](const char* call, int code) {
+      const char* fname = libs->avutil().api.get_sample_fmt_name(ffmt);
+      return string(call) + " failed: " + av_err_(libs, code) + " -- in " +
+             std::to_string(f->sample_rate) + " Hz, " +
+             std::to_string(f->ch_layout.nb_channels) + " channel(s), " +
+             (fname != nullptr ? fname : "?") + "; out " +
+             std::to_string(target_sample_rate) + " Hz, " +
+             std::to_string(out_channels) + " channel(s), flt" +
+             said.suffix();
+    };
     SwrContext* sw = nullptr;
     int rc = libs->swresample().api.alloc_set_opts2(
         &sw,
@@ -477,13 +492,14 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
         &in_layout,  ffmt,              f->sample_rate,
         0, nullptr);
     if (rc < 0 || !sw) {
-      set_err_(error, "swr_alloc_set_opts2 failed");
+      if (sw) { libs->swresample().api.free(&sw); }
+      set_err_(error, refused("swr_alloc_set_opts2", rc));
       return false;
     }
     rc = libs->swresample().api.init(sw);
     if (rc < 0) {
       libs->swresample().api.free(&sw);
-      set_err_(error, "swr_init failed: " + av_err_(libs, rc));
+      set_err_(error, refused("swr_init", rc));
       return false;
     }
     swr.reset(sw);

@@ -204,10 +204,11 @@ second is the one that decides whether a small box survives:
   exactly the pressure that squeezes out the blocks a resident set is
   trying to keep.
 
-> **Trap: `F_NOCACHE` only bypasses the cache on a PAGE-ALIGNED file
-> offset, and a read that misses the alignment does not fail — it
-> silently falls back to the buffered path.** MEASURED with a clean
-> control, 4096 MB read from one file with `F_NOCACHE` set throughout:
+> **Trap: `F_NOCACHE` only bypasses the cache when the file offset AND
+> the destination address are both 4 KB-aligned, and a read that misses
+> either does not fail — it silently falls back to the buffered path.**
+> MEASURED with a clean control, 4096 MB read from one file with
+> `F_NOCACHE` set throughout:
 >
 > | file offset | file-backed pages gained |
 > |---|---|
@@ -215,16 +216,31 @@ second is the one that decides whether a small box survives:
 > | + 8 bytes | **+1813 MB** |
 > | + 4096 bytes | +0 MB |
 >
+> The destination counts as much as the file. MEASURED with `mincore`
+> over the file's own pages, 1 GB read at a page-aligned file offset: a
+> destination 8, 2048 or 4016 bytes off a page put **896 MB** of it in
+> the cache, one 4096 or 12288 bytes off none. The same misalignment on
+> both sides does not help (+80 / +80 cached 7/8 of it).
+>
 > A safetensors data section starts at `8 + header_len`, so its alignment
 > is whatever the header length happened to be, and every tensor in the
-> shard inherits it. MEASURED through the real loader on a misaligned
-> checkpoint: 6233 MB read grew the file cache by **6212 MB** — one for
-> one, on a path that sets `F_NOCACHE` on every read.
+> shard inherits it — and since a tensor's offset from its destination
+> is fixed by where it lies, a misaligned tensor can never be read
+> straight into page-aligned memory. MEASURED through the real loader on
+> a misaligned checkpoint: 6233 MB read grew the file cache by **6212
+> MB** — one for one, on a path that sets `F_NOCACHE` on every read.
 >
-> The read now stages through page boundaries and copies out, so the
-> same 6233 MB grows the cache by **1 MB**. You do not have to do
-> anything to get this; it is in the accessor. What you *do* have to do
-> is not build a second read path that skips it.
+> The read stages through 4 KB boundaries and copies out, so the same
+> 6233 MB grows the cache by **1 MB**. You do not have to do anything to
+> get this; it is in the accessor. What you *do* have to do is not build
+> a second read path that skips it.
+
+A read is also split into **1 MB pieces, four in flight**: one read at a
+time leaves a drive short of its rate. MEASURED on an M4 Pro, uncached,
+misaligned checkpoints: the internal SSD 3.9 → 4.8 GB/s, a Thunderbolt 5
+SSD 3.7–3.9 → 5.3–5.4 GB/s, near what either gives any read shape; a
+50-block MiniMax-H3 forward streamed from the latter, 61.6 GB of blocks,
+15.5–15.9 → 12.7–13.0 s. Eight in flight never beat four.
 
 ### Alignment, and the two costs of a misaligned pack
 

@@ -465,6 +465,18 @@ private:
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;
   genai::FlowSchedulerSpec _scheduler_spec;
+  // The sampler port read for MINIMAX-H3, which cannot run the shared
+  // FlowSampler and maps the spec's method onto its own scheduler's
+  // steps (genai::sampler_choice_from_spec). kAuto with nothing wired.
+  genai::SamplerChoice _h3_sampler;
+  // Said once a run: the update was dropped for a flow-map adapter, the
+  // config's sigmas replace the stage's `steps`.
+  bool _h3_sampler_flow_said = false;
+  bool _h3_sigmas_steps_said = false;
+  // The step count a MiniMax-H3 clip runs: its model config's `sigmas`
+  // set it when they are given (one forward a sigma but the last), else
+  // `steps`. Reads `_model_cfg`, so the plan and the run agree.
+  int h3_steps_() const;
 
   // The resident family's per-generation parameters, as ITS model layer
   // defines them. Both are held for the same reason the two DiTs are:

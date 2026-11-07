@@ -1836,8 +1836,10 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // chunked video decoder cannot read: `token_drop` spends the first
     // chunk priming the temporal window, so `decode_video` needs 7
     // latent frames and refuses 1 -- while the encoder turns a still
-    // into exactly 1. Only a checkpoint whose decoder was fine-tuned for
-    // it can decode this, and it declares that itself.
+    // into exactly 1. A checkpoint whose decoder was fine-tuned for it
+    // (it declares that itself) reads the token alone; the stock decoder
+    // reads it as a chunk of copies, as the reference's ComfyUI VAE does
+    // (`decode_image`).
     const bool one_frame = (LT == 1);
     if (one_frame && _h3_fast) {
       session()->warn(fmt(
@@ -1849,9 +1851,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     if (one_frame && !_h3_vae->can_decode_image()) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): this is a single-frame latent and the "
-          "loaded MiniMax-H3 VAE does not decode one -- its metadata "
-          "declares no 'h3_t1_direct'. Point hf_dir at an image-trained H3 "
-          "VAE (Mamad8/MiniMax-H3-Image-VAE); skipping", this->id()));
+          "loaded MiniMax-H3 decoder decodes neither a still nor a clip; "
+          "skipping", this->id()));
       co_return;
     }
 
@@ -1925,18 +1926,20 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // included.
       // The released decoder's clip (bf16) and the chunk it works in
       // beside it -- its tiles, their stitch, its ViT scratch.
-      // A single-frame-only decoder (P-H3-Image's) states its picture's
-      // working set -- the tiles, their stitch, a tile's ViT scratch --
-      // which is the figure generate-video's plan booked for it.
+      // A STILL states its picture's decode -- on the stock decoder a
+      // chunk of copies, one tile of it at all 20 frames until cut, the
+      // stitch, the widest tile's ViT scratch -- not the picture alone,
+      // which it had booked: 9 MB at 1024^2, where the decode MEASURED
+      // 119 MB (297 before only the kept frame was stitched). A single-
+      // frame-only decoder (P-H3-Image's) is always that, and it is the
+      // figure generate-video's plan booked for it.
       const bool image_only =
           !_h3_fast && !_h3_vae->config().decodes_video();
       const std::size_t need =
           (_h3_fast ? _h3_fast->scratch_bytes(LT, lh, lw)
-           : image_only
-               ? genai::MetalMiniMaxH3VideoVae::decode_working_bytes(
-                     _h3_vae->config(), 1, lh, lw)
-           : one_frame
-               ? px * 3 * 2
+           : (image_only || one_frame)
+               ? genai::MetalMiniMaxH3VideoVae::still_decode_bytes(
+                     _h3_vae->config(), lh, lw)
                : genai::MetalMiniMaxH3VideoVae::decode_video_bytes(
                      _h3_vae->config(), LT, lh, lw))
           + px * 3;                    // the stage's planar-U8 clip

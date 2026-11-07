@@ -62,16 +62,23 @@ constexpr const char* kRefPortDoc =
     "rate is for, so set the producer's rate to the VAE's (32000 for the "
     "released checkpoint) to be resampled once instead of twice. Optional "
     "sideband keys: `short_edge` for this one reference's canvas (0, the "
-    "default here, encodes it at the size it arrived), and `attach` on an "
+    "default here, encodes it at the size it arrived), `attach` on an "
     "audio beat to override the stage's `attach_audio` for that beat -- "
     "true to make it the SOUNDTRACK "
-    "of the preceding reference, false to decline where the config asked. "
+    "of the preceding reference, false to decline where the config asked "
+    "-- and `present: false` on any beat to give the DiT this reference "
+    "ALONE: its rows packed and on the clock as ever, but no label in the "
+    "prompt and no vision tower, the tags after it numbered without it "
+    "(what ComfyUI's RefMod \"Apply\" does with a stored reference). "
     "`latent: true` says the beat is ALREADY ENCODED -- generate-video's "
-    "own oports, cut by a load-tensor: f32 [z, frames, h, w] video rows "
-    "(with `attach: true` it folds onto the clip before it, whose pixels "
-    "still feed the conditioner) or f32 [2, channels, latents] soundtrack "
-    "rows (attached: that clip's soundtrack; else an audio reference) -- "
-    "the VAE skipped, the latent taken at its own length. "
+    "own oports, cut by a load-tensor, or a stored reference's latent: "
+    "f32 [z, frames, h, w] video rows (with `attach: true` it folds onto "
+    "the clip before it, whose pixels still feed the conditioner; with "
+    "`present: false` it is a reference of its own, and `image: true` "
+    "makes a one-frame latent a STILL, one slot on the clock, rather than "
+    "a one-frame clip) or f32 [2, channels, latents] soundtrack rows "
+    "(attached: that clip's soundtrack; else an audio reference) -- the "
+    "VAE skipped, the latent taken at its own length. "
     "A WIRED port must beat every request -- an empty tensor is how "
     "you say \"nothing this time\", because a silent port would renumber "
     "every reference after it and quietly change the request";
@@ -1259,6 +1266,9 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
   // tensor comes from.
   bool is_latent = false;
   sideband_bool_(tb.sideband, "latent", &is_latent);
+  // Presented to the conditioner, or the DiT's alone (MediaReference::
+  // presented); any reference may say so.
+  sideband_bool_(tb.sideband, "present", &out->presented);
   if (is_latent) {
     if (tb.dtype != TensorBeat::DType::F32) {
       return fail("a carried latent must be f32, got " +
@@ -1291,7 +1301,17 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
     if (z <= 0 || lt <= 0 || lh <= 0 || lw <= 0) {
       return fail("a carried latent is empty");
     }
-    out->kind          = h3::MediaReference::Kind::kVideo;
+    // A STILL's latent -- one frame, said so (`image`) -- is a picture
+    // on the clock, one integer slot, not a one-frame clip's 5/3 units:
+    // what it is when its pixels come with it.
+    bool still = false;
+    sideband_bool_(tb.sideband, "image", &still);
+    if (still && lt != 1) {
+      return fail("a carried latent said to be an image has " +
+                  std::to_string(lt) + " latent frames; a still has 1");
+    }
+    out->kind          = still ? h3::MediaReference::Kind::kImage
+                               : h3::MediaReference::Kind::kVideo;
     out->latent_z      = z;
     out->latent_frames = lt;
     out->latent_height = lh;
@@ -1418,6 +1438,15 @@ VideoRefEncoderStage::trim_soundtrack_to_frames(h3::MediaReference* m)
   }
   m->pcm.resize(C * keep);
   return true;
+}
+
+VideoRefEncoderStage::CarriedLatent
+VideoRefEncoderStage::carried_latent_route(const h3::MediaReference& m,
+                                           bool attach)
+{
+  if (!m.has_video_latent() || !m.rgb.empty()) { return CarriedLatent::kNone; }
+  if (attach) { return CarriedLatent::kAttach; }
+  return m.presented ? CarriedLatent::kRefused : CarriedLatent::kOwn;
 }
 
 // The audio VAE's rate is the only rate a reference soundtrack may be
@@ -1758,15 +1787,28 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     // the tower; the latent only replaces what the VAE would have
     // produced for the DiT -- which is the round trip worth removing,
     // since encode(decode(z)) recovers z at correlation 0.875 with a
-    // systematic 0.86 gain.
-    if (m.has_video_latent() && m.rgb.empty()) {
-      if (!attach) {
+    // systematic 0.86 gain. NOT PRESENTED (`present: false`), a latent
+    // is a reference of its own, the DiT's alone: the prompt never reads
+    // it, as ComfyUI's RefMod "Apply" hands a stored latent over.
+    const CarriedLatent route = carried_latent_route(m, attach);
+    if (route == CarriedLatent::kOwn) {
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): reference iport {} is a carried "
+          "latent [{}x{}x{}x{}] for the DiT alone -- not presented to the "
+          "conditioner", this->id(), refno, m.latent_z, m.latent_frames,
+          m.latent_height, m.latent_width));
+      refs.push_back(std::move(m));
+      continue;
+    }
+    if (route != CarriedLatent::kNone) {
+      if (route == CarriedLatent::kRefused) {
         session()->warn(fmt(
             "VideoRefEncoderStage('{}'): reference iport {} carries a "
             "latent but no pixels and does not ask to attach. A visual "
             "reference needs pixels for the conditioner; set `attach: "
             "true` in its sideband so the latent folds onto the picture "
-            "reference before it; skipping", this->id(), refno));
+            "reference before it, or `present: false` to give the DiT its "
+            "rows alone; skipping", this->id(), refno));
         co_return;
       }
       if (refs.empty()) {

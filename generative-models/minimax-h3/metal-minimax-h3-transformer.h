@@ -312,6 +312,13 @@ class MetalMiniMaxH3Transformer {
     // release's own grid for the step count (0.909375 at 3 steps).
     double refine_start_sigma = -1.0;
     double refine_shift       = 6.0;
+    // The VIDEO's sigmas AS RUN, terminal 0 included (`sigmas`: an array
+    // of numbers, or the comma-separated string a graph writes) -- in
+    // place of the grid `steps` and the shifts make, and so of the step
+    // count: one forward a sigma but the last. The audio's follow from
+    // them through the two shifts (DenoiseRequest::video_sigmas). Empty:
+    // the model's own grid.
+    std::vector<double> sigmas;
 
     // Parse the `minimax-h3-model-config` beat. Absent keys keep the
     // defaults above; `err` collects what was ignored, and is not fatal.

@@ -118,3 +118,44 @@ TEST(ffmpeg_log_tap, threaded_install_dispatch_remove)
   EXPECT_FALSE(fail.load());
   EXPECT_TRUE(global_count.load() == kThreads);
 }
+
+// What FFmpeg said on THIS thread, WARNING or worse, while a capture
+// lives: the reason a synchronous call refused. Another thread's lines
+// (a decoder concealing a frame) are not this call's and are not kept;
+// verbose lines are not reasons; scopes nest, the innermost collecting;
+// the text is bounded.
+TEST(ffmpeg_log_tap, a_capture_keeps_this_threads_reasons)
+{
+  {
+    FfmpegLogCapture cap;
+    ffmpeg_log_tap_dispatch(16, "SWR", "bad layout");          // ERROR
+    ffmpeg_log_tap_dispatch(40, "SWR", "verbose chatter");     // VERBOSE
+    std::thread other([] {
+      ffmpeg_log_tap_dispatch(16, "h264", "concealing errors");
+    });
+    other.join();
+    ffmpeg_log_tap_dispatch(24, "AVCodecContext", "a warning"); // WARNING
+    EXPECT_TRUE(cap.text() == "SWR: bad layout; AVCodecContext: a warning");
+    EXPECT_TRUE(cap.suffix() ==
+                " (FFmpeg: SWR: bad layout; AVCodecContext: a warning)");
+  }
+  {
+    FfmpegLogCapture outer;
+    {
+      FfmpegLogCapture inner;
+      ffmpeg_log_tap_dispatch(16, "a", "inner");
+      EXPECT_TRUE(inner.text() == "a: inner");
+    }
+    ffmpeg_log_tap_dispatch(16, "b", "outer");
+    EXPECT_TRUE(outer.text() == "b: outer");
+    EXPECT_TRUE(FfmpegLogCapture().suffix().empty());
+  }
+  {
+    FfmpegLogCapture cap;
+    const string line(200, 'x');
+    for (int i = 0; i < 50; ++i) { ffmpeg_log_tap_dispatch(16, "t", line); }
+    EXPECT_TRUE(cap.text().size() <= FfmpegLogCapture::kMax);
+  }
+  // No capture open: nothing to collect into, and nothing breaks.
+  ffmpeg_log_tap_dispatch(16, "SWR", "nobody listening");
+}

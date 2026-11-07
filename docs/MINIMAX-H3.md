@@ -27,6 +27,7 @@ arrives in **8–16 steps** instead of 30+.
 - [Step 2 — text to video and audio](#step-2--text-to-video-and-audio)
   - [The settings worth knowing](#the-settings-worth-knowing)
     - [Counting steps](#counting-steps)
+    - [Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken)
   - [How long it takes](#how-long-it-takes)
     - [Against h3.c](#against-h3c)
   - [Watching it form — live previews](#watching-it-form--live-previews)
@@ -46,6 +47,7 @@ arrives in **8–16 steps** instead of 30+.
     - [Writing the prompts](#writing-the-prompts)
     - [Joining the parts](#joining-the-parts)
     - [Making it your own](#making-it-your-own)
+    - [Carrying a part's own latents](#carrying-a-parts-own-latents)
   - [The released weights, either partition](#the-released-weights-either-partition)
   - [Fewer steps — the Turbo LoRA](#fewer-steps--the-turbo-lora)
     - [Get it](#get-it)
@@ -419,6 +421,7 @@ And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
 | `condition_timestep` | 1.0 | The level the pinned keyframe rows sit at. `1.0` is **clean** in this model's `t = 1 − sigma` convention. |
 | `condition_audio_timestep` | 1.0 | The same, for a Ref2VA reference **soundtrack**. |
 | `audio_seconds` | 0 | Audio length follows from `frames` and `fps`; set this only to override that. |
+| `sigmas` | — | The video's sigmas **as run**, in place of the grid `steps` and the shifts make — and so of the step count. A ComfyUI `SIGMAS` list pastes as it is. See [Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken). |
 
 These are H3's own knobs, so they live in an H3 stage rather than in
 `generate-video`, which keeps only what every video model answers to
@@ -455,6 +458,74 @@ follows ComfyUI and diffusers rather than the reference for two reasons:
 What the reference-style count would have given is still one number away:
 `steps: N` here is `num_inference_steps: N + 1` there, and the schedules
 are then identical.
+
+#### Your own grid, and how a step is taken
+
+By default a clip runs `steps` forwards over `linspace(1, 0, steps + 1)`,
+pushed through each modality's shift, and every step is an Euler step.
+That is the schedule MiniMax's reference and the Turbo adapters' own
+workflows use. Two settings change it, and they are independent:
+
+- **The grid** — `sigmas` on `minimax-h3-model-config`: the video's sigmas
+  as run, terminal `0` included, strictly falling from at most 1:
+
+  ```json
+  "sigmas": "1, 0.9844, 0.9627, 0.9304, 0.878, 0.7579, 0.5527, 0.2369, 0"
+  ```
+
+  One forward runs per sigma but the last, so this list is eight steps,
+  whatever `generate-video`'s `steps` says (the stage warns when the two
+  disagree). A ComfyUI `SIGMAS` list pastes as it is — brackets are
+  fine — because ComfyUI's sigmas are the video's too. The **audio's**
+  sigmas follow the way ComfyUI's H3 model derives them: each video sigma
+  is taken back to the shared unshifted grid through `video_shift`, then
+  out through `audio_shift`. So the two shifts still matter with a list of
+  your own: they decide where the audio sits. The list for the example
+  above, at shifts 12 / 3, puts the audio at 1, 0.940, 0.866, 0.770,
+  0.643, 0.439, 0.236, 0.072, 0.
+
+- **The update** — a `diffusion-sampler-select` stage wired to
+  `generate-video`'s `sampler` iport (port 3). H3 has its own scheduler and
+  maps the selector's `method` onto it. Each method below runs one forward
+  a step:
+
+  | `method` | what each step does |
+  |---|---|
+  | `euler` | the default: `x += (σ' − σ) · v`, deterministic |
+  | `dmd` | re-noising: the clean estimate `x0 = x + σ · v`, then put at the next sigma with **fresh** noise, `(1 − σ') · x0 + σ' · n` — the update a DMD-style few-step student is sampled with, and diffusers' `stochastic_sampling` |
+  | `res_multistep` | ComfyUI's: second order in log-sigma, off the previous step's `x0` |
+
+  `heun`, `dpmpp_2m` and `dpmpp_sde` are not offered for H3. `heun` and
+  `dpmpp_sde` take **two** forwards a step, which on a 33B model is twice
+  the cost of a step. A spec naming one is warned about and the default
+  runs. `eta` and `s_noise` are `dpmpp_sde`'s and are not read. The
+  re-noise draws from the clip's own seed, or from the selector's `seed`
+  when one is set.
+
+Where an adapter brings its own schedule, the two settings take
+precedence:
+
+- A [HyperFlow](#eight-steps--hyperflow) flow map's grid, or a
+  [Pika H3 Flex](#six-steps-any-reference--pika-h3-flex) sampling
+  contract's, is replaced by `sigmas` (the stage warns). A contract's
+  re-noising goes with it unless the sampler port names `dmd`.
+- A sampler port naming `euler` over a Pika contract keeps the contract's
+  grid and steps it by Euler.
+- A flow map's step **is** its jump to the next sigma, so under one only
+  `euler` runs, and anything else is warned about and dropped.
+- On a [refine](#a-draft-at-2k--open-h3-regenerate-2k), `sigmas` **are**
+  its sigmas. The first one is then the level the clip is re-noised to.
+- TaoMate-H3's streaming method takes neither setting: it runs its own
+  grid and steps.
+
+**A few-step adapter was fitted to a grid.** The Turbo LoRAs were
+distilled on the shifted `linspace` grid at their own shifts (see
+[Fewer steps](#fewer-steps--the-turbo-lora)), HyperFlow and Pika H3 Flex
+on grids of their own, so a grid of yours puts them off their training:
+it may look better on one shot and worse on the next. One thing a list changes that `steps` and the shifts
+cannot reach separately is the **last** step, which takes the clip from
+the last sigma straight to clean. The 8-step grid at shift 12 starts it at
+0.632; at shift 6, 0.462; at shift 12, 16 steps start it at 0.444.
 
 ### How long it takes
 
@@ -1139,7 +1210,11 @@ key. It matters because nothing downstream looks at the rate again: an
 i.e. 1.38× too fast, pitched up a fourth, and 1.38× too long against the
 clip it shares a rotary clock with — with every shape still valid.
 
-One optional sideband key: `short_edge` sets *this one reference's* canvas.
+Optional sideband keys: `short_edge` sets *this one reference's* canvas,
+`attach` folds a soundtrack onto the reference before it (below), `latent`
+says the beat is already encoded ([Carrying a part's own
+latents](#carrying-a-parts-own-latents)), and `present: false` gives the
+reference to the DiT alone ([below](#a-reference-for-the-dit-alone)).
 
 When the rate is not yours to set — the PCM arrives from a stage you did not
 configure, or one feed has to serve both this port and a 44.1 kHz mux — put an
@@ -1178,6 +1253,42 @@ Attaching to a **still** is allowed and warned about. It is a real request —
 a one-frame `.mp4` with an audio track comes through the `references` list the
 same way — but it is far more often a port wired in the wrong order, so the run
 says so rather than refusing something the other route permits.
+
+##### A reference for the DiT alone
+
+`present: false` in a beat's sideband keeps that reference out of the
+prompt. It gets no `<Picture i>` / `<Video k>` / `<Audio j>` block and no
+vision tower run, while its rows are packed and placed on the clock exactly as
+a presented reference's are: the DiT reads it, the conditioner never does. It
+is what ComfyUI's RefMod pack does with a stored reference in **Apply H3
+RefMod**, which appends the latents to the conditioning's references without
+telling the text encoder; its **H3 RefMod Text Encode** is the presented route.
+
+**Count only the presented references when you write tags.** The tags after an
+unpresented reference are numbered without it, so with two stills of which
+the first is for the DiT alone, the second is `<Picture 1>` and there is no
+`<Picture 2>`. A request whose references are all unpresented presents the
+prompt alone.
+
+It is also how a **carried latent with no pixels** comes in. A beat with
+`{latent: true, present: false}` is a reference of its own, with no VAE encode
+and no tower. A presented latent has to `attach` to the picture or clip before
+it, whose pixels feed the tower, because there is nothing else for the tower
+to read. A one-frame latent is a one-frame **clip** unless the beat also says
+`image: true`, which makes it a **still**: one slot on the clock, as the
+picture it was encoded from takes. `image: true` on a latent of more than one
+frame is refused.
+
+To *present* a stored still instead, decode it first: `vae-decode` reads a
+one-frame H3 latent on the stock video VAE, so the picture can go on a port of
+its own with the latent attached after it. The stock decoder cannot read the
+token alone. It decodes five copies of it as one chunk and keeps frame 3, the
+rule ComfyUI's `MiniMaxH3VideoVAE` follows: a photo round-tripped that way read
+33.0 dB, against 17.2 dB for the token alone. The fast decoder
+(`fast_decoder`) does not decode stills.
+
+`present` on a beat that attaches is not read: the reference it folds onto
+keeps its own.
 
 A **wired port must beat every request**; send an empty tensor to say "nothing
 this time". A port that could fall silent would renumber every reference after
@@ -1660,6 +1771,9 @@ Two ways to continue from them:
   (the audio VAE skipped). Time is axis 1 of the video latent
   `[z, T, H/16, W/16]` and axis 2 of the audio latent `[2, 32, n]`; 90
   frames are the last 27 latent frames and 150 audio latents.
+  With no pixels, `{latent: true, present: false}` hands the DiT the rows
+  alone and the prompt never names them ([A reference for the DiT
+  alone](#a-reference-for-the-dit-alone)).
 - **FL2VA, through the tail — a GUIDE.** `generate-video`'s ports 12
   (`guide_latent`) and 13 (`guide_audio_latent`) pin latent frames and
   their soundtrack where they lie in the clip being made, from pixel

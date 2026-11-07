@@ -18,6 +18,7 @@
 #include "common/session.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/ui-delegate-intf.h"
 #include "generative-models/shared/streamed-refill.h"
@@ -30,9 +31,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <mach/mach.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1197,10 +1202,19 @@ TEST(weight_set, reload_rearms_the_integrity_hash) {
 // REGRESSION to lockstep, not to certify a number).
 //
 //   vpipe_test --filter 'weight_set.streaming_reads_run_concurrently'
+//
+// ONE PIECE AT A TIME (VPIPE_PREAD_THREADS=1) for the measurement: a read
+// is itself several reads in flight now, so "1 thread" would already be
+// parallel and the ratio would say nothing about the lock -- MEASURED
+// 1.17-1.35x at the default against 1.84-2.00x one at a time, the 2
+// threads' time the same either way (90-103 ms).
 TEST(weight_set, streaming_reads_run_concurrently) {
   Session s;
   MetalCompute* mc = mc_(s);
   if (mc == nullptr) { return; }
+  const char* was = std::getenv("VPIPE_PREAD_THREADS");
+  const string saved = was != nullptr ? was : "";
+  ::setenv("VPIPE_PREAD_THREADS", "1", 1);
   // 4 MB: the order of a single quantised DiT block's codes, which is
   // what the streaming path actually re-reads per layer per step.
   BigCheckpoint ck(1024 * 1024);
@@ -1257,6 +1271,11 @@ TEST(weight_set, streaming_reads_run_concurrently) {
   // what this needs to catch is a regression to LOCKSTEP -- not to
   // certify any particular throughput.
   EXPECT_TRUE(speedup > 1.25);
+  if (saved.empty()) {
+    ::unsetenv("VPIPE_PREAD_THREADS");
+  } else {
+    ::setenv("VPIPE_PREAD_THREADS", saved.c_str(), 1);
+  }
 }
 
 // The cap parks rather than refuses. Parking hands pages to the kernel
@@ -1623,4 +1642,402 @@ TEST(weight_set, a_component_directory_opens_its_one_file) {
   EXPECT_FALSE(MetalLlamaWeights::open_model(two.string()).has_value());
 
   fs::remove_all(base, ec);
+}
+
+// A TENSOR READ IN PIECES LANDS BYTE FOR BYTE, WHATEVER THE ALIGNMENT.
+//
+// pread_into() cuts a tensor into 4 MB pieces on the file's 4 KB grid
+// and reads several at once: straight into the destination where the
+// file offset and the destination are both on the grid, through staging
+// buffers where either is not (F_NOCACHE caches the read otherwise).
+// Each is a boundary to get wrong -- a piece's first or last bytes, the
+// staged copy's offset, a tensor shorter than a page or than a piece,
+// the grid starting before the data section -- so the fixture holds
+// tensors either side of each, in a file whose data section starts on
+// the grid (tensors placed on it too) and one 80 bytes off it (packed),
+// read uncached and cached, into a page-aligned destination and one 8
+// bytes off, on 1, 4 and 8 threads. Guard bytes either side catch a
+// piece written past its tensor.
+namespace {
+
+std::uint8_t
+piece_byte_(std::size_t t, std::size_t i)
+{
+  const std::uint64_t h = (i + 1) * 0x9E3779B97F4A7C15ull + t * 0x1F3Dull;
+  return static_cast<std::uint8_t>(h >> 37);
+}
+
+const std::vector<std::size_t>&
+piece_sizes_()
+{
+  static const std::vector<std::size_t> s = {
+      1, 4095, 4096, 4097, 12345, (4u << 20) - 1, 4u << 20,
+      (4u << 20) + 1, (9u << 20) + 123, 13u << 20};
+  return s;
+}
+
+// `lead` is the data section's offset from the 4 KB grid; `on_grid`
+// places every tensor on it (else they are packed end to end).
+void
+write_piece_checkpoint_(const string& dir, std::size_t lead, bool on_grid)
+{
+  std::filesystem::create_directories(dir);
+  const auto& sz = piece_sizes_();
+  std::vector<std::size_t> off(sz.size());
+  std::size_t at = 0;
+  string hdr = "{";
+  for (std::size_t t = 0; t < sz.size(); ++t) {
+    if (on_grid) { at = (at + 4095) & ~std::size_t(4095); }
+    off[t] = at;
+    hdr += string(t ? "," : "") + "\"t" + to_string(t) +
+           "\":{\"dtype\":\"U8\",\"shape\":[" + to_string(sz[t]) +
+           "],\"data_offsets\":[" + to_string(at) + "," +
+           to_string(at + sz[t]) + "]}";
+    at += sz[t];
+  }
+  hdr += "}";
+  while ((8 + hdr.size()) % 4096 != lead) { hdr.push_back(' '); }
+  ofstream out(dir + "/model.safetensors", ios::binary);
+  const std::uint64_t n = hdr.size();
+  out.write(reinterpret_cast<const char*>(&n), 8);
+  out.write(hdr.data(), (streamsize)hdr.size());
+  std::vector<char> blob(at, 0);
+  for (std::size_t t = 0; t < sz.size(); ++t) {
+    for (std::size_t i = 0; i < sz[t]; ++i) {
+      blob[off[t] + i] = static_cast<char>(piece_byte_(t, i));
+    }
+  }
+  out.write(blob.data(), (streamsize)blob.size());
+}
+
+}  // namespace
+
+TEST(weight_set, a_tensor_read_in_pieces_lands_at_any_alignment)
+{
+  namespace fs = std::filesystem;
+  const string root = (fs::temp_directory_path() /
+                       ("vpipe-pieces-" + to_string(::getpid()))).string();
+  const char* was = std::getenv("VPIPE_PREAD_THREADS");
+  const string saved = was != nullptr ? was : "";
+  const auto& sz = piece_sizes_();
+  const std::size_t guard = 16384;
+  void* raw = nullptr;
+  ASSERT_TRUE(::posix_memalign(&raw, 16384, (16u << 20) + 2 * guard) == 0);
+  auto* mem = static_cast<std::uint8_t*>(raw);
+
+  struct Layout { std::size_t lead; bool on_grid; const char* tag; };
+  for (const Layout& L : {Layout{0, true, "grid"},
+                          Layout{80, false, "off"}}) {
+    const string dir = root + "/" + L.tag;
+    write_piece_checkpoint_(dir, L.lead, L.on_grid);
+    auto w = MetalLlamaWeights::open_model(dir);
+    ASSERT_TRUE(w.has_value());
+    if (!w.has_value()) { continue; }
+    int bad = 0, runs = 0;
+    for (const char* th : {"1", "4", "8"}) {
+      ::setenv("VPIPE_PREAD_THREADS", th, 1);
+      for (bool uncached : {true, false}) {
+        for (std::size_t shift : {std::size_t(0), std::size_t(8)}) {
+          for (std::size_t t = 0; t < sz.size(); ++t) {
+            const string nm = "t" + to_string(t);
+            std::memset(mem, 0xA5, sz[t] + 2 * guard + 8);
+            std::uint8_t* dst = mem + guard + shift;
+            ++runs;
+            if (!w->pread_into(nm, dst, sz[t], uncached)) {
+              ++bad;
+              std::printf("[pieces] %s t%zu (%zu B) threads %s uncached %d"
+                          " shift %zu: refused\n", L.tag, t, sz[t], th,
+                          (int)uncached, shift);
+              continue;
+            }
+            std::size_t wrong = 0;
+            for (std::size_t i = 0; i < sz[t]; ++i) {
+              wrong += dst[i] != piece_byte_(t, i);
+            }
+            std::size_t over = 0;
+            for (std::uint8_t* p = mem; p < dst; ++p) { over += *p != 0xA5; }
+            for (std::size_t i = 0; i < guard; ++i) {
+              over += dst[sz[t] + i] != 0xA5;
+            }
+            if (wrong != 0 || over != 0) {
+              ++bad;
+              std::printf("[pieces] %s t%zu (%zu B) threads %s uncached %d"
+                          " shift %zu: %zu wrong, %zu guard bytes hit\n",
+                          L.tag, t, sz[t], th, (int)uncached, shift,
+                          wrong, over);
+            }
+          }
+        }
+      }
+    }
+    EXPECT_TRUE(bad == 0);
+    EXPECT_TRUE(runs == 3 * 2 * 2 * (int)sz.size());
+    // A destination smaller than the tensor is refused, untouched.
+    std::memset(mem, 0xA5, 64);
+    EXPECT_FALSE(w->pread_into("t4", mem, sz[4] - 1));
+    EXPECT_TRUE(mem[0] == 0xA5);
+  }
+  if (saved.empty()) {
+    ::unsetenv("VPIPE_PREAD_THREADS");
+  } else {
+    ::setenv("VPIPE_PREAD_THREADS", saved.c_str(), 1);
+  }
+  std::free(raw);
+  std::error_code ec;
+  fs::remove_all(root, ec);
+}
+
+// WHAT THE READS HOLD: a staging pool, and nothing else after them.
+//
+// A staged read takes a 1 MB buffer per worker from a process-wide pool
+// and gives it back; the pool keeps at most 8 idle and frees the rest.
+// Freed large blocks can stay dirty in the footprint on macOS, so a
+// burst of concurrent callers -- each fanning out to four workers -- is
+// where memory could be left behind. Sixteen threads at once on a 13 MB
+// misaligned tensor (staged), then the process footprint against before:
+// what is left is the pool and the dispatch threads, not the burst.
+// MEASURED on an M4 Pro: +8.0-8.6 MB after one burst and after two; with
+// the buffers from posix_memalign (freed with free), +32-47 MB, growing.
+namespace {
+
+double
+footprint_mb_()
+{
+  task_vm_info_data_t vmi{};
+  mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) !=
+      KERN_SUCCESS) {
+    return 0.0;
+  }
+  return (double)vmi.phys_footprint / 1048576.0;
+}
+
+}  // namespace
+
+TEST(weight_set, piece_reads_leave_only_their_staging_pool)
+{
+  namespace fs = std::filesystem;
+  const string dir = (fs::temp_directory_path() /
+                      ("vpipe-pool-" + to_string(::getpid()))).string();
+  write_piece_checkpoint_(dir, 80, false);
+  auto w = MetalLlamaWeights::open_model(dir);
+  ASSERT_TRUE(w.has_value());
+  if (!w.has_value()) { return; }
+  const std::size_t n = piece_sizes_().back();
+  const int kThreads = 16, kReads = 24;
+  std::vector<std::vector<std::uint8_t>> dst(kThreads);
+  for (auto& d : dst) { d.assign(n, 0); }
+  std::atomic<int> bad{0};
+  auto burst = [&]() {
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kThreads; ++i) {
+      ts.emplace_back([&, i]() {
+        for (int r = 0; r < kReads; ++r) {
+          if (!w->pread_into("t9", dst[(std::size_t)i].data(), n)) { ++bad; }
+        }
+      });
+    }
+    for (auto& t : ts) { t.join(); }
+  };
+  const double f0 = footprint_mb_();
+  burst();
+  const double f1 = footprint_mb_();
+  burst();
+  const double f2 = footprint_mb_();
+  std::size_t wrong = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    wrong += dst[(std::size_t)kThreads - 1][i] != piece_byte_(9, i);
+  }
+  std::printf("[pool] %d threads x %d reads of %zu MB: footprint %+.1f MB "
+              "after the first burst, %+.1f after the second\n", kThreads,
+              kReads, n >> 20, f1 - f0, f2 - f0);
+  EXPECT_TRUE(bad.load() == 0);
+  EXPECT_TRUE(wrong == 0);
+  // The pool (8 MB) and the dispatch threads' stacks; a burst in flight
+  // holds up to 64 buffers, and any it left behind read on top.
+  EXPECT_TRUE(f1 - f0 < 12.0);
+  // And it does not grow with use.
+  EXPECT_TRUE(f2 - f1 < 2.0);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// WHAT THE PIECES BUY, ON A REAL CHECKPOINT AND A REAL DRIVE.
+//
+// VPIPE_PREAD_BENCH names a directory of .safetensors (a checkpoint, or
+// one component of it); unset, this skips. Each arm reads its own
+// tensors (1 MB and up, none read by another arm; any already in the
+// page cache are skipped, so every byte comes off the drive) through
+// pread_into uncached, VPIPE_PREAD_BENCH_GB of them (default 4), at
+// each thread count of VPIPE_PREAD_BENCH_ARMS (default "1,4,8"), the
+// order reversed each of VPIPE_PREAD_BENCH_ROUNDS rounds (default 2).
+// What it ASSERTS is the half that does not depend on the box: every arm
+// left its tensors out of the file cache -- mincore over the file's own
+// pages, before and after -- which is what F_NOCACHE is there for and
+// what a direct read at the wrong alignment silently breaks. The rates
+// are printed; whether one wins is the drive's answer.
+namespace {
+
+struct BenchTensor {
+  string        name;
+  string        file;
+  std::uint64_t off = 0;
+  std::size_t   nbytes = 0;
+};
+
+std::vector<BenchTensor>
+bench_tensors_(const string& dir)
+{
+  std::vector<BenchTensor> out;
+  std::vector<string> files;
+  for (const auto& e : std::filesystem::directory_iterator(dir)) {
+    if (e.path().extension() == ".safetensors") {
+      files.push_back(e.path().string());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  for (const string& f : files) {
+    ifstream in(f, ios::binary);
+    std::uint64_t n = 0;
+    in.read(reinterpret_cast<char*>(&n), 8);
+    string hdr(n, '\0');
+    in.read(hdr.data(), (streamsize)n);
+    const FlexData h = FlexData::from_json(hdr);
+    if (!h.is_object()) { continue; }
+    for (const auto& [k, v] : h.as_object()) {
+      if (k == "__metadata__") { continue; }
+      const FlexData offs = v.as_object().at("data_offsets");
+      const auto a = offs.as_array();
+      if (a.size() != 2) { continue; }
+      const std::uint64_t lo = a[0].as_uint(), hi = a[1].as_uint();
+      if (hi - lo < (1u << 20)) { continue; }
+      out.push_back({string(k), f, 8 + n + lo, (std::size_t)(hi - lo)});
+    }
+  }
+  std::sort(out.begin(), out.end(), [](const auto& x, const auto& y) {
+    return x.file != y.file ? x.file < y.file : x.off < y.off;
+  });
+  return out;
+}
+
+// Pages of [off, off + n) of `f` in the page cache.
+std::size_t
+resident_pages_(const string& f, std::uint64_t off, std::size_t n)
+{
+  const std::uint64_t page = (std::uint64_t)::getpagesize();
+  const std::uint64_t lo = off & ~(page - 1);
+  const std::size_t span = (std::size_t)((off + n - lo + page - 1) &
+                                         ~(page - 1));
+  const int fd = ::open(f.c_str(), O_RDONLY);
+  if (fd < 0) { return 0; }
+  void* m = ::mmap(nullptr, span, PROT_READ, MAP_SHARED, fd, (off_t)lo);
+  std::size_t res = 0;
+  if (m != MAP_FAILED) {
+    std::vector<char> v(span / page);
+    if (::mincore(m, span, v.data()) == 0) {
+      for (char c : v) { res += (c & MINCORE_INCORE) ? 1 : 0; }
+    }
+    ::munmap(m, span);
+  }
+  ::close(fd);
+  return res;
+}
+
+}  // namespace
+
+TEST(weight_set, pieces_read_at_the_drive_s_rate)
+{
+  const char* dir = std::getenv("VPIPE_PREAD_BENCH");
+  if (dir == nullptr || *dir == '\0') { return; }
+  auto env_num = [](const char* k, double d) {
+    const char* e = std::getenv(k);
+    return e != nullptr && *e != '\0' ? std::atof(e) : d;
+  };
+  const double quota = env_num("VPIPE_PREAD_BENCH_GB", 4.0) * 1e9;
+  const int rounds = (int)env_num("VPIPE_PREAD_BENCH_ROUNDS", 2);
+  std::vector<string> arms;
+  {
+    const char* e = std::getenv("VPIPE_PREAD_BENCH_ARMS");
+    string s = e != nullptr && *e != '\0' ? e : "1,4,8";
+    std::size_t at = 0;
+    while (at <= s.size()) {
+      const std::size_t c = std::min(s.find(',', at), s.size());
+      if (c > at) { arms.push_back(s.substr(at, c - at)); }
+      at = c + 1;
+    }
+  }
+  auto w = MetalLlamaWeights::open_model(dir);
+  ASSERT_TRUE(w.has_value());
+  if (!w.has_value()) { return; }
+  std::vector<BenchTensor> all = bench_tensors_(dir);
+  std::size_t biggest = 0;
+  for (const auto& t : all) { biggest = std::max(biggest, t.nbytes); }
+  ASSERT_TRUE(!all.empty());
+  void* raw = nullptr;
+  ASSERT_TRUE(::posix_memalign(&raw, 16384, biggest) == 0);
+  std::memset(raw, 1, biggest);
+  const char* was = std::getenv("VPIPE_PREAD_THREADS");
+  const string saved = was != nullptr ? was : "";
+
+  std::size_t cursor = 0;
+  std::map<string, std::vector<double>> rates;
+  for (int r = 0; r < rounds; ++r) {
+    for (std::size_t k = 0; k < arms.size(); ++k) {
+      const string& th = arms[r % 2 == 0 ? k : arms.size() - 1 - k];
+      std::vector<const BenchTensor*> mine;
+      double bytes = 0;
+      std::size_t warm = 0;
+      while (bytes < quota && cursor < all.size()) {
+        const BenchTensor& t = all[cursor++];
+        if (w->info(t.name) == nullptr) { continue; }
+        const std::size_t pages = (t.nbytes >> 14) + 1;
+        if (resident_pages_(t.file, t.off, t.nbytes) * 100 > pages) {
+          ++warm;
+          continue;
+        }
+        mine.push_back(&t);
+        bytes += (double)t.nbytes;
+      }
+      if (mine.empty()) {
+        std::printf("[pread_bench] out of cold tensors at round %d\n", r);
+        break;
+      }
+      ::setenv("VPIPE_PREAD_THREADS", th.c_str(), 1);
+      int fails = 0;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (const BenchTensor* t : mine) {
+        if (!w->pread_into(t->name, raw, biggest)) { ++fails; }
+      }
+      const double s = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t0).count();
+      std::size_t after = 0;
+      for (const BenchTensor* t : mine) {
+        after += resident_pages_(t->file, t->off, t->nbytes);
+      }
+      const double cached_mb = (double)after * 16384.0 / 1048576.0;
+      const double gbs = bytes / s / 1e9;
+      rates[th].push_back(gbs);
+      std::printf("[pread_bench] round %d threads %-2s %6.2f GB/s  %zu "
+                  "tensors %.2f GB  cached after %.1f MB  (skipped %zu "
+                  "warm)\n", r, th.c_str(), gbs, mine.size(), bytes / 1e9,
+                  cached_mb, warm);
+      EXPECT_TRUE(fails == 0);
+      // Out of the cache: under 0.1% of what was read. MEASURED: 0.0-0.1
+      // MB of 2-4 GB staged; read straight in at the tensors' own
+      // misalignment, 6.2 MB of 1 GB (0.6%) at half the rate -- 1 MB
+      // reads there; 8 MB ones cached 7/8 of themselves.
+      EXPECT_TRUE(cached_mb * 1048576.0 < 0.001 * bytes);
+    }
+  }
+  for (auto& [th, v] : rates) {
+    std::sort(v.begin(), v.end());
+    std::printf("[pread_bench] threads %-2s %.2f-%.2f GB/s over %zu arms\n",
+                th.c_str(), v.front(), v.back(), v.size());
+  }
+  if (saved.empty()) {
+    ::unsetenv("VPIPE_PREAD_THREADS");
+  } else {
+    ::setenv("VPIPE_PREAD_THREADS", saved.c_str(), 1);
+  }
+  std::free(raw);
 }

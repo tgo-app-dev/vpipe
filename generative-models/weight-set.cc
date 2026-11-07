@@ -95,11 +95,11 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
   // grew file pages by 0 MB at a page-aligned offset and 1813 MB at
   // offset+8.
   //
-  // THAT IS FIXED IN THE READER. pread_into() now reads on page
-  // boundaries into a staging buffer and copies the wanted bytes out,
-  // so the cache stays clean whatever the offset. What is left of the
-  // cost is one extra memcpy per streamed read, at memory bandwidth,
-  // against a drive -- and it is paid ONLY on the streaming path.
+  // THAT IS FIXED IN THE READER. pread_into() now reads on the 4 KB
+  // grid into staging buffers and copies the wanted bytes out, so the
+  // cache stays clean whatever the offset. What is left of the cost is
+  // one extra memcpy per uncached read, at memory bandwidth, and with
+  // four pieces in flight it hides under the other pieces' reads.
   //
   // So the warning had outlived its cause twice over. It fired at
   // OPEN, before anything knew whether this checkpoint would ever be
@@ -116,7 +116,7 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
     if (a.misaligned > 0 || a.bad_shards > 0) {
       session->log_debug(fmt(
           "weights: '{}' is not aligned ({}). Costs one extra copy per "
-          "STREAMED read (pread_into stages on page boundaries so the "
+          "STREAMED read (pread_into stages on 4 KB boundaries so the "
           "buffer cache stays clean); nothing on the mmap+memcpy path "
           "every preloaded model takes",
           dir,

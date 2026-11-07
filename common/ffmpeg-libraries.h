@@ -4,6 +4,11 @@
 #include "common/library-handle.h"
 #include "interfaces/log-sink-intf.h"
 
+#include <functional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavdevice/avdevice.h>
@@ -251,6 +256,64 @@ public:
     decltype(&::avdevice_register_all) register_all;
   } api{};
 };
+
+// A channel layout of `channels` channels that FFmpeg accepts. Mono and
+// stereo by name, as they always were; past two, `from` -- a decoded
+// frame's own -- when it is a well-formed NATIVE layout of that count
+// (plain data, so a copy is safe), else UNSPEC with the count, which the
+// decoder and the resampler both take (the resampler's default layout
+// for it). The old spelling, MONO with its count overwritten, is a
+// NATIVE layout whose mask names one channel: avcodec_open2 refused it
+// ("Invalid channel layout") and so did swr_alloc_set_opts2 ("ichl
+// channel layout is invalid"), so no source of more than two channels
+// decoded at all.
+inline AVChannelLayout
+ffmpeg_channel_layout(int channels, const AVChannelLayout* from = nullptr)
+{
+  if (channels == 1) { return AVChannelLayout(AV_CHANNEL_LAYOUT_MONO); }
+  if (channels == 2) { return AVChannelLayout(AV_CHANNEL_LAYOUT_STEREO); }
+  if (from != nullptr && from->order == AV_CHANNEL_ORDER_NATIVE &&
+      from->nb_channels == channels &&
+      __builtin_popcountll(from->u.mask) == channels) {
+    AVChannelLayout l = *from;
+    l.opaque = nullptr;
+    return l;
+  }
+  AVChannelLayout l{};
+  l.order = AV_CHANNEL_ORDER_UNSPEC;
+  l.nb_channels = channels > 0 ? channels : 0;
+  return l;
+}
+
+// WHICH FFmpeg TO LOAD: one whose MAJOR is the one these headers
+// describe. The code reads FFmpeg's structures in place -- an AVFrame's
+// sample_rate and ch_layout, an AVCodecContext's fields -- at the
+// offsets this build's headers give, and a major version is FFmpeg's
+// own word that those offsets moved. Loaded under another major they
+// read garbage: an audio frame's rate came back 0 and every resampler
+// refused ("Requested input sample rate 0 is invalid"), while video,
+// whose fields lead the struct, went on working. So a candidate of
+// another major is passed over, and when none matches the library is
+// refused with every candidate found named. VPIPE_FFMPEG_ANY_MAJOR=1
+// takes the first loadable one anyway, warned -- for trying an FFmpeg
+// known to keep the layouts this code reads.
+//
+// `probe` dlopens a candidate and returns its packed AV_VERSION_INT
+// (false when it does not load); separate so the rule is testable with
+// no second FFmpeg installed.
+struct FfmpegPick {
+  std::string path;          // empty: none taken
+  unsigned    version = 0;   // the taken one's packed version
+  bool        other_major = false;   // taken under VPIPE_FFMPEG_ANY_MAJOR
+  std::string why;           // the refusal, or the any-major warning
+  std::string passed_over;   // candidates of another major, named
+};
+FfmpegPick
+pick_ffmpeg_library(const std::vector<std::string>& candidates,
+                    std::string_view lib, unsigned want_major,
+                    bool any_major,
+                    const std::function<bool(const std::string&,
+                                             unsigned*)>& probe);
 
 // Composite owner: load all four libraries together. Loaded in
 // dependency order (avutil first, then avcodec / swresample, then

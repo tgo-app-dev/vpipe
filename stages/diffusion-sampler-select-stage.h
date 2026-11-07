@@ -23,10 +23,14 @@ namespace vpipe {
 // The spec is:
 //   { sampler:"flow_match", method, eta, s_noise, seed }
 // method  -- "euler" (default, token-exact turbo) | "heun" | "dpmpp_2m"
-//            | "dpmpp_sde"  (aliases "dpm++_2m"/"dpm++_sde" accepted).
+//            | "dpmpp_sde" | "dmd" | "res_multistep" (aliases
+//            "dpm++_2m"/"dpm++_sde" accepted). MiniMax-H3 maps euler,
+//            dmd and res_multistep onto its own scheduler's steps
+//            (genai::sampler_choice_from_spec); the other families' built-
+//            in samplers have no res_multistep and run euler.
 // eta     -- dpmpp_sde stochasticity (0 => deterministic).
 // s_noise -- dpmpp_sde added-noise scale.
-// seed    -- dpmpp_sde noise seed.
+// seed    -- dpmpp_sde / dmd noise seed (0: on MiniMax-H3, the clip's).
 //
 // This stage is MODEL-AGNOSTIC: it forwards the user's sampler choice and does
 // not read any model's scheduler config (the generate-image stage owns the

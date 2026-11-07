@@ -22,7 +22,7 @@ std::string
 canon_sampler_method(const std::string& m)
 {
   if (m == "euler" || m == "heun" || m == "dpmpp_2m" || m == "dpmpp_sde" ||
-      m == "dmd") {
+      m == "dmd" || m == "res_multistep") {
     return m;
   }
   if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
@@ -33,20 +33,27 @@ canon_sampler_method(const std::string& m)
 
 // The integrators this stage can select, for the editor's dropdown.
 constexpr SpecExtra kMethodChoices[] = {
-  {spec_key::kChoices, "euler,heun,dpmpp_2m,dpmpp_sde,dmd"},
+  {spec_key::kChoices, "euler,heun,dpmpp_2m,dpmpp_sde,dmd,res_multistep"},
 };
 const ConfigKey kAttrs[] = {
   {.key = "method", .type = ConfigType::String, .required = false,
    .doc = "sampler method: euler (default) | heun | dpmpp_2m | dpmpp_sde | "
           "dmd (the Boogu-Image Turbo few-step student: jump to x0 then "
-          "re-noise; only meaningful on a DMD-distilled checkpoint)",
+          "re-noise; only meaningful on a DMD-distilled checkpoint) | "
+          "res_multistep (ComfyUI's: second order off the previous step's "
+          "x0, one forward a step). heun and dpmpp_sde take TWO forwards a "
+          "step. minimax-h3 runs euler, dmd (its re-noising step) and "
+          "res_multistep, and warns and runs its default for the rest; the "
+          "other families' built-in samplers do not run res_multistep, and "
+          "run euler",
    .extra = kMethodChoices},
   {.key = "eta", .type = ConfigType::Real, .required = false,
    .doc = "dpmpp_sde stochasticity, 0 = deterministic (default 1.0)"},
   {.key = "s_noise", .type = ConfigType::Real, .required = false,
    .doc = "dpmpp_sde added-noise scale (default 1.0)"},
   {.key = "seed", .type = ConfigType::Int, .required = false,
-   .doc = "dpmpp_sde / dmd re-noise seed (default 0)"},
+   .doc = "dpmpp_sde / dmd re-noise seed (default 0). On minimax-h3, 0 "
+          "draws the re-noise from the clip's own seed"},
   {.key = "conditioning_sigma", .type = ConfigType::Real, .required = false,
    .doc = "dmd only: the sigma the schedule starts at, linspace(this, 1, "
           "steps+1)[:-1] (default 0.0 -- the reference edit setting; the "
@@ -60,9 +67,10 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "diffusion-sampler-select",
   .doc       = "Choose a diffusion sampler/integrator (euler | heun | dpmpp_2m "
-               "| dpmpp_sde | dmd) and emit its spec as a FlexData beat for a "
-               "generate-image stage to latch. Pairs with scheduler-select. "
-               "For the LLM token sampler see sampler-select instead. "
+               "| dpmpp_sde | dmd | res_multistep) and emit its spec as a "
+               "FlexData beat for a generate-image or generate-video stage "
+               "to latch. Pairs with scheduler-select. For the LLM token "
+               "sampler see sampler-select instead. "
                "0 in / 1 out (emits once).",
   .display_name = "Diffusion Sampler",
   .category  = StageCategory::Generative,
@@ -96,8 +104,8 @@ DiffusionSamplerSelectStage::DiffusionSamplerSelectStage(
     const std::string c = canon_sampler_method(_method);
     if (c.empty()) {
       fail_config(fmt("DiffusionSamplerSelectStage('{}'): method must be "
-                      "euler | heun | dpmpp_2m | dpmpp_sde | dmd (got "
-                      "\"{}\")",
+                      "euler | heun | dpmpp_2m | dpmpp_sde | dmd | "
+                      "res_multistep (got \"{}\")",
                       this->id(), _method));
     }
     _method = c;

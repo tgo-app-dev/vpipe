@@ -1,8 +1,10 @@
 #ifndef FFMPEG_LOG_TAP_H
 #define FFMPEG_LOG_TAP_H
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <string_view>
 
 namespace vpipe {
@@ -52,6 +54,38 @@ void remove_log_tap(LogTapHandle h);
 void ffmpeg_log_tap_dispatch(int              level,
                              std::string_view tag,
                              std::string_view msg);
+
+// What FFmpeg said ON THIS THREAD, WARNING or worse, while the scope
+// lives. A synchronous call that refuses -- swr_init, avcodec_open2,
+// avformat_open_input -- returns a bare AVERROR(EINVAL) and states its
+// reason ("Requested input sample rate 0 is invalid") only through
+// av_log, which reaches the session at VERBOSE. Open one of these
+// around the call and put text() in the caller's own error: the reason
+// travels with the failure, and FFmpeg's routine errors (a decoder
+// concealing a damaged frame, from its own threads) stay out of the
+// warnings. Only the emitting thread's lines are kept, so a decoder
+// running elsewhere cannot leak into this call's reason. Scopes nest;
+// the innermost one collects. At most kMax bytes are kept.
+class FfmpegLogCapture {
+public:
+  static constexpr std::size_t kMax = 1024;
+  FfmpegLogCapture() noexcept;
+  ~FfmpegLogCapture();
+  FfmpegLogCapture(const FfmpegLogCapture&) = delete;
+  FfmpegLogCapture& operator=(const FfmpegLogCapture&) = delete;
+
+  // "tag: message; tag: message" -- empty when FFmpeg said nothing.
+  const std::string& text() const noexcept { return _text; }
+  // " (FFmpeg: <text>)", or "" -- for appending to a message.
+  std::string suffix() const;
+
+  // Called by ffmpeg_log_tap_dispatch for this thread's scope.
+  void note(int level, std::string_view tag, std::string_view msg);
+
+private:
+  std::string       _text;
+  FfmpegLogCapture* _prev = nullptr;
+};
 
 }
 

@@ -572,13 +572,18 @@ const PortSpec kIports[] = {
   {.name = "sampler",
    .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select). Read "
           "by a family that samples from a spec, in place of the sampler it "
-          "ships; inert for a family that carries its own sampler and its "
-          "own schedule, which is shaped through that family's model-config "
-          "source instead",
+          "ships. minimax-h3 carries its own sampler and maps the spec's "
+          "method onto it: euler (its default), dmd (x0 at each sigma, "
+          "then fresh noise to the next) and res_multistep, one forward a "
+          "step each; any other method is warned about and its default "
+          "runs. Its grid is not the spec's but its model-config "
+          "source's (`sigmas`, or `steps` and the shifts)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "scheduler",
-   .doc = "OPTIONAL scheduler spec FlexData (scheduler-select). Inert for the "
-          "same families the sampler port is inert for",
+   .doc = "OPTIONAL scheduler spec FlexData (scheduler-select), for a "
+          "family that samples from a spec. Inert for minimax-h3, whose "
+          "grid is its model-config source's `sigmas` (the video's, as "
+          "run) or `steps` and the two shifts",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_latent0",
    .doc = "OPTIONAL image-to-video conditioning latent from vae-encode, in "
@@ -1565,6 +1570,15 @@ GenerateVideoStage::h3_plan_lora_files_() const
   return out;
 }
 
+int
+GenerateVideoStage::h3_steps_() const
+{
+  const auto p =
+      genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
+          _model_cfg);
+  return p.sigmas.size() >= 2 ? (int)p.sigmas.size() - 1 : _steps;
+}
+
 bool
 GenerateVideoStage::refines_() const
 {
@@ -1883,7 +1897,7 @@ GenerateVideoStage::declare_resources() const
     const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
     tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
     bool off_curve = false;
-    int bound_steps = _steps;
+    int bound_steps = h3_steps_();
     for (const std::string& f : h3_plan_lora_files_()) {
       const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr);
       off_curve = off_curve || (tc.pruned() && T::moves_time_embedding(f));
@@ -2162,6 +2176,13 @@ GenerateVideoStage::reset_run_state()
   _guide_beat.reset();
   _guide_audio_beat.reset();
   _guide_ignored_said = false;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // What the sampler port said is THIS run's; a relaunch whose graph
+  // no longer wires one runs the model's default.
+  _h3_sampler = genai::SamplerChoice{};
+  _h3_sampler_flow_said = false;
+  _h3_sigmas_steps_said = false;
+#endif
   // A relaunch may name another checkpoint, whose audio VAE encodes
   // silence to other latents.
   _h3_silence.clear();
@@ -2408,8 +2429,10 @@ GenerateVideoStage::resolve_config_()
     }
     session()->info(fmt(
         "GenerateVideoStage('{}'): MiniMax-H3 (video+audio) at {}x{}x{} "
-        "frames, {} steps, shifts {:.1f}/{:.1f}", this->id(), _width, _height,
-        _frames, _steps, _h3_params.video_shift, _h3_params.audio_shift));
+        "frames, {} steps{}, shifts {:.1f}/{:.1f}", this->id(), _width,
+        _height, _frames, h3_steps_(),
+        _h3_params.sigmas.empty() ? "" : " on the model config's sigmas",
+        _h3_params.video_shift, _h3_params.audio_shift));
     return;
   }
   std::string cerr;
@@ -2500,6 +2523,18 @@ GenerateVideoStage::apply_model_config_()
     _h3_params =
         genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
             _model_cfg, &perr);
+    // The config's `sigmas` set the step count. A graph that also says
+    // `steps`, and another number, is told which one runs.
+    if (!_h3_params.sigmas.empty() && !_h3_sigmas_steps_said &&
+        this->config().is_object() &&
+        this->config().as_object().contains("steps") &&
+        (int)_h3_params.sigmas.size() - 1 != _steps) {
+      _h3_sigmas_steps_said = true;
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): steps {} is NOT used -- the model "
+          "config's {} sigmas run {} steps", this->id(), _steps,
+          _h3_params.sigmas.size(), _h3_params.sigmas.size() - 1));
+    }
     // P-H3-Image's grid is FINAL -- the reference never shifts it
     // (`shift_provided_sigmas` false), whatever a model config's shifts
     // say: minimax-h3-model-config emits every key it has, so its 12 / 3
@@ -3043,7 +3078,8 @@ GenerateVideoStage::ensure_expert_(int which)
       // takes the larger -- read from the file's header, since nothing
       // is loaded yet. (Its (t, r) pairs still number at most four a
       // step: video, audio and the two pinned conditioning levels.)
-      int bound_steps = _steps;
+      // So does the model config's `sigmas`.
+      int bound_steps = h3_steps_();
       for (const H3LoraSlot& sl : _h3_lora) {
         if (sl.path.empty()) { continue; }
         std::string ignored;
@@ -3297,11 +3333,20 @@ GenerateVideoStage::ensure_expert_(int which)
       const auto& fm = *_h3_dit->flow_map();
       const int fsteps =
           fm.sigmas.empty() ? _steps : (int)fm.sigmas.size() - 1;
-      session()->info(fmt(
-          "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- "
-          "{}-step flow-map grid from the adapter (`steps: {}` is not "
-          "used while it is live), two-time embedding at gate {:.4g}",
-          this->id(), fm.version, fm.slot, fsteps, _steps, fm.gate));
+      if (!_h3_params.sigmas.empty()) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} was "
+            "distilled on its own {}-step grid; the model config's "
+            "sigmas replace it ({} steps), two-time embedding at gate "
+            "{:.4g}", this->id(), fm.version, fm.slot, fsteps,
+            _h3_params.sigmas.size() - 1, fm.gate));
+      } else {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- "
+            "{}-step flow-map grid from the adapter (`steps: {}` is not "
+            "used while it is live), two-time embedding at gate {:.4g}",
+            this->id(), fm.version, fm.slot, fsteps, _steps, fm.gate));
+      }
       // The grid is shifted with the GRAPH's shifts, as upstream does,
       // but it was distilled at the file's. Warn, do not override: the
       // shifts are a knob someone may be turning on purpose.
@@ -3323,13 +3368,27 @@ GenerateVideoStage::ensure_expert_(int which)
     // grid and update in place of `steps`; said once, here.
     if (_h3_dit) {
       if (const auto* sc = _h3_dit->sampling_contract()) {
-        session()->info(fmt(
-            "GenerateVideoStage('{}'): {} on lora slot {} -- its sampling "
-            "contract runs {} steps on its own grid{} (`steps: {}` is not "
-            "used while it is live)", this->id(),
-            sc->release.empty() ? std::string("an adapter") : sc->release,
-            sc->slot, (int)sc->sigmas.size() - 1,
-            sc->renoise ? ", fresh noise each step" : "", _steps));
+        const std::string who =
+            sc->release.empty() ? std::string("an adapter") : sc->release;
+        if (!_h3_params.sigmas.empty()) {
+          // An explicit grid replaces the contract whole: its grid AND
+          // its update, as an explicit sigma_grid always has.
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): {} on lora slot {} states a "
+              "{}-step sampling contract{}; the model config's sigmas "
+              "REPLACE it ({} steps, stepped by Euler unless the sampler "
+              "port names another -- `dmd` is its re-noising step)",
+              this->id(), who, sc->slot, (int)sc->sigmas.size() - 1,
+              sc->renoise ? " with fresh noise each step" : "",
+              _h3_params.sigmas.size() - 1));
+        } else {
+          session()->info(fmt(
+              "GenerateVideoStage('{}'): {} on lora slot {} -- its "
+              "sampling contract runs {} steps on its own grid{} (`steps: "
+              "{}` is not used while it is live)", this->id(), who,
+              sc->slot, (int)sc->sigmas.size() - 1,
+              sc->renoise ? ", fresh noise each step" : "", _steps));
+        }
         auto off = [](double want, double have) {
           return want > 0.0 && std::fabs(want - have) > 1e-6;
         };
@@ -4417,8 +4476,22 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     }
     _h3_dit->set_vdn_radius(narrow);
   }
+  // What the denoise holds on the host beside the forward: the latent
+  // state this stage owns (both modalities, references included) and the
+  // loop's own buffers -- the velocity read back, a re-noising or
+  // res_multistep step's extra state, MotionCache's residual, a preview's
+  // estimate. Physical RAM, paged if it must be; 384 bytes a video row
+  // each, ~51 MB a buffer at 2K x 124 frames.
+  const std::size_t host =
+      ((std::size_t)L.video_indices.size() * c.video_patch_elems() +
+       (std::size_t)L.audio_indices.size() * c.audio_channels) *
+          sizeof(float) +
+      genai::denoise_host_bytes(
+          L, c, genai::motion_cache::config_from_flex(&_accel).enabled,
+          _preview && _preview->active());
   const bool booked = preflight_h3_scratch_(L.seq_len, text_rows, L,
-                                            lh / c.patch_h, lw / c.patch_w);
+                                            lh / c.patch_h, lw / c.patch_w,
+                                            host);
   if (_h3_dit) { _h3_dit->set_vdn_radius(_vdn_range); }
   if (!booked) {
     return false;
@@ -4692,23 +4765,44 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     req.refine_sigmas = refine->sigmas;
     req.num_steps = (int)refine->sigmas.size() - 1;
   }
+  // The model config's sigmas, the video's as run, in place of every
+  // grid but a refine's (which took them already: see process()). The
+  // loop reads them off set_params() below.
+  const bool given = refine == nullptr && !_h3_params.sigmas.empty();
+  if (given) { req.num_steps = (int)_h3_params.sigmas.size() - 1; }
   // An adapter's sampling contract runs its own grid; the loop takes it
   // off the DiT, and the step count here is what Sage's int8 P*V start
   // and the progress bar read.
   const genai::MetalMiniMaxH3Transformer::SamplingContract* contract =
-      refine == nullptr ? _h3_dit->sampling_contract() : nullptr;
+      refine == nullptr && !given ? _h3_dit->sampling_contract() : nullptr;
   if (contract != nullptr) {
     req.num_steps = (int)contract->sigmas.size() - 1;
   }
   // P-H3-Image's grid, AS RUN (its shifts are 1: see apply_model_config_)
   // -- 8 forwards, whatever `steps` says. An adapter's contract or a
   // refine would name another; neither rides this model.
-  if (_ph3 && refine == nullptr && contract == nullptr) {
+  if (_ph3 && refine == nullptr && contract == nullptr && !given) {
     req.sigma_grid = _ph3_manifest.sample_sigmas;
     req.num_steps = (int)req.sigma_grid.size() - 1;
   }
-  // The re-noising sampler's fresh noise follows the clip's seed.
-  req.seed = _seed;
+  // How a step is taken, as the sampler port said. A flow map's step is
+  // its jump, Euler; anything else is said once and dropped.
+  req.update = _h3_sampler.update;
+  if (_h3_dit->two_time_active() &&
+      (req.update == genai::StepUpdate::kRenoise ||
+       req.update == genai::StepUpdate::kResMultistep)) {
+    if (!_h3_sampler_flow_said) {
+      _h3_sampler_flow_said = true;
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the sampler port's '{}' is IGNORED -- "
+          "the flow-map adapter on the DiT steps by its jump to the next "
+          "sigma, which is Euler", this->id(), _h3_sampler.method));
+    }
+    req.update = genai::StepUpdate::kAuto;
+  }
+  // The re-noising sampler's fresh noise follows the clip's seed, unless
+  // the sampler spec names one.
+  req.seed = _h3_sampler.seed != 0 ? _h3_sampler.seed : _seed;
   // VDN's hybrid attention needs the target's grid; without a branch
   // attached the transformer ignores it. Patches, not pixels -- the same
   // division build_packed_sequence made to lay the rows out, so the two
@@ -4732,9 +4826,10 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // forward per step. A live flow-map adapter runs its own grid, so the
   // bar starts at THAT count rather than jumping to it after step one.
   int bar_steps =
-      refine != nullptr || contract != nullptr || _ph3 ? req.num_steps
-                                                       : _steps;
-  if (refine == nullptr && _h3_dit->two_time_active() &&
+      refine != nullptr || contract != nullptr || _ph3 || given
+          ? req.num_steps
+          : _steps;
+  if (refine == nullptr && !given && _h3_dit->two_time_active() &&
       _h3_dit->flow_map() != nullptr &&
       !_h3_dit->flow_map()->sigmas.empty()) {
     bar_steps = (int)_h3_dit->flow_map()->sigmas.size() - 1;
@@ -4904,7 +4999,7 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
   session()->info(fmt(
       "GenerateVideoStage('{}'): TaoMate-H3 -- {} request(s) of 5 s, {} "
       "native frames at {}x{}; base-model audio teacher, then 4 chunks x "
-      "(3 steps + a commit) a request; clean-K/V cache {}{}",
+      "(3 steps + a commit) a request; clean-K/V cache {}{}{}",
       this->id(), R, native, _width, _height,
       kv_disk ? fmt("on disk ({}), {} MB held for it", kv_bits == 8
                                                           ? "8-bit"
@@ -4914,7 +5009,12 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
       _steps > 0 && _steps != 3
           ? fmt("; `steps` {} does not apply (the method is 3 a chunk)",
                 _steps)()
-          : std::string()));
+          : std::string(),
+      !_h3_params.sigmas.empty() ||
+              _h3_sampler.update != genai::StepUpdate::kAuto
+          ? "; the model config's sigmas and the sampler port do not "
+            "apply either (the method runs its own grid and steps)"
+          : ""));
 
   // The longest forward the run makes is request 0's first chunk; the
   // preflight judges the box against it plus the cache, and declares
@@ -5047,11 +5147,34 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     if (round.note(took)) { ctx.signal_done(); co_return; }
     if (const auto* sfd = took == Took::kFresh
             ? dynamic_cast<const FlexDataPayload*>(sb.get()) : nullptr) {
-      std::string serr;
-      _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
-      if (!serr.empty()) {
-        session()->warn(fmt("GenerateVideoStage('{}'): sampler spec: {}",
-                            this->id(), serr));
+      if (_family == "minimax-h3") {
+        // Its own scheduler's steps, by the spec's method -- a method it
+        // does not run is said, and its default runs.
+        std::string why;
+        if (genai::sampler_choice_from_spec(sfd->data, &_h3_sampler,
+                                            &why)) {
+          session()->info(fmt(
+              "GenerateVideoStage('{}'): sampler '{}' from the sampler "
+              "port -- minimax-h3 steps by {}{}{}", this->id(),
+              _h3_sampler.method,
+              genai::step_update_name(_h3_sampler.update),
+              _h3_sampler.seed != 0
+                  ? fmt(", re-noise seed {}", _h3_sampler.seed)()
+                  : std::string(),
+              _h3_sampler.note.empty() ? std::string()
+                                       : "; " + _h3_sampler.note));
+        } else {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): sampler spec: {}; the model's "
+              "default runs", this->id(), why));
+        }
+      } else {
+        std::string serr;
+        _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
+        if (!serr.empty()) {
+          session()->warn(fmt("GenerateVideoStage('{}'): sampler spec: {}",
+                              this->id(), serr));
+        }
       }
     }
   }
@@ -5080,9 +5203,9 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         if (_family == "minimax-h3") {
           session()->warn(fmt(
               "GenerateVideoStage('{}'): the wired scheduler's {} steps are "
-              "NOT used -- minimax-h3 runs its own schedule, at this "
-              "stage's steps {}", this->id(), _scheduler_spec.steps,
-              _steps));
+              "NOT used -- minimax-h3 runs its own schedule, {} steps (a "
+              "grid of its own goes in its model config's `sigmas`)",
+              this->id(), _scheduler_spec.steps, h3_steps_()));
         } else {
           session()->warn(fmt(
               "GenerateVideoStage('{}'): steps {} is IGNORED -- the wired "
@@ -5610,8 +5733,13 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           rfps = io.at(sideband::kFps).as_real(rfps);
         }
       }
-      refine.sigmas = genai::MiniMaxH3Scheduler::refine_sigmas(
-          _steps, _h3_params.refine_start_sigma, _h3_params.refine_shift);
+      // The model config's sigmas, when it names them, ARE a refine's:
+      // the video's as run, the first the level it is re-noised to.
+      refine.sigmas = !_h3_params.sigmas.empty()
+          ? _h3_params.sigmas
+          : genai::MiniMaxH3Scheduler::refine_sigmas(
+                _steps, _h3_params.refine_start_sigma,
+                _h3_params.refine_shift);
       int salat = 0;
       if (refine.frames <= 0 || refine.sigmas.size() < 2 ||
           !h3_silence_rows_(refine.frames, rfps, &refine.audio_rows,

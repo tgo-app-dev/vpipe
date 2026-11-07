@@ -7,12 +7,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 extern "C" {
 #include <libavutil/log.h>
+// Each library's own VERSION_MAJOR: what this build's headers describe.
+#include <libavcodec/version.h>
+#include <libavdevice/version.h>
+#include <libavfilter/version.h>
+#include <libavformat/version.h>
+#include <libavutil/version.h>
+#include <libswresample/version.h>
+#include <libswscale/version.h>
 }
 
 using namespace std;
@@ -68,6 +77,11 @@ ffmpeg_log_cb_(void* avcl, int level, const char* fmt_str, va_list vl)
   const LogSinkIntf* s =
     g_ff_log_target.load(std::memory_order_acquire);
   if (s) {
+    // Verbose, ERRORs included: a decoder concealing a damaged frame
+    // says so at ERROR, from its own threads, for every such frame. The
+    // reason a SYNCHRONOUS call refused is carried by the caller instead
+    // -- FfmpegLogCapture (ffmpeg-log-tap.h) collects this thread's
+    // lines around the call and its error message ends with them.
     s->log_verbose(fmt("[ffmpeg:{}] {}", class_name, msg_view));
   }
 
@@ -250,36 +264,126 @@ ffmpeg_refused_()
   return v != nullptr && *v != '\0' && string_view(v) != "0";
 }
 
+// VPIPE_FFMPEG_ANY_MAJOR=1: load an FFmpeg of another major (see
+// pick_ffmpeg_library).
+bool
+ffmpeg_any_major_()
+{
+  const char* v = ::getenv("VPIPE_FFMPEG_ANY_MAJOR");
+  return v != nullptr && *v != '\0' && string_view(v) != "0";
+}
+
+string
+version_string_(unsigned v)
+{
+  return std::to_string((v >> 16) & 0xff) + "." +
+         std::to_string((v >> 8) & 0xff) + "." + std::to_string(v & 0xff);
+}
+
 template <size_t N>
 string
-find_first_loadable_(const LogSinkIntf*  session,
-                     const char* const   (&candidates)[N],
-                     string_view         lib_name)
+find_first_loadable_(const LogSinkIntf*      session,
+                     const char* const       (&candidates)[N],
+                     string_view             lib_name,
+                     const char*             version_symbol,
+                     unsigned                want_major,
+                     LibraryHandle::LoadMode mode)
 {
   if (ffmpeg_refused_()) {
     return "VPIPE_NO_FFMPEG";
   }
-  for (const string& c : preferred_candidates_(lib_name)) {
-    void* h = ::dlopen(c.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (h) {
-      ::dlclose(h);
-      session->log_normal(fmt("{}: using '{}'", lib_name, c));
-      return c;
+  vector<string> all = preferred_candidates_(lib_name);
+  for (const char* c : candidates) { all.emplace_back(c); }
+  // Loads it, reads its version, lets it go: LibraryHandle opens the
+  // pick again, which the loader's reference count makes free.
+  auto probe = [version_symbol](const string& path, unsigned* version) {
+    void* h = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (h == nullptr) { return false; }
+    using VersionFn = unsigned (*)();
+    auto fn = reinterpret_cast<VersionFn>(::dlsym(h, version_symbol));
+    *version = fn != nullptr ? fn() : 0u;
+    ::dlclose(h);
+    return true;
+  };
+  const FfmpegPick pick = pick_ffmpeg_library(all, lib_name, want_major,
+                                              ffmpeg_any_major_(), probe);
+  if (!pick.path.empty()) {
+    if (session != nullptr) {
+      session->log_normal(fmt("{}: using '{}' ({})", lib_name, pick.path,
+                              version_string_(pick.version)));
+      if (!pick.passed_over.empty()) {
+        session->log_normal(fmt(
+            "{}: passed over {} -- not major {}, this build's", lib_name,
+            pick.passed_over, want_major));
+      }
+      if (pick.other_major) { session->warn(fmt("{}", pick.why)); }
     }
+    return pick.path;
   }
-  for (const char* c : candidates) {
-    void* h = ::dlopen(c, RTLD_NOW | RTLD_LOCAL);
-    if (h) {
-      ::dlclose(h);
-      session->log_normal(fmt("{}: using '{}'", lib_name, c));
-      return string(c);
+  if (!pick.why.empty()) {
+    // error() throws for a Required library, as a failed dlopen does.
+    if (session != nullptr) {
+      if (mode == LibraryHandle::LoadMode::Required) {
+        session->error(fmt("{}", pick.why));
+      } else {
+        session->warn(fmt("{}", pick.why));
+      }
     }
+    return "VPIPE_FFMPEG_MAJOR_MISMATCH";
   }
-  // Hand the canonical bare soname back so LibraryHandle's failure
-  // path produces a meaningful error message.
+  // Nothing loads: hand the canonical bare soname back so
+  // LibraryHandle's failure path produces a meaningful error message.
   return string(candidates[0]);
 }
 
+}
+
+FfmpegPick
+pick_ffmpeg_library(const vector<string>& candidates, string_view lib,
+                    unsigned want_major, bool any_major,
+                    const function<bool(const string&, unsigned*)>& probe)
+{
+  FfmpegPick out;
+  string found;              // every loadable one of another major
+  string first_other;
+  unsigned first_other_v = 0;
+  for (const string& c : candidates) {
+    unsigned v = 0;
+    if (!probe(c, &v)) { continue; }
+    const unsigned major = (v >> 16) & 0xff;
+    if (major == want_major) {
+      out.path = c;
+      out.version = v;
+      out.passed_over = found;
+      return out;
+    }
+    if (first_other.empty()) {
+      first_other = c;
+      first_other_v = v;
+    }
+    found += (found.empty() ? "" : ", ") + string("'") + c + "' " +
+             (v != 0 ? version_string_(v) : string("(no version)"));
+  }
+  if (first_other.empty()) { return out; }   // nothing loads at all
+  const string want = std::to_string(want_major);
+  if (any_major) {
+    out.path = first_other;
+    out.version = first_other_v;
+    out.other_major = true;
+    out.why = string(lib) + ": '" + first_other + "' is major " +
+              std::to_string((first_other_v >> 16) & 0xff) + " and this "
+              "build's FFmpeg headers are major " + want + "; loaded "
+              "anyway (VPIPE_FFMPEG_ANY_MAJOR) -- FFmpeg's structures are "
+              "read at the offsets those headers give";
+    return out;
+  }
+  out.why = string(lib) + ": no FFmpeg of major " + want + " -- the "
+            "major this build's headers describe, and the only one whose "
+            "structures it reads correctly; found " + found + ". Install "
+            "that FFmpeg (or point VPIPE_FFMPEG_DIR at one), or rebuild "
+            "against the one installed. VPIPE_FFMPEG_ANY_MAJOR=1 loads it "
+            "anyway";
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -288,7 +392,8 @@ find_first_loadable_(const LogSinkIntf*  session,
 
 LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvUtilCandidates,
-                                          "libavutil"),
+                                          "libavutil", "avutil_version",
+                                          LIBAVUTIL_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -348,7 +453,8 @@ LibAvUtil::version_micro() const noexcept
 
 LibAvCodec::LibAvCodec(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvCodecCandidates,
-                                          "libavcodec"),
+                                          "libavcodec", "avcodec_version",
+                                          LIBAVCODEC_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -408,7 +514,8 @@ LibAvCodec::version_micro() const noexcept
 
 LibAvFormat::LibAvFormat(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvFormatCandidates,
-                                          "libavformat"),
+                                          "libavformat", "avformat_version",
+                                          LIBAVFORMAT_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -469,7 +576,8 @@ LibAvFormat::version_micro() const noexcept
 
 LibSwResample::LibSwResample(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kSwResampleCandidates,
-                                          "libswresample"),
+                                          "libswresample", "swresample_version",
+                                          LIBSWRESAMPLE_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -514,7 +622,8 @@ LibSwResample::version_micro() const noexcept
 
 LibSwScale::LibSwScale(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kSwScaleCandidates,
-                                          "libswscale"),
+                                          "libswscale", "swscale_version",
+                                          LIBSWSCALE_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -559,7 +668,8 @@ LibSwScale::version_micro() const noexcept
 
 LibAvFilter::LibAvFilter(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvFilterCandidates,
-                                          "libavfilter"),
+                                          "libavfilter", "avfilter_version",
+                                          LIBAVFILTER_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -609,7 +719,8 @@ LibAvFilter::version_micro() const noexcept
 
 LibAvDevice::LibAvDevice(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvDeviceCandidates,
-                                          "libavdevice"),
+                                          "libavdevice", "avdevice_version",
+                                          LIBAVDEVICE_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {

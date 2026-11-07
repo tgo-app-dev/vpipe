@@ -182,6 +182,13 @@ public:
   // tensors: 27 us at 10 KB, so a block's norms and scales can come the
   // same way as its matrices.
   //
+  // A tensor is read in 1 MB pieces, four in flight (VPIPE_PREAD_THREADS
+  // the A/B): one read at a time left an M4 Pro's internal SSD and a
+  // Thunderbolt 5 one 1.2x and 1.4x short of their rates. An uncached
+  // read whose file offset or destination is off a 4 KB boundary -- a
+  // misaligned checkpoint, as every large Hub file checked was -- is staged
+  // through page-aligned buffers, since F_NOCACHE caches it otherwise.
+  //
   // `uncached` sets F_NOCACHE, which does NOT make the read faster (a
   // cached pread measured identically) -- it keeps the read from growing
   // the file cache. For a model that re-reads its whole checkpoint every

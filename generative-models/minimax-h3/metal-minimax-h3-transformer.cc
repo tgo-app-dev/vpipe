@@ -1,5 +1,6 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "common/memory-owner.h"
+#include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
 
 #include "common/flex-data.h"
@@ -493,6 +494,39 @@ MetalMiniMaxH3Transformer::GenerationParams::from_flex(const FlexData& fd,
   }
   if (o.contains("refine_shift")) {
     p.refine_shift = o.at("refine_shift").as_real(p.refine_shift);
+  }
+  // The video's sigmas as run: an array of numbers, or the string a
+  // graph writes. A list that is not a schedule is said and dropped --
+  // the model's own grid runs -- never half-taken.
+  if (o.contains("sigmas")) {
+    const FlexData& sg = o.at("sigmas");
+    std::string why;
+    bool ok = true;
+    if (sg.is_string()) {
+      ok = MiniMaxH3Scheduler::parse_sigmas(sg.as_string(""), &p.sigmas,
+                                            &why);
+    } else if (sg.is_array()) {
+      const auto a = sg.as_array();
+      for (std::size_t i = 0; ok && i < a.size(); ++i) {
+        const FlexData e = a[i];
+        if (!e.is_real() && !e.is_int() && !e.is_uint()) {
+          ok = false;
+          why = fmt("entry {} is not a number", i)();
+        } else {
+          p.sigmas.push_back(e.as_real(0.0));
+        }
+      }
+      ok = ok && MiniMaxH3Scheduler::sigmas_ok(p.sigmas, &why);
+    } else if (!sg.is_null()) {
+      ok = false;
+      why = "not a list of numbers";
+    }
+    if (!ok) {
+      p.sigmas.clear();
+      if (err != nullptr) {
+        *err = fmt("sigmas: {}; the model's own grid runs", why)();
+      }
+    }
   }
   if (p.refine_start_sigma > 1.0 || p.refine_start_sigma == 0.0) {
     if (err != nullptr) {

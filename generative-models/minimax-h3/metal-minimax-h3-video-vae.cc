@@ -992,38 +992,8 @@ MetalMiniMaxH3VideoVae::decode_working_bytes(const Config& c, int LT, int lh,
   const int tcs = c.tokens_per_chunk();
   if (LT <= 0 || lh <= 0 || lw <= 0 || tcs <= 0) { return 0; }
   // A single-frame decoder (decode_image): no chunk, no cross-fade --
-  // the picture's tiles, a row of them kept until stitched, beside the
-  // widest tile's ViT scratch and the stitched picture.
-  if (!c.decodes_video()) {
-    const std::size_t ZC = (std::size_t)c.z_channels;
-    const std::size_t OC = (std::size_t)c.out_channels;
-    const std::size_t H = (std::size_t)lh * c.patch;
-    const std::size_t W = (std::size_t)lw * c.patch;
-    const auto ys = minimax_h3::split_tiles((int)H, c.tile_size,
-                                            c.tile_overlap_min, c.patch);
-    const auto xs = minimax_h3::split_tiles((int)W, c.tile_size,
-                                            c.tile_overlap_min, c.patch);
-    std::size_t row_most = 0, widest = 0;
-    for (int th : ys.length) {
-      std::size_t row = 0;
-      for (int tw : xs.length) {
-        row += OC * (std::size_t)th * tw * 2;
-        widest = std::max(widest, (std::size_t)th * tw);
-      }
-      row_most = std::max(row_most, row);
-    }
-    const std::size_t voxels = widest / ((std::size_t)c.patch * c.patch);
-    const std::size_t R = voxels + (std::size_t)c.n_register + 1;
-    const std::size_t D = (std::size_t)c.dim, F = (std::size_t)c.ffn_inner;
-    std::size_t b = ZC * (std::size_t)lh * lw * 2;        // the latent
-    b += 2 * row_most + ZC * voxels * 2;                   // tiles, a sub
-    b += OC * H * W * 2;                                   // the stitch
-    b += R * (std::size_t)(3 * c.rope_freqs()) * sizeof(float) * 2;
-    b += R * D * 2 * 7;
-    b += R * std::max(3 * D, F) * 2 + R * 2 * F * 2;
-    b += R * (std::size_t)c.patch_elems() * 2 + voxels * ZC * 2;
-    return b;
-  }
+  // its picture's decode, which is what decode_image holds.
+  if (!c.decodes_video()) { return still_decode_bytes(c, lh, lw); }
   const int td = c.token_drop, tr = c.patch_t;
   const int span = tcs + c.token_overlap();
   const int num_tokens = LT + td;
@@ -1068,6 +1038,61 @@ MetalMiniMaxH3VideoVae::decode_working_bytes(const Config& c, int LT, int lh,
   b += R * (std::size_t)c.patch_elems() * 2 + voxels * ZC * 2;
   // The cross-fade partner.
   b += OC * (std::size_t)(c.token_overlap() * tr) * H * W * 2;
+  return b;
+}
+
+std::size_t
+MetalMiniMaxH3VideoVae::still_decode_bytes(const Config& c, int lh, int lw)
+{
+  if (lh <= 0 || lw <= 0 || c.patch <= 0) { return 0; }
+  const bool direct = c.t1_direct;
+  if (!direct && !c.decodes_video()) { return 0; }
+  // decode_image's route: the token alone, or a chunk of its copies.
+  const std::size_t LT = direct ? 1 : (std::size_t)c.tokens_per_chunk();
+  const std::size_t OT = LT * (std::size_t)c.out_patch_t();
+  const std::size_t ZC = (std::size_t)c.z_channels;
+  const std::size_t OC = (std::size_t)c.out_channels;
+  const std::size_t P  = (std::size_t)c.patch;
+  const std::size_t H = (std::size_t)lh * P, W = (std::size_t)lw * P;
+  const auto ys = minimax_h3::split_tiles((int)H, c.tile_size,
+                                          c.tile_overlap_min, c.patch);
+  const auto xs = minimax_h3::split_tiles((int)W, c.tile_size,
+                                          c.tile_overlap_min, c.patch);
+  std::size_t row_most = 0, widest = 0;
+  for (int th : ys.length) {
+    std::size_t row = 0;
+    for (int tw : xs.length) {
+      row += OC * (std::size_t)th * tw * 2;          // its kept frame
+      widest = std::max(widest, (std::size_t)th * tw);
+    }
+    row_most = std::max(row_most, row);
+  }
+  const bool one = ys.length.size() <= 1 && xs.length.size() <= 1;
+  if (one) { widest = H * W; }
+  // The latent handed in, and the copies decoded in its place.
+  std::size_t b = ZC * (std::size_t)lh * lw * 2;
+  if (LT > 1) { b += ZC * LT * (std::size_t)lh * lw * 2; }
+  // One tile's decode at every frame it expands to -- the picture itself
+  // when it is one tile of one frame, else held until it is cut.
+  b += OC * OT * widest * 2;
+  if (one) {
+    if (OT > 1) { b += OC * H * W * 2; }             // the frame cut out
+  } else {
+    // The stitch, the row above and this one, a tile's latent, and the
+    // stitch's f32 copy of a tile (host memory, on the same RAM).
+    b += OC * H * W * 2;
+    b += 2 * row_most + ZC * LT * (widest / (P * P)) * 2;
+    b += OC * widest * sizeof(float);
+  }
+  // The ViT scratch at the widest tile's rows (ensure_scratch_).
+  const std::size_t voxels = LT * (widest / (P * P));
+  const std::size_t R = voxels + (std::size_t)c.n_register + 1;
+  const std::size_t D = (std::size_t)c.dim, F = (std::size_t)c.ffn_inner;
+  b += R * (std::size_t)(3 * c.rope_freqs()) * sizeof(float) * 2;
+  b += R * D * 2 * 7;
+  b += R * std::max(3 * D, F) * 2 + R * 2 * F * 2;
+  b += R * (std::size_t)c.patch_elems() * 2 + voxels * ZC * 2;
+  b += (std::size_t)c.head_dim * 2;
   return b;
 }
 
@@ -2953,7 +2978,7 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
 
 SharedBuffer
 MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
-                                      int lw, std::string* err)
+                                      int lw, std::string* err, int keep)
 {
   const Config& c = _cfg;
   // The tiles are laid out in PIXEL space and mapped back onto the
@@ -2964,6 +2989,30 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
                                           c.patch);
   const auto xs = minimax_h3::split_tiles(W, c.tile_size, c.tile_overlap_min,
                                           c.patch);
+  const int OC = c.out_channels, OT = LT * c.out_patch_t();
+  if (keep >= OT) {
+    if (err != nullptr) {
+      *err = "frame " + std::to_string(keep) + " of a " + std::to_string(OT) +
+             "-frame decode";
+    }
+    return {};
+  }
+  // The frames stitched: all, or the one kept. A decode of one frame
+  // has nothing to cut.
+  const int KT = (keep >= 0) ? 1 : OT;
+  const bool cut = keep >= 0 && OT > 1;
+  // Frame `keep` of a channel-first [OC, OT, n] decode, as [OC, 1, n].
+  auto frame_of = [&](const SharedBuffer& b, std::size_t n) {
+    SharedBuffer f = _mc->make_shared_buffer((std::size_t)OC * n * 2);
+    if (f.empty()) { return f; }
+    const auto* s = static_cast<const std::uint16_t*>(b.contents());
+    auto*       d = static_cast<std::uint16_t*>(f.contents());
+    for (int ch = 0; ch < OC; ++ch) {
+      std::memcpy(d + (std::size_t)ch * n,
+                  s + ((std::size_t)ch * OT + keep) * n, n * 2);
+    }
+    return f;
+  };
   if (ys.start.size() <= 1 && xs.start.size() <= 1) {
     // A clip small enough not to tile still ticks -- once per CHUNK,
     // which is what a "tile" degenerates to here. Leaving this path
@@ -2976,6 +3025,10 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
     SharedBuffer one = decode(z, LT, lh, lw, err);
     if (!one.empty()) { ++_prog_done; }
     if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+    if (cut && !one.empty()) {
+      one = frame_of(one, (std::size_t)H * W);
+      if (one.empty() && err != nullptr) { *err = "allocation failed"; }
+    }
     return one;
   }
   const int ZC = c.z_channels;
@@ -2992,10 +3045,9 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
   // tile above and the one to its left (stitch_tile_), so the previous
   // row of tiles and this one are all that is held -- where every tile
   // of the clip was kept until the end.
-  const int OC = c.out_channels, OT = LT * c.out_patch_t();
   const int rows = (int)ys.start.size(), cols = (int)xs.start.size();
   SharedBuffer out =
-      _mc->make_shared_buffer((std::size_t)OC * OT * H * W * 2);
+      _mc->make_shared_buffer((std::size_t)OC * KT * H * W * 2);
   if (out.empty()) {
     if (err != nullptr) { *err = "tile allocation failed"; }
     return {};
@@ -3038,6 +3090,14 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
         if (err != nullptr) { *err = "tile stitch failed"; }
         return {};
       }
+      // A still keeps one frame of the tile, and the rows hold that.
+      if (cut) {
+        dec = frame_of(dec, (std::size_t)(th * c.patch) * (tw * c.patch));
+        if (dec.empty()) {
+          if (err != nullptr) { *err = "tile allocation failed"; }
+          return {};
+        }
+      }
       auto bytes = [](const SharedBuffer& b) {
         return b.empty() ? nullptr
                          : static_cast<const std::uint16_t*>(b.contents());
@@ -3045,7 +3105,7 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
       stitch_tile_(dst, bytes(dec),
                    i > 0 ? bytes(above[(std::size_t)j]) : nullptr,
                    j > 0 ? bytes(row[(std::size_t)(j - 1)]) : nullptr, i, j,
-                   ys, xs, 1, OC, OT, H, W, tmp);
+                   ys, xs, 1, OC, KT, H, W, tmp);
       row[(std::size_t)j] = std::move(dec);
     }
     above.swap(row);
@@ -3417,39 +3477,77 @@ MetalMiniMaxH3VideoVae::decode_image(const SharedBuffer& z, int h, int w,
     return {};
   };
   const Config& c = _cfg;
-  // Refused rather than attempted, and the message names what is
-  // missing: every H3 video VAE has the tensors to run this and would
-  // return a picture-shaped buffer of the wrong picture, so a caller who
-  // pointed at the wrong checkpoint needs to be told which one to use
-  // rather than left to judge the output.
-  if (!c.t1_direct) {
-    return fail("this checkpoint does not decode a single latent frame: it "
-                "declares no 'h3_t1_direct' in its metadata. The chunked "
-                "video decoder needs " +
-                std::to_string(c.tokens_per_chunk() + c.token_drop) +
-                " latent frames; a still is 1, which only an image-trained "
-                "H3 VAE decodes");
-  }
+  // The tile counters are this call's, as encode_video's and
+  // decode_video's are: decode_tiled_ sets them only when they are 0, so
+  // left set here the next still's bar counted on past its total.
+  struct ProgReset {
+    int& done;
+    int& total;
+    ~ProgReset() { done = 0; total = 0; }
+  } prog_reset{_prog_done, _prog_total};
   if (h <= 0 || w <= 0) { return fail("empty latent grid"); }
 
-  // One latent frame in, one whole `patch_t` block out. Tiled exactly as
-  // a clip is, so a picture and a frame of a clip at the same canvas see
-  // the same rope and the same seams.
-  SharedBuffer block = decode_tiled_(z, 1, h, w, err);
+  // A checkpoint fine-tuned for it reads the one token alone. The stock
+  // video decoder cannot: its rope normalizes time over the frames it is
+  // handed, so a lone token lands where no voxel of a video decode ever
+  // sits, and comes back picture-shaped and wrong. It reads a still the
+  // way the reference's own ComfyUI VAE does -- as a CHUNK OF COPIES,
+  // `tokens_per_chunk()` of them, the extent a chunk's rope is laid
+  // over, keeping the first frame that chunk really carries
+  // (`frame_pre_pad()`: the leading pixel frames are an implicit pad).
+  // A still IS the first latent of a clip -- the encoder's causal
+  // padding makes it so -- and that is the frame it decodes to.
+  const bool direct = c.t1_direct;
+  if (!direct && !c.decodes_video()) {
+    return fail("this decoder expands a token into " +
+                std::to_string(c.out_patch_t()) + " frames and declares no "
+                "'h3_t1_direct'; it decodes neither a clip nor a still");
+  }
+  const int LT    = direct ? 1 : c.tokens_per_chunk();
+  const int slice = direct ? c.t1_output_slice : c.frame_pre_pad();
+  // config_from_json bounds this, but decode_image is public and a Config
+  // can also be hand-built, so the read is checked where it is used.
+  if (slice < 0 || slice >= c.out_patch_t() || LT < 1) {
+    return fail("output slice " + std::to_string(slice) + " is not one of "
+                "the " + std::to_string(c.out_patch_t()) + " pixel frames a "
+                "latent frame decodes to");
+  }
+
+  SharedBuffer copies;
+  const SharedBuffer* zin = &z;
+  const std::size_t lplane = (std::size_t)h * w;
+  if (LT > 1) {
+    copies =
+        _mc->make_shared_buffer((std::size_t)c.z_channels * LT * lplane * 2);
+    if (copies.empty()) { return fail("allocation failed"); }
+    zin = &copies;
+    const auto* s = static_cast<const std::uint16_t*>(z.contents());
+    auto*       d = static_cast<std::uint16_t*>(copies.contents());
+    for (int ch = 0; ch < c.z_channels; ++ch) {
+      for (int t = 0; t < LT; ++t) {
+        std::memcpy(d + ((std::size_t)ch * LT + t) * lplane,
+                    s + (std::size_t)ch * lplane, lplane * 2);
+      }
+    }
+  }
+
+  // Tiled exactly as a clip is, so a picture and a frame of a clip at the
+  // same canvas see the same rope and the same seams -- and only the kept
+  // frame stitched: the copies expand to LT * out_patch_t() pixel frames
+  // (20), and the stitched block of all of them was 20 pictures held for
+  // one. The stitch is per frame, so the picture is the same bit for bit;
+  // VPIPE_H3_VVAE_STILL_WHOLE=1 stitches every frame and cuts after, the
+  // A/B.
+  const bool whole = std::getenv("VPIPE_H3_VVAE_STILL_WHOLE") != nullptr;
+  SharedBuffer block = decode_tiled_(*zin, LT, h, w, err, whole ? -1 : slice);
   if (block.empty()) { return {}; }
+  if (!whole) { return block; }   // [out_channels, H, W]: the picture
 
   const int OC = c.out_channels;
   const int H  = h * c.patch;
   const int W  = w * c.patch;
   const std::size_t plane = (std::size_t)H * W;
-  const int slice = c.t1_output_slice;
-  // config_from_json bounds this, but decode_image is public and a Config
-  // can also be hand-built, so the read is checked where it is used.
-  if (slice < 0 || slice >= c.out_patch_t()) {
-    return fail("t1_output_slice " + std::to_string(slice) + " is not one of "
-                "the " + std::to_string(c.out_patch_t()) + " pixel frames a "
-                "latent frame decodes to");
-  }
+  const int frames = LT * c.out_patch_t();   // per channel, in the block
 
   SharedBuffer out = _mc->make_shared_buffer((std::size_t)OC * plane * 2);
   if (out.empty()) { return fail("output allocation failed"); }
@@ -3457,7 +3555,7 @@ MetalMiniMaxH3VideoVae::decode_image(const SharedBuffer& z, int h, int w,
   auto*       dst = static_cast<std::uint16_t*>(out.contents());
   for (int ch = 0; ch < OC; ++ch) {
     std::memcpy(dst + (std::size_t)ch * plane,
-                src + ((std::size_t)ch * c.out_patch_t() + slice) * plane,
+                src + ((std::size_t)ch * frames + slice) * plane,
                 plane * 2);
   }
   return out;

@@ -36,6 +36,65 @@ namespace genai {
 //     reference steps in float32 for exactly that reason; the bf16 round
 //     trip happens per forward, not per accumulation.
 //
+// How the loop takes a step. Every one is ONE forward a step, which is
+// the only kind worth having on a 33B model.
+enum class StepUpdate : int {
+  // What the loop does with nothing asked: an adapter's sampling
+  // contract's update where one is live (Pika H3 Flex: re-noising), a
+  // refine's plain Euler, else Euler.
+  kAuto = 0,
+  kEuler,
+  // x0 = x + sigma v at each sigma, then put at the next one with FRESH
+  // noise -- diffusers' `stochastic_sampling`, and the update a DMD-style
+  // few-step student takes (the sampler spec's `dmd`).
+  kRenoise,
+  // ComfyUI's `res_multistep`: second order in log-sigma off the previous
+  // step's x0 (MiniMaxH3Scheduler::step_res).
+  kResMultistep,
+};
+
+// "euler" / "renoise" / "res_multistep"; "auto" for kAuto.
+const char* step_update_name(StepUpdate u);
+
+// A `diffusion-sampler-select` spec, read for THIS model. H3 cannot run
+// the shared FlowSampler -- its velocity points the other way, its
+// timesteps run 1 - sigma, and it steps two schedules in lockstep over
+// rows that are never all stepped -- so the spec's method is mapped onto
+// the updates its own scheduler has: `euler`, `dmd` (the same update as
+// kRenoise) and `res_multistep`.
+struct SamplerChoice {
+  StepUpdate    update = StepUpdate::kAuto;
+  // The spec's re-noise seed; 0 names none, and the clip's seed runs.
+  std::uint64_t seed   = 0;
+  // The method as the spec spelled it.
+  std::string   method;
+  // What the spec carries that this model does not read (a `dmd`
+  // conditioning_sigma: H3 runs its own grid). Empty when nothing.
+  std::string   note;
+};
+
+// False -- with the reason in `why` and `out->update` left kAuto -- for
+// a method H3 does not run (heun, dpmpp_2m and dpmpp_sde take two
+// forwards a step; unipc; a name this tree does not know) or a beat that
+// is not a spec. The caller WARNS and the default runs: spec-keys.h's
+// rule for a value a reader does not run. eta and s_noise are
+// dpmpp_sde's and are not read.
+bool sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
+                              std::string* why = nullptr);
+
+// What one denoise() holds on the HOST beside the forward, f32 over the
+// GENERATED rows it steps -- for a caller judging a clip against
+// physical RAM (generate-video hands it to its preflight as pageable
+// memory). The velocity read back each step; ONE more state for the
+// update's own -- a re-noising step's fresh noise or a res_multistep
+// step's previous x0, never both -- counted whatever the update, so on
+// an Euler run it is a bound by that state; MotionCache's residual when
+// `motion_cache`; a preview's clean estimate (video only) when
+// `preview`. Not the caller's `video` / `audio` buffers, which it owns.
+std::size_t denoise_host_bytes(const minimax_h3::PackedLayout& L,
+                               const MetalMiniMaxH3Transformer::Config& cfg,
+                               bool motion_cache, bool preview);
+
 // What a denoise did, for a caller that wants to report or assert it.
 // `forwards` is the transformer calls that RAN; `reused` the steps
 // MotionCache answered from its residual instead. They sum to `steps`.
@@ -47,9 +106,14 @@ struct DenoiseReport {
   int  forwards     = 0;
   int  reused       = 0;
   bool motion_cache = false;
-  // The steps re-noised (an adapter's sampling contract) rather than
-  // stepped by Euler.
+  // The steps re-noised (an adapter's sampling contract, or asked for)
+  // rather than stepped by Euler.
   bool renoise      = false;
+  // The update that RAN (never kAuto), and the two schedules it ran
+  // over, terminal 0 included.
+  StepUpdate update = StepUpdate::kEuler;
+  std::vector<float> video_sigmas;
+  std::vector<float> audio_sigmas;
 };
 
 struct DenoiseRequest {
@@ -105,6 +169,20 @@ struct DenoiseRequest {
   // (its grid shifted in double, and its update: re-noising, see
   // `seed`). An explicit grid here still wins, stepped by Euler.
   std::vector<float> sigma_grid;
+  // The VIDEO's sigmas AS RUN, terminal 0 included -- what ComfyUI hands
+  // its sampler as SIGMAS -- overriding `num_steps`, `sigma_grid`, a
+  // flow-map adapter's grid and a sampling contract's (stepped by Euler
+  // unless `update` says otherwise). The AUDIO runs ComfyUI's mapping of
+  // each: back to the shared base grid through `video_shift`, out
+  // through `audio_shift` (MiniMaxH3Scheduler::set_sigmas_mapped).
+  // Strictly decreasing from at most 1 to exactly 0. A refine's
+  // `refine_sigmas` take its place: they are the same thing for a
+  // refine, the video's sigmas as run.
+  std::vector<double> video_sigmas;
+  // How a step is taken (StepUpdate). Named, it overrides a sampling
+  // contract's update. A flow-map adapter's step IS its jump to the next
+  // sigma, so under a live one anything but Euler is refused.
+  StepUpdate update = StepUpdate::kAuto;
   // A REFINE -- Open-H3-Regenerate-2K's: the video's sigmas AS RUN (no
   // shift, overriding `num_steps` and `sigma_grid`), stepped by the
   // reference's plain Euler (MiniMaxH3Scheduler::step_plain), and the
@@ -183,6 +261,7 @@ struct DenoiseRequest {
     audio_shift = p.audio_shift;
     condition_timestep = (float)p.condition_timestep;
     condition_audio_timestep = (float)p.condition_audio_timestep;
+    video_sigmas = p.sigmas;
   }
 };
 

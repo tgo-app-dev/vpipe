@@ -312,6 +312,43 @@ TEST(minimax_h3_refenc, a_carried_soundtrack_latent_packs_its_rows)
               L.num_condition_audio_rows);
 }
 
+// A stored still's latent given to the DiT ALONE (`presented` false):
+// no pixels, no tower, no VAE -- its rows packed as a picture's, one
+// slot on the clock, as ComfyUI's RefMod "Apply" hands one over.
+TEST(minimax_h3_refenc, a_latent_for_the_dit_alone_is_packed_unpresented)
+{
+  const int z = 3, Hh = 4, Ww = 6;
+  h3::MediaReference still;
+  still.kind = h3::MediaReference::Kind::kImage;
+  still.latent_z = z;
+  still.latent_frames = 1;
+  still.latent_height = Hh;
+  still.latent_width = Ww;
+  still.video_latent.assign((std::size_t)z * Hh * Ww, 0.5f);
+  still.presented = false;
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  plan.condition_noise_aug = 1.0;        // the rows exactly as carried
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  h3::EncodedReferences enc;
+  std::string err;
+  bool ok = h3::encode_references({still}, "a prompt", plan, models, &enc,
+                                  &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  ASSERT_TRUE(enc.layout.size() == 1);
+  EXPECT_TRUE(enc.layout[0].kind == h3::Reference::Kind::kImage);
+  EXPECT_TRUE(enc.layout[0].num_latent_frames == 1);
+  EXPECT_TRUE(enc.video_rows.size() == (std::size_t)z * Hh * Ww);
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      std::vector<int>(8, h3::kTextTag), enc.layout, 7, 4, 6, 12, 2, 2,
+      h3::kAudioChannels, &L));
+  EXPECT_TRUE(L.seq_len > 8 + (Hh / 2) * (Ww / 2));
+}
+
 TEST(minimax_h3_refenc, progress_is_weighed_by_work_planned_up_front)
 {
   h3::ReferencePlan plan;

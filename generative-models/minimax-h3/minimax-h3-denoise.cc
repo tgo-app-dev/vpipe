@@ -3,6 +3,7 @@
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/shared/motion-cache.h"
 #include "generative-models/shared/sage-attention.h"
+#include "generative-models/spec-keys.h"
 #include "common/perf-flops.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -107,6 +108,84 @@ motion_cache_gathers(const MetalMiniMaxH3Transformer::Config& cfg,
   return true;
 }
 
+const char*
+step_update_name(StepUpdate u)
+{
+  switch (u) {
+    case StepUpdate::kAuto:         return "auto";
+    case StepUpdate::kEuler:        return "euler";
+    case StepUpdate::kRenoise:      return "renoise";
+    case StepUpdate::kResMultistep: return "res_multistep";
+  }
+  return "auto";
+}
+
+bool
+sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
+                         std::string* why)
+{
+  namespace k = sampler_spec;
+  *out = SamplerChoice{};
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    out->update = StepUpdate::kAuto;
+    return false;
+  };
+  if (!spec.is_object()) { return no("the beat is not a sampler spec"); }
+  const auto o = spec.as_object();
+  // A spec with no method names the spec's own default, euler.
+  out->method = o.contains(k::kMethod)
+      ? std::string(o.at(k::kMethod).as_string("")) : std::string(k::kEuler);
+  if (o.contains(k::kSeed)) {
+    out->seed = (std::uint64_t)o.at(k::kSeed).as_int(0);
+  }
+  const std::string& m = out->method;
+  if (m == k::kEuler) {
+    out->update = StepUpdate::kEuler;
+  } else if (m == k::kDmd || m == "dmd_student" || m == "turbo") {
+    // The DMD student's step is this model's re-noising one: the clean
+    // estimate at each sigma, then fresh noise to the next. The spec's
+    // conditioning_sigma shapes ITS schedule; H3 runs its own.
+    out->update = StepUpdate::kRenoise;
+    if (o.contains(k::kConditioningSigma) &&
+        o.at(k::kConditioningSigma).as_real(0.0) != 0.0) {
+      out->note = fmt("its conditioning_sigma {} is not read -- minimax-h3 "
+                      "runs its own grid",
+                      o.at(k::kConditioningSigma).as_real(0.0))();
+    }
+  } else if (m == k::kResMultistep) {
+    out->update = StepUpdate::kResMultistep;
+  } else if (m == k::kHeun || m == k::kDpmpp2m || m == k::kDpmppSde ||
+             m == "dpm++_2m" || m == "dpm++_sde") {
+    return no(fmt("'{}' is not one minimax-h3 runs: it runs euler, dmd "
+                  "(re-noising) and res_multistep, one forward a step "
+                  "each{}", m,
+                  m == k::kDpmpp2m || m == "dpm++_2m"
+                      ? "" : " -- this one takes two")());
+  } else {
+    return no(fmt("'{}' is not one minimax-h3 runs: it runs euler, dmd "
+                  "(re-noising) and res_multistep", m)());
+  }
+  return true;
+}
+
+std::size_t
+denoise_host_bytes(const minimax_h3::PackedLayout& L,
+                   const MetalMiniMaxH3Transformer::Config& cfg,
+                   bool motion_cache, bool preview)
+{
+  const std::size_t v =
+      (std::size_t)L.num_video_rows * (std::size_t)cfg.video_patch_elems();
+  const std::size_t a =
+      (std::size_t)L.num_audio_rows * (std::size_t)cfg.audio_channels;
+  // vel_v / vel_a; rn_v / rn_a or vprev / aprev; MotionCache's rv / ra;
+  // preview_x0.
+  std::size_t n = 2 * (v + a);
+  if (motion_cache) { n += v + a; }
+  if (preview) { n += v; }
+  return n * sizeof(float);
+}
+
 bool
 denoise(const DenoiseRequest& req, std::string* err)
 {
@@ -145,11 +224,6 @@ denoise(const DenoiseRequest& req, std::string* err)
 
   MiniMaxH3Scheduler sv(req.video_shift);
   MiniMaxH3Scheduler sa(req.audio_shift);
-  // `res_multistep` -- the second-order sampler the reference template
-  // ships -- against the first-order Euler this loop has always used.
-  // Under measurement rather than default-on: it changes BOTH modalities'
-  // output, and the video at 4 steps is already good.
-  const bool res_ms = std::getenv("VPIPE_H3_RES_MULTISTEP") != nullptr;
   std::vector<float> vprev, aprev;
   // A FLOW-MAP adapter conditions each step on where it lands, so the
   // loop hands the DiT (t, r) pairs rather than t alone -- and runs the
@@ -157,8 +231,12 @@ denoise(const DenoiseRequest& req, std::string* err)
   const bool two_time = req.dit->two_time_active();
   const MetalMiniMaxH3Transformer::FlowMap* fm = req.dit->flow_map();
   const bool refine = !req.refine_sigmas.empty();
+  // The video's sigmas as given, below a refine's (which are the same
+  // thing for a refine) and above every other grid.
+  const bool given = !refine && !req.video_sigmas.empty();
   const std::vector<float>* grid =
-      !req.sigma_grid.empty() ? &req.sigma_grid
+      given ? nullptr
+      : !req.sigma_grid.empty() ? &req.sigma_grid
       : (two_time && fm != nullptr && !fm->sigmas.empty()) ? &fm->sigmas
                                                            : nullptr;
   // An adapter's SAMPLING CONTRACT: its grid, shifted in double, and its
@@ -166,10 +244,43 @@ denoise(const DenoiseRequest& req, std::string* err)
   // contract beside one). VPIPE_H3_RENOISE=0 keeps the grid and steps it
   // by Euler, for the A/B the release says is not equivalent.
   const MetalMiniMaxH3Transformer::SamplingContract* sc =
-      grid == nullptr ? req.dit->sampling_contract() : nullptr;
+      grid == nullptr && !given ? req.dit->sampling_contract() : nullptr;
   bool renoise = sc != nullptr && sc->renoise;
   if (const char* e = std::getenv("VPIPE_H3_RENOISE")) {
     renoise = renoise && std::atoi(e) != 0;
+  }
+  // `res_multistep` -- the second-order sampler the reference template
+  // ships -- against the first-order Euler this loop has always used.
+  // Not the default: it changes BOTH modalities' output, and the video
+  // at 4 steps is already good. The env var is the dev A/B; a sampler
+  // spec asks for it by name.
+  bool res_ms =
+      !refine && std::getenv("VPIPE_H3_RES_MULTISTEP") != nullptr;
+  // An update asked for by name replaces the loop's own choice.
+  switch (req.update) {
+    case StepUpdate::kAuto: break;
+    case StepUpdate::kEuler:
+      renoise = false;
+      res_ms = false;
+      break;
+    case StepUpdate::kRenoise:
+      renoise = true;
+      res_ms = false;
+      break;
+    case StepUpdate::kResMultistep:
+      renoise = false;
+      res_ms = true;
+      break;
+  }
+  // A flow map's velocity is its AVERAGE over the jump to the next sigma,
+  // so Euler lands where it was trained to; read as an instantaneous
+  // velocity (an x0 estimate, a multistep's history) it lands elsewhere.
+  if (two_time && (req.update == StepUpdate::kRenoise ||
+                   req.update == StepUpdate::kResMultistep)) {
+    return fail(fmt("denoise: a flow-map adapter ({}) steps by its jump, "
+                    "Euler; it cannot run {}", fm != nullptr ? fm->version
+                                                             : "live",
+                    step_update_name(req.update))());
   }
   if (refine) {
     if (two_time) {
@@ -184,6 +295,18 @@ denoise(const DenoiseRequest& req, std::string* err)
       return fail(fmt("denoise: the refine's {} sigmas are not a strictly "
                       "decreasing grid from at most 1 to exactly 0",
                       req.refine_sigmas.size())());
+    }
+  } else if (given) {
+    std::string why;
+    if (!MiniMaxH3Scheduler::sigmas_ok(req.video_sigmas, &why)) {
+      return fail("denoise: the video's sigmas: " + why);
+    }
+    if (!sv.set_sigmas_mapped(req.video_sigmas, req.video_shift) ||
+        !sa.set_sigmas_mapped(req.video_sigmas, req.video_shift)) {
+      return fail(fmt("denoise: the video's {} sigmas do not stay a "
+                      "strictly decreasing grid mapped to the audio's "
+                      "shift ({:.4g} from {:.4g})", req.video_sigmas.size(),
+                      req.audio_shift, req.video_shift)());
     }
   } else if (sc != nullptr) {
     if (!sv.set_sigmas_shifted(sc->sigmas) ||
@@ -439,10 +562,40 @@ denoise(const DenoiseRequest& req, std::string* err)
                    "either side (the last for any step past it), the "
                    "linear half beyond", rs));
   }
-  if (renoise && sess != nullptr) {
-    sess->info(fmt("h3-denoise: {} steps RE-NOISED on the sampling "
-                   "contract's grid ({}): x0 at each sigma, then fresh "
-                   "noise to the next", steps, sc->release));
+  // How the steps are taken and on what grid, whenever either is not
+  // the loop's plain default: the line that says a sampler or a grid the
+  // graph named actually ran.
+  if (sess != nullptr &&
+      (renoise || res_ms || given || req.update != StepUpdate::kAuto)) {
+    const char* how =
+        renoise ? "RE-NOISED (x0 at each sigma, then fresh noise to the "
+                  "next)"
+        : res_ms ? "by res_multistep"
+        : refine ? "by the refine's plain Euler"
+                 : "by Euler";
+    const std::string whose =
+        req.update != StepUpdate::kAuto ? std::string("as the sampler asks")
+        : sc != nullptr && renoise
+            ? fmt("as {}'s sampling contract asks", sc->release)()
+        : res_ms ? std::string("VPIPE_H3_RES_MULTISTEP")
+                 : std::string("the default");
+    std::string on;
+    auto list = [](const std::vector<float>& g) {
+      std::string r;
+      for (float x : g) {
+        r += fmt("{}{:.4f}", r.empty() ? "" : ", ", (double)x)();
+      }
+      return r;
+    };
+    if (given) {
+      on = fmt(", on the video's sigmas as given [{}], the audio's mapped "
+               "through shifts {:.4g}/{:.4g} [{}]", list(sv.sigmas()),
+               req.video_shift, req.audio_shift, list(sa.sigmas()))();
+    } else if (sc != nullptr) {
+      on = fmt(", on {}'s grid", sc->release)();
+    }
+    sess->info(fmt("h3-denoise: {} steps {}, {}{}", steps, how, whose,
+                   on));
   }
   for (int i = 0; i < steps; ++i) {
     // Every row's timestep, this step. The conditioning rows keep their
@@ -674,11 +827,11 @@ denoise(const DenoiseRequest& req, std::string* err)
       const bool vlast = sv.sigmas()[(std::size_t)i + 1] == 0.0f;
       if (renoise && !vlast) { draw(&rn_v, vel.size()); }
       const bool vok =
-          refine ? sv.step_plain(vel.data(), i, vx, vel.size())
-          : renoise ? sv.step_renoise(vel.data(), i, vx,
-                                      vlast ? nullptr : rn_v.data(),
-                                      vel.size())
+          renoise ? sv.step_renoise(vel.data(), i, vx,
+                                    vlast ? nullptr : rn_v.data(),
+                                    vel.size())
           : res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
+          : refine ? sv.step_plain(vel.data(), i, vx, vel.size())
                    : sv.step(vel.data(), i, vx, vel.size());
       if (!vok) {
         return fail("denoise: video step " + std::to_string(i) + " failed");
@@ -780,6 +933,11 @@ denoise(const DenoiseRequest& req, std::string* err)
     req.report->reused   = reused_steps;
     req.report->motion_cache = mcache.armed();
     req.report->renoise  = renoise;
+    req.report->update   = renoise ? StepUpdate::kRenoise
+                           : res_ms ? StepUpdate::kResMultistep
+                                    : StepUpdate::kEuler;
+    req.report->video_sigmas = sv.sigmas();
+    req.report->audio_sigmas = sa.sigmas();
   }
   // The one line that says whether the setting did anything. The ratio
   // is of FORWARDS, the dominant cost of a step, not of wall time.

@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_SCHEDULER_H
 
 #include <cstddef>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace vpipe {
@@ -70,6 +72,30 @@ class MiniMaxH3Scheduler {
   // a few-step adapter's sampling contract builds its schedule (Pika H3
   // Flex: knots / 1000). Same checks as set_sigmas.
   bool set_sigmas_shifted(const std::vector<double>& raw);
+
+  // A schedule named AS RUN on ANOTHER modality's axis: `sigmas` are the
+  // sigmas of a schedule shifted by `given_shift` -- ComfyUI's custom
+  // SIGMAS, which are always the VIDEO's -- and each is carried to this
+  // one's as ComfyUI's DiT does (comfy/ldm/minimax/model.py,
+  // time_shift_sigma): back to the shared base grid,
+  //     b = sigma / (given + sigma (1 - given)),
+  // then out through this shift, in double, cast once. With `given_shift`
+  // equal to shift() the sigmas are installed as given. False unless
+  // `sigmas` is strictly decreasing from at most 1 to exactly 0, and
+  // unless the cast grid still is.
+  bool set_sigmas_mapped(const std::vector<double>& sigmas,
+                         double given_shift);
+
+  // True for a schedule given AS RUN: two or more finite sigmas, strictly
+  // decreasing from at most 1 to exactly 0. Else false, with the reason.
+  static bool sigmas_ok(const std::vector<double>& sigmas,
+                        std::string* why = nullptr);
+  // A sigma list as a graph writes it -- "1, 0.9844, ..., 0", commas or
+  // whitespace between, an optional [ ] around it (ComfyUI's SIGMAS
+  // pasted) -- into `out`, checked by sigmas_ok(). False with the reason
+  // when a token is not a number or the list is not a schedule.
+  static bool parse_sigmas(std::string_view text, std::vector<double>* out,
+                           std::string* why = nullptr);
 
   // A schedule given AS RUN: `sigmas` installed verbatim, no shift --
   // Open-H3-Regenerate-2K's refine names its sigmas outright. Strictly

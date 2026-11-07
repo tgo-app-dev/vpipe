@@ -128,6 +128,17 @@ struct MediaReference {
   // a caller's choice (a song drawn on as a whole), and a long clip so
   // kept is a long block of rows on every step.
   bool whole = false;
+
+  // PRESENTED to the conditioner: labelled in the prompt presentation
+  // (`<Picture i>: ` with the vision tower's tokens, `<Audio j>: `), as
+  // every reference is by default. Not presented, it is the DiT's alone
+  // -- its rows packed and on the clock as ever, the prompt neither
+  // naming it nor reading it, the labels numbered over the presented
+  // ones: what the reference's ComfyUI RefMod "Apply" node does with a
+  // stored latent (appended to the conditioning's references, the text
+  // encoder never told). A visual reference carried as a latent with no
+  // pixels has nothing for the vision tower, so it can only be so.
+  bool presented = true;
 };
 
 // What the encoder had to do to a reference to make it fit.

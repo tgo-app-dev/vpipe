@@ -683,6 +683,12 @@ encode_references(const std::vector<MediaReference>& refs,
     const bool latent_only = m.kind != MediaReference::Kind::kAudio
                              && m.has_video_latent() && m.rgb.empty();
     if (latent_only) {
+      // Presented, the text encoder would find no vision for it.
+      if (m.presented && models.text != nullptr) {
+        return fail(where + ": a carried latent with no pixels has nothing "
+                            "for the vision tower to read; it can only be "
+                            "the DiT's (not presented)");
+      }
       const int lh = m.latent_height, lw = m.latent_width;
       if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
         return fail(where + ": a carried latent is " + std::to_string(lh) +
@@ -795,7 +801,8 @@ encode_references(const std::vector<MediaReference>& refs,
       // changing only the video canvas 1344x768 -> 960x544: 3115 -> 2119
       // conditioning rows, all of it the clip's vision blocks (the still
       // is encoded at its own short edge and did not move).
-      if (models.vision != nullptr) {
+      // Not presented, the tower's reading would go unread.
+      if (models.vision != nullptr && m.presented) {
         report(done_work, label + ": vision tower");
         if (timing) { (void)tick(); }
         MetalQwenVisionEncoder::Result res;
@@ -997,6 +1004,8 @@ encode_references(const std::vector<MediaReference>& refs,
     std::vector<MiniMaxH3TextEncoder::Reference> pres;
     pres.reserve(refs.size());
     for (std::size_t i = 0; i < refs.size(); ++i) {
+      // The DiT's alone: no label, the ones after it numbered without it.
+      if (!refs[i].presented) { continue; }
       MiniMaxH3TextEncoder::Reference p;
       p.kind = refs[i].kind == MediaReference::Kind::kImage
                    ? MiniMaxH3TextEncoder::Reference::Kind::kImage

@@ -14,10 +14,15 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
+#include <mutex>
 
 #include <vector>
 #include <filesystem>
@@ -771,6 +776,170 @@ MetalLlamaWeights::is_gguf() const noexcept
   return _gguf != nullptr && _gguf->gguf.has_value();
 }
 
+namespace {
+
+// HOW A TENSOR IS READ: in 1 MB pieces on the file's 4 KB grid, four in
+// flight.
+//
+// One read at a time leaves a drive short of its rate. MEASURED on an M4
+// Pro through this function (weight_set.pieces_read_at_the_drive_s_rate:
+// uncached, 2-3 GB of tensors an arm, none in the page cache, arms and
+// binaries interleaved in both orders), GB/s, MiniMax-H3 FL2VA's
+// transformer off a Thunderbolt 5 SSD / Fibo 2.0's off the internal one:
+//
+//   the old read: 8 MB staged reads, one at a time   3.69-3.86 / 3.93-3.96
+//   4 MB pieces    4 threads 5.11-5.21 / 4.39-4.40   8: 4.84-4.89 / 4.09-4.16
+//   2 MB                     5.22-5.31 / 4.46-4.60      5.03-5.10 / 4.40-4.45
+//   1 MB                     5.33-5.41 / 4.74-4.78      5.21-5.36 / 4.64-4.70
+//   512 KB                   5.20-5.25 / 4.80-4.82
+//
+// 1.4x off the dock and 1.2x off the internal SSD, near what either
+// drive gives any read shape (a raw-read study: 5.1-5.5 / 4.9 GB/s,
+// 256 MB reads to 32 small ones in flight, cached or not). Smaller
+// pieces keep four in flight to the end of a tensor (Fibo's average 38
+// MB); 8 threads never beat 4. VPIPE_PREAD_THREADS is the A/B -- 1 is
+// one 1 MB piece at a time (2.5-2.6 GB/s), NOT the old read.
+constexpr std::size_t kReadPiece   = 1ull << 20;
+constexpr std::size_t kReadGrid    = 4096;
+constexpr int         kReadThreads = 4;
+
+// Read per call rather than latched: a tensor read costs milliseconds and
+// a getenv nanoseconds, and an A/B can then interleave its arms in one
+// process.
+int
+read_threads_()
+{
+  const char* e = std::getenv("VPIPE_PREAD_THREADS");
+  if (e == nullptr || *e == '\0') { return kReadThreads; }
+  return std::clamp(std::atoi(e), 1, 64);
+}
+
+// Staging buffers, a piece each and page-aligned, kept for the next read
+// rather than freed: a buffer's pages are faulted in by the first read
+// into it, and a streamed model reads a block's pieces every few
+// milliseconds. At most kKeptStages idle (8 MB): four workers for the
+// streamer's prefetch and four for the forward's own reads; a burst past
+// that frees its extras.
+constexpr std::size_t kKeptStages = 8;
+
+struct StagePool {
+  std::mutex                 mu;
+  std::vector<std::uint8_t*> idle;
+
+  // Never destroyed: a read during exit must not find it gone.
+  static StagePool& get()
+  {
+    static StagePool* p = new StagePool;
+    return *p;
+  }
+  std::uint8_t* take()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (!idle.empty()) {
+        std::uint8_t* b = idle.back();
+        idle.pop_back();
+        return b;
+      }
+    }
+    // MAPPED, not malloc'd: a freed large heap block stays dirty in the
+    // footprint on macOS, and munmap gives its pages back. MEASURED, 16
+    // threads reading a staged 13 MB tensor at once: posix_memalign left
+    // +16 MB at one worker a read and +32-47 MB at four, where the pool
+    // keeps 8 MB.
+    void* b = ::mmap(nullptr, kReadPiece, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    return b == MAP_FAILED ? nullptr : static_cast<std::uint8_t*>(b);
+  }
+  void give(std::uint8_t* b)
+  {
+    if (b == nullptr) { return; }
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (idle.size() < kKeptStages) {
+        idle.push_back(b);
+        return;
+      }
+    }
+    ::munmap(b, kReadPiece);
+  }
+};
+
+// pread(2) until `n` bytes are in.
+//
+// A short read that is not EINTR is a truncated or racing file. The
+// destination is left partly written, which is why this returns false
+// rather than trying to paper over it -- the caller must fall back to a
+// path that rewrites the whole buffer, not top this one up.
+bool
+pread_full_(int fd, std::uint8_t* out, std::size_t n, std::uint64_t off)
+{
+  std::size_t done = 0;
+  while (done < n) {
+    const ssize_t k = ::pread(fd, out + done, n - done,
+                              static_cast<off_t>(off + done));
+    if (k < 0 && errno == EINTR) { continue; }
+    if (k <= 0) { return false; }
+    done += static_cast<std::size_t>(k);
+  }
+  return true;
+}
+
+// Bytes [base, base + n) of `fd` into `out`, piece k being the file's
+// [g0 + k P, g0 + (k + 1) P) cut to the tensor, g0 its start rounded down
+// to the grid. A piece goes straight into `out` unless `stage` says the
+// read must not (see pread_into): then it is read whole into a staging
+// buffer -- an aligned offset into aligned memory -- and copied out.
+bool
+read_pieces_(int fd, std::uint64_t base, std::size_t n, std::uint8_t* out,
+             bool stage)
+{
+  const std::uint64_t end = base + n;
+  const std::uint64_t g0 = base & ~static_cast<std::uint64_t>(kReadGrid - 1);
+  const auto np =
+      static_cast<std::size_t>((end - g0 + kReadPiece - 1) / kReadPiece);
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> ok{true};
+  auto work = [&]() {
+    std::uint8_t* buf = nullptr;
+    for (;;) {
+      const std::size_t c = next.fetch_add(1, std::memory_order_relaxed);
+      if (c >= np || !ok.load(std::memory_order_relaxed)) { break; }
+      const std::uint64_t p0 = g0 + static_cast<std::uint64_t>(c) * kReadPiece;
+      const std::uint64_t lo = p0 < base ? base : p0;
+      const std::uint64_t hi = p0 + kReadPiece < end ? p0 + kReadPiece : end;
+      bool good = false;
+      if (!stage) {
+        good = pread_full_(fd, out + (lo - base),
+                           static_cast<std::size_t>(hi - lo), lo);
+      } else {
+        if (buf == nullptr) { buf = StagePool::get().take(); }
+        good = buf != nullptr &&
+               pread_full_(fd, buf, static_cast<std::size_t>(hi - p0), p0);
+        if (good) {
+          std::memcpy(out + (lo - base), buf + (lo - p0),
+                      static_cast<std::size_t>(hi - lo));
+        }
+      }
+      if (!good) { ok.store(false, std::memory_order_relaxed); }
+    }
+    StagePool::get().give(buf);
+  };
+  const std::size_t workers =
+      std::min(static_cast<std::size_t>(read_threads_()), np);
+  if (workers <= 1) {
+    work();
+    return ok.load();
+  }
+  auto* const wp = &work;
+  dispatch_apply(workers,
+                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                 ^(std::size_t) { (*wp)(); });
+  return ok.load();
+}
+
+}  // namespace
+
 bool
 MetalLlamaWeights::pread_into(const std::string& name, void* dst,
                               std::size_t cap, bool uncached) const
@@ -790,72 +959,38 @@ MetalLlamaWeights::pread_into(const std::string& name, void* dst,
   const int fd = uncached && sh.fd_stream >= 0 ? sh.fd_stream : sh.fd;
   if (fd < 0) { return false; }
   const std::uint64_t base = sh.data_start + ti->offset;
-  auto* out = static_cast<std::uint8_t*>(dst);
 
-  // F_NOCACHE ONLY BYPASSES THE BUFFER CACHE ON A PAGE-ALIGNED OFFSET.
+  // AN UNCACHED READ GOES STRAIGHT INTO `dst` ONLY WHEN THE FILE OFFSET
+  // AND THE MEMORY ADDRESS ARE BOTH 4 KB MULTIPLES.
   //
   // Unbuffered I/O has alignment requirements, and a read that does not
-  // meet them does not fail -- it silently falls back to the buffered
-  // path and fills the cache with exactly the bytes the caller asked not
-  // to keep. MEASURED, 4 GB read from one file with F_NOCACHE set: a
-  // page-aligned offset grows file-backed pages by 0 MB, the SAME read
-  // at offset+8 grows them by 1813 MB.
+  // meet them does not fail -- it silently takes the buffered path and
+  // fills the cache with exactly the bytes the caller asked not to keep.
+  // MEASURED with mincore over the file's own pages (APFS, M4 Pro), 1 GB
+  // a read: memory 8, 2048 or 4016 bytes off a page cached 896 MB of it,
+  // 4096 or 12288 off nothing; a file offset 4096 into a page, nothing;
+  // the SAME misalignment on both sides (+80 / +80) cached 7/8 of it, so
+  // it is each side's alignment, not the two agreeing. (Earlier, 4 GB at
+  // a page-aligned offset grew file-backed pages by 0 MB and the same
+  // read at offset+8 by 1813 MB.)
   //
   // That matters because a safetensors data section is 8 + header_len
   // into the file, so its alignment is whatever the header length
-  // happened to be -- and every tensor inherits it. On a checkpoint
-  // whose section is off-boundary (Comfy-Org repacks, and anything an
-  // older vpipe quantizer wrote) EVERY streamed read was cached, which
-  // is where the tens of gigabytes of file cache came from that the
-  // wired pool then had to compete with.
-  //
-  // So read on page boundaries and copy the wanted bytes out. The extra
-  // memcpy runs at memory bandwidth; the cache it avoids was costing the
-  // model its resident set.
-  if (uncached && sh.fd_stream >= 0) {
-    const std::size_t page =
-        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
-    if (page != 0 && (base % page) != 0) {
-      // One page-aligned staging buffer per thread: the streamer calls
-      // this from a prefetch thread while the forward calls it from its
-      // own, and a per-call allocation would be a megabyte-scale malloc
-      // in the middle of every block read.
-      constexpr std::size_t kChunk = 8ull << 20;      // page multiple
-      static thread_local std::vector<std::uint8_t> stage(kChunk + 16384);
-      std::size_t done = 0;
-      std::uint64_t cur = base;
-      while (done < ti->nbytes) {
-        const std::uint64_t off = cur & ~(std::uint64_t)(page - 1);
-        const std::size_t slack = (std::size_t)(cur - off);
-        std::size_t want = kChunk - slack;
-        if (want > ti->nbytes - done) { want = ti->nbytes - done; }
-        const ssize_t n = ::pread(fd, stage.data(), slack + want,
-                                  static_cast<off_t>(off));
-        if (n < 0 && errno == EINTR) { continue; }
-        if (n <= 0 || (std::size_t)n <= slack) { return false; }
-        const std::size_t got = (std::size_t)n - slack;
-        const std::size_t take = got < want ? got : want;
-        std::memcpy(out + done, stage.data() + slack, take);
-        done += take;
-        cur += take;
-      }
-      return true;
-    }
-  }
-
-  std::size_t done = 0;
-  while (done < ti->nbytes) {
-    const ssize_t n = ::pread(fd, out + done, ti->nbytes - done,
-                              static_cast<off_t>(base + done));
-    if (n < 0 && errno == EINTR) { continue; }
-    // A short read that is not EINTR is a truncated or racing file. The
-    // destination is left partly written, which is why this returns
-    // false rather than trying to paper over it -- the caller must fall
-    // back to a path that rewrites the whole buffer, not top this one up.
-    if (n <= 0) { return false; }
-    done += static_cast<std::size_t>(n);
-  }
-  return true;
+  // happened to be -- and every tensor inherits it. Every large Hub file
+  // checked here is off-boundary (all of MiniMax-H3 FL2VA's transformer
+  // and text encoder; Fibo 2.0, LFM3-VL, P-H3-Image, Open-H3-Regenerate),
+  // and since a tensor's offset from its destination is fixed by where it
+  // lies, a misaligned tensor can never be read straight into a
+  // page-aligned buffer. It is STAGED:
+  // each piece read whole on the 4 KB grid, its part copied out. The
+  // copy runs at memory bandwidth, on four threads it hides under the
+  // other pieces' reads, and the cache it avoids was costing the model
+  // its resident set.
+  const bool stage =
+      fd == sh.fd_stream &&
+      ((base | reinterpret_cast<std::uintptr_t>(dst)) % kReadGrid) != 0;
+  return read_pieces_(fd, base, ti->nbytes, static_cast<std::uint8_t*>(dst),
+                      stage);
 }
 
 metal_compute::SharedBuffer

@@ -2,6 +2,7 @@
 
 #include "common/beat-payload-intf.h"
 #include "common/encoded-segment.h"
+#include "common/ffmpeg-log-tap.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -375,27 +376,23 @@ AudioToPcmStage::ensure_decoder_(const EncodedSegment& seg)
   // channel count, not a full layout. For AAC the layout is encoded
   // in extradata (AudioSpecificConfig); for raw PCM-like codecs we
   // fall back to mono/stereo defaults by channel count.
+  // Past two channels the count is all there is: an UNSPEC layout of it
+  // (ffmpeg_channel_layout) -- the decoder states its own.
   if (seg.channels > 0) {
-    if (seg.channels == 1) {
-      cctx->ch_layout = AV_CHANNEL_LAYOUT_MONO;
-    } else if (seg.channels == 2) {
-      cctx->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
-    } else {
-      AVChannelLayout cl = AV_CHANNEL_LAYOUT_MONO;
-      cl.nb_channels = static_cast<int>(seg.channels);
-      cctx->ch_layout = cl;
-    }
+    cctx->ch_layout =
+        ffmpeg_channel_layout(static_cast<int>(seg.channels));
   }
   if (!seg.extradata.empty()) {
     cctx->extradata_size = static_cast<int>(seg.extradata.size());
     cctx->extradata = static_cast<uint8_t*>(
         _libs->avutil().api.malloc(
             cctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE));
+    // Freed BEFORE error(), which throws: after it nothing runs.
     if (!cctx->extradata) {
+      _libs->avcodec().api.free_context(&cctx);
       session()->error(fmt(
           "AudioToPcmStage('{}'): extradata alloc failed",
           this->id()));
-      _libs->avcodec().api.free_context(&cctx);
       return false;
     }
     std::memcpy(cctx->extradata, seg.extradata.data(),
@@ -403,14 +400,17 @@ AudioToPcmStage::ensure_decoder_(const EncodedSegment& seg)
     std::memset(cctx->extradata + cctx->extradata_size, 0,
                 AV_INPUT_BUFFER_PADDING_SIZE);
   }
+  FfmpegLogCapture said;            // the decoder's reason, if it refuses
   int rc = _libs->avcodec().api.open2(cctx, codec, nullptr);
   if (rc < 0) {
     char buf[256] = {0};
     _libs->avutil().api.strerror(rc, buf, sizeof(buf));
-    session()->error(fmt(
-        "AudioToPcmStage('{}'): avcodec_open2 failed: {} ({})",
-        this->id(), buf, rc));
+    // Freed BEFORE error(), which throws: it leaked on every refusal.
     _libs->avcodec().api.free_context(&cctx);
+    session()->error(fmt(
+        "AudioToPcmStage('{}'): avcodec_open2 failed: {} ({}) -- {} Hz, "
+        "{} channel(s){}", this->id(), buf, rc, seg.sample_rate,
+        seg.channels, said.suffix()));
     return false;
   }
   _dctx = cctx;
@@ -426,7 +426,8 @@ AudioToPcmStage::ensure_decoder_(const EncodedSegment& seg)
 bool
 AudioToPcmStage::ensure_resampler_(int             in_sample_rate,
                                    int             in_channels,
-                                   enum AVSampleFormat in_fmt)
+                                   enum AVSampleFormat in_fmt,
+                                   const AVChannelLayout* in_src)
 {
   if (_swr
       && in_sample_rate == _last_in_sample_rate
@@ -444,14 +445,7 @@ AudioToPcmStage::ensure_resampler_(int             in_sample_rate,
         sample_fmt_name_(_libs, in_fmt)));
     teardown_resampler_();
   }
-  AVChannelLayout in_layout = AV_CHANNEL_LAYOUT_MONO;
-  if (in_channels == 1) {
-    in_layout = AV_CHANNEL_LAYOUT_MONO;
-  } else if (in_channels == 2) {
-    in_layout = AV_CHANNEL_LAYOUT_STEREO;
-  } else {
-    in_layout.nb_channels = in_channels;
-  }
+  AVChannelLayout in_layout = ffmpeg_channel_layout(in_channels, in_src);
   // Packed FLT either way: swresample writes interleaved LRLR into one
   // buffer, which keeps the accumulate path a single growing vector. The
   // de-interleave to the planar [2, N] the oport promises happens once,
@@ -459,6 +453,20 @@ AudioToPcmStage::ensure_resampler_(int             in_sample_rate,
   AVChannelLayout out_layout =
       _channels == 2 ? AVChannelLayout(AV_CHANNEL_LAYOUT_STEREO)
                      : AVChannelLayout(AV_CHANNEL_LAYOUT_MONO);
+  // What swr was handed, and why it refused in FFmpeg's own words
+  // (FfmpegLogCapture): a bare EINVAL is otherwise unreadable after the
+  // fact.
+  FfmpegLogCapture said;
+  auto refused = [&](const char* call, int code) {
+    char buf[256] = {0};
+    _libs->avutil().api.strerror(code, buf, sizeof(buf));
+    return fmt(
+        "AudioToPcmStage('{}'): {} failed: {} (rc={}) -- in {} Hz, {} "
+        "channel(s), {}; out {} Hz, {} channel(s), flt{}",
+        this->id(), call, buf, code, in_sample_rate, in_channels,
+        sample_fmt_name_(_libs, in_fmt), _output_sample_rate, _channels,
+        said.suffix());
+  };
   SwrContext* sw = nullptr;
   int rc = _libs->swresample().api.alloc_set_opts2(
       &sw,
@@ -466,17 +474,15 @@ AudioToPcmStage::ensure_resampler_(int             in_sample_rate,
       &in_layout,  in_fmt,            in_sample_rate,
       0, nullptr);
   if (rc < 0 || !sw) {
-    session()->error(fmt(
-        "AudioToPcmStage('{}'): swr_alloc_set_opts2 failed (rc={})",
-        this->id(), rc));
+    if (sw) { _libs->swresample().api.free(&sw); }
+    session()->error(refused("swr_alloc_set_opts2", rc));
     return false;
   }
   rc = _libs->swresample().api.init(sw);
   if (rc < 0) {
-    session()->error(fmt(
-        "AudioToPcmStage('{}'): swr_init failed (rc={})",
-        this->id(), rc));
+    // Freed BEFORE error(), which throws.
     _libs->swresample().api.free(&sw);
+    session()->error(refused("swr_init", rc));
     return false;
   }
   _swr                 = sw;
@@ -527,22 +533,30 @@ AudioToPcmStage::decode_one_(const EncodedSegment& seg)
       break;
     }
     any_decoded = true;
+    // The frame's rate, channels and format -- the decoder's own where a
+    // frame leaves one unset (0, or -1 for the format).
+    const int in_sr = _frame->sample_rate > 0 ? _frame->sample_rate
+                                              : _dctx->sample_rate;
+    const int in_ch = _frame->ch_layout.nb_channels > 0
+                          ? _frame->ch_layout.nb_channels
+                          : _dctx->ch_layout.nb_channels;
+    const auto in_fmt = static_cast<enum AVSampleFormat>(
+        _frame->format >= 0 ? _frame->format : _dctx->sample_fmt);
     // Build / refresh the resampler if the frame's format changed.
-    if (!ensure_resampler_(
-            _frame->sample_rate,
-            _frame->ch_layout.nb_channels,
-            static_cast<enum AVSampleFormat>(_frame->format))) {
+    const AVChannelLayout* in_lay = _frame->ch_layout.nb_channels > 0
+                                        ? &_frame->ch_layout
+                                        : &_dctx->ch_layout;
+    if (!ensure_resampler_(in_sr, in_ch, in_fmt, in_lay)) {
       _libs->avutil().api.frame_unref(_frame);
       continue;
     }
     // Resample. The swr's out_samples upper bound is
     //   delay + in_samples * out_sr / in_sr + 32 (slack).
-    int64_t delay = _libs->swresample().api.get_delay(
-        _swr, _frame->sample_rate);
+    int64_t delay = _libs->swresample().api.get_delay(_swr, in_sr);
     int64_t max_out =
         delay + (static_cast<int64_t>(_frame->nb_samples)
                  * _output_sample_rate)
-                / std::max(1, _frame->sample_rate) + 32;
+                / std::max(1, in_sr) + 32;
     // `max_out` / `n_out` count samples PER CHANNEL; the packed buffer
     // holds `_channels` floats for each of them.
     const std::size_t ch = static_cast<std::size_t>(_channels);

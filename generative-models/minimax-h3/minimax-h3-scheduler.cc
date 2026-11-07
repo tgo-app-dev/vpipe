@@ -1,6 +1,10 @@
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 
+#include "common/vpipe-format.h"
+
 #include <cmath>
+#include <cstdlib>
+#include <string>
 
 namespace vpipe {
 namespace genai {
@@ -151,6 +155,103 @@ MiniMaxH3Scheduler::step_renoise(const float* velocity, int step_index,
     const float a = keep * x0;
     const float b = sn * noise[i];
     x[i] = a + b;
+  }
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::set_sigmas_mapped(const std::vector<double>& sigmas,
+                                      double given_shift)
+{
+#pragma clang fp contract(off)   // Python-float ops, each rounded
+  _sigmas_d.clear();
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  if (!(_shift > 0.0) || !(given_shift > 0.0) || sigmas.size() < 2) {
+    return false;
+  }
+  if (!(sigmas.front() <= 1.0) || sigmas.back() != 0.0) { return false; }
+  const bool same = given_shift == _shift;
+  std::vector<float> g;
+  g.reserve(sigmas.size());
+  for (std::size_t i = 0; i < sigmas.size(); ++i) {
+    const double s = sigmas[i];
+    if (!(s >= 0.0) || (i > 0 && !(s < sigmas[i - 1]))) { return false; }
+    if (same) {
+      g.push_back((float)s);
+      continue;
+    }
+    const double b = s / (given_shift + s * (1.0 - given_shift));
+    g.push_back((float)(_shift * b / (1.0 + (_shift - 1.0) * b)));
+  }
+  for (std::size_t i = 1; i < g.size(); ++i) {
+    if (!(g[i] < g[i - 1])) { return false; }
+  }
+  if (g.back() != 0.0f) { return false; }
+  _sigmas = std::move(g);
+  derive_();
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::sigmas_ok(const std::vector<double>& s, std::string* why)
+{
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    return false;
+  };
+  if (s.size() < 2) {
+    return no(fmt("{} sigma(s): a schedule needs a start and the "
+                  "terminal 0", s.size())());
+  }
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (!std::isfinite(s[i]) || s[i] < 0.0) {
+      return no(fmt("sigma {} is {}", i, s[i])());
+    }
+    if (i > 0 && !(s[i] < s[i - 1])) {
+      return no(fmt("sigma {} ({}) is not below sigma {} ({}); the "
+                    "list must fall strictly", i, s[i], i - 1, s[i - 1])());
+    }
+  }
+  if (s.front() > 1.0) {
+    return no(fmt("the first sigma is {}; at most 1", s.front())());
+  }
+  if (s.back() != 0.0) {
+    return no(fmt("the last sigma is {}; a schedule ends at exactly 0",
+                  s.back())());
+  }
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::parse_sigmas(std::string_view text,
+                                 std::vector<double>* out, std::string* why)
+{
+  out->clear();
+  std::string t(text);
+  for (char& ch : t) {
+    if (ch == '[' || ch == ']' || ch == ',' || ch == ';') { ch = ' '; }
+  }
+  const char* p = t.c_str();
+  for (;;) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') { ++p; }
+    if (*p == '\0') { break; }
+    char* end = nullptr;
+    const double v = std::strtod(p, &end);
+    if (end == p) {
+      if (why != nullptr) {
+        *why = fmt("'{}' is not a number", std::string(p).substr(0, 16))();
+      }
+      out->clear();
+      return false;
+    }
+    out->push_back(v);
+    p = end;
+  }
+  if (!sigmas_ok(*out, why)) {
+    out->clear();
+    return false;
   }
   return true;
 }

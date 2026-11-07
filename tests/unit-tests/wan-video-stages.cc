@@ -1654,6 +1654,127 @@ TEST(video_ref_encoder, reference_beats_are_typed_by_rank)
               "missing rate is refused\n");
 }
 
+// `present` and `image`, read off a beat's sideband, and what a carried
+// latent with no pixels then becomes. Any kind may say `present: false`
+// (an int reads as a bool, as `attach` does); a one-frame carried latent
+// is a CLIP unless it says `image: true`, and more than one frame said
+// to be an image is refused. The route: a latent with no pixels that is
+// not presented is a reference of its own, one that attaches folds onto
+// the reference before it whatever it says, and a presented unattached
+// one is refused -- the tower has nothing to read.
+TEST(video_ref_encoder, present_and_image_are_read_off_the_sideband)
+{
+  namespace h3 = vpipe::genai::minimax_h3;
+  using Route = VideoRefEncoderStage::CarriedLatent;
+  auto beat = [](std::vector<long long> shape, TensorBeat::DType dt) {
+    TensorBeatPayload tb;
+    tb.dtype = dt;
+    tb.shape = std::move(shape);
+    std::size_t n = 1;
+    for (long long d : tb.shape) { n *= (std::size_t)d; }
+    tb.resize_contiguous(n);
+    tb.sideband = FlexData::make_object();
+    return tb;
+  };
+  auto put = [](TensorBeatPayload& tb, const char* k, FlexData v) {
+    tb.sideband.as_object().insert_or_assign(k, std::move(v));
+  };
+  auto read = [](const TensorBeatPayload& tb, h3::MediaReference* m,
+                 std::string* err) {
+    *m = h3::MediaReference{};
+    err->clear();
+    return VideoRefEncoderStage::media_from_beat(tb, 1, m, err);
+  };
+  h3::MediaReference m;
+  std::string err;
+
+  // Presented by default; `present: false` on a picture, a clip, audio.
+  {
+    auto tb = beat({3, 64, 128}, TensorBeat::DType::U8);
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(m.presented);
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, false) ==
+                Route::kNone);
+    put(tb, "present", FlexData::make_bool(false));
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(!m.presented && m.kind == h3::MediaReference::Kind::kImage);
+    // Pixels are never this decision, presented or not.
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, false) ==
+                Route::kNone);
+  }
+  {
+    auto tb = beat({5, 3, 64, 128}, TensorBeat::DType::U8);
+    put(tb, "fps", FlexData::make_real(24.0));
+    put(tb, "present", FlexData::make_int(0));
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(!m.presented && m.kind == h3::MediaReference::Kind::kVideo);
+  }
+  {
+    auto tb = beat({800}, TensorBeat::DType::F32);
+    put(tb, "sr", FlexData::make_int(32000));
+    put(tb, "present", FlexData::make_bool(false));
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(!m.presented && m.kind == h3::MediaReference::Kind::kAudio);
+  }
+
+  // A carried video latent, one frame: a clip, unless it says `image`.
+  auto latent = [&](int frames) {
+    auto tb = beat({24, frames, 4, 6}, TensorBeat::DType::F32);
+    put(tb, "latent", FlexData::make_bool(true));
+    return tb;
+  };
+  {
+    auto tb = latent(1);
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kVideo);
+    EXPECT_TRUE(m.presented && m.has_video_latent() && m.rgb.empty());
+    EXPECT_TRUE(m.latent_frames == 1 && m.latent_z == 24);
+    // Presented with no pixels: refused unless it attaches.
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, false) ==
+                Route::kRefused);
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, true) ==
+                Route::kAttach);
+  }
+  {
+    auto tb = latent(1);
+    put(tb, "image", FlexData::make_bool(true));
+    put(tb, "present", FlexData::make_bool(false));
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kImage);
+    EXPECT_TRUE(!m.presented && m.latent_frames == 1);
+    EXPECT_TRUE(m.video_latent.size() == (std::size_t)24 * 4 * 6);
+    // The DiT's alone -- and an attaching beat folds whatever it says.
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, false) ==
+                Route::kOwn);
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, true) ==
+                Route::kAttach);
+  }
+  {
+    auto tb = latent(3);
+    put(tb, "present", FlexData::make_bool(false));
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kVideo);
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, false) ==
+                Route::kOwn);
+    put(tb, "image", FlexData::make_bool(true));
+    EXPECT_FALSE(read(tb, &m, &err));
+    EXPECT_TRUE(err.find("image") != std::string::npos);
+  }
+  // A soundtrack latent is audio: never this decision.
+  {
+    auto tb = beat({2, 32, 10}, TensorBeat::DType::F32);
+    put(tb, "latent", FlexData::make_bool(true));
+    put(tb, "present", FlexData::make_bool(false));
+    ASSERT_TRUE(read(tb, &m, &err));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kAudio && !m.presented);
+    EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, false) ==
+                Route::kNone);
+  }
+  std::printf("[video_ref_encoder] present / image: read off any beat; a "
+              "carried latent with no pixels is the DiT's alone, attached "
+              "or refused\n");
+}
+
 TEST(video_ref_encoder, references_may_be_empty_but_must_be_paths)
 {
   Session sess;

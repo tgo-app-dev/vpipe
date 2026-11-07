@@ -75,6 +75,54 @@ make_wav_()
   return out;
 }
 
+// A 0.25 s, 8 kHz, s16 WAV of `channels` channels, a 440 Hz sine at
+// ~0.5 in every one. `mask` non-zero writes WAVE_FORMAT_EXTENSIBLE with
+// that speaker mask (a NATIVE layout); zero, plain PCM, whose layout
+// past two channels FFmpeg leaves unnamed.
+vector<uint8_t>
+make_wav_channels_(int channels, uint32_t mask)
+{
+  constexpr int kRate = 8000, kFrames = kRate / 4;
+  const uint32_t data_len = (uint32_t)kFrames * channels * 2;
+  const uint32_t fmt_len = mask != 0 ? 40 : 16;
+  vector<uint8_t> out;
+  auto u32 = [&](uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+      out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+    }
+  };
+  auto u16 = [&](uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xff));
+    out.push_back(static_cast<uint8_t>(v >> 8));
+  };
+  auto tag = [&](const char* t) { out.insert(out.end(), t, t + 4); };
+  tag("RIFF"); u32(4 + (8 + fmt_len) + (8 + data_len)); tag("WAVE");
+  tag("fmt "); u32(fmt_len);
+  u16(mask != 0 ? 0xFFFE : 1);
+  u16((uint16_t)channels);
+  u32(kRate);
+  u32((uint32_t)kRate * channels * 2);
+  u16((uint16_t)(channels * 2));
+  u16(16);
+  if (mask != 0) {
+    u16(22);                    // cbSize
+    u16(16);                    // valid bits
+    u32(mask);
+    // KSDATAFORMAT_SUBTYPE_PCM
+    u32(0x00000001); u16(0x0000); u16(0x0010);
+    const uint8_t tail[8] = {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
+    out.insert(out.end(), tail, tail + 8);
+  }
+  tag("data"); u32(data_len);
+  for (int i = 0; i < kFrames; ++i) {
+    const double v = 0.5 * std::sin(2.0 * M_PI * 440.0 * i / kRate);
+    for (int c = 0; c < channels; ++c) {
+      u16(static_cast<uint16_t>(static_cast<int16_t>(v * 32767.0)));
+    }
+  }
+  return out;
+}
+
 }
 
 TEST(media_decode, image_bytes_to_planar_rgb) {
@@ -453,4 +501,48 @@ TEST(media_decode, probe_classifies_by_content) {
   EXPECT_TRUE(media_kind_name(MediaKind::Video) == "video");
   EXPECT_TRUE(media_kind_name(MediaKind::Audio) == "audio");
   EXPECT_TRUE(media_kind_name(MediaKind::Unknown) == "unknown");
+}
+
+// A source of more than two channels decodes, downmixed to what was
+// asked. The input layout used to be MONO with its count overwritten --
+// a NATIVE layout naming one channel -- which swr_alloc_set_opts2
+// refused (rc -22, "ichl channel layout is invalid"), so no 5.1 or 3.0
+// file decoded at all. Three sources: 6 channels with no speaker mask
+// (an UNSPEC layout), 6 with the 5.1 mask (the frame's own NATIVE
+// layout is taken), and 3 with no mask.
+TEST(media_decode, a_source_of_more_than_two_channels_decodes) {
+  Session s;
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    libs = s.ffmpeg_libraries();
+  } catch (...) {
+    return;
+  }
+  if (!libs || !libs->valid()) {
+    return;
+  }
+  struct Case { int channels; uint32_t mask; };
+  for (const Case c : {Case{6, 0}, Case{6, 0x3F}, Case{3, 0}}) {
+    const auto wav = make_wav_channels_(c.channels, c.mask);
+    for (const int out_ch : {2, 1}) {
+      string err;
+      auto au = decode_audio_bytes(
+          libs, span<const uint8_t>(wav.data(), wav.size()), 16000, &err,
+          out_ch);
+      if (!au) { printf("[media_decode] %s\n", err.c_str()); }
+      ASSERT_TRUE(au.has_value());
+      if (!au) { continue; }
+      EXPECT_TRUE(au->channels == out_ch && au->sample_rate == 16000);
+      // 0.25 s at 16 kHz = 4000 frames a channel, planar.
+      const size_t n = au->pcm.size() / (size_t)out_ch;
+      EXPECT_TRUE(n > 3900 && n < 4100);
+      double sq = 0.0;
+      for (float v : au->pcm) { sq += (double)v * v; }
+      const double rms = std::sqrt(sq / (double)max<size_t>(1,
+                                                            au->pcm.size()));
+      printf("[media_decode] %d ch (mask 0x%X) -> %d ch: %zu frames, rms "
+             "%.3f\n", c.channels, (unsigned)c.mask, out_ch, n, rms);
+      EXPECT_TRUE(rms > 0.05);
+    }
+  }
 }

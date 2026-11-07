@@ -127,9 +127,10 @@ class MetalMiniMaxH3VideoVae {
     // A CAPABILITY OF THE WEIGHTS, never of the request, which is why it
     // is read from the file rather than configured. Every H3 checkpoint
     // has the same geometry and the same tensor names, so nothing about
-    // the shapes distinguishes the two -- run `decode_image` on the
-    // stock video decoder and it returns a picture-shaped buffer full of
-    // the wrong thing. The released image checkpoint says so in its
+    // the shapes distinguishes the two -- the stock video decoder handed
+    // one token alone returns a picture-shaped buffer full of the wrong
+    // thing (its `decode_image` reads a chunk of copies instead). The
+    // released image checkpoint says so in its
     // `__metadata__` (`h3_t1_direct` / `h3_t1_output_slice`); a
     // checkpoint that says nothing does not have it.
     //
@@ -230,6 +231,14 @@ class MetalMiniMaxH3VideoVae {
                                         int lw);
   static std::size_t decode_working_bytes(const Config& c, int LT, int lh,
                                           int lw);
+  // What decode_image() allocates beside the weights for an lh x lw
+  // still, the picture it returns included: the latent and the chunk of
+  // copies decoded in its place, one tile's decode at every frame it
+  // expands to (cut to the kept frame as it finishes), two rows of kept
+  // frames, the stitched picture, and the ViT scratch of the widest
+  // tile. 0 for a decoder that reads no still. An image-only decoder's
+  // decode_working_bytes is this figure.
+  static std::size_t still_decode_bytes(const Config& c, int lh, int lw);
 
   // Decode one latent grid. `z` is CHANNEL-FIRST [z_channels, T, h, w]
   // bf16 -- the layout the DiT's unpatchify produces -- and the result is
@@ -257,13 +266,22 @@ class MetalMiniMaxH3VideoVae {
   // `t1_direct` closes that gap: its decoder was fine-tuned to read one
   // token on its own.
   //
-  // False on a checkpoint that does not declare the capability, because
-  // the failure is otherwise invisible: the stock video decoder returns
-  // a correctly shaped picture that merely looks wrong, and the rope is
-  // why. `build_rope_` normalizes the temporal axis by `T` ITSELF, so a
-  // lone latent lands at coordinate 0.0 -- the middle of the spread a
-  // 7-frame chunk gives its frames, and a grid no voxel occupies during
-  // a video decode. The fine-tune is what learned it.
+  // The STOCK video decoder cannot read a lone token -- it returns a
+  // correctly shaped picture that merely looks wrong, and the rope is
+  // why: `build_rope_` normalizes the temporal axis by `T` ITSELF, so a
+  // lone latent lands at coordinate 0.0, a grid no voxel occupies during
+  // a video decode. So it reads a still as the reference's ComfyUI VAE
+  // does (`MiniMaxH3VideoVAE.decode`, a still latent): `tokens_per_chunk()`
+  // copies of the token decoded as one chunk, frame `frame_pre_pad()`
+  // kept -- the first frame a chunk really carries, the slice the image
+  // checkpoint names too. MEASURED on a 512 crop of a photo: 33.00 dB
+  // PSNR as 5 copies, 17.15 dB alone (the image checkpoint reports 30.44
+  // over its own 512 set). That is how a stored reference's still (a
+  // RefMod's picture) reaches a vision tower with no image checkpoint.
+  // Only the kept frame is stitched (decode_tiled_'s `keep`): the copies
+  // expand to 20 pixel frames, and stitching them all held 297 MB at
+  // 1024^2 against 119 MB for the one kept. still_decode_bytes is what
+  // it holds.
   //
   // Spatially tiled exactly as `decode_video` tiles, and the tiling is
   // REQUIRED rather than an optimization. MEASURED on a 512px centre
@@ -284,9 +302,12 @@ class MetalMiniMaxH3VideoVae {
   decode_image(const metal_compute::SharedBuffer& z, int h, int w,
                std::string* err = nullptr);
 
-  // Whether `decode_image` will run at all -- `t1_direct` under the
-  // name a caller asks its question in.
-  bool can_decode_image() const { return _cfg.t1_direct; }
+  // Whether `decode_image` will run at all: a checkpoint fine-tuned for
+  // it, or a video decoder (a chunk of copies).
+  bool can_decode_image() const
+  {
+    return _cfg.t1_direct || _cfg.decodes_video();
+  }
 
   // Encode ONE temporal clip -- the reference's `_encode_clip` with
   // tiling off. `x` is CHANNEL-FIRST [in_channels, T, H, W] bf16 in
@@ -619,9 +640,13 @@ class MetalMiniMaxH3VideoVae {
   metal_compute::SharedBuffer
   encode_tiled_(const metal_compute::SharedBuffer& x, int T, int H, int W,
                 std::string* err);
+  // `keep` >= 0 stitches that one pixel frame of the LT * out_patch_t()
+  // a decode expands to, each tile cut to it as it finishes -- a still
+  // needs one, and the stitch is per frame, so it is the same frame the
+  // whole decode would give, bit for bit. -1 stitches every frame.
   metal_compute::SharedBuffer
   decode_tiled_(const metal_compute::SharedBuffer& z, int LT, int lh, int lw,
-                std::string* err);
+                std::string* err, int keep = -1);
 
   // Cross-fade a grid of channel-first [C, T, th, tw] tiles into one
   // [C, T, out_h, out_w]. `ratio` converts the split's PIXEL units into

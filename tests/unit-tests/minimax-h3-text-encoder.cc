@@ -36,6 +36,7 @@
 #include "common/session.h"
 #include "stages/model-quantize-stage.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
 #include <cmath>
@@ -46,6 +47,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace vpipe;
@@ -1152,4 +1154,144 @@ TEST(minimax_h3_text_enc, quantized_reloads)
               std::sqrt(sq / (double)((std::size_t)n * cfg.text_dim)), n);
   EXPECT_TRUE(finite);
   EXPECT_TRUE(sq > 0.0);
+}
+
+// A reference NOT PRESENTED is the DiT's alone: no label, no tower run,
+// the tags after it numbered without it, its rows laid out as ever. Two
+// pictures, the first not presented, must present EXACTLY as the second
+// alone -- its "<Picture 1>", the same ids, tags and conditioning bytes
+// -- while both presented present more; the tower must not run for the
+// first (the encoder's own progress labels say which ran). A carried
+// latent with no pixels: presented, refused up front ("not presented"
+// in the reason); not presented, the prompt alone is presented.
+//
+// Truncated to two layers as the prompt-only test is: the claim is
+// equality. No VAE is loaded, so a picture's rows are not encoded --
+// the presentation is what is under test. Env:
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH only.
+TEST(minimax_h3_text_enc, an_unpresented_reference_is_the_dits_alone)
+{
+  namespace h3 = minimax_h3;
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &err));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  auto enc = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  auto tower = MiniMaxH3TextEncoder::load_vision(root, mc, cfg, &err);
+  if (!tower) { std::printf("[minimax_h3_text_enc] tower: %s\n", err.c_str()); }
+  ASSERT_TRUE(enc != nullptr && tower != nullptr);
+  if (enc == nullptr || tower == nullptr) { return; }
+
+  // Two different pictures, already on the 32-grid, kept at that size.
+  auto picture = [](int H, int W, int seed) {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1;
+    m.height = H;
+    m.width = W;
+    m.short_edge = 0;
+    m.rgb.resize((std::size_t)3 * H * W);
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          m.rgb[((std::size_t)c * H + y) * W + x] =
+              (std::uint8_t)((x * (c + seed) + y * (2 * seed + 1)) & 255);
+        }
+      }
+    }
+    return m;
+  };
+  const h3::MediaReference a = picture(96, 128, 1);
+  const h3::MediaReference b = picture(128, 96, 3);
+  h3::MediaReference a_alone = a;
+  a_alone.presented = false;
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  h3::ReferenceEncoders models;
+  models.mc = mc;
+  models.vision = tower.get();
+  models.text = enc.get();
+  std::vector<std::string> details;
+  models.progress = [&details](std::uint64_t, std::uint64_t,
+                               const std::string& d) {
+    details.push_back(d);
+  };
+  auto run = [&](std::vector<h3::MediaReference> refs,
+                 h3::EncodedReferences* out, std::string* e) {
+    details.clear();
+    e->clear();
+    const bool ok = h3::encode_references(refs, kPrompt, plan, models, out, e);
+    if (!ok) { std::printf("[minimax_h3_text_enc] %s\n", e->c_str()); }
+    return ok;
+  };
+  auto ran = [&details](const std::string& what) {
+    for (const std::string& d : details) {
+      if (d == what) { return true; }
+    }
+    return false;
+  };
+
+  h3::EncodedReferences e_ab, e_b, e_both, e_none;
+  std::string e1, e2, e3, e4;
+  ASSERT_TRUE(run({a_alone, b}, &e_ab, &e1));
+  const bool tower_a = ran("reference 1/2 (image): vision tower");
+  const bool tower_b = ran("reference 2/2 (image): vision tower");
+  ASSERT_TRUE(run({b}, &e_b, &e2));
+  ASSERT_TRUE(run({a, b}, &e_both, &e3));
+  ASSERT_TRUE(run({}, &e_none, &e4));
+
+  const std::size_t row = (std::size_t)cfg.text_dim * 2;
+  auto same_rows = [&](const h3::EncodedReferences& x,
+                       const h3::EncodedReferences& y) {
+    const std::size_t n = (std::size_t)x.n_tokens * row;
+    return x.n_tokens == y.n_tokens && x.token_tags == y.token_tags &&
+           x.conditioning.byte_size() >= n &&
+           y.conditioning.byte_size() >= n &&
+           std::memcmp(x.conditioning.contents(), y.conditioning.contents(),
+                       n) == 0;
+  };
+  const bool as_b = same_rows(e_ab, e_b);
+  std::printf("[minimax_h3_text_enc] presentation: the prompt %d tokens, "
+              "b alone %d, a unpresented + b %d (%s b's), a + b %d; tower "
+              "run for a: %s, for b: %s\n", e_none.n_tokens, e_b.n_tokens,
+              e_ab.n_tokens, as_b ? "IDENTICAL to" : "DIFFERS from",
+              e_both.n_tokens, tower_a ? "yes" : "no",
+              tower_b ? "yes" : "no");
+  EXPECT_TRUE(as_b);
+  EXPECT_TRUE(e_both.n_tokens > e_b.n_tokens);
+  EXPECT_TRUE(e_b.n_tokens > e_none.n_tokens);
+  EXPECT_TRUE(!tower_a && tower_b);
+  // Both laid out: the presentation is all that left it.
+  EXPECT_TRUE(e_ab.layout.size() == 2 && e_b.layout.size() == 1);
+
+  // A still's latent with no pixels. Presented, the tower has nothing to
+  // read, and it is refused before the conditioner runs.
+  h3::MediaReference lat;
+  lat.kind = h3::MediaReference::Kind::kImage;
+  lat.latent_z = 4;
+  lat.latent_frames = 1;
+  lat.latent_height = 4;
+  lat.latent_width = 6;
+  lat.video_latent.assign((std::size_t)4 * 4 * 6, 0.25f);
+  h3::EncodedReferences e_lat;
+  std::string el;
+  details.clear();
+  EXPECT_FALSE(h3::encode_references({lat}, kPrompt, plan, models, &e_lat,
+                                     &el));
+  EXPECT_TRUE(el.find("not presented") != std::string::npos);
+  // Not presented: the prompt alone, the latent's rows laid out.
+  lat.presented = false;
+  ASSERT_TRUE(run({lat}, &e_lat, &el));
+  EXPECT_TRUE(same_rows(e_lat, e_none));
+  EXPECT_TRUE(e_lat.layout.size() == 1 &&
+              e_lat.layout[0].kind == h3::Reference::Kind::kImage &&
+              e_lat.video_rows.size() == lat.video_latent.size());
 }
