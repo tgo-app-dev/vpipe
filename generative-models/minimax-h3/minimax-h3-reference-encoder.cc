@@ -374,18 +374,10 @@ condition_frame_indices(int num_frames, double fps, double sample_fps,
     }
     cursor += stride;
   }
-  if ((int)indices->size() < temporal_patch) {
-    const long long minimum = rnd((double)(temporal_patch - 1) * stride) + 1;
-    return fail("a reference video is read at " +
-                std::to_string(sample_fps) + " fps and its sampled frames "
-                "are merged in groups of " + std::to_string(temporal_patch) +
-                ", so it must run at least " + std::to_string(minimum) +
-                " frames, got " + std::to_string(num_frames));
-  }
-
   // One timestamp per sampled frame, the LAST repeated until the count
   // fills a whole number of merged groups, then a group's label is the
-  // mean of its first and last.
+  // mean of its first and last. One frame sampled is one group, the
+  // frame twice (ComfyUI's repeat-pad; the tower repeats its pixels).
   std::vector<double> ts;
   ts.reserve(indices->size() + (std::size_t)temporal_patch);
   for (std::size_t i = 0; i < indices->size(); ++i) {
@@ -442,10 +434,9 @@ validate_reference_request(const std::vector<MediaReference>& refs,
                 std::to_string(limits.max_references) +
                 " references in total, got " + std::to_string(refs.size()));
   }
-  if (n_img == 0 && n_vid == 0) {
-    return fail("an audio reference has to be paired with at least one "
-                "image or video reference and cannot be used on its own");
-  }
+  // Audio alone passes: its label precedes the prompt and its rows sit
+  // on the clock ahead of the generated ones, as ComfyUI's reference
+  // node packs a request of nothing but soundtracks.
   return true;
 }
 
@@ -457,6 +448,31 @@ audio_reference_seconds(const MediaReference& m, double max_seconds)
   }
   const double samples = (double)(m.pcm.size() / (std::size_t)m.channels);
   return samples / (double)m.sample_rate + 1.0;
+}
+
+std::size_t
+audio_encode_bytes(const std::vector<MediaReference>& refs,
+                   const ReferencePlan& plan,
+                   const MetalMiniMaxH3AudioVae* vae)
+{
+  if (vae == nullptr || plan.target_frames <= 0) { return 0; }
+  const double max_seconds = (double)plan.target_frames / kFps;
+  std::size_t most = 0;
+  for (const MediaReference& m : refs) {
+    // encode_references' order: a carried latent first, never encoded.
+    if (m.has_audio_latent() || !m.has_audio() || m.channels <= 0 ||
+        m.sample_rate <= 0) {
+      continue;
+    }
+    // normalize_audio_reference's cut, at the source rate.
+    const long long n = (long long)(m.pcm.size() / (std::size_t)m.channels);
+    const long long cap = (long long)(audio_reference_seconds(m, max_seconds)
+                                      * (double)m.sample_rate);
+    const int kept = (int)std::min(n, std::max(0LL, cap));
+    most = std::max(most, MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+                              vae->config(), kept, 2));
+  }
+  return most;
 }
 
 bool

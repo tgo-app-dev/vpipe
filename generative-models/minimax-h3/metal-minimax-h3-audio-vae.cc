@@ -935,6 +935,44 @@ MetalMiniMaxH3AudioVae::encoded_frames(int samples) const
   return (samples + h - 1) / h;
 }
 
+// encode()'s allocations, term for term: keep the two in step.
+std::size_t
+MetalMiniMaxH3AudioVae::encode_scratch_bytes(const Config& c, int samples,
+                                             int stereo)
+{
+  const int h = c.hop();
+  if (samples <= 0 || stereo <= 0 || h <= 0) { return 0; }
+  const std::size_t B = (std::size_t)stereo;
+  const std::size_t T = (std::size_t)((samples + h - 1) / h);
+  const std::size_t S = T * (std::size_t)h;
+  const std::size_t LD = (std::size_t)c.latent_dim;
+  const std::size_t ZC = (std::size_t)c.latent_channels;
+  // The trunk's widest activation, walked as encode() walks it (each
+  // stride conv is kernel 2 x rate, padded by ceil(rate / 2)).
+  std::size_t need = B * S * (std::size_t)c.encoder_dim;
+  long long L = (long long)S;
+  std::size_t W = (std::size_t)c.encoder_dim;
+  for (int rate : c.down_rates) {
+    if (rate <= 0) { return 0; }
+    need = std::max(need, B * (std::size_t)L * W);
+    L = (L + 2 * ((rate + 1) / 2) - 2 * rate) / rate + 1;
+    W *= 2;
+    need = std::max(need, B * (std::size_t)L * W);
+  }
+  need = std::max(need, B * T * LD);
+  const std::size_t col_cap = 8u << 20;      // f16 elements
+  const std::size_t hidden  = 2 * ZC;        // max(ZC, the MLP's width)
+  // f16 buffers, each a whole number of 16 KB pages as Metal makes them.
+  auto buf = [](std::size_t elems) {
+    const std::size_t pg = 16384;
+    return (elems * 2 + pg - 1) / pg * pg;
+  };
+  return 3 * buf(need) + buf(col_cap)          // cur, t1, t2, the band
+         + 4 * buf(B * T * LD)                 // q, k, v, attention out
+         + 2 * buf(B * T * hidden)             // the MLP's two
+         + buf(B * T * ZC);                    // the residual
+}
+
 // Build the encoder half. Split out of load() because `t2va` / `fl2va`
 // never touch it, and it is ~110 tensors that would otherwise be read,
 // folded and held for every generation that has no reference soundtrack.

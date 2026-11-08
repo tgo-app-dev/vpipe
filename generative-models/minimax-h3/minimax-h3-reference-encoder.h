@@ -391,28 +391,30 @@ struct ReferenceEncoders {
 // makes the first block 0.25 s, which "%.1f" renders as "0.2" rather
 // than "0.3": both C's and Python's formatting round half to even.
 //
-// False when the clip is too short to fill one merged group, with the
-// minimum length in `err` -- a case worth naming, since the tower would
-// otherwise silently pad it.
+// A clip too short to fill one merged group -- ONE frame sampled, under
+// 13 at 24 -> 2 fps -- is a group of that frame twice, at its own time
+// ("<0.0 seconds>"), as ComfyUI's H3 text encoder repeat-pads it: its
+// native reference node takes clips from 5 frames, and a stored latent
+// of 2 or 3 frames (a RefMod) decodes to 5 or 9. The tower repeats the
+// frame itself (encode_video). False only for arguments out of range.
 bool condition_frame_indices(int num_frames, double fps, double sample_fps,
                              int temporal_patch, std::vector<int>* indices,
                              std::vector<float>* block_seconds,
                              std::string* err = nullptr);
 
-// Check a request against the released checkpoint's limits.
+// Check a request against the released checkpoint's limits: counts per
+// modality and in total, nothing else.
 //
-// The one rule that is not a count: an AUDIO reference may not be the
-// only kind. A soundtrack never reaches the conditioner, so a request
-// of nothing but audio has no visual reference at all -- it is a `t2va`
-// request wearing a `ref2va` shape, and it packs a sequence whose text
-// rows describe references the model cannot see.
+// AUDIO ALONE passes. A soundtrack never reaches the vision tower, but
+// it is not invisible: the presentation carries its "<Audio j>: " label
+// ahead of the prompt and the DiT reads its rows, packed on the shared
+// clock before the generated ones -- ComfyUI's MiniMax-H3 reference
+// node takes such a request and packs it the same way.
 //
-// An EMPTY list passes. It is the prompt-only form of `ref2va`, and it
-// differs from audio-alone in the way that matters: nothing in its
-// presentation describes a reference, so there is nothing the model is
-// told about and cannot see. Whether a caller MEANT it is the stage's
-// question (an absent list and an explicitly empty one look the same by
-// the time they get here), not this one's.
+// An EMPTY list passes too. It is the prompt-only form of `ref2va`.
+// Whether a caller MEANT it is the stage's question (an absent list and
+// an explicitly empty one look the same by the time they get here), not
+// this one's.
 bool validate_reference_request(const std::vector<MediaReference>& refs,
                                 const ReferenceLimits& limits,
                                 std::string* err = nullptr);
@@ -422,6 +424,15 @@ bool validate_reference_request(const std::vector<MediaReference>& refs,
 // or, kept WHOLE, its own length and a second, so the int() of
 // seconds * rate takes every sample.
 double audio_reference_seconds(const MediaReference& m, double max_seconds);
+
+// The device bytes of the LARGEST audio-VAE encode a request runs --
+// soundtracks are encoded one at a time, each at the length it is kept
+// (audio_reference_seconds), and a carried soundtrack latent runs none.
+// MetalMiniMaxH3AudioVae::encode_scratch_bytes at that length; 0 with
+// no PCM soundtrack or no VAE.
+std::size_t audio_encode_bytes(const std::vector<MediaReference>& refs,
+                               const ReferencePlan& plan,
+                               const MetalMiniMaxH3AudioVae* vae);
 
 // Normalize and encode a whole `ref2va` request.
 //

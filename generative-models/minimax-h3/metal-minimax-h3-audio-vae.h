@@ -192,6 +192,19 @@ class MetalMiniMaxH3AudioVae {
   // right-pad makes this a CEILING, not a truncation.
   int encoded_frames(int samples) const;
 
+  // What encode() ALLOCATES on the device for `samples` per channel of
+  // `stereo` channels, freed when it returns: the trunk's three
+  // activation buffers at its widest (the input convolution's output,
+  // stereo x padded samples x encoder_dim -- ~768 bytes a sample on the
+  // released checkpoint, 25 MB a second of soundtrack), the 16 MB
+  // im2col band and the posterior head's buffers. From the config alone,
+  // so a plan can book it before anything loads; the head's MLP width
+  // is the released one's (2 x latent_channels), ~1% of the whole. The
+  // encoder half's WEIGHTS are not in it. 0 when `samples` is not
+  // positive.
+  static std::size_t encode_scratch_bytes(const Config& cfg, int samples,
+                                          int stereo = 2);
+
   // Whether the encoder half is loaded. It is built on first encode()
   // and released with the model; a decode-only pipeline never pays for
   // it. False when the checkpoint carries no `encoder.*` tensors at all

@@ -36,6 +36,7 @@
 #include "common/job.h"
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/weight-set.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
@@ -43,6 +44,7 @@
 #include "pipeline/typed-stage.h"
 #include "stages/audio-vae-decode-stage.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -51,6 +53,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1138,4 +1141,163 @@ TEST(minimax_h3_avae, decode_bench)
   std::printf("[minimax_h3_avae] %d frames -> %.2f s stereo in %.1f ms "
               "(%.0fx realtime)\n", T, secs, ms, secs * 1000.0 / ms);
   EXPECT_TRUE(ms > 0.0);
+}
+
+namespace {
+
+// The device's growth over a settled baseline while `fn` runs, sampled.
+template <typename Fn>
+std::size_t
+device_peak_of_(MetalCompute* mc, Fn&& fn)
+{
+  const std::size_t base = mc->memory_budget_settled().allocated;
+  std::atomic<std::size_t> peak{base};
+  std::atomic<bool> done{false};
+  std::thread sampler([&] {
+    while (!done.load()) {
+      const std::size_t a = mc->memory_budget().allocated;
+      if (a > peak.load()) { peak.store(a); }
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+  });
+  fn();
+  done.store(true);
+  sampler.join();
+  const std::size_t top =
+      std::max(peak.load(), mc->memory_budget().allocated);
+  return top > base ? top - base : 0;
+}
+
+std::vector<float>
+noise_pcm_(int samples, unsigned seed)
+{
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> nd(0.0f, 0.1f);
+  std::vector<float> pcm((std::size_t)2 * samples);
+  for (float& v : pcm) { v = nd(rng); }
+  return pcm;
+}
+
+}  // namespace
+
+// What an encode ALLOCATES is what encode_scratch_bytes() states -- the
+// figure video-ref-encoder books for a soundtrack reference, and the
+// only one: at 25 MB a second, a soundtrack kept whole is gigabytes.
+// The encoder half is built by a warm-up encode first, so the sampled
+// growth is the encode's own. And audio_encode_bytes() takes the
+// LARGEST encode a request runs, at the length each soundtrack is kept.
+TEST(minimax_h3_avae, an_encode_allocates_what_it_books)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+  if (vae == nullptr) { return; }
+  const int rate = cfg.sample_rate;
+  {
+    const std::vector<float> warm = noise_pcm_(rate, 1);
+    std::vector<float> z;
+    ASSERT_TRUE(vae->encode(warm.data(), 2, rate, &z, nullptr, &err));
+    ASSERT_TRUE(vae->has_encoder());
+  }
+  bool all_covered = true, all_close = true;
+  for (double secs : {1.0, 3.04, 10.0, 30.0}) {
+    const int n = (int)(secs * rate);
+    const std::vector<float> pcm = noise_pcm_(n, 7);
+    std::vector<float> z;
+    bool ok = false;
+    const std::size_t peak = device_peak_of_(mc, [&] {
+      ok = vae->encode(pcm.data(), 2, n, &z, nullptr, &err);
+    });
+    EXPECT_TRUE(ok);
+    const std::size_t booked =
+        MetalMiniMaxH3AudioVae::encode_scratch_bytes(cfg, n);
+    const bool covered = peak <= booked;
+    const bool close = (double)booked <= 1.05 * (double)peak + (4u << 20);
+    all_covered = all_covered && covered;
+    all_close = all_close && close;
+    std::printf("[minimax_h3_avae] encode of %5.2f s: device peak %7.1f MB, "
+                "booked %7.1f MB (%lld bytes over)%s\n", secs, peak / 1048576.0,
+                booked / 1048576.0, (long long)peak - (long long)booked,
+                covered ? (close ? "" : "  (LOOSE)") : "  (UNDER)");
+  }
+  EXPECT_TRUE(all_covered);
+  EXPECT_TRUE(all_close);
+
+  // The request's figure: a soundtrack cut to a 73-frame clip, one kept
+  // whole, a carried latent and a picture -- the whole one sets it.
+  namespace h3 = minimax_h3;
+  h3::ReferencePlan plan;
+  plan.target_frames = 73;
+  auto sound = [&](double secs, bool whole) {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kAudio;
+    m.channels = 2;
+    m.sample_rate = rate;
+    m.pcm.assign((std::size_t)2 * (std::size_t)(secs * rate), 0.0f);
+    m.whole = whole;
+    return m;
+  };
+  h3::MediaReference carried;
+  carried.kind = h3::MediaReference::Kind::kAudio;
+  carried.audio_latent_channels = cfg.latent_channels;
+  carried.audio_latent_frames = 4000;
+  carried.audio_latent.assign((std::size_t)2 * cfg.latent_channels * 4000,
+                              0.0f);
+  h3::MediaReference picture;
+  picture.kind = h3::MediaReference::Kind::kImage;
+  const std::size_t cut = h3::audio_encode_bytes(
+      {sound(10.0, false), carried, picture}, plan, vae.get());
+  const std::size_t whole = h3::audio_encode_bytes(
+      {sound(10.0, false), sound(10.0, true), carried}, plan, vae.get());
+  const std::size_t none =
+      h3::audio_encode_bytes({carried, picture}, plan, vae.get());
+  EXPECT_TRUE(cut == MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+                         cfg, (int)(73.0 / h3::kFps * rate)));
+  EXPECT_TRUE(whole == MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+                           cfg, 10 * rate));
+  EXPECT_TRUE(none == 0);
+  std::printf("[minimax_h3_avae] a request's encode: cut %.1f MB, one kept "
+              "whole %.1f MB, a carried latent alone %zu\n",
+              cut / 1048576.0, whole / 1048576.0, none);
+}
+
+// Two holders of one audio VAE THROUGH THE MANAGER hold one decoder: the
+// second load builds nothing, where the dir overload builds a private
+// copy of every weight. video-ref-encoder used the dir overload beside
+// audio-vae-decode's managed copy -- the decoder twice, neither half of
+// its own copy in any plan.
+TEST(minimax_h3_avae, holders_through_the_manager_share_its_weights)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_AVAE_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3AudioVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(root, cfg, &err));
+  std::unique_ptr<MetalMiniMaxH3AudioVae> a, b, p;
+  const std::size_t first = device_peak_of_(mc, [&] {
+    a = MetalMiniMaxH3AudioVae::load(open_weight_set(root, &sess), mc, cfg);
+  });
+  const std::size_t second = device_peak_of_(mc, [&] {
+    b = MetalMiniMaxH3AudioVae::load(open_weight_set(root, &sess), mc, cfg);
+  });
+  const std::size_t priv = device_peak_of_(mc, [&] {
+    p = MetalMiniMaxH3AudioVae::load(root, mc, cfg);
+  });
+  ASSERT_TRUE(a != nullptr && b != nullptr && p != nullptr);
+  std::printf("[minimax_h3_avae] load through the manager %.1f MB, a second "
+              "holder %.1f MB, the dir overload %.1f MB\n",
+              first / 1048576.0, second / 1048576.0, priv / 1048576.0);
+  EXPECT_TRUE(first > (64u << 20));
+  EXPECT_TRUE(second < (4u << 20));
+  EXPECT_TRUE(priv > first / 2);
 }

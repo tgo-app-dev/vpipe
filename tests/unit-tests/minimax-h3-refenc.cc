@@ -18,6 +18,7 @@
 
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-references.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
 #include <algorithm>
 #include <cmath>
@@ -162,24 +163,36 @@ TEST(minimax_h3_refenc, condition_frames_match_the_reference)
   EXPECT_TRUE(checked == (int)(sizeof(kFrames) / sizeof(kFrames[0])));
 }
 
-TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_named)
+TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_one_group)
 {
-  // Qwen3-VL merges the sampled frames in PAIRS, so one sampled frame is
-  // not a vision block. Left to the tower it would be padded into one
-  // silently, which conditions the model on a still it was told is
-  // motion.
+  // Qwen3-VL merges the sampled frames in PAIRS. A clip that samples one
+  // -- under 13 frames at 24 -> 2 fps -- is one group of that frame
+  // twice at its own time, as ComfyUI's H3 text encoder repeat-pads it
+  // (its reference node takes clips from 5 frames; a RefMod's stored
+  // 3-frame latent decodes to 9). It was refused, and the refusal ended
+  // the graph with no clip.
   std::vector<int> idx;
   std::vector<float> blocks;
   std::string err;
-  EXPECT_FALSE(h3::condition_frame_indices(11, h3::kFps, 2.0, 2, &idx,
-                                           &blocks, &err));
-  EXPECT_TRUE(!err.empty());
+  for (int n : {1, 5, 9, 12}) {
+    EXPECT_TRUE(h3::condition_frame_indices(n, h3::kFps, 2.0, 2, &idx,
+                                            &blocks, &err));
+    EXPECT_TRUE(idx.size() == 1 && idx[0] == 0);
+    EXPECT_TRUE(blocks.size() == 1 && blocks[0] == 0.0f);
+  }
+  // The text encoder labels the padded group alike.
+  const std::vector<float> label =
+      vpipe::genai::MiniMaxH3TextEncoder::video_block_seconds(1, 2.0f, 2);
+  EXPECT_TRUE(label.size() == 1 && label[0] == 0.0f);
   // 13 frames is the first length that samples two: round(1 * 12) + 1.
   EXPECT_TRUE(h3::condition_frame_indices(13, h3::kFps, 2.0, 2, &idx,
                                           &blocks, &err));
   EXPECT_TRUE(idx.size() == 2 && blocks.size() == 1);
-  std::printf("[minimax_h3_refenc] a 11-frame clip is refused (\"%s\"), 13 "
-              "frames sample %zu\n", err.c_str(), idx.size());
+  // Only rates out of range are refused.
+  EXPECT_FALSE(h3::condition_frame_indices(0, h3::kFps, 2.0, 2, &idx,
+                                           &blocks, &err));
+  std::printf("[minimax_h3_refenc] 1-12 frames sample one group at 0.0 s, "
+              "13 frames sample %zu\n", idx.size());
 }
 
 // The progress contract, without a single model loaded.
@@ -310,6 +323,102 @@ TEST(minimax_h3_refenc, a_carried_soundtrack_latent_packs_its_rows)
   std::printf("[minimax_h3_refenc] carried soundtrack: %d of %d values "
               "misplaced; %d reference audio rows\n", bad, 2 * AC * n,
               L.num_condition_audio_rows);
+}
+
+// A request of ONE SOUNDTRACK and nothing else -- no picture, no clip.
+// It encodes to audio rows alone, and the layout packs them ahead of
+// the generated rows: [text | reference audio | target audio | target
+// video], the reference pinned to the TARGET width grid's two extremes
+// from where the text ends, and the generated rows exactly the
+// prompt-only layout's moved along the time axis by the soundtrack's
+// latents -- as ComfyUI's reference node places a standalone audio
+// block. A carried latent, so every model pointer is null.
+TEST(minimax_h3_refenc, a_soundtrack_alone_packs_ahead_of_the_generated_rows)
+{
+  const int AC = 4, n = 5, ntext = 8, lt = 7, lh = 4, lw = 6, alat = 12;
+  h3::MediaReference sound;
+  sound.kind = h3::MediaReference::Kind::kAudio;
+  sound.audio_latent_channels = AC;
+  sound.audio_latent_frames = n;
+  sound.audio_latent.resize((std::size_t)2 * AC * n);
+  for (std::size_t i = 0; i < sound.audio_latent.size(); ++i) {
+    sound.audio_latent[i] = 0.5f * (float)i;
+  }
+  h3::ReferenceLimits lim;
+  std::string err;
+  ASSERT_TRUE(h3::validate_reference_request({sound}, lim, &err));
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  h3::ReferenceEncoders models;
+  h3::EncodedReferences enc;
+  const bool ok = h3::encode_references({sound}, "a prompt", plan, models,
+                                        &enc, &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  ASSERT_TRUE(enc.layout.size() == 1);
+  EXPECT_TRUE(enc.layout[0].kind == h3::Reference::Kind::kAudio);
+  EXPECT_TRUE(enc.layout[0].num_audio_latents == n);
+  EXPECT_TRUE(enc.video_rows.empty());
+  EXPECT_TRUE(enc.audio_rows.size() == (std::size_t)2 * AC * n);
+
+  const std::vector<int> tags((std::size_t)ntext, h3::kTextTag);
+  h3::PackedLayout L, E;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, enc.layout, lt, lh, lw, alat, 2, 2, h3::kAudioChannels, &L));
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, {}, lt, lh, lw, alat, 2, 2, h3::kAudioChannels, &E));
+  const int ref_rows = h3::kAudioChannels * n;
+  EXPECT_TRUE(L.seq_len == E.seq_len + ref_rows);
+  EXPECT_TRUE(L.num_condition_video_rows == 0);
+  EXPECT_TRUE(L.num_condition_audio_rows == ref_rows);
+  EXPECT_TRUE(L.video_runs.size() == 1);
+  ASSERT_TRUE(L.audio_runs.size() == 2);
+  EXPECT_TRUE(L.audio_runs[0].start == ntext &&
+              L.audio_runs[0].count == ref_rows);
+  EXPECT_TRUE(L.audio_start == ntext + ref_rows);
+  auto at = [](const h3::PackedLayout& P, int row, int axis) {
+    return P.position_ids[(std::size_t)row * 3 + (std::size_t)axis];
+  };
+
+  // The reference's rows: time from where the text ends, no height, the
+  // width the generated soundtrack's own channel takes.
+  int off = 0;
+  for (int c = 0; c < h3::kAudioChannels; ++c) {
+    for (int i = 0; i < n; ++i) {
+      const int row = ntext + c * n + i;
+      const int gen = E.audio_start + c * alat;
+      if (at(L, row, 0) != (double)(ntext + i) || at(L, row, 1) != 0.0 ||
+          at(L, row, 2) != at(E, gen, 2) ||
+          L.token_tags[(std::size_t)row] != E.token_tags[(std::size_t)gen]) {
+        ++off;
+      }
+    }
+  }
+  EXPECT_TRUE(off == 0);
+
+  // The generated rows: the prompt-only layout's, `n` later in time --
+  // to an ulp, since a video frame's time is its origin plus the
+  // frames' 5/3 spans summed in double from there.
+  int moved = 0;
+  double worst = 0.0;
+  for (int r = 0; r < E.seq_len - ntext; ++r) {
+    const int a = E.audio_start + r, b = L.audio_start + r;
+    const double dt = std::fabs(at(L, b, 0) - (at(E, a, 0) + (double)n));
+    worst = std::max(worst, dt);
+    if (dt > 1e-12 * (1.0 + std::fabs(at(L, b, 0))) ||
+        at(L, b, 1) != at(E, a, 1) || at(L, b, 2) != at(E, a, 2) ||
+        L.token_tags[(std::size_t)b] != E.token_tags[(std::size_t)a]) {
+      ++moved;
+    }
+  }
+  EXPECT_TRUE(moved == 0);
+  EXPECT_TRUE(L.video_start - L.audio_start == E.video_start - E.audio_start);
+  std::printf("[minimax_h3_refenc] a soundtrack alone: %d reference audio "
+              "rows, %d of them misplaced; %d generated rows, %d off the "
+              "prompt-only layout's moved by %d (time %.1e at worst)\n",
+              ref_rows, off, E.seq_len - ntext, moved, n, worst);
 }
 
 // A stored still's latent given to the DiT ALONE (`presented` false):
@@ -691,20 +800,23 @@ TEST(minimax_h3_refenc, request_limits)
   h3::ReferenceLimits lim;
   std::string err;
 
-  // Empty is the prompt-only form, and passes: nothing in its
-  // presentation describes a reference the model cannot see, which is
-  // what the audio-alone rule below is about. Whether the caller MEANT
+  // Empty is the prompt-only form, and passes. Whether the caller MEANT
   // it is the stage's question.
   EXPECT_TRUE(h3::validate_reference_request({}, lim, &err));
 
-  // Audio alone never reaches the conditioner, so a request of nothing
-  // but audio packs text rows describing references the model cannot
-  // see.
-  EXPECT_FALSE(h3::validate_reference_request({audio_ref_()}, lim, &err));
-  EXPECT_FALSE(h3::validate_reference_request(
+  // Audio alone passes: its label precedes the prompt and the DiT reads
+  // its rows (soundtracks_alone_pack_ahead_of_the_generated_rows). Only
+  // the count binds it.
+  EXPECT_TRUE(h3::validate_reference_request({audio_ref_()}, lim, &err));
+  EXPECT_TRUE(h3::validate_reference_request(
       {audio_ref_(), audio_ref_()}, lim, &err));
   EXPECT_TRUE(h3::validate_reference_request(
       {audio_ref_(), image_ref_()}, lim, &err));
+  std::vector<h3::MediaReference> sounds;
+  for (int i = 0; i < lim.max_audios; ++i) { sounds.push_back(audio_ref_()); }
+  EXPECT_TRUE(h3::validate_reference_request(sounds, lim, &err));
+  sounds.push_back(audio_ref_());
+  EXPECT_FALSE(h3::validate_reference_request(sounds, lim, &err));
 
   // The per-modality caps.
   std::vector<h3::MediaReference> many;
@@ -728,7 +840,7 @@ TEST(minimax_h3_refenc, request_limits)
   mixed.push_back(audio_ref_());
   EXPECT_FALSE(h3::validate_reference_request(mixed, lim, &err));
   std::printf("[minimax_h3_refenc] limits: %d images / %d videos / %d "
-              "audios / %d total, audio never alone\n", lim.max_images,
+              "audios / %d total, audio alone allowed\n", lim.max_images,
               lim.max_videos, lim.max_audios, lim.max_references);
 }
 

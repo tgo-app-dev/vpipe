@@ -693,6 +693,89 @@ TEST(minimax_h3_text_enc, prompt_only_presentation_is_the_prompt)
               same ? "byte-identical to" : "DIFFERS from");
 }
 
+// A request of SOUNDTRACKS ALONE, no picture or clip: each is its
+// "<Audio j>: " label ahead of the prompt, tokenized piece by piece as
+// every label is, no vision run, every row text on a flat rotary
+// layout -- and conditioned by the plain-text path over those ids, as
+// ComfyUI's tokenizer presents it (audio never enters Qwen). Same
+// truncated encoder as above; VPIPE_MINIMAX_H3_TEXT_ENC_PATH only.
+TEST(minimax_h3_text_enc, soundtracks_alone_are_labels_and_the_prompt)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &cerr));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  auto m = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  using Ref = MiniMaxH3TextEncoder::Reference;
+  Ref sound;
+  sound.kind = Ref::Kind::kAudio;
+  sound.has_audio = true;        // as encode_references sets it
+  for (int count = 1; count <= 2; ++count) {
+    const std::vector<Ref> refs((std::size_t)count, sound);
+    std::vector<std::int32_t> want;
+    for (int j = 1; j <= count; ++j) {
+      const std::vector<std::int32_t> l =
+          m->tokenize("<Audio " + std::to_string(j) + ">: ");
+      want.insert(want.end(), l.begin(), l.end());
+    }
+    const std::vector<std::int32_t> p = m->tokenize(kPrompt);
+    want.insert(want.end(), p.begin(), p.end());
+
+    MiniMaxH3TextEncoder::Presentation P;
+    std::string perr;
+    const bool built = m->build_presentation(refs, kPrompt, &P, &perr);
+    if (!built) { std::printf("[minimax_h3_text_enc] %s\n", perr.c_str()); }
+    ASSERT_TRUE(built);
+    if (!built) { return; }
+    const int n = P.size();
+    EXPECT_TRUE(P.ids == want);
+    EXPECT_TRUE(P.runs.empty());
+    bool all_text = (int)P.tags.size() == n;
+    for (int t : P.tags) {
+      all_text = all_text && t == minimax_h3::kTextTag;
+    }
+    EXPECT_TRUE(all_text);
+    bool flat = (int)P.mrope.size() == 3 * n;
+    for (int i = 0; flat && i < n; ++i) {
+      flat = P.mrope[(std::size_t)i] == i &&
+             P.mrope[(std::size_t)n + i] == i &&
+             P.mrope[(std::size_t)2 * n + i] == i;
+    }
+    EXPECT_TRUE(flat);
+
+    std::vector<int> tags;
+    int rn = 0;
+    std::string rerr, ierr;
+    SharedBuffer r = m->encode_references(refs, kPrompt, &tags, &rn, &rerr);
+    SharedBuffer t = m->encode_ids(want, &ierr);
+    if (r.empty()) { std::printf("[minimax_h3_text_enc] %s\n", rerr.c_str()); }
+    if (t.empty()) { std::printf("[minimax_h3_text_enc] %s\n", ierr.c_str()); }
+    ASSERT_TRUE(!r.empty() && !t.empty());
+    if (r.empty() || t.empty()) { return; }
+    EXPECT_TRUE(rn == n);
+    EXPECT_TRUE(tags == P.tags);
+    const std::size_t bytes = (std::size_t)n * cfg.text_dim * 2;
+    const bool same =
+        r.byte_size() >= bytes && t.byte_size() >= bytes &&
+        std::memcmp(r.contents(), t.contents(), bytes) == 0;
+    EXPECT_TRUE(same);
+    std::printf("[minimax_h3_text_enc] %d soundtrack(s) alone: %d tokens "
+                "(%d of labels), %s the labelled text's conditioning\n",
+                count, n, n - (int)p.size(),
+                same ? "byte-identical to" : "DIFFERS from");
+  }
+}
+
 namespace {
 
 // Whether the golden's reference was built ONE LAYER AT A TIME. The

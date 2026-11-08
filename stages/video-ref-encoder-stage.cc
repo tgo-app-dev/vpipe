@@ -107,11 +107,14 @@ const ConfigKey kAttrs[] = {
           "request. WHAT each file is -- image, video or audio -- is read "
           "from the FILE, not from its name: a container with one frame is "
           "an image reference, an .mp4 with no video stream is an audio one. "
-          "At most 9 images, 3 videos and 3 audios, 12 in total, and audio "
-          "cannot be the only kind. An EMPTY list, `[]`, is a prompt-only "
-          "request: the conditioning is the prompt alone and no reference "
-          "rows are packed -- the same sequence text-to-video builds, "
-          "through whichever partition is resident. Leaving the key out "
+          "At most 9 images, 3 videos and 3 audios, 12 in total. Audio "
+          "may be the only kind: one soundtrack alone is labelled "
+          "<Audio 1> ahead of the prompt and its rows reach the DiT, "
+          "with no picture or clip. An EMPTY list, `[]`, is a "
+          "prompt-only request: the conditioning is the prompt alone "
+          "and no reference rows are packed -- the same sequence "
+          "text-to-video builds, through whichever partition is "
+          "resident. Leaving the key out "
           "is NOT that: with no reference iport wired either, the request "
           "is skipped as an unwired graph",
    .is_path = true, .path_filter = "image,video,audio"},
@@ -615,7 +618,7 @@ VideoRefEncoderStage::declare_memory() const
   StageMemory m;
   if (_hf_dir.empty()) { return m; }
   // Weights named apart are what loads, so they are what is held.
-  const auto [enc, vvae] = claimed_dirs_();
+  const auto [enc, vvae, avae] = claimed_dirs_();
   // ONLY what this stage HOLDS. The DiT belongs to generate-video, which
   // declares it -- here as in declare_resources -- and counting it here
   // as well would charge the graph for it twice: this plan dedups by
@@ -629,6 +632,10 @@ VideoRefEncoderStage::declare_memory() const
          genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc),
          destroys, reclaims);
   m.hold(vvae, model_memory::dir_weights_bytes(vvae), 0, destroys, reclaims);
+  if (!avae.empty()) {
+    m.hold(avae, model_memory::dir_weights_bytes(avae), 0, destroys,
+           reclaims);
+  }
   return m;
 }
 
@@ -636,7 +643,7 @@ std::vector<ResourceClaim>
 VideoRefEncoderStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  const auto [enc, vvae] = claimed_dirs_();
+  const auto [enc, vvae, avae] = claimed_dirs_();
 
   // THE ENCODER IS CLAIMED WITH ITS FLOOR, and that is not the same
   // thing as declare_memory() already knowing the floor.
@@ -674,6 +681,53 @@ VideoRefEncoderStage::declare_resources() const
                        (std::int64_t)enc_half);
     }
     out.push_back(std::move(c));
+  }
+  // THE AUDIO VAE, every soundtrack reference's encoder -- a request of
+  // soundtracks alone has nothing else. Loaded through the manager, so
+  // audio-vae-decode's copy of the same checkpoint is this one and the
+  // plan counts it once; claimed whole, as audio-vae-decode claims it
+  // (this stage builds the encoder half beside the decoder load() makes).
+  //
+  // Its lifetime is STATED HERE, never decided below. audio-vae-decode
+  // holds this checkpoint all run unless it destroys, and says so by
+  // claiming it unphased and deciding nothing -- which the manager
+  // cannot tell from "not decided yet", so a condition phase decided
+  // here replaced it and the denoise and decode counted 0 bytes of a
+  // VAE that was resident (model_memory.h3_ref2va_leaves_the_denoise_
+  // room_for_its_ane_module caught it). A phase declared is kept as an
+  // ASSERTION: a peer's unphased claim still widens it to the whole
+  // run, a peer's own phase widens it to cover both. So: `condition`
+  // where the release is certain from config, unphased otherwise.
+  if (!avae.empty()) {
+    for (auto& c : model_memory::weight_claims({avae})) {
+      if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+        c.phase = std::string(model_memory::kPhaseCondition);
+      }
+      out.push_back(std::move(c));
+    }
+  }
+  // And what ENCODING a soundtrack allocates (25 MB a second): at the
+  // generated duration, which every soundtrack is cut to unless kept
+  // whole -- process() revises it to the request's longest before the
+  // encode. Booked whenever the model has an audio VAE, since a
+  // reference port can carry a soundtrack the plan cannot see.
+  {
+    const std::string root0 = resolve_model_dir(session(), _hf_dir);
+    const std::string adir =
+        genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root0);
+    genai::MetalMiniMaxH3AudioVae::Config ac;
+    if (genai::MetalMiniMaxH3AudioVae::config_from_json(
+            adir.empty() ? root0 : adir, ac, nullptr)) {
+      const double secs =
+          (double)h3::align_num_frames(_frames, 17, 5) / h3::kFps;
+      const std::size_t eb =
+          genai::MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+              ac, (int)(secs * (double)ac.sample_rate));
+      for (auto& c : model_memory::scratch_claims(
+               audio_encode_label_(), eb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
   }
   // P-H3-Image's connector beside the encoder (f32, held whole), phased
   // and released with it -- and the tower's work: it reads its own copy
@@ -738,7 +792,7 @@ VideoRefEncoderStage::decide_resources() const
   // The encoder this stage LOADS -- `encoder_dir` when set, as
   // declare_resources claims it. Phasing the release's copy left the
   // claimed one (a 32B Draw Things .ckpt) persistent through the denoise.
-  const auto [enc, vvae] = claimed_dirs_();
+  const auto [enc, vvae, avae] = claimed_dirs_();
 
   const bool releases =
       _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
@@ -747,6 +801,9 @@ VideoRefEncoderStage::decide_resources() const
   if (!releases) { return {}; }
   std::vector<std::string> dirs{enc};
   if (weights_path_(_vae_weights).empty()) { dirs.push_back(vvae); }
+  // NOT the audio VAE, though unload_models_() drops it too: its
+  // lifetime is declared (declare_resources says why).
+  (void)avae;
   if (const std::string cd =
           genai::ph3::connector_dir(resolve_model_dir(session(), _hf_dir));
       !cd.empty()) {
@@ -771,8 +828,25 @@ VideoRefEncoderStage::claimed_dirs_() const
   }
   if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
     d.vvae = w;
+  } else {
+    // The audio VAE's own dir, by the test the load and audio-vae-encode
+    // use: resolved, and its config readable. Not the root fallback the
+    // load also tries -- claiming the root would book the whole model.
+    const std::string a =
+        genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+    genai::MetalMiniMaxH3AudioVae::Config probe;
+    if (!a.empty() &&
+        genai::MetalMiniMaxH3AudioVae::config_from_json(a, probe, nullptr)) {
+      d.avae = a;
+    }
   }
   return d;
+}
+
+std::string
+VideoRefEncoderStage::audio_encode_label_() const
+{
+  return "audio-encode:" + this->id();
 }
 
 Job
@@ -1000,12 +1074,14 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   std::string acerr;
   if (genai::MetalMiniMaxH3AudioVae::config_from_json(
           adir.empty() ? _root : adir, acfg, &acerr)) {
-    _audio_vae =
-        vae_w.empty()
-            ? genai::MetalMiniMaxH3AudioVae::load(adir.empty() ? _root : adir,
-                                                  mc, acfg)
-            : genai::MetalMiniMaxH3AudioVae::load(
-                  genai::open_weight_set(vae_w, session()), mc, acfg);
+    // Through the MANAGER, as audio-vae-decode loads the same VAE: the
+    // dir overload built a private set beside its copy -- the decoder
+    // twice, and neither half of this one in any plan.
+    _audio_vae = genai::MetalMiniMaxH3AudioVae::load(
+        genai::open_weight_set(
+            vae_w.empty() ? (adir.empty() ? _root : adir) : vae_w,
+            session()),
+        mc, acfg);
   }
   if (!_audio_vae && !_ph3) {
     // NOT fatal: a request of images and silent clips never touches it.
@@ -1625,6 +1701,12 @@ VideoRefEncoderStage::unload_models_()
     const ClaimedDirs d = claimed_dirs_();
     mgr->note_phase_released(d.enc);
     mgr->note_phase_released(d.vvae);
+    if (!d.avae.empty()) {
+      // The bytes back now where no peer holds the set; borrowed by
+      // audio-vae-decode, it settles when that stage lets go.
+      mgr->drop_weights(d.avae);
+      mgr->note_phase_released(d.avae);
+    }
     if (const std::string cd = genai::ph3::connector_dir(
             resolve_model_dir(session(), _hf_dir));
         !cd.empty()) {
@@ -1996,6 +2078,13 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     _enc->set_residency_reserve(model_memory::residency_reserve_beside(
         session(), model_memory::kPhaseCondition));
     _enc->set_residency_schedule(_unload_idle ? 1 : 4);
+  }
+
+  // The audio encode's arena at THIS request's longest soundtrack (a
+  // whole one can be minutes: 25 MB a second), or 0 with none to encode.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(audio_encode_label_(),
+                        h3::audio_encode_bytes(refs, plan, _audio_vae.get()));
   }
 
   h3::ReferenceEncoders models;

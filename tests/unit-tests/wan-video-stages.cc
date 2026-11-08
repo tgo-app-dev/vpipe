@@ -2239,6 +2239,73 @@ TEST(video_ref_encoder, the_encoder_is_phased_and_claimed_at_its_floor)
 }
 
 
+// THE AUDIO VAE IS CLAIMED BY THE STAGE THAT ENCODES THROUGH IT. Every
+// soundtrack reference goes through it -- a request of soundtracks alone
+// has nothing else -- and the stage had loaded it as a private set
+// beside audio-vae-decode's managed copy, in no claim. Now: claimed under
+// the dir audio-vae-decode claims (one checkpoint, counted once), its
+// lifetime DECLARED -- `condition` under `destroy`, unphased otherwise --
+// and never decided (a decided phase replaced audio-vae-decode's whole-
+// run claim: see model_memory.h3_ref2va_leaves_the_denoise_room_for_its_
+// ane_module), held in declare_memory; and what ENCODING a soundtrack
+// allocates is a condition-phase arena at the generated duration
+// (minimax_h3_avae.an_encode_allocates_what_it_books holds the figure to
+// the device). Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(video_ref_encoder, the_audio_vae_and_its_encode_are_booked)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  using genai::MetalMiniMaxH3AudioVae;
+  const std::string avae = MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+  MetalMiniMaxH3AudioVae::Config ac;
+  ASSERT_TRUE(MetalMiniMaxH3AudioVae::config_from_json(avae, ac, nullptr));
+
+  const std::size_t want = MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+      ac, (int)(73.0 / genai::minimax_h3::kFps * (double)ac.sample_rate));
+  const std::string arena =
+      "audio-encode:refenc|" + std::to_string(want);
+  for (const char* policy : {"destroy", "auto", "never"}) {
+    Session sess;
+    auto cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("frames", FlexData::make_int(73));
+    cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(root));
+    cfg.as_object().insert_or_assign("unload_when_idle",
+                                     FlexData::make_string(policy));
+    VideoRefEncoderStage st(&sess, "refenc", vector<InEdge>{}, cfg);
+    EXPECT_TRUE(st.config_error().empty());
+    const bool destroys = std::string(policy) == "destroy";
+    int weights = 0, arenas = 0;
+    for (const ResourceClaim& c : st.declare_resources()) {
+      if (c.kind == model_memory::kWeightsKind && c.key == avae) {
+        ++weights;
+        EXPECT_TRUE(destroys ? c.phase == model_memory::kPhaseCondition
+                             : c.phase.empty());
+      }
+      if (c.kind == model_memory::kScratchKind && c.key == arena) {
+        ++arenas;
+        EXPECT_TRUE(c.phase == model_memory::kPhaseCondition);
+      }
+    }
+    EXPECT_TRUE(weights == 1);
+    EXPECT_TRUE(arenas == 1);
+    int decided = 0;
+    for (const ResourceClaim& d : st.decide_resources()) {
+      if (d.key == avae) { ++decided; }
+    }
+    EXPECT_TRUE(decided == 0);
+    int held = 0;
+    for (const StageHolding& h : st.declare_memory().holdings) {
+      if (h.source == avae && h.preload > 0) { ++held; }
+    }
+    EXPECT_TRUE(held == 1);
+    std::printf("[video_ref_encoder] %-7s: audio VAE claimed %d (%s), "
+                "decided %d, held %d; the encode's arena %.1f MB at 73 "
+                "frames\n", policy, weights,
+                destroys ? "condition" : "whole run", decided, held,
+                want / 1048576.0);
+  }
+}
+
 // A REF2VA REQUEST TAKES NO KEYFRAME ANCHOR, AND SAYS SO.
 //
 // The two MiniMax-H3 partitions pack different sequences -- FL2VA's is

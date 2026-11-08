@@ -521,11 +521,15 @@ private:
   bool reload_models_();
   // The encoder and video VAE this stage loads, as its claims and their
   // releases name them: `encoder_dir` / `vae_dir` when set, else the
-  // model's own.
+  // model's own. `avae` is the AUDIO VAE's own dir, empty when `vae_dir`
+  // (a store carrying both VAEs, claimed as `vvae`) supplies it or the
+  // model has none.
   struct ClaimedDirs {
-    std::string enc, vvae;
+    std::string enc, vvae, avae;
   };
   ClaimedDirs claimed_dirs_() const;
+  // The audio encode's scratch label (a condition-phase arena).
+  std::string audio_encode_label_() const;
 #endif
 };
 

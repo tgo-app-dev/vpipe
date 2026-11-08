@@ -799,9 +799,10 @@ at once is the difference between a clip and a refusal.
 
 MiniMax-H3 ships a **second checkpoint**, `ref2va`, that conditions on a
 *list* of reference media instead of on keyframes: up to **9 images**, **3
-video clips** and **3 soundtracks**, twelve in total, and audio can never be
-the only kind. Images carry subject and style, clips carry motion and camera,
-soundtracks carry a voice or a piece of music.
+video clips** and **3 soundtracks**, twelve in total, in any mix — a
+soundtrack alone included ([below](#a-soundtrack-alone)). Images carry subject
+and style, clips carry motion and camera, soundtracks carry a voice or a piece
+of music.
 
 The two partitions are the same architecture and ship byte-identical
 transformer configs, so **nothing in the weights tells them apart** — vpipe
@@ -918,6 +919,39 @@ prompt-only request is still Ref2VA's sequence, which has no keyframe slot.
 This is the Ref2VA weights doing text-to-video, which the sequence permits
 but the Ref2VA recipe does not describe. The FL2VA checkpoint is the trained
 route for it; this one is for the graph that already holds Ref2VA.
+
+#### A soundtrack alone
+
+One soundtrack, or up to three, with **no picture and no clip** is a request
+of its own: a voice to speak in, or a piece of music to move to.
+
+```json
+"references": ["voice.wav"]
+```
+
+Each soundtrack is labelled ahead of the prompt as usual — the presentation
+is `<Audio 1>: ` and then your text, so the prompt can say *"talks in the
+voice of `<Audio 1>`"* — and its rows reach the DiT on the shared clock ahead
+of the generated ones: `[text | reference audio | target audio | target
+video]`. Nothing goes through the vision tower or the video VAE. ComfyUI's
+MiniMax-H3 reference node packs the same request the same way. The log says
+what was packed:
+
+```
+VideoRefEncoderStage('video-ref-encoder'): 1 reference(s) -> 46 conditioning
+  rows, 0 reference video rows, 244 reference audio rows
+```
+
+As with any reference, the soundtrack is cut to the generated duration unless
+`whole_references` keeps it whole. Encoding one takes about **25 MB of GPU
+memory per second** of it while it runs (91 MB for a 3 s cut, 1.5 GB for a
+minute kept whole), and the memory plan books it before the conditioning
+starts. MEASURED on the M4 Pro (the w8 Ref2VA pack streamed from an external
+SSD, 640x352x73, 8 steps, shift 12): a 7.7 s spoken English clip as the only
+reference ran in 6 min 02 s. The clip was clean, its subject talking to camera
+as the prompt asked. Qwen3-ASR heard its soundtrack as English speech opening
+on the reference's own first word ("Sometimes …"); the words after it are not
+the reference's.
 
 #### The example
 
