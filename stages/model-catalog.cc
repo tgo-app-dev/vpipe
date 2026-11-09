@@ -2566,6 +2566,79 @@ builtin_catalog_()
                "README.md", "NOTICE"},
      .needs_tokenizer_json = false,
      .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-fast-vae"},
+    // Open-H3-Regenerate-2K-IC (NVIDIA): the IN-CONTEXT refine. The draft
+    // stays CLEAN in MiniMax-H3's Ref2VA DiT (transformer_ref) as a
+    // reference video, and the clip is regenerated beside it from the
+    // upscaled draft at sigma 0.835 -- the last 3 steps of HyperFlow's
+    // 8-step grid, CFG 1 -- under three runtime adapters: HyperFlow
+    // 8-step, LMS Sharp v1.0 and the IC LoRA (rank 384 on all 312
+    // linears, alpha == rank). Faces, lip sync, lettering and layout
+    // stay the draft's.
+    //
+    // Five records over ONE repo, each pinning what it is: the three
+    // adapters (one file each, as a slot names one), the upscaler (the
+    // base release's file, byte-identical) and the fast decoder v2 --
+    // the release's DEFAULT decode, StreamRender-H3's architecture with
+    // new weights. HyperFlow here is VideoRebirthAI's file, byte for
+    // byte. NOT fetched: `base_model/` (MiniMax-H3's diffusers
+    // components, which the MiniMaxAI entries hold), `infer/` (the
+    // release's runner) and `assets/` (an encoded silence, which
+    // generate-video makes itself from the audio VAE). LMS Sharp's 50
+    // AdaLN curve branches are all zero, so no curve table either.
+    // MiniMax H3 Community License; the upscaler MIT; Sharp its own.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Open-H3-Regenerate-2K-IC in-context refine, rank 384 "
+                "(NVIDIA)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"lora/open_h3_regenerate_2k_ic_lora.safetensors",
+               "lora/lora_config.json", "config.json", "README.md",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-lora"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "HyperFlow 8-step flow map v1.0, as Open-H3-Regenerate-2K-"
+                "IC ships it",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"lora/minimax_h3_hyperflow_8step_v1.0.safetensors",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-hyperflow"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "LMS Sharp v1.0 r64 (Alissonerdx), as Open-H3-Regenerate-"
+                "2K-IC ships it",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"lora/minimax_h3_lms_v1.0_r64.safetensors", "LICENSE",
+               "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-sharp"},
+    {.family = "MiniMax", .version = "H3-Ref2VA",
+     .param_class = "latent upscaler",
+     .variant = "H3 latent upscaler 3D-conv v1 (Open-H3-Regenerate-2K-IC)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-latent-upscaler",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"latent_upsampler/"
+               "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+               "latent_upsampler/LICENSE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-upscaler"},
+    {.family = "MiniMax", .version = "H3-Ref2VA",
+     .param_class = "video decoder",
+     .variant = "fast H3 VAE decoder v2, non-causal 24-layer "
+                "(Open-H3-Regenerate-2K-IC, lossy)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-fast-vae",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"vae_fast/fast_h3_vae_v2_24l.safetensors", "README.md",
+               "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-fast-vae"},
     // TaoLiveAIGC's TaoMate-H3: a 3-step adapter for a STREAMING method,
     // not a few-step LoRA for the ordinary denoise. generate-video knows
     // it by its tensors and runs that method -- the base model's
@@ -3205,6 +3278,9 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "bs-roformer") {
     // A source separator: music in, one source and its complement out.
     set({"audio"}, {"audio"});
+  } else if (mt == "rife") {
+    // A frame interpolator: frames in, more (or retimed) frames out.
+    set({"video"}, {"video"});
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
              || mt == "flux3" || mt == "fibo2") {
     set({"text", "image"}, {"image"});

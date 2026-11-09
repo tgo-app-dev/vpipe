@@ -2,7 +2,9 @@
 
 #include "common/vpipe-format.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <string>
 
@@ -301,6 +303,17 @@ MiniMaxH3Scheduler::refine_sigmas(int steps, double start, double shift)
   }
   g.push_back(0.0);
   return g;
+}
+
+std::vector<double>
+MiniMaxH3Scheduler::grid_tail(const std::vector<float>& raw, double shift,
+                              int steps)
+{
+  MiniMaxH3Scheduler s(shift);
+  if (steps < 1 || !s.set_sigmas(raw)) { return {}; }
+  const std::vector<float>& g = s.sigmas();
+  const std::size_t n = std::min(g.size(), (std::size_t)steps + 1);
+  return std::vector<double>(g.end() - (std::ptrdiff_t)n, g.end());
 }
 
 bool

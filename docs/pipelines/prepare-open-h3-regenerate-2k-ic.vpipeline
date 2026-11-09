@@ -1,0 +1,66 @@
+{
+  "id": "prepare-open-h3-regenerate-2k-ic",
+  "stages": [
+    {
+      "id": "fetch-ic-lora",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-lora",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-hyperflow",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-hyperflow",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-sharp",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-sharp",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-upscaler",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-upscaler",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-fast-vae",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+        "model_variant": "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-fast-vae",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

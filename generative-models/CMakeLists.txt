@@ -122,6 +122,7 @@ set(LOCAL_SOURCES
   minimax-music3/music3-vae-family.cc
   bs-roformer/bs-roformer-config.cc
   bs-roformer/metal-bs-roformer.cc
+  rife/metal-rife.cc
   drama3/drama3-prompt.cc
   drama3/metal-drama3-tower.cc
   deepseek-v41/deepseek-v41-config.cc
@@ -224,6 +225,7 @@ set(LOCAL_HEADERS
   shared/overlap-demix.h
   bs-roformer/bs-roformer-config.h
   bs-roformer/metal-bs-roformer.h
+  rife/metal-rife.h
   drama3/drama3-prompt.h
   drama3/metal-drama3-tower.h
   deepseek-v41/deepseek-v41-config.h

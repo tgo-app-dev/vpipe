@@ -287,12 +287,25 @@ RgbToVideoStage::process(RuntimeContext& ctx)
   if (H <= 0 || W <= 0) { co_return; }
 
   // The producer knows the clip's rate when it made the frames; the config
-  // is only the fallback for one that does not.
+  // is only the fallback for one that does not. A FRAME states it as the
+  // rational `fps_num` / `fps_den` (video-to-rgb, temporal-resample), a
+  // clip as `fps`; reading only the latter encoded every frame stream at
+  // the fallback -- 124 frames at 24 came out a 16 fps file.
   double fps = _fps;
+  std::int64_t rate_num = 0, rate_den = 0;
   if (tbp->sideband.is_object()) {
     FlexData sb = tbp->sideband;          // as_object() is a view: keep it
     auto o = sb.as_object();
-    if (o.contains("fps")) {
+    if (o.contains("fps_num") && o.contains("fps_den")) {
+      const std::int64_t n = o.at("fps_num").as_int(0);
+      const std::int64_t d = o.at("fps_den").as_int(0);
+      if (n > 0 && d > 0 && n <= INT32_MAX && d <= INT32_MAX) {
+        rate_num = n;
+        rate_den = d;
+        fps = (double)n / (double)d;
+      }
+    }
+    if (rate_num == 0 && o.contains("fps")) {
       const double f = o.at("fps").as_real(0.0);
       if (f > 0.0) { fps = f; }
     }
@@ -338,11 +351,17 @@ RgbToVideoStage::process(RuntimeContext& ctx)
       p.color_primaries = _bt709 ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M;
       p.color_trc   = _bt709 ? AVCOL_TRC_BT709 : AVCOL_TRC_SMPTE170M;
     }
-    // A rational rate from the double, denominator 1000, so 16 stays 16/1
-    // and 23.976 survives as 23976/1000 rather than becoming 24.
-    const long long num = (long long)std::llround(fps * 1000.0);
-    p.frame_rate = AVRational{(int)num, 1000};
-    p.time_base  = AVRational{1000, (int)num};
+    // The producer's rational as it stated it (30000/1001 exactly), else
+    // one from the double at denominator 1000, so 16 stays 16/1 and
+    // 23.976 survives as 23976/1000 rather than becoming 24.
+    if (rate_num > 0) {
+      p.frame_rate = AVRational{(int)rate_num, (int)rate_den};
+      p.time_base  = AVRational{(int)rate_den, (int)rate_num};
+    } else {
+      const long long num = (long long)std::llround(fps * 1000.0);
+      p.frame_rate = AVRational{(int)num, 1000};
+      p.time_base  = AVRational{1000, (int)num};
+    }
     auto hdr = std::make_unique<VideoStreamParamsPayload>(p);
     // Provenance rides on the HEADER because there is nowhere else for
     // it: a FrameRef is a bare AVFrame with no sideband, and the sink

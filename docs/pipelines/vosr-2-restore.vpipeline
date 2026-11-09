@@ -127,6 +127,10 @@
         {
           "src": "model-select",
           "oport": 0
+        },
+        {
+          "src": "image-resample",
+          "oport": 0
         }
       ],
       "config": {}

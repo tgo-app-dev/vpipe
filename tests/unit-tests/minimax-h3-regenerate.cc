@@ -38,6 +38,7 @@
 #include "stages/latent-upscale-stage.h"
 #include "stages/generate-video-stage.h"
 #include "stages/vae-encode-stage.h"
+#include "stages/video-ref-encoder-stage.h"
 #include "stages/model-memory.h"
 #include "stages/model-memory-host.h"
 #include "common/flex-bag.h"
@@ -48,6 +49,10 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-latent-upscaler.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-denoise.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/quantize/safetensors-writer.h"
@@ -59,6 +64,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <array>
 #include <atomic>
 #include <random>
 #include <thread>
@@ -1970,4 +1976,628 @@ TEST(minimax_h3_regenerate, a_step_routes_with_its_own_tau)
   EXPECT_TRUE(!hi.empty() && hi != base && k_hi < k_same);
   EXPECT_TRUE(!ex.empty() && ex != base && k_ex != k_same);
   EXPECT_TRUE(after == base);
+}
+
+// ---- Open-H3-Regenerate-2K-IC ------------------------------------------
+//
+// The in-context refine (Efficient-Large-Model/Open-H3-Regenerate-2K-IC):
+// the Ref2VA DiT under HyperFlow + LMS Sharp + the IC LoRA, the draft a
+// clean reference video ahead of the clip regenerated from it, the last
+// steps of HyperFlow's grid from the upscaled draft. Read, not run:
+// NVlabs/Sana sol-engine models/Open-H3-Regenerate-2K/IC (infer.py,
+// ref2va_ic/layout.py, hyperflow.py, sharp.py).
+//
+//   VPIPE_OPEN_H3_IC_PATH  the IC release directory (lora/: the IC LoRA,
+//                          HyperFlow and LMS Sharp as it ships them)
+
+// Its samplers, up3 / up4 / hf8: the last 3 / 4 / 8 steps of HyperFlow's
+// 8-step grid at shift 12 -- the float32 points hyperflow.sigmas() makes
+// (`shift * raw / (1 + (shift - 1) * raw)` over a float32 tensor),
+// which the release's config.json states to six digits -- and each
+// step's interval as its infer.py hands it to the endpoint embedder:
+// t = 1 - float32(sigma), r = 1 - the next.
+TEST(minimax_h3_regenerate, ic_samplers_are_hyperflow_s_tail)
+{
+#pragma clang fp contract(off)
+  // HyperFlow v1.0's raw grid, as its header's `hyperflow_sigmas` says.
+  const std::vector<float> raw = {1.0f,      0.931506f, 0.839236f,
+                                  0.703462f, 0.5f,      0.296538f,
+                                  0.160764f, 0.068494f, 0.0f};
+  const std::vector<double> hf8_cfg = {1.0,      0.99391,  0.984288,
+                                       0.966064, 0.923077, 0.834942,
+                                       0.696852, 0.468753, 0.0};
+  const auto up3 = MiniMaxH3Scheduler::grid_tail(raw, 12.0, 3);
+  const auto up4 = MiniMaxH3Scheduler::grid_tail(raw, 12.0, 4);
+  const auto hf8 = MiniMaxH3Scheduler::grid_tail(raw, 12.0, 8);
+  ASSERT_TRUE(up3.size() == 4 && up4.size() == 5 && hf8.size() == 9);
+  if (hf8.size() != 9) { return; }
+  double worst = 0.0;
+  bool exact = true;
+  for (std::size_t i = 0; i < 9; ++i) {
+    worst = std::max(worst, std::fabs(hf8[i] - hf8_cfg[i]));
+    const float x = raw[i];
+    const float a = 12.0f * x;
+    const float b = 1.0f + 11.0f * x;
+    exact = exact && hf8[i] == (double)(a / b);
+  }
+  bool tails = true;
+  for (std::size_t i = 0; i < 4; ++i) { tails = tails && up3[i] == hf8[5 + i]; }
+  for (std::size_t i = 0; i < 5; ++i) { tails = tails && up4[i] == hf8[4 + i]; }
+  std::printf("  hf8 within %.2e of config.json, %s the release's float32 "
+              "points; up3 [%.6f %.6f %.6f 0], up4 from %.6f\n", worst,
+              exact ? "EXACTLY" : "NOT", up3[0], up3[1], up3[2], up4[0]);
+  EXPECT_TRUE(worst < 1e-6);
+  EXPECT_TRUE(exact && tails);
+  // Longer than the grid: the whole of it. None: nothing.
+  EXPECT_TRUE(MiniMaxH3Scheduler::grid_tail(raw, 12.0, 20) == hf8);
+  EXPECT_TRUE(MiniMaxH3Scheduler::grid_tail(raw, 12.0, 0).empty());
+  MiniMaxH3Scheduler sv(12.0);
+  ASSERT_TRUE(sv.set_sigmas_as_run(up3));
+  bool pairs = sv.num_inference_steps() == 3;
+  for (int i = 0; pairs && i < 3; ++i) {
+    pairs = sv.timesteps()[(std::size_t)i] ==
+                (float)(1.0 - (double)(float)up3[(std::size_t)i]) &&
+            sv.endpoints()[(std::size_t)i] ==
+                (float)(1.0 - (double)(float)up3[(std::size_t)i + 1]);
+  }
+  EXPECT_TRUE(pairs);
+}
+
+namespace {
+
+// The IC release's loop, restated from its infer.py over a DiT already
+// loaded: the generated video rows at (1 - sigma, 1 - next) -- text rows
+// with them -- the reference rows at (0.999, 0.999), every audio row
+// held at (1, 1); a bf16 upload of the whole f32 state, the generated
+// velocity read back, x += float(sigma - next) * v. `endpoints` false
+// gives every row r = t: the flow map's interval taken away.
+bool
+ic_restated_(MetalCompute* mc, MetalMiniMaxH3Transformer& m,
+             const h3::PackedLayout& L,
+             const metal_compute::SharedBuffer& text,
+             const std::vector<double>& sig, std::vector<float>* vid,
+             const std::vector<float>& aud, bool endpoints)
+{
+#pragma clang fp contract(off)
+  const auto& c = m.config();
+  const int PE = c.video_patch_elems(), AC = c.audio_channels;
+  const std::size_t vrows = L.video_indices.size();
+  const std::size_t arows = L.audio_indices.size();
+  const std::size_t ncv = (std::size_t)L.num_condition_video_rows;
+  metal_compute::SharedBuffer vb = mc->make_shared_buffer(vrows * PE * 2);
+  metal_compute::SharedBuffer ab = mc->make_shared_buffer(arows * AC * 2);
+  if (vb.empty() || ab.empty()) { return false; }
+  using Pair = std::pair<float, float>;
+  for (std::size_t i = 0; i + 1 < sig.size(); ++i) {
+    const float t = (float)(1.0 - sig[i]);
+    const float r = endpoints ? (float)(1.0 - sig[i + 1]) : t;
+    std::vector<Pair> row((std::size_t)L.seq_len, Pair{t, r});
+    for (std::size_t k = 0; k < ncv; ++k) {
+      row[(std::size_t)L.video_indices[k]] = Pair{0.999f, 0.999f};
+    }
+    for (std::size_t k = 0; k < arows; ++k) {
+      row[(std::size_t)L.audio_indices[k]] = Pair{1.0f, 1.0f};
+    }
+    std::vector<Pair> u = row;
+    std::sort(u.begin(), u.end());
+    u.erase(std::unique(u.begin(), u.end()), u.end());
+    std::vector<float> ut, ur;
+    for (const Pair& p : u) {
+      ut.push_back(p.first);
+      ur.push_back(p.second);
+    }
+    std::vector<int> idx(row.size());
+    for (std::size_t k = 0; k < row.size(); ++k) {
+      idx[k] = (int)(std::lower_bound(u.begin(), u.end(), row[k]) -
+                     u.begin());
+    }
+    auto* vd = static_cast<std::uint16_t*>(vb.contents());
+    for (std::size_t k = 0; k < vrows * PE; ++k) {
+      vd[k] = to_bf16_((*vid)[k]);
+    }
+    auto* ad = static_cast<std::uint16_t*>(ab.contents());
+    for (std::size_t k = 0; k < arows * AC; ++k) { ad[k] = to_bf16_(aud[k]); }
+    MetalMiniMaxH3Transformer::Step st;
+    st.video = &vb;  st.audio = &ab;  st.text = &text;
+    st.layout = &L;  st.timesteps = &ut;  st.endpoints = &ur;
+    st.row_timestep_index = &idx;
+    std::string ferr;
+    const auto v = m.forward(st, &ferr);
+    if (v.empty()) {
+      std::printf("  forward: %s\n", ferr.c_str());
+      return false;
+    }
+    const auto* g =
+        static_cast<const std::uint16_t*>(v.video.contents()) + ncv * PE;
+    const float d = (float)(sig[i] - sig[i + 1]);
+    float* x = vid->data() + ncv * PE;
+    for (std::size_t k = 0; k < (vrows - ncv) * PE; ++k) {
+      const float dv = d * from_bf16_(g[k]);
+      x[k] = x[k] + dv;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+// THE IN-CONTEXT REFINE through denoise(), on two real blocks under
+// HyperFlow: a 2 x 6 x 10 reference clip held clean ahead of a 2 x 12 x
+// 20 re-noised clip, three steps of HyperFlow's grid tail -- the release
+// restated (ic_restated_) to the BIT. denoise() refused a flow map under
+// a refine before; its held audio must keep r = t (it has no schedule of
+// its own), and the reference rows and the soundtrack are never written.
+// The flow map's interval must matter: every row at r = t reads another
+// result.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (Ref2VA, or any H3 partition) +
+// VPIPE_OPEN_H3_IC_PATH.
+TEST(minimax_h3_regenerate, an_in_context_refine_steps_as_the_release)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string ic = env_("VPIPE_OPEN_H3_IC_PATH");
+  if (h3root.empty() || ic.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / "
+                "VPIPE_OPEN_H3_IC_PATH unset\n");
+    return;
+  }
+  const std::string hf =
+      ic + "/lora/minimax_h3_hyperflow_8step_v1.0.safetensors";
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(h3root, cfg, &cerr));
+  cfg.n_layers = 2;
+  // [4 vision rows + 6 text | the reference clip | 8 audio latents a
+  // channel | the target]
+  std::vector<int> tags(10, h3::kTextTag);
+  for (int k = 0; k < 4; ++k) { tags[(std::size_t)k] = h3::kVideoTag; }
+  h3::Reference ref;
+  ref.kind = h3::Reference::Kind::kVideo;
+  ref.num_latent_frames = 2;
+  ref.latent_height = 6;
+  ref.latent_width = 10;
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, {ref}, 2, 12, 20, 8, cfg.patch_h, cfg.patch_w,
+      h3::kAudioChannels, &L));
+  const int PE = cfg.video_patch_elems(), AC = cfg.audio_channels;
+  const std::size_t ncv = (std::size_t)L.num_condition_video_rows;
+  ASSERT_TRUE(ncv == 2 * 3 * 5 && L.num_condition_audio_rows == 0);
+  auto ramp = [](std::size_t n, float k, float a) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) { v[i] = a * std::sin(i * k); }
+    return v;
+  };
+  const std::vector<float> vid =
+      ramp(L.video_indices.size() * PE, 0.013f, 0.8f);
+  const std::vector<float> aud =
+      ramp(L.audio_indices.size() * AC, 0.029f, 0.5f);
+  metal_compute::SharedBuffer tb =
+      bf16_buf_(mc, ramp(tags.size() * (std::size_t)cfg.text_dim, 0.005f,
+                         0.5f));
+  ASSERT_TRUE(!tb.empty());
+
+  using Spec = MetalMiniMaxH3Transformer::LoraSpec;
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  ::setenv("VPIPE_H3_NO_ADALN_BAKE", "1", 1);
+  auto m = MetalMiniMaxH3Transformer::load(h3root, mc, cfg, false,
+                                           {Spec{hf, 1.0f}});
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+  ASSERT_TRUE(m->two_time_active() && m->flow_map() != nullptr);
+  const std::vector<double> sig =
+      MiniMaxH3Scheduler::grid_tail(m->flow_map()->sigmas, 12.0, 3);
+  ASSERT_TRUE(sig.size() == 4);
+
+  std::vector<float> dv = vid, da = aud;
+  DenoiseRequest req;
+  req.dit = m.get();
+  req.layout = &L;
+  req.text = &tb;
+  req.video = dv.data();
+  req.audio = da.data();
+  req.refine_sigmas = sig;
+  req.num_steps = 3;
+  req.condition_timestep = 0.999f;
+  req.condition_audio_timestep = 1.0f;
+  DenoiseReport rep;
+  req.report = &rep;
+  std::string derr;
+  const bool ok = denoise(req, &derr);
+  if (!ok) { std::printf("  denoise: %s\n", derr.c_str()); }
+  std::vector<float> rv = vid, flat = vid;
+  const bool ok2 = ic_restated_(mc, *m, L, tb, sig, &rv, aud, true);
+  const bool ok3 = ic_restated_(mc, *m, L, tb, sig, &flat, aud, false);
+  ::unsetenv("VPIPE_H3_NO_ADALN_BAKE");
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  ASSERT_TRUE(ok && ok2 && ok3);
+  const bool same = dv == rv;
+  const bool held =
+      std::equal(dv.begin(), dv.begin() + (std::ptrdiff_t)(ncv * PE),
+                 vid.begin()) && da == aud;
+  const double moved = rel_l2_(dv, vid);
+  const double interval = rel_l2_(flat, rv);
+  std::printf("  %d forwards over sigmas [%.6f %.6f %.6f 0]: denoise %s the "
+              "release's loop; reference rows and soundtrack %s; the clip "
+              "moved %.3e, r = t everywhere %.3e away\n", rep.forwards,
+              sig[0], sig[1], sig[2], same ? "IS" : "is NOT",
+              held ? "untouched" : "WRITTEN", moved, interval);
+  EXPECT_TRUE(rep.forwards == 3);
+  EXPECT_TRUE(same);
+  EXPECT_TRUE(held);
+  EXPECT_TRUE(moved > 1e-2);
+  EXPECT_TRUE(interval > 1e-3);
+}
+
+// LMS SHARP AS ITS AUTHOR PUBLISHES IT -- the file Open-H3-Regenerate-2K-
+// IC installs -- was trained on ComfyUI's pruned form, so its AdaLN
+// modules are LoRA factors over the 8-D curve point (`lora_A` [r, 8]),
+// which on a released DiT are CURVE branches, as the release's sharp.py
+// installs them. On two real blocks: a branch in that spelling is the
+// same forward as the release's `curve_A` / `curve_B` spelling of the
+// same factors, to the bit; an `.alpha` scales it by alpha / rank (8 / 4
+// at strength 1 is the curve file at 2); every B zero beside a real
+// module binds that module alone, nothing skipped, exactly the module's
+// own forward (LMS v1.0's 50 branches are all zero); and the plan books
+// what the load holds -- B A, f32 [D, 8], a live block.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_OPEN_H3_TEST_MODEL_PATH
+// (its lora/adaln_t_table.bin, copied beside each file).
+TEST(minimax_h3_regenerate, lora_spelled_curve_branches_are_curves)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string rel = env_("VPIPE_OPEN_H3_TEST_MODEL_PATH");
+  if (h3root.empty() || rel.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / "
+                "VPIPE_OPEN_H3_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  BlockRun br;
+  ASSERT_TRUE(br.setup(mc, h3root, 2));
+  if (br.vb.empty()) { return; }
+  const int D = br.cfg.adaln_out(), r = 4;
+  const int H = br.cfg.hidden, I = br.cfg.inner();
+  std::mt19937 rng(11);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<std::vector<float>> A(2), B(2);
+  for (int L = 0; L < 2; ++L) {
+    A[(std::size_t)L].resize((std::size_t)r * 8);
+    B[(std::size_t)L].resize((std::size_t)D * r);
+    for (auto& v : A[(std::size_t)L]) { v = 0.3f * nd(rng); }
+    for (auto& v : B[(std::size_t)L]) { v = 0.05f * nd(rng); }
+  }
+  // out_proj of block 0, a real module: A [r, I], B [H, r].
+  std::vector<float> oa((std::size_t)r * I), ob((std::size_t)H * r);
+  for (auto& v : oa) { v = 0.02f * nd(rng); }
+  for (auto& v : ob) { v = 0.02f * nd(rng); }
+  const std::vector<float> zero((std::size_t)D * r, 0.0f);
+
+  const fs::path root = fs::temp_directory_path() / "vpipe-h3-lms-test";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  // One file a directory, the table beside it.
+  auto write = [&](const char* name,
+                   const std::function<bool(SafetensorsWriter&)>& fill) {
+    const fs::path dir = root / name;
+    fs::create_directories(dir, ec);
+    SafetensorsWriter wr(dir.string());
+    if (!fill(wr) || !wr.close()) { return std::string(); }
+    fs::copy_file(rel + "/lora/adaln_t_table.bin",
+                  dir / "adaln_t_table.bin",
+                  fs::copy_options::overwrite_existing, ec);
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      if (e.path().extension() == ".safetensors") {
+        return e.path().string();
+      }
+    }
+    return std::string();
+  };
+  auto put = [](SafetensorsWriter& wr, const std::string& n,
+                std::vector<std::int64_t> shape, const std::vector<float>& v) {
+    return wr.add(n, "F32", shape, v.data(), v.size() * 4);
+  };
+  auto curves = [&](SafetensorsWriter& wr, const char* pre, const char* a,
+                    const char* b, bool zb) {
+    for (int L = 0; L < 2; ++L) {
+      const std::string m = std::string(pre) + std::to_string(L) +
+                            ".adaln_proj.linear.";
+      if (!put(wr, m + a, {r, 8}, A[(std::size_t)L]) ||
+          !put(wr, m + b, {D, r}, zb ? zero : B[(std::size_t)L])) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const std::string f_curve = write("curve", [&](SafetensorsWriter& wr) {
+    return curves(wr, "transformer.transformer_blocks.", "curve_A.weight",
+                  "curve_B.weight", false);
+  });
+  const std::string f_lora = write("lora", [&](SafetensorsWriter& wr) {
+    return curves(wr, "diffusion_model.blocks.", "lora_A.weight",
+                  "lora_B.weight", false);
+  });
+  const std::string f_alpha = write("alpha", [&](SafetensorsWriter& wr) {
+    if (!curves(wr, "diffusion_model.blocks.", "lora_down.weight",
+                "lora_up.weight", false)) {
+      return false;
+    }
+    const std::vector<float> al = {8.0f};
+    for (int L = 0; L < 2; ++L) {
+      if (!wr.add("diffusion_model.blocks." + std::to_string(L) +
+                      ".adaln_proj.linear.alpha",
+                  "F32", {}, al.data(), 4)) {
+        return false;
+      }
+    }
+    return true;
+  });
+  auto out_proj = [&](SafetensorsWriter& wr) {
+    return put(wr, "diffusion_model.blocks.0.attn.out_proj.lora_A.weight",
+               {r, I}, oa) &&
+           put(wr, "diffusion_model.blocks.0.attn.out_proj.lora_B.weight",
+               {H, r}, ob);
+  };
+  const std::string f_zero = write("zero", [&](SafetensorsWriter& wr) {
+    return curves(wr, "diffusion_model.blocks.", "lora_A.weight",
+                  "lora_B.weight", true) && out_proj(wr);
+  });
+  const std::string f_out = write("out", out_proj);
+  ASSERT_TRUE(!f_curve.empty() && !f_lora.empty() && !f_alpha.empty() &&
+              !f_zero.empty() && !f_out.empty());
+
+  using Spec = MetalMiniMaxH3Transformer::LoraSpec;
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  std::vector<float> base, curve1, curve2, lora1, alpha1, zero1, out1;
+  int mb = -1, mc1 = -1, ml = -1, ma = -1, mz = -1, mo = -1;
+  ASSERT_TRUE(br.run(mc, {}, &base, &mb));
+  ASSERT_TRUE(br.run(mc, {Spec{f_curve, 1.0f}}, &curve1, &mc1));
+  ASSERT_TRUE(br.run(mc, {Spec{f_curve, 2.0f}}, &curve2, nullptr));
+  ASSERT_TRUE(br.run(mc, {Spec{f_lora, 1.0f}}, &lora1, &ml));
+  ASSERT_TRUE(br.run(mc, {Spec{f_alpha, 1.0f}}, &alpha1, &ma));
+  ASSERT_TRUE(br.run(mc, {Spec{f_zero, 1.0f}}, &zero1, &mz));
+  ASSERT_TRUE(br.run(mc, {Spec{f_out, 1.0f}}, &out1, &mo));
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  std::printf("  LoRA-spelled curves %s the curve file (%d / %d bound); "
+              "alpha 8 / rank 4 %s it at 2; zero curves + out_proj bind "
+              "%d module(s), %s out_proj alone (%d); the curve moves the "
+              "base %.3e\n", lora1 == curve1 ? "ARE" : "are NOT", ml, mc1,
+              alpha1 == curve2 ? "IS" : "is NOT", mz,
+              zero1 == out1 ? "exactly" : "NOT", mo,
+              rel_l2_(curve1, base));
+  EXPECT_TRUE(mc1 == 2 && ml == 2 && ma == 2);
+  EXPECT_TRUE(lora1 == curve1);
+  EXPECT_TRUE(alpha1 == curve2 && curve2 != curve1);
+  EXPECT_TRUE(mz == 1 && mo == 1 && zero1 == out1 && out1 != base);
+  EXPECT_TRUE(rel_l2_(curve1, base) > 1e-3);
+
+  // Booked == held: two live blocks' B A, f32 [D, 8], and nothing for
+  // the factors themselves; the out_proj file its factors at bf16.
+  const auto fp = MetalMiniMaxH3Transformer::lora_footprint(f_lora, 2);
+  auto ml2 = MetalMiniMaxH3Transformer::load(h3root, mc, br.cfg, false,
+                                             {Spec{f_lora, 1.0f}});
+  ASSERT_TRUE(ml2 != nullptr);
+  if (ml2 == nullptr) { return; }
+  const std::size_t held = ml2->lora_bytes();
+  ml2.reset();
+  const std::size_t want = (std::size_t)2 * D * 8 * 4;
+  std::printf("  booked / held: %zu / %zu bytes (B A f32 a block: %zu); "
+              "streamed %zu\n", fp.whole, held, want, fp.streamed);
+  EXPECT_TRUE(fp.whole == held && held == want && fp.streamed == want);
+  fs::remove_all(root, ec);
+}
+
+// THE THREE ADAPTERS THE IC RELEASE INSTALLS, as it ships them, on two
+// real blocks: HyperFlow 8-step (a flow map), LMS Sharp v1.0 (ComfyUI
+// names, fused flat q|k|v, its 50 curve branches all zero -- here the
+// two of the trimmed stack) and the IC LoRA (diffusers names, rank 384,
+// 312 linears -- 16 modules here, 4 a block and a refiner block, its
+// q / k / v one fused module). Each binds
+// what it adapts and nothing is skipped; all three at strength 0 are
+// the base forward exactly; and the plan books what the load holds --
+// LMS's zero branches booked as live (the header cannot tell), so the
+// booking is the held bytes plus their B A.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (Ref2VA) + VPIPE_OPEN_H3_IC_PATH.
+TEST(minimax_h3_regenerate, the_ic_adapters_bind_as_the_release_installs)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string ic = env_("VPIPE_OPEN_H3_IC_PATH");
+  if (h3root.empty() || ic.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / "
+                "VPIPE_OPEN_H3_IC_PATH unset\n");
+    return;
+  }
+  const std::string hf =
+      ic + "/lora/minimax_h3_hyperflow_8step_v1.0.safetensors";
+  const std::string sharp = ic + "/lora/minimax_h3_lms_v1.0_r64.safetensors";
+  const std::string icl =
+      ic + "/lora/open_h3_regenerate_2k_ic_lora.safetensors";
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  BlockRun br;
+  ASSERT_TRUE(br.setup(mc, h3root, 2));
+  if (br.vb.empty()) { return; }
+  using Spec = MetalMiniMaxH3Transformer::LoraSpec;
+  const std::vector<Spec> on = {Spec{hf, 1.0f}, Spec{sharp, 1.0f},
+                                Spec{icl, 1.0f}};
+  const std::vector<Spec> off = {Spec{hf, 0.0f}, Spec{sharp, 0.0f},
+                                 Spec{icl, 0.0f}};
+  ::setenv("VPIPE_H3_NO_FUSED_FF", "1", 1);
+  std::vector<float> base, at0;
+  ASSERT_TRUE(br.run(mc, {}, &base, nullptr));
+  ASSERT_TRUE(br.run(mc, off, &at0, nullptr));
+  ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+  auto m = MetalMiniMaxH3Transformer::load(h3root, mc, br.cfg, false, on);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  const int mh = m->lora_modules(0), ms = m->lora_modules(1);
+  const int mi = m->lora_modules(2);
+  const bool flow = m->two_time_active() && m->flow_map() != nullptr &&
+                    m->flow_map()->slot == 0;
+  const std::size_t held = m->lora_bytes();
+  m.reset();
+  std::size_t booked = 0;
+  for (const Spec& sp : on) {
+    booked += MetalMiniMaxH3Transformer::lora_footprint(sp.path, 2).whole;
+  }
+  const std::size_t zero_curves = (std::size_t)2 * br.cfg.adaln_out() * 32;
+  std::printf("  bound: HyperFlow %d (flow map %s), LMS Sharp %d, IC %d; "
+              "all at 0 %s the base; booked %zu = held %zu + %zu of zero "
+              "curves: %s\n", mh, flow ? "live" : "NOT live", ms, mi,
+              at0 == base ? "IS" : "is NOT", booked, held, zero_curves,
+              booked == held + zero_curves ? "yes" : "NO");
+  EXPECT_TRUE(flow && mh > 0);
+  EXPECT_TRUE(ms == 16 && mi == 16);
+  EXPECT_TRUE(at0 == base);
+  EXPECT_TRUE(booked == held + zero_curves);
+}
+
+// THE IN-CONTEXT REFINE'S PLAN. A refine books no keyframe frames, and
+// one with references wired (Open-H3-Regenerate-2K-IC) books its
+// recipe's draft as well: a 768P clip over the clip's latent frames and
+// its presentation, the clip sampled at 2 fps, a 1008-token cell a pair.
+// The launch had booked the canvas and two anchors -- at the release's
+// 2K x 124, ~141k rows for a ~177k-row forward. video-ref-encoder books
+// the vision tower's work over one such clip (nothing had booked it for
+// MiniMax-H3), and the tower's device growth over the draft's
+// presentation stays within that figure: at the release's 124 frames
+// and at the end-to-end runs' 22 and 39.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (a root or partition: configs
+// for the plans, the text encoder's tower for the measurement).
+TEST(minimax_h3_regenerate, an_in_context_refine_books_its_draft)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (h3root.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  auto cfg = [&](int w, int h, int f) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string(h3root));
+    c.as_object().insert("width", FlexData::make_int(w));
+    c.as_object().insert("height", FlexData::make_int(h));
+    c.as_object().insert("frames", FlexData::make_int(f));
+    c.as_object().insert("fps", FlexData::make_real(24.0));
+    return c;
+  };
+  // Any upstream vertex: iport 11 makes a refine, iport 7 references.
+  LatentUpscaleStage up(&sess, "up", std::vector<InEdge>{},
+                        FlexData::make_object());
+  std::vector<InEdge> refine(12, InEdge{nullptr, 0});
+  refine[11] = InEdge{&up, 0};
+  std::vector<InEdge> ic = refine;
+  ic[7] = InEdge{&up, 0};
+  auto presented = [](int frames) {
+    std::vector<int> idx;
+    std::vector<float> secs;
+    (void)h3::condition_frame_indices(frames, h3::kFps, 2.0, 2, &idx,
+                                      &secs);
+    return (int)idx.size();
+  };
+  const MetalMiniMaxH3VideoVae::Config vc;
+  bool rows_ok = true;
+  for (const auto& g : {std::array<int, 3>{2560, 1440, 124},
+                        std::array<int, 3>{2560, 1440, 22},
+                        std::array<int, 3>{1344, 768, 39}}) {
+    GenerateVideoStage t2v(&sess, "g", std::vector<InEdge>{},
+                           cfg(g[0], g[1], g[2]));
+    GenerateVideoStage ref(&sess, "g", refine, cfg(g[0], g[1], g[2]));
+    GenerateVideoStage inc(&sess, "g", ic, cfg(g[0], g[1], g[2]));
+    const int lf = MetalMiniMaxH3VideoVae::video_latent_frames_for(vc, g[2]);
+    const int cells = (g[1] / 32) * (g[0] / 32);
+    const int rest = MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
+                         g[2] / 24.0) + 512;
+    const int draft =
+        lf * 24 * 42 + (presented(g[2]) + 1) / 2 * 1008;
+    std::printf("  %dx%dx%d: text-to-video %d rows, refine %d, in context "
+                "%d (the draft %d)\n", g[0], g[1], g[2],
+                t2v.planned_h3_rows(), ref.planned_h3_rows(),
+                inc.planned_h3_rows(), draft);
+    rows_ok = rows_ok &&
+              t2v.planned_h3_rows() == (lf + 2) * cells + rest &&
+              ref.planned_h3_rows() == lf * cells + rest &&
+              inc.planned_h3_rows() == lf * cells + rest + draft;
+  }
+  EXPECT_TRUE(rows_ok);
+
+  // video-ref-encoder's booking: one clip at its canvas cap (1344 x 768)
+  // over the generated frames, wherever a clip can arrive.
+  const std::string enc = MiniMaxH3TextEncoder::resolve_encoder_dir(h3root);
+  MiniMaxH3TextEncoder::Config ec;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr));
+  auto vision_claim = [&](const std::vector<InEdge>& edges) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string(h3root));
+    c.as_object().insert("frames", FlexData::make_int(124));
+    VideoRefEncoderStage v(&sess, "vre", edges, c);
+    std::size_t bytes = 0;
+    for (const ResourceClaim& rc : v.declare_resources()) {
+      if (rc.key.rfind("vision:vre|", 0) == 0) {
+        bytes = (std::size_t)std::stoull(rc.key.substr(11));
+      }
+    }
+    return bytes;
+  };
+  std::vector<InEdge> port(3, InEdge{nullptr, 0});
+  port[2] = InEdge{&up, 0};
+  const std::size_t claimed = vision_claim(port);
+  const std::size_t none = vision_claim({});
+  const std::size_t want = MetalQwenVisionEncoder::encode_video_scratch_bytes(
+      ec.vision, presented(124), 768, 1344);
+  std::printf("  video-ref-encoder books %.1f MB for a clip (%.1f with no "
+              "reference wired)\n", claimed / 1048576.0, none / 1048576.0);
+  EXPECT_TRUE(claimed == want && claimed > 0 && none == 0);
+
+  // The tower over each draft's presentation.
+  std::string verr;
+  auto tower = MiniMaxH3TextEncoder::load_vision(enc, mc, ec, &verr);
+  ASSERT_TRUE(tower != nullptr);
+  if (tower == nullptr) {
+    std::printf("  tower: %s\n", verr.c_str());
+    return;
+  }
+  for (const auto& d : {std::array<int, 3>{1344, 768, 124},
+                        std::array<int, 3>{1344, 768, 22},
+                        std::array<int, 3>{672, 384, 39}}) {
+    const int n = presented(d[2]);
+    std::vector<std::uint8_t> px((std::size_t)n * 3 * d[0] * d[1]);
+    for (std::size_t i = 0; i < px.size(); ++i) {
+      px[i] = (std::uint8_t)((i * 2654435761u) >> 24);
+    }
+    (void)mc->memory_budget_settled();
+    const std::size_t before = mc->memory_budget().allocated;
+    std::atomic<std::size_t> peak{before};
+    std::atomic<bool> done{false};
+    std::thread sampler([&] {
+      while (!done.load()) {
+        peak = std::max(peak.load(), mc->memory_budget().allocated);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+    });
+    auto r = tower->encode_video(px.data(), n, d[1], d[0]);
+    done = true;
+    sampler.join();
+    const std::size_t grew = peak.load() - before;
+    const std::size_t booked =
+        MetalQwenVisionEncoder::encode_video_scratch_bytes(ec.vision, n,
+                                                           d[1], d[0]);
+    const int tokens = r.embeddings.empty() ? 0 : r.n_tokens;
+    std::printf("  %dx%dx%d: %d frames presented, %d tokens; peak growth "
+                "%.1f MB, booked %.1f MB\n", d[0], d[1], d[2], n, tokens,
+                grew / 1048576.0, booked / 1048576.0);
+    EXPECT_TRUE(tokens == (n + 1) / 2 * (d[1] / 32) * (d[0] / 32));
+    EXPECT_TRUE(grew <= booked);
+  }
 }

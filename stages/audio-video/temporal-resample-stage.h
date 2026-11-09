@@ -5,6 +5,8 @@
 #include "common/av-filter-graph.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
+#include "pipeline/memory-plan.h"
+#include "pipeline/resource-plan.h"
 #include "pipeline/typed-stage.h"
 
 #include <cstdint>
@@ -40,6 +42,18 @@ namespace vpipe {
 //   motion   `minterpolate` -- estimate motion and synthesise the
 //            in-between frames. The one that helps when going UP in
 //            rate, where there is no information to average.
+//   rife     RIFE (Practical-RIFE 4.22-4.26, generative-models/rife/) --
+//            a learned flow network synthesises the frame AT each output
+//            time from the two source frames around it, on the GPU.
+//            Far better than `motion` at what `motion` is for (going UP
+//            in rate; slow motion), and like it no anti-alias going
+//            down: an output time between two frames gets the frame at
+//            that time, not an average. Needs the model (`hf_dir`).
+//            Not libavfilter: the stage times the output frames itself
+//            -- output frame k at source position k * in / out, the
+//            source frame itself where that is whole -- and holds the
+//            last frame over the end of the clip, so a clip keeps its
+//            length (N frames at r in are N / r seconds out).
 //
 // CLOCK DOMAINS -- read this before wiring it.
 //
@@ -88,6 +102,11 @@ public:
   Job process(RuntimeContext& ctx) override;
   void reset_run_state() override;
 
+  // Only `rife` holds a model: its checkpoint and the GPU scratch of the
+  // geometry it runs (booked at 1920x1080 until the first frame says).
+  std::vector<ResourceClaim> declare_resources() const override;
+  StageMemory declare_memory() const override;
+
   const StageSpec& spec() const noexcept override;
 
   // See the CLOCK DOMAINS note above: the oport shares the iport's
@@ -96,7 +115,7 @@ public:
 
   // How a rate change is filtered. Public so the chain builder has a
   // test that needs neither FFmpeg nor a runtime.
-  enum class Method { kNearest, kBlend, kAverage, kMotion };
+  enum class Method { kNearest, kBlend, kAverage, kMotion, kRife };
 
   // The libavfilter chain for one request. `in_fps`/`out_fps` are the
   // resolved rates; `avg_frames` is the `tmix` window, 0 to derive it
@@ -112,8 +131,26 @@ public:
   bool          stacked()    const noexcept { return _stacked; }
   double        output_fps() const noexcept { return _out_fps; }
   std::uint64_t emitted()    const noexcept { return _emitted; }
+  // `rife`: frames synthesised (the rest were source frames, or held
+  // over a scene cut), and pairs held as cuts.
+  std::uint64_t interpolated() const noexcept { return _interpolated; }
+  std::uint64_t cuts_held()    const noexcept { return _cuts_held; }
+
+  // Where output frame `k` falls in the source: frame `*i0` and the
+  // fraction `*t` of the way to the next, for a source at `in_fps`
+  // resampled to `out_fps` -- in exact rational arithmetic, so 30000/1001
+  // into 60000/1001 lands on whole frames every other output and not a
+  // hair off them. False for rates that do not convert.
+  static bool output_position(std::int64_t k, double in_fps, double out_fps,
+                              std::int64_t* i0, double* t);
+  // How many frames a clip of `n` source frames resamples to: every
+  // output time before the clip's end, n / in_fps seconds.
+  static std::int64_t output_count(std::int64_t n, double in_fps,
+                                   double out_fps);
 
 private:
+  struct Rife;   // the `rife` method's model and frame window (.cc)
+
   // Resolve the source rate for one beat: `input_fps` when configured,
   // else the beat's own sideband. 0 when neither said.
   double input_fps_of_(const TensorBeat& tb) const;
@@ -166,6 +203,31 @@ private:
   std::uint64_t _out_index   = 0;
   std::uint64_t _emitted     = 0;
   bool          _shape_warned = false;
+
+  // `rife`.
+  std::string   _hf_dir;
+  double        _rife_scale = 0.0;     // 0: the driver's rule per size
+  double        _scene_threshold = 0.2;
+  std::unique_ptr<Rife> _rife;
+  std::uint64_t _interpolated = 0;
+  std::uint64_t _cuts_held = 0;
+  // The checkpoint file for `_hf_dir`; empty + *err when it names none.
+  std::string rife_file_(std::string* err = nullptr) const;
+  std::string rife_scratch_label_() const;
+  // Load at initialize; drop at the end of the run.
+  bool rife_load_();
+  void rife_release_();
+  // The `rife` beat paths. `out` gets each output frame's planar bytes.
+  bool rife_stream_frame_(std::unique_ptr<BeatPayloadIntf> p, double in_fps,
+                          std::vector<std::vector<std::uint8_t>>* out);
+  void rife_stream_end_(std::vector<std::vector<std::uint8_t>>* out);
+  bool rife_clip_(const TensorBeat& clip, double in_fps,
+                  std::vector<std::vector<std::uint8_t>>* out);
+  // Output frame at `t` of the way from source frame `i0` to the next,
+  // both already in the window (t == 0: frame i0 itself).
+  bool rife_pair_(std::int64_t i0, double t, std::vector<std::uint8_t>* out);
+  // Book the scratch of the geometry the window now runs at.
+  void rife_revise_scratch_();
 };
 
 }  // namespace vpipe

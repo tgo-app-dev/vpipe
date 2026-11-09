@@ -127,6 +127,20 @@ inline constexpr std::string_view kMergeLead = "merge_lead";
 inline constexpr std::string_view kColorRefFrames = "color_ref_frames";
 // Int: the wavelet colour fix's levels. Absent: 5.
 inline constexpr std::string_view kColorRefLevels = "color_ref_levels";
+// String: on an IMAGE latent ([z, h, w]) that announces
+// `color_ref_frames` 1, how its decode is corrected against the one
+// picture its decoder's colour-reference input then carries ([3, H, W]
+// at the output size, samples 0..1): "gaussian" -- clamp(x - low(x) +
+// low(ref)) with `low` ONE Gaussian blur of `color_ref_sigma` (OpenCV's
+// kernel: cvRound(8 sigma + 1) | 1 taps, reflect-101 edges; VOSR's
+// `wavelet_color_fix`); "adain" -- each channel's mean and unbiased
+// spread (+ 1e-5) moved to the picture's (VOSR's `adain_color_fix`);
+// "none" -- the picture read and left, so the pairing holds. Over
+// samples in 0..1, clamped there. Absent: "wavelet", the stack above,
+// which an image decoder does not run.
+inline constexpr std::string_view kColorRefMethod = "color_ref_method";
+// Real: the "gaussian" colour fix's sigma, in output pixels. Absent: 5.
+inline constexpr std::string_view kColorRefSigma = "color_ref_sigma";
 // String: which of its model's decoders a latent asks to be decoded by.
 // "tiny": the model's small CONDITIONED decoder in place of its VAE --
 // FlashVSR's TCDecoder, which reads the restored clip's own source beside

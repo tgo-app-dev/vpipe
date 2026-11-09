@@ -154,6 +154,10 @@ public:
   // at once plus the host-side pixels and patches. For a memory plan.
   static std::size_t encode_scratch_bytes(const Config& c,
                                           std::int64_t max_pixels = 0);
+  // The same for encode_video() of `n_frames` frames of H x W: its
+  // grid, by the video rule, and every frame's pixels on the host.
+  static std::size_t encode_video_scratch_bytes(const Config& c,
+                                                int n_frames, int H, int W);
 
   // Encode a CLIP: `rgb` is `n_frames` consecutive [3, H, W] U8 planes.
   //

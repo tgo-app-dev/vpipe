@@ -189,8 +189,11 @@ struct DenoiseRequest {
   // AUDIO HELD CLEAN: every audio row rides at `condition_audio_timestep`
   // and none is stepped -- the release conditions its refine on a fixed
   // encoded silence. The caller puts the re-noised state in `video`
-  // itself, (1 - sigma[0]) x + sigma[0] noise. A flow-map adapter is
-  // refused: its (t, r) pairs follow a schedule this replaces.
+  // itself, (1 - sigma[0]) x + sigma[0] noise. Under a live flow-map
+  // adapter (Open-H3-Regenerate-2K-IC: the tail of HyperFlow's grid)
+  // step i jumps to sigma[i + 1]: the generated rows carry
+  // (1 - sigma[i], 1 - sigma[i + 1]), every held row r = t. A sampling
+  // contract is refused.
   std::vector<double> refine_sigmas;
   // The seed of the FRESH NOISE a re-noising sampler draws each step
   // (MetalMiniMaxH3Transformer::SamplingContract): the video's

@@ -627,19 +627,15 @@ MetalQwenVisionEncoder::config_from(const ModelConfig& c)
   return m;
 }
 
+namespace {
+
+// encode_()'s allocations for `n` patches whose pixels, resized, number
+// `host_px` on the host.
 std::size_t
-MetalQwenVisionEncoder::encode_scratch_bytes(const Config& c,
-                                             std::int64_t max_pixels)
+encode_bytes_(const MetalQwenVisionEncoder::Config& c, std::size_t n,
+              std::int64_t host_px)
 {
-  // encode_()'s allocations at the largest grid: a picture of at most
-  // `px` pixels is at most px / P^2 patches (smart_resize keeps the area
-  // under the bound).
-  const std::int64_t px =
-      max_pixels > 0 ? std::min<std::int64_t>(max_pixels, c.max_pixels)
-                     : (std::int64_t)c.max_pixels;
   const int P = std::max(1, c.patch_size), S = std::max(1, c.spatial_merge);
-  const std::size_t n = (std::size_t)std::max<std::int64_t>(px, 0) /
-                        ((std::size_t)P * P);
   const std::size_t n_im = n / ((std::size_t)S * S);
   const std::size_t hidden = (std::size_t)c.hidden;
   const std::size_t hd = (std::size_t)std::max(1, c.head_dim());
@@ -664,9 +660,45 @@ MetalQwenVisionEncoder::encode_scratch_bytes(const Config& c,
   // positions and RoPE. MEASURED with the real tower (Qwen3.5-4B's): the
   // GPU term within 1% of the device's allocated size at its peak, the
   // host term within 10% of the resident size's growth (2048^2 and 4096^2).
-  const std::size_t host = (std::size_t)px * 3 * 4 * 2 +
+  const std::size_t host = (std::size_t)host_px * 3 * 4 * 2 +
                            n * (feat + hidden + 2 * hd) * 2;
   return gpu + host;
+}
+
+}  // namespace
+
+std::size_t
+MetalQwenVisionEncoder::encode_scratch_bytes(const Config& c,
+                                             std::int64_t max_pixels)
+{
+  // encode_()'s allocations at the largest grid: a picture of at most
+  // `px` pixels is at most px / P^2 patches (smart_resize keeps the area
+  // under the bound).
+  const std::int64_t px =
+      max_pixels > 0 ? std::min<std::int64_t>(max_pixels, c.max_pixels)
+                     : (std::int64_t)c.max_pixels;
+  const int P = std::max(1, c.patch_size);
+  const std::size_t n = (std::size_t)std::max<std::int64_t>(px, 0) /
+                        ((std::size_t)P * P);
+  return encode_bytes_(c, n, px);
+}
+
+std::size_t
+MetalQwenVisionEncoder::encode_video_scratch_bytes(const Config& c,
+                                                   int n_frames, int H, int W)
+{
+  if (n_frames <= 0 || H <= 0 || W <= 0) { return 0; }
+  const int P = std::max(1, c.patch_size), S = std::max(1, c.spatial_merge);
+  const int T = std::max(1, c.temporal_patch);
+  int th = 0, tw = 0;
+  smart_resize_video_(n_frames, H, W, P * S, T, c.video_min_pixels,
+                      c.video_max_pixels, &th, &tw);
+  // encode_()'s grid: a cell of the resized frame per T frames, every
+  // frame's pixels resized on the host.
+  const std::size_t cells = (std::size_t)((n_frames + T - 1) / T);
+  const std::size_t n =
+      cells * (std::size_t)(th / P) * (std::size_t)(tw / P);
+  return encode_bytes_(c, n, (std::int64_t)n_frames * th * tw);
 }
 
 MetalQwenVisionEncoder::Result

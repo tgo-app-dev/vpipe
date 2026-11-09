@@ -217,7 +217,8 @@ to_host_f32_(WeightSet& ws, MetalCompute* mc, const std::string& nm,
              std::vector<float>& out)
 {
   const auto* info = ws.src().info(nm);
-  if (info == nullptr || info->shape.empty()) { return false; }
+  if (info == nullptr) { return false; }
+  // A 0-d tensor (a kohya `.alpha`) is one value.
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
   if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
@@ -2692,6 +2693,14 @@ MetalMiniMaxH3Transformer::lora_bytes() const
       }
     }
     n += fb(sl.final_adaln);
+    // A live curve branch's product B A, held in the trunk.
+    for (const SharedBuffer& w : sl.curve.wc) { n += w.byte_size(); }
+    // The timestep MLP's factors (and a flow map's endpoint twin), held
+    // on the host in f32.
+    for (const lora::HostFactors* h :
+         {&sl.time_in, &sl.time_out, &sl.end_in, &sl.end_out}) {
+      n += (h->a.size() + h->b.size()) * sizeof(float);
+    }
   }
   // ...and the set a streamed block's factors are read into.
   for (const BlockLora& bl : _lora_stream) {
@@ -2804,6 +2813,19 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
   std::size_t main = 0;
   std::map<std::string, std::size_t> per_role;   // largest across blocks
   std::map<std::string, int> fused;              // q|k|v ranks summed
+  // On a RELEASED DiT an AdaLN module over the pruned form's 8-D point
+  // is a CURVE branch (bind_curves_), held as its f32 product B A
+  // [D, 8] in the trunk, not as factors -- and not at all when its B is
+  // zero, which the header cannot tell, so it is booked as live.
+  auto curve_mod = [&](const std::string& mod) {
+    for (const char* a : {".lora_A.weight", ".lora_down.weight"}) {
+      if (const auto* ai = wts->info(mod + a)) {
+        return ai->shape.size() == 2 && ai->shape[1] == 8;
+      }
+    }
+    return false;
+  };
+  const std::string kCurveB = ".adaln_proj.linear.curve_B.weight";
   for (const std::string& nm : wts->tensor_names()) {
     const auto* ti = wts->info(nm);
     if (ti == nullptr || nm.size() < 7 ||
@@ -2814,14 +2836,31 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
     const std::size_t pb = pa == std::string::npos
                                ? mark(nm, kB, std::size(kB))
                                : std::string::npos;
-    if (pa == std::string::npos && pb == std::string::npos) { continue; }
+    const bool curve_b =
+        !skip_adaln && nm.size() > kCurveB.size() &&
+        nm.compare(nm.size() - kCurveB.size(), kCurveB.size(), kCurveB) ==
+            0;
+    if (pa == std::string::npos && pb == std::string::npos && !curve_b) {
+      continue;
+    }
     if (skip_adaln && adaln_(nm)) { continue; }   // counted above
     std::size_t end = 0;
     const int L = adapter_main_block_(nm, &end);
     if (L >= 0 && n_layers > 0 && L >= n_layers) { continue; }
+    if (!skip_adaln && adaln_(nm) &&
+        (curve_b ||
+         curve_mod(nm.substr(0, pa != std::string::npos ? pa : pb)))) {
+      if ((curve_b || pb != std::string::npos) && !ti->shape.empty()) {
+        fp.whole += (std::size_t)ti->shape[0] * 8 * 4;
+      }
+      continue;
+    }
     std::size_t n = 1;
     for (auto d : ti->shape) { n *= (std::size_t)d; }
-    const std::size_t b = n * 2;
+    // bf16 factors, but the timestep MLP's (a flow map's endpoint twin
+    // included): those stay f32 on the host (lora::HostFactors).
+    const bool host = nm.find("time_embedder") != std::string::npos;
+    const std::size_t b = n * (host ? 4 : 2);
     fp.whole += b;
     if (L >= 0) {
       main += b;
@@ -2999,6 +3038,16 @@ MetalMiniMaxH3Transformer::curve_coords(const std::vector<float>& table,
 // the curve TABLE is a tensor `adaln_t_table` in the file itself or a
 // file beside it: `adaln_t_table.bin` (raw little-endian f32, what the
 // release's download script writes) or `adaln_t_table.safetensors`.
+//
+// Two spellings of the FACTORS. The release's own file says `curve_A`
+// / `curve_B`. An adapter TRAINED on ComfyUI's pruned form -- LMS Sharp
+// v1.0 as Alissonerdx publishes it, which Open-H3-Regenerate-2K-IC
+// installs -- writes its AdaLN modules as ordinary LoRA factors over the
+// 8-D point (`lora_A` [r, 8]; `lora_down` / `lora_up`, with an `.alpha`
+// beside them, alike). On a pruned DiT that point IS the projection's
+// input and they bind as a plain adapter; on a released one they are
+// curve branches, as the release's sharp.py installs them. Only an
+// 8-wide A is one: a released AdaLN module's A is [r, time_dim].
 bool
 MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
                                         LoraSlot& slot, bool* took,
@@ -3009,41 +3058,87 @@ MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
     if (err != nullptr) { *err = "minimax-h3 curve branches: " + m; }
     return false;
   };
-  if (!lora::Adapter::file_touches(path, ".curve_A.")) { return true; }
+  const bool lora_ok = !_cfg.pruned();
+  if (!lora::Adapter::file_touches(path, ".curve_A.") &&
+      !(lora_ok &&
+        lora::Adapter::file_touches(path, "adaln_proj.linear.lora_"))) {
+    return true;
+  }
   std::shared_ptr<WeightSet> ws = WeightSet::open(path, nullptr);
   if (!ws) { return no("cannot open '" + path + "'"); }
   const Config& c = _cfg;
   const int D = c.adaln_out();
-  std::vector<std::string> an((std::size_t)c.n_layers),
-      bn((std::size_t)c.n_layers);
-  const std::string kA = ".adaln_proj.linear.curve_A.weight";
-  const std::string kB = ".adaln_proj.linear.curve_B.weight";
-  int unplaced = 0;
-  for (const std::string& n : ws->src().tensor_names()) {
-    const bool is_a = n.size() > kA.size() &&
-                      n.compare(n.size() - kA.size(), kA.size(), kA) == 0;
-    const bool is_b = n.size() > kB.size() &&
-                      n.compare(n.size() - kB.size(), kB.size(), kB) == 0;
-    if (!is_a && !is_b) { continue; }
-    std::string k = n.substr(0, n.size() - kA.size());
+  struct Spell {
+    const char* a;
+    const char* b;
+    bool        lora;
+  };
+  static const Spell kSpell[] = {
+      {".adaln_proj.linear.curve_A.weight",
+       ".adaln_proj.linear.curve_B.weight", false},
+      {".adaln_proj.linear.lora_A.weight",
+       ".adaln_proj.linear.lora_B.weight", true},
+      {".adaln_proj.linear.lora_down.weight",
+       ".adaln_proj.linear.lora_up.weight", true},
+  };
+  auto ends = [](const std::string& n, const std::string& x) {
+    return n.size() > x.size() &&
+           n.compare(n.size() - x.size(), x.size(), x) == 0;
+  };
+  auto layer_of = [&](std::string k) {
     for (const char* pre : {"model.diffusion_model.", "diffusion_model.",
                             "transformer."}) {
       const std::string ps(pre);
       if (k.compare(0, ps.size(), ps) == 0) { k = k.substr(ps.size()); }
     }
-    int layer = -1;
     for (const char* blk : {"transformer_blocks.", "blocks."}) {
       const std::string bs(blk);
       if (k.compare(0, bs.size(), bs) == 0) {
         const std::string idx = k.substr(bs.size());
         if (!idx.empty() &&
             idx.find_first_not_of("0123456789") == std::string::npos) {
-          layer = std::atoi(idx.c_str());
+          return std::atoi(idx.c_str());
         }
       }
     }
-    if (layer < 0 || layer >= c.n_layers) { ++unplaced; continue; }
-    (is_a ? an : bn)[(std::size_t)layer] = n;
+    return -1;
+  };
+  std::vector<std::string> an((std::size_t)c.n_layers),
+      bn((std::size_t)c.n_layers), aln((std::size_t)c.n_layers);
+  std::vector<char> from_lora((std::size_t)c.n_layers, 0);
+  int unplaced = 0;
+  for (const std::string& n : ws->src().tensor_names()) {
+    for (const Spell& sp : kSpell) {
+      if (sp.lora && !lora_ok) { continue; }
+      const std::string A(sp.a), B(sp.b);
+      const bool is_a = ends(n, A);
+      const bool is_b = ends(n, B);
+      if (!is_a && !is_b) { continue; }
+      // A LoRA-spelled branch is found from its A, the one that says it
+      // is a curve: B and the alpha follow from the name.
+      if (sp.lora) {
+        const auto* ai = ws->src().info(n);
+        if (!is_a || ai == nullptr || ai->shape.size() != 2 ||
+            ai->shape[1] != 8) {
+          break;
+        }
+      }
+      const std::string stem = n.substr(0, n.size() - (is_a ? A : B).size());
+      const int layer = layer_of(stem);
+      if (layer < 0 || layer >= c.n_layers) {
+        ++unplaced;
+        break;
+      }
+      const std::size_t L = (std::size_t)layer;
+      (is_a ? an : bn)[L] = n;
+      if (sp.lora) {
+        bn[L] = stem + B;
+        const std::string al = stem + ".adaln_proj.linear.alpha";
+        if (ws->src().info(al) != nullptr) { aln[L] = al; }
+        from_lora[L] = 1;
+      }
+      break;
+    }
   }
   // Outside this DiT's blocks is SKIPPED and said, as an adapter's
   // unmatched modules are: a DiT built with fewer blocks (a test's) is
@@ -3056,6 +3151,7 @@ MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
 
   CurveSet& cs = slot.curve;
   cs = CurveSet{};
+  cs.lora_layers = std::move(from_lora);
   // B A per block, in double: [D, 8]. A branch whose B is all zero adds
   // nothing at any timestep and is dropped -- Open-H3-Regenerate-2K's 50
   // are all zero (LMS Sharp v1.0's curve_B as shipped), so that file
@@ -3086,6 +3182,16 @@ MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
       ++zero;
       continue;
     }
+    // A kohya-style `.alpha` scales the branch by alpha / rank, as it
+    // does a LoRA module; without one the factors stand as they are.
+    double mul = 1.0;
+    if (!aln[(std::size_t)L].empty()) {
+      std::vector<float> al;
+      if (!to_host_f32_(*ws, _mc, aln[(std::size_t)L], al) || al.empty()) {
+        return no(fmt("cannot read block {}'s curve alpha", L)());
+      }
+      mul = (double)al[0] / (double)r;
+    }
     SharedBuffer w = _mc->make_shared_buffer((std::size_t)D * 8 * 4);
     if (w.empty()) { return no("allocation failed"); }
     auto* wp = static_cast<float*>(w.contents());
@@ -3096,7 +3202,7 @@ MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
         for (int q = 0; q < r; ++q) {
           acc += (double)br[q] * (double)A[(std::size_t)q * 8 + k];
         }
-        wp[(std::size_t)j * 8 + k] = (float)acc;
+        wp[(std::size_t)j * 8 + k] = (float)(acc * mul);
       }
     }
     wc[(std::size_t)L] = std::move(w);
@@ -3106,10 +3212,15 @@ MetalMiniMaxH3Transformer::bind_curves_(const std::string& path,
   *took = cs.branches + zero > 0;
   if (cs.branches == 0) {
     if (_mc->session() != nullptr && zero > 0) {
+      const bool spelled =
+          std::any_of(cs.lora_layers.begin(), cs.lora_layers.end(),
+                      [](char t) { return t != 0; });
       _mc->session()->info(fmt(
-          "MetalMiniMaxH3Transformer: '{}': {} AdaLN curve branches, every "
-          "one with B = 0 -- they add nothing, so none is bound", path,
-          zero));
+          "MetalMiniMaxH3Transformer: '{}': {} AdaLN curve branches{}, "
+          "every one with B = 0 -- they add nothing, so none is bound",
+          path, zero,
+          spelled ? " (LoRA factors over the pruned form's 8-D point)"
+                  : ""));
     }
     return true;
   }
@@ -3988,7 +4099,11 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     bind(p + "attn.out_proj", H, I, bl.out);
     bind(p + "mlp.fc1", 2 * F, H, bl.fc1);
     bind(p + "mlp.fc2", H, F, bl.fc2);
-    bind(p + "adaln_proj.linear", c.adaln_out(), c.time_dim, bl.adaln);
+    // Not where the file's branch is a curve's (bind_curves_ took it).
+    if ((std::size_t)i >= slot.curve.lora_layers.size() ||
+        slot.curve.lora_layers[(std::size_t)i] == 0) {
+      bind(p + "adaln_proj.linear", c.adaln_out(), c.time_dim, bl.adaln);
+    }
   }
   slot.refiner.resize((std::size_t)c.n_refiner);
   for (int i = 0; i < c.n_refiner; ++i) {
@@ -4016,6 +4131,9 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
                           err)) {
     return false;
   }
+  // Curve branches alone, every one zero (bind_curves_ said so): bound
+  // as a no-op, as the release's own curve file is.
+  if (slot.modules == 0 && curved) { return true; }
   if (slot.modules == 0) {
     // NAME what would have matched. "none of this model's modules" is
     // the whole of what a user sees when a trainer's naming is one this

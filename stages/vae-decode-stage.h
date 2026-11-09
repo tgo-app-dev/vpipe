@@ -253,6 +253,12 @@ private:
   // and whether a missing color_reference input has been said.
   std::unique_ptr<WaveletColorFix> _wavelet;
   bool _ref_port_noted = false;
+  // An image latent's colour fix (VOSR's): said once when it first runs,
+  // warned once when one it asked for could not.
+  bool _image_fix_noted = false;
+  bool _image_fix_said = false;
+  void note_image_color_fix_(const std::string& why,
+                             const std::string& method, double sigma);
   bool _h3_cut_said = false;     // one note per run of a trim / crop
   // FlashVSR's TINY decoder (sideband::kDecoder "tiny"), loaded at the
   // first latent that asks for it, and its stream: the MemBlocks'

@@ -320,6 +320,9 @@ public:
   const FlexData& accel_settings() const noexcept { return _accel; }
   // The model_config beat as the stage holds it now.
   const FlexData& model_config() const noexcept { return _model_cfg; }
+  // MiniMax-H3's packed sequence as the launch plan books it
+  // (h3_plan_seq_).
+  int planned_h3_rows() const { return h3_plan_seq_(); }
 
 private:
   // Which DiT family the resident checkpoint is, from its `_class_name`
@@ -352,7 +355,8 @@ private:
   std::string ane_claim_label_() const;
   std::size_t h3_ane_bytes_() const;
   // MiniMax-H3's packed sequence at the planned geometry (a 512-row
-  // prompt, the two conditioning frames), and the forward's activations
+  // prompt, the two conditioning frames -- none for a refine, and a
+  // refine in context's 768P draft), and the forward's activations
   // there -- the denoise phase's scratch in both ledgers.
   int h3_plan_seq_() const;
   std::size_t h3_forward_scratch_bytes_(const std::string& dit) const;
@@ -733,6 +737,7 @@ private:
   bool h3_silence_rows_(int frames, double fps, std::vector<float>* rows,
                         int* alat);
   bool _refine_ref2va_said = false, _refine_audio_said = false;
+  bool _refine_in_context_said = false;
   std::vector<float> _h3_silence;
   int    _h3_silence_frames = 0;
   double _h3_silence_fps    = 0.0;

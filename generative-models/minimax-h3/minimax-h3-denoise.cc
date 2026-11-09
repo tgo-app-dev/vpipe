@@ -283,10 +283,11 @@ denoise(const DenoiseRequest& req, std::string* err)
                     step_update_name(req.update))());
   }
   if (refine) {
-    if (two_time) {
-      return fail("denoise: a refine names its own sigmas and cannot run a "
-                  "flow-map adapter, whose (t, r) pairs follow its grid");
-    }
+    // A flow-map adapter runs here too (Open-H3-Regenerate-2K-IC: the
+    // last steps of HyperFlow's grid from the upscaled draft): each step
+    // jumps from sigma i to sigma i + 1, so the generated rows carry
+    // (1 - sigma_i, 1 - sigma_i+1) -- set_sigmas_as_run's timesteps and
+    // endpoints -- and the rows a refine holds, r = t.
     if (sc != nullptr) {
       return fail("denoise: a refine names its own sigmas and cannot run "
                   "an adapter's sampling contract (" + sc->release + ")");
@@ -370,10 +371,11 @@ denoise(const DenoiseRequest& req, std::string* err)
     const float ta = refine ? req.condition_audio_timestep
                             : sa.timesteps()[(std::size_t)i];
     if (two_time) {
+      // Held audio stays where it is: r = t.
+      const float ra = refine ? ta : sa.endpoints()[(std::size_t)i];
       minimax_h3::build_row_time_pairs(
-          L, tv, sv.endpoints()[(std::size_t)i], ta,
-          sa.endpoints()[(std::size_t)i], req.condition_timestep, u, ur, ri,
-          req.condition_audio_timestep);
+          L, tv, sv.endpoints()[(std::size_t)i], ta, ra,
+          req.condition_timestep, u, ur, ri, req.condition_audio_timestep);
     } else {
       minimax_h3::build_row_timesteps(L, tv, ta, req.condition_timestep, u,
                                       ri, req.condition_audio_timestep);

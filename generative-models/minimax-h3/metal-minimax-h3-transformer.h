@@ -2094,6 +2094,11 @@ class MetalMiniMaxH3Transformer {
     int knots    = 0;
     int branches = 0;
     int rank     = 0;
+    // Blocks whose branch the file spells as LoRA factors -- an adapter
+    // trained on ComfyUI's pruned form, LMS Sharp's own file: there the
+    // AdaLN module IS this branch, so bind_lora_ leaves it alone (zero
+    // branches included, which bind nothing here).
+    std::vector<char> lora_layers;
     bool empty() const { return branches == 0; }
   };
   // One attached adapter. Slots are independent all the way down: their

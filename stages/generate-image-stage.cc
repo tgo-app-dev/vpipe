@@ -1916,6 +1916,12 @@ GenerateImageStage::reset_run_state()
   _qi21_sigmas.clear();
   _qi21_shift_terminal = -1.0;
   _qi21_sched_noted = false;
+  // VOSR's tiling and colour fix: unset again is the trained grid and the
+  // release's wavelet fix, not the last run's numbers.
+  _tile_size = 0;
+  _tile_size_set = false;
+  _tile_overlap = (int)attr_int("tile_overlap");
+  _vosr_color_fix = "wavelet";
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The preview keys too: a relaunch whose graph no longer names a
   // preview VAE must not inherit one.
@@ -3070,6 +3076,16 @@ GenerateImageStage::apply_model_config_()
       }
       if (o.contains("tile_overlap")) {
         _tile_overlap = (int)o.at("tile_overlap").as_int(32);
+      }
+      if (o.contains("color_fix")) {
+        std::string m(o.at("color_fix").as_string("wavelet"));
+        if (m == "nofix") { m = "none"; }      // the script's spelling
+        if (m == "wavelet" || m == "adain" || m == "none") {
+          _vosr_color_fix = m;
+        } else {
+          perr = fmt("color_fix '{}' is not wavelet, adain or none; "
+                     "keeping {}", m, _vosr_color_fix)();
+        }
       }
     }
   }
@@ -8704,6 +8720,28 @@ GenerateImageStage::process(RuntimeContext& ctx)
     out->resize_contiguous(vout.size());
     std::memcpy(out->as_f32(), vout.data(), vout.size() * sizeof(float));
     tag_output_(*out);
+    // THE COLOUR FIX the release's script applies to what it restored
+    // (--align_method, `wavelet` by default: the picture's low
+    // frequencies, a Gaussian blur at sigma 5, under the restored
+    // detail). vae-decode runs it against the picture on its
+    // color_reference input, so it is announced on EVERY latent, `none`
+    // included: one picture is read per latent whatever the method, or
+    // the next latent would pair with this one's picture.
+    {
+      if (!out->sideband.is_object()) {
+        out->sideband = FlexData::make_object();
+      }
+      auto so = out->sideband.as_object();
+      const bool wavelet = _vosr_color_fix == "wavelet";
+      so.insert_or_assign(sideband::kColorRefFrames, FlexData::make_int(1));
+      so.insert_or_assign(sideband::kColorRefMethod,
+                          FlexData::make_string(wavelet ? "gaussian"
+                                                        : _vosr_color_fix));
+      if (wavelet) {
+        so.insert_or_assign(sideband::kColorRefSigma,
+                            FlexData::make_real(5.0));
+      }
+    }
     ++_latents_emitted;
     session()->info(fmt(
         "GenerateImageStage('{}'): VOSR latent [{}, {}, {}] ({} step{} @ "

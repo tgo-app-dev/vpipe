@@ -3829,16 +3829,22 @@ const STRINGS = {
       + '：f32 [z, T, H/16, W/16]，已白化——草稿的 vae-encode，或其 '
       + 'latent-upscale 结果。片段被送回精修的第一个 sigma，再在它自己的几何'
       + '（潜在的，而非本阶段的 width / height）上重新去噪，以提示词和一段编'
-      + '码后的静音为条件；关键帧与参考输入会被忽略。调度由模型配置的 '
+      + '码后的静音为条件；关键帧输入会被忽略。参考输入则保留，干净地放在它'
+      + '前面——即上下文中的精修（Open-H3-Regenerate-2K-IC：草稿作为 '
+      + '<Video 1>，用 Ref2VA 权重）。调度由模型配置的 '
       + '`refine_start_sigma` / `refine_shift` 在本阶段的 `steps` 上给出——3 '
-      + '即发布版的取值。请在模型配置上接上发布版的合并 LoRA',
+      + '即发布版的取值；挂了流映射适配器（HyperFlow）时，则取其自身网格的最'
+      + '后 `steps` 步。请在模型配置上接上发布版的适配器',
       '可選：要精修而非從雜訊產生的片段（MiniMax-H3：Open-H3-Regenerate-2K）'
       + '：f32 [z, T, H/16, W/16]，已白化——草稿的 vae-encode，或其 '
       + 'latent-upscale 結果。片段被送回精修的第一個 sigma，再在它自己的幾何'
       + '（潛在的，而非本階段的 width / height）上重新去噪，以提示詞和一段編'
-      + '碼後的靜音為條件；關鍵影格與參考輸入會被忽略。排程由模型設定的 '
+      + '碼後的靜音為條件；關鍵影格輸入會被忽略。參考輸入則保留，乾淨地放在'
+      + '它前面——即上下文中的精修（Open-H3-Regenerate-2K-IC：草稿作為 '
+      + '<Video 1>，用 Ref2VA 權重）。排程由模型設定的 '
       + '`refine_start_sigma` / `refine_shift` 在本階段的 `steps` 上給出——3 '
-      + '即發布版的取值。請在模型設定上接上發布版的合併 LoRA'],
+      + '即發布版的取值；掛了流映射適配器（HyperFlow）時，則取其自身網格的最'
+      + '後 `steps` 步。請在模型設定上接上發布版的適配器'],
   'port.generate-video.latent': ['',
       'f32 潜在视频 [z, T, H/r, W/r]（已白化），边带 {fps, frames}。z/r 即'
       + '常驻模型族的 VAE 几何参数',
@@ -4402,12 +4408,18 @@ const STRINGS = {
       + '一组就对应一拍——先是 `color_ref_frames`，供 wavelet 颜色校正使用；'
       + '再是 `decoder_cond_frames`，供在潜变量旁读取源图的小型解码器使用'
       + '（FlashVSR 的小型解码器，此时由它代替 VAE 解码）——且只为这些读取。'
-      + '即 flashvsr-src-encoder 的 color_reference 输出',
+      + '即 flashvsr-src-encoder 的 color_reference 输出。对声明了 '
+      + '`color_ref_frames` 的图像潜变量（VOSR 的颜色校正），则是每个潜变量'
+      + '按顺序对应一张输出尺寸的 [3, H, W] 图：接上修复器看到的同一批像素'
+      + '（VOSR 的 image-resample）',
       '可選，來源圖：平面 [n, 3, H, W]（U8、F16 或 F32），潛變量的邊帶每宣'
       + '告一組就對應一拍——先是 `color_ref_frames`，供 wavelet 色彩校正使用'
       + '；再是 `decoder_cond_frames`，供在潛變量旁讀取來源圖的小型解碼器使'
       + '用（FlashVSR 的小型解碼器，此時由它代替 VAE 解碼）——且只為這些讀取'
-      + '。即 flashvsr-src-encoder 的 color_reference 輸出'],
+      + '。即 flashvsr-src-encoder 的 color_reference 輸出。對宣告了 '
+      + '`color_ref_frames` 的影像潛變量（VOSR 的色彩校正），則是每個潛變量'
+      + '按順序對應一張輸出尺寸的 [3, H, W] 圖：接上修復器看到的同一批像素'
+      + '（VOSR 的 image-resample）'],
   'port.vae-decode.image': ['',
       '解码出的平面 U8 RGB TensorBeat [3, H, W]。视频潜变量按帧逐个发出节拍'
       + '，而不是发一个片段形状的张量，每个节拍的边带都带有 {frame, frames,'
@@ -4715,6 +4727,21 @@ const STRINGS = {
       + '能來自 `references` 清單，因為清單是先讀的。之所以逐埠設定而不是一'
       + '個總開關，是因為一次請求完全可能既帶隨片配樂、又帶一段獨立音樂。節'
       + '拍自身的 `attach` 邊帶可針對該節拍覆寫此項'],
+  'cfg.video-ref-encoder.attach_latent': ['',
+      '参考输入端口编号（1..6），表示这些端口上的节拍是已经编码好的视频潜变'
+      + '量——f32 [z, frames, h, w]，例如 vae-encode 对前一个端口上同一段片'
+      + '段编出的潜变量——它附加到紧邻其前的参考上：其行取代该参考的 VAE 编'
+      + '码，而画面仍送给条件编码器。等同于节拍自己声明 `latent: true` 与 '
+      + '`attach: true`，供不作此声明的生产者使用。Open-H3-Regenerate-2K-IC '
+      + '就这样只把草稿编码一次：同一个潜变量既是 DiT 保持干净的参考，也是放'
+      + '大器的输入',
+      '參考輸入埠編號（1..6），表示這些埠上的節拍是已經編碼好的影片潛變量'
+      + '——f32 [z, frames, h, w]，例如 vae-encode 對前一個埠上同一段片段編'
+      + '出的潛變量——它附加到緊鄰其前的參考上：其列取代該參考的 VAE 編碼，'
+      + '而畫面仍送給條件編碼器。等同於節拍自己宣告 `latent: true` 與 '
+      + '`attach: true`，供不作此宣告的生產者使用。Open-H3-Regenerate-2K-IC '
+      + '就這樣只把草稿編碼一次：同一個潛變量既是 DiT 保持乾淨的參考，也是放'
+      + '大器的輸入'],
   'cfg.video-ref-encoder.whole_references': ['',
       '按请求中的编号（1..12：先是 `references` 列表，再按顺序是各输入端口，'
       + '附加在片段上的配乐与该片段算作同一个）指定要保持完整的参考：不截断到'
@@ -6181,11 +6208,13 @@ const STRINGS = {
       '仅用于精修（接了 generate-video 的 init_latent——'
       + 'Open-H3-Regenerate-2K）：片段被送回的噪声水平，取值 (0, 1]。默认'
       + '（-1）：发布版针对该步数自己的网格——3 步为 0.909375、0.857、0.667；'
-      + '2 步为 0.7、0.494。越低保留的输入越多；其后的步按 `refine_shift` 排',
+      + '2 步为 0.7、0.494。越低保留的输入越多；其后的步按 `refine_shift` 排'
+      + '。挂了流映射适配器时不使用：精修取其自身网格的最后 `steps` 步',
       '僅用於精修（接了 generate-video 的 init_latent——'
       + 'Open-H3-Regenerate-2K）：片段被送回的雜訊水準，取值 (0, 1]。預設'
       + '（-1）：發布版針對該步數自己的網格——3 步為 0.909375、0.857、0.667；'
-      + '2 步為 0.7、0.494。越低保留的輸入越多；其後的步按 `refine_shift` 排'],
+      + '2 步為 0.7、0.494。越低保留的輸入越多；其後的步按 `refine_shift` 排'
+      + '。掛了流映射適配器時不使用：精修取其自身網格的最後 `steps` 步'],
   'cfg.minimax-h3-model-config.refine_shift': ['',
       '仅用于精修：从 `refine_start_sigma` 往后各步所遵循的 shift，即在均匀'
       + '间隔的未平移 sigma 上取 s x / (1 + (s - 1) x)。6 为发布版的取值',
@@ -6450,11 +6479,11 @@ const STRINGS = {
   'stage.vosr-model-config.name': ['', 'VOSR 模型配置', 'VOSR 模型設定'],
   'stage.vosr-model-config.doc': ['',
       '源：VOSR 专属参数——当画面大于其权重蒸馏时所用的网格时，这个一步修复器'
-      + '要如何切分。发出一个节拍即结束；若接了 trigger 输入端口，则每收到一个'
-      + '节拍发出一个。',
+      + '要如何切分，以及其输出的颜色如何对照原图校正。发出一个节拍即结束；若'
+      + '接了 trigger 输入端口，则每收到一个节拍发出一个。',
       '來源：VOSR 專屬參數——當畫面大於其權重蒸餾時所用的網格時，這個一步修復'
-      + '器要如何切分。發出一個節拍即結束；若接了 trigger 輸入埠，則每收到一個'
-      + '節拍發出一個。'],
+      + '器要如何切分，以及其輸出的色彩如何對照原圖校正。發出一個節拍即結束；'
+      + '若接了 trigger 輸入埠，則每收到一個節拍發出一個。'],
   'cfg.vosr-model-config.tile_size': ['',
       '在潜空间里对修复器分块，每个分块的边长为这么多输出像素（向 16 的倍数取'
       + '整）。不填时，只要输出比检查点蒸馏时的分辨率大，就按那个分辨率分块'
@@ -6473,6 +6502,19 @@ const STRINGS = {
       '分塊之間的重疊，單位是輸出像素；小於分塊的八分之一時會被提到八分之一。'
       + '重疊的分塊用高斯權重融合，並共用同一個雜訊場，所以這是用計算量換取無'
       + '縫拼接。tile_size 為 0 時忽略'],
+  'cfg.vosr-model-config.color_fix': ['',
+      'wavelet | adain | none：发布版本的脚本对其输出所做的颜色校正，对照的'
+      + '是它修复的那张放大后的图（即其 --align_method）。`wavelet`（默认，与'
+      + '其一致）：修复后的图保留自身的细节，低频部分——sigma 为 5 的高斯模糊'
+      + '——取自原图。`adain`：把每个通道的均值和离散程度移到原图的水平。'
+      + '`none`：解码结果原样输出（即脚本的 nofix）。需要把原图接到 '
+      + 'vae-decode 的 color_reference 输入——也就是修复器看到的同一批像素',
+      'wavelet | adain | none：發佈版本的腳本對其輸出所做的色彩校正，對照的'
+      + '是它修復的那張放大後的圖（即其 --align_method）。`wavelet`（預設，與'
+      + '其一致）：修復後的圖保留自身的細節，低頻部分——sigma 為 5 的高斯模糊'
+      + '——取自原圖。`adain`：把每個通道的平均值和離散程度移到原圖的水準。'
+      + '`none`：解碼結果原樣輸出（即腳本的 nofix）。需要把原圖接到 '
+      + 'vae-decode 的 color_reference 輸入——也就是修復器看到的同一批像素'],
   'port.vosr-model-config.trigger': ['',
       '可选：用于触发重新发出配置的节拍（chrono 计时、提示词源、反馈回路都'
       + '行）。任何载荷都可以——收到本身就是信号。不接线时，本阶段在整段运行中'
@@ -6482,11 +6524,11 @@ const STRINGS = {
       + '只發出一次'],
   'port.vosr-model-config.model_config': ['',
       'VOSR 参数，作为一个 FlexData 对象 {model_family: vosr, +tile_size, '
-      + '+tile_overlap}，供 generate-image 的 model_config 输入端口使用'
-      + '（修复器的分块方式）',
+      + '+tile_overlap, +color_fix}，供 generate-image 的 model_config 输入'
+      + '端口使用（修复器的分块方式，以及其解码所做的颜色校正）',
       'VOSR 參數，作為一個 FlexData 物件 {model_family: vosr, +tile_size, '
-      + '+tile_overlap}，供 generate-image 的 model_config 輸入埠使用'
-      + '（修復器的分塊方式）'],
+      + '+tile_overlap, +color_fix}，供 generate-image 的 model_config 輸入'
+      + '埠使用（修復器的分塊方式，以及其解碼所做的色彩校正）'],
 
   // ---- Wan 2.x Model Config (model-specific-config) ----
   'stage.wan2-model-config.name': ['',
@@ -9016,12 +9058,14 @@ const STRINGS = {
   // ---- Temporal Resample (visual) ----
   'stage.temporal-resample.name': ['', '时间重采样', '時間重新取樣'],
   'stage.temporal-resample.doc': ['',
-      '通过一条 FFmpeg 滤镜链把平面 RGB 帧从一个帧率重采样到另一个帧率，并'
-      + '可选择被丢弃的信息如何处理：丢帧/复帧、混合、盒式平均（运动模糊）'
-      + '或运动补偿插值。它是 image-resample 在时间轴上的对应物。',
-      '透過一條 FFmpeg 濾鏡鏈把平面 RGB 影格從一個影格率重新取樣到另一個影'
-      + '格率，並可選擇被丟棄的資訊如何處理：丟格/複格、混合、盒式平均（動'
-      + '態模糊）或運動補償插值。它是 image-resample 在時間軸上的對應物。'],
+      '把平面 RGB 帧从一个帧率重采样到另一个帧率，并可选择被丢弃的信息如何'
+      + '处理：通过一条 FFmpeg 滤镜链做丢帧/复帧、混合、盒式平均（运动模糊）'
+      + '或运动补偿插值，或者在 GPU 上用学习得到的插帧模型 RIFE 合成新帧。'
+      + '它是 image-resample 在时间轴上的对应物。',
+      '把平面 RGB 影格從一個影格率重新取樣到另一個影格率，並可選擇被丟棄的'
+      + '資訊如何處理：透過一條 FFmpeg 濾鏡鏈做丟格/複格、混合、盒式平均（'
+      + '動態模糊）或運動補償插值，或者在 GPU 上用學習得到的插格模型 RIFE '
+      + '合成新影格。它是 image-resample 在時間軸上的對應物。'],
   'cfg.temporal-resample.output_fps': ['',
       '要重采样到的目标帧率。必填且为正——它就是这条请求的全部，一个给它设默'
       + '认值的阶段无非是顶着重采样器名字的直通。它会用连分数转换成真正的有'
@@ -9048,16 +9092,50 @@ const STRINGS = {
       + '先把每个输出帧时间区间内的源帧做盒式平均再抽取（`tmix` + `fps`）——'
       + '相当于空间上缩小时的面积平均，看起来就是运动模糊，因为它本来就是。'
       + '"motion" 估计运动并合成中间帧（`minterpolate`），这是升帧时唯一有'
-      + '用的方式，因为那时根本没有东西可平均。开销依次递增，`motion` 远为'
-      + '昂贵',
+      + '用的滤镜，因为那时根本没有东西可平均。"rife" 在 GPU 上用 RIFE（一个'
+      + '学习得到的光流网络；Practical-RIFE 4.22-4.26，由 `hf_dir` 指定）合'
+      + '成每个输出时刻的帧——在真实运动上远比 `motion` 干净，适合慢动作或提'
+      + '高帧率；降帧时它取每个输出时刻的那一帧，不做平均。前四种开销依次递'
+      + '增；`rife` 在 M4 Pro 上每个 1080p 帧约 30 ms',
       '影格率變化所丟棄的資訊如何處理。"nearest"（預設）丟格和複格（ffmpeg '
       + '的 `fps`）——最省，但會產生疊頻：大比例降格會抖動，車輪會倒轉。"'
       + 'blend" 把每個輸出影格所落在的兩個來源影格混合起來（`framerate`）。'
       + '"average" 先把每個輸出影格時間區間內的來源影格做盒式平均再抽取（`'
       + 'tmix` + `fps`）——相當於空間上縮小時的面積平均，看起來就是動態模糊'
       + '，因為它本來就是。"motion" 估計運動並合成中間影格（`minterpolate`'
-      + '），這是升格時唯一有用的方式，因為那時根本沒有東西可平均。開銷依次'
-      + '遞增，`motion` 遠為昂貴'],
+      + '），這是升格時唯一有用的濾鏡，因為那時根本沒有東西可平均。"rife" '
+      + '在 GPU 上用 RIFE（一個學習得到的光流網路；Practical-RIFE 4.22-4.26'
+      + '，由 `hf_dir` 指定）合成每個輸出時刻的影格——在真實運動上遠比 `'
+      + 'motion` 乾淨，適合慢動作或提高影格率；降格時它取每個輸出時刻的那一'
+      + '格，不做平均。前四種開銷依次遞增；`rife` 在 M4 Pro 上每個 1080p 影'
+      + '格約 30 ms'],
+  'cfg.temporal-resample.hf_dir': ['',
+      '`method: rife` 所用的 RIFE 模型：存放 flownet.pkl 的目录——即 '
+      + 'Practical-RIFE 的 train_log/，与其发布的 zip 解压后一致（4.25 是其 '
+      + 'README 推荐的版本；4.22、4.22.lite、4.25.lite 和 4.26 也能读取）——'
+      + '或该文件本身，或模型库中的键。旁边的驱动程序（RIFE_HDv3.py）只会被'
+      + '读取以获得网络的尺度列表，绝不会被执行',
+      '`method: rife` 所用的 RIFE 模型：存放 flownet.pkl 的目錄——即 '
+      + 'Practical-RIFE 的 train_log/，與其發佈的 zip 解壓後一致（4.25 是其 '
+      + 'README 推薦的版本；4.22、4.22.lite、4.25.lite 和 4.26 也能讀取）——'
+      + '或該檔案本身，或模型庫中的鍵。旁邊的驅動程式（RIFE_HDv3.py）只會被'
+      + '讀取以取得網路的尺度列表，絕不會被執行'],
+  'cfg.temporal-resample.rife_scale': ['',
+      '`rife`：发布版本的 --scale，即相对于帧估计光流时所用的分辨率——0.25、'
+      + '0.5、1、2 或 4。0（默认）按发布版本对每帧的建议：1，或者当帧的宽或'
+      + '高超过 2560（4K）时取 0.5。越低越快，也越能跟上大幅运动；越高越能保'
+      + '留细微运动',
+      '`rife`：發佈版本的 --scale，即相對於影格估計光流時所用的解析度——0.25'
+      + '、0.5、1、2 或 4。0（預設）按發佈版本對每格的建議：1，或者當影格的寬'
+      + '或高超過 2560（4K）時取 0.5。越低越快，也越能跟上大幅運動；越高越能'
+      + '保留細微運動'],
+  'cfg.temporal-resample.scene_threshold': ['',
+      '`rife`：发布版本的场景切换检测。两帧的相似度（两者缩到 32 x 32 后的 '
+      + 'SSIM）低于此值时不在它们之间插帧：其间的输出时刻重复前一帧。0.2（默'
+      + '认）是发布版本的取值；0 表示对每一对帧都插帧',
+      '`rife`：發佈版本的場景切換偵測。兩格的相似度（兩者縮到 32 x 32 後的 '
+      + 'SSIM）低於此值時不在它們之間插格：其間的輸出時刻重複前一格。0.2（預'
+      + '設）是發佈版本的取值；0 表示對每一對影格都插格'],
   'cfg.temporal-resample.average_frames': ['',
       '`average` 的窗口长度，以源帧计。0（默认）由比例推导——round(input_fps'
       + ' / output_fps)，也就是一个输出帧所覆盖的区间。调大相当于更长的快门'

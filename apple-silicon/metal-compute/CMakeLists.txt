@@ -113,6 +113,12 @@ add_vpipe_metal_kernel(minimax_music3_bf16 SRC ops/minimax_music3.metal
 # 3x3 depthwise conv, the per-head attention gate and a few-row GEMV
 # (generative-models/lfm3/).
 add_vpipe_metal_kernel(lfm3 SRC ops/lfm3.metal)
+# RIFE's IFNet frame interpolation (temporal-resample `rife`): the frame
+# upload, the fused warp + resize + concat feeding each block, the
+# pixel-shuffled flow update and the final blend (generative-models/rife/).
+# Its convs are dense_gemm's gather conv, or conv2d_mma's hardware conv
+# on an M5.
+add_vpipe_metal_kernel(rife SRC ops/rife.metal)
 # Open-H3-Regenerate-2K: MiniMax-H3's latent upscaler (its folded-affine
 # GroupNorm, temporal depthwise conv and bilinear resize) and the LMS
 # Sharp curve branch on the DiT's AdaLN (generative-models/minimax-h3/).

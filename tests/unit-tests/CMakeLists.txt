@@ -53,6 +53,7 @@ set(LOCAL_TEST_SOURCES
   model-catalog.cc
   vosr.cc
   vosr-reference.cc
+  vosr-color-fix.cc
   model-source.cc
   model-source-live.cc
   block-residency.cc
@@ -269,6 +270,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-music3.cc
         bonsai.cc
         bs-roformer.cc
+        rife.cc
         drama3.cc
         deepseek-v41.cc
         lm-run-memory.cc

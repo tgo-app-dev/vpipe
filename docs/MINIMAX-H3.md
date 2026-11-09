@@ -75,6 +75,10 @@ arrives in **8–16 steps** instead of 30+.
     - [Get it, then run it](#get-it-then-run-it)
     - [What it costs](#what-it-costs-2)
     - [Against the release](#against-the-release)
+  - [The draft in context — Open-H3-Regenerate-2K-IC](#the-draft-in-context--open-h3-regenerate-2k-ic)
+    - [Fetch the IC release, then run it](#fetch-the-ic-release-then-run-it)
+    - [What the in-context refine costs](#what-the-in-context-refine-costs)
+    - [Checked against the IC release](#checked-against-the-ic-release)
   - [Pictures — P-H3-Image](#pictures--p-h3-image)
     - [Get it, then run it](#get-it-then-run-it-1)
     - [What is read off the checkpoint](#what-is-read-off-the-checkpoint)
@@ -3245,6 +3249,160 @@ GPU with CUDA's generator, which no Mac reproduces), and its forward
 every other graph here runs). The release itself warns that same-seed PSNR
 is not a metric for this model — rounding-level changes move its 3-step
 output a lot — so judge by eye.
+
+### The draft in context — Open-H3-Regenerate-2K-IC
+
+[Open-H3-Regenerate-2K-IC](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K-IC)
+([project page](https://nvlabs.github.io/Sana/Open-H3-Regenerate-2K/#ic)) is
+the same job — a 768P draft back at 2K — done **in context**: the draft
+stays in the DiT's sequence, **clean**, as a reference video, and the
+large clip is generated beside it, every step attending to it. The plain
+refine above re-noises the draft and lets the DiT redraw it; this one is
+told what the draft was at every step, so faces, mouths, lip sync,
+lettering and layout stay the draft's while the detail is drawn at 2K.
+
+It runs on the **Ref2VA** weights (`transformer_ref`, the reference-to-video
+partition), under three adapters at strength 1: HyperFlow's 8-step flow
+map, LMS Sharp v1.0, and the IC LoRA NVIDIA trained (rank 384 on every
+projection of the blocks and the token refiner, alpha = rank). CFG 1, so
+one forward a step.
+
+What runs:
+
+1. **Fit and encode the draft**, as the plain refine does — 24 fps,
+   cover-scaled and centre-cropped to 1344 × 768, 124 frames —
+   `vae-encode` with `posterior: sample` at the release's seed (0). ONE
+   encode: the latent goes both to the upscaler and to `video-ref-encoder`.
+2. **The draft as `<Video 1>`** — `video-ref-encoder` takes the draft's
+   pixels on its first reference port (they feed the vision tower: the
+   prompt sees the draft) and the latent on the second, which
+   **`attach_latent: [2]`** folds onto it as its rows — no second VAE
+   encode. Its prompt is the release's task text, then
+   `Scene description:` and the prompt the draft was made from (empty is
+   fine):
+
+   ```
+   Enhance <Video 1> into a high-quality version of the same video.
+   Preserve the scene, objects, camera motion, timing, and composition of
+   every frame. Restore fine details and remove degradation. Do not
+   continue or change the scene.
+
+   Scene description: <the draft's own prompt>
+   ```
+
+   The graph's `text-prompt` holds all of it; change only the last line.
+   The reference rows are noised to 0.999 (`condition_noise_aug`) and held
+   there (`condition_timestep: 0.999` on the model config), as the release
+   holds them.
+3. **Enlarge the latent** — `latent-upscale`, the same upscaler and the
+   same rule as the plain refine.
+4. **Regenerate in context** — `generate-video` with the upscaled latent on
+   `init_latent` AND the reference rows on its reference ports: the
+   reference layout, the draft's rows ahead of the clip's, the clip put
+   back to sigma 0.835 and denoised over the **last three steps of
+   HyperFlow's 8-step grid** (0.835 → 0.697 → 0.469 → 0, at shift 12),
+   each step the flow map's jump to the next. The soundtrack is an encoded
+   silence held clean, as in the plain refine.
+5. **Decode** — the release's default is the **fast decoder v2**
+   (`vae_fast/` of this repository: StreamRender-H3's 24-layer decoder,
+   new weights), `vae-decode`'s `fast_decoder`. Unset it for the released
+   decoder.
+
+`steps` picks the release's sampler: 3 is its default `up3`, 4 its `up4`
+(from 0.923), 8 its `hf8` — all eight steps from pure noise, the draft
+then guiding through the context alone.
+
+#### Fetch the IC release, then run it
+
+[`prepare-open-h3-regenerate-2k-ic.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-ic.vpipeline)
+fetches the five pieces and registers them under
+`Efficient-Large-Model/Open-H3-Regenerate-2K-IC-`: `-lora` (the IC LoRA,
+8.3 GB f32), `-hyperflow` (2.8 GB, Video Rebirth's file byte for byte),
+`-sharp` (LMS Sharp, 1.2 GB), `-upscaler` (0.7 GB, the plain refine's
+file) and `-fast-vae` (6.5 GB). Not fetched: `base_model/` (MiniMax-H3's
+own components — the `MiniMaxAI/MiniMax-H3-Ref2VA` checkpoint serves),
+`infer/` (the release's runner) and `assets/` (an encoded silence, which
+`generate-video` makes itself). LMS Sharp, as its author publishes it, was
+trained on ComfyUI's pruned H3, so its 50 AdaLN modules read the pruned
+form's 8-wide curve point; on the released weights they are curve
+branches, read as such — and all 50 are zero, as in the plain refine's
+release, so they add nothing and need no curve table.
+
+[`minimax-h3-regenerate-2k-ic.vpipeline`](pipelines/minimax-h3-regenerate-2k-ic.vpipeline)
+takes `minimax-h3-768p-draft.mp4` and writes
+`minimax-h3-regenerate-2k-ic.mp4` with the draft's soundtrack. Set the
+draft on `load-draft` and `load-audio`, its prompt on `text-prompt`.
+
+| to get | `draft-fit` | `latent-upscale` | `generate-video` |
+|---|---|---|---|
+| 2K (the release's default) | 1344 × 768 | 2560 × 1440 | 2560 × 1440 |
+| 1080p | 1344 × 768 | 1920 × 1080 | 1920 × 1088 |
+| 4K | 1344 × 768 | 3840 × 2160 | 3840 × 2176 |
+| 768P from a 384P draft | 672 × 384 | 1344 × 768 | 1344 × 768 |
+
+`video-ref-encoder`'s `frames` and `generate-video`'s stay the draft's
+length (124). The 384P row is the release's `--lq 384` (512 and 576 work
+the same way).
+
+#### What the in-context refine costs
+
+The draft's rows ride every forward beside the clip's, so a step costs
+more than the plain refine's at the same size: at 2K × 124 the clip is
+133,200 rows and the draft 37,296 more. MEASURED on an M4 Pro (64 GB), the
+Ref2VA weights (bf16) and the adapters read off an external drive, the
+release's three steps and its fast decoder, the pianist draft:
+
+| clip | rows a forward | prompt + draft | refine (3 steps) | decode | whole run |
+|---|---:|---:|---:|---:|---:|
+| 39 frames, 672 × 384 → 1344 × 768 | 15,844 | 13 s | 8.4 min | 27 s | 10.3 min |
+| 22 frames, 1344 × 768 → 2560 × 1440 | 33,420 | 15 s | 24.3 min | 54 s | 28.2 min |
+
+Peak footprint 48.7 and 49.5 GB, the DiT keeping 45 of its 50 blocks; on a
+smaller Mac it streams them every step. The release's own clip, 124 frames
+at 2K, is ~173,000 rows a forward: several hours on this box. Both
+pictures keep the draft's composition, hands and lettering (its subtitle
+line character for character); scaled back to the draft's size they sit
+29.5 dB (768P) and 34.4 dB (2K) from it over every frame.
+
+The adapters run beside the base GEMMs: three of them, ranks 256 + 64 +
+384, about a fifth of a block's projection FLOPs (attention not counted);
+folding them into the weights once (the release's own apply rule for
+HyperFlow and Sharp) is not done. They hold 7.6 GB at 16 bits, set aside
+and read with the blocks on a smaller Mac, as the plain refine's are. The Neural Engine and int8 tiers of the plain
+refine's fast graphs work here too (the adapters fold into the ANE's
+staged weights; the int8 tiers take them on top) but are not measured
+with the IC adapters.
+
+#### Checked against the IC release
+
+Read, not run — NVlabs/Sana sol-engine `models/Open-H3-Regenerate-2K/IC`
+(`infer.py`, `ref2va_ic/`):
+
+- **The samplers**: up3 / up4 / hf8 are HyperFlow's float32 points to the
+  bit (`shift · raw / (1 + (shift − 1) · raw)` over float32), the release's
+  `config.json` to its six digits; each step's (t, r) is the release's
+  `1 − float32(σ)` and `1 − σ'`.
+- **The loop**: on two real Ref2VA blocks under HyperFlow, a 2 × 6 × 10
+  reference clip ahead of a 2 × 12 × 20 clip, three steps through
+  `generate-video`'s denoise equal the release's loop restated — generated
+  rows at (1 − σ, 1 − σ'), the reference rows at (0.999, 0.999), the
+  silence at (1, 1), `x + float(σ − σ') · v` — **to the bit**; the
+  reference rows and the soundtrack are never written; and the interval
+  matters (every row at r = t lands 0.13 away).
+- **The adapters** bind as the release installs them: the IC LoRA through
+  the diffusers decomposition (q / k / v fused per head), LMS Sharp from
+  ComfyUI's names (its flat q|k|v re-ordered for the released weights'
+  per-head grouping), HyperFlow's flow map live; all three at strength 0
+  are the base forward exactly; the memory plan books what the load holds.
+- **The draft's posterior sample** is torch's CPU generator at the
+  release's seed, bit for bit.
+
+What is not the release's: the sampling noise (CUDA's generator), the
+reference rows' 0.001 of noise (ours, at the same level), the adapters
+(the release merges HyperFlow and Sharp into the weights in fp32 and runs
+the IC LoRA beside them; vpipe runs all three beside the base GEMMs, the
+same function up to the weights' rounding), and its VAE encode (FP32,
+tiled; vpipe's is the H3 video VAE every graph here runs).
 
 ### Pictures — P-H3-Image
 

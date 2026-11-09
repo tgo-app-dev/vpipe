@@ -1,6 +1,7 @@
 #include "stages/model-detect.h"
 
 #include "generative-models/bs-roformer/bs-roformer-config.h"
+#include "generative-models/rife/metal-rife.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/detect-profile.h"
 #include "generative-models/image-model-registry.h"
@@ -236,6 +237,7 @@ family_version_(const std::string& mt, std::string& family,
       {"minimax-music3",         "MiniMax",     "Music3"},
       {"yue2-vae",               "YuE",         "2-Vae"},
       {"bs-roformer",            "BS-RoFormer", "MSST"},
+      {"rife",                   "RIFE",        "Practical-RIFE 4"},
       {"dflash",                 "DFlash",      "1"},
       {"dflash2",                "DFlash",      "2"},
       {"yolo",                   "YOLOX",       "L"},
@@ -1017,6 +1019,17 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   if (d.model_type.empty() && genai::looks_like_bs_roformer_dir(dir)) {
     d.model_type    = "bs-roformer";
     d.detected_by   = "msst-yaml";
+    d.weight_format = "torch";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+
+  // ---- 2e. a RIFE frame interpolator --------------------------------------
+  // Practical-RIFE's train_log/: flownet.pkl beside the python that
+  // defines it, no config.json. Tagged only when its tensors are the
+  // network temporal-resample's `rife` runs (4.22-4.26).
+  if (d.model_type.empty() && genai::MetalRife::looks_like_rife(dir)) {
+    d.model_type    = "rife";
+    d.detected_by   = "flownet";
     d.weight_format = "torch";
     catalog_default_io(d.model_type, d.inputs, d.outputs);
   }

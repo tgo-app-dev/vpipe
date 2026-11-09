@@ -298,10 +298,12 @@ public:
   // clip taken for a still, a soundtrack read at the wrong rate -- and
   // that deserves a test that does not need a model or a runtime. `n` is
   // the 1-based port number, for the message only. False with a reason
-  // in `err`.
+  // in `err`. `latent` reads the beat as an encoded latent whatever
+  // its sideband says (`attach_latent`).
   static bool
   media_from_beat(const TensorBeatPayload& tb, int n,
-                  genai::minimax_h3::MediaReference* out, std::string* err);
+                  genai::minimax_h3::MediaReference* out, std::string* err,
+                  bool latent = false);
 
   // What a port beat carrying a VIDEO latent and NO PIXELS becomes. The
   // conditioner presents a visual reference out of the vision tower's
@@ -427,6 +429,9 @@ private:
   // Reference iport numbers (1-based) whose audio is the SOUNDTRACK of
   // the reference before it. A beat's own `attach` sideband overrides.
   std::vector<int> _attach_audio;
+  // Reference iport numbers whose beat is an encoded video LATENT that
+  // folds onto the reference before it (`attach_latent`), said or not.
+  std::vector<int> _attach_latent;
   // References kept whole (`whole_references`), by their number in the
   // request.
   std::vector<int> _whole_refs;

@@ -1,6 +1,7 @@
 #include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
+#include "stages/color-fix.h"
 #include "common/host-report.h"
 #include "common/flex-bag.h"
 #include "common/beat-keys.h"
@@ -321,7 +322,10 @@ const PortSpec kIports[] = {
           "`decoder_cond_frames` for a TINY decoder that reads the source "
           "beside the latent (FlashVSR's, which then decodes in place of "
           "the VAE) -- and read only for those. flashvsr-src-encoder's "
-          "`color_reference` output",
+          "`color_reference` output. For an IMAGE latent that announces "
+          "`color_ref_frames` (VOSR's colour fix), one [3, H, W] picture "
+          "at the output size, per latent and in order: wire the same "
+          "pixels the restorer saw (VOSR's image-resample)",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 const PortSpec kOports[] = {
@@ -420,6 +424,8 @@ VaeDecodeStage::reset_run_state()
   if (!_tiny) { _tiny_tried = false; }
   _held.clear();
   _ref_port_noted = false;
+  _image_fix_noted = false;
+  _image_fix_said = false;
   _h3_cut_said = false;
 
   // Both are measurements of the PREVIOUS run's beats. The ratchet in
@@ -624,6 +630,33 @@ VaeDecodeStage::publish_image_arena_(int px_w, int px_h)
   if (px_w <= 0 || px_h <= 0 || _hf_dir.empty()) { return; }
   revise_decode_arena_(model_memory::vae_decode_scratch_bytes(
       resolve_model_dir(session(), _hf_dir), px_w, px_h));
+}
+
+void
+VaeDecodeStage::note_image_color_fix_(const std::string& why,
+                                      const std::string& method,
+                                      double             sigma)
+{
+  if (!why.empty()) {
+    if (!_image_fix_noted) {
+      _image_fix_noted = true;
+      session()->warn(fmt(
+          "VaeDecodeStage('{}'): the latent's colour fix did not run: {}; "
+          "the decode goes out uncorrected", this->id(), why));
+    }
+    return;
+  }
+  if (_image_fix_said || (method != "gaussian" && method != "adain")) {
+    return;
+  }
+  _image_fix_said = true;
+  session()->info(method == "gaussian"
+      ? fmt("VaeDecodeStage('{}'): colour fix against the restored "
+            "picture -- its low frequencies (a Gaussian blur at sigma {}) "
+            "under the decode's own detail", this->id(), sigma)
+      : fmt("VaeDecodeStage('{}'): colour fix against the restored "
+            "picture -- each channel's mean and spread (AdaIN)",
+            this->id()));
 }
 
 void
@@ -1549,6 +1582,91 @@ put_unit_(TensorBeatPayload& out, std::size_t i, float unit)
   }
 }
 
+// The colour fix an IMAGE latent announces (sideband::kColorRefFrames 1,
+// kColorRefMethod, kColorRefSigma) and the picture read for it.
+struct ImageColorRef {
+  bool announced = false;
+  bool wired = false;                    // color_reference has a source
+  std::string method;                    // gaussian | adain | none | ...
+  double sigma = 5.0;
+  std::unique_ptr<BeatPayloadIntf> pic;  // null: nothing wired or EOS
+};
+
+// A decode, [C, H, W] f16 in [-1, 1], into `out` at 0..1 -- corrected
+// first by the fix `cr` asks for, on the decode BEFORE it is rounded to
+// 8 bits (the release corrects its 8-bit picture), against a picture of
+// the decode's own size. Returns why an asked-for fix did not run ("" if
+// it ran or none was asked).
+//
+// Host scratch: two or three planes of floats at a time (12 B a pixel),
+// far inside the decode arena that is declared for this decode.
+std::string
+put_decode_(TensorBeatPayload& out, const _Float16* rp, int C, int H, int W,
+            const ImageColorRef& cr)
+{
+  const std::size_t plane = (std::size_t)H * W;
+  const bool gaussian = cr.method == "gaussian";
+  const bool adain = cr.method == "adain";
+  const auto* ref = cr.pic
+      ? dynamic_cast<const TensorBeatPayload*>(cr.pic.get()) : nullptr;
+  std::string why;
+  if (cr.announced && !gaussian && !adain && cr.method != "none") {
+    why = cr.method.empty() || cr.method == "wavelet"
+        ? "an image decoder runs `gaussian` or `adain`, not the wavelet "
+          "stack"
+        : "unknown method '" + cr.method + "'";
+  } else if ((gaussian || adain) && ref == nullptr) {
+    // Unwired was said where the picture would have been read.
+    if (cr.wired) { why = "no picture came for it"; }
+  } else if (gaussian || adain) {
+    const auto& s = ref->shape;
+    const bool lead = s.size() == 4 && s[0] == 1;
+    const bool ok_dtype = ref->dtype == TensorBeat::DType::U8 ||
+                          ref->dtype == TensorBeat::DType::F16 ||
+                          ref->dtype == TensorBeat::DType::F32;
+    if (!ok_dtype || !ref->strides.empty() ||
+        (s.size() != 3 && !lead) || s[lead ? 1 : 0] != C || C != 3 ||
+        s[lead ? 2 : 1] != H || s[lead ? 3 : 2] != W) {
+      why = fmt("the picture is {} where the decode is RGB [3, {}, {}]",
+                cr.pic->describe(), H, W)();
+    }
+  }
+  if (!why.empty() || !(gaussian || adain) || ref == nullptr) {
+    const std::size_t n = (std::size_t)C * plane;
+    for (std::size_t i = 0; i < n; ++i) {
+      put_unit_(out, i, ((float)rp[i] + 1.0f) * 0.5f);
+    }
+    return why;
+  }
+  const std::vector<float> taps =
+      gaussian ? color_fix::gaussian_taps(cr.sigma) : std::vector<float>{};
+  std::vector<float> x(plane), r(plane), tmp(gaussian ? plane : 0);
+  for (int c = 0; c < C; ++c) {
+    const std::size_t at = (std::size_t)c * plane;
+    // The picture the release corrects is its decode in 0..1.
+    for (std::size_t i = 0; i < plane; ++i) {
+      x[i] = std::clamp(((float)rp[at + i] + 1.0f) * 0.5f, 0.0f, 1.0f);
+    }
+    if (ref->dtype == TensorBeat::DType::U8) {
+      const std::uint8_t* p = ref->as_u8() + at;
+      for (std::size_t i = 0; i < plane; ++i) { r[i] = (float)p[i] / 255.0f; }
+    } else if (ref->dtype == TensorBeat::DType::F16) {
+      const auto* p = reinterpret_cast<const _Float16*>(ref->as_f16()) + at;
+      for (std::size_t i = 0; i < plane; ++i) { r[i] = (float)p[i]; }
+    } else {
+      const float* p = ref->as_f32() + at;
+      for (std::size_t i = 0; i < plane; ++i) { r[i] = p[i]; }
+    }
+    if (gaussian) {
+      color_fix::gaussian(x.data(), r.data(), tmp.data(), H, W, taps);
+    } else {
+      color_fix::adain(x.data(), r.data(), plane);
+    }
+    for (std::size_t i = 0; i < plane; ++i) { put_unit_(out, at + i, x[i]); }
+  }
+  return {};
+}
+
 }  // namespace
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
@@ -1680,6 +1798,38 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         in->describe()));
     co_return;
   }
+  // AN IMAGE LATENT'S COLOUR REFERENCE (VOSR's colour fix): one picture
+  // per latent that announces it, read NOW, before any branch below can
+  // skip the beat -- the pictures arrive in lockstep with the latents,
+  // so one left unread pairs with the next latent. A clip reads its own
+  // in its branch.
+  ImageColorRef icr;
+  if (tbp->shape.size() == 3 && tbp->sideband.is_object()) {
+    FlexData sb = tbp->sideband;          // as_object() is a view: keep it
+    auto o = sb.as_object();
+    icr.announced = o.contains(sideband::kColorRefFrames) &&
+                    o.at(sideband::kColorRefFrames).as_int(0) > 0;
+    if (icr.announced) {
+      icr.method = o.contains(sideband::kColorRefMethod)
+          ? o.at(sideband::kColorRefMethod).as_string("") : "";
+      if (o.contains(sideband::kColorRefSigma)) {
+        icr.sigma = o.at(sideband::kColorRefSigma).as_real(5.0);
+      }
+      icr.wired = ctx.num_iports() > kColorRefPort &&
+                  ctx.iport_connected(kColorRefPort);
+      if (icr.wired) {
+        icr.pic = co_await ctx.read(kColorRefPort);
+      } else if (icr.method != "none" && !_ref_port_noted) {
+        _ref_port_noted = true;
+        session()->info(fmt(
+            "VaeDecodeStage('{}'): the latent asks for its model's colour "
+            "fix ({}), which needs the picture it restored on the "
+            "color_reference input (iport {}); nothing is wired there, so "
+            "the decode goes out uncorrected", this->id(),
+            icr.method.empty() ? "wavelet" : icr.method, kColorRefPort));
+      }
+    }
+  }
   // ---- Content-policy refusal ------------------------------------------
   // A prompt a family's content screen refused never reaches a DiT, so
   // there is no latent to decode -- the upstream beat is a marker carrying
@@ -1776,9 +1926,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     out->shape = {3, H, W};
     out->resize_contiguous(n);
     const auto* rp = static_cast<const _Float16*>(rgb.contents());
-    for (std::size_t i = 0; i < n; ++i) {
-      put_unit_(*out, i, ((float)rp[i] + 1.0f) * 0.5f);
-    }
+    note_image_color_fix_(put_decode_(*out, rp, 3, H, W, icr), icr.method,
+                          icr.sigma);
     ++_images_emitted;
     session()->log_debug(fmt(
         "VaeDecodeStage('{}'): AutoencoderKL decoded + emitted image #{} "
@@ -3026,9 +3175,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   out->shape = {OC, H, W};
   out->resize_contiguous(n);
   const auto* rp = static_cast<const _Float16*>(rgb.contents());
-  for (std::size_t i = 0; i < n; ++i) {
-    put_unit_(*out, i, ((float)rp[i] + 1.0f) * 0.5f);
-  }
+  note_image_color_fix_(put_decode_(*out, rp, OC, H, W, icr), icr.method,
+                        icr.sigma);
   ++_images_emitted;
   session()->log_debug(fmt(
       "VaeDecodeStage('{}'): decoded + emitted image #{} planar {} {} "

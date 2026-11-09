@@ -25,6 +25,17 @@ const ConfigKey kAttrs[] = {
           "and share one noise field, so this trades work for seam-free "
           "blending. Ignored when tile_size is 0",
    .def_int = 32},
+  {.key = "color_fix", .type = ConfigType::String, .required = false,
+   .doc = "wavelet | adain | none: the colour correction the release's "
+          "script applies to its output against the upscaled picture it "
+          "restored (its --align_method). `wavelet` (default, as there): "
+          "the restored picture keeps its own detail and takes its low "
+          "frequencies -- a Gaussian blur at sigma 5 -- from the "
+          "picture. `adain`: each channel's mean and spread moved to the "
+          "picture's. `none`: the decode as it is (the script's nofix). "
+          "Needs the picture on vae-decode's color_reference input -- the "
+          "same pixels the restorer saw",
+   .def_str = "wavelet"},
 };
 const PortSpec kIports[] = {
   {.name = "trigger",
@@ -36,8 +47,9 @@ const PortSpec kIports[] = {
 const PortSpec kOports[] = {
   {.name = "model_config",
    .doc = "VOSR parameters as one FlexData object {model_family: vosr, "
-          "+tile_size, +tile_overlap}, for a generate-image model_config "
-          "iport (the restorer's tiling)",
+          "+tile_size, +tile_overlap, +color_fix}, for a generate-image "
+          "model_config iport (the restorer's tiling and the colour fix "
+          "its decode takes)",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -45,7 +57,8 @@ const StageSpec kSpec = {
   .type_name = "vosr-model-config",
   .doc       = "Source: the VOSR-specific parameters -- how the one-step "
                "restorer is split over a picture larger than the grid its "
-               "weights were distilled at. One beat then done; with a "
+               "weights were distilled at, and how its output's colour is "
+               "corrected against the picture. One beat then done; with a "
                "trigger iport, one beat per inbound beat.",
   .display_name = "VOSR Model Config",
   .category  = StageCategory::ModelSpecificConfig,
@@ -86,7 +99,7 @@ VosrModelConfigStage::resolved_config() const
   if (cfg.is_object()) {
     auto in = cfg.as_object();
     auto out = fd.as_object();
-    for (const char* k : {"tile_size", "tile_overlap"}) {
+    for (const char* k : {"tile_size", "tile_overlap", "color_fix"}) {
       if (in.contains(k)) { out.insert_or_assign(k, in.at(k)); }
     }
   }

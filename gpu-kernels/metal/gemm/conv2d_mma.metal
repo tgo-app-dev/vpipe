@@ -612,9 +612,11 @@ CV_HW_S1_ACC(conv2d_hw_3x3_s1_c32_acc_f16, 32)
 // in mode::multiply -- write-only to the pipeline, the fast path -- and
 // pay for the epilogue only in threadgroup memory.
 //
-// EPI: 0 = bias, 1 = bias + ReLU, 2 = bias + residual + ReLU. `res` is
-// the full [H, W, Cout] residual and is read at this tile's own offset.
-// Same contract as the plain twin otherwise, plus 7:bias 8:res.
+// EPI: 0 = bias, 1 = bias + ReLU, 2 = bias + residual + ReLU, 3 = bias +
+// LeakyReLU(0.2), 4 = bias + residual + LeakyReLU(0.2) (RIFE's convs and
+// ResConv). `res` is the full [H, W, Cout] residual and is read at this
+// tile's own offset. Same contract as the plain twin otherwise, plus
+// 7:bias 8:res.
 #define CV_HW_S1_EPI(NAME, TILE_C, EPI, TAIL)                               \
 kernel void NAME(                                                          \
     const device VPIPE_ELT* inp  [[buffer(0)]],                            \
@@ -683,8 +685,9 @@ kernel void NAME(                                                          \
     const int64_t o = ((int64_t)(oy0 + py) * img_w + (ox0 + px)) * cout    \
                     + (oc0 + oc);                                          \
     float v = Ys[e] + (float)bias[oc0 + oc];                               \
-    if (EPI == 2) { v += (float)res[o]; }                                  \
-    if (EPI >= 1) { v = max(v, 0.0f); }                                    \
+    if (EPI == 2 || EPI == 4) { v += (float)res[o]; }                      \
+    if (EPI == 1 || EPI == 2) { v = max(v, 0.0f); }                        \
+    if (EPI == 3 || EPI == 4) { v = v >= 0.0f ? v : 0.2f * v; }            \
     out[o] = (VPIPE_ELT)v;                                                 \
   }                                                                        \
 }
@@ -771,6 +774,98 @@ CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_addrelu_f16, 64, 2, 0)
 CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_tail_f16, 64, 0, 1)
 CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_relu_tail_f16, 64, 1, 1)
 CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_addrelu_tail_f16, 64, 2, 1)
+
+// RIFE's IFNet (generative-models/rife/): LeakyReLU(0.2) convs, its
+// ResConv (beta folded into the weights, the input added back), and the
+// plain convs its transposed convs fold into, over every destination
+// tile its widths need -- 192 / 128 / 64 on the 64 tile, 96 / 32 on the
+// 32, its 208-wide flow head and 16-wide feature head on the 16.
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_lrelu_f16, 64, 3, 0)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_lrelu_tail_f16, 64, 3, 1)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_addlrelu_f16, 64, 4, 0)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_epi_addlrelu_tail_f16, 64, 4, 1)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c32_epi_f16, 32, 0, 0)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c32_epi_tail_f16, 32, 0, 1)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c32_epi_lrelu_f16, 32, 3, 0)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c32_epi_lrelu_tail_f16, 32, 3, 1)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c32_epi_addlrelu_f16, 32, 4, 0)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c32_epi_addlrelu_tail_f16, 32, 4, 1)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c16_epi_f16, 16, 0, 0)
+CV_HW_S1_EPI(conv2d_hw_3x3_s1_c16_epi_tail_f16, 16, 0, 1)
+
+// The STRIDE-2 conv with the same fused epilogue: torch's Conv2d(k3, s2,
+// p1), SYMMETRIC pad -- iy = 2*oy + ky - 1, the s2 kernels' off_mode 2,
+// fixed here -- then bias + LeakyReLU(0.2) on the f32 accumulator, one
+// rounding. RIFE's downsampling convs. img_w / img_h are the SOURCE's
+// (even); the destination is half of each. A partial edge tile is fine
+// under TAIL: the op zero-fills its source window past the extents (the
+// pad), and this loop drops what lies past the destination.
+//   0:in[H,W,Cin] 1:W[3,3,Cin,Cout] 2:out[H/2,W/2,Cout] 3:W 4:H 5:Cin
+//   6:Cout 7:bias   dispatch {ceil(W/2/8)*CV_THREADS, ceil(H/2/8),
+//   Cout/TILE_C}, tg {CV_THREADS,1,1}
+#define CV_HW_S2P1_EPI(NAME, TILE_C, EPI, TAIL)                             \
+kernel void NAME(                                                          \
+    const device VPIPE_ELT* inp  [[buffer(0)]],                            \
+    const device VPIPE_ELT* wt   [[buffer(1)]],                            \
+    device VPIPE_ELT*       out  [[buffer(2)]],                            \
+    const constant int& img_w [[buffer(3)]],                               \
+    const constant int& img_h [[buffer(4)]],                               \
+    const constant int& cin   [[buffer(5)]],                               \
+    const constant int& cout  [[buffer(6)]],                               \
+    const device VPIPE_ELT* bias [[buffer(7)]],                            \
+    uint3 tgid [[threadgroup_position_in_grid]],                           \
+    uint  lid  [[thread_index_in_threadgroup]])                            \
+{                                                                          \
+  threadgroup float Ys[CV_TH * CV_TW * TILE_C];                            \
+  const int ow = img_w / 2, oh = img_h / 2;                                \
+  using T4 = tensor<device VPIPE_ELT, dextents<int32_t, 4>, tensor_inline>; \
+  T4 tA(const_cast<device VPIPE_ELT*>(inp),                                \
+        dextents<int32_t, 4>(cin, img_w, img_h, 1));                       \
+  T4 tW(const_cast<device VPIPE_ELT*>(wt),                                 \
+        dextents<int32_t, 4>(cout, cin, 3, 3));                            \
+  constexpr auto desc = convolution2d_descriptor(                          \
+      /*destination_dimensions=*/int4(TILE_C, CV_TW, CV_TH, 1),            \
+      /*source_dimensions=*/int4(CV_CIN, CV_HW, CV_HW, 1),                 \
+      /*kernel_dimensions=*/int2(3, 3),                                    \
+      convolution2d_activation_layout::nhwc,                               \
+      convolution2d_weights_layout::hwio,                                  \
+      /*strides=*/int2(2, 2), /*dilations=*/int2(1, 1), /*groups=*/1,      \
+      /*relaxed_precision=*/false,                                         \
+      convolution2d_descriptor::mode::multiply);                           \
+  convolution2d<desc, execution_simdgroups<CV_SG>> op;                     \
+  const int ox0 = (int)tgid.x * CV_TW;                                     \
+  const int oy0 = (int)tgid.y * CV_TH;                                     \
+  const int oc0 = (int)tgid.z * TILE_C;                                    \
+  auto sW = tW.slice(oc0, 0, 0, 0);                                        \
+  auto cT = op.template get_destination_cooperative_tensor<                \
+      decltype(tA), decltype(sW), float>();                                \
+  convolution2d_descriptor rd = desc;                                      \
+  rd.source_dimensions = int4(cin, img_w, img_h, 1);                       \
+  int2 off = int2(ox0 * 2, oy0 * 2);                                       \
+  __convolution2d_detail::__run<execution_simdgroups<CV_SG>,               \
+                                decltype(tA), decltype(sW), decltype(cT)>( \
+      tA, sW, cT, rd, off);                                                \
+  using TS = tensor<threadgroup float, dextents<int32_t, 4>,              \
+                    tensor_inline>;                                       \
+  TS tYs(Ys, dextents<int32_t, 4>(TILE_C, CV_TW, CV_TH, 1));              \
+  cT.store(tYs);                                                           \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+  for (int e = (int)lid; e < CV_TH * CV_TW * TILE_C; e += CV_THREADS) {    \
+    const int oc = e % TILE_C;                                             \
+    const int px = (e / TILE_C) % CV_TW;                                   \
+    const int py = e / (TILE_C * CV_TW);                                   \
+    if (TAIL && (oy0 + py >= oh || ox0 + px >= ow)) { continue; }         \
+    const int64_t o = ((int64_t)(oy0 + py) * ow + (ox0 + px)) * cout       \
+                    + (oc0 + oc);                                          \
+    float v = Ys[e] + (float)bias[oc0 + oc];                               \
+    if (EPI == 3) { v = v >= 0.0f ? v : 0.2f * v; }                        \
+    out[o] = (VPIPE_ELT)v;                                                 \
+  }                                                                        \
+}
+CV_HW_S2P1_EPI(conv2d_hw_3x3_s2p1_epi_lrelu_f16, 64, 3, 0)
+CV_HW_S2P1_EPI(conv2d_hw_3x3_s2p1_epi_lrelu_tail_f16, 64, 3, 1)
+CV_HW_S2P1_EPI(conv2d_hw_3x3_s2p1_c32_epi_lrelu_f16, 32, 3, 0)
+CV_HW_S2P1_EPI(conv2d_hw_3x3_s2p1_c32_epi_lrelu_tail_f16, 32, 3, 1)
 
 // STRIDE-2 twin of the general hw conv (the VAE encoder's downsample
 // convs): dest [H/2, W/2, Cout], symmetric pad-1 (iy = oy*2 + ky - 1,

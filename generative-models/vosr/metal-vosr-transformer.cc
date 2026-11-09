@@ -191,9 +191,29 @@ MetalVosrTransformer::read_config(const std::string& dir, Config* cfg,
     const std::string ae(o.at("ae_type").as_string("qwen"));
     if (ae != "qwen") { return fail("only the Qwen-Image VAE variant"); }
   }
-  if (o.contains("distill_type")) {
-    const std::string dt(o.at("distill_type").as_string("onestep"));
-    if (dt != "onestep") { return fail("only the one-step checkpoint"); }
+  // THE ONE-STEP MARK MUST BE THERE. VOSR 2.0 says `distill_type:
+  // onestep`; the release's other 1.4B checkpoints have the same block
+  // stack and the same tensor shapes, so nothing else tells them apart.
+  // VOSR_1.4B_ms (multi-step: 25 steps at guidance 2.0) carries no
+  // distill_type at all -- read as absent = one-step, it loaded and ran
+  // one unguided step -- and VOSR_1.4B_os says `rcgm`, VOSR 1's own
+  // distillation, which conditions differently.
+  {
+    const std::string dt(o.contains("distill_type")
+                             ? o.at("distill_type").as_string("")
+                             : std::string_view{});
+    if (dt.empty()) {
+      return fail("no distill_type: a multi-step VOSR checkpoint (VOSR 1's "
+                  "VOSR_*_ms); only VOSR 2.0's one-step restorer runs here");
+    }
+    if (dt == "rcgm") {
+      return fail("distill_type rcgm: VOSR 1's one-step checkpoint "
+                  "(VOSR_*_os), which this tree does not run; only VOSR "
+                  "2.0's one-step restorer does");
+    }
+    if (dt != "onestep") {
+      return fail("distill_type is not VOSR 2.0's (onestep)");
+    }
   }
   if (getb("auxiliary_time_cond", false)) {
     return fail("auxiliary_time_cond is not implemented");

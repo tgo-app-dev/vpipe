@@ -1,0 +1,69 @@
+{
+  "id": "rife-frame-interpolation",
+  "stages": [
+    {
+      "id": "load-video",
+      "type": "load-video",
+      "iports": [],
+      "config": {
+        "input_url": "input.mp4",
+        "enable_audio": false
+      }
+    },
+    {
+      "id": "video-to-rgb",
+      "type": "video-to-rgb",
+      "iports": [
+        {
+          "src": "load-video",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_dtype": "u8"
+      }
+    },
+    {
+      "id": "temporal-resample",
+      "type": "temporal-resample",
+      "iports": [
+        {
+          "src": "video-to-rgb",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_fps": 60.0,
+        "method": "rife",
+        "hf_dir": "Practical-RIFE/train_log"
+      }
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "temporal-resample",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "interpolated-60fps.mp4",
+        "enable_audio": false
+      }
+    }
+  ],
+  "subpipelines": [],
+  "aux": {}
+}

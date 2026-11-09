@@ -2,12 +2,20 @@
 
 #include "common/beat-payload-intf.h"
 #include "common/ffmpeg-libraries.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/rife/metal-rife.h"
+#include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-memory-host.h"
+#include "stages/model-memory.h"
+#include "stages/model-registry.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -45,7 +53,7 @@ sb_num_(const FlexData& sb, const char* key, double* out)
 // The resampling methods, for the editor's dropdown; the ctor's own
 // branch chain stays the authority.
 constexpr SpecExtra kMethodChoices[] = {
-  {spec_key::kChoices, "nearest,blend,average,motion"},
+  {spec_key::kChoices, "nearest,blend,average,motion,rife"},
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_fps", .type = ConfigType::Real, .required = true,
@@ -77,9 +85,38 @@ constexpr ConfigKey kAttrs[] = {
           "as motion blur because that is what it is. \"motion\" "
           "estimates motion and synthesises the in-between frames "
           "(`minterpolate`), which is the one that helps going UP in "
-          "rate, where there is nothing to average. Cost rises in that "
-          "order and `motion` is far the most expensive",
+          "rate, where there is nothing to average. \"rife\" synthesises "
+          "the frame at each output time with RIFE, a learned flow "
+          "network on the GPU (Practical-RIFE 4.22-4.26; `hf_dir` names "
+          "it) -- far cleaner than `motion` on real motion, for slow "
+          "motion or a frame-rate increase; going DOWN it takes the frame "
+          "at each output time, with no averaging. The first four cost "
+          "more in that order; `rife` runs ~30 ms a 1080p frame on an M4 "
+          "Pro",
    .def_str = "nearest", .extra = kMethodChoices},
+  {.key = "hf_dir", .type = ConfigType::String, .required = false,
+   .doc = "the RIFE model, for `method: rife`: a directory holding "
+          "flownet.pkl -- Practical-RIFE's train_log/, as its release "
+          "zips unpack (4.25 is the one its README recommends; 4.22, "
+          "4.22.lite, 4.25.lite and 4.26 read too) -- or the file "
+          "itself, or a models-DB key. The driver beside it "
+          "(RIFE_HDv3.py) is read for the network's scale list, never "
+          "run",
+   .suggest_db = kModelRegistryDb, .suggest_db_type = "rife"},
+  {.key = "rife_scale", .type = ConfigType::Real, .required = false,
+   .doc = "`rife`: the release's --scale, the resolution its flow is "
+          "estimated at relative to the frame -- 0.25, 0.5, 1, 2 or 4. "
+          "0 (default) is the release's advice per frame: 1, or 0.5 for "
+          "a frame wider or taller than 2560 (4K). Lower is faster and "
+          "follows large motion better, higher keeps fine motion",
+   .def_real = 0.0},
+  {.key = "scene_threshold", .type = ConfigType::Real, .required = false,
+   .doc = "`rife`: the release's scene-cut test. Two frames whose "
+          "similarity (SSIM of the two at 32 x 32) is under this are not "
+          "interpolated across: the output times between them repeat the "
+          "first. 0.2 (default) is the release's; 0 interpolates every "
+          "pair",
+   .def_real = 0.2},
   {.key = "average_frames", .type = ConfigType::Int, .required = false,
    .doc = "the `average` window, in SOURCE frames. 0 (default) derives "
           "it from the ratio -- round(input_fps / output_fps), which is "
@@ -117,10 +154,12 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "temporal-resample",
   .doc       = "Resamples planar RGB frames from one frame rate to "
-               "another through an FFmpeg filter chain, with a choice of "
-               "how the discarded information is filtered: drop/dup, "
-               "blend, box-average (motion blur) or motion-compensated "
-               "interpolation. The temporal half of image-resample.",
+               "another, with a choice of how the discarded information "
+               "is filtered: drop/dup, blend, box-average (motion blur) "
+               "or motion-compensated interpolation through an FFmpeg "
+               "filter chain, or frames synthesised by RIFE, a learned "
+               "frame interpolator, on the GPU. The temporal half of "
+               "image-resample.",
   .display_name = "Temporal Resample",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -164,10 +203,281 @@ TemporalResampleStage::TemporalResampleStage(const SessionContextIntf* s,
   else if (m == "blend")    { _method = Method::kBlend; }
   else if (m == "average")  { _method = Method::kAverage; }
   else if (m == "motion")   { _method = Method::kMotion; }
+  else if (m == "rife")     { _method = Method::kRife; }
   else {
     fail_config(fmt("TemporalResampleStage('{}'): method '{}' is not one "
-                    "of nearest|blend|average|motion", this->id(), m));
+                    "of nearest|blend|average|motion|rife", this->id(), m));
     return;
+  }
+  _hf_dir = attr_str("hf_dir");
+  _rife_scale = attr_real("rife_scale");
+  _scene_threshold = attr_real("scene_threshold");
+  if (_rife_scale != 0.0 && !genai::MetalRife::valid_scale(_rife_scale)) {
+    fail_config(fmt("TemporalResampleStage('{}'): rife_scale {} is not one "
+                    "of 0 (the release's rule), 0.25, 0.5, 1, 2, 4",
+                    this->id(), _rife_scale));
+    return;
+  }
+  if (_method == Method::kRife && _hf_dir.empty()) {
+    fail_config(fmt("TemporalResampleStage('{}'): method 'rife' needs the "
+                    "model -- `hf_dir`, Practical-RIFE's train_log/ "
+                    "directory or its flownet.pkl", this->id()));
+    return;
+  }
+}
+
+// ---- rife ------------------------------------------------------------------
+
+// The model and the two source frames the next output times fall
+// between. A frame is PREPARED (padded, its features encoded) once, the
+// first time a pair needs it -- every frame is the second of one pair and
+// the first of the next.
+struct TemporalResampleStage::Rife {
+  std::shared_ptr<genai::WeightSet> ws;
+  std::unique_ptr<genai::MetalRife> model;
+  std::string file;
+  struct Src {
+    std::unique_ptr<BeatPayloadIntf> beat;  // a stream keeps its beat
+    const std::uint8_t* px = nullptr;       // planar [3, h, w]
+    std::int64_t index = -1;
+    genai::MetalRife::Frame frame;
+    bool prepared = false;
+  };
+  Src slot[2];
+  int h = 0, w = 0;
+  bool f32 = false;
+  double in_fps = 0.0, scale = 1.0;
+  std::int64_t n_src = 0, next_out = 0;
+  // The pair the scene test last scored, and its answer.
+  std::int64_t scored = -1;
+  bool cut = false;
+  std::size_t scratch_stated = 0;
+  double gpu_ms = 0.0;
+
+  Src* find(std::int64_t i)
+  {
+    for (Src& s : slot) {
+      if (s.index == i) { return &s; }
+    }
+    return nullptr;
+  }
+  // The slot a new frame `i` goes in: the empty one, else the older.
+  Src* take(std::int64_t i)
+  {
+    Src* v = slot[0].index <= slot[1].index ? &slot[0] : &slot[1];
+    v->beat.reset();
+    v->px = nullptr;
+    v->index = i;
+    v->prepared = false;
+    return v;
+  }
+  void clear_stream()
+  {
+    for (Src& s : slot) {
+      s.beat.reset();
+      s.px = nullptr;
+      s.index = -1;
+      s.prepared = false;
+    }
+    n_src = next_out = 0;
+    scored = -1;
+    cut = false;
+  }
+};
+
+bool
+TemporalResampleStage::output_position(std::int64_t k, double in_fps,
+                                       double out_fps, std::int64_t* i0,
+                                       double* t)
+{
+  const AVRational ri = av_rational_from_double(in_fps);
+  const AVRational ro = av_rational_from_double(out_fps);
+  if (ri.num <= 0 || ri.den <= 0 || ro.num <= 0 || ro.den <= 0 || k < 0) {
+    return false;
+  }
+  // Output k is at k / out seconds, source position k * in / out.
+  const __int128 A = (__int128)ri.num * ro.den;
+  const __int128 B = (__int128)ri.den * ro.num;
+  const __int128 n = (__int128)k * A;
+  *i0 = (std::int64_t)(n / B);
+  *t = (double)(n % B) / (double)B;
+  return true;
+}
+
+std::int64_t
+TemporalResampleStage::output_count(std::int64_t n, double in_fps,
+                                    double out_fps)
+{
+  const AVRational ri = av_rational_from_double(in_fps);
+  const AVRational ro = av_rational_from_double(out_fps);
+  if (ri.num <= 0 || ri.den <= 0 || ro.num <= 0 || ro.den <= 0 || n <= 0) {
+    return 0;
+  }
+  // Every k with k * in / out < n.
+  const __int128 A = (__int128)ri.num * ro.den;
+  const __int128 B = (__int128)ri.den * ro.num;
+  return (std::int64_t)(((__int128)n * B + A - 1) / A);
+}
+
+std::string
+TemporalResampleStage::rife_file_(std::string* err) const
+{
+  if (_hf_dir.empty()) {
+    if (err != nullptr) { *err = "no RIFE model (hf_dir)"; }
+    return {};
+  }
+  const ResolvedModel rm = resolve_model(session(), _hf_dir);
+  return genai::MetalRife::resolve_weights(rm.dir, err);
+}
+
+std::string
+TemporalResampleStage::rife_scratch_label_() const
+{
+  return fmt("temporal-resample:{}", this->id())();
+}
+
+namespace {
+
+const metal_compute::MetalCompute*
+gpu_of_(const SessionContextIntf* s)
+{
+  return s != nullptr && s->services() != nullptr
+             ? s->services()->metal_compute()
+             : nullptr;
+}
+
+// Booked until the first frame says: 1080p, f32 (video-to-rgb's default).
+constexpr int kPlanH = 1080, kPlanW = 1920;
+
+// The GPU memory a geometry runs in: the shared scratch and the two
+// prepared frames the window holds.
+std::size_t
+rife_run_bytes_(const genai::MetalRife::Info& info, int h, int w,
+                double scale, bool f32, bool hw)
+{
+  return genai::MetalRife::scratch_bytes(info, h, w, scale, f32, hw) +
+         2 * genai::MetalRife::frame_bytes(info, h, w, scale);
+}
+
+}  // namespace
+
+std::vector<ResourceClaim>
+TemporalResampleStage::declare_resources() const
+{
+  std::vector<ResourceClaim> out;
+  if (_method != Method::kRife) { return out; }
+  const std::string file = rife_file_();
+  genai::MetalRife::Info info;
+  std::string err;
+  if (file.empty() || !genai::MetalRife::read_info(file, &info, &err)) {
+    return out;
+  }
+  // Held for the run, as converted (f16, the convs' layout, with the
+  // hardware conv's HWIO twins where it runs).
+  const bool hw = genai::MetalRife::hw_conv_wanted(gpu_of_(session()));
+  for (auto& c : model_memory::weight_claims({file})) {
+    bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                     (std::int64_t)genai::MetalRife::weight_bytes(info, hw));
+    out.push_back(std::move(c));
+  }
+  const double sc = _rife_scale > 0.0
+                        ? _rife_scale
+                        : genai::MetalRife::auto_scale(kPlanH, kPlanW);
+  for (auto& c : model_memory::scratch_claims(
+           rife_scratch_label_(),
+           rife_run_bytes_(info, kPlanH, kPlanW, sc, true, hw), {})) {
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+StageMemory
+TemporalResampleStage::declare_memory() const
+{
+  StageMemory m;
+  if (_method != Method::kRife) { return m; }
+  const std::string file = rife_file_();
+  genai::MetalRife::Info info;
+  std::string err;
+  if (file.empty() || !genai::MetalRife::read_info(file, &info, &err)) {
+    return m;
+  }
+  const bool hw = genai::MetalRife::hw_conv_wanted(gpu_of_(session()));
+  m.hold(file, genai::MetalRife::weight_bytes(info, hw));
+  const double sc = _rife_scale > 0.0
+                        ? _rife_scale
+                        : genai::MetalRife::auto_scale(kPlanH, kPlanW);
+  m.scratch = rife_run_bytes_(info, kPlanH, kPlanW, sc, true, hw);
+  return m;
+}
+
+bool
+TemporalResampleStage::rife_load_()
+{
+  if (_rife && _rife->model) { return true; }
+  if (!_rife) { _rife = std::make_unique<Rife>(); }
+  std::string err;
+  const std::string file = rife_file_(&err);
+  if (file.empty()) {
+    session()->error(fmt("TemporalResampleStage('{}'): {}", this->id(),
+                         err));
+    return false;
+  }
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr) {
+    session()->error(fmt("TemporalResampleStage('{}'): no metal-compute "
+                         "backend for `rife`", this->id()));
+    return false;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  _rife->ws = genai::open_weight_set(file, session());
+  if (_rife->ws) {
+    _rife->model = genai::MetalRife::load(_rife->ws, mc, file, &err);
+  }
+  if (!_rife->model) {
+    _rife->ws.reset();
+    session()->error(fmt("TemporalResampleStage('{}'): '{}': {}", this->id(),
+                         file, err.empty() ? "cannot open" : err));
+    return false;
+  }
+  _rife->file = file;
+  const auto& in = _rife->model->info();
+  std::string blocks, scales;
+  for (int i = 0; i < in.blocks(); ++i) {
+    blocks += fmt("{}{}", i ? "/" : "", in.widths[(std::size_t)i])();
+    scales += fmt("{}{}", i ? "/" : "", in.scales[(std::size_t)i])();
+  }
+  session()->info(fmt(
+      "TemporalResampleStage('{}'): RIFE loaded in {:.2f} s -- {:.2f} M "
+      "params, {} blocks ({}) at 1/{} of the frame{}, {}-channel features, "
+      "{:.1f} MB held", this->id(),
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count(),
+      (double)in.params * 1e-6, in.blocks(), blocks, scales,
+      in.scales_from_driver ? " (the driver's list)"
+                            : " (by block count: no RIFE_HDv3.py beside it)",
+      in.features, (double)_rife->model->held_weight_bytes() / 1048576.0));
+  return true;
+}
+
+void
+TemporalResampleStage::rife_release_()
+{
+  if (!_rife || !_rife->model) { return; }
+  if (_interpolated > 0) {
+    session()->info(fmt(
+        "TemporalResampleStage('{}'): {} frame(s) synthesised in {:.1f} ms "
+        "each, {} pair(s) held over a scene cut", this->id(), _interpolated,
+        _rife->gpu_ms / (double)_interpolated, _cuts_held));
+  }
+  const std::string file = _rife->file;
+  _rife->clear_stream();
+  for (auto& s : _rife->slot) { s.frame = genai::MetalRife::Frame{}; }
+  _rife->model.reset();
+  _rife->ws.reset();
+  _rife->scratch_stated = 0;
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->drop_weights(file);
   }
 }
 
@@ -206,6 +516,7 @@ TemporalResampleStage::method_name(Method m) noexcept
     case Method::kBlend:   return "blend";
     case Method::kAverage: return "average";
     case Method::kMotion:  return "motion";
+    case Method::kRife:    return "rife";
   }
   return "nearest";
 }
@@ -252,8 +563,197 @@ TemporalResampleStage::chain_for(Method m, double in_fps, double out_fps,
       // manual.
       return "minterpolate=fps=" + rate +
              ":mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1";
+    case Method::kRife:
+      // Not a filter chain: the stage runs the model itself.
+      return {};
   }
   return {};
+}
+
+void
+TemporalResampleStage::rife_revise_scratch_()
+{
+  Rife& R = *_rife;
+  const std::size_t bytes = rife_run_bytes_(R.model->info(), R.h, R.w,
+                                            R.scale, R.f32,
+                                            R.model->hw_conv());
+  if (bytes == R.scratch_stated) { return; }
+  R.scratch_stated = bytes;
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(rife_scratch_label_(), bytes);
+  }
+  StageMemory m = declare_memory();
+  m.scratch = bytes;
+  revise_memory(m);
+}
+
+bool
+TemporalResampleStage::rife_pair_(std::int64_t i0, double t,
+                                  std::vector<std::uint8_t>* out)
+{
+  Rife& R = *_rife;
+  Rife::Src* a = R.find(i0);
+  Rife::Src* b = t > 0.0 ? R.find(i0 + 1) : nullptr;
+  if (a == nullptr || a->px == nullptr || (t > 0.0 && b == nullptr)) {
+    session()->warn(fmt("TemporalResampleStage('{}'): source frame {} is "
+                        "not in the window", this->id(), i0));
+    return false;
+  }
+  const std::size_t bytes = (std::size_t)3 * R.h * R.w * (R.f32 ? 4 : 1);
+  if (b != nullptr && _scene_threshold > 0.0 && R.scored != i0) {
+    const double ssim = genai::MetalRife::scene_ssim(a->px, b->px, R.f32,
+                                                     R.h, R.w, R.scale);
+    R.scored = i0;
+    R.cut = ssim < _scene_threshold;
+    if (R.cut) {
+      ++_cuts_held;
+      session()->log_normal(fmt(
+          "TemporalResampleStage('{}'): frames {} and {} are a scene cut "
+          "(SSIM {:.3f} under {}); the times between hold frame {}",
+          this->id(), i0, i0 + 1, ssim, _scene_threshold, i0));
+    }
+  }
+  if (b == nullptr || (_scene_threshold > 0.0 && R.cut)) {
+    out->assign(a->px, a->px + bytes);
+    return true;
+  }
+  std::string err;
+  for (Rife::Src* s : {a, b}) {
+    if (s->prepared) { continue; }
+    if (!R.model->prepare(s->px, R.f32, R.h, R.w, R.scale, &s->frame,
+                          &err)) {
+      session()->warn(fmt("TemporalResampleStage('{}'): frame {}: {}",
+                          this->id(), s->index, err));
+      return false;
+    }
+    s->prepared = true;
+  }
+  out->resize(bytes);
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!R.model->interpolate(a->frame, b->frame, (float)t, R.f32,
+                            out->data(), &err)) {
+    session()->warn(fmt("TemporalResampleStage('{}'): frames {}-{}: {}",
+                        this->id(), i0, i0 + 1, err));
+    return false;
+  }
+  R.gpu_ms += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0).count();
+  ++_interpolated;
+  return true;
+}
+
+bool
+TemporalResampleStage::rife_stream_frame_(
+    std::unique_ptr<BeatPayloadIntf> p, double in_fps,
+    std::vector<std::vector<std::uint8_t>>* out)
+{
+  Rife& R = *_rife;
+  const auto* tb = dynamic_cast<const TensorBeatPayload*>(p.get());
+  const int h = (int)tb->shape[1], w = (int)tb->shape[2];
+  const bool f32 = tb->dtype == TensorBeat::DType::F32;
+  if (R.n_src > 0 && (h != R.h || w != R.w || f32 != R.f32 ||
+                      std::fabs(in_fps - R.in_fps) > 1e-9)) {
+    // The source changed under the stream: what is held ends there (its
+    // last frame over its own end), and a new stream starts here.
+    session()->warn(fmt(
+        "TemporalResampleStage('{}'): frames went from {}x{} {} at {:.4f} "
+        "fps to {}x{} {} at {:.4f} mid-stream; interpolation restarts here",
+        this->id(), R.w, R.h, R.f32 ? "f32" : "u8", R.in_fps, w, h,
+        f32 ? "f32" : "u8", in_fps));
+    rife_stream_end_(out);
+  }
+  if (R.n_src == 0) {
+    R.h = h;
+    R.w = w;
+    R.f32 = f32;
+    R.in_fps = in_fps;
+    R.scale = _rife_scale > 0.0 ? _rife_scale
+                                : genai::MetalRife::auto_scale(h, w);
+    rife_revise_scratch_();
+  }
+  const std::int64_t i = R.n_src;
+  Rife::Src* s = R.take(i);
+  s->px = tb->as_u8();      // the payload's own bytes; it moves, they stay
+  s->beat = std::move(p);
+  R.n_src = i + 1;
+  // Every output time before this frame: they lie between it and the one
+  // before.
+  while (true) {
+    std::int64_t i0 = 0;
+    double t = 0.0;
+    if (!output_position(R.next_out, R.in_fps, _out_fps, &i0, &t)) {
+      return false;
+    }
+    if (i0 >= i) { break; }
+    std::vector<std::uint8_t> px;
+    if (!rife_pair_(i0, t, &px)) { return false; }
+    out->push_back(std::move(px));
+    ++R.next_out;
+  }
+  return true;
+}
+
+void
+TemporalResampleStage::rife_stream_end_(
+    std::vector<std::vector<std::uint8_t>>* out)
+{
+  if (!_rife || _rife->n_src == 0) { return; }
+  Rife& R = *_rife;
+  // The times after the last frame and before the clip's end hold it.
+  const std::int64_t N = R.n_src;
+  while (true) {
+    std::int64_t i0 = 0;
+    double t = 0.0;
+    if (!output_position(R.next_out, R.in_fps, _out_fps, &i0, &t) ||
+        i0 >= N) {
+      break;
+    }
+    std::vector<std::uint8_t> px;
+    if (!rife_pair_(N - 1, 0.0, &px)) { break; }
+    out->push_back(std::move(px));
+    ++R.next_out;
+  }
+  R.clear_stream();
+}
+
+bool
+TemporalResampleStage::rife_clip_(const TensorBeat& clip, double in_fps,
+                                  std::vector<std::vector<std::uint8_t>>* out)
+{
+  Rife& R = *_rife;
+  const std::int64_t N = clip.shape[0];
+  R.clear_stream();
+  R.h = (int)clip.shape[2];
+  R.w = (int)clip.shape[3];
+  R.f32 = clip.dtype == TensorBeat::DType::F32;
+  R.in_fps = in_fps;
+  R.scale = _rife_scale > 0.0 ? _rife_scale
+                              : genai::MetalRife::auto_scale(R.h, R.w);
+  rife_revise_scratch_();
+  const std::size_t step =
+      (std::size_t)3 * R.h * R.w * (R.f32 ? 4 : 1);
+  const std::uint8_t* base = clip.as_u8();
+  const std::int64_t M = output_count(N, in_fps, _out_fps);
+  for (std::int64_t k = 0; k < M; ++k) {
+    std::int64_t i0 = 0;
+    double t = 0.0;
+    if (!output_position(k, in_fps, _out_fps, &i0, &t)) { return false; }
+    if (i0 >= N - 1) {
+      i0 = N - 1;      // past the last frame: hold it
+      t = 0.0;
+    }
+    for (std::int64_t idx : {i0, i0 + 1}) {
+      if (idx == i0 + 1 && t == 0.0) { continue; }
+      if (R.find(idx) == nullptr) {
+        R.take(idx)->px = base + (std::size_t)idx * step;
+      }
+    }
+    std::vector<std::uint8_t> px;
+    if (!rife_pair_(i0, t, &px)) { return false; }
+    out->push_back(std::move(px));
+  }
+  R.clear_stream();
+  return true;
 }
 
 double
@@ -277,6 +777,18 @@ Job
 TemporalResampleStage::initialize(RuntimeContext& ctx)
 {
   (void)ctx;
+  if (_method == Method::kRife) {
+    if (rife_load_()) {
+      session()->info(fmt(
+          "TemporalResampleStage('{}'): -> {:.4f} fps by RIFE, {} input, "
+          "flow at scale {}, scene cut under SSIM {}", this->id(), _out_fps,
+          _stacked ? "one stacked clip per beat" : "one frame per beat",
+          _rife_scale > 0.0 ? fmt("{}", _rife_scale)()
+                            : std::string("1 (0.5 past 2560 px)"),
+          _scene_threshold));
+    }
+    co_return;
+  }
   const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (libs == nullptr || !libs->avfilter().valid()) {
     session()->warn(fmt(
@@ -312,6 +824,12 @@ TemporalResampleStage::reset_run_state()
   _have_ts = false;
   _first_ts_us = 0;
   _shape_warned = false;
+  _interpolated = 0;
+  _cuts_held = 0;
+  if (_rife) {
+    _rife->clear_stream();
+    _rife->gpu_ms = 0.0;
+  }
 }
 
 bool
@@ -458,6 +976,26 @@ Job
 TemporalResampleStage::process(RuntimeContext& ctx)
 {
   auto p = co_await ctx.read(0);
+  if (!p && _method == Method::kRife) {
+    // EOS: the output times past the last frame hold it, so the clip
+    // keeps its length.
+    std::vector<std::vector<std::uint8_t>> tail;
+    const int h = _rife ? _rife->h : 0, w = _rife ? _rife->w : 0;
+    const bool f32 = _rife && _rife->f32;
+    if (!_stacked) { rife_stream_end_(&tail); }
+    for (auto& px : tail) {
+      auto t = std::make_unique<TensorBeatPayload>();
+      t->dtype = f32 ? TensorBeat::DType::F32 : TensorBeat::DType::U8;
+      t->shape = {3, h, w};
+      t->data.assign(px.begin(), px.end());
+      t->sideband = frame_sideband_();
+      ++_emitted;
+      co_await ctx.write(0, std::move(t));
+    }
+    rife_release_();
+    ctx.signal_done();
+    co_return;
+  }
   if (!p) {
     // EOS. A frame stream still has whatever the chain is holding --
     // minterpolate keeps a frame, tmix a window -- and dropping it
@@ -490,9 +1028,13 @@ TemporalResampleStage::process(RuntimeContext& ctx)
     co_return;
   }
   const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
-  if (libs == nullptr || !libs->avfilter().valid()) {
+  if (_method != Method::kRife &&
+      (libs == nullptr || !libs->avfilter().valid())) {
     co_await ctx.write(0, std::move(p));      // already warned at launch
     co_return;
+  }
+  if (_method == Method::kRife && (!_rife || !_rife->model)) {
+    co_return;                                 // its error was at launch
   }
   // Both of `video-to-rgb`'s outputs, and it defaults to f32. GBRPF32
   // is the same three planes in float, so the only difference below is
@@ -555,6 +1097,44 @@ TemporalResampleStage::process(RuntimeContext& ctx)
     _have_ts = sb_num_(tb->sideband, "timestamp_us", &ts) && ts >= 0.0;
     _first_ts_us = _have_ts ? (std::uint64_t)ts : 0;
     if (_stacked) { _out_index = 0; }
+  }
+
+  if (_method == Method::kRife) {
+    std::vector<std::vector<std::uint8_t>> out;
+    const TensorBeat::DType dt = tb->dtype;
+    const std::size_t step_by =
+        (std::size_t)3 * h * w * (dt == TensorBeat::DType::F32 ? 4 : 1);
+    if (_stacked) {
+      if (!rife_clip_(*tb, in_fps, &out)) { co_return; }
+      auto t = std::make_unique<TensorBeatPayload>();
+      t->dtype = dt;
+      t->shape = {(std::int64_t)out.size(), 3, h, w};
+      t->resize_contiguous(out.size() * step_by /
+                           (dt == TensorBeat::DType::F32 ? 4 : 1));
+      std::uint8_t* dst = t->as_u8();
+      for (std::size_t i = 0; i < out.size(); ++i) {
+        std::memcpy(dst + i * step_by, out[i].data(), step_by);
+      }
+      t->sideband = clip_sideband_((int)out.size());
+      ++_emitted;
+      session()->log_debug(fmt(
+          "TemporalResampleStage('{}'): clip {} -> {} frames by RIFE "
+          "({:.4f} -> {:.4f} fps)", this->id(), frames_in, out.size(),
+          in_fps, _out_fps));
+      co_await ctx.write(0, std::move(t));
+      co_return;
+    }
+    if (!rife_stream_frame_(std::move(p), in_fps, &out)) { co_return; }
+    for (auto& px : out) {
+      auto t = std::make_unique<TensorBeatPayload>();
+      t->dtype = dt;
+      t->shape = {3, h, w};
+      t->data.assign(px.begin(), px.end());
+      t->sideband = frame_sideband_();
+      ++_emitted;
+      co_await ctx.write(0, std::move(t));
+    }
+    co_return;
   }
 
   // A stacked clip gets a FRESH graph per beat and is flushed at the

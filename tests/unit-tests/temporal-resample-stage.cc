@@ -28,6 +28,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/audio-video/temporal-resample-stage.h"
+#include "generative-models/rife/metal-rife.h"
 
 #include <algorithm>
 #include <cmath>
@@ -78,6 +79,7 @@ public:
   std::vector<std::vector<std::int64_t>> shapes;
   std::vector<std::uint8_t> first_px;      // one leading byte per beat
   std::vector<std::uint8_t> bytes;         // the LAST beat's payload
+  std::vector<std::vector<std::uint8_t>> all;   // every beat's payload
   FlexData last_sb;
   Job
   process(RuntimeContext& ctx) override
@@ -89,6 +91,7 @@ public:
       shapes.push_back(tb->shape);
       last_sb = tb->sideband;
       bytes.assign(tb->data.begin(), tb->data.end());
+      all.push_back(bytes);
       if (!tb->data.empty()) { first_px.push_back(tb->data[0]); }
     }
     co_return;
@@ -486,4 +489,234 @@ TEST(temporal_resample, averaging_is_visible_in_the_pixels)
   std::printf("[temporal_resample] flicker at Nyquist: nearest %d/%d "
               "frames extreme (mean %.1f), average %d/%d (mean %.1f)\n",
               nx, nt, nm, ax, at, am);
+}
+
+// ---- rife -------------------------------------------------------------------
+//
+// `rife` is not a filter chain: the stage times the output frames itself.
+// The timing is model-free and asserted here exactly; the pictures need
+// the model (VPIPE_RIFE_TEST_MODEL_PATH: Practical-RIFE's train_log/, the
+// directory holding flownet.pkl).
+
+// Output frame k sits at source position k * in / out, in exact rational
+// arithmetic -- the NTSC rates included, where a double ratio would land a
+// hair off a whole frame and interpolate a frame the source has.
+TEST(temporal_resample, rife_times_its_frames_exactly)
+{
+  std::int64_t i0 = 0;
+  double t = 0.0;
+  // 30 -> 60: every other output is a source frame.
+  ASSERT_TRUE(TemporalResampleStage::output_position(1, 30, 60, &i0, &t));
+  EXPECT_TRUE(i0 == 0 && t == 0.5);
+  ASSERT_TRUE(TemporalResampleStage::output_position(2, 30, 60, &i0, &t));
+  EXPECT_TRUE(i0 == 1 && t == 0.0);
+  // 24 -> 60: 0, 0.4, 0.8, 1.2, ...
+  ASSERT_TRUE(TemporalResampleStage::output_position(3, 24, 60, &i0, &t));
+  EXPECT_TRUE(i0 == 1 && std::fabs(t - 0.2) < 1e-12);
+  // 29.97 -> 59.94 is 30000/1001 -> 60000/1001: exact halves forever.
+  ASSERT_TRUE(TemporalResampleStage::output_position(
+      200001, 30000.0 / 1001.0, 60000.0 / 1001.0, &i0, &t));
+  EXPECT_TRUE(i0 == 100000 && t == 0.5);
+  ASSERT_TRUE(TemporalResampleStage::output_position(
+      200000, 29.97, 59.94, &i0, &t));
+  EXPECT_TRUE(i0 == 100000 && t == 0.0);
+  // Down in rate: 60 -> 24 takes source positions 0, 2.5, 5, ...
+  ASSERT_TRUE(TemporalResampleStage::output_position(1, 60, 24, &i0, &t));
+  EXPECT_TRUE(i0 == 2 && t == 0.5);
+  // A clip keeps its length: N frames at r in, N / r seconds out.
+  EXPECT_TRUE(TemporalResampleStage::output_count(10, 24, 60) == 25);
+  EXPECT_TRUE(TemporalResampleStage::output_count(30, 30, 60) == 60);
+  EXPECT_TRUE(TemporalResampleStage::output_count(30, 30, 15) == 15);
+  EXPECT_TRUE(TemporalResampleStage::output_count(7, 30, 60) == 14);
+  EXPECT_TRUE(TemporalResampleStage::output_count(1, 24, 60) == 3);
+  EXPECT_TRUE(std::string(TemporalResampleStage::method_name(
+                  Method::kRife)) == "rife");
+  // It has no chain: the stage runs the model itself.
+  EXPECT_TRUE(TemporalResampleStage::chain_for(Method::kRife, 30, 60, 0)
+                  .empty());
+}
+
+namespace {
+
+const char*
+rife_model_()
+{
+  const char* v = std::getenv("VPIPE_RIFE_TEST_MODEL_PATH");
+  return v != nullptr && *v != '\0' ? v : nullptr;
+}
+
+// A textured square (a checker inside a bright frame) on a dim
+// background, its left edge at `x0`: [3, h, w] u8.
+std::vector<std::uint8_t>
+square_px_(int h, int w, int x0, int y0, int side)
+{
+  std::vector<std::uint8_t> px((std::size_t)3 * h * w, 24);
+  for (int c = 0; c < 3; ++c) {
+    for (int y = y0; y < y0 + side && y < h; ++y) {
+      for (int x = x0; x < x0 + side && x < w; ++x) {
+        const bool edge = y - y0 < 3 || x - x0 < 3 || y0 + side - 1 - y < 3 ||
+                          x0 + side - 1 - x < 3;
+        const bool chk = (((x - x0) / 6) + ((y - y0) / 6)) % 2 == 0;
+        px[((std::size_t)c * h + y) * w + x] =
+            edge ? 240 : chk ? (std::uint8_t)(200 - 40 * c) : 90;
+      }
+    }
+  }
+  return px;
+}
+
+TensorBeat
+px_frame_(const std::vector<std::uint8_t>& px, int h, int w, unsigned fps,
+          std::uint64_t ts)
+{
+  TensorBeat tb = frame_(h, w, 0, fps, 1, ts);
+  std::memcpy(tb.data.data(), px.data(), px.size());
+  return tb;
+}
+
+// Where the bright edge pixels of the square are in channel 0 -- their
+// x centroid -- and how many pixels sit between the background and the
+// edge's brightness (a cross-fade's ghosts do).
+void
+square_stats_(const std::vector<std::uint8_t>& px, int h, int w,
+              double* cx, int* ghosts)
+{
+  double sx = 0.0, n = 0.0;
+  int g = 0;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int v = px[(std::size_t)y * w + x];
+      if (v >= 200) { sx += x; n += 1.0; }
+      if (v > 60 && v < 180) { ++g; }
+    }
+  }
+  *cx = n > 0.0 ? sx / n : -1.0;
+  *ghosts = g;
+}
+
+}  // namespace
+
+// The point of `rife`: a square moving 12 px a frame, doubled from 30 to
+// 60 fps. The frame between two sources has the square HALFWAY -- one
+// square, where `blend` cross-fades two half-bright ones. The same frames
+// as one stacked clip come out byte-identical to the stream.
+TEST(temporal_resample, rife_puts_a_moving_square_halfway)
+{
+  const char* model = rife_model_();
+  if (model == nullptr) { return; }
+  constexpr int H = 128, W = 192, kSide = 48, kStep = 12, kN = 6;
+  std::vector<std::vector<std::uint8_t>> src;
+  std::vector<TensorBeat> beats;
+  for (int i = 0; i < kN; ++i) {
+    src.push_back(square_px_(H, W, 24 + kStep * i, 40, kSide));
+    beats.push_back(px_frame_(src.back(), H, W, 30,
+                              (std::uint64_t)i * 33333));
+  }
+  Run r;
+  ASSERT_TRUE(drive_(r, beats,
+                     cfg_({{"output_fps", FlexData::make_real(60.0)},
+                           {"method", FlexData::make_string("rife")},
+                           {"hf_dir", FlexData::make_string(model)}})));
+  // Six frames at 30 are 0.2 s: twelve at 60, the last holding frame 5.
+  ASSERT_TRUE(r.sink->beats == 2 * kN);
+  ASSERT_TRUE(r.sink->all.size() == (std::size_t)(2 * kN));
+  EXPECT_TRUE(r.stage->interpolated() == (std::uint64_t)(kN - 1));
+  EXPECT_TRUE(sb_real_(r.sink->last_sb, "fps_num") == 60.0);
+  // Even outputs ARE the source frames; the last is frame 5 held.
+  for (int k = 0; k < 2 * kN; k += 2) {
+    EXPECT_TRUE(r.sink->all[(std::size_t)k] == src[(std::size_t)(k / 2)]);
+  }
+  EXPECT_TRUE(r.sink->all.back() == src.back());
+  // Odd outputs: the square halfway, and no cross-fade.
+  for (int k = 1; k < 2 * kN - 1; k += 2) {
+    double cx = 0.0, ca = 0.0, cb = 0.0;
+    int g = 0, ga = 0, gb = 0;
+    square_stats_(r.sink->all[(std::size_t)k], H, W, &cx, &g);
+    square_stats_(src[(std::size_t)(k / 2)], H, W, &ca, &ga);
+    square_stats_(src[(std::size_t)(k / 2 + 1)], H, W, &cb, &gb);
+    std::printf("[temporal_resample] rife frame %d: square at x %.2f "
+                "(sources %.2f, %.2f), %d ghost px (sources %d)\n", k, cx,
+                ca, cb, g, ga);
+    EXPECT_TRUE(std::fabs(cx - 0.5 * (ca + cb)) < 1.5);
+    // A cross-fade of the two would leave every pixel the squares do not
+    // share at half brightness: 2 x 12 x 48 rows of ghosts per channel.
+    EXPECT_TRUE(g < ga + 2 * kStep * kSide / 4);
+  }
+  // The same six frames as ONE clip.
+  TensorBeat clip;
+  clip.dtype = TensorBeat::DType::U8;
+  clip.shape = {kN, 3, H, W};
+  for (const auto& f : src) {
+    clip.data.insert(clip.data.end(), f.begin(), f.end());
+  }
+  FlexData o = FlexData::make_object();
+  o.as_object().insert_or_assign("fps", FlexData::make_real(30.0));
+  clip.sideband = std::move(o);
+  Run rc;
+  ASSERT_TRUE(drive_(rc, {clip},
+                     cfg_({{"output_fps", FlexData::make_real(60.0)},
+                           {"method", FlexData::make_string("rife")},
+                           {"stacked", FlexData::make_bool(true)},
+                           {"hf_dir", FlexData::make_string(model)}})));
+  ASSERT_TRUE(rc.sink->beats == 1 && rc.sink->shapes.size() == 1);
+  ASSERT_TRUE(rc.sink->shapes[0][0] == 2 * kN);
+  const std::size_t per = (std::size_t)3 * H * W;
+  bool same = rc.sink->bytes.size() == (std::size_t)(2 * kN) * per;
+  for (int k = 0; same && k < 2 * kN; ++k) {
+    same = std::memcmp(rc.sink->bytes.data() + (std::size_t)k * per,
+                       r.sink->all[(std::size_t)k].data(), per) == 0;
+  }
+  EXPECT_TRUE(same);
+  EXPECT_TRUE(sb_real_(rc.sink->last_sb, "fps") == 60.0);
+}
+
+// The release's scene rule: across a cut the in-between times repeat the
+// frame before it rather than morph one scene into the other.
+TEST(temporal_resample, rife_holds_a_scene_cut)
+{
+  const char* model = rife_model_();
+  if (model == nullptr) { return; }
+  constexpr int H = 128, W = 192;
+  // Scene A: the square; scene B: horizontal bars, inverted.
+  const auto a0 = square_px_(H, W, 30, 40, 48);
+  const auto a1 = square_px_(H, W, 40, 40, 48);
+  std::vector<std::uint8_t> b0((std::size_t)3 * H * W);
+  for (std::size_t k = 0; k < b0.size(); ++k) {
+    const int y = (int)((k / W) % H);
+    b0[k] = (y / 8) % 2 == 0 ? 230 : 10;
+  }
+  std::vector<TensorBeat> beats = {px_frame_(a0, H, W, 30, 0),
+                                   px_frame_(a1, H, W, 30, 33333),
+                                   px_frame_(b0, H, W, 30, 66666)};
+  for (double thr : {0.2, 0.0}) {
+    Run r;
+    ASSERT_TRUE(drive_(r, beats,
+                       cfg_({{"output_fps", FlexData::make_real(60.0)},
+                             {"method", FlexData::make_string("rife")},
+                             {"scene_threshold", FlexData::make_real(thr)},
+                             {"hf_dir", FlexData::make_string(model)}})));
+    ASSERT_TRUE(r.sink->all.size() == 6);
+    const double s01 = genai::MetalRife::scene_ssim(a0.data(), a1.data(),
+                                                    false, H, W, 1.0);
+    const double s12 = genai::MetalRife::scene_ssim(a1.data(), b0.data(),
+                                                    false, H, W, 1.0);
+    std::printf("[temporal_resample] threshold %.1f: SSIM %.3f within the "
+                "scene, %.3f across the cut; %llu interpolated, %llu cut(s) "
+                "held\n", thr, s01, s12,
+                (unsigned long long)r.stage->interpolated(),
+                (unsigned long long)r.stage->cuts_held());
+    ASSERT_TRUE(s01 > 0.2 && s12 < 0.2);
+    if (thr > 0.0) {
+      // Frame 3 (between a1 and b0) repeats a1; frame 1 is synthesised.
+      EXPECT_TRUE(r.sink->all[3] == a1);
+      EXPECT_TRUE(r.sink->all[1] != a0 && r.sink->all[1] != a1);
+      EXPECT_TRUE(r.stage->cuts_held() == 1);
+      EXPECT_TRUE(r.stage->interpolated() == 1);
+    } else {
+      // Off: the cut is interpolated across like any pair.
+      EXPECT_TRUE(r.sink->all[3] != a1);
+      EXPECT_TRUE(r.stage->cuts_held() == 0);
+      EXPECT_TRUE(r.stage->interpolated() == 2);
+    }
+  }
 }

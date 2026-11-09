@@ -137,6 +137,15 @@ struct ReluEpilogue {
   }
 };
 
+// LeakyReLU(0.2) on the fp32 accumulator (RIFE's IFNet: every conv's
+// activation is nn.LeakyReLU(0.2)).
+struct LeakyRelu02Epilogue {
+  template <typename AccumT>
+  METAL_FUNC AccumT apply(AccumT x) const {
+    return x >= static_cast<AccumT>(0) ? x : x * static_cast<AccumT>(0.2f);
+  }
+};
+
 // CAUSAL: 0 = dense (default). 1 = QK (scores[query,key]): skip a whole tile
 // when its smallest key column (y_col) is above the block's largest query
 // (q_offset+y_row+BM-1) -- those columns are masked away by the downstream
@@ -1509,11 +1518,16 @@ kernel void dense_moe_gate_f16(
 //             `inp2`, each Cin/2 wide -- read in place, so the [H*W, Cin]
 //             concat is never materialized (a TAEHV MemBlock's [x, past]).
 //             Cin/2 must be a multiple of 4, and of BK for the fast gather.
+//   EPI == 3  y = leaky_relu(conv + bias, 0.2)
+//   EPI == 4  y = leaky_relu(conv + bias + res, 0.2)
+//   S2PAD == 1  a stride-2 conv padded SYMMETRICALLY, torch's
+//             Conv2d(k3, s2, p1): iy = 2*oy + ky - 1 (RIFE's IFNet). The
+//             default 0 is the encoders' (0,1,0,1) pad above.
 // all on the fp32 accumulator, so the fused output is rounded once where
 // the unfused chain rounded after every op.
 template <typename T, const int BM, const int BK, const int BN,
           const int STRIDE, const int UP = 1, const int EPI = 0,
-          const int CAT = 0>
+          const int CAT = 0, const int S2PAD = 0>
 METAL_FUNC void conv3x3_gemm_impl(
     const device T* inp,
     const device T* Wt,
@@ -1611,8 +1625,10 @@ METAL_FUNC void conv3x3_gemm_impl(
         const int i = rl + n * RPP;
         vec<T, 4> v = vec<T, 4>(T(0));
         if (i < num_els) {
-          const int iy = (STRIDE == 2) ? (oyv[n] * 2 + ky) : (oyv[n] + ky - 1);
-          const int ix = (STRIDE == 2) ? (oxv[n] * 2 + kx) : (oxv[n] + kx - 1);
+          const int iy = (STRIDE == 2) ? (oyv[n] * 2 + ky - S2PAD)
+                                       : (oyv[n] + ky - 1);
+          const int ix = (STRIDE == 2) ? (oxv[n] * 2 + kx - S2PAD)
+                                       : (oxv[n] + kx - 1);
           if (iy >= 0 && iy < LH && ix >= 0 && ix < LW) {
             // Cin and ci are multiples of 4, so this is 8-byte aligned; a
             // concat half is too (CS % 4 == 0), and a quad never straddles
@@ -1638,8 +1654,8 @@ METAL_FUNC void conv3x3_gemm_impl(
           const int kk = k + j;
           const int tap = kk / Cin, ci = kk - tap * Cin;
           const int ky = tap / 3, kx = tap - ky * 3;
-          const int iy = (STRIDE == 2) ? (oy * 2 + ky) : (oy + ky - 1);
-          const int ix = (STRIDE == 2) ? (ox * 2 + kx) : (ox + kx - 1);
+          const int iy = (STRIDE == 2) ? (oy * 2 + ky - S2PAD) : (oy + ky - 1);
+          const int ix = (STRIDE == 2) ? (ox * 2 + kx - S2PAD) : (ox + kx - 1);
           if (iy >= 0 && iy < LH && ix >= 0 && ix < LW) {
             const bool hi = CAT && ci >= CS;
             v = (hi ? inp2 : inp)[((int64_t)(iy / UP) * Wi + ix / UP) * CS +
@@ -1668,22 +1684,28 @@ METAL_FUNC void conv3x3_gemm_impl(
       mma_op.apply_epilogue_safe(bias + y_col, 0, 1, short2(num_outs, num_els),
                                  op);
     }
-    if (EPI == 2) {
+    if (EPI == 2 || EPI == 4) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue_safe(rp, Cout, 1, short2(num_outs, num_els), op);
     }
-    if (EPI >= 1) { mma_op.apply_epilogue(ReluEpilogue()); }
+    if (EPI == 1 || EPI == 2) { mma_op.apply_epilogue(ReluEpilogue()); }
+    if (EPI == 3 || EPI == 4) {
+      mma_op.apply_epilogue(LeakyRelu02Epilogue());
+    }
     mma_op.store_result_safe(yp, Cout, short2(num_outs, num_els));
   } else {
     if (has_bias) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue(bias + y_col, 0, 1, op);
     }
-    if (EPI == 2) {
+    if (EPI == 2 || EPI == 4) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue(rp, Cout, 1, op);
     }
-    if (EPI >= 1) { mma_op.apply_epilogue(ReluEpilogue()); }
+    if (EPI == 1 || EPI == 2) { mma_op.apply_epilogue(ReluEpilogue()); }
+    if (EPI == 3 || EPI == 4) {
+      mma_op.apply_epilogue(LeakyRelu02Epilogue());
+    }
     mma_op.store_result(yp, Cout);
   }
 }
@@ -1776,6 +1798,49 @@ VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_cat_relu_f16,
                                64, 64, 1, 1, 1)
 VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_cat_relu_f16,
                                64, 32, 1, 1, 1)
+
+// RIFE's IFNet (generative-models/rife/): every conv activates with
+// LeakyReLU(0.2), its ResConv adds its input back before that, and its
+// stride-2 convs pad symmetrically (torch's p1). The FUSED entry's
+// buffers (11 the residual, 12 unused), any STRIDE.
+#define VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(NAME, BM_, BN_, STRIDE_, EPI_, S2PAD_) \
+  kernel void NAME(                                                           \
+      const device VPIPE_ELT* inp  [[buffer(0)]],                             \
+      const device VPIPE_ELT* Wt   [[buffer(1)]],                             \
+      const device VPIPE_ELT* bias [[buffer(2)]],                             \
+      device VPIPE_ELT*       y    [[buffer(3)]],                             \
+      const constant int& H        [[buffer(4)]],                             \
+      const constant int& Wi       [[buffer(5)]],                             \
+      const constant int& Cin      [[buffer(6)]],                             \
+      const constant int& Cout     [[buffer(7)]],                             \
+      const constant int& OH       [[buffer(8)]],                             \
+      const constant int& OW       [[buffer(9)]],                             \
+      const constant int& has_bias [[buffer(10)]],                            \
+      const device VPIPE_ELT* res  [[buffer(11)]],                            \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]],                           \
+      uint  lid      [[thread_index_in_threadgroup]])                         \
+  {                                                                           \
+    constexpr int BK = 32;                                                    \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
+    threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
+    conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, STRIDE_, 1, EPI_, 0, S2PAD_>(  \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, res,    \
+        (const device VPIPE_ELT*)nullptr, tid, simd_gid, simd_lid, lid);      \
+  }
+
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn64_lrelu_f16, 64, 64, 1, 3, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn32_lrelu_f16, 64, 32, 1, 3, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn64_addlrelu_f16,
+                               64, 64, 1, 4, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn32_addlrelu_f16,
+                               64, 32, 1, 4, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn64_lrelu_f16,
+                               64, 64, 2, 3, 1)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn32_lrelu_f16,
+                               64, 32, 2, 3, 1)
 
 // ---- the tiny autoencoders' ConvNeXt-style block ---------------------------
 //

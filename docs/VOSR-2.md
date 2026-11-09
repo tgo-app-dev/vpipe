@@ -76,14 +76,16 @@ vpipe --launch docs/pipelines/vosr-2-restore.vpipeline
 ```
 load-image ─▸ image-resample ─┬─▸ diffusion-conditioner ─┐
                               │                          ├─▸ generate-image ─▸ vae-decode
-                              └─▸ vae-encode ────────────┘
+                              ├─▸ vae-encode ────────────┘                       ▲
+                              └─────────────────────────────────── color_reference ┘
 ```
 
-**One resample feeds both branches**, and that is the load-bearing part. The
+**One resample feeds every branch**, and that is the load-bearing part. The
 model never enlarges anything itself: the picture is upscaled to the output
-size first, and the restorer works at that size from the start. Both the
-autoencoder and the vision tower have to see **the same pixels**, so the
-resample happens once, upstream of the fork.
+size first, and the restorer works at that size from the start. The
+autoencoder and the vision tower have to see **the same pixels**, and so does
+the colour fix at the end (below), so the resample happens once, upstream of
+the fork.
 
 Use `"algorithm": "bicubic"` there. The reference upscales with Pillow's
 bicubic, and the pixels are the entire conditioning signal — a different filter
@@ -106,8 +108,39 @@ A mismatch is reported at debug level and the latent wins.
 | `tile_overlap` | vosr-model-config | Overlap between tiles, in output pixels. Default 32, raised to an eighth of the tile when smaller. |
 | `steps` | generate-image | Defaults to **1** here. The checkpoint is distilled to one step and gains nothing from more. |
 | `seed` | generate-image | The noise field. One step still starts from noise. |
+| `color_fix` | vosr-model-config | `wavelet` (default), `adain` or `none` — the colour correction below. |
 | `encoder_dir` | diffusion-conditioner | Where DINOv2 is, if it is not `facebook/dinov2-large` in the models DB. |
 | `unload_when_idle` | diffusion-conditioner | `park` hands the tower's pages back between pictures. |
+
+### Colour, as the release corrects it
+
+The release's script does not hand back the decode as it is: it corrects
+the restored picture's colour against the upscaled picture it restored
+(its `--align_method`), and by default it does so with what it calls a
+**wavelet** fix — the restored picture keeps its own detail and takes its
+low frequencies from the input, a Gaussian blur at sigma 5:
+
+```
+out = clamp(blur(input) + restored − blur(restored))
+```
+
+vpipe does the same, by default, in `vae-decode`: `generate-image` asks for
+it on every latent, and `vae-decode` runs it against the picture on its
+`color_reference` input — the same resampled pixels, which the shipped graph
+wires there. `color_fix` on `vosr-model-config` picks `adain` instead (each
+channel's mean and spread moved to the input's) or `none` (the script's
+`nofix`).
+
+A graph that leaves `vae-decode`'s `color_reference` unwired gets the
+decode uncorrected, and the log says so once. The pictures pair with the
+latents **in order, one each**, so feed that input the same stream of
+pictures the restorer saw.
+
+The blur is OpenCV's: 41 taps at sigma 5 and mirrored edges, as the
+script's `cv2.GaussianBlur` uses. One difference remains: the script
+corrects its 8-bit picture and truncates the result to 8 bits again;
+vpipe corrects the decode before it is rounded, and rounds once. So
+vpipe's output reads about half a level brighter on average.
 
 ### Tiling, and why it is the default
 
@@ -157,6 +190,16 @@ invents plausible detail rather than the exact detail that was lost, which
 costs a little PSNR and buys a great deal of apparent resolution. PSNR is here
 as a sanity bound — a broken port lands ten decibels lower — not as a quality
 score.
+
+## Which checkpoint
+
+Only `VOSR2/`, the folder the catalogue fetches. The same repository also
+publishes the April release's checkpoints (`VOSR_0.5B_*` and
+`VOSR_1.4B_*`). Each is refused by name if pointed at: the 0.5B models use
+another autoencoder, `VOSR_1.4B_ms` is the multi-step model, and
+`VOSR_1.4B_os` is distilled differently. The two 1.4B ones have VOSR 2.0's
+tensor shapes, so their `args.json` is the only thing that tells them
+apart.
 
 ## What is inside
 

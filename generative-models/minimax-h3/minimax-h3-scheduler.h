@@ -119,6 +119,16 @@ class MiniMaxH3Scheduler {
   static std::vector<double> refine_sigmas(int steps, double start = -1.0,
                                            double shift = 6.0);
 
+  // The last `steps` steps of a RAW grid (1 -> 0, as a flow-map adapter
+  // states it) pushed through `shift` -- set_sigmas()'s float32 points,
+  // the terminal 0 included, widened to double for set_sigmas_as_run().
+  // Open-H3-Regenerate-2K-IC's samplers: up3 / up4 the last 3 / 4 steps
+  // of HyperFlow's 8 at shift 12, hf8 all of them. The whole grid when
+  // `steps` reaches its length; empty for steps < 1 or a grid
+  // set_sigmas() refuses.
+  static std::vector<double> grid_tail(const std::vector<float>& raw,
+                                       double shift, int steps);
+
   // The plain Euler step a loop over Python-float sigmas takes:
   //
   //   x += float(sigma[i] - sigma[i+1]) * v

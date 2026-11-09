@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <chrono>
@@ -75,6 +76,68 @@ const char* kShipped = R"({
   "ae_type": "qwen", "dinov2_size": 448, "enc_type": "dinov2l",
   "enc_dim": 1024, "layer_dinov2b_list": [17], "encdim_ratio": 3,
   "auxiliary_time_cond": false, "distill_type": "onestep"
+})";
+
+// The same repo's VOSR 1 checkpoints at 1.4B, their args.json VERBATIM
+// (CSWRY/VOSR, VOSR_1.4B_ms/ and VOSR_1.4B_os/). Their tensors are
+// VOSR 2.0's shapes -- the multi-step file is even the same size -- so
+// the config is all that tells them apart.
+const char* kVosr1Ms = R"({
+    "resolution": 512,
+    "patch_size": 2,
+    "mlp_ratio": 4,
+    "use_qknorm": true,
+    "use_swiglu": true,
+    "use_rope": true,
+    "use_rmsnorm": true,
+    "wo_shift": false,
+    "dim": 1536,
+    "depth": 36,
+    "num_heads": 24,
+    "ae_type": "qwen",
+    "ae_path": "preset/ckpts/Qwen-Image-vae-2d",
+    "time_dist": ["uniform", 0, 1.0],
+    "cfg_ratio": 0.1,
+    "cfg_scale": 2.0,
+    "dinov2_size": 448,
+    "enc_type": "dinov2l",
+    "enc_dim": 1024,
+    "layer_dinov2b_list": [17],
+    "interp_type": "lin",
+    "encdim_ratio": 3,
+    "weak_cond_strength_aelq_list": [0.05, 0.25],
+    "cond_strength_aelq_list": [5, 1]
+})";
+
+const char* kVosr1Os = R"({
+    "resolution": 512,
+    "patch_size": 2,
+    "mlp_ratio": 4,
+    "use_qknorm": true,
+    "use_swiglu": true,
+    "use_rope": true,
+    "use_rmsnorm": true,
+    "wo_shift": false,
+    "dim": 1536,
+    "depth": 36,
+    "num_heads": 24,
+    "ae_type": "qwen",
+    "ae_path": "preset/ckpts/Qwen-Image-vae-2d",
+    "time_dist": ["uniform", 0, 1.0],
+    "cfg_ratio": 0.1,
+    "cfg_scale": 0.5,
+    "dinov2_size": 448,
+    "enc_type": "dinov2l",
+    "enc_dim": 1024,
+    "layer_dinov2b_list": [17],
+    "interp_type": "lin",
+    "encdim_ratio": 3,
+    "weak_cond_strength_aelq_list": [0.05, 0.25],
+    "weak_cond_strength_aelq": 0.1,
+    "cond_strength_aelq_list": [5, 1],
+    "t_start": 0,
+    "t_end": 1,
+    "distill_type": "rcgm"
 })";
 
 bool
@@ -203,6 +266,33 @@ TEST(vosr, the_variants_this_tree_does_not_implement_are_refused)
         genai::MetalVosrTransformer::read_config(c.root.string(), &cfg, &why);
     EXPECT_FALSE(ok);
     EXPECT_FALSE(why.empty());
+  }
+}
+
+// The published VOSR 1 checkpoints that share VOSR 2.0's shapes, as
+// published: the multi-step one says nothing about distillation, and
+// reading that silence as "one step" ran it as VOSR 2.0.
+TEST(vosr, the_release_s_vosr_1_checkpoints_are_refused)
+{
+  struct Case { const char* tag; const char* body; const char* names; };
+  const Case cases[] = {
+      {"v1ms", kVosr1Ms, "multi-step"},
+      {"v1os", kVosr1Os, "rcgm"},
+  };
+  for (const Case& cs : cases) {
+    Ckpt c(cs.tag);
+    c.args(cs.body);
+    genai::MetalVosrTransformer::Config cfg;
+    std::string why;
+    const bool ok =
+        genai::MetalVosrTransformer::read_config(c.root.string(), &cfg, &why);
+    EXPECT_FALSE(ok);
+    // Refused for the RIGHT reason, said in words a user can act on.
+    EXPECT_TRUE(why.find(cs.names) != std::string::npos);
+    if (why.find(cs.names) == std::string::npos) {
+      std::fprintf(stderr, "[vosr] %s refused as: %s\n", cs.tag,
+                   why.c_str());
+    }
   }
 }
 

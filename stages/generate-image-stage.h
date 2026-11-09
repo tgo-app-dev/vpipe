@@ -568,6 +568,10 @@ private:
   int _tile_size = 0;
   bool _tile_size_set = false;
   int _tile_overlap = 32;
+  // The colour fix the release applies to the restored picture
+  // (vosr-model-config `color_fix`: wavelet, adain or none), announced on
+  // each latent for vae-decode to run against the picture.
+  std::string _vosr_color_fix = "wavelet";
   bool        _boogu_stream   = false;
   bool load_boogu_dit_();
   bool load_vosr_dit_();

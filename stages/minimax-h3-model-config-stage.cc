@@ -51,7 +51,8 @@ const ConfigKey kAttrs[] = {
           "to, in (0, 1]. Default (-1): the release's own grid for the "
           "step count -- 3 steps run 0.909375, 0.857, 0.667; 2 run 0.7, "
           "0.494. Lower keeps more of the input; the steps after it follow "
-          "`refine_shift`",
+          "`refine_shift`. Not used under a flow-map adapter, whose own "
+          "grid's last `steps` the refine runs",
    .def_real = -1.0},
   {.key = "refine_shift", .type = ConfigType::Real, .required = false,
    .doc = "a REFINE only: the shift its steps follow from "

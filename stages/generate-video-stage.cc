@@ -642,10 +642,14 @@ const PortSpec kIports[] = {
           "one. The clip is put back to the refine's first sigma and "
           "denoised again over its own geometry (the latent's, not this "
           "stage's width / height), conditioned on the prompt and on an "
-          "encoded silence; keyframe and reference inputs are ignored. "
-          "The schedule is the model config's `refine_start_sigma` / "
-          "`refine_shift` over this stage's `steps` -- 3 is the "
-          "release's. Wire the release's merged LoRA on the model config",
+          "encoded silence; keyframe inputs are ignored. REFERENCES are "
+          "kept, held clean ahead of it -- an in-context refine "
+          "(Open-H3-Regenerate-2K-IC: the draft as <Video 1> on the "
+          "Ref2VA weights). The schedule is the model config's "
+          "`refine_start_sigma` / `refine_shift` over this stage's `steps` "
+          "-- 3 is the release's -- or, under a flow-map adapter "
+          "(HyperFlow), the last `steps` of its own grid. Wire the "
+          "release's adapters on the model config",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
   {.name = "guide_latent",
@@ -1457,9 +1461,37 @@ GenerateVideoStage::h3_plan_seq_() const
       (iport_edges().size() > kGuideAudioPort &&
        iport_edges()[kGuideAudioPort].v != nullptr);
   constexpr int kGuideFrames = 7, kGuideAudio = 37;
-  return (std::max(0, lf) + kCondFrames + (guided ? kGuideFrames : 0)) *
+  // A REFINE takes no keyframe frames. IN CONTEXT -- references wired
+  // beside its init latent, Open-H3-Regenerate-2K-IC -- it books that
+  // recipe's reference: the draft as a clip at 768P (1344 x 768, the
+  // release's draft canvas and video-ref-encoder's clip cap) over the
+  // clip's latent frames, and its presentation: the clip sampled at
+  // 2 fps, merged in pairs, a 1344 x 768 cell of 1008 tokens a pair.
+  // Another draft is the runtime preflight's to book at its geometry.
+  // 2K x 22 books 33,813 rows for the 33,420 a forward ran (the prompt's
+  // 512 are generous); the release's 2K x 124 ~177k, where the canvas
+  // and two anchors alone had booked ~141k.
+  const bool refine = refines_();
+  const bool in_context = refine &&
+                          iport_edges().size() > kRefVideoRowsPort &&
+                          iport_edges()[kRefVideoRowsPort].v != nullptr;
+  int draft = 0;
+  if (in_context) {
+    constexpr int kDraftW = 1344, kDraftH = 768;
+    const int dgh = kDraftH / vc.patch / tc.patch_h;
+    const int dgw = kDraftW / vc.patch / tc.patch_w;
+    draft = std::max(0, lf) * dgh * dgw;
+    std::vector<int> idx;
+    std::vector<float> secs;
+    if (genai::minimax_h3::condition_frame_indices(
+            std::max(1, f), genai::minimax_h3::kFps, 2.0, 2, &idx, &secs)) {
+      draft += ((int)idx.size() + 1) / 2 * (kDraftW / 32) * (kDraftH / 32);
+    }
+  }
+  return (std::max(0, lf) + (refine ? 0 : kCondFrames) +
+          (guided ? kGuideFrames : 0)) *
              gh * gw +
-         audio + (guided ? 2 * kGuideAudio : 0) + kTextRows;
+         draft + audio + (guided ? 2 * kGuideAudio : 0) + kTextRows;
 }
 
 std::size_t
@@ -3340,6 +3372,14 @@ GenerateVideoStage::ensure_expert_(int which)
             "sigmas replace it ({} steps), two-time embedding at gate "
             "{:.4g}", this->id(), fm.version, fm.slot, fsteps,
             _h3_params.sigmas.size() - 1, fm.gate));
+      } else if (refines_()) {
+        // A refine runs the grid's TAIL, `steps` long (process()).
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- a "
+            "refine runs the last {} of its {}-step flow-map grid "
+            "(`steps`), two-time embedding at gate {:.4g}", this->id(),
+            fm.version, fm.slot, std::min(_steps, fsteps), fsteps,
+            fm.gate));
       } else {
         session()->info(fmt(
             "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- "
@@ -4549,17 +4589,22 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // an anchor is, and put back to the first sigma --
   // (1 - s0) x + s0 noise, each product rounded and then the sum, as the
   // release's f32 tensors with Python-float scalars give it. Its
-  // soundtrack is the silence, which the loop never steps.
+  // soundtrack is the silence, which the loop never steps. Both go
+  // AFTER the rows a refine in context holds clean (its references'),
+  // which lead each modality's buffer.
+  const std::size_t ncv = (std::size_t)L.num_condition_video_rows;
+  const std::size_t nca = (std::size_t)L.num_condition_audio_rows;
   if (refine != nullptr) {
-    if ((int)refine->audio_rows.size() != (int)aud.size()) {
+    const std::size_t tail = aud.size() - nca * AC;
+    if (refine->audio_rows.size() != tail) {
       session()->warn(fmt(
           "GenerateVideoStage('{}'): the refine's soundtrack has {} values "
           "where the layout packs {}; skipping", this->id(),
-          refine->audio_rows.size(), aud.size()));
+          refine->audio_rows.size(), tail));
       return false;
     }
-    std::memcpy(aud.data(), refine->audio_rows.data(),
-                aud.size() * sizeof(float));
+    std::memcpy(aud.data() + nca * AC, refine->audio_rows.data(),
+                tail * sizeof(float));
   }
   if (refine != nullptr) {
 #pragma clang fp contract(off)
@@ -4568,9 +4613,18 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     const int gh0 = lh / c.patch_h, gw0 = lw / c.patch_w;
     const int cells = gh0 * gw0;
     const std::size_t rplane = (std::size_t)lh * lw;
+    if (ncv + (std::size_t)lt * cells != (std::size_t)vrows) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the layout packs {} video rows where "
+          "a refine of [{}, {}, {}] after {} held rows needs {}; skipping",
+          this->id(), vrows, lt, lh, lw, ncv,
+          ncv + (std::size_t)lt * cells));
+      return false;
+    }
     for (int t = 0; t < lt; ++t) {
       for (int cell = 0; cell < cells; ++cell) {
-        float* row = vid.data() + ((std::size_t)t * cells + cell) * PE;
+        float* row =
+            vid.data() + (ncv + (std::size_t)t * cells + cell) * PE;
         const int by = (cell / gw0) * c.patch_h;
         const int bx = (cell % gw0) * c.patch_w;
         for (int ch = 0; ch < c.video_channels; ++ch) {
@@ -5735,11 +5789,43 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       }
       // The model config's sigmas, when it names them, ARE a refine's:
       // the video's as run, the first the level it is re-noised to.
-      refine.sigmas = !_h3_params.sigmas.empty()
-          ? _h3_params.sigmas
-          : genai::MiniMaxH3Scheduler::refine_sigmas(
-                _steps, _h3_params.refine_start_sigma,
-                _h3_params.refine_shift);
+      // Else, under a live FLOW-MAP adapter, the last `steps` steps of
+      // its own grid at the video shift -- Open-H3-Regenerate-2K-IC's
+      // up3 / up4 (3 / 4 steps of HyperFlow's 8, from sigma 0.835 /
+      // 0.923), and hf8 all eight from 1, where the re-noise below is the
+      // noise alone. Else the base release's rule.
+      const genai::MetalMiniMaxH3Transformer::FlowMap* fmap =
+          _h3_dit && _h3_dit->two_time_active() ? _h3_dit->flow_map()
+                                                : nullptr;
+      std::string sig_from = "the refine's rule";
+      if (!_h3_params.sigmas.empty()) {
+        refine.sigmas = _h3_params.sigmas;
+        sig_from = "the model config's sigmas";
+      } else if (fmap != nullptr && fmap->sigmas.size() >= 2) {
+        const int fsteps = (int)fmap->sigmas.size() - 1;
+        refine.sigmas = genai::MiniMaxH3Scheduler::grid_tail(
+            fmap->sigmas, _h3_params.video_shift, _steps);
+        sig_from = fmt("the last {} of the flow map's {} steps at shift "
+                       "{:.4g}", std::min(_steps, fsteps), fsteps,
+                       _h3_params.video_shift)();
+        if (_steps > fsteps) {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): `steps: {}` under the flow-map "
+              "adapter, whose grid has {}; the refine runs all {}, from "
+              "pure noise", this->id(), _steps, fsteps, fsteps));
+        }
+        if (_h3_params.refine_start_sigma >= 0.0) {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): refine_start_sigma {:.4g} is not "
+              "used under the flow-map adapter -- the refine starts at "
+              "its grid point `steps` from the end", this->id(),
+              _h3_params.refine_start_sigma));
+        }
+      } else {
+        refine.sigmas = genai::MiniMaxH3Scheduler::refine_sigmas(
+            _steps, _h3_params.refine_start_sigma,
+            _h3_params.refine_shift);
+      }
       int salat = 0;
       if (refine.frames <= 0 || refine.sigmas.size() < 2 ||
           !h3_silence_rows_(refine.frames, rfps, &refine.audio_rows,
@@ -5750,17 +5836,28 @@ GenerateVideoStage::process(RuntimeContext& ctx)
             _steps));
         co_return;
       }
-      if (refp != nullptr || have_r2v) {
+      if (refp != nullptr) {
         session()->warn(fmt(
-            "GenerateVideoStage('{}'): a refine re-noises the init latent "
-            "over the text-to-video layout; the keyframe / reference "
-            "inputs are IGNORED", this->id()));
+            "GenerateVideoStage('{}'): a refine re-noises the init latent; "
+            "the keyframe inputs are IGNORED (its layout has no keyframe "
+            "slot)", this->id()));
         refp = nullptr;
         ref_frames = 0;
         last_only = false;
-        have_r2v = false;
       }
-      if (_h3_partition == "ref2va" && !_refine_ref2va_said) {
+      // REFERENCES stay: a refine IN CONTEXT -- Open-H3-Regenerate-2K-
+      // IC's, the draft a clean reference video ahead of the clip
+      // regenerated from it, on the reference layout.
+      if (have_r2v && !r2v.refs.empty() && !_refine_in_context_said) {
+        _refine_in_context_said = true;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): a refine IN CONTEXT -- {} "
+            "reference{} held clean ahead of the re-noised clip, on the "
+            "reference layout (Open-H3-Regenerate-2K-IC: the draft as "
+            "<Video 1>)", this->id(), r2v.refs.size(),
+            r2v.refs.size() == 1 ? "" : "s"));
+      }
+      if (_h3_partition == "ref2va" && !have_r2v && !_refine_ref2va_said) {
         _refine_ref2va_said = true;
         session()->warn(fmt(
             "GenerateVideoStage('{}'): refining with the Ref2VA weights. "
@@ -5774,10 +5871,11 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       }
       session()->info(fmt(
           "GenerateVideoStage('{}'): REFINE of [{}, {}, {}, {}] ({} frames "
-          "at {:.3g} fps) -- {} steps over sigmas [{}], the audio an "
-          "encoded silence of {} latents held clean", this->id(),
+          "at {:.3g} fps) -- {} steps over sigmas [{}] ({}){}, the audio "
+          "an encoded silence of {} latents held clean", this->id(),
           hc.video_channels, refine.lt, refine.lh, refine.lw, refine.frames,
-          rfps, refine.sigmas.size() - 1, grid, salat));
+          rfps, refine.sigmas.size() - 1, grid, sig_from,
+          fmap != nullptr ? ", each step its flow-map jump" : "", salat));
       rp = &refine;
     }
     const int tm_slot = rp != nullptr ? -1 : taomate_slot_();

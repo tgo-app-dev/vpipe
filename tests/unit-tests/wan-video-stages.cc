@@ -65,6 +65,9 @@ public:
   int w = 64;
   int h = 32;
   double fps = 24.0;
+  // > 0: state the rate as a FRAME does (video-to-rgb, temporal-resample)
+  // -- `fps_num` / `fps_den` and no `fps`.
+  int rate_num = 0, rate_den = 0;
   // What vae-decode carries onto a decoded frame when a model made it.
   string model_name;
   // 3 = RGB (the ramp below), 4 = RGBA at `rgba` -- a constant frame, so
@@ -108,7 +111,14 @@ public:
       FlexData sb = FlexData::make_object();
       sb.as_object().insert_or_assign("frame", FlexData::make_int(i));
       sb.as_object().insert_or_assign("frames", FlexData::make_int(count));
-      sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+      if (rate_num > 0) {
+        sb.as_object().insert_or_assign(
+            "fps_num", FlexData::make_uint((std::uint64_t)rate_num));
+        sb.as_object().insert_or_assign(
+            "fps_den", FlexData::make_uint((std::uint64_t)rate_den));
+      } else {
+        sb.as_object().insert_or_assign("fps", FlexData::make_real(fps));
+      }
       b->sideband = std::move(sb);
       provenance::set_model_name(b->sideband, model_name);
       co_await ctx.write(0, std::move(b));
@@ -387,6 +397,41 @@ TEST(rgb_to_video, header_then_one_frame_each)
   const double got = (double)sink->rate_num / (double)sink->rate_den;
   EXPECT_TRUE(got > 23.99 && got < 24.01);
   EXPECT_TRUE(cvt->frames_emitted() == 5u);
+}
+
+// A FRAME stream states its rate as the rational `fps_num` / `fps_den`
+// (video-to-rgb, temporal-resample), not a clip's `fps` -- and the header
+// takes it exactly, 30000/1001 as 30000/1001. Read only `fps`, every
+// frame stream was encoded at the config's 16: a 24 -> 60 fps resample
+// came out a 16 fps file 3.75x too long.
+TEST(rgb_to_video, a_frame_stream_s_rational_rate_reaches_the_header)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RgbSource>(&sess, "src", vector<InEdge>{},
+                                      FlexData::make_object());
+  src_u->count = 3;
+  src_u->rate_num = 60000;
+  src_u->rate_den = 1001;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RgbSource*>(pl->insert_stage(std::move(src_u)));
+  auto cvt_u = make_unique<RgbToVideoStage>(&sess, "cvt",
+                                            vector<InEdge>{{src, 0}},
+                                            FlexData::make_object());
+  auto* cvt = static_cast<RgbToVideoStage*>(
+      pl->insert_stage(std::move(cvt_u)));
+  auto sink_u = make_unique<VideoSink>(&sess, "sink",
+                                       vector<InEdge>{{cvt, 0}},
+                                       FlexData::make_object());
+  auto* sink = static_cast<VideoSink*>(pl->insert_stage(std::move(sink_u)));
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+  EXPECT_TRUE(sink->headers == 1 && sink->frames == 3);
+  std::printf("[rgb_to_video] a frame stream at 60000/1001 -> header "
+              "%d/%d\n", sink->rate_num, sink->rate_den);
+  EXPECT_TRUE(sink->rate_num == 60000 && sink->rate_den == 1001);
 }
 
 // An RGBA frame is COMPOSITED OVER WHITE, not truncated. No video pixel
@@ -1773,6 +1818,70 @@ TEST(video_ref_encoder, present_and_image_are_read_off_the_sideband)
   std::printf("[video_ref_encoder] present / image: read off any beat; a "
               "carried latent with no pixels is the DiT's alone, attached "
               "or refused\n");
+}
+
+// A port named in `attach_latent` reads its beat as an ENCODED latent
+// whatever the sideband says -- vae-encode's clip latent says nothing of
+// the kind -- and the latent then attaches to the reference before it
+// (the route the stage takes: `attach` is set for such a port). Unnamed,
+// the same f32 [z, frames, h, w] reads as pixels, and a float clip is
+// refused. A soundtrack-shaped beat is a soundtrack latent either way.
+// The key's values are reference iport numbers, as attach_audio's are.
+TEST(video_ref_encoder, a_port_in_attach_latent_reads_as_a_latent)
+{
+  namespace h3 = vpipe::genai::minimax_h3;
+  using Route = VideoRefEncoderStage::CarriedLatent;
+  TensorBeatPayload tb;
+  tb.dtype = TensorBeat::DType::F32;
+  tb.shape = {24, 7, 48, 84};
+  tb.resize_contiguous((std::size_t)24 * 7 * 48 * 84);
+  tb.sideband = FlexData::make_object();
+  tb.sideband.as_object().insert_or_assign("anchors",
+                                           FlexData::make_string("clip"));
+  h3::MediaReference m;
+  std::string err;
+  EXPECT_FALSE(VideoRefEncoderStage::media_from_beat(tb, 2, &m, &err));
+  m = h3::MediaReference{};
+  err.clear();
+  ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(tb, 2, &m, &err, true));
+  EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kVideo);
+  EXPECT_TRUE(m.has_video_latent() && m.rgb.empty() && m.presented);
+  EXPECT_TRUE(m.latent_z == 24 && m.latent_frames == 7 &&
+              m.latent_height == 48 && m.latent_width == 84);
+  EXPECT_TRUE(m.video_latent.size() == (std::size_t)24 * 7 * 48 * 84);
+  EXPECT_TRUE(VideoRefEncoderStage::carried_latent_route(m, true) ==
+              Route::kAttach);
+  {
+    TensorBeatPayload a;
+    a.dtype = TensorBeat::DType::F32;
+    a.shape = {2, 32, 10};
+    a.resize_contiguous(2 * 32 * 10);
+    m = h3::MediaReference{};
+    ASSERT_TRUE(VideoRefEncoderStage::media_from_beat(a, 2, &m, &err, true));
+    EXPECT_TRUE(m.kind == h3::MediaReference::Kind::kAudio &&
+                m.has_audio_latent());
+  }
+  Session sess;
+  auto cfg = [](FlexData v) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert_or_assign("attach_latent", std::move(v));
+    return c;
+  };
+  {
+    FlexData a = FlexData::make_array();
+    a.as_array().push_back(FlexData::make_int(2));
+    VideoRefEncoderStage s(&sess, "a", vector<InEdge>{}, cfg(a));
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  {
+    FlexData a = FlexData::make_array();
+    a.as_array().push_back(FlexData::make_int(7));
+    VideoRefEncoderStage s(&sess, "b", vector<InEdge>{}, cfg(a));
+    EXPECT_TRUE(s.config_error().find("attach_latent") !=
+                std::string::npos);
+  }
+  std::printf("[video_ref_encoder] attach_latent: the port's beat is a "
+              "latent that attaches; unnamed, a float clip is refused\n");
 }
 
 TEST(video_ref_encoder, references_may_be_empty_but_must_be_paths)

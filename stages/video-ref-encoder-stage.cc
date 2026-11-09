@@ -208,6 +208,17 @@ const ConfigKey kAttrs[] = {
           "both an attached soundtrack and a standalone piece of music. A "
           "beat's own `attach` sideband overrides this for that beat",
    .def_str = ""},
+  {.key = "attach_latent", .type = ConfigType::Array, .required = false,
+   .doc = "reference iport numbers (1..6) whose beat is an ALREADY-ENCODED "
+          "video latent -- f32 [z, frames, h, w], e.g. vae-encode's latent "
+          "of the very clip the port before it carries -- that folds onto "
+          "the reference before it: its rows replace that reference's VAE "
+          "encode, while the pixels still feed the conditioner. The same "
+          "as the beat saying `latent: true` and `attach: true`, for a "
+          "producer that does not say so. Open-H3-Regenerate-2K-IC "
+          "encodes its draft ONCE this way: one latent is both the "
+          "reference the DiT holds clean and the upscaler's input",
+   .def_str = ""},
   {.key = "whole_references", .type = ConfigType::Array, .required = false,
    .doc = "references kept WHOLE, by their number in the request (1..12: "
           "the `references` list first, then the iports in order, a "
@@ -476,8 +487,10 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   _img_max_pixels   = attr_int("reference_image_max_pixels");
   {
     auto c = this->config().as_object();
-    if (c.contains("attach_audio")) {
-      FlexData v = c.at("attach_audio");
+    // A list of reference iport numbers, 1..kNumRefPorts.
+    auto ports = [&](const char* key, std::vector<int>* out) {
+      if (!c.contains(key)) { return; }
+      FlexData v = c.at(key);
       if (v.is_array()) {
         auto arr = v.as_array();
         for (std::size_t i = 0; i < arr.size(); ++i) {
@@ -486,21 +499,23 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
                             : e.is_uint() ? (long long)e.as_uint(0) : -1;
           if (n < 1 || n > (long long)kNumRefPorts) {
             fail_config(fmt(
-                "VideoRefEncoderStage('{}'): attach_audio[{}] is {}; it must "
-                "be a reference iport number, 1..{}", this->id(), i,
+                "VideoRefEncoderStage('{}'): {}[{}] is {}; it must be a "
+                "reference iport number, 1..{}", this->id(), key, i,
                 e.is_int() || e.is_uint() ? std::to_string(n)
                                           : std::string("not a number"),
                 kNumRefPorts));
             break;
           }
-          _attach_audio.push_back((int)n);
+          out->push_back((int)n);
         }
       } else if (!v.is_null()) {
         fail_config(fmt(
-            "VideoRefEncoderStage('{}'): attach_audio must be an array of "
-            "reference iport numbers", this->id()));
+            "VideoRefEncoderStage('{}'): {} must be an array of reference "
+            "iport numbers", this->id(), key));
       }
-    }
+    };
+    ports("attach_audio", &_attach_audio);
+    ports("attach_latent", &_attach_latent);
     if (c.contains("whole_references")) {
       FlexData v = c.at("whole_references");
       if (v.is_array()) {
@@ -729,11 +744,45 @@ VideoRefEncoderStage::declare_resources() const
       }
     }
   }
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  // THE VISION TOWER'S WORK over one reference CLIP: the clip at this
+  // stage's canvas cap (`reference_video_max_pixels`; 1344 x 768 the
+  // release's) for the generated duration, sampled at `video_sample_fps`
+  // and sized by the tower's video rule -- encode_video_scratch_bytes.
+  // Open-H3-Regenerate-2K-IC's draft is exactly that, and it is always
+  // presented. One reference at a time, so one is booked; wherever a
+  // clip can arrive (a reference port wired, or a `references` list).
+  // A picture's presentation, at the 2048 short edge, is not.
+  bool can_clip = !_references.empty();
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    can_clip = can_clip ||
+               (iport_edges().size() > p && iport_edges()[p].v != nullptr);
+  }
+  if (can_clip && !genai::ph3::is_root(root)) {
+    genai::MiniMaxH3TextEncoder::Config ec;
+    std::vector<int> idx;
+    std::vector<float> secs;
+    if (genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr) &&
+        h3::condition_frame_indices(h3::align_num_frames(_frames, 17, 5),
+                                    h3::kFps, _video_sample_fps,
+                                    ec.vision.temporal_patch, &idx, &secs)) {
+      const double s =
+          std::sqrt((double)std::max<std::int64_t>(_vid_max_pixels, 1) /
+                    (1344.0 * 768.0));
+      const std::size_t vb =
+          genai::MetalQwenVisionEncoder::encode_video_scratch_bytes(
+              ec.vision, (int)idx.size(), (int)std::lround(768.0 * s),
+              (int)std::lround(1344.0 * s));
+      for (auto& c : model_memory::scratch_claims(
+               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
   // P-H3-Image's connector beside the encoder (f32, held whole), phased
   // and released with it -- and the tower's work: it reads its own copy
   // of each picture at about the manifest's vision_pixels (at most 1.2x:
   // size_at_area keeps a gridded picture within 20%), one at a time.
-  const std::string root = resolve_model_dir(session(), _hf_dir);
   if (const std::string cd = genai::ph3::connector_dir(root); !cd.empty()) {
     for (auto& c : model_memory::weight_claims({cd})) {
       out.push_back(std::move(c));
@@ -1306,7 +1355,7 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
 bool
 VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
                                       h3::MediaReference* out,
-                                      std::string* err)
+                                      std::string* err, bool latent)
 {
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = "reference iport " + std::to_string(n) +
@@ -1342,6 +1391,7 @@ VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
   // tensor comes from.
   bool is_latent = false;
   sideband_bool_(tb.sideband, "latent", &is_latent);
+  is_latent = is_latent || latent;
   // Presented to the conditioner, or the DiT's alone (MediaReference::
   // presented); any reference may say so.
   sideband_bool_(tb.sideband, "present", &out->presented);
@@ -1832,9 +1882,13 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
       port_said_none = true;
       continue;
     }
+    const int refno = (int)(p - kFirstRefPort + 1);
+    const bool as_latent =
+        std::find(_attach_latent.begin(), _attach_latent.end(), refno) !=
+        _attach_latent.end();
     h3::MediaReference m;
     std::string merr;
-    if (!media_from_beat(*tb, (int)(p - kFirstRefPort + 1), &m, &merr)) {
+    if (!media_from_beat(*tb, refno, &m, &merr, as_latent)) {
       session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
                           this->id(), merr));
       co_return;
@@ -1854,8 +1908,8 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     // The stage's config decides it, so the switch is reachable from the
     // stage whose behaviour it is; a beat may still override for itself,
     // which is how a producer that knows better than the graph says so.
-    const int refno = (int)(p - kFirstRefPort + 1);
-    bool attach = std::find(_attach_audio.begin(), _attach_audio.end(),
+    bool attach = as_latent ||
+                  std::find(_attach_audio.begin(), _attach_audio.end(),
                             refno) != _attach_audio.end();
     {
       bool said = false;
