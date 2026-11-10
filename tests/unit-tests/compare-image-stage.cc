@@ -12,12 +12,17 @@
 #include "common/compare-image-channel.h"
 #include "common/job.h"
 #include "common/session.h"
+#include "generative-models/generative-model-manager.h"
+#include "interfaces/session-services-intf.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/audio-video/compare-image-stage.h"
 
+#include <malloc/malloc.h>
+
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -505,3 +510,150 @@ TEST(compare_image_stage, rgba_is_accepted_and_alpha_is_visible)
   // pattern and the opaque one does not.
   EXPECT_TRUE(*s.a != *s.b);
 }
+
+// NOTHING IS ENCODED UNTIL A READER ASKS. A publish owes the pair's
+// PNGs; the first snapshot renders each side once, at the common size;
+// a republish keeps a side whose picture and common size are the last
+// publish's, and owes afresh a new picture or a new size. Before, the
+// stage encoded both sides at full size on the pipeline's thread at
+// every publish -- and again for the side that had not changed --
+// whether or not any view was watching, and kept the encoder, its frame
+// and its packet for the run (250 MiB at 42 MP).
+TEST(compare_image_stage, a_pair_is_encoded_when_a_reader_asks)
+{
+  CompareImageChannel ch;
+  int renders = 0;
+  auto render = make_shared<const CompareImageChannel::Render>(
+      [&renders](const CompareImageChannel::Picture& p, int w, int h) {
+        ++renders;
+        return make_shared<const vector<uint8_t>>(vector<uint8_t>{
+            (uint8_t)p.width, (uint8_t)w, (uint8_t)h});
+      });
+  auto pic = [](int w, int h) {
+    return CompareImageChannel::Picture{
+        make_shared<const vector<uint8_t>>((size_t)w * h * 3, 7), w, h};
+  };
+  const auto a = pic(8, 6);
+  ch.publish_pictures(a, pic(4, 3), 8, 6, render);
+  EXPECT_TRUE(renders == 0);
+  auto s = ch.snapshot();
+  EXPECT_TRUE(renders == 2 && s.version == 1 && s.a && s.b);
+  if (!s.a || !s.b) { return; }
+  // Each side rendered at the COMMON size, from its own picture.
+  EXPECT_TRUE((*s.a)[0] == 8 && (*s.b)[0] == 4 && (*s.b)[1] == 8 &&
+              (*s.b)[2] == 6);
+  ch.snapshot();
+  EXPECT_TRUE(renders == 2);                   // once, not per reader
+  // B changes, A does not: A keeps its PNG.
+  ch.publish_pictures(a, pic(4, 3), 8, 6, render);
+  s = ch.snapshot();
+  EXPECT_TRUE(renders == 3 && s.version == 2 && s.a && s.b);
+  // A new common size owes both.
+  const auto a2 = pic(10, 6);
+  const auto b2 = pic(4, 3);
+  ch.publish_pictures(a2, b2, 10, 6, render);
+  s = ch.snapshot();
+  EXPECT_TRUE(renders == 5 && s.version == 3);
+  // wait_change renders what it returns, as snapshot does.
+  ch.publish_pictures(a2, pic(4, 3), 10, 6, render);
+  s = ch.wait_change(3, 1000);
+  EXPECT_TRUE(renders == 6 && s.version == 4 && s.b);
+}
+
+namespace {
+
+// u8 noise: a picture PNG cannot compress, so a render's packet and PNG
+// are as large as they can be.
+TensorBeat
+make_noise_(int H, int W, uint32_t seed)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::U8;
+  tb.shape = {3, H, W};
+  tb.resize_contiguous(static_cast<size_t>(3) * H * W);
+  uint8_t* p = tb.as_u8();
+  uint32_t x = seed;
+  for (size_t i = 0; i < static_cast<size_t>(3) * H * W; ++i) {
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    p[i] = (uint8_t)x;
+  }
+  return tb;
+}
+
+size_t
+heap_in_use_()
+{
+  malloc_statistics_t st{};
+  malloc_zone_statistics(nullptr, &st);
+  return st.size_in_use;
+}
+
+}  // namespace
+
+// THE PLAN HOLDS WHAT THE STAGE AND A VIEWER DO. The pair's pictures
+// (packed RGB24, each at its own size) are booked before they are
+// unpacked, and a viewer's render besides, at pair_bytes -- since no
+// signal says whether one will mount. A render of two incompressible
+// pictures, one padded to the other's size, grows the heap by no more
+// than that render share.
+TEST(compare_image_stage, the_plan_books_the_pair_and_a_render)
+{
+  // A small pair and a large one: FFmpeg's own share grows with the
+  // picture (0.5 MB at 1024 x 768, 3 MB at 4096 x 3072).
+  const int geo[][4] = {{1024, 768, 512, 384}, {4096, 3072, 2048, 1536}};
+  for (const auto& g : geo) {
+  const int WA = g[0], HA = g[1], WB = g[2], HB = g[3];
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto a_u = make_unique<RepeatSource>(&sess, "a", vector<InEdge>{},
+                                       FlexData::make_object());
+  a_u->tb = make_noise_(HA, WA, 1);
+  a_u->allocate_oports(1);
+  auto* a = pl->insert_stage(std::move(a_u));
+  auto b_u = make_unique<RepeatSource>(&sess, "b", vector<InEdge>{},
+                                       FlexData::make_object());
+  b_u->tb = make_noise_(HB, WB, 2);
+  b_u->allocate_oports(1);
+  auto* b = pl->insert_stage(std::move(b_u));
+  auto* cmp = static_cast<CompareImageStage*>(
+      pl->insert_stage(make_unique<CompareImageStage>(
+          &sess, "cmp", vector<InEdge>{{a, 0}, {b, 0}},
+          FlexData::make_object())));
+  auto ch = cmp->compare_channel();
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();          // both published; nothing has asked to see them
+  EXPECT_TRUE(cmp->have_a() && cmp->have_b());
+
+  const size_t booked = sess.services()->generative_model_manager()
+                            ->declared_scratch("compare-image:cmp");
+  const size_t sides = (size_t)3 * ((size_t)WA * HA + (size_t)WB * HB);
+  EXPECT_TRUE(booked ==
+              CompareImageStage::pair_bytes(WA, HA, WB, HB, WA, HA));
+
+  // A viewer asks: both sides render, B padded to A's size.
+  const size_t base = heap_in_use_();
+  atomic<bool> run{true};
+  atomic<size_t> peak{base};
+  thread sampler([&] {
+    while (run.load()) {
+      const size_t now = heap_in_use_();
+      if (now > peak.load()) { peak.store(now); }
+      this_thread::sleep_for(chrono::microseconds(20));
+    }
+  });
+  const auto s = ch->snapshot();
+  run.store(false);
+  sampler.join();
+  const size_t grew = peak.load() - base;
+  printf("[compare_image_stage] booked %zu B (pictures %zu, render %zu); "
+         "a render grew the heap %zu B, PNGs %zu + %zu B\n", booked, sides,
+         booked - sides, grew, s.a ? s.a->size() : 0,
+         s.b ? s.b->size() : 0);
+  EXPECT_TRUE(is_png_(s.a) && is_png_(s.b));
+  EXPECT_TRUE(grew >= (size_t)3 * WA * HA);        // the frame, at least
+  EXPECT_TRUE(grew <= booked - sides);
+  rt.stop();
+  }
+}
+

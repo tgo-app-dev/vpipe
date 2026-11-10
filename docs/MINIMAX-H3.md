@@ -84,6 +84,7 @@ arrives in **8–16 steps** instead of 30+.
     - [What is read off the checkpoint](#what-is-read-off-the-checkpoint)
     - [What it costs](#what-it-costs-3)
     - [Checked against the reference](#checked-against-the-reference)
+  - [Pictures through H3's VAE — the Image VAE](#pictures-through-h3s-vae--the-image-vae)
   - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
     - [Get it and run it](#get-it-and-run-it)
     - [What it saves](#what-it-saves)
@@ -243,6 +244,12 @@ you want to see the model work before spending the hours and the 115 GB.
   under PrunaAI's adapter, text-to-image at 8 megapixels and editing a
   picture with up to seven more as references, in eight steps (see
   [Pictures](#pictures--p-h3-image)).
+- **[`prepare-minimax-h3-image-vae.vpipeline`](pipelines/prepare-minimax-h3-image-vae.vpipeline)**
+  / **[`minimax-h3-image-round-trip.vpipeline`](pipelines/minimax-h3-image-round-trip.vpipeline)**
+  — fetch Mamad8's **single-frame** H3 VAE and send a picture through H3's
+  latent space and back: what a reference picture or a keyframe keeps once
+  the model has encoded it (see
+  [Pictures through H3's VAE](#pictures-through-h3s-vae--the-image-vae)).
 - **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
   / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
   — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
@@ -3516,6 +3523,81 @@ Not ported: the **prompt upsampler** (a Qwen3.5-9B that rewrites a short
 request into the long prompt the model renders best from; on by default in
 PrunaAI's pipeline) — write the full prompt yourself. And the noise is
 vpipe's own, so a seed does not reproduce a picture made elsewhere.
+
+### Pictures through H3's VAE — the Image VAE
+
+H3's video VAE encodes a picture into exactly **one latent frame**, which is
+the form a reference picture or a keyframe takes inside the model. Its
+released decoder is built for clips, so it reads that frame as a short clip
+of copies of itself and keeps one.
+[Mamad8/MiniMax-H3-Image-VAE](https://huggingface.co/Mamad8/MiniMax-H3-Image-VAE)
+is the same encoder, byte for byte, with the decoder retrained to read one
+latent frame on its own. The latent space is unchanged, so it decodes a
+one-frame latent from either partition.
+
+**It is for pictures only.** Its author reports that it decodes clips worse
+than the released decoder (ghosting along the patch grid, frames mixing), so
+keep it out of video graphs. The file says what it is in its metadata, and
+vae-decode reads it as a picture decoder because of that.
+
+[`prepare-minimax-h3-image-vae.vpipeline`](pipelines/prepare-minimax-h3-image-vae.vpipeline)
+fetches the one file (5.2 GB) and registers it as
+`Mamad8/MiniMax-H3-Image-VAE`.
+[`minimax-h3-image-round-trip.vpipeline`](pipelines/minimax-h3-image-round-trip.vpipeline)
+then encodes a picture and decodes it again:
+
+```
+load-image → image-resample (crop_to_grid, 16) → vae-encode → vae-decode → save-image
+                                                                         → compare-image
+```
+
+```sh
+cd ~/vpipe-work                                    # the SAME work directory
+vpipe --launch ~/src/vpipe/docs/pipelines/prepare-minimax-h3-image-vae.vpipeline
+vpipe --launch ~/src/vpipe/docs/pipelines/minimax-h3-image-round-trip.vpipeline \
+      --stage-cfg load-image::url=photo.jpg \
+      --stage-cfg save-image::path=photo-h3.png
+```
+
+H3 wants both sides on a multiple of 16, so image-resample cuts the picture
+down to that grid (1150 × 770 comes back 1136 × 768). It also shrinks a
+picture over `max_pixels`, 4 megapixels in the graph. Both VAE stages take
+the model from one `model-select`. Point it at your H3 checkout instead and
+the same graph runs the released decoder, for comparison.
+
+What it costs and keeps, measured on an M4 Pro with the checkpoint on an
+external Thunderbolt drive, loading included:
+
+| | the Image VAE | the released decoder |
+|---|---|---|
+| 1024 × 1024 photo, whole graph | **12 s** | 34 s |
+| PSNR against the picture | **34.9 dB** | 32.3 dB |
+| mean colour shift | under 0.5 levels | 3 levels darker, every channel |
+| 2048 × 2048, whole graph | 53 s | — |
+| peak memory | 5.5–5.6 GB | 5.1 GB |
+
+The decoder works in overlapping 256-pixel tiles, so its time grows with the
+area: 25 tiles at 1024², 121 at 2048². Nothing in it limits the size: the
+picture comes back at the size it went in. Its author trained it on 256- and
+384-pixel crops, reports 30.4 dB over a 512-pixel test set and checked it up
+to about 3 megapixels. The graph's 4-megapixel cap is the graph's choice, and
+raising `max_pixels` works. One camera photo, scaled down to 2 and 8
+megapixels, measured against the released decoder on the same picture:
+
+| | the Image VAE | the released decoder |
+|---|---|---|
+| 1152 × 1728 (2 MP) | 30.9 dB, 24 s | 28.9 dB, 72 s |
+| 2304 × 3456 (8 MP) | 35.8 dB, 97 s | 33.4 dB, 275 s |
+| 4480 × 6720 (30 MP) | 37.5 dB, 6 min, 805 tiles | — |
+| 5296 × 7952 (42 MP) | 37.0 dB, 8.6 min, 1176 tiles | — |
+
+The higher figure at 8 MP is the picture, not the model: the same photo has
+less detail per pixel at the larger size, and both decoders gain the same
+amount. Up to 42 MP no seam between its tiles is visible; measured, the
+error along the tiles' blend edges is 1.1 to 1.3 times the error elsewhere,
+about what the released decoder shows. Memory grows slowly with the
+picture: the 42 MP round trip peaks at 6.1 GB, of which the checkpoint is
+5.2 GB. As its author warns, it softens hair and fine texture.
 
 ### Faster attention — the VDN linear branch
 

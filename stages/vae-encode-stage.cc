@@ -23,8 +23,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -438,6 +440,7 @@ VaeEncodeStage::reset_run_state()
   // run's selection.
   _model_latched = false;
   _batch = false;
+  _scratch_stated = 0;
 }
 std::string
 VaeEncodeStage::vae_weights_() const
@@ -500,7 +503,53 @@ VaeEncodeStage::declare_memory() const
   m.hold(vae_dir, h3 > 0 ? h3 : model_memory::dir_weights_bytes(vae_dir), 0,
          _unload_cfg == model_memory::UnloadPolicy::kDestroy,
          _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  m.scratch = _scratch_stated > 0 ? _scratch_stated : planned_scratch_();
   return m;
+}
+
+std::string
+VaeEncodeStage::scratch_label_() const
+{
+  return fmt("vae-encode:{}", this->id())();
+}
+
+// The picture is not known at launch. A letterbox target is the size it
+// will be encoded at; otherwise the graph's picture is its own, and this
+// books a 1024^2 one -- 4 channels at 2 bytes (an RGBA VAE's upload) and
+// a latent of 16 channels a cell of 8 x 8, f16 and its f32 beat -- with
+// Wan's clip at its frame count. The first beat states the real figure
+// before it allocates (revise_scratch_).
+std::size_t
+VaeEncodeStage::planned_scratch_() const
+{
+  const bool resize = _target_w > 0 && _target_h > 0;
+  const std::size_t px = resize ? (std::size_t)_target_w * _target_h
+                                : (std::size_t)1024 * 1024;
+  std::size_t frames = 1;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (!_hf_dir.empty() &&
+      builtin_vae_family(resolve_vae_dir(
+          resolve_model_dir(session(), _hf_dir))) == "wan") {
+    frames = (std::size_t)std::max(1, _frames);
+  }
+#endif
+  return frames * px * 8 + frames * px * 3 / 2;
+}
+
+void
+VaeEncodeStage::revise_scratch_(std::size_t bytes)
+{
+  if (bytes == 0 || bytes == _scratch_stated || session() == nullptr ||
+      session()->services() == nullptr) {
+    return;
+  }
+  _scratch_stated = bytes;
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(scratch_label_(), bytes);
+  }
+  StageMemory m = declare_memory();
+  m.scratch = bytes;
+  revise_memory(m);
 }
 
 // MiniMax-H3's video VAE builds each half at its first use, and this stage
@@ -545,6 +594,22 @@ std::vector<ResourceClaim>
 VaeEncodeStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
+  // The working set beside the weights, in the condition phase when the
+  // VAE is let go after every beat (as decide_resources phases the
+  // weights), else for the run.
+  std::vector<ResourceClaim> out = model_memory::scratch_claims(
+      scratch_label_(), planned_scratch_(),
+      _unload_cfg == model_memory::UnloadPolicy::kDestroy
+          ? model_memory::kPhaseCondition : std::string_view());
+  for (ResourceClaim& c : declare_weights_()) {
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+std::vector<ResourceClaim>
+VaeEncodeStage::declare_weights_() const
+{
   // The name the release and declare_memory() use, so the claim cannot
   // name something else. It differs from the plain resolver below only
   // where resolve_vae_dir() hands back the ROOT, and there a registered
@@ -986,8 +1051,43 @@ build_resample_(int srcN, int dstN)
   return c;
 }
 
+// A beat's samples where they lie, read as float: U8 0..255, F16 and
+// F32 as stored. Reading in place is what keeps an encode from holding
+// the picture twice more beside the beat -- a contiguous copy of it,
+// and an F16 picture's F32 widening (MEASURED, a 42 MP still: 121 MiB
+// and, for F16, 482 MiB).
+struct Samples {
+  const std::uint8_t* p  = nullptr;
+  TensorBeat::DType   dt = TensorBeat::DType::U8;
+
+  float
+  operator[](std::size_t i) const
+  {
+    switch (dt) {
+      case TensorBeat::DType::U8: return (float)p[i];
+      case TensorBeat::DType::F16:
+        return (float)reinterpret_cast<const _Float16*>(p)[i];
+      default: return reinterpret_cast<const float*>(p)[i];
+    }
+  }
+};
+
+// The beat's own bytes when it is contiguous; else a contiguous copy,
+// kept in `hold` for as long as the samples are read.
+Samples
+samples_of_(const TensorBeat& tb, AlignedVector<std::uint8_t>* hold)
+{
+  std::size_t n = 1;
+  for (const auto d : tb.shape) { n *= (std::size_t)std::max<int64_t>(0, d); }
+  if (tb.is_contiguous() && tb.byte_size() >= n * tb.element_byte_size()) {
+    return {static_cast<const std::uint8_t*>(tb.bytes_()), tb.dtype};
+  }
+  *hold = tb.materialize_contiguous();
+  return {hold->data(), tb.dtype};
+}
+
 // Produce a normalized f32 [-1,1] planar RGB [3,outH,outW] from the source
-// image bytes (channel-first [3,sH,sW], U8 0..255 or f32 already in [-1,1]).
+// image samples (channel-first [3,sH,sW]: U8 0..255, F16 / F32 as stored).
 // When the target differs from the source the picture is scaled to fit with its
 // original aspect ratio (anti-aliased separable resample), centered, and the
 // leftover border is filled with `pad` (per-channel, already mapped to [-1,1]).
@@ -997,10 +1097,9 @@ build_resample_(int srcN, int dstN)
 // the dtype alone does not say. See kInputRangeDoc.
 // `C` is the source AND destination channel count: 3 for RGB, 4 for an
 // RGBA beat feeding an RGBA VAE. `pad` carries C entries.
-std::vector<float> normalize_and_fit_(const std::uint8_t* src, bool is_u8,
-                                      float vscale, float voffset, int C,
-                                      int sH, int sW, int outH, int outW,
-                                      const float* pad);
+std::vector<float> normalize_and_fit_(Samples src, float vscale,
+                                      float voffset, int C, int sH, int sW,
+                                      int outH, int outW, const float* pad);
 
 // The same over a STACKED CLIP: a `[frames, 3, sH, sW]` beat -- what
 // `temporal-stack` emits -- becomes f32 `[3][frames][outH][outW]`, the
@@ -1012,18 +1111,17 @@ std::vector<float> normalize_and_fit_(const std::uint8_t* src, bool is_u8,
 // clip whose channels rotate frame to frame -- which decodes to
 // something colourful and plausible rather than to an error.
 std::vector<float>
-normalize_clip_(const std::uint8_t* src, bool is_u8, float vscale,
-                float voffset, int frames, int sH, int sW, int outH,
-                int outW, const float pad[3])
+normalize_clip_(Samples src, float vscale, float voffset, int frames, int sH,
+                int sW, int outH, int outW, const float pad[3])
 {
   std::vector<float> out((std::size_t)3 * frames * outH * outW);
-  const std::size_t in_bytes =
-      (std::size_t)3 * sH * sW * (is_u8 ? 1u : 4u);
+  const std::size_t in_bytes = (std::size_t)3 * sH * sW *
+                               TensorBeat::byte_size_of(src.dt);
   const std::size_t px = (std::size_t)outH * outW;
   for (int f = 0; f < frames; ++f) {
-    const std::vector<float> one =
-        normalize_and_fit_(src + (std::size_t)f * in_bytes, is_u8, vscale,
-                           voffset, 3, sH, sW, outH, outW, pad);
+    const std::vector<float> one = normalize_and_fit_(
+        {src.p + (std::size_t)f * in_bytes, src.dt}, vscale, voffset, 3, sH,
+        sW, outH, outW, pad);
     for (int c = 0; c < 3; ++c) {
       std::memcpy(out.data() + ((std::size_t)c * frames + f) * px,
                   one.data() + (std::size_t)c * px, px * sizeof(float));
@@ -1033,14 +1131,12 @@ normalize_clip_(const std::uint8_t* src, bool is_u8, float vscale,
 }
 
 std::vector<float>
-normalize_and_fit_(const std::uint8_t* src, bool is_u8, float vscale,
-                   float voffset, int C, int sH, int sW, int outH, int outW,
-                   const float* pad)
+normalize_and_fit_(Samples src, float vscale, float voffset, int C, int sH,
+                   int sW, int outH, int outW, const float* pad)
 {
   auto src_val = [&](int c, int y, int x) -> float {
     const std::size_t idx = ((std::size_t)c * sH + y) * sW + x;
-    const float raw = is_u8 ? (float)src[idx]
-                            : reinterpret_cast<const float*>(src)[idx];
+    const float raw = src[idx];
     return raw * vscale + voffset;
   };
   std::vector<float> out((std::size_t)C * outH * outW);
@@ -1176,6 +1272,152 @@ fit_channels_(std::vector<float> in, int srcC, int dstC, int H, int W)
   return in;
 }
 
+// A beat's picture in the VAE's [-1, 1], laid out [dst_c][frames][H][W]
+// -- what every family below uploads.
+//
+// READ STRAIGHT FROM THE BEAT when it is already the target size: the
+// caller writes each value into its device buffer as it comes (`each`).
+// Through a float vector only where one has to exist -- a letterbox
+// resample, an RGBA picture composited for an RGB VAE, or a caller that
+// needs the floats themselves (a registered family's API, `floats`).
+// Before, every encode built that vector (4 bytes a sample) and a copy
+// of the beat, and held both beside the device copy through the whole
+// encode: MEASURED on a 42 MP still, 603 MiB that the decode then
+// found still in the footprint.
+//
+// The values are the vector's to the bit: the same `raw * scale + off`
+// per sample, and the opaque alpha fit_channels_ appends is 1.0f.
+class Pixels {
+public:
+  // `src_c`: the channels a frame of the beat carries; `C`: the channels
+  // read, its first planes (an RGB VAE reads an RGBA beat's colour, as it
+  // always has); `dst_c`: what the VAE takes -- 4 from 3 adds an opaque
+  // alpha, 3 from 4 composites over white (fit_channels_).
+  Pixels(Samples s, float scale, float off, bool stacked, int frames,
+         int src_c, int C, int dst_c, int sH, int sW, int H, int W,
+         const float* pad)
+    : _s(s), _scale(scale), _off(off), _stacked(stacked), _frames(frames),
+      _src_c(src_c), _C(C), _dst_c(dst_c), _sH(sH), _sW(sW), _H(H), _W(W),
+      _pad(pad)
+  {
+  }
+
+  // Whether `each` reads the beat in place: no resample, and no channel
+  // adaptation but the opaque alpha. VPIPE_VAE_ENCODE_VIA_FLOATS=1 is
+  // the A/B: every picture through the float vector, as before (read
+  // per call, so one process can run both).
+  static bool
+  in_place(int C, int dst_c, int sH, int sW, int H, int W)
+  {
+    const char* e = std::getenv("VPIPE_VAE_ENCODE_VIA_FLOATS");
+    if (e != nullptr && e[0] == '1') { return false; }
+    return sH == H && sW == W && (dst_c == C || (C == 3 && dst_c == 4));
+  }
+  bool direct() const { return in_place(_C, _dst_c, _sH, _sW, _H, _W); }
+
+  // put(c, k, v) for every sample k of [dst_c][frames][H][W], in order;
+  // c is k's channel.
+  template <class Put>
+  void
+  each(Put&& put)
+  {
+    const std::size_t px = (std::size_t)_H * _W;
+    if (!direct()) {
+      const std::vector<float>& v = floats();
+      const std::size_t span = (std::size_t)_frames * px;
+      for (int c = 0; c < _dst_c; ++c) {
+        for (std::size_t i = 0; i < span; ++i) {
+          const std::size_t k = (std::size_t)c * span + i;
+          put(c, k, v[k]);
+        }
+      }
+      return;
+    }
+    for (int c = 0; c < _dst_c; ++c) {
+      for (int f = 0; f < _frames; ++f) {
+        const std::size_t d0 = ((std::size_t)c * _frames + f) * px;
+        if (c >= _C) {                     // fit_channels_' opaque alpha
+          for (std::size_t i = 0; i < px; ++i) { put(c, d0 + i, 1.0f); }
+          continue;
+        }
+        const std::size_t s0 = ((std::size_t)f * _src_c + c) * px;
+        switch (_s.dt) {
+          case TensorBeat::DType::U8: {
+            const std::uint8_t* q = _s.p + s0;
+            for (std::size_t i = 0; i < px; ++i) {
+              const float raw = (float)q[i];
+              put(c, d0 + i, raw * _scale + _off);
+            }
+            break;
+          }
+          case TensorBeat::DType::F16: {
+            const auto* q = reinterpret_cast<const _Float16*>(_s.p) + s0;
+            for (std::size_t i = 0; i < px; ++i) {
+              const float raw = (float)q[i];
+              put(c, d0 + i, raw * _scale + _off);
+            }
+            break;
+          }
+          default: {
+            const auto* q = reinterpret_cast<const float*>(_s.p) + s0;
+            for (std::size_t i = 0; i < px; ++i) {
+              const float raw = q[i];
+              put(c, d0 + i, raw * _scale + _off);
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // The floats themselves, [dst_c][frames][H][W], built once.
+  const std::vector<float>&
+  floats()
+  {
+    if (_built) { return _v; }
+    _built = true;
+    _v = _stacked
+             ? normalize_clip_(_s, _scale, _off, _frames, _sH, _sW, _H, _W,
+                               _pad)
+             : fit_channels_(normalize_and_fit_(_s, _scale, _off, _C, _sH,
+                                                _sW, _H, _W, _pad),
+                             _C, _dst_c, _H, _W);
+    return _v;
+  }
+
+  // The most a float vector holds while it is built -- `floats`, and
+  // `each` off the direct path -- beside the beat: the picture at 4
+  // bytes a sample, a clip's frame in turn, the resample's row pass and
+  // an RGBA picture premultiplied, a 3-to-4 widening's new vector beside
+  // its old. A bound for the plan, so it adds what may coexist.
+  static std::size_t
+  float_bytes(bool stacked, int frames, int C, int dst_c, int sH, int sW,
+              int H, int W)
+  {
+    const std::size_t px = (std::size_t)H * W;
+    std::size_t b = (std::size_t)std::max(C, dst_c) * frames * px * 4;
+    if (stacked) { b += (std::size_t)3 * px * 4; }   // a frame in turn
+    if (sH != H || sW != W) {
+      const double s = std::min((double)W / sW, (double)H / sH);
+      const int nw = std::max(1, (int)std::lround(sW * s));
+      b += (std::size_t)C * sH * nw * 4;              // the row pass
+      if (C == 4) { b += (std::size_t)4 * sH * sW * 4; }
+    }
+    if (C == 3 && dst_c == 4) { b += (std::size_t)3 * px * 4; }
+    return b;
+  }
+
+private:
+  Samples      _s;
+  float        _scale, _off;
+  bool         _stacked;
+  int          _frames, _src_c, _C, _dst_c, _sH, _sW, _H, _W;
+  const float* _pad;
+  bool               _built = false;
+  std::vector<float> _v;
+};
+
 }  // namespace
 
 Job
@@ -1273,15 +1515,21 @@ VaeEncodeStage::process(RuntimeContext& ctx)
       _batch = true;
     }
   }
-  auto out = encode_one_(*tb, in->describe());
+  // The picture goes once its pixels are in the buffer the VAE encodes
+  // from (encode_one_'s `release`): it had been held through the whole
+  // encode beside that copy -- a 42 MP still's 121 MiB for 3.5 minutes.
+  // What is read of it afterwards is taken first; `tb` dangles after.
+  const bool still = tb->shape.size() == 3;
+  FlexData in_sb = tb->sideband;
+  auto out = encode_one_(*tb, in->describe(), [&in] { in.reset(); });
+  tb = nullptr;
   if (!out) { co_return; }
   // A picture padded out to a canvas (image-resample `pad_to_grid`) says
   // where it sits on it; the latent of that canvas carries the box on, in
   // the same pixels -- so only when the picture is encoded at its own
   // size, since a target_width/height letterbox would move it.
-  if (tb->shape.size() == 3 && !(_target_w > 0 && _target_h > 0) &&
-      tb->sideband.is_object()) {
-    FlexData sb = tb->sideband;          // as_object() is a view: keep it
+  if (still && !(_target_w > 0 && _target_h > 0) && in_sb.is_object()) {
+    FlexData sb = in_sb;                 // as_object() is a view: keep it
     auto so = sb.as_object();
     if (so.contains(sideband::kCropBox)) {
       if (!out->sideband.is_object()) {
@@ -1299,7 +1547,8 @@ VaeEncodeStage::process(RuntimeContext& ctx)
 // checkpoint resolved to; null, having said why, when it cannot be.
 // `what` names the input in that message.
 std::unique_ptr<TensorBeatPayload>
-VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
+VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what,
+                            const std::function<void()>& release)
 {
   const TensorBeat* tbp = &in_tb;
   // WHAT ARRIVED IS SAID BY THE RANK, the same convention
@@ -1334,26 +1583,14 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
   // The source picture's size, wherever the rank put it.
   const int src_h = (int)tbp->shape[stacked ? 2 : 1];
   const int src_w = (int)tbp->shape[stacked ? 3 : 2];
-  // F16 IS WIDENED HERE, ONCE, so every family below keeps reading U8 or
-  // F32. An F16 picture is 0..1 by its own convention (common/beat-keys.h:
+  // An F16 picture is 0..1 by its own convention (common/beat-keys.h:
   // load-image, avf-load-video and vae-decode all emit it that way), so
   // it is read as `unit` whatever `input_range` says -- that key exists
   // for F32, whose range the dtype does not settle. A linear picture's
   // values above 1 go through as they are; the VAE was trained on 0..1.
-  TensorBeat widened;
+  // Read in place (Samples), as U8 and F32 are: it was widened to an F32
+  // copy of the picture here, held through the encode.
   const bool src_f16 = tbp->dtype == TensorBeat::DType::F16;
-  if (src_f16) {
-    const auto bytes = tbp->materialize_contiguous();
-    const auto* h = reinterpret_cast<const _Float16*>(bytes.data());
-    const std::size_t n = bytes.size() / sizeof(_Float16);
-    widened.dtype = TensorBeat::DType::F32;
-    widened.shape = tbp->shape;
-    widened.sideband = tbp->sideband;
-    widened.resize_contiguous(n);
-    float* f = widened.as_f32();
-    for (std::size_t i = 0; i < n; ++i) { f[i] = (float)h[i]; }
-    tbp = &widened;
-  }
   // U8 is unambiguous -- 0..255 -- and F16 is 0..1, so only F32 consults
   // `input_range`.
   const bool src_u8 = tbp->dtype == TensorBeat::DType::U8;
@@ -1366,6 +1603,16 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
   ensure_loaded_();
   // A previous beat may have dropped the encoder to leave the DiT room.
   if (_unloaded) { reload_vae_(); }
+  // The beat's samples, read where they lie (a strided beat is copied
+  // into `hold`), and the hand-back once every family below has its
+  // pixels in the buffer it encodes from: from there the picture is not
+  // read again, and it was held through the whole encode.
+  AlignedVector<std::uint8_t> hold;
+  const Samples smp = samples_of_(*tbp, &hold);
+  auto let_go = [&] {
+    hold = AlignedVector<std::uint8_t>();
+    if (release) { release(); }
+  };
 
   // ---- an out-of-tree family (VaeModelRegistry) ------------------------
   //
@@ -1380,8 +1627,6 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     const bool resize = _target_w > 0 && _target_h > 0;
     const int H = resize ? _target_h : sH;
     const int W = resize ? _target_w : sW;
-    const auto img = tbp->materialize_contiguous();
-    const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
     const float pad[3] = {
       (float)_pad_r / 255.0f * 2.0f - 1.0f,
       (float)_pad_g / 255.0f * 2.0f - 1.0f,
@@ -1391,11 +1636,13 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     // are causal and compress time, so frames encoded separately and
     // concatenated are a DIFFERENT tensor from one encode of the same
     // frames -- the request carries `frames` for exactly this reason.
-    const std::vector<float> norm =
-        stacked ? normalize_clip_(img.data(), is_u8, in_scale, in_off,
-                                  in_frames, sH, sW, H, W, pad)
-                : normalize_and_fit_(img.data(), is_u8, in_scale, in_off,
-                                     3, sH, sW, H, W, pad);
+    // The family's API takes floats, so this one path keeps the vector.
+    Pixels pix(smp, in_scale, in_off, stacked, in_frames, 3, 3, 3, sH, sW,
+               H, W, pad);
+    revise_scratch_(Pixels::float_bytes(stacked, in_frames, 3, 3, sH, sW,
+                                        H, W));
+    const std::vector<float>& norm = pix.floats();
+    let_go();
 
     genai::VaeEncodeRequest req;
     req.accel = &_accel;
@@ -1499,21 +1746,29 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
       return nullptr;
     }
     auto* mc = session()->services()->metal_compute();
-    const auto img = tbp->materialize_contiguous();
-    const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
     const float pad[3] = {
       (float)_pad_r / 255.0f * 2.0f - 1.0f,
       (float)_pad_g / 255.0f * 2.0f - 1.0f,
       (float)_pad_b / 255.0f * 2.0f - 1.0f,
     };
-    const std::vector<float> norm =
-        normalize_and_fit_(img.data(), is_u8, in_scale, in_off, 3, sH, sW,
-                           H, W, pad);
     const std::size_t n = (std::size_t)3 * H * W;
+    // The upload, the f16 latent and its f32 beat.
+    const int lpx = 8 * _flux2_vae->config().patch;
+    revise_scratch_(
+        n * 2 +
+        (Pixels::in_place(3, 3, sH, sW, H, W)
+             ? 0 : Pixels::float_bytes(false, 1, 3, 3, sH, sW, H, W)) +
+        (std::size_t)_flux2_vae->config().dit_channels() * (H / lpx) *
+            (W / lpx) * 6);
     metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
     if (imgbuf.empty()) { return nullptr; }
-    { auto* d = static_cast<_Float16*>(imgbuf.contents());
-      for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)norm[i]; } }
+    {
+      Pixels pix(smp, in_scale, in_off, false, 1, (int)tbp->shape[0], 3, 3,
+                 sH, sW, H, W, pad);
+      auto* d = static_cast<_Float16*>(imgbuf.contents());
+      pix.each([d](int, std::size_t k, float v) { d[k] = (_Float16)v; });
+    }
+    let_go();
     metal_compute::SharedBuffer lat;
     {   // LLM-lane perf event: one VAE encode per reference image.
       PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
@@ -1580,8 +1835,6 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
       return nullptr;
     }
     auto* mc = session()->services()->metal_compute();
-    const auto img = tbp->materialize_contiguous();
-    const bool u8 = tbp->dtype == TensorBeat::DType::U8;
     const float pad[3] = {
       (float)_pad_r / 255.0f * 2.0f - 1.0f,
       (float)_pad_g / 255.0f * 2.0f - 1.0f,
@@ -1591,38 +1844,47 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     // frames encoded one at a time and concatenated are a different
     // tensor -- which is also why `encode_video` has always taken a
     // frame count here even when the count was 1.
-    const std::vector<float> norm =
-        stacked ? normalize_clip_(img.data(), u8, in_scale, in_off, in_frames,
-                                  sH, sW, H, W, pad)
-                : normalize_and_fit_(img.data(), u8, in_scale, in_off, 3, sH,
-                                     sW, H, W, pad);
     const std::size_t plane = (std::size_t)H * W;
+    {
+      // The upload, the bf16 moments and the f32 latent beat, and the
+      // posterior's noise where a clip samples it.
+      const std::size_t vox = (std::size_t)_h3_vae->encoded_frames(
+                                  in_frames) * (H / vc.patch) *
+                              (W / vc.patch);
+      revise_scratch_(
+          (std::size_t)3 * in_frames * plane * 2 +
+          (Pixels::in_place(3, 3, sH, sW, H, W)
+               ? 0 : Pixels::float_bytes(stacked, in_frames, 3, 3, sH, sW,
+                                         H, W)) +
+          (std::size_t)vc.z_channels * vox *
+              (8 + (_posterior_sample && stacked ? 4 : 0)));
+    }
     metal_compute::SharedBuffer frame =
         mc->make_shared_buffer((std::size_t)3 * in_frames * plane * 2);
     if (frame.empty()) { return nullptr; }
     {
+      Pixels pix(smp, in_scale, in_off, stacked, in_frames,
+                 stacked ? 3 : (int)tbp->shape[0], 3, 3, sH, sW, H, W,
+                 pad);
       auto* d = static_cast<std::uint16_t*>(frame.contents());
       // This VAE's pixel space is IMAGENET-NORMALIZED, not [-1, 1]:
       // the reference encoder's first act is `(x + 1)/2` then
-      // `(. - mean)/std`. `normalize_and_fit_` only gets as far as
-      // [-1, 1], so without this the encoder sees an input ~4.4x too
-      // wide and the anchor latent it produces is wrong. vae-decode
-      // undoes exactly this on the way out.
-      // `norm` is [3][frames][H][W] and the mean/std are PER CHANNEL, so
-      // the whole of one channel's time series takes the same pair --
-      // which is why this walks `frames * plane` and not `plane`.
-      const std::size_t span = (std::size_t)in_frames * plane;
-      for (int c = 0; c < 3; ++c) {
+      // `(. - mean)/std`. The pixels only get as far as [-1, 1], so
+      // without this the encoder sees an input ~4.4x too wide and the
+      // anchor latent it produces is wrong. vae-decode undoes exactly
+      // this on the way out.
+      // The pixels are [3][frames][H][W] and the mean/std are PER
+      // CHANNEL, so the whole of one channel's time series takes the
+      // same pair.
+      pix.each([d](int c, std::size_t k, float x) {
         const float pm = kImagenetMean[c], ps = kImagenetStd[c];
-        for (std::size_t i = 0; i < span; ++i) {
-          const std::size_t k = (std::size_t)c * span + i;
-          const float v = ((norm[k] + 1.0f) * 0.5f - pm) / ps;
-          std::uint32_t u;
-          std::memcpy(&u, &v, 4);
-          d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-        }
-      }
+        const float v = ((x + 1.0f) * 0.5f - pm) / ps;
+        std::uint32_t u;
+        std::memcpy(&u, &v, 4);
+        d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+      });
     }
+    let_go();
     int lf = 0;
     std::string eerr;
     metal_compute::SharedBuffer mom;
@@ -1749,18 +2011,11 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
       }
     }
     auto* mc = session()->services()->metal_compute();
-    const auto img = tbp->materialize_contiguous();
-    const bool u8 = tbp->dtype == TensorBeat::DType::U8;
     const float pad[3] = {
       (float)_pad_r / 255.0f * 2.0f - 1.0f,
       (float)_pad_g / 255.0f * 2.0f - 1.0f,
       (float)_pad_b / 255.0f * 2.0f - 1.0f,
     };
-    const std::vector<float> norm =
-        stacked ? normalize_clip_(img.data(), u8, in_scale, in_off, in_frames,
-                                  sH, sW, H, W, pad)
-                : normalize_and_fit_(img.data(), u8, in_scale, in_off, 3, sH,
-                                     sW, H, W, pad);
     // [3, F, H, W] channel-first: the frames that ARRIVED, then the ZERO
     // of the [-1, 1] range (mid grey) for the rest -- which is what the
     // reference's new_zeros produces on an already-normalized tensor.
@@ -1779,6 +2034,15 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
           this->id(), in_frames, _frames, _frames));
     }
     const std::size_t plane = (std::size_t)H * W;
+    // The clip, the f16 latent and its f32 beat.
+    revise_scratch_(
+        (std::size_t)3 * _frames * plane * 2 +
+        (Pixels::in_place(3, 3, sH, sW, H, W)
+             ? 0 : Pixels::float_bytes(stacked, in_frames, 3, 3, sH, sW, H,
+                                       W)) +
+        (std::size_t)_wan_vae->config().z_dim *
+            genai::MetalWanVae::latent_frames(_frames) * (H / 8) * (W / 8) *
+            6);
     metal_compute::SharedBuffer vid =
         mc->make_shared_buffer((std::size_t)3 * _frames * plane * 2);
     if (vid.empty()) {
@@ -1789,20 +2053,22 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     {
       auto* d = static_cast<_Float16*>(vid.contents());
       std::memset(d, 0, (std::size_t)3 * _frames * plane * 2);
-      for (int c = 0; c < 3; ++c) {
-        _Float16* dst = d + (std::size_t)c * _frames * plane;
-        // `norm` is [3][in_frames][H][W], and in_frames is 1 on the
-        // single-picture path -- so this is the SAME loop that wrote
-        // frame 0 before, run `fill` times.
-        const float* src = norm.data() + (std::size_t)c * in_frames * plane;
-        for (int f = 0; f < fill; ++f) {
-          const std::size_t o = (std::size_t)f * plane;
-          for (std::size_t i = 0; i < plane; ++i) {
-            dst[o + i] = (_Float16)src[o + i];
-          }
-        }
-      }
+      // The pixels are [3][in_frames][H][W], and in_frames is 1 on the
+      // single-picture path; a sample k of channel c, frame f lands in
+      // the clip's [3][_frames][H][W] at frame f -- the frames that
+      // arrived, up to `fill`.
+      Pixels pix(smp, in_scale, in_off, stacked, in_frames,
+                 stacked ? 3 : (int)tbp->shape[0], 3, 3, sH, sW, H, W,
+                 pad);
+      const std::size_t span = (std::size_t)in_frames * plane;
+      const std::size_t kept = (std::size_t)fill * plane;
+      const std::size_t cstep = (std::size_t)_frames * plane;
+      pix.each([&](int c, std::size_t k, float v) {
+        const std::size_t r = k - (std::size_t)c * span;   // f * plane + i
+        if (r < kept) { d[(std::size_t)c * cstep + r] = (_Float16)v; }
+      });
     }
+    let_go();
     std::string eerr;
     metal_compute::SharedBuffer lat;
     {
@@ -1871,11 +2137,8 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
       "{}]{} -> latent [{}, {}, {}]", this->id(), sH, sW, H, W,
       resize ? " (letterbox)" : "", _vae->config().z_dim, H / 8, W / 8));
 
-  // Materialise the source (handles a padded/strided beat), then normalize to
-  // [-1,1] and letterbox-fit into the target [3,H,W] (pad in [-1,1]). U8 maps
-  // 0..255 -> [-1,1]; f32 is assumed already in [-1,1].
-  const auto img = tbp->materialize_contiguous();
-  const bool is_u8 = tbp->dtype == TensorBeat::DType::U8;
+  // Normalize to [-1,1] and letterbox-fit into the target [C,H,W] (pad in
+  // [-1,1]): U8 maps 0..255 -> [-1,1]; F16 and F32 by `in_scale`/`in_off`.
   // WHAT ARRIVED and WHAT THE VAE TAKES are separate questions, and on
   // this family they differ: Qwen-Image-2.1's VAE is RGBA in and out.
   // Resample at the BEAT's channel count -- so an alpha that is there
@@ -1891,11 +2154,9 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     (float)_pad_b / 255.0f * 2.0f - 1.0f,
     -1.0f,
   };
-  const std::vector<float> norm = fit_channels_(
-      normalize_and_fit_(img.data(), is_u8, in_scale, in_off, beat_c, sH,
-                         sW, H, W, pad),
-      beat_c, vae_c, H, W);
-  if ((int)norm.size() != vae_c * H * W) {
+  // fit_channels_ adapts 3 <-> 4 and nothing else.
+  if (beat_c != vae_c && !(beat_c == 3 && vae_c == 4) &&
+      !(beat_c == 4 && vae_c == 3)) {
     session()->warn(fmt(
         "VaeEncodeStage('{}'): a {}-channel picture cannot feed a "
         "{}-channel VAE; skipping", this->id(), beat_c, vae_c));
@@ -1903,6 +2164,16 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
   }
 
   const std::size_t n = (std::size_t)vae_c * H * W;
+  {
+    // The upload, the f16 latent and its f32 beat.
+    const int px = _vae->config().spatial_factor();
+    revise_scratch_(
+        n * 2 +
+        (Pixels::in_place(beat_c, vae_c, sH, sW, H, W)
+             ? 0 : Pixels::float_bytes(false, 1, beat_c, vae_c, sH, sW, H,
+                                       W)) +
+        (std::size_t)_vae->config().z_dim * (H / px) * (W / px) * 6);
+  }
   metal_compute::SharedBuffer imgbuf = mc->make_shared_buffer(n * 2);
   if (imgbuf.empty()) {
     session()->warn(fmt(
@@ -1911,9 +2182,12 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what)
     return nullptr;
   }
   {
+    Pixels pix(smp, in_scale, in_off, false, 1, beat_c, beat_c, vae_c, sH,
+               sW, H, W, pad);
     auto* d = static_cast<_Float16*>(imgbuf.contents());
-    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)norm[i]; }
+    pix.each([d](int, std::size_t k, float v) { d[k] = (_Float16)v; });
   }
+  let_go();
 
   metal_compute::SharedBuffer lat;
   {

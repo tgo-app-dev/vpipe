@@ -25,6 +25,12 @@ SaveTextStage::SaveTextStage(const SessionContextIntf* s,
   _path   = attr_path("path", true);
   _key    = attr_str("key");
   _append = attr_bool("append");
+  const string format = attr_str("format");
+  _json = format == "json";
+  if (format != "text" && format != "json") {
+    fail_config(fmt("SaveTextStage('{}'): format must be text|json (got "
+                    "'{}')", this->id(), format));
+  }
   const string nl = attr_str("newline");
   if (nl == "before") {
     _newline = Newline::Before;
@@ -51,6 +57,9 @@ namespace {
 constexpr SpecExtra kNewlineChoices[] = {
   {spec_key::kChoices, "after,before,none"},
 };
+constexpr SpecExtra kFormatChoices[] = {
+  {spec_key::kChoices, "text,json"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "path", .type = ConfigType::String, .required = true,
    .doc = "output text file path",
@@ -64,6 +73,11 @@ constexpr ConfigKey kAttrs[] = {
   {.key = "append", .type = ConfigType::Bool,
    .doc = "append to the file (default); false truncates it at start",
    .def_bool = true},
+  {.key = "format", .type = ConfigType::String,
+   .doc = "text (default): the string field `key` | json: field `key` as "
+          "compact JSON when the beat has it, else the whole beat -- one "
+          "JSON value an entry (JSON Lines under newline `after`)",
+   .def_str = "text", .extra = kFormatChoices},
 };
 const PortSpec kIports[] = {
   {.name = "text", .doc = "FlexData carrying the text to save (see `key`)",
@@ -84,8 +98,15 @@ const StageSpec kSpec = {
 // The text to write from a FlexData beat: a plain-string payload is used
 // whole; an object payload uses field `key` (as a string). Empty when the
 // field is missing / not a string.
-std::string extract_text_(const FlexData& d, const std::string& key)
+std::string extract_text_(const FlexData& d, const std::string& key,
+                          bool json)
 {
+  if (json) {
+    if (d.is_object() && !key.empty() && d.as_object().contains(key)) {
+      return d.as_object().at(key).to_json();
+    }
+    return d.to_json();
+  }
   if (d.is_string()) { return std::string(d.as_string("")); }
   if (d.is_object() && !key.empty()) {
     auto o = d.as_object();
@@ -141,7 +162,7 @@ SaveTextStage::process(RuntimeContext& ctx)
         "dropping beat", this->id(), t->describe()));
     co_return;
   }
-  const std::string text = extract_text_(fdp->data, _key);
+  const std::string text = extract_text_(fdp->data, _key, _json);
   if (text.empty()) { co_return; }   // nothing to write
 
   switch (_newline) {

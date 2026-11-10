@@ -1,0 +1,60 @@
+{
+  "id": "beat-track",
+  "stages": [
+    {
+      "id": "load-audio",
+      "type": "load-audio",
+      "iports": [],
+      "config": {
+        "input_url": "song.m4a"
+      }
+    },
+    {
+      "id": "audio-to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_sample_rate": 22050,
+        "channels": 2,
+        "chunk_duration_s": 1,
+        "flush_on_eos": true
+      }
+    },
+    {
+      "id": "beat-track",
+      "type": "beat-track",
+      "iports": [
+        {
+          "src": "audio-to-pcm",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "mode": "stream",
+        "group": 4,
+        "units": "time",
+        "max_latency": 4
+      }
+    },
+    {
+      "id": "save-beats",
+      "type": "save-text",
+      "iports": [
+        {
+          "src": "beat-track",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "song-beats.jsonl",
+        "format": "json",
+        "append": false
+      }
+    }
+  ]
+}

@@ -499,6 +499,50 @@ TEST(minimax_h3_comfy, scan_repo_lists_every_readable_component)
   fs::remove_all(part, ec);
 }
 
+// A repository that IS one H3 VAE file, at its top with no `vae/` and no
+// config.json: Mamad8/MiniMax-H3-Image-VAE, registered by its directory.
+// The Comfy-Org probe looks in `vae/` and there is no class to read, so
+// both VAE stages took the directory for a Qwen-Image VAE and refused it
+// ("missing latents_mean/latents_std") -- named by its file, it ran.
+TEST(minimax_h3_comfy, a_repository_of_one_vae_file_resolves_to_it)
+{
+  const fs::path root = scratch_() / "image-vae";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const fs::path file =
+      root / "minimax_h3_t1_image_vae_step1597.safetensors";
+  write_component_(file, "minimax_h3_video_vae", "{\"vae_clip_length\": 17}");
+  // A file beside it that names no VAE changes nothing.
+  write_component_(root / "example.safetensors", "format", "pt");
+
+  EXPECT_TRUE(builtin_vae_family(root.string()) == "minimax-h3");
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(root.string()) ==
+              file.string());
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(file.string()) ==
+              file.string());
+  // The role-subdirectory search alone misses it: that was the gap.
+  EXPECT_TRUE(comfy::resolve_component(root.string(), "vae",
+                                       "minimax_h3_video_vae").empty());
+
+  // A `vae/` beside it still wins: the top is the last resort.
+  const fs::path sub =
+      root / "vae" / "minimax_h3_video_vae_fp16.safetensors";
+  write_component_(sub, "minimax_h3_video_vae", "{\"vae_clip_length\": 17}");
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(root.string()) ==
+              sub.string());
+
+  // A directory whose files name no H3 VAE is the standalone Qwen-Image
+  // VAE it always was.
+  const fs::path other = scratch_() / "standalone-vae";
+  fs::remove_all(other, ec);
+  write_component_(other / "qwen_image_vae.safetensors", "format", "pt");
+  EXPECT_TRUE(builtin_vae_family(other.string()) == "krea2");
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(other.string()) ==
+              other.string());
+  fs::remove_all(root, ec);
+  fs::remove_all(other, ec);
+}
+
 // The record has to SAY which components a checkout holds, so a later
 // failure reads as "this copy has no text encoder" rather than as an
 // unsupported model.

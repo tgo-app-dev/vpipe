@@ -19,6 +19,7 @@
 #endif
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -136,8 +137,26 @@ public:
 private:
   // One picture (or clip) -> one latent; null, having said why, when it
   // cannot be. Serves both the `image` port and each item of `images`.
+  // `release`, when given, is called once the picture's pixels are in
+  // the buffer the VAE encodes from -- `in` is not read after it.
   std::unique_ptr<TensorBeatPayload>
-  encode_one_(const TensorBeat& in, const std::string& what);
+  encode_one_(const TensorBeat& in, const std::string& what,
+              const std::function<void()>& release = {});
+
+  // ---- the stage's own working set, in the plan ---------------------
+  // What it allocates to encode a picture beside the VAE's weights: the
+  // copy of the pixels the VAE encodes from, a float picture where one
+  // has to be built (a letterbox resample, a registered family's float
+  // API), and the latent. Not the encoder's own working set, which is
+  // the VAE class's. Claimed as `scratch_label_()` at a planned size --
+  // the picture is not known at launch -- and revised by every beat
+  // BEFORE it allocates.
+  std::string scratch_label_() const;
+  // The VAE's weight claims (declare_resources adds the scratch).
+  std::vector<ResourceClaim> declare_weights_() const;
+  std::size_t planned_scratch_() const;
+  void revise_scratch_(std::size_t bytes);
+  std::size_t _scratch_stated = 0;
 
   std::string _hf_dir;
   // `vae_dir`: the VAE's WEIGHTS when they are not the model's own (a

@@ -1379,6 +1379,13 @@ builtin_vae_family(const std::string& vae_dir, std::string* unknown_class)
       return "wan";
     }
   }
+  // MiniMax-H3's VAE as ONE file at a repository's top, with no `vae/`
+  // and no config.json: Mamad8/MiniMax-H3-Image-VAE. Its metadata names
+  // it; the default below would open it as a Qwen-Image VAE.
+  if (!genai::comfy::resolve_component_in(vae_dir, "minimax_h3_video_vae",
+                                          {"video_vae"}).empty()) {
+    return "minimax-h3";
+  }
   // No class at all: a STANDALONE checkpoint, whose config is borrowed
   // from the model it serves (resolve_vae_config_path). Every one of
   // those is a Qwen-Image VAE.

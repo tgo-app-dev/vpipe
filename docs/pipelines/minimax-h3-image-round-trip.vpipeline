@@ -1,0 +1,98 @@
+{
+  "id": "minimax-h3-image-round-trip",
+  "stages": [
+    {
+      "id": "load-image",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "picture.jpg"
+        ]
+      }
+    },
+    {
+      "id": "image-resample",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fit": "crop_to_grid",
+        "grid": 16,
+        "max_pixels": 4194304
+      }
+    },
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "Mamad8/MiniMax-H3-Image-VAE"
+      }
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "image-resample",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "vae-encode",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "compare-image",
+      "type": "compare-image",
+      "iports": [
+        {
+          "src": "image-resample",
+          "oport": 0
+        },
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "save-image",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "minimax-h3-round-trip.png"
+      }
+    }
+  ],
+  "subpipelines": [],
+  "aux": {}
+}

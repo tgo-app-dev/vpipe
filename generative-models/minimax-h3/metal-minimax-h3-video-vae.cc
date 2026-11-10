@@ -444,6 +444,14 @@ MetalMiniMaxH3VideoVae::resolve_vae_dir(const std::string& path)
   if (video_vae_dir_((p / "vae").string())) {
     return (p / "vae").string();
   }
+  // A repository that IS the single file, at its top with no `vae/`
+  // beside it: Mamad8/MiniMax-H3-Image-VAE publishes its one-frame
+  // decoder that way. Last, so every layout above resolves as it did.
+  {
+    const std::string f =
+        comfy::resolve_component_in(path, kComfyKey, {"video_vae"});
+    if (!f.empty()) { return f; }
+  }
   return path;
 }
 

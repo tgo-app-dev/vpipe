@@ -3,11 +3,14 @@
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
+#include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "pipeline/stage-spec.h"
+#include "stages/model-memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +20,7 @@
 #include <vector>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
 }
@@ -95,6 +99,10 @@ const StageSpec kSpec = {
 
 }  // namespace
 
+static CompareImageChannel::Png
+render_png_(const FFmpegLibraries* libs, const uint8_t pad[3],
+            const CompareImageChannel::Picture& side, int w, int h);
+
 CompareImageStage::CompareImageStage(const SessionContextIntf* s,
                                      string                    id,
                                      vector<InEdge>            iports,
@@ -109,6 +117,24 @@ CompareImageStage::CompareImageStage(const SessionContextIntf* s,
 
   allocate_oports(spec().oports.size());   // sink: 0 oports
   _channel = std::make_shared<CompareImageChannel>();
+  // The libraries are the session's and outlive the stage; the colour
+  // is copied. Nothing of the stage's is captured: the channel, and a
+  // viewer rendering through it, can outlive the stage.
+  {
+    const FFmpegLibraries* libs = _libs;
+    const std::array<uint8_t, 3> pad{_pad_r, _pad_g, _pad_b};
+    _render = std::make_shared<const CompareImageChannel::Render>(
+        [libs, pad](const CompareImageChannel::Picture& side, int w,
+                    int h) {
+          return render_png_(libs, pad.data(), side, w, h);
+        });
+  }
+  if (_libs == nullptr ||
+      _libs->avcodec().api.find_encoder_by_name("png") == nullptr) {
+    session()->warn(fmt(
+        "compare-image('{}'): PNG encoder unavailable; view disabled",
+        this->id()));
+  }
 
   session()->info(fmt(
       "compare-image('{}'): image A/B comparison view", this->id()));
@@ -138,9 +164,6 @@ CompareImageStage::teardown_()
   if (_torn) { return; }
   _torn = true;
   if (_channel) { _channel->close(); }
-  if (_png)     { _libs->avcodec().api.free_context(&_png); }
-  if (_png_frm) { _libs->avutil().api.frame_free(&_png_frm); }
-  if (_png_pkt) { _libs->avcodec().api.packet_free(&_png_pkt); }
 }
 
 void
@@ -180,7 +203,8 @@ CompareImageStage::unpack_(const TensorBeat& tb, Side& side) const
 
   const size_t plane   = static_cast<size_t>(H) * W;
   const size_t expect  = static_cast<size_t>(CH) * plane;
-  vector<uint8_t>       out(3 * plane);
+  auto                  rgb = make_shared<vector<uint8_t>>(3 * plane);
+  vector<uint8_t>&      out = *rgb;
 
   // alpha in [0,1] for pixel i, or 1 when the beat carries none.
   auto blend = [&](size_t i, int c, float v, float a01) {
@@ -230,40 +254,50 @@ CompareImageStage::unpack_(const TensorBeat& tb, Side& side) const
     return false;   // unsupported dtype: keep whatever we had
   }
 
-  side.rgb   = std::move(out);
+  side.rgb   = std::move(rgb);
   side.w     = W;
   side.h     = H;
   side.valid = true;
   return true;
 }
 
-void
-CompareImageStage::pad_fit_(const Side& src, int dst_w, int dst_h,
-                            vector<uint8_t>* dst) const
+// Draw `src` at the common `dst_w` x `dst_h` into rows `linesize` apart:
+// copied verbatim when it is that size, else scaled to the largest fit
+// that keeps its aspect, centred, on a `pad` border. What the stage's
+// canvas held before -- now drawn straight into the encoder's frame, so a
+// render keeps one copy of the picture rather than two.
+static void
+fit_into_(const CompareImageChannel::Picture& src, int dst_w, int dst_h,
+          const uint8_t pad[3], uint8_t* dst, int linesize)
 {
-  dst->assign(static_cast<size_t>(dst_w) * dst_h * 3, 0);
-  // Fill with pad_color first; the fitted image overwrites its box.
-  for (size_t i = 0; i < dst->size(); i += 3) {
-    (*dst)[i + 0] = _pad_r;
-    (*dst)[i + 1] = _pad_g;
-    (*dst)[i + 2] = _pad_b;
-  }
-  if (!src.valid || src.w <= 0 || src.h <= 0) { return; }
-
+  const vector<uint8_t>& rgb = *src.rgb;
   // Already the target size -> verbatim copy, no resample. This is the
   // common case (both inputs agree) and must not go through the
   // interpolator, which would soften a pixel-exact image.
-  if (src.w == dst_w && src.h == dst_h) {
-    std::memcpy(dst->data(), src.rgb.data(), src.rgb.size());
+  if (src.width == dst_w && src.height == dst_h) {
+    for (int y = 0; y < dst_h; ++y) {
+      std::memcpy(dst + static_cast<size_t>(y) * linesize,
+                  rgb.data() + static_cast<size_t>(y) * dst_w * 3,
+                  static_cast<size_t>(dst_w) * 3);
+    }
     return;
+  }
+  // Fill with pad_color first; the fitted image overwrites its box.
+  for (int y = 0; y < dst_h; ++y) {
+    uint8_t* row = dst + static_cast<size_t>(y) * linesize;
+    for (int x = 0; x < dst_w; ++x) {
+      row[x * 3 + 0] = pad[0];
+      row[x * 3 + 1] = pad[1];
+      row[x * 3 + 2] = pad[2];
+    }
   }
 
   // pad policy: largest fit preserving aspect ratio, centred.
-  const double sx = static_cast<double>(dst_w) / src.w;
-  const double sy = static_cast<double>(dst_h) / src.h;
+  const double sx = static_cast<double>(dst_w) / src.width;
+  const double sy = static_cast<double>(dst_h) / src.height;
   const double s  = std::min(sx, sy);
-  int fit_w = static_cast<int>(std::lround(src.w * s));
-  int fit_h = static_cast<int>(std::lround(src.h * s));
+  int fit_w = static_cast<int>(std::lround(src.width * s));
+  int fit_h = static_cast<int>(std::lround(src.height * s));
   fit_w = std::clamp(fit_w, 1, dst_w);
   fit_h = std::clamp(fit_h, 1, dst_h);
   const int off_x = (dst_w - fit_w) / 2;
@@ -271,28 +305,28 @@ CompareImageStage::pad_fit_(const Side& src, int dst_w, int dst_h,
 
   // Bilinear sample, matching image-resample's default algorithm.
   for (int y = 0; y < fit_h; ++y) {
-    const double fy = (y + 0.5) * src.h / fit_h - 0.5;
+    const double fy = (y + 0.5) * src.height / fit_h - 0.5;
     const int    y0 = static_cast<int>(std::floor(fy));
     const double wy = fy - y0;
-    const int    y0c = std::clamp(y0, 0, src.h - 1);
-    const int    y1c = std::clamp(y0 + 1, 0, src.h - 1);
+    const int    y0c = std::clamp(y0, 0, src.height - 1);
+    const int    y1c = std::clamp(y0 + 1, 0, src.height - 1);
     uint8_t* drow =
-        dst->data() + (static_cast<size_t>(y + off_y) * dst_w + off_x) * 3;
+        dst + static_cast<size_t>(y + off_y) * linesize + off_x * 3;
     for (int x = 0; x < fit_w; ++x) {
-      const double fx = (x + 0.5) * src.w / fit_w - 0.5;
+      const double fx = (x + 0.5) * src.width / fit_w - 0.5;
       const int    x0 = static_cast<int>(std::floor(fx));
       const double wx = fx - x0;
-      const int    x0c = std::clamp(x0, 0, src.w - 1);
-      const int    x1c = std::clamp(x0 + 1, 0, src.w - 1);
+      const int    x0c = std::clamp(x0, 0, src.width - 1);
+      const int    x1c = std::clamp(x0 + 1, 0, src.width - 1);
       for (int c = 0; c < 3; ++c) {
         const double p00 =
-            src.rgb[(static_cast<size_t>(y0c) * src.w + x0c) * 3 + c];
+            rgb[(static_cast<size_t>(y0c) * src.width + x0c) * 3 + c];
         const double p01 =
-            src.rgb[(static_cast<size_t>(y0c) * src.w + x1c) * 3 + c];
+            rgb[(static_cast<size_t>(y0c) * src.width + x1c) * 3 + c];
         const double p10 =
-            src.rgb[(static_cast<size_t>(y1c) * src.w + x0c) * 3 + c];
+            rgb[(static_cast<size_t>(y1c) * src.width + x0c) * 3 + c];
         const double p11 =
-            src.rgb[(static_cast<size_t>(y1c) * src.w + x1c) * 3 + c];
+            rgb[(static_cast<size_t>(y1c) * src.width + x1c) * 3 + c];
         const double top = p00 + (p01 - p00) * wx;
         const double bot = p10 + (p11 - p10) * wx;
         drow[x * 3 + c] =
@@ -302,87 +336,56 @@ CompareImageStage::pad_fit_(const Side& src, int dst_w, int dst_h,
   }
 }
 
-CompareImageChannel::Png
-CompareImageStage::encode_png_(const vector<uint8_t>& rgb, int w, int h)
+// A viewer's render of one side: an encoder, its frame and its packet
+// made for this picture and FREED with it. The stage kept all three for
+// the run -- a frame of the whole picture and FFmpeg's packet sized for
+// it, 250 MiB at 42 MP -- and encoded on the pipeline's thread whether
+// or not anything was watching.
+static CompareImageChannel::Png
+render_png_(const FFmpegLibraries* libs, const uint8_t pad[3],
+            const CompareImageChannel::Picture& side, int w, int h)
 {
-  if (_png_bad || _libs == nullptr) { return nullptr; }
-
-  // (Re)build the encoder when the common size changes -- an AVCodec
-  // context's dimensions are fixed once opened.
-  if (_png != nullptr && (_png_w != w || _png_h != h)) {
-    _libs->avcodec().api.free_context(&_png);
-    _libs->avutil().api.frame_free(&_png_frm);
-    _png = nullptr;
-    _png_frm = nullptr;
-  }
-  if (_png == nullptr) {
-    const AVCodec* codec = _libs->avcodec().api.find_encoder_by_name("png");
-    if (codec == nullptr) {
-      session()->warn(fmt(
-          "compare-image('{}'): PNG encoder unavailable; view disabled",
-          this->id()));
-      _png_bad = true;
-      return nullptr;
-    }
-    _png = _libs->avcodec().api.alloc_context3(codec);
-    if (_png == nullptr) { _png_bad = true; return nullptr; }
-    _png->width     = w;
-    _png->height    = h;
-    _png->pix_fmt   = AV_PIX_FMT_RGB24;
-    _png->time_base = AVRational{1, 1};
-    const int rc = _libs->avcodec().api.open2(_png, codec, nullptr);
-    if (rc < 0) {
-      session()->warn(fmt(
-          "compare-image('{}'): PNG avcodec_open2 failed", this->id()));
-      _libs->avcodec().api.free_context(&_png);
-      _png_bad = true;
-      return nullptr;
-    }
-    _png_w = w;
-    _png_h = h;
-  }
-  if (_png_frm == nullptr) {
-    _png_frm = _libs->avutil().api.frame_alloc();
-    if (_png_frm == nullptr) { _png_bad = true; return nullptr; }
-    _png_frm->format = AV_PIX_FMT_RGB24;
-    _png_frm->width  = w;
-    _png_frm->height = h;
-    if (_libs->avutil().api.frame_get_buffer(_png_frm, 32) < 0) {
-      _libs->avutil().api.frame_free(&_png_frm);
-      _png_bad = true;
-      return nullptr;
-    }
-  }
-  if (_png_pkt == nullptr) {
-    _png_pkt = _libs->avcodec().api.packet_alloc();
-    if (_png_pkt == nullptr) { _png_bad = true; return nullptr; }
-  }
-
-  // Copy row-wise: the frame's linesize is padded for alignment and is
-  // not necessarily w*3.
-  const int ls = _png_frm->linesize[0];
-  for (int y = 0; y < h; ++y) {
-    std::memcpy(_png_frm->data[0] + static_cast<size_t>(y) * ls,
-                rgb.data() + static_cast<size_t>(y) * w * 3,
-                static_cast<size_t>(w) * 3);
-  }
-  _png_frm->pts = 0;
-
-  if (_libs->avcodec().api.send_frame(_png, _png_frm) < 0) {
+  if (libs == nullptr || side.rgb == nullptr || w <= 0 || h <= 0) {
     return nullptr;
   }
-  auto out = make_shared<vector<uint8_t>>();
-  for (;;) {
-    const int rc = _libs->avcodec().api.receive_packet(_png, _png_pkt);
-    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { break; }
-    if (rc < 0) { break; }
-    if (_png_pkt->size > 0) {
-      out->insert(out->end(), _png_pkt->data,
-                  _png_pkt->data + _png_pkt->size);
+  const auto& cod = libs->avcodec().api;
+  const auto& utl = libs->avutil().api;
+  const AVCodec* codec = cod.find_encoder_by_name("png");
+  if (codec == nullptr) { return nullptr; }
+  AVCodecContext* ctx = cod.alloc_context3(codec);
+  AVFrame*        frm = utl.frame_alloc();
+  AVPacket*       pkt = cod.packet_alloc();
+  CompareImageChannel::Png out;
+  if (ctx != nullptr && frm != nullptr && pkt != nullptr) {
+    ctx->width     = w;
+    ctx->height    = h;
+    ctx->pix_fmt   = AV_PIX_FMT_RGB24;
+    ctx->time_base = AVRational{1, 1};
+    frm->format = AV_PIX_FMT_RGB24;
+    frm->width  = w;
+    frm->height = h;
+    if (cod.open2(ctx, codec, nullptr) >= 0 &&
+        utl.frame_get_buffer(frm, 32) >= 0) {
+      fit_into_(side, w, h, pad, frm->data[0], frm->linesize[0]);
+      frm->pts = 0;
+      // PNG makes ONE packet a frame, in the encoder's own buffer (kept
+      // in the context) copied out into a refcounted one. The frame and
+      // the context go before the PNG is copied out of that packet: with
+      // them held, a render peaked at four buffers of the picture's size
+      // (MEASURED 4.1x the picture, incompressible content), three now.
+      const int rc = cod.send_frame(ctx, frm) >= 0
+                         ? cod.receive_packet(ctx, pkt) : -1;
+      utl.frame_free(&frm);
+      cod.free_context(&ctx);
+      if (rc >= 0 && pkt->size > 0) {
+        out = make_shared<const vector<uint8_t>>(pkt->data,
+                                                 pkt->data + pkt->size);
+      }
     }
-    _libs->avcodec().api.packet_unref(_png_pkt);
   }
-  if (out->empty()) { return nullptr; }
+  if (pkt != nullptr) { cod.packet_free(&pkt); }
+  if (frm != nullptr) { utl.frame_free(&frm); }
+  if (ctx != nullptr) { cod.free_context(&ctx); }
   return out;
 }
 
@@ -404,18 +407,74 @@ CompareImageStage::publish_()
   _pub_w = w;
   _pub_h = h;
 
-  CompareImageChannel::Png pa;
-  CompareImageChannel::Png pb;
-  vector<uint8_t> canvas;
-  if (_a.valid) {
-    pad_fit_(_a, w, h, &canvas);
-    pa = encode_png_(canvas, w, h);
+  auto pic = [](const Side& s) {
+    return s.valid ? CompareImageChannel::Picture{s.rgb, s.w, s.h}
+                   : CompareImageChannel::Picture{};
+  };
+  _channel->publish_pictures(pic(_a), pic(_b), w, h, _render);
+}
+
+std::string
+CompareImageStage::scratch_label_() const
+{
+  return fmt("compare-image:{}", this->id())();
+}
+
+std::size_t
+CompareImageStage::pair_bytes(int wa, int ha, int wb, int hb, int w, int h)
+{
+  const std::size_t sides = (std::size_t)3 *
+      ((std::size_t)std::max(0, wa) * std::max(0, ha) +
+       (std::size_t)std::max(0, wb) * std::max(0, hb));
+  if (w <= 0 || h <= 0) { return sides; }
+  // A render's peak (render_png_): the frame (rows padded), the PNG
+  // encoder's buffer -- a deflate bound a row plus each IDAT's 12 bytes,
+  // and its minimum -- and the packet it is copied into; then, the frame
+  // and the encoder gone, the packet and the PNG copied out of it. Beside
+  // that the other side's PNG, at most a packet, and a quarter of the
+  // picture and a MiB for FFmpeg's and zlib's own, which grows with the
+  // picture. MEASURED, a pair of noise (the worst a PNG can be), the
+  // second side padded: 4.05x the common picture at 1024 x 768, 4.14x
+  // at 4096 x 3072, against this bound's 4.84x / 4.31x.
+  const std::size_t row   = (std::size_t)w * 3 + 1;
+  const std::size_t raw   = (std::size_t)w * 3 * h;
+  const std::size_t frame = ((std::size_t)w * 3 + 128) * h;
+  const std::size_t pkt   = 32768 + (std::size_t)h * (row + row / 2048 + 64);
+  return sides + frame + 3 * pkt + raw / 4 + ((std::size_t)1 << 20);
+}
+
+std::vector<ResourceClaim>
+CompareImageStage::declare_resources() const
+{
+  return model_memory::scratch_claims(
+      scratch_label_(), pair_bytes(1024, 1024, 1024, 1024, 1024, 1024),
+      std::string_view());
+}
+
+StageMemory
+CompareImageStage::declare_memory() const
+{
+  StageMemory m;
+  m.scratch = _scratch_stated > 0
+                  ? _scratch_stated
+                  : pair_bytes(1024, 1024, 1024, 1024, 1024, 1024);
+  return m;
+}
+
+void
+CompareImageStage::revise_scratch_(std::size_t bytes)
+{
+  if (bytes == 0 || bytes == _scratch_stated || session() == nullptr ||
+      session()->services() == nullptr) {
+    return;
   }
-  if (_b.valid) {
-    pad_fit_(_b, w, h, &canvas);
-    pb = encode_png_(canvas, w, h);
+  _scratch_stated = bytes;
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(scratch_label_(), bytes);
   }
-  _channel->publish(std::move(pa), std::move(pb), w, h);
+  StageMemory m = declare_memory();
+  m.scratch = bytes;
+  revise_memory(m);
 }
 
 Job
@@ -477,6 +536,14 @@ CompareImageStage::process(RuntimeContext& ctx)
       if (!beat) { break; }
       const auto* tb = dynamic_cast<const TensorBeatPayload*>(beat.get());
       if (tb == nullptr) { continue; }
+      // The pair this beat makes, in the plan before its picture is.
+      if (tb->shape.size() == 3) {
+        const int bh = (int)tb->shape[1], bw = (int)tb->shape[2];
+        const Side& o = p == 0 ? _b : _a;
+        const int ow = o.valid ? o.w : 0, oh = o.valid ? o.h : 0;
+        revise_scratch_(pair_bytes(bw, bh, ow, oh, std::max(bw, ow),
+                                   std::max(bh, oh)));
+      }
       if (unpack_(*tb, p == 0 ? _a : _b)) { changed = true; }
     }
   }

@@ -1352,6 +1352,91 @@ const STRINGS = {
       '混音减去该声源——人声模型的伴奏。布局与节拍同 `stem`',
       '混音減去該聲源——人聲模型的伴奏。版面與節拍同 `stem`'],
 
+  // ---- Beat Track (audio) ----
+  'stage.beat-track.name': ['', '节拍跟踪', '節拍追蹤'],
+  'stage.beat-track.doc': ['',
+      '用 librosa 的节拍跟踪（beat_track：梅尔起音包络、由其自相关估计速度'
+      + '、Ellis 的动态规划）跟踪 PCM 音频的拍点，并以 FlexData 流式输出拍点'
+      + '位置——秒、采样点或包络帧——每个对象 `group` 个拍点。单声道、各声道'
+      + '的平均或逐声道分别跟踪；像 librosa.load 那样转换到 22050 Hz。',
+      '用 librosa 的節拍追蹤（beat_track：梅爾起音包絡、由其自相關估計速度'
+      + '、Ellis 的動態規劃）追蹤 PCM 音訊的拍點，並以 FlexData 串流輸出拍點'
+      + '位置——秒、取樣點或包絡幀——每個物件 `group` 個拍點。單聲道、各聲道'
+      + '的平均或逐聲道分別追蹤；像 librosa.load 那樣轉換到 22050 Hz。'],
+  'cfg.beat-track.mode': ['',
+      '"stream"（默认）：拍点一经确定即输出、从不改写——从第一个起音之后 8 '
+      + '秒起，此后落后声音一到三拍；librosa 针对整段音轨的统计量取自已听到'
+      + '的部分。"whole"：在流结束时对整个流运行 librosa.beat.beat_track',
+      '"stream"（預設）：拍點一經確定即輸出、從不改寫——從第一個起音之後 8 '
+      + '秒起，此後落後聲音一到三拍；librosa 針對整段音軌的統計量取自已聽到'
+      + '的部分。"whole"：在串流結束時對整個串流執行 librosa.beat.beat_track'],
+  'cfg.beat-track.group': ['',
+      '每个输出对象包含的拍点数（>= 1）。一个流的最后一个对象装下剩余的拍点',
+      '每個輸出物件包含的拍點數（>= 1）。一個串流的最後一個物件裝下剩餘的拍點'],
+  'cfg.beat-track.units': ['',
+      '拍点的表示方式："time"（从流的第一个采样点起算的秒数，默认）、"samples"'
+      + '（输入采样率下的那个采样点）或 "frames"（起音包络帧，即分析采样率下'
+      + ' hop_length 个采样点——librosa 的默认）',
+      '拍點的表示方式："time"（從串流的第一個取樣點起算的秒數，預設）、"samples"'
+      + '（輸入取樣率下的那個取樣點）或 "frames"（起音包絡幀，即分析取樣率下'
+      + ' hop_length 個取樣點——librosa 的預設）'],
+  'cfg.beat-track.channels': ['',
+      '"mix"（默认）：一个跟踪器跟踪各声道的平均，正如 librosa.load 读取文件'
+      + '；"each"：每个声道一个跟踪器，每个对象注明其 `channel`；或一个声道序号',
+      '"mix"（預設）：一個追蹤器追蹤各聲道的平均，正如 librosa.load 讀取檔案'
+      + '；"each"：每個聲道一個追蹤器，每個物件註明其 `channel`；或一個聲道序號'],
+  'cfg.beat-track.sample_rate': ['',
+      '跟踪器所听的采样率：22050（默认），即 librosa.load 的采样率。其他输入'
+      + '采样率用 libavfilter 的 aresample 转换。0 表示按输入自身的采样率跟踪'
+      + '，相当于 beat_track(y, sr=该采样率)',
+      '追蹤器所聽的取樣率：22050（預設），即 librosa.load 的取樣率。其他輸入'
+      + '取樣率用 libavfilter 的 aresample 轉換。0 表示按輸入自身的取樣率追蹤'
+      + '，相當於 beat_track(y, sr=該取樣率)'],
+  'cfg.beat-track.hop_length': ['',
+      '起音包络在分析采样率下的步长（采样点数；librosa 的 512：22050 Hz 下 '
+      + '23 毫秒）；每秒最多 1000 个包络帧',
+      '起音包絡在分析取樣率下的步長（取樣點數；librosa 的 512：22050 Hz 下 '
+      + '23 毫秒）；每秒最多 1000 個包絡幀'],
+  'cfg.beat-track.start_bpm': ['',
+      '速度估计所用对数正态先验的中心，单位 bpm（librosa 的 120）',
+      '速度估計所用對數常態先驗的中心，單位 bpm（librosa 的 120）'],
+  'cfg.beat-track.tightness': ['',
+      '拍点贴合速度的紧密程度（librosa 的 100）；调低则更多地跟随起音',
+      '拍點貼合速度的緊密程度（librosa 的 100）；調低則更多地跟隨起音'],
+  'cfg.beat-track.trim': ['',
+      '去掉开头和结尾处较弱的拍点（librosa 的默认）',
+      '去掉開頭和結尾處較弱的拍點（librosa 的預設）'],
+  'cfg.beat-track.bpm': ['',
+      '> 0：按此速度跟踪而不估计速度（librosa 的 bpm=）',
+      '> 0：按此速度追蹤而不估計速度（librosa 的 bpm=）'],
+  'cfg.beat-track.max_latency': ['',
+      'stream 模式下拍点等待输出的最长时间，单位秒（默认 4）。多数拍点在被听到'
+      + '后 2-4 秒即可确定，但在两种拍点相位都说得通的段落，确定可能需要 10-20 '
+      + '秒；超过此时间就输出目前的最佳猜测，之后若有不同的判断，便从它接着往'
+      + '下走——已输出的从不改写。0 表示等到确定为止。与 librosa 对比的实测：'
+      + '4 秒时 98.1% 的拍点误差在一帧以内，2 秒 96.9%，1 秒 95.5%，等到确定'
+      + '时 98.8%-100%',
+      'stream 模式下拍點等待輸出的最長時間，單位秒（預設 4）。多數拍點在被聽到'
+      + '後 2-4 秒即可確定，但在兩種拍點相位都說得通的段落，確定可能需要 10-20 '
+      + '秒；超過此時間就輸出目前的最佳猜測，之後若有不同的判斷，便從它接著往'
+      + '下走——已輸出的從不改寫。0 表示等到確定為止。與 librosa 對比的實測：'
+      + '4 秒時 98.1% 的拍點誤差在一幀以內，2 秒 96.9%，1 秒 95.5%，等到確定'
+      + '時 98.8%-100%'],
+  'port.beat-track.in.pcm': ['',
+      'f32 PCM，单声道 [N] 或平面的 [C, N]，边带带 `sample_rate`。节拍长度'
+      + '任意；直到流结束为止的节拍属于同一个流',
+      'f32 PCM，單聲道 [N] 或平面的 [C, N]，邊帶帶 `sample_rate`。節拍長度'
+      + '任意；直到串流結束為止的節拍屬於同一個串流'],
+  'port.beat-track.out.beats': ['',
+      '每 `group` 个拍点一个 FlexData：{beats: 按 `units` 表示的 [..]、units、'
+      + 'index（beats[0] 的序号）、tempo（bpm）、sample_rate、hop_length、'
+      + 'analysis_rate、channel（"each" 或声道序号时）、timestamp_us（流的第一'
+      + '个采样点的 UTC，若有）}。拍点一经确定即输出',
+      '每 `group` 個拍點一個 FlexData：{beats: 按 `units` 表示的 [..]、units、'
+      + 'index（beats[0] 的序號）、tempo（bpm）、sample_rate、hop_length、'
+      + 'analysis_rate、channel（"each" 或聲道序號時）、timestamp_us（串流的第一'
+      + '個取樣點的 UTC，若有）}。拍點一經確定即輸出'],
+
   // ---- Audio → PCM (audio) ----
   'stage.audio-to-pcm.name': ['', '音频流 → PCM', '音訊串流 → PCM'],
   'stage.audio-to-pcm.doc': ['',
@@ -7482,6 +7567,13 @@ const STRINGS = {
   'cfg.save-text.append': ['',
       '追加写入文件（默认）；设为 false 则在开始时清空文件',
       '附加寫入檔案（預設）；設為 false 則在開始時清空檔案'],
+  'cfg.save-text.format': ['',
+      'text（默认）：字符串字段 `key` | json：节拍含有 `key` 字段时把它写成'
+      + '紧凑的 JSON，否则写整个节拍——每条一个 JSON 值（换行策略为 after 时'
+      + '即 JSON Lines）',
+      'text（預設）：字串欄位 `key` | json：節拍含有 `key` 欄位時把它寫成'
+      + '緊湊的 JSON，否則寫整個節拍——每條一個 JSON 值（換行策略為 after 時'
+      + '即 JSON Lines）'],
   'port.save-text.text': ['',
       '携带待保存文本的 FlexData（见 `key`）',
       '攜帶待儲存文字的 FlexData（見 `key`）'],

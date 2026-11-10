@@ -308,12 +308,14 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         temporal-slice-stage.cc
         vae-encode-range.cc
         vae-encode-plugin.cc
+        vae-encode-memory.cc
         vae-flops.cc
         content-aware-continuation-stage.cc
         temporal-stack-stage.cc
         tensor-list-stage.cc
         temporal-resample-stage.cc
         audio-temporal-resample-stage.cc
+        beat-track.cc
         text-chat-stage.cc
         text-to-speech-stage.cc
         visual-qa-stage.cc

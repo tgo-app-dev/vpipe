@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -48,12 +49,35 @@ public:
   CompareImageChannel(const CompareImageChannel&)            = delete;
   CompareImageChannel& operator=(const CompareImageChannel&) = delete;
 
+  // One side as the producer holds it: packed RGB24 at its own size.
+  struct Picture {
+    std::shared_ptr<const std::vector<std::uint8_t>> rgb;
+    int width  = 0;
+    int height = 0;
+  };
+  // Turns a side into the PNG the view shows at the common size, padded
+  // to it by the producer's policy; null when it cannot. Runs on a
+  // READER's thread, so it must hold nothing of the producer's but what
+  // it captured -- and it must stay callable for as long as the channel
+  // lives.
+  using Render =
+      std::function<Png(const Picture& side, int width, int height)>;
+
   // ---- producer side ------------------------------------------------
 
   // Latch a new pair (either image may be null) at the common size and
   // wake every waiter. Each call bumps the version, so republishing an
   // identical pair still notifies.
   void publish(Png a, Png b, int width, int height);
+
+  // The same for a pair still to be encoded: a side becomes a PNG only
+  // when a reader asks for the pair (snapshot / wait_change), once, on
+  // that reader's thread. A graph nobody watches -- every run without
+  // the web UI -- encodes nothing, and a producer never waits on a PNG.
+  // A side whose picture (the same `rgb`) and common size are the last
+  // publish's keeps the PNG it had.
+  void publish_pictures(Picture a, Picture b, int width, int height,
+                        std::shared_ptr<const Render> render);
 
   // End the channel: waiters wake with closed=true. Idempotent.
   void close();
@@ -70,9 +94,23 @@ public:
   bool closed() const noexcept;
 
 private:
+  // A side published as a picture, and whether its PNG is still owed.
+  struct Pending {
+    Picture pic;
+    bool    owed = false;
+  };
+
+  // Encode whatever the current pair still owes, then return it.
+  Snapshot render_owed_() const;
+
   mutable std::mutex              _mu;
   mutable std::condition_variable _cv;
-  Snapshot                        _cur;
+  // Serialises the renders: two readers asking at once encode a side
+  // once. Never held with _mu.
+  mutable std::mutex              _render_mu;
+  mutable Snapshot                _cur;
+  mutable Pending                 _pa, _pb;
+  std::shared_ptr<const Render>   _render;
 };
 
 // Abstract interface a stage implements to expose its comparison pair

@@ -38,6 +38,11 @@ namespace vpipe {
 //                                        "none"   entries concatenated as-is.
 //   append   (bool,   default true)   -- append to an existing file; false
 //                                        truncates it at initialize().
+//   format   (string, default "text") -- "text": the string field `key`;
+//                                        "json": field `key` as compact
+//                                        JSON when the beat has it, else
+//                                        the whole beat (JSON Lines under
+//                                        newline "after").
 class SaveTextStage final : public TypedStage<SaveTextStage> {
 public:
   static constexpr const char* kTypeName = "save-text";
@@ -64,6 +69,7 @@ private:
   std::string _key;
   Newline     _newline = Newline::After;
   bool        _append  = true;
+  bool        _json    = false;
 
   std::ofstream _out;
   bool          _wrote_any     = false;

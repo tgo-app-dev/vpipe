@@ -395,7 +395,8 @@ photo, **[docs/KLEIN.md](docs/KLEIN.md)**; for text-to-image,
 prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**; for speech with
 several voices, inline cues and voice cloning,
 **[docs/DRAMA3.md](docs/DRAMA3.md)**; to split a song into its vocals and
-accompaniment, **[docs/BS-ROFORMER.md](docs/BS-ROFORMER.md)**.
+accompaniment, **[docs/BS-ROFORMER.md](docs/BS-ROFORMER.md)**; to find
+a song's beats as they go by, **[docs/BEAT-TRACK.md](docs/BEAT-TRACK.md)**.
 Each ships the pipelines it describes.
 
 ---

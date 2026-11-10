@@ -58,7 +58,8 @@ std::string tmp_path_(const char* name)
 // Run a source -> save-text pipeline to completion and return the file text.
 std::string run_(Session& sess, std::vector<FlexData> beats,
                  const std::string& path, const char* newline,
-                 const char* key = "text", bool append = false)
+                 const char* key = "text", bool append = false,
+                 const char* format = "text")
 {
   Pipeline pl("tw", &sess);
   auto src = make_unique<FlexSource>(&sess, "src", vector<InEdge>{},
@@ -74,6 +75,7 @@ std::string run_(Session& sess, std::vector<FlexData> beats,
     o.insert("key", FlexData::make_string(key));
     o.insert("newline", FlexData::make_string(newline));
     o.insert("append", FlexData::make_bool(append));
+    o.insert("format", FlexData::make_string(format));
   }
   auto tw = make_unique<SaveTextStage>(&sess, "tw",
                                         vector<InEdge>{ { s, 0 } },
@@ -174,4 +176,51 @@ TEST(save_text_stage, plain_string_payload_written_whole) {
       run_(sess, { FlexData::make_string("bare line") }, p, "after");
   EXPECT_TRUE(got == "bare line\n");
   std::filesystem::remove(p, ec);
+}
+
+// format json: the field `key` as compact JSON when the beat has it, else
+// the whole beat -- one JSON value a line, read back as written.
+TEST(save_text_stage, json_writes_the_field_or_the_beat) {
+  Session sess;
+  const std::string p = tmp_path_("vpipe-tw-json.txt");
+  std::error_code ec; std::filesystem::remove(p, ec);
+  FlexData whole = FlexData::make_object();
+  {
+    auto o = whole.as_object();
+    FlexData a = FlexData::make_array();
+    a.as_array().push_back(FlexData::make_real(0.5));
+    a.as_array().push_back(FlexData::make_real(1.25));
+    o.insert("beats", std::move(a));
+    o.insert("tempo", FlexData::make_real(117.45));
+  }
+  FlexData field = FlexData::make_object();
+  {
+    FlexData inner = FlexData::make_object();
+    inner.as_object().insert("n", FlexData::make_int(7));
+    field.as_object().insert("text", std::move(inner));
+    field.as_object().insert("other", FlexData::make_int(1));
+  }
+  const std::string got =
+      run_(sess, { whole, field }, p, "after", "text", false, "json");
+  std::istringstream lines(got);
+  std::string l1, l2, l3;
+  std::getline(lines, l1);
+  std::getline(lines, l2);
+  const bool more = (bool)std::getline(lines, l3);
+  std::istringstream j1(l1), j2(l2);
+  const FlexData r1 = FlexData::from_json(j1);
+  const FlexData r2 = FlexData::from_json(j2);
+  EXPECT_TRUE(!more);
+  EXPECT_TRUE(r1.is_object() && r1.as_object().contains("tempo") &&
+              r1.as_object().at("tempo").as_real(0.0) == 117.45);
+  EXPECT_TRUE(r1.as_object().at("beats").as_array().size() == 2);
+  EXPECT_TRUE(r2.is_object() && r2.as_object().contains("n") &&
+              !r2.as_object().contains("other"));
+  std::filesystem::remove(p, ec);
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string("/tmp/x.txt"));
+  cfg.as_object().insert("format", FlexData::make_string("yaml"));
+  SaveTextStage bad(&sess, "w", vector<InEdge>{}, std::move(cfg));
+  EXPECT_FALSE(bad.config_error().empty());
 }

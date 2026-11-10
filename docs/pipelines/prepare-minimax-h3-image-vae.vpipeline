@@ -1,0 +1,17 @@
+{
+  "id": "prepare-minimax-h3-image-vae",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Mamad8/MiniMax-H3-Image-VAE",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

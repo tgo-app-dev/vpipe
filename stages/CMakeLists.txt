@@ -53,6 +53,7 @@ set(LOCAL_SOURCES
   vae-decode-stage.cc
   wavelet-color-fix.cc
   color-fix.cc
+  beat-tracker.cc
   vae-encode-stage.cc
   video-ref-encoder-stage.cc
   model-catalog.cc
@@ -206,6 +207,8 @@ if(VPIPE_BUILD_APPLE_SILICON)
   list(APPEND LOCAL_HEADERS generate-audio-stage.h)
   list(APPEND LOCAL_SOURCES audio-separate-stage.cc)
   list(APPEND LOCAL_HEADERS audio-separate-stage.h)
+  list(APPEND LOCAL_SOURCES beat-track-stage.cc)
+  list(APPEND LOCAL_HEADERS beat-track-stage.h)
   list(APPEND LOCAL_SOURCES latent-upscale-stage.cc)
   list(APPEND LOCAL_HEADERS latent-upscale-stage.h)
   list(APPEND LOCAL_SOURCES model-quantize-stage.cc)

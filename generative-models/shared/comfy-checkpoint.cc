@@ -131,29 +131,13 @@ unsupported_quant(const std::string& file)
   return false;
 }
 
+namespace {
+
 std::string
-resolve_component(const std::string& path, const std::string& subdir,
-                  const std::string& meta_key,
-                  const std::vector<std::string>& prefer)
+best_component_(const std::vector<fs::path>& dirs,
+                const std::string& meta_key,
+                const std::vector<std::string>& prefer)
 {
-  std::error_code ec;
-  const fs::path p(path);
-  // Handed the file itself -- the only case that accepts an unsupported
-  // packing's NAME, because an explicit path is a deliberate choice and
-  // the metadata check below still has to pass.
-  if (fs::is_regular_file(p, ec) && !ec) {
-    return is_component(path, meta_key) ? path : std::string();
-  }
-  if (!fs::is_directory(p, ec) || ec) { return {}; }
-
-  // The component subdirectory, then the repo root holding it. A root
-  // whose subdir is absent is not a Comfy-Org repo.
-  std::vector<fs::path> dirs;
-  if (p.filename() == subdir) { dirs.push_back(p); }
-  const fs::path sub = p / subdir;
-  if (fs::is_directory(sub, ec) && !ec) { dirs.push_back(sub); }
-  if (dirs.empty()) { return {}; }
-
   // Rank: preferred-substring index first (earliest wins), then the
   // SHORTEST filename. The length tiebreak is what picks the plain
   // conversion over a variant of it -- `minimax_h3_fl2va_bf16` over
@@ -188,6 +172,43 @@ resolve_component(const std::string& path, const std::string& subdir,
     }
   }
   return best;
+}
+
+}  // namespace
+
+std::string
+resolve_component(const std::string& path, const std::string& subdir,
+                  const std::string& meta_key,
+                  const std::vector<std::string>& prefer)
+{
+  std::error_code ec;
+  const fs::path p(path);
+  // Handed the file itself -- the only case that accepts an unsupported
+  // packing's NAME, because an explicit path is a deliberate choice and
+  // the metadata check below still has to pass.
+  if (fs::is_regular_file(p, ec) && !ec) {
+    return is_component(path, meta_key) ? path : std::string();
+  }
+  if (!fs::is_directory(p, ec) || ec) { return {}; }
+
+  // The component subdirectory, then the repo root holding it. A root
+  // whose subdir is absent is not a Comfy-Org repo.
+  std::vector<fs::path> dirs;
+  if (p.filename() == subdir) { dirs.push_back(p); }
+  const fs::path sub = p / subdir;
+  if (fs::is_directory(sub, ec) && !ec) { dirs.push_back(sub); }
+  if (dirs.empty()) { return {}; }
+  return best_component_(dirs, meta_key, prefer);
+}
+
+std::string
+resolve_component_in(const std::string& dir, const std::string& meta_key,
+                     const std::vector<std::string>& prefer)
+{
+  std::error_code ec;
+  const fs::path p(dir);
+  if (!fs::is_directory(p, ec) || ec) { return {}; }
+  return best_component_({p}, meta_key, prefer);
 }
 
 std::vector<Component>

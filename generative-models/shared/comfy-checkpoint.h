@@ -93,6 +93,14 @@ std::string resolve_component(const std::string& path,
                               const std::string& meta_key,
                               const std::vector<std::string>& prefer = {});
 
+// The same search over the files directly in `dir` -- a repository
+// published as one self-describing file at its top, with no role
+// subdirectory. Same candidates, same ranking. "" when `dir` is not a
+// directory or holds no such file.
+std::string resolve_component_in(const std::string& dir,
+                                 const std::string& meta_key,
+                                 const std::vector<std::string>& prefer = {});
+
 // One readable single-file component found in a Comfy-Org repo.
 struct Component {
   std::string role;      // the repo subdir: "diffusion_models", "vae", ...

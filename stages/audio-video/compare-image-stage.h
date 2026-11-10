@@ -12,10 +12,6 @@
 #include <string>
 #include <vector>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-}
-
 namespace vpipe {
 
 struct TensorBeat;
@@ -66,6 +62,19 @@ public:
 
   Job process(RuntimeContext& ctx) override;
 
+  // What the stage holds, in the plan: see pair_bytes().
+  std::vector<ResourceClaim> declare_resources() const override;
+  StageMemory declare_memory() const override;
+
+  // The bytes a pair holds: each side's picture, packed RGB24 at its own
+  // size, kept for the run -- and a viewer's render at the common size
+  // (`w` x `h`): the frame it draws into, the PNG encoder's buffer and
+  // its packet, sized for a picture that does not compress, the PNG
+  // copied out, the other side's PNG kept. No signal says whether a
+  // viewer will mount, so the render is counted whenever the stage runs.
+  static std::size_t pair_bytes(int wa, int ha, int wb, int hb, int w,
+                                int h);
+
   const StageSpec& spec() const noexcept override;
 
   std::shared_ptr<CompareImageChannel> compare_channel() const override
@@ -86,12 +95,13 @@ public:
   std::uint64_t process_calls() const noexcept { return _process_calls; }
 
 private:
-  // One input's latest frame, unpacked to packed RGB24 at its OWN size.
-  // Padding to the common size happens at publish time, so a later
-  // change to the other input re-fits this one without needing the
-  // original TensorBeat.
+  // One input's latest frame, unpacked to packed RGB24 at its OWN size,
+  // and SHARED with the channel, which pads and encodes it only when a
+  // viewer asks (CompareImageChannel::publish_pictures) -- so a later
+  // change to the other input re-fits this one without the original
+  // TensorBeat, and nothing is encoded for a graph nobody watches.
   struct Side {
-    std::vector<std::uint8_t> rgb;   // packed RGB24, w*h*3
+    std::shared_ptr<const std::vector<std::uint8_t>> rgb;  // w*h*3
     int  w = 0;
     int  h = 0;
     bool valid = false;
@@ -104,23 +114,21 @@ private:
   // a malformed shape.
   bool unpack_(const TensorBeat& tb, Side& side) const;
 
-  // Scale-and-centre `src` into a `dst_w` x `dst_h` packed-RGB24 buffer
-  // using the pad policy; the border is `pad_color`. A source already at
-  // the target size is copied verbatim (no resample).
-  void pad_fit_(const Side& src, int dst_w, int dst_h,
-                std::vector<std::uint8_t>* dst) const;
-
-  // PNG-encode a packed-RGB24 buffer. Returns null on failure (the
-  // encoder is built lazily and re-built when the size changes).
-  CompareImageChannel::Png
-  encode_png_(const std::vector<std::uint8_t>& rgb, int w, int h);
-
   void teardown_();
 
-  // Re-fit both sides to the current common size and publish the pair.
+  // Publish the current pair at its common size, for a viewer to render.
   void publish_();
 
+  // The plan's figure: two 1024^2 sides at launch, then each beat's real
+  // pair, stated BEFORE its picture is unpacked.
+  std::string scratch_label_() const;
+  void revise_scratch_(std::size_t bytes);
+  std::size_t _scratch_stated = 0;
+
   const FFmpegLibraries* _libs = nullptr;
+  // What a viewer runs to turn a side into a PNG (render_png_ over the
+  // libraries and the pad colour, nothing of the stage's).
+  std::shared_ptr<const CompareImageChannel::Render> _render;
 
   // Config.
   bool         _input_normalized = true;
@@ -130,16 +138,9 @@ private:
   Side _a;
   Side _b;
 
-  // Last published common size; the PNG encoder is keyed to it.
+  // Last published common size.
   int _pub_w = 0;
   int _pub_h = 0;
-
-  AVCodecContext* _png     = nullptr;
-  AVFrame*        _png_frm = nullptr;
-  AVPacket*       _png_pkt = nullptr;
-  int             _png_w   = 0;    // size the encoder was opened at
-  int             _png_h   = 0;
-  bool            _png_bad = false;
 
   bool _roles_resolved = false;
   bool _want_a = false;
