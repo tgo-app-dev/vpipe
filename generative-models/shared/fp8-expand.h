@@ -60,6 +60,12 @@ struct Codes {
   const metal_compute::SharedBuffer* s_rel    = nullptr;
   const metal_compute::SharedBuffer* codebook = nullptr;
   int                                qgroup   = 0;
+  // NVFP4 (Format::kNVFP4; `codes` [N, K / 2] nibbles, `s_rel` its E4M3
+  // block scales, `scale` its weight_scale_2): the spelling (fp8.h), and
+  // an AWQ pre_quant_scale as f32 [K] (null or empty: none).
+  bool                               nibble_hi = false;
+  bool                               swizzled  = false;
+  const metal_compute::SharedBuffer* pre_quant = nullptr;
   bool any() const noexcept {
     return format != Format::kNone && codes != nullptr;
   }
@@ -81,6 +87,9 @@ class Expander {
   bool int8_valid() const noexcept;
   // W4A8's kernel (w4a8_convrot_dequant), optional as int8's are.
   bool w4a8_valid() const noexcept { return _w4a8.valid(); }
+  // NVFP4's (nvfp4_dequant), optional alike: a host older than it
+  // refuses an NVFP4 checkpoint by name.
+  bool nvfp4_valid() const noexcept { return _nvfp4.valid(); }
 
   // Encode codes -> `dst`, [N, K] bf16, and return true. False, with
   // nothing encoded, when the buffers are short, the element count
@@ -95,7 +104,15 @@ class Expander {
   metal_compute::ComputeFunction _e4m3, _e5m2, _e4m3_s, _e5m2_s;
   metal_compute::ComputeFunction _i8_s, _i8_rot;   // int8; and ConvRot
   metal_compute::ComputeFunction _w4a8;           // W4A8
+  metal_compute::ComputeFunction _nvfp4;          // NVFP4
 };
+
+// An NVFP4 weight's AWQ pre_quant_scale as the f32 buffer Codes::pre_quant
+// is: empty (and *ok true) where it has none.
+metal_compute::SharedBuffer pre_quant_buffer(const MetalLlamaWeights& w,
+                                             const Weight& x,
+                                             metal_compute::MetalCompute* mc,
+                                             bool* ok);
 
 // The scale of the FP8 weight `name` as the f32 buffer Codes::scale is:
 // empty for an unscaled weight (and *ok true), one value or `rows` of
@@ -108,7 +125,8 @@ metal_compute::SharedBuffer scale_buffer(const MetalLlamaWeights& w,
 // One FP8 tensor decoded whole on the host, to bf16 or f32 -- for the
 // small tensors a model converts rather than keeps (norms, embeddings,
 // host-side MLPs) and for fallbacks. False + *err when `name` is not an
-// FP8 tensor this build reads, or `n` is not its element count.
+// FP8 tensor this build reads, or `n` is not its element count (its
+// LOGICAL count: a nibble format's twice its bytes). NVFP4 too.
 bool decode_tensor_bf16(const MetalLlamaWeights& w, const std::string& name,
                         std::uint16_t* dst, std::size_t n, std::string* err);
 bool decode_tensor_f32(const MetalLlamaWeights& w, const std::string& name,

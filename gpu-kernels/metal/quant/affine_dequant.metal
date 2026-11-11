@@ -2384,3 +2384,68 @@ kernel void w4a8_to_i8(const device uchar* w       [[buffer(0)]],
   const float p = val * fp8_e4m3_f_(s_rel[e / qgroup]);
   q[e] = (char)(int)clamp(rint(p), -127.0f, 127.0f);
 }
+
+// NVFP4 (shared/fp8.h): element e of row r = e / K, column k = e % K is an
+// E2M1 nibble of byte e / 2 -- the even column's LOW nibble in ModelOpt's
+// spelling, HIGH in ComfyUI's (flags bit 0) -- times its 16-column
+// block's E4M3 scale and the tensor's scale_2: e2m1 * (scale * scale_2),
+// in f32 in that order, times the column's AWQ pre_quant_scale where
+// given (flags bit 2), rounded ONCE into VPIPE_ELT -- shared/
+// fp8-layout.cc's decode_nvfp4_bf16 to the bit. The block scales lie row
+// by row ([N, K / 16]) or in cuBLAS's swizzled tiles (flags bit 1; fp8.h's
+// nvfp4_scale_index). scale_2 is one value (div = n) or one a row
+// (div = K: a weight stacked from several tensors). Eight elements a
+// thread, half a block: one scale read. K a multiple of 16.
+//
+//   0:packed(uchar) 1:y(VPIPE_ELT) 2:n 3:scale_2(float) 4:div 5:K
+//   6:blocks(uchar, E4M3) 7:pre_quant(float[K]) 8:flags
+// grid {ceil(n / 8), 1, 1}, tg {256, 1, 1}.
+constant float kE2M1_[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,
+                             4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
+                             -2.0f, -3.0f, -4.0f, -6.0f};
+
+kernel void nvfp4_dequant(const device uchar* w       [[buffer(0)]],
+                          device VPIPE_ELT*   y       [[buffer(1)]],
+                          const constant uint& n      [[buffer(2)]],
+                          const device float* scale_2 [[buffer(3)]],
+                          const constant uint& div    [[buffer(4)]],
+                          const constant uint& K      [[buffer(5)]],
+                          const device uchar* blocks  [[buffer(6)]],
+                          const device float* pq      [[buffer(7)]],
+                          const constant uint& flags  [[buffer(8)]],
+                          uint gid [[thread_position_in_grid]])
+{
+  const uint e = gid * 8u;
+  if (e >= n) { return; }
+  const uint r = e / K, k = e % K, b = k / 16u, nb = K / 16u;
+  uint si;
+  if ((flags & 2u) != 0u) {
+    const uint tiles = (nb + 3u) / 4u;
+    si = ((r / 128u) * tiles + b / 4u) * 512u + (r % 32u) * 16u +
+         ((r % 128u) / 32u) * 4u + b % 4u;
+  } else {
+    si = r * nb + b;
+  }
+  const float s = fp8_e4m3_f_(blocks[si]) * scale_2[e / div];
+  const uchar4 c = *reinterpret_cast<const device uchar4*>(w + e / 2u);
+  const bool hi = (flags & 1u) != 0u;
+  const bool awq = (flags & 4u) != 0u;
+  VPIPE_ELT out[8];
+  for (uint j = 0; j < 4u; ++j) {
+    const uint byte = c[j];
+    const uint even = hi ? (byte >> 4) : (byte & 15u);
+    const uint odd = hi ? (byte & 15u) : (byte >> 4);
+    float v0 = kE2M1_[even] * s, v1 = kE2M1_[odd] * s;
+    if (awq) {
+      v0 *= pq[k + 2u * j];
+      v1 *= pq[k + 2u * j + 1u];
+    }
+    out[2u * j] = (VPIPE_ELT)v0;
+    out[2u * j + 1u] = (VPIPE_ELT)v1;
+  }
+  device VPIPE_ELT* dst = y + e;
+  *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(dst) =
+      vec<VPIPE_ELT, 4>(out[0], out[1], out[2], out[3]);
+  *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(dst + 4) =
+      vec<VPIPE_ELT, 4>(out[4], out[5], out[6], out[7]);
+}

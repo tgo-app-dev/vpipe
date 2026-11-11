@@ -3035,6 +3035,208 @@ KQ_BATCH_ENTRY(qmv_q5k_batch4_f16, qmv_q5k_batch_impl, 4)
 KQ_BATCH_ENTRY(qmv_q6k_batch_f16,  qmv_q6k_batch_impl, 2)
 KQ_BATCH_ENTRY(qmv_q6k_batch4_f16, qmv_q6k_batch_impl, 4)
 
+// ---- NVFP4 (ModelOpt), served as a k-quant type -------------------------
+// A super-block (generative-models/shared/nvfp4.h) is 256 inputs of one
+// row in 148 bytes: f32 scale_2 at +0, the 16 block scales (E4M3, a block
+// 16 inputs) at +4, the 128 code bytes at +20 as ModelOpt packs them --
+// input 2i the low nibble, 2i+1 the high. w = e2m1(code) * e4m3(scale) *
+// scale_2.
+//
+// Neither table is a lookup. An E2M1 code's three magnitude bits, put on
+// a half's exponent low bits and top mantissa bit (subnormal for exponent
+// 0), read as the value times 2^-14; an E4M3 scale's seven, on the
+// exponent low bits and the top three mantissa bits, as its value times
+// 2^-8. Both factors are powers of two, folded into the block's scale
+// exactly: 2^22.
+
+// Two codes of a byte (the low nibble first) as their values / 2^14.
+inline float2 nvfp4_pair_(uint b) {
+  const uint lo = b & 0xFu, hi = (b >> 4) & 0xFu;
+  const uint bits = ((lo & 8u) << 12) | ((lo & 7u) << 9) |
+                    ((((hi & 8u) << 12) | ((hi & 7u) << 9)) << 16);
+  return float2(as_type<half2>(bits));
+}
+
+// A block scale (E4M3) as its value / 2^8.
+inline float nvfp4_scale_(uint s) {
+  return float(as_type<half>(ushort(((s & 0x80u) << 8) |
+                                    ((s & 0x7Fu) << 7))));
+}
+
+// The weight at input `pos` (0..255) of super-block `sb`.
+inline float nvfp4_value(const device uchar* sb, int pos) {
+  const float g = *(const device float*)sb;
+  const float2 p = nvfp4_pair_(sb[20 + (pos >> 1)]);
+  return ((pos & 1) != 0 ? p.y : p.x) *
+         (nvfp4_scale_(sb[4 + (pos >> 4)]) * g * 4194304.0f);
+}
+
+// Dequantize N served NVFP4 weights -> f16 (rows back to back).
+// 0:src 1:out 2:N.  grid (N).
+kernel void dequant_nvfp4_f16(
+    const device uchar* src [[buffer(0)]],
+    device VPIPE_ELT*   out [[buffer(1)]],
+    constant int&       N   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)N) { return; }
+  out[gid] = VPIPE_ELT(nvfp4_value(src + (gid >> 8) * 148u,
+                                   (int)(gid & 255u)));
+}
+
+// GEMV over a served NVFP4 weight [N, H]: y[o] = sum_h x[h] w[o, h].
+// One simdgroup a row: each lane reads 4 code bytes -- 8 inputs, half of
+// one 16-input block -- of every super-block, so its block scale is one
+// load and one decode. NSG=2 rows a threadgroup. Requires H % 256 == 0.
+// 0:w 1:x 2:y 3:H 4:N.  grid (32, ceil(N/2)*2, 1); threadgroup (32, 2, 1).
+kernel void qmv_nvfp4_f16(
+    const device uchar*     w [[buffer(0)]],
+    const device VPIPE_ELT* x [[buffer(1)]],
+    device VPIPE_ELT*       y [[buffer(2)]],
+    constant int&           H [[buffer(3)]],
+    constant int&           N [[buffer(4)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int NSG = 2;
+  const int row = (int)tid.y * NSG + (int)simd_gid;
+  if (row >= N) { return; }
+  const int nsb = H / 256;
+  const device uchar* rowp = w + (uint)row * (uint)(nsb * 148);
+  const int lane = (int)simd_lid;
+  float acc = 0.0f;
+  for (int s = 0; s < nsb; ++s) {
+    const device uchar* sb = rowp + s * 148;
+    const float d = nvfp4_scale_(sb[4 + (lane >> 1)]) *
+                    (*(const device float*)sb) * 4194304.0f;
+    const uint q = *(const device uint*)(sb + 20 + lane * 4);
+    const device VPIPE_ELT* xp = x + s * 256 + lane * 8;
+    float part = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+      const float2 wv = nvfp4_pair_(q >> (8 * k));
+      part += wv.x * float(xp[2 * k]) + wv.y * float(xp[2 * k + 1]);
+    }
+    acc += part * d;
+  }
+  const float v = simd_sum(acc);
+  if (lane == 0) { y[row] = VPIPE_ELT(v); }
+}
+
+// The batched twin (MTP verify / batched decode): the weight read once per
+// MAXM rows; per row the single-row kernel's arithmetic in its order, so
+// bit-identical to it. The k-quant batch entries' binding.
+template <int MAXM>
+inline void qmv_nvfp4_batch_impl(
+    const device uchar*     w,
+    const device VPIPE_ELT* x,
+    device VPIPE_ELT*       y,
+    const constant int&     H,
+    const constant int&     N,
+    const constant int&     m_total,
+    const constant int&     ystride,
+    const constant int&     yoff,
+    uint3 tid, uint simd_gid, uint simd_lid)
+{
+  constexpr int NSG = 2;
+  const int row = (int)tid.y * NSG + (int)simd_gid;
+  if (row >= N) { return; }
+  const int base = (int)tid.z * MAXM;
+  const int m_rows = metal::min(MAXM, m_total - base);
+  if (m_rows <= 0) { return; }
+  const int nsb = H / 256;
+  const device uchar* rowp = w + (uint)row * (uint)(nsb * 148);
+  const int lane = (int)simd_lid;
+  const device VPIPE_ELT* xptr[MAXM];
+  for (int m = 0; m < MAXM; ++m) {
+    const int mm = (m < m_rows) ? m : (m_rows - 1);
+    xptr[m] = x + (uint)(base + mm) * H;
+  }
+  float acc[MAXM];
+  for (int m = 0; m < MAXM; ++m) { acc[m] = 0.0f; }
+  for (int s = 0; s < nsb; ++s) {
+    const device uchar* sb = rowp + s * 148;
+    const float d = nvfp4_scale_(sb[4 + (lane >> 1)]) *
+                    (*(const device float*)sb) * 4194304.0f;
+    const uint q = *(const device uint*)(sb + 20 + lane * 4);
+    const int xo = s * 256 + lane * 8;
+    float2 wv[4];
+    for (int k = 0; k < 4; ++k) { wv[k] = nvfp4_pair_(q >> (8 * k)); }
+    for (int m = 0; m < MAXM; ++m) {
+      const device VPIPE_ELT* xp = xptr[m] + xo;
+      float part = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        part += wv[k].x * float(xp[2 * k]) + wv[k].y * float(xp[2 * k + 1]);
+      }
+      acc[m] += part * d;
+    }
+  }
+  for (int m = 0; m < MAXM; ++m) {
+    const float v = simd_sum(acc[m]);
+    if (lane == 0 && m < m_rows) {
+      y[(uint)(base + m) * ystride + yoff + row] = VPIPE_ELT(v);
+    }
+  }
+}
+KQ_BATCH_ENTRY(qmv_nvfp4_batch_f16,  qmv_nvfp4_batch_impl, 2)
+KQ_BATCH_ENTRY(qmv_nvfp4_batch4_f16, qmv_nvfp4_batch_impl, 4)
+
+// Serve an NVFP4 linear [N, K] from its file tensors: the super-blocks
+// nvfp4::pack writes, byte for byte, with ComfyUI's spelling made
+// ModelOpt's on the way (the even column's nibble high -> low; the block
+// scales out of cuBLAS's swizzled 128 x 4 tiles) and, with a row
+// multiplier bound, scale_2 * mul[n] in f32 for row n's tensor scale (the
+// next projection's AWQ scale folded into this one's output rows) -- the
+// bytes LayerLoad::nvfp4_served packs on the host. A streamed NVFP4 layer
+// of MetalQwenModel is built by it. One thread a super-block, written as
+// its 37 words (scale_2, 4 of block scales, 32 of codes); K % 256 == 0.
+// 0:codes [N, K/2] 1:blocks (as stored) 2:scale_2 f32 [1] 3:mul f32 [N]
+// 4:dst 5:N 6:K 7:flags (1 high nibble first, 2 swizzled, 4 multiplier).
+// grid (K/256, N).
+kernel void nvfp4_serve(
+    const device uint*  codes  [[buffer(0)]],
+    const device uint*  blocks [[buffer(1)]],
+    const device float* s2     [[buffer(2)]],
+    const device float* mul    [[buffer(3)]],
+    device uint*        dst    [[buffer(4)]],
+    constant int&       N      [[buffer(5)]],
+    constant int&       K      [[buffer(6)]],
+    constant uint&      flags  [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const uint supers = (uint)K / 256u;
+  const uint s = gid.x, n = gid.y;
+  if (s >= supers || n >= (uint)N) { return; }
+  device uint* o = dst + ((ulong)n * supers + s) * 37ul;
+  float g = s2[0];
+  if ((flags & 4u) != 0u) { g = g * mul[n]; }
+  o[0] = as_type<uint>(g);
+  // Four blocks a word: contiguous in either layout (a swizzled tile
+  // keeps a row's four blocks together).
+  const uint B = (uint)K / 16u;
+  for (uint q = 0; q < 4u; ++q) {
+    const uint b = s * 16u + q * 4u;
+    ulong at;
+    if ((flags & 2u) != 0u) {
+      const ulong tiles = (ulong)((B + 3u) / 4u);
+      at = ((ulong)(n / 128u) * tiles + (ulong)(b / 4u)) * 512ul +
+           (ulong)(n % 32u) * 16ul + (ulong)((n % 128u) / 32u) * 4ul;
+    } else {
+      at = (ulong)n * B + b;
+    }
+    o[1 + q] = blocks[at / 4ul];
+  }
+  const device uint* c =
+      codes + ((ulong)n * (ulong)(K / 2) + (ulong)s * 128ul) / 4ul;
+  for (uint w = 0; w < 32u; ++w) {
+    uint v = c[w];
+    if ((flags & 1u) != 0u) {
+      v = ((v & 0x0F0F0F0Fu) << 4) | ((v >> 4) & 0x0F0F0F0Fu);
+    }
+    o[5 + w] = v;
+  }
+}
+
 // Transpose [A, B, D] -> [B, A, D] (D-vectors kept intact). Used by
 // batched prefill to swap token-major <-> head-major:
 //   q [n, Hq, D] -> [Hq, n, D]   (A=n, B=Hq)
@@ -5699,4 +5901,18 @@ kernel void prism_hadamard_rows_1024(
     if (inverse != 0) { o *= signs[k0 + j]; }
     yr[j] = (VPIPE_ELT)o;
   }
+}
+
+// x[r, c] *= s[c]: a column scale over `total` elements of rows `cols`
+// wide -- an NVFP4 projection's AWQ pre_quant_scale on its input.
+//   0:x 1:s(float[cols]) 2:cols 3:total. grid (total).
+kernel void scale_cols_inplace_f16(
+    device VPIPE_ELT*    x     [[buffer(0)]],
+    const device float*  s     [[buffer(1)]],
+    constant int&        cols  [[buffer(2)]],
+    constant int&        total [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)total) { return; }
+  x[gid] = VPIPE_ELT(float(x[gid]) * s[gid % (uint)cols]);
 }

@@ -26,6 +26,7 @@ Expander::load(MetalCompute* mc)
   _i8_s   = _lib.function("i8_dequant_scaled");
   _i8_rot = _lib.function("i8_convrot_dequant");
   _w4a8   = _lib.function("w4a8_convrot_dequant");
+  _nvfp4  = _lib.function("nvfp4_dequant");
   return valid();
 }
 
@@ -53,6 +54,37 @@ Expander::encode(ComputeEncoder& enc, const Codes& w, const SharedBuffer& dst,
   // any single weight these models carry.
   if (n == 0 || n > 0xFFFFFFFFull || dst.byte_size() < n * 2) {
     return false;
+  }
+  if (w.format == Format::kNVFP4) {
+    // Nibbles, eight elements a thread -- one 16-column block's half,
+    // so a thread reads one block scale.
+    const std::size_t blocks = K / 16;
+    const std::size_t sbytes =
+        w.swizzled ? (N + 127) / 128 * 128 * ((blocks + 3) / 4 * 4)
+                   : N * blocks;
+    const bool pq = w.pre_quant != nullptr && !w.pre_quant->empty();
+    if (!nvfp4_valid() || !w.scaled() || w.s_rel == nullptr ||
+        K % 16 != 0 || w.codes->byte_size() < n / 2 ||
+        w.s_rel->byte_size() < sbytes ||
+        w.scale->byte_size() < (w.per_row ? N : 1) * sizeof(float) ||
+        (pq && w.pre_quant->byte_size() < K * sizeof(float))) {
+      return false;
+    }
+    enc.set_function(_nvfp4);
+    enc.set_buffer(0, *w.codes);
+    enc.set_buffer(1, dst);
+    enc.set_constant(2, (std::uint32_t)n);
+    enc.set_buffer(3, *w.scale);
+    enc.set_constant(4, (std::uint32_t)(w.per_row ? K : n));
+    enc.set_constant(5, (std::uint32_t)K);
+    enc.set_buffer(6, *w.s_rel);
+    // The pre_quant slot is bound either way; without one it is not read.
+    enc.set_buffer(7, pq ? *w.pre_quant : *w.scale);
+    enc.set_constant(8, (std::uint32_t)((w.nibble_hi ? 1u : 0u) |
+                                        (w.swizzled ? 2u : 0u) |
+                                        (pq ? 4u : 0u)));
+    enc.dispatch({(unsigned)((n + 7) / 8), 1, 1}, {256, 1, 1});
+    return true;
   }
   if (w.format == Format::kW4A8) {
     // Nibbles, two a byte; the int8 pass after the decode (a 1024-element
@@ -152,6 +184,31 @@ scale_buffer(const MetalLlamaWeights& w, const Weight& x, std::size_t rows,
   return b;
 }
 
+SharedBuffer
+pre_quant_buffer(const MetalLlamaWeights& w, const Weight& x,
+                 MetalCompute* mc, bool* ok)
+{
+  if (ok != nullptr) { *ok = true; }
+  if (x.pre_quant.empty()) { return {}; }
+  const auto* pi = w.info(x.pre_quant);
+  std::size_t n = 1;
+  if (pi != nullptr) {
+    for (auto d : pi->shape) { n *= (std::size_t)d; }
+  }
+  Weight as_scale;
+  as_scale.scale = x.pre_quant;
+  as_scale.per_row = true;
+  std::vector<float> v;
+  SharedBuffer b;
+  if (mc != nullptr && pi != nullptr &&
+      read_scale(w, as_scale, n, &v, nullptr) && v.size() == n) {
+    b = mc->make_shared_buffer(n * sizeof(float));
+    if (!b.empty()) { std::memcpy(b.contents(), v.data(), n * sizeof(float)); }
+  }
+  if (b.empty() && ok != nullptr) { *ok = false; }
+  return b;
+}
+
 namespace {
 
 // The codes and scale of `name`, read for a host decode.
@@ -228,6 +285,52 @@ w4a8_host_(const MetalLlamaWeights& w, const std::string& name,
   return true;
 }
 
+// An NVFP4 tensor decoded on the host: `n` the LOGICAL element count.
+bool
+nvfp4_host_(const MetalLlamaWeights& w, const std::string& name,
+            const Weight& x, std::uint16_t* dst, std::size_t n,
+            std::string* err)
+{
+  const auto* ti = w.info(name);
+  const auto* bi = w.info(x.s_rel);
+  if (ti == nullptr || bi == nullptr || ti->shape.size() != 2) {
+    if (err != nullptr) { *err = "'" + name + "' is not an NVFP4 tensor"; }
+    return false;
+  }
+  const std::size_t rows = (std::size_t)ti->shape[0];
+  const std::size_t cols = (std::size_t)ti->shape[1] * 2;
+  if (rows * cols != n) {
+    if (err != nullptr) {
+      *err = fmt("'{}' holds {} values, not {}", name, rows * cols, n)();
+    }
+    return false;
+  }
+  std::vector<std::uint8_t> codes((std::size_t)ti->nbytes),
+      bs((std::size_t)bi->nbytes);
+  std::vector<float> scale, pq;
+  if (!w.read_into(name, codes.data(), codes.size()) ||
+      !w.read_into(x.s_rel, bs.data(), bs.size()) ||
+      !read_scale(w, x, rows, &scale, err) || scale.size() != 1) {
+    if (err != nullptr && err->empty()) { *err = "cannot read " + name; }
+    return false;
+  }
+  if (!x.pre_quant.empty()) {
+    Weight as_scale;
+    as_scale.scale = x.pre_quant;
+    as_scale.per_row = true;
+    if (!read_scale(w, as_scale, cols, &pq, err) || pq.size() != cols) {
+      if (err != nullptr && err->empty()) {
+        *err = "cannot read '" + x.pre_quant + "'";
+      }
+      return false;
+    }
+  }
+  decode_nvfp4_bf16(codes.data(), bs.data(), scale[0],
+                    pq.empty() ? nullptr : pq.data(), rows, cols,
+                    x.nibble_hi, x.swizzled, dst);
+  return true;
+}
+
 }  // namespace
 
 bool
@@ -237,9 +340,13 @@ decode_tensor_bf16(const MetalLlamaWeights& w, const std::string& name,
   {
     Weight x;
     std::string e;
-    if (resolve(w, name, &x, &e, /*int8=*/true) &&
-        x.format == Format::kW4A8) {
-      return w4a8_host_(w, name, x, dst, n, err);
+    if (resolve(w, name, &x, &e, /*int8=*/true, /*nvfp4=*/true)) {
+      if (x.format == Format::kW4A8) {
+        return w4a8_host_(w, name, x, dst, n, err);
+      }
+      if (x.format == Format::kNVFP4) {
+        return nvfp4_host_(w, name, x, dst, n, err);
+      }
     }
   }
   Weight x;
@@ -261,10 +368,14 @@ decode_tensor_f32(const MetalLlamaWeights& w, const std::string& name,
   {
     Weight x;
     std::string e;
-    if (resolve(w, name, &x, &e, /*int8=*/true) &&
-        x.format == Format::kW4A8) {
+    if (resolve(w, name, &x, &e, /*int8=*/true, /*nvfp4=*/true) &&
+        (x.format == Format::kW4A8 || x.format == Format::kNVFP4)) {
       std::vector<std::uint16_t> b(n);
-      if (!w4a8_host_(w, name, x, b.data(), n, err)) { return false; }
+      if (!(x.format == Format::kW4A8
+                ? w4a8_host_(w, name, x, b.data(), n, err)
+                : nvfp4_host_(w, name, x, b.data(), n, err))) {
+        return false;
+      }
       for (std::size_t i = 0; i < n; ++i) {
         const std::uint32_t u = (std::uint32_t)b[i] << 16;
         std::memcpy(&dst[i], &u, sizeof(float));

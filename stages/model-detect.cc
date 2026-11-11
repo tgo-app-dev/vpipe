@@ -10,6 +10,7 @@
 
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
 #include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/wan/metal-wan-vae.h"
@@ -227,6 +228,7 @@ family_version_(const std::string& mt, std::string& family,
       {"minimax-h3-dit",         "MiniMax",     "H3-FL2VA"},
       {"minimax-h3-text-encoder", "MiniMax",    "H3-FL2VA"},
       {"p-h3-image",             "P-H3",        "Image"},
+      {"minimax-h3-image",       "MiniMax",     "H3-Image"},
       {"moss-tts",               "MOSS",        "TTS"},
       {"moss-tts-local",         "MOSS",        "TTS-Local"},
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
@@ -855,6 +857,13 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     d.detected_by = "p-h3-image-manifest";
     catalog_default_io(d.model_type, d.inputs, d.outputs);
   }
+  // MiniMax-H3-Image, by its model_index.json: an audio-less H3 DiT whose
+  // `_minimax_h3.partition` ("image") is neither of the video ones.
+  if (d.is_dir && d.model_type.empty() && genai::h3i::is_root(dir)) {
+    d.model_type  = "minimax-h3-image";
+    d.detected_by = "minimax-h3-image-manifest";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
   const FlexData dit_cfg = read_json_(root / "transformer" / "config.json");
   if (dit_cfg.is_object() && d.model_type.empty()) {
     // as_object() returns a VIEW, so the manifest has to outlive the
@@ -1331,6 +1340,9 @@ constexpr VaeClass kVaeClasses[] = {
     // P-H3-Image's: H3's encoder with a decoder for one latent frame,
     // which the same class runs (Config::dec_patch_t).
     {genai::ph3::kVaeClass, "minimax-h3"},
+    // MiniMax-H3-Image's: H3's encoder with a 2D ViT decoder, (h, w)
+    // rotary over one latent frame (Config::rope_axes).
+    {genai::h3i::kVaeClass, "minimax-h3"},
 };
 
 }  // namespace

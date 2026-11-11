@@ -153,6 +153,11 @@ class MetalMiniMaxH3VideoVae {
     // Such a checkpoint decodes single frames only (decode_image).
     int    dec_patch_t = 0;
     double t1_time     = std::numeric_limits<double>::quiet_NaN();
+    // The decoder's ROTARY AXES: 3 -- (t, h, w), the video decoder's and
+    // P-H3-Image's -- or 2, (h, w) alone: MiniMax-H3-Image's 2D decoder
+    // (`MiniMaxH3ImageVAE`, `vit_decoder_2d`), which decodes one latent
+    // frame and carries no time at all.
+    int    rope_axes   = 3;
 
     // Derived temporal-chunk geometry. `clip_length` is deliberately
     // NOT a multiple of `patch_t`, so a chunk's leading `frame_pre_pad`
@@ -177,11 +182,14 @@ class MetalMiniMaxH3VideoVae {
       return f > 0 ? f : 0;
     }
 
-    // int(head_dim * rope_dim_ratio) = 48 of 64 channels rotate. The
-    // angles are 3 axes x (rope_dim / (2*3)) frequencies concatenated and
-    // then duplicated, so the table needs rope_dim/2 entries per row.
+    // int(head_dim * rope_dim_ratio) = 48 of 64 channels rotate (32 on
+    // the 2D decoder). The angles are `rope_axes` axes x (rope_dim /
+    // (2 * rope_axes)) frequencies concatenated and then duplicated, so
+    // the table needs rope_dim/2 entries per row.
     int rope_dim() const { return (int)((double)head_dim * rope_dim_ratio); }
-    int rope_freqs() const { return rope_dim() / 6; }
+    int rope_freqs() const { return rope_dim() / (2 * rope_axes); }
+    // The table's width a row: rope_axes x rope_freqs(), rope_dim() / 2.
+    int rope_half() const { return rope_axes * rope_freqs(); }
     // The pixel frames one decoder token expands to.
     int out_patch_t() const
     {

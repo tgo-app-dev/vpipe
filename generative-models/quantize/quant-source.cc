@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/vpipe-format.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
+#include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/fp8-layout.h"
 
 #include <cstdint>
@@ -71,7 +72,7 @@ QuantSource::open(const std::string& path, std::string* err)
   fp8::Layout f8;
   {
     std::string ferr;
-    if (!fp8::scan(*w, &f8, &ferr)) {
+    if (!fp8::scan(*w, &f8, &ferr, /*int8=*/false, /*nvfp4=*/true)) {
       return fail("model-quantize: '" + path + "': " + ferr);
     }
   }
@@ -82,7 +83,18 @@ QuantSource::open(const std::string& path, std::string* err)
     Entry e;
     e.src  = n;
     e.info = *ti;
-    if (const fp8::Weight* fw = f8.find(n); fw != nullptr) {
+    if (const fp8::Weight* fw = f8.find(n);
+        fw != nullptr && fw->format == fp8::Format::kNVFP4) {
+      // Presented at its unpacked width; decoded whole on load.
+      e.f8 = fw->format;
+      e.rows = (std::size_t)ti->shape[0];
+      e.cols = (std::size_t)fp8::logical_cols(*fw, ti->shape[1]);
+      e.info.shape = {(std::int64_t)e.rows, (std::int64_t)e.cols};
+      e.info.dtype = "BF16";
+      e.info.nbytes = e.rows * e.cols * 2;
+      ++s._n_fp8;
+      ++s._n_scaled;
+    } else if (fw != nullptr) {
       std::size_t numel = 1;
       for (auto d : ti->shape) { numel *= (std::size_t)d; }
       e.f8   = fw->format;
@@ -126,9 +138,19 @@ QuantSource::load(const std::string& name, MetalCompute* mc) const
   if (it == _map.end() || !_w.has_value()) { return {}; }
   const Entry& e = it->second;
   if (e.f8 == fp8::Format::kNone) { return _w->load(e.src, mc); }
+  const std::size_t n = (std::size_t)(e.info.nbytes / 2);
+  if (e.f8 == fp8::Format::kNVFP4) {
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty() ||
+        !fp8::decode_tensor_bf16(*_w, e.src,
+                                 static_cast<std::uint16_t*>(out.contents()),
+                                 n, nullptr)) {
+      return {};
+    }
+    return out;
+  }
   // Decode straight out of the raw read into the bf16 destination, the
   // scale folded in; the codes are dropped with the scratch.
-  const std::size_t n = (std::size_t)(e.info.nbytes / 2);
   SharedBuffer raw = _w->load(e.src, mc);
   if (raw.empty() || raw.byte_size() < n || e.rows * e.cols != n) {
     return {};

@@ -1259,9 +1259,13 @@ TEST(model_catalog, minimaxai_publishes_both_partitions_too) {
 // key is what a consumer resolves, and two records over ONE directory
 // can only be told apart by it.
 TEST(model_catalog, several_models_can_share_one_repo) {
+  // MiniMaxAI's repo publishes a third: its text encoder alone, which
+  // MiniMax-H3-Image conditions on.
   for (const char* repo : {"Comfy-Org/MiniMax-H3", "MiniMaxAI/MiniMax-H3"}) {
     const auto h3 = catalog_all_by_path(repo);
-    EXPECT_TRUE(h3.size() == 2);
+    EXPECT_TRUE(h3.size() == (std::string(repo) == "MiniMaxAI/MiniMax-H3"
+                                  ? 3u
+                                  : 2u));
     bool fl = false, ref = false;
     std::vector<std::string> keys;
     for (const auto* e : h3) {

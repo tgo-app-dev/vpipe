@@ -19,6 +19,7 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
 #include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/wan/metal-wan-transformer.h"
@@ -494,6 +495,19 @@ private:
   // from the root's manifest.
   bool _ph3 = false;
   genai::ph3::Manifest _ph3_manifest;
+  // MiniMax-H3-Image (generative-models/minimax-h3/minimax-h3-image.h):
+  // its manifest, and the size the picture is RETURNED at (the request's,
+  // or the default) where the canvas it is generated on (_height /
+  // _width) may be larger.
+  bool _h3i = false;
+  genai::h3i::Manifest _h3i_manifest;
+  int _h3i_out_h = 0, _h3i_out_w = 0;
+  // The smallest area generated (minimax-h3-model-config
+  // `min_generation_area`), 0 the model's default.
+  std::int64_t _h3i_min_area = 0;
+  // The canvas from the size returned and `min_generation_area`, into
+  // _height / _width.
+  void h3i_canvas_();
   // Whether the graph named a canvas (`width` / `height`): P-H3-Image
   // defaults text-to-image to 2912x2912 and an edit to its picture's.
   bool _size_set = false;
@@ -652,6 +666,9 @@ private:
     // reads this, so it cannot be assumed uniform the way a text-only
     // prompt's can.
     std::vector<int> text_tags;
+    // Per reference, the posterior's draws off the request's generator
+    // (cond_sideband::kPosteriorDraws), 0 where none was said.
+    std::vector<std::int64_t> posterior_draws;
   };
   // The minimax-h3 branch of process(): builds the packed layout, runs
   // genai::denoise, and unpatchifies both modalities back to latents.

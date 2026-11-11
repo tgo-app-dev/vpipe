@@ -267,6 +267,24 @@ struct ReferencePlan {
   // whitened -- encode_vae_condition, bit for bit in the noise. Negative:
   // the mean, as MiniMax-H3's references take it here.
   std::int64_t posterior_seed = -1;
+
+  // ---- MiniMax-H3-Image's picture rules (minimax-h3-image.h), on when
+  // `edge_min` > 0; images only. --------------------------------------
+  // The VAE's copy keeps its size when its short edge is within
+  // [edge_min, edge_max], else is scaled at its aspect so that edge lands
+  // on the nearer end (both sides rounded to `canvas_multiple`); it is
+  // then CROPPED at the top left to whole VAE cells, and its latent to
+  // whole DiT patches. The tower reads its own copy, from the picture as
+  // it arrived, at a `vision_edge` short edge (the same rule, both ends
+  // that edge). The area and short-edge rules above do not apply.
+  int edge_min    = 0;
+  int edge_max    = 0;
+  int vision_edge = 0;
+  // `posterior_seed` seeds ONE generator for the whole request, drawn
+  // in reference order -- the request's own, as MiniMax-H3-Image's
+  // reference draws it -- where by default each picture takes a fresh
+  // one. EncodedReferences::posterior_draws says how much each took.
+  bool posterior_one_stream = false;
 };
 
 // The CONDITION NOISE AUGMENTATION on `n` packed values in place:
@@ -308,6 +326,12 @@ struct EncodedReferences {
 
   // One per reference, in read order, parallel to `layout`.
   std::vector<ReferenceFit> fits;
+
+  // One per reference, parallel to `layout`: the normal draws its VAE
+  // posterior SAMPLE took (its whole latent, before any crop), 0 for the
+  // mean. A caller continuing the request's generator after them
+  // (ReferencePlan::posterior_one_stream) skips this many.
+  std::vector<std::int64_t> posterior_draws;
 };
 
 // The models. Each may be null when the corresponding work is not

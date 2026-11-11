@@ -3024,6 +3024,90 @@ builtin_catalog_()
                "LICENSE-APACHE", "NOTICE", "README.md"},
      .needs_tokenizer_json = false,
      .name = "PrunaAI/P-H3-Image-lora"},
+    // MiniMax-H3-Image (MiniMaxAI): the H3 family's IMAGE model --
+    // text-to-image and editing with up to 16 pictures at about 16
+    // megapixels, 6 steps, no guidance (generative-models/minimax-h3/
+    // minimax-h3-image.h). Its DiT is H3's stack without the audio
+    // branch, with one output head per step beside it
+    // (pdd_fused_heads.safetensors); its VAE H3's encoder with a 2D ViT
+    // decoder. It does NOT carry its text encoder: model_index.json
+    // names MiniMax-H3's `text_encoder/` (Qwen3-VL-32B, hidden state 50),
+    // the second record -- the same files every MiniMax-H3 partition
+    // carries, so a box holding FL2VA or Ref2VA needs neither download.
+    // MiniMax-H3-Image Community License.
+    {.family = "MiniMax", .version = "H3-Image", .param_class = "33B",
+     .variant = "bf16 image generation and editing (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-H3-Image",
+     .model_type = "minimax-h3-image",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = {"LICENSE", "README.md", "model_index.json", "pdd_config.json",
+               "pdd_fused_heads.safetensors", "processor/chat_template.json",
+               "processor/merges.txt", "processor/preprocessor_config.json",
+               "processor/tokenizer.json", "processor/tokenizer_config.json",
+               "processor/video_preprocessor_config.json",
+               "processor/vocab.json", "tokenizer/merges.txt",
+               "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json", "transformer/config.json",
+               "transformer/model.safetensors.index.json",
+               "transformer/model-00001-of-00012.safetensors",
+               "transformer/model-00002-of-00012.safetensors",
+               "transformer/model-00003-of-00012.safetensors",
+               "transformer/model-00004-of-00012.safetensors",
+               "transformer/model-00005-of-00012.safetensors",
+               "transformer/model-00006-of-00012.safetensors",
+               "transformer/model-00007-of-00012.safetensors",
+               "transformer/model-00008-of-00012.safetensors",
+               "transformer/model-00009-of-00012.safetensors",
+               "transformer/model-00010-of-00012.safetensors",
+               "transformer/model-00011-of-00012.safetensors",
+               "transformer/model-00012-of-00012.safetensors",
+               "vae/config.json", "vae/diffusion_pytorch_model.safetensors",
+               "examples/reference1.png", "examples/prompt.edit.txt",
+               "examples/request.t2i.json"},
+     .needs_tokenizer_json = false,
+     .name = "MiniMaxAI/MiniMax-H3-Image"},
+    {.family = "MiniMax", .version = "H3-Image", .param_class = "32B",
+     .variant = "text encoder alone, MiniMax-H3's Qwen3-VL-32B (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-H3",
+     .model_type = "minimax-h3-text-encoder",
+     .parent_model_type = "minimax-h3-image",
+     .files = {"text_encoder/chat_template.json", "text_encoder/config.json",
+               "text_encoder/merges.txt",
+               "text_encoder/model-00001-of-00014.safetensors",
+               "text_encoder/model-00002-of-00014.safetensors",
+               "text_encoder/model-00003-of-00014.safetensors",
+               "text_encoder/model-00004-of-00014.safetensors",
+               "text_encoder/model-00005-of-00014.safetensors",
+               "text_encoder/model-00006-of-00014.safetensors",
+               "text_encoder/model-00007-of-00014.safetensors",
+               "text_encoder/model-00008-of-00014.safetensors",
+               "text_encoder/model-00009-of-00014.safetensors",
+               "text_encoder/model-00010-of-00014.safetensors",
+               "text_encoder/model-00011-of-00014.safetensors",
+               "text_encoder/model-00012-of-00014.safetensors",
+               "text_encoder/model-00013-of-00014.safetensors",
+               "text_encoder/model-00014-of-00014.safetensors",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/preprocessor_config.json",
+               "text_encoder/tokenizer.json",
+               "text_encoder/tokenizer_config.json",
+               "text_encoder/video_preprocessor_config.json",
+               "text_encoder/vocab.json"},
+     .needs_tokenizer_json = false,
+     .name = "MiniMaxAI/MiniMax-H3-text-encoder"},
+    // MiniMax-H3-Image-PE, MiniMax-H3-Image's PROMPT EXPANDER: a Qwen3.8-27B
+    // fine-tune that reasons, then answers one JSON object -- a long caption
+    // of the whole picture (`expanded_caption`) and a ratio -- for a short
+    // request (its system and task prompts in prompt/, as its release's
+    // scripts/expand_prompt.py sends them). Published only in ModelOpt
+    // NVFP4 (generative-models/shared/nvfp4.h): every projection and the
+    // head, the token table and the vision tower bf16. The qwen3.5 path
+    // runs it natively on the k-quant route (KQ::kNVFP4). MiniMax-H3-Image
+    // Community License, as the model it writes for.
+    {.family = "MiniMax", .version = "H3-Image-PE", .param_class = "27B",
+     .variant = "NVFP4 prompt expander (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-H3-Image-PE",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
     // A tiny autoencoder for LIVE PREVIEWS: it decodes a denoise step's
     // clean estimate onto generate-video's `preview` port at a small
     // fraction of the video VAE's cost. Named on minimax-h3-model-config's

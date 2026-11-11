@@ -175,6 +175,18 @@ const MirrorEntry kMirrors[] = {
     {.source = "modelscope",
      .hf_path = "MiniMaxAI/MiniMax-H3",
      .path = "MiniMax/MiniMax-H3"},
+    // The same owner rename for MiniMax's other repos -- it is per repo
+    // here, so each needs its row: under "MiniMaxAI/..." ModelScope
+    // answers "record not found". VERIFIED (2026-11-10): every pinned
+    // file of each entry listed under the renamed path at HuggingFace's
+    // size, its first 1 KB byte-identical (MiniMax-H3-Image's README.md
+    // excepted: ModelScope carries an older revision of it).
+    {.source = "modelscope",
+     .hf_path = "MiniMaxAI/MiniMax-H3-Image",
+     .path = "MiniMax/MiniMax-H3-Image"},
+    {.source = "modelscope",
+     .hf_path = "MiniMaxAI/MiniMax-Music3",
+     .path = "MiniMax/MiniMax-Music3"},
     // VOSR's authors publish the restorer under their own account on
     // HuggingFace and under a lab account on ModelScope, with a repo
     // name that says CKPT rather than the model's own. The tree is

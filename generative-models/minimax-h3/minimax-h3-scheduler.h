@@ -140,6 +140,17 @@ class MiniMaxH3Scheduler {
   bool step_plain(const float* velocity, int step_index, float* x,
                   std::size_t n) const;
 
+  // Euler in its VELOCITY form, every operation in float32:
+  //
+  //   x += (sigma[i] - sigma[i+1]) * v
+  //
+  // on the grid's own float sigmas -- diffusers' MiniMaxH3Scheduler with
+  // `euler_update_form="velocity"`, which MiniMax-H3-Image's per-step
+  // heads were distilled with. The same update as step() in exact
+  // arithmetic; the last bit differs, and the bf16 forward amplifies it.
+  bool step_velocity(const float* velocity, int step_index, float* x,
+                     std::size_t n) const;
+
   // torch.linspace(1, 0, num_points) in float32, at torch's rounding --
   // the RAW grid set_timesteps shifts. Exposed for a distillation that
   // keeps a SUBSET of a longer schedule (TaoMate-H3 runs points 0, 16,

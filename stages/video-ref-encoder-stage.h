@@ -397,6 +397,8 @@ private:
   // carries both VAEs in one file); the configs stay the model's. Empty:
   // none.
   std::string   _enc_weights;
+  // `seed`: MiniMax-H3-Image's posterior generator (the request's).
+  std::int64_t  _posterior_seed = 0;
   std::string   _vae_weights;
   bool          _autotune = true;   // kernel tuners measure (kAutotune)
   // Either one resolved (a registry key or a path); empty when unset.
@@ -516,6 +518,9 @@ private:
   // tower given its own ~1 MP copy, the posterior sampled, and the
   // instruction prefixed "Edit <Picture 1>. ". Set at initialize.
   bool _ph3 = false;
+  // MiniMax-H3-Image's edit (generative-models/minimax-h3/
+  // minimax-h3-image.h), by its model_index.json.
+  bool _h3i = false;
   genai::ph3::Manifest _ph3_manifest;
   // The dirs the idle-unload heuristic weighs: this stage's own
   // components plus the DiT it is paired with. Filled at load.

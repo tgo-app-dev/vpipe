@@ -1,3 +1,4 @@
+#include "stages/minimax-h3-image-host.h"
 #include "stages/video-ref-encoder-stage.h"
 #include "generative-models/gen-input.h"
 #include "generative-models/generative-model-manager.h"
@@ -128,7 +129,15 @@ const ConfigKey kAttrs[] = {
    // stage exactly the same way. Offering Ref2VA alone would hide the
    // mode from the composer entirely -- the picker would filter out the
    // only checkpoint it runs on.
-   .suggest_db_type = "minimax-h3-ref2va,minimax-h3-fl2va"},
+   .suggest_db_type = "minimax-h3-ref2va,minimax-h3-fl2va,minimax-h3-image"},
+  {.key = "seed", .type = ConfigType::Int, .required = false,
+   .doc = "MiniMax-H3-Image only: the REQUEST's seed -- the generator each "
+          "picture's VAE posterior is sampled from, in picture order, "
+          "before generate-video draws the request's noise from it. Set it "
+          "to generate-video's `seed` (both default 0) and an edit draws "
+          "the release's noise; another value only changes the pictures' "
+          "samples. Other models ignore it",
+   .def_int = 0},
   {.key = "encoder_dir", .type = ConfigType::String, .required = false,
    .doc = "the text encoder's WEIGHTS, when they are not hf_dir's own: a "
           "directory, a registry key, or a single file -- a Draw Things "
@@ -415,6 +424,7 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   // iport connectivity is known, rather than at construction.
   _hf_dir           = attr_str("hf_dir");
   _enc_weights      = attr_str("encoder_dir");
+  _posterior_seed   = attr_int("seed");
   _vae_weights      = attr_str("vae_dir");
   _autotune         = attr_bool("autotune");
   // One path or a list of them. The composer's file browser appends
@@ -872,7 +882,15 @@ VideoRefEncoderStage::claimed_dirs_() const
   if (d.enc.empty()) { d.enc = (fs::path(root) / "text_encoder").string(); }
   d.vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
   if (d.vvae.empty()) { d.vvae = (fs::path(root) / "video_vae").string(); }
-  if (const std::string w = weights_path_(_enc_weights); !w.empty()) {
+  // MiniMax-H3-Image's encoder is MiniMax-H3's, outside its root
+  // (`encoder_dir` names where it is, not weights apart).
+  const bool h3i = genai::h3i::is_root(root);
+  if (h3i) {
+    const std::string e =
+        minimax_h3_image_encoder_dir(session(), root, _enc_weights);
+    if (!e.empty()) { d.enc = e; }
+  } else if (const std::string w = weights_path_(_enc_weights);
+             !w.empty()) {
     d.enc = w;
   }
   if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
@@ -977,6 +995,14 @@ VideoRefEncoderStage::ensure_loaded_()
   }
   // P-H3-Image's EDIT, by its manifest: the same encoders (its Qwen3-VL-4B
   // with the connector, H3's VAE encoder), its own picture rules.
+  // MiniMax-H3-Image's EDIT: up to 16 pictures, its own size rules.
+  _h3i = genai::h3i::is_root(_root);
+  if (_h3i) {
+    _limits.max_images = genai::h3i::kMaxReferences;
+    _limits.max_videos = 0;
+    _limits.max_audios = 0;
+    _limits.max_references = genai::h3i::kMaxReferences;
+  }
   _ph3 = genai::ph3::is_root(_root);
   if (_ph3) {
     std::string merr;
@@ -1010,6 +1036,19 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   // ---- the conditioner + its vision tower ---------------------------
   _enc_dir = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
   if (_enc_dir.empty()) { _enc_dir = _root; }
+  // MiniMax-H3-Image's is MiniMax-H3's (minimax-h3-image-host.h).
+  if (_h3i) {
+    _enc_dir = minimax_h3_image_encoder_dir(session(), _root, _enc_weights);
+    if (_enc_dir.empty()) {
+      session()->error(fmt(
+          "VideoRefEncoderStage('{}'): MiniMax-H3-Image conditions on "
+          "MiniMax-H3's text encoder, which '{}' does not carry and no "
+          "local copy answers for: fetch MiniMaxAI/MiniMax-H3-text-encoder "
+          "(or MiniMax-H3 itself), or name its text_encoder/ in "
+          "encoder_dir", this->id(), _root));
+      return false;
+    }
+  }
   genai::MiniMaxH3TextEncoder::Config ecfg;
   std::string eerr;
   if (!genai::MiniMaxH3TextEncoder::config_from_json(_enc_dir, ecfg, &eerr)) {
@@ -1024,9 +1063,15 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   // text-only conditioner should not pay for it.
   if (_max_prompt_tokens > 0) { ecfg.lm.max_seq = _max_prompt_tokens; }
   ecfg.lm.autotune = _autotune;
+  // MiniMax-H3-Image: "Picture i: " labels, 4096 tokens a piece.
+  if (_h3i) {
+    ecfg.bare_picture_labels = true;
+    ecfg.max_tokens = genai::h3i::kMaxSequenceLength;
+  }
   // The weights from `encoder_dir` when it names them; the config above
   // and the tokenizer from the model's own encoder either way.
-  const std::string enc_w = weights_path_(_enc_weights);
+  const std::string enc_w =
+      _h3i ? std::string() : weights_path_(_enc_weights);
   if (!enc_w.empty()) {
     ecfg.weights = enc_w;
     session()->info(fmt(
@@ -1132,7 +1177,7 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
             session()),
         mc, acfg);
   }
-  if (!_audio_vae && !_ph3) {
+  if (!_audio_vae && !_ph3 && !_h3i) {
     // NOT fatal: a request of images and silent clips never touches it.
     // A soundtrack that then arrives is refused by name rather than
     // dropped, which is what encode_references does.
@@ -1692,10 +1737,11 @@ VideoRefEncoderStage::report_fits_(const h3::EncodedReferences& enc)
     // P-H3-Image sizes its pictures by its own area rules -- the one to
     // edit scaled up to the canvas floor is the recipe, not a loss -- so
     // what it did is said, not warned about.
-    if (_ph3) {
+    if (_ph3 || _h3i) {
       session()->info(fmt(
-          "VideoRefEncoderStage('{}'): picture {} sized by P-H3-Image's "
-          "rules -- {}", this->id(), i + 1, joined));
+          "VideoRefEncoderStage('{}'): picture {} sized by {}'s rules -- "
+          "{}", this->id(), i + 1, _h3i ? "MiniMax-H3-Image" : "P-H3-Image",
+          joined));
       continue;
     }
     session()->warn(fmt(
@@ -2192,6 +2238,28 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // the posterior sampled at the reference's seed, the rows noised to
   // the level they are held at, and the instruction as the encoder reads
   // it. A request naming no picture is not an edit and is refused.
+  // MiniMax-H3-Image's edit: each picture at its own size within short
+  // edges [1024, 2048] (cut to whole VAE cells), the tower's copy at a
+  // 1024 short edge, the posteriors SAMPLED off one generator at
+  // `posterior_seed` in picture order -- the request's, when it is
+  // generate-video's `seed` -- and the rows left clean: generate-video
+  // noises them with the same generator after the picture's noise.
+  if (_h3i) {
+    if (refs.empty()) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): a MiniMax-H3-Image edit needs a "
+          "picture to edit; text-to-image goes through "
+          "diffusion-conditioner. Skipping", this->id()));
+      co_return;
+    }
+    plan.edge_min    = genai::h3i::kReferenceMinShortEdge;
+    plan.edge_max    = genai::h3i::kReferenceMaxShortEdge;
+    plan.vision_edge = genai::h3i::kVisionShortEdge;
+    plan.canvas_multiple = genai::h3i::kCanvasMultiple;
+    plan.posterior_seed  = std::max<std::int64_t>(0, _posterior_seed);
+    plan.posterior_one_stream = true;
+    plan.condition_noise_aug  = 1.0;
+  }
   std::string ph3_prompt;
   if (_ph3) {
     if (refs.empty()) {
@@ -2314,6 +2382,11 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
                           FlexData::make_int(L.latent_width));
       ro.insert_or_assign(ck::kAudioLatents,
                           FlexData::make_int(L.num_audio_latents));
+      const std::size_t li = (std::size_t)(&L - enc.layout.data());
+      if (li < enc.posterior_draws.size() && enc.posterior_draws[li] > 0) {
+        ro.insert_or_assign(ck::kPosteriorDraws,
+                            FlexData::make_int(enc.posterior_draws[li]));
+      }
       rl.as_array().push_back(std::move(r));
     }
     o.insert_or_assign(ck::kReferences, std::move(rl));

@@ -165,6 +165,12 @@ inline constexpr std::string_view kDecoderCondFrames = "decoder_cond_frames";
 // single-reference edit, generated on the padded canvas and cropped back.
 // Absent: all of it.
 inline constexpr std::string_view kCropBox = "crop_box";
+// The size, as Ints [width, height] in pixels, a decoded picture is
+// RESIZED to (Pillow's Lanczos, on its 8-bit pixels): MiniMax-H3-Image
+// generates a smaller request on a larger canvas of its aspect and
+// returns it at the size asked for. generate-video sets it on the
+// latent; vae-decode resizes. Absent: as decoded.
+inline constexpr std::string_view kResizeTo = "resize_to";
 
 // The content screen refused the prompt. Bool. Set on the conditioning
 // and carried to the latent, where a decoder emits a refusal card of

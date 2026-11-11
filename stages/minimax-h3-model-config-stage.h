@@ -87,6 +87,7 @@ private:
   double _cond_timestep = 1.0;
   double _cond_audio_timestep = 1.0;
   double _audio_seconds = 0.0;
+  std::int64_t _min_generation_area = 0;
   double _refine_start  = -1.0;
   double _refine_shift  = 6.0;
   // The video's sigmas as run (`sigmas`); empty for the model's own grid.

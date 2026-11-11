@@ -13,9 +13,11 @@
 //     is a bf16 value), scaled ones as code * scale rounded once to bf16.
 //     The encoding's own tensors -- scales, the `scaled_fp8` marker,
 //     comfy_quant records, activation scales -- are HIDDEN, since the
-//     values they describe are what is presented. An encoding this
-//     cannot decode (MXFP8, NVFP4, int8, block scales) is refused at open,
-//     by name.
+//     values they describe are what is presented. NVFP4 too (either
+//     spelling, an AWQ scale folded in): reported at its unpacked [N, K]
+//     and decoded as the GPU widens it. An encoding this cannot decode
+//     (MXFP8, int8, W4A8, other block scales) is refused at open, by
+//     name.
 //   * A foreign LAYOUT. A single-file Krea-2 DiT in Krea's own naming
 //     (krea2/krea2-native-checkpoint.h) is read under the diffusers names
 //     every loader here uses -- MetalLlamaWeights::open_model translates

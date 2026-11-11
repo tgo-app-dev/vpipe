@@ -9,6 +9,9 @@
 #include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/comfy-checkpoint.h"
+#include "generative-models/shared/fp8-expand.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
@@ -98,6 +101,27 @@ h3_vision_defaults_(MetalQwenVisionEncoder::Config& v)
 // The file is also PRUNED to the tap: 50 layers, not 64. So the layer
 // count read here is both `total_layers` and `tap` -- there is nothing
 // past it to tap at.
+// A single file of the encoder ComfyUI's tooling wrote WITHOUT the tap
+// in its header -- Comfy-Org's NVFP4 AWQ repack carries no __metadata__
+// at all -- told by its tensors: the text stack under "model.", its
+// vision tower under "visual.", no config beside it.
+bool
+comfy_te_by_shape_(const std::string& path)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec) ||
+      fs::path(path).extension() != ".safetensors" ||
+      fs::exists(fs::path(path).parent_path() / "config.json", ec)) {
+    return false;
+  }
+  auto w = MetalLlamaWeights::open(path);
+  return w.has_value() && w->has("model.embed_tokens.weight") &&
+         w->has("model.layers.0.self_attn.q_proj.weight") &&
+         w->has("model.layers.0.self_attn.q_norm.weight") &&
+         w->has("visual.patch_embed.proj.weight");
+}
+
 bool
 comfy_config_(const std::string& file, MiniMaxH3TextEncoder::Config& out,
               std::string* err)
@@ -326,7 +350,8 @@ MiniMaxH3TextEncoder::config_from_json(const std::string& enc_dir, Config& out,
   // The Comfy-Org single file: no config.json, and its `__metadata__`
   // carries only the tap -- so the geometry is measured off the tensor
   // shapes instead. See comfy_config_.
-  if (comfy::is_component(dir.string(), kComfyKey)) {
+  if (comfy::is_component(dir.string(), kComfyKey) ||
+      comfy_te_by_shape_(dir.string())) {
     MiniMaxH3TextEncoder::Config c;
     if (!comfy_config_(dir.string(), c, err)) { return false; }
     // The invariant fields, shared with the diffusers path below: a
@@ -544,6 +569,24 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
     if (ti == nullptr) { continue; }
     if (ti->dtype == "BF16") {
       m->_embed = m->_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    } else if (ti->dtype == "I8" || ti->dtype == "U8" ||
+               fp8::format_of(ti->dtype) != fp8::Format::kNone) {
+      // ComfyUI's int8 table (a record, a scale a row: the NVFP4 AWQ
+      // repack's) or FP8: decoded once, to the bf16 a dense conversion of
+      // the file holds.
+      WeightSet& ws = *m->_ws;
+      m->_embed = ws.derived(std::string(kComfyKey) + "/embed-bf16/" + nm,
+                             [&]() -> SharedBuffer {
+        const std::size_t n = fp8::logical_numel(ws.src(), nm);
+        SharedBuffer out = mc->make_shared_buffer(n * 2);
+        if (out.empty() ||
+            !fp8::decode_tensor_bf16(
+                ws.src(), nm, static_cast<std::uint16_t*>(out.contents()), n,
+                nullptr)) {
+          return {};
+        }
+        return out;
+      });
     } else if (ti->dtype == "F16" || ti->dtype == "F32") {
       WeightSet& ws = *m->_ws;
       m->_embed = ws.derived(std::string(kComfyKey) + "/embed-bf16/" + nm,
@@ -688,7 +731,11 @@ MiniMaxH3TextEncoder::tokenize(std::string_view prompt) const
   if (!_tok) { return {}; }
   // Tokenizer::encode adds no BOS/EOS of its own, which IS the
   // reference's `add_special_tokens=False`.
-  return _tok->encode(prompt);
+  std::vector<std::int32_t> ids = _tok->encode(prompt);
+  if (_cfg.max_tokens > 0 && (int)ids.size() > _cfg.max_tokens) {
+    ids.resize((std::size_t)_cfg.max_tokens);
+  }
+  return ids;
 }
 
 SharedBuffer
@@ -916,7 +963,9 @@ MiniMaxH3TextEncoder::build_presentation(const std::vector<Reference>& refs,
   std::vector<std::int32_t>& ids = P.ids;
   std::vector<int>&          tags = P.tags;
   auto emit_text = [&](const std::string& str) {
-    const std::vector<std::int32_t> t = _tok->encode(str);
+    // tokenize(): the label or prompt alone, truncated as the encoder's
+    // config says (MiniMax-H3-Image: each at most 4096 tokens).
+    const std::vector<std::int32_t> t = tokenize(str);
     ids.insert(ids.end(), t.begin(), t.end());
     tags.insert(tags.end(), t.size(), minimax_h3::kTextTag);
   };
@@ -957,7 +1006,10 @@ MiniMaxH3TextEncoder::build_presentation(const std::vector<Reference>& refs,
     }
     if (r.kind == Reference::Kind::kImage) {
       if (gt != 1) { return fail("an image reference has more than one cell"); }
-      emit_text("<Picture " + std::to_string(++n_image) + ">: ");
+      ++n_image;
+      emit_text(_cfg.bare_picture_labels
+                    ? "Picture " + std::to_string(n_image) + ": "
+                    : "<Picture " + std::to_string(n_image) + ">: ");
       emit_vision(ip, per_cell, r.vision, 0, mh, mw);
     } else {
       if ((int)r.block_seconds.size() != gt) {

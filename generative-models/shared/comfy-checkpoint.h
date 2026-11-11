@@ -47,10 +47,11 @@ namespace comfy {
 // keeps the released per-head qkv while its DiT does not -- so never
 // infer one component's layout from another's.
 //
-// Precisions this build reads are bf16 / fp16 / fp32. The int8_convrot,
-// fp8_scaled and nvfp4_awq variants use Comfy-Org's own packing and are
-// deliberately not supported (nor fetched); `unsupported_quant()` names
-// them so a resolve skips them rather than loading garbage.
+// A resolve picks the bf16 / fp16 / fp32 file. The int8_convrot,
+// fp8_scaled and nvfp4 variants use Comfy-Org's own packing --
+// `unsupported_quant()` names them so a resolve skips them rather than
+// choosing one by accident; a model that reads one (fp8-layout.h: an
+// NVFP4 AWQ text encoder, an int8 DiT) takes it NAMED, as the file.
 
 // The whole `__metadata__` object of a single-file safetensors
 // checkpoint. Values are strings (safetensors metadata is string ->

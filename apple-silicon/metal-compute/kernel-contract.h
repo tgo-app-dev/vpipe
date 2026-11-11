@@ -271,6 +271,10 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   // alike: an older host refuses a W4A8 checkpoint by name
   // (Expander::w4a8_valid() false).
   {"affine_dequant_bf16", "w4a8_convrot_dequant", false},
+  // ...and NVFP4 (four-bit floats, E4M3 block scales). Optional alike: an
+  // older host refuses an NVFP4 checkpoint by name
+  // (Expander::nvfp4_valid() false).
+  {"affine_dequant_bf16", "nvfp4_dequant", false},
   // The accurate tier's quantizers rotated (I8GemmContext::
   // set_g64_rotation). Optional: a toolkit on a host older than these
   // finds them invalid and keeps the plain pair (g64_rotated() false).

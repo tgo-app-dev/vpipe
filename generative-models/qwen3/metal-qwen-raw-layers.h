@@ -26,6 +26,15 @@
 //   copies (copy_rows_u32). Half the bytes per streamed read of a raw
 //   bf16 source, and a slot a little over half the size.
 //
+//   STREAMING NVFP4. A ModelOpt / ComfyUI NVFP4 stack (an encoder's,
+//   e.g. MiniMax-H3's Qwen3-VL repack) streams through the same slots:
+//   its sources are the file's nibble codes and E4M3 block scales as
+//   they sit, its products the served super-blocks the k-quant forward
+//   reads (shared/nvfp4.h), built on the GPU by nvfp4_serve -- the bytes
+//   LayerLoad::nvfp4_served packs on the host for a resident load,
+//   ComfyUI's spelling normalized and down_proj's AWQ scale folded into
+//   up_proj's rows on the way.
+//
 //   DECODE-CAPABLE STREAMING (stream_decode). A layer the box cannot
 //   keep is read per use into one of two slots (shared/block-slots.h),
 //   refilled in place by pread with the next streamed layer's read issued
@@ -69,6 +78,57 @@ enum PackTensor : int {
   kPackQ,    kPackK = kPackQ + 3, kPackV = kPackK + 3, kPackO = kPackV + 3,
   kPackGate = kPackO + 3, kPackUp = kPackGate + 3, kPackDown = kPackUp + 3,
   kPackCount = kPackDown + 3
+};
+
+// The tensors of one streamed NVFP4 layer, in slot order: the four norms
+// first, as in RawTensor, then (codes, block scales, tensor scale) per
+// projection in RawTensor's order (q, k, v, o, gate, up, down), then the
+// AWQ pre_quant_scale of o_proj and of down_proj where the stack has
+// them (an empty name and buffer where it does not). The codes and block
+// scales are placed raw; the two kinds of scale are f32, rebuilt per
+// refill.
+enum NvTensor : int {
+  kNvInLn, kNvPostLn, kNvQNorm, kNvKNorm,
+  kNvProj,                              // projection p at kNvProj + 3 p
+  kNvOPq = kNvProj + 3 * 7, kNvDownPq,
+  kNvCount
+};
+
+// An NVFP4 stack's slot layout, off the checkpoint: one for every layer
+// (nv_layout_ refuses a stack whose layers differ). Per projection, in
+// RawTensor's order from q.
+struct MetalQwenModel::NvLayout {
+  std::array<int, 7>         N{}, K{};       // rows, inputs (logical)
+  std::array<char, 7>        hi{}, swz{};    // the file's spelling
+  std::array<std::size_t, 7> codes{}, blocks{};   // bytes as stored
+  bool        o_pq = false, down_pq = false;      // AWQ scales present
+  std::size_t norms = 0;   // the four norms in the compute dtype
+  std::size_t raw = 0;     // every layer's bytes on disk
+  // A projection's served bytes: 148 a 256 inputs of a row.
+  std::size_t served(int p) const
+  {
+    return (std::size_t)N[(std::size_t)p] *
+           (std::size_t)(K[(std::size_t)p] / 256) * 148;
+  }
+  // What a kept layer holds: the served projections, the norms and
+  // o_proj's AWQ scale.
+  std::size_t kept() const
+  {
+    std::size_t n = norms + (o_pq ? (std::size_t)K[3] * 4 : 0);
+    for (int p = 0; p < 7; ++p) { n += served(p); }
+    return n;
+  }
+  // One slot: every source as it sits (the tensor scales f32, a word
+  // each) and the served products built beside them.
+  std::size_t slot() const
+  {
+    std::size_t n = kept() + 7 * 4 +
+                    (down_pq ? (std::size_t)K[6] * 4 : 0);
+    for (int p = 0; p < 7; ++p) {
+      n += codes[(std::size_t)p] + blocks[(std::size_t)p];
+    }
+    return n;
+  }
 };
 
 // The tensors of one layer of a HYBRID stack (Qwen3.5: gated-DeltaNet
@@ -126,7 +186,8 @@ struct MetalQwenModel::RawLayer {
 
 struct MetalQwenModel::RawStream {
   RawStream(MetalQwenModel* model, metal_compute::MetalCompute* c,
-            bool quantize, bool stream, bool pack = false);
+            bool quantize, bool stream, bool pack = false,
+            bool nvfp4 = false);
   ~RawStream();
   RawStream(const RawStream&) = delete;
   RawStream& operator=(const RawStream&) = delete;
@@ -182,6 +243,7 @@ struct MetalQwenModel::RawStream {
   const bool                         quant;
   const bool                         streaming;
   const bool                         pack;   // the source is a w8 pack
+  const bool                         nv;     // the source is NVFP4
   bool                               hyb = false;   // a hybrid stack
 
   int H = 0, qd = 0, qdo = 0, kd = 0, F = 0, D = 0;
@@ -210,10 +272,22 @@ struct MetalQwenModel::RawStream {
   int next_streamed_(int L) const;
   std::size_t kept_(int L) const;
   // Every buffer a raw-built layer can bind -- the dense fields (bf16, w8,
-  // a pack's) and the gated-DeltaNet ones -- for each walk that wires,
-  // counts, copies or aliases a layer, so none of them misses a kind.
-  static constexpr int kFields = 23;
+  // a pack's), the gated-DeltaNet ones and an NVFP4 layer's served
+  // projections and AWQ scale -- for each walk that wires, counts, copies
+  // or aliases a layer, so none of them misses a kind.
+  static constexpr int kFields = 30;
   static std::array<metal_compute::SharedBuffer*, kFields> fields_(Layer& y);
+  // A layer's k-quant tags and fused-rows count, which the buffer walks
+  // above do not carry: copied wherever a layer is.
+  static void copy_kq_tags_(const Layer& s, Layer& d);
+  // ---- an NVFP4 stack --------------------------------------------------
+  // Whether source slot `i` is one of the f32 scales (rebuilt per refill)
+  // or the codes / block scales (placed raw).
+  static bool nv_derived_(int i);
+  static bool nv_raw_(int i);
+  // An f32 scale as the build reads it: a tensor scale, or an AWQ
+  // pre_quant_scale.
+  metal_compute::SharedBuffer nv_read_f32_(const std::string& name) const;
   // A layer's distinct allocations, summed once: `arena` first (a fused
   // projection is a window onto it), then the fields, then `src`.
   static std::size_t layer_bytes_(
@@ -239,8 +313,10 @@ struct MetalQwenModel::RawStream {
   metal_compute::ComputeFunction _fn_quant;   // affine_quant_rows_w8g64
   metal_compute::ComputeFunction _fn_copy;    // copy_f16: bf16 q|k|v fuse
   metal_compute::ComputeFunction _fn_rows;    // copy_rows_u32: pack fuses
+  metal_compute::ComputeFunction _fn_serve;   // nvfp4_serve: NVFP4 builds
 
   HybLayout            _hl;           // hybrid only
+  NvLayout             _nl;           // NVFP4 only
   BlockSlots<RawLayer> _slots;
   BlockResidency       _resid;
   WiredPool            _wire;

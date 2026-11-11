@@ -2,6 +2,7 @@
 #include "generative-models/gen-input.h"
 #include "common/beat-keys.h"
 
+#include "stages/model-memory-host.h"
 #include "stages/model-memory.h"
 #include "stages/model-provenance.h"
 
@@ -2644,8 +2645,11 @@ GenerateImageStage::declare_resources() const
         c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
         c.autotune = _autotune;
         c.sage = _sage; c.sol = _sol;
+        // An FP8 / NVFP4 weight is widened per GEMM on any GPU, into
+        // the scratch a pack's stand-in takes.
         bytes = genai::MetalQwenImage21Transformer::forward_scratch_bytes(
-            c, img, 512, /*cfg=*/true, bits > 0, mx);
+            c, img, 512, /*cfg=*/true, bits > 0, mx,
+            model_memory::widened_weight_bytes(dit));
       }
     } else if (img > 0 && fam == "z-image") {
       genai::MetalZImageTransformer::Config c;
@@ -2661,8 +2665,11 @@ GenerateImageStage::declare_resources() const
       c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
       c.autotune = _autotune;
       c.sage = _sage; c.sol = _sol;
+      // The dequant scratch: an FP8 / NVFP4 weight widened on any GPU,
+      // a pack's on the matrix-core route.
       bytes = genai::MetalKrea2Transformer::forward_scratch_bytes(
-          c, img, 512, mx);
+          c, img, 512, mx,
+          model_memory::widened_weight_bytes(dit, mx && bits > 0));
     } else if (img > 0 && fam == "flux2") {
       genai::MetalFlux2Transformer::Config c;
       if (genai::MetalFlux2Transformer::read_dims(dit, &c)) {

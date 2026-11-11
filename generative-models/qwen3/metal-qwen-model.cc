@@ -1,4 +1,8 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/shared/fp8-expand.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
+#include "generative-models/shared/nvfp4.h"
 
 #include "generative-models/lm-run-memory.h"
 #include "generative-models/qwen3/metal-qwen-raw-layers.h"
@@ -210,6 +214,24 @@ struct MetalQwenModel::LayerLoad {
   SharedBuffer to_elt(const std::string& name) {
     const auto* info = wts->info(name);
     if (info == nullptr) { return gptq_dense(name); }
+    if (info->dtype == "U8" && nvfp4_source(name)) {
+      return nvfp4_dense(name);
+    }
+    // ComfyUI's int8 (a record, a scale a row) and FP8, plain or scaled
+    // -- an NVFP4 checkpoint's token table in a ComfyUI file is int8.
+    if (info->dtype == "I8" || info->dtype == "U8" ||
+        fp8::format_of(info->dtype) != fp8::Format::kNone) {
+      const std::size_t n = numel_(info->shape);
+      std::vector<float> f(n);
+      if (!fp8::decode_tensor_f32(*wts, name, f.data(), n, nullptr)) {
+        return {};
+      }
+      SharedBuffer out = mc->make_shared_buffer(n * 2);
+      if (out.empty()) { return {}; }
+      auto* o = static_cast<std::uint16_t*>(out.contents());
+      for (std::size_t i = 0; i < n; ++i) { o[i] = elt_bits(f[i]); }
+      return out;
+    }
     const std::string want = bf16 ? "BF16" : "F16";
     // Already the compute dtype: an owned copy, uncached.
     //
@@ -249,6 +271,147 @@ struct MetalQwenModel::LayerLoad {
   }
   // Alias: all callers want the compute element type.
   SharedBuffer to_f16(const std::string& name) { return to_elt(name); }
+  // ---- NVFP4 ----------------------------------------------------------
+  // <base>.weight U8 [N, K/2] + .weight_scale F8_E4M3 block scales +
+  // .weight_scale_2 F32 [], in ModelOpt's spelling or ComfyUI's (high
+  // nibble first, scales swizzled), an AWQ .pre_quant_scale [K] beside
+  // it or not (shared/fp8.h; generative-models/shared/nvfp4.h). Read
+  // whole and uncached, normalized to ModelOpt's layout: consumed into
+  // the served super-blocks or, on the dense path, the compute dtype.
+  static std::string nvfp4_base(const std::string& name) {
+    static constexpr std::string_view kW = ".weight";
+    if (name.size() <= kW.size() ||
+        name.compare(name.size() - kW.size(), kW.size(), kW) != 0) {
+      return {};
+    }
+    return name.substr(0, name.size() - kW.size());
+  }
+  bool nvfp4_weight(const std::string& name, fp8::Weight* x) const {
+    if (nvfp4_base(name).empty()) { return false; }
+    const auto* wi = wts->info(name);
+    if (wi == nullptr || wi->dtype != "U8") { return false; }
+    fp8::Weight w;
+    if (!fp8::resolve(*wts, name, &w, nullptr, /*int8=*/false,
+                      /*nvfp4=*/true) ||
+        w.format != fp8::Format::kNVFP4) {
+      return false;
+    }
+    if (x != nullptr) { *x = w; }
+    return true;
+  }
+  bool nvfp4_source(const std::string& name) const {
+    return nvfp4_weight(name, nullptr);
+  }
+  // Its AWQ pre_quant_scale, one f32 a column; empty when it has none.
+  std::vector<float> nvfp4_pre_quant(const std::string& name) const {
+    fp8::Weight x;
+    std::vector<float> v;
+    if (!nvfp4_weight(name, &x) || x.pre_quant.empty()) { return v; }
+    const auto* pi = wts->info(x.pre_quant);
+    std::size_t n = 1;
+    for (auto d : pi->shape) { n *= (std::size_t)d; }
+    fp8::Weight as_scale;
+    as_scale.scale = x.pre_quant;
+    as_scale.per_row = true;
+    if (!fp8::read_scale(*wts, as_scale, n, &v, nullptr)) { v.clear(); }
+    return v;
+  }
+  bool nvfp4_read(const std::string& name, int* N, int* K,
+                  std::vector<std::uint8_t>* codes,
+                  std::vector<std::uint8_t>* scales, float* g) const {
+    fp8::Weight x;
+    if (!nvfp4_weight(name, &x)) { return false; }
+    const auto* wi = wts->info(name);
+    const auto* si = wts->info(x.s_rel);
+    if (wi->shape.size() != 2 || si == nullptr) { return false; }
+    *N = (int)wi->shape[0];
+    *K = (int)wi->shape[1] * 2;
+    if (*K % nvfp4::kBlock != 0) { return false; }
+    const int B = *K / nvfp4::kBlock;
+    codes->resize((std::size_t)*N * (*K / 2));
+    std::vector<std::uint8_t> stored((std::size_t)si->nbytes);
+    std::vector<float> g2;
+    if (!wts->pread_into(name, codes->data(), codes->size(), true) ||
+        !wts->pread_into(x.s_rel, stored.data(), stored.size(), true) ||
+        !fp8::read_scale(*wts, x, 1, &g2, nullptr) || g2.size() != 1) {
+      return false;
+    }
+    *g = g2[0];
+    // ComfyUI's even column is the HIGH nibble; ModelOpt's the low.
+    if (x.nibble_hi) {
+      for (auto& b : *codes) { b = (std::uint8_t)(b << 4 | b >> 4); }
+    }
+    scales->resize((std::size_t)*N * B);
+    for (int r = 0; r < *N; ++r) {
+      for (int b = 0; b < B; ++b) {
+        const std::size_t at = fp8::nvfp4_scale_index(
+            (std::size_t)r, (std::size_t)b, (std::size_t)B, x.swizzled);
+        if (at >= stored.size()) { return false; }
+        (*scales)[(std::size_t)r * B + b] = stored[at];
+      }
+    }
+    return true;
+  }
+  // Its served form (KQ::kNVFP4); empty, said, when K is no multiple of
+  // the super-block. `row_mul` (N values, or null): each row's
+  // super-block scales multiplied by it -- the next projection's AWQ
+  // scale folded into this one's output rows (load_kq_awq). A weight with
+  // an AWQ scale of its OWN needs the caller to apply it to its input
+  // (`own_pq`), and is refused here otherwise.
+  SharedBuffer nvfp4_served(const std::string& name, int* N, int* K,
+                            const float* row_mul = nullptr,
+                            bool own_pq = false) {
+    std::vector<std::uint8_t> codes, scales;
+    float g = 0.0f;
+    if (!nvfp4_read(name, N, K, &codes, &scales, &g)) { return {}; }
+    if (!own_pq && !nvfp4_pre_quant(name).empty()) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] NVFP4 '{}' carries an AWQ pre_quant_scale "
+                    "this projection cannot take -- not served", name));
+      }
+      return {};
+    }
+    if (*K % nvfp4::kSuper != 0) {
+      if (const SessionContextIntf* s = mc->session()) {
+        s->warn(fmt("[qwen] NVFP4 '{}': {} inputs, not a multiple of {} -- "
+                    "not served natively", name, *K, nvfp4::kSuper));
+      }
+      return {};
+    }
+    SharedBuffer out = mc->make_shared_buffer(nvfp4::served_bytes(*N, *K));
+    if (out.empty() ||
+        !nvfp4::pack(codes.data(), scales.data(), g, *N, *K,
+                     static_cast<std::uint8_t*>(out.contents()))) {
+      return {};
+    }
+    if (row_mul != nullptr) {
+      auto* o = static_cast<std::uint8_t*>(out.contents());
+      const int supers = *K / nvfp4::kSuper;
+      for (int n = 0; n < *N; ++n) {
+        const float gg = g * row_mul[n];
+        for (int sb = 0; sb < supers; ++sb) {
+          std::memcpy(o + ((std::size_t)n * supers + sb) * nvfp4::kSuperBytes,
+                      &gg, 4);
+        }
+      }
+    }
+    return out;
+  }
+  // Dequantized to the compute dtype [N, K], its AWQ scale folded in (the
+  // dense path's reference; VPIPE_NVFP4_DENSE). Empty when `name` is no
+  // NVFP4 weight.
+  SharedBuffer nvfp4_dense(const std::string& name) {
+    const std::size_t n = fp8::logical_numel(*wts, name);
+    std::vector<float> f(n);
+    if (n == 0 || !fp8::decode_tensor_f32(*wts, name, f.data(), n, nullptr)) {
+      return {};
+    }
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    if (out.empty()) { return {}; }
+    auto* o = static_cast<std::uint16_t*>(out.contents());
+    for (std::size_t i = 0; i < n; ++i) { o[i] = elt_bits(f[i]); }
+    return out;
+  }
   // ---- GPTQ int4 (fishaudio/drama-3-int4) ----------------------------
   // <base>.qweight I32 [K/8, N] -- value k at bits 4(k%8) of word k/8,
   // offset 8 -- and .scales F16 [K/128, N]: symmetric, no act order (a
@@ -957,8 +1120,16 @@ struct MetalQwenModel::LayerLoad {
     if (dt == "Q6K") { return KQ::kQ6K; }
     return KQ::kNone;
   }
+  // `row_mul` / `own_pq`: an NVFP4 weight's AWQ arrangement
+  // (nvfp4_served).
   bool load_kq(const std::string& name, SharedBuffer& buf,
-               KQ& ty) {
+               KQ& ty, const float* row_mul = nullptr, bool own_pq = false) {
+    if (nvfp4_source(name)) {
+      ty = KQ::kNVFP4;
+      int N = 0, K = 0;
+      buf = nvfp4_served(name, &N, &K, row_mul, own_pq);
+      return !buf.empty();
+    }
     const auto* info = wts->info(name);
     if (info == nullptr) {
       // Required k-quant tensor absent. The GGUF converter DROPS tensors of an
@@ -988,6 +1159,22 @@ struct MetalQwenModel::LayerLoad {
   // [N1+N2, K] -- the qmv reads it as one taller matrix. nrows = N1+N2.
   bool fuse_kq(const std::string& n1, const std::string& n2,
                SharedBuffer& buf, KQ& ty, int& nrows) {
+    if (nvfp4_source(n1) && nvfp4_source(n2)) {
+      // Served super-blocks are whole rows, each carrying its own
+      // tensor's scale_2: the fused weight is the two back to back.
+      int N1 = 0, N2 = 0, K1 = 0, K2 = 0;
+      SharedBuffer b1 = nvfp4_served(n1, &N1, &K1),
+                   b2 = nvfp4_served(n2, &N2, &K2);
+      if (b1.empty() || b2.empty() || K1 != K2) { return false; }
+      buf = mc->make_shared_buffer(b1.byte_size() + b2.byte_size());
+      if (buf.empty()) { return false; }
+      std::memcpy(buf.contents(), b1.contents(), b1.byte_size());
+      std::memcpy(static_cast<char*>(buf.contents()) + b1.byte_size(),
+                  b2.contents(), b2.byte_size());
+      ty = KQ::kNVFP4;
+      nrows = N1 + N2;
+      return true;
+    }
     const auto* i1 = wts->info(n1);
     const auto* i2 = wts->info(n2);
     if (i1 == nullptr || i2 == nullptr || i1->dtype != i2->dtype) {
@@ -2012,11 +2199,24 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
   // weights with a k-quant family dtype ("Q4K"/"Q5K"/"Q6K") instead of the
   // affine U32+scales+biases triple. Probe a tensor present on every layer.
   {
-    const auto* probe =
-        wts->info(cfg.weight_prefix + cfg.model_seg + "layers.0.mlp.gate_proj.weight");
+    const std::string pn =
+        cfg.weight_prefix + cfg.model_seg + "layers.0.mlp.gate_proj.weight";
+    const auto* probe = wts->info(pn);
     m->_kquant = probe != nullptr &&
         (probe->dtype == "Q4K" || probe->dtype == "Q5K" ||
          probe->dtype == "Q6K");
+    // ModelOpt NVFP4 (its codes U8 beside an E4M3 scale per 16): the
+    // k-quant route as KQ::kNVFP4, unless VPIPE_NVFP4_DENSE asks for the
+    // dense reference (the dense probe below then takes it, to_elt
+    // dequantizing each NVFP4 weight).
+    if (probe != nullptr && probe->dtype == "U8" &&
+        H.nvfp4_source(pn)) {
+      const char* e = std::getenv("VPIPE_NVFP4_DENSE");
+      if (e == nullptr || std::atoi(e) == 0) {
+        m->_kquant = true;
+        m->_nvfp4 = true;
+      }
+    }
     // GDN v-head order follows the FILE, not the quantization -- see
     // _gdn_strided_v. Every GGUF is strided; an all-Q8_0 one is repacked
     // to affine and so is NOT _kquant, which is why this is a separate
@@ -2212,6 +2412,37 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
                   m->_stream_layers ? "prefill-streamed" : "resident"));
     }
   }
+  // AN NVFP4 STACK streams through the slots or not at all: its sources
+  // are the codes and block scales as they sit, its products the served
+  // super-blocks (RawStream's nv kind), and residency grows the kept set.
+  // It never takes the prefill path's pinned prefix, which no format
+  // added since pin_frac's retirement does: where the slots cannot serve
+  // it, it loads resident, said.
+  if (m->_nvfp4 && (cfg.stream_decode || m->_stream_layers)) {
+    if (cfg.stream_decode && nv_servable_(*wts, cfg)) {
+      m->_raw = true;
+      m->_raw_nv = true;
+      m->_stream_layers = true;
+      m->_rs = std::make_unique<RawStream>(m.get(), mc, /*quantize=*/false,
+                                           /*stream=*/true, /*pack=*/false,
+                                           /*nvfp4=*/true);
+      if (!m->_rs->init()) {
+        if (const SessionContextIntf* s = mc->session()) {
+          s->warn(fmt("[qwen] streaming an NVFP4 stack: nvfp4_serve did "
+                      "not load; model not loaded"));
+        }
+        return nullptr;
+      }
+    } else {
+      m->_stream_layers = false;
+      if (const SessionContextIntf* s = mc->session()) {
+        s->info(fmt("[qwen] an NVFP4 stack streams through the slots only "
+                    "as a dense full-attention backbone_only bf16 model, "
+                    "every projection NVFP4 of one spelling, a multiple of "
+                    "256 inputs; this one loads resident"));
+      }
+    }
+  }
   if (m->_dense) {
     // Dense f16 GEMM/GEMV (the same kernels the k-quant prefill runs post-
     // dequant) + the in-stream embed gather. dense_gemm_ rides the matrix
@@ -2341,6 +2572,20 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_lib_dense = mc->load_library("dense_gemm" + sfx);
     m->_fn_dense_gemm = m->_lib_dense.function("dense_gemm_t_f16");
     m->_fn_dense_gemv = m->_lib_dense.function("dense_gemv_t_f16");
+    // NVFP4: its qmv, the batched pair (optional, as the k-quants'), its
+    // dequant; its bf16 token table through the dense gather.
+    m->_fn_qmv_nvfp4 = m->_lib_elt.function("qmv_nvfp4_f16");
+    m->_fn_qmv_nvfp4_batch = m->_lib_elt.function("qmv_nvfp4_batch_f16");
+    m->_fn_qmv_nvfp4_batch4 = m->_lib_elt.function("qmv_nvfp4_batch4_f16");
+    m->_fn_dequant_nvfp4 = m->_lib_elt.function("dequant_nvfp4_f16");
+    m->_fn_scale_cols = m->_lib_elt.function("scale_cols_inplace_f16");
+    if (m->_nvfp4) {
+      m->_fn_embed_dense = m->_lib_elt.function("embed_gather_f16");
+      if (!m->_fn_qmv_nvfp4.valid() || !m->_fn_dequant_nvfp4.valid() ||
+          !m->_fn_embed_dense.valid() || !m->_fn_scale_cols.valid()) {
+        return nullptr;
+      }
+    }
     if (!m->_fn_qmv_q4k.valid() || !m->_fn_qmv_q5k.valid() ||
         !m->_fn_qmv_q6k.valid() || !m->_fn_embed_q6k.valid() ||
         !m->_fn_embed_q4k.valid() ||
@@ -2521,7 +2766,15 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
 
   bool ok = true;
   if (!cfg.backbone_only) {
-    if (m->_kquant) {
+    if (m->_nvfp4) {
+      // NVFP4: the token table stays bf16 in the checkpoint (ModelOpt
+      // leaves embed_tokens out), gathered dense; the untied head is an
+      // NVFP4 linear, loaded below as one.
+      m->_embed_w = to_f16(cfg.weight_prefix + cfg.model_seg +
+                           "embed_tokens.weight");
+      m->_kq_embed_dense = !m->_embed_w.empty();
+      ok = m->_kq_embed_dense;
+    } else if (m->_kquant) {
       // token_embd is a raw k-quant table: gathered + matvec'd natively
       // (embed_gather_q{4,6}k / qmv_q6k), no affine requant. Q6_K on tied
       // checkpoints (lm_head == embed); Q4_K on untied ones (the 27B), whose
@@ -2579,7 +2832,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     }
   }
   m->_final_ln = to_f16(cfg.weight_prefix + cfg.model_seg + "norm.weight");
-  if (m->_dense && fold_norm_plus_one) {           // +1 RMSNorm fold (raw-HF)
+  // +1 RMSNorm fold (raw-HF)
+  if ((m->_dense || m->_nvfp4) && fold_norm_plus_one) {
     add_one_f16(m->_final_ln);
   }
   if (!ok) {
@@ -2748,7 +3002,7 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
       m->_muxer = std::make_unique<MetalTokenMuxer>(
           mc, &m->_embed_q6k, cfg.hidden, bf16,
           m->_embed_kqt == KQ::kQ4K);
-    } else if (m->_dense || m->_dense_embed) {
+    } else if (m->_dense || m->_dense_embed || m->_kq_embed_dense) {
       // Unquantized dense f16 embed table -> embed_gather_f16 (full precision;
       // _dense_embed keeps the MOSS bf16 embed even though the backbone is
       // affine).
@@ -3800,6 +4054,20 @@ MetalQwenModel::decode_step_fast(ContextId cid, std::int32_t token_id,
 // Native k-quant (GGUF) matmul dispatch.
 // ---------------------------------------------------------------------
 void
+MetalQwenModel::scale_cols_(ComputeEncoder& enc, const SharedBuffer& x,
+                            std::size_t xoff, const SharedBuffer& s, int cols,
+                            int rows)
+{
+  const int total = cols * rows;
+  enc.set_function(_fn_scale_cols);
+  enc.set_buffer(0, x, xoff * 2);
+  enc.set_buffer(1, s);
+  enc.set_constant(2, cols);
+  enc.set_constant(3, total);
+  enc.dispatch({(unsigned)total, 1, 1}, {256, 1, 1});
+}
+
+void
 MetalQwenModel::kqmv_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
                       const SharedBuffer& x, std::size_t xoff,
                       const SharedBuffer& y, std::size_t yoff, int K, int N)
@@ -3816,7 +4084,11 @@ MetalQwenModel::kqmv_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
   enc.set_buffer(2, y, yoff * 2);
   enc.set_constant(3, K);
   enc.set_constant(4, N);
-  if (type == KQ::kQ6K) {
+  if (type == KQ::kNVFP4) {
+    // 1 row/simdgroup x NSG=2, as q4k.
+    enc.set_function(_fn_qmv_nvfp4);
+    enc.dispatch({32, (unsigned)(((N + 1) / 2) * 2), 1}, {32, 2, 1});
+  } else if (type == KQ::kQ6K) {
     // q6k_v2: _q6k_rpt rows/threadgroup (RPS*NSG), _q6k_nsg simdgroups -- the
     // tuned variant chosen at load.
     enc.set_function(_fn_qmv_q6k);
@@ -3856,7 +4128,9 @@ MetalQwenModel::kqmv_batch_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
   // Invalid selected fn -> the looped single-row fallback below.
   const bool use4 = _qmv4_enabled && M > 2 && M <= 4;
   const metal_compute::ComputeFunction& fn =
-      use4 ? (type == KQ::kQ6K ? _fn_qmv_q6k_batch4
+      type == KQ::kNVFP4
+          ? (use4 ? _fn_qmv_nvfp4_batch4 : _fn_qmv_nvfp4_batch)
+      : use4 ? (type == KQ::kQ6K ? _fn_qmv_q6k_batch4
                                : (type == KQ::kQ5K ? _fn_qmv_q5k_batch4
                                                    : _fn_qmv_q4k_batch4))
            : (type == KQ::kQ6K ? _fn_qmv_q6k_batch
@@ -3946,7 +4220,7 @@ MetalQwenModel::LayerLoad::build_layer(int L)
   ly.in_ln = to_f16(p + "input_layernorm.weight");
   ly.post_ln = to_f16(p + "post_attention_layernorm.weight");
   bool ok = !ly.in_ln.empty() && !ly.post_ln.empty();
-  if (m->_dense && fold_norm_plus_one) {
+  if ((m->_dense || m->_nvfp4) && fold_norm_plus_one) {
     add_one_f16(ly.in_ln); add_one_f16(ly.post_ln);
   }
   if (ly.is_full) {
@@ -3963,7 +4237,22 @@ MetalQwenModel::LayerLoad::build_layer(int L)
                          p + "self_attn.k_proj.weight",
                          ly.kqk, ly.kqk_t, ly.kqk_n);
       ok = ok && load_kq(p + "self_attn.v_proj.weight", ly.kqv, ly.kqv_t);
-      ok = ok && load_kq(p + "self_attn.o_proj.weight", ly.kqo, ly.kqo_t);
+      // NVFP4 AWQ on o_proj: its scale is the attention output's, a
+      // column of a head of a GQA group each -- no projection before it
+      // can take it, so the forward multiplies the output by it.
+      {
+        const std::string on = p + "self_attn.o_proj.weight";
+        const std::vector<float> pq = nvfp4_pre_quant(on);
+        if (!pq.empty()) {
+          ly.o_pq = mc->make_shared_buffer(pq.size() * sizeof(float));
+          ok = ok && !ly.o_pq.empty() && (int)pq.size() == cfg.qd();
+          if (ok) {
+            std::memcpy(ly.o_pq.contents(), pq.data(),
+                        pq.size() * sizeof(float));
+          }
+        }
+        ok = ok && load_kq(on, ly.kqo, ly.kqo_t, nullptr, !pq.empty());
+      }
       static const bool kAff = q4k_affine_enabled_();
       if (ok && kAff && ly.kqk_t == KQ::kQ4K) {
         ly.qk_q4k_aff = repack_q4k(ly.kqk, ly.kqk_n, cfg.hidden,
@@ -4029,7 +4318,7 @@ MetalQwenModel::LayerLoad::build_layer(int L)
       ly.q_norm = to_f16(p + "self_attn.q_norm.weight");
       ly.k_norm = to_f16(p + "self_attn.k_norm.weight");
       ok = ok && !ly.q_norm.empty() && !ly.k_norm.empty();
-      if (m->_dense && fold_norm_plus_one) {
+      if ((m->_dense || m->_nvfp4) && fold_norm_plus_one) {
         add_one_f16(ly.q_norm); add_one_f16(ly.k_norm);
       }
     }
@@ -4159,8 +4448,19 @@ MetalQwenModel::LayerLoad::build_layer(int L)
     // gate/up stay separate raw q4_K (two qmv + swiglu at decode); the
     // affine path's interleaved-swiglu kernel has no k-quant variant.
     ok = ok && load_kq(p + "mlp.gate_proj.weight", ly.kqgate, ly.kqgate_t);
-    ok = ok && load_kq(p + "mlp.up_proj.weight", ly.kqup, ly.kqup_t);
-    ok = ok && load_kq(p + "mlp.down_proj.weight", ly.kqdown, ly.kqdown_t);
+    // NVFP4 AWQ on down_proj: its input is silu(gate) * up, so its scale
+    // is up_proj's rows' -- folded into their super-block scales, exact
+    // but for the f32 product's order.
+    {
+      const std::vector<float> pq =
+          nvfp4_pre_quant(p + "mlp.down_proj.weight");
+      ok = ok && (pq.empty() || (int)pq.size() == cfg.ffn_inner);
+      ok = ok && load_kq(p + "mlp.up_proj.weight", ly.kqup, ly.kqup_t,
+                         pq.empty() ? nullptr : pq.data());
+      ok = ok && (pq.empty() || ly.kqup_t == KQ::kNVFP4);
+      ok = ok && load_kq(p + "mlp.down_proj.weight", ly.kqdown, ly.kqdown_t,
+                         nullptr, !pq.empty());
+    }
     // Opt-in: repack the Q4_K gate/up to affine-g32 for the ~1.9x faster
     // affine decode matvec (decode is FFN-dominated). Prefill keeps the raw.
     static const bool kAff = q4k_affine_enabled_();
@@ -4949,7 +5249,8 @@ MetalQwenModel::kqmm_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
   if (_w_deq.empty() || _w_deq.byte_size() < need) {
     _w_deq = _mc->make_shared_buffer(need);
   }
-  enc.set_function(type == KQ::kQ6K ? _fn_dequant_q6k
+  enc.set_function(type == KQ::kNVFP4 ? _fn_dequant_nvfp4
+                  : type == KQ::kQ6K ? _fn_dequant_q6k
                   : (type == KQ::kQ5K ? _fn_dequant_q5k : _fn_dequant_q4k));
   enc.set_buffer(0, w);
   enc.set_buffer(1, _w_deq);
@@ -4965,7 +5266,8 @@ MetalQwenModel::kdequant_(ComputeEncoder& enc, KQ type, const SharedBuffer& w,
   assert(type != KQ::kNone && "k-quant dequant received kNone");
   // Dequant `count` k-quant elements of `w` into _w_deq[dst_off:], for a
   // fused prefill GEMM (heterogeneous parts share one f16 scratch).
-  enc.set_function(type == KQ::kQ6K ? _fn_dequant_q6k
+  enc.set_function(type == KQ::kNVFP4 ? _fn_dequant_nvfp4
+                  : type == KQ::kQ6K ? _fn_dequant_q6k
                   : (type == KQ::kQ5K ? _fn_dequant_q5k : _fn_dequant_q4k));
   enc.set_buffer(0, w);
   enc.set_buffer(1, _w_deq, dst_off * 2);
@@ -5082,6 +5384,16 @@ void
 MetalQwenModel::embed_q6k_(ComputeEncoder& enc, const SharedBuffer& ids,
                            std::size_t ioff, const SharedBuffer& out, int n)
 {
+  if (_kq_embed_dense) {
+    // NVFP4's bf16 table (as f16): embed_gather_f16(ids, table, out, H).
+    enc.set_function(_fn_embed_dense);
+    enc.set_buffer(0, ids, ioff * 4);
+    enc.set_buffer(1, _embed_w);
+    enc.set_buffer(2, out);
+    enc.set_constant(3, _cfg.hidden);
+    enc.dispatch({(unsigned)_cfg.hidden, (unsigned)n, 1}, {256, 1, 1});
+    return;
+  }
   enc.set_function(_embed_kqt == KQ::kQ4K ? _fn_embed_q4k : _fn_embed_q6k);
   enc.set_buffer(0, ids, ioff * 4);
   enc.set_buffer(1, _embed_q6k);
@@ -5218,6 +5530,7 @@ bool
 MetalQwenModel::embed_in_stream_ok_() const
 {
   if (_kquant) {
+    if (_kq_embed_dense) { return _fn_embed_dense.valid(); }
     return _embed_is_q6k && (_embed_kqt == KQ::kQ4K ? _fn_embed_q4k.valid()
                                                     : _fn_embed_q6k.valid());
   }
@@ -5753,6 +6066,9 @@ MetalQwenModel::encode_decode_step_(
           if (ly.o_q4k_aff) {
             amv_g32(ly.o_aw, ly.o_as, ly.o_ab, _d_attn, _d_radd, qd, H);
           } else {
+            if (!ly.o_pq.empty()) {
+              scale_cols_(enc, _d_attn, 0, ly.o_pq, qd, 1);
+            }
             kqmv_(enc, ly.kqo_t, ly.kqo, _d_attn, 0, _d_radd, 0, qd, H);
           }
           radd(H);
@@ -9909,7 +10225,10 @@ MetalQwenModel::forward_chunk_(ContextId cid, const SharedBuffer& x, int n,
         if (_prism) { prism_rows_(enc, att, 0, att, 0, n, qd); }
         if (_kquant && ly.o_q4k_aff) {
           aqmm_g32_(enc, ly.o_aw, ly.o_as, ly.o_ab, att, ao, qd, H, n);
-        } else if (_kquant) { kqmm_(enc, ly.kqo_t, ly.kqo, att, ao, qd, H, n); }
+        } else if (_kquant) {
+          if (!ly.o_pq.empty()) { scale_cols_(enc, att, 0, ly.o_pq, qd, n); }
+          kqmm_(enc, ly.kqo_t, ly.kqo, att, ao, qd, H, n);
+        }
         else if (_mixed) {
           aqmm_(enc, ly.ow, ly.os, ly.ob, ly.o_bits, att, ao, qd, H, n);
         } else { qmm(ly.ow, ly.os, ly.ob, att, ao, qd, H); }
@@ -11215,6 +11534,9 @@ MetalQwenModel::mtp_verify_chunk_(ContextId cid, const SharedBuffer& x, int n,
               amv_g32_batch_(enc, ly.o_aw, ly.o_as, ly.o_ab, att, ao, qd, H,
                              n, H, 0);
             } else {
+              if (!ly.o_pq.empty()) {
+                scale_cols_(enc, att, 0, ly.o_pq, qd, n);
+              }
               kqmv_batch_(enc, ly.kqo_t, ly.kqo, att, ao, qd, H, n, H, 0);
             }
           } else if (uni) {
@@ -11992,7 +12314,8 @@ MetalQwenModel::decode_pipelined(
 {
   out_ids.clear();
   if (n_steps <= 0) { return true; }
-  const bool embed_ok = _kquant ? _embed_is_q6k : _fn_embed.valid();
+  const bool embed_ok =
+      _kquant ? (_embed_is_q6k || _kq_embed_dense) : _fn_embed.valid();
   if (!embed_ok || !_fn_argmax.valid() || !_fn_sample.valid()) {
     return false;
   }
@@ -12273,7 +12596,8 @@ MetalQwenModel::pdecode_begin(ContextId cid, std::int32_t first_token,
                               const GpuSamplerParams& sp, int max_tokens,
                               int rope_first)
 {
-  const bool embed_ok = _kquant ? _embed_is_q6k : _fn_embed.valid();
+  const bool embed_ok =
+      _kquant ? (_embed_is_q6k || _kq_embed_dense) : _fn_embed.valid();
   if (!embed_ok || !_fn_argmax.valid() ||
       (!sp.greedy && !_fn_sample.valid())) {
     return false;
@@ -12823,7 +13147,9 @@ MetalQwenModel::mtp_decode(ContextId cid, std::int32_t first_token,
   };
   // k-quant gathers the MTP drafter's embed via embed_q6k (tied q6_K table),
   // not the affine _fn_embed; both paths still need the per-position argmax.
-  const bool kembed_ok = _kquant ? (_embed_is_q6k && _fn_embed_q6k.valid())
+  const bool kembed_ok = _kquant ? ((_embed_is_q6k && _fn_embed_q6k.valid()) ||
+                                    (_kq_embed_dense &&
+                                     _fn_embed_dense.valid()))
                        : ((_dense || _dense_embed) ? _fn_embed_dense.valid()
                                                    : _fn_embed.valid());
   if (!kembed_ok || !_fn_argmax.valid()) { return false; }
@@ -13861,8 +14187,9 @@ MetalQwenModel::pinned_layer_count(const MetalLlamaWeights& wts,
                                    const Config& c)
 {
   if (!c.stream_layers || c.pin_frac <= 0.0) { return 0; }
-  // The raw-source path grows its resident set by measurement instead.
-  if (streams_raw(wts, c)) { return 0; }
+  // The raw-source path grows its resident set by measurement instead,
+  // and an NVFP4 stack never pins (it streams that way or loads resident).
+  if (streams_raw(wts, c) || nvfp4_stack_(wts, c)) { return 0; }
   std::vector<std::string> pfx;
   pfx.reserve((std::size_t)c.n_layers);
   for (int i = 0; i < c.n_layers; ++i) {

@@ -27,7 +27,10 @@
 #include "common/session.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
+#include "stages/model-memory-host.h"
 #include "generative-models/qwen-image/qwen-image21-layout.h"
+#include "generative-models/shared/fp8-expand.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/block-slots.h"
 #include "generative-models/train/lora-params.h"
 #include "generative-models/weight-set.h"
@@ -4586,4 +4589,259 @@ TEST(qwen_image_21_dit, fill_study)
     }
     std::printf("\n");
   }
+}
+
+// ---- NVFP4 ---------------------------------------------------------
+//
+// A tiny Qwen-Image 2.1 DiT (two blocks, two heads of 128) whose block
+// projections are NVFP4 -- ComfyUI's spelling on the attention (a
+// comfy_quant record a layer, the scales swizzled), ModelOpt's on the
+// MLP with an AWQ scale on `out` -- against its TWIN, the same weights
+// decoded to bf16 on the host (fp8::decode_tensor_bf16, which the GPU
+// widening matches bit for bit: fp8_layouts.nvfp4_reads_in_both_
+// spellings). The forward must be BYTE-IDENTICAL, preloaded and streamed.
+namespace {
+
+struct Q21T {
+  std::string name, dtype;
+  std::vector<std::int64_t> shape;
+  std::vector<std::uint8_t> bytes;
+};
+
+bool
+q21_write_(const std::filesystem::path& p, const std::vector<Q21T>& ts)
+{
+  std::string hdr = "{";
+  std::uint64_t off = 0;
+  for (std::size_t i = 0; i < ts.size(); ++i) {
+    std::string shp;
+    for (std::size_t d = 0; d < ts[i].shape.size(); ++d) {
+      shp += (d ? "," : "") + std::to_string(ts[i].shape[d]);
+    }
+    hdr += (i ? "," : "") + std::string("\"") + ts[i].name +
+           "\":{\"dtype\":\"" + ts[i].dtype + "\",\"shape\":[" + shp +
+           "],\"data_offsets\":[" + std::to_string(off) + "," +
+           std::to_string(off + ts[i].bytes.size()) + "]}";
+    off += ts[i].bytes.size();
+  }
+  hdr += "}";
+  while (hdr.size() % 8 != 0) { hdr += ' '; }
+  std::ofstream f(p, std::ios::binary);
+  const std::uint64_t n = hdr.size();
+  f.write(reinterpret_cast<const char*>(&n), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  for (const Q21T& t : ts) {
+    f.write(reinterpret_cast<const char*>(t.bytes.data()),
+            (std::streamsize)t.bytes.size());
+  }
+  return f.good();
+}
+
+}  // namespace
+
+TEST(qwen_image_21_dit, nvfp4_dit_forwards_as_its_dense_twin)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const int H = 256, C = 256, IN = 64, L = 2, F = 3 * H;
+  unsigned st = 5;
+  auto next = [&]() { st = st * 1664525u + 1013904223u; return st >> 8; };
+  auto bf16 = [&](const std::string& nm, std::vector<std::int64_t> shape,
+                  float spread, float center = 0.0f) {
+    std::size_t n = 1;
+    for (auto d : shape) { n *= (std::size_t)d; }
+    Q21T t{nm, "BF16", shape, std::vector<std::uint8_t>(n * 2)};
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v =
+          center + ((float)(next() % 65536) / 32768.0f - 1.0f) * spread;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      const std::uint16_t b = (std::uint16_t)(u >> 16);
+      std::memcpy(&t.bytes[i * 2], &b, 2);
+    }
+    return t;
+  };
+  std::vector<Q21T> q, d;
+  auto both = [&](Q21T t) { q.push_back(t); d.push_back(std::move(t)); };
+  // An NVFP4 projection in `q`; its host decode in `d` (read back from a
+  // one-layer file, the decoder every reader uses).
+  const fs::path dir = fs::temp_directory_path() /
+                       ("vpipe-q21-nvfp4-" + std::to_string(::getpid()));
+  fs::create_directories(dir / "q");
+  fs::create_directories(dir / "d");
+  auto nv = [&](const std::string& nm, int n, int k, bool comfy, bool awq) {
+    const int B = k / 16;
+    std::vector<std::uint8_t> nib((std::size_t)n * k);
+    for (auto& c : nib) { c = (std::uint8_t)(next() % 16); }
+    std::vector<std::uint8_t> sc((std::size_t)n * B);
+    for (auto& c : sc) { c = (std::uint8_t)(0x20 + next() % 0x10); }
+    std::vector<Q21T> one;
+    Q21T w{nm + ".weight", "U8", {n, k / 2},
+           std::vector<std::uint8_t>((std::size_t)n * k / 2)};
+    for (std::size_t e = 0; e < nib.size(); e += 2) {
+      w.bytes[e / 2] = comfy ? (std::uint8_t)(nib[e] << 4 | nib[e + 1])
+                             : (std::uint8_t)(nib[e + 1] << 4 | nib[e]);
+    }
+    one.push_back(w);
+    std::vector<std::uint8_t> stored = sc;
+    std::int64_t rows = n, cols = B;
+    if (comfy) {
+      rows = (n + 127) / 128 * 128;
+      cols = (B + 3) / 4 * 4;
+      stored.assign((std::size_t)(rows * cols), 0);
+      for (int r = 0; r < n; ++r) {
+        for (int b = 0; b < B; ++b) {
+          stored[fp8::nvfp4_scale_index((std::size_t)r, (std::size_t)b,
+                                        (std::size_t)B, true)] =
+              sc[(std::size_t)r * B + b];
+        }
+      }
+      const std::string rec = "{\"format\": \"nvfp4\"}";
+      one.push_back({nm + ".comfy_quant", "U8", {(std::int64_t)rec.size()},
+                     std::vector<std::uint8_t>(rec.begin(), rec.end())});
+    }
+    one.push_back({nm + ".weight_scale", "F8_E4M3", {rows, cols}, stored});
+    const float s2 = 0.02f;
+    Q21T g{nm + ".weight_scale_2", "F32", {}, std::vector<std::uint8_t>(4)};
+    std::memcpy(g.bytes.data(), &s2, 4);
+    one.push_back(g);
+    if (awq) { one.push_back(bf16(nm + ".pre_quant_scale", {k}, 0.4f, 1.0f)); }
+    const fs::path tmp = dir / "one.safetensors";
+    if (!q21_write_(tmp, one)) { return; }
+    auto ow = MetalLlamaWeights::open(tmp.string());
+    std::vector<std::uint16_t> dec((std::size_t)n * k);
+    if (!ow.has_value() ||
+        !fp8::decode_tensor_bf16(*ow, nm + ".weight", dec.data(), dec.size(),
+                                 nullptr)) {
+      return;
+    }
+    for (Q21T& t : one) { q.push_back(std::move(t)); }
+    Q21T dt{nm + ".weight", "BF16", {n, k},
+            std::vector<std::uint8_t>(dec.size() * 2)};
+    std::memcpy(dt.bytes.data(), dec.data(), dt.bytes.size());
+    d.push_back(std::move(dt));
+  };
+  both(bf16("img_in.weight", {H, IN}, 0.05f));
+  both(bf16("norm_out.linear.weight", {H, H}, 0.02f));
+  both(bf16("proj_out.weight", {IN, H}, 0.05f));
+  both(bf16("time_text_embed.timestep_embedder.linear_1.weight", {H, 256},
+            0.05f));
+  both(bf16("time_text_embed.timestep_embedder.linear_2.weight", {H, H},
+            0.05f));
+  both(bf16("txt_in.in_layer.weight", {H, C}, 0.05f));
+  both(bf16("txt_in.out_layer.weight", {H, H}, 0.05f));
+  both(bf16("txt_in.text_norm.weight", {C}, 0.1f));
+  both(bf16("modulation.1.weight", {4 * H, H}, 0.02f));
+  for (int l = 0; l < L; ++l) {
+    const std::string p = "transformer_blocks." + std::to_string(l) + ".";
+    both(bf16(p + "attn.norm_q.weight", {128}, 0.1f, 1.0f));
+    both(bf16(p + "attn.norm_k.weight", {128}, 0.1f, 1.0f));
+    nv(p + "attn.to_q", H, H, true, false);
+    nv(p + "attn.to_k", H, H, true, false);
+    nv(p + "attn.to_v", H, H, true, false);
+    nv(p + "attn.to_out.0", H, H, true, false);
+    nv(p + "img_mlp.gate_layer", F, H, false, false);
+    nv(p + "img_mlp.proj", F, H, false, false);
+    nv(p + "img_mlp.out", H, F, false, true);
+  }
+  const std::string cfg_json =
+      "{\"_class_name\": \"QwenImage21Transformer2DModel\", "
+      "\"attention_head_dim\": 128, \"axes_dims_rope\": [16, 56, 56], "
+      "\"context_in_dim\": 256, \"in_channels\": 64, "
+      "\"num_attention_heads\": 2, \"num_layers\": 2, \"out_channels\": 64, "
+      "\"patch_size\": 1, \"mlp_ratio\": 3, \"eps\": 1e-06, "
+      "\"causal_condition\": true}";
+  for (const char* sub : {"q", "d"}) {
+    std::ofstream(dir / sub / "config.json") << cfg_json;
+  }
+  Q21D_REQUIRE(q21_write_(dir / "q" / "diffusion_pytorch_model.safetensors",
+                          q));
+  Q21D_REQUIRE(q21_write_(dir / "d" / "diffusion_pytorch_model.safetensors",
+                          d));
+  fs::remove(dir / "one.safetensors");
+
+  MetalQwenImage21Transformer::Config cfg;
+  Q21D_REQUIRE(MetalQwenImage21Transformer::Config::read_dims(
+      (dir / "d").string(), &cfg));
+  const std::vector<std::uint8_t> slot = {0, 0, 0, 1, 0, 0, 1, 1, 1, 1};
+  const std::vector<qi21::ImgBlock> blocks = {{1, 2, 2}, {1, 4, 4}};
+  qi21::Layout lay;
+  std::string lerr;
+  Q21D_REQUIRE(qi21::build_layout(slot, {}, blocks, &lay, &lerr));
+  auto rnd = [&](std::size_t n, unsigned seed) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    unsigned s = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+      s = s * 1664525u + 1013904223u;
+      const float v = ((float)((s >> 8) & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      p[i] = (std::uint16_t)(u >> 16);
+    }
+    return b;
+  };
+  metal_compute::SharedBuffer lat =
+      rnd((std::size_t)lay.image_len * cfg.in_channels, 11u);
+  metal_compute::SharedBuffer txt =
+      rnd((std::size_t)slot.size() * cfg.txt_dim, 22u);
+  std::vector<std::size_t> widen;   // the widening scratch, per run
+  auto run = [&](const std::string& sub, bool stream) {
+    std::vector<std::uint16_t> out;
+    auto m = MetalQwenImage21Transformer::load((dir / sub).string(), mc, cfg,
+                                               stream);
+    if (m == nullptr) { return out; }
+    MetalQwenImage21Transformer::Request req;
+    req.latents = &lat;
+    req.txt = &txt;
+    req.layout = &lay;
+    req.timestep = 0.75f;
+    std::string ferr;
+    metal_compute::SharedBuffer o = m->forward(req, &ferr);
+    if (o.empty()) { return out; }
+    const auto* p = static_cast<const std::uint16_t*>(o.contents());
+    out.assign(p, p + (std::size_t)lay.target_len * cfg.out_channels);
+    widen.push_back(m->widen_scratch_bytes());
+    return out;
+  };
+  const auto ref = run("d", false);
+  const auto pre = run("q", false);
+  const auto str = run("q", true);
+  Q21D_REQUIRE(!ref.empty() && !pre.empty() && !str.empty());
+  double s2 = 0.0;
+  for (std::uint16_t b : ref) {
+    std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    s2 += (double)f * f;
+  }
+  std::printf("[qwen_image_21_dit] NVFP4 DiT against its bf16 twin: "
+              "preloaded %s, streamed %s (rms %.4f)\n",
+              pre == ref ? "IDENTICAL" : "DIFFERENT",
+              str == ref ? "IDENTICAL" : "DIFFERENT",
+              std::sqrt(s2 / (double)ref.size()));
+  EXPECT_TRUE(pre == ref);
+  EXPECT_TRUE(str == ref);
+  // The one widening scratch, as the plan books it: the widest NVFP4
+  // weight at its LOGICAL width (an NVFP4 row stores half), whichever hold
+  // ran; the dense twin widens nothing. And the plan's term is it.
+  const std::size_t booked = vpipe::model_memory::widened_weight_bytes(
+      (dir / "q").string());
+  std::printf("[qwen_image_21_dit] NVFP4 widening scratch: booked %zu B, "
+              "grown %zu / %zu B (preloaded / streamed), dense %zu B\n",
+              booked, widen.size() > 1 ? widen[1] : 0,
+              widen.size() > 2 ? widen[2] : 0, widen.empty() ? 0 : widen[0]);
+  EXPECT_TRUE(booked == (std::size_t)F * H * 2);
+  EXPECT_TRUE(widen.size() == 3 && widen[0] == 0 && widen[1] == booked &&
+              widen[2] == booked);
+  const int img = lay.image_len, txtn = (int)slot.size();
+  EXPECT_TRUE(MetalQwenImage21Transformer::forward_scratch_bytes(
+                  cfg, img, txtn, true, false, false, booked) ==
+              MetalQwenImage21Transformer::forward_scratch_bytes(
+                  cfg, img, txtn, true, false, false) +
+                  booked);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
 }

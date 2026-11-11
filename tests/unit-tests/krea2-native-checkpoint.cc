@@ -28,6 +28,7 @@
 #include "common/session.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
+#include "stages/model-memory-host.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/lora-fusion.h"
 #include "generative-models/quantize/model-quantizer.h"
@@ -52,6 +53,7 @@
 #include <string>
 #include <unistd.h>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 using namespace vpipe;
@@ -101,7 +103,13 @@ write_safetensors_(const fs::path& p, const std::vector<T>& ts,
     hdr += "\"__metadata__\":{";
     bool first = true;
     for (const auto& [k, v] : meta) {
-      hdr += (first ? "" : ",") + std::string("\"") + k + "\":\"" + v +
+      // A value is a JSON string: a JSON document in it is escaped.
+      std::string esc;
+      for (char c : v) {
+        if (c == '"' || c == '\\') { esc += '\\'; }
+        esc += c;
+      }
+      hdr += (first ? "" : ",") + std::string("\"") + k + "\":\"" + esc +
              "\"";
       first = false;
     }
@@ -262,6 +270,77 @@ scale_native_(std::vector<T>& ts, std::mt19937& rng, ScaleStyle st)
     extra.push_back({"scaled_fp8", "F8_E4M3", {}, {0}});
   }
   ts.insert(ts.end(), extra.begin(), extra.end());
+}
+
+// Make a tiny native checkpoint's block projections NVFP4 (the rest stays
+// as it was): nibble codes, E4M3 block scales of 16 and the tensor's
+// scale_2 -- ComfyUI's spelling (the even column HIGH, the scales in
+// cuBLAS's swizzled tiles, the header's _quantization_metadata keyed by
+// the FILE's names, which the translation at open renames away from) or
+// ModelOpt's (LOW, row by row, no record) with an AWQ pre_quant_scale on
+// the MLPs' down projection. Returns the header metadata to write.
+std::map<std::string, std::string>
+nvfp4_native_(std::vector<T>& ts, std::mt19937& rng, bool comfy)
+{
+  std::uniform_int_distribution<int> nib(0, 15), blk(0x20, 0x30);
+  std::uniform_real_distribution<float> pqd(0.5f, 1.8f);
+  std::vector<T> extra;
+  std::string layers;
+  for (T& t : ts) {
+    const bool proj = t.name.size() > 7 &&
+                      t.name.compare(t.name.size() - 7, 7, ".weight") == 0 &&
+                      (t.name.find(".attn.") != std::string::npos ||
+                       t.name.find(".mlp.") != std::string::npos) &&
+                      t.shape.size() == 2;
+    if (!proj) { continue; }
+    const std::string layer = t.name.substr(0, t.name.size() - 7);
+    const std::int64_t N = t.shape[0], K = t.shape[1], B = K / 16;
+    std::vector<std::uint8_t> codes((std::size_t)(N * K / 2));
+    for (auto& c : codes) {
+      c = (std::uint8_t)(nib(rng) | nib(rng) << 4);
+    }
+    std::vector<std::uint8_t> sc((std::size_t)(N * B));
+    for (auto& c : sc) { c = (std::uint8_t)blk(rng); }
+    if (comfy) {
+      // torch's to_blocked: tiles of 128 rows x 4 blocks, each [32][4][4].
+      const std::int64_t Np = (N + 127) / 128 * 128, Bp = (B + 3) / 4 * 4;
+      std::vector<std::uint8_t> st((std::size_t)(Np * Bp), 0);
+      for (std::int64_t r = 0; r < N; ++r) {
+        for (std::int64_t b = 0; b < B; ++b) {
+          const std::int64_t o =
+              ((r / 128) * (Bp / 4) + b / 4) * 512 + (r % 32) * 16 +
+              ((r % 128) / 32) * 4 + b % 4;
+          st[(std::size_t)o] = sc[(std::size_t)(r * B + b)];
+        }
+      }
+      sc = std::move(st);
+      layers += std::string(layers.empty() ? "" : ", ") + "\"" + layer +
+                "\": {\"format\": \"nvfp4\"}";
+    }
+    t.dtype = "U8";
+    t.shape = {N, K / 2};
+    t.bytes = std::move(codes);
+    const std::int64_t rows = comfy ? (N + 127) / 128 * 128 : N;
+    const std::int64_t cols = comfy ? (B + 3) / 4 * 4 : B;
+    extra.push_back({layer + ".weight_scale", "F8_E4M3", {rows, cols}, sc});
+    extra.push_back({layer + ".weight_scale_2", "F32", {},
+                     f32_bytes_({0.15f})});
+    extra.push_back({layer + ".input_scale", "F32", {},
+                     f32_bytes_({1.0f})});
+    if (!comfy && layer.find("mlp.down") != std::string::npos) {
+      std::vector<std::uint8_t> pq((std::size_t)K * 2);
+      for (std::int64_t k = 0; k < K; ++k) {
+        const std::uint16_t b = bf16_rne_(pqd(rng));
+        std::memcpy(&pq[(std::size_t)k * 2], &b, 2);
+      }
+      extra.push_back({layer + ".pre_quant_scale", "BF16", {K}, pq});
+    }
+  }
+  ts.insert(ts.end(), extra.begin(), extra.end());
+  if (!comfy) { return {}; }
+  return {{"_quantization_metadata",
+           "{\"format_version\": \"1.0\", \"layers\": {" + layers +
+               "}}"}};
 }
 
 MetalKrea2Transformer::Config
@@ -672,7 +751,8 @@ TEST(krea2_native, real_file_matches_the_published_transformer)
 // minitest's EXPECT/ASSERT only exist inside a TEST body.)
 TEST(krea2_native, fp8_runtime_matches_dense)
 {
-  auto check = [&](const std::string& label, const std::vector<T>& content) {
+  auto check = [&](const std::string& label, const std::vector<T>& content,
+                   const std::map<std::string, std::string>& meta = {}) {
     Session sess;
     metal_compute::MetalCompute* mc = sess.metal_compute();
     if (mc == nullptr) { return; }
@@ -681,7 +761,7 @@ TEST(krea2_native, fp8_runtime_matches_dense)
     const fs::path dir = scratch_("rt");
     fs::create_directories(dir);
     const fs::path file = dir / "tiny_krea2_fp8.safetensors";
-    ASSERT_TRUE(write_safetensors_(file, content));
+    ASSERT_TRUE(write_safetensors_(file, content, meta));
     const fs::path dense = scratch_("rt-dense");
     {
       QuantizeOptions opt;
@@ -706,7 +786,10 @@ TEST(krea2_native, fp8_runtime_matches_dense)
     const metal_compute::SharedBuffer lat = f16buf((std::size_t)IS * 64);
 
     // One text pass and one denoise step, as f16 bits.
-    struct Out { std::vector<std::uint16_t> text, vel; std::size_t held = 0; };
+    struct Out {
+      std::vector<std::uint16_t> text, vel;
+      std::size_t held = 0, widen = 0;
+    };
     auto run = [&](const std::string& src, bool stream) {
       Out o;
       auto ws = WeightSet::open(src, nullptr);
@@ -722,6 +805,7 @@ TEST(krea2_native, fp8_runtime_matches_dense)
       o.text.assign(tp, tp + (std::size_t)TS * cfg.hidden);
       o.vel.assign(vp, vp + (std::size_t)IS * 64);
       o.held = ws->stats().bytes;
+      o.widen = m->widen_scratch_bytes();
       return o;
     };
     const Out ref = run(dense.string(), false);
@@ -753,6 +837,24 @@ TEST(krea2_native, fp8_runtime_matches_dense)
     std::printf("[krea2_native] %s held: dense %zu B, fp8 %zu B\n",
                 label.c_str(), ref.held, pre.held);
     EXPECT_TRUE(pre.held > 0 && pre.held * 10 < ref.held * 7);
+    // The one widening scratch, as the plan books it: the widest FP8 /
+    // NVFP4 weight at its logical width, whichever hold ran (the dense
+    // twin widens nothing).
+    const std::size_t booked =
+        vpipe::model_memory::widened_weight_bytes(file.string());
+    std::printf("[krea2_native] %s widening scratch: booked %zu B, grown "
+                "%zu / %zu / %zu B (preloaded / streamed / no slots), dense "
+                "%zu B\n", label.c_str(), booked, pre.widen, str.widen,
+                nos.widen, ref.widen);
+    EXPECT_TRUE(ref.widen == 0 && booked > 0);
+    for (const Out* o : {&pre, &str, &nos}) {
+      EXPECT_TRUE(o->widen == booked);
+    }
+    EXPECT_TRUE(MetalKrea2Transformer::forward_scratch_bytes(cfg, IS, TS,
+                                                             false, booked) ==
+                MetalKrea2Transformer::forward_scratch_bytes(cfg, IS, TS,
+                                                             false) +
+                    booked);
 
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -776,10 +878,20 @@ TEST(krea2_native, fp8_runtime_matches_dense)
     scale_native_(ts, rng, ScaleStyle::kComfyU8Row);
     check("scaled comfy_quant per-row", ts);
   }
+  // NVFP4 projections beside the FP8 rest, in ComfyUI's spelling (the
+  // header names the file's layers; the translation renames them) and
+  // ModelOpt's with an AWQ scale: the nibble widening, the block scales
+  // refilled raw and the AWQ scale rebuilt per slot, against the dense
+  // conversion model-quantize makes of the same file.
+  for (bool comfy : {true, false}) {
+    std::vector<T> ts = tiny_native_(rng, "", 0x27, "F8_E4M3");
+    const auto meta = nvfp4_native_(ts, rng, comfy);
+    check(comfy ? "NVFP4 ComfyUI" : "NVFP4 ModelOpt + AWQ", ts, meta);
+  }
 }
 
 // The transformer's own refusals: a layer in an encoding it cannot decode
-// (NVFP4) and a native file with a DiT tensor the translation cannot place
+// (MXFP8) and a native file with a DiT tensor the translation cannot place
 // both load as NOTHING, with the reason in the log -- not as a model
 // missing a term.
 TEST(krea2_native, loader_refuses_what_it_cannot_read)
@@ -793,9 +905,10 @@ TEST(krea2_native, loader_refuses_what_it_cannot_read)
   fs::create_directories(dir);
   const MetalKrea2Transformer::Config cfg = tiny_cfg_();
   const std::pair<const char*, T> extra[] = {
-      {"nvfp4.safetensors",
+      // NVFP4 is read now; MXFP8 is not.
+      {"mxfp8.safetensors",
        T{"blocks.0.attn.wq.comfy_quant", "U8", {18},
-         str_bytes_("{\"format\":\"nvfp4\"}")}},
+         str_bytes_("{\"format\":\"mxfp8\"}")}},
       {"stray.safetensors",
        T{"blocks.0.attn.wq.bias", "F8_E4M3", {128},
          std::vector<std::uint8_t>(128, 0)}},
@@ -876,8 +989,7 @@ TEST(fp8_layout, every_scaled_spelling_decodes_alike)
        {{"a.weight", "U8", {4, 8}, codes},
         {"a.weight_scale", "F32", {1}, f32_bytes_({one_s})}},
        {{"_quantization_metadata",
-         "{\\\"layers\\\": {\\\"a\\\": {\\\"format\\\": "
-         "\\\"float8_e4m3fn\\\"}}}"}},
+         "{\"layers\": {\"a\": {\"format\": \"float8_e4m3fn\"}}}"}},
        fp8::Format::kE4M3, false, 1},
       {"per-row scale",
        {{"a.weight", "F8_E4M3", {4, 8}, codes},
@@ -959,6 +1071,106 @@ TEST(fp8_layout, every_scaled_spelling_decodes_alike)
     const bool named = err.find(why) != std::string::npos;
     if (!named) { std::printf("[fp8_layout] '%s': %s\n", why, err.c_str()); }
     EXPECT_TRUE(named);
+  }
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// A LoRA on an NVFP4 BASE (ComfyUI's spelling and ModelOpt's with AWQ):
+// the base widened per GEMM, the adapter applied at runtime over it --
+// EXACTLY what the same adapter does over the base's dense conversion,
+// preloaded and streamed.
+TEST(krea2_native, lora_on_an_nvfp4_base_matches_its_dense_base)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  CerrSilencer hush;
+  std::mt19937 rng(91);
+  const fs::path dir = scratch_("nvlora");
+  fs::create_directories(dir);
+  const int R = 4, H = 128, FF = 256;
+  struct Mod { std::string name; int n, k; };
+  const std::vector<Mod> mods = {
+      {"transformer_blocks.0.attn.to_q", H, H},
+      {"transformer_blocks.0.ff.down", H, FF},
+      {"transformer_blocks.1.attn.to_v", H, H},
+      {"transformer_blocks.1.ff.up", FF, H}};
+  std::normal_distribution<float> fd(0.0f, 0.05f);
+  std::vector<T> lora;
+  for (const Mod& m : mods) {
+    for (const auto& [suf, rows, cols] :
+         {std::tuple<const char*, int, int>{".lora_A.weight", R, m.k},
+          std::tuple<const char*, int, int>{".lora_B.weight", m.n, R}}) {
+      std::vector<std::uint8_t> b((std::size_t)rows * cols * 2);
+      for (std::size_t i = 0; i < b.size() / 2; ++i) {
+        const std::uint16_t v = bf16_rne_(fd(rng));
+        std::memcpy(&b[2 * i], &v, 2);
+      }
+      lora.push_back({m.name + suf, "BF16", {rows, cols}, b});
+    }
+  }
+  const fs::path lp = dir / "lora.safetensors";
+  ASSERT_TRUE(write_safetensors_(lp, lora));
+  const MetalKrea2Transformer::Config cfg = tiny_cfg_();
+  const int TS = 8, GH = 4, GW = 4, IS = GH * GW;
+  std::normal_distribution<float> nd(0.0f, 0.5f);
+  auto f16buf = [&](std::size_t n) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = (_Float16)nd(rng); }
+    return b;
+  };
+  const metal_compute::SharedBuffer ehs =
+      f16buf((std::size_t)TS * cfg.n_text_layers * cfg.text_hidden);
+  const metal_compute::SharedBuffer lat = f16buf((std::size_t)IS * 64);
+  int bound = -1;
+  auto run = [&](const std::string& src, bool stream, bool with) {
+    std::vector<std::uint16_t> out;
+    std::vector<MetalKrea2Transformer::LoraSpec> specs;
+    if (with) { specs.push_back({lp.string(), 1.0f}); }
+    auto m = MetalKrea2Transformer::load(src, mc, cfg, stream, specs);
+    if (m == nullptr) { return out; }
+    bound = m->lora_modules();
+    auto t = m->forward_text(ehs, TS);
+    if (t.empty()) { return out; }
+    auto v = m->forward_dit(t, TS, lat, IS, GH, GW, 0.5f);
+    if (v.empty()) { return out; }
+    const auto* vp = static_cast<const std::uint16_t*>(v.contents());
+    out.assign(vp, vp + (std::size_t)IS * 64);
+    return out;
+  };
+  for (bool comfy : {true, false}) {
+    std::vector<T> ts = tiny_native_(rng, "", 0x27);
+    const auto meta = nvfp4_native_(ts, rng, comfy);
+    const fs::path basef = dir / (comfy ? "base_c.safetensors"
+                                        : "base_m.safetensors");
+    ASSERT_TRUE(write_safetensors_(basef, ts, meta));
+    const fs::path dense = dir / (comfy ? "dense_c" : "dense_m");
+    {
+      QuantizeOptions opt;
+      opt.bits = 16;
+      std::string err;
+      ASSERT_TRUE(ModelQuantizer(mc).run(basef.string(), dense.string(), opt,
+                                         &err));
+    }
+    const auto ref = run(dense.string(), false, true);
+    EXPECT_TRUE(bound == (int)mods.size());
+    const auto none = run(basef.string(), false, false);
+    const auto pre = run(basef.string(), false, true);
+    EXPECT_TRUE(bound == (int)mods.size());
+    const auto str = run(basef.string(), true, true);
+    ASSERT_TRUE(!ref.empty() && !pre.empty() && !str.empty() &&
+                !none.empty());
+    std::printf("[krea2_native] LoRA on an NVFP4 base (%s): preloaded %s, "
+                "streamed %s the dense base's; %s without it\n",
+                comfy ? "ComfyUI" : "ModelOpt + AWQ",
+                pre == ref ? "IDENTICAL to" : "DIFFERENT from",
+                str == ref ? "IDENTICAL to" : "DIFFERENT from",
+                pre != none ? "different" : "THE SAME");
+    EXPECT_TRUE(pre == ref);
+    EXPECT_TRUE(str == ref);
+    EXPECT_TRUE(pre != none);
   }
   std::error_code ec;
   fs::remove_all(dir, ec);

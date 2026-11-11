@@ -334,6 +334,24 @@ MiniMaxH3Scheduler::step_plain(const float* velocity, int step_index,
   return true;
 }
 
+bool
+MiniMaxH3Scheduler::step_velocity(const float* velocity, int step_index,
+                                  float* x, std::size_t n) const
+{
+#pragma clang fp contract(off)
+  if (velocity == nullptr || x == nullptr || step_index < 0 ||
+      step_index + 1 >= (int)_sigmas.size()) {
+    return false;
+  }
+  const float d = _sigmas[(std::size_t)step_index] -
+                  _sigmas[(std::size_t)step_index + 1];
+  for (std::size_t i = 0; i < n; ++i) {
+    const float dv = d * velocity[i];
+    x[i] = x[i] + dv;
+  }
+  return true;
+}
+
 void
 MiniMaxH3Scheduler::derive_()
 {

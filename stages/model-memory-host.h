@@ -103,6 +103,16 @@ inline constexpr std::string_view kClaimHeldBytes = "held_bytes";
 std::size_t residency_reserve_beside(const SessionContextIntf* session,
                                      std::string_view phase);
 
+// THE WIDEST WEIGHT A DiT FORWARD WIDENS per GEMM into its one dequant
+// scratch (Krea 2's and Qwen-Image 2.1's `_w_deq`), as bf16 [N, K], off
+// the checkpoint's headers: an FP8 or NVFP4 weight kept as its codes (K
+// its logical width -- an NVFP4 row stores half), on any GPU; and with
+// `affine` (a pack on the matrix-core route, which dequantizes it), an
+// affine-quantized one, K off its scales at the config's group. 0 when
+// the forward widens nothing.
+std::size_t widened_weight_bytes(const std::string& dit_dir,
+                                 bool affine = false);
+
 }  // namespace model_memory
 }  // namespace vpipe
 

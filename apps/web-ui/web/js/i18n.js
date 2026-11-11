@@ -4720,6 +4720,15 @@ const STRINGS = {
       + 'model 输入端口上的 model-select 源会覆盖它',
       'MiniMax-H3 模型目錄（text_encoder/、video_vae/、audio_vae/）。可選：'
       + 'model 輸入埠上的 model-select 來源會覆寫它'],
+  'cfg.video-ref-encoder.seed': ['',
+      '仅用于 MiniMax-H3-Image：请求的种子——每张图片的 VAE 后验按图片顺序'
+      + '从这个生成器中采样，之后 generate-video 再从同一生成器抽取请求的噪'
+      + '声。设为与 generate-video 的 `seed` 相同（两者默认都是 0），编辑就会'
+      + '抽到与发布版相同的噪声；取其他值只会改变图片的采样。其他模型忽略此项',
+      '僅用於 MiniMax-H3-Image：請求的種子——每張圖片的 VAE 後驗按圖片順序'
+      + '從這個產生器中取樣，之後 generate-video 再從同一產生器抽取請求的雜'
+      + '訊。設為與 generate-video 的 `seed` 相同（兩者預設都是 0），編輯就會'
+      + '抽到與發布版相同的雜訊；取其他值只會改變圖片的取樣。其他模型忽略此項'],
   'cfg.video-ref-encoder.encoder_dir': ['',
       '文本编码器的权重，当它们不是 hf_dir 自带的那份时使用：可以是目录、注'
       + '册表键或单个文件——Draw Things 的 .ckpt（MiniMax-H3 的 Qwen3-VL-32B'
@@ -6289,6 +6298,17 @@ const STRINGS = {
       '配乐时长；0 表示由视频的帧数 / 帧率推导，这样两种模态在构造上就等长',
       '配樂長度；0 表示由影片的影格數 / 影格率推導，這樣兩種模態在結構上就'
       + '等長'],
+  'cfg.minimax-h3-model-config.min_generation_area': ['',
+      '仅用于 MiniMax-H3-Image：图片实际生成时的最小面积（像素）。更小的'
+      + ' width x height 会在按其宽高比放大到该面积的画布上生成，解码后再用'
+      + ' Lanczos 缩回所请求的尺寸，与发布版一致；1024 表示按所请求的尺寸生'
+      + '成。取值 1024 到 16777216；0（默认）为发布版的 4194304（2048 x '
+      + '2048）。其他模型忽略此项',
+      '僅用於 MiniMax-H3-Image：圖片實際產生時的最小面積（像素）。更小的'
+      + ' width x height 會在按其寬高比放大到該面積的畫布上產生，解碼後再用'
+      + ' Lanczos 縮回所請求的尺寸，與發布版一致；1024 表示按所請求的尺寸產'
+      + '生。取值 1024 到 16777216；0（預設）為發布版的 4194304（2048 x '
+      + '2048）。其他模型忽略此項'],
   'cfg.minimax-h3-model-config.refine_start_sigma': ['',
       '仅用于精修（接了 generate-video 的 init_latent——'
       + 'Open-H3-Regenerate-2K）：片段被送回的噪声水平，取值 (0, 1]。默认'

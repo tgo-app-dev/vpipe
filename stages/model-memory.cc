@@ -15,6 +15,7 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/drawthings-store.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "generative-models/wan/metal-wan-vae.h"
@@ -34,6 +35,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -126,6 +129,80 @@ gguf_served_bytes_(const std::string& path)
   return served;
 }
 
+// What an NVFP4 Qwen stack's native load adds to its bytes on disk
+// (MetalQwenModel::nvfp4_held_bytes: its linears served at 148 bytes a
+// 256 inputs against the file's 144, an int8 token table in bf16) --
+// the PE expander's 17.9 GB held 0.57 GB more than it booked by its
+// size. 0 for any other checkpoint. Only a candidate is opened (a file
+// whose header names E4M3 scales beside a token table and an MLP gate;
+// a directory whose config says NVFP4), and the answer is kept per path
+// and file stamp: the planner asks for a checkpoint's size many times a
+// launch.
+std::size_t
+nvfp4_growth_(const std::string& path, bool is_file)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  // The stamp: what would make an answer stale.
+  const char* const kCfgs[] = {"config.json", "hf_quant_config.json"};
+  std::string stamp;
+  if (is_file) {
+    const auto t = fs::last_write_time(fs::path(path), ec);
+    stamp = std::to_string(fs::file_size(fs::path(path), ec)) + ":" +
+            std::to_string((long long)t.time_since_epoch().count());
+  } else {
+    for (const char* cfg : kCfgs) {
+      const auto t = fs::last_write_time(fs::path(path) / cfg, ec);
+      if (!ec) {
+        stamp += std::string(cfg) + ":" +
+                 std::to_string((long long)t.time_since_epoch().count()) + ";";
+      }
+    }
+  }
+  static std::mutex mu;
+  static std::map<std::string, std::pair<std::string, std::size_t>> memo;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    auto it = memo.find(path);
+    if (it != memo.end() && it->second.first == stamp) {
+      return it->second.second;
+    }
+  }
+  bool candidate = false;
+  if (is_file) {
+    std::ifstream f(path, std::ios::binary);
+    std::uint64_t n = 0;
+    if (f.read(reinterpret_cast<char*>(&n), 8) && n > 0 &&
+        n <= ((std::uint64_t)256 << 20)) {
+      std::string hdr((std::size_t)n, '\0');
+      candidate = (bool)f.read(hdr.data(), (std::streamsize)n) &&
+                  hdr.find("F8_E4M3") != std::string::npos &&
+                  hdr.find("embed_tokens") != std::string::npos &&
+                  hdr.find("gate_proj") != std::string::npos;
+    }
+  } else {
+    for (const char* cfg : kCfgs) {
+      std::ifstream f(fs::path(path) / cfg);
+      if (!f) { continue; }
+      const std::string text((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+      candidate = candidate || text.find("NVFP4") != std::string::npos;
+    }
+  }
+  std::size_t growth = 0;
+  if (candidate) {
+    if (auto w = genai::MetalLlamaWeights::open_model(path)) {
+      std::size_t stored = 0;
+      const std::size_t held =
+          genai::MetalQwenModel::nvfp4_held_bytes(*w, &stored);
+      if (held > stored) { growth = held - stored; }
+    }
+  }
+  std::lock_guard<std::mutex> g(mu);
+  memo[path] = {stamp, growth};
+  return growth;
+}
+
 }  // namespace
 
 std::size_t
@@ -185,7 +262,11 @@ dir_weights_bytes(const std::string& dir)
       }
     }
     const std::uintmax_t n = fs::file_size(fs::path(dir), ec);
-    return ec ? 0 : (std::size_t)n;
+    if (ec) { return 0; }
+    // An NVFP4 language model or text encoder named by its file (a
+    // ComfyUI repack) weighs what its load holds.
+    return (std::size_t)n +
+           (ext == ".safetensors" ? nvfp4_growth_(dir, true) : 0);
   }
   bool gguf = false;
   for (fs::recursive_directory_iterator it(dir, ec), end; it != end;
@@ -196,7 +277,8 @@ dir_weights_bytes(const std::string& dir)
     gguf = gguf || it->path().extension() == ".gguf";
   }
   if (total == 0 && gguf) { return gguf_served_bytes_(dir); }
-  return total;
+  // An NVFP4 (ModelOpt) language model weighs what its load holds.
+  return total > 0 ? total + nvfp4_growth_(dir, false) : total;
 }
 
 std::size_t
@@ -1795,6 +1877,56 @@ public:
 VPIPE_REGISTER_RESOURCE_PLANNER(ScratchPlanner)
 VPIPE_REGISTER_RESOURCE_PLANNER(ModelWeightPlanner)
 VPIPE_REGISTER_RESOURCE_PLANNER(CoreMLPlanner)
+
+std::size_t
+widened_weight_bytes(const std::string& dit_dir, bool affine)
+{
+  namespace fs = std::filesystem;
+  auto w = genai::MetalLlamaWeights::open_model(dit_dir);
+  if (!w.has_value()) { return 0; }
+  int group = 64;
+  if (affine) {
+    // The pack's group, from its config (a directory checkpoint's).
+    std::ifstream in(fs::path(dit_dir) / "config.json");
+    if (in) {
+      const FlexData fd = FlexData::from_json(in);
+      const FlexData q = fd.is_object() && fd.as_object().contains(
+                                               "quantization")
+                             ? fd.as_object().at("quantization")
+                             : FlexData();
+      if (q.is_object() && q.as_object().contains("group_size")) {
+        group = (int)q.as_object().at("group_size").as_int(64);
+      }
+    }
+  }
+  std::size_t widest = 0;
+  for (const std::string& nm : w->tensor_names()) {
+    constexpr std::string_view kW = ".weight";
+    if (nm.size() <= kW.size() ||
+        nm.compare(nm.size() - kW.size(), kW.size(), kW) != 0) {
+      continue;
+    }
+    const auto* ti = w->info(nm);
+    if (ti == nullptr || ti->shape.size() != 2) { continue; }
+    std::size_t n = 0;
+    genai::fp8::Weight x;
+    if (genai::fp8::resolve(*w, nm, &x, nullptr, /*int8=*/false,
+                            /*nvfp4=*/true) &&
+        x.format != genai::fp8::Format::kNone) {
+      n = (std::size_t)ti->shape[0] *
+          (std::size_t)genai::fp8::logical_cols(x, ti->shape[1]);
+    } else if (affine && ti->dtype == "U32" && group > 0) {
+      const auto* si = w->info(nm.substr(0, nm.size() - kW.size()) +
+                               ".scales");
+      if (si != nullptr && si->shape.size() == 2) {
+        n = (std::size_t)ti->shape[0] * (std::size_t)si->shape[1] *
+            (std::size_t)group;
+      }
+    }
+    widest = std::max(widest, n * 2);
+  }
+  return widest;
+}
 
 }  // namespace model_memory
 }  // namespace vpipe

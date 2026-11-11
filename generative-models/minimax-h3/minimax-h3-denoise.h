@@ -51,9 +51,13 @@ enum class StepUpdate : int {
   // ComfyUI's `res_multistep`: second order in log-sigma off the previous
   // step's x0 (MiniMaxH3Scheduler::step_res).
   kResMultistep,
+  // Euler in its VELOCITY form, x + (sigma - sigma_next) v on the grid's
+  // float sigmas (MiniMaxH3Scheduler::step_velocity): what MiniMax-H3-
+  // Image's heads were distilled with. Not a sampler-spec method.
+  kVelocity,
 };
 
-// "euler" / "renoise" / "res_multistep"; "auto" for kAuto.
+// "euler" / "renoise" / "res_multistep" / "velocity"; "auto" for kAuto.
 const char* step_update_name(StepUpdate u);
 
 // A `diffusion-sampler-select` spec, read for THIS model. H3 cannot run
@@ -183,6 +187,10 @@ struct DenoiseRequest {
   // contract's update. A flow-map adapter's step IS its jump to the next
   // sigma, so under a live one anything but Euler is refused.
   StepUpdate update = StepUpdate::kAuto;
+  // Step i through the DiT's per-step output head i
+  // (MetalMiniMaxH3Transformer::set_step_heads; MiniMax-H3-Image), in
+  // place of its own head. Needs a head for every step.
+  bool step_heads = false;
   // A REFINE -- Open-H3-Regenerate-2K's: the video's sigmas AS RUN (no
   // shift, overriding `num_steps` and `sigma_grid`), stepped by the
   // reference's plain Euler (MiniMaxH3Scheduler::step_plain), and the

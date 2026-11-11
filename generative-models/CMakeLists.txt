@@ -41,6 +41,7 @@ set(LOCAL_SOURCES
   shared/drawthings-store.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
+  shared/nvfp4.cc
   shared/grounded-encode-params.cc
   shared/i8-gemm.cc
   shared/metal-tae-decoder.cc
@@ -161,6 +162,7 @@ set(LOCAL_SOURCES
   minimax-h3/metal-vdn-branch.cc
   minimax-h3/minimax-h3-references.cc
   minimax-h3/p-h3-image.cc
+  minimax-h3/minimax-h3-image.cc
   minimax-h3/minimax-h3-reference-encoder.cc
   minimax-h3/metal-minimax-h3-transformer.cc
   minimax-h3/metal-minimax-h3-video-vae.cc
@@ -297,6 +299,7 @@ set(LOCAL_HEADERS
   minimax-h3/metal-vdn-branch.h
   minimax-h3/minimax-h3-references.h
   minimax-h3/p-h3-image.h
+  minimax-h3/minimax-h3-image.h
   minimax-h3/minimax-h3-reference-encoder.h
   minimax-h3/metal-minimax-h3-transformer.h
   minimax-h3/metal-minimax-h3-video-vae.h

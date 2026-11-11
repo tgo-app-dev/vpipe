@@ -116,6 +116,7 @@ step_update_name(StepUpdate u)
     case StepUpdate::kEuler:        return "euler";
     case StepUpdate::kRenoise:      return "renoise";
     case StepUpdate::kResMultistep: return "res_multistep";
+    case StepUpdate::kVelocity:     return "velocity";
   }
   return "auto";
 }
@@ -193,8 +194,10 @@ denoise(const DenoiseRequest& req, std::string* err)
     if (err != nullptr) { *err = std::move(m); }
     return false;
   };
+  // A layout with no audio rows (MiniMax-H3-Image) has no audio state.
   if (req.dit == nullptr || req.layout == nullptr || req.text == nullptr ||
-      req.video == nullptr || req.audio == nullptr) {
+      req.video == nullptr ||
+      (req.audio == nullptr && !req.layout->audio_indices.empty())) {
     return fail("denoise: incomplete request");
   }
   const minimax_h3::PackedLayout& L = *req.layout;
@@ -271,6 +274,15 @@ denoise(const DenoiseRequest& req, std::string* err)
       renoise = false;
       res_ms = true;
       break;
+    case StepUpdate::kVelocity:
+      renoise = false;
+      res_ms = false;
+      break;
+  }
+  const bool vel_form = req.update == StepUpdate::kVelocity;
+  if (req.step_heads && req.dit->step_heads() <= 0) {
+    return fail("denoise: per-step heads asked for and the DiT has none "
+                "(set_step_heads)");
   }
   // A flow map's velocity is its AVERAGE over the jump to the next sigma,
   // so Euler lands where it was trained to; read as an instantaneous
@@ -573,10 +585,14 @@ denoise(const DenoiseRequest& req, std::string* err)
         renoise ? "RE-NOISED (x0 at each sigma, then fresh noise to the "
                   "next)"
         : res_ms ? "by res_multistep"
+        : vel_form ? "by Euler in its velocity form"
         : refine ? "by the refine's plain Euler"
                  : "by Euler";
     const std::string whose =
-        req.update != StepUpdate::kAuto ? std::string("as the sampler asks")
+        vel_form && req.step_heads
+            ? std::string("as the checkpoint's per-step heads were "
+                          "distilled")
+        : req.update != StepUpdate::kAuto ? std::string("as the sampler asks")
         : sc != nullptr && renoise
             ? fmt("as {}'s sampling contract asks", sc->release)()
         : res_ms ? std::string("VPIPE_H3_RES_MULTISTEP")
@@ -689,6 +705,7 @@ denoise(const DenoiseRequest& req, std::string* err)
       st.row_timestep_index = &row_idx;
       st.endpoints          = two_time ? &uniq_r : nullptr;
       st.schedule_index     = baked ? i : -1;
+      st.out_head           = req.step_heads ? i : -1;
       st.dense_attention    = i < req.sol_dense_steps || !sol_probe.empty();
       if (!req.sol_tau_steps.empty()) {
         st.sol_routing = true;
@@ -833,6 +850,7 @@ denoise(const DenoiseRequest& req, std::string* err)
                                     vlast ? nullptr : rn_v.data(),
                                     vel.size())
           : res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
+          : vel_form ? sv.step_velocity(vel.data(), i, vx, vel.size())
           : refine ? sv.step_plain(vel.data(), i, vx, vel.size())
                    : sv.step(vel.data(), i, vx, vel.size());
       if (!vok) {
@@ -876,6 +894,7 @@ denoise(const DenoiseRequest& req, std::string* err)
                                     alast ? nullptr : rn_a.data(),
                                     vel.size())
           : res_ms ? sa.step_res(vel.data(), i, ax, vel.size(), &aprev)
+          : vel_form ? sa.step_velocity(vel.data(), i, ax, vel.size())
                    : sa.step(vel.data(), i, ax, vel.size());
       if (!aok) {
         return fail("denoise: audio step " + std::to_string(i) + " failed");
@@ -937,7 +956,8 @@ denoise(const DenoiseRequest& req, std::string* err)
     req.report->renoise  = renoise;
     req.report->update   = renoise ? StepUpdate::kRenoise
                            : res_ms ? StepUpdate::kResMultistep
-                                    : StepUpdate::kEuler;
+                           : vel_form ? StepUpdate::kVelocity
+                                      : StepUpdate::kEuler;
     req.report->video_sigmas = sv.sigmas();
     req.report->audio_sigmas = sa.sigmas();
   }

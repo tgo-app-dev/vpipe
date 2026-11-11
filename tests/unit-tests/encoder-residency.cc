@@ -42,6 +42,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/shared/fp8.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline.h"
@@ -61,6 +62,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 using vpipe::FlexData;
 using vpipe::Session;
@@ -862,4 +865,359 @@ TEST(encoder_residency, a_warm_encoder_is_taken_back_whatever_the_box)
   EXPECT_TRUE(r[0] == 0 && r[1] > 0 && r[2] > 0);
   EXPECT_TRUE(same);
   EXPECT_TRUE(same_small);
+}
+
+// ---- AN NVFP4 STACK ------------------------------------------------------
+//
+// An NVFP4 conditioning encoder (Comfy-Org's NVFP4 AWQ repack of
+// MiniMax-H3's Qwen3-VL-32B is one) streams through the same slots: the
+// codes and E4M3 block scales placed as they sit, the served super-blocks
+// built on the GPU (nvfp4_serve) -- never the prefill path's pinned
+// prefix. A small synthetic Qwen3 stack in both spellings, AWQ scales on
+// o_proj and down_proj as ModelOpt and ComfyUI leave them, held to the
+// resident k-quant load (whose super-blocks LayerLoad packs on the host)
+// BYTE-IDENTICAL at its taps, through every residency step; the floor and
+// a kept layer against arithmetic of their own; and a stack the slots
+// cannot serve (spellings mixed across layers) loading resident without a
+// pin.
+
+namespace {
+
+struct NvT {
+  std::string               name;
+  std::string               dtype;
+  std::vector<std::int64_t> shape;
+  std::vector<std::uint8_t> bytes;
+};
+
+bool
+write_nv_(const std::filesystem::path& p, const std::vector<NvT>& ts)
+{
+  std::string hdr = "{";
+  std::uint64_t off = 0;
+  for (std::size_t i = 0; i < ts.size(); ++i) {
+    std::string shp;
+    for (std::size_t d = 0; d < ts[i].shape.size(); ++d) {
+      shp += (d ? "," : "") + std::to_string(ts[i].shape[d]);
+    }
+    hdr += (i ? "," : "") + std::string("\"") + ts[i].name +
+           "\":{\"dtype\":\"" + ts[i].dtype + "\",\"shape\":[" + shp +
+           "],\"data_offsets\":[" + std::to_string(off) + "," +
+           std::to_string(off + ts[i].bytes.size()) + "]}";
+    off += ts[i].bytes.size();
+  }
+  hdr += "}";
+  while (hdr.size() % 8 != 0) { hdr += ' '; }
+  std::ofstream f(p, std::ios::binary);
+  if (!f) { return false; }
+  const std::uint64_t n = hdr.size();
+  f.write(reinterpret_cast<const char*>(&n), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  for (const NvT& t : ts) {
+    f.write(reinterpret_cast<const char*>(t.bytes.data()),
+            (std::streamsize)t.bytes.size());
+  }
+  return f.good();
+}
+
+struct NvRng {
+  std::uint32_t s;
+  std::uint32_t next() { s = s * 1664525u + 1013904223u; return s >> 8; }
+  // A bf16 in [center - spread, center + spread].
+  std::uint16_t bf16(float center, float spread)
+  {
+    const float v =
+        center + ((float)(next() % 65536) / 32768.0f - 1.0f) * spread;
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return (std::uint16_t)(u >> 16);
+  }
+};
+
+NvT
+nv_bf16_(const std::string& name, std::vector<std::int64_t> shape,
+         NvRng& r, float center, float spread)
+{
+  std::size_t n = 1;
+  for (auto d : shape) { n *= (std::size_t)d; }
+  NvT t{name, "BF16", std::move(shape), std::vector<std::uint8_t>(n * 2)};
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::uint16_t b = r.bf16(center, spread);
+    std::memcpy(&t.bytes[i * 2], &b, 2);
+  }
+  return t;
+}
+
+// One NVFP4 projection `stem` [n, k]: ModelOpt's spelling, or ComfyUI's
+// (the even column's nibble high, the block scales swizzled and padded, a
+// record), with an AWQ pre_quant_scale or not.
+void
+nv_proj_(std::vector<NvT>& ts, const std::string& stem, int n, int k,
+         bool comfy, bool awq, NvRng& r)
+{
+  const int B = k / 16;
+  NvT w{stem + ".weight", "U8", {n, k / 2},
+        std::vector<std::uint8_t>((std::size_t)n * k / 2)};
+  for (auto& b : w.bytes) { b = (std::uint8_t)r.next(); }
+  ts.push_back(std::move(w));
+  std::vector<std::uint8_t> sc((std::size_t)n * B);
+  for (auto& b : sc) { b = (std::uint8_t)(0x28 + r.next() % 0x18); }
+  std::vector<std::int64_t> sshape = {n, B};
+  if (comfy) {
+    const std::int64_t np = (n + 127) / 128 * 128, bp = (B + 3) / 4 * 4;
+    std::vector<std::uint8_t> st((std::size_t)(np * bp), 0);
+    for (int i = 0; i < n; ++i) {
+      for (int b = 0; b < B; ++b) {
+        st[vpipe::genai::fp8::nvfp4_scale_index(
+            (std::size_t)i, (std::size_t)b, (std::size_t)B, true)] =
+            sc[(std::size_t)i * B + b];
+      }
+    }
+    sc = std::move(st);
+    sshape = {np, bp};
+    const std::string rec = "{\"format\": \"nvfp4\"}";
+    ts.push_back({stem + ".comfy_quant", "U8", {(std::int64_t)rec.size()},
+                  std::vector<std::uint8_t>(rec.begin(), rec.end())});
+  }
+  ts.push_back({stem + ".weight_scale", "F8_E4M3", sshape, sc});
+  const float s2 = 0.004f + (float)(r.next() % 100) * 2e-5f;
+  NvT g{stem + ".weight_scale_2", "F32", {}, std::vector<std::uint8_t>(4)};
+  std::memcpy(g.bytes.data(), &s2, 4);
+  ts.push_back(std::move(g));
+  NvT is{stem + ".input_scale", "F32", {}, std::vector<std::uint8_t>(4)};
+  ts.push_back(std::move(is));
+  if (awq) { ts.push_back(nv_bf16_(stem + ".pre_quant_scale", {k}, r, 1.0f,
+                                   0.5f)); }
+}
+
+// A Qwen3 backbone of `layers` layers, hidden 256, 2 heads of 128, 1 kv
+// head, MLP 512, under `model.` -- every projection NVFP4, AWQ scales on
+// o_proj and down_proj. `comfy` per layer: its spelling.
+bool
+write_nv_stack_(const std::filesystem::path& dir,
+                const std::vector<bool>& comfy)
+{
+  constexpr int H = 256, D = 128, Q = 256, KV = 128, F = 512, V = 64;
+  std::filesystem::create_directories(dir);
+  NvRng r{11u};
+  std::vector<NvT> ts;
+  ts.push_back(nv_bf16_("model.embed_tokens.weight", {V, H}, r, 0.0f, 0.5f));
+  ts.push_back(nv_bf16_("model.norm.weight", {H}, r, 1.0f, 0.1f));
+  for (std::size_t L = 0; L < comfy.size(); ++L) {
+    const std::string p = "model.layers." + std::to_string(L) + ".";
+    const bool c = comfy[L];
+    ts.push_back(nv_bf16_(p + "input_layernorm.weight", {H}, r, 1.0f, 0.1f));
+    ts.push_back(nv_bf16_(p + "post_attention_layernorm.weight", {H}, r,
+                          1.0f, 0.1f));
+    ts.push_back(nv_bf16_(p + "self_attn.q_norm.weight", {D}, r, 1.0f,
+                          0.1f));
+    ts.push_back(nv_bf16_(p + "self_attn.k_norm.weight", {D}, r, 1.0f,
+                          0.1f));
+    nv_proj_(ts, p + "self_attn.q_proj", Q, H, c, false, r);
+    nv_proj_(ts, p + "self_attn.k_proj", KV, H, c, false, r);
+    nv_proj_(ts, p + "self_attn.v_proj", KV, H, c, false, r);
+    nv_proj_(ts, p + "self_attn.o_proj", H, Q, c, true, r);
+    nv_proj_(ts, p + "mlp.gate_proj", F, H, c, false, r);
+    nv_proj_(ts, p + "mlp.up_proj", F, H, c, false, r);
+    nv_proj_(ts, p + "mlp.down_proj", H, F, c, true, r);
+  }
+  std::ofstream(dir / "config.json")
+      << "{\"hidden_size\": 256, \"num_attention_heads\": 2, "
+         "\"num_key_value_heads\": 1, \"head_dim\": 128, "
+         "\"intermediate_size\": 512, \"num_hidden_layers\": "
+      << comfy.size() << ", \"vocab_size\": 64, \"rope_theta\": 1000000}";
+  return write_nv_(dir / "model.safetensors", ts);
+}
+
+}  // namespace
+
+TEST(encoder_residency, an_nvfp4_stack_streams_as_it_holds)
+{
+  namespace fs = std::filesystem;
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  constexpr int H = 256, D = 128, Q = 256, KV = 128, F = 512, NL = 4;
+  const std::vector<int> taps = {1, 3};
+  NvRng xr{5u};
+  auto x_of = [&](int n) {
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * H * 2);
+    auto* p = static_cast<std::uint16_t*>(x.contents());
+    for (int i = 0; i < n * H; ++i) { p[i] = xr.bf16(0.0f, 0.6f); }
+    return x;
+  };
+  // Two prompts, the same rows for every load.
+  const int n1 = 37, n2 = 23;
+  SharedBuffer x1 = x_of(n1), x2 = x_of(n2);
+  auto copy_of = [&](const SharedBuffer& b) {
+    SharedBuffer c = mc->make_shared_buffer(b.byte_size());
+    std::memcpy(c.contents(), b.contents(), b.byte_size());
+    return c;
+  };
+  auto same = [](const std::vector<std::uint8_t>& a,
+                 const std::vector<std::uint8_t>& b) {
+    return !a.empty() && a.size() == b.size() &&
+           std::memcmp(a.data(), b.data(), a.size()) == 0;
+  };
+  const fs::path root = fs::temp_directory_path() /
+                        ("vpipe-nvfp4-stack-" + std::to_string(::getpid()));
+  // What a layer keeps, by arithmetic of its own: the served projections
+  // (148 bytes a 256 inputs of a row, whatever the file's spelling), the
+  // norms, o_proj's AWQ scale in f32.
+  auto served = [](std::size_t n, std::size_t k) {
+    return n * (k / 256) * 148;
+  };
+  const std::size_t norms = (std::size_t)(2 * H + 2 * D) * 2;
+  const std::size_t kept = norms + served(Q, H) + 2 * served(KV, H) +
+                           served(H, Q) + 2 * served(F, H) + served(H, F) +
+                           (std::size_t)Q * 4;
+  const std::size_t final_norm = (std::size_t)H * 2;
+  int ran = 0;
+  for (const bool comfy : {false, true}) {
+    const fs::path dir = root / (comfy ? "comfy" : "modelopt");
+    ENCR_REQUIRE(write_nv_stack_(dir, std::vector<bool>(NL, comfy)));
+    auto wts = MetalLlamaWeights::open_model(dir.string());
+    ENCR_REQUIRE(wts.has_value());
+    MetalQwenModel::Config base;
+    std::string embed_name;
+    ENCR_REQUIRE(config_(dir.string(), *wts, 0, &base, &embed_name));
+    base.rms_eps = 1e-6f;
+    // The resident k-quant load: LayerLoad packs every layer on the host.
+    std::vector<std::uint8_t> want1, want2;
+    {
+      MetalQwenModel::Config c = base;
+      auto m = MetalQwenModel::load(dir.string(), mc, c);
+      ENCR_REQUIRE(m != nullptr);
+      ENCR_REQUIRE(m->uses_kquant() && !m->streams_decode());
+      // Resident, it says what it holds: every layer's served form.
+      EXPECT_TRUE((std::size_t)m->resident_bytes() ==
+                  (std::size_t)NL * kept + final_norm);
+      want1 = taps_(*m, copy_of(x1), n1, taps);
+      want2 = taps_(*m, copy_of(x2), n2, taps);
+    }
+    ENCR_REQUIRE(!want1.empty() && !want2.empty());
+
+    // Through the slots, as the conditioner asks (a pin_frac it ignores).
+    MetalQwenModel::Config c = base;
+    c.stream_layers = true;
+    c.stream_decode = true;
+    c.pin_frac = 0.5;
+    EXPECT_TRUE(MetalQwenModel::streams_raw(*wts, c));
+    EXPECT_TRUE(MetalQwenModel::pinned_layer_count(*wts, c) == 0);
+    auto m = MetalQwenModel::load(dir.string(), mc, c);
+    ENCR_REQUIRE(m != nullptr);
+    ENCR_REQUIRE(m->streams_decode() && m->streams_nvfp4());
+    EXPECT_TRUE(m->pinned_layers() == 0);
+
+    // What a slot holds beside a kept layer: the codes and block scales
+    // as stored, seven f32 tensor scales and down_proj's AWQ scale.
+    auto blocks = [&](std::size_t n, std::size_t k) {
+      const std::size_t b = k / 16;
+      return comfy ? (n + 127) / 128 * 128 * ((b + 3) / 4 * 4) : n * b;
+    };
+    const std::size_t codes = ((std::size_t)Q * H + 2 * (std::size_t)KV * H +
+                               (std::size_t)H * Q + 2 * (std::size_t)F * H +
+                               (std::size_t)H * F) / 2;
+    const std::size_t slot =
+        kept + codes + blocks(Q, H) + 2 * blocks(KV, H) + blocks(H, Q) +
+        2 * blocks(F, H) + blocks(H, F) + 7 * 4 + (std::size_t)F * 4;
+    const std::size_t trunk = (std::size_t)64 * H * 2 + final_norm;
+    const std::size_t floor =
+        MetalQwenModel::stream_floor_bytes(*wts, "model.layers.");
+    // Everything the load holds, resident: dir_weights_bytes' figure.
+    const std::size_t whole = MetalQwenModel::nvfp4_held_bytes(*wts);
+    EXPECT_TRUE(floor == trunk + 2 * slot);
+    EXPECT_TRUE(whole == trunk + (std::size_t)NL * kept);
+
+    // 1. No reserve: growth off, the floor held to the byte.
+    const auto g1 = taps_(*m, copy_of(x1), n1, taps);
+    EXPECT_TRUE(same(g1, want1));
+    EXPECT_TRUE(m->resident_layer_count() == 0);
+    const bool slots_off = std::getenv("VPIPE_QWEN_NO_SLOTS") != nullptr;
+    const std::size_t held0 = (std::size_t)m->resident_bytes();
+    EXPECT_TRUE(slots_off || held0 == floor - trunk + final_norm);
+    // 2. Growth on, then the first prompt again against what was kept.
+    m->set_residency_reserve(test_residency_reserve(1ull << 30));
+    m->set_residency_schedule(4);
+    const auto g2 = taps_(*m, copy_of(x2), n2, taps);
+    EXPECT_TRUE(same(g2, want2));
+    const auto g3 = taps_(*m, copy_of(x1), n1, taps);
+    EXPECT_TRUE(same(g3, want1));
+    const int kept3 = m->resident_layer_count();
+    EXPECT_TRUE(kept3 > 0);
+    // 3. The slots given back once every layer the taps ran is kept, then
+    // the deeper half of the kept layers by their exact bytes.
+    m->release_idle_slots();
+    const int keep_r = kept3 / 2;
+    const std::size_t tail = (std::size_t)(kept3 - keep_r) * kept;
+    EXPECT_TRUE(m->release_resident_layers(tail) == tail);
+    EXPECT_TRUE(m->resident_layer_count() == keep_r);
+    // 4. A layer-major batch over the rest.
+    std::vector<SharedBuffer> xs;
+    xs.push_back(copy_of(x1));
+    xs.push_back(copy_of(x2));
+    std::vector<SharedBuffer*> xp = {&xs[0], &xs[1]};
+    std::vector<SharedBuffer> bt =
+        m->forward_embeddings_taps_batch(xp, {n1, n2}, taps);
+    ENCR_REQUIRE(bt.size() == 2);
+    auto bytes = [](const SharedBuffer& b) {
+      const auto* p = static_cast<const std::uint8_t*>(b.contents());
+      return std::vector<std::uint8_t>(p, p + b.byte_size());
+    };
+    EXPECT_TRUE(same(bytes(bt[0]), want1) && same(bytes(bt[1]), want2));
+    // 5. What it holds now, to the byte.
+    const std::size_t held_end = (std::size_t)m->resident_bytes();
+    const std::size_t want_held =
+        (std::size_t)keep_r * kept + final_norm +
+        (kept3 >= taps.back() + 1 || slots_off ? 0 : 2 * slot);
+    std::printf("[encoder_residency] NVFP4 %s: floor %zu KB (trunk %zu + "
+                "slot pair %zu), held at it %zu KB; a kept layer %zu KB; "
+                "%d of %d kept, %d after half given back, held %zu KB "
+                "(want %zu); prompts and batch byte-identical to resident: "
+                "%d %d %d %d\n",
+                comfy ? "ComfyUI" : "ModelOpt", floor >> 10, trunk >> 10,
+                (2 * slot) >> 10, held0 >> 10, kept >> 10, kept3, NL,
+                keep_r, held_end >> 10, want_held >> 10, (int)same(g1, want1),
+                (int)same(g2, want2), (int)same(g3, want1),
+                (int)(same(bytes(bt[0]), want1) &&
+                      same(bytes(bt[1]), want2)));
+    EXPECT_TRUE(held_end == want_held);
+    ++ran;
+  }
+  EXPECT_TRUE(ran == 2);
+
+  // A stack the slots cannot serve -- its spelling changes from layer to
+  // layer -- loads RESIDENT when asked to stream, pins nothing, and is
+  // booked whole: no floor below what it holds.
+  {
+    const fs::path dir = root / "mixed";
+    ENCR_REQUIRE(write_nv_stack_(dir, {false, true, false, false}));
+    auto wts = MetalLlamaWeights::open_model(dir.string());
+    ENCR_REQUIRE(wts.has_value());
+    MetalQwenModel::Config base;
+    std::string embed_name;
+    ENCR_REQUIRE(config_(dir.string(), *wts, 0, &base, &embed_name));
+    std::vector<std::uint8_t> want;
+    {
+      auto m = MetalQwenModel::load(dir.string(), mc, base);
+      ENCR_REQUIRE(m != nullptr);
+      want = taps_(*m, copy_of(x1), n1, taps);
+    }
+    MetalQwenModel::Config c = base;
+    c.stream_layers = true;
+    c.stream_decode = true;
+    c.pin_frac = 0.5;
+    EXPECT_TRUE(!MetalQwenModel::streams_raw(*wts, c));
+    EXPECT_TRUE(MetalQwenModel::pinned_layer_count(*wts, c) == 0);
+    EXPECT_TRUE(MetalQwenModel::stream_floor_bytes(*wts, "model.layers.") ==
+                MetalQwenModel::nvfp4_held_bytes(*wts));
+    auto m = MetalQwenModel::load(dir.string(), mc, c);
+    ENCR_REQUIRE(m != nullptr);
+    EXPECT_TRUE(!m->streams_decode() && m->pinned_layers() == 0);
+    EXPECT_TRUE((std::size_t)m->resident_bytes() ==
+                (std::size_t)NL * kept + final_norm);
+    EXPECT_TRUE(same(taps_(*m, copy_of(x1), n1, taps), want));
+  }
+  std::error_code ec;
+  fs::remove_all(root, ec);
 }

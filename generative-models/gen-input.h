@@ -76,6 +76,11 @@ inline constexpr std::string_view kLatentWidth  = "latent_width";
 inline constexpr std::string_view kAudioLatents = "audio_latents";
 // Per caption token, the tag of what it belongs to. Int array.
 inline constexpr std::string_view kTokenTags = "token_tags";
+// Per reference: the normal draws its VAE posterior SAMPLE took off the
+// request's generator (its whole latent, before any crop). Int; absent or
+// 0 for the mean. A family drawing its own noise from the same generator
+// afterwards skips this many first (MiniMax-H3-Image).
+inline constexpr std::string_view kPosteriorDraws = "posterior_draws";
 
 }  // namespace cond_sideband
 

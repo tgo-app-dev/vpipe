@@ -20,6 +20,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/image-decode.h"
+#include "stages/minimax-h3-image-host.h"
 #include "stages/model-config-source.h"
 #include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
@@ -1396,6 +1397,11 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
     _enc_hidden = h3cfg.text_dim;
     // Weights named apart from the config (`encoder_dir`): read there.
     if (_enc_dir != _enc_cfg_dir) { h3cfg.weights = _enc_dir; }
+    // MiniMax-H3-Image reads the prompt at most 4096 tokens long.
+    if (genai::h3i::is_root(resolve_model_dir(session(), _hf_dir))) {
+      h3cfg.bare_picture_labels = true;
+      h3cfg.max_tokens = genai::h3i::kMaxSequenceLength;
+    }
     // The Qwen3-VL-32B backbone is ~48 GB bf16 (~26 GB at w8) for the 50
     // tapped layers, so on a small box it cannot be resident -- and it
     // only ever PREFILLS, which is exactly what layer streaming serves.
@@ -1803,6 +1809,14 @@ DiffusionConditionerStage::resolve_component_dirs_(std::string* enc_out,
         genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
     if (!e.empty() && e != root) { enc = e; }
   }
+  // MiniMax-H3-Image's is MiniMax-H3's, outside its root -- claimed where
+  // it is, or the plan counts a 62 GB encoder as nothing.
+  const bool h3i_root = genai::h3i::is_root(root);
+  if (h3i_root) {
+    const std::string e =
+        minimax_h3_image_encoder_dir(session(), root, _venc_dir);
+    if (!e.empty()) { enc = e; }
+  }
   // And on MiniMaxAI's repository root `transformer/` is one PARTITION's
   // DiT in the diffusers naming, beside the released partitions whose
   // copy generate-video loads -- so it is named through the same resolver
@@ -1817,7 +1831,7 @@ DiffusionConditionerStage::resolve_component_dirs_(std::string* enc_out,
   // Weights named apart from the release (`encoder_dir`: a Draw Things
   // .ckpt, a directory) are what loads, so they are what is claimed.
   // VOSR's own reading of the key (a DINOv2 checkpoint) follows.
-  if (!_venc_dir.empty()) {
+  if (!_venc_dir.empty() && !h3i_root) {
     const std::string w = resolve_model_dir(session(), _venc_dir);
     if (!w.empty() && fs::exists(w, ec)) { enc = w; }
   }
@@ -2280,7 +2294,24 @@ DiffusionConditionerStage::ensure_loaded_()
       }
     }
   }
-  if (_family == "minimax-h3") {
+  // MiniMax-H3-Image's encoder is MiniMax-H3's, outside its repository
+  // (minimax-h3-image-host.h): `encoder_dir` names WHERE it is, config,
+  // tokenizer and weights alike, rather than weights apart.
+  const bool h3i_root = genai::h3i::is_root(root);
+  if (_family == "minimax-h3" && h3i_root) {
+    const std::string enc =
+        minimax_h3_image_encoder_dir(session(), root, _venc_dir);
+    if (enc.empty()) {
+      session()->error(fmt(
+          "DiffusionConditionerStage('{}'): MiniMax-H3-Image conditions on "
+          "MiniMax-H3's text encoder, which '{}' does not carry and no "
+          "local copy answers for: fetch MiniMaxAI/MiniMax-H3-text-encoder "
+          "(or MiniMax-H3 itself), or name its text_encoder/ in "
+          "encoder_dir; inert", this->id(), root));
+      return;
+    }
+    _enc_dir = enc;
+  } else if (_family == "minimax-h3") {
     // `text_encoders/` on a repack, `text_encoder/` on a diffusers tree,
     // and a directory checkpoint in either once quantized -- one resolver
     // for all of them.
@@ -2293,7 +2324,8 @@ DiffusionConditionerStage::ensure_loaded_()
   // release's names by MetalLlamaWeights. Not VOSR's, whose encoder_dir
   // is a whole DINOv2 checkpoint and is resolved below.
   _enc_cfg_dir = _enc_dir;
-  if (!_venc_dir.empty() && _family != "vosr") {
+  if (!_venc_dir.empty() && _family != "vosr" &&
+      !(_family == "minimax-h3" && h3i_root)) {
     const std::string w = resolve_model_dir(session(), _venc_dir);
     std::error_code wec;
     if (w.empty() || !std::filesystem::exists(w, wec)) {

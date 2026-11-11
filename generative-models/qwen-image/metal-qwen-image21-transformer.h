@@ -391,10 +391,16 @@ class MetalQwenImage21Transformer {
   // plan's denoise phase: img_rows image tokens beside txt_rows of prompt,
   // `cfg` for a negative branch (its own K / V cache), `packed` for a
   // pack (the dense stand-in), `matrix_cores` for the tiers that need
-  // them (int8, Sage, Sol).
+  // them (int8, Sage, Sol). `widen`: the widest FP8 / NVFP4 weight the
+  // forward widens per GEMM, as bf16 (model_memory::widened_weight_bytes)
+  // -- one scratch with the pack's stand-in, so the larger of the two.
   static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
                                            int txt_rows, bool cfg,
-                                           bool packed, bool matrix_cores);
+                                           bool packed, bool matrix_cores,
+                                           std::size_t widen = 0);
+  // The dequant / widening scratch's bytes as grown so far (`widen`'s
+  // measure).
+  std::size_t widen_scratch_bytes() const { return _w_deq.byte_size(); }
   bool streaming() const { return _stream_blocks; }
   int quant_bits() const { return _quant_bits; }
 
@@ -420,6 +426,11 @@ class MetalQwenImage21Transformer {
     fp8::Format f8 = fp8::Format::kNone;
     metal_compute::SharedBuffer f8_scale;
     bool f8_per_row = false;
+    // NVFP4 (f8 kNVFP4): `codes` the [N, K / 2] nibbles, `f8_scale` the
+    // tensor's scale_2, `f8_srel` the E4M3 block scales as stored; the
+    // spelling (fp8.h) and an AWQ pre_quant_scale, f32 [K] (empty: none).
+    metal_compute::SharedBuffer f8_srel, f8_pq;
+    bool f8_nhi = false, f8_swz = false;
     // codes/qbias are in the SIGNED layout (I8GemmContext::gemm_signed):
     // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
     // the signed dequant read it; see _sgn.

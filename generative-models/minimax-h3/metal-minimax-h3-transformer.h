@@ -146,6 +146,10 @@ class MetalMiniMaxH3Transformer {
     // embedding, projected onto it (see CurveBasis). Empty: those are
     // skipped (AdaLN modules) or refused (a flow map), as before.
     std::string time_mlp_dir;
+    // The audio branch (`audio_enabled`): its patch projection and its
+    // head. MiniMax-H3-Image's stack has neither, and its layouts no
+    // audio rows (minimax-h3-image.h).
+    bool audio = true;
     int rope_freq_dim = 16;       // per AXIS; 3 axes, doubled -> rot 96
     // Only for a checkpoint with no `rope.inv_freq` tensor (the
     // diffusers layout), which the table is then computed from.
@@ -319,6 +323,9 @@ class MetalMiniMaxH3Transformer {
     // them through the two shifts (DenoiseRequest::video_sigmas). Empty:
     // the model's own grid.
     std::vector<double> sigmas;
+    // MiniMax-H3-Image only: the smallest area a picture is GENERATED
+    // at (`min_generation_area`), 0 the model's own (minimax-h3-image.h).
+    std::int64_t min_generation_area = 0;
 
     // Parse the `minimax-h3-model-config` beat. Absent keys keep the
     // defaults above; `err` collects what was ignored, and is not fatal.
@@ -811,6 +818,10 @@ class MetalMiniMaxH3Transformer {
     // Sage's int8 P*V (sage::Config::pv8) off for this forward -- the
     // int8 QK alone -- as the loop's sage_pv8_from_step says.
     bool sage_pv8_off = false;
+    // Which per-step output head projects the video rows (set_step_heads:
+    // MiniMax-H3-Image's step i runs head i), or -1 for the checkpoint's
+    // own `final_layer.video_out`.
+    int out_head = -1;
     // TaoMate-H3's STREAMING attention (minimax-h3-stream-kv.h). Set, and
     // every main block's attention splits in two:
     //   text rows   -> the text rows alone
@@ -840,6 +851,21 @@ class MetalMiniMaxH3Transformer {
 
   // One denoiser evaluation. Empty on failure, with a reason in `err`.
   Velocity forward(const Step& in, std::string* err = nullptr);
+
+  // MiniMax-H3-Image's PER-STEP output heads (Parallel Decoding
+  // Distillation; minimax-h3-image.h): `video_out.weight` [steps,
+  // video_patch_elems, hidden] and `video_out.bias` [steps,
+  // video_patch_elems] out of `ws` (pdd_fused_heads.safetensors), one
+  // head a step in place of the checkpoint's own `final_layer.video_out`
+  // -- Step::out_head picks it. Each is held as that head is (bf16, a
+  // derived entry of `ws`, which is kept for their lifetime). False, with
+  // `err`, on a shape that is not this model's.
+  bool set_step_heads(std::shared_ptr<WeightSet> ws,
+                      std::string* err = nullptr);
+  int step_heads() const { return (int)_step_out.size(); }
+  // What the heads hold: derived entries of `ws`, whose manager sees
+  // them as it sees any cached tensor.
+  std::size_t step_heads_bytes() const;
 
   // Size the activation scratch for at least `seq` rows and `n_text`
   // text rows, and KEEP it for any forward that fits, rather than
@@ -1497,6 +1523,11 @@ class MetalMiniMaxH3Transformer {
     // the codebook (16 f32; empty: code - 8).
     metal_compute::SharedBuffer f8_srel, f8_cb;
     int f8_qgroup = 0;
+    // NVFP4 (f8 kNVFP4): `codes` the [N, K / 2] nibbles, `f8_scale` the
+    // tensor's scale_2, `f8_srel` the E4M3 block scales; the spelling
+    // (fp8.h) and an AWQ pre_quant_scale, f32 [K] (empty: none).
+    bool f8_nhi = false, f8_swz = false;
+    metal_compute::SharedBuffer f8_pq;
     // I8GemmContext's int8 LAYOUT (Config::i8_tier) when gc > 0: `codes`
     // int8 [n, k] and `cscales` its scales at group gc (kTokenGroup: f32
     // [n]) -- or, `pc`, a w4 pack's codes / scales / qbias as stored,
@@ -2004,6 +2035,9 @@ class MetalMiniMaxH3Transformer {
   WiredPool   _wire;
   metal_compute::SharedBuffer _final_norm;
   Linear _final_adaln, _video_out, _audio_out;
+  // set_step_heads: one head a step, and the set they are derived in.
+  std::vector<Linear> _step_out;
+  std::shared_ptr<WeightSet> _step_ws;
 
   int _quant_bits = 0;
   int _quant_group = 64;

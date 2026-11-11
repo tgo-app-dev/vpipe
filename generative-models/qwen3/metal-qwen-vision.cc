@@ -481,7 +481,21 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
     return w;
   };
 
-  const std::string r = cfg.weight_prefix;   // "vision_tower." or "visual."
+  // The prefix the caller names -- else, when the checkpoint holds no
+  // tower under it, the first known layout that does: MLX's
+  // "vision_tower.", HF's Qwen3_5ForConditionalGeneration "model.visual."
+  // (what a ModelOpt export keeps), a bare Qwen3-VL "visual.".
+  std::string r = cfg.weight_prefix;
+  if (!gguf && wts->src().info(r + "patch_embed.proj.weight") == nullptr) {
+    for (const char* p : {"vision_tower.", "model.visual.", "visual."}) {
+      if (wts->src().info(std::string(p) + "patch_embed.proj.weight") !=
+          nullptr) {
+        r = p;
+        break;
+      }
+    }
+  }
+  m->_cfg.weight_prefix = r;
   m->_pe_w = gguf ? patch_embed_gguf() : to_f16(r + "patch_embed.proj.weight");
   if (!gguf && !m->_pe_w.empty()) {
     // The host patchify above emits each patch's features CHANNELS-LAST

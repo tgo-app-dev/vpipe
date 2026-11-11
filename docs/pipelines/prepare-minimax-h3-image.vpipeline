@@ -1,0 +1,29 @@
+{
+  "id": "prepare-minimax-h3-image",
+  "stages": [
+    {
+      "id": "fetch-minimax-h3-image",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "MiniMaxAI/MiniMax-H3-Image",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-minimax-h3-text-encoder",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "MiniMaxAI/MiniMax-H3",
+        "model_variant": "MiniMaxAI/MiniMax-H3-text-encoder",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

@@ -156,6 +156,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-lm/gemma-gguf.cc
         metal-lm/gemma-text.cc
         metal-lm/kquant.cc
+        metal-lm/nvfp4.cc
         metal-lm/manager.cc
         metal-lm/lfm3.cc
         metal-lm/ministral3.cc
@@ -215,6 +216,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-diffusers-root.cc
         minimax-h3-diffusers-vae.cc
         p-h3-image.cc
+        minimax-h3-image.cc
         minimax-h3-layout.cc
         minimax-h3-taomate.cc
         minimax-h3-regenerate.cc

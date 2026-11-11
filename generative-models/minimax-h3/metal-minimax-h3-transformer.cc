@@ -157,6 +157,8 @@ to_bf16_(const MetalLlamaWeights& wts, MetalCompute* mc, const std::string& nm)
   // tensor no record claims fails here, as it should.
   if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
       info->dtype == "U8" || info->dtype == "I8") {
+    // A nibble format's values are twice its bytes.
+    n = fp8::logical_numel(wts, nm);
     SharedBuffer out = mc->make_shared_buffer(n * 2);
     if (out.empty() ||
         !fp8::decode_tensor_bf16(
@@ -223,6 +225,7 @@ to_host_f32_(WeightSet& ws, MetalCompute* mc, const std::string& nm,
   for (auto d : info->shape) { n *= (std::size_t)d; }
   if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
       info->dtype == "U8" || info->dtype == "I8") {
+    n = fp8::logical_numel(ws.src(), nm);
     out.resize(n);
     return fp8::decode_tensor_f32(ws.src(), nm, out.data(), n, nullptr);
   }
@@ -486,6 +489,10 @@ MetalMiniMaxH3Transformer::GenerationParams::from_flex(const FlexData& fd,
     p.condition_audio_timestep =
         o.at("condition_audio_timestep").as_real(p.condition_audio_timestep);
   }
+  if (o.contains("min_generation_area")) {
+    p.min_generation_area =
+        std::max<std::int64_t>(0, o.at("min_generation_area").as_int(0));
+  }
   if (o.contains("audio_seconds")) {
     p.audio_seconds = o.at("audio_seconds").as_real(p.audio_seconds);
   }
@@ -656,12 +663,13 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
       const auto* ti = w->info(n);
       if (ti == nullptr || (int)ti->shape.size() <= axis) { return -1; }
       long v = (long)ti->shape[(std::size_t)axis];
-      // A W4A8 weight's codes are nibbles, two a byte: its logical width
-      // is twice the stored one (its relative scales beside it say so).
-      if (axis == 1 && ti->dtype == "I8" && n.size() > 7 &&
-          n.compare(n.size() - 7, 7, ".weight") == 0 &&
-          w->has(n.substr(0, n.size() - 7) + ".weight_s_rel")) {
-        v *= 2;
+      // A W4A8 or NVFP4 weight's codes are nibbles, two a byte: its
+      // logical width is twice the stored one (the scales beside it say
+      // so).
+      if (axis == 1 && ti->shape.size() == 2 && ti->shape[0] > 0 &&
+          (ti->dtype == "I8" || ti->dtype == "U8")) {
+        const std::size_t ln = fp8::logical_numel(*w, n);
+        if (ln > 0) { v = (long)(ln / (std::size_t)ti->shape[0]); }
       }
       return v;
     };
@@ -776,6 +784,8 @@ MetalMiniMaxH3Transformer::config_from_json(const std::string& dit_dir,
   out.ffn            = gi("ffn_hidden_size", 14336);
   out.video_channels = gi("latents_dim", 24);
   out.audio_channels = gi("audio_latents_dim", 32);
+  out.audio = !o.contains("audio_enabled") ||
+              o.at("audio_enabled").as_bool(true);
   out.text_dim       = gi("text_dim", 5120);
   out.freq_dim       = gi("timestep_input_dim", 256);
   out.time_hidden    = gi("time_embed_hidden_size", 5376);
@@ -902,8 +912,8 @@ adaln_table_budget_()
 namespace {
 
 // fp8_widen_bytes off a surveyed checkpoint: the widest of its FP8 /
-// int8 / W4A8 weights as bf16 (a W4A8 weight's K is twice its stored
-// width), and the fused q|k|v when a block's projections are among them
+// int8 / W4A8 / NVFP4 weights as bf16 (a nibble weight's K is twice its
+// stored width), and the fused q|k|v when a block's projections are among them
 // -- a file that stores q, k and v apart is widened fused, as it loads.
 std::size_t
 widen_of_(const MetalLlamaWeights& w, const fp8::Layout& lay,
@@ -914,8 +924,7 @@ widen_of_(const MetalLlamaWeights& w, const fp8::Layout& lay,
   for (const auto& [nm, fw] : lay.weights) {
     const auto* ti = w.info(nm);
     if (ti == nullptr || ti->shape.size() != 2) { continue; }
-    const std::size_t k = (std::size_t)ti->shape[1] *
-                          (fw.format == fp8::Format::kW4A8 ? 2 : 1);
+    const std::size_t k = (std::size_t)fp8::logical_cols(fw, ti->shape[1]);
     n = std::max(n, (std::size_t)ti->shape[0] * k);
     block = block || nm.compare(0, 7, "blocks.") == 0;
   }
@@ -937,7 +946,10 @@ MetalMiniMaxH3Transformer::fp8_widen_bytes(const std::string& dit_dir,
   if (!w.has_value()) { return 0; }
   fp8::Layout lay;
   std::string err;
-  if (!fp8::scan(*w, &lay, &err, /*int8=*/true) || !lay.any()) { return 0; }
+  if (!fp8::scan(*w, &lay, &err, /*int8=*/true, /*nvfp4=*/true) ||
+      !lay.any()) {
+    return 0;
+  }
   return widen_of_(*w, lay, c);
 }
 
@@ -1016,6 +1028,72 @@ MetalMiniMaxH3Transformer::weight_(WeightSet& ws, const std::string& nm,
   return ws.derived(std::string(kKey) + nm, build);
 }
 
+bool
+MetalMiniMaxH3Transformer::set_step_heads(std::shared_ptr<WeightSet> ws,
+                                          std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  if (!ws) { return fail("no weight set for the per-step heads"); }
+  const int VPE = _cfg.video_patch_elems(), H = _cfg.hidden;
+  const auto* wi = ws->src().info("video_out.weight");
+  const auto* bi = ws->src().info("video_out.bias");
+  if (wi == nullptr || bi == nullptr) {
+    return fail("the per-step heads' file has no video_out.weight / "
+                "video_out.bias");
+  }
+  if (wi->shape.size() != 3 || wi->shape[1] != VPE || wi->shape[2] != H ||
+      bi->shape.size() != 2 || bi->shape[0] != wi->shape[0] ||
+      bi->shape[1] != VPE || wi->shape[0] <= 0) {
+    return fail(fmt("the per-step heads are not [steps, {}, {}] and "
+                    "[steps, {}]", VPE, H, VPE)());
+  }
+  const int S = (int)wi->shape[0];
+  // Read once; each head's builder slices its own (a derived entry is
+  // built inside its builder, which here only copies).
+  std::vector<float> wf, bf;
+  if (!to_host_f32_(*ws, _mc, "video_out.weight", wf) ||
+      !to_host_f32_(*ws, _mc, "video_out.bias", bf)) {
+    return fail("the per-step heads cannot be read");
+  }
+  auto slice = [&](const std::vector<float>& src, std::size_t off,
+                   std::size_t n) -> SharedBuffer {
+    SharedBuffer b = _mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { d[i] = f32_to_bf16_(src[off + i]); }
+    return b;
+  };
+  std::vector<Linear> heads((std::size_t)S);
+  const std::size_t wn = (std::size_t)VPE * H;
+  for (int s = 0; s < S; ++s) {
+    Linear& l = heads[(std::size_t)s];
+    l.w = ws->derived(std::string(kKey) + "pdd/" + std::to_string(s) + "/w",
+                      [&]() { return slice(wf, (std::size_t)s * wn, wn); });
+    l.b = ws->derived(std::string(kKey) + "pdd/" + std::to_string(s) + "/b",
+                      [&]() {
+                        return slice(bf, (std::size_t)s * VPE,
+                                     (std::size_t)VPE);
+                      });
+    if (l.w.empty() || l.b.empty()) {
+      return fail("the per-step heads cannot be allocated");
+    }
+  }
+  _step_out = std::move(heads);
+  _step_ws  = std::move(ws);
+  return true;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::step_heads_bytes() const
+{
+  std::size_t n = 0;
+  for (const Linear& l : _step_out) { n += l.w.byte_size() + l.b.byte_size(); }
+  return n;
+}
+
 MetalMiniMaxH3Transformer::Linear
 MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
                                    bool bias, Retain r)
@@ -1076,14 +1154,24 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
     l.f8         = fw->format;
     l.f8_per_row = fw->per_row;
     l.f8_rot     = fw->rot_group;
-    // W4A8: its relative scales beside the codes (held as they are, the
-    // same way), and the codebook, 16 f32.
-    if (fw->format == fp8::Format::kW4A8) {
+    // W4A8 and NVFP4: their group scales beside the codes (held as they
+    // are, the same way); W4A8's codebook, 16 f32; NVFP4's spelling and
+    // its AWQ scale, f32 a column (read once: it is a column's, never
+    // refilled).
+    if (fw->format == fp8::Format::kW4A8 ||
+        fw->format == fp8::Format::kNVFP4) {
       l.f8_qgroup = fw->qgroup;
       l.f8_srel = r == Retain::Streamed
                       ? ws.stream_tensor(fw->s_rel, _mc, res)
                       : ws.tensor(fw->s_rel, _mc, res);
       if (l.f8_srel.empty()) { return Linear{}; }
+      if (fw->format == fp8::Format::kNVFP4) {
+        l.f8_nhi = fw->nibble_hi;
+        l.f8_swz = fw->swizzled;
+        bool pok = true;
+        l.f8_pq = fp8::pre_quant_buffer(src, *fw, _mc, &pok);
+        if (!pok) { return Linear{}; }
+      }
       if (!fw->codebook.empty()) {
         l.f8_cb = _mc->make_shared_buffer(16 * sizeof(float));
         if (l.f8_cb.empty() ||
@@ -1428,7 +1516,7 @@ MetalMiniMaxH3Transformer::kept_block_bytes_(const Block& b) const
     return l.w.byte_size() + l.b.byte_size() + l.codes.byte_size() +
            l.scales.byte_size() + l.qbias.byte_size() +
            l.f8_scale.byte_size() + l.f8_srel.byte_size() +
-           l.f8_cb.byte_size() + l.cscales.byte_size();
+           l.f8_cb.byte_size() + l.f8_pq.byte_size() + l.cscales.byte_size();
   };
   return b.n1.byte_size() + b.n2.byte_size() + b.qn.byte_size() +
          b.kn.byte_size() + kl(b.qkv) + kl(b.out) + kl(b.fc1) + kl(b.fc2) +
@@ -1555,7 +1643,9 @@ MetalMiniMaxH3Transformer::assemble_(
   const MetalLlamaWeights& src = ws.src();
   // Every piece has to be a matrix of one width, and the rows it lends
   // have to exist.
-  std::int64_t rows = 0, K = -1;
+  // K the pieces' stored width; KL their values' (an NVFP4 piece's
+  // nibbles are half its row).
+  std::int64_t rows = 0, K = -1, KL = -1;
   fp8::Format f = fp8::Format::kNone;
   bool all_f8 = true;
   for (const auto& p : parts) {
@@ -1568,14 +1658,20 @@ MetalMiniMaxH3Transformer::assemble_(
     K = ti->shape[1];
     rows += p.rows;
     // int8 pieces are assembled dense (to_bf16_ decodes each with its
-    // rotation): stacked codes would mix their scales and groups.
+    // rotation): stacked codes would mix their scales and groups. So are
+    // NVFP4 pieces (a ModelOpt export of the diffusers layout's split
+    // q / k / v): each widened on the host, the product bf16.
     const fp8::Weight* fw = _f8.find(p.layer + ".weight");
     // W4A8 pieces are not assembled: their nibble rows are half a row,
     // and no layout stores it in pieces.
     if (fw != nullptr && fw->format == fp8::Format::kW4A8) {
       return Linear{};
     }
+    if (fw != nullptr && fw->format == fp8::Format::kNVFP4) {
+      KL = fp8::logical_cols(*fw, K);
+    }
     if (fw == nullptr || fw->format == fp8::Format::kI8 ||
+        fw->format == fp8::Format::kNVFP4 ||
         (f != fp8::Format::kNone && fw->format != f)) {
       all_f8 = false;
     } else {
@@ -1585,7 +1681,8 @@ MetalMiniMaxH3Transformer::assemble_(
   // FP8 codes stacked, or bf16: one element's bytes, and the piece's
   // bytes as this weight stores them.
   const std::size_t elt = all_f8 ? 1 : 2;
-  const std::size_t row_bytes = (std::size_t)K * elt;
+  const std::size_t row_bytes =
+      (std::size_t)(all_f8 || KL < 0 ? K : KL) * elt;
   auto build = [&]() -> SharedBuffer {
     SharedBuffer d = _mc->make_shared_buffer((std::size_t)rows * row_bytes);
     if (d.empty()) { return {}; }
@@ -1666,7 +1763,18 @@ MetalMiniMaxH3Transformer::refill_linear_(WeightSet& ws,
       }
       std::memcpy(l.f8_scale.contents(), v.data(), l.f8_scale.byte_size());
     }
-    if (l.f8 == fp8::Format::kW4A8) {
+    // NVFP4's AWQ scale is the layer's: a slot holds another layer's
+    // after a refill, so it is read again.
+    if (l.f8 == fp8::Format::kNVFP4 && !l.f8_pq.empty()) {
+      const fp8::Weight* fw = _f8.find(nm + ".weight");
+      bool pok = false;
+      SharedBuffer pq = fw != nullptr
+                            ? fp8::pre_quant_buffer(src, *fw, _mc, &pok)
+                            : SharedBuffer{};
+      if (!pok || pq.byte_size() != l.f8_pq.byte_size()) { return false; }
+      std::memcpy(l.f8_pq.contents(), pq.contents(), pq.byte_size());
+    }
+    if (l.f8 == fp8::Format::kW4A8 || l.f8 == fp8::Format::kNVFP4) {
       const fp8::Weight* fw = _f8.find(nm + ".weight");
       if (fw == nullptr || l.f8_srel.empty() ||
           refill_streamed_tensor(ws, fw->s_rel, l.f8_srel,
@@ -1685,6 +1793,12 @@ MetalMiniMaxH3Transformer::refill_linear_(WeightSet& ws,
     return true;
   }
   if (!l.b.empty()) { return false; }
+  // NVFP4 pieces assemble dense, widened on the host (assemble_): no
+  // raw refill reaches them, so the whole Linear is rebuilt.
+  for (const auto& p : parts) {
+    const fp8::Weight* fw = _f8.find(p.layer + ".weight");
+    if (fw != nullptr && fw->format == fp8::Format::kNVFP4) { return false; }
+  }
   const bool f8 = l.is_fp8();
   SharedBuffer& dst = f8 ? l.codes : l.w;
   if (dst.empty()) { return false; }
@@ -1757,6 +1871,9 @@ MetalMiniMaxH3Transformer::fp8_dense_(ComputeEncoder& enc, const Linear& l,
   c.s_rel    = &l.f8_srel;
   c.codebook = &l.f8_cb;
   c.qgroup   = l.f8_qgroup;
+  c.nibble_hi = l.f8_nhi;
+  c.swizzled  = l.f8_swz;
+  c.pre_quant = &l.f8_pq;
   if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
     _fp8_failed = true;
     return nullptr;
@@ -1966,6 +2083,8 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     d.f8_per_row = s.f8_per_row;
     d.f8_rot     = s.f8_rot;
     d.f8_qgroup  = s.f8_qgroup;
+    d.f8_nhi     = s.f8_nhi;
+    d.f8_swz     = s.f8_swz;
     d.gc         = s.gc;
     d.cr         = s.cr;
     d.cr_w4      = s.cr_w4;
@@ -1990,6 +2109,7 @@ MetalMiniMaxH3Transformer::clone_block_(const Block& src, Block& dst,
     one(s.f8_scale, d.f8_scale);
     one(s.f8_srel, d.f8_srel);
     one(s.f8_cb, d.f8_cb);
+    one(s.f8_pq, d.f8_pq);
   };
   one(src.n1, dst.n1);
   one(src.n2, dst.n2);
@@ -4716,7 +4836,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // widening here carries its rotation (Linear::f8_rot), and so does
     // the ANE's staging (AneFfnSource::kInt8 / kW4A8).
     std::string ferr;
-    if (!fp8::scan(src, &m->_f8, &ferr, /*int8=*/true)) {
+    if (!fp8::scan(src, &m->_f8, &ferr, /*int8=*/true, /*nvfp4=*/true)) {
       if (sess != nullptr) {
         sess->warn(fmt("minimax-h3: '{}': {}", ws.dir(), ferr));
       }
@@ -4736,9 +4856,9 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         return nullptr;
       }
       std::size_t fp8_bytes = 0, n_scaled = 0, n_i8 = 0, n_rot = 0;
-      std::size_t n_w4 = 0;
+      std::size_t n_w4 = 0, n_nv = 0;
       int rot = 0;
-      std::string first_i8, first_w4;
+      std::string first_i8, first_w4, first_nv;
       for (const auto& [n, fw] : m->_f8.weights) {
         if (const auto* ti = src.info(n); ti != nullptr) {
           fp8_bytes += (std::size_t)ti->nbytes;
@@ -4747,6 +4867,13 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         if (fw.format == fp8::Format::kI8) {
           ++n_i8;
           if (first_i8.empty()) { first_i8 = n; }
+        }
+        if (fw.format == fp8::Format::kNVFP4) {
+          ++n_nv;
+          if (first_nv.empty()) { first_nv = n; }
+          if (const auto* ai = src.info(fw.s_rel); ai != nullptr) {
+            fp8_bytes += (std::size_t)ai->nbytes;
+          }
         }
         if (fw.format == fp8::Format::kW4A8) {
           ++n_w4;
@@ -4780,13 +4907,22 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         }
         return nullptr;
       }
+      if (n_nv > 0 && !m->_fp8x.nvfp4_valid()) {
+        if (sess != nullptr) {
+          sess->warn(fmt("minimax-h3: '{}' stores NVFP4 weights ('{}' among "
+                         "{}) and this host has no NVFP4 widening kernel",
+                         ws.dir(), first_nv, n_nv));
+        }
+        return nullptr;
+      }
       if (sess != nullptr) {
         sess->info(fmt(
             "MetalMiniMaxH3Transformer: {} checkpoint{} -- {} tensors "
             "({} MB){} kept as {} codes and widened per GEMM{}",
-            n_w4 == m->_f8.weights.size() ? "W4A8"
+            n_nv == m->_f8.weights.size() ? "NVFP4"
+            : n_w4 == m->_f8.weights.size() ? "W4A8"
             : n_i8 == m->_f8.weights.size() ? "int8"
-            : n_i8 + n_w4 > 0             ? "FP8 / int8"
+            : n_i8 + n_w4 + n_nv > 0       ? "FP8 / int8 / 4-bit"
                                           : "FP8",
             src.has("blocks.0.attn.qkv_proj.q.weight")
                 ? std::string(" (diffusers layout, read under H3's names)")
@@ -4794,7 +4930,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
             m->_f8.weights.size(), fp8_bytes >> 20,
             n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
                          : std::string(),
-            n_w4 > 0 ? "4-bit" : n_i8 > 0 ? "8-bit" : "FP8",
+            n_w4 + n_nv > 0 ? "4-bit" : n_i8 > 0 ? "8-bit" : "FP8",
             n_rot > 0 ? fmt(" ({} ConvRot-rotated, groups up to {}, "
                             "un-rotated as they widen)", n_rot, rot)()
                       : std::string()));
@@ -5070,7 +5206,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   if (m->_use_mma2) { m->_fuse_ff = false; }
 
   m->_video_patch = m->linear_(ws, "video_patch_proj", true, r);
-  m->_audio_patch = m->linear_(ws, "audio_patch_proj", true, r);
+  // No audio branch (MiniMax-H3-Image): neither audio tensor exists, and
+  // a forward with audio rows is refused.
+  if (cfg.audio) {
+    m->_audio_patch = m->linear_(ws, "audio_patch_proj", true, r);
+  }
   m->_cond_proj   = m->linear_(ws, "condition_proj", true, r);
   m->_final_norm  = m->weight_(ws, "final_layer.norm.weight", r);
   if (!cfg.pruned()) {
@@ -5078,12 +5218,15 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
         m->linear_(ws, "final_layer.adaln_proj.linear", true, r);
   }
   m->_video_out   = m->linear_(ws, "final_layer.video_out", true, r);
-  m->_audio_out   = m->linear_(ws, "final_layer.audio_out", true, r);
+  if (cfg.audio) {
+    m->_audio_out = m->linear_(ws, "final_layer.audio_out", true, r);
+  }
   m->_refiner_final_norm = m->weight_(ws, "token_refiner.final_norm.weight", r);
-  if (m->_video_patch.empty() || m->_audio_patch.empty() ||
+  if (m->_video_patch.empty() || (cfg.audio && m->_audio_patch.empty()) ||
       m->_cond_proj.empty() || m->_final_norm.empty() ||
       (m->_final_adaln.empty() && !cfg.pruned()) || m->_video_out.empty() ||
-      m->_audio_out.empty() || m->_refiner_final_norm.empty()) {
+      (cfg.audio && m->_audio_out.empty()) ||
+      m->_refiner_final_norm.empty()) {
     return nullptr;
   }
 
@@ -7447,7 +7590,8 @@ MetalMiniMaxH3Transformer::block_bytes_(const Block& b)
       &b.adaln.f8_scale, &b.qkv.cscales, &b.out.cscales, &b.fc1.cscales,
       &b.fc2.cscales, &b.adaln.cscales,
       &b.qkv.f8_srel, &b.out.f8_srel, &b.fc1.f8_srel, &b.fc2.f8_srel,
-      &b.qkv.f8_cb, &b.out.f8_cb, &b.fc1.f8_cb, &b.fc2.f8_cb};
+      &b.qkv.f8_cb, &b.out.f8_cb, &b.fc1.f8_cb, &b.fc2.f8_cb,
+      &b.qkv.f8_pq, &b.out.f8_pq, &b.fc1.f8_pq, &b.fc2.f8_pq};
   std::size_t n = 0;
   for (const metal_compute::SharedBuffer* p : all) { n += p->byte_size(); }
   return n;
@@ -7518,6 +7662,7 @@ MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
     for (const auto& p : parts) {
       const fp8::Weight* fw = _f8.find(p.layer + ".weight");
       if (fw == nullptr || fw->format == fp8::Format::kI8 ||
+          fw->format == fp8::Format::kNVFP4 ||
           (f != fp8::Format::kNone && fw->format != f)) {
         all = false;
       } else {
@@ -7534,7 +7679,9 @@ MetalMiniMaxH3Transformer::linear_matches_(WeightSet& ws,
            l.f8_scale.empty() == fw->scale.empty() &&
            l.f8_per_row == fw->per_row && l.f8_rot == fw->rot_group &&
            l.f8_qgroup == fw->qgroup &&
-           l.f8_cb.empty() == fw->codebook.empty();
+           l.f8_cb.empty() == fw->codebook.empty() &&
+           l.f8_nhi == fw->nibble_hi && l.f8_swz == fw->swizzled &&
+           l.f8_pq.empty() == fw->pre_quant.empty();
   }
   if (l.is_fp8()) { return false; }
   const bool ckpt_quant = _quant_bits > 0 && si != nullptr &&
@@ -7586,7 +7733,8 @@ MetalMiniMaxH3Transformer::wire_block_(Block& b, bool on)
       &b.adaln.f8_scale, &b.qkv.cscales, &b.out.cscales, &b.fc1.cscales,
       &b.fc2.cscales, &b.adaln.cscales,
       &b.qkv.f8_srel, &b.out.f8_srel, &b.fc1.f8_srel, &b.fc2.f8_srel,
-      &b.qkv.f8_cb, &b.out.f8_cb, &b.fc1.f8_cb, &b.fc2.f8_cb};
+      &b.qkv.f8_cb, &b.out.f8_cb, &b.fc1.f8_cb, &b.fc2.f8_cb,
+      &b.qkv.f8_pq, &b.out.f8_pq, &b.fc1.f8_pq, &b.fc2.f8_pq};
   std::size_t changed = 0;
   for (metal_compute::SharedBuffer* p : all) {
     const std::size_t n = _wire.wire_one(_mc, *p, on);
@@ -8420,6 +8568,9 @@ MetalMiniMaxH3Transformer::ane_stageable_(const Linear& l)
 {
   // The module has no bias: a projection carrying one keeps the GPU.
   if (l.empty() || !l.b.empty()) { return false; }
+  // NVFP4 has no staging of its own yet: such a projection keeps the GPU
+  // (where it widens per GEMM), the others in the block go on.
+  if (l.f8 == fp8::Format::kNVFP4) { return false; }
   // ComfyUI's int8 (ConvRot or not) and W4A8: staged as the bf16 values
   // the GPU's widening holds (AneFfnSource::kInt8 / kW4A8). Per-row or
   // per-tensor f32 scales; a rotation a power of four dividing the row.
@@ -8690,6 +8841,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   }
   if (n_audio > 0 && in.audio == nullptr) {
     return fail("the layout has audio rows but no audio latents");
+  }
+  if (n_audio > 0 && !c.audio) {
+    return fail("the layout has audio rows and this DiT has no audio "
+                "branch (audio_enabled false)");
+  }
+  if (in.out_head >= (int)_step_out.size()) {
+    return fail(fmt("output head {} asked for, {} loaded (set_step_heads)",
+                    in.out_head, _step_out.size())());
   }
   // A layout with NO video rows is legal: TaoMate-H3's audio teacher is a
   // text + audio sequence, and the reference runs it as one.
@@ -11885,10 +12044,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // The inverse gather, run by run, so the velocity comes back in the
     // same row order the caller handed the latents in.
     {
+      // A per-step head (set_step_heads) in place of the checkpoint's
+      // own when the step names one.
+      const Linear& vout =
+          in.out_head >= 0 ? _step_out[(std::size_t)in.out_head] : _video_out;
       std::size_t dst = 0;
       for (const h3::RowRun& r : L.video_runs) {
         if (r.count > 0) {
-          gemm_(enc, s.proj, (std::size_t)r.start * H, _video_out, out.video,
+          gemm_(enc, s.proj, (std::size_t)r.start * H, vout, out.video,
                 dst * VPE, r.count, VPE, H);
         }
         dst += (std::size_t)r.count;

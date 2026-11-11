@@ -5,6 +5,7 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-references.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
 #include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/shared/torch-randn.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
@@ -196,20 +197,19 @@ pack_condition_rows_raw_(const std::uint16_t* mp, int z,
 }
 
 // The posterior SAMPLED, as the reference's encode_vae_condition draws
-// it: DiagonalGaussianDistribution's sample under a fresh torch CPU
-// generator at `seed` -- noise drawn over the whole [1, z, lt, lh, lw]
+// it: DiagonalGaussianDistribution's sample off `rng` (a fresh torch CPU
+// generator, or the request's) -- noise drawn over the whole [1, z, lt, lh, lw]
 // latent in C order -- the logvar clamped to [-30, 20], the sample
 // rounded to float16, then whitened. Into an f32 [z, lt, lh, lw] latent.
 bool
 sample_condition_latent_(const std::uint16_t* mp, int z, int lt, int lh,
-                         int lw, std::uint64_t seed,
+                         int lw, TorchCpuRandn& rng,
                          const std::vector<float>& mean,
                          const std::vector<float>& std_,
                          std::vector<float>* out)
 {
   const std::size_t vox = (std::size_t)lt * lh * lw;
   const std::size_t n = (std::size_t)z * vox;
-  TorchCpuRandn rng(seed);
   const std::vector<float> eps = rng.randn(n);
   if (eps.size() != n) { return false; }
   const bool whiten = (int)mean.size() == z && (int)std_.size() == z;
@@ -275,7 +275,13 @@ reference_work_(const MediaReference& m, const ReferencePlan& plan,
   if (m.kind == MediaReference::Kind::kAudio) { return 1; }
   if (m.has_video_latent() && m.rgb.empty()) { return 1; }
   int nf = 0, th = 0, tw = 0;
-  if (m.kind == MediaReference::Kind::kImage && plan.area_min_pixels > 0) {
+  if (m.kind == MediaReference::Kind::kImage && plan.edge_min > 0) {
+    // MiniMax-H3-Image's short-edge rule (the crop is not worth weighing).
+    h3i::bound_short_edge(m.width, m.height, plan.edge_min, plan.edge_max,
+                          plan.canvas_multiple, &tw, &th);
+    nf = 1;
+  } else if (m.kind == MediaReference::Kind::kImage &&
+             plan.area_min_pixels > 0) {
     // P-H3-Image's rule; the first picture's floor is a few percent of
     // the bar, not worth carrying the index for.
     ph3::size_in_area_range(m.width, m.height, plan.area_min_pixels,
@@ -580,9 +586,15 @@ encode_references(const std::vector<MediaReference>& refs,
     models.video_vae->set_stop(models.stopping);
   }
 
+  // MiniMax-H3-Image's posteriors: ONE generator for the request, drawn
+  // in reference order (ReferencePlan::posterior_one_stream).
+  TorchCpuRandn post_rng(plan.posterior_seed >= 0
+                             ? (std::uint64_t)plan.posterior_seed
+                             : 0);
   for (std::size_t i = 0; i < refs.size(); ++i) {
     if (stopped()) { return bail_stop(); }
     const MediaReference& m = refs[i];
+    std::int64_t post_draws = 0;
     const std::string where = "reference " + std::to_string(i + 1);
     const char* kind =
         m.kind == MediaReference::Kind::kImage   ? "image"
@@ -749,8 +761,45 @@ encode_references(const std::vector<MediaReference>& refs,
       if (timing) { (void)tick(); }
       // A reference's own short edge wins over the plan's. Negative
       // means it did not state one.
-      if (m.kind == MediaReference::Kind::kImage &&
-          plan.area_min_pixels > 0) {
+      if (m.kind == MediaReference::Kind::kImage && plan.edge_min > 0) {
+        // MiniMax-H3-Image's: the short edge kept within its range, else
+        // scaled to the nearer end; then cut at the top left to whole VAE
+        // cells -- a picture keeps its own size, never the canvas's.
+        int bw = 0, bh = 0;
+        h3i::bound_short_edge(m.width, m.height, plan.edge_min,
+                              plan.edge_max, plan.canvas_multiple, &bw, &bh);
+        std::vector<std::uint8_t> full;
+        if (bh == m.height && bw == m.width) {
+          full = m.rgb;
+        } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                              m.width, bh, bw, &full)) {
+          return fail(where + ": the resize to " + std::to_string(bw) + "x" +
+                      std::to_string(bh) + " failed");
+        }
+        const int cell = models.video_vae != nullptr
+                             ? models.video_vae->config().patch
+                             : 16;
+        th = bh / cell * cell;
+        tw = bw / cell * cell;
+        if (th <= 0 || tw <= 0) {
+          return fail(where + " is smaller than one VAE cell");
+        }
+        if (th == bh && tw == bw) {
+          px = std::move(full);
+        } else {
+          px.resize((std::size_t)3 * th * tw);
+          for (int c = 0; c < 3; ++c) {
+            for (int y = 0; y < th; ++y) {
+              std::memcpy(px.data() + ((std::size_t)c * th + y) * tw,
+                          full.data() + ((std::size_t)c * bh + y) * bw,
+                          (std::size_t)tw);
+            }
+          }
+        }
+        nf = 1;
+        fit.rate_frames = 1;
+      } else if (m.kind == MediaReference::Kind::kImage &&
+                 plan.area_min_pixels > 0) {
         // P-H3-Image's area range, the first picture -- the one edited --
         // held at the canvas floor when the plan names one.
         std::int64_t lo = plan.area_min_pixels;
@@ -824,7 +873,23 @@ encode_references(const std::vector<MediaReference>& refs,
         MetalQwenVisionEncoder::Result res;
         std::vector<float> secs;
         if (m.kind == MediaReference::Kind::kImage &&
-            plan.vision_pixels > 0) {
+            plan.vision_edge > 0) {
+          // MiniMax-H3-Image's: the tower's own copy at a fixed short
+          // edge, from the picture as it arrived.
+          int vw = 0, vh = 0;
+          h3i::bound_short_edge(m.width, m.height, plan.vision_edge,
+                                plan.vision_edge, plan.canvas_multiple, &vw,
+                                &vh);
+          std::vector<std::uint8_t> vpx;
+          if (vh == m.height && vw == m.width) {
+            vpx = m.rgb;
+          } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                                m.width, vh, vw, &vpx)) {
+            return fail(where + ": the vision resize failed");
+          }
+          res = models.vision->encode(vpx.data(), vh, vw);
+        } else if (m.kind == MediaReference::Kind::kImage &&
+                   plan.vision_pixels > 0) {
           // The tower's OWN copy (P-H3-Image): resized from the picture
           // as it arrived, not from the VAE's.
           int vw = 0, vh = 0;
@@ -945,8 +1010,15 @@ encode_references(const std::vector<MediaReference>& refs,
           return fail(where + ": the video VAE encode failed (" +
                       (eerr.empty() ? "unknown error" : eerr) + ")");
         }
-        const int lh = th / vc.patch, lw = tw / vc.patch;
-        if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
+        // The latent the VAE made, and -- MiniMax-H3-Image's -- cut to
+        // whole DiT patches at the top left after the posterior is
+        // sampled over all of it.
+        const int full_h = th / vc.patch, full_w = tw / vc.patch;
+        const bool crop = plan.edge_min > 0 && lf == 1;
+        const int lh = crop ? full_h / plan.patch_h * plan.patch_h : full_h;
+        const int lw = crop ? full_w / plan.patch_w * plan.patch_w : full_w;
+        if (lh <= 0 || lw <= 0 ||
+            (lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
           return fail(where + " encodes to a " + std::to_string(lh) + "x" +
                       std::to_string(lw) + " latent, which the DiT's " +
                       std::to_string(plan.patch_h) + "x" +
@@ -956,12 +1028,29 @@ encode_references(const std::vector<MediaReference>& refs,
         const std::size_t before = r.video_rows.size();
         if (plan.posterior_seed >= 0) {
           std::vector<float> lat;
+          // A fresh generator per picture, or the request's one stream.
+          TorchCpuRandn fresh((std::uint64_t)plan.posterior_seed);
+          TorchCpuRandn& rng = plan.posterior_one_stream ? post_rng : fresh;
           if (!sample_condition_latent_(
                   static_cast<const std::uint16_t*>(mom.contents()),
-                  vc.z_channels, lf, lh, lw,
-                  (std::uint64_t)plan.posterior_seed, vc.latents_mean,
+                  vc.z_channels, lf, full_h, full_w, rng, vc.latents_mean,
                   vc.latents_std, &lat)) {
             return fail(where + ": the posterior sample failed");
+          }
+          post_draws =
+              (std::int64_t)vc.z_channels * lf * full_h * full_w;
+          if (lh != full_h || lw != full_w) {
+            // [z, lf, full_h, full_w] -> [z, lf, lh, lw], the top left.
+            std::vector<float> cut((std::size_t)vc.z_channels * lf * lh * lw);
+            for (std::size_t c = 0; c < (std::size_t)vc.z_channels * lf;
+                 ++c) {
+              for (int y = 0; y < lh; ++y) {
+                std::memcpy(cut.data() + (c * lh + y) * lw,
+                            lat.data() + (c * full_h + y) * full_w,
+                            (std::size_t)lw * sizeof(float));
+              }
+            }
+            lat = std::move(cut);
           }
           pack_latent_rows_(lat.data(), vc.z_channels, lf, lh, lw,
                             plan.patch_h, plan.patch_w, &r.video_rows);
@@ -1003,6 +1092,7 @@ encode_references(const std::vector<MediaReference>& refs,
                  : Reference::Kind::kAudio;
     r.layout.push_back(L);
     r.fits.push_back(fit);
+    r.posterior_draws.push_back(post_draws);
     done_work += work[i];
     report(done_work, label + ": done");
   }

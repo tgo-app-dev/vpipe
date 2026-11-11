@@ -101,6 +101,13 @@ class MiniMaxH3TextEncoder {
     // raw `tap`, no connector.
     std::vector<int> taps;
     std::string connector;
+
+    // MiniMax-H3-Image's presentation (minimax-h3-image.h): a picture is
+    // labelled "Picture i: " -- no angle brackets, where H3 writes
+    // "<Picture i>: " -- and the prompt, and each label, keeps at most
+    // `max_tokens` tokens. Defaults: H3's, nothing truncated.
+    bool bare_picture_labels = false;
+    int  max_tokens          = 0;
   };
 
   // `path` may be the `text_encoder` directory, the partition root, or

@@ -74,6 +74,8 @@ to_bf16_(const MetalLlamaWeights& wts, MetalCompute* mc,
   // decoded whole, scale applied -- what a dense conversion holds.
   if (fp8::format_of(info->dtype) != fp8::Format::kNone ||
       info->dtype == "U8") {
+    // NVFP4's values are twice its bytes.
+    n = fp8::logical_numel(wts, nm);
     SharedBuffer out = mc->make_shared_buffer(n * 2);
     if (out.empty() ||
         !fp8::decode_tensor_bf16(
@@ -212,6 +214,7 @@ MetalQwenImage21Transformer::wire_block_(Block& b, bool on)
   };
   auto qw = [&](QWeight& w) {
     one(w.w); one(w.codes); one(w.scales); one(w.qbias); one(w.f8_scale);
+    one(w.f8_srel); one(w.f8_pq);
   };
   QWeight* q[] = {&b.qw, &b.kw, &b.vw, &b.ow,
                   &b.gate_w, &b.proj_w, &b.out_w};
@@ -317,9 +320,13 @@ MetalQwenImage21Transformer::Config::read_dims(const std::string& dir,
     if (!w.has_value()) { return false; }
     auto dim = [&](const std::string& n, int axis) -> int {
       const auto* ti = w->info(n);
-      return ti != nullptr && (int)ti->shape.size() > axis
-                 ? (int)ti->shape[(std::size_t)axis]
-                 : -1;
+      if (ti == nullptr || (int)ti->shape.size() <= axis) { return -1; }
+      // An NVFP4 weight's codes are nibbles: its width is twice theirs.
+      if (axis == 1 && ti->shape.size() == 2 && ti->shape[0] > 0 &&
+          ti->dtype == "U8") {
+        return (int)(fp8::logical_numel(*w, n) / (std::size_t)ti->shape[0]);
+      }
+      return (int)ti->shape[(std::size_t)axis];
     };
     int layers = 0;
     while (w->has("transformer_blocks." + std::to_string(layers) +
@@ -582,6 +589,20 @@ MetalQwenImage21Transformer::load_qw_(WeightSet& ws, const std::string& name,
     }
     qw.f8         = fw->format;
     qw.f8_per_row = fw->per_row;
+    // NVFP4: its block scales beside the codes, as stored; its AWQ scale
+    // as f32.
+    if (fw->format == fp8::Format::kNVFP4) {
+      qw.f8_srel = r == Retain::Streamed
+                       ? ws.stream_tensor(fw->s_rel, _mc,
+                                          WeightSet::Residency::Copied)
+                       : ws.tensor(fw->s_rel, _mc,
+                                   WeightSet::Residency::Copied);
+      qw.f8_nhi = fw->nibble_hi;
+      qw.f8_swz = fw->swizzled;
+      bool pok = true;
+      qw.f8_pq = fp8::pre_quant_buffer(ws.src(), *fw, _mc, &pok);
+      if (qw.f8_srel.empty() || !pok) { return QWeight{}; }
+    }
     return qw;
   }
   // A DRAW THINGS i8x weight on the UNROTATED token tier: its codes and
@@ -748,7 +769,9 @@ MetalQwenImage21Transformer::fp8_kinds_match_(int L, const Block& b) const
     if (q->is_fp8() != (fw != nullptr)) { return false; }
     if (fw == nullptr) { continue; }
     if (q->f8 != fw->format || q->f8_scale.empty() != fw->scale.empty() ||
-        q->f8_per_row != fw->per_row) {
+        q->f8_per_row != fw->per_row || q->f8_nhi != fw->nibble_hi ||
+        q->f8_swz != fw->swizzled ||
+        q->f8_pq.empty() != fw->pre_quant.empty()) {
       return false;
     }
   }
@@ -772,6 +795,11 @@ MetalQwenImage21Transformer::fp8_dense_(ComputeEncoder& enc, const QWeight& w,
   c.format  = w.f8;
   c.scale   = &w.f8_scale;
   c.per_row = w.f8_per_row;
+  c.s_rel     = &w.f8_srel;
+  c.qgroup    = 16;
+  c.nibble_hi = w.f8_nhi;
+  c.swizzled  = w.f8_swz;
+  c.pre_quant = &w.f8_pq;
   if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
     _fp8_failed = true;
     return nullptr;
@@ -839,7 +867,10 @@ MetalQwenImage21Transformer::qw_bytes_(const QWeight& w)
     return w.codes.byte_size() + w.scales.byte_size() + w.qbias.byte_size() +
            w.cscales.byte_size() + (w.ds ? w.w.byte_size() : 0);
   }
-  if (w.is_fp8()) { return w.codes.byte_size() + w.f8_scale.byte_size(); }
+  if (w.is_fp8()) {
+    return w.codes.byte_size() + w.f8_scale.byte_size() +
+           w.f8_srel.byte_size() + w.f8_pq.byte_size();
+  }
   return w.w.byte_size();
 }
 
@@ -879,6 +910,14 @@ MetalQwenImage21Transformer::each_block_tensor_(
       if (const fp8::Weight* fw = _f8.find(p + nm + ".weight");
           fw != nullptr && !fw->scale.empty()) {
         fn(fw->scale, w.f8_scale, Placement::kDerived);
+        // NVFP4: its block scales raw, its AWQ scale rebuilt (the
+        // layer's: a slot keeping it would keep the FIRST block's).
+        if (fw->format == fp8::Format::kNVFP4) {
+          fn(fw->s_rel, w.f8_srel, Placement::kRaw);
+          if (!fw->pre_quant.empty()) {
+            fn(fw->pre_quant, w.f8_pq, Placement::kDerived);
+          }
+        }
       }
     } else {
       fn(p + nm + ".weight", w.w, Placement::kBf16);
@@ -958,6 +997,8 @@ MetalQwenImage21Transformer::clone_block_(const Block& src, Block& dst,
     d.bits       = s.bits;
     d.f8         = s.f8;
     d.f8_per_row = s.f8_per_row;
+    d.f8_nhi     = s.f8_nhi;
+    d.f8_swz     = s.f8_swz;
     d.sgn        = s.sgn;
     d.gc         = s.gc;
     d.pc         = s.pc && !hold;
@@ -984,6 +1025,8 @@ MetalQwenImage21Transformer::clone_block_(const Block& src, Block& dst,
     }
     ok = clone_buf_(_mc, s.cscales, d.cscales, copy) && ok;
     ok = clone_buf_(_mc, s.f8_scale, d.f8_scale, copy) && ok;
+    ok = clone_buf_(_mc, s.f8_srel, d.f8_srel, copy) && ok;
+    ok = clone_buf_(_mc, s.f8_pq, d.f8_pq, copy) && ok;
     ok = clone_buf_(_mc, s.ds && copy ? kNone : s.w, d.w, copy) && ok;
     ok = clone_buf_(_mc, s.codes, d.codes, copy) && ok;
     // A weight already in its int8 layout (gc > 0, not converted per
@@ -1100,9 +1143,29 @@ MetalQwenImage21Transformer::rebuild_one_(const std::string& nm, Placement how)
           [&]() { return i8x_scales_f32_(_ws->src(), _mc, nm); });
     }
   }
-  // An FP8 SCALE: the f32 multiplier of the weight it sits beside.
+  // A raw placement first: NVFP4's block scales are bookkeeping by name
+  // but placed as stored.
+  if (how == Placement::kRaw) {
+    return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
+  }
+  // NVFP4's AWQ scale, f32 a column.
+  static constexpr std::string_view kPq = ".pre_quant_scale";
+  if (nm.size() > kPq.size() &&
+      nm.compare(nm.size() - kPq.size(), kPq.size(), kPq) == 0) {
+    const fp8::Weight* fw =
+        _f8.find(nm.substr(0, nm.size() - kPq.size()) + ".weight");
+    bool ok = false;
+    SharedBuffer b = fw != nullptr
+                         ? fp8::pre_quant_buffer(_ws->src(), *fw, _mc, &ok)
+                         : SharedBuffer{};
+    if (!ok) { return SharedBuffer{}; }
+    return b;
+  }
+  // An FP8 SCALE: the f32 multiplier of the weight it sits beside --
+  // NVFP4's tensor scale too.
   if (fp8::is_aux_name(nm)) {
-    for (const char* suf : {".weight_scale", ".scale_weight"}) {
+    for (const char* suf : {".weight_scale_2", ".weight_scale",
+                            ".scale_weight"}) {
       const std::size_t k = std::char_traits<char>::length(suf);
       if (nm.size() > k && nm.compare(nm.size() - k, k, suf) == 0) {
         return fp8_scale_buf_(nm.substr(0, nm.size() - k) + ".weight");
@@ -1326,7 +1389,7 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
     const SessionContextIntf* sess = mc->session();
     const MetalLlamaWeights& src = m->_ws->src();
     std::string ferr;
-    if (!fp8::scan(src, &m->_f8, &ferr)) {
+    if (!fp8::scan(src, &m->_f8, &ferr, /*int8=*/false, /*nvfp4=*/true)) {
       if (sess != nullptr) {
         sess->warn(fmt("qwen-image-2.1: '{}': {}", m->_ws->dir(), ferr));
       }
@@ -1341,17 +1404,34 @@ MetalQwenImage21Transformer::load(std::shared_ptr<WeightSet> ws,
         }
         return nullptr;
       }
-      std::size_t fp8_bytes = 0, n_scaled = 0;
+      std::size_t fp8_bytes = 0, n_scaled = 0, n_nv = 0;
       for (const auto& [n, fw] : m->_f8.weights) {
         if (const auto* ti = src.info(n); ti != nullptr) {
           fp8_bytes += (std::size_t)ti->nbytes;
         }
         if (!fw.scale.empty()) { ++n_scaled; }
+        if (fw.format == fp8::Format::kNVFP4) {
+          ++n_nv;
+          if (const auto* ai = src.info(fw.s_rel); ai != nullptr) {
+            fp8_bytes += (std::size_t)ai->nbytes;
+          }
+        }
+      }
+      if (n_nv > 0 && !m->_fp8x.nvfp4_valid()) {
+        if (sess != nullptr) {
+          sess->warn(fmt("qwen-image-2.1: '{}' stores NVFP4 weights and "
+                         "this host has no NVFP4 widening kernel",
+                         m->_ws->dir()));
+        }
+        return nullptr;
       }
       if (sess != nullptr) {
         sess->info(fmt(
-            "qwen-image-2.1: FP8 checkpoint -- {} tensors ({} MB){} kept as "
-            "FP8 codes and widened per GEMM",
+            "qwen-image-2.1: {} checkpoint -- {} tensors ({} MB){} kept as "
+            "their codes and widened per GEMM",
+            n_nv == m->_f8.weights.size() ? "NVFP4"
+            : n_nv > 0                    ? "FP8 / NVFP4"
+                                          : "FP8",
             m->_f8.weights.size(), fp8_bytes >> 20,
             n_scaled > 0 ? fmt(", {} of them scaled", n_scaled)()
                          : std::string()));
@@ -3395,6 +3475,8 @@ MetalQwenImage21Transformer::ane_eligible_(int L, const Block& b) const
   // and biases are all present. The module is fp16 either way.
   auto ok = [](const QWeight& q) {
     if (q.empty()) { return false; }
+    // NVFP4 has no ANE staging: such a block keeps the GPU.
+    if (q.f8 == fp8::Format::kNVFP4) { return false; }
     if (!q.quantized) { return true; }
     // The fast layout is not affine: the stager cannot read it.
     return q.gc == 0 && (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
@@ -3476,6 +3558,8 @@ MetalQwenImage21Transformer::ane_qkv_eligible_(int L, const Block& b) const
   if (L >= cap) { return false; }
   auto ok = [](const QWeight& q) {
     if (q.empty()) { return false; }
+    // NVFP4 has no ANE staging: such a block keeps the GPU.
+    if (q.f8 == fp8::Format::kNVFP4) { return false; }
     if (!q.quantized) { return true; }
     // The fast layout is not affine: the stager cannot read it.
     return q.gc == 0 && (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
@@ -3822,7 +3906,8 @@ std::size_t
 MetalQwenImage21Transformer::forward_scratch_bytes(const Config& c,
                                                    int img_rows, int txt_rows,
                                                    bool cfg, bool packed,
-                                                   bool matrix_cores)
+                                                   bool matrix_cores,
+                                                   std::size_t widen)
 {
   // Mirrors forward(): every buffer is made up front and held to its
   // return, beside what it keeps between forwards, so the sum IS the
@@ -3832,7 +3917,9 @@ MetalQwenImage21Transformer::forward_scratch_bytes(const Config& c,
   // f32 rotary pair, and on a full step img_in's [img, H] and txt_in's
   // three. Held: the prompt's K / V for every block, one cache per CFG
   // branch (all that guidance doubles); a pack's dense stand-in; the
-  // int8 context; Sage's int8 Q / K and Sol's routing scratch.
+  // int8 context; Sage's int8 Q / K and Sol's routing scratch. A pack's
+  // stand-in and an FP8 / NVFP4 weight's widening are one scratch
+  // (_w_deq), grown to the larger.
   const std::size_t I = img_rows > 0 ? (std::size_t)img_rows : 0;
   const std::size_t T = txt_rows > 0 ? (std::size_t)txt_rows : 0;
   const std::size_t J = I + T;
@@ -3844,7 +3931,7 @@ MetalQwenImage21Transformer::forward_scratch_bytes(const Config& c,
                   T * (std::size_t)c.txt_dim * 2 + T * H * 2 * 2 +
                   J * Hd * 4 * 2;
   if (c.causal_condition) { n += (cfg ? 2u : 1u) * L * 2 * T * H * 2; }
-  if (packed) { n += F * H * 2; }
+  n += std::max(packed ? F * H * 2 : (std::size_t)0, widen);
   if (!matrix_cores) { return n; }
   if (c.i8_gemm) {
     n += I8GemmContext::forward_bytes_bound((int)J, (int)F, (int)F, (int)H,

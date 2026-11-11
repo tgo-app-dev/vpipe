@@ -61,8 +61,11 @@ class WiredPool;           // shared/wired-pool.h
 // is on the affine (safetensors / gemma-style) path. The metal forward
 // dispatches the matching qmv (decode) / dequant-to-f16 + dense GEMM
 // (prefill) per tensor; q4_K and q5_K share get_scale_min_k4, q6_K is its
-// own block format. See gguf-convert GgufQwen35Converter.
-enum class KQ : std::uint8_t { kNone = 0, kQ4K, kQ5K, kQ6K };
+// own block format. See gguf-convert GgufQwen35Converter. kNVFP4 is a
+// ModelOpt NVFP4 linear served in k-quant form (generative-models/shared/
+// nvfp4.h): 256-input super-blocks of E2M1 codes, E4M3 block scales and
+// the tensor's f32 scale -- the same qmv / dequant-and-GEMM route.
+enum class KQ : std::uint8_t { kNone = 0, kQ4K, kQ5K, kQ6K, kNVFP4 };
 
 // Streaming / stop / position control for MetalQwenModel::mtp_decode. All
 // fields optional; the defaults reproduce the original generate-to-budget,
@@ -631,10 +634,20 @@ public:
                                 const Config& c);
   // Whether a load of `c` over `wts` streams its layers through the
   // raw-source slots (Config::stream_decode engaged): a raw float stack
-  // of an eligible backbone, or a uniform affine w8 pack of one. The
-  // rule load() takes, for a caller that must know before it builds --
-  // which floor to declare, whether a pin is asked for at all.
+  // of an eligible backbone, a uniform affine w8 pack of one, or an NVFP4
+  // one (its served super-blocks built per refill). The rule load()
+  // takes, for a caller that must know before it builds -- which floor to
+  // declare, whether a pin is asked for at all.
   static bool streams_raw(const MetalLlamaWeights& wts, const Config& c);
+  // What an NVFP4 Qwen stack (ModelOpt's or ComfyUI's: a language model,
+  // or a conditioning encoder's text stack) holds once loaded natively:
+  // every NVFP4 linear as its served super-blocks (148 bytes a 256 inputs
+  // against the file's 144), an int8 / FP8 tensor beside them in the
+  // compute dtype, the rest as stored. 0 for any other checkpoint --
+  // the figure dir_weights_bytes books such a checkpoint at. `stored`,
+  // when given: the same tensors' bytes on disk.
+  static std::size_t nvfp4_held_bytes(const MetalLlamaWeights& wts,
+                                      std::size_t* stored = nullptr);
   // The LEAST a layer-streaming load holds, from the checkpoint alone:
   // everything outside the stack under `layer_stem` ("model.layers.")
   // plus what is in flight -- the raw-source slot pair (a layer's
@@ -653,6 +666,7 @@ public:
   bool raw_layers()        const { return _raw; }
   bool quantized_on_load() const { return _raw_quant && !_raw_pack; }
   bool streams_pack()      const { return _raw_pack; }
+  bool streams_nvfp4()     const { return _raw_nv; }
   bool streams_decode()    const;
   // Residency, as the block-streaming DiTs take it (docs/MODEL-MEMORY.md
   // mechanisms 6 and 7). The reserve is what must stay clear for whatever
@@ -752,6 +766,7 @@ public:
     std::size_t layer    = 0;   // what the WIDEST layer holds built
     std::size_t slot     = 0;   // one streaming slot: sources + products
     bool        pack     = false;   // the layers are already affine w8
+    bool        nv       = false;   // the layers are NVFP4, served
   };
   static RawSizes raw_sizes(const MetalLlamaWeights& wts,
                             const std::string& layer_prefix, int n_layers,
@@ -1642,6 +1657,10 @@ private:
        kqkv_t = KQ::kNone, kqz_t = KQ::kNone, kqout_t = KQ::kNone,
        kqgate_t = KQ::kNone, kqup_t = KQ::kNone, kqdown_t = KQ::kNone;
     int kqk_n = 0;   // rows in the fused q|k buffer (2*qd + kd)
+    // NVFP4 with an AWQ pre_quant_scale on o_proj: f32 [qd], applied to
+    // the attention output before the projection (scale_cols_). The MLP
+    // down projection's is folded into up_proj's rows at load.
+    metal_compute::SharedBuffer o_pq;
 
     // ---- Q4_K -> affine-g32 decode repack (VPIPE_QWEN_Q4K_AFFINE) -------
     // The native qmv_q4k is ~1.9x slower than the affine qmv (its hierarchical
@@ -1771,6 +1790,9 @@ private:
       // the MAXM=2 form's 2 grid.z tiles; the k-quant depth-2 cliff). _qmv4_*.
       _fn_qmv_q4k_batch4, _fn_qmv_q5k_batch4, _fn_qmv_q6k_batch4,
       _fn_dequant_q4k, _fn_dequant_q5k, _fn_dequant_q6k, _fn_copy,
+      // NVFP4 (KQ::kNVFP4): its qmv, the batched pair, its dequant.
+      _fn_qmv_nvfp4, _fn_qmv_nvfp4_batch, _fn_qmv_nvfp4_batch4,
+      _fn_dequant_nvfp4, _fn_scale_cols,
       _fn_dequant_w4g32,   // affine g32 prefill dequant (Q4_K->affine repack)
       // Mixture-of-Experts (Qwen3.5-MoE): on-GPU router (softmax+top-k+renorm),
       // gathered expert gate|up+SwiGLU and down GEMVs (index a 3D expert slab),
@@ -2061,6 +2083,12 @@ private:
   // within-process profiler can toggle the duplicated category between
   // passes); production never pays the per-step getenv.
   bool _catprof = false;
+
+  // x[r, c] *= s[c] for `rows` rows of `cols` (s f32): an NVFP4
+  // projection's AWQ scale on its input (Layer::o_pq).
+  void scale_cols_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xoff,
+                   const metal_compute::SharedBuffer& s, int cols, int rows);
 
   // ---- Native k-quant (GGUF) decode/prefill dispatch ------------------
   // Decode (M=1): one qmv per typed weight into an output offset.
@@ -2556,12 +2584,26 @@ private:
   struct RawLayer;
   struct RawStream;
   struct HybLayout;
+  struct NvLayout;
   friend struct RawStream;
   std::unique_ptr<RawStream> _rs;
   bool _raw = false;
   bool _raw_quant = false;
   bool _raw_pack = false;    // the source is an affine w8g64 pack
+  bool _raw_nv = false;      // the source is NVFP4, served per build
   static bool raw_eligible_(const Config& c);
+  // An NVFP4 dense stack's slot layout (metal-qwen-raw-layers.h), off the
+  // checkpoint alone: false unless every layer under `layer_prefix` holds
+  // its seven projections in NVFP4 of one spelling throughout, each a
+  // multiple of 256 inputs, an AWQ scale on o_proj / down_proj at most.
+  static bool nv_layout_(const MetalLlamaWeights& wts,
+                         const std::string& layer_prefix, int n_layers,
+                         NvLayout* out);
+  // An NVFP4 `c` the raw path serves over `wts`: a layout whose shapes
+  // are the config's.
+  static bool nv_servable_(const MetalLlamaWeights& wts, const Config& c);
+  // Whether `wts` stores the stack of `c` in NVFP4 (its first MLP gate).
+  static bool nvfp4_stack_(const MetalLlamaWeights& wts, const Config& c);
   // An affine w8 group-64 pack whose layers a RawStream can stream: every
   // projection a (u32 codes, scales, biases) triple of one width that a
   // refill can place, and a hidden size whose rows copy in 32-bit words.
@@ -2615,6 +2657,18 @@ private:
   // 0.196 rel vs the same model quantized from HF, against 0.011 for the
   // Q4_K_M sibling that got the strided flag.
   bool _gdn_strided_v = false;
+  // A ModelOpt NVFP4 checkpoint run natively: every NVFP4 linear (the
+  // projections, the untied head) on the k-quant route as KQ::kNVFP4, the
+  // rest as the HF checkpoint holds it -- a bf16 token table gathered
+  // dense (_kq_embed_dense), zero-centred norms given their +1, the GDN in
+  // its own (contiguous) value order. Set with _kquant.
+  // VPIPE_NVFP4_DENSE=1 runs the same checkpoint on the dense path instead,
+  // every NVFP4 weight dequantized to the compute dtype at load: the
+  // reference the native route is held to (3.5x the memory).
+  bool _nvfp4 = false;
+  // The k-quant route's token table is dense f16 (NVFP4's bf16 one), not a
+  // raw k-quant table: gathered by embed_gather_f16.
+  bool _kq_embed_dense = false;
   // The gated-DeltaNet q / k normalization's eps, inside rsqrt(sum / Dk +
   // eps) (MLX's rms form; the reference's l2norm adds its eps to the SUM).
   float _gdn_qk_eps = 1e-6f;

@@ -157,7 +157,9 @@ TEST(model_source_live, pinned_files_resolve_on_modelscope) {
   Session sess;
 
   const char* kRepos[] = {
-      "MiniMaxAI/MiniMax-H3",              // FL2VA + Ref2VA partitions
+      "MiniMaxAI/MiniMax-H3",              // FL2VA, Ref2VA, the encoder
+      "MiniMaxAI/MiniMax-H3-Image",        // renamed on ModelScope
+      "MiniMaxAI/MiniMax-Music3",          // renamed on ModelScope
       "Comfy-Org/MiniMax-H3",              // the repack, both partitions
       "black-forest-labs/FLUX.2-klein-9B",
       "krea/Krea-2-Turbo",
@@ -210,16 +212,20 @@ TEST(model_source_live, minimax_rename_is_necessary) {
   const ModelSource* ms = model_source("modelscope");
   ASSERT_TRUE(ms != nullptr);
   if (ms == nullptr) { return; }
-  string body, err;
-  long   status = 0;
-  const bool upstream_ok = http_get_text(
-      ms->tree_url("MiniMaxAI/MiniMax-H3", ms->default_revision()), "",
-      true, 120, body, status, err);
-  EXPECT_FALSE(upstream_ok);          // 404 under the HuggingFace name
-  const bool renamed_ok = http_get_text(
-      ms->tree_url("MiniMax/MiniMax-H3", ms->default_revision()), "",
-      true, 120, body, status, err);
-  EXPECT_TRUE(renamed_ok);
+  // Per repo: each of MiniMax's repos is "MiniMax/..." there.
+  for (const char* repo :
+       {"MiniMax-H3", "MiniMax-H3-Image", "MiniMax-Music3"}) {
+    string body, err;
+    long   status = 0;
+    const bool upstream_ok = http_get_text(
+        ms->tree_url(string("MiniMaxAI/") + repo, ms->default_revision()),
+        "", true, 120, body, status, err);
+    EXPECT_FALSE(upstream_ok);        // 404 under the HuggingFace name
+    const bool renamed_ok = http_get_text(
+        ms->tree_url(string("MiniMax/") + repo, ms->default_revision()),
+        "", true, 120, body, status, err);
+    EXPECT_TRUE(renamed_ok);
+  }
 }
 
 // ModelScope answers an UNKNOWN revision with HTTP 200 and an empty file

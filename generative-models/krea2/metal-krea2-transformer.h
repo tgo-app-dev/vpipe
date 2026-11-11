@@ -372,8 +372,15 @@ class MetalKrea2Transformer {
   // What a forward allocates beyond the weights, for the plan's denoise
   // phase (default Config dims are Turbo's): img_rows image tokens beside
   // txt_rows of prompt, `matrix_cores` for the tiers that need them.
+  // `widen`: the widest weight a GEMM widens into the dequant scratch, as
+  // bf16 (model_memory::widened_weight_bytes) -- an FP8 / NVFP4 weight on
+  // any GPU, a pack's on the matrix-core route.
   static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
-                                           int txt_rows, bool matrix_cores);
+                                           int txt_rows, bool matrix_cores,
+                                           std::size_t widen = 0);
+  // The dequant / widening scratch's bytes as grown so far (`widen`'s
+  // measure).
+  std::size_t widen_scratch_bytes() const { return _w_deq.byte_size(); }
   // Rows per ANE predict: VPIPE_KREA2_ANE_CHUNK or the default. One reading
   // for the plan and the model, so the two cannot book different shapes.
   static int ane_chunk_rows() noexcept;
@@ -518,6 +525,11 @@ class MetalKrea2Transformer {
     fp8::Format f8 = fp8::Format::kNone;
     metal_compute::SharedBuffer f8_scale;
     bool f8_per_row = false;
+    // NVFP4 (f8 kNVFP4): `codes` the [N, K / 2] nibbles, `f8_scale` the
+    // tensor's scale_2, `f8_srel` the E4M3 block scales as stored; the
+    // spelling (fp8.h) and an AWQ pre_quant_scale, f32 [K] (empty: none).
+    metal_compute::SharedBuffer f8_srel, f8_pq;
+    bool f8_nhi = false, f8_swz = false;
     // codes/qbias are in the SIGNED layout (I8GemmContext::gemm_signed):
     // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
     // the signed dequant read it; see _sgn.

@@ -130,6 +130,7 @@ format_named_(const std::string& s)
   if (s == "float8_e5m2") { return Format::kE5M2; }
   if (s == "int8_tensorwise") { return Format::kI8; }
   if (s == "asym_w4a8_int8") { return Format::kW4A8; }
+  if (s == "nvfp4") { return Format::kNVFP4; }
   return Format::kNone;
 }
 
@@ -209,6 +210,69 @@ resolve_w4a8_(const MetalLlamaWeights& w, const std::string& name,
   return true;
 }
 
+// Whether the checkpoint's header carries ComfyUI's per-layer records --
+// which, for a layer a translation at open renamed away from its entry,
+// is what still says the file is ComfyUI's.
+bool
+comfy_header_(const MetalLlamaWeights& w)
+{
+  return w.metadata().count("_quantization_metadata") != 0;
+}
+
+// An NVFP4 layer (fp8.h): its nibble codes and the scales beside them,
+// each checked against the codes' shape. `comfy`: ComfyUI's spelling.
+bool
+resolve_nvfp4_(const MetalLlamaWeights& w, const std::string& name,
+               const MetalLlamaWeights::TensorInfo& ti,
+               const std::string& layer, bool comfy, Weight* out,
+               std::string* err)
+{
+  if (ti.dtype != "U8" || ti.shape.size() != 2) {
+    return fail_(err, fmt("'{}' is NVFP4 but stored as {} of {} dims", name,
+                          ti.dtype, ti.shape.size())());
+  }
+  const std::int64_t N = ti.shape[0], K = ti.shape[1] * 2;
+  const std::string bs = layer + ".weight_scale";
+  const std::string ts = layer + ".weight_scale_2";
+  const std::string pq = layer + ".pre_quant_scale";
+  const auto* bi = w.info(bs);
+  const auto* gi = w.info(ts);
+  // ComfyUI pads its swizzled scales to whole tiles of 128 rows x 4
+  // blocks (cuBLAS's layout); ModelOpt stores [N, K / 16] as it is.
+  const std::int64_t B = K / 16;
+  const std::int64_t want = comfy ? (N + 127) / 128 * 128 * ((B + 3) / 4 * 4)
+                                  : N * B;
+  if (K % 16 != 0 || bi == nullptr || bi->dtype != "F8_E4M3" ||
+      (std::int64_t)numel_(*bi) != want ||
+      (!comfy && (bi->shape.size() != 2 || bi->shape[0] != N))) {
+    return fail_(err, fmt("'{}': NVFP4 wants '{}', {} E4M3 block scales for "
+                          "its [{}, {}] nibble codes", name, bs, want, N,
+                          K / 2)());
+  }
+  if (gi == nullptr || numel_(*gi) != 1 ||
+      (gi->dtype != "F32" && gi->dtype != "BF16" && gi->dtype != "F16")) {
+    return fail_(err, fmt("'{}': NVFP4 wants '{}', one float", name, ts)());
+  }
+  Weight x;
+  x.format = Format::kNVFP4;
+  x.scale = ts;
+  x.per_row = false;
+  x.s_rel = bs;
+  x.qgroup = 16;
+  x.nibble_hi = comfy;
+  x.swizzled = comfy;
+  if (const auto* pi = w.info(pq)) {
+    if ((std::int64_t)numel_(*pi) != K ||
+        (pi->dtype != "F32" && pi->dtype != "BF16" && pi->dtype != "F16")) {
+      return fail_(err, fmt("'{}': its pre_quant_scale '{}' is not {} "
+                            "floats", name, pq, K)());
+    }
+    x.pre_quant = pq;
+  }
+  *out = x;
+  return true;
+}
+
 }  // namespace
 
 bool
@@ -242,7 +306,7 @@ is_aux_name(const std::string& name) noexcept
 
 bool
 resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
-        std::string* err, bool int8)
+        std::string* err, bool int8, bool nvfp4)
 {
   if (err != nullptr) { err->clear(); }
   const auto* ti = w.info(name);
@@ -267,6 +331,13 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
     }
     if (df == Format::kW4A8 && int8) {
       return resolve_w4a8_(w, name, *ti, layer, declared, out, err);
+    }
+    if (df == Format::kNVFP4) {
+      if (!nvfp4) {
+        return fail_(err, fmt("'{}' is stored as 'nvfp4', which this build "
+                              "does not read for this model", name)());
+      }
+      return resolve_nvfp4_(w, name, *ti, layer, /*comfy=*/true, out, err);
     }
     if (df == Format::kNone || (df != Format::kE4M3 &&
                                 df != Format::kE5M2 && !int8)) {
@@ -315,6 +386,21 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
   if (!layer.empty()) {
     for (const char* suf : kScaleSuffixes) {
       if (w.has(layer + suf)) { scale = layer + suf; break; }
+    }
+    // NVFP4 with no record: U8 codes, E4M3 block scales and the tensor's
+    // scale beside them -- ModelOpt's export, or a ComfyUI file whose
+    // layer a translation renamed away from its header entry.
+    if (declared.format.empty() && ti->dtype == "U8" &&
+        w.has(layer + ".weight_scale_2")) {
+      const auto* bi = w.info(layer + ".weight_scale");
+      if (bi != nullptr && bi->dtype == "F8_E4M3") {
+        if (!nvfp4) {
+          return fail_(err, fmt("'{}' is NVFP4, which this build does not "
+                                "read for this model", name)());
+        }
+        return resolve_nvfp4_(w, name, *ti, layer, comfy_header_(w), out,
+                              err);
+      }
     }
     for (const char* suf : {".weight_scale_2", ".pre_quant_scale"}) {
       if (w.has(layer + suf)) {
@@ -371,8 +457,25 @@ resolve(const MetalLlamaWeights& w, const std::string& name, Weight* out,
   return true;
 }
 
+std::size_t
+logical_numel(const MetalLlamaWeights& w, const std::string& name)
+{
+  const auto* ti = w.info(name);
+  if (ti == nullptr) { return 0; }
+  std::size_t n = numel_(*ti);
+  if (ti->dtype == "U8" || ti->dtype == "I8") {
+    Weight x;
+    if (resolve(w, name, &x, nullptr, /*int8=*/true, /*nvfp4=*/true) &&
+        (x.format == Format::kW4A8 || x.format == Format::kNVFP4)) {
+      n *= 2;
+    }
+  }
+  return n;
+}
+
 bool
-scan(const MetalLlamaWeights& w, Layout* out, std::string* err, bool int8)
+scan(const MetalLlamaWeights& w, Layout* out, std::string* err, bool int8,
+     bool nvfp4)
 {
   Layout l;
   const std::vector<std::string> names = w.tensor_names();
@@ -380,7 +483,7 @@ scan(const MetalLlamaWeights& w, Layout* out, std::string* err, bool int8)
     if (is_aux_name(n)) { continue; }
     Weight x;
     std::string e;
-    if (resolve(w, n, &x, &e, int8)) {
+    if (resolve(w, n, &x, &e, int8, nvfp4)) {
       l.weights.emplace(n, std::move(x));
     } else if (!e.empty()) {
       return fail_(err, e);
@@ -391,9 +494,19 @@ scan(const MetalLlamaWeights& w, Layout* out, std::string* err, bool int8)
   for (const std::string& n : names) {
     if (!is_aux_name(n)) { continue; }
     if (ends_(n, ".weight_scale_2") || ends_(n, ".pre_quant_scale")) {
-      return fail_(err, fmt("'{}' is a second-stage scale (NVFP4 / "
-                            "AWQ-style), which this build does not read",
-                            n)());
+      // An NVFP4 weight's own; anything else's is an encoding this
+      // cannot see.
+      const std::string sfx =
+          ends_(n, ".weight_scale_2") ? ".weight_scale_2" : ".pre_quant_scale";
+      const Weight* x =
+          l.find(n.substr(0, n.size() - sfx.size()) + ".weight");
+      if (x == nullptr || x->format != Format::kNVFP4) {
+        return fail_(err, fmt("'{}' is a second-stage scale (NVFP4 / "
+                              "AWQ-style) of no weight this build reads "
+                              "as NVFP4", n)());
+      }
+      l.aux.insert(n);
+      continue;
     }
     for (const char* suf : kScaleSuffixes) {
       if (!ends_(n, suf)) { continue; }
@@ -466,6 +579,41 @@ translate_torchao(MetalLlamaWeights& w)
         return name;
       });
   return ok ? n : 0;
+}
+
+float
+nvfp4_value(const std::uint8_t* packed, const std::uint8_t* blocks,
+            float scale_2, const float* pre_quant, std::size_t r,
+            std::size_t k, std::size_t cols, bool nibble_hi, bool swizzled)
+{
+  const std::uint8_t b = packed[r * (cols / 2) + k / 2];
+  const bool high = ((k & 1u) != 0) != nibble_hi;
+  const std::uint8_t c =
+      high ? (std::uint8_t)(b >> 4) : (std::uint8_t)(b & 15u);
+  const float s = to_f32(blocks[nvfp4_scale_index(r, k / 16, cols / 16,
+                                                  swizzled)],
+                         Format::kE4M3);
+  float v = e2m1_f32(c) * (s * scale_2);
+  if (pre_quant != nullptr) { v *= pre_quant[k]; }
+  return v;
+}
+
+void
+decode_nvfp4_bf16(const std::uint8_t* packed, const std::uint8_t* blocks,
+                  float scale_2, const float* pre_quant, std::size_t rows,
+                  std::size_t cols, bool nibble_hi, bool swizzled,
+                  std::uint16_t* dst)
+{
+  for (std::size_t r = 0; r < rows; ++r) {
+    std::uint16_t* d = dst + r * cols;
+    for (std::size_t k = 0; k < cols; ++k) {
+      const float v = nvfp4_value(packed, blocks, scale_2, pre_quant, r, k,
+                                  cols, nibble_hi, swizzled);
+      std::uint32_t u;
+      std::memcpy(&u, &v, 4);
+      d[k] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+  }
 }
 
 void

@@ -161,6 +161,13 @@ TEST(model_source, mirror_paths) {
   EXPECT_TRUE(mirror_repo("modelscope", "MiniMaxAI/MiniMax-H3", out)
               == MirrorStatus::Renamed);
   EXPECT_TRUE(out == "MiniMax/MiniMax-H3");
+  // ...and per repo, not per owner: each of MiniMax's repos has a row.
+  EXPECT_TRUE(mirror_repo("modelscope", "MiniMaxAI/MiniMax-H3-Image", out)
+              == MirrorStatus::Renamed);
+  EXPECT_TRUE(out == "MiniMax/MiniMax-H3-Image");
+  EXPECT_TRUE(mirror_repo("modelscope", "MiniMaxAI/MiniMax-Music3", out)
+              == MirrorStatus::Renamed);
+  EXPECT_TRUE(out == "MiniMax/MiniMax-Music3");
 
   // Same: the common case, and what an unlisted repo gets.
   EXPECT_TRUE(mirror_repo("modelscope", "Lightricks/LTX-2.5", out)
@@ -298,7 +305,9 @@ TEST(model_source, normalize_model_ref_both_hosts) {
 // name a repo that is actually in the catalogue -- otherwise the row is
 // a typo that silently never fires.
 TEST(model_source, mirror_rows_match_catalogue) {
-  const char* kRenamed[] = {"MiniMaxAI/MiniMax-H3"};
+  const char* kRenamed[] = {"MiniMaxAI/MiniMax-H3",
+                            "MiniMaxAI/MiniMax-H3-Image",
+                            "MiniMaxAI/MiniMax-Music3"};
   const char* kAbsent[]  = {"mgwr/M87", "RudySen/Krea2-realism-V2",
                             "conradlocke/krea2-identity-edit"};
   for (const char* p : kRenamed) {

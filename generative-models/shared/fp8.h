@@ -39,6 +39,23 @@
 // rotated (ConvRot) and scaled by its row (`s_channel`) exactly as kI8's.
 // Not elementwise: the code tables below do not apply to it
 // (fp8-layout.h's decode_w4a8_bf16 does).
+//
+// NVFP4 (kNVFP4) is NVIDIA's four-bit float: a row's codes are nibbles,
+// two a byte, each an E2M1 value {0, .5, 1, 1.5, 2, 3, 4, 6} with bit 3
+// its sign; a block of 16 columns carries an E4M3 scale, the tensor one
+// f32 `weight_scale_2`, and the weight is
+//   e2m1[code] * (e4m3(block scale) * weight_scale_2)
+// in f32 -- times an AWQ `pre_quant_scale` of its column where the file
+// has one (an activation scale folded into the weight: x * s @ W^T is
+// x @ (W * s)^T). Two spellings, the same arithmetic:
+//   ModelOpt  (an HF export: no record) the even column in the LOW
+//             nibble; the block scales [N, K / 16] row by row.
+//   ComfyUI   (a `nvfp4` comfy_quant record or header entry -- Comfy-Org's
+//             and BFL's files) the even column in the HIGH nibble; the
+//             block scales in cuBLAS's swizzled tiles of 128 rows x 4
+//             blocks, padded to whole tiles (nvfp4_scale_index below).
+// Both measured against their bf16 releases (0.995 cosine either way,
+// ~0 with the other spelling's nibble order).
 
 
 #include <array>
@@ -53,7 +70,7 @@
 
 namespace vpipe::genai::fp8 {
 
-enum class Format { kNone, kE4M3, kE5M2, kI8, kW4A8 };
+enum class Format { kNone, kE4M3, kE5M2, kI8, kW4A8, kNVFP4 };
 
 // The FP8 format a safetensors dtype string names; kNone for any other
 // dtype (I8 among them: see kI8 above).
@@ -202,6 +219,31 @@ inline float
 convrot_norm(int g)
 {
   return 1.0f / (float)(1 << (__builtin_ctz((unsigned)g) / 2));
+}
+
+// An E2M1 nibble's value (bit 3 the sign) -- NVFP4's element.
+inline float
+e2m1_f32(std::uint8_t nibble)
+{
+  static constexpr float kV[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,
+                                   4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
+                                   -2.0f, -3.0f, -4.0f, -6.0f};
+  return kV[nibble & 15u];
+}
+
+// Where row `r`, block `b` of an NVFP4 weight's block scales lies: row by
+// row (`swizzled` false, `blocks` a row's count), or in cuBLAS's swizzled
+// layout -- tiles of 128 rows x 4 blocks, each stored as [32][4][4] (row
+// r % 32, then r % 128 / 32, then b % 4), the tiles row-major over the
+// row padded to whole tiles (`blocks` rounded up to 4).
+inline std::size_t
+nvfp4_scale_index(std::size_t r, std::size_t b, std::size_t blocks,
+                  bool swizzled)
+{
+  if (!swizzled) { return r * blocks + b; }
+  const std::size_t tiles = (blocks + 3) / 4;
+  return ((r / 128) * tiles + b / 4) * 512 + (r % 32) * 16 +
+         ((r % 128) / 32) * 4 + b % 4;
 }
 
 // Decode `n` codes into bf16. `f` must not be kNone.

@@ -45,6 +45,14 @@ const ConfigKey kAttrs[] = {
    .doc = "soundtrack duration; 0 derives it from the video's frames / fps, "
           "which is what keeps the two modalities the same length by "
           "construction", .def_real = 0.0},
+  {.key = "min_generation_area", .type = ConfigType::Int, .required = false,
+   .doc = "MiniMax-H3-Image only: the smallest area, in pixels, a picture "
+          "is GENERATED at. A smaller width x height is generated on a "
+          "canvas of its aspect scaled up to this area and resized back "
+          "(Lanczos) after decoding, as the release does; 1024 generates "
+          "at the requested size. 1024 to 16777216; 0 (default) is the "
+          "release's 4194304 (2048 x 2048). Other models ignore it",
+   .def_int = 0},
   {.key = "refine_start_sigma", .type = ConfigType::Real, .required = false,
    .doc = "a REFINE only (generate-video's init_latent wired -- "
           "Open-H3-Regenerate-2K): the noise level the clip is put back "
@@ -280,6 +288,7 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _cond_timestep = attr_real("condition_timestep");
   _cond_audio_timestep = attr_real("condition_audio_timestep");
   _audio_seconds = attr_real("audio_seconds");
+  _min_generation_area = attr_int("min_generation_area");
   _refine_start  = attr_real("refine_start_sigma");
   _refine_shift  = attr_real("refine_shift");
   _linear_branch = attr_str("linear_branch");
@@ -341,6 +350,14 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
         "in t = 1 - sigma and must be in [0, 1] (got {:.3f} / {:.3f})",
         this->id(), _cond_timestep, _cond_audio_timestep));
   }
+  if (_min_generation_area != 0 &&
+      (_min_generation_area < 1024 ||
+       _min_generation_area > 4096LL * 4096LL)) {
+    fail_config(fmt(
+        "MiniMaxH3ModelConfigStage('{}'): min_generation_area must be in "
+        "[1024, 16777216], or 0 for the model's own (got {})", this->id(),
+        _min_generation_area));
+  }
   if (_audio_seconds < 0.0) {
     fail_config(fmt(
         "MiniMaxH3ModelConfigStage('{}'): audio_seconds must be >= 0; 0 "
@@ -378,6 +395,11 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   o.insert_or_assign("refine_start_sigma",
                      FlexData::make_real(_refine_start));
   o.insert_or_assign("refine_shift", FlexData::make_real(_refine_shift));
+  // Emitted only when SET: absent is the model's own.
+  if (_min_generation_area > 0) {
+    o.insert_or_assign("min_generation_area",
+                       FlexData::make_int(_min_generation_area));
+  }
   // Emitted only when SET: absent is the model's own grid.
   if (!_sigmas.empty()) {
     FlexData sg = FlexData::make_array();

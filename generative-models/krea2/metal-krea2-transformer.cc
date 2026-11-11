@@ -27,6 +27,7 @@
 #include <thread>
 #include <fstream>
 #include <string>
+#include <string_view>
 
 namespace vpipe {
 namespace genai {
@@ -154,6 +155,22 @@ fp8_elt_(const MetalLlamaWeights& wts, MetalCompute* mc,
   if (ti == nullptr) { return {}; }
   std::size_t n = 1;
   for (auto d : ti->shape) { n *= (std::size_t)d; }
+  if (fw.format == fp8::Format::kNVFP4) {
+    // Not elementwise: decoded whole, at its unpacked width.
+    n = fp8::logical_numel(wts, nm);
+    SharedBuffer out = mc->make_shared_buffer(n * 2);
+    auto* d = out.empty() ? nullptr
+                          : static_cast<std::uint16_t*>(out.contents());
+    if (d == nullptr || !fp8::decode_tensor_bf16(wts, nm, d, n, nullptr)) {
+      return {};
+    }
+    if (norm) {
+      for (std::size_t i = 0; i < n; ++i) {
+        d[i] = f32_to_bf16_(bf16_to_f32_(d[i]) + 1.0f);
+      }
+    }
+    return out;
+  }
   const std::size_t rows =
       ti->shape.empty() ? 1 : (std::size_t)ti->shape[0];
   if (rows == 0 || n % rows != 0) { return {}; }
@@ -365,6 +382,31 @@ MetalKrea2Transformer::load_qw_(WeightSet& ws, const std::string& name,
       qw.f8_per_row = fw->per_row;
       if (qw.f8_scale.empty()) { return QWeight{}; }
     }
+    // NVFP4: its block scales beside the codes, as stored; its AWQ scale
+    // as f32 (rebuilt per refill: it is the layer's).
+    if (fw->format == fp8::Format::kNVFP4) {
+      qw.f8_srel = r == Retain::Streamed
+                       ? ws.stream_tensor(fw->s_rel, _mc, res)
+                       : ws.tensor(fw->s_rel, _mc, res);
+      qw.f8_nhi = fw->nibble_hi;
+      qw.f8_swz = fw->swizzled;
+      if (!fw->pre_quant.empty()) {
+        const fp8::Weight x = *fw;
+        auto build = [this, x]() -> SharedBuffer {
+          bool ok = false;
+          SharedBuffer b = fp8::pre_quant_buffer(_ws->src(), x, _mc, &ok);
+          if (!ok) { return SharedBuffer{}; }
+          return b;
+        };
+        qw.f8_pq = r == Retain::Streamed
+                       ? ws.stream_derived(build)
+                       : ws.derived(std::string(kKey) + "f8pq|" +
+                                        fw->pre_quant,
+                                    build);
+        if (qw.f8_pq.empty()) { return QWeight{}; }
+      }
+      if (qw.f8_srel.empty()) { return QWeight{}; }
+    }
     if (!qw.codes.empty()) { qw.f8 = fw->format; }
     return qw;
   }
@@ -546,6 +588,13 @@ MetalKrea2Transformer::each_block_tensor_(
       if (const fp8::Weight* fw = _f8.find(base + ".weight");
           fw != nullptr && !fw->scale.empty()) {
         fn(fw->scale, w.f8_scale, P::kDerived);
+        // NVFP4: its block scales raw, its AWQ scale rebuilt.
+        if (fw->format == fp8::Format::kNVFP4) {
+          fn(fw->s_rel, w.f8_srel, P::kRaw);
+          if (!fw->pre_quant.empty()) {
+            fn(fw->pre_quant, w.f8_pq, P::kDerived);
+          }
+        }
       }
     } else {
       fn(base + ".weight", w.w, P::kBf16);
@@ -633,6 +682,8 @@ MetalKrea2Transformer::clone_block_(const Block& src, Block& dst,
     d.bits       = s.bits;
     d.f8         = s.f8;
     d.f8_per_row = s.f8_per_row;
+    d.f8_nhi     = s.f8_nhi;
+    d.f8_swz     = s.f8_swz;
     d.sgn        = s.sgn;
     d.gc         = s.gc;
     d.pc         = s.pc && !hold;
@@ -664,6 +715,7 @@ MetalKrea2Transformer::clone_block_(const Block& src, Block& dst,
       one(s.w, d.w);
     }
     one(s.codes, d.codes); one(s.f8_scale, d.f8_scale);
+    one(s.f8_srel, d.f8_srel); one(s.f8_pq, d.f8_pq);
     // A weight already in its int8 layout (gc > 0, not converted per
     // call) never reads the pack's scales and biases again, so a
     // PROMOTED copy leaves them behind -- ~6% of a w8 block, wired. A
@@ -764,9 +816,31 @@ MetalKrea2Transformer::rebuild_one_(const std::string& nm, P how)
   // Its blocks, kept or streamed (common/memory-owner.h).
   MemoryUseScope blocks_use(MemoryUse::kBlocks);
   if (!_ws) { return {}; }
-  // An FP8 SCALE: the f32 multiplier of the weight it sits beside.
+  // A raw placement first: NVFP4's block scales are bookkeeping by name
+  // but placed as stored.
+  if (how == P::kRaw) {
+    const auto res = _mmap_weights ? WeightSet::Residency::Mapped
+                                   : WeightSet::Residency::Copied;
+    return _ws->stream_tensor(nm, _mc, res);
+  }
+  // NVFP4's AWQ scale, f32 a column.
+  static constexpr std::string_view kPq = ".pre_quant_scale";
+  if (nm.size() > kPq.size() &&
+      nm.compare(nm.size() - kPq.size(), kPq.size(), kPq) == 0) {
+    const fp8::Weight* fw =
+        _f8.find(nm.substr(0, nm.size() - kPq.size()) + ".weight");
+    bool ok = false;
+    SharedBuffer b = fw != nullptr
+                         ? fp8::pre_quant_buffer(_ws->src(), *fw, _mc, &ok)
+                         : SharedBuffer{};
+    if (!ok) { return SharedBuffer{}; }
+    return b;
+  }
+  // An FP8 SCALE: the f32 multiplier of the weight it sits beside --
+  // NVFP4's tensor scale too.
   if (fp8::is_aux_name(nm)) {
-    for (const char* suf : {".weight_scale", ".scale_weight"}) {
+    for (const char* suf : {".weight_scale_2", ".weight_scale",
+                            ".scale_weight"}) {
       const std::size_t k = std::char_traits<char>::length(suf);
       if (nm.size() > k && nm.compare(nm.size() - k, k, suf) == 0) {
         return fp8_scale_buf_(nm.substr(0, nm.size() - k) + ".weight");
@@ -1244,7 +1318,7 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
       return nullptr;
     }
     std::string ferr;
-    if (!fp8::scan(src, &m->_f8, &ferr)) {
+    if (!fp8::scan(src, &m->_f8, &ferr, /*int8=*/false, /*nvfp4=*/true)) {
       if (sess != nullptr) {
         sess->warn(fmt("krea2: '{}': {}", model_dir, ferr));
       }
@@ -1259,17 +1333,33 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
         }
         return nullptr;
       }
-      std::size_t fp8_bytes = 0, n_scaled = 0;
+      std::size_t fp8_bytes = 0, n_scaled = 0, n_nv = 0;
       for (const auto& [n, fw] : m->_f8.weights) {
         if (const auto* ti = src.info(n); ti != nullptr) {
           fp8_bytes += (std::size_t)ti->nbytes;
         }
         if (!fw.scale.empty()) { ++n_scaled; }
+        if (fw.format == fp8::Format::kNVFP4) {
+          ++n_nv;
+          if (const auto* ai = src.info(fw.s_rel); ai != nullptr) {
+            fp8_bytes += (std::size_t)ai->nbytes;
+          }
+        }
+      }
+      if (n_nv > 0 && !m->_fp8x.nvfp4_valid()) {
+        if (sess != nullptr) {
+          sess->warn(fmt("krea2: '{}' stores NVFP4 weights and this host "
+                         "has no NVFP4 widening kernel", model_dir));
+        }
+        return nullptr;
       }
       if (sess != nullptr) {
         sess->info(fmt(
-            "krea2: FP8 checkpoint{} -- {} tensors ({} MB){} kept as FP8 "
+            "krea2: {} checkpoint{} -- {} tensors ({} MB){} kept as their "
             "codes and expanded per GEMM",
+            n_nv == m->_f8.weights.size() ? "NVFP4"
+            : n_nv > 0                    ? "FP8 / NVFP4"
+                                          : "FP8",
             krea2::is_native_dit_file(model_dir)
                 ? std::string(" (Krea's own layout, read under diffusers "
                               "names)")
@@ -2023,6 +2113,12 @@ void
 ane_fp8_source_(const QW& q, AneFfnSource& s)
 {
   if (!q.is_fp8()) { return; }
+  // NVFP4 has no staging of its own: an empty source, which the
+  // eligibility check (stageable) turns down -- the block keeps the GPU.
+  if (q.f8 == fp8::Format::kNVFP4) {
+    s = AneFfnSource{};
+    return;
+  }
   s.w         = &q.codes;
   s.quantized = false;
   s.bits      = q.f8 == fp8::Format::kE5M2 ? AneFfnSource::kFp8E5M2
@@ -2044,6 +2140,8 @@ MetalKrea2Transformer::ane_qkv_eligible_(int L, const Block& b)
   if (L >= cap) { return false; }
   auto stageable = [](const QWeight& q) {
     if (q.empty()) { return false; }
+    // NVFP4 has no ANE staging: such a block keeps the GPU.
+    if (q.f8 == fp8::Format::kNVFP4) { return false; }
     if (!q.quantized) { return true; }   // bf16, or FP8 codes
     // The fast layout is not affine: the stager cannot read it.
     return q.gc == 0 && (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
@@ -2107,6 +2205,8 @@ MetalKrea2Transformer::ane_eligible_(int L, const Block& b)
   // quantized projection is dequantized into its slot per block.
   auto stageable = [](const QWeight& q) {
     if (q.empty()) { return false; }
+    // NVFP4 has no ANE staging: such a block keeps the GPU.
+    if (q.f8 == fp8::Format::kNVFP4) { return false; }
     if (!q.quantized) { return true; }   // bf16, or FP8 codes
     // The fast layout is not affine: the stager cannot read it.
     return q.gc == 0 && (q.bits == 4 || q.bits == 8) && !q.scales.empty() &&
@@ -2261,6 +2361,7 @@ MetalKrea2Transformer::qw_bytes_(const QWeight& w)
 {
   return w.w.byte_size() + w.codes.byte_size() + w.scales.byte_size() +
          w.qbias.byte_size() + w.f8_scale.byte_size() +
+         w.f8_srel.byte_size() + w.f8_pq.byte_size() +
          w.cscales.byte_size();
 }
 
@@ -2594,7 +2695,9 @@ MetalKrea2Transformer::fp8_kinds_match_(int L, const Block& b) const
     if (q->is_fp8() != (fw != nullptr)) { return false; }
     if (fw == nullptr) { continue; }
     if (q->f8 != fw->format || q->f8_scale.empty() != fw->scale.empty() ||
-        q->f8_per_row != fw->per_row) {
+        q->f8_per_row != fw->per_row || q->f8_nhi != fw->nibble_hi ||
+        q->f8_swz != fw->swizzled ||
+        q->f8_pq.empty() != fw->pre_quant.empty()) {
       return false;
     }
   }
@@ -2620,6 +2723,11 @@ MetalKrea2Transformer::fp8_dense_(ComputeEncoder& enc, const QWeight& w,
   c.format  = w.f8;
   c.scale   = &w.f8_scale;
   c.per_row = w.f8_per_row;
+  c.s_rel     = &w.f8_srel;
+  c.qgroup    = 16;
+  c.nibble_hi = w.f8_nhi;
+  c.swizzled  = w.f8_swz;
+  c.pre_quant = &w.f8_pq;
   if (!_fp8x.encode(enc, c, _w_deq, (std::size_t)N, (std::size_t)K)) {
     _fp8_failed = true;
     return nullptr;
@@ -4291,7 +4399,8 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
 
 std::size_t
 MetalKrea2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
-                                             int txt_rows, bool matrix_cores)
+                                             int txt_rows, bool matrix_cores,
+                                             std::size_t widen)
 {
   const std::size_t I = img_rows > 0 ? (std::size_t)img_rows : 0;
   const std::size_t T = txt_rows > 0 ? (std::size_t)txt_rows : 0;
@@ -4313,6 +4422,8 @@ MetalKrea2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
   const std::size_t L = (std::size_t)c.n_text_layers;
   const std::size_t TH = (std::size_t)c.text_hidden;
   n += T * (13 * L * TH + TH + 2 * L * (std::size_t)c.text_ffn + 2 * H) * 2;
+  // The one dequant scratch (_w_deq), at the widest weight it widens.
+  n += widen;
   if (!matrix_cores) { return n; }
   if (!c.i8_gemm) {
     n += 2 * S * H * 2;     // _splitk: the ff-down's two K = 8192 planes

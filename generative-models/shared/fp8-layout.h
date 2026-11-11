@@ -54,6 +54,17 @@
 // code. A `weight_correction` (the asymmetric form) and the 6-bit
 // `w6a8_int8` are refused by name.
 //
+// NVFP4 (fp8.h), under an opt-in of its own (`nvfp4` on scan / resolve):
+// U8 nibble codes [N, K / 2], `<layer>.weight_scale` E4M3 block scales,
+// `<layer>.weight_scale_2` the tensor's f32 scale and, from an AWQ
+// export, `<layer>.pre_quant_scale` [K]. A `nvfp4` comfy_quant record or
+// header entry -- or, a translation at open having renamed the layer away
+// from its header entry, a file whose header carries ComfyUI's
+// `_quantization_metadata` at all -- is ComfyUI's spelling (high nibble
+// first, swizzled scales); a weight with no record is ModelOpt's. Opt-in
+// because the codes are half a byte: a reader that takes a weight's
+// shape for its size would read half of it.
+//
 // `input_scale` / `scale_input` are ACTIVATION scales for an FP8 matmul.
 // A model that dequantizes its weights and multiplies in bf16 has no use
 // for them, so they are bookkeeping here, exactly like the markers.
@@ -90,6 +101,13 @@ struct Weight {
   // - 8), and the columns a relative scale covers. `scale` is s_channel.
   std::string s_rel, codebook;
   int         qgroup = 0;
+  // NVFP4: `s_rel` its E4M3 block scales (qgroup 16), `scale` its
+  // weight_scale_2; ComfyUI's spelling (the even column's nibble HIGH,
+  // the block scales swizzled) or ModelOpt's; and an AWQ pre_quant_scale
+  // ("" = none), one a column.
+  bool        nibble_hi = false;
+  bool        swizzled  = false;
+  std::string pre_quant;
 };
 
 // A whole checkpoint's FP8 tensors, and the tensors that belong to the
@@ -116,13 +134,30 @@ bool is_aux_name(const std::string& name) noexcept;
 // message names the tensor and the format. `int8`: ComfyUI's int8 weights
 // read too (see above); else refused by name.
 bool scan(const MetalLlamaWeights& w, Layout* out, std::string* err,
-          bool int8 = false);
+          bool int8 = false, bool nvfp4 = false);
 
 // One tensor. False with *out untouched (format kNone) when `name` is not
 // FP8; false + *err when it is FP8 in a form this build cannot read --
 // or int8 where `int8` is false.
 bool resolve(const MetalLlamaWeights& w, const std::string& name,
-             Weight* out, std::string* err, bool int8 = false);
+             Weight* out, std::string* err, bool int8 = false,
+             bool nvfp4 = false);
+
+// A tensor's LOGICAL element count: its stored count, doubled for a
+// nibble format (W4A8, NVFP4) -- what a decode of it writes. 0 when
+// `name` is not in `w`.
+std::size_t logical_numel(const MetalLlamaWeights& w,
+                          const std::string& name);
+
+// The weight's LOGICAL columns: its stored width, doubled for the
+// nibble formats (W4A8, NVFP4).
+inline std::int64_t
+logical_cols(const Weight& x, std::int64_t stored_cols)
+{
+  return x.format == Format::kW4A8 || x.format == Format::kNVFP4
+             ? stored_cols * 2
+             : stored_cols;
+}
 
 // The scale of `x` as f32: one value, or `rows` of them. Empty for an
 // unscaled weight. False + *err when the scale tensor cannot be read.
@@ -161,6 +196,23 @@ void decode_w4a8_bf16(const std::uint8_t* packed, const std::uint8_t* s_rel,
 // One code's int8 value: round(codebook[c] * s_rel), clamped to +-127.
 std::int32_t w4a8_code(std::uint8_t nibble, float s_rel,
                        const float* codebook);
+
+// NVFP4 to bf16, [rows, cols] with `cols` the LOGICAL width: each
+// element e2m1[code] * (e4m3(block scale) * scale_2), times `pre_quant`
+// [cols] where given (null: none), the product in f32 in that order and
+// rounded once, nearest-even -- the GPU widening (nvfp4_dequant) to the
+// bit. `packed` [rows, cols / 2]; `blocks` the E4M3 scales as
+// fp8.h's nvfp4_scale_index lays them out.
+void decode_nvfp4_bf16(const std::uint8_t* packed, const std::uint8_t* blocks,
+                       float scale_2, const float* pre_quant,
+                       std::size_t rows, std::size_t cols, bool nibble_hi,
+                       bool swizzled, std::uint16_t* dst);
+// One NVFP4 element as f32, before any rounding -- what the bf16 decode
+// rounds.
+float nvfp4_value(const std::uint8_t* packed, const std::uint8_t* blocks,
+                  float scale_2, const float* pre_quant, std::size_t r,
+                  std::size_t k, std::size_t cols, bool nibble_hi,
+                  bool swizzled);
 
 void decode_f32(const std::uint8_t* codes, float* dst, std::size_t rows,
                 std::size_t cols, Format f, const std::vector<float>& scale,

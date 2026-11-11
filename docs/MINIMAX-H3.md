@@ -79,6 +79,11 @@ arrives in **8–16 steps** instead of 30+.
     - [Fetch the IC release, then run it](#fetch-the-ic-release-then-run-it)
     - [What the in-context refine costs](#what-the-in-context-refine-costs)
     - [Checked against the IC release](#checked-against-the-ic-release)
+  - [Pictures — MiniMax-H3-Image](#pictures--minimax-h3-image)
+    - [Fetch MiniMax-H3-Image, then run it](#fetch-minimax-h3-image-then-run-it)
+    - [Sizes, and what is read off the checkpoint](#sizes-and-what-is-read-off-the-checkpoint)
+    - [What MiniMax-H3-Image costs](#what-minimax-h3-image-costs)
+    - [Checked against diffusers' MiniMax-H3-Image](#checked-against-diffusers-minimax-h3-image)
   - [Pictures — P-H3-Image](#pictures--p-h3-image)
     - [Get it, then run it](#get-it-then-run-it-1)
     - [What is read off the checkpoint](#what-is-read-off-the-checkpoint)
@@ -237,6 +242,13 @@ you want to see the model work before spending the hours and the 115 GB.
   int8 on an M5's matrix cores — and the release's **fast decoder**, which
   [`prepare-open-h3-regenerate-2k-fast-vae.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-fast-vae.vpipeline)
   fetches.
+- **[`prepare-minimax-h3-image.vpipeline`](pipelines/prepare-minimax-h3-image.vpipeline)**
+  / **[`minimax-h3-image-text-to-image.vpipeline`](pipelines/minimax-h3-image-text-to-image.vpipeline)**,
+  **[`minimax-h3-image-edit.vpipeline`](pipelines/minimax-h3-image-edit.vpipeline)**
+  — **pictures** from MiniMax's own image model, **MiniMax-H3-Image**:
+  text-to-image and editing with up to 16 pictures, about 16 megapixels at
+  any aspect, in six steps (see
+  [Pictures](#pictures--minimax-h3-image)).
 - **[`prepare-p-h3-image.vpipeline`](pipelines/prepare-p-h3-image.vpipeline)**
   / **[`p-h3-image-text-to-image.vpipeline`](pipelines/p-h3-image-text-to-image.vpipeline)**,
   **[`p-h3-image-edit.vpipeline`](pipelines/p-h3-image-edit.vpipeline)**
@@ -3410,6 +3422,129 @@ reference rows' 0.001 of noise (ours, at the same level), the adapters
 the IC LoRA beside them; vpipe runs all three beside the base GEMMs, the
 same function up to the weights' rounding), and its VAE encode (FP32,
 tiled; vpipe's is the H3 video VAE every graph here runs).
+
+### Pictures — MiniMax-H3-Image
+
+[MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
+is MiniMax's own **image** model in the H3 family: text-to-image, and editing
+of up to **16 pictures** in one request. It generates about **16
+megapixels** at any aspect directly (4096 × 4096 at 1:1, 6272 × 2688 at
+21:9) in **six steps**, with no guidance and no negative prompt.
+
+Its DiT is H3's stack with the **audio branch removed** (33.1B parameters,
+bf16), distilled twice over: guidance is in the weights, and each of its six
+steps runs through an **output head of its own**
+(`pdd_fused_heads.safetensors`, beside the transformer). The picture is one
+latent frame in H3's packed sequence — `[prompt | pictures | the picture]`,
+no soundtrack rows at all. Around it:
+
+- the **text encoder is MiniMax-H3's own** Qwen3-VL-32B (hidden state 50),
+  which this repository does **not** carry — its `model_index.json` names
+  MiniMax-H3's `text_encoder/`. A box with MiniMax-H3 already has it;
+- the **VAE** is H3's encoder with a smaller **2D ViT decoder** (24 blocks,
+  rotary over height and width only): one latent frame into one picture,
+  tiled at 256 px as released.
+
+#### Fetch MiniMax-H3-Image, then run it
+
+[`prepare-minimax-h3-image.vpipeline`](pipelines/prepare-minimax-h3-image.vpipeline)
+fetches the repository (~71 GB: the DiT, its heads, the VAE) and MiniMax-H3's
+text encoder alone (~67 GB). If you already have MiniMax-H3 (either
+partition), delete the second stage — its encoder is the same files:
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-image.vpipeline
+```
+
+The conditioning stages find the encoder through the models DB (MiniMax-H3,
+either partition, or the encoder record). Where it is somewhere else, name
+it: `encoder_dir` on diffusion-conditioner / video-ref-encoder takes the
+`text_encoder/` directory, a partition, or a MiniMax-H3 root.
+
+Then:
+
+- [`minimax-h3-image-text-to-image.vpipeline`](pipelines/minimax-h3-image-text-to-image.vpipeline)
+  — the prompt in `text-prompt`, the size in generate-video's `width` /
+  `height` (the shipped graph: 4736 × 3552, 4:3 at 16 MP). The model reads
+  the prompt **as written** (at most 4096 tokens) and was trained on long,
+  complete descriptions of the whole picture; MiniMax's own pipeline
+  rewrites a short request into one first (MiniMax-H3-Image-PE, not ported).
+- [`minimax-h3-image-edit.vpipeline`](pipelines/minimax-h3-image-edit.vpipeline)
+  — the pictures on video-ref-encoder's reference ports, in order
+  `<Picture 1>`, `<Picture 2>`, … in the prompt; the size of the RESULT on
+  generate-video (the shipped graph: 4096 × 4096). The pictures keep their
+  own sizes; they are never resized to the result's. The example picture is
+  the repository's `examples/reference1.png`.
+
+#### Sizes, and what is read off the checkpoint
+
+- **The size you name is the size you get.** A request under
+  `min_generation_area` (default 4,194,304 = 2048 × 2048) is generated on a
+  canvas of its aspect scaled up to that area and resized back with Lanczos
+  after decoding, as the release does — so a 1024 × 1024 request costs what
+  2048 × 2048 does. `min_generation_area` on minimax-h3-model-config changes
+  it (1024 generates at the size named). Canvas sides are multiples of 32.
+  The working range is about 4–20 MP, best near 16.
+- **The grid** (`pdd_config.json`): six steps, run exactly as listed —
+  `steps`, the model config's `sigmas` and shifts, and the sampler port do
+  not apply — Euler in the velocity form the heads were distilled with.
+- **Edit pictures** keep their size when their short edge is within 1024 to
+  2048 px, else are scaled to the nearer end; the vision tower reads its own
+  copy at a 1024 short edge. Each picture's VAE posterior is sampled, rounded
+  to float16 and noised to t = 0.999, as the release does.
+- **The noise is the release's**: torch's CPU generator at the seed, so a
+  text-to-image seed reproduces the picture another `generator_device: cpu`
+  run makes. For an edit, the pictures' posteriors draw from that generator
+  first: set video-ref-encoder's `seed` to generate-video's (the shipped
+  graph does).
+
+#### What MiniMax-H3-Image costs
+
+MEASURED on the M4 Pro (64 GB), the DiT and MiniMax-H3's encoder bf16 from
+the Thunderbolt 5 dock, every block kept after the first forward (the read
+hides under it), no lossy tier:
+
+| request | generated at | rows a forward | a step | whole graph |
+|---|---|---:|---:|---:|
+| text-to-image 1024 × 1024 | 2048 × 2048 | 4,388 | ~30 s | 3 m 23 s |
+| text-to-image 4736 × 3552 (16 MP) | 4736 × 3552 | 16,754 | ~160 s | 16 m 44 s |
+| edit, a 1024² picture → 4096 × 4096 | 4096 × 4096 | 19,165 | ~195 s | 20 m 23 s |
+Peak footprint 43–44 GB: the DiT is kept whole (37 GB once its AdaLN
+projections are baked for the six steps). The prompt's conditioning takes
+~20–26 s (the 32B encoder streamed), the decode 6 s at 2048² and 24 s at
+16 MP. The int8, Sol, Sage and Neural Engine tiers are H3's own code paths
+and take this DiT's settings, but none has been run on it yet.
+
+The edit's picture is encoded in ~21 s (vision tower 1.2 s, VAE 4.9 s, the
+32B encoder over its 1,757-token presentation 14.8 s); its 1,024 rows ride
+every forward beside the 16,384 generated.
+
+The 16 MP row is the release's own example — `revised_prompt.t2i.txt` at
+4736 × 3552, seed 42 — and the picture it makes is the one the model card
+shows from SGLang, object for object (pixel correlation 0.90 against that
+image; 0.07 against MiniMax's API sample of the same prompt). Only the fine
+detail differs, as bf16 on two different GPUs does. The edit row is its
+edit example (`revised_prompt.edit.txt` on `reference1.png`, seed 1234):
+the same edit as SGLang's — headphones gone, the fist bump above the sign
+between the microphones — at correlation 0.93 to it (0.86 to the unedited
+picture).
+
+#### Checked against diffusers' MiniMax-H3-Image
+
+Held to `tools/dump_minimax_h3_image_golden.py` — the DiT, the layout and
+the VAE restated from diffusers' MiniMax-H3-Image (huggingface/diffusers
+#15230) over the release's own weights, fp32 the truth and the release's
+own bf16 the bar:
+
+- the packed layout — every position and tag — **equal** to the
+  reference's builder; the grid as the release steps it **equal**;
+- two real DiT blocks through step 2's head: 0.00496 from fp32 (the
+  release's bf16 0.00476); the checkpoint's own head reads 0.0082 there,
+  step 0's 0.0114 — the heads differ from each other by 1–2%;
+- the 2D decoder 0.0052 on a 2 × 2 tiling, 0.0038 on one tile (the
+  release's bf16 0.0050 / 0.0035);
+- the encoder 0.015 from fp32 (the release runs it in fp32; this one keeps
+  H3's bf16 activations).
 
 ### Pictures — P-H3-Image
 

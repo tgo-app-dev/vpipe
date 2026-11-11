@@ -10,6 +10,8 @@
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "generative-models/shared/stream-sizing.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
@@ -19,6 +21,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <string_view>
 #include <utility>
 
 namespace vpipe::genai {
@@ -144,6 +147,54 @@ alias_(const SharedBuffer& b)
   return b.empty() ? SharedBuffer{} : b.subview(0, b.byte_size());
 }
 
+std::size_t
+numel_(const MetalLlamaWeights::TensorInfo& ti)
+{
+  std::size_t n = 1;
+  for (std::int64_t d : ti.shape) { n *= (std::size_t)d; }
+  return n;
+}
+
+bool
+ends_(const std::string& s, std::string_view t)
+{
+  return s.size() >= t.size() &&
+         s.compare(s.size() - t.size(), t.size(), t) == 0;
+}
+
+// `name` an NVFP4 linear's codes: U8 [N, K / 2] that resolves as one.
+bool
+nvfp4_weight_(const MetalLlamaWeights& wts, const std::string& name,
+              fp8::Weight* x = nullptr)
+{
+  const auto* ti = wts.info(name);
+  if (ti == nullptr || ti->dtype != "U8" || ti->shape.size() != 2) {
+    return false;
+  }
+  fp8::Weight w;
+  if (!fp8::resolve(wts, name, &w, nullptr, /*int8=*/false,
+                    /*nvfp4=*/true) ||
+      w.format != fp8::Format::kNVFP4) {
+    return false;
+  }
+  if (x != nullptr) { *x = w; }
+  return true;
+}
+
+// What a trunk tensor (outside the stack) is held at: an int8 / FP8 one
+// in the compute dtype (LayerLoad::to_elt widens it; an encoder's token
+// table is decoded to bf16), anything else as stored.
+std::size_t
+trunk_held_(const std::string& name, const MetalLlamaWeights::TensorInfo& ti)
+{
+  if ((ti.dtype == "I8" ||
+       fp8::format_of(ti.dtype) != fp8::Format::kNone) &&
+      !fp8::is_aux_name(name)) {
+    return numel_(ti) * 2;
+  }
+  return (std::size_t)ti.nbytes;
+}
+
 }  // namespace
 
 // ---- eligibility + planning sizes -------------------------------------
@@ -266,6 +317,169 @@ MetalQwenModel::hyb_servable_(const MetalLlamaWeights& wts, const Config& c)
   return true;
 }
 
+bool
+MetalQwenModel::nv_layout_(const MetalLlamaWeights& wts,
+                           const std::string& layer_prefix, int n_layers,
+                           NvLayout* out)
+{
+  if (n_layers <= 0) { return false; }
+  NvLayout nl;
+  for (int L = 0; L < n_layers; ++L) {
+    const std::string p = layer_prefix + std::to_string(L) + ".";
+    std::size_t norms = 0;
+    for (int i = 0; i < kRawQ; ++i) {
+      const auto* ti = wts.info(p + kRawNames[i]);
+      if (ti == nullptr ||
+          (ti->dtype != "BF16" && ti->dtype != "F16" && ti->dtype != "F32")) {
+        return false;
+      }
+      norms += numel_(*ti) * 2;      // held in the compute dtype
+      nl.raw += (std::size_t)ti->nbytes;
+    }
+    if (L > 0 && norms != nl.norms) { return false; }
+    nl.norms = norms;
+    for (int q = 0; q < 7; ++q) {
+      const std::size_t u = (std::size_t)q;
+      const std::string nm = p + kRawNames[kRawQ + q];
+      fp8::Weight x;
+      if (!nvfp4_weight_(wts, nm, &x)) { return false; }
+      const auto* ti = wts.info(nm);
+      const auto* bi = wts.info(x.s_rel);
+      const auto* gi = wts.info(x.scale);
+      const std::string stem = nm.substr(0, nm.size() - 7);   // .weight
+      // The names a refill places, as resolve_nvfp4_ found them.
+      if (bi == nullptr || gi == nullptr ||
+          x.s_rel != stem + ".weight_scale" ||
+          x.scale != stem + ".weight_scale_2") {
+        return false;
+      }
+      const int N = (int)ti->shape[0], K = (int)ti->shape[1] * 2;
+      if (K % 256 != 0) { return false; }
+      // An AWQ scale only where the forward takes one: o_proj's on the
+      // attention output, down_proj's folded into up_proj's rows.
+      const bool pq = !x.pre_quant.empty();
+      if (pq && (q != 3 && q != 6)) { return false; }
+      if (pq && x.pre_quant != stem + ".pre_quant_scale") { return false; }
+      if (L == 0) {
+        nl.N[u] = N;
+        nl.K[u] = K;
+        nl.hi[u] = x.nibble_hi ? 1 : 0;
+        nl.swz[u] = x.swizzled ? 1 : 0;
+        nl.codes[u] = (std::size_t)ti->nbytes;
+        nl.blocks[u] = (std::size_t)bi->nbytes;
+        if (q == 3) { nl.o_pq = pq; }
+        if (q == 6) { nl.down_pq = pq; }
+      } else if (N != nl.N[u] || K != nl.K[u] ||
+                 (x.nibble_hi ? 1 : 0) != nl.hi[u] ||
+                 (x.swizzled ? 1 : 0) != nl.swz[u] ||
+                 (std::size_t)ti->nbytes != nl.codes[u] ||
+                 (std::size_t)bi->nbytes != nl.blocks[u] ||
+                 (q == 3 && pq != nl.o_pq) ||
+                 (q == 6 && pq != nl.down_pq)) {
+        return false;
+      }
+      nl.raw += (std::size_t)(ti->nbytes + bi->nbytes + gi->nbytes);
+      if (pq) {
+        if (const auto* pi = wts.info(x.pre_quant)) {
+          nl.raw += (std::size_t)pi->nbytes;
+        }
+      }
+    }
+  }
+  // down_proj's AWQ scale is up_proj's rows' (its input is silu(gate) *
+  // up), one a row.
+  if (nl.down_pq && nl.K[6] != nl.N[5]) { return false; }
+  *out = nl;
+  return true;
+}
+
+bool
+MetalQwenModel::nv_servable_(const MetalLlamaWeights& wts, const Config& c)
+{
+  if (!raw_eligible_(c) || !c.dense) { return false; }
+  NvLayout nl;
+  if (!nv_layout_(wts, c.weight_prefix + c.model_seg + "layers.",
+                  c.n_layers, &nl)) {
+    return false;
+  }
+  // The shapes the forward was configured for: q (gated or not), k, v,
+  // o, gate, up, down.
+  const int H = c.hidden, F = c.ffn_inner;
+  const int qdo = c.attn_output_gate ? 2 * c.qd() : c.qd();
+  const int want_n[7] = {qdo, c.kd(), c.kd(), H, F, F, H};
+  const int want_k[7] = {H, H, H, c.qd(), H, H, F};
+  for (std::size_t q = 0; q < 7; ++q) {
+    if (nl.N[q] != want_n[q] || nl.K[q] != want_k[q]) { return false; }
+  }
+  return true;
+}
+
+bool
+MetalQwenModel::nvfp4_stack_(const MetalLlamaWeights& wts, const Config& c)
+{
+  return nvfp4_weight_(wts, c.weight_prefix + c.model_seg +
+                                "layers.0.mlp.gate_proj.weight");
+}
+
+std::size_t
+MetalQwenModel::nvfp4_held_bytes(const MetalLlamaWeights& wts,
+                                 std::size_t* stored)
+{
+  if (stored != nullptr) { *stored = 0; }
+  // A Qwen stack: a token table and its first MLP gate in NVFP4 (no DiT
+  // names either).
+  bool table = false, stack = false;
+  for (const std::string& nm : wts.tensor_names()) {
+    table = table || ends_(nm, "embed_tokens.weight");
+    if (!stack && ends_(nm, "layers.0.mlp.gate_proj.weight")) {
+      stack = nvfp4_weight_(wts, nm);
+    }
+  }
+  if (!table || !stack) { return 0; }
+  // The NVFP4 linears, and the scales their served form takes in (the
+  // block scales and the tensor scale) or the load consumes (the
+  // activation scale; down_proj's AWQ scale, folded into up_proj's rows).
+  std::map<std::string, std::size_t> served;
+  std::map<std::string, char> consumed;
+  for (const std::string& nm : wts.tensor_names()) {
+    fp8::Weight x;
+    if (!nvfp4_weight_(wts, nm, &x)) { continue; }
+    const auto* ti = wts.info(nm);
+    const std::int64_t N = ti->shape[0], K = ti->shape[1] * 2;
+    // A width the k-quant route does not serve fails the load; booked
+    // as stored.
+    served[nm] = K % 256 == 0
+                     ? (std::size_t)N * (std::size_t)(K / 256) * 148
+                     : (std::size_t)ti->nbytes;
+    const std::string stem = nm.substr(0, nm.size() - 7);   // .weight
+    consumed[x.s_rel] = 1;
+    consumed[x.scale] = 1;
+    consumed[stem + ".input_scale"] = 1;
+    consumed[stem + ".comfy_quant"] = 1;
+    if (!x.pre_quant.empty() && ends_(stem, "down_proj")) {
+      consumed[x.pre_quant] = 1;
+    }
+  }
+  std::size_t held = 0, raw = 0;
+  for (const std::string& nm : wts.tensor_names()) {
+    if (stream_sizing_alias(nm)) { continue; }
+    const auto* ti = wts.info(nm);
+    if (ti == nullptr) { continue; }
+    raw += (std::size_t)ti->nbytes;
+    if (auto it = served.find(nm); it != served.end()) {
+      held += it->second;
+    } else if (consumed.count(nm) != 0) {
+      continue;
+    } else if (ends_(nm, ".pre_quant_scale")) {
+      held += numel_(*ti) * 4;        // o_proj's, applied as f32
+    } else {
+      held += trunk_held_(nm, *ti);
+    }
+  }
+  if (stored != nullptr) { *stored = raw; }
+  return held;
+}
+
 MetalQwenModel::RawSizes
 MetalQwenModel::raw_sizes(const MetalLlamaWeights& wts,
                           const std::string& layer_prefix, int n_layers,
@@ -288,6 +502,20 @@ MetalQwenModel::raw_sizes(const MetalLlamaWeights& wts,
       out.layer = std::max(out.layer, k);
     }
     out.slot = hl.slot();
+    return out;
+  }
+  // An NVFP4 stack is sized off its layout: the codes and block scales as
+  // they sit, the served super-blocks beside them -- its slots' shape.
+  if (const auto* probe = wts.info(layer_prefix + "0." + kRawNames[kRawQ]);
+      probe != nullptr && probe->dtype == "U8") {
+    NvLayout nl;
+    if (!nv_layout_(wts, layer_prefix, n_layers, &nl)) { return RawSizes{}; }
+    out.n_layers = n_layers;
+    out.nv = true;
+    out.raw = nl.raw;
+    out.layer = nl.kept();
+    out.built = (std::size_t)n_layers * nl.kept();
+    out.slot = nl.slot();
     return out;
   }
   for (int L = 0; L < n_layers; ++L) {
@@ -427,6 +655,7 @@ MetalQwenModel::streams_raw(const MetalLlamaWeights& wts, const Config& c)
   const RawSizes rs = raw_sizes(wts, pfx, c.n_layers, 0);
   if (rs.n_layers != c.n_layers || rs.n_layers == 0) { return false; }
   if (rs.pack) { return c.quant_bits == 8 && pack_streamable_(wts, c); }
+  if (rs.nv) { return nv_servable_(wts, c); }
   return c.load_quant_bits != 8 || c.quant_bits == 8;
 }
 
@@ -437,12 +666,14 @@ MetalQwenModel::stream_floor_bytes(const MetalLlamaWeights& wts,
   // The stack's depth and what lies outside it, in one pass -- the trunk
   // counted as genai::stream_floor_bytes counts it, a second view of a
   // tensor (a Draw Things i8x weight's codes) left out.
+  // An int8 / FP8 trunk tensor is held in the compute dtype (an NVFP4
+  // repack's int8 token table: twice its bytes on disk).
   std::size_t trunk = 0;
   int n_layers = 0;
   for (const std::string& nm : wts.tensor_names()) {
     if (stream_sizing_alias(nm)) { continue; }
     if (nm.rfind(layer_stem, 0) != 0) {
-      if (const auto* ti = wts.info(nm)) { trunk += (std::size_t)ti->nbytes; }
+      if (const auto* ti = wts.info(nm)) { trunk += trunk_held_(nm, *ti); }
       continue;
     }
     n_layers = std::max(
@@ -458,6 +689,11 @@ MetalQwenModel::stream_floor_bytes(const MetalLlamaWeights& wts,
   if (rs.n_layers == n_layers && rs.slot > 0) {
     return trunk + 2 * rs.slot;
   }
+  // An NVFP4 stack the slots cannot serve loads RESIDENT (it never takes
+  // the prefill path's pinned prefix): no floor below the whole.
+  if (nvfp4_weight_(wts, layer_stem + "0.mlp.gate_proj.weight")) {
+    return nvfp4_held_bytes(wts);
+  }
   return genai::stream_floor_bytes(wts, layer_stem);
 }
 
@@ -465,9 +701,10 @@ MetalQwenModel::stream_floor_bytes(const MetalLlamaWeights& wts,
 
 MetalQwenModel::RawStream::RawStream(MetalQwenModel* model,
                                      metal_compute::MetalCompute* c,
-                                     bool quantize, bool stream, bool pack_src)
+                                     bool quantize, bool stream, bool pack_src,
+                                     bool nvfp4)
     : m(model), mc(c), quant(quantize || pack_src), streaming(stream),
-      pack(pack_src)
+      pack(pack_src), nv(nvfp4)
 {
 }
 
@@ -485,6 +722,23 @@ MetalQwenModel::RawStream::source_names_(int L) const
 {
   const std::string p = prefix_(L);
   std::vector<std::string> out;
+  if (nv) {
+    // NvTensor order; the scales' names are the ones nv_layout_ checked
+    // resolve_nvfp4_ finds.
+    for (int i = 0; i < kRawQ; ++i) { out.push_back(p + kRawNames[i]); }
+    for (int q = 0; q < 7; ++q) {
+      const std::string nm = p + kRawNames[kRawQ + q];
+      const std::string stem = nm.substr(0, nm.size() - 7);   // .weight
+      out.push_back(nm);
+      out.push_back(stem + ".weight_scale");
+      out.push_back(stem + ".weight_scale_2");
+    }
+    out.push_back(_nl.o_pq ? p + "self_attn.o_proj.pre_quant_scale"
+                           : std::string());
+    out.push_back(_nl.down_pq ? p + "mlp.down_proj.pre_quant_scale"
+                              : std::string());
+    return out;
+  }
   if (!pack) {
     for (int i = 0; i < kRawCount; ++i) { out.push_back(p + kRawNames[i]); }
     return out;
@@ -500,9 +754,55 @@ MetalQwenModel::RawStream::source_names_(int L) const
   return out;
 }
 
+bool
+MetalQwenModel::RawStream::nv_derived_(int i)
+{
+  return i == kNvOPq || i == kNvDownPq ||
+         (i >= kNvProj && i < kNvOPq && (i - kNvProj) % 3 == 2);
+}
+
+bool
+MetalQwenModel::RawStream::nv_raw_(int i)
+{
+  return i >= kNvProj && i < kNvOPq && (i - kNvProj) % 3 != 2;
+}
+
+SharedBuffer
+MetalQwenModel::RawStream::nv_read_f32_(const std::string& name) const
+{
+  // A tensor scale (one float) or an AWQ pre_quant_scale (one a column),
+  // f32 whatever the file stores -- as LayerLoad reads both.
+  const MetalLlamaWeights& w = m->_ws->src();
+  const auto* ti = w.info(name);
+  if (ti == nullptr) { return {}; }
+  fp8::Weight as_scale;
+  as_scale.scale = name;
+  as_scale.per_row = true;
+  std::vector<float> v;
+  const std::size_t n = numel_(*ti);
+  if (!fp8::read_scale(w, as_scale, n, &v, nullptr) || v.size() != n) {
+    return {};
+  }
+  SharedBuffer b = mc->make_shared_buffer(n * sizeof(float));
+  if (!b.empty()) { std::memcpy(b.contents(), v.data(), n * sizeof(float)); }
+  return b;
+}
+
 SharedBuffer
 MetalQwenModel::RawStream::read_source_(const std::string& name) const
 {
+  if (nv) {
+    if (ends_(name, ".weight_scale_2") || ends_(name, ".pre_quant_scale")) {
+      return nv_read_f32_(name);
+    }
+    // The codes and the block scales as they sit.
+    const auto* ti = m->_ws->src().info(name);
+    if (ti != nullptr && ti->dtype != "BF16" && ti->dtype != "F16" &&
+        ti->dtype != "F32") {
+      return m->_ws->read(name, mc, WeightSet::Residency::Copied);
+    }
+    return m->raw_read_(name);
+  }
   // The compute-dtype converter widens; u32 codes are not a dtype to
   // convert, so a pack's codes are read as they sit.
   if (pack) {
@@ -525,7 +825,20 @@ MetalQwenModel::RawStream::init()
   F   = c.ffn_inner;
   D   = c.head_dim;
   hyb = !c.dense;
-  if (hyb) {
+  if (nv) {
+    // NVFP4 (a dense stack): the products are the served super-blocks,
+    // each projection's built by one dispatch; the layout is the one
+    // nv_servable_ checked.
+    if (hyb || quant) { return false; }
+    if (!nv_layout_(m->_ws->src(), c.weight_prefix + c.model_seg + "layers.",
+                    c.n_layers, &_nl)) {
+      return false;
+    }
+    _fn_serve = m->_lib_elt.function("nvfp4_serve");
+    if (!_fn_serve.valid()) { return false; }
+    kept_bytes = _nl.kept();
+    slot_bytes = _nl.slot();
+  } else if (hyb) {
     // A hybrid streams bf16 through its pool (HybLayout): no pack, no
     // in-memory w8. The only product built on the GPU is the fused
     // projection, by the same copies the dense bf16 path makes.
@@ -561,7 +874,7 @@ MetalQwenModel::RawStream::init()
     kept_bytes = ((std::size_t)(qdo + 2 * kd) * H + (std::size_t)H * qd +
                   (std::size_t)2 * F * H + (std::size_t)H * F) * 2;
   }
-  if (!hyb) {
+  if (!hyb && !nv) {
     kept_bytes += (std::size_t)(2 * H + 2 * D) * 2;   // the four norms
     const std::size_t raw =
         ((std::size_t)(qdo + 2 * kd) * H + (std::size_t)H * qd +
@@ -594,6 +907,20 @@ MetalQwenModel::RawStream::init()
       return;
     }
     const std::vector<std::string> names = source_names_(L);
+    if (nv) {
+      // The codes and block scales as they sit; the f32 scales rebuilt
+      // (they are the layer's, and no raw read widens them); the norms
+      // bf16 as the dense stack's. An absent AWQ scale has no name.
+      for (std::size_t i = 0; i < names.size(); ++i) {
+        if (names[i].empty()) { continue; }
+        const int t = (int)i;
+        fn(names[i], b.src[i],
+           nv_derived_(t) ? Placement::kDerived
+           : nv_raw_(t)   ? Placement::kRaw
+                          : Placement::kBf16);
+      }
+      return;
+    }
     for (std::size_t i = 0; i < names.size(); ++i) {
       // bf16 as it sits (a pack's u32 codes too); an f16 tensor is
       // converted in place, which is legitimate only because the two are
@@ -641,7 +968,24 @@ MetalQwenModel::RawStream::fields_(Layer& y)
           &y.ob,    &y.guw,     &y.gus,    &y.gub,    &y.uw,
           &y.dw,    &y.ds,      &y.db,     &y.in_ln,  &y.post_ln,
           &y.q_norm, &y.k_norm, &y.iqw,    &y.gow,    &y.conv_w,
-          &y.A_log, &y.dt_bias, &y.gdn_norm};
+          &y.A_log, &y.dt_bias, &y.gdn_norm,
+          &y.kqk,   &y.kqv,     &y.kqo,    &y.kqgate, &y.kqup,
+          &y.kqdown, &y.o_pq};
+}
+
+void
+MetalQwenModel::RawStream::copy_kq_tags_(const Layer& s, Layer& d)
+{
+  d.kqk_t = s.kqk_t;
+  d.kqv_t = s.kqv_t;
+  d.kqo_t = s.kqo_t;
+  d.kqkv_t = s.kqkv_t;
+  d.kqz_t = s.kqz_t;
+  d.kqout_t = s.kqout_t;
+  d.kqgate_t = s.kqgate_t;
+  d.kqup_t = s.kqup_t;
+  d.kqdown_t = s.kqdown_t;
+  d.kqk_n = s.kqk_n;
 }
 
 std::size_t
@@ -764,6 +1108,8 @@ MetalQwenModel::RawStream::read_sources_(int L, RawLayer& r)
   r.src.clear();
   r.src.resize(names.size());
   for (std::size_t i = 0; i < names.size(); ++i) {
+    // An NVFP4 stack's absent AWQ scale has no name, and no buffer.
+    if (names[i].empty()) { continue; }
     r.src[i] = read_source_(names[i]);
     if (r.src[i].empty()) { return false; }
   }
@@ -798,6 +1144,12 @@ MetalQwenModel::RawStream::alias_products_(RawLayer& r) const
   y.post_ln = alias_(r.src[(std::size_t)kRawPostLn]);
   y.q_norm  = alias_(r.src[(std::size_t)kRawQNorm]);
   y.k_norm  = alias_(r.src[(std::size_t)kRawKNorm]);
+  if (nv) {
+    // The served projections are buffers of their own; o_proj's AWQ
+    // scale, applied to the attention output, is its source as read.
+    y.o_pq = _nl.o_pq ? alias_(r.src[(std::size_t)kNvOPq]) : SharedBuffer{};
+    return;
+  }
   if (pack) {
     // A pack's o and down are already the products.
     y.ow = alias_(r.src[(std::size_t)kPackO]);
@@ -851,7 +1203,9 @@ MetalQwenModel::RawStream::take_products_(RawLayer& r) const
   // A clone out of a slot carries products only, already owned; a block
   // MOVED out of the per-block fallback still has its sources to hand
   // over in place of the windows onto them.
-  const int n_src = pack ? (int)kPackCount : (int)kRawCount;
+  const int n_src = pack ? (int)kPackCount
+                   : nv ? (int)kNvCount
+                        : (int)kRawCount;
   if (r.src.size() != (std::size_t)n_src) {
     y.is_full = true;
     return y;
@@ -863,7 +1217,9 @@ MetalQwenModel::RawStream::take_products_(RawLayer& r) const
   own(kRawPostLn, y.post_ln);
   own(kRawQNorm, y.q_norm);
   own(kRawKNorm, y.k_norm);
-  if (pack) {
+  if (nv) {
+    if (_nl.o_pq) { own(kNvOPq, y.o_pq); }
+  } else if (pack) {
     own(kPackO, y.ow);
     own(kPackO + 1, y.os);
     own(kPackO + 2, y.ob);
@@ -887,6 +1243,7 @@ MetalQwenModel::RawStream::alias_layer_(const Layer& a)
 {
   Layer y;
   y.is_full = a.is_full;
+  copy_kq_tags_(a, y);
   const auto from = fields_(const_cast<Layer&>(a));
   const auto to = fields_(y);
   for (std::size_t i = 0; i < (std::size_t)kFields; ++i) {
@@ -913,7 +1270,16 @@ MetalQwenModel::RawStream::alloc_products_(RawLayer& r)
   };
   const std::size_t nqkv = (std::size_t)(qdo + 2 * kd);
   bool ok = true;
-  if (pack) {
+  if (nv) {
+    // The served projections, q|k fused by rows as fuse_kq lays them.
+    ok = mk(_nl.served(0) + _nl.served(1), y.kqk) &&
+         mk(_nl.served(2), y.kqv) && mk(_nl.served(3), y.kqo) &&
+         mk(_nl.served(4), y.kqgate) && mk(_nl.served(5), y.kqup) &&
+         mk(_nl.served(6), y.kqdown);
+    y.kqk_t = y.kqv_t = y.kqo_t = KQ::kNVFP4;
+    y.kqgate_t = y.kqup_t = y.kqdown_t = KQ::kNVFP4;
+    y.kqk_n = _nl.N[0] + _nl.N[1];
+  } else if (pack) {
     // Only the fusions are new buffers; o and down alias the sources.
     const std::size_t gH = (std::size_t)H / 64;
     ok = ok && mk(nqkv * H, y.qw) && mk(nqkv * gH * 2, y.qs) &&
@@ -966,6 +1332,7 @@ MetalQwenModel::RawStream::copy_products_(const RawLayer& s, RawLayer& d)
   for (int i = 0; i < kFields; ++i) {
     if (!cp(*a[(std::size_t)i], *b[(std::size_t)i])) { return false; }
   }
+  copy_kq_tags_(s.prod, d.prod);
   return true;
 }
 
@@ -976,6 +1343,9 @@ MetalQwenModel::RawStream::alloc_like_(const RawLayer& s, RawLayer& d)
   d.src.clear();
   d.src.resize(s.src.size());
   for (std::size_t i = 0; i < s.src.size(); ++i) {
+    // A source the stack does not have (an NVFP4 layer's absent AWQ
+    // scale) stays absent.
+    if (s.src[i].empty()) { continue; }
     d.src[i] = mc->make_shared_buffer(s.src[i].byte_size());
     if (d.src[i].empty()) { return false; }
   }
@@ -993,6 +1363,41 @@ MetalQwenModel::RawStream::encode_build_(ComputeEncoder& enc,
                                          const RawLayer& r) const
 {
   const Layer& y = r.prod;
+  if (nv) {
+    // Each projection's served super-blocks from its codes, block scales
+    // and tensor scale (nvfp4_serve: nvfp4::pack's bytes, the file's
+    // spelling normalized) -- q and k into one buffer, as fuse_kq lays
+    // them, and down_proj's AWQ scale folded into up_proj's rows.
+    auto serve = [&](int q, const SharedBuffer& dst, std::size_t off,
+                     const SharedBuffer* mul) {
+      const std::size_t u = (std::size_t)q;
+      const std::size_t si = (std::size_t)(kNvProj + 3 * q);
+      const int N = _nl.N[u], K = _nl.K[u];
+      const std::uint32_t flags = (_nl.hi[u] != 0 ? 1u : 0u) |
+                                  (_nl.swz[u] != 0 ? 2u : 0u) |
+                                  (mul != nullptr ? 4u : 0u);
+      enc.set_function(_fn_serve);
+      enc.set_buffer(0, r.src[si]);
+      enc.set_buffer(1, r.src[si + 1]);
+      enc.set_buffer(2, r.src[si + 2]);
+      // Bound either way; read only with the flag.
+      enc.set_buffer(3, mul != nullptr ? *mul : r.src[si + 2]);
+      enc.set_buffer(4, dst, off);
+      enc.set_constant(5, N);
+      enc.set_constant(6, K);
+      enc.set_constant(7, flags);
+      enc.dispatch({(unsigned)(K / 256), (unsigned)N, 1}, {8, 32, 1});
+    };
+    serve(0, y.kqk, 0, nullptr);
+    serve(1, y.kqk, _nl.served(0), nullptr);
+    serve(2, y.kqv, 0, nullptr);
+    serve(3, y.kqo, 0, nullptr);
+    serve(4, y.kqgate, 0, nullptr);
+    serve(5, y.kqup, 0,
+          _nl.down_pq ? &r.src[(std::size_t)kNvDownPq] : nullptr);
+    serve(6, y.kqdown, 0, nullptr);
+    return;
+  }
   if (pack) {
     // The pack's q, k, v rows concatenated, and its gate, up rows
     // interleaved -- codes, scales and biases alike, by the row map the
@@ -1477,6 +1882,15 @@ MetalQwenModel::resident_bytes() const
                         &y.euw, &y.eus, &y.eub, &y.edw, &y.eds, &y.edb,
                         &y.sguw, &y.sgus, &y.sgub, &y.sdw, &y.sds, &y.sdb,
                         &y.segw, &y.segs, &y.segb});
+    // A k-quant stack's projections (GGUF's raw blocks, NVFP4's served
+    // super-blocks), their affine repacks, an NVFP4 o_proj's AWQ scale,
+    // and a mixed pack's up-projection scales -- none of which the walks
+    // above see, so a resident one read as holding its norms alone.
+    n += unique_bytes_({&y.kqk, &y.kqv, &y.kqo, &y.kqkv, &y.kqz, &y.kqab,
+                        &y.kqout, &y.kqgate, &y.kqup, &y.kqdown, &y.o_pq,
+                        &y.gate_aw, &y.gate_as, &y.gate_ab, &y.up_aw,
+                        &y.up_as, &y.up_ab, &y.qk_aw, &y.qk_as, &y.qk_ab,
+                        &y.o_aw, &y.o_as, &y.o_ab, &y.us, &y.ub});
   }
   // The routed-expert cache: its whole pool, which fills as it runs.
   if (_xc) { n += _xc->bytes(); }

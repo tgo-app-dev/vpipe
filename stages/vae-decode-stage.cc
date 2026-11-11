@@ -15,6 +15,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/flashvsr/flashvsr-family.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
@@ -1990,6 +1991,13 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // reads it as a chunk of copies, as the reference's ComfyUI VAE does
     // (`decode_image`).
     const bool one_frame = (LT == 1);
+    // MiniMax-H3-Image's 2D decoder (rope over (h, w)), read NOW: a
+    // tight box unloads the VAE right after the decode (`_unload_idle`),
+    // and asked after that, a picture of it skipped the release's 8-bit
+    // truncation and its resize back to the size asked -- an edit made
+    // with its encoder in the graph came back at the canvas, 2048^2 for
+    // 1024^2.
+    const bool h3_image_2d = _h3_vae && _h3_vae->config().rope_axes == 2;
     if (one_frame && _h3_fast) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): this is a single-frame latent (a picture), "
@@ -2312,6 +2320,90 @@ VaeDecodeStage::process(RuntimeContext& ctx)
                   : std::string()));
     }
     const std::size_t oplane = (std::size_t)cw * chh;
+    // MiniMax-H3-Image's picture (its 2D decoder: rope over (h, w)) as
+    // the release returns it: un-normalized, clamped, TRUNCATED to 8 bits
+    // (`.to(torch.uint8)`, where everything else here rounds), then --
+    // generated on a larger canvas than asked for (sideband::kResizeTo)
+    // -- resized back with Pillow's Lanczos on those 8-bit pixels.
+    if (one_frame && h3_image_2d) {
+#pragma clang fp contract(off)
+      std::vector<std::uint8_t> px((std::size_t)3 * oplane);
+      for (int c = 0; c < 3; ++c) {
+        const std::uint16_t* src = rp + (std::size_t)c * F * plane;
+        const float pm = kImagenetMean[c], ps = kImagenetStd[c];
+        for (int y = 0; y < chh; ++y) {
+          const std::uint16_t* srow =
+              src + (std::size_t)(cy0 + y) * W + (std::size_t)cx0;
+          for (int x0 = 0; x0 < cw; ++x0) {
+            const std::uint32_t u = (std::uint32_t)srow[x0] << 16;
+            float x;
+            std::memcpy(&x, &u, 4);
+            const float m = x * ps;
+            float v = m + pm;
+            v = v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;
+            px[(std::size_t)c * oplane + (std::size_t)y * cw + x0] =
+                (std::uint8_t)(v * 255.0f);
+          }
+        }
+      }
+      int ow = cw, oh = chh;
+      if (tbp->sideband.is_object()) {
+        FlexData rsb = tbp->sideband;     // as_object() is a view: keep it
+        auto ro = rsb.as_object();
+        if (ro.contains(sideband::kResizeTo)) {
+          const FlexData rz = ro.at(sideband::kResizeTo);
+          if (rz.is_array() && rz.as_array().size() == 2) {
+            const int rw = (int)rz.as_array().at(0).as_int(0);
+            const int rh = (int)rz.as_array().at(1).as_int(0);
+            if (rw > 0 && rh > 0 && (rw != cw || rh != chh)) {
+              std::vector<std::uint8_t> rs;
+              if (genai::minimax_h3::resize_lanczos_planar_rgb(
+                      px.data(), chh, cw, rh, rw, &rs)) {
+                if (!_h3_cut_said) {
+                  _h3_cut_said = true;
+                  session()->info(fmt(
+                      "VaeDecodeStage('{}'): generated at {}x{}, resized "
+                      "to the {}x{} asked for", this->id(), cw, chh, rw,
+                      rh));
+                }
+                px = std::move(rs);
+                ow = rw;
+                oh = rh;
+              } else {
+                session()->warn(fmt(
+                    "VaeDecodeStage('{}'): the resize to {}x{} failed; the "
+                    "picture is emitted at {}x{}", this->id(), rw, rh, cw,
+                    chh));
+              }
+            }
+          }
+        }
+      }
+      auto out = std::make_unique<TensorBeatPayload>();
+      out->dtype = _out_dtype;
+      out->shape = {3, oh, ow};
+      const std::size_t n = (std::size_t)3 * oh * ow;
+      out->resize_contiguous(n);
+      if (out->dtype == TensorBeat::DType::F16) {
+        auto* d = reinterpret_cast<_Float16*>(out->bytes_());
+        for (std::size_t i = 0; i < n; ++i) {
+          d[i] = (_Float16)((float)px[i] / 255.0f);
+        }
+      } else {
+        std::memcpy(out->bytes_(), px.data(), n);
+      }
+      FlexData sb = FlexData::make_object();
+      sb.as_object().insert_or_assign(sideband::kFrame,
+                                      FlexData::make_int((std::int64_t)0));
+      sb.as_object().insert_or_assign(sideband::kFrames,
+                                      FlexData::make_int((std::int64_t)1));
+      sb.as_object().insert_or_assign(sideband::kFps, FlexData::make_real(fps));
+      out->sideband = std::move(sb);
+      forward_model_name_(*tbp, *out);
+      ++_images_emitted;
+      co_await ctx.write(0, std::move(out));
+      co_return;
+    }
     auto clip = one_frame ? nullptr : begin_clip_(ctx, Fo, chh, cw);
     for (int f = 0; f < Fo; ++f) {
       auto out = std::make_unique<TensorBeatPayload>();

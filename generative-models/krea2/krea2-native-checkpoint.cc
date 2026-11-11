@@ -148,16 +148,18 @@ to_diffusers(std::string_view                 native,
   std::string_view rest;
   std::string      leaf;
   *out_shape = shape;
-  // Scaled FP8's bookkeeping (shared/fp8-layout.h) travels WITH its
-  // layer: `<layer>.scale_weight` is renamed exactly as `<layer>.weight`
-  // is, so the scale is still found beside the weight it multiplies. The
-  // legacy `scaled_fp8` marker sits at the model root and keeps its name.
+  // Scaled FP8's bookkeeping (shared/fp8-layout.h) -- NVFP4's too --
+  // travels WITH its layer: `<layer>.scale_weight` is renamed exactly as
+  // `<layer>.weight` is, so the scale is still found beside the weight it
+  // multiplies. The legacy `scaled_fp8` marker sits at the model root and
+  // keeps its name.
   if (native == "scaled_fp8") {
     *name = "scaled_fp8";
     return true;
   }
   for (const char* suf : {".weight_scale", ".scale_weight", ".input_scale",
-                          ".scale_input", ".comfy_quant"}) {
+                          ".scale_input", ".comfy_quant", ".weight_scale_2",
+                          ".pre_quant_scale"}) {
     const std::string_view sv(suf);
     if (native.size() <= sv.size() ||
         native.substr(native.size() - sv.size()) != sv) {

@@ -811,6 +811,213 @@ TEST(fp8_layouts, comfy_w4a8_reads_as_its_weight)
   }
 }
 
+namespace {
+
+// An NVFP4 layer from random but valid parts: nibble codes, E4M3 block
+// scales (never NaN), a tensor scale and, `awq`, a pre_quant_scale -- in
+// ModelOpt's spelling (the even column LOW, the scales row by row) or
+// ComfyUI's (HIGH, the scales put through torch's to_blocked here, as
+// comfy_kitchen writes them: padded to 128 x 4 tiles, each tile viewed
+// [4][32][4] and transposed to [32][4][4]). The logical scales come back
+// in `logical` [N][K / 16] for an independent decode.
+struct Nvfp4Parts {
+  std::vector<std::uint8_t> nib;      // [N * K] one code an element
+  std::vector<std::uint8_t> logical;  // [N * K / 16]
+  float scale_2 = 0.0f;
+  std::vector<float> pq;              // [K] or empty
+};
+std::vector<T>
+nvfp4_layer_(const std::string& layer, int N, int K, bool comfy, bool awq,
+             unsigned seed, Nvfp4Parts* out)
+{
+  unsigned s = seed;
+  auto next = [&]() { s = s * 1664525u + 1013904223u; return s >> 8; };
+  const int B = K / 16;
+  out->nib.resize((std::size_t)N * K);
+  for (auto& c : out->nib) { c = (std::uint8_t)(next() % 16); }
+  out->logical.resize((std::size_t)N * B);
+  for (auto& c : out->logical) { c = (std::uint8_t)(0x20 + next() % 0x30); }
+  out->scale_2 = 0.0013f + (float)(next() % 100) * 1e-5f;
+  T wt{layer + ".weight", "U8", {N, K / 2},
+       std::vector<std::uint8_t>((std::size_t)N * K / 2)};
+  for (std::size_t e = 0; e < (std::size_t)N * K; e += 2) {
+    const std::uint8_t a = out->nib[e], b = out->nib[e + 1];
+    wt.bytes[e / 2] = comfy ? (std::uint8_t)(a << 4 | b)
+                            : (std::uint8_t)(b << 4 | a);
+  }
+  T sc{layer + ".weight_scale", "F8_E4M3", {N, B}, out->logical};
+  if (comfy) {
+    const int Np = (N + 127) / 128 * 128, Bp = (B + 3) / 4 * 4;
+    std::vector<std::uint8_t> padded((std::size_t)Np * Bp, 0);
+    for (int r = 0; r < N; ++r) {
+      for (int b = 0; b < B; ++b) {
+        padded[(std::size_t)r * Bp + b] = out->logical[(std::size_t)r * B + b];
+      }
+    }
+    std::vector<std::uint8_t> st(padded.size());
+    std::size_t o = 0;
+    for (int rb = 0; rb < Np / 128; ++rb) {
+      for (int cb = 0; cb < Bp / 4; ++cb) {
+        // view(.., 128, .., 4).permute(0, 2, 1, 3): one tile [128][4];
+        // reshape(-1, 4, 32, 4).transpose(1, 2): [32][4][4].
+        for (int bb = 0; bb < 32; ++bb) {
+          for (int a = 0; a < 4; ++a) {
+            for (int j = 0; j < 4; ++j) {
+              st[o++] = padded[(std::size_t)(rb * 128 + a * 32 + bb) * Bp +
+                               (std::size_t)(cb * 4 + j)];
+            }
+          }
+        }
+      }
+    }
+    sc.shape = {Np, Bp};
+    sc.bytes = std::move(st);
+  }
+  T s2{layer + ".weight_scale_2", "F32", {}, std::vector<std::uint8_t>(4)};
+  std::memcpy(s2.bytes.data(), &out->scale_2, 4);
+  T is{layer + ".input_scale", "F32", {}, std::vector<std::uint8_t>(4)};
+  std::vector<T> ts = {wt, sc, s2, is};
+  out->pq.clear();
+  if (awq) {
+    T pq{layer + ".pre_quant_scale", "BF16", {K},
+         std::vector<std::uint8_t>((std::size_t)K * 2)};
+    for (int k = 0; k < K; ++k) {
+      const std::uint16_t b = (std::uint16_t)(0x3e80 + next() % 0x200);
+      std::memcpy(&pq.bytes[(std::size_t)k * 2], &b, 2);
+      const std::uint32_t u = (std::uint32_t)b << 16;
+      float f;
+      std::memcpy(&f, &u, 4);
+      out->pq.push_back(f);
+    }
+    ts.push_back(pq);
+  }
+  return ts;
+}
+
+}  // namespace
+
+// NVFP4 in both spellings -- ModelOpt's (no record) and ComfyUI's (a
+// comfy_quant record, or the header's _quantization_metadata), an AWQ
+// pre_quant_scale, a tile-padded swizzle (200 rows, 6 blocks) -- reads
+// as e2m1 x (block scale x scale_2) [x pre_quant] for a model that opts
+// in, is refused by name for one that does not, and the GPU widening
+// is the host decode to the bit.
+TEST(fp8_layouts, nvfp4_reads_in_both_spellings)
+{
+  struct Case {
+    const char* name;
+    int n, k;
+    bool comfy, awq, header;
+  };
+  const Case cases[] = {{"m", 6, 64, false, false, false},
+                        {"q", 200, 96, true, true, false},
+                        {"h", 130, 64, true, false, true},
+                        {"a", 3, 32, false, true, false},
+                        {"b", 256, 512, false, false, false}};
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  fp8::Expander x;
+  const bool gpu = mc != nullptr && x.load(mc) && x.nvfp4_valid();
+  for (const Case& cs : cases) {
+    Nvfp4Parts pp;
+    std::vector<T> ts =
+        nvfp4_layer_(cs.name, cs.n, cs.k, cs.comfy, cs.awq, 31u, &pp);
+    std::string qmeta;
+    if (cs.comfy && !cs.header) {
+      ts.push_back(record_(cs.name, "{\"format\": \"nvfp4\", "
+                                    "\"full_precision_matrix_mult\": true}"));
+    } else if (cs.header) {
+      qmeta = std::string("{\"format_version\": \"1.0\", \"layers\": {\"") +
+              cs.name + "\": {\"format\": \"nvfp4\"}}}";
+    }
+    const fs::path p = tmp_(std::string("nvfp4-") + cs.name +
+                            ".safetensors");
+    ASSERT_TRUE(write_st_(p, ts, qmeta));
+    auto w = MetalLlamaWeights::open(p.string());
+    ASSERT_TRUE(w.has_value());
+    if (!w.has_value()) { continue; }
+    fp8::Layout l;
+    std::string err;
+    EXPECT_TRUE(!fp8::scan(*w, &l, &err, /*int8=*/true));
+    EXPECT_TRUE(err.find("NVFP4") != std::string::npos ||
+                err.find("nvfp4") != std::string::npos);
+    ASSERT_TRUE(fp8::scan(*w, &l, &err, /*int8=*/false, /*nvfp4=*/true));
+    const std::string nm = std::string(cs.name) + ".weight";
+    const fp8::Weight* fw = l.find(nm);
+    ASSERT_TRUE(fw != nullptr);
+    if (fw == nullptr) { continue; }
+    EXPECT_TRUE(fw->format == fp8::Format::kNVFP4 &&
+                fw->nibble_hi == cs.comfy && fw->swizzled == cs.comfy &&
+                fw->qgroup == 16 && !fw->per_row &&
+                fw->pre_quant.empty() != cs.awq);
+    EXPECT_TRUE(l.is_aux(std::string(cs.name) + ".weight_scale_2") &&
+                l.is_aux(std::string(cs.name) + ".weight_scale"));
+    EXPECT_TRUE(fp8::logical_cols(*fw, cs.k / 2) == cs.k);
+    const std::size_t n = (std::size_t)cs.n * cs.k;
+    std::vector<float> got(n);
+    ASSERT_TRUE(fp8::decode_tensor_f32(*w, nm, got.data(), n, &err));
+    double worst = 0.0;
+    for (std::size_t e = 0; e < n; ++e) {
+      const std::size_t r = e / (std::size_t)cs.k, k = e % (std::size_t)cs.k;
+      double v = (double)fp8::e2m1_f32(pp.nib[e]) *
+                 (double)fp8::to_f32(pp.logical[r * (std::size_t)(cs.k / 16) +
+                                                k / 16],
+                                     fp8::Format::kE4M3) *
+                 (double)pp.scale_2;
+      if (cs.awq) { v *= (double)pp.pq[k]; }
+      const double tol = std::abs(v) * 0x1p-8 + 1e-12;
+      worst = std::max(worst, std::abs(got[e] - v) / tol);
+    }
+    std::size_t diff = 0;
+    if (gpu) {
+      metal_compute::SharedBuffer codes = mc->make_shared_buffer(n / 2);
+      const auto* bi = w->info(fw->s_rel);
+      metal_compute::SharedBuffer blocks =
+          mc->make_shared_buffer((std::size_t)bi->nbytes);
+      metal_compute::SharedBuffer dst = mc->make_shared_buffer(n * 2);
+      ASSERT_TRUE(w->read_into(nm, codes.contents(), n / 2));
+      ASSERT_TRUE(w->read_into(fw->s_rel, blocks.contents(),
+                               (std::size_t)bi->nbytes));
+      bool ok = true;
+      metal_compute::SharedBuffer scale =
+          fp8::scale_buffer(*w, *fw, (std::size_t)cs.n, mc, &ok);
+      ASSERT_TRUE(ok);
+      metal_compute::SharedBuffer pq = fp8::pre_quant_buffer(*w, *fw, mc, &ok);
+      ASSERT_TRUE(ok);
+      fp8::Codes cd;
+      cd.codes = &codes;
+      cd.format = fw->format;
+      cd.scale = &scale;
+      cd.s_rel = &blocks;
+      cd.qgroup = 16;
+      cd.nibble_hi = fw->nibble_hi;
+      cd.swizzled = fw->swizzled;
+      cd.pre_quant = &pq;
+      metal_compute::CommandStream st = mc->make_command_stream();
+      {
+        metal_compute::ComputeEncoder enc = st.begin_compute();
+        ASSERT_TRUE(x.encode(enc, cd, dst, (std::size_t)cs.n,
+                             (std::size_t)cs.k));
+      }
+      ASSERT_TRUE(st.commit().wait_ok());
+      std::vector<std::uint16_t> host(n);
+      ASSERT_TRUE(fp8::decode_tensor_bf16(*w, nm, host.data(), n, &err));
+      const auto* g16 = static_cast<const std::uint16_t*>(dst.contents());
+      for (std::size_t e = 0; e < n; ++e) { diff += g16[e] != host[e]; }
+    }
+    std::printf("[fp8_layouts] NVFP4 %s (%s%s, %d x %d): off the "
+                "restatement by %.2f of its bf16 rounding; GPU and host "
+                "differ in %zu of %zu%s\n", cs.name,
+                cs.comfy ? (cs.header ? "ComfyUI header" : "ComfyUI record")
+                         : "ModelOpt",
+                cs.awq ? ", AWQ" : "", cs.n, cs.k, worst, diff, n,
+                gpu ? "" : " (no GPU)");
+    EXPECT_TRUE(worst <= 1.0);
+    EXPECT_TRUE(diff == 0);
+    fs::remove(p);
+  }
+}
+
 // The token tier's CONVROT quantizer (quant_i8_tok_cr): an activation
 // rotated by comfy_kitchen's regular Hadamard over each 256-block -- built
 // here as the matrix, in double -- then quantized per row. The kernel
@@ -1100,7 +1307,8 @@ struct H3Twin {
 };
 
 H3Twin
-h3_int8_twin_(bool pruned, bool w4a8 = false, int tier = 0)
+h3_int8_twin_(bool pruned, bool w4a8 = false, int tier = 0,
+              bool nvfp4 = false)
 {
   H3Twin res;
   Session sess;
@@ -1180,6 +1388,33 @@ h3_int8_twin_(bool pruned, bool w4a8 = false, int tier = 0)
   // An int8 projection in the file, and its decode in the twin. g > 0:
   // ConvRot at that group.
   auto lin = [&](const std::string& nm, int n, int k, int g, bool per_row) {
+    // NVFP4 in place of the ConvRot-256 int8 projections -- ComfyUI's
+    // spelling, but fc2 ModelOpt's with an AWQ scale -- and its host
+    // decode (the GPU widening's bf16, test nvfp4_reads_...) in the twin.
+    if (nvfp4 && g == 256) {
+      const bool mo = nm.find("fc2") != std::string::npos;
+      Nvfp4Parts pp;
+      for (auto& t : nvfp4_layer_(P + nm, n, k, !mo, mo, ++seed, &pp)) {
+        q.push_back(std::move(t));
+      }
+      if (!mo) {
+        q.push_back(record_(P + nm, "{\"format\": \"nvfp4\"}"));
+      }
+      std::vector<std::uint8_t> packed((std::size_t)n * k / 2);
+      for (std::size_t e = 0; e < (std::size_t)n * k; e += 2) {
+        packed[e / 2] = (std::uint8_t)(pp.nib[e + 1] << 4 | pp.nib[e]);
+      }
+      std::vector<std::uint16_t> b((std::size_t)n * k);
+      fp8::decode_nvfp4_bf16(packed.data(), pp.logical.data(), pp.scale_2,
+                             pp.pq.empty() ? nullptr : pp.pq.data(),
+                             (std::size_t)n, (std::size_t)k, false, false,
+                             b.data());
+      T t{P + nm + ".weight", "BF16", {n, k},
+          std::vector<std::uint8_t>(b.size() * 2)};
+      std::memcpy(t.bytes.data(), b.data(), t.bytes.size());
+      d.push_back(std::move(t));
+      return;
+    }
     // W4A8 in place of the ConvRot-256 int8 projections; the twin holds
     // its host decode (the GPU widening's bf16, test comfy_w4a8_...).
     if (w4a8 && g == 256) {
@@ -1297,7 +1532,8 @@ h3_int8_twin_(bool pruned, bool w4a8 = false, int tier = 0)
   both(f32("final_layer.audio_out.bias", {32}, 0.0, 0.01));
 
   const std::string tag =
-      std::string(pruned ? "pruned-" : "") + (w4a8 ? "w4a8" : "int8");
+      std::string(pruned ? "pruned-" : "") +
+      (nvfp4 ? "nvfp4" : w4a8 ? "w4a8" : "int8");
   const fs::path pq = tmp_("h3-" + tag + ".safetensors");
   const fs::path pd = tmp_("h3-" + tag + "-bf16.safetensors");
   if (!write_st_(pq, q) || !write_st_(pd, d)) { return res; }
@@ -1568,6 +1804,36 @@ TEST(fp8_layouts, h3_pruned_w4a8_forwards_as_its_dense_twin)
   // At its unpacked width: a W4A8 weight widens to K, twice what it
   // stores.
   EXPECT_TRUE(widen_as_booked_(r));
+}
+
+// NVFP4 projections (ComfyUI's spelling, and ModelOpt's with an AWQ
+// scale) in an H3 DiT: forwarded BYTE-IDENTICAL to the twin holding their
+// host decode, in every hold -- preloaded, streamed, no slots, promoted --
+// and, unpruned, with the AdaLN baked; the widening booked at the
+// unpacked width.
+TEST(fp8_layouts, h3_nvfp4_forwards_as_its_dense_twin)
+{
+  for (bool pruned : {false, true}) {
+    const H3Twin r = h3_int8_twin_(pruned, false, 0, /*nvfp4=*/true);
+    if (!r.ran) { return; }
+    ASSERT_TRUE(r.finite);
+    std::printf("[fp8_layouts] %sH3 NVFP4 against its bf16 twin: "
+                "preloaded %s, streamed %s, no slots %s, promoted (%d of %d) "
+                "%s\n", pruned ? "pruned " : "",
+                say_(r.pre, r.dense), say_(r.str, r.dense),
+                say_(r.flat, r.dense), r.grown.kept, r.layers,
+                say_(r.grown, r.dense));
+    EXPECT_TRUE(same_out_(r.pre, r.dense));
+    EXPECT_TRUE(same_out_(r.str, r.dense));
+    EXPECT_TRUE(same_out_(r.flat, r.dense));
+    EXPECT_TRUE(r.grown.kept > 0 && same_out_(r.grown, r.dense));
+    if (!pruned) {
+      EXPECT_TRUE(!r.dense_baked.v.empty() &&
+                  same_out_(r.baked, r.dense_baked));
+      EXPECT_TRUE(same_out_(r.str_baked, r.dense_baked));
+    }
+    EXPECT_TRUE(widen_as_booked_(r));
+  }
 }
 
 // ComfyUI's int8 ConvRot and W4A8 RUN AS STORED on the token tier (M5:

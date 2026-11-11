@@ -29,6 +29,7 @@
 // for the weights-from-a-.ckpt test.
 
 #include "minitest.h"
+#include "tests/unit-tests/residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -38,7 +39,12 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/shared/stream-sizing.h"
+#include "stages/model-memory.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1377,4 +1383,210 @@ TEST(minimax_h3_text_enc, an_unpresented_reference_is_the_dits_alone)
   EXPECT_TRUE(e_lat.layout.size() == 1 &&
               e_lat.layout[0].kind == h3::Reference::Kind::kImage &&
               e_lat.video_rows.size() == lat.video_latent.size());
+}
+
+// Comfy-Org's NVFP4 AWQ repack of the encoder (`qwen3vl_32b_minimax_h3_
+// nvfp4_awq.safetensors`: the projections NVFP4 in ComfyUI's spelling, an
+// AWQ scale on o_proj and down_proj, the token table int8, no header)
+// against the bf16 encoder it was made from: the tap, token by token,
+// within what four-bit weights keep -- and not a model that merely loads.
+// Env: VPIPE_MINIMAX_H3_TEXT_ENC_NVFP4 (the file),
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH (the bf16 encoder).
+TEST(minimax_h3_text_enc, nvfp4_awq_repack_reads_as_its_bf16_encoder)
+{
+  const char* nv = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_NVFP4");
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (nv == nullptr || *nv == '\0' || root == nullptr || *root == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config qc, bc;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(nv, qc, &err));
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, bc, &err));
+  // The repack is pruned to the tap; the bf16 one is read to the same.
+  bc.tap = qc.tap;
+  bc.lm.n_layers = qc.tap;
+  std::printf("[minimax_h3_text_enc] NVFP4 repack: %d layers, hidden %d, "
+              "ffn %d\n", qc.tap, qc.lm.hidden, qc.lm.ffn_inner);
+  // A prompt's worth of ordinary token ids.
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 96; ++i) { ids.push_back(1000 + (i * 7919) % 90000); }
+  auto encode = [&](const std::string& dir,
+                    const MiniMaxH3TextEncoder::Config& c,
+                    double* secs) -> std::vector<float> {
+    std::vector<float> out;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto m = MiniMaxH3TextEncoder::load(dir, mc, &sess, c);
+    if (m == nullptr) { return out; }
+    std::string e;
+    SharedBuffer h = m->encode_ids(ids, &e);
+    if (h.empty()) {
+      std::printf("[minimax_h3_text_enc] %s\n", e.c_str());
+      return out;
+    }
+    *secs = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          t0).count();
+    const auto* p = static_cast<const std::uint16_t*>(h.contents());
+    for (std::size_t i = 0; i < h.byte_size() / 2; ++i) {
+      out.push_back(bf16_to_f32_(p[i]));
+    }
+    return out;
+  };
+  double tq = 0, tb = 0;
+  const std::vector<float> q = encode(nv, qc, &tq);
+  ASSERT_TRUE(!q.empty());
+  const std::vector<float> b = encode(root, bc, &tb);
+  ASSERT_TRUE(!b.empty() && b.size() == q.size());
+  const std::size_t H = (std::size_t)qc.lm.hidden;
+  const std::size_t T = q.size() / H;
+  double worst = 1.0, mean = 0.0;
+  bool finite = true;
+  for (std::size_t t = 0; t < T; ++t) {
+    double dot = 0, nq = 0, nb = 0;
+    for (std::size_t i = 0; i < H; ++i) {
+      const double x = q[t * H + i], y = b[t * H + i];
+      finite = finite && std::isfinite(x);
+      dot += x * y;
+      nq += x * x;
+      nb += y * y;
+    }
+    const double c = dot / std::sqrt(nq * nb + 1e-30);
+    worst = std::min(worst, c);
+    mean += c / (double)T;
+  }
+  std::printf("[minimax_h3_text_enc] NVFP4 AWQ vs bf16 at the tap: cosine "
+              "mean %.4f, worst token %.4f over %zu tokens (load + encode "
+              "%.1f s against %.1f s)\n", mean, worst, T, tq, tb);
+  EXPECT_TRUE(finite);
+  EXPECT_TRUE(mean > 0.95);
+  EXPECT_TRUE(worst > 0.85);
+}
+
+// The NVFP4 AWQ repack STREAMS as the conditioner asks it to
+// (stream_layers + stream_decode, a pin_frac it ignores): through the
+// raw-source slots -- the codes and block scales placed as they sit, the
+// served super-blocks built on the GPU -- never a pinned prefix. The
+// conditioning is the resident load's BYTE FOR BYTE at the tap with growth
+// off (every layer streamed), on, and once the slots are given back. Held
+// at the floor: the floor's slot pair and the final norm. Booked: the
+// floor's trunk counts the int8 token table at the bf16 the encoder holds
+// it in, and the whole (dir_weights_bytes) is that trunk and every layer
+// as kept, to the byte.
+TEST(minimax_h3_text_enc, nvfp4_awq_repack_streams_as_it_holds)
+{
+  const char* nv = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_NVFP4");
+  if (nv == nullptr || *nv == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config c;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(nv, c, &err));
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 96; ++i) { ids.push_back(1000 + (i * 7919) % 90000); }
+  auto bytes_of = [](const SharedBuffer& h) {
+    const auto* p = static_cast<const std::uint8_t*>(h.contents());
+    return h.empty() ? std::vector<std::uint8_t>{}
+                     : std::vector<std::uint8_t>(p, p + h.byte_size());
+  };
+  auto same = [](const std::vector<std::uint8_t>& a,
+                 const std::vector<std::uint8_t>& b) {
+    return !a.empty() && a == b;
+  };
+  std::vector<std::uint8_t> want;
+  {
+    auto m = MiniMaxH3TextEncoder::load(nv, mc, &sess, c);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    EXPECT_TRUE(!m->streams_resident_set());
+    want = bytes_of(m->encode_ids(ids, &err));
+  }
+  ASSERT_TRUE(!want.empty());
+  (void)mc->memory_budget_settled();
+
+  MiniMaxH3TextEncoder::Config s = c;
+  s.lm.stream_layers = true;
+  s.lm.stream_decode = true;
+  s.lm.pin_frac = 0.5;
+  auto m = MiniMaxH3TextEncoder::load(nv, mc, &sess, s);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->streams_resident_set());
+  EXPECT_TRUE(m->pinned_layers() == 0);
+  auto wts = MetalLlamaWeights::open_model(nv);
+  ASSERT_TRUE(wts.has_value());
+  if (!wts.has_value()) { return; }
+  const std::string stem = c.lm.weight_prefix + c.lm.model_seg + "layers.";
+  const MetalQwenModel::RawSizes rs =
+      MetalQwenModel::raw_sizes(*wts, stem, c.lm.n_layers, 0);
+  EXPECT_TRUE(rs.nv && rs.n_layers == c.lm.n_layers);
+  // The final norm where the file has one (this repack, pruned to the
+  // tap, does not).
+  const std::size_t final_norm =
+      wts->info(c.lm.weight_prefix + c.lm.model_seg + "norm.weight") !=
+              nullptr
+          ? (std::size_t)c.lm.hidden * 2
+          : 0;
+
+  // 1. Growth off: every layer streamed, the floor's slot pair held.
+  const auto g1 = bytes_of(m->encode_ids(ids, &err));
+  EXPECT_TRUE(same(g1, want));
+  EXPECT_TRUE(m->resident_layer_count() == 0);
+  const std::size_t held0 = (std::size_t)m->resident_bytes();
+  EXPECT_TRUE(held0 == 2 * rs.slot + final_norm);
+  // The floor's trunk: the int8 token table at bf16, the rest as stored.
+  const std::size_t floor = MiniMaxH3TextEncoder::streaming_floor_bytes(nv);
+  std::size_t stored = 0, table = 0, table_n = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (genai::stream_sizing_alias(nm) || nm.rfind(stem, 0) == 0) {
+      continue;
+    }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    stored += (std::size_t)ti->nbytes;
+    if (ti->dtype == "I8") {
+      table = (std::size_t)ti->nbytes;
+      table_n = 1;
+      for (auto d : ti->shape) { table_n *= (std::size_t)d; }
+    }
+  }
+  const std::size_t trunk = floor - 2 * rs.slot;
+  EXPECT_TRUE(table > 0 && trunk == stored - table + 2 * table_n);
+  // 2. Growth on, then the prompt again against what was kept.
+  m->set_residency_reserve(test_residency_reserve(1ull << 30));
+  m->set_residency_schedule(4);
+  const auto g2 = bytes_of(m->encode_ids(ids, &err));
+  const auto g3 = bytes_of(m->encode_ids(ids, &err));
+  EXPECT_TRUE(same(g2, want) && same(g3, want));
+  const int kept = m->resident_layer_count();
+  EXPECT_TRUE(kept > 0);
+  // 3. The slots given back where every layer is kept.
+  m->release_idle_slots();
+  const auto g4 = bytes_of(m->encode_ids(ids, &err));
+  EXPECT_TRUE(same(g4, want));
+  const std::size_t held = (std::size_t)m->resident_bytes();
+  const bool all = kept == c.lm.n_layers;
+  EXPECT_TRUE(held == (std::size_t)kept * rs.layer + final_norm +
+                          (all ? 0 : 2 * rs.slot));
+  // The whole, as dir_weights_bytes books it: the trunk and every layer.
+  std::size_t raw = 0;
+  const std::size_t whole = MetalQwenModel::nvfp4_held_bytes(*wts, &raw);
+  EXPECT_TRUE(whole == trunk + (std::size_t)c.lm.n_layers * rs.layer);
+  std::error_code ec;
+  const std::size_t file = (std::size_t)fs::file_size(nv, ec);
+  EXPECT_TRUE(model_memory::dir_weights_bytes(nv) == file + whole - raw);
+  std::printf("[minimax_h3_text_enc] NVFP4 streamed: floor %zu MB (trunk "
+              "%zu, the int8 table at bf16 %zu; slot pair %zu), held at it "
+              "%zu MB; %d of %d layers kept (%zu MB a layer), held %zu MB; "
+              "booked whole %zu MB (file %zu); the tap byte-identical to "
+              "resident: %d %d %d %d\n",
+              floor >> 20, trunk >> 20, (2 * table_n) >> 20,
+              (2 * rs.slot) >> 20, held0 >> 20, kept, c.lm.n_layers,
+              rs.layer >> 20, held >> 20,
+              model_memory::dir_weights_bytes(nv) >> 20, file >> 20,
+              (int)same(g1, want), (int)same(g2, want), (int)same(g3, want),
+              (int)same(g4, want));
 }

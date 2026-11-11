@@ -6,6 +6,7 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
 #include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/mma-tile.h"
@@ -206,8 +207,12 @@ finish_config_(MetalMiniMaxH3VideoVae::Config& out, std::string* err)
     return fail("only dim_head 64 is supported (the steel flash-attention "
                 "entry point this decoder runs on is bd64)");
   }
-  if (out.rope_dim() % 6 != 0) {
-    return fail("int(dim_head * rope_dim_ratio) must be divisible by 6");
+  if (out.rope_axes != 2 && out.rope_axes != 3) {
+    return fail("the decoder's rotary axes must be 2 or 3");
+  }
+  if (out.rope_dim() % (2 * out.rope_axes) != 0) {
+    return fail("int(dim_head * rope_dim_ratio) must be divisible by " +
+                std::to_string(2 * out.rope_axes));
   }
   // Tile size, overridable for MEASUREMENT. The checkpoint's 256 is the
   // reference's number, and the cost it buys is not obvious: at 960x544
@@ -267,7 +272,117 @@ video_vae_dir_(const std::string& dir)
 {
   return minimax_h3::is_diffusers_vae_dir(
              dir, minimax_h3::kDiffusersVideoVaeClass) ||
-         minimax_h3::is_diffusers_vae_dir(dir, ph3::kVaeClass);
+         minimax_h3::is_diffusers_vae_dir(dir, ph3::kVaeClass) ||
+         minimax_h3::is_diffusers_vae_dir(dir, h3i::kVaeClass);
+}
+
+// MiniMax-H3-Image's VAE (`MiniMaxH3ImageVAE`, the repository's `vae/`):
+// ONE flat config -- the wrapper's tiling and whitening beside the
+// decoder's `vit_decoder_kwargs` -- over weights under the RELEASED
+// names (`diffusion_pytorch_model.safetensors`; nothing to rename). The
+// encoder is H3's, its geometry unstated and the defaults; the decoder
+// is a 2D ViT (`vit_decoder_2d`): one latent frame into one picture,
+// rotary over (h, w) alone.
+bool
+image_vae_config_(const std::string& dir, MetalMiniMaxH3VideoVae::Config& out,
+                  std::string* err)
+{
+  namespace fs = std::filesystem;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const fs::path p = fs::path(dir) / "config.json";
+  FlexData cfg;
+  {
+    std::ifstream f(p);
+    if (!f) { return fail("cannot open " + p.string()); }
+    try {
+      cfg = FlexData::from_json(f);
+    } catch (...) {
+      return fail("cannot parse " + p.string());
+    }
+  }
+  if (!cfg.is_object()) { return fail(p.string() + " is not a JSON object"); }
+  auto o = cfg.as_object();
+  auto gi = [&](const char* k, int d) {
+    return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+  };
+  out.z_channels = gi("latent_channels", out.z_channels);
+  out.clip_length = gi("vae_clip_length", out.clip_length);
+  out.token_drop = gi("vae_token_drop", out.token_drop);
+  out.tile_size = gi("vae_tile_size", out.tile_size);
+  out.tile_overlap_min = gi("vae_tile_overlap_min", out.tile_overlap_min);
+  if (gi("vae_decoder_tiling", 1) != 1 || gi("vae_encoder_tiling", 1) != 1) {
+    return fail(p.string() + ": untiled coding is not how this VAE was "
+                "released (vae_*_tiling 0)");
+  }
+  const bool two_d =
+      o.contains("vit_decoder_2d") && o.at("vit_decoder_2d").as_bool(false);
+  if (!two_d) {
+    return fail(p.string() + ": not a 2D ViT decoder (vit_decoder_2d)");
+  }
+  if (!o.contains("vit_decoder_kwargs") ||
+      !o.at("vit_decoder_kwargs").is_object()) {
+    return fail(p.string() + ": no vit_decoder_kwargs");
+  }
+  {
+    const FlexData v = o.at("vit_decoder_kwargs");   // a VIEW: bind it
+    auto vo = v.as_object();
+    auto vi = [&](const char* k, int d) {
+      return vo.contains(k) ? (int)vo.at(k).as_int(d) : d;
+    };
+    auto vs = [&](const char* k, const char* d) {
+      if (!vo.contains(k)) { return std::string(d); }
+      const FlexData x = vo.at(k);
+      return std::string(x.as_string(d));
+    };
+    out.n_layers = vi("num_layers", 24);
+    out.n_heads  = vi("heads", 16);
+    out.head_dim = vi("dim_head", 64);
+    if (vo.contains("rope_theta")) {
+      out.rope_theta = vo.at("rope_theta").as_real(100.0);
+    }
+    out.rope_dim_ratio = vo.contains("rope_dim_ratio")
+                             ? vo.at("rope_dim_ratio").as_real(0.5)
+                             : 0.5;
+    if (vo.contains("ffn_use_gated") &&
+        !vo.at("ffn_use_gated").as_bool(true)) {
+      return fail("ffn_use_gated is false: this decoder's feed-forward is "
+                  "not the gated one implemented here");
+    }
+    if (vs("ffn_activation_fn", "silu") != "silu") {
+      return fail("ffn_activation_fn is not silu");
+    }
+    if (vs("norm_type", "rms_norm") != "rms_norm" ||
+        vs("qk_norm_type", "rms_norm") != "rms_norm") {
+      return fail("the decoder's norms are not RMS norms");
+    }
+    if (vo.contains("qk_norm_affine") &&
+        vo.at("qk_norm_affine").as_bool(false)) {
+      return fail("qk_norm_affine is true: this decoder's q/k norms have "
+                  "no affine");
+    }
+  }
+  auto reals = [&](const char* k, std::vector<float>& dst) {
+    if (!o.contains(k)) { return; }
+    FlexData v = o.at(k);
+    if (!v.is_array()) { return; }
+    auto a = v.as_array();
+    std::vector<float> got;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      got.push_back((float)a.at(i).as_real(0.0));
+    }
+    if ((int)got.size() == out.z_channels) { dst = std::move(got); }
+  };
+  reals("latents_mean", out.latents_mean);
+  reals("latents_std", out.latents_std);
+  // One latent frame into one picture, its (h, w) the only rotary axes.
+  out.rope_axes       = 2;
+  out.dec_patch_t     = 1;
+  out.t1_direct       = true;
+  out.t1_output_slice = 0;
+  return true;
 }
 
 bool
@@ -465,6 +580,10 @@ MetalMiniMaxH3VideoVae::config_from_json(const std::string& vae_dir,
     return false;
   };
   fs::path p(resolve_vae_dir(vae_dir));
+  if (minimax_h3::is_diffusers_vae_dir(p.string(), h3i::kVaeClass)) {
+    return image_vae_config_(p.string(), out, err) &&
+           finish_config_(out, err);
+  }
   if (video_vae_dir_(p.string())) {
     return diffusers_config_(p.string(), out, err) &&
            finish_config_(out, err);
@@ -1040,7 +1159,7 @@ MetalMiniMaxH3VideoVae::decode_working_bytes(const Config& c, int LT, int lh,
       (std::size_t)span * (widest / ((std::size_t)c.patch * c.patch));
   const std::size_t R = voxels + (std::size_t)c.n_register + 1;
   const std::size_t D = (std::size_t)c.dim, F = (std::size_t)c.ffn_inner;
-  b += R * (std::size_t)(3 * c.rope_freqs()) * sizeof(float) * 2;
+  b += R * (std::size_t)c.rope_half() * sizeof(float) * 2;
   b += R * D * 2 * 7;
   b += R * std::max(3 * D, F) * 2 + R * 2 * F * 2;
   b += R * (std::size_t)c.patch_elems() * 2 + voxels * ZC * 2;
@@ -1096,7 +1215,7 @@ MetalMiniMaxH3VideoVae::still_decode_bytes(const Config& c, int lh, int lw)
   const std::size_t voxels = LT * (widest / (P * P));
   const std::size_t R = voxels + (std::size_t)c.n_register + 1;
   const std::size_t D = (std::size_t)c.dim, F = (std::size_t)c.ffn_inner;
-  b += R * (std::size_t)(3 * c.rope_freqs()) * sizeof(float) * 2;
+  b += R * (std::size_t)c.rope_half() * sizeof(float) * 2;
   b += R * D * 2 * 7;
   b += R * std::max(3 * D, F) * 2 + R * 2 * F * 2;
   b += R * (std::size_t)c.patch_elems() * 2 + voxels * ZC * 2;
@@ -1490,7 +1609,10 @@ MetalMiniMaxH3VideoVae::build_rope_(int T, int h, int w, SharedBuffer& cos_out,
   // position: the same voxel decoded inside a different tile size sees
   // different angles.
   const int F = _cfg.rope_freqs();
-  const int half = 3 * F;
+  // (t, h, w) -- or (h, w) alone on the 2D decoder (Config::rope_axes),
+  // whose frequencies are the same steps over its narrower rotary width.
+  const int axes = _cfg.rope_axes;
+  const int half = axes * F;
   const int voxels = T * h * w;
   const int rows = voxels + _cfg.n_register + 1;
   auto* cb = static_cast<float*>(cos_out.contents());
@@ -1498,10 +1620,10 @@ MetalMiniMaxH3VideoVae::build_rope_(int T, int h, int w, SharedBuffer& cos_out,
   std::vector<double> inv((std::size_t)F);
   for (int i = 0; i < F; ++i) {
     // 1 / theta^arange(0, 1, 2*num_axes/rope_dim): the exponent grid is
-    // built by STEP, not by count, so it is i * (6 / rope_dim).
+    // built by STEP, not by count, so it is i * (2 * axes / rope_dim).
     inv[(std::size_t)i] =
         1.0 / std::pow(_cfg.rope_theta,
-                       (double)i * 6.0 / (double)_cfg.rope_dim());
+                       (double)i * (2.0 * axes) / (double)_cfg.rope_dim());
   }
   // Diagnostic only: neutralize the rope (cos 1, sin 0) so a mismatch
   // can be attributed to the rope or to the rest of the block.
@@ -1511,6 +1633,8 @@ MetalMiniMaxH3VideoVae::build_rope_(int T, int h, int w, SharedBuffer& cos_out,
   // chunk's first token) puts every voxel there; normalized over one
   // frame it would sit at 0, a place that decoder never trained at.
   const bool pinned = T == 1 && !std::isnan(_cfg.t1_time);
+  // The 2D decoder's axes are the last two of (t, h, w).
+  const int a0 = 3 - axes;
   for (int r = 0; r < rows; ++r) {
     double coord[3] = {0.0, 0.0, 0.0};
     if (r < voxels) {
@@ -1522,10 +1646,10 @@ MetalMiniMaxH3VideoVae::build_rope_(int T, int h, int w, SharedBuffer& cos_out,
     }
     // The register tokens and the trailing zero token all sit at
     // position 0, which is what `coord` already is.
-    for (int a = 0; a < 3; ++a) {
+    for (int a = 0; a < axes; ++a) {
       for (int i = 0; i < F; ++i) {
         const double ang =
-            2.0 * M_PI * coord[a] * inv[(std::size_t)i];
+            2.0 * M_PI * coord[a0 + a] * inv[(std::size_t)i];
         const std::size_t o = (std::size_t)r * half + (std::size_t)(a * F + i);
         cb[o] = no_rope ? 1.0f : (float)std::cos(ang);
         sb[o] = no_rope ? 0.0f : (float)std::sin(ang);
@@ -1543,7 +1667,7 @@ MetalMiniMaxH3VideoVae::ensure_scratch_(int rows, int voxels)
   auto mk = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
   Scratch s;
   s.rows = rows;
-  const std::size_t half = (std::size_t)(3 * c.rope_freqs());
+  const std::size_t half = (std::size_t)c.rope_half();
   s.rcos = _mc->make_shared_buffer(R * half * sizeof(float));
   s.rsin = _mc->make_shared_buffer(R * half * sizeof(float));
   s.x   = mk(R * D);
