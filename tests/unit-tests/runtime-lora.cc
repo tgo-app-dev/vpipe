@@ -979,8 +979,10 @@ TEST(runtime_lora, applier_computes_x_a_b_on_the_gpu)
     return b;
   };
   // Small, exactly-representable values: bf16 has 8 mantissa bits, so
-  // the reference and the GPU agree to the bit on these and the test
-  // needs no tolerance argument.
+  // the inputs are exact, and so is t at a power-of-two strength. What
+  // separates the GPU from the reference is then y's bf16 store, and t's
+  // where the strength rounds (-0.8 below): 0.4% at worst, well inside
+  // the 1% bar.
   auto seq = [](std::size_t n, float step) {
     std::vector<float> v(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1025,34 +1027,78 @@ TEST(runtime_lora, applier_computes_x_a_b_on_the_gpu)
     std::memcpy(&o, &u, 4);
     return o;
   };
-  int wrong = 0;
-  double worst = 0.0;
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
-      double acc = 0.0;
-      for (int r = 0; r < R; ++r) {
-        double t = 0.0;
-        for (int k = 0; k < K; ++k) {
-          t += (double)rd(x, (std::size_t)m * K + k) *
-               (double)rd(f.a, (std::size_t)r * K + k);
+  // The cells of `out` that are not y + s (x A^T) B^T.
+  auto wrong_cells = [&](const metal_compute::SharedBuffer& out, float s) {
+    int wrong = 0;
+    double worst = 0.0;
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (int r = 0; r < R; ++r) {
+          double t = 0.0;
+          for (int k = 0; k < K; ++k) {
+            t += (double)rd(x, (std::size_t)m * K + k) *
+                 (double)rd(f.a, (std::size_t)r * K + k);
+          }
+          acc += t * (double)rd(f.b, (std::size_t)n * R + r);
         }
-        acc += t * (double)rd(f.b, (std::size_t)n * R + r);
+        const double want =
+            (double)yv[(std::size_t)m * N + n] + (double)s * acc;
+        const double got = rd(out, (std::size_t)m * N + n);
+        const double rel =
+            std::fabs(got - want) / std::max(1e-6, std::fabs(want));
+        worst = std::max(worst, rel);
+        if (rel > 1e-2) { ++wrong; }
       }
-      const double want =
-          (double)rd(y, 0) * 0.0 + (double)yv[(std::size_t)m * N + n]
-          + (double)scale * acc;
-      const double got = rd(y, (std::size_t)m * N + n);
-      const double rel =
-          std::fabs(got - want) / std::max(1e-6, std::fabs(want));
-      worst = std::max(worst, rel);
-      if (rel > 1e-2) { ++wrong; }
     }
+    if (wrong != 0) {
+      std::printf("[runtime_lora] applier at %.2f: %d of %d cells wrong, "
+                  "worst rel %.4f\n", s, wrong, M * N, worst);
+    }
+    return wrong;
+  };
+  EXPECT_TRUE(wrong_cells(y, scale) == 0);
+
+  // A NEGATIVE strength subtracts the adapter -- a slider LoRA turned the
+  // other way, a style taken out. Nothing may read the strength as a
+  // magnitude: it rides t, sign and all.
+  //
+  // And not a power of two: at +-0.5 the scaled tile's multiply below is
+  // exact, so its rounding never ran. At -0.8 every one of t's 15 values
+  // rounds there; the worst cell is then 0.33% from the reference, on
+  // either route (the smallest |want| 12.4), against the 1% bar.
+  const float neg = -0.8f;
+  metal_compute::SharedBuffer yn = buf(yv);
+  {
+    metal_compute::CommandStream st = mc->make_command_stream();
+    metal_compute::ComputeEncoder enc = st.begin_compute();
+    ap.apply(enc, x, 0, f, yn, 0, M, N, K, neg, /*mma_min_m=*/1 << 30);
+    enc.end();
+    std::string gerr;
+    ASSERT_TRUE(st.commit().wait_ok(&gerr));
   }
-  if (wrong != 0) {
-    std::printf("[runtime_lora] applier: %d of %d cells wrong, "
-                "worst rel %.4f\n", wrong, M * N, worst);
+  EXPECT_TRUE(wrong_cells(yn, neg) == 0);
+  // And on the matrix cores, where the FIRST GEMM's tile carries it.
+  // ENGAGEMENT FIRST: a tile that does not resolve sends apply() down
+  // the steel pair without a word, and this arm would then pass having
+  // run steel twice. At M = 5 >= mma_min_m and rank 3 <= 64, the tile
+  // route_a_ takes is the 64-wide scaled one.
+  if (mc->supports_matrix_cores()) {
+    metal_compute::ComputeLibrary lmma =
+        mc->load_library("dense_gemm_mma_bf16");
+    ASSERT_TRUE(lmma.function("dense_gemm_mma_t_scaled_f16").valid());
+    genai::lora::Applier mma;
+    ASSERT_TRUE(mma.init(mc, /*allow_mma=*/true));
+    ASSERT_TRUE(mma.ensure_scratch((std::size_t)M * R));
+    metal_compute::SharedBuffer ym = buf(yv);
+    metal_compute::CommandStream st = mc->make_command_stream();
+    metal_compute::ComputeEncoder enc = st.begin_compute();
+    mma.apply(enc, x, 0, f, ym, 0, M, N, K, neg, /*mma_min_m=*/1);
+    enc.end();
+    std::string gerr;
+    ASSERT_TRUE(st.commit().wait_ok(&gerr));
+    EXPECT_TRUE(wrong_cells(ym, neg) == 0);
   }
-  EXPECT_TRUE(wrong == 0);
 
   // Scale 0 must be EXACTLY off -- not a pair of roundings that cancel.
   metal_compute::SharedBuffer y2 = buf(yv);

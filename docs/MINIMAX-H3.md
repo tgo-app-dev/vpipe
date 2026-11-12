@@ -249,6 +249,9 @@ you want to see the model work before spending the hours and the 115 GB.
   text-to-image and editing with up to 16 pictures, about 16 megapixels at
   any aspect, in six steps (see
   [Pictures](#pictures--minimax-h3-image)).
+  **[`minimax-h3-image-text-to-image-fast-m5.vpipeline`](pipelines/minimax-h3-image-text-to-image-fast-m5.vpipeline)**
+  is the same picture with the DiT's projections in int8 on an M5's
+  matrix cores.
 - **[`prepare-p-h3-image.vpipeline`](pipelines/prepare-p-h3-image.vpipeline)**
   / **[`p-h3-image-text-to-image.vpipeline`](pipelines/p-h3-image-text-to-image.vpipeline)**,
   **[`p-h3-image-edit.vpipeline`](pipelines/p-h3-image-edit.vpipeline)**
@@ -3468,7 +3471,15 @@ Then:
   `height` (the shipped graph: 4736 × 3552, 4:3 at 16 MP). The model reads
   the prompt **as written** (at most 4096 tokens) and was trained on long,
   complete descriptions of the whole picture; MiniMax's own pipeline
-  rewrites a short request into one first (MiniMax-H3-Image-PE, not ported).
+  rewrites a short request into one first, with MiniMax-H3-Image-PE (no
+  graph here runs it yet).
+- [`minimax-h3-image-text-to-image-fast-m5.vpipeline`](pipelines/minimax-h3-image-text-to-image-fast-m5.vpipeline)
+  — the same request, size and seed on an **M5**: generate-video's
+  `i8_gemm` at tier `token`, so the DiT's block projections run in int8 on
+  the matrix cores (lossy: compare its picture with the plain graph's by
+  eye). The text encoder and the VAE run as in the plain graph; neither has
+  an int8 route. On an M1–M4 there are no matrix cores, the tier stays
+  off and the graph is the plain one.
 - [`minimax-h3-image-edit.vpipeline`](pipelines/minimax-h3-image-edit.vpipeline)
   — the pictures on video-ref-encoder's reference ports, in order
   `<Picture 1>`, `<Picture 2>`, … in the prompt; the size of the RESULT on
@@ -3512,8 +3523,24 @@ hides under it), no lossy tier:
 Peak footprint 43–44 GB: the DiT is kept whole (37 GB once its AdaLN
 projections are baked for the six steps). The prompt's conditioning takes
 ~20–26 s (the 32B encoder streamed), the decode 6 s at 2048² and 24 s at
-16 MP. The int8, Sol, Sage and Neural Engine tiers are H3's own code paths
-and take this DiT's settings, but none has been run on it yet.
+16 MP.
+
+The box's tiers are H3's own code paths and take this DiT's settings.
+MEASURED on an M5 Pro (24 GB, a 12 GB wired pool, the blocks streamed), a
+1024 × 1024 request (generated at 2048 × 2048), the six steps' denoise:
+
+| tiers | denoise |
+|---|---:|
+| none (bf16) | 55.8 s |
+| `i8_gemm` `accurate` + `sage_attn` | 44.8 s |
+| `i8_gemm` `fast` | 43.8 s |
+| `i8_gemm` `token` (the `-fast-m5` graph) | 32.9 s |
+| `i8_gemm` `token` + `sage_attn` with int8 P·V | 32.6 s |
+
+So `token` is 1.7× and Sage adds nothing measurable beside it. Leave two
+tiers off on this model: Sol-Attn (`sol_attn`) duplicated objects in the
+picture, and on that M5 Pro the Neural Engine's feed-forward (`ane_ffn`)
+fell back to the GPU after its 11.7 s build.
 
 The edit's picture is encoded in ~21 s (vision tower 1.2 s, VAE 4.9 s, the
 32B encoder over its 1,757-token presentation 14.8 s); its 1,024 rows ride
