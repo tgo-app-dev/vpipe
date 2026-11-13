@@ -16,6 +16,8 @@
 #include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "generative-models/shared/dit-flops.h"
+#include "generative-models/shared/tp-overlap.h"
+#include "generative-models/tensor-parallel.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -265,6 +267,18 @@ class MetalMiniMaxH3Transformer {
     // ...unrotated: the GPU token_plain tier's arithmetic (generate-video's
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool  ane_int8_plain = false;
+
+    // TENSOR PARALLEL (generative-models/tensor-parallel.h): this rank's
+    // share of the heads and the feed-forward rows. Given to load() with
+    // n_heads and ffn the CHECKPOINT's; the model keeps them as the
+    // share's -- a rank is a narrower H3, every GEMM, scratch and kernel
+    // sized by its share -- and adds the other ranks' partials after the
+    // out projection and fc2 of every block -- a long sequence's in row
+    // bands, each band's exchanges under the GPU work of the bands beside
+    // it (band_rows, TpOverlap) -- through the channel a generation is
+    // given (begin_tp_generation). Preloaded blocks only, dense or affine
+    // weights, no ANE, VDN, TaoMate or adapter: load() refuses the rest.
+    TpShare tp;
 
     int inner() const { return n_heads * head_dim; }        // 7168
     int video_patch_elems() const
@@ -1062,6 +1076,11 @@ class MetalMiniMaxH3Transformer {
   // so this answers with the WORST case, and a caller may subtract
   // adaln_retired_bytes() only when it is true.
   static bool adaln_bake_certain(const Config& cfg, int max_rows);
+  // ...and what its tables hold for that many rows: every block's
+  // [rows, adaln_out] and the final layer's [rows, 2 * hidden], bf16 --
+  // what a model that holds no AdaLN (a rank of a split DiT) holds for it
+  // once baked.
+  static std::size_t adaln_table_bytes_for(const Config& cfg, int max_rows);
   // What the tables cost, for the memory report. 0 when not baked.
   std::size_t adaln_table_bytes() const;
 
@@ -1153,7 +1172,49 @@ class MetalMiniMaxH3Transformer {
   // image DiTs do; an empty function disables the check.
   void set_stream_stop(std::function<bool()> stop)
   {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
+  }
+
+  // A RANK'S LINK FOR ONE GENERATION (Config::tp; tensor-parallel.h,
+  // TpChannel): the channel a stage opened for this clip, a worker of its
+  // own over it, and the exchange count from 0. Each clip begins afresh
+  // on every rank, whatever its last one did -- a forward that stopped
+  // part way abandons what it posted and fails its worker, and a peer
+  // that let go of its share between clips reopened a channel at 0 --
+  // so neither the weights' lifetime, which each host decides by its
+  // own memory, nor a stop can leave the ranks out of step. A forward on
+  // a rank with no generation open fails. False, with `err`, when this
+  // is not a rank or the worker could not start. One already open is
+  // ended first.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  // ...and its end, on every way out (a stage's guard): anything still
+  // posted abandoned -- the channel first given a stop that is always
+  // true, so an exchange waiting on a peer returns -- the worker joined,
+  // every exchange buffer forgotten, the channel's stop cleared and the
+  // channel let go. Nothing when none is open.
+  void end_tp_generation();
+  bool tp_generation_open() const { return _tp_pipe != nullptr; }
+
+  // The model a RANK of a split DiT is (Config::tp): `c`'s heads and
+  // feed-forward rows narrowed to the share's, as load() narrows its own
+  // -- what a stage sizes a rank's scratch by, since its Config keeps the
+  // checkpoint's widths. `c` itself when not split.
+  static Config rank_config(const Config& c)
+  {
+    Config r = c;
+    if (c.tp.active()) {
+      r.n_heads = c.tp.heads();
+      r.ffn = c.tp.ffn();
+    }
+    return r;
   }
 
   // Bytes of per-forward SCRATCH this geometry needs, BEFORE anything is
@@ -1214,9 +1275,14 @@ class MetalMiniMaxH3Transformer {
   // sequence: under 2 bands' worth, and wherever a path needs the whole
   // sequence's buffers -- the ANE tiers (and, at the forward, streaming
   // attention, VDN's branch, the in-place q/k/v layout).
-  // VPIPE_H3_BAND_ROWS=<rows> sets the band (0: never).
+  // VPIPE_H3_BAND_ROWS=<rows> sets the band (0: never). A RANK of a
+  // split DiT (Config::tp) bands for its exchanges, not its memory: a
+  // band at most an eighth of the sequence (VPIPE_H3_TP_BANDS=<n>: n),
+  // 1,024 rows at least, by seq alone -- every rank must cut the same
+  // bands, so nothing measured on its own host goes in.
   static int band_rows(const Config& c, int seq);
   static constexpr int kBandRows = 8192;
+  static constexpr int kTpMinBand = 1024;
   // The band the last forward ran its main blocks in (0: whole).
   int last_band_rows() const { return _last_band; }
   // ...and the one this model's forward takes at `seq` (band_rows under
@@ -2040,6 +2106,35 @@ class MetalMiniMaxH3Transformer {
   std::shared_ptr<WeightSet> _step_ws;
 
   int _quant_bits = 0;
+  // Tensor parallel: a whole block's partial, copied out of the scratch
+  // (which is not an exchange buffer: ensure_scratch_ replaces it), and
+  // the other ranks' sum of it, [rows, H] bf16 each, grown to the longest
+  // -- the text refiner's rows, or a sequence too short to band; and the
+  // generation's exchange count, the same on every rank (TpChannel::
+  // exchange's `seq`). Every buffer handed to the channel is grown by
+  // tp_buffer_; kept across generations, handed to each new channel.
+  metal_compute::SharedBuffer _tp_send;
+  metal_compute::SharedBuffer _tp_others;
+  std::uint64_t _tp_seq = 0;
+  // ...and the banded block's, overlapped: the generation's channel, the
+  // worker that carries a band's partial over it while the GPU works on
+  // (both made by begin_tp_generation, let go by end_tp_generation), and
+  // the partials and sums in flight, [band, H] each -- two bands' out
+  // projections ([0], [1]) and two bands' fc2s ([2], [3]), a band's
+  // pair alive from its projection to its residual.
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  metal_compute::SharedBuffer _tp_part[4];
+  metal_compute::SharedBuffer _tp_recv[4];
+  // A share of one of a block's projections, cut from the checkpoint's
+  // whole one (load_block_ under Config::tp).
+  enum class TpCut { kQkv, kOut, kFc1, kFc2 };
+  Linear tp_linear_(WeightSet& ws, const std::string& nm, TpCut cut,
+                    std::string* err);
+  // An EXCHANGE BUFFER at least `bytes` long: one too short is forgotten
+  // by the channel (TpChannel::forget) before it is replaced. False when
+  // there is no room.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
   int _quant_group = 64;
 
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_rope,

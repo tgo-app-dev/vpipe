@@ -438,6 +438,8 @@ private:
   // reads it is not known until the checkpoint resolves, and a config
   // beat can arrive before the model does.
   FlexData _model_cfg;
+  // `tensor_parallel` as configured (null: not split).
+  FlexData _tp_cfg;
   // The same beat as delivered BEFORE launch (apply_constant), held until
   // reset_run_state() puts it back: the runtime resets a stage after it
   // has delivered its constants.
@@ -685,6 +687,11 @@ private:
   // The idle-unload decision, made after the load so it can use the
   // streaming verdict. See the note on its definition.
   void resolve_unload_policy_h3_(bool tight);
+  // A RANK of a split DiT (`tensor_parallel`): the channel for ONE
+  // generation, from the transport the config names (tensor-parallel.h:
+  // opened as a clip's denoise starts, let go when it ends). Null, with
+  // `err`, when there is no such transport or it refuses (or throws).
+  std::shared_ptr<genai::TpChannel> open_tp_channel_(std::string* err);
   // `L` and the PATCH grid are here because the VDN branch's scratch is
   // sized by the video geometry rather than by the packed sequence, and
   // it is the half of the forward's memory that used to go unplanned.

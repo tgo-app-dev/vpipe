@@ -105,6 +105,11 @@
 //                      and labels of the sources model-fetch reads from,
 //                      a mirror's renames and absences -- a family's rows
 //                      added by register_mirror_repos
+//   tensor-parallel    generative-models/tensor-parallel.h installed,
+//                      WEAK imports in a plugin (tp_transports_available()):
+//                      register_tp_transport, a plugin's transport carrying
+//                      a split DiT's partial sums between ranks (generate-
+//                      video's `tensor_parallel`)
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
@@ -112,6 +117,7 @@
 #define VPIPE_FEATURE_ANE_ADAPTERS      "ane-adapters/1"
 #define VPIPE_FEATURE_KERNEL_TUNING     "kernel-tuning/1"
 #define VPIPE_FEATURE_MODEL_SOURCES     "model-sources/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL   "tensor-parallel/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

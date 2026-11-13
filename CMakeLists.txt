@@ -696,6 +696,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/quantize-profile.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/image-model-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-model-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tensor-parallel.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/hidden-state-encoder.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/weight-set.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/quantize-family-registry.h

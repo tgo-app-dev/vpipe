@@ -145,6 +145,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-compute-saxpy.cc
         metal-compute-shared-buffer.cc
         metal-compute-stream.cc
+        tensor-parallel.cc
         metal-compute-tensor-beat-bridge.cc
         metal-compute-texture.cc
         audio-transcribe-stage.cc

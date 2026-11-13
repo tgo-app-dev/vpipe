@@ -434,6 +434,12 @@ denoise(const DenoiseRequest& req, std::string* err)
       sess->log_normal(fmt("denoise: AdaLN not baked ({}); running the "
                            "projections per step", berr));
     }
+    // A rank of a split DiT holds no AdaLN projection (load() leaves it
+    // in the checkpoint): its modulation is the bake's or nothing.
+    if (!baked && req.dit->config().tp.active()) {
+      return fail("denoise: a rank of a split DiT needs the AdaLN bake ("
+                  + berr + ")");
+    }
   }
 
   // MotionCache: a step whose forward a cached residual predicts well
@@ -442,8 +448,18 @@ denoise(const DenoiseRequest& req, std::string* err)
   // reference's sampler carries, the audio being mapped onto it -- and
   // the estimator reads the generated rows only, through gathers that
   // undo this loop's patch packing.
-  const motion_cache::Config mcfg =
-      motion_cache::config_from_flex(req.accel);
+  motion_cache::Config mcfg = motion_cache::config_from_flex(req.accel);
+  // Not on a rank of a split DiT: whether a step's forward is skipped is
+  // judged from this rank's own sums, which differ from the others' by
+  // rounding -- one rank skipping a forward its peer runs would leave
+  // the two out of step at their next exchange.
+  if (mcfg.enabled && req.dit->config().tp.active()) {
+    mcfg.enabled = false;
+    if (sess != nullptr) {
+      sess->info(fmt("h3-denoise: MotionCache off on a rank of a split "
+                     "DiT"));
+    }
+  }
   // Sage's int8 P*V from this step on (sage::Config::pv8_from_step): the
   // steps before, which settle a clip's layout, keep the int8 QK alone.
   // Unsaid, the first quarter of the steps.

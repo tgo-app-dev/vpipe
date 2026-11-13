@@ -2,6 +2,7 @@
 #include "stages/generate-video-stage.h"
 #include "generative-models/shared/torch-randn.h"
 #include "generative-models/gen-input.h"
+#include "generative-models/tensor-parallel.h"
 #include "common/host-report.h"
 #include "common/beat-keys.h"
 #include "common/flex-bag.h"
@@ -35,6 +36,7 @@
 #endif
 
 #include <algorithm>
+#include <exception>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -192,6 +194,16 @@ const ConfigKey kAttrs[] = {
           "codes as stored). Taken by minimax-h3; others run accurate. "
           "Env VPIPE_I8_TIER overrides",
    .def_str = "accurate", .extra = kI8TierChoices},
+  {.key = "tensor_parallel", .type = ConfigType::Object, .required = false,
+   .doc = "this stage as one RANK of a MiniMax H3 DiT split across hosts "
+          "(generative-models/tensor-parallel.h): {rank, ranks, heads: "
+          "[first, end], ffn: [first, end] -- unsaid, an even split -- "
+          "transport: the name a plugin registered its transport under, "
+          "params: that transport's own, passed through}. The rank holds "
+          "its share of every block's projections, preloaded, and adds "
+          "the other ranks' partial sums through the transport twice a "
+          "block. Dense or affine weights; no ANE, VDN, TaoMate, adapter "
+          "or int8 tier beyond accurate"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls instead of bf16, at int8 quality. Independent of "
@@ -782,6 +794,11 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _fps    = attr_real("fps");
   _steps  = (int)attr_int("steps");
   _i8_gemm = attr_bool("i8_gemm");
+  _tp_cfg = {};
+  if (this->config().is_object() &&
+      this->config().as_object().contains("tensor_parallel")) {
+    _tp_cfg = this->config().as_object().at("tensor_parallel");
+  }
   _sage.enabled      = attr_bool("sage_attn");
   _sage.dense_layers = (int)attr_int("sage_dense_layers");
   _sage.pv8          = attr_bool("sage_pv8");
@@ -1541,6 +1558,55 @@ GenerateVideoStage::h3_ane_bytes_() const
                                                              h3_plan_seq_());
 }
 
+namespace {
+
+// What a RANK of a split H3 holds (`tensor_parallel`): its share of every
+// block's four projections and the trunk whole -- no AdaLN, which the
+// bake reads from the checkpoint and retires (the final layer's too) --
+// and the bake's tables for up to `bake_rows` rows in its place. 0 when
+// not split.
+//
+// The load's transient -- each projection read whole, uncached, then cut
+// (tp_linear_): fc1's 411 MB at most -- is not held: the forward's
+// scratch, booked beside this, is not allocated until the first forward,
+// after the load.
+std::size_t
+h3_tp_held_bytes_(const std::string& dit, const FlexData& tp, int bake_rows)
+{
+  using T = genai::MetalMiniMaxH3Transformer;
+  if (!tp.is_object()) { return 0; }
+  T::Config tc;
+  if (!T::config_from_json(dit, tc, nullptr)) { return 0; }
+  genai::TpShare sh;
+  if (!genai::TpShare::from_flex(tp, tc.n_heads, tc.ffn, &sh, nullptr) ||
+      !sh.active()) {
+    return 0;
+  }
+  auto wts = genai::MetalLlamaWeights::open_model(dit);
+  if (!wts) { return 0; }
+  const double hf = (double)sh.heads() / (double)sh.n_heads;
+  const double ff = (double)sh.ffn() / (double)sh.n_ffn;
+  double held = 0.0;
+  for (const std::string& nm : wts->tensor_names()) {
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    const double b = (double)ti->nbytes;
+    if (nm.find(".adaln_proj.") != std::string::npos) { continue; }
+    if (nm.find(".attn.qkv_proj.") != std::string::npos ||
+        nm.find(".attn.out_proj.") != std::string::npos) {
+      held += b * hf;
+    } else if (nm.find(".mlp.fc1.") != std::string::npos ||
+               nm.find(".mlp.fc2.") != std::string::npos) {
+      held += b * ff;
+    } else {
+      held += b;
+    }
+  }
+  return (std::size_t)held + T::adaln_table_bytes_for(tc, bake_rows);
+}
+
+}
+
 // THE DENOISE'S ACTIVATIONS, which the plan never booked: only the
 // runtime preflight (preflight_h3_scratch_) knew them, so the one ledger
 // that can refuse a graph carried weights alone through the phase where a
@@ -1567,6 +1633,18 @@ GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
   c.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
   c.sol = _sol;
   c.sage = _sage;
+  // A RANK of a split DiT (`tensor_parallel`): its share's widths, and
+  // the banding a rank takes -- every scratch below is the narrower
+  // model's, its exchange buffers counted by scratch_bytes.
+  {
+    genai::TpShare sh;
+    if (_tp_cfg.is_object() &&
+        genai::TpShare::from_flex(_tp_cfg, c.n_heads, c.ffn, &sh, nullptr) &&
+        sh.active()) {
+      c.tp = sh;
+      c = T::rank_config(c);
+    }
+  }
   const std::vector<std::string> loras = h3_plan_lora_files_();
   bool whole = !vdn_dir_().empty();
   for (const std::string& f : loras) {
@@ -1954,9 +2032,25 @@ GenerateVideoStage::declare_resources() const
   // BOTH numbers: what this DiT weighs, and the floor it can be reduced
   // to by streaming its blocks. A graph that does not fit the first and
   // does fit the second is not one to refuse -- it is one to stream.
-  std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
-      dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
-               h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier))};
+  //
+  // A RANK of a split DiT (`tensor_parallel`) is neither: it holds its
+  // share, preloaded, and never streams -- booked at that (held), its
+  // floor the same, as declare_memory() reports it. Claimed as the whole
+  // checkpoint streamable to its floor, the ledger that refuses graphs
+  // and every peer sizing against it read 66.3 GB that could shrink to a
+  // few, for a rank that holds 8.0 (11 of 56 heads) and cannot.
+  std::vector<ResourceClaim> out;
+  if (const std::size_t tp = h3_tp_held_bytes_(dit, _tp_cfg, 4 * h3_steps_());
+      tp > 0) {
+    ResourceClaim c = model_memory::weight_claim_streamable(dit, tp);
+    bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                     (std::int64_t)tp);
+    out.push_back(std::move(c));
+  } else {
+    out.push_back(model_memory::weight_claim_streamable(
+        dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
+                 h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier)));
+  }
   // THE FORWARD'S ACTIVATIONS, in the denoise phase (see
   // h3_forward_scratch_bytes_): a presence marker where the geometry is
   // not known, which the preflight then answers for.
@@ -2139,19 +2233,29 @@ GenerateVideoStage::declare_memory() const
   // is `destroy` -- so under `auto` the pooling below had an empty
   // string and did nothing, silently.
   _dit_dir_declared_ = dit;
-  // A preload holding its w4 projections' int8 layout holds that
-  // layout's growth too (0 until the load decides it; see
-  // _h3_i8_hold_growth_).
-  m.hold(dit, model_memory::dir_weights_bytes(dit) + _h3_i8_hold_growth_,
-         genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
-             h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier),
-         // `destroy` only, the same condition the phase claim carries:
-         // `auto` resolves against a figure this would itself change.
-         _unload_cfg == model_memory::UnloadPolicy::kDestroy,
-         // ...and `auto` is the RECLAIMABLE case -- held while there is
-         // room, given back under pressure, found still there or
-         // reloaded when next used.
-         _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  // A rank of a split DiT holds its share, preloaded.
+  // Its bake's rows as the plan bounds them, four a step: a rank runs no
+  // adapter, so the steps are the request's.
+  if (const std::size_t tp = h3_tp_held_bytes_(dit, _tp_cfg, 4 * h3_steps_());
+      tp > 0) {
+    m.hold(dit, tp, tp,
+           _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+           _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  } else {
+    // A preload holding its w4 projections' int8 layout holds that
+    // layout's growth too (0 until the load decides it; see
+    // _h3_i8_hold_growth_).
+    m.hold(dit, model_memory::dir_weights_bytes(dit) + _h3_i8_hold_growth_,
+           genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
+               h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier),
+           // `destroy` only, the same condition the phase claim carries:
+           // `auto` resolves against a figure this would itself change.
+           _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+           // ...and `auto` is the RECLAIMABLE case -- held while there is
+           // room, given back under pressure, found still there or
+           // reloaded when next used.
+           _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  }
   // The runtime adapters' factors, as declare_resources() books them;
   // they go with the DiT, and nothing parks them (they are not a set).
   {
@@ -2281,6 +2385,9 @@ GenerateVideoStage::reset_run_state()
   _generation = 0;
   _seed       = _seed_base;
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // A rank's link is a clip's, ended on every way out of one; nothing of
+  // a run's may reach the next (tensor-parallel.h). Kept weights stay.
+  if (_h3_dit) { _h3_dit->end_tp_generation(); }
   // The preview keys were PARSED out of the beat reset above; a relaunch
   // whose graph no longer names a preview VAE must not inherit one.
   if (_preview) {
@@ -3215,6 +3322,19 @@ GenerateVideoStage::ensure_expert_(int which)
         _h3i ? minimax_h3_image_encoder_dir(session(), _root)
              : genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
     if (enc_dir == _root || !fs::exists(enc_dir)) { enc_dir.clear(); }
+    // A RANK of a split DiT (`tensor_parallel`, checked in full below):
+    // known BEFORE the streaming question, which it is not asked -- a
+    // rank holds its share, preloaded, and the checkpoint's whole size is
+    // nothing it will hold. Decided after it, the verdict on 66 GB read
+    // "tight" on a box its share fits, and a tight box revised the
+    // declaration to the trunk (the share is the model's own buffers, not
+    // the set's) and dropped the DiT after every clip.
+    genai::TpShare tp_share;
+    const bool tp_rank =
+        _tp_cfg.is_object() &&
+        genai::TpShare::from_flex(_tp_cfg, _h3_cfg.n_heads, _h3_cfg.ffn,
+                                  &tp_share, nullptr) &&
+        tp_share.active();
     // What the AdaLN bake will retire, before anything loads.
     //
     // The bake runs moments after this and drops every adaln_proj -- 39%
@@ -3256,7 +3376,9 @@ GenerateVideoStage::ensure_expert_(int which)
         }
       }
       const int max_rows = bound_steps > 0 ? bound_steps * kRowsPerStep : 0;
-      if (genai::MetalMiniMaxH3Transformer::adaln_bake_certain(_h3_cfg,
+      // (A rank's claim already leaves its AdaLN out.)
+      if (!tp_rank &&
+          genai::MetalMiniMaxH3Transformer::adaln_bake_certain(_h3_cfg,
                                                               max_rows)) {
         dit_retires =
             genai::MetalMiniMaxH3Transformer::adaln_retired_bytes(dit_dir);
@@ -3274,6 +3396,7 @@ GenerateVideoStage::ensure_expert_(int which)
     if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    if (tp_rank) { stream_blocks = false; }   // a rank preloads its share
     // THE BOX IS TIGHT, apart from the mechanism: what only a tight box
     // wants -- dropping the DiT after each clip, revising the declaration
     // to the trunk -- keys on this. A streamed DiT on a box with room
@@ -3413,6 +3536,51 @@ GenerateVideoStage::ensure_expert_(int which)
     // exist until a beat -- and H3 already covers that where it can be
     // known: preflight_h3_scratch_ computes the real number at the first
     // beat and parks, or refuses, if the prefix turned out too generous.
+    // TENSOR PARALLEL: this stage is one RANK of a DiT split across
+    // hosts -- its share of the heads and the feed-forward rows, the
+    // other ranks' partial sums through the transport a plugin registered
+    // under the name given. A rank preloads its share (it is a share).
+    // Its CHANNEL is not opened here: the weights may outlive a clip --
+    // kept or let go by this host's own memory, kept warm into the next
+    // graph -- and the link must not. Each clip opens one
+    // (open_tp_channel_) and lets it go however it ends.
+    _h3_cfg.tp = {};
+    if (_tp_cfg.is_object()) {
+      bool tp_ok = true;
+      auto refuse = [&](const std::string& why) {
+        session()->error(fmt("GenerateVideoStage('{}'): tensor_parallel: {}",
+                             this->id(), why));
+        tp_ok = false;
+      };
+      genai::TpShare share;
+      std::string terr;
+      auto o = _tp_cfg.as_object();
+      const std::string tname =
+          o.contains("transport")
+              ? std::string(o.at("transport").as_string(""))
+              : std::string();
+      if (!genai::TpShare::from_flex(_tp_cfg, _h3_cfg.n_heads, _h3_cfg.ffn,
+                                     &share, &terr)) {
+        refuse(terr);
+      } else if (genai::find_tp_transport(tname) == nullptr) {
+        refuse(fmt("no transport named '{}' -- a plugin registers it",
+                   tname)());
+      } else if (!_vdn_dir.empty() || taomate_slot >= 0) {
+        refuse("not with VDN or TaoMate");
+      } else if (share.active()) {
+        _h3_cfg.tp = share;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): rank {} of {}: heads [{}, {}) of "
+            "{}, feed-forward rows [{}, {}) of {}, through '{}' (a channel "
+            "each clip)", this->id(), share.rank, share.ranks, share.head0,
+            share.head1, share.n_heads, share.ffn0, share.ffn1,
+            share.n_ffn, tname));
+      }
+      if (!tp_ok) {
+        _h3_dit.reset();
+        return false;
+      }
+    }
     _h3_dit = genai::MetalMiniMaxH3Transformer::load(
         genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
         stream_blocks, loras);
@@ -3796,6 +3964,42 @@ GenerateVideoStage::correct_h3_holding_()
       _h3_cfg.n_layers, h->preload >> 20, h->floor >> 20));
 }
 
+std::shared_ptr<genai::TpChannel>
+GenerateVideoStage::open_tp_channel_(std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = why; }
+    return std::shared_ptr<genai::TpChannel>();
+  };
+  if (!_h3_cfg.tp.active() || !_tp_cfg.is_object()) {
+    return fail("this stage is not a rank");
+  }
+  auto o = _tp_cfg.as_object();
+  const std::string tname = o.contains("transport")
+                                ? std::string(o.at("transport").as_string(""))
+                                : std::string();
+  genai::TpTransport* tr = genai::find_tp_transport(tname);
+  if (tr == nullptr) {
+    return fail(fmt("no transport named '{}' -- a plugin registers it",
+                    tname)());
+  }
+  const FlexData params = o.contains("params") ? o.at("params") : FlexData();
+  // The transport is a plugin's: an exception is its refusal.
+  std::string terr;
+  std::shared_ptr<genai::TpChannel> ch;
+  try {
+    ch = tr->open(params, _h3_cfg.tp, &terr);
+  } catch (const std::exception& e) {
+    ch.reset();
+    terr = std::string("it threw: ") + e.what();
+  } catch (...) {
+    ch.reset();
+    terr = "it threw";
+  }
+  if (!ch) { return fail(fmt("transport '{}': {}", tname, terr)()); }
+  return ch;
+}
+
 void
 GenerateVideoStage::resolve_unload_policy_h3_(bool tight)
 {
@@ -3891,9 +4095,12 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // Banded where the DiT will band it (its rule, at this sequence).
   const int band =
       _h3_dit && taomate_slot_() < 0 ? _h3_dit->forward_band(seq) : 0;
+  // A RANK of a split DiT at its share's widths: _h3_cfg keeps the
+  // checkpoint's (the model narrows its own copy at load).
   const std::size_t dit = genai::MetalMiniMaxH3Transformer::scratch_bytes(
-      _h3_cfg, seq, text_rows, kTimestepsUpperBound, dq, /*narrow_ff=*/false,
-      vdn_arena, band, _h3_dit ? _h3_dit->fp8_widen_bytes() : 0);
+      genai::MetalMiniMaxH3Transformer::rank_config(_h3_cfg), seq, text_rows,
+      kTimestepsUpperBound, dq, /*narrow_ff=*/false, vdn_arena, band,
+      _h3_dit ? _h3_dit->fp8_widen_bytes() : 0);
   // AND SOL'S, which is the same story again: a second allocation of
   // the same order, spent at the first routed block and therefore after
   // this. Almost all of it is lent rather than allocated -- the fused
@@ -5171,7 +5378,11 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     }
   }
   if (!ok) {
-    session()->warn(fmt("GenerateVideoStage('{}'): {}", this->id(), derr));
+    // "; skipping", as every stage that drops the beat it was given says
+    // it: the denoise's reason is what a host shows for the clip it never
+    // got (a rank whose link to its peer failed, say).
+    session()->warn(fmt("GenerateVideoStage('{}'): {}; skipping", this->id(),
+                        derr));
     return false;
   }
 
@@ -5974,6 +6185,28 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // captured past this generation -- the lambda holds a reference.
     auto stopping = [&ctx]() { return ctx.stop_requested(); };
     if (_h3_dit) { _h3_dit->set_stream_stop(stopping); }
+    // ...on EVERY way out, the early ones below included: a split DiT's
+    // channel holds the stop too, on threads of its own (tensor-
+    // parallel.h: cleared after the generation), and `ctx` is gone once
+    // this returns.
+    struct StopCleared {
+      GenerateVideoStage* st;
+      ~StopCleared()
+      {
+        if (st->_h3_dit) { st->_h3_dit->set_stream_stop({}); }
+      }
+    } stop_cleared{this};
+    // A RANK's generation (tensor-parallel.h) ends on every way out too,
+    // and BEFORE the stop is cleared (declared after it, so destroyed
+    // first): a channel still waiting on a peer then sees the stop. The
+    // ordinary way out ends it as soon as the denoise returns, below.
+    struct TpGenerationEnded {
+      GenerateVideoStage* st;
+      ~TpGenerationEnded()
+      {
+        if (st->_h3_dit) { st->_h3_dit->end_tp_generation(); }
+      }
+    } tp_generation_ended{this};
     // Previews for THIS clip, on oport2. Ended when this block is left --
     // after the latents are written on the ordinary path, so the last
     // step's preview renders while vae-decode is already working -- and
@@ -6159,6 +6392,19 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         gp = &guide;
       }
     }
+    // A RANK opens this clip's channel to the other ranks (it waits for
+    // them there, as the transport does) and a fresh exchange count: what
+    // its last clip did -- stopped part way, run on a channel since let
+    // go, on weights this host reloaded or kept -- is not carried in.
+    if (_h3_dit && _h3_cfg.tp.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_h3_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateVideoStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     const bool ok_h3 =
         tm_slot >= 0
             ? run_h3_taomate_(cond->data.data(), (int)cond->shape[0],
@@ -6166,6 +6412,9 @@ GenerateVideoStage::process(RuntimeContext& ctx)
             : run_h3_(cond->data.data(), (int)cond->shape[0], refp,
                       ref_frames, last_only, have_r2v ? &r2v : nullptr,
                       &vlat, &vshape, &alat_out, &ashape, rp, gp);
+    // The clip's link let go -- the stop still set -- before anything
+    // else: the peers learn this clip is over, and the next opens anew.
+    if (_h3_dit) { _h3_dit->end_tp_generation(); }
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
     // What the DiT held WHILE it denoised, before any drop below -- the
     // figure a peer sizes against.

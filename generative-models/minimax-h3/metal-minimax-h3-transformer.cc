@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <cctype>
@@ -999,12 +1000,18 @@ MetalMiniMaxH3Transformer::adaln_bake_certain(const Config& cfg, int max_rows)
   if (std::getenv("VPIPE_H3_NO_ADALN_BAKE") != nullptr) { return false; }
   // The same arithmetic bake_adaln refuses on, with the caller's WORST
   // case for the row count. Certain only when even that fits.
+  return adaln_table_bytes_for(cfg, max_rows) <= adaln_table_budget_();
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::adaln_table_bytes_for(const Config& cfg,
+                                                 int max_rows)
+{
+  if (max_rows <= 0) { return 0; }
   const std::size_t T = (std::size_t)max_rows;
   const std::size_t D = (std::size_t)cfg.adaln_out();
   const std::size_t FD = (std::size_t)(2 * cfg.hidden);
-  const std::size_t want =
-      T * D * 2 * (std::size_t)cfg.n_layers + T * FD * 2;
-  return want <= adaln_table_budget_();
+  return T * D * 2 * (std::size_t)cfg.n_layers + T * FD * 2;
 }
 
 SharedBuffer
@@ -1185,6 +1192,140 @@ MetalMiniMaxH3Transformer::linear_(WeightSet& ws, const std::string& nm,
   }
   l.w = weight_(ws, nm + ".weight", r);
   return l;
+}
+
+namespace {
+
+// `rows` -- [first, end) each -- of an [N, rb]-byte buffer, each row's
+// bytes [c0, c1) (c1 0: to its end), copied in order into a buffer of
+// their own: a rank's share of a weight (Config::tp). Empty when the
+// buffer is not N rows or a range falls outside it.
+SharedBuffer
+tp_cut_(MetalCompute* mc, const SharedBuffer& src, int N,
+        const std::vector<std::pair<int, int>>& rows, std::size_t c0,
+        std::size_t c1)
+{
+  if (src.empty() || N <= 0 || src.byte_size() % (std::size_t)N != 0) {
+    return {};
+  }
+  const std::size_t rb = src.byte_size() / (std::size_t)N;
+  if (c1 == 0) { c1 = rb; }
+  if (c0 >= c1 || c1 > rb) { return {}; }
+  std::size_t n = 0;
+  for (const auto& [a, b] : rows) {
+    if (a < 0 || b > N || a >= b) { return {}; }
+    n += (std::size_t)(b - a);
+  }
+  SharedBuffer out = mc->make_shared_buffer(n * (c1 - c0));
+  if (out.empty()) { return {}; }
+  const auto* sp = static_cast<const std::uint8_t*>(src.contents());
+  auto* dp = static_cast<std::uint8_t*>(out.contents());
+  for (const auto& [a, b] : rows) {
+    if (c0 == 0 && c1 == rb) {
+      std::memcpy(dp, sp + (std::size_t)a * rb, (std::size_t)(b - a) * rb);
+      dp += (std::size_t)(b - a) * rb;
+      continue;
+    }
+    for (int r = a; r < b; ++r) {
+      std::memcpy(dp, sp + (std::size_t)r * rb + c0, c1 - c0);
+      dp += c1 - c0;
+    }
+  }
+  return out;
+}
+
+}
+
+// A rank's share of a block projection, CUT from the checkpoint's whole
+// one: the fused q|k|v and fc1 by their output ROWS -- the rank's heads,
+// each head's q, k and v rows in either qkv layout, and its feed-forward
+// rows, gate and up alike -- the out projection and fc2 by their input
+// COLUMNS over the same heads and rows, so each of the two yields a
+// partial sum. The whole weight is read UNCACHED (Retain::Streamed, so
+// the weight set keeps none of it) and the share copied out of it. Dense
+// bf16 and the MLX affine packs; anything else is refused by name.
+MetalMiniMaxH3Transformer::Linear
+MetalMiniMaxH3Transformer::tp_linear_(WeightSet& ws, const std::string& nm,
+                                      TpCut cut, std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = nm + ": " + why; }
+    return Linear{};
+  };
+  const TpShare& t = _cfg.tp;
+  const int HD = _cfg.head_dim;
+  const int I = t.n_heads * HD;               // the checkpoint's widths
+  const int F = t.n_ffn;
+  const int H = _cfg.hidden;
+  Linear w = linear_(ws, nm, false, Retain::Streamed);
+  if (w.empty()) { return fail("not in the checkpoint"); }
+  if (w.is_fp8() || w.gc > 0 || w.i8x) {
+    return fail("a split DiT reads dense or affine weights only");
+  }
+  std::vector<std::pair<int, int>> rows;
+  int N = H;
+  int k0 = 0, k1 = 0;                         // a column cut, in K
+  switch (cut) {
+    case TpCut::kQkv:
+      N = 3 * I;
+      if (_cfg.qkv_per_head) {
+        rows = {{t.head0 * 3 * HD, t.head1 * 3 * HD}};
+      } else {
+        for (int part = 0; part < 3; ++part) {
+          rows.push_back({part * I + t.head0 * HD, part * I + t.head1 * HD});
+        }
+      }
+      break;
+    case TpCut::kFc1:
+      N = 2 * F;
+      rows = {{t.ffn0, t.ffn1}, {F + t.ffn0, F + t.ffn1}};
+      break;
+    case TpCut::kOut:
+      rows = {{0, H}};
+      k0 = t.head0 * HD;
+      k1 = t.head1 * HD;
+      break;
+    case TpCut::kFc2:
+      rows = {{0, H}};
+      k0 = t.ffn0;
+      k1 = t.ffn1;
+      break;
+  }
+  Linear l;
+  if (w.quantized) {
+    const int g = _quant_group;
+    if (k1 > 0 && (k0 % g != 0 || k1 % g != 0)) {
+      return fail(fmt("its share's columns [{}, {}) are not whole groups "
+                      "of {}", k0, k1, g)());
+    }
+    l.quantized = true;
+    l.bits = w.bits;
+    // Codes: `32 / bits` columns a word; scales and biases: one a group.
+    l.codes = tp_cut_(_mc, w.codes, N, rows, (std::size_t)k0 * w.bits / 8,
+                      (std::size_t)k1 * w.bits / 8);
+    l.scales = tp_cut_(_mc, w.scales, N, rows, (std::size_t)k0 / g * 2,
+                       (std::size_t)k1 / g * 2);
+    l.qbias = tp_cut_(_mc, w.qbias, N, rows, (std::size_t)k0 / g * 2,
+                      (std::size_t)k1 / g * 2);
+    if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+      return fail("its share could not be cut");
+    }
+    return l;
+  }
+  l.w = tp_cut_(_mc, w.w, N, rows, (std::size_t)k0 * 2,
+                (std::size_t)k1 * 2);
+  if (l.w.empty()) { return fail("its share could not be cut"); }
+  return l;
+}
+
+bool
+MetalMiniMaxH3Transformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
+{
+  if (b.byte_size() >= bytes) { return true; }
+  if (!b.empty() && _tp_pipe != nullptr) { _tp_pipe->forget(b); }
+  b = SharedBuffer{};
+  b = _mc->make_shared_buffer(bytes);
+  return !b.empty();
 }
 
 // A ConvRot weight's row scales as the token GEMM reads them: f32, one a
@@ -2302,6 +2443,38 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
   MemoryUseScope blocks_use(MemoryUse::kBlocks);
   b.n1  = weight_(ws, prefix + "norm1.weight", r);
   b.n2  = weight_(ws, prefix + "norm2.weight", r);
+  // A rank of a split DiT: its share of the four projections, cut from
+  // the whole ones; norms, the per-head q / k gammas and the AdaLN whole.
+  if (_cfg.tp.active()) {
+    std::string terr;
+    b.qkv = tp_linear_(ws, prefix + "attn.qkv_proj", TpCut::kQkv, &terr);
+    if (terr.empty()) {
+      b.out = tp_linear_(ws, prefix + "attn.out_proj", TpCut::kOut, &terr);
+    }
+    if (terr.empty()) {
+      b.fc1 = tp_linear_(ws, prefix + "mlp.fc1", TpCut::kFc1, &terr);
+    }
+    if (terr.empty()) {
+      b.fc2 = tp_linear_(ws, prefix + "mlp.fc2", TpCut::kFc2, &terr);
+    }
+    if (!terr.empty()) {
+      if (_mc->session() != nullptr) {
+        _mc->session()->error(fmt("MetalMiniMaxH3Transformer: tensor "
+                                  "parallel: {}", terr));
+      }
+      return false;
+    }
+    // Interleaved for the fused SwiGLU as a kept block's fc1 is.
+    if (_fuse_ff && b.fc1.quantized) { interleave_gu_(b.fc1); }
+    b.qn = weight_(ws, prefix + "attn.q_norm.weight", r);
+    b.kn = weight_(ws, prefix + "attn.k_norm.weight", r);
+    if (with_adaln && !_cfg.pruned()) {
+      b.adaln = linear_(ws, prefix + "adaln_proj.linear", true, r);
+      if (b.adaln.empty() || b.adaln.b.empty()) { return false; }
+    }
+    return !b.n1.empty() && !b.n2.empty() && !b.qn.empty() &&
+           !b.kn.empty();
+  }
   // A MAIN block's projections in the int8 layout where the tier asks
   // and the weight allows -- baked or not; the refiner (text rows, under
   // the int8 row floor) keeps its own.
@@ -4614,8 +4787,80 @@ MetalMiniMaxH3Transformer::two_time_active() const
          _lora[(std::size_t)_flow.slot].scale != 0.0f;
 }
 
+bool
+MetalMiniMaxH3Transformer::begin_tp_generation(std::shared_ptr<TpChannel> ch,
+                                               std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = "tensor parallel: " + why; }
+    return false;
+  };
+  end_tp_generation();
+  if (!_cfg.tp.active()) { return fail("this model is not a rank"); }
+  if (!ch) { return fail("no channel to the other ranks"); }
+  auto pipe = std::make_unique<TpOverlap>(_mc, ch, 4, TpDType::kBF16);
+  if (!pipe->valid()) {
+    return fail("no events or thread for the exchanges");
+  }
+  _tp_ch = std::move(ch);
+  _tp_pipe = std::move(pipe);
+  _tp_seq = 0;
+  // The stop the stage set before the clip, which the channel polls while
+  // it waits on the others.
+  try {
+    _tp_ch->set_stop(_stream_stop);
+  } catch (...) {
+  }
+  return true;
+}
+
+void
+MetalMiniMaxH3Transformer::end_tp_generation()
+{
+  if (_tp_pipe == nullptr && !_tp_ch) { return; }
+  // AN EXCHANGE STILL WAITING ON A PEER would hold the worker the join
+  // below waits for: a forward that ended early (its later partials
+  // never committed, abandoned by TpEnd) or a failed one, whose peer may
+  // be gone. The channel is told to stop waiting first -- set_stop may
+  // come at any time -- and a channel that polls returns.
+  if (_tp_pipe != nullptr && _tp_ch &&
+      (_tp_pipe->pending() || _tp_pipe->failed())) {
+    try {
+      _tp_ch->set_stop([]() { return true; });
+    } catch (...) {
+    }
+  }
+  // The worker joined (abandoning what is posted), so no exchange of a
+  // buffer is in flight; then every buffer the channel was handed is
+  // forgotten before the channel goes -- a transport may keep a device's
+  // registration of each past the channel (TpChannel::forget). Each is
+  // handed to the next generation's channel afresh.
+  _tp_pipe.reset();
+  if (_tp_ch) {
+    for (const SharedBuffer* b :
+         {&_tp_send, &_tp_others, &_tp_part[0], &_tp_part[1],
+          &_tp_part[2], &_tp_part[3], &_tp_recv[0], &_tp_recv[1],
+          &_tp_recv[2], &_tp_recv[3]}) {
+      if (b->empty()) { continue; }
+      try {
+        _tp_ch->forget(b->contents(), b->byte_size());
+      } catch (...) {
+      }
+    }
+    try {
+      _tp_ch->set_stop({});
+    } catch (...) {
+    }
+  }
+  _tp_ch.reset();
+  _tp_seq = 0;
+}
+
 MetalMiniMaxH3Transformer::~MetalMiniMaxH3Transformer()
 {
+  // A rank's generation, if one is still open: the worker joined and its
+  // buffers forgotten before the members they live in go.
+  end_tp_generation();
   // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
   // so the machine recovers either way -- but the pool's own counter
   // would not, and a DiT that is destroyed after every clip (the
@@ -4663,6 +4908,35 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     stream_blocks = (std::atoi(e) != 0);
   }
   m->_stream_blocks = stream_blocks;
+  // A RANK OF A SPLIT DiT (Config::tp) is a narrower H3: its heads and
+  // feed-forward rows are the share's from here on, every scratch and
+  // GEMM sized by them. What it cannot do yet is refused here, by name,
+  // rather than computed wrong: each of these reads or holds the whole
+  // width of a projection a rank has only a share of.
+  if (cfg.tp.active()) {
+    auto refuse = [&](const char* why) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(fmt("MetalMiniMaxH3Transformer: tensor "
+                                 "parallel: {}", why));
+      }
+      return nullptr;
+    };
+    const TpShare& t = cfg.tp;
+    if (t.n_heads != cfg.n_heads || t.n_ffn != cfg.ffn) {
+      return refuse("the share is of another model's widths");
+    }
+    if (stream_blocks) {
+      return refuse("its blocks are preloaded, not streamed");
+    }
+    if (cfg.ane_ffn || cfg.ane_qkv) { return refuse("no ANE tier"); }
+    if (cfg.i8_tier > 0) {
+      return refuse("int8 runs on its accurate tier (i8_gemm) alone");
+    }
+    if (!loras.empty()) { return refuse("no adapter yet"); }
+    // Its channel is a generation's (begin_tp_generation), not the
+    // model's: the weights may outlive a clip, the link may not.
+    m->_cfg = rank_config(m->_cfg);
+  }
   // Everything loaded HERE is kept for the model's life, so it is cached
   // whichever mode we are in. Only the 50 main blocks stream, and they do
   // it in forward().
@@ -5359,9 +5633,12 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
+      // A rank's blocks keep no AdaLN: the bake reads it from the
+      // checkpoint (minimax-h3-denoise requires the bake of a rank), and
+      // holding it would be 39% of the whole checkpoint on every rank.
       if (!m->load_block_(ws, blk_("blocks.", i, ""),
                           m->_blocks[(std::size_t)i], /*main=*/true,
-                          /*with_adaln=*/true, r)) {
+                          /*with_adaln=*/!cfg.tp.active(), r)) {
         return nullptr;
       }
     }
@@ -7482,10 +7759,15 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
                                             ? n_t
                                             : kTimestepSlots);
     const std::size_t ff = narrow_ff ? 3 * I : 2 * (std::size_t)c.ffn;
-    std::size_t b = S * (2 * rot_half * 4 + H * 2 + 3 * I * 2 +
-                         2 * sizeof(int));
-    b += B * (H + 3 * I + std::max(3 * I, ff)) * 2;
+    std::size_t b = S * (2 * rot_half * 4 + H * 2 + 2 * sizeof(int));
+    // The arena: qh | kh | vh and a band's tail, or proj's [seq, H] over
+    // it where that is wider (a narrow rank of a split DiT).
+    b += std::max(S * 3 * I + B * std::max(3 * I, ff), S * H) * 2;
+    b += B * (H + 3 * I) * 2;
     b += T * H * 2 + N * ((std::size_t)c.time_dim + c.adaln_out() + 2 * H) * 2;
+    // A rank's partials and sums in flight (_tp_part, _tp_recv), and the
+    // text refiner's partial and sum (_tp_send, _tp_others).
+    if (c.tp.active()) { b += 8 * B * H * 2 + 2 * T * H * 2; }
     return b + dequant();
   }
   // THE SLOT FLOOR, applied HERE and not left to the caller. The scratch
@@ -7512,6 +7794,11 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
   // they are not.
   const std::size_t arena = S * attn_arena_elems_(c, narrow_ff) * 2;
   if (arena_floor > arena) { total += arena_floor - arena; }
+  // A rank whose sequence is too short to band exchanges whole blocks:
+  // their partial and sum (_tp_send, _tp_others), the refiner's within.
+  if (c.tp.active()) {
+    total += 2 * std::max(S, T) * (std::size_t)c.hidden * 2;
+  }
   total += dequant();
   return total;
 }
@@ -7524,6 +7811,20 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
     // Whole multiples of the widest query tile, so every band starts on
     // a tile the whole sequence's attention would start one on too.
     band = std::max(0, std::atoi(e)) / 128 * 128;
+  }
+  if (c.tp.active()) {
+    // A RANK OF A SPLIT DiT bands to overlap its exchanges: a band's
+    // partial crosses while the GPU attends the next band and runs the
+    // feed-forward of the one before, so what stays exposed is about one
+    // band's exchange a block -- the more bands, the less, each band's
+    // GEMMs and attention the shorter for it.
+    int parts = 8;
+    if (const char* e = std::getenv("VPIPE_H3_TP_BANDS")) {
+      parts = std::atoi(e);
+    }
+    if (parts < 2) { return 0; }
+    const int want = ((seq + parts - 1) / parts + 127) / 128 * 128;
+    band = std::min(band, std::max(want, kTpMinBand));
   }
   if (band <= 0 || seq < 2 * band) { return 0; }
   if (c.ane_ffn || c.ane_qkv) { return 0; }
@@ -7540,7 +7841,11 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
   // At the default band that holds to ~250k rows; past it the split
   // with the longest last band is taken -- correct, if a few rows then
   // round as a short band's do.
-  const int floor = std::min(std::max(tune_ceiling_(), 4096), band / 2);
+  // A rank's floor is the same on every rank: its own tuner's ceiling
+  // could cut its bands apart from its peer's.
+  const int floor =
+      c.tp.active() ? band / 2
+                    : std::min(std::max(tune_ceiling_(), 4096), band / 2);
   const int n0 = (seq + band - 1) / band;
   int best = 0;
   int best_last = 0;
@@ -7560,10 +7865,15 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
 std::size_t
 MetalMiniMaxH3Transformer::scratch_resident_bytes() const
 {
+  // A rank's exchange buffers with them: per-forward scratch as much as
+  // the rest, sized by the same geometry (scratch_bytes counts them).
   const metal_compute::SharedBuffer* all[] = {
       &_s.rcos, &_s.rsin, &_s.x, &_s.nm, &_s.qkv, &_s.attn,
       &_s.txt, &_s.temb, &_s.mod,
-      &_s.fmod, &_s.adaln_idx, &_s.tstep_idx};
+      &_s.fmod, &_s.adaln_idx, &_s.tstep_idx,
+      &_tp_send, &_tp_others, &_tp_part[0], &_tp_part[1], &_tp_part[2],
+      &_tp_part[3], &_tp_recv[0], &_tp_recv[1], &_tp_recv[2],
+      &_tp_recv[3]};
   std::size_t total = 0;
   for (const metal_compute::SharedBuffer* b : all) { total += b->byte_size(); }
   return total;
@@ -7958,7 +8268,13 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
     const std::size_t ff_elems =
         R * (_ff_needs_wide ? 2 * (std::size_t)c.ffn : 3 * I);
     const std::size_t tail = std::max(3 * bw, ff_elems * 2);
-    s.attn = _mc->make_shared_buffer(std::max(3 * win + tail, arena_floor));
+    // ...and proj needs [seq, hidden] of it: 3 * inner per row holds that
+    // on the released model, not on a narrow RANK of a split one (10 of
+    // 56 heads: 3,840 of 5,376), whose final norm then wrote past the
+    // arena -- the last rows' velocity another buffer's, then a page
+    // fault.
+    s.attn = _mc->make_shared_buffer(
+        std::max({3 * win + tail, S * (std::size_t)H * 2, arena_floor}));
     if (s.attn.empty()) { return false; }
     s.qh   = s.attn.subview(0 * win, win);
     s.kh   = s.attn.subview(1 * win, win);
@@ -8794,6 +9110,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (in.layout == nullptr || in.timesteps == nullptr ||
       in.row_timestep_index == nullptr || in.text == nullptr) {
     return fail("incomplete Step");
+  }
+  // A RANK exchanges through its generation's channel; with none open a
+  // forward would compute this rank's share alone.
+  if (c.tp.active() && _tp_pipe == nullptr) {
+    return fail("tensor parallel: no generation is open on this rank "
+                "(begin_tp_generation)");
   }
   const h3::PackedLayout& L = *in.layout;
   const int seq = L.seq_len;
@@ -9762,6 +10084,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // plausible video with one block's attention missing.
   std::string vdn_err;
   std::string sol_err;
+  // A rank of a split DiT (Config::tp): the link to the others failed.
+  std::string tp_err;
 
   // ---- env-gated streaming split (VPIPE_H3_STREAM_PROFILE) ------------
   // How much of a streamed block's wall time is the DISK read and how
@@ -9811,6 +10135,19 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // dropped.
   _flops.begin();
   CommandStream stream = _mc->make_command_stream();
+  // A RANK'S EXCHANGES LEFT POSTED when the forward ends early -- their
+  // partials in a buffer never committed -- would hold the GPU's waits
+  // and the worker: released here, before the stream goes (declared after
+  // it). A forward that ran to its end has none pending.
+  struct TpEnd {
+    TpOverlap* pipe;
+    ~TpEnd()
+    {
+      if (pipe != nullptr && pipe->pending()) {
+        pipe->abandon("the forward ended early");
+      }
+    }
+  } tp_end{_tp_pipe.get()};
   {
     ComputeEncoder enc = stream.begin_compute();
     auto psplit = [&](double& acc) {
@@ -10385,8 +10722,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // band-sized s.nm), and the rows the ANE lost -- which still hold
     // their input, because the ANE writes a chunk back only once all of
     // it came out finite. The scratch is used from its first row.
+    // `out`: where fc2 writes, from its row 0, in place of s.nm's rows (a
+    // rank's partial buffer).
     auto ff_gpu = [&](const Block& b, const LoraStack& lo_fc1,
-                      const LoraStack& lo_fc2, int r0, int n) {
+                      const LoraStack& lo_fc2, int r0, int n,
+                      const SharedBuffer* out = nullptr) {
       if (n <= 0) { return; }
       const std::size_t e0 = (std::size_t)r0 * H;
       const bool head = r0 == 0;          // the dumps describe the head
@@ -10433,8 +10773,40 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         bdump("swiglu", s.qkv, FF);
         trip(trip_blk, 7, s.qkv, (std::size_t)n * FF);
       }
-      gemm_(enc, s.qkv, 0, b.fc2, s.nm, e0, n, H, FF,
-            &lo_fc2);
+      gemm_(enc, s.qkv, 0, b.fc2, out != nullptr ? *out : s.nm,
+            out != nullptr ? 0 : e0, n, H, FF, &lo_fc2);
+    };
+    // A RANK'S PARTIAL SUM COMPLETED (Config::tp): s.nm holds this rank's
+    // share of a projection's output, [rows, H]; the GPU's work is drained,
+    // the partial handed to the channel and the other ranks' sum taken
+    // back, and added on the GPU -- s.nm then holds the whole projection,
+    // as one model would have, and the residual goes on as before. The
+    // stream commits and waits here twice a block: what the exchange
+    // costs beyond the link itself.
+    // The partial is COPIED into an exchange buffer of its own: the
+    // scratch is not one (ensure_scratch_ replaces it, and a transport
+    // may keep a device's registration of what it is handed) -- a few MB
+    // of text rows, or a sequence too short to band.
+    auto tp_reduce = [&](int rows) {
+      if (!c.tp.active() || !tp_err.empty()) { return; }
+      const std::size_t bytes = (std::size_t)rows * (std::size_t)H * 2;
+      if (!tp_buffer_(_tp_send, bytes) || !tp_buffer_(_tp_others, bytes)) {
+        tp_err = "tensor parallel: no room for a block's partial sums";
+        return;
+      }
+      enc.end();
+      _flops.flush(stream);
+      stream.commit().wait();
+      std::memcpy(_tp_send.contents(), s.nm.contents(), bytes);
+      std::string terr;
+      if (!_tp_pipe->exchange_now(_tp_send.contents(), _tp_others.contents(),
+                                  bytes, _tp_seq++, &terr)) {
+        tp_err = "tensor parallel: " + terr;
+      }
+      enc = stream.begin_compute();
+      mark = std::chrono::steady_clock::now();
+      if (!tp_err.empty()) { return; }
+      residual(s.nm, _tp_others, rows);
     };
     auto block = [&](const Block& b, const SharedBuffer& x, int rows,
                      bool modulated, int lora_layer) {
@@ -10761,6 +11133,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         enc.dispatch({(unsigned)(L.num_video_rows * H), 1, 1}, {256, 1, 1});
         psplit(t_vdn);
       }
+      tp_reduce(rows);
       bdump("o_proj", s.nm, H);
       trip(trip_blk, 4, s.nm, (std::size_t)rows * H);
       psplit(t_oproj);   // the dumps and tripwires only, by now
@@ -10876,6 +11249,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       } else {
         gpu_ff(0, rows);
       }
+      tp_reduce(rows);
       bdump("fc2", s.nm, H);
       trip(trip_blk, 8, s.nm, (std::size_t)rows * H);
       psplit(t_ff);
@@ -10904,12 +11278,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.set_constant(8, n * H);
       enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
     };
-    auto gated_band = [&](int r0, int n, int gate_off) {
+    // `sub`: what is added, from its row 0 -- the band's s.nm unless a
+    // rank's partial buffer says otherwise.
+    auto gated_band = [&](int r0, int n, int gate_off,
+                          const SharedBuffer* sub = nullptr) {
       enc.set_function(_fn_gated);
       enc.set_buffer(0, s.x, (std::size_t)r0 * H * 2);
       enc.set_buffer(1, *mod_buf, mod_off * 2);
       enc.set_buffer(2, s.adaln_idx, (std::size_t)r0 * sizeof(int));
-      enc.set_buffer(3, s.nm);
+      enc.set_buffer(3, sub != nullptr ? *sub : s.nm);
       enc.set_constant(4, H);
       enc.set_constant(5, 6 * H);
       enc.set_constant(6, gate_off);
@@ -10990,8 +11367,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
                                       _sol_fwd, &kerr);
         if (!sol_keys && sol_err.empty()) { sol_err = "sol_attn: " + kerr; }
       }
-      for (int r0 = 0; r0 < seq; r0 += band) {
-        const int n = std::min(band, seq - r0);
+      // A band's attention over every key and its out projection, into
+      // `out` from its row 0: s.nm, or a rank's partial buffer.
+      auto attend_band = [&](int r0, int n, const SharedBuffer& out) {
         const bool full = n == band;
         const int fi = full ? 0 : 1;
         const int nqb = (n + A_BQ - 1) / A_BQ;
@@ -11093,16 +11471,176 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           _flops.attention(NH, (long long)n * seq, HD);
         }
         psplit(t_attn);
-        gemm_(enc, s.ob, 0, b.out, s.nm, 0, n, H, I, &lo_out);
+        gemm_(enc, s.ob, 0, b.out, out, 0, n, H, I, &lo_out);
         psplit(t_oproj);
-        gated_band(r0, n, 2 * H);
+      };
+      if (!c.tp.active()) {
+        for (int r0 = 0; r0 < seq; r0 += band) {
+          const int n = std::min(band, seq - r0);
+          attend_band(r0, n, s.nm);
+          gated_band(r0, n, 2 * H);
+          rms(s.x, (std::size_t)r0 * H, b.n2, s.nm, 0, n, H, c.norm_eps);
+          modulate_band(r0, n, 4 * H, 3 * H);
+          psplit(t_elt);
+          ff_gpu(b, lo_fc1, lo_fc2, 0, n);
+          psplit(t_ff);
+          gated_band(r0, n, 5 * H);
+          psplit(t_elt);
+        }
+        return;
+      }
+      // A RANK'S BANDS, PIPELINED (TpOverlap). Each band's out projection
+      // and fc2 yield PARTIAL sums, exchanged while the GPU works on: in
+      // GPU order step i runs A(i) -- band i's attention and out
+      // projection, its partial posted -- then B(i - 1) -- band i - 1's
+      // sum added, its feed-forward, its fc2 partial posted -- then
+      // C(i - 2) -- that sum added. So band i's first exchange crosses
+      // under A(i + 1) and its second under A(i + 2); what is left
+      // exposed is the last band's fc2, once a block. Posts go out in the
+      // order the GPU signals them and every rank posts alike.
+      // VPIPE_H3_TP_LAG=0 runs the same steps band after band -- no
+      // overlap, the same arithmetic to the bit (read per block, so one
+      // process can run both).
+      // A band's partials live in buffers of their own -- two bands of
+      // out projections, two of fc2s -- never in the band scratch the next
+      // step writes; the GPU's tracked hazards order a slot's next writer
+      // after its last reader, and its next exchange after that.
+      const int nb = (seq + band - 1) / band;
+      const std::size_t pb = (std::size_t)band * (std::size_t)H * 2;
+      for (int k = 0; k < 4; ++k) {
+        for (SharedBuffer* sb : {&_tp_part[k], &_tp_recv[k]}) {
+          if (!tp_buffer_(*sb, pb)) {
+            tp_err = "tensor parallel: no room for a band's partial sums";
+            return;
+          }
+        }
+      }
+      const int lag = []() {
+        const char* e = std::getenv("VPIPE_H3_TP_LAG");
+        return e != nullptr && std::atoi(e) == 0 ? 0 : 1;
+      }();
+      std::vector<std::uint64_t> va((std::size_t)nb), vc((std::size_t)nb);
+      // A handoff is encoded between encoders, into the open command
+      // buffer: the slot's signal after the dispatch that wrote its
+      // partial (a buffer splits only at the next op, so that dispatch is
+      // in it), a wait before the first that reads the sum. Posted and
+      // signaled together, so the posts' order is the signals'.
+      auto post = [&](int slot, int n) {
+        const TpOverlap::Ticket t =
+            _tp_pipe->post(slot, _tp_part[slot], _tp_recv[slot],
+                           (std::size_t)n * (std::size_t)H * 2, _tp_seq++);
+        enc.end();
+        stream.encode_signal(*t.ready, t.ready_at);
+        enc = stream.begin_compute();
+        return t.done_at;
+      };
+      auto await = [&](std::uint64_t v) {
+        enc.end();
+        stream.encode_wait(_tp_pipe->done(), v);
+        enc = stream.begin_compute();
+      };
+      auto step_a = [&](int k) {
+        const int r0 = k * band, n = std::min(band, seq - r0);
+        attend_band(r0, n, _tp_part[k & 1]);
+        va[(std::size_t)k] = post(k & 1, n);
+      };
+      // VPIPE_TP_TRACE=2 (a debugging aid): the GPU drained around each
+      // band's sums, the add checked on the CPU -- the GPU's p + others
+      // against the bytes the channel wrote -- and the band's residual
+      // rows hashed, for two ranks' logs to be compared.
+      static const int tp_trace = []() {
+        const char* e = std::getenv("VPIPE_TP_TRACE");
+        return e != nullptr ? std::atoi(e) : 0;
+      }();
+      std::vector<std::uint16_t> tr_p, tr_o;
+      auto bf16_f = [](std::uint16_t h) {
+        const std::uint32_t u = (std::uint32_t)h << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+      };
+      auto fnv = [](const void* q, std::size_t nb_) {
+        std::uint64_t h = 1469598103934665603ull;
+        const auto* c8 = static_cast<const unsigned char*>(q);
+        for (std::size_t i = 0; i < nb_; ++i) {
+          h = (h ^ c8[i]) * 1099511628211ull;
+        }
+        return h;
+      };
+      auto drain = [&]() {
+        enc.end();
+        stream.commit().wait();
+        enc = stream.begin_compute();
+      };
+      auto checked_add = [&](const char* what, int k, int n,
+                             const SharedBuffer& p, const SharedBuffer& o) {
+        const std::size_t ne = (std::size_t)n * (std::size_t)H;
+        if (tp_trace >= 2) {
+          drain();
+          const auto* pp = static_cast<const std::uint16_t*>(p.contents());
+          const auto* oo = static_cast<const std::uint16_t*>(o.contents());
+          tr_p.assign(pp, pp + ne);
+          tr_o.assign(oo, oo + ne);
+        }
+        residual(p, o, n);
+        if (tp_trace >= 2) {
+          drain();
+          const auto* q = static_cast<const std::uint16_t*>(p.contents());
+          std::size_t bad = 0, first = ne;
+          for (std::size_t i = 0; i < ne; ++i) {
+            const float want = bf16_f(tr_p[i]) + bf16_f(tr_o[i]);
+            const float got = bf16_f(q[i]);
+            if (std::fabs(got - want) > std::fabs(want) * 0.0079f + 1e-30f) {
+              if (bad++ == 0) { first = i; }
+            }
+          }
+          std::fprintf(stderr, "[tp-add] layer %d band %d %s rows %d bad %zu "
+                       "first-row %zd p %016llx o %016llx sum %016llx\n",
+                       layer, k, what, n, bad,
+                       bad > 0 ? (std::ptrdiff_t)(first / (std::size_t)H)
+                               : (std::ptrdiff_t)-1,
+                       (unsigned long long)fnv(tr_p.data(), ne * 2),
+                       (unsigned long long)fnv(tr_o.data(), ne * 2),
+                       (unsigned long long)fnv(q, ne * 2));
+        }
+      };
+      auto x_hash = [&](int k, int n) {
+        if (tp_trace < 2) { return; }
+        drain();
+        const auto* xb = static_cast<const unsigned char*>(s.x.contents()) +
+                         (std::size_t)k * band * H * 2;
+        std::fprintf(stderr, "[tp-x] layer %d band %d x %016llx\n", layer,
+                     k, (unsigned long long)fnv(xb, (std::size_t)n * H * 2));
+      };
+      auto step_b = [&](int k) {
+        const int r0 = k * band, n = std::min(band, seq - r0);
+        const SharedBuffer& p = _tp_part[k & 1];
+        await(va[(std::size_t)k]);
+        checked_add("attn", k, n, p, _tp_recv[k & 1]);
+        gated_band(r0, n, 2 * H, &p);
         rms(s.x, (std::size_t)r0 * H, b.n2, s.nm, 0, n, H, c.norm_eps);
         modulate_band(r0, n, 4 * H, 3 * H);
         psplit(t_elt);
-        ff_gpu(b, lo_fc1, lo_fc2, 0, n);
+        ff_gpu(b, lo_fc1, lo_fc2, 0, n, &_tp_part[2 + (k & 1)]);
         psplit(t_ff);
-        gated_band(r0, n, 5 * H);
+        vc[(std::size_t)k] = post(2 + (k & 1), n);
+      };
+      auto step_c = [&](int k) {
+        const int r0 = k * band, n = std::min(band, seq - r0);
+        const SharedBuffer& p = _tp_part[2 + (k & 1)];
+        await(vc[(std::size_t)k]);
+        checked_add("ff", k, n, p, _tp_recv[2 + (k & 1)]);
+        gated_band(r0, n, 5 * H, &p);
         psplit(t_elt);
+        x_hash(k, n);
+      };
+      for (int i = 0; i < nb + 2 * lag; ++i) {
+        if (i < nb) { step_a(i); }
+        if (i - lag >= 0 && i - lag < nb) { step_b(i - lag); }
+        if (i - 2 * lag >= 0 && i - 2 * lag < nb) { step_c(i - 2 * lag); }
+      }
+      if (_tp_pipe->failed()) {
+        tp_err = "tensor parallel: " + _tp_pipe->error();
       }
     };
 
@@ -11149,6 +11687,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // ---- 2. the text refiner -----------------------------------------
     for (std::size_t ri = 0; ri < _refiner.size(); ++ri) {
       block(_refiner[ri], s.txt, n_text, false, (int)ri);
+      if (!tp_err.empty()) { return fail(tp_err); }
     }
     // Its final norm writes straight into the packed sequence's text
     // rows, which are rows [0, n_text) -- no separate copy.
@@ -11755,6 +12294,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       ane_on_commit = nullptr;
       if (!vdn_err.empty()) { return fail(vdn_err); }
       if (!sol_err.empty()) { return fail(sol_err); }
+      if (!tp_err.empty()) { return fail(tp_err); }
       bprobe = false;
       if (Lx == 0 || Lx == 3 || Lx == 24 || Lx == c.n_layers - 1) {
         xdump(("after block " + std::to_string(Lx)).c_str());
@@ -12077,6 +12617,22 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   if (!stream.commit().wait_ok(&gpu_err)) {
     return fail(gpu_err.empty() ? std::string("MiniMax-H3 DiT forward failed")
                                 : gpu_err);
+  }
+  // A rank's exchanges, all answered by now: one that failed released
+  // the GPU's waits and left wrong sums behind it.
+  if (_tp_pipe != nullptr) {
+    if (_tp_pipe->failed()) {
+      return fail("tensor parallel: " + _tp_pipe->error());
+    }
+    const TpOverlap::Stats ts = _tp_pipe->take_stats();
+    if (_mc->session() != nullptr && ts.exchanges > 0) {
+      _mc->session()->log_debug(fmt(
+          "[h3-dit] tensor parallel: {} exchanges, {:.1f} MB, link {:.1f} "
+          "ms, waiting for the GPU {:.1f} ms, forward {:.1f} ms",
+          ts.exchanges, (double)ts.bytes / 1e6, ts.link_ms, ts.idle_ms,
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - t_begin).count()));
+    }
   }
   // Every routed layer has run, so Sol's count is this forward's whole.
   // (The log at the next forward's start reads the same count.)

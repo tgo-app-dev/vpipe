@@ -50,6 +50,7 @@ generative-models/shared/ane-tier.h
 generative-models/shared/wired-pool.h
 generative-models/spec-keys.h
 generative-models/speculative-decode.h
+generative-models/tensor-parallel.h
 generative-models/token-muxer.h
 generative-models/tokenizer.h
 generative-models/vae-model-registry.h
@@ -1381,6 +1382,29 @@ record vpipe::genai::Tokenizer::StreamDecoder
   0 | std::string pending
   | [sizeof=24, dsize=24, align=8,
   | nvsize=24, nvalign=8]
+record vpipe::genai::TpChannel
+  0 | class vpipe::genai::TpChannel
+  0 | (TpChannel vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::TpShare
+  0 | struct vpipe::genai::TpShare
+  0 | int rank
+  4 | int ranks
+  8 | int head0
+  12 | int head1
+  16 | int ffn0
+  20 | int ffn1
+  24 | int n_heads
+  28 | int n_ffn
+  32 | class vpipe::FlexData extra
+  | [sizeof=40, dsize=40, align=8,
+  | nvsize=40, nvalign=8]
+record vpipe::genai::TpTransport
+  0 | class vpipe::genai::TpTransport
+  0 | (TpTransport vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
 record vpipe::genai::VaeDecodeRequest
   0 | struct vpipe::genai::VaeDecodeRequest
   0 | const float * latent
@@ -2138,6 +2162,17 @@ class vpipe::genai::SpecDecodeExt
   drafter std::string_view () const noexcept = 0
   attach_drafter bool (const std::string &, int, std::string *) = 0
   generate bool (const SpecDecodeRequest &, SpecDecodeResult *) = 0
+class vpipe::genai::TpChannel
+  ~TpChannel void ()
+  exchange bool (const void *, void *, std::size_t, TpDType, std::uint64_t, std::string *) = 0
+  forget void (const void *, std::size_t)
+  set_stop void (std::function<bool ()>)
+  query_extension void *(std::string_view) noexcept
+class vpipe::genai::TpTransport
+  ~TpTransport void ()
+  name std::string_view () const = 0
+  open std::shared_ptr<TpChannel> (const FlexData &, const TpShare &, std::string *) = 0
+  query_extension void *(std::string_view) noexcept
 class vpipe::genai::VaeDecoder
   ~VaeDecoder void ()
   latent_channels int () const = 0
@@ -2905,6 +2940,7 @@ vpipe::genai::Tokenizer::step(vpipe::genai::Tokenizer::StreamDecoder&, int) cons
 vpipe::genai::Tokenizer::vocab_size() const
 vpipe::genai::Tokenizer::whitespace_clean(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::genai::Tokenizer::~Tokenizer()
+vpipe::genai::TpShare::from_flex(vpipe::FlexData const&, int, int, vpipe::genai::TpShare*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::genai::VaeModelRegistry::add(std::__1::unique_ptr<vpipe::genai::VaeModelFamily, std::__1::default_delete<vpipe::genai::VaeModelFamily>>)
 vpipe::genai::VaeModelRegistry::all() const
 vpipe::genai::VaeModelRegistry::claim_for(vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) const
@@ -3001,12 +3037,14 @@ vpipe::genai::ane::runtime_bytes(vpipe::FlexData const&)
 vpipe::genai::build_mrope_position_ids(std::__1::span<vpipe::genai::TokenRef const, 18446744073709551615ul>, std::__1::span<std::__1::pair<int, int> const, 18446744073709551615ul>, std::__1::vector<int, std::__1::allocator<int>>*, std::__1::vector<int, std::__1::allocator<int>>*, std::__1::vector<int, std::__1::allocator<int>>*, int*)
 vpipe::genai::detect::for_model_type(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::genai::detect::model_type_for_class(std::__1::basic_string_view<char, std::__1::char_traits<char>>, bool)
+vpipe::genai::find_tp_transport(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::genai::open_weight_set(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::profile::Registry::add(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, vpipe::FlexData)
 vpipe::genai::profile::Registry::families(std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
 vpipe::genai::profile::Registry::find(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
 vpipe::genai::profile::Registry::get()
 vpipe::genai::quant::family_for_class(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
+vpipe::genai::register_tp_transport(std::__1::unique_ptr<vpipe::genai::TpTransport, std::__1::default_delete<vpipe::genai::TpTransport>>)
 vpipe::hf_tree_files(vpipe::FlexData const&)
 vpipe::host_features()
 vpipe::host_has_feature(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
@@ -3331,6 +3369,7 @@ vpipe::genai::cond_sideband::kKind = "kind"
 vpipe::genai::cond_sideband::kLatentFrames = "latent_frames"
 vpipe::genai::cond_sideband::kLatentHeight = "latent_height"
 vpipe::genai::cond_sideband::kLatentWidth = "latent_width"
+vpipe::genai::cond_sideband::kPosteriorDraws = "posterior_draws"
 vpipe::genai::cond_sideband::kRefGridH = "ref_grid_h"
 vpipe::genai::cond_sideband::kRefGridW = "ref_grid_w"
 vpipe::genai::cond_sideband::kReferences = "references"
@@ -3397,6 +3436,7 @@ vpipe::genai::sampler_spec::kFlowMatch = "flow_match"
 vpipe::genai::sampler_spec::kHeun = "heun"
 vpipe::genai::sampler_spec::kMethod = "method"
 vpipe::genai::sampler_spec::kOrder = "order"
+vpipe::genai::sampler_spec::kResMultistep = "res_multistep"
 vpipe::genai::sampler_spec::kSNoise = "s_noise"
 vpipe::genai::sampler_spec::kSampler = "sampler"
 vpipe::genai::sampler_spec::kSeed = "seed"
@@ -3473,6 +3513,8 @@ vpipe::sideband::kColorPrimaries = "color_primaries"
 vpipe::sideband::kColorRef = "color_ref"
 vpipe::sideband::kColorRefFrames = "color_ref_frames"
 vpipe::sideband::kColorRefLevels = "color_ref_levels"
+vpipe::sideband::kColorRefMethod = "color_ref_method"
+vpipe::sideband::kColorRefSigma = "color_ref_sigma"
 vpipe::sideband::kColorTransfer = "color_transfer"
 vpipe::sideband::kContentBlocked = "content_blocked"
 vpipe::sideband::kContentLight = "content_light"
@@ -3493,6 +3535,7 @@ vpipe::sideband::kPtsUs = "pts_us"
 vpipe::sideband::kRefusalHeight = "refusal_height"
 vpipe::sideband::kRefusalWidth = "refusal_width"
 vpipe::sideband::kRepeated = "repeated"
+vpipe::sideband::kResizeTo = "resize_to"
 vpipe::sideband::kSourceBits = "source_bits"
 vpipe::sideband::kStreamContinues = "stream_continues"
 vpipe::sideband::kStreamFinal = "stream_final"

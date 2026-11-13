@@ -26,6 +26,7 @@ set(LOCAL_SOURCES
   vae-model-registry.cc
   image-model-registry.cc
   video-model-registry.cc
+  tensor-parallel.cc
   quantize-family-registry.cc
   hidden-state-encoder.cc
   model-loader.cc
@@ -54,6 +55,7 @@ set(LOCAL_SOURCES
   shared/motion-cache.cc
   shared/wan-vae-names.cc
   shared/wired-pool.cc
+  shared/tp-overlap.cc
   shared/mcp/file-sandbox.cc
   shared/mcp/mcp-tools.cc
   shared/mcp/python-sandbox.cc
@@ -216,6 +218,7 @@ set(LOCAL_HEADERS
   shared/grounded-encode-params.h
   shared/torch-zip.h
   shared/wired-pool.h
+  shared/tp-overlap.h
   shared/mcp/file-sandbox.h
   shared/mcp/mcp-tools.h
   shared/mcp/python-sandbox.h

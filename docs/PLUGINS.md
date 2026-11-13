@@ -1483,6 +1483,99 @@ choice, `mirror_repo(source, hf_path, out)` for whether that source carries a
 repo -- `Absent` greys the choice instead of a fetch failing on it. How each
 source is asked for a listing is the host's own and not part of the SDK.
 
+## Extension point 5b — a transport for a DiT split across hosts
+
+A DiT can run SPLIT across processes on several Macs -- tensor parallelism,
+`generative-models/tensor-parallel.h`: each RANK holds its share of every
+block's attention heads and feed-forward rows, and after each block's out
+projection and fc2 its partial sum is added to the other ranks'. vpipe moves no
+bytes between machines. A plugin registers a TRANSPORT, which opens a CHANNEL
+for each generation (a clip); the channel takes this rank's partial (memory
+the CPU may read, the GPU's work on it finished) and returns the sum of the
+others':
+
+```cpp
+#include "generative-models/tensor-parallel.h"
+
+class MyChannel final : public vpipe::genai::TpChannel {
+  bool exchange(const void* partial, void* others, std::size_t bytes,
+                vpipe::genai::TpDType dtype, std::uint64_t seq,
+                std::string* err) override;
+  void forget(const void* base, std::size_t bytes) override;  // optional
+  void set_stop(std::function<bool()> stop) override;         // optional
+};
+class MyTransport final : public vpipe::genai::TpTransport {
+  std::string_view name() const override { return "my-link"; }
+  std::shared_ptr<vpipe::genai::TpChannel>
+  open(const vpipe::FlexData& params, const vpipe::genai::TpShare& share,
+       std::string* err) override;
+};
+
+void my_register(vpipe::VpipePluginContext*) {
+  if (vpipe::genai::tp_transports_available()) {
+    vpipe::genai::register_tp_transport(std::make_unique<MyTransport>());
+  }
+}
+```
+
+A stage names the transport and hands it its own bag, unread --
+generate-video's `tensor_parallel` is `{rank, ranks, heads: [first, end],
+ffn: [first, end], transport, params}` (shares unsaid split evenly; a slower
+host takes fewer). `seq` counts a generation's exchanges from 0 on every rank
+alike, so a transport can catch ranks out of step; `dtype` is the partial's elements
+(bf16 for MiniMax H3), what a transport adds as when more than one other rank
+answers. `exchange` and `forget` are called one at a time, `exchange` in `seq`
+order, but not always from the stage's thread: a DiT that overlaps its
+exchanges with its GPU work calls them from a worker of its own while the GPU
+runs on, so `exchange` should block only on the link -- its latency is what
+the GPU waits for when the overlap runs dry. Nothing the host calls may throw:
+an exception is caught and taken as the call's failure (`open` null, the
+run failed).
+
+THE MEMORY a channel is handed is the host's few EXCHANGE BUFFERS, each at the
+same address from its first exchange until the host calls `forget` on it --
+before it frees or replaces it, never while an exchange of it is in flight --
+or the channel goes. A transport that registers memory with a device (RDMA)
+may therefore register a buffer the first time it sees it and keep the
+registration until `forget`; one that only copies ignores it.
+
+A run's STOP reaches the channel by `set_stop`: the predicate the DiT polls
+between blocks, set before a generation and cleared (empty) after it, on every
+way out. A channel that polls it while it WAITS -- for its peers to appear,
+for their partials -- lets a stop land there too, rather than when a peer
+gives up; it calls it under a lock of its own `set_stop` also takes, so once
+cleared it is never called.
+
+A CHANNEL IS ONE GENERATION'S. `open` is called as each clip's denoise
+starts -- it may wait there for the other ranks -- and the channel is let go
+when the clip ends, however it ends: finished, stopped part way, failed. A
+rank keeps its share's weights between clips, or lets them go and reloads
+them, by its own host's memory; the link and its `seq` start over with every
+clip either way, so one rank stopping part way through a forward, or
+reloading while its peer kept its weights, never leaves the next clip out of
+step. Before it lets go of a channel with an exchange still waiting on a
+peer, the host sets a stop that is always true, so a channel that polls
+returns; and it calls `forget` on every buffer it handed first. Expect `open`
+again once the last clip's channel is gone, and let a peer's channel going
+fail an exchange still waiting for it.
+
+MiniMax H3 is the first family to run split (preloaded shares of dense or
+affine weights, its blocks in row bands, each band's exchanges under the next
+band's work; no ANE tier, VDN, TaoMate, adapter or int8 tier beyond accurate
+yet, and MotionCache off on a rank -- each of its skips is judged from that
+rank's own sums). A rank's memory is booked at its share, in the plan that
+refuses graphs as in the report: its share of the projections and the AdaLN
+bake's tables (it holds no AdaLN weights) -- held whole, since a rank never
+streams -- and the scratch of the narrower model it is, its exchange buffers
+included.
+
+**Optional, as model sources are.** The header is installed since feature
+`"tensor-parallel/1"`, its functions weak imports outside the host: check
+`tp_transports_available()`, or list the feature as required. It grows as the
+rest of the ABI does: `TpChannel` and `TpTransport` through
+`query_extension(id)` (null: the host keeps the older behaviour), `TpShare`
+through keys in its `extra` (none defined yet).
+
 ## Extension point 6 — CoreML
 
 There is no separate CoreML plugin type: a CoreML consumer is just a
@@ -1779,7 +1872,10 @@ answers null, so never list it as required) and `"model-sources/1"`
 (`stages/model-source.h` installed, its functions weak imports outside the
 host: the sources' names and labels, the mirror table, `register_mirror_repos`
 for a family's rows; check `model_sources_available()`, or list it as
-required).
+required) and `"tensor-parallel/1"` (`generative-models/tensor-parallel.h`
+installed, its functions weak imports: `register_tp_transport`, a transport
+for a DiT split across hosts -- extension point 5b; check
+`tp_transports_available()`).
 
 ## Where your stages show up
 
