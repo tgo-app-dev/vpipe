@@ -25,9 +25,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
+
+namespace genai { class TpChannel; }
 
 // VAE decode stage: the second half of the `krea2` (Krea-2-Turbo) text-to-
 // image split -- it turns a latent tensor into an RGB image. Runs the
@@ -139,6 +143,37 @@ private:
   std::string vae_dir_for_release_() const;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // ---- a decode split between hosts (`tensor_parallel`) ----
+  //
+  // This rank's share of the clip's units (each chunk's tiles) and the
+  // channel its part crosses on: opened before the decode, so the link is
+  // made while the GPU decodes, let go once the parts are added -- or on
+  // any other way out (decode_split_release_). The buffers handed to the
+  // channel go with it.
+  struct DecodeSplit {
+    std::shared_ptr<genai::TpChannel> ch;
+    int rank = 0, units = 0, u0 = 0, u1 = 0;
+    std::unique_ptr<std::uint8_t[]> hs, hr, sbuf, rbuf;
+    std::size_t hbytes = 0, piece = 0;
+  };
+  // Null `ch` (the decode whole) when this stage is no share, or the
+  // channel cannot be opened (said).
+  DecodeSplit decode_split_open_(int LT, int lh, int lw,
+                                 RuntimeContext& ctx);
+  // The ranks' headers swapped and checked, then the other rank's part
+  // added into `rgb` ([3, F, H, W] bf16) on rank 0; false, with `err`,
+  // when they disagree or the exchange failed. Lets the channel go either
+  // way.
+  bool decode_split_join_(DecodeSplit& split,
+                          metal_compute::SharedBuffer& rgb, int F, int H,
+                          int W, int LT, std::string* err);
+  // The channel's stop cleared, its buffers forgotten and the channel let
+  // go, off the clip's path (an RDMA teardown takes a third of a second).
+  void decode_split_release_(DecodeSplit& split);
+  // Whether `tensor_parallel` asks this stage to be a share at all: a
+  // clip decoded whole while it does is said.
+  bool tp_split_asked_() const;
+
   // ---- the clip oport (oport1) ----
   //
   // Allocate the [F, 3, H, W] clip, or return null when nothing is
@@ -230,6 +265,13 @@ private:
   // Shared, so it can outlive the stage kept warm (~VaeDecodeStage).
   std::shared_ptr<genai::MetalKrea2Vae> _vae;
   double      _keep_loaded = 0.0;    // s it is kept warm after the stage
+  // `tensor_parallel`: this stage as one share of a MiniMax H3 decode
+  // split between hosts (decode_split_), null when it decodes whole.
+  FlexData    _tp_cfg;
+  // A split decode's channel let go off the clip's path (its RDMA queue
+  // pairs and registrations take a third of a second): joined before the
+  // next split opens one, and as the stage goes.
+  std::thread _tp_teardown;
   std::string _vae_warm_key;         // what it was built with
   static constexpr const char* kKrea2VaeWarmKind = "krea2-vae-decoder";
   static constexpr const char* kFlux2VaeWarmKind = "flux2-vae-decoder";
@@ -278,10 +320,15 @@ private:
   // MiniMax-H3's video VAE. Its decoder is a ViT rather than an
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole
   // clip at once instead of streaming chunks through a sink.
-  std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
+  // Shared: kept warm (keep_loaded) as the stage ends, as the 2D VAEs.
+  std::shared_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
   // ...or its fast decoder, when `fast_decoder` names one: the released
   // VAE's weights are then never read, only its config.
-  std::unique_ptr<genai::MetalMiniMaxH3FastVae> _h3_fast;
+  std::shared_ptr<genai::MetalMiniMaxH3FastVae> _h3_fast;
+  // What the H3 decoder in use was built with, as its warm hold's key.
+  std::string _h3_vae_warm_key;
+  static constexpr const char* kH3VaeWarmKind = "minimax-h3-video-vae";
+  static constexpr const char* kH3FastWarmKind = "minimax-h3-fast-vae";
   // The i8 tier the fast decoder runs at on this box (-1 none), as the
   // plan books it.
   int fast_i8_tier_() const;
@@ -316,6 +363,11 @@ private:
   // the same rule the DiT and conditioner stages use.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   bool _unload_idle   = false;
+  // The phase the idle rule weighs the peers in ("" all: a picture's
+  // decoder runs between denoises; MiniMax-H3's decode phase, and every
+  // other phase it would sit through kept).
+  std::string_view _idle_phase;
+  std::size_t idle_footprint_(std::size_t decode_need) const;
   bool _autotune      = true;     // kernel tuners measure (kAutotune)
   // `dtype`: the pictures this emits. U8 (the default) quantizes the
   // decoder's samples to 8 bits; F16 keeps them (0..1, clamped) -- for
@@ -338,6 +390,47 @@ private:
   // an approximation here has nowhere to be absorbed.
   FlexData _accel{};
 };
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// A MiniMax H3 clip's decode split between two ranks (vae-decode's
+// `tensor_parallel`): what the ranks swap before their parts cross, and
+// how rank 0 takes the other's part in. Free functions, so a test drives
+// them through a channel of its own.
+namespace vae_decode_split {
+
+// What a rank states first -- the clip it decoded and the units it took
+// -- swapped as the channel's exchange 0. Both parts are the whole clip's
+// buffer whatever either rank decoded, so ranks that would not add to one
+// clip (shares that do not tile the units, another tiling, another
+// latent) cross the same bytes; only this tells them apart.
+struct Header {
+  static constexpr std::int32_t kMagic = 0x56504453;   // "VPDS"
+  std::int32_t magic = kMagic, version = 1;
+  std::int32_t rank = 0, ranks = 0;
+  std::int32_t units = 0, u0 = 0, u1 = 0;
+  std::int32_t frames = 0, h = 0, w = 0, lt = 0;
+  std::int32_t reserved = 0;
+};
+
+// Whether two ranks' headers describe one clip whose two shares tile its
+// units; `why` not.
+bool agree(const Header& a, const Header& b, std::string* why);
+
+// Rank 1's frames `theirs` [first, end) of a [C, F, plane] bf16 clip
+// cross to rank 0, `piece` bytes at a time through `sbuf` / `rbuf`, as
+// `ch`'s exchanges seq0, seq0 + 1, ...: each rank hands its own bytes of
+// those frames (rank 0's are never read), and rank 0 ADDS each piece
+// where its own frames `mine` are too -- the two fade across each other
+// there -- and copies it everywhere else. Rank 1's clip is left as it is.
+// False, with `err`, when an exchange fails.
+bool cross(genai::TpChannel& ch, int rank, std::uint16_t* clip, int C,
+           int F, std::size_t plane, std::pair<int, int> theirs,
+           std::pair<int, int> mine, std::uint8_t* sbuf, std::uint8_t* rbuf,
+           std::size_t piece, std::uint64_t seq0, std::string* err,
+           double* merge_ms = nullptr);
+
+}  // namespace vae_decode_split
+#endif
 
 }
 

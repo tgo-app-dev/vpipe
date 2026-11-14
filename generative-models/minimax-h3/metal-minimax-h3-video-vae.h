@@ -13,6 +13,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -433,6 +434,27 @@ class MetalMiniMaxH3VideoVae {
     return _ane != nullptr && _ane->gpu_only();
   }
 
+  // A SHARE OF THE DECODE, for a decode split between hosts. A clip
+  // decodes in UNITS -- each chunk's rows of tiles, chunk by chunk, row
+  // by row -- and the next decode_video() decodes only units [u0, u1),
+  // writing the WHOLE clip's buffer: zero outside what those units make,
+  // and where a unit of another share fades with one of these (the tile
+  // row below, the next chunk) only this share's weighted part. Every
+  // stitch and fade is a weighted sum, so the shares' buffers ADD to the
+  // clip decoded whole (to bf16 rounding where two shares fade across
+  // each other). Set again for every decode; (0, -1) is the whole clip.
+  void set_unit_range(int u0, int u1)
+  {
+    _unit0 = u0;
+    _unit1 = u1;
+  }
+  // How many units an LT x lh x lw latent decodes in, and the pixel
+  // frames [first, end) units [u0, u1) write into (end past the fade
+  // into the next chunk's head). 0 / {0, 0} when there is no clip.
+  int decode_units(int LT, int lh, int lw) const;
+  std::pair<int, int> unit_frames(int LT, int lh, int lw, int u0,
+                                  int u1) const;
+
   void set_tile_progress(genai::VaeTileProgressFn fn)
   {
     _tile_progress = std::move(fn);
@@ -654,7 +676,8 @@ class MetalMiniMaxH3VideoVae {
   // whole decode would give, bit for bit. -1 stitches every frame.
   metal_compute::SharedBuffer
   decode_tiled_(const metal_compute::SharedBuffer& z, int LT, int lh, int lw,
-                std::string* err, int keep = -1);
+                std::string* err, int keep = -1, int row0 = 0,
+                int row1 = -1);
 
   // Cross-fade a grid of channel-first [C, T, th, tw] tiles into one
   // [C, T, out_h, out_w]. `ratio` converts the split's PIXEL units into
@@ -731,6 +754,8 @@ class MetalMiniMaxH3VideoVae {
   genai::VaeTileProgressFn _tile_progress;
   std::function<bool()>    _stop;
   int _prog_done = 0;
+  // set_unit_range's [u0, u1): the next decode_video's share.
+  int _unit0 = 0, _unit1 = -1;
   int _prog_total = 0;
   bool _use_mma2 = false;
   // M5: the encoder's 3x3x3 convs on the hardware convolution op

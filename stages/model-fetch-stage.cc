@@ -309,13 +309,21 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "bearer token for gated/private repos; empty -> the token env "
           "var for the chosen source ($HF_TOKEN / "
           "$HUGGING_FACE_HUB_TOKEN for HuggingFace, "
-          "$MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN for ModelScope), "
+          "$MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN for ModelScope, "
+          "$HF_MIRROR_TOKEN for hf-mirror), "
           "and prompted via getpasswd if a download turns out to be "
-          "gated"},
+          "gated. hf-mirror has no accounts: a gated repo through it takes "
+          "your own HuggingFace token, sent to that third party -- so it "
+          "is never offered $HF_TOKEN, and this key reaches it only when "
+          "`source` here names hf-mirror (not when $VPIPE_MODEL_SOURCE "
+          "chose it); set $HF_MIRROR_TOKEN only if you accept sending it "
+          "there"},
   {.key = "source", .type = ConfigType::String,
-   .doc = "where to DOWNLOAD from: 'huggingface' (default) or "
+   .doc = "where to DOWNLOAD from: 'huggingface' (default), "
           "'modelscope' (modelscope.cn, the mirror reachable from "
-          "mainland China). Empty -> $VPIPE_MODEL_SOURCE, else "
+          "mainland China) or 'hf-mirror' (hf-mirror.com, a mirror of "
+          "HuggingFace itself, reachable there too; elsewhere it redirects "
+          "to huggingface.co). Empty -> $VPIPE_MODEL_SOURCE, else "
           "huggingface -- so a machine behind the Great Firewall sets "
           "the env var once instead of every stage. This picks the "
           "SOURCE only: the registry key and the on-disk directory come "
@@ -411,7 +419,8 @@ const StageSpec kSpec = {
   .type_name = "model-fetch",
   .doc       = "Interactive one-shot: identify a model (browse the "
                "internal HuggingFace catalogue or type a path), download "
-               "it from HuggingFace or a mirror (modelscope.cn) under a "
+               "it from HuggingFace or a mirror (modelscope.cn, "
+               "hf-mirror.com) under a "
                "base path, synthesize the Qwen3-ASR tokenizer.json "
                "natively, and register it in the model registry keyed by "
                "the huggingface.co path whichever source served it. "
@@ -497,7 +506,8 @@ ModelFetchStage::process(RuntimeContext& ctx)
     string direct;
     if (s->getline(
             fmt("Model path (owner/repo, or a huggingface.co / "
-                "modelscope.cn URL), or Enter to browse the catalogue: "),
+                "modelscope.cn / hf-mirror.com URL), or Enter to browse "
+                "the catalogue: "),
             direct, cancel) != UiInputStatus::Ok) {
       s->error(fmt("ModelFetchStage('{}'): input closed", this->id()));
     }
@@ -838,8 +848,22 @@ ModelFetchStage::process(RuntimeContext& ctx)
 
   // -------- 4. Resolve auth token -------------------------------------
   // Each source has its own token env vars, so a machine set up for both
-  // does not offer HuggingFace's credential to modelscope.cn.
+  // does not offer HuggingFace's credential to modelscope.cn. A source
+  // that RELAYS a HuggingFace token to a third party (hf-mirror) takes a
+  // stage's `hf_token` only beside a `source` naming it: a graph carrying
+  // one for HuggingFace, on a machine whose $VPIPE_MODEL_SOURCE picked the
+  // mirror, would otherwise hand it there unasked.
   string token = _hf_token;
+  if (!token.empty() && src->relays_huggingface_token() &&
+      _source.empty()) {
+    token.clear();
+    s->info(fmt("ModelFetchStage('{}'): `hf_token` is not sent to {} -- "
+                "$VPIPE_MODEL_SOURCE chose it, not this stage; set "
+                "`source: {}` beside the token, or ${}, to send it there",
+                this->id(), src->label(), src->name(),
+                src->token_env().empty() ? string("HF_MIRROR_TOKEN")
+                                         : src->token_env().front()));
+  }
   for (const string& var : src->token_env()) {
     if (!token.empty()) { break; }
     if (const char* e = std::getenv(var.c_str())) { token = e; }
@@ -873,10 +897,14 @@ ModelFetchStage::process(RuntimeContext& ctx)
   // retry. This is where getpasswd earns its keep.
   if (!ok && (status == 401 || status == 403)) {
     string t;
-    if (s->getpasswd(
-            fmt("'{}' is gated. {} token (blank to cancel): ",
-                repo_path, src->label()),
-            t, cancel) == UiInputStatus::Ok) {
+    const string ask =
+        src->relays_huggingface_token()
+            ? fmt("'{}' is gated. {} has no accounts: your HuggingFace "
+                  "token, sent to it (blank to cancel): ",
+                  repo_path, src->label())()
+            : fmt("'{}' is gated. {} token (blank to cancel): ", repo_path,
+                  src->label())();
+    if (s->getpasswd(fmt("{}", ask), t, cancel) == UiInputStatus::Ok) {
       trim_(t);
       if (!t.empty()) {
         token = t;

@@ -16,8 +16,9 @@
 // download coordinate and the registry key -- because that is where these
 // models are published. It is not always where they can be REACHED:
 // huggingface.co is not routable from mainland China, and much of the
-// catalogue is mirrored on modelscope.cn instead. `model-fetch` reads from
-// either (its `source`, or $VPIPE_MODEL_SOURCE).
+// catalogue is mirrored on modelscope.cn instead -- and the whole of it on
+// hf-mirror.com, a mirror of HuggingFace itself. `model-fetch` reads from
+// any of them (its `source`, or $VPIPE_MODEL_SOURCE).
 //
 // WHAT A SOURCE DOES NOT CHANGE IS IDENTITY. A model fetched from a
 // mirror registers under the SAME key and lands in the SAME directory as
@@ -52,8 +53,9 @@ VPIPE_API_BEGIN
 
 namespace vpipe {
 
-// Every source name ("huggingface", "modelscope"), in registration order:
-// what `model-fetch`'s `source` attribute takes.
+// Every source name ("huggingface", "modelscope", "hf-mirror"), in
+// registration order: what `model-fetch`'s `source` attribute takes. A
+// later host may list more; a caller offers what it is given.
 VPIPE_MODEL_SOURCES_IMPORT std::vector<std::string> model_source_names();
 
 // How source `name` is spelled to a human ("ModelScope"); "" when the

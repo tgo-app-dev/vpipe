@@ -39,7 +39,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -269,12 +271,75 @@ dir_weights_bytes(const std::string& dir)
            (ext == ".safetensors" ? nvfp4_growth_(dir, true) : 0);
   }
   bool gguf = false;
+  // A RE-SHARDED REPO fetched over an older copy leaves the older shards
+  // beside the new (fishaudio/drama-3: eight shards became fifteen of the
+  // same tensors), and the loader reads the ones the index names. So in a
+  // directory holding shards of two counts ("-of-00008", "-of-00015"),
+  // only the counts its index names weigh -- all of them where the index
+  // names none on disk, as the loader then globs.
+  struct Shard {
+    fs::path path;
+    std::size_t bytes;
+    std::string of;   // "-of-NNNNN", or "" for an unsharded file
+  };
+  std::map<fs::path, std::vector<Shard>> by_dir;
   for (fs::recursive_directory_iterator it(dir, ec), end; it != end;
        it.increment(ec)) {
     if (it->is_regular_file(ec) && it->path().extension() == ".safetensors") {
-      total += (std::size_t)it->file_size(ec);
+      const std::string nm = it->path().filename().string();
+      const std::size_t at = nm.rfind("-of-");
+      by_dir[it->path().parent_path()].push_back(
+          {it->path(), (std::size_t)it->file_size(ec),
+           at == std::string::npos ? std::string() : nm.substr(at)});
     }
     gguf = gguf || it->path().extension() == ".gguf";
+  }
+  for (const auto& [d, shards] : by_dir) {
+    std::set<std::string> counts;
+    for (const Shard& s : shards) {
+      if (!s.of.empty()) { counts.insert(s.of); }
+    }
+    std::set<std::string> named;   // file names the index names
+    if (counts.size() > 1) {
+      for (const auto& e : fs::directory_iterator(d, ec)) {
+        const std::string nm = e.path().filename().string();
+        constexpr std::string_view kIndex = ".safetensors.index.json";
+        if (nm.size() < kIndex.size() ||
+            nm.compare(nm.size() - kIndex.size(), kIndex.size(), kIndex) !=
+                0) {
+          continue;
+        }
+        try {
+          std::ifstream f(e.path());
+          const std::string text((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+          const FlexData j = FlexData::from_json(text);
+          if (!j.is_object() || !j.as_object().contains("weight_map")) {
+            continue;
+          }
+          const FlexData wm = j.as_object().at("weight_map");
+          if (!wm.is_object()) { continue; }
+          for (const auto& kv : wm.as_object()) {
+            if (kv.second.is_string()) {
+              named.insert(std::string(kv.second.as_string("")));
+            }
+          }
+        } catch (...) {
+        }
+      }
+    }
+    std::set<std::string> kept;    // the counts the index names, on disk
+    for (const Shard& s : shards) {
+      if (!s.of.empty() && named.count(s.path.filename().string()) != 0) {
+        kept.insert(s.of);
+      }
+    }
+    for (const Shard& s : shards) {
+      if (!kept.empty() && !s.of.empty() && kept.count(s.of) == 0) {
+        continue;
+      }
+      total += s.bytes;
+    }
   }
   if (total == 0 && gguf) { return gguf_served_bytes_(dir); }
   // An NVFP4 (ModelOpt) language model weighs what its load holds.
@@ -1046,6 +1111,38 @@ residency_reserve_beside(const SessionContextIntf* session,
     widest = std::max(widest, scratch_footprint(session, p));
   }
   return widest;
+}
+
+std::size_t
+kept_beside_every_phase(const SessionContextIntf* session,
+                        const std::string& dir, std::string_view phase,
+                        std::size_t need, std::size_t beside,
+                        std::size_t headroom)
+{
+  auto* mgr = session != nullptr
+                  ? session->services()->generative_model_manager()
+                  : nullptr;
+  const std::vector<std::string> self = {dir};
+  // A phase's weights with `dir` in them: weight_footprint adds a
+  // checkpoint the plan has not heard of, and skips one it has whatever
+  // the phase -- so one claimed for another phase is added here.
+  auto weights = [&](std::string_view p) {
+    std::size_t w = weight_footprint(session, self, p);
+    if (mgr != nullptr && mgr->accounts_for(dir) &&
+        !mgr->counts_in_phase(dir, std::string(p))) {
+      w += mgr->planned_weight_bytes(dir);
+    }
+    return w;
+  };
+  std::size_t fp = weights(phase) + beside;
+  for (int i = 0; i < phase_count(); ++i) {
+    const std::string_view p = phase_name(i);
+    if (p == phase) { continue; }
+    const std::size_t sc = scratch_footprint(session, p);
+    const std::size_t total = weights(p) + beside + (sc > 0 ? sc : headroom);
+    if (total > need) { fp = std::max(fp, total - need); }
+  }
+  return fp;
 }
 
 std::size_t

@@ -274,6 +274,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         bonsai.cc
         bs-roformer.cc
         rife.cc
+        relayvsr.cc
         drama3.cc
         deepseek-v41.cc
         lm-run-memory.cc

@@ -397,6 +397,109 @@ TEST(minimax_h3_vvae, each_half_loads_at_its_first_use)
   EXPECT_TRUE(after_dec - after_enc == dec);
 }
 
+// A SHARE OF THE DECODE (set_unit_range: a decode split between hosts)
+// writes the whole clip's buffer, zero outside its own frames, and the
+// shares' buffers ADD to the clip decoded whole -- every tile stitch and
+// chunk fade a weighted sum, each share writing the terms of its own
+// tiles. Cut at a tile in a chunk's first row, at a row inside a chunk,
+// at a chunk's end and after its first tile: frames one share wrote alone
+// the whole decode's to the bit, the rest to bf16 rounding: each share's
+// part rounded in its stitch and its fade, then their sum -- two steps of
+// the largest but for a few pixels where a share's terms cancel (up to
+// ten, 1/64 at most, measured).
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (the video VAE's folder).
+TEST(minimax_h3_vvae, decode_shares_add_to_the_whole)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config c;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, c, &err));
+  // A 2 x 2 grid of 64-pixel tiles, several chunks.
+  c.tile_size = 64;
+  c.tile_overlap_min = 16;
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, c);
+  ASSERT_TRUE(m != nullptr);
+  if (!m) { return; }
+  const int LT = 14, lh = 6, lw = 6;
+  const std::size_t lplane = (std::size_t)lh * lw;
+  std::vector<std::uint16_t> zv((std::size_t)c.z_channels * LT * lplane);
+  for (std::size_t i = 0; i < zv.size(); ++i) {
+    zv[i] = f32_to_bf16_(std::sin(0.37f * (float)i) * 0.9f);
+  }
+  SharedBuffer zb = mc->make_shared_buffer(zv.size() * 2);
+  std::memcpy(zb.contents(), zv.data(), zv.size() * 2);
+  int F = 0;
+  SharedBuffer whole = m->decode_video(zb, LT, lh, lw, &F, &err);
+  ASSERT_TRUE(!whole.empty());
+  if (whole.empty()) { return; }
+  const int units = m->decode_units(LT, lh, lw);
+  const int tcs = c.tokens_per_chunk(), td = c.token_drop;
+  const int pad = ((-(LT + td) % tcs) + tcs) % tcs;
+  const int chunks = (LT + td + pad) / tcs - (td > 0 ? 1 : 0);
+  const int per = units / std::max(1, chunks);
+  ASSERT_TRUE(per == 4);   // the 2 x 2 grid
+  ASSERT_TRUE(units >= 3 * per);
+  const std::size_t plane = (std::size_t)lh * c.patch * lw * c.patch;
+  const std::size_t n = (std::size_t)c.out_channels * F * plane;
+  const auto* wv = static_cast<const std::uint16_t*>(whole.contents());
+  for (const int cut : {1, 2, per, per + 1, 2 * per + 1, units - 1}) {
+    m->set_unit_range(0, cut);
+    int F0 = 0, F1 = 0;
+    SharedBuffer a = m->decode_video(zb, LT, lh, lw, &F0, &err);
+    m->set_unit_range(cut, -1);
+    SharedBuffer b = m->decode_video(zb, LT, lh, lw, &F1, &err);
+    ASSERT_TRUE(!a.empty() && !b.empty() && F0 == F && F1 == F);
+    if (a.empty() || b.empty()) { return; }
+    const auto* av = static_cast<const std::uint16_t*>(a.contents());
+    const auto* bv = static_cast<const std::uint16_t*>(b.contents());
+    // Each share zero outside its frames.
+    const auto fa = m->unit_frames(LT, lh, lw, 0, cut);
+    const auto fb = m->unit_frames(LT, lh, lw, cut, units);
+    ASSERT_TRUE(fa.first == 0 && fb.second == F && fb.first < fa.second);
+    // Where one share wrote alone, its frames are the whole decode's to
+    // the bit; where both did, each pixel within two of bf16's steps.
+    std::size_t stray = 0, alone_off = 0, both_off = 0, both = 0;
+    double worst = 0, worst_abs = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const int f = (int)((i / plane) % (std::size_t)F);
+      if ((f >= fa.second && av[i] != 0) || (f < fb.first && bv[i] != 0)) {
+        ++stray;
+      }
+      const float want = bf16_to_f32_(wv[i]);
+      if (f < fb.first || f >= fa.second) {
+        alone_off += (f < fb.first ? av[i] : bv[i]) != wv[i];
+        continue;
+      }
+      const float got = bf16_to_f32_(f32_to_bf16_(bf16_to_f32_(av[i]) +
+                                                  bf16_to_f32_(bv[i])));
+      // A step of the largest of the parts and the result: where the
+      // parts nearly cancel, their own rounding is what remains.
+      const float mag = std::max({std::fabs(want),
+                                  std::fabs(bf16_to_f32_(av[i])),
+                                  std::fabs(bf16_to_f32_(bv[i])), 1e-6f});
+      const double ulp = std::ldexp(1.0, std::ilogb(mag) - 7);
+      const double d = std::fabs((double)got - want);
+      worst = std::max(worst, d / ulp);
+      worst_abs = std::max(worst_abs, d);
+      both_off += d > 2 * ulp;
+      ++both;
+    }
+    std::printf("[minimax_h3_vvae] shares cut at unit %d of %d: frames "
+                "[0, %d) + [%d, %d); alone %zu off, both worst %.1f steps "
+                "%.4f (%zu of %zu past 2)\n", cut, units, fa.second,
+                fb.first, F, alone_off, worst, worst_abs, both_off, both);
+    EXPECT_TRUE(stray == 0);
+    EXPECT_TRUE(alone_off == 0);
+    EXPECT_TRUE(worst_abs <= 1.0 / 32);
+    EXPECT_TRUE(both_off * 1000 <= both);
+  }
+}
+
 // decode_video writes each chunk into ONE clip as it goes, where it once
 // kept every chunk's piece and copied them into a second whole clip at the
 // end (two copies of the decode at the peak). The clip must be the old

@@ -53,6 +53,13 @@
 namespace vpipe {
 namespace {
 
+// The warm hold's kind for MiniMax-H3's DiT (keep_model_warm).
+constexpr const char* kWarmH3 = "minimax-h3-dit";
+
+}  // namespace
+
+namespace {
+
 // The margin kept on reclaimable RAM. The WORKING-SET margin is
 // deliberately NOT here: over-allocating wired Metal memory is the failure
 // that takes the machine down rather than slowing it, so that cushion stays
@@ -555,6 +562,18 @@ const ConfigKey kAttrs[] = {
           "reuses every element; only the estimate is subsampled. 1 reads "
           "everything",
    .def_int = 8},
+  {.key = "keep_loaded", .type = ConfigType::Real, .required = false,
+   .doc = "seconds to keep MiniMax-H3's DiT BUILT after this stage lets it "
+          "go (a clip's end under unload_when_idle, or the graph's), on a "
+          "box with room for it beside the decode -- every block resident "
+          "(its blocks stream on the first forward and are kept as the box "
+          "allows): the next graph asking for the same checkpoint and "
+          "build -- a rank's share, adapters, int8 tier, attention -- is "
+          "handed it resident, nothing read again. Released sooner when a "
+          "launch that does not use it needs the room. 0 (the default) "
+          "lets it go. Not on a box whose blocks stream for want of room, "
+          "nor with a VDN branch, TaoMate or MiniMax-H3-Image",
+   .def_real = 0.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
@@ -792,6 +811,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
 #endif
   _frames = (int)attr_int("frames");
   _fps    = attr_real("fps");
+  _keep_loaded = std::max(0.0, attr_real("keep_loaded"));
   _steps  = (int)attr_int("steps");
   _i8_gemm = attr_bool("i8_gemm");
   _tp_cfg = {};
@@ -1135,7 +1155,102 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   set_oport_policy(kPreviewPort, {kPreviewDepth, OverrunPolicy::DropOldest});
 }
 
-GenerateVideoStage::~GenerateVideoStage() = default;
+GenerateVideoStage::~GenerateVideoStage()
+{
+  (void)keep_h3_warm_();
+}
+
+// MiniMax-H3's DiT handed to the manager's warm hold (keep_loaded) as the
+// stage lets it go -- the same rule the picture stages keep: a build on a
+// box that is not tight (_h3_may_keep: its blocks did not stream for want
+// of room) and, streamed then retained, with EVERY block resident -- the
+// stack a next graph takes back then reads nothing -- and only where the
+// box holds it beside the rest of THIS graph and what else is warm: what
+// the manager books in the decode phase still to come (its weights, its
+// declared scratch -- else the decode's working set), the live language
+// models' K/V, every other warm hold, this one, the headroom -- within
+// the RAM, as release_warm_unless_it_fits_ asks of the next launch. The
+// plan let this DiT's bytes go at the decode only under `destroy` (its
+// phase claim); otherwise its claim is counted there already and is left
+// out once, so the hold is weighed at what the model holds (held_bytes,
+// its adapters' factors with it). A rank's share is small beside its
+// checkpoint, so a rank on a box that streams the whole model keeps it.
+// A rank's generation is ended first: the link is a clip's, never kept.
+// Its wired bytes are noted with the hold (note_warm_wired): they stay
+// charged to the pool.
+bool
+GenerateVideoStage::keep_h3_warm_()
+{
+  if (!_h3_dit || !_h3_may_keep || _h3_warm_key.empty() ||
+      session() == nullptr) {
+    return false;
+  }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return false; }
+  if (_h3_dit->streaming()) {
+    (void)_h3_dit->release_idle_slots();
+    const int kept = _h3_dit->resident_block_count();
+    if (kept < _h3_cfg.n_layers) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): the MiniMax-H3 DiT is not kept warm -- "
+          "residency held {} of its {} blocks, so the next graph would "
+          "stream it again", this->id(), kept, _h3_cfg.n_layers));
+      return false;
+    }
+  }
+  // Its forward's scratch goes first: a warm hold keeps weights.
+  const std::size_t freed = _h3_dit->release_forward_scratch();
+  if (freed > 0) {
+    session()->log_debug(fmt(
+        "GenerateVideoStage('{}'): {} MB of the DiT's forward scratch let "
+        "go before it is kept warm", this->id(), freed >> 20));
+  }
+  const std::size_t held = _h3_dit->held_bytes() + _h3_dit->lora_bytes();
+  const std::string decode_phase(model_memory::kPhaseDecode);
+  std::size_t decode = mgr->scratch_bytes(decode_phase);
+  if (decode == 0) {
+    decode = model_memory::video_vae_working_bytes(_root, _width, _height);
+  }
+  std::size_t others = mgr->phase_footprint(decode_phase) +
+                       mgr->resident_kv_bytes();
+  // Its own claims -- the DiT's and its adapters' -- unless `destroy`
+  // phased them to the denoise (decide_resources): counted in the decode
+  // phase's figure already, where `held` counts them again.
+  if (_unload_cfg != model_memory::UnloadPolicy::kDestroy) {
+    std::size_t own = mgr->planned_weight_bytes(h3_warm_dir_());
+    for (const std::string& f : h3_plan_lora_files_()) {
+      own += mgr->planned_weight_bytes(f);
+    }
+    others -= std::min(others, own);
+  }
+  for (const auto& w : mgr->warm_report()) {
+    others += w.bytes + w.kv_bytes;
+  }
+  const std::size_t ram = model_memory::phys_ram();
+  if (ram == 0 || others + held + decode + model_memory::kHeadroom > ram) {
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): the MiniMax-H3 DiT is not kept warm -- "
+        "{} MB beside {} MB held or booked and the decode's {} MB is more "
+        "than this {} MB box keeps", this->id(), held >> 20, others >> 20,
+        decode >> 20, ram >> 20));
+    return false;
+  }
+  _h3_dit->end_tp_generation();
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): the MiniMax-H3 DiT{} kept warm for {:.0f} s "
+      "({} MB)", this->id(),
+      _h3_cfg.tp.active() ? fmt(" (rank {}'s share)", _h3_cfg.tp.rank)()
+                          : std::string(),
+      _keep_loaded, held >> 20));
+  const std::size_t wired = _h3_dit->wired_bytes();
+  mgr->keep_model_warm(kWarmH3, h3_warm_dir_(), _h3_warm_key,
+                       std::move(_h3_dit), held, _keep_loaded);
+  // Its blocks stay wired while it is warm: the pool test of the next
+  // launch beside it counts them (release_warm_unless_it_fits_).
+  mgr->note_warm_wired(kWarmH3, h3_warm_dir_(), _h3_warm_key, wired);
+  _h3_dit.reset();
+  return true;
+}
 
 const StageSpec&
 GenerateVideoStage::spec() const noexcept
@@ -1203,6 +1318,28 @@ GenerateVideoStage::h3_reference_route(bool said, int num_references,
     return said ? H3Route::kReference : H3Route::kRefuse;
   }
   return H3Route::kKeyframe;
+}
+
+// See the declaration. Neither question names the text encoder or a VAE:
+// a peer that holds one has declared it (every model-holding stage
+// does), and the manager counts that declaration in its phase. Named
+// here as well, it was counted AGAIN at its size on disk whenever
+// nothing in the launch held it -- a graph handed its conditioning,
+// with no conditioning stage in it.
+model_memory::StreamPlan
+GenerateVideoStage::h3_stream_plan(const SessionContextIntf* session,
+                                   const std::string&        dit_dir,
+                                   std::size_t               dit_retires)
+{
+  return model_memory::plan_streaming(session, dit_dir, std::string(),
+                                      model_memory::kStreamHeadroom,
+                                      dit_retires);
+}
+
+bool
+GenerateVideoStage::h3_box_bounded(const SessionContextIntf* session)
+{
+  return model_memory::bounded(session, {}, model_memory::kHeadroom);
 }
 
 // See the declaration. Outside the Apple-Silicon guard for the same
@@ -1558,53 +1695,66 @@ GenerateVideoStage::h3_ane_bytes_() const
                                                              h3_plan_seq_());
 }
 
-namespace {
-
-// What a RANK of a split H3 holds (`tensor_parallel`): its share of every
-// block's four projections and the trunk whole -- no AdaLN, which the
-// bake reads from the checkpoint and retires (the final layer's too) --
-// and the bake's tables for up to `bake_rows` rows in its place. 0 when
-// not split.
+// What a RANK of a split H3 holds (`tensor_parallel`): the transformer's
+// own figure, the one held_bytes() then measures -- its share of every
+// block's four projections in the layout the load leaves (bf16, an
+// affine pack's codes, a main block's int8 tier layout where it engages
+// -- not under an ANE tier asked, the larger figure whether or not it is
+// granted), the trunk and the refiner's norms whole, no AdaLN (the bake
+// reads it from the checkpoint and retires it, the final layer's too),
+// and the bake's tables for four rows a step of the most steps it can
+// run. 0 when not split.
 //
-// The load's transient -- each projection read whole, uncached, then cut
-// (tp_linear_): fc1's 411 MB at most -- is not held: the forward's
-// scratch, booked beside this, is not allocated until the first forward,
-// after the load.
+// The load's transient -- a column cut's projection read whole,
+// uncached, then cut (tp_linear_; a row cut reads its share's rows
+// alone): the out projection's 77 MB, fc2's 154 at most -- is not held:
+// the forward's scratch, booked beside this, is not allocated until the
+// first forward, after the load.
 std::size_t
-h3_tp_held_bytes_(const std::string& dit, const FlexData& tp, int bake_rows)
+GenerateVideoStage::h3_tp_held_bytes_(const std::string& dit,
+                                      bool hold_w4,
+                                      std::size_t* floor) const
 {
+  if (floor != nullptr) { *floor = 0; }
   using T = genai::MetalMiniMaxH3Transformer;
-  if (!tp.is_object()) { return 0; }
   T::Config tc;
-  if (!T::config_from_json(dit, tc, nullptr)) { return 0; }
-  genai::TpShare sh;
-  if (!genai::TpShare::from_flex(tp, tc.n_heads, tc.ffn, &sh, nullptr) ||
-      !sh.active()) {
+  if (!_tp_cfg.is_object() || !T::config_from_json(dit, tc, nullptr)) {
     return 0;
   }
-  auto wts = genai::MetalLlamaWeights::open_model(dit);
-  if (!wts) { return 0; }
-  const double hf = (double)sh.heads() / (double)sh.n_heads;
-  const double ff = (double)sh.ffn() / (double)sh.n_ffn;
-  double held = 0.0;
-  for (const std::string& nm : wts->tensor_names()) {
-    const auto* ti = wts->info(nm);
-    if (ti == nullptr) { continue; }
-    const double b = (double)ti->nbytes;
-    if (nm.find(".adaln_proj.") != std::string::npos) { continue; }
-    if (nm.find(".attn.qkv_proj.") != std::string::npos ||
-        nm.find(".attn.out_proj.") != std::string::npos) {
-      held += b * hf;
-    } else if (nm.find(".mlp.fc1.") != std::string::npos ||
-               nm.find(".mlp.fc2.") != std::string::npos) {
-      held += b * ff;
-    } else {
-      held += b;
+  tc.tp = h3_tp_share_(tc);
+  if (!tc.tp.active()) { return 0; }
+  tc.i8_gemm = _i8_gemm;
+  tc.i8_tier = _i8_tier;
+  tc.i8_hold_w4 = hold_w4;
+  tc.autotune = _autotune;
+  tc.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  auto* mc = session() != nullptr ? session()->services()->metal_compute()
+                                  : nullptr;
+  // The bake's rows: four a step, at the most steps the clip can run --
+  // the request's, or a flow-map adapter's grid, or an adapter's sampling
+  // contract, as the load bounds them.
+  int steps = h3_steps_();
+  for (const std::string& f : h3_plan_lora_files_()) {
+    steps = std::max(steps, T::flow_map_steps(f));
+    T::SamplingContract sc;
+    std::string cerr;
+    if (T::sampling_contract_of(f, &sc, &cerr)) {
+      steps = std::max(steps, (int)sc.sigmas.size() - 1);
     }
   }
-  return (std::size_t)held + T::adaln_table_bytes_for(tc, bake_rows);
+  return T::tp_held_bytes(dit, tc, 4 * steps, mc, floor);
 }
 
+genai::TpShare
+GenerateVideoStage::h3_tp_share_(
+    const genai::MetalMiniMaxH3Transformer::Config& c) const
+{
+  genai::TpShare sh;
+  if (!_tp_cfg.is_object() ||
+      !genai::TpShare::from_flex(_tp_cfg, c.n_heads, c.ffn, &sh, nullptr)) {
+    return genai::TpShare{};
+  }
+  return sh;
 }
 
 // THE DENOISE'S ACTIVATIONS, which the plan never booked: only the
@@ -2033,16 +2183,21 @@ GenerateVideoStage::declare_resources() const
   // to by streaming its blocks. A graph that does not fit the first and
   // does fit the second is not one to refuse -- it is one to stream.
   //
-  // A RANK of a split DiT (`tensor_parallel`) is neither: it holds its
-  // share, preloaded, and never streams -- booked at that (held), its
-  // floor the same, as declare_memory() reports it. Claimed as the whole
-  // checkpoint streamable to its floor, the ledger that refuses graphs
-  // and every peer sizing against it read 66.3 GB that could shrink to a
-  // few, for a rank that holds 8.0 (11 of 56 heads) and cannot.
+  // A RANK of a split DiT (`tensor_parallel`) streams its SHARE as the
+  // whole model streams the checkpoint: booked at the share every block
+  // kept (held), streamable to the rank's floor -- its trunk, refiner and
+  // tables, and two blocks' shares -- as declare_memory() reports it.
+  // Claimed as the whole checkpoint, the ledger that refuses graphs and
+  // every peer sizing against it read 66.3 GB for a rank that holds 8.0
+  // (11 of 56 heads).
   std::vector<ResourceClaim> out;
-  if (const std::size_t tp = h3_tp_held_bytes_(dit, _tp_cfg, 4 * h3_steps_());
+  std::size_t tp_floor = 0;
+  if (std::size_t tp = h3_tp_held_bytes_(dit, false, &tp_floor);
       tp > 0) {
-    ResourceClaim c = model_memory::weight_claim_streamable(dit, tp);
+    // ...and the w4 layouts' growth on its share where its load held
+    // them preloaded (the VPIPE_PRELOAD A/B; 0 until a load decides).
+    tp += _h3_tp_hold_growth_;
+    ResourceClaim c = model_memory::weight_claim_streamable(dit, tp_floor);
     bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
                      (std::int64_t)tp);
     out.push_back(std::move(c));
@@ -2079,10 +2234,13 @@ GenerateVideoStage::declare_resources() const
     T::Config tc;
     const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
     tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
+    // A rank holds its cut of the split projections' factors.
+    const genai::TpShare share = h3_tp_share_(tc);
     bool off_curve = false;
     int bound_steps = h3_steps_();
     for (const std::string& f : h3_plan_lora_files_()) {
-      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr);
+      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr,
+                                        share.active() ? &share : nullptr);
       off_curve = off_curve || (tc.pruned() && T::moves_time_embedding(f));
       bound_steps = std::max(bound_steps, T::flow_map_steps(f));
       if (fp.whole == 0) { continue; }
@@ -2233,12 +2391,14 @@ GenerateVideoStage::declare_memory() const
   // is `destroy` -- so under `auto` the pooling below had an empty
   // string and did nothing, silently.
   _dit_dir_declared_ = dit;
-  // A rank of a split DiT holds its share, preloaded.
-  // Its bake's rows as the plan bounds them, four a step: a rank runs no
-  // adapter, so the steps are the request's.
-  if (const std::size_t tp = h3_tp_held_bytes_(dit, _tp_cfg, 4 * h3_steps_());
-      tp > 0) {
-    m.hold(dit, tp, tp,
+  // A rank of a split DiT holds its share, every block kept, with its
+  // bake's tables (h3_tp_held_bytes_) -- and, where a preloaded load held
+  // the w4 layouts, their growth on the share -- streamable to its floor.
+  std::size_t tp_floor = 0;
+  if (const std::size_t share = h3_tp_held_bytes_(dit, false, &tp_floor);
+      share > 0) {
+    const std::size_t tp = share + _h3_tp_hold_growth_;
+    m.hold(dit, tp, tp_floor,
            _unload_cfg == model_memory::UnloadPolicy::kDestroy,
            _unload_cfg == model_memory::UnloadPolicy::kAuto);
   } else {
@@ -2263,8 +2423,10 @@ GenerateVideoStage::declare_memory() const
     T::Config tc;
     const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
     tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
+    const genai::TpShare share = h3_tp_share_(tc);
     for (const std::string& f : h3_plan_lora_files_()) {
-      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr);
+      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr,
+                                        share.active() ? &share : nullptr);
       m.hold(f, fp.whole, fp.streamed,
              _unload_cfg == model_memory::UnloadPolicy::kDestroy);
     }
@@ -3313,22 +3475,11 @@ GenerateVideoStage::ensure_expert_(int which)
     _h3_dit_dir_ = dit_dir;
     _h3_load_floor_ = 0;
     _h3_revised_ = 0;
-    // Through the encoder's own resolver, not by spelling a sibling of
-    // the DiT: on a Comfy-Org repack the DiT's parent IS the root and the
-    // encoder lives under `text_encoders/`, so building the path by hand
-    // produced a directory that does not exist and silently dropped the
-    // encoder out of the streaming decision.
-    std::string enc_dir =
-        _h3i ? minimax_h3_image_encoder_dir(session(), _root)
-             : genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
-    if (enc_dir == _root || !fs::exists(enc_dir)) { enc_dir.clear(); }
-    // A RANK of a split DiT (`tensor_parallel`, checked in full below):
-    // known BEFORE the streaming question, which it is not asked -- a
-    // rank holds its share, preloaded, and the checkpoint's whole size is
-    // nothing it will hold. Decided after it, the verdict on 66 GB read
-    // "tight" on a box its share fits, and a tight box revised the
-    // declaration to the trunk (the share is the model's own buffers, not
-    // the set's) and dropped the DiT after every clip.
+    // A RANK of a split DiT (`tensor_parallel`, checked in full below).
+    // It STREAMS, THEN RETAINS as the whole model does, asked the
+    // streaming question on its SHARE: the plan books the share (its
+    // claim's held bytes), never the checkpoint's whole size, which it
+    // will not hold.
     genai::TpShare tp_share;
     const bool tp_rank =
         _tp_cfg.is_object() &&
@@ -3384,9 +3535,9 @@ GenerateVideoStage::ensure_expert_(int which)
             genai::MetalMiniMaxH3Transformer::adaln_retired_bytes(dit_dir);
       }
     }
-    const auto plan = model_memory::plan_streaming(
-        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom,
-        dit_retires);
+    // This stage's checkpoint alone: the text encoder is a peer's, and
+    // counts through what its stage declared (h3_stream_plan).
+    const auto plan = h3_stream_plan(session(), dit_dir, dit_retires);
     // STREAM, THEN RETAIN on every box (model_memory::stream_blocks_by_
     // default; VPIPE_PRELOAD=1 preloads, for the A/B): the first forward
     // reads each block as it needs it and residency keeps it, so a box
@@ -3396,7 +3547,6 @@ GenerateVideoStage::ensure_expert_(int which)
     if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
-    if (tp_rank) { stream_blocks = false; }   // a rank preloads its share
     // THE BOX IS TIGHT, apart from the mechanism: what only a tight box
     // wants -- dropping the DiT after each clip, revising the declaration
     // to the trunk -- keys on this. A streamed DiT on a box with room
@@ -3426,8 +3576,15 @@ GenerateVideoStage::ensure_expert_(int which)
     // growth (every w4 block projection's codes again) -- and converted
     // per projection where it has not, or the blocks stream; generate-
     // image's rule. VPIPE_I8_W4_HOLD overrides.
+    //
+    // A RANK's growth is its SHARE's: what tp_held_bytes books for it
+    // with the layout held, less what it books without (the main blocks'
+    // w4 shares at int8 in place of their packs), asked only where the
+    // checkpoint has a w4 block projection at all. Weighed as the whole
+    // checkpoint's, a rank asked for room its share never takes.
     _h3_cfg.i8_hold_w4 = false;
     _h3_i8_hold_growth_ = 0;
+    _h3_tp_hold_growth_ = 0;
     if (_i8_gemm && _i8_tier > 0 && h3mc != nullptr &&
         h3mc->supports_matrix_cores()) {
       std::size_t held = 0;
@@ -3448,6 +3605,11 @@ GenerateVideoStage::ensure_expert_(int which)
           }
         }
       }
+      if (held > 0 && tp_rank) {
+        const std::size_t as_pack = h3_tp_held_bytes_(dit_dir, false);
+        const std::size_t as_layout = h3_tp_held_bytes_(dit_dir, true);
+        held = as_layout > as_pack ? as_layout - as_pack : 0;
+      }
       if (held > 0) {
         // By the box's room, streamed or not: residency converts each
         // block it keeps into the layout (keep_block_), a slot converts
@@ -3464,13 +3626,13 @@ GenerateVideoStage::ensure_expert_(int which)
         // manager's declaration by it. A streamed DiT holds the layout
         // only in the blocks it keeps, which its own revision reads.
         if (_h3_cfg.i8_hold_w4 && !stream_blocks) {
-          _h3_i8_hold_growth_ = held;
+          (tp_rank ? _h3_tp_hold_growth_ : _h3_i8_hold_growth_) = held;
         }
         session()->info(fmt(
             "GenerateVideoStage('{}'): the w4 projections' int8 layout {} "
-            "({} MB to hold it; {})", this->id(),
+            "({} MB to hold it{}; {})", this->id(),
             _h3_cfg.i8_hold_w4 ? "HELD" : "CONVERTED PER PROJECTION",
-            held >> 20,
+            held >> 20, tp_rank ? " on this rank's share" : "",
             std::getenv("VPIPE_I8_W4_HOLD") != nullptr
                 ? "VPIPE_I8_W4_HOLD"
                 : bounded ? "the blocks stream" : "by the box's room"));
@@ -3539,7 +3701,7 @@ GenerateVideoStage::ensure_expert_(int which)
     // TENSOR PARALLEL: this stage is one RANK of a DiT split across
     // hosts -- its share of the heads and the feed-forward rows, the
     // other ranks' partial sums through the transport a plugin registered
-    // under the name given. A rank preloads its share (it is a share).
+    // under the name given. A rank streams its share, then keeps it.
     // Its CHANNEL is not opened here: the weights may outlive a clip --
     // kept or let go by this host's own memory, kept warm into the next
     // graph -- and the link must not. Each clip opens one
@@ -3581,9 +3743,87 @@ GenerateVideoStage::ensure_expert_(int which)
         return false;
       }
     }
-    _h3_dit = genai::MetalMiniMaxH3Transformer::load(
-        genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
-        stream_blocks, loras);
+    // KEPT WARM by an earlier graph (keep_loaded): the same checkpoint,
+    // built alike -- every setting the load takes, a rank's share and its
+    // adapters by file -- taken back resident; each adapter's strength set
+    // as this stage has it (a strength is live, not a load argument).
+    // STREAM, THEN RETAIN is every box's (stream_blocks_by_default): a
+    // streamed DiT on a box with room converges on every block resident,
+    // and that is what a warm hold keeps (keep_h3_warm_ checks it). A
+    // TIGHT box -- its blocks stream for want of room -- keeps nothing.
+    _h3_may_keep = _keep_loaded > 0 && !bounded && _vdn_dir.empty() &&
+                   taomate_slot < 0 && !_h3i;
+    if (_keep_loaded > 0 && !_h3_may_keep) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): keep_loaded is not taken -- {}",
+          this->id(),
+          bounded ? "the DiT's blocks stream on this box for want of room"
+          : !_vdn_dir.empty() ? "a VDN branch rides on the DiT"
+          : taomate_slot >= 0 ? "TaoMate-H3's adapter rides on the DiT"
+                              : "MiniMax-H3-Image's per-step heads ride on "
+                                "the DiT"));
+    }
+    {
+      const auto& c = _h3_cfg;
+      // Every setting the load takes, the denoise reads off the model's
+      // config (Sol's threshold) or a bound adapter reads off it (the
+      // released timestep MLP a pruned DiT's adapters are ported
+      // through), and whether its blocks were streamed.
+      std::string k = fmt("{}|{}|i8 {} {} {} tune {}|sage {} {} {} {} {} "
+                          "{}|sol {} {} {} {} {} {} {} {}|ane {} {} {} {} "
+                          "{} {}|qkv {}|stream {}|mlp {}",
+                          dit_dir, c.partition, c.i8_gemm ? 1 : 0,
+                          c.i8_tier, c.i8_hold_w4 ? 1 : 0,
+                          c.autotune ? 1 : 0, c.sage.enabled ? 1 : 0,
+                          c.sage.dense_layers, c.sage.smooth_k ? 1 : 0,
+                          c.sage.pv8 ? 1 : 0, c.sage.pv8_from_step,
+                          c.sage.pv8_all_rows ? 1 : 0,
+                          c.sol.enabled ? 1 : 0, c.sol.tau,
+                          c.sol.dense_layers, c.sol.local_radius,
+                          c.sol.sink_start, c.sol.sink_tokens,
+                          c.sol.key_block, (int)c.sol.thresh,
+                          c.ane_ffn ? 1 : 0, c.ane_qkv ? 1 : 0,
+                          c.ane_int8 ? 1 : 0, c.ane_int8_plain ? 1 : 0,
+                          c.ane_rows, c.ane_layers, c.qkv_per_head ? 1 : 0,
+                          stream_blocks ? 1 : 0, c.time_mlp_dir)();
+      if (c.tp.active()) {
+        k += fmt("|tp {}/{} heads {}-{} ffn {}-{}", c.tp.rank, c.tp.ranks,
+                 c.tp.head0, c.tp.head1, c.tp.ffn0, c.tp.ffn1)();
+      }
+      for (const auto& l : loras) {
+        k += fmt("|lora {} {}", l.path, (int)l.qkv_layout)();
+      }
+      _h3_warm_key = std::move(k);
+    }
+    if (_h3_may_keep) {
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        _h3_dit = mgr->take_warm<genai::MetalMiniMaxH3Transformer>(
+            kWarmH3, h3_warm_dir_(), _h3_warm_key);
+        // (A miss lets another build of it go: take_warm_model.)
+      }
+      if (_h3_dit) {
+        // Every slot the model bound, its modules or curve branches alone
+        // (set_lora_scale ignores a slot it does not have).
+        for (int i = 0; i < kH3LoraSlots; ++i) {
+          const int ms = _h3_lora_model_slot[(std::size_t)i];
+          if (ms >= 0) {
+            _h3_dit->set_lora_scale(ms,
+                                    (float)_h3_lora[(std::size_t)i].scale);
+          }
+        }
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): the MiniMax-H3 DiT kept warm is taken "
+            "back{}", this->id(),
+            _h3_cfg.tp.active()
+                ? fmt(" (rank {}'s share)", _h3_cfg.tp.rank)()
+                : std::string()));
+      }
+    }
+    if (!_h3_dit) {
+      _h3_dit = genai::MetalMiniMaxH3Transformer::load(
+          genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
+          stream_blocks, loras);
+    }
     // MiniMax-H3-Image: one output head a step, through the manager like
     // every weight (12 MB beside the 66 GB stack).
     if (_h3_dit && _h3i) {
@@ -3752,17 +3992,21 @@ GenerateVideoStage::ensure_expert_(int which)
       }
     }
     resolve_unload_policy_h3_(bounded);
-    if (_h3_dit && !stream_blocks && _h3_i8_hold_growth_ > 0) {
+    const std::size_t hold_growth =
+        tp_rank ? _h3_tp_hold_growth_ : _h3_i8_hold_growth_;
+    if (_h3_dit && !stream_blocks && hold_growth > 0) {
       // A PRELOAD that holds the w4 projections' int8 layout holds its
       // files AND that growth, which neither ledger had heard of: the
       // declaration said the files, and the plan's holding the same.
       // MEASURED on the Ultra: 3.06 GB of peak footprint against the
-      // 3.33 GB the decision above computed.
+      // 3.33 GB the decision above computed. A RANK's files are its
+      // share (h3_tp_held_bytes_), not the checkpoint.
       auto* mgr = session()->services()->generative_model_manager();
       if (mgr != nullptr) {
-        mgr->revise_declaration(dit_dir,
-                                model_memory::dir_weights_bytes(dit_dir) +
-                                    _h3_i8_hold_growth_);
+        const std::size_t files =
+            tp_rank ? h3_tp_held_bytes_(dit_dir)
+                    : model_memory::dir_weights_bytes(dit_dir);
+        mgr->revise_declaration(dit_dir, files + hold_growth);
       }
       revise_memory(declare_memory());
     }
@@ -3775,7 +4019,10 @@ GenerateVideoStage::ensure_expert_(int which)
       auto* mgr = session()->services()->generative_model_manager();
       auto ws = mgr != nullptr ? mgr->weight_set(dit_dir) : nullptr;
       if (ws) {
-        const std::size_t held = ws->stats().bytes;
+        // ...and what the model holds beside it (streamed_holding_bytes,
+        // as the per-clip correction reads it): a rank's cut refiner.
+        const std::size_t held =
+            ws->stats().bytes + _h3_dit->streamed_holding_bytes();
         mgr->revise_declaration(dit_dir, held);
         // The same correction on the topological plan. What the plan
         // could only bound -- the checkpoint's size on disk -- the model
@@ -4005,19 +4252,11 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool tight)
 {
   if (_unload_resolved) { return; }
   _unload_resolved = true;
-  std::vector<std::string> peers;
-  for (const std::string& p :
-       {genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root),
-        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(_root)}) {
-    if (!p.empty() && p != _root) { peers.push_back(p); }
-  }
   switch (_unload_cfg) {
     case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
     case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
     default:
-      _unload_idle = tight ||
-                     model_memory::bounded(session(), peers,
-                                           model_memory::kHeadroom);
+      _unload_idle = tight || h3_box_bounded(session());
       break;
   }
   if (_unload_idle) {
@@ -6456,12 +6695,18 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       // Settling REFUSES a set the AdaLN bake specialised, which is this
       // model on every schedule -- it is dropped rather than kept, so
       // the reload is real and visible either way.
+      //
+      // KEPT WARM instead (keep_loaded), where the box has room for it
+      // beside the decode: the manager's hold then, the checkpoint's
+      // weights with it.
+      const bool kept = keep_h3_warm_();
       _h3_dit.reset();
       // The preview TAE goes with it, once its last render is out: small
       // weights, but its decode scratch is what an idle stage should not
       // keep.
       preview_scope.release = true;
-      if (auto* mgr = session()->services()->generative_model_manager()) {
+      if (auto* mgr = session()->services()->generative_model_manager();
+          mgr != nullptr && !kept) {
         if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
           mgr->drop_weights(_dit_dir_declared_);
         } else {

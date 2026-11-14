@@ -19,11 +19,18 @@
 // Kinds, and what their documents hold (byte figures are unsigned):
 //
 //   "memory"       a stage refused work it could not fit:
-//                  {"stage", "step" ("denoise" | "decode"), "need",
+//                  {"stage", "step" ("denoise" | "decode" | "upscale"),
+//                   "need",
 //                   "parts": [{"name", "bytes"}...] -- summing to need,
 //                   "gates": [{"name", "need", "have", "ok"}...] -- what
 //                   each budget wanted, margins included, and had,
 //                   "parked", ...the step's own geometry}
+//                  "upscale" (relayvsr-upscale) adds "at": "launch" (the
+//                  output size given, the run alone against the whole GPU
+//                  working set, nothing loaded; one gate) or "first_frame"
+//                  (against what is left of it and reclaimable RAM), and
+//                  "width" / "height" of the INPUT frame; it parks
+//                  nothing, so it has no "parked".
 //   "memory-plan"  the resource plan's peak, before anything loaded:
 //                  {"peak", "phase", "phases": [{"name", "bytes"}...],
 //                   "ram", "pool"}

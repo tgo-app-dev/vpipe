@@ -328,6 +328,28 @@ TEST(weight_registry, shared_model_dies_with_its_last_holder) {
 // next stage asking for its kind, directory AND key; another key over
 // the same model drops the stale build; it goes at its time, and when
 // a launch that declares weights but not its directory asks for room.
+// A built model kept warm that stays WIRED (MiniMax-H3's DiT, a split
+// rank's share) says so (note_warm_wired), and the pool test a launch
+// makes beside it counts it with the warm language models' wired bytes;
+// a note under another key is not its.
+TEST(weight_registry, a_warm_models_wired_bytes_are_counted) {
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  const std::string dir = "/tmp/vpipe-warm-wired-test";
+  mgr->keep_model_warm("ut-dit", dir, "share 0-20",
+                       std::make_shared<Payload>(1), 1 << 20, 60.0);
+  EXPECT_TRUE(mgr->warm_wired_bytes(dir) == 0);
+  mgr->note_warm_wired("ut-dit", dir, "share 20-56", 5 << 20);
+  EXPECT_TRUE(mgr->warm_wired_bytes(dir) == 0);
+  mgr->note_warm_wired("ut-dit", dir, "share 0-20", 3 << 20);
+  EXPECT_TRUE(mgr->warm_wired_bytes(dir) == (3u << 20));
+  // Taken back, nothing of it stays counted.
+  EXPECT_TRUE(mgr->take_warm<Payload>("ut-dit", dir, "share 0-20") !=
+              nullptr);
+  EXPECT_TRUE(mgr->warm_wired_bytes(dir) == 0);
+}
+
 TEST(weight_registry, a_built_model_is_kept_warm_by_key) {
   Session s;
   auto* mgr = s.generative_model_manager();

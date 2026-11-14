@@ -1189,6 +1189,44 @@ GenerativeModelManager::planned_weight_bytes(const string& dir) const
   return it == per_dir.end() ? 0 : it->second;
 }
 
+bool
+GenerativeModelManager::counts_in_phase(const string& dir,
+                                        const string& phase) const
+{
+  if (dir.empty()) { return false; }
+  const string key = canonicalize_(session(), dir);
+  // phase_footprint_'s rule, for one checkpoint.
+  const auto per_dir = per_dir_bytes_();
+  if (per_dir.find(key) == per_dir.end()) { return false; }
+  std::unordered_map<string, string> phase_of, last_of;
+  std::unordered_map<string, std::uint64_t> bits;
+  std::vector<string> order;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    phase_of = _phase;
+    last_of  = _phase_last;
+    bits     = _phase_bits;
+    order    = _phase_order;
+  }
+  auto it = phase_of.find(key);
+  if (it == phase_of.end() || it->second.empty()) { return true; }
+  auto index_of = [&](const string& p) {
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      if (order[i] == p) { return (int)i; }
+    }
+    return -1;
+  };
+  const int p = index_of(phase);
+  if (phase_bit(bits, key, 0).has_value()) {
+    return p >= 0 && phase_bit(bits, key, p).value_or(false);
+  }
+  const auto lt = last_of.find(key);
+  const int a = index_of(it->second);
+  const int z = lt != last_of.end() ? index_of(lt->second) : a;
+  if (a < 0 || z <= a) { return it->second == phase; }
+  return a <= p && p <= z;
+}
+
 size_t
 GenerativeModelManager::scratch_bytes(const string& phase) const
 {
@@ -2555,7 +2593,22 @@ GenerativeModelManager::warm_wired_bytes(const string& dir) const
       }
     }
   }
+  // ...and the models stages built and keep, where they said.
+  for (const auto& w : _warm_models) {
+    if (w.dir == cdir) { n += w.wired; }
+  }
   return n;
+}
+
+void
+GenerativeModelManager::note_warm_wired(const string& kind, const string& dir,
+                                        const string& key, size_t bytes)
+{
+  const string cdir = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_warm_mu);
+  for (auto& w : _warm_models) {
+    if (w.kind == kind && w.dir == cdir && w.key == key) { w.wired = bytes; }
+  }
 }
 
 size_t

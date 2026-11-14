@@ -119,6 +119,12 @@ add_vpipe_metal_kernel(lfm3 SRC ops/lfm3.metal)
 # Its convs are dense_gemm's gather conv, or conv2d_mma's hardware conv
 # on an M5.
 add_vpipe_metal_kernel(rife SRC ops/rife.metal)
+# RelayVSR (generative-models/relayvsr/): the frame upload, the keyframe
+# DiT's source rows, f32 modulation, RoPE and one-step latent, and the
+# decoder's condition rows, per-head norms, RoPE, SwiGLU and output frame.
+add_vpipe_metal_kernel(relayvsr SRC ops/relayvsr.metal)
+add_vpipe_metal_kernel(relayvsr_bf16 SRC ops/relayvsr.metal
+                       DEFINES VPIPE_ELT=bfloat)
 # Open-H3-Regenerate-2K: MiniMax-H3's latent upscaler (its folded-affine
 # GroupNorm, temporal depthwise conv and bilinear resize) and the LMS
 # Sharp curve branch on the DiT's AdaLN (generative-models/minimax-h3/).
@@ -349,6 +355,34 @@ add_vpipe_metal_kernel(attn_steel
                                vendored/mlx/backend/metal/kernels/steel/gemm/params.h
                                vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
                                vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+
+# Attention through a per-query spatial window over a stack of key planes
+# (RelayVSR): attn_steel_paged's register-resident core with K/V gathered
+# from the union of a query tile's windows. Both element types, by name.
+add_vpipe_metal_kernel(local_window_attn
+                       SRC attention/local_window_attn.metal
+                       DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
+                               vendored/mlx/backend/metal/kernels/steel/utils.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/attn.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/loader.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/mma.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/params.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/transforms.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h
+                               vendored/mlx/backend/metal/kernels/steel/gemm/params.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+
+# ...the same on the matrix cores (M5+), with SageAttention's int8 QK and
+# int8 P*V behind function constants and the int8 prologue beside it.
+# metal4.0 for the MPP fragments; #if __HAVE_TENSOR__ guards the kernel.
+add_vpipe_metal_kernel(local_window_attn_nax
+                       SRC attention/local_window_attn_nax.metal
+                       STD metal4.0
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/nax.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h)
 
 # The steel flash attention's backward (LoRA training): dQ, and dK/dV
 # accumulated in f32, in the forward's per-segment band form. Both element

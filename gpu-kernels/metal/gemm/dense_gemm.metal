@@ -137,6 +137,15 @@ struct ReluEpilogue {
   }
 };
 
+// SiLU on the fp32 accumulator (RelayVSR's decoder: its frame encoder's
+// convs are nn.Conv2d then nn.SiLU).
+struct SiluEpilogue {
+  template <typename AccumT>
+  METAL_FUNC AccumT apply(AccumT x) const {
+    return x / (static_cast<AccumT>(1) + metal::exp(-x));
+  }
+};
+
 // LeakyReLU(0.2) on the fp32 accumulator (RIFE's IFNet: every conv's
 // activation is nn.LeakyReLU(0.2)).
 struct LeakyRelu02Epilogue {
@@ -1520,6 +1529,7 @@ kernel void dense_moe_gate_f16(
 //             Cin/2 must be a multiple of 4, and of BK for the fast gather.
 //   EPI == 3  y = leaky_relu(conv + bias, 0.2)
 //   EPI == 4  y = leaky_relu(conv + bias + res, 0.2)
+//   EPI == 5  y = silu(conv + bias)
 //   S2PAD == 1  a stride-2 conv padded SYMMETRICALLY, torch's
 //             Conv2d(k3, s2, p1): iy = 2*oy + ky - 1 (RIFE's IFNet). The
 //             default 0 is the encoders' (0,1,0,1) pad above.
@@ -1692,6 +1702,7 @@ METAL_FUNC void conv3x3_gemm_impl(
     if (EPI == 3 || EPI == 4) {
       mma_op.apply_epilogue(LeakyRelu02Epilogue());
     }
+    if (EPI == 5) { mma_op.apply_epilogue(SiluEpilogue()); }
     mma_op.store_result_safe(yp, Cout, short2(num_outs, num_els));
   } else {
     if (has_bias) {
@@ -1706,6 +1717,7 @@ METAL_FUNC void conv3x3_gemm_impl(
     if (EPI == 3 || EPI == 4) {
       mma_op.apply_epilogue(LeakyRelu02Epilogue());
     }
+    if (EPI == 5) { mma_op.apply_epilogue(SiluEpilogue()); }
     mma_op.store_result(yp, Cout);
   }
 }
@@ -1841,6 +1853,17 @@ VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn64_lrelu_f16,
                                64, 64, 2, 3, 1)
 VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn32_lrelu_f16,
                                64, 32, 2, 3, 1)
+// RelayVSR (generative-models/relayvsr/): the decoder's frame encoder --
+// Conv2d(k3, s2, p1) + SiLU twice, Conv2d(k3, s1, p1) + SiLU -- and the
+// keyframe DiT's source projection, a plain Conv2d(k3, s2, p1) whose
+// output is normed before it activates. The same entry shape (buffer 11
+// unread at EPI 0 and 5; bind anything valid).
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn64_silu_f16,
+                               64, 64, 2, 5, 1)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn64_silu_f16,
+                               64, 64, 1, 5, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn128_f16,
+                               64, 128, 2, 0, 1)
 
 // ---- the tiny autoencoders' ConvNeXt-style block ---------------------------
 //

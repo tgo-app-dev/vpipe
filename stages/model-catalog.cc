@@ -313,28 +313,19 @@ builtin_catalog_()
     // costs one register conversion at LOAD and then runs at 16-bit
     // width; nothing widens to f32.
     //
-    // Two quantization points, one row each. Q4_K_M is all k-quant
-    // (Q4_K 294 / Q5_K 48 / Q6_K 67) and passes through raw; Q8_0 is
-    // repacked to affine 8-bit group 64, the only affine shape the metal
-    // Qwen accepts (see GgufQwen35Converter). Both share the projector.
+    // ONE quantization point: Q8_0, repacked to affine 8-bit group 64,
+    // the only affine shape the metal Qwen accepts (see
+    // GgufQwen35Converter). There was a Q4_K_M row too, all k-quant
+    // (Q4_K 294 / Q5_K 48 / Q6_K 67, passed through raw); unsloth deleted
+    // that file on 2026-08-19 (commit e1d8a267) and every fetch of the
+    // row failed. Its successor, UD-Q4_K_M, mixes in IQ4_XS, IQ4_NL and
+    // IQ3_S, which the loader refuses, so nothing replaced it.
     //
-    // Both land in the SAME directory (<base>/unsloth/Qwen3.8-27B-GGUF),
-    // so a caller that fetches both and then points hf_dir at the
-    // directory gets whichever sorts first -- Q4_K_M. Name the .gguf to
-    // pick: hf_dir accepts a file.
-    //
-    // MEASURED, both against the same 27B quantized from the bf16
-    // original to w8g64, layer-0 residual / final-layer residual:
-    // Q8_0 4.3e-03 / 3.9e-02, Q4_K_M 1.1e-02 / 5.2e-02 at layer 32.
-    // Q8_0 costs 29 GB against Q4_K_M's 17 GB, and its requant to
-    // group 64 (Q8_0's own block is 32) puts it ~1.4x above the Q8_0
-    // floor -- so it is the accuracy option, not the free one.
-    {.family = "Qwen", .version = "3.8", .param_class = "27B",
-     .variant = "Q4_K_M GGUF +mmproj (unsloth)",
-     .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
-     .files = {"Qwen3.8-27B-Q4_K_M.gguf",  // main quant
-               "mmproj-F16.gguf"},         // F16 multimodal projector
-     .needs_tokenizer_json = false},
+    // MEASURED against the same 27B quantized from the bf16 original to
+    // w8g64, layer-0 residual / final-layer residual: Q8_0 4.3e-03 /
+    // 3.9e-02 (the old Q4_K_M 1.1e-02 / 5.2e-02 at layer 32). Q8_0 is
+    // 29 GB, and its requant to group 64 (Q8_0's own block is 32) puts
+    // it ~1.4x above the Q8_0 floor.
     {.family = "Qwen", .version = "3.8", .param_class = "27B",
      .variant = "Q8_0 GGUF +mmproj (unsloth)",
      .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
@@ -792,20 +783,33 @@ builtin_catalog_()
     // from a reference clip + its transcript. FISH AUDIO COMMUNITY LICENSE:
     // research / non-commercial use, commercial only under USD 500k annual
     // revenue, and no hosted TTS service without Fish Audio's licence.
-    // PINNED to the files the stage reads.
+    // PINNED to the files the stage reads. RE-SHARDED upstream on
+    // 2026-10-29 (commit 256faf59, the eight shards removed in 0a52d99b):
+    // fifteen shards of the same 62,245 tensors, 39,594,895,616 bytes and
+    // config -- the pins followed. A copy fetched before keeps its eight,
+    // read through its own index; fetched again over it, the eight stay
+    // beside the fifteen, and the plan weighs only what the index names
+    // (dir_weights_bytes).
     {.family = "Fish Audio", .version = "Drama 3", .param_class = "35B-A3B",
      .variant = "FP8 experts + bf16 (fishaudio)",
      .hf_path = "fishaudio/drama-3",
      .model_type = "fish-drama3",
      .files = {"config.json", "model.safetensors.index.json",
-               "model-00001-of-00008.safetensors",
-               "model-00002-of-00008.safetensors",
-               "model-00003-of-00008.safetensors",
-               "model-00004-of-00008.safetensors",
-               "model-00005-of-00008.safetensors",
-               "model-00006-of-00008.safetensors",
-               "model-00007-of-00008.safetensors",
-               "model-00008-of-00008.safetensors",
+               "model-00001-of-00015.safetensors",
+               "model-00002-of-00015.safetensors",
+               "model-00003-of-00015.safetensors",
+               "model-00004-of-00015.safetensors",
+               "model-00005-of-00015.safetensors",
+               "model-00006-of-00015.safetensors",
+               "model-00007-of-00015.safetensors",
+               "model-00008-of-00015.safetensors",
+               "model-00009-of-00015.safetensors",
+               "model-00010-of-00015.safetensors",
+               "model-00011-of-00015.safetensors",
+               "model-00012-of-00015.safetensors",
+               "model-00013-of-00015.safetensors",
+               "model-00014-of-00015.safetensors",
+               "model-00015-of-00015.safetensors",
                "tokenizer.json", "tokenizer_config.json",
                "special_tokens_map.json", "chat_template.jinja",
                "codec.pth", "LICENSE", "README.md"},
@@ -2156,6 +2160,24 @@ builtin_catalog_()
      .needs_tokenizer_json = false,
      .extra = local_subdir_extra_("base"),
      .name = "ruchangyao/FlashVSR_plus-base"},
+    // RelayVSR (kopperx, "Large-Small Model Collaboration for Efficient
+    // Real-World Video Super-Resolution", arXiv 2609.37850; Apache-2.0):
+    // streaming 4x video super-resolution by two models in relay -- a
+    // Wan2.2-TI2V-5B-shaped DiT retrained to write a KEYFRAME latent in
+    // one step every 15 frames (wan.safetensors, 10.1 GB bf16, its fixed
+    // T5 context inside), and a 32M-parameter decoder turning every frame
+    // into its 4x RGB frame between the two keyframes around it
+    // (flash.safetensors, F32). No VAE, no text encoder. Each file carries
+    // its architecture in its safetensors metadata (format refvsr-wan-v1
+    // / refvsr-flash-v1). Run by the relayvsr-upscale stage.
+    {.family = "RelayVSR", .version = "1.0", .param_class = "5B",
+     .variant = "keyframe DiT + S decoder, EMA (kopperx)",
+     .hf_path = "kopper/RelayVSR",
+     .model_type = "relayvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"wan.safetensors", "flash.safetensors", "LICENSE",
+               "README.md"},
+     .needs_tokenizer_json = false},
     // ---- Wan (text+image -> VIDEO diffusion) --------------------------
     // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
     // that outputs anything but text / images / audio. Same diffusers
@@ -3405,6 +3427,9 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "flashvsr") {
     // RESTORATION: a low-quality clip in, the same clip at 4x out. No
     // prompt -- the conditioning is a constant the checkpoint ships.
+    set({"video"}, {"video"});
+  } else if (mt == "relayvsr") {
+    // RelayVSR: frames in, the same frames at 4x out (relayvsr-upscale).
     set({"video"}, {"video"});
   } else if (mt == "minimax-h3-fl2va") {
     // The only entry whose OUTPUT is two modalities: one denoise loop

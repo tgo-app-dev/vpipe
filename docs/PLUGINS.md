@@ -1556,25 +1556,78 @@ reloading while its peer kept its weights, never leaves the next clip out of
 step. Before it lets go of a channel with an exchange still waiting on a
 peer, the host sets a stop that is always true, so a channel that polls
 returns; and it calls `forget` on every buffer it handed first. Expect `open`
-again once the last clip's channel is gone, and let a peer's channel going
+again once that stage's last channel is gone, and let a peer's channel going
 fail an exchange still waiting for it.
 
 MiniMax H3 is the first family to run split (preloaded shares of dense or
 affine weights, its blocks in row bands, each band's exchanges under the next
-band's work; no ANE tier, VDN, TaoMate, adapter or int8 tier beyond accurate
-yet, and MotionCache off on a rank -- each of its skips is judged from that
-rank's own sums). A rank's memory is booked at its share, in the plan that
-refuses graphs as in the report: its share of the projections and the AdaLN
-bake's tables (it holds no AdaLN weights) -- held whole, since a rank never
-streams -- and the scratch of the narrower model it is, its exchange buffers
-included.
+band's work; no ANE tier, VDN or TaoMate yet, and MotionCache off on a rank --
+each of its skips is judged from that rank's own sums). A rank takes runtime
+adapters -- bound at the checkpoint's widths, their factors then cut as the
+weights are: B's rows of q|k|v and fc1, A's columns of the out projection and
+fc2, so the ranks' deltas sum to the whole one -- and the int8 tiers past
+accurate, its dense share converted at the group its own width takes (a width
+no group divides stays on accurate: give a rank whole groups of four heads,
+512 columns, for every tier's rotation). A transport sees none of this: the
+partials are the same shape whatever runs. A rank's memory is booked at its
+share, in the plan that refuses graphs as in the report: its share of the
+projections in the layout it holds them in (bf16, an affine pack's codes, or
+the int8 tier's on the main blocks -- the text refiner keeps its own, as the
+unsplit model's does), its adapters' factors as cut, and the AdaLN bake's
+tables (it holds no AdaLN weights) -- and the scratch of the narrower model it
+is, its exchange buffers included. A rank streams its share as the whole model
+streams the checkpoint and keeps what the box allows: booked with every block
+kept, streamable to its floor (the rest, and two blocks' shares).
+
+A rank's BANDS are about an eighth of its sequence, and no band but the last
+is under 1,024 rows -- or under the floor its share is given
+(`tensor_parallel.min_band_rows`, kept in `TpShare::extra` as
+`tp_extra::kMinBandRows`); where an eighth is shorter than the floor the rank
+takes fewer bands, each at least the floor, and a sequence under two floors
+exchanges whole blocks. Both ranks must cut the same bands, so a host states
+the floor for both, and only to a peer whose libvpipe reads it -- one listing
+`"tensor-parallel-decode/1"`, which came with it. A link that carries a
+band's partial in well under its compute (RDMA over several Thunderbolt
+cables) is better served by fewer, taller bands: an 832 x 480 x 73 clip's
+8,843 rows in four bands of 2,304 denoised in 8.5 s, in eight of 1,152 in
+10.4 (M5 Max and M5 Ultra, four TB5 cables). The transport sees nothing of
+it but larger partials.
+
+THE CLIP'S DECODE splits the same way (feature
+`"tensor-parallel-decode/1"`): vae-decode's `tensor_parallel` --
+`{rank, ranks: 2, decode_share: [first, end], transport, params}` -- has
+MiniMax H3's video decoder decode only this rank's span of the clip's UNITS
+(each chunk's tiles, row by row) into a buffer of the whole clip, zero
+elsewhere; every tile stitch and chunk fade is a weighted sum, so each rank
+writes the terms of its own tiles, and the two buffers add to the clip
+decoded whole (to bf16 rounding where the shares fade across each other).
+The ranks first swap a header -- the clip each decoded, the units each took
+-- as the channel's exchange 0 in a 48-byte buffer pair of its own, and
+refuse a split that would not add to one clip: shares that do not tile the
+units, another tiling, another latent all cross the same bytes, so nothing
+else could tell. Then rank 1's frames alone cross, a piece at a time through
+two staging buffers of up to 32 MB (a device registers only so much), and
+rank 0 adds them in; the channel is opened before the decode, so its link is
+made while the GPU decodes. Rank 0 emits the clip; the others emit nothing. A
+still, the fast decoder, or more than two ranks decode whole, said, and every
+rank emits it.
+
+TWO CHANNELS AT ONCE. When a launch makes several clips, clip k decodes while
+generate-video denoises clip k+1, so a process holds a DiT's channel and a
+decode's at the same time -- opened in either order, and the peer's two in
+its own order. The decode's `TpShare` says what it is (`extra`:
+`tp_extra::kChannel` = `tp_extra::kChannelDecode`; no heads, no rows), and
+its `params` are vae-decode's own: pair a rank's channel with the peer's of
+the same kind -- by that key, or by params a host gives each stage apart (a
+port each) -- never by the order they open.
 
 **Optional, as model sources are.** The header is installed since feature
 `"tensor-parallel/1"`, its functions weak imports outside the host: check
 `tp_transports_available()`, or list the feature as required. It grows as the
 rest of the ABI does: `TpChannel` and `TpTransport` through
 `query_extension(id)` (null: the host keeps the older behaviour), `TpShare`
-through keys in its `extra` (none defined yet).
+through keys in its `extra` (`genai::tp_extra`: `kMinBandRows`, from a stage's
+bag; `kChannel`, a decode's channel).
 
 ## Extension point 6 — CoreML
 
@@ -1795,6 +1848,7 @@ constant, never the spelling:
 | `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
 | speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |
 | the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |
+| `TpShare::extra` (a rank's band floor; which stage's channel) | `genai::tp_extra` (`generative-models/tensor-parallel.h`) |
 | what a stage tells a family it loads (`ImageModelCreateArgs` / `VideoModelCreateArgs` `borrowed_extra`: the CoreML label) | `genai::create_args` (`gen-input.h`) |
 | beats and TensorBeat sidebands | `beat`, `sideband` (`common/beat-keys.h`) |
 | `model_config` keys the host reads | `model_config::kFamilyKey` (`stages/model-config-source.h`), `genai::preview_key` (`gen-input.h`) |
@@ -1875,7 +1929,10 @@ for a family's rows; check `model_sources_available()`, or list it as
 required) and `"tensor-parallel/1"` (`generative-models/tensor-parallel.h`
 installed, its functions weak imports: `register_tp_transport`, a transport
 for a DiT split across hosts -- extension point 5b; check
-`tp_transports_available()`).
+`tp_transports_available()`) and `"tensor-parallel-decode/1"` (vae-decode's
+`tensor_parallel`: a MiniMax H3 clip's decode split between the same ranks,
+through the same transport, and a rank's band floor, `min_band_rows`; a host
+asks its peer for it before handing a rank a `decode_share` or a floor).
 
 ## Where your stages show up
 

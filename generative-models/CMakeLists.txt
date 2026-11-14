@@ -126,6 +126,10 @@ set(LOCAL_SOURCES
   bs-roformer/bs-roformer-config.cc
   bs-roformer/metal-bs-roformer.cc
   rife/metal-rife.cc
+  relayvsr/relayvsr-ops.cc
+  relayvsr/metal-relayvsr-wan.cc
+  relayvsr/metal-relayvsr-decoder.cc
+  relayvsr/relayvsr-stream.cc
   drama3/drama3-prompt.cc
   drama3/metal-drama3-tower.cc
   deepseek-v41/deepseek-v41-config.cc
@@ -231,6 +235,10 @@ set(LOCAL_HEADERS
   bs-roformer/bs-roformer-config.h
   bs-roformer/metal-bs-roformer.h
   rife/metal-rife.h
+  relayvsr/relayvsr-ops.h
+  relayvsr/metal-relayvsr-wan.h
+  relayvsr/metal-relayvsr-decoder.h
+  relayvsr/relayvsr-stream.h
   drama3/drama3-prompt.h
   drama3/metal-drama3-tower.h
   deepseek-v41/deepseek-v41-config.h

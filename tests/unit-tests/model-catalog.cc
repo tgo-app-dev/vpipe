@@ -247,10 +247,14 @@ TEST(model_catalog, drama3_present) {
   EXPECT_TRUE(e->model_type == "fish-drama3");
   EXPECT_FALSE(e->needs_tokenizer_json);
   for (const char* f : {"config.json", "model.safetensors.index.json",
-                        "model-00001-of-00008.safetensors",
-                        "model-00008-of-00008.safetensors",
+                        "model-00001-of-00015.safetensors",
+                        "model-00015-of-00015.safetensors",
                         "tokenizer.json", "codec.pth"}) {
     EXPECT_TRUE(has_(e->files, f));
+  }
+  // Re-sharded upstream (2026-10-29): none of the eight left pinned.
+  for (const auto& f : e->files) {
+    EXPECT_TRUE(f.find("-of-00008") == std::string::npos);
   }
   // The int4 copy: the same type, its twelve shards, no eval clips.
   const ModelCatalogEntry* q = catalog_by_path("fishaudio/drama-3-int4");
@@ -380,7 +384,7 @@ TEST(model_catalog, qwen38_27b_family) {
       EXPECT_TRUE(catalog_category(*e) == "model");
     }
   }
-  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 6);
+  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 5);
 
   struct Row { const char* path; const char* variant; };
   const Row rows[] = {
@@ -390,7 +394,7 @@ TEST(model_catalog, qwen38_27b_family) {
       {"mlx-community/Qwen3.8-27B-4bit", "MLX 4-bit (mlx-community)"},
       {"mlx-community/Qwen3.8-27B-OptiQ-4bit",
        "MLX OptiQ 4-bit (mlx-community)"},
-      {"unsloth/Qwen3.8-27B-GGUF", "Q4_K_M GGUF +mmproj (unsloth)"},
+      {"unsloth/Qwen3.8-27B-GGUF", "Q8_0 GGUF +mmproj (unsloth)"},
   };
   for (const Row& r : rows) {
     const ModelCatalogEntry* e = catalog_by_path(r.path);
@@ -416,15 +420,14 @@ TEST(model_catalog, qwen38_27b_family) {
   EXPECT_TRUE(
       catalog_by_path("mlx-community/Qwen3.8-27B-OptiQ-4bit")
           ->files.empty());
-  // TWO GGUF rows share the repo -- one per quantization point -- so the
-  // by-path lookup answers with the first (documented) and the caller
-  // that must not take the wrong one asks for all of them.
+  // ONE GGUF row: the Q4_K_M file it once pinned is gone upstream
+  // (2026-08-19), and a pin to a file the repo lacks fails every fetch.
   auto gs = catalog_all_by_path("unsloth/Qwen3.8-27B-GGUF");
-  EXPECT_TRUE(gs.size() == 2);
+  EXPECT_TRUE(gs.size() == 1);
   const ModelCatalogEntry* g = catalog_by_path("unsloth/Qwen3.8-27B-GGUF");
-  EXPECT_TRUE(g == gs[0]);
-  const char* quants[] = {"Qwen3.8-27B-Q4_K_M.gguf", "Qwen3.8-27B-Q8_0.gguf"};
-  for (std::size_t i = 0; i < gs.size() && i < 2; ++i) {
+  EXPECT_TRUE(!gs.empty() && g == gs[0]);
+  const char* quants[] = {"Qwen3.8-27B-Q8_0.gguf"};
+  for (std::size_t i = 0; i < gs.size() && i < 1; ++i) {
     EXPECT_TRUE(gs[i]->files.size() == 2);
     EXPECT_TRUE(gs[i]->files[0] == quants[i]);
     // The F16 projector, NOT the BF16 one: they differ in how

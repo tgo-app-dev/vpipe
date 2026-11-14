@@ -1,0 +1,106 @@
+{
+  "id": "relayvsr-upscale",
+  "stages": [
+    {
+      "id": "load-video",
+      "type": "load-video",
+      "iports": [],
+      "config": {
+        "input_url": "low-quality.mp4",
+        "enable_audio": false
+      }
+    },
+    {
+      "id": "video-to-rgb",
+      "type": "video-to-rgb",
+      "iports": [
+        {
+          "src": "load-video",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_dtype": "u8",
+        "hwaccel": "auto",
+        "oport_capacity": 2
+      }
+    },
+    {
+      "id": "relayvsr-upscale",
+      "type": "relayvsr-upscale",
+      "iports": [
+        {
+          "src": "video-to-rgb",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "kopper/RelayVSR",
+        "window": 16,
+        "seed": 42,
+        "output_dtype": "auto"
+      }
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "relayvsr-upscale",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "load-audio",
+      "type": "load-audio",
+      "iports": [],
+      "config": {
+        "input_url": "low-quality.mp4"
+      }
+    },
+    {
+      "id": "audio-to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_sample_rate": 48000,
+        "channels": 2,
+        "chunk_duration_s": 10.0,
+        "max_chunk_duration_s": 30.0
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-to-pcm",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "relayvsr-4x.mp4",
+        "enable_video": true,
+        "enable_audio": true,
+        "video_bitrate": 24000000,
+        "video_gop_size": 48,
+        "audio_bitrate": 192000,
+        "muxer_options": {
+          "movflags": "+faststart"
+        }
+      }
+    }
+  ],
+  "subpipelines": []
+}

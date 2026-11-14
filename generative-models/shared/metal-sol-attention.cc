@@ -485,6 +485,16 @@ MetalSolAttention::drop_residency_()
   _mc->residency_commit();
 }
 
+void
+MetalSolAttention::release_prepared_keys()
+{
+  drop_prepared_residency_();
+  for (SharedBuffer* b : {&_pk_kc, &_pk_vc, &_pk_mean, &_pk_var, &_pk_cov}) {
+    *b = SharedBuffer{};
+  }
+  _pk_kvh = _pk_tok = _pk_d = _pk_blk = 0;
+}
+
 std::size_t
 MetalSolAttention::pinned_bytes()
 {

@@ -650,6 +650,12 @@ public:
   // with it). Host-only, as declared_scratch.
   __attribute__((visibility("hidden"))) std::size_t
   planned_weight_bytes(const std::string& dir) const;
+  // Whether phase_footprint(`phase`) counts `dir`'s weights: declared
+  // unphased (or open and undeclared), or in a phase its claims put it
+  // in. False for a checkpoint the plan has not heard of. Host-only, as
+  // declared_scratch.
+  __attribute__((visibility("hidden"))) bool
+  counts_in_phase(const std::string& dir, const std::string& phase) const;
   // What the language models kept warm for `dir` hold in WEIGHTS, as
   // their loads measured it (wired, or kept unwired by a full pool); 0
   // when none was measured (a load not wired). A Mixture of Experts holds
@@ -667,9 +673,17 @@ public:
   __attribute__((visibility("hidden"))) std::size_t
   warm_run_bytes(const std::string& dir) const;
   // What their loads left wired, charged to the wired pool while they
-  // live. Host-only, as declared_scratch.
+  // live -- the language models' and, where a stage noted it
+  // (note_warm_wired), a built model's: a DiT kept warm stays wired.
+  // Host-only, as declared_scratch.
   __attribute__((visibility("hidden"))) std::size_t
   warm_wired_bytes(const std::string& dir) const;
+  // What a model a stage keeps warm (keep_model_warm: its kind, dir and
+  // key) holds WIRED, for the pool test a launch makes beside it --
+  // MiniMax-H3's DiT keeps its blocks wired, 15-60 GB. Host-only.
+  __attribute__((visibility("hidden"))) void
+  note_warm_wired(const std::string& kind, const std::string& dir,
+                  const std::string& key, std::size_t bytes);
 
   // Correct a declared arena to its real size.
   //
@@ -1362,6 +1376,7 @@ private:
     std::shared_ptr<void>                 model;
     std::size_t                           bytes = 0;
     std::chrono::steady_clock::time_point until;
+    std::size_t                           wired = 0;   // note_warm_wired
   };
   std::vector<WarmModel>   _warm_models;
   std::function<void()>    _warm_reap;

@@ -1,6 +1,7 @@
 #include "stages/model-detect.h"
 
 #include "generative-models/bs-roformer/bs-roformer-config.h"
+#include "generative-models/relayvsr/relayvsr-stream.h"
 #include "generative-models/rife/metal-rife.h"
 #include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/detect-profile.h"
@@ -240,6 +241,7 @@ family_version_(const std::string& mt, std::string& family,
       {"yue2-vae",               "YuE",         "2-Vae"},
       {"bs-roformer",            "BS-RoFormer", "MSST"},
       {"rife",                   "RIFE",        "Practical-RIFE 4"},
+      {"relayvsr",               "RelayVSR",    "1.0"},
       {"dflash",                 "DFlash",      "1"},
       {"dflash2",                "DFlash",      "2"},
       {"yolo",                   "YOLOX",       "L"},
@@ -1041,6 +1043,25 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     d.detected_by   = "flownet";
     d.weight_format = "torch";
     catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+
+  // ---- 2f. RelayVSR ------------------------------------------------------
+  // Two safetensors and no config.json: a keyframe DiT (format
+  // refvsr-wan-v1) and its decoder (refvsr-flash-v1), told by the format
+  // each states in its metadata -- what relayvsr-upscale runs.
+  // Only where the release's two names are there: the formats are read
+  // from the headers, and a scan of every safetensors in every directory
+  // the models DB walks is not worth that.
+  if (d.model_type.empty() && fs::is_directory(root) &&
+      fs::exists(root / "wan.safetensors") &&
+      fs::exists(root / "flash.safetensors")) {
+    genai::RelayVsrFiles rf;
+    if (genai::resolve_relayvsr_files(dir, &rf)) {
+      d.model_type    = "relayvsr";
+      d.detected_by   = "refvsr-metadata";
+      d.weight_format = "safetensors";
+      catalog_default_io(d.model_type, d.inputs, d.outputs);
+    }
   }
 
   // ---- 3. a plain HF / MLX checkpoint (config.json at the root) -------

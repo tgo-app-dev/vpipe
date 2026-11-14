@@ -103,6 +103,22 @@ inline constexpr std::string_view kClaimHeldBytes = "held_bytes";
 std::size_t residency_reserve_beside(const SessionContextIntf* session,
                                      std::string_view phase);
 
+// WHAT A MODEL KEPT RESIDENT BETWEEN ITS USES SITS BESIDE. A model loaded
+// for `phase` (MiniMax-H3's video decoder, the decode) and kept after it
+// is still resident through every OTHER phase of the next clip -- where
+// its claim, if phased, told the plan it is absent. So: each phase's
+// weights with `dir` in them (weight_footprint's union: once, whatever it
+// claimed), that phase's declared scratch (`headroom` where it declared
+// none), `beside` (what is held through every phase: warm holds) -- the
+// worst of them, LESS `need`, the working set of `phase` itself, which
+// the caller adds back with its own band; `phase`'s own figure is its
+// weights with `dir` and `beside`. So `peers + need` is the worst phase's.
+std::size_t kept_beside_every_phase(const SessionContextIntf* session,
+                                    const std::string& dir,
+                                    std::string_view phase,
+                                    std::size_t need, std::size_t beside,
+                                    std::size_t headroom = kHeadroom);
+
 // THE WIDEST WEIGHT A DiT FORWARD WIDENS per GEMM into its one dequant
 // scratch (Krea 2's and Qwen-Image 2.1's `_w_deq`), as bf16 [N, K], off
 // the checkpoint's headers: an FP8 or NVFP4 weight kept as its codes (K

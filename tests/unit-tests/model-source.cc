@@ -63,7 +63,40 @@ TEST(model_source, sources_registered) {
   EXPECT_TRUE(has_(names, "modelscope"));
   EXPECT_TRUE(model_source("huggingface") != nullptr);
   EXPECT_TRUE(model_source("modelscope") != nullptr);
+  EXPECT_TRUE(has_(names, "hf-mirror"));
+  EXPECT_TRUE(model_source_label("hf-mirror") == "HF-Mirror");
   EXPECT_TRUE(model_source("no-such-source") == nullptr);
+}
+
+// hf-mirror.com is HuggingFace's own API under another host: the same
+// listing, parsed alike, the same `resolve` path; every repo under its
+// HuggingFace name (no mirror rows); no Xet; and never offered
+// HuggingFace's token -- a third party gets only its own.
+TEST(model_source, hf_mirror_is_huggingface_elsewhere) {
+  const ModelSource* m = model_source("hf-mirror");
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(string(m->default_revision()) == "main");
+  EXPECT_TRUE(m->tree_url("fishaudio/drama-3", "main")
+      == "https://hf-mirror.com/api/models/fishaudio/drama-3"
+         "/tree/main?recursive=true");
+  EXPECT_TRUE(m->file_url("fishaudio/drama-3", "main", "config.json")
+      == "https://hf-mirror.com/fishaudio/drama-3/resolve/main/config.json");
+  EXPECT_FALSE(m->supports_xet());
+  for (const string& v : m->token_env()) {
+    EXPECT_TRUE(v != "HF_TOKEN" && v != "HUGGING_FACE_HUB_TOKEN");
+  }
+  // It has no accounts: a token it takes is the user's HuggingFace one,
+  // relayed -- so a graph's `hf_token` reaches it only beside a `source`
+  // naming it. The other two take their own.
+  EXPECT_TRUE(m->relays_huggingface_token());
+  EXPECT_FALSE(model_source("huggingface")->relays_huggingface_token());
+  EXPECT_FALSE(model_source("modelscope")->relays_huggingface_token());
+  string out;
+  EXPECT_TRUE(mirror_repo("hf-mirror", "MiniMaxAI/MiniMax-H3", out) ==
+              MirrorStatus::Same);
+  EXPECT_TRUE(normalize_model_ref("https://hf-mirror.com/fishaudio/drama-3")
+              == "fishaudio/drama-3");
 }
 
 // The two sources disagree about the default branch, and getting it

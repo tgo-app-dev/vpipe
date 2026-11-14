@@ -91,6 +91,57 @@ TEST(model_memory, weight_bytes_counts_only_safetensors)
   fs::remove_all(dir.parent_path(), ec);
 }
 
+// A RE-SHARDED REPO fetched over an older copy (fishaudio/drama-3: eight
+// shards became fifteen of the same tensors) leaves the old shards
+// beside the new. The loader reads what the index names, so the plan
+// weighs those -- all of them where the index names none on disk (an
+// index from another repo: the loader globs), and every shard where a
+// directory holds one count only.
+TEST(model_memory, weight_bytes_skip_shards_the_index_left)
+{
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-model-memory-shards";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir / "vae", ec);
+  auto write = [](const fs::path& p, std::size_t n) {
+    std::ofstream f(p, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  auto index = [](const fs::path& p, const std::vector<std::string>& files) {
+    std::ofstream f(p);
+    f << "{\"metadata\": {}, \"weight_map\": {";
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      f << (i ? ", " : "") << "\"t" << i << "\": \"" << files[i] << "\"";
+    }
+    f << "}}";
+  };
+  write(dir / "model-00001-of-00002.safetensors", 700);   // the old pair
+  write(dir / "model-00002-of-00002.safetensors", 700);
+  write(dir / "model-00001-of-00003.safetensors", 500);   // the new three
+  write(dir / "model-00002-of-00003.safetensors", 500);
+  write(dir / "model-00003-of-00003.safetensors", 400);
+  write(dir / "vae" / "diffusion_pytorch_model.safetensors", 90);
+  // No index: everything, as before.
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 2890);
+  index(dir / "model.safetensors.index.json",
+        {"model-00001-of-00003.safetensors",
+         "model-00002-of-00003.safetensors",
+         "model-00003-of-00003.safetensors",
+         "model-00001-of-00003.safetensors"});
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 1490);
+  // An index naming no shard on disk: the loader globs, so all count.
+  index(dir / "model.safetensors.index.json",
+        {"model-00001-of-00004.safetensors"});
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 2890);
+  // One count only: an index is not even read.
+  fs::remove(dir / "model-00001-of-00002.safetensors", ec);
+  fs::remove(dir / "model-00002-of-00002.safetensors", ec);
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 1490);
+  fs::remove_all(dir, ec);
+}
+
 TEST(model_memory, bounded_compares_against_physical_ram)
 {
   const std::size_t ram = model_memory::phys_ram();
@@ -2857,6 +2908,78 @@ TEST(model_memory, a_refinement_widens_to_another_stage_s_phase)
 // decode). Counted over the HULL, condition..decode, the 5 GB VAE sat in
 // a denoise neither holds it in, and on a 16 GB M4 that left the DiT's
 // ANE module (1.9 GB) no room: granted 0 of 1 where it had run.
+// A MODEL KEPT BETWEEN ITS USES SITS BESIDE EVERY PHASE.
+// MiniMax-H3's video decoder kept resident after the decode
+// (kept_beside_every_phase, vae-decode's idle rule) is beside the next
+// clip's denoise too -- where its claim, decode-phased in a model-select
+// graph, told the plan it is absent. With the DiT phased to the denoise
+// (`destroy`), the decode phase alone reads roomy: its peers are the
+// decoder itself, and a box short by the DiT, its scratch and the decoder
+// together kept it. The figure is the worst phase's less the decode's
+// working set: the denoise's here, under `destroy` and under `auto` alike.
+TEST(model_memory, a_kept_model_sits_beside_every_phase)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-kept";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  put("transformer/dit.safetensors", 8000);
+  put("video_vae/source/model.safetensors", 3000);
+  const std::string dit = (root / "transformer").string();
+  const std::string vae = (root / "video_vae" / "source").string();
+  const std::string den(model_memory::kPhaseDenoise);
+  const std::string dec(model_memory::kPhaseDecode);
+  constexpr std::size_t kNeed = 500, kHead = 100;
+
+  // `destroy`: the DiT phased to the denoise, its scratch there.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, den, "", 0);
+  pl->claim(&s, vae, dec, "", 0);
+  pl->end_plan(&s);
+  mgr->declare_scratch("dit", 2000, den);
+  const std::size_t decode_only =
+      model_memory::weight_footprint(&s, {vae}, dec);
+  const std::size_t kept =
+      model_memory::kept_beside_every_phase(&s, vae, dec, kNeed, 0, kHead);
+  std::printf("  destroy: the decode phase alone %zu, every phase %zu "
+              "(the denoise: 8000 + 2000 + 3000 - %zu)\n", decode_only,
+              kept, kNeed);
+  EXPECT_TRUE(decode_only == 3000u);
+  EXPECT_TRUE(kept == 8000u + 2000u + 3000u - kNeed);
+  // ...and what is held through every phase is added to every phase.
+  EXPECT_TRUE(model_memory::kept_beside_every_phase(&s, vae, dec, kNeed, 700,
+                                                    kHead) ==
+              kept + 700u);
+
+  // `auto`: the DiT unphased -- in the decode phase too.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, dec, "", 0);
+  pl->end_plan(&s);
+  mgr->declare_scratch("dit", 2000, den);
+  EXPECT_TRUE(model_memory::kept_beside_every_phase(&s, vae, dec, kNeed, 0,
+                                                    kHead) ==
+              8000u + 2000u + 3000u - kNeed);
+  // The decode's own figure (weights, the decoder with them) wins once
+  // its working set makes the decode the larger phase.
+  EXPECT_TRUE(model_memory::kept_beside_every_phase(&s, vae, dec, 5000, 0,
+                                                    kHead) == 11000u);
+  fs::remove_all(root, ec);
+}
+
 TEST(model_memory, two_holders_apart_leave_the_phase_between_free)
 {
   Session s;
@@ -3176,6 +3299,85 @@ TEST(model_memory, generate_video_books_h3_s_activations)
   } else {
     EXPECT_TRUE(acc.scratch == base.scratch && tok.floor == acc.floor);
   }
+}
+
+// MiniMax-H3's DiT asks its two memory questions of the manager and names
+// no peer's directory (GenerateVideoStage::h3_stream_plan,
+// ::h3_box_bounded). The geometry is a split's rank on a 64 GB box: its
+// share of the DiT declared at 13 GB, the root's text encoder on disk at
+// 50 GB. In a graph handed its conditioning nothing declares the
+// encoder, and naming it tipped both questions on its own. Through the
+// manager it counts where a stage declares it, in that stage's phase.
+TEST(model_memory, h3_counts_an_encoder_only_where_a_stage_holds_it)
+{
+  namespace fs = std::filesystem;
+  constexpr std::size_t kGB = 1ull << 30;
+  const fs::path root = fs::temp_directory_path() / "vpipe-h3-peers";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const std::string enc = (root / "text_encoder").string();
+  const std::string dit = (root / "transformer").string();
+  // Laid out as a root's encoder is, where its resolver finds it. The
+  // shard is SPARSE: dir_weights_bytes reads its size, and none of the
+  // 50 GB is written.
+  fs::create_directories(enc, ec);
+  const fs::path shard = fs::path(enc) / "model.safetensors";
+  { std::ofstream f(shard, std::ios::binary); }
+  std::ofstream(fs::path(enc) / "config.json") << "{}";
+  fs::resize_file(shard, 50 * kGB, ec);
+  if (ec) {
+    fs::remove_all(root, ec);
+    ASSERT_TRUE(false);
+    return;
+  }
+  ASSERT_TRUE(model_memory::dir_weights_bytes(enc) == 50 * kGB);
+
+  RamLimit ram("65536");
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { fs::remove_all(root, ec); return; }
+  mgr->clear_declarations();
+  mgr->declare_weights(dit, 13 * kGB);
+
+  // NO STAGE HOLDS THE ENCODER. The DiT's share alone fits: its blocks
+  // are kept, and it stays between clips.
+  const auto alone = GenerateVideoStage::h3_stream_plan(&sess, dit, 0);
+  EXPECT_TRUE(alone.footprint == 13 * kGB);
+  EXPECT_FALSE(alone.stream);
+  EXPECT_FALSE(GenerateVideoStage::h3_box_bounded(&sess));
+  // ...where naming the encoder, as both questions once did, tips each
+  // of them: the geometry tells the two apart.
+  EXPECT_TRUE(model_memory::plan_streaming(&sess, dit, enc,
+                                           model_memory::kStreamHeadroom)
+                  .stream);
+  EXPECT_TRUE(model_memory::bounded(&sess, {enc}, model_memory::kHeadroom));
+
+  // A STAGE HOLDS IT ALL RUN: both questions see it.
+  mgr->declare_weights(enc, 50 * kGB);
+  const auto held = GenerateVideoStage::h3_stream_plan(&sess, dit, 0);
+  EXPECT_TRUE(held.footprint == 63 * kGB);
+  EXPECT_TRUE(held.stream);
+  EXPECT_TRUE(GenerateVideoStage::h3_box_bounded(&sess));
+
+  // A STAGE HOLDS IT ONLY TO CONDITION: gone before the denoise the
+  // streaming question is asked in, still in the launch's peak.
+  mgr->clear_declarations();
+  mgr->declare_weights(dit, 13 * kGB);
+  mgr->declare_weights(enc, 50 * kGB,
+                       std::string(model_memory::kPhaseCondition));
+  const auto cond = GenerateVideoStage::h3_stream_plan(&sess, dit, 0);
+  EXPECT_TRUE(cond.footprint == 13 * kGB);
+  EXPECT_FALSE(cond.stream);
+  EXPECT_TRUE(GenerateVideoStage::h3_box_bounded(&sess));
+  std::printf("[model_memory] H3 at 64 GB, DiT 13 GB: encoder unheld %zu GB "
+              "stream %d; held %zu GB stream %d; conditioning only %zu GB "
+              "stream %d\n", alone.footprint / kGB, (int)alone.stream,
+              held.footprint / kGB, (int)held.stream,
+              cond.footprint / kGB, (int)cond.stream);
+
+  mgr->note_phase_released(enc);
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
 }
 
 TEST(model_memory, ane_modules_are_claimed_by_the_stages_that_build_them)

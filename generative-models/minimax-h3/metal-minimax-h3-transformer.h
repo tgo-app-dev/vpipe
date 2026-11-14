@@ -448,7 +448,9 @@ class MetalMiniMaxH3Transformer {
   // nowhere for a pre-activation delta to land.
   struct LoraSpec {
     std::string path;          // a single .safetensors of lora_A/B pairs
-    float       scale = 1.0f;  // folded into A at load; 1.0 = as trained
+    // The strength at load; 1.0 = as trained. Applied per forward, so
+    // live: set_lora_scale() changes it.
+    float       scale = 1.0f;
 
     // Which row order the adapter's FUSED `attn.qkv_proj` is in.
     //
@@ -523,6 +525,11 @@ class MetalMiniMaxH3Transformer {
   // GEMMs run on ComfyUI's int8 ConvRot (or W4A8) codes as stored, on the
   // token tier (Linear::cr), since load -- engagement, for a test.
   std::uint64_t convrot_native_gemms() const { return _cr_gemms; }
+  // Of the projections held from the load, how many are in the int8
+  // tier's layout: the refiner's (`refiner`), else the main blocks'.
+  // The refiner keeps its own whatever the tier (text rows, under the
+  // int8 row floor) -- split or not. For a test.
+  int int8_layouts(bool refiner) const;
 
   // What an adapter FILE will cost before anything loads -- the plan's
   // figure, off its header; lora_bytes() is the loaded model's. Every
@@ -545,9 +552,14 @@ class MetalMiniMaxH3Transformer {
   // patches too, which a released DiT does not read -- and take no
   // [rows, rank] scratch; an adapter on the timestep MLP adds that MLP,
   // read to the host from `pruned->time_mlp_dir`.
+  // `tp`: the share of a RANK (Config::tp), whose four split projections'
+  // factors are as tp_cut_lora_ cuts them -- q|k|v's and fc1's B to the
+  // share's rows, the out projection's and fc2's A to its columns -- and
+  // which streams them as any H3 does (its streamed set of cut factors).
   static LoraFootprint lora_footprint(const std::string& path,
                                       int n_layers = 0,
-                                      const Config* pruned = nullptr);
+                                      const Config* pruned = nullptr,
+                                      const TpShare* tp = nullptr);
   // Whether an adapter FILE moves a pruned DiT's timestep embedding (it
   // adapts the timestep MLP, or is a flow map), so the forward needs the
   // off-curve tables bake_adaln builds (off_curve_bytes).
@@ -1138,9 +1150,41 @@ class MetalMiniMaxH3Transformer {
   // the bake built -- not the adapter factors kept with promoted blocks,
   // which the adapter file's own claim books. The figure a per-clip
   // holding correction adds to the set's -- promoted blocks are this
-  // model's own buffers, which the set never sees. 0 for a preloaded
-  // model, whose blocks are the set's.
+  // model's own buffers, which the set never sees; so, a RANK's, are its
+  // refiner's cut projections. 0 for a preloaded model, whose blocks are
+  // the set's.
   std::size_t streamed_holding_bytes() const;
+  // EVERYTHING this model holds in WEIGHTS but the adapter factors
+  // (lora_bytes()): its weight set's entries and its own buffers -- a
+  // streaming model's promoted blocks, slot pair and AdaLN tables
+  // (streamed_holding_bytes()), a RANK's cut projections in the layout
+  // each took and its AdaLN tables. What a warm hold keeps; a rank's
+  // is what tp_held_bytes() books for it.
+  std::size_t held_bytes() const;
+  // What a RANK of `c` (Config::tp, with the tiers it loads with) holds
+  // with every block kept -- where stream, then retain converges on a box
+  // with room -- off the checkpoint's headers before anything loads: the
+  // plan's figure for held_bytes(). Every tensor of the trunk, the
+  // refiner and the first `c.n_layers` blocks as stored but the AdaLN
+  // projections (the bake reads them; the final layer's too), each
+  // block's four projections at its share -- tp_part_'s rows or columns
+  // -- in the layout the load leaves it: bf16, an affine pack's codes,
+  // scales and biases, or, on a MAIN block where the int8 tier engages
+  // (asked of an I8GemmContext made as load() makes it, on `mc`), its
+  // codes and scales -- a w4 pack's only where `c.i8_hold_w4` holds them,
+  // else its pack, converted per projection; and the bake's tables for
+  // `bake_rows` rows. 0 when `c` is not split. `c.ane_ffn` is the
+  // REQUEST: under it the share stays bf16, the larger figure, which is
+  // what holds if the grant comes. A stage deciding whether its rank
+  // holds the w4 layouts asks this twice, `i8_hold_w4` false and true:
+  // the difference is that layout's growth on this rank's share.
+  // `floor`: what the rank holds streaming at the least -- all of the
+  // above but the main blocks, and the two largest of those (the block a
+  // forward runs and the one read under it).
+  static std::size_t tp_held_bytes(const std::string& dit_dir,
+                                   const Config& c, int bake_rows,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
   // EVERY BLOCK KEPT: give the slot pair back -- two blocks a preload
   // never held. Call with no forward running; the next streamed block
   // (after an eviction) builds it again. Returns the bytes freed.
@@ -1277,14 +1321,34 @@ class MetalMiniMaxH3Transformer {
   // attention, VDN's branch, the in-place q/k/v layout).
   // VPIPE_H3_BAND_ROWS=<rows> sets the band (0: never). A RANK of a
   // split DiT (Config::tp) bands for its exchanges, not its memory: a
-  // band at most an eighth of the sequence (VPIPE_H3_TP_BANDS=<n>: n),
-  // 1,024 rows at least, by seq alone -- every rank must cut the same
-  // bands, so nothing measured on its own host goes in.
+  // band about an eighth of the sequence (VPIPE_H3_TP_BANDS=<n>: an n-th,
+  // no floor), and no band but the last under 1,024 rows -- or the
+  // share's own tp_extra::kMinBandRows, a host's for both ranks -- fewer
+  // bands where an eighth is shorter; by seq alone: every rank must cut
+  // the same bands, so nothing measured on its own host goes in.
   static int band_rows(const Config& c, int seq);
   static constexpr int kBandRows = 8192;
   static constexpr int kTpMinBand = 1024;
   // The band the last forward ran its main blocks in (0: whole).
   int last_band_rows() const { return _last_band; }
+  // What this model holds WIRED (its window onto the wired pool): a warm
+  // hold keeps it charged.
+  std::size_t wired_bytes() const { return _wire.wired_bytes(); }
+  // The forward's SCRATCH let go -- the activation set, a rank's
+  // exchange buffers (its generation ended first: the channel forgets
+  // them), Sage's and Sol's own buffers and the GEMMs' grow-only ones
+  // (the dequant matrix, a W4A8 weight's codes, the int8 context's) --
+  // before the model is kept warm: a few GB a video forward, built again
+  // at the next one's geometry. Returns what was freed (the int8
+  // context's not counted: it states no figure).
+  std::size_t release_forward_scratch();
+  // FOR TESTS: adapter slot `slot`'s delta on main block `block`'s
+  // projection `which` (0 q|k|v, 1 out, 2 fc1, 3 fc2) for ONE row `x` of
+  // its input as this model holds it -- a rank's share -- computed on
+  // the host from the bound factors, B (A x), banded or not, at
+  // strength 1. Empty where the slot has no factors there.
+  std::vector<float> lora_delta_for_test(int slot, int block, int which,
+                                         const std::vector<float>& x) const;
   // ...and the one this model's forward takes at `seq` (band_rows under
   // the load's kernels and branches; a request's streaming attention
   // aside).
@@ -2128,9 +2192,41 @@ class MetalMiniMaxH3Transformer {
   metal_compute::SharedBuffer _tp_recv[4];
   // A share of one of a block's projections, cut from the checkpoint's
   // whole one (load_block_ under Config::tp).
+  // `fast`: the share takes its int8 tier's layout (tp_fast_) -- a MAIN
+  // block's projections; the refiner's (text rows, under the int8 row
+  // floor) stay as cut, as the unsplit model keeps its own.
   enum class TpCut { kQkv, kOut, kFc1, kFc2 };
   Linear tp_linear_(WeightSet& ws, const std::string& nm, TpCut cut,
-                    std::string* err);
+                    bool fast, std::string* err);
+  // What a cut keeps of a projection of the checkpoint's widths: its
+  // output rows (`rows` of N) and its input columns [k0, k1) -- k1 0:
+  // all of them.
+  struct TpPart {
+    int N = 0;
+    std::vector<std::pair<int, int>> rows;
+    int k0 = 0, k1 = 0;
+  };
+  TpPart tp_part_(TpCut cut) const;
+  // The same for a config's share: what the plan's tp_held_bytes cuts.
+  static TpPart tp_part_of_(const Config& c, TpCut cut);
+  // A rank's dense or affine share in the int8 LAYOUT its tier holds
+  // (Config::i8_tier past accurate): converted from the cut, as a kept
+  // block's projection is from the checkpoint. A share whose width no
+  // group divides stays as it is, on the accurate tier.
+  bool tp_fast_(Linear& l, std::string* err);
+  bool tp_fast_affine_(Linear& l, std::string* err);
+  // The bytes of `v`'s four projections: a rank's cuts, its own buffers.
+  static std::size_t tp_cut_bytes_(const std::vector<Block>& v);
+  // The checkpoint's widths a rank's adapter is bound at.
+  int full_inner_() const
+  {
+    return _cfg.tp.active() ? _cfg.tp.n_heads * _cfg.head_dim
+                            : _cfg.inner();
+  }
+  int full_ffn_() const
+  {
+    return _cfg.tp.active() ? _cfg.tp.n_ffn : _cfg.ffn;
+  }
   // An EXCHANGE BUFFER at least `bytes` long: one too short is forgotten
   // by the channel (TpChannel::forget) before it is replaced. False when
   // there is no room.
@@ -2389,6 +2485,9 @@ class MetalMiniMaxH3Transformer {
   // rows are CONTIGUOUS, which is what lets a block bind its slice
   // directly instead of gathering.
   std::vector<int> _adaln_row0, _adaln_nt;
+  // What the tables were baked for (bake_adaln): its timesteps, endpoints
+  // and the adapters' strengths -- the same again keeps them.
+  std::vector<float> _baked_t, _baked_r, _baked_scales;
   metal_compute::ComputeFunction _fn_copy;
   // The per-head row copies, 64-bit: the streaming attention's K/V and
   // the banded forward's Sol query gather.
@@ -2403,6 +2502,11 @@ class MetalMiniMaxH3Transformer {
   // Read the adapter and bind its factors to the modules above. Called
   // from load() once the blocks exist.
   bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // A RANK's adapter (Config::tp): bound at the checkpoint's widths, its
+  // factors then cut as the weights are -- B's rows of q|k|v and fc1, A's
+  // columns of the out projection and fc2 -- so a rank adds its share of
+  // each delta and the two ranks' sum is the whole one.
+  bool tp_cut_lora_(LoraSlot& slot, std::string* err);
   // A file of AdaLN curve branches into slot.curve (true, with `*took`
   // set); `*took` false for a file that carries none.
   bool bind_curves_(const std::string& path, LoraSlot& slot, bool* took,

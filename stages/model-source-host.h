@@ -49,6 +49,16 @@ public:
   // Env vars consulted in order for a bearer token, most specific first.
   virtual std::vector<std::string> token_env() const = 0;
 
+  // Whether the token this source takes is the user's HUGGINGFACE
+  // credential handed to a third party: a mirror of HuggingFace itself
+  // (hf-mirror.com) has no accounts, so a gated repo through it needs the
+  // user's own HuggingFace token, relayed. Such a source is offered one
+  // only where the user said so for it: its own env var, the prompt that
+  // names where the token goes, or a stage's `hf_token` beside a `source`
+  // that names it -- never a `hf_token` a graph carried for HuggingFace
+  // while $VPIPE_MODEL_SOURCE chose the mirror.
+  virtual bool relays_huggingface_token() const { return false; }
+
   // Where a human reads about the repo; the registry record's source_url.
   virtual std::string web_url(const std::string& repo) const = 0;
 

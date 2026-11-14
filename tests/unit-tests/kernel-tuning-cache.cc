@@ -25,6 +25,7 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/shared/accel-settings.h"
 #include "generative-models/shared/kernel-autotune.h"
+#include "stages/audio-video/relayvsr-upscale-stage.h"
 #include "stages/diffusion-conditioner-stage.h"
 #include "stages/generate-audio-stage.h"
 #include "stages/generate-image-stage.h"
@@ -447,9 +448,11 @@ TEST(kernel_tuning, the_stages_carry_the_autotune_key)
   LatentUpscaleStage lu(&sess, "lu", none, off);
   TextToSpeechStage tts(&sess, "tts", none, off);
   VideoRefEncoderStage vr(&sess, "vr", none, off);
+  RelayVsrUpscaleStage rv(&sess, "rv", none, off);
   for (const StageSpec* sp : {&gi.spec(), &gv.spec(), &vd.spec(),
                               &ve.spec(), &dc.spec(), &ga.spec(),
-                              &lu.spec(), &tts.spec(), &vr.spec()}) {
+                              &lu.spec(), &tts.spec(), &vr.spec(),
+                              &rv.spec()}) {
     if (!declares(*sp)) {
       std::printf("[kernel_tuning] %s: no `autotune` bool defaulting "
                   "true\n", std::string(sp->type_name).c_str());

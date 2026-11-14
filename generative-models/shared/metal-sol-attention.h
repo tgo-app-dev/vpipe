@@ -262,6 +262,11 @@ class MetalSolAttention {
 
   std::size_t resident_bytes() const;
 
+  // Give back the keys prepare_keys() made (private buffers, kept for
+  // the next layer's call): a caller keeping this object idle -- a model
+  // held warm between graphs. The next prepare_keys() makes them again.
+  void release_prepared_keys();
+
   // LEND THIS MEMORY THAT IS DEAD FOR THE LENGTH OF ONE CALL, and the
   // scratch above stops being an allocation.
   //

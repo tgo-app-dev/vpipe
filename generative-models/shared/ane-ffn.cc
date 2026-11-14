@@ -112,6 +112,14 @@ f32_of_bf16_(std::uint16_t v)
   return f;
 }
 
+float
+f32_of_f16_(std::uint16_t v)
+{
+  _Float16 h;
+  std::memcpy(&h, &v, sizeof(h));
+  return (float)h;
+}
+
 bool
 filled_(const metal_compute::SharedBuffer* b)
 {
@@ -440,6 +448,7 @@ AneFeedForward::create(const Options& o)
   f->_ffn     = o.ffn;
   f->_matmul  = o.matmul;
   f->_gelu    = o.gelu && !o.matmul;
+  f->_f16     = o.f16;
   f->_scaled  = (o.situ && !o.matmul && !o.gelu) ? 2 : 1;
   f->_out_w   = o.matmul ? o.ffn : o.hidden;
   // What one row costs the ANE, as perf-flops counts it: one projection
@@ -827,6 +836,10 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
         if (!q.quantized) {
           const std::uint16_t* s =
               static_cast<const std::uint16_t*>(q.w->contents()) + sr * cols;
+          if (_f16) {                      // already the module's type
+            std::memcpy(dr, s, cols * 2);
+            return;
+          }
           for (std::size_t cc = 0; cc < cols; ++cc) {
             const std::uint16_t hv = lut[s[cc]];
             std::memcpy(dr + cc * 2, &hv, sizeof(hv));
@@ -902,7 +915,7 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
           const std::uint16_t* s =
               static_cast<const std::uint16_t*>(q.w->contents()) + sr * cols;
           for (std::size_t cc = 0; cc < cols; ++cc) {
-            acc[cc] = f32_of_bf16_(s[cc]);
+            acc[cc] = _f16 ? f32_of_f16_(s[cc]) : f32_of_bf16_(s[cc]);
           }
           return;
         }
@@ -1073,9 +1086,11 @@ AneFeedForward::stage_(int layer, std::vector<AneFfnSource> sources,
             have ? static_cast<const std::uint16_t*>(q.bias->contents())
                  : nullptr;
         for (std::size_t cc = 0; cc < n; ++cc) {
+          const std::size_t bi = cc * q.stride + q.offset;
           const float v =
-              bp != nullptr ? f32_of_bf16_(bp[cc * q.stride + q.offset]) * mul
-                            : 0.0f;
+              bp != nullptr
+                  ? (_f16 ? f32_of_f16_(bp[bi]) : f32_of_bf16_(bp[bi])) * mul
+                  : 0.0f;
           const _Float16 hv = (_Float16)v;
           std::memcpy(d + cc * 2, &hv, sizeof(hv));
         }
@@ -1377,15 +1392,22 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
       const auto ta = Clk::now();
       // bf16 -> fp16 in. The DiTs run bf16 (their residual streams
       // overflow f16) while the module declares fp16, so handing the bits
-      // over unconverted reinterprets them.
-      w.parallel_for(cin_n, [&](std::size_t lo, std::size_t hi) {
-        for (std::size_t i = lo; i < hi; ++i) {
-          in16[i] = (_Float16)f32_of_bf16_(src[io + i]);
-        }
-      });
+      // over unconverted reinterprets them. An fp16 family's rows are the
+      // module's own (Options::f16).
+      if (_f16) {
+        std::memcpy(in16, src + io, cin_n * 2);
+      } else {
+        w.parallel_for(cin_n, [&](std::size_t lo, std::size_t hi) {
+          for (std::size_t i = lo; i < hi; ++i) {
+            in16[i] = (_Float16)f32_of_bf16_(src[io + i]);
+          }
+        });
+      }
       if (_check) {
         for (std::size_t i = 0; i < cin_n; ++i) {
-          mx = std::max(mx, std::fabs(f32_of_bf16_(src[io + i])));
+          const float v =
+              _f16 ? f32_of_f16_(src[io + i]) : f32_of_bf16_(src[io + i]);
+          mx = std::max(mx, std::fabs(v));
           if (!std::isfinite((float)in16[i])) { ++over; }
         }
       }
@@ -1436,8 +1458,17 @@ AneFeedForward::begin(const metal_compute::SharedBuffer& in,
           const _Float16* orow = o16 + r * ow;
           for (const Seg& sg : segs) {
             std::uint16_t* d = sg.p + (sg.r0 + rbase + r) * sg.w;
+            if (_f16 && up == 1.0f) {
+              std::memcpy(d, orow + sg.c0, sg.w * 2);
+              continue;
+            }
             for (std::size_t cc = 0; cc < sg.w; ++cc) {
               const float f = (float)orow[sg.c0 + cc] * up;
+              if (_f16) {
+                const _Float16 h = (_Float16)f;
+                std::memcpy(&d[cc], &h, sizeof(h));
+                continue;
+              }
               std::uint32_t bits = 0;
               std::memcpy(&bits, &f, sizeof(bits));
               d[cc] = (std::uint16_t)(bits >> 16);

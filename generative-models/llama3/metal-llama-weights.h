@@ -207,6 +207,15 @@ public:
   // agree.
   bool pread_into(const std::string& name, void* dst, std::size_t cap,
                   bool uncached = true) const;
+  // The bytes [at, at + bytes) of a tensor's data, read as pread_into reads
+  // a whole one (pieces, staging off the grid) -- a split model's share of
+  // a weight's rows, the rest never read. False, as pread_into, where the
+  // tensor is not a plain safetensors one or the range runs past it.
+  // Host-only, as GenerativeModelManager's own: no symbol, the class's
+  // layout unchanged (plugin ABI 8 untouched).
+  __attribute__((visibility("hidden"))) bool
+  pread_range_into(const std::string& name, std::uint64_t at,
+                   std::size_t bytes, void* dst, bool uncached = true) const;
 
   // Allocate a SharedBuffer and copy the tensor's bytes into it.
   // Returns an empty SharedBuffer if the tensor is missing. `cost`, when

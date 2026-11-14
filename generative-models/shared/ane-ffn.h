@@ -192,6 +192,12 @@ class AneFeedForward {
     // no group divides keeps fp16. VPIPE_ANE_INT8=fast (512) or
     // fast<group> turns it on.
     int   int8_group = 0;
+    // The family's rows are FP16, not bf16 -- the module's own type (a
+    // model whose residual stream fits it, RelayVSR's decoder): begin()
+    // hands its rows over and back as they are, rounded only by the
+    // headroom scale, and a DENSE source's `w` and `bias` hold fp16.
+    // Adapters, integer, FP8 and affine sources are read as ever.
+    bool  f16     = false;
   };
 
   // Builds the module and its weight slots, or explains at warn/info why
@@ -371,6 +377,7 @@ class AneFeedForward {
   bool _plain  = false;      // ...unrotated (int8_plain)
   int  _group  = 0;          // ...grouped at this target (int8_group)
   bool _gelu   = false;      // {up, down}: the headroom rides slot 1 = down
+  bool _f16    = false;      // fp16 rows and dense sources (Options::f16)
   // The slot the fp16 headroom scale divides: 1 (SwiGLU's up, GELU's
   // down), or 2 (SITU's down).
   std::size_t _scaled = 1;

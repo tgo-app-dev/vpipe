@@ -147,10 +147,75 @@ public:
   }
 };
 
+// ---- HF-Mirror ---------------------------------------------------------
+
+// hf-mirror.com, a community mirror of HuggingFace itself that is
+// reachable from mainland China: the same API, the same listing, the same
+// `resolve` URLs under its own host, every repo under its HuggingFace name
+// (so no mirror table). From elsewhere it answers with a redirect to
+// huggingface.co (MEASURED: 308 on the listing and the files alike), which
+// the transfer follows -- so choosing it outside China costs nothing.
+//
+// Two things it is NOT:
+//  - a content store: HuggingFace's Xet reconstruction is HuggingFace's
+//    own service, so every file streams through the mirror;
+//  - an account. It has none (its FAQ: no login): a gated repo through it
+//    takes the user's own HuggingFace token, relayed. It is a third party,
+//    so that token is never offered unasked -- not $HF_TOKEN, not a
+//    graph's `hf_token` while $VPIPE_MODEL_SOURCE picked the mirror -- but
+//    only from $HF_MIRROR_TOKEN (set by a user who accepts sending it
+//    there), a `hf_token` beside `source: hf-mirror`, or the prompt.
+// Outside mainland China its redirect to huggingface.co carries no token
+// either (curl drops Authorization on a redirect to another host), so a
+// gated repo comes through it only where it answers itself.
+class HfMirrorSource final : public ModelSource
+{
+public:
+  const char* name() const override { return "hf-mirror"; }
+  const char* label() const override { return "HF-Mirror"; }
+  const char* default_revision() const override { return "main"; }
+
+  vector<string> token_env() const override { return {"HF_MIRROR_TOKEN"}; }
+  bool relays_huggingface_token() const override { return true; }
+
+  string web_url(const string& repo) const override
+  {
+    return "https://hf-mirror.com/" + repo;
+  }
+
+  string tree_url(const string& repo, const string& rev) const override
+  {
+    return "https://hf-mirror.com/api/models/" + repo + "/tree/" + rev
+         + "?recursive=true";
+  }
+
+  vector<HfFile> parse_tree(const FlexData& body) const override
+  {
+    return hf_tree_files(body);
+  }
+
+  string file_url(const string& repo, const string& rev,
+                  const string& path) const override
+  {
+    return "https://hf-mirror.com/" + repo + "/resolve/" + rev + "/" + path;
+  }
+
+  string empty_tree_hint(const string& repo, const string&) const override
+  {
+    return "'" + repo + "' lists no files on hf-mirror.com -- private, "
+           "gated, or misspelled. The mirror has no accounts: a gated repo "
+           "through it takes your own HuggingFace token, sent to "
+           "hf-mirror.com -- set $HF_MIRROR_TOKEN to it if you accept that "
+           "($HF_TOKEN is never sent there)";
+  }
+};
+
 const HuggingFaceSource kHuggingFace;
 const ModelScopeSource  kModelScope;
+const HfMirrorSource    kHfMirror;
 
-const ModelSource* const kSources[] = {&kHuggingFace, &kModelScope};
+const ModelSource* const kSources[] = {&kHuggingFace, &kModelScope,
+                                       &kHfMirror};
 
 // ---- the mirror table --------------------------------------------------
 
@@ -503,6 +568,7 @@ normalize_model_ref(const string& input)
   const bool modelscope = s.compare(0, 14, "modelscope.cn/") == 0;
   strip_prefix_(s, "modelscope.cn/");
   strip_prefix_(s, "huggingface.co/");
+  strip_prefix_(s, "hf-mirror.com/");
   if (modelscope) {
     strip_prefix_(s, "models/");
   }

@@ -540,6 +540,68 @@ DGVL(dense_gemm_mma_t_n128_scaled_f16, 128, 128, 8, false)
 DGVL(dense_gemm_mma_t_n128_acc_f16,    128, 128, 8, true)
 DGVL(dense_gemm_mma_t_n128x256_acc_f16, 128, 256, 8, true)
 
+// THE BIAS IN THE EPILOGUE. No tile above applies a bias -- each takes the
+// slot and discards it, and a caller adds the bias in a second pass over a
+// product already rounded to the element type: TWO roundings where the
+// steel kernel folds the bias into its f32 accumulator and rounds once. In
+// f16 the second rounding is lost in the noise; in bf16 it is not -- a
+// bf16 DiT whose every projection carries a bias (RelayVSR's keyframe
+// model) measured 1.02-1.17x the reference's own bf16 error on this route
+// against 1.00x on steel. Here the destination is f32 and the bias is added
+// to it element by element, so the output rounds ONCE, as steel's does.
+//   0:x[M,K] 1:W[N,K] 2:bias[N] 3:y[M,N] 4:K 5:N 6:M 7:has_bias (unread)
+//   dispatch as dense_gemm_mma_t_n128_f16.
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_bias_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* bias, device VPIPE_ELT* y, int K, int N, int M,
+    uint3 tgid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }      // uniform
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), float>();
+  op.run(mX, mW, cT);
+  // Coordinates come back (col, row): x is the N extent in this file.
+  for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+    if (!cT.is_valid_element(i)) { continue; }
+    const auto ids = cT.get_multidimensional_index(i);
+    const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+    if (gm < M && gn < N) {
+      y[(int64_t)gm * (int64_t)N + gn] =
+          static_cast<VPIPE_ELT>(cT[i] + (float)bias[gn]);
+    }
+  }
+}
+
+#define DGVB(NAME, BM, BN, SG)                                           \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias;                                                      \
+    dense_gemm_mma_bias_impl<BM, BN, SG>(x, W, bias, y, K, N, M, tgid);  \
+  }
+DGVB(dense_gemm_mma_t_n128_bias_f16,     128, 128, 8)
+DGVB(dense_gemm_mma_t_n128x256_bias_f16, 128, 256, 8)
+
 // Split-K deep-reduction tile. A single-op full-K reduction underutilizes the
 // matrix units once K gets very deep (Krea2 ff-down, K=16384 runs ~0.7x the
 // K<=9728 rate): too few threadgroups (N/BN of them) each walking a long serial
@@ -3482,6 +3544,8 @@ DGV_STUB(dense_gemm_mma_t_n128x256_rp_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_tn2_f16)
 DGV_STUB(dense_gemm_mma_t_scaled_f16)
 DGV_STUB(dense_gemm_mma_t_n128_scaled_f16)
+DGV_STUB(dense_gemm_mma_t_n128_bias_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_bias_f16)
 DGV_STUB(dense_gemm_mma_t_n128_acc_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_acc_f16)
 DGV_STUB(dense_gemm_mma_t_n128_lora_f16)

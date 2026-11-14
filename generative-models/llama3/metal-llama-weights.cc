@@ -993,6 +993,29 @@ MetalLlamaWeights::pread_into(const std::string& name, void* dst,
                       stage);
 }
 
+bool
+MetalLlamaWeights::pread_range_into(const std::string& name,
+                                    std::uint64_t at, std::size_t bytes,
+                                    void* dst, bool uncached) const
+{
+  const TensorInfo* ti = info(name);
+  if (ti == nullptr || dst == nullptr || bytes == 0 ||
+      at + bytes > ti->nbytes || ti->shard < 0 ||
+      static_cast<std::size_t>(ti->shard) >= _shards.size()) {
+    return false;
+  }
+  const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
+  const int fd = uncached && sh.fd_stream >= 0 ? sh.fd_stream : sh.fd;
+  if (fd < 0) { return false; }
+  const std::uint64_t base = sh.data_start + ti->offset + at;
+  // Staged off the 4 KB grid, as pread_into is (see there).
+  const bool stage =
+      fd == sh.fd_stream &&
+      ((base | reinterpret_cast<std::uintptr_t>(dst)) % kReadGrid) != 0;
+  return read_pieces_(fd, base, bytes, static_cast<std::uint8_t*>(dst),
+                      stage);
+}
+
 metal_compute::SharedBuffer
 MetalLlamaWeights::load(const std::string& name,
                         metal_compute::MetalCompute* mc,

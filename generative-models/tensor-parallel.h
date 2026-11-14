@@ -49,6 +49,23 @@ VPIPE_API_BEGIN
 
 namespace vpipe::genai {
 
+// Keys of TpShare::extra (docs/PLUGINS.md, "Versioning"). Absent, each is
+// the older behaviour.
+namespace tp_extra {
+// The fewest rows a band of a rank's forward takes (MiniMax H3's
+// band_rows), from a stage's `tensor_parallel` bag. The ranks must cut
+// the same bands, so a host states it for both, and only to a peer whose
+// libvpipe reads it -- one listing "tensor-parallel-decode/1", which
+// came with it.
+inline constexpr std::string_view kMinBandRows = "min_band_rows";
+// What a channel carries. Absent: a split DiT's generation (generate-
+// video). kChannelDecode: a split clip's decode (vae-decode's
+// `tensor_parallel`), which a process may hold BESIDE a DiT's channel --
+// see TpTransport::open.
+inline constexpr std::string_view kChannel = "channel";
+inline constexpr std::string_view kChannelDecode = "decode";
+}  // namespace tp_extra
+
 // One rank's share: [head0, head1) of the model's `n_heads` attention
 // heads and [ffn0, ffn1) of its `n_ffn` feed-forward rows. The ranks'
 // shares tile both with no overlap; ranks == 1 is the whole model.
@@ -56,7 +73,7 @@ namespace vpipe::genai {
 // ITS LAYOUT IS THE ABI's (abi/plugin-abi-<N>.txt): a plugin is handed
 // one, and from_flex() writes a whole one into the caller's. It grows
 // through `extra` (docs/PLUGINS.md, "Versioning"): a new field is a KEY
-// there, never a member. None is defined yet.
+// there (tp_extra, above), never a member.
 struct TpShare {
   int rank  = 0;
   int ranks = 1;
@@ -167,8 +184,19 @@ public:
   // A channel for one generation (TpChannel). `params` is the
   // transport's own bag, passed through from the stage unread; `share`
   // the rank it serves. Null, with `err`, when it cannot be opened (the
-  // peer is not there). Called again for every clip, once the last
-  // clip's channel has been let go.
+  // peer is not there). Called again for every clip, once that STAGE's
+  // last channel has been let go.
+  //
+  // TWO STAGES, TWO CHANNELS AT ONCE. A split clip's decode (vae-decode)
+  // opens a channel of its own, and when a launch makes several clips it
+  // decodes clip k while generate-video denoises clip k+1: a process then
+  // holds a DiT's channel and a decode's at the same time, opened in
+  // either order, and the peer's two in its own order. The decode's
+  // share says what it is (`extra`: tp_extra::kChannel =
+  // tp_extra::kChannelDecode; heads and ffn rows empty), and its `params`
+  // are the decode stage's own -- so a transport pairs a rank's channel
+  // with the peer's of the same kind, by that key or by params a host
+  // gives each stage apart (a port each), never by the order they open.
   virtual std::shared_ptr<TpChannel> open(const FlexData& params,
                                           const TpShare&  share,
                                           std::string*    err) = 0;

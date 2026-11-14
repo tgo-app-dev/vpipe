@@ -66,6 +66,20 @@ TpShare::from_flex(const FlexData& fd, int n_heads, int ffn, TpShare* out,
   if (s.ffn0 < 0 || s.ffn1 > ffn || s.ffn0 >= s.ffn1) {
     return fail(fmt("ffn rows [{}, {}) of {}", s.ffn0, s.ffn1, ffn)());
   }
+  // `min_band_rows`: the fewest rows a band of a rank's forward takes
+  // (MiniMax H3's band_rows: bands overlap its exchanges, and a link
+  // that carries a band's partial in well under its compute is better
+  // with fewer, taller ones) -- a figure the ranks must share, so a host
+  // states it for both; unsaid, the model's own.
+  if (o.contains(tp_extra::kMinBandRows)) {
+    const int b = (int)o.at(tp_extra::kMinBandRows).as_int(0);
+    if (b < 128 || b > (1 << 20)) {
+      return fail(fmt("min_band_rows {}", b)());
+    }
+    s.extra = FlexData::make_object();
+    s.extra.as_object().insert_or_assign(tp_extra::kMinBandRows,
+                                         FlexData::make_int(b));
+  }
   // One rank holding everything is the unsplit model whatever `ranks`
   // says; the shares of the others are theirs to check.
   *out = s;

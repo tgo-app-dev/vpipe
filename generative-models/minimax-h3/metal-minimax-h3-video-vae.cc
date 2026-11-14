@@ -3110,7 +3110,8 @@ MetalMiniMaxH3VideoVae::encode_tiled_(const SharedBuffer& x, int T, int H,
 
 SharedBuffer
 MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
-                                      int lw, std::string* err, int keep)
+                                      int lw, std::string* err, int keep,
+                                      int row0, int row1)
 {
   const Config& c = _cfg;
   // The tiles are laid out in PIXEL space and mapped back onto the
@@ -3178,6 +3179,20 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
   // row of tiles and this one are all that is held -- where every tile
   // of the clip was kept until the end.
   const int rows = (int)ys.start.size(), cols = (int)xs.start.size();
+  // A SHARE's tiles [t0, t1), row by row (decode_video's units): only
+  // those are decoded, the rest stay zero. A tile's region is stitched
+  // from its own pixels, the tile above's and the one to its left's
+  // (stitch_tile_), each with a fixed weight -- so this share writes, in
+  // every region, the terms of the tiles it holds, zeros standing in
+  // for the others', and the shares' parts add to the stitch whole.
+  const int nt = rows * cols;
+  const int t0 = std::clamp(row0, 0, nt);
+  const int t1 = row1 < 0 ? nt : std::clamp(row1, t0, nt);
+  const bool part = t0 > 0 || t1 < nt;
+  auto own = [&](int i, int j) {
+    const int k = i * cols + j;
+    return i >= 0 && j >= 0 && k >= t0 && k < t1;
+  };
   SharedBuffer out =
       _mc->make_shared_buffer((std::size_t)OC * KT * H * W * 2);
   if (out.empty()) {
@@ -3185,59 +3200,77 @@ MetalMiniMaxH3VideoVae::decode_tiled_(const SharedBuffer& z, int LT, int lh,
     return {};
   }
   auto* dst = static_cast<std::uint16_t*>(out.contents());
+  std::vector<std::uint16_t> zeros;
+  if (part) {
+    std::memset(dst, 0, (std::size_t)OC * KT * H * W * 2);
+    const int my = *std::max_element(ys.length.begin(), ys.length.end());
+    const int mx = *std::max_element(xs.length.begin(), xs.length.end());
+    zeros.assign((std::size_t)OC * KT * my * mx, 0);
+  }
+  auto bytes = [](const SharedBuffer& b) {
+    return b.empty() ? nullptr
+                     : static_cast<const std::uint16_t*>(b.contents());
+  };
   std::vector<SharedBuffer> above((std::size_t)cols), row((std::size_t)cols);
   std::vector<float> tmp;
   for (int i = 0; i < rows; ++i) {
     for (int j = 0; j < cols; ++j) {
-      const int y0 = ys.start[(std::size_t)i] / c.patch;
-      const int th = ys.length[(std::size_t)i] / c.patch;
-      const int x0 = xs.start[(std::size_t)j] / c.patch;
-      const int tw = xs.length[(std::size_t)j] / c.patch;
-      SharedBuffer sub =
-          _mc->make_shared_buffer((std::size_t)ZC * LT * th * tw * 2);
-      if (sub.empty()) {
-        if (err != nullptr) { *err = "tile allocation failed"; }
-        return {};
-      }
-      auto* d = static_cast<std::uint16_t*>(sub.contents());
-      for (int ch = 0; ch < ZC; ++ch) {
-        for (int t = 0; t < LT; ++t) {
-          const std::size_t sb = ((std::size_t)ch * LT + t) * plane;
-          const std::size_t db = ((std::size_t)ch * LT + t) * th * tw;
-          for (int r = 0; r < th; ++r) {
-            std::memcpy(d + db + (std::size_t)r * tw,
-                        src + sb + (std::size_t)(y0 + r) * lw + x0,
-                        (std::size_t)tw * 2);
-          }
-        }
-      }
-      if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
-      SharedBuffer dec = decode(sub, LT, th, tw, err);
-      if (dec.empty()) { return {}; }
-      ++_prog_done;
-      if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
-      const std::size_t n = (std::size_t)OC * OT * (th * c.patch) *
-                            (tw * c.patch);
-      if (dec.byte_size() < n * 2) {
-        if (err != nullptr) { *err = "tile stitch failed"; }
-        return {};
-      }
-      // A still keeps one frame of the tile, and the rows hold that.
-      if (cut) {
-        dec = frame_of(dec, (std::size_t)(th * c.patch) * (tw * c.patch));
-        if (dec.empty()) {
+      const bool oc = own(i, j), ou = own(i - 1, j), ol = own(i, j - 1);
+      if (!oc && !ou && !ol) { continue; }
+      SharedBuffer dec;
+      if (oc) {
+        const int y0 = ys.start[(std::size_t)i] / c.patch;
+        const int th = ys.length[(std::size_t)i] / c.patch;
+        const int x0 = xs.start[(std::size_t)j] / c.patch;
+        const int tw = xs.length[(std::size_t)j] / c.patch;
+        SharedBuffer sub =
+            _mc->make_shared_buffer((std::size_t)ZC * LT * th * tw * 2);
+        if (sub.empty()) {
           if (err != nullptr) { *err = "tile allocation failed"; }
           return {};
         }
+        auto* d = static_cast<std::uint16_t*>(sub.contents());
+        for (int ch = 0; ch < ZC; ++ch) {
+          for (int t = 0; t < LT; ++t) {
+            const std::size_t sb = ((std::size_t)ch * LT + t) * plane;
+            const std::size_t db = ((std::size_t)ch * LT + t) * th * tw;
+            for (int r = 0; r < th; ++r) {
+              std::memcpy(d + db + (std::size_t)r * tw,
+                          src + sb + (std::size_t)(y0 + r) * lw + x0,
+                          (std::size_t)tw * 2);
+            }
+          }
+        }
+        if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+        dec = decode(sub, LT, th, tw, err);
+        if (dec.empty()) { return {}; }
+        ++_prog_done;
+        if (_tile_progress) { _tile_progress(_prog_done, _prog_total); }
+        const std::size_t n = (std::size_t)OC * OT * (th * c.patch) *
+                              (tw * c.patch);
+        if (dec.byte_size() < n * 2) {
+          if (err != nullptr) { *err = "tile stitch failed"; }
+          return {};
+        }
+        // A still keeps one frame of the tile, and the rows hold that.
+        if (cut) {
+          dec = frame_of(dec, (std::size_t)(th * c.patch) * (tw * c.patch));
+          if (dec.empty()) {
+            if (err != nullptr) { *err = "tile allocation failed"; }
+            return {};
+          }
+        }
       }
-      auto bytes = [](const SharedBuffer& b) {
-        return b.empty() ? nullptr
-                         : static_cast<const std::uint16_t*>(b.contents());
-      };
-      stitch_tile_(dst, bytes(dec),
-                   i > 0 ? bytes(above[(std::size_t)j]) : nullptr,
-                   j > 0 ? bytes(row[(std::size_t)(j - 1)]) : nullptr, i, j,
-                   ys, xs, 1, OC, KT, H, W, tmp);
+      const std::uint16_t* cur = oc ? bytes(dec) : zeros.data();
+      const std::uint16_t* up =
+          i == 0 ? nullptr
+          : ou   ? bytes(above[(std::size_t)j])
+                 : zeros.data();
+      const std::uint16_t* lf =
+          j == 0 ? nullptr
+          : ol   ? bytes(row[(std::size_t)(j - 1)])
+                 : zeros.data();
+      stitch_tile_(dst, cur, up, lf, i, j, ys, xs, 1, OC, KT, H, W, tmp);
       row[(std::size_t)j] = std::move(dec);
     }
     above.swap(row);
@@ -3316,6 +3349,69 @@ MetalMiniMaxH3VideoVae::decoded_frames_for(const Config& c, int LT)
     }
   }
   return frames > 0 ? frames : 0;
+}
+
+namespace {
+
+// The tiles a chunk of an lh x lw latent decodes in: decode_tiled_'s
+// grid (one where it does not tile).
+int
+tiles_per_chunk_(const MetalMiniMaxH3VideoVae::Config& c, int lh, int lw)
+{
+  const auto n = [&](int px) {
+    return std::max<int>(1, (int)minimax_h3::split_tiles(
+                                px, c.tile_size, c.tile_overlap_min,
+                                c.patch)
+                                .start.size());
+  };
+  return n(lh * c.patch) * n(lw * c.patch);
+}
+
+}  // namespace
+
+int
+MetalMiniMaxH3VideoVae::decode_units(int LT, int lh, int lw) const
+{
+  const Config& c = _cfg;
+  const int tcs = c.tokens_per_chunk();
+  if (LT <= 0 || lh <= 0 || lw <= 0 || tcs <= 0) { return 0; }
+  const int td = c.token_drop;
+  const int num_tokens = LT + td;
+  const int pad_tokens = ((-num_tokens % tcs) + tcs) % tcs;
+  const int chunks =
+      std::max(0, (num_tokens + pad_tokens) / tcs - (td > 0 ? 1 : 0));
+  return chunks * tiles_per_chunk_(c, lh, lw);
+}
+
+std::pair<int, int>
+MetalMiniMaxH3VideoVae::unit_frames(int LT, int lh, int lw, int u0,
+                                    int u1) const
+{
+  // decode_video's geometry, as it walks its chunks: the frames of every
+  // chunk with a unit in [u0, u1), and the fade into the next one's.
+  const Config& c = _cfg;
+  const int units = decode_units(LT, lh, lw);
+  if (units <= 0) { return {0, 0}; }
+  const int trows = tiles_per_chunk_(c, lh, lw);
+  const int chunks = units / trows;
+  u0 = std::clamp(u0, 0, units);
+  u1 = u1 < 0 ? units : std::clamp(u1, u0, units);
+  if (u0 >= u1) { return {0, 0}; }
+  const int c0 = u0 / trows, c1 = (u1 - 1) / trows + 1;
+  const int tcs = c.tokens_per_chunk(), tr = c.patch_t;
+  const int td = c.token_drop, fpp = c.frame_pre_pad();
+  const int cnf = tcs * tr, cf = (tcs + c.token_overlap()) * tr;
+  const int n_main = cf > fpp ? std::min(cnf, cf) - fpp : 0;
+  const int n_tail =
+      td > 0 && cf - cnf > fpp ? std::min(cnf, cf - cnf) - fpp : 0;
+  const int keep = decoded_frames_for(c, LT);
+  int end = c1 * n_main;
+  if (n_tail > 0) {
+    end += c1 == chunks
+               ? n_tail
+               : std::min(std::min(n_tail, n_main), c.frame_overlap());
+  }
+  return {std::min(c0 * n_main, keep), std::min(end, keep)};
 }
 
 SharedBuffer
@@ -3457,6 +3553,31 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
   }
   const int ZC = c.z_channels;
   const int H = lh * c.patch, W = lw * c.patch;
+  // This decode's share of the units (set_unit_range), taken once: of
+  // chunk i, its tiles [first, end), row by row -- none where it has
+  // none.
+  const int trows =
+      std::max<int>(1, (int)minimax_h3::split_tiles(
+                           H, c.tile_size, c.tile_overlap_min, c.patch)
+                           .start.size()) *
+      std::max<int>(1, (int)minimax_h3::split_tiles(
+                           W, c.tile_size, c.tile_overlap_min, c.patch)
+                           .start.size());
+  const int units = chunks * trows;
+  const int u0 = std::clamp(_unit0, 0, units);
+  const int u1 = _unit1 < 0 ? units : std::clamp(_unit1, u0, units);
+  _unit0 = 0;
+  _unit1 = -1;
+  const bool share = u0 > 0 || u1 < units;
+  auto rows_of = [&](int i) {
+    return std::pair<int, int>{std::clamp(u0 - i * trows, 0, trows),
+                               std::clamp(u1 - i * trows, 0, trows)};
+  };
+  auto mine = [&](int i) {
+    if (i < 0 || i >= chunks) { return false; }
+    const auto r = rows_of(i);
+    return r.first < r.second;
+  };
   const std::size_t lplane = (std::size_t)lh * lw;
   const std::size_t plane  = (std::size_t)H * W;
   const int OC = c.out_channels;
@@ -3503,6 +3624,9 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
       _mc->make_shared_buffer((std::size_t)OC * keep * plane * 2);
   if (out.empty()) { return fail("output allocation failed"); }
   auto* dst = static_cast<std::uint16_t*>(out.contents());
+  // A share writes what its chunks make and nothing else: the rest stays
+  // zero, for the other shares' buffers to be added.
+  if (share) { std::memset(dst, 0, (std::size_t)OC * keep * plane * 2); }
   // Frames [at, at + n) of the clip from `src` ([OC, n_src, H, W], frames
   // from `f0`); those past the pad trim are not kept.
   auto put = [&](const std::uint16_t* src, int n_src, int f0, int at,
@@ -3525,19 +3649,34 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
 
   // The bar spans the WHOLE clip, not one chunk: a chunk boundary is
   // invisible to whoever is watching, and a bar that refilled per chunk
-  // would read as progress restarting. Counted here because this is the
-  // only place that knows both factors -- the tiling is decided per chunk
-  // but is identical across them, since every chunk has the same extent.
-  {
-    const int H0 = lh * c.patch, W0 = lw * c.patch;
-    const auto ys0 = minimax_h3::split_tiles(H0, c.tile_size,
-                                             c.tile_overlap_min, c.patch);
-    const auto xs0 = minimax_h3::split_tiles(W0, c.tile_size,
-                                             c.tile_overlap_min, c.patch);
-    _prog_total = chunks * (int)(ys0.start.size() * xs0.start.size());
-    _prog_done  = 0;
-  }
+  // would read as progress restarting. Counted in units -- a chunk's
+  // tiles, identical across chunks of one extent -- and only this
+  // decode's share of them.
+  _prog_total = u1 - u0;
+  _prog_done  = 0;
+  // A frame's weight in a cross-fade written ALONE: the half a chunk of
+  // another share fades against. `scale` the weight of frame f of `ext`.
+  auto weigh = [&](int at0, int ext, const std::uint16_t* src,
+                   std::size_t n_src, int f_src0, bool head) {
+    for (int ch = 0; ch < OC; ++ch) {
+      for (int f = 0; f < ext && at0 + f < keep; ++f) {
+        const float wb = (float)f / (float)ext;
+        const float w = head ? wb : 1.0f - wb;
+        std::uint16_t* pd = dst + ((std::size_t)ch * keep + at0 + f) * plane;
+        const std::uint16_t* ps =
+            src + ((std::size_t)ch * n_src + f_src0 + f) * plane;
+        for (std::size_t q = 0; q < plane; ++q) {
+          pd[q] = f32_to_bf16_(w * bf16_to_f32_(ps[q]));
+        }
+      }
+    }
+  };
   for (int i = 0; i < chunks; ++i) {
+    if (!mine(i)) {
+      // Another share's chunk: its frames are its to write.
+      if (n_main > 0) { at += n_main; }
+      continue;
+    }
     const int start = i * tcs;
     {
       const auto* s = static_cast<const std::uint16_t*>(zp.contents());
@@ -3550,7 +3689,9 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
         }
       }
     }
-    SharedBuffer clip = decode_tiled_(sub, span, lh, lw, err);
+    const auto rr = rows_of(i);
+    SharedBuffer clip =
+        decode_tiled_(sub, span, lh, lw, err, -1, rr.first, rr.second);
     if (clip.empty()) { return {}; }
     const auto* cd = static_cast<const std::uint16_t*>(clip.contents());
     if (n_main > 0) {
@@ -3577,10 +3718,20 @@ MetalMiniMaxH3VideoVae::decode_video(const SharedBuffer& z, int LT, int lh,
         }
         overlap = SharedBuffer{};
         overlap_n = 0;
+      } else if (i > 0 && !mine(i - 1) && n_tail > 0) {
+        // The chunk before is another share's: this head's half of the
+        // fade, w * head, over the frames the two share.
+        const int ext = std::min(std::min(n_tail, n_main), fov);
+        weigh(at, ext, cd, cf, fpp, /*head=*/true);
       }
       at += n_main;
     }
-    if (n_tail > 0) {
+    if (n_tail > 0 && i < chunks - 1 && !mine(i + 1)) {
+      // The chunk after is another share's: this tail's half of the
+      // fade, (1 - w) * tail, over that chunk's first frames.
+      const int ext = std::min(std::min(n_tail, n_main), fov);
+      weigh(at, ext, cd, cf, cnf + fpp + n_tail - ext, /*head=*/false);
+    } else if (n_tail > 0) {
       overlap = _mc->make_shared_buffer((std::size_t)OC * n_tail * plane * 2);
       if (overlap.empty()) { return fail("allocation failed"); }
       auto* tp = static_cast<std::uint16_t*>(overlap.contents());

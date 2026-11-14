@@ -110,6 +110,12 @@
 //                      register_tp_transport, a plugin's transport carrying
 //                      a split DiT's partial sums between ranks (generate-
 //                      video's `tensor_parallel`)
+//   tensor-parallel-decode  vae-decode's `tensor_parallel`: a MiniMax H3
+//                      clip's decode split between the same ranks, each
+//                      its share of the units, the parts exchanged
+//                      through the same transport (a channel of its own,
+//                      tp_extra::kChannel) and added on rank 0; and a
+//                      rank's band floor, tp_extra::kMinBandRows
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
@@ -118,6 +124,7 @@
 #define VPIPE_FEATURE_KERNEL_TUNING     "kernel-tuning/1"
 #define VPIPE_FEATURE_MODEL_SOURCES     "model-sources/1"
 #define VPIPE_FEATURE_TENSOR_PARALLEL   "tensor-parallel/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_DECODE "tensor-parallel-decode/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

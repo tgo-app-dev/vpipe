@@ -7,6 +7,7 @@
 #include "common/beat-keys.h"
 
 #include <cstring>
+#include <dispatch/dispatch.h>
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -16,6 +17,7 @@
 #include "generative-models/flashvsr/flashvsr-family.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/minimax-h3-references.h"
+#include "generative-models/tensor-parallel.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
@@ -53,6 +55,10 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
   // (when iport connectivity is known), not here.
   _hf_dir    = attr_str("hf_dir");
   _keep_loaded = attr_real("keep_loaded");
+  if (this->config().is_object() &&
+      this->config().as_object().contains("tensor_parallel")) {
+    _tp_cfg = this->config().as_object().at("tensor_parallel");
+  }
   _vae_weights = attr_str("vae_dir");
   _fast_decoder = attr_str("fast_decoder");
   // THE ACCELERATION BAG, built once and handed to a registered family
@@ -120,9 +126,37 @@ VaeDecodeStage::VaeDecodeStage(const SessionContextIntf* s,
 
 VaeDecodeStage::~VaeDecodeStage()
 {
+  if (_tp_teardown.joinable()) { _tp_teardown.join(); }
   // Kept warm (`keep_loaded`) where it was kept resident between beats:
   // a stage that unloads after each beat does so because the box is
   // tight.
+  // MiniMax-H3's video decoder, the released one or the fast one, alike:
+  // a clip's decode then loads nothing for the next clip.
+  if ((_h3_vae || _h3_fast) && _keep_loaded > 0 && !_unload_idle &&
+      !_h3_vae_warm_key.empty() && session() != nullptr) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      session()->info(fmt("VaeDecodeStage('{}'): MiniMax-H3's {} decoder "
+                          "kept warm for {:.0f} s", this->id(),
+                          _h3_fast ? "fast" : "video", _keep_loaded));
+      if (_h3_fast) {
+        const std::size_t b = _h3_fast->weight_bytes();
+        mgr->keep_model_warm(kH3FastWarmKind, vae_dir_for_release_(),
+                             _h3_vae_warm_key, std::move(_h3_fast), b,
+                             _keep_loaded);
+      } else {
+        // What its decoder holds (the stage never encodes, so the
+        // encoder half never loaded), off the checkpoint's headers: the
+        // set it reads is its own, which the manager cannot measure, so
+        // a hold of 0 bytes read as free to every warm-hold sum.
+        const std::size_t b = genai::MetalMiniMaxH3VideoVae::held_bytes(
+            vae_dir_for_release_(),
+            genai::MetalMiniMaxH3VideoVae::Half::kDecoder);
+        mgr->keep_model_warm(kH3VaeWarmKind, vae_dir_for_release_(),
+                             _h3_vae_warm_key, std::move(_h3_vae), b,
+                             _keep_loaded);
+      }
+    }
+  }
   if ((_vae || _flux2_vae) && _keep_loaded > 0 && !_unload_idle &&
       !_vae_warm_key.empty() && session() != nullptr) {
     if (auto* mgr = session()->services()->generative_model_manager()) {
@@ -283,8 +317,27 @@ const ConfigKey kAttrs[] = {
           "the same checkpoint and settings is handed it -- no read, no "
           "int8 convs made again. Released sooner when a launch that does "
           "not use it needs the room. 0 (the default) lets it go with the "
-          "graph. The Qwen-Image / Krea-2 VAE and FLUX.2's AutoencoderKL",
+          "graph. The Qwen-Image / Krea-2 VAE, FLUX.2's AutoencoderKL and "
+          "MiniMax-H3's video decoder, released or fast",
    .def_real = 0.0},
+  {.key = "tensor_parallel", .type = ConfigType::Object, .required = false,
+   .doc = "this stage as one SHARE of a MiniMax H3 clip's decode split "
+          "across hosts (generative-models/tensor-parallel.h), as "
+          "generate-video's ranks split its DiT: {rank, ranks: 2, "
+          "decode_share: [first, end] -- this rank's span of the clip's "
+          "UNITS (each chunk's tiles, row by row) as fractions of them, "
+          "the ranks' spans tiling [0, 1] -- transport, params: the "
+          "transport's bag for THIS stage's link}. A launch of several "
+          "clips decodes one while generate-video denoises the next, so "
+          "both stages' channels are open at once: the decode's share "
+          "says it is one, and a transport that pairs channels by its "
+          "params needs this stage's apart from generate-video's (a port "
+          "of its own). Each rank decodes its units; the ranks swap what "
+          "they took -- a split that would not add to one clip is "
+          "refused -- and rank 1's frames cross to rank 0, which adds "
+          "them in and emits the clip; the others emit nothing. The "
+          "released video decoder only: a still, the fast decoder or a "
+          "rank of more than two decode whole, and every rank emits it"},
   {.key = "ane_ffn", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated decode (LOSSY, fp16): split the decoder blocks' "
           "feed-forward between the GPU and the Apple Neural Engine by rows, "
@@ -696,8 +749,7 @@ VaeDecodeStage::revise_decode_arena_(std::size_t bytes)
   _arena_decided = bytes;
 
   const std::size_t ram = model_memory::phys_ram();
-  const std::size_t fp  = model_memory::weight_footprint(session(),
-                                                         _idle_peers);
+  const std::size_t fp  = idle_footprint_(bytes + _ane_bytes);
   // The ANE module sits beside the arena for the whole decode, so the
   // question is whether BOTH fit next to the peers.
   const bool want = model_memory::resolve_idle_unload(
@@ -864,6 +916,35 @@ VaeDecodeStage::vae_dir_for_release_() const
   // no-ops the manager cannot report, because it has never heard of the
   // name being released.
   return resolve_vae_weights_path(generic);
+}
+
+// What the idle rule weighs the decode's working set `decode_need`
+// against. A picture's decoder: its graph's peers whole (the DiT and
+// encoder are back for the next beat). MiniMax-H3's video decoder
+// (`_idle_phase`): what the manager holds, not its graph's folders at
+// their size on disk, which name the whole 63 GB checkpoint a rank holds
+// a quarter of and an encoder gone since the condition phase -- but in
+// EVERY phase a decoder kept resident sits through, not the decode's
+// alone: kept, it is beside the next clip's conditioning and denoise
+// too, where its claim (decode-phased in a model-select graph) told the
+// plan it is absent. Each phase's weights with the decoder's own, its
+// declared scratch (the headroom when it declared none), the warm holds;
+// the worst of them, less `decode_need`, so the caller's peers + need is
+// that phase's figure (model_memory::kept_beside_every_phase). A DiT
+// phased to the denoise (`destroy`) or a rank's small share leaves the
+// decode phase roomy; the denoise beside it may not be.
+std::size_t
+VaeDecodeStage::idle_footprint_(std::size_t decode_need) const
+{
+  if (_idle_phase.empty()) {
+    return model_memory::weight_footprint(session(), _idle_peers);
+  }
+  std::size_t warm = 0;
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    for (const auto& w : mgr->warm_report()) { warm += w.bytes + w.kv_bytes; }
+  }
+  return model_memory::kept_beside_every_phase(
+      session(), vae_dir_for_release_(), _idle_phase, decode_need, warm);
 }
 
 void
@@ -1065,7 +1146,22 @@ VaeDecodeStage::ensure_loaded_()
                   (std::filesystem::path(root) / "text_encoder").string(),
                   (std::filesystem::path(root) / "mllm").string()};
     _idle_peers = peers;
-    const std::size_t fp = model_memory::weight_footprint(session(), peers);
+    // MiniMax-H3's video decoder runs ONCE a clip, after the denoise:
+    // beside what the DECODE phase holds -- its DiT let go by then (or
+    // kept warm, its share of a split DiT 15 GB where the checkpoint is
+    // 63), the text encoder long gone -- not every peer at its size on
+    // disk. Counted whole, a 64 GB Mac read 79 GB of peers and dropped
+    // the decoder after every clip, the keep_loaded hold with it. A
+    // picture graph's decoder runs between its denoises, and keeps the
+    // whole-graph answer.
+    {
+      std::string unk;
+      _idle_phase = _vae_family == nullptr &&
+                            builtin_vae_family(probe_vae_dir, &unk) ==
+                                "minimax-h3"
+                        ? model_memory::kPhaseDecode
+                        : std::string_view();
+    }
     // The decode ARENA, if the stage that has the geometry declared one.
     //
     // This is the quantity the decision was always about and could not
@@ -1081,6 +1177,7 @@ VaeDecodeStage::ensure_loaded_()
     const std::size_t arena =
         model_memory::scratch_footprint(session(), model_memory::kPhaseDecode);
     const std::size_t need = arena > 0 ? arena : model_memory::kHeadroom;
+    const std::size_t fp = idle_footprint_(need);
     switch (_unload_cfg) {
       case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
       case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
@@ -1303,6 +1400,22 @@ VaeDecodeStage::ensure_loaded_()
     }
     const auto t0 = std::chrono::steady_clock::now();
     fcfg.autotune = _autotune;
+    // KEPT WARM by an earlier graph (keep_loaded): the same file, tier,
+    // ANE share and tuning.
+    _h3_vae_warm_key = fmt("{}|{}|i8 {}|ane {} {} {}|tune {}", file, vae_dir,
+                           fcfg.i8_tier, fcfg.ane_ffn ? 1 : 0, fcfg.ane_rows,
+                           fcfg.ane_layers, fcfg.autotune ? 1 : 0)();
+    if (_keep_loaded > 0 && !_unload_idle) {
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        if (auto warm = mgr->take_warm<genai::MetalMiniMaxH3FastVae>(
+                kH3FastWarmKind, vae_dir_for_release_(), _h3_vae_warm_key)) {
+          _h3_fast = std::move(warm);
+          load_note_(fmt("VaeDecodeStage('{}'): MiniMax-H3's fast decoder "
+                         "kept warm is taken back", this->id()));
+          return;
+        }
+      }
+    }
     _h3_fast = genai::MetalMiniMaxH3FastVae::load(fws, mc, fcfg, &ferr);
     if (!_h3_fast) {
       session()->error(fmt(
@@ -1358,9 +1471,26 @@ VaeDecodeStage::ensure_loaded_()
             this->id(), bytes >> 20));
       }
     }
+    h3cfg.autotune = _autotune;
+    // KEPT WARM by an earlier graph (keep_loaded): the same weights, ANE
+    // share and tuning.
+    _h3_vae_warm_key = fmt("{}|{}|ane {} {} {}|tune {}", vae_dir,
+                           ws_override, h3cfg.ane_ffn ? 1 : 0,
+                           h3cfg.ane_rows, h3cfg.ane_layers,
+                           h3cfg.autotune ? 1 : 0)();
+    if (_keep_loaded > 0 && !_unload_idle) {
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        if (auto warm = mgr->take_warm<genai::MetalMiniMaxH3VideoVae>(
+                kH3VaeWarmKind, vae_dir_for_release_(), _h3_vae_warm_key)) {
+          _h3_vae = std::move(warm);
+          load_note_(fmt("VaeDecodeStage('{}'): the MiniMax-H3 video VAE "
+                         "kept warm is taken back", this->id()));
+          return;
+        }
+      }
+    }
     load_note_(fmt("VaeDecodeStage('{}'): loading the MiniMax-H3 video VAE "
                    "from '{}'", this->id(), vae_dir));
-    h3cfg.autotune = _autotune;
     _h3_vae = ws_override.empty()
                   ? genai::MetalMiniMaxH3VideoVae::load(vae_dir, mc, h3cfg)
                   : genai::MetalMiniMaxH3VideoVae::load(ws, mc, h3cfg);
@@ -1735,6 +1865,345 @@ VaeDecodeStage::finish_clip_(TensorBeatPayload* clip, double fps,
   clip->sideband = std::move(sb);
   forward_model_name_(src, *clip);
 }
+
+bool
+VaeDecodeStage::tp_split_asked_() const
+{
+  if (!_tp_cfg.is_object()) { return false; }
+  auto o = _tp_cfg.as_object();
+  return o.contains("ranks") && o.at("ranks").as_int(1) >= 2;
+}
+
+VaeDecodeStage::DecodeSplit
+VaeDecodeStage::decode_split_open_(int LT, int lh, int lw,
+                                   RuntimeContext& ctx)
+{
+  DecodeSplit sp;
+  if (!_tp_cfg.is_object() || !_h3_vae) { return sp; }
+  if (_tp_teardown.joinable()) { _tp_teardown.join(); }
+  auto o = _tp_cfg.as_object();
+  auto num = [&](const char* k, int d) {
+    return o.contains(k) ? (int)o.at(k).as_int(d) : d;
+  };
+  const int rank = num("rank", 0), ranks = num("ranks", 1);
+  if (ranks < 2) { return sp; }
+  auto whole = [&](const std::string& why) {
+    session()->warn(fmt("VaeDecodeStage('{}'): tensor_parallel: {}; the "
+                        "clip decoded whole here", this->id(), why));
+    return DecodeSplit{};
+  };
+  if (ranks != 2 || rank < 0 || rank >= ranks) {
+    return whole("a split decode is two ranks");
+  }
+  // This rank's span of the units: decode_share's fractions, both ranks
+  // rounding the one they share alike; unsaid, halves. Whether the two
+  // spans tile the units is checked when the ranks swap headers.
+  double a = (double)rank / ranks, b = (double)(rank + 1) / ranks;
+  const FlexData ds =
+      o.contains("decode_share") ? o.at("decode_share") : FlexData();
+  if (ds.is_array()) {
+    auto arr = ds.as_array();
+    if (arr.size() == 2) {
+      a = arr[0].as_real(a);
+      b = arr[1].as_real(b);
+    }
+  }
+  const int N = _h3_vae->decode_units(LT, lh, lw);
+  sp.units = N;
+  sp.rank = rank;
+  sp.u0 = std::clamp((int)std::lround(std::clamp(a, 0.0, 1.0) * N), 0, N);
+  sp.u1 = std::clamp((int)std::lround(std::clamp(b, 0.0, 1.0) * N), sp.u0,
+                     N);
+  const std::string tname =
+      o.contains("transport") ? std::string(o.at("transport").as_string(""))
+                              : std::string();
+  genai::TpTransport* tr = genai::tp_transports_available()
+                               ? genai::find_tp_transport(tname)
+                               : nullptr;
+  if (tr == nullptr) {
+    return whole(fmt("no transport named '{}'", tname)());
+  }
+  // A DECODE's channel, said in the share: a launch of several clips
+  // decodes one while generate-video denoises the next, so this process
+  // may hold the DiT's channel beside this one (TpTransport::open).
+  genai::TpShare share;
+  share.rank = rank;
+  share.ranks = ranks;
+  share.extra = FlexData::make_object();
+  share.extra.as_object().insert_or_assign(
+      genai::tp_extra::kChannel,
+      FlexData::make_string(std::string(genai::tp_extra::kChannelDecode)));
+  const FlexData params = o.contains("params") ? o.at("params") : FlexData();
+  std::string terr;
+  try {
+    sp.ch = tr->open(params, share, &terr);
+  } catch (const std::exception& e) {
+    sp.ch.reset();
+    terr = std::string("it threw: ") + e.what();
+  } catch (...) {
+    sp.ch.reset();
+    terr = "it threw";
+  }
+  if (!sp.ch) {
+    // Rank 0 makes the clip whole; another rank's part is the clip's
+    // only through a channel, so it has nothing to give.
+    return whole(fmt("transport '{}': {}", tname, terr)());
+  }
+  try {
+    sp.ch->set_stop([&ctx]() { return ctx.stop_requested(); });
+  } catch (...) {
+  }
+  _h3_vae->set_unit_range(sp.u0, sp.u1);
+  session()->info(fmt("VaeDecodeStage('{}'): rank {} of {}: units [{}, "
+                      "{}) of {} (a tile of a chunk each), the rest "
+                      "through '{}'", this->id(), rank,
+                      ranks, sp.u0, sp.u1, N, tname));
+  return sp;
+}
+
+void
+VaeDecodeStage::decode_split_release_(DecodeSplit& sp)
+{
+  if (!sp.ch) { return; }
+  try {
+    sp.ch->set_stop(nullptr);
+  } catch (...) {
+  }
+  // The buffers it was handed go with it: forgotten, then freed, there.
+  if (_tp_teardown.joinable()) { _tp_teardown.join(); }
+  _tp_teardown = std::thread(
+      [ch = std::move(sp.ch), hs = std::move(sp.hs), hr = std::move(sp.hr),
+       s = std::move(sp.sbuf), r = std::move(sp.rbuf), hb = sp.hbytes,
+       piece = sp.piece]() mutable {
+        try {
+          if (hs) { ch->forget(hs.get(), hb); }
+          if (hr) { ch->forget(hr.get(), hb); }
+          if (s) { ch->forget(s.get(), piece); }
+          if (r) { ch->forget(r.get(), piece); }
+        } catch (...) {
+        }
+        ch.reset();
+      });
+}
+
+bool
+VaeDecodeStage::decode_split_join_(DecodeSplit& sp,
+                                   metal_compute::SharedBuffer& rgb, int F,
+                                   int H, int W, int LT, std::string* err)
+{
+  namespace ds = vae_decode_split;
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::size_t plane = (std::size_t)H * W;
+  const int pt = std::max(1, _h3_vae->config().patch);
+  const int lh = H / pt, lw = W / pt;
+  // EXCHANGE 0, THE HEADERS: what each rank decoded and which units it
+  // took. Both parts are the whole clip's buffer, so two ranks that would
+  // not add to one clip cross the same bytes -- this is what refuses
+  // them. Its own pair of buffers: a transport may register a buffer at
+  // the size it is first handed.
+  ds::Header mine_h;
+  mine_h.rank = sp.rank;
+  mine_h.ranks = 2;
+  mine_h.units = sp.units;
+  mine_h.u0 = sp.u0;
+  mine_h.u1 = sp.u1;
+  mine_h.frames = F;
+  mine_h.h = H;
+  mine_h.w = W;
+  mine_h.lt = LT;
+  sp.hbytes = sizeof(ds::Header);
+  sp.hs.reset(new std::uint8_t[sp.hbytes]);
+  sp.hr.reset(new std::uint8_t[sp.hbytes]);
+  std::memcpy(sp.hs.get(), &mine_h, sp.hbytes);
+  bool ok = true;
+  try {
+    ok = sp.ch->exchange(sp.hs.get(), sp.hr.get(), sp.hbytes,
+                         genai::TpDType::kF32, 0, err);
+  } catch (...) {
+    ok = false;
+    if (err != nullptr) { *err = "the channel threw"; }
+  }
+  ds::Header peer_h;
+  if (ok) {
+    std::memcpy(&peer_h, sp.hr.get(), sp.hbytes);
+    std::string why;
+    if (!ds::agree(mine_h, peer_h, &why)) {
+      ok = false;
+      if (err != nullptr) {
+        *err = "the ranks did not decode one clip alike: " + why;
+      }
+    }
+  }
+  // WHAT CROSSES: rank 1's frames alone, rank 0 the one that adds -- the
+  // rest of either buffer is zero or rank 0's own. A piece at a time
+  // through two staging buffers: a transport may register what it is
+  // handed with a device (RDMA), and a device holds only so much.
+  std::size_t crossed = 0;
+  double merge_ms = 0;
+  if (ok) {
+    const ds::Header& h0 = mine_h.rank == 0 ? mine_h : peer_h;
+    const ds::Header& h1 = mine_h.rank == 0 ? peer_h : mine_h;
+    const auto theirs = _h3_vae->unit_frames(LT, lh, lw, h1.u0, h1.u1);
+    const auto own0 = _h3_vae->unit_frames(LT, lh, lw, h0.u0, h0.u1);
+    constexpr int C = 3;
+    crossed = (std::size_t)C *
+              (std::size_t)std::max(0, theirs.second - theirs.first) *
+              plane * 2;
+    if (crossed > 0) {
+      constexpr std::size_t kPiece = std::size_t(32) << 20;   // bytes
+      sp.piece = std::min(crossed, kPiece);
+      sp.sbuf.reset(new std::uint8_t[sp.piece]);
+      sp.rbuf.reset(new std::uint8_t[sp.piece]);
+      ok = ds::cross(*sp.ch, sp.rank,
+                     static_cast<std::uint16_t*>(rgb.contents()), C, F,
+                     plane, theirs, own0, sp.sbuf.get(), sp.rbuf.get(),
+                     sp.piece, 1, err, &merge_ms);
+    }
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  decode_split_release_(sp);
+  session()->log_debug(fmt("VaeDecodeStage('{}'): split decode: {} MB "
+                           "crossed in {:.1f} ms ({:.1f} of it taking "
+                           "the part in)", this->id(), crossed >> 20,
+                           std::chrono::duration<double, std::milli>(t1 - t0)
+                               .count(),
+                           merge_ms));
+  return ok;
+}
+
+namespace vae_decode_split {
+
+// Twelve words, as the docs say: a peer reads the same layout.
+static_assert(sizeof(Header) == 48);
+
+bool
+agree(const Header& a, const Header& b, std::string* why)
+{
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    return false;
+  };
+  if (a.magic != Header::kMagic || b.magic != Header::kMagic ||
+      a.version != b.version) {
+    return no("not a split decode's header");
+  }
+  if (a.ranks != 2 || b.ranks != 2 || a.rank == b.rank ||
+      a.rank < 0 || a.rank > 1 || b.rank < 0 || b.rank > 1) {
+    return no(fmt("ranks {} and {} of {} / {}", a.rank, b.rank, a.ranks,
+                  b.ranks)());
+  }
+  if (a.frames != b.frames || a.h != b.h || a.w != b.w || a.lt != b.lt) {
+    return no(fmt("{} x {} x {} frames from {} latents against {} x {} x "
+                  "{} from {}", a.w, a.h, a.frames, a.lt, b.w, b.h,
+                  b.frames, b.lt)());
+  }
+  if (a.units != b.units) {
+    return no(fmt("{} units against {} (another tiling)", a.units,
+                  b.units)());
+  }
+  const Header& lo = a.u0 <= b.u0 ? a : b;
+  const Header& hi = a.u0 <= b.u0 ? b : a;
+  if (lo.u0 != 0 || lo.u1 != hi.u0 || hi.u1 != a.units ||
+      lo.u0 > lo.u1 || hi.u0 > hi.u1) {
+    return no(fmt("shares [{}, {}) and [{}, {}) do not tile {} units",
+                  a.u0, a.u1, b.u0, b.u1, a.units)());
+  }
+  return true;
+}
+
+bool
+cross(genai::TpChannel& ch, int rank, std::uint16_t* clip, int C, int F,
+      std::size_t plane, std::pair<int, int> theirs,
+      std::pair<int, int> mine, std::uint8_t* sbuf, std::uint8_t* rbuf,
+      std::size_t piece, std::uint64_t seq0, std::string* err,
+      double* merge_ms)
+{
+  const int nf = theirs.second - theirs.first;
+  if (nf <= 0 || C <= 0 || plane == 0) { return true; }
+  // The frames that cross, channel by channel: one run each, laid end to
+  // end as the stream the pieces cut.
+  const std::size_t run = (std::size_t)nf * plane;
+  const std::size_t total = (std::size_t)C * run;
+  const std::size_t per = std::max<std::size_t>(1, piece / 2);
+  // Calls fn(clip element, piece offset, count) for each stretch of the
+  // stream's [v, v + n) lying in one run.
+  auto walk = [&](std::size_t v, std::size_t n, auto&& fn) {
+    for (std::size_t k = 0; k < n;) {
+      const std::size_t at = v + k;
+      const std::size_t c = at / run, o = at % run;
+      const std::size_t e =
+          ((std::size_t)c * F + (std::size_t)theirs.first) * plane + o;
+      const std::size_t len = std::min(run - o, n - k);
+      fn(e, k, len);
+      k += len;
+    }
+  };
+  auto* sb = reinterpret_cast<std::uint16_t*>(sbuf);
+  const auto* rb = reinterpret_cast<const std::uint16_t*>(rbuf);
+  std::uint64_t seq = seq0;
+  for (std::size_t v = 0; v < total; v += per, ++seq) {
+    const std::size_t n = std::min(per, total - v);
+    walk(v, n, [&](std::size_t e, std::size_t k, std::size_t len) {
+      std::memcpy(sb + k, clip + e, len * 2);
+    });
+    bool ok = false;
+    try {
+      ok = ch.exchange(sbuf, rbuf, n * 2, genai::TpDType::kBF16, seq, err);
+    } catch (...) {
+      ok = false;
+      if (err != nullptr) { *err = "the channel threw"; }
+    }
+    if (!ok) { return false; }
+    if (rank != 0) { continue; }
+    const auto m0 = std::chrono::steady_clock::now();
+    walk(v, n, [&](std::size_t e0, std::size_t k0, std::size_t len) {
+      // 1 MB runs on every core, each split at its frames' planes: added
+      // where rank 0 wrote this frame too, copied where it did not.
+      constexpr std::size_t kRun = std::size_t(1) << 19;   // elements
+      const std::size_t runs = (len + kRun - 1) / kRun;
+      dispatch_apply(runs,
+                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                     ^(std::size_t j) {
+        std::size_t e = e0 + j * kRun;
+        const std::size_t end = std::min(e0 + len, e + kRun);
+        while (e < end) {
+          const std::size_t pl = e / plane;
+          const std::size_t stop = std::min(end, (pl + 1) * plane);
+          const int f = (int)(pl % (std::size_t)F);
+          std::uint16_t* pd = clip + e;
+          const std::uint16_t* ps = rb + k0 + (e - e0);
+          if (f >= mine.first && f < mine.second) {
+            for (std::size_t q = 0; q < stop - e; ++q) {
+              std::uint32_t ua = (std::uint32_t)pd[q] << 16;
+              std::uint32_t ub = (std::uint32_t)ps[q] << 16;
+              float fa, fb;
+              std::memcpy(&fa, &ua, 4);
+              std::memcpy(&fb, &ub, 4);
+              const float r = fa + fb;
+              std::uint32_t u;
+              std::memcpy(&u, &r, 4);
+              pd[q] = (u & 0x7fffffffu) > 0x7f800000u
+                          ? (std::uint16_t)0x7fc0
+                          : (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u))
+                                            >> 16);
+            }
+          } else {
+            std::memcpy(pd, ps, (stop - e) * 2);
+          }
+          e = stop;
+        }
+      });
+    });
+    if (merge_ms != nullptr) {
+      *merge_ms += std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - m0)
+                       .count();
+    }
+  }
+  return true;
+}
+
+}  // namespace vae_decode_split
 
 #endif
 
@@ -2201,6 +2670,16 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     int F = 0;
     std::string derr;
     metal_compute::SharedBuffer rgb;
+    DecodeSplit split;
+    // Every way out but the join's lets the channel go as the join does
+    // -- its stop cleared, its buffers forgotten, off the clip's path: a
+    // decode that failed after the channel opened left it with a stop
+    // that reads this frame's context.
+    struct SplitRelease {
+      VaeDecodeStage* st;
+      DecodeSplit*    sp;
+      ~SplitRelease() { st->decode_split_release_(*sp); }
+    } split_release{this, &split};
     {
       PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmVae,
                          kPerfLlmVaeBegin,
@@ -2212,6 +2691,12 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // reporting, and it is what the bar counts.
       UiProgress bar = session()->open_progress("vae decode");
       if (_h3_fast) {
+        if (tp_split_asked_()) {
+          session()->warn(fmt("VaeDecodeStage('{}'): tensor_parallel: the "
+                              "fast decoder decodes a clip whole -- the "
+                              "split is the released decoder's -- so this "
+                              "rank emits it too", this->id()));
+        }
         // A layer at a time over the whole clip; a stop lands between
         // layers (each commits and waits).
         _h3_fast->set_progress([&bar](int done, int total) {
@@ -2233,9 +2718,15 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         // -- the u8 quantize, the per-frame beats, the diagnostics -- is
         // the video path's, unchanged.
         if (one_frame) {
+          if (tp_split_asked_()) {
+            session()->warn(fmt("VaeDecodeStage('{}'): tensor_parallel: a "
+                                "still decodes whole, so this rank emits "
+                                "it too", this->id()));
+          }
           rgb = _h3_vae->decode_image(z, lh, lw, &derr);
           F = rgb.empty() ? 0 : 1;
         } else {
+          split = decode_split_open_(LT, lh, lw, ctx);
           rgb = _h3_vae->decode_video(z, LT, lh, lw, &F, &derr);
         }
         // Cleared before the bar it captures leaves scope -- the VAE
@@ -2264,6 +2755,26 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           "VaeDecodeStage('{}'): MiniMax-H3 video decode failed ({}); "
           "skipping", this->id(), derr.empty() ? "unknown error" : derr));
       co_return;
+    }
+    if (split.ch) {
+      // A SHARE: the others' parts added in; the clip whole on rank 0.
+      std::string serr;
+      if (!decode_split_join_(split, rgb, F, lh * vp, lw * vp, LT, &serr)) {
+        session()->error(fmt("VaeDecodeStage('{}'): the split decode: {}",
+                             this->id(), serr));
+        co_return;
+      }
+      if (split.rank != 0) {
+        session()->info(fmt(
+            "VaeDecodeStage('{}'): rank {}'s share of the decode (units "
+            "[{}, {}) of {}) handed over; rank 0 emits the clip",
+            this->id(), split.rank, split.u0, split.u1, split.units));
+        // Let go as rank 0 lets go after its beats: this rank emits none,
+        // and on a tight box the decoder must not ride into the next
+        // clip's denoise.
+        if (_unload_idle) { unload_vae_(); }
+        co_return;
+      }
     }
     const int H = lh * vp, W = lw * vp;
     const auto* rp = static_cast<const std::uint16_t*>(rgb.contents());

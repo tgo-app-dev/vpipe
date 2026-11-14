@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <cctype>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1236,6 +1237,58 @@ tp_cut_(MetalCompute* mc, const SharedBuffer& src, int N,
 
 }
 
+namespace {
+
+// The int8 context a model of `cfg` runs (Config::i8_gemm, its tier), or
+// null where none is: load() and the plan's tp_held_bytes ask the same.
+std::unique_ptr<I8GemmContext>
+h3_i8_context_(MetalCompute* mc, const MetalMiniMaxH3Transformer::Config& c)
+{
+  auto i8 = std::make_unique<I8GemmContext>(mc, c.i8_gemm, /*bf16=*/true);
+  i8->set_tier(c.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+               : c.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                : I8GemmContext::Tier::kAccurate);
+  i8->set_token_rotation(c.i8_tier == 2);
+  i8->set_autotune(c.autotune);
+  if (!i8->enabled()) { return nullptr; }
+  return i8;
+}
+
+// Whether the main blocks hold the int8 tier's layout under `i8`.
+bool
+h3_i8_layout_(const I8GemmContext* i8,
+              const MetalMiniMaxH3Transformer::Config& c)
+{
+  return i8 != nullptr && i8->tier() != I8GemmContext::Tier::kAccurate &&
+         !c.ane_ffn && i8->fast_group(c.hidden) > 0;
+}
+
+// The group a dense [N, K] share takes in its tier's layout (tp_fast_),
+// or 0 where it stays as cut: no group divides K, or too few rows.
+int
+h3_share_group_(const I8GemmContext& i8, int N, int K)
+{
+  const int gc = i8.fast_group(K);
+  if (gc <= 0 || N < 16 ||
+      (gc == I8GemmContext::kTokenGroup && (N % 4) != 0)) {
+    return 0;
+  }
+  return gc;
+}
+
+// What tp_fast_ makes of a dense [N, K] share under `i8` (its layout's
+// codes and scales), or 0 where it leaves the share as cut.
+std::size_t
+h3_fast_share_bytes_(const I8GemmContext& i8, int N, int K)
+{
+  const int gc = h3_share_group_(i8, N, K);
+  if (gc <= 0) { return 0; }
+  return (std::size_t)N * (std::size_t)K +
+         I8GemmContext::fast_scale_bytes(N, K, gc);
+}
+
+}  // namespace
+
 // A rank's share of a block projection, CUT from the checkpoint's whole
 // one: the fused q|k|v and fc1 by their output ROWS -- the rank's heads,
 // each head's q, k and v rows in either qkv layout, and its feed-forward
@@ -1246,51 +1299,61 @@ tp_cut_(MetalCompute* mc, const SharedBuffer& src, int N,
 // bf16 and the MLX affine packs; anything else is refused by name.
 MetalMiniMaxH3Transformer::Linear
 MetalMiniMaxH3Transformer::tp_linear_(WeightSet& ws, const std::string& nm,
-                                      TpCut cut, std::string* err)
+                                      TpCut cut, bool fast, std::string* err)
 {
   auto fail = [&](const std::string& why) {
     if (err != nullptr) { *err = nm + ": " + why; }
     return Linear{};
   };
-  const TpShare& t = _cfg.tp;
-  const int HD = _cfg.head_dim;
-  const int I = t.n_heads * HD;               // the checkpoint's widths
-  const int F = t.n_ffn;
-  const int H = _cfg.hidden;
-  Linear w = linear_(ws, nm, false, Retain::Streamed);
+  // A dense bf16 weight cut by its ROWS -- q|k|v, fc1: 70% of a block's
+  // bytes -- has only the share's rows READ, straight into the share
+  // (MetalLlamaWeights::pread_range_into: a range a row band); a column
+  // cut needs every row, and is read whole and cut, as anything else (an
+  // affine pack, an assembled or FP8 weight) is. NOT through the file's
+  // mapping: on a box whose cache does not hold the checkpoint the pages
+  // then fault in a few at a time -- MEASURED on the M5 Max (64 GB) at
+  // three times this read.
+  const TpPart part = tp_part_(cut);
+  {
+    const MetalLlamaWeights& src = ws.src();
+    const auto* wi = src.info(nm + ".weight");
+    if (part.k1 == 0 && wi != nullptr && wi->dtype == "BF16" &&
+        wi->shape.size() == 2 && wi->shape[0] == part.N &&
+        src.info(nm + ".scales") == nullptr &&
+        _f8.find(nm + ".weight") == nullptr &&
+        minimax_h3::assembled_parts(src, nm).empty() &&
+        std::getenv("VPIPE_H3_TP_WHOLE_READ") == nullptr) {
+      const std::size_t rb = (std::size_t)wi->shape[1] * 2;
+      std::size_t n = 0;
+      for (const auto& [a, b] : part.rows) { n += (std::size_t)(b - a); }
+      Linear l;
+      l.w = _mc->make_shared_buffer(n * rb);
+      bool ok = !l.w.empty();
+      auto* d = static_cast<std::uint8_t*>(ok ? l.w.contents() : nullptr);
+      for (const auto& [a, b] : part.rows) {
+        if (!ok) { break; }
+        ok = src.pread_range_into(nm + ".weight", (std::uint64_t)a * rb,
+                                  (std::size_t)(b - a) * rb, d);
+        d += (std::size_t)(b - a) * rb;
+      }
+      if (ok) {
+        l.n = (int)n;
+        l.k = (int)wi->shape[1];
+        std::string ferr;
+        if (fast && !tp_fast_(l, &ferr)) { return fail(ferr); }
+        return l;
+      }
+    }
+  }
+  Linear w;
+  w = linear_(ws, nm, false, Retain::Streamed);
   if (w.empty()) { return fail("not in the checkpoint"); }
   if (w.is_fp8() || w.gc > 0 || w.i8x) {
     return fail("a split DiT reads dense or affine weights only");
   }
-  std::vector<std::pair<int, int>> rows;
-  int N = H;
-  int k0 = 0, k1 = 0;                         // a column cut, in K
-  switch (cut) {
-    case TpCut::kQkv:
-      N = 3 * I;
-      if (_cfg.qkv_per_head) {
-        rows = {{t.head0 * 3 * HD, t.head1 * 3 * HD}};
-      } else {
-        for (int part = 0; part < 3; ++part) {
-          rows.push_back({part * I + t.head0 * HD, part * I + t.head1 * HD});
-        }
-      }
-      break;
-    case TpCut::kFc1:
-      N = 2 * F;
-      rows = {{t.ffn0, t.ffn1}, {F + t.ffn0, F + t.ffn1}};
-      break;
-    case TpCut::kOut:
-      rows = {{0, H}};
-      k0 = t.head0 * HD;
-      k1 = t.head1 * HD;
-      break;
-    case TpCut::kFc2:
-      rows = {{0, H}};
-      k0 = t.ffn0;
-      k1 = t.ffn1;
-      break;
-  }
+  const int N = part.N;
+  const std::vector<std::pair<int, int>>& rows = part.rows;
+  const int k0 = part.k0, k1 = part.k1;   // a column cut, in K
   Linear l;
   if (w.quantized) {
     const int g = _quant_group;
@@ -1310,12 +1373,185 @@ MetalMiniMaxH3Transformer::tp_linear_(WeightSet& ws, const std::string& nm,
     if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
       return fail("its share could not be cut");
     }
+    for (const auto& [a, b] : rows) { l.n += b - a; }
+    l.k = k1 > 0 ? k1 - k0 : (int)(w.codes.byte_size() * 8 /
+                                   (std::size_t)N / (std::size_t)w.bits);
+    std::string ferr;
+    if (fast && !tp_fast_(l, &ferr)) { return fail(ferr); }
     return l;
   }
   l.w = tp_cut_(_mc, w.w, N, rows, (std::size_t)k0 * 2,
                 (std::size_t)k1 * 2);
   if (l.w.empty()) { return fail("its share could not be cut"); }
+  // Its int8 tier's layout, where one is asked for.
+  int n = 0;
+  for (const auto& [a, b] : rows) { n += b - a; }
+  l.n = n;
+  l.k = k1 > 0 ? k1 - k0 : (int)(w.w.byte_size() / 2 / (std::size_t)N);
+  std::string ferr;
+  if (fast && !tp_fast_(l, &ferr)) { return fail(ferr); }
   return l;
+}
+
+int
+MetalMiniMaxH3Transformer::int8_layouts(bool refiner) const
+{
+  int n = 0;
+  for (const Block& b : refiner ? _refiner : _blocks) {
+    for (const Linear* l : {&b.qkv, &b.out, &b.fc1, &b.fc2}) {
+      n += l->gc > 0 ? 1 : 0;
+    }
+  }
+  return n;
+}
+
+MetalMiniMaxH3Transformer::TpPart
+MetalMiniMaxH3Transformer::tp_part_(TpCut cut) const
+{
+  return tp_part_of_(_cfg, cut);
+}
+
+MetalMiniMaxH3Transformer::TpPart
+MetalMiniMaxH3Transformer::tp_part_of_(const Config& c, TpCut cut)
+{
+  const TpShare& t = c.tp;
+  const int HD = c.head_dim;
+  const int I = t.n_heads * HD;               // the checkpoint's widths
+  const int F = t.n_ffn;
+  TpPart p;
+  p.N = c.hidden;
+  switch (cut) {
+    case TpCut::kQkv:
+      p.N = 3 * I;
+      if (c.qkv_per_head) {
+        p.rows = {{t.head0 * 3 * HD, t.head1 * 3 * HD}};
+      } else {
+        for (int part = 0; part < 3; ++part) {
+          p.rows.push_back(
+              {part * I + t.head0 * HD, part * I + t.head1 * HD});
+        }
+      }
+      break;
+    case TpCut::kFc1:
+      p.N = 2 * F;
+      p.rows = {{t.ffn0, t.ffn1}, {F + t.ffn0, F + t.ffn1}};
+      break;
+    case TpCut::kOut:
+      p.rows = {{0, p.N}};
+      p.k0 = t.head0 * HD;
+      p.k1 = t.head1 * HD;
+      break;
+    case TpCut::kFc2:
+      p.rows = {{0, p.N}};
+      p.k0 = t.ffn0;
+      p.k1 = t.ffn1;
+      break;
+  }
+  return p;
+}
+
+// A rank's int8 tier: the share converted as i8_linear_ converts a kept
+// block's dense projection -- the same group the share's own K takes
+// (fast_group), the same quantizer -- and the bf16 copy let go. The
+// rotation runs within the share's columns, so the out projection's and
+// fc2's partial sums are each an orthogonal basis's, and their sum is
+// the whole product's: no group crosses a rank's edge. (A width no
+// group divides stays dense, on the accurate tier, as a checkpoint's
+// would.) An affine pack's share converts as its whole one does
+// (tp_fast_affine_): its cut scales and biases are the bf16 pair
+// i8_linear_ hands the conversion, a group's columns never split.
+bool
+MetalMiniMaxH3Transformer::tp_fast_(Linear& l, std::string* err)
+{
+  if (!_i8_layout || _i8 == nullptr) { return true; }
+  if (l.quantized) { return tp_fast_affine_(l, err); }
+  if (l.w.empty()) { return true; }
+  const int N = l.n, K = l.k;
+  // (tp_held_bytes books the same rule: h3_fast_share_bytes_.)
+  const int gc = h3_share_group_(*_i8, N, K);
+  if (gc <= 0) { return true; }
+  const std::size_t cb = (std::size_t)N * K;
+  const std::size_t sb = I8GemmContext::fast_scale_bytes(N, K, gc);
+  SharedBuffer codes = _mc->make_shared_buffer(cb);
+  SharedBuffer scales = _mc->make_shared_buffer(sb);
+  if (codes.empty() || scales.empty()) {
+    if (err != nullptr) { *err = "no room for its int8 layout"; }
+    return false;
+  }
+  // On the conversions' one stream: a new queue a projection cost ~1-2
+  // ms of commit each, 200 times a load.
+  if (!_cvt_stream.valid()) { _cvt_stream = _mc->make_command_stream(); }
+  bool ok = false;
+  {
+    ComputeEncoder e = _cvt_stream.begin_compute();
+    ok = _i8->encode_quant_fast(e, l.w, codes, scales, gc, N, K);
+  }
+  if (!ok || !_cvt_stream.commit().wait_ok(nullptr)) {
+    if (err != nullptr) { *err = "its int8 layout could not be made"; }
+    return false;
+  }
+  l.w = SharedBuffer{};
+  l.gc = gc;
+  l.codes = std::move(codes);
+  l.cscales = std::move(scales);
+  return true;
+}
+
+// A cut AFFINE share (a g64 pack, w8 or w4) into its tier's layout, as
+// i8_linear_ makes a whole one's: a w8 share converted once (in place of
+// its pack), a w4 one kept as stored and converted per projection unless
+// the engine holds w4 layouts (Config::i8_hold_w4; a rank's stage
+// decides it on the share's growth, tp_held_bytes asked both ways). Left
+// as cut, a share ran every projection through the dequant and bf16 GEMM
+// -- MEASURED before this, on the M5 Ultra: a compressed checkpoint's
+// rank at ~100 TF/s against its layout's ~160, an 832 x 480 x 124
+// split's denoise 18.9 s against 14.3 from the bf16 checkpoint.
+bool
+MetalMiniMaxH3Transformer::tp_fast_affine_(Linear& l, std::string* err)
+{
+  const int N = l.n, K = l.k;
+  if (_quant_group != 64 || (l.bits != 8 && l.bits != 4) || N <= 0 ||
+      K <= 0) {
+    return true;
+  }
+  const int gc = h3_share_group_(*_i8, N, K);
+  if (gc <= 0 || !_i8->fast_converts(l.bits, gc)) { return true; }
+  if (l.bits == 4 && !_cfg.i8_hold_w4) {
+    l.quantized = false;
+    l.gc = gc;
+    l.pc = true;
+    return true;
+  }
+  const std::size_t cb = (std::size_t)N * K;
+  // A w8 share's codes take the layout in place; a w4 one's (nibbles)
+  // need a buffer twice their size.
+  SharedBuffer wide = l.bits == 8 ? SharedBuffer{}
+                                  : _mc->make_shared_buffer(cb);
+  const SharedBuffer& codes = l.bits == 8 ? l.codes : wide;
+  SharedBuffer scales =
+      _mc->make_shared_buffer(I8GemmContext::fast_scale_bytes(N, K, gc));
+  if (codes.empty() || scales.empty()) {
+    if (err != nullptr) { *err = "no room for its int8 layout"; }
+    return false;
+  }
+  if (!_cvt_stream.valid()) { _cvt_stream = _mc->make_command_stream(); }
+  bool ok = false;
+  {
+    ComputeEncoder e = _cvt_stream.begin_compute();
+    ok = _i8->encode_to_fast(e, l.codes, l.scales, l.qbias, codes, scales,
+                             gc, N, K, l.bits);
+  }
+  if (!ok || !_cvt_stream.commit().wait_ok(nullptr)) {
+    if (err != nullptr) { *err = "its int8 layout could not be made"; }
+    return false;
+  }
+  l.quantized = false;
+  l.scales = SharedBuffer{};
+  l.qbias = SharedBuffer{};
+  l.gc = gc;
+  if (l.bits != 8) { l.codes = std::move(wide); }
+  l.cscales = std::move(scales);
+  return true;
 }
 
 bool
@@ -1604,14 +1840,204 @@ MetalMiniMaxH3Transformer::streamed_holding_bytes() const
   std::size_t n = _resid.bytes() - std::min(_lora_kept, _resid.bytes()) +
                   slot_bytes() + _final_adaln_tab.byte_size();
   for (const SharedBuffer& t : _adaln_tab) { n += t.byte_size(); }
+  // A rank's refiner projections are cut out of uncached reads.
+  if (_cfg.tp.active()) { n += tp_cut_bytes_(_refiner); }
   return n;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::held_bytes() const
+{
+  std::size_t n = _ws ? _ws->stats().bytes : 0;
+  // On the host, f32: the timestep MLP (time_embed_), the rotary
+  // frequencies, a pruned DiT's curve table.
+  for (const std::vector<float>* v :
+       {&_time_in_w, &_time_in_b, &_time_out_w, &_time_out_b, &_inv_freq,
+        &_adaln_t_table}) {
+    n += v->size() * sizeof(float);
+  }
+  if (_stream_blocks) { return n + streamed_holding_bytes(); }
+  n += _final_adaln_tab.byte_size();
+  for (const SharedBuffer& t : _adaln_tab) { n += t.byte_size(); }
+  // A rank's projections are cut out of uncached reads: its own buffers,
+  // which the set never sees. (A preload's are the set's entries.)
+  if (_cfg.tp.active()) {
+    n += tp_cut_bytes_(_blocks) + tp_cut_bytes_(_refiner);
+  }
+  return n;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::tp_cut_bytes_(const std::vector<Block>& v)
+{
+  std::size_t n = 0;
+  for (const Block& b : v) {
+    for (const Linear* l : {&b.qkv, &b.out, &b.fc1, &b.fc2}) {
+      n += l->w.byte_size() + l->codes.byte_size() + l->scales.byte_size() +
+           l->qbias.byte_size() + l->cscales.byte_size();
+    }
+  }
+  return n;
+}
+
+namespace {
+
+// The block a tensor of a main stack (`blocks.<i>.`, diffusers'
+// `transformer_blocks.<i>.`) or of the refiner (`token_refiner.blocks.
+// <i>.`, `token_refiner.refiner_blocks.<i>.`) belongs to; -1 for the
+// trunk's.
+int
+h3_block_of_(const std::string& n, bool* refiner)
+{
+  *refiner = n.rfind("token_refiner.", 0) == 0;
+  for (const char* p : {"blocks.", "transformer_blocks.",
+                        "token_refiner.blocks.",
+                        "token_refiner.refiner_blocks."}) {
+    const std::size_t k = std::strlen(p);
+    if (n.compare(0, k, p) != 0 || k >= n.size() ||
+        std::isdigit((unsigned char)n[k]) == 0) {
+      continue;
+    }
+    return std::atoi(n.c_str() + k);
+  }
+  return -1;
+}
+
+}  // namespace
+
+std::size_t
+MetalMiniMaxH3Transformer::tp_held_bytes(const std::string& dit_dir,
+                                         const Config& c, int bake_rows,
+                                         MetalCompute* mc,
+                                         std::size_t* floor)
+{
+  if (floor != nullptr) { *floor = 0; }
+  if (!c.tp.active()) { return 0; }
+  // The directory load() opens, a model's root resolved to its DiT.
+  auto wts = MetalLlamaWeights::open_model(
+      resolve_dit_dir(dit_dir, c.partition));
+  if (!wts) { return 0; }
+  const MetalLlamaWeights& src = *wts;
+  // The int8 layout as load() decides it, on a context made as it makes
+  // one: no matrix cores, or the ANE tier asked, and the shares stay as
+  // cut.
+  const std::unique_ptr<I8GemmContext> i8 =
+      mc != nullptr ? h3_i8_context_(mc, c) : nullptr;
+  const bool layout = h3_i8_layout_(i8.get(), c);
+  const int H = c.hidden;
+  const int I = c.tp.n_heads * c.head_dim, F = c.tp.n_ffn;
+  // What each projection's share holds, and every tensor it consumes:
+  // a main block's into its own sum (the floor takes two of them), the
+  // rest -- trunk, refiner -- into `held`.
+  std::vector<std::string> taken;
+  std::size_t held = 0;
+  std::vector<std::size_t> blk((std::size_t)std::max(c.n_layers, 0), 0);
+  auto proj = [&](const std::string& nm, TpCut cut, int K, bool main,
+                  std::size_t& to) {
+    const TpPart part = tp_part_of_(c, cut);
+    int n = 0;
+    for (const auto& [a, b] : part.rows) { n += b - a; }
+    const int Ks = part.k1 > 0 ? part.k1 - part.k0 : K;
+    const std::size_t whole = (std::size_t)part.N * (std::size_t)K;
+    const std::size_t share = (std::size_t)n * (std::size_t)Ks;
+    const auto parts = minimax_h3::assembled_parts(src, nm);
+    for (const auto& pt : parts) { taken.push_back(pt.layer + "."); }
+    taken.push_back(nm + ".");
+    const auto* wi = src.info(nm + ".weight");
+    const auto* si = src.info(nm + ".scales");
+    const auto* bi = src.info(nm + ".biases");
+    if (parts.empty() && wi != nullptr && si != nullptr && bi != nullptr &&
+        si->shape.size() == 2 && si->shape[1] > 0 && whole > 0) {
+      // An affine pack keeps its codes, cut: bits from the codes' bytes,
+      // the group from the scales' width; scales and biases 2 bytes.
+      const std::size_t bits = (std::size_t)wi->nbytes * 8 / whole;
+      const std::size_t g =
+          std::max<std::size_t>((std::size_t)K / (std::size_t)si->shape[1],
+                                1);
+      // On a main block a g64 share takes its tier's layout as tp_fast_
+      // makes it: a w8 one converted, a w4 one only where w4 layouts are
+      // held (else converted per projection, its pack kept).
+      const int gc = main && layout && g == 64 && (bits == 8 || bits == 4)
+                         ? h3_share_group_(*i8, n, Ks)
+                         : 0;
+      const bool conv = gc > 0 && i8->fast_converts((int)bits, gc) &&
+                        (bits == 8 || c.i8_hold_w4);
+      to += conv ? h3_fast_share_bytes_(*i8, n, Ks)
+                 : share * bits / 8 + 2 * (share / g) * 2;
+      return;
+    }
+    // Dense: the share in bf16, or its tier's layout on a main block.
+    const std::size_t fast =
+        main && layout ? h3_fast_share_bytes_(*i8, n, Ks) : 0;
+    to += fast > 0 ? fast : share * 2;
+  };
+  auto block = [&](const std::string& pfx, bool main, std::size_t& to) {
+    proj(pfx + "attn.qkv_proj", TpCut::kQkv, H, main, to);
+    proj(pfx + "attn.out_proj", TpCut::kOut, I, main, to);
+    proj(pfx + "mlp.fc1", TpCut::kFc1, H, main, to);
+    proj(pfx + "mlp.fc2", TpCut::kFc2, F, main, to);
+  };
+  for (int i = 0; i < c.n_layers; ++i) {
+    block(blk_("blocks.", i, ""), true, blk[(std::size_t)i]);
+  }
+  for (int i = 0; i < c.n_refiner; ++i) {
+    block(blk_("token_refiner.blocks.", i, ""), false, held);
+  }
+  // The rest: the trunk, every norm and q / k gamma, the refiner's own
+  // -- but the AdaLN projections, and blocks past the config's -- in
+  // bf16 (weight_ / linear_ narrow F32 and F16), but what goes to the
+  // HOST in f32: the timestep MLP and the rotary frequencies.
+  auto consumed = [&](const std::string& nm) {
+    for (const std::string& pre : taken) {
+      if (nm.compare(0, pre.size(), pre) == 0) { return true; }
+    }
+    return false;
+  };
+  for (const std::string& nm : src.tensor_names()) {
+    if (consumed(nm)) { continue; }
+    if (nm.find(".adaln_proj.") != std::string::npos ||
+        nm.rfind("norm_out.linear", 0) == 0) {
+      continue;
+    }
+    bool refiner = false;
+    const int L = h3_block_of_(nm, &refiner);
+    if (L >= (refiner ? c.n_refiner : c.n_layers)) { continue; }
+    const auto* ti = src.info(nm);
+    if (ti == nullptr) { continue; }
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    const bool host = nm.rfind("time_embedder.", 0) == 0 ||
+                      nm == "rope.inv_freq";
+    const bool wide = ti->dtype == "BF16" || ti->dtype == "F16" ||
+                      ti->dtype == "F32";
+    const std::size_t b = host   ? n * sizeof(float)
+                          : wide ? n * 2
+                                 : (std::size_t)ti->nbytes;
+    (!refiner && L >= 0 ? blk[(std::size_t)L] : held) += b;
+  }
+  held += adaln_table_bytes_for(c, bake_rows);
+  // Streaming, a rank holds no main block but the one a forward runs and
+  // the one read under it (the per-block path: a rank's blocks are cuts,
+  // never a slot's refill), so its floor is the rest and the two largest.
+  if (floor != nullptr) {
+    std::vector<std::size_t> top = blk;
+    std::sort(top.begin(), top.end(), std::greater<std::size_t>());
+    *floor = held;
+    for (std::size_t i = 0; i < top.size() && i < 2; ++i) {
+      *floor += top[i];
+    }
+  }
+  for (const std::size_t b : blk) { held += b; }
+  return held;
 }
 
 std::size_t
 MetalMiniMaxH3Transformer::release_idle_slots()
 {
-  if (!_stream_blocks || !_slots_ready ||
-      _blocks.size() != (std::size_t)_cfg.n_layers) {
+  // Slots or not: a stack streamed on the per-block path (a rank's, or
+  // VPIPE_H3_NO_SLOTS) has none to give back, but its adapters' streamed
+  // set still goes once every block is kept.
+  if (!_stream_blocks || _blocks.size() != (std::size_t)_cfg.n_layers) {
     return 0;
   }
   for (const Block& b : _blocks) {
@@ -2445,17 +2871,21 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
   b.n2  = weight_(ws, prefix + "norm2.weight", r);
   // A rank of a split DiT: its share of the four projections, cut from
   // the whole ones; norms, the per-head q / k gammas and the AdaLN whole.
+  // A main block's share takes the int8 tier's layout; the refiner's
+  // keeps its own, as the unsplit model's does.
   if (_cfg.tp.active()) {
     std::string terr;
-    b.qkv = tp_linear_(ws, prefix + "attn.qkv_proj", TpCut::kQkv, &terr);
+    b.qkv = tp_linear_(ws, prefix + "attn.qkv_proj", TpCut::kQkv, main,
+                       &terr);
     if (terr.empty()) {
-      b.out = tp_linear_(ws, prefix + "attn.out_proj", TpCut::kOut, &terr);
+      b.out = tp_linear_(ws, prefix + "attn.out_proj", TpCut::kOut, main,
+                         &terr);
     }
     if (terr.empty()) {
-      b.fc1 = tp_linear_(ws, prefix + "mlp.fc1", TpCut::kFc1, &terr);
+      b.fc1 = tp_linear_(ws, prefix + "mlp.fc1", TpCut::kFc1, main, &terr);
     }
     if (terr.empty()) {
-      b.fc2 = tp_linear_(ws, prefix + "mlp.fc2", TpCut::kFc2, &terr);
+      b.fc2 = tp_linear_(ws, prefix + "mlp.fc2", TpCut::kFc2, main, &terr);
     }
     if (!terr.empty()) {
       if (_mc->session() != nullptr) {
@@ -2464,8 +2894,11 @@ MetalMiniMaxH3Transformer::load_block_(WeightSet& ws,
       }
       return false;
     }
-    // Interleaved for the fused SwiGLU as a kept block's fc1 is.
-    if (_fuse_ff && b.fc1.quantized) { interleave_gu_(b.fc1); }
+    // Interleaved for the fused SwiGLU as a kept block's fc1 is -- a
+    // STREAMED one at its promotion (keep_rest), paid once, as below.
+    if (_fuse_ff && b.fc1.quantized && r == Retain::Cached) {
+      interleave_gu_(b.fc1);
+    }
     b.qn = weight_(ws, prefix + "attn.q_norm.weight", r);
     b.kn = weight_(ws, prefix + "attn.k_norm.weight", r);
     if (with_adaln && !_cfg.pruned()) {
@@ -3036,7 +3469,8 @@ adapter_main_block_(const std::string& n, std::size_t* end)
 
 MetalMiniMaxH3Transformer::LoraFootprint
 MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
-                                          int n_layers, const Config* pruned)
+                                          int n_layers, const Config* pruned,
+                                          const TpShare* tp)
 {
   LoraFootprint fp;
   auto wts = MetalLlamaWeights::open_model(path);
@@ -3153,7 +3587,34 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
     // bf16 factors, but the timestep MLP's (a flow map's endpoint twin
     // included): those stay f32 on the host (lora::HostFactors).
     const bool host = nm.find("time_embedder") != std::string::npos;
-    const std::size_t b = n * (host ? 4 : 2);
+    std::size_t b = n * (host ? 4 : 2);
+    // A RANK's share of a split projection's factor (tp_cut_lora_), in a
+    // main or refiner block: q|k|v's and fc1's B to its rows, the out
+    // projection's and fc2's A to its columns -- whole multiples of the
+    // share's heads and rows, so exact.
+    if (tp != nullptr && tp->active() &&
+        (L >= 0 || nm.find("refiner") != std::string::npos)) {
+      const std::string mod = nm.substr(0, pa != std::string::npos ? pa : pb);
+      auto ends = [&](std::initializer_list<const char*> xs) {
+        for (const char* x : xs) {
+          const std::size_t k = std::strlen(x);
+          if (mod.size() >= k && mod.compare(mod.size() - k, k, x) == 0) {
+            return true;
+          }
+        }
+        return false;
+      };
+      const bool heads_b = ends({"qkv_proj", "to_q", "to_k", "to_v"});
+      const bool ffn_b = ends({"fc1", "ff.net.0.proj", "ff_net_0_proj"});
+      const bool heads_a = ends({"out_proj", "to_out.0", "to_out_0"});
+      const bool ffn_a = ends({"fc2", "ff.net.2", "ff_net_2"});
+      const bool is_b = pb != std::string::npos;
+      if ((is_b && heads_b) || (!is_b && heads_a)) {
+        b = b * (std::size_t)tp->heads() / (std::size_t)tp->n_heads;
+      } else if ((is_b && ffn_b) || (!is_b && ffn_a)) {
+        b = b * (std::size_t)tp->ffn() / (std::size_t)tp->n_ffn;
+      }
+    }
     fp.whole += b;
     if (L >= 0) {
       main += b;
@@ -4224,7 +4685,8 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   };
 
   const Config& c = _cfg;
-  const int H = c.hidden, I = c.inner(), F = c.ffn;
+  // A rank binds at the checkpoint's widths; tp_cut_lora_ cuts after.
+  const int H = c.hidden, I = full_inner_(), F = full_ffn_();
 
   // ---- the DIFFUSERS decomposition ---------------------------------
   //
@@ -4501,6 +4963,116 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     }
   }
   return true;
+}
+
+// A RANK'S ADAPTER. Bound at the checkpoint's widths (bind_lora_ reads
+// full_inner_ / full_ffn_), each block's four split projections' factors
+// are cut as their weights were (tp_part_): a projection cut by its
+// output ROWS -- q|k|v, fc1 -- keeps A whole and B's rows of the share,
+// so its delta is the share's rows of the whole delta; one cut by its
+// input COLUMNS -- the out projection, fc2 -- keeps B whole and A's
+// columns of the share, so t = x_share A_share^T is this rank's part of
+// x A^T, and the two ranks' deltas, summed with their partials, are the
+// whole projection's. A BANDED q|k|v B (bind_banded) keeps its parts in
+// the same row order: per head a head's q, k and v rows lie together,
+// so the cut keeps the group; flat, each part's rows are the share's
+// heads, and the group is the share's inner width. The AdaLN and the
+// timestep MLP are whole on every rank, their factors as bound.
+bool
+MetalMiniMaxH3Transformer::tp_cut_lora_(LoraSlot& slot, std::string* err)
+{
+  const int I = full_inner_();
+  const TpShare& t = _cfg.tp;
+  auto cut = [&](LoraFactors& f, TpCut c, const std::string& where) {
+    if (f.empty()) { return true; }
+    const TpPart p = tp_part_(c);
+    if (p.k1 == 0) {
+      // B [N, b_rank]: its rows.
+      SharedBuffer b = tp_cut_(_mc, f.b, p.N, p.rows, 0, 0);
+      if (b.empty()) {
+        if (err != nullptr) {
+          *err = "minimax-h3 lora: " + where + ": its B could not be cut";
+        }
+        return false;
+      }
+      f.b = std::move(b);
+      if (c == TpCut::kQkv && f.banded() && !_cfg.qkv_per_head &&
+          f.group == I) {
+        f.group = t.heads() * _cfg.head_dim;
+      }
+      return true;
+    }
+    // A [rank, K]: its columns.
+    SharedBuffer a = tp_cut_(_mc, f.a, f.rank, {{0, f.rank}},
+                             (std::size_t)p.k0 * 2, (std::size_t)p.k1 * 2);
+    if (a.empty()) {
+      if (err != nullptr) {
+        *err = "minimax-h3 lora: " + where + ": its A could not be cut";
+      }
+      return false;
+    }
+    f.a = std::move(a);
+    return true;
+  };
+  auto blocks = [&](std::vector<BlockLora>& bs, const char* what) {
+    for (std::size_t i = 0; i < bs.size(); ++i) {
+      const std::string w = fmt("{} {}", what, i)();
+      BlockLora& bl = bs[i];
+      if (!cut(bl.qkv, TpCut::kQkv, w + " q|k|v") ||
+          !cut(bl.out, TpCut::kOut, w + " out") ||
+          !cut(bl.fc1, TpCut::kFc1, w + " fc1") ||
+          !cut(bl.fc2, TpCut::kFc2, w + " fc2")) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return blocks(slot.blocks, "block") && blocks(slot.refiner, "refiner");
+}
+
+std::vector<float>
+MetalMiniMaxH3Transformer::lora_delta_for_test(
+    int slot, int block, int which, const std::vector<float>& x) const
+{
+  if (slot < 0 || (std::size_t)slot >= _lora.size() || block < 0 ||
+      (std::size_t)block >= _lora[(std::size_t)slot].blocks.size() ||
+      which < 0 || which > 3) {
+    return {};
+  }
+  const BlockLora& bl = _lora[(std::size_t)slot].blocks[(std::size_t)block];
+  const LoraFactors& f = which == 0   ? bl.qkv
+                         : which == 1 ? bl.out
+                         : which == 2 ? bl.fc1
+                                      : bl.fc2;
+  if (f.empty()) { return {}; }
+  const int r = f.rank;
+  const std::size_t K = f.a.byte_size() / 2 / (std::size_t)r;
+  if (x.size() != K) { return {}; }
+  const int br = f.b_rank();
+  const std::size_t N = f.b.byte_size() / 2 / (std::size_t)br;
+  const auto* a = static_cast<const std::uint16_t*>(f.a.contents());
+  const auto* b = static_cast<const std::uint16_t*>(f.b.contents());
+  std::vector<double> t((std::size_t)r, 0.0);
+  for (int i = 0; i < r; ++i) {
+    for (std::size_t k = 0; k < K; ++k) {
+      t[(std::size_t)i] += (double)bf16_to_f32_(a[(std::size_t)i * K + k]) *
+                           x[k];
+    }
+  }
+  std::vector<float> y(N, 0.0f);
+  for (std::size_t c = 0; c < N; ++c) {
+    // Banded: row c contracts over its part's window of t.
+    const int t0 = f.banded()
+                       ? (int)(((int)c / f.group) % f.parts) * br
+                       : 0;
+    double acc = 0.0;
+    for (int j = 0; j < br; ++j) {
+      acc += (double)bf16_to_f32_(b[c * (std::size_t)br + (std::size_t)j]) *
+             t[(std::size_t)(t0 + j)];
+    }
+    y[c] = (float)acc;
+  }
+  return y;
 }
 
 bool
@@ -4925,14 +5497,13 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     if (t.n_heads != cfg.n_heads || t.n_ffn != cfg.ffn) {
       return refuse("the share is of another model's widths");
     }
-    if (stream_blocks) {
-      return refuse("its blocks are preloaded, not streamed");
-    }
     if (cfg.ane_ffn || cfg.ane_qkv) { return refuse("no ANE tier"); }
-    if (cfg.i8_tier > 0) {
-      return refuse("int8 runs on its accurate tier (i8_gemm) alone");
-    }
-    if (!loras.empty()) { return refuse("no adapter yet"); }
+    // Its blocks stream, then are kept, as any H3's: each streamed block
+    // is its share cut afresh (load_block_ -> tp_linear_) on the per-block
+    // path, never a slot -- a slot refills a block by its tensors whole.
+    // Its int8 tier and its adapters are its share's: the projections
+    // cut and then converted (tp_fast_), the factors bound at the
+    // checkpoint's widths and cut alike (tp_cut_lora_).
     // Its channel is a generation's (begin_tp_generation), not the
     // model's: the weights may outlive a clip, the link may not.
     m->_cfg = rank_config(m->_cfg);
@@ -5362,19 +5933,11 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     // Dynamic-int8 accelerated GEMMs (opt-in, LOSSY), tried first in
     // gemm_mma_ once the dense weight exists. bf16 kernels: this DiT's
     // activations, dequant scratch and output are all bf16.
-    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm, /*bf16=*/true);
-    i8->set_tier(cfg.i8_tier >= 2   ? I8GemmContext::Tier::kToken
-                 : cfg.i8_tier == 1 ? I8GemmContext::Tier::kFast
-                                    : I8GemmContext::Tier::kAccurate);
-    i8->set_token_rotation(cfg.i8_tier == 2);
-    i8->set_autotune(cfg.autotune);
-    if (i8->enabled()) { m->_i8 = std::move(i8); }
+    m->_i8 = h3_i8_context_(mc, cfg);
     // The int8 LAYOUT for the main blocks (see Config::i8_tier), decided
     // here because load_block_ reads it. Not under the ANE tier, whose
     // stagers read the checkpoint's weights as they are.
-    m->_i8_layout = m->_i8 != nullptr &&
-                    m->_i8->tier() != I8GemmContext::Tier::kAccurate &&
-                    !cfg.ane_ffn && m->_i8->fast_group(cfg.hidden) > 0;
+    m->_i8_layout = h3_i8_layout_(m->_i8.get(), cfg);
     if (m->_i8_layout && mc->session() != nullptr) {
       const int fg = m->_i8->fast_group(cfg.hidden);
       // ComfyUI ConvRot-256 codes the token tier runs as stored (the
@@ -5487,7 +6050,12 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   }
   m->_cond_proj   = m->linear_(ws, "condition_proj", true, r);
   m->_final_norm  = m->weight_(ws, "final_layer.norm.weight", r);
-  if (!cfg.pruned()) {
+  // Not on a rank, as its blocks' are not: a rank runs baked alone, and
+  // the bake reads the projection from the checkpoint. Held, it was a
+  // cached entry of the set, which the bake's reset of this member
+  // could not free -- 57.8 MB a rank kept for the run that its plan
+  // (tp_held_bytes) says it does not hold.
+  if (!cfg.pruned() && !cfg.tp.active()) {
     m->_final_adaln =
         m->linear_(ws, "final_layer.adaln_proj.linear", true, r);
   }
@@ -5498,7 +6066,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_refiner_final_norm = m->weight_(ws, "token_refiner.final_norm.weight", r);
   if (m->_video_patch.empty() || (cfg.audio && m->_audio_patch.empty()) ||
       m->_cond_proj.empty() || m->_final_norm.empty() ||
-      (m->_final_adaln.empty() && !cfg.pruned()) || m->_video_out.empty() ||
+      (m->_final_adaln.empty() && !cfg.pruned() && !cfg.tp.active()) ||
+      m->_video_out.empty() ||
       (cfg.audio && m->_audio_out.empty()) ||
       m->_refiner_final_norm.empty()) {
     return nullptr;
@@ -5628,8 +6197,9 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // one accounting, and wire_into_pool() is what enforces it -- this
   // flag only says whether to ask.
   m->_wire.open(mc);
-  // The 50 main blocks: preloaded (default), or -- streaming -- only the
-  // pinned prefix, with forward() reading and freeing the tail per block.
+  // The 50 main blocks: held from the load (the VPIPE_PRELOAD test A/B),
+  // or streamed -- forward() reading each block as it needs it and
+  // residency keeping what the box allows; a rank's, its share.
   if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
@@ -5678,7 +6248,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     }
     LoraSlot slot;
     std::string lerr;
-    if (!m->bind_lora_(sp, slot, &lerr)) {
+    if (!m->bind_lora_(sp, slot, &lerr) ||
+        (cfg.tp.active() && !m->tp_cut_lora_(slot, &lerr))) {
       if (mc->session() != nullptr) { mc->session()->error(fmt("{}", lerr)); }
       return nullptr;
     }
@@ -7340,6 +7911,26 @@ MetalMiniMaxH3Transformer::bake_adaln(
   }
   const int T = (int)all.size();
 
+  // BAKED ALREADY for this schedule -- a model kept warm into the next
+  // clip (a stage's keep_loaded), the same steps and shift: the same
+  // timesteps, endpoints and adapter strengths (an adapter on the
+  // timestep MLP moves the embedding) make the same tables, so they are
+  // kept. A split rank reads its 25 GB of AdaLN projections for them
+  // otherwise, every clip.
+  std::vector<float> scales;
+  for (const LoraSlot& sl : _lora) { scales.push_back(sl.scale); }
+  if (!c.pruned() && !_adaln_tab.empty() && !_final_adaln_tab.empty() &&
+      all == _baked_t && all_r == _baked_r && scales == _baked_scales &&
+      std::getenv("VPIPE_H3_REBAKE") == nullptr) {
+    if (_mc->session() != nullptr) {
+      _mc->session()->log_debug(fmt(
+          "MetalMiniMaxH3Transformer: AdaLN tables for these {} steps "
+          "kept from the last bake", schedule.size()));
+    }
+    return true;
+  }
+  _baked_t.clear();
+
   // The size grows with the step count, and past some point holding the
   // table is worse than recomputing it -- so this REFUSES rather than
   // silently taking a bad trade. The default budget is generous next to
@@ -7633,6 +8224,9 @@ MetalMiniMaxH3Transformer::bake_adaln(
         adaln_table_bytes() >> 20,
         _stream_blocks ? ", and no longer streamed per step" : ""));
   }
+  _baked_t = all;
+  _baked_r = all_r;
+  _baked_scales = std::move(scales);
   return true;
 }
 
@@ -7812,6 +8406,8 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
     // a tile the whole sequence's attention would start one on too.
     band = std::max(0, std::atoi(e)) / 128 * 128;
   }
+  // A rank's floor: no band but the last shorter (0 off a rank).
+  int tp_floor = 0;
   if (c.tp.active()) {
     // A RANK OF A SPLIT DiT bands to overlap its exchanges: a band's
     // partial crosses while the GPU attends the next band and runs the
@@ -7819,12 +8415,23 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
     // band's exchange a block -- the more bands, the less, each band's
     // GEMMs and attention the shorter for it.
     int parts = 8;
-    if (const char* e = std::getenv("VPIPE_H3_TP_BANDS")) {
-      parts = std::atoi(e);
-    }
+    const char* forced = std::getenv("VPIPE_H3_TP_BANDS");
+    if (forced != nullptr) { parts = std::atoi(forced); }
     if (parts < 2) { return 0; }
+    // The share's own floor (tp_extra::kMinBandRows, both ranks alike),
+    // else the model's; a count forced by hand is that count, no floor.
+    tp_floor = kTpMinBand;
+    if (forced != nullptr) {
+      tp_floor = 128;
+    } else if (c.tp.extra.is_object() &&
+               c.tp.extra.as_object().contains(tp_extra::kMinBandRows)) {
+      tp_floor = std::max<int>(
+          128,
+          (int)c.tp.extra.as_object().at(tp_extra::kMinBandRows).as_int(
+              tp_floor) / 128 * 128);
+    }
     const int want = ((seq + parts - 1) / parts + 127) / 128 * 128;
-    band = std::min(band, std::max(want, kTpMinBand));
+    band = std::min(band, std::max(want, tp_floor));
   }
   if (band <= 0 || seq < 2 * band) { return 0; }
   if (c.ane_ffn || c.ane_qkv) { return 0; }
@@ -7852,7 +8459,23 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
   for (int n = n0; n < n0 + 16; ++n) {
     const int step = ((seq + n - 1) / n + 127) / 128 * 128;
     const int last = seq - (n - 1) * step;
-    if (step > band || last <= 0) { continue; }
+    if (step > band || last <= 0 || step < tp_floor) { continue; }
+    if (last >= floor) { return step; }
+    if (last > best_last) {
+      best = step;
+      best_last = last;
+    }
+  }
+  // A RANK'S FLOOR HOLDS where an eighth of the sequence is shorter than
+  // it: balanced at `band`, the bands came out under it (4,700 rows at a
+  // floor of 2,304: three of 1,664), so the rank takes fewer, each at
+  // least the floor and under twice it (two of 2,432). Nothing fits --
+  // a sequence under two floors -- and it exchanges whole blocks.
+  for (int n = tp_floor > 0 ? seq / tp_floor : 0; best == 0 && n >= 2;
+       --n) {
+    const int step = ((seq + n - 1) / n + 127) / 128 * 128;
+    const int last = seq - (n - 1) * step;
+    if (last <= 0) { continue; }
     if (last >= floor) { return step; }
     if (last > best_last) {
       best = step;
@@ -7877,6 +8500,53 @@ MetalMiniMaxH3Transformer::scratch_resident_bytes() const
   std::size_t total = 0;
   for (const metal_compute::SharedBuffer* b : all) { total += b->byte_size(); }
   return total;
+}
+
+std::size_t
+MetalMiniMaxH3Transformer::release_forward_scratch()
+{
+  end_tp_generation();
+  std::size_t freed = scratch_resident_bytes() + _w_deq.byte_size() +
+                      _cr_codes.byte_size();
+  for (const auto* sol : {_sol.get(), _sol_tail.get()}) {
+    if (sol != nullptr) { freed += sol->resident_bytes(); }
+  }
+  if (_sage) { freed += _sage->private_held(); }
+  // The windows over the arena first, as ensure_scratch_ takes them back:
+  // each holds it alive.
+  if (_vdn) { _vdn->set_arena(metal_compute::SharedBuffer{}); }
+  if (_sage) {
+    _sage->set_arena(metal_compute::SharedBuffer{},
+                     metal_compute::SharedBuffer{});
+  }
+  if (_sol) {
+    _sol->set_arena(metal_compute::SharedBuffer{},
+                    metal_compute::SharedBuffer{});
+  }
+  if (_sol_tail) {
+    _sol_tail->set_arena(metal_compute::SharedBuffer{},
+                         metal_compute::SharedBuffer{});
+  }
+  // Sol's prepared keys are its own, not the arena's.
+  for (auto* sol : {_sol.get(), _sol_tail.get()}) {
+    if (sol != nullptr) { sol->release_prepared_keys(); }
+  }
+  _vdn_proj = metal_compute::SharedBuffer{};
+  _s = Scratch{};
+  for (metal_compute::SharedBuffer* b :
+       {&_tp_send, &_tp_others, &_tp_part[0], &_tp_part[1], &_tp_part[2],
+        &_tp_part[3], &_tp_recv[0], &_tp_recv[1], &_tp_recv[2],
+        &_tp_recv[3]}) {
+    *b = metal_compute::SharedBuffer{};
+  }
+  // And the GEMMs' grow-only scratch: the dequant / widening matrix (the
+  // widest projection, ~300 MB), a native W4A8 weight's int8 codes, and
+  // the int8 context's activation, weight and split-K buffers -- all made
+  // again at the next GEMM that needs them.
+  _w_deq = metal_compute::SharedBuffer{};
+  _cr_codes = metal_compute::SharedBuffer{};
+  if (_i8) { _i8->release_scratch(); }
+  return freed;
 }
 
 std::size_t
@@ -9408,6 +10078,12 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     return fail(fmt("schedule_index {} does not name a baked step with {} "
                     "timesteps (the schedule has {})", in.schedule_index,
                     n_t, _adaln_row0.size())());
+  }
+  // A rank holds no AdaLN projection (load()): it runs baked or not at
+  // all.
+  if (!baked && c.tp.active() && !c.pruned()) {
+    return fail("a rank of a split DiT runs the AdaLN bake (bake_adaln) "
+                "-- it holds no AdaLN projection");
   }
   // The step's first row in every baked table.
   const std::size_t brow =
@@ -11956,9 +12632,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // is what makes the slot path A/B-able against the thing it
         // replaced -- the two must be the same function, and the only way
         // to show that is to run one forward each way.
+        // A RANK's blocks are cuts (tp_linear_), which a slot -- refilled
+        // by the checkpoint's tensors whole -- cannot hold: it builds each
+        // streamed block afresh, the next one's read still issued under
+        // this one's GPU work.
         if (_slots_first) {
           _slots_first = false;
-          _slots_off = std::getenv("VPIPE_H3_NO_SLOTS") != nullptr;
+          _slots_off = std::getenv("VPIPE_H3_NO_SLOTS") != nullptr ||
+                       _cfg.tp.active();
         }
         if (!_slots_off && (!_slots_ready || _slots_adaln != !baked)) {
           // The pending block out of its slot or the spare before either

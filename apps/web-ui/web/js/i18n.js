@@ -7115,16 +7115,16 @@ const STRINGS = {
   // ---- Model Fetch (preparation) ----
   'stage.model-fetch.name': ['', '模型下载', '模型下載'],
   'stage.model-fetch.doc': ['',
-      '交互式一次性任务：确定一个模型（浏览内置的 HuggingFace 目录，或直接'
-      + '输入路径），从 HuggingFace 或镜像（modelscope.cn）下载到某个基准路'
-      + '径下，原生合成 Qwen3-ASR 的 tokenizer.json，并以 huggingface.co 上'
-      + '的路径为键注册进模型注册表（无论实际由哪个源提供）。可选的 trigger'
-      + ' 输入与 summary 输出。',
-      '互動式一次性工作：確定一個模型（瀏覽內建的 HuggingFace 目錄，或直接'
-      + '輸入路徑），從 HuggingFace 或鏡像（modelscope.cn）下載到某個基準路'
-      + '徑下，原生合成 Qwen3-ASR 的 tokenizer.json，並以 huggingface.co 上'
-      + '的路徑為鍵註冊進模型註冊表（無論實際由哪個來源提供）。可選的 '
-      + 'trigger 輸入與 summary 輸出。'],
+      '交互式一次性任务：确定一个模型（浏览内置的 HuggingFace 目录，或直接输'
+      + '入路径），从 HuggingFace 或镜像（modelscope.cn、hf-mirror.com）下载到'
+      + '某个基准路径下，原生合成 Qwen3-ASR 的 tokenizer.json，并以 '
+      + 'huggingface.co 上的路径为键注册进模型注册表（无论实际由哪个源提供）。'
+      + '可选的 trigger 输入与 summary 输出。',
+      '互動式一次性工作：確定一個模型（瀏覽內建的 HuggingFace 目錄，或直接輸'
+      + '入路徑），從 HuggingFace 或鏡像（modelscope.cn、hf-mirror.com）下載到'
+      + '某個基準路徑下，原生合成 Qwen3-ASR 的 tokenizer.json，並以 '
+      + 'huggingface.co 上的路徑為鍵註冊進模型註冊表（無論實際由哪個來源提供）'
+      + '。可選的 trigger 輸入與 summary 輸出。'],
   'cfg.model-fetch.base_path': ['',
       '下载根目录；留空 -> ./models。文件落在 <base>/<owner>/<repo> 下',
       '下載根目錄；留空 -> ./models。檔案落在 <base>/<owner>/<repo> 下'],
@@ -7164,30 +7164,42 @@ const STRINGS = {
       + '就是要第二個。儲存庫只發布一個模型時留空即可；發布了多個而留空時，'
       + '取回會被拒絕並列出候選，而不是悄悄取第一個'],
   'cfg.model-fetch.hf_token': ['',
-      '访问受限/私有仓库所用的 bearer token；留空 -> 取所选源对应的环境变量'
-      + '（HuggingFace 用 $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN，ModelScope '
-      + '用 $MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN）；若下载时发现是受限'
-      + '仓库，会通过 getpasswd 提示输入',
-      '存取受限/私有儲存庫所用的 bearer token；留空 -> 取所選來源對應的環境'
-      + '變數（HuggingFace 用 $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN，'
-      + 'ModelScope 用 $MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN）；若下載'
-      + '時發現是受限儲存庫，會透過 getpasswd 提示輸入'],
+      '访问受限/私有仓库所用的 bearer token；留空 -> 取所选源对应的环境变量（'
+      + 'HuggingFace 用 $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN，ModelScope 用 '
+      + '$MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN，hf-mirror 用 '
+      + '$HF_MIRROR_TOKEN）；若下载时发现是受限仓库，会通过 getpasswd 提示输入'
+      + '。hf-mirror 没有账号体系：经由它下载受限仓库要用你自己的 HuggingFace '
+      + 'token，并会发送给这个第三方——所以它永远拿不到 $HF_TOKEN，而这个键只有'
+      + '在本阶段的 `source` 明确写为 hf-mirror 时才会发给它（由 '
+      + '$VPIPE_MODEL_SOURCE 选中时不会）；只有在你接受把 token 发送给它时才设'
+      + '置 $HF_MIRROR_TOKEN',
+      '存取受限/私有儲存庫所用的 bearer token；留空 -> 取所選來源對應的環境變'
+      + '數（HuggingFace 用 $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN，ModelScope 用 '
+      + '$MODELSCOPE_API_TOKEN / $MODELSCOPE_TOKEN，hf-mirror 用 '
+      + '$HF_MIRROR_TOKEN）；若下載時發現是受限儲存庫，會透過 getpasswd 提示輸'
+      + '入。hf-mirror 沒有帳號體系：經由它下載受限儲存庫要用你自己的 '
+      + 'HuggingFace token，並會傳送給這個第三方——所以它永遠拿不到 $HF_TOKEN，'
+      + '而這個鍵只有在本階段的 `source` 明確寫為 hf-mirror 時才會傳給它（由 '
+      + '$VPIPE_MODEL_SOURCE 選中時不會）；只有在你接受把 token 傳送給它時才設'
+      + '定 $HF_MIRROR_TOKEN'],
   'cfg.model-fetch.source': ['',
-      '从哪里下载：\'huggingface\'（默认）或 \'modelscope\'（modelscope.cn，中'
-      + '国大陆可访问的镜像）。留空 -> 取 $VPIPE_MODEL_SOURCE，否则用 '
-      + 'huggingface——这样受网络限制的机器只需设置一次环境变量，而不必逐个'
-      + '阶段配置。它只决定下载源：注册表的键和磁盘上的目录一律取自 '
-      + 'HuggingFace 路径，因此同一个模型无论从哪一侧取回，都是同一个位置上'
-      + '的同一个模型，切换源也不会产生第二份副本。目录中的绝大多数条目在镜'
-      + '像上使用完全相同的 owner/repo；少数例外的映射写在 model-source.cc '
-      + '中',
-      '從哪裡下載：\'huggingface\'（預設）或 \'modelscope\'（modelscope.cn，中'
-      + '國大陸可存取的鏡像）。留空 -> 取 $VPIPE_MODEL_SOURCE，否則用 '
-      + 'huggingface——這樣受網路限制的機器只需設定一次環境變數，而不必逐個'
-      + '階段設定。它只決定下載來源：註冊表的鍵和磁碟上的目錄一律取自 '
-      + 'HuggingFace 路徑，因此同一個模型無論從哪一側取回，都是同一個位置上'
-      + '的同一個模型，切換來源也不會產生第二份副本。目錄中的絕大多數條目在'
-      + '鏡像上使用完全相同的 owner/repo；少數例外的對應寫在 '
+      '从哪里下载：\'huggingface\'（默认）、\'modelscope\'（modelscope.cn，中国大'
+      + '陆可访问的镜像）或 \'hf-mirror\'（hf-mirror.com，HuggingFace 本身的镜像'
+      + '，中国大陆同样可访问；在其他地区它会重定向到 huggingface.co）。留空 ->'
+      + ' 取 $VPIPE_MODEL_SOURCE，否则用 huggingface——这样受网络限制的机器只需'
+      + '设置一次环境变量，而不必逐个阶段配置。它只决定下载源：注册表的键和磁盘'
+      + '上的目录一律取自 HuggingFace 路径，因此同一个模型无论从哪一侧取回，都'
+      + '是同一个位置上的同一个模型，切换源也不会产生第二份副本。目录中的绝大多'
+      + '数条目在镜像上使用完全相同的 owner/repo；少数例外的映射写在 '
+      + 'model-source.cc 中',
+      '從哪裡下載：\'huggingface\'（預設）、\'modelscope\'（modelscope.cn，中國大'
+      + '陸可存取的鏡像）或 \'hf-mirror\'（hf-mirror.com，HuggingFace 本身的鏡像'
+      + '，中國大陸同樣可存取；在其他地區它會重新導向到 huggingface.co）。留空 '
+      + '-> 取 $VPIPE_MODEL_SOURCE，否則用 huggingface——這樣受網路限制的機器只'
+      + '需設定一次環境變數，而不必逐個階段設定。它只決定下載來源：註冊表的鍵和'
+      + '磁碟上的目錄一律取自 HuggingFace 路徑，因此同一個模型無論從哪一側取回'
+      + '，都是同一個位置上的同一個模型，切換來源也不會產生第二份副本。目錄中的'
+      + '絕大多數條目在鏡像上使用完全相同的 owner/repo；少數例外的對應寫在 '
       + 'model-source.cc 中'],
   'cfg.model-fetch.source_revision': ['',
       '要读取的分支/标签/提交；留空 -> 各源自己的默认值，而两者并不相同（'
@@ -9280,6 +9292,161 @@ const STRINGS = {
       '同樣的形狀，位於 `output_fps`，邊帶中的影格率已重寫。宣告的時脈組是'
       + '串流情形下的答案；真正的答案由 oport_clock_group() 決定——堆疊片段'
       + '是 1:1 的，與輸入埠共用時脈'],
+
+  // ---- RelayVSR Upscale (visual) ----
+  'stage.relayvsr-upscale.name': ['', 'RelayVSR 超分', 'RelayVSR 超解析'],
+  'stage.relayvsr-upscale.doc': ['',
+      '用 RelayVSR 做 4 倍视频超分辨率：一个单步的 5B DiT 每隔几帧写出一个'
+      + '关键帧，一个小解码器把每一帧在其前后两个关键帧之间变成 4 倍的帧。'
+      + '帧进、4 倍的帧出，顺序不变。',
+      '用 RelayVSR 做 4 倍影片超解析度：一個單步的 5B DiT 每隔幾格寫出一個'
+      + '關鍵影格，一個小解碼器把每一格在其前後兩個關鍵影格之間變成 4 倍的'
+      + '影格。影格進、4 倍的影格出，順序不變。'],
+  'cfg.relayvsr-upscale.hf_dir': ['',
+      'RelayVSR 模型：存放它两个检查点的目录——wan.safetensors（关键帧 DiT）'
+      + '和 flash.safetensors（逐帧解码器），与 kopper/RelayVSR 发布的一致'
+      + '——或模型库中的键（kopper/RelayVSR）',
+      'RelayVSR 模型：存放它兩個檢查點的目錄——wan.safetensors（關鍵影格 '
+      + 'DiT）和 flash.safetensors（逐格解碼器），與 kopper/RelayVSR 發佈的'
+      + '一致——或模型庫中的鍵（kopper/RelayVSR）'],
+  'cfg.relayvsr-upscale.window': ['',
+      '发布版本的 --window-size：每隔 `window - 1` 帧一个关键帧，每个窗口的'
+      + '帧在其前后两个关键帧之间解码。16（默认）是发布版本的取值。越大越快'
+      + '（5B 关键帧模型运行次数更少），也越依赖小解码器；一帧最多在进入后 `'
+      + 'window - 1` 帧才离开本阶段。2 .. 64',
+      '發佈版本的 --window-size：每隔 `window - 1` 格一個關鍵影格，每個視窗'
+      + '的影格在其前後兩個關鍵影格之間解碼。16（預設）是發佈版本的取值。越'
+      + '大越快（5B 關鍵影格模型執行次數更少），也越依賴小解碼器；一格最多在'
+      + '進入後 `window - 1` 格才離開本階段。2 .. 64'],
+  'cfg.relayvsr-upscale.output_width': ['',
+      '可选：本次运行将输出的 4 倍帧的宽度（若在第一帧之前已知）。只有资源计划'
+      + '读取它——工作集（关键帧的键值环，随帧尺寸增长）按它的四分之一预订——'
+      + '因此小输入按小尺寸规划；即使单独运行也放不进 GPU 工作集的任务会在读取'
+      + '权重之前被拒绝。本阶段输出的仍然恰好是输入的 4 倍，运行在第一帧时按实'
+      + '际帧尺寸重新预订。0（默认）按 3840 x 2176 预订。两者同时给出或都不给'
+      + '；4 的倍数，32 .. 32768',
+      '可選：本次執行將輸出的 4 倍影格的寬度（若在第一格之前已知）。只有資源'
+      + '計畫讀取它——工作集（關鍵影格的鍵值環，隨影格尺寸增長）按它的四分之一'
+      + '預訂——因此小輸入按小尺寸規劃；即使單獨執行也放不進 GPU 工作集的任務'
+      + '會在讀取權重之前被拒絕。本階段輸出的仍然恰好是輸入的 4 倍，執行在第一'
+      + '格時按實際影格尺寸重新預訂。0（預設）按 3840 x 2176 預訂。兩者同時給'
+      + '出或都不給；4 的倍數，32 .. 32768'],
+  'cfg.relayvsr-upscale.output_height': ['',
+      '可选：4 倍帧的高度（见 output_width）；4 的倍数，32 .. 32768',
+      '可選：4 倍影格的高度（見 output_width）；4 的倍數，32 .. 32768'],
+  'cfg.relayvsr-upscale.seed': ['',
+      '关键帧噪声：每次运行开始时用这个种子初始化一个生成器，按 torch 的 '
+      + 'CPU 正态分布抽取，与发布版本的抽取方式相同（它用的是 CUDA 的生成器'
+      + '；这里用 CPU 的）。42（默认）是发布版本的取值',
+      '關鍵影格雜訊：每次執行開始時用這個種子初始化一個產生器，按 torch 的 '
+      + 'CPU 常態分佈抽取，與發佈版本的抽取方式相同（它用的是 CUDA 的產生器'
+      + '；這裡用 CPU 的）。42（預設）是發佈版本的取值'],
+  'cfg.relayvsr-upscale.output_dtype': ['',
+      '"auto"（默认）：与输入相同——u8 进则 u8 出，f32 或 f16 进则 f32 出。'
+      + '"u8"：与发布版本写帧的方式相同，(v + 1) * 127.5 截断到 [0, 255]。'
+      + '"f32"：[0, 1] 的平面 f32，不截断——供 f32 链路（avf-save-video、'
+      + '后续的重采样）保留',
+      '"auto"（預設）：與輸入相同——u8 進則 u8 出，f32 或 f16 進則 f32 出。'
+      + '"u8"：與發佈版本寫影格的方式相同，(v + 1) * 127.5 截斷到 [0, 255]'
+      + '。"f32"：[0, 1] 的平面 f32，不截斷——供 f32 鏈路（avf-save-video、'
+      + '後續的重新取樣）保留'],
+  'cfg.relayvsr-upscale.i8_gemm': ['',
+      '加速模式（有损）：两个模型各 block 的投影改走 int8 GEMM 档位——关键帧 '
+      + 'DiT 每个 block 的八个（q、k、v、out、交叉注意力的 q 与 out、前馈的'
+      + '两个）和解码器的（q、k、v、out、gate|up、down）——而帧编码器、patch '
+      + '嵌入和各输出头保持 f16 / bf16。仅矩阵核心（M5 及以后）：其他机器上不'
+      + '起作用。在 M5 Max 上实测 480x270 输入：token 档下一个关键帧 431 -> '
+      + '285 毫秒。那里一帧的大部分是解码器的窗口注意力，它不是 GEMM，所以一个'
+      + '窗口的帧提速较少（每帧 0.063 -> 0.051 秒）。环境变量 VPIPE_I8_GEMM 可'
+      + '覆盖',
+      '加速模式（失真）：兩個模型各 block 的投影改走 int8 GEMM 檔位——關鍵影格 '
+      + 'DiT 每個 block 的八個（q、k、v、out、交叉注意力的 q 與 out、前饋的'
+      + '兩個）和解碼器的（q、k、v、out、gate|up、down）——而影格編碼器、patch '
+      + '嵌入和各輸出頭保持 f16 / bf16。僅矩陣核心（M5 及以後）：其他機器上不'
+      + '起作用。在 M5 Max 上實測 480x270 輸入：token 檔下一個關鍵影格 431 -> '
+      + '285 毫秒。那裡一格的大部分是解碼器的視窗注意力，它不是 GEMM，所以一個'
+      + '視窗的影格提速較少（每格 0.063 -> 0.051 秒）。環境變數 VPIPE_I8_GEMM '
+      + '可覆寫'],
+  'cfg.relayvsr-upscale.i8_gemm_tier': ['',
+      'i8_gemm 运行哪一种 int8，用 generate-image 的说法：\'accurate\'（默'
+      + '认）每次调用时把每个 bf16 / f16 权重按 64 一组量化（至少 1024 深的投'
+      + '影：关键帧的每一个，解码器只有 down）；\'fast\' 和 \'token\' 把投'
+      + '影以 int8 常驻——两个模型 8.4 GB 的权重只占 4.3 GB——分别按旋转后的分'
+      + '组或按输出通道；\'token_plain\' 同上但不旋转。以 fp32 参考实测（以'
+      + '其自身 bf16 的误差为基准），最差的关键帧 / 帧：accurate 为基准的 '
+      + '1.31x / 1.03x，fast 1.36x / 1.16x，token 1.51x / 1.21x，token_plain '
+      + '3.91x / 3.10x',
+      'i8_gemm 執行哪一種 int8，用 generate-image 的說法：\'accurate\'（預'
+      + '設）每次呼叫時把每個 bf16 / f16 權重按 64 一組量化（至少 1024 深的投'
+      + '影：關鍵影格的每一個，解碼器只有 down）；\'fast\' 和 \'token\' 把'
+      + '投影以 int8 常駐——兩個模型 8.4 GB 的權重只占 4.3 GB——分別按旋轉後的'
+      + '分組或按輸出通道；\'token_plain\' 同上但不旋轉。以 fp32 參考實測（'
+      + '以其自身 bf16 的誤差為基準），最差的關鍵影格 / 影格：accurate 為基準'
+      + '的 1.31x / 1.03x，fast 1.36x / 1.16x，token 1.51x / 1.21x，'
+      + 'token_plain 3.91x / 3.10x'],
+  'cfg.relayvsr-upscale.ane_ffn': ['',
+      '把两个模型的前馈按行切分给 GPU 与 Apple 神经引擎并发执行（ANE 上为 '
+      + 'fp16）：每个模型一个模块，从资源计划中申请，在各 block 的注意力运行时'
+      + '暂存权重。该档位会实测两种方式，在单用 GPU 更快的机器上保留 GPU。面向 '
+      + 'M4 一类的 Mac：在 M4 Pro 上实测 480x270 输入，一个关键帧 3.35 -> '
+      + '2.51 秒（ANE 处理 5B 模型前馈的那一半，与 GPU 处理自己那一半一样快）'
+      + '；解码器的前馈较小，在那里留在 GPU 上，在 M5 Max 上两者都留在 GPU 上'
+      + '。前馈被 int8 档位常驻（\'fast\' 及以上）的 block 保留 GPU',
+      '把兩個模型的前饋按行切分給 GPU 與 Apple 神經引擎並行執行（ANE 上為 '
+      + 'fp16）：每個模型一個模組，從資源計畫中申請，在各 block 的注意力執行時'
+      + '暫存權重。該檔位會實測兩種方式，在單用 GPU 更快的機器上保留 GPU。面向 '
+      + 'M4 一類的 Mac：在 M4 Pro 上實測 480x270 輸入，一個關鍵影格 3.35 -> '
+      + '2.51 秒（ANE 處理 5B 模型前饋的那一半，與 GPU 處理自己那一半一樣快）'
+      + '；解碼器的前饋較小，在那裡留在 GPU 上，在 M5 Max 上兩者都留在 GPU 上'
+      + '。前饋被 int8 檔位常駐（\'fast\' 及以上）的 block 保留 GPU'],
+  'cfg.relayvsr-upscale.ane_rows': ['',
+      'ANE 在每个前馈的行中所占的比例，向下取整到整块；0（默认）按两个引擎的'
+      + '实测耗时来平衡',
+      'ANE 在每個前饋的行中所占的比例，向下取整到整塊；0（預設）按兩個引擎的'
+      + '實測耗時來平衡'],
+  'cfg.relayvsr-upscale.sage_attn': ['',
+      '加速模式（有损）：在矩阵核心上用 SageAttention 的 int8 QK——两个模型'
+      + '的窗口自注意力（Q 与 K 按 token 量化，K 减去它所关注的所有帧共用的一'
+      + '个均值）以及关键帧 DiT 对其上下文的交叉注意力（从 4096 个查询行起，'
+      + '那里才划算）。仅矩阵核心（M5 及以后）：其他机器上不起作用。在 M5 Max '
+      + '上实测 960x540 输入，加上 sage_pv8：一个关键帧的窗口注意力 277 -> '
+      + '162 毫秒，交叉注意力 52 -> 39（关键帧快 6%）；一帧的注意力快 2-4%（'
+      + '解码器的 int8 预处理大约抵消了其内核省下的时间）',
+      '加速模式（失真）：在矩陣核心上用 SageAttention 的 int8 QK——兩個模型'
+      + '的視窗自注意力（Q 與 K 按 token 量化，K 減去它所關注的所有影格共用的'
+      + '一個均值）以及關鍵影格 DiT 對其上下文的交叉注意力（從 4096 個查詢列'
+      + '起，那裡才划算）。僅矩陣核心（M5 及以後）：其他機器上不起作用。在 M5 '
+      + 'Max 上實測 960x540 輸入，加上 sage_pv8：一個關鍵影格的視窗注意力 277 '
+      + '-> 162 毫秒，交叉注意力 52 -> 39（關鍵影格快 6%）；一格的注意力快 '
+      + '2-4%（解碼器的 int8 前處理大約抵消了其核心省下的時間）'],
+  'cfg.relayvsr-upscale.sage_pv8': ['',
+      '配合 sage_attn：P*V 也用 int8（P 相对每行的当前最大值，V 按通道在所'
+      + '关注的所有帧上量化，累加保持在 int32）。以 fp32 参考实测（以其自身 '
+      + 'bf16 的误差为基准），最差的关键帧 / 帧：仅 sage_attn 为基准的 1.19x '
+      + '/ 1.10x，加上 sage_pv8 为 1.73x / 1.31x',
+      '配合 sage_attn：P*V 也用 int8（P 相對每列的當前最大值，V 按通道在所'
+      + '關注的所有影格上量化，累加保持在 int32）。以 fp32 參考實測（以其自身 '
+      + 'bf16 的誤差為基準），最差的關鍵影格 / 影格：僅 sage_attn 為基準的 '
+      + '1.19x / 1.10x，加上 sage_pv8 為 1.73x / 1.31x'],
+  'cfg.relayvsr-upscale.autotune': ['',
+      'int8 accurate 档的 split-K 调优器是否实测：false 时什么都不计时，也不'
+      + '读取保存的调优结果，直接采用这块 GPU 上被认为最快的选择，因此一次运行'
+      + '可以原样重现（accel-keys.h kAutotune）。默认 true',
+      'int8 accurate 檔的 split-K 調校器是否實測：false 時什麼都不計時，也不'
+      + '讀取保存的調校結果，直接採用這塊 GPU 上被認為最快的選擇，因此一次執行'
+      + '可以原樣重現（accel-keys.h kAutotune）。預設 true'],
+  'port.relayvsr-upscale.in.frames': ['',
+      '每个节拍一帧平面 RGB TensorBeat [3, H, W]——u8，或 [0, 1] 的 f32 / '
+      + 'f16，即 video-to-rgb 的两种输出——一次运行中所有帧尺寸相同',
+      '每個節拍一格平面 RGB TensorBeat [3, H, W]——u8，或 [0, 1] 的 f32 / '
+      + 'f16，即 video-to-rgb 的兩種輸出——一次執行中所有影格尺寸相同'],
+  'port.relayvsr-upscale.out.frames': ['',
+      '同样的帧放大到 4 倍，平面 [3, 4H, 4W]，每进一帧出一帧且顺序不变，各'
+      + '自带着输入的边带。自成一个时钟域：一帧要等它所在的窗口完整后才离开'
+      + '，所以输出的节拍成批地落在输入之后',
+      '同樣的影格放大到 4 倍，平面 [3, 4H, 4W]，每進一格出一格且順序不變，'
+      + '各自帶著輸入的邊帶。自成一個時脈域：一格要等它所在的視窗完整後才離'
+      + '開，所以輸出的節拍成批地落在輸入之後'],
 
   // ---- Temporal Slice (visual) ----
   'stage.temporal-slice.name': ['', '时间切片', '時間切片'],

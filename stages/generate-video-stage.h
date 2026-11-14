@@ -307,6 +307,29 @@ public:
   static H3Route h3_reference_route(bool said, int num_references,
                                     const std::string& partition);
 
+  // MiniMax-H3's two memory questions, asked as its DiT loads. The first
+  // is whether its blocks stream for want of room: the denoise phase,
+  // against the irreversible cushion. `bounded` keys on it. The second is
+  // whether the box is tight enough that the DiT goes after each clip:
+  // the launch's peak, against the revisable cushion.
+  //
+  // Each names this stage's checkpoint and NO PEER'S. The text encoder
+  // and the VAEs count only through the manager: the declaration of the
+  // stage that holds one, in the phase it gave, or a set held open. A
+  // graph handed its conditioning has no conditioning stage, so nothing
+  // declares the encoder. Named here anyway, its size on disk was added
+  // to the box. MEASURED by a host, the second rank of a split on a 64 GB
+  // Max: 63.6 GB of footprint, so the rank's blocks streamed for want of
+  // room, it kept none of them, and its DiT went after every clip.
+  //
+  // Public and static for the reason the ones above are: the mistake
+  // reads a box with room as tight, silently, and a test of it needs
+  // neither a model nor a runtime.
+  static model_memory::StreamPlan h3_stream_plan(
+      const SessionContextIntf* session, const std::string& dit_dir,
+      std::size_t dit_retires);
+  static bool h3_box_bounded(const SessionContextIntf* session);
+
   // Test-only accessors.
   const std::string& hf_dir()          const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _emitted; }
@@ -530,7 +553,41 @@ private:
   // DiTs: the two have different forward signatures (one packed
   // sequence with per-row timesteps against a 4-D latent) and an
   // interface wide enough for both would describe neither.
-  std::unique_ptr<genai::MetalMiniMaxH3Transformer> _h3_dit;
+  // Shared, so it may be handed to the manager's WARM HOLD as the stage
+  // ends (keep_loaded) and taken back by the next graph's.
+  std::shared_ptr<genai::MetalMiniMaxH3Transformer> _h3_dit;
+  // `keep_loaded`: seconds the DiT stays built after this stage lets it
+  // go (a clip's end, the graph's), where the box has room for it --
+  // GenerativeModelManager::keep_model_warm. The key names what built it;
+  // `_h3_may_keep` whether this build may be kept at all (the box not
+  // tight -- its blocks not streamed for want of room -- and no VDN
+  // branch, TaoMate or H3-Image heads riding on it).
+  double      _keep_loaded = 0.0;
+  std::string _h3_warm_key;
+  bool        _h3_may_keep = false;
+  // Kept warm now, if there was room: the DiT then is the manager's.
+  bool keep_h3_warm_();
+  // What a RANK holds (`tensor_parallel`; 0 when not split), as the
+  // transformer books it (tp_held_bytes): at the int8 tier this stage
+  // loads with, the bake's tables for four rows a step of the most steps
+  // the clip can run (its adapters' grids and contracts included). With
+  // `hold_w4`, a w4 pack's shares in the int8 layout (Config::
+  // i8_hold_w4), else as their pack -- the load asks both to weigh the
+  // layout's growth on this rank's share. Every block kept; `floor`, the
+  // rank streaming at the least (tp_held_bytes).
+  std::size_t h3_tp_held_bytes_(const std::string& dit,
+                                bool hold_w4 = false,
+                                std::size_t* floor = nullptr) const;
+  // A rank's share against `c`'s widths -- inactive when not split --
+  // for its adapters' cut (lora_footprint).
+  genai::TpShare h3_tp_share_(
+      const genai::MetalMiniMaxH3Transformer::Config& c) const;
+  // The directory the hold is filed under: the one this stage declares to
+  // the planner, so the next launch claiming it keeps the hold.
+  const std::string& h3_warm_dir_() const
+  {
+    return _dit_dir_declared_.empty() ? _h3_dit_dir_ : _dit_dir_declared_;
+  }
   genai::MetalMiniMaxH3Transformer::Config _h3_cfg;
 
   // A family contributed by a PLUGIN, from genai::VideoModelRegistry.
@@ -558,6 +615,12 @@ private:
   // converts per projection or streams. Set at load, read by
   // declare_memory().
   std::size_t _h3_i8_hold_growth_ = 0;
+  // A RANK's (`tensor_parallel`) growth when it holds them: its share's
+  // (h3_tp_held_bytes_ with the layout and without), beside the share.
+  // Apart from the unsplit figure, so neither reads the other's at a
+  // later launch's plan. Set at load, read by declare_resources() and
+  // declare_memory().
+  std::size_t _h3_tp_hold_growth_ = 0;
   // The STREAMED H3 DiT's holding as residency grows it, corrected in
   // both ledgers after every clip (correct_h3_holding_): the set sees only
   // the cached trunk, and the promoted blocks are the model's own buffers.
