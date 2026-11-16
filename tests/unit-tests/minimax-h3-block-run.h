@@ -89,9 +89,11 @@ struct BlockRun {
   vpipe::metal_compute::SharedBuffer vb, ab, tb;
   int n_video = 0;
 
+  // `text`: the prompt's rows (a long one spans the banded forward's
+  // bands).
   bool
   setup(MetalCompute* mc, const std::string& r, int layers, int T = 2,
-        int h = 12, int w = 20, int audio = 8)
+        int h = 12, int w = 20, int audio = 8, int text = 8)
   {
     root = r;
     std::string cerr;
@@ -100,7 +102,7 @@ struct BlockRun {
       return false;
     }
     cfg.n_layers = layers;
-    const std::vector<int> tags(8, h3b::kTextTag);
+    const std::vector<int> tags((std::size_t)text, h3b::kTextTag);
     if (!h3b::build_packed_sequence(tags, T, h, w, audio, cfg.patch_h,
                                     cfg.patch_w, h3b::kAudioChannels, {},
                                     &L)) {

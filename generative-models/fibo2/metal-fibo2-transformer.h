@@ -16,6 +16,7 @@
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/tensor-parallel.h"
 #include "generative-models/fibo2/fibo2-layout.h"
 
 #include <cstddef>
@@ -35,6 +36,8 @@ class WeightSet;
 class MetalSageAttention;
 class MetalSolAttention;
 class I8GemmContext;
+class MetalLlamaWeights;
+class TpOverlap;
 
 // Fibo 2.0's DiT (BriaFibo2Transformer2DModel; Bria, briaai/Fibo-2.0-*),
 // on metal-compute.
@@ -164,6 +167,27 @@ class MetalFibo2Transformer {
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool ane_int8_plain = false;
 
+    // TENSOR PARALLEL (tensor-parallel.h): this model one RANK of a DiT
+    // split across machines -- Z-Image's split of the block (MetalZImage
+    // Transformer::Config::tp), on every block of the stack: its share of
+    // each block's heads (to_q / to_k / to_v by their rows, to_out.0 by
+    // its columns) and feed-forward rows (w1 and w3 by their rows, w2 by
+    // its columns), each partial completed by the other ranks' sum BEFORE
+    // its sandwich post-norm and gate -- two exchanges a block, a band.
+    // An INJECTION block's cross-attention is cut by the same heads
+    // (to_q, and to_k / to_v over the text, by their rows; to_out.0 by
+    // its columns), its keys and values its heads' alone, and its partial
+    // completed before cross_attn_norm2 and the tanh gate: a THIRD
+    // exchange there. Every step after a block's self-attention is a
+    // row's own -- the cross-attention reads the text, not the other
+    // rows -- so the three cross in row bands where the share carries a
+    // floor (tp_extra::kMinBandRows). The Perceiver (the text alone, once
+    // a prompt), the per-token modulation, the norms and the trunk run
+    // whole on every rank. A rank streams its share then keeps it (on the
+    // per-block path: no slot pair), with no runtime LoRA and no ANE tier
+    // (each refused by name).
+    TpShare tp;
+
     // Read what can be read from <dir>/config.json. False when the file
     // is absent or names a different class.
     static bool read_dims(const std::string& dir, Config* out);
@@ -252,9 +276,33 @@ class MetalFibo2Transformer {
 
   const Config& config() const { return _cfg; }
 
+  // A RANK's link to the others for ONE PICTURE (TpChannel): opened by
+  // the stage before the first forward, let go after the last however
+  // the picture ends; the exchange count new with it. False, with
+  // `err`, on a model that is not a rank or a channel that cannot run.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  void end_tp_generation();
+  // The exchange buffers it holds: grown at a forward's start, let go
+  // with the picture's channel (end_tp_generation).
+  std::size_t tp_exchange_bytes() const
+  {
+    std::size_t n = 0;
+    for (const auto& b : _tp_part) { n += b.byte_size(); }
+    for (const auto& b : _tp_recv) { n += b.byte_size(); }
+    return n;
+  }
+
   // Streaming + residency, the shared contract every DiT here
   // implements.
   void set_stream_stop(std::function<bool()> stop) {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
   }
   void set_block_progress(DitBlockProgressFn fn) {
@@ -389,6 +437,20 @@ class MetalFibo2Transformer {
                                            int txt_rows, bool packed,
                                            bool matrix_cores,
                                            int neg_txt_rows = -1);
+  // What a RANK of `c` (Config::tp, with the int8 tier it loads with)
+  // holds with every block kept -- where stream, then retain converges on
+  // a box with room -- off the checkpoint's headers before anything
+  // loads: the plan's figure for resident_bytes(). The trunk (bf16, a
+  // pack's codes as stored; the Perceiver whole; the injection blocks'
+  // cross-attention at its heads' share) and every block's share as
+  // tp_qw_ leaves it -- in the int8 tier's layout where it engages (asked
+  // of an I8GemmContext made as load() makes it, on `mc`), a w4 pack's
+  // only where `c.i8_hold_w4` holds it -- beside its norms and adaLN
+  // whole. `floor`: the trunk and two blocks' shares, what it holds
+  // streaming at the least. 0 when `c` is not split.
+  static std::size_t tp_held_bytes(const std::string& dir, const Config& c,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
   bool streaming() const { return _stream_blocks; }
   int quant_bits() const { return _quant_bits; }
 
@@ -518,6 +580,27 @@ class MetalFibo2Transformer {
   bool load_block_(WeightSet& ws, const std::string& pre, bool with_ada,
                    Block& b, Retain r);
   bool load_fixed_(WeightSet& ws);
+  // A RANK's share of the block under `pre` (Config::tp): each projection
+  // cut by tp_qw_, the norms and adaLN whole. False, with `err` naming
+  // the tensor, where a projection cannot be cut.
+  bool load_tp_block_(WeightSet& ws, const std::string& pre, Block& b,
+                      Retain r, std::string* err);
+  // One projection's share: `rows` of its N output rows, its input
+  // columns [k0, k1) (k1 0: all of them), laid out as the whole model
+  // lays out its own (`sign`: the signed layout where it engages;
+  // `fast`: a block's, on the int8 fast / token tier).
+  QWeight tp_qw_(WeightSet& ws, const std::string& name, int N,
+                 const std::vector<std::pair<int, int>>& rows, int k0,
+                 int k1, bool sign, bool fast, std::string* err);
+  // One block's share (prefix `pfx`) as tp_qw_ leaves it, off the
+  // headers; `fast` the tier's context where it engages, else null.
+  static std::size_t tp_block_bytes_(const MetalLlamaWeights& src,
+                                     const Config& c,
+                                     const I8GemmContext* fast,
+                                     const std::string& pfx);
+  // An exchange buffer of at least `bytes`, forgotten first where it is
+  // replaced.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
 
   // BlockSlots' callbacks; see shared/block-slots.h.
   void each_block_tensor_(int L, Block& b,
@@ -626,7 +709,10 @@ class MetalFibo2Transformer {
   metal_compute::SharedBuffer _queries;
   std::vector<PerceiverLayer> _perceiver;
   metal_compute::SharedBuffer _p_norm_out;
-  bool load_cross_(WeightSet& ws, const std::string& p, CrossAttn& ca);
+  // `share`: a RANK's injection cross-attention, cut by its heads (the
+  // Perceiver's is whole on every rank).
+  bool load_cross_(WeightSet& ws, const std::string& p, CrossAttn& ca,
+                   bool share = false);
   // What set_text leaves for the forwards, per slot: the gist rows and,
   // per injection block, its keys and values head-major [NH, T, Hd]
   // (normed), at text_len rows.
@@ -749,6 +835,19 @@ class MetalFibo2Transformer {
   // The per-projection stack for one block, or an empty one when
   // nothing is attached.
   lora::Stack lora_for_(int L, lora::Factors BlockLora::* which) const;
+
+  // ---- a rank's link (Config::tp) -------------------------------------
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  std::uint64_t _tp_seq = 0;
+  // The EXCHANGE BUFFERS, a lane each: a band's partial sum, written
+  // there by its GEMM, and the others' sum back. Lanes 0 / 1 carry the
+  // attention's partials, 2 / 3 an injection block's cross-attention's,
+  // 4 / 5 the feed-forward's (banded; a whole block uses lane 0 for
+  // all). Grown at a forward's start to its widest band (tp_buffer_),
+  // let go with the picture's channel (end_tp_generation).
+  static constexpr int kTpLanes = 6;
+  metal_compute::SharedBuffer _tp_part[kTpLanes], _tp_recv[kTpLanes];
 };
 
 }  // namespace genai

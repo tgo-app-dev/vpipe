@@ -45,6 +45,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -519,6 +520,7 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   _stream_answer_only = attr_bool("stream_answer_only");
   _stream_words = static_cast<int>(
       std::max<int64_t>(0, attr_int("stream_words")));
+  _stream_speed = attr_bool("stream_speed");
 
   // disable_thinking is tri-state (unset = family default), with no flat
   // ConfigKey form, so it's read from the config object directly.
@@ -656,6 +658,19 @@ constexpr ConfigKey kAttrs[] = {
           "every decoded piece as it comes, for a reader watching the "
           "reply being written",
    .def_int = 20},
+  {.key = "stream_speed", .type = ConfigType::Bool,
+   .doc = "each streaming out-port (index 1) beat carries `speed`: "
+          "{phase: prefill | decode, prefill_tps -- the last prefill "
+          "piece's tokens a second (the prompt whole where the model reads "
+          "it in one forward) -- prefill_tokens (that piece's), "
+          "prefill_done / prefill_total (the prompt so far), decode_tps -- "
+          "over the last 128 tokens decoded, or the round's so far when it "
+          "has fewer -- decoded (the round's tokens)}; a prompt being read "
+          "sends beats of no text, one a piece, and so does a decode that "
+          "sends nothing else for 250 ms (reasoning or a tool call folded "
+          "out by stream_answer_only, words gathering for stream_words). "
+          "A reader's meter",
+   .def_bool = false},
   {.key = "mtp", .type = ConfigType::Bool,
    .doc = "use the MTP speculative-decode head when the model carries one "
           "(token-exact; perf only); false forces the standard decode path",
@@ -777,8 +792,10 @@ const PortSpec kOports[] = {
           "punctuation (English + Chinese); the last beat of a reply sets "
           "end_of_response=true. Feeds a streaming consumer (e.g. "
           "text-to-speech) so it starts before the turn finishes. With "
-          "stream_answer_only, reasoning + tool-call spans are folded out "
-          "(downstream optional)",
+          "stream_answer_only, reasoning + tool-call spans are folded out; "
+          "with stream_speed, each beat carries `speed` (and a prompt "
+          "being read, or a decode that sends nothing else for 250 ms, "
+          "sends beats of no text) (downstream optional)",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
 };
@@ -1846,15 +1863,48 @@ TextChatStage::process(RuntimeContext& ctx)
       media_line::kThinkStart, media_line::kThinkEnd,
       tools_active ? tpl->tool_call_open_marker() : std::string_view(),
       tools_active ? tpl->tool_call_close_marker() : std::string_view());
+  // The reply's LIVE SPEED (stream_speed): what the last prefill piece
+  // read a second, and the decode's tokens a second over its last 128
+  // (the round's so far when it has fewer), each beat's as it goes out.
+  // `last_beat`: when the last beat of any kind went out.
+  struct LiveSpeed {
+    const char* phase = "prefill";
+    double prefill_tps = -1.0;
+    int    prefill_tokens = 0;
+    int    prefill_done = 0, prefill_total = 0;
+    double decode_tps = -1.0;
+    int    decoded = 0;
+    clock::time_point last_beat{};
+  } live;
   auto stream_emit =
       [&](std::string text, bool end_of_response) {
         if (!stream_alive) { return; }
+        live.last_beat = clock::now();
         FlexData fd = FlexData::make_object();
         {
           auto o = fd.as_object();
           o.insert("text", FlexData::make_string(text));
           o.insert("end_of_response",
                    FlexData::make_bool(end_of_response));
+          if (_stream_speed) {
+            FlexData sp = FlexData::make_object();
+            auto so = sp.as_object();
+            so.insert("phase", FlexData::make_string(live.phase));
+            if (live.prefill_tps >= 0.0) {
+              so.insert("prefill_tps",
+                        FlexData::make_real(live.prefill_tps));
+              so.insert("prefill_tokens",
+                        FlexData::make_int(live.prefill_tokens));
+            }
+            so.insert("prefill_done", FlexData::make_int(live.prefill_done));
+            so.insert("prefill_total",
+                      FlexData::make_int(live.prefill_total));
+            if (live.decode_tps >= 0.0) {
+              so.insert("decode_tps", FlexData::make_real(live.decode_tps));
+            }
+            so.insert("decoded", FlexData::make_int(live.decoded));
+            o.insert("speed", std::move(sp));
+          }
         }
         stream_alive =
             ctx.write_sync(1, make_payload<FlexDataPayload>(std::move(fd)));
@@ -1911,22 +1961,60 @@ TextChatStage::process(RuntimeContext& ctx)
       [&](int32_t next, std::span<const int32_t> prompt_ids)
           -> std::string {
     const auto t_decode_start = clock::now();
+    // The round's decode speed (stream_speed): each token decoded and its
+    // time, the last 129 kept -- the speed over the last 128 tokens, or
+    // over the round's from its start while it has fewer.
+    std::deque<std::pair<int, clock::time_point>> dec_at;
+    live.phase = "decode";
+    live.decoded = 0;
+    live.decode_tps = -1.0;
+    auto count_token = [&]() {
+      if (!_stream_speed) { return; }
+      const auto now = clock::now();
+      ++live.decoded;
+      dec_at.emplace_back(live.decoded, now);
+      while (dec_at.size() > 129) { dec_at.pop_front(); }
+      const auto& [n0, t0] = live.decoded > 128
+                                 ? dec_at.front()
+                                 : std::pair<int, clock::time_point>(
+                                       0, t_decode_start);
+      const double s = std::chrono::duration<double>(now - t0).count();
+      if (s > 0.0) { live.decode_tps = (live.decoded - n0) / s; }
+    };
+    // A DECODE THAT SENDS A READER NOTHING still moves the meter: reasoning
+    // or a tool call folded out by stream_answer_only, words gathering for
+    // stream_words, a token with no text yet. Each beat carries the speed,
+    // so where none has gone out for kSpeedGap a beat of no text does --
+    // as each prefill piece does. Most of an agentic turn is such a
+    // stretch.
+    constexpr auto kSpeedGap = std::chrono::milliseconds(250);
+    auto speed_heartbeat = [&]() {
+      if (_stream_speed && clock::now() - live.last_beat >= kSpeedGap) {
+        stream_emit(std::string(), /*end_of_response=*/false);
+      }
+    };
     // Stream the assistant's tokens to the user as they are produced via
     // the UI delegate's live text stream (stdout by default; the web-ui
     // console under the web delegate). We also accumulate the full text
     // so the per-turn FlexData beat on out-port 0 carries it.
     auto out_stream = session()->open_text_stream();
     std::string assistant_text;
+    // `decoded`: a token the decode wrote (not the thinking marker, nor
+    // the prefill's own first token): counted for the live speed.
     auto emit_chunk =
-        [&assistant_text, &out_stream, &stream_push](const std::string& chunk) {
-          if (chunk.empty()) {
-            return;
+        [&assistant_text, &out_stream, &stream_push, &count_token,
+         &speed_heartbeat](const std::string& chunk, bool decoded = true) {
+          if (decoded) { count_token(); }
+          if (!chunk.empty()) {
+            assistant_text += chunk;
+            out_stream->write(chunk);
+            // Feed the streaming out-port (index 1): same text as the
+            // live UI stream, re-chunked into ~20-word punctuation-
+            // bounded beats.
+            stream_push(chunk);
           }
-          assistant_text += chunk;
-          out_stream->write(chunk);
-          // Feed the streaming out-port (index 1): same text as the live
-          // UI stream, re-chunked into ~20-word punctuation-bounded beats.
-          stream_push(chunk);
+          // After the text's own beat, if it made one.
+          if (decoded) { speed_heartbeat(); }
         };
 
     auto sd = tok.make_stream_decoder();
@@ -1937,7 +2025,7 @@ TextChatStage::process(RuntimeContext& ctx)
     // generated by the model and the detokenizer rewrites it to
     // media_line::kThinkEnd (as it does both of Gemma's channel tokens).
     if (tpl->assistant_prompt_opens_thinking()) {
-      emit_chunk(string(media_line::kThinkStart));
+      emit_chunk(string(media_line::kThinkStart), /*decoded=*/false);
     }
     // Per-turn sampler — fresh seen-token set each turn so the
     // repetition / presence penalty rolls over cleanly between
@@ -1959,7 +2047,7 @@ TextChatStage::process(RuntimeContext& ctx)
       }
     }
     if (next >= 0 && !is_stop(next)) {
-      emit_chunk(tok.step(sd, next));
+      emit_chunk(tok.step(sd, next), /*decoded=*/false);
       sampler.prime(std::span<const int32_t>(&next, 1));
     }
     reason = StopReason::StopToken;
@@ -2148,10 +2236,66 @@ TextChatStage::process(RuntimeContext& ctx)
   // Plain-text prefill of a round's prompt ids, timed into the
   // accumulators. Returns the predicted next token (-1 on failure).
   // Round 1 with media uses prefill_multimodal_metal inline instead.
+  // A prefill's live speed (stream_speed): each piece as the model reads
+  // it -- prefill-progress.h; a beat of no text a piece -- or, where the
+  // model reads the prompt in one forward, the prompt whole once read.
+  auto speed_beat = [&]() {
+    if (_stream_speed) { stream_emit(std::string(), false); }
+  };
+  auto prefill_timed = [&](int total, const auto& run) -> int32_t {
+    if (!_stream_speed) { return run(); }
+    live.phase = "prefill";
+    live.prefill_done = 0;
+    live.prefill_total = total;
+    auto last = clock::now();
+    int  last_done = 0;
+    bool pieces = false;
+    const bool told = _lm->set_prefill_progress(
+        [&](int done, int of) {
+          const auto now = clock::now();
+          const double sec = std::chrono::duration<double>(now - last)
+                                 .count();
+          pieces = true;
+          live.prefill_tokens = done - last_done;
+          live.prefill_tps = sec > 0.0 ? live.prefill_tokens / sec : -1.0;
+          live.prefill_done = done;
+          live.prefill_total = of;
+          last = now;
+          last_done = done;
+          speed_beat();
+        });
+    // LET GO ON EVERY WAY OUT: the callback reads this frame, and the
+    // model outlives it -- kept warm, holding a parked conversation,
+    // shared with the launch's other stages naming its checkpoint -- while
+    // a prefill can THROW (Session::error does, the routed-expert cache's
+    // failure among its callers). Cleared only after a return, a throw
+    // left the next prefill on the model calling into a dead frame.
+    struct Untell {
+      genai::LoadedLanguageModel* lm;
+      bool on;
+      ~Untell()
+      {
+        if (on) { lm->set_prefill_progress({}); }
+      }
+    } untell{_lm.get(), told};
+    const auto t0 = last;
+    const int32_t r = run();
+    if (!pieces && r >= 0) {
+      const double sec = std::chrono::duration<double>(clock::now() - t0)
+                             .count();
+      live.prefill_tokens = total;
+      live.prefill_tps = sec > 0.0 ? total / sec : -1.0;
+      live.prefill_done = total;
+      speed_beat();
+    }
+    return r;
+  };
   auto prefill_plain =
       [&](std::span<const int32_t> pids) -> int32_t {
     const auto t0 = clock::now();
-    const int32_t n = _lm->prefill(_chat_ctx, pids);
+    const int32_t n = prefill_timed(static_cast<int>(pids.size()), [&] {
+      return _lm->prefill(_chat_ctx, pids);
+    });
     const auto t1 = clock::now();
     prefill_s_total += std::chrono::duration<double>(t1 - t0).count();
     prefill_n_total += static_cast<int>(pids.size());
@@ -2222,9 +2366,11 @@ TextChatStage::process(RuntimeContext& ctx)
       }
       refs.push_back(r);
     }
-    next = _lm->prefill_multimodal_metal(
-        _chat_ctx, span<const genai::TokenRef>(refs),
-        span<const pair<int, int>>(image_grids));
+    next = prefill_timed(static_cast<int>(refs.size()), [&] {
+      return _lm->prefill_multimodal_metal(
+          _chat_ctx, span<const genai::TokenRef>(refs),
+          span<const pair<int, int>>(image_grids));
+    });
     const auto t_prefill_end = clock::now();
     prefill_s_total += std::chrono::duration<double>(
         t_prefill_end - t_prefill_start).count();

@@ -206,11 +206,18 @@ const ConfigKey kAttrs[] = {
           "(generative-models/tensor-parallel.h): {rank, ranks, heads: "
           "[first, end], ffn: [first, end] -- unsaid, an even split -- "
           "transport: the name a plugin registered its transport under, "
-          "params: that transport's own, passed through}. The rank holds "
-          "its share of every block's projections, preloaded, and adds "
-          "the other ranks' partial sums through the transport twice a "
-          "block. Dense or affine weights; no ANE, VDN, TaoMate, adapter "
-          "or int8 tier beyond accurate"},
+          "params: that transport's own, passed through; min_band_rows: "
+          "the fewest rows a band takes, stated alike to every rank; "
+          "prompt_bands: true bands a prompt longer than a band (unsaid, "
+          "its blocks run whole), stated alike to every rank and only to "
+          "peers listing tensor-parallel-prompt-bands/1}. The "
+          "rank holds its share of every block's projections -- streamed, "
+          "then kept as the box allows -- and adds the other ranks' "
+          "partial sums through the transport twice a block, a long "
+          "sequence's band by band under the next band's work. Dense or "
+          "affine weights; adapters, the int8 tiers and the ANE tier take "
+          "the share's widths (the ANE splitting each band's rows with the "
+          "GPU, its bands a rank's without it); no VDN or TaoMate"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls instead of bf16, at int8 quality. Independent of "
@@ -1583,7 +1590,7 @@ GenerateVideoStage::ane_claim_label_() const
 // longest text. The same geometry answers the claim and the grant, so the
 // two cannot book different numbers.
 int
-GenerateVideoStage::h3_plan_seq_() const
+GenerateVideoStage::h3_plan_seq_(int* text) const
 {
   int w = _width, h = _height, f = _frames;
   const std::string root = resolve_model_dir(session(), _hf_dir);
@@ -1615,6 +1622,7 @@ GenerateVideoStage::h3_plan_seq_() const
     const int picture = std::max(gh * gw, (int)(4096LL * 4096LL / 4 / cell));
     const int vision = (int)((std::int64_t)genai::h3i::kVisionShortEdge *
                              genai::h3i::kVisionShortEdge / cell) + 16;
+    if (text != nullptr) { *text = kTextRows + (edit ? vision : 0); }
     return gh * gw + (edit ? picture + vision : 0) + kTextRows;
   }
   if (genai::ph3::is_root(root)) {
@@ -1628,6 +1636,9 @@ GenerateVideoStage::h3_plan_seq_() const
     const int cell = genai::ph3::kCanvasMultiple * genai::ph3::kCanvasMultiple;
     const int picture =
         std::max(gh * gw, (int)(man.canvas_min_pixels / cell));
+    if (text != nullptr) {
+      *text = kTextRows + (edit ? kPictureTokens : 0);
+    }
     return gh * gw + (edit ? picture + kPictureTokens : 0) +
            genai::minimax_h3::kAudioChannels * genai::ph3::kAudioLatents +
            kTextRows;
@@ -1664,7 +1675,9 @@ GenerateVideoStage::h3_plan_seq_() const
   const bool in_context = refine &&
                           iport_edges().size() > kRefVideoRowsPort &&
                           iport_edges()[kRefVideoRowsPort].v != nullptr;
-  int draft = 0;
+  // The presentation's tokens are the PROMPT's rows: the text refiner's,
+  // banded with the prompt where it passes a band.
+  int draft = 0, present = 0;
   if (in_context) {
     constexpr int kDraftW = 1344, kDraftH = 768;
     const int dgh = kDraftH / vc.patch / tc.patch_h;
@@ -1674,13 +1687,15 @@ GenerateVideoStage::h3_plan_seq_() const
     std::vector<float> secs;
     if (genai::minimax_h3::condition_frame_indices(
             std::max(1, f), genai::minimax_h3::kFps, 2.0, 2, &idx, &secs)) {
-      draft += ((int)idx.size() + 1) / 2 * (kDraftW / 32) * (kDraftH / 32);
+      present = ((int)idx.size() + 1) / 2 * (kDraftW / 32) * (kDraftH / 32);
     }
   }
+  if (text != nullptr) { *text = kTextRows + present; }
   return (std::max(0, lf) + (refine ? 0 : kCondFrames) +
           (guided ? kGuideFrames : 0)) *
              gh * gw +
-         draft + audio + (guided ? 2 * kGuideAudio : 0) + kTextRows;
+         draft + present + audio + (guided ? 2 * kGuideAudio : 0) +
+         kTextRows;
 }
 
 std::size_t
@@ -1691,6 +1706,8 @@ GenerateVideoStage::h3_ane_bytes_() const
   // cover the qkv module while the preflight already charged for it, so
   // the gate refused against a number the plan had never granted.
   tc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  // A RANK (`tensor_parallel`): its modules are its share's.
+  tc.tp = h3_tp_share_(tc);
   return genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(tc,
                                                              h3_plan_seq_());
 }
@@ -1775,8 +1792,9 @@ GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
   auto* mc = session() != nullptr ? session()->services()->metal_compute()
                                   : nullptr;
   const bool mx = mc != nullptr && mc->supports_matrix_cores();
-  const int seq = h3_plan_seq_();
-  // THE BANDED FORWARD, as the DiT will decide it (band_rows): the tiers
+  int text = 0;
+  const int seq = h3_plan_seq_(&text);
+  // THE BANDED FORWARD, as the DiT will decide it (band_for): the tiers
   // the graph asked for keep the whole sequence, and so do VDN's branch
   // and TaoMate-H3's streaming attention.
   c.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
@@ -1800,12 +1818,14 @@ GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
   for (const std::string& f : loras) {
     whole = whole || genai::minimax_h3::taomate::is_adapter(f);
   }
-  const int band = whole ? 0 : T::band_rows(c, seq);
+  const int band = whole ? 0 : T::band_for(c, seq, text);
   const int rows = band > 0 ? band : seq;
   // An FP8 / int8 / W4A8 file widens its projections into the dequant
   // scratch on every GPU (fp8_widen_bytes), the matrix cores' tiles
-  // aside.
-  std::size_t n = T::scratch_bytes(c, seq, 512, T::kTimestepSlots, mx,
+  // aside. The prompt at the rows the plan put in the sequence: an
+  // in-context refine's presentation is thousands of them, a long
+  // draft's past a band.
+  std::size_t n = T::scratch_bytes(c, seq, text, T::kTimestepSlots, mx,
                                    /*narrow_ff=*/false, 0, band,
                                    T::fp8_widen_bytes(dit, c));
   if (mx && _i8_gemm) {
@@ -1939,7 +1959,7 @@ GenerateVideoStage::apply_h3_ane_()
 }
 #else
 std::size_t GenerateVideoStage::h3_ane_bytes_() const { return 0; }
-int GenerateVideoStage::h3_plan_seq_() const { return 0; }
+int GenerateVideoStage::h3_plan_seq_(int*) const { return 0; }
 std::size_t
 GenerateVideoStage::h3_forward_scratch_bytes_(const std::string&) const
 {
@@ -4332,8 +4352,9 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
                                            &vdn_arena)
               : 0;
   // Banded where the DiT will band it (its rule, at this sequence).
-  const int band =
-      _h3_dit && taomate_slot_() < 0 ? _h3_dit->forward_band(seq) : 0;
+  const int band = _h3_dit && taomate_slot_() < 0
+                       ? _h3_dit->forward_band(seq, text_rows)
+                       : 0;
   // A RANK of a split DiT at its share's widths: _h3_cfg keeps the
   // checkpoint's (the model narrows its own copy at load).
   const std::size_t dit = genai::MetalMiniMaxH3Transformer::scratch_bytes(
@@ -4347,17 +4368,20 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // while Sol runs -- so what comes back is the remainder, and it is
   // the real carve rather than a subtraction. Zero when Sol is off, and
   // zero before the DiT exists to be asked.
-  const std::size_t sol = _h3_dit ? _h3_dit->sol_scratch_bytes(seq) : 0;
+  const std::size_t sol =
+      _h3_dit ? _h3_dit->sol_scratch_bytes(seq, text_rows) : 0;
   // AND SAGE'S, which nothing counted until now: its int8 twins of q
   // and k are one byte per element where the tensors are two, so at
   // video geometry they are ~1.5 GB the plan had never heard of. Zero
   // when the setting is off, and reduced by whatever the forward arena
   // could lend -- see MetalMiniMaxH3Transformer::sage_lend_bytes_.
-  const std::size_t sage = _h3_dit ? _h3_dit->sage_scratch_bytes(seq) : 0;
+  const std::size_t sage =
+      _h3_dit ? _h3_dit->sage_scratch_bytes(seq, text_rows) : 0;
   // AND THE INT8 CONTEXT'S: activation codes at the widest GEMM, the
   // per-call weight scratch and split-K's planes, grown inside the first
   // forward and kept. Zero when i8_gemm is off.
-  const std::size_t i8 = _h3_dit ? _h3_dit->i8_scratch_bytes(seq) : 0;
+  const std::size_t i8 =
+      _h3_dit ? _h3_dit->i8_scratch_bytes(seq, text_rows) : 0;
   // AND THE ANE MODULE'S, when the plan granted it: CoreML holds its staged
   // weights and the host rows beside this forward, at THIS sequence rather
   // than the planned one. Counted in `need`, so the refusal is judged with

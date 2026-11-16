@@ -18,6 +18,7 @@
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/tensor-parallel.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -32,9 +33,11 @@ class FlexData;
 namespace genai {
 
 class WeightSet;
+class MetalLlamaWeights;
 class MetalSageAttention;
 class MetalSolAttention;
 class I8GemmContext;
+class TpOverlap;
 
 // Qwen-Image-2.1's DiT (QwenImage21Transformer2DModel), on metal-compute.
 //
@@ -134,6 +137,22 @@ class MetalQwenImage21Transformer {
     // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool ane_int8_plain = false;
+    // TENSOR PARALLEL (tensor-parallel.h): this model one RANK of a DiT
+    // split across machines -- its share of every block's heads (to_q /
+    // to_k / to_v by their rows, to_out by its columns) and feed-forward
+    // rows (gate_layer and proj by their rows, out by its columns). The
+    // attention and the feed-forward are gated apart, so a rank
+    // exchanges TWO partials a block, each before its gate -- two a BAND
+    // where the share carries a floor (tp_extra::kMinBandRows;
+    // tp_row_bands), each crossing under the next band's work. Its
+    // share is cut as stored (bf16 or an affine pack; only its rows read
+    // where a cut is by rows) and then laid out for the int8 tier asked,
+    // within its own columns. Inactive: the whole model. A rank streams
+    // its share then keeps it, as the whole model streams its blocks (on
+    // the per-block path: no slot pair), with no runtime LoRA, no ANE
+    // tier, no FP8 / NVFP4 / i8x weights and no training forward (each
+    // refused by name).
+    TpShare tp;
 
     // Read what can be read from <dir>/config.json. False when the file
     // is absent or names a different class. `dir` may also be a single
@@ -282,16 +301,42 @@ class MetalQwenImage21Transformer {
   static std::string block_module(int L, const std::string& leaf);
 
   // One forward. Returns the TARGET block's rows only --
-  // [layout->target_len, out_channels] f32-convertible f16 -- because
-  // that is the whole of what a denoise step consumes; the reference
-  // slices the same rows off its joint output. Empty on failure.
+  // [layout->target_len, out_channels] bf16, the element type the model
+  // runs in (its libraries are the bf16 builds, whatever a kernel's name
+  // says) -- because that is the whole of what a denoise step consumes;
+  // the reference slices the same rows off its joint output. Empty on
+  // failure.
   metal_compute::SharedBuffer forward(const Request& req,
                                       std::string* err = nullptr);
 
   const Config& config() const { return _cfg; }
 
+  // A RANK's link to the others for ONE PICTURE (TpChannel): opened by
+  // the stage before the first forward, let go after the last however
+  // the picture ends; the exchange count new with it. False, with
+  // `err`, on a model that is not a rank or a channel that cannot run.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  void end_tp_generation();
+  // The exchange buffers it holds: grown at a forward's start, let go
+  // with the picture's channel (end_tp_generation).
+  std::size_t tp_exchange_bytes() const
+  {
+    std::size_t n = 0;
+    for (const auto& b : _tp_part) { n += b.byte_size(); }
+    for (const auto& b : _tp_recv) { n += b.byte_size(); }
+    return n;
+  }
+
   // Streaming + residency, the shared contract every DiT here implements.
   void set_stream_stop(std::function<bool()> stop) {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
   }
   void set_block_progress(DitBlockProgressFn fn) {
@@ -387,13 +432,30 @@ class MetalQwenImage21Transformer {
   static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
   // The joint length a plan should book for, from the picture.
   static int ane_plan_seq(int width, int height) noexcept;
+  // What a RANK of `c` (Config::tp, with the int8 tier it loads with)
+  // holds with every block kept -- where stream, then retain converges on
+  // a box with room -- off the checkpoint's headers before anything
+  // loads: the plan's figure for resident_bytes(). The trunk (bf16, a
+  // pack's codes as stored) and every block's share as tp_qw_ leaves it:
+  // its projections at the share's rows and columns in the layout each
+  // takes -- the int8 tier's where the tier engages (asked of an
+  // I8GemmContext made as load() makes it, on `mc`), a w4 pack's only
+  // where `c.i8_hold_w4` holds it -- and its q / k norms whole. `floor`:
+  // the trunk and two blocks' shares, what it holds streaming at the
+  // least. 0 when `c` is not split. (A column cut's projection is read
+  // whole before it is cut: a load-time transient, not held.)
+  static std::size_t tp_held_bytes(const std::string& dir, const Config& c,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
   // What one denoise step's forwards allocate beyond the weights, for the
   // plan's denoise phase: img_rows image tokens beside txt_rows of prompt,
   // `cfg` for a negative branch (its own K / V cache), `packed` for a
   // pack (the dense stand-in), `matrix_cores` for the tiers that need
   // them (int8, Sage, Sol). `widen`: the widest FP8 / NVFP4 weight the
   // forward widens per GEMM, as bf16 (model_memory::widened_weight_bytes)
-  // -- one scratch with the pack's stand-in, so the larger of the two.
+  // -- one scratch with the pack's stand-in, so the larger of the two. A
+  // RANK's (c.tp) are its share's widths, and its exchange buffers beside
+  // them.
   static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
                                            int txt_rows, bool cfg,
                                            bool packed, bool matrix_cores,
@@ -508,6 +570,25 @@ class MetalQwenImage21Transformer {
   metal_compute::SharedBuffer to_elt_(WeightSet& ws, const std::string& name,
                                       Retain r);
   bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
+  // A RANK's share of block L (Config::tp): each projection read
+  // uncached, cut, and laid out for the int8 tier. False, with `err`.
+  bool load_tp_block_(WeightSet& ws, int L, Block& b, std::string* err);
+  // The share of `name` ([N, K]): `rows` of it, each row's columns
+  // [k0, k1) (k1 0: all -- then only those rows are read), then in the
+  // tier's layout where one is asked for and its group divides the
+  // share's columns, else signed where _sgn says.
+  QWeight tp_qw_(WeightSet& ws, const std::string& name, int N,
+                 const std::vector<std::pair<int, int>>& rows, int k0,
+                 int k1, std::string* err);
+  // One block's share (prefix `pfx`) as tp_qw_ leaves it, off the
+  // headers, `fast` the tier's context where the tier engages: the
+  // plan's figure and residency's block size for a rank.
+  static std::size_t tp_block_bytes_(const MetalLlamaWeights& src,
+                                     const Config& c,
+                                     const I8GemmContext* fast,
+                                     const std::string& pfx);
+  // An exchange buffer at least `bytes`: one replaced is forgotten first.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
   bool load_fixed_(WeightSet& ws);
 
   // BlockSlots' four callbacks; see shared/block-slots.h.
@@ -756,6 +837,19 @@ class MetalQwenImage21Transformer {
   std::unique_ptr<AneFeedForward> _ane_qkv;
   bool _ane_qkv_tried = false;
   std::unique_ptr<I8GemmContext> _i8;
+
+  // ---- a rank's link (Config::tp) -------------------------------------
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  std::uint64_t _tp_seq = 0;
+  // The EXCHANGE BUFFERS, a lane each: a band's partial sum, written
+  // there by its last GEMM (the forward's scratch is per forward, and a
+  // transport may keep a device's registration of what it is handed),
+  // and the others' sum back -- lanes 0 / 1 the attention's, 2 / 3 the
+  // feed-forward's (a block whole uses 0 for both). Grown at a forward's
+  // start to its widest band (tp_buffer_), let go with the picture's
+  // channel (end_tp_generation).
+  metal_compute::SharedBuffer _tp_part[4], _tp_recv[4];
   // Set by the trainer around a backward GEMM it keeps off the int8
   // pipe (QwenImage21Trainer::set_i8_backward).
   bool _i8_hold = false;

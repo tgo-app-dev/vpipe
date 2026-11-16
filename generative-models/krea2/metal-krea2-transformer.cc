@@ -8,6 +8,8 @@
 #include "generative-models/shared/signed-affine.h"
 #include "generative-models/shared/lora-names.h"
 #include "generative-models/shared/dit-gpu-progress.h"
+#include "generative-models/shared/tp-cut.h"
+#include "generative-models/shared/tp-overlap.h"
 
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -18,6 +20,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -550,6 +553,317 @@ MetalKrea2Transformer::load_block_(WeightSet& ws,
 }
 
 
+// A rank's share of one projection. CUT BY ITS ROWS -- to_q / to_gate,
+// to_k / to_v, ff.gate and ff.up, most of a block -- a dense bf16 weight
+// or an MLX affine pack has only the share's rows READ, straight into the
+// share (tp_read_rows); the rest of the tensor never leaves the disk.
+// CUT BY ITS COLUMNS -- to_out, ff.down -- every row is needed: the whole
+// weight is read UNCACHED (Retain::Streamed, plain: no signed or tier
+// layout) and the share copied out of it, as is any weight the row read
+// does not serve (VPIPE_TP_WHOLE_READ, the A/B). An affine pack's columns
+// are cut in whole groups. Then the share is laid out as a whole model
+// lays out its own main-block weights: on the int8 fast / token tier, a
+// w8 share converted, a w4 share held as stored and converted per GEMM,
+// and a DENSE share quantized -- from a dense checkpoint only, as
+// load_qw_ quantizes (a pack's dense tensors stay dense) -- each at the
+// group the share's own columns take, a width none divides staying on
+// the accurate tier; off those tiers an affine share takes the SIGNED
+// layout where the model's projections do (_sgn: per byte and per group,
+// so a share converts as its whole weight would).
+MetalKrea2Transformer::QWeight
+MetalKrea2Transformer::tp_qw_(WeightSet& ws, const std::string& name, int N,
+                              const std::vector<std::pair<int, int>>& rows,
+                              int k0, int k1, std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = name + ": " + why; }
+    return QWeight{};
+  };
+  int n = 0;
+  for (const auto& [a, b] : rows) { n += b - a; }
+  QWeight l;
+  l.n = n;
+  bool read = false;
+  if (k1 == 0 && std::getenv("VPIPE_TP_WHOLE_READ") == nullptr) {
+    const MetalLlamaWeights& src = ws.src();
+    // A pack's scales and biases as the model holds them, bf16: read in
+    // the dtype stored, an F16 pack's widened in place (one width).
+    auto rows_bf16 = [&](const std::string& nm) -> SharedBuffer {
+      const auto* ti = src.info(nm);
+      if (ti == nullptr || (ti->dtype != "BF16" && ti->dtype != "F16")) {
+        return {};
+      }
+      SharedBuffer b =
+          tp_read_rows(_mc, src, nm, ti->dtype.c_str(), N, rows);
+      if (b.empty() || ti->dtype == "BF16") { return b; }
+      auto* p = static_cast<std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < b.byte_size() / 2; ++i) {
+        _Float16 h;
+        std::memcpy(&h, &p[i], 2);
+        p[i] = f32_to_bf16_((float)h);
+      }
+      return b;
+    };
+    const auto* ci = src.info(name + ".weight");
+    const auto* si = src.info(name + ".scales");
+    if (_quant_bits > 0 && ci != nullptr && si != nullptr &&
+        ci->shape.size() == 2 && si->shape.size() == 2) {
+      const long K = si->shape[1] * (long)_quant_group;
+      const long bits = K > 0 ? ci->shape[1] * 32 / K : 0;
+      if (bits == 4 || bits == 8) {
+        l.codes = tp_read_rows(_mc, src, name + ".weight", "U32", N, rows);
+        l.scales = rows_bf16(name + ".scales");
+        l.qbias = rows_bf16(name + ".biases");
+        if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
+          l.quantized = true;
+          l.bits = (int)bits;
+          l.k = (int)K;
+          read = true;
+        } else {
+          l.codes = {}; l.scales = {}; l.qbias = {};
+        }
+      }
+    } else if (si == nullptr && ci != nullptr && ci->shape.size() == 2) {
+      l.w = tp_read_rows(_mc, src, name + ".weight", "BF16", N, rows);
+      if (!l.w.empty()) {
+        l.k = (int)ci->shape[1];
+        read = true;
+      }
+    }
+  }
+  if (!read) {
+    QWeight w = load_qw_(ws, name, Retain::Streamed, /*sign=*/false,
+                         /*fast=*/false);
+    if (w.empty()) { return fail("not in the checkpoint"); }
+    if (w.is_fp8() || w.gc > 0) {
+      return fail("a split DiT reads dense or affine weights only");
+    }
+    if (w.quantized) {
+      const int g = _quant_group;
+      if (k1 > 0 && (k0 % g != 0 || k1 % g != 0)) {
+        return fail(fmt("its share's columns [{}, {}) are not whole "
+                        "groups of {}", k0, k1, g)());
+      }
+      l.quantized = true;
+      l.bits = w.bits;
+      // Codes: `32 / bits` columns a word; scales and biases: one a group.
+      l.codes = tp_cut(_mc, w.codes, N, rows, (std::size_t)k0 * w.bits / 8,
+                       (std::size_t)k1 * w.bits / 8);
+      l.scales = tp_cut(_mc, w.scales, N, rows, (std::size_t)k0 / g * 2,
+                        (std::size_t)k1 / g * 2);
+      l.qbias = tp_cut(_mc, w.qbias, N, rows, (std::size_t)k0 / g * 2,
+                       (std::size_t)k1 / g * 2);
+      if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+        return fail("its share could not be cut");
+      }
+      l.k = k1 > 0 ? k1 - k0 : (int)(w.codes.byte_size() * 8 /
+                                     (std::size_t)N / (std::size_t)w.bits);
+    } else {
+      l.w = tp_cut(_mc, w.w, N, rows, (std::size_t)k0 * 2,
+                   (std::size_t)k1 * 2);
+      if (l.w.empty()) { return fail("its share could not be cut"); }
+      l.k = k1 > 0 ? k1 - k0
+                   : (int)(w.w.byte_size() / 2 / (std::size_t)N);
+    }
+  }
+  // Off the int8 fast / token tier: the signed layout, where the model's
+  // projections take it.
+  auto plain = [&]() -> QWeight {
+    if (!sign_(l)) {
+      return fail("its share did not take the signed layout");
+    }
+    return std::move(l);
+  };
+  if (!_fast || !_i8) { return plain(); }
+  // A pack's dense tensor stays dense, as the whole model keeps it.
+  if (!l.quantized && _quant_bits != 0) { return plain(); }
+  // The tier's layout, within the share's own columns.
+  const int fgc = _i8->fast_group(l.k);
+  if (fgc <= 0) { return plain(); }
+  const std::size_t cb = (std::size_t)l.n * l.k;
+  const std::size_t sb = I8GemmContext::fast_scale_bytes(l.n, l.k, fgc);
+  if (l.quantized) {
+    if (_quant_group != 64 || !_i8->fast_converts(l.bits, fgc)) {
+      return plain();
+    }
+    if (l.bits == 4 && !_cfg.i8_hold_w4) {
+      // A W4 SHARE IS HELD AS STORED, converted before each GEMM
+      // (fast_operand_), as a whole model's w4 block is.
+      l.gc = fgc;
+      l.pc = true;
+      return l;
+    }
+    QWeight f;
+    f.bits = l.bits; f.gc = fgc; f.n = l.n; f.k = l.k;
+    f.codes = _mc->make_shared_buffer(cb);
+    f.cscales = _mc->make_shared_buffer(sb);
+    if (f.codes.empty() || f.cscales.empty()) { return plain(); }
+    CommandStream st = _mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = _i8->encode_to_fast(e, l.codes, l.scales, l.qbias, f.codes,
+                               f.cscales, fgc, l.n, l.k, l.bits);
+    }
+    if (!ok || !st.commit().wait_ok(nullptr)) { return plain(); }
+    f.quantized = true;
+    return f;
+  }
+  QWeight f;
+  f.bits = 8; f.gc = fgc; f.n = l.n; f.k = l.k;
+  f.codes = _mc->make_shared_buffer(cb);
+  f.cscales = _mc->make_shared_buffer(sb);
+  if (f.codes.empty() || f.cscales.empty()) { return l; }
+  CommandStream st = _mc->make_command_stream();
+  bool ok = false;
+  {
+    ComputeEncoder e = st.begin_compute();
+    ok = _i8->encode_quant_fast(e, l.w, f.codes, f.cscales, fgc, l.n, l.k);
+  }
+  if (!ok || !st.commit().wait_ok(nullptr)) { return l; }
+  f.quantized = true;
+  return f;
+}
+
+// GQA HERE IS WHY A SHARE IS WHOLE KV GROUPS (load() refuses any other):
+// query head h reads kv head h / G (G = n_heads / n_kv_heads, the steel
+// kernels' gqa_factor), so the share's query heads [h0, h1) read exactly
+// kv heads [h0 / G, h1 / G) when both ends are multiples of G -- and the
+// rank's own attention is then a GQA of its own, the same factor. to_q
+// and to_gate (the sigmoid gate over the attention's output, one value
+// per query-head channel) are cut alike; to_k / to_v at the kv heads.
+bool
+MetalKrea2Transformer::load_tp_block_(WeightSet& ws, int L, Block& b,
+                                      std::string* err)
+{
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
+  const TpShare& t = _cfg.tp;
+  const int H = _cfg.hidden, Hd = _cfg.head_dim, F = _cfg.ffn;
+  const int G = _cfg.n_heads / _cfg.n_kv_heads;
+  const int qd = _cfg.n_heads * Hd, kd = _cfg.n_kv_heads * Hd;
+  const std::vector<std::pair<int, int>> heads = {
+      {t.head0 * Hd, t.head1 * Hd}};
+  const std::vector<std::pair<int, int>> kv = {
+      {t.head0 / G * Hd, t.head1 / G * Hd}};
+  const std::vector<std::pair<int, int>> all = {{0, H}};
+  const std::vector<std::pair<int, int>> ff = {{t.ffn0, t.ffn1}};
+  const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+  struct One {
+    QWeight* w;
+    const char* leaf;
+    int N;
+    const std::vector<std::pair<int, int>>* rows;
+    int k0, k1;
+  };
+  const One all_of[] = {
+      {&b.q, "attn.to_q", qd, &heads, 0, 0},
+      {&b.k, "attn.to_k", kd, &kv, 0, 0},
+      {&b.v, "attn.to_v", kd, &kv, 0, 0},
+      {&b.gate, "attn.to_gate", qd, &heads, 0, 0},
+      {&b.o, "attn.to_out.0", H, &all, t.head0 * Hd, t.head1 * Hd},
+      {&b.ff_gate, "ff.gate", F, &ff, 0, 0},
+      {&b.ff_up, "ff.up", F, &ff, 0, 0},
+      {&b.ff_down, "ff.down", H, &all, t.ffn0, t.ffn1}};
+  for (const One& o : all_of) {
+    *o.w = tp_qw_(ws, p + o.leaf, o.N, *o.rows, o.k0, o.k1, err);
+    if (o.w->empty()) { return false; }
+  }
+  // The norms, the q / k RMSNorms (a head's own, [head_dim]) and the
+  // block's modulation table: whole on every rank.
+  const Retain r = Retain::Cached;
+  b.sst = elt_(ws, p + "scale_shift_table", r);
+  b.n1 = elt_(ws, p + "norm1.weight", r, true);
+  b.n2 = elt_(ws, p + "norm2.weight", r, true);
+  b.qn = elt_(ws, p + "attn.norm_q.weight", r, true);
+  b.kn = elt_(ws, p + "attn.norm_k.weight", r, true);
+  if (b.sst.empty() || b.n1.empty() || b.n2.empty() || b.qn.empty() ||
+      b.kn.empty()) {
+    if (err != nullptr) { *err = p + ": no norms or modulation table"; }
+    return false;
+  }
+  return true;
+}
+
+bool
+MetalKrea2Transformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
+{
+  if (b.byte_size() >= bytes) { return true; }
+  if (!b.empty() && _tp_pipe != nullptr) { _tp_pipe->forget(b); }
+  b = SharedBuffer{};
+  b = _mc->make_shared_buffer(bytes);
+  return !b.empty();
+}
+
+bool
+MetalKrea2Transformer::begin_tp_generation(std::shared_ptr<TpChannel> ch,
+                                           std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = "tensor parallel: " + why; }
+    return false;
+  };
+  end_tp_generation();
+  if (!_cfg.tp.active()) { return fail("this model is not a rank"); }
+  if (!ch) { return fail("no channel to the other ranks"); }
+  // Four lanes: a block's bands alternate between two for the attention's
+  // partials and two for the feed-forward's (forward_dit's rank tail).
+  auto pipe = std::make_unique<TpOverlap>(_mc, ch, 4, TpDType::kBF16);
+  if (!pipe->valid()) {
+    return fail("no events or thread for the exchanges");
+  }
+  _tp_ch = std::move(ch);
+  _tp_pipe = std::move(pipe);
+  _tp_seq = 0;
+  // The stop the stage set before the picture, which the channel polls
+  // while it waits on the others.
+  try {
+    _tp_ch->set_stop(_stream_stop);
+  } catch (...) {
+  }
+  return true;
+}
+
+void
+MetalKrea2Transformer::end_tp_generation()
+{
+  if (_tp_pipe == nullptr && !_tp_ch) { return; }
+  // An exchange still waiting on a peer would hold the worker the reset
+  // below joins: the channel told to stop waiting first.
+  if (_tp_pipe != nullptr && _tp_ch &&
+      (_tp_pipe->pending() || _tp_pipe->failed())) {
+    try {
+      _tp_ch->set_stop([]() { return true; });
+    } catch (...) {
+    }
+  }
+  _tp_pipe.reset();
+  // Every buffer the channel was handed forgotten before it goes (a
+  // transport may keep a device's registration of each).
+  if (_tp_ch) {
+    for (const SharedBuffer* b :
+         {&_tp_part[0], &_tp_part[1], &_tp_part[2], &_tp_part[3],
+          &_tp_recv[0], &_tp_recv[1], &_tp_recv[2], &_tp_recv[3]}) {
+      if (b->empty()) { continue; }
+      try {
+        _tp_ch->forget(b->contents(), b->byte_size());
+      } catch (...) {
+      }
+    }
+    try {
+      _tp_ch->set_stop({});
+    } catch (...) {
+    }
+  }
+  _tp_ch.reset();
+  _tp_seq = 0;
+  // THE BUFFERS GO WITH THE PICTURE. The plan books them with the
+  // forward's activations alone (forward_scratch_bytes), and the
+  // transport's registration of them went with the forget above; kept,
+  // they sat unbooked beside the decode and in a DiT kept warm.
+  for (SharedBuffer& b : _tp_part) { b = SharedBuffer{}; }
+  for (SharedBuffer& b : _tp_recv) { b = SharedBuffer{}; }
+}
+
 // ---- the streamed blocks' reusable destinations ------------------------
 
 // Shorthand for the per-tensor placement the refill needs stated.
@@ -989,10 +1303,22 @@ MetalKrea2Transformer::configure_slots_()
     // once the fused weight exists, which is right for a resident block
     // and impossible for a refillable one: the fuse has to be rebuilt
     // from them after every read.
-    return _ws && load_block_(*_ws,
-                              "transformer_blocks." + std::to_string(L) + ".",
-                              b, /*main_block=*/true, Retain::Streamed,
-                              /*keep_split=*/true);
+    if (!_ws) { return false; }
+    if (!_cfg.tp.active()) {
+      return load_block_(*_ws,
+                         "transformer_blocks." + std::to_string(L) + ".",
+                         b, /*main_block=*/true, Retain::Streamed,
+                         /*keep_split=*/true);
+    }
+    // A RANK's block is its share, cut at every read (load() turns the
+    // slots off for it).
+    std::string terr;
+    if (load_tp_block_(*_ws, L, b, &terr)) { return true; }
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt("MetalKrea2Transformer: tensor_parallel: "
+                               "block {}: {}", L, terr));
+    }
+    return false;
   };
   o.clone = [this](const Block& s, Block& d, bool copy) {
     return clone_block_(s, d, copy);
@@ -1036,6 +1362,8 @@ MetalKrea2Transformer::configure_slots_()
 
 MetalKrea2Transformer::~MetalKrea2Transformer()
 {
+  // A rank's channel let go (its buffers forgotten) before they are.
+  end_tp_generation();
   // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
   // so the machine recovers either way -- but the pool's own counter
   // would not, and a DiT freed for the vae-decode and reloaded on the
@@ -1371,6 +1699,43 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
     }
   }
 
+  // A RANK (Config::tp): its share, streamed then kept as any Krea-2's
+  // blocks are, nothing that reads the checkpoint's widths -- the ANE's
+  // modules, a runtime LoRA, the calibration -- and weights it can cut:
+  // dense or an affine pack. A share is WHOLE kv groups (load_tp_block_).
+  const bool rank = cfg.tp.active();
+  if (rank) {
+    const TpShare& t = cfg.tp;
+    const int G = cfg.n_kv_heads > 0 && cfg.n_heads % cfg.n_kv_heads == 0
+                      ? cfg.n_heads / cfg.n_kv_heads
+                      : 0;
+    std::string why;
+    if (t.n_heads != cfg.n_heads || t.n_ffn != cfg.ffn || t.heads() <= 0 ||
+        t.ffn() <= 0) {
+      why = fmt("a share of {} heads and {} feed-forward rows does not "
+                "fit this model's {} and {}", t.n_heads, t.n_ffn,
+                cfg.n_heads, cfg.ffn)();
+    } else if (G <= 0 || t.head0 % G != 0 || t.head1 % G != 0) {
+      why = fmt("a share's heads [{}, {}) are not whole groups of the {} "
+                "query heads that read one kv head", t.head0, t.head1, G)();
+    } else if (cfg.n_heads * cfg.head_dim != cfg.hidden) {
+      why = "its attention is not the model's width";
+    } else if (!loras.empty()) {
+      why = "not with a runtime LoRA yet";
+    } else if (cfg.session != nullptr || cfg.ane_qkv) {
+      why = "not with the Neural Engine's share";
+    } else if (m->_f8.any()) {
+      why = "a split DiT reads dense or affine weights only";
+    }
+    if (!why.empty()) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(fmt("MetalKrea2Transformer: tensor_parallel: "
+                                 "{}", why));
+      }
+      return nullptr;
+    }
+  }
+
   // The Krea-2 DiT runs in bf16 (f16's 65504 range overflows on real
   // conditioning through the 28-block residual/attention stream, and the
   // reference is bf16). Load the bf16 metallibs (VPIPE_ELT=bfloat); entry-point
@@ -1602,7 +1967,9 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   // Steel keeps it on. Skipped for dense/g32 (kernels are g64-only). Decided
   // BEFORE the blocks load (load_block_ interleaves when set).
   // VPIPE_KREA2_NO_FUSED_FF opts out entirely (A/B).
-  if (m->_quant_bits > 0 && m->_quant_group == 64 &&
+  // Not on a RANK: the weave interleaves whole gate | up pairs, and a
+  // rank's are its share, cut afresh at every read.
+  if (m->_quant_bits > 0 && m->_quant_group == 64 && !rank &&
       std::getenv("VPIPE_KREA2_NO_FUSED_FF") == nullptr &&
       (!m->_use_mma2 || std::getenv("VPIPE_KREA2_FUSED_FF") != nullptr)) {
     m->_fn_qmm_swiglu4 = m->_lib_qmm.function("affine_qmm_swiglu_w4g64");
@@ -1765,7 +2132,38 @@ MetalKrea2Transformer::load(std::shared_ptr<WeightSet> ws_in, MetalCompute* mc,
   // Streaming mode preloads NOTHING: the resident set is grown by
   // BlockResidency as free memory allows, which is what replaced the
   // pinned prefix. Loaded from `wts` here (read from the weight set).
-  if (!stream_blocks) {
+  if (rank && mc->session() != nullptr) {
+    const TpShare& t = cfg.tp;
+    mc->session()->info(fmt(
+        "MetalKrea2Transformer: rank {} of {}: heads [{}, {}) of {} (kv "
+        "[{}, {}) of {}), feed-forward rows [{}, {}) of {}{}", t.rank,
+        t.ranks, t.head0, t.head1, t.n_heads,
+        t.head0 * cfg.n_kv_heads / cfg.n_heads,
+        t.head1 * cfg.n_kv_heads / cfg.n_heads, cfg.n_kv_heads, t.ffn0,
+        t.ffn1, t.n_ffn, stream_blocks ? ", streamed then kept" : ""));
+  }
+  if (rank && stream_blocks) {
+    // A RANK STREAMS ON THE PER-BLOCK PATH, never a slot: a slot refills
+    // a block by its tensors whole, and a rank's block is its share, cut
+    // afresh at each read (load_tp_block_) in the layout its tier holds.
+    // Serial reads, then, until residency keeps the stack -- which a box
+    // with room does on the first forward.
+    m->_slots.disable();
+    m->_blocks.resize((std::size_t)cfg.n_layers);
+  } else if (rank) {
+    m->_blocks.resize((std::size_t)cfg.n_layers);
+    for (int L = 0; L < cfg.n_layers; ++L) {
+      std::string terr;
+      if (!m->load_tp_block_(ws, L, m->_blocks[(std::size_t)L], &terr)) {
+        if (mc->session() != nullptr) {
+          mc->session()->error(fmt("MetalKrea2Transformer: "
+                                   "tensor_parallel: block {}: {}", L,
+                                   terr));
+        }
+        return nullptr;
+      }
+    }
+  } else if (!stream_blocks) {
     m->_blocks.resize((std::size_t)cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; ++i) {
       if (!m->load_block_(ws,
@@ -1941,8 +2339,13 @@ MetalKrea2Transformer::ensure_dit_scratch_(int text_seq, int grid_h, int grid_w,
     }
   }
   const Config& c = _cfg;
-  const int HID = c.hidden, FF = c.ffn, TD = c.timestep_dim;
-  const int qd = c.n_heads * c.head_dim, kd = c.n_kv_heads * c.head_dim;
+  // A rank's head planes and feed-forward are its share's widths.
+  const bool rank = c.tp.active();
+  const int HID = c.hidden, TD = c.timestep_dim;
+  const int FF = rank ? c.tp.ffn() : c.ffn;
+  const int nh = rank ? c.tp.heads() : c.n_heads;
+  const int qd = nh * c.head_dim;
+  const int kd = nh * c.n_kv_heads / c.n_heads * c.head_dim;
   auto buf = [&](std::size_t e) { return _mc->make_shared_buffer(e * 2); };
   _dit.te_in = buf((std::size_t)TD);
   _dit.joint = buf((std::size_t)seq * HID);
@@ -1954,8 +2357,8 @@ MetalKrea2Transformer::ensure_dit_scratch_(int text_seq, int grid_h, int grid_w,
   _dit.n1    = buf((std::size_t)seq * HID);
   _dit.n2    = buf((std::size_t)seq * HID);
   _dit.nm    = buf((std::size_t)seq * HID);
-  _dit.gate  = buf((std::size_t)seq * HID);
-  _dit.att   = buf((std::size_t)seq * HID);
+  _dit.gate  = buf((std::size_t)seq * qd);
+  _dit.att   = buf((std::size_t)seq * qd);
   _dit.o     = buf((std::size_t)seq * HID);
   _dit.q     = buf((std::size_t)seq * qd);
   _dit.k     = buf((std::size_t)seq * kd);
@@ -2306,11 +2709,18 @@ MetalKrea2Transformer::sol_scratch_bytes(int seq) const
   // the whole scratch. `g` is the feed-forward's gate intermediate,
   // written only after the attention; `n1` dies at the pre-attention
   // adaLN. Both are dead for exactly the length of Sol's call.
+  // A RANK routes its share's heads over its share's `g`, as
+  // forward_scratch_bytes books it.
+  const bool rank = _cfg.tp.active();
+  const int nh = rank ? _cfg.tp.heads() : _cfg.n_heads;
+  const int nkv = rank ? _cfg.tp.heads() * _cfg.n_kv_heads / _cfg.n_heads
+                       : _cfg.n_kv_heads;
+  const int ff = rank ? _cfg.tp.ffn() : _cfg.ffn;
   const std::size_t s = (std::size_t)seq;
-  const std::size_t lend_g = s * (std::size_t)_cfg.ffn * 2;
+  const std::size_t lend_g = s * (std::size_t)ff * 2;
   const std::size_t lend_n = s * (std::size_t)_cfg.hidden * 2;
   return MetalSolAttention::private_bytes(
-      _cfg.n_heads, _cfg.n_kv_heads, seq, _cfg.head_dim, _cfg.sol.key_block,
+      nh, nkv, seq, _cfg.head_dim, _cfg.sol.key_block,
       _sol->uses_matrix_cores(), lend_g, lend_n);
 }
 
@@ -3200,10 +3610,32 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   int IS_REF = 0;
   for (const auto& r : refs) { IS_REF += r.seq; }
   const int IS = IS_GEN + IS_REF, seq = TS + IS;
-  const int HID = c.hidden, IC = c.in_channels, HED = c.n_heads;
-  const int KVH = c.n_kv_heads, HD = c.head_dim, FF = c.ffn, TD = c.timestep_dim;
+  // A RANK (Config::tp) runs its share's heads -- whole kv groups, so
+  // HED / KVH stays the model's GQA factor -- and feed-forward rows: HED,
+  // KVH and FF are its own, qd its heads' width; HID stays the model's.
+  const bool rank = c.tp.active();
+  const int HID = c.hidden, IC = c.in_channels;
+  const int HED = rank ? c.tp.heads() : c.n_heads;
+  const int KVH = rank ? c.tp.heads() * c.n_kv_heads / c.n_heads
+                       : c.n_kv_heads;
+  const int HD = c.head_dim, TD = c.timestep_dim;
+  const int FF = rank ? c.tp.ffn() : c.ffn;
   const int qd = HED * HD, kd = KVH * HD;         // 6144, 1536
   const float eps = c.norm_eps;
+  auto refuse = [&](const char* why) {
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt("MetalKrea2Transformer::forward_dit: {}",
+                               why));
+    }
+    return SharedBuffer{};
+  };
+  if (rank && _tp_pipe == nullptr) {
+    return refuse("a rank with no channel (begin_tp_generation)");
+  }
+  if (rank && _calib_on) {
+    return refuse("a rank runs no calibration (its activations are its "
+                  "share's)");
+  }
   if (TS <= 0 || IS_GEN <= 0
       || fused_text.byte_size() < (std::size_t)TS * HID * 2
       || latents.byte_size() < (std::size_t)IS_GEN * IC * 2) {
@@ -3301,7 +3733,9 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   // GPU so absolute step time inflates a little, but the RELATIVE breakdown is
   // faithful. Persistent scratch is all _dit members, so flushing mid-block is
   // safe (buffers outlive each commit; commit().wait() preserves ordering).
-  const bool prof = !_stream_blocks
+  // Not on a rank: a barrier between its posted exchanges would time the
+  // link, not the section.
+  const bool prof = !_stream_blocks && !rank
                     && std::getenv("VPIPE_KREA2_DIT_PROFILE") != nullptr;
   // ---- env-gated streaming split (VPIPE_KREA2_STREAM_PROFILE) ----------
   // What a weight PREFETCH could hide. The streamed path loads a block
@@ -3336,7 +3770,50 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
   // No-op once the shapes are settled.
   if (_i8) { _i8->tune_pending(_mc); }
 
+  // A RANK'S EXCHANGE BUFFERS, grown HERE to this forward's widest band
+  // (every block runs `seq` rows): a buffer replaced is forgotten first,
+  // and forget() waits out the exchanges posted on it -- mid-forward
+  // those wait on GPU work not yet committed. Nothing is pending between
+  // forwards.
+  std::vector<std::pair<int, int>> tp_bands;
+  int tp_lag = 1;
+  std::string tp_err;
+  if (rank) {
+    int forced = 0;
+    if (const char* e = std::getenv("VPIPE_KREA2_TP_BANDS")) {
+      forced = std::max(0, std::atoi(e));
+    }
+    if (const char* e = std::getenv("VPIPE_KREA2_TP_LAG")) {
+      tp_lag = std::atoi(e) == 0 ? 0 : 1;
+    }
+    tp_bands = tp_row_bands(seq, tp_band_floor(c.tp), forced);
+    int widest = 0;
+    for (const auto& bd : tp_bands) { widest = std::max(widest, bd.second); }
+    const std::size_t pb = (std::size_t)widest * (std::size_t)HID * 2;
+    const int lanes = tp_bands.size() > 1 ? 4 : 1;
+    for (int k = 0; k < lanes; ++k) {
+      if (!tp_buffer_(_tp_part[k], pb) || !tp_buffer_(_tp_recv[k], pb)) {
+        return refuse("tensor parallel: no room for the partial sums");
+      }
+    }
+  }
+
   CommandStream stream = _mc->make_command_stream();
+  // A RANK'S EXCHANGES LEFT POSTED when the forward ends early -- a stop
+  // between blocks, a failure -- their partials in work never committed,
+  // would hold the GPU's waits and the worker: abandoned here, after the
+  // encoder (its scope's) and before the stream goes (declared after
+  // it). The stack is committed after that scope closes, so a forward
+  // that ran to its end has none pending by the time this goes.
+  struct TpEnd {
+    TpOverlap* pipe;
+    ~TpEnd()
+    {
+      if (pipe != nullptr && pipe->pending()) {
+        pipe->abandon("the forward ended early");
+      }
+    }
+  } tp_end{rank ? _tp_pipe.get() : nullptr};
   // perf-flops: whatever an aborted forward left uncredited is dropped.
   _flops.begin();
   if (_sol) { _sol_flops.begin(); }
@@ -3888,12 +4365,12 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
                         {{&b.q, &q, 0, qd, !lb(&BlockLora::q).empty()},
                          {&b.k, &k, 0, kd, !lb(&BlockLora::k).empty()},
                          {&b.v, &v, 0, kd, !lb(&BlockLora::v).empty()},
-                         {&b.gate, &gate, 0, HID,
+                         {&b.gate, &gate, 0, qd,
                           !lb(&BlockLora::gate).empty()}})) {
         gemm(nm, b.q, q, 0, qg_rows, qd, HID, lb(&BlockLora::q));
         gemm(nm, b.k, k, 0, qg_rows, kd, HID, lb(&BlockLora::k));
         gemm(nm, b.v, v, 0, qg_rows, kd, HID, lb(&BlockLora::v));
-        gemm(nm, b.gate, gate, 0, qg_rows, HID, HID, lb(&BlockLora::gate));
+        gemm(nm, b.gate, gate, 0, qg_rows, qd, HID, lb(&BlockLora::gate));
       }
       if (q_rows > 0 || qkv_probe) {
         enc.end();
@@ -3997,242 +4474,350 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
         sdpa(qt, kt, vt, atb, scale, seq, HD, HED, KVH, seq, seq);
       }
       transpose(atb, att, HED, seq, HD);         // [H,seq,hd] -> [seq,H,hd]
-      elt3(_fn_mul_sigmoid, att, gate, att, seq * HID);
+      elt3(_fn_mul_sigmoid, att, gate, att, seq * qd);
       psplit(t_attn);
       if (_calib_on) { colmax(att, _cb_o[(std::size_t)L], seq, HID); }
-      gemm(att, b.o, o, 0, seq, HID, HID, lb(&BlockLora::o));
-      gated(joint, mod, 2 * HID, o, HID, seq * HID);          // += pregate*attn
-      psplit(t_oproj);
-      rms(joint, 0, b.n2, n2, 0, seq, HID);
-      adaln(n2, mod, 3 * HID, 4 * HID, nm, HID, seq * HID);
-      psplit(t_norm);
-      if (_calib_on) { colmax(nm, _cb_gu[(std::size_t)L], seq, HID); }
-      // The FUSED quantized feed-forward over the first `rows` rows of `nm`,
-      // into `o`. Fused interleaved gate|up. M5 mma: dequant + one matmul2d
-      // over the fused weight -> _dit.gu [rows, 2*FF], folded to g[rows, FF]
-      // by swiglu_interleaved. Steel: one GEMM whose register-local
-      // epilogue writes g = silu(gate)*up directly (no intermediates, no
-      // separate swiglu pass). N passed to either kernel is the fused 2*FF.
-      // A lambda over `rows` because the ANE split runs it for the GPU's
-      // HEAD rows: every kernel here reads from row 0 and writes at offset 0.
-      // Over `rows` rows of `x` (`nm`, or a subview of it from a later
-      // row), into `o` from element `ye`.
-      auto fused_ff = [&](const SharedBuffer& x, int rows, std::size_t ye) {
-        if (rows <= 0) { return; }
-        _flops.gemm(rows, 2 * FF, HID);   // the fused gate|up
-        if (!_dit.gu.empty() &&
-            gemm_mma_(enc, x, b.ff_gu, _dit.gu, 0, rows, 2 * FF, HID)) {
-          psplit(t_ffup);
-          enc.set_function(_fn_swiglu_inter);
-          enc.set_buffer(0, _dit.gu); enc.set_buffer(1, g);
-          enc.set_constant(2, rows); enc.set_constant(3, FF);
-          enc.dispatch({(unsigned)(rows * FF), 1, 1}, {256, 1, 1});
-          psplit(t_ffact);
-        } else {
-          // BM=128 fused-SwiGLU at high res (rows >= 1024): 4x fewer weight
-          // re-reads than the default BM=32 tile for the biggest DiT GEMM.
-          const bool huge = _qmm_tile == 2 && rows >= 1024 &&
-                            _fn_qmm_swiglu4_bm128.valid();
-          const bool a16  = _acc16 && !huge;
-          const int  bm   = huge ? 128 : 32;
-          const unsigned tgz = huge ? 4u : 2u;
-          enc.set_function(
-              b.ff_gu.bits == 8
-                  ? (huge ? _fn_qmm_swiglu8_bm128
-                          : (a16 ? _fn_qmm_swiglu8_a16 : _fn_qmm_swiglu8))
-                  : (huge ? _fn_qmm_swiglu4_bm128
-                          : (a16 ? _fn_qmm_swiglu4_a16 : _fn_qmm_swiglu4)));
-          enc.set_buffer(0, b.ff_gu.codes); enc.set_buffer(1, b.ff_gu.scales);
-          enc.set_buffer(2, b.ff_gu.qbias); enc.set_buffer(3, x);
-          enc.set_buffer(4, g);
-          enc.set_constant(5, HID); enc.set_constant(6, 2 * FF);
-          enc.set_constant(7, rows);
-          enc.dispatch({(unsigned)(((2 * FF + 31) / 32) * 32),
-                        (unsigned)(((rows + bm - 1) / bm) * 2), tgz},
-                       {32, 2, tgz});
-          psplit(t_ffup);
-          psplit(t_ffact);   // activation fused into the GEMM epilogue
+      // The split feed-forward over `rows` rows of `x` (`nm`, or a
+      // subview of it from a later row) into `out` from element `oe`:
+      // gate and up, the activation, the down projection. The unsplit
+      // GPU path (gpu_ff below) and a rank's bands share it.
+      auto ff_into = [&](const SharedBuffer& x, int rows,
+                         const SharedBuffer& out, std::size_t oe) {
+        if (!fast_shared_(enc, x, rows, HID,
+                          {{&b.ff_gate, &g, 0, FF,
+                            !lb(&BlockLora::ff_gate).empty()},
+                           {&b.ff_up, &u, 0, FF,
+                            !lb(&BlockLora::ff_up).empty()}})) {
+          gemm(x, b.ff_gate, g, 0, rows, FF, HID,
+               lb(&BlockLora::ff_gate));
+          gemm(x, b.ff_up, u, 0, rows, FF, HID, lb(&BlockLora::ff_up));
         }
+        psplit(t_ffup);
+        // FUSED: the down projection's int8 input quantized straight
+        // from gate and up, so the product is never stored -- the same
+        // codes swiglu + gemm_fast make. Not with an adapter on the
+        // down projection (it reads the bf16 product), nor while the
+        // calibration reads it. VPIPE_KREA2_NO_SWIGLU_FUSE=1 for the
+        // A/B.
+        {
+          const QWeight& dw = b.ff_down;
+          const SharedBuffer* dc = nullptr;
+          const SharedBuffer* dcs = nullptr;
+          if (!_calib_on && _i8 && dw.quantized && dw.gc > 0 &&
+              lb(&BlockLora::ff_down).empty() &&
+              rows <= mma_row_band(HID, FF) &&
+              std::getenv("VPIPE_KREA2_NO_SWIGLU_FUSE") == nullptr &&
+              _i8->fast_accepts(rows, HID, FF) &&
+              fast_operand_(enc, dw, &dc, &dcs) &&
+              _i8->gemm_fast_swiglu(enc, g, 0, u, 0, *dc, *dcs, dw.gc, out,
+                                    oe, rows, HID, FF)) {
+            _flops.gemm(rows, HID, FF);
+            return;             // the down GEMM's own split follows
+          }
+        }
+        elt3(_fn_swiglu, g, u, g, rows * FF);
+        psplit(t_ffact);
         if (_calib_on) { colmax(g, _cb_dn[(std::size_t)L], rows, FF); }
-        gemm(g, b.ff_down, o, ye, rows, HID, FF,
+        gemm(g, b.ff_down, out, oe, rows, HID, FF,
              lb(&BlockLora::ff_down));
       };
-      // A block on the ANE takes the SPLIT path below even when it is
-      // quantized: taking the fused path here instead bypassed the split
-      // entirely -- staging ran for every block and no row ever reached
-      // the ANE (a 4-bit forward came out identical to GPU-only).
-      if (!b.ff_gu.empty() && !ane_block && !ane_probe) {
-        fused_ff(nm, seq, 0);
-      } else {
-        // ---- the dense feed-forward, optionally split ------------
-        //
-        // Rows are independent here, so handing the ANE a contiguous
-        // band of them is EXACT -- no partial sums, no seam, and the
-        // residual below is untouched because it is applied after `o`
-        // is complete.
-        //
-        // The GPU takes the HEAD and the ANE the TAIL, which is not
-        // arbitrary: `gemm` writes at an output offset but always reads
-        // its input from zero, so head-to-GPU needs no new plumbing,
-        // while AneModule::run offsets both ends.
-        int a_rows = 0;
-        double ane_drain_ms = 0.0;
-        if (ane_block || ane_probe) {
-          // COMMIT this block's attention WITHOUT waiting, and only then
-          // wait for the staging job: this stack otherwise commits only at
-          // the drain, so joining first would overlap nothing but the
-          // encode. The GPU runs the attention while the worker finishes
-          // the weights, and `nm` is readable once both are done.
-          const auto t_d0 = std::chrono::steady_clock::now();
+      // A RANK'S BLOCK TAIL (Config::tp), from the gated attention's
+      // token-major output on. Its out projection and feed-forward are
+      // PARTIAL sums -- its heads' and rows' share of the block's -- each
+      // completed by the other ranks' sum before its gate: the attention's
+      // gated residual and the feed-forward's apart, so two a block. The
+      // rows are cut into bands (tp_row_bands: one, the block whole,
+      // unless the share was given a floor), each band's partial written
+      // straight into an EXCHANGE BUFFER (no copy) and POSTED (TpOverlap):
+      // the GPU signals it written, the worker hands it to the channel,
+      // and the GPU waits for the others' sum only where it adds it -- the
+      // encoder never waits. In GPU order step i runs A(i) -- band i's out
+      // projection, posted -- then B(i - 1) -- that band's sum added, its
+      // gated residual, the feed-forward's norm and modulation and the
+      // feed-forward, posted -- then C(i - 2) -- that sum added, its gated
+      // residual. Every row past the attention is its own (norm,
+      // modulation, SwiGLU), so a band needs nothing of another. Band i's
+      // first partial crosses under A(i + 1) and its second under the next
+      // step's work; what stays exposed is the last band's feed-forward,
+      // once a block. VPIPE_KREA2_TP_LAG=0 runs the steps band after band:
+      // no overlap, the same arithmetic. Lanes 0 / 1 carry the attention's
+      // partials, 2 / 3 the feed-forward's (a whole block: lane 0 both); a
+      // lane's next write follows the GPU's read of its sum before it.
+      auto rank_tail = [&]() -> bool {
+        const int nb = (int)tp_bands.size();
+        const int la = nb > 1 ? 2 : 1, lf = nb > 1 ? 2 : 0;
+        std::vector<std::uint64_t> va((std::size_t)nb), vc((std::size_t)nb);
+        auto post = [&](int lane, int n) {
+          const TpOverlap::Ticket t =
+              _tp_pipe->post(lane, _tp_part[lane], _tp_recv[lane],
+                             (std::size_t)n * (std::size_t)HID * 2,
+                             _tp_seq++);
+          // Between encoders, into the open command buffer: the signal
+          // after the dispatch that wrote the partial.
           enc.end();
-          _flops.flush(stream);
-          metal_compute::CommandStream::Fence afence = stream.commit();
-          // A STREAMED block issues its successor's read here too, not only
-          // at its end. The end-of-block prefetch hides the read under the
-          // block's final commit -- which on this path holds only the gated
-          // add, because attention and both engines' feed-forward are
-          // committed and waited above it. MEASURED on a 16 GB simulation:
-          // ~400 ms a block of serial reading, a 1.34x SLOWER denoise than
-          // the GPU alone. Issued here, the read runs under this block's
-          // attention, its GPU rows and the ANE's predict. Safe for the
-          // same reason the end-of-block one is: it lands in the OTHER slot,
-          // and this block's weights -- which staging is reading -- are
-          // untouched. The later call is a no-op while this read is
-          // outstanding.
-          if (streaming) {
-            int nxt = -1;
-            for (int n = L + 1; n < c.n_layers; ++n) {
-              const bool h = n < (int)_blocks.size() &&
-                             !_blocks[(std::size_t)n].q.empty();
-              if (!h) { nxt = n; break; }
-            }
-            _slots.prefetch(nxt);
-          }
-          const bool staged = ane_block && _ane->join_stage(L);
-          afence.wait();
-          ane_drain_ms = std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - t_d0).count();
-          if (staged) {
-            // Start the ANE on its rows NOW, before any of the GPU's
-            // feed-forward is encoded. Encoding the GPU's gate/up/swiglu
-            // before this drain put them INSIDE the drained section, where
-            // they overlap nothing -- leaving only the down projection
-            // (17-19 ms) to hide 28-40 ms of ANE behind, which profiled at
-            // 48-62% hidden. Started here, the ANE hides behind the GPU's
-            // WHOLE feed-forward.
-            a_rows = _ane->begin(nm, o, seq);
-          } else if (ane_block && _cfg.session != nullptr) {
-            _cfg.session->warn(fmt("krea2: staging block {}'s weights for "
-                                   "the ANE failed; it keeps the GPU "
-                                   "feed-forward", L));
-          }
+          stream.encode_signal(*t.ready, t.ready_at);
           enc = stream.begin_compute();
+          return t.done_at;
+        };
+        auto await = [&](std::uint64_t v) {
+          enc.end();
+          stream.encode_wait(_tp_pipe->done(), v);
+          enc = stream.begin_compute();
+        };
+        // Rows [r0, r0 + n) of a [seq, w] plane.
+        auto rows_of = [&](const SharedBuffer& b, int r0, int n, int w) {
+          return b.subview((std::size_t)r0 * (std::size_t)w * 2,
+                           (std::size_t)n * (std::size_t)w * 2);
+        };
+        auto step_a = [&](int k) {
+          const int r0 = tp_bands[(std::size_t)k].first;
+          const int n = tp_bands[(std::size_t)k].second;
+          gemm(rows_of(att, r0, n, qd), b.o, _tp_part[k % la], 0, n, HID,
+               qd);
+          va[(std::size_t)k] = post(k % la, n);
+        };
+        auto step_b = [&](int k) {
+          const int r0 = tp_bands[(std::size_t)k].first;
+          const int n = tp_bands[(std::size_t)k].second;
+          const SharedBuffer& p = _tp_part[k % la];
+          await(va[(std::size_t)k]);
+          elt3(_fn_residual, p, _tp_recv[k % la], p, n * HID);
+          const SharedBuffer jb = rows_of(joint, r0, n, HID);
+          gated(jb, mod, 2 * HID, p, HID, n * HID);   // += pregate*attn
+          rms(joint, (std::size_t)r0 * HID, b.n2, n2,
+              (std::size_t)r0 * HID, n, HID);
+          const SharedBuffer xb = rows_of(nm, r0, n, HID);
+          adaln(rows_of(n2, r0, n, HID), mod, 3 * HID, 4 * HID, xb, HID,
+                n * HID);
+          ff_into(xb, n, _tp_part[lf + k % la], 0);
+          vc[(std::size_t)k] = post(lf + k % la, n);
+        };
+        auto step_c = [&](int k) {
+          const int r0 = tp_bands[(std::size_t)k].first;
+          const int n = tp_bands[(std::size_t)k].second;
+          const SharedBuffer& p = _tp_part[lf + k % la];
+          await(vc[(std::size_t)k]);
+          elt3(_fn_residual, p, _tp_recv[lf + k % la], p, n * HID);
+          gated(rows_of(joint, r0, n, HID), mod, 5 * HID, p, HID,
+                n * HID);                             // += postgate*ff
+        };
+        for (int i = 0; i < nb + 2 * tp_lag; ++i) {
+          if (i < nb) { step_a(i); }
+          if (i - tp_lag >= 0 && i - tp_lag < nb) { step_b(i - tp_lag); }
+          if (i - 2 * tp_lag >= 0 && i - 2 * tp_lag < nb) {
+            step_c(i - 2 * tp_lag);
+          }
         }
-        const int g_rows = seq - a_rows;
-
-        // The GPU's share, as one lambda so the split, the unsplit path
-        // and the ANE's lost rows cannot drift: whatever rows it is given,
-        // [r0, r0 + rows), it does the whole feed-forward over them.
-        // `gemm` reads its input from row 0, so a later band is handed
-        // `nm` from r0 on.
-        auto gpu_ff = [&](int r0, int rows) {
+        if (_tp_pipe->failed()) {
+          tp_err = _tp_pipe->error();
+          return false;
+        }
+        return true;
+      };
+      if (rank) {
+        if (!rank_tail()) {
+          if (_stream_stop && _stream_stop()) { return {}; }
+          return refuse(fmt("tensor parallel: {}", tp_err)().c_str());
+        }
+      } else {
+        gemm(att, b.o, o, 0, seq, HID, HID, lb(&BlockLora::o));
+        gated(joint, mod, 2 * HID, o, HID, seq * HID);        // += pregate*attn
+        psplit(t_oproj);
+        rms(joint, 0, b.n2, n2, 0, seq, HID);
+        adaln(n2, mod, 3 * HID, 4 * HID, nm, HID, seq * HID);
+        psplit(t_norm);
+        if (_calib_on) { colmax(nm, _cb_gu[(std::size_t)L], seq, HID); }
+        // The FUSED quantized feed-forward over the first `rows` rows of `nm`,
+        // into `o`. Fused interleaved gate|up. M5 mma: dequant + one matmul2d
+        // over the fused weight -> _dit.gu [rows, 2*FF], folded to g[rows, FF]
+        // by swiglu_interleaved. Steel: one GEMM whose register-local
+        // epilogue writes g = silu(gate)*up directly (no intermediates, no
+        // separate swiglu pass). N passed to either kernel is the fused 2*FF.
+        // A lambda over `rows` because the ANE split runs it for the GPU's
+        // HEAD rows: every kernel here reads from row 0 and writes at offset 0.
+        // Over `rows` rows of `x` (`nm`, or a subview of it from a later
+        // row), into `o` from element `ye`.
+        auto fused_ff = [&](const SharedBuffer& x, int rows, std::size_t ye) {
           if (rows <= 0) { return; }
-          SharedBuffer sub;
-          if (r0 > 0) {
-            sub = nm.subview((std::size_t)r0 * HID * 2,
-                             (std::size_t)rows * HID * 2);
+          _flops.gemm(rows, 2 * FF, HID);   // the fused gate|up
+          if (!_dit.gu.empty() &&
+              gemm_mma_(enc, x, b.ff_gu, _dit.gu, 0, rows, 2 * FF, HID)) {
+            psplit(t_ffup);
+            enc.set_function(_fn_swiglu_inter);
+            enc.set_buffer(0, _dit.gu); enc.set_buffer(1, g);
+            enc.set_constant(2, rows); enc.set_constant(3, FF);
+            enc.dispatch({(unsigned)(rows * FF), 1, 1}, {256, 1, 1});
+            psplit(t_ffact);
+          } else {
+            // BM=128 fused-SwiGLU at high res (rows >= 1024): 4x fewer weight
+            // re-reads than the default BM=32 tile for the biggest DiT GEMM.
+            const bool huge = _qmm_tile == 2 && rows >= 1024 &&
+                              _fn_qmm_swiglu4_bm128.valid();
+            const bool a16  = _acc16 && !huge;
+            const int  bm   = huge ? 128 : 32;
+            const unsigned tgz = huge ? 4u : 2u;
+            enc.set_function(
+                b.ff_gu.bits == 8
+                    ? (huge ? _fn_qmm_swiglu8_bm128
+                            : (a16 ? _fn_qmm_swiglu8_a16 : _fn_qmm_swiglu8))
+                    : (huge ? _fn_qmm_swiglu4_bm128
+                            : (a16 ? _fn_qmm_swiglu4_a16 : _fn_qmm_swiglu4)));
+            enc.set_buffer(0, b.ff_gu.codes); enc.set_buffer(1, b.ff_gu.scales);
+            enc.set_buffer(2, b.ff_gu.qbias); enc.set_buffer(3, x);
+            enc.set_buffer(4, g);
+            enc.set_constant(5, HID); enc.set_constant(6, 2 * FF);
+            enc.set_constant(7, rows);
+            enc.dispatch({(unsigned)(((2 * FF + 31) / 32) * 32),
+                          (unsigned)(((rows + bm - 1) / bm) * 2), tgz},
+                         {32, 2, tgz});
+            psplit(t_ffup);
+            psplit(t_ffact);   // activation fused into the GEMM epilogue
           }
-          const SharedBuffer& x = r0 > 0 ? sub : nm;
-          const std::size_t ye = (std::size_t)r0 * HID;
-          // A quantized block's GPU rows run the FUSED kernels whenever the
-          // fused weight exists: it is the faster GPU path, and a promoted
-          // or preloaded block has released its split gate/up anyway.
-          if (!b.ff_gu.empty()) {
-            fused_ff(x, rows, ye);
-            return;
-          }
-          if (!fast_shared_(enc, x, rows, HID,
-                            {{&b.ff_gate, &g, 0, FF,
-                              !lb(&BlockLora::ff_gate).empty()},
-                             {&b.ff_up, &u, 0, FF,
-                              !lb(&BlockLora::ff_up).empty()}})) {
-            gemm(x, b.ff_gate, g, 0, rows, FF, HID,
-                 lb(&BlockLora::ff_gate));
-            gemm(x, b.ff_up, u, 0, rows, FF, HID, lb(&BlockLora::ff_up));
-          }
-          psplit(t_ffup);
-          // FUSED: the down projection's int8 input quantized straight
-          // from gate and up, so the product is never stored -- the same
-          // codes swiglu + gemm_fast make. Not with an adapter on the
-          // down projection (it reads the bf16 product), nor while the
-          // calibration reads it. VPIPE_KREA2_NO_SWIGLU_FUSE=1 for the
-          // A/B.
-          {
-            const QWeight& dw = b.ff_down;
-            const SharedBuffer* dc = nullptr;
-            const SharedBuffer* dcs = nullptr;
-            if (!_calib_on && _i8 && dw.quantized && dw.gc > 0 &&
-                lb(&BlockLora::ff_down).empty() &&
-                rows <= mma_row_band(HID, FF) &&
-                std::getenv("VPIPE_KREA2_NO_SWIGLU_FUSE") == nullptr &&
-                _i8->fast_accepts(rows, HID, FF) &&
-                fast_operand_(enc, dw, &dc, &dcs) &&
-                _i8->gemm_fast_swiglu(enc, g, 0, u, 0, *dc, *dcs, dw.gc, o,
-                                      ye, rows, HID, FF)) {
-              _flops.gemm(rows, HID, FF);
-              return;             // the down GEMM's own split follows
-            }
-          }
-          elt3(_fn_swiglu, g, u, g, rows * FF);
-          psplit(t_ffact);
           if (_calib_on) { colmax(g, _cb_dn[(std::size_t)L], rows, FF); }
           gemm(g, b.ff_down, o, ye, rows, HID, FF,
                lb(&BlockLora::ff_down));
         };
-
-        if (a_rows == 0 && ane_probe) {
-          // The GPU over every row, drained, for the on/off measurement.
-          const auto t_p0 = std::chrono::steady_clock::now();
-          gpu_ff(0, seq);
-          enc.end();
-          _flops.flush(stream);
-          stream.commit().wait();
-          _ane->note_probe(ane_drain_ms,
-                           std::chrono::duration<double, std::milli>(
-                               std::chrono::steady_clock::now() - t_p0)
-                               .count());
-          enc = stream.begin_compute();
-        } else if (a_rows == 0) {
-          gpu_ff(0, seq);
+        // A block on the ANE takes the SPLIT path below even when it is
+        // quantized: taking the fused path here instead bypassed the split
+        // entirely -- staging ran for every block and no row ever reached
+        // the ANE (a 4-bit forward came out identical to GPU-only).
+        if (!b.ff_gu.empty() && !ane_block && !ane_probe) {
+          fused_ff(nm, seq, 0);
         } else {
-          // ---- the two engines, concurrently --------------------
+          // ---- the dense feed-forward, optionally split ------------
           //
-          // The GPU's WHOLE feed-forward over its rows, on this thread,
-          // while the ANE works. Sound because the two engines touch
-          // disjoint ROWS of `o` (GPU [0, g_rows), ANE [g_rows, seq)) -- no
-          // race on the output and no barrier to express, which is just as
-          // well since CoreML offers no Metal-shared-event interop to
-          // express one with.
-          const auto t_g0 = std::chrono::steady_clock::now();
-          gpu_ff(0, g_rows);
-          enc.end();
-          _flops.flush(stream);
-          stream.commit().wait();
-          const double t_gpu =
-              _ane->timing()
-                  ? std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t_g0).count()
-                  : 0.0;
-          const bool ane_ok = _ane->finish(L, seq, t_gpu, ane_drain_ms);
-          enc = stream.begin_compute();
-          // THE GPU FALLBACK: `nm` is only the tier's input, so the rows
-          // it lost run again from it, before the gated add reads `o`.
-          const int lost = ane_ok ? -1 : _ane->lost_row0();
-          if (lost >= 0 && lost < seq) { gpu_ff(lost, seq - lost); }
+          // Rows are independent here, so handing the ANE a contiguous
+          // band of them is EXACT -- no partial sums, no seam, and the
+          // residual below is untouched because it is applied after `o`
+          // is complete.
+          //
+          // The GPU takes the HEAD and the ANE the TAIL, which is not
+          // arbitrary: `gemm` writes at an output offset but always reads
+          // its input from zero, so head-to-GPU needs no new plumbing,
+          // while AneModule::run offsets both ends.
+          int a_rows = 0;
+          double ane_drain_ms = 0.0;
+          if (ane_block || ane_probe) {
+            // COMMIT this block's attention WITHOUT waiting, and only then
+            // wait for the staging job: this stack otherwise commits only at
+            // the drain, so joining first would overlap nothing but the
+            // encode. The GPU runs the attention while the worker finishes
+            // the weights, and `nm` is readable once both are done.
+            const auto t_d0 = std::chrono::steady_clock::now();
+            enc.end();
+            _flops.flush(stream);
+            metal_compute::CommandStream::Fence afence = stream.commit();
+            // A STREAMED block issues its successor's read here too, not only
+            // at its end. The end-of-block prefetch hides the read under the
+            // block's final commit -- which on this path holds only the gated
+            // add, because attention and both engines' feed-forward are
+            // committed and waited above it. MEASURED on a 16 GB simulation:
+            // ~400 ms a block of serial reading, a 1.34x SLOWER denoise than
+            // the GPU alone. Issued here, the read runs under this block's
+            // attention, its GPU rows and the ANE's predict. Safe for the
+            // same reason the end-of-block one is: it lands in the OTHER slot,
+            // and this block's weights -- which staging is reading -- are
+            // untouched. The later call is a no-op while this read is
+            // outstanding.
+            if (streaming) {
+              int nxt = -1;
+              for (int n = L + 1; n < c.n_layers; ++n) {
+                const bool h = n < (int)_blocks.size() &&
+                               !_blocks[(std::size_t)n].q.empty();
+                if (!h) { nxt = n; break; }
+              }
+              _slots.prefetch(nxt);
+            }
+            const bool staged = ane_block && _ane->join_stage(L);
+            afence.wait();
+            ane_drain_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_d0).count();
+            if (staged) {
+              // Start the ANE on its rows NOW, before any of the GPU's
+              // feed-forward is encoded. Encoding the GPU's gate/up/swiglu
+              // before this drain put them INSIDE the drained section, where
+              // they overlap nothing -- leaving only the down projection
+              // (17-19 ms) to hide 28-40 ms of ANE behind, which profiled at
+              // 48-62% hidden. Started here, the ANE hides behind the GPU's
+              // WHOLE feed-forward.
+              a_rows = _ane->begin(nm, o, seq);
+            } else if (ane_block && _cfg.session != nullptr) {
+              _cfg.session->warn(fmt("krea2: staging block {}'s weights for "
+                                     "the ANE failed; it keeps the GPU "
+                                     "feed-forward", L));
+            }
+            enc = stream.begin_compute();
+          }
+          const int g_rows = seq - a_rows;
+
+          // The GPU's share, as one lambda so the split, the unsplit path
+          // and the ANE's lost rows cannot drift: whatever rows it is given,
+          // [r0, r0 + rows), it does the whole feed-forward over them.
+          // `gemm` reads its input from row 0, so a later band is handed
+          // `nm` from r0 on.
+          auto gpu_ff = [&](int r0, int rows) {
+            if (rows <= 0) { return; }
+            SharedBuffer sub;
+            if (r0 > 0) {
+              sub = nm.subview((std::size_t)r0 * HID * 2,
+                               (std::size_t)rows * HID * 2);
+            }
+            const SharedBuffer& x = r0 > 0 ? sub : nm;
+            const std::size_t ye = (std::size_t)r0 * HID;
+            // A quantized block's GPU rows run the FUSED kernels whenever the
+            // fused weight exists: it is the faster GPU path, and a promoted
+            // or preloaded block has released its split gate/up anyway.
+            if (!b.ff_gu.empty()) {
+              fused_ff(x, rows, ye);
+              return;
+            }
+            ff_into(x, rows, o, ye);
+          };
+
+          if (a_rows == 0 && ane_probe) {
+            // The GPU over every row, drained, for the on/off measurement.
+            const auto t_p0 = std::chrono::steady_clock::now();
+            gpu_ff(0, seq);
+            enc.end();
+            _flops.flush(stream);
+            stream.commit().wait();
+            _ane->note_probe(ane_drain_ms,
+                             std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_p0)
+                                 .count());
+            enc = stream.begin_compute();
+          } else if (a_rows == 0) {
+            gpu_ff(0, seq);
+          } else {
+            // ---- the two engines, concurrently --------------------
+            //
+            // The GPU's WHOLE feed-forward over its rows, on this thread,
+            // while the ANE works. Sound because the two engines touch
+            // disjoint ROWS of `o` (GPU [0, g_rows), ANE [g_rows, seq)) -- no
+            // race on the output and no barrier to express, which is just as
+            // well since CoreML offers no Metal-shared-event interop to
+            // express one with.
+            const auto t_g0 = std::chrono::steady_clock::now();
+            gpu_ff(0, g_rows);
+            enc.end();
+            _flops.flush(stream);
+            stream.commit().wait();
+            const double t_gpu =
+                _ane->timing()
+                    ? std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t_g0).count()
+                    : 0.0;
+            const bool ane_ok = _ane->finish(L, seq, t_gpu, ane_drain_ms);
+            enc = stream.begin_compute();
+            // THE GPU FALLBACK: `nm` is only the tier's input, so the rows
+            // it lost run again from it, before the gated add reads `o`.
+            const int lost = ane_ok ? -1 : _ane->lost_row0();
+            if (lost >= 0 && lost < seq) { gpu_ff(lost, seq - lost); }
+          }
         }
+        gated(joint, mod, 5 * HID, o, HID, seq * HID);        // += postgate*ff
+        psplit(t_ff);
       }
-      gated(joint, mod, 5 * HID, o, HID, seq * HID);          // += postgate*ff
-      psplit(t_ff);
       if (streaming) {
         const auto gp0 = sp_now();
         // COMMIT, then issue the next block's read, then WAIT. Between
@@ -4348,6 +4933,13 @@ MetalKrea2Transformer::forward_dit(const SharedBuffer& fused_text, int text_seq,
       return {};
     }
   }
+  // A RANK's exchange that failed after its block was encoded let the GPU
+  // run on with wrong sums (TpOverlap releases its waits): said here.
+  if (rank && _tp_pipe->failed()) {
+    if (_stream_stop && _stream_stop()) { return {}; }
+    return refuse(
+        fmt("tensor parallel: {}", _tp_pipe->error())().c_str());
+  }
   // Every routed layer has run, so Sol's count is this forward's whole.
   if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   // A GEMM whose FP8 weight had no scratch to expand into was skipped,
@@ -4405,15 +4997,32 @@ MetalKrea2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
   const std::size_t I = img_rows > 0 ? (std::size_t)img_rows : 0;
   const std::size_t T = txt_rows > 0 ? (std::size_t)txt_rows : 0;
   const std::size_t S = I + T;                 // the joint sequence
-  const std::size_t H = (std::size_t)c.hidden, F = (std::size_t)c.ffn;
+  // A RANK's (c.tp) head planes are its heads' width and its
+  // feed-forward its rows', and it holds its EXCHANGE BUFFERS -- a
+  // partial and the others' sum a lane, at the widest band of the joint
+  // rows (tp_row_bands; four lanes banded, one whole).
+  const bool rank = c.tp.active();
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t F = rank ? (std::size_t)c.tp.ffn() : (std::size_t)c.ffn;
   const std::size_t D = (std::size_t)c.head_dim;
-  const std::size_t qd = (std::size_t)c.n_heads * D;
-  const std::size_t kd = (std::size_t)c.n_kv_heads * D;
+  const int nh = rank ? c.tp.heads() : c.n_heads;
+  const int nkv = rank ? c.tp.heads() * c.n_kv_heads / c.n_heads
+                       : c.n_kv_heads;
+  const std::size_t qd = (std::size_t)nh * D;
+  const std::size_t kd = (std::size_t)nkv * D;
   // DitScratch (ensure_dit_scratch_), held across steps AND generations:
-  // joint n1 n2 nm gate att o [S, H]; q qt atb [S, qd]; k v kt vt
+  // joint n1 n2 nm o [S, H]; q qt atb gate att [S, qd]; k v kt vt
   // [S, kd]; g u [S, F]; the f32 rotary pair [S, D]; te_in .. modf.
-  std::size_t n = S * (2 * (7 * H + 3 * qd + 4 * kd + 2 * F) + 8 * D) +
+  std::size_t n = S * (2 * (5 * H + 5 * qd + 4 * kd + 2 * F) + 8 * D) +
                   ((std::size_t)c.timestep_dim + 17 * H) * 2;
+  if (rank && S > 0) {
+    const auto bands = tp_row_bands((int)S, tp_band_floor(c.tp));
+    std::size_t widest = 0;
+    for (const auto& bd : bands) {
+      widest = std::max(widest, (std::size_t)bd.second);
+    }
+    n += (bands.size() > 1 ? 4u : 1u) * 2 * widest * H * 2;
+  }
   // Per forward: bf16 latents, the velocity and its f16 copy; the fused
   // text the stage holds (a second under CFG).
   n += 3 * I * (std::size_t)c.in_channels * 2 + 2 * T * H * 2;
@@ -4434,16 +5043,168 @@ MetalKrea2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
   if (c.sol.enabled && c.sol.dense_layers < c.n_layers) {
     // What Sol cannot carve from the g and n1 the forward lends it.
     const std::size_t lg = S * F * 2, ln = S * H * 2;
-    n += MetalSolAttention::private_bytes(c.n_heads, c.n_kv_heads, (int)S,
+    n += MetalSolAttention::private_bytes(nh, nkv, (int)S,
                                           c.head_dim, c.sol.key_block, true,
                                           lg, ln);
   }
   if (c.sage.enabled && c.sage.dense_layers < c.n_layers) {
     n += MetalSageAttention::scratch_bytes(
-        c.n_heads, c.n_kv_heads, (int)S, (int)S, c.head_dim,
+        nh, nkv, (int)S, (int)S, c.head_dim,
         MetalSageAttention::nax_query_block(),
         MetalSageAttention::nax_key_block(), c.sage.pv8);
   }
+  return n;
+}
+
+// One main block's SHARE as tp_qw_ leaves it, off the headers: its eight
+// projections at the share's rows and columns, in the layout each takes
+// -- on the int8 fast / token tier (`fast`, the context load() makes
+// when the tier engages) an affine share converted where its columns
+// take a group (a w4 one only where Config::i8_hold_w4 holds it, else
+// its pack) and a dense one quantized (a dense checkpoint's alone);
+// else bf16, or an affine pack's codes, scales and biases -- and its
+// norms and modulation table whole.
+std::size_t
+MetalKrea2Transformer::tp_block_bytes_(const MetalLlamaWeights& src,
+                                       const Config& c,
+                                       const I8GemmContext* fast,
+                                       const std::string& pfx)
+{
+  const TpShare& t = c.tp;
+  const std::size_t H = (std::size_t)c.hidden, F = (std::size_t)c.ffn;
+  const std::size_t D = (std::size_t)c.head_dim;
+  const std::size_t qd = (std::size_t)c.n_heads * D;
+  const std::size_t kd = (std::size_t)c.n_kv_heads * D;
+  const std::size_t hi = (std::size_t)t.heads() * D;
+  const std::size_t ki = hi * (std::size_t)c.n_kv_heads /
+                         (std::size_t)c.n_heads;
+  const std::size_t f = (std::size_t)t.ffn();
+  const bool pack = src.info(pfx + "attn.to_q.scales") != nullptr;
+  // [rows] x [cols] of an [N, K] weight.
+  auto proj = [&](const std::string& nm, std::size_t N, std::size_t K,
+                  std::size_t rows, std::size_t cols) -> std::size_t {
+    const auto* ci = src.info(nm + ".weight");
+    const auto* si = src.info(nm + ".scales");
+    const std::size_t share = rows * cols;
+    const int fgc = fast != nullptr ? fast->fast_group((int)cols) : 0;
+    const std::size_t layout =
+        fgc > 0 ? share + I8GemmContext::fast_scale_bytes(
+                              (int)rows, (int)cols, fgc)
+                : 0;
+    if (ci != nullptr && si != nullptr && si->shape.size() == 2 &&
+        si->shape[1] > 0 && N * K > 0) {
+      const std::size_t bits = (std::size_t)ci->nbytes * 8 / (N * K);
+      const std::size_t g = std::max<std::size_t>(
+          K / (std::size_t)si->shape[1], 1);
+      const std::size_t as_pack = share * bits / 8 + 2 * (share / g) * 2;
+      if (fgc > 0 && g == 64 && fast->fast_converts((int)bits, fgc) &&
+          (bits == 8 || c.i8_hold_w4)) {
+        return layout;
+      }
+      return as_pack;
+    }
+    return fgc > 0 && !pack ? layout : share * 2;
+  };
+  // A tensor whole, as bf16.
+  auto whole = [&](const std::string& nm) -> std::size_t {
+    const auto* ti = src.info(nm);
+    if (ti == nullptr) { return 0; }
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    return n * 2;
+  };
+  return proj(pfx + "attn.to_q", qd, H, hi, H) +
+         proj(pfx + "attn.to_k", kd, H, ki, H) +
+         proj(pfx + "attn.to_v", kd, H, ki, H) +
+         proj(pfx + "attn.to_gate", qd, H, hi, H) +
+         proj(pfx + "attn.to_out.0", H, qd, H, hi) +
+         proj(pfx + "ff.gate", F, H, f, H) +
+         proj(pfx + "ff.up", F, H, f, H) +
+         proj(pfx + "ff.down", H, F, H, f) +
+         whole(pfx + "scale_shift_table") + whole(pfx + "norm1.weight") +
+         whole(pfx + "norm2.weight") + whole(pfx + "attn.norm_q.weight") +
+         whole(pfx + "attn.norm_k.weight");
+}
+
+std::size_t
+MetalKrea2Transformer::tp_held_bytes(const std::string& dir,
+                                     const Config& c, MetalCompute* mc,
+                                     std::size_t* floor)
+{
+  if (floor != nullptr) { *floor = 0; }
+  if (!c.tp.active() || dir.empty()) { return 0; }
+  auto wts = MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return 0; }
+  // The int8 tier as load() decides it, on a context made as it makes
+  // one: no matrix cores, the accurate tier, or a pack of another group,
+  // and the shares stay as cut.
+  std::unique_ptr<I8GemmContext> i8;
+  if (mc != nullptr && c.i8_gemm && c.i8_tier > 0 &&
+      mc->supports_matrix_cores() &&
+      std::getenv("VPIPE_KREA2_NO_MMA2") == nullptr) {
+    i8 = std::make_unique<I8GemmContext>(mc, true, /*bf16=*/true);
+    i8->set_tier(c.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : c.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                  : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(c.i8_tier == 2);
+    if (!i8->enabled() || i8->fast_group(c.hidden) <= 0) { i8.reset(); }
+  }
+  if (i8 != nullptr) {
+    const auto* si = wts->info("transformer_blocks.0.attn.to_q.scales");
+    if (si != nullptr && si->shape.size() == 2 && si->shape[1] > 0 &&
+        c.hidden / (int)si->shape[1] != 64) {
+      i8.reset();
+    }
+  }
+  // The trunk: every tensor outside the main blocks -- the text-fusion
+  // tower whole among them -- bf16 (narrowed from F32 or F16) or a pack's
+  // codes as stored.
+  std::size_t trunk = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.rfind("transformer_blocks.", 0) == 0) { continue; }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    const bool fl = ti->dtype == "F32" || ti->dtype == "F16" ||
+                    ti->dtype == "BF16";
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    trunk += fl ? n * 2 : (std::size_t)ti->nbytes;
+  }
+  std::size_t held = trunk, widest = 0;
+  for (int L = 0; L < c.n_layers; ++L) {
+    const std::size_t b = tp_block_bytes_(
+        *wts, c, i8.get(), "transformer_blocks." + std::to_string(L) + ".");
+    held += b;
+    widest = std::max(widest, b);
+  }
+  if (floor != nullptr) { *floor = trunk + 2 * widest; }
+  return held;
+}
+
+std::uint64_t
+MetalKrea2Transformer::resident_bytes() const
+{
+  std::uint64_t n = qw_bytes_(_projector) + _txt_norm.byte_size() +
+                    qw_bytes_(_txt_l1w) + _txt_l1b.byte_size() +
+                    qw_bytes_(_txt_l2w) + _txt_l2b.byte_size() +
+                    qw_bytes_(_img_in_w) + _img_in_b.byte_size() +
+                    qw_bytes_(_te_l1w) + qw_bytes_(_te_l2w) +
+                    _te_l1b.byte_size() + _te_l2b.byte_size() +
+                    qw_bytes_(_tmp_w) + _tmp_b.byte_size() +
+                    _final_sst.byte_size() + _final_norm.byte_size() +
+                    qw_bytes_(_final_lw) + _final_lb.byte_size();
+  // block_bytes_ leaves a main block's modulation table out (residency
+  // books its projections and norms): counted here.
+  auto blk = [](const Block& b) {
+    return (std::uint64_t)(block_bytes_(b) + b.sst.byte_size());
+  };
+  for (const Block& b : _layerwise) { n += blk(b); }
+  for (const Block& b : _refiner) { n += blk(b); }
+  // `_blocks` IS the answer in both modes: preloaded, the whole stack;
+  // streaming, exactly what residency promoted.
+  for (const Block& b : _blocks) { n += blk(b); }
+  // And the slot pair while it exists, beside every promoted block.
+  n += _slots.held_bytes();
   return n;
 }
 

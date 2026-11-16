@@ -64,6 +64,13 @@ inline constexpr std::string_view kMinBandRows = "min_band_rows";
 // see TpTransport::open.
 inline constexpr std::string_view kChannel = "channel";
 inline constexpr std::string_view kChannelDecode = "decode";
+// A MiniMax H3 rank may band a prompt longer than its band: its blocks
+// banded whatever the prompt's length, its text refiner in bands of its
+// own, each band's partials exchanged. The ranks must cut the same
+// bands, so a host states it (true) for both, and only to a peer listing
+// "tensor-parallel-prompt-bands/1". Unsaid, a prompt longer than a band
+// runs every block whole, as an older rank's does.
+inline constexpr std::string_view kPromptBands = "prompt_bands";
 }  // namespace tp_extra
 
 // One rank's share: [head0, head1) of the model's `n_heads` attention

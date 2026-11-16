@@ -185,7 +185,7 @@ AudioTemporalResampleStage::AudioTemporalResampleStage(
 
 AudioTemporalResampleStage::~AudioTemporalResampleStage()
 {
-  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
+  const FFmpegLibraries* libs = _frame_libs;
   if (libs != nullptr && libs->avutil().api.frame_free != nullptr) {
     if (_in_frame  != nullptr) { libs->avutil().api.frame_free(&_in_frame); }
     if (_out_frame != nullptr) { libs->avutil().api.frame_free(&_out_frame); }
@@ -316,6 +316,7 @@ AudioTemporalResampleStage::ensure_graph_(int rate, int channels)
   }
   const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
   if (libs == nullptr || !libs->avfilter().valid()) { return false; }
+  _frame_libs = libs;
   if (_in_frame == nullptr)  { _in_frame  = libs->avutil().api.frame_alloc(); }
   if (_out_frame == nullptr) { _out_frame = libs->avutil().api.frame_alloc(); }
   if (_in_frame == nullptr || _out_frame == nullptr) { return false; }

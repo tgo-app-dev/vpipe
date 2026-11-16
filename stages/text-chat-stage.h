@@ -364,6 +364,11 @@ private:
   // Out-port 1's chunk target in words (config "stream_words", default
   // 20); 0 flushes every decoded piece -- a reader, not a speaker.
   int         _stream_words{20};
+  // Out-port 1's beats carry the reply's live speed (config
+  // "stream_speed", default false): the last prefill piece's tokens a
+  // second, and the decode's over its last 128 tokens -- with beats of no
+  // text while a prompt is read.
+  bool        _stream_speed{};
   // The locally-dispatchable tool registry, seeded in initialize() when
   // tools are enabled and supported. Empty otherwise.
   McpToolRegistry _tools;

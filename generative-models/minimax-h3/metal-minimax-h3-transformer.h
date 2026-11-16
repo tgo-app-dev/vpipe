@@ -276,8 +276,11 @@ class MetalMiniMaxH3Transformer {
     // out projection and fc2 of every block -- a long sequence's in row
     // bands, each band's exchanges under the GPU work of the bands beside
     // it (band_rows, TpOverlap) -- through the channel a generation is
-    // given (begin_tp_generation). Preloaded blocks only, dense or affine
-    // weights, no ANE, VDN, TaoMate or adapter: load() refuses the rest.
+    // given (begin_tp_generation). Dense or affine weights, no VDN or
+    // TaoMate: load() refuses the rest. The ANE tier is the share's
+    // (ane_runtime_bytes sizes it so), and splits each band's rows with
+    // the GPU: a rank's bands are its rows' and its floor's alone, the
+    // same whether its ANE (or its peer's) runs.
     TpShare tp;
 
     int inner() const { return n_heads * head_dim; }        // 7168
@@ -733,8 +736,9 @@ class MetalMiniMaxH3Transformer {
   // Bytes the ANE feed-forward tier holds for a `seq`-row forward of this
   // shape (and the qkv one's, when `c` asks for it); see
   // AneFeedForward::runtime_bytes. Static because the PLAN asks before
-  // anything loads. ane_held_bytes() is what the ARMED modules hold -- the
-  // qkv tier may have declined where the plan asked for it.
+  // anything loads; a rank's (Config::tp) at its share's widths.
+  // ane_held_bytes() is what the ARMED modules hold -- the qkv tier may
+  // have declined where the plan asked for it.
   static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
   std::size_t ane_held_bytes() const noexcept;
   // Rows per ANE predict: VPIPE_H3_ANE_CHUNK or the default (2048).
@@ -748,6 +752,13 @@ class MetalMiniMaxH3Transformer {
   // the module can release the booking when it did not.
   bool ane_attempted() const noexcept { return _ane_tried; }
   bool ane_armed() const noexcept { return _ane != nullptr; }
+  // Rows the feed-forward tier (`qkv`: the qkv tier) ran ON THE ANE, over
+  // the model's life -- whether it took any, which being armed does not
+  // say.
+  std::int64_t ane_rows_run(bool qkv = false) const noexcept
+  {
+    return qkv ? _ane_qkv_rows_run : _ane_rows_run;
+  }
   // How many of the armed modules run int8 (Config::ane_int8, where the
   // module and the OS could take it): rotated per token, or with `plain`
   // unrotated (Config::ane_int8_plain).
@@ -1327,10 +1338,39 @@ class MetalMiniMaxH3Transformer {
   // bands where an eighth is shorter; by seq alone: every rank must cut
   // the same bands, so nothing measured on its own host goes in.
   static int band_rows(const Config& c, int seq);
+  // ...and the rows a band of the PROMPT takes when the main blocks band
+  // at `band` and the prompt is longer than that (an in-context refine
+  // presents its whole draft clip as tokens: ~12k rows at 2K x 15 s): the
+  // text refiner then runs a band at a time as the main blocks do, and
+  // the prompt's rows lie in as many bands of theirs as they take. 0 --
+  // the refiner whole -- where the prompt fits a band. Balanced as
+  // band_rows' are, at most `band`.
+  static int text_band_rows(const Config& c, int n_text, int band);
+  // The band a forward over `seq` rows behind an `n_text`-row prompt
+  // runs its main blocks in under `c`: band_rows', except that a RANK not
+  // given tp_extra::kPromptBands keeps the older rule -- a prompt longer
+  // than its band runs every block whole -- so a pair of ranks cuts the
+  // same bands whichever release each runs. 0 for whole.
+  static int band_for(const Config& c, int seq, int n_text);
+  // The longest sequence the WHOLE-SEQUENCE block (no bands: the ANE
+  // tiers, VDN's branch when `vdn`, streaming attention, a rank told no
+  // prompt bands) runs under `c`; the forward refuses a longer one rather
+  // than write wrong rows. Set by the widest activation a pass still
+  // addresses in 32 bits -- VDN's branch reads the fused q|k|v (3 x inner
+  // a row) at unsigned 32-bit offsets -- and capped at 2^31 elements of
+  // the residual stream, past which no whole-sequence block has been run.
+  static int whole_rows_max(const Config& c, bool vdn);
+  // The rows one dispatch of a thread-an-element pass over a `width`-wide
+  // activation covers: the elementwise kernels count their elements in
+  // an int, so a longer activation goes in row bands of this many.
+  // VPIPE_H3_ELT_ROWS=<rows> caps it lower (tests: the bands' offsets).
+  static int elt_rows(int width);
   static constexpr int kBandRows = 8192;
   static constexpr int kTpMinBand = 1024;
-  // The band the last forward ran its main blocks in (0: whole).
+  // The band the last forward ran its main blocks in (0: whole), and its
+  // text refiner's (0: whole).
   int last_band_rows() const { return _last_band; }
+  int last_text_band_rows() const { return _last_text_band; }
   // What this model holds WIRED (its window onto the wired pool): a warm
   // hold keeps it charged.
   std::size_t wired_bytes() const { return _wire.wired_bytes(); }
@@ -1349,10 +1389,10 @@ class MetalMiniMaxH3Transformer {
   // strength 1. Empty where the slot has no factors there.
   std::vector<float> lora_delta_for_test(int slot, int block, int which,
                                          const std::vector<float>& x) const;
-  // ...and the one this model's forward takes at `seq` (band_rows under
-  // the load's kernels and branches; a request's streaming attention
-  // aside).
-  int forward_band(int seq) const;
+  // ...and the one this model's forward takes at `seq` behind an
+  // `n_text`-row prompt (band_for under the load's kernels and branches;
+  // a request's streaming attention aside).
+  int forward_band(int seq, int n_text) const;
 
   // What the per-forward scratch buffers ACTUALLY hold right now, and
   // what the matrix-core dequant scratch holds, kept apart because they
@@ -1413,7 +1453,7 @@ class MetalMiniMaxH3Transformer {
   // geometry is a few hundred bytes against 861 MB unlent. It is the
   // real carve and not a subtraction; see
   // MetalSolAttention::private_bytes.
-  std::size_t sol_scratch_bytes(int seq) const;
+  std::size_t sol_scratch_bytes(int seq, int n_text) const;
   // The share of key blocks Sol-Attn's routing kept exact over the LAST
   // forward's routed layers: valid once forward() has returned, until
   // the next one starts (which reports and resets it). -1 where nothing
@@ -1427,7 +1467,7 @@ class MetalMiniMaxH3Transformer {
   // and did not have: its int8 twins of q and k are H * seq * head_dim
   // BYTES each, which at video geometry is a gigabyte and a half that
   // nothing sizing the box had heard of.
-  std::size_t sage_scratch_bytes(int seq) const;
+  std::size_t sage_scratch_bytes(int seq, int n_text) const;
 
   // ...and the INT8 CONTEXT's, the same shape of question again: the
   // activation codes and scales of the widest GEMM at this sequence, the
@@ -1435,7 +1475,7 @@ class MetalMiniMaxH3Transformer {
   // per call; a w4 pack on fast / token converts into it) and split-K's
   // planes -- grown inside the first forward and kept. A bound
   // (I8GemmContext::forward_bytes_bound), 0 when the context is off.
-  std::size_t i8_scratch_bytes(int seq) const;
+  std::size_t i8_scratch_bytes(int seq, int n_text) const;
 
   // How many times the activation scratch has been ALLOCATED.
   //
@@ -2272,10 +2312,16 @@ class MetalMiniMaxH3Transformer {
   std::unique_ptr<AneFeedForward> _ane_qkv;
   bool _ane_qkv_tried = false;
   bool _ane_disabled  = false;   // disable_ane() was called
-  bool ane_qkv_setup_(int seq);
+  // `seq`: the rows a call takes (a band's, banded); `chunk`: the
+  // module's rows a predict (ane_chunk_for_).
+  bool ane_qkv_setup_(int seq, int chunk);
   bool ane_qkv_eligible_(int L, const Block& b);
   void ane_qkv_stage_(int L, const Block& b, const LoraStack& lora);
-  bool ane_setup_(int seq);        // false == tier off
+  bool ane_setup_(int seq, int chunk);   // false == tier off
+  // The modules' chunk for blocks run `band` rows at a time (0: whole).
+  static int ane_chunk_for_(int band) noexcept;
+  // Rows each tier ran on the ANE, over the model's life.
+  std::int64_t _ane_rows_run = 0, _ane_qkv_rows_run = 0;
   // A projection the ANE's staging reads: no bias, and dense bf16, FP8,
   // ComfyUI's int8 (ConvRot or not), W4A8, or 4/8-bit affine.
   static bool ane_stageable_(const Linear& l);
@@ -2710,15 +2756,25 @@ class MetalMiniMaxH3Transformer {
   // and the kernel.
   metal_compute::ComputeFunction _fn_trope_band;
   // [full band | last band][0 dense, 1 int8 QK (per-block Q scales),
-  // 2 int8 QK (per-token Q: band 0's prompt and soundtrack rows under
-  // the int8 P*V), 3 int8 QK and P*V]; band 0's parameters past those
-  // rows (_attn_p_bandq_rest, as _attn_p_band is the whole sequence's).
+  // 2 int8 QK (per-token Q: the prompt's, conditioning's and
+  // soundtrack's rows under the int8 P*V -- whole bands of them, and the
+  // band they end in up to its first video block), 3 int8 QK and P*V];
+  // that band's parameters past those rows (_attn_p_bandq_rest, as
+  // _attn_p_band is the whole sequence's), `_attn_bandq_nb` the query
+  // blocks before the video's, counted over the sequence.
   metal_compute::ComputeFunction _fn_attn_bandv[2][4];
   metal_compute::SharedBuffer _attn_p_bandq, _attn_p_bandq_tail;
   metal_compute::SharedBuffer _attn_p_bandq_rest;
   int _attn_bandq_seq = -1, _attn_bandq_rows = -1, _attn_bandq_nax = -1;
   int _attn_bandq_sage = -1, _attn_bandq_nb = 0;
   int _last_band = 0;
+  // The text refiner's bands (text_band_rows): a band of prompt queries
+  // over every prompt key, dense -- [full band | last band], keyed by the
+  // prompt's length, its band and the kernel.
+  metal_compute::ComputeFunction _fn_attn_tband[2];
+  metal_compute::SharedBuffer _attn_p_tband[2];
+  int _attn_tband_text = -1, _attn_tband_rows = -1, _attn_tband_nax = -1;
+  int _last_text_band = 0;
   // Sol's last band: ONE band size per Sol object, whose parameter block
   // and scratch are per object -- a narrower call on the same object
   // would rewrite the parameters the full bands' encoded dispatches

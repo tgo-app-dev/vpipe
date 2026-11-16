@@ -355,6 +355,41 @@ injection blocks' cross-attention, which run once a prompt. AWQ is refused.
 You do not need a pack to run on a small machine (the DiT streams instead),
 and w4 costs visible quality on models of this kind.
 
+## Split across machines
+
+generate-image's `tensor_parallel` runs the stage as one RANK of the DiT
+split across machines (`generative-models/tensor-parallel.h`, feature
+`tensor-parallel-fibo2/1`), as it does for FLUX.3 and Qwen-Image-2.1. Every
+block's heads (`to_q` / `to_k` / `to_v` by their rows, `to_out.0` by its
+columns) and feed-forward rows (`w1` and `w3` by their rows, `w2` by its
+columns) are a rank's share. The block is Z-Image's, sandwich-normed: the
+attention's and the feed-forward's outputs are RMS-normed inside the
+residual, so each rank's partial is completed by the others' sum BEFORE
+that post-norm and its tanh gate -- two exchanges a block. An injection
+block's cross-attention is cut by the same heads (its keys and values over
+the text a rank's own heads'), a third exchange there. The Perceiver, a
+function of the text alone, runs whole on every rank, as do the per-token
+modulation, the norms and the model-level layers. An edit's references are
+context rows like any other. A share given `min_band_rows` cuts every
+block's rows into bands, each band's partials crossing under the next
+band's work; every step after a block's self-attention -- the injection's
+included -- is a row's own. A rank streams its share and keeps it, booked
+at the share; it runs no runtime LoRA and no ANE tier. An 8-bit pack's
+feed-forward share must be whole groups of 64 columns (9,536 rows split
+evenly is not: give `ffn` explicitly).
+
+Verified (`tensor_parallel.a_split_fibo2_forward_is_the_unsplit_one`, a
+random small model; `tensor_parallel.a_split_real_fibo2_forward_is_the_
+unsplit_one`, Edit Turbo as an 8-bit pack): split against whole within the
+bf16 rounding of three partials where the whole model rounds one, the two
+ranks identical to the bit, what a rank holds what the plan books to the
+byte; through generate-image, the ranks' pictures identical and within
+1e-2 of the whole model's (`tensor_parallel.a_split_fibo2_runs_through_
+the_stage`). Timed on two M5 Macs over an RDMA transport, the 8-bit pack
+at 2560 x 1792: the denoise 32 s split, against 94 s and 48 s on either
+Mac alone. A rank's exchange buffers are the picture's, freed with its
+channel.
+
 ## Not yet supported
 
 - **Text images.** When a caption's `text_render` entries carry text, the

@@ -16,6 +16,7 @@
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/tensor-parallel.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
@@ -33,6 +35,8 @@ class WeightSet;
 class MetalSageAttention;
 class MetalSolAttention;
 class I8GemmContext;
+class MetalLlamaWeights;
+class TpOverlap;
 
 // MOSS-Image's DiT (OpenMOSS MOSSImageTransformer), on metal-compute.
 //
@@ -133,6 +137,27 @@ class MetalMossImageTransformer {
     // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool ane_int8_plain = false;
+    // TENSOR PARALLEL (tensor-parallel.h): this model one RANK of a DiT
+    // split across machines -- its share of every main block's heads
+    // (proj.q / k / v by their rows, proj.o by its columns) and
+    // feed-forward rows (ffn_up_gate by its rows -- the share's rows of
+    // the HIDDEN half and the same rows of the GATE half, which follows
+    // it -- and ffn_down by its columns). Attention and feed-forward are
+    // gated apart, so a rank exchanges TWO partials a block, each before
+    // its gate -- two a BAND where the share carries a floor
+    // (tp_extra::kMinBandRows; tp_row_bands), each crossing under the
+    // next band's work. The two text blocks, the shared modulation, the
+    // embedders and the head run WHOLE on every rank: the text blocks
+    // see the prompt's few hundred rows alone, once a forward, where an
+    // exchange would cost more than the work it splits, and their biased
+    // projections would need a rank to add each bias once. Its share is
+    // cut as stored (bf16 or an affine pack; only its rows read where a
+    // cut is by rows), then laid out for the int8 tier asked within its
+    // own columns. Inactive: the whole model. A rank streams its share
+    // then keeps it, as the whole model streams its blocks (on the
+    // per-block path: no slot pair), with no runtime LoRA and no ANE
+    // tier (each refused by name).
+    TpShare tp;
 
     // Read <dir>/config.json. False when the file is absent or names a
     // different class, or the shape is one this does not run.
@@ -188,9 +213,36 @@ class MetalMossImageTransformer {
 
   const Config& config() const { return _cfg; }
 
+  // A RANK's link to the others for ONE PICTURE (TpChannel): opened by
+  // the stage before the first forward, let go after the last however
+  // the picture ends; the exchange count new with it. Every forward of
+  // the picture -- the positive, the negative, a skip-layer guidance
+  // pass -- exchanges on it in the order both ranks run them. False,
+  // with `err`, on a model that is not a rank or a channel that cannot
+  // run.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  void end_tp_generation();
+  // The exchange buffers it holds: grown at a forward's start, let go
+  // with the picture's channel (end_tp_generation).
+  std::size_t tp_exchange_bytes() const
+  {
+    std::size_t n = 0;
+    for (const auto& b : _tp_part) { n += b.byte_size(); }
+    for (const auto& b : _tp_recv) { n += b.byte_size(); }
+    return n;
+  }
+
   // Streaming + residency, the shared contract every DiT here
   // implements.
   void set_stream_stop(std::function<bool()> stop) {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
   }
   void set_block_progress(DitBlockProgressFn fn) {
@@ -275,11 +327,23 @@ class MetalMossImageTransformer {
   // blocks, held in both modes) + ONE slot pair of main blocks. 0 when
   // the directory cannot be read.
   static std::size_t streaming_floor_bytes(const std::string& dir);
+  // What a RANK of `c` (Config::tp, with the int8 tier it loads with)
+  // holds with every block kept -- where stream, then retain converges on
+  // a box with room -- off the checkpoint's headers before anything
+  // loads: the plan's figure for resident_bytes(). The trunk (the
+  // model-level weights and both text blocks: bf16, a pack's codes as
+  // stored) and every main block's share as tp_qw_ leaves it, its four
+  // norms whole. `floor`: the trunk and two blocks' shares, what it holds
+  // streaming at the least. 0 when `c` is not split.
+  static std::size_t tp_held_bytes(const std::string& dir, const Config& c,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
   // The activations one forward allocates at this geometry -- what the
   // denoise phase has to book beside the weights.
   // `packed` books a pack's dense stand-in; `matrix_cores` the int8,
   // Sage and Sol scratch (Config::i8_gemm / sage / sol) held between
-  // forwards on a box that runs them.
+  // forwards on a box that runs them. A RANK's (c.tp) main-block planes
+  // are its share's widths, and its exchange buffers sit beside them.
   static std::size_t forward_scratch_bytes(const Config& c, int grid_h,
                                            int grid_w, int text_rows,
                                            bool sol, bool packed = false,
@@ -389,6 +453,25 @@ class MetalMossImageTransformer {
                                       Retain r);
   bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
   bool load_text_block_(WeightSet& ws, int i, TextBlock& b);
+  // A RANK's share of block L (Config::tp): each projection read
+  // uncached, cut, and laid out for the int8 tier. False, with `err`.
+  bool load_tp_block_(WeightSet& ws, int L, Block& b, std::string* err);
+  // The share of `name` ([N, K]): `rows` of it, each row's columns
+  // [k0, k1) (k1 0: all -- then only those rows are read), then in the
+  // tier's layout where one is asked for and its group divides the
+  // share's columns, else signed where _sgn says.
+  QWeight tp_qw_(WeightSet& ws, const std::string& name, int N,
+                 const std::vector<std::pair<int, int>>& rows, int k0,
+                 int k1, std::string* err);
+  // One block's share (prefix `pfx`) as tp_qw_ leaves it, off the
+  // headers, `fast` the tier's context where the tier engages: the
+  // plan's figure and residency's block size for a rank.
+  static std::size_t tp_block_bytes_(const MetalLlamaWeights& src,
+                                     const Config& c,
+                                     const I8GemmContext* fast,
+                                     const std::string& pfx);
+  // An exchange buffer at least `bytes`: one replaced is forgotten first.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
   bool load_fixed_(WeightSet& ws);
 
   void each_block_tensor_(int L, Block& b,
@@ -523,6 +606,19 @@ class MetalMossImageTransformer {
   mutable std::size_t _lora_scratch_rows = 0;
   bool bind_loras_(const std::vector<LoraSpec>& loras);
   lora::Stack lora_for_(int L, lora::Factors BlockLora::* which) const;
+
+  // ---- a rank's link (Config::tp) -------------------------------------
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  std::uint64_t _tp_seq = 0;
+  // The EXCHANGE BUFFERS, a lane each: a band's partial sum, written
+  // there by its last GEMM (the forward's scratch is per forward, and a
+  // transport may keep a device's registration of what it is handed),
+  // and the others' sum back -- lanes 0 / 1 the attention's, 2 / 3 the
+  // feed-forward's (a block whole uses 0 for both). Grown at a forward's
+  // start to its widest band (tp_buffer_), let go with the picture's
+  // channel (end_tp_generation).
+  metal_compute::SharedBuffer _tp_part[4], _tp_recv[4];
 };
 
 // ---- the reference's sampler arithmetic ------------------------------

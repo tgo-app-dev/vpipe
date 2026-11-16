@@ -12,6 +12,8 @@
 #include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/shared/lora-names.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tp-cut.h"
+#include "generative-models/shared/tp-overlap.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
@@ -113,6 +115,9 @@ constexpr const char* kKey = "fibo2-dit/";
 
 MetalFibo2Transformer::~MetalFibo2Transformer()
 {
+  // A rank's picture, if one is still open: the worker joined and its
+  // buffers forgotten before the members they live in go.
+  end_tp_generation();
   // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
   // so the machine recovers either way -- but the pool's own counter
   // would not, and a DiT destroyed and reloaded per prompt would leak
@@ -571,13 +576,35 @@ MetalFibo2Transformer::load_block_(WeightSet& ws, const std::string& p,
 
 bool
 MetalFibo2Transformer::load_cross_(WeightSet& ws, const std::string& p,
-                                    CrossAttn& ca)
+                                    CrossAttn& ca, bool share)
 {
   const Retain r = Retain::Cached;
-  ca.qw = load_qw_(ws, p + "to_q", r);
-  ca.kw = load_qw_(ws, p + "to_k", r);
-  ca.vw = load_qw_(ws, p + "to_v", r);
-  ca.ow = load_qw_(ws, p + "to_out.0", r);
+  if (share) {
+    // A RANK's injection cross-attention: its heads' queries, and its
+    // heads' keys and values over the text (to_k / to_v [H, cap_dim], by
+    // their rows), its out projection by its columns -- kept as the whole
+    // model keeps them (no signed or tier layout). The q / k norms are a
+    // head's own, whole.
+    const TpShare& t = _cfg.tp;
+    const int H = _cfg.hidden, Hd = _cfg.head_dim;
+    const int i0 = t.head0 * Hd, i1 = t.head1 * Hd;
+    const std::vector<std::pair<int, int>> heads = {{i0, i1}};
+    const std::vector<std::pair<int, int>> all = {{0, H}};
+    std::string err;
+    ca.qw = tp_qw_(ws, p + "to_q", H, heads, 0, 0, false, false, &err);
+    ca.kw = tp_qw_(ws, p + "to_k", H, heads, 0, 0, false, false, &err);
+    ca.vw = tp_qw_(ws, p + "to_v", H, heads, 0, 0, false, false, &err);
+    ca.ow = tp_qw_(ws, p + "to_out.0", H, all, i0, i1, false, false, &err);
+    if (!err.empty() && _mc->session() != nullptr) {
+      _mc->session()->error(fmt("MetalFibo2Transformer: tensor_parallel: "
+                                "{}", err));
+    }
+  } else {
+    ca.qw = load_qw_(ws, p + "to_q", r);
+    ca.kw = load_qw_(ws, p + "to_k", r);
+    ca.vw = load_qw_(ws, p + "to_v", r);
+    ca.ow = load_qw_(ws, p + "to_out.0", r);
+  }
   ca.nq = to_elt_(ws, p + "norm_q.weight", r);
   ca.nk = to_elt_(ws, p + "norm_k.weight", r);
   return !ca.qw.empty() && !ca.kw.empty() && !ca.vw.empty() &&
@@ -642,7 +669,7 @@ MetalFibo2Transformer::load_fixed_(WeightSet& ws)
     in.n1 = to_elt_(ws, p + "cross_attn_norm1.weight", r);
     in.n2 = to_elt_(ws, p + "cross_attn_norm2.weight", r);
     ok = !in.n1.empty() && !in.n2.empty() &&
-         load_cross_(ws, p + "cross_attention.", in.ca);
+         load_cross_(ws, p + "cross_attention.", in.ca, _cfg.tp.active());
     // The gate is ONE scalar; the gated residual kernel reads a row of
     // H, tanh'd in the kernel, so the scalar is broadcast once here.
     SharedBuffer g = ws.read(p + "cross_attn_gate", _mc,
@@ -663,6 +690,318 @@ MetalFibo2Transformer::load_fixed_(WeightSet& ws)
     _inject.push_back(std::move(in));
   }
   return ok;
+}
+
+// ---- a rank's share (Config::tp) -------------------------------------
+
+// A rank's share of one projection, as Z-Image's rank cuts it (the same
+// block, the same layouts). CUT BY ITS ROWS -- to_q / to_k / to_v, w1
+// and w3, most of a block, and an injection block's cross-attention to_q
+// / to_k / to_v -- a dense weight (bf16, or F32
+// narrowed here as the whole model narrows it) or an MLX affine pack has
+// only the share's rows READ, straight into the share (tp_read_rows); the
+// rest of the tensor never leaves the disk. CUT BY ITS COLUMNS --
+// to_out.0, w2 -- every row is needed: the whole weight is read UNCACHED
+// (Retain::Streamed, plain: no signed or tier layout) and the share
+// copied out of it, as is any weight the row read does not serve
+// (VPIPE_TP_WHOLE_READ, the A/B). An affine pack's columns are cut in
+// whole groups. Then the share is laid out as a whole model lays out its
+// own weights: a MODULATED block's (`fast`) on the int8 fast / token
+// tier -- a w8 share converted, a w4 share held as stored and converted
+// per GEMM, a dense share quantized (a dense checkpoint's only, as
+// load_qw_ quantizes) -- each at the group the share's own columns take,
+// a width none divides staying accurate; anything else the SIGNED layout
+// where the model's projections take it (_sgn: per byte and per group,
+// so a share converts as its whole weight would).
+MetalFibo2Transformer::QWeight
+MetalFibo2Transformer::tp_qw_(
+    WeightSet& ws, const std::string& name, int N,
+    const std::vector<std::pair<int, int>>& rows, int k0, int k1, bool sign,
+    bool fast, std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = name + ": " + why; }
+    return QWeight{};
+  };
+  int n = 0;
+  for (const auto& [a, b] : rows) { n += b - a; }
+  QWeight l;
+  l.n = n;
+  bool read = false;
+  if (k1 == 0 && std::getenv("VPIPE_TP_WHOLE_READ") == nullptr) {
+    const MetalLlamaWeights& src = ws.src();
+    // Rows of a float tensor as the model holds it, bf16: read in the
+    // dtype stored and narrowed where that is wider or another half.
+    auto rows_bf16 = [&](const std::string& nm) -> SharedBuffer {
+      const auto* ti = src.info(nm);
+      if (ti == nullptr || (ti->dtype != "BF16" && ti->dtype != "F16" &&
+                            ti->dtype != "F32")) {
+        return {};
+      }
+      SharedBuffer b =
+          tp_read_rows(_mc, src, nm, ti->dtype.c_str(), N, rows);
+      if (b.empty() || ti->dtype == "BF16") { return b; }
+      const std::size_t es = ti->dtype == "F32" ? 4 : 2;
+      const std::size_t cnt = b.byte_size() / es;
+      SharedBuffer o = _mc->make_shared_buffer(cnt * 2);
+      if (o.empty() ||
+          !narrow_to_bf16_(b.contents(), ti->dtype, cnt,
+                           static_cast<std::uint16_t*>(o.contents()))) {
+        return {};
+      }
+      return o;
+    };
+    const auto* ci = src.info(name + ".weight");
+    const auto* si = src.info(name + ".scales");
+    if (_quant_bits > 0 && ci != nullptr && si != nullptr &&
+        ci->shape.size() == 2 && si->shape.size() == 2) {
+      const long K = si->shape[1] * (long)_quant_group;
+      const long bits = K > 0 ? ci->shape[1] * 32 / K : 0;
+      if (bits == 4 || bits == 8) {
+        l.codes = tp_read_rows(_mc, src, name + ".weight", "U32", N, rows);
+        l.scales = rows_bf16(name + ".scales");
+        l.qbias = rows_bf16(name + ".biases");
+        if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
+          l.quantized = true;
+          l.bits = (int)bits;
+          l.k = (int)K;
+          read = true;
+        } else {
+          l.codes = {}; l.scales = {}; l.qbias = {};
+        }
+      }
+    } else if (si == nullptr && ci != nullptr && ci->shape.size() == 2) {
+      l.w = rows_bf16(name + ".weight");
+      if (!l.w.empty()) {
+        l.k = (int)ci->shape[1];
+        read = true;
+      }
+    }
+  }
+  if (!read) {
+    QWeight w = load_qw_(ws, name, Retain::Streamed, /*sign=*/false,
+                         /*fast=*/false);
+    if (w.empty()) { return fail("not in the checkpoint"); }
+    if (w.gc > 0 || w.sgn) {
+      return fail("a split DiT reads dense or affine weights only");
+    }
+    if (w.quantized) {
+      const int g = _quant_group;
+      if (k1 > 0 && (k0 % g != 0 || k1 % g != 0)) {
+        return fail(fmt("its share's columns [{}, {}) are not whole "
+                        "groups of {}", k0, k1, g)());
+      }
+      l.quantized = true;
+      l.bits = w.bits;
+      // Codes: `32 / bits` columns a word; scales and biases: one a group.
+      l.codes = tp_cut(_mc, w.codes, N, rows, (std::size_t)k0 * w.bits / 8,
+                       (std::size_t)k1 * w.bits / 8);
+      l.scales = tp_cut(_mc, w.scales, N, rows, (std::size_t)k0 / g * 2,
+                        (std::size_t)k1 / g * 2);
+      l.qbias = tp_cut(_mc, w.qbias, N, rows, (std::size_t)k0 / g * 2,
+                       (std::size_t)k1 / g * 2);
+      if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+        return fail("its share could not be cut");
+      }
+      l.k = k1 > 0 ? k1 - k0 : (int)(w.codes.byte_size() * 8 /
+                                     (std::size_t)N / (std::size_t)w.bits);
+    } else {
+      l.w = tp_cut(_mc, w.w, N, rows, (std::size_t)k0 * 2,
+                   (std::size_t)k1 * 2);
+      if (l.w.empty()) { return fail("its share could not be cut"); }
+      l.k = k1 > 0 ? k1 - k0
+                   : (int)(w.w.byte_size() / 2 / (std::size_t)N);
+    }
+  }
+  // Off the int8 fast / token tier: the signed layout, where the model's
+  // projections take it (`sign`: a block's, not a cross-attention's).
+  auto plain = [&]() -> QWeight {
+    if (sign && !sign_(l)) {
+      return fail("its share did not take the signed layout");
+    }
+    return std::move(l);
+  };
+  if (!fast || !_fast || !_i8) { return plain(); }
+  // A pack's dense tensor stays dense, as the whole model keeps it.
+  if (!l.quantized && _quant_bits != 0) { return plain(); }
+  // The tier's layout, within the share's own columns.
+  const int fgc = _i8->fast_group(l.k);
+  if (fgc <= 0) { return plain(); }
+  const std::size_t cb = (std::size_t)l.n * l.k;
+  const std::size_t sb = I8GemmContext::fast_scale_bytes(l.n, l.k, fgc);
+  if (l.quantized) {
+    if (_quant_group != 64 || !_i8->fast_converts(l.bits, fgc)) {
+      return plain();
+    }
+    if (l.bits == 4 && !_cfg.i8_hold_w4) {
+      // A W4 SHARE IS HELD AS STORED, converted before each GEMM
+      // (fast_operand_), as a whole model's w4 block is.
+      l.gc = fgc;
+      l.pc = true;
+      return l;
+    }
+    QWeight f;
+    f.bits = l.bits; f.gc = fgc; f.n = l.n; f.k = l.k;
+    f.codes = _mc->make_shared_buffer(cb);
+    f.cscales = _mc->make_shared_buffer(sb);
+    if (f.codes.empty() || f.cscales.empty()) { return plain(); }
+    CommandStream st = _mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = _i8->encode_to_fast(e, l.codes, l.scales, l.qbias, f.codes,
+                               f.cscales, fgc, l.n, l.k, l.bits);
+    }
+    if (!ok || !st.commit().wait_ok(nullptr)) { return plain(); }
+    f.quantized = true;
+    return f;
+  }
+  QWeight f;
+  f.bits = 8; f.gc = fgc; f.n = l.n; f.k = l.k;
+  f.codes = _mc->make_shared_buffer(cb);
+  f.cscales = _mc->make_shared_buffer(sb);
+  if (f.codes.empty() || f.cscales.empty()) { return l; }
+  CommandStream st = _mc->make_command_stream();
+  bool ok = false;
+  {
+    ComputeEncoder e = st.begin_compute();
+    ok = _i8->encode_quant_fast(e, l.w, f.codes, f.cscales, fgc, l.n, l.k);
+  }
+  if (!ok || !st.commit().wait_ok(nullptr)) { return l; }
+  f.quantized = true;
+  return f;
+}
+
+bool
+MetalFibo2Transformer::load_tp_block_(WeightSet& ws, const std::string& p,
+                                      Block& b, Retain r, std::string* err)
+{
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
+  const TpShare& t = _cfg.tp;
+  const int H = _cfg.hidden, Hd = _cfg.head_dim, F = _cfg.ffn_inner;
+  const int i0 = t.head0 * Hd, i1 = t.head1 * Hd;
+  const std::vector<std::pair<int, int>> heads = {{i0, i1}};
+  const std::vector<std::pair<int, int>> all = {{0, H}};
+  const std::vector<std::pair<int, int>> ff = {{t.ffn0, t.ffn1}};
+  struct One {
+    QWeight* w;
+    const char* leaf;
+    int N;
+    const std::vector<std::pair<int, int>>* rows;
+    int k0, k1;
+  };
+  // q / k / v are three [H, H] tensors, each head's Hd rows in turn: a
+  // head range is one row range of each.
+  const One all_of[] = {
+      {&b.qw, "attention.to_q", H, &heads, 0, 0},
+      {&b.kw, "attention.to_k", H, &heads, 0, 0},
+      {&b.vw, "attention.to_v", H, &heads, 0, 0},
+      {&b.ow, "attention.to_out.0", H, &all, i0, i1},
+      {&b.w1, "feed_forward.w1", F, &ff, 0, 0},
+      {&b.w3, "feed_forward.w3", F, &ff, 0, 0},
+      {&b.w2, "feed_forward.w2", H, &all, t.ffn0, t.ffn1}};
+  for (const One& o : all_of) {
+    *o.w = tp_qw_(ws, p + o.leaf, o.N, *o.rows, o.k0, o.k1, true, true,
+                  err);
+    if (o.w->empty()) { return false; }
+  }
+  // The q / k RMSNorms are a head's own, [head_dim]; the sandwich norms
+  // and adaLN read the whole residual stream: whole on every rank.
+  b.nq = to_elt_(ws, p + "attention.norm_q.weight", r);
+  b.nk = to_elt_(ws, p + "attention.norm_k.weight", r);
+  b.an1 = to_elt_(ws, p + "attention_norm1.weight", r);
+  b.an2 = to_elt_(ws, p + "attention_norm2.weight", r);
+  b.fn1 = to_elt_(ws, p + "ffn_norm1.weight", r);
+  b.fn2 = to_elt_(ws, p + "ffn_norm2.weight", r);
+  b.ada = load_qw_(ws, p + "adaLN_modulation.0", r);
+  b.ada_b = to_elt_(ws, p + "adaLN_modulation.0.bias", r);
+  const bool ok = !b.nq.empty() && !b.nk.empty() && !b.an1.empty() &&
+                  !b.an2.empty() && !b.fn1.empty() && !b.fn2.empty() &&
+                  !b.ada.empty() && !b.ada_b.empty();
+  if (!ok && err != nullptr) { *err = p + ": its norms or adaLN"; }
+  return ok;
+}
+
+bool
+MetalFibo2Transformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
+{
+  if (b.byte_size() >= bytes) { return true; }
+  if (!b.empty() && _tp_pipe != nullptr) { _tp_pipe->forget(b); }
+  b = SharedBuffer{};
+  b = _mc->make_shared_buffer(bytes);
+  return !b.empty();
+}
+
+bool
+MetalFibo2Transformer::begin_tp_generation(std::shared_ptr<TpChannel> ch,
+                                            std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = "tensor parallel: " + why; }
+    return false;
+  };
+  end_tp_generation();
+  if (!_cfg.tp.active()) { return fail("this model is not a rank"); }
+  if (!ch) { return fail("no channel to the other ranks"); }
+  // Six lanes: a block's bands alternate between two for the attention's
+  // partials, two for an injection block's cross-attention's and two for
+  // the feed-forward's (run_block's rank tail).
+  auto pipe = std::make_unique<TpOverlap>(_mc, ch, kTpLanes,
+                                          TpDType::kBF16);
+  if (!pipe->valid()) {
+    return fail("no events or thread for the exchanges");
+  }
+  _tp_ch = std::move(ch);
+  _tp_pipe = std::move(pipe);
+  _tp_seq = 0;
+  // The stop the stage set before the picture, which the channel polls
+  // while it waits on the others.
+  try {
+    _tp_ch->set_stop(_stream_stop);
+  } catch (...) {
+  }
+  return true;
+}
+
+void
+MetalFibo2Transformer::end_tp_generation()
+{
+  if (_tp_pipe == nullptr && !_tp_ch) { return; }
+  // An exchange still waiting on a peer would hold the worker the reset
+  // below joins: the channel told to stop waiting first.
+  if (_tp_pipe != nullptr && _tp_ch &&
+      (_tp_pipe->pending() || _tp_pipe->failed())) {
+    try {
+      _tp_ch->set_stop([]() { return true; });
+    } catch (...) {
+    }
+  }
+  _tp_pipe.reset();
+  // Every buffer the channel was handed forgotten before it goes (a
+  // transport may keep a device's registration of each).
+  if (_tp_ch) {
+    for (int k = 0; k < kTpLanes; ++k) {
+      for (const SharedBuffer* b : {&_tp_part[k], &_tp_recv[k]}) {
+        if (b->empty()) { continue; }
+        try {
+          _tp_ch->forget(b->contents(), b->byte_size());
+        } catch (...) {
+        }
+      }
+    }
+    try {
+      _tp_ch->set_stop({});
+    } catch (...) {
+    }
+  }
+  _tp_ch.reset();
+  _tp_seq = 0;
+  // THE BUFFERS GO WITH THE PICTURE. The plan books them with the
+  // forward's activations alone (forward_scratch_bytes), and the
+  // transport's registration of them went with the forget above; kept,
+  // they sat unbooked beside the decode and in a DiT kept warm.
+  for (SharedBuffer& b : _tp_part) { b = SharedBuffer{}; }
+  for (SharedBuffer& b : _tp_recv) { b = SharedBuffer{}; }
 }
 
 std::size_t
@@ -1061,8 +1400,21 @@ MetalFibo2Transformer::configure_slots_()
     return fill_narrow_(nm, d);
   };
   ops.build = [this](int L, Block& b) {
-    return _ws != nullptr &&
-           load_block_(*_ws, mod_prefix_(L), true, b, Retain::Streamed);
+    if (_ws == nullptr) { return false; }
+    if (!_cfg.tp.active()) {
+      return load_block_(*_ws, mod_prefix_(L), true, b, Retain::Streamed);
+    }
+    // A RANK's block is its share, cut at every read (load() turns the
+    // slots off for it).
+    std::string terr;
+    if (load_tp_block_(*_ws, mod_prefix_(L), b, Retain::Streamed, &terr)) {
+      return true;
+    }
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt("MetalFibo2Transformer: tensor_parallel: "
+                               "block {}: {}", L, terr));
+    }
+    return false;
   };
   ops.clone = [this](const Block& s, Block& d, bool copy) {
     return clone_block_(s, d, copy);
@@ -1303,6 +1655,32 @@ MetalFibo2Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   }
   if (m->_gemm_tile == 1 && !m->_fn_gemm_bm64.valid()) { m->_gemm_tile = 0; }
 
+  // A RANK (Config::tp): its share, streamed then kept as any Fibo 2.0's
+  // blocks are, nothing that reads the checkpoint's widths -- the ANE's
+  // modules, a runtime LoRA -- and weights it can cut: dense or an affine
+  // pack.
+  const bool rank = m->_cfg.tp.active();
+  if (rank) {
+    const TpShare& t = m->_cfg.tp;
+    std::string why;
+    if (t.n_heads != m->_cfg.n_heads || t.n_ffn != m->_cfg.ffn_inner ||
+        t.heads() <= 0 || t.ffn() <= 0) {
+      why = fmt("a share of {} heads and {} feed-forward rows does not "
+                "fit this model's {} and {}", t.n_heads, t.n_ffn,
+                m->_cfg.n_heads, m->_cfg.ffn_inner)();
+    } else if (!loras.empty()) {
+      why = "not with a runtime LoRA yet";
+    } else if (m->_cfg.ane_ffn || m->_cfg.ane_qkv) {
+      why = "not with the Neural Engine's share";
+    }
+    if (!why.empty()) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(fmt("MetalFibo2Transformer: "
+                                 "tensor_parallel: {}", why));
+      }
+      return nullptr;
+    }
+  }
   if (!m->load_fixed_(*m->_ws)) {
     if (mc->session() != nullptr) {
       mc->session()->error(fmt("MetalFibo2Transformer: the model-level "
@@ -1352,9 +1730,21 @@ MetalFibo2Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   }
 
   m->_wire.open(mc);
+  if (rank && mc->session() != nullptr) {
+    const TpShare& t = m->_cfg.tp;
+    mc->session()->info(fmt(
+        "MetalFibo2Transformer: rank {} of {}: heads [{}, {}) of {}, "
+        "feed-forward rows [{}, {}) of {}{}", t.rank, t.ranks, t.head0,
+        t.head1, t.n_heads, t.ffn0, t.ffn1, t.n_ffn,
+        stream_blocks ? ", streamed then kept" : ""));
+  }
   const int NM = m->_cfg.n_mod_blocks();
   if (stream_blocks) {
     m->configure_slots_();
+    // A RANK STREAMS ON THE PER-BLOCK PATH, never a slot: a slot refills
+    // a block by its tensors whole, and a rank's block is its share, cut
+    // afresh at each read (load_tp_block_) in the layout its tier holds.
+    if (rank) { m->_slots.disable(); }
     // Sized to the stack so a PROMOTED block has somewhere to land; an
     // unfilled entry reads as empty, which is how the forward tells a
     // resident block from one that is still streamed.
@@ -1362,11 +1752,18 @@ MetalFibo2Transformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   } else {
     m->_blocks.resize((std::size_t)NM);
     for (int L = 0; L < NM; ++L) {
-      if (!m->load_block_(*m->_ws, m->mod_prefix_(L), /*with_ada=*/true,
-                          m->_blocks[(std::size_t)L], Retain::Cached)) {
+      std::string terr;
+      Block& b = m->_blocks[(std::size_t)L];
+      const bool ok =
+          rank ? m->load_tp_block_(*m->_ws, m->mod_prefix_(L), b,
+                                   Retain::Cached, &terr)
+               : m->load_block_(*m->_ws, m->mod_prefix_(L),
+                                /*with_ada=*/true, b, Retain::Cached);
+      if (!ok) {
         if (mc->session() != nullptr) {
           mc->session()->error(fmt("MetalFibo2Transformer: block {} is "
-                                   "incomplete", L));
+                                   "incomplete{}", L,
+                                   terr.empty() ? "" : " (" + terr + ")"));
         }
         return nullptr;
       }
@@ -1563,15 +1960,28 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     return fail("fibo2 forward: no text was set (set_text)");
   }
   const fibo2::Layout& lay = *req.layout;
-  const int H = _cfg.hidden, NH = _cfg.n_heads, Hd = _cfg.head_dim;
-  const int FFI = _cfg.ffn_inner, PD = _cfg.patch_dim();
+  // A RANK (Config::tp) runs its share's heads and feed-forward rows:
+  // NH and FFI are its own, HI its heads' width; H stays the model's, and
+  // the Perceiver -- whole on every rank -- runs NHW heads and FFW rows.
+  const bool rank = _cfg.tp.active();
+  const int H = _cfg.hidden, Hd = _cfg.head_dim;
+  const int NHW = _cfg.n_heads, FFW = _cfg.ffn_inner;
+  const int NH = rank ? _cfg.tp.heads() : NHW;
+  const int HI = NH * Hd;
+  const int FFI = rank ? _cfg.tp.ffn() : FFW;
+  const int PD = _cfg.patch_dim();
   const int JT = lay.joint_len(), RT = lay.refiner_len();
   const int IMG = lay.img_tokens, G = lay.gist, T = ts.text_len;
   const int CAP = _cfg.cap_dim;
   const int NM = _cfg.n_mod_blocks();
-  if (JT <= 0 || IMG <= 0 || NH * Hd != H) {
+  if (JT <= 0 || IMG <= 0 || NHW * Hd != H) {
     return fail("fibo2 forward: degenerate geometry");
   }
+  if (rank && _tp_pipe == nullptr) {
+    return fail("fibo2 forward: a rank with no channel "
+                "(begin_tp_generation)");
+  }
+  std::string tp_err;
   // THE GIST COUNT IS THE TEXT'S, and the layout has to agree with it:
   // the gist rows are a function of the text alone.
   if (G != ts.gist_n || (int)lay.pos_t.size() != JT) {
@@ -1611,18 +2021,25 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // Peak scratch is ~10 [JT,H] planes plus 2 [JT,FFI] ones: 0.5 GB at
   // 1024^2 and 2 GB at 2048^2, which is the number a memory plan has to
   // carry for this family beside the weights.
+  // A rank's head planes are its heads' width and its feed-forward its
+  // rows' -- at least the whole Perceiver's over the gist, on the
+  // forward that runs it.
+  const std::size_t hp = std::max((std::size_t)JT * HI,
+                                  ts.dirty ? (std::size_t)G * H : 0);
+  const std::size_t fp = std::max((std::size_t)JT * FFI,
+                                  ts.dirty ? (std::size_t)G * FFW : 0);
   SharedBuffer joint = buf((std::size_t)JT * H);
   SharedBuffer nrm = buf((std::size_t)JT * H);
   SharedBuffer ob = buf((std::size_t)JT * H);
-  SharedBuffer qb = buf((std::size_t)JT * H);
-  SharedBuffer kb = buf((std::size_t)JT * H);
-  SharedBuffer vb = buf((std::size_t)JT * H);
-  SharedBuffer qh = buf((std::size_t)JT * H);
-  SharedBuffer kh = buf((std::size_t)JT * H);
-  SharedBuffer vh = buf((std::size_t)JT * H);
-  SharedBuffer ao = buf((std::size_t)JT * H);
-  SharedBuffer ffg = buf((std::size_t)JT * FFI);
-  SharedBuffer ffu = buf((std::size_t)JT * FFI);
+  SharedBuffer qb = buf(hp);
+  SharedBuffer kb = buf(hp);
+  SharedBuffer vb = buf(hp);
+  SharedBuffer qh = buf(hp);
+  SharedBuffer kh = buf(hp);
+  SharedBuffer vh = buf(hp);
+  SharedBuffer ao = buf(hp);
+  SharedBuffer ffg = buf(fp);
+  SharedBuffer ffu = buf(fp);
   // TWO timestep rows throughout: row 0 the image's (sigma * t_scale),
   // row 1 every clean row's (t = 0) -- the per-token modulation.
   SharedBuffer te1 = buf((std::size_t)2 * _cfg.time_mid);
@@ -1663,9 +2080,10 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     ts.inj_v.resize(_inject.size());
     bool ok = !tk.empty() && !tv.empty() && !tkh.empty() && !tvh.empty() &&
               !ts.gist.empty();
+    // A rank keeps its heads' keys and values alone.
     for (std::size_t i = 0; ok && i < _inject.size(); ++i) {
-      ts.inj_k[i] = buf((std::size_t)T * H);
-      ts.inj_v[i] = buf((std::size_t)T * H);
+      ts.inj_k[i] = buf((std::size_t)T * HI);
+      ts.inj_v[i] = buf((std::size_t)T * HI);
       ok = !ts.inj_k[i].empty() && !ts.inj_v[i].empty();
     }
     if (!ok) { return fail("fibo2 forward: text scratch allocation failed"); }
@@ -1688,9 +2106,54 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // pending, and on a run with i8 off.
   if (_i8) { _i8->tune_pending(mc); }
 
+  // A RANK'S EXCHANGE BUFFERS, grown HERE to this forward's widest band
+  // over the two row counts its blocks run (the noise refiner's, the
+  // main stack's): a buffer replaced is forgotten first, and forget()
+  // waits out the exchanges posted on it -- mid-forward those wait on GPU
+  // work not yet committed. Nothing is pending between forwards.
+  int tp_forced = 0, tp_lag = 1;
+  const int tp_floor = rank ? tp_band_floor(_cfg.tp) : 0;
+  if (rank) {
+    if (const char* e = std::getenv("VPIPE_FIBO2_TP_BANDS")) {
+      tp_forced = std::max(0, std::atoi(e));
+    }
+    if (const char* e = std::getenv("VPIPE_FIBO2_TP_LAG")) {
+      tp_lag = std::atoi(e) == 0 ? 0 : 1;
+    }
+    int widest = 0;
+    bool banded = false;
+    for (const int r : {RT, JT}) {
+      const auto bd = tp_row_bands(r, tp_floor, tp_forced);
+      banded = banded || bd.size() > 1;
+      for (const auto& x : bd) { widest = std::max(widest, x.second); }
+    }
+    const std::size_t pb = (std::size_t)widest * (std::size_t)H * 2;
+    const int lanes = banded ? kTpLanes : 1;
+    for (int k = 0; k < lanes; ++k) {
+      if (!tp_buffer_(_tp_part[k], pb) || !tp_buffer_(_tp_recv[k], pb)) {
+        return fail("fibo2 forward: tensor parallel: no room for the "
+                    "partial sums");
+      }
+    }
+  }
+
   CommandStream stream = mc->make_command_stream();
   ComputeEncoder enc = stream.begin_compute();
   if (!enc.valid()) { return fail("fibo2 forward: no compute encoder"); }
+  // A RANK'S EXCHANGES LEFT POSTED when the forward ends early -- a stop
+  // between blocks, a failure -- their partials in work never committed,
+  // would hold the GPU's waits and the worker: abandoned here, before the
+  // encoder and stream go (declared after them). A forward that ran to
+  // its end has none pending.
+  struct TpEnd {
+    TpOverlap* pipe;
+    ~TpEnd()
+    {
+      if (pipe != nullptr && pipe->pending()) {
+        pipe->abandon("the forward ended early");
+      }
+    }
+  } tp_end{rank ? _tp_pipe.get() : nullptr};
   // perf-flops. Whatever an aborted forward left uncredited is dropped,
   // and Sol's GPU counter starts this forward at zero so finish() reads
   // this forward's keep alone.
@@ -1989,15 +2452,18 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   const int A_BK = nax ? 32 : 16;
   const float ascale = 1.0f / std::sqrt((float)Hd);
   std::vector<std::pair<long long, SharedBuffer>> aparams;
-  auto params_for = [&](int qL, int kL) -> const SharedBuffer* {
-    const long long key = ((long long)qL << 32) | (unsigned)kL;
+  // `nh` heads: the share's in a rank's blocks, the whole model's in the
+  // Perceiver -- in the key, as the lengths are.
+  auto params_for = [&](int qL, int kL, int nh) -> const SharedBuffer* {
+    const long long key =
+        ((long long)nh << 48) | ((long long)qL << 24) | (unsigned)kL;
     for (auto& p : aparams) {
       if (p.first == key) { return &p.second; }
     }
     SharedBuffer b = mc->make_shared_buffer(sizeof(SteelAttnParams));
     if (b.empty()) { return nullptr; }
     auto* p = static_cast<SteelAttnParams*>(b.contents());
-    p->B = 1; p->H = NH; p->D = Hd; p->qL = qL; p->kL = kL;
+    p->B = 1; p->H = nh; p->D = Hd; p->qL = qL; p->kL = kL;
     p->gqa_factor = 1; p->scale = ascale;
     p->NQ = (qL + A_BQ - 1) / A_BQ; p->NK = (kL + A_BK - 1) / A_BK;
     p->NQ_aligned = qL / A_BQ; p->NK_aligned = kL / A_BK;
@@ -2006,9 +2472,9 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     p->qL_off = 0;
     const std::int64_t qs = (std::int64_t)qL * Hd;
     const std::int64_t ks = (std::int64_t)kL * Hd;
-    p->Q_strides[0] = (std::int64_t)NH * qs;
+    p->Q_strides[0] = (std::int64_t)nh * qs;
     p->Q_strides[1] = qs; p->Q_strides[2] = Hd;
-    p->K_strides[0] = (std::int64_t)NH * ks;
+    p->K_strides[0] = (std::int64_t)nh * ks;
     p->K_strides[1] = ks; p->K_strides[2] = Hd;
     p->V_strides[0] = p->K_strides[0];
     p->V_strides[1] = ks; p->V_strides[2] = Hd;
@@ -2043,17 +2509,17 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   // into o [NH, qL, Hd] -- the cross-attentions and the Perceiver's.
   auto attend = [&](const SharedBuffer& q, const SharedBuffer& k,
                     const SharedBuffer& v, const SharedBuffer& o, int qL,
-                    int kL) {
+                    int kL, int nh) {
     if (!attn_ok) { return; }
-    const SharedBuffer* pp = params_for(qL, kL);
+    const SharedBuffer* pp = params_for(qL, kL, nh);
     const metal_compute::ComputeFunction* fn = attn_fn(qL, kL, false);
     if (pp == nullptr || fn == nullptr) { attn_ok = false; return; }
     enc.set_function(*fn);
     enc.set_buffer(0, q); enc.set_buffer(1, k); enc.set_buffer(2, v);
     enc.set_buffer(3, o); enc.set_buffer(4, *pp);
     enc.dispatch({(unsigned)(32 * ((qL + A_BQ - 1) / A_BQ)),
-                  (unsigned)(4 * NH), 1}, {32, 4, 1});
-    _flops.attention(NH, (long long)qL * kL, Hd);
+                  (unsigned)(4 * nh), 1}, {32, 4, 1});
+    _flops.attention(nh, (long long)qL * kL, Hd);
   };
   auto run_attn = [&](int L, int rows) {
     if (!attn_ok) { return; }
@@ -2100,7 +2566,7 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
         i8_ok = false;
       }
     }
-    const SharedBuffer* pp = params_for(rows, rows);
+    const SharedBuffer* pp = params_for(rows, rows, NH);
     const metal_compute::ComputeFunction* fn = attn_fn(rows, rows, i8_ok);
     if (pp == nullptr || fn == nullptr) { attn_ok = false; return; }
     enc.set_function(*fn);
@@ -2189,12 +2655,12 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     const auto t_q0 = std::chrono::steady_clock::now();
     if (qg_rows > 0 &&
         !fast_shared_(enc, nrm, 0, qg_rows, H,
-                      {{&b.qw, &qb, 0, H, !LA(&BlockLora::q).empty()},
-                       {&b.kw, &kb, 0, H, !LA(&BlockLora::k).empty()},
-                       {&b.vw, &vb, 0, H, !LA(&BlockLora::v).empty()}})) {
-      lin(nrm, 0, b.qw, qb, 0, qg_rows, H, H, LA(&BlockLora::q));
-      lin(nrm, 0, b.kw, kb, 0, qg_rows, H, H, LA(&BlockLora::k));
-      lin(nrm, 0, b.vw, vb, 0, qg_rows, H, H, LA(&BlockLora::v));
+                      {{&b.qw, &qb, 0, HI, !LA(&BlockLora::q).empty()},
+                       {&b.kw, &kb, 0, HI, !LA(&BlockLora::k).empty()},
+                       {&b.vw, &vb, 0, HI, !LA(&BlockLora::v).empty()}})) {
+      lin(nrm, 0, b.qw, qb, 0, qg_rows, HI, H, LA(&BlockLora::q));
+      lin(nrm, 0, b.kw, kb, 0, qg_rows, HI, H, LA(&BlockLora::k));
+      lin(nrm, 0, b.vw, vb, 0, qg_rows, HI, H, LA(&BlockLora::v));
     }
     mark("gemm.qkv");
     if (qkv_split || qkv_probe) {
@@ -2243,6 +2709,210 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     mark("rope");
     run_attn(L, rows);
     mark("attn");
+    // An injection block's text bundle: -1 for a plain block.
+    const int Lm = L - _cfg.n_refiner;
+    const int bi = Lm >= 0 ? _cfg.bundle_of(Lm) : -1;
+    // The GPU's feed-forward over rows [r0, r0 + n) of `nrm`, its output
+    // into `out` from element `oe` -- `ob`'s own rows for the whole model
+    // (its share of an ANE split, every row of an unsplit block, and the
+    // rows the ANE lost); a band's exchange buffer for a RANK. The
+    // scratch is used from its first row whatever r0 is.
+    auto gpu_ff = [&](int r0, int n, const SharedBuffer& out,
+                      std::size_t oe) {
+      if (n <= 0) { return; }
+      const std::size_t e0 = (std::size_t)r0 * H;
+      if (!fast_shared_(enc, nrm, e0, n, H,
+                        {{&b.w1, &ffg, 0, FFI, !LA(&BlockLora::w1).empty()},
+                         {&b.w3, &ffu, 0, FFI,
+                          !LA(&BlockLora::w3).empty()}})) {
+        lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
+        lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
+      }
+      // FUSED: the down projection's int8 input quantized straight from
+      // gate and up, so the product is never stored -- the same codes
+      // swiglu + gemm_fast make. Not with an adapter on the down
+      // projection (it reads the bf16 product).
+      // VPIPE_FIBO2_NO_SWIGLU_FUSE=1 for the A/B.
+      {
+        const QWeight& dw = b.w2;
+        const SharedBuffer* dc = nullptr;
+        const SharedBuffer* dcs = nullptr;
+        if (_i8 && dw.quantized && dw.gc > 0 && LA(&BlockLora::w2).empty() &&
+            n <= mma_row_band(H, FFI) &&
+            std::getenv("VPIPE_FIBO2_NO_SWIGLU_FUSE") == nullptr &&
+            _i8->fast_accepts(n, H, FFI) &&
+            fast_operand_(enc, dw, &dc, &dcs) &&
+            _i8->gemm_fast_swiglu(enc, ffg, 0, ffu, 0, *dc, *dcs, dw.gc, out,
+                                  oe, n, H, FFI)) {
+          _flops.gemm(n, H, FFI);
+          return;
+        }
+      }
+      // In place on the gate: same index in, same index out. The
+      // largest elementwise dispatch in the model, so it is the one
+      // that pays most for being four-wide.
+      swiglu(ffg, ffu, ffg, n * FFI);
+      lin(ffg, 0, b.w2, out, oe, n, H, FFI, LA(&BlockLora::w2));
+    };
+    // A RANK'S BLOCK TAIL (Config::tp), from the attention's token-major
+    // output on -- in `vb`, its heads' width, apart from `nrm`, which the
+    // norms write band by band while a later band's out projection still
+    // reads the attention. Z-Image's rank tail (its block), with what
+    // this stack adds: the per-token modulation -- a band cut at the
+    // image's last row into the noisy range's chunk and the clean one's
+    // -- and an INJECTION block's cross-attention, its heads' share of the
+    // queries over its heads' keys and values from the text's pass, a
+    // THIRD partial completed before cross_attn_norm2 and the tanh gate.
+    // Every step after the self-attention is a row's own (the cross-
+    // attention reads the text, not the other rows), so a band runs
+    // through all of it: in GPU order step i runs A(i) -- band i's out
+    // projection, posted -- B(i - 1) -- that sum added, normed and gated,
+    // then the injection's projections and attention, posted (a plain
+    // block: the feed-forward's norm and the feed-forward) -- I(i - 2) --
+    // the injection's sum added, normed and gated, the feed-forward,
+    // posted -- and C(i - 3) -- that sum added, normed and gated.
+    // VPIPE_FIBO2_TP_LAG=0 runs the steps band after band. Lanes 0 / 1
+    // carry the attention's partials, 2 / 3 the injection's, 4 / 5 the
+    // feed-forward's (a whole block: lane 0 all three).
+    auto rank_tail = [&]() -> bool {
+      const auto tb = tp_row_bands(rows, tp_floor, tp_forced);
+      const int nb = (int)tb.size();
+      const bool inj = bi > 0;
+      const Inject* in = inj ? &_inject[(std::size_t)(bi - 1)] : nullptr;
+      const int la = nb > 1 ? 2 : 1;
+      const int li = nb > 1 ? 2 : 0, lf = nb > 1 ? 4 : 0;
+      std::vector<std::uint64_t> va((std::size_t)nb), vi((std::size_t)nb),
+          vc((std::size_t)nb);
+      auto post = [&](int lane, int n) {
+        const TpOverlap::Ticket t =
+            _tp_pipe->post(lane, _tp_part[lane], _tp_recv[lane],
+                           (std::size_t)n * (std::size_t)H * 2, _tp_seq++);
+        // Between encoders, into the open command buffer: the signal
+        // after the dispatch that wrote the partial.
+        enc.end();
+        stream.encode_signal(*t.ready, t.ready_at);
+        enc = stream.begin_compute();
+        return t.done_at;
+      };
+      auto await = [&](std::uint64_t v) {
+        enc.end();
+        stream.encode_wait(_tp_pipe->done(), v);
+        enc = stream.begin_compute();
+      };
+      // Rows [r0, r0 + n) cut at the image's last: `f` with the chunk's
+      // row in `mods` (0 noisy, M4 clean), its first row and its count.
+      const std::size_t M4 = (std::size_t)4 * H;
+      auto each_mod = [&](int r0, int n, const auto& f) {
+        const int z = r0 + n;
+        if (r0 < nN) { f((std::size_t)0, r0, std::min(z, nN) - r0); }
+        if (z > nN) {
+          const int a = std::max(r0, nN);
+          f(M4, a, z - a);
+        }
+      };
+      // The band's partial completed by the others' sum and post-normed.
+      auto complete = [&](const SharedBuffer& p, const SharedBuffer& recv,
+                          const SharedBuffer& post_norm, int n) {
+        resid(p, 0, recv, 0, n * H);
+        rms(p, 0, post_norm, p, 0, n, H);
+      };
+      // ...into the residual through the block's gate `g` of `mods`.
+      auto gate_band = [&](const SharedBuffer& p, std::size_t g, int r0,
+                           int n) {
+        each_mod(r0, n, [&](std::size_t mo, int a, int c) {
+          gated(joint, (std::size_t)a * H, mods, mo + g, p,
+                (std::size_t)(a - r0) * H, c);
+        });
+      };
+      // The feed-forward's input norm and (1 + scale) over the band, then
+      // the feed-forward into lane `lane`, posted.
+      auto ff_band = [&](int k, int r0, int n) {
+        const std::size_t ne = (std::size_t)r0 * H;
+        if (_fold_mod) {
+          each_mod(r0, n, [&](std::size_t mo, int a, int c) {
+            rms(joint, (std::size_t)a * H, nw3, nrm, (std::size_t)a * H, c,
+                H, mo == 0 ? 0 : (std::size_t)H);
+          });
+        } else {
+          rms(joint, ne, b.fn1, nrm, ne, n, H);
+          each_mod(r0, n, [&](std::size_t mo, int a, int c) {
+            modulate(nrm, (std::size_t)a * H, mods,
+                     mo + (std::size_t)2 * H, nrm, (std::size_t)a * H, c);
+          });
+        }
+        const int lane = lf + k % la;
+        gpu_ff(r0, n, _tp_part[lane], 0);
+        vc[(std::size_t)k] = post(lane, n);
+      };
+      auto step_a = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        lin(vb, (std::size_t)r0 * HI, b.ow, _tp_part[k % la], 0, n, H, HI);
+        va[(std::size_t)k] = post(k % la, n);
+      };
+      auto step_b = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        const SharedBuffer& p = _tp_part[k % la];
+        await(va[(std::size_t)k]);
+        complete(p, _tp_recv[k % la], b.an2, n);
+        gate_band(p, (std::size_t)H, r0, n);
+        if (!inj) {
+          ff_band(k, r0, n);
+          return;
+        }
+        // The injection's queries for the band, its heads' -- each row
+        // against the text alone.
+        const std::size_t ne = (std::size_t)r0 * H;
+        rms(joint, ne, in->n1, nrm, ne, n, H);
+        lin(nrm, ne, in->ca.qw, qb, 0, n, HI, H);
+        rms(qb, 0, in->ca.nq, qb, 0, n * NH, Hd);
+        transpose(qb, qh, n, NH);
+        attend(qh, ts.inj_k[(std::size_t)(bi - 1)],
+               ts.inj_v[(std::size_t)(bi - 1)], ao, n, T, NH);
+        transpose(ao, kb, NH, n);
+        const int lane = li + k % la;
+        lin(kb, 0, in->ca.ow, _tp_part[lane], 0, n, H, HI);
+        vi[(std::size_t)k] = post(lane, n);
+      };
+      auto step_i = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        const int lane = li + k % la;
+        await(vi[(std::size_t)k]);
+        complete(_tp_part[lane], _tp_recv[lane], in->n2, n);
+        gated(joint, (std::size_t)r0 * H, in->gate, 0, _tp_part[lane], 0,
+              n);
+        ff_band(k, r0, n);
+      };
+      auto step_c = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        const int lane = lf + k % la;
+        await(vc[(std::size_t)k]);
+        complete(_tp_part[lane], _tp_recv[lane], b.fn2, n);
+        gate_band(_tp_part[lane], (std::size_t)3 * H, r0, n);
+      };
+      const int last = inj ? 3 : 2;
+      for (int i = 0; i < nb + last * tp_lag; ++i) {
+        auto at = [&](int s) { return i - s * tp_lag; };
+        if (i < nb) { step_a(i); }
+        if (at(1) >= 0 && at(1) < nb) { step_b(at(1)); }
+        if (inj && at(2) >= 0 && at(2) < nb) { step_i(at(2)); }
+        if (at(last) >= 0 && at(last) < nb) { step_c(at(last)); }
+      }
+      mark("tp");
+      if (_tp_pipe->failed()) {
+        tp_err = _tp_pipe->error();
+        return false;
+      }
+      return true;
+    };
+    if (rank) {
+      transpose(ao, vb, NH, rows);
+      mark("transpose");
+      return rank_tail();
+    }
     transpose(ao, nrm, NH, rows);
     mark("transpose");
     lin(nrm, 0, b.ow, ob, 0, rows, H, H, LA(&BlockLora::o));
@@ -2256,8 +2926,6 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     // row (image, context, gist) reads this block's text bundle:
     // unmodulated, no rotary, keys and values from set_text's pass, into
     // the residual through tanh(cross_attn_gate).
-    const int Lm = L - _cfg.n_refiner;
-    const int bi = Lm >= 0 ? _cfg.bundle_of(Lm) : -1;
     if (bi > 0) {
       const std::size_t k = (std::size_t)(bi - 1);
       const Inject& in = _inject[k];
@@ -2265,7 +2933,7 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       lin(nrm, 0, in.ca.qw, qb, 0, rows, H, H);
       rms(qb, 0, in.ca.nq, qb, 0, rows * NH, Hd);
       transpose(qb, qh, rows, NH);
-      attend(qh, ts.inj_k[k], ts.inj_v[k], ao, rows, T);
+      attend(qh, ts.inj_k[k], ts.inj_v[k], ao, rows, T, NH);
       transpose(ao, nrm, NH, rows);
       lin(nrm, 0, in.ca.ow, ob, 0, rows, H, H);
       rms(ob, 0, in.n2, ob, 0, rows, H);
@@ -2306,50 +2974,11 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
-    // The GPU's feed-forward over rows [r0, r0 + n), `nrm` into `ob`: its
-    // share of a split, every row of an unsplit block, and the rows the
-    // ANE lost. The scratch is used from its first row whatever r0 is.
-    auto gpu_ff = [&](int r0, int n) {
-      if (n <= 0) { return; }
-      const std::size_t e0 = (std::size_t)r0 * H;
-      if (!fast_shared_(enc, nrm, e0, n, H,
-                        {{&b.w1, &ffg, 0, FFI, !LA(&BlockLora::w1).empty()},
-                         {&b.w3, &ffu, 0, FFI,
-                          !LA(&BlockLora::w3).empty()}})) {
-        lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
-        lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
-      }
-      // FUSED: the down projection's int8 input quantized straight from
-      // gate and up, so the product is never stored -- the same codes
-      // swiglu + gemm_fast make. Not with an adapter on the down
-      // projection (it reads the bf16 product).
-      // VPIPE_FIBO2_NO_SWIGLU_FUSE=1 for the A/B.
-      {
-        const QWeight& dw = b.w2;
-        const SharedBuffer* dc = nullptr;
-        const SharedBuffer* dcs = nullptr;
-        if (_i8 && dw.quantized && dw.gc > 0 && LA(&BlockLora::w2).empty() &&
-            n <= mma_row_band(H, FFI) &&
-            std::getenv("VPIPE_FIBO2_NO_SWIGLU_FUSE") == nullptr &&
-            _i8->fast_accepts(n, H, FFI) &&
-            fast_operand_(enc, dw, &dc, &dcs) &&
-            _i8->gemm_fast_swiglu(enc, ffg, 0, ffu, 0, *dc, *dcs, dw.gc, ob,
-                                  e0, n, H, FFI)) {
-          _flops.gemm(n, H, FFI);
-          return;
-        }
-      }
-      // In place on the gate: same index in, same index out. The
-      // largest elementwise dispatch in the model, so it is the one
-      // that pays most for being four-wide.
-      swiglu(ffg, ffu, ffg, n * FFI);
-      lin(ffg, 0, b.w2, ob, e0, n, H, FFI, LA(&BlockLora::w2));
-    };
     // The GPU's share. A probe block deliberately takes EVERY row:
     // that is what makes its time comparable with the split's.
     const int g_rows = rows - a_rows;
     const auto t_g0 = std::chrono::steady_clock::now();
-    gpu_ff(0, g_rows);
+    gpu_ff(0, g_rows, ob, 0);
     mark("gemm.ff");
     // The GPU's rows have to be DONE before the ANE's are folded in and
     // before the norm below reads the whole tensor, so this commit is
@@ -2376,7 +3005,9 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
       // stream_per_commit_costs).
       enc = stream.begin_compute();
-      if (ff_lost >= 0) { gpu_ff(ff_lost, rows - ff_lost); }
+      if (ff_lost >= 0) {
+        gpu_ff(ff_lost, rows - ff_lost, ob, (std::size_t)ff_lost * H);
+      }
     }
     rms(ob, 0, b.fn2, ob, 0, rows, H);
     gate_in((std::size_t)3 * H);
@@ -2418,25 +3049,27 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
   if (ts.dirty) {
     const std::size_t bstride = (std::size_t)T * CAP;
     // A cross-attention's keys (normed) and values over text bundle
-    // `te`, head-major [NH, T, Hd].
+    // `te`, head-major [nh, T, Hd]: the Perceiver's every head, a rank's
+    // injection block its own.
     auto text_kv = [&](const CrossAttn& ca, std::size_t te,
-                       const SharedBuffer& ko, const SharedBuffer& vo) {
-      lin(ts.text, te, ca.kw, tk, 0, T, H, CAP);
-      rms(tk, 0, ca.nk, tk, 0, T * NH, Hd);
-      transpose(tk, ko, T, NH);
-      lin(ts.text, te, ca.vw, tv, 0, T, H, CAP);
-      transpose(tv, vo, T, NH);
+                       const SharedBuffer& ko, const SharedBuffer& vo,
+                       int nh) {
+      lin(ts.text, te, ca.kw, tk, 0, T, nh * Hd, CAP);
+      rms(tk, 0, ca.nk, tk, 0, T * nh, Hd);
+      transpose(tk, ko, T, nh);
+      lin(ts.text, te, ca.vw, tv, 0, T, nh * Hd, CAP);
+      transpose(tv, vo, T, nh);
     };
     copy_rows(_queries, 0, ts.gist, 0, G, H, H, H);
     for (const PerceiverLayer& l : _perceiver) {
       // Cross-attention to bundle 0.
       rms(ts.gist, 0, l.n_ca, nrm, 0, G, H);
       lin(nrm, 0, l.ca.qw, qb, 0, G, H, H);
-      rms(qb, 0, l.ca.nq, qb, 0, G * NH, Hd);
-      transpose(qb, qh, G, NH);
-      text_kv(l.ca, 0, tkh, tvh);
-      attend(qh, tkh, tvh, ao, G, T);
-      transpose(ao, nrm, NH, G);
+      rms(qb, 0, l.ca.nq, qb, 0, G * NHW, Hd);
+      transpose(qb, qh, G, NHW);
+      text_kv(l.ca, 0, tkh, tvh, NHW);
+      attend(qh, tkh, tvh, ao, G, T, NHW);
+      transpose(ao, nrm, NHW, G);
       lin(nrm, 0, l.ca.ow, ob, 0, G, H, H);
       resid(ts.gist, 0, ob, 0, G * H);
       // Self-attention, no rotary.
@@ -2444,26 +3077,27 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
       lin(nrm, 0, l.sq, qb, 0, G, H, H);
       lin(nrm, 0, l.sk, kb, 0, G, H, H);
       lin(nrm, 0, l.sv, vb, 0, G, H, H);
-      rms(qb, 0, l.snq, qb, 0, G * NH, Hd);
-      rms(kb, 0, l.snk, kb, 0, G * NH, Hd);
-      transpose(qb, qh, G, NH);
-      transpose(kb, kh, G, NH);
-      transpose(vb, vh, G, NH);
-      attend(qh, kh, vh, ao, G, G);
-      transpose(ao, nrm, NH, G);
+      rms(qb, 0, l.snq, qb, 0, G * NHW, Hd);
+      rms(kb, 0, l.snk, kb, 0, G * NHW, Hd);
+      transpose(qb, qh, G, NHW);
+      transpose(kb, kh, G, NHW);
+      transpose(vb, vh, G, NHW);
+      attend(qh, kh, vh, ao, G, G, NHW);
+      transpose(ao, nrm, NHW, G);
       lin(nrm, 0, l.so, ob, 0, G, H, H);
       resid(ts.gist, 0, ob, 0, G * H);
       // SwiGLU.
       rms(ts.gist, 0, l.n_ff, nrm, 0, G, H);
-      lin(nrm, 0, l.w1, ffg, 0, G, FFI, H);
-      lin(nrm, 0, l.w3, ffu, 0, G, FFI, H);
-      swiglu(ffg, ffu, ffg, G * FFI);
-      lin(ffg, 0, l.w2, ob, 0, G, H, FFI);
+      lin(nrm, 0, l.w1, ffg, 0, G, FFW, H);
+      lin(nrm, 0, l.w3, ffu, 0, G, FFW, H);
+      swiglu(ffg, ffu, ffg, G * FFW);
+      lin(ffg, 0, l.w2, ob, 0, G, H, FFW);
       resid(ts.gist, 0, ob, 0, G * H);
     }
     rms(ts.gist, 0, _p_norm_out, ts.gist, 0, G, H);
     for (std::size_t i = 0; i < _inject.size(); ++i) {
-      text_kv(_inject[i].ca, (i + 1) * bstride, ts.inj_k[i], ts.inj_v[i]);
+      text_kv(_inject[i].ca, (i + 1) * bstride, ts.inj_k[i], ts.inj_v[i],
+              NH);
     }
     trace("gist", ts.gist, (std::size_t)G * H);
     mark("text");
@@ -2698,6 +3332,10 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
 
     fill_mod(*b);
     if (!run_block(*b, rows, L, ane_plan, qkv_plan)) {
+      if (!tp_err.empty()) {
+        if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+        return fail("fibo2 forward: tensor parallel: " + tp_err);
+      }
       return fail("fibo2 forward: block " + std::to_string(L) +
                   " failed");
     }
@@ -2820,6 +3458,12 @@ MetalFibo2Transformer::forward(const Request& req, std::string* err)
     if (!stream.commit().wait_ok(&ge)) {
       return fail("fibo2 forward: " + (ge.empty() ? "GPU failed" : ge));
     }
+  }
+  // A rank whose exchange failed after its last block was encoded ran
+  // on with wrong sums (TpOverlap releases its waits): said here.
+  if (rank && _tp_pipe->failed()) {
+    if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+    return fail("fibo2 forward: tensor parallel: " + _tp_pipe->error());
   }
   // Every routed layer has run, so Sol's count is this forward's whole.
   if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
@@ -3403,10 +4047,179 @@ MetalFibo2Transformer::streaming_floor_bytes(const std::string& dir)
   return floor + gates;
 }
 
+namespace {
+
+// [rows] x [cols] of the [N, K] weight `nm` as a rank holds its share
+// (MetalFibo2Transformer::tp_qw_): on the int8 fast / token tier (`fast`
+// non-null) an affine share converted where its columns take a group (a
+// w4 one only where `hold_w4`), a dense one quantized (a dense
+// checkpoint's alone, `pack` false); else bf16, or a pack's codes,
+// scales and biases.
+std::size_t
+tp_proj_bytes_(const MetalLlamaWeights& src, const I8GemmContext* fast,
+               bool hold_w4, bool pack, const std::string& nm,
+               std::size_t N, std::size_t K, std::size_t rows,
+               std::size_t cols)
+{
+  const auto* ci = src.info(nm + ".weight");
+  const auto* si = src.info(nm + ".scales");
+  const std::size_t share = rows * cols;
+  const int fgc = fast != nullptr ? fast->fast_group((int)cols) : 0;
+  const std::size_t layout =
+      fgc > 0
+          ? share + I8GemmContext::fast_scale_bytes((int)rows, (int)cols, fgc)
+          : 0;
+  if (ci != nullptr && si != nullptr && si->shape.size() == 2 &&
+      si->shape[1] > 0 && N * K > 0) {
+    const std::size_t bits = (std::size_t)ci->nbytes * 8 / (N * K);
+    const std::size_t g =
+        std::max<std::size_t>(K / (std::size_t)si->shape[1], 1);
+    const std::size_t as_pack = share * bits / 8 + 2 * (share / g) * 2;
+    if (fgc > 0 && g == 64 && fast->fast_converts((int)bits, fgc) &&
+        (bits == 8 || hold_w4)) {
+      return layout;
+    }
+    return as_pack;
+  }
+  return fgc > 0 && !pack ? layout : share * 2;
+}
+
+// A tensor as the model holds it whole: a float one bf16, anything else
+// (a pack's codes) as stored.
+std::size_t
+tp_whole_bytes_(const MetalLlamaWeights& src, const std::string& nm)
+{
+  const auto* ti = src.info(nm);
+  if (ti == nullptr) { return 0; }
+  std::size_t n = 1;
+  for (auto d : ti->shape) { n *= (std::size_t)d; }
+  const bool fl =
+      ti->dtype == "F32" || ti->dtype == "F16" || ti->dtype == "BF16";
+  return fl ? n * 2 : (std::size_t)ti->nbytes;
+}
+
+}  // namespace
+
+// One block's SHARE as tp_qw_ leaves it, off the headers (Z-Image's
+// arithmetic: the same block) -- its seven projections at the share's
+// rows and columns in the layout each takes, its norms and adaLN whole.
+std::size_t
+MetalFibo2Transformer::tp_block_bytes_(const MetalLlamaWeights& src,
+                                       const Config& c,
+                                       const I8GemmContext* fast,
+                                       const std::string& pfx)
+{
+  const TpShare& t = c.tp;
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t F = (std::size_t)c.ffn_inner;
+  const std::size_t hi = (std::size_t)t.heads() * (std::size_t)c.head_dim;
+  const std::size_t f = (std::size_t)t.ffn();
+  const bool pack = src.info(pfx + "attention.to_q.scales") != nullptr;
+  auto proj = [&](const char* nm, std::size_t N, std::size_t K,
+                  std::size_t rows, std::size_t cols) {
+    return tp_proj_bytes_(src, fast, c.i8_hold_w4, pack, pfx + nm, N, K,
+                          rows, cols);
+  };
+  std::size_t n = proj("attention.to_q", H, H, hi, H) +
+                  proj("attention.to_k", H, H, hi, H) +
+                  proj("attention.to_v", H, H, hi, H) +
+                  proj("attention.to_out.0", H, H, H, hi) +
+                  proj("feed_forward.w1", F, H, f, H) +
+                  proj("feed_forward.w3", F, H, f, H) +
+                  proj("feed_forward.w2", H, F, H, f);
+  for (const char* nm :
+       {"attention.norm_q.weight", "attention.norm_k.weight",
+        "attention_norm1.weight", "attention_norm2.weight",
+        "ffn_norm1.weight", "ffn_norm2.weight", "adaLN_modulation.0.weight",
+        "adaLN_modulation.0.scales", "adaLN_modulation.0.biases",
+        "adaLN_modulation.0.bias"}) {
+    n += tp_whole_bytes_(src, pfx + nm);
+  }
+  return n;
+}
+
+std::size_t
+MetalFibo2Transformer::tp_held_bytes(const std::string& dir, const Config& c,
+                                     MetalCompute* mc, std::size_t* floor)
+{
+  if (floor != nullptr) { *floor = 0; }
+  if (!c.tp.active() || dir.empty()) { return 0; }
+  auto wts = MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return 0; }
+  // The int8 tier as load() decides it, on a context made as it makes
+  // one: no matrix cores, the accurate tier, or a pack of another group,
+  // and the shares stay as cut.
+  std::unique_ptr<I8GemmContext> i8;
+  if (mc != nullptr && c.i8_gemm && c.i8_tier > 0 &&
+      mc->supports_matrix_cores() && !c.ane_ffn && !c.ane_qkv &&
+      std::getenv("VPIPE_FIBO2_NO_MMA2") == nullptr) {
+    i8 = std::make_unique<I8GemmContext>(mc, true, /*bf16=*/true);
+    i8->set_tier(c.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : c.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                  : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(c.i8_tier == 2);
+    if (!i8->enabled() || i8->fast_group(c.hidden) <= 0) { i8.reset(); }
+  }
+  const std::string p0 = "noise_refiner.0.";
+  if (i8 != nullptr) {
+    const auto* si = wts->info(p0 + "attention.to_q.scales");
+    if (si != nullptr && si->shape.size() == 2 && si->shape[1] > 0 &&
+        c.hidden / (int)si->shape[1] != 64) {
+      i8.reset();
+    }
+  }
+  // The trunk: every tensor outside the stack, bf16 (narrowed from F32
+  // or F16) or a pack's codes as stored -- the Perceiver whole -- and the
+  // injection blocks' cross-attention at the share's heads, its norms
+  // whole and its gate a row.
+  std::size_t trunk = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.rfind("noise_refiner.", 0) == 0 || nm.rfind("layers.", 0) == 0) {
+      continue;
+    }
+    trunk += tp_whole_bytes_(*wts, nm);
+  }
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t hi = (std::size_t)c.tp.heads() * (std::size_t)c.head_dim;
+  const std::size_t CAP = (std::size_t)c.cap_dim;
+  for (int id : c.injection_ids) {
+    const std::string p = "layers." + std::to_string(id) + ".";
+    const std::string ca = p + "cross_attention.";
+    const bool pack = wts->info(ca + "to_q.scales") != nullptr;
+    auto proj = [&](const char* nm, std::size_t K, std::size_t rows,
+                    std::size_t cols) {
+      return tp_proj_bytes_(*wts, nullptr, c.i8_hold_w4, pack, ca + nm, H,
+                            K, rows, cols);
+    };
+    trunk += proj("to_q", H, hi, H) + proj("to_k", CAP, hi, CAP) +
+             proj("to_v", CAP, hi, CAP) + proj("to_out.0", H, H, hi) +
+             tp_whole_bytes_(*wts, ca + "norm_q.weight") +
+             tp_whole_bytes_(*wts, ca + "norm_k.weight") +
+             tp_whole_bytes_(*wts, p + "cross_attn_norm1.weight") +
+             tp_whole_bytes_(*wts, p + "cross_attn_norm2.weight") + H * 2;
+  }
+  std::size_t held = trunk, widest = 0;
+  for (int L = 0; L < c.n_mod_blocks(); ++L) {
+    const std::string pfx =
+        L < c.n_refiner ? "noise_refiner." + std::to_string(L) + "."
+                        : "layers." + std::to_string(L - c.n_refiner) + ".";
+    const std::size_t b = tp_block_bytes_(*wts, c, i8.get(), pfx);
+    held += b;
+    widest = std::max(widest, b);
+  }
+  if (floor != nullptr) { *floor = trunk + 2 * widest; }
+  return held;
+}
+
 std::size_t
 MetalFibo2Transformer::checkpoint_block_bytes_() const
 {
   if (_ws == nullptr) { return 0; }
+  // A RANK keeps its share of a block, in its tier's layout.
+  if (_cfg.tp.active()) {
+    return tp_block_bytes_(_ws->src(), _cfg, _fast ? _i8.get() : nullptr,
+                           mod_prefix_(0));
+  }
   const MetalLlamaWeights& w = _ws->src();
   // Block 0 of the streaming stack, which is noise_refiner.0 -- the
   // same shape as every block in the stack.
@@ -3536,16 +4349,38 @@ MetalFibo2Transformer::forward_scratch_bytes(const Config& c, int img_rows,
   const std::size_t Gn = guided ? gist_of(Tn) : 0;
   const std::size_t RT = (std::size_t)img_rows;
   const std::size_t JT = RT + std::max(G, Gn);
+  // A RANK's head planes are its heads' width and its feed-forward its
+  // rows' -- the whole Perceiver's over the gist at least -- its injection
+  // keys and values its heads' alone, and it holds its EXCHANGE BUFFERS,
+  // a partial and the others' sum a lane at the widest band of its two
+  // row counts (tp_row_bands; six lanes banded, one whole).
+  const bool rank = c.tp.active();
   const std::size_t H = (std::size_t)c.hidden;
-  const std::size_t F = (std::size_t)c.ffn_inner;
+  const std::size_t FW = (std::size_t)c.ffn_inner;
+  const std::size_t F = rank ? (std::size_t)c.tp.ffn() : FW;
   const std::size_t Hd = (std::size_t)c.head_dim;
+  const int NH = rank ? c.tp.heads() : c.n_heads;
+  const std::size_t HI = (std::size_t)NH * Hd;
   const std::size_t NI = c.injection_ids.size();
-  std::size_t n = 10 * JT * H * 2 + 2 * JT * F * 2 + 2 * JT * Hd * 4 +
+  const std::size_t GM = std::max(G, Gn);
+  std::size_t n = 3 * JT * H * 2 + 7 * std::max(JT * HI, GM * H) * 2 +
+                  2 * std::max(JT * F, GM * FW) * 2 + 2 * JT * Hd * 4 +
                   RT * (std::size_t)c.patch_dim() * 2;
-  n += 4 * std::max(T, Tn) * H * 2 + G * H * 2 + 2 * NI * T * H * 2;
-  if (guided) { n += Gn * H * 2 + 2 * NI * Tn * H * 2; }
-  if (packed) { n += F * H * 2; }
-  const int NH = c.n_heads;
+  n += 4 * std::max(T, Tn) * H * 2 + G * H * 2 + 2 * NI * T * HI * 2;
+  if (guided) { n += Gn * H * 2 + 2 * NI * Tn * HI * 2; }
+  if (packed) { n += std::max(FW, HI) * H * 2; }
+  if (rank) {
+    std::size_t widest = 0;
+    bool banded = false;
+    for (std::size_t r : {RT, JT}) {
+      const auto bd = tp_row_bands((int)r, tp_band_floor(c.tp));
+      banded = banded || bd.size() > 1;
+      for (const auto& x : bd) {
+        widest = std::max(widest, (std::size_t)x.second);
+      }
+    }
+    n += (banded ? (std::size_t)kTpLanes : 1u) * 2 * widest * H * 2;
+  }
   // Sol on either arm: the matrix-core one's bf16 partial, or the ALU
   // one's fp32 padded one.
   if (c.sol.enabled) {

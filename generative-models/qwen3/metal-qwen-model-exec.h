@@ -11,6 +11,7 @@
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/context-io.h"
 #include "generative-models/model-exec.h"
+#include "generative-models/prefill-progress.h"
 #include "generative-models/speculative-decode.h"
 
 #include <cstdint>
@@ -28,7 +29,8 @@ namespace vpipe::metal_compute { class MetalCompute; }
 namespace vpipe::genai {
 
 class MetalQwenModelExec : public ModelExec, private SpecDecodeExt,
-                           private ContextIoExt {
+                           private ContextIoExt,
+                           private PrefillProgressExt {
 public:
   MetalQwenModelExec(const std::string&            model_dir,
                      metal_compute::MetalCompute*  mc,
@@ -170,6 +172,12 @@ private:
   bool attach_drafter(const std::string& dir, int bits,
                       std::string* err) override;
   bool generate(const SpecDecodeRequest& rq, SpecDecodeResult* out) override;
+
+  // ---- PrefillProgressExt: each piece of a prefill read in pieces -----
+  void set_prefill_progress(prefill_progress::Fn fn) override
+  {
+    if (_model != nullptr) { _model->set_prefill_progress(std::move(fn)); }
+  }
 
   // ---- ContextIoExt: a context written out and read back --------------
   bool export_context(ContextId ctx,

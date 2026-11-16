@@ -4359,3 +4359,95 @@ TEST(minimax_h3_blocks, a_long_sequences_heads_are_addressed_past_2_32)
     EXPECT_TRUE(nbad == 0);
   }
 }
+
+// ---- the feed-forward's SwiGLU past 2^31 outputs -----------------------
+//
+// A WHOLE-SEQUENCE block (the Neural Engine's share, VDN's branch,
+// streaming attention -- and, before the prompt banded, any prompt longer
+// than a band) ran its SwiGLU as ONE grid of rows x ffn threads, and the
+// kernel took the row as (int)gid / D: past 2^31 outputs -- from row 149,796
+// at H3's 14,336 -- the row went negative and every output from there on
+// came from somewhere else. A 15 s 1440p Ref2VA draft (218,406 rows: its
+// 12,010-row prompt ran every block whole) was noise from frame ~136.
+// The kernel indexes unsigned now, and the forward runs the pass in row
+// bands (elt_rows) besides; this runs the kernel ALONE, in one grid past
+// 2^31, and reads rows on both sides of the line.
+TEST(minimax_h3_blocks, swiglu_reads_its_rows_past_2_31_outputs)
+{
+  if (std::getenv("VPIPE_H3_BIG_SEQ") == nullptr) {
+    std::printf("[ SKIP     ] set VPIPE_H3_BIG_SEQ=1 (allocates ~13 GB)\n");
+    return;
+  }
+  auto session = std::make_shared<Session>();
+  MetalCompute* mc = session->metal_compute();
+  if (mc == nullptr) { EXPECT_TRUE(false); return; }
+  ComputeLibrary lelt = mc->load_library("llm_elementwise_bf16");
+  ComputeFunction sw = lelt.function("swiglu_split_gate_first_f16");
+  if (!sw.valid()) { EXPECT_TRUE(false); return; }
+  const int D = kFfn, R = 152000;            // R * D = 2.18e9 outputs
+  const int line = (int)((1LL << 31) / D);   // 149,796: the last good row
+  const std::size_t out_n = (std::size_t)R * D;
+  SharedBuffer in = mc->make_shared_buffer(out_n * 2 * 2);
+  SharedBuffer out = mc->make_shared_buffer(out_n * 2);
+  if (in.empty() || out.empty()) {
+    std::printf("  allocation failed -- not enough memory for this test\n");
+    EXPECT_TRUE(false);
+    return;
+  }
+  // [gate | up], each row's values its own: a row read from another is a
+  // wrong number. Both exact in bf16 (sixteenths, thirty-seconds).
+  auto gate = [](long long r, int d) {
+    return (float)(((r * 13 + d) % 61) - 30) / 16.0f;
+  };
+  auto up = [](long long r, int d) {
+    return (float)(((r * 7 + d * 3) % 53) - 26) / 32.0f;
+  };
+  {
+    std::uint16_t gt[61], ut[53];
+    for (int i = 0; i < 61; ++i) { gt[i] = to_bf16_((i - 30) / 16.0f); }
+    for (int i = 0; i < 53; ++i) { ut[i] = to_bf16_((i - 26) / 32.0f); }
+    auto* p = static_cast<std::uint16_t*>(in.contents());
+    for (long long r = 0; r < R; ++r) {
+      std::uint16_t* g = p + (std::size_t)r * 2 * D;
+      std::uint16_t* u = g + D;
+      int gi = (int)((r * 13) % 61), ui = (int)((r * 7) % 53);
+      for (int d = 0; d < D; ++d) {
+        g[d] = gt[gi];
+        u[d] = ut[ui];
+        gi = gi == 60 ? 0 : gi + 1;
+        ui += 3;
+        if (ui >= 53) { ui -= 53; }
+      }
+    }
+    std::memset(out.contents(), 0xff, out_n * 2);   // NaN until written
+  }
+  CommandStream st = mc->make_command_stream();
+  {
+    ComputeEncoder enc = st.begin_compute();
+    enc.set_function(sw);
+    enc.set_buffer(0, in); enc.set_buffer(1, out);
+    enc.set_constant(2, R);
+    enc.set_constant(3, D);
+    enc.dispatch({(unsigned)out_n, 1, 1}, {256, 1, 1});
+    enc.end();
+  }
+  st.commit().wait();
+  const auto* op = static_cast<const std::uint16_t*>(out.contents());
+  int bad = 0, bad_past = 0;
+  for (int r : {0, 1, line - 2, line - 1, line, line + 1, line + 2,
+                line + 1000, R - 2, R - 1}) {
+    for (int d = 0; d < D; ++d) {
+      const float g = gate(r, d), v = up(r, d);
+      const float want = v * (g / (1.0f + std::exp(-g)));
+      const float got = from_bf16_(op[(std::size_t)r * D + d]);
+      if (!(std::fabs(got - want) <=
+            1e-2f * std::max(1.0f, std::fabs(want)))) {
+        ++bad;
+        if (r > line) { ++bad_past; }
+      }
+    }
+  }
+  std::printf("  swiglu [%d, %d] in one grid  bad %d (past row %d: %d)\n",
+              R, D, bad, line, bad_past);
+  EXPECT_TRUE(bad == 0);
+}

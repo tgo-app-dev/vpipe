@@ -347,6 +347,13 @@ public:
   // MiniMax-H3's packed sequence as the launch plan books it
   // (h3_plan_seq_).
   int planned_h3_rows() const { return h3_plan_seq_(); }
+  // ...and the prompt's rows within it.
+  int planned_h3_text_rows() const
+  {
+    int t = 0;
+    (void)h3_plan_seq_(&t);
+    return t;
+  }
 
 private:
   // Which DiT family the resident checkpoint is, from its `_class_name`
@@ -381,8 +388,10 @@ private:
   // MiniMax-H3's packed sequence at the planned geometry (a 512-row
   // prompt, the two conditioning frames -- none for a refine, and a
   // refine in context's 768P draft), and the forward's activations
-  // there -- the denoise phase's scratch in both ledgers.
-  int h3_plan_seq_() const;
+  // there -- the denoise phase's scratch in both ledgers. `text`: the
+  // prompt's rows within it (the 512, and a presentation's tokens --
+  // an edit's picture, an in-context refine's draft).
+  int h3_plan_seq_(int* text = nullptr) const;
   std::size_t h3_forward_scratch_bytes_(const std::string& dit) const;
   // The runtime adapters the model config names, resolved as the load
   // resolves them -- read off the pre-launch constant, so the plan books

@@ -288,6 +288,9 @@ MetalDeepseekV41ModelExec::query_extension(std::string_view id) noexcept
   if (id == spec_decode::kExtensionId) {
     return static_cast<SpecDecodeExt*>(this);
   }
+  if (id == prefill_progress::kExtensionId) {
+    return static_cast<PrefillProgressExt*>(this);
+  }
   return ModelExec::query_extension(id);
 }
 

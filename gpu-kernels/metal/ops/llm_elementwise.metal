@@ -1299,10 +1299,10 @@ kernel void glu_split_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float a = float(in[base + d]);
   const float g = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(a * (1.0f / (1.0f + exp(-g))));
@@ -5636,6 +5636,10 @@ kernel void umt5_attn_f16(
 // gate_msa, shift_mlp, scale_mlp, gate_mlp.
 
 // out[m,n] = (1 + scale[idx[m], n]) * x[m,n] + shift[idx[m], n]
+// The row and column are taken unsigned, as the split kernels' are;
+// `total` is an int, so a dispatch covers at most 2^31 - 1 elements and
+// a longer activation is dispatched in row bands (idx, x and out bound
+// at the band's row).
 //   0:x[M,N] 1:mod[*,stride] 2:idx[M] (int32) 3:out[M,N] 4:N 5:stride
 //   6:scale_off 7:shift_off 8:total(=M*N).  grid (total).
 kernel void adaln_modulate_idx_f16(
@@ -5651,8 +5655,8 @@ kernel void adaln_modulate_idx_f16(
     uint gid [[thread_position_in_grid]])
 {
   if (gid >= (uint)total) { return; }
-  const int m = (int)gid / N;
-  const int n = (int)gid % N;
+  const uint m = gid / (uint)N;
+  const uint n = gid % (uint)N;
   const int64_t base = (int64_t)idx[m] * stride;
   const float sc = float(mod[base + scale_off + n]);
   const float sh = float(mod[base + shift_off + n]);
@@ -5674,8 +5678,8 @@ kernel void gated_residual_idx_f16(
     uint gid [[thread_position_in_grid]])
 {
   if (gid >= (uint)total) { return; }
-  const int m = (int)gid / N;
-  const int n = (int)gid % N;
+  const uint m = gid / (uint)N;
+  const uint n = gid % (uint)N;
   const int64_t base = (int64_t)idx[m] * stride;
   h[gid] = VPIPE_ELT(float(h[gid]) +
                      float(mod[base + gate_off + n]) * float(sub[gid]));
@@ -5692,6 +5696,13 @@ kernel void gated_residual_idx_f16(
 // gate-first matrix produces a plausible, wrong activation rather than
 // anything that fails loudly, which is why it is a separate entry point
 // instead of a flag on swiglu_f16.
+//
+// THE SPLIT KERNELS INDEX UNSIGNED (this one, the gate-first twin, SITU,
+// GLU): a row read as `(int)gid / D` went negative past 2^31 outputs --
+// MiniMax-H3's whole-sequence feed-forward, 14336 wide, from row 149,796
+// -- and read and wrote other rows. Unsigned they are right to the
+// grid's 2^32 threads; a caller with more rows than that dispatches
+// them in row bands.
 //   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
 kernel void swiglu_split_value_first_f16(
     const device VPIPE_ELT* in  [[buffer(0)]],
@@ -5700,10 +5711,10 @@ kernel void swiglu_split_value_first_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float v = float(in[base + d]);
   const float g = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
@@ -5727,10 +5738,10 @@ kernel void swiglu_split_gate_first_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float g = float(in[base + d]);
   const float v = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
@@ -5755,10 +5766,10 @@ kernel void situ_split_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float h = float(in[base + d]);
   const float g = float(in[base + D + d]);
   const float gate = 4.0f * precise::tanh(g * 0.25f) / (1.0f + exp(-g));

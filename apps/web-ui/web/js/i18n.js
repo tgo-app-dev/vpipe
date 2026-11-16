@@ -7729,6 +7729,23 @@ const STRINGS = {
       '串流輸出埠（編號 1）的分塊：超過這麼多個詞後在句讀處發出（硬上限為 '
       + '3 倍，至少 60）——適合 text-to-speech 朗讀的單位；0 則每解碼出一段'
       + '就立即發出，供讀者看著回覆寫出來'],
+  'cfg.text-chat.stream_speed': ['',
+      '流式输出端口（编号 1）的每个节拍携带 `speed`：{phase：prefill | '
+      + 'decode；prefill_tps——上一段预填充每秒读入的 token 数（模型一次前向'
+      + '读完整个提示时，即整个提示的）；prefill_tokens（该段的 token 数）；'
+      + 'prefill_done / prefill_total（提示已读 / 总数）；decode_tps——最近 '
+      + '128 个解码 token 的速度（不足 128 个时为本轮至今的）；decoded（本轮'
+      + '的 token 数）}。读入提示时每段发一个无文本的节拍；解码在 250 毫秒内'
+      + '没有发出其他节拍时（推理或工具调用被 stream_answer_only 剔除，或词'
+      + '还在为 stream_words 累积）也发一个。供读者的速度表使用',
+      '串流輸出埠（編號 1）的每個節拍攜帶 `speed`：{phase：prefill | '
+      + 'decode；prefill_tps——上一段預填充每秒讀入的 token 數（模型一次前向'
+      + '讀完整個提示時，即整個提示的）；prefill_tokens（該段的 token 數）；'
+      + 'prefill_done / prefill_total（提示已讀 / 總數）；decode_tps——最近 '
+      + '128 個解碼 token 的速度（不足 128 個時為本輪至今的）；decoded（本輪'
+      + '的 token 數）}。讀入提示時每段發一個無文字的節拍；解碼在 250 毫秒內'
+      + '沒有發出其他節拍時（推理或工具呼叫被 stream_answer_only 剔除，或詞'
+      + '還在為 stream_words 累積）也發一個。供讀者的速度錶使用'],
   'cfg.text-chat.mtp': ['',
       '模型自带 MTP 推测解码头时使用它（token 精确；只影响性能）；设为 '
       + 'false 则强制走标准解码路径',
@@ -7814,12 +7831,16 @@ const STRINGS = {
       + '在句读处（中英文皆可）发一个节拍；一次回复的最后一个节拍会把 '
       + 'end_of_response 置为 true。它供流式消费者（例如 text-to-speech）使'
       + '用，让其在整个回合结束之前就开始工作。开启 stream_answer_only 时，'
-      + '推理与工具调用片段会被剔除（下游可选）',
+      + '推理与工具调用片段会被剔除；开启 stream_speed 时，每个节拍携带 '
+      + '`speed`（读入提示时，或解码在 250 毫秒内没有发出其他节拍时，会发出'
+      + '无文本的节拍）（下游可选）',
       '回覆過程中逐步發出的 FlexData {text,end_of_response}——大約每 20 個詞'
       + '在句讀處（中英文皆可）發一個節拍；一次回覆的最後一個節拍會把 '
       + 'end_of_response 置為 true。它供串流消費者（例如 text-to-speech）使'
       + '用，讓其在整個回合結束之前就開始工作。開啟 stream_answer_only 時，'
-      + '推理與工具呼叫片段會被剔除（下游可選）'],
+      + '推理與工具呼叫片段會被剔除；開啟 stream_speed 時，每個節拍攜帶 '
+      + '`speed`（讀入提示時，或解碼在 250 毫秒內沒有發出其他節拍時，會發出'
+      + '無文字的節拍）（下游可選）'],
 
   // ---- Text Input (text) ----
   'stage.text-input.name': ['', '文本输入', '文字輸入'],

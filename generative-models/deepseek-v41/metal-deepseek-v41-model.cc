@@ -2978,6 +2978,12 @@ MetalDeepseekV41Model::forward(CtxId ctx, std::span<const std::int32_t> ids,
     if (lg != nullptr) {
       logits->insert(logits->end(), piece.begin(), piece.end());
     }
+    // A prefill's piece done. Not a decode step's one row, nor a DSpark
+    // verify's few: those ask for every row's logits (all_rows), a
+    // prompt for its last.
+    if (_prefill_progress && !all_rows && ids.size() > 1) {
+      _prefill_progress((int)(i + n), (int)ids.size());
+    }
     if (ahead.valid()) {
       ahead.wait();
       ahead = std::future<bool>();

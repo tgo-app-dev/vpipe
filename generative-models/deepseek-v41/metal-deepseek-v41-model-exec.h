@@ -9,6 +9,7 @@
 
 #include "generative-models/deepseek-v41/metal-deepseek-v41-model.h"
 #include "generative-models/model-exec.h"
+#include "generative-models/prefill-progress.h"
 #include "generative-models/speculative-decode.h"
 
 #include <functional>
@@ -23,7 +24,8 @@ namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
 
-class MetalDeepseekV41ModelExec : public ModelExec, private SpecDecodeExt {
+class MetalDeepseekV41ModelExec : public ModelExec, private SpecDecodeExt,
+                                  private PrefillProgressExt {
 public:
   MetalDeepseekV41ModelExec(const std::string&                    model_dir,
                             metal_compute::MetalCompute*          mc,
@@ -214,6 +216,12 @@ private:
   const SessionContextIntf* _session = nullptr;
   std::vector<float> _logits;
   std::vector<std::int32_t> _suppress;
+
+  // ---- PrefillProgressExt: each piece of a prefill ---------------------
+  void set_prefill_progress(prefill_progress::Fn fn) override
+  {
+    if (_model != nullptr) { _model->set_prefill_progress(std::move(fn)); }
+  }
 };
 
 }  // namespace vpipe::genai

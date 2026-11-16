@@ -16,6 +16,7 @@
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/tensor-parallel.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,9 +30,11 @@ namespace vpipe {
 namespace genai {
 
 class WeightSet;
+class MetalLlamaWeights;
 class MetalSageAttention;
 class MetalSolAttention;
 class I8GemmContext;
+class TpOverlap;
 
 // FLUX.3 Image Klein's DiT (Flux3Transformer2DModel), on metal-compute.
 //
@@ -119,6 +122,20 @@ class MetalFlux3Transformer {
     // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool ane_int8_plain = false;
+    // TENSOR PARALLEL (tensor-parallel.h): this model one RANK of a DiT
+    // split across machines -- its share of every block's heads (q / k / v
+    // by their rows, the out projection by its columns) and feed-forward
+    // rows (linear_in's gate and up rows alike, linear_out by its
+    // columns). A block's attention and feed-forward share one norm and
+    // one gate over their SUM, so a rank exchanges ONE partial a block,
+    // the sum of its two -- or one a BAND where the share carries a floor
+    // (tp_extra::kMinBandRows; tp_row_bands), each band's crossing under
+    // the next band's work. Inactive: the whole model. A rank streams its
+    // share then keeps it, as the whole model streams its blocks (on the
+    // per-block path: no slot pair), reading only its share's rows where
+    // a cut is by rows; no runtime LoRA and no ANE tier (load() refuses
+    // each by name).
+    TpShare tp;
 
     // Read what can be read from <dir>/config.json. False when the file
     // is absent, names a different class, or describes a geometry this
@@ -187,9 +204,33 @@ class MetalFlux3Transformer {
 
   const Config& config() const { return _cfg; }
 
+  // A RANK's link to the others for ONE PICTURE (TpChannel): opened by
+  // the stage before the first forward, let go after the last however
+  // the picture ends; the exchange count new with it. False, with
+  // `err`, on a model that is not a rank or a channel that cannot run.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  void end_tp_generation();
+  // The exchange buffers it holds: grown at a forward's start, let go
+  // with the picture's channel (end_tp_generation).
+  std::size_t tp_exchange_bytes() const
+  {
+    std::size_t n = 0;
+    for (const auto& b : _tp_part) { n += b.byte_size(); }
+    for (const auto& b : _tp_recv) { n += b.byte_size(); }
+    return n;
+  }
+
   // Streaming + residency, the shared contract every DiT here
   // implements.
   void set_stream_stop(std::function<bool()> stop) {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
   }
   void set_block_progress(DitBlockProgressFn fn) {
@@ -276,6 +317,18 @@ class MetalFlux3Transformer {
   // books the floor through the shared helper.
   static const std::vector<std::string>& block_stems();
 
+  // What a RANK of `c` (Config::tp) holds with every block kept -- where
+  // stream, then retain converges on a box with room -- off the
+  // checkpoint's headers before anything loads: the plan's figure for
+  // resident_bytes(). The trunk as load_fixed_ keeps it (bf16, a pack's
+  // codes as stored) and every block's share as tp_qw_ cuts it, its QK
+  // norms whole. `floor`: the trunk and two blocks' shares -- what it
+  // holds streaming at the least. 0 when `c` is not split. (A column
+  // cut's projection is read whole before it is cut: a load-time
+  // transient of one projection, not held.)
+  static std::size_t tp_held_bytes(const std::string& dir, const Config& c,
+                                   std::size_t* floor = nullptr);
+
   static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
   static int ane_plan_seq(int width, int height) noexcept;
   // What ONE forward allocates for its activations at `rows` joint rows
@@ -284,7 +337,8 @@ class MetalFlux3Transformer {
   // in the rows, and the term that dominates at large sizes -- 8.1 GB
   // at 4096^2 against 11.1 GB of bf16 weights. Plus, as `c` enables
   // them, Sage's and Sol's own scratch at the joint stack's rows (c.sage
-  // with its pv8, c.sol): both allocate privately here.
+  // with its pv8, c.sol): both allocate privately here. A RANK's (c.tp)
+  // are its share's widths, and its exchange buffers beside them.
   static std::size_t forward_scratch_bytes(const Config& c,
                                            int rows) noexcept;
   bool streaming() const { return _stream_blocks; }
@@ -349,6 +403,22 @@ class MetalFlux3Transformer {
   metal_compute::SharedBuffer to_elt_(WeightSet& ws, const std::string& name,
                                       Retain r);
   bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
+  // A RANK's share of block L, cut from the checkpoint's whole weights
+  // (Config::tp), each read uncached and cut. False, with `err`.
+  bool load_tp_block_(WeightSet& ws, int L, Block& b, std::string* err);
+  // The share of `name` ([N, K]): `rows` of it, each row's columns
+  // [k0, k1) (k1 0: all -- then only those rows are read). Dense and
+  // affine, an affine share in the signed layout where _sgn says.
+  QWeight tp_qw_(WeightSet& ws, const std::string& name, int N,
+                 const std::vector<std::pair<int, int>>& rows, int k0,
+                 int k1, std::string* err);
+  // One block's share (prefix `pfx`) as tp_qw_ leaves it, off the
+  // headers: the plan's figure and residency's block size for a rank.
+  static std::size_t tp_block_bytes_(const MetalLlamaWeights& src,
+                                     const Config& c,
+                                     const std::string& pfx);
+  // An exchange buffer at least `bytes`: one replaced is forgotten first.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
   bool load_fixed_(WeightSet& ws);
 
   void each_block_tensor_(int L, Block& b,
@@ -453,6 +523,18 @@ class MetalFlux3Transformer {
   std::unique_ptr<AneFeedForward> _ane_qkv;
   bool _ane_qkv_tried = false;
   std::unique_ptr<I8GemmContext> _i8;
+
+  // ---- a rank's link (Config::tp) -------------------------------------
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  std::uint64_t _tp_seq = 0;
+  // The EXCHANGE BUFFERS, a lane each: a band's partial sum, written
+  // there by its last GEMM and add (the forward's scratch is per forward,
+  // and a transport may keep a device's registration of what it is
+  // handed), and the others' sum back. Grown at a forward's start to its
+  // widest band (tp_buffer_), let go with the picture's channel
+  // (end_tp_generation).
+  metal_compute::SharedBuffer _tp_part[2], _tp_recv[2];
 
   // ---- runtime LoRA ---------------------------------------------------
   // Indexed [slot][L] over the stack's own index space.

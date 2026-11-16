@@ -707,7 +707,8 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
     // Sol's booking at THIS arm's band (read before the band is unset).
     if (ok && keep) {
       a->sol_held = keep->sol_held_bytes();
-      a->sol_booked = keep->sol_scratch_bytes(br.L.seq_len);
+      a->sol_booked =
+          keep->sol_scratch_bytes(br.L.seq_len, br.L.num_text_rows);
     }
     ::unsetenv("VPIPE_H3_BAND_ROWS");
     if (!ok || !keep) { return false; }
@@ -793,6 +794,125 @@ TEST(minimax_h3_regenerate, banded_forward_is_the_whole_one)
       EXPECT_TRUE(tw.sol_held == tw.sol_booked);
       EXPECT_TRUE(tb.sol_held == tb.sol_booked);
     }
+  }
+}
+
+// A PROMPT LONGER THAN A BAND. An in-context refine presents its draft
+// clip to the conditioner, so its prompt grows with the clip -- ~12k
+// rows at 2K x 15 s, past the 8,192-row band -- and a forward that kept
+// the prompt in band 0 went whole there, which past 399,457 rows it
+// refuses. Two real blocks under the merged LoRA, 4,096 video rows
+// behind a 2,600-row prompt, in bands of at most 1,024: the text refiner
+// runs in bands of its own (896, 896, 808) and the prompt lies in three
+// of the main blocks' bands. Under Sage's int8 P*V the prompt's and
+// soundtrack's 41 query blocks keep the int8 QK alone through bands 0
+// and 1 and band 2's first 9 blocks, where it splits. The velocity must
+// be the whole forward's to the bit -- dense (steel's tile pinned and
+// the engine's routes) and under each attention tier, each tier moving
+// the dense forward -- both bands TAKEN, and the banded scratch what
+// scratch_bytes books. Sage needs matrix cores.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH + VPIPE_OPEN_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_regenerate, a_prompt_longer_than_a_band_is_the_whole_one)
+{
+  const std::string h3root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string rel = env_("VPIPE_OPEN_H3_TEST_MODEL_PATH");
+  if (h3root.empty() || rel.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / "
+                "VPIPE_OPEN_H3_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  constexpr int kText = 2600;
+  BlockRun br;
+  ASSERT_TRUE(br.setup(mc, h3root, 2, 8, 32, 64, 8, kText));
+  if (br.vb.empty()) { return; }
+  using Spec = MetalMiniMaxH3Transformer::LoraSpec;
+  const std::string lp = rel + "/lora/open_h3_regenerate_2k_lora.safetensors";
+  struct Arm {
+    std::vector<float> v;
+    int band = -1, tband = -1;
+    std::size_t resident = 0, booked = 0;
+  };
+  auto arm = [&](const char* band, bool routes, Arm* a,
+                 const MetalMiniMaxH3Transformer::Config* with = nullptr) {
+    ::setenv("VPIPE_H3_BAND_ROWS", band, 1);
+    std::unique_ptr<MetalMiniMaxH3Transformer> keep;
+    const bool ok = br.run(mc, {Spec{lp, 1.0f}}, &a->v, nullptr, -1.0f,
+                           false, with, routes, &keep);
+    if (ok && keep) {
+      a->band = keep->last_band_rows();
+      a->tband = keep->last_text_band_rows();
+      a->resident = keep->scratch_resident_bytes();
+      a->booked = MetalMiniMaxH3Transformer::scratch_bytes(
+          br.cfg, br.L.seq_len, kText, (int)br.uniq.size(), false,
+          keep->ff_scratch_narrow(), 0, a->band);
+    }
+    ::unsetenv("VPIPE_H3_BAND_ROWS");
+    return ok && keep != nullptr;
+  };
+  Arm whole, banded, whole_r, banded_r;
+  ASSERT_TRUE(arm("0", false, &whole));
+  ASSERT_TRUE(arm("1024", false, &banded));
+  ASSERT_TRUE(arm("0", true, &whole_r));
+  ASSERT_TRUE(arm("1024", true, &banded_r));
+  std::vector<float> base;
+  ASSERT_TRUE(br.run(mc, {}, &base, nullptr));
+  const double moved = rel_l2_(whole.v, base);
+  std::printf("  %d rows (a %d-row prompt, video from row %d) in bands of "
+              "%d, the prompt's of %d: pinned tile %s (rel-L2 %.3e), the "
+              "engine's routes %.3e, against the adapter's own %.3e; "
+              "scratch %zu MB banded (booked %zu) against %zu whole\n",
+              br.L.seq_len, kText, br.L.video_start, banded.band,
+              banded.tband,
+              banded.v == whole.v ? "IDENTICAL" : "differs",
+              rel_l2_(banded.v, whole.v), rel_l2_(banded_r.v, whole_r.v),
+              moved, banded.resident >> 20, banded.booked >> 20,
+              whole.resident >> 20);
+  EXPECT_TRUE(whole.band == 0 && whole.tband == 0);
+  EXPECT_TRUE(banded.band > 0 && banded.band <= 1024);
+  // The prompt past a band, in bands of its own of at most the band.
+  EXPECT_TRUE(kText > 2 * banded.band);
+  EXPECT_TRUE(banded.tband > 0 && banded.tband <= banded.band &&
+              banded.tband < kText);
+  EXPECT_TRUE(banded.v == whole.v);
+  EXPECT_TRUE(banded_r.v == whole_r.v);
+  EXPECT_TRUE(moved > 0.1);
+  EXPECT_TRUE(banded.resident == banded.booked);
+  EXPECT_TRUE(banded.resident < whole.resident);
+
+  struct Tier { const char* name; bool sol, sage, pv8, exact = false; };
+  const bool mx = mc->supports_matrix_cores();
+  for (const Tier& t : {Tier{"sol", true, false, false},
+                        Tier{"sol exact", true, false, false, true},
+                        Tier{"sage", false, true, false},
+                        Tier{"sage + int8 P*V", false, true, true},
+                        Tier{"sol + sage", true, true, false}}) {
+    if (t.sage && !mx) {
+      std::printf("  %s: SKIP (no matrix cores)\n", t.name);
+      continue;
+    }
+    MetalMiniMaxH3Transformer::Config tc = br.cfg;
+    tc.sol.enabled = t.sol;
+    tc.sol.dense_layers = 0;
+    tc.sol.thresh = t.exact ? sol::Threshold::kExact : sol::Threshold::kDiag;
+    tc.sage.enabled = t.sage;
+    tc.sage.dense_layers = 0;
+    tc.sage.pv8 = t.pv8;
+    Arm tw, tb;
+    ASSERT_TRUE(arm("0", false, &tw, &tc));
+    ASSERT_TRUE(arm("1024", false, &tb, &tc));
+    const double moved_t = rel_l2_(tw.v, whole.v);
+    std::printf("  %s: banded %s whole (rel-L2 %.3e), bands %d / %d; the "
+                "tier moves the dense forward %.3e\n", t.name,
+                tb.v == tw.v ? "IS" : "is NOT", rel_l2_(tb.v, tw.v), tb.band,
+                tb.tband, moved_t);
+    EXPECT_TRUE(tw.band == 0 && tb.band == banded.band &&
+                tb.tband == banded.tband);
+    EXPECT_TRUE(tb.v == tw.v);
+    EXPECT_TRUE(moved_t > 0.0);
   }
 }
 
@@ -2469,7 +2589,9 @@ TEST(minimax_h3_regenerate, the_ic_adapters_bind_as_the_release_installs)
 // the vision tower's work over one such clip (nothing had booked it for
 // MiniMax-H3), and the tower's device growth over the draft's
 // presentation stays within that figure: at the release's 124 frames
-// and at the end-to-end runs' 22 and 39.
+// and at the end-to-end runs' 22 and 39. The presentation is the
+// prompt's rows, and the plan sizes the forward's prompt at them (it had
+// sized 512 whatever the draft).
 //
 // Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (a root or partition: configs
 // for the plans, the text encoder's tower for the measurement).
@@ -2519,16 +2641,22 @@ TEST(minimax_h3_regenerate, an_in_context_refine_books_its_draft)
     const int cells = (g[1] / 32) * (g[0] / 32);
     const int rest = MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
                          g[2] / 24.0) + 512;
-    const int draft =
-        lf * 24 * 42 + (presented(g[2]) + 1) / 2 * 1008;
+    const int present = (presented(g[2]) + 1) / 2 * 1008;
+    const int draft = lf * 24 * 42 + present;
     std::printf("  %dx%dx%d: text-to-video %d rows, refine %d, in context "
-                "%d (the draft %d)\n", g[0], g[1], g[2],
-                t2v.planned_h3_rows(), ref.planned_h3_rows(),
-                inc.planned_h3_rows(), draft);
+                "%d (the draft %d); the prompt %d / %d / %d\n", g[0], g[1],
+                g[2], t2v.planned_h3_rows(), ref.planned_h3_rows(),
+                inc.planned_h3_rows(), draft, t2v.planned_h3_text_rows(),
+                ref.planned_h3_text_rows(), inc.planned_h3_text_rows());
     rows_ok = rows_ok &&
               t2v.planned_h3_rows() == (lf + 2) * cells + rest &&
               ref.planned_h3_rows() == lf * cells + rest &&
               inc.planned_h3_rows() == lf * cells + rest + draft;
+    // The presentation is the PROMPT's (the text refiner's rows, booked
+    // in the forward's scratch at its length, banded past a band).
+    rows_ok = rows_ok && t2v.planned_h3_text_rows() == 512 &&
+              ref.planned_h3_text_rows() == 512 &&
+              inc.planned_h3_text_rows() == 512 + present;
   }
   EXPECT_TRUE(rows_ok);
 

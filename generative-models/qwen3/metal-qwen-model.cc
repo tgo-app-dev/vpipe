@@ -8440,6 +8440,7 @@ MetalQwenModel::prefill(ContextId cid, const std::vector<std::int32_t>& ids)
       hc_taps_piece_(taps, i, m, run);
       r = forward_hc_(cid, part, nullptr, nullptr, nullptr, -1, nullptr, &run);
       if (r.empty() || !hc_taps_ingest_(taps, i, m, run)) { return {}; }
+      if (_prefill_progress) { _prefill_progress(i + m, n); }
       if (prime &&
           !hc_mtp_prime_(cid, resid, part, _ctx->seq_len_of(cid), nullptr)) {
         if (const SessionContextIntf* s = _mc->session()) {
@@ -8651,16 +8652,14 @@ MetalQwenModel::prefill_piece_()
 {
   // 8192 rows keep a piece's activations near 1.5 GB on Ministral-3 and
   // far above every attention kernel's crossover (2048).
-  // VPIPE_QWEN_PREFILL_CHUNK sets it; 0 disables the split.
-  static const int piece = []() {
-    const char* e = std::getenv("VPIPE_QWEN_PREFILL_CHUNK");
-    if (e != nullptr) {
-      const int v = std::atoi(e);
-      return v <= 0 ? std::numeric_limits<int>::max() : std::max(v, 512);
-    }
-    return 8192;
-  }();
-  return piece;
+  // VPIPE_QWEN_PREFILL_CHUNK sets it; 0 disables the split. Read at EACH
+  // call, not latched: latched, the process's first prefill decided for
+  // every later one, so a test setting it after another had prefilled
+  // ran on the default (text_chat_stage.metal_chat_stream_speed).
+  const char* e = std::getenv("VPIPE_QWEN_PREFILL_CHUNK");
+  if (e == nullptr) { return 8192; }
+  const int v = std::atoi(e);
+  return v <= 0 ? std::numeric_limits<int>::max() : std::max(v, 512);
 }
 
 std::vector<float>
@@ -8681,6 +8680,7 @@ MetalQwenModel::forward_pieces_(ContextId cid, const SharedBuffer& x, int n)
                 (std::size_t)m * rowb);
     r = forward_chunk_(cid, part, m, nullptr, nullptr);
     if (r.empty()) { return r; }
+    if (_prefill_progress) { _prefill_progress(r0 + m, n); }
   }
   return r;
 }

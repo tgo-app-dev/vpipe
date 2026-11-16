@@ -14,6 +14,7 @@
 #include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/fp8.h"
+#include "generative-models/tensor-parallel.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
@@ -30,6 +31,7 @@ namespace genai {
 class MetalLlamaWeights;   // fwd
 class WeightSet;           // generative-models/weight-set.h
 class I8GemmContext;       // fwd (shared/i8-gemm.h)
+class TpOverlap;           // fwd (shared/tp-overlap.h)
 
 
 // Krea-2-Turbo denoiser (Krea2Transformer2DModel): a single-stream MMDiT
@@ -156,6 +158,27 @@ class MetalKrea2Transformer {
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool  ane_int8_plain = false;
 
+    // TENSOR PARALLEL (tensor-parallel.h): this model one RANK of a DiT
+    // split across machines -- its share of every main block's heads
+    // (to_q / to_gate by their rows, to_k / to_v by the rows of the kv
+    // heads those query heads read, to_out by its columns) and
+    // feed-forward rows (ff.gate and ff.up by their rows, ff.down by its
+    // columns). GQA ties four query heads to one kv head, so a share is
+    // WHOLE kv groups or it is refused. The attention and the
+    // feed-forward are gated apart, so a rank exchanges TWO partials a
+    // block, each before its gate -- two a BAND where the share carries
+    // a floor (tp_extra::kMinBandRows; tp_row_bands), each crossing under
+    // the next band's work. The text-fusion tower, the embeddings, the
+    // modulation and the final layer run whole on every rank. Its share
+    // is cut as stored (bf16 or an affine pack; only its rows read where
+    // a cut is by rows) and then laid out for the int8 tier asked,
+    // within its own columns. Inactive: the whole model. A rank streams
+    // its share then keeps it (on the per-block path: no slot pair), with
+    // no runtime LoRA, no ANE tier, no FP8 / NVFP4 weights, no fused
+    // gate|up weave and no AWQ calibration (each refused by name, or not
+    // built).
+    TpShare tp;
+
     int   text_head_dim() const { return text_hidden / text_heads; }  // 128
   };
 
@@ -262,7 +285,54 @@ class MetalKrea2Transformer {
   // forward_dit polls this before each main block and bails early (returns
   // empty) when it returns true. Used by the AWQ calibration collector to honor
   // a pipeline stop within ~one block. No effect on the preloaded path.
-  void set_stream_stop(std::function<bool()> stop) { _stream_stop = std::move(stop); }
+  void set_stream_stop(std::function<bool()> stop) {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
+    _stream_stop = std::move(stop);
+  }
+
+  // A RANK's link to the others for ONE PICTURE (TpChannel): opened by
+  // the stage before the first forward, let go after the last however
+  // the picture ends; the exchange count new with it. False, with
+  // `err`, on a model that is not a rank or a channel that cannot run.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  void end_tp_generation();
+  // The exchange buffers it holds: grown at a forward's start, let go
+  // with the picture's channel (end_tp_generation).
+  std::size_t tp_exchange_bytes() const
+  {
+    std::size_t n = 0;
+    for (const auto& b : _tp_part) { n += b.byte_size(); }
+    for (const auto& b : _tp_recv) { n += b.byte_size(); }
+    return n;
+  }
+
+  // What a RANK of `c` (Config::tp, with the int8 tier it loads with)
+  // holds with every block kept -- where stream, then retain converges on
+  // a box with room -- off the checkpoint's headers before anything
+  // loads: the plan's figure for resident_bytes(). The trunk (bf16, a
+  // pack's codes as stored; the text-fusion tower whole) and every main
+  // block's share as tp_qw_ leaves it: its projections at the share's
+  // rows and columns in the layout each takes -- the int8 tier's where
+  // the tier engages (asked of an I8GemmContext made as load() makes it,
+  // on `mc`), a w4 pack's only where `c.i8_hold_w4` holds it -- and its
+  // norms and modulation table whole. `floor`: the trunk and two blocks'
+  // shares, what it holds streaming at the least. 0 when `c` is not
+  // split. (A column cut's projection is read whole before it is cut: a
+  // load-time transient, not held.)
+  static std::size_t tp_held_bytes(const std::string& dir, const Config& c,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
+  // What the model holds: the trunk the weight set keeps for it, the main
+  // blocks it holds (all of them preloaded; what residency kept,
+  // streamed) and the slot pair while it exists.
+  std::uint64_t resident_bytes() const;
 
   // ---- adaptive block residency (streaming mode) -----------------------
   // Grow the resident block set into free RAM so later steps re-read less
@@ -592,6 +662,25 @@ class MetalKrea2Transformer {
   bool load_block_(WeightSet& ws, const std::string& pre,
                    Block& b, bool main_block, Retain r,
                    bool keep_split = false);
+  // A RANK's share of main block L (Config::tp): each projection read
+  // uncached, cut, and laid out for the int8 tier. False, with `err`.
+  bool load_tp_block_(WeightSet& ws, int L, Block& b, std::string* err);
+  // The share of `name` ([N, K]): `rows` of it, each row's columns
+  // [k0, k1) (k1 0: all -- then only those rows are read), then in the
+  // tier's layout where one is asked for and its group divides the
+  // share's columns, else signed where _sgn says.
+  QWeight tp_qw_(WeightSet& ws, const std::string& name, int N,
+                 const std::vector<std::pair<int, int>>& rows, int k0,
+                 int k1, std::string* err);
+  // One main block's share (prefix `pfx`) as tp_qw_ leaves it, off the
+  // headers, `fast` the tier's context where the tier engages: the
+  // plan's figure for a rank.
+  static std::size_t tp_block_bytes_(const MetalLlamaWeights& src,
+                                     const Config& c,
+                                     const I8GemmContext* fast,
+                                     const std::string& pfx);
+  // An exchange buffer at least `bytes`: one replaced is forgotten first.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
   // Load a Linear weight: quantized (affine triple) when `<name>.scales` is
   // present, else dense f16.
   // `sign`: a BLOCK projection, which takes the signed layout when _sgn
@@ -1080,6 +1169,19 @@ class MetalKrea2Transformer {
   metal_compute::ComputeFunction _fn_dense_mma_splitk;
   metal_compute::SharedBuffer _splitk;  // [n_splits, M, N] f16 partial planes
   bool _use_splitk = false;
+
+  // ---- a rank's link (Config::tp) -------------------------------------
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  std::uint64_t _tp_seq = 0;
+  // The EXCHANGE BUFFERS, a lane each: a band's partial sum, written
+  // there by its last GEMM (the forward's scratch is per shape, and a
+  // transport may keep a device's registration of what it is handed),
+  // and the others' sum back -- lanes 0 / 1 the attention's, 2 / 3 the
+  // feed-forward's (a block whole uses 0 for both). Grown at a forward's
+  // start to its widest band (tp_buffer_), let go with the picture's
+  // channel (end_tp_generation).
+  metal_compute::SharedBuffer _tp_part[4], _tp_recv[4];
 
   // ---- AWQ calibration accumulators (per main block; live while _calib_on) --
   bool _calib_on = false;

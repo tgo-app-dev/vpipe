@@ -193,6 +193,54 @@ and the bf16 tiles are its fastest path:
 
 Streaming, not quantization, is what runs the bf16 model on a small box.
 
+## Split across two Macs
+
+generate-image's `tensor_parallel` runs the stage as one RANK of the DiT
+split across machines (`generative-models/tensor-parallel.h`, feature
+`tensor-parallel-flux3/1`), as generate-video's does for MiniMax H3: each
+rank holds its share of every block's heads -- `to_q` / `to_k` / `to_v` by
+their rows, `to_out` by its columns -- and feed-forward rows (`linear_in`'s
+gate and up halves alike, `linear_out` by its columns), cut at load from
+the checkpoint (bf16 or an affine pack, the pack's columns in whole
+groups). A block's attention and feed-forward share one norm and one gate
+over their sum, so a rank exchanges ONE partial a block -- the sum of the
+two, through the transport a plugin registered -- and adds the others'
+before the gate; norms, modulation, RoPE and the sampler run whole on
+every rank. A channel each picture. The partial is written straight into
+the buffer the transport is handed and the exchange is posted to a worker
+of its own: the GPU waits for the others' sum only where it adds it.
+
+A rank streams its share and keeps it as the whole model streams its
+blocks, reading only its share's rows where a weight is cut by rows
+(`to_q` / `to_k` / `to_v`, `linear_in`); the plan books it at its share
+with every block kept, streamable to the trunk and two blocks' shares, not
+at the checkpoint. No runtime LoRA and no ANE tier on a rank; every other
+family refuses the key.
+
+`min_band_rows` (feature `tensor-parallel-flux3/2`) cuts each block's rows
+into bands of at least that many -- at most eight -- and each band's
+partial then crosses while the GPU runs the next band's out projection and
+feed-forward, so one band's exchange a block is left exposed. Give it
+alike to every rank, and only to a peer whose host lists the /2 feature:
+unsaid, a rank exchanges whole blocks, as /1 did.
+
+```json
+{"type": "generate-image", "config": {"tensor_parallel": {
+  "rank": 0, "ranks": 2, "heads": [0, 8], "ffn": [0, 3072],
+  "min_band_rows": 1024,
+  "transport": "<a plugin's>", "params": {}}}}
+```
+
+Measured: on a random small model the split is the unsplit forward to
+2.2e-3 relative L2 (bf16 and an 8-bit pack), the two ranks' velocities
+bit-identical, a streamed rank's velocity the preloaded one's bit for bit,
+and the share held what the plan booked to the byte (`tensor_parallel.
+a_split_flux3_forward_is_the_unsplit_one`; through generate-image, `a_split_
+flux3_runs_through_the_stage`). An M5 Max paired with an M5 Ultra over
+three Thunderbolt 5 cables (RDMA), the 8-bit pack at 1024x1024, 8 of 24
+heads on the Max: the denoise 6-7 s against 12 s on the Max alone (whole
+blocks, exchanged in line, before these changes).
+
 ## Not supported
 
 - **BFL's own single-file layout** — the root `model.safetensors` and

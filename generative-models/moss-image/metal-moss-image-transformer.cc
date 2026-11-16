@@ -12,6 +12,8 @@
 #include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/shared/lora-names.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tp-cut.h"
+#include "generative-models/shared/tp-overlap.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
@@ -251,6 +253,8 @@ rope_tables(int grid_h, int grid_w, int text_rows, int head_dim, float base,
 
 MetalMossImageTransformer::~MetalMossImageTransformer()
 {
+  // A rank's link goes first: its worker may still hold an exchange.
+  end_tp_generation();
   // GIVE THE POOL BACK: only unwire_from_pool decrements its counter.
   if (_wire.on()) {
     wire_fixed_(false);
@@ -652,6 +656,309 @@ MetalMossImageTransformer::load_text_block_(WeightSet& ws, int i,
          !b.gate.empty() && !b.gate_b.empty() && !b.down.empty() &&
          !b.down_b.empty() && !b.n1.empty() &&
          !b.n2.empty() && !b.nq.empty() && !b.nk.empty();
+}
+
+// A rank's share of one projection. CUT BY ITS ROWS -- proj.q / k / v
+// and ffn_up_gate, most of a block -- a dense bf16 weight or an MLX
+// affine pack has only the share's rows READ, straight into the share
+// (tp_read_rows); the rest of the tensor never leaves the disk. CUT BY
+// ITS COLUMNS -- proj.o, ffn_down -- every row is needed: the whole
+// weight is read UNCACHED (Retain::Streamed, plain: no signed or tier
+// layout) and the share copied out of it, as is any weight the row read
+// does not serve (an F32 checkpoint; VPIPE_TP_WHOLE_READ, the A/B). An
+// affine pack's columns are cut in whole groups. Then the share is laid
+// out as a whole model lays out its own block projections: on the int8
+// fast / token tier, a w8 share converted, a w4 share held as stored
+// and converted per GEMM (unless Config::i8_hold_w4), and a DENSE share
+// quantized -- from a dense checkpoint only, as load_qw_ quantizes (a
+// pack's dense tensors stay dense) -- each at the group the share's own
+// columns take, a width none divides staying on the accurate tier; off
+// those tiers an affine share takes the SIGNED layout where the model's
+// projections do (_sgn: per byte and per group, so a share converts as
+// its whole weight would).
+MetalMossImageTransformer::QWeight
+MetalMossImageTransformer::tp_qw_(
+    WeightSet& ws, const std::string& name, int N,
+    const std::vector<std::pair<int, int>>& rows, int k0, int k1,
+    std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = name + ": " + why; }
+    return QWeight{};
+  };
+  int n = 0;
+  for (const auto& [a, b] : rows) { n += b - a; }
+  QWeight l;
+  l.n = n;
+  bool read = false;
+  if (k1 == 0 && std::getenv("VPIPE_TP_WHOLE_READ") == nullptr) {
+    const MetalLlamaWeights& src = ws.src();
+    // A pack's scales and biases as the model holds them, bf16: read in
+    // the dtype stored, an F16 pack's widened in place (one width).
+    auto rows_bf16 = [&](const std::string& nm) -> SharedBuffer {
+      const auto* ti = src.info(nm);
+      if (ti == nullptr || (ti->dtype != "BF16" && ti->dtype != "F16")) {
+        return {};
+      }
+      SharedBuffer b =
+          tp_read_rows(_mc, src, nm, ti->dtype.c_str(), N, rows);
+      if (b.empty() || ti->dtype == "BF16") { return b; }
+      auto* p = static_cast<std::uint16_t*>(b.contents());
+      for (std::size_t i = 0; i < b.byte_size() / 2; ++i) {
+        _Float16 h;
+        std::memcpy(&h, &p[i], 2);
+        p[i] = f32_to_bf16_((float)h);
+      }
+      return b;
+    };
+    const auto* ci = src.info(name + ".weight");
+    const auto* si = src.info(name + ".scales");
+    if (_quant_bits > 0 && ci != nullptr && si != nullptr &&
+        ci->shape.size() == 2 && si->shape.size() == 2) {
+      const long K = si->shape[1] * (long)_quant_group;
+      const long bits = K > 0 ? ci->shape[1] * 32 / K : 0;
+      if (bits == 4 || bits == 8) {
+        l.codes = tp_read_rows(_mc, src, name + ".weight", "U32", N, rows);
+        l.scales = rows_bf16(name + ".scales");
+        l.qbias = rows_bf16(name + ".biases");
+        if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
+          l.quantized = true;
+          l.bits = (int)bits;
+          l.k = (int)K;
+          read = true;
+        } else {
+          l.codes = {}; l.scales = {}; l.qbias = {};
+        }
+      }
+    } else if (si == nullptr && ci != nullptr && ci->shape.size() == 2) {
+      l.w = tp_read_rows(_mc, src, name + ".weight", "BF16", N, rows);
+      if (!l.w.empty()) {
+        l.k = (int)ci->shape[1];
+        read = true;
+      }
+    }
+  }
+  if (!read) {
+    QWeight w = load_qw_(ws, name, Retain::Streamed, /*sign=*/false,
+                         /*fast=*/false);
+    if (w.empty()) { return fail("not in the checkpoint"); }
+    if (w.gc > 0 || w.sgn) {
+      return fail("a split DiT reads dense or affine weights only");
+    }
+    if (w.quantized) {
+      const int g = _quant_group;
+      if (k1 > 0 && (k0 % g != 0 || k1 % g != 0)) {
+        return fail(fmt("its share's columns [{}, {}) are not whole "
+                        "groups of {}", k0, k1, g)());
+      }
+      l.quantized = true;
+      l.bits = w.bits;
+      // Codes: `32 / bits` columns a word; scales and biases: one a group.
+      l.codes = tp_cut(_mc, w.codes, N, rows, (std::size_t)k0 * w.bits / 8,
+                       (std::size_t)k1 * w.bits / 8);
+      l.scales = tp_cut(_mc, w.scales, N, rows, (std::size_t)k0 / g * 2,
+                        (std::size_t)k1 / g * 2);
+      l.qbias = tp_cut(_mc, w.qbias, N, rows, (std::size_t)k0 / g * 2,
+                       (std::size_t)k1 / g * 2);
+      if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+        return fail("its share could not be cut");
+      }
+      l.k = k1 > 0 ? k1 - k0 : (int)(w.codes.byte_size() * 8 /
+                                     (std::size_t)N / (std::size_t)w.bits);
+    } else {
+      l.w = tp_cut(_mc, w.w, N, rows, (std::size_t)k0 * 2,
+                   (std::size_t)k1 * 2);
+      if (l.w.empty()) { return fail("its share could not be cut"); }
+      l.k = k1 > 0 ? k1 - k0
+                   : (int)(w.w.byte_size() / 2 / (std::size_t)N);
+    }
+  }
+  // Off the int8 fast / token tier: the signed layout, where the model's
+  // projections take it.
+  auto plain = [&]() -> QWeight {
+    if (!sign_(l)) {
+      return fail("its share did not take the signed layout");
+    }
+    return std::move(l);
+  };
+  if (!_fast || !_i8) { return plain(); }
+  // A pack's dense tensor stays dense, as the whole model keeps it.
+  if (!l.quantized && _quant_bits != 0) { return plain(); }
+  // The tier's layout, within the share's own columns.
+  const int fgc = _i8->fast_group(l.k);
+  if (fgc <= 0) { return plain(); }
+  const std::size_t cb = (std::size_t)l.n * l.k;
+  const std::size_t sb = I8GemmContext::fast_scale_bytes(l.n, l.k, fgc);
+  if (l.quantized) {
+    if (_quant_group != 64 || !_i8->fast_converts(l.bits, fgc)) {
+      return plain();
+    }
+    if (l.bits == 4 && !_cfg.i8_hold_w4) {
+      // A W4 SHARE IS HELD AS STORED, converted before each GEMM
+      // (fast_operand_), as a whole model's w4 block is.
+      l.gc = fgc;
+      l.pc = true;
+      return l;
+    }
+    QWeight f;
+    f.bits = l.bits; f.gc = fgc; f.n = l.n; f.k = l.k;
+    f.codes = _mc->make_shared_buffer(cb);
+    f.cscales = _mc->make_shared_buffer(sb);
+    if (f.codes.empty() || f.cscales.empty()) { return plain(); }
+    CommandStream st = _mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = _i8->encode_to_fast(e, l.codes, l.scales, l.qbias, f.codes,
+                               f.cscales, fgc, l.n, l.k, l.bits);
+    }
+    if (!ok || !st.commit().wait_ok(nullptr)) { return plain(); }
+    f.quantized = true;
+    return f;
+  }
+  QWeight f;
+  f.bits = 8; f.gc = fgc; f.n = l.n; f.k = l.k;
+  f.codes = _mc->make_shared_buffer(cb);
+  f.cscales = _mc->make_shared_buffer(sb);
+  if (f.codes.empty() || f.cscales.empty()) { return l; }
+  CommandStream st = _mc->make_command_stream();
+  bool ok = false;
+  {
+    ComputeEncoder e = st.begin_compute();
+    ok = _i8->encode_quant_fast(e, l.w, f.codes, f.cscales, fgc, l.n, l.k);
+  }
+  if (!ok || !st.commit().wait_ok(nullptr)) { return l; }
+  f.quantized = true;
+  return f;
+}
+
+// A RANK's block. THE FUSED ffn_up_gate is [hidden | gate] by its rows --
+// hidden FIRST -- and SITU pairs hidden row j with gate row F + j, so a
+// share of feed-forward rows [f0, f1) takes [f0, f1) of the hidden half
+// AND [F + f0, F + f1) of the gate half: its [2f, H] share is again
+// [hidden | gate], which situ_split reads at the share's width.
+bool
+MetalMossImageTransformer::load_tp_block_(WeightSet& ws, int L, Block& b,
+                                          std::string* err)
+{
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
+  const TpShare& t = _cfg.tp;
+  const int H = _cfg.hidden, Hd = _cfg.head_dim, F = _cfg.ffn_inner;
+  const int i0 = t.head0 * Hd, i1 = t.head1 * Hd;
+  const std::vector<std::pair<int, int>> heads = {{i0, i1}};
+  const std::vector<std::pair<int, int>> all = {{0, H}};
+  const std::vector<std::pair<int, int>> ug = {{t.ffn0, t.ffn1},
+                                               {F + t.ffn0, F + t.ffn1}};
+  const std::string p = prefix_(L);
+  struct One {
+    QWeight* w;
+    const char* leaf;
+    int N;
+    const std::vector<std::pair<int, int>>* rows;
+    int k0, k1;
+  };
+  const One all_of[] = {
+      {&b.qw, "proj.q", H, &heads, 0, 0},
+      {&b.kw, "proj.k", H, &heads, 0, 0},
+      {&b.vw, "proj.v", H, &heads, 0, 0},
+      {&b.ow, "proj.o", H, &all, i0, i1},
+      {&b.ug, "proj.ffn_up_gate", 2 * F, &ug, 0, 0},
+      {&b.dn, "proj.ffn_down", H, &all, t.ffn0, t.ffn1}};
+  for (const One& o : all_of) {
+    *o.w = tp_qw_(ws, p + o.leaf, o.N, *o.rows, o.k0, o.k1, err);
+    if (o.w->empty()) { return false; }
+  }
+  // The norms -- the block's two over the hidden width and the q / k
+  // RMSNorms, a head's own [head_dim] -- are whole on every rank.
+  b.n1 = to_elt_(ws, p + "norm1.weight", Retain::Cached);
+  b.n2 = to_elt_(ws, p + "norm2.weight", Retain::Cached);
+  b.nq = to_elt_(ws, p + "q_norm.weight", Retain::Cached);
+  b.nk = to_elt_(ws, p + "k_norm.weight", Retain::Cached);
+  if (b.n1.empty() || b.n2.empty() || b.nq.empty() || b.nk.empty()) {
+    if (err != nullptr) { *err = p + ": a norm is missing"; }
+    return false;
+  }
+  return true;
+}
+
+bool
+MetalMossImageTransformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
+{
+  if (b.byte_size() >= bytes) { return true; }
+  if (!b.empty() && _tp_pipe != nullptr) { _tp_pipe->forget(b); }
+  b = SharedBuffer{};
+  b = _mc->make_shared_buffer(bytes);
+  return !b.empty();
+}
+
+bool
+MetalMossImageTransformer::begin_tp_generation(std::shared_ptr<TpChannel> ch,
+                                               std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = "tensor parallel: " + why; }
+    return false;
+  };
+  end_tp_generation();
+  if (!_cfg.tp.active()) { return fail("this model is not a rank"); }
+  if (!ch) { return fail("no channel to the other ranks"); }
+  // Four lanes: a block's bands alternate between two for the attention's
+  // partials and two for the feed-forward's (forward()'s rank tail).
+  auto pipe = std::make_unique<TpOverlap>(_mc, ch, 4, TpDType::kBF16);
+  if (!pipe->valid()) {
+    return fail("no events or thread for the exchanges");
+  }
+  _tp_ch = std::move(ch);
+  _tp_pipe = std::move(pipe);
+  _tp_seq = 0;
+  // The stop the stage set before the picture, which the channel polls
+  // while it waits on the others.
+  try {
+    _tp_ch->set_stop(_stream_stop);
+  } catch (...) {
+  }
+  return true;
+}
+
+void
+MetalMossImageTransformer::end_tp_generation()
+{
+  if (_tp_pipe == nullptr && !_tp_ch) { return; }
+  // An exchange still waiting on a peer would hold the worker the reset
+  // below joins: the channel told to stop waiting first.
+  if (_tp_pipe != nullptr && _tp_ch &&
+      (_tp_pipe->pending() || _tp_pipe->failed())) {
+    try {
+      _tp_ch->set_stop([]() { return true; });
+    } catch (...) {
+    }
+  }
+  _tp_pipe.reset();
+  // Every buffer the channel was handed forgotten before it goes (a
+  // transport may keep a device's registration of each).
+  if (_tp_ch) {
+    for (const SharedBuffer* b :
+         {&_tp_part[0], &_tp_part[1], &_tp_part[2], &_tp_part[3],
+          &_tp_recv[0], &_tp_recv[1], &_tp_recv[2], &_tp_recv[3]}) {
+      if (b->empty()) { continue; }
+      try {
+        _tp_ch->forget(b->contents(), b->byte_size());
+      } catch (...) {
+      }
+    }
+    try {
+      _tp_ch->set_stop({});
+    } catch (...) {
+    }
+  }
+  _tp_ch.reset();
+  _tp_seq = 0;
+  // THE BUFFERS GO WITH THE PICTURE. The plan books them with the
+  // forward's activations alone (forward_scratch_bytes), and the
+  // transport's registration of them went with the forget above; kept,
+  // they sat unbooked beside the decode and in a DiT kept warm.
+  for (SharedBuffer& b : _tp_part) { b = SharedBuffer{}; }
+  for (SharedBuffer& b : _tp_recv) { b = SharedBuffer{}; }
 }
 
 bool
@@ -1065,7 +1372,19 @@ MetalMossImageTransformer::configure_slots_()
     return fill_narrow_(nm, d);
   };
   ops.build = [this](int L, Block& b) {
-    return _ws != nullptr && load_block_(*_ws, L, b, Retain::Streamed);
+    if (_ws == nullptr) { return false; }
+    if (!_cfg.tp.active()) {
+      return load_block_(*_ws, L, b, Retain::Streamed);
+    }
+    // A RANK's block is its share, cut at every read (load() turns the
+    // slots off for it).
+    std::string terr;
+    if (load_tp_block_(*_ws, L, b, &terr)) { return true; }
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt("MetalMossImageTransformer: "
+                               "tensor_parallel: block {}: {}", L, terr));
+    }
+    return false;
   };
   ops.clone = [this](const Block& s, Block& d, bool copy) {
     return clone_block_(s, d, copy);
@@ -1297,6 +1616,34 @@ MetalMossImageTransformer::load(std::shared_ptr<WeightSet> ws,
   }
   if (m->_gemm_tile == 1 && !m->_fn_gemm_bm64.valid()) { m->_gemm_tile = 0; }
 
+  // A RANK (Config::tp): its share, streamed then kept as any MOSS-Image
+  // block is, nothing that reads the checkpoint's widths -- the ANE's
+  // modules, a runtime LoRA -- and weights it can cut: dense or an
+  // affine pack.
+  const bool rank = m->_cfg.tp.active();
+  if (rank) {
+    const TpShare& t = m->_cfg.tp;
+    std::string why;
+    const auto* q0 = m->_ws->src().info(m->prefix_(0) + "proj.q.weight");
+    const bool dense = q0 != nullptr &&
+                       (q0->dtype == "BF16" || q0->dtype == "F16" ||
+                        q0->dtype == "F32");
+    if (t.n_heads != m->_cfg.n_heads || t.n_ffn != m->_cfg.ffn_inner ||
+        t.heads() <= 0 || t.ffn() <= 0) {
+      why = fmt("a share of {} heads and {} feed-forward rows does not "
+                "fit this model's {} and {}", t.n_heads, t.n_ffn,
+                m->_cfg.n_heads, m->_cfg.ffn_inner)();
+    } else if (!loras.empty()) {
+      why = "not with a runtime LoRA yet";
+    } else if (m->_cfg.ane_ffn || m->_cfg.ane_qkv) {
+      why = "not with the Neural Engine's share";
+    } else if (m->_quant_bits == 0 && !dense) {
+      why = "a split DiT reads dense or affine weights only";
+    }
+    if (!why.empty()) {
+      return err(fmt("tensor_parallel: {}", why)());
+    }
+  }
   if (!m->load_fixed_(*m->_ws)) {
     return err("the model-level weights are incomplete");
   }
@@ -1349,10 +1696,32 @@ MetalMossImageTransformer::load(std::shared_ptr<WeightSet> ws,
   m->_wire.open(mc);
   const int NL = m->_cfg.n_layers;
   m->_blocks.resize((std::size_t)NL);
+  if (rank && mc->session() != nullptr) {
+    const TpShare& t = m->_cfg.tp;
+    mc->session()->info(fmt(
+        "MetalMossImageTransformer: rank {} of {}: heads [{}, {}) of {}, "
+        "feed-forward rows [{}, {}) of {}{}", t.rank, t.ranks, t.head0,
+        t.head1, t.n_heads, t.ffn0, t.ffn1, t.n_ffn,
+        stream_blocks ? ", streamed then kept" : ""));
+  }
   if (stream_blocks) {
     // Sized to the stack so a PROMOTED block has somewhere to land; an
     // unfilled entry reads as empty.
     m->configure_slots_();
+    // A RANK STREAMS ON THE PER-BLOCK PATH, never a slot: a slot refills
+    // a block by its tensors whole, and a rank's block is its share, cut
+    // afresh at each read (load_tp_block_) in the layout its tier holds.
+    // Serial reads, then, until residency keeps the stack -- which a box
+    // with room does on the first forward.
+    if (rank) { m->_slots.disable(); }
+  } else if (rank) {
+    for (int L = 0; L < NL; ++L) {
+      std::string terr;
+      if (!m->load_tp_block_(*m->_ws, L, m->_blocks[(std::size_t)L],
+                             &terr)) {
+        return err(fmt("tensor_parallel: block {}: {}", L, terr)());
+      }
+    }
   } else {
     for (int L = 0; L < NL; ++L) {
       if (!m->load_block_(*m->_ws, L, m->_blocks[(std::size_t)L],
@@ -1398,14 +1767,28 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
   if (req.latents == nullptr || req.text == nullptr) {
     return fail("moss-image forward: missing input");
   }
-  const int H = _cfg.hidden, NH = _cfg.n_heads, Hd = _cfg.head_dim;
-  const int FFI = _cfg.ffn_inner, LC = _cfg.latent_channels;
+  // A RANK (Config::tp) runs its share's heads and feed-forward rows in
+  // the main blocks: NH and FFI are its own there, HI its heads' width;
+  // the text blocks run whole (NHT heads, FFT rows) and H stays the
+  // model's.
+  const bool rank = _cfg.tp.active();
+  const int H = _cfg.hidden, NHT = _cfg.n_heads, Hd = _cfg.head_dim;
+  const int NH = rank ? _cfg.tp.heads() : NHT;
+  const int HI = NH * Hd;
+  const int FFT = _cfg.ffn_inner;
+  const int FFI = rank ? _cfg.tp.ffn() : FFT;
+  const int LC = _cfg.latent_channels;
   const int IMG = req.grid_h * req.grid_w, TXT = req.text_rows;
   const int JT = IMG + TXT;
   const int NL = _cfg.n_layers;
-  if (IMG <= 0 || TXT <= 0 || NH * Hd != H) {
+  if (IMG <= 0 || TXT <= 0 || NHT * Hd != H) {
     return fail("moss-image forward: degenerate geometry");
   }
+  if (rank && _tp_pipe == nullptr) {
+    return fail("moss-image forward: a rank with no channel "
+                "(begin_tp_generation)");
+  }
+  std::string tp_err;
   if (req.latents->byte_size() < (std::size_t)IMG * LC * 2 ||
       req.text->byte_size() < (std::size_t)TXT * _cfg.text_dim * 2) {
     return fail("moss-image forward: an input is smaller than its shape");
@@ -1437,22 +1820,26 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
   auto buf = [&](std::size_t elems) {
     return mc->make_shared_buffer(elems * 2);
   };
-  SharedBuffer joint = buf((std::size_t)JT * H);
-  SharedBuffer nrm = buf((std::size_t)JT * H);
-  SharedBuffer ob = buf((std::size_t)JT * H);
-  SharedBuffer qb = buf((std::size_t)JT * H);
-  SharedBuffer kb = buf((std::size_t)JT * H);
-  SharedBuffer vb = buf((std::size_t)JT * H);
-  SharedBuffer af = buf((std::size_t)JT * H);
-  SharedBuffer ffu = buf((std::size_t)JT * 2 * FFI);
-  SharedBuffer ffg = buf((std::size_t)JT * FFI);
-  SharedBuffer tqkv = buf((std::size_t)TXT * 3 * H);
+  // A rank's main-block planes are its share's widths; the text blocks
+  // (whole) use `ob`, `af` and the feed-forward scratch at the model's,
+  // over the text rows alone.
+  const std::size_t jt = (std::size_t)JT, tx = (std::size_t)TXT;
+  SharedBuffer joint = buf(jt * H);
+  SharedBuffer nrm = buf(jt * H);
+  SharedBuffer ob = buf((rank ? tx : jt) * H);
+  SharedBuffer qb = buf(jt * HI);
+  SharedBuffer kb = buf(jt * HI);
+  SharedBuffer vb = buf(jt * HI);
+  SharedBuffer af = buf(std::max(jt * HI, tx * H));
+  SharedBuffer ffu = buf(std::max(jt * 2 * FFI, tx * FFT));
+  SharedBuffer ffg = buf(std::max(jt * FFI, tx * FFT));
+  SharedBuffer tqkv = buf(tx * 3 * H);
   SharedBuffer qh, kh, vh, ao;
   if (head_major) {
-    qh = buf((std::size_t)JT * H);
-    kh = buf((std::size_t)JT * H);
-    vh = buf((std::size_t)JT * H);
-    ao = buf((std::size_t)JT * H);
+    qh = buf(jt * HI);
+    kh = buf(jt * HI);
+    vh = buf(jt * HI);
+    ao = buf(jt * HI);
   }
   SharedBuffer tin = buf((std::size_t)_cfg.freq_dim);
   SharedBuffer te1 = buf((std::size_t)H);
@@ -1497,9 +1884,51 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
 
   if (_i8) { _i8->tune_pending(mc); }
 
+  // A RANK'S EXCHANGE BUFFERS, grown HERE to this forward's widest band
+  // (every main block runs JT rows): a buffer replaced is forgotten
+  // first, and forget() waits out the exchanges posted on it --
+  // mid-forward those wait on GPU work not yet committed. Nothing is
+  // pending between forwards.
+  std::vector<std::pair<int, int>> tp_bands;
+  int tp_lag = 1;
+  if (rank) {
+    int forced = 0;
+    if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_TP_BANDS")) {
+      forced = std::max(0, std::atoi(e));
+    }
+    if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_TP_LAG")) {
+      tp_lag = std::atoi(e) == 0 ? 0 : 1;
+    }
+    tp_bands = tp_row_bands(JT, tp_band_floor(_cfg.tp), forced);
+    int widest = 0;
+    for (const auto& bd : tp_bands) { widest = std::max(widest, bd.second); }
+    const std::size_t pb = (std::size_t)widest * (std::size_t)H * 2;
+    const int lanes = tp_bands.size() > 1 ? 4 : 1;
+    for (int k = 0; k < lanes; ++k) {
+      if (!tp_buffer_(_tp_part[k], pb) || !tp_buffer_(_tp_recv[k], pb)) {
+        return fail("moss-image forward: tensor parallel: no room for the "
+                    "partial sums");
+      }
+    }
+  }
+
   CommandStream stream = mc->make_command_stream();
   ComputeEncoder enc = stream.begin_compute();
   if (!enc.valid()) { return fail("moss-image forward: no compute encoder"); }
+  // A RANK'S EXCHANGES LEFT POSTED when the forward ends early -- a stop
+  // between blocks, a failure -- their partials in work never committed,
+  // would hold the GPU's waits and the worker: abandoned here, before the
+  // encoder and stream go (declared after them). A forward that ran to
+  // its end has none pending.
+  struct TpEnd {
+    TpOverlap* pipe;
+    ~TpEnd()
+    {
+      if (pipe != nullptr && pipe->pending()) {
+        pipe->abandon("the forward ended early");
+      }
+    }
+  } tp_end{rank ? _tp_pipe.get() : nullptr};
   _flops.begin();
   if (_sol) {
     _sol->reset_counts();
@@ -1704,16 +2133,16 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
   // of row 0; tables from row `row0` of the joint table.
   auto rms_rope = [&](const SharedBuffer& x, std::size_t xe,
                       const SharedBuffer& gamma, int rows, int row0,
-                      int stride) {
+                      int stride, int nh) {
     const std::size_t tb = (std::size_t)row0 * (Hd / 2) * sizeof(float);
     enc.set_function(_fn_rms_rope);
     enc.set_buffer(0, x, xe * 2);
     enc.set_buffer(1, rcos, tb); enc.set_buffer(2, rsin, tb);
     enc.set_buffer(3, gamma);
-    enc.set_constant(4, NH); enc.set_constant(5, rows);
+    enc.set_constant(4, nh); enc.set_constant(5, rows);
     enc.set_constant(6, Hd); enc.set_constant(7, stride);
     enc.set_constant(8, eps);
-    enc.dispatch({32, (unsigned)rows, (unsigned)NH}, {32, 1, 1});
+    enc.dispatch({32, (unsigned)rows, (unsigned)nh}, {32, 1, 1});
   };
   auto transpose = [&](const SharedBuffer& in, const SharedBuffer& out,
                        int A, int B) {
@@ -1733,18 +2162,22 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
   const int A_BQ = nax ? 64 : 32;
   const int A_BK = nax ? 32 : 16;
   const float ascale = 1.0f / std::sqrt((float)Hd);
-  struct PKey { int rows, stride; bool hm; SharedBuffer b; };
+  struct PKey { int rows, stride, nh; bool hm; SharedBuffer b; };
   std::vector<PKey> aparams;
   // `stride` is the row stride of a TOKEN-major operand; `hm` takes the
-  // head-major layout instead ([NH, rows, Hd], Sol's).
-  auto params_for = [&](int R, int stride, bool hm) -> const SharedBuffer* {
+  // head-major layout instead ([nh, rows, Hd], Sol's). `nh` heads: the
+  // model's in a text block, a rank's share in a main one.
+  auto params_for = [&](int R, int stride, bool hm,
+                        int nh) -> const SharedBuffer* {
     for (auto& p : aparams) {
-      if (p.rows == R && p.stride == stride && p.hm == hm) { return &p.b; }
+      if (p.rows == R && p.stride == stride && p.hm == hm && p.nh == nh) {
+        return &p.b;
+      }
     }
     SharedBuffer b = mc->make_shared_buffer(sizeof(SteelAttnParams));
     if (b.empty()) { return nullptr; }
     auto* p = static_cast<SteelAttnParams*>(b.contents());
-    p->B = 1; p->H = NH; p->D = Hd; p->qL = R; p->kL = R;
+    p->B = 1; p->H = nh; p->D = Hd; p->qL = R; p->kL = R;
     p->gqa_factor = 1; p->scale = ascale;
     p->NQ = (R + A_BQ - 1) / A_BQ; p->NK = (R + A_BK - 1) / A_BK;
     p->NQ_aligned = R / A_BQ; p->NK_aligned = R / A_BK;
@@ -1754,7 +2187,7 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
     const std::int64_t rs = (std::int64_t)R * Hd;
     for (std::int64_t* s : {p->Q_strides, p->K_strides, p->V_strides,
                             p->O_strides}) {
-      s[0] = (std::int64_t)NH * rs;
+      s[0] = (std::int64_t)nh * rs;
       if (hm) {
         s[1] = rs; s[2] = Hd;
       } else {
@@ -1762,10 +2195,10 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
         s[1] = Hd; s[2] = stride;
       }
     }
-    // The output is always a plain [rows, H] (token-major) or [NH, rows,
-    // Hd] (head-major) buffer, whatever the inputs' stride.
-    if (!hm) { p->O_strides[2] = H; }
-    aparams.push_back(PKey{R, stride, hm, std::move(b)});
+    // The output is always a plain [rows, nh * Hd] (token-major) or [nh,
+    // rows, Hd] (head-major) buffer, whatever the inputs' stride.
+    if (!hm) { p->O_strides[2] = (std::int64_t)nh * Hd; }
+    aparams.push_back(PKey{R, stride, nh, hm, std::move(b)});
     return &aparams.back().b;
   };
   auto attn_fn = [&](int R, bool i8) -> const metal_compute::ComputeFunction* {
@@ -1795,7 +2228,8 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
   auto run_attn_tm = [&](int L, const SharedBuffer& q, std::size_t qe,
                          const SharedBuffer& k, std::size_t ke,
                          const SharedBuffer& v, std::size_t ve,
-                         const SharedBuffer& o, int rows, int stride) {
+                         const SharedBuffer& o, int rows, int stride,
+                         int nh) {
     if (!attn_ok) { return; }
     bool i8_ok = false;
     if (_sage && nax && _cfg.sage.enabled && L >= _cfg.sage.dense_layers &&
@@ -1804,7 +2238,7 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
       const MetalSageAttention::Operand ko{&k, ke, stride, Hd};
       const MetalSageAttention::Operand vo{&v, ve, stride, Hd};
       std::string gerr;
-      i8_ok = _sage->prepare(enc, qo, ko, NH, NH, rows, rows, Hd, A_BQ,
+      i8_ok = _sage->prepare(enc, qo, ko, nh, nh, rows, rows, Hd, A_BQ,
                              A_BK, _cfg.sage, &gerr, &vo);
       // The int8 function takes the int8 P*V's operands iff pv8_for()
       // says so: a prologue that made none runs dense.
@@ -1812,7 +2246,7 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
         i8_ok = false;
       }
     }
-    const SharedBuffer* pp = params_for(rows, stride, false);
+    const SharedBuffer* pp = params_for(rows, stride, false, nh);
     const metal_compute::ComputeFunction* fn = attn_fn(rows, i8_ok);
     if (pp == nullptr || fn == nullptr) { attn_ok = false; return; }
     enc.set_function(*fn);
@@ -1821,8 +2255,8 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
     enc.set_buffer(3, o); enc.set_buffer(4, *pp);
     if (i8_ok) { _sage->bind(enc); }
     enc.dispatch({(unsigned)(32 * ((rows + A_BQ - 1) / A_BQ)),
-                  (unsigned)(4 * NH), 1}, {32, 4, 1});
-    _flops.attention(NH, (long long)rows * rows, Hd);
+                  (unsigned)(4 * nh), 1}, {32, 4, 1});
+    _flops.attention(nh, (long long)rows * rows, Hd);
   };
   // The main blocks' attention: Sol where it is on and the sequence
   // long enough (head-major, through transposes), token-major steel
@@ -1873,7 +2307,7 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
           i8_ok = false;
         }
       }
-      const SharedBuffer* pp = params_for(rows, Hd, true);
+      const SharedBuffer* pp = params_for(rows, Hd, true, NH);
       const metal_compute::ComputeFunction* fn = attn_fn(rows, i8_ok);
       if (pp == nullptr || fn == nullptr) { attn_ok = false; return; }
       enc.set_function(*fn);
@@ -1886,7 +2320,7 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
       transpose(ao, af, NH, rows);
       return;
     }
-    run_attn_tm(L, qb, 0, kb, 0, vb, 0, af, rows, H);
+    run_attn_tm(L, qb, 0, kb, 0, vb, 0, af, rows, HI, NH);
   };
 
   // ---- the shared modulation and the head's ---------------------------
@@ -1936,28 +2370,28 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
     rms(joint, txe, b.n1, nrm, 0, TXT, H);
     lin(nrm, 0, b.qkv, tqkv, 0, TXT, 3 * H, H);
     bias(b.qkv_b, tqkv, 0, TXT, 3 * H);
-    rms_rope(tqkv, 0, b.nq, TXT, IMG, 3 * H);
-    rms_rope(tqkv, (std::size_t)H, b.nk, TXT, IMG, 3 * H);
+    rms_rope(tqkv, 0, b.nq, TXT, IMG, 3 * H, NHT);
+    rms_rope(tqkv, (std::size_t)H, b.nk, TXT, IMG, 3 * H, NHT);
     run_attn_tm(-1, tqkv, 0, tqkv, (std::size_t)H, tqkv, (std::size_t)2 * H,
-                af, TXT, 3 * H);
+                af, TXT, 3 * H, NHT);
     lin(af, 0, b.proj, ob, 0, TXT, H, H);
     bias(b.proj_b, ob, 0, TXT, H);
     resid(joint, txe, ob, 0, TXT * H);
     rms(joint, txe, b.n2, nrm, 0, TXT, H);
     // The hidden half (ffn_up) and the gate (ffn_gate) as two GEMMs,
     // then the two-input SITU in place on the hidden one.
-    lin(nrm, 0, b.up, ffu, 0, TXT, FFI, H);
-    bias(b.up_b, ffu, 0, TXT, FFI);
-    lin(nrm, 0, b.gate, ffg, 0, TXT, FFI, H);
-    bias(b.gate_b, ffg, 0, TXT, FFI);
+    lin(nrm, 0, b.up, ffu, 0, TXT, FFT, H);
+    bias(b.up_b, ffu, 0, TXT, FFT);
+    lin(nrm, 0, b.gate, ffg, 0, TXT, FFT, H);
+    bias(b.gate_b, ffg, 0, TXT, FFT);
     {
-      const int n = TXT * FFI;
+      const int n = TXT * FFT;
       enc.set_function(_fn_situ2);
       enc.set_buffer(0, ffu); enc.set_buffer(1, ffg); enc.set_buffer(2, ffu);
       enc.set_constant(3, n);
       enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
     }
-    lin(ffu, 0, b.down, ob, 0, TXT, H, FFI);
+    lin(ffu, 0, b.down, ob, 0, TXT, H, FFT);
     bias(b.down_b, ob, 0, TXT, H);
     resid(joint, txe, ob, 0, TXT * H);
     ++done;
@@ -2162,17 +2596,20 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
       // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
+    // A rank's q / k / v are its heads' width (HI); the input is the
+    // model's.
     auto gpu_qkv = [&](int r0, int n) {
       if (n <= 0) { return; }
       const std::size_t e0 = (std::size_t)r0 * H;
+      const std::size_t y0 = (std::size_t)r0 * HI;
       if (!fast_shared_(enc, nrm, e0, n, H,
-                        {{&b->qw, &qb, e0, H, !LA(&BlockLora::q).empty()},
-                         {&b->kw, &kb, e0, H, !LA(&BlockLora::k).empty()},
-                         {&b->vw, &vb, e0, H,
+                        {{&b->qw, &qb, y0, HI, !LA(&BlockLora::q).empty()},
+                         {&b->kw, &kb, y0, HI, !LA(&BlockLora::k).empty()},
+                         {&b->vw, &vb, y0, HI,
                           !LA(&BlockLora::v).empty()}})) {
-        lin(nrm, e0, b->qw, qb, e0, n, H, H, LA(&BlockLora::q));
-        lin(nrm, e0, b->kw, kb, e0, n, H, H, LA(&BlockLora::k));
-        lin(nrm, e0, b->vw, vb, e0, n, H, H, LA(&BlockLora::v));
+        lin(nrm, e0, b->qw, qb, y0, n, HI, H, LA(&BlockLora::q));
+        lin(nrm, e0, b->kw, kb, y0, n, HI, H, LA(&BlockLora::k));
+        lin(nrm, e0, b->vw, vb, y0, n, HI, H, LA(&BlockLora::v));
       }
     };
     const auto t_q0 = std::chrono::steady_clock::now();
@@ -2209,92 +2646,186 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
     if (qkv_split && ane_plan == AneFeedForward::Plan::kSplit) {
       ane_stage_(L, *b);
     }
-    rms_rope(qb, 0, b->nq, rows, 0, H);
-    rms_rope(kb, 0, b->nk, rows, 0, H);
+    rms_rope(qb, 0, b->nq, rows, 0, HI, NH);
+    rms_rope(kb, 0, b->nk, rows, 0, HI, NH);
     mark("rope");
     run_attn_main(L, rows);
     mark("attn");
-    lin(af, 0, b->ow, ob, 0, rows, H, H, LA(&BlockLora::o));
-    mark("gemm.out");
-    gated(joint, 0, mods, mod_at(kGateA), ob, 0, rows);
-    // y = norm2(x) * (1 + scale_f) + shift_f
-    rms(joint, 0, b->n2, nrm, 0, rows, H);
-    modulate(nrm, 0, mods, mod_at(kScaleF), mods, mod_at(kShiftF), nrm, 0,
-             rows);
-    mark("elt");
-    // ---- the feed-forward split point -------------------------------
-    //
-    // THE ORDER IS LOAD-BEARING: commit the attention without waiting,
-    // drain, START THE ANE on the tail rows, and only then encode the
-    // GPU's -- after them, only the down projection would be left to
-    // hide behind.
-    const bool ane_split = ane_plan == AneFeedForward::Plan::kSplit;
-    const bool ane_probe = ane_plan == AneFeedForward::Plan::kProbe;
-    int a_rows = 0;
-    double ane_drain_ms = 0.0;
-    if (ane_split || ane_probe) {
-      enc.end();
-      _flops.flush(stream);
-      const auto t_d0 = std::chrono::steady_clock::now();
-      std::string ge2;
-      if (!stream.commit().wait_ok(&ge2)) {
-        return fail("moss-image forward: " + ge2);
-      }
-      ane_drain_ms = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - t_d0).count();
-      if (ane_split && _ane->join_stage(L)) {
-        a_rows = _ane->begin(nrm, ob, rows);
-      } else if (ane_split && _mc->session() != nullptr) {
-        _mc->session()->warn(fmt(
-            "moss-image: staging block {}'s weights for the ANE failed; it "
-            "keeps the GPU feed-forward", L));
-      }
-      // The same stream: a fresh one is a new queue, and its first
-      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-      // stream_per_commit_costs).
-      enc = stream.begin_compute();
-    }
-    // The GPU's feed-forward over rows [r0, r0 + n), `nrm` into `ob`; the
+    // The GPU's feed-forward over rows [r0, r0 + n), `nrm` into `out`
+    // from element `oe` -- `ob`'s own rows for the whole model (and the
+    // rows the ANE lost), a band's exchange buffer for a RANK. The
     // up|gate and SITU scratch is used from its first row.
-    auto gpu_ff = [&](int r0, int n) {
+    auto gpu_ff = [&](int r0, int n, const SharedBuffer& out,
+                      std::size_t oe) {
       if (n <= 0) { return; }
       const std::size_t e0 = (std::size_t)r0 * H;
       lin(nrm, e0, b->ug, ffu, 0, n, 2 * FFI, H, LA(&BlockLora::ug));
       mark("gemm.ff");
       situ(ffu, ffg, n);
       mark("elt");
-      lin(ffg, 0, b->dn, ob, e0, n, H, FFI, LA(&BlockLora::dn));
+      lin(ffg, 0, b->dn, out, oe, n, H, FFI, LA(&BlockLora::dn));
       mark("gemm.ff");
     };
-    const auto t_g0 = std::chrono::steady_clock::now();
-    gpu_ff(0, rows - a_rows);
-    if (ane_split || ane_probe) {
-      enc.end();
-      _flops.flush(stream);
-      std::string ge2;
-      if (!stream.commit().wait_ok(&ge2)) {
-        if (a_rows > 0) { (void)_ane->finish(L, rows, 0.0, ane_drain_ms); }
-        return fail("moss-image forward: " + ge2);
-      }
-      const double t_gpu = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - t_g0).count();
-      if (ane_probe) { _ane->note_probe(ane_drain_ms, t_gpu); }
-      int ff_lost = -1;
-      if (!_ane->finish(L, rows, t_gpu, ane_drain_ms) && a_rows > 0) {
-        ff_lost = _ane->lost_row0();
-        if (ff_lost < 0 || ff_lost >= rows) {
-          return fail("moss-image forward: the ANE feed-forward lost its "
-                      "rows");
+    // A RANK'S BLOCK TAIL (Config::tp), from the attention's token-major
+    // output on. Its out projection and feed-forward are PARTIAL sums --
+    // its heads' and rows' share of the block's -- each completed by the
+    // other ranks' sum before its gate. The rows are cut into bands
+    // (tp_row_bands: one, the block whole, unless the share was given a
+    // floor), each band's partial written straight into an EXCHANGE
+    // BUFFER (no copy) and POSTED (TpOverlap): the GPU signals it
+    // written, the worker hands it to the channel, and the GPU waits for
+    // the others' sum only where it adds it -- the encoder never waits.
+    // In GPU order step i runs A(i) -- band i's out projection, posted --
+    // then B(i - 1) -- that band's sum added, its attention gate, the
+    // feed-forward's norm and modulation and the feed-forward, posted --
+    // then C(i - 2) -- that sum added, its gate. So band i's first partial
+    // crosses under A(i + 1) and its second under the next step's work;
+    // what stays exposed is the last band's feed-forward, once a block.
+    // VPIPE_MOSS_IMAGE_TP_LAG=0 runs the steps band after band: no
+    // overlap, the same arithmetic. Lanes 0 / 1 carry the attention's
+    // partials, 2 / 3 the feed-forward's (a whole block: lane 0 both); a
+    // lane's next write follows the GPU's read of its sum before it. The
+    // modulation is ONE for every row, so a band reads it at no offset.
+    auto rank_tail = [&]() -> bool {
+      const int nb = (int)tp_bands.size();
+      const int la = nb > 1 ? 2 : 1, lf = nb > 1 ? 2 : 0;
+      std::vector<std::uint64_t> va((std::size_t)nb), vc((std::size_t)nb);
+      auto post = [&](int lane, int n) {
+        const TpOverlap::Ticket t =
+            _tp_pipe->post(lane, _tp_part[lane], _tp_recv[lane],
+                           (std::size_t)n * (std::size_t)H * 2, _tp_seq++);
+        // Between encoders, into the open command buffer: the signal
+        // after the dispatch that wrote the partial.
+        enc.end();
+        stream.encode_signal(*t.ready, t.ready_at);
+        enc = stream.begin_compute();
+        return t.done_at;
+      };
+      auto await = [&](std::uint64_t v) {
+        enc.end();
+        stream.encode_wait(_tp_pipe->done(), v);
+        enc = stream.begin_compute();
+      };
+      auto step_a = [&](int k) {
+        const int r0 = tp_bands[(std::size_t)k].first;
+        const int n = tp_bands[(std::size_t)k].second;
+        lin(af, (std::size_t)r0 * HI, b->ow, _tp_part[k % la], 0, n, H, HI);
+        va[(std::size_t)k] = post(k % la, n);
+      };
+      auto step_b = [&](int k) {
+        const int r0 = tp_bands[(std::size_t)k].first;
+        const int n = tp_bands[(std::size_t)k].second;
+        const std::size_t e0 = (std::size_t)r0 * H;
+        const SharedBuffer& p = _tp_part[k % la];
+        await(va[(std::size_t)k]);
+        resid(p, 0, _tp_recv[k % la], 0, n * H);
+        gated(joint, e0, mods, mod_at(kGateA), p, 0, n);
+        rms(joint, e0, b->n2, nrm, e0, n, H);
+        modulate(nrm, e0, mods, mod_at(kScaleF), mods, mod_at(kShiftF), nrm,
+                 e0, n);
+        gpu_ff(r0, n, _tp_part[lf + k % la], 0);
+        vc[(std::size_t)k] = post(lf + k % la, n);
+      };
+      auto step_c = [&](int k) {
+        const int r0 = tp_bands[(std::size_t)k].first;
+        const int n = tp_bands[(std::size_t)k].second;
+        const SharedBuffer& p = _tp_part[lf + k % la];
+        await(vc[(std::size_t)k]);
+        resid(p, 0, _tp_recv[lf + k % la], 0, n * H);
+        gated(joint, (std::size_t)r0 * H, mods, mod_at(kGateF), p, 0, n);
+      };
+      for (int i = 0; i < nb + 2 * tp_lag; ++i) {
+        if (i < nb) { step_a(i); }
+        if (i - tp_lag >= 0 && i - tp_lag < nb) { step_b(i - tp_lag); }
+        if (i - 2 * tp_lag >= 0 && i - 2 * tp_lag < nb) {
+          step_c(i - 2 * tp_lag);
         }
       }
-      // The same stream: a fresh one is a new queue, and its first
-      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
-      // stream_per_commit_costs).
-      enc = stream.begin_compute();
-      if (ff_lost >= 0) { gpu_ff(ff_lost, rows - ff_lost); }
+      mark("tp");
+      if (_tp_pipe->failed()) {
+        tp_err = _tp_pipe->error();
+        return false;
+      }
+      return true;
+    };
+    if (rank) {
+      if (!rank_tail()) {
+        if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+        return fail("moss-image forward: tensor parallel: " + tp_err);
+      }
+    } else {
+      lin(af, 0, b->ow, ob, 0, rows, H, H, LA(&BlockLora::o));
+      mark("gemm.out");
+      gated(joint, 0, mods, mod_at(kGateA), ob, 0, rows);
+      // y = norm2(x) * (1 + scale_f) + shift_f
+      rms(joint, 0, b->n2, nrm, 0, rows, H);
+      modulate(nrm, 0, mods, mod_at(kScaleF), mods, mod_at(kShiftF), nrm, 0,
+               rows);
+      mark("elt");
+      // ---- the feed-forward split point -------------------------------
+      //
+      // THE ORDER IS LOAD-BEARING: commit the attention without waiting,
+      // drain, START THE ANE on the tail rows, and only then encode the
+      // GPU's -- after them, only the down projection would be left to
+      // hide behind.
+      const bool ane_split = ane_plan == AneFeedForward::Plan::kSplit;
+      const bool ane_probe = ane_plan == AneFeedForward::Plan::kProbe;
+      int a_rows = 0;
+      double ane_drain_ms = 0.0;
+      if (ane_split || ane_probe) {
+        enc.end();
+        _flops.flush(stream);
+        const auto t_d0 = std::chrono::steady_clock::now();
+        std::string ge2;
+        if (!stream.commit().wait_ok(&ge2)) {
+          return fail("moss-image forward: " + ge2);
+        }
+        ane_drain_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_d0).count();
+        if (ane_split && _ane->join_stage(L)) {
+          a_rows = _ane->begin(nrm, ob, rows);
+        } else if (ane_split && _mc->session() != nullptr) {
+          _mc->session()->warn(fmt(
+              "moss-image: staging block {}'s weights for the ANE failed; it "
+              "keeps the GPU feed-forward", L));
+        }
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
+        enc = stream.begin_compute();
+      }
+      const auto t_g0 = std::chrono::steady_clock::now();
+      gpu_ff(0, rows - a_rows, ob, 0);
+      if (ane_split || ane_probe) {
+        enc.end();
+        _flops.flush(stream);
+        std::string ge2;
+        if (!stream.commit().wait_ok(&ge2)) {
+          if (a_rows > 0) { (void)_ane->finish(L, rows, 0.0, ane_drain_ms); }
+          return fail("moss-image forward: " + ge2);
+        }
+        const double t_gpu = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_g0).count();
+        if (ane_probe) { _ane->note_probe(ane_drain_ms, t_gpu); }
+        int ff_lost = -1;
+        if (!_ane->finish(L, rows, t_gpu, ane_drain_ms) && a_rows > 0) {
+          ff_lost = _ane->lost_row0();
+          if (ff_lost < 0 || ff_lost >= rows) {
+            return fail("moss-image forward: the ANE feed-forward lost its "
+                        "rows");
+          }
+        }
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
+        enc = stream.begin_compute();
+        if (ff_lost >= 0) {
+          gpu_ff(ff_lost, rows - ff_lost, ob, (std::size_t)ff_lost * H);
+        }
+      }
+      gated(joint, 0, mods, mod_at(kGateF), ob, 0, rows);
+      mark("elt");
     }
-    gated(joint, 0, mods, mod_at(kGateF), ob, 0, rows);
-    mark("elt");
     ++done;
 
     // ---- the streaming boundary --------------------------------------
@@ -2371,6 +2902,13 @@ MetalMossImageTransformer::forward(const Request& req, std::string* err)
     if (!stream.commit().wait_ok(&ge)) {
       return fail("moss-image forward: " + (ge.empty() ? "GPU failed" : ge));
     }
+  }
+  // A RANK's exchange that failed after its block was encoded let the GPU
+  // run on with wrong sums (TpOverlap releases its waits): said here.
+  if (rank && _tp_pipe->failed()) {
+    if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+    return fail("moss-image forward: tensor parallel: " +
+                _tp_pipe->error());
   }
   if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
   if (_fast_failed) {
@@ -2893,16 +3431,37 @@ MetalMossImageTransformer::forward_scratch_bytes(const Config& c, int grid_h,
                                                  bool matrix_cores)
 {
   const std::size_t img = (std::size_t)grid_h * grid_w;
-  const std::size_t jt = img + (std::size_t)text_rows;
+  const std::size_t tx = (std::size_t)std::max(text_rows, 0);
+  const std::size_t jt = img + tx;
   const std::size_t H = (std::size_t)c.hidden, F = (std::size_t)c.ffn_inner;
-  // joint, nrm, ob, q, k, v, af (+ four head-major planes under Sol),
-  // the [jt, 2F] up|gate and the [jt, F] product, the text block's
-  // fused q|k|v, the velocity, and the f32 rotary tables.
-  std::size_t planes = 7 + (sol ? 4 : 0);
-  std::size_t n = planes * jt * H * 2 + jt * 3 * F * 2 +
-                  (std::size_t)text_rows * 3 * H * 2 +
+  // A RANK's main-block planes are its share's: q / k / v, af and the
+  // head-major planes its heads' width, the feed-forward its rows'; the
+  // text blocks still run whole over the text rows.
+  const bool rank = c.tp.active();
+  const int nh = rank ? c.tp.heads() : c.n_heads;
+  const std::size_t HI = (std::size_t)nh * (std::size_t)c.head_dim;
+  const std::size_t FF = rank ? (std::size_t)c.tp.ffn() : F;
+  // joint, nrm, ob (a rank's the text rows' alone), q, k, v, af (+ four
+  // head-major planes under Sol), the [jt, 2F] up|gate and the [jt, F]
+  // product, the text block's fused q|k|v, the velocity, and the f32
+  // rotary tables.
+  std::size_t n = 2 * jt * H * 2 + (rank ? tx : jt) * H * 2 +
+                  (3 + (sol ? 4 : 0)) * jt * HI * 2 +
+                  std::max(jt * HI, tx * H) * 2 +
+                  std::max(jt * 2 * FF, tx * F) * 2 +
+                  std::max(jt * FF, tx * F) * 2 + tx * 3 * H * 2 +
                   img * (std::size_t)c.latent_channels * 2 +
                   2 * jt * (std::size_t)(c.head_dim / 2) * 4;
+  // A rank's EXCHANGE BUFFERS: a partial and the others' sum a lane, at
+  // the widest band of the joint rows (four lanes banded, one whole).
+  if (rank && jt > 0) {
+    const auto bands = tp_row_bands((int)jt, tp_band_floor(c.tp));
+    std::size_t widest = 0;
+    for (const auto& bd : bands) {
+      widest = std::max(widest, (std::size_t)bd.second);
+    }
+    n += (bands.size() > 1 ? 4u : 1u) * 2 * widest * H * 2;
+  }
   // HELD between forwards, which the planes above leave out: a pack's
   // dense stand-in (the fused [hidden | gate], the widest projection),
   // and where the box runs them the int8 context, Sage's int8 Q / K and
@@ -2915,22 +3474,141 @@ MetalMossImageTransformer::forward_scratch_bytes(const Config& c, int grid_h,
                                               (int)H, c.i8_tier == 0);
     }
     if (c.sage.enabled) {
-      n += MetalSageAttention::scratch_bytes(c.n_heads, c.n_heads, (int)jt,
-                                             (int)jt, c.head_dim, 64, 32,
+      n += MetalSageAttention::scratch_bytes(nh, nh, (int)jt, (int)jt,
+                                             c.head_dim, 64, 32,
                                              c.sage.pv8);
     }
     if (sol) {
-      n += MetalSolAttention::scratch_bytes(c.n_heads, (int)jt, c.head_dim,
+      n += MetalSolAttention::scratch_bytes(nh, (int)jt, c.head_dim,
                                             c.sol.key_block, /*nax=*/true);
     }
   }
   return n;
 }
 
+// One block's SHARE as tp_qw_ leaves it, off the headers: its six
+// projections at the share's rows and columns, in the layout each takes
+// -- on the int8 fast / token tier (`fast`, the context load() makes
+// when the tier engages) an affine share converted where its columns
+// take a group (a w4 one only where Config::i8_hold_w4 holds it, else
+// its pack) and a dense one quantized (a dense checkpoint's alone);
+// else bf16, or an affine pack's codes, scales and biases -- and its
+// four norms whole.
+std::size_t
+MetalMossImageTransformer::tp_block_bytes_(const MetalLlamaWeights& src,
+                                           const Config& c,
+                                           const I8GemmContext* fast,
+                                           const std::string& pfx)
+{
+  const TpShare& t = c.tp;
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t F = (std::size_t)c.ffn_inner;
+  const std::size_t hi = (std::size_t)t.heads() * (std::size_t)c.head_dim;
+  const std::size_t f = (std::size_t)t.ffn();
+  const bool pack = src.info(pfx + "proj.q.scales") != nullptr;
+  // [rows] x [cols] of an [N, K] weight.
+  auto proj = [&](const std::string& nm, std::size_t N, std::size_t K,
+                  std::size_t rows, std::size_t cols) -> std::size_t {
+    const auto* ci = src.info(nm + ".weight");
+    const auto* si = src.info(nm + ".scales");
+    const std::size_t share = rows * cols;
+    const int fgc = fast != nullptr ? fast->fast_group((int)cols) : 0;
+    const std::size_t layout =
+        fgc > 0 ? share + I8GemmContext::fast_scale_bytes(
+                              (int)rows, (int)cols, fgc)
+                : 0;
+    if (ci != nullptr && si != nullptr && si->shape.size() == 2 &&
+        si->shape[1] > 0 && N * K > 0) {
+      const std::size_t bits = (std::size_t)ci->nbytes * 8 / (N * K);
+      const std::size_t g = std::max<std::size_t>(
+          K / (std::size_t)si->shape[1], 1);
+      const std::size_t as_pack = share * bits / 8 + 2 * (share / g) * 2;
+      if (fgc > 0 && g == 64 && fast->fast_converts((int)bits, fgc) &&
+          (bits == 8 || c.i8_hold_w4)) {
+        return layout;
+      }
+      return as_pack;
+    }
+    return fgc > 0 && !pack ? layout : share * 2;
+  };
+  return proj(pfx + "proj.q", H, H, hi, H) +
+         proj(pfx + "proj.k", H, H, hi, H) +
+         proj(pfx + "proj.v", H, H, hi, H) +
+         proj(pfx + "proj.o", H, H, H, hi) +
+         proj(pfx + "proj.ffn_up_gate", 2 * F, H, 2 * f, H) +
+         proj(pfx + "proj.ffn_down", H, F, H, f) +
+         2 * H * 2 + 2 * (std::size_t)c.head_dim * 2;
+}
+
+std::size_t
+MetalMossImageTransformer::tp_held_bytes(const std::string& dir,
+                                         const Config& c, MetalCompute* mc,
+                                         std::size_t* floor)
+{
+  if (floor != nullptr) { *floor = 0; }
+  if (!c.tp.active() || dir.empty()) { return 0; }
+  auto wts = MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return 0; }
+  // The int8 tier as load() decides it, on a context made as it makes
+  // one: no matrix cores, the accurate tier, or a pack of another group,
+  // and the shares stay as cut.
+  std::unique_ptr<I8GemmContext> i8;
+  if (mc != nullptr && c.i8_gemm && c.i8_tier > 0 &&
+      mc->supports_matrix_cores() &&
+      std::getenv("VPIPE_MOSS_IMAGE_NO_MMA2") == nullptr) {
+    i8 = std::make_unique<I8GemmContext>(mc, true, /*bf16=*/true);
+    i8->set_tier(c.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : c.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                  : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(c.i8_tier == 2);
+    if (!i8->enabled() || i8->fast_group(c.hidden) <= 0) { i8.reset(); }
+  }
+  if (i8 != nullptr) {
+    const auto* si = wts->info("layers.0.proj.q.scales");
+    if (si != nullptr && si->shape.size() == 2 && si->shape[1] > 0 &&
+        c.hidden / (int)si->shape[1] != 64) {
+      i8.reset();
+    }
+  }
+  // The trunk: every tensor outside the main blocks -- the model-level
+  // weights and both text blocks, held whole -- bf16 (narrowed from F32
+  // or F16) or a pack's codes as stored. The checkpoint's `rope.bands`
+  // is the reference's own table, which this model computes and never
+  // loads.
+  std::size_t trunk = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.rfind("layers.", 0) == 0 || nm.rfind("rope.", 0) == 0) {
+      continue;
+    }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    const bool fl = ti->dtype == "F32" || ti->dtype == "F16" ||
+                    ti->dtype == "BF16";
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    trunk += fl ? n * 2 : (std::size_t)ti->nbytes;
+  }
+  std::size_t held = trunk, widest = 0;
+  for (int L = 0; L < c.n_layers; ++L) {
+    const std::size_t b = tp_block_bytes_(*wts, c, i8.get(),
+                                          "layers." + std::to_string(L) +
+                                              ".");
+    held += b;
+    widest = std::max(widest, b);
+  }
+  if (floor != nullptr) { *floor = trunk + 2 * widest; }
+  return held;
+}
+
 std::size_t
 MetalMossImageTransformer::checkpoint_block_bytes_() const
 {
   if (_ws == nullptr) { return 0; }
+  // A RANK keeps its share of a block, in its tier's layout.
+  if (_cfg.tp.active()) {
+    return tp_block_bytes_(_ws->src(), _cfg, _fast ? _i8.get() : nullptr,
+                           prefix_(0));
+  }
   const MetalLlamaWeights& w = _ws->src();
   const std::string pre = prefix_(0);
   std::size_t n = 0;

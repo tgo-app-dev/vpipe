@@ -5497,7 +5497,13 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
     if (t.n_heads != cfg.n_heads || t.n_ffn != cfg.ffn) {
       return refuse("the share is of another model's widths");
     }
-    if (cfg.ane_ffn || cfg.ane_qkv) { return refuse("no ANE tier"); }
+    // ITS ANE TIER is its share's: the feed-forward module the share's
+    // rows wide (fc1 / fc2 cut by them), the qkv module its heads' -- each
+    // staged from the cut projections, its output a partial sum the
+    // exchange completes as the GPU's is. A rank bands with it as without
+    // (band_rows), each band's rows split between the two engines
+    // (block_banded), so its exchanges stay under the next band's work and
+    // its peer, ANE or not, cuts the same bands.
     // Its blocks stream, then are kept, as any H3's: each streamed block
     // is its share cut afresh (load_block_ -> tp_linear_) on the per-block
     // path, never a slot -- a slot refills a block by its tensors whole.
@@ -8280,17 +8286,29 @@ attn_arena_elems_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
   return std::max<std::size_t>(5 * I, ff + (std::size_t)c.hidden);
 }
 
+// Elements per row of `qkv`: the fused projection's 3 x inner, and the
+// feed-forward's SwiGLU output (ffn) after it -- the one buffer free and
+// wide enough on the released config (21,504 against 14,336), but not on
+// every config: a rank of a split DiT given a narrow share of heads and a
+// wide one of the feed-forward (or a test model of H3's ffn at a narrow
+// width) had its SwiGLU write past the buffer.
+std::size_t
+qkv_elems_(const MetalMiniMaxH3Transformer::Config& c)
+{
+  return std::max<std::size_t>(3 * (std::size_t)c.inner(),
+                               (std::size_t)c.ffn);
+}
+
 std::vector<ScratchItem>
 scratch_plan_(const MetalMiniMaxH3Transformer::Config& c, bool narrow_ff)
 {
   const std::size_t H = (std::size_t)c.hidden;
-  const std::size_t I = (std::size_t)c.inner();
   const std::size_t rot_half = (std::size_t)(3 * c.rope_freq_dim);
   return {
       {rot_half, 0, 0, sizeof(float)},           // rcos
       {rot_half, 0, 0, sizeof(float)},           // rsin
       {H, 0, 0, 2}, {H, 0, 0, 2},                // x, nm (proj is in the arena)
-      {3 * I, 0, 0, 2},                          // qkv
+      {qkv_elems_(c), 0, 0, 2},                  // qkv, then the SwiGLU's
       // qh|kh|vh|oh|ob and ff, one arena (see attn_arena_elems_).
       {attn_arena_elems_(c, narrow_ff), 0, 0, 2},
       {0, H, 0, 2},                              // txt
@@ -8357,11 +8375,15 @@ MetalMiniMaxH3Transformer::scratch_bytes(const Config& c, int seq, int n_text,
     // The arena: qh | kh | vh and a band's tail, or proj's [seq, H] over
     // it where that is wider (a narrow rank of a split DiT).
     b += std::max(S * 3 * I + B * std::max(3 * I, ff), S * H) * 2;
-    b += B * (H + 3 * I) * 2;
+    b += B * (H + qkv_elems_(c)) * 2;
     b += T * H * 2 + N * ((std::size_t)c.time_dim + c.adaln_out() + 2 * H) * 2;
     // A rank's partials and sums in flight (_tp_part, _tp_recv), and the
-    // text refiner's partial and sum (_tp_send, _tp_others).
-    if (c.tp.active()) { b += 8 * B * H * 2 + 2 * T * H * 2; }
+    // text refiner's partial and sum (_tp_send, _tp_others): the prompt's
+    // rows, or a band of them where it is longer (text_band_rows).
+    if (c.tp.active()) {
+      const int tb = text_band_rows(c, (int)T, band);
+      b += 8 * B * H * 2 + 2 * (tb > 0 ? (std::size_t)tb : T) * H * 2;
+    }
     return b + dequant();
   }
   // THE SLOT FLOOR, applied HERE and not left to the caller. The scratch
@@ -8434,7 +8456,13 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
     band = std::min(band, std::max(want, tp_floor));
   }
   if (band <= 0 || seq < 2 * band) { return 0; }
-  if (c.ane_ffn || c.ane_qkv) { return 0; }
+  // THE ANE TIERS keep a whole model's blocks whole. A RANK bands with
+  // them or without: its bands are the pair's exchange pattern, so they
+  // follow its rows and its share's floor alone -- never this host's ANE,
+  // which its plan may refuse, or a clip drop (disable_ane), while the
+  // peer's runs. The ANE takes its share of each band's rows instead
+  // (block_banded), at a chunk the band holds (ane_chunk_for_).
+  if (!c.tp.active() && (c.ane_ffn || c.ane_qkv)) { return 0; }
   // BALANCED BANDS: every band but the last takes `step` rows (at most
   // `band`, a whole number of query tiles), the last the rest -- never
   // more than step, so the band-sized scratch and the two banded
@@ -8483,6 +8511,78 @@ MetalMiniMaxH3Transformer::band_rows(const Config& c, int seq)
     }
   }
   return best;
+}
+
+int
+MetalMiniMaxH3Transformer::text_band_rows(const Config& c, int n_text,
+                                          int band)
+{
+  if (band <= 0 || n_text <= band) { return 0; }
+  // Balanced as band_rows' bands are, for the same reasons: a short last
+  // band would take another GEMM route, int8 floor or tuner bucket than
+  // the whole prompt's rows do. The floor is band_rows' own.
+  const int floor =
+      c.tp.active() ? band / 2
+                    : std::min(std::max(tune_ceiling_(), 4096), band / 2);
+  const int n0 = (n_text + band - 1) / band;
+  int best = band;
+  int best_last = 0;
+  for (int n = n0; n < n0 + 16; ++n) {
+    const int step = ((n_text + n - 1) / n + 127) / 128 * 128;
+    const int last = n_text - (n - 1) * step;
+    if (step > band || last <= 0) { continue; }
+    if (last >= floor) { return step; }
+    if (last > best_last) {
+      best = step;
+      best_last = last;
+    }
+  }
+  return best;
+}
+
+int
+MetalMiniMaxH3Transformer::band_for(const Config& c, int seq, int n_text)
+{
+  const int band = band_rows(c, seq);
+  // A RANK cuts the bands its peer cuts, and a peer whose release runs a
+  // prompt longer than its band whole exchanges whole blocks: a rank
+  // bands such a prompt only when its share says both may
+  // (tp_extra::kPromptBands, stated alike to every rank).
+  if (band > 0 && n_text > band && c.tp.active()) {
+    const bool told =
+        c.tp.extra.is_object() &&
+        c.tp.extra.as_object().contains(tp_extra::kPromptBands) &&
+        c.tp.extra.as_object().at(tp_extra::kPromptBands).as_bool(false);
+    if (!told) { return 0; }
+  }
+  return band;
+}
+
+int
+MetalMiniMaxH3Transformer::whole_rows_max(const Config& c, bool vdn)
+{
+  // Every pass of the whole block addresses its activations in 64 bits
+  // or, one thread an element, in row bands of elt_rows() -- the
+  // feed-forward's [rows, 2 x ffn] and [rows, ffn], the q|k|v, the
+  // attention output, the residual stream. What still counts in 32 bits
+  // is VDN's branch: the fused q|k|v at row * 3 x inner, unsigned.
+  long long rows = (long long)INT32_MAX / std::max(1, c.hidden);
+  if (vdn) {
+    rows = std::min(rows, (long long)UINT32_MAX /
+                              (3LL * std::max(1, c.inner())));
+  }
+  return (int)rows;
+}
+
+int
+MetalMiniMaxH3Transformer::elt_rows(int width)
+{
+  int rows = INT32_MAX / std::max(1, width);
+  if (const char* e = std::getenv("VPIPE_H3_ELT_ROWS")) {
+    const int r = std::atoi(e);
+    if (r > 0) { rows = std::min(rows, r); }
+  }
+  return rows;
 }
 
 std::size_t
@@ -8918,7 +9018,7 @@ MetalMiniMaxH3Transformer::ensure_scratch_(int seq, int n_text, int n_t,
   s.band = band;
   s.x    = mk(S * H);
   s.nm   = mk(R * H);
-  s.qkv  = mk(std::max(R * 3 * I, _qkv_floor_elems));
+  s.qkv  = mk(std::max(R * qkv_elems_(c), _qkv_floor_elems));
   // The arena, then five windows into it. subview() keeps the same
   // MTL::Buffer and carries the offset, so binding a window addresses
   // its slice with no copy -- and each window is CONTIGUOUS, which the
@@ -9090,7 +9190,7 @@ MetalMiniMaxH3Transformer::attach_linear_branch(const std::string& dir,
 // kilobytes but building them walks every (query frame, key frame)
 // pair, and a denoise loop asks the same question 50 times a step.
 int
-MetalMiniMaxH3Transformer::forward_band(int seq) const
+MetalMiniMaxH3Transformer::forward_band(int seq, int n_text) const
 {
   // The forward's own rule (see where it decides), less what only a
   // request says (streaming attention).
@@ -9099,7 +9199,7 @@ MetalMiniMaxH3Transformer::forward_band(int seq) const
       (_fused_attn & kFusedAttnOut) == 0) {
     return 0;
   }
-  return band_rows(_cfg, seq);
+  return band_for(_cfg, seq, n_text);
 }
 
 double
@@ -9129,14 +9229,14 @@ MetalMiniMaxH3Transformer::sol_held_bytes() const
 }
 
 std::size_t
-MetalMiniMaxH3Transformer::sol_scratch_bytes(int seq) const
+MetalMiniMaxH3Transformer::sol_scratch_bytes(int seq, int n_text) const
 {
   if (!_sol || seq <= 0) { return 0; }
   // The same condition forward() applies: every layer dense means the
   // routed path is never reached and nothing is allocated for it.
   if (_cfg.sol.dense_layers >= _cfg.n_layers) { return 0; }
   const std::size_t I = (std::size_t)_cfg.inner();
-  const int band = forward_band(seq);
+  const int band = forward_band(seq, n_text);
   if (band > 0) {
     // Two objects, a band's calls each, lent the band's qkv buffer.
     const std::size_t lend = (std::size_t)band * 3 * I * 2;
@@ -9175,7 +9275,7 @@ MetalMiniMaxH3Transformer::sage_lend_bytes_(int seq) const
 }
 
 std::size_t
-MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq) const
+MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq, int n_text) const
 {
   if (!_sage || seq <= 0) { return 0; }
   // The same condition forward() applies: every layer dense means the
@@ -9186,7 +9286,7 @@ MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq) const
   // one entry per its tiles. Banded: one band's queries against the
   // whole sequence's keys (and V), lent nothing -- those outlive every
   // band of a layer.
-  const int band = forward_band(seq);
+  const int band = forward_band(seq, n_text);
   return MetalSageAttention::private_bytes(
       _cfg.n_heads, _cfg.n_heads, band > 0 ? band : seq, seq,
       _cfg.head_dim, MetalSageAttention::nax_query_block(),
@@ -9196,13 +9296,13 @@ MetalMiniMaxH3Transformer::sage_scratch_bytes(int seq) const
 }
 
 std::size_t
-MetalMiniMaxH3Transformer::i8_scratch_bytes(int seq) const
+MetalMiniMaxH3Transformer::i8_scratch_bytes(int seq, int n_text) const
 {
   if (!_i8 || seq <= 0) { return 0; }
   // fc2's K is the widest activation, fc1 [2 ffn, hidden] the widest
   // weight; the row bands gemm_ cuts are at most the sequence -- or, in
   // the banded forward, one band.
-  const int band = forward_band(seq);
+  const int band = forward_band(seq, n_text);
   return I8GemmContext::forward_bytes_bound(
       band > 0 ? band : seq, _cfg.ffn, 2 * _cfg.ffn, _cfg.hidden,
       _i8->tier() == I8GemmContext::Tier::kAccurate);
@@ -9527,7 +9627,7 @@ MetalMiniMaxH3Transformer::ensure_vdn_(const Step& in,
 // ---- the ANE tier ---------------------------------------------------
 
 bool
-MetalMiniMaxH3Transformer::ane_setup_(int seq)
+MetalMiniMaxH3Transformer::ane_setup_(int seq, int chunk)
 {
   if (_ane_tried) { return _ane != nullptr; }
   _ane_tried = true;
@@ -9543,7 +9643,7 @@ MetalMiniMaxH3Transformer::ane_setup_(int seq)
   o.ffn     = _cfg.ffn;
   o.seq     = seq;
   o.rows    = _cfg.ane_rows;
-  o.chunk   = ane_chunk_rows();
+  o.chunk   = chunk;
   o.profile = std::getenv("VPIPE_H3_ANE_PROFILE") != nullptr;
   _ane = AneFeedForward::create(o);
   return _ane != nullptr;
@@ -9669,7 +9769,7 @@ MetalMiniMaxH3Transformer::ane_stage_(int L, const Block& b,
 }
 
 bool
-MetalMiniMaxH3Transformer::ane_qkv_setup_(int seq)
+MetalMiniMaxH3Transformer::ane_qkv_setup_(int seq, int chunk)
 {
   if (_ane_qkv_tried) { return _ane_qkv != nullptr; }
   _ane_qkv_tried = true;
@@ -9683,7 +9783,7 @@ MetalMiniMaxH3Transformer::ane_qkv_setup_(int seq)
   o.hidden  = _cfg.hidden;
   o.ffn     = 3 * _cfg.inner();          // output width
   o.seq     = seq;
-  o.chunk   = ane_chunk_rows();
+  o.chunk   = chunk;
   o.matmul  = true;
   o.profile = std::getenv("VPIPE_H3_ANE_PROFILE") != nullptr;
   if (const char* r = std::getenv("VPIPE_H3_ANE_QKV_ROWS")) {
@@ -9725,16 +9825,23 @@ MetalMiniMaxH3Transformer::ane_qkv_stage_(int L, const Block& b,
 }
 
 std::size_t
-MetalMiniMaxH3Transformer::ane_runtime_bytes(const Config& c, int seq) noexcept
+MetalMiniMaxH3Transformer::ane_runtime_bytes(const Config& c,
+                                             int seq) noexcept
 {
+  // A rank's modules are its share's widths (as rank_config narrows
+  // them; a Config it already narrowed reads the same). At the
+  // configured chunk: a banded rank's is never larger (ane_chunk_for_).
+  const bool rank = c.tp.active();
+  const int ffn = rank ? c.tp.ffn() : c.ffn;
+  const int inner = (rank ? c.tp.heads() : c.n_heads) * c.head_dim;
   std::size_t n =
-      AneFeedForward::runtime_bytes(c.hidden, c.ffn, seq, ane_chunk_rows());
+      AneFeedForward::runtime_bytes(c.hidden, ffn, seq, ane_chunk_rows());
   // The fused qkv projection's module, when the graph asked for it. The
   // preflight in generate-video booked this term long before the CLAIM
   // did, so the gate and the plan disagreed about the same tier; they
   // read the same function now.
   if (c.ane_qkv || std::getenv("VPIPE_H3_ANE_QKV") != nullptr) {
-    n += AneFeedForward::matmul_runtime_bytes(c.hidden, 3 * c.inner(), seq,
+    n += AneFeedForward::matmul_runtime_bytes(c.hidden, 3 * inner, seq,
                                               ane_chunk_rows());
   }
   return n;
@@ -9759,6 +9866,23 @@ int
 MetalMiniMaxH3Transformer::ane_chunk_rows() noexcept
 {
   return AneFeedForward::chunk_rows("VPIPE_H3_ANE_CHUNK");
+}
+
+int
+MetalMiniMaxH3Transformer::ane_chunk_for_(int band) noexcept
+{
+  // A whole block's rows, or a chunk pinned by hand: as configured.
+  if (band <= 0 || std::getenv("VPIPE_H3_ANE_CHUNK") != nullptr) {
+    return ane_chunk_rows();
+  }
+  // A BAND's: the ANE runs whole chunks of its share (planned_rows), and
+  // a 2048-row chunk would leave it none of a 1,152-row band at half. So
+  // the largest of 2048 / 1024 / 512 / 256 that a quarter of the band
+  // holds -- its opening half two chunks -- the balancer moving whole
+  // chunks from there.
+  int chunk = ane_chunk_rows();
+  while (chunk > 256 && chunk > band / 4) { chunk /= 2; }
+  return chunk;
 }
 
 MetalMiniMaxH3Transformer::Velocity
@@ -9938,25 +10062,46 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // with the layout: a path that needs the whole sequence's buffers keeps
   // them -- streaming attention, VDN's branch, the in-place q/k/v layout,
   // a head-major output, no steel kernels.
-  int band = forward_band(seq);
-  if (sattn || n_text > band) { band = 0; }
-  // THE WHOLE-SEQUENCE BLOCK COUNTS ITS ELEMENTS IN 32 BITS: its
-  // modulation, gate and residual passes (and VDN's) take rows * hidden
-  // as an int and dispatch it as one grid, so past 2^31 elements of the
-  // residual stream -- 399,457 rows of 5,376 -- they read and write the
-  // wrong rows. The banded block addresses any length; a request that
-  // keeps the whole sequence (the Neural Engine's share, VDN's branch,
-  // streaming attention) is refused here rather than run wrong.
-  if (band == 0 &&
-      (std::size_t)seq * (std::size_t)H > (std::size_t)INT32_MAX) {
+  // THE PROMPT TAKES AS MANY BANDS AS IT NEEDS. An in-context refine
+  // presents its draft clip to the conditioner (two frames a cell), so
+  // its prompt grows with the clip -- ~12k rows at 2K x 15 s, past a
+  // band. Its main blocks band as any long sequence's do (nothing in a
+  // band is the prompt's alone; Sage's int8 P*V keeps the prompt's,
+  // conditioning's and soundtrack's query blocks on the int8 QK in
+  // whichever bands they fall), and the text refiner runs in bands of
+  // its own (text_band_rows) rather than whole in a band's scratch. A
+  // RANK does so only when its share says both may (band_for): its peer
+  // cuts the bands it cuts.
+  int band = forward_band(seq, n_text);
+  if (sattn) { band = 0; }
+  const int tband = text_band_rows(c, n_text, band);
+  // THE WHOLE-SEQUENCE BLOCK'S LONGEST SEQUENCE (whole_rows_max). Its
+  // thread-an-element passes -- modulation, gate, residual, the
+  // feed-forward's SwiGLU -- count in an int and run in row bands of
+  // elt_rows() (the SwiGLU had run as one grid of rows x ffn and read
+  // the wrong rows past 2^31 of them: from row 149,796 at H3's 14,336); what
+  // still counts in 32 bits is VDN's branch. The banded block addresses
+  // any length; a request that keeps the whole sequence (the Neural
+  // Engine's share, VDN's branch, streaming attention, a rank told no
+  // prompt bands) past the line is refused here rather than run wrong.
+  // VDN's hybrid attention, for this forward. Off unless a branch is
+  // attached AND the caller named the target video's grid: the window
+  // is over whole frames and the short conv is a (t, h, w) stencil, and
+  // neither can be recovered from a row count.
+  const bool vdn_on = (bool)_vdn && in.video_grid_h > 0
+                      && in.video_grid_w > 0 && L.num_video_rows > 0
+                      && !sattn;
+  const int whole_max = whole_rows_max(c, vdn_on);
+  if (band == 0 && seq > whole_max) {
     return fail("a " + std::to_string(seq) + "-row sequence is too long "
                 "for the whole-sequence blocks this request runs (at "
-                "most " + std::to_string(INT32_MAX / H) + " rows): "
+                "most " + std::to_string(whole_max) + " rows): "
                 "without the Neural Engine's share, VDN's branch and "
                 "streaming attention its blocks run in row bands, which "
                 "take any length");
   }
   _last_band = band;
+  _last_text_band = tband;
   if (!ensure_scratch_(seq, n_text, n_t, vdn_arena, band)) {
     return fail("activation allocation failed (out of GPU memory)");
   }
@@ -10165,13 +10310,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       _attn_nax = false;
     }
   }
-  // VDN's hybrid attention, for this forward. Off unless a branch is
-  // attached AND the caller named the target video's grid: the window
-  // is over whole frames and the short conv is a (t, h, w) stencil, and
-  // neither can be recovered from a row count.
-  const bool vdn_on = (bool)_vdn && in.video_grid_h > 0
-                      && in.video_grid_w > 0 && L.num_video_rows > 0
-                      && !sattn;
+  // (VDN's hybrid attention for this forward, vdn_on, is decided above,
+  // where the whole-sequence block's length is checked.)
   // TWO SWITCHES, not one. The per-head softmax gate is part of the
   // hybrid's attention whatever the window does; the WINDOW and the
   // linear branch are a matched pair that turn off together when the
@@ -10542,14 +10682,23 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // its output row-major into the band's own buffer. The dense kernel and
   // the dense parameters but for qL and the strides, so a query row's
   // arithmetic is the whole sequence's. One block per band size (full,
-  // last) and, under Sage's int8 P*V, one for band 0 past its prompt and
-  // soundtrack rows, which keep the int8 QK alone as the whole sequence's
-  // do (`_attn_p_band`): qL kept, NQ_aligned short of those blocks.
+  // last). Under Sage's int8 P*V the prompt's, conditioning's and
+  // soundtrack's query blocks -- [0, band_nb), counted over the sequence
+  // -- keep the int8 QK alone, as the whole sequence's do: a band of them
+  // whole on variant 2, and the band their last block lies in split
+  // there, its video blocks on params of their own (`_attn_p_bandq_rest`:
+  // qL kept, NQ_aligned short of the band's leading blocks, as
+  // `_attn_p_band` is the whole sequence's). They pass band 0 wherever
+  // the references do -- a Ref2VA clip's rows, an in-context refine's
+  // draft (dozens of bands at 2K) -- and a band of them on the P*V is
+  // not the whole sequence's arithmetic. None where the sequence has no
+  // video rows past them, as the whole sequence's rule has it.
   // Pipelines per band size: dense, and under Sage its three variants.
-  const int band_nb =
-      band > 0 && sage_on && pv8_on && !c.sage.pv8_all_rows
-          ? (L.video_start + A_BQ - 1) / A_BQ
-          : 0;
+  int band_nb = 0;
+  if (band > 0 && sage_on && pv8_on && !c.sage.pv8_all_rows) {
+    const int nb = (L.video_start + A_BQ - 1) / A_BQ;
+    if (nb > 0 && nb < (seq + A_BQ - 1) / A_BQ) { band_nb = nb; }
+  }
   if (band > 0 && (_attn_bandq_seq != seq || _attn_bandq_rows != band ||
                    _attn_bandq_nax != (_attn_nax ? 1 : 0) ||
                    _attn_bandq_sage != (sage_on ? 1 : 0) ||
@@ -10608,11 +10757,17 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         for (int v = 1; v < 4; ++v) { _fn_attn_bandv[k][v] = build(qL, v); }
       }
     }
-    if (band_nb > 0 && !_attn_p_bandq.empty()) {
-      fill(_attn_p_bandq_rest, band);
+    // The band the prefix's last block lies in, split at it: its rows
+    // (a full band's, or the last's) and its leading prefix blocks. A
+    // prefix that ends on a band's edge splits none. Bands start on whole
+    // query tiles (band_rows: multiples of 128).
+    const int per = band / A_BQ;
+    const int pk = per > 0 ? band_nb / per : 0;
+    const int pre = per > 0 ? band_nb % per : 0;
+    if (band_nb > 0 && pre > 0) {
+      fill(_attn_p_bandq_rest, std::min(band, seq - pk * band));
       if (!_attn_p_bandq_rest.empty()) {
-        static_cast<P*>(_attn_p_bandq_rest.contents())->NQ_aligned -=
-            band_nb;
+        static_cast<P*>(_attn_p_bandq_rest.contents())->NQ_aligned -= pre;
       }
     }
     _attn_bandq_seq = seq;
@@ -10625,6 +10780,67 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       (!_fn_attn_bandv[0][0].valid() ||
        (seq % band != 0 && !_fn_attn_bandv[1][0].valid()))) {
     return fail("banded attention: the steel pipelines did not build");
+  }
+  // THE TEXT REFINER'S BANDS (text_band_rows): a band of the prompt's
+  // queries, head-major in the windows at the prompt's own length, over
+  // every prompt key, its output row-major into the band's buffer. The
+  // whole refiner's dense kernel and parameters but for qL and the
+  // strides -- the main bands' rule -- so a prompt row's arithmetic is
+  // the whole refiner's.
+  if (tband > 0 && (_attn_tband_text != n_text || _attn_tband_rows != tband ||
+                    _attn_tband_nax != (_attn_nax ? 1 : 0))) {
+    struct P {
+      int B, H, D, qL, kL, gqa_factor;
+      float scale;
+      int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+      std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+    };
+    for (int k = 0; k < 2; ++k) {
+      _fn_attn_tband[k] = metal_compute::ComputeFunction{};
+      const int qL = k == 0 ? tband : n_text % tband;
+      if (qL == 0) { continue; }
+      SharedBuffer& pb = _attn_p_tband[k];
+      if (pb.empty()) { pb = _mc->make_shared_buffer(sizeof(P)); }
+      if (pb.empty()) { continue; }
+      auto* p = static_cast<P*>(pb.contents());
+      p->B = 1; p->H = NH; p->D = HD;
+      p->qL = qL; p->kL = n_text;
+      p->gqa_factor = 1; p->scale = scale;
+      p->NQ = (qL + A_BQ - 1) / A_BQ;
+      p->NK = (n_text + A_BK - 1) / A_BK;
+      p->NQ_aligned = qL / A_BQ; p->NK_aligned = n_text / A_BK;
+      p->qL_rem = qL - p->NQ_aligned * A_BQ;
+      p->kL_rem = n_text - p->NK_aligned * A_BK;
+      p->qL_off = 0;
+      const std::int64_t hm[3] = {(std::int64_t)NH * n_text * HD,
+                                  (std::int64_t)n_text * HD, HD};
+      for (int i = 0; i < 3; ++i) {
+        p->Q_strides[i] = hm[i];
+        p->K_strides[i] = hm[i];
+        p->V_strides[i] = hm[i];
+      }
+      p->O_strides[0] = (std::int64_t)qL * I;
+      p->O_strides[1] = HD;
+      p->O_strides[2] = I;
+      metal_compute::FunctionConstants fc;
+      fc.set_bool(200, (qL % A_BQ) == 0).set_bool(201, (n_text % A_BK) == 0)
+          .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+          .set_bool(303, false)
+          .set_bool(sage::kQkInt8Constant, false);
+      MetalSageAttention::pv8_constants(fc, false);
+      _fn_attn_tband[k] =
+          _attn_nax
+              ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+              : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+    }
+    _attn_tband_text = n_text;
+    _attn_tband_rows = tband;
+    _attn_tband_nax = _attn_nax ? 1 : 0;
+  }
+  if (tband > 0 &&
+      (!_fn_attn_tband[0].valid() ||
+       (n_text % tband != 0 && !_fn_attn_tband[1].valid()))) {
+    return fail("banded text refiner: the steel pipelines did not build");
   }
   // Sol's last band on an object of its own (see _sol_tail).
   if (band > 0 && sol_on && seq % band != 0 && !_sol_tail) {
@@ -10980,38 +11196,62 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // block lambda sets both before using them.
     const SharedBuffer* mod_buf = &s.mod;
     std::size_t mod_off = 0;
+    // A THREAD-AN-ELEMENT PASS GOES IN ROW BANDS of elt_rows(width): its
+    // kernel counts the elements in an int, and the whole-sequence block
+    // runs these over every row at once (the banded block's rows are a
+    // band's). Every row's arithmetic is the one-grid pass's.
+    const int elt_h = elt_rows(H);
+    const int elt_ff = elt_rows(FF);
     auto modulate = [&](const SharedBuffer& x, const SharedBuffer& mod,
                         std::size_t mod_byte_off,
                         const SharedBuffer& idx, const SharedBuffer& y,
                         int rows, int stride, int scale_off, int shift_off) {
       enc.set_function(_fn_modulate);
-      enc.set_buffer(0, x); enc.set_buffer(1, mod, mod_byte_off);
-      enc.set_buffer(2, idx);
-      enc.set_buffer(3, y);
+      enc.set_buffer(1, mod, mod_byte_off);
       enc.set_constant(4, H);
       enc.set_constant(5, stride);
       enc.set_constant(6, scale_off);
       enc.set_constant(7, shift_off);
-      enc.set_constant(8, rows * H);
-      enc.dispatch({(unsigned)(rows * H), 1, 1}, {256, 1, 1});
+      for (int r0 = 0; r0 < rows; r0 += elt_h) {
+        const int n = std::min(elt_h, rows - r0);
+        const std::size_t eo = (std::size_t)r0 * H * 2;
+        enc.set_buffer(0, x, eo);
+        enc.set_buffer(2, idx, (std::size_t)r0 * 4);
+        enc.set_buffer(3, y, eo);
+        enc.set_constant(8, n * H);
+        enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
+      }
     };
     auto gated = [&](const SharedBuffer& x, const SharedBuffer& sub, int rows,
                      int gate_off) {
       enc.set_function(_fn_gated);
-      enc.set_buffer(0, x); enc.set_buffer(1, *mod_buf, mod_off * 2);
-      enc.set_buffer(2, s.adaln_idx); enc.set_buffer(3, sub);
+      enc.set_buffer(1, *mod_buf, mod_off * 2);
       enc.set_constant(4, H);
       enc.set_constant(5, 6 * H);
       enc.set_constant(6, gate_off);
-      enc.set_constant(7, rows * H);
-      enc.dispatch({(unsigned)(rows * H), 1, 1}, {256, 1, 1});
+      for (int r0 = 0; r0 < rows; r0 += elt_h) {
+        const int n = std::min(elt_h, rows - r0);
+        const std::size_t eo = (std::size_t)r0 * H * 2;
+        enc.set_buffer(0, x, eo);
+        enc.set_buffer(2, s.adaln_idx, (std::size_t)r0 * 4);
+        enc.set_buffer(3, sub, eo);
+        enc.set_constant(7, n * H);
+        enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
+      }
     };
+    // `r0`: x's first row (the text refiner's bands).
     auto residual = [&](const SharedBuffer& x, const SharedBuffer& sub,
-                        int rows) {
+                        int rows, int r0 = 0) {
       enc.set_function(_fn_residual);
-      enc.set_buffer(0, x); enc.set_buffer(1, sub); enc.set_buffer(2, x);
-      enc.set_constant(3, rows * H);
-      enc.dispatch({(unsigned)(rows * H), 1, 1}, {256, 1, 1});
+      for (int e0 = 0; e0 < rows; e0 += elt_h) {
+        const int n = std::min(elt_h, rows - e0);
+        const std::size_t xo = (std::size_t)(r0 + e0) * H * 2;
+        enc.set_buffer(0, x, xo);
+        enc.set_buffer(1, sub, (std::size_t)e0 * H * 2);
+        enc.set_buffer(2, x, xo);
+        enc.set_constant(3, n * H);
+        enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
+      }
     };
     // q, k and v all come straight out of the ONE fused [rows, 3*I]
     // projection. `rot` 0 makes this a pure strided transpose, which is
@@ -11354,11 +11594,15 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // The ANE feed-forward tier, armed once from the first forward's row
     // count. `ane_on_commit` is how a streamed block lets the split issue
     // its successor's read early; see the ANE split in the block.
-    const bool ane_on = _cfg.ane_ffn && ane_setup_(seq);
+    // A BANDED rank's modules take a band's rows a call, at a chunk the
+    // band holds; the share opens at half a band.
+    const int ane_seq = band > 0 ? band : seq;
+    const int ane_chunk = ane_chunk_for_(band);
+    const bool ane_on = _cfg.ane_ffn && ane_setup_(ane_seq, ane_chunk);
     const bool qkv_on =
         (_cfg.ane_qkv ||
          (!_ane_disabled && std::getenv("VPIPE_H3_ANE_QKV") != nullptr)) &&
-        ane_qkv_setup_(seq);
+        ane_qkv_setup_(ane_seq, ane_chunk);
     // Nothing staged by an earlier forward is taken for this one's: an
     // adapter's strength may have moved between the two.
     if (ane_on) { _ane->forget_staged(); }
@@ -11398,8 +11642,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // band-sized s.nm), and the rows the ANE lost -- which still hold
     // their input, because the ANE writes a chunk back only once all of
     // it came out finite. The scratch is used from its first row.
-    // `out`: where fc2 writes, from its row 0, in place of s.nm's rows (a
-    // rank's partial buffer).
+    // `out`: where fc2 writes, at the same rows, in place of s.nm's (a
+    // rank's band partial buffer, whose rows are the band's).
     auto ff_gpu = [&](const Block& b, const LoraStack& lo_fc1,
                       const LoraStack& lo_fc2, int r0, int n,
                       const SharedBuffer* out = nullptr) {
@@ -11439,18 +11683,24 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         }
         // fc1 is FUSED [gate | up], GATE first -- the diffusers SwiGLU
         // convention, not the llama one the rest of this tree follows.
+        // In row bands (elt_rows): one grid of n x FF passed 2^31 at row
+        // 149,796 and the kernel read and wrote other rows.
         enc.set_function(_fn_swiglu);
-        enc.set_buffer(0, s.ff); enc.set_buffer(1, s.qkv);
-        enc.set_constant(2, n);
         enc.set_constant(3, FF);
-        enc.dispatch({(unsigned)(n * FF), 1, 1}, {256, 1, 1});
+        for (int f0 = 0; f0 < n; f0 += elt_ff) {
+          const int fn = std::min(elt_ff, n - f0);
+          enc.set_buffer(0, s.ff, (std::size_t)f0 * 2 * FF * 2);
+          enc.set_buffer(1, s.qkv, (std::size_t)f0 * FF * 2);
+          enc.set_constant(2, fn);
+          enc.dispatch({(unsigned)(fn * FF), 1, 1}, {256, 1, 1});
+        }
       }
       if (head) {
         bdump("swiglu", s.qkv, FF);
         trip(trip_blk, 7, s.qkv, (std::size_t)n * FF);
       }
-      gemm_(enc, s.qkv, 0, b.fc2, out != nullptr ? *out : s.nm,
-            out != nullptr ? 0 : e0, n, H, FF, &lo_fc2);
+      gemm_(enc, s.qkv, 0, b.fc2, out != nullptr ? *out : s.nm, e0, n, H,
+            FF, &lo_fc2);
     };
     // A RANK'S PARTIAL SUM COMPLETED (Config::tp): s.nm holds this rank's
     // share of a projection's output, [rows, H]; the GPU's work is drained,
@@ -11609,6 +11859,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
             !_ane_qkv->finish(lora_layer, rows, g_ms, sect - g_ms)) {
           q_lost = _ane_qkv->lost_row0();
         }
+        _ane_qkv_rows_run +=
+            q_lost >= 0 ? std::max(0, q_lost - (rows - q_rows)) : q_rows;
         enc = stream.begin_compute();
         mark = std::chrono::steady_clock::now();
         // THE GPU FALLBACK: `s.nm` is only the tier's input, so what the
@@ -11800,13 +12052,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         vl.w = wl->subview(0, wl->byte_size());
         gemm_(enc, _vdn_ro, 0, vl, _vdn_proj, 0, L.num_video_rows, H, I,
               nullptr);
-        const std::size_t vo = (std::size_t)L.video_start * H * 2;
-        enc.set_function(_fn_residual);
-        enc.set_buffer(0, s.nm, vo);
-        enc.set_buffer(1, _vdn_proj);
-        enc.set_buffer(2, s.nm, vo);
-        enc.set_constant(3, L.num_video_rows * H);
-        enc.dispatch({(unsigned)(L.num_video_rows * H), 1, 1}, {256, 1, 1});
+        residual(s.nm, _vdn_proj, L.num_video_rows, L.video_start);
         psplit(t_vdn);
       }
       tp_reduce(rows);
@@ -11897,6 +12143,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         // the ANE writes a chunk back only once all of it came out finite.
         gpu_ff(g_end, planned - a_rows);
         const int lost = ane_ok ? -1 : _ane->lost_row0();
+        _ane_rows_run +=
+            lost >= 0 ? std::max(0, lost - (rows - a_rows)) : a_rows;
         if (lost >= 0 && lost < rows) {
           const int r0 = std::max(lost, rows - a_rows);
           gpu_ff(r0, rows - r0);
@@ -11971,8 +12219,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     };
     const std::size_t rope_row =
         (std::size_t)(3 * c.rope_freq_dim) * sizeof(float);
+    // `out_rows`: the window's rows (the sequence's; the prompt's for
+    // the text refiner's bands).
     auto trope_band = [&](const SharedBuffer& dst, int r0, int n, int off,
-                          int rot) {
+                          int rot, int out_rows = 0) {
       enc.set_function(_fn_trope_band);
       enc.set_buffer(0, s.qkv); enc.set_buffer(1, dst);
       enc.set_buffer(2, s.rcos, (std::size_t)r0 * rope_row);
@@ -11984,7 +12234,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       enc.set_constant(8, 3 * I);
       enc.set_constant(9, off);
       enc.set_constant(10, QKV_HSTRIDE);
-      enc.set_constant(11, seq);
+      enc.set_constant(11, out_rows > 0 ? out_rows : seq);
       enc.set_constant(12, r0);
       enc.dispatch({(unsigned)HD, (unsigned)n, (unsigned)NH},
                    {(unsigned)HD, 1, 1});
@@ -11995,12 +12245,154 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       const LoraStack lo_fc1 = lora_stack_(false, layer, &BlockLora::fc1);
       const LoraStack lo_fc2 = lora_stack_(false, layer, &BlockLora::fc2);
       const int rot = c.rope_rot();
-      for (int r0 = 0; r0 < seq; r0 += band) {
+      // ---- THE ANE TIERS, BANDED (a rank's: band_rows keeps a whole
+      // model's blocks whole under them). Planned and staged once for the
+      // block as block() plans and stages them; then each BAND's rows are
+      // split as block() splits its block's -- the qkv's in pass 1, the
+      // feed-forward's in pass 2 -- the module taking a band's rows a call
+      // (ane_setup_'s `seq`, at a chunk the band holds).
+      const bool ane_ok =
+          ane_on &&
+          ane_eligible_(layer, b, !lo_fc1.empty() || !lo_fc2.empty());
+      const AneFeedForward::Plan ane_plan =
+          ane_ok ? _ane->plan_block() : AneFeedForward::Plan::kGpu;
+      const bool ane_block = ane_plan == AneFeedForward::Plan::kSplit;
+      const bool ane_probe = ane_plan == AneFeedForward::Plan::kProbe;
+      const bool qkv_ok = qkv_on && ane_qkv_eligible_(layer, b);
+      const AneFeedForward::Plan qkv_plan =
+          qkv_ok ? _ane_qkv->plan_block() : AneFeedForward::Plan::kGpu;
+      const bool qkv_block = qkv_plan == AneFeedForward::Plan::kSplit;
+      const bool qkv_probe = qkv_plan == AneFeedForward::Plan::kProbe;
+      // A measured block after unsplit work: drain that first (see
+      // block() and AneFeedForward::needs_barrier).
+      if (((ane_block || ane_probe) &&
+           (layer == 0 || _ane->needs_barrier())) ||
+          ((qkv_block || qkv_probe) &&
+           (layer == 0 || _ane_qkv->needs_barrier()))) {
+        enc.end();
+        _flops.flush(stream);
+        stream.commit().wait();
+        enc = stream.begin_compute();
+        mark = std::chrono::steady_clock::now();
+      }
+      if (qkv_block) {
+        if (!_ane_qkv->queued(layer)) { ane_qkv_stage_(layer, b, lo_qkv); }
+      } else if (ane_block) {
+        ane_stage_(layer, b, lo_fc1, lo_fc2);
+      }
+      // One engine's rows of a band split with the other's: the GPU's
+      // head rows committed behind the band's input, the staging joined,
+      // the ANE started on the tail once the input is readable, both
+      // joined -- block()'s choreography, a band at a time. `gpu(r0, n)`
+      // encodes the GPU's rows [r0, r0 + n) of the band; `begin` starts
+      // the ANE's (its rows back). The rows the ANE did not take, or
+      // lost, are the GPU's after the join. Returns the ANE's rows.
+      auto split_band = [&](AneFeedForward& ane, int n,
+                            const std::function<void(int, int)>& gpu,
+                            const std::function<int()>& begin, bool first,
+                            const char* what) {
+        const int planned = ane.planned_rows(n);
+        const int g_end = n - planned;     // the GPU's rows: [0, g_end)
+        const auto t0 = std::chrono::steady_clock::now();
+        enc.end();
+        _flops.flush(stream);
+        metal_compute::CommandStream::Fence ifence = stream.commit();
+        enc = stream.begin_compute();
+        gpu(0, g_end);
+        enc.end();
+        _flops.flush(stream);
+        metal_compute::CommandStream::Fence gfence = stream.commit();
+        // A streamed block's successor read, under this band's work.
+        if (first && ane_on_commit) { ane_on_commit(); }
+        const bool staged = ane.join_stage(layer);
+        ifence.wait();
+        int a_rows = 0;
+        if (staged) {
+          a_rows = begin();
+        } else if (first && _mc->session() != nullptr) {
+          _mc->session()->warn(fmt(
+              "minimax-h3: staging block {}'s {} for the ANE failed; it "
+              "keeps the GPU", layer, what));
+        }
+        gfence.wait();
+        const double sect = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        double g_ms = gfence.gpu_times().gpu_s * 1000.0;
+        if (!(g_ms > 0.0) || g_ms > sect) { g_ms = sect; }
+        int lost = -1;
+        if (a_rows > 0 && !ane.finish(layer, n, g_ms, sect - g_ms)) {
+          lost = ane.lost_row0();
+          if (lost < 0 || lost >= n) { lost = n - a_rows; }
+        }
+        enc = stream.begin_compute();
+        mark = std::chrono::steady_clock::now();
+        gpu(g_end, planned - a_rows);
+        if (lost >= 0) {
+          const int r0 = std::max(lost, n - a_rows);
+          gpu(r0, n - r0);
+        }
+        return lost >= 0 ? std::max(0, lost - (n - a_rows)) : a_rows;
+      };
+      // ...and the tier's PROBE, a band at a time: the GPU over every row,
+      // drained, for the on/off measurement.
+      auto probe_band = [&](AneFeedForward& ane, int n,
+                            const std::function<void(int, int)>& gpu) {
+        const auto t0 = std::chrono::steady_clock::now();
+        enc.end();
+        _flops.flush(stream);
+        stream.commit().wait();
+        const double drain_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        enc = stream.begin_compute();
+        const auto tg = std::chrono::steady_clock::now();
+        gpu(0, n);
+        enc.end();
+        _flops.flush(stream);
+        stream.commit().wait();
+        ane.note_probe(drain_ms, std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - tg)
+                                     .count());
+        enc = stream.begin_compute();
+        mark = std::chrono::steady_clock::now();
+      };
+      // A band's feed-forward from its band-sized s.nm into `out` (s.nm
+      // itself, or a rank's partial buffer), the ANE's tail rows beside
+      // the GPU's where the block splits.
+      auto ff_band = [&](int n, const SharedBuffer& out, bool first) {
+        auto gpu = [&](int r0, int m) {
+          ff_gpu(b, lo_fc1, lo_fc2, r0, m, &out);
+        };
+        if (ane_block) {
+          _ane_rows_run += split_band(
+              *_ane, n, gpu, [&]() { return _ane->begin(s.nm, out, n); },
+              first, "feed-forward");
+        } else if (ane_probe) {
+          probe_band(*_ane, n, gpu);
+        } else {
+          gpu(0, n);
+        }
+      };
+      int k1 = 0;
+      for (int r0 = 0; r0 < seq; r0 += band, ++k1) {
         const int n = std::min(band, seq - r0);
         rms(s.x, (std::size_t)r0 * H, b.n1, s.nm, 0, n, H, c.norm_eps);
         modulate_band(r0, n, H, 0);
         psplit(t_elt);
-        gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, n, 3 * I, H, &lo_qkv);
+        auto gpu = [&](int q0, int m) {
+          if (m <= 0) { return; }
+          gemm_(enc, s.nm, (std::size_t)q0 * H, b.qkv, s.qkv,
+                (std::size_t)q0 * 3 * I, m, 3 * I, H, &lo_qkv);
+        };
+        if (qkv_block) {
+          _ane_qkv_rows_run += split_band(
+              *_ane_qkv, n, gpu,
+              [&]() { return _ane_qkv->begin(s.nm, s.qkv, n); }, k1 == 0,
+              "qkv");
+        } else if (qkv_probe) {
+          probe_band(*_ane_qkv, n, gpu);
+        } else {
+          gpu(0, n);
+        }
         psplit(t_qkv);
         qk_norm(b.qn, n, Q_OFF);
         qk_norm(b.kn, n, K_OFF);
@@ -12009,6 +12401,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         trope_band(s.vh, r0, n, V_OFF, 0);
         psplit(t_prep);
       }
+      // The FF's staging, deferred past the qkv's as block() defers it,
+      // and the next block's qkv staged ahead, under this one's work.
+      if (qkv_block && ane_block) { ane_stage_(layer, b, lo_fc1, lo_fc2); }
+      qkv_stage_ahead(layer + 1);
       // The layer's attention, chosen as block() chooses it: Sol on its
       // routed layers (Sage on its exact half where both are on), Sage's
       // int8 kernels past its dense layers, else the dense kernel. Sage's
@@ -12049,6 +12445,9 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         const bool full = n == band;
         const int fi = full ? 0 : 1;
         const int nqb = (n + A_BQ - 1) / A_BQ;
+        // The band's query blocks before the video's (int8 P*V only).
+        const int pre = std::max(
+            0, std::min(_attn_bandq_nb - r0 / A_BQ, nqb));
         bool sage_ok = false;
         if (keys_ok) {
           const MetalSageAttention::Operand qo{
@@ -12102,35 +12501,37 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           enc.set_constant(4, HD);
           enc.dispatch({(unsigned)HD, (unsigned)n, (unsigned)NH},
                        {(unsigned)HD, 1, 1});
-        } else if (sage_ok && r0 == 0 && _attn_bandq_nb > 0 &&
-                   _attn_bandq_nb < nqb && _fn_attn_bandv[0][2].valid() &&
-                   !_attn_p_bandq_rest.empty()) {
-          // Band 0 under the int8 P*V: its prompt and soundtrack rows on
-          // the int8 QK alone, as the whole sequence's are.
-          const int nb = _attn_bandq_nb;
-          const std::size_t qr = (std::size_t)nb * A_BQ;
-          enc.set_function(_fn_attn_bandv[0][2]);
-          enc.set_buffer(0, s.qh);
+        } else if (sage_ok && pre > 0 && _fn_attn_bandv[fi][2].valid() &&
+                   (pre == nqb || !_attn_p_bandq_rest.empty())) {
+          // Under the int8 P*V: the band's prompt, conditioning and
+          // soundtrack rows on the int8 QK alone, as the whole sequence's
+          // are -- the whole band, or its leading blocks and then its
+          // video blocks on the P*V.
+          const std::size_t qr = (std::size_t)pre * A_BQ;
+          enc.set_function(_fn_attn_bandv[fi][2]);
+          enc.set_buffer(0, s.qh, (std::size_t)r0 * HD * 2);
           enc.set_buffer(1, s.kh);
           enc.set_buffer(2, s.vh);
           enc.set_buffer(3, s.ob);
-          enc.set_buffer(4, _attn_p_bandq);
+          enc.set_buffer(4, full ? _attn_p_bandq : _attn_p_bandq_tail);
           _sage->bind(enc);
-          enc.dispatch({32u * (unsigned)nb, 4u * (unsigned)NH, 1},
+          enc.dispatch({32u * (unsigned)pre, 4u * (unsigned)NH, 1},
                        {32, 4, 1});
-          enc.set_function(_fn_attn_bandv[0][3]);
-          enc.set_buffer(0, s.qh, qr * HD * 2);
-          enc.set_buffer(1, s.kh);
-          enc.set_buffer(2, s.vh);
-          enc.set_buffer(3, s.ob, qr * I * 2);
-          enc.set_buffer(4, _attn_p_bandq_rest);
-          if (!_sage->bind(enc, (int)qr)) {
-            if (sol_err.empty()) {
-              sol_err = "sage_attn: the video rows' operands did not bind";
+          if (pre < nqb) {
+            enc.set_function(_fn_attn_bandv[fi][3]);
+            enc.set_buffer(0, s.qh, ((std::size_t)r0 + qr) * HD * 2);
+            enc.set_buffer(1, s.kh);
+            enc.set_buffer(2, s.vh);
+            enc.set_buffer(3, s.ob, qr * I * 2);
+            enc.set_buffer(4, _attn_p_bandq_rest);
+            if (!_sage->bind(enc, (int)qr)) {
+              if (sol_err.empty()) {
+                sol_err = "sage_attn: the video rows' operands did not bind";
+              }
+            } else {
+              enc.dispatch({32u * (unsigned)(nqb - pre),
+                            4u * (unsigned)NH, 1}, {32, 4, 1});
             }
-          } else {
-            enc.dispatch({32u * (unsigned)(nqb - nb), 4u * (unsigned)NH, 1},
-                         {32, 4, 1});
           }
           _flops.attention(NH, (long long)n * seq, HD);
         } else {
@@ -12158,7 +12559,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           rms(s.x, (std::size_t)r0 * H, b.n2, s.nm, 0, n, H, c.norm_eps);
           modulate_band(r0, n, 4 * H, 3 * H);
           psplit(t_elt);
-          ff_gpu(b, lo_fc1, lo_fc2, 0, n);
+          ff_band(n, s.nm, r0 == 0);
           psplit(t_ff);
           gated_band(r0, n, 5 * H);
           psplit(t_elt);
@@ -12297,7 +12698,7 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         rms(s.x, (std::size_t)r0 * H, b.n2, s.nm, 0, n, H, c.norm_eps);
         modulate_band(r0, n, 4 * H, 3 * H);
         psplit(t_elt);
-        ff_gpu(b, lo_fc1, lo_fc2, 0, n, &_tp_part[2 + (k & 1)]);
+        ff_band(n, _tp_part[2 + (k & 1)], k == 0);
         psplit(t_ff);
         vc[(std::size_t)k] = post(2 + (k & 1), n);
       };
@@ -12317,6 +12718,61 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
       if (_tp_pipe->failed()) {
         tp_err = "tensor parallel: " + _tp_pipe->error();
+      }
+    };
+
+    // THE TEXT REFINER IN BANDS (text_band_rows), for a prompt longer
+    // than a main band: block()'s refiner block as block_banded runs a
+    // main one -- pass 1 each band's normed rows, q|k|v and q / k norms,
+    // its q / k / v into the head-major windows at the prompt's length
+    // (unrotated, as block() leaves the refiner's); pass 2 each band's
+    // queries over every prompt key, its out projection, residual and
+    // feed-forward -- in the band-sized nm / qkv / ob | ff, which a
+    // whole refiner over the prompt would overrun. A rank completes each
+    // band's partial sums as block() completes the whole prompt's.
+    auto refiner_banded = [&](const Block& b, int ri) {
+      const LoraStack lo_qkv = lora_stack_(true, ri, &BlockLora::qkv);
+      const LoraStack lo_out = lora_stack_(true, ri, &BlockLora::out);
+      const LoraStack lo_fc1 = lora_stack_(true, ri, &BlockLora::fc1);
+      const LoraStack lo_fc2 = lora_stack_(true, ri, &BlockLora::fc2);
+      for (int r0 = 0; r0 < n_text; r0 += tband) {
+        const int n = std::min(tband, n_text - r0);
+        rms(s.txt, (std::size_t)r0 * H, b.n1, s.nm, 0, n, H, c.norm_eps);
+        psplit(t_elt);
+        gemm_(enc, s.nm, 0, b.qkv, s.qkv, 0, n, 3 * I, H, &lo_qkv);
+        psplit(t_qkv);
+        qk_norm(b.qn, n, Q_OFF);
+        qk_norm(b.kn, n, K_OFF);
+        trope_band(s.qh, r0, n, Q_OFF, 0, n_text);
+        trope_band(s.kh, r0, n, K_OFF, 0, n_text);
+        trope_band(s.vh, r0, n, V_OFF, 0, n_text);
+        psplit(t_prep);
+      }
+      for (int r0 = 0; r0 < n_text; r0 += tband) {
+        const int n = std::min(tband, n_text - r0);
+        const int ti = n == tband ? 0 : 1;
+        enc.set_function(_fn_attn_tband[ti]);
+        enc.set_buffer(0, s.qh, (std::size_t)r0 * HD * 2);
+        enc.set_buffer(1, s.kh);
+        enc.set_buffer(2, s.vh);
+        enc.set_buffer(3, s.ob);
+        enc.set_buffer(4, _attn_p_tband[ti]);
+        enc.dispatch({32 * (unsigned)((n + A_BQ - 1) / A_BQ),
+                      4 * (unsigned)NH, 1}, {32, 4, 1});
+        _flops.attention(NH, (long long)n * n_text, HD);
+        psplit(t_attn);
+        gemm_(enc, s.ob, 0, b.out, s.nm, 0, n, H, I, &lo_out);
+        tp_reduce(n);
+        psplit(t_oproj);
+        residual(s.txt, s.nm, n, r0);
+        rms(s.txt, (std::size_t)r0 * H, b.n2, s.nm, 0, n, H, c.norm_eps);
+        psplit(t_elt);
+        ff_gpu(b, lo_fc1, lo_fc2, 0, n);
+        tp_reduce(n);
+        psplit(t_ff);
+        residual(s.txt, s.nm, n, r0);
+        psplit(t_elt);
+        if (!tp_err.empty()) { return; }
       }
     };
 
@@ -12357,12 +12813,33 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         src += (std::size_t)r.count;
       }
     }
-    gemm_(enc, *in.text, 0, _cond_proj, s.txt, 0, n_text, H, c.text_dim);
+    // A prompt longer than a band is projected a text band at a time, on
+    // the whole prompt's route: every scratch a GEMM grows (the int8
+    // context's activations among them) is booked at a band's rows.
+    if (tband > 0) {
+      _route_rows = n_text;
+      for (int r0 = 0; r0 < n_text; r0 += tband) {
+        gemm_(enc, *in.text, (std::size_t)r0 * c.text_dim, _cond_proj, s.txt,
+              (std::size_t)r0 * H, std::min(tband, n_text - r0), H,
+              c.text_dim);
+      }
+      _route_rows = 0;
+    } else {
+      gemm_(enc, *in.text, 0, _cond_proj, s.txt, 0, n_text, H, c.text_dim);
+    }
     psplit(t_in);
 
     // ---- 2. the text refiner -----------------------------------------
     for (std::size_t ri = 0; ri < _refiner.size(); ++ri) {
-      block(_refiner[ri], s.txt, n_text, false, (int)ri);
+      if (tband > 0) {
+        // On the whole prompt's GEMM routes, as a main band takes the
+        // sequence's.
+        _route_rows = n_text;
+        refiner_banded(_refiner[ri], (int)ri);
+        _route_rows = 0;
+      } else {
+        block(_refiner[ri], s.txt, n_text, false, (int)ri);
+      }
       if (!tp_err.empty()) { return fail(tp_err); }
     }
     // Its final norm writes straight into the packed sequence's text

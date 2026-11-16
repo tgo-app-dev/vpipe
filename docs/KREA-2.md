@@ -544,6 +544,54 @@ the images. FP8 itself had already cost ~3% — this file's weights sit that
 far from the published bf16 Turbo — so the 8-bit copy is effectively as
 faithful as the file it came from.
 
+## Split across two Macs
+
+generate-image's `tensor_parallel` runs the stage as one RANK of the DiT
+split across machines (`generative-models/tensor-parallel.h`, feature
+`tensor-parallel-krea2/1`), as it does for FLUX.3 and Qwen-Image-2.1: each
+rank holds its share of every main block's heads -- `to_q` and `to_gate` by
+their rows, `to_k` / `to_v` by the rows of the kv heads those query heads
+read, `to_out` by its columns -- and feed-forward rows (`ff.gate` and
+`ff.up` by their rows, `ff.down` by its columns), cut at load from the
+checkpoint (bf16 or an affine pack, the pack's columns in whole groups) and
+laid out for the int8 tier asked within the share's own columns.
+
+The attention is grouped -- 48 query heads read 12 kv heads, four to one --
+so a share is WHOLE GROUPS: its heads a multiple of four at both ends (24 /
+24, or 20 / 28 for a slower second Mac). Any other share is refused by name.
+A block's attention and feed-forward are gated apart, so a rank exchanges
+TWO partials a block, each added before its gate; the text-fusion tower,
+the embeddings, the modulation and the final layer run whole on every rank.
+A channel each picture. `min_band_rows` cuts each block's rows into bands of
+at least that many, each band's partials crossing under the next band's
+work; give it alike to both ranks (a peer listing the feature reads it).
+
+A rank streams its share and keeps it as the whole model streams its
+blocks, reading only its share's rows where a weight is cut by rows; the
+plan books it at its share with every block kept, streamable to the trunk
+and two blocks' shares. No runtime LoRA, no ANE tier, no FP8 / NVFP4
+community file and no fused gate|up weave on a rank.
+
+```json
+{"type": "generate-image", "config": {"tensor_parallel": {
+  "rank": 0, "ranks": 2, "heads": [0, 24], "ffn": [0, 8192],
+  "min_band_rows": 1024,
+  "transport": "<a plugin's>", "params": {}}}}
+```
+
+Measured on an M5 Max: on a random small model the split is the unsplit
+forward to 3.0e-3 relative L2 (bf16 and an 8-bit pack; 4.2e-3 at int8 Per
+Token), the two ranks bit-identical, a streamed rank the preloaded one bit
+for bit, and the share held what the plan booked to the byte; the release's
+first two blocks split 24 / 24 differ from unsplit by 3.9e-3 (`tensor_
+parallel.a_split_krea2_forward_is_the_unsplit_one`). Timed on two M5 Macs
+over an RDMA transport, a 2560^2 picture in bf16, banded: the denoise 39 s
+split, against 100 s and 53 s on either Mac alone.
+
+A rank's exchange buffers -- its partial and the others' sum a lane, at
+the widest band -- are the picture's: made at its first forward and freed
+with its channel, as the plan books them (with the forward's activations).
+
 ## Troubleshooting
 
 **`model-fetch` reports an authorization failure.** The licence is not

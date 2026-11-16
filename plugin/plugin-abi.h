@@ -116,6 +116,41 @@
 //                      through the same transport (a channel of its own,
 //                      tp_extra::kChannel) and added on rank 0; and a
 //                      rank's band floor, tp_extra::kMinBandRows
+//   tensor-parallel-flux3  generate-image's `tensor_parallel`: FLUX.3's
+//                      DiT split between ranks through the same transport,
+//                      one partial a block
+//   tensor-parallel-qwen-image-21  the same for Qwen-Image-2.1's DiT, two
+//                      partials a block, its int8 tiers within a share
+//   tensor-parallel-flux3/2, tensor-parallel-qwen-image-21/2  a rank of
+//                      either reads `min_band_rows` (tp_extra::
+//                      kMinBandRows): given, its blocks' rows are cut
+//                      into bands, each band's partials exchanged under
+//                      the next band's work; unsaid, /1's whole blocks. A
+//                      host states the floor alike to every rank, and
+//                      only to a peer listing /2
+//   tensor-parallel-krea2  generate-image's `tensor_parallel` for Krea-2's
+//                      DiT: two partials a block, a share whole kv groups,
+//                      its int8 tiers within a share, and `min_band_rows`
+//                      read from the start (banded as the /2s above)
+//   tensor-parallel-moss-image  generate-image's `tensor_parallel` for
+//                      MOSS-Image's DiT: two partials a main block, its
+//                      int8 tiers within a share, its text blocks whole;
+//                      `min_band_rows` read from this first version
+//   tensor-parallel-z-image  generate-image's `tensor_parallel` for
+//                      Z-Image's DiT: every block (the refiners' too) a
+//                      rank's share, two partials a block, each completed
+//                      before its sandwich post-norm; banded where the
+//                      share carries `min_band_rows`, from the first
+//   tensor-parallel-fibo2  the same for Fibo 2.0's DiT (its block is
+//                      Z-Image's), an injection block's cross-attention
+//                      cut by the same heads: a third partial there
+//   tensor-parallel-prompt-bands  a MiniMax H3 rank reads `prompt_bands`
+//                      (tp_extra::kPromptBands): given, a prompt longer
+//                      than its band is banded -- its blocks and its text
+//                      refiner, each band's partials exchanged; unsaid,
+//                      such a prompt runs every block whole. A host
+//                      states it alike to every rank, and only to a peer
+//                      listing this
 #define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
 #define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
 #define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
@@ -125,6 +160,21 @@
 #define VPIPE_FEATURE_MODEL_SOURCES     "model-sources/1"
 #define VPIPE_FEATURE_TENSOR_PARALLEL   "tensor-parallel/1"
 #define VPIPE_FEATURE_TENSOR_PARALLEL_DECODE "tensor-parallel-decode/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FLUX3 "tensor-parallel-flux3/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_QI21 "tensor-parallel-qwen-image-21/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FLUX3_2 "tensor-parallel-flux3/2"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_QI21_2 \
+  "tensor-parallel-qwen-image-21/2"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_KREA2 "tensor-parallel-krea2/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_MOSS_IMAGE \
+  "tensor-parallel-moss-image/1"
+// A MiniMax H3 rank takes the ANE tier (generate-video's ane_ffn /
+// ane_qkv / ane_int8 beside tensor_parallel): its modules its share's.
+#define VPIPE_FEATURE_TENSOR_PARALLEL_ANE "tensor-parallel-ane/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_Z_IMAGE "tensor-parallel-z-image/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FIBO2 "tensor-parallel-fibo2/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_PROMPT_BANDS \
+  "tensor-parallel-prompt-bands/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

@@ -576,6 +576,17 @@ public:
       const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
       int* produced = nullptr, bool* hit_stop = nullptr);
 
+  // ---- A prefill's pieces as they finish (prefill-progress.h) ----------
+  // `fn(done, total)` after each piece of every prefill from now on, on
+  // the forward's thread; empty: none. False where the backend reads a
+  // prompt in one forward or cannot say (a caller then times the prefill
+  // whole). `fn` may read its caller's frame: let it go (empty) on every
+  // way out of the prefill -- the model outlives the call. Host-only
+  // (hidden), as run_state_bytes: exported, it was a new symbol a plugin
+  // built against it could not load without on an older ABI-8 host.
+  __attribute__((visibility("hidden"))) bool
+  set_prefill_progress(std::function<void(int, int)> fn);
+
   // ---- Speculative decode, any drafter (speculative-decode.h) ----------
   // True iff the backend can decode speculatively with a drafter it
   // carries: an attached DFlash / DFlash 2 drafter, or an MTP head.

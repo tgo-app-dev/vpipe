@@ -40,6 +40,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/tensor-parallel.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -49,6 +50,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace vpipe::metal_compute { class MetalCompute; }
 
@@ -165,6 +168,54 @@ private:
   std::mutex                 _ch_mu;     // the channel, one caller at a time
   std::thread                _th;
 };
+
+// A RANK'S FLOOR for its row bands: TpShare::extra's
+// tp_extra::kMinBandRows, 0 when the share was given none.
+inline int
+tp_band_floor(const TpShare& s)
+{
+  if (!s.extra.is_object()) { return 0; }
+  FlexData e = s.extra;                   // as_object() is a view
+  auto o = e.as_object();
+  if (!o.contains(tp_extra::kMinBandRows)) { return 0; }
+  return std::max(0, (int)o.at(tp_extra::kMinBandRows).as_int(0));
+}
+
+// AN IMAGE DiT RANK'S ROW BANDS (FLUX.3, Qwen-Image-2.1): one block's
+// `rows` cut into [first, count) runs, in order, each band's partial
+// exchanged while the GPU works on the next band. ONE band -- the
+// block whole, as the first protocol of both families exchanged it --
+// unless the share was given a `floor` (tp_band_floor; a host states it
+// for every rank alike, and only to a peer whose libvpipe bands -- one
+// listing "tensor-parallel-flux3/2" or "tensor-parallel-qwen-image-
+// 21/2"): then as many bands as the block holds floors, eight at most,
+// balanced (the first `rows % n` a row longer), every one at least the
+// floor. `forced` > 0 -- a test's knob -- is that many, no floor.
+inline std::vector<std::pair<int, int>>
+tp_row_bands(int rows, int floor, int forced = 0)
+{
+  constexpr int kMaxBands = 8;
+  int n = 1;
+  if (forced > 0) {
+    n = std::min(forced, rows);
+  } else if (floor > 0) {
+    n = std::min(kMaxBands, rows / floor);
+  }
+  std::vector<std::pair<int, int>> out;
+  if (rows <= 0) { return out; }
+  if (n < 2) {
+    out.emplace_back(0, rows);
+    return out;
+  }
+  const int base = rows / n, extra = rows % n;
+  int at = 0;
+  for (int i = 0; i < n; ++i) {
+    const int c = base + (i < extra ? 1 : 0);
+    out.emplace_back(at, c);
+    at += c;
+  }
+  return out;
+}
 
 }
 

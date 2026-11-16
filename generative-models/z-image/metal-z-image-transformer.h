@@ -16,6 +16,7 @@
 #include "generative-models/shared/sage-attention.h"
 #include "generative-models/shared/sol-attention.h"
 #include "generative-models/shared/wired-pool.h"
+#include "generative-models/tensor-parallel.h"
 #include "generative-models/z-image/z-image-layout.h"
 
 #include <cstddef>
@@ -35,6 +36,8 @@ class WeightSet;
 class MetalSageAttention;
 class MetalSolAttention;
 class I8GemmContext;
+class MetalLlamaWeights;
+class TpOverlap;
 
 // Z-Image's DiT (ZImageTransformer2DModel), on metal-compute.
 //
@@ -161,6 +164,25 @@ class MetalZImageTransformer {
     // `ane_int8_tier: token_plain`). Only with ane_int8.
     bool ane_int8_plain = false;
 
+    // TENSOR PARALLEL (tensor-parallel.h): this model one RANK of a DiT
+    // split across machines -- its share of EVERY block's heads (to_q /
+    // to_k / to_v by their rows, to_out.0 by its columns) and feed-
+    // forward rows (w1 and w3 by their rows, w2 by its columns), the two
+    // refiners' as the main stack's: they are blocks of the one shape,
+    // and a refiner left whole would hold its full width on every rank
+    // and run its attention twice over. The sandwich norms (n2, n4) read
+    // a sublayer's WHOLE output, so a rank's partial is completed by the
+    // others' sum BEFORE its post-norm and tanh gate: TWO exchanges a
+    // block -- two a BAND where the share carries a floor (tp_extra::
+    // kMinBandRows; tp_row_bands), each crossing under the next band's
+    // work. Its share is cut as stored (bf16, F32 narrowed, or an affine
+    // pack; only its rows read where a cut is by rows) and laid out for
+    // the int8 tier asked within its own columns; adaLN, the norms and
+    // the trunk run whole. A rank streams its share then keeps it, as the
+    // whole model streams its blocks (on the per-block path: no slot
+    // pair), with no runtime LoRA and no ANE tier (each refused by name).
+    TpShare tp;
+
     // Read what can be read from <dir>/config.json. False when the file
     // is absent or names a different class.
     static bool read_dims(const std::string& dir, Config* out);
@@ -222,9 +244,33 @@ class MetalZImageTransformer {
 
   const Config& config() const { return _cfg; }
 
+  // A RANK's link to the others for ONE PICTURE (TpChannel): opened by
+  // the stage before the first forward, let go after the last however
+  // the picture ends; the exchange count new with it. False, with
+  // `err`, on a model that is not a rank or a channel that cannot run.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  void end_tp_generation();
+  // The exchange buffers it holds: grown at a forward's start, let go
+  // with the picture's channel (end_tp_generation).
+  std::size_t tp_exchange_bytes() const
+  {
+    std::size_t n = 0;
+    for (const auto& b : _tp_part) { n += b.byte_size(); }
+    for (const auto& b : _tp_recv) { n += b.byte_size(); }
+    return n;
+  }
+
   // Streaming + residency, the shared contract every DiT here
   // implements.
   void set_stream_stop(std::function<bool()> stop) {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
   }
   void set_block_progress(DitBlockProgressFn fn) {
@@ -346,9 +392,26 @@ class MetalZImageTransformer {
   // phase: img_rows image tokens beside txt_rows of caption, `packed`
   // for a pack (the dense stand-in), `matrix_cores` for the tiers that
   // need them (int8, Sage, Sol). CFG runs its two forwards in turn.
+  // A RANK's (c.tp) are its share's widths, and its exchange buffers
+  // beside them.
   static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
                                            int txt_rows, bool packed,
                                            bool matrix_cores);
+  // What a RANK of `c` (Config::tp, with the int8 tier it loads with)
+  // holds with every block kept -- where stream, then retain converges on
+  // a box with room -- off the checkpoint's headers before anything
+  // loads: the plan's figure for resident_bytes(). The trunk (bf16, a
+  // pack's codes as stored) and every block's share as tp_qw_ leaves it
+  // -- the two context-refiner blocks' on the accurate tier, as the
+  // whole model keeps them; the modulated ones' in the int8 tier's
+  // layout where it engages (asked of an I8GemmContext made as load()
+  // makes it, on `mc`), a w4 pack's only where `c.i8_hold_w4` holds it
+  // -- beside the norms and adaLN whole. `floor`: the trunk (the context
+  // refiner held in both modes) and two blocks' shares, what it holds
+  // streaming at the least. 0 when `c` is not split.
+  static std::size_t tp_held_bytes(const std::string& dir, const Config& c,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
   bool streaming() const { return _stream_blocks; }
   int quant_bits() const { return _quant_bits; }
 
@@ -480,6 +543,27 @@ class MetalZImageTransformer {
   bool load_block_(WeightSet& ws, const std::string& pre, bool with_ada,
                    Block& b, Retain r);
   bool load_fixed_(WeightSet& ws);
+  // A RANK's share of the block under `pre` (Config::tp): each projection
+  // cut by tp_qw_, the norms and adaLN whole. False, with `err` naming
+  // the tensor, where a projection cannot be cut.
+  bool load_tp_block_(WeightSet& ws, const std::string& pre, bool with_ada,
+                      Block& b, Retain r, std::string* err);
+  // One projection's share: `rows` of its N output rows, its input
+  // columns [k0, k1) (k1 0: all of them), laid out as the whole model
+  // lays out its own (`fast`: a modulated block's, on the int8 fast /
+  // token tier where it engages).
+  QWeight tp_qw_(WeightSet& ws, const std::string& name, int N,
+                 const std::vector<std::pair<int, int>>& rows, int k0,
+                 int k1, bool fast, std::string* err);
+  // One block's share (prefix `pfx`) as tp_qw_ leaves it, off the
+  // headers; `fast` the tier's context where it engages, else null.
+  static std::size_t tp_block_bytes_(const MetalLlamaWeights& src,
+                                     const Config& c,
+                                     const I8GemmContext* fast,
+                                     const std::string& pfx, bool with_ada);
+  // An exchange buffer of at least `bytes`, forgotten first where it is
+  // replaced.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
 
   // BlockSlots' callbacks; see shared/block-slots.h.
   void each_block_tensor_(int L, Block& b,
@@ -675,6 +759,18 @@ class MetalZImageTransformer {
   // nothing is attached. `ctx` selects the context refiner's space.
   lora::Stack lora_for_(bool ctx, int L,
                         lora::Factors BlockLora::* which) const;
+
+  // ---- a rank's link (Config::tp) -------------------------------------
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  std::uint64_t _tp_seq = 0;
+  // The EXCHANGE BUFFERS, a lane each: a band's partial sum, written
+  // there by its GEMM, and the others' sum back. Lanes 0 / 1 carry the
+  // attention's partials, 2 / 3 the feed-forward's (banded; a whole
+  // block uses lane 0 for both). Grown at a forward's start to its
+  // widest band (tp_buffer_), let go with the picture's channel
+  // (end_tp_generation).
+  metal_compute::SharedBuffer _tp_part[4], _tp_recv[4];
 };
 
 }  // namespace genai

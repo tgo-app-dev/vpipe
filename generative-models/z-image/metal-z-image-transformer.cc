@@ -12,6 +12,8 @@
 #include "generative-models/shared/metal-sol-attention.h"
 #include "generative-models/shared/lora-names.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tp-cut.h"
+#include "generative-models/shared/tp-overlap.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
@@ -113,6 +115,9 @@ constexpr const char* kKey = "z-image-dit/";
 
 MetalZImageTransformer::~MetalZImageTransformer()
 {
+  // A rank's picture, if one is still open: the worker joined and its
+  // buffers forgotten before the members they live in go.
+  end_tp_generation();
   // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
   // so the machine recovers either way -- but the pool's own counter
   // would not, and a DiT destroyed and reloaded per prompt would leak
@@ -619,6 +624,316 @@ MetalZImageTransformer::load_fixed_(WeightSet& ws)
          !_final_lin_b.empty();
 }
 
+// ---- a rank's share (Config::tp) -------------------------------------
+
+// A rank's share of one projection. CUT BY ITS ROWS -- to_q / to_k /
+// to_v, w1 and w3, most of a block -- a dense weight (bf16, or F32
+// narrowed here as the whole model narrows it) or an MLX affine pack has
+// only the share's rows READ, straight into the share (tp_read_rows); the
+// rest of the tensor never leaves the disk. CUT BY ITS COLUMNS --
+// to_out.0, w2 -- every row is needed: the whole weight is read UNCACHED
+// (Retain::Streamed, plain: no signed or tier layout) and the share
+// copied out of it, as is any weight the row read does not serve
+// (VPIPE_TP_WHOLE_READ, the A/B). An affine pack's columns are cut in
+// whole groups. Then the share is laid out as a whole model lays out its
+// own weights: a MODULATED block's (`fast`) on the int8 fast / token
+// tier -- a w8 share converted, a w4 share held as stored and converted
+// per GEMM, a dense share quantized (a dense checkpoint's only, as
+// load_qw_ quantizes) -- each at the group the share's own columns take,
+// a width none divides staying accurate; anything else the SIGNED layout
+// where the model's projections take it (_sgn: per byte and per group,
+// so a share converts as its whole weight would).
+MetalZImageTransformer::QWeight
+MetalZImageTransformer::tp_qw_(
+    WeightSet& ws, const std::string& name, int N,
+    const std::vector<std::pair<int, int>>& rows, int k0, int k1, bool fast,
+    std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = name + ": " + why; }
+    return QWeight{};
+  };
+  int n = 0;
+  for (const auto& [a, b] : rows) { n += b - a; }
+  QWeight l;
+  l.n = n;
+  bool read = false;
+  if (k1 == 0 && std::getenv("VPIPE_TP_WHOLE_READ") == nullptr) {
+    const MetalLlamaWeights& src = ws.src();
+    // Rows of a float tensor as the model holds it, bf16: read in the
+    // dtype stored and narrowed where that is wider or another half.
+    auto rows_bf16 = [&](const std::string& nm) -> SharedBuffer {
+      const auto* ti = src.info(nm);
+      if (ti == nullptr || (ti->dtype != "BF16" && ti->dtype != "F16" &&
+                            ti->dtype != "F32")) {
+        return {};
+      }
+      SharedBuffer b =
+          tp_read_rows(_mc, src, nm, ti->dtype.c_str(), N, rows);
+      if (b.empty() || ti->dtype == "BF16") { return b; }
+      const std::size_t es = ti->dtype == "F32" ? 4 : 2;
+      const std::size_t cnt = b.byte_size() / es;
+      SharedBuffer o = _mc->make_shared_buffer(cnt * 2);
+      if (o.empty() ||
+          !narrow_to_bf16_(b.contents(), ti->dtype, cnt,
+                           static_cast<std::uint16_t*>(o.contents()))) {
+        return {};
+      }
+      return o;
+    };
+    const auto* ci = src.info(name + ".weight");
+    const auto* si = src.info(name + ".scales");
+    if (_quant_bits > 0 && ci != nullptr && si != nullptr &&
+        ci->shape.size() == 2 && si->shape.size() == 2) {
+      const long K = si->shape[1] * (long)_quant_group;
+      const long bits = K > 0 ? ci->shape[1] * 32 / K : 0;
+      if (bits == 4 || bits == 8) {
+        l.codes = tp_read_rows(_mc, src, name + ".weight", "U32", N, rows);
+        l.scales = rows_bf16(name + ".scales");
+        l.qbias = rows_bf16(name + ".biases");
+        if (!l.codes.empty() && !l.scales.empty() && !l.qbias.empty()) {
+          l.quantized = true;
+          l.bits = (int)bits;
+          l.k = (int)K;
+          read = true;
+        } else {
+          l.codes = {}; l.scales = {}; l.qbias = {};
+        }
+      }
+    } else if (si == nullptr && ci != nullptr && ci->shape.size() == 2) {
+      l.w = rows_bf16(name + ".weight");
+      if (!l.w.empty()) {
+        l.k = (int)ci->shape[1];
+        read = true;
+      }
+    }
+  }
+  if (!read) {
+    QWeight w = load_qw_(ws, name, Retain::Streamed, /*sign=*/false,
+                         /*fast=*/false);
+    if (w.empty()) { return fail("not in the checkpoint"); }
+    if (w.gc > 0 || w.sgn) {
+      return fail("a split DiT reads dense or affine weights only");
+    }
+    if (w.quantized) {
+      const int g = _quant_group;
+      if (k1 > 0 && (k0 % g != 0 || k1 % g != 0)) {
+        return fail(fmt("its share's columns [{}, {}) are not whole "
+                        "groups of {}", k0, k1, g)());
+      }
+      l.quantized = true;
+      l.bits = w.bits;
+      // Codes: `32 / bits` columns a word; scales and biases: one a group.
+      l.codes = tp_cut(_mc, w.codes, N, rows, (std::size_t)k0 * w.bits / 8,
+                       (std::size_t)k1 * w.bits / 8);
+      l.scales = tp_cut(_mc, w.scales, N, rows, (std::size_t)k0 / g * 2,
+                        (std::size_t)k1 / g * 2);
+      l.qbias = tp_cut(_mc, w.qbias, N, rows, (std::size_t)k0 / g * 2,
+                       (std::size_t)k1 / g * 2);
+      if (l.codes.empty() || l.scales.empty() || l.qbias.empty()) {
+        return fail("its share could not be cut");
+      }
+      l.k = k1 > 0 ? k1 - k0 : (int)(w.codes.byte_size() * 8 /
+                                     (std::size_t)N / (std::size_t)w.bits);
+    } else {
+      l.w = tp_cut(_mc, w.w, N, rows, (std::size_t)k0 * 2,
+                   (std::size_t)k1 * 2);
+      if (l.w.empty()) { return fail("its share could not be cut"); }
+      l.k = k1 > 0 ? k1 - k0
+                   : (int)(w.w.byte_size() / 2 / (std::size_t)N);
+    }
+  }
+  // Off the int8 fast / token tier: the signed layout, where the model's
+  // projections take it.
+  auto plain = [&]() -> QWeight {
+    if (!sign_(l)) {
+      return fail("its share did not take the signed layout");
+    }
+    return std::move(l);
+  };
+  if (!fast || !_fast || !_i8) { return plain(); }
+  // A pack's dense tensor stays dense, as the whole model keeps it.
+  if (!l.quantized && _quant_bits != 0) { return plain(); }
+  // The tier's layout, within the share's own columns.
+  const int fgc = _i8->fast_group(l.k);
+  if (fgc <= 0) { return plain(); }
+  const std::size_t cb = (std::size_t)l.n * l.k;
+  const std::size_t sb = I8GemmContext::fast_scale_bytes(l.n, l.k, fgc);
+  if (l.quantized) {
+    if (_quant_group != 64 || !_i8->fast_converts(l.bits, fgc)) {
+      return plain();
+    }
+    if (l.bits == 4 && !_cfg.i8_hold_w4) {
+      // A W4 SHARE IS HELD AS STORED, converted before each GEMM
+      // (fast_operand_), as a whole model's w4 block is.
+      l.gc = fgc;
+      l.pc = true;
+      return l;
+    }
+    QWeight f;
+    f.bits = l.bits; f.gc = fgc; f.n = l.n; f.k = l.k;
+    f.codes = _mc->make_shared_buffer(cb);
+    f.cscales = _mc->make_shared_buffer(sb);
+    if (f.codes.empty() || f.cscales.empty()) { return plain(); }
+    CommandStream st = _mc->make_command_stream();
+    bool ok = false;
+    {
+      ComputeEncoder e = st.begin_compute();
+      ok = _i8->encode_to_fast(e, l.codes, l.scales, l.qbias, f.codes,
+                               f.cscales, fgc, l.n, l.k, l.bits);
+    }
+    if (!ok || !st.commit().wait_ok(nullptr)) { return plain(); }
+    f.quantized = true;
+    return f;
+  }
+  QWeight f;
+  f.bits = 8; f.gc = fgc; f.n = l.n; f.k = l.k;
+  f.codes = _mc->make_shared_buffer(cb);
+  f.cscales = _mc->make_shared_buffer(sb);
+  if (f.codes.empty() || f.cscales.empty()) { return l; }
+  CommandStream st = _mc->make_command_stream();
+  bool ok = false;
+  {
+    ComputeEncoder e = st.begin_compute();
+    ok = _i8->encode_quant_fast(e, l.w, f.codes, f.cscales, fgc, l.n, l.k);
+  }
+  if (!ok || !st.commit().wait_ok(nullptr)) { return l; }
+  f.quantized = true;
+  return f;
+}
+
+bool
+MetalZImageTransformer::load_tp_block_(WeightSet& ws, const std::string& p,
+                                       bool with_ada, Block& b, Retain r,
+                                       std::string* err)
+{
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
+  const TpShare& t = _cfg.tp;
+  const int H = _cfg.hidden, Hd = _cfg.head_dim, F = _cfg.ffn_inner;
+  const int i0 = t.head0 * Hd, i1 = t.head1 * Hd;
+  const std::vector<std::pair<int, int>> heads = {{i0, i1}};
+  const std::vector<std::pair<int, int>> all = {{0, H}};
+  const std::vector<std::pair<int, int>> ff = {{t.ffn0, t.ffn1}};
+  struct One {
+    QWeight* w;
+    const char* leaf;
+    int N;
+    const std::vector<std::pair<int, int>>* rows;
+    int k0, k1;
+  };
+  // q / k / v are three [H, H] tensors, each head's Hd rows in turn: a
+  // head range is one row range of each.
+  const One all_of[] = {
+      {&b.qw, "attention.to_q", H, &heads, 0, 0},
+      {&b.kw, "attention.to_k", H, &heads, 0, 0},
+      {&b.vw, "attention.to_v", H, &heads, 0, 0},
+      {&b.ow, "attention.to_out.0", H, &all, i0, i1},
+      {&b.w1, "feed_forward.w1", F, &ff, 0, 0},
+      {&b.w3, "feed_forward.w3", F, &ff, 0, 0},
+      {&b.w2, "feed_forward.w2", H, &all, t.ffn0, t.ffn1}};
+  for (const One& o : all_of) {
+    *o.w = tp_qw_(ws, p + o.leaf, o.N, *o.rows, o.k0, o.k1, with_ada, err);
+    if (o.w->empty()) { return false; }
+  }
+  // The q / k RMSNorms are a head's own, [head_dim]; the sandwich norms
+  // and adaLN read the whole residual stream: whole on every rank.
+  b.nq = to_elt_(ws, p + "attention.norm_q.weight", r);
+  b.nk = to_elt_(ws, p + "attention.norm_k.weight", r);
+  b.an1 = to_elt_(ws, p + "attention_norm1.weight", r);
+  b.an2 = to_elt_(ws, p + "attention_norm2.weight", r);
+  b.fn1 = to_elt_(ws, p + "ffn_norm1.weight", r);
+  b.fn2 = to_elt_(ws, p + "ffn_norm2.weight", r);
+  bool ok = !b.nq.empty() && !b.nk.empty() && !b.an1.empty() &&
+            !b.an2.empty() && !b.fn1.empty() && !b.fn2.empty();
+  if (with_ada) {
+    b.ada = load_qw_(ws, p + "adaLN_modulation.0", r);
+    b.ada_b = to_elt_(ws, p + "adaLN_modulation.0.bias", r);
+    ok = ok && !b.ada.empty() && !b.ada_b.empty();
+  }
+  if (!ok && err != nullptr) { *err = p + ": its norms or adaLN"; }
+  return ok;
+}
+
+bool
+MetalZImageTransformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
+{
+  if (b.byte_size() >= bytes) { return true; }
+  if (!b.empty() && _tp_pipe != nullptr) { _tp_pipe->forget(b); }
+  b = SharedBuffer{};
+  b = _mc->make_shared_buffer(bytes);
+  return !b.empty();
+}
+
+bool
+MetalZImageTransformer::begin_tp_generation(std::shared_ptr<TpChannel> ch,
+                                            std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = "tensor parallel: " + why; }
+    return false;
+  };
+  end_tp_generation();
+  if (!_cfg.tp.active()) { return fail("this model is not a rank"); }
+  if (!ch) { return fail("no channel to the other ranks"); }
+  // Four lanes: a block's bands alternate between two for the attention's
+  // partials and two for the feed-forward's (run_block's rank tail).
+  auto pipe = std::make_unique<TpOverlap>(_mc, ch, 4, TpDType::kBF16);
+  if (!pipe->valid()) {
+    return fail("no events or thread for the exchanges");
+  }
+  _tp_ch = std::move(ch);
+  _tp_pipe = std::move(pipe);
+  _tp_seq = 0;
+  // The stop the stage set before the picture, which the channel polls
+  // while it waits on the others.
+  try {
+    _tp_ch->set_stop(_stream_stop);
+  } catch (...) {
+  }
+  return true;
+}
+
+void
+MetalZImageTransformer::end_tp_generation()
+{
+  if (_tp_pipe == nullptr && !_tp_ch) { return; }
+  // An exchange still waiting on a peer would hold the worker the reset
+  // below joins: the channel told to stop waiting first.
+  if (_tp_pipe != nullptr && _tp_ch &&
+      (_tp_pipe->pending() || _tp_pipe->failed())) {
+    try {
+      _tp_ch->set_stop([]() { return true; });
+    } catch (...) {
+    }
+  }
+  _tp_pipe.reset();
+  // Every buffer the channel was handed forgotten before it goes (a
+  // transport may keep a device's registration of each).
+  if (_tp_ch) {
+    for (int k = 0; k < 4; ++k) {
+      for (const SharedBuffer* b : {&_tp_part[k], &_tp_recv[k]}) {
+        if (b->empty()) { continue; }
+        try {
+          _tp_ch->forget(b->contents(), b->byte_size());
+        } catch (...) {
+        }
+      }
+    }
+    try {
+      _tp_ch->set_stop({});
+    } catch (...) {
+    }
+  }
+  _tp_ch.reset();
+  _tp_seq = 0;
+  // THE BUFFERS GO WITH THE PICTURE. The plan books them with the
+  // forward's activations alone (forward_scratch_bytes), and the
+  // transport's registration of them went with the forget above; kept,
+  // they sat unbooked beside the decode and in a DiT kept warm.
+  for (SharedBuffer& b : _tp_part) { b = SharedBuffer{}; }
+  for (SharedBuffer& b : _tp_recv) { b = SharedBuffer{}; }
+}
+
 std::size_t
 MetalZImageTransformer::qw_bytes_(const QWeight& w)
 {
@@ -1015,8 +1330,22 @@ MetalZImageTransformer::configure_slots_()
     return fill_narrow_(nm, d);
   };
   ops.build = [this](int L, Block& b) {
-    return _ws != nullptr &&
-           load_block_(*_ws, mod_prefix_(L), true, b, Retain::Streamed);
+    if (_ws == nullptr) { return false; }
+    if (!_cfg.tp.active()) {
+      return load_block_(*_ws, mod_prefix_(L), true, b, Retain::Streamed);
+    }
+    // A RANK's block is its share, cut at every read (load() turns the
+    // slots off for it).
+    std::string terr;
+    if (load_tp_block_(*_ws, mod_prefix_(L), true, b, Retain::Streamed,
+                       &terr)) {
+      return true;
+    }
+    if (_mc->session() != nullptr) {
+      _mc->session()->warn(fmt("MetalZImageTransformer: tensor_parallel: "
+                               "block {}: {}", L, terr));
+    }
+    return false;
   };
   ops.clone = [this](const Block& s, Block& d, bool copy) {
     return clone_block_(s, d, copy);
@@ -1257,6 +1586,32 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   }
   if (m->_gemm_tile == 1 && !m->_fn_gemm_bm64.valid()) { m->_gemm_tile = 0; }
 
+  // A RANK (Config::tp): its share, streamed then kept as any Z-Image's
+  // blocks are, nothing that reads the checkpoint's widths -- the ANE's
+  // modules, a runtime LoRA -- and weights it can cut: dense or an affine
+  // pack.
+  const bool rank = m->_cfg.tp.active();
+  if (rank) {
+    const TpShare& t = m->_cfg.tp;
+    std::string why;
+    if (t.n_heads != m->_cfg.n_heads || t.n_ffn != m->_cfg.ffn_inner ||
+        t.heads() <= 0 || t.ffn() <= 0) {
+      why = fmt("a share of {} heads and {} feed-forward rows does not "
+                "fit this model's {} and {}", t.n_heads, t.n_ffn,
+                m->_cfg.n_heads, m->_cfg.ffn_inner)();
+    } else if (!loras.empty()) {
+      why = "not with a runtime LoRA yet";
+    } else if (m->_cfg.ane_ffn || m->_cfg.ane_qkv) {
+      why = "not with the Neural Engine's share";
+    }
+    if (!why.empty()) {
+      if (mc->session() != nullptr) {
+        mc->session()->error(fmt("MetalZImageTransformer: "
+                                 "tensor_parallel: {}", why));
+      }
+      return nullptr;
+    }
+  }
   if (!m->load_fixed_(*m->_ws)) {
     if (mc->session() != nullptr) {
       mc->session()->error(fmt("MetalZImageTransformer: the model-level "
@@ -1313,20 +1668,40 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   // refillable by every index that uses it.
   m->_ctx.resize((std::size_t)m->_cfg.n_refiner);
   for (int i = 0; i < m->_cfg.n_refiner; ++i) {
-    if (!m->load_block_(*m->_ws, m->ctx_prefix_(i), /*with_ada=*/false,
-                        m->_ctx[(std::size_t)i], Retain::Cached)) {
+    std::string terr;
+    Block& cb = m->_ctx[(std::size_t)i];
+    const bool ok =
+        rank ? m->load_tp_block_(*m->_ws, m->ctx_prefix_(i),
+                                 /*with_ada=*/false, cb, Retain::Cached,
+                                 &terr)
+             : m->load_block_(*m->_ws, m->ctx_prefix_(i),
+                              /*with_ada=*/false, cb, Retain::Cached);
+    if (!ok) {
       if (mc->session() != nullptr) {
         mc->session()->error(fmt("MetalZImageTransformer: context_refiner "
-                                 "block {} is incomplete", i));
+                                 "block {} is incomplete{}", i,
+                                 terr.empty() ? "" : " (" + terr + ")"));
       }
       return nullptr;
     }
   }
 
   m->_wire.open(mc);
+  if (rank && mc->session() != nullptr) {
+    const TpShare& t = m->_cfg.tp;
+    mc->session()->info(fmt(
+        "MetalZImageTransformer: rank {} of {}: heads [{}, {}) of {}, "
+        "feed-forward rows [{}, {}) of {}{}", t.rank, t.ranks, t.head0,
+        t.head1, t.n_heads, t.ffn0, t.ffn1, t.n_ffn,
+        stream_blocks ? ", streamed then kept" : ""));
+  }
   const int NM = m->_cfg.n_mod_blocks();
   if (stream_blocks) {
     m->configure_slots_();
+    // A RANK STREAMS ON THE PER-BLOCK PATH, never a slot: a slot refills
+    // a block by its tensors whole, and a rank's block is its share, cut
+    // afresh at each read (load_tp_block_) in the layout its tier holds.
+    if (rank) { m->_slots.disable(); }
     // Sized to the stack so a PROMOTED block has somewhere to land; an
     // unfilled entry reads as empty, which is how the forward tells a
     // resident block from one that is still streamed.
@@ -1334,11 +1709,19 @@ MetalZImageTransformer::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   } else {
     m->_blocks.resize((std::size_t)NM);
     for (int L = 0; L < NM; ++L) {
-      if (!m->load_block_(*m->_ws, m->mod_prefix_(L), /*with_ada=*/true,
-                          m->_blocks[(std::size_t)L], Retain::Cached)) {
+      std::string terr;
+      Block& b = m->_blocks[(std::size_t)L];
+      const bool ok =
+          rank ? m->load_tp_block_(*m->_ws, m->mod_prefix_(L),
+                                   /*with_ada=*/true, b, Retain::Cached,
+                                   &terr)
+               : m->load_block_(*m->_ws, m->mod_prefix_(L),
+                                /*with_ada=*/true, b, Retain::Cached);
+      if (!ok) {
         if (mc->session() != nullptr) {
           mc->session()->error(fmt("MetalZImageTransformer: block {} is "
-                                   "incomplete", L));
+                                   "incomplete{}", L,
+                                   terr.empty() ? "" : " (" + terr + ")"));
         }
         return nullptr;
       }
@@ -1476,14 +1859,25 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     return fail("z-image forward: missing input");
   }
   const zimage::Layout& lay = *req.layout;
-  const int H = _cfg.hidden, NH = _cfg.n_heads, Hd = _cfg.head_dim;
-  const int FFI = _cfg.ffn_inner, PD = _cfg.patch_dim();
+  // A RANK (Config::tp) runs its share's heads and feed-forward rows:
+  // NH and FFI are its own, HI its heads' width; H stays the model's.
+  const bool rank = _cfg.tp.active();
+  const int H = _cfg.hidden, Hd = _cfg.head_dim;
+  const int NH = rank ? _cfg.tp.heads() : _cfg.n_heads;
+  const int HI = NH * Hd;
+  const int FFI = rank ? _cfg.tp.ffn() : _cfg.ffn_inner;
+  const int PD = _cfg.patch_dim();
   const int JT = lay.joint_len, IMGT = lay.img_total;
   const int CAPT = lay.cap_total, IMG = lay.img_tokens;
   const int NM = _cfg.n_mod_blocks();
-  if (JT <= 0 || IMG <= 0 || NH * Hd != H) {
+  if (JT <= 0 || IMG <= 0 || _cfg.n_heads * Hd != H) {
     return fail("z-image forward: degenerate geometry");
   }
+  if (rank && _tp_pipe == nullptr) {
+    return fail("z-image forward: a rank with no channel "
+                "(begin_tp_generation)");
+  }
+  std::string tp_err;
   if (!_steel_attn_ok) {
     return fail("z-image forward: the steel attention kernel is "
                 "unavailable");
@@ -1516,16 +1910,17 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   // Peak scratch is ~10 [JT,H] planes plus 2 [JT,FFI] ones: 0.5 GB at
   // 1024^2 and 2 GB at 2048^2, which is the number a memory plan has to
   // carry for this family beside the weights.
+  // A rank's head planes are its heads' width.
   SharedBuffer joint = buf((std::size_t)JT * H);
   SharedBuffer nrm = buf((std::size_t)JT * H);
   SharedBuffer ob = buf((std::size_t)JT * H);
-  SharedBuffer qb = buf((std::size_t)JT * H);
-  SharedBuffer kb = buf((std::size_t)JT * H);
-  SharedBuffer vb = buf((std::size_t)JT * H);
-  SharedBuffer qh = buf((std::size_t)JT * H);
-  SharedBuffer kh = buf((std::size_t)JT * H);
-  SharedBuffer vh = buf((std::size_t)JT * H);
-  SharedBuffer ao = buf((std::size_t)JT * H);
+  SharedBuffer qb = buf((std::size_t)JT * HI);
+  SharedBuffer kb = buf((std::size_t)JT * HI);
+  SharedBuffer vb = buf((std::size_t)JT * HI);
+  SharedBuffer qh = buf((std::size_t)JT * HI);
+  SharedBuffer kh = buf((std::size_t)JT * HI);
+  SharedBuffer vh = buf((std::size_t)JT * HI);
+  SharedBuffer ao = buf((std::size_t)JT * HI);
   SharedBuffer ffg = buf((std::size_t)JT * FFI);
   SharedBuffer ffu = buf((std::size_t)JT * FFI);
   SharedBuffer capn = buf((std::size_t)lay.cap_len * _cfg.cap_dim);
@@ -1567,9 +1962,55 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
   // pending, and on a run with i8 off.
   if (_i8) { _i8->tune_pending(mc); }
 
+  // A RANK'S EXCHANGE BUFFERS, grown HERE to this forward's widest band
+  // over the three row counts its blocks run (the caption refiner's, the
+  // noise refiner's, the main stack's): a buffer replaced is forgotten
+  // first, and forget() waits out the exchanges posted on it -- mid-
+  // forward those wait on GPU work not yet committed. Nothing is pending
+  // between forwards.
+  int tp_forced = 0, tp_lag = 1;
+  const int tp_floor = rank ? tp_band_floor(_cfg.tp) : 0;
+  if (rank) {
+    if (const char* e = std::getenv("VPIPE_Z_IMAGE_TP_BANDS")) {
+      tp_forced = std::max(0, std::atoi(e));
+    }
+    if (const char* e = std::getenv("VPIPE_Z_IMAGE_TP_LAG")) {
+      tp_lag = std::atoi(e) == 0 ? 0 : 1;
+    }
+    int widest = 0;
+    bool banded = false;
+    for (const int r : {CAPT, IMGT, JT}) {
+      const auto bd = tp_row_bands(r, tp_floor, tp_forced);
+      banded = banded || bd.size() > 1;
+      for (const auto& x : bd) { widest = std::max(widest, x.second); }
+    }
+    const std::size_t pb = (std::size_t)widest * (std::size_t)H * 2;
+    const int lanes = banded ? 4 : 1;
+    for (int k = 0; k < lanes; ++k) {
+      if (!tp_buffer_(_tp_part[k], pb) || !tp_buffer_(_tp_recv[k], pb)) {
+        return fail("z-image forward: tensor parallel: no room for the "
+                    "partial sums");
+      }
+    }
+  }
+
   CommandStream stream = mc->make_command_stream();
   ComputeEncoder enc = stream.begin_compute();
   if (!enc.valid()) { return fail("z-image forward: no compute encoder"); }
+  // A RANK'S EXCHANGES LEFT POSTED when the forward ends early -- a stop
+  // between blocks, a failure -- their partials in work never committed,
+  // would hold the GPU's waits and the worker: abandoned here, before the
+  // encoder and stream go (declared after them). A forward that ran to
+  // its end has none pending.
+  struct TpEnd {
+    TpOverlap* pipe;
+    ~TpEnd()
+    {
+      if (pipe != nullptr && pipe->pending()) {
+        pipe->abandon("the forward ended early");
+      }
+    }
+  } tp_end{rank ? _tp_pipe.get() : nullptr};
   // perf-flops. Whatever an aborted forward left uncredited is dropped,
   // and Sol's GPU counter starts this forward at zero so finish() reads
   // this forward's keep alone.
@@ -2023,12 +2464,12 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     const auto t_q0 = std::chrono::steady_clock::now();
     if (qg_rows > 0 &&
         !fast_shared_(enc, nrm, 0, qg_rows, H,
-                      {{&b.qw, &qb, 0, H, !LA(&BlockLora::q).empty()},
-                       {&b.kw, &kb, 0, H, !LA(&BlockLora::k).empty()},
-                       {&b.vw, &vb, 0, H, !LA(&BlockLora::v).empty()}})) {
-      lin(nrm, 0, b.qw, qb, 0, qg_rows, H, H, LA(&BlockLora::q));
-      lin(nrm, 0, b.kw, kb, 0, qg_rows, H, H, LA(&BlockLora::k));
-      lin(nrm, 0, b.vw, vb, 0, qg_rows, H, H, LA(&BlockLora::v));
+                      {{&b.qw, &qb, 0, HI, !LA(&BlockLora::q).empty()},
+                       {&b.kw, &kb, 0, HI, !LA(&BlockLora::k).empty()},
+                       {&b.vw, &vb, 0, HI, !LA(&BlockLora::v).empty()}})) {
+      lin(nrm, 0, b.qw, qb, 0, qg_rows, HI, H, LA(&BlockLora::q));
+      lin(nrm, 0, b.kw, kb, 0, qg_rows, HI, H, LA(&BlockLora::k));
+      lin(nrm, 0, b.vw, vb, 0, qg_rows, HI, H, LA(&BlockLora::v));
     }
     mark("gemm.qkv");
     if (qkv_split || qkv_probe) {
@@ -2077,6 +2518,151 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     mark("rope");
     run_attn(L, rows);
     mark("attn");
+    // The GPU's feed-forward over rows [r0, r0 + n) of `nrm`, its output
+    // into `out` from element `oe` -- `ob`'s own rows for the whole model
+    // (its share of an ANE split, every row of an unsplit block, and the
+    // rows the ANE lost); a band's exchange buffer for a RANK. The
+    // scratch is used from its first row whatever r0 is.
+    auto gpu_ff = [&](int r0, int n, const SharedBuffer& out,
+                      std::size_t oe) {
+      if (n <= 0) { return; }
+      const std::size_t e0 = (std::size_t)r0 * H;
+      if (!fast_shared_(enc, nrm, e0, n, H,
+                        {{&b.w1, &ffg, 0, FFI, !LA(&BlockLora::w1).empty()},
+                         {&b.w3, &ffu, 0, FFI,
+                          !LA(&BlockLora::w3).empty()}})) {
+        lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
+        lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
+      }
+      // FUSED: the down projection's int8 input quantized straight from
+      // gate and up, so the product is never stored -- the same codes
+      // swiglu + gemm_fast make. Not with an adapter on the down
+      // projection (it reads the bf16 product).
+      // VPIPE_Z_IMAGE_NO_SWIGLU_FUSE=1 for the A/B.
+      {
+        const QWeight& dw = b.w2;
+        const SharedBuffer* dc = nullptr;
+        const SharedBuffer* dcs = nullptr;
+        if (_i8 && dw.quantized && dw.gc > 0 && LA(&BlockLora::w2).empty() &&
+            n <= mma_row_band(H, FFI) &&
+            std::getenv("VPIPE_Z_IMAGE_NO_SWIGLU_FUSE") == nullptr &&
+            _i8->fast_accepts(n, H, FFI) &&
+            fast_operand_(enc, dw, &dc, &dcs) &&
+            _i8->gemm_fast_swiglu(enc, ffg, 0, ffu, 0, *dc, *dcs, dw.gc, out,
+                                  oe, n, H, FFI)) {
+          _flops.gemm(n, H, FFI);
+          return;
+        }
+      }
+      // In place on the gate: same index in, same index out. The
+      // largest elementwise dispatch in the model, so it is the one
+      // that pays most for being four-wide.
+      swiglu(ffg, ffu, ffg, n * FFI);
+      lin(ffg, 0, b.w2, out, oe, n, H, FFI, LA(&BlockLora::w2));
+    };
+    // A RANK'S BLOCK TAIL (Config::tp), from the attention's token-major
+    // output on -- here `vb`, its heads' width, apart from `nrm`, which
+    // the feed-forward's norm writes band by band while a later band's
+    // out projection still reads the attention. Its out projection and
+    // feed-forward are PARTIAL sums -- its heads' and rows' share of the
+    // block's -- and the SANDWICH NORM (n2, n4) reads a sublayer's whole
+    // output, so each partial is completed by the other ranks' sum BEFORE
+    // its post-norm and gate. The rows are cut into bands (tp_row_bands:
+    // one, the block whole, unless the share was given a floor), each
+    // band's partial written straight into an EXCHANGE BUFFER (no copy)
+    // and POSTED (TpOverlap): the GPU signals it written, the worker
+    // hands it to the channel, and the GPU waits for the others' sum only
+    // where it adds it -- the encoder never waits. In GPU order step i
+    // runs A(i) -- band i's out projection, posted -- then B(i - 1) --
+    // that band's sum added, normed and gated into the residual, the
+    // feed-forward's norm and the feed-forward, posted -- then C(i - 2) --
+    // that sum added, normed and gated. Every step after the attention
+    // is a row's own, which is what lets a band run ahead of the next.
+    // VPIPE_Z_IMAGE_TP_LAG=0 runs the steps band after band: no overlap,
+    // the same arithmetic. Lanes 0 / 1 carry the attention's partials,
+    // 2 / 3 the feed-forward's (a whole block: lane 0 both); a lane's
+    // next write follows the GPU's read of its sum before it.
+    auto rank_tail = [&]() -> bool {
+      const auto tb = tp_row_bands(rows, tp_floor, tp_forced);
+      const int nb = (int)tb.size();
+      const int la = nb > 1 ? 2 : 1, lf = nb > 1 ? 2 : 0;
+      std::vector<std::uint64_t> va((std::size_t)nb), vc((std::size_t)nb);
+      auto post = [&](int lane, int n) {
+        const TpOverlap::Ticket t =
+            _tp_pipe->post(lane, _tp_part[lane], _tp_recv[lane],
+                           (std::size_t)n * (std::size_t)H * 2, _tp_seq++);
+        // Between encoders, into the open command buffer: the signal
+        // after the dispatch that wrote the partial.
+        enc.end();
+        stream.encode_signal(*t.ready, t.ready_at);
+        enc = stream.begin_compute();
+        return t.done_at;
+      };
+      auto await = [&](std::uint64_t v) {
+        enc.end();
+        stream.encode_wait(_tp_pipe->done(), v);
+        enc = stream.begin_compute();
+      };
+      // The band's sum completed, post-normed and into the residual
+      // through its gate (`gc`: the gate's chunk of `mods`).
+      auto settle = [&](const SharedBuffer& p, const SharedBuffer& recv,
+                       const SharedBuffer& post_norm, std::size_t gc,
+                       int r0, int n) {
+        resid(p, 0, recv, 0, n * H);
+        rms(p, 0, post_norm, p, 0, n, H);
+        const std::size_t je = xe + (std::size_t)r0 * H;
+        if (modulated) {
+          gated(joint, je, mods, gc, p, 0, n);
+        } else {
+          resid(joint, je, p, 0, n * H);
+        }
+      };
+      auto step_a = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        lin(vb, (std::size_t)r0 * HI, b.ow, _tp_part[k % la], 0, n, H, HI);
+        va[(std::size_t)k] = post(k % la, n);
+      };
+      auto step_b = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        await(va[(std::size_t)k]);
+        settle(_tp_part[k % la], _tp_recv[k % la], b.an2, (std::size_t)H,
+              r0, n);
+        const std::size_t ne = (std::size_t)r0 * H;
+        rms(joint, xe + ne, fold ? nw3 : b.fn1, nrm, ne, n, H);
+        if (modulated && !fold) {
+          modulate(nrm, ne, mods, (std::size_t)2 * H, nrm, ne, n);
+        }
+        gpu_ff(r0, n, _tp_part[lf + k % la], 0);
+        vc[(std::size_t)k] = post(lf + k % la, n);
+      };
+      auto step_c = [&](int k) {
+        const int r0 = tb[(std::size_t)k].first;
+        const int n = tb[(std::size_t)k].second;
+        await(vc[(std::size_t)k]);
+        settle(_tp_part[lf + k % la], _tp_recv[lf + k % la], b.fn2,
+              (std::size_t)3 * H, r0, n);
+      };
+      for (int i = 0; i < nb + 2 * tp_lag; ++i) {
+        if (i < nb) { step_a(i); }
+        if (i - tp_lag >= 0 && i - tp_lag < nb) { step_b(i - tp_lag); }
+        if (i - 2 * tp_lag >= 0 && i - 2 * tp_lag < nb) {
+          step_c(i - 2 * tp_lag);
+        }
+      }
+      mark("tp");
+      if (_tp_pipe->failed()) {
+        tp_err = _tp_pipe->error();
+        return false;
+      }
+      return true;
+    };
+    if (rank) {
+      transpose(ao, vb, NH, rows);
+      mark("transpose");
+      return rank_tail();
+    }
     transpose(ao, nrm, NH, rows);
     mark("transpose");
     lin(nrm, 0, b.ow, ob, 0, rows, H, H, LA(&BlockLora::o));
@@ -2124,50 +2710,11 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       // stream_per_commit_costs).
       enc = stream.begin_compute();
     }
-    // The GPU's feed-forward over rows [r0, r0 + n), `nrm` into `ob`: its
-    // share of a split, every row of an unsplit block, and the rows the
-    // ANE lost. The scratch is used from its first row whatever r0 is.
-    auto gpu_ff = [&](int r0, int n) {
-      if (n <= 0) { return; }
-      const std::size_t e0 = (std::size_t)r0 * H;
-      if (!fast_shared_(enc, nrm, e0, n, H,
-                        {{&b.w1, &ffg, 0, FFI, !LA(&BlockLora::w1).empty()},
-                         {&b.w3, &ffu, 0, FFI,
-                          !LA(&BlockLora::w3).empty()}})) {
-        lin(nrm, e0, b.w1, ffg, 0, n, FFI, H, LA(&BlockLora::w1));
-        lin(nrm, e0, b.w3, ffu, 0, n, FFI, H, LA(&BlockLora::w3));
-      }
-      // FUSED: the down projection's int8 input quantized straight from
-      // gate and up, so the product is never stored -- the same codes
-      // swiglu + gemm_fast make. Not with an adapter on the down
-      // projection (it reads the bf16 product).
-      // VPIPE_Z_IMAGE_NO_SWIGLU_FUSE=1 for the A/B.
-      {
-        const QWeight& dw = b.w2;
-        const SharedBuffer* dc = nullptr;
-        const SharedBuffer* dcs = nullptr;
-        if (_i8 && dw.quantized && dw.gc > 0 && LA(&BlockLora::w2).empty() &&
-            n <= mma_row_band(H, FFI) &&
-            std::getenv("VPIPE_Z_IMAGE_NO_SWIGLU_FUSE") == nullptr &&
-            _i8->fast_accepts(n, H, FFI) &&
-            fast_operand_(enc, dw, &dc, &dcs) &&
-            _i8->gemm_fast_swiglu(enc, ffg, 0, ffu, 0, *dc, *dcs, dw.gc, ob,
-                                  e0, n, H, FFI)) {
-          _flops.gemm(n, H, FFI);
-          return;
-        }
-      }
-      // In place on the gate: same index in, same index out. The
-      // largest elementwise dispatch in the model, so it is the one
-      // that pays most for being four-wide.
-      swiglu(ffg, ffu, ffg, n * FFI);
-      lin(ffg, 0, b.w2, ob, e0, n, H, FFI, LA(&BlockLora::w2));
-    };
     // The GPU's share. A probe block deliberately takes EVERY row:
     // that is what makes its time comparable with the split's.
     const int g_rows = rows - a_rows;
     const auto t_g0 = std::chrono::steady_clock::now();
-    gpu_ff(0, g_rows);
+    gpu_ff(0, g_rows, ob, 0);
     mark("gemm.ff");
     // The GPU's rows have to be DONE before the ANE's are folded in and
     // before the norm below reads the whole tensor, so this commit is
@@ -2194,7 +2741,9 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
       // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
       // stream_per_commit_costs).
       enc = stream.begin_compute();
-      if (ff_lost >= 0) { gpu_ff(ff_lost, rows - ff_lost); }
+      if (ff_lost >= 0) {
+        gpu_ff(ff_lost, rows - ff_lost, ob, (std::size_t)ff_lost * H);
+      }
     }
     rms(ob, 0, b.fn2, ob, 0, rows, H);
     if (modulated) {
@@ -2386,6 +2935,10 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     if (!run_block(_ctx[(std::size_t)i], (std::size_t)IMGT * H, CAPT, IMGT,
                    /*modulated=*/false, i, AneFeedForward::Plan::kGpu,
                    /*ctx=*/true)) {
+      if (!tp_err.empty()) {
+        if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+        return fail("z-image forward: tensor parallel: " + tp_err);
+      }
       return fail("z-image forward: the context refiner failed");
     }
     ++done;
@@ -2483,6 +3036,10 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     fill_mod(*b);
     if (!run_block(*b, 0, rows, 0, /*modulated=*/true, L, ane_plan,
                    /*ctx=*/false, qkv_plan)) {
+      if (!tp_err.empty()) {
+        if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+        return fail("z-image forward: tensor parallel: " + tp_err);
+      }
       return fail("z-image forward: block " + std::to_string(L) +
                   " failed");
     }
@@ -2605,6 +3162,12 @@ MetalZImageTransformer::forward(const Request& req, std::string* err)
     if (!stream.commit().wait_ok(&ge)) {
       return fail("z-image forward: " + (ge.empty() ? "GPU failed" : ge));
     }
+  }
+  // A rank whose exchange failed after its last block was encoded ran
+  // on with wrong sums (TpOverlap releases its waits): said here.
+  if (rank && _tp_pipe->failed()) {
+    if (_stream_stop && _stream_stop()) { return SharedBuffer{}; }
+    return fail("z-image forward: tensor parallel: " + _tp_pipe->error());
   }
   // Every routed layer has run, so Sol's count is this forward's whole.
   if (_sol) { _sol_flops.finish(_sol->exact_blocks()); }
@@ -3168,10 +3731,165 @@ MetalZImageTransformer::streaming_floor_bytes(const std::string& dir)
   return floor;
 }
 
+// One block's SHARE as tp_qw_ leaves it, off the headers: its seven
+// projections at the share's rows and columns, in the layout each takes
+// -- on the int8 fast / token tier (`fast`, the context load() makes when
+// the tier engages; a modulated block's alone) an affine share converted
+// where its columns take a group (a w4 one only where Config::
+// i8_hold_w4 holds it, else its pack) and a dense one quantized (a dense
+// checkpoint's alone); else bf16 (an F32 checkpoint narrowed), or an
+// affine pack's codes, scales and biases -- beside its norms whole and,
+// `with_ada`, its adaLN as stored.
+std::size_t
+MetalZImageTransformer::tp_block_bytes_(const MetalLlamaWeights& src,
+                                        const Config& c,
+                                        const I8GemmContext* fast,
+                                        const std::string& pfx,
+                                        bool with_ada)
+{
+  const TpShare& t = c.tp;
+  const std::size_t H = (std::size_t)c.hidden;
+  const std::size_t F = (std::size_t)c.ffn_inner;
+  const std::size_t hi = (std::size_t)t.heads() * (std::size_t)c.head_dim;
+  const std::size_t f = (std::size_t)t.ffn();
+  const bool pack = src.info(pfx + "attention.to_q.scales") != nullptr;
+  if (!with_ada) { fast = nullptr; }
+  // [rows] x [cols] of an [N, K] weight.
+  auto proj = [&](const std::string& nm, std::size_t N, std::size_t K,
+                  std::size_t rows, std::size_t cols) -> std::size_t {
+    const auto* ci = src.info(nm + ".weight");
+    const auto* si = src.info(nm + ".scales");
+    const std::size_t share = rows * cols;
+    const int fgc = fast != nullptr ? fast->fast_group((int)cols) : 0;
+    const std::size_t layout =
+        fgc > 0 ? share + I8GemmContext::fast_scale_bytes(
+                              (int)rows, (int)cols, fgc)
+                : 0;
+    if (ci != nullptr && si != nullptr && si->shape.size() == 2 &&
+        si->shape[1] > 0 && N * K > 0) {
+      const std::size_t bits = (std::size_t)ci->nbytes * 8 / (N * K);
+      const std::size_t g = std::max<std::size_t>(
+          K / (std::size_t)si->shape[1], 1);
+      const std::size_t as_pack = share * bits / 8 + 2 * (share / g) * 2;
+      if (fgc > 0 && g == 64 && fast->fast_converts((int)bits, fgc) &&
+          (bits == 8 || c.i8_hold_w4)) {
+        return layout;
+      }
+      return as_pack;
+    }
+    return fgc > 0 && !pack ? layout : share * 2;
+  };
+  // A float tensor held bf16, or a pack's as stored with its scales and
+  // biases bf16.
+  auto whole = [&](const std::string& nm) -> std::size_t {
+    const auto* ti = src.info(nm);
+    if (ti == nullptr) { return 0; }
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    const bool fl = ti->dtype == "F32" || ti->dtype == "F16" ||
+                    ti->dtype == "BF16";
+    return fl ? n * 2 : (std::size_t)ti->nbytes;
+  };
+  std::size_t n = proj(pfx + "attention.to_q", H, H, hi, H) +
+                  proj(pfx + "attention.to_k", H, H, hi, H) +
+                  proj(pfx + "attention.to_v", H, H, hi, H) +
+                  proj(pfx + "attention.to_out.0", H, H, H, hi) +
+                  proj(pfx + "feed_forward.w1", F, H, f, H) +
+                  proj(pfx + "feed_forward.w3", F, H, f, H) +
+                  proj(pfx + "feed_forward.w2", H, F, H, f);
+  for (const char* nm : {"attention.norm_q.weight", "attention.norm_k.weight",
+                         "attention_norm1.weight", "attention_norm2.weight",
+                         "ffn_norm1.weight", "ffn_norm2.weight"}) {
+    n += whole(pfx + nm);
+  }
+  if (with_ada) {
+    const std::string a = pfx + "adaLN_modulation.0";
+    if (src.info(a + ".scales") != nullptr) {
+      n += whole(a + ".weight") + whole(a + ".scales") +
+           whole(a + ".biases");
+    } else {
+      n += whole(a + ".weight");
+    }
+    n += whole(a + ".bias");
+  }
+  return n;
+}
+
+std::size_t
+MetalZImageTransformer::tp_held_bytes(const std::string& dir,
+                                      const Config& c, MetalCompute* mc,
+                                      std::size_t* floor)
+{
+  if (floor != nullptr) { *floor = 0; }
+  if (!c.tp.active() || dir.empty()) { return 0; }
+  auto wts = MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return 0; }
+  // The int8 tier as load() decides it, on a context made as it makes
+  // one: no matrix cores, the accurate tier, or a pack of another group,
+  // and the shares stay as cut.
+  std::unique_ptr<I8GemmContext> i8;
+  if (mc != nullptr && c.i8_gemm && c.i8_tier > 0 &&
+      mc->supports_matrix_cores() && !c.ane_ffn && !c.ane_qkv &&
+      std::getenv("VPIPE_Z_IMAGE_NO_MMA2") == nullptr) {
+    i8 = std::make_unique<I8GemmContext>(mc, true, /*bf16=*/true);
+    i8->set_tier(c.i8_tier >= 2   ? I8GemmContext::Tier::kToken
+                 : c.i8_tier == 1 ? I8GemmContext::Tier::kFast
+                                  : I8GemmContext::Tier::kAccurate);
+    i8->set_token_rotation(c.i8_tier == 2);
+    if (!i8->enabled() || i8->fast_group(c.hidden) <= 0) { i8.reset(); }
+  }
+  const std::string p0 = "noise_refiner.0.";
+  if (i8 != nullptr) {
+    const auto* si = wts->info(p0 + "attention.to_q.scales");
+    if (si != nullptr && si->shape.size() == 2 && si->shape[1] > 0 &&
+        c.hidden / (int)si->shape[1] != 64) {
+      i8.reset();
+    }
+  }
+  // The trunk: every tensor outside the blocks, bf16 (narrowed from F32
+  // or F16) or a pack's codes as stored -- and the context refiner's
+  // shares, held in both modes.
+  std::size_t trunk = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.rfind("context_refiner.", 0) == 0 ||
+        nm.rfind("noise_refiner.", 0) == 0 || nm.rfind("layers.", 0) == 0) {
+      continue;
+    }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    const bool fl = ti->dtype == "F32" || ti->dtype == "F16" ||
+                    ti->dtype == "BF16";
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    trunk += fl ? n * 2 : (std::size_t)ti->nbytes;
+  }
+  for (int i = 0; i < c.n_refiner; ++i) {
+    trunk += tp_block_bytes_(*wts, c, nullptr,
+                             "context_refiner." + std::to_string(i) + ".",
+                             /*with_ada=*/false);
+  }
+  std::size_t held = trunk, widest = 0;
+  for (int L = 0; L < c.n_mod_blocks(); ++L) {
+    const std::string pfx =
+        L < c.n_refiner ? "noise_refiner." + std::to_string(L) + "."
+                        : "layers." + std::to_string(L - c.n_refiner) + ".";
+    const std::size_t b = tp_block_bytes_(*wts, c, i8.get(), pfx, true);
+    held += b;
+    widest = std::max(widest, b);
+  }
+  if (floor != nullptr) { *floor = trunk + 2 * widest; }
+  return held;
+}
+
 std::size_t
 MetalZImageTransformer::checkpoint_block_bytes_() const
 {
   if (_ws == nullptr) { return 0; }
+  // A RANK keeps its share of a block, in its tier's layout.
+  if (_cfg.tp.active()) {
+    return tp_block_bytes_(_ws->src(), _cfg, _fast ? _i8.get() : nullptr,
+                           mod_prefix_(0), true);
+  }
   const MetalLlamaWeights& w = _ws->src();
   // Block 0 of the streaming stack, which is noise_refiner.0 -- the
   // same shape as every block in the stack.
@@ -3273,22 +3991,42 @@ MetalZImageTransformer::forward_scratch_bytes(const Config& c, int img_rows,
     const std::size_t m = (std::size_t)zimage::kSeqMultiple;
     return (n + m - 1) / m * m;
   };
+  // A RANK's head planes are its heads' width, its feed-forward its
+  // rows', and it holds its EXCHANGE BUFFERS -- a partial and the others'
+  // sum a lane, at the widest band of the three row counts its blocks run
+  // (tp_row_bands; four lanes banded, one whole).
+  const bool rank = c.tp.active();
   const std::size_t txt = txt_rows > 0 ? (std::size_t)txt_rows : 0;
   const std::size_t IT = pad((std::size_t)img_rows), CT = pad(txt);
   const std::size_t JT = IT + CT;
   const std::size_t H = (std::size_t)c.hidden;
-  const std::size_t F = (std::size_t)c.ffn_inner;
+  const std::size_t F = rank ? (std::size_t)c.tp.ffn()
+                             : (std::size_t)c.ffn_inner;
   const std::size_t Hd = (std::size_t)c.head_dim;
-  std::size_t n = 10 * JT * H * 2 + 2 * JT * F * 2 +
+  const int NH = rank ? c.tp.heads() : c.n_heads;
+  const std::size_t HI = (std::size_t)NH * Hd;
+  std::size_t n = 3 * JT * H * 2 + 7 * JT * HI * 2 + 2 * JT * F * 2 +
                   txt * (std::size_t)c.cap_dim * 2 + 2 * JT * Hd * 4 +
                   (std::size_t)img_rows * (std::size_t)c.patch_dim() * 2;
-  if (packed) { n += F * H * 2; }
+  // A pack's dense stand-in is the widest projection a GEMM dequantizes.
+  if (packed) { n += std::max(F, HI) * H * 2; }
+  if (rank) {
+    std::size_t widest = 0;
+    bool banded = false;
+    for (std::size_t r : {CT, IT, JT}) {
+      const auto bd = tp_row_bands((int)r, tp_band_floor(c.tp));
+      banded = banded || bd.size() > 1;
+      for (const auto& x : bd) {
+        widest = std::max(widest, (std::size_t)x.second);
+      }
+    }
+    n += (banded ? 4u : 1u) * 2 * widest * H * 2;
+  }
   if (!matrix_cores) { return n; }
   if (c.i8_gemm) {
     n += I8GemmContext::forward_bytes_bound((int)JT, (int)F, (int)F, (int)H,
                                             c.i8_tier == 0);
   }
-  const int NH = c.n_heads;
   if (c.sol.enabled) {
     for (std::size_t r : {JT, IT}) {
       if (r >= (std::size_t)kSolMinSegment) {

@@ -697,6 +697,31 @@ private:
   std::shared_ptr<genai::MetalFlux3Transformer> _flux3_dit;
   std::string _flux3_dit_dir;
   bool _flux3_stream = false;
+  // TENSOR PARALLEL (`tensor_parallel`; generative-models/tensor-
+  // parallel.h): this stage one RANK of the DiT split across machines --
+  // FLUX.3's, Qwen-Image-2.1's, Krea-2's, MOSS-Image's, Z-Image's or Fibo
+  // 2.0's -- the bag as given, and the share it reads to. Inactive: the
+  // whole model.
+  FlexData _tp_cfg;
+  genai::TpShare _tp_share;
+  // The share read from the bag against the DiT's widths, the transport
+  // it names checked; false (said) when it does not fit.
+  bool take_tp_share_(int n_heads, int n_ffn);
+  // THE SAME SHARE FOR THE PLAN, before anything loads: the bag read
+  // against `dit`'s widths, FLUX.3's, Qwen-Image-2.1's, Krea-2's
+  // (Turbo's, as every Krea-2 Config here), MOSS-Image's, Z-Image's or
+  // Fibo 2.0's. Inactive where there is no bag, the family is another, or
+  // the share does not fit (ensure_loaded_ then says why).
+  genai::TpShare plan_tp_share_(const std::string& dit) const;
+  // What this RANK holds with every block kept, off the headers (its
+  // share in the layout its tier takes; the transformers' tp_held_bytes),
+  // and its streaming floor -- the trunk and two blocks' shares. 0 when
+  // this stage is not a rank.
+  std::size_t tp_held_bytes_(const std::string& dit,
+                             std::size_t* floor = nullptr) const;
+  // This picture's channel to the other ranks, opened before its first
+  // forward (the transport the bag names).
+  std::shared_ptr<genai::TpChannel> open_tp_channel_(std::string* err);
   // The sampler the CHECKPOINT states (<root>/config.json `sampler`):
   // the schedule's alpha (6.93) and its step count (16 for the distilled
   // Klein). Read at load, because the two Klein checkpoints differ here

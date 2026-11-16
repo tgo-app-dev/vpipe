@@ -167,6 +167,12 @@ public:
   // runs the block [token, noise...] (dspark_block rows, at the positions
   // after the context's) through the stages and the Markov-biased head.
   bool has_dspark() const { return !_stages.empty(); }
+  // Told after each piece of a prefill (prefill-progress.h): the tokens
+  // read so far of the call's. Empty: none.
+  void set_prefill_progress(std::function<void(int, int)> fn)
+  {
+    _prefill_progress = std::move(fn);
+  }
   // A draft from the context's last position: `token` is the next token,
   // decided and not yet run. `drafts` gets the block's dspark_block
   // tokens after it (greedy), `conf` the confidence of each block row (the
@@ -246,6 +252,7 @@ public:
   }
 
 private:
+  std::function<void(int, int)> _prefill_progress;
   MetalDeepseekV41Model() = default;
   bool init_(const std::shared_ptr<WeightSet>& ws, std::string* err);
 

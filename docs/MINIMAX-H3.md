@@ -3386,6 +3386,17 @@ pictures keep the draft's composition, hands and lettering (its subtitle
 line character for character); scaled back to the draft's size they sit
 29.5 dB (768P) and 34.4 dB (2K) from it over every frame.
 
+The draft is part of the prompt too: the text encoder reads it as a clip,
+two frames a second merged in pairs, about 1,000 tokens a pair at 768P —
+some 1,000 prompt tokens for every second of draft, so a long draft's
+prompt passes a band's 8,192 rows. A long refine works through its rows
+a band of up to 8,192 at a time, the prompt's included — the token
+refiner runs in bands of its own when the prompt is longer than one —
+with exactly the results the whole sequence gives. A DiT split across Macs does the same
+where both ranks are told they may (`prompt_bands` in `tensor_parallel`;
+see [PLUGINS.md, extension point 5b](PLUGINS.md#extension-point-5b--a-transport-for-a-dit-split-across-hosts));
+otherwise a prompt longer than a rank's band runs its blocks whole.
+
 The adapters run beside the base GEMMs: three of them, ranks 256 + 64 +
 384, about a fifth of a block's projection FLOPs (attention not counted);
 folding them into the weights once (the release's own apply rule for

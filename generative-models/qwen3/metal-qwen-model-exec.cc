@@ -488,6 +488,9 @@ MetalQwenModelExec::query_extension(std::string_view id) noexcept
   if (id == context_io::kExtensionId) {
     return static_cast<ContextIoExt*>(this);
   }
+  if (id == prefill_progress::kExtensionId) {
+    return static_cast<PrefillProgressExt*>(this);
+  }
   return ModelExec::query_extension(id);
 }
 

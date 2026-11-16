@@ -1117,6 +1117,12 @@ public:
   // extra prefill cost). DEFAULT OFF -- a stage opts in (text-chat) or leaves
   // it off (realtime-vqa). VPIPE_MTP_NO_SEED hard-disables regardless.
   void set_mtp_prefix_seed(bool on) noexcept { _mtp_seed_enabled = on; }
+  // Told after each piece of a prefill read in pieces (prefill-
+  // progress.h): the tokens read so far of the call's. Empty: none.
+  void set_prefill_progress(std::function<void(int, int)> fn)
+  {
+    _prefill_progress = std::move(fn);
+  }
   bool mtp_prefix_seed() const noexcept { return _mtp_seed_enabled; }
 
   // M5 matrix-core fast-path engagement -- for perf-GUARD tests, NOT timing.
@@ -2263,6 +2269,7 @@ private:
   // Last-position pre-final-norm hidden of the most recent prefill / verify
   // forward [H] -- the main-model hidden the MTP drafter consumes.
   metal_compute::SharedBuffer _mtp_h;
+  std::function<void(int, int)> _prefill_progress;
   // MTP prefix seed (opt-in, _mtp_seed_enabled): the last text prefill's
   // per-position POST-final-norm main hiddens [s, H] (f16) + its token ids, so
   // mtp_decode can populate the MTP head's self-attention KV with the prompt

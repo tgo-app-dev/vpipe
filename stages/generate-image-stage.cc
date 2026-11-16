@@ -1,5 +1,6 @@
 #include "stages/generate-image-stage.h"
 #include "generative-models/gen-input.h"
+#include "common/flex-bag.h"
 #include "common/beat-keys.h"
 
 #include "stages/model-memory-host.h"
@@ -58,6 +59,38 @@ namespace vpipe {
 
 namespace {
 
+// A picture's hold on a DiT's stop and, for a RANK of a split one, its
+// channel (tensor-parallel.h), let go on EVERY way out: a generation can
+// throw (Session::error does), a split DiT's channel polls the stop on
+// threads of its own, and `ctx`, which the stop reads, is gone once
+// process() returns. The generation ends FIRST, so a channel still
+// waiting on a peer sees the stop. end() lets both go on the ordinary
+// way out, as soon as the denoise returns. Holds the stage's member, not
+// the model: whatever the stage holds then is let go.
+template <class Dit>
+struct DitPictureScope {
+  std::shared_ptr<Dit>* dit = nullptr;
+  void end()
+  {
+    if (dit != nullptr && *dit) {
+      (*dit)->end_tp_generation();
+      (*dit)->set_stream_stop({});
+    }
+    dit = nullptr;
+  }
+  ~DitPictureScope() { end(); }
+};
+
+// A rank's share in a warm DiT's key: a warm whole model is not a rank,
+// nor a rank of another share.
+std::string
+tp_warm_key(const genai::TpShare& t)
+{
+  return t.active() ? fmt("tp {}/{} heads {}-{} ffn {}-{}", t.rank, t.ranks,
+                          t.head0, t.head1, t.ffn0, t.ffn1)()
+                    : std::string();
+}
+
 // The Qwen-Image-Edit DiT runs bf16 (its residual stream exceeds f16's 65504);
 // its packed-latent + velocity buffers are raw bf16, not _Float16.
 inline std::uint16_t
@@ -110,6 +143,29 @@ constexpr std::string_view kLoraMoreDoc =
     "is still read once. The same key on the family's model-config beat "
     "OVERRIDES this";
 const ConfigKey kAttrs[] = {
+  {.key = "tensor_parallel", .type = ConfigType::Object, .required = false,
+   .doc = "this stage as one RANK of a FLUX.3, Qwen-Image-2.1, Krea-2, "
+          "MOSS-Image, Z-Image or Fibo 2.0 DiT split across machines "
+          "(generative-models/tensor-parallel.h): {rank, ranks, heads: "
+          "[first, end], ffn: [first, end] -- unsaid, an even split -- "
+          "transport: the name a plugin registered its transport under, "
+          "params: that transport's own, passed through; min_band_rows: "
+          "given -- alike to every rank, and only to a peer whose libvpipe "
+          "lists tensor-parallel-flux3/2, -qwen-image-21/2, -krea2/1, "
+          "-moss-image/1, -z-image/1 or -fibo2/1 -- each block's rows are "
+          "cut into bands of at least that many, each band's partial "
+          "crossing under the next band's work; unsaid, whole blocks}. The "
+          "rank holds its share of every block's projections -- streamed, "
+          "then kept as the box allows, only its rows read where a share "
+          "is a weight's rows -- and adds the other ranks' partial sums "
+          "through the transport: once a block (a band) for FLUX.3, twice "
+          "for Qwen-Image-2.1, Krea-2 (whose shares are whole groups of "
+          "the query heads one kv head serves: four), MOSS-Image (whose two "
+          "text blocks run whole) and Z-Image, and three times in Fibo "
+          "2.0's injection blocks (their cross-attention a third partial). "
+          "Dense or affine weights (an affine pack's columns cut in whole "
+          "groups of 64); no ANE, no runtime LoRA. Every other family "
+          "refuses it"},
   {.key = "autotune", .type = ConfigType::Bool,
    .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
           "routes and tiles, a VAE's conv route and mid-attention, a "
@@ -1971,7 +2027,8 @@ GenerateImageStage::dit_resident_bytes_() const
   if (_flux3_dit) { return (std::size_t)_flux3_dit->resident_bytes(); }
   if (_moss_dit) { return (std::size_t)_moss_dit->resident_bytes(); }
   if (_fibo2_dit) { return (std::size_t)_fibo2_dit->resident_bytes(); }
-  // Krea-2, FLUX.2, Boogu and Qwen-Image-Edit keep no total of their own:
+  // A whole Krea-2, FLUX.2, Boogu and Qwen-Image-Edit are asked for no
+  // total of their own:
   // what their set CACHED (the trunk, and every block when preloaded --
   // held int8 layouts included, which are derived entries) plus what
   // residency PROMOTED (the model's own buffers) plus the slot pairs
@@ -1988,6 +2045,14 @@ GenerateImageStage::dit_resident_bytes_() const
     const std::size_t cached = ws ? ws->stats().bytes : 0;
     return cached + promoted + slots;
   };
+  // A Krea-2 RANK answers for itself: it reads its share uncached into
+  // buffers of its own, so its set holds the trunk alone, and a
+  // preloaded rank promotes nothing -- the sum above read it at about its
+  // trunk while it held every block's share. resident_bytes() is the
+  // figure its claim books (tp_held_bytes).
+  if (_dit && _dit->config().tp.active()) {
+    return (std::size_t)_dit->resident_bytes();
+  }
   if (_dit) {
     return cached_plus(_krea2_dit_dir, _dit->resident_block_bytes(),
                        _dit->slot_bytes());
@@ -2294,7 +2359,14 @@ GenerateImageStage::declare_memory() const
     held_by_family = true;
     enc_answered = family_claims_dir_(*fam, root, enc);
   }
-  if (!held_by_family) {
+  std::size_t tp_floor = 0;
+  const std::size_t tp_held =
+      held_by_family ? 0 : tp_held_bytes_(dit, &tp_floor);
+  if (tp_held > 0) {
+    // A RANK holds its share: every block's kept, at the most; the trunk
+    // and two blocks' at the least (declare_resources).
+    m.hold(dit, tp_held, tp_floor);
+  } else if (!held_by_family) {
     // A w4 pack's int8 layout: held where the box has room (the
     // preload, at its largest), a scratch where it streams (the floor).
     const std::size_t floor = dit_floor_bytes_(root, dit) +
@@ -2407,10 +2479,25 @@ GenerateImageStage::declare_resources() const
   // is booked with the activations below -- not in the weights' floor. A
   // dense checkpoint's slots carry their int8 layout too, and that IS a
   // holding: int8_slot_bytes_.)
+  //
+  // A RANK of a split DiT (`tensor_parallel`) streams its SHARE as the
+  // whole model streams the checkpoint: booked at the share with every
+  // block kept (held), streamable to its floor -- the trunk and two
+  // blocks' shares. Claimed as the whole checkpoint, the ledger that
+  // refuses graphs, plan_streaming's verdict and every peer sizing
+  // against this one read the checkpoint for a rank that holds a share.
+  const genai::TpShare tp_share = plan_tp_share_(dit);
+  std::size_t tp_floor = 0;
+  const std::size_t tp_held = tp_held_bytes_(dit, &tp_floor);
   const std::size_t floor =
-      dit_floor_bytes_(root, dit) + int8_slot_bytes_(dit);
+      tp_held > 0 ? tp_floor
+                  : dit_floor_bytes_(root, dit) + int8_slot_bytes_(dit);
   std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
       dit, floor)};
+  if (tp_held > 0) {
+    bag::set_integer(out.back().extra, model_memory::kClaimHeldBytes,
+                     (std::int64_t)tp_held);
+  }
   for (auto& c : model_memory::weight_claims({enc})) {
     out.push_back(std::move(c));
   }
@@ -2464,8 +2551,9 @@ GenerateImageStage::declare_resources() const
   // A QUANTIZED checkpoint claims the same unit: its feed-forward is
   // dequantized into the module's fp16 inputs per block, so the module
   // costs what it costs a dense one.
+  // (Not a rank's: it runs no ANE tier.)
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
-      t2i_family_(dit) == "krea2") {
+      t2i_family_(dit) == "krea2" && !tp_share.active()) {
     genai::MetalKrea2Transformer::Config kc;
     kc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
     for (auto& c : model_memory::coreml_claims(
@@ -2485,8 +2573,10 @@ GenerateImageStage::declare_resources() const
   // single fixed unit, granted or not. Claimed only for the family that
   // calls it -- booking bytes nothing allocates is the same lie the
   // other way round.
+  // (A rank runs no ANE tier -- load_qwen_image21_dit_ turns it off --
+  // so it claims no module.)
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
-      t2i_family_(dit) == "qwen-image-21") {
+      t2i_family_(dit) == "qwen-image-21" && !tp_share.active()) {
     genai::MetalQwenImage21Transformer::Config qc;
     (void)genai::MetalQwenImage21Transformer::Config::read_dims(dit, &qc);
     qc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
@@ -2504,8 +2594,9 @@ GenerateImageStage::declare_resources() const
   // the refiners run a shorter sequence than the module is sized for.
   // Claimed in UNITS because CoreML holds those bytes and no other
   // ledger in this process can see them.
+  // (A rank runs no ANE tier, as Qwen-Image-2.1's.)
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
-      t2i_family_(dit) == "z-image") {
+      t2i_family_(dit) == "z-image" && !tp_share.active()) {
     genai::MetalZImageTransformer::Config zc;
     (void)genai::MetalZImageTransformer::Config::read_dims(dit, &zc);
     zc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
@@ -2530,9 +2621,11 @@ GenerateImageStage::declare_resources() const
     std::size_t bytes = model_memory::kUnknownArena;
     if (_width > 0 && _height > 0 &&
         genai::MetalFlux3Transformer::Config::read_dims(dit, &fc)) {
-      // The attention tiers allocate their own scratch beside the planes.
+      // The attention tiers allocate their own scratch beside the planes;
+      // a rank's are its share's, its exchange buffers beside them.
       fc.sage = _sage;
       fc.sol = _sol;
+      fc.tp = tp_share;
       bytes = genai::MetalFlux3Transformer::forward_scratch_bytes(
           fc, genai::MetalFlux3Transformer::ane_plan_seq(_width, _height));
     }
@@ -2570,6 +2663,8 @@ GenerateImageStage::declare_resources() const
       bc.i8_tier = _i8_tier;
       bc.sage = _sage;
       bc.sol = _sol;
+      // A rank's widths, its exchange buffers beside them.
+      bc.tp = tp_share;
       auto* mcm = session() != nullptr
                       ? session()->services()->metal_compute()
                       : nullptr;
@@ -2608,6 +2703,8 @@ GenerateImageStage::declare_resources() const
       mc.i8_tier = _i8_tier;
       mc.sage = _sage;
       mc.sol = _sol;
+      // A rank's widths, its exchange buffers beside them.
+      mc.tp = tp_share;
       auto* mcm = session() != nullptr
                       ? session()->services()->metal_compute()
                       : nullptr;
@@ -2645,6 +2742,8 @@ GenerateImageStage::declare_resources() const
         c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
         c.autotune = _autotune;
         c.sage = _sage; c.sol = _sol;
+        // A rank's widths, its exchange buffers beside them.
+        c.tp = tp_share;
         // An FP8 / NVFP4 weight is widened per GEMM on any GPU, into
         // the scratch a pack's stand-in takes.
         bytes = genai::MetalQwenImage21Transformer::forward_scratch_bytes(
@@ -2657,6 +2756,8 @@ GenerateImageStage::declare_resources() const
         c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
         c.autotune = _autotune;
         c.sage = _sage; c.sol = _sol;
+        // A rank's widths, its exchange buffers beside them.
+        c.tp = tp_share;
         bytes = genai::MetalZImageTransformer::forward_scratch_bytes(
             c, img, 512, bits > 0, mx);
       }
@@ -2665,6 +2766,8 @@ GenerateImageStage::declare_resources() const
       c.i8_gemm = _i8_gemm; c.i8_tier = _i8_tier;
       c.autotune = _autotune;
       c.sage = _sage; c.sol = _sol;
+      // A rank's widths, its exchange buffers beside them.
+      c.tp = tp_share;
       // The dequant scratch: an FP8 / NVFP4 weight widened on any GPU,
       // a pack's on the matrix-core route.
       bytes = genai::MetalKrea2Transformer::forward_scratch_bytes(
@@ -2696,8 +2799,9 @@ GenerateImageStage::declare_resources() const
   }
   // MOSS-Image's tiers: the main blocks' SITU feed-forward and, beside it,
   // q / k / v as one matmul -- fixed modules, one unit, in the denoise.
+  // (Not a rank's: it runs none.)
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
-      t2i_family_(dit) == "moss-image") {
+      t2i_family_(dit) == "moss-image" && !tp_share.active()) {
     genai::MetalMossImageTransformer::Config mc;
     (void)genai::MetalMossImageTransformer::Config::read_dims(dit, &mc);
     mc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
@@ -2713,7 +2817,7 @@ GenerateImageStage::declare_resources() const
   // Fibo 2.0's tiers are Z-Image's: the main stack's feed-forward and,
   // with ane_qkv, its q/k/v -- a module each.
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
-      t2i_family_(dit) == "fibo2") {
+      t2i_family_(dit) == "fibo2" && !tp_share.active()) {
     genai::MetalFibo2Transformer::Config bc;
     (void)genai::MetalFibo2Transformer::Config::read_dims(dit, &bc);
     bc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
@@ -2729,9 +2833,9 @@ GenerateImageStage::declare_resources() const
     }
   }
   // FLUX.3's tier is the joint blocks' feed-forward: ONE runtime-weight
-  // module, one unit, in the denoise phase.
+  // module, one unit, in the denoise phase. (Not a rank's: it runs none.)
   if (genai::accel::flag(&_accel, genai::accel::kAneFfn) &&
-      t2i_family_(dit) == "flux3") {
+      t2i_family_(dit) == "flux3" && !tp_share.active()) {
     genai::MetalFlux3Transformer::Config fc;
     (void)genai::MetalFlux3Transformer::Config::read_dims(dit, &fc);
     for (auto& c : model_memory::coreml_claims(
@@ -3213,6 +3317,25 @@ GenerateImageStage::ensure_loaded_()
                          genai::flux3::bfl_root_layout_message(root)));
     return;
   }
+  // A RANK of a split DiT: FLUX.3's, Qwen-Image-2.1's, Krea-2's,
+  // MOSS-Image's, Z-Image's or Fibo 2.0's (its share read in the
+  // family's branch below, against the checkpoint's widths).
+  _tp_cfg = FlexData();
+  _tp_share = genai::TpShare{};
+  if (this->config().is_object() &&
+      this->config().as_object().contains("tensor_parallel")) {
+    _tp_cfg = this->config().as_object().at("tensor_parallel");
+    if (_family != "flux3" && _family != "qwen-image-21" &&
+        _family != "krea2" && _family != "moss-image" &&
+        _family != "z-image" && _family != "fibo2") {
+      session()->error(fmt(
+          "GenerateImageStage('{}'): tensor_parallel: the {} family is "
+          "not split -- FLUX.3's, Qwen-Image-2.1's, Krea-2's, "
+          "MOSS-Image's, Z-Image's and Fibo 2.0's alone; inert",
+          this->id(), _family));
+      return;
+    }
+  }
   if (_plugin_family == nullptr && _family == "krea2") {
     std::string vwhy;
     genai::MetalVosrTransformer::Config vc;
@@ -3225,6 +3348,13 @@ GenerateImageStage::ensure_loaded_()
       _vosr_dir = _dit_dir.empty()
           ? genai::MetalVosrTransformer::weights_path(root)
           : dit_dir;
+      // Read as Krea-2 until here, so the bag passed the check above.
+      if (_tp_cfg.is_object()) {
+        session()->error(fmt(
+            "GenerateImageStage('{}'): tensor_parallel: VOSR is not "
+            "split; inert", this->id()));
+        return;
+      }
     }
   }
   // NO CONFIG AND NO CLAIM: `_family` above is the fall-through, not a
@@ -3603,6 +3733,20 @@ GenerateImageStage::ensure_loaded_()
     if (const char* e = std::getenv("VPIPE_QWEN_IMAGE21_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    // A RANK streams its SHARE, then keeps it, as the whole model streams
+    // its blocks; the plan above weighed the share (its claim's held
+    // bytes), so `bounded` is the share's verdict.
+    if (_tp_cfg.is_object()) {
+      genai::MetalQwenImage21Transformer::Config qc;
+      if (!genai::MetalQwenImage21Transformer::Config::read_dims(dit_dir,
+                                                                 &qc)) {
+        session()->error(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                             "no Qwen-Image-2.1 config to read the widths "
+                             "from; inert", this->id()));
+        return;
+      }
+      if (!take_tp_share_(qc.n_heads, qc.hidden * qc.mlp_ratio)) { return; }
+    }
     const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Qwen-Image-2.1 footprint {} GB (others {} "
@@ -3676,6 +3820,19 @@ GenerateImageStage::ensure_loaded_()
     if (const char* e = std::getenv("VPIPE_Z_IMAGE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    // A RANK streams its SHARE, then keeps it, as the whole model streams
+    // its blocks; the plan above weighed the share (its claim's held
+    // bytes), so `bounded` is the share's verdict.
+    if (_tp_cfg.is_object()) {
+      genai::MetalZImageTransformer::Config zc;
+      if (!genai::MetalZImageTransformer::Config::read_dims(dit_dir, &zc)) {
+        session()->error(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                             "no Z-Image config to read the widths from; "
+                             "inert", this->id()));
+        return;
+      }
+      if (!take_tp_share_(zc.n_heads, zc.ffn_inner)) { return; }
+    }
     const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Z-Image footprint {} GB (others {} GB) + "
@@ -3740,6 +3897,19 @@ GenerateImageStage::ensure_loaded_()
     bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_FLUX3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
+    }
+    // A RANK streams its SHARE, then keeps it, as the whole model streams
+    // its blocks; the plan above weighed the share (its claim's held
+    // bytes), so `bounded` is the share's verdict.
+    if (_tp_cfg.is_object()) {
+      genai::MetalFlux3Transformer::Config fc;
+      if (!genai::MetalFlux3Transformer::Config::read_dims(dit_dir, &fc)) {
+        session()->error(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                             "no FLUX.3 config to read the widths from; "
+                             "inert", this->id()));
+        return;
+      }
+      if (!take_tp_share_(fc.n_heads, fc.mlp_hidden)) { return; }
     }
     const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
@@ -3808,6 +3978,17 @@ GenerateImageStage::ensure_loaded_()
     if (const char* e = std::getenv("VPIPE_FIBO2_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    // A RANK streams its SHARE, then keeps it (Z-Image's).
+    if (_tp_cfg.is_object()) {
+      genai::MetalFibo2Transformer::Config bc;
+      if (!genai::MetalFibo2Transformer::Config::read_dims(dit_dir, &bc)) {
+        session()->error(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                             "no Fibo 2.0 config to read the widths from; "
+                             "inert", this->id()));
+        return;
+      }
+      if (!take_tp_share_(bc.n_heads, bc.ffn_inner)) { return; }
+    }
     const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
         "GenerateImageStage('{}'): Fibo 2.0 footprint {} GB (others {} GB) "
@@ -3872,6 +4053,20 @@ GenerateImageStage::ensure_loaded_()
     bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_MOSS_IMAGE_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
+    }
+    // A RANK streams its SHARE, then keeps it, as the whole model streams
+    // its blocks; the plan above weighed the share (its claim's held
+    // bytes), so `bounded` is the share's verdict.
+    if (_tp_cfg.is_object()) {
+      genai::MetalMossImageTransformer::Config mc;
+      if (!genai::MetalMossImageTransformer::Config::read_dims(dit_dir,
+                                                              &mc)) {
+        session()->error(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                             "no MOSS-Image config to read the widths "
+                             "from; inert", this->id()));
+        return;
+      }
+      if (!take_tp_share_(mc.n_heads, mc.ffn_inner)) { return; }
     }
     const bool bounded = plan.stream && stream_blocks;
     session()->log_debug(fmt(
@@ -4029,12 +4224,21 @@ GenerateImageStage::ensure_loaded_()
     kcfg.i8_hold_w4 = _i8_hold_w4;
     kcfg.sage = _sage;
     kcfg.sol  = _sol;
-    apply_ane_(kcfg);
+    // A RANK streams its SHARE, then keeps it, as the whole model streams
+    // its blocks; the plan weighed the share (its claim's held bytes).
+    // Its widths are Turbo's, as every Krea-2 Config's here.
+    if (_tp_cfg.is_object() && !take_tp_share_(kcfg.n_heads, kcfg.ffn)) {
+      return;
+    }
+    kcfg.tp = _tp_share;
+    // The share reads the checkpoint's widths: the ANE's modules do not.
+    if (!kcfg.tp.active()) { apply_ane_(kcfg); }
     {
       using Dit = genai::MetalKrea2Transformer;
       const auto loras = lora_specs_<Dit::LoraSpec>();
       _dit = take_warm_dit_<Dit>(kWarmKrea2, dit_dir,
-                                 warm_key_(kcfg, stream_blocks, loras),
+                                 warm_key_(kcfg, stream_blocks, loras,
+                                           tp_warm_key(kcfg.tp)),
                                  "Krea-2");
       if (!_dit) {
         _dit = Dit::load(weight_set_(dit_dir), mc, kcfg, stream_blocks,
@@ -4356,9 +4560,17 @@ GenerateImageStage::load_qwen_image21_dit_()
       (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
+  cfg.tp = _tp_share;
+  if (cfg.tp.active()) {
+    // The share reads the checkpoint's widths: the ANE's modules do not.
+    cfg.ane_ffn = cfg.ane_qkv = cfg.ane_int8 = false;
+  }
   const auto loras = lora_specs_<Dit::LoraSpec>();
+  // A rank's share in the key: a warm whole model is not a rank, nor a
+  // rank of another share.
+  const std::string tp_key = tp_warm_key(cfg.tp);
   _qi21_dit = take_warm_dit_<Dit>(kWarmQi21, _qi21_dit_dir,
-                                  warm_key_(cfg, _qi21_stream, loras),
+                                  warm_key_(cfg, _qi21_stream, loras, tp_key),
                                   "Qwen-Image-2.1");
   if (_qi21_dit) { return true; }
   _qi21_dit = genai::MetalQwenImage21Transformer::load(
@@ -4433,9 +4645,17 @@ GenerateImageStage::load_z_image_dit_()
       (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
+  cfg.tp = _tp_share;
+  if (cfg.tp.active()) {
+    // The share reads the checkpoint's widths: the ANE's modules do not.
+    cfg.ane_ffn = cfg.ane_qkv = cfg.ane_int8 = false;
+  }
   const auto loras = lora_specs_<Dit::LoraSpec>();
+  // A rank's share in the key: a warm whole model is not a rank, nor a
+  // rank of another share.
+  const std::string tp_key = tp_warm_key(cfg.tp);
   _zi_dit = take_warm_dit_<Dit>(kWarmZImage, _zi_dit_dir,
-                                warm_key_(cfg, _zi_stream, loras),
+                                warm_key_(cfg, _zi_stream, loras, tp_key),
                                 "Z-Image");
   if (_zi_dit) { return true; }
   _zi_dit = Dit::load(weight_set_(_zi_dit_dir), mc, cfg, _zi_stream, loras);
@@ -4480,6 +4700,210 @@ GenerateImageStage::free_z_image_dit_for_decode_(int gen_w, int gen_h)
 }
 
 bool
+GenerateImageStage::take_tp_share_(int n_heads, int n_ffn)
+{
+  std::string terr;
+  auto o = _tp_cfg.as_object();
+  const std::string tname = o.contains("transport")
+                                ? std::string(o.at("transport").as_string(""))
+                                : std::string();
+  if (!genai::TpShare::from_flex(_tp_cfg, n_heads, n_ffn, &_tp_share,
+                                 &terr)) {
+  } else if (genai::find_tp_transport(tname) == nullptr) {
+    terr = fmt("no transport named '{}' -- a plugin registers it", tname)();
+  }
+  if (!terr.empty()) {
+    session()->error(fmt("GenerateImageStage('{}'): tensor_parallel: {}; "
+                         "inert", this->id(), terr));
+    return false;
+  }
+  if (_tp_share.active()) {
+    session()->info(fmt(
+        "GenerateImageStage('{}'): rank {} of {}: heads [{}, {}) of {}, "
+        "feed-forward rows [{}, {}) of {}, through '{}' (a channel each "
+        "picture)", this->id(), _tp_share.rank, _tp_share.ranks,
+        _tp_share.head0, _tp_share.head1, _tp_share.n_heads, _tp_share.ffn0,
+        _tp_share.ffn1, _tp_share.n_ffn, tname));
+  }
+  return true;
+}
+
+genai::TpShare
+GenerateImageStage::plan_tp_share_(const std::string& dit) const
+{
+  genai::TpShare sh;
+  if (!this->config().is_object() ||
+      !this->config().as_object().contains("tensor_parallel")) {
+    return sh;
+  }
+  FlexData cfg = this->config();             // as_object() is a view
+  const FlexData bag = cfg.as_object().at("tensor_parallel");
+  if (!bag.is_object()) { return sh; }
+  const std::string fam = t2i_family_(dit);
+  int heads = 0, ffn = 0;
+  if (fam == "flux3") {
+    genai::MetalFlux3Transformer::Config c;
+    if (!genai::MetalFlux3Transformer::Config::read_dims(dit, &c)) {
+      return sh;
+    }
+    heads = c.n_heads;
+    ffn = c.mlp_hidden;
+  } else if (fam == "qwen-image-21") {
+    genai::MetalQwenImage21Transformer::Config c;
+    if (!genai::MetalQwenImage21Transformer::Config::read_dims(dit, &c)) {
+      return sh;
+    }
+    heads = c.n_heads;
+    ffn = c.hidden * c.mlp_ratio;
+  } else if (fam == "krea2") {
+    const genai::MetalKrea2Transformer::Config c;   // Turbo's dims
+    heads = c.n_heads;
+    ffn = c.ffn;
+  } else if (fam == "moss-image") {
+    genai::MetalMossImageTransformer::Config c;
+    if (!genai::MetalMossImageTransformer::Config::read_dims(dit, &c)) {
+      return sh;
+    }
+    heads = c.n_heads;
+    ffn = c.ffn_inner;
+  } else if (fam == "z-image") {
+    genai::MetalZImageTransformer::Config c;
+    if (!genai::MetalZImageTransformer::Config::read_dims(dit, &c)) {
+      return sh;
+    }
+    heads = c.n_heads;
+    ffn = c.ffn_inner;
+  } else if (fam == "fibo2") {
+    genai::MetalFibo2Transformer::Config c;
+    if (!genai::MetalFibo2Transformer::Config::read_dims(dit, &c)) {
+      return sh;
+    }
+    heads = c.n_heads;
+    ffn = c.ffn_inner;
+  } else {
+    return sh;
+  }
+  if (!genai::TpShare::from_flex(bag, heads, ffn, &sh, nullptr)) {
+    return genai::TpShare{};
+  }
+  return sh;
+}
+
+std::size_t
+GenerateImageStage::tp_held_bytes_(const std::string& dit,
+                                   std::size_t* floor) const
+{
+  if (floor != nullptr) { *floor = 0; }
+  const genai::TpShare sh = plan_tp_share_(dit);
+  if (!sh.active()) { return 0; }
+  if (t2i_family_(dit) == "flux3") {
+    genai::MetalFlux3Transformer::Config c;
+    if (!genai::MetalFlux3Transformer::Config::read_dims(dit, &c)) {
+      return 0;
+    }
+    c.tp = sh;
+    return genai::MetalFlux3Transformer::tp_held_bytes(dit, c, floor);
+  }
+  auto* mc = session() != nullptr ? session()->services()->metal_compute()
+                                  : nullptr;
+  if (t2i_family_(dit) == "krea2") {
+    genai::MetalKrea2Transformer::Config c;   // Turbo's dims
+    c.tp = sh;
+    // Its share in the layout its tier holds, as for Qwen-Image-2.1.
+    c.i8_gemm = _i8_gemm;
+    c.i8_tier = _i8_tier;
+    c.i8_hold_w4 = _i8_hold_decided && _i8_hold_w4;
+    return genai::MetalKrea2Transformer::tp_held_bytes(dit, c, mc, floor);
+  }
+  if (t2i_family_(dit) == "moss-image") {
+    genai::MetalMossImageTransformer::Config c;
+    if (!genai::MetalMossImageTransformer::Config::read_dims(dit, &c)) {
+      return 0;
+    }
+    c.tp = sh;
+    // Its share in the layout its tier holds: the same tier and the same
+    // w4 decision the load is given (a pack until one is taken).
+    c.i8_gemm = _i8_gemm;
+    c.i8_tier = _i8_tier;
+    c.i8_hold_w4 = _i8_hold_decided && _i8_hold_w4;
+    return genai::MetalMossImageTransformer::tp_held_bytes(dit, c, mc,
+                                                           floor);
+  }
+  // Z-Image's and Fibo 2.0's shares in the layout their tier holds, as
+  // Qwen-Image-2.1's below.
+  if (t2i_family_(dit) == "z-image") {
+    genai::MetalZImageTransformer::Config c;
+    if (!genai::MetalZImageTransformer::Config::read_dims(dit, &c)) {
+      return 0;
+    }
+    c.tp = sh;
+    c.i8_gemm = _i8_gemm;
+    c.i8_tier = _i8_tier;
+    c.i8_hold_w4 = _i8_hold_decided && _i8_hold_w4;
+    return genai::MetalZImageTransformer::tp_held_bytes(dit, c, mc, floor);
+  }
+  if (t2i_family_(dit) == "fibo2") {
+    genai::MetalFibo2Transformer::Config c;
+    if (!genai::MetalFibo2Transformer::Config::read_dims(dit, &c)) {
+      return 0;
+    }
+    c.tp = sh;
+    c.i8_gemm = _i8_gemm;
+    c.i8_tier = _i8_tier;
+    c.i8_hold_w4 = _i8_hold_decided && _i8_hold_w4;
+    return genai::MetalFibo2Transformer::tp_held_bytes(dit, c, mc, floor);
+  }
+  genai::MetalQwenImage21Transformer::Config c;
+  if (!genai::MetalQwenImage21Transformer::Config::read_dims(dit, &c)) {
+    return 0;
+  }
+  c.tp = sh;
+  // Its share in the layout its tier holds: the same tier and the same
+  // w4 decision the load is given (a pack until one is taken).
+  c.i8_gemm = _i8_gemm;
+  c.i8_tier = _i8_tier;
+  c.i8_hold_w4 = _i8_hold_decided && _i8_hold_w4;
+  return genai::MetalQwenImage21Transformer::tp_held_bytes(dit, c, mc,
+                                                           floor);
+}
+
+std::shared_ptr<genai::TpChannel>
+GenerateImageStage::open_tp_channel_(std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = why; }
+    return std::shared_ptr<genai::TpChannel>();
+  };
+  if (!_tp_share.active() || !_tp_cfg.is_object()) {
+    return fail("this stage is not a rank");
+  }
+  auto o = _tp_cfg.as_object();
+  const std::string tname = o.contains("transport")
+                                ? std::string(o.at("transport").as_string(""))
+                                : std::string();
+  genai::TpTransport* tr = genai::find_tp_transport(tname);
+  if (tr == nullptr) {
+    return fail(fmt("no transport named '{}' -- a plugin registers it",
+                    tname)());
+  }
+  const FlexData params = o.contains("params") ? o.at("params") : FlexData();
+  // The transport is a plugin's: an exception is its refusal.
+  std::string terr;
+  std::shared_ptr<genai::TpChannel> ch;
+  try {
+    ch = tr->open(params, _tp_share, &terr);
+  } catch (const std::exception& e) {
+    ch.reset();
+    terr = std::string("it threw: ") + e.what();
+  } catch (...) {
+    ch.reset();
+    terr = "it threw";
+  }
+  if (!ch) { return fail(fmt("transport '{}': {}", tname, terr)()); }
+  return ch;
+}
+
+bool
 GenerateImageStage::load_flux3_dit_()
 {
   auto* mc = session() ? session()->services()->metal_compute() : nullptr;
@@ -4514,10 +4938,18 @@ GenerateImageStage::load_flux3_dit_()
       (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
+  cfg.tp = _tp_share;
+  if (cfg.tp.active()) {
+    // The share reads the checkpoint's widths: the ANE's modules do not.
+    cfg.ane_ffn = cfg.ane_qkv = cfg.ane_int8 = false;
+  }
   const auto loras = lora_specs_<Dit::LoraSpec>();
-  _flux3_dit = take_warm_dit_<Dit>(kWarmFlux3, _flux3_dit_dir,
-                                   warm_key_(cfg, _flux3_stream, loras),
-                                   "FLUX.3");
+  // A rank's share in the key: a warm whole model is not a rank, nor a
+  // rank of another share.
+  const std::string tp_key = tp_warm_key(cfg.tp);
+  _flux3_dit = take_warm_dit_<Dit>(
+      kWarmFlux3, _flux3_dit_dir,
+      warm_key_(cfg, _flux3_stream, loras, tp_key), "FLUX.3");
   if (_flux3_dit) { return true; }
   _flux3_dit = Dit::load(weight_set_(_flux3_dit_dir), mc, cfg, _flux3_stream,
                          loras);
@@ -4592,9 +5024,17 @@ GenerateImageStage::load_fibo2_dit_()
       (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
+  cfg.tp = _tp_share;
+  if (cfg.tp.active()) {
+    // The share reads the checkpoint's widths: the ANE's modules do not.
+    cfg.ane_ffn = cfg.ane_qkv = cfg.ane_int8 = false;
+  }
   const auto loras = lora_specs_<Dit::LoraSpec>();
+  // A rank's share in the key, as Z-Image's.
+  const std::string tp_key = tp_warm_key(cfg.tp);
   _fibo2_dit = take_warm_dit_<Dit>(kWarmFibo2, _fibo2_dit_dir,
-                                   warm_key_(cfg, _fibo2_stream, loras),
+                                   warm_key_(cfg, _fibo2_stream, loras,
+                                             tp_key),
                                    "Fibo 2.0");
   if (_fibo2_dit) { return true; }
   _fibo2_dit = Dit::load(weight_set_(_fibo2_dit_dir), mc, cfg, _fibo2_stream,
@@ -4669,9 +5109,17 @@ GenerateImageStage::load_moss_image_dit_()
       (float)genai::accel::real(&_accel, genai::accel::kAneRows, 0.0);
   cfg.ane_layers = (int)genai::accel::integer(&_accel,
                                               genai::accel::kAneLayers, 0);
+  cfg.tp = _tp_share;
+  if (cfg.tp.active()) {
+    // The share reads the checkpoint's widths: the ANE's modules do not.
+    cfg.ane_ffn = cfg.ane_qkv = cfg.ane_int8 = false;
+  }
   const auto loras = lora_specs_<Dit::LoraSpec>();
+  // A rank's share in the key: a warm whole model is not a rank, nor a
+  // rank of another share.
+  const std::string tp_key = tp_warm_key(cfg.tp);
   _moss_dit = take_warm_dit_<Dit>(kWarmMoss, _moss_dit_dir,
-                                  warm_key_(cfg, _moss_stream, loras),
+                                  warm_key_(cfg, _moss_stream, loras, tp_key),
                                   "MOSS-Image");
   if (_moss_dit) { return true; }
   _moss_dit = Dit::load(weight_set_(_moss_dit_dir), mc, cfg, _moss_stream,
@@ -4891,14 +5339,17 @@ GenerateImageStage::load_krea2_dit_()
   kcfg.i8_tier = _i8_tier;
   kcfg.i8_hold_w4 = _i8_hold_w4;
   kcfg.sage = _sage;
-  apply_ane_(kcfg);
+  // The share the first load took, and no ANE beside it.
+  kcfg.tp = _tp_share;
+  if (!kcfg.tp.active()) { apply_ane_(kcfg); }
   // The streaming flag the first load used, and the adapter with it. A
   // reload that dropped either would come back preloaded, or un-adapted,
   // on the graph that asked for both.
   using Dit = genai::MetalKrea2Transformer;
   const auto loras = lora_specs_<Dit::LoraSpec>();
   _dit = take_warm_dit_<Dit>(kWarmKrea2, _krea2_dit_dir,
-                             warm_key_(kcfg, _krea2_stream, loras),
+                             warm_key_(kcfg, _krea2_stream, loras,
+                                       tp_warm_key(kcfg.tp)),
                              "Krea-2");
   if (!_dit) {
     _dit = Dit::load(weight_set_(_krea2_dit_dir), mc, kcfg, _krea2_stream,
@@ -8772,12 +9223,26 @@ GenerateImageStage::process(RuntimeContext& ctx)
     std::vector<RefLatent> qrefs;
     for (const RefLatent& r : _ref) { qrefs.push_back(r); }
     _qi21_dit->set_stream_stop(stopping);
+    DitPictureScope<genai::MetalQwenImage21Transformer> picture{&_qi21_dit};
+    // A RANK opens this picture's channel to the other ranks (it waits
+    // for them there, as the transport does) and a fresh exchange count.
+    if (_tp_share.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_qi21_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
     const std::vector<float> ql =
         generate_qwen_image21_(cond, n_real, cond_neg, n_real_neg, gen_h,
                                gen_w, qrefs, step_emitter({QZ, qlh, qlw}));
-    _qi21_dit->set_stream_stop({});
+    // The picture's link let go -- the stop still set -- before anything
+    // else: the peers learn it is over, and the next opens anew.
+    picture.end();
     if (ql.empty()) {
       session()->info(fmt(
           "GenerateImageStage('{}'): Qwen-Image-2.1 generation {}; dropping "
@@ -8815,12 +9280,26 @@ GenerateImageStage::process(RuntimeContext& ctx)
   if (_family == "z-image") {
     const int ZZ = _zi_dit->config().in_channels;
     _zi_dit->set_stream_stop(stopping);
+    DitPictureScope<genai::MetalZImageTransformer> picture{&_zi_dit};
+    // A RANK opens this picture's channel to the other ranks (it waits
+    // for them there, as the transport does) and a fresh exchange count.
+    if (_tp_share.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_zi_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
     const std::vector<float> zl =
         generate_z_image_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w,
                           step_emitter({ZZ, lh, lw}));
-    _zi_dit->set_stream_stop({});
+    // The picture's link let go -- the stop still set -- before anything
+    // else: the peers learn it is over, and the next opens anew.
+    picture.end();
     if (zl.empty()) {
       session()->info(fmt(
           "GenerateImageStage('{}'): Z-Image generation {}; dropping beat",
@@ -8885,6 +9364,17 @@ GenerateImageStage::process(RuntimeContext& ctx)
     std::vector<RefLatent> frefs;
     for (const RefLatent& r : _ref) { frefs.push_back(r); }
     _fibo2_dit->set_stream_stop(stopping);
+    DitPictureScope<genai::MetalFibo2Transformer> picture{&_fibo2_dit};
+    // A RANK opens this picture's channel to the other ranks, as Z-Image's.
+    if (_tp_share.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_fibo2_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
     const int lh = gen_h / 16, lw = gen_w / 16;
@@ -8892,7 +9382,7 @@ GenerateImageStage::process(RuntimeContext& ctx)
     const std::vector<float> fl = generate_fibo2_(
         cond, rows, rows_neg > 0 ? cond_neg : no_neg, rows_neg, gen_h, gen_w,
         frefs, init_ptr, step_emitter({PD, lh, lw}));
-    _fibo2_dit->set_stream_stop({});
+    picture.end();
     if (fl.empty()) {
       session()->info(fmt(
           "GenerateImageStage('{}'): Fibo 2.0 generation {}; dropping beat",
@@ -8924,13 +9414,27 @@ GenerateImageStage::process(RuntimeContext& ctx)
     std::vector<RefLatent> frefs;
     for (const RefLatent& r : _ref) { frefs.push_back(r); }
     _flux3_dit->set_stream_stop(stopping);
+    DitPictureScope<genai::MetalFlux3Transformer> picture{&_flux3_dit};
+    // A RANK opens this picture's channel to the other ranks (it waits
+    // for them there, as the transport does) and a fresh exchange count.
+    if (_tp_share.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_flux3_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
     const int lh3 = gen_h / 16, lw3 = gen_w / 16;
     const std::vector<float> fl =
         generate_flux3_(cond, n_real, gen_h, gen_w, frefs, init_ptr,
                         step_emitter({C3, lh3, lw3}));
-    _flux3_dit->set_stream_stop({});
+    // The picture's link let go -- the stop still set -- before anything
+    // else: the peers learn it is over, and the next opens anew.
+    picture.end();
     if (fl.empty()) {
       session()->info(fmt(
           "GenerateImageStage('{}'): FLUX.3 generation {}; dropping beat",
@@ -8963,13 +9467,29 @@ GenerateImageStage::process(RuntimeContext& ctx)
   if (_family == "moss-image") {
     const int CM = _moss_dit->config().latent_channels;
     _moss_dit->set_stream_stop(stopping);
+    DitPictureScope<genai::MetalMossImageTransformer> picture{&_moss_dit};
+    // A RANK opens this picture's channel to the other ranks (it waits
+    // for them there, as the transport does) and a fresh exchange count;
+    // every forward of the picture -- the positive, the negative, a
+    // skip-layer pass -- exchanges on it, both ranks in one order.
+    if (_tp_share.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_moss_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
                                          0.0, 0);
     const int lhm = gen_h / 16, lwm = gen_w / 16;
     const std::vector<float> ml =
         generate_moss_image_(cond, n_real, cond_neg, n_real_neg, gen_h,
                              gen_w, init_ptr, step_emitter({CM, lhm, lwm}));
-    _moss_dit->set_stream_stop({});
+    // The picture's link let go -- the stop still set -- before anything
+    // else: the peers learn it is over, and the next opens anew.
+    picture.end();
     if (ml.empty()) {
       session()->info(fmt(
           "GenerateImageStage('{}'): MOSS-Image generation {}; dropping beat",
@@ -9044,6 +9564,18 @@ GenerateImageStage::process(RuntimeContext& ctx)
     }
   }
   _dit->set_stream_stop(stopping);
+  DitPictureScope<genai::MetalKrea2Transformer> picture{&_dit};
+  // A RANK opens this picture's channel to the other ranks (it waits for
+  // them there, as the transport does) and a fresh exchange count.
+  if (_tp_share.active()) {
+    std::string terr;
+    std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+    if (!ch || !_dit->begin_tp_generation(std::move(ch), &terr)) {
+      session()->warn(fmt("GenerateImageStage('{}'): tensor_parallel: "
+                          "{}; skipping", this->id(), terr));
+      co_return;
+    }
+  }
   // Previews for THIS image, on oport2, ended when process() returns --
   // after the latent is written, so the last step's preview renders while
   // vae-decode is already working. Declines, loading nothing, when the
@@ -9053,7 +9585,9 @@ GenerateImageStage::process(RuntimeContext& ctx)
   const std::vector<float> out_latent =
       generate_(cond, n_real, cond_neg, n_real_neg, gen_h, gen_w, init_ptr,
                 latent_ptr, krefs, step_emitter({16, lh, lw}));
-  _dit->set_stream_stop({});
+  // The picture's link let go -- the stop still set -- before anything
+  // else: the peers learn it is over, and the next opens anew.
+  picture.end();
   if (out_latent.empty()) {
     session()->info(fmt(
         "GenerateImageStage('{}'): generation {}; dropping beat", this->id(),

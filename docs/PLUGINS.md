@@ -1559,13 +1559,21 @@ returns; and it calls `forget` on every buffer it handed first. Expect `open`
 again once that stage's last channel is gone, and let a peer's channel going
 fail an exchange still waiting for it.
 
-MiniMax H3 is the first family to run split (preloaded shares of dense or
-affine weights, its blocks in row bands, each band's exchanges under the next
-band's work; no ANE tier, VDN or TaoMate yet, and MotionCache off on a rank --
-each of its skips is judged from that rank's own sums). A rank takes runtime
-adapters -- bound at the checkpoint's widths, their factors then cut as the
-weights are: B's rows of q|k|v and fc1, A's columns of the out projection and
-fc2, so the ranks' deltas sum to the whole one -- and the int8 tiers past
+MiniMax H3 is the first family to run split (shares of dense or affine
+weights, its blocks in row bands, each band's exchanges under the next band's
+work; no VDN or TaoMate yet, and MotionCache off on a rank -- each of its skips
+is judged from that rank's own sums). A rank takes the ANE tier (`ane_ffn`,
+`ane_qkv`, `ane_int8`; feature `"tensor-parallel-ane/1"`): its modules its
+share's widths, staged from its cut projections, and each band's rows split
+between the two engines -- the qkv's in the band's first pass, the
+feed-forward's straight into the band's exchange buffer -- so the bands, and
+the exchanges under them, are those of a rank without it. A rank's bands
+follow its rows and its floor alone, never its ANE, so a pair may mix a rank
+with the tier and one without (an M4 beside an M5), and a rank whose plan
+refuses the module, or that drops it for a clip, stays in step. A rank takes
+runtime adapters -- bound at the checkpoint's widths, their factors then cut as
+the weights are: B's rows of q|k|v and fc1, A's columns of the out projection
+and fc2, so the ranks' deltas sum to the whole one -- and the int8 tiers past
 accurate, its dense share converted at the group its own width takes (a width
 no group divides stays on accurate: give a rank whole groups of four heads,
 512 columns, for every tier's rotation). A transport sees none of this: the
@@ -1586,12 +1594,82 @@ is under 1,024 rows -- or under the floor its share is given
 takes fewer bands, each at least the floor, and a sequence under two floors
 exchanges whole blocks. Both ranks must cut the same bands, so a host states
 the floor for both, and only to a peer whose libvpipe reads it -- one listing
-`"tensor-parallel-decode/1"`, which came with it. A link that carries a
+`"tensor-parallel-decode/1"`, which came with it.
+
+A prompt longer than a rank's band -- a Ref2VA request's presentation of its
+references, an in-context refine's draft -- runs every block whole unless the
+share says both ranks may band it (`tensor_parallel.prompt_bands: true`, kept
+in `TpShare::extra` as `tp_extra::kPromptBands`; feature
+`"tensor-parallel-prompt-bands/1"`). Given, the rank bands such a prompt as an
+unsplit model does: its blocks banded whatever the prompt's length, its text
+refiner in bands of its own, each band's partials exchanged. It changes the
+bands the ranks cut, so a host states it alike to both, and only to a peer
+listing the feature: a rank that bands beside one that does not is out of
+step at its first exchange. A link that carries a
 band's partial in well under its compute (RDMA over several Thunderbolt
 cables) is better served by fewer, taller bands: an 832 x 480 x 73 clip's
 8,843 rows in four bands of 2,304 denoised in 8.5 s, in eight of 1,152 in
 10.4 (M5 Max and M5 Ultra, four TB5 cables). The transport sees nothing of
 it but larger partials.
+
+FLUX.3 and Qwen-Image-2.1 run split too, through generate-image's
+`tensor_parallel` (features `"tensor-parallel-flux3/1"`,
+`"tensor-parallel-qwen-image-21/1"`): ONE partial a block for FLUX.3, whose
+attention and feed-forward share a gate, TWO for Qwen-Image-2.1, each
+written straight into an exchange buffer and posted to the rank's worker as
+MiniMax H3's are. A rank streams its share and keeps it, booked as H3's is
+(its share with every block kept, streamable to the trunk and two blocks'
+shares), its share's rows alone read where a weight is cut by rows. Their
+BANDS are the host's to ask for: only a share given `min_band_rows`
+(features `"tensor-parallel-flux3/2"`, `"tensor-parallel-qwen-image-21/2"`)
+cuts a block's rows into bands -- at most eight, each at least the floor --
+for a /1 rank exchanges whole blocks, and a pair where one rank bands and the
+other does not is out of step at its first exchange. State the floor alike
+to both ranks, and only to a peer that lists /2.
+
+Krea-2 runs split the same way (feature `"tensor-parallel-krea2/1"`):
+generate-image's `tensor_parallel` on a Krea-2 DiT, TWO partials a block
+(its attention's gated residual and its feed-forward's apart), its int8 tiers
+laid out within a share, `min_band_rows` read from the start -- there is no
+unbanded /1 to keep in step with. Its attention is grouped (48 query heads
+over 12 kv heads), so a share is WHOLE GROUPS: its heads a multiple of four
+at both ends, the kv heads they read cut with them; any other share is
+refused by name. The text-fusion tower, the embeddings, the modulation and
+the final layer run whole on every rank.
+
+MOSS-Image runs split the same way (feature
+`"tensor-parallel-moss-image/1"`): TWO partials a main block -- its
+attention's out projection and its feed-forward, gated apart by the one
+modulation every block shares -- its int8 tiers laid out within a rank's
+share, `min_band_rows` read from this first version. Its fused
+`ffn_up_gate` is `[hidden | gate]`, so a rank's feed-forward rows `[f0, f1)`
+take those rows of the hidden half and the same rows of the gate half. Its
+two text blocks, the modulation, the embedders and the head run whole on
+every rank: the text blocks see the prompt's rows alone, too few to be
+worth an exchange. The negative and a skip-layer pass are forwards of
+their own on the picture's one channel, every rank running them in one
+order; a skipped block exchanges nothing on any rank. No runtime LoRA and
+no ANE tier on a rank.
+
+Z-Image and Fibo 2.0 run split the same way (features
+`"tensor-parallel-z-image/1"`, `"tensor-parallel-fibo2/1"`). Their block is
+SANDWICH-normed -- the attention's and the feed-forward's outputs are
+RMS-normed inside the residual, under a tanh gate -- so a rank completes each
+partial with the others' sum before that post-norm: TWO partials a block.
+Every block of the one shape is split, Z-Image's two refiners as its main
+stack; Fibo 2.0's injection blocks cut their cross-attention by the same heads
+(the text's keys and values each rank's own), a THIRD partial there; its
+Perceiver, a function of the text alone, runs whole on every rank. Both band
+from the first: a share given `min_band_rows` cuts every block's rows into
+bands (Fibo 2.0's injection running through each band, row by row), one
+without exchanges whole blocks -- state the floor alike to both ranks. A rank
+of either takes no runtime LoRA and no ANE tier.
+
+An image rank's EXCHANGE BUFFERS are its picture's, in all six families:
+made at the picture's first forward at its widest band, and freed -- after
+`forget` on each -- when the picture's channel goes. So a transport sees
+new buffers each picture, perhaps at addresses it saw before: register
+what it is handed after a `forget` afresh.
 
 THE CLIP'S DECODE splits the same way (feature
 `"tensor-parallel-decode/1"`): vae-decode's `tensor_parallel` --
@@ -1932,7 +2010,39 @@ for a DiT split across hosts -- extension point 5b; check
 `tp_transports_available()`) and `"tensor-parallel-decode/1"` (vae-decode's
 `tensor_parallel`: a MiniMax H3 clip's decode split between the same ranks,
 through the same transport, and a rank's band floor, `min_band_rows`; a host
-asks its peer for it before handing a rank a `decode_share` or a floor).
+asks its peer for it before handing a rank a `decode_share` or a floor) and
+`"tensor-parallel-flux3/1"` (generate-image's `tensor_parallel`: FLUX.3's DiT
+split between ranks through the same transport, one partial a block; a caller
+asks its peer for it before handing it a FLUX.3 rank) and
+`"tensor-parallel-qwen-image-21/1"` (the same for Qwen-Image-2.1's DiT: two
+partials a block, its int8 tiers laid out within a rank's share) and
+`"tensor-parallel-flux3/2"` / `"tensor-parallel-qwen-image-21/2"` (a rank of
+either reads `min_band_rows`: given, its blocks' rows are cut into bands, each
+band's partials exchanged under the next band's work; a host states the floor
+alike to both ranks, and only to a peer listing /2) and
+`"tensor-parallel-krea2/1"` (generate-image's `tensor_parallel` for Krea-2's
+DiT: two partials a block, a share whole kv groups, its int8 tiers within the
+share, `min_band_rows` read from the start; a caller asks its peer for it
+before handing it a Krea-2 rank) and
+`"tensor-parallel-moss-image/1"` (the same for MOSS-Image's DiT: two
+partials a main block, its text blocks whole, its int8 tiers within a
+share, `min_band_rows` read from the first version; a caller asks its peer
+for it before handing it a MOSS-Image rank) and
+`"tensor-parallel-z-image/1"` / `"tensor-parallel-fibo2/1"` (generate-image's
+`tensor_parallel` for Z-Image's and Fibo 2.0's DiTs: two partials a block --
+three in Fibo 2.0's injection blocks -- each completed before its sandwich
+post-norm, banded where the share carries `min_band_rows`) and
+`"tensor-parallel-ane/1"` (a MiniMax H3 rank takes the ANE tier --
+`ane_ffn`, `ane_qkv`, `ane_int8` beside `tensor_parallel` -- its feed-forward
+and qkv modules its share's widths, staged from its cut projections, each
+band's rows split between the engines, its bands those of a rank without the
+tier. A host asks a peer for it before handing it a rank under the tier; an
+older peer refuses such a rank by name) and
+`"tensor-parallel-prompt-bands/1"` (a MiniMax H3 rank reads `prompt_bands`:
+given, a prompt longer than its band is banded -- its blocks and its text
+refiner, each band's partials exchanged; unsaid, such a prompt runs every
+block whole. A host states it alike to every rank, and only to a peer listing
+it).
 
 ## Where your stages show up
 

@@ -128,6 +128,11 @@ private:
   std::int64_t  _pts = 0;
   AVFrame*      _in_frame  = nullptr;
   AVFrame*      _out_frame = nullptr;
+  // The libraries the two frames were allocated from, freed through
+  // the same: the destructor never asks the session for them, since a
+  // first ask LOADS them and throws where none load (a stage probed and
+  // unloaded on a machine without a usable FFmpeg).
+  const FFmpegLibraries* _frame_libs = nullptr;
 
   FlexData      _sb_seed;
   bool          _have_seed = false;

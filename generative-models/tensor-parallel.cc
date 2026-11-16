@@ -80,6 +80,16 @@ TpShare::from_flex(const FlexData& fd, int n_heads, int ffn, TpShare* out,
     s.extra.as_object().insert_or_assign(tp_extra::kMinBandRows,
                                          FlexData::make_int(b));
   }
+  // `prompt_bands`: a MiniMax H3 rank bands a prompt longer than its band
+  // -- a change to the bands the ranks cut, so a host states it for both;
+  // unsaid, such a prompt runs every block whole, as before.
+  if (o.contains(tp_extra::kPromptBands)) {
+    const FlexData& v = o.at(tp_extra::kPromptBands);
+    if (!v.is_bool()) { return fail("prompt_bands is not true / false"); }
+    if (!s.extra.is_object()) { s.extra = FlexData::make_object(); }
+    s.extra.as_object().insert_or_assign(tp_extra::kPromptBands,
+                                         FlexData::make_bool(v.as_bool()));
+  }
   // One rank holding everything is the unsplit model whatever `ranks`
   // says; the shares of the others are theirs to check.
   *out = s;

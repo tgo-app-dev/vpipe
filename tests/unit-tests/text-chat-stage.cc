@@ -197,6 +197,22 @@ TEST(text_chat_stage, stream_words_config) {
   }
 }
 
+// stream_speed: pure config parse -- off unless asked.
+TEST(text_chat_stage, stream_speed_config) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/tmp/chat-fake-model","stream_speed":true})");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+  }
+}
+
 TEST(text_chat_stage, enable_python_tool_config) {
   Session sess;
   CerrSilencer hush;
@@ -352,7 +368,8 @@ public:
   static constexpr const char* kTypeName = "ut-chat-stream-sink";
   using TypedStage::TypedStage;
 
-  struct Beat { std::string text; bool eor; };
+  // `speed`: the beat's live speed (stream_speed), null when it has none.
+  struct Beat { std::string text; bool eor; FlexData speed; };
 
   std::vector<Beat> take()
   {
@@ -372,6 +389,7 @@ public:
           ? std::string(o.at("text").as_string("")) : std::string();
       b.eor = o.contains("end_of_response")
           && o.at("end_of_response").as_bool(false);
+      if (o.contains("speed")) { b.speed = o.at("speed"); }
       lock_guard<mutex> g(_mu);
       _beats.push_back(std::move(b));
     }
@@ -886,6 +904,225 @@ TEST(text_chat_stage, metal_chat_stream_answer_only) {
     expected.erase(s, (e + te.size()) - s);
     EXPECT_TRUE(streamed == expected);
     EXPECT_TRUE(!streamed.empty());   // "Paris" survives the fold
+  }
+}
+
+namespace {
+
+// An environment variable set for a scope and put back as it was on every
+// way out: a test that fails an assert part way leaves the process as it
+// found it for the tests after it.
+struct ChatEnvScope {
+  std::string name;
+  bool had = false;
+  std::string old;
+  ChatEnvScope(const char* n, const char* v) : name(n)
+  {
+    if (const char* e = std::getenv(n)) {
+      had = true;
+      old = e;
+    }
+    ::setenv(n, v, 1);
+  }
+  ~ChatEnvScope()
+  {
+    if (had) {
+      ::setenv(name.c_str(), old.c_str(), 1);
+    } else {
+      ::unsetenv(name.c_str());
+    }
+  }
+  ChatEnvScope(const ChatEnvScope&) = delete;
+  ChatEnvScope& operator=(const ChatEnvScope&) = delete;
+};
+
+// One stream_speed turn of `prompt` on the model at `path`: out-port 1's
+// beats, and the turn's own decode rate (out-port 0's decoded /
+// decode_ms).
+struct SpeedRun {
+  bool launched = false;
+  std::vector<StreamSink::Beat> beats;
+  double turn_tps = 0.0;
+};
+SpeedRun
+speed_run_(const char* path, const std::string& prompt, int stream_words,
+           int max_new)
+{
+  SpeedRun out;
+  const char* dt = std::getenv("VPIPE_CHAT_SPEED_TEST_DTYPE");
+  ChatEnvScope backend("VPIPE_LLM_BACKEND", "metal");
+  Session  sess;
+  Pipeline pl("chat-stream-speed", &sess);
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = prompt;
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype",
+             FlexData::make_string(dt != nullptr && *dt ? dt : "f16"));
+    o.insert("max_new_tokens", FlexData::make_int(max_new));
+    o.insert("max_pages", FlexData::make_int(96));
+    o.insert("disable_thinking", FlexData::make_bool(true));
+    o.insert("mtp", FlexData::make_bool(false));
+    o.insert("stream_words", FlexData::make_int(stream_words));
+    o.insert("stream_speed", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+  auto turnsk = make_unique<TurnSink>(
+      &sess, "turn", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* turnsink = static_cast<TurnSink*>(pl.insert_stage(std::move(turnsk)));
+  auto strsk = make_unique<StreamSink>(
+      &sess, "stream", vector<InEdge>{ { chat, 1 } },
+      FlexData::make_object());
+  auto* streamsink = static_cast<StreamSink*>(
+      pl.insert_stage(std::move(strsk)));
+  PipelineRuntime rt(&pl, &sess);
+  out.launched = rt.launch();
+  if (!out.launched) { return out; }
+  rt.wait_idle();
+  rt.stop();
+  out.beats = streamsink->take();
+  double turn_decoded = 0.0, turn_ms = 0.0;
+  for (const auto& fd : turnsink->take()) {
+    if (!fd.is_object()) { continue; }
+    FlexData d = fd;
+    auto o = d.as_object();
+    if (o.contains("decoded")) { turn_decoded = o.at("decoded").as_real(0); }
+    if (o.contains("decode_ms")) { turn_ms = o.at("decode_ms").as_real(0); }
+  }
+  out.turn_tps = turn_ms > 0 ? turn_decoded * 1000.0 / turn_ms : 0.0;
+  return out;
+}
+
+double
+speed_num_(const FlexData& sp, const char* k)
+{
+  if (!sp.is_object()) { return -1.0; }
+  FlexData d = sp;
+  auto o = d.as_object();
+  return o.contains(k) ? o.at(k).as_real(-1.0) : -1.0;
+}
+
+std::string
+speed_phase_(const FlexData& sp)
+{
+  if (!sp.is_object()) { return std::string(); }
+  FlexData d = sp;
+  auto o = d.as_object();
+  return o.contains("phase") ? std::string(o.at("phase").as_string(""))
+                             : std::string();
+}
+
+}  // namespace
+
+// stream_speed: a reader's live meter.
+//   - THE PREFILL: a prompt of a few thousand tokens read in pieces
+//     (VPIPE_QWEN_PREFILL_CHUNK=1024, the MTP seed off so the prompt is not
+//     read in one forward) sends a beat of no text a piece, each its
+//     piece's tokens and speed, the last at the prompt's end; the decode's
+//     beats count its tokens and carry its speed over the last 128 -- held
+//     to the turn's own decode rate (out-port 0's decoded / decode_ms).
+//     The piece size is read at each prefill, so a test before this one
+//     that prefilled at the default (8192) does not decide it.
+//   - A DECODE THAT SENDS NOTHING ELSE still moves the meter: with
+//     stream_words 200 the text goes out a beat in a couple of hundred
+//     words, and a beat of no text goes out where none has for 250 ms --
+//     so no stretch of the decode goes unreported for more than about a
+//     quarter second's tokens. MEASURED (Bonsai 2 27B, M4 Pro): 25 decode
+//     beats over 159 tokens, the widest gap 7 (bound 13); MUTATION, the
+//     heartbeat taken out: one beat, a gap of 159 -- fails.
+// Env: VPIPE_CHAT_SPEED_TEST_MODEL_PATH, a Qwen-family chat model (a GGUF
+// one's folder too); VPIPE_CHAT_SPEED_TEST_DTYPE its compute dtype (f16).
+TEST(text_chat_stage, metal_chat_stream_speed) {
+  const char* path = std::getenv("VPIPE_CHAT_SPEED_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    std::printf("  SKIP: VPIPE_CHAT_SPEED_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  {
+    ChatEnvScope chunk("VPIPE_QWEN_PREFILL_CHUNK", "1024");
+    ChatEnvScope seed("VPIPE_MTP_NO_SEED", "1");
+    std::string prompt = "Here are notes on rivers:\n";
+    for (int i = 0; i < 150; ++i) {
+      prompt += "River number " + std::to_string(i) +
+                " flows north through green valleys, past old stone "
+                "bridges and quiet farms.\n";
+    }
+    prompt += "Write a long story, at least 300 words, about one of them.";
+    const SpeedRun run = speed_run_(path, prompt, 0, 300);
+    ASSERT_TRUE(run.launched);
+    int prefill_beats = 0, prefill_total = 0, last_done = 0;
+    bool done_rises = true;
+    double last_decode_tps = -1.0;
+    int decoded = 0, last_decoded = 0;
+    bool decoded_rises = true;
+    for (const auto& b : run.beats) {
+      if (!b.speed.is_object()) { continue; }
+      if (speed_phase_(b.speed) == "prefill") {
+        ++prefill_beats;
+        EXPECT_TRUE(b.text.empty());
+        EXPECT_TRUE(speed_num_(b.speed, "prefill_tps") > 0.0);
+        EXPECT_TRUE(speed_num_(b.speed, "prefill_tokens") > 0.0);
+        const int done = (int)speed_num_(b.speed, "prefill_done");
+        done_rises = done_rises && done > last_done;
+        last_done = done;
+        prefill_total = (int)speed_num_(b.speed, "prefill_total");
+      } else if (speed_phase_(b.speed) == "decode") {
+        decoded = (int)speed_num_(b.speed, "decoded");
+        decoded_rises = decoded_rises && decoded >= last_decoded;
+        last_decoded = decoded;
+        if (speed_num_(b.speed, "decode_tps") > 0.0) {
+          last_decode_tps = speed_num_(b.speed, "decode_tps");
+        }
+      }
+    }
+    std::printf("[text_chat_stage.stream_speed] %zu beats: %d prefill "
+                "(prompt %d tokens, the last done %d), %d decoded, the "
+                "meter's last %.1f tok/s against the turn's %.1f\n",
+                run.beats.size(), prefill_beats, prefill_total, last_done,
+                decoded, last_decode_tps, run.turn_tps);
+    // Several pieces, each a beat, the last at the prompt's end.
+    EXPECT_TRUE(prefill_beats >= 2);
+    EXPECT_TRUE(done_rises && last_done == prefill_total &&
+                prefill_total > 2048);
+    // The decode counted, its speed near the turn's own.
+    EXPECT_TRUE(decoded_rises && decoded > 128);
+    EXPECT_TRUE(last_decode_tps > 0.5 * run.turn_tps &&
+                last_decode_tps < 2.0 * run.turn_tps);
+  }
+  {
+    const SpeedRun run = speed_run_(
+        path, "Write a long story, at least 300 words, about a river.",
+        200, 160);
+    ASSERT_TRUE(run.launched);
+    int decode_beats = 0, quiet = 0, last = 0, gap = 0, decoded = 0;
+    bool rated = true;
+    for (const auto& b : run.beats) {
+      if (speed_phase_(b.speed) != "decode") { continue; }
+      ++decode_beats;
+      if (b.text.empty() && !b.eor) { ++quiet; }
+      decoded = (int)speed_num_(b.speed, "decoded");
+      gap = std::max(gap, decoded - last);
+      last = decoded;
+      rated = rated && (decoded == 0 ||
+                        speed_num_(b.speed, "decode_tps") > 0.0);
+    }
+    // At most twice the tokens a quarter second holds, and a couple more,
+    // between two beats.
+    const int bound = (int)(2.0 * 0.25 * run.turn_tps) + 2;
+    std::printf("[text_chat_stage.stream_speed] stream_words 200: %d decode "
+                "beats (%d of no text) over %d tokens, the widest gap %d "
+                "tokens (bound %d at the turn's %.1f tok/s)\n",
+                decode_beats, quiet, decoded, gap, bound, run.turn_tps);
+    EXPECT_TRUE(decoded > 64 && quiet > 0 && rated);
+    EXPECT_TRUE(decode_beats >= 8 && gap <= bound);
   }
 }
 

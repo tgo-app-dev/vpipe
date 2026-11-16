@@ -20,6 +20,7 @@
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/model-exec.h"
 #include "generative-models/model-exec-registry.h"
+#include "generative-models/prefill-progress.h"
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/weight-set.h"
@@ -2373,6 +2374,17 @@ spec_ext_(ModelExec* exec)
 }
 
 }  // namespace
+
+bool
+LoadedLanguageModel::set_prefill_progress(std::function<void(int, int)> fn)
+{
+  if (!valid() || !_impl->exec) { return false; }
+  auto* px = static_cast<PrefillProgressExt*>(
+      _impl->exec->query_extension(prefill_progress::kExtensionId));
+  if (px == nullptr) { return false; }
+  px->set_prefill_progress(std::move(fn));
+  return true;
+}
 
 bool
 LoadedLanguageModel::spec_decode_available() const
