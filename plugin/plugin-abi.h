@@ -175,6 +175,15 @@
 #define VPIPE_FEATURE_TENSOR_PARALLEL_FIBO2 "tensor-parallel-fibo2/1"
 #define VPIPE_FEATURE_TENSOR_PARALLEL_PROMPT_BANDS \
   "tensor-parallel-prompt-bands/1"
+// A MiniMax H3 rank binds TaoMate-H3's adapter as a plain LoRA (the
+// clip's `taomate: off`) at its share's widths; its streaming is still
+// refused on a rank, a clip at a time.
+#define VPIPE_FEATURE_TENSOR_PARALLEL_TAOMATE_LORA \
+  "tensor-parallel-taomate-lora/1"
+// generative-models/far-memory.h: another machine's memory lent through a
+// plugin's transport -- a Mixture of Experts' expert cache's far tier
+// (text-chat's `far_memory`).
+#define VPIPE_FEATURE_FAR_MEMORY "far-memory/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

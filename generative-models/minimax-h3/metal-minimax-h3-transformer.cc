@@ -3553,16 +3553,29 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
     return false;
   };
   const std::string kCurveB = ".adaln_proj.linear.curve_B.weight";
+  // TaoMate-H3's factors are `<module>.lora_a` / `.lora_b`, no `.weight`
+  // (lora::Adapter's tail marks): counted as the others.
+  auto tail = [](const std::string& n, const char* t) {
+    const std::size_t k = std::strlen(t);
+    return n.size() > k && n.compare(n.size() - k, k, t) == 0
+               ? n.size() - k
+               : std::string::npos;
+  };
   for (const std::string& nm : wts->tensor_names()) {
     const auto* ti = wts->info(nm);
-    if (ti == nullptr || nm.size() < 7 ||
-        nm.compare(nm.size() - 7, 7, ".weight") != 0) {
+    const std::size_t ta = tail(nm, ".lora_a"), tb = tail(nm, ".lora_b");
+    if (ti == nullptr ||
+        ((nm.size() < 7 || nm.compare(nm.size() - 7, 7, ".weight") != 0) &&
+         ta == std::string::npos && tb == std::string::npos)) {
       continue;
     }
-    const std::size_t pa = mark(nm, kA, std::size(kA));
-    const std::size_t pb = pa == std::string::npos
-                               ? mark(nm, kB, std::size(kB))
-                               : std::string::npos;
+    const std::size_t pa = ta != std::string::npos
+                               ? ta
+                               : mark(nm, kA, std::size(kA));
+    const std::size_t pb = pa != std::string::npos ? std::string::npos
+                           : tb != std::string::npos
+                               ? tb
+                               : mark(nm, kB, std::size(kB));
     const bool curve_b =
         !skip_adaln && nm.size() > kCurveB.size() &&
         nm.compare(nm.size() - kCurveB.size(), kCurveB.size(), kCurveB) ==

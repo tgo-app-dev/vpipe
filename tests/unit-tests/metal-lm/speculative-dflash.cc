@@ -239,7 +239,10 @@ load_fixture_(Session& sess, int bits, int gen, bool bf16_dflt = true)
 // context: final hidden, the head's top-16 candidates, and the drafts
 // (DFlash 2's selector path / DFlash's argmax), for two blocks -- the
 // second after an incremental ingest. Dense first (the bar: bf16 against
-// the reference's bf16), then the in-memory w8 / w4 holdings.
+// the reference's bf16), then the in-memory w8 / w4 holdings. w4 has no
+// bar here: on this noise context its hidden reads ~0.9 from fp32, which
+// real taps do not (dflash_quantized_drafter_on_real_taps: 0.21 from
+// dense, the same drafts but for a few near ties).
 TEST(metal_lm_smoke, dflash_drafter_matches_reference) {
   const char* gdir = std::getenv("VPIPE_DFLASH_GOLDEN");
   if (!gdir || !*gdir) { return; }
@@ -421,6 +424,151 @@ TEST(metal_lm_smoke, dflash_drafter_matches_reference) {
       } else if (bits == 8) {
         if (ref32 >= 0.0) { EXPECT_TRUE(rel32 < 2.5 * ref32 + 0.02); }
       }
+    }
+  }
+}
+
+namespace {
+
+std::vector<std::int32_t>
+prompt_ids_(genai::Tokenizer& tok);
+
+}  // namespace
+
+// The quantized holdings against the dense drafter on the TARGET's own
+// taps. The golden's context is noise (N(0, 4) taps no target writes), on
+// which a w4 drafter's final hidden reads ~0.9 from fp32 while its real
+// drafts are dense's: this holds them on what a decode feeds them. A real
+// turn is prefilled up to each cut and one block drafted from the token
+// that follows: the final hidden against dense's, the top-16 candidates,
+// and the drafts -- against dense's and against the turn's own text.
+TEST(metal_lm_smoke, dflash_quantized_drafter_on_real_taps) {
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  Session sess;
+  DFlashFixture fx = load_fixture_(sess, 0, 64);
+  if (!fx.model || !fx.tok) { return; }
+  genai::MetalQwenModel& m = *fx.model;
+  auto* mc = sess.metal_compute();
+  const std::string text =
+      "<|im_start|>user\nWrite a short Python function that returns the "
+      "n-th Fibonacci number iteratively, then explain in two sentences why "
+      "it is O(n).<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+      "```python\ndef fibonacci(n):\n    if n < 0:\n        raise "
+      "ValueError(\"n must be non-negative\")\n    a, b = 0, 1\n    for _ in "
+      "range(n):\n        a, b = b, a + b\n    return a\n```\n\nThe loop runs "
+      "exactly n times and each iteration does a constant amount of work, so "
+      "the running time grows linearly with n. It keeps only two numbers at "
+      "a time, so it also uses constant extra memory.";
+  const std::vector<std::int32_t> all = fx.tok->encode(text);
+  const int H = m.dflash()->config().hidden;
+  const int L = m.dflash()->config().block_size;
+  const bool v2 = m.dflash()->config().v2();
+  std::vector<int> cuts;
+  for (int k = 0; k < 6; ++k) {
+    cuts.push_back(48 + k * (((int)all.size() - 48 - L) / 6));
+  }
+  struct Draft {
+    std::vector<float> h;
+    std::vector<std::int32_t> cand, path;
+  };
+  std::vector<std::vector<Draft>> got;   // [arm][cut]
+  for (const int bits : {0, 8, 4}) {
+    if (bits != 0) {
+      genai::MetalDFlashDrafter::Options opt;
+      opt.quant_bits = bits;
+      opt.target_bf16 = true;
+      std::string err;
+      auto nd = genai::MetalDFlashDrafter::load(
+          genai::WeightSet::open(std::getenv("VPIPE_DFLASH_TEST_DRAFT"),
+                                 &sess),
+          mc, opt, &err);
+      ASSERT_TRUE(nd != nullptr);
+      if (!nd) { return; }
+      ASSERT_TRUE(m.attach_dflash(std::move(nd), &err));
+    }
+    genai::MetalDFlashDrafter* d = m.dflash_mut();
+    genai::DFlashTarget* tgt = m.dflash_target();
+    ASSERT_TRUE(d != nullptr && tgt != nullptr);
+    if (!d || !tgt) { return; }
+    got.emplace_back();
+    auto bids = mc->make_shared_buffer((std::size_t)L * 4);
+    auto out = mc->make_shared_buffer((std::size_t)L * 4);
+    for (const int cut : cuts) {
+      const genai::ContextId cid =
+          m.context_manager()->branch(m.root_context());
+      ASSERT_TRUE(cid.valid());
+      const std::vector<std::int32_t> pre(all.begin(), all.begin() + cut);
+      ASSERT_TRUE(!m.prefill(cid, pre).empty());
+      d->fill_block_ids(static_cast<std::int32_t*>(bids.contents()),
+                        all[(std::size_t)cut], L);
+      metal_compute::CommandStream st = mc->make_command_stream();
+      {
+        metal_compute::ComputeEncoder enc = st.begin_compute();
+        d->encode_draft(enc, *tgt, bids, L, cut, out, 0);
+      }
+      st.commit().wait();
+      Draft dr;
+      const auto* hp =
+          static_cast<const std::uint16_t*>(d->last_hidden().contents());
+      for (std::size_t i = 0; i < (std::size_t)(L - 1) * H; ++i) {
+        dr.h.push_back(from_bf16_(hp[(std::size_t)H + i]));
+      }
+      const auto* op = static_cast<const std::int32_t*>(out.contents());
+      dr.path.assign(op, op + (L - 1));
+      if (v2) {
+        const auto* cp =
+            static_cast<const std::int32_t*>(d->last_cand_idx().contents());
+        dr.cand.assign(cp, cp + (std::size_t)(L - 1) * 16);
+      }
+      got.back().push_back(std::move(dr));
+      m.context_manager()->release(cid);
+    }
+  }
+  // Dense against the text: what the quantized arms are held beside.
+  const int arms[3] = {0, 8, 4};
+  int dense_text = 0;
+  for (int a = 0; a < 3; ++a) {
+    double rel = 0.0, worst = 0.0;
+    int same = 0, text_hits = 0, cand_hits = 0, cand_tot = 0;
+    for (std::size_t k = 0; k < cuts.size(); ++k) {
+      const Draft& g = got[(std::size_t)a][k];
+      const Draft& d0 = got[0][k];
+      const double r = rel_l2_(g.h.data(), d0.h.data(), g.h.size());
+      rel += r / (double)cuts.size();
+      worst = std::max(worst, r);
+      for (int i = 0; i < L - 1; ++i) {
+        same += g.path[(std::size_t)i] == d0.path[(std::size_t)i];
+        text_hits += g.path[(std::size_t)i] ==
+                     all[(std::size_t)cuts[k] + 1 + (std::size_t)i];
+      }
+      for (std::size_t r16 = 0; r16 < (std::size_t)(L - 1); ++r16) {
+        for (int q = 0; q < 16 && v2; ++q) {
+          const std::int32_t want = d0.cand[r16 * 16 + (std::size_t)q];
+          ++cand_tot;
+          for (int p = 0; p < 16; ++p) {
+            if (g.cand[r16 * 16 + (std::size_t)p] == want) {
+              ++cand_hits;
+              break;
+            }
+          }
+        }
+      }
+    }
+    const int tot = (int)cuts.size() * (L - 1);
+    std::printf("[dflash_real] w%d: hidden vs dense %.4f (worst %.4f) | "
+                "top-16 %d/%d | drafts as dense %d/%d, as the text %d/%d\n",
+                arms[a], rel, worst, cand_hits, cand_tot, same, tot,
+                text_hits, tot);
+    if (arms[a] == 0) {
+      dense_text = text_hits;
+    } else {
+      // MEASURED on the 27B's DFlash 2 (M4 Pro): w8 0.022 (worst 0.027),
+      // 42 / 42 drafts as dense; w4 0.21 (worst 0.32), 35 / 42, the text
+      // 24 / 42 against dense's 25 -- 4-bit rounding (~9% of a weight)
+      // spread over every linear, no one of them the cause. On the
+      // golden's noise the w4 hidden reads 0.9 from fp32.
+      EXPECT_TRUE(rel < (arms[a] == 8 ? 0.06 : 0.3));
+      EXPECT_TRUE(text_hits >= dense_text - 3);
     }
   }
 }

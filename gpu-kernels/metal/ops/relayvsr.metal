@@ -59,22 +59,37 @@ kernel void rvsr_upload(
 
 // ---- the keyframe DiT ---------------------------------------------------
 //
-// THE SOURCE ROWS: lq_proj's first two steps in one. The frame is
-// upsampled 4x bilinearly (torch's align_corners=False rule: source
-// max(0, (d + 0.5) / 4 - 0.5), the far neighbour clamped) and pixel-
-// unshuffled by 16, so row (ty, tx) of the [ph/4 * pw/4, 768] result holds
-// the 16 x 16 upsampled block at (16 ty, 16 tx), channel c * 256 + 16 dy +
-// dx -- the 4ph x 4pw upsample itself is never written. Each value is
-// rounded to the element type once, as the reference's upsampled tensor is.
-//   0:lr[ph*pw,3] 1:out[rows,768] 2:ph 3:pw   grid (768, rows)
+// THE SOURCE ROWS: lq_proj's first two steps in one, on the latent grid
+// (1/4 of the frame at 4x, 1/8 at 2x). At 4x the frame is upsampled 4x
+// bilinearly (torch's align_corners=False rule: source max(0, (d + 0.5) /
+// 4 - 0.5), the far neighbour clamped) and pixel-unshuffled by 16, so row
+// (ty, tx) of the [ph/4 * pw/4, 768] result holds the 16 x 16 upsampled
+// block at (16 ty, 16 tx), channel c * 256 + 16 dy + dx -- the 4ph x 4pw
+// upsample itself is never written; each value is rounded to the element
+// type once, as the reference's upsampled tensor is. At 2x the frame
+// itself is pixel-unshuffled by 8 (LightX2V's native_x2_input): row (ty,
+// tx) of [ph/8 * pw/8, 192] holds the 8 x 8 block at (8 ty, 8 tx),
+// channel c * 64 + 8 dy + dx, copied.
+//   0:lr[ph*pw,3] 1:out[rows,C] 2:ph 3:pw 4:scale (4 | 2)
+//   grid (C, rows), C = 768 at 4x, 192 at 2x
 kernel void rvsr_lq_rows(
-    const device elt* lr  [[buffer(0)]],
-    device elt*       out [[buffer(1)]],
-    constant int&     ph  [[buffer(2)]],
-    constant int&     pw  [[buffer(3)]],
+    const device elt* lr    [[buffer(0)]],
+    device elt*       out   [[buffer(1)]],
+    constant int&     ph    [[buffer(2)]],
+    constant int&     pw    [[buffer(3)]],
+    constant int&     scale [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]])
 {
   const int ch = (int)gid.x, row = (int)gid.y;
+  if (scale == 2) {
+    const int tw = pw / 8;
+    if (ch >= 192 || row >= (ph / 8) * tw) { return; }
+    const int c = ch / 64, dy = (ch / 8) % 8, dx = ch % 8;
+    const int Y = (row / tw) * 8 + dy, X = (row % tw) * 8 + dx;
+    out[(uint)row * 192u + (uint)ch] =
+        lr[((uint)Y * (uint)pw + (uint)X) * 3u + (uint)c];
+    return;
+  }
   const int tw = pw / 4;
   if (ch >= 768 || row >= (ph / 4) * tw) { return; }
   const int c = ch / 256, dy = (ch / 16) % 16, dx = ch % 16;
@@ -466,12 +481,14 @@ static inline float rvsr_cubic(float x0, float x1, float x2, float x3,
 }
 
 // THE FRAME OUT: the residual rows [n, 3 * 256] pixel-shuffled by 16 onto
-// a 4x bicubic upsample of the padded frame (both in the element type and
-// summed in it, as the reference adds two tensors of its dtype), cut to
-// the frame's own 4h x 4w and written planar: u8 as the release writes it
-// -- (v + 1) 127.5 clamped to [0, 255] and TRUNCATED (`.to(torch.uint8)`)
-// -- or f32 in [0, 1] as (v + 1) / 2, unclamped.
-//   0:res 1:lr[ph*pw,3] 2:out 3:ph 4:pw 5:H (=4h) 6:W (=4w) 7:f32 out
+// a `scale` x (4 or 2) bicubic upsample of the padded frame (both in the
+// element type and summed in it, as the reference adds two tensors of its
+// dtype), cut to the frame's own sh x sw and written planar: u8 as the
+// release writes it -- (v + 1) 127.5 clamped to [0, 255] and TRUNCATED
+// (`.to(torch.uint8)`) -- or f32 in [0, 1] as (v + 1) / 2, unclamped. The
+// residual's grid is 1/16 of the output at either scale.
+//   0:res 1:lr[ph*pw,3] 2:out 3:ph 4:pw 5:H (=sh) 6:W (=sw) 7:f32 out
+//   8:scale (4 | 2)
 //   grid (W, H, 3)
 kernel void rvsr_frame_out(
     const device elt* res [[buffer(0)]],
@@ -482,12 +499,16 @@ kernel void rvsr_frame_out(
     constant int&     H   [[buffer(5)]],
     constant int&     W   [[buffer(6)]],
     constant int&     f32 [[buffer(7)]],
+    constant int&     scale [[buffer(8)]],
     uint3 gid [[thread_position_in_grid]])
 {
   const int X = (int)gid.x, Y = (int)gid.y, c = (int)gid.z;
   if (X >= W || Y >= H || c >= 3) { return; }
-  const float ry = 0.25f * ((float)Y + 0.5f) - 0.5f;
-  const float rx = 0.25f * ((float)X + 0.5f) - 0.5f;
+  // torch's source index for a given scale_factor: (d + 0.5) / s - 0.5
+  // (1/4 and 1/2 are exact).
+  const float inv = scale == 2 ? 0.5f : 0.25f;
+  const float ry = inv * ((float)Y + 0.5f) - 0.5f;
+  const float rx = inv * ((float)X + 0.5f) - 0.5f;
   const int iy = (int)floor(ry), ix = (int)floor(rx);
   const float ty = ry - (float)iy, tx = rx - (float)ix;
   float rows[4];
@@ -502,7 +523,7 @@ kernel void rvsr_frame_out(
   }
   const float bic = (float)elt(rvsr_cubic(rows[0], rows[1], rows[2], rows[3],
                                           ty));
-  const int tw = pw / 4;
+  const int tw = (scale == 2 ? 2 : 4) * pw / 16;
   const uint row = (uint)(Y / 16) * (uint)tw + (uint)(X / 16);
   const uint ch = (uint)c * 256u + (uint)(Y % 16) * 16u + (uint)(X % 16);
   const float v = (float)elt(bic + (float)res[row * 768u + ch]);

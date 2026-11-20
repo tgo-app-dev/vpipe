@@ -64,10 +64,24 @@ public:
     std::uint64_t        offset = 0;  // bytes from the data section start
     const std::uint8_t*  data = nullptr;  // mmap + data_start + offset
     std::uint64_t        nbytes = 0;
+    // The file the bytes are in (0 the first; a split checkpoint's
+    // later shards after it -- file_path()) and where in it, for a
+    // reader that preads rather than faults the mapping in.
+    int                  file = 0;
+    std::uint64_t        file_offset = 0;
     std::int64_t numel() const;
   };
 
+  // A split checkpoint (llama.cpp's `-00001-of-0000N.gguf`, metadata
+  // `split.count`) opens whole from its first file: every shard's tensors
+  // in one table, the metadata the first file's.
   static std::optional<GgufFile> open(const std::string& path);
+  // One file alone, whatever its `split.*` keys say (DeepSeek-V4.1's
+  // n-gram table is a file of its own that its builder numbered as the
+  // last shard of a set).
+  static std::optional<GgufFile> open_single(const std::string& path);
+  std::size_t file_count() const { return _paths.size(); }
+  const std::string& file_path(int file) const { return _paths[file]; }
 
   GgufFile(GgufFile&&) noexcept;
   GgufFile& operator=(GgufFile&&) noexcept;
@@ -122,6 +136,7 @@ private:
   };
 
   const Value* find_(const std::string& key) const;
+  static std::optional<GgufFile> open_one_(const std::string& path);
 
   int                 _fd = -1;
   const std::uint8_t* _base = nullptr;   // mmap base
@@ -130,6 +145,8 @@ private:
   std::unordered_map<std::string, Value> _meta;
   std::vector<Tensor> _tensors;
   std::unordered_map<std::string, std::size_t> _tensor_index;
+  std::vector<std::string> _paths;       // file i of a split checkpoint
+  std::vector<GgufFile> _splits;         // files 1.. (their mappings)
 };
 
 }  // namespace vpipe::genai

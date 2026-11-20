@@ -18,9 +18,11 @@ namespace vpipe {
 
 class TensorBeatPayload;
 
-// 4x VIDEO SUPER-RESOLUTION by RelayVSR (kopper/RelayVSR; arXiv
-// 2609.37850; generative-models/relayvsr/): frames in, the same frames at
-// four times the width and height out, one beat for one beat, in order.
+// 4x / 2x VIDEO SUPER-RESOLUTION by RelayVSR (kopper/RelayVSR, 4x;
+// lightx2v/RelayVSR_X2, 2x; ComfyUI's int8 repack of both,
+// Comfy-Org/RelayVSR; arXiv 2609.37850; generative-models/relayvsr/):
+// frames in, the same frames at the model's scale out, one beat for one
+// beat, in order.
 //
 // Two models run in relay over the stream. A large one-step DiT writes a
 // KEYFRAME every `window - 1` frames (and at the last), and a small decoder
@@ -37,7 +39,8 @@ class TensorBeatPayload;
 //                    or f32 / f16 in [0, 1] (video-to-rgb's two). Every
 //                    frame of a run one size; any size (the model pads to
 //                    8 and cuts back).
-//   oport0  frames   planar RGB [3, 4H, 4W]: u8, or f32 in [0, 1]
+//   oport0  frames   planar RGB [3, sH, sW] (s the scale): u8, or f32 in
+//                    [0, 1]
 //                    (`output_dtype`), the input's sideband carried over
 //                    -- its rate and timestamp are the output's.
 //
@@ -47,11 +50,13 @@ class TensorBeatPayload;
 // Engine (an M4's lever; a GPU that is faster alone keeps it). See
 // docs/RELAYVSR.md for what each measured.
 //
-// Memory: the two models hold 8.4 GB of weights, and every one of the
-// keyframe DiT's 30 blocks keeps the last four keyframes' keys and values
-// -- 0.4 GB a block at a 960 x 544 input. Booked at every launch at a
-// quarter of `output_width` x `output_height` when the graph gives them,
-// else at a 960 x 544 input; revised to the run's frame size at its first
+// Memory: the two models hold 8.4 GB of weights (5.2 GB from ComfyUI's
+// int8 repack), and every one of the keyframe DiT's 30 blocks keeps the
+// last four keyframes' keys and values -- 0.4 GB a block at a 960 x 544
+// input at 4x (a quarter of that at 2x, whose tokens are 1/16 of the frame
+// rather than 1/8). Booked at every launch at `output_width` x
+// `output_height` over the scale when the graph gives them, else at a
+// 3840 x 2176 output; revised to the run's frame size at its first
 // frame, and withdrawn with the models at the end of the stream. Nothing
 // here streams, so a run that cannot fit is REFUSED before it allocates:
 // at the launch when the output size is given and the run alone is over
@@ -102,6 +107,11 @@ private:
   std::string scratch_label_() const;
   // What a stream of this frame size holds beside the weights.
   std::uint64_t run_bytes_(int h, int w) const;
+  // The input frame the launch plans: the output size given (or 3840 x
+  // 2176) over the model's scale. False, and the reason, when the output
+  // size given is not a multiple of the scale (the size is still set).
+  bool plan_in_(const Configs& c, int* h, int* w,
+                std::string* why = nullptr) const;
   bool load_();
   // Whether `weights` (still to load) and a stream's `run` fit the box;
   // false: reported (a "memory" report) and the refusal's sentence in
@@ -127,8 +137,9 @@ private:
 
   std::string _hf_dir;
   int _window = 16;
-  int _plan_w = 0, _plan_h = 0;  // the launch's booked input frame
-  bool _plan_given = false;      // ...from output_width / output_height
+  int _scale = 0;                // asked: 0 the model's, 2 or 4
+  int _out_w = 0, _out_h = 0;    // output_width / output_height
+  bool _plan_given = false;      // ...given
   std::uint64_t _seed = 42;
   std::string _out_dtype = "auto";
   int _i8_tier = -1;             // asked: -1 off, 0 accurate .. 3

@@ -9,6 +9,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "ops/deepseek_v41_route.h"
+
 #ifndef VPIPE_ELT
 #define VPIPE_ELT half
 #endif
@@ -1160,77 +1162,17 @@ kernel void dsv41_handshake(
 // then `bi` (the host's answer, m0..m2 words and its checksum) is read by
 // atomic loads into d0..d2, again until the checksum holds. Atomics are
 // what both sides were seen to observe while a buffer runs (on an M5
-// Ultra; the model's probe keeps this off where they are not), plain
-// stores are not relied on, and the checksums make a late or partial
-// mailbox a give-up rather than a wrong answer.
+// Ultra under macOS 27.0; the model's probe keeps this off where they are
+// not), plain stores are not relied on, and the checksums make a late or
+// partial mailbox a give-up rather than a wrong answer. This is the
+// DEVICE-scope handshake, the fallback: host_handshake.metal holds the
+// system-scope one (host_handshake_io, and this file's
+// dsv41_handshake_route under its own name), which the model probes
+// first.
 // A wait gives up when word 3 (the host's heartbeat) has not moved in
 // `spins` loads, counting it in word 2; once one has given up, later ones
 // do not wait (a host that is gone costs one wait, not one a layer).
 // grid {256}, tg {256}.
-inline uint dsv41_hs_mix_(uint k, uint v)
-{
-  return v * (2u * k + 1u) + (v >> 16) * 0x9E3779B9u;
-}
-
-// dsv41_route's body (see it, below) for row `row`, by a group of 256:
-// the route kernel's own and, folded, the handshake's.
-inline void dsv41_route_tg_(
-    const device float* sc, const device float* bias,
-    const device float* bias_vl, const device uchar* vl, device int* eid,
-    device float* wt, const int E, const int topk, const float rscale,
-    const int norm, const int has_vl, const uint row, const uint tid,
-    const uint sg, const uint lane, threadgroup float* val,
-    threadgroup float* sel, threadgroup float* rv, threadgroup int* ri,
-    threadgroup int* pick)
-{
-  const bool use_vl = has_vl != 0 && vl[row] != 0;
-  for (int e = (int)tid; e < E; e += 256) {
-    const float x = sc[(long)row * E + e];
-    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
-    const float v = sqrt(sp);
-    val[e] = v;
-    sel[e] = v + (use_vl ? bias_vl[e] : bias[e]);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int k = 0; k < topk; ++k) {
-    float bv = -INFINITY;
-    int bi = 0x7fffffff;
-    for (int e = (int)tid; e < E; e += 256) {
-      const float v = sel[e];
-      if (v > bv || (v == bv && e < bi)) { bv = v; bi = e; }
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-      const float ov = simd_shuffle_down(bv, (ushort)off);
-      const int oi = simd_shuffle_down(bi, (ushort)off);
-      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-    }
-    if (lane == 0) { rv[sg] = bv; ri[sg] = bi; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-      float b = rv[0];
-      int bi2 = ri[0];
-      for (int g = 1; g < 8; ++g) {
-        if (rv[g] > b || (rv[g] == b && ri[g] < bi2)) {
-          b = rv[g];
-          bi2 = ri[g];
-        }
-      }
-      pick[k] = bi2;
-      sel[bi2] = -INFINITY;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  if (tid == 0) {
-    float sum = 0.0f;
-    for (int k = 0; k < topk; ++k) { sum += val[pick[k]]; }
-    const float dn = (norm != 0 && topk > 1) ? sum + 1e-20f : 1.0f;
-    for (int k = 0; k < topk; ++k) {
-      eid[row * topk + k] = pick[k];
-      wt[row * topk + k] = val[pick[k]] / dn * rscale;
-    }
-  }
-}
-
 inline void dsv41_handshake_body_(
     device atomic_uint* f, const device uint* s0, const device uint* s1,
     const device uint* s2, device atomic_uint* bo, device atomic_uint* bi,
@@ -2448,6 +2390,40 @@ inline float dsv41_fp4_dot8_(uint u, thread const float* x)
   s += (float)h3.x * x[6];
   s += (float)h3.y * x[7];
   return s * 16384.0f;
+}
+
+// REMOTE EXPERTS (prototype: experts the far side runs, its sum put in).
+// A decode row's routing weights and activation packed into one buffer
+// for the host's handshake (rx[0..np) the weights' bits, then x's
+// elements two a word): the host sees only what that turn copies out.
+// grid {256}, tg {256}.
+kernel void dsv41_pack_remote(
+    const device float* wt [[buffer(0)]],
+    const device uint*  x  [[buffer(1)]],      // [H] T, two a word
+    device uint*        rx [[buffer(2)]],
+    constant int&       np [[buffer(3)]],
+    constant int&       hw [[buffer(4)]],      // H / 2
+    uint t  [[thread_position_in_grid]],
+    uint nt [[threads_per_grid]])
+{
+  for (int k = (int)t; k < np; k += (int)nt) { rx[k] = as_type<uint>(wt[k]); }
+  for (int k = (int)t; k < hw; k += (int)nt) { rx[np + k] = x[k]; }
+}
+
+// The far side's rows put in their pairs' places (those pairs read the
+// zero slot: their own rows are 0), each as the local kernels would have
+// written it, so the combine after is the local one; rp[r] < 0, row r ran
+// nowhere. grid {H, R}, tg {256, 1}.
+kernel void dsv41_put_remote(
+    device T*         part [[buffer(0)]],      // [np, H]
+    const device T*   rows [[buffer(1)]],      // [R, H]
+    const device int* rp   [[buffer(2)]],      // [R]
+    constant int&     H    [[buffer(3)]],
+    uint2 i [[thread_position_in_grid]])
+{
+  const int p = rp[i.y];
+  if (p < 0 || (int)i.x >= H) { return; }
+  part[(long)p * H + i.x] = rows[(long)i.y * H + i.x];
 }
 
 // Expert.forward's first half for (token, expert) pairs: gate = w1 . x,
@@ -4250,3 +4226,1732 @@ DSV41_MOE_Q_GROUPED(4)
 DSV41_MOE_Q_GROUPED(5)
 DSV41_MOE_Q_GROUPED(6)
 DSV41_MOE_Q_GROUPED(8)
+
+// ---- a GGUF's routed experts in their own blocks (IQ2_XXS, IQ2_XS, IQ1_M)
+// The cache's slots hold an expert's three slabs as the file has them --
+// a row of K values is K / 256 blocks -- and each 32 values (a block's
+// sub-block) are widened as ggml's dequantize_row_* widens them (each
+// value one product chain in f32), never to an intermediate form: a slot
+// is the file's 8 MB, not an affine copy's 38. The tables
+// (ggml-blocks.cc's gpu_iq_tables) one buffer of ulongs: the IQ2_XXS grid
+// (256), IQ2_XS's (512), IQ1_S/M's (2048), then ksigns_iq2xs's bytes.
+constant constexpr uint kDsv41IqXXS = 16, kDsv41IqXS = 17;  // else IQ1_M
+// IQ2_S (82-byte blocks) and IQ3_XXS (98): their grids at 3856 (1024 u64)
+// and 4880 (256 u32) of gpu_iq_tables_native
+constant constexpr uint kDsv41Iq2S = 22, kDsv41Iq3XXS = 18;
+constant constexpr uint kDsv41Grid2S = 3856, kDsv41Grid3XXS = 4880;
+constant constexpr uint kDsv41GridXS = 256, kDsv41Grid1S = 768,
+                        kDsv41Signs = 2816;
+
+inline int dsv41_iq_block_bytes_(const uint type)
+{
+  return type == kDsv41IqXXS ? 66 : type == kDsv41IqXS ? 74
+         : type == kDsv41Iq2S ? 82 : type == kDsv41Iq3XXS ? 98 : 56;
+}
+
+// a grid table's u32 view (IQ3_XXS's entries are 4 bytes)
+inline const device uint* dsv41_u32_(const device ulong* p)
+{
+  return (const device uint*)p;
+}
+inline const threadgroup uint* dsv41_u32_(const threadgroup ulong* p)
+{
+  return (const threadgroup uint*)p;
+}
+inline uint dsv41_u32_at2_(const device uchar* p)
+{
+  return uint(*(const device ushort*)p) |
+         (uint(*(const device ushort*)(p + 2)) << 16);
+}
+
+inline float dsv41_f16_at_(const device uchar* p)
+{
+  return float(as_type<half>(ushort(p[0] | (ushort(p[1]) << 8))));
+}
+
+inline uint dsv41_iq_sign_(const device ulong* tab, const uint i)
+{
+  return uint((tab[kDsv41Signs + i / 8] >> (8 * (i % 8))) & 0xff);
+}
+
+// Eight values of a row: sub-block `sub` (32 values), its 8 at l (0..3).
+inline void dsv41_iq8_(const device uchar* row, const int sub, const int l,
+                       const uint type, const device ulong* tab,
+                       thread float* v)
+{
+  const int ib = sub % 8;
+  if (type == kDsv41IqXXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 66;
+    const float d = dsv41_f16_at_(blk);
+    const device uchar* q = blk + 2 + 8 * ib;
+    const uint a1 = uint(q[4]) | (uint(q[5]) << 8) | (uint(q[6]) << 16) |
+                    (uint(q[7]) << 24);
+    const float db = d * (0.5f + float(a1 >> 28)) * 0.25f;
+    const uint sg = dsv41_iq_sign_(tab, (a1 >> (7 * l)) & 127);
+    const ulong g = tab[q[l]];
+    for (int j = 0; j < 8; ++j) {
+      const float gv = float((g >> (8 * j)) & 0xff);
+      v[j] = db * gv * ((sg & (1u << j)) != 0 ? -1.0f : 1.0f);
+    }
+  } else if (type == kDsv41IqXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 74;
+    const float d = dsv41_f16_at_(blk);
+    const uint sc = blk[66 + ib];
+    const float db = l / 2 == 0 ? d * (0.5f + float(sc & 0xf)) * 0.25f
+                                : d * (0.5f + float(sc >> 4)) * 0.25f;
+    const device uchar* qp = blk + 2 + 2 * (4 * ib + l);
+    const uint q = uint(qp[0]) | (uint(qp[1]) << 8);
+    const uint sg = dsv41_iq_sign_(tab, q >> 9);
+    const ulong g = tab[kDsv41GridXS + (q & 511)];
+    for (int j = 0; j < 8; ++j) {
+      const float gv = float((g >> (8 * j)) & 0xff);
+      v[j] = db * gv * ((sg & (1u << j)) != 0 ? -1.0f : 1.0f);
+    }
+  } else if (type == kDsv41Iq2S) {
+    const device uchar* blk = row + (long)(sub / 8) * 82;
+    const float d = dsv41_f16_at_(blk);
+    const uint sc = blk[74 + ib];
+    const float db = d * (0.5f + float(l < 2 ? sc & 0xf : sc >> 4)) * 0.25f;
+    const uint gi = uint(blk[2 + 4 * ib + l]) |
+                    ((uint(blk[66 + ib]) << (8 - 2 * l)) & 0x300);
+    const uint sg = blk[2 + 32 + 4 * ib + l];
+    const ulong g = tab[kDsv41Grid2S + gi];
+    for (int j = 0; j < 8; ++j) {
+      const float gv = float((g >> (8 * j)) & 0xff);
+      v[j] = db * gv * ((sg & (1u << j)) != 0 ? -1.0f : 1.0f);
+    }
+  } else if (type == kDsv41Iq3XXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 98;
+    const float d = dsv41_f16_at_(blk);
+    const device uchar* qs = blk + 2 + 8 * ib;
+    const uint a = dsv41_u32_at2_(blk + 66 + 4 * ib);
+    const float db = d * (0.5f + float(a >> 28)) * 0.5f;
+    const uint sg = dsv41_iq_sign_(tab, (a >> (7 * l)) & 127);
+    const device uint* g3 = dsv41_u32_(tab + kDsv41Grid3XXS);
+    const uint g1 = g3[qs[2 * l]], g2 = g3[qs[2 * l + 1]];
+    for (int j = 0; j < 8; ++j) {
+      const float gv = float(((j < 4 ? g1 : g2) >> (8 * (j % 4))) & 0xff);
+      v[j] = db * gv * ((sg & (1u << j)) != 0 ? -1.0f : 1.0f);
+    }
+  } else {
+    const device uchar* blk = row + (long)(sub / 8) * 56;
+    const device uchar* qs = blk + 4 * ib;
+    const device uchar* qh = blk + 32 + 2 * ib;
+    ushort sc[4];
+    for (int i = 0; i < 4; ++i) {
+      sc[i] = ushort(blk[48 + 2 * i] | (ushort(blk[49 + 2 * i]) << 8));
+    }
+    const ushort su = ushort((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                             ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+    const float d = float(as_type<half>(su));
+    const int sh = 6 * (ib % 2) + (l < 2 ? 0 : 3);
+    const float dl = d * float(2 * ((sc[ib / 2] >> sh) & 0x7) + 1);
+    const uint h = qh[l / 2];
+    const uint idx = uint(qs[l]) | ((l % 2 == 0 ? (h << 8) : (h << 4)) & 0x700);
+    const float delta =
+        (h & (l % 2 == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f : 0.125f;
+    const ulong g = tab[kDsv41Grid1S + idx];
+    for (int j = 0; j < 8; ++j) {
+      const float gv = float(char((g >> (8 * j)) & 0xff));
+      v[j] = dl * (gv + delta);
+    }
+  }
+}
+
+// The routed experts' two halves over the blocks (dsv41_moe_swiglu_q /
+// _down_q's mapping and arithmetic: 8 lanes a row, 4 rows a simdgroup,
+// each lane every 8th sub-block). The pools hold a slot's slab at slot *
+// cw bytes. grid {32, ceil(rows / 8) * 2, pairs}, tg {32, 2, 1}.
+kernel void dsv41_moe_swiglu_iq(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int r = (int)lane / 8, j = (int)lane % 8;
+  const int f = ((int)tg.y * 2 + (int)sg) * 4 + r;
+  const bool live = f < I;
+  float g = 0.0f, u = 0.0f;
+  if (live) {
+    const device uchar* r1 =
+        w1 + e * cw + (long)f * (K / 256) * dsv41_iq_block_bytes_(t1);
+    const device uchar* r3 =
+        w3 + e * cw + (long)f * (K / 256) * dsv41_iq_block_bytes_(t3);
+    const device T* xr = x + (long)(p / topk) * K;
+    for (int k = j * 32; k < K; k += 256) {
+      float dg = 0.0f, du = 0.0f;
+      for (int l = 0; l < 4; ++l) {
+        float a[8], b[8];
+        dsv41_iq8_(r1, k / 32, l, t1, tab, a);
+        dsv41_iq8_(r3, k / 32, l, t3, tab, b);
+        for (int q = 0; q < 8; ++q) {
+          const float xv = (float)xr[k + 8 * l + q];
+          dg = fma(a[q], xv, dg);
+          du = fma(b[q], xv, du);
+        }
+      }
+      g += dg;
+      u += du;
+    }
+  }
+  g += simd_shuffle_down(g, 4);
+  g += simd_shuffle_down(g, 2);
+  g += simd_shuffle_down(g, 1);
+  u += simd_shuffle_down(u, 4);
+  u += simd_shuffle_down(u, 2);
+  u += simd_shuffle_down(u, 1);
+  if (j != 0 || !live) { return; }
+  if (lim > 0.0f) {
+    u = clamp(u, -lim, lim);
+    g = min(g, lim);
+  }
+  act[(long)p * I + f] = (T)(wt[p] * (g / (1.0f + exp(-g)) * u));
+}
+
+kernel void dsv41_moe_down_iq(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* slot [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int r = (int)lane / 8, j = (int)lane % 8;
+  const int o = ((int)tg.y * 2 + (int)sg) * 4 + r;
+  const bool live = o < H;
+  float acc = 0.0f;
+  if (live) {
+    const device uchar* rw =
+        w2 + e * cw + (long)o * (I / 256) * dsv41_iq_block_bytes_(t2);
+    const device T* ar = act + (long)p * I;
+    for (int k = j * 32; k < I; k += 256) {
+      float d = 0.0f;
+      for (int l = 0; l < 4; ++l) {
+        float a[8];
+        dsv41_iq8_(rw, k / 32, l, t2, tab, a);
+        for (int q = 0; q < 8; ++q) {
+          d = fma(a[q], (float)ar[k + 8 * l + q], d);
+        }
+      }
+      acc += d;
+    }
+  }
+  acc += simd_shuffle_down(acc, 4);
+  acc += simd_shuffle_down(acc, 2);
+  acc += simd_shuffle_down(acc, 1);
+  if (j != 0 || !live) { return; }
+  out[(long)p * H + o] = (T)acc;
+}
+
+// A 32 x 32 weight tile of an expert's blocks widened to f32: 128 threads,
+// 8 values (one grid entry) each.
+struct Dsv41IqLoader {
+  const short bi, bj;
+  threadgroup float* dst;
+  const device uchar* row;
+  const uint type;
+  const device ulong* tab;
+  int k_off;
+  METAL_FUNC Dsv41IqLoader(const device uchar* codes, const int K,
+                           const uint type_, const device ulong* tab_,
+                           const int y_col, threadgroup float* dst_,
+                           ushort sg, ushort lane)
+      : bi((short)((sg * 32 + lane) / 4)),
+        bj((short)(8 * ((sg * 32 + lane) % 4))),
+        dst(dst_ + bi * 36 + bj),
+        row(codes + (long)(y_col + bi) * (K / 256) *
+                        dsv41_iq_block_bytes_(type_)),
+        type(type_), tab(tab_), k_off(0) {}
+  METAL_FUNC void load() const {
+    float v[8];
+    dsv41_iq8_(row, k_off / 32, bj / 8, type, tab, v);
+    for (short j = 0; j < 8; ++j) { dst[j] = v[j]; }
+  }
+  METAL_FUNC void next() { k_off += 32; }
+};
+
+// dsv41_moe_gu_q_grouped / _down_q_grouped over the blocks.
+// threadgroups {I / 32 (H / 32), maxtiles}, tg {32, 2, 2}.
+kernel void dsv41_moe_gu_iq_grouped(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* srow [[buffer(5)]],
+    const device float* swt [[buffer(6)]],
+    const device int* tile2e [[buffer(7)]],
+    constant int& K [[buffer(8)]], constant int& I [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float Xs[32 * 36], Gs[32 * 36], Us[32 * 36];
+  const int e = tile2e[tid.y];
+  if (e < 0) { return; }
+  const int y_row = (int)tid.y * 32, y_col = (int)tid.x * 32;
+  Dsv41RowLoader<T> lx(x, K, srow, y_row, Xs, sg, lane);
+  Dsv41IqLoader lg(w1 + (long)e * cw, K, t1, tab, y_col, Gs, sg, lane);
+  Dsv41IqLoader lu(w3 + (long)e * cw, K, t3, tab, y_col, Us, sg, lane);
+  dsv41_mma_f32_t mg(sg, lane), mu(sg, lane);
+  for (int k = 0; k < K; k += 32) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    lx.load();
+    lg.load();
+    lu.load();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mg.mma(Xs, Gs);
+    mu.mma(Xs, Us);
+    lx.next();
+    lg.next();
+    lu.next();
+  }
+  for (short ti = 0; ti < 2; ++ti) {
+    const int row = y_row + mg.sm + ti * 16;
+    const float w = swt[row];
+    for (short tj = 0; tj < 2; ++tj) {
+      const int col = y_col + mg.sn + tj * 16;
+      const thread auto& fg = mg.Ctile.frag_at(ti, tj);
+      const thread auto& fu = mu.Ctile.frag_at(ti, tj);
+      for (short c = 0; c < 2; ++c) {
+        float gg = fg[c], uu = fu[c];
+        if (lim > 0.0f) {
+          uu = clamp(uu, -lim, lim);
+          gg = min(gg, lim);
+        }
+        act[(long)row * I + col + c] = (T)(w * (gg / (1.0f + exp(-gg)) * uu));
+      }
+    }
+  }
+}
+
+kernel void dsv41_moe_down_iq_grouped(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* part [[buffer(3)]],
+    const device int* sdst [[buffer(4)]],
+    const device int* tile2e [[buffer(5)]],
+    constant int& I [[buffer(6)]], constant int& H [[buffer(7)]],
+    constant uint& t2 [[buffer(8)]], constant long& cw [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float Xs[32 * 36], Ws[32 * 36];
+  const int e = tile2e[tid.y];
+  if (e < 0) { return; }
+  const int y_row = (int)tid.y * 32, y_col = (int)tid.x * 32;
+  Dsv41RowLoader<T> lx(act, I, nullptr, y_row, Xs, sg, lane);
+  Dsv41IqLoader lw(w2 + (long)e * cw, I, t2, tab, y_col, Ws, sg, lane);
+  dsv41_mma_f32_t mm(sg, lane);
+  for (int k = 0; k < I; k += 32) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    lx.load();
+    lw.load();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mm.mma(Xs, Ws);
+    lx.next();
+    lw.next();
+  }
+  for (short ti = 0; ti < 2; ++ti) {
+    const int row = y_row + mm.sm + ti * 16;
+    const int dr = sdst[row];
+    if (dr < 0) { continue; }
+    for (short tj = 0; tj < 2; ++tj) {
+      const int col = y_col + mm.sn + tj * 16;
+      const thread auto& f = mm.Ctile.frag_at(ti, tj);
+      part[(long)dr * H + col] = (T)f[0];
+      part[(long)dr * H + col + 1] = (T)f[1];
+    }
+  }
+}
+
+// ---- the same, a lane a sub-block (llama.cpp's kernel_mul_mv_iq* mapping):
+// a simdgroup's 32 lanes take consecutive sub-blocks of 4 rows, each lane
+// its 32 inputs in registers for all four; the grids (and signs) read from
+// device memory or, TG, from a threadgroup copy. A sub-block's sum is
+// d * sum(grid * sign * x) -- the step taken out of the sum (ggml widens
+// each value first: the same terms, another rounding).
+inline int dsv41_iq_grid_at_(const uint type)
+{
+  return type == kDsv41IqXXS ? 0 : type == kDsv41IqXS ? (int)kDsv41GridXS
+         : type == kDsv41Iq2S ? (int)kDsv41Grid2S
+         : type == kDsv41Iq3XXS ? (int)kDsv41Grid3XXS : (int)kDsv41Grid1S;
+}
+inline int dsv41_iq_grid_n_(const uint type)
+{
+  return type == kDsv41IqXXS ? 256 : type == kDsv41IqXS ? 512
+         : type == kDsv41Iq2S ? 1024 : type == kDsv41Iq3XXS ? 128 : 2048;
+}
+
+template <typename P>
+inline float dsv41_iq32_dot_(const device uchar* row, const int sub,
+                             const uint type, P grid, P signs,
+                             thread const float* y)
+{
+  const int ib = sub % 8;
+  if (type == kDsv41IqXXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 66;
+    const float d = dsv41_f16_at_(blk);
+    const device uchar* q = blk + 2 + 8 * ib;
+    const uint a1 = uint(q[4]) | (uint(q[5]) << 8) | (uint(q[6]) << 16) |
+                    (uint(q[7]) << 24);
+    float s = 0.0f;
+    for (int l = 0; l < 4; ++l) {
+      const uint i = (a1 >> (7 * l)) & 127;
+      const uint sg = uint((signs[i / 8] >> (8 * (i % 8))) & 0xff);
+      const ulong g = grid[q[l]];
+      for (int j = 0; j < 8; ++j) {
+        const float gv = float((g >> (8 * j)) & 0xff);
+        s += ((sg >> j) & 1u) != 0 ? -gv * y[8 * l + j] : gv * y[8 * l + j];
+      }
+    }
+    return d * (0.5f + float(a1 >> 28)) * 0.25f * s;
+  }
+  if (type == kDsv41IqXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 74;
+    const float d = dsv41_f16_at_(blk);
+    const uint sc = blk[66 + ib];
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int l = 0; l < 4; ++l) {
+      const device uchar* qp = blk + 2 + 2 * (4 * ib + l);
+      const uint q = uint(qp[0]) | (uint(qp[1]) << 8);
+      const uint i = q >> 9;
+      const uint sg = uint((signs[i / 8] >> (8 * (i % 8))) & 0xff);
+      const ulong g = grid[q & 511];
+      float s = 0.0f;
+      for (int j = 0; j < 8; ++j) {
+        const float gv = float((g >> (8 * j)) & 0xff);
+        s += ((sg >> j) & 1u) != 0 ? -gv * y[8 * l + j] : gv * y[8 * l + j];
+      }
+      if (l < 2) { s0 += s; } else { s1 += s; }
+    }
+    return d * 0.25f * ((0.5f + float(sc & 0xf)) * s0 +
+                        (0.5f + float(sc >> 4)) * s1);
+  }
+  const device uchar* blk = row + (long)(sub / 8) * 56;
+  const device uchar* qs = blk + 4 * ib;
+  const device uchar* qh = blk + 32 + 2 * ib;
+  const device ushort* scp = (const device ushort*)(blk + 48);
+  const ushort sc0 = scp[0], sc1 = scp[1], sc2 = scp[2], sc3 = scp[3];
+  const ushort su = ushort((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) |
+                           ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+  const float d = float(as_type<half>(su));
+  const ushort scb = ib / 2 == 0 ? sc0 : ib / 2 == 1 ? sc1 : ib / 2 == 2
+                                                               ? sc2 : sc3;
+  const int sh = 6 * (ib % 2);
+  float r = 0.0f;
+  for (int half_ = 0; half_ < 2; ++half_) {
+    const float dl = d * float(2 * ((scb >> (sh + 3 * half_)) & 0x7) + 1);
+    const uint h = qh[half_];
+    float s = 0.0f;
+    for (int t = 0; t < 2; ++t) {
+      const int l = 2 * half_ + t;
+      const uint idx = uint(qs[l]) | ((t == 0 ? (h << 8) : (h << 4)) & 0x700);
+      const float delta = (h & (t == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f
+                                                              : 0.125f;
+      const ulong g = grid[idx];
+      for (int j = 0; j < 8; ++j) {
+        const float gv = float(char((g >> (8 * j)) & 0xff));
+        s += (gv + delta) * y[8 * l + j];
+      }
+    }
+    r += dl * s;
+  }
+  return r;
+}
+
+// grid {32, ceil(rows / 16) * 4, pairs}, tg {32, 4, 1}
+template <bool TG>
+kernel void dsv41_moe_swiglu_iq2_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  // (two 2064-entry tables are 33 KB, past an M1-M4's 32 KB of
+  // threadgroup memory: only the device-table form is built)
+  static_assert(!TG, "dsv41_moe_swiglu_iq2_'s tables exceed 32 KB");
+  threadgroup ulong tt[TG ? 2 * (2048 + 16) : 1];
+  const device ulong* g1d = tab + dsv41_iq_grid_at_(t1);
+  const device ulong* g3d = tab + dsv41_iq_grid_at_(t3);
+  const device ulong* sgd = tab + kDsv41Signs;
+  const threadgroup ulong* g1t = tt;
+  const threadgroup ulong* g3t = tt + 2064;
+  if (TG) {
+    const int n1 = dsv41_iq_grid_n_(t1), n3 = dsv41_iq_grid_n_(t3);
+    for (int i = (int)(sg * 32 + lane); i < 2064; i += 128) {
+      if (i < n1 + 16) {
+        tt[i] = i < n1 ? g1d[i] : sgd[i - n1];
+      }
+      if (i < n3 + 16) {
+        tt[2064 + i] = i < n3 ? g3d[i] : sgd[i - n3];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int f0 = ((int)tg.y * 4 + (int)sg) * 4;
+  const long rb1 = (long)(K / 256) * dsv41_iq_block_bytes_(t1);
+  const long rb3 = (long)(K / 256) * dsv41_iq_block_bytes_(t3);
+  const device uchar* b1 = w1 + e * cw;
+  const device uchar* b3 = w3 + e * cw;
+  const device T* xr = x + (long)(p / topk) * K;
+  float g[4] = {0, 0, 0, 0}, u[4] = {0, 0, 0, 0};
+  for (int sb = (int)lane; sb < K / 32; sb += 32) {
+    float y[32];
+    for (int q = 0; q < 32; ++q) { y[q] = (float)xr[sb * 32 + q]; }
+    for (int r = 0; r < 4; ++r) {
+      const int f = f0 + r;
+      if (f >= I) { break; }
+      if (TG) {
+        const int n1 = dsv41_iq_grid_n_(t1), n3 = dsv41_iq_grid_n_(t3);
+        g[r] += dsv41_iq32_dot_(b1 + f * rb1, sb, t1, g1t, g1t + n1, y);
+        u[r] += dsv41_iq32_dot_(b3 + f * rb3, sb, t3, g3t, g3t + n3, y);
+      } else {
+        g[r] += dsv41_iq32_dot_(b1 + f * rb1, sb, t1, g1d, sgd, y);
+        u[r] += dsv41_iq32_dot_(b3 + f * rb3, sb, t3, g3d, sgd, y);
+      }
+    }
+  }
+  for (int r = 0; r < 4; ++r) {
+    float gg = simd_sum(g[r]), uu = simd_sum(u[r]);
+    const int f = f0 + r;
+    if (lane != 0 || f >= I) { continue; }
+    if (lim > 0.0f) {
+      uu = clamp(uu, -lim, lim);
+      gg = min(gg, lim);
+    }
+    act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+  }
+}
+
+template <bool TG>
+kernel void dsv41_moe_down_iq2_(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* slot [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[2048 + 16];
+  const device ulong* gd = tab + dsv41_iq_grid_at_(t2);
+  const device ulong* sgd = tab + kDsv41Signs;
+  const int n2 = dsv41_iq_grid_n_(t2);
+  if (TG) {
+    for (int i = (int)(sg * 32 + lane); i < n2 + 16; i += 128) {
+      tt[i] = i < n2 ? gd[i] : sgd[i - n2];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int o0 = ((int)tg.y * 4 + (int)sg) * 4;
+  const long rb = (long)(I / 256) * dsv41_iq_block_bytes_(t2);
+  const device uchar* b2 = w2 + e * cw;
+  const device T* ar = act + (long)p * I;
+  float acc[4] = {0, 0, 0, 0};
+  for (int sb = (int)lane; sb < I / 32; sb += 32) {
+    float y[32];
+    for (int q = 0; q < 32; ++q) { y[q] = (float)ar[sb * 32 + q]; }
+    for (int r = 0; r < 4; ++r) {
+      const int o = o0 + r;
+      if (o >= H) { break; }
+      if (TG) {
+        acc[r] += dsv41_iq32_dot_(b2 + o * rb, sb, t2,
+                                  (const threadgroup ulong*)tt,
+                                  (const threadgroup ulong*)tt + n2, y);
+      } else {
+        acc[r] += dsv41_iq32_dot_(b2 + o * rb, sb, t2, gd, sgd, y);
+      }
+    }
+  }
+  for (int r = 0; r < 4; ++r) {
+    const float s = simd_sum(acc[r]);
+    const int o = o0 + r;
+    if (lane == 0 && o < H) { out[(long)p * H + o] = (T)s; }
+  }
+}
+
+#define DSV41_IQ2_KERNELS(SUF, TGV)                                          \
+  template [[host_name("dsv41_moe_swiglu_iq2" SUF)]] kernel void             \
+  dsv41_moe_swiglu_iq2_<TGV>(                                                \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);    \
+  template [[host_name("dsv41_moe_down_iq2" SUF)]] kernel void               \
+  dsv41_moe_down_iq2_<TGV>(                                                  \
+      const device uchar*, const device ulong*, const device T*, device T*,  \
+      const device int*, constant int&, constant int&, constant uint&,       \
+      constant long&, uint3, uint, uint);
+DSV41_IQ2_KERNELS("", false)
+
+// ---- vectorized: a grid entry's 8 bytes widened four at a time, a sign
+// byte applied to the inputs' sign bits, dot() over float4s.
+inline float dsv41_iq_dot8_(const ulong g, const uint sg, const float4 y0,
+                            const float4 y1)
+{
+  const float4 a = float4(as_type<uchar4>(uint(g)));
+  const float4 b = float4(as_type<uchar4>(uint(g >> 32)));
+  const uint4 m0 = ((uint4(sg) >> uint4(0, 1, 2, 3)) & 1u) << 31;
+  const uint4 m1 = ((uint4(sg) >> uint4(4, 5, 6, 7)) & 1u) << 31;
+  return dot(a, as_type<float4>(as_type<uint4>(y0) ^ m0)) +
+         dot(b, as_type<float4>(as_type<uint4>(y1) ^ m1));
+}
+
+template <typename P>
+inline float dsv41_iq32_dotv_(const device uchar* row, const int sub,
+                              const uint type, P grid, P signs,
+                              thread const float4* y)
+{
+  const int ib = sub % 8;
+  if (type == kDsv41IqXXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 66;
+    const device ushort* q16 = (const device ushort*)(blk + 2 + 8 * ib);
+    const float d = float(as_type<half>(*(const device ushort*)blk));
+    const ushort q0 = q16[0], q1 = q16[1];
+    const uint a1 = uint(q16[2]) | (uint(q16[3]) << 16);
+    const uint idx[4] = {uint(q0 & 0xff), uint(q0 >> 8), uint(q1 & 0xff),
+                         uint(q1 >> 8)};
+    float s = 0.0f;
+    for (int l = 0; l < 4; ++l) {
+      const uint i = (a1 >> (7 * l)) & 127;
+      const uint sg = uint((signs[i / 8] >> (8 * (i % 8))) & 0xff);
+      s += dsv41_iq_dot8_(grid[idx[l]], sg, y[2 * l], y[2 * l + 1]);
+    }
+    return d * (0.5f + float(a1 >> 28)) * 0.25f * s;
+  }
+  if (type == kDsv41IqXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 74;
+    const device ushort* q16 = (const device ushort*)(blk + 2 + 8 * ib);
+    const float d = float(as_type<half>(*(const device ushort*)blk));
+    const uint sc = blk[66 + ib];
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int l = 0; l < 4; ++l) {
+      const uint q = q16[l];
+      const uint i = q >> 9;
+      const uint sg = uint((signs[i / 8] >> (8 * (i % 8))) & 0xff);
+      const float s = dsv41_iq_dot8_(grid[q & 511], sg, y[2 * l],
+                                     y[2 * l + 1]);
+      if (l < 2) { s0 += s; } else { s1 += s; }
+    }
+    return d * 0.25f * ((0.5f + float(sc & 0xf)) * s0 +
+                        (0.5f + float(sc >> 4)) * s1);
+  }
+  const device uchar* blk = row + (long)(sub / 8) * 56;
+  const uint qs = *(const device uint*)(blk + 4 * ib);
+  const uint qh = *(const device ushort*)(blk + 32 + 2 * ib);
+  const device ushort* scp = (const device ushort*)(blk + 48);
+  const ushort sc0 = scp[0], sc1 = scp[1], sc2 = scp[2], sc3 = scp[3];
+  const ushort su = ushort((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) |
+                           ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+  const float d = float(as_type<half>(su));
+  const uint scb = scp[ib / 2];
+  const int sh = 6 * (ib % 2);
+  float r = 0.0f;
+  for (int hh = 0; hh < 2; ++hh) {
+    const float dl = d * float(2 * ((scb >> (sh + 3 * hh)) & 0x7) + 1);
+    const uint h = (qh >> (8 * hh)) & 0xff;
+    float s = 0.0f;
+    for (int t = 0; t < 2; ++t) {
+      const int l = 2 * hh + t;
+      const uint idx = ((qs >> (8 * l)) & 0xff) |
+                       ((t == 0 ? (h << 8) : (h << 4)) & 0x700);
+      const float delta = (h & (t == 0 ? 0x08u : 0x80u)) != 0 ? -0.125f
+                                                              : 0.125f;
+      const ulong g = grid[idx];
+      const float4 a = float4(as_type<char4>(uint(g)));
+      const float4 b = float4(as_type<char4>(uint(g >> 32)));
+      const float4 y0 = y[2 * l], y1 = y[2 * l + 1];
+      s += dot(a, y0) + dot(b, y1) +
+           delta * (y0.x + y0.y + y0.z + y0.w + y1.x + y1.y + y1.z + y1.w);
+    }
+    r += dl * s;
+  }
+  return r;
+}
+
+// grid {32, ceil(rows / (4 * RS)) * 4, pairs}, tg {32, 4, 1}: RS rows a
+// simdgroup.
+template <bool TG, int RS>
+kernel void dsv41_moe_swiglu_iq3_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[2048 + 16];
+  const device ulong* g1d = tab + dsv41_iq_grid_at_(t1);
+  const device ulong* g3d = tab + dsv41_iq_grid_at_(t3);
+  const device ulong* sgd = tab + kDsv41Signs;
+  const int n1 = dsv41_iq_grid_n_(t1);
+  if (TG) {
+    for (int i = (int)(sg * 32 + lane); i < n1 + 16; i += 128) {
+      tt[i] = i < n1 ? g1d[i] : sgd[i - n1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const bool same = t1 == t3;
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int f0 = ((int)tg.y * 4 + (int)sg) * RS;
+  const long rb1 = (long)(K / 256) * dsv41_iq_block_bytes_(t1);
+  const long rb3 = (long)(K / 256) * dsv41_iq_block_bytes_(t3);
+  const device uchar* b1 = w1 + e * cw;
+  const device uchar* b3 = w3 + e * cw;
+  const device T* xr = x + (long)(p / topk) * K;
+  float g[RS], u[RS];
+  for (int r = 0; r < RS; ++r) { g[r] = u[r] = 0.0f; }
+  for (int sb = (int)lane; sb < K / 32; sb += 32) {
+    float4 y[8];
+    for (int q = 0; q < 8; ++q) {
+      const device T* xp = xr + sb * 32 + 4 * q;
+      y[q] = float4((float)xp[0], (float)xp[1], (float)xp[2], (float)xp[3]);
+    }
+    for (int r = 0; r < RS; ++r) {
+      const int f = f0 + r;
+      if (f >= I) { break; }
+      if (TG) {
+        const threadgroup ulong* gt = tt;
+        g[r] += dsv41_iq32_dotv_(b1 + f * rb1, sb, t1, gt, gt + n1, y);
+        u[r] += same ? dsv41_iq32_dotv_(b3 + f * rb3, sb, t3, gt, gt + n1, y)
+                     : dsv41_iq32_dotv_(b3 + f * rb3, sb, t3, g3d, sgd, y);
+      } else {
+        g[r] += dsv41_iq32_dotv_(b1 + f * rb1, sb, t1, g1d, sgd, y);
+        u[r] += dsv41_iq32_dotv_(b3 + f * rb3, sb, t3, g3d, sgd, y);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    float gg = simd_sum(g[r]), uu = simd_sum(u[r]);
+    const int f = f0 + r;
+    if (lane != 0 || f >= I) { continue; }
+    if (lim > 0.0f) {
+      uu = clamp(uu, -lim, lim);
+      gg = min(gg, lim);
+    }
+    act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+  }
+}
+
+template <bool TG, int RS>
+kernel void dsv41_moe_down_iq3_(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* slot [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[2048 + 16];
+  const device ulong* gd = tab + dsv41_iq_grid_at_(t2);
+  const device ulong* sgd = tab + kDsv41Signs;
+  const int n2 = dsv41_iq_grid_n_(t2);
+  if (TG) {
+    for (int i = (int)(sg * 32 + lane); i < n2 + 16; i += 128) {
+      tt[i] = i < n2 ? gd[i] : sgd[i - n2];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int o0 = ((int)tg.y * 4 + (int)sg) * RS;
+  const long rb = (long)(I / 256) * dsv41_iq_block_bytes_(t2);
+  const device uchar* b2 = w2 + e * cw;
+  const device T* ar = act + (long)p * I;
+  float acc[RS];
+  for (int r = 0; r < RS; ++r) { acc[r] = 0.0f; }
+  for (int sb = (int)lane; sb < I / 32; sb += 32) {
+    float4 y[8];
+    for (int q = 0; q < 8; ++q) {
+      const device T* ap = ar + sb * 32 + 4 * q;
+      y[q] = float4((float)ap[0], (float)ap[1], (float)ap[2], (float)ap[3]);
+    }
+    for (int r = 0; r < RS; ++r) {
+      const int o = o0 + r;
+      if (o >= H) { break; }
+      if (TG) {
+        const threadgroup ulong* gt = tt;
+        acc[r] += dsv41_iq32_dotv_(b2 + o * rb, sb, t2, gt, gt + n2, y);
+      } else {
+        acc[r] += dsv41_iq32_dotv_(b2 + o * rb, sb, t2, gd, sgd, y);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    const float s = simd_sum(acc[r]);
+    const int o = o0 + r;
+    if (lane == 0 && o < H) { out[(long)p * H + o] = (T)s; }
+  }
+}
+
+#define DSV41_IQ3_KERNELS(SUF, TGV, RSV)                                     \
+  template [[host_name("dsv41_moe_swiglu_iq3" SUF)]] kernel void             \
+  dsv41_moe_swiglu_iq3_<TGV, RSV>(                                           \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);    \
+  template [[host_name("dsv41_moe_down_iq3" SUF)]] kernel void               \
+  dsv41_moe_down_iq3_<TGV, RSV>(                                             \
+      const device uchar*, const device ulong*, const device T*, device T*,  \
+      const device int*, constant int&, constant int&, constant uint&,       \
+      constant long&, uint3, uint, uint);
+DSV41_IQ3_KERNELS("_r4", false, 4)
+DSV41_IQ3_KERNELS("_tg_r4", true, 4)
+DSV41_IQ3_KERNELS("_r2", false, 2)
+DSV41_IQ3_KERNELS("_tg_r8", true, 8)
+DSV41_IQ3_KERNELS("_r8", false, 8)
+
+// DIAGNOSTIC (bench only): IQ2_XXS's swiglu with parts of the decode taken
+// out. MODE 1: no grid / sign lookups (the indices as the bytes); 2: no
+// weight reads at all (a constant block).
+template <int MODE>
+kernel void dsv41_moe_swiglu_iqd_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  (void)lim;   // (the dispatch-cost study: no clamp, one format)
+  (void)t1;
+  (void)t3;
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int f0 = ((int)tg.y * 4 + (int)sg) * 2;
+  const long rb = (long)(K / 256) * 66;
+  const device T* xr = x + (long)(p / topk) * K;
+  float g[2] = {0, 0}, u[2] = {0, 0};
+  for (int sb = (int)lane; sb < K / 32; sb += 32) {
+    float4 y[8];
+    for (int q = 0; q < 8; ++q) {
+      const device T* xp = xr + sb * 32 + 4 * q;
+      y[q] = float4((float)xp[0], (float)xp[1], (float)xp[2], (float)xp[3]);
+    }
+    for (int r = 0; r < 2; ++r) {
+      for (int m = 0; m < 2; ++m) {
+        const device uchar* blk =
+            (m == 0 ? w1 : w3) + e * cw + (f0 + r) * rb + (long)(sb / 8) * 66;
+        uint q0 = 0x01020304u, q1 = 0x05060708u, a1 = 0x12345678u;
+        (void)q1;
+        float d = 0.01f;
+        if (MODE < 2) {
+          const device ushort* q16 =
+              (const device ushort*)(blk + 2 + 8 * (sb % 8));
+          d = float(as_type<half>(*(const device ushort*)blk));
+          q0 = uint(q16[0]) | (uint(q16[1]) << 16);
+          a1 = uint(q16[2]) | (uint(q16[3]) << 16);
+        }
+        float s = 0.0f;
+        for (int l = 0; l < 4; ++l) {
+          const uint i = (a1 >> (7 * l)) & 127;
+          ulong gg;
+          uint sgn;
+          if (MODE == 0) {
+            sgn = uint((tab[kDsv41Signs + i / 8] >> (8 * (i % 8))) & 0xff);
+            gg = tab[(q0 >> (8 * l)) & 0xff];
+          } else {
+            sgn = i;
+            gg = ulong((q0 >> (8 * l)) & 0xff) * 0x0101010101010101ul;
+          }
+          s += dsv41_iq_dot8_(gg, sgn, y[2 * l], y[2 * l + 1]);
+        }
+        const float v = d * (0.5f + float(a1 >> 28)) * 0.25f * s;
+        if (m == 0) { g[r] += v; } else { u[r] += v; }
+      }
+    }
+  }
+  for (int r = 0; r < 2; ++r) {
+    float gg = simd_sum(g[r]), uu = simd_sum(u[r]);
+    const int f = f0 + r;
+    if (lane != 0 || f >= I) { continue; }
+    act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+  }
+}
+#define DSV41_IQD(M)                                                         \
+  template [[host_name("dsv41_moe_swiglu_iqd" #M "_r2")]] kernel void        \
+  dsv41_moe_swiglu_iqd_<M>(                                                  \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);
+DSV41_IQD(0)
+DSV41_IQD(1)
+DSV41_IQD(2)
+
+// ---- fewer loads: the sign byte computed (ksigns_iq2xs[i] is i with its
+// parity in bit 7), a sub-block's codes one packed load, the grids from a
+// threadgroup copy (TG) or device memory.
+inline uint dsv41_ksign_(const uint i) { return i | ((popcount(i) & 1u) << 7); }
+
+template <typename P>
+inline float dsv41_iq32_dotf_(const device uchar* row, const int sub,
+                              const uint type, P grid,
+                              thread const float4* y)
+{
+  const int ib = sub % 8;
+  if (type == kDsv41IqXXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 66;
+    const packed_ushort4 q =
+        *(const device packed_ushort4*)(blk + 2 + 8 * ib);
+    const float d = float(as_type<half>(*(const device ushort*)blk));
+    const uint a1 = uint(q[2]) | (uint(q[3]) << 16);
+    const ulong g0 = grid[q[0] & 0xff], g1 = grid[q[0] >> 8];
+    const ulong g2 = grid[q[1] & 0xff], g3 = grid[q[1] >> 8];
+    float s = dsv41_iq_dot8_(g0, dsv41_ksign_(a1 & 127), y[0], y[1]);
+    s += dsv41_iq_dot8_(g1, dsv41_ksign_((a1 >> 7) & 127), y[2], y[3]);
+    s += dsv41_iq_dot8_(g2, dsv41_ksign_((a1 >> 14) & 127), y[4], y[5]);
+    s += dsv41_iq_dot8_(g3, dsv41_ksign_((a1 >> 21) & 127), y[6], y[7]);
+    return d * (0.5f + float(a1 >> 28)) * 0.25f * s;
+  }
+  if (type == kDsv41IqXS) {
+    const device uchar* blk = row + (long)(sub / 8) * 74;
+    const packed_ushort4 q =
+        *(const device packed_ushort4*)(blk + 2 + 8 * ib);
+    const float d = float(as_type<half>(*(const device ushort*)blk));
+    const uint sc = blk[66 + ib];
+    const float s0 =
+        dsv41_iq_dot8_(grid[q[0] & 511], dsv41_ksign_(q[0] >> 9), y[0],
+                       y[1]) +
+        dsv41_iq_dot8_(grid[q[1] & 511], dsv41_ksign_(q[1] >> 9), y[2], y[3]);
+    const float s1 =
+        dsv41_iq_dot8_(grid[q[2] & 511], dsv41_ksign_(q[2] >> 9), y[4],
+                       y[5]) +
+        dsv41_iq_dot8_(grid[q[3] & 511], dsv41_ksign_(q[3] >> 9), y[6], y[7]);
+    return d * 0.25f * ((0.5f + float(sc & 0xf)) * s0 +
+                        (0.5f + float(sc >> 4)) * s1);
+  }
+  return dsv41_iq32_dotv_(row, sub, type, grid, grid, y);
+}
+
+template <bool TG, int RS>
+kernel void dsv41_moe_swiglu_iq4_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[2048];
+  const device ulong* g1d = tab + dsv41_iq_grid_at_(t1);
+  const device ulong* g3d = tab + dsv41_iq_grid_at_(t3);
+  if (TG) {
+    const int n1 = dsv41_iq_grid_n_(t1);
+    for (int i = (int)(sg * 32 + lane); i < n1; i += 128) { tt[i] = g1d[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const bool same = t1 == t3;
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int f0 = ((int)tg.y * 4 + (int)sg) * RS;
+  const long rb1 = (long)(K / 256) * dsv41_iq_block_bytes_(t1);
+  const long rb3 = (long)(K / 256) * dsv41_iq_block_bytes_(t3);
+  const device uchar* b1 = w1 + e * cw;
+  const device uchar* b3 = w3 + e * cw;
+  const device T* xr = x + (long)(p / topk) * K;
+  float g[RS], u[RS];
+  for (int r = 0; r < RS; ++r) { g[r] = u[r] = 0.0f; }
+  for (int sb = (int)lane; sb < K / 32; sb += 32) {
+    float4 y[8];
+    {
+      const device vec<T, 4>* xp = (const device vec<T, 4>*)(xr + sb * 32);
+      for (int q = 0; q < 8; ++q) { y[q] = float4(xp[q]); }
+    }
+    for (int r = 0; r < RS; ++r) {
+      const int f = f0 + r;
+      if (f >= I) { break; }
+      if (TG) {
+        const threadgroup ulong* gt = tt;
+        g[r] += dsv41_iq32_dotf_(b1 + f * rb1, sb, t1, gt, y);
+        u[r] += same ? dsv41_iq32_dotf_(b3 + f * rb3, sb, t3, gt, y)
+                     : dsv41_iq32_dotf_(b3 + f * rb3, sb, t3, g3d, y);
+      } else {
+        g[r] += dsv41_iq32_dotf_(b1 + f * rb1, sb, t1, g1d, y);
+        u[r] += dsv41_iq32_dotf_(b3 + f * rb3, sb, t3, g3d, y);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    float gg = simd_sum(g[r]), uu = simd_sum(u[r]);
+    const int f = f0 + r;
+    if (lane != 0 || f >= I) { continue; }
+    if (lim > 0.0f) {
+      uu = clamp(uu, -lim, lim);
+      gg = min(gg, lim);
+    }
+    act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+  }
+}
+
+template <bool TG, int RS>
+kernel void dsv41_moe_down_iq4_(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* slot [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[2048];
+  const device ulong* gd = tab + dsv41_iq_grid_at_(t2);
+  if (TG) {
+    const int n2 = dsv41_iq_grid_n_(t2);
+    for (int i = (int)(sg * 32 + lane); i < n2; i += 128) { tt[i] = gd[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int o0 = ((int)tg.y * 4 + (int)sg) * RS;
+  const long rb = (long)(I / 256) * dsv41_iq_block_bytes_(t2);
+  const device uchar* b2 = w2 + e * cw;
+  const device T* ar = act + (long)p * I;
+  float acc[RS];
+  for (int r = 0; r < RS; ++r) { acc[r] = 0.0f; }
+  for (int sb = (int)lane; sb < I / 32; sb += 32) {
+    float4 y[8];
+    {
+      const device vec<T, 4>* ap = (const device vec<T, 4>*)(ar + sb * 32);
+      for (int q = 0; q < 8; ++q) { y[q] = float4(ap[q]); }
+    }
+    for (int r = 0; r < RS; ++r) {
+      const int o = o0 + r;
+      if (o >= H) { break; }
+      if (TG) {
+        const threadgroup ulong* gt = tt;
+        acc[r] += dsv41_iq32_dotf_(b2 + o * rb, sb, t2, gt, y);
+      } else {
+        acc[r] += dsv41_iq32_dotf_(b2 + o * rb, sb, t2, gd, y);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    const float s = simd_sum(acc[r]);
+    const int o = o0 + r;
+    if (lane == 0 && o < H) { out[(long)p * H + o] = (T)s; }
+  }
+}
+
+#define DSV41_IQ4_KERNELS(SUF, TGV, RSV)                                     \
+  template [[host_name("dsv41_moe_swiglu_iq4" SUF)]] kernel void             \
+  dsv41_moe_swiglu_iq4_<TGV, RSV>(                                           \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);    \
+  template [[host_name("dsv41_moe_down_iq4" SUF)]] kernel void               \
+  dsv41_moe_down_iq4_<TGV, RSV>(                                             \
+      const device uchar*, const device ulong*, const device T*, device T*,  \
+      const device int*, constant int&, constant int&, constant uint&,       \
+      constant long&, uint3, uint, uint);
+DSV41_IQ4_KERNELS("_r2", false, 2)
+DSV41_IQ4_KERNELS("_tg_r2", true, 2)
+DSV41_IQ4_KERNELS("_r4", false, 4)
+DSV41_IQ4_KERNELS("_tg_r4", true, 4)
+
+// A verify's pairs grouped by slot on the GPU (the picks are its own under
+// the handshake): gtab[g * 10 ..] = {slot, count, pairs...}, at most cap
+// pairs a group, in first-pick order; the groups past the last count 0.
+// grid {1}.
+kernel void dsv41_moe_group_pairs(
+    const device int* slot [[buffer(0)]],
+    device int*       gtab [[buffer(1)]],
+    constant int&     np   [[buffer(2)]],
+    constant int&     cap  [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+  if (tid != 0) { return; }
+  int ng = 0;
+  for (int q = 0; q < np; ++q) {
+    int at = 0;
+    while (at < ng && (gtab[at * 10] != slot[q] || gtab[at * 10 + 1] >= cap)) {
+      ++at;
+    }
+    if (at == ng) {
+      gtab[at * 10] = slot[q];
+      gtab[at * 10 + 1] = 0;
+      ++ng;
+    }
+    gtab[at * 10 + 2 + gtab[at * 10 + 1]++] = q;
+  }
+  for (int at = ng; at < np; ++at) {
+    gtab[at * 10] = 0;
+    gtab[at * 10 + 1] = 0;
+  }
+}
+
+// ---- IQ1_M by nibbles (llama.cpp's iq1s_grid_gpu idea): the grid's
+// ternary values stored value + 1, a u32 an entry (byte j: element j low,
+// element j + 4 high; gpu_iq_tables_native at 2832), so a sum is
+// dot(nibbles, y) + (delta - 1) * sum(y) -- no widening of signed bytes,
+// a quarter of the table. ys[l]: the sum of y's 8 values at l.
+constant constexpr uint kDsv41Grid1N = 2832;   // in u64s
+
+template <typename PU>
+inline float dsv41_iq1m_dot_(const device uchar* row, const int sub, PU g4,
+                             thread const float4* y, thread const float* ys)
+{
+  const int ib = sub % 8;
+  const device uchar* blk = row + (long)(sub / 8) * 56;
+  const uint qs = *(const device uint*)(blk + 4 * ib);
+  const uint qh = *(const device ushort*)(blk + 32 + 2 * ib);
+  const uint2 sc = *(const device uint2*)(blk + 48);
+  const uint sc0 = sc.x & 0xffff, sc1 = sc.x >> 16, sc2 = sc.y & 0xffff,
+             sc3 = sc.y >> 16;
+  const ushort su = ushort((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) |
+                           ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000));
+  const float d = float(as_type<half>(su));
+  const uint scb = (ib / 2 == 0 ? sc0 : ib / 2 == 1 ? sc1 : ib / 2 == 2 ? sc2
+                                                                       : sc3);
+  const int sh = 6 * (ib % 2);
+  float r = 0.0f;
+  for (int hh = 0; hh < 2; ++hh) {
+    const float dl = d * float(2 * ((scb >> (sh + 3 * hh)) & 0x7) + 1);
+    const uint h = (qh >> (8 * hh)) & 0xff;
+    float s = 0.0f;
+    for (int t = 0; t < 2; ++t) {
+      const int l = 2 * hh + t;
+      const uint idx = ((qs >> (8 * l)) & 0xff) |
+                       ((t == 0 ? (h << 8) : (h << 4)) & 0x700);
+      const float delta = (h & (t == 0 ? 0x08u : 0x80u)) != 0 ? -1.125f
+                                                              : -0.875f;
+      const uint u = g4[idx];
+      const float4 a = float4(as_type<uchar4>(u & 0x0f0f0f0fu));
+      const float4 b = float4(as_type<uchar4>((u >> 4) & 0x0f0f0f0fu));
+      s += dot(a, y[2 * l]) + dot(b, y[2 * l + 1]) + delta * ys[l];
+    }
+    r += dl * s;
+  }
+  return r;
+}
+
+// IQ2_S: grid indices 10 bits (qs | qh's two), signs stored as bytes, a
+// scale nibble a half sub-block.
+template <typename P>
+inline float dsv41_iq2s_dot_(const device uchar* row, const int sub, P grid,
+                             thread const float4* y)
+{
+  const int ib = sub % 8;
+  const device uchar* blk = row + (long)(sub / 8) * 82;
+  const float d = float(as_type<half>(*(const device ushort*)blk));
+  const device uchar* qs = blk + 2 + 4 * ib;
+  const device uchar* sgn = blk + 2 + 32 + 4 * ib;
+  const uint qh = blk[66 + ib], sc = blk[74 + ib];
+  float s0 = 0.0f, s1 = 0.0f;
+  for (int l = 0; l < 4; ++l) {
+    const uint gi = uint(qs[l]) | ((qh << (8 - 2 * l)) & 0x300);
+    const float s = dsv41_iq_dot8_(grid[gi], sgn[l], y[2 * l], y[2 * l + 1]);
+    if (l < 2) { s0 += s; } else { s1 += s; }
+  }
+  return d * 0.25f * ((0.5f + float(sc & 0xf)) * s0 +
+                      (0.5f + float(sc >> 4)) * s1);
+}
+
+// IQ3_XXS: 4-value grid entries (u32), two an 8; ksigns as IQ2_XXS's.
+template <typename PU>
+inline float dsv41_iq3xxs_dot_(const device uchar* row, const int sub,
+                               PU g3, thread const float4* y)
+{
+  const int ib = sub % 8;
+  const device uchar* blk = row + (long)(sub / 8) * 98;
+  const float d = float(as_type<half>(*(const device ushort*)blk));
+  const device uchar* qs = blk + 2 + 8 * ib;
+  const uint a = dsv41_u32_at2_(blk + 66 + 4 * ib);
+  float s = 0.0f;
+  for (int l = 0; l < 4; ++l) {
+    const ulong g = ulong(g3[qs[2 * l]]) | (ulong(g3[qs[2 * l + 1]]) << 32);
+    s += dsv41_iq_dot8_(g, dsv41_ksign_((a >> (7 * l)) & 127), y[2 * l],
+                        y[2 * l + 1]);
+  }
+  return d * (0.5f + float(a >> 28)) * 0.5f * s;
+}
+
+template <typename P, typename PU>
+inline float dsv41_iq32_dot5_(const device uchar* row, const int sub,
+                              const uint type, P grid, PU g4,
+                              thread const float4* y, thread const float* ys)
+{
+  if (type == kDsv41IqXXS || type == kDsv41IqXS) {
+    return dsv41_iq32_dotf_(row, sub, type, grid, y);
+  }
+  if (type == kDsv41Iq2S) { return dsv41_iq2s_dot_(row, sub, grid, y); }
+  if (type == kDsv41Iq3XXS) { return dsv41_iq3xxs_dot_(row, sub, g4, y); }
+  return dsv41_iq1m_dot_(row, sub, g4, y, ys);
+}
+
+inline int dsv41_iq_tab_at5_(const uint type)
+{
+  return type == kDsv41IqXXS ? 0 : type == kDsv41IqXS ? (int)kDsv41GridXS
+         : type == kDsv41Iq2S ? (int)kDsv41Grid2S
+         : type == kDsv41Iq3XXS ? (int)kDsv41Grid3XXS : (int)kDsv41Grid1N;
+}
+inline int dsv41_iq_tab_n5_(const uint type)
+{
+  return type == kDsv41IqXXS ? 256 : type == kDsv41IqXS ? 512
+         : type == kDsv41Iq2S ? 1024 : type == kDsv41Iq3XXS ? 128 : 1024;
+}
+
+inline void dsv41_y32_(const device T* x, thread float4* y, thread float* ys)
+{
+  const device vec<T, 4>* xp = (const device vec<T, 4>*)x;
+  for (int q = 0; q < 8; ++q) { y[q] = float4(xp[q]); }
+  for (int l = 0; l < 4; ++l) {
+    const float4 v = y[2 * l] + y[2 * l + 1];
+    ys[l] = v.x + v.y + v.z + v.w;
+  }
+}
+
+// NS simdgroups of RS rows each a threadgroup; TG: the first weight's
+// table copied into threadgroup memory (8 KB at most).
+// grid {32, ceil(rows / (NS * RS)) * NS, pairs}, tg {32, NS, 1}.
+template <int NS, int RS, bool TG>
+kernel void dsv41_moe_swiglu_iq5_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[1024];
+  const device ulong* a1d = tab + dsv41_iq_tab_at5_(t1);
+  const device ulong* a3d = tab + dsv41_iq_tab_at5_(t3);
+  if (TG) {
+    const int n = dsv41_iq_tab_n5_(t1);
+    for (int i = (int)(sg * 32 + lane); i < n; i += 32 * NS) { tt[i] = a1d[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const bool same = t1 == t3;
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int f0 = ((int)tg.y * NS + (int)sg) * RS;
+  const long rb1 = (long)(K / 256) * dsv41_iq_block_bytes_(t1);
+  const long rb3 = (long)(K / 256) * dsv41_iq_block_bytes_(t3);
+  const device uchar* b1 = w1 + e * cw;
+  const device uchar* b3 = w3 + e * cw;
+  const device T* xr = x + (long)(p / topk) * K;
+  float g[RS], u[RS];
+  for (int r = 0; r < RS; ++r) { g[r] = u[r] = 0.0f; }
+  for (int sb = (int)lane; sb < K / 32; sb += 32) {
+    float4 y[8];
+    float ys[4];
+    dsv41_y32_(xr + sb * 32, y, ys);
+    for (int r = 0; r < RS; ++r) {
+      const int f = f0 + r;
+      if (f >= I) { break; }
+      if (TG) {
+        const threadgroup ulong* gt = tt;
+        const threadgroup uint* gu = (const threadgroup uint*)tt;
+        g[r] += dsv41_iq32_dot5_(b1 + f * rb1, sb, t1, gt, gu, y, ys);
+        u[r] += same ? dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, gt, gu, y, ys)
+                     : dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, a3d,
+                                        (const device uint*)a3d, y, ys);
+      } else {
+        g[r] += dsv41_iq32_dot5_(b1 + f * rb1, sb, t1, a1d,
+                                 (const device uint*)a1d, y, ys);
+        u[r] += dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, a3d,
+                                 (const device uint*)a3d, y, ys);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    float gg = simd_sum(g[r]), uu = simd_sum(u[r]);
+    const int f = f0 + r;
+    if (lane != 0 || f >= I) { continue; }
+    if (lim > 0.0f) {
+      uu = clamp(uu, -lim, lim);
+      gg = min(gg, lim);
+    }
+    act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+  }
+}
+
+template <int NS, int RS, bool TG>
+kernel void dsv41_moe_down_iq5_(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* slot [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup ulong tt[1024];
+  const device ulong* ad = tab + dsv41_iq_tab_at5_(t2);
+  if (TG) {
+    const int n = dsv41_iq_tab_n5_(t2);
+    for (int i = (int)(sg * 32 + lane); i < n; i += 32 * NS) { tt[i] = ad[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int o0 = ((int)tg.y * NS + (int)sg) * RS;
+  const long rb = (long)(I / 256) * dsv41_iq_block_bytes_(t2);
+  const device uchar* b2 = w2 + e * cw;
+  const device T* ar = act + (long)p * I;
+  float acc[RS];
+  for (int r = 0; r < RS; ++r) { acc[r] = 0.0f; }
+  for (int sb = (int)lane; sb < I / 32; sb += 32) {
+    float4 y[8];
+    float ys[4];
+    dsv41_y32_(ar + sb * 32, y, ys);
+    for (int r = 0; r < RS; ++r) {
+      const int o = o0 + r;
+      if (o >= H) { break; }
+      if (TG) {
+        acc[r] += dsv41_iq32_dot5_(b2 + o * rb, sb, t2,
+                                   (const threadgroup ulong*)tt,
+                                   (const threadgroup uint*)tt, y, ys);
+      } else {
+        acc[r] += dsv41_iq32_dot5_(b2 + o * rb, sb, t2, ad,
+                                   (const device uint*)ad, y, ys);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    const float s = simd_sum(acc[r]);
+    const int o = o0 + r;
+    if (lane == 0 && o < H) { out[(long)p * H + o] = (T)s; }
+  }
+}
+
+#define DSV41_IQ5_KERNELS(SUF, NSV, RSV, TGV)                                \
+  template [[host_name("dsv41_moe_swiglu_iq5" SUF)]] kernel void             \
+  dsv41_moe_swiglu_iq5_<NSV, RSV, TGV>(                                      \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);    \
+  template [[host_name("dsv41_moe_down_iq5" SUF)]] kernel void               \
+  dsv41_moe_down_iq5_<NSV, RSV, TGV>(                                        \
+      const device uchar*, const device ulong*, const device T*, device T*,  \
+      const device int*, constant int&, constant int&, constant uint&,       \
+      constant long&, uint3, uint, uint);
+DSV41_IQ5_KERNELS("_s4_r2_tg", 4, 2, true)
+DSV41_IQ5_KERNELS("_s4_r2", 4, 2, false)
+DSV41_IQ5_KERNELS("_s8_r2_tg", 8, 2, true)
+DSV41_IQ5_KERNELS("_s8_r4_tg", 8, 4, true)
+DSV41_IQ5_KERNELS("_s16_r2_tg", 16, 2, true)
+DSV41_IQ5_KERNELS("_s4_r4_tg", 4, 4, true)
+
+// ---- a verify's pairs grouped by expert (dsv41_moe_group_pairs): each
+// group's weight rows read once for its rows, every row's sum THE DECODE'S
+// (dsv41_moe_*_iq5_s4_r2[_tg]: the same sub-block dots in the same order,
+// so a verify's row is a decode row bit for bit -- what keeps DSpark's
+// tokens the plain decode's). The first weight's table in threadgroup
+// memory, as the _tg decode keeps it (the same values either way).
+// grid {32, ceil(I / 8) * 4, groups}, tg {32, 4, 1}: 2 rows a simdgroup.
+template <int MM>
+kernel void dsv41_moe_swiglu_iqg_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* gtab [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  if (gtab[(long)tg.z * 10 + 1] == 0) { return; }   // past the last
+  threadgroup ulong tt[1024];
+  const device ulong* a1d = tab + dsv41_iq_tab_at5_(t1);
+  const device ulong* a3d = tab + dsv41_iq_tab_at5_(t3);
+  {
+    const int n = dsv41_iq_tab_n5_(t1);
+    for (int i = (int)(sg * 32 + lane); i < n; i += 128) { tt[i] = a1d[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const threadgroup ulong* gt = tt;
+  const threadgroup uint* gu = (const threadgroup uint*)tt;
+  const bool same = t1 == t3;
+  const device int* gr = gtab + (long)tg.z * 10;
+  const long e = gr[0];
+  const int cnt = gr[1];
+  const int f0 = ((int)tg.y * 4 + (int)sg) * 2;
+  const long rb1 = (long)(K / 256) * dsv41_iq_block_bytes_(t1);
+  const long rb3 = (long)(K / 256) * dsv41_iq_block_bytes_(t3);
+  const device uchar* b1 = w1 + e * cw;
+  const device uchar* b3 = w3 + e * cw;
+  float g[2][MM], u[2][MM];
+  for (int r = 0; r < 2; ++r) {
+    for (int m = 0; m < MM; ++m) { g[r][m] = u[r][m] = 0.0f; }
+  }
+  for (int sb = (int)lane; sb < K / 32; sb += 32) {
+    for (int m = 0; m < MM; ++m) {
+      if (m >= cnt) { break; }
+      float4 y[8];
+      float ys[4];
+      dsv41_y32_(x + (long)(gr[2 + m] / topk) * K + sb * 32, y, ys);
+      for (int r = 0; r < 2; ++r) {
+        const int f = f0 + r;
+        if (f >= I) { break; }
+        g[r][m] += dsv41_iq32_dot5_(b1 + f * rb1, sb, t1, gt, gu, y, ys);
+        u[r][m] += same ? dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, gt, gu, y,
+                                           ys)
+                        : dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, a3d,
+                                           (const device uint*)a3d, y, ys);
+      }
+    }
+  }
+  for (int r = 0; r < 2; ++r) {
+    const int f = f0 + r;
+    for (int m = 0; m < MM; ++m) {
+      float gg = simd_sum(g[r][m]), uu = simd_sum(u[r][m]);
+      if (lane != 0 || f >= I || m >= cnt) { continue; }
+      const int p = gr[2 + m];
+      if (lim > 0.0f) {
+        uu = clamp(uu, -lim, lim);
+        gg = min(gg, lim);
+      }
+      act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+    }
+  }
+}
+
+template <int MM>
+kernel void dsv41_moe_down_iqg_(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* gtab [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  if (gtab[(long)tg.z * 10 + 1] == 0) { return; }   // past the last
+  threadgroup ulong tt[1024];
+  {
+    const device ulong* ad = tab + dsv41_iq_tab_at5_(t2);
+    const int n = dsv41_iq_tab_n5_(t2);
+    for (int i = (int)(sg * 32 + lane); i < n; i += 128) { tt[i] = ad[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const threadgroup ulong* gt = tt;
+  const threadgroup uint* gu = (const threadgroup uint*)tt;
+  const device int* gr = gtab + (long)tg.z * 10;
+  const long e = gr[0];
+  const int cnt = gr[1];
+  const int o0 = ((int)tg.y * 4 + (int)sg) * 2;
+  const long rb = (long)(I / 256) * dsv41_iq_block_bytes_(t2);
+  const device uchar* b2 = w2 + e * cw;
+  float acc[2][MM];
+  for (int r = 0; r < 2; ++r) {
+    for (int m = 0; m < MM; ++m) { acc[r][m] = 0.0f; }
+  }
+  for (int sb = (int)lane; sb < I / 32; sb += 32) {
+    for (int m = 0; m < MM; ++m) {
+      if (m >= cnt) { break; }
+      float4 y[8];
+      float ys[4];
+      dsv41_y32_(act + (long)gr[2 + m] * I + sb * 32, y, ys);
+      for (int r = 0; r < 2; ++r) {
+        const int o = o0 + r;
+        if (o >= H) { break; }
+        acc[r][m] += dsv41_iq32_dot5_(b2 + o * rb, sb, t2, gt, gu, y, ys);
+      }
+    }
+  }
+  for (int r = 0; r < 2; ++r) {
+    const int o = o0 + r;
+    for (int m = 0; m < MM; ++m) {
+      const float s = simd_sum(acc[r][m]);
+      if (lane == 0 && o < H && m < cnt) {
+        out[(long)gr[2 + m] * H + o] = (T)s;
+      }
+    }
+  }
+}
+
+#define DSV41_IQG_KERNELS(MMV)                                               \
+  template [[host_name("dsv41_moe_swiglu_iqg" #MMV)]] kernel void            \
+  dsv41_moe_swiglu_iqg_<MMV>(                                                \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);    \
+  template [[host_name("dsv41_moe_down_iqg" #MMV)]] kernel void              \
+  dsv41_moe_down_iqg_<MMV>(                                                  \
+      const device uchar*, const device ulong*, const device T*, device T*,  \
+      const device int*, constant int&, constant int&, constant uint&,       \
+      constant long&, uint3, uint, uint);
+DSV41_IQG_KERNELS(1)
+DSV41_IQG_KERNELS(2)
+DSV41_IQG_KERNELS(4)
+DSV41_IQG_KERNELS(8)
+
+// ---- wo_a's groups over affine codes in ONE dispatch: dsv41_gemv_q's
+// mapping and arithmetic, group z's x, rows, scales and y at z times their
+// strides (xb, yb in elements, wb in words, sb in scales). grid {32,
+// ceil(N/8) * 2 * KS, groups}, tg {32, 2 * KS, 1}.
+#define DSV41_GEMVQB(name, B, MM, KS)                                        \
+  kernel void name(                                                          \
+      const device uint* w [[buffer(0)]],                                    \
+      const device bfloat* s [[buffer(1)]],                                  \
+      const device bfloat* bs [[buffer(2)]],                                 \
+      const device T* x [[buffer(3)]], device T* y [[buffer(4)]],            \
+      constant int& K [[buffer(5)]], constant int& N [[buffer(6)]],          \
+      constant int& M [[buffer(7)]], constant int& gs [[buffer(8)]],         \
+      constant long& xb [[buffer(9)]], constant long& wb [[buffer(10)]],     \
+      constant long& sb [[buffer(11)]], constant long& yb [[buffer(12)]],    \
+      uint3 tg [[threadgroup_position_in_grid]],                             \
+      uint sg [[simdgroup_index_in_threadgroup]],                            \
+      uint lane [[thread_index_in_simdgroup]])                               \
+  {                                                                          \
+    threadgroup float red[2 * KS * MM * 4];                                  \
+    const long z = (long)tg.z;                                               \
+    dsv41_gemv_q_impl_<B, MM, KS>(w + z * wb, s + z * sb, bs + z * sb,       \
+                                  x + z * xb, y + z * yb, K, N, M, gs, tg,   \
+                                  sg, lane, red);                            \
+  }
+#define DSV41_GEMVQB_ALL(B)                                                  \
+  DSV41_GEMVQB(dsv41_gemv_q##B##_b, B, 1, 1)                                 \
+  DSV41_GEMVQB(dsv41_gemv_q##B##_rows_b, B, 8, 1)                            \
+  DSV41_GEMVQB(dsv41_gemv_q##B##_k4_b, B, 1, 4)                              \
+  DSV41_GEMVQB(dsv41_gemv_q##B##_rows_k4_b, B, 8, 4)
+DSV41_GEMVQB_ALL(2)
+DSV41_GEMVQB_ALL(3)
+DSV41_GEMVQB_ALL(4)
+DSV41_GEMVQB_ALL(5)
+DSV41_GEMVQB_ALL(6)
+DSV41_GEMVQB_ALL(8)
+
+// ---- the decode's halves with K split across simdgroups: RG row groups of
+// RS rows, each split KS ways along K (NS = RG * KS simdgroups), the
+// slices' sums added in threadgroup memory -- more threads, each a shorter
+// chain, for a decode's few pairs on a wide GPU.
+// grid {32, ceil(rows / (RG * RS)) * RG * KS, pairs}, tg {32, RG * KS, 1}.
+template <int RG, int KS, int RS, bool TG>
+kernel void dsv41_moe_swiglu_iq6_(
+    const device uchar* w1 [[buffer(0)]],
+    const device uchar* w3 [[buffer(1)]],
+    const device ulong* tab [[buffer(2)]],
+    const device T* x [[buffer(3)]], device T* act [[buffer(4)]],
+    const device int* slot [[buffer(5)]],
+    const device float* wt [[buffer(6)]], constant int& K [[buffer(7)]],
+    constant int& I [[buffer(8)]], constant int& topk [[buffer(9)]],
+    constant float& lim [[buffer(10)]], constant uint& t1 [[buffer(11)]],
+    constant uint& t3 [[buffer(12)]], constant long& cw [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  constexpr int NS = RG * KS;
+  threadgroup ulong tt[1024];
+  threadgroup float red[2][KS][RG * RS];
+  const device ulong* a1d = tab + dsv41_iq_tab_at5_(t1);
+  const device ulong* a3d = tab + dsv41_iq_tab_at5_(t3);
+  if (TG) {
+    const int n = dsv41_iq_tab_n5_(t1);
+    for (int i = (int)(sg * 32 + lane); i < n; i += 32 * NS) { tt[i] = a1d[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const bool same = t1 == t3;
+  const int rg = (int)sg % RG, ks = (int)sg / RG;
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int f0 = ((int)tg.y * RG + rg) * RS;
+  const long rb1 = (long)(K / 256) * dsv41_iq_block_bytes_(t1);
+  const long rb3 = (long)(K / 256) * dsv41_iq_block_bytes_(t3);
+  const device uchar* b1 = w1 + e * cw;
+  const device uchar* b3 = w3 + e * cw;
+  const device T* xr = x + (long)(p / topk) * K;
+  float g[RS], u[RS];
+  for (int r = 0; r < RS; ++r) { g[r] = u[r] = 0.0f; }
+  for (int sb = ks * 32 + (int)lane; sb < K / 32; sb += 32 * KS) {
+    float4 y[8];
+    float ys[4];
+    dsv41_y32_(xr + sb * 32, y, ys);
+    for (int r = 0; r < RS; ++r) {
+      const int f = f0 + r;
+      if (f >= I) { break; }
+      if (TG) {
+        const threadgroup ulong* gt = tt;
+        const threadgroup uint* gu = (const threadgroup uint*)tt;
+        g[r] += dsv41_iq32_dot5_(b1 + f * rb1, sb, t1, gt, gu, y, ys);
+        u[r] += same ? dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, gt, gu, y, ys)
+                     : dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, a3d,
+                                        (const device uint*)a3d, y, ys);
+      } else {
+        g[r] += dsv41_iq32_dot5_(b1 + f * rb1, sb, t1, a1d,
+                                 (const device uint*)a1d, y, ys);
+        u[r] += dsv41_iq32_dot5_(b3 + f * rb3, sb, t3, a3d,
+                                 (const device uint*)a3d, y, ys);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    const float gg = simd_sum(g[r]), uu = simd_sum(u[r]);
+    if (lane == 0) {
+      red[0][ks][rg * RS + r] = gg;
+      red[1][ks][rg * RS + r] = uu;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks != 0 || lane >= (uint)RS) { return; }
+  const int r = (int)lane, f = f0 + r;
+  if (f >= I) { return; }
+  float gg = 0.0f, uu = 0.0f;
+  for (int q = 0; q < KS; ++q) {
+    gg += red[0][q][rg * RS + r];
+    uu += red[1][q][rg * RS + r];
+  }
+  if (lim > 0.0f) {
+    uu = clamp(uu, -lim, lim);
+    gg = min(gg, lim);
+  }
+  act[(long)p * I + f] = (T)(wt[p] * (gg / (1.0f + exp(-gg)) * uu));
+}
+
+template <int RG, int KS, int RS, bool TG>
+kernel void dsv41_moe_down_iq6_(
+    const device uchar* w2 [[buffer(0)]],
+    const device ulong* tab [[buffer(1)]],
+    const device T* act [[buffer(2)]], device T* out [[buffer(3)]],
+    const device int* slot [[buffer(4)]], constant int& I [[buffer(5)]],
+    constant int& H [[buffer(6)]], constant uint& t2 [[buffer(7)]],
+    constant long& cw [[buffer(8)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  constexpr int NS = RG * KS;
+  threadgroup ulong tt[1024];
+  threadgroup float red[KS][RG * RS];
+  const device ulong* ad = tab + dsv41_iq_tab_at5_(t2);
+  if (TG) {
+    const int n = dsv41_iq_tab_n5_(t2);
+    for (int i = (int)(sg * 32 + lane); i < n; i += 32 * NS) { tt[i] = ad[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int rg = (int)sg % RG, ks = (int)sg / RG;
+  const int p = (int)tg.z;
+  const long e = slot[p];
+  const int o0 = ((int)tg.y * RG + rg) * RS;
+  const long rb = (long)(I / 256) * dsv41_iq_block_bytes_(t2);
+  const device uchar* b2 = w2 + e * cw;
+  const device T* ar = act + (long)p * I;
+  float acc[RS];
+  for (int r = 0; r < RS; ++r) { acc[r] = 0.0f; }
+  for (int sb = ks * 32 + (int)lane; sb < I / 32; sb += 32 * KS) {
+    float4 y[8];
+    float ys[4];
+    dsv41_y32_(ar + sb * 32, y, ys);
+    for (int r = 0; r < RS; ++r) {
+      const int o = o0 + r;
+      if (o >= H) { break; }
+      if (TG) {
+        acc[r] += dsv41_iq32_dot5_(b2 + o * rb, sb, t2,
+                                   (const threadgroup ulong*)tt,
+                                   (const threadgroup uint*)tt, y, ys);
+      } else {
+        acc[r] += dsv41_iq32_dot5_(b2 + o * rb, sb, t2, ad,
+                                   (const device uint*)ad, y, ys);
+      }
+    }
+  }
+  for (int r = 0; r < RS; ++r) {
+    const float s = simd_sum(acc[r]);
+    if (lane == 0) { red[ks][rg * RS + r] = s; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ks != 0 || lane >= (uint)RS) { return; }
+  const int r = (int)lane, o = o0 + r;
+  if (o >= H) { return; }
+  float s = 0.0f;
+  for (int q = 0; q < KS; ++q) { s += red[q][rg * RS + r]; }
+  out[(long)p * H + o] = (T)s;
+}
+
+#define DSV41_IQ6_KERNELS(SUF, RGV, KSV, RSV, TGV)                           \
+  template [[host_name("dsv41_moe_swiglu_iq6" SUF)]] kernel void             \
+  dsv41_moe_swiglu_iq6_<RGV, KSV, RSV, TGV>(                                 \
+      const device uchar*, const device uchar*, const device ulong*,         \
+      const device T*, device T*, const device int*, const device float*,    \
+      constant int&, constant int&, constant int&, constant float&,          \
+      constant uint&, constant uint&, constant long&, uint3, uint, uint);    \
+  template [[host_name("dsv41_moe_down_iq6" SUF)]] kernel void               \
+  dsv41_moe_down_iq6_<RGV, KSV, RSV, TGV>(                                   \
+      const device uchar*, const device ulong*, const device T*, device T*,  \
+      const device int*, constant int&, constant int&, constant uint&,       \
+      constant long&, uint3, uint, uint);
+DSV41_IQ6_KERNELS("_g2_k2_r2_tg", 2, 2, 2, true)
+DSV41_IQ6_KERNELS("_g2_k2_r2", 2, 2, 2, false)
+DSV41_IQ6_KERNELS("_g2_k4_r2_tg", 2, 4, 2, true)
+DSV41_IQ6_KERNELS("_g2_k4_r2", 2, 4, 2, false)
+DSV41_IQ6_KERNELS("_g4_k2_r1_tg", 4, 2, 1, true)
+DSV41_IQ6_KERNELS("_g4_k2_r1", 4, 2, 1, false)
+DSV41_IQ6_KERNELS("_g1_k4_r4_tg", 1, 4, 4, true)
+DSV41_IQ5_KERNELS("_s8_r1_tg", 8, 1, true)
+DSV41_IQ5_KERNELS("_s8_r1", 8, 1, false)

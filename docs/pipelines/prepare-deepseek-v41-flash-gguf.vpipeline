@@ -1,0 +1,33 @@
+{
+  "id": "prepare-deepseek-v41-flash-gguf",
+  "stages": [
+    {
+      "id": "fetch",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF",
+        "model_variant": "IQ2_XXS",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-ngram-table",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

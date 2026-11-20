@@ -78,6 +78,20 @@
 // external drive 4.5 = 4.5, Drama 3 FP8 at 16 GB 3.4 against 3.5 frames/s,
 // at 32 GB 9.4 against 10.2 (none: 8.5). It never ran slower than none.
 
+// A FAR TIER. Given far memory (far-memory.h: another machine's DRAM lent
+// over a link), the cache keeps a second set of experts there: those
+// selected most often after the ones it holds, by the same scores. A miss
+// whose expert is held far is read from there, not from disk. The far
+// tier is filled by what the cache lets go anyway -- an expert the
+// resident set evicts is WRITTEN to the far side (its slot pinned until
+// the write is done) when there is room or it outscores the far tier's
+// least selected -- so no read is made for it. Not an expert read for a
+// step alone: most are not asked for again, and writing each cost the
+// link as much as reading one back (DeepSeek V4.1 Flash, 64 GB cache:
+// 35k written for 36k read), and an expert taken into the resident set from
+// there leaves it: the two tiers hold different experts. A far call that
+// fails lets the tier go; the model goes on from disk.
+//
 // Misses are read by a pool of threads, concurrently (an SSD answers more
 // requests in flight with more bandwidth). The caller has made sure the GPU
 // no longer reads any slot but the ones this step will -- in the models
@@ -85,6 +99,7 @@
 // also ran everything before it.
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/far-memory.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -92,6 +107,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -123,6 +139,25 @@ public:
     // compared on (a decode's 1; a speculative verify's few rows read
     // ahead for each row, and the chain they form is a decode's).
     int ahead_rows = 1;
+    // The far tier (see A FAR TIER), and how many of the experts it holds
+    // may be written at once (each pins a spare).
+    std::shared_ptr<FarMemory> far;
+    int far_writes = 4;
+    // The Fill skips a part whose dst is null: an expert held far is then
+    // read from BOTH -- some parts over the link, the rest from disk at
+    // once, shared by how fast each has been -- so a miss waits on the
+    // two together, not on one.
+    bool fill_skips_null = false;
+    // One-off misses written far too, not only what the resident set
+    // lets go (VPIPE_MOE_FAR_ADMIT=all|victims overrides: an A/B).
+    bool far_one_offs = false;
+    // Bytes kept out of the far tier at the far memory's end, the model's
+    // own (far_reserved_at(): a far compute's tables).
+    std::uint64_t far_reserve = 0;
+    // A ZERO SLOT past the others, for REMOTE pairs (see resolve()): asked
+    // by a model whose far side may run experts, held only with a far
+    // tier, counted in bytes().
+    bool zero_slot = false;
   };
 
   struct Stats {
@@ -139,6 +174,13 @@ public:
     std::uint64_t ahead_read = 0;      // experts read ahead
     std::uint64_t ahead_hits = 0;      // picks a read-ahead served
     std::uint64_t ahead_dropped = 0;   // read-aheads dropped unread
+    std::uint64_t far_reads = 0;       // experts read from the far tier
+    std::uint64_t far_writes = 0;      // ...written to it
+    std::uint64_t far_evicted = 0;     // ...it let go for another
+    std::uint64_t far_dropped = 0;     // writes not made: none could pin
+    std::uint64_t far_bytes_read = 0;
+    std::uint64_t far_split = 0;       // ...read from both at once
+    std::uint64_t far_computed = 0;    // ...run there, not read (Remote)
     double read_ms = 0.0;              // resolve() reading its own misses
     double wait_ms = 0.0;              // ...waiting on reads ahead
     double hit_rate() const {
@@ -164,9 +206,45 @@ public:
   // pair reads out (`slot` may be `eid`). `rows` is the step's token count
   // (a decode 1). Loads whatever is not held before returning; `ahead`, if
   // given, is read ahead behind it (see READING AHEAD).
+  //
+  // REMOTE (a far tier whose memory runs experts, far-memory.h's
+  // far-compute/2; PROTOTYPE): given `remote`, a miss held far that the
+  // resident set would not take is not read: its pairs are listed there
+  // with its far slot, and handed the ZERO SLOT (every part zero, so the
+  // model's kernels compute nothing for them) -- the caller has the far
+  // side run it and puts its rows in. The far slots stay pinned until
+  // remote_done(). A miss the resident set takes is read as ever, so a hot
+  // expert still comes home; so is one whose pairs would take the step
+  // past `cap` PAIRS (the caller's room for the far side's rows: at a
+  // decode row's one token a pair an expert). A resolve that fails before
+  // the pairs are listed unpins them itself; once listed (and `start`
+  // called) a later failure -- a read of the step's own -- leaves them
+  // listed and pinned: the caller calls remote_done() for any Remote that
+  // came back with pairs, whatever resolve() returned.
+  // `start`, if set, is called (under the cache's lock: it should only hand
+  // the call off) as soon as the step's remote pairs are known -- before
+  // resolve() waits on its own reads -- so the far side runs them while
+  // the disk reads the rest.
+  struct Remote {
+    std::vector<int> pair;        // pair index into eid / slot
+    std::vector<int> far_slot;    // where its expert is held
+    std::function<void(const Remote&)> start;
+    int cap = 1;                  // the most pairs run there a step
+    void clear() { pair.clear(); far_slot.clear(); }
+  };
   bool resolve(int L, const std::int32_t* eid, int np, int rows,
                std::int32_t* slot, std::string* err = nullptr,
-               const Ahead* ahead = nullptr);
+               const Ahead* ahead = nullptr, Remote* remote = nullptr);
+  // The far slots of a Remote released (the call answered or failed).
+  void remote_done(const Remote& r);
+  // A far slot's part k: its offset in the far memory.
+  std::uint64_t far_part_offset(int far_slot, int k) const
+  {
+    return (std::uint64_t)far_slot * _slot_bytes + _part_off[(std::size_t)k];
+  }
+  // The slot whose parts are all zero (-1: none; there is one where
+  // Options::zero_slot asks for it and a far tier is open).
+  int zero_slot() const { return _zero; }
 
   // How many experts the next decode step should name to read ahead: the
   // cache's choice among Options::ahead_widths (0 when it has none).
@@ -192,7 +270,26 @@ public:
     return s >= 0 && s < slots() && _res[(std::size_t)s] != 0;
   }
   std::size_t slot_bytes() const { return _slot_bytes; }
-  std::size_t bytes() const { return _slot_bytes * (std::size_t)slots(); }
+  std::size_t bytes() const
+  {
+    return _slot_bytes * ((std::size_t)slots() + (_zero >= 0 ? 1 : 0));
+  }
+  // The far tier: its slots, those holding an expert, and whether it is
+  // still in use (a failure lets it go).
+  int far_slots() const { return _far_slots; }
+  // Where Options::far_reserve's bytes begin in the far memory.
+  std::uint64_t far_reserved_at() const { return _far_reserved_at; }
+  int far_used() const;
+  bool far_on() const;
+  // Whether the far tier holds layer L's expert e (written, or writing).
+  bool far_holds(int L, int e) const;
+  // Whether it holds any of layer L's experts ready to read or run (false
+  // once the tier is let go).
+  bool far_holds_any(int L) const;
+  // What reading `bytes` of experts costs now, in seconds: at the paces
+  // the cache has measured, the far tier's where it holds them, else the
+  // disk's (0 while neither has been measured).
+  double read_seconds(std::size_t bytes, bool far) const;
 
   // The selection scores, [layers][experts]: what an earlier run learned,
   // to seed the next (seed_scores), or to order a preload.
@@ -231,6 +328,11 @@ private:
   void to_spare_(int s);
   void age_();
   void note_step_(int L, int rows, double blocked_ms);
+  // The far tier, under the pool's lock.
+  void far_offer_(int s);
+  void far_release_(int key);
+  void far_fail_(const std::string& why);
+  void far_writer_();
 
   // Choosing the read-ahead width (see HOW MANY TO READ AHEAD).
   struct AheadChooser {
@@ -258,6 +360,7 @@ private:
   std::vector<metal_compute::SharedBuffer> _pool;
   std::size_t _slot_bytes = 0;
   int _resident = 0, _transient = 0, _n_res = 0;
+  int _zero = -1;   // the zero slot: past every other, never handed out
   // [keys = layers * experts]: the slot holding it (or being read into
   // it), or -1; and its score.
   std::vector<std::int32_t> _slot_of;
@@ -280,6 +383,29 @@ private:
   bool _record = false;
   std::vector<int> _blocked;
   std::uint64_t _step = 0, _layer0_steps = 0;
+  // The far tier: [far slots] the key held (-1 free), written yet, reads
+  // in flight; [keys] the far slot holding it; the writes queued (slot,
+  // far slot); [slots] pinned by a write.
+  std::shared_ptr<FarMemory> _far;
+  int _far_slots = 0;
+  std::uint64_t _far_reserved_at = 0;
+  std::vector<std::int32_t> _far_key, _far_of;
+  std::vector<std::uint8_t> _far_ready;
+  std::vector<int> _far_reading, _far_free;
+  std::vector<std::pair<int, int>> _far_queue;
+  int _far_inflight = 0, _n_pinned = 0;
+  bool _far_dead = false;
+  bool _far_one_offs = false;   // a one-off miss written far too
+  // An expert taken home keeps its far copy, let go only when the far
+  // tier needs the room (copies of experts held home first): no write
+  // when it is evicted again.
+  bool _far_lazy = false;
+  std::vector<std::uint8_t> _pinned;
+  std::vector<std::size_t> _part_off;
+  std::vector<std::thread> _far_threads;
+  // Seconds a byte from each source, as measured (0 not yet): how an
+  // expert held far is shared between the link and the disk.
+  double _far_spb = 0.0, _disk_spb = 0.0;
   Stats _stats;
   std::unique_ptr<Pool> _workers;
 };

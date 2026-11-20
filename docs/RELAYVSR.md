@@ -1,11 +1,17 @@
-# 4x video super-resolution with RelayVSR
+# 4x and 2x video super-resolution with RelayVSR
 
-**RelayVSR** upscales a video to exactly four times its width and height.
-It is the model of Wang et al., *RelayVSR: Large-Small Model Collaboration
-for Efficient Real-World Video Super-Resolution* (arXiv 2609.37850), as
+**RelayVSR** upscales a video to exactly four times its width and height,
+or, with its 2x model, exactly twice. It is the model of Wang et al.,
+*RelayVSR: Large-Small Model Collaboration for Efficient Real-World Video
+Super-Resolution* (arXiv 2609.37850), as
 [kopperx/RelayVSR](https://github.com/kopperx/RelayVSR) publishes it, with
 its weights at [kopper/RelayVSR](https://huggingface.co/kopper/RelayVSR)
-(Apache-2.0).
+(Apache-2.0). The 2x model is
+[lightx2v/RelayVSR_X2](https://huggingface.co/lightx2v/RelayVSR_X2), the same
+two networks retrained for a native 2x; ComfyUI ships both scales, the
+keyframe models in int8, as
+[Comfy-Org/RelayVSR](https://huggingface.co/Comfy-Org/RelayVSR). All three
+run here; see "2x, and ComfyUI's files" below.
 
 Two models work in relay over the stream:
 
@@ -20,8 +26,8 @@ There is no VAE and no text encoder: the keyframe model's text context is
 a constant shipped inside its checkpoint.
 
 vpipe runs both on-device through its **metal-compute** backend, in the
-**`relayvsr-upscale`** stage: frames in, 4x frames out, one for one and in
-order. No Python is involved; the checkpoints are read as data.
+**`relayvsr-upscale`** stage: frames in, upscaled frames out, one for one
+and in order. No Python is involved; the checkpoints are read as data.
 
 Its sibling is **FlashVSR+** (the `flashvsr` family of `generate-video`).
 The two differ mainly in this:
@@ -38,8 +44,8 @@ The two differ mainly in this:
 | | |
 |---|---|
 | **Machine** | Apple Silicon Mac (M-series). |
-| **Memory** | **8.4 GB of weights** (4.3 GB with the `fast` or `token` int8 tier, on an M5), plus a working set that grows with the input frame. Most of it is the keyframe model's ring of keys and values for the last four keyframes, 30 blocks deep. See the table below. |
-| **Disk** | **10.2 GB**: `wan.safetensors` (the keyframe model, 10.1 GB) and `flash.safetensors` (the decoder, 128 MB). |
+| **Memory** | **8.4 GB of weights** from the release (4.3 GB with the `fast` or `token` int8 tier, on an M5), or **4.3 GB from ComfyUI's int8 files** at either scale, plus a working set that grows with the frame. Most of it is the keyframe model's ring of keys and values for the last four keyframes, 30 blocks deep. See the table below. |
+| **Disk** | **10.2 GB**: `wan.safetensors` (the keyframe model, 10.1 GB) and `flash.safetensors` (the decoder, 128 MB). ComfyUI's files: **5.3 GB** a scale. |
 | **Account** | None. The repository is public and ungated. |
 
 What a run needs, by **input** size. This is what the stage books, and
@@ -55,12 +61,19 @@ each figure was checked against the GPU's actual peak allocation (see
 | 960 x 540 | 3840 x 2160 | 11.2 GB | 2.2 GB | **21.8 GB** |
 | 1280 x 720 | 5120 x 2880 | 19.8 GB | 3.9 GB | **32.0 GB** |
 
+The working set follows the OUTPUT, not the scale: the 2x model's tokens
+are 1/16 of its input where the 4x model's are 1/8, so for one output
+size both book the same ring. A 2x run from 960 x 540 to 1920 x 1080 needs
+the 480 x 270 row's working set. With ComfyUI's int8 files the weights
+are 4.3 GB rather than 8.4, so that row's total is 7.8 GB.
+
 Beside these, the stage holds one output frame in ordinary memory at a
 time: a finished window's frames are decoded and handed on one by one.
 
 When a graph launches, the stage books the size `output_width` x
-`output_height` names (a quarter of it, as input). Without them it cannot
-know the frame size yet, so it books a 960 x 544 input (the 21.8 GB row),
+`output_height` names (a quarter of it as input at 4x, a half at 2x).
+Without them it cannot know the frame size yet, so it books a 3840 x 2176
+output (the 21.8 GB row; 17.8 GB from ComfyUI's int8 files),
 and on a 16 GB Mac the launch then warns that the graph may not fit, even
 for an input that does. Either way it revises the booking to the real size
 at the first frame, and gives everything back at the end of the stream.
@@ -90,6 +103,10 @@ implemented yet.
   fetches the model. Run it once.
 - **[`relayvsr-upscale.vpipeline`](pipelines/relayvsr-upscale.vpipeline)**
   takes a video in and writes its 4x `.mp4`, soundtrack included.
+- **[`prepare-relayvsr-x2.vpipeline`](pipelines/prepare-relayvsr-x2.vpipeline)**
+  and **[`relayvsr-upscale-x2.vpipeline`](pipelines/relayvsr-upscale-x2.vpipeline)**
+  are the same at 2x, from ComfyUI's int8 files (`Comfy-Org/RelayVSR-x2`):
+  the graph of ComfyUI's own "RelayVSR 2x" template.
 
 Either runs from the terminal with `vpipe --launch <file>`, or opens with
 **Load** in the web UI's Pipeline Manager.
@@ -130,9 +147,10 @@ without a soundtrack.
 
 | Key | Default | What it does |
 |---|---|---|
-| `hf_dir` | — | The model: `kopper/RelayVSR`, or the directory holding both checkpoints. |
+| `hf_dir` | — | The model: `kopper/RelayVSR` (4x), `Comfy-Org/RelayVSR-x2` or `Comfy-Org/RelayVSR-x4` (ComfyUI's int8 files), a directory holding a pair of checkpoints, or either checkpoint file. Each file states its own scale. |
+| `scale` | 0 | 2 or 4, when `hf_dir` holds both scales (the root of `Comfy-Org/RelayVSR`). 0 takes the one the model names. |
 | `window` | 16 | The release's `--window-size`: a keyframe every `window - 1` frames. Larger is faster (fewer runs of the keyframe model) and leans more on the small decoder. A frame leaves the stage at most `window - 1` frames after it arrived. 2 to 64. |
-| `output_width`, `output_height` | 0 | Optional: the size of the 4x frames the run will make, if it is known before the first frame. Both or neither, each a multiple of 4 from 32 to 32768. Only the memory plan reads it: a small input is planned small, and a run that cannot fit the Mac even alone is refused before its weights are read (see "What you need" above). The stage still makes exactly 4x what it is given. 0 plans for 3840 x 2176. |
+| `output_width`, `output_height` | 0 | Optional: the size of the frames the run will make (4x or 2x the input, the model's scale), if it is known before the first frame. Both or neither, each a multiple of the scale from 32 to 32768. Only the memory plan reads it: a small input is planned small, and a run that cannot fit the Mac even alone is refused before its weights are read (see "What you need" above). The stage still makes exactly the scale times what it is given. 0 plans for a 3840 x 2176 output. |
 | `seed` | 42 | The keyframe noise: torch's CPU normal draw from one generator, seeded at the start of every run. The release uses CUDA's generator, so its draw differs. |
 | `output_dtype` | `auto` | `auto` matches the input: u8 in gives u8 out, f32 in gives f32 out. `u8` writes frames as the release does: (v + 1) x 127.5, clamped and truncated. `f32` gives [0, 1], unclamped. |
 | `i8_gemm` | off | Run both models' block projections on the int8 GEMMs. M5 and later only. See "Faster" below. |
@@ -143,8 +161,9 @@ without a soundtrack.
 | `sage_pv8` | off | With `sage_attn`: the attention's P*V in int8 too. |
 | `autotune` | on | Whether the `accurate` tier's kernel tuner measures. Off, a run repeats exactly. |
 
-Any input size works. The model pads a frame to a multiple of 8 and cuts
-the result back to exactly 4x. Every frame of a run must be the same size.
+Any input size works. The model pads a frame to a multiple of 8 (16 at
+2x) and cuts the result back to exactly the scale times the input. Every
+frame of a run must be the same size.
 
 ### How fast
 
@@ -314,17 +333,119 @@ for a module the tier does not build. With `i8_gemm` at `fast` or above
 every feed-forward is held int8, which the Neural Engine cannot read, so
 the stage claims no module and the feed-forward stays on the GPU.
 
+## 2x, and ComfyUI's files
+
+### The 2x model
+
+[lightx2v/RelayVSR_X2](https://huggingface.co/lightx2v/RelayVSR_X2) is
+RelayVSR retrained by the LightX2V team for a **native 2x**: the output is
+exactly twice the input's width and height. It is not the 4x model run
+smaller. Both networks keep their shapes. Three things change, all
+following from one fact: the latent grid stays 1/16 of the OUTPUT, so it
+is 1/8 of the input at 2x where it was 1/4 at 4x.
+
+- The keyframe model reads the frame **pixel-unshuffled by 8**, with no
+  upsampling (the 4x model upsamples 4x and unshuffles by 16).
+- The decoder's frame encoder takes its third convolution at stride 2.
+- The decoder adds its residual to a **2x** bicubic upsample.
+
+The keyframe model runs on a quarter of the 4x model's tokens for the same
+input, and its ring of keys and values is a quarter as large. Frames are
+padded to a multiple of 16 rather than 8. The stream, the windows and
+the keyframe schedule are the 4x model's.
+
+vpipe follows LightX2V's code for it (the model's own inference, read and
+not run), which ComfyUI's port matches. Each checkpoint states its scale
+in its metadata (`relayvsr-wan-x2-v1`, `relayvsr-flash-x2-v1`), and the
+stage reads it: the same `relayvsr-upscale` stage runs either.
+
+### ComfyUI's files
+
+[Comfy-Org/RelayVSR](https://huggingface.co/Comfy-Org/RelayVSR) repackages
+both scales for ComfyUI:
+
+| File | What it is |
+|---|---|
+| `diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors` | the 2x keyframe model, 5.2 GB |
+| `diffusion_models/relayvsr_x4_int8_convrot.safetensors` | the 4x keyframe model, 5.2 GB |
+| `vae/relayvsr_flash_vae_x2_fp32.safetensors` | the 2x decoder, 128 MB |
+| `vae/relayvsr_flash_vae_x4_fp32.safetensors` | the 4x decoder, 128 MB (the release's own file) |
+
+The keyframe models are in ComfyUI's tensor names, with every block
+projection stored as **int8**: one scale per output row, quantized after
+a Hadamard rotation of each 256 input columns ("ConvRot"). The 4x one is
+the release's weights to within that rounding (cosine 0.99996 to the
+release's bf16, every block). vpipe reads the files as they are and keeps
+the int8 codes, so the two models hold **4.3 GB of weights instead of
+8.4**:
+
+- With no int8 tier, and on the `accurate` tier, each projection is
+  widened to bf16 just before its multiply, exactly as ComfyUI widens it
+  (bit for bit the host's own decode).
+- On the `token` and `token_plain` tiers (an M5), the codes **are** the
+  tier's layout. The activation is rotated as the weights were and the
+  int8 multiply reads the file's codes directly: nothing is quantized twice.
+- The `fast` tier converts each projection into its own layout once, at
+  load.
+- With `ane_ffn`, the Neural Engine is staged from the int8 codes.
+
+### Speed and accuracy at 2x
+
+Model time, averaged over a 16-frame window as in "How fast" above:
+
+| Input → output | Apple M4 Pro | Apple M5 Ultra | M5 Ultra, `i8_gemm` `token` | + `sage_attn` `sage_pv8` |
+|---|---|---|---|---|
+| 480 x 270 → 960 x 540 | 0.129 s a frame | — | — | — |
+| 960 x 540 → 1920 x 1080 | 0.517 s a frame | 0.041 s | 0.031 s | 0.030 s |
+| 1920 x 1080 → 3840 x 2160 | — | 0.143 s | 0.112 s | 0.107 s |
+
+A keyframe at 1920 x 1080 → 3840 x 2160 on the M5 Ultra: 979 ms, 591 with
+`token`, 516 with Sage on top. On the M4 Pro, `ane_ffn` takes a 960 x 540
+keyframe from 3.21 s to 2.62 s.
+
+**The cost follows the output, not the scale.** For one output size the
+2x and 4x models run the same number of tokens in both networks, so 2x
+from 1080p and 4x from 540p both make 4K at about 0.14 s a frame on the
+Ultra. For one *input*, 2x costs about a quarter of 4x.
+
+Accuracy, against the fp32 restatement of LightX2V's 2x inference over
+ComfyUI's int8 file (the model the file describes), the release's own
+bf16 the bar, two clips (378 x 252 with a keyframe every 3 frames, and
+624 x 360 → 1248 x 720):
+
+| | vpipe | the release in bf16 |
+|---|---|---|
+| the decoder (fed the fp32 keyframes) | **0.13–0.14%** | 0.84–1.01% |
+| a keyframe | 0.98–1.02x the bar | — |
+| the whole stream | **0.58–0.83%** | 1.02–1.31% |
+
+The same on an M5 (matrix cores), and the int8 tiers and Sage stay within
+the bars measured at 4x (see "Faster"). On `token` and `token_plain` the
+ConvRot codes run as stored, so ComfyUI's 4x file on `token` is **closer**
+to fp32 than the release on `token` (worst keyframe 1.21x the bar against
+1.51x): its weights are rounded once, by the file, not again by the tier.
+On no tier, widening the int8 weights before each multiply costs 2–3% of a
+keyframe (M4 Pro 3.21 s against 3.13 s at 480 x 270; M5 Ultra 984 ms
+against 953 at 960 x 540).
+
+The catalogue lists them as **`Comfy-Org/RelayVSR-x2`** and
+**`Comfy-Org/RelayVSR-x4`**, one record per scale over the one repository;
+each registers its keyframe model's file, and the stage finds the decoder
+in the `vae/` beside it. A path to the repository's root holds both
+scales: set `scale` to 2 or 4 there.
+
 ## How it works
 
 The stream follows the release's `CollaborativeFrameStream` step for step:
 
 1. Frame 0 is a **keyframe**. The large model writes its latent in one step
-   from noise, conditioned on the frame upsampled 4x. The decoder **primes**
+   from noise, conditioned on the frame upsampled 4x (at 2x, on the frame
+   itself). The decoder **primes**
    it, running it through its own 10 blocks to get every block's keys and
    values.
 2. Frames collect into a **window** of 16: frames 0 to 15. Frame 15 is the
    next keyframe.
-3. The decoder turns every frame of the window into its 4x frame. Each
+3. The decoder turns every frame of the window into its upscaled frame. Each
    block attends, through a local spatial window, to:
    - the two keyframes, 48 x 48 tokens around the position;
    - the frame before, 24 x 24 tokens;
@@ -365,10 +486,15 @@ bf16 error, stream 0.59–0.77%.
 
 ## Limits
 
-- **Memory:** the keyframe model's weights are held whole (8.4 GB), so a
-  16 GB Mac is limited to small inputs (about 320 x 180). Streaming its
-  blocks from disk, as the other large DiTs here do, is not implemented
-  yet.
+- **Memory:** the keyframe model's weights are held whole (8.4 GB from the
+  release, 4.3 GB from ComfyUI's int8 files), so a 16 GB Mac is limited to
+  small outputs: about 1280 x 720 from the release, more from ComfyUI's
+  files (not measured on a 16 GB Mac). Streaming its blocks from disk, as
+  the other large DiTs here do, is not implemented yet.
+- At 2x a small input's keyframe has few rows (its tokens are 1/16 of
+  the frame): under roughly 512 x 512 in, its share of the feed-forward is
+  less than one Neural Engine chunk (512 rows), and `ane_ffn` leaves the
+  keyframe model on the GPU. The decoder still splits.
 - On an M5 the decoder's windowed attention is still most of a frame.
   Its int8 form (`sage_attn`) gains little there, because every frame
   quantizes all four frames' keys and values again, including the two

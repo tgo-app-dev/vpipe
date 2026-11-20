@@ -26,7 +26,9 @@
 #include "generative-models/relayvsr/metal-relayvsr-wan.h"
 #include "generative-models/relayvsr/relayvsr-ops.h"
 #include "generative-models/relayvsr/relayvsr-stream.h"
+#include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/ane-ffn.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/weight-set.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/flex-bag.h"
@@ -41,6 +43,7 @@
 #include "stages/model-memory.h"
 
 #include <malloc/malloc.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -55,6 +58,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -204,17 +208,56 @@ tier_name_(int t)
          : t == 3 ? "token_plain" : "none";
 }
 
-bool
-load_(MetalCompute* mc, bool want_wan, Model* m, const Accel& a = {})
+std::string
+str_(const FlexData& m, const char* k)
 {
-  const char* root = env_("VPIPE_RELAYVSR_TEST_MODEL_PATH");
-  if (root == nullptr) { return false; }
-  genai::RelayVsrFiles files;
+  auto o = m.as_object();
+  auto it = o.find(k);
+  return it == o.end() ? std::string()
+                       : std::string((*it).second.as_string(""));
+}
+
+// A golden case's scale: meta `scale`, 4 for the release's goldens (which
+// predate it). Its latent stride is 16 over it.
+int
+scale_(const FlexData& meta)
+{
+  const int s = int_(meta, "scale");
+  return s == 2 ? 2 : 4;
+}
+
+// THE CHECKPOINTS A GOLDEN CASE WAS MADE FROM. The release's goldens name
+// none: VPIPE_RELAYVSR_TEST_MODEL_PATH (kopper/RelayVSR). A case whose
+// meta names its files (`wan`, `flash`) was made from ComfyUI's repack:
+// VPIPE_RELAYVSR_COMFY_PATH, the Comfy-Org/RelayVSR root (diffusion_models/
+// + vae/). False -- the case is skipped, and said -- without them.
+bool
+case_files_(const fs::path& c, genai::RelayVsrFiles* f)
+{
+  const FlexData meta = read_json_(c / "meta.json");
+  const std::string wan = str_(meta, "wan"), flash = str_(meta, "flash");
   std::string err;
-  if (!genai::resolve_relayvsr_files(root, &files, &err)) {
-    std::printf("[relayvsr] %s\n", err.c_str());
+  if (wan.empty()) {
+    const char* root = env_("VPIPE_RELAYVSR_TEST_MODEL_PATH");
+    return root != nullptr && genai::resolve_relayvsr_files(root, f, &err);
+  }
+  const char* root = env_("VPIPE_RELAYVSR_COMFY_PATH");
+  if (root == nullptr) {
+    std::printf("[relayvsr] %s: needs VPIPE_RELAYVSR_COMFY_PATH; SKIPPED\n",
+                c.filename().c_str());
     return false;
   }
+  f->wan = (fs::path(root) / "diffusion_models" / wan).string();
+  f->flash = (fs::path(root) / "vae" / flash).string();
+  f->scale = scale_(meta);
+  return fs::exists(f->wan) && fs::exists(f->flash);
+}
+
+bool
+load_files_(MetalCompute* mc, const genai::RelayVsrFiles& files,
+            bool want_wan, Model* m, const Accel& a = {})
+{
+  std::string err;
   MetalRelayVsrDecoder::Config dc;
   if (!MetalRelayVsrDecoder::config_from_checkpoint(files.flash, &dc,
                                                     &err)) {
@@ -262,6 +305,30 @@ load_(MetalCompute* mc, bool want_wan, Model* m, const Accel& a = {})
   return true;
 }
 
+// The release's pair (VPIPE_RELAYVSR_TEST_MODEL_PATH).
+bool
+load_(MetalCompute* mc, bool want_wan, Model* m, const Accel& a = {})
+{
+  const char* root = env_("VPIPE_RELAYVSR_TEST_MODEL_PATH");
+  if (root == nullptr) { return false; }
+  genai::RelayVsrFiles files;
+  std::string err;
+  if (!genai::resolve_relayvsr_files(root, &files, &err)) {
+    std::printf("[relayvsr] %s\n", err.c_str());
+    return false;
+  }
+  return load_files_(mc, files, want_wan, m, a);
+}
+
+// A golden case's pair (case_files_).
+bool
+load_case_(MetalCompute* mc, const fs::path& c, bool want_wan, Model* m,
+           const Accel& a = {})
+{
+  genai::RelayVsrFiles files;
+  return case_files_(c, &files) && load_files_(mc, files, want_wan, m, a);
+}
+
 // A frame the stream gave out, copied.
 struct OutFrame {
   std::int64_t index = 0;
@@ -289,9 +356,11 @@ drain_(RelayVsrStream& st, std::vector<OutFrame>* out, std::size_t* n,
 // kernel (the same Ops a stream loads).
 SharedBuffer
 upload_(MetalCompute* mc, const genai::relayvsr::Ops& op,
-        const std::vector<std::uint8_t>& px, int h, int w)
+        const std::vector<std::uint8_t>& px, int h, int w, int ph = 0,
+        int pw = 0)
 {
-  const int ph = h + (8 - h % 8) % 8, pw = w + (8 - w % 8) % 8;
+  if (ph == 0) { ph = h + (8 - h % 8) % 8; }
+  if (pw == 0) { pw = w + (8 - w % 8) % 8; }
   SharedBuffer src = mc->make_shared_buffer(px.size());
   std::memcpy(src.contents(), px.data(), px.size());
   SharedBuffer dst = mc->make_shared_buffer((std::size_t)ph * pw * 3 * 2);
@@ -470,17 +539,18 @@ TEST(relayvsr, decoder_matches_reference)
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  Model m;
-  if (!load_(mc, false, &m)) { return; }
   genai::relayvsr::Ops op16;
   std::string err;
   ASSERT_TRUE(op16.load(mc, false, &err));
   int frames = 0;
   for (const fs::path& c : golden_cases_(golden)) {
+    Model m;
+    if (!load_case_(mc, c, false, &m)) { continue; }
     const FlexData meta = read_json_(c / "meta.json");
     const int h = int_(meta, "height"), w = int_(meta, "width");
     const int ph = int_(meta, "pad_height"), pw = int_(meta, "pad_width");
     const int count = int_(meta, "count"), window = int_(meta, "window");
+    const int sc = scale_(meta), ls = 16 / sc;
     const std::vector<double> bar = reals_(meta, "bar_out_tf");
     ASSERT_TRUE((int)bar.size() == count);
     std::map<int, MetalRelayVsrDecoder::Condition> cond;
@@ -490,9 +560,9 @@ TEST(relayvsr, decoder_matches_reference)
       const int k = (int)kf.as_int();
       std::vector<float> lat;
       ASSERT_TRUE(read_bin_(c / fmt("latent_{}_f32.bin", k)(),
-                            (std::size_t)48 * (ph / 4) * (pw / 4), &lat));
+                            (std::size_t)48 * (ph / ls) * (pw / ls), &lat));
       SharedBuffer lb = genai::relayvsr::upload_f32(mc, lat);
-      ASSERT_TRUE(m.dec->prepare(lb, ph / 4, pw / 4, &cond[k], &err));
+      ASSERT_TRUE(m.dec->prepare(lb, ph / ls, pw / ls, &cond[k], &err));
     }
     std::vector<double> got((std::size_t)count, -1.0);
     SharedBuffer out;
@@ -503,13 +573,13 @@ TEST(relayvsr, decoder_matches_reference)
         std::vector<std::uint8_t> px;
         ASSERT_TRUE(read_bin_(c / fmt("lr_{}.u8", i)(),
                               (std::size_t)3 * h * w, &px));
-        SharedBuffer lr = upload_(mc, op16, px, h, w);
+        SharedBuffer lr = upload_(mc, op16, px, h, w, ph, pw);
         ASSERT_TRUE(m.dec->decode(lr, ph, pw, cond[idx.front()],
-                                  cond[idx.back()], 4 * h, 4 * w, true, &out,
-                                  &err));
+                                  cond[idx.back()], sc * h, sc * w, true,
+                                  &out, &err));
         if ((int)off < emit_from) { continue; }
         std::vector<float> ref;
-        const std::size_t ne = (std::size_t)3 * 16 * h * w;
+        const std::size_t ne = (std::size_t)3 * sc * sc * h * w;
         ASSERT_TRUE(read_bin_(c / fmt("out_{}_f32.bin", i)(), ne, &ref));
         std::vector<float> ours(ne);
         const auto* o = (const float*)out.contents();
@@ -527,9 +597,10 @@ TEST(relayvsr, decoder_matches_reference)
       ++frames;
       EXPECT_TRUE(got[(std::size_t)i] <= bar[(std::size_t)i]);
     }
-    std::printf("[relayvsr] decoder %s: %d frames, rel-L2 mean %.4f "
+    std::printf("[relayvsr] decoder %s (%dx): %d frames, rel-L2 mean %.4f "
                 "(reference bf16 %.4f), worst ratio %.2f\n",
-                c.filename().c_str(), count, mean, mean_bar, worst_ratio);
+                c.filename().c_str(), sc, count, mean, mean_bar,
+                worst_ratio);
   }
   EXPECT_TRUE(frames > 0);
 }
@@ -545,13 +616,14 @@ TEST(relayvsr, keyframes_match_reference)
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  Model m;
-  if (!load_(mc, true, &m)) { return; }
   int checked = 0;
   for (const fs::path& c : golden_cases_(golden)) {
+    Model m;
+    if (!load_case_(mc, c, true, &m)) { continue; }
     const FlexData meta = read_json_(c / "meta.json");
     const int h = int_(meta, "height"), w = int_(meta, "width");
     const int ph = int_(meta, "pad_height"), pw = int_(meta, "pad_width");
+    const int ls = 16 / scale_(meta);
     const std::vector<double> bar = reals_(meta, "bar_latent");
     RelayVsrStream::Options o;
     o.window = int_(meta, "window");
@@ -564,7 +636,7 @@ TEST(relayvsr, keyframes_match_reference)
     std::vector<float> lq0, blk0;
     st.on_keyframe = [&](std::int64_t f, const std::vector<float>& noise,
                          const SharedBuffer& lat) {
-      const std::size_t ne = (std::size_t)48 * (ph / 4) * (pw / 4);
+      const std::size_t ne = (std::size_t)48 * (ph / ls) * (pw / ls);
       std::vector<float> rn, rl;
       if (!read_bin_(c / fmt("noise_{}.f32", f)(), ne, &rn) ||
           !read_bin_(c / fmt("latent_{}_f32.bin", f)(), ne, &rl)) {
@@ -594,7 +666,8 @@ TEST(relayvsr, keyframes_match_reference)
     EXPECT_TRUE(noise_exact);
     ASSERT_TRUE(got.size() == bar.size());
     {
-      const std::size_t n = (std::size_t)(ph / 8) * (pw / 8) * 3072;
+      const std::size_t n =
+          (std::size_t)(ph / (2 * ls)) * (pw / (2 * ls)) * 3072;
       std::vector<float> r;
       if (read_bin_(c / "lq_0_f32.bin", n, &r) && lq0.size() == n) {
         std::printf("[relayvsr]   keyframe 0 source rows %.4f, after block "
@@ -612,9 +685,15 @@ TEST(relayvsr, keyframes_match_reference)
       EXPECT_TRUE(got[k] <= 1.1 * bar[k]);
       ++checked;
     }
-    std::printf("[relayvsr] keyframes %s (ours/reference bf16):%s; latents "
-                "digest %016llx\n", c.filename().c_str(), line.c_str(),
-                (unsigned long long)digest);
+    // ComfyUI's int8 runs as stored: widened to bf16 before each of its
+    // 240 GEMMs a keyframe off the int8 tiers.
+    if (m.wan->config().int8 && m.wan->config().i8_tier < 1) {
+      EXPECT_TRUE(m.wan->widened_gemms() == 8 * m.wan->config().layers);
+    }
+    std::printf("[relayvsr] keyframes %s (%dx%s; ours/reference bf16):%s; "
+                "latents digest %016llx\n", c.filename().c_str(),
+                scale_(meta), m.wan->config().int8 ? ", int8 ConvRot" : "",
+                line.c_str(), (unsigned long long)digest);
   }
   EXPECT_TRUE(checked > 0);
 }
@@ -628,12 +707,13 @@ TEST(relayvsr, stream_matches_reference)
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  Model m;
-  if (!load_(mc, true, &m)) { return; }
   for (const fs::path& c : golden_cases_(golden)) {
+    Model m;
+    if (!load_case_(mc, c, true, &m)) { continue; }
     const FlexData meta = read_json_(c / "meta.json");
     const int h = int_(meta, "height"), w = int_(meta, "width");
     const int count = int_(meta, "count");
+    const int sc = scale_(meta);
     const std::vector<double> bar = reals_(meta, "bar_out");
     RelayVsrStream::Options o;
     o.window = int_(meta, "window");
@@ -661,9 +741,10 @@ TEST(relayvsr, stream_matches_reference)
       EXPECT_TRUE(out[(std::size_t)i].index == i);
       digest = fnv_(out[(std::size_t)i].px.data(),
                     out[(std::size_t)i].px.size(), digest);
-      const std::size_t ne = (std::size_t)3 * 16 * h * w;
+      const std::size_t ne = (std::size_t)3 * sc * sc * h * w;
       std::vector<float> ref;
       ASSERT_TRUE(read_bin_(c / fmt("out_{}_f32.bin", i)(), ne, &ref));
+      ASSERT_TRUE(out[(std::size_t)i].px.size() == ne * 4);
       const auto* p = (const float*)out[(std::size_t)i].px.data();
       std::vector<float> ours(ne);
       for (std::size_t e = 0; e < ne; ++e) { ours[e] = 2.0f * p[e] - 1.0f; }
@@ -707,20 +788,32 @@ TEST(relayvsr, bench)
   if (const char* r = env_("VPIPE_RELAYVSR_BENCH_ANE_ROWS")) {
     acc.ane_rows = (float)std::atof(r);
   }
+  // VPIPE_RELAYVSR_BENCH_MODEL: any layout (a Comfy-Org/RelayVSR root
+  // with VPIPE_RELAYVSR_BENCH_SCALE 2 or 4, or a checkpoint file); the
+  // release's (VPIPE_RELAYVSR_TEST_MODEL_PATH) otherwise.
   Model m;
-  if (!load_(mc, true, &m, acc)) { return; }
-  genai::relayvsr::Ops op16, op16b;
   std::string err;
+  if (const char* bm = env_("VPIPE_RELAYVSR_BENCH_MODEL")) {
+    genai::RelayVsrFiles files;
+    const char* bs = env_("VPIPE_RELAYVSR_BENCH_SCALE");
+    ASSERT_TRUE(genai::resolve_relayvsr_files(bm, &files, &err,
+                                              bs ? std::atoi(bs) : 0));
+    if (!load_files_(mc, files, true, &m, acc)) { return; }
+  } else if (!load_(mc, true, &m, acc)) {
+    return;
+  }
+  genai::relayvsr::Ops op16, op16b;
   ASSERT_TRUE(op16.load(mc, false, &err));
   ASSERT_TRUE(op16b.load(mc, true, &err));
-  const int ph = h + (8 - h % 8) % 8, pw = w + (8 - w % 8) % 8;
+  const int sc = m.wan->config().upscale, ls = 16 / sc, ts = 2 * ls;
+  const int ph = h + (ts - h % ts) % ts, pw = w + (ts - w % ts) % ts;
   std::mt19937 rng(1);
   std::vector<std::uint8_t> px((std::size_t)3 * h * w);
   for (auto& b : px) { b = (std::uint8_t)(rng() & 0xff); }
-  SharedBuffer lr16 = upload_(mc, op16, px, h, w);
-  SharedBuffer lrbf = upload_(mc, op16b, px, h, w);
+  SharedBuffer lr16 = upload_(mc, op16, px, h, w, ph, pw);
+  SharedBuffer lrbf = upload_(mc, op16b, px, h, w, ph, pw);
   std::normal_distribution<float> nd;
-  std::vector<float> noise((std::size_t)48 * (ph / 4) * (pw / 4));
+  std::vector<float> noise((std::size_t)48 * (ph / ls) * (pw / ls));
   for (float& v : noise) { v = nd(rng); }
   SharedBuffer lat, out;
   MetalRelayVsrDecoder::Condition c0, c1;
@@ -738,25 +831,27 @@ TEST(relayvsr, bench)
     ASSERT_TRUE(m.wan->keyframe(lrbf, ph, pw, noise, &lat, &err));
     if (r > 0) { tk = std::min(tk, ms(t0)); }
     t0 = std::chrono::steady_clock::now();
-    ASSERT_TRUE(m.dec->prepare(lat, ph / 4, pw / 4, &c0, &err));
+    ASSERT_TRUE(m.dec->prepare(lat, ph / ls, pw / ls, &c0, &err));
     if (r > 0) { tp = std::min(tp, ms(t0)); }
-    ASSERT_TRUE(m.dec->prepare(lat, ph / 4, pw / 4, &c1, &err));
+    ASSERT_TRUE(m.dec->prepare(lat, ph / ls, pw / ls, &c1, &err));
     m.dec->begin_window();
     t0 = std::chrono::steady_clock::now();
-    ASSERT_TRUE(m.dec->decode(lr16, ph, pw, c0, c1, 4 * h, 4 * w, false,
+    ASSERT_TRUE(m.dec->decode(lr16, ph, pw, c0, c1, sc * h, sc * w, false,
                               &out, &err));
     if (r > 0) { td = std::min(td, ms(t0)); }
     t0 = std::chrono::steady_clock::now();
-    ASSERT_TRUE(m.dec->decode(lr16, ph, pw, c0, c1, 4 * h, 4 * w, false,
+    ASSERT_TRUE(m.dec->decode(lr16, ph, pw, c0, c1, sc * h, sc * w, false,
                               &out, &err));
     if (r > 0) { td2 = std::min(td2, ms(t0)); }
   }
-  std::printf("[relayvsr] bench %dx%d -> %dx%d (%s, int8 %s, ANE %s, "
-              "sage %d, window attention on %s, cross on %s): "
+  std::printf("[relayvsr] bench %dx%d -> %dx%d (%dx%s, %s, int8 %s, ANE "
+              "%s, sage %d, window attention on %s, cross on %s): "
               "keyframe %.0f ms, prime %.0f ms, frame %.0f ms (first of a "
               "window) / %.0f ms (with history); a 16-frame window ~%.3f s "
-              "a frame; int8 GEMMs %ld / %ld, ANE rows %ld / %ld\n",
-              w, h, 4 * w, 4 * h,
+              "a frame; int8 GEMMs %ld / %ld (%ld ConvRot as stored, %ld "
+              "widened), ANE rows %ld / %ld\n",
+              w, h, sc * w, sc * h, sc,
+              m.wan->config().int8 ? " ComfyUI int8" : "",
               m.wan->uses_matrix_cores() ? "matrix cores" : "steel",
               tier_name_(m.wan->config().i8_tier), acc.ane ? "on" : "off",
               m.wan->config().sage_mode(),
@@ -764,8 +859,8 @@ TEST(relayvsr, bench)
               m.wan->cross_on_matrix_cores() ? "matrix cores" : "steel", tk,
               tp,
               td, td2, (tk + tp + td + 14 * td2) / 15.0 / 1000.0,
-              m.wan->i8_gemms(), m.dec->i8_gemms(), m.wan->ane_rows(),
-              m.dec->ane_rows());
+              m.wan->i8_gemms(), m.dec->i8_gemms(), m.wan->convrot_gemms(),
+              m.wan->widened_gemms(), m.wan->ane_rows(), m.dec->ane_rows());
 }
 
 namespace {
@@ -800,7 +895,25 @@ device_peak_of_(MetalCompute* mc, Fn&& fn)
 // weights as held, and RelayVsrStream::run_bytes.
 TEST(relayvsr, allocates_what_it_books)
 {
-  if (env_("VPIPE_RELAYVSR_TEST_MODEL_PATH") == nullptr) { return; }
+  // The release's pair, and -- VPIPE_RELAYVSR_COMFY_PATH -- ComfyUI's
+  // int8 repack at 2x and at 4x (its codes held as stored, widened per
+  // GEMM into a scratch the plan books, or run as the token layout).
+  std::vector<genai::RelayVsrFiles> models;
+  {
+    genai::RelayVsrFiles f;
+    std::string e;
+    if (const char* r = env_("VPIPE_RELAYVSR_TEST_MODEL_PATH")) {
+      if (genai::resolve_relayvsr_files(r, &f, &e)) { models.push_back(f); }
+    }
+    if (const char* r = env_("VPIPE_RELAYVSR_COMFY_PATH")) {
+      for (int sc : {2, 4}) {
+        if (genai::resolve_relayvsr_files(r, &f, &e, sc)) {
+          models.push_back(f);
+        }
+      }
+    }
+  }
+  if (models.empty()) { return; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
@@ -831,9 +944,23 @@ TEST(relayvsr, allocates_what_it_books)
     arms.push_back(Accel{});
     arms.back().sage = 2;
   }
+  // ComfyUI's int8 adds the fast tier: its layout converted from the
+  // widened codes.
+  if (mc->supports_matrix_cores()) {
+    arms.push_back(Accel{});
+    arms.back().i8 = 1;
+  }
+  for (const genai::RelayVsrFiles& files : models)
   for (const Accel& arm : arms)
   for (const auto& [h, w] : {std::pair<int, int>{136, 248},
                              std::pair<int, int>{270, 480}}) {
+    MetalRelayVsrWan::Config probe;
+    std::string pe;
+    if (arm.i8 == 1 &&
+        (!MetalRelayVsrWan::config_from_checkpoint(files.wan, &probe, &pe) ||
+         !probe.int8)) {
+      continue;   // the release's fast tier: as token's, measured before
+    }
     if (arm.sage > 0) {
       setenv("VPIPE_RELAYVSR_XSAGE_MIN_ROWS", "512", 1);
     } else {
@@ -846,7 +973,7 @@ TEST(relayvsr, allocates_what_it_books)
     MetalRelayVsrDecoder::Config dc;
     std::size_t n_out = 0;
     const std::size_t peak = device_peak_of_(mc, [&] {
-      ASSERT_TRUE(load_(mc, true, &m, arm));
+      ASSERT_TRUE(load_files_(mc, files, true, &m, arm));
       if (!m.wan) { return; }
       wc = m.wan->config();
       dc = m.dec->config();
@@ -893,19 +1020,35 @@ TEST(relayvsr, allocates_what_it_books)
       const long want = arm.sage == 0 ? 0 : arm.sage == 1 ? 7 : 9;
       EXPECT_TRUE(op->window_int8_allocs() == want);
     }
+    // ComfyUI's int8 widening scratch: made ONCE -- at the fold, at the
+    // widest projection a forward widens, and kept for the forward where
+    // the tier widens (none, accurate), dropped after the fold where it
+    // does not -- and held at what the plan books (widen_bytes).
+    if (wc.int8) {
+      const genai::relayvsr::Ops& wo = m.wan->ops();
+      const int Di = wc.hidden, Fi = wc.ffn;
+      const std::uint64_t wbk = genai::relayvsr::Ops::widen_bytes(
+          wc.i8_tier, true, {Di, Fi, Di}, {Di, Di, Fi});
+      EXPECT_TRUE(wo.widen_allocs() == 1);
+      EXPECT_TRUE(wo.widened_held() == wbk);
+      EXPECT_TRUE((wbk > 0) == (wc.i8_tier < 1));
+    }
     const std::size_t w8 = m.wan->ops().window_int8_held() +
                            m.dec->ops().window_int8_held();
+    const int ts = wc.token_stride();
+    const int th = (h + ts - 1) / ts, tw = (w + ts - 1) / ts;
     const std::size_t w8_booked =
         genai::relayvsr::Ops::window_int8_bytes(
-            wc.context_frames, wc.heads, wc.heads,
-            ((h + 7) / 8) * ((w + 7) / 8), wc.head_dim, wc.sage_mode()) +
+            wc.context_frames, wc.heads, wc.heads, th * tw, wc.head_dim,
+            wc.sage_mode()) +
         genai::relayvsr::Ops::window_int8_bytes(
-            4, dc.heads, dc.kv_heads, ((h + 7) / 8 * 2) * ((w + 7) / 8 * 2),
-            dc.head_dim, dc.sage_mode());
+            4, dc.heads, dc.kv_heads, (th * 2) * (tw * 2), dc.head_dim,
+            dc.sage_mode());
     EXPECT_TRUE(w8 <= w8_booked + (18u << 14));   // a page a buffer
-    std::printf("[relayvsr] %dx%d, int8 %s%s, ANE %s, sage %d: device "
-                "+%.1f MB, booked %.1f MB (weights %.1f, run %.1f, ANE "
-                "%.1f; int8 attention %.1f of %.1f)\n",
+    std::printf("[relayvsr] %dx %s, %dx%d, int8 %s%s, ANE %s, sage %d: "
+                "device +%.1f MB, booked %.1f MB (weights %.1f, run %.1f, "
+                "ANE %.1f; int8 attention %.1f of %.1f)\n",
+                wc.upscale, wc.int8 ? "ComfyUI int8" : "release",
                 w, h, tier_name_(wc.i8_tier),
                 arm.autotune ? " (tuned)" : "", arm.ane ? "on" : "off",
                 arm.sage,
@@ -964,17 +1107,40 @@ heap_peak_of_(Fn&& fn)
 // buffer that keeps them. The heap's peak over a load of both models.
 TEST(relayvsr, loading_keeps_no_large_host_copy)
 {
-  if (env_("VPIPE_RELAYVSR_TEST_MODEL_PATH") == nullptr) { return; }
+  // The release's pair, and ComfyUI's int8 repack at both scales
+  // (VPIPE_RELAYVSR_COMFY_PATH): its codes read into Metal buffers, its
+  // scales a row of f32 at a time, its widening on the GPU.
+  std::vector<genai::RelayVsrFiles> models;
+  {
+    genai::RelayVsrFiles f;
+    std::string e;
+    if (const char* r = env_("VPIPE_RELAYVSR_TEST_MODEL_PATH")) {
+      if (genai::resolve_relayvsr_files(r, &f, &e)) { models.push_back(f); }
+    }
+    if (const char* r = env_("VPIPE_RELAYVSR_COMFY_PATH")) {
+      for (int sc : {2, 4}) {
+        if (genai::resolve_relayvsr_files(r, &f, &e, sc)) {
+          models.push_back(f);
+        }
+      }
+    }
+  }
+  if (models.empty()) { return; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
-  Model m;
-  bool ok = false;
-  const std::size_t peak = heap_peak_of_([&] { ok = load_(mc, true, &m); });
-  ASSERT_TRUE(ok);
-  std::printf("[relayvsr] load: host heap peak +%.1f MB\n",
-              peak / 1048576.0);
-  EXPECT_TRUE(peak < (32u << 20));
+  for (const genai::RelayVsrFiles& files : models) {
+    Model m;
+    bool ok = false;
+    const std::size_t peak =
+        heap_peak_of_([&] { ok = load_files_(mc, files, true, &m); });
+    ASSERT_TRUE(ok);
+    std::printf("[relayvsr] load %dx%s: host heap peak +%.1f MB\n",
+                m.wan->config().upscale,
+                m.wan->config().int8 ? " ComfyUI int8" : "",
+                peak / 1048576.0);
+    EXPECT_TRUE(peak < (32u << 20));
+  }
 }
 
 namespace {
@@ -1035,7 +1201,7 @@ class RvSink : public TypedStage<RvSink> {
 public:
   static constexpr const char* kTypeName = "ut-relayvsr-sink";
   using TypedStage::TypedStage;
-  int h = 0, w = 0, frames = 0;
+  int h = 0, w = 0, frames = 0, scale = 4;
   bool ordered = true, shaped = true;
   std::size_t booked = 0;
   // At the second frame (the stage has settled its ANE bookings after the
@@ -1059,7 +1225,7 @@ public:
     const auto* tb = dynamic_cast<const TensorBeatPayload*>(in.get());
     shaped = shaped && tb != nullptr && tb->dtype == TensorBeat::DType::F32 &&
              tb->shape.size() == 3 && tb->shape[0] == 3 &&
-             tb->shape[1] == 4 * h && tb->shape[2] == 4 * w;
+             tb->shape[1] == scale * h && tb->shape[2] == scale * w;
     ordered = ordered && tb != nullptr &&
               bag::integer(tb->sideband, "i", -1) == frames;
     if (frames == 0) {
@@ -1611,11 +1777,15 @@ TEST(relayvsr, the_stage_checks_its_config)
                           {"i8_gemm_tier", FlexData::make_string(t)}}))
                     .empty());
   }
-  // The output size the launch plans at: both or neither, multiples of 4
-  // (the frames are 4x the input's), 32 .. 32768.
-  auto sized = [&](int w, int h) {
+  // The output size the launch plans at: both or neither, multiples of
+  // the scale (the frames are the scale times the input's), 32 .. 32768.
+  // The scale is the model's unless `scale` names it, so a side need only
+  // be even here -- a 4x model refuses one not a multiple of 4 at its
+  // launch (the_stage_runs_at_the_models_scale).
+  auto sized = [&](int w, int h, int sc = 0) {
     return make(cfg({{"hf_dir", dir}, {"output_width", FlexData::make_int(w)},
-                     {"output_height", FlexData::make_int(h)}}));
+                     {"output_height", FlexData::make_int(h)},
+                     {"scale", FlexData::make_int(sc)}}));
   };
   EXPECT_TRUE(sized(0, 0).empty());
   EXPECT_TRUE(sized(1408, 960).empty());
@@ -1624,8 +1794,17 @@ TEST(relayvsr, the_stage_checks_its_config)
   EXPECT_FALSE(sized(0, 960).empty());
   EXPECT_FALSE(sized(16, 960).empty());
   EXPECT_FALSE(sized(1408, 32800).empty());
-  EXPECT_FALSE(sized(1410, 960).empty());
-  EXPECT_FALSE(sized(1408, 962).empty());
+  EXPECT_TRUE(sized(1410, 960).empty());
+  EXPECT_FALSE(sized(1409, 960).empty());
+  EXPECT_FALSE(sized(1408, 961).empty());
+  EXPECT_FALSE(sized(1410, 960, 4).empty());
+  EXPECT_TRUE(sized(1410, 962, 2).empty());
+  // The scale itself: 0 (the model's), 2 or 4.
+  for (int sc : {1, 3, 8, -2}) {
+    EXPECT_FALSE(make(cfg({{"hf_dir", dir},
+                           {"scale", FlexData::make_int(sc)}}))
+                     .empty());
+  }
   EXPECT_TRUE(make(cfg({{"hf_dir", dir}, {"ane_ffn", on},
                         {"ane_rows", FlexData::make_real(0.5)}}))
                   .empty());
@@ -1734,6 +1913,7 @@ run_stream_(MetalCompute* mc, Model& m, const fs::path& c, StreamRun* r)
   const int h = int_(meta, "height"), w = int_(meta, "width");
   const int ph = int_(meta, "pad_height"), pw = int_(meta, "pad_width");
   const int count = int_(meta, "count");
+  const int sc = scale_(meta), ls = 16 / sc;
   r->bar_kf = reals_(meta, "bar_latent");
   r->bar_frames = reals_(meta, "bar_out");
   RelayVsrStream::Options o;
@@ -1741,7 +1921,7 @@ run_stream_(MetalCompute* mc, Model& m, const fs::path& c, StreamRun* r)
   o.seed = (std::uint64_t)int_(meta, "seed");
   o.f32_out = true;
   RelayVsrStream st(m.wan.get(), m.dec.get(), mc, o);
-  const std::size_t nl = (std::size_t)48 * (ph / 4) * (pw / 4);
+  const std::size_t nl = (std::size_t)48 * (ph / ls) * (pw / ls);
   st.on_keyframe = [&](std::int64_t f, const std::vector<float>&,
                        const SharedBuffer& lat) {
     std::vector<float> ref;
@@ -1766,7 +1946,7 @@ run_stream_(MetalCompute* mc, Model& m, const fs::path& c, StreamRun* r)
       (int)out.size() != count) {
     return false;
   }
-  const std::size_t ne = (std::size_t)3 * 16 * h * w;
+  const std::size_t ne = (std::size_t)3 * sc * sc * h * w;
   std::vector<float> ours(ne), ref;
   for (const OutFrame& f : out) {
     r->digest = fnv_(f.px.data(), f.px.size(), r->digest);
@@ -1799,6 +1979,7 @@ decode_tf_(MetalCompute* mc, Model& m, const genai::relayvsr::Ops& op16,
   const int h = int_(meta, "height"), w = int_(meta, "width");
   const int ph = int_(meta, "pad_height"), pw = int_(meta, "pad_width");
   const int count = int_(meta, "count"), window = int_(meta, "window");
+  const int sc = scale_(meta), ls = 16 / sc;
   *bar = reals_(meta, "bar_out_tf");
   std::map<int, MetalRelayVsrDecoder::Condition> cond;
   FlexData mm = meta;
@@ -1808,15 +1989,17 @@ decode_tf_(MetalCompute* mc, Model& m, const genai::relayvsr::Ops& op16,
     const int k = (int)kf.as_int();
     std::vector<float> lat;
     if (!read_bin_(c / fmt("latent_{}_f32.bin", k)(),
-                   (std::size_t)48 * (ph / 4) * (pw / 4), &lat)) {
+                   (std::size_t)48 * (ph / ls) * (pw / ls), &lat)) {
       return false;
     }
     SharedBuffer lb = genai::relayvsr::upload_f32(mc, lat);
-    if (!m.dec->prepare(lb, ph / 4, pw / 4, &cond[k], &err)) { return false; }
+    if (!m.dec->prepare(lb, ph / ls, pw / ls, &cond[k], &err)) {
+      return false;
+    }
   }
   got->assign((std::size_t)count, -1.0);
   SharedBuffer out;
-  const std::size_t ne = (std::size_t)3 * 16 * h * w;
+  const std::size_t ne = (std::size_t)3 * sc * sc * h * w;
   std::vector<float> ours(ne), ref;
   for (const auto& [idx, emit_from] : plan_(count, window)) {
     m.dec->begin_window();
@@ -1827,9 +2010,9 @@ decode_tf_(MetalCompute* mc, Model& m, const genai::relayvsr::Ops& op16,
                      &px)) {
         return false;
       }
-      SharedBuffer lr = upload_(mc, op16, px, h, w);
+      SharedBuffer lr = upload_(mc, op16, px, h, w, ph, pw);
       if (!m.dec->decode(lr, ph, pw, cond[idx.front()], cond[idx.back()],
-                         4 * h, 4 * w, true, &out, &err)) {
+                         sc * h, sc * w, true, &out, &err)) {
         return false;
       }
       if ((int)off < emit_from) { continue; }
@@ -1857,9 +2040,7 @@ decode_tf_(MetalCompute* mc, Model& m, const genai::relayvsr::Ops& op16,
 TEST(relayvsr, int8_tiers_stay_close)
 {
   const char* golden = env_("VPIPE_RELAYVSR_GOLDEN");
-  if (golden == nullptr || env_("VPIPE_RELAYVSR_TEST_MODEL_PATH") == nullptr) {
-    return;
-  }
+  if (golden == nullptr) { return; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
@@ -1872,14 +2053,15 @@ TEST(relayvsr, int8_tiers_stay_close)
   ASSERT_TRUE(op16.load(mc, false, &err));
   MetalRelayVsrWan::Config wc0;
   MetalRelayVsrDecoder::Config dc0;
+  for (const fs::path& c : golden_cases_(golden))
   for (int tier = 0; tier <= 3; ++tier) {
     Accel a;
     a.i8 = tier;
     Model m;
-    ASSERT_TRUE(load_(mc, true, &m, a));
-    if (!m.wan) { continue; }
+    if (!load_case_(mc, c, true, &m, a)) { break; }
     EXPECT_TRUE(m.wan->config().i8_tier == tier);
     EXPECT_TRUE(m.dec->config().i8_tier == tier);
+    const bool q = m.wan->config().int8;
     wc0 = m.wan->config();
     dc0 = m.dec->config();
     wc0.i8_tier = dc0.i8_tier = -1;
@@ -1888,15 +2070,31 @@ TEST(relayvsr, int8_tiers_stay_close)
                  MetalRelayVsrDecoder::weight_bytes(m.dec->config()));
     const double dense = (double)(MetalRelayVsrWan::weight_bytes(wc0) +
                                   MetalRelayVsrDecoder::weight_bytes(dc0));
-    if (tier >= 1) { EXPECT_TRUE(held < 0.6 * dense); }
-    for (const fs::path& c : golden_cases_(golden)) {
+    // A bf16 checkpoint's held tiers halve it; ComfyUI's int8 is held at
+    // its own size whatever the tier.
+    if (tier >= 1 && !q) { EXPECT_TRUE(held < 0.6 * dense); }
+    if (q) { EXPECT_TRUE(held < 1.01 * dense); }
+    {
       StreamRun r;
       ASSERT_TRUE(run_stream_(mc, m, c, &r));
       ASSERT_TRUE(r.kf.size() == r.bar_kf.size());
       ASSERT_TRUE(r.frames.size() == r.bar_frames.size());
-      EXPECT_TRUE(m.wan->i8_gemms() == 8 * m.wan->config().layers);
+      const long L = m.wan->config().layers;
+      // The accurate route's floor: a keyframe of fewer than 1024 rows (the
+      // 2x goldens': 384 and 897) runs its GEMMs densely by design.
+      const FlexData meta = read_json_(c / "meta.json");
+      const int ts = 32 / scale_(meta);
+      const int kr = (int_(meta, "pad_height") / ts) *
+                     (int_(meta, "pad_width") / ts);
+      const bool acc_floor = tier == 0 && kr < 1024;
+      EXPECT_TRUE(m.wan->i8_gemms() == (acc_floor ? 0 : 8 * L));
       EXPECT_TRUE(m.dec->i8_gemms() ==
                   (tier == 0 ? 1 : 6) * m.dec->config().depth);
+      // ComfyUI's ConvRot codes: run AS STORED on the token tiers (the
+      // activation rotated alike), converted on fast, widened per GEMM on
+      // accurate.
+      EXPECT_TRUE(m.wan->convrot_gemms() == (q && tier >= 2 ? 8 * L : 0));
+      EXPECT_TRUE(m.wan->widened_gemms() == (q && tier == 0 ? 8 * L : 0));
       double kw = 0.0, fw = 0.0;
       for (std::size_t k = 0; k < r.kf.size(); ++k) {
         kw = std::max(kw, r.kf[k] / r.bar_kf[k]);
@@ -1910,21 +2108,32 @@ TEST(relayvsr, int8_tiers_stay_close)
       for (std::size_t k = 0; k < tf.size(); ++k) {
         tw = std::max(tw, tf[k] / tf_bar[k]);
       }
-      std::printf("[relayvsr] int8 %s, %s: keyframes rel-L2 mean %.4f "
+      std::printf("[relayvsr] int8 %s, %s%s: keyframes rel-L2 mean %.4f "
                   "(reference bf16 %.4f, worst ratio %.2f); frames %.4f "
                   "(%.4f, worst %.2f); the decoder alone %.4f (%.4f, worst "
-                  "%.2f); weights %.0f MB against %.0f\n",
-                  tier_name_(tier), c.filename().c_str(), mean_(r.kf),
+                  "%.2f); weights %.0f MB against %.0f; %ld ConvRot GEMMs "
+                  "as stored, %ld widened\n",
+                  tier_name_(tier), c.filename().c_str(),
+                  q ? " (ComfyUI int8)" : "", mean_(r.kf),
                   mean_(r.bar_kf), kw, mean_(r.frames), mean_(r.bar_frames),
                   fw, mean_(tf), mean_(tf_bar), tw, held / 1048576.0,
-                  dense / 1048576.0);
+                  dense / 1048576.0, m.wan->convrot_gemms(),
+                  m.wan->widened_gemms());
       // Over what each tier measured on an M5 Max (worst keyframe / frame
       // / decoder alone: accurate 1.31 / 1.12 / 0.32, fast 1.35 / 1.18 /
       // 1.20, token 1.39 / 1.17 / 1.19, token_plain 3.89 / 3.04 / 1.62).
-      const bool plain = tier == 3;
+      // ComfyUI's ConvRot codes run as stored on token_plain too: their
+      // activation is rotated whatever the tier says, so the KEYFRAME
+      // model's bar is token's; the decoder's projections are its own f16
+      // weights, plain on token_plain whatever the file. The decoder alone
+      // at 2x is held to its worst FRAME against a reference whose own bf16
+      // spreads 0.58-1.54% frame to frame on the small 2x golden (M5 Ultra:
+      // token's worst 1.69x, its mean 0.70x the reference's): 1.8 there.
+      const bool plain = tier == 3 && !q;
+      const bool two = scale_(meta) == 2;
       EXPECT_TRUE(kw <= (plain ? 4.5 : 1.6));
-      EXPECT_TRUE(fw <= (plain ? 3.5 : 1.35));
-      EXPECT_TRUE(tw <= (plain ? 1.9 : 1.4));
+      EXPECT_TRUE(fw <= (tier == 3 ? 3.5 : 1.35));
+      EXPECT_TRUE(tw <= (tier == 3 ? 1.9 : two ? 1.8 : 1.4));
     }
   }
 }
@@ -1939,9 +2148,7 @@ TEST(relayvsr, int8_tiers_stay_close)
 TEST(relayvsr, ane_feed_forward_stays_close)
 {
   const char* golden = env_("VPIPE_RELAYVSR_GOLDEN");
-  if (golden == nullptr || env_("VPIPE_RELAYVSR_TEST_MODEL_PATH") == nullptr) {
-    return;
-  }
+  if (golden == nullptr) { return; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
@@ -1949,21 +2156,40 @@ TEST(relayvsr, ane_feed_forward_stays_close)
     StreamRun gpu, ane;
     {
       Model m;
-      ASSERT_TRUE(load_(mc, true, &m));
-      if (!m.wan) { return; }
+      if (!load_case_(mc, c, true, &m)) { continue; }
       ASSERT_TRUE(run_stream_(mc, m, c, &gpu));
     }
+    // Half the rows, or -- where half a keyframe's rows are under one
+    // chunk (a 2x model's keyframe has a quarter of the 4x one's tokens:
+    // 897 and 384 rows on the x2 goldens) -- one whole chunk's share. A
+    // keyframe under one chunk is under the tier's floor: it declines,
+    // and the test says so rather than asserting rows it cannot take.
+    const FlexData meta = read_json_(c / "meta.json");
+    const int ts = 32 / scale_(meta);
+    const int kr = (int_(meta, "pad_height") / ts) *
+                   (int_(meta, "pad_width") / ts);
+    const int chunk = genai::relayvsr::ane_chunk(kr);
+    const bool k_floor = kr < chunk;
     Accel a;
     a.ane = true;
-    a.ane_rows = 0.5f;
+    a.ane_rows = kr / 2 >= chunk || k_floor
+                     ? 0.5f
+                     : std::min(1.0f, (float)chunk / (float)kr + 1e-3f);
     Model m;
-    ASSERT_TRUE(load_(mc, true, &m, a));
+    ASSERT_TRUE(load_case_(mc, c, true, &m, a));
     ASSERT_TRUE(run_stream_(mc, m, c, &ane));
     if (m.wan->ane_rows() == 0 && m.dec->ane_rows() == 0) {
       std::printf("[relayvsr] ANE tier: not built here; SKIPPED\n");
       return;
     }
-    EXPECT_TRUE(m.wan->ane_rows() > 0);
+    if (k_floor) {
+      std::printf("[relayvsr] ANE %s: a keyframe's %d rows are under one "
+                  "%d-row chunk -- the keyframe model keeps the GPU\n",
+                  c.filename().c_str(), kr, chunk);
+      EXPECT_TRUE(m.wan->ane_rows() == 0);
+    } else {
+      EXPECT_TRUE(m.wan->ane_rows() > 0);
+    }
     EXPECT_TRUE(m.dec->ane_rows() > 0);
     ASSERT_TRUE(ane.latents.size() == gpu.latents.size());
     double lat = 0.0;
@@ -1979,11 +2205,15 @@ TEST(relayvsr, ane_feed_forward_stays_close)
     for (std::size_t k = 0; k < ane.frames.size(); ++k) {
       fw = std::max(fw, ane.frames[k] / ane.bar_frames[k]);
     }
-    std::printf("[relayvsr] ANE %s: %ld / %ld rows a keyframe / a frame on "
+    std::printf("[relayvsr] ANE %s%s: %ld / %ld rows a keyframe / a frame on "
                 "the ANE; latents %.4f from the GPU's (worst); keyframes "
                 "rel-L2 mean %.4f (GPU %.4f, reference bf16 %.4f, worst "
                 "ratio %.2f); frames %.4f (GPU %.4f, %.4f, worst %.2f)\n",
-                c.filename().c_str(), m.wan->ane_rows(), m.dec->ane_rows(),
+                c.filename().c_str(),
+                m.wan->config().int8 ? " (ComfyUI int8, staged from its "
+                                       "codes)"
+                                     : "",
+                m.wan->ane_rows(), m.dec->ane_rows(),
                 lat, mean_(ane.kf), mean_(gpu.kf), mean_(ane.bar_kf), kw,
                 mean_(ane.frames), mean_(gpu.frames), mean_(ane.bar_frames),
                 fw);
@@ -2105,9 +2335,7 @@ TEST(relayvsr, window_attention_bench)
 TEST(relayvsr, sage_attention_stays_close)
 {
   const char* golden = env_("VPIPE_RELAYVSR_GOLDEN");
-  if (golden == nullptr || env_("VPIPE_RELAYVSR_TEST_MODEL_PATH") == nullptr) {
-    return;
-  }
+  if (golden == nullptr) { return; }
   Session sess;
   MetalCompute* mc = sess.metal_compute();
   if (mc == nullptr) { return; }
@@ -2118,12 +2346,12 @@ TEST(relayvsr, sage_attention_stays_close)
   genai::relayvsr::Ops op16;
   std::string err;
   ASSERT_TRUE(op16.load(mc, false, &err));
+  for (const fs::path& c : golden_cases_(golden))
   for (int sage = 0; sage <= 2; ++sage) {
     Accel a;
     a.sage = sage;
     Model m;
-    ASSERT_TRUE(load_(mc, true, &m, a));
-    if (!m.wan) { continue; }
+    if (!load_case_(mc, c, true, &m, a)) { break; }
     EXPECT_TRUE(m.wan->window_on_matrix_cores());
     EXPECT_TRUE(m.wan->cross_on_matrix_cores());
     EXPECT_TRUE(m.dec->window_on_matrix_cores());
@@ -2132,7 +2360,7 @@ TEST(relayvsr, sage_attention_stays_close)
     if (sage > 0) {
       setenv("VPIPE_RELAYVSR_XSAGE_MIN_ROWS", "0", 1);
     }
-    for (const fs::path& c : golden_cases_(golden)) {
+    {
       StreamRun r;
       ASSERT_TRUE(run_stream_(mc, m, c, &r));
       ASSERT_TRUE(r.kf.size() == r.bar_kf.size());
@@ -2159,11 +2387,355 @@ TEST(relayvsr, sage_attention_stays_close)
                   c.filename().c_str(), mean_(r.kf), mean_(r.bar_kf), kw,
                   mean_(r.frames), mean_(r.bar_frames), fw, mean_(tf),
                   mean_(tf_bar), tw);
+      // At 2x the decoder alone and the frames are held looser, for the
+      // reason int8_tiers_stay_close gives (the small 2x golden's reference
+      // spreads 0.58-1.54% frame to frame; M5 Ultra: the int8 QK's decoder
+      // worst 1.61x, its QK + P*V frames 1.48x).
+      const bool two = scale_(read_json_(c / "meta.json")) == 2;
       const double bk = sage == 0 ? 1.1 : sage == 1 ? 1.4 : 2.0;
-      const double bf = sage == 0 ? 1.1 : sage == 1 ? 1.3 : 1.5;
-      const double bt = sage == 0 ? 0.5 : 1.4;
+      const double bf = sage == 0 ? 1.1 : sage == 1 ? 1.3 : two ? 1.7 : 1.5;
+      const double bt = sage == 0 ? 0.5 : two ? 1.8 : 1.4;
       EXPECT_TRUE(kw <= bk && fw <= bf && tw <= bt);
     }
     unsetenv("VPIPE_RELAYVSR_XSAGE_MIN_ROWS");
+  }
+}
+
+namespace {
+
+// A safetensors file of one F32 scalar and the metadata `format` -- what
+// resolve_relayvsr_files reads of a checkpoint (its header alone).
+void
+write_st_(const fs::path& p, const std::string& format)
+{
+  fs::create_directories(p.parent_path());
+  const std::string hdr =
+      "{\"__metadata__\":{\"format\":\"" + format +
+      "\"},\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+  std::ofstream f(p, std::ios::binary);
+  const std::uint64_t n = hdr.size();
+  f.write(reinterpret_cast<const char*>(&n), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  const float z = 0.0f;
+  f.write(reinterpret_cast<const char*>(&z), 4);
+}
+
+}  // namespace
+
+// WHERE A PAIR IS, in every layout in circulation -- the release's (wan /
+// flash), lightx2v's x2 (wan_x2 / flash_x2), ComfyUI's (diffusion_models/
+// relayvsr_x<s>_* beside vae/relayvsr_flash_vae_x<s>_*, both scales in one
+// root) -- by each file's format: a root of two scales asks for `scale`, a
+// FILE names its own pair (its partner found in the sibling folder), and a
+// pair of two scales is no pair. Model-free: header-only files.
+TEST(relayvsr, files_resolve_in_every_layout)
+{
+  const fs::path t = fs::temp_directory_path() /
+                     fmt("rvsr-layouts-{}", (long)getpid())();
+  fs::remove_all(t);
+  write_st_(t / "rel" / "wan.safetensors", "refvsr-wan-v1");
+  write_st_(t / "rel" / "flash.safetensors", "refvsr-flash-v1");
+  write_st_(t / "l2v" / "wan_x2.safetensors", "relayvsr-wan-x2-v1");
+  write_st_(t / "l2v" / "flash_x2.safetensors", "relayvsr-flash-x2-v1");
+  const fs::path c = t / "comfy";
+  write_st_(c / "diffusion_models" /
+                "relayvsr_x2_lightx2v_int8_convrot.safetensors",
+            "relayvsr-wan-x2-v1");
+  write_st_(c / "diffusion_models" / "relayvsr_x4_int8_convrot.safetensors",
+            "refvsr-wan-v1");
+  write_st_(c / "vae" / "relayvsr_flash_vae_x2_fp32.safetensors",
+            "relayvsr-flash-x2-v1");
+  write_st_(c / "vae" / "relayvsr_flash_vae_x4_fp32.safetensors",
+            "refvsr-flash-v1");
+  // A mismatched pair: a 4x keyframe model beside a 2x decoder.
+  write_st_(t / "mixed" / "wan.safetensors", "refvsr-wan-v1");
+  write_st_(t / "mixed" / "flash_x2.safetensors", "relayvsr-flash-x2-v1");
+  genai::RelayVsrFiles f;
+  std::string err;
+  auto ok = [&](const fs::path& p, int sc, const fs::path& wan,
+                const fs::path& flash, int want) {
+    f = genai::RelayVsrFiles{};
+    err.clear();
+    const bool r = genai::resolve_relayvsr_files(p.string(), &f, &err, sc);
+    if (!r) { std::printf("[relayvsr] %s\n", err.c_str()); }
+    return r && f.wan == wan.string() && f.flash == flash.string() &&
+           f.scale == want;
+  };
+  auto refused = [&](const fs::path& p, int sc) {
+    f = genai::RelayVsrFiles{};
+    err.clear();
+    return !genai::resolve_relayvsr_files(p.string(), &f, &err, sc) &&
+           !err.empty();
+  };
+  EXPECT_TRUE(ok(t / "rel", 0, t / "rel" / "wan.safetensors",
+                 t / "rel" / "flash.safetensors", 4));
+  EXPECT_TRUE(ok(t / "rel" / "flash.safetensors", 0,
+                 t / "rel" / "wan.safetensors",
+                 t / "rel" / "flash.safetensors", 4));
+  EXPECT_TRUE(refused(t / "rel", 2));
+  EXPECT_TRUE(ok(t / "l2v", 0, t / "l2v" / "wan_x2.safetensors",
+                 t / "l2v" / "flash_x2.safetensors", 2));
+  const fs::path x2w = c / "diffusion_models" /
+                       "relayvsr_x2_lightx2v_int8_convrot.safetensors";
+  const fs::path x4w = c / "diffusion_models" /
+                       "relayvsr_x4_int8_convrot.safetensors";
+  const fs::path x2f = c / "vae" / "relayvsr_flash_vae_x2_fp32.safetensors";
+  const fs::path x4f = c / "vae" / "relayvsr_flash_vae_x4_fp32.safetensors";
+  // The root holds both: refused unasked, naming the key.
+  EXPECT_TRUE(refused(c, 0));
+  EXPECT_TRUE(err.find("scale") != std::string::npos);
+  EXPECT_TRUE(ok(c, 2, x2w, x2f, 2));
+  EXPECT_TRUE(ok(c, 4, x4w, x4f, 4));
+  // A FILE names its pair, the partner from the sibling folder.
+  EXPECT_TRUE(ok(x2w, 0, x2w, x2f, 2));
+  EXPECT_TRUE(ok(x4w, 0, x4w, x4f, 4));
+  EXPECT_TRUE(ok(x2f, 0, x2w, x2f, 2));
+  EXPECT_TRUE(ok(x2w, 2, x2w, x2f, 2));
+  EXPECT_TRUE(refused(x2w, 4));
+  // The folder of the DiTs alone: no decoder there.
+  EXPECT_TRUE(refused(c / "diffusion_models", 2));
+  EXPECT_TRUE(refused(t / "mixed", 0));
+  EXPECT_TRUE(refused(t / "mixed" / "wan.safetensors", 0));
+  EXPECT_TRUE(refused(t / "nothing-here", 0));
+  EXPECT_TRUE(refused(c, 3));
+  fs::remove_all(t);
+}
+
+// COMFYUI'S INT8 WIDENED AS THE HOST DECODES IT: each block projection of
+// the repack held as stored (its I8 codes, an f32 scale a row, ConvRot
+// group 256) and widened on the GPU right before its GEMM -- the codes
+// un-rotated in integers, times the scale, rounded once -- is the host's
+// fp8::decode_bf16 of the same tensor BIT FOR BIT; and, with the release
+// beside it (VPIPE_RELAYVSR_TEST_MODEL_PATH), the 4x repack's weights are
+// the release's to the int8 grid (cosine >= 0.9999 -- the rotation undone
+// the wrong way, or not at all, reads ~0). VPIPE_RELAYVSR_COMFY_PATH.
+TEST(relayvsr, comfy_int8_widens_as_the_host_decodes)
+{
+  const char* root = env_("VPIPE_RELAYVSR_COMFY_PATH");
+  if (root == nullptr) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  genai::relayvsr::Ops op;
+  std::string err;
+  ASSERT_TRUE(op.load(mc, /*bf16=*/true, &err));
+  std::optional<genai::MetalLlamaWeights> rel;
+  if (const char* r = env_("VPIPE_RELAYVSR_TEST_MODEL_PATH")) {
+    genai::RelayVsrFiles rf;
+    if (genai::resolve_relayvsr_files(r, &rf, &err)) {
+      rel = genai::MetalLlamaWeights::open(rf.wan);
+    }
+  }
+  for (int sc : {2, 4}) {
+    genai::RelayVsrFiles files;
+    ASSERT_TRUE(genai::resolve_relayvsr_files(root, &files, &err, sc));
+    auto ws = genai::WeightSet::open(files.wan, nullptr);
+    ASSERT_TRUE(ws != nullptr);
+    genai::fp8::Layout lay;
+    ASSERT_TRUE(genai::fp8::scan(ws->src(), &lay, &err, /*int8=*/true));
+    // Every block projection int8 ConvRot (10 a block: the cross K / V
+    // too, which the load folds), nothing else.
+    EXPECT_TRUE(lay.weights.size() == 300);
+    struct T { const char* comfy; const char* rel; int n, k; };
+    for (const T& tt : {T{"blocks.0.ffn.0.weight", "blocks.0.ffn.net.0.proj"
+                                                   ".weight", 14336, 3072},
+                        T{"blocks.29.ffn.2.weight", "blocks.29.ffn.net.2"
+                                                    ".weight", 3072, 14336},
+                        T{"blocks.13.self_attn.q.weight",
+                          "blocks.13.attn1.to_q.weight", 3072, 3072},
+                        T{"blocks.7.cross_attn.v.weight",
+                          "blocks.7.attn2.to_v.weight", 3072, 3072}}) {
+      const genai::fp8::Weight* q = lay.find(tt.comfy);
+      ASSERT_TRUE(q != nullptr);
+      if (q == nullptr) { continue; }
+      EXPECT_TRUE(q->format == genai::fp8::Format::kI8 &&
+                  q->rot_group == 256 && q->per_row);
+      const genai::relayvsr::Proj p = op.load_proj(
+          *ws, tt.comfy, "", tt.n, tt.k, "ut-rvsr/", /*hold=*/false, q,
+          /*cache=*/false, &err);
+      ASSERT_TRUE(p.valid() && p.stored());
+      if (!p.stored()) { continue; }
+      auto cs = mc->make_command_stream();
+      const SharedBuffer* gpu = nullptr;
+      {
+        ComputeEncoder enc = cs.begin_compute();
+        gpu = op.dense_weight(enc, p);
+        enc.end();
+      }
+      ASSERT_TRUE(gpu != nullptr && cs.commit().wait_ok(&err));
+      const std::size_t nk = (std::size_t)tt.n * tt.k;
+      std::vector<float> scales;
+      ASSERT_TRUE(genai::fp8::read_scale(ws->src(), *q, (std::size_t)tt.n,
+                                         &scales, &err));
+      std::vector<std::uint16_t> host(nk), unrot(nk);
+      genai::fp8::decode_bf16((const std::uint8_t*)p.i8.contents(),
+                              host.data(), tt.n, tt.k,
+                              genai::fp8::Format::kI8, scales, 256);
+      genai::fp8::decode_bf16((const std::uint8_t*)p.i8.contents(),
+                              unrot.data(), tt.n, tt.k,
+                              genai::fp8::Format::kI8, scales, 0);
+      const bool same =
+          std::memcmp(gpu->contents(), host.data(), nk * 2) == 0;
+      EXPECT_TRUE(same);
+      // ...and the rotation matters (a widening that skipped it would
+      // pass a test against itself).
+      EXPECT_TRUE(std::memcmp(host.data(), unrot.data(), nk * 2) != 0);
+      double cos = -2.0;
+      if (sc == 4 && rel) {
+        std::vector<std::uint16_t> b(nk);
+        if (rel->read_into(tt.rel, b.data(), nk * 2)) {
+          double xy = 0.0, xx = 0.0, yy = 0.0;
+          for (std::size_t i = 0; i < nk; ++i) {
+            const double x = genai::relayvsr::from_bf16(host[i]);
+            const double y = genai::relayvsr::from_bf16(b[i]);
+            xy += x * y;
+            xx += x * x;
+            yy += y * y;
+          }
+          cos = xy / std::sqrt(xx * yy);
+          EXPECT_TRUE(cos >= 0.9999);
+        }
+      }
+      std::printf("[relayvsr] %dx %s [%d, %d]: GPU widening %s the host's "
+                  "decode%s\n", sc, tt.comfy, tt.n, tt.k,
+                  same ? "==" : "!=",
+                  cos > -2.0 ? fmt("; cosine to the release's bf16 {:.6f}",
+                                   cos)().c_str()
+                             : "");
+    }
+  }
+}
+
+// THE STAGE AT THE MODEL'S SCALE, from ComfyUI's 2x catalogue record (its
+// keyframe DiT FILE, as model-fetch registers it): frames out in order at
+// 2x, the arena booked at the run's frame -- the plan's default a
+// 3840 x 2176 OUTPUT (1920 x 1088 in at 2x), an output size given planned
+// at its half -- and given back at the end; the 4x file's launch refuses
+// an output size that is not 4x a frame. VPIPE_RELAYVSR_COMFY_PATH.
+TEST(relayvsr, the_stage_runs_at_the_models_scale)
+{
+  const char* root = env_("VPIPE_RELAYVSR_COMFY_PATH");
+  if (root == nullptr) { return; }
+  genai::RelayVsrFiles files, files4;
+  std::string err;
+  ASSERT_TRUE(genai::resolve_relayvsr_files(root, &files, &err, 2));
+  ASSERT_TRUE(genai::resolve_relayvsr_files(root, &files4, &err, 4));
+  MetalRelayVsrWan::Config wc;
+  MetalRelayVsrDecoder::Config dc;
+  ASSERT_TRUE(MetalRelayVsrWan::config_from_checkpoint(files.wan, &wc, &err));
+  ASSERT_TRUE(
+      MetalRelayVsrDecoder::config_from_checkpoint(files.flash, &dc, &err));
+  EXPECT_TRUE(wc.upscale == 2 && dc.upscale == 2 && wc.int8);
+  constexpr int H = 180, W = 320, N = 18;
+  const std::size_t run = RelayVsrStream::run_bytes(wc, dc, H, W, 16);
+  const std::size_t plan = RelayVsrStream::run_bytes(wc, dc, 1088, 1920, 16);
+  Session sess;
+  if (sess.metal_compute() == nullptr) { return; }
+  auto* mgr = sess.services()->generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  {
+    // Planned at the model's scale: half the output size given.
+    FlexData sized = FlexData::make_object();
+    sized.as_object().insert_or_assign("hf_dir",
+                                       FlexData::make_string(files.wan));
+    sized.as_object().insert_or_assign("output_width",
+                                       FlexData::make_int(2 * W));
+    sized.as_object().insert_or_assign("output_height",
+                                       FlexData::make_int(2 * H));
+    RelayVsrUpscaleStage st(&sess, "sized", std::vector<InEdge>{},
+                            std::move(sized));
+    EXPECT_TRUE(st.config_error().empty());
+    EXPECT_TRUE(planned_arena_(st) == run);
+  }
+  auto pl = std::make_unique<Pipeline>("p", &sess);
+  auto src_u = std::make_unique<RvSource>(&sess, "src", std::vector<InEdge>{},
+                                          FlexData::make_object());
+  src_u->h = H;
+  src_u->w = W;
+  src_u->count = N;
+  src_u->allocate_oports(1);
+  auto* src = pl->insert_stage(std::move(src_u));
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert_or_assign("hf_dir", FlexData::make_string(files.wan));
+  cfg.as_object().insert_or_assign("output_dtype",
+                                   FlexData::make_string("f32"));
+  auto* rv = static_cast<RelayVsrUpscaleStage*>(pl->insert_stage(
+      std::make_unique<RelayVsrUpscaleStage>(
+          &sess, "rv", std::vector<InEdge>{{src, 0}}, cfg)));
+  auto sink_u = std::make_unique<RvSink>(&sess, "sink",
+                                         std::vector<InEdge>{{rv, 0}},
+                                         FlexData::make_object());
+  sink_u->h = H;
+  sink_u->w = W;
+  sink_u->scale = 2;
+  sink_u->files = files;
+  auto* sink = static_cast<RvSink*>(pl->insert_stage(std::move(sink_u)));
+  EXPECT_TRUE(planned_arena_(*rv) == plan);
+  g_rv_arm.store(false);
+  g_rv_armed.store(true);   // the source need not wait for a sampler
+  bool ok = false;
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    ok = rt.launch();
+    if (ok) {
+      rt.wait_idle();
+      rt.stop();
+    }
+  }
+  ASSERT_TRUE(ok);
+  std::printf("[relayvsr] stage at 2x: %d frames (in order %d, 2x f32 %d); "
+              "arena booked %.1f MB at the first frame (run %.1f), the "
+              "launch planned %.1f MB (a 3840 x 2176 output)\n",
+              sink->frames, (int)sink->ordered, (int)sink->shaped,
+              sink->booked / 1048576.0, run / 1048576.0, plan / 1048576.0);
+  EXPECT_TRUE(sink->frames == N);
+  EXPECT_TRUE(sink->ordered && sink->shaped);
+  EXPECT_TRUE(rv->emitted() == (std::uint64_t)N);
+  EXPECT_TRUE(sink->booked == run);
+  // The int8 checkpoints planned at what their loads hold (codes and a
+  // scale a row), not their size on disk or a bf16 one.
+  std::printf("[relayvsr] stage at 2x: weights planned %.1f MB (the "
+              "loads' figure %.1f)\n", sink->weights / 1048576.0,
+              (MetalRelayVsrWan::weight_bytes(wc) +
+               MetalRelayVsrDecoder::weight_bytes(dc)) / 1048576.0);
+  EXPECT_TRUE(sink->weights == MetalRelayVsrWan::weight_bytes(wc) +
+                                   MetalRelayVsrDecoder::weight_bytes(dc));
+  EXPECT_TRUE(mgr->declared_scratch("relayvsr-upscale:rv") == 0);
+  EXPECT_TRUE(mgr->planned_weight_bytes(files.wan) == 0);
+  {
+    // The 4x file with a 2x-only output size: refused at its launch,
+    // naming the scale, before a weight is read.
+    auto pl4 = std::make_unique<Pipeline>("p4", &sess);
+    auto s4 = std::make_unique<RvSource>(&sess, "src4",
+                                         std::vector<InEdge>{},
+                                         FlexData::make_object());
+    s4->h = H;
+    s4->w = W;
+    s4->count = 2;
+    s4->allocate_oports(1);
+    auto* src4 = pl4->insert_stage(std::move(s4));
+    FlexData c4 = FlexData::make_object();
+    c4.as_object().insert_or_assign("hf_dir",
+                                    FlexData::make_string(files4.wan));
+    c4.as_object().insert_or_assign("output_width", FlexData::make_int(642));
+    c4.as_object().insert_or_assign("output_height", FlexData::make_int(362));
+    auto* rv4 = static_cast<RelayVsrUpscaleStage*>(pl4->insert_stage(
+        std::make_unique<RelayVsrUpscaleStage>(
+            &sess, "rv4", std::vector<InEdge>{{src4, 0}}, c4)));
+    EXPECT_TRUE(rv4->config_error().empty());
+    auto k4 = std::make_unique<RvSink>(&sess, "sink4",
+                                       std::vector<InEdge>{{rv4, 0}},
+                                       FlexData::make_object());
+    auto* sink4 = static_cast<RvSink*>(pl4->insert_stage(std::move(k4)));
+    {
+      PipelineRuntime rt(pl4.get(), &sess);
+      if (rt.launch()) {
+        rt.wait_idle();
+        rt.stop();
+      }
+    }
+    EXPECT_TRUE(sink4->frames == 0);
+    EXPECT_TRUE(rv4->loads() == 0);
+    EXPECT_TRUE(mgr->declared_scratch("relayvsr-upscale:rv4") == 0);
   }
 }

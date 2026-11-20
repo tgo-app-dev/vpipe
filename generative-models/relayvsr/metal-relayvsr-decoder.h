@@ -22,11 +22,15 @@ class Ops;
 
 // RelayVSR's SMALL model: the per-frame conditional decoder
 // (kopper/RelayVSR, `flash.safetensors`, format refvsr-flash-v1; the
-// reference's FlashVSRConditionNet, variant S, EMA weights).
+// reference's FlashVSRConditionNet, variant S, EMA weights) -- and its
+// native 2x sibling (lightx2v/RelayVSR_X2, relayvsr-flash-x2-v1; ComfyUI
+// ships both as its "flash VAE").
 //
-// Every low-resolution frame becomes its 4x frame here, directly in RGB:
-// no VAE anywhere in the model. The frame is encoded to tokens on its 1/4
-// grid (3x3 s2, 3x3 s2, 3x3 s1 convs with SiLU, a 1x1 to 512, RMSNorm);
+// Every low-resolution frame becomes its 4x (or 2x) frame here, directly
+// in RGB: no VAE anywhere in the model. The frame is encoded to tokens on
+// its LATENT grid -- 1/4 of it at 4x, 1/8 at 2x, 1/16 of the output either
+// way -- (3x3 s2, 3x3 s2, 3x3 s1 convs -- s2 at 2x -- with SiLU, a 1x1 to
+// 512, RMSNorm);
 // 10 blocks at 512 (8 query heads over 2 key/value heads, head dim 64,
 // SwiGLU 1408) attend
 //
@@ -38,7 +42,7 @@ class Ops;
 // every plane through a query-centred, half-open window truncated at the
 // borders: 48 x 48 tokens for the keyframes, 24 x 24 for the video. A
 // linear head (512 -> 1024 + SiLU -> 768) is pixel-shuffled by 16 onto a
-// 4x bicubic upsample of the frame. RoPE is 3-D (t 16 | h 24 | w 24) with
+// 4x (2x) bicubic upsample of the frame. RoPE is 3-D (t 16 | h 24 | w 24) with
 // the current frame at t = 0, the previous at -1 and both keyframes at 0
 // ("current_relative").
 //
@@ -64,6 +68,11 @@ class MetalRelayVsrDecoder {
     int win_self[2]  = {48, 48};
     int history   = 2;        // window_size: the frame and one before it
     float eps     = 1e-5f;
+    int upscale   = 4;        // upscale_factor: 4, or 2 (the x2 file)
+    // The latent grid's stride in frame pixels, and the alignment a frame
+    // is padded to (the keyframe DiT's token stride).
+    int latent_stride() const noexcept { return 16 / upscale; }
+    int pad_stride() const noexcept { return 32 / upscale; }
 
     // ACCELERATION, the stage's to set. The int8 tier of the 10 blocks'
     // projections (q, k, v, the keyframes' k and v, o, the feed-forward's
@@ -110,7 +119,8 @@ class MetalRelayVsrDecoder {
     int h = 0, w = 0;   // its token grid
     bool valid() const noexcept { return !k.empty() && !v.empty(); }
   };
-  // `latent` is the keyframe DiT's, f32 [cond_channels, h4, w4].
+  // `latent` is the keyframe DiT's, f32 [cond_channels, h4, w4] -- its
+  // latent grid (the frame / latent_stride).
   bool prepare(const metal_compute::SharedBuffer& latent, int h4, int w4,
                Condition* out, std::string* err);
 
@@ -118,9 +128,10 @@ class MetalRelayVsrDecoder {
   void begin_window() noexcept { _in_window = 0; }
 
   // ONE FRAME. `lr` is the padded frame, channel-last [ph * pw, 3] f16 in
-  // [-1, 1] (Ops::upload in the f16 library), ph and pw multiples of 8, and
-  // `start` / `end` the window's two keyframes at its 1/4 grid. Writes the
-  // frame cut to out_h x out_w (at most 4 ph x 4 pw), planar [3, out_h,
+  // [-1, 1] (Ops::upload in the f16 library), ph and pw multiples of
+  // pad_stride(), and `start` / `end` the window's two keyframes at its
+  // latent grid. Writes the frame cut to out_h x out_w (at most s ph x
+  // s pw, s the scale), planar [3, out_h,
   // out_w] -- u8 as the release writes it, or f32 in [0, 1] -- into `out`
   // (allocated when empty or too small). The frame's own K and V become the
   // next frame's history.

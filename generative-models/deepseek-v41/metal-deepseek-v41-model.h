@@ -70,6 +70,7 @@ namespace vpipe::genai {
 
 class WeightSet;
 class MoeExpertCache;
+class FarCompute;
 class SafetensorsRanges;
 
 class MetalDeepseekV41Model {
@@ -156,6 +157,12 @@ public:
   // further context adds).
   static std::size_t context_bytes(const DeepseekV41Config& c, int ctx);
   const MoeExpertCache* expert_cache() const { return _cache.get(); }
+  // Whether a decode step's resolves ride the GPU <-> host handshake, and
+  // the far side's work so far (REMOTE EXPERTS): the experts it ran, the
+  // answers that came too late.
+  bool handshake_on() const { return _hs_ok; }
+  std::uint64_t remote_experts() const { return _remote_experts; }
+  std::uint64_t remote_late() const { return _remote_late; }
   MoeExpertCache* expert_cache_mut() { return _cache.get(); }
   // Read every routed expert into the cache now, layer by layer, until it
   // is full (benches: a steady state without the warm-up); how many.
@@ -188,12 +195,23 @@ public:
                     std::string* err = nullptr,
                     const std::vector<std::int32_t>* given = nullptr);
   // The bytes the draft head holds when loaded, from the checkpoint.
+  // A GGUF's routed experts as its native slots hold them (every expert
+  // resident: the layers times the widest of each weight's slab); 0 where
+  // they are not run in their own blocks.
+  static std::size_t gguf_native_expert_bytes(const std::string& model_dir);
   static std::size_t dspark_bytes(const std::string& model_dir);
   // Whether a running command buffer and this host see each other's
-  // stores (what a step's per-layer handshake stands on; an M5 does, an M4
-  // Pro does not reliably), as the loads a waiting GPU makes in a quarter
-  // second: 0 when they do not. Probed once a process.
+  // stores (what a step's per-layer handshake stands on), as the loads a
+  // waiting GPU makes in a quarter second: 0 when they do not. Probed once
+  // a process (gpu-host-handshake.h), the system-scope handshake first
+  // (host_handshake: every Apple GPU measured sees the host there), then
+  // the device-scope one (an M5 Ultra did under macOS 27.0, nothing does
+  // since 27.2).
   static std::uint32_t handshake_works(metal_compute::MetalCompute* mc);
+  // The library whose turn passed that probe ("host_handshake", or the
+  // model's own "deepseek_v41_bf16" for the device scope); empty when
+  // none did. VPIPE_DSV41_HS_SCOPE=device skips the system scope (an A/B).
+  static std::string handshake_library(metal_compute::MetalCompute* mc);
   // Whether this model's decode and verify steps take the handshake.
   bool handshake() const { return _hs_ok; }
   // Debug: the next handshake forward abandons layer `layer`'s turn (the
@@ -273,9 +291,11 @@ private:
     }
   };
   // A layer's routed experts: the release's FP4 (bits 0), or affine codes
-  // -- w1 and w3 at `b13` bits, w2 at `b2`, a scale and bias per `gs`.
+  // -- w1 and w3 at `b13` bits, w2 at `b2`, a scale and bias per `gs` --
+  // or a GGUF's own blocks (`gt`: w1's, w3's and w2's ggml types).
   struct ExpertFmt {
     int b13 = 0, b2 = 0, gs = 0;
+    std::uint32_t gt[3] = {0, 0, 0};
   };
   struct Layer {
     // attention
@@ -293,6 +313,8 @@ private:
     Proj e_wkv;
     metal_compute::SharedBuffer e_qk;
     std::string e_rows, e_scales, e_biases; // the table's tensor names
+    std::int64_t e_row0 = -1;   // a GGUF's: its table's first row in the
+                                // engram file
     ExpertFmt ex;
   };
 
@@ -444,6 +466,16 @@ private:
   std::shared_ptr<WeightSet> _ws;
   std::unique_ptr<SafetensorsRanges> _rows_file;     // engram rows
   std::unique_ptr<SafetensorsRanges> _expert_file;   // routed experts
+  // A llama.cpp GGUF: its shards read by pread for the routed experts,
+  // the engram table's own file a row at a time.
+  struct GgufFiles;
+  std::unique_ptr<GgufFiles> _gguf;
+  // A GGUF's shards read off the far side's drive too (far-files/1).
+  struct FarDisk;
+  std::shared_ptr<FarDisk> _far_disk;
+  // A GGUF expert's rows converted on the GPU (ggml_to_affine.metal).
+  struct GpuConv;
+  std::shared_ptr<GpuConv> _gpu_conv;
   std::unique_ptr<MoeExpertCache> _cache;
   std::vector<std::unique_ptr<Stage>> _stages;
   Proj _main_proj;
@@ -459,6 +491,8 @@ private:
   bool ensure_spark_(int rows);
   metal_compute::CommandStream _stream;   // every forward's and draft's
   int _ahead_max = 0;                      // the widest read-ahead width
+  // The layer a step's read-ahead names: L + _ahead_dist.
+  int _ahead_dist = 1;
   metal_compute::SharedBuffer _ahead_sc;   // the next layer's raw scores
   // A few rows' experts by slot, {slot, count, pairs...} (10 ints a group)
   metal_compute::SharedBuffer _mgrp;
@@ -468,16 +502,51 @@ private:
   // running command buffers, not a commit and wait (~3 us against ~280 on
   // an M5 Ultra): words {posted, answered, gave up, heartbeat}; mailboxes
   // out (picks, next-layer scores) and in (slots). Taken where the load's
-  // probe saw both sides' stores; VPIPE_DSV41_HANDSHAKE=0 is the A/B.
+  // probe saw both sides' stores, from handshake_library() (_lib_hs);
+  // VPIPE_DSV41_HANDSHAKE=0 is the A/B.
+  metal_compute::ComputeLibrary _lib_hs;
   metal_compute::ComputeFunction _fn_hs;
   // the same with a decode step's route before it in its dispatch;
   // VPIPE_DSV41_HS_ROUTE=0 keeps the route its own dispatch
   metal_compute::ComputeFunction _fn_hs_route;
   bool _hs_route = true;
   metal_compute::SharedBuffer _hsf, _hsbo, _hsbi;
+  // REMOTE EXPERTS (prototype; far-memory.h's far-compute/2): a decode
+  // row's far-held misses (kRemoteRows a layer at most) run by the far
+  // side, each one's row put in its pair's place. Its words out (_rx: the
+  // row's weights and activation), the rows and their pairs back (_rsum,
+  // _rpair) -- through the handshake's mailboxes, or written while the
+  // GPU is idle; off for good once a call fails (the forward reads them
+  // from there instead).
+  FarCompute* _far_compute = nullptr;
+  std::uint64_t _far_tab_at = 0;     // a GGUF's tables in the far memory
+  bool _remote_off = false;
+  // _rans: the rows (kRemoteRows x H / 2 words), then their pairs
+  metal_compute::SharedBuffer _rx, _rans;
+  metal_compute::ComputeFunction _fn_pack_remote, _fn_put_remote;
+  std::uint64_t _remote_steps = 0, _remote_experts = 0, _remote_late = 0;
+  double _remote_ms = 0.0;
+  // A call in flight (its own words; see the service in forward_piece_),
+  // and those still running -- the model waits for them as it goes.
+  struct FarCall;
+  std::mutex _far_mu;
+  std::condition_variable _far_cv;
+  int _far_inflight = 0;
+  // WHETHER IT PAYS, measured: each call's time beside what reading its
+  // experts would have cost, smoothed; past a window where the calls cost
+  // more, paused for a while (its words off every layer), then tried
+  // again.
+  void note_remote_(double call_us, double alt_us);
+  double _remote_call_us = 0.0, _remote_alt_us = 0.0;
+  int _remote_window = 0;
+  int _remote_pause = 0;              // layer steps left paused
+  std::uint64_t _remote_pauses = 0;
   bool _hs_ok = false;
   std::uint32_t _hs_spins = 1u << 20;   // loads a give-up waits (probed)
   bool _hs_redo = false;                  // a give-up's forward, synced
+  // VPIPE_DSV41_HS_STUDY's figures for the forward before (see forward_)
+  double _st_busy0 = 0, _st_t0 = 0, _st_end = 0, _st_hs_ms = 0;
+  int _st_rows = 0, _st_turns = 0;
   // ahead_study()'s record: [L][k][E] scores of the routers run early, this
   // step's and the step before's own [L][E], picks and blockers [L]
   struct AheadStudy {
@@ -581,6 +650,8 @@ private:
   static int qidx_(int bits);
   struct QFns {
     metal_compute::ComputeFunction gv[2][2], dq, sw[4], dn[4], gu, dg;
+    // gv's twins over a batch of groups in one dispatch (wo_a's)
+    metal_compute::ComputeFunction gvb[2][2];
     // the grouped GEMMs' matrix-core twins (deepseek_v41_nax), if loaded
     metal_compute::ComputeFunction gun, dgn;
     bool loaded = false;
@@ -591,6 +662,25 @@ private:
   // biases in elements; w1 / w3, then w2): the widest layer's sizes.
   long _xcw13 = 0, _xcs13 = 0, _xcw2 = 0, _xcs2 = 0;
   bool _xaffine = false;
+  // A GGUF's experts in their own blocks (dsv41_moe_*_iq*): the slots
+  // hold the file's slabs, w1 / w3 at _xiw13 bytes a slot, w2 at _xiw2;
+  // the grids and signs in _iq_tab.
+  bool _xiq = false;
+  long _xiw13 = 0, _xiw2 = 0;
+  metal_compute::SharedBuffer _iq_tab;
+  // the decode's: IQ1_M's and IQ3_XXS's grids from a threadgroup copy,
+  // IQ2_XXS's, IQ2_XS's and IQ2_S's from device memory (the faster of
+  // each, measured)
+  metal_compute::ComputeFunction _fn_iq_sw, _fn_iq_dn, _fn_iq_gu_g,
+      _fn_iq_dn_g, _fn_iq_sw1, _fn_iq_dn1;
+  // a verify's rows: its pairs grouped by expert on the GPU, each group's
+  // expert widened once for its rows (VPIPE_DSV41_IQ_GROUPS=0: by pair)
+  metal_compute::ComputeFunction _fn_iq_grp, _fn_iq_swg, _fn_iq_dng;
+  // a prefill's grouped GEMMs over the blocks on the matrix cores
+  // (deepseek_v41_nax's dsv41_moe_{gu,down}_nax_iq)
+  metal_compute::ComputeFunction _fn_iq_gun, _fn_iq_dnn;
+  metal_compute::SharedBuffer _iq_gtab;
+  bool _iq_groups = true;
 
   metal_compute::SharedBuffer _embed, _head, _norm;
   std::vector<Layer> _layers;
@@ -623,6 +713,7 @@ private:
   metal_compute::SharedBuffer _tkk, _tkp, _tkt, _tkr;   // two-phase top-k
   bool _split_attn = true;                // VPIPE_DSV41_SPLIT_ATTN=0: off
   bool _fp8_wo_a = true;                  // VPIPE_DSV41_WO_A_BF16=1: off
+  bool _gemv_batched = true;              // VPIPE_DSV41_GEMV_BATCH=0: off
   bool _concurrent = true;                // VPIPE_DSV41_CONCURRENT=0: off
   bool _hc_fuse = true;                   // VPIPE_DSV41_HC_FUSE=0: off
   bool _index_mma = true;                 // VPIPE_DSV41_INDEX_MMA=0: off

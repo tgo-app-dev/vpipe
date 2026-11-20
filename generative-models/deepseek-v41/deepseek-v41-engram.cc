@@ -470,7 +470,79 @@ DeepseekV41Engram::init(const DeepseekV41Config& cfg,
     return fail("engram pad token outside the vocabulary");
   }
   _pad = _map[(std::size_t)cfg.engram_pad];
+  return derive_(cfg, err);
+}
 
+bool
+DeepseekV41Engram::init_tables(const DeepseekV41Config& cfg,
+                               std::span<const std::int32_t> token_map,
+                               std::span<const std::int64_t> multipliers,
+                               std::span<const std::int64_t> primes,
+                               std::span<const std::int64_t> offsets,
+                               std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = "DeepSeek-V4.1 engram: " + std::move(m); }
+    return false;
+  };
+  if (cfg.engram_layers.empty()) { return true; }
+  _ngram = cfg.engram_ngram;
+  _heads = cfg.engram_heads;
+  _cols = cfg.engram_cols();
+  std::int32_t top = -1;
+  for (std::int32_t v : token_map) {
+    if (v < 0) { return fail("a negative compressed id in the token map"); }
+    top = std::max(top, v);
+  }
+  _map.assign(token_map.begin(), token_map.end());
+  if (_map.size() < (std::size_t)cfg.vocab) {
+    _map.resize((std::size_t)cfg.vocab, 0);
+  }
+  _cvocab = top + 1;
+  if (_cvocab != cfg.engram_cvocab) {
+    return fail(std::format("the token map compresses to {} ids, the "
+                            "checkpoint's tables were hashed over {}",
+                            _cvocab, cfg.engram_cvocab));
+  }
+  if (cfg.engram_pad < 0 || (std::size_t)cfg.engram_pad >= _map.size()) {
+    return fail("engram pad token outside the vocabulary");
+  }
+  _pad = _map[(std::size_t)cfg.engram_pad];
+  if (!derive_(cfg, err)) { return false; }
+  // The file's own constants must be the ones derived: the release's
+  // numpy draws and prime sequence, offsets from each layer's table start.
+  const std::size_t nl = cfg.engram_layers.size();
+  if (multipliers.size() != nl * (std::size_t)_ngram ||
+      primes.size() != nl * (std::size_t)_cols ||
+      offsets.size() != primes.size()) {
+    return fail("the file's hash tables are not [layers][n-gram] and "
+                "[layers][columns]");
+  }
+  for (std::size_t l = 0; l < nl; ++l) {
+    for (int i = 0; i < _ngram; ++i) {
+      if (multipliers[l * _ngram + i] != _mult[l][(std::size_t)i]) {
+        return fail(std::format("layer {}'s multiplier {} is not the "
+                                "release's", cfg.engram_layers[l], i));
+      }
+    }
+    for (int i = 0; i < _cols; ++i) {
+      if (primes[l * _cols + i] != _primes[l][(std::size_t)i] ||
+          offsets[l * _cols + i] != _offsets[l][(std::size_t)i]) {
+        return fail(std::format("layer {}'s prime / offset {} is not the "
+                                "release's", cfg.engram_layers[l], i));
+      }
+    }
+  }
+  return true;
+}
+
+bool
+DeepseekV41Engram::derive_(const DeepseekV41Config& cfg, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = "DeepSeek-V4.1 engram: " + std::move(m); }
+    return false;
+  };
   // ---- the primes, in order, never reused -----------------------------
   std::set<std::uint64_t> seen;
   _primes.clear();

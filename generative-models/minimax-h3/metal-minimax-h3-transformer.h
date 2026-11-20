@@ -276,8 +276,9 @@ class MetalMiniMaxH3Transformer {
     // out projection and fc2 of every block -- a long sequence's in row
     // bands, each band's exchanges under the GPU work of the bands beside
     // it (band_rows, TpOverlap) -- through the channel a generation is
-    // given (begin_tp_generation). Dense or affine weights, no VDN or
-    // TaoMate: load() refuses the rest. The ANE tier is the share's
+    // given (begin_tp_generation). Dense or affine weights, adapters
+    // (TaoMate-H3's as a plain LoRA too) cut to the share; no VDN, and no
+    // TaoMate streaming -- the stage refuses those. The ANE tier is the share's
     // (ane_runtime_bytes sizes it so), and splits each band's rows with
     // the GPU: a rank's bands are its rows' and its floor's alone, the
     // same whether its ANE (or its peer's) runs.

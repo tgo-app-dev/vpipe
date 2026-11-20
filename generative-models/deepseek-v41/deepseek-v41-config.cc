@@ -1,6 +1,9 @@
 #include "generative-models/deepseek-v41/deepseek-v41-config.h"
 
 #include "common/flex-data.h"
+#include "generative-models/shared/gguf-convert.h"
+#include "generative-models/shared/gguf-deepseek41.h"
+#include "generative-models/shared/gguf-file.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -42,12 +45,59 @@ DeepseekV41Config::ced_mid() const
   return -1;
 }
 
+std::string
+DeepseekV41Config::dspark_dir(const std::string& dir)
+{
+  if (find_gguf_in_dir(dir).empty()) { return {}; }
+  // a GGUF named by its file (its first shard): the folder it is in
+  std::error_code ec;
+  std::filesystem::path base(dir);
+  if (std::filesystem::is_regular_file(base, ec)) {
+    base = base.parent_path();
+  }
+  const std::filesystem::path d = base / "dspark";
+  return std::filesystem::exists(d / "config.json", ec) ? d.string()
+                                                        : std::string{};
+}
+
 bool
 DeepseekV41Config::from_dir(const std::string& dir, DeepseekV41Config* out,
                             std::string* err)
 {
   std::ifstream in(std::filesystem::path(dir) / "config.json");
   if (!in) {
+    // A llama.cpp GGUF (its first file, or a directory holding one): the
+    // config its keys stand for.
+    const std::string g = find_gguf_in_dir(dir);
+    if (!g.empty()) {
+      const auto f = GgufFile::open(g);
+      std::string js;
+      if (!f) {
+        if (err != nullptr) { *err = "the GGUF did not open: " + g; }
+        return false;
+      }
+      if (!gguf_to_deepseek41_json(*f, &js, err)) { return false; }
+      if (!from_json_text(js, out, err)) { return false; }
+      // A DSpark head beside it (dspark_dir: the release's mtp.* and its
+      // config.json): its stages and their settings, the release's.
+      const std::string sd = dspark_dir(dir);
+      if (!sd.empty()) {
+        DeepseekV41Config r;
+        std::string e;
+        if (from_dir(sd, &r, &e) && r.n_layers == out->n_layers &&
+            r.dim == out->dim && r.n_mtp > 0) {
+          out->n_mtp = r.n_mtp;
+          out->compress_ratios = r.compress_ratios;
+          out->dspark_block = r.dspark_block;
+          out->dspark_noise = r.dspark_noise;
+          out->dspark_targets = r.dspark_targets;
+          out->dspark_markov = r.dspark_markov;
+          out->dspark_experts = r.dspark_experts;
+          out->dspark_top_k = r.dspark_top_k;
+        }
+      }
+      return true;
+    }
     if (err != nullptr) { *err = "no config.json under " + dir; }
     return false;
   }

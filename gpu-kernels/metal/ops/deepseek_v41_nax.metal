@@ -1,6 +1,7 @@
 // deepseek_v41_nax.metal -- DeepSeek-V4.1's routed experts as grouped GEMMs
 // on the matrix cores (NAX): the twins of deepseek_v41.metal's
-// dsv41_moe_{gu,down}_q<B>_grouped and dsv41_moe_{gu,down}_fp4_grouped,
+// dsv41_moe_{gu,down}_q<B>_grouped, dsv41_moe_{gu,down}_fp4_grouped and
+// dsv41_moe_{gu,down}_iq_grouped (a GGUF's own blocks),
 // with their buffers, constants and sorted 32-row tiles (dsv41_moe_sort:
 // tile tid.y reads ONE expert's slot, tile2e < 0 an unused tile; srow /
 // sdst a pad's -1).
@@ -38,6 +39,7 @@ typedef VPIPE_ELT T;
 #if defined(__HAVE_TENSOR__)
 
 #include "mlx/backend/metal/kernels/steel/attn/nax.h"
+#include "ggml_native.h"
 
 namespace {
 
@@ -139,6 +141,37 @@ struct Fp4Tile {
     src += 8;
     k += kBK;
   }
+};
+
+// The same over a GGUF's own blocks (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+// IQ1_M; ggml_native.h's widening, ggml's dequantize_row_* value for
+// value): a row of K values is K / 256 blocks, and thread t's 32 values a
+// K step are one sub-block of its row -- widened in f32, rounded once to
+// T, as the affine tile's dequant is.
+struct IqTile {
+  const device uchar* row;
+  const device ulong* tab;
+  const uint type;
+  threadgroup T* dst;
+  int sub;                    // this thread's sub-block (32 values)
+  METAL_FUNC IqTile(const device uchar* codes, const uint type_,
+                    const device ulong* tab_, const int K, const int row0,
+                    threadgroup T* Ws, uint t)
+      : tab(tab_), type(type_), sub((int)(t & 1u)) {
+    const int r = (int)(t >> 1);
+    row = codes + (long)(row0 + r) * ggml_native::row_bytes(type_, K);
+    dst = Ws + r * kBKp + 32 * (int)(t & 1u);
+  }
+  METAL_FUNC void load() const {
+    float v[32];
+    ggml_native::w32(type, row, sub, tab, v);
+#pragma unroll
+    for (int j = 0; j < 32; j += 4) {
+      *(threadgroup vec<T, 4>*)(dst + j) =
+          vec<T, 4>((T)v[j], (T)v[j + 1], (T)v[j + 2], (T)v[j + 3]);
+    }
+  }
+  METAL_FUNC void next() { sub += 2; }   // a K step: 64 values
 };
 
 constexpr constant short kSM = kBM / 2, kSN = kBN / kWN, kSK = 32;
@@ -341,6 +374,60 @@ DSV41_NAX_Q(4)
 DSV41_NAX_Q(5)
 DSV41_NAX_Q(6)
 DSV41_NAX_Q(8)
+
+// A GGUF's experts in their own blocks (deepseek_v41.metal's
+// dsv41_moe_{gu,down}_iq_grouped's buffers and constants: the slot `cw`
+// bytes apart, w1's and w3's types t1 / t3, w2's t2; `tab`
+// gpu_iq_tables_native).
+kernel void dsv41_moe_gu_nax_iq(
+    const device uchar* w1     [[buffer(0)]],
+    const device uchar* w3     [[buffer(1)]],
+    const device ulong* tab    [[buffer(2)]],
+    const device T*     x      [[buffer(3)]],
+    device T*           act    [[buffer(4)]],
+    const device int*   srow   [[buffer(5)]],
+    const device float* swt    [[buffer(6)]],
+    const device int*   tile2e [[buffer(7)]],
+    constant int&       K      [[buffer(8)]],
+    constant int&       I      [[buffer(9)]],
+    constant float&     lim    [[buffer(10)]],
+    constant uint&      t1     [[buffer(11)]],
+    constant uint&      t3     [[buffer(12)]],
+    constant long&      cw     [[buffer(13)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  t    [[thread_index_in_threadgroup]])
+{
+  const int e = tile2e[tid.y];
+  if (e < 0) { return; }
+  threadgroup T Wg[kBN * kBKp], Wu[kBN * kBKp];
+  const int y_col = (int)tid.x * kBN;
+  IqTile lg(w1 + (long)e * cw, t1, tab, K, y_col, Wg, t);
+  IqTile lu(w3 + (long)e * cw, t3, tab, K, y_col, Wu, t);
+  gu_impl(lg, lu, x, act, srow, swt, K, I, lim, Wg, Wu, tid, sgid);
+}
+
+kernel void dsv41_moe_down_nax_iq(
+    const device uchar* w2     [[buffer(0)]],
+    const device ulong* tab    [[buffer(1)]],
+    const device T*     act    [[buffer(2)]],
+    device T*           part   [[buffer(3)]],
+    const device int*   sdst   [[buffer(4)]],
+    const device int*   tile2e [[buffer(5)]],
+    constant int&       I      [[buffer(6)]],
+    constant int&       H      [[buffer(7)]],
+    constant uint&      t2     [[buffer(8)]],
+    constant long&      cw     [[buffer(9)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  t    [[thread_index_in_threadgroup]])
+{
+  const int e = tile2e[tid.y];
+  if (e < 0) { return; }
+  threadgroup T Ws[kBN * kBKp];
+  IqTile lw(w2 + (long)e * cw, t2, tab, I, (int)tid.x * kBN, Ws, t);
+  down_impl(lw, act, part, sdst, I, H, Ws, tid, sgid);
+}
 
 kernel void dsv41_moe_gu_nax_fp4(
     const device uchar* w1     [[buffer(0)]],

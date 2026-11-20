@@ -531,8 +531,11 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
         if (spans) { mmarks.push_back(CommandStream::host_seconds()); }
         return true;
       };
-      const bool mok = lm->mtp_generate(mctx, mf, dec, spec_sp, no_stop,
-                                        on_round);
+      // The prompt as text-chat hands it: the penalties' seen-set and
+      // the context copy's history.
+      const bool mok = lm->mtp_generate(
+          mctx, mf, dec, spec_sp, no_stop, on_round, nullptr, nullptr,
+          std::span<const std::int32_t>(ids.data(), ids.size()));
       if (spans) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         span_report("mtp", N, mmarks);
@@ -577,11 +580,17 @@ TEST(metal_lm_bench, qwen_ctx_sweep) {
       ASSERT_TRUE(sf >= 0);
       genai::SpecDecodeResult st;
       int sprod = 0;
+      const double sg0 = gpu_busy();
       const auto s0 = clk::now();
-      const bool sok = lm->spec_generate(sctx, sf, dec, spec_sp, no_stop,
-                                         keep, &sprod, nullptr, {}, block,
-                                         &st);
+      const bool sok = lm->spec_generate(
+          sctx, sf, dec, spec_sp, no_stop, keep, &sprod, nullptr,
+          std::span<const std::int32_t>(ids.data(), ids.size()), block, &st);
       const double sds = secs(clk::now() - s0);
+      if (gpu_t && sok && st.rounds > 0) {
+        std::printf("[BENCH-CTX-GPU] ctx=%d draft ms/round wall %.2f "
+                    "gpu %.2f\n", N, 1e3 * sds / st.rounds,
+                    (gpu_busy() - sg0) / st.rounds);
+      }
       if (sok && sprod > 0 && sds > 0.0) {
         std::printf(
             "[BENCH-CTX-DRAFT] drafter=%s ctx=%d block=%d decode_n=%d "

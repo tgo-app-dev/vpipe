@@ -126,6 +126,14 @@ inline constexpr std::string_view kExpertCacheMb = "expert_cache_mb";
 // rows are read from disk as without it. Absent / false: from disk. Not
 // part of the cache key, as kMemoryLimitMb.
 inline constexpr std::string_view kNgramResident = "ngram_resident";
+// object: FAR MEMORY for a Mixture of Experts' expert cache
+// (generative-models/far-memory.h) -- {"transport": <name>, "params":
+// {...}}, opened by the manager as the model loads; its experts selected
+// next most often after those the cache holds are kept there. One that
+// does not open is said and the model loads without it. Not part of the
+// cache key, as kMemoryLimitMb: a model loaded already is handed over
+// with the far tier it was loaded with.
+inline constexpr std::string_view kFarMemory = "far_memory";
 }  // namespace load_spec
 
 // Session-shared cache of loaded language models. Two loads with the
@@ -1303,6 +1311,9 @@ private:
   std::unordered_map<Key,
                      std::weak_ptr<LoadedLanguageModel>,
                      KeyHash>                                 _cache;
+  // The keys being loaded now: another load of one waits for it.
+  std::unordered_set<Key, KeyHash>                            _loading;
+  std::condition_variable                                     _loading_cv;
 
   // Kept warm (keep_warm): each model, its canonical directory, until
   // when. The reaper thread (started by the first keep_warm, stopped and

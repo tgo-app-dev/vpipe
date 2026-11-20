@@ -143,7 +143,12 @@ public:
   // from 0 on every rank alike: a transport checks it to catch ranks out
   // of step.
   // False, with `err`, when the link failed or the run was stopped; the
-  // run then fails.
+  // run then fails. A channel LET GO -- a rank that refused its clip
+  // after opening it, so the ranks stay paired clip for clip -- should
+  // make the peers' exchanges of that generation return false promptly
+  // (its links closed, or watched while a wait runs), not at their
+  // wait's end; one let go before its links were made may leave a peer
+  // waiting for them until its own wait or stop.
   virtual bool exchange(const void* partial, void* others, std::size_t bytes,
                         TpDType dtype, std::uint64_t seq,
                         std::string* err) = 0;

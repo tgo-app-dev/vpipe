@@ -11,7 +11,44 @@
 #include <Metal/Metal.hpp>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
 #include <utility>
+
+// VPIPE_MC_DISPATCH_TALLY=1 (a diagnostic): every dispatch counted by its
+// kernel's name, the totals printed at exit -- what a forward is made of.
+namespace {
+struct DispatchTally {
+  std::mutex mu;
+  std::map<std::string, long long> n;
+  ~DispatchTally()
+  {
+    long long all = 0;
+    for (const auto& [k, v] : n) { all += v; }
+    if (all == 0) { return; }
+    std::fprintf(stderr, "[metal-compute] dispatches: %lld\n", all);
+    std::multimap<long long, std::string, std::greater<long long>> by;
+    for (const auto& [k, v] : n) { by.emplace(v, k); }
+    for (const auto& [v, k] : by) {
+      std::fprintf(stderr, "  %10lld  %s\n", v, k.c_str());
+    }
+  }
+};
+thread_local std::string t_tally_name;   // the kernel set last, this thread
+DispatchTally* tally_()
+{
+  static const bool on = [] {
+    const char* e = std::getenv("VPIPE_MC_DISPATCH_TALLY");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  if (!on) { return nullptr; }
+  static DispatchTally t;
+  return &t;
+}
+}  // namespace
 
 namespace vpipe::metal_compute {
 
@@ -202,6 +239,9 @@ ComputeEncoder::set_function(const ComputeFunction& fn)
     return;
   }
   _fn_bad = false;
+  if (tally_() != nullptr && fn.mtl_function() != nullptr) {
+    t_tally_name = fn.mtl_function()->name()->utf8String();
+  }
   // Auto command-buffer split: at an OP BOUNDARY (set_function starts a new op),
   // once _split_every dispatches have accumulated, commit the current buffer +
   // reopen a fresh one, so the CPU-encode of the next chunk pipelines against
@@ -428,6 +468,10 @@ ComputeEncoder::dispatch(LaunchDims threads_per_grid,
   }
   ++_n_dispatch;
   ++_since_split;
+  if (DispatchTally* t = tally_()) {
+    std::lock_guard<std::mutex> lk(t->mu);
+    ++t->n[t_tally_name];
+  }
   // Op complete -> the encoder is at a clean boundary and nothing is pending.
   // clear() keeps both vectors' capacity, so steady-state encoding does not
   // allocate.

@@ -202,6 +202,169 @@ TEST(moe_expert_cache, policy)
   }
 }
 
+// Memory standing in for another machine's: a byte array, its calls
+// counted, failing on demand.
+class TestFarMemory final : public FarMemory {
+public:
+  explicit TestFarMemory(std::size_t bytes) : _mem(bytes) {}
+  std::uint64_t bytes() const override { return _mem.size(); }
+  bool read(const FarPiece* p, std::size_t n, std::string* err) override
+  {
+    if (fail.load()) {
+      if (err != nullptr) { *err = "the link is down"; }
+      return false;
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      std::memcpy(p[i].local, _mem.data() + p[i].offset, p[i].bytes);
+    }
+    reads.fetch_add(1);
+    return true;
+  }
+  bool write(const FarPiece* p, std::size_t n, std::string*) override
+  {
+    for (std::size_t i = 0; i < n; ++i) {
+      std::memcpy(_mem.data() + p[i].offset, p[i].local, p[i].bytes);
+    }
+    writes.fetch_add(1);
+    return true;
+  }
+  std::atomic<bool> fail{false};
+  std::atomic<int> reads{0}, writes{0};
+
+private:
+  std::vector<std::uint8_t> _mem;
+};
+
+// THE FAR TIER: an expert read from disk for a step alone, or evicted from
+// the resident set, is written to far memory; asked for again it is read
+// from there, not from disk, with its own bytes; taken into the resident
+// set it leaves the far tier; a far read that fails lets the tier go and
+// the expert is read from disk.
+// Both ways: and with `split`, the fill skipping a null part, an expert
+// held far is read from both at once -- part 0 (the larger) over the
+// link, part 1 from disk. Only part 0's disk reads are counted: the same
+// counts either way.
+TEST(moe_expert_cache, far_tier)
+{
+  for (bool split : {false, true}) {
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  std::atomic<int> reads{0};
+  auto far = std::make_shared<TestFarMemory>(6 * 24);
+  MoeExpertCache::Options o;
+  o.layers = 1;
+  o.experts = 16;
+  o.part_bytes = {16, 8};
+  o.resident = 2;
+  o.transient = 4;
+  o.threads = 2;
+  o.half_life = 1000;
+  o.far = far;
+  o.fill_skips_null = split;
+  o.far_one_offs = true;
+  std::string err;
+  auto c = MoeExpertCache::create(
+      mc, o,
+      [&](int L, int e, std::uint8_t* const* dst, std::string*) {
+        const std::uint32_t t = tag_(L, e);
+        if (dst[0] != nullptr) {
+          for (int i = 0; i < 4; ++i) { std::memcpy(dst[0] + 4 * i, &t, 4); }
+          reads.fetch_add(1);
+        }
+        if (dst[1] != nullptr) { std::memcpy(dst[1], &t, 4); }
+        return true;
+      },
+      &err);
+  ASSERT_TRUE(c != nullptr);
+  if (c == nullptr) { return; }
+  EXPECT_TRUE(c->far_slots() == 6 && c->far_on());
+  auto step = [&](std::vector<std::int32_t> eid) {
+    std::vector<std::int32_t> slot(eid.size(), -1);
+    EXPECT_TRUE(c->resolve(0, eid.data(), (int)eid.size(), 1, slot.data(),
+                           &err));
+    for (std::size_t p = 0; p < eid.size(); ++p) {
+      EXPECT_TRUE(slot_tag_(*c, slot[p]) == tag_(0, eid[p]));
+      std::uint32_t t1;
+      std::memcpy(&t1,
+                  static_cast<const std::uint8_t*>(c->pool(1).contents()) +
+                      (std::size_t)slot[p] * 8,
+                  4);
+      EXPECT_TRUE(t1 == tag_(0, eid[p]));
+    }
+  };
+  auto written = [&](int n) {
+    for (int i = 0; i < 1000 && far->writes.load() < n; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return far->writes.load() == n;
+  };
+  // Resident by room: nothing written far.
+  step({0, 1});
+  EXPECT_TRUE(reads.load() == 2 && far->writes.load() == 0);
+  // One-offs: read into spares, each written far.
+  for (int e = 2; e <= 6; ++e) {
+    step({e});
+    EXPECT_TRUE(written(e - 1));
+  }
+  EXPECT_TRUE(reads.load() == 7 && c->far_used() == 5);
+  EXPECT_TRUE(c->far_holds(0, 2) && c->far_holds(0, 6));
+  // Expert 2, its spare long taken: read from the far tier, not disk --
+  // and now outscoring a resident, admitted: it leaves the far tier, and
+  // the resident it evicts is written there.
+  step({2});
+  EXPECT_TRUE(reads.load() == 7 && far->reads.load() == 1);
+  EXPECT_TRUE(c->stats().far_reads == 1);
+  EXPECT_TRUE(c->stats().far_split == (split ? 1u : 0u));
+  EXPECT_TRUE(!c->far_holds(0, 2));
+  EXPECT_TRUE(written(6));
+  EXPECT_TRUE(c->far_holds(0, 0) || c->far_holds(0, 1));
+  // A far read that fails: the expert read from disk, the tier let go.
+  far->fail.store(true);
+  step({3});
+  EXPECT_TRUE(reads.load() == 8 && !c->far_on());
+  step({5});   // still in a spare
+  EXPECT_TRUE(reads.load() == 8 && far->reads.load() == 1);
+  }
+  // By default only what the resident set lets go is written far: one-off
+  // misses are not; an evicted resident is.
+  {
+    Session sess;
+    MetalCompute* mc = sess.metal_compute();
+    if (mc == nullptr) { return; }
+    auto far = std::make_shared<TestFarMemory>(6 * 24);
+    MoeExpertCache::Options o;
+    o.layers = 1;
+    o.experts = 16;
+    o.part_bytes = {16, 8};
+    o.resident = 2;
+    o.transient = 4;
+    o.threads = 2;
+    o.half_life = 1000;
+    o.far = far;
+    std::string err;
+    auto c = MoeExpertCache::create(
+        mc, o,
+        [&](int, int, std::uint8_t* const*, std::string*) { return true; },
+        &err);
+    ASSERT_TRUE(c != nullptr);
+    std::vector<std::int32_t> sl(2);
+    std::vector<std::int32_t> e01{0, 1}, e2{2};
+    ASSERT_TRUE(c->resolve(0, e01.data(), 2, 1, sl.data(), &err));
+    ASSERT_TRUE(c->resolve(0, e2.data(), 1, 1, sl.data(), &err));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_TRUE(far->writes.load() == 0 && !c->far_holds(0, 2));
+    // Picked again, 2 outscores a resident and evicts it: that one is
+    // written far.
+    ASSERT_TRUE(c->resolve(0, e2.data(), 1, 1, sl.data(), &err));
+    for (int i = 0; i < 1000 && far->writes.load() < 1; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(far->writes.load() == 1 &&
+                (c->far_holds(0, 0) || c->far_holds(0, 1)));
+  }
+}
+
 // READING AHEAD: a step names what the next one will pick; those it does
 // not hold are read behind it, the next step finds them (no read of its
 // own), and the ones it does not pick are dropped if still unread or kept
@@ -498,6 +661,139 @@ TEST(moe_expert_cache, qwen_moe_is_resident)
   EXPECT_TRUE(b.held < a.held / 2);
 }
 
+// THE CACHE'S TURN AS A HANDSHAKE (gpu-host-handshake.h): where this GPU
+// takes it, a cached Qwen MoE hands each layer's picks over inside the
+// running GPU work on every decode path -- forward(), decode_step_fast(),
+// the pipelined decode, a batched step of two branches -- and stays the
+// resident model's to the bit; so does a run with every 13th turn
+// abandoned (the GPU gives up and runs on stale slots; the step is redone
+// with commits from the state it found: its linear layers' state written
+// out of place, its input rows kept). VPIPE_QWEN_HANDSHAKE=0 runs the
+// cached arms at a commit and wait a layer (the same bits).
+TEST(moe_expert_cache, the_handshake_keeps_the_resident_bits)
+{
+  const char* path = std::getenv("VPIPE_QWEN35_MOE_TEST_MODEL_PATH");
+  if (path == nullptr || *path == '\0') { return; }
+  const PinnedTuners pinned;
+  ModelLoader loader(nullptr);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  if (!cfg.has_value()) { return; }
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 300; ++i) { ids.push_back((i * 131 + 7) % 2000 + 10); }
+  auto argmax = [](const float* p, std::size_t n) {
+    std::int32_t t = 0;
+    for (std::size_t i = 1; i < n; ++i) {
+      if (p[i] > p[t]) { t = (std::int32_t)i; }
+    }
+    return t;
+  };
+  struct Run {
+    std::vector<float> lg;
+    std::vector<std::int32_t> toks;
+    bool ok = false, hs = false, cached = false;
+    int redos = 0;
+    double grew_mb = 0;   // the device's growth over the forward() steps
+  };
+  auto run = [&](std::size_t cache, int drop) {
+    Run r;
+    Session sess;
+    MetalCompute* mc = sess.metal_compute();
+    if (mc == nullptr) { return r; }
+    (void)mc->memory_budget_settled(15000);
+    auto mcfg = MetalQwenModel::config_from(*cfg);
+    mcfg.page_tokens = 512;
+    mcfg.max_pages = 16;
+    mcfg.expert_cache_bytes = cache;
+    auto m = MetalQwenModel::load(path, mc, mcfg);
+    if (m == nullptr) { return r; }
+    r.hs = m->expert_handshake();
+    r.cached = m->expert_cache() != nullptr;
+    m->xhs_drop_every(drop);
+    const ContextId root = m->root_context();
+    const std::size_t V = (std::size_t)mcfg.vocab;
+    std::vector<float> lg = m->prefill(ids);
+    if (lg.size() != V) { return r; }
+    r.lg = lg;
+    std::int32_t t = argmax(lg.data(), V);
+    const std::size_t a0 = mc->memory_budget().allocated;
+    for (int i = 0; i < 4; ++i) {           // forward()
+      lg = m->forward(t);
+      if (lg.size() != V) { return r; }
+      r.lg.insert(r.lg.end(), lg.begin(), lg.end());
+      t = argmax(lg.data(), V);
+      r.toks.push_back(t);
+    }
+    r.grew_mb = ((double)mc->memory_budget().allocated - (double)a0) /
+                1048576.0;
+    for (int i = 0; i < 4; ++i) {           // decode_step_fast()
+      t = m->decode_step_fast(root, t);
+      if (t < 0) { return r; }
+      r.toks.push_back(t);
+    }
+    std::vector<std::int32_t> pd;           // the pipelined decode
+    if (!m->decode_pipelined(root, t, 6, pd) || pd.size() != 6) { return r; }
+    r.toks.insert(r.toks.end(), pd.begin(), pd.end());
+    // a batched step of two branches
+    ContextManager* cx = m->context_manager();
+    const std::vector<ContextId> bc{cx->branch(root), cx->branch(root)};
+    std::vector<std::int32_t> in{pd.back(), (pd.back() + 1) % 1000 + 10};
+    for (int i = 0; i < 3; ++i) {
+      std::vector<float> out;
+      if (!m->decode_batched_step(bc, in, {}, out) ||
+          out.size() != 2 * V) {
+        return r;
+      }
+      r.lg.insert(r.lg.end(), out.begin(), out.end());
+      in = {argmax(out.data(), V), argmax(out.data() + V, V)};
+      r.toks.insert(r.toks.end(), in.begin(), in.end());
+    }
+    r.redos = m->xhs_redos();
+    r.ok = true;
+    return r;
+  };
+  const Run a = run(0, 0);
+  const Run b = run((std::size_t)2048 << 20, 0);
+  ASSERT_TRUE(a.ok && b.ok);
+  if (!a.ok || !b.ok) { return; }
+  auto same = [&](const Run& x) {
+    return x.lg.size() == a.lg.size() && x.toks == a.toks &&
+           std::memcmp(x.lg.data(), a.lg.data(), a.lg.size() * 4) == 0;
+  };
+  // A context's linear-layer state, a slot: what the handshake's ring
+  // holds twice more (run_bytes books it).
+  std::size_t slot = 0;
+  {
+    const auto mc0 = MetalQwenModel::config_from(*cfg);
+    for (int L = 0; L < mc0.n_layers; ++L) {
+      if (mc0.layer_is_full(L)) { continue; }
+      slot += (std::size_t)std::max(mc0.gdn_conv_kernel - 1, 0) *
+                  mc0.gdn_conv_dim * 2 +
+              (std::size_t)mc0.gdn_v_heads * mc0.gdn_v_dim * mc0.gdn_k_dim *
+                  4;
+    }
+  }
+  std::printf("[moe_cache] handshake: resident %d, cached %d; cached == "
+              "resident %d (%zu logits, %zu tokens); the first decode steps "
+              "allocated %.1f MB resident, %.1f MB cached (two slots of "
+              "linear-layer state: %.1f MB)\n", a.hs, b.hs, same(b),
+              a.lg.size(), a.toks.size(), a.grew_mb, b.grew_mb,
+              2.0 * slot / 1048576.0);
+  EXPECT_TRUE(!a.hs && !a.cached);
+  // a checkpoint the cache refuses (mixed expert widths) proves nothing
+  ASSERT_TRUE(b.cached);
+  EXPECT_TRUE(same(b));
+  EXPECT_TRUE(b.redos == 0);
+  if (!b.hs) { return; }   // this GPU (or VPIPE_QWEN_HANDSHAKE=0) has none
+  const Run c = run((std::size_t)2048 << 20, 13);
+  ASSERT_TRUE(c.ok);
+  if (!c.ok) { return; }
+  std::printf("[moe_cache] every 13th turn abandoned: %d steps redone, "
+              "== resident %d\n", c.redos, same(c));
+  EXPECT_TRUE(c.redos > 0);
+  EXPECT_TRUE(same(c));
+}
+
 namespace {
 
 std::size_t
@@ -584,4 +880,98 @@ TEST(moe_expert_cache, lm_loader_caches_on_a_small_box)
   std::string lower = b.text;
   for (char& ch : lower) { ch = (char)std::tolower((unsigned char)ch); }
   EXPECT_TRUE(lower.find("paris") != std::string::npos);
+}
+
+// REMOTE: given a Remote, a miss held far that the resident set would not
+// take is not read: its pair gets the zero slot (all its parts zero) and
+// is listed with the far slot holding it, whose parts are its bytes. One
+// the resident set takes is read home as before; without a Remote the
+// same miss is read from the far tier.
+TEST(moe_expert_cache, remote_runs_a_far_expert_in_place)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto far = std::make_shared<TestFarMemory>(6 * 24);
+  MoeExpertCache::Options o;
+  o.layers = 1;
+  o.experts = 16;
+  o.part_bytes = {16, 8};
+  o.resident = 2;
+  o.transient = 4;
+  o.threads = 2;
+  o.half_life = 1000;
+  o.far = far;
+  o.far_one_offs = true;
+  o.zero_slot = true;
+  std::string err;
+  std::atomic<int> reads{0};
+  auto c = MoeExpertCache::create(
+      mc, o,
+      [&](int L, int e, std::uint8_t* const* dst, std::string*) {
+        const std::uint32_t t = tag_(L, e);
+        for (int i = 0; i < 4; ++i) { std::memcpy(dst[0] + 4 * i, &t, 4); }
+        std::memcpy(dst[1], &t, 4);
+        reads.fetch_add(1);
+        return true;
+      },
+      &err);
+  ASSERT_TRUE(c != nullptr);
+  if (c == nullptr) { return; }
+  ASSERT_TRUE(c->zero_slot() == c->slots());
+  // the zero slot is held, and counted
+  EXPECT_TRUE(c->bytes() == (std::size_t)(c->slots() + 1) * 24);
+  std::vector<std::int32_t> sl(2);
+  // 0 and 1 resident and hot; 2 a one-off, written far
+  for (int k = 0; k < 3; ++k) {
+    std::vector<std::int32_t> e{0, 1};
+    ASSERT_TRUE(c->resolve(0, e.data(), 2, 1, sl.data(), &err));
+  }
+  {
+    std::vector<std::int32_t> e{2};
+    ASSERT_TRUE(c->resolve(0, e.data(), 1, 1, sl.data(), &err));
+  }
+  for (int i = 0; i < 1000 && far->writes.load() < 1; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(c->far_holds(0, 2));
+  // a spare's copy gone: the other spares taken by one-offs
+  for (int e = 3; e <= 6; ++e) {
+    std::vector<std::int32_t> ee{e};
+    ASSERT_TRUE(c->resolve(0, ee.data(), 1, 1, sl.data(), &err));
+  }
+  const int disk = reads.load(), fr = far->reads.load();
+  MoeExpertCache::Remote rem;
+  std::vector<std::int32_t> e{2, 0};
+  ASSERT_TRUE(c->resolve(0, e.data(), 2, 1, sl.data(), &err, nullptr, &rem));
+  EXPECT_TRUE(sl[0] == c->zero_slot() && slot_tag_(*c, sl[1]) == tag_(0, 0));
+  EXPECT_TRUE(rem.pair.size() == 1 && rem.pair[0] == 0);
+  EXPECT_TRUE(reads.load() == disk && far->reads.load() == fr);
+  EXPECT_TRUE(c->stats().far_computed == 1);
+  if (rem.far_slot.size() == 1) {
+    std::vector<FarPiece> pc(2);
+    std::uint8_t a[16], b[8];
+    pc[0] = {c->far_part_offset(rem.far_slot[0], 0), a, 16};
+    pc[1] = {c->far_part_offset(rem.far_slot[0], 1), b, 8};
+    ASSERT_TRUE(far->read(pc.data(), 2, &err));
+    std::uint32_t t0, t1;
+    std::memcpy(&t0, a + 12, 4);
+    std::memcpy(&t1, b, 4);
+    EXPECT_TRUE(t0 == tag_(0, 2) && t1 == tag_(0, 2));
+  }
+  for (int k = 0; k < 2; ++k) {
+    const auto* z = static_cast<const std::uint8_t*>(c->pool(k).contents()) +
+                    (std::size_t)c->zero_slot() * o.part_bytes[(std::size_t)k];
+    bool zero = true;
+    for (std::size_t i = 0; i < o.part_bytes[(std::size_t)k]; ++i) {
+      zero = zero && z[i] == 0;
+    }
+    EXPECT_TRUE(zero);
+  }
+  c->remote_done(rem);
+  // without a Remote it is read from the far tier
+  const int fr2 = far->reads.load();
+  ASSERT_TRUE(c->resolve(0, e.data(), 2, 1, sl.data(), &err));
+  EXPECT_TRUE(slot_tag_(*c, sl[0]) == tag_(0, 2));
+  EXPECT_TRUE(far->reads.load() == fr2 + 1 && reads.load() == disk);
 }

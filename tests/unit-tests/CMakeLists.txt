@@ -151,6 +151,8 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         audio-transcribe-stage.cc
         gemma4-unified-embedder.cc
         gguf-convert.cc
+        gguf-deepseek41.cc
+        gguf-qwen4exp.cc
         metal-lm/attention.cc
         metal-lm/batched-decode.cc
         metal-lm/bench.cc
@@ -278,6 +280,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         relayvsr.cc
         drama3.cc
         deepseek-v41.cc
+        host-handshake.cc
         lm-run-memory.cc
         qwen4-exp-kernels.cc
         moe-grouped-nax.cc

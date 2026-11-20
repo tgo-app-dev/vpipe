@@ -32,6 +32,8 @@
 #include "generative-models/lm-run-memory.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/shared/dflash-drafter.h"
+#include "generative-models/shared/gguf-convert.h"
+#include "generative-models/shared/gguf-file.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-memory-host.h"
@@ -57,6 +59,19 @@ using namespace vpipe;
 using metal_compute::MetalCompute;
 
 namespace {
+
+// The checkpoint's tokenizer: its tokenizer.json, or a GGUF's own.
+std::unique_ptr<vpipe::genai::Tokenizer>
+tokenizer_of_(const std::string& dir, const vpipe::Session& sess)
+{
+  const std::string g = vpipe::genai::find_gguf_in_dir(dir);
+  if (!g.empty()) {
+    auto f = vpipe::genai::GgufFile::open(g);
+    return f ? vpipe::genai::Tokenizer::from_gguf(*f, &sess) : nullptr;
+  }
+  return vpipe::genai::Tokenizer::from_huggingface_json(
+      dir + "/tokenizer.json", &sess);
+}
 
 std::uint16_t
 to_bf16_(float f)
@@ -1641,6 +1656,35 @@ TEST(qwen4_exp, mtp_decode_keeps_the_plain_tokens)
   EXPECT_TRUE(sspec == ps);
 }
 
+namespace {
+
+// VPIPE_QWEN4_EXP_NGRAM_RESIDENT=1: hold the n-gram table in memory --
+// and hash the verify's rows on the GPU (VPIPE_QWEN_PLE_GPU=1, off by
+// default), unless the caller says otherwise. Read before the process's
+// first DFlash decode.
+bool
+ngram_resident_env_(vpipe::genai::MetalQwenModel::Config& c)
+{
+  const char* e = std::getenv("VPIPE_QWEN4_EXP_NGRAM_RESIDENT");
+  c.ple_resident = e != nullptr && std::atoi(e) != 0;
+  if (c.ple_resident) { ::setenv("VPIPE_QWEN_PLE_GPU", "1", 0); }
+  return c.ple_resident;
+}
+
+// The table's fill (a thread of its own, after the load): done?
+bool
+wait_ngram_resident_(const vpipe::genai::MetalQwenModel& m)
+{
+  for (int i = 0; i < 6000 && !m.ple_resident_done(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  std::printf("[qwen4_exp] the n-gram table in memory: %zu MB\n",
+              m.ple_resident_bytes() >> 20);
+  return m.ple_resident_done();
+}
+
+}  // namespace
+
 // The DFlash 2 drafter (incoai/Qwen3.8-Flash-Next-DFlash2) speculating for
 // the model: a math word problem through the chat template, decoded plain
 // and speculatively -- greedy at the drafter's trained block, at block 4
@@ -1679,8 +1723,7 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
     cache_mb = (std::size_t)std::atoll(e);
   }
   c.expert_cache_bytes = cache_mb << 20;
-  auto tok = vpipe::genai::Tokenizer::from_huggingface_json(
-      std::string(mp) + "/tokenizer.json", &sess);
+  auto tok = tokenizer_of_(mp, sess);
   ASSERT_TRUE(tok != nullptr);
   if (tok == nullptr) { return; }
   auto tpl = vpipe::genai::make_chat_template(*mcfg, *tok,
@@ -1701,9 +1744,14 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
   if (const char* e = std::getenv("VPIPE_QWEN4_EXP_DFLASH_TOKENS")) {
     N = std::max(8, std::atoi(e));
   }
+  // VPIPE_QWEN4_EXP_NGRAM_RESIDENT=1: the n-gram table in memory -- the
+  // verify's rows hashed and gathered on the GPU (a round one
+  // submission), held to the host's rows by the plain decode's tokens.
+  const bool resident = ngram_resident_env_(c);
   auto m = MetalQwenModel::load(mp, mc, c);
   ASSERT_TRUE(m != nullptr);
   if (m == nullptr) { return; }
+  if (resident) { ASSERT_TRUE(wait_ngram_resident_(*m)); }
   vpipe::genai::MetalDFlashDrafter::Options opt;
   opt.target_bf16 = c.use_bf16;
   // VPIPE_QWEN4_EXP_DFLASH_BITS: the drafter held dense (0) / w8 / w4.
@@ -1841,6 +1889,13 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
     // Engaged: a decode without drafts keeps one a round.
     if (a.block != 0) { EXPECT_TRUE(per_round > 1.8); }
   }
+  if (resident) {
+    // Its rounds one submission each: the verify's rows hashed on the GPU
+    // (a copy round's are the host's).
+    std::printf("[qwen4_exp] %llu rounds with the verify's ids on the "
+                "GPU\n", (unsigned long long)m->hc_dev_rounds());
+    EXPECT_TRUE(m->hc_dev_rounds() > 0);
+  }
   (void)run_plain(gs, N, &warm_ms);
   std::printf("[qwen4_exp] the plain decode: %.0f ms a token warm (%.0f "
               "cold)\n", warm_ms / (double)N, cold_ms / (double)N);
@@ -1864,6 +1919,21 @@ TEST(qwen4_exp, dflash_decode_keeps_the_plain_tokens)
               sst.rounds, sst.accepted,
               sspec == ps ? "the same tokens as" : "NOT the same tokens as");
   EXPECT_TRUE(sspec == ps);
+  if (resident) {
+    // ...and sampled with no penalty: no seen-set to fill on the host, so
+    // the rounds run as one submission, the sample on the GPU's ids.
+    ss.presence_penalty = 0.0f;
+    const std::uint64_t r0 = m->hc_dev_rounds();
+    const std::vector<std::int32_t> pn = run_plain(ss, Ns, nullptr);
+    const std::vector<std::int32_t> sn = run_spec(ss, Ns, 4, &sst, &sms);
+    std::printf("[qwen4_exp] DFlash 2 sampled, no penalty, block 4: %zu "
+                "tokens, %llu rounds one submission; %s the pipelined "
+                "sampler's\n", sn.size(),
+                (unsigned long long)(m->hc_dev_rounds() - r0),
+                sn == pn ? "the same tokens as" : "NOT the same tokens as");
+    EXPECT_TRUE(sn == pn);
+    EXPECT_TRUE(m->hc_dev_rounds() > r0);
+  }
 }
 
 // What makes the speculative decode keep the plain one's tokens EXACTLY: a
@@ -1960,8 +2030,7 @@ TEST(qwen4_exp, speculative_decodes_leave_the_plain_state)
     cache_mb = (std::size_t)std::atoll(e);
   }
   c.expert_cache_bytes = cache_mb << 20;
-  auto tok = vpipe::genai::Tokenizer::from_huggingface_json(
-      std::string(mp) + "/tokenizer.json", &sess);
+  auto tok = tokenizer_of_(mp, sess);
   ASSERT_TRUE(tok != nullptr);
   if (tok == nullptr) { return; }
   auto tpl = vpipe::genai::make_chat_template(*mcfg, *tok,
@@ -1974,9 +2043,11 @@ TEST(qwen4_exp, speculative_decodes_leave_the_plain_state)
       "half as many clips in May. How many clips did Natalia sell "
       "altogether in April and May? Explain your reasoning step by step.",
       /*is_first_turn=*/true, &prompt);
+  const bool resident = ngram_resident_env_(c);
   auto m = MetalQwenModel::load(mp, mc, c);
   ASSERT_TRUE(m != nullptr);
   if (m == nullptr) { return; }
+  if (resident) { ASSERT_TRUE(wait_ngram_resident_(*m)); }
   auto argmax = [](const std::vector<float>& v) {
     std::size_t a = 0;
     for (std::size_t i = 1; i < v.size(); ++i) {
@@ -2060,6 +2131,131 @@ TEST(qwen4_exp, speculative_decodes_leave_the_plain_state)
     *kept = st.accepted;
     return ok;
   });
+}
+
+// THE EXPERT CACHE'S TURN AS A HANDSHAKE (gpu-host-handshake.h): a cached
+// step hands each layer's picks over inside the running GPU work -- a
+// plain decode step's one row, the MTP head's passes and a verify's few
+// rows -- and decodes what the same cache decodes at a commit and wait a
+// layer (VPIPE_QWEN_HANDSHAKE=0), to the bit; so does a run with every
+// 13th turn abandoned (the GPU gives up; the forward is redone with
+// commits from the state it found: the linear layers' read slots, the K/V
+// rows given back). The attention tuners pinned, each arm its own load.
+TEST(qwen4_exp, the_handshake_keeps_the_cached_bits)
+{
+  const char* mp = std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH");
+  if (mp == nullptr) { return; }
+  using vpipe::genai::MetalQwenModel;
+  struct Arm {
+    std::vector<float> lg;
+    std::vector<std::int32_t> plain, spec;
+    bool ok = false, hs = false;
+    int redos = 0;
+  };
+  struct Pinned {
+    Pinned()
+    {
+      ::setenv("VPIPE_QWEN_GQA_AUTOTUNE", "0", 1);
+      ::setenv("VPIPE_QWEN_PREFILL_AUTOTUNE", "0", 1);
+    }
+    ~Pinned()
+    {
+      ::unsetenv("VPIPE_QWEN_GQA_AUTOTUNE");
+      ::unsetenv("VPIPE_QWEN_PREFILL_AUTOTUNE");
+    }
+  } pinned;
+  auto arm = [&](bool handshake, int drop) {
+    Arm a;
+    if (!handshake) { ::setenv("VPIPE_QWEN_HANDSHAKE", "0", 1); }
+    Session sess;
+    MetalCompute* mc = sess.metal_compute();
+    if (mc == nullptr) { return a; }
+    (void)mc->memory_budget_settled(15000);
+    vpipe::genai::ModelLoader loader(&sess);
+    const auto mcfg = loader.load_config(mp);
+    if (!mcfg.has_value()) { return a; }
+    MetalQwenModel::Config c = MetalQwenModel::config_from(*mcfg);
+    c.use_bf16 = std::getenv("VPIPE_QWEN4_EXP_F16") == nullptr;
+    c.page_tokens = 256;
+    c.max_pages = 64;
+    c.max_seq = 8192;
+    std::size_t cache_mb = 36864;
+    if (const char* e = std::getenv("VPIPE_QWEN4_EXP_CACHE_MB")) {
+      cache_mb = (std::size_t)std::atoll(e);
+    }
+    c.expert_cache_bytes = cache_mb << 20;
+    auto tok = tokenizer_of_(mp, sess);
+    if (tok == nullptr) { return a; }
+    auto tpl = vpipe::genai::make_chat_template(*mcfg, *tok,
+                                                /*disable_thinking=*/true);
+    if (tpl == nullptr) { return a; }
+    std::vector<std::int32_t> prompt;
+    tpl->render_user_turn(
+        "Natalia sold clips to 48 of her friends in April, and then she "
+        "sold half as many clips in May. How many clips did Natalia sell "
+        "altogether in April and May? Explain your reasoning step by step.",
+        /*is_first_turn=*/true, &prompt);
+    auto m = MetalQwenModel::load(mp, mc, c);
+    ::unsetenv("VPIPE_QWEN_HANDSHAKE");
+    if (m == nullptr || m->expert_cache() == nullptr) { return a; }
+    a.hs = m->expert_handshake();
+    m->xhs_drop_every(drop);
+    auto argmax = [](const std::vector<float>& v) {
+      std::size_t b = 0;
+      for (std::size_t i = 1; i < v.size(); ++i) {
+        if (v[i] > v[b]) { b = i; }
+      }
+      return (std::int32_t)b;
+    };
+    auto* cm = m->context_manager();
+    // plain steps: every logit
+    const auto c1 = cm->acquire_root();
+    std::vector<float> lg = m->prefill(c1, prompt);
+    a.lg = lg;
+    for (int i = 0; i < 24; ++i) {
+      const std::int32_t t = argmax(lg);
+      a.plain.push_back(t);
+      lg = m->forward(c1, t);
+      if (lg.empty()) { return a; }
+      a.lg.insert(a.lg.end(), lg.begin(), lg.end());
+    }
+    cm->release(c1);
+    // the MTP head's rounds (the draft count measured: the tokens, not the
+    // rounds, are the plain decode's)
+    const auto c2 = cm->acquire_root();
+    const std::int32_t first = argmax(m->prefill(c2, prompt));
+    long kept = 0, rounds = 0;
+    if (!m->mtp_decode(c2, first, 48, a.spec, 1, &kept, &rounds)) {
+      return a;
+    }
+    cm->release(c2);
+    a.redos = m->xhs_redos();
+    a.ok = true;
+    return a;
+  };
+  const Arm off = arm(false, 0);
+  const Arm on = arm(true, 0);
+  ASSERT_TRUE(off.ok && on.ok);
+  if (!off.ok || !on.ok) { return; }
+  auto same = [&](const Arm& x) {
+    return x.lg.size() == off.lg.size() && x.plain == off.plain &&
+           x.spec == off.spec &&
+           std::memcmp(x.lg.data(), off.lg.data(), off.lg.size() * 4) == 0;
+  };
+  std::printf("[qwen4_exp] the cache's turns: handshake %d / %d; with it == "
+              "without %d (%zu logits, %zu + %zu tokens)\n", off.hs, on.hs,
+              same(on), off.lg.size(), off.plain.size(), off.spec.size());
+  EXPECT_TRUE(!off.hs);
+  EXPECT_TRUE(same(on));
+  EXPECT_TRUE(on.redos == 0);
+  if (!on.hs) { return; }
+  const Arm drop = arm(true, 13);
+  ASSERT_TRUE(drop.ok);
+  if (!drop.ok) { return; }
+  std::printf("[qwen4_exp] every 13th turn abandoned: %d forwards redone, == "
+              "without the handshake %d\n", drop.redos, same(drop));
+  EXPECT_TRUE(drop.redos > 0);
+  EXPECT_TRUE(same(drop));
 }
 
 // PAST THE QSA THRESHOLD: a ~2400-token prompt (VPIPE_QWEN4_EXP_LONG_GOLDEN,
@@ -3231,4 +3427,958 @@ TEST(qwen4_exp_flavors, packs_match_reference)
     }
   }
   ASSERT_TRUE(ran > 0);
+}
+
+// THE N-GRAM ROWS HASHED AND GATHERED ON THE GPU (ple_rows_gpu_f16)
+// against the host's arithmetic (MetalQwenModel::ple_rows_ / ple_note_,
+// restated): a synthetic table of 3 shards of 5-bit rows (group 32,
+// bf16 scales) in chunks of 2 shards, 16 heads over 2- and 3-grams, the
+// two tokens before from the state (+1, 0 = EOS), ids with EOS among
+// them (the shift stops at one) -- every value BIT FOR BIT, f16 and bf16;
+// the state's last two ids written apart (a verify's ring) and in place
+// (ple_ids_note_f16).
+TEST(qwen4_exp_kernels, ple_rows_gpu_are_the_host_rows)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using metal_compute::SharedBuffer;
+  constexpr int NS = 3, ROWS = 500, D = 160, BITS = 5, GRP = 32;
+  constexpr int HEADS = 16, HPN = 8, G = 3, N = 8, SPC = 2;
+  constexpr int RW = D * BITS / 8, RS = D / GRP * 2;
+  constexpr std::int64_t EOS = 7;
+  std::uint64_t rs = 0x9e3779b97f4a7c15ull;
+  auto next = [&]() {
+    rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+    return rs;
+  };
+  // The table: codes, scales, biases of every shard, as stored.
+  std::vector<std::uint8_t> w((std::size_t)NS * ROWS * RW);
+  std::vector<std::uint16_t> sc((std::size_t)NS * ROWS * (D / GRP)),
+      bi(sc.size());
+  for (auto& b : w) { b = (std::uint8_t)next(); }
+  for (std::size_t i = 0; i < sc.size(); ++i) {
+    sc[i] = to_bf16_((float)(1e-3 + 2e-3 * (double)(next() % 1000) / 1e3));
+    bi[i] = to_bf16_((float)(-0.02 + 0.01 * (double)(next() % 1000) / 1e3));
+  }
+  std::int64_t mult[G], sizes[HEADS], offs[HEADS];
+  for (auto& m : mult) { m = (std::int64_t)(next() | 1u); }
+  std::int64_t at = 0;
+  for (int h = 0; h < HEADS; ++h) {
+    sizes[h] = 80 + (std::int64_t)(next() % 13);
+    offs[h] = at;
+    at += sizes[h];
+  }
+  ASSERT_TRUE(at <= NS * ROWS);
+  const float wscale = 1.375f;
+  std::vector<std::int32_t> ids(N);
+  for (auto& t : ids) { t = (std::int32_t)(next() % 40); }
+  ids[3] = (std::int32_t)EOS;
+  for (const bool bf16 : {false, true}) {
+    for (const int prev : {0, 1}) {
+      // The two before: none (EOS), or two tokens.
+      const std::int32_t st0 = prev ? 12 + 1 : 0, st1 = prev ? 33 + 1 : 0;
+      // The host: ple_rows_'s hash and dequant, ple_note_'s ids.
+      const std::int64_t h0 = st0 > 0 ? st0 - 1 : EOS;
+      const std::int64_t h1 = st1 > 0 ? st1 - 1 : EOS;
+      std::vector<std::int64_t> h(N + 2);
+      h[0] = h0;
+      h[1] = h1;
+      for (int t = 0; t < N; ++t) {
+        h[(std::size_t)t + 2] = ids[(std::size_t)t];
+      }
+      std::vector<std::uint16_t> want((std::size_t)N * HEADS * D);
+      for (int t = 0; t < N; ++t) {
+        const int pos = t + 2;
+        std::int64_t shv[G];
+        for (int k = 0; k < G; ++k) {
+          bool cut = false;
+          for (int q = pos - k + 1; q <= pos - 1; ++q) {
+            if (h[(std::size_t)q] == EOS) { cut = true; }
+          }
+          shv[k] = cut ? EOS : h[(std::size_t)(pos - k)];
+        }
+        for (int g = 2; g <= G; ++g) {
+          std::int64_t mix = shv[0] * mult[0];
+          for (int k = 1; k < g; ++k) { mix ^= shv[k] * mult[k]; }
+          for (int j = 0; j < HPN; ++j) {
+            const int hh = (g - 2) * HPN + j;
+            const std::int64_t m = mix % sizes[hh];
+            const std::int64_t r = (m < 0 ? m + sizes[hh] : m) + offs[hh];
+            const std::uint8_t* wp = &w[(std::size_t)r * RW];
+            for (int d = 0; d < D; ++d) {
+              const std::size_t bit = (std::size_t)BITS * d;
+              unsigned v = wp[bit >> 3];
+              if ((bit >> 3) + 1 < (std::size_t)RW) {
+                v |= (unsigned)wp[(bit >> 3) + 1] << 8;
+              }
+              const unsigned q = (v >> (bit & 7)) & ((1u << BITS) - 1u);
+              const std::size_t gi = (std::size_t)r * (D / GRP) + d / GRP;
+              const float s = (float)from_bf16_(sc[gi]);
+              const float b = (float)from_bf16_(bi[gi]);
+              const float dq = s * (float)q + b;
+              const float x =
+                  (bf16 ? (float)from_bf16_(to_bf16_(dq)) : dq) * wscale;
+              want[((std::size_t)t * HEADS + hh) * D + d] =
+                  bf16 ? to_bf16_(x) : to_f16_(x);
+            }
+          }
+        }
+      }
+      // The GPU: the table in chunks of SPC shards, each kind.
+      auto chunk = [&](const void* src, std::size_t shard_b, int first,
+                       int cnt) {
+        SharedBuffer b = mc->make_shared_buffer(shard_b * cnt);
+        std::memcpy(b.contents(),
+                    static_cast<const std::uint8_t*>(src) + shard_b * first,
+                    shard_b * cnt);
+        return b;
+      };
+      const std::size_t swb = (std::size_t)ROWS * RW;
+      const std::size_t ssb = (std::size_t)ROWS * RS;
+      SharedBuffer wc[2] = {chunk(w.data(), swb, 0, 2),
+                            chunk(w.data(), swb, 2, 1)};
+      SharedBuffer scb[2] = {chunk(sc.data(), ssb, 0, 2),
+                             chunk(sc.data(), ssb, 2, 1)};
+      SharedBuffer bcb[2] = {chunk(bi.data(), ssb, 0, 2),
+                             chunk(bi.data(), ssb, 2, 1)};
+      struct Args {
+        std::int64_t mult[8], sizes[32], offsets[32];
+        std::int64_t shard_rows, eos;
+        std::uint64_t shard_wb, shard_sb;
+        std::int32_t heads, hpn, G, D, bits, group, spc_w, spc_s;
+        std::int32_t row_w, row_s, n, note, scales_bf16, elt_bf16;
+        std::uint32_t ids_off;
+        float scale;
+      } a{};
+      static_assert(sizeof(Args) == 672, "the kernel's layout");
+      for (int k = 0; k < G; ++k) { a.mult[k] = mult[k]; }
+      for (int k = 0; k < HEADS; ++k) {
+        a.sizes[k] = sizes[k];
+        a.offsets[k] = offs[k];
+      }
+      a.shard_rows = ROWS;
+      a.eos = EOS;
+      a.shard_wb = swb;
+      a.shard_sb = ssb;
+      a.heads = HEADS; a.hpn = HPN; a.G = G; a.D = D; a.bits = BITS;
+      a.group = GRP; a.spc_w = SPC; a.spc_s = SPC;
+      a.row_w = RW; a.row_s = RS; a.n = N;
+      a.scales_bf16 = 1;
+      a.elt_bf16 = bf16 ? 1 : 0;
+      a.ids_off = 64;
+      a.scale = wscale;
+      auto lib = mc->load_library(bf16 ? "qwen4_hc_bf16" : "qwen4_hc");
+      auto fr = lib.function("ple_rows_gpu_f16");
+      auto fn = lib.function("ple_ids_note_f16");
+      ASSERT_TRUE(fr.valid() && fn.valid());
+      SharedBuffer bids = mc->make_shared_buffer((std::size_t)N * 4);
+      std::memcpy(bids.contents(), ids.data(), (std::size_t)N * 4);
+      for (const bool apart : {true, false}) {
+        SharedBuffer sin = mc->make_shared_buffer(128);
+        SharedBuffer sapart = mc->make_shared_buffer(128);
+        const SharedBuffer& sout = apart ? sapart : sin;
+        auto* si = reinterpret_cast<std::int32_t*>(
+            static_cast<std::uint8_t*>(sin.contents()) + a.ids_off);
+        si[0] = st0;
+        si[1] = st1;
+        SharedBuffer out =
+            mc->make_shared_buffer((std::size_t)N * HEADS * D * 2);
+        a.note = apart ? 1 : 0;
+        auto cs = mc->make_command_stream();
+        {
+          metal_compute::ComputeEncoder enc = cs.begin_compute();
+          enc.set_function(fr);
+          enc.set_buffer(0, bids); enc.set_buffer(1, sin);
+          enc.set_buffer(2, sout); enc.set_buffer(3, out);
+          enc.set_constant(4, a);
+          for (int k = 0; k < 8; ++k) {
+            enc.set_buffer(5 + k, wc[k < 1 ? 0 : 1]);
+          }
+          for (int k = 0; k < 4; ++k) {
+            enc.set_buffer(13 + k, scb[k < 1 ? 0 : 1]);
+            enc.set_buffer(17 + k, bcb[k < 1 ? 0 : 1]);
+          }
+          enc.dispatch({32u * HEADS, (unsigned)N, 1u}, {32, 1, 1});
+          if (!apart) {
+            enc.set_function(fn);
+            enc.set_buffer(0, bids); enc.set_buffer(1, sin);
+            enc.set_buffer(2, sout); enc.set_constant(4, a);
+            enc.dispatch({1, 1, 1}, {1, 1, 1});
+          }
+        }
+        ASSERT_TRUE(cs.commit().wait_ok());
+        const auto* o = static_cast<const std::uint16_t*>(out.contents());
+        int bad = 0;
+        for (std::size_t i = 0; i < want.size(); ++i) {
+          bad += o[i] != want[i];
+        }
+        const auto* so = reinterpret_cast<const std::int32_t*>(
+            static_cast<const std::uint8_t*>(sout.contents()) + a.ids_off);
+        const bool ids_ok =
+            so[0] == ids[N - 2] + 1 && so[1] == ids[N - 1] + 1;
+        std::printf("[ple_gpu] %s, %s, state %s: %d of %zu values off the "
+                    "host's; last ids %s\n", bf16 ? "bf16" : "f16",
+                    prev ? "two tokens before" : "EOS before",
+                    apart ? "apart" : "in place", bad, want.size(),
+                    ids_ok ? "right" : "WRONG");
+        EXPECT_TRUE(bad == 0);
+        EXPECT_TRUE(ids_ok);
+      }
+    }
+  }
+}
+
+// THE DOWN LAUNCH BY UNITS (affine_moe_down_units_*) against an f64
+// restatement at every format the fused launch takes -- w4 / w5 / w6 / w8
+// g64, w4 g32 beside a g32 shared expert -- at the inner width 640 (20
+// units a row, so a lane's units cross rows), f16 and bf16: the routed
+// experts' rows, the shared expert's, the combine. Against the qmv loop's
+// kernel (affine_moe_down_fused_*: the same arithmetic but for summation
+// order), and a 4-row launch's rows against each row launched alone, BIT
+// FOR BIT: a verify's rows are a decode's.
+TEST(qwen4_exp_kernels, fused_moe_down_units_match_f64)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using metal_compute::ComputeEncoder;
+  using metal_compute::SharedBuffer;
+  constexpr int E = 12, H = 256, I = 640, Sh = 640, TK = 10, M = 4;
+  constexpr int NP = M * TK;
+  std::uint32_t rng = 20261117u;
+  auto next = [&]() {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  auto unif = [&]() { return (next() >> 8) * (1.0 / 16777216.0); };
+  // A row of codes as one little-endian bit stream (MLX's affine layout
+  // at 4, 5, 6 and 8 bits).
+  auto pack = [](const std::vector<std::uint32_t>& q, std::size_t row,
+                 int K, int eb, std::uint8_t* out) {
+    std::memset(out, 0, (std::size_t)K * eb / 8);
+    for (int k = 0; k < K; ++k) {
+      const std::uint32_t c = q[row * K + (std::size_t)k];
+      for (int b = 0; b < eb; ++b) {
+        const int bit = k * eb + b;
+        out[bit / 8] |= (std::uint8_t)(((c >> b) & 1u) << (bit % 8));
+      }
+    }
+  };
+  struct Fmt { int eb, eg, sg; const char* sfx; };
+  const Fmt fmts[] = {{5, 64, 64, "w5g64"}, {4, 64, 64, "w4g64"},
+                      {6, 64, 64, "w6g64"}, {8, 64, 64, "w8g64"},
+                      {4, 32, 32, "w4g32_sg32"}};
+  int ran = 0;
+  for (const bool bf16 : {false, true}) {
+    auto lib = mc->load_library(bf16 ? "affine_qmv_bf16" : "affine_qmv");
+    auto el = [&](double v) {
+      return bf16 ? to_bf16_((float)v) : to_f16_(v);
+    };
+    auto rd = [&](std::uint16_t u) {
+      return bf16 ? from_bf16_(u) : from_f16_(u);
+    };
+    for (const Fmt& f : fmts) {
+      auto fu = lib.function(std::string("affine_moe_down_units_") + f.sfx);
+      auto fo = lib.function(std::string("affine_moe_down_fused_") + f.sfx);
+      ASSERT_TRUE(fu.valid() && fo.valid());
+      if (!fu.valid() || !fo.valid()) { return; }
+      // Codes, groups' scales / biases, inputs (all in the element type).
+      std::vector<std::uint32_t> q((std::size_t)E * H * I),
+          qs((std::size_t)H * Sh);
+      for (auto& c : q) { c = next() >> (32 - f.eb); }
+      for (auto& c : qs) { c = next() >> 24; }
+      const int qmax = (1 << f.eb) - 1;
+      auto mk = [&](std::size_t n, int qm, std::vector<std::uint16_t>& sv,
+                    std::vector<std::uint16_t>& bv) {
+        sv.resize(n);
+        bv.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+          const double sc = (0.5 + unif()) * 0.06 / qm;
+          sv[i] = el(sc);
+          bv[i] = el(-0.5 * qm * sc * (0.8 + 0.4 * unif()));
+        }
+      };
+      std::vector<std::uint16_t> s_e, b_e, s_s, b_s;
+      mk((std::size_t)E * H * (I / f.eg), qmax, s_e, b_e);
+      mk((std::size_t)H * (Sh / f.sg), 255, s_s, b_s);
+      std::vector<std::uint16_t> act((std::size_t)NP * I),
+          sx((std::size_t)M * Sh), gate(M), pw(NP);
+      for (auto& v : act) { v = el(2.0 * unif() - 1.0); }
+      for (auto& v : sx) { v = el(2.0 * unif() - 1.0); }
+      for (auto& v : gate) { v = el(0.1 + 0.8 * unif()); }
+      for (auto& v : pw) { v = el(0.02 + 0.18 * unif()); }
+      std::vector<std::int32_t> eid(NP);
+      for (auto& e : eid) { e = (std::int32_t)(next() % E); }
+      const std::size_t rb = (std::size_t)I * f.eb / 8;
+      std::vector<std::uint8_t> w((std::size_t)E * H * rb),
+          ws((std::size_t)H * Sh);
+      for (std::size_t r = 0; r < (std::size_t)E * H; ++r) {
+        pack(q, r, I, f.eb, &w[r * rb]);
+      }
+      for (std::size_t i = 0; i < ws.size(); ++i) {
+        ws[i] = (std::uint8_t)qs[i];
+      }
+      // f64: every expert's row, the shared expert's, combined.
+      std::vector<double> ref((std::size_t)M * H);
+      for (int m = 0; m < M; ++m) {
+        for (int h = 0; h < H; ++h) {
+          double moe = 0.0;
+          for (int j = 0; j < TK; ++j) {
+            const int pp = m * TK + j;
+            const std::size_t row = (std::size_t)eid[pp] * H + h;
+            double a = 0.0;
+            for (int k = 0; k < I; ++k) {
+              const std::size_t g = row * (I / f.eg) + (std::size_t)(k / f.eg);
+              a += rd(act[(std::size_t)pp * I + k]) *
+                   (rd(s_e[g]) * (double)q[row * I + k] + rd(b_e[g]));
+            }
+            moe += rd(pw[pp]) * a;
+          }
+          double sh = 0.0;
+          for (int k = 0; k < Sh; ++k) {
+            const std::size_t g = (std::size_t)h * (Sh / f.sg) + k / f.sg;
+            sh += rd(sx[(std::size_t)m * Sh + k]) *
+                  (rd(s_s[g]) * (double)qs[(std::size_t)h * Sh + k] +
+                   rd(b_s[g]));
+          }
+          ref[(std::size_t)m * H + h] = moe + rd(gate[m]) * sh;
+        }
+      }
+      auto up = [&](const void* p, std::size_t n) {
+        SharedBuffer b = mc->make_shared_buffer(n);
+        std::memcpy(b.contents(), p, n);
+        return b;
+      };
+      SharedBuffer bw = up(w.data(), w.size()),
+                   bs = up(s_e.data(), s_e.size() * 2),
+                   bb = up(b_e.data(), b_e.size() * 2),
+                   bws = up(ws.data(), ws.size()),
+                   bss = up(s_s.data(), s_s.size() * 2),
+                   bbs = up(b_s.data(), b_s.size() * 2),
+                   bact = up(act.data(), act.size() * 2),
+                   bsx = up(sx.data(), sx.size() * 2),
+                   bgate = up(gate.data(), gate.size() * 2),
+                   bpw = up(pw.data(), pw.size() * 2),
+                   beid = up(eid.data(), eid.size() * 4);
+      SharedBuffer out_u = mc->make_shared_buffer((std::size_t)M * H * 2),
+                   out_o = mc->make_shared_buffer((std::size_t)M * H * 2),
+                   out_1 = mc->make_shared_buffer((std::size_t)M * H * 2);
+      auto st = mc->make_command_stream();
+      {
+        ComputeEncoder enc = st.begin_compute();
+        // rows [m0, m0 + mm) into `o`, by units (or the qmv loop).
+        auto launch = [&](bool units, int m0, int mm, const SharedBuffer& o) {
+          enc.set_function(units ? fu : fo);
+          enc.set_buffer(0, bw); enc.set_buffer(1, bs); enc.set_buffer(2, bb);
+          enc.set_buffer(3, bact, (std::size_t)m0 * TK * I * 2);
+          enc.set_buffer(4, beid, (std::size_t)m0 * TK * 4);
+          enc.set_buffer(5, bpw, (std::size_t)m0 * TK * 2);
+          enc.set_buffer(6, bws); enc.set_buffer(7, bss);
+          enc.set_buffer(8, bbs);
+          enc.set_buffer(9, bsx, (std::size_t)m0 * Sh * 2);
+          enc.set_buffer(10, bgate, (std::size_t)m0 * 2);
+          enc.set_buffer(11, o, (std::size_t)m0 * H * 2);
+          enc.set_constant(12, I); enc.set_constant(13, H);
+          enc.set_constant(14, Sh); enc.set_constant(15, TK);
+          const unsigned sg = (units ? 1u : 2u) * (unsigned)(TK + 1);
+          enc.dispatch({32u * (unsigned)mm, sg * (unsigned)(H / 8), 1u},
+                       {32, sg, 1});
+        };
+        launch(true, 0, M, out_u);
+        launch(false, 0, M, out_o);
+        for (int m = 0; m < M; ++m) { launch(true, m, 1, out_1); }
+      }
+      ASSERT_TRUE(st.commit().wait_ok());
+      auto rel = [&](const SharedBuffer& o) {
+        const auto* p = static_cast<const std::uint16_t*>(o.contents());
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+          const double d = rd(p[i]) - ref[i];
+          num += d * d;
+          den += ref[i] * ref[i];
+        }
+        return std::sqrt(num / den);
+      };
+      const double ru = rel(out_u), ro = rel(out_o);
+      const bool same = std::memcmp(out_u.contents(), out_1.contents(),
+                                    (std::size_t)M * H * 2) == 0;
+      std::printf("[fused_moe] %s %s: units %.2e from f64, the qmv loop "
+                  "%.2e; a row alone the same bits: %s\n",
+                  bf16 ? "bf16" : "f16 ", f.sfx, ru, ro, same ? "yes" : "NO");
+      // Each expert's rows are rounded to the element type before they
+      // are combined, as the kernels both do: the bar is that rounding.
+      EXPECT_TRUE(ru < (bf16 ? 6e-3 : 8e-4));
+      EXPECT_TRUE(ru < 1.25 * ro + 1e-5);
+      EXPECT_TRUE(same);
+      ++ran;
+    }
+  }
+  ASSERT_TRUE(ran == 10);
+}
+
+// THE DECODE STEP'S MoE, TIMED (VPIPE_FUSED_MOE_BENCH=<layers>): the two
+// fused launches (affine_moe_up_fused_w5g64, the down launch by the qmv
+// loop and by units) at the model's shape -- 512 w5 experts of 2560 ->
+// 640, top 10, a w8 shared expert and gate -- over `layers` layers' worth
+// of weights (1.7 GB each) and a pick set per (rep, layer), so an expert
+// read is a read from DRAM, as a decode's is. One command buffer of every
+// layer in turn, dependent as a decode's are; each launch alone too. RUN
+// IT WITH VPIPE_MC_CMDBUF_SPLIT=0: the stream splits a buffer every 50
+// dispatches and the fence times the last piece alone (it read 4 TB/s).
+// VPIPE_FUSED_MOE_UP / _DOWN name another pair (outputs compared).
+TEST(qwen4_exp_kernels, fused_moe_bench)
+{
+  const char* env = std::getenv("VPIPE_FUSED_MOE_BENCH");
+  if (env == nullptr) { return; }
+  const char* split = std::getenv("VPIPE_MC_CMDBUF_SPLIT");
+  if (split == nullptr || std::atoi(split) != 0) {
+    std::printf("[fused_moe] set VPIPE_MC_CMDBUF_SPLIT=0 (see above)\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using metal_compute::ComputeEncoder;
+  using metal_compute::SharedBuffer;
+  const int L = std::max(1, std::atoi(env));
+  constexpr int E = 512, H = 2560, I = 640, Sh = 640, TK = 10, G = 64;
+  const std::size_t guw = (std::size_t)2 * I * H * 5 / 8;   // bytes a pair
+  const std::size_t gus = (std::size_t)2 * I * (H / G) * 2;
+  const std::size_t dnw = (std::size_t)H * I * 5 / 8;
+  const std::size_t dns = (std::size_t)H * (I / G) * 2;
+  std::uint64_t rs = 0x9e3779b97f4a7c15ull;
+  auto next64 = [&]() {
+    rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+    return rs;
+  };
+  auto fill_codes = [&](SharedBuffer& b) {
+    auto* p = static_cast<std::uint64_t*>(b.contents());
+    for (std::size_t i = 0; i < b.byte_size() / 8; ++i) { p[i] = next64(); }
+  };
+  auto fill_sb = [&](SharedBuffer& b, float base, float span) {
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < b.byte_size() / 2; ++i) {
+      p[i] = to_bf16_(base + span * (float)((next64() >> 40) & 0xffff) /
+                                 65536.0f);
+    }
+  };
+  struct Layer {
+    SharedBuffer gw, gs, gb, dw, ds, db;            // routed
+    SharedBuffer sgw, sgs, sgb, ggw, ggs, ggb;      // shared gate|up, gate
+    SharedBuffer sdw, sds, sdb;                     // shared down
+  };
+  std::vector<Layer> ly((std::size_t)L);
+  for (Layer& l : ly) {
+    l.gw = mc->make_shared_buffer(E * guw);
+    l.gs = mc->make_shared_buffer(E * gus);
+    l.gb = mc->make_shared_buffer(E * gus);
+    l.dw = mc->make_shared_buffer(E * dnw);
+    l.ds = mc->make_shared_buffer(E * dns);
+    l.db = mc->make_shared_buffer(E * dns);
+    l.sgw = mc->make_shared_buffer((std::size_t)2 * Sh * H);
+    l.sgs = mc->make_shared_buffer((std::size_t)2 * Sh * (H / G) * 2);
+    l.sgb = mc->make_shared_buffer((std::size_t)2 * Sh * (H / G) * 2);
+    l.ggw = mc->make_shared_buffer((std::size_t)H);
+    l.ggs = mc->make_shared_buffer((std::size_t)(H / G) * 2);
+    l.ggb = mc->make_shared_buffer((std::size_t)(H / G) * 2);
+    l.sdw = mc->make_shared_buffer((std::size_t)H * Sh);
+    l.sds = mc->make_shared_buffer((std::size_t)H * (Sh / G) * 2);
+    l.sdb = mc->make_shared_buffer((std::size_t)H * (Sh / G) * 2);
+    ASSERT_TRUE(!l.gw.empty() && !l.dw.empty() && !l.sdb.empty());
+    if (l.gw.empty() || l.dw.empty() || l.sdb.empty()) { return; }
+    for (SharedBuffer* b : {&l.gw, &l.dw, &l.sgw, &l.ggw, &l.sdw}) {
+      fill_codes(*b);
+    }
+    for (SharedBuffer* b : {&l.gs, &l.ds, &l.sgs, &l.ggs, &l.sds}) {
+      fill_sb(*b, 1e-3f, 2e-3f);
+    }
+    for (SharedBuffer* b : {&l.gb, &l.db, &l.sgb, &l.ggb, &l.sdb}) {
+      fill_sb(*b, -2e-2f, 1e-2f);
+    }
+  }
+  auto lib = mc->load_library("affine_qmv_bf16");
+  struct Pair {
+    std::string up, down;
+    metal_compute::ComputeFunction fu, fd;
+  };
+  // The qmv loop's pair, then the shipped one (the down launch by units)
+  // or VPIPE_FUSED_MOE_UP / _DOWN.
+  std::vector<Pair> arms(2);
+  arms[0].up = arms[1].up = "affine_moe_up_fused_w5g64";
+  arms[0].down = "affine_moe_down_fused_w5g64";
+  arms[1].down = "affine_moe_down_units_w5g64";
+  if (const char* u = std::getenv("VPIPE_FUSED_MOE_UP")) { arms[1].up = u; }
+  if (const char* d = std::getenv("VPIPE_FUSED_MOE_DOWN")) {
+    arms[1].down = d;
+  }
+  for (Pair& a : arms) {
+    a.fu = lib.function(a.up);
+    a.fd = lib.function(a.down);
+    ASSERT_TRUE(a.fu.valid() && a.fd.valid());
+    if (!a.fu.valid() || !a.fd.valid()) { return; }
+  }
+  auto st = mc->make_command_stream();
+  for (const int M : {1, 2, 4, 8}) {
+    const int np = M * TK;
+    // Each row's picks distinct, per layer; the rows' picks overlap as a
+    // verify's do (about a quarter repeated). A pick set per (rep, layer):
+    // a rep re-reading the last one's experts reads the cache, not DRAM.
+    const int kReps = std::getenv("VPIPE_FUSED_MOE_REPS") != nullptr
+        ? std::max(1, std::atoi(std::getenv("VPIPE_FUSED_MOE_REPS")))
+        : 8;
+    const int LR = L * kReps;
+    std::vector<std::vector<std::int32_t>> eids((std::size_t)LR);
+    std::vector<int> distinct((std::size_t)LR);
+    for (int li = 0; li < LR; ++li) {
+      std::vector<std::int32_t>& e = eids[(std::size_t)li];
+      for (int m = 0; m < M; ++m) {
+        std::vector<std::int32_t> row;
+        while ((int)row.size() < TK) {
+          std::int32_t c = (std::int32_t)(next64() % E);
+          if (m > 0 && (next64() & 3) == 0) {
+            c = e[(std::size_t)(next64() % (std::uint64_t)(m * TK))];
+          }
+          if (std::find(row.begin(), row.end(), c) == row.end()) {
+            row.push_back(c);
+          }
+        }
+        e.insert(e.end(), row.begin(), row.end());
+      }
+      std::vector<std::int32_t> u(e);
+      std::sort(u.begin(), u.end());
+      distinct[(std::size_t)li] =
+          (int)(std::unique(u.begin(), u.end()) - u.begin());
+    }
+    std::vector<SharedBuffer> beid((std::size_t)LR);
+    for (int li = 0; li < LR; ++li) {
+      beid[(std::size_t)li] = mc->make_shared_buffer((std::size_t)np * 4);
+      std::memcpy(beid[(std::size_t)li].contents(),
+                  eids[(std::size_t)li].data(), (std::size_t)np * 4);
+    }
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)M * H * 2);
+    SharedBuffer pw = mc->make_shared_buffer((std::size_t)np * 2);
+    fill_sb(x, -1.0f, 2.0f);
+    fill_sb(pw, 0.02f, 0.15f);
+    struct Outs {
+      SharedBuffer act, sy, gate, out;
+    };
+    std::vector<Outs> outs(arms.size());
+    for (Outs& o : outs) {
+      o.act = mc->make_shared_buffer((std::size_t)np * I * 2);
+      o.sy = mc->make_shared_buffer((std::size_t)M * Sh * 2);
+      o.gate = mc->make_shared_buffer((std::size_t)M * 2);
+      o.out = mc->make_shared_buffer((std::size_t)M * H * 2);
+    }
+    const int Y = std::max({2 * I / 8, 2 * Sh / 8, M});
+    auto enc_up = [&](ComputeEncoder& enc, const Pair& a, Outs& o,
+                      int pi) {
+      const Layer& l = ly[(std::size_t)(pi % L)];
+      enc.set_function(a.fu);
+      enc.set_buffer(0, l.gw); enc.set_buffer(1, l.gs);
+      enc.set_buffer(2, l.gb);
+      enc.set_buffer(3, x); enc.set_buffer(4, o.act);
+      enc.set_constant(5, H); enc.set_constant(6, 2 * I);
+      enc.set_buffer(7, beid[(std::size_t)pi]); enc.set_constant(8, TK);
+      enc.set_buffer(9, l.sgw); enc.set_buffer(10, l.sgs);
+      enc.set_buffer(11, l.sgb); enc.set_buffer(12, o.sy);
+      enc.set_constant(13, 2 * Sh);
+      enc.set_buffer(14, l.ggw); enc.set_buffer(15, l.ggs);
+      enc.set_buffer(16, l.ggb); enc.set_buffer(17, o.gate);
+      enc.set_constant(18, M);
+      const unsigned zu = (unsigned)(np + M + 1);
+      enc.dispatch({32u * zu, (unsigned)(2 * Y), 1u}, {32, 2, 1});
+    };
+    auto enc_dn = [&](ComputeEncoder& enc, const Pair& a, Outs& o,
+                      int pi) {
+      const Layer& l = ly[(std::size_t)(pi % L)];
+      enc.set_function(a.fd);
+      enc.set_buffer(0, l.dw); enc.set_buffer(1, l.ds);
+      enc.set_buffer(2, l.db);
+      enc.set_buffer(3, o.act); enc.set_buffer(4, beid[(std::size_t)pi]);
+      enc.set_buffer(5, pw);
+      enc.set_buffer(6, l.sdw); enc.set_buffer(7, l.sds);
+      enc.set_buffer(8, l.sdb); enc.set_buffer(9, o.sy);
+      enc.set_buffer(10, o.gate); enc.set_buffer(11, o.out);
+      enc.set_constant(12, I); enc.set_constant(13, H);
+      enc.set_constant(14, Sh); enc.set_constant(15, TK);
+      // The unit kernel: a simdgroup an expert, 8 rows a threadgroup.
+      const bool units = a.down.find("_units_") != std::string::npos;
+      const unsigned sg = (units ? 1u : 2u) * (unsigned)(TK + 1);
+      enc.dispatch({32u * (unsigned)M, sg * (unsigned)(H / 8), 1u},
+                   {32, sg, 1});
+    };
+    // what: 0 both, 1 up alone, 2 down alone (on the last up's act).
+    // Every (rep, layer) pick set once, in order. Between runs the other
+    // arms (and the other launch) read GBs, so a run starts cold.
+    auto run = [&](std::size_t ai, int what) {
+      {
+        ComputeEncoder enc = st.begin_compute();
+        for (int pi = 0; pi < LR; ++pi) {
+          if (what != 2) { enc_up(enc, arms[ai], outs[ai], pi); }
+          if (what != 1) { enc_dn(enc, arms[ai], outs[ai], pi); }
+        }
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      auto f = st.commit();
+      (void)f.wait_ok();
+      const double wall = std::chrono::duration<double, std::micro>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (std::getenv("VPIPE_FUSED_MOE_WALL") != nullptr) {
+        std::printf("[fused_moe] run %zu/%d: gpu %.1f us, wall %.1f us\n",
+                    ai, what, f.gpu_times().gpu_s * 1e6, wall);
+      }
+      return f.gpu_times().gpu_s * 1e6 / (double)LR;
+    };
+    for (std::size_t ai = 0; ai < arms.size(); ++ai) { (void)run(ai, 0); }
+    double up_b = 0.0, dn_b = 0.0, dmean = 0.0;
+    for (int li = 0; li < LR; ++li) {
+      const double d = (double)distinct[(std::size_t)li];
+      dmean += d / LR;
+      up_b += d * (double)(guw + 2 * gus) + (double)2 * Sh * H +
+              2.0 * Sh * (H / G) * 4 + H + (double)(H / G) * 4;
+      dn_b += d * (double)(dnw + 2 * dns) + (double)H * Sh +
+              (double)H * (Sh / G) * 4;
+    }
+    up_b /= LR;
+    dn_b /= LR;
+    for (std::size_t ai = 0; ai < arms.size(); ++ai) {
+      double best[3] = {1e30, 1e30, 1e30};
+      for (int rep = 0; rep < 4; ++rep) {
+        for (int w = 0; w < 3; ++w) {
+          best[w] = std::min(best[w], run(ai, w));
+        }
+      }
+      std::printf("[fused_moe] %-28s M=%d (%.1f experts a layer): layer "
+                  "%.1f us | up %.1f us %.0f GB/s | down %.1f us %.0f "
+                  "GB/s\n", arms[ai].down.c_str(), M, dmean, best[0],
+                  best[1],
+                  up_b / best[1] / 1e3, best[2], dn_b / best[2] / 1e3);
+    }
+    // The arms' outputs (the last layer's run), against the first.
+    for (std::size_t ai = 1; ai < arms.size(); ++ai) {
+      (void)run(0, 0);
+      (void)run(ai, 0);
+      auto cmp = [&](const SharedBuffer& a, const SharedBuffer& b,
+                     std::size_t n) {
+        const auto* pa = static_cast<const std::uint16_t*>(a.contents());
+        const auto* pb = static_cast<const std::uint16_t*>(b.contents());
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double u = from_bf16_(pa[i]), v = from_bf16_(pb[i]);
+          num += (u - v) * (u - v);
+          den += u * u;
+        }
+        return std::sqrt(num / std::max(den, 1e-30));
+      };
+      const double ra = cmp(outs[0].act, outs[ai].act, (std::size_t)np * I);
+      const double ro = cmp(outs[0].out, outs[ai].out, (std::size_t)M * H);
+      std::printf("[fused_moe] %s vs the qmv loop's, M=%d: act %.2e, out "
+                  "%.2e\n", arms[ai].down.c_str(), M, ra, ro);
+      EXPECT_TRUE(ra < 2e-2 && ro < 2e-2);
+    }
+  }
+}
+
+// A chain of decode / verify hyper-connection blocks (the fused
+// launches, every block's injection pending into the next) at the model's
+// shape -- 4 streams of 2560, R 320 plus 4 injection rows, w8 at `G` --
+// with each block's weights its own, for the bench and the test below.
+namespace {
+
+struct HcfBlocks {
+  static constexpr int S = 4, H = 2560, R = 320, N = R + S, K = S * H;
+  int G = 64;
+  struct Blk {
+    metal_compute::SharedBuffer norm, dw, ds, db, uw, us, ub;
+  };
+  std::vector<Blk> bl;
+  std::uint64_t rs = 0x2545f4914f6cdd1dull;
+  std::uint64_t next64() {
+    rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+    return rs;
+  }
+  void fill_codes(metal_compute::SharedBuffer& b) {
+    auto* p = static_cast<std::uint64_t*>(b.contents());
+    for (std::size_t i = 0; i < b.byte_size() / 8; ++i) { p[i] = next64(); }
+  }
+  void fill_el(metal_compute::SharedBuffer& b, bool bf16, float base,
+               float span) {
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < b.byte_size() / 2; ++i) {
+      const float v = base + span * (float)((next64() >> 40) & 0xffff) /
+                                 65536.0f;
+      p[i] = bf16 ? to_bf16_(v) : to_f16_(v);
+    }
+  }
+  bool make(MetalCompute* mc, int B, int group, bool bf16) {
+    G = group;
+    bl.resize((std::size_t)B);
+    for (Blk& b : bl) {
+      b.norm = mc->make_shared_buffer((std::size_t)K * 4);
+      b.dw = mc->make_shared_buffer((std::size_t)N * K);
+      b.ds = mc->make_shared_buffer((std::size_t)N * (K / G) * 2);
+      b.db = mc->make_shared_buffer((std::size_t)N * (K / G) * 2);
+      b.uw = mc->make_shared_buffer((std::size_t)K * R);
+      b.us = mc->make_shared_buffer((std::size_t)K * (R / G) * 2);
+      b.ub = mc->make_shared_buffer((std::size_t)K * (R / G) * 2);
+      if (b.norm.empty() || b.dw.empty() || b.ub.empty()) { return false; }
+      fill_codes(b.dw);
+      fill_codes(b.uw);
+      // Small steps: the codes are random, so a row's sum stays O(1).
+      fill_el(b.ds, bf16, 1e-4f, 2e-4f);
+      fill_el(b.db, bf16, -1.3e-2f, 1e-3f);
+      fill_el(b.us, bf16, 1e-3f, 2e-3f);
+      fill_el(b.ub, bf16, -0.13f, 1e-2f);
+      auto* nw = static_cast<float*>(b.norm.contents());
+      for (int i = 0; i < K; ++i) {
+        nw[i] = 0.8f + 0.4f * (float)((next64() >> 40) & 0xffff) / 65536.0f;
+      }
+    }
+    return true;
+  }
+  // What a chain writes: the residual, the normed streams, the mixed
+  // input, the down's runs, both injection buffers.
+  struct State {
+    metal_compute::SharedBuffer X, hcn, xmix, parts, inj, inj2, y;
+  };
+  State state(MetalCompute* mc, int n) const {
+    State s;
+    s.X = mc->make_shared_buffer((std::size_t)n * K * 2);
+    s.hcn = mc->make_shared_buffer((std::size_t)n * K * 2);
+    s.xmix = mc->make_shared_buffer((std::size_t)n * H * 2);
+    s.parts = mc->make_shared_buffer((std::size_t)n * 8 * N * 4);
+    s.inj = mc->make_shared_buffer((std::size_t)n * S * 4);
+    s.inj2 = mc->make_shared_buffer((std::size_t)n * S * 4);
+    s.y = mc->make_shared_buffer((std::size_t)n * H * 2);
+    for (auto* b : {&s.hcn, &s.xmix, &s.parts, &s.inj, &s.inj2}) {
+      std::memset(b->contents(), 0, b->byte_size());
+    }
+    return s;
+  }
+  // Block b of a chain at n rows: the pairs launches (the forward's
+  // default) or a row a slice (hc_pre_down_r1 / hc_up_mix_h1). The last
+  // block's mixed input stands in for the sublayer's output.
+  // what: 0 both launches, 1 the norm's alone, 2 the up's alone.
+  void encode(metal_compute::ComputeEncoder& enc,
+              const metal_compute::ComputeLibrary& lib, bool pairs, State& s,
+              int n, int b, int what) const {
+    const Blk& w = bl[(std::size_t)b % bl.size()];
+    const bool alt = (b & 1) != 0;
+    const metal_compute::SharedBuffer& wi = alt ? s.inj2 : s.inj;
+    const metal_compute::SharedBuffer& pi = alt ? s.inj : s.inj2;
+    const int pend = b > 0 ? 1 : 0;
+    const std::string g = G == 32 ? "_g32" : "";
+    const int pm = n <= 2 ? 1 : 2;
+    const float eps = 1e-6f;
+    if (what != 2) {
+      metal_compute::ComputeFunction f = lib.function(
+          pairs ? "hc_pre_half_m" + std::to_string(pm) + g + "_f16"
+                : "hc_pre_down_r1" + g + "_f16");
+      enc.set_function(f);
+      enc.set_buffer(0, s.X); enc.set_buffer(1, s.y);
+      enc.set_buffer(2, pi); enc.set_buffer(3, w.norm);
+      enc.set_buffer(4, s.hcn); enc.set_buffer(5, w.dw);
+      enc.set_buffer(6, w.ds); enc.set_buffer(7, w.db);
+      enc.set_buffer(8, s.parts);
+      enc.set_constant(9, H); enc.set_constant(10, N);
+      enc.set_constant(11, n); enc.set_constant(12, eps);
+      enc.set_constant(13, pend);
+      if (pairs) {
+        enc.dispatch({(unsigned)(256 * ((N + 7) / 8)), 8u,
+                      (unsigned)((n + pm - 1) / pm)}, {256, 1, 1});
+      } else {
+        enc.dispatch({(unsigned)(256 * ((N + 3) / 4)), (unsigned)S,
+                      (unsigned)n}, {256, 1, 1});
+      }
+    }
+    if (what != 1) {
+      const bool up_pairs = pairs && n >= 2;
+      metal_compute::ComputeFunction f = lib.function(
+          up_pairs ? "hc_up_all_m2" + g + "_f16" : "hc_up_mix_h1" + g + "_f16");
+      enc.set_function(f);
+      enc.set_buffer(0, s.parts); enc.set_buffer(1, w.uw);
+      enc.set_buffer(2, w.us); enc.set_buffer(3, w.ub);
+      enc.set_buffer(4, s.hcn); enc.set_buffer(5, s.xmix);
+      enc.set_buffer(6, wi); enc.set_buffer(7, s.X);
+      enc.set_buffer(8, s.y); enc.set_buffer(9, pi);
+      enc.set_constant(10, H); enc.set_constant(11, R);
+      enc.set_constant(12, N); enc.set_constant(13, n);
+      enc.set_constant(14, pend);
+      enc.dispatch({(unsigned)(256 * (H / 8)), 1u,
+                    (unsigned)(up_pairs ? (n + 1) / 2 : n)}, {256, 1, 1});
+    }
+  }
+};
+
+}  // namespace
+
+// THE BLOCK BY HALF RUNS AND ROW PAIRS (hc_pre_half_*, hc_up_all_*) is the
+// row-a-slice block (hc_pre_down_r1, hc_up_mix_h1) BIT FOR BIT: a chain of
+// three blocks (the injection pending from each into the next) at 1, 2,
+// 3, 4, 5 and 8 rows, f16 and bf16, groups 64 and 32 -- the residual, the
+// normed streams, the mixed input, the down's runs and the injection
+// weights all compared whole. A decode keeps its tokens, and a verify's
+// rows (any count) are a decode's.
+TEST(qwen4_exp_kernels, hcf_pairs_are_the_row_kernels)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  int ran = 0;
+  for (const bool bf16 : {false, true}) {
+    auto lib = mc->load_library(bf16 ? "qwen4_hc_bf16" : "qwen4_hc");
+    for (const int group : {64, 32}) {
+      HcfBlocks hb;
+      ASSERT_TRUE(hb.make(mc, 3, group, bf16));
+      for (const int n : {1, 2, 3, 4, 5, 8}) {
+        HcfBlocks::State st[2] = {hb.state(mc, n), hb.state(mc, n)};
+        hb.fill_el(st[0].X, bf16, -1.0f, 2.0f);
+        hb.fill_el(st[0].y, bf16, -0.5f, 1.0f);
+        std::memcpy(st[1].X.contents(), st[0].X.contents(),
+                    st[0].X.byte_size());
+        std::memcpy(st[1].y.contents(), st[0].y.contents(),
+                    st[0].y.byte_size());
+        auto cs = mc->make_command_stream();
+        {
+          metal_compute::ComputeEncoder enc = cs.begin_compute();
+          for (int a = 0; a < 2; ++a) {
+            for (int b = 0; b < 3; ++b) {
+              hb.encode(enc, lib, a == 1, st[a], n, b, 0);
+            }
+          }
+        }
+        ASSERT_TRUE(cs.commit().wait_ok());
+        bool same = true;
+        for (auto m : {&HcfBlocks::State::X, &HcfBlocks::State::hcn,
+                       &HcfBlocks::State::xmix, &HcfBlocks::State::parts,
+                       &HcfBlocks::State::inj, &HcfBlocks::State::inj2}) {
+          same = same && std::memcmp((st[0].*m).contents(),
+                                     (st[1].*m).contents(),
+                                     (st[0].*m).byte_size()) == 0;
+        }
+        // Not vacuous: the chain moved the residual.
+        using U16 = const std::uint16_t;
+        const auto* x0 = static_cast<U16*>(st[0].X.contents());
+        const auto* xm = static_cast<U16*>(st[0].xmix.contents());
+        double ax = 0.0, am = 0.0;
+        for (int i = 0; i < n * HcfBlocks::H; ++i) {
+          am += std::fabs(bf16 ? from_bf16_(xm[i]) : from_f16_(xm[i]));
+          ax += std::fabs(bf16 ? from_bf16_(x0[i]) : from_f16_(x0[i]));
+        }
+        if (!same || am == 0.0) {
+          std::printf("[hcf] %s g%d n=%d: pairs %s the row kernels (|xmix| "
+                      "%.3g, |X| %.3g)\n", bf16 ? "bf16" : "f16", group, n,
+                      same ? "==" : "!=", am, ax);
+        }
+        EXPECT_TRUE(same);
+        EXPECT_TRUE(am > 0.0);
+        ++ran;
+      }
+    }
+  }
+  ASSERT_TRUE(ran == 24);
+}
+
+// THE DECODE STEP'S HYPER-CONNECTION BLOCKS, TIMED (VPIPE_HCF_BENCH=
+// <blocks>, with VPIPE_MC_CMDBUF_SPLIT=0): the two launches a block, a row
+// a slice against half runs and row pairs (the forward's default), over
+// `blocks` blocks' weights (6.9 MB each, cold), each block's injection
+// pending into the next, as a decode's are. First the floor: an empty
+// dependent launch and a cold 3.5 MB read.
+TEST(qwen4_exp_kernels, hcf_bench)
+{
+  const char* env = std::getenv("VPIPE_HCF_BENCH");
+  if (env == nullptr) { return; }
+  const char* split = std::getenv("VPIPE_MC_CMDBUF_SPLIT");
+  if (split == nullptr || std::atoi(split) != 0) {
+    std::printf("[hcf] set VPIPE_MC_CMDBUF_SPLIT=0\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  using metal_compute::ComputeEncoder;
+  using metal_compute::SharedBuffer;
+  const int B = std::max(2, std::atoi(env));
+  HcfBlocks hb;
+  ASSERT_TRUE(hb.make(mc, B, 64, true));
+  auto lib = mc->load_library("qwen4_hc_bf16");
+  auto st = mc->make_command_stream();
+  {
+    auto fe = lib.function("hc_study_empty");
+    auto fr = lib.function("hc_study_read");
+    ASSERT_TRUE(fe.valid() && fr.valid());
+    const std::uint32_t words = (std::uint32_t)((3584u << 10) / 16);
+    SharedBuffer src = mc->make_shared_buffer((std::size_t)B * words * 16);
+    SharedBuffer dst = mc->make_shared_buffer(1 << 20);
+    hb.fill_codes(src);
+    auto time = [&](bool rd) {
+      {
+        ComputeEncoder enc = st.begin_compute();
+        for (int b = 0; b < B; ++b) {
+          if (rd) {
+            enc.set_function(fr);
+            enc.set_buffer(0, src, (std::size_t)b * words * 16);
+            enc.set_buffer(1, dst);
+            enc.set_constant(2, words);
+            enc.dispatch({256u * ((words + 1023u) / 1024u), 1u, 1u},
+                         {256, 1, 1});
+          } else {
+            enc.set_function(fe);
+            enc.set_buffer(0, dst);
+            enc.dispatch({256u * 324u, 1u, 1u}, {256, 1, 1});
+          }
+        }
+      }
+      auto f = st.commit();
+      (void)f.wait_ok();
+      return f.gpu_times().gpu_s * 1e6 / (double)B;
+    };
+    double be = 1e30, br = 1e30;
+    for (int rep = 0; rep < 4; ++rep) {
+      be = std::min(be, time(false));
+      br = std::min(br, time(true));
+    }
+    std::printf("[hcf] floor: an empty dependent launch %.2f us, a 3.5 MB "
+                "read %.2f us (%.0f GB/s)\n", be, br,
+                (double)words * 16 / br / 1e3);
+  }
+  using HB = HcfBlocks;
+  const double wb = (double)HB::N * HB::K + (double)HB::K * HB::R +
+                    4.0 * ((double)HB::N * (HB::K / 64) +
+                           (double)HB::K * (HB::R / 64));
+  for (const int n : {1, 2, 4, 8}) {
+    HcfBlocks::State sts[2] = {hb.state(mc, n), hb.state(mc, n)};
+    hb.fill_el(sts[0].y, true, -0.5f, 1.0f);
+    std::memcpy(sts[1].y.contents(), sts[0].y.contents(),
+                sts[0].y.byte_size());
+    SharedBuffer X0 = mc->make_shared_buffer(sts[0].X.byte_size());
+    hb.fill_el(X0, true, -1.0f, 2.0f);
+    auto run = [&](int arm, int what) {
+      std::memcpy(sts[arm].X.contents(), X0.contents(), X0.byte_size());
+      {
+        ComputeEncoder enc = st.begin_compute();
+        for (int b = 0; b < B; ++b) {
+          hb.encode(enc, lib, arm == 1, sts[arm], n, b, what);
+        }
+      }
+      auto f = st.commit();
+      (void)f.wait_ok();
+      return f.gpu_times().gpu_s * 1e6 / (double)B;
+    };
+    for (int arm = 0; arm < 2; ++arm) { (void)run(arm, 0); }
+    for (int arm = 0; arm < 2; ++arm) {
+      double best[3] = {1e30, 1e30, 1e30};
+      for (int rep = 0; rep < 4; ++rep) {
+        for (int w = 0; w < 3; ++w) {
+          best[w] = std::min(best[w], run(arm, w));
+        }
+      }
+      std::printf("[hcf] %-16s n=%d: block %.1f us (%.0f GB/s of weights) | "
+                  "norm's launch %.1f us | up %.1f us\n",
+                  arm == 0 ? "a row a slice" : "pairs", n, best[0],
+                  wb / best[0] / 1e3, best[1], best[2]);
+    }
+  }
 }

@@ -1530,7 +1530,12 @@ exchanges with its GPU work calls them from a worker of its own while the GPU
 runs on, so `exchange` should block only on the link -- its latency is what
 the GPU waits for when the overlap runs dry. Nothing the host calls may throw:
 an exception is caught and taken as the call's failure (`open` null, the
-run failed).
+run failed). A channel the host lets go unused -- a rank that refuses its clip
+after opening it, so that each clip takes one channel on every rank and the
+ranks stay paired clip for clip -- should make the peers' exchanges of that
+generation fail promptly (close its links, or watch them while a wait runs),
+not at their wait's end; one let go before its links were made may leave a
+peer waiting for them until its own wait or stop.
 
 THE MEMORY a channel is handed is the host's few EXCHANGE BUFFERS, each at the
 same address from its first exchange until the host calls `forget` on it --
@@ -1561,7 +1566,9 @@ fail an exchange still waiting for it.
 
 MiniMax H3 is the first family to run split (shares of dense or affine
 weights, its blocks in row bands, each band's exchanges under the next band's
-work; no VDN or TaoMate yet, and MotionCache off on a rank -- each of its skips
+work; no VDN or TaoMate's streaming yet -- TaoMate's adapter as a LoRA,
+`taomate: off`, binds at the share (feature `"tensor-parallel-taomate-lora/1"`)
+-- and MotionCache off on a rank -- each of its skips
 is judged from that rank's own sums). A rank takes the ANE tier (`ane_ffn`,
 `ane_qkv`, `ane_int8`; feature `"tensor-parallel-ane/1"`): its modules its
 share's widths, staged from its cut projections, and each band's rows split
@@ -1706,6 +1713,45 @@ rest of the ABI does: `TpChannel` and `TpTransport` through
 `query_extension(id)` (null: the host keeps the older behaviour), `TpShare`
 through keys in its `extra` (`genai::tp_extra`: `kMinBandRows`, from a stage's
 bag; `kChannel`, a decode's channel).
+
+## Extension point 5c — far memory for an expert cache
+
+A Mixture of Experts too large for the machine (DeepSeek-V4.1-Flash, a
+Qwen3.x MoE under a small `expert_cache_mb`) keeps its routed experts in
+`generative-models/moe-expert-cache.h`'s cache, refilled from disk on a miss.
+**Far memory** (`generative-models/far-memory.h`) gives that cache a second
+tier: another machine's DRAM, lent over a link. The cache keeps there the
+experts its resident set lets go (a victim tier: the two tiers hold
+different experts), reads a miss held far from there -- and, where the
+model's fill can skip parts, from the link and the disk at once, shared by
+how fast each has been -- and lets the tier go on the first failed call,
+going on from disk.
+
+vpipe moves no bytes between machines: a plugin registers a
+`FarMemoryTransport` by name (`register_far_memory_transport`), and
+text-chat's `far_memory` -- `{"transport": <name>, "params": {...}}`, the
+params passed through unread -- names it (`load_spec::kFarMemory`). The
+transport's `open()` returns a `FarMemory`: its size, and `read` / `write`
+of `FarPiece`s at offsets, called from several threads at once, each call
+whole on return. What lies where is the cache's to decide; the far side
+holds bytes.
+
+Two extensions, asked of the `FarMemory` through `query_extension(id)`
+(PROTOTYPE): **`"far-compute/2"`** -- a `FarCompute` that RUNS experts the
+far side holds, one decode row's activation in and each expert's output row
+back, rounded where the model's own decode kernels round it (THE CONTRACT
+in the header; a far side running vpipe's kernels gives the local rows bit
+for bit, so the model's combine is the local one; DeepSeek-V4.1's FP4
+experts and a GGUF's own blocks, the latter's grids in a `FarGgufTables`
+the model writes into the far memory once; an unknown format a false
+return, after which the model reads those experts) -- and
+**`"far-files/1"`** -- a `FarFiles` reading copies of the model's files off
+the far side's drive. Each lives as long as its `FarMemory`, and grows
+through its own `query_extension`.
+
+**Optional.** Installed since feature `"far-memory/1"`, its functions weak
+imports outside libvpipe: check `far_memory_available()`. It grows through
+`query_extension(id)`, as the tensor-parallel classes do.
 
 ## Extension point 6 — CoreML
 
@@ -2004,7 +2050,10 @@ answers null, so never list it as required) and `"model-sources/1"`
 (`stages/model-source.h` installed, its functions weak imports outside the
 host: the sources' names and labels, the mirror table, `register_mirror_repos`
 for a family's rows; check `model_sources_available()`, or list it as
-required) and `"tensor-parallel/1"` (`generative-models/tensor-parallel.h`
+required) and `"far-memory/1"` (`generative-models/far-memory.h` installed,
+its functions weak imports: `register_far_memory_transport`, another
+machine's memory for an expert cache's far tier -- extension point 5c; check
+`far_memory_available()`) and `"tensor-parallel/1"` (`generative-models/tensor-parallel.h`
 installed, its functions weak imports: `register_tp_transport`, a transport
 for a DiT split across hosts -- extension point 5b; check
 `tp_transports_available()`) and `"tensor-parallel-decode/1"` (vae-decode's

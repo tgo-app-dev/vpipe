@@ -34,6 +34,8 @@
 #include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
 #include "generative-models/chat-template.h"
+#include "generative-models/far-memory.h"
+#include "far-test-kernels.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/lm-memory-limit.h"
 #include "generative-models/lm-run-memory.h"
@@ -3198,9 +3200,12 @@ TEST(deepseek_v41, release_decode_rate)
   if (!ex.valid()) { return; }
   MetalDeepseekV41Model* m = ex.model();
   std::printf("[dsv41] bench: loaded in %.1f s, holds %zu MB, cache %zu MB%s"
-              ", footprint %zu MB\n", sec(tl, Clk::now()),
+              ", footprint %zu MB, handshake %s\n", sec(tl, Clk::now()),
               m->resident_bytes() >> 20, m->expert_cache()->bytes() >> 20,
-              spark ? ", DSpark loaded" : "", footprint_() >> 20);
+              spark ? ", DSpark loaded" : "", footprint_() >> 20,
+              m->handshake()
+                  ? MetalDeepseekV41Model::handshake_library(mc).c_str()
+                  : "off");
   // VPIPE_DSV41_BENCH_PRELOAD=1: every expert read before the first
   // prompt (a steady state, not the cache's warm-up)
   if (!env_("VPIPE_DSV41_BENCH_PRELOAD").empty()) {
@@ -3418,6 +3423,10 @@ TEST(deepseek_v41, release_decode_rate)
                   all_drafted);
     }
     std::printf("\n");
+  }
+  if (m->handshake()) {
+    std::printf("[dsv41] bench: %d forwards redone after a handshake "
+                "given up\n", m->hs_redos());
   }
   if (spark) {
     // what a round cost by its rows, and the drafts' confidence against
@@ -5252,30 +5261,6 @@ TEST(deepseek_v41, decode_kernel_rates)
   }
 }
 
-// A word the GPU writes while this host reads it, as it is now.
-static std::uint32_t
-load_now_(const std::uint32_t& x)
-{
-  return std::atomic_ref<std::uint32_t>(const_cast<std::uint32_t&>(x))
-      .load(std::memory_order_acquire);
-}
-
-// dsv41_handshake_io's checksum of a mailbox's `n` words for round `seq`.
-static std::uint32_t
-hs_sum_(const std::uint32_t* w, std::uint32_t n, std::uint32_t seq)
-{
-  std::uint32_t s = 0;
-  for (std::uint32_t k = 0; k < n; ++k) {
-    const std::uint32_t v = load_now_(w[k]);
-    s += v * (2u * k + 1u) + (v >> 16) * 0x9E3779B9u;
-  }
-  return s + seq * 2654435761u;
-}
-
-// What a running dispatch sees of the host's stores (VPIPE_DSV41_HS_PROBE=1):
-// the answer word on the posted word's cache line or its own, read by a
-// load or an atomic add of 0, with the host writing beside it as it waits
-// (a heartbeat on the posted word's line) or not.
 TEST(deepseek_v41, handshake_visibility_probe)
 {
   using metal_compute::CommandStream;
@@ -5342,145 +5327,6 @@ TEST(deepseek_v41, handshake_visibility_probe)
       }
     }
   }
-}
-
-// The decode's per-layer turn of the host (the expert cache's resolve)
-// rides a handshake inside a running command buffer: the GPU's words reach
-// the host through the mailbox, and the host's answer reaches the
-// dispatches after it, every round. Plain stores both ways are counted
-// too, for the record; nothing relies on them. The rounds go a buffer of
-// 16 at a time, each answered before the next is encoded: a host that
-// encodes far ahead of its answers can block on the queue's buffer limit
-// while the GPU waits for it.
-TEST(deepseek_v41, a_mid_buffer_handshake_carries_data)
-{
-  using metal_compute::CommandStream;
-  using metal_compute::ComputeEncoder;
-  using metal_compute::ComputeFunction;
-  using metal_compute::ComputeLibrary;
-  using metal_compute::SharedBuffer;
-  Session sess;
-  MetalCompute* mc = sess.metal_compute();
-  ASSERT_TRUE(mc != nullptr);
-  if (mc == nullptr) { return; }
-  ComputeLibrary lib = mc->load_library("deepseek_v41_bf16");
-  ComputeFunction fw = lib.function("dsv41_probe_write");
-  ComputeFunction fh = lib.function("dsv41_handshake_io");
-  ComputeFunction fc = lib.function("dsv41_probe_check");
-  ASSERT_TRUE(fw.valid() && fh.valid() && fc.valid());
-  if (!fw.valid() || !fh.valid() || !fc.valid()) { return; }
-  const std::string rv = env_("VPIPE_DSV41_HS_ROUNDS");
-  const unsigned rounds = rv.empty() ? 2000u : (unsigned)std::stoi(rv);
-  const unsigned NO = 3168, NI = 600, chunk = 16;
-  auto words = [&](unsigned n) {
-    SharedBuffer b = mc->make_shared_buffer((std::size_t)n * 4);
-    std::memset(b.contents(), 0, (std::size_t)n * 4);
-    return b;
-  };
-  SharedBuffer f = words(16), src = words(NO), bo = words(NO + 1);
-  SharedBuffer bi = words(NI + 1), dst = words(NI), raw = words(NI);
-  auto* fw32 = static_cast<std::uint32_t*>(f.contents());
-  auto* box = static_cast<const std::uint32_t*>(bo.contents());
-  auto* plain = static_cast<const std::uint32_t*>(src.contents());
-  auto* in = static_cast<std::uint32_t*>(bi.contents());
-  auto* rw = static_cast<std::uint32_t*>(raw.contents());
-  auto word = [&](int k) { return std::atomic_ref<std::uint32_t>(fw32[k]); };
-  unsigned long bad_box = 0, bad_plain = 0, bad_sums = 0;
-  bool lost = false;
-  CommandStream st = mc->make_command_stream();
-  std::string why;
-  {
-    // the model's probe first: a GPU that does not see the host's stores
-    // while a buffer runs (an M4 Pro: only once they leave the CPU's
-    // caches) keeps the handshake off, and is not checked here
-    const auto m = genai::MetalDeepseekV41Model::handshake_works(mc);
-    if (!m) {
-      std::printf("[dsv41] handshake: this GPU does not see host stores "
-                  "mid-buffer; not checked here\n");
-      return;
-    }
-  }
-  const auto t0 = std::chrono::steady_clock::now();
-  for (unsigned r0 = 1; r0 <= rounds && !lost; r0 += chunk) {
-    const unsigned r1 = std::min(rounds, r0 + chunk - 1);
-    ComputeEncoder enc = st.begin_compute();
-    for (unsigned r = r0; r <= r1; ++r) {
-      enc.set_function(fw);
-      enc.set_buffer(0, src);
-      enc.set_constant(1, r);
-      enc.set_constant(2, NO);
-      enc.dispatch({NO, 1, 1}, {256, 1, 1});
-      enc.set_function(fh);
-      enc.set_buffer(0, f);
-      enc.set_buffer(1, src);
-      enc.set_buffer(2, src);
-      enc.set_buffer(3, src);
-      enc.set_buffer(4, bo);
-      enc.set_buffer(5, bi);
-      enc.set_buffer(6, dst);
-      enc.set_buffer(7, dst);
-      enc.set_buffer(8, dst);
-      const std::uint32_t nv[4] = {NO, 0, 0, r};
-      const std::uint32_t mv[4] = {NI, 0, 0, 1u << 24};
-      enc.set_constant_bytes(9, nv, sizeof nv);
-      enc.set_constant_bytes(10, mv, sizeof mv);
-      enc.dispatch({256, 1, 1}, {256, 1, 1});
-      enc.set_function(fc);
-      enc.set_buffer(0, dst);
-      enc.set_buffer(1, raw);
-      enc.set_buffer(2, f);
-      enc.set_constant(3, r);
-      enc.set_constant(4, NI);
-      enc.dispatch({NI, 1, 1}, {256, 1, 1});
-    }
-    enc.end();
-    auto fence = st.commit();
-    for (unsigned r = r0; r <= r1 && !lost; ++r) {
-      const auto ts = std::chrono::steady_clock::now();
-      while (word(0).load(std::memory_order_acquire) < r) {
-        word(3).fetch_add(1, std::memory_order_relaxed);   // heartbeat
-        if (word(2).load(std::memory_order_relaxed) != 0 ||
-            std::chrono::steady_clock::now() - ts > std::chrono::seconds(2)) {
-          lost = true;
-          break;
-        }
-      }
-      if (lost) { break; }
-      // the mailbox once its checksum holds (as the model reads it)
-      const auto tc = std::chrono::steady_clock::now();
-      while (hs_sum_(box, NO, r) != load_now_(box[NO])) {
-        if (std::chrono::steady_clock::now() - tc > std::chrono::seconds(1)) {
-          ++bad_sums;
-          break;
-        }
-      }
-      for (unsigned k = 0; k < NO; ++k) {
-        bad_box += box[k] != r * 4096u + k;
-        bad_plain += plain[k] != r * 4096u + k;
-      }
-      for (unsigned k = 0; k < NI; ++k) {
-        in[k] = r * 7u + k;
-        rw[k] = r * 7u + k;
-      }
-      in[NI] = hs_sum_(in, NI, r);
-      word(1).store(r, std::memory_order_release);
-    }
-    if (lost) {   // let the buffer finish: every later wait passes
-      word(1).store(~0u, std::memory_order_release);
-    }
-    ASSERT_TRUE(fence.wait_ok(&why));
-  }
-  const double us = std::chrono::duration<double, std::micro>(
-                        std::chrono::steady_clock::now() - t0).count();
-  std::printf("[dsv41] handshake: %u rounds, %.1f us a round; mailbox "
-              "%lu / %u bad out (%lu sums), %u bad in; plain %lu bad out, "
-              "%u bad in; %u gave up%s\n",
-              rounds, us / rounds, bad_box, rounds * NO, bad_sums, fw32[5],
-              bad_plain, fw32[6], fw32[2], lost ? " (LOST)" : "");
-  ASSERT_TRUE(!lost);
-  ASSERT_TRUE(fw32[2] == 0);
-  ASSERT_TRUE(bad_box == 0 && bad_sums == 0);
-  ASSERT_TRUE(fw32[5] == 0);
 }
 
 TEST(deepseek_v41, small_model_layers)
@@ -6181,4 +6027,302 @@ TEST(deepseek_v41, wide_model_timing)
   std::printf("[dsv41] run state held %.1f MB, booked %.1f MB\n",
               held / 1048576.0, booked / 1048576.0);
   EXPECT_TRUE(held <= booked && booked <= 1.1 * held + (16 << 20));
+}
+
+// FAR MEMORY AND FAR COMPUTE CHANGE NOTHING: a greedy decode with the
+// expert cache a third of the experts, then with far memory beside it
+// (victims kept there, read back), then with the far side RUNNING the
+// misses it holds (far-compute/2: vpipe's own decode kernels on the far
+// bytes, a row an expert; a commit and wait a layer -- that far side shares
+// this GPU, which a handshake turn's spin would hold), then the same with
+// the HANDSHAKE ON, the far side replaying the rows the third arm recorded
+// (far-test-kernels.h) -- the logits the same to the bit each way, and the
+// far side having run (and replayed) experts. (MUTATION: the put of the
+// far rows dropped, or the rows summed into one pair, as cc05eea2's
+// far-compute/1 did, reads different; the handshake answering the pairs'
+// words short, m.z = 0, gives its turns up -- forwards redone.)
+TEST(deepseek_v41, far_memory_and_compute_change_nothing)
+{
+  using far_test::KernelFar;
+  const std::string gd = env_("VPIPE_DSV41_SMALL_GOLDEN");
+  if (gd.empty()) { return; }
+  const fs::path md = fs::path(gd) / "model";
+  const FlexData meta = read_json_(fs::path(gd) / "meta.json");
+  const std::vector<std::int32_t> ids = ints_(meta, "ids");
+  const std::vector<std::int32_t> dec = ints_(meta, "decode_ids");
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  if (mc == nullptr) { return; }
+  std::size_t ex = 0, rest = 0;
+  ASSERT_TRUE(MetalDeepseekV41ModelExec::expert_bytes(md.string(), &ex,
+                                                      &rest));
+  ::setenv("VPIPE_MOE_EXPERT_AHEAD", "0", 1);
+  auto rec = std::make_shared<far_test::Recording>();
+  std::vector<float> out[4];
+  int ran = 0, replayed = 0, missed = 0;
+  bool hs_on = false;
+  int redos = -1;
+  std::uint64_t far_reads = 0;
+  for (int a = 0; a < 4; ++a) {
+    ::setenv("VPIPE_DSV41_HANDSHAKE", a == 3 ? "1" : "0", 1);
+    const KernelFar::Mode mode = a == 1   ? KernelFar::Mode::kMemory
+                                 : a == 2 ? KernelFar::Mode::kCompute
+                                          : KernelFar::Mode::kReplay;
+    std::shared_ptr<KernelFar> far =
+        a == 0 ? nullptr : std::make_shared<KernelFar>(mc, ex, mode, rec);
+    LmFarMemory scope(far);
+    std::string err;
+    MetalDeepseekV41Model::Options opt;
+    opt.expert_cache_bytes = ex / 3;
+    auto m = MetalDeepseekV41Model::load(WeightSet::open(md.string(), nullptr),
+                                         mc, opt, &err);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { break; }
+    std::vector<float> lg;
+    ASSERT_TRUE(m->forward(1, ids, &lg, false, &err));
+    out[a] = lg;
+    for (std::size_t i = 0; i < 3 * dec.size(); ++i) {
+      const std::int32_t t = argmax_(lg.data(), m->config().vocab);
+      ASSERT_TRUE(m->forward(1, std::vector<std::int32_t>{t}, &lg, false,
+                             &err));
+      out[a].insert(out[a].end(), lg.begin(), lg.end());
+    }
+    if (a == 1) { far_reads = m->expert_cache()->stats().far_reads; }
+    if (a == 2) { ran = far->ran.load(); }
+    if (a == 3) {
+      replayed = far->replayed.load();
+      missed = far->missed.load();
+      hs_on = m->handshake_on();
+      redos = m->hs_redos();
+    }
+  }
+  ::unsetenv("VPIPE_MOE_EXPERT_AHEAD");
+  ::unsetenv("VPIPE_DSV41_HANDSHAKE");
+  std::printf("[dsv41] far: %llu read back; %d run there; %d replayed "
+              "through the handshake (%d not recorded; handshake %s, %d "
+              "forwards redone)\n",
+              (unsigned long long)far_reads, ran, replayed, missed,
+              hs_on ? "on" : "OFF", redos);
+  ASSERT_TRUE(!out[0].empty());
+  for (int a = 1; a < 4; ++a) {
+    ASSERT_TRUE(out[a].size() == out[0].size());
+    EXPECT_TRUE(std::memcmp(out[0].data(), out[a].data(),
+                            out[0].size() * sizeof(float)) == 0);
+  }
+  EXPECT_TRUE(far_reads > 0);
+  EXPECT_TRUE(ran > 0);
+  EXPECT_TRUE(replayed > 0);
+  // ...its turns all taken (a mailbox answered short or stale is a give-up
+  // and a forward redone with commits: right, but not the path tested)
+  EXPECT_TRUE(hs_on && redos == 0);
+}
+
+// BENCH (VPIPE_DSV41_FAR_EXPERT_BENCH=1): what one decode row's routed
+// experts cost run where their weights already are -- the question being
+// whether a machine holding experts should run them and hand back their
+// sum (10 KB each way) rather than hand over the weights (18 MB an
+// expert). A request is timed whole, as a server would see it: the row's
+// activation copied in, k of the release's FP4 experts (V4.1 Flash's
+// widths) run by the decode's own kernels, the command waited on, the k
+// outputs summed on the CPU. The experts are drawn from a pool larger
+// than the GPU's caches (_POOL experts, 256: 4.8 GB), and requests come
+// after an idle gap (_GAPS ms, "0,1,5,20"), as a decode's would.
+TEST(deepseek_v41, far_expert_compute_bench)
+{
+  using metal_compute::CommandStream;
+  using metal_compute::ComputeEncoder;
+  using metal_compute::ComputeFunction;
+  using metal_compute::SharedBuffer;
+  if (env_("VPIPE_DSV41_FAR_EXPERT_BENCH").empty()) {
+    std::printf("[dsv41] far expert bench: set "
+                "VPIPE_DSV41_FAR_EXPERT_BENCH=1\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  if (mc == nullptr) { return; }
+  auto lib = mc->load_library("deepseek_v41_bf16");
+  ComputeFunction fgu = lib.function("dsv41_moe_swiglu_fp4");
+  ComputeFunction fdn = lib.function("dsv41_moe_down_fp4");
+  ASSERT_TRUE(fgu.valid() && fdn.valid());
+  if (!fgu.valid() || !fdn.valid()) { return; }
+  const int H = 5120, I = 2304;
+  const std::string ps = env_("VPIPE_DSV41_FAR_EXPERT_BENCH_POOL");
+  const int pool = ps.empty() ? 256 : std::max(8, std::atoi(ps.c_str()));
+  const std::string rs = env_("VPIPE_DSV41_FAR_EXPERT_BENCH_ROUNDS");
+  const int rounds = rs.empty() ? 300 : std::max(10, std::atoi(rs.c_str()));
+  std::vector<int> gaps = {0, 1, 5, 20};
+  if (const std::string g = env_("VPIPE_DSV41_FAR_EXPERT_BENCH_GAPS");
+      !g.empty()) {
+    gaps.clear();
+    std::stringstream ss(g);
+    for (std::string t; std::getline(ss, t, ',');) {
+      gaps.push_back(std::atoi(t.c_str()));
+    }
+  }
+  // parts: w1 codes [I, H/2], scales [I, H/32]; w3 the same; w2 codes
+  // [H, I/2], scales [H, I/32] -- slot s of part k at s * bytes[k]
+  const std::size_t bytes[6] = {
+      (std::size_t)I * H / 2, (std::size_t)I * H / 32,
+      (std::size_t)I * H / 2, (std::size_t)I * H / 32,
+      (std::size_t)H * I / 2, (std::size_t)H * I / 32};
+  SharedBuffer part[6];
+  std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+  std::size_t total = 0;
+  for (int k = 0; k < 6; ++k) {
+    const std::size_t n = bytes[k] * (std::size_t)pool;
+    part[k] = mc->make_shared_buffer(n);
+    ASSERT_TRUE(part[k].contents() != nullptr);
+    if (part[k].contents() == nullptr) { return; }
+    auto* p = static_cast<std::uint8_t*>(part[k].contents());
+    if (k % 2 == 1) {
+      // E8M0 scales near 1/16: the outputs stay finite
+      for (std::size_t i = 0; i < n; ++i) {
+        p[i] = (std::uint8_t)(120 + (i * 7) % 5);
+      }
+    } else {
+      auto* q = reinterpret_cast<std::uint64_t*>(p);
+      for (std::size_t i = 0; i < n / 8; ++i) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        q[i] = seed;
+      }
+    }
+    total += n;
+  }
+  std::printf("[dsv41] far expert bench: %d experts in the pool (%.1f GB), "
+              "%.1f MB an expert, %d rounds a case\n",
+              pool, total / 1e9,
+              (bytes[0] + bytes[1]) * 3 / 1048576.0, rounds);
+  // resident, as a server's held experts would be
+  const bool resident = mc->residency_set_supported();
+  if (resident) {
+    for (const SharedBuffer& b : part) { mc->residency_add(b); }
+    mc->residency_commit();
+    mc->residency_request();
+  }
+  SharedBuffer xb = mc->make_shared_buffer((std::size_t)H * 2);
+  SharedBuffer act = mc->make_shared_buffer((std::size_t)6 * I * 2);
+  SharedBuffer out = mc->make_shared_buffer((std::size_t)6 * H * 2);
+  SharedBuffer slot = mc->make_shared_buffer(6 * 4);
+  SharedBuffer wt = mc->make_shared_buffer(6 * 4);
+  std::vector<std::uint16_t> x((std::size_t)H);
+  for (int i = 0; i < H; ++i) {
+    const float f = std::sin((float)i * 0.37f) * 0.5f;
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    x[(std::size_t)i] = (std::uint16_t)(u >> 16);
+  }
+  std::vector<float> sum((std::size_t)H);
+  const float lim = 10.0f;
+  using clk = std::chrono::steady_clock;
+  // _WARM_US: through a gap, a small dispatch (one expert's gate|up on
+  // a slot of its own) every so many us -- does a GPU kept busy answer
+  // as one never idle does?
+  const std::string ws = env_("VPIPE_DSV41_FAR_EXPERT_BENCH_WARM_US");
+  const int warm_us = ws.empty() ? 0 : std::atoi(ws.c_str());
+  SharedBuffer wact = mc->make_shared_buffer((std::size_t)I * 2);
+  SharedBuffer wslot = mc->make_shared_buffer(4);
+  SharedBuffer wwt = mc->make_shared_buffer(4);
+  *static_cast<std::int32_t*>(wslot.contents()) = 0;
+  *static_cast<float*>(wwt.contents()) = 1.0f;
+  std::uint32_t pick = 12345u;
+  CommandStream st = mc->make_command_stream();   // one queue, reused
+  for (int gap : gaps) {
+    for (int k : {1, 2, 3, 6}) {
+      std::vector<double> us;
+      us.reserve((std::size_t)rounds);
+      bool ok = true;
+      for (int r = 0; r < rounds + 5 && ok; ++r) {
+        if (gap > 0 && warm_us > 0) {
+          const auto until = clk::now() + std::chrono::milliseconds(gap);
+          while (clk::now() < until) {
+            ComputeEncoder we = st.begin_compute();
+            we.set_function(fgu);
+            for (int b = 0; b < 4; ++b) { we.set_buffer(b, part[b]); }
+            we.set_buffer(4, xb);
+            we.set_buffer(5, wact);
+            we.set_buffer(6, wslot);
+            we.set_buffer(7, wwt);
+            we.set_constant(8, H);
+            we.set_constant(9, I);
+            we.set_constant(10, 1);
+            we.set_constant(11, 10.0f);
+            we.dispatch({32, 64, 1}, {32, 2, 1});   // a few rows only
+            we.end();
+            std::string why;
+            st.commit().wait_ok(&why);
+            std::this_thread::sleep_for(std::chrono::microseconds(warm_us));
+          }
+        } else if (gap > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(gap));
+        }
+        auto* sl = static_cast<std::int32_t*>(slot.contents());
+        auto* w = static_cast<float*>(wt.contents());
+        const auto t0 = clk::now();
+        std::memcpy(xb.contents(), x.data(), x.size() * 2);
+        for (int j = 0; j < k; ++j) {
+          pick = pick * 1664525u + 1013904223u;
+          sl[j] = (std::int32_t)((pick >> 8) % (std::uint32_t)pool);
+          w[j] = 1.0f / (float)k;
+        }
+        ComputeEncoder enc = st.begin_compute();
+        enc.set_function(fgu);
+        for (int b = 0; b < 4; ++b) { enc.set_buffer(b, part[b]); }
+        enc.set_buffer(4, xb);
+        enc.set_buffer(5, act);
+        enc.set_buffer(6, slot);
+        enc.set_buffer(7, wt);
+        enc.set_constant(8, H);
+        enc.set_constant(9, I);
+        enc.set_constant(10, k);
+        enc.set_constant(11, lim);
+        enc.dispatch({32, (unsigned)((I / 4) * 2), (unsigned)k}, {32, 2, 1});
+        enc.set_function(fdn);
+        enc.set_buffer(0, part[4]);
+        enc.set_buffer(1, part[5]);
+        enc.set_buffer(2, act);
+        enc.set_buffer(3, out);
+        enc.set_buffer(4, slot);
+        enc.set_constant(5, I);
+        enc.set_constant(6, H);
+        enc.dispatch({32, (unsigned)((H / 8) * 2), (unsigned)k}, {32, 2, 1});
+        enc.end();
+        std::string why;
+        ok = st.commit().wait_ok(&why);
+        const auto* o = static_cast<const std::uint16_t*>(out.contents());
+        for (int i = 0; i < H; ++i) {
+          float s = 0.0f;
+          for (int j = 0; j < k; ++j) {
+            const std::uint32_t u = (std::uint32_t)o[(std::size_t)j * H + i]
+                                    << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            s += f;
+          }
+          sum[(std::size_t)i] = s;
+        }
+        const double t = std::chrono::duration<double, std::micro>(
+                             clk::now() - t0).count();
+        if (r >= 5) { us.push_back(t); }   // the first few warm the path
+        if (!ok) { std::printf("[dsv41] GPU: %s\n", why.c_str()); }
+      }
+      ASSERT_TRUE(ok);
+      if (!ok) { return; }
+      std::sort(us.begin(), us.end());
+      auto at = [&](double q) {
+        return us[std::min(us.size() - 1, (std::size_t)(q * us.size()))];
+      };
+      bool finite = true;
+      for (float v : sum) { finite = finite && std::isfinite(v); }
+      std::printf("[dsv41] far expert bench: gap %2d ms, %d expert%s: "
+                  "p50 %6.0f us  p90 %6.0f  p99 %6.0f  min %6.0f%s\n",
+                  gap, k, k == 1 ? " " : "s", at(0.5), at(0.9), at(0.99),
+                  us.front(), finite ? "" : "  (non-finite sum)");
+      EXPECT_TRUE(finite);
+    }
+  }
 }

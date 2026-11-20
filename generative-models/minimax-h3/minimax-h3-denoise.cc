@@ -143,10 +143,12 @@ sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
   const std::string& m = out->method;
   if (m == k::kEuler) {
     out->update = StepUpdate::kEuler;
-  } else if (m == k::kDmd || m == "dmd_student" || m == "turbo") {
+  } else if (m == k::kDmd || m == "dmd_student" || m == "turbo" ||
+             m == "lcm") {
     // The DMD student's step is this model's re-noising one: the clean
-    // estimate at each sigma, then fresh noise to the next. The spec's
-    // conditioning_sigma shapes ITS schedule; H3 runs its own.
+    // estimate at each sigma, then fresh noise to the next -- which is
+    // also ComfyUI's "lcm". The spec's conditioning_sigma shapes ITS
+    // schedule; H3 runs its own.
     out->update = StepUpdate::kRenoise;
     if (o.contains(k::kConditioningSigma) &&
         o.at(k::kConditioningSigma).as_real(0.0) != 0.0) {
@@ -283,6 +285,12 @@ denoise(const DenoiseRequest& req, std::string* err)
   if (req.step_heads && req.dit->step_heads() <= 0) {
     return fail("denoise: per-step heads asked for and the DiT has none "
                 "(set_step_heads)");
+  }
+  for (int h : req.step_head_of) {
+    if (h >= req.dit->step_heads()) {
+      return fail(fmt("denoise: output head {} asked for, {} loaded "
+                      "(set_step_heads)", h, req.dit->step_heads())());
+    }
   }
   // A flow map's velocity is its AVERAGE over the jump to the next sigma,
   // so Euler lands where it was trained to; read as an instantaneous
@@ -604,10 +612,12 @@ denoise(const DenoiseRequest& req, std::string* err)
         : vel_form ? "by Euler in its velocity form"
         : refine ? "by the refine's plain Euler"
                  : "by Euler";
+    // kVelocity is the image model's own form (no sampler names it).
     const std::string whose =
-        vel_form && req.step_heads
+        vel_form && (req.step_heads || !req.step_head_of.empty())
             ? std::string("as the checkpoint's per-step heads were "
                           "distilled")
+        : vel_form ? std::string("as the release steps")
         : req.update != StepUpdate::kAuto ? std::string("as the sampler asks")
         : sc != nullptr && renoise
             ? fmt("as {}'s sampling contract asks", sc->release)()
@@ -721,7 +731,11 @@ denoise(const DenoiseRequest& req, std::string* err)
       st.row_timestep_index = &row_idx;
       st.endpoints          = two_time ? &uniq_r : nullptr;
       st.schedule_index     = baked ? i : -1;
-      st.out_head           = req.step_heads ? i : -1;
+      st.out_head           =
+          !req.step_head_of.empty()
+              ? req.step_head_of[std::min<std::size_t>(
+                    (std::size_t)i, req.step_head_of.size() - 1)]
+              : req.step_heads ? i : -1;
       st.dense_attention    = i < req.sol_dense_steps || !sol_probe.empty();
       if (!req.sol_tau_steps.empty()) {
         st.sol_routing = true;

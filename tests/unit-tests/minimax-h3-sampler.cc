@@ -84,6 +84,7 @@ TEST(minimax_h3_sampler, a_spec_names_one_of_its_own_steps)
       {"dmd", StepUpdate::kRenoise, true},
       {"dmd_student", StepUpdate::kRenoise, true},
       {"turbo", StepUpdate::kRenoise, true},
+      {"lcm", StepUpdate::kRenoise, true},
       {"res_multistep", StepUpdate::kResMultistep, true},
       {nullptr, StepUpdate::kEuler, true},     // no method: the spec's euler
       {"heun", StepUpdate::kAuto, false},

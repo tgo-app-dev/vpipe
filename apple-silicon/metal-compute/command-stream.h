@@ -232,6 +232,23 @@ public:
     return ok;
   }
 
+  // The same WITHOUT the wait: commit what `enc` has encoded so far and
+  // reopen it in place, so the GPU runs it while the host encodes on (a
+  // turn of a mid-buffer handshake the host answers later). A failure
+  // latches into the stream (a later Fence::wait_ok reports it). Inline;
+  // false, with nothing committed, on an encoder with no stream or inside
+  // a concurrent_scope.
+  static bool commit_and_reopen(ComputeEncoder& enc)
+  {
+    CommandStream* s = enc._stream;
+    if (s == nullptr || enc._scope_depth != 0) { return false; }
+    const DispatchType dt = enc._dt;
+    enc.end();
+    (void)s->commit();
+    enc = s->begin_compute(dt);
+    return true;
+  }
+
   MTL::CommandQueue* mtl_queue() const noexcept { return _queue; }
 
 private:

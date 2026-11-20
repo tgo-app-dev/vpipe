@@ -2,6 +2,9 @@
 
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/shared/fp8-expand.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/metal-sage-attention.h"
 #include "generative-models/shared/mma-tile.h"
@@ -334,11 +337,28 @@ held_group(int K, int tier)
 }
 
 std::uint64_t
-proj_bytes(int N, int K, int tier)
+proj_bytes(int N, int K, int tier, bool int8)
 {
   const std::uint64_t nk = (std::uint64_t)N * (std::uint64_t)K;
   const int gc = held_group(K, tier);
+  if (int8) {
+    // As stored (codes and an f32 scale a row) -- which is also the token
+    // layout's size -- but for the fast tier's own layout.
+    return tier == 1 && gc > 0
+               ? nk + I8GemmContext::fast_scale_bytes(N, K, gc)
+               : nk + (std::uint64_t)N * 4u;
+  }
   return gc > 0 ? nk + I8GemmContext::fast_scale_bytes(N, K, gc) : nk * 2u;
+}
+
+bool
+convrot_native(int K, int tier, int rot)
+{
+  if (const char* e = std::getenv("VPIPE_RELAYVSR_CONVROT_NATIVE")) {
+    if (std::atoi(e) == 0) { return false; }
+  }
+  return (tier == 2 || tier == 3) && rot == 256 && K % 256 == 0 &&
+         held_group(K, tier) == I8GemmContext::kTokenGroup;
 }
 
 int
@@ -382,18 +402,38 @@ Ops::set_i8(int tier, bool autotune)
 Proj
 Ops::load_proj(WeightSet& ws, const std::string& weight,
                const std::string& bias, int N, int K, const std::string& key,
-               bool hold)
+               bool hold, const fp8::Weight* q, bool cache, std::string* err)
 {
   Proj p;
   p.n = N;
   p.k = K;
   if (!bias.empty()) {
-    p.b = tensor_elt(ws, _mc, bias, _bf16, key);
+    if (cache) {
+      p.b = tensor_elt(ws, _mc, bias, _bf16, key);
+    } else {
+      RawTensor r;
+      if (read_raw(ws, _mc, bias, &r)) { p.b = convert_elt(_mc, r, _bf16); }
+    }
     if (p.b.empty()) { return Proj{}; }
+  }
+  if (q != nullptr) {
+    return load_int8_(ws, weight, std::move(p), key, hold, *q, cache, err);
   }
   const int gc = hold && _i8 && _i8_tier >= 1 ? _i8->fast_group(K) : 0;
   if (gc == 0) {
-    p.w = tensor_elt(ws, _mc, weight, _bf16, key);
+    if (cache) {
+      p.w = tensor_elt(ws, _mc, weight, _bf16, key);
+    } else {
+      const auto* info = ws.src().info(weight);
+      if (info != nullptr && info->dtype == (_bf16 ? "BF16" : "F16")) {
+        p.w = ws.read(weight, _mc, WeightSet::Residency::Copied);
+      } else {
+        RawTensor r;
+        if (read_raw(ws, _mc, weight, &r)) {
+          p.w = convert_elt(_mc, r, _bf16);
+        }
+      }
+    }
     if (p.w.empty() || p.w.byte_size() < (std::size_t)N * K * 2) {
       return Proj{};
     }
@@ -434,6 +474,163 @@ Ops::load_proj(WeightSet& ws, const std::string& weight,
   return p;
 }
 
+Proj
+Ops::load_int8_(WeightSet& ws, const std::string& weight, Proj p,
+                const std::string& key, bool hold, const fp8::Weight& q,
+                bool cache, std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return Proj{};
+  };
+  const int N = p.n, K = p.k;
+  if (q.format != fp8::Format::kI8 || !_bf16 ||
+      (q.rot_group != 0 && K % q.rot_group != 0)) {
+    return fail(fmt("relayvsr: '{}' is an 8-bit weight this model does not "
+                    "run (only ComfyUI's int8, in the bf16 model)", weight)());
+  }
+  if (!_x8) {
+    auto x = std::make_unique<fp8::Expander>();
+    if (!x->load(_mc) || !x->int8_valid()) {
+      return fail("relayvsr: the int8 widening kernels are missing (an older "
+                  "host): ComfyUI's int8 checkpoint cannot run here");
+    }
+    _x8 = std::move(x);
+  }
+  // Its scale, one f32 a row (a tensor-wide one repeated).
+  auto scales = [&]() -> SharedBuffer {
+    std::vector<float> v;
+    std::string se;
+    if (!fp8::read_scale(ws.src(), q, (std::size_t)N, &v, &se) || v.empty()) {
+      return {};
+    }
+    if (v.size() == 1) { v.assign((std::size_t)N, v[0]); }
+    if (v.size() != (std::size_t)N) { return {}; }
+    return upload_f32(_mc, v);
+  };
+  // Read uncached: only the routes that keep the codes as stored keep it
+  // (a derived entry, below); the fast tier's conversion consumes it.
+  SharedBuffer sc = scales();
+  if (sc.empty()) { return fail(fmt("relayvsr: '{}' has no scale", weight)()); }
+  auto kept = [&]() -> SharedBuffer {
+    if (!cache) { return std::move(sc); }
+    return ws.derived(key + "i8-scale/" + weight,
+                      [&]() -> SharedBuffer { return std::move(sc); });
+  };
+  const std::size_t nk = (std::size_t)N * (std::size_t)K;
+  // THE TOKEN TIERS run the codes as they are.
+  if (hold && _i8 && _i8->convrot_available() &&
+      convrot_native(K, _i8_tier, q.rot_group) &&
+      _i8->fast_group(K) == I8GemmContext::kTokenGroup) {
+    p.i8 = ws.tensor(weight, _mc, WeightSet::Residency::Copied);
+    if (p.i8.empty() || p.i8.byte_size() < nk) { return Proj{}; }
+    p.rot = q.rot_group;
+    p.cr = true;
+    p.gc = I8GemmContext::kTokenGroup;
+    p.i8s = kept();
+    if (p.i8s.empty()) { return Proj{}; }
+    p.codes = p.i8.subview(0, p.i8.byte_size());
+    p.scales = p.i8s.subview(0, p.i8s.byte_size());
+    return p;
+  }
+  // A TIER THAT HOLDS ITS OWN LAYOUT (fast; token where the codes are not
+  // its own): the weight widened on the GPU, then quantized into the
+  // layout -- once, into a derived entry; the codes read uncached.
+  const int gc = hold && _i8 && _i8_tier >= 1 ? _i8->fast_group(K) : 0;
+  if (gc != 0) {
+    const std::size_t sb = I8GemmContext::fast_scale_bytes(N, K, gc);
+    MetalCompute* mc = _mc;
+    SharedBuffer both = ws.derived(
+        key + "bf16-i8/" + _i8->layout_tag(gc) + "/" + weight,
+        [&]() -> SharedBuffer {
+          SharedBuffer codes = ws.read(weight, mc,
+                                       WeightSet::Residency::Copied);
+          SharedBuffer f = mc->make_shared_buffer(nk * 2);
+          SharedBuffer out = mc->make_shared_buffer(nk + sb);
+          if (codes.byte_size() < nk || f.empty() || out.empty()) {
+            return {};
+          }
+          fp8::Codes c;
+          c.codes = &codes;
+          c.format = fp8::Format::kI8;
+          c.scale = &sc;
+          c.per_row = true;
+          c.rot_group = q.rot_group;
+          metal_compute::CommandStream st = mc->make_command_stream();
+          bool ok = false;
+          {
+            ComputeEncoder e = st.begin_compute();
+            ok = _x8->encode(e, c, f, (std::size_t)N, (std::size_t)K) &&
+                 _i8->encode_quant_fast(e, f, out.subview(0, nk),
+                                        out.subview(nk, sb), gc, N, K);
+          }
+          return ok && st.commit().wait_ok(nullptr) ? std::move(out)
+                                                    : SharedBuffer{};
+        });
+    if (both.empty()) { return Proj{}; }
+    p.gc = gc;
+    p.codes = both.subview(0, nk);
+    p.scales = both.subview(nk, sb);
+    return p;
+  }
+  // AS STORED, widened right before each GEMM -- into one scratch, sized
+  // at the widest such projection a forward will widen (widen_).
+  p.i8 = cache ? ws.tensor(weight, _mc, WeightSet::Residency::Copied)
+               : ws.read(weight, _mc, WeightSet::Residency::Copied);
+  if (p.i8.empty() || p.i8.byte_size() < nk) { return Proj{}; }
+  p.i8s = kept();
+  if (p.i8s.empty()) { return Proj{}; }
+  p.rot = q.rot_group;
+  if (cache) { _wdeq_max = std::max(_wdeq_max, nk * 2); }
+  return p;
+}
+
+bool
+Ops::widen_(ComputeEncoder& enc, const Proj& p) const
+{
+  if (!_x8 || p.i8.empty() || p.i8s.empty()) { return false; }
+  const std::size_t need = (std::size_t)p.n * (std::size_t)p.k * 2;
+  if (_wdeq.byte_size() < need) {
+    _wdeq = _mc->make_shared_buffer(std::max(need, _wdeq_max));
+    if (_wdeq.empty()) { return false; }
+    ++_n_wdeq_allocs;
+  }
+  fp8::Codes c;
+  c.codes = &p.i8;
+  c.format = fp8::Format::kI8;
+  c.scale = &p.i8s;
+  c.per_row = true;
+  c.rot_group = p.rot;
+  if (!_x8->encode(enc, c, _wdeq, (std::size_t)p.n, (std::size_t)p.k)) {
+    return false;
+  }
+  ++_n_widen;
+  return true;
+}
+
+const SharedBuffer*
+Ops::dense_weight(ComputeEncoder& enc, const Proj& p) const
+{
+  if (p.held()) { return nullptr; }
+  if (p.stored()) { return widen_(enc, p) ? &_wdeq : nullptr; }
+  return &p.w;
+}
+
+std::uint64_t
+Ops::widen_bytes(int tier, bool int8, const std::vector<int>& n,
+                 const std::vector<int>& k)
+{
+  if (!int8) { return 0; }
+  std::uint64_t b = 0;
+  for (std::size_t i = 0; i < n.size() && i < k.size(); ++i) {
+    // A projection no tier holds is widened per GEMM.
+    if (held_group(k[i], tier) == 0 || tier < 1) {
+      b = std::max<std::uint64_t>(b, (std::uint64_t)n[i] * k[i] * 2u);
+    }
+  }
+  return b;
+}
+
 void
 Ops::proj(ComputeEncoder& enc, const SharedBuffer& x, std::size_t x_off,
           const Proj& p, const SharedBuffer& y, std::size_t y_off,
@@ -442,32 +639,50 @@ Ops::proj(ComputeEncoder& enc, const SharedBuffer& x, std::size_t x_off,
   if (M <= 0) { return; }
   const std::size_t xe = x_off / 2, ye = y_off / 2;
   if (p.held()) {
-    if (_i8->gemm_fast(enc, x, xe, p.codes, p.scales, p.gc, p.b, y, ye, M,
-                       p.n, p.k)) {
+    // ComfyUI's ConvRot codes as the token layout: the activation rotated
+    // and quantized alike, then the tier's GEMM over the codes as stored.
+    if (p.cr ? _i8->quantize_token_convrot(enc, x, xe, M, p.k) &&
+                   _i8->gemm_fast_quantized(enc, p.codes, p.scales, p.gc,
+                                            p.b, y, ye, M, p.n, p.k)
+             : _i8->gemm_fast(enc, x, xe, p.codes, p.scales, p.gc, p.b, y,
+                              ye, M, p.n, p.k)) {
       ++_n_i8;
+      if (p.cr) { ++_n_cr; }
       return;
     }
-    const std::size_t need = (std::size_t)p.n * p.k * 2;
-    if (_wdeq.byte_size() < need) { _wdeq = _mc->make_shared_buffer(need); }
-    if (_wdeq.empty() ||
-        !_i8->encode_dequant_fast(enc, p.codes, p.scales, p.gc, _wdeq, p.n,
-                                  p.k)) {
-      return;
+    // Declined (the tier's row floor): widened back to the element type.
+    if (p.cr) {
+      if (!widen_(enc, p)) { return; }
+    } else {
+      const std::size_t need = (std::size_t)p.n * p.k * 2;
+      if (_wdeq.byte_size() < need) { _wdeq = _mc->make_shared_buffer(need); }
+      if (_wdeq.empty() ||
+          !_i8->encode_dequant_fast(enc, p.codes, p.scales, p.gc, _wdeq, p.n,
+                                    p.k)) {
+        return;
+      }
     }
     ++_n_dense;
     gemm(enc, x, x_off, _wdeq, p.b.empty() ? nullptr : &p.b, y, y_off, M,
          p.n, p.k);
     return;
   }
+  // A STORED int8 weight: widened, then whatever an element-type weight
+  // takes -- the accurate tier's per-call quantization, else dense.
+  const SharedBuffer* w = &p.w;
+  if (p.stored()) {
+    if (!widen_(enc, p)) { return; }
+    w = &_wdeq;
+  }
   // The element-type weight: the int8 requant route where the context takes
   // the shape (K >= 1024, on any tier -- a depth a held layout cannot take
   // stays accurate), else the dense GEMM.
-  if (_i8 && _i8->gemm(enc, x, xe, p.w, p.b, y, ye, M, p.n, p.k)) {
+  if (_i8 && _i8->gemm(enc, x, xe, *w, p.b, y, ye, M, p.n, p.k)) {
     ++_n_i8;
     return;
   }
   ++_n_dense;
-  gemm(enc, x, x_off, p.w, p.b.empty() ? nullptr : &p.b, y, y_off, M, p.n,
+  gemm(enc, x, x_off, *w, p.b.empty() ? nullptr : &p.b, y, y_off, M, p.n,
        p.k);
 }
 
@@ -478,14 +693,20 @@ Ops::proj_shared(ComputeEncoder& enc, const SharedBuffer& x,
   bool shared = _i8 != nullptr && outs.size() > 1 && M > 0;
   const int gc = shared ? outs[0].p->gc : 0;
   const int K = shared ? outs[0].p->k : 0;
+  const bool cr = shared && outs[0].p->cr;
   for (const Out& o : outs) {
-    shared = shared && o.p->held() && o.p->gc == gc && o.p->k == K;
+    shared = shared && o.p->held() && o.p->gc == gc && o.p->k == K &&
+             o.p->cr == cr;
   }
-  if (shared && _i8->quantize_fast(enc, x, x_off / 2, M, K, gc)) {
+  // One quantizer for all: the tier's, or -- ComfyUI's ConvRot codes --
+  // the rotated token quantizer they were made for.
+  if (shared && (cr ? _i8->quantize_token_convrot(enc, x, x_off / 2, M, K)
+                    : _i8->quantize_fast(enc, x, x_off / 2, M, K, gc))) {
     for (const Out& o : outs) {
       if (_i8->gemm_fast_quantized(enc, o.p->codes, o.p->scales, gc, o.p->b,
                                    *o.y, o.y_off / 2, M, o.p->n, K)) {
         ++_n_i8;
+        if (cr) { ++_n_cr; }
       } else {
         // Its own route; it quantizes the same rows the same way.
         proj(enc, x, x_off, *o.p, *o.y, o.y_off, M);

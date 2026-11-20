@@ -136,6 +136,12 @@ MetalDeepseekV41ModelExec::expert_bytes(const std::string& model_dir,
     }
     e = std::max(e, widest * per[0].size());
   }
+  // a GGUF's experts in their own blocks: its slabs, not the affine view's
+  if (const std::size_t n =
+          MetalDeepseekV41Model::gguf_native_expert_bytes(model_dir);
+      n > 0) {
+    e = n;
+  }
   if (experts != nullptr) { *experts = e; }
   if (rest != nullptr) { *rest = r; }
   if (vision != nullptr) { *vision = v; }
@@ -403,6 +409,24 @@ MetalDeepseekV41ModelExec::kept_share_(float conf, int at) const
       (std::size_t)bin;
   if (u >= dc.kept.size()) { return (bin + 0.5) / 10.0; }
   return (dc.kept[u] + 2.0 * (bin + 0.5) / 10.0) / (dc.reached[u] + 2.0);
+}
+
+MetalDeepseekV41ModelExec::~MetalDeepseekV41ModelExec()
+{
+  // where DSpark drafted, with the profile's figures (VPIPE_DSV41_PROFILE)
+  const DraftStats& d = _dstats;
+  if (d.drafts == 0 || std::getenv("VPIPE_DSV41_PROFILE") == nullptr) {
+    return;
+  }
+  std::string v;
+  for (std::size_t r = 1; r < d.verifies.size(); ++r) {
+    if (d.verifies[r] == 0) { continue; }
+    v += std::format(" {}:{}x{:.1f}", r, d.verifies[r],
+                     d.verify_ms[r] / (double)d.verifies[r]);
+  }
+  std::fprintf(stderr, "[dsv41] DSpark: %lld drafts, %.2f ms each; verifies "
+               "rows:count x ms%s\n", (long long)d.drafts,
+               d.draft_ms / (double)d.drafts, v.c_str());
 }
 
 bool

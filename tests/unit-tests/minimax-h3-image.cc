@@ -20,6 +20,8 @@
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/krea2/flow-sampler.h"
+#include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-image.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
@@ -36,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <random>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -381,6 +384,132 @@ TEST(minimax_h3_image, dit_matches_reference)
   // A head it does not have is refused.
   st.out_head = 99;
   EXPECT_TRUE(m->forward(st, &err).empty());
+}
+
+// A GRID NOT THE RELEASE'S, through the loop, on two real blocks: step i
+// takes the head DenoiseRequest::step_head_of names (-1 the checkpoint's
+// own), over `step_heads` -- so a map of 0 .. 5 IS the release's per-step
+// heads, a map of -1 IS no heads, and the two differ; and a scheduler's
+// grid (ComfyUI's beta, 8 steps at shift 3, FlowSchedulerSpec) runs as
+// given, with the sampler's update and the interval map the stage builds.
+TEST(minimax_h3_image, a_custom_grid_runs_its_own_heads)
+{
+  const std::string root = env_("VPIPE_MINIMAX_H3_IMAGE_PATH");
+  if (root.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3Transformer::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3Transformer::config_from_json(root, cfg, &err));
+  cfg.n_layers = 2;
+  auto m = MetalMiniMaxH3Transformer::load(root, mc, cfg, false, {});
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  m->set_gemm_route(MetalMiniMaxH3Transformer::GemmRoute::kSteelBm32);
+  h3i::Manifest man;
+  ASSERT_TRUE(h3i::read_manifest(root, &man, &err));
+  ASSERT_TRUE(m->set_step_heads(WeightSet::open(man.heads_file, nullptr),
+                                &err));
+  const int text_rows = 24, lh = 16, lw = 16;
+  const std::vector<int> tags((std::size_t)text_rows, minimax_h3::kTextTag);
+  minimax_h3::PackedLayout L;
+  ASSERT_TRUE(minimax_h3::build_ref2va_packed_sequence(
+      tags, {}, 1, lh, lw, 0, cfg.patch_h, cfg.patch_w,
+      minimax_h3::kAudioChannels, &L));
+  std::mt19937_64 g(11);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> text((std::size_t)text_rows * cfg.text_dim);
+  for (float& x : text) { x = 0.5f * nd(g); }
+  SharedBuffer tb = bf16_buf_(mc, text);
+  const std::size_t nv =
+      (std::size_t)L.video_indices.size() * cfg.video_patch_elems();
+  std::vector<float> x0(nv);
+  for (float& x : x0) { x = nd(g); }
+  const std::vector<float> rel = h3i::grid_as_run(man.sigmas);
+  struct Run {
+    std::vector<float> v;
+    DenoiseReport rep;
+    bool ok = false;
+  };
+  auto run = [&](const std::vector<double>& sig, bool heads,
+                 const std::vector<int>& map, StepUpdate up) {
+    Run r;
+    r.v = x0;
+    DenoiseRequest q;
+    q.dit = m.get();
+    q.layout = &L;
+    q.text = &tb;
+    q.video = r.v.data();
+    q.audio = nullptr;
+    q.video_grid_h = lh / cfg.patch_h;
+    q.video_grid_w = lw / cfg.patch_w;
+    q.num_steps = (int)sig.size() - 1;
+    q.video_sigmas = sig;
+    q.video_shift = 1.0;
+    q.audio_shift = 1.0;
+    q.update = up;
+    q.step_heads = heads;
+    q.step_head_of = map;
+    q.seed = 5;
+    q.report = &r.rep;
+    std::string e;
+    r.ok = denoise(q, &e);
+    if (!r.ok) { std::printf("  denoise: %s\n", e.c_str()); }
+    return r;
+  };
+  const std::vector<double> rg(rel.begin(), rel.end());
+  const auto V = StepUpdate::kVelocity;
+  const Run heads = run(rg, true, {}, V);
+  const Run mapped = run(rg, false, {0, 1, 2, 3, 4, 5}, V);
+  const Run own = run(rg, false, {}, V);
+  const Run own_map = run(rg, true, {-1, -1, -1, -1, -1, -1}, V);
+  ASSERT_TRUE(heads.ok && mapped.ok && own.ok && own_map.ok);
+  // a scheduler's grid: ComfyUI's beta at shift 3 (the stage's default
+  // for this model), 8 steps, each step's head the release step whose
+  // interval holds its sigma
+  FlowSchedulerSpec bs;
+  bs.type = "beta";
+  bs.steps = 8;
+  bs.shift = 3.0;
+  bs.shift_type = "linear";
+  const std::vector<double> beta = bs.sigmas();
+  std::vector<int> imap;
+  for (int i = 0; i + 1 < (int)beta.size(); ++i) {
+    int j = 0;
+    while (j + 1 < man.steps() &&
+           man.sigmas[(std::size_t)j + 1] >= beta[(std::size_t)i]) {
+      ++j;
+    }
+    imap.push_back(j);
+  }
+  const Run b_own = run(beta, false, {}, V);
+  const Run b_int = run(beta, false, imap, V);
+  const Run b_rn = run(beta, false, {}, StepUpdate::kRenoise);
+  ASSERT_TRUE(b_own.ok && b_int.ok && b_rn.ok);
+  bool beta_ran = b_own.rep.video_sigmas.size() == beta.size();
+  for (std::size_t i = 0; beta_ran && i < beta.size(); ++i) {
+    beta_ran = std::fabs(b_own.rep.video_sigmas[i] - beta[i]) < 1e-6;
+  }
+  std::printf("[minimax_h3_image] heads map 0..5 %s the per-step heads; "
+              "map -1 %s no heads; heads vs own %.3e; beta 8 at shift 3 "
+              "ran %zu sigmas%s, interval heads %.3e from own, renoise "
+              "%.3e from velocity Euler\n",
+              mapped.v == heads.v ? "IS" : "is NOT",
+              own_map.v == own.v ? "IS" : "is NOT",
+              rel_f32_(own.v, heads.v), b_own.rep.video_sigmas.size(),
+              beta_ran ? " as given" : " NOT as given",
+              rel_f32_(b_int.v, b_own.v), rel_f32_(b_rn.v, b_own.v));
+  EXPECT_TRUE(mapped.v == heads.v);
+  EXPECT_TRUE(own_map.v == own.v);
+  EXPECT_TRUE(rel_f32_(own.v, heads.v) > 1e-4);
+  EXPECT_TRUE(beta_ran);
+  EXPECT_TRUE(b_own.rep.update == V && b_rn.rep.renoise);
+  EXPECT_TRUE(rel_f32_(b_int.v, b_own.v) > 1e-4);
+  EXPECT_TRUE(rel_f32_(b_rn.v, b_own.v) > 1e-4);
+  // a head it does not have is refused before anything runs
+  const Run bad = run(rg, false, {0, 1, 2, 3, 4, 9}, V);
+  EXPECT_TRUE(!bad.ok);
 }
 
 // THE IMAGE VAE: H3's encoder over one frame, tiled at 256 px with the

@@ -312,6 +312,7 @@ private:
   // Its n-gram table held in memory where it fits (load_spec::
   // kNgramResident; config "ngram_resident").
   bool        _ngram_resident{};
+  FlexData _far_memory;   // far_memory: the expert cache's far tier
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};

@@ -19,11 +19,15 @@ namespace vpipe {
 // The spec is:
 //   { scheduler:"flow_match", type, steps, shift, shift_type, rho }
 // type       -- "simple" (default, the flow-match linspace+shift, token-exact)
-//               | "karras" | "exponential".
+//               | "karras" | "exponential" | "boogu_v1" | ComfyUI's
+//               "normal" | "sgm_uniform" | "beta" | "linear_quadratic"
+//               (genai::FlowSchedulerSpec computes those as comfy/
+//               samplers.py does over a flow model's sigma table).
 // steps      -- denoising steps.
 // shift      -- mu, the flow-matching time-shift strength.
 // shift_type -- "exponential" | "linear".
 // rho        -- karras curvature (default 7).
+// beta_alpha, beta_beta -- beta's distribution (default 0.6 / 0.6).
 //
 // This stage is MODEL-AGNOSTIC: it forwards the user's schedule choice and does
 // not read any model's scheduler config (the generate-image stage owns the
@@ -60,6 +64,8 @@ private:
   std::int64_t _steps = 0;
   double       _shift = 0.0;
   double       _rho = 0.0;
+  double       _beta_alpha = 0.0;
+  double       _beta_beta = 0.0;
   // boogu_v1 only (0 = unset -> the schedule's own default).
   std::int64_t _seq_len = 0;
   double       _base_shift = 0.0;

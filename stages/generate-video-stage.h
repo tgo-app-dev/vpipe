@@ -512,10 +512,27 @@ private:
   // config's sigmas replace the stage's `steps`.
   bool _h3_sampler_flow_said = false;
   bool _h3_sigmas_steps_said = false;
+  // The scheduler port's spec, read for MINIMAX-H3 when one arrived this
+  // run (`_h3_sched_given`): its TYPE over this model's steps at the
+  // schedule shift (h3_sched_sigmas_). Said once a run.
+  genai::FlowSchedulerSpec _h3_sched;
+  bool _h3_sched_given = false;
+  bool _h3_sched_said = false;
+  // Said once a run: MiniMax-H3-Image runs a grid not the release's.
+  bool _h3i_custom_said = false;
   // The step count a MiniMax-H3 clip runs: its model config's `sigmas`
   // set it when they are given (one forward a sigma but the last), else
-  // `steps`. Reads `_model_cfg`, so the plan and the run agree.
+  // `steps`. Reads `_model_cfg`, so the plan and the run agree. On
+  // MiniMax-H3-Image the release's 6, or -- a scheduler wired and
+  // `steps` said -- the larger, which bounds what the port can ask.
   int h3_steps_() const;
+  // A scheduler port's grid on MiniMax-H3: the spec's type (anything but
+  // `simple`, which is the model's own grid) over h3_sched_steps_() at
+  // h3_schedule_shift_(), ComfyUI's way (genai::FlowSchedulerSpec, the
+  // linear shift). Empty when no such type was given.
+  std::vector<double> h3_sched_sigmas_() const;
+  int h3_sched_steps_() const;
+  double h3_schedule_shift_() const;
 
   // The resident family's per-generation parameters, as ITS model layer
   // defines them. Both are held for the same reason the two DiTs are:

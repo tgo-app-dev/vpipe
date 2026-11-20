@@ -2,6 +2,9 @@
 #include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/fp8-layout.h"
 #include "generative-models/shared/fp8.h"
+#include "generative-models/shared/ggml-blocks.h"
+#include "generative-models/shared/gguf-convert.h"
+#include "generative-models/shared/gguf-qwen4exp.h"
 #include "generative-models/shared/nvfp4.h"
 
 #include "generative-models/lm-run-memory.h"
@@ -12,6 +15,8 @@
 #include "generative-models/model-loader.h"
 #include "interfaces/session-services-intf.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/gpu-host-handshake.h"
+#include "generative-models/lm-memory-limit.h"
 #include "generative-models/moe-expert-cache.h"
 #include "generative-models/safetensors-ranges.h"
 #include "generative-models/shared/wired-pool.h"
@@ -29,8 +34,11 @@
 #include "interfaces/session-context-intf.h"
 
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <limits>
@@ -1792,6 +1800,14 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
       m->_fn_hcf_up[a] =
           m->_lib_hc.function("hc_up_mix_h" + w + gs + "_f16");
     }
+    {
+      const std::string gs = cfg.hc_group == 32 ? "_g32" : "";
+      m->_fn_hcf_pre_half[0] =
+          m->_lib_hc.function("hc_pre_half_m1" + gs + "_f16");
+      m->_fn_hcf_pre_half[1] =
+          m->_lib_hc.function("hc_pre_half_m2" + gs + "_f16");
+      m->_fn_hcf_up_all = m->_lib_hc.function("hc_up_all_m2" + gs + "_f16");
+    }
     m->_fn_hc_tile = m->_lib_hc.function("hc_tile_f16");
     m->_fn_hc_attn_prework = m->_lib_hc.function("hc_attn_prework_f16");
     m->_fn_hc_attn_post = m->_lib_hc.function("hc_attn_post_f16");
@@ -1801,6 +1817,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_ple_gate = m->_lib_hc.function("ple_gate_f16");
     m->_fn_ple_conv = m->_lib_hc.function("ple_conv_f16");
     m->_fn_ple_state = m->_lib_hc.function("ple_state_f16");
+    m->_fn_ple_rows_gpu = m->_lib_hc.function("ple_rows_gpu_f16");
+    m->_fn_ple_ids_note = m->_lib_hc.function("ple_ids_note_f16");
     m->_fn_qsa_store = m->_lib_hc.function("qsa_store_f16");
     m->_fn_qsa_pool = m->_lib_hc.function("qsa_pool_f16");
     m->_fn_qsa_query = m->_lib_hc.function("qsa_query_f16");
@@ -1829,6 +1847,8 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_moe_up_fused = m->_lib_qmv.function("affine_moe_up_fused_w5g64");
     m->_fn_moe_down_fused =
         m->_lib_qmv.function("affine_moe_down_fused_w5g64");
+    m->_fn_moe_down_units =
+        m->_lib_qmv.function("affine_moe_down_units_w5g64");
     // The bf16 router's verify rows in one dispatch (the library is the
     // cached one the dense kernels below load).
     m->_fn_hc_dense_gemv_rows = mc->load_library("dense_gemm" + sfx)
@@ -2221,7 +2241,9 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     // _gdn_strided_v. Every GGUF is strided; an all-Q8_0 one is repacked
     // to affine and so is NOT _kquant, which is why this is a separate
     // probe rather than a reuse of the flag above.
-    m->_gdn_strided_v = wts != nullptr && wts->is_gguf();
+    // A hyper-connection model's GGUF converter puts the heads back in
+    // the release's order (gguf-qwen4exp.h): its GDN runs that layout.
+    m->_gdn_strided_v = wts != nullptr && wts->is_gguf() && !cfg.hc();
   }
   // The GDN's q / k normalization: the reference (transformers, fla) is
   // an L2 norm with its eps on the SUM of squares, rsqrt(sum + eps); MLX
@@ -2684,12 +2706,24 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_cfg.expert_cache_bytes =
         (std::size_t)std::max(0LL, std::atoll(e)) << 20;
   }
+  // A GGUF whose routed experts are all formats the native kernels read:
+  // they run from their own blocks, so through the cache whatever its size
+  // (every expert resident where nothing else was asked).
+  const std::size_t asked_cache = m->_cfg.expert_cache_bytes;
+  if (cfg.is_moe() && m->_ws->src().is_gguf() &&
+      gguf_native_experts_(m->_ws->dir(), cfg.n_layers, cfg.hidden,
+                           cfg.moe_inner, &m->_x_types)) {
+    m->_x_native = true;
+    if (m->_cfg.expert_cache_bytes == 0) {
+      m->_cfg.expert_cache_bytes = std::numeric_limits<std::size_t>::max() / 4;
+    }
+  }
   if (m->_cfg.expert_cache_bytes > 0 && cfg.is_moe()) {
     std::string why;
     if (m->_kquant || m->_raw || m->_stream_layers || cfg.calib_stream) {
       why = "this load already streams or converts its layers another way";
-    } else if (m->_fp8_experts || m->_gptq_experts) {
-      // One tensor per expert: nothing more to ask.
+    } else if (m->_fp8_experts || m->_gptq_experts || m->_x_native) {
+      // One tensor per expert, or a GGUF's own blocks: nothing more to ask.
     } else if (m->_dense) {
       why = "a dense (bf16) MoE has no expert-cache layout yet";
     } else if (m->_mixed) {
@@ -2705,8 +2739,10 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
         const int dg = affine_group(p + "down_proj", cfg.moe_inner);
         // A hyper-connection model's experts at 5 or 6 bits, or at group
         // 32, run the kernels that offset a slot in 64 bits.
-        const bool hc_ok = cfg.hc() && gb == db &&
-                           (gb == 4 || gb == 5 || gb == 6 || gb == 8) &&
+        // Gate|up and down may differ there (a GGUF's: gate|up at its
+        // format's width, down at its own): each runs its own kernels.
+        auto w_ok = [](int b) { return b == 4 || b == 5 || b == 6 || b == 8; };
+        const bool hc_ok = cfg.hc() && w_ok(gb) && w_ok(db) &&
                            (gg == 32 || gg == 64);
         if (gb != ub || gg != dg ||
             (((gb != 4 && gb != 8) || (db != 4 && db != 8) || gg != 64) &&
@@ -2727,6 +2763,11 @@ MetalQwenModel::load(std::shared_ptr<WeightSet> ws_in,
       s->warn(fmt("[qwen] routed experts load resident, not cached: {}",
                   why));
     }
+  }
+  // not through the cache after all: converted as before
+  if (m->_x_native && !m->_xstream) {
+    m->_x_native = false;
+    m->_cfg.expert_cache_bytes = asked_cache;
   }
 
   m->_layers.resize(cfg.n_layers);
@@ -4658,6 +4699,95 @@ MetalQwenModel::x_ahead_rows_()
   return rows;
 }
 
+MetalQwenModel::GgufSrc::~GgufSrc()
+{
+  for (int f : fd) { if (f >= 0) { ::close(f); } }
+  for (int f : fd_nc) { if (f >= 0) { ::close(f); } }
+}
+
+bool
+MetalQwenModel::gguf_native_experts_(
+    const std::string& dir, int layers, int H, int I,
+    std::vector<std::array<std::uint32_t, 3>>* types)
+{
+  const char* v = std::getenv("VPIPE_QWEN_GGUF_NATIVE");
+  if (v != nullptr && std::atoi(v) == 0) { return false; }
+  const std::string first = find_gguf_in_dir(dir);
+  if (first.empty()) { return false; }
+  const auto g = GgufFile::open(first);
+  if (!g) { return false; }
+  // the formats ops/ggml_native.h reads
+  auto native = [](std::uint32_t t) {
+    switch (t) {
+      case 8: case 11: case 12: case 13: case 14: case 16: case 17:
+      case 18: case 20: case 21: case 22: case 23: case 29: return true;
+      default: return false;
+    }
+  };
+  static const char* kRole[3] = {"ffn_gate_exps", "ffn_up_exps",
+                                 "ffn_down_exps"};
+  types->clear();
+  // every layer the file has (its MTP head's past the model's own)
+  for (int L = 0; L <= layers; ++L) {
+    std::array<std::uint32_t, 3> ts{};
+    for (int r = 0; r < 3; ++r) {
+      const GgufFile::Tensor* t =
+          g->tensor(fmt("blk.{}.{}.weight", L, kRole[r])());
+      if (t == nullptr) {
+        if (L == layers && r == 0) { return !types->empty(); }
+        return false;
+      }
+      const ggml::Geom geo = ggml::geom(t->type);
+      const std::int64_t K = r < 2 ? H : I;
+      if (!native(t->type) || geo.elems == 0 || K % geo.elems != 0 ||
+          K % 32 != 0) {
+        return false;
+      }
+      ts[(std::size_t)r] = t->type;
+    }
+    types->push_back(ts);
+  }
+  return true;
+}
+
+namespace {
+// The page-aligned staging a cache's reader thread keeps between a GGUF's
+// expert fills, freed when the thread ends (the cache's readers end with
+// it: a raw thread_local leaked it every load).
+struct ExpertStaging {
+  std::array<std::uint8_t*, 3> buf{};
+  std::array<std::size_t, 3> cap{};
+  ~ExpertStaging() { for (std::uint8_t* b : buf) { std::free(b); } }
+};
+}  // namespace
+
+MetalQwenModel::GgufSrc*
+MetalQwenModel::gguf_src_(std::string* err)
+{
+  if (_gguf_src) { return _gguf_src.get(); }
+  auto g = std::make_unique<GgufSrc>();
+  const std::string path = find_gguf_in_dir(_ws->dir());
+  g->g = path.empty() ? std::nullopt : GgufFile::open(path);
+  if (!g->g) {
+    if (err != nullptr) { *err = "the GGUF did not open: " + _ws->dir(); }
+    return nullptr;
+  }
+  for (std::size_t i = 0; i < g->g->file_count(); ++i) {
+    const std::string& f = g->g->file_path((int)i);
+    const int a = ::open(f.c_str(), O_RDONLY);
+    const int b = ::open(f.c_str(), O_RDONLY);
+    g->fd.push_back(a);
+    g->fd_nc.push_back(b);
+    if (a < 0 || b < 0) {
+      if (err != nullptr) { *err = "cannot open " + f; }
+      return nullptr;
+    }
+    ::fcntl(b, F_NOCACHE, 1);
+  }
+  _gguf_src = std::move(g);
+  return _gguf_src.get();
+}
+
 bool
 MetalQwenModel::setup_expert_cache_(std::string* err)
 {
@@ -4677,12 +4807,162 @@ MetalQwenModel::setup_expert_cache_(std::string* err)
   std::vector<std::size_t> parts;
   MoeExpertCache::Fill fill;
   const char* what = "";
-  // Every layout reads through the ranges: an expert's tensors in one read
-  // where they lie together, a stacked tensor's rows as a range.
-  _xranges = SafetensorsRanges::open(_ws->dir(), _ws->src(), err);
-  if (!_xranges) { return false; }
+  // A llama.cpp GGUF: an expert's three slabs read from its files and
+  // converted, exactly, into the affine parts as they fill.
+  const bool gguf = _ws->src().is_gguf();
+  if (!gguf) {
+    // Every layout reads through the ranges: an expert's tensors in one
+    // read where they lie together, a stacked tensor's rows as a range.
+    _xranges = SafetensorsRanges::open(_ws->dir(), _ws->src(), err);
+    if (!_xranges) { return false; }
+  }
   const SafetensorsRanges* rr = _xranges.get();
-  if (_fp8_experts) {
+  if (gguf) {
+    GgufSrc* gs = gguf_src_(err);
+    if (gs == nullptr) { return false; }
+    struct Slab {
+      std::uint32_t type = 0;
+      int fd = -1;
+      std::uint64_t off = 0;
+      std::size_t bytes = 0;
+    };
+    // [layer][gate, up, down]
+    auto slabs = std::make_shared<std::vector<std::array<Slab, 3>>>(nl);
+    const char* role[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    for (int L = 0; L < nl; ++L) {
+      for (int r = 0; r < 3; ++r) {
+        const std::string nm =
+            fmt("blk.{}.{}.weight", L, role[r])();
+        const GgufFile::Tensor* t = gs->g->tensor(nm);
+        const ggml::Geom geo = t != nullptr ? ggml::geom(t->type)
+                                            : ggml::Geom{};
+        const std::int64_t K = r < 2 ? H : I, N = r < 2 ? I : H;
+        if (t == nullptr || t->dims.size() != 3 || t->dims[0] != K ||
+            t->dims[1] != N || t->dims[2] != E || geo.elems == 0) {
+          if (err != nullptr) { *err = nm + ": not a routed-expert stack"; }
+          return false;
+        }
+        Slab& sl = (*slabs)[(std::size_t)L][(std::size_t)r];
+        sl.type = t->type;
+        sl.fd = gs->fd_nc[(std::size_t)t->file];
+        sl.off = t->file_offset;
+        sl.bytes = (std::size_t)(N * (K / geo.elems) * geo.bytes);
+      }
+    }
+    if (_x_native) {
+      // parts: the gate slab, the up slab, the down slab, each as wide as
+      // the widest layer's; each read straight into its part
+      std::size_t w[3] = {0, 0, 0};
+      for (int L = 0; L < nl; ++L) {
+        for (int r = 0; r < 3; ++r) {
+          w[r] = std::max(w[r], (*slabs)[(std::size_t)L][(std::size_t)r].bytes);
+        }
+      }
+      parts = {w[0], w[1], w[2]};
+      for (int r = 0; r < 3; ++r) { _x_cw[r] = (long)w[r]; }
+      what = "GGUF, its own blocks";
+      fill = [slabs](int L, int e, std::uint8_t* const* dst,
+                     std::string* er) {
+        thread_local ExpertStaging stg;
+        std::array<std::uint8_t*, 3>& buf = stg.buf;
+        std::array<std::size_t, 3>& cap = stg.cap;
+        for (int r = 0; r < 3; ++r) {
+          if (dst[r] == nullptr) { continue; }   // the split read's
+          const Slab& sl = (*slabs)[(std::size_t)L][(std::size_t)r];
+          const std::uint64_t at = sl.off + (std::uint64_t)e * sl.bytes;
+          const std::uint64_t a0 = at & ~(std::uint64_t)4095;
+          const std::size_t len = (std::size_t)(
+              ((at + sl.bytes - a0) + 4095) & ~(std::uint64_t)4095);
+          std::uint8_t*& b = buf[(std::size_t)r];
+          if (cap[(std::size_t)r] < len) {
+            std::free(b);
+            b = nullptr;
+            if (posix_memalign(reinterpret_cast<void**>(&b), 16384, len) !=
+                0) {
+              cap[(std::size_t)r] = 0;
+              if (er != nullptr) { *er = "out of memory"; }
+              return false;
+            }
+            cap[(std::size_t)r] = len;
+          }
+          std::size_t got = 0;
+          while (got < len) {
+            const ssize_t k =
+                ::pread(sl.fd, b + got, len - got, (off_t)(a0 + got));
+            if (k <= 0) { break; }
+            got += (std::size_t)k;
+          }
+          if (got < (std::size_t)(at - a0) + sl.bytes) {
+            if (er != nullptr) {
+              *er = fmt("layer {} expert {}: its blocks did not read", L,
+                        e)();
+            }
+            return false;
+          }
+          std::memcpy(dst[r], b + (at - a0), sl.bytes);
+        }
+        return true;
+      };
+    }
+    if (!_x_native) {
+    parts = LayerLoad::affine_expert_parts(I, H, _x_gb, _x_db, _x_group);
+    what = "GGUF";
+    const int gb = _x_gb, db = _x_db;
+    const bool bf16 = c.use_bf16;
+    fill = [slabs, I, H, gb, db, bf16](int L, int e, std::uint8_t* const* dst,
+                                       std::string* er) {
+      // Each slab read whole, the window widened to the page grid so an
+      // uncached read goes straight into the (page-aligned) staging.
+      thread_local ExpertStaging stg;
+      std::array<std::uint8_t*, 3>& buf = stg.buf;
+      std::array<std::size_t, 3>& cap = stg.cap;
+      const std::uint8_t* src[3];
+      for (int r = 0; r < 3; ++r) {
+        const Slab& sl = (*slabs)[(std::size_t)L][(std::size_t)r];
+        const std::uint64_t at = sl.off + (std::uint64_t)e * sl.bytes;
+        const std::uint64_t a0 = at & ~(std::uint64_t)4095;
+        const std::size_t len =
+            (std::size_t)(((at + sl.bytes - a0) + 4095) & ~(std::uint64_t)4095);
+        if (cap[(std::size_t)r] < len) {
+          std::free(buf[(std::size_t)r]);
+          buf[(std::size_t)r] = nullptr;
+          if (posix_memalign(reinterpret_cast<void**>(&buf[(std::size_t)r]),
+                             16384, len) != 0) {
+            cap[(std::size_t)r] = 0;
+            if (er != nullptr) { *er = "out of memory"; }
+            return false;
+          }
+          cap[(std::size_t)r] = len;
+        }
+        std::size_t got = 0;
+        while (got < len) {
+          const ssize_t k = ::pread(sl.fd, buf[(std::size_t)r] + got,
+                                    len - got, (off_t)(a0 + got));
+          if (k <= 0) { break; }
+          got += (std::size_t)k;
+        }
+        if (got < (std::size_t)(at - a0) + sl.bytes) {
+          if (er != nullptr) {
+            *er = fmt("layer {} expert {}: its blocks did not read", L, e)();
+          }
+          return false;
+        }
+        src[r] = buf[(std::size_t)r] + (at - a0);
+      }
+      const auto& sl = (*slabs)[(std::size_t)L];
+      if (qwen4exp_expert_to_affine(sl[0].type, src[0], sl[1].type, src[1],
+                                    sl[2].type, src[2], I, H, gb, db, bf16,
+                                    dst)) {
+        return true;
+      }
+      if (er != nullptr) {
+        *er = fmt("layer {} expert {}: its blocks have no affine form at "
+                  "w{} / w{}", L, e, gb, db)();
+      }
+      return false;
+    };
+    }
+  } else if (_fp8_experts) {
     parts = LayerLoad::fp8_expert_parts(I, H);
     what = "block-FP8";
     fill = [ld, rr, prefix, I, H](int L, int e, std::uint8_t* const* dst,
@@ -4738,21 +5018,57 @@ MetalQwenModel::setup_expert_cache_(std::string* err)
   // The 5-bit expert kernels offset a slot in 64-bit bytes too, as do
   // the 6-bit and group-32 ones (VPIPE_GATHER_*_ANY and the grouped
   // impls) and every fused decode launch.
-  if (_fp8_experts ||
+  if (_fp8_experts || _x_native ||
       (!_gptq_experts && (_x_gb == 5 || _x_gb == 6 || _x_group != 64))) {
     lim = _mc->max_buffer_length();
     if (lim == 0) { lim = (std::size_t)1 << 33; }
   }
   const std::size_t cap = lim / widest;
-  const int total = (int)std::clamp<std::size_t>(want, (std::size_t)E, cap);
+  // (at most every expert resident beside a layer's transient)
+  int total = (int)std::clamp<std::size_t>(
+      std::min(want, (std::size_t)(nl + 1) * (std::size_t)E), (std::size_t)E,
+      cap);
+  // Every expert resident: nothing is read for a step alone (a miss is
+  // admitted while there is room, and once all are in none is missed or
+  // read ahead), so a few spares, not a layer's worth -- 512 slots of a
+  // GGUF's Q5_K_M experts were 2.1 GB held, and unbooked, for nothing
+  // (DeepSeek-V4.1's rule).
+  int transient = E;
+  if ((std::size_t)total >= (std::size_t)(nl + 1) * (std::size_t)E) {
+    transient = std::max(1, c.top_k);
+    total = nl * E + transient;
+  }
   MoeExpertCache::Options o;
   o.layers = nl;
   o.experts = E;
   o.part_bytes = parts;
-  o.transient = E;
-  o.resident = total - E;
+  o.transient = transient;
+  o.resident = total - transient;
   o.threads =
       (int)std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+  // a GGUF's own blocks: a slab a part, a null part not read
+  o.fill_skips_null = _x_native;
+  if (_x_native) {
+    // the native kernels and the grids they read
+    auto lib = _mc->load_library(std::string("qwen_moe_native") +
+                                 (c.use_bf16 ? "_bf16" : ""));
+    _fn_xn_sw = lib.function("qwen_native_gather_swiglu");
+    _fn_xn_dn = lib.function("qwen_native_gather_down");
+    _fn_xn_gs = lib.function("qwen_native_grouped_swiglu");
+    _fn_xn_gd = lib.function("qwen_native_grouped_down");
+    const std::vector<std::uint64_t> t = ggml::gpu_iq_tables_native();
+    _x_native_tab = _mc->make_shared_buffer(t.size() * 8);
+    if (!_fn_xn_sw.valid() || !_fn_xn_dn.valid() || !_fn_xn_gs.valid() ||
+        !_fn_xn_gd.valid() || _x_native_tab.empty()) {
+      if (err != nullptr) { *err = "the native expert kernels did not load"; }
+      return false;
+    }
+    std::memcpy(_x_native_tab.contents(), t.data(), t.size() * 8);
+    if (const SessionContextIntf* ss = _mc->session()) {
+      ss->info(fmt("[qwen] routed experts run in the GGUF's own blocks "
+                   "({} MB a slot)", (slot + (1 << 20) - 1) >> 20));
+    }
+  }
   // READING AHEAD, a decode step at a time: the next layer's router over
   // this layer's input ranks that layer's experts, and the cache reads the
   // likeliest it does not hold while this layer runs -- as many as it
@@ -4765,6 +5081,8 @@ MetalQwenModel::setup_expert_cache_(std::string* err)
   // A hyper-connection model's verify reads ahead for its few rows too.
   o.ahead_rows = c.hc() ? x_ahead_rows_() : 1;
   _x_ahead = *std::max_element(o.ahead_widths.begin(), o.ahead_widths.end());
+  // A far tier (load_spec::kFarMemory) where the experts do not all fit.
+  if (o.resident < nl * E) { o.far = LmFarMemory::current(); }
   _xc = MoeExpertCache::create(_mc, o, std::move(fill), err);
   if (!_xc) { return false; }
   if (_x_ahead > 0) {
@@ -4776,18 +5094,22 @@ MetalQwenModel::setup_expert_cache_(std::string* err)
       return false;
     }
   }
+  (void)setup_handshake_(err);
   if (const SessionContextIntf* s = _mc->session()) {
     const double all = (double)nl * E;
     s->info(fmt("[qwen] routed experts CACHED ({}): {} MB -- {} resident "
                 "slots ({:.1f}% of {} experts), {} spare, {:.2f} MB an "
                 "expert; read from disk on a miss, kept by how often they "
-                "are selected{}", what, _xc->bytes() >> 20, o.resident,
+                "are selected{}; a step's layers hand the cache their picks "
+                "{}", what, _xc->bytes() >> 20, o.resident,
                 100.0 * o.resident / all, (int)all, o.transient,
                 slot / 1048576.0,
                 _x_ahead > 0 ? fmt("; a decode step reads ahead up to "
                                    "the next layer's {} likeliest",
                                    _x_ahead)()
-                             : std::string()));
+                             : std::string(),
+                _xhs_ok ? "inside the running GPU work (the handshake)"
+                        : "at a commit and wait each"));
   }
   return true;
 }
@@ -4919,6 +5241,30 @@ MetalQwenModel::routed_expert_bytes(const MetalLlamaWeights& wts,
 }
 
 std::size_t
+MetalQwenModel::gguf_native_expert_bytes(const std::string& dir,
+                                         const Config& c)
+{
+  if (!c.is_moe()) { return 0; }
+  std::vector<std::array<std::uint32_t, 3>> types;
+  if (!gguf_native_experts_(dir, c.n_layers, c.hidden, c.moe_inner,
+                            &types)) {
+    return 0;
+  }
+  // the slots' parts (the cache's): each slab as wide as the widest
+  // layer's -- gate and up I rows of `hidden`, down `hidden` rows of I
+  std::size_t w[3] = {0, 0, 0};
+  for (const auto& ts : types) {
+    for (int r = 0; r < 3; ++r) {
+      const ggml::Geom g = ggml::geom(ts[(std::size_t)r]);
+      const std::int64_t K = r < 2 ? c.hidden : c.moe_inner;
+      const std::int64_t N = r < 2 ? c.moe_inner : c.hidden;
+      w[r] = std::max(w[r], (std::size_t)(N * (K / g.elems) * g.bytes));
+    }
+  }
+  return (w[0] + w[1] + w[2]) * (std::size_t)c.n_experts * types.size();
+}
+
+std::size_t
 MetalQwenModel::unheld_bytes(const MetalLlamaWeights& wts, const Config& c)
 {
   if (!c.hc()) { return 0; }
@@ -4936,7 +5282,10 @@ std::size_t
 MetalQwenModel::held_growth_bytes(const MetalLlamaWeights& wts,
                                   const Config& c)
 {
-  if (!c.hc()) { return 0; }
+  // A GGUF's converter presents every projection as it is held (w8 at the
+  // model's group, gguf-qwen4exp.h); its shapes are not to be read as a
+  // pack's -- w8 at 32 over 320 inputs is also w4 at 64 over 640.
+  if (!c.hc() || wts.is_gguf()) { return 0; }
   // A projection's input width is one of the model's own: which one the
   // stored codes and scales mean (4-bit at 32 and 2-bit at 64 fill the
   // same shapes) is the candidate among these.
@@ -5009,8 +5358,13 @@ lm_hold_(const SessionContextIntf* session, const std::string& dir,
   for (const std::string& nm : w->tensor_names()) {
     if (const auto* ti = w->info(nm)) { disk += (std::size_t)ti->nbytes; }
   }
-  h.experts = MetalQwenModel::routed_expert_bytes(*w, c);
-  if (h.experts == 0) { return h; }
+  // the view's experts (what its whole is taken down by), and the experts
+  // as held -- a GGUF's in their own blocks, smaller
+  const std::size_t viewed = MetalQwenModel::routed_expert_bytes(*w, c);
+  if (viewed == 0) { return h; }
+  const std::size_t native =
+      w->is_gguf() ? MetalQwenModel::gguf_native_expert_bytes(dir, c) : 0;
+  h.experts = native > 0 ? native : viewed;
   // Beside it: whatever the manager holds or was told is coming, without
   // this checkpoint -- what the plan counts for it, which a host's limit
   // books under its size on disk.
@@ -5039,7 +5393,7 @@ lm_hold_(const SessionContextIntf* session, const std::string& dir,
     h.budget = std::min(h.budget, limit > scratch ? limit - scratch : 0);
   }
   h.unheld = MetalQwenModel::unheld_bytes(*w, c);
-  h.rest = (disk > h.experts + h.unheld ? disk - h.experts - h.unheld : 0) +
+  h.rest = (disk > viewed + h.unheld ? disk - viewed - h.unheld : 0) +
            MetalQwenModel::held_growth_bytes(*w, c);
   h.ok = true;
   return h;
@@ -5573,6 +5927,47 @@ MetalQwenModel::encode_embed_ids_(ComputeEncoder& enc, const SharedBuffer& ids,
 
 void
 MetalQwenModel::encode_decode_step_(
+    ComputeEncoder& enc, ContextId cid, int pos, int rpos,
+    std::size_t page_off, int n_pages,
+    const ContextManager::AppendSlot& slot,
+    const SharedBuffer& pgtab, std::size_t pgtab_off, bool return_hidden,
+    metal_compute::CommandStream* stream)
+{
+  // A cached MoE's step takes the handshake (XhsRun): its linear layers'
+  // state out of place (the ring) and its input row saved, so a step the
+  // GPU gave up a wait in is redone from what it found. Not under a
+  // raw-source stream (a streamed layer commits and waits of its own) or
+  // the category profiler (its duplicated dispatches advance the state).
+  auto body = [&] {
+    encode_decode_step_body_(enc, cid, pos, rpos, page_off, n_pages, slot,
+                             pgtab, pgtab_off, return_hidden, stream);
+  };
+  const bool raw = _rs != nullptr && _rs->streaming && stream != nullptr;
+  XhsRun r;
+  int ring = 0;
+  if (raw || _catprof || !_xhs_ok || _xc == nullptr || _xhs_redo ||
+      (ring = xhs_ring_(*_ctx, cid)) < 0 || !xhs_begin_(r, 1)) {
+    if (ring > 0) { xhs_ring_off_(*_ctx, cid, false); }
+    body();
+    return;
+  }
+  xhs_rows_(enc, _d_x, 1, false);
+  body();
+  if (!xhs_end_(r)) {
+    // every buffer of the step run out, then the step again with commits
+    ++_xhs_redos;
+    std::string why;
+    (void)metal_compute::CommandStream::sync_and_reopen(enc, &why);
+    xhs_rows_(enc, _d_x, 1, true);
+    _xhs_redo = true;
+    body();
+    _xhs_redo = false;
+  }
+  if (ring > 0) { xhs_ring_off_(*_ctx, cid, true); }
+}
+
+void
+MetalQwenModel::encode_decode_step_body_(
     ComputeEncoder& enc, ContextId cid, int pos, int rpos,
     std::size_t page_off, int n_pages,
     const ContextManager::AppendSlot& slot,
@@ -6911,6 +7306,306 @@ MetalQwenModel::qmm_auto_swiglu_(
                (unsigned)(((m + 31) / 32) * 2), 2}, {32, 2, 2});
 }
 
+bool
+MetalQwenModel::setup_handshake_(std::string* /*err*/)
+{
+  // VPIPE_QWEN_HANDSHAKE=0: a commit and wait a layer (an A/B)
+  const char* e = std::getenv("VPIPE_QWEN_HANDSHAKE");
+  if (e != nullptr && std::atoi(e) == 0) { return false; }
+  const std::uint32_t sp = host_handshake::probe(_mc);
+  if (sp == 0 || !_fn_copy.valid()) { return false; }
+  _fn_xhs = _mc->load_library(host_handshake::kLibrary)
+                .function(host_handshake::kIo);
+  const Config& c = _cfg;
+  // out: the picks and the next layer's router logits (two a word); in:
+  // the slots; each with its checksum
+  const std::size_t np = (std::size_t)kXhsRows * c.top_k;
+  const std::size_t na = ((std::size_t)kXhsRows * c.n_experts + 1) / 2;
+  _xhs_f = _mc->make_shared_buffer(host_handshake::kControlBytes);
+  _xhs_bo = _mc->make_shared_buffer((np + na + 1) * 4);
+  _xhs_bi = _mc->make_shared_buffer((np + 1) * 4);
+  _xhs_x0 = _mc->make_shared_buffer((std::size_t)kXhsRows * c.hidden * 2);
+  if (!_fn_xhs.valid() || _xhs_f.empty() || _xhs_bo.empty() ||
+      _xhs_bi.empty() || _xhs_x0.empty()) {
+    return false;
+  }
+  std::memset(_xhs_f.contents(), 0, host_handshake::kControlBytes);
+  _xhs_beat = std::make_unique<host_handshake::Heartbeat>(
+      static_cast<std::uint32_t*>(_xhs_f.contents()));
+  _xhs_spins = sp;
+  _xhs_ok = true;
+  return true;
+}
+
+MetalQwenModel::XhsRun::~XhsRun()
+{
+  if (open && m != nullptr) { m->xhs_abandon_(*this); }
+}
+
+bool
+MetalQwenModel::xhs_begin_(XhsRun& r, int rows)
+{
+  if (!_xhs_ok || _xc == nullptr || _xhs_redo || _xhs_run != nullptr ||
+      rows < 1 || rows > kXhsRows) {
+    return false;
+  }
+  // the GPU reads them from the next commit on
+  auto* hw = static_cast<std::uint32_t*>(_xhs_f.contents());
+  for (int k : {host_handshake::kPosted, host_handshake::kAnswered,
+                host_handshake::kGaveUp, host_handshake::kAcked}) {
+    std::atomic_ref<std::uint32_t>(hw[k]).store(0, std::memory_order_relaxed);
+  }
+  r.m = this;
+  r.open = true;
+  _xhs_run = &r;
+  _xhs_beat->set(true);
+  return true;
+}
+
+void
+MetalQwenModel::xhs_turn_(ComputeEncoder& enc, int Lx, int M, int aw,
+                          const SharedBuffer& eid)
+{
+  const Config& c = _cfg;
+  XhsRun& r = *_xhs_run;
+  const std::uint32_t np = (std::uint32_t)(M * c.top_k);
+  const std::uint32_t na =
+      aw > 0 ? (std::uint32_t)((M * c.n_experts + 1) / 2) : 0u;
+  const std::uint32_t seq = (std::uint32_t)r.turns.size() + 1;
+  // the picks (and the next layer's logits) out, the slots back over the
+  // picks: only the expert kernels read the ids after this
+  enc.set_function(_fn_xhs);
+  enc.set_buffer(0, _xhs_f);
+  enc.set_buffer(1, eid);
+  enc.set_buffer(2, na > 0 ? _x_pred_logits : eid);
+  enc.set_buffer(3, eid);
+  enc.set_buffer(4, _xhs_bo);
+  enc.set_buffer(5, _xhs_bi);
+  enc.set_buffer(6, eid);
+  enc.set_buffer(7, eid);
+  enc.set_buffer(8, eid);
+  const std::uint32_t nv[4] = {np, na, 0u, seq};
+  const std::uint32_t mv[4] = {np, 0u, 0u, _xhs_spins};
+  enc.set_constant_bytes(9, nv, sizeof nv);
+  enc.set_constant_bytes(10, mv, sizeof mv);
+  enc.dispatch({256, 1, 1}, {256, 1, 1});
+  r.turns.push_back({Lx, M, aw, seq});
+  // the layer's buffer goes now; the host answers at most kXhsAhead turns
+  // behind what it has encoded
+  if (!metal_compute::CommandStream::commit_and_reopen(enc)) {
+    // not committed: nothing may wait for it (every wait passes), and the
+    // forward is redone
+    r.lost = true;
+    std::atomic_ref<std::uint32_t>(
+        static_cast<std::uint32_t*>(_xhs_f.contents())
+            [host_handshake::kAnswered])
+        .store(~0u, std::memory_order_release);
+    return;
+  }
+  if (r.turns.size() > kXhsAhead) {
+    xhs_serve_(r, r.turns.size() - kXhsAhead);
+  }
+}
+
+void
+MetalQwenModel::xhs_serve_(XhsRun& r, std::size_t upto)
+{
+  using Clk = std::chrono::steady_clock;
+  const Config& c = _cfg;
+  auto* hw = static_cast<std::uint32_t*>(_xhs_f.contents());
+  auto word = [hw](int k) { return std::atomic_ref<std::uint32_t>(hw[k]); };
+  auto lose = [&] {
+    r.lost = true;
+    word(host_handshake::kAnswered).store(~0u, std::memory_order_release);
+  };
+  while (r.served < upto && !r.lost) {
+    const XhsTurn& t = r.turns[r.served];
+    const auto t0 = Clk::now();
+    while (word(host_handshake::kPosted).load(std::memory_order_acquire) <
+           t.seq) {
+      if (word(host_handshake::kGaveUp).load(std::memory_order_relaxed) !=
+              0 ||
+          Clk::now() - t0 > std::chrono::seconds(30)) {
+        lose();
+        return;
+      }
+    }
+    const bool drop =
+        (int)r.served == _xhs_drop ||
+        (_xhs_drop_every > 0 &&
+         ++_xhs_turns % (std::uint64_t)_xhs_drop_every == 0);
+    if (drop) {
+      // debug: this turn abandoned, as by a host that is gone
+      _xhs_drop = -1;
+      word(host_handshake::kGaveUp).store(1, std::memory_order_relaxed);
+      lose();
+      return;
+    }
+    // the GPU's words, once their checksum holds (they may land after the
+    // post that announces them)
+    const std::uint32_t np = (std::uint32_t)(t.M * c.top_k);
+    const std::uint32_t na =
+        t.aw > 0 ? (std::uint32_t)((t.M * c.n_experts + 1) / 2) : 0u;
+    const auto* bw = static_cast<const std::uint32_t*>(_xhs_bo.contents());
+    const auto t1 = Clk::now();
+    while (host_handshake::sum(bw, np + na, t.seq) !=
+           host_handshake::load_now(bw[np + na])) {
+      if (word(host_handshake::kGaveUp).load(std::memory_order_relaxed) !=
+              0 ||
+          Clk::now() - t1 > std::chrono::seconds(1)) {
+        lose();
+        return;
+      }
+    }
+    auto* bi = static_cast<std::uint32_t*>(_xhs_bi.contents());
+    x_resolve_(t.L, t.M, t.aw, reinterpret_cast<const std::int32_t*>(bw),
+               na > 0 ? reinterpret_cast<const std::uint16_t*>(bw + np)
+                      : nullptr,
+               reinterpret_cast<std::int32_t*>(bi), std::string());
+    bi[np] = host_handshake::sum(bi, np, t.seq);
+    word(host_handshake::kAnswered).store(t.seq, std::memory_order_release);
+    ++r.served;
+  }
+}
+
+bool
+MetalQwenModel::xhs_end_(XhsRun& r)
+{
+  if (!r.open) { return true; }
+  using Clk = std::chrono::steady_clock;
+  auto* hw = static_cast<std::uint32_t*>(_xhs_f.contents());
+  auto word = [hw](int k) { return std::atomic_ref<std::uint32_t>(hw[k]); };
+  xhs_serve_(r, r.turns.size());
+  bool ok = !r.lost;
+  if (ok && !r.turns.empty()) {
+    // the GPU's word that it took the last answer: a give-up before it is
+    // in word kGaveUp by then
+    const std::uint32_t last = r.turns.back().seq;
+    const auto t0 = Clk::now();
+    while (word(host_handshake::kAcked).load(std::memory_order_acquire) <
+           last) {
+      if (word(host_handshake::kGaveUp).load(std::memory_order_relaxed) !=
+              0 ||
+          Clk::now() - t0 > std::chrono::seconds(30)) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  ok = ok &&
+       word(host_handshake::kGaveUp).load(std::memory_order_acquire) == 0;
+  if (!ok) {
+    word(host_handshake::kAnswered).store(~0u, std::memory_order_release);
+  }
+  _xhs_beat->set(false);
+  _xhs_run = nullptr;
+  r.open = false;
+  return ok;
+}
+
+void
+MetalQwenModel::xhs_abandon_(XhsRun& r)
+{
+  std::atomic_ref<std::uint32_t>(
+      static_cast<std::uint32_t*>(_xhs_f.contents())
+          [host_handshake::kAnswered])
+      .store(~0u, std::memory_order_release);
+  _xhs_beat->set(false);
+  if (_xhs_run == &r) { _xhs_run = nullptr; }
+  r.open = false;
+}
+
+int
+MetalQwenModel::xhs_ring_(ContextManager& cx, ContextId cid)
+{
+  for (int L = 0; L < cx.spec().n_layers; ++L) {
+    const SharedBuffer* rd = cx.ssm_read(cid, L);
+    if (rd == nullptr) { continue; }
+    // the first linear layer says it for every one
+    if (rd != cx.ssm_write(cid, L)) { return 0; }
+    if (!cx.gdn_ring_begin(cid, 2)) { return -1; }
+    return cx.ssm_read(cid, L) != cx.ssm_write(cid, L) ? 1 : -1;
+  }
+  return 0;
+}
+
+void
+MetalQwenModel::xhs_ring_off_(ContextManager& cx, ContextId cid, bool keep)
+{
+  if (keep) { cx.gdn_ring_advance(cid); }
+  cx.gdn_ring_end(cid);
+}
+
+void
+MetalQwenModel::xhs_rows_(ComputeEncoder& enc, const SharedBuffer& x,
+                          int rows, bool restore)
+{
+  const int N = rows * _cfg.hidden;
+  enc.set_function(_fn_copy);
+  enc.set_buffer(0, restore ? _xhs_x0 : x);
+  enc.set_buffer(1, restore ? x : _xhs_x0);
+  enc.set_constant(2, 0);
+  enc.set_constant(3, N);
+  enc.dispatch({(unsigned)N, 1, 1}, {256, 1, 1});
+}
+
+void
+MetalQwenModel::x_resolve_(int Lx, int M, int aw, const std::int32_t* ids,
+                           const std::uint16_t* pred, std::int32_t* slots,
+                           std::string why)
+{
+  const Config& c = _cfg;
+  const int E = c.n_experts, np = M * c.top_k;
+  MoeExpertCache::Ahead ah;
+  if (why.empty() && pred != nullptr && aw > 0) {
+    // Rank by logit (the softmax keeps the order): each row's first `aw`,
+    // interleaved, each expert once.
+    std::vector<float> v((std::size_t)E);
+    _x_ord.resize((std::size_t)E);
+    int na = 0;
+    std::vector<std::int32_t> top((std::size_t)M * aw);
+    for (int t = 0; t < M; ++t) {
+      for (int e = 0; e < E; ++e) {
+        const std::uint16_t u = pred[(std::size_t)t * E + (std::size_t)e];
+        if (c.use_bf16) {
+          v[(std::size_t)e] = bf16_to_f32_(u);
+        } else {
+          _Float16 h;
+          std::memcpy(&h, &u, 2);
+          v[(std::size_t)e] = (float)h;
+        }
+      }
+      for (int e = 0; e < E; ++e) { _x_ord[(std::size_t)e] = e; }
+      std::partial_sort(_x_ord.begin(), _x_ord.begin() + aw, _x_ord.end(),
+                        [&](std::int32_t a, std::int32_t b) {
+        return v[(std::size_t)a] > v[(std::size_t)b];
+      });
+      for (int k = 0; k < aw; ++k) {
+        top[(std::size_t)k * M + (std::size_t)t] = _x_ord[(std::size_t)k];
+      }
+    }
+    for (const std::int32_t e : top) {
+      if (std::find(_x_rank.begin(), _x_rank.begin() + na, e) ==
+          _x_rank.begin() + na) {
+        _x_rank[(std::size_t)na++] = e;
+      }
+    }
+    ah = {Lx + 1, _x_rank.data(), na};
+  }
+  if (!why.empty() ||
+      !_xc->resolve(Lx, ids, np, M, slots, &why,
+                    ah.layer >= 0 ? &ah : nullptr)) {
+    if (!_xc_failed) {
+      _xc_failed = true;
+      if (const SessionContextIntf* s = _mc->session()) {
+        s->error(fmt("[qwen] the routed-expert cache failed at layer {}: "
+                     "{} -- this output is wrong", Lx, why));
+      }
+    }
+    std::fill(slots, slots + np, 0);     // in bounds, at least
+  }
+}
+
 // Mixture-of-Experts MLP for M rows (Qwen3.5-MoE). Shared by serial decode
 // (M=1), prefill / multimodal (M=n), and batched multi-branch decode (M=N).
 // hn = post-attention normed hidden [M,H]; x = residual stream [M,H] updated
@@ -6930,6 +7625,11 @@ MetalQwenModel::encode_moe_mlp_(
   // only, so a mixed-width layer takes the pair-batched form -- which serves
   // prefill as well as decode, just without the grouped weight-reuse win.
   if (ly.moe_split) { grp = nullptr; }
+  // A GGUF's own blocks: the pairs one by one, or a prefill's 32-row
+  // sorted tiles (the steel grouping); the small-tile grouping by pair.
+  if (_x_native && grp != nullptr && (!grp->steel || grp->maxm != 32)) {
+    grp = nullptr;
+  }
   auto ifill = [&](const SharedBuffer& b, int val, int nb) {
     enc.set_function(_fn_moe_ifill);
     enc.set_buffer(0, b); enc.set_constant(1, val); enc.set_constant(2, nb);
@@ -7034,59 +7734,24 @@ MetalQwenModel::encode_moe_mlp_(
   // dispatches below bind the cache's pools where a resident model binds
   // the layer's slabs (the same layout, slot for expert), and the grouped
   // sort counts slots.
+  // The turn: inside the running command buffers where the forward took
+  // the handshake (xhs_turn_; a turn carries at most kXhsRows rows, and a
+  // section profile's marks wait anyway), else a commit and wait here.
   if (xs) {
-    std::string why;
-    auto* ids = static_cast<std::int32_t*>(eid.contents());
-    MoeExpertCache::Ahead ah;
-    if (metal_compute::CommandStream::sync_and_reopen(enc, &why) &&
-        nx != nullptr) {
-      // Rank by logit (the softmax keeps the order): each row's first
-      // `aw`, interleaved, each expert once.
-      const auto* lg =
-          static_cast<const std::uint16_t*>(_x_pred_logits.contents());
-      std::vector<float> v((std::size_t)E);
-      _x_ord.resize((std::size_t)E);
-      int na = 0;
-      std::vector<std::int32_t> top((std::size_t)M * aw);
-      for (int t = 0; t < M; ++t) {
-        for (int e = 0; e < E; ++e) {
-          const std::uint16_t u = lg[(std::size_t)t * E + (std::size_t)e];
-          if (c.use_bf16) {
-            v[(std::size_t)e] = bf16_to_f32_(u);
-          } else {
-            _Float16 h;
-            std::memcpy(&h, &u, 2);
-            v[(std::size_t)e] = (float)h;
-          }
-        }
-        for (int e = 0; e < E; ++e) { _x_ord[(std::size_t)e] = e; }
-        std::partial_sort(_x_ord.begin(), _x_ord.begin() + aw, _x_ord.end(),
-                          [&](std::int32_t a, std::int32_t b) {
-          return v[(std::size_t)a] > v[(std::size_t)b];
-        });
-        for (int k = 0; k < aw; ++k) {
-          top[(std::size_t)k * M + (std::size_t)t] = _x_ord[(std::size_t)k];
-        }
-      }
-      for (const std::int32_t e : top) {
-        if (std::find(_x_rank.begin(), _x_rank.begin() + na, e) ==
-            _x_rank.begin() + na) {
-          _x_rank[(std::size_t)na++] = e;
-        }
-      }
-      ah = {Lx + 1, _x_rank.data(), na};
-    }
-    if (!why.empty() ||
-        !_xc->resolve(Lx, ids, np, M, ids, &why,
-                      ah.layer >= 0 ? &ah : nullptr)) {
-      if (!_xc_failed) {
-        _xc_failed = true;
-        if (const SessionContextIntf* s = _mc->session()) {
-          s->error(fmt("[qwen] the routed-expert cache failed at layer {}: "
-                       "{} -- this output is wrong", Lx, why));
-        }
-      }
-      std::fill(ids, ids + np, 0);     // in bounds, at least
+    const int awn = nx != nullptr ? aw : 0;
+    if (_xhs_run != nullptr && M <= kXhsRows && _moe_prof == nullptr) {
+      xhs_turn_(enc, Lx, M, awn, eid);
+    } else {
+      std::string why;
+      auto* ids = static_cast<std::int32_t*>(eid.contents());
+      const bool synced =
+          metal_compute::CommandStream::sync_and_reopen(enc, &why);
+      if (!synced && why.empty()) { why = "the encoder cannot sync"; }
+      x_resolve_(Lx, M, awn, ids,
+                 awn > 0 ? static_cast<const std::uint16_t*>(
+                               _x_pred_logits.contents())
+                         : nullptr,
+                 ids, synced ? std::string() : why);
     }
   }
   // The matrix-core routes (the routed experts' NAX twins, the shared
@@ -7124,10 +7789,14 @@ MetalQwenModel::encode_moe_mlp_(
           ? fused_moe_fns_(ly.eg_bits, ly.e_group, _cfg.hc_group)
           : nullptr;
   if (kMoeFused && _cfg.hc() && M <= 8 && grp == nullptr && !_fp8_experts &&
+      !_x_native &&
       !_dense && !_gptq_experts && !ly.moe_split && fz != nullptr &&
       ly.se_bits == 8 && ly.sd_bits == 8 && !ly.segs.empty() && K <= 15 &&
       H % 8 == 0) {
     const int Y = std::max({2 * I / 8, 2 * Sh / 8, M});
+    // A section profile (VPIPE_QWEN_HC_PROFILE=4): the router and route,
+    // then this launch, then the down launch (a mark reopens the encoder).
+    if (_moe_prof != nullptr) { (*_moe_prof)(0); }
     enc.set_function(*fz->up);
     sb012(XGW, XGS, XGB);
     enc.set_buffer(3, hn); enc.set_buffer(4, act);
@@ -7156,7 +7825,19 @@ MetalQwenModel::encode_moe_mlp_(
     enc.dispatch(px ? LaunchDims{32u * zu, (unsigned)(2 * Y), 1u}
                     : LaunchDims{32u, (unsigned)(2 * Y), zu},
                  {32, 2, 1});
-    enc.set_function(*fz->down);
+    if (_moe_prof != nullptr) { (*_moe_prof)(1); }
+    // The down launch by 32-code units: an expert a simdgroup of eight
+    // rows, every lane busy at the 640-wide rows (the qmv loop left a
+    // quarter-busy second block). M5 Ultra, cold experts: 1 / 4 / 8 rows
+    // 16.6 / 53.5 / 103 us -> 16.6 / 44.3 / 75.6. VPIPE_QWEN_MOE_UNITS=0
+    // keeps the qmv loop (an A/B: other bits).
+    static const bool kUnits = [] {
+      const char* e = std::getenv("VPIPE_QWEN_MOE_UNITS");
+      return e == nullptr || std::atoi(e) != 0;
+    }();
+    const bool units = kUnits && fz->down_units != nullptr &&
+                       I % 32 == 0 && Sh % 32 == 0;
+    enc.set_function(units ? *fz->down_units : *fz->down);
     sb012(XDW, XDS, XDB);
     enc.set_buffer(3, act); enc.set_buffer(4, eid); enc.set_buffer(5, w);
     enc.set_buffer(6, ly.sdw); enc.set_buffer(7, ly.sds);
@@ -7164,13 +7845,36 @@ MetalQwenModel::encode_moe_mlp_(
     enc.set_buffer(10, gate); enc.set_buffer(11, x);
     enc.set_constant(12, I); enc.set_constant(13, H);
     enc.set_constant(14, Sh); enc.set_constant(15, K);
-    const unsigned sg = 2u * (unsigned)(K + 1);
+    const unsigned sg = (units ? 1u : 2u) * (unsigned)(K + 1);
     enc.dispatch(px ? LaunchDims{32u * (unsigned)M, sg * (unsigned)(H / 8), 1u}
                     : LaunchDims{32u, sg * (unsigned)(H / 8), (unsigned)M},
                  {32, sg, 1});
+    if (_moe_prof != nullptr) { (*_moe_prof)(2); }
     return;
   }
-  if (grp == nullptr && _fp8_experts) {
+  const std::array<std::uint32_t, 3> xt =
+      _x_native && (std::size_t)Lx < _x_types.size()
+          ? _x_types[(std::size_t)Lx]
+          : std::array<std::uint32_t, 3>{};
+  if (grp == nullptr && _x_native) {
+    // the pairs from their own blocks: gate | up + SwiGLU, then down
+    enc.set_function(_fn_xn_sw);
+    enc.set_buffer(0, _xc->pool(0)); enc.set_buffer(1, _xc->pool(1));
+    enc.set_buffer(2, _x_native_tab);
+    enc.set_buffer(3, hn); enc.set_buffer(4, act); enc.set_buffer(5, eid);
+    enc.set_constant(6, H); enc.set_constant(7, I); enc.set_constant(8, K);
+    enc.set_constant(9, xt[0]); enc.set_constant(10, xt[1]);
+    enc.set_constant(11, _x_cw[0]); enc.set_constant(12, _x_cw[1]);
+    enc.dispatch({32, (unsigned)(((I + 7) / 8) * 4), (unsigned)np},
+                 {32, 4, 1});
+    enc.set_function(_fn_xn_dn);
+    enc.set_buffer(0, _xc->pool(2)); enc.set_buffer(1, _x_native_tab);
+    enc.set_buffer(2, act); enc.set_buffer(3, part); enc.set_buffer(4, eid);
+    enc.set_constant(5, I); enc.set_constant(6, H); enc.set_constant(7, xt[2]);
+    enc.set_constant(8, _x_cw[2]);
+    enc.dispatch({32, (unsigned)(((H + 7) / 8) * 4), (unsigned)np},
+                 {32, 4, 1});
+  } else if (grp == nullptr && _fp8_experts) {
     // Block-FP8 routed experts: the same pair-batched gather, reading codes
     // + block scales (same grids as the dense twins below).
     enc.set_function(_fn_moe_gather_swiglu_fp8);
@@ -7262,7 +7966,28 @@ MetalQwenModel::encode_moe_mlp_(
       enc.dispatch({(unsigned)np, 1, 1}, {256, 1, 1});
     }
     if (_moe_prof != nullptr) { (*_moe_prof)(0); }
-    if (grp->steel && _fp8_experts) {
+    if (_x_native) {
+      // the sorted 32-row tiles from their own blocks (grp->steel, maxm 32)
+      if (!grp->abl_gemm) {
+        const unsigned tiles = (unsigned)(npad / 32);
+        enc.set_function(_fn_xn_gs);
+        enc.set_buffer(0, _xc->pool(0)); enc.set_buffer(1, _xc->pool(1));
+        enc.set_buffer(2, _x_native_tab);
+        enc.set_buffer(3, hn); enc.set_buffer(4, *grp->gact);
+        enc.set_buffer(5, *grp->srow); enc.set_buffer(6, *grp->t2e);
+        enc.set_constant(7, H); enc.set_constant(8, I);
+        enc.set_constant(9, xt[0]); enc.set_constant(10, xt[1]);
+        enc.set_constant(11, _x_cw[0]); enc.set_constant(12, _x_cw[1]);
+        enc.dispatch({(unsigned)I, tiles * 2, 2}, {32, 2, 2});
+        enc.set_function(_fn_xn_gd);
+        enc.set_buffer(0, _xc->pool(2)); enc.set_buffer(1, _x_native_tab);
+        enc.set_buffer(2, *grp->gact); enc.set_buffer(3, part);
+        enc.set_buffer(4, *grp->sdst); enc.set_buffer(5, *grp->t2e);
+        enc.set_constant(6, I); enc.set_constant(7, H);
+        enc.set_constant(8, xt[2]); enc.set_constant(9, _x_cw[2]);
+        enc.dispatch({(unsigned)H, tiles * 2, 2}, {32, 2, 2});
+      }
+    } else if (grp->steel && _fp8_experts) {
       // The block-FP8 twins: the same sorted tiles, row gather and scatter
       // store, the weight read as codes + block scales.
       if (!grp->abl_gemm) {
@@ -7588,6 +8313,56 @@ MetalQwenModel::encode_batched_step_(
     const std::vector<int>& rope_pos_v,
     int shared_pages, bool head)
 {
+  // A cached MoE's batched step takes the handshake as a decode step does
+  // (encode_decode_step_), every branch's linear-layer state out of place.
+  auto body = [&] {
+    encode_batched_step_body_(enc, bs, cids, slots, page_offs, n_pages_v,
+                              rope_pos_v, shared_pages, head);
+  };
+  const int N = bs.n;
+  XhsRun r;
+  std::vector<int> rings;
+  bool hs = !_catprof && _xhs_ok && _xc != nullptr && !_xhs_redo &&
+            N <= kXhsRows && (int)cids.size() == N;
+  for (std::size_t i = 0; hs && i < cids.size(); ++i) {
+    rings.push_back(xhs_ring_(*_ctx, cids[i]));
+    hs = rings.back() >= 0;
+  }
+  hs = hs && xhs_begin_(r, N);
+  auto rings_off = [&](bool keep) {
+    for (std::size_t i = 0; i < rings.size(); ++i) {
+      if (rings[i] > 0) { xhs_ring_off_(*_ctx, cids[i], keep); }
+    }
+  };
+  if (!hs) {
+    rings_off(false);
+    body();
+    return;
+  }
+  xhs_rows_(enc, bs.x, N, false);
+  body();
+  if (!xhs_end_(r)) {
+    ++_xhs_redos;
+    std::string why;
+    (void)metal_compute::CommandStream::sync_and_reopen(enc, &why);
+    xhs_rows_(enc, bs.x, N, true);
+    _xhs_redo = true;
+    body();
+    _xhs_redo = false;
+  }
+  rings_off(true);
+}
+
+void
+MetalQwenModel::encode_batched_step_body_(
+    ComputeEncoder& enc, BScratch& bs,
+    std::span<const ContextId> cids,
+    const std::vector<ContextManager::AppendSlot>& slots,
+    const std::vector<std::size_t>& page_offs,
+    const std::vector<int>& n_pages_v,
+    const std::vector<int>& rope_pos_v,
+    int shared_pages, bool head)
+{
   KsScopeGuard ks_scope(*this, KsScope::kBatched);
   if (_stream_layers && !stream_decode_ok_()) { return; }
   const Config& c = _cfg;
@@ -7860,7 +8635,11 @@ MetalQwenModel::encode_batched_step_(
       {   // phase A: conv1d + g_beta (mutually independent, per branch)
         auto _g = enc.concurrent_scope(bconc);
         for (int i = 0; i < N; ++i) {
-          const SharedBuffer* cs = _ctx->conv_state(cids[(std::size_t)i], L);
+          // the state through the GDN ring's read / write slots: the
+          // canonical buffer both when the ring is off (in place), apart
+          // under a handshake (encode_batched_step_)
+          const SharedBuffer* cs = _ctx->conv_read(cids[(std::size_t)i], L);
+          const SharedBuffer* cw = _ctx->conv_write(cids[(std::size_t)i], L);
           const std::size_t coff = (std::size_t)i * Cd * 2;
           const std::size_t moff = (std::size_t)i * gdn_in_stride * 2;
           enc.set_function(_fn_gdn_conv1d);
@@ -7869,7 +8648,7 @@ MetalQwenModel::encode_batched_step_(
           enc.set_constant(4, one); enc.set_constant(5, Cd);
           enc.set_constant(6, K); enc.set_constant(7, gdn_in_stride);
           enc.set_constant(8, keyd);
-          enc.set_buffer(9, *cs);          // in-place (no run-ahead ring here)
+          enc.set_buffer(9, *cw);
           enc.dispatch({(unsigned)Cd, 1, 1}, {256, 1, 1});
           enc.set_function(_fn_gdn_g_beta);
           enc.set_buffer(0, bs.abuf, (std::size_t)i * Hv * 2);
@@ -7896,7 +8675,8 @@ MetalQwenModel::encode_batched_step_(
       {   // phase C: ssm step (reads qk-normed conv output + g/beta + ssm state)
         auto _g = enc.concurrent_scope(bconc);
         for (int i = 0; i < N; ++i) {
-          const SharedBuffer* ss = _ctx->ssm_state(cids[(std::size_t)i], L);
+          const SharedBuffer* ss = _ctx->ssm_read(cids[(std::size_t)i], L);
+          const SharedBuffer* sw = _ctx->ssm_write(cids[(std::size_t)i], L);
           const std::size_t coff = (std::size_t)i * Cd * 2;
           enc.set_function(_fn_gdn_step);
           enc.set_buffer(0, bs.convout, coff);
@@ -7906,7 +8686,7 @@ MetalQwenModel::encode_batched_step_(
           enc.set_buffer(4, bs.betabuf, (std::size_t)i * Hv * 4);
           enc.set_buffer(5, *ss);
           enc.set_buffer(6, bs.ygdn, (std::size_t)i * vald * 2);
-          enc.set_buffer(7, *ss);
+          enc.set_buffer(7, *sw);
           enc.set_constant(8, one);
           // strided GQA for a GGUF -- see _gdn_strided_v
           enc.set_constant(9, _gdn_strided_v ? -Hk : Hk);

@@ -233,6 +233,137 @@ kernel void dflash_attn_f16(
 }
 
 // ---------------------------------------------------------------------
+// dflash_attn_f16 split across the keys: a simdgroup walked all `cap`
+// ring slots in turn, each slot's loads waited for -- with a block's few
+// rows only L * Hkv threadgroups, so the latency was the cost (~1.3 ms a
+// layer at cap 2048, 4 rows, M5 Ultra). Here chunk c < P of a row walks
+// ring slots [c * C, c * C + C), chunk P the block's own keys, each with
+// the same online softmax; dflash_attn_comb_f16 merges a row's chunks in
+// order. part[((i * Hq + h) * (P + 1) + c) * (D + 2)]: acc[D] (unscaled
+// by 1 / l), then m, l -- f32.
+//   0:q 1:kb 2:vb 3:kc 4:vc 5:tags 6:part
+//   7:L 8:Hq 9:Hkv 10:D 11:cap 12:p0 13:window 14:causal 15:scale 16:ld
+//   17:C 18:P
+//   threadgroups {L * (P + 1), Hkv}, tg {32, Hq/Hkv}   (D % 32 == 0)
+kernel void dflash_attn_part_f16(
+    const device VPIPE_ELT* q      [[buffer(0)]],
+    const device VPIPE_ELT* kb     [[buffer(1)]],
+    const device VPIPE_ELT* vb     [[buffer(2)]],
+    const device VPIPE_ELT* kc     [[buffer(3)]],
+    const device VPIPE_ELT* vc     [[buffer(4)]],
+    const device int*       tags   [[buffer(5)]],
+    device float*           part   [[buffer(6)]],
+    constant int&           L      [[buffer(7)]],
+    constant int&           Hq     [[buffer(8)]],
+    constant int&           Hkv    [[buffer(9)]],
+    constant int&           D      [[buffer(10)]],
+    constant int&           cap    [[buffer(11)]],
+    constant int&           p0     [[buffer(12)]],
+    constant int&           window [[buffer(13)]],
+    constant int&           causal [[buffer(14)]],
+    constant float&         scale  [[buffer(15)]],
+    constant int&           ld     [[buffer(16)]],
+    constant int&           C      [[buffer(17)]],
+    constant int&           P      [[buffer(18)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int NP = P + 1;
+  const int i = (int)tg.x / NP;
+  const int c = (int)tg.x % NP;
+  const int hk = (int)tg.y;
+  const int G = Hq / Hkv;
+  const int h = hk * G + (int)sg;
+  const int npl = D / 32;              // dims per lane (<= 8)
+  const int d0 = (int)lane * npl;
+  float qv[8], acc[8];
+  const device VPIPE_ELT* qr = q + (size_t)i * ld + (size_t)h * D + d0;
+  for (int j = 0; j < npl; ++j) {
+    qv[j] = (float)qr[j] * scale;
+    acc[j] = 0.0f;
+  }
+  float m = -INFINITY, l = 0.0f;
+  const int qpos = p0 + i;
+  if (c < P) {
+    const int s1 = min(cap, c * C + C);
+    for (int s = c * C; s < s1; ++s) {
+      const int tag = tags[s];
+      if (tag < 0 || tag >= p0) { continue; }
+      if (window > 0 && qpos - tag >= window) { continue; }
+      const size_t off = ((size_t)hk * cap + s) * D + d0;
+      float dot = 0.0f;
+      for (int j = 0; j < npl; ++j) { dot += qv[j] * (float)kc[off + j]; }
+      dot = simd_sum(dot);
+      const float mn = max(m, dot);
+      const float corr = exp(m - mn);
+      const float p = exp(dot - mn);
+      l = l * corr + p;
+      for (int j = 0; j < npl; ++j) {
+        acc[j] = acc[j] * corr + p * (float)vc[off + j];
+      }
+      m = mn;
+    }
+  } else {
+    for (int jb = 0; jb < L; ++jb) {
+      if (causal != 0 && jb > i) { break; }
+      const size_t off = (size_t)jb * ld + (size_t)hk * D + d0;
+      float dot = 0.0f;
+      for (int j = 0; j < npl; ++j) { dot += qv[j] * (float)kb[off + j]; }
+      dot = simd_sum(dot);
+      const float mn = max(m, dot);
+      const float corr = exp(m - mn);
+      const float p = exp(dot - mn);
+      l = l * corr + p;
+      for (int j = 0; j < npl; ++j) {
+        acc[j] = acc[j] * corr + p * (float)vb[off + j];
+      }
+      m = mn;
+    }
+  }
+  device float* pp = part + ((size_t)(i * Hq + h) * NP + c) * (D + 2);
+  for (int j = 0; j < npl; ++j) { pp[d0 + j] = acc[j]; }
+  if (lane == 0) {
+    pp[D] = m;
+    pp[D + 1] = l;
+  }
+}
+
+// A row's chunks merged in chunk order:
+//   out = sum_c e^(m_c - M) acc_c / sum_c e^(m_c - M) l_c.
+//   0:part 1:out 2:Hq 3:D 4:P            threadgroups {L, Hq}, tg {32}
+kernel void dflash_attn_comb_f16(
+    const device float* part [[buffer(0)]],
+    device VPIPE_ELT*   out  [[buffer(1)]],
+    constant int&       Hq   [[buffer(2)]],
+    constant int&       D    [[buffer(3)]],
+    constant int&       P    [[buffer(4)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int i = (int)tg.x, h = (int)tg.y;
+  const int NP = P + 1;
+  const int npl = D / 32;
+  const int d0 = (int)lane * npl;
+  const device float* pr = part + (size_t)(i * Hq + h) * NP * (D + 2);
+  float M = -INFINITY;
+  for (int c = 0; c < NP; ++c) { M = max(M, pr[(size_t)c * (D + 2) + D]); }
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  float l = 0.0f;
+  for (int c = 0; c < NP; ++c) {
+    const device float* pc = pr + (size_t)c * (D + 2);
+    const float mc = pc[D];
+    if (mc == -INFINITY) { continue; }
+    const float w = exp(mc - M);
+    l += w * pc[D + 1];
+    for (int j = 0; j < npl; ++j) { acc[j] += w * pc[d0 + j]; }
+  }
+  const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+  device VPIPE_ELT* o = out + (size_t)i * Hq * D + (size_t)h * D + d0;
+  for (int j = 0; j < npl; ++j) { o[j] = (VPIPE_ELT)(acc[j] * inv); }
+}
+
+// ---------------------------------------------------------------------
 // Top-16 of each logit row, two stages. Order: value descending, then
 // index ascending, so equal logits resolve the same way every run.
 #define DFLASH_TOPK 16
@@ -380,6 +511,8 @@ kernel void dflash_topk_merge_f16(
 //   0:cval[R,16] (f32) 1:cidx[R,16] 2:hp[R,rank] 3:pred_cb[V,rank]
 //   4:succ_cb[V,rank] 5:anchor (int, [0]) 6:out (int)
 //   7:R 8:rank 9:out_off            threadgroups {1}, tg {rank}
+//   10:conf[R] (f32): each position's choice's share of the softmax over
+//   its 16 scores -- what a verify's rows can be chosen by.
 kernel void dflash_select_f16(
     const device float*     cval    [[buffer(0)]],
     const device int*       cidx    [[buffer(1)]],
@@ -391,6 +524,7 @@ kernel void dflash_select_f16(
     constant int&           R       [[buffer(7)]],
     constant int&           rank    [[buffer(8)]],
     constant int&           out_off [[buffer(9)]],
+    device float*           conf    [[buffer(10)]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -427,6 +561,11 @@ kernel void dflash_select_f16(
       const int b = cidx[p * DFLASH_TOPK + best];
       pred_sh[0] = b;
       out[out_off + p] = b;
+      float z = 0.0f;
+      for (int k = 0; k < DFLASH_TOPK; ++k) {
+        z += exp(score[k] - score[best]);
+      }
+      conf[p] = 1.0f / z;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

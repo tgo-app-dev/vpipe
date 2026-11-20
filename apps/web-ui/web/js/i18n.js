@@ -2555,14 +2555,16 @@ const STRINGS = {
   'cfg.diffusion-sampler-select.method': ['',
       '采样方法：euler（默认）| heun | dpmpp_2m | dpmpp_sde | dmd（'
       + 'Boogu-Image Turbo 的少步学生模型：先跳到 x0 再重新加噪；只对 DMD '
-      + '蒸馏过的检查点有意义）| res_multistep（ComfyUI 的：基于上一步的 x0 '
+      + '蒸馏过的检查点有意义；ComfyUI 的 lcm 是同一步，`lcm` 即选它）'
+      + '| res_multistep（ComfyUI 的：基于上一步的 x0 '
       + '做二阶更新，每步一次前向）。heun 与 dpmpp_sde 每步要做两次前向。'
       + 'minimax-h3 运行 euler、dmd（它的重新加噪步）和 res_multistep，其余'
       + '方法会发出警告并改用它的默认值；其他模型族的内置采样器不支持 '
       + 'res_multistep，会改用 euler',
       '取樣方法：euler（預設）| heun | dpmpp_2m | dpmpp_sde | dmd（'
       + 'Boogu-Image Turbo 的少步學生模型：先跳到 x0 再重新加噪；只對 DMD '
-      + '蒸餾過的檢查點有意義）| res_multistep（ComfyUI 的：以上一步的 x0 '
+      + '蒸餾過的檢查點有意義；ComfyUI 的 lcm 是同一步，`lcm` 即選它）'
+      + '| res_multistep（ComfyUI 的：以上一步的 x0 '
       + '做二階更新，每步一次前向）。heun 與 dpmpp_sde 每步要做兩次前向。'
       + 'minimax-h3 執行 euler、dmd（它的重新加噪步）和 res_multistep，其餘'
       + '方法會發出警告並改用它的預設值；其他模型族的內建取樣器不支援 '
@@ -3837,23 +3839,29 @@ const STRINGS = {
   'port.generate-video.sampler': ['',
       '可选的采样器配置 FlexData（diffusion-sampler-select）。由“按配置采样'
       + '”的模型族读取，用来替换它自带的采样器。minimax-h3 自带采样器，会把'
-      + '配置里的 method 映射到它自己的步上：euler（默认）、dmd（在每个 sigma '
-      + '处取 x0，再以新噪声送到下一个 sigma）和 res_multistep，每步都只做一'
-      + '次前向；其他方法会发出警告并改用默认值。它的网格不来自这里，而来自'
-      + '它的 model-config 源（`sigmas`，或 `steps` 加两个 shift）',
+      + '配置里的 method 映射到它自己的步上：euler（默认；MiniMax-H3-Image 为'
+      + '其速度形式）、dmd / lcm（在每个 sigma 处取 x0，再以新噪声送到下一个 '
+      + 'sigma）和 res_multistep，每步都只做一次前向；其他方法会发出警告并改'
+      + '用默认值。它的网格不来自这里：见 scheduler 端口',
       '可選的取樣器組態 FlexData（diffusion-sampler-select）。由「按組態取'
       + '樣」的模型族讀取，用來取代它自帶的取樣器。minimax-h3 自帶取樣器，會'
-      + '把組態裡的 method 對應到它自己的步上：euler（預設）、dmd（在每個 '
-      + 'sigma 處取 x0，再以新雜訊送到下一個 sigma）和 res_multistep，每步都'
-      + '只做一次前向；其他方法會發出警告並改用預設值。它的網格不來自這裡，'
-      + '而來自它的 model-config 來源（`sigmas`，或 `steps` 加兩個 shift）'],
+      + '把組態裡的 method 對應到它自己的步上：euler（預設；MiniMax-H3-Image '
+      + '為其速度形式）、dmd / lcm（在每個 sigma 處取 x0，再以新雜訊送到下一'
+      + '個 sigma）和 res_multistep，每步都只做一次前向；其他方法會發出警告並'
+      + '改用預設值。它的網格不來自這裡：見 scheduler 埠'],
   'port.generate-video.scheduler': ['',
       '可选的噪声计划配置 FlexData（scheduler-select），供按配置采样的模型'
-      + '族使用。对 minimax-h3 无效：它的网格来自 model-config 源的 '
-      + '`sigmas`（视频的，按实际运行的值）或 `steps` 加两个 shift',
+      + '族使用。在 minimax-h3 上，按 ComfyUI 的方式计算它的类型（normal、'
+      + 'sgm_uniform、beta、linear_quadratic、karras、exponential），步数取'
+      + '本阶段的 `steps`，shift 取模型配置的 schedule_shift（默认为模型自己的 '
+      + 'shift），得到按实际运行的视频 sigma；`simple` 即模型自己的网格，模型'
+      + '配置的 `sigmas` 优先于它',
       '可選的雜訊排程組態 FlexData（scheduler-select），供按組態取樣的模型'
-      + '族使用。對 minimax-h3 無效：它的網格來自 model-config 來源的 '
-      + '`sigmas`（影片的，按實際執行的值）或 `steps` 加兩個 shift'],
+      + '族使用。在 minimax-h3 上，按 ComfyUI 的方式計算它的類型（normal、'
+      + 'sgm_uniform、beta、linear_quadratic、karras、exponential），步數取'
+      + '本階段的 `steps`，shift 取模型組態的 schedule_shift（預設為模型自己的 '
+      + 'shift），得到按實際執行的影片 sigma；`simple` 即模型自己的網格，模型'
+      + '組態的 `sigmas` 優先於它'],
   'port.generate-video.ref_latent0': ['',
       '可选的图生视频条件潜变量，来自 vae-encode，采用常驻模型族自身的潜空'
       + '间几何。具体形状取决于该族如何施加条件：可能是片段形状的张量（条件'
@@ -4021,12 +4029,14 @@ const STRINGS = {
   // ---- Scheduler Select (generative) ----
   'stage.scheduler-select.name': ['', '噪声计划表', '雜訊排程器'],
   'stage.scheduler-select.doc': ['',
-      '选择扩散的 sigma 计划（simple | karras | exponential | boogu_v1）以'
+      '选择扩散的 sigma 计划（simple | karras | exponential | boogu_v1 | '
+      + 'normal | sgm_uniform | beta | linear_quadratic）以'
       + '及步数/shift，把配置作为 FlexData 节拍发出，供 generate-image 阶段'
       + '锁存。与模型无关（原样转发用户的选择）；这里的配置项会覆盖 turbo '
       + '默认值。与 diffusion-sampler-select 配套。0 入 / 1 出（只发一次）'
       + '。',
-      '選擇擴散的 sigma 排程（simple | karras | exponential | boogu_v1）以'
+      '選擇擴散的 sigma 排程（simple | karras | exponential | boogu_v1 | '
+      + 'normal | sgm_uniform | beta | linear_quadratic）以'
       + '及步數/shift，把組態作為 FlexData 節拍發出，供 generate-image 階段'
       + '鎖存。與模型無關（原樣轉發使用者的選擇）；這裡的設定項會覆寫 turbo'
       + ' 預設值。與 diffusion-sampler-select 配套。0 入 / 1 出（只發一次）'
@@ -4034,10 +4044,22 @@ const STRINGS = {
   'cfg.scheduler-select.type': ['',
       '计划类型：simple（默认）| karras | exponential | boogu_v1（'
       + 'Boogu-Image 的 logistic 时间偏移；它的 sigma 是递增的——0 是噪声，1'
-      + ' 是干净——因此只适用于 Boogu 的 DiT）',
+      + ' 是干净——因此只适用于 Boogu 的 DiT）| normal | sgm_uniform | beta '
+      + '| linear_quadratic（ComfyUI 的，按它的方式在模型的 sigma 表上以 '
+      + '`shift` 计算：normal 与 sgm_uniform 在时间步上等距，sgm_uniform '
+      + '比最小值少一个点；beta 按 Beta(beta_alpha, beta_beta) 分位数放置，'
+      + '两端步数更多，步数很多时会去掉重复点；linear_quadratic 是 Mochi '
+      + '的，不受 shift 影响）。在 minimax-h3 上，除 simple 外的类型都按模型'
+      + '配置的 schedule shift、以 generate-video 的步数计算',
       '排程類型：simple（預設）| karras | exponential | boogu_v1（'
       + 'Boogu-Image 的 logistic 時間偏移；它的 sigma 是遞增的——0 是雜訊，1'
-      + ' 是乾淨——因此只適用於 Boogu 的 DiT）'],
+      + ' 是乾淨——因此只適用於 Boogu 的 DiT）| normal | sgm_uniform | beta '
+      + '| linear_quadratic（ComfyUI 的，按它的方式在模型的 sigma 表上以 '
+      + '`shift` 計算：normal 與 sgm_uniform 在時間步上等距，sgm_uniform '
+      + '比最小值少一個點；beta 按 Beta(beta_alpha, beta_beta) 分位數放置，'
+      + '兩端步數更多，步數很多時會去掉重複點；linear_quadratic 是 Mochi '
+      + '的，不受 shift 影響）。在 minimax-h3 上，除 simple 外的類型都按模型'
+      + '組態的 schedule shift、以 generate-video 的步數計算'],
   'cfg.scheduler-select.steps': ['',
       '覆盖去噪步数（默认 8）',
       '覆寫去噪步數（預設 8）'],
@@ -4050,6 +4072,14 @@ const STRINGS = {
   'cfg.scheduler-select.rho': ['',
       'karras 曲率（默认 7）',
       'karras 曲率（預設 7）'],
+  'cfg.scheduler-select.beta_alpha': ['',
+      '仅 beta：分布的 alpha（默认 0.6；RES4LYF 的 beta57 是 0.5，'
+      + 'beta_beta 0.7）',
+      '僅 beta：分佈的 alpha（預設 0.6；RES4LYF 的 beta57 是 0.5，'
+      + 'beta_beta 0.7）'],
+  'cfg.scheduler-select.beta_beta': ['',
+      '仅 beta：分布的 beta（默认 0.6）',
+      '僅 beta：分佈的 beta（預設 0.6）'],
   'cfg.scheduler-select.seq_len': ['',
       '仅 boogu_v1：据以读取 mu 的静态 token 数，即检查点 scheduler_config '
       + '中的 seq_len（默认 4096 = 1K 方图）',
@@ -6325,6 +6355,19 @@ const STRINGS = {
       + '间隔的未平移 sigma 上取 s x / (1 + (s - 1) x)。6 为发布版的取值',
       '僅用於精修：從 `refine_start_sigma` 往後各步所遵循的 shift，即在均勻'
       + '間隔的未平移 sigma 上取 s x / (1 + (s - 1) x)。6 為發布版的取值'],
+  'cfg.minimax-h3-model-config.schedule_shift': ['',
+      '计算噪声计划端口（scheduler-select：normal、sgm_uniform、beta、'
+      + 'linear_quadratic、karras 或 exponential）网格所用的 shift（ComfyUI 的'
+      + '模型 shift，线性形式 s x / (1 + (s - 1) x)）。不设：模型自己的——视频'
+      + '模型为 `video_shift`，MiniMax-H3-Image 为 3（其发布网格在计划中点经过 '
+      + '0.75，即 shift 3 的值），P-H3-Image 为 1。不读取噪声计划阶段自己的 '
+      + 'shift',
+      '計算雜訊排程埠（scheduler-select：normal、sgm_uniform、beta、'
+      + 'linear_quadratic、karras 或 exponential）網格所用的 shift（ComfyUI 的'
+      + '模型 shift，線性形式 s x / (1 + (s - 1) x)）。不設：模型自己的——影片'
+      + '模型為 `video_shift`，MiniMax-H3-Image 為 3（其發布網格在排程中點經過 '
+      + '0.75，即 shift 3 的值），P-H3-Image 為 1。不讀取雜訊排程階段自己的 '
+      + 'shift'],
   'cfg.minimax-h3-model-config.sigmas': ['',
       '视频的 sigma，按实际运行的值给出，取代由 `steps` 和两个 shift 生成的'
       + '网格——逗号分隔，含末尾的 0，从不超过 1 的值严格递减："1, 0.9844, '
@@ -7766,6 +7809,17 @@ const STRINGS = {
       + 'memory_limit_mb 與 expert_cache_mb 約束）；否則仍從磁碟讀取。'
       + '其他模型忽略此項；保溫中的模型按其載入時的方式交接。false：從磁'
       + '碟讀取'],
+  'cfg.text-chat.far_memory': ['',
+      '借用另一台机器的内存作为混合专家（MoE）专家缓存的远端层（原型）：'
+      + '{"transport": 插件注册的名称, "params": 插件自己的参数，原样传递}。'
+      + '本机缓存之外最常被选中的专家放在那里，需要时经链路读回，而不是从磁盘'
+      + '读取；对方支持时，解码时那里的专家就在那里运行。打不开时会说明，模型'
+      + '照常加载。稠密模型忽略此项；保温中的模型按其加载时的方式交接',
+      '借用另一台機器的記憶體作為混合專家（MoE）專家快取的遠端層（原型）：'
+      + '{"transport": 外掛註冊的名稱, "params": 外掛自己的參數，原樣傳遞}。'
+      + '本機快取之外最常被選中的專家放在那裡，需要時經連結讀回，而不是從磁碟'
+      + '讀取；對方支援時，解碼時那裡的專家就在那裡執行。打不開時會說明，模型'
+      + '照常載入。稠密模型忽略此項；保溫中的模型按其載入時的方式交接'],
   'cfg.text-chat.mtp_prefix_seed': ['',
       '解码开始时用提示词为 MTP 起草器的 KV 预热：草稿接受率/解码吞吐更高，'
       + '代价是少量额外预填充（token 精确；只影响性能）。默认开启（聊天是解'
@@ -9317,19 +9371,38 @@ const STRINGS = {
   // ---- RelayVSR Upscale (visual) ----
   'stage.relayvsr-upscale.name': ['', 'RelayVSR 超分', 'RelayVSR 超解析'],
   'stage.relayvsr-upscale.doc': ['',
-      '用 RelayVSR 做 4 倍视频超分辨率：一个单步的 5B DiT 每隔几帧写出一个'
-      + '关键帧，一个小解码器把每一帧在其前后两个关键帧之间变成 4 倍的帧。'
-      + '帧进、4 倍的帧出，顺序不变。',
-      '用 RelayVSR 做 4 倍影片超解析度：一個單步的 5B DiT 每隔幾格寫出一個'
-      + '關鍵影格，一個小解碼器把每一格在其前後兩個關鍵影格之間變成 4 倍的'
-      + '影格。影格進、4 倍的影格出，順序不變。'],
+      '用 RelayVSR 做 4 倍或 2 倍视频超分辨率：一个单步的 5B DiT 每隔几帧'
+      + '写出一个关键帧，一个小解码器把每一帧在其前后两个关键帧之间变成放大'
+      + '后的帧。帧进、放大后的帧出，顺序不变。',
+      '用 RelayVSR 做 4 倍或 2 倍影片超解析度：一個單步的 5B DiT 每隔幾格'
+      + '寫出一個關鍵影格，一個小解碼器把每一格在其前後兩個關鍵影格之間變成'
+      + '放大後的影格。影格進、放大後的影格出，順序不變。'],
   'cfg.relayvsr-upscale.hf_dir': ['',
-      'RelayVSR 模型：存放它两个检查点的目录——wan.safetensors（关键帧 DiT）'
-      + '和 flash.safetensors（逐帧解码器），与 kopper/RelayVSR 发布的一致'
-      + '——或模型库中的键（kopper/RelayVSR）',
-      'RelayVSR 模型：存放它兩個檢查點的目錄——wan.safetensors（關鍵影格 '
-      + 'DiT）和 flash.safetensors（逐格解碼器），與 kopper/RelayVSR 發佈的'
-      + '一致——或模型庫中的鍵（kopper/RelayVSR）'],
+      'RelayVSR 模型：模型库中的键——kopper/RelayVSR（发布版本，4 倍）、'
+      + 'Comfy-Org/RelayVSR-x2 或 Comfy-Org/RelayVSR-x4（ComfyUI 的 int8 '
+      + '重新打包）——或一个路径：存放关键帧 DiT 与逐帧解码器的目录（kopper/'
+      + 'RelayVSR 发布的 wan.safetensors + flash.safetensors、lightx2v/'
+      + 'RelayVSR_X2 的 wan_x2 / flash_x2，或 ComfyUI 的 diffusion_models/ + '
+      + 'vae/），或其中任一检查点文件。每个文件都标明自己的倍数；输出是输入的'
+      + '该倍数',
+      'RelayVSR 模型：模型庫中的鍵——kopper/RelayVSR（發佈版本，4 倍）、'
+      + 'Comfy-Org/RelayVSR-x2 或 Comfy-Org/RelayVSR-x4（ComfyUI 的 int8 '
+      + '重新打包）——或一個路徑：存放關鍵影格 DiT 與逐格解碼器的目錄（kopper/'
+      + 'RelayVSR 發佈的 wan.safetensors + flash.safetensors、lightx2v/'
+      + 'RelayVSR_X2 的 wan_x2 / flash_x2，或 ComfyUI 的 diffusion_models/ + '
+      + 'vae/），或其中任一檢查點檔案。每個檔案都標明自己的倍數；輸出是輸入的'
+      + '該倍數'],
+  'cfg.relayvsr-upscale.scale': ['',
+      '原生倍数，2 或 4，用于 `hf_dir` 同时存放两种倍数的情况（'
+      + 'Comfy-Org/RelayVSR 的根目录）；0（默认）取模型所指的那一种。2 倍模型'
+      + '不是缩小运行的 4 倍模型：它是自己的一对检查点（lightx2v/RelayVSR_X2'
+      + '），为 2 倍重新训练——同样的输入，它的关键帧 DiT 只处理 4 倍模型四分之'
+      + '一的 token',
+      '原生倍數，2 或 4，用於 `hf_dir` 同時存放兩種倍數的情況（'
+      + 'Comfy-Org/RelayVSR 的根目錄）；0（預設）取模型所指的那一種。2 倍模型'
+      + '不是縮小執行的 4 倍模型：它是自己的一對檢查點（lightx2v/RelayVSR_X2'
+      + '），為 2 倍重新訓練——同樣的輸入，它的關鍵影格 DiT 只處理 4 倍模型四分'
+      + '之一的 token'],
   'cfg.relayvsr-upscale.window': ['',
       '发布版本的 --window-size：每隔 `window - 1` 帧一个关键帧，每个窗口的'
       + '帧在其前后两个关键帧之间解码。16（默认）是发布版本的取值。越大越快'
@@ -9340,21 +9413,21 @@ const STRINGS = {
       + '大越快（5B 關鍵影格模型執行次數更少），也越依賴小解碼器；一格最多在'
       + '進入後 `window - 1` 格才離開本階段。2 .. 64'],
   'cfg.relayvsr-upscale.output_width': ['',
-      '可选：本次运行将输出的 4 倍帧的宽度（若在第一帧之前已知）。只有资源计划'
-      + '读取它——工作集（关键帧的键值环，随帧尺寸增长）按它的四分之一预订——'
-      + '因此小输入按小尺寸规划；即使单独运行也放不进 GPU 工作集的任务会在读取'
-      + '权重之前被拒绝。本阶段输出的仍然恰好是输入的 4 倍，运行在第一帧时按实'
-      + '际帧尺寸重新预订。0（默认）按 3840 x 2176 预订。两者同时给出或都不给'
-      + '；4 的倍数，32 .. 32768',
-      '可選：本次執行將輸出的 4 倍影格的寬度（若在第一格之前已知）。只有資源'
-      + '計畫讀取它——工作集（關鍵影格的鍵值環，隨影格尺寸增長）按它的四分之一'
-      + '預訂——因此小輸入按小尺寸規劃；即使單獨執行也放不進 GPU 工作集的任務'
-      + '會在讀取權重之前被拒絕。本階段輸出的仍然恰好是輸入的 4 倍，執行在第一'
-      + '格時按實際影格尺寸重新預訂。0（預設）按 3840 x 2176 預訂。兩者同時給'
-      + '出或都不給；4 的倍數，32 .. 32768'],
+      '可选：本次运行将输出的帧的宽度（输入的 4 倍或 2 倍，即模型的倍数），若'
+      + '在第一帧之前已知。只有资源计划读取它——工作集（关键帧的键值环，随帧尺'
+      + '寸增长）按它所对应的输入预订——因此小输入按小尺寸规划；即使单独运行也'
+      + '放不进 GPU 工作集的任务会在读取权重之前被拒绝。本阶段输出的仍然恰好是'
+      + '输入的该倍数，运行在第一帧时按实际帧尺寸重新预订。0（默认）按 3840 x '
+      + '2176 预订。两者同时给出或都不给；倍数的整数倍，32 .. 32768',
+      '可選：本次執行將輸出的影格的寬度（輸入的 4 倍或 2 倍，即模型的倍數），'
+      + '若在第一格之前已知。只有資源計畫讀取它——工作集（關鍵影格的鍵值環，隨'
+      + '影格尺寸增長）按它所對應的輸入預訂——因此小輸入按小尺寸規劃；即使單獨'
+      + '執行也放不進 GPU 工作集的任務會在讀取權重之前被拒絕。本階段輸出的仍然'
+      + '恰好是輸入的該倍數，執行在第一格時按實際影格尺寸重新預訂。0（預設）按 '
+      + '3840 x 2176 預訂。兩者同時給出或都不給；倍數的整數倍，32 .. 32768'],
   'cfg.relayvsr-upscale.output_height': ['',
-      '可选：4 倍帧的高度（见 output_width）；4 的倍数，32 .. 32768',
-      '可選：4 倍影格的高度（見 output_width）；4 的倍數，32 .. 32768'],
+      '可选：输出帧的高度（见 output_width）；倍数的整数倍，32 .. 32768',
+      '可選：輸出影格的高度（見 output_width）；倍數的整數倍，32 .. 32768'],
   'cfg.relayvsr-upscale.seed': ['',
       '关键帧噪声：每次运行开始时用这个种子初始化一个生成器，按 torch 的 '
       + 'CPU 正态分布抽取，与发布版本的抽取方式相同（它用的是 CUDA 的生成器'
@@ -9462,11 +9535,11 @@ const STRINGS = {
       '每個節拍一格平面 RGB TensorBeat [3, H, W]——u8，或 [0, 1] 的 f32 / '
       + 'f16，即 video-to-rgb 的兩種輸出——一次執行中所有影格尺寸相同'],
   'port.relayvsr-upscale.out.frames': ['',
-      '同样的帧放大到 4 倍，平面 [3, 4H, 4W]，每进一帧出一帧且顺序不变，各'
-      + '自带着输入的边带。自成一个时钟域：一帧要等它所在的窗口完整后才离开'
+      '同样的帧按模型的倍数（4 倍或 2 倍）放大，平面 [3, sH, sW]，每进一帧'
+      + '出一帧且顺序不变，各自带着输入的边带。自成一个时钟域：一帧要等它所在的窗口完整后才离开'
       + '，所以输出的节拍成批地落在输入之后',
-      '同樣的影格放大到 4 倍，平面 [3, 4H, 4W]，每進一格出一格且順序不變，'
-      + '各自帶著輸入的邊帶。自成一個時脈域：一格要等它所在的視窗完整後才離'
+      '同樣的影格按模型的倍數（4 倍或 2 倍）放大，平面 [3, sH, sW]，每進一'
+      + '格出一格且順序不變，各自帶著輸入的邊帶。自成一個時脈域：一格要等它所在的視窗完整後才離'
       + '開，所以輸出的節拍成批地落在輸入之後'],
 
   // ---- Temporal Slice (visual) ----

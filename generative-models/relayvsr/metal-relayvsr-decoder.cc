@@ -74,9 +74,13 @@ MetalRelayVsrDecoder::config_from_checkpoint(const std::string& flash_file,
   }
   const auto& md = w->metadata();
   auto it = md.find("format");
-  if (it == md.end() || it->second != "refvsr-flash-v1") {
+  // The x2 file (lightx2v's, and ComfyUI's "flash VAE x2") states its scale
+  // and leaves the S variant's defaults out of its config.
+  const bool x2 = it != md.end() && it->second == "relayvsr-flash-x2-v1";
+  if (it == md.end() || (it->second != "refvsr-flash-v1" && !x2)) {
     return fail(fmt("'{}' is not a RelayVSR decoder checkpoint (format "
-                    "refvsr-flash-v1)", flash_file)());
+                    "refvsr-flash-v1, or relayvsr-flash-x2-v1)",
+                    flash_file)());
   }
   auto ct = md.find("config");
   if (ct == md.end()) { return fail("refvsr-flash: no config in the file"); }
@@ -110,6 +114,7 @@ MetalRelayVsrDecoder::config_from_checkpoint(const std::string& flash_file,
   cfg.head_width = (int)bag::integer(c, "spatial_head_dim", 1024);
   cfg.history = (int)bag::integer(c, "window_size", 3);
   cfg.eps = (float)bag::real(c, "norm_eps", 1e-5);
+  cfg.upscale = (int)bag::integer(c, "upscale_factor", 4);
   const FlexData enc = bag::value(c, "encoder_channels");
   if (enc.is_array() && enc.as_array().size() == 3) {
     for (int i = 0; i < 3; ++i) {
@@ -134,8 +139,8 @@ MetalRelayVsrDecoder::config_from_checkpoint(const std::string& flash_file,
   } else if (bag::text(c, "temporal_rope_policy", "current_relative") !=
              "current_relative") {
     why = "temporal_rope_policy is not current_relative";
-  } else if (bag::integer(c, "upscale_factor", 4) != 4) {
-    why = "upscale_factor is not 4";
+  } else if (cfg.upscale != (x2 ? 2 : 4)) {
+    why = fmt("upscale_factor {} in a {} file", cfg.upscale, it->second)();
   } else if (!sa.is_object()) {
     why = "it has no spatial_attention (dense attention is not ported)";
   } else if (bag::text(sa, "type", "query_centered") != "query_centered" ||
@@ -168,7 +173,8 @@ MetalRelayVsrDecoder::config_from_checkpoint(const std::string& flash_file,
 std::uint64_t
 MetalRelayVsrDecoder::condition_bytes(const Config& cfg, int ph, int pw)
 {
-  const std::uint64_t n = (std::uint64_t)(ph / 4) * (pw / 4);
+  const int ls = cfg.latent_stride();
+  const std::uint64_t n = (std::uint64_t)(ph / ls) * (pw / ls);
   return 2u * (std::uint64_t)cfg.depth * n *
          (std::uint64_t)(cfg.kv_heads * cfg.head_dim) * 2u;
 }
@@ -176,13 +182,17 @@ MetalRelayVsrDecoder::condition_bytes(const Config& cfg, int ph, int pw)
 std::uint64_t
 MetalRelayVsrDecoder::scratch_bytes(const Config& cfg, int ph, int pw)
 {
-  const std::uint64_t n = (std::uint64_t)(ph / 4) * (pw / 4);
+  // The encoder at 1/2, 1/4 and the latent grid (1/4 at 4x, 1/8 at 2x).
+  const int ls = cfg.latent_stride();
+  const std::uint64_t n = (std::uint64_t)(ph / ls) * (pw / ls);
   const std::uint64_t n2 = (std::uint64_t)(ph / 2) * (pw / 2);
+  const std::uint64_t n4 = (std::uint64_t)(ph / 4) * (pw / 4);
   const std::uint64_t kv = (std::uint64_t)(cfg.kv_heads * cfg.head_dim);
   const std::uint64_t D = (std::uint64_t)cfg.dim;
   std::uint64_t b = 0;
   b += n2 * (std::uint64_t)cfg.enc[0] * 2u;
-  b += n * (std::uint64_t)(cfg.enc[1] + cfg.enc[2]) * 2u;
+  b += n4 * (std::uint64_t)cfg.enc[1] * 2u;
+  b += n * (std::uint64_t)cfg.enc[2] * 2u;
   b += 5u * n * D * 2u;                                // x y q a o
   b += n * (std::uint64_t)(3 * cfg.ffn) * 2u;          // gu, sw
   b += n * (std::uint64_t)(cfg.head_width + 768) * 2u; // hd, res
@@ -405,10 +415,11 @@ MetalRelayVsrDecoder::ensure_scratch_(int ph, int pw, std::string* err)
   auto sc = std::make_unique<Scratch>();
   sc->ph = ph;
   sc->pw = pw;
-  sc->h = ph / 4;
-  sc->w = pw / 4;
+  sc->h = ph / _cfg.latent_stride();
+  sc->w = pw / _cfg.latent_stride();
   const std::size_t n = (std::size_t)sc->h * sc->w;
   const std::size_t n2 = (std::size_t)(ph / 2) * (pw / 2);
+  const std::size_t n4 = (std::size_t)(ph / 4) * (pw / 4);
   const std::size_t kv = (std::size_t)(_cfg.kv_heads * _cfg.head_dim);
   const std::size_t D = (std::size_t)_cfg.dim;
   sc->n = (int)n;
@@ -416,7 +427,7 @@ MetalRelayVsrDecoder::ensure_scratch_(int ph, int pw, std::string* err)
     return _mc->make_shared_buffer(std::max<std::size_t>(elts * 2, 16));
   };
   sc->e0 = mk(n2 * (std::size_t)_cfg.enc[0]);
-  sc->e1 = mk(n * (std::size_t)_cfg.enc[1]);
+  sc->e1 = mk(n4 * (std::size_t)_cfg.enc[1]);
   sc->e2 = mk(n * (std::size_t)_cfg.enc[2]);
   sc->x = mk(n * D);
   sc->y = mk(n * D);
@@ -518,7 +529,10 @@ MetalRelayVsrDecoder::prepare(const SharedBuffer& latent, int h4, int w4,
     if (err != nullptr) { *err = m; }
     return false;
   };
-  if (!ensure_scratch_(h4 * 4, w4 * 4, err)) { return false; }
+  if (!ensure_scratch_(h4 * _cfg.latent_stride(), w4 * _cfg.latent_stride(),
+                       err)) {
+    return false;
+  }
   Scratch& s = *_sc;
   _ops->tune_pending();
   const relayvsr::Ops& op = *_ops;
@@ -632,8 +646,9 @@ MetalRelayVsrDecoder::decode(const SharedBuffer& lr, int ph, int pw,
     if (err != nullptr) { *err = m; }
     return false;
   };
-  if (ph % 8 != 0 || pw % 8 != 0 || out_h <= 0 || out_w <= 0 ||
-      out_h > 4 * ph || out_w > 4 * pw) {
+  const int ps = _cfg.pad_stride(), sc = _cfg.upscale;
+  if (ph % ps != 0 || pw % ps != 0 || out_h <= 0 || out_w <= 0 ||
+      out_h > sc * ph || out_w > sc * pw) {
     return fail("refvsr-flash: a frame of the wrong geometry");
   }
   if (!ensure_scratch_(ph, pw, err)) { return false; }
@@ -666,8 +681,9 @@ MetalRelayVsrDecoder::decode(const SharedBuffer& lr, int ph, int pw,
   op.conv3x3(enc, lr, _e0w, _e0b, s.e0, ph, pw, 3, _cfg.enc[0], 2, true);
   op.conv3x3(enc, s.e0, _e1w, _e1b, s.e1, ph / 2, pw / 2, _cfg.enc[0],
              _cfg.enc[1], 2, true);
-  op.conv3x3(enc, s.e1, _e2w, _e2b, s.e2, s.h, s.w, _cfg.enc[1],
-             _cfg.enc[2], 1, true);
+  // The third conv at the latent stride / 4: 1 at 4x, 2 at 2x.
+  op.conv3x3(enc, s.e1, _e2w, _e2b, s.e2, ph / 4, pw / 4, _cfg.enc[1],
+             _cfg.enc[2], _cfg.latent_stride() / 4, true);
   op.gemm(enc, s.e2, 0, _e3w, &_e3b, s.x, 0, n, D, _cfg.enc[2]);
   enc.set_function(op.rms_embed);
   enc.set_buffer(0, s.x); enc.set_buffer(1, _enorm); enc.set_buffer(2, _vtype);
@@ -842,6 +858,7 @@ MetalRelayVsrDecoder::decode(const SharedBuffer& lr, int ph, int pw,
   enc.set_constant(3, ph); enc.set_constant(4, pw);
   enc.set_constant(5, out_h); enc.set_constant(6, out_w);
   enc.set_constant(7, f32 ? 1 : 0);
+  enc.set_constant(8, sc);
   enc.dispatch({(unsigned)out_w, (unsigned)out_h, 3}, {32, 8, 1});
   prof.mark(enc, "head");
   enc.end();

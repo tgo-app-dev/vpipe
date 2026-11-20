@@ -65,7 +65,8 @@ const char* step_update_name(StepUpdate u);
 // timesteps run 1 - sigma, and it steps two schedules in lockstep over
 // rows that are never all stepped -- so the spec's method is mapped onto
 // the updates its own scheduler has: `euler`, `dmd` (the same update as
-// kRenoise) and `res_multistep`.
+// kRenoise; `lcm`, `dmd_student` and `turbo` name it too) and
+// `res_multistep`.
 struct SamplerChoice {
   StepUpdate    update = StepUpdate::kAuto;
   // The spec's re-noise seed; 0 names none, and the clip's seed runs.
@@ -191,6 +192,10 @@ struct DenoiseRequest {
   // (MetalMiniMaxH3Transformer::set_step_heads; MiniMax-H3-Image), in
   // place of its own head. Needs a head for every step.
   bool step_heads = false;
+  // Or step i through head step_head_of[i] (-1 the DiT's own), when not
+  // empty -- a grid that is not the heads' own, mapped onto them. One
+  // entry a step; it overrides `step_heads`.
+  std::vector<int> step_head_of;
   // A REFINE -- Open-H3-Regenerate-2K's: the video's sigmas AS RUN (no
   // shift, overriding `num_steps` and `sigma_grid`), stepped by the
   // reference's plain Euler (MiniMaxH3Scheduler::step_plain), and the

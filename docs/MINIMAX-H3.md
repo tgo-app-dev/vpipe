@@ -448,6 +448,7 @@ And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
 | `condition_audio_timestep` | 1.0 | The same, for a Ref2VA reference **soundtrack**. |
 | `audio_seconds` | 0 | Audio length follows from `frames` and `fps`; set this only to override that. |
 | `sigmas` | — | The video's sigmas **as run**, in place of the grid `steps` and the shifts make — and so of the step count. A ComfyUI `SIGMAS` list pastes as it is. See [Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken). |
+| `schedule_shift` | the model's | The shift a wired `scheduler-select`'s grid is computed at: `video_shift` on the video models, 3 on MiniMax-H3-Image, 1 on P-H3-Image. See [Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken). |
 
 These are H3's own knobs, so they live in an H3 stage rather than in
 `generate-video`, which keeps only what every video model answers to
@@ -490,7 +491,8 @@ are then identical.
 By default a clip runs `steps` forwards over `linspace(1, 0, steps + 1)`,
 pushed through each modality's shift, and every step is an Euler step.
 That is the schedule MiniMax's reference and the Turbo adapters' own
-workflows use. Two settings change it, and they are independent:
+workflows use. Three settings change it. The first two both set the grid
+(the list wins when both are given); the update is independent of them:
 
 - **The grid** — `sigmas` on `minimax-h3-model-config`: the video's sigmas
   as run, terminal `0` included, strictly falling from at most 1:
@@ -510,6 +512,26 @@ workflows use. Two settings change it, and they are independent:
   above, at shifts 12 / 3, puts the audio at 1, 0.940, 0.866, 0.770,
   0.643, 0.439, 0.236, 0.072, 0.
 
+- **A scheduler** — a `scheduler-select` stage wired to `generate-video`'s
+  `scheduler` iport (port 4): its `type`, computed the way ComfyUI computes
+  that scheduler for a flow model at the model's shift, over
+  `generate-video`'s `steps`:
+
+  | `type` | where the steps fall |
+  |---|---|
+  | `simple` | the model's own grid, as above |
+  | `normal` | evenly spaced in the model's timestep from the largest sigma to the smallest, each shifted again (ComfyUI's flow models take a sigma as their timestep, so the low end sits well above 0 at a large shift) |
+  | `sgm_uniform` | the same with one point more spaced in and dropped, so the last step starts a little higher |
+  | `beta` | a Beta(`beta_alpha`, `beta_beta`) quantile, 0.6 / 0.6 by default (RES4LYF's `beta57` is 0.5 / 0.7): more steps at both ends |
+  | `linear_quadratic` | Mochi's: linear down to 0.025 over the first half, quadratic after; the shift does not move it |
+  | `karras`, `exponential` | vpipe's own spacings of the unshifted grid, then shifted |
+
+  The shift is the model's, as ComfyUI's model shift is: the model config's
+  `schedule_shift` when it is set, else `video_shift` (12) on the video
+  models — the scheduler stage's own `shift` and `shift_type` are not read
+  here. The audio follows each video sigma as it does for a list of your
+  own. The step count is `generate-video`'s, not the scheduler stage's.
+  `boogu_v1` is Boogu-Image's and is refused here.
 - **The update** — a `diffusion-sampler-select` stage wired to
   `generate-video`'s `sampler` iport (port 3). H3 has its own scheduler and
   maps the selector's `method` onto it. Each method below runs one forward
@@ -518,7 +540,7 @@ workflows use. Two settings change it, and they are independent:
   | `method` | what each step does |
   |---|---|
   | `euler` | the default: `x += (σ' − σ) · v`, deterministic |
-  | `dmd` | re-noising: the clean estimate `x0 = x + σ · v`, then put at the next sigma with **fresh** noise, `(1 − σ') · x0 + σ' · n` — the update a DMD-style few-step student is sampled with, and diffusers' `stochastic_sampling` |
+  | `dmd` | re-noising: the clean estimate `x0 = x + σ · v`, then put at the next sigma with **fresh** noise, `(1 − σ') · x0 + σ' · n` — the update a DMD-style few-step student is sampled with, diffusers' `stochastic_sampling`, and ComfyUI's `lcm` sampler (`lcm` selects it too) |
   | `res_multistep` | ComfyUI's: second order in log-sigma, off the previous step's `x0` |
 
   `heun`, `dpmpp_2m` and `dpmpp_sde` are not offered for H3. `heun` and
@@ -533,8 +555,9 @@ precedence:
 
 - A [HyperFlow](#eight-steps--hyperflow) flow map's grid, or a
   [Pika H3 Flex](#six-steps-any-reference--pika-h3-flex) sampling
-  contract's, is replaced by `sigmas` (the stage warns). A contract's
-  re-noising goes with it unless the sampler port names `dmd`.
+  contract's, is replaced by `sigmas` or a scheduler's grid (the stage
+  says so). A contract's re-noising goes with it unless the sampler port
+  names `dmd`.
 - A sampler port naming `euler` over a Pika contract keeps the contract's
   grid and steps it by Euler.
 - A flow map's step **is** its jump to the next sigma, so under one only
@@ -3508,8 +3531,21 @@ Then:
   it (1024 generates at the size named). Canvas sides are multiples of 32.
   The working range is about 4–20 MP, best near 16.
 - **The grid** (`pdd_config.json`): six steps, run exactly as listed —
-  `steps`, the model config's `sigmas` and shifts, and the sampler port do
-  not apply — Euler in the velocity form the heads were distilled with.
+  `steps` and the shifts do not apply — Euler in the velocity form the
+  heads were distilled with, each step through its own output head.
+- **Your own sampling**, as on the video models
+  ([Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken)):
+  the model config's `sigmas`, or a `scheduler-select` on the `scheduler`
+  port (its type over `generate-video`'s `steps` when the graph says them,
+  else six), and a `diffusion-sampler-select` on the `sampler` port
+  (`euler`, `dmd` / `lcm`, `res_multistep`; unwired, the velocity-form
+  Euler). The release has no shift of its own, so a scheduler's grid is
+  computed at `schedule_shift`, **3** by default: the release's grid
+  passes 0.75 at its middle step, which is shift 3's. MiniMax supports
+  only the release's six steps (its API refuses others), and the per-step
+  heads were each distilled for one step of that grid — so another grid
+  runs the checkpoint's own output head at every step. A list equal to
+  the release's runs as the release does, heads included.
 - **Edit pictures** keep their size when their short edge is within 1024 to
   2048 px, else are scaled to the nearer end; the vision tower reads its own
   copy at a 1024 short edge. Each picture's VAE posterior is sampled, rounded

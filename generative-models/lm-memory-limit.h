@@ -40,6 +40,7 @@
 // INTERNAL: not installed and not exported.
 
 #include <cstddef>
+#include <memory>
 
 namespace vpipe::genai {
 
@@ -77,6 +78,32 @@ private:
   }
 
   Held _outer;
+};
+
+class FarMemory;
+
+// The far memory opened for the load on this thread (load_spec::
+// kFarMemory), for its expert cache to take: as LmMemoryLimit, a scope.
+class LmFarMemory {
+public:
+  explicit LmFarMemory(std::shared_ptr<FarMemory> far) noexcept
+    : _outer(slot_())
+  {
+    slot_() = std::move(far);
+  }
+  ~LmFarMemory() { slot_() = std::move(_outer); }
+  LmFarMemory(const LmFarMemory&)            = delete;
+  LmFarMemory& operator=(const LmFarMemory&) = delete;
+
+  static std::shared_ptr<FarMemory> current() { return slot_(); }
+
+private:
+  static std::shared_ptr<FarMemory>& slot_() noexcept
+  {
+    thread_local std::shared_ptr<FarMemory> far;
+    return far;
+  }
+  std::shared_ptr<FarMemory> _outer;
 };
 
 }  // namespace vpipe::genai

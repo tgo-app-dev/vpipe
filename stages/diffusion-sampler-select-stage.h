@@ -24,7 +24,8 @@ namespace vpipe {
 //   { sampler:"flow_match", method, eta, s_noise, seed }
 // method  -- "euler" (default, token-exact turbo) | "heun" | "dpmpp_2m"
 //            | "dpmpp_sde" | "dmd" | "res_multistep" (aliases
-//            "dpm++_2m"/"dpm++_sde" accepted). MiniMax-H3 maps euler,
+//            "dpm++_2m"/"dpm++_sde" accepted, and "lcm" / "turbo" /
+//            "dmd_student" for "dmd"). MiniMax-H3 maps euler,
 //            dmd and res_multistep onto its own scheduler's steps
 //            (genai::sampler_choice_from_spec); the other families' built-
 //            in samplers have no res_multistep and run euler.

@@ -103,6 +103,9 @@ public:
     std::int64_t drafts = 0;
   };
   const DraftStats& draft_stats() const { return _dstats; }
+  // where DSpark drafted: its rounds' time, draft and verify, on stderr
+  // under VPIPE_DSV41_PROFILE
+  ~MetalDeepseekV41ModelExec() override;
   // The speculative decode's modes (VPIPE_DSV41_MTP_DRAFT / _DEPTH win):
   // chained drafts (a DSpark pass a draft over the real drafts so far) in
   // place of the one-pass block, and omlx's acceptance-only depth (one

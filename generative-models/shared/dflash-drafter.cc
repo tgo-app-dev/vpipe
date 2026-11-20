@@ -385,6 +385,17 @@ struct MetalDFlashDrafter::Impl {
   ComputeFunction fn_conv, fn_qk_prep, fn_kv_store, fn_attn, fn_topk_part,
       fn_topk_merge, fn_select, fn_copy_rows, fn_argmax, fn_rms,
       fn_residual, fn_swiglu, fn_scale, fn_softcap;
+  // The block's attention split across the ring's keys (chunks of ring
+  // slots, then the block's own keys) and merged in order: a simdgroup
+  // walking every slot in turn left a block's few rows latency-bound.
+  // Invalid (an older metallib) or VPIPE_DFLASH_ATTN_SPLIT=0: fn_attn.
+  ComputeFunction fn_attn_part, fn_attn_comb;
+  SharedBuffer attn_part;                  // [Lmax, Hq, P + 1, D + 2] f32
+  static constexpr int kAttnChunk = 128;   // ring slots a chunk, at least
+  static constexpr int kAttnParts = 64;    // chunks a row, at most
+  static int attn_parts(int cap) {
+    return std::clamp((cap + kAttnChunk - 1) / kAttnChunk, 1, kAttnParts);
+  }
   // Boundary converters, used only when the target is f16; and the
   // embedding scale, which acts on the drafter's own bf16 rows.
   ComputeFunction fn_h2b, fn_b2h, fn_copy_rows_h2b, fn_scale_d;
@@ -405,7 +416,7 @@ struct MetalDFlashDrafter::Impl {
   static constexpr int kTopkParts = 64;
   int Lmax = 0;
   SharedBuffer hb, xn, xc, qkv, att, ao, ao2, dyn, g, u, hn, logits;
-  SharedBuffer pval, pidx, cval, cidx, hpo;
+  SharedBuffer pval, pidx, cval, cidx, hpo, conf;
   SharedBuffer cat, ctx, ctxn, kv;
   // f16-target boundary scratch: the embeddings as the target writes them,
   // the normed hidden as its head reads it.
@@ -634,6 +645,13 @@ MetalDFlashDrafter::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   m.fn_qk_prep = m.lib_df.function("dflash_qk_prep_f16");
   m.fn_kv_store = m.lib_df.function("dflash_kv_store_f16");
   m.fn_attn = m.lib_df.function("dflash_attn_f16");
+  {
+    const char* e = std::getenv("VPIPE_DFLASH_ATTN_SPLIT");
+    if (e == nullptr || std::atoi(e) != 0) {
+      m.fn_attn_part = m.lib_df.function("dflash_attn_part_f16");
+      m.fn_attn_comb = m.lib_df.function("dflash_attn_comb_f16");
+    }
+  }
   m.fn_topk_part = m.lib_df_t.function("dflash_topk_part_f16");
   m.fn_topk_merge = m.lib_df_t.function("dflash_topk_merge_f16");
   m.fn_select = m.lib_df.function("dflash_select_f16");
@@ -962,6 +980,17 @@ MetalDFlashDrafter::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   m.xc = buf((std::size_t)Lx * H * 2);
   m.qkv = buf((std::size_t)Lx * (c.qd() + 2 * c.kvd()) * 2);
   m.att = buf((std::size_t)Lx * c.qd() * 2);
+  if (m.fn_attn_part.valid() && m.fn_attn_comb.valid()) {
+    int pmax = 1;
+    for (const DLayer& ly : m.layers) {
+      pmax = std::max(pmax, Impl::attn_parts(ly.cap));
+    }
+    m.attn_part = buf((std::size_t)Lx * c.n_heads * (pmax + 1) *
+                      (c.head_dim + 2) * 4);
+    if (m.attn_part.empty()) {
+      return fail("failed to allocate drafter scratch");
+    }
+  }
   m.ao = buf((std::size_t)Lx * H * 2);
   m.ao2 = buf((std::size_t)Lx * H * 2);
   m.dyn = buf((std::size_t)Lx * 2 * ks * G * 2);
@@ -974,6 +1003,7 @@ MetalDFlashDrafter::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   m.cval = buf((std::size_t)Lx * 16 * 4);
   m.cidx = buf((std::size_t)Lx * 16 * 4);
   m.hpo = buf((std::size_t)Lx * std::max(c.selector_rank, 1) * 2);
+  m.conf = buf((std::size_t)Lx * 4);
   const int ch = Impl::kIngestChunk;
   m.cat = buf((std::size_t)ch * nT * H * 2);
   m.ctx = buf((std::size_t)ch * H * 2);
@@ -989,6 +1019,7 @@ MetalDFlashDrafter::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   for (const SharedBuffer* b :
        {&m.hb, &m.xn, &m.xc, &m.qkv, &m.att, &m.ao, &m.ao2, &m.dyn, &m.g,
         &m.u, &m.hn, &m.logits, &m.pval, &m.pidx, &m.cval, &m.cidx, &m.hpo,
+        &m.conf,
         &m.cat, &m.ctx, &m.ctxn, &m.kv}) {
     if (b->empty()) { return fail("failed to allocate drafter scratch"); }
   }
@@ -1036,6 +1067,12 @@ const SharedBuffer&
 MetalDFlashDrafter::last_cand_idx() const noexcept
 {
   return _impl->cidx;
+}
+
+const SharedBuffer&
+MetalDFlashDrafter::last_confidence() const noexcept
+{
+  return _impl->conf;
 }
 
 void
@@ -1169,14 +1206,15 @@ MetalDFlashDrafter::encode_draft(ComputeEncoder& enc, DFlashTarget& target,
     m.qk_prep(enc, m.qkv, 0, ly.q_norm, L, Hq, D, eps, pos0, ldq);
     m.qk_prep(enc, m.qkv, (std::size_t)qd * es, ly.k_norm, L, Hkv, D, eps,
               pos0, ldq);
-    enc.set_function(m.fn_attn);
+    const bool split = !m.attn_part.empty();
+    enc.set_function(split ? m.fn_attn_part : m.fn_attn);
     enc.set_buffer(0, m.qkv, 0);
     enc.set_buffer(1, m.qkv, (std::size_t)qd * es);
     enc.set_buffer(2, m.qkv, (std::size_t)(qd + kvd) * es);
     enc.set_buffer(3, ly.kc);
     enc.set_buffer(4, ly.vc);
     enc.set_buffer(5, ly.tags);
-    enc.set_buffer(6, m.att);
+    enc.set_buffer(6, split ? m.attn_part : m.att);
     enc.set_constant(7, L);
     enc.set_constant(8, Hq);
     enc.set_constant(9, Hkv);
@@ -1189,8 +1227,24 @@ MetalDFlashDrafter::encode_draft(ComputeEncoder& enc, DFlashTarget& target,
     enc.set_constant(14, causal);
     enc.set_constant(15, scale);
     enc.set_constant(16, ldq);
-    enc.dispatch({(unsigned)(32 * L), (unsigned)Hq, 1},
-                 {32, (unsigned)(Hq / Hkv), 1});
+    if (split) {
+      const int P = Impl::attn_parts(ly.cap);
+      const int C = (ly.cap + P - 1) / P;
+      enc.set_constant(17, C);
+      enc.set_constant(18, P);
+      enc.dispatch({(unsigned)(32 * L * (P + 1)), (unsigned)Hq, 1},
+                   {32, (unsigned)(Hq / Hkv), 1});
+      enc.set_function(m.fn_attn_comb);
+      enc.set_buffer(0, m.attn_part);
+      enc.set_buffer(1, m.att);
+      enc.set_constant(2, Hq);
+      enc.set_constant(3, D);
+      enc.set_constant(4, P);
+      enc.dispatch({(unsigned)(32 * L), (unsigned)Hq, 1}, {32, 1, 1});
+    } else {
+      enc.dispatch({(unsigned)(32 * L), (unsigned)Hq, 1},
+                   {32, (unsigned)(Hq / Hkv), 1});
+    }
     m.gemm(enc, ly.o, m.att, 0, m.ao, 0, L);
     if (c.v2()) {
       m.conv(enc, m.ao, ly.attn_base, (std::size_t)ks * H * es, m.ao2, H, L,
@@ -1306,6 +1360,7 @@ MetalDFlashDrafter::encode_draft(ComputeEncoder& enc, DFlashTarget& target,
   enc.set_constant(7, R);
   enc.set_constant(8, c.selector_rank);
   enc.set_constant(9, out_off);
+  enc.set_buffer(10, m.conf);
   enc.dispatch({(unsigned)c.selector_rank, 1, 1},
                {(unsigned)c.selector_rank, 1, 1});
 }

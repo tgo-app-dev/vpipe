@@ -1,5 +1,8 @@
 #include "generative-models/shared/gguf-file.h"
 
+#include "generative-models/shared/ggml-blocks.h"
+
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -44,6 +47,15 @@ bf16_to_f32_(std::uint16_t b)
   return f;
 }
 
+// llama.cpp's split suffix: "-00002-of-00003".
+std::string
+fmt_split_(int i, int n)
+{
+  char b[32];
+  std::snprintf(b, sizeof(b), "-%05d-of-%05d", i, n);
+  return b;
+}
+
 // ggml block geometry for the types we size/dequant.
 struct BlkGeom { int elems; int bytes; };
 BlkGeom
@@ -60,7 +72,12 @@ blk_geom_(std::uint32_t type)
     case GgufFile::kQ6_K: return {256, 210};
     case GgufFile::kPQ2_0:  return {128, 34};
     case GgufFile::kPTQ1_0: return {128, 28};
-    default: return {0, 0};
+    default: {
+      // Every other ggml block format this tree reads (the IQ codebooks,
+      // Q3_K, Q5_0 / Q5_1, IQ4_NL): ggml-blocks.h.
+      const ggml::Geom g = ggml::geom(type);
+      return {g.elems, g.bytes};
+    }
   }
 }
 
@@ -130,6 +147,45 @@ GgufFile::Tensor::numel() const
 
 std::optional<GgufFile>
 GgufFile::open(const std::string& path)
+{
+  auto g = open_one_(path);
+  if (!g) { return std::nullopt; }
+  const auto count = g->get_uint("split.count");
+  if (!count || *count <= 1) { return g; }
+  // `<stem>-00001-of-0000N.gguf`: the others by the same spelling.
+  const std::string tail = fmt_split_(1, (int)*count) + ".gguf";
+  if (path.size() <= tail.size() ||
+      path.compare(path.size() - tail.size(), tail.size(), tail) != 0) {
+    return std::nullopt;     // not the first shard: open that one
+  }
+  const std::string stem = path.substr(0, path.size() - tail.size());
+  g->_splits.reserve((std::size_t)*count - 1);
+  for (int i = 2; i <= (int)*count; ++i) {
+    const std::string pi = stem + fmt_split_(i, (int)*count) + ".gguf";
+    auto s = open_one_(pi);
+    if (!s) { return std::nullopt; }
+    const int file = (int)g->_paths.size();
+    g->_paths.push_back(pi);
+    for (auto& t : s->_tensors) {
+      if (g->_tensor_index.count(t.name) != 0) { return std::nullopt; }
+      Tensor c = t;
+      c.file = file;
+      g->_tensor_index.emplace(c.name, g->_tensors.size());
+      g->_tensors.push_back(std::move(c));
+    }
+    g->_splits.push_back(std::move(*s));
+  }
+  return g;
+}
+
+std::optional<GgufFile>
+GgufFile::open_single(const std::string& path)
+{
+  return open_one_(path);
+}
+
+std::optional<GgufFile>
+GgufFile::open_one_(const std::string& path)
 {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) { return std::nullopt; }
@@ -211,12 +267,17 @@ GgufFile::open(const std::string& path)
   for (auto& t : g._tensors) {
     if (g._data_start + t.offset > fsz) { return std::nullopt; }
     t.data = g._base + g._data_start + t.offset;
+    t.file_offset = g._data_start + t.offset;
     BlkGeom bg = blk_geom_(t.type);
     if (bg.elems > 0) {
       const std::int64_t ne = t.numel();
       t.nbytes = static_cast<std::uint64_t>(ne / bg.elems) * bg.bytes;
     }
+    // A tensor past the file's end (a download cut short) is refused at
+    // open, not met as a fault on the first read of its mapping.
+    if (t.nbytes > fsz - t.file_offset) { return std::nullopt; }
   }
+  g._paths = {path};
   return g;
 }
 
@@ -234,6 +295,8 @@ GgufFile::operator=(GgufFile&& o) noexcept
     _meta = std::move(o._meta);
     _tensors = std::move(o._tensors);
     _tensor_index = std::move(o._tensor_index);
+    _paths = std::move(o._paths);
+    _splits = std::move(o._splits);
     o._fd = -1; o._base = nullptr; o._map_size = 0;
   }
   return *this;
@@ -594,7 +657,7 @@ dequant_span_(std::uint32_t type, const std::uint8_t* src,
       return true;
     }
     default:
-      return false;
+      return ggml::decode(type, src, n, out);
   }
 }
 

@@ -27,7 +27,7 @@ canon_sampler_method(const std::string& m)
   }
   if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
   if (m == "dpm++_sde" || m == "dpmppsde") { return "dpmpp_sde"; }
-  if (m == "dmd_student" || m == "turbo") { return "dmd"; }
+  if (m == "dmd_student" || m == "turbo" || m == "lcm") { return "dmd"; }
   return {};
 }
 
@@ -39,7 +39,8 @@ const ConfigKey kAttrs[] = {
   {.key = "method", .type = ConfigType::String, .required = false,
    .doc = "sampler method: euler (default) | heun | dpmpp_2m | dpmpp_sde | "
           "dmd (the Boogu-Image Turbo few-step student: jump to x0 then "
-          "re-noise; only meaningful on a DMD-distilled checkpoint) | "
+          "re-noise; only meaningful on a DMD-distilled checkpoint; "
+          "ComfyUI's lcm is the same step, and `lcm` selects it) | "
           "res_multistep (ComfyUI's: second order off the previous step's "
           "x0, one forward a step). heun and dpmpp_sde take TWO forwards a "
           "step. minimax-h3 runs euler, dmd (its re-noising step) and "

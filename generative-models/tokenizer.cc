@@ -1498,7 +1498,12 @@ Tokenizer::Impl::load_gguf(const GgufFile& g,
     // whole-chunk BPE rather than a mismatched scanner. Without this the
     // byte-level encode would BPE the whole turn as one chunk (wrong splits).
     const std::string pre = g.get_string("tokenizer.ggml.pre").value_or("");
-    if (pre.find("qwen") != string::npos
+    if (pre == "deepseek-v3" || pre == "joyai-llm") {
+      // DeepSeek-V3 / V4's three Isolated splits (deepseek_pre_split_);
+      // "joyai-llm" is what DeepSeek-V4.1's GGUFs name it -- the same
+      // tokenizer, ids equal to its tokenizer.json's (MEASURED).
+      _use_deepseek_pre = true;
+    } else if (pre.find("qwen") != string::npos
         || pre.find("llama") != string::npos) {
       _use_llama3_pre = true;
     }

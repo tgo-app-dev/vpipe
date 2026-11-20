@@ -3,13 +3,23 @@
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "generative-models/gpu-host-handshake.h"
 #include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/lm-memory-limit.h"
 #include "generative-models/moe-expert-cache.h"
 #include "generative-models/safetensors-ranges.h"
+#include "generative-models/shared/ggml-blocks.h"
+#include "generative-models/shared/gguf-convert.h"
+#include "generative-models/shared/gguf-deepseek41.h"
+#include "generative-models/shared/gguf-file.h"
 #include "generative-models/shared/mma-tile.h"
 #include "generative-models/weight-set.h"
+#include "common/vpipe-format.h"
+#include "interfaces/session-context-intf.h"
 
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdio>
@@ -23,6 +33,7 @@
 #include <future>
 #include <filesystem>
 #include <format>
+#include <optional>
 
 namespace vpipe::genai {
 
@@ -52,11 +63,22 @@ constexpr int kRingSlack = 8;
 // finds a whole window computed: DeepInfer's KEEP_TOKENS >= window +
 // backtracking).
 constexpr int kKeepRows = 8;
+// REMOTE EXPERTS: the most a decode step's layer runs on the far side --
+// the rows its answer carries back (more take the disk's path).
+constexpr int kRemoteRows = 2;
+// ...waited for this many times what reading its experts would cost
+// (1 ms at least), then read instead.
+constexpr double kRemoteDeadline = 4.0;
+// Whether it pays: judged over this many calls; paused this many layer
+// steps (about a hundred tokens of DeepSeek V4.1 Flash) when it does not.
+constexpr int kRemoteWindow = 64;
+constexpr int kRemotePause = 4096;
 // The handshake: the host answers at most this many layers behind the one
 // it has encoded (so the buffers in flight stay few: a host that blocks on
 // the queue's limit while the GPU waits for it is a deadlock), and a wait
-// gives up once the host's heartbeat has not moved in kHsGiveUp (the
-// probe turns that into loads: an M4 Pro polls far faster than an M5).
+// gives up once the host's heartbeat has not moved in host_handshake::
+// kGiveUpSeconds (the probe turns that into loads: an M4 Pro polls far
+// faster than an M5).
 constexpr int kHsAhead = 4;
 // dsv41_attn_split's keys a chunk (and its threadgroup's heads)
 constexpr int kAttnChunk = 16, kAttnHeads = 16;
@@ -66,7 +88,6 @@ constexpr int kAttnChunk = 16, kAttnHeads = 16;
 // 128K 64 against 145; and the top 2048 (a chunk keeping half of itself)
 // no quicker at any width the indexer reaches.
 constexpr int kTopkChunk = 4096, kTopkTwoMin = 8, kTopkThreads = 256;
-constexpr double kHsGiveUp = 0.25;   // seconds
 // The hyper-connection mix's stream is summed in at most this many
 // slices, each a threadgroup (_hc_slices of them).
 constexpr int kHcSlices = 64;
@@ -181,27 +202,6 @@ bf16_to_fp8_codes_(MetalCompute* mc, SharedBuffer* w, SharedBuffer* s,
   *w = std::move(codes);
   *s = std::move(sc);
   return true;
-}
-
-// A word the GPU writes while this host reads it, as it is now.
-std::uint32_t
-load_now_(const std::uint32_t& x)
-{
-  return std::atomic_ref<std::uint32_t>(const_cast<std::uint32_t&>(x))
-      .load(std::memory_order_acquire);
-}
-
-// dsv41_handshake_io's checksum of a mailbox's `n` words for round `seq`
-// (the word after them holds it).
-std::uint32_t
-hs_sum_(const std::uint32_t* w, std::uint32_t n, std::uint32_t seq)
-{
-  std::uint32_t s = 0;
-  for (std::uint32_t k = 0; k < n; ++k) {
-    const std::uint32_t v = load_now_(w[k]);
-    s += v * (2u * k + 1u) + (v >> 16) * 0x9E3779B9u;
-  }
-  return s + seq * 2654435761u;
 }
 
 // The key chunks of a row's split attention: its window and its picks.
@@ -327,8 +327,180 @@ MetalDeepseekV41Model::tensor_name(const std::string& release, bool mlx)
   return release;
 }
 
+struct MetalDeepseekV41Model::GgufFiles {
+  std::optional<GgufFile> g;        // the backbone, every shard
+  std::vector<int> fd_nc;           // each shard's uncached descriptor
+  int eg_fd = -1;                   // the engram table's file, uncached
+  std::uint32_t eg_type = 0;        // its block format
+  std::uint64_t eg_off = 0;         // the table's first byte
+  std::int64_t eg_rowb = 0;         // a row's bytes
+  ~GgufFiles()
+  {
+    for (int f : fd_nc) {
+      if (f >= 0) { ::close(f); }
+    }
+    if (eg_fd >= 0) { ::close(eg_fd); }
+  }
+};
+
+// The far side's drive (far-files/1): its copies' ids, each slab's share,
+// and what came from each.
+struct MetalDeepseekV41Model::FarDisk {
+  FarFiles* ff = nullptr;
+  std::shared_ptr<FarMemory> keep;      // ff lives as long as it
+  std::vector<int> ids;                 // each shard's far id (-1 none)
+  double pinned = -1.0;                 // the far share asked for
+  std::atomic<bool> failed{false};      // a far read failed: none more
+  std::mutex mu;
+  double local_spb = 0.0, far_spb = 0.0;   // seconds a byte, smoothed
+  double acc = 0.0;
+  std::atomic<std::uint64_t> n_far{0}, n_local{0}, b_far{0}, b_local{0};
+
+  // The far share: what makes the two drives' time a slab alike.
+  double share()
+  {
+    if (failed.load()) { return 0.0; }
+    if (pinned >= 0.0) { return pinned; }
+    std::lock_guard<std::mutex> lk(mu);
+    if (local_spb <= 0.0 || far_spb <= 0.0) { return 0.5; }
+    return std::clamp(local_spb / (local_spb + far_spb), 0.05, 0.95);
+  }
+  bool take(double s)
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    acc += s;
+    if (acc >= 1.0) {
+      acc -= 1.0;
+      return true;
+    }
+    return false;
+  }
+  void note(bool far, std::size_t bytes, double sec)
+  {
+    (far ? n_far : n_local).fetch_add(1);
+    (far ? b_far : b_local).fetch_add(bytes);
+    if (bytes == 0) { return; }
+    const double v = sec / (double)bytes;
+    std::lock_guard<std::mutex> lk(mu);
+    double& spb = far ? far_spb : local_spb;
+    spb = spb > 0.0 ? 0.95 * spb + 0.05 * v : v;
+  }
+};
+
+// A miss's conversion ON THE GPU (ggml_to_affine.metal: the CPU's
+// row_affine32, bit for bit): the kernel, its tables, and a pool of
+// readers' streams and staging buffers -- a fill takes one, reads its
+// slabs into the staging, converts them into the slot, waits, gives it
+// back.
+struct MetalDeepseekV41Model::GpuConv {
+  MetalCompute* mc = nullptr;
+  ComputeFunction fn;
+  SharedBuffer tab;
+  struct Slot {
+    CommandStream st;
+    SharedBuffer stage[3];
+  };
+  std::mutex mu;
+  std::vector<std::unique_ptr<Slot>> free;
+  std::atomic<std::uint64_t> n{0}, us{0}, fallback{0};
+
+  std::unique_ptr<Slot> take()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (!free.empty()) {
+        auto s = std::move(free.back());
+        free.pop_back();
+        return s;
+      }
+    }
+    auto s = std::make_unique<Slot>();
+    s->st = mc->make_command_stream();
+    return s;
+  }
+  void give(std::unique_ptr<Slot> s)
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    free.push_back(std::move(s));
+  }
+};
+
+// A far call's own: the form, its calls, the row's activation, the rows
+// it answers into, and the far slots it holds until it ends.
+struct MetalDeepseekV41Model::FarCall {
+  FarExpertForm form;
+  std::vector<FarExpertCall> calls;
+  std::vector<std::uint32_t> x, rows;
+  MoeExpertCache::Remote rem;
+  std::chrono::steady_clock::time_point t0, t1;   // made, answered
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false, ok = false, abandoned = false;
+  std::string err;
+};
+
+void
+MetalDeepseekV41Model::note_remote_(double call_us, double alt_us)
+{
+  auto ewma = [](double& v, double x) { v = v > 0 ? 0.9 * v + 0.1 * x : x; };
+  ewma(_remote_call_us, call_us);
+  if (alt_us > 0) { ewma(_remote_alt_us, alt_us); }
+  if (++_remote_window < kRemoteWindow) { return; }
+  _remote_window = 0;
+  if (_remote_alt_us > 0 && _remote_call_us > _remote_alt_us) {
+    _remote_pause = kRemotePause;
+    ++_remote_pauses;
+    if (const SessionContextIntf* ss = _mc->session()) {
+      ss->info(fmt("[dsv41] far experts: a call {:.0f} us against {:.0f} "
+                   "to read them -- read for a while", _remote_call_us,
+                   _remote_alt_us));
+    }
+    _remote_call_us = _remote_alt_us = 0;
+  }
+}
+
 MetalDeepseekV41Model::~MetalDeepseekV41Model()
 {
+  // far calls still running (late ones) end before what they use goes
+  {
+    std::unique_lock<std::mutex> lk(_far_mu);
+    _far_cv.wait(lk, [&] { return _far_inflight == 0; });
+  }
+  if (_remote_steps > 0 && std::getenv("VPIPE_DSV41_PROFILE") != nullptr) {
+    std::fprintf(stderr,
+                 "[dsv41] far experts: %llu steps, %llu experts run there, "
+                 "%llu late, paused %llu times\n",
+                 (unsigned long long)_remote_steps,
+                 (unsigned long long)_remote_experts,
+                 (unsigned long long)_remote_late,
+                 (unsigned long long)_remote_pauses);
+  }
+  // the GPU conversion's figures, with the profile's (VPIPE_DSV41_PROFILE)
+  if (_gpu_conv && std::getenv("VPIPE_DSV41_PROFILE") != nullptr) {
+    const GpuConv& g = *_gpu_conv;
+    std::fprintf(stderr,
+                 "[dsv41] GPU conversion: %llu experts, %.2f ms each on "
+                 "average (read and convert), %llu on the CPU\n",
+                 (unsigned long long)g.n.load(),
+                 g.n.load() > 0 ? g.us.load() / 1000.0 / g.n.load() : 0.0,
+                 (unsigned long long)g.fallback.load());
+  }
+  const bool profile = std::getenv("VPIPE_DSV41_PROFILE") != nullptr;
+  if (_far_disk && profile) {
+    const FarDisk& d = *_far_disk;
+    std::fprintf(stderr,
+                 "[dsv41] far drive: %llu slabs (%.1f GB) read there, %llu "
+                 "(%.1f GB) here; a GB %.0f ms there, %.0f ms here%s\n",
+                 (unsigned long long)d.n_far.load(), d.b_far.load() / 1e9,
+                 (unsigned long long)d.n_local.load(),
+                 d.b_local.load() / 1e9, d.far_spb * 1e12,
+                 d.local_spb * 1e12, d.failed.load() ? " (failed)" : "");
+  }
+  // The read-ahead study's report (VPIPE_DSV41_AHEAD_STUDY), as the
+  // model goes.
+  if (const std::string r = ahead_study(); !r.empty()) {
+    std::fprintf(stderr, "[dsv41] read-ahead study:\n%s\n", r.c_str());
+  }
   if (_hs_beat.joinable()) {
     {
       std::lock_guard<std::mutex> lk(_hs_mu);
@@ -366,96 +538,51 @@ MetalDeepseekV41Model::hs_beating_(bool on)
   _hs_cv.notify_all();
 }
 
+namespace {
+
+// The handshakes this model can take, in order: the system scope's
+// (host_handshake.metal -- every Apple GPU measured sees the host
+// through it), then its own device-scope one (an M5 Ultra under macOS
+// 27.0 did). VPIPE_DSV41_HS_SCOPE=device skips the first (an A/B).
+struct HsLib { const char* lib; const char* io; };
+constexpr HsLib kHsLibs[] = {{host_handshake::kLibrary, host_handshake::kIo},
+                             {"deepseek_v41_bf16", "dsv41_handshake_io"}};
+
+// The first that passes host_handshake::probe (each probed once a
+// process), its loads a give-up waits in *spins; null when none does.
+const HsLib*
+hs_lib_(MetalCompute* mc, std::uint32_t* spins)
+{
+  const char* e = std::getenv("VPIPE_DSV41_HS_SCOPE");
+  const bool device_only = e != nullptr && std::string(e) == "device";
+  for (const HsLib& l : kHsLibs) {
+    if (device_only && &l == &kHsLibs[0]) { continue; }
+    if (const std::uint32_t sp = host_handshake::probe(mc, l.lib, l.io);
+        sp > 0) {
+      *spins = sp;
+      return &l;
+    }
+  }
+  *spins = 0;
+  return nullptr;
+}
+
+}  // namespace
+
 std::uint32_t
 MetalDeepseekV41Model::handshake_works(MetalCompute* mc)
 {
-  // once a process: rounds of a word the GPU wrote carried out and one the
-  // host wrote carried in, each answered as it is posted; then the loads a
-  // wait nobody answers makes before it gives up, timed
-  static std::mutex mu;
-  static std::uint32_t known = 0;
-  static bool tried = false;
-  std::lock_guard<std::mutex> lk(mu);
-  if (tried) { return known; }
-  tried = true;
-  if (mc == nullptr) { return 0; }
-  ComputeLibrary lib = mc->load_library("deepseek_v41_bf16");
-  ComputeFunction fill = lib.function("dsv41_fill32");
-  ComputeFunction hs = lib.function("dsv41_handshake_io");
-  SharedBuffer f = mc->make_shared_buffer(64), v = mc->make_shared_buffer(64);
-  SharedBuffer bo = mc->make_shared_buffer(64), bi = mc->make_shared_buffer(64);
-  if (!fill.valid() || !hs.valid() || f.empty() || v.empty() || bo.empty() ||
-      bi.empty()) {
-    return 0;
-  }
-  constexpr std::uint32_t kRounds = 8, kCal = 1u << 20;
-  auto* hw = static_cast<std::uint32_t*>(f.contents());
-  auto word = [hw](int k) { return std::atomic_ref<std::uint32_t>(hw[k]); };
-  std::memset(f.contents(), 0, 64);
-  std::memset(v.contents(), 0, 64);
-  auto turn = [&](ComputeEncoder& enc, std::uint32_t seq, std::uint32_t nw,
-                  std::uint32_t spins) {
-    enc.set_function(hs);
-    enc.set_buffer(0, f);
-    for (unsigned b = 1; b <= 3; ++b) { enc.set_buffer(b, v); }
-    enc.set_buffer(4, bo);
-    enc.set_buffer(5, bi);
-    for (unsigned b = 6; b <= 8; ++b) { enc.set_buffer(b, v, 16); }
-    const std::uint32_t nv[4] = {nw, 0, 0, seq};
-    const std::uint32_t mv[4] = {nw, 0, 0, spins};
-    enc.set_constant_bytes(9, nv, sizeof nv);
-    enc.set_constant_bytes(10, mv, sizeof mv);
-    enc.dispatch({256, 1, 1}, {256, 1, 1});
-  };
-  CommandStream st = mc->make_command_stream();
-  ComputeEncoder enc = st.begin_compute();
-  for (std::uint32_t r = 1; r <= kRounds; ++r) {
-    enc.set_function(fill);
-    enc.set_buffer(0, v);
-    enc.set_constant(1, (int)(1000 + r));
-    enc.set_constant(2, 1);
-    enc.dispatch({1, 1, 1}, {32, 1, 1});
-    turn(enc, r, 1, kCal);
-  }
-  enc.end();
-  auto fence = st.commit();
-  bool ok = true;
-  const auto* out = static_cast<const std::uint32_t*>(bo.contents());
-  auto* in = static_cast<std::uint32_t*>(bi.contents());
-  for (std::uint32_t r = 1; r <= kRounds && ok; ++r) {
-    const auto t0 = std::chrono::steady_clock::now();
-    while (word(0).load(std::memory_order_acquire) < r) {
-      word(3).fetch_add(1, std::memory_order_relaxed);   // the heartbeat
-      if (word(2).load(std::memory_order_relaxed) != 0 ||
-          std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) {
-        ok = false;
-        break;
-      }
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    while (ok && hs_sum_(out, 1, r) != load_now_(out[1])) {
-      ok = std::chrono::steady_clock::now() - t1 < std::chrono::seconds(1);
-    }
-    ok = ok && out[0] == 1000 + r;
-    in[0] = 2000 + r;
-    in[1] = hs_sum_(in, 1, r);
-    word(1).store(ok ? r : ~0u, std::memory_order_release);
-  }
-  std::string why;
-  ok = fence.wait_ok(&why) && ok && word(2).load() == 0 &&
-       static_cast<const std::uint32_t*>(v.contents())[4] == 2000 + kRounds;
-  if (!ok) { return 0; }
-  std::memset(f.contents(), 0, 64);
-  ComputeEncoder e2 = st.begin_compute();
-  turn(e2, 1, 0, kCal);
-  e2.end();
-  auto f2 = st.commit();
-  if (!f2.wait_ok(&why) || word(2).load() != 1) { return 0; }
-  const double t = f2.gpu_times().gpu_s;
-  known = (std::uint32_t)std::clamp(
-      t > 0.0 ? kCal / t * kHsGiveUp : (double)kCal, (double)kCal,
-      (double)(1u << 30));
-  return known;
+  std::uint32_t sp = 0;
+  (void)hs_lib_(mc, &sp);
+  return sp;
+}
+
+std::string
+MetalDeepseekV41Model::handshake_library(MetalCompute* mc)
+{
+  std::uint32_t sp = 0;
+  const HsLib* l = hs_lib_(mc, &sp);
+  return l != nullptr ? l->lib : "";
 }
 
 std::unique_ptr<MetalDeepseekV41Model>
@@ -496,9 +623,79 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   // the collapses: dsv41_hc_pre_norm keeps a row in registers, 8 values of
   // 1024 threads; dsv41_hc_collapse's last group norms 4 pairs a thread
   if (c.dim > 8192) { return fail("a hidden size past 8192"); }
-  if (!_engram.init(c, (std::filesystem::path(dir) / "tokenizer.json")
-                           .string(), &e)) {
+  const bool gguf = ws->src().is_gguf();
+  if (gguf && !c.engram_layers.empty()) {
+    // A GGUF carries the engram's tables (token map, multipliers, primes,
+    // offsets), each checked against what the release derives.
+    auto rd = [&](const char* n) {
+      return ws->read(n, _mc, WeightSet::Residency::Copied);
+    };
+    const metal_compute::SharedBuffer tm = rd("gguf.engram_token_map");
+    const metal_compute::SharedBuffer mu = rd("gguf.engram_multipliers");
+    const metal_compute::SharedBuffer pr = rd("gguf.engram_primes");
+    const metal_compute::SharedBuffer of = rd("gguf.engram_offsets");
+    if (tm.empty() || mu.empty() || pr.empty() || of.empty()) {
+      return fail("the GGUF carries no engram tables");
+    }
+    auto i64s = [](const metal_compute::SharedBuffer& b) {
+      return std::span<const std::int64_t>(
+          static_cast<const std::int64_t*>(b.contents()), b.byte_size() / 8);
+    };
+    if (!_engram.init_tables(
+            c,
+            std::span<const std::int32_t>(
+                static_cast<const std::int32_t*>(tm.contents()),
+                tm.byte_size() / 4),
+            i64s(mu), i64s(pr), i64s(of), &e)) {
+      return fail(e);
+    }
+  } else if (!_engram.init(c, (std::filesystem::path(dir) / "tokenizer.json")
+                                  .string(), &e)) {
     return fail(e);
+  }
+  if (gguf) {
+    // The shards (their experts read by pread, uncached) and the engram
+    // table's own file.
+    _gguf = std::make_unique<GgufFiles>();
+    const std::string first = find_gguf_in_dir(dir);
+    _gguf->g = first.empty() ? std::nullopt : GgufFile::open(first);
+    if (!_gguf->g) { return fail("the GGUF did not open: " + dir); }
+    for (std::size_t i = 0; i < _gguf->g->file_count(); ++i) {
+      const int f = ::open(_gguf->g->file_path((int)i).c_str(), O_RDONLY);
+      if (f < 0) {
+        return fail("cannot open " + _gguf->g->file_path((int)i));
+      }
+      ::fcntl(f, F_NOCACHE, 1);
+      _gguf->fd_nc.push_back(f);
+    }
+    if (!c.engram_layers.empty()) {
+      const std::string ep = gguf_deepseek41_engram_path(*_gguf->g, first);
+      const auto eg = ep.empty() ? std::nullopt : GgufFile::open_single(ep);
+      const GgufFile::Tensor* t =
+          eg ? eg->tensor("per_layer_token_embd.weight") : nullptr;
+      std::int64_t rows = 0;
+      for (std::int64_t r : c.engram_rows) { rows += r; }
+      const std::int64_t rb =
+          t != nullptr ? (std::int64_t)ggml::geom(t->type).bytes *
+                             c.engram_dim /
+                             std::max(ggml::geom(t->type).elems, 1)
+                       : 0;
+      if (t == nullptr || t->dims.size() != 2 ||
+          t->dims[0] != c.engram_dim || t->dims[1] != rows || rb <= 0 ||
+          c.engram_dim % std::max(ggml::geom(t->type).elems, 1) != 0) {
+        return fail(std::format(
+            "the engram table ({}) is missing or not [{}, {}] rows of a "
+            "block format -- it is a file of its own (ISTA-DASLab's "
+            "DeepSeek-V4.1-Flash-Engram-*.gguf), beside the shards",
+            ep.empty() ? "unnamed" : ep, c.engram_dim, rows));
+      }
+      _gguf->eg_fd = ::open(eg->file_path(t->file).c_str(), O_RDONLY);
+      if (_gguf->eg_fd < 0) { return fail("cannot open " + ep); }
+      ::fcntl(_gguf->eg_fd, F_NOCACHE, 1);
+      _gguf->eg_type = t->type;
+      _gguf->eg_off = t->file_offset;
+      _gguf->eg_rowb = rb;
+    }
   }
   MetalCompute* mc = _mc;
   const char* sfx = _bf16 ? "_bf16" : "";
@@ -605,6 +802,13 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
       _fn_gu4n = _lib_nax.function("dsv41_moe_gu_nax_fp4");
       _fn_down4n = _lib_nax.function("dsv41_moe_down_nax_fp4");
       _moe_nax = _fn_gu4n.valid() && _fn_down4n.valid();
+      // a GGUF's own blocks (VPIPE_DSV41_IQ_NAX=0 keeps the simdgroup
+      // grouped kernels)
+      const char* nq = std::getenv("VPIPE_DSV41_IQ_NAX");
+      if (nq == nullptr || std::atoi(nq) != 0) {
+        _fn_iq_gun = _lib_nax.function("dsv41_moe_gu_nax_iq");
+        _fn_iq_dnn = _lib_nax.function("dsv41_moe_down_nax_iq");
+      }
     }
     const char* na = std::getenv("VPIPE_DSV41_ATTN_NAX");
     if (_lib_nax.valid() && (na == nullptr || std::atoi(na) != 0)) {
@@ -702,13 +906,19 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   }
   // A decode or verify step's attention split by keys; the A/B is
   // VPIPE_DSV41_SPLIT_ATTN=0 (one simdgroup a head over every key).
+  // An affine wo_a's groups in one dispatch; VPIPE_DSV41_GEMV_BATCH=0 runs
+  // a dispatch a group (the same arithmetic).
+  if (const char* e = std::getenv("VPIPE_DSV41_GEMV_BATCH")) {
+    _gemv_batched = std::atoi(e) != 0;
+  }
   if (const char* e = std::getenv("VPIPE_DSV41_SPLIT_ATTN")) {
     _split_attn = std::atoi(e) != 0;
   }
 
   // ---- weights ----------------------------------------------------------
-  WeightSet& wts = *ws;
-  const auto& src = wts.src();
+  // the set the helpers below read: the checkpoint's, or -- for a GGUF's
+  // DSpark head -- the release's mtp.* beside it (dspark_dir)
+  WeightSet* wtsp = ws.get();
   const bool bf16 = _bf16;
   // Two layouts of one model. DeepSeek's release: names as inference/
   // model.py spells them, FP8 projections with an E8M0 scale per 32x32
@@ -718,12 +928,12 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   // a layer's experts stacked [E, rows, K/8] in MXFP4 (the release's codes
   // and scales, laid end to end), wo_a already bf16, the n-gram tables
   // affine at 4 bits per 32. Every name below is the release's; `tn` maps.
-  _mlx = src.info("language_model.embed.weight") != nullptr;
-  const bool mlx = _mlx;
-  auto tn = [mlx](const std::string& r) { return tensor_name(r, mlx); };
+  _mlx = wtsp->src().info("language_model.embed.weight") != nullptr;
+  bool mlx = _mlx;    // the set read: switched for a GGUF's DSpark head
+  auto tn = [&mlx](const std::string& r) { return tensor_name(r, mlx); };
   auto shape_is = [&](const std::string& nm0, std::vector<std::int64_t> sh,
                       const char* dtype) {
-    const auto* ti = src.info(tn(nm0));
+    const auto* ti = wtsp->src().info(tn(nm0));
     return ti != nullptr && ti->dtype == dtype && ti->shape == sh;
   };
   std::string bad;
@@ -735,7 +945,7 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   auto elt = [&](const std::string& nm,
                  std::vector<std::int64_t> sh) -> SharedBuffer {
     if (!shape_is(nm, sh, "BF16")) { return note(nm); }
-    SharedBuffer raw = wts.read(tn(nm), _mc, WeightSet::Residency::Copied);
+    SharedBuffer raw = wtsp->read(tn(nm), _mc, WeightSet::Residency::Copied);
     if (raw.empty()) { return note(nm); }
     if (bf16) { return raw; }
     const std::size_t n = raw.byte_size() / 2;
@@ -754,7 +964,7 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   auto f32 = [&](const std::string& nm,
                  std::vector<std::int64_t> sh) -> SharedBuffer {
     if (!shape_is(nm, sh, "F32")) { return note(nm); }
-    SharedBuffer raw = wts.read(tn(nm), _mc, WeightSet::Residency::Copied);
+    SharedBuffer raw = wtsp->read(tn(nm), _mc, WeightSet::Residency::Copied);
     if (raw.empty()) { return note(nm); }
     return raw;
   };
@@ -775,8 +985,8 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
       note(wn);
       return false;
     }
-    SharedBuffer w = wts.read(tn(wn), _mc, WeightSet::Residency::Copied);
-    SharedBuffer s = wts.read(tn(sn), _mc, WeightSet::Residency::Copied);
+    SharedBuffer w = wtsp->read(tn(wn), _mc, WeightSet::Residency::Copied);
+    SharedBuffer s = wtsp->read(tn(sn), _mc, WeightSet::Residency::Copied);
     if (w.empty() || s.empty()) { note(wn); return false; }
     if (out->empty()) {
       *out = _mc->make_shared_buffer((std::size_t)N * (std::size_t)K * 2);
@@ -805,9 +1015,9 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   auto affine_of = [&](const std::string& p, std::int64_t N, std::int64_t K,
                        int* bits, int* gs) -> bool {
     if (!mlx) { return false; }
-    const auto* wi = src.info(tn(p + ".weight"));
-    const auto* si = src.info(tn(p + ".scales"));
-    const auto* bi = src.info(tn(p + ".biases"));
+    const auto* wi = wtsp->src().info(tn(p + ".weight"));
+    const auto* si = wtsp->src().info(tn(p + ".scales"));
+    const auto* bi = wtsp->src().info(tn(p + ".biases"));
     if (wi == nullptr || si == nullptr || bi == nullptr ||
         wi->dtype != "U32" || si->dtype != "BF16" || bi->dtype != "BF16" ||
         wi->shape.size() != 2 || si->shape.size() != 2 ||
@@ -829,11 +1039,11 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
                                std::int64_t K, int bits, int gs,
                                SharedBuffer* out,
                                std::int64_t row0) -> bool {
-    SharedBuffer w = wts.read(tn(p + ".weight"), _mc,
+    SharedBuffer w = wtsp->read(tn(p + ".weight"), _mc,
                               WeightSet::Residency::Copied);
-    SharedBuffer s = wts.read(tn(p + ".scales"), _mc,
+    SharedBuffer s = wtsp->read(tn(p + ".scales"), _mc,
                               WeightSet::Residency::Copied);
-    SharedBuffer b = wts.read(tn(p + ".biases"), _mc,
+    SharedBuffer b = wtsp->read(tn(p + ".biases"), _mc,
                               WeightSet::Residency::Copied);
     if (w.empty() || s.empty() || b.empty()) { note(p); return false; }
     const auto* wc = static_cast<const std::uint32_t*>(w.contents());
@@ -920,11 +1130,11 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
         return false;
       }
       if (!keep) { return affine_dense_into(p, N, K, qb, qg, &out->w, row0); }
-      SharedBuffer w = wts.read(tn(p + ".weight"), _mc,
+      SharedBuffer w = wtsp->read(tn(p + ".weight"), _mc,
                                 WeightSet::Residency::Copied);
-      SharedBuffer s = wts.read(tn(p + ".scales"), _mc,
+      SharedBuffer s = wtsp->read(tn(p + ".scales"), _mc,
                                 WeightSet::Residency::Copied);
-      SharedBuffer b = wts.read(tn(p + ".biases"), _mc,
+      SharedBuffer b = wtsp->read(tn(p + ".biases"), _mc,
                                 WeightSet::Residency::Copied);
       if (w.empty() || s.empty() || b.empty()) { note(p); return false; }
       const std::size_t rb = (std::size_t)K * qb / 8;
@@ -935,6 +1145,25 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
                   s.contents(), (std::size_t)N * rs);
       std::memcpy(static_cast<std::uint8_t*>(out->b.contents()) + row0 * rs,
                   b.contents(), (std::size_t)N * rs);
+      return true;
+    }
+    // Stored dense (a GGUF's BF16 projections -- the indexer's wq_b):
+    // its rows as they are, in the compute dtype, as a widened one runs.
+    if (shape_is(p + ".weight", {N, K}, "BF16")) {
+      if (out->w.empty()) {
+        out->N = (int)Ntot;
+        out->K = (int)K;
+        out->w = _mc->make_shared_buffer((std::size_t)Ntot * K * 2);
+        if (out->w.empty()) { note(p); return false; }
+      } else if (out->affine() || out->fp8) {
+        note(p);                        // fused pieces stored apart
+        return false;
+      }
+      const SharedBuffer b = elt(p + ".weight", {N, K});
+      if (b.empty()) { return false; }
+      std::memcpy(static_cast<std::uint8_t*>(out->w.contents()) +
+                      (std::size_t)row0 * (std::size_t)K * 2,
+                  b.contents(), (std::size_t)N * (std::size_t)K * 2);
       return true;
     }
     if (!out->w.empty() && out->affine()) {
@@ -962,8 +1191,8 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
                          : shape_is(wn, {N, K}, "F8_E4M3") &&
                                shape_is(sn, {NB, KB}, "F8_E8M0"));
     if (!ok) { note(wn); return false; }
-    SharedBuffer w = wts.read(tn(wn), _mc, WeightSet::Residency::Copied);
-    SharedBuffer sc = wts.read(tn(sn), _mc, WeightSet::Residency::Copied);
+    SharedBuffer w = wtsp->read(tn(wn), _mc, WeightSet::Residency::Copied);
+    SharedBuffer sc = wtsp->read(tn(sn), _mc, WeightSet::Residency::Copied);
     if (w.empty() || sc.empty()) { note(wn); return false; }
     if (out->w.empty()) {
       out->w = _mc->make_shared_buffer((std::size_t)Ntot * K);
@@ -1053,7 +1282,7 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
     }
     ly.gate_w = elt(p + "ffn.gate.weight", {ne, H});
     ly.gate_b = f32(p + "ffn.gate.bias", {ne});
-    if (src.info(tn(p + "ffn.gate.bias_vl")) != nullptr) {
+    if (wtsp->src().info(tn(p + "ffn.gate.bias_vl")) != nullptr) {
       ly.gate_bvl = f32(p + "ffn.gate.bias_vl", {ne});
     }
     if (!proj_into(p + "ffn.shared_experts.w1", I, H, 2 * I, &ly.sh_w13, 0) ||
@@ -1110,7 +1339,14 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
       }
       const std::int64_t R = c.engram_rows[(std::size_t)es];
       const std::int64_t ED = c.engram_dim;
-      if (mlx && shape_is(p + "engram.embed.weight", {R, ED}, "F8_E4M3")) {
+      if (gguf) {
+        // the engram file's one table: every layer's rows end to end
+        ly.e_row0 = 0;
+        for (int k = 0; k < es; ++k) {
+          ly.e_row0 += c.engram_rows[(std::size_t)k];
+        }
+      } else if (mlx &&
+                 shape_is(p + "engram.embed.weight", {R, ED}, "F8_E4M3")) {
         // an oQ -ngram pack's: the release's FP8 rows under MLX's names
         ly.e_rows = tn(p + "engram.embed.weight");
         ly.e_scales = tn(p + "engram.embed.scales");
@@ -1146,6 +1382,21 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
 
   // ---- DSpark, the draft head (mtp.*), when asked for --------------------
   if (_opt.dspark && c.n_mtp > 0 && c.dspark_block > 1) {
+    // A GGUF's head is the release's, beside it: read from its own set,
+    // opened through the manager and held while its tensors are read
+    // (each read into the model's own buffers; nothing cached in it)
+    std::shared_ptr<WeightSet> dspark_ws;
+    if (gguf) {
+      const std::string sd = DeepseekV41Config::dspark_dir(dir);
+      dspark_ws = sd.empty() ? nullptr : open_weight_set(sd, _mc->session());
+      if (dspark_ws == nullptr) {
+        return fail("the DSpark head beside the GGUF did not open: " + sd);
+      }
+      wtsp = dspark_ws.get();
+      mlx = wtsp->src().info("language_model.embed.weight") != nullptr ||
+            wtsp->src().info("language_model.mtp.0.attn_norm.weight") !=
+                nullptr;
+    }
     const std::int64_t SE = c.dspark_experts;
     const std::int64_t NT = (std::int64_t)c.dspark_targets.size();
     const std::int64_t MR = c.dspark_markov;
@@ -1169,8 +1420,8 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
             note(b);
             continue;
           }
-          w = wts.read(tn(b + ".weight"), _mc, WeightSet::Residency::Copied);
-          sc = wts.read(tn(b + ".scales"), _mc,
+          w = wtsp->read(tn(b + ".weight"), _mc, WeightSet::Residency::Copied);
+          sc = wtsp->read(tn(b + ".scales"), _mc,
                         WeightSet::Residency::Copied);
           if (w.empty() || sc.empty()) { note(b); }
           continue;
@@ -1186,9 +1437,9 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
             note(b);
             break;
           }
-          SharedBuffer rw = wts.read(b + ".weight", _mc,
+          SharedBuffer rw = wtsp->read(b + ".weight", _mc,
                                      WeightSet::Residency::Copied);
-          SharedBuffer rs = wts.read(b + ".scale", _mc,
+          SharedBuffer rs = wtsp->read(b + ".scale", _mc,
                                      WeightSet::Residency::Copied);
           if (rw.empty() || rs.empty()) { note(b); break; }
           std::memcpy(static_cast<std::uint8_t*>(w.contents()) + ex * pw,
@@ -1207,7 +1458,7 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
     _markov_head = elt(q + "markov_head.head.weight", {V, MR});
     // the confidence head is run in f32 (the reference keeps it so)
     if (shape_is(q + "confidence_head.proj.weight", {1, H + MR}, "BF16")) {
-      SharedBuffer cw = wts.read(tn(q + "confidence_head.proj.weight"), _mc,
+      SharedBuffer cw = wtsp->read(tn(q + "confidence_head.proj.weight"), _mc,
                                  WeightSet::Residency::Copied);
       const auto* u = static_cast<const std::uint16_t*>(cw.contents());
       _conf_w.resize((std::size_t)(H + MR));
@@ -1224,10 +1475,13 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
     if (!bad.empty()) {
       return fail("DSpark tensor " + bad + " is missing or misshapen");
     }
+    wtsp = ws.get();
+    mlx = _mlx;
   }
 
   // ---- the n-gram tables and the experts, read by range -----------------
-  if (!c.engram_layers.empty()) {
+  // (A GGUF's are read from its files: _gguf, above.)
+  if (!c.engram_layers.empty() && !gguf) {
     // UNCACHED: a lookup reads three scattered pieces of a 61 GB table, a
     // page each, and the page cache keeps nothing worth its memory -- a
     // cached hit costs a read what a miss does (concurrent preads of
@@ -1237,17 +1491,19 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
     // the page cache).
     const char* ec = std::getenv("VPIPE_DSV41_ENGRAM_CACHED");
     _rows_file = SafetensorsRanges::open(
-        dir, src, &e, /*cached=*/ec != nullptr && std::atoi(ec) != 0,
+        dir, ws->src(), &e, /*cached=*/ec != nullptr && std::atoi(ec) != 0,
         [](std::string_view n) {
           return n.find(".engram.embed.") != std::string_view::npos;
         });
     if (_rows_file == nullptr) { return fail("engram tables: " + e); }
   }
-  _expert_file = SafetensorsRanges::open(
-      dir, src, &e, /*cached=*/false, [](std::string_view n) {
-        return n.find(".ffn.experts.") != std::string_view::npos;
-      });
-  if (_expert_file == nullptr) { return fail("experts: " + e); }
+  if (!gguf) {
+    _expert_file = SafetensorsRanges::open(
+        dir, ws->src(), &e, /*cached=*/false, [](std::string_view n) {
+          return n.find(".ffn.experts.") != std::string_view::npos;
+        });
+    if (_expert_file == nullptr) { return fail("experts: " + e); }
+  }
   // A layer's experts: the release's E2M1 / E8M0, or an oQ pack's affine
   // codes ([E, N, K * bits / 32] with [E, N, K / gs] bf16 scales and
   // biases), w1 and w3 at one width, w2 at its own, layer by layer.
@@ -1261,9 +1517,9 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
           mlx ? std::format("layers.{}.ffn.experts.w{}.", L, w)
               : std::format("layers.{}.ffn.experts.0.w{}.", L, w);
       if (mlx) {
-        const auto* wi = src.info(tn(p + "weight"));
-        const auto* si = src.info(tn(p + "scales"));
-        const auto* bi = src.info(tn(p + "biases"));
+        const auto* wi = wtsp->src().info(tn(p + "weight"));
+        const auto* si = wtsp->src().info(tn(p + "scales"));
+        const auto* bi = wtsp->src().info(tn(p + "biases"));
         if (wi != nullptr && si != nullptr && bi != nullptr &&
             wi->dtype == "U32" && si->dtype == "BF16" &&
             bi->dtype == "BF16" && wi->shape.size() == 3 &&
@@ -1311,11 +1567,94 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
     return fail("some layers' routed experts are FP4 and some affine");
   }
   _xaffine = n_affine > 0;
+  // A GGUF's experts IN THEIR OWN BLOCKS where every slab is IQ2_XXS,
+  // IQ2_XS, IQ2_S, IQ3_XXS or IQ1_M (VPIPE_DSV41_GGUF_NATIVE=0: widened
+  // to affine codes as they are read, as before): a slot is the file's
+  // bytes, ~4.6x as many in the cache, and nothing converted on a miss.
+  if (gguf) {
+    const char* v = std::getenv("VPIPE_DSV41_GGUF_NATIVE");
+    bool nat = !(v != nullptr && std::atoi(v) == 0) && H % 256 == 0 &&
+               I % 256 == 0;
+    static const char* kRole[3] = {"ffn_gate_exps", "ffn_up_exps",
+                                   "ffn_down_exps"};
+    for (int L = 0; L < c.n_layers && nat; ++L) {
+      for (int r = 0; r < 3 && nat; ++r) {
+        const GgufFile::Tensor* t = _gguf->g->tensor(
+            std::format("blk.{}.{}.weight", L, kRole[r]));
+        // IQ2_XXS, IQ2_XS, IQ1_M; IQ2_S and IQ3_XXS (the IQ2_XS file's)
+        nat = t != nullptr && (t->type == 16 || t->type == 17 ||
+                               t->type == 29 || t->type == 22 ||
+                               t->type == 18);
+        if (nat) { _layers[(std::size_t)L].ex.gt[r] = t->type; }
+      }
+    }
+    if (nat) {
+      // VPIPE_DSV41_IQ_KERNEL=<suffix>: every layer's decode on that one
+      // (iq4_tg_r2: before IQ1_M's nibbles), for an A/B
+      const char* kv = std::getenv("VPIPE_DSV41_IQ_KERNEL");
+      const std::string k2 = kv != nullptr ? kv : "iq5_s4_r2";
+      const std::string k1 = kv != nullptr ? kv : "iq5_s4_r2_tg";
+      _fn_iq_sw = _lib.function("dsv41_moe_swiglu_" + k2);
+      _fn_iq_dn = _lib.function("dsv41_moe_down_" + k2);
+      _fn_iq_sw1 = _lib.function("dsv41_moe_swiglu_" + k1);
+      _fn_iq_dn1 = _lib.function("dsv41_moe_down_" + k1);
+      _fn_iq_gu_g = _lib.function("dsv41_moe_gu_iq_grouped");
+      _fn_iq_dn_g = _lib.function("dsv41_moe_down_iq_grouped");
+      const std::vector<std::uint64_t> t = ggml::gpu_iq_tables_native();
+      _iq_tab = _mc->make_shared_buffer(t.size() * 8);
+      _fn_iq_grp = _lib.function("dsv41_moe_group_pairs");
+      _fn_iq_swg = _lib.function("dsv41_moe_swiglu_iqg8");
+      _fn_iq_dng = _lib.function("dsv41_moe_down_iqg8");
+      _iq_gtab = _mc->make_shared_buffer((std::size_t)kKeepRows * c.top_k *
+                                         10 * 4);
+      {
+        const char* g = std::getenv("VPIPE_DSV41_IQ_GROUPS");
+        _iq_groups = !(g != nullptr && std::atoi(g) == 0);
+      }
+      // The plan books the file's slabs (gguf_native_expert_bytes, by the
+      // formats alone): a kernel that does not resolve fails the load
+      // rather than holding ~4x as much in 8-bit slots.
+      if (_iq_gtab.empty() || _iq_tab.empty()) {
+        return fail("out of memory for the native expert tables");
+      }
+      if (!(_fn_iq_sw1.valid() && _fn_iq_dn1.valid() &&
+            _fn_iq_grp.valid() && _fn_iq_swg.valid() &&
+            _fn_iq_dng.valid() && _fn_iq_sw.valid() && _fn_iq_dn.valid() &&
+            _fn_iq_gu_g.valid() && _fn_iq_dn_g.valid())) {
+        return fail("the GGUF's native expert kernels did not load (" +
+                    k2 + " / " + k1 + ")");
+      }
+      std::memcpy(_iq_tab.contents(), t.data(), t.size() * 8);
+    }
+    _xiq = nat;
+    if (nat) {
+      if (const SessionContextIntf* ss = _mc->session()) {
+        ss->info(fmt("[dsv41] routed experts run in the GGUF's own blocks"));
+      }
+    }
+  }
   MoeExpertCache::Options co;
   co.layers = c.n_layers;
   co.experts = (int)E;
   const std::size_t wb = (std::size_t)I * H / 2, sb = (std::size_t)I * H / 32;
-  if (!_xaffine) {
+  if (_xiq) {
+    // parts: w1's slab, w3's, w2's, each as wide as the widest layer's
+    auto bb = [](std::uint32_t t) -> std::size_t {
+      return t == 16 ? 66 : t == 17 ? 74 : t == 22 ? 82 : t == 18 ? 98 : 56;
+    };
+    std::size_t c13 = 0, c2 = 0;
+    for (const Layer& ly : _layers) {
+      c13 = std::max({c13, (std::size_t)I * (std::size_t)(H / 256) *
+                               bb(ly.ex.gt[0]),
+                      (std::size_t)I * (std::size_t)(H / 256) *
+                          bb(ly.ex.gt[1])});
+      c2 = std::max(c2, (std::size_t)H * (std::size_t)(I / 256) *
+                            bb(ly.ex.gt[2]));
+    }
+    co.part_bytes = {c13, c13, c2};
+    _xiw13 = (long)c13;
+    _xiw2 = (long)c2;
+  } else if (!_xaffine) {
     co.part_bytes = {wb, sb, wb, sb, wb, sb};
   } else {
     // A slot holds any layer's expert: each part as wide as the widest
@@ -1379,6 +1718,12 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   }
   _ahead_max =
       *std::max_element(co.ahead_widths.begin(), co.ahead_widths.end());
+  // How many layers ahead it names (VPIPE_DSV41_AHEAD_DIST; 1 the next): a
+  // read takes several layers' compute, so the next layer's guess comes
+  // too late to hide one.
+  if (const char* v = std::getenv("VPIPE_DSV41_AHEAD_DIST")) {
+    _ahead_dist = std::clamp(std::atoi(v), 1, 8);
+  }
   _ahead_sc = _mc->make_shared_buffer(E * 4 * kKeepRows);
   _ahead_rank.resize(E);
   _mgrp = _mc->make_shared_buffer((std::size_t)kKeepRows * c.top_k * 10 * 4);
@@ -1386,20 +1731,33 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   {
     const std::size_t np = (std::size_t)kKeepRows * c.top_k;
     _hsf = _mc->make_shared_buffer(64);
-    _hsbo = _mc->make_shared_buffer((np + (std::size_t)kKeepRows * E + 1) *
-                                    4);
-    _hsbi = _mc->make_shared_buffer((np + 1) * 4);
-    if (_hsf.empty() || _hsbo.empty() || _hsbi.empty()) {
+    // (and REMOTE EXPERTS' words: a row's weights and activation out, the
+    // far side's rows and their pairs in -- run_bytes books them)
+    const std::size_t ro = (std::size_t)c.top_k + (std::size_t)H / 2;
+    const std::size_t ri = (std::size_t)kRemoteRows * (H / 2 + 1);
+    _hsbo = _mc->make_shared_buffer(
+        (np + (std::size_t)kKeepRows * E + ro + 1) * 4);
+    _hsbi = _mc->make_shared_buffer((np + ri + 1) * 4);
+    _rx = _mc->make_shared_buffer(ro * 4);
+    _rans = _mc->make_shared_buffer(ri * 4);
+    if (_hsf.empty() || _hsbo.empty() || _hsbi.empty() || _rx.empty() ||
+        _rans.empty()) {
       return fail("out of memory");
     }
+    // the handshake from the library the process's probe passed with: the
+    // system scope's where it compiled and works, else the device scope's
     const char* v = std::getenv("VPIPE_DSV41_HANDSHAKE");
-    _fn_hs = _lib.function("dsv41_handshake_io");
-    _fn_hs_route = _lib.function("dsv41_handshake_route");
-    if (!_fn_hs_route.valid()) { _hs_route = false; }
-    if ((v == nullptr || std::atoi(v) != 0) && _fn_hs.valid()) {
-      _hs_spins = handshake_works(_mc);
-      _hs_ok = _hs_spins > 0;
+    if (v == nullptr || std::atoi(v) != 0) {
+      std::uint32_t sp = 0;
+      if (const HsLib* l = hs_lib_(_mc, &sp); l != nullptr) {
+        _lib_hs = _mc->load_library(l->lib);
+        _fn_hs = _lib_hs.function(l->io);
+        _fn_hs_route = _lib_hs.function("dsv41_handshake_route");
+        _hs_spins = sp;
+        _hs_ok = _fn_hs.valid() && _hs_spins > 0;
+      }
     }
+    if (!_fn_hs_route.valid()) { _hs_route = false; }
   }
   SafetensorsRanges* xf = _expert_file.get();
   // An expert's six tensors (parts: w1, w1 scale, w3, w3 scale, w2, w2
@@ -1410,9 +1768,9 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
   const bool serial = std::getenv("VPIPE_DSV41_SERIAL_READS") != nullptr;
   std::vector<ExpertFmt> xfmt;
   for (const Layer& ly : _layers) { xfmt.push_back(ly.ex); }
-  auto fill = [xf, mlx, H, I, serial, xfmt](int L, int ex,
-                                            std::uint8_t* const* dst,
-                                            std::string* why) {
+  MoeExpertCache::Fill fill = [xf, mlx, H, I, serial,
+                                xfmt](int L, int ex, std::uint8_t* const* dst,
+                                      std::string* why) {
     static const char* kW[3] = {"w1", "w2", "w3"};
     if (mlx) {
       // its ranges (three tensors' codes and scales, and an affine
@@ -1439,9 +1797,12 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
         static const char* kT[3] = {"weight", "scales", "biases"};
         const std::string nm = std::format(
             "language_model.layers.{}.ffn.experts.{}.{}", L, kW[k], kT[t]);
-        // parts by weight: w1 at 0, w3 next, w2 last
+        // parts by weight: w1 at 0, w3 next, w2 last; a null part not
+        // read (MoeExpertCache's split read: it comes from far memory)
         const int w_at = k == 0 ? 0 : k == 2 ? 1 : 2;
-        if (!xf->read(nm, (std::size_t)ex * nb, nb, dst[w_at * per + t])) {
+        std::uint8_t* const d = dst[w_at * per + t];
+        if (d == nullptr) { return; }
+        if (!xf->read(nm, (std::size_t)ex * nb, nb, d)) {
           badp->store(k);
         }
       };
@@ -1467,13 +1828,20 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
         names.push_back(std::format("layers.{}.ffn.experts.{}.{}.{}", L, ex,
                                     w, scale != 0 ? "scale" : "weight"));
       }
+      static const int kPartOfW[3] = {0, 4, 2};   // codes; scale +1
+      // A null part is not read (MoeExpertCache's split read); with any
+      // left out, each of the rest is read alone.
+      bool all = true;
+      for (int k = 0; k < 3; ++k) {
+        all = all && dst[kPartOfW[k] + scale] != nullptr;
+      }
       thread_local std::vector<std::uint8_t> stage;
       std::vector<const std::uint8_t*> at;
-      const bool together = xf->read_together(names, stage, at);
+      const bool together = all && xf->read_together(names, stage, at);
       for (int k = 0; k < 3; ++k) {
         const std::string& nm = names[(std::size_t)k];
-        static const int kPartOfW[3] = {0, 4, 2};   // codes; scale +1
         std::uint8_t* d = dst[kPartOfW[k] + scale];
+        if (d == nullptr) { continue; }
         if (together) {
           std::memcpy(d, at[(std::size_t)k], xf->nbytes(nm));
         } else if (!xf->read(nm, 0, xf->nbytes(nm), d)) {
@@ -1484,8 +1852,459 @@ MetalDeepseekV41Model::init_(const std::shared_ptr<WeightSet>& ws,
     }
     return true;
   };
+  if (gguf) {
+    // A GGUF: an expert's three slabs (w1 = ffn_gate_exps, w3 =
+    // ffn_up_exps, w2 = ffn_down_exps) read by pread -- uncached, the
+    // window widened to the page grid into page-aligned staging -- and
+    // converted into the slot's parts at the layer's widths
+    // (gguf-deepseek41.h).
+    struct Slab {
+      std::uint32_t type = 0;
+      int fd = -1;
+      int file = 0;                 // its shard
+      std::uint64_t off = 0;
+      std::size_t bytes = 0, rowb = 0;
+    };
+    auto slabs = std::make_shared<std::vector<std::array<Slab, 3>>>(
+        (std::size_t)c.n_layers);
+    static const char* kRole[3] = {"ffn_gate_exps", "ffn_up_exps",
+                                   "ffn_down_exps"};
+    for (int L = 0; L < c.n_layers; ++L) {
+      for (int r = 0; r < 3; ++r) {
+        const std::string nm = std::format("blk.{}.{}.weight", L, kRole[r]);
+        const GgufFile::Tensor* t = _gguf->g->tensor(nm);
+        const std::int64_t K = r < 2 ? H : I, N = r < 2 ? I : H;
+        const ggml::Geom geo =
+            t != nullptr ? ggml::geom(t->type) : ggml::Geom{};
+        if (t == nullptr || t->dims.size() != 3 || t->dims[0] != K ||
+            t->dims[1] != N || t->dims[2] != E || geo.elems == 0 ||
+            K % geo.elems != 0) {
+          return fail(nm + " is not a routed-expert stack");
+        }
+        Slab& sl = (*slabs)[(std::size_t)L][(std::size_t)r];
+        sl.type = t->type;
+        sl.fd = _gguf->fd_nc[(std::size_t)t->file];
+        sl.file = t->file;
+        sl.off = t->file_offset;
+        sl.rowb = (std::size_t)(K / geo.elems * geo.bytes);
+        sl.bytes = (std::size_t)N * sl.rowb;
+      }
+    }
+    // THE FAR DRIVE (far-files/1; PROTOTYPE): where the far side keeps a
+    // copy of the shards, a slab may be read off ITS drive instead --
+    // two drives' bandwidth for what neither tier holds -- each slab to
+    // the one further below its share, the share by how fast each has
+    // been a byte (VPIPE_DSV41_FAR_FILES=<0..1> pins the far share, 0
+    // never).
+    std::shared_ptr<FarDisk> fd_far;
+    {
+      const auto fm = LmFarMemory::current();
+      const char* v = std::getenv("VPIPE_DSV41_FAR_FILES");
+      FarFiles* ff = nullptr;
+      if (fm && !(v != nullptr && std::atof(v) <= 0.0)) {
+        try {
+          ff = static_cast<FarFiles*>(
+              fm->query_extension(kFarFilesExtension));
+        } catch (...) {
+          ff = nullptr;
+        }
+      }
+      if (ff != nullptr) {
+        auto d = std::make_shared<FarDisk>();
+        d->ff = ff;
+        d->keep = fm;
+        d->pinned = v != nullptr ? std::clamp(std::atof(v), 0.0, 1.0) : -1.0;
+        bool any = false;
+        // a shard named as it lies under a models root: <org>/<repo>/ then
+        // its path in the model's folder (a quant's subfolder kept)
+        const std::filesystem::path md =
+            std::filesystem::weakly_canonical(std::filesystem::path(dir));
+        const std::filesystem::path repo =
+            md.parent_path().filename() / md.filename();
+        int there = 0;
+        for (std::size_t i = 0; i < _gguf->g->file_count(); ++i) {
+          const std::filesystem::path p = std::filesystem::weakly_canonical(
+              std::filesystem::path(_gguf->g->file_path((int)i)));
+          const std::filesystem::path rel = p.lexically_relative(md);
+          const std::string name =
+              (rel.empty() || *rel.begin() == ".." ? repo / p.filename()
+                                                   : repo / rel)
+                  .string();
+          std::error_code ec;
+          const auto size = std::filesystem::file_size(p, ec);
+          std::string e;
+          int id = -1;
+          if (!ec) {
+            try {
+              id = ff->open(name, (std::uint64_t)size, &e);
+            } catch (...) {
+              id = -1;
+              e = "the open threw";
+            }
+          }
+          d->ids.push_back(id);
+          any = any || id >= 0;
+          there += id >= 0 ? 1 : 0;
+          if (id < 0) {
+            if (const SessionContextIntf* ss = _mc->session()) {
+              ss->info(fmt("[dsv41] far drive: {}: {}", name, e));
+            }
+          }
+        }
+        if (const SessionContextIntf* ss = _mc->session()) {
+          ss->info(fmt("[dsv41] far drive: {} of {} shards there", there,
+                       _gguf->g->file_count()));
+        }
+        if (any) {
+          fd_far = d;
+          _far_disk = d;
+        }
+      }
+    }
+    // THE CONVERSION ON THE GPU (VPIPE_DSV41_GPU_CONVERT=0: the CPU's):
+    // where every expert stack is a format ggml_to_affine.metal takes, at
+    // 8 bits.
+    std::shared_ptr<GpuConv> gconv;
+    {
+      const char* v = std::getenv("VPIPE_DSV41_GPU_CONVERT");
+      bool all8 = !_xiq && !(v != nullptr && std::atoi(v) == 0);
+      for (int L = 0; L < c.n_layers && all8; ++L) {
+        const ExpertFmt& f = xfmt[(std::size_t)L];
+        all8 = f.b13 == 8 && f.b2 == 8;
+        for (int r = 0; r < 3 && all8; ++r) {
+          all8 = ggml::gpu_affine8((*slabs)[(std::size_t)L][(std::size_t)r]
+                                       .type);
+        }
+      }
+      if (all8) {
+        auto g = std::make_shared<GpuConv>();
+        g->mc = _mc;
+        g->fn = _mc->load_library("ggml_to_affine")
+                    .function("ggml_rows_to_affine8");
+        const std::vector<std::uint64_t> t = ggml::gpu_iq_tables();
+        g->tab = _mc->make_shared_buffer(t.size() * 8);
+        if (g->fn.valid() && !g->tab.empty()) {
+          std::memcpy(g->tab.contents(), t.data(), t.size() * 8);
+          gconv = g;
+          _gpu_conv = g;
+          if (const SessionContextIntf* ss = _mc->session()) {
+            ss->info(fmt("[dsv41] expert misses converted on the GPU"));
+          }
+        }
+      }
+    }
+    MetalDeepseekV41Model* const self = this;
+    const bool native = _xiq;
+    fill = [slabs, xfmt, H, I, fd_far, gconv, self, native](
+               int L, int ex, std::uint8_t* const* dst, std::string* why) {
+      const auto tf0 = std::chrono::steady_clock::now();
+      // An expert's three slabs read at once, each through a staging
+      // buffer of its own a reader thread (at most the widest slab, ~4.5
+      // MB; the cache runs several fills at once) -- off this drive or the
+      // far side's -- then each slab's rows converted in pieces across
+      // cores.
+      const ExpertFmt& f = xfmt[(std::size_t)L];
+      const auto& sl = (*slabs)[(std::size_t)L];
+      // (freed when the thread ends: the cache's readers end with it)
+      struct Staging {
+        std::uint8_t* b[3] = {nullptr, nullptr, nullptr};
+        std::size_t cap[3] = {0, 0, 0};
+        ~Staging() { for (std::uint8_t* q : b) { std::free(q); } }
+      };
+      thread_local Staging stg;
+      std::uint8_t** const tbufs = stg.b;
+      std::size_t* const caps = stg.cap;
+      std::uint8_t* bufs[3] = {tbufs[0], tbufs[1], tbufs[2]};
+      std::uint64_t ats[3], a0s[3];
+      std::size_t lens[3], needs[3];
+      // on the GPU: the slabs read straight into its staging buffers
+      std::unique_ptr<GpuConv::Slot> gs = gconv ? gconv->take() : nullptr;
+      struct Back {
+        GpuConv* g;
+        std::unique_ptr<GpuConv::Slot>* s;
+        ~Back()
+        {
+          if (g != nullptr && *s) { g->give(std::move(*s)); }
+        }
+      } back{gconv.get(), &gs};
+      for (int r = 0; r < 3; ++r) {
+        const Slab& sr = sl[(std::size_t)r];
+        ats[r] = sr.off + (std::uint64_t)ex * sr.bytes;
+        a0s[r] = ats[r] & ~(std::uint64_t)4095;
+        needs[r] = (std::size_t)(ats[r] - a0s[r]) + sr.bytes;
+        lens[r] = (needs[r] + 4095) & ~(std::size_t)4095;
+        if (gs) {
+          SharedBuffer& b = gs->stage[r];
+          if (b.byte_size() < lens[r]) {
+            b = gconv->mc->make_shared_buffer(lens[r]);
+            if (b.empty()) {
+              if (why != nullptr) { *why = "out of memory"; }
+              return false;
+            }
+          }
+          bufs[r] = static_cast<std::uint8_t*>(b.contents());
+          continue;
+        }
+        bufs[r] = tbufs[r];
+        if (caps[r] < lens[r]) {
+          std::free(bufs[r]);
+          bufs[r] = nullptr;
+          caps[r] = 0;
+          void* p = nullptr;
+          if (posix_memalign(&p, 16384, lens[r]) != 0) {
+            if (why != nullptr) { *why = "out of memory"; }
+            return false;
+          }
+          tbufs[r] = bufs[r] = static_cast<std::uint8_t*>(p);
+          caps[r] = lens[r];
+        }
+      }
+      // where each slab comes from
+      bool far[3] = {};
+      if (fd_far) {
+        const double share = fd_far->share();
+        for (int r = 0; r < 3; ++r) {
+          far[r] = fd_far->ids[(std::size_t)sl[(std::size_t)r].file] >= 0 &&
+                   fd_far->take(share);
+        }
+      }
+      std::atomic<bool> bad{false};
+      std::atomic<bool>* const badp = &bad;
+      std::uint8_t* const* const bp = bufs;
+      FarDisk* const fdp = fd_far.get();
+      const std::uint64_t* const atp = ats;
+      const std::uint64_t* const a0p = a0s;
+      const std::size_t* const lenp = lens;
+      const std::size_t* const needp = needs;
+      const bool* const farp = far;
+      const auto* const slp = &sl;
+      // in its own blocks: each slab straight into its part (a null part
+      // not read: MoeExpertCache's split read)
+      std::uint8_t* const* const dstp = native ? dst : nullptr;
+      dispatch_apply(3, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,
+                                                  0),
+                     ^(std::size_t j) {
+        const int r = (int)j;
+        const Slab& sr = (*slp)[(std::size_t)r];
+        if (dstp != nullptr && dstp[r] == nullptr) { return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        bool ok = false;
+        if (farp[r]) {
+          // exactly the expert's bytes: the far copy is read uncached
+          try {
+            ok = fdp->ff->read(fdp->ids[(std::size_t)sr.file], atp[r],
+                               bp[r] + (atp[r] - a0p[r]), sr.bytes,
+                               nullptr);
+          } catch (...) {
+            ok = false;   // taken as the read's failure (far-memory.h)
+          }
+          if (!ok) { fdp->failed.store(true); }
+        }
+        if (!ok) {
+          // the window may run past the file's end: the expert's own
+          // bytes are what must arrive
+          std::size_t got = 0;
+          while (got < lenp[r]) {
+            const ssize_t k = ::pread(sr.fd, bp[r] + got, lenp[r] - got,
+                                      (off_t)(a0p[r] + got));
+            if (k <= 0) { break; }
+            got += (std::size_t)k;
+          }
+          ok = got >= needp[r];
+        }
+        if (ok && dstp != nullptr) {
+          std::memcpy(dstp[r], bp[r] + (atp[r] - a0p[r]), sr.bytes);
+        }
+        if (!ok) {
+          badp->store(true);
+        } else if (fdp != nullptr) {
+          fdp->note(farp[r] && !fdp->failed.load(), sr.bytes,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0).count());
+        }
+      });
+      if (bad.load()) {
+        if (why != nullptr) {
+          *why = std::format("layer {} expert {}: its blocks did not read",
+                             L, ex);
+        }
+        return false;
+      }
+      if (native) { return true; }
+      if (gs) {
+        // each slab's rows into the slot's parts, one dispatch a slab;
+        // the parts' places in the cache's pools
+        MoeExpertCache* cache = self->_cache.get();
+        bool ok = cache != nullptr;
+        {
+          ComputeEncoder enc = gs->st.begin_compute();
+          for (int r = 0; r < 3 && ok; ++r) {
+            const Slab& sr = sl[(std::size_t)r];
+            const int N = r < 2 ? (int)I : (int)H, K = r < 2 ? (int)H : (int)I;
+            const std::uint32_t G = (std::uint32_t)N * (std::uint32_t)(K / 32);
+            std::size_t off[3];
+            for (int k = 0; k < 3; ++k) {
+              const SharedBuffer& pool = cache->pool(3 * r + k);
+              const auto* base =
+                  static_cast<const std::uint8_t*>(pool.contents());
+              off[k] = (std::size_t)(dst[3 * r + k] - base);
+              ok = ok && dst[3 * r + k] >= base &&
+                   off[k] < pool.byte_size();
+            }
+            if (!ok) { break; }
+            enc.set_function(gconv->fn);
+            enc.set_buffer(0, gs->stage[r]);
+            enc.set_buffer(1, gconv->tab);
+            enc.set_buffer(2, cache->pool(3 * r), off[0]);
+            enc.set_buffer(3, cache->pool(3 * r + 1), off[1]);
+            enc.set_buffer(4, cache->pool(3 * r + 2), off[2]);
+            enc.set_constant(5, sr.type);
+            enc.set_constant(6, (std::uint32_t)K);
+            enc.set_constant(7, (std::uint32_t)sr.rowb);
+            enc.set_constant(8, G);
+            enc.set_constant(9, (std::uint32_t)(ats[r] - a0s[r]));
+            enc.dispatch({(unsigned)G, 1, 1}, {256, 1, 1});
+          }
+        }
+        std::string e;
+        if (ok && gs->st.commit().wait_ok(&e)) {
+          gconv->n.fetch_add(1);
+          gconv->us.fetch_add((std::uint64_t)
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - tf0).count());
+          return true;
+        }
+        // not on the GPU: the CPU's, from the same bytes
+        gconv->fallback.fetch_add(1);
+      }
+      for (int r = 0; r < 3; ++r) {
+        const Slab& sr = sl[(std::size_t)r];
+        const std::uint64_t at = ats[r], a0 = a0s[r];
+        std::uint8_t* const buf = bufs[r];
+        constexpr int kPieces = 8;
+        const int N = r < 2 ? (int)I : (int)H, K = r < 2 ? (int)H : (int)I;
+        const int bits = r < 2 ? f.b13 : f.b2;
+        const std::uint8_t* src = buf + (at - a0);
+        const std::size_t rowb = sr.rowb, wr = (std::size_t)K * bits / 8;
+        const std::size_t gr = (std::size_t)(K / 32) * 2;
+        const std::uint32_t type = sr.type;
+        std::uint8_t* const w = dst[3 * r];
+        std::uint8_t* const sc = dst[3 * r + 1];
+        std::uint8_t* const bi = dst[3 * r + 2];
+        std::atomic<bool> ok{true};
+        std::atomic<bool>* const okp = &ok;
+        dispatch_apply(kPieces,
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,
+                                                 0),
+                       ^(std::size_t k) {
+          const int r0 = N * (int)k / kPieces;
+          const int r1 = N * ((int)k + 1) / kPieces;
+          if (!deepseek41_rows_to_affine(type, src + (std::size_t)r0 * rowb,
+                                         r1 - r0, K, bits, w + r0 * wr,
+                                         sc + r0 * gr, bi + r0 * gr)) {
+            okp->store(false);
+          }
+        });
+        if (!ok.load()) {
+          if (why != nullptr) {
+            *why = std::format("layer {} expert {}: its blocks have no "
+                               "affine form at w{} / w{}", L, ex, f.b13,
+                               f.b2);
+          }
+          return false;
+        }
+      }
+      return true;
+    };
+  }
+  // A far tier (load_spec::kFarMemory) where the experts do not all fit.
+  if ((std::size_t)co.resident < all) { co.far = LmFarMemory::current(); }
+  // The safetensors fills skip a null part (the split read); a GGUF's
+  // converts a slab into all its parts at once, so it reads whole.
+  co.fill_skips_null = !gguf || _xiq;
+  // A far side that runs a GGUF's experts reads the grids and signs from
+  // its own memory: room for them past the far slots.
+  std::vector<std::uint64_t> far_tab =
+      _xiq && co.far ? ggml::gpu_iq_tables_native()
+                     : std::vector<std::uint64_t>{};
+  if (far_tab.size() != kFarGgufTablesV1Words) { far_tab.clear(); }
+  co.far_reserve =
+      far_tab.empty() ? 0
+                      : (sizeof(FarGgufTables) + far_tab.size() * 8 + 16383) /
+                            16384 * 16384;
+  // A zero slot for REMOTE pairs where a far side may run them: taken from
+  // the resident set's room (what the plan booked), not beside it.
+  // Only where the far side runs experts (asked first: it needs nothing
+  // of the cache) and the far memory holds a slot past its reserve.
+  void* far_x = nullptr;
+  {
+    bool fp4 = true;
+    for (const Layer& ly : _layers) { fp4 = fp4 && ly.ex.b13 == 0; }
+    const char* v = std::getenv("VPIPE_DSV41_FAR_COMPUTE");
+    const bool may = co.far && ((fp4 && !_xiq) || !far_tab.empty()) &&
+                     !(v != nullptr && std::atoi(v) == 0);
+    std::uint64_t fb = 0;
+    if (may) {
+      try {
+        far_x = co.far->query_extension(kFarComputeExtension);
+        fb = co.far->bytes();
+      } catch (...) {
+        far_x = nullptr;
+      }
+    }
+    std::size_t sb = 0;
+    for (std::size_t b : co.part_bytes) { sb += b; }
+    co.zero_slot = far_x != nullptr && sb > 0 && fb > co.far_reserve &&
+                   (fb - co.far_reserve) / sb >= 1;
+    if (co.zero_slot && co.resident > 0) { --co.resident; }
+  }
   _cache = MoeExpertCache::create(_mc, co, fill, &e);
   if (_cache == nullptr) { return fail("expert cache: " + e); }
+  // REMOTE EXPERTS: where the far memory runs experts (far-compute/2) and
+  // every layer's are the release's FP4 or a GGUF's own blocks (the far
+  // side's kernels), a decode row's far-held misses are run there
+  // (VPIPE_DSV41_FAR_COMPUTE=0 reads them, as before). The cache was asked
+  // for its zero slot only where this may run.
+  if (co.far && co.zero_slot && _cache->far_slots() > 0 &&
+      _cache->zero_slot() >= 0 && H % 2 == 0) {
+    const SessionContextIntf* ss = _mc->session();
+    auto say = [&](const VpipeFormat& m) {
+      if (ss != nullptr) { ss->info(m); }
+    };
+    bool tab_ok = !_xiq;
+    if (_xiq) {
+      // the tables written once into the reserved bytes, behind their head
+      FarGgufTables head;
+      head.words = far_tab.size();
+      std::vector<std::uint8_t> buf(sizeof head + far_tab.size() * 8);
+      std::memcpy(buf.data(), &head, sizeof head);
+      std::memcpy(buf.data() + sizeof head, far_tab.data(),
+                  far_tab.size() * 8);
+      const FarPiece piece{_cache->far_reserved_at(), buf.data(), buf.size()};
+      std::string we;
+      try {
+        tab_ok = co.far->write(&piece, 1, &we);
+      } catch (...) {
+        tab_ok = false;
+        we = "the write threw";
+      }
+      if (!tab_ok) {
+        say(fmt("[dsv41] far experts: their tables were not written ({}); "
+                "they are read", we));
+      }
+      _far_tab_at = _cache->far_reserved_at();
+    }
+    void* x = far_x;
+    if (x != nullptr && tab_ok) {
+      _fn_pack_remote = _lib.function("dsv41_pack_remote");
+      _fn_put_remote = _lib.function("dsv41_put_remote");
+      if (_fn_pack_remote.valid() && _fn_put_remote.valid()) {
+        _far_compute = static_cast<FarCompute*>(x);
+        say(fmt("[dsv41] far experts run where they are held "
+                "(far-compute/2, {} a layer at most)", kRemoteRows));
+      }
+    }
+  }
   if (const char* v = std::getenv("VPIPE_DSV41_AHEAD_STUDY")) {
     AheadStudy& a = _study;
     a.k = std::clamp(std::atoi(v), 0, 8);
@@ -1875,6 +2694,13 @@ MetalDeepseekV41Model::run_bytes(const DeepseekV41Config& c, int rows,
   b += (std::size_t)c.vocab * 4;
   b += (std::size_t)kKeepRows * c.top_k * 10 * 4;
   b += 64 + ((std::size_t)kKeepRows * (2 * c.top_k + c.n_experts) + 2) * 4;
+  // REMOTE EXPERTS' mailbox words and buffers (init_: held whether or not
+  // a far side runs any)
+  {
+    const std::size_t ro = (std::size_t)c.top_k + (std::size_t)c.dim / 2;
+    const std::size_t ri = (std::size_t)kRemoteRows * (c.dim / 2 + 1);
+    b += (2 * ro + 2 * ri) * 4;
+  }
   b += (std::size_t)rows * ((std::size_t)c.dim * 2 + 4 + 2) + 32;
   return b;
 }
@@ -1919,7 +2745,7 @@ MetalDeepseekV41Model::run_held() const
         &_mixA[1], &_mixA[2], &_mixF[0], &_mixF[1], &_mixF[2], &_pm[0],
         &_pm[1], &_mh, &_mx, &_hcpart, &_sX, &_stok, &_slog, &_memb,
         &_mbias, &_xpre, &_mgrp, &_apart, &_aml, &_tkk, &_tkp, &_tkt,
-        &_tkr, &_hsf, &_hsbo, &_hsbi, &_hcps, &_hccnt}) {
+        &_tkr, &_hsf, &_hsbo, &_hsbi, &_hcps, &_hccnt, &_rx, &_rans}) {
     b += s->byte_size();
   }
   for (const auto& r : _erow) { b += r.byte_size(); }
@@ -2098,6 +2924,10 @@ MetalDeepseekV41Model::load_q_(int bits, std::string* err)
       {&q.gv[1][0], "dsv41_gemv_q" + b + "_rows"},
       {&q.gv[0][1], "dsv41_gemv_q" + b + "_k4"},
       {&q.gv[1][1], "dsv41_gemv_q" + b + "_rows_k4"},
+      {&q.gvb[0][0], "dsv41_gemv_q" + b + "_b"},
+      {&q.gvb[1][0], "dsv41_gemv_q" + b + "_rows_b"},
+      {&q.gvb[0][1], "dsv41_gemv_q" + b + "_k4_b"},
+      {&q.gvb[1][1], "dsv41_gemv_q" + b + "_rows_k4_b"},
       {&q.dq, "dsv41_dequant_q" + b},
       {&q.sw[0], "dsv41_moe_swiglu_q" + b},
       {&q.sw[1], "dsv41_moe_swiglu_q" + b + "_rows2"},
@@ -2220,6 +3050,28 @@ MetalDeepseekV41Model::gemm_groups_(ComputeEncoder& enc, const Proj& p,
     gemv_(enc, p.fp8 ? 2 : 1, p.w, 0, p.fp8 ? &p.s : nullptr, 0, x, 0, y, 0,
           K, rows, M, G, (std::int64_t)M * K, (std::int64_t)rows * K,
           (std::int64_t)M * rows);
+    return;
+  }
+  if (M <= kGemv32Rows && p.affine() && _gemv_batched) {
+    // every group in one dispatch (gemv_q_'s split and arithmetic)
+    const int ks = (rows + 7) / 8 < 512 && K >= 1024 ? 4 : 1;
+    const QFns& q = _qf[qidx_(p.bits)];
+    enc.set_function(q.gvb[M == 1 ? 0 : 1][ks == 4 ? 1 : 0]);
+    enc.set_buffer(0, p.w);
+    enc.set_buffer(1, p.s);
+    enc.set_buffer(2, p.b);
+    enc.set_buffer(3, x);
+    enc.set_buffer(4, y);
+    enc.set_constant(5, K);
+    enc.set_constant(6, rows);
+    enc.set_constant(7, M);
+    enc.set_constant(8, p.gs);
+    enc.set_constant(9, (long)M * K);
+    enc.set_constant(10, (long)rows * K * p.bits / 32);
+    enc.set_constant(11, (long)rows * (K / p.gs));
+    enc.set_constant(12, (long)M * rows);
+    enc.dispatch({32, (unsigned)(((rows + 7) / 8) * 2 * ks), (unsigned)G},
+                 {32, (unsigned)(2 * ks), 1});
     return;
   }
   // (affine codes, or many rows: a group at a time)
@@ -2748,6 +3600,7 @@ MetalDeepseekV41Model::engram_rows_(int slot,
   auto* out = static_cast<std::uint16_t*>(dst.contents());
   const float* lut = e4m3_table_();
   const bool bf16 = _bf16, mlx = !ly.e_biases.empty();
+  const bool gguf = ly.e_row0 >= 0 && _gguf != nullptr;
   std::atomic<bool> ok{true};
   const std::size_t total = (std::size_t)n * (std::size_t)cols;
   const std::size_t ns_ = c.engram_layers.size();
@@ -2775,44 +3628,77 @@ MetalDeepseekV41Model::engram_rows_(int slot,
     }
     where[k] = (std::uint32_t)(uniq.size() - 1);
   }
-  parallel_(uniq.size(), [&](std::size_t lo, std::size_t hi) {
-    // release: E4M3 codes + E8M0 per 32; MLX: 4-bit codes (8 a word, low
-    // nibble first) + a bf16 scale and bias per 32
-    std::vector<std::uint8_t> w(mlx ? (std::size_t)dim / 2 : (std::size_t)dim);
-    std::vector<std::uint8_t> s(mlx ? (std::size_t)ns * 2 : (std::size_t)ns);
-    std::vector<std::uint8_t> bi(mlx ? (std::size_t)ns * 2 : 0);
-    for (std::size_t u = lo; u < hi; ++u) {
-      const std::int64_t r = uniq[u];
-      bool got = _rows_file->read(ly.e_rows, (std::size_t)r * w.size(),
-                                  w.size(), w.data()) &&
-                 _rows_file->read(ly.e_scales, (std::size_t)r * s.size(),
-                                  s.size(), s.data());
-      if (mlx && got) {
-        got = _rows_file->read(ly.e_biases, (std::size_t)r * bi.size(),
-                               bi.size(), bi.data());
-      }
-      if (!got) {
-        ok = false;
-        return;
-      }
-      std::uint16_t* d = out + (std::size_t)first[u] * dim;
-      if (mlx) {
-        const auto* sc = reinterpret_cast<const std::uint16_t*>(s.data());
-        const auto* bs = reinterpret_cast<const std::uint16_t*>(bi.data());
-        for (int j = 0; j < dim; ++j) {
-          const unsigned q = (w[(std::size_t)j / 2] >> (4 * (j & 1))) & 0xFu;
-          const float v = bf16_f32_(sc[j / 32]) * (float)q +
-                          bf16_f32_(bs[j / 32]);
-          d[j] = f32_elt_(v, bf16);
+  if (gguf) {
+    // A GGUF's table: a row is its blocks in one read, decoded as ggml
+    // decodes them, rounded once into the compute dtype.
+    parallel_(uniq.size(), [&](std::size_t lo, std::size_t hi) {
+      std::vector<std::uint8_t> row((std::size_t)_gguf->eg_rowb);
+      std::vector<float> v((std::size_t)dim);
+      for (std::size_t u = lo; u < hi; ++u) {
+        const std::uint64_t at =
+            _gguf->eg_off +
+            (std::uint64_t)(ly.e_row0 + uniq[u]) * (std::uint64_t)row.size();
+        std::size_t got = 0;
+        while (got < row.size()) {
+          const ssize_t k = ::pread(_gguf->eg_fd, row.data() + got,
+                                    row.size() - got, (off_t)(at + got));
+          if (k <= 0) { break; }
+          got += (std::size_t)k;
         }
-      } else {
+        if (got != row.size() ||
+            !ggml::decode(_gguf->eg_type, row.data(), dim, v.data())) {
+          ok = false;
+          return;
+        }
+        std::uint16_t* d = out + (std::size_t)first[u] * dim;
         for (int j = 0; j < dim; ++j) {
-          d[j] = f32_elt_(lut[w[(std::size_t)j]] *
-                              e8m0_(s[(std::size_t)j / 32]), bf16);
+          d[j] = f32_elt_(v[(std::size_t)j], bf16);
         }
       }
-    }
-  });
+    });
+  } else {
+    parallel_(uniq.size(), [&](std::size_t lo, std::size_t hi) {
+      // release: E4M3 codes + E8M0 per 32; MLX: 4-bit codes (8 a word, low
+      // nibble first) + a bf16 scale and bias per 32
+      std::vector<std::uint8_t> w(mlx ? (std::size_t)dim / 2
+                                      : (std::size_t)dim);
+      std::vector<std::uint8_t> s(mlx ? (std::size_t)ns * 2
+                                      : (std::size_t)ns);
+      std::vector<std::uint8_t> bi(mlx ? (std::size_t)ns * 2 : 0);
+      for (std::size_t u = lo; u < hi; ++u) {
+        const std::int64_t r = uniq[u];
+        bool got = _rows_file->read(ly.e_rows, (std::size_t)r * w.size(),
+                                    w.size(), w.data()) &&
+                   _rows_file->read(ly.e_scales, (std::size_t)r * s.size(),
+                                    s.size(), s.data());
+        if (mlx && got) {
+          got = _rows_file->read(ly.e_biases, (std::size_t)r * bi.size(),
+                                 bi.size(), bi.data());
+        }
+        if (!got) {
+          ok = false;
+          return;
+        }
+        std::uint16_t* d = out + (std::size_t)first[u] * dim;
+        if (mlx) {
+          const auto* sc = reinterpret_cast<const std::uint16_t*>(s.data());
+          const auto* bs = reinterpret_cast<const std::uint16_t*>(bi.data());
+          for (int j = 0; j < dim; ++j) {
+            const unsigned q =
+                (w[(std::size_t)j / 2] >> (4 * (j & 1))) & 0xFu;
+            const float v = bf16_f32_(sc[j / 32]) * (float)q +
+                            bf16_f32_(bs[j / 32]);
+            d[j] = f32_elt_(v, bf16);
+          }
+        } else {
+          for (int j = 0; j < dim; ++j) {
+            d[j] = f32_elt_(lut[w[(std::size_t)j]] *
+                                e8m0_(s[(std::size_t)j / 32]), bf16);
+          }
+        }
+      }
+    });
+  }
   if (!ok) {
     if (err != nullptr) { *err = "an engram row could not be read"; }
     return false;
@@ -3078,6 +3964,38 @@ MetalDeepseekV41Model::forward_piece_(
   };
   const auto t_start = Clk::now();
   double t_gpu = 0, t_cache = 0;
+  // STUDY (VPIPE_DSV41_HS_STUDY=1, with VPIPE_MC_GPU_TIME=1): the
+  // handshake's dispatch in a command buffer of its own, so Metal's
+  // timestamps tell the GPU's kernels from its wait on the host; each
+  // forward then reports the one before it. VPIPE_DSV41_HS_NAP=<us>: the
+  // host's wait for the GPU's post sleeps that long between looks, not
+  // spinning a core (a spinning core slows an M5's GPU).
+  static const bool hs_study = [] {
+    const char* e = std::getenv("VPIPE_DSV41_HS_STUDY");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  static const int hs_nap_us = [] {
+    const char* e = std::getenv("VPIPE_DSV41_HS_NAP");
+    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+  }();
+  if (hs_study) {
+    double busy = 0;
+    CommandStream::gpu_time_stats(&busy, nullptr);
+    const double now_s = CommandStream::host_seconds();
+    if (_st_rows > 0) {
+      const double gpu = busy - _st_busy0;
+      std::fprintf(stderr,
+                   "[dsv41] hs-study %d rows: wall %.2f ms, GPU busy %.2f "
+                   "ms = kernels %.2f + handshake %.2f (%d turns)\n",
+                   _st_rows, (_st_end - _st_t0) * 1e3, gpu, gpu - _st_hs_ms,
+                   _st_hs_ms, _st_turns);
+    }
+    _st_busy0 = busy;
+    _st_t0 = now_s;
+    _st_hs_ms = 0;
+    _st_turns = 0;
+    _st_rows = (int)ids.size();
+  }
 
   // ---- engram rows (host) -------------------------------------------------
   // A long prefill's piece has them read ahead (forward(): `prep`, on a
@@ -3295,15 +4213,45 @@ MetalDeepseekV41Model::forward_piece_(
     if (_logits.empty()) { return fail("out of memory for logits"); }
   }
   // ---- the handshake (_fn_hs): a decode or verify step's resolves -----
+  // Not while expert misses are converted on the GPU: a step's misses
+  // are known only once the handshake's dispatch has posted its picks,
+  // and while that dispatch spins no other queue's work runs -- the
+  // conversion would wait on the spin, the spin on the conversion. The
+  // commits' path leaves the GPU idle while the host resolves.
   const bool hs = _hs_ok && !_hs_redo && n <= kKeepRows && _force.empty() &&
-                  _capture < 0 && prof_level < 2 && _study.k == 0;
+                  _capture < 0 && prof_level < 2 && _study.k == 0 &&
+                  !_gpu_conv;
   const bool study = _study.k > 0 && n == 1;
   // a few rows' independent dispatches side by side (VPIPE_DSV41_CONCURRENT)
   const bool conc = _concurrent && n <= kKeepRows && prof_level < 2;
   // a decode step's route inside the handshake's dispatch, by its whole
   // group (VPIPE_DSV41_HS_ROUTE); a verify's rows keep the route's own,
   // a group a row side by side
-  const bool fold_route = hs && _hs_route && n == 1;
+  // REMOTE EXPERTS: a decode row's far-held misses run there, through the
+  // handshake (its route then a dispatch of its own: the weights it
+  // writes are packed for the mailbox after it)
+  // (through the handshake's mailboxes, or -- a commit and wait a layer --
+  // the buffers themselves once the GPU is idle)
+  const bool remote_fwd = n == 1 && _far_compute != nullptr &&
+                          !_remote_off && _cache->far_on();
+  // ... and only the layers the far tier holds experts of carry its words
+  // (the rest keep the folded route and the plain mailboxes)
+  std::vector<std::uint8_t> rlay((std::size_t)c.n_layers, 0);
+  // (a pause counts down a layer step at a time, whether or not a layer
+  // carried the far side's words)
+  if (remote_fwd && _remote_pause > 0) {
+    _remote_pause = std::max(0, _remote_pause - c.n_layers);
+  }
+  if (remote_fwd && _remote_pause == 0) {
+    for (int l = 0; l < c.n_layers; ++l) {
+      rlay[(std::size_t)l] = _cache->far_holds_any(l) ? 1 : 0;
+    }
+  }
+  auto remote_at = [&](int l) { return rlay[(std::size_t)l] != 0; };
+  auto fold_at = [&](int l) {
+    return hs && _hs_route && n == 1 && !remote_at(l);
+  };
+  MoeExpertCache::Remote rem;
   // ---- CED: the decoder on the piece's last window ---------------------
   // The README's causal encoder-decoder: the decoder's global KV (layer
   // cmid's latents and index keys) is projected from the encoder's last
@@ -3321,7 +4269,7 @@ MetalDeepseekV41Model::forward_piece_(
   const bool ced = _ced && cmid >= 0 && n > T && !all_rows && nm == 0 &&
                    _force.empty() && _capture < cmid && !hs && !study;
   if (ced) { ++_ced_pieces; }
-  struct HsTurn { int L, aw; std::uint32_t seq; };
+  struct HsTurn { int L, aw; std::uint32_t seq; bool remote; };
   std::vector<HsTurn> turns;
   std::vector<CommandStream::Fence> fences;
   std::size_t served = 0;
@@ -3347,15 +4295,21 @@ MetalDeepseekV41Model::forward_piece_(
   int np = n * K;
   // a verify's few rows read each expert once for all its pairs (not under
   // the handshake: its grid is encoded before the picks are known)
-  const bool rows_groups = !hs && n > 1 && n <= kKeepRows && _rows_mm > 0;
+  const bool rows_groups = !hs && n > 1 && n <= kKeepRows && _rows_mm > 0 &&
+                           !_xiq;
   const int rk = _rows_mm >= 8 ? 2 : _rows_mm >= 4 ? 1 : 0;
   int ngroups = 0;
   // The host's part of a layer once its router has run: fp32's picks if
   // forced, the routes kept, the next layer's likeliest experts ranked,
   // and the cache's resolve (reading what it lacks) into the slots.
+  // `rx` (REMOTE): the row's weights and activation as the mailbox
+  // brought them, `rout` where the far side's rows (kRemoteRows x H / 2
+  // words) and the pair each goes in (kRemoteRows words, -1 none) are
+  // answered; null where the step runs none there.
   auto service = [&](int L, int aw, std::string& swhy,
                      const std::int32_t* eid, const float* ahead,
-                     std::int32_t* slot) -> bool {
+                     std::int32_t* slot, const std::uint32_t* rx,
+                     std::uint32_t* rout) -> bool {
     if ((std::size_t)L < _force.size() &&
         _force[(std::size_t)L].size() == (std::size_t)np) {
       force_picks_(_force[(std::size_t)L], n, E, K);
@@ -3366,7 +4320,7 @@ MetalDeepseekV41Model::forward_piece_(
       if (aw > 0) {
         // each row's likeliest by the biased score, as the router picks;
         // the rows' firsts, then their seconds, ..., each expert once
-        const Layer& nx = _layers[(std::size_t)L + 1];
+        const Layer& nx = _layers[(std::size_t)(L + _ahead_dist)];
         const auto* bias = static_cast<const float*>(nx.gate_b.contents());
         std::vector<float> v((std::size_t)E);
         std::vector<std::int32_t> top((std::size_t)(n * aw)), ord(E);
@@ -3394,12 +4348,170 @@ MetalDeepseekV41Model::forward_piece_(
             _ahead_rank[(std::size_t)na++] = e;
           }
         }
-        ah = {L + 1, _ahead_rank.data(), na};
+        ah = {L + _ahead_dist, _ahead_rank.data(), na};
       }
-      if (!_cache->resolve(L, eid, np, n, slot, &swhy,
-                           aw > 0 ? &ah : nullptr)) {
+      // REMOTE: the far side's call goes out as soon as the cache knows
+      // which pairs it runs, and runs while the cache reads the rest. The
+      // call owns its words (the mailbox moves on without it) and is
+      // waited for only so long: a late one is let run out, its answer
+      // dropped and its far slots let go when it ends.
+      std::shared_ptr<FarCall> call;
+      rem.start = nullptr;
+      rem.cap = kRemoteRows;
+      rem.clear();
+      // (a far call that failed earlier in this forward turns its later
+      // layers to the disk's path at once; one that does not pay, paused)
+      // (and one call at a time: a late one still running holds the next
+      // back -- far-memory.h's contract; a slow far side then costs one
+      // queued call, not a pile of them)
+      bool idle_far = false;
+      if (rx != nullptr) {
+        std::lock_guard<std::mutex> lk(_far_mu);
+        idle_far = _far_inflight == 0;
+      }
+      const bool run_far = rx != nullptr && !_remote_off &&
+                           _remote_pause == 0 && idle_far;
+      std::uint32_t* const rpairs =
+          rout != nullptr ? rout + (std::size_t)kRemoteRows * (H / 2)
+                          : nullptr;
+      if (rpairs != nullptr) {
+        for (int r = 0; r < kRemoteRows; ++r) { rpairs[r] = ~0u; }
+      }
+      if (run_far) {
+        rem.start = [&](const MoeExpertCache::Remote& r) {
+          call = std::make_shared<FarCall>();
+          FarCall& fc = *call;
+          fc.t0 = Clk::now();
+          fc.form.format =
+              _xiq ? kFarExpertsDeepseekGguf : kFarExpertsDeepseekFp4;
+          if (_xiq) {
+            const ExpertFmt& xf = _layers[(std::size_t)L].ex;
+            fc.form.arg[0] = (std::uint32_t)_far_tab_at;
+            fc.form.arg[1] = (std::uint32_t)(_far_tab_at >> 32);
+            fc.form.arg[2] = xf.gt[0] | (xf.gt[1] << 8) | (xf.gt[2] << 16);
+          }
+          fc.form.dtype = _bf16 ? 1u : 0u;
+          fc.form.hidden = (std::uint32_t)H;
+          fc.form.inter = (std::uint32_t)c.moe_inter;
+          fc.form.swiglu_limit = c.swiglu_limit;
+          fc.calls.resize(r.pair.size());
+          for (std::size_t i = 0; i < r.pair.size(); ++i) {
+            for (int k = 0; k < 6; ++k) {
+              // a GGUF's slot: w1's, w3's and w2's slabs (parts 0-2)
+              fc.calls[i].part[k] =
+                  !_xiq ? _cache->far_part_offset(r.far_slot[i], k)
+                  : k % 2 == 0 ? _cache->far_part_offset(r.far_slot[i], k / 2)
+                               : 0;
+            }
+            std::memcpy(&fc.calls[i].weight, rx + r.pair[i], 4);
+          }
+          fc.x.assign(rx + np, rx + np + H / 2);
+          fc.rows.assign(r.pair.size() * (std::size_t)(H / 2), 0u);
+          fc.rem.pair = r.pair;
+          fc.rem.far_slot = r.far_slot;
+          {
+            std::lock_guard<std::mutex> lk(_far_mu);
+            ++_far_inflight;
+          }
+          std::shared_ptr<FarCall> keep = call;
+          FarCompute* far = _far_compute;
+          MoeExpertCache* cache = _cache.get();
+          MetalDeepseekV41Model* self = this;
+          dispatch_async(
+              dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                FarCall& k = *keep;
+                bool ok = false;
+                std::string e;
+                try {
+                  ok = far->experts(k.form, k.x.data(), k.calls.data(),
+                                    k.calls.size(), k.rows.data(), &e);
+                } catch (...) {
+                  e = "the far call threw";
+                }
+                std::unique_lock<std::mutex> lk(k.mu);
+                k.ok = ok;
+                k.err = std::move(e);
+                k.done = true;
+                k.t1 = std::chrono::steady_clock::now();
+                const bool late = k.abandoned;
+                lk.unlock();
+                k.cv.notify_all();
+                if (late) { cache->remote_done(k.rem); }
+                std::lock_guard<std::mutex> fl(self->_far_mu);
+                --self->_far_inflight;
+                self->_far_cv.notify_all();
+              });
+        };
+      }
+      const bool rok = _cache->resolve(L, eid, np, n, slot, &swhy,
+                                       aw > 0 ? &ah : nullptr,
+                                       run_far ? &rem : nullptr);
+      bool fok = true, late = false;
+      if (call) {
+        // a few times what reading them would cost, 1 ms at least
+        const double alt =
+            _cache->read_seconds(_cache->slot_bytes() * rem.pair.size(),
+                                 true);
+        const auto wait = std::chrono::duration<double>(
+            std::max(1e-3, kRemoteDeadline * alt));
+        std::unique_lock<std::mutex> lk(call->mu);
+        if (!call->cv.wait_for(lk, wait, [&] { return call->done; })) {
+          call->abandoned = true;
+          late = true;
+        }
+        // the call's own time (its end stamped as it answered: not the
+        // step's own reads, waited for before this)
+        const double us =
+            late ? std::chrono::duration<double, std::micro>(Clk::now() -
+                                                             call->t0)
+                       .count()
+                 : std::chrono::duration<double, std::micro>(call->t1 -
+                                                             call->t0)
+                       .count();
+        lk.unlock();
+        _remote_ms += us / 1000.0;
+        fok = !late && call->ok;
+        if (!late && call->ok) {
+          note_remote_(us, alt * 1e6);
+          std::memcpy(rout, call->rows.data(), call->rows.size() * 4);
+        }
+      }
+      // a late call's far slots go when it ends; the rest now
+      if (!late) { _cache->remote_done(rem); }
+      if (!rok) {
         std::fill(slot, slot + np, 0);     // in bounds, at least
         return false;
+      }
+      if (!rem.pair.empty() && fok) {
+        // each row into its pair's place: the local combine adds them
+        for (std::size_t r = 0; r < rem.pair.size(); ++r) {
+          rpairs[r] = (std::uint32_t)rem.pair[r];
+        }
+        ++_remote_steps;
+        _remote_experts += rem.pair.size();
+      } else if (!rem.pair.empty()) {
+        // a late answer: these read as any miss (and the time it cost
+        // counted against far compute); a failure: off for good. Either
+        // way the layer's step is then counted twice in the cache's
+        // scores and timing -- once.
+        if (late) {
+          ++_remote_late;
+          note_remote_(kRemoteDeadline * 1e6 *
+                           _cache->read_seconds(_cache->slot_bytes() *
+                                                    rem.pair.size(),
+                                                true),
+                       0.0);
+        } else {
+          _remote_off = true;
+          if (const SessionContextIntf* ss = _mc->session()) {
+            ss->info(fmt("[dsv41] far experts: {} -- read from there from "
+                         "now on", call ? call->err : std::string()));
+          }
+        }
+        if (!_cache->resolve(L, eid, np, n, slot, &swhy)) {
+          std::fill(slot, slot + np, 0);
+          return false;
+        }
       }
       if (study) {
         _study.picks[(std::size_t)L].assign(eid, eid + np);
@@ -3445,6 +4557,10 @@ MetalDeepseekV41Model::forward_piece_(
             word(1).store(~0u, std::memory_order_release);
             return;
           }
+          if (hs_nap_us > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(hs_nap_us));
+          }
         }
         t_gpu += ms(t0, Clk::now());
       }
@@ -3461,10 +4577,13 @@ MetalDeepseekV41Model::forward_piece_(
       auto* bi = static_cast<std::int32_t*>(_hsbi.contents());
       // the GPU's words, once their checksum holds (they may land after
       // the post that announces them)
+      const std::uint32_t na = (std::uint32_t)(h.aw > 0 ? n * E : 0);
       const std::uint32_t no =
-          (std::uint32_t)(np + (h.aw > 0 ? n * E : 0));
+          (std::uint32_t)np + na +
+          (h.remote ? (std::uint32_t)(np + H / 2) : 0u);   // out
       const auto* bw = reinterpret_cast<const std::uint32_t*>(bo);
-      while (hs_sum_(bw, no, h.seq) != load_now_(bw[no])) {
+      while (host_handshake::sum(bw, no, h.seq) !=
+             host_handshake::load_now(bw[no])) {
         if (word(2).load(std::memory_order_relaxed) != 0 ||
             Clk::now() - t1 > std::chrono::seconds(1)) {
           hs_lost = true;
@@ -3473,13 +4592,20 @@ MetalDeepseekV41Model::forward_piece_(
         }
       }
       std::string why;
+      auto* biw = reinterpret_cast<std::uint32_t*>(bi);
+      const auto* rxw =
+          h.remote ? reinterpret_cast<const std::uint32_t*>(bo) + np + na
+                     : nullptr;
       if (!service(h.L, h.aw, why, bo,
-                   reinterpret_cast<const float*>(bo + np), bi)) {
+                   reinterpret_cast<const float*>(bo + np), bi, rxw,
+                   h.remote ? biw + np : nullptr)) {
         if (hs_err.empty()) { hs_err = "expert cache: " + why; }
         std::fill(bi, bi + np, 0);     // in bounds, at least
       }
-      auto* biw = reinterpret_cast<std::uint32_t*>(bi);
-      biw[np] = hs_sum_(biw, (std::uint32_t)np, h.seq);
+      const std::uint32_t ni =
+          (std::uint32_t)np +
+          (h.remote ? (std::uint32_t)(kRemoteRows * (H / 2 + 1)) : 0u);
+      biw[ni] = host_handshake::sum(biw, ni, h.seq);
       word(1).store(h.seq, std::memory_order_release);
       t_cache += ms(t1, Clk::now());
       ++served;
@@ -3960,7 +5086,7 @@ MetalDeepseekV41Model::forward_piece_(
     // router over this layer's FFN input -- the residual moves little from
     // one layer to the next -- ranks what that layer will pick; the cache
     // reads the likeliest it does not hold while the GPU runs this layer.
-    const int aw = n <= kKeepRows && L + 1 < c.n_layers
+    const int aw = n <= kKeepRows && L + _ahead_dist < c.n_layers
                        ? std::min(_cache->ahead_width(), _ahead_max) : 0;
     auto route = [&] {
       enc.set_function(_fn_route);
@@ -3987,8 +5113,8 @@ MetalDeepseekV41Model::forward_piece_(
     };
     auto ahead = [&] {
       if (aw > 0) {
-        gemm_f32_(enc, _layers[(std::size_t)L + 1].gate_w, _xa, 0,
-                  _ahead_sc, 0, H, E, n);
+        gemm_f32_(enc, _layers[(std::size_t)(L + _ahead_dist)].gate_w,
+                  _xa, 0, _ahead_sc, 0, H, E, n);
       }
     };
     if (conc) {
@@ -4019,7 +5145,7 @@ MetalDeepseekV41Model::forward_piece_(
       }
       // folded, the route runs in the handshake's dispatch, the shared
       // expert's activation beside it (below)
-      if (!fold_route) {
+      if (!fold_at(L)) {
         auto cs = enc.concurrent_scope();
         route();
         swiglu();
@@ -4029,7 +5155,7 @@ MetalDeepseekV41Model::forward_piece_(
       hc_mix(ly.hf_fn, ly.hf_scale, ly.hf_base, _mixF);
       mark(kHc);
       gemm_f32_(enc, ly.gate_w, _xa, 0, _sc, 0, H, E, n);
-      if (!fold_route) { route(); }
+      if (!fold_at(L)) { route(); }
       mark(kRoute);
       // the shared expert runs while the routed ones are read
       gemm_p_(enc, ly.sh_w13, _xa, 0, _gu, 0, n);
@@ -4048,10 +5174,27 @@ MetalDeepseekV41Model::forward_piece_(
     }
     mark(kShared);
     if (hs) {
+      if (hs_study) {
+        // this layer's work goes alone; the turn's buffer after it
+        n_disp += enc.dispatch_count();
+        enc.end();
+        (void)stream.commit();
+        enc = stream.begin_compute();
+      }
       // the host's turn inside the running buffers: picks (and the next
       // layer's scores) out, slots in; this layer's buffer goes now, and
       // the host answers as the GPU posts, kHsAhead layers behind at most
       const std::uint32_t seq = (std::uint32_t)turns.size() + 1;
+      const bool remote_l = remote_at(L), fold_route = fold_at(L);
+      if (remote_l) {
+        enc.set_function(_fn_pack_remote);
+        enc.set_buffer(0, _wt);
+        enc.set_buffer(1, _xa);
+        enc.set_buffer(2, _rx);
+        enc.set_constant(3, np);
+        enc.set_constant(4, (int)(H / 2));
+        enc.dispatch({256, 1, 1}, {256, 1, 1});
+      }
       {
         auto cs = enc.concurrent_scope(fold_route && conc);
         if (fold_route && conc) { swiglu(); }
@@ -4072,15 +5215,24 @@ MetalDeepseekV41Model::forward_piece_(
         enc.set_buffer(0, _hsf);
         enc.set_buffer(1, _eid);
         enc.set_buffer(2, aw > 0 ? _ahead_sc : _eid);
-        enc.set_buffer(3, _eid);
+        enc.set_buffer(3, remote_l ? _rx : _eid);
         enc.set_buffer(4, _hsbo);
         enc.set_buffer(5, _hsbi);
         enc.set_buffer(6, _slot);
-        enc.set_buffer(7, _slot);
-        enc.set_buffer(8, _slot);
+        // the rows and their pairs, one buffer: the pairs after the rows
+        enc.set_buffer(7, remote_l ? _rans : _slot);
+        if (remote_l) {
+          enc.set_buffer(8, _rans, (std::size_t)kRemoteRows * (H / 2) * 4);
+        } else {
+          enc.set_buffer(8, _slot);
+        }
+        const std::uint32_t hw2 = (std::uint32_t)(H / 2);
         const std::uint32_t nv[4] = {
-            (std::uint32_t)np, aw > 0 ? (std::uint32_t)(n * E) : 0u, 0u, seq};
-        const std::uint32_t mv[4] = {(std::uint32_t)np, 0u, 0u, _hs_spins};
+            (std::uint32_t)np, aw > 0 ? (std::uint32_t)(n * E) : 0u,
+            remote_l ? (std::uint32_t)np + hw2 : 0u, seq};
+        const std::uint32_t mv[4] = {
+            (std::uint32_t)np, remote_l ? kRemoteRows * hw2 : 0u,
+            remote_l ? (std::uint32_t)kRemoteRows : 0u, _hs_spins};
         enc.set_constant_bytes(9, nv, sizeof nv);
         enc.set_constant_bytes(10, mv, sizeof mv);
         enc.dispatch({256, 1, 1}, {256, 1, 1});
@@ -4089,10 +5241,20 @@ MetalDeepseekV41Model::forward_piece_(
       enc.end();
       fences.push_back(stream.commit());
       enc = stream.begin_compute();
-      turns.push_back({L, aw, seq});
+      turns.push_back({L, aw, seq, remote_l});
       serve(L - kHsAhead);
     } else {
       std::string why;
+      const bool remote_l = remote_at(L);
+      if (remote_l) {
+        enc.set_function(_fn_pack_remote);
+        enc.set_buffer(0, _wt);
+        enc.set_buffer(1, _xa);
+        enc.set_buffer(2, _rx);
+        enc.set_constant(3, np);
+        enc.set_constant(4, (int)(H / 2));
+        enc.dispatch({256, 1, 1}, {256, 1, 1});
+      }
       const auto t0 = Clk::now();
       n_disp += enc.dispatch_count();
       if (!CommandStream::sync_and_reopen(enc, &why)) {
@@ -4100,13 +5262,21 @@ MetalDeepseekV41Model::forward_piece_(
         return fail("GPU: " + why);
       }
       const auto t1 = Clk::now();
+      // the far side's answer straight into the buffer the put reads, as
+      // the mailbox lays it out (the GPU idle until the next commit)
       if (!service(L, aw, why,
                    static_cast<const std::int32_t*>(_eid.contents()),
                    static_cast<const float*>(_ahead_sc.contents()),
-                   static_cast<std::int32_t*>(_slot.contents()))) {
+                   static_cast<std::int32_t*>(_slot.contents()),
+                   remote_l ? static_cast<const std::uint32_t*>(
+                                  _rx.contents())
+                            : nullptr,
+                   remote_l ? static_cast<std::uint32_t*>(_rans.contents())
+                            : nullptr)) {
         cx.hist.resize(hist0);
         return fail("expert cache: " + why);
       }
+
       const auto t2 = Clk::now();
       t_gpu += ms(t0, t1);
       t_cache += ms(t1, t2);
@@ -4144,8 +5314,47 @@ MetalDeepseekV41Model::forward_piece_(
                        (aff ? qf13.gun.valid() && qf2.dgn.valid() : true);
       const unsigned gx = nax ? (unsigned)(I / 64 * 32) : (unsigned)I;
       const unsigned dx = nax ? (unsigned)(H / 64 * 32) : (unsigned)H;
-      if (nax) { _nax_gemms += 2; }
-      if (aff) {
+      // a GGUF's own blocks on the matrix cores where its twins loaded
+      // (whole 256-value blocks a row, as the simdgroup twins read them)
+      const bool nax_iq = _xiq && nax && _fn_iq_gun.valid() &&
+                          _fn_iq_dnn.valid() && I % 256 == 0 &&
+                          H % 256 == 0;
+      if (nax && (!_xiq || nax_iq)) { _nax_gemms += 2; }
+      if (_xiq) {
+        {
+        auto cs = enc.concurrent_scope(conc);
+        enc.set_function(nax_iq ? _fn_iq_gun : _fn_iq_gu_g);
+        enc.set_buffer(0, _cache->pool(0));
+        enc.set_buffer(1, _cache->pool(1));
+        enc.set_buffer(2, _iq_tab);
+        enc.set_buffer(3, _xa);
+        enc.set_buffer(4, _act);
+        enc.set_buffer(5, _srow);
+        enc.set_buffer(6, _swt);
+        enc.set_buffer(7, _tile2e);
+        enc.set_constant(8, H);
+        enc.set_constant(9, I);
+        enc.set_constant(10, c.swiglu_limit);
+        enc.set_constant(11, ly.ex.gt[0]);
+        enc.set_constant(12, ly.ex.gt[1]);
+        enc.set_constant(13, _xiw13);
+        enc.dispatch({nax_iq ? gx : (unsigned)I, tiles * 2, 2}, {32, 2, 2});
+        expert_side();
+        }
+        enc.set_function(nax_iq ? _fn_iq_dnn : _fn_iq_dn_g);
+        enc.set_buffer(0, _cache->pool(2));
+        enc.set_buffer(1, _iq_tab);
+        enc.set_buffer(2, _act);
+        enc.set_buffer(3, _part);
+        enc.set_buffer(4, _sdst);
+        enc.set_buffer(5, _tile2e);
+        enc.set_constant(6, I);
+        enc.set_constant(7, H);
+        enc.set_constant(8, ly.ex.gt[2]);
+        enc.set_constant(9, _xiw2);
+        enc.dispatch({nax_iq ? dx : (unsigned)H, tiles * 2, 2}, {32, 2, 2});
+        ++_grouped_steps;
+      } else if (aff) {
         {
         auto cs = enc.concurrent_scope(conc);
         enc.set_function(nax ? qf13.gun : qf13.gu);
@@ -4207,6 +5416,60 @@ MetalDeepseekV41Model::forward_piece_(
         enc.dispatch({dx, tiles * 2, 2}, {32, 2, 2});
         ++_grouped_steps;
       }
+    } else if (_xiq) {
+      // a GGUF's own blocks: one pair a threadgroup column -- or, a
+      // verify's few rows, one group of the pairs that share an expert
+      // (grouped on the GPU: under the handshake the picks are its own)
+      const unsigned nz = (unsigned)np;
+      // (_iq_gtab holds kKeepRows x top_k pairs: a short prefill's pairs
+      // go one by one)
+      const bool grp = _iq_groups && n > 1 && n <= kKeepRows;
+      if (grp) {
+        enc.set_function(_fn_iq_grp);
+        enc.set_buffer(0, _slot);
+        enc.set_buffer(1, _iq_gtab);
+        enc.set_constant(2, np);
+        enc.set_constant(3, 8);
+        enc.dispatch({1, 1, 1}, {1, 1, 1});
+      }
+      {
+      auto cs = enc.concurrent_scope(conc);
+      enc.set_function(grp ? _fn_iq_swg
+                           : ly.ex.gt[0] == 29 || ly.ex.gt[0] == 18
+                               ? _fn_iq_sw1
+                               : _fn_iq_sw);
+      enc.set_buffer(0, _cache->pool(0));
+      enc.set_buffer(1, _cache->pool(1));
+      enc.set_buffer(2, _iq_tab);
+      enc.set_buffer(3, _xa);
+      enc.set_buffer(4, _act);
+      enc.set_buffer(5, grp ? _iq_gtab : _slot);
+      enc.set_buffer(6, _wt);
+      enc.set_constant(7, H);
+      enc.set_constant(8, I);
+      enc.set_constant(9, K);
+      enc.set_constant(10, c.swiglu_limit);
+      enc.set_constant(11, ly.ex.gt[0]);
+      enc.set_constant(12, ly.ex.gt[1]);
+      enc.set_constant(13, _xiw13);
+      // a lane a sub-block, 2 rows a simdgroup, 4 simdgroups
+      enc.dispatch({32, (unsigned)(((I + 7) / 8) * 4), nz}, {32, 4, 1});
+      expert_side();
+      }
+      enc.set_function(grp ? _fn_iq_dng
+                           : ly.ex.gt[2] == 29 || ly.ex.gt[2] == 18
+                               ? _fn_iq_dn1
+                               : _fn_iq_dn);
+      enc.set_buffer(0, _cache->pool(2));
+      enc.set_buffer(1, _iq_tab);
+      enc.set_buffer(2, _act);
+      enc.set_buffer(3, _part);
+      enc.set_buffer(4, grp ? _iq_gtab : _slot);
+      enc.set_constant(5, I);
+      enc.set_constant(6, H);
+      enc.set_constant(7, ly.ex.gt[2]);
+      enc.set_constant(8, _xiw2);
+      enc.dispatch({32, (unsigned)(((H + 7) / 8) * 4), nz}, {32, 4, 1});
     } else if (aff) {
       // the affine twins: 8 lanes a row, so 8 features (outputs) a
       // threadgroup; a few rows' groups as their FP4 kernels take them
@@ -4271,6 +5534,16 @@ MetalDeepseekV41Model::forward_piece_(
       enc.set_constant(6, H);
       enc.dispatch({32, (unsigned)((H / 8) * 2), nz}, {32, 2, 1});
     }
+    if (remote_at(L)) {
+      // the far side's rows in their pairs' places, whichever kernels ran
+      // the rest (each reads the zero slot for them)
+      enc.set_function(_fn_put_remote);
+      enc.set_buffer(0, _part);
+      enc.set_buffer(1, _rans);
+      enc.set_buffer(2, _rans, (std::size_t)kRemoteRows * (H / 2) * 4);
+      enc.set_constant(3, (int)H);
+      enc.dispatch({(unsigned)H, (unsigned)kRemoteRows, 1}, {256, 1, 1});
+    }
     defer_post_moe(_mixF);
     if (_capture == L) {
       flush_post();
@@ -4330,7 +5603,12 @@ MetalDeepseekV41Model::forward_piece_(
       all_ok = false;
       why = w;
     }
+    if (hs_study) {
+      _st_hs_ms += f.gpu_times().gpu_s * 1e3;
+      ++_st_turns;
+    }
   }
+  if (hs_study) { _st_end = CommandStream::host_seconds(); }
   if (hs) {
     hs_beating_(false);
     if (hs_lost || word(2).load(std::memory_order_relaxed) != 0) {
@@ -4646,9 +5924,50 @@ MetalDeepseekV41Model::dspark_draft(CtxId ctx, std::int32_t token,
 }
 
 std::size_t
+MetalDeepseekV41Model::gguf_native_expert_bytes(const std::string& model_dir)
+{
+  // init_'s rule and slots: every routed-expert stack IQ2_XXS, IQ2_XS,
+  // IQ2_S, IQ3_XXS or IQ1_M, the slot each weight as wide as the widest
+  // layer's
+  const char* v = std::getenv("VPIPE_DSV41_GGUF_NATIVE");
+  if (v != nullptr && std::atoi(v) == 0) { return 0; }
+  const std::string first = find_gguf_in_dir(model_dir);
+  if (first.empty()) { return 0; }
+  const auto g = GgufFile::open(first);
+  if (!g) { return 0; }
+  auto bb = [](std::uint32_t t) -> std::size_t {
+    return t == 16 ? 66 : t == 17 ? 74 : t == 29 ? 56 : t == 22 ? 82
+           : t == 18 ? 98 : 0;
+  };
+  static const char* kRole[3] = {"ffn_gate_exps", "ffn_up_exps",
+                                 "ffn_down_exps"};
+  std::size_t c13 = 0, c2 = 0, layers = 0, E = 0;
+  for (int L = 0;; ++L) {
+    const GgufFile::Tensor* t0 =
+        g->tensor(std::format("blk.{}.{}.weight", L, kRole[0]));
+    if (t0 == nullptr) { break; }
+    for (int r = 0; r < 3; ++r) {
+      const GgufFile::Tensor* t =
+          g->tensor(std::format("blk.{}.{}.weight", L, kRole[r]));
+      if (t == nullptr || t->dims.size() != 3 || bb(t->type) == 0 ||
+          t->dims[0] % 256 != 0) {
+        return 0;
+      }
+      const std::size_t row = (std::size_t)(t->dims[0] / 256) * bb(t->type);
+      const std::size_t part = row * (std::size_t)t->dims[1];
+      (r < 2 ? c13 : c2) = std::max(r < 2 ? c13 : c2, part);
+      E = (std::size_t)t->dims[2];
+    }
+    ++layers;
+  }
+  return (2 * c13 + c2) * E * layers;
+}
+
+std::size_t
 MetalDeepseekV41Model::dspark_bytes(const std::string& model_dir)
 {
-  auto w = MetalLlamaWeights::open_model(model_dir);
+  const std::string sd = DeepseekV41Config::dspark_dir(model_dir);
+  auto w = MetalLlamaWeights::open_model(sd.empty() ? model_dir : sd);
   if (!w.has_value()) { return 0; }
   std::size_t b = 0;
   for (const std::string& nm : w->tensor_names()) {

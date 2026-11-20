@@ -39,6 +39,17 @@ public:
   bool init(const DeepseekV41Config& cfg, const std::string& tokenizer_json,
             std::string* err);
 
+  // From a llama.cpp GGUF's own tables (engram_token_map, _multipliers
+  // [layers][n-gram], _primes and _offsets [layers][columns]): the token
+  // map taken as written (its size the config's compressed vocabulary),
+  // the rest derived as init() derives them and refused where the file's
+  // differ.
+  bool init_tables(const DeepseekV41Config& cfg,
+                   std::span<const std::int32_t> token_map,
+                   std::span<const std::int64_t> multipliers,
+                   std::span<const std::int64_t> primes,
+                   std::span<const std::int64_t> offsets, std::string* err);
+
   // The compressed id of each token id ([vocab]).
   const std::vector<std::int32_t>& token_map() const { return _map; }
   int compressed_vocab() const { return _cvocab; }
@@ -72,6 +83,9 @@ public:
   static std::string normalize(const std::string& utf8);
 
 private:
+  // The primes, offsets and multipliers from the config and _cvocab.
+  bool derive_(const DeepseekV41Config& cfg, std::string* err);
+
   std::vector<std::int32_t> _map;
   int _cvocab = 0;
   int _ngram = 0, _heads = 0, _cols = 0;

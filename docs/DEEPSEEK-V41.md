@@ -57,6 +57,87 @@ vpipe gives every expert a cache slot of one size, as wide as the widest
 layer's. oQ2.5e's six 3-bit layers make every slot a 3-bit one, so in
 memory that pack takes as much room as oQ3e (238 GB, not 199).
 
+### GGUFs: IQ2_XXS and IQ2_XS
+
+[AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF](https://huggingface.co/AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF)
+publishes the 1017 update as llama.cpp-format GGUFs: ISTA-DASLab's GSQ-RCO
+quantizations, with DeepSeek's refusal direction projected out of three of
+the dense tensors. vpipe reads two of its rungs: IQ2_XXS (138 GB, four
+files) and IQ2_XS (155 GB). Neither carries the n-gram tables. Those are
+one shared file from
+[ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
+`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` (110.6 GB), fetched once for both
+rungs. vpipe looks for it beside the shards, then in its own repository's
+folder under the same models directory, which is where `model-fetch` puts
+it.
+
+- **[`prepare-deepseek-v41-flash-gguf.vpipeline`](pipelines/prepare-deepseek-v41-flash-gguf.vpipeline)**
+  -- fetch the IQ2_XXS files and the n-gram table, and register them (for
+  IQ2_XS, change `model_variant`).
+- **[`deepseek-v41-flash-gguf-chat.vpipeline`](pipelines/deepseek-v41-flash-gguf-chat.vpipeline)**
+  -- the chat, text only.
+
+What vpipe does with the blocks:
+
+- **The projections** (attention, the shared expert, the engram's, the
+  embedding and the head) are Q8_0 and Q5_K in these files. They are
+  held as 8- and 5-bit affine codes at group 32, with the files' own codes.
+  What rounds is each group's scale in bf16 (0.17% of a weight) and, for
+  Q5_K, its offset (0.4%). Everything else -- the norms, the hyper-
+  connections, the router, the compressors and the indexers -- is read as
+  stored.
+- **The routed experts run in the files' own blocks.** The expert
+  cache's slots hold each expert's bytes as the file stores them (IQ2_XXS,
+  IQ2_XS, IQ2_S, IQ3_XXS, IQ1_M), and the decode, a speculative verify's
+  few rows and a prefill read them through kernels of their own: nothing
+  is converted on a miss, and an expert takes its ~9-10 MB in the file,
+  so a cache holds about four times as many as it would converted. A
+  verify's rows are computed exactly as the decode's, so speculative
+  decoding keeps the plain decode's tokens. On a Mac with matrix cores
+  (M5) a prompt's experts run on them: on an M5 Ultra with every expert
+  held, a 158,000-token prompt reads at about 2,200 tokens a second (1,540
+  on the other kernels) and a warm 2,500-token one at about 1,240; with a
+  64 GB cache prompts wait on the drive (about 500).
+  `VPIPE_DSV41_IQ_NAX=0` keeps the other kernels. The cache never holds
+  fewer than two layers of experts: ~7 GB this way (computed from the
+  files; not yet run on a box smaller than 64 GB) beside ~9 GB of the
+  rest.
+- `VPIPE_DSV41_GGUF_NATIVE=0` converts them as they are read into the
+  cache's affine layout instead. IQ2_XXS and IQ3_XXS keep their own
+  codes, at 8 and 6 bits; IQ1_M, IQ2_XS and IQ2_S carry a scale for every
+  16 weights, which that layout (a scale per 32) cannot hold exactly, so
+  they are rounded to 8 bits (0.4-0.5% of a weight). An expert then takes
+  ~40 MB, and the cache's floor is ~31 GB.
+- **DSpark** (speculative decoding): the files carry no draft head. Put
+  the release's `mtp.*` shards and its `config.json` in a folder named
+  `dspark` beside the GGUF files and vpipe reads the head from there --
+  as with the MLX packs, it is loaded only where every expert fits in
+  memory beside it.
+- No vision tower (text only).
+
+Checked against the release: the config, the tokenizer (token for token
+against the release's `tokenizer.json`) and the engram's hash tables are
+the release's. Every converted tensor matches the file's own decode within
+the rounding above. Against the oQ4e pack, the projections agree to cosine
+0.999-1.000 and the 2-bit experts to 0.82-0.95.
+
+Measured with the experts converted (as `VPIPE_DSV41_GGUF_NATIVE=0` runs
+them now; the native slots are not measured yet), on an M4 Pro with 64 GB,
+the files on an external Thunderbolt drive, the expert cache at its least
+(31 GB): both answer a short question
+right and write fluently, at about half a second a token (nearly every
+token reads experts from the drive). The n-gram table's rows agree with
+the oQ4e pack's to cosine 0.994.
+
+| rung | prefill logits from the oQ4e's fp32 | decisive picks held | decode, ms a token |
+|---|---|---|---|
+| IQ2_XXS | 0.51 | 22 of 23 | 490 |
+| IQ2_XS | 0.47 | 23 of 23 | 430 |
+
+That pack's own bf16 run is 0.08 from its fp32: the distance is the 2-bit
+experts'. Converted, the model held 38.9 GB either way: the cache and 8.3
+GB of the rest.
+
 ## What you need
 
 | | |
@@ -210,10 +291,11 @@ Most of a token's GPU time on this machine is not reading weights but
 waiting for small steps to finish, so the decode is built to keep the GPU
 busy: the attention splits each head's keys across the GPU, the
 projections spread a row across eight lanes, independent steps run side
-by side, and on an M5 Ultra a layer hands its expert picks to the CPU
-inside the running GPU work (~3 microseconds) instead of stopping the GPU
-for each of the 40 layers (~0.3 ms each). vpipe checks at load whether the
-GPU can do that and falls back to stopping where it cannot.
+by side, and a layer hands its expert picks to the CPU inside the
+running GPU work (~3 microseconds) instead of stopping the GPU for each
+of the 40 layers (~0.3 ms each). vpipe checks at load whether the GPU can
+do that -- an M4 Pro, an M5 and an M5 Ultra all can -- and falls back to
+stopping where it cannot.
 
 On an M4 Pro with 64 GB and the oQ4e pack on an external Thunderbolt
 SSD (about 0.8 GB/s):
@@ -313,6 +395,39 @@ against 139 released: loading the model again costs the turns more than
 the picture gains. A cache asked for under the floor loads the floor,
 and its load line says so ("a 13770 MB expert cache ... 7629 MB asked
 for, under the least it runs with").
+
+## Another Mac's memory (PROTOTYPE)
+
+A Mac whose expert cache is small can borrow a second machine's memory as
+a FAR TIER (text-chat's `far_memory`: a plugin's transport -- over
+Thunderbolt RDMA, say -- and its parameters, passed through). The experts
+the cache lets go are kept there and read back over the cables beside the
+drive; where the far side also runs experts (far-compute/2), a decode
+row's misses held there are run there and only their output rows come
+back. A far side running vpipe's own kernels hands back the local
+kernels' rows to the bit, so the reply is what it would have been with no
+far tier; one summing in another order gives replies that differ from run
+to run (and DSpark's are then no longer a plain decode's). A call that
+takes longer than a few times what reading its experts would cost is
+dropped for the read; a far side that does not pay is left alone for a
+while.
+
+What to expect (the IQ2_XXS GGUF, an M5 Ultra with 46 GB of an M5 Max's
+memory over three Thunderbolt 5 cables, tokens a second, one run each):
+
+| cache | DSpark | alone | far memory | far compute |
+|---|---|---|---|---|
+| 32 GB | off | 24.3 | 27.9 | 29.5 |
+| 32 GB | on | 29.9 | 31.8 | 34.4 |
+| 64 GB | off | 39.6 | 41.9 | 40.0 |
+| 64 GB | on | 53.0 | 59.4 | 58.6 |
+| 128 GB | off | 50.6 | 48.6 | 48.9 |
+| 128 GB | on | 77.9 | 74.7 | 76.3 |
+
+It pays where many misses are held far -- a small cache -- and decode
+rows are most of the steps; at 128 GB the far tier is not read (the
+differences there, 2-4%, are within a run's noise of +-5%). Off:
+VPIPE_DSV41_FAR_COMPUTE=0 (far memory alone).
 
 ## What is not here yet
 

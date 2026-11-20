@@ -5,6 +5,8 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <dispatch/dispatch.h>
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -60,6 +62,34 @@ MoeExpertCache::~MoeExpertCache()
     }
     _workers->work_cv.notify_all();
     for (auto& t : _workers->threads) { t.join(); }
+    for (auto& t : _far_threads) { t.join(); }
+  }
+  // What the cache -- and its far tier -- did over its life: the
+  // figures that say whether either paid (read once the readers and
+  // writers are done).
+  if (_mc != nullptr && _stats.picks > 0) {
+    if (const SessionContextIntf* sess = _mc->session()) {
+      const Stats& st = _stats;
+      std::string far;
+      if (_far) {
+        far = fmt("; far tier {}: {} read ({} beside the disk; {} MB), {} "
+                  "run there, {} "
+                  "written, {} let go, {} not written; a GB {:.0f} ms far, "
+                  "{:.0f} ms disk",
+                  _far_dead ? "let go" : "on", st.far_reads, st.far_split,
+                  st.far_bytes_read >> 20, st.far_computed, st.far_writes,
+                  st.far_evicted,
+                  st.far_dropped, _far_spb * 1e12, _disk_spb * 1e12)();
+      }
+      sess->info(fmt("[moe-cache] {:.1f}% hits over {} picks, {} ms "
+                     "waited ({:.0f} on own reads, {:.0f} on reads ahead); "
+                     "{} MB read from disk; {} read ahead, {} of them "
+                     "picked, {} dropped, width now {}{}",
+                     100.0 * st.hit_rate(), st.picks,
+                     (long long)(st.read_ms + st.wait_ms), st.read_ms,
+                     st.wait_ms, st.bytes_read >> 20, st.ahead_read,
+                     st.ahead_hits, st.ahead_dropped, _aw.width, far));
+    }
   }
 }
 
@@ -78,6 +108,11 @@ MoeExpertCache::create(metal_compute::MetalCompute* mc, const Options& opt,
   std::unique_ptr<MoeExpertCache> c(new MoeExpertCache());
   c->_mc = mc;
   c->_opt = opt;
+  // VPIPE_MOE_HALF_LIFE=<steps of a layer>: how long the scores remember
+  // (an A/B).
+  if (const char* v = std::getenv("VPIPE_MOE_HALF_LIFE")) {
+    c->_opt.half_life = std::max(1, std::atoi(v));
+  }
   c->_fill = std::move(fill);
   c->_resident = opt.resident;
   c->_transient = opt.transient;
@@ -85,16 +120,40 @@ MoeExpertCache::create(metal_compute::MetalCompute* mc, const Options& opt,
   // Its model's experts (common/memory-owner.h), under whatever owns the
   // load that makes it.
   MemoryUseScope use(MemoryUse::kExperts);
+  for (std::size_t b : opt.part_bytes) { c->_slot_bytes += b; }
+  // The far memory's size (a plugin's call: a throw is a far memory that
+  // is not there), and how many of these slots it holds.
+  const std::size_t keys = (std::size_t)opt.layers * opt.experts;
+  std::uint64_t far_bytes = 0;
+  if (opt.far) {
+    try {
+      far_bytes = opt.far->bytes();
+    } catch (...) {
+      far_bytes = 0;
+    }
+  }
+  if (far_bytes > opt.far_reserve) {
+    const std::uint64_t room = far_bytes - opt.far_reserve;
+    c->_far_reserved_at = room;
+    const std::uint64_t n = room / c->_slot_bytes;
+    c->_far_slots = (int)std::min<std::uint64_t>(n, keys);
+  }
+  // one slot more, all zero, where the model asks for it (REMOTE)
+  const int pooled =
+      slots + (opt.zero_slot && c->_far_slots > 0 ? 1 : 0);
   for (std::size_t b : opt.part_bytes) {
-    c->_slot_bytes += b;
-    SharedBuffer p = mc->make_shared_buffer(b * (std::size_t)slots);
+    SharedBuffer p = mc->make_shared_buffer(b * (std::size_t)pooled);
     if (p.empty()) {
       return fail(std::format("expert cache: could not allocate {} MB",
-                              (b * (std::size_t)slots) >> 20));
+                              (b * (std::size_t)pooled) >> 20));
+    }
+    if (pooled > slots) {
+      std::memset(static_cast<std::uint8_t*>(p.contents()) +
+                      b * (std::size_t)slots, 0, b);
     }
     c->_pool.push_back(std::move(p));
   }
-  const std::size_t keys = (std::size_t)opt.layers * opt.experts;
+  if (pooled > slots) { c->_zero = slots; }
   c->_slot_of.assign(keys, -1);
   c->_score.assign(keys, 0.0f);
   const std::size_t S = (std::size_t)slots;
@@ -110,6 +169,45 @@ MoeExpertCache::create(metal_compute::MetalCompute* mc, const Options& opt,
     c->_spare[(std::size_t)s] = s;
     c->_spare_at[(std::size_t)s] = s;
   }
+  c->_pinned.assign(S, 0);
+  {
+    std::size_t at = 0;   // a slot's part k at this offset in the far tier
+    for (std::size_t b : opt.part_bytes) {
+      c->_part_off.push_back(at);
+      at += b;
+    }
+  }
+  if (c->_far_slots > 0) {
+    c->_far = opt.far;
+    c->_far_one_offs = opt.far_one_offs;
+    // VPIPE_MOE_FAR_LAZY=1: an expert taken home keeps its far copy (an
+    // A/B; see far_offer_).
+    if (const char* v = std::getenv("VPIPE_MOE_FAR_LAZY")) {
+      c->_far_lazy = std::atoi(v) != 0;
+    }
+    if (const char* v = std::getenv("VPIPE_MOE_FAR_ADMIT")) {
+      c->_far_one_offs = std::string_view(v) == "all";
+    }
+    const std::size_t F = (std::size_t)c->_far_slots;
+    c->_far_key.assign(F, -1);
+    c->_far_ready.assign(F, 0);
+    c->_far_reading.assign(F, 0);
+    c->_far_of.assign(keys, -1);
+    for (int f = c->_far_slots - 1; f >= 0; --f) {
+      c->_far_free.push_back(f);
+    }
+    if (const SessionContextIntf* sess = mc->session()) {
+      std::string where;
+      try {
+        where = c->_far->describe();
+      } catch (...) {
+        where = "far memory";
+      }
+      if (where.empty()) { where = "far memory"; }
+      sess->info(fmt("[moe-cache] far tier: {} experts ({} MB) in {}",
+                     c->_far_slots, (F * c->_slot_bytes) >> 20, where));
+    }
+  }
   for (int w : opt.ahead_widths) {
     if (w >= 0) { c->_aw.widths.push_back(std::min(w, opt.experts)); }
   }
@@ -120,13 +218,20 @@ MoeExpertCache::create(metal_compute::MetalCompute* mc, const Options& opt,
   c->_workers = std::make_unique<Pool>();
   // VPIPE_MOE_EXPERT_THREADS=<n> sets the readers (an A/B: the drive
   // decides how many requests in flight it answers best)
-  int threads = opt.threads;
+  // With a far tier, readers for it beside the drive's: a far read waits
+  // on the link, not the drive.
+  int threads = opt.threads + (c->_far ? 4 : 0);
   if (const char* e = std::getenv("VPIPE_MOE_EXPERT_THREADS")) {
     threads = std::clamp(std::atoi(e), 1, 64);
   }
   const int nt = std::max(1, threads - 1);       // the caller is one more
   for (int t = 0; t < nt; ++t) {
     c->_workers->threads.emplace_back([p = c.get()] { p->worker_(); });
+  }
+  if (c->_far) {
+    for (int t = 0; t < std::max(1, opt.far_writes); ++t) {
+      c->_far_threads.emplace_back([p = c.get()] { p->far_writer_(); });
+    }
   }
   return c;
 }
@@ -148,22 +253,327 @@ MoeExpertCache::run_(int s, std::unique_lock<std::mutex>& lk,
   Pool& w = *_workers;
   _io[(std::size_t)s] = kRunning;
   const std::int32_t key = _key[(std::size_t)s];
+  // Held far (and written): read from there.
+  int fs = -1;
+  if (_far && !_far_dead) {
+    fs = _far_of[(std::size_t)key];
+    if (fs >= 0 && _far_ready[(std::size_t)fs] == 0) { fs = -1; }
+    if (fs >= 0) { ++_far_reading[(std::size_t)fs]; }
+  }
+  // Shared between the link and the disk where the fill can: the far
+  // share by how fast each has been.
+  const bool split = fs >= 0 && _opt.fill_skips_null;
+  double share = 0.5;
+  if (split && _far_spb > 0 && _disk_spb > 0) {
+    share = std::clamp(_disk_spb / (_disk_spb + _far_spb), 0.15, 0.85);
+  }
   lk.unlock();
   slot_ptrs_(s, dst);
-  std::string e;
-  const bool ok =
-      _fill(key / _opt.experts, key % _opt.experts, dst, &e);
+  std::string e, fe;
+  bool far_ok = false;
+  const std::size_t np = std::min<std::size_t>(_pool.size(), 16);
+  // Which parts come over the link: the largest first, each to the side
+  // further below its share of the bytes.
+  std::uint8_t far_part[16] = {};
+  if (fs >= 0) {
+    if (!split) {
+      std::fill(far_part, far_part + np, 1);
+    } else {
+      std::size_t order[16];
+      for (std::size_t k = 0; k < np; ++k) { order[k] = k; }
+      std::sort(order, order + np, [&](std::size_t a, std::size_t b) {
+        return _opt.part_bytes[a] > _opt.part_bytes[b];
+      });
+      double fb = 0, db = 0;
+      for (std::size_t j = 0; j < np; ++j) {
+        const std::size_t k = order[j];
+        const double b = (double)_opt.part_bytes[k];
+        if (fb / share <= db / (1.0 - share)) {
+          far_part[k] = 1;
+          fb += b;
+        } else {
+          db += b;
+        }
+      }
+    }
+  }
+  double far_s = 0, disk_s = 0;
+  std::size_t far_b = 0, disk_b = 0;
+  auto far_read = [&] {
+    FarPiece pc[16];
+    std::size_t n = 0;
+    const std::uint64_t at = (std::uint64_t)fs * _slot_bytes;
+    for (std::size_t k = 0; k < np; ++k) {
+      if (far_part[k] == 0) { continue; }
+      pc[n++] = {at + _part_off[k], dst[k], _opt.part_bytes[k]};
+      far_b += _opt.part_bytes[k];
+    }
+    const auto t0 = Clock::now();
+    try {
+      far_ok = _far->read(pc, n, &fe);
+    } catch (...) {
+      fe = "the far read threw";
+    }
+    far_s = std::chrono::duration<double>(Clock::now() - t0).count();
+  };
+  bool ok = false;
+  const int L = key / _opt.experts, ex = key % _opt.experts;
+  if (fs >= 0 && split) {
+    std::uint8_t* rest[16] = {};
+    for (std::size_t k = 0; k < np; ++k) {
+      rest[k] = far_part[k] != 0 ? nullptr : dst[k];
+      disk_b += far_part[k] != 0 ? 0 : _opt.part_bytes[k];
+    }
+    dispatch_group_t g = dispatch_group_create();
+    dispatch_group_async(g, dispatch_get_global_queue(
+                                QOS_CLASS_USER_INITIATED, 0), ^{ far_read(); });
+    const auto t0 = Clock::now();
+    ok = _fill(L, ex, rest, &e);
+    disk_s = std::chrono::duration<double>(Clock::now() - t0).count();
+    dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+    dispatch_release(g);
+    if (ok && !far_ok) {
+      // The link failed: its parts from disk too.
+      std::uint8_t* theirs[16] = {};
+      for (std::size_t k = 0; k < np; ++k) {
+        theirs[k] = far_part[k] != 0 ? dst[k] : nullptr;
+      }
+      const auto t1 = Clock::now();
+      ok = _fill(L, ex, theirs, &e);
+      disk_s += std::chrono::duration<double>(Clock::now() - t1).count();
+      disk_b += far_b;
+    }
+  } else if (fs >= 0) {
+    far_read();
+    ok = far_ok;
+    if (!far_ok) {
+      const auto t1 = Clock::now();
+      ok = _fill(L, ex, dst, &e);
+      disk_s = std::chrono::duration<double>(Clock::now() - t1).count();
+      disk_b = _slot_bytes;
+    }
+  } else {
+    const auto t0 = Clock::now();
+    ok = _fill(L, ex, dst, &e);
+    disk_s = std::chrono::duration<double>(Clock::now() - t0).count();
+    disk_b = _slot_bytes;
+  }
   lk.lock();
+  if (fs >= 0) {
+    --_far_reading[(std::size_t)fs];
+    if (!far_ok) { far_fail_(fe.empty() ? "a read failed" : fe); }
+  }
+  // Each source's pace, an average weighted to the recent.
+  auto pace = [](double& spb, double sec, std::size_t bytes) {
+    if (bytes == 0 || sec <= 0) { return; }
+    const double v = sec / (double)bytes;
+    spb = spb > 0 ? 0.9 * spb + 0.1 * v : v;
+  };
+  if (ok && _far) {
+    if (far_ok) { pace(_far_spb, far_s, far_b); }
+    pace(_disk_spb, disk_s, disk_b);
+  }
   _io[(std::size_t)s] = kIdle;
   _bad[(std::size_t)s] = ok ? 0 : 1;
   if (ok) {
-    w.bytes += _slot_bytes;
+    w.bytes += disk_b;
+    if (far_ok) {
+      ++_stats.far_reads;
+      _stats.far_bytes_read += far_b;
+      if (split) { ++_stats.far_split; }
+    }
+    // The two tiers hold different experts: one taken into the resident
+    // set leaves the far one; one read from disk that is not kept here
+    // goes there.
+    if (_far && !_far_dead) {
+      if (_res[(std::size_t)s] != 0) {
+        if (!_far_lazy) { far_release_(key); }
+      } else if (!far_ok && _far_one_offs) {
+        far_offer_(s);
+      }
+    }
   } else if (w.err.empty()) {
     w.err = e.empty() ? std::format("layer {} expert {} did not read",
                                     key / _opt.experts, key % _opt.experts)
                       : e;
   }
   w.done_cv.notify_all();
+}
+
+// Slot s's expert to the far tier, if it earns a far slot: a free one, or
+// the least selected written one no read is using, if it scores higher.
+// The write is queued and the slot pinned until it is made.
+void
+MoeExpertCache::far_offer_(int s)
+{
+  if (!_far || _far_dead) { return; }
+  const std::size_t i = (std::size_t)s;
+  const std::int32_t key = _key[i];
+  if (key < 0 || _bad[i] != 0 || _pinned[i] != 0 || _io[i] != kIdle ||
+      _far_of[(std::size_t)key] >= 0) {
+    return;
+  }
+  if (_far_inflight + (int)_far_queue.size() >=
+      std::max(1, _opt.far_writes)) {
+    ++_stats.far_dropped;
+    return;
+  }
+  int fs = -1;
+  if (!_far_free.empty()) {
+    fs = _far_free.back();
+    _far_free.pop_back();
+  } else {
+    float vs = 0.0f;
+    bool dup = false;   // the slot chosen holds a copy of one held home
+    for (int f = 0; f < _far_slots; ++f) {
+      const std::size_t u = (std::size_t)f;
+      if (_far_ready[u] == 0 || _far_reading[u] != 0 || _far_key[u] < 0) {
+        continue;
+      }
+      const std::size_t fk = (std::size_t)_far_key[u];
+      // LAZY: a copy of an expert the resident set holds goes first, the
+      // least selected of them -- its loss costs a write only if it is
+      // evicted again.
+      const bool d = _far_lazy && _slot_of[fk] >= 0 &&
+                     _res[(std::size_t)_slot_of[fk]] != 0;
+      const float sc = _score[fk];
+      if (fs < 0 || (d && !dup) || (d == dup && sc < vs)) {
+        fs = f;
+        vs = sc;
+        dup = d;
+      }
+    }
+    if (fs < 0 || (!dup && _score[(std::size_t)key] <= vs)) { return; }
+    _far_of[(std::size_t)_far_key[(std::size_t)fs]] = -1;
+    ++_stats.far_evicted;
+  }
+  _far_key[(std::size_t)fs] = key;
+  _far_of[(std::size_t)key] = fs;
+  _far_ready[(std::size_t)fs] = 0;
+  _pinned[i] = 1;
+  ++_n_pinned;
+  _far_queue.push_back({s, fs});
+  _workers->work_cv.notify_all();
+}
+
+// The far copy of `key` let go, where no read or write is using it.
+void
+MoeExpertCache::far_release_(int key)
+{
+  if (!_far) { return; }
+  const int fs = _far_of[(std::size_t)key];
+  if (fs < 0) { return; }
+  const std::size_t u = (std::size_t)fs;
+  if (_far_ready[u] == 0 || _far_reading[u] != 0) { return; }
+  _far_of[(std::size_t)key] = -1;
+  _far_key[u] = -1;
+  _far_ready[u] = 0;
+  _far_free.push_back(fs);
+}
+
+void
+MoeExpertCache::far_fail_(const std::string& why)
+{
+  if (_far_dead) { return; }
+  _far_dead = true;
+  if (const SessionContextIntf* sess = _mc->session()) {
+    sess->warn(fmt("[moe-cache] the far tier is let go ({}); experts are "
+                   "read from disk", why));
+  }
+}
+
+void
+MoeExpertCache::far_writer_()
+{
+  Pool& w = *_workers;
+  std::unique_lock<std::mutex> lk(w.mu);
+  for (;;) {
+    w.work_cv.wait(lk, [&] { return w.stop || !_far_queue.empty(); });
+    if (w.stop) { return; }
+    const auto [s, fs] = _far_queue.front();
+    _far_queue.erase(_far_queue.begin());
+    ++_far_inflight;
+    const bool dead = _far_dead;
+    lk.unlock();
+    bool ok = false;
+    std::string e;
+    if (!dead) {
+      std::vector<std::uint8_t*> src(_pool.size());
+      slot_ptrs_(s, src.data());
+      FarPiece pc[16];
+      const std::size_t n = std::min<std::size_t>(_pool.size(), 16);
+      const std::uint64_t at = (std::uint64_t)fs * _slot_bytes;
+      for (std::size_t k = 0; k < n; ++k) {
+        pc[k] = {at + _part_off[k], src[k], _opt.part_bytes[k]};
+      }
+      try {
+        ok = _far->write(pc, n, &e);
+      } catch (...) {
+        e = "the far write threw";
+      }
+    }
+    lk.lock();
+    --_far_inflight;
+    _pinned[(std::size_t)s] = 0;
+    --_n_pinned;
+    if (ok) {
+      _far_ready[(std::size_t)fs] = 1;
+      ++_stats.far_writes;
+    } else {
+      // Never believed: the far slot is free again.
+      const std::int32_t key = _far_key[(std::size_t)fs];
+      if (key >= 0) { _far_of[(std::size_t)key] = -1; }
+      _far_key[(std::size_t)fs] = -1;
+      _far_free.push_back(fs);
+      if (!dead) { far_fail_(e.empty() ? "a write failed" : e); }
+    }
+    w.done_cv.notify_all();
+  }
+}
+
+int
+MoeExpertCache::far_used() const
+{
+  std::lock_guard<std::mutex> lk(_workers->mu);
+  return _far_slots - (int)_far_free.size();
+}
+
+bool
+MoeExpertCache::far_on() const
+{
+  std::lock_guard<std::mutex> lk(_workers->mu);
+  return _far && !_far_dead;
+}
+
+bool
+MoeExpertCache::far_holds(int L, int e) const
+{
+  std::lock_guard<std::mutex> lk(_workers->mu);
+  if (!_far || L < 0 || L >= _opt.layers || e < 0 || e >= _opt.experts) {
+    return false;
+  }
+  return _far_of[(std::size_t)L * _opt.experts + (std::size_t)e] >= 0;
+}
+
+bool
+MoeExpertCache::far_holds_any(int L) const
+{
+  std::lock_guard<std::mutex> lk(_workers->mu);
+  if (!_far || _far_dead || L < 0 || L >= _opt.layers) { return false; }
+  const std::size_t b = (std::size_t)L * _opt.experts;
+  for (int e = 0; e < _opt.experts; ++e) {
+    const int fs = _far_of[b + (std::size_t)e];
+    if (fs >= 0 && _far_ready[(std::size_t)fs] != 0) { return true; }
+  }
+  return false;
+}
+
+double
+MoeExpertCache::read_seconds(std::size_t bytes, bool far) const
+{
+  std::lock_guard<std::mutex> lk(_workers->mu);
+  const double spb = far && _far_spb > 0 ? _far_spb : _disk_spb;
+  return spb * (double)bytes;
 }
 
 void
@@ -224,7 +634,9 @@ MoeExpertCache::take_spare_() const
   int best = -1;
   for (int s : _spare) {
     const std::size_t i = (std::size_t)s;
-    if (_used[i] == _step || _io[i] != kIdle) { continue; }
+    if (_used[i] == _step || _io[i] != kIdle || _pinned[i] != 0) {
+      continue;
+    }
     if (_key[i] < 0) { return s; }
     if (best < 0 || _used[i] < _used[(std::size_t)best]) { best = s; }
   }
@@ -364,8 +776,9 @@ MoeExpertCache::note_step_(int L, int rows, double blocked_ms)
 bool
 MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
                         std::int32_t* slot, std::string* err,
-                        const Ahead* ahead)
+                        const Ahead* ahead, Remote* remote)
 {
+  if (remote != nullptr) { remote->clear(); }
   const int E = _opt.experts;
   if (L < 0 || L >= _opt.layers || np < 0 || rows <= 0) {
     if (err != nullptr) { *err = "expert cache: a bad step"; }
@@ -418,6 +831,12 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
       const bool picked = key >= 0 && (std::size_t)key >= base &&
                           (std::size_t)key < base + (std::size_t)E &&
                           count[(std::size_t)key - base] > 0;
+      // A read ahead for a LATER layer (named several layers before it)
+      // waits its turn, queued: settled at that layer's step.
+      if (_io[i] == kAheadQueued && key >= 0 && key / E > L) {
+        keep.push_back(s);
+        continue;
+      }
       if (_io[i] == kAheadQueued) {
         w.ahead.erase(std::find(w.ahead.begin(), w.ahead.end(), s));
         if (picked) {
@@ -468,12 +887,15 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
     if (s < 0 || _res[(std::size_t)s] != 0) { continue; }
     if (_n_res < _resident) {
       to_resident_(s);
+      if (!_far_lazy) { far_release_((int)key); }
       ++_stats.admitted;
     } else if (_resident > 0) {
       const int v = victim_();
       if (v >= 0 && _score[key] > _score[(std::size_t)_key[(std::size_t)v]]) {
         to_spare_(v);
+        far_offer_(v);
         to_resident_(s);
+        if (!_far_lazy) { far_release_((int)key); }
         ++_stats.evicted;
         ++_stats.admitted;
       }
@@ -483,8 +905,42 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
   std::sort(miss.begin(), miss.end(), [&](int a, int b) {
     return _score[base + (std::size_t)a] > _score[base + (std::size_t)b];
   });
+  // [experts]: the far slot running it this step (REMOTE), or -1
+  std::vector<int> run_far;
+  int n_far_run = 0;
+  // A step that fails before its remote pairs are listed lets their pins
+  // go: the caller is handed none, so it calls nothing to undo them.
+  auto unpin_run_far = [&] {
+    for (int fs : run_far) {
+      if (fs < 0) { continue; }
+      --_far_reading[(std::size_t)fs];
+      --_stats.far_computed;
+    }
+    run_far.clear();
+  };
   for (int e : miss) {
     const std::size_t key = base + (std::size_t)e;
+    if (remote != nullptr && _far && !_far_dead && _zero >= 0) {
+      const int fs = _far_of[key];
+      bool home = _n_res < _resident;
+      if (!home && _resident > 0) {
+        const int v = victim_();
+        home = v >= 0 &&
+               _score[key] > _score[(std::size_t)_key[(std::size_t)v]];
+      }
+      // its pairs: the caller's rows (one a pair) must hold them all
+      int pairs = 0;
+      for (int p = 0; p < np; ++p) { pairs += eid[p] == e ? 1 : 0; }
+      if (fs >= 0 && _far_ready[(std::size_t)fs] != 0 && !home &&
+          n_far_run + pairs <= remote->cap) {
+        ++_far_reading[(std::size_t)fs];   // pinned until remote_done
+        n_far_run += pairs;
+        if (run_far.empty()) { run_far.assign((std::size_t)E, -1); }
+        run_far[(std::size_t)e] = fs;
+        ++_stats.far_computed;
+        continue;
+      }
+    }
     int s = take_spare_();
     if (s < 0 && !_ahead.empty()) {
       // Every spare is this step's or being read ahead: let the reads
@@ -501,11 +957,18 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
       _ahead.clear();
       s = take_spare_();
     }
+    if (s < 0 && _n_pinned > 0) {
+      // Spares pinned by writes to the far tier: they end soon.
+      w.done_cv.wait(lk, [&] { return _n_pinned == 0 || take_spare_() >= 0; });
+      s = take_spare_();
+    }
     if (s < 0) {
       if (err != nullptr) {
         *err = std::format("expert cache: layer {} needs more than {} "
                            "spare slots", L, _transient);
       }
+      unpin_run_far();
+      w.done_cv.notify_all();
       return false;
     }
     drop_(s);
@@ -518,6 +981,7 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
     if (admit) {
       if (v >= 0) {
         to_spare_(v);
+        far_offer_(v);
         ++_stats.evicted;
       }
       to_resident_(s);
@@ -558,6 +1022,17 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
     }
   }
   w.work_cv.notify_all();
+  // The pairs the far side runs, known now: handed off before the reads
+  // are waited on.
+  if (!run_far.empty()) {
+    for (int p = 0; p < np; ++p) {
+      const int fs = run_far[(std::size_t)eid[p]];
+      if (fs < 0) { continue; }
+      remote->pair.push_back(p);
+      remote->far_slot.push_back(fs);
+    }
+    if (remote->start) { remote->start(*remote); }
+  }
   // This step's own reads (this thread reads too), then any it picked that
   // were already under way as reads ahead.
   // A read that failed must not be believed later: its slot is let go.
@@ -609,9 +1084,28 @@ MoeExpertCache::resolve(int L, const std::int32_t* eid, int np, int rows,
   if (!ok) { return false; }
   note_step_(L, rows, blocked);
   for (int p = 0; p < np; ++p) {
+    if (!run_far.empty() && run_far[(std::size_t)eid[p]] >= 0) {
+      slot[p] = _zero;
+      continue;
+    }
     slot[p] = _slot_of[base + (std::size_t)eid[p]];
   }
   return true;
+}
+
+void
+MoeExpertCache::remote_done(const Remote& r)
+{
+  if (r.far_slot.empty()) { return; }
+  std::lock_guard<std::mutex> lk(_workers->mu);
+  std::vector<int> seen;
+  for (int fs : r.far_slot) {
+    // a far slot once however many of the step's pairs it ran
+    if (std::find(seen.begin(), seen.end(), fs) != seen.end()) { continue; }
+    seen.push_back(fs);
+    --_far_reading[(std::size_t)fs];
+  }
+  _workers->done_cv.notify_all();
 }
 
 int

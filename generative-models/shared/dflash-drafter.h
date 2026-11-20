@@ -188,6 +188,10 @@ public:
   // [L-1, k] int32 (DFlash 2 only; empty otherwise).
   const metal_compute::SharedBuffer& last_cand_val() const noexcept;
   const metal_compute::SharedBuffer& last_cand_idx() const noexcept;
+  // DFlash 2: each draft's confidence in the last encode_draft -- its
+  // choice's share of the softmax over its position's candidate scores,
+  // f32 [L - 1], readable once that draft has run (empty otherwise).
+  const metal_compute::SharedBuffer& last_confidence() const noexcept;
   // Bisecting aid: when on, encode_draft also copies the block residual
   // after every layer into debug_layers() [n_layers][L][H].
   void set_debug_layers(bool on);

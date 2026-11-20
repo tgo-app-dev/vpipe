@@ -480,6 +480,112 @@ builtin_catalog_()
      .variant = "MLX oQ8e, MTP (mlx-community)",
      .hf_path = "mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp",
      .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // orcarouter's llama.cpp GGUFs of the same abliterated release (a gated
+    // repo: model-fetch needs an HF token for it; Apache-2.0 per its card).
+    // A variant is its split files, the record the first of them
+    // (`local_subdir`). Read by GgufQwen4ExpConverter: the projections
+    // held as w8 at group 32 (exact for every block format but Q6_K /
+    // IQ2_S), the routed experts through the cache at the affine width
+    // their format takes exactly (Q4_K / IQ3_S 4, Q5_K 5, IQ3_XXS 6,
+    // IQ4_* / Q3_K 8; down per its own), the n-gram table by row from the
+    // file. Text only here (the mmproj is not wired).
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF IQ3_XXS uncensored (85.2 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00002-of-00002.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-00001-of-00002.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF IQ3_M uncensored (89.5 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-IQ3_M-00001-of-00002.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-IQ3_M-00002-of-00002.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-IQ3_M-00001-of-00002.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF IQ4_XS uncensored (97.5 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q3_K_S uncensored (88.8 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q3_K_S-00001-of-00002.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q3_K_S-00002-of-00002.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q3_K_S-00001-of-00002.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q3_K_M uncensored (94.1 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q3_K_M-00001-of-00003.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q3_K_L uncensored (96.7 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q3_K_L-00001-of-00003.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q4_K_S uncensored (111.8 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q4_K_S-00001-of-00003.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q4_K_M uncensored (119.2 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q4_K_M-00001-of-00003.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q5_K_S uncensored (127.7 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf")},
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "GGUF Q5_K_M uncensored (134.1 GB, orcarouter)",
+     .hf_path = "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+     .model_type = "qwen3.8-flash",
+     .files = {"Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00002-of-00003.gguf",
+               "Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00003-of-00003.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf")},
     // DeepSeek-V4.1-Flash (model_type deepseek_v41; 552B backbone, 8B / 16B
     // active in prefill / decode): hyper-connections, compressed sparse
     // attention with a two-level indexer, engram n-gram tables (read by
@@ -539,6 +645,49 @@ builtin_catalog_()
      .variant = "FP8 / FP4 (deepseek-ai)",
      .hf_path = "deepseek-ai/DeepSeek-V4.1-Flash",
      .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // AtomicChat's GGUFs of 1017 (MIT): ISTA-DASLab's GSQ-RCO quantizations
+    // with the refusal direction projected out of three dense writers. A
+    // variant is its four split files, the record the first of them.
+    // Read by GgufDeepseek41Converter: the projections as affine 8 / 5-bit
+    // codes at group 32 (Q8_0 / Q5_K, exact), the routed experts through
+    // the cache as affine codes -- IQ2_XXS and IQ3_XXS exactly, IQ1_M /
+    // IQ2_XS / IQ2_S (a scale a 16 values) rounded to 8 bits. The n-gram
+    // TABLE is not in them: ISTA-DASLab's file of its own, the record
+    // after these, found beside the shards or in its own repo's directory.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017 GGUF IQ2_XXS uncensored (138 GB + n-gram table, "
+                "AtomicChat)",
+     .hf_path = "AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF",
+     .model_type = "deepseek-v4.1",
+     .files = {"DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf",
+               "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf",
+               "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf",
+               "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf")},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017 GGUF IQ2_XS uncensored (155 GB + n-gram table, "
+                "AtomicChat)",
+     .hf_path = "AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF",
+     .model_type = "deepseek-v4.1",
+     .files = {"DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf",
+               "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf",
+               "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf",
+               "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf")},
+    // The GSQ-RCO builds' shared n-gram table (IQ4_NL, both engram layers'
+    // rows end to end), 110.6 GB, which every GGUF above reads a row at a
+    // time. Not a model of its own.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017 GGUF n-gram table IQ4_NL (110.6 GB, ISTA-DASLab)",
+     .hf_path = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+     .model_type = "deepseek-v4.1-engram",
+     .parent_model_type = "deepseek-v4.1",
+     .files = {"DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"},
+     .needs_tokenizer_json = false},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
@@ -2178,6 +2327,40 @@ builtin_catalog_()
      .files = {"wan.safetensors", "flash.safetensors", "LICENSE",
                "README.md"},
      .needs_tokenizer_json = false},
+    // ComfyUI's repack of RelayVSR (Comfy-Org/RelayVSR; Apache-2.0): the
+    // release's 4x pair and lightx2v's native 2x one (lightx2v/
+    // RelayVSR_X2: the same two networks retrained for exact 2x -- the
+    // keyframe DiT reads the frame pixel-unshuffled by 8, the decoder's
+    // encoder strides once more), each keyframe DiT in ComfyUI's Wan names
+    // with every block projection int8 ConvRot (5.2 GB against the
+    // release's 10.1 bf16), each decoder ("flash VAE") the release's F32
+    // file as it is (the x4 one byte-identical to kopper/RelayVSR's).
+    // Both scales sit side by side in one repo, so each record pins its
+    // pair and registers its keyframe DiT's FILE; relayvsr-upscale finds
+    // the decoder in the sibling vae/.
+    {.family = "RelayVSR", .version = "1.0", .param_class = "5B",
+     .variant = "x2, int8 ConvRot (ComfyUI repack of lightx2v's X2)",
+     .hf_path = "Comfy-Org/RelayVSR",
+     .model_type = "relayvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"diffusion_models/relayvsr_x2_lightx2v_int8_convrot."
+               "safetensors",
+               "vae/relayvsr_flash_vae_x2_fp32.safetensors", "README.md"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "diffusion_models/relayvsr_x2_lightx2v_int8_convrot.safetensors"),
+     .name = "Comfy-Org/RelayVSR-x2"},
+    {.family = "RelayVSR", .version = "1.0", .param_class = "5B",
+     .variant = "x4, int8 ConvRot (ComfyUI repack)",
+     .hf_path = "Comfy-Org/RelayVSR",
+     .model_type = "relayvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"diffusion_models/relayvsr_x4_int8_convrot.safetensors",
+               "vae/relayvsr_flash_vae_x4_fp32.safetensors", "README.md"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "diffusion_models/relayvsr_x4_int8_convrot.safetensors"),
+     .name = "Comfy-Org/RelayVSR-x4"},
     // ---- Wan (text+image -> VIDEO diffusion) --------------------------
     // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
     // that outputs anything but text / images / audio. Same diffusers
@@ -3429,7 +3612,8 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // prompt -- the conditioning is a constant the checkpoint ships.
     set({"video"}, {"video"});
   } else if (mt == "relayvsr") {
-    // RelayVSR: frames in, the same frames at 4x out (relayvsr-upscale).
+    // RelayVSR: frames in, the same frames at 4x (or 2x) out
+    // (relayvsr-upscale).
     set({"video"}, {"video"});
   } else if (mt == "minimax-h3-fl2va") {
     // The only entry whose OUTPUT is two modalities: one denoise loop

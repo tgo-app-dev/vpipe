@@ -19,7 +19,8 @@ namespace {
 // They must agree with the ctor's validation above, which stays the
 // authority on what is accepted.
 constexpr SpecExtra kTypeChoices[] = {
-  {spec_key::kChoices, "simple,karras,exponential,boogu_v1"},
+  {spec_key::kChoices, "simple,karras,exponential,boogu_v1,normal,"
+                       "sgm_uniform,beta,linear_quadratic"},
 };
 constexpr SpecExtra kShiftTypeChoices[] = {
   {spec_key::kChoices, "exponential,linear"},
@@ -28,7 +29,15 @@ const ConfigKey kAttrs[] = {
   {.key = "type", .type = ConfigType::String, .required = false,
    .doc = "schedule: simple (default) | karras | exponential | boogu_v1 "
           "(Boogu-Image's logistic time shift; its sigmas ASCEND -- 0 is noise, "
-          "1 is clean -- so it only fits a Boogu DiT)",
+          "1 is clean -- so it only fits a Boogu DiT) | normal | sgm_uniform "
+          "| beta | linear_quadratic (ComfyUI's, computed as it does over the "
+          "model's sigma table at `shift`: normal and sgm_uniform evenly "
+          "spaced in its timestep, sgm_uniform one point short of the "
+          "smallest; beta placed by a Beta(beta_alpha, beta_beta) quantile, "
+          "more steps at both ends, a long one dropping repeats; "
+          "linear_quadratic Mochi's, which the shift does not move). On "
+          "minimax-h3 every type but simple is computed at the model "
+          "config's schedule shift over generate-video's steps",
    .extra = kTypeChoices},
   {.key = "steps", .type = ConfigType::Int, .required = false,
    .doc = "override denoising steps (default 8)"},
@@ -39,6 +48,11 @@ const ConfigKey kAttrs[] = {
    .extra = kShiftTypeChoices},
   {.key = "rho", .type = ConfigType::Real, .required = false,
    .doc = "karras curvature (default 7)"},
+  {.key = "beta_alpha", .type = ConfigType::Real, .required = false,
+   .doc = "beta only: the distribution's alpha (default 0.6; RES4LYF's "
+          "beta57 is 0.5 with beta_beta 0.7)"},
+  {.key = "beta_beta", .type = ConfigType::Real, .required = false,
+   .doc = "beta only: the distribution's beta (default 0.6)"},
   {.key = "seq_len", .type = ConfigType::Int, .required = false,
    .doc = "boogu_v1 only: the STATIC token count its mu is read off, i.e. the "
           "checkpoint scheduler_config seq_len (default 4096 = 1K square)"},
@@ -56,7 +70,8 @@ const PortSpec kOports[] = {
 const StageSpec kSpec = {
   .type_name = "scheduler-select",
   .doc       = "Choose a diffusion sigma schedule (simple | karras | "
-               "exponential | boogu_v1) + steps/shift and emit its spec as a "
+               "exponential | boogu_v1 | normal | sgm_uniform | beta | "
+               "linear_quadratic) + steps/shift and emit its spec as a "
                "FlexData beat "
                "for a generate-image stage to latch. Model-agnostic (forwards the "
                "user's choice); config fields override the turbo defaults. Pairs "
@@ -82,14 +97,30 @@ SchedulerSelectStage::SchedulerSelectStage(const SessionContextIntf* s,
   _steps      = attr_int("steps");
   _shift      = attr_real("shift");
   _rho        = attr_real("rho");
+  _beta_alpha = attr_real("beta_alpha");
+  _beta_beta  = attr_real("beta_beta");
   _seq_len    = attr_int("seq_len");
   _base_shift = attr_real("base_shift");
   _max_shift  = attr_real("max_shift");
-  if (!_type.empty() && _type != "simple" && _type != "karras" &&
-      _type != "exponential" && _type != "boogu_v1") {
+  namespace k = genai::scheduler_spec;
+  if (!_type.empty() && _type != k::kSimple && _type != k::kKarras &&
+      _type != k::kExponential && _type != k::kBooguV1 &&
+      _type != k::kNormal && _type != k::kSgmUniform && _type != k::kBeta &&
+      _type != k::kLinearQuadratic) {
     fail_config(fmt("SchedulerSelectStage('{}'): type must be simple | karras "
-                    "| exponential | boogu_v1 (got \"{}\")", this->id(),
-                    _type));
+                    "| exponential | boogu_v1 | normal | sgm_uniform | beta | "
+                    "linear_quadratic (got \"{}\")", this->id(), _type));
+  }
+  const bool cfg = this->config().is_object();
+  if (cfg && this->config().as_object().contains("beta_alpha") &&
+      !(_beta_alpha > 0.0)) {
+    fail_config(fmt("SchedulerSelectStage('{}'): beta_alpha must be > 0 "
+                    "(got {})", this->id(), _beta_alpha));
+  }
+  if (cfg && this->config().as_object().contains("beta_beta") &&
+      !(_beta_beta > 0.0)) {
+    fail_config(fmt("SchedulerSelectStage('{}'): beta_beta must be > 0 "
+                    "(got {})", this->id(), _beta_beta));
   }
   if (!_shift_type.empty() && _shift_type != "exponential" &&
       _shift_type != "linear") {
@@ -133,6 +164,14 @@ SchedulerSelectStage::resolved_spec() const
   o.insert_or_assign(k::kShift, FlexData::make_real(shift));
   o.insert_or_assign(k::kShiftType, FlexData::make_string(shift_type));
   o.insert_or_assign(k::kRho, FlexData::make_real(rho));
+  if (type == k::kBeta) {
+    o.insert_or_assign(k::kBetaAlpha,
+                       FlexData::make_real(_beta_alpha > 0.0 ? _beta_alpha
+                                                             : 0.6));
+    o.insert_or_assign(k::kBetaBeta,
+                       FlexData::make_real(_beta_beta > 0.0 ? _beta_beta
+                                                            : 0.6));
+  }
   if (type == k::kBooguV1) {
     o.insert_or_assign(k::kSeqLen,
                        FlexData::make_int(_seq_len > 0 ? _seq_len : 4096));

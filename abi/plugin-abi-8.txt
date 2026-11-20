@@ -35,6 +35,7 @@ generative-models/content-screen.h
 generative-models/context-manager.h
 generative-models/detect-profile.h
 generative-models/family-profile.h
+generative-models/far-memory.h
 generative-models/gen-input.h
 generative-models/generative-model-manager.h
 generative-models/hidden-state-encoder.h
@@ -916,6 +917,57 @@ record vpipe::genai::ContextManager::Spec
   188 | int ssm_v_head_dim
   | [sizeof=192, dsize=192, align=8,
   | nvsize=192, nvalign=8]
+record vpipe::genai::FarCompute
+  0 | class vpipe::genai::FarCompute
+  0 | (FarCompute vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::FarExpertCall
+  0 | struct vpipe::genai::FarExpertCall
+  0 | std::uint64_t[6] part
+  48 | float weight
+  52 | std::uint32_t pad
+  | [sizeof=56, dsize=56, align=8,
+  | nvsize=56, nvalign=8]
+record vpipe::genai::FarExpertForm
+  0 | struct vpipe::genai::FarExpertForm
+  0 | std::uint32_t format
+  4 | std::uint32_t dtype
+  8 | std::uint32_t hidden
+  12 | std::uint32_t inter
+  16 | float swiglu_limit
+  20 | std::uint32_t[3] arg
+  | [sizeof=32, dsize=32, align=4,
+  | nvsize=32, nvalign=4]
+record vpipe::genai::FarFiles
+  0 | class vpipe::genai::FarFiles
+  0 | (FarFiles vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::FarGgufTables
+  0 | struct vpipe::genai::FarGgufTables
+  0 | std::uint32_t magic
+  4 | std::uint32_t version
+  8 | std::uint64_t words
+  | [sizeof=16, dsize=16, align=8,
+  | nvsize=16, nvalign=8]
+record vpipe::genai::FarMemory
+  0 | class vpipe::genai::FarMemory
+  0 | (FarMemory vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::FarMemoryTransport
+  0 | class vpipe::genai::FarMemoryTransport
+  0 | (FarMemoryTransport vtable pointer)
+  | [sizeof=8, dsize=8, align=8,
+  | nvsize=8, nvalign=8]
+record vpipe::genai::FarPiece
+  0 | struct vpipe::genai::FarPiece
+  0 | std::uint64_t offset
+  8 | void * local
+  16 | std::size_t bytes
+  | [sizeof=24, dsize=24, align=8,
+  | nvsize=24, nvalign=8]
 record vpipe::genai::GenerativeModelManager (opaque: read inline)
   528 | class vpipe::genai::WeightRegistry _weights
 record vpipe::genai::GenerativeModelManager::SwapSupply
@@ -2083,6 +2135,27 @@ class vpipe::genai::AudioVaeEncoder
   release_idle void ()
   resident_bytes std::uint64_t () const
   query_extension void *(std::string_view) noexcept
+class vpipe::genai::FarCompute
+  ~FarCompute void ()
+  experts bool (const FarExpertForm &, const void *, const FarExpertCall *, std::size_t, void *, std::string *) = 0
+  query_extension void *(std::string_view) noexcept
+class vpipe::genai::FarFiles
+  ~FarFiles void ()
+  open int (std::string_view, std::uint64_t, std::string *) = 0
+  read bool (int, std::uint64_t, void *, std::size_t, std::string *) = 0
+  query_extension void *(std::string_view) noexcept
+class vpipe::genai::FarMemory
+  ~FarMemory void ()
+  bytes std::uint64_t () const = 0
+  read bool (const FarPiece *, std::size_t, std::string *) = 0
+  write bool (const FarPiece *, std::size_t, std::string *) = 0
+  describe std::string () const
+  query_extension void *(std::string_view) noexcept
+class vpipe::genai::FarMemoryTransport
+  ~FarMemoryTransport void ()
+  name std::string_view () const = 0
+  open std::shared_ptr<FarMemory> (const FlexData &, std::string *) = 0
+  query_extension void *(std::string_view) noexcept
 class vpipe::genai::HiddenStateEncoder
   ~HiddenStateEncoder void ()
   n_layers int () const noexcept = 0
@@ -3037,13 +3110,16 @@ vpipe::genai::ane::runtime_bytes(vpipe::FlexData const&)
 vpipe::genai::build_mrope_position_ids(std::__1::span<vpipe::genai::TokenRef const, 18446744073709551615ul>, std::__1::span<std::__1::pair<int, int> const, 18446744073709551615ul>, std::__1::vector<int, std::__1::allocator<int>>*, std::__1::vector<int, std::__1::allocator<int>>*, std::__1::vector<int, std::__1::allocator<int>>*, int*)
 vpipe::genai::detect::for_model_type(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::genai::detect::model_type_for_class(std::__1::basic_string_view<char, std::__1::char_traits<char>>, bool)
+vpipe::genai::find_far_memory_transport(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
 vpipe::genai::find_tp_transport(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
+vpipe::genai::open_far_memory(vpipe::FlexData const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*)
 vpipe::genai::open_weight_set(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, vpipe::SessionContextIntf const*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
 vpipe::genai::profile::Registry::add(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, vpipe::FlexData)
 vpipe::genai::profile::Registry::families(std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
 vpipe::genai::profile::Registry::find(std::__1::basic_string_view<char, std::__1::char_traits<char>>, std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
 vpipe::genai::profile::Registry::get()
 vpipe::genai::quant::family_for_class(std::__1::basic_string_view<char, std::__1::char_traits<char>>)
+vpipe::genai::register_far_memory_transport(std::__1::unique_ptr<vpipe::genai::FarMemoryTransport, std::__1::default_delete<vpipe::genai::FarMemoryTransport>>)
 vpipe::genai::register_tp_transport(std::__1::unique_ptr<vpipe::genai::TpTransport, std::__1::default_delete<vpipe::genai::TpTransport>>)
 vpipe::hf_tree_files(vpipe::FlexData const&)
 vpipe::host_features()
@@ -3386,10 +3462,13 @@ vpipe::genai::detect::kModelType = "model_type"
 vpipe::genai::detect::kModelTypeEdit = "model_type_edit"
 vpipe::genai::detect::kOutputs = "outputs"
 vpipe::genai::gpu_sampler::kPrime = "prime"
+vpipe::genai::kFarComputeExtension = "far-compute/2"
+vpipe::genai::kFarFilesExtension = "far-files/1"
 vpipe::genai::kOutputPreviewX0 = "preview_x0"
 vpipe::genai::load_spec::kDraftBits = "draft_bits"
 vpipe::genai::load_spec::kDraftDir = "draft_dir"
 vpipe::genai::load_spec::kExpertCacheMb = "expert_cache_mb"
+vpipe::genai::load_spec::kFarMemory = "far_memory"
 vpipe::genai::load_spec::kMemoryLimitMb = "memory_limit_mb"
 vpipe::genai::load_spec::kMtpDir = "mtp_dir"
 vpipe::genai::load_spec::kNgramResident = "ngram_resident"
@@ -3478,6 +3557,10 @@ vpipe::genai::token_sampler_spec::kTemperature = "temperature"
 vpipe::genai::token_sampler_spec::kToken = "token"
 vpipe::genai::token_sampler_spec::kTopK = "top_k"
 vpipe::genai::token_sampler_spec::kTopP = "top_p"
+vpipe::genai::tp_extra::kChannel = "channel"
+vpipe::genai::tp_extra::kChannelDecode = "decode"
+vpipe::genai::tp_extra::kMinBandRows = "min_band_rows"
+vpipe::genai::tp_extra::kPromptBands = "prompt_bands"
 vpipe::genai::wired_pool::kEnabled = "enabled"
 vpipe::genai::wired_pool::kInfoBudget = "budget"
 vpipe::genai::wired_pool::kInfoLastRefused = "last_refused_bytes"

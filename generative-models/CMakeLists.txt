@@ -18,6 +18,7 @@ set(LOCAL_SOURCES
   weight-registry.cc
   weight-set.cc
   moe-expert-cache.cc
+  gpu-host-handshake.cc
   safetensors-ranges.cc
   loaded-language-model.cc
   lm-run-memory.cc
@@ -27,6 +28,7 @@ set(LOCAL_SOURCES
   image-model-registry.cc
   video-model-registry.cc
   tensor-parallel.cc
+  far-memory.cc
   quantize-family-registry.cc
   hidden-state-encoder.cc
   model-loader.cc
@@ -42,6 +44,9 @@ set(LOCAL_SOURCES
   shared/drawthings-store.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
+  shared/gguf-qwen4exp.cc
+  shared/gguf-deepseek41.cc
+  shared/ggml-blocks.cc
   shared/nvfp4.cc
   shared/grounded-encode-params.cc
   shared/i8-gemm.cc
@@ -201,6 +206,7 @@ set(LOCAL_HEADERS
   weight-registry.h
   weight-set.h
   moe-expert-cache.h
+  gpu-host-handshake.h
   safetensors-ranges.h
   loaded-language-model.h
   metal-token-muxer.h
@@ -219,6 +225,9 @@ set(LOCAL_HEADERS
   shared/drawthings-store.h
   shared/gguf-convert.h
   shared/gguf-file.h
+  shared/gguf-qwen4exp.h
+  shared/gguf-deepseek41.h
+  shared/ggml-blocks.h
   shared/grounded-encode-params.h
   shared/torch-zip.h
   shared/wired-pool.h

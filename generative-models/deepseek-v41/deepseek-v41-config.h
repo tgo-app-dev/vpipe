@@ -127,6 +127,10 @@ struct DeepseekV41Config {
   int  ced_mid() const;
   int  mix_hc() const { return (2 + hc) * hc; }
 
+  // A GGUF's DSpark head, where one is beside it: `<dir>/dspark` (the
+  // GGUF's own directory when `dir` names a file), the release's mtp.*
+  // shards and its config.json (a GGUF carries none); empty otherwise.
+  static std::string dspark_dir(const std::string& dir);
   // False with `err` set when the file is missing, not this model, or
   // outside what the port runs.
   static bool from_dir(const std::string& dir, DeepseekV41Config* out,

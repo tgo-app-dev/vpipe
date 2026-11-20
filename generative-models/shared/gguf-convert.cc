@@ -5,6 +5,8 @@
 #include <set>
 
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/shared/gguf-deepseek41.h"
+#include "generative-models/shared/gguf-qwen4exp.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 namespace vpipe::genai {
@@ -40,6 +43,22 @@ constexpr int kEmbedBits = 8;
 
 }  // namespace
 
+namespace {
+
+// Whether a GGUF's header names `general.architecture` in its first 64 KB
+// (every model file does, as its first key).
+bool
+names_architecture_(const std::string& path)
+{
+  std::ifstream in(path, std::ios::binary);
+  std::string head(65536, '\0');
+  in.read(head.data(), (std::streamsize)head.size());
+  head.resize((std::size_t)in.gcount());
+  return head.find("general.architecture") != std::string::npos;
+}
+
+}  // namespace
+
 std::string
 find_gguf_in_dir(const std::string& dir)
 {
@@ -63,6 +82,16 @@ find_gguf_in_dir(const std::string& dir)
     const std::string fn = p.filename().string();
     // Skip the multimodal projector; pick the main model shard.
     if (fn.rfind("mmproj", 0) == 0) { continue; }
+    // A table that is not a model (DeepSeek-V4.1's engram file sits beside
+    // its shards) names no architecture: llama.cpp writes that key first.
+    if (!names_architecture_(p.string())) { continue; }
+    // A split checkpoint (`-0000K-of-0000N.gguf`) is its first shard; the
+    // others open with it (GgufFile::open).
+    if (const auto at = fn.rfind("-of-");
+        at != std::string::npos && at >= 6 && fn[at - 6] == '-' &&
+        fn.compare(at - 5, 5, "00001") != 0) {
+      continue;
+    }
     ++candidates;
     if (best.empty() || fn < fs::path(best).filename().string()) {
       best = p.string();
@@ -205,6 +234,12 @@ gguf_to_model_config(const GgufFile& g, ModelConfig* out)
   auto arch = g.get_string("general.architecture");
   if (arch && *arch == "qwen35") {
     return gguf_to_qwen35_config_(g, out);
+  }
+  if (arch && *arch == "qwen4exp") {
+    return gguf_to_qwen4exp_config(g, out);
+  }
+  if (arch && *arch == "deepseek41") {
+    return gguf_to_deepseek41_config(g, out);
   }
   if (!arch || (*arch != "gemma4" && *arch != "gemma4_unified")) {
     return false;

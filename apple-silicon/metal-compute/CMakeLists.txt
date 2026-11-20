@@ -86,9 +86,31 @@ add_vpipe_metal_kernel(qwen4_hc_bf16 SRC ops/qwen4_hc.metal
 # DeepSeek-V4.1-Flash: hyper-connections with Sinkhorn, the compressed
 # sparse attention and its indexer, the FP4 experts, engram
 # (generative-models/deepseek-v41/).
-add_vpipe_metal_kernel(deepseek_v41 SRC ops/deepseek_v41.metal)
+# A GGUF's routed-expert rows into 8-bit affine codes on the GPU
+# (ggml-blocks.cc's row_affine32, bit for bit): no fast math.
+add_vpipe_metal_kernel(ggml_to_affine SRC ops/ggml_to_affine.metal
+                       FLAGS -fno-fast-math)
+# llama.cpp's block formats read as stored (ops/ggml_native.h): the
+# readers' own kernels, the reference the native MoE kernels are tested by.
+# No fast math: each value the CPU's decode, product for product.
+add_vpipe_metal_kernel(ggml_native SRC ops/ggml_native.metal
+                       DEPENDS ops/ggml_native.h FLAGS -fno-fast-math)
+# A Qwen MoE's routed experts run from a GGUF's own blocks.
+add_vpipe_metal_kernel(qwen_moe_native SRC ops/qwen_moe_native.metal
+                       DEPENDS ops/ggml_native.h)
+add_vpipe_metal_kernel(qwen_moe_native_bf16 SRC ops/qwen_moe_native.metal
+                       DEFINES VPIPE_ELT=bfloat DEPENDS ops/ggml_native.h)
+add_vpipe_metal_kernel(deepseek_v41 SRC ops/deepseek_v41.metal
+                       DEPENDS ops/deepseek_v41_route.h)
 add_vpipe_metal_kernel(deepseek_v41_bf16 SRC ops/deepseek_v41.metal
-                       DEFINES VPIPE_ELT=bfloat)
+                       DEFINES VPIPE_ELT=bfloat
+                       DEPENDS ops/deepseek_v41_route.h)
+# A GPU <-> host handshake inside a running command buffer through the
+# SYSTEM memory scope (generative-models/gpu-host-handshake.h): a private
+# pragma, so a library of its own (one that does not compile is an invalid
+# library at load, and its users take a commit and wait instead).
+add_vpipe_metal_kernel(host_handshake SRC ops/host_handshake.metal
+                       DEPENDS ops/deepseek_v41_route.h)
 add_vpipe_metal_kernel(audio_vae_1d SRC ops/audio_vae_1d.metal)
 add_vpipe_metal_kernel(rope SRC ops/rope.metal)
 add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
@@ -311,11 +333,11 @@ add_vpipe_metal_kernel(affine_qmm_grouped_nax_bf16
 # on the matrix cores: the twins of deepseek_v41's _grouped kernels.
 add_vpipe_metal_kernel(deepseek_v41_nax SRC ops/deepseek_v41_nax.metal
                        STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
-                       DEPENDS ${GROUPED_NAX_HDRS})
+                       DEPENDS ${GROUPED_NAX_HDRS} ops/ggml_native.h)
 add_vpipe_metal_kernel(deepseek_v41_nax_bf16 SRC ops/deepseek_v41_nax.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS}
-                       DEPENDS ${GROUPED_NAX_HDRS})
+                       DEPENDS ${GROUPED_NAX_HDRS} ops/ggml_native.h)
 # 4-bit -> dense weight expansion feeding the matrix-core dense GEMM
 # (dequant-once then dense_gemm_mma; faster than fused dequant-in-loop).
 add_vpipe_metal_kernel(affine_dequant SRC quant/affine_dequant.metal)

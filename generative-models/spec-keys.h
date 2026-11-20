@@ -36,6 +36,15 @@ inline constexpr std::string_view kKarras      = "karras";
 inline constexpr std::string_view kExponential = "exponential";
 inline constexpr std::string_view kBooguV1     = "boogu_v1";
 inline constexpr std::string_view kUnipcFlow   = "unipc_flow";
+// ComfyUI's schedulers of the same names (comfy/samplers.py), over the
+// flow model's table of sigmas at `shift`: `normal` and `sgm_uniform`
+// evenly spaced in its timestep (sgm_uniform one point short of the
+// smallest), `beta` placed by a Beta(kBetaAlpha, kBetaBeta) quantile,
+// `linear_quadratic` Mochi's, which no shift moves.
+inline constexpr std::string_view kNormal          = "normal";
+inline constexpr std::string_view kSgmUniform      = "sgm_uniform";
+inline constexpr std::string_view kBeta            = "beta";
+inline constexpr std::string_view kLinearQuadratic = "linear_quadratic";
 
 inline constexpr std::string_view kSteps = "steps";   // int
 inline constexpr std::string_view kShift = "shift";   // real
@@ -45,6 +54,10 @@ inline constexpr std::string_view kShiftType        = "shift_type";
 inline constexpr std::string_view kShiftExponential = "exponential";
 inline constexpr std::string_view kShiftLinear      = "linear";
 inline constexpr std::string_view kRho = "rho";       // real; karras
+// kBeta's distribution (reals; default 0.6 and 0.6, ComfyUI's -- 0.5 and
+// 0.7 is RES4LYF's "beta57").
+inline constexpr std::string_view kBetaAlpha = "beta_alpha";
+inline constexpr std::string_view kBetaBeta  = "beta_beta";
 
 // Resolution-dependent shift (the diffusers "use_dynamic_shifting").
 inline constexpr std::string_view kDynamicShift  = "dynamic_shift";  // bool

@@ -27,19 +27,31 @@ class Ops;
 // resolution by two models in relay. A large one-step DiT
 // (MetalRelayVsrWan) writes a KEYFRAME latent every `window - 1` frames,
 // and a small decoder (MetalRelayVsrDecoder) turns every frame into its 4x
-// frame between the two keyframes around it.
+// frame between the two keyframes around it. lightx2v/RelayVSR_X2 is the
+// same pair retrained for a native 2x (lightx2v's own inference is
+// ModelTC/LightX2V's relayvsr_x2): the same stream, frames padded to 16.
 //
-// WHERE ITS FILES ARE. The release is two safetensors side by side,
-// `wan.safetensors` (format refvsr-wan-v1) and `flash.safetensors`
-// (refvsr-flash-v1), each carrying its architecture in its metadata.
-// `path` is the directory holding both or either file; a file named
-// otherwise is told by its format.
+// WHERE ITS FILES ARE. Each checkpoint carries its architecture and its
+// scale in its safetensors metadata: refvsr-wan-v1 / refvsr-flash-v1 (4x)
+// and relayvsr-wan-x2-v1 / relayvsr-flash-x2-v1 (2x). Three layouts:
+//   the release           <dir>/wan.safetensors + flash.safetensors
+//   lightx2v's x2         <dir>/wan_x2.safetensors + flash_x2.safetensors
+//   ComfyUI's (Comfy-Org/RelayVSR)
+//                         <root>/diffusion_models/relayvsr_x<s>_*.safetensors
+//                         + <root>/vae/relayvsr_flash_vae_x<s>_*.safetensors
+//                         -- both scales side by side
+// `path` names a directory of any of them, or either FILE of a pair (its
+// partner found beside it, or in the sibling diffusion_models/ / vae/).
+// `scale` (2 or 4) picks the pair where a directory holds both; 0 takes
+// the file's own, or the only pair -- a directory of two scales asked for
+// neither is refused, naming both.
 struct RelayVsrFiles {
   std::string wan;
   std::string flash;
+  int scale = 0;     // the pair's native scale
 };
 bool resolve_relayvsr_files(const std::string& path, RelayVsrFiles* out,
-                            std::string* err = nullptr);
+                            std::string* err = nullptr, int scale = 0);
 
 // THE STREAM, as the release's CollaborativeFrameStream runs it, frame in,
 // frames out:
@@ -61,8 +73,8 @@ bool resolve_relayvsr_files(const std::string& path, RelayVsrFiles* out,
 // draws, on the CPU rather than CUDA's generator.
 //
 // Frames are planar [3, h, w]: u8, or f32 / f16 in [0, 1]. Out comes
-// planar [3, 4h, 4w]: u8 (the release's truncation) or f32 in [0, 1].
-// Every frame of a stream must be the same size.
+// planar [3, sh, sw] at the pair's scale s: u8 (the release's truncation)
+// or f32 in [0, 1]. Every frame of a stream must be the same size.
 class RelayVsrStream {
  public:
   struct Options {
@@ -75,7 +87,7 @@ class RelayVsrStream {
   // stream's own buffer, valid until the next call on the stream.
   struct Frame {
     std::int64_t index = 0;      // the frame's index in the stream
-    int h = 0, w = 0;            // 4x the input
+    int h = 0, w = 0;            // the scale times the input
     const void* px = nullptr;
     std::size_t bytes = 0;
   };
@@ -104,12 +116,15 @@ class RelayVsrStream {
   // Forget everything; the next push starts a stream.
   void reset();
 
+  // The native scale (the keyframe model's; the decoder must agree).
+  int scale() const noexcept { return _wan->config().upscale; }
+
   std::int64_t frames_in() const noexcept { return _n_in; }
   std::int64_t frames_out() const noexcept { return _n_out; }
   int keyframes() const noexcept { return _n_key; }
 
-  // TEST HOOK: each keyframe's latent as it is made (f32 [48, ph/4,
-  // pw/4]) and the noise it was made from.
+  // TEST HOOK: each keyframe's latent as it is made (f32 [48, ph/l,
+  // pw/l], l the latent stride) and the noise it was made from.
   std::function<void(std::int64_t frame, const std::vector<float>& noise,
                      const metal_compute::SharedBuffer& latent)>
       on_keyframe;

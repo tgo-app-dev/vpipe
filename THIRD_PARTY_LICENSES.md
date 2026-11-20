@@ -489,3 +489,48 @@ Reproduced verbatim from
 > WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 > FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 > OTHER DEALINGS IN THE SOFTWARE.
+
+## ggml (quantization lookup tables)
+
+`vpipe` reads llama.cpp's GGUF checkpoints. The codebooks of ggml's IQ
+quantization formats (IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL / IQ4_XS: the
+`iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `ksigns_iq2xs`, `kmask_iq2xs`
+and `kvalues_iq4nl` tables of ggml's `ggml-common.h`,
+<https://github.com/ggml-org/llama.cpp>) are reproduced in
+`generative-models/shared/ggml-iq-tables.inc` and compiled into
+`libvpipe`. The block decoders beside them
+(`generative-models/shared/ggml-blocks.cc`) follow ggml's
+`dequantize_row_*` functions.
+
+ggml is distributed under the MIT License.
+
+### Copyright notice
+
+> Copyright (c) 2023-2026 The ggml authors
+
+### License
+
+Reproduced verbatim from llama.cpp's `LICENSE`:
+
+> MIT License
+>
+> Copyright (c) 2023-2026 The ggml authors
+>
+> Permission is hereby granted, free of charge, to any person obtaining a
+> copy of this software and associated documentation files (the
+> "Software"), to deal in the Software without restriction, including
+> without limitation the rights to use, copy, modify, merge, publish,
+> distribute, sublicense, and/or sell copies of the Software, and to
+> permit persons to whom the Software is furnished to do so, subject to
+> the following conditions:
+>
+> The above copyright notice and this permission notice shall be included
+> in all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+> OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+> MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+> IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+> CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+> TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+> SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

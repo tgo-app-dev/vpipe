@@ -6,6 +6,8 @@
 
 #include "generative-models/shared/drawthings-store.h"
 #include "generative-models/shared/gguf-convert.h"
+#include "generative-models/shared/gguf-deepseek41.h"
+#include "generative-models/shared/gguf-qwen4exp.h"
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/shared/torch-zip.h"
 #include "generative-models/model-loader.h"
@@ -495,6 +497,16 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
     if (arch && *arch == "qwen35") {
       backing->conv =
           std::make_unique<GgufQwen35Converter>(&*backing->gguf, cfg);
+    } else if (arch && *arch == "qwen4exp") {
+      // Qwen3.8-Flash-Next: presented under the release's names, the
+      // routed experts in the expert cache's affine layout.
+      backing->conv =
+          std::make_unique<GgufQwen4ExpConverter>(&*backing->gguf);
+    } else if (arch && *arch == "deepseek41") {
+      // DeepSeek-V4.1: presented under the MLX pack's names, the
+      // projections and experts as affine codes.
+      backing->conv =
+          std::make_unique<GgufDeepseek41Converter>(&*backing->gguf);
     } else {
       backing->conv =
           std::make_unique<GgufGemma4Converter>(&*backing->gguf, cfg);

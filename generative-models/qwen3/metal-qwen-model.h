@@ -18,6 +18,7 @@
 // conv/ssm state in SharedBuffers). Every kernel it calls is independently
 // oracle-verified in tests/unit-tests/metal-compute-llm-ops.cc.
 
+#include "generative-models/shared/gguf-file.h"
 #include "generative-models/context-manager.h"   // ContextId, ContextManager
 #include "generative-models/metal-token-muxer.h"
 #include "generative-models/model-exec.h"         // GpuSamplerParams
@@ -34,6 +35,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,6 +58,7 @@ class MetalLlamaWeights;   // llama3/metal-llama-weights.h
 class MoeExpertCache;      // moe-expert-cache.h
 class SafetensorsRanges;   // safetensors-ranges.h
 class WiredPool;           // shared/wired-pool.h
+namespace host_handshake { class Heartbeat; }   // gpu-host-handshake.h
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
 // is on the affine (safetensors / gemma-style) path. The metal forward
@@ -566,10 +569,35 @@ public:
   // The routed-expert cache (Config::expert_cache_bytes), null when every
   // expert is resident: its hit rate, its reads.
   const MoeExpertCache* expert_cache() const { return _xc.get(); }
+  // Whether the cache's per-layer turn rides the handshake inside the
+  // running command buffers (gpu-host-handshake.h) on this box, not a
+  // commit and wait a layer.
+  bool expert_handshake() const { return _xhs_ok; }
+  // What that handshake holds for a MoE beside its contexts (0 for a dense
+  // model): the control words, the mailboxes, a turn's input rows. Each
+  // context it decodes also keeps its linear-layer state in THREE slots
+  // (the GDN ring: read, written, spare) -- the caller books those with
+  // the state, as run_bytes does.
+  static std::size_t handshake_bytes(const Config& c);
+  // Debug: the next forward that takes the handshake abandons its turn
+  // `turn` (the GPU runs on stale slots; the forward is then redone with
+  // commits). Forwards redone so far.
+  void xhs_drop_next(int turn) { _xhs_drop = turn; }
+  // Debug: every n-th turn served abandoned, across forwards (0: none).
+  void xhs_drop_every(int n) { _xhs_drop_every = n; }
+  int xhs_redos() const { return _xhs_redos; }
   // A checkpoint's routed-expert bytes AS HELD (0 for a dense model): what
   // a cache stands in for. The rest is everything else the model holds.
   static std::size_t routed_expert_bytes(const MetalLlamaWeights& wts,
                                          const Config& c);
+  // The same where a llama.cpp GGUF's experts run in their own blocks
+  // (_x_native): as the cache's slots hold them -- each layer's gate, up
+  // and down slabs as wide as the widest layer's, every expert of every
+  // layer the file has. 0 where they do not (routed_expert_bytes then:
+  // the converted view's). routed_expert_bytes stays what is taken off
+  // the view's whole to find the rest.
+  static std::size_t gguf_native_expert_bytes(const std::string& dir,
+                                              const Config& c);
   // A checkpoint's bytes the model never holds resident: Qwen3.8-Flash-
   // Next's n-gram PLE table (read by row). 0 for every other model.
   // Beside routed_expert_bytes, what sizes the cache and the claim's
@@ -1233,6 +1261,13 @@ private:
       const metal_compute::SharedBuffer& pgtab, std::size_t pgtab_off,
       bool return_hidden = false,
       metal_compute::CommandStream* stream = nullptr);
+  // ...its layers (encode_decode_step_ is the handshake's run around it).
+  void encode_decode_step_body_(
+      metal_compute::ComputeEncoder& enc, ContextId cid, int pos, int rpos,
+      std::size_t page_off, int n_pages,
+      const ContextManager::AppendSlot& slot,
+      const metal_compute::SharedBuffer& pgtab, std::size_t pgtab_off,
+      bool return_hidden, metal_compute::CommandStream* stream);
 
   // Encode the next-token pick (greedy argmax or full GPU sampler) into
   // `enc`: reads `logits`, writes the chosen id to out_id[out_off], and
@@ -1558,6 +1593,14 @@ private:
       const std::vector<int>& n_pages_v,
       const std::vector<int>& rope_pos_v,
       int shared_pages, bool head = true);
+  void encode_batched_step_body_(
+      metal_compute::ComputeEncoder& enc, BScratch& bs,
+      std::span<const ContextId> cids,
+      const std::vector<ContextManager::AppendSlot>& slots,
+      const std::vector<std::size_t>& page_offs,
+      const std::vector<int>& n_pages_v,
+      const std::vector<int>& rope_pos_v,
+      int shared_pages, bool head);
 
   struct Layer {
     bool is_full = false;
@@ -1845,9 +1888,14 @@ private:
       // A decode's and a verify's mixer block in two launches, a row a
       // grid slice: [RPS / HPS 1, 2, 4] (qwen4_hc.metal hcf_*).
       _fn_hcf_pre[3], _fn_hcf_up[3],
+      // ...the same by half runs and row pairs (hc_pre_half_m1 / _m2,
+      // hc_up_all_m2): the rows' arithmetic to the bit, fewer launches'
+      // worth of work a row.
+      _fn_hcf_pre_half[2], _fn_hcf_up_all,
       // ...and its MoE in two launches after the routing (affine_qmv.metal
-      // affine_moe_*_fused_w5g64: w5 experts, a w8 shared expert).
-      _fn_moe_up_fused, _fn_moe_down_fused,
+      // affine_moe_*_fused_w5g64: w5 experts, a w8 shared expert; the down
+      // launch by units, affine_moe_down_units_w5g64, where it loads).
+      _fn_moe_up_fused, _fn_moe_down_fused, _fn_moe_down_units,
       // ...and its GDN layers between the projections in two (the conv, the
       // q / k norms, g / beta; the step, its norm and gate).
       _fn_gdn_prework, _fn_gdn_step_ng,
@@ -1860,6 +1908,8 @@ private:
       _fn_gdn_conv1d_ring, _fn_gdn_step_ring,
       _fn_hc_stream_mean,   // a DFlash drafter's tap: the streams' mean
       _fn_moe_finalize_set, _fn_ple_gate, _fn_ple_conv, _fn_ple_state,
+      // ...the n-gram rows hashed and gathered on the GPU (optional).
+      _fn_ple_rows_gpu, _fn_ple_ids_note,
       _fn_hc_qmv8_b4,
       // The mixers' 10240-wide projections, split along K (affine_qmv.metal
       // qmv_splitk_w8_impl): 8 runs a row for many outputs, 16 for few.
@@ -2730,6 +2780,33 @@ private:
   bool _xstream = false;
   int _x_gb = 4, _x_db = 4;          // affine gate|up / down widths
   int _x_group = 64;                 // ...and their group
+  // A llama.cpp GGUF's own files (Qwen3.8-Flash-Next, `qwen4exp`): the
+  // routed experts and the n-gram table are read from them by pread, the
+  // experts converted to the cache's affine layout as they fill
+  // (gguf-qwen4exp.h). Declared ahead of the cache and the PLE so it
+  // outlives their readers.
+  struct GgufSrc {
+    std::optional<GgufFile> g;
+    std::vector<int> fd, fd_nc;   // a file each; the second F_NOCACHE
+    ~GgufSrc();
+  };
+  std::unique_ptr<GgufSrc> _gguf_src;
+  GgufSrc* gguf_src_(std::string* err);
+  // A GGUF's routed experts IN THEIR OWN BLOCKS (qwen_moe_native.metal,
+  // ops/ggml_native.h): the cache's slots hold each expert's gate, up and
+  // down slabs as the file has them (parts 0, 1, 2, _x_cw[k] bytes a slot),
+  // each layer's ggml types in _x_types. VPIPE_QWEN_GGUF_NATIVE=0: widened
+  // to affine codes as they are read, as before.
+  bool _x_native = false;
+  std::vector<std::array<std::uint32_t, 3>> _x_types;
+  long _x_cw[3] = {0, 0, 0};
+  metal_compute::SharedBuffer _x_native_tab;
+  metal_compute::ComputeFunction _fn_xn_sw, _fn_xn_dn, _fn_xn_gs, _fn_xn_gd;
+  // Whether every routed-expert stack of the GGUF at `dir` is one the
+  // native kernels read (and the shapes they take); its types by layer.
+  static bool gguf_native_experts_(
+      const std::string& dir, int layers, int H, int I,
+      std::vector<std::array<std::uint32_t, 3>>* types);
   std::unique_ptr<MoeExpertCache> _xc;
   std::unique_ptr<SafetensorsRanges> _xranges;
   std::unique_ptr<WiredPool> _xwire;
@@ -2742,6 +2819,67 @@ private:
   int _x_ahead = 0;
   bool _xc_failed = false;
   static int x_ahead_rows_();
+  // The host's part of a cached layer's turn: the next layer's likeliest
+  // experts ranked off its router's logits (`pred`, [M, E] in the compute
+  // dtype; aw a row), then the cache's resolve of the M * top_k picks
+  // `ids` into `slots` (in place allowed). `why` set: the turn failed
+  // before it (reported, the slots zeroed: in bounds).
+  void x_resolve_(int Lx, int M, int aw, const std::int32_t* ids,
+                  const std::uint16_t* pred, std::int32_t* slots,
+                  std::string why);
+  // THE CACHE'S TURN AS A HANDSHAKE (gpu-host-handshake.h): a decode
+  // step's or a few rows' (a batched step, a verify) per-layer resolve
+  // INSIDE the running command buffers -- the picks and the next layer's
+  // router logits out through a mailbox, the slots back into the ids, the
+  // layer's buffer committed, the host answering at most kXhsAhead turns
+  // behind what it has encoded -- not a commit and wait a layer. A forward
+  // opens a run (xhs_begin_) and drains it at its end (xhs_end_); one the
+  // GPU gave up a wait in is REDONE with commits from the state it found:
+  // its linear layers' state written out of place (xhs_ring_), its input
+  // rows saved (xhs_rows_). VPIPE_QWEN_HANDSHAKE=0 is the A/B.
+  struct XhsTurn {
+    int L, M, aw;
+    std::uint32_t seq;
+  };
+  struct XhsRun {
+    MetalQwenModel* m = nullptr;
+    std::vector<XhsTurn> turns;
+    std::size_t served = 0;
+    bool lost = false, open = false;
+    // a run left open (a forward that failed half-way) lets every wait
+    // pass and stops the heartbeat
+    ~XhsRun();
+  };
+  static constexpr int kXhsRows = 8;
+  static constexpr std::size_t kXhsAhead = 4;
+  bool _xhs_ok = false;
+  std::uint32_t _xhs_spins = 0;
+  metal_compute::ComputeFunction _fn_xhs;
+  // the control words, the mailboxes out / in, a forward's input rows
+  metal_compute::SharedBuffer _xhs_f, _xhs_bo, _xhs_bi, _xhs_x0;
+  std::unique_ptr<host_handshake::Heartbeat> _xhs_beat;
+  XhsRun* _xhs_run = nullptr;   // the open run (encode_moe_mlp_'s)
+  bool _xhs_redo = false;       // a redo's forward: commits as before
+  int _xhs_drop = -1, _xhs_drop_every = 0;
+  std::uint64_t _xhs_turns = 0;   // served, for _xhs_drop_every
+  int _xhs_redos = 0;
+  bool setup_handshake_(std::string* err);
+  bool xhs_begin_(XhsRun& r, int rows);
+  void xhs_turn_(metal_compute::ComputeEncoder& enc, int Lx, int M, int aw,
+                 const metal_compute::SharedBuffer& eid);
+  void xhs_serve_(XhsRun& r, std::size_t upto);
+  bool xhs_end_(XhsRun& r);
+  void xhs_abandon_(XhsRun& r);
+  // A context's linear-layer state out of place for one forward: 0 when
+  // it already is (the caller's GDN ring) or there is none, 1 when the
+  // ring was turned on here (xhs_ring_off_ after the forward: `keep` the
+  // state it wrote, else the one it found), -1 when it could not be.
+  int xhs_ring_(ContextManager& cx, ContextId cid);
+  void xhs_ring_off_(ContextManager& cx, ContextId cid, bool keep);
+  // rows [rows, H] of `x` copied to _xhs_x0 (or back)
+  void xhs_rows_(metal_compute::ComputeEncoder& enc,
+                 const metal_compute::SharedBuffer& x, int rows,
+                 bool restore);
   bool setup_expert_cache_(std::string* err);
   void wire_for_experts_();
   // ...or whose routed experts are GPTQ int4 per expert (qweight + scales,
@@ -2922,6 +3060,12 @@ private:
                                        // 0: unquantized, dense_dtype)
     std::string dense_dtype;
     std::size_t row_w = 0, row_s = 0;  // a row's code / scale bytes
+    // A GGUF's table (per_layer_token_embd, one tensor): the rows' ggml
+    // block type (-1: not a GGUF) and where they lie, read by pread
+    // through the cached / uncached descriptor and decoded per row.
+    int g_type = -1;
+    int g_fd = -1, g_fd_nc = -1;
+    std::uint64_t g_off = 0;
     bool scales_bf16 = true;
     float scale = 1.0f;                // ngram_embedding.weight_scale
     int hist = 0;                      // conv history rows ((K-1) * dil)
@@ -2929,12 +3073,22 @@ private:
     // the conv history [hist, hc*H], then the last two token ids (+1; 0 =
     // none, which reads as EOS).
     std::size_t hist_off = 0, ids_off = 0;
-    // The table in memory (Config::ple_resident): each shard's codes,
-    // scales and biases as stored (the weight set's derived entries, so
-    // the manager sees them), filled in shard order by `res_fill`; the
-    // rows of shards below `res_ready` read from here.
+    // The table in memory (Config::ple_resident): the shards' codes,
+    // scales and biases as stored, CHUNKS of `res_spc*` shards back to
+    // back (each chunk the weight set's derived entry, so the manager sees
+    // it), filled in shard order by `res_fill`; the rows of shards below
+    // `res_ready` read from here -- by the host, and by the GPU's row
+    // gather once every shard is in (hc_dev_ids_ok_: one kernel binds
+    // every chunk, which 128 shard buffers would not fit). Shards of
+    // unequal sizes (`res_even` false) go one a chunk, each its own size,
+    // and the GPU's gather is not taken.
+    static constexpr int kResChunksW = 8, kResChunksS = 4;
+    int res_spc_w = 0, res_spc_s = 0;            // shards a chunk
+    std::size_t shard_wb = 0, shard_sb = 0;      // a shard's code / scale
+    bool res_even = true;
     std::vector<metal_compute::SharedBuffer> res_w, res_s, res_b;
     std::atomic<int> res_ready{0};
+    std::atomic<std::size_t> res_bytes{0};       // the chunks built so far
     std::atomic<bool> res_stop{false};
     std::thread res_fill;
     ~Ple();   // stops and joins res_fill
@@ -3016,7 +3170,32 @@ private:
     // picks at every row (argmax, or a sample), which a command buffer of
     // their own, committed and waited for, cost each round.
     std::function<void(metal_compute::ComputeEncoder&)> tail;
+    // The rows' ids ON THE GPU (int32 [n] at offset 0; `ids` gives their
+    // count alone, its values unread): the embedding gathered and the
+    // n-gram rows hashed and gathered there (hc_dev_ids_ok_), so a verify
+    // need not read its drafts back before it is encoded.
+    const metal_compute::SharedBuffer* dev_ids = nullptr;
   };
+  // DFlash rounds run as one submission (their verify's ids on the GPU)
+  // since the load -- for tests.
+  std::uint64_t _hc_dev_rounds = 0;
+
+public:
+  std::uint64_t hc_dev_rounds() const noexcept { return _hc_dev_rounds; }
+private:
+  // Whether a forward may take HcRun::dev_ids: asked for
+  // (VPIPE_QWEN_PLE_GPU=1), the embedding gathers in the stream, and the
+  // n-gram table is in memory, whole, in chunks the GPU's gather binds.
+  // OFF BY DEFAULT: see dflash_decode_hc_.
+  bool hc_dev_ids_ok_() const;
+  // The n-gram rows of the n ids at `ids` (GPU), the two before them from
+  // the PLE state `st_in`, into `out` [n, ple_dim]; their last two ids
+  // into `st_out` -- the host's ple_rows_ / ple_note_ on the GPU.
+  void encode_ple_rows_gpu_(metal_compute::ComputeEncoder& enc,
+                            const metal_compute::SharedBuffer& ids, int n,
+                            const metal_compute::SharedBuffer& st_in,
+                            const metal_compute::SharedBuffer& st_out,
+                            const metal_compute::SharedBuffer& out);
   std::vector<float> forward_hc_(ContextId cid,
                                  std::span<const std::int32_t> ids,
                                  const metal_compute::SharedBuffer* embeds,
@@ -3099,6 +3278,35 @@ private:
     int best(int k_max) const;
   };
   HcDraftChoice _hc_dc;
+  // HOW MANY OF A DFLASH 2 BLOCK'S DRAFTS A ROUND VERIFIES (adaptive
+  // dflash_decode_hc_): the whole trained block is drafted, then the
+  // prefix of most tokens a ms is verified -- each draft's chance its
+  // position's kept share at its confidence's bin (the selector's softmax
+  // share of its choice), a verify of r rows its measured cost. A MoE
+  // target's every verified row routes its own experts, so a row the
+  // verifier rejects is read for nothing. Kept across decodes.
+  struct HcDFlashChoice {
+    static constexpr int kRows = 16;        // verify rows, at most
+    static constexpr int kBins = 10;
+    static constexpr int kExplore = 8;      // one round in this many
+    static constexpr int kHalve = 512;      // rounds, calibration halves
+    double ms[kRows + 1] = {};              // a verify of r rows (EMA)
+    int nms[kRows + 1] = {};
+    double draft = 0.0;                     // a round's draft (EMA)
+    int ndraft = 0;
+    double reached[kRows * kBins] = {}, kept[kRows * kBins] = {};
+    std::uint64_t rounds = 0;
+    // A verify of r rows in ms: measured, else interpolated between
+    // measured counts, else from the nearest at a prior slope.
+    double cost(int r) const;
+    // The kept share of a draft at block row `at` (1..) and confidence c.
+    double share(int at, float c) const;
+    // The rows to verify (1 = the anchor alone) of L drafted, by the
+    // drafts' confidences conf[0 .. L - 2]: the most tokens a ms over
+    // the whole round, its draft included (every round pays it).
+    int rows(const float* conf, int L) const;
+  };
+  HcDFlashChoice _hc_dfc;
   // dflash_decode for a hyper-connection model: a round drafts on the GPU,
   // reads the drafts back (forward_hc_ takes host ids -- the PLE reads its
   // n-gram rows by them), verifies with forward_hc_ tapping the drafter's
@@ -3166,6 +3374,9 @@ private:
   struct FusedMoeFns {
     const metal_compute::ComputeFunction* up = nullptr;
     const metal_compute::ComputeFunction* down = nullptr;
+    // The down launch by 32-code units (affine_moe_down_units_*); null
+    // where it did not load (an older metallib): `down` then.
+    const metal_compute::ComputeFunction* down_units = nullptr;
   };
   std::unordered_map<int, ExpertFns> _xfns;       // width * 1000 + group
   std::unordered_map<int, FusedMoeFns> _xfused;   // see fused_moe_fns_
@@ -3187,6 +3398,8 @@ private:
   double _hc_prof[4] = {0, 0, 0, 0};    // VPIPE_QWEN_HC_PROFILE
   long _qsa_two = 0;                    // two-phase QSA selects run
   long _hc_prof_n = 0;
+  double _hc_vprof[4] = {0, 0, 0, 0};   // ...a verify's few rows
+  long _hc_vprof_n = 0;
   // The PLE rows [n, ple_dim] (compute dtype) of `ids`, continuing the
   // context's hashed history (and advancing it).
   bool ple_embed_(const metal_compute::SharedBuffer* state_in,

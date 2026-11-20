@@ -90,6 +90,8 @@ private:
   std::int64_t _min_generation_area = 0;
   double _refine_start  = -1.0;
   double _refine_shift  = 6.0;
+  // A scheduler port's grid's shift; 0 for the model's own.
+  double _schedule_shift = 0.0;
   // The video's sigmas as run (`sigmas`); empty for the model's own grid.
   std::vector<double> _sigmas;
   // The VDN-H3 release root, or empty for the stock attention.

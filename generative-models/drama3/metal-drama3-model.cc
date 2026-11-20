@@ -426,15 +426,20 @@ MetalDrama3Model::run_bytes(const Drama3Config& c, int rows, int prompt_rows)
   int full = 0;
   for (int L = 0; L < q.n_layers; ++L) { full += q.layer_is_full(L) ? 1 : 0; }
   // Backbone K/V (bf16, pages of 256) + the gated-DeltaNet layers' f32
-  // state and conv tail.
+  // state and conv tail -- in three slots: a cached backbone's step hands
+  // its experts over through a handshake that writes the state out of
+  // place (MetalQwenModel::handshake_bytes; a resident one takes none, and
+  // the plan cannot tell the two apart).
   const std::size_t pages = (R + 255) / 256 * 256;
   const std::size_t kv = pages * (std::size_t)full * q.n_kv_heads *
                          q.head_dim * 2 * 2;
   const std::size_t gdn = (std::size_t)(q.n_layers - full) *
-                          ((std::size_t)q.gdn_v_heads * q.gdn_k_dim *
-                               q.gdn_v_dim * 4 +
-                           (std::size_t)q.gdn_conv_dim * q.gdn_conv_kernel *
-                               2);
+                              ((std::size_t)q.gdn_v_heads * q.gdn_k_dim *
+                                   q.gdn_v_dim * 4 +
+                               (std::size_t)q.gdn_conv_dim *
+                                   q.gdn_conv_kernel * 2) *
+                              3 +
+                          MetalQwenModel::handshake_bytes(q);
   const std::size_t tower =
       MetalDrama3Tower::kv_bytes_for(c.tower, (int)((R + 255) / 256 * 256));
   // The prefill's widest transients: the MoE pairs' activations and

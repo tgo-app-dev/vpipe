@@ -4394,6 +4394,161 @@ moe_down_fused_t<4, 32, 32>(
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]);
 
+// ===================================================================
+// THE DOWN LAUNCH BY 32-CODE UNITS. A lane reads a whole unit -- 32
+// consecutive codes of a row, 4 * EB bytes as EB aligned words (the codes
+// are one little-endian bit stream: MLX's packs lie back to back) -- with
+// its 32 inputs as four 16-byte loads and one scale / bias (EG >= 32: a
+// unit never straddles a group). A simdgroup's R rows lie back to back,
+// so its units are one run: unit u is row u / U, column unit u % U (U =
+// K / 32), and every lane takes its share however U falls against 32. The
+// qmv loop's 512-wide blocks left the down projection's 640-wide rows a
+// quarter-busy second block, and its threadgroups 22 simdgroups of four
+// rows; here an expert is one simdgroup of eight rows. MEASURED on the M5
+// Ultra (qwen4_exp_kernels.fused_moe_bench, Flash-Next's shape, cold
+// experts): 1 / 2 / 4 / 8 rows 16.6 / 28.9 / 53.5 / 103 us -> 16.6 / 26.5
+// / 44.3 / 75.6 (~945 GB/s past a ~3.6 us launch); the gate | up launch,
+// already ~1.05 TB/s, lost a little this way and keeps the qmv loop. A
+// row's sum is the simd_sum of its units' partials, each lane's masked to
+// that row; a row's arithmetic does not depend on the other rows, so a
+// verify's row is a decode's bit for bit.
+// ===================================================================
+
+template <int EB>
+METAL_FUNC float moe_unit_dot_(const device uint32_t* wu,
+                               const device VPIPE_ELT* xu, float s, float b)
+{
+  uint wv[EB];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < EB; ++i) { wv[i] = wu[i]; }
+  using V8 = vec<VPIPE_ELT, 8>;
+  const device V8* xv = (const device V8*)xu;
+  float acc = 0.0f, xs = 0.0f;
+#pragma clang loop unroll(full)
+  for (int q = 0; q < 4; ++q) {
+    const V8 xq = xv[q];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < 8; ++t) {
+      const int bit = EB * (q * 8 + t);
+      const int wi = bit / 32, sh = bit % 32;
+      uint c = wv[wi] >> sh;
+      if (sh + EB > 32) { c |= wv[wi + 1] << (32 - sh); }
+      c &= (1u << EB) - 1u;
+      const float xf = (float)xq[t];
+      acc += xf * (float)c;
+      xs += xf;
+    }
+  }
+  return s * acc + b * xs;
+}
+
+// R rows of K codes from `w` (back to back) against one input row x[K]:
+// each row's sum in out[r] (simd-uniform). K % 32 == 0.
+template <int EB, int EG, int R>
+METAL_FUNC void moe_unit_rows_(const device uint32_t* w,
+                               const device VPIPE_ELT* scales,
+                               const device VPIPE_ELT* biases,
+                               const device VPIPE_ELT* x, int K, uint lane,
+                               thread float* out)
+{
+  const int U = K / 32;
+  const int KG = K / EG;
+  float acc[R];
+#pragma clang loop unroll(full)
+  for (int r = 0; r < R; ++r) { acc[r] = 0.0f; }
+  for (int u = (int)lane; u < R * U; u += 32) {
+    const int r = u / U, cu = u - r * U;
+    const int g = r * KG + (cu * 32) / EG;
+    const float p = moe_unit_dot_<EB>(w + (uint)u * EB, x + cu * 32,
+                                      (float)scales[g], (float)biases[g]);
+#pragma clang loop unroll(full)
+    for (int rr = 0; rr < R; ++rr) { acc[rr] += rr == r ? p : 0.0f; }
+  }
+#pragma clang loop unroll(full)
+  for (int r = 0; r < R; ++r) { out[r] = simd_sum(acc[r]); }
+}
+
+// Threadgroup (y, m): output rows y * 8 .. of row m. Simdgroup j < top_k
+// runs pair m * top_k + j's eight rows, top_k the shared expert's; eight
+// threads then add them up as moe_down_fused_t does (each expert's rows
+// rounded to the element type first). top_k <= 15; inner, Sh multiples of
+// 32. grid {32 M, (top_k + 1) H / 8, 1}, tg {32, top_k + 1, 1} -- or m
+// along z: grid {32, (top_k + 1) H / 8, M}.
+template <int EB, int EG, int SG>
+kernel void moe_down_units_t(
+    const device uint32_t* w        [[buffer(0)]],   // [E, H, inner*EB/32]
+    const device VPIPE_ELT* scales  [[buffer(1)]],
+    const device VPIPE_ELT* biases  [[buffer(2)]],
+    const device VPIPE_ELT* x       [[buffer(3)]],   // [npair, inner]
+    const device int* pair_eid      [[buffer(4)]],
+    const device VPIPE_ELT* pw      [[buffer(5)]],   // [npair] route weights
+    const device uint32_t* sw       [[buffer(6)]],   // shared down [H, Sh] w8
+    const device VPIPE_ELT* ss      [[buffer(7)]],
+    const device VPIPE_ELT* sb      [[buffer(8)]],
+    const device VPIPE_ELT* sx      [[buffer(9)]],   // [M, Sh]
+    const device VPIPE_ELT* gate    [[buffer(10)]],  // [M]
+    device VPIPE_ELT*       out     [[buffer(11)]],  // [M, H]
+    constant int& inner             [[buffer(12)]],
+    constant int& H                 [[buffer(13)]],
+    constant int& Sh                [[buffer(14)]],
+    constant int& top_k             [[buffer(15)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int RT = 8;
+  threadgroup VPIPE_ELT part[16][RT];
+  const int m = (int)(tid.x + tid.z);     // whichever the grid lays it on
+  const int j = (int)simd_gid;
+  const int row = (int)tid.y * RT;
+  float rr[RT];
+  if (j < top_k) {
+    const int p = m * top_k + j;
+    const ulong r0 = (ulong)pair_eid[p] * (ulong)H + (ulong)row;
+    const int K = inner;
+    moe_unit_rows_<EB, EG, RT>(
+        (const device uint32_t*)((const device uint8_t*)w +
+                                 r0 * (ulong)K * EB / 8),
+        scales + r0 * (ulong)(K / EG), biases + r0 * (ulong)(K / EG),
+        x + (uint)p * (uint)K, K, simd_lid, rr);
+  } else {
+    moe_unit_rows_<8, SG, RT>(sw + (uint)row * (uint)(Sh / 4),
+                              ss + (uint)row * (uint)(Sh / SG),
+                              sb + (uint)row * (uint)(Sh / SG),
+                              sx + (uint)m * (uint)Sh, Sh, simd_lid, rr);
+  }
+  if (simd_lid == 0) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < RT; ++r) { part[j][r] = (VPIPE_ELT)rr[r]; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid != 0 || (int)simd_lid >= RT) { return; }
+  const int base = m * top_k;
+  float acc = 0.0f;
+  for (int s = 0; s < top_k; ++s) {
+    acc += (float)pw[base + s] * (float)part[s][simd_lid];
+  }
+  const float moe = (float)(VPIPE_ELT)acc;
+  const float g = (float)gate[m];
+  out[(ulong)m * H + (uint)row + simd_lid] =
+      (VPIPE_ELT)(moe + (float)(VPIPE_ELT)(g * (float)part[top_k][simd_lid]));
+}
+
+#define VPIPE_MOE_DOWN_UNITS(NAME, EB, EG, SG)                              \
+  template [[host_name(NAME)]] kernel void moe_down_units_t<EB, EG, SG>(   \
+      const device uint32_t*, const device VPIPE_ELT*,                     \
+      const device VPIPE_ELT*, const device VPIPE_ELT*, const device int*, \
+      const device VPIPE_ELT*, const device uint32_t*,                     \
+      const device VPIPE_ELT*, const device VPIPE_ELT*,                    \
+      const device VPIPE_ELT*, const device VPIPE_ELT*, device VPIPE_ELT*, \
+      constant int&, constant int&, constant int&, constant int&, uint3,   \
+      uint, uint);
+VPIPE_MOE_DOWN_UNITS("affine_moe_down_units_w5g64", 5, 64, 64)
+VPIPE_MOE_DOWN_UNITS("affine_moe_down_units_w4g64", 4, 64, 64)
+VPIPE_MOE_DOWN_UNITS("affine_moe_down_units_w6g64", 6, 64, 64)
+VPIPE_MOE_DOWN_UNITS("affine_moe_down_units_w8g64", 8, 64, 64)
+VPIPE_MOE_DOWN_UNITS("affine_moe_down_units_w4g32_sg32", 4, 32, 32)
+
 // ====================================================================
 // 2-BIT, GROUP 128: the ternary packs (MLX affine 2-bit g128, as Bonsai's
 // MLX pack stores it and as its GGUF PQ2_0 / PTQ1_0 repack to). The w4g64

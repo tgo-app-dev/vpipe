@@ -477,6 +477,10 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
                     _expert_cache_mb));
   }
   _ngram_resident = attr_bool("ngram_resident");
+  if (this->config().is_object() &&
+      this->config().as_object().contains("far_memory")) {
+    _far_memory = this->config().as_object().at("far_memory");
+  }
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -715,6 +719,15 @@ constexpr ConfigKey kAttrs[] = {
           "ignores it; a model kept warm is handed over as it was loaded. "
           "false: from disk",
    .def_bool = false},
+  {.key = "far_memory", .type = ConfigType::Object, .required = false,
+   .doc = "another machine's memory lent to a Mixture of Experts' expert "
+          "cache (generative-models/far-memory.h): {\"transport\": the "
+          "name a plugin registered, \"params\": its own bag, passed "
+          "through}. The experts selected most often after those the "
+          "cache holds are kept there and read back over the link instead "
+          "of from disk. One that does not open is said; the model loads "
+          "without it. A dense model ignores it; a model kept warm is "
+          "handed over as it was loaded"},
   {.key = "keep_loaded", .type = ConfigType::Real,
    .doc = "seconds to keep the model loaded after this stage lets it go "
           "(its graph unloaded): a chat that runs a graph per request "
@@ -1118,6 +1131,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
   }
   if (_ngram_resident) {
     bag::set_flag(spec.extra, genai::load_spec::kNgramResident, true);
+  }
+  if (_far_memory.is_object()) {
+    bag::set(spec.extra, genai::load_spec::kFarMemory, _far_memory);
   }
   session()->info(fmt(
       "TextChatStage('{}'): loading model from '{}' "

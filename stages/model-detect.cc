@@ -558,8 +558,13 @@ variant_(const FlexData& cfg, const std::string& name_lc,
          const std::string& gguf_file)
 {
   if (!gguf_file.empty()) {
-    // "...-Q4_K_M.gguf" -> "GGUF Q4_K_M".
-    const std::string base = fs::path(gguf_file).stem().string();
+    // "...-Q4_K_M.gguf" -> "GGUF Q4_K_M" (a split checkpoint's
+    // "-00001-of-00003" first taken off).
+    std::string base = fs::path(gguf_file).stem().string();
+    if (const auto at = base.rfind("-of-");
+        at != std::string::npos && at >= 6 && base[at - 6] == '-') {
+      base.resize(at - 6);
+    }
     const size_t dash = base.rfind('-');
     const std::string q = (dash == std::string::npos) ? std::string()
                                                       : base.substr(dash + 1);
@@ -1047,16 +1052,42 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
 
   // ---- 2f. RelayVSR ------------------------------------------------------
   // Two safetensors and no config.json: a keyframe DiT (format
-  // refvsr-wan-v1) and its decoder (refvsr-flash-v1), told by the format
-  // each states in its metadata -- what relayvsr-upscale runs.
-  // Only where the release's two names are there: the formats are read
-  // from the headers, and a scan of every safetensors in every directory
-  // the models DB walks is not worth that.
-  if (d.model_type.empty() && fs::is_directory(root) &&
-      fs::exists(root / "wan.safetensors") &&
-      fs::exists(root / "flash.safetensors")) {
+  // refvsr-wan-v1, or relayvsr-wan-x2-v1) and its decoder (refvsr-flash-
+  // v1 / relayvsr-flash-x2-v1), told by the format each states in its
+  // metadata -- what relayvsr-upscale runs. Only where one of the known
+  // layouts' names is there -- the release's (wan / flash), lightx2v's
+  // x2 (wan_x2 / flash_x2), ComfyUI's (diffusion_models/relayvsr_* beside
+  // vae/) -- or a FILE named relayvsr* / wan* / flash* is registered (a
+  // catalogue record of ComfyUI's repack names its DiT file): the formats
+  // are read from the headers, and a scan of every safetensors in every
+  // directory the models DB walks is not worth that.
+  if (d.model_type.empty()) {
+    bool named = false;
+    std::error_code rec;
+    if (fs::is_directory(root, rec)) {
+      named = (fs::exists(root / "wan.safetensors") &&
+               fs::exists(root / "flash.safetensors")) ||
+              (fs::exists(root / "wan_x2.safetensors") &&
+               fs::exists(root / "flash_x2.safetensors"));
+      if (!named && fs::is_directory(root / "diffusion_models", rec) &&
+          fs::is_directory(root / "vae", rec)) {
+        for (const auto& e :
+             fs::directory_iterator(root / "diffusion_models", rec)) {
+          named = named ||
+                  e.path().filename().string().rfind("relayvsr", 0) == 0;
+        }
+      }
+    } else if (fs::is_regular_file(root, rec) &&
+               root.extension() == ".safetensors") {
+      const std::string fn = root.filename().string();
+      named = fn.rfind("relayvsr", 0) == 0 || fn.rfind("wan", 0) == 0 ||
+              fn.rfind("flash", 0) == 0;
+    }
     genai::RelayVsrFiles rf;
-    if (genai::resolve_relayvsr_files(dir, &rf)) {
+    // A root holding both scales is RelayVSR too (it asks for `scale`).
+    if (named && (genai::resolve_relayvsr_files(dir, &rf) ||
+                  genai::resolve_relayvsr_files(dir, &rf, nullptr, 4) ||
+                  genai::resolve_relayvsr_files(dir, &rf, nullptr, 2))) {
       d.model_type    = "relayvsr";
       d.detected_by   = "refvsr-metadata";
       d.weight_format = "safetensors";
@@ -1133,6 +1164,11 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
                          : std::nullopt;
         if (!a || *a == "clip") { continue; }
         if (*a == "qwen35" || *a == "qwen35moe") { d.model_type = "qwen3.5"; }
+        // Qwen3.8-Flash-Next as llama.cpp writes it.
+        if (*a == "qwen4exp") { d.model_type = "qwen3.8-flash"; }
+        // DeepSeek-V4.1-Flash as its GGUFs write it (the engram table's
+        // own file names no architecture and is passed over).
+        if (*a == "deepseek41") { d.model_type = "deepseek-v4.1"; }
         break;
       }
     }

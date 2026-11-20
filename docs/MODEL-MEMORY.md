@@ -2107,8 +2107,9 @@ miss.
 **It is the host's, not the SDK's.** The cache is part of the host's Qwen
 MoE stack, and every model built on that stack takes it (see "What it
 covers"); a plugin's own mixture-of-experts model cannot use it through
-the SDK today. The one piece of it the SDK carries is the in-place sync
-it is built on, `CommandStream::sync_and_reopen`. The rest of this
+the SDK today. The pieces of it the SDK carries are the in-place
+commits it is built on, `CommandStream::sync_and_reopen` and
+`CommandStream::commit_and_reopen` (both inline). The rest of this
 section is how it decides and how to read its numbers.
 
 It is the opposite design to block residency (mechanism 6), and on
@@ -2275,22 +2276,29 @@ the model staying loaded:
   Ultra's internal SSD 1.7 ms against 2.5 for one expert -- because what a
   stalled step waits for is mostly a read already under way: its latency,
   not the drive's bandwidth, is the cost.
-- **The sync.** The routes are on the GPU and the CPU has to see them: the
-  model commits after the route kernel, waits, resolves, and reopens the
-  stream in place (`CommandStream::sync_and_reopen`). That wait is also
-  what makes overwriting a slot safe — the GPU has finished everything
-  before it. A commit and wait costs ~280 µs of an idle GPU, once a layer.
-  Where the GPU sees the CPU's stores while a command buffer runs (an M5
-  Ultra does; an M4 Pro and a base M5 do not, so it is probed at load), a
-  model can instead hand the picks over **inside** the running buffer: a
+- **The handover.** The routes are on the GPU and the CPU has to see
+  them. Where the GPU and the CPU see each other's stores while a command
+  buffer runs -- through the GPU's system memory scope, which every Apple
+  GPU tested does (M4 Pro, M5, M5 Ultra; probed once at load) -- a step
+  hands each layer's picks over **inside** the running buffer: a
   one-threadgroup kernel posts them to a mailbox and waits for the
-  resolved slots (~3 µs a layer). Every wait gives up when the CPU's
-  heartbeat stops (a process that is gone costs one wait, not the GPU),
-  both mailboxes are checksummed, and a forward the GPU gave up on is done
-  again the plain way. The CPU must never encode more than a few layers
-  ahead of the turns it has answered: a queue holds 64 command buffers in
-  flight, and a CPU blocked on the 65th while the GPU waits for its answer
-  is a deadlock that outlives the process.
+  resolved slots, ~3-30 µs a layer, and the layer's buffer is committed
+  without waiting while the CPU encodes on. Elsewhere the model commits
+  after the route kernel, waits, resolves, and reopens the stream in place
+  (`CommandStream::sync_and_reopen`), ~0.3 ms of an idle GPU a layer.
+  Either way overwriting a slot is safe: the GPU has finished everything
+  before the turn. Every wait gives up when the CPU's heartbeat stops (a
+  process that is gone costs one wait, not the GPU), both mailboxes are
+  checksummed, and a forward the GPU gave up on is done again the plain
+  way, from the state it found -- so a hybrid model's recurrent state is
+  written out of place for such a step, and a context decoding this way
+  keeps that state in three slots rather than one (the run's booking
+  counts them). The CPU never encodes more than a few layers ahead of the
+  turns it has answered: a queue holds 64 command buffers in flight, and a
+  CPU blocked on the 65th while the GPU waits for its answer is a deadlock
+  that outlives the process. Steps of up to 8 rows take the handover (a
+  decode step, a batched step, a speculative verify); a prefill keeps the
+  commit and wait, its rows' reads dwarfing it.
 
 **Bit-identical to resident**: the arithmetic is the same, only the
 addressing changes. Every model wired to the cache is tested that way
@@ -2365,6 +2373,17 @@ for no change). Read the line a model prints when it unloads —
 ... read ahead` — before concluding anything about a box.
 
 ---
+
+### A far tier (another machine's memory)
+
+A Mixture of Experts' far tier (text-chat's `far_memory`) is memory on
+ANOTHER machine: nothing of it is booked here. What it costs here is
+booked as the rest: the one empty expert slot a far-run expert is given
+locally comes out of the cache's own room, so the cache holds what the
+plan booked; the longer messages to the far side and its answers' buffer
+are part of the model's run memory, booked and held alike. One load of a
+model is in flight at a time, so two never each open far memory and hold
+a cache.
 
 ## Idle policy: `destroy` / `park` / `keep` / `auto`
 

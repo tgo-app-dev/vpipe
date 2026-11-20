@@ -25,6 +25,11 @@ class I8GemmContext;
 class MetalSageAttention;
 class WeightSet;
 
+namespace fp8 {
+class Expander;
+struct Weight;
+}  // namespace fp8
+
 namespace relayvsr {
 
 // Host mirror of the kernel's LocalWindowAttnParams
@@ -80,8 +85,15 @@ int effective_i8_tier(int asked, bool matrix_cores);
 // layout does not take K -- that projection stays in the element type.
 int held_group(int K, int tier);
 // What such a projection holds: its codes and scales, or its element-type
-// weight (2 bytes an element).
-std::uint64_t proj_bytes(int N, int K, int tier);
+// weight (2 bytes an element). `int8`: the checkpoint stores it as
+// ComfyUI's int8 (see Proj), which every tier but fast keeps as stored --
+// its codes and an f32 scale a row -- and fast converts into its layout.
+std::uint64_t proj_bytes(int N, int K, int tier, bool int8 = false);
+// Whether a ComfyUI int8 projection of depth K, quantized in ConvRot group
+// `rot`, runs AS STORED on `tier`: the token tiers (2 and 3) take a 256
+// group's codes as their own layout, the activation rotated alike.
+// VPIPE_RELAYVSR_CONVROT_NATIVE=0 converts them instead (the A/B).
+bool convrot_native(int K, int tier, int rot);
 
 // The Neural Engine tier's chunk -- the rows a predict takes -- for a
 // forward of `rows`: 2048 (where the ANE's rate saturates) from 4096 rows,
@@ -92,22 +104,43 @@ int ane_chunk(int rows);
 // One block projection as a model holds it: the element-type weight
 // [N, K] and its bias, or -- on a tier that holds the layout -- its int8
 // codes [N, K] and scales at group `gc` in place of the weight.
+//
+// ComfyUI's INT8 (a comfy_quant record, int8_tensorwise; Comfy-Org's
+// RelayVSR repack) is KEPT AS STORED: `i8` the file's codes [N, K], `i8s`
+// their f32 scale a row (N of them) and `rot` the ConvRot group they were
+// quantized in (0 unrotated; shared/fp8-layout.h). Off the token tiers
+// such a weight is widened to the element type right before each GEMM
+// (fp8::Expander: the codes un-rotated exactly, times the scale, rounded
+// once -- the host decode to the bit); on them (`cr`) it IS the held
+// layout -- `codes` / `scales` alias `i8` / `i8s`, gc the token group --
+// and the activation is rotated alike (I8GemmContext::
+// quantize_token_convrot), so nothing is quantized twice. The fast tier
+// converts it into its own layout at load, from the widened weight.
 struct Proj {
   metal_compute::SharedBuffer w;
   metal_compute::SharedBuffer b;            // may be empty
   metal_compute::SharedBuffer codes, scales;
   int gc = 0;                               // 0: the element-type weight
   int n = 0, k = 0;
+  metal_compute::SharedBuffer i8, i8s;      // ComfyUI int8, as stored
+  int rot = 0;
+  bool cr = false;                          // ...run as the token layout
   bool held() const noexcept { return gc != 0; }
+  // ComfyUI int8 widened per GEMM.
+  bool stored() const noexcept { return gc == 0 && !i8.empty(); }
   bool valid() const noexcept
   {
-    return n > 0 && k > 0 && (held() ? !codes.empty() : !w.empty());
+    return n > 0 && k > 0 &&
+           (held() ? !codes.empty() && !scales.empty()
+                   : stored() ? !i8s.empty() : !w.empty());
   }
   // The weight as held -- what proj_bytes predicts at the tier the rule
   // names -- and with its bias.
   std::uint64_t weight_bytes() const noexcept
   {
-    return held() ? codes.byte_size() + scales.byte_size() : w.byte_size();
+    return held()     ? codes.byte_size() + scales.byte_size()
+           : stored() ? i8.byte_size() + i8s.byte_size()
+                      : w.byte_size();
   }
   std::uint64_t bytes() const noexcept
   {
@@ -169,10 +202,49 @@ class Ops {
   // that holds the layout and a K it takes, the layout -- converted once
   // into a derived entry of the set (the element-type weight read
   // uncached and dropped). `hold` false keeps the element type whatever
-  // the tier (a weight the ANE stages). An invalid Proj on a failure.
+  // the tier (a weight the ANE stages). `q`, when the checkpoint stores
+  // the weight as ComfyUI's int8 (fp8::resolve's answer): kept as stored
+  // (see Proj) -- run as the token layout where convrot_native says so,
+  // converted on the fast tier. `cache` false reads everything uncached
+  // (a weight the load consumes). An invalid Proj on a failure, with
+  // *err set when the encoding cannot be run.
   Proj load_proj(WeightSet& ws, const std::string& weight,
                  const std::string& bias, int N, int K,
-                 const std::string& key, bool hold = true);
+                 const std::string& key, bool hold = true,
+                 const fp8::Weight* q = nullptr, bool cache = true,
+                 std::string* err = nullptr);
+  // The weight a dense GEMM reads: `p.w`, or a stored int8 weight widened
+  // into this load's scratch (encoded into `enc`; valid until the next
+  // widening). Null for a held layout, or when the widening cannot run.
+  const metal_compute::SharedBuffer*
+  dense_weight(metal_compute::ComputeEncoder& enc, const Proj& p) const;
+  // THE WIDENING'S SCRATCH is made ONCE, at the widest projection the
+  // model keeps as stored (load_proj with `cache`): every widening of a
+  // forward fits it, so it never grows under an encoder -- a grown copy
+  // stays alive, retained by the command buffer, beside the one it
+  // replaced until that buffer completes. A load's own widenings (the
+  // keyframe model's cross K / V fold, `cache` false) take it at that size
+  // too, or at their own where nothing is kept as stored.
+  //   widens()       whether a forward widens (some projection is stored)
+  //   drop_widened() give the scratch back, once the GPU work reading it
+  //                  has finished -- after the fold, where widens() is
+  //                  false: the plan books it only where a forward widens
+  //                  (widen_bytes)
+  bool widens() const noexcept { return _wdeq_max > 0; }
+  void drop_widened() noexcept { _wdeq = metal_compute::SharedBuffer{}; }
+  // TEST SEAMS: the scratch's bytes now, and its allocations since load.
+  std::uint64_t widened_held() const noexcept { return _wdeq.byte_size(); }
+  long widen_allocs() const noexcept { return _n_wdeq_allocs; }
+  // What the per-GEMM widening holds: an element-type copy of the widest
+  // ComfyUI int8 projection no tier holds (at `tier`) -- 0 for a
+  // checkpoint without int8 (`int8` false).
+  static std::uint64_t widen_bytes(int tier, bool int8,
+                                   const std::vector<int>& n,
+                                   const std::vector<int>& k);
+  // ComfyUI int8 projections run AS STORED on the token layout since load,
+  // and widened per GEMM (engagement checks).
+  long convrot_gemms() const noexcept { return _n_cr; }
+  long widened_gemms() const noexcept { return _n_widen; }
 
   // y[M, N] = x[M, K] W^T + b through the projection's route: a held
   // layout's tier GEMM, the accurate tier's per-call quantization where it
@@ -308,9 +380,18 @@ class Ops {
   mutable metal_compute::SharedBuffer _w8_q, _w8_qs, _w8_k, _w8_ks, _w8_km,
       _w8_part, _w8_v, _w8_vm, _w8_vs;
   // A held layout widened to the element type, for a GEMM its tier
-  // declines (none at this model's shapes: grown only if one does).
+  // declines (none at this model's shapes: grown only if one does) -- and
+  // every stored int8 weight's per-GEMM widening.
   mutable metal_compute::SharedBuffer _wdeq;
-  mutable long _n_i8 = 0, _n_dense = 0;
+  mutable long _n_i8 = 0, _n_dense = 0, _n_cr = 0, _n_widen = 0;
+  mutable long _n_wdeq_allocs = 0;
+  std::size_t _wdeq_max = 0;   // the widest stored projection, bytes
+  // The int8 widening (bf16 only), loaded at the first int8 weight.
+  std::unique_ptr<fp8::Expander> _x8;
+  bool widen_(metal_compute::ComputeEncoder& enc, const Proj& p) const;
+  Proj load_int8_(WeightSet& ws, const std::string& weight, Proj p,
+                  const std::string& key, bool hold, const fp8::Weight& q,
+                  bool cache, std::string* err);
   metal_compute::ComputeLibrary _lib_rv, _lib_gemm, _lib_mma, _lib_elt,
       _lib_rms, _lib_lwa, _lib_attn;
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bn64, _fn_gemm_mma,

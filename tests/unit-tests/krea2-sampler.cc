@@ -33,6 +33,7 @@
 #include "stages/generate-image-stage.h"
 #include "stages/vae-decode-stage.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -139,6 +140,8 @@ TEST(krea2_sampler, boogu_v1_schedule_ascends_and_dmd_spec_roundtrips)
   FlexData fd = FlexData::make_object();
   fd.as_object().insert_or_assign("method", FlexData::make_string("turbo"));
   EXPECT_TRUE(FlowSamplerSpec::from_flex(fd).method == "dmd");
+  fd.as_object().insert_or_assign("method", FlexData::make_string("lcm"));
+  EXPECT_TRUE(FlowSamplerSpec::from_flex(fd).method == "dmd");
 
   FlowSchedulerSpec sc;
   sc.type = "boogu_v1"; sc.steps = 4; sc.seq_len = 4096;
@@ -186,6 +189,137 @@ TEST(krea2_sampler, simple_schedule_matches_baked_turbo)
   }
   EXPECT_TRUE(ok);
   EXPECT_TRUE(sig[8] == 0.0);
+}
+
+// ComfyUI's normal / sgm_uniform / beta / linear_quadratic, against a
+// float64 restatement of comfy/samplers.py over its flow ModelSampling
+// (1000 sigmas for the linear shift, 10000 for the exponential), the beta
+// quantile from mpmath -- not this tree's: the reference is independent of
+// the bisection it checks. Includes a long beta schedule whose repeats
+// ComfyUI drops (600 asked, 559 run), which FlowSampler::steps() counts.
+TEST(krea2_sampler, comfyui_schedules_match_their_restatement)
+{
+  struct Case {
+    const char* type;
+    int steps;
+    double shift;
+    const char* shift_type;
+    double a, b;
+    int n;
+    std::vector<double> want;
+  };
+  const std::vector<Case> cases = {
+    {"normal", 8, 3.0, "linear", 0.6, 0.6, 9,
+     {1, 0.94754253308128544, 0.88278775079197469, 0.80083732057416268,
+      0.69379310344827583, 0.54804560260586321, 0.33797216699801186,
+      0.0089285714285713344, 0}},
+    {"normal", 6, 12.0, "linear", 0.6, 0.6, 7,
+     {1, 0.97988766080811751, 0.9483480688692415, 0.89177770555736102,
+      0.76077586206896552, 0.1259842519685036, 0}},
+    {"normal", 7, 1.15, "exponential", 0.6, 0.6, 8,
+     {1, 0.94046538089033083, 0.86337637583567228, 0.75962624452162686,
+      0.61249212723052449, 0.38756847423265151, 0.00099652394670915229, 0}},
+    // a shift far under 1: its last timestep's sigma is within 1e-5 of 0,
+    // so ComfyUI runs one point more and appends no 0
+    {"normal", 6, 0.01, "linear", 0.6, 0.6, 7,
+     {0.99999999999990941, 0.047619592381185273, 0.019608131776443515,
+      0.0099011863544363303, 0.0049752730379225372, 0.0019961276250948391,
+      1.0010009007998765e-07}},
+    {"normal", 5, 1.0, "linear", 0.6, 0.6, 6,
+     {1, 0.75024999999999997, 0.50049999999999994, 0.25075000000000003,
+      0.0010000000000000009, 0}},
+    {"sgm_uniform", 8, 3.0, "linear", 0.6, 0.6, 9,
+     {1, 0.95469387755102031, 0.90035906642728902, 0.83399800598205387,
+      0.7511210762331838, 0.64468629961587709, 0.50298507462686559,
+      0.30500894454382821, 0}},
+    {"sgm_uniform", 6, 1.15, "exponential", 0.6, 0.6, 7,
+     {1, 0.94046538089033083, 0.86337637583567228, 0.75962624452162686,
+      0.61249212723052449, 0.38756847423265151, 0}},
+    {"beta", 8, 3.0, "linear", 0.6, 0.6, 9,
+     {1, 0.98024948024948011, 0.93353474320241703, 0.85952177625960713,
+      0.75074925074925092, 0.59638554216867468, 0.39217134416543564,
+      0.15591397849462366, 0}},
+    {"beta", 20, 1.15, "exponential", 0.5, 0.7, 21,
+     {1, 0.99010398002589939, 0.97277860369940006, 0.95020565618944386,
+      0.92262405162796379, 0.89002456428625054, 0.85214222235371684,
+      0.80864680245269172, 0.75914541907976807, 0.70333947507019978,
+      0.64093094118385896, 0.57218434329446, 0.49726981163295214,
+      0.41739031748621275, 0.33450068228994151, 0.25180114398452424,
+      0.17294503272678066, 0.10331938318148372, 0.047958616721044893,
+      0.012524649202339705, 0}},
+    {"beta", 30, 12.0, "linear", 0.6, 0.6, 31,
+     {1, 0.99949723479135255, 0.99830220713073003, 0.99653979238754331,
+      0.9944282302998142, 0.99172652059278121, 0.98844744998591161,
+      0.98471721989681693, 0.98033650922359628, 0.97517504774029284,
+      0.96935933147632303, 0.96259703599153146, 0.95485158393614367,
+      0.94568690095846641, 0.93544249679350144, 0.92336046690216567,
+      0.90890890890890896, 0.89252591380250945, 0.87242138994592422,
+      0.84896872920825017, 0.82061446977205155, 0.78661087866108781,
+      0.74403815580286159, 0.69247626004382756, 0.62944162436548223,
+      0.54870775347912526, 0.45070422535211269, 0.33907649896623016,
+      0.20471161657189277, 0.077994428969359333, 0}},
+    {"beta", 600, 1.0, "linear", 0.6, 0.6, 560,
+     {}},   // its length only: repeats dropped
+    {"linear_quadratic", 8, 3.0, "linear", 0.6, 0.6, 9,
+     {1, 0.99375000000000002, 0.98750000000000004, 0.98124999999999996,
+      0.97500000000000009, 0.90937500000000004, 0.72500000000000031,
+      0.42187500000000022, 0}},
+    {"linear_quadratic", 9, 1.15, "exponential", 0.6, 0.6, 10,
+     {1, 0.99375000000000002, 0.98750000000000004, 0.98124999999999996,
+      0.97500000000000009, 0.93100000000000005, 0.81150000000000022,
+      0.61650000000000016, 0.3460000000000002, 0}},
+    {"linear_quadratic", 1, 3.0, "linear", 0.6, 0.6, 2,
+     {1, 0}},
+    {"linear_quadratic", 2, 3.0, "linear", 0.6, 0.6, 3,
+     {1, 0.97500000000000009, 0}},
+  };
+  for (const Case& c : cases) {
+    FlowSchedulerSpec s;
+    s.type = c.type;
+    s.steps = c.steps;
+    s.shift = c.shift;
+    s.shift_type = c.shift_type;
+    s.beta_alpha = c.a;
+    s.beta_beta = c.b;
+    // through the spec's FlexData form, as a scheduler-select beat
+    const FlowSchedulerSpec r = FlowSchedulerSpec::from_flex(s.to_flex());
+    EXPECT_TRUE(r == s);
+    const std::vector<double> got = r.sigmas();
+    double worst = 0.0;
+    const bool len_ok = (int)got.size() == c.n;
+    for (std::size_t i = 0; len_ok && i < c.want.size(); ++i) {
+      worst = std::max(worst, std::fabs(got[i] - c.want[i]));
+    }
+    std::printf("  %-16s %3d steps, shift %5.2f %-11s: %3zu points "
+                "(want %d), worst %.2g\n", c.type, c.steps, c.shift,
+                c.shift_type, got.size(), c.n, worst);
+    EXPECT_TRUE(len_ok);
+    EXPECT_TRUE(worst <= 1e-12);
+    // every grid a schedule: strictly decreasing to 0 -- exactly, but for
+    // that one case of normal's, within 1e-5
+    bool dec = !got.empty() && std::fabs(got.back()) <= 1e-5;
+    for (std::size_t i = 1; i < got.size(); ++i) {
+      dec = dec && got[i] < got[i - 1];
+    }
+    EXPECT_TRUE(dec);
+    if (c.want.empty()) {
+      FlowSampler fs(FlowSamplerSpec{}, r);
+      EXPECT_TRUE(fs.steps() == c.n - 1);
+    }
+  }
+  // An unknown type is said and runs simple; the new ones are kept.
+  FlexData fd = FlexData::make_object();
+  fd.as_object().insert_or_assign("type", FlexData::make_string("ays_30"));
+  std::string err;
+  EXPECT_TRUE(FlowSchedulerSpec::from_flex(fd, &err).type == "simple");
+  EXPECT_TRUE(!err.empty());
+  for (const char* t : {"normal", "sgm_uniform", "beta",
+                        "linear_quadratic"}) {
+    fd.as_object().insert_or_assign("type", FlexData::make_string(t));
+    err.clear();
+    EXPECT_TRUE(FlowSchedulerSpec::from_flex(fd, &err).type == t);
+    EXPECT_TRUE(err.empty());
+  }
 }
 
 TEST(krea2_sampler, karras_and_exponential_are_valid_and_distinct)
@@ -316,6 +450,15 @@ TEST(krea2_sampler, sampler_select_resolves_defaults_and_overrides)
     EXPECT_TRUE(std::string(o.at("method").as_string("")) == "dpmpp_sde");
     EXPECT_TRUE(o.at("eta").as_real(9.0) == 0.0);          // eta=0 honored
     EXPECT_TRUE(o.at("seed").as_int(0) == 123);
+  }
+  {
+    // ComfyUI's lcm is the dmd step: the stage emits it by that name
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert_or_assign("method", FlexData::make_string("lcm"));
+    DiffusionSamplerSelectStage st(&sess, "s", {}, std::move(cfg));
+    FlexData fd = st.resolved_spec();
+    auto o = fd.as_object();
+    EXPECT_TRUE(std::string(o.at("method").as_string("")) == "dmd");
   }
 }
 

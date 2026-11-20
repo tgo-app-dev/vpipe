@@ -42,6 +42,91 @@ xorshift64(std::uint64_t& s)
   return s;
 }
 
+// ---- ComfyUI's schedulers over a flow model (comfy/samplers.py) --------
+//
+// A flow model's ModelSampling holds a TABLE of sigmas, sigma(k / N) for
+// k = 1 .. N, where sigma(t) is its time shift: ModelSamplingDiscreteFlow's
+// time_snr_shift over N = 1000 (the linear shift), ModelSamplingFlux's
+// flux_time_shift over N = 10000 (the exponential one). Its timestep IS
+// the sigma (times a multiplier that cancels), so a scheduler that spaces
+// timesteps spaces sigmas and shifts them again -- as ComfyUI does.
+constexpr int kComfyFlowTable = 1000;
+constexpr int kComfyFluxTable = 10000;
+
+// The regularized incomplete beta I_x(a, b) (Numerical Recipes' continued
+// fraction by Lentz's method, on the side where it converges fast).
+double
+beta_cf_(double a, double b, double x)
+{
+  constexpr double kTiny = 1e-300;
+  const double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+  double c = 1.0, d = 1.0 - qab * x / qap;
+  if (std::fabs(d) < kTiny) { d = kTiny; }
+  d = 1.0 / d;
+  double h = d;
+  for (int m = 1; m <= 1000; ++m) {
+    const double m2 = 2.0 * m;
+    double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+    d = 1.0 + aa * d;
+    if (std::fabs(d) < kTiny) { d = kTiny; }
+    c = 1.0 + aa / c;
+    if (std::fabs(c) < kTiny) { c = kTiny; }
+    d = 1.0 / d;
+    h *= d * c;
+    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+    d = 1.0 + aa * d;
+    if (std::fabs(d) < kTiny) { d = kTiny; }
+    c = 1.0 + aa / c;
+    if (std::fabs(c) < kTiny) { c = kTiny; }
+    d = 1.0 / d;
+    const double del = d * c;
+    h *= del;
+    if (std::fabs(del - 1.0) < 1e-16) { break; }
+  }
+  return h;
+}
+
+double
+beta_cdf_(double x, double a, double b)
+{
+  if (x <= 0.0) { return 0.0; }
+  if (x >= 1.0) { return 1.0; }
+  const double lbt = std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b) +
+                     a * std::log(x) + b * std::log1p(-x);
+  const double bt = std::exp(lbt);
+  if (x < (a + 1.0) / (a + b + 2.0)) { return bt * beta_cf_(a, b, x) / a; }
+  return 1.0 - bt * beta_cf_(b, a, 1.0 - x) / b;
+}
+
+// scipy.stats.beta.ppf(p, a, b): the x with I_x(a, b) = p, by bisection
+// (the CDF is monotone; 200 halvings reach the double next to it).
+double
+beta_ppf_(double p, double a, double b)
+{
+  if (p <= 0.0) { return 0.0; }
+  if (p >= 1.0) { return 1.0; }
+  // A symmetric distribution's median is exactly 1/2 -- and it lands on a
+  // half step of the table (1/2 * 999), where an ulp below rounds to the
+  // other index. Boost's inverse, which scipy calls, converges onto the
+  // root there; bisection on a CDF computed to an ulp does not.
+  if (a == b && p == 0.5) { return 0.5; }
+  double lo = 0.0, hi = 1.0;
+  for (int it = 0; it < 200; ++it) {
+    const double mid = 0.5 * (lo + hi);
+    if (mid <= lo || mid >= hi) { break; }
+    if (beta_cdf_(mid, a, b) < p) { lo = mid; } else { hi = mid; }
+  }
+  return 0.5 * (lo + hi);
+}
+
+// torch.linspace(start, end, n)[i] in double.
+double
+linspace_at_(double start, double end, int n, int i)
+{
+  return n <= 1 ? start
+                : start + (double)i * (end - start) / (double)(n - 1);
+}
+
 }  // namespace
 
 // ---- FlowSchedulerSpec -------------------------------------------------
@@ -58,6 +143,10 @@ FlowSchedulerSpec::to_flex() const
   o.insert_or_assign(k::kShift, FlexData::make_real(shift));
   o.insert_or_assign(k::kShiftType, FlexData::make_string(shift_type));
   o.insert_or_assign(k::kRho, FlexData::make_real(rho));
+  if (type == k::kBeta) {
+    o.insert_or_assign(k::kBetaAlpha, FlexData::make_real(beta_alpha));
+    o.insert_or_assign(k::kBetaBeta, FlexData::make_real(beta_beta));
+  }
   if (type == k::kBooguV1) {
     o.insert_or_assign(k::kBaseShift, FlexData::make_real(base_shift));
     o.insert_or_assign(k::kMaxShift, FlexData::make_real(max_shift));
@@ -94,6 +183,14 @@ FlowSchedulerSpec::from_flex(const FlexData& fd, std::string* err)
         std::string(o.at(k::kShiftType).as_string(s.shift_type.c_str()));
   }
   if (o.contains(k::kRho)) { s.rho = o.at(k::kRho).as_real(s.rho); }
+  if (o.contains(k::kBetaAlpha)) {
+    s.beta_alpha = o.at(k::kBetaAlpha).as_real(s.beta_alpha);
+  }
+  if (o.contains(k::kBetaBeta)) {
+    s.beta_beta = o.at(k::kBetaBeta).as_real(s.beta_beta);
+  }
+  if (!(s.beta_alpha > 0.0)) { s.beta_alpha = 0.6; }
+  if (!(s.beta_beta > 0.0)) { s.beta_beta = 0.6; }
   if (o.contains(k::kDynamicShift)) {
     s.dynamic_shift = o.at(k::kDynamicShift).as_bool(false);
   }
@@ -120,7 +217,10 @@ FlowSchedulerSpec::from_flex(const FlexData& fd, std::string* err)
   }
   if (s.steps < 1) { s.steps = 1; }
   if (s.type == k::kBooguV1) { return s; }
-  if (s.type != "simple" && s.type != "karras" && s.type != "exponential") {
+  if (s.type != k::kSimple && s.type != k::kKarras &&
+      s.type != k::kExponential && s.type != k::kNormal &&
+      s.type != k::kSgmUniform && s.type != k::kBeta &&
+      s.type != k::kLinearQuadratic) {
     if (err != nullptr) {
       *err = "unknown scheduler type '" + s.type + "'; using 'simple'";
     }
@@ -238,6 +338,80 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
     return sig;
   }
 
+  // ---- ComfyUI's normal / sgm_uniform / beta / linear_quadratic -------
+  // comfy/samplers.py's normal_scheduler, beta_scheduler and
+  // linear_quadratic_schedule, over the flow model's table at `shift`
+  // (see kComfyFlowTable). In double; ComfyUI's table is float32, so its
+  // sigmas sit within a float32 rounding of these.
+  {
+    namespace k = scheduler_spec;
+    const bool sgm = type == k::kSgmUniform;
+    if (sgm || type == k::kNormal || type == k::kBeta ||
+        type == k::kLinearQuadratic) {
+      const int N = expo ? kComfyFluxTable : kComfyFlowTable;
+      auto sigma_of = [&](double t) { return time_shift(t, shift, expo); };
+      const double sig_max = sigma_of(1.0);
+      const double sig_min = sigma_of(1.0 / (double)N);
+      std::vector<double> sig;
+      if (type == k::kLinearQuadratic) {
+        // Mochi's: linear to 0.025 over the first steps / 2, quadratic
+        // after, flipped; times sigma_max, which no shift moves from 1.
+        constexpr double thr = 0.025;
+        if (S == 1) {
+          sig = {1.0, 0.0};
+        } else {
+          const int ls = S / 2;
+          std::vector<double> sch;
+          for (int i = 0; i < ls; ++i) {
+            sch.push_back((double)i * thr / (double)ls);
+          }
+          const double diff = (double)ls - thr * (double)S;
+          const int qs = S - ls;
+          const double qc = diff / ((double)ls * (double)qs * (double)qs);
+          const double lc =
+              thr / (double)ls - 2.0 * diff / ((double)qs * (double)qs);
+          const double c0 = qc * (double)ls * (double)ls;
+          for (int i = ls; i < S; ++i) {
+            sch.push_back(qc * (double)i * (double)i + lc * (double)i + c0);
+          }
+          sch.push_back(1.0);
+          for (double x : sch) { sig.push_back(1.0 - x); }
+        }
+        for (double& x : sig) { x *= sig_max; }
+        return sig;
+      }
+      if (type == k::kBeta) {
+        // 1 - linspace(0, 1, S, endpoint=False), each through the Beta
+        // quantile, rint onto the table's N - 1 steps; repeats dropped.
+        const double total = (double)(N - 1);
+        double last = -1.0;
+        for (int i = 0; i < S; ++i) {
+          const double p = 1.0 - (double)i * (1.0 / (double)S);
+          const double t =
+              std::nearbyint(beta_ppf_(p, beta_alpha, beta_beta) * total);
+          if (t != last) { sig.push_back(sigma_of((t + 1.0) / (double)N)); }
+          last = t;
+        }
+        sig.push_back(0.0);
+        return sig;
+      }
+      // normal / sgm_uniform: the timesteps -- here the sigmas -- evenly
+      // spaced from sigma_max to sigma_min, each shifted again.
+      int n = sgm ? S + 1 : S;
+      bool append_zero = true;
+      if (!sgm && std::fabs(sigma_of(sig_min)) <= 1e-5) {
+        n = S + 1;
+        append_zero = false;
+      }
+      const int keep = sgm ? S : n;
+      for (int i = 0; i < keep; ++i) {
+        sig.push_back(sigma_of(linspace_at_(sig_max, sig_min, n, i)));
+      }
+      if (append_zero) { sig.push_back(0.0); }
+      return sig;
+    }
+  }
+
   const double smax = 1.0, smin = 1.0 / (double)S;
 
   std::vector<double> base((std::size_t)S);
@@ -321,7 +495,9 @@ FlowSamplerSpec::canon_method(const std::string& m, bool* ok)
   if (m == "unipc_multistep" || m == "uni_pc") { return "unipc"; }
   if (m == "dpm++_2m" || m == "dpmpp2m") { return "dpmpp_2m"; }
   if (m == "dpm++_sde" || m == "dpmppsde") { return "dpmpp_sde"; }
-  if (m == "dmd_student" || m == "turbo") { return "dmd"; }
+  // ComfyUI's "lcm" is the same step: the clean estimate, then fresh
+  // noise to the next sigma
+  if (m == "dmd_student" || m == "turbo" || m == "lcm") { return "dmd"; }
   // NOT one of this host's names -- and PASSED THROUGH rather than
   // replaced. The in-tree samplers all fall to euler for a name they do
   // not know, so nothing here changes for them; what changes is that a

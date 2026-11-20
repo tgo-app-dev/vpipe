@@ -6,6 +6,7 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/relayvsr/relayvsr-ops.h"
 #include "generative-models/shared/ane-ffn.h"
+#include "generative-models/shared/fp8-layout.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
@@ -61,6 +62,62 @@ silu_bf(float v)
   return bf(v / (1.0f + std::exp(-v)));
 }
 
+// ComfyUI'S NAMES (Comfy-Org/RelayVSR's repack) for the release's diffusers
+// ones -- a pure renaming, measured against the release: no row or column
+// moves (the int8 projections dequantized sit at cosine 0.99996 to the
+// bf16 file's, every block).
+std::string
+comfy_name(const std::string& d)
+{
+  static const std::pair<const char*, const char*> kTop[] = {
+      {"lq_proj.out_proj.", "lq_proj_in.linear."},
+      {"lq_proj.", "lq_proj_in."},
+      {"proj_out.", "head.head."},
+      {"scale_shift_table", "head.modulation"},
+      {"condition_embedder.time_embedder.linear_1.", "time_embedding.0."},
+      {"condition_embedder.time_embedder.linear_2.", "time_embedding.2."},
+      {"condition_embedder.time_proj.", "time_projection.1."},
+      {"condition_embedder.text_embedder.linear_1.", "text_embedding.0."},
+      {"condition_embedder.text_embedder.linear_2.", "text_embedding.2."},
+      {"prompt_embeds", "positive_conditioning"},
+  };
+  static const std::pair<const char*, const char*> kBlock[] = {
+      {"attn1.to_q.", "self_attn.q."},     {"attn1.to_k.", "self_attn.k."},
+      {"attn1.to_v.", "self_attn.v."},     {"attn1.to_out.0.", "self_attn.o."},
+      {"attn1.norm_q.", "self_attn.norm_q."},
+      {"attn1.norm_k.", "self_attn.norm_k."},
+      {"attn2.to_q.", "cross_attn.q."},    {"attn2.to_k.", "cross_attn.k."},
+      {"attn2.to_v.", "cross_attn.v."},    {"attn2.to_out.0.", "cross_attn.o."},
+      {"attn2.norm_q.", "cross_attn.norm_q."},
+      {"attn2.norm_k.", "cross_attn.norm_k."},
+      {"ffn.net.0.proj.", "ffn.0."},       {"ffn.net.2.", "ffn.2."},
+      {"norm2.", "norm3."},                {"scale_shift_table", "modulation"},
+  };
+  auto starts = [](const std::string& a, const char* b) {
+    return a.compare(0, std::strlen(b), b) == 0;
+  };
+  if (starts(d, "blocks.")) {
+    const std::size_t dot = d.find('.', 7);
+    if (dot == std::string::npos) { return d; }
+    const std::string head = d.substr(0, dot + 1), rest = d.substr(dot + 1);
+    for (const auto& [a, b] : kBlock) {
+      if (starts(rest, a)) { return head + b + rest.substr(std::strlen(a)); }
+    }
+    return d;
+  }
+  for (const auto& [a, b] : kTop) {
+    if (starts(d, a)) { return b + d.substr(std::strlen(a)); }
+  }
+  return d;
+}
+
+// Whether `w` spells the model in ComfyUI's names.
+bool
+comfy_spelled(const MetalLlamaWeights& w)
+{
+  return w.info("blocks.0.self_attn.q.weight") != nullptr;
+}
+
 }  // namespace
 
 struct MetalRelayVsrWan::Block {
@@ -113,14 +170,33 @@ MetalRelayVsrWan::config_from_checkpoint(const std::string& wan_file,
   if (!w) { return fail(fmt("'{}' is not a safetensors file", wan_file)()); }
   const auto& md = w->metadata();
   auto it = md.find("format");
-  if (it == md.end() || it->second != "refvsr-wan-v1") {
+  const bool x2 = it != md.end() && it->second == "relayvsr-wan-x2-v1";
+  if (it == md.end() || (it->second != "refvsr-wan-v1" && !x2)) {
     return fail(fmt("'{}' is not a RelayVSR keyframe checkpoint (format "
-                    "refvsr-wan-v1)", wan_file)());
+                    "refvsr-wan-v1, or relayvsr-wan-x2-v1)", wan_file)());
   }
   auto ct = md.find("config");
   if (ct == md.end()) { return fail("refvsr-wan: no config in the file"); }
   const FlexData c = FlexData::from_json(ct->second);
   Config cfg;
+  // The release's 4x metadata predates the scale; the x2 file states it.
+  cfg.upscale = (int)bag::integer(c, "upscale_factor", x2 ? 2 : 4);
+  // ComfyUI's int8 projections (its repack), read as stored.
+  {
+    fp8::Layout lay;
+    std::string le;
+    if (!fp8::scan(*w, &lay, &le, /*int8=*/true)) {
+      return fail(fmt("refvsr-wan: '{}' -- {}", wan_file, le)());
+    }
+    for (const auto& [nm, q] : lay.weights) {
+      if (q.format != fp8::Format::kI8) {
+        return fail(fmt("refvsr-wan: '{}' stores '{}' in an 8-bit format "
+                        "this port does not run (only ComfyUI's int8)",
+                        wan_file, nm)());
+      }
+    }
+    cfg.int8 = lay.any();
+  }
   cfg.heads = (int)bag::integer(c, "num_attention_heads", 24);
   cfg.head_dim = (int)bag::integer(c, "attention_head_dim", 128);
   cfg.hidden = cfg.heads * cfg.head_dim;
@@ -139,7 +215,16 @@ MetalRelayVsrWan::config_from_checkpoint(const std::string& wan_file,
   // What this port runs, said where the file says otherwise.
   std::string why;
   const FlexData patch = bag::value(c, "patch_size");
-  if (!patch.is_array() || patch.as_array().size() != 3 ||
+  const char* c1 = comfy_spelled(*w) ? "lq_proj_in.conv1.weight"
+                                     : "lq_proj.conv1.weight";
+  const auto* c1i = w->info(c1);
+  if (cfg.upscale != (x2 ? 2 : 4)) {
+    why = fmt("upscale_factor {} in a {} file", cfg.upscale, it->second)();
+  } else if (c1i == nullptr || c1i->shape.size() != 4 ||
+             c1i->shape[1] != cfg.lq_channels()) {
+    why = fmt("its input projection does not read a {}x frame "
+              "({} channels)", cfg.upscale, cfg.lq_channels())();
+  } else if (!patch.is_array() || patch.as_array().size() != 3 ||
       patch.as_array()[0].as_int() != 1 || patch.as_array()[1].as_int() != 2 ||
       patch.as_array()[2].as_int() != 2) {
     why = "patch_size is not [1, 2, 2]";
@@ -182,7 +267,8 @@ MetalRelayVsrWan::config_from_checkpoint(const std::string& wan_file,
 std::uint64_t
 MetalRelayVsrWan::ring_bytes(const Config& cfg, int ph, int pw)
 {
-  const std::uint64_t n = (std::uint64_t)(ph / 8) * (pw / 8);
+  const int ts = cfg.token_stride();
+  const std::uint64_t n = (std::uint64_t)(ph / ts) * (pw / ts);
   return (std::uint64_t)cfg.layers * 2u * (std::uint64_t)cfg.context_frames *
          n * (std::uint64_t)cfg.hidden * 2u;
 }
@@ -190,11 +276,13 @@ MetalRelayVsrWan::ring_bytes(const Config& cfg, int ph, int pw)
 std::uint64_t
 MetalRelayVsrWan::scratch_bytes(const Config& cfg, int ph, int pw)
 {
-  const std::uint64_t n = (std::uint64_t)(ph / 8) * (pw / 8);
+  const int ts = cfg.token_stride();
+  const std::uint64_t n = (std::uint64_t)(ph / ts) * (pw / ts);
   const std::uint64_t D = (std::uint64_t)cfg.hidden;
   const std::uint64_t n4 = 4 * n;
   std::uint64_t b = 0;
-  b += n4 * 768u * 2u * 2u;                        // lqr, lq1
+  b += n4 * (std::uint64_t)cfg.lq_channels() * 2u;          // lqr
+  b += n4 * (std::uint64_t)cfg.lq_hidden1 * 2u;             // lq1
   b += n * (std::uint64_t)cfg.lq_hidden2 * 2u;     // lq2
   b += n * 4u * (std::uint64_t)cfg.in_channels * 2u;   // prow
   b += 5u * n * D * 2u;                            // x y q a o
@@ -216,6 +304,10 @@ MetalRelayVsrWan::scratch_bytes(const Config& cfg, int ph, int pw)
                                         cfg.sage_mode());
   b += relayvsr::Ops::cross_int8_bytes(cfg.heads, (int)n, cfg.text_tokens,
                                        cfg.sage_mode());
+  // ComfyUI's int8 widened to bf16 before each GEMM no tier holds: one
+  // copy of the widest (the feed-forward's).
+  b += relayvsr::Ops::widen_bytes(cfg.i8_tier, cfg.int8, {Di, Fi, Di},
+                                  {Di, Di, Fi});
   return b;
 }
 
@@ -228,17 +320,19 @@ MetalRelayVsrWan::weight_bytes(const Config& cfg)
   // the tier's layout -- their biases, the norms; plus its folded
   // modulation (f32) and context K / V.
   const int t = cfg.i8_tier;
+  const bool q = cfg.int8;
   const std::uint64_t blk =
-      6u * relayvsr::proj_bytes((int)D, (int)D, t) +
-      relayvsr::proj_bytes((int)F, (int)D, t) +
-      relayvsr::proj_bytes((int)D, (int)F, t) +
+      6u * relayvsr::proj_bytes((int)D, (int)D, t, q) +
+      relayvsr::proj_bytes((int)F, (int)D, t, q) +
+      relayvsr::proj_bytes((int)D, (int)F, t, q) +
       (6u * D + F + D + 5u * D) * 2u + 6u * D * 4u +
       2u * (std::uint64_t)cfg.text_tokens * D * 2u;
   const std::uint64_t h1 = (std::uint64_t)cfg.lq_hidden1;
   const std::uint64_t h2 = (std::uint64_t)cfg.lq_hidden2;
   const std::uint64_t pv = 4u * (std::uint64_t)cfg.in_channels;
+  const std::uint64_t lc = (std::uint64_t)cfg.lq_channels();
   const std::uint64_t top =
-      (768u * h1 + 2u * h1 + 9u * h1 * h2 + 2u * h2 + h2 * D + D +
+      (lc * h1 + 2u * h1 + 9u * h1 * h2 + 2u * h2 + h2 * D + D +
        pv * D + D + D * pv + pv) * 2u + 2u * D * 4u +
       2u * 1024u * (std::uint64_t)cfg.head_dim * 4u;
   return (std::uint64_t)cfg.layers * blk + top;
@@ -252,7 +346,7 @@ MetalRelayVsrWan::held_bytes() const
     for (const relayvsr::Proj* p :
          {&k.q, &k.k, &k.v, &k.o, &k.xq, &k.xo, &k.f1, &k.f2}) {
       b += p->weight_bytes();
-      b -= relayvsr::proj_bytes(p->n, p->k, _cfg.i8_tier);
+      b -= relayvsr::proj_bytes(p->n, p->k, _cfg.i8_tier, _cfg.int8);
     }
   }
   return b;
@@ -311,12 +405,26 @@ MetalRelayVsrWan::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   // The self-attention's int8 prologue at the ring's every slot.
   m->_ops->set_window_planes(cfg.context_frames);
   WeightSet& w = *m->_ws;
+  // The file's spelling: the release's names, or ComfyUI's -- and its
+  // int8 projections, which the file (not the caller) says it has.
+  const bool comfy = comfy_spelled(w.src());
+  m->_comfy = comfy;
+  auto nm_ = [comfy](const std::string& d) {
+    return comfy ? comfy_name(d) : d;
+  };
+  {
+    std::string le;
+    if (!fp8::scan(w.src(), &m->_f8, &le, /*int8=*/true)) {
+      return fail("refvsr-wan: " + le);
+    }
+    m->_cfg.int8 = m->_f8.any();
+  }
   auto t = [&](const std::string& nm) {
-    return relayvsr::tensor_elt(w, mc, nm, true, kKey);
+    return relayvsr::tensor_elt(w, mc, nm_(nm), true, kKey);
   };
   // The 3x3 conv's weight, tap-major for the gather conv: [Cout, 9 * Cin].
   {
-    const std::string nm = "lq_proj.conv2.weight";
+    const std::string nm = nm_("lq_proj.conv2.weight");
     m->_lq_c2w = w.derived(std::string(kKey) + "tap-major/" + nm, [&]() {
       relayvsr::RawTensor r;
       if (!relayvsr::read_raw(w, mc, nm, &r)) { return SharedBuffer{}; }
@@ -348,8 +456,11 @@ MetalRelayVsrWan::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
   for (int i = 0; i < cfg.layers; ++i) {
     Block& b = m->_blocks[(std::size_t)i];
     const std::string p = fmt("blocks.{}.", i)();
+    std::string pe;
     auto proj = [&](const std::string& nm, int N, int K) {
-      return op.load_proj(w, p + nm + ".weight", p + nm + ".bias", N, K, kKey);
+      const std::string wn = nm_(p + nm + ".weight");
+      return op.load_proj(w, wn, nm_(p + nm + ".bias"), N, K, kKey, true,
+                          m->_f8.find(wn), true, &pe);
     };
     b.q = proj("attn1.to_q", D, D);
     b.k = proj("attn1.to_k", D, D);
@@ -370,7 +481,10 @@ MetalRelayVsrWan::load(std::shared_ptr<WeightSet> ws, MetalCompute* mc,
     for (const SharedBuffer* s : {&b.nq, &b.nk, &b.xnq, &b.n2w, &b.n2b}) {
       ok = ok && !s->empty();
     }
-    if (!ok) { return fail(fmt("refvsr-wan: block {} is incomplete", i)()); }
+    if (!ok) {
+      return fail(pe.empty() ? fmt("refvsr-wan: block {} is incomplete", i)()
+                             : pe);
+    }
   }
   if (!m->fold_(err)) { return nullptr; }
   return m;
@@ -389,8 +503,12 @@ MetalRelayVsrWan::fold_(std::string* err)
   };
   WeightSet& w = *_ws;
   const int D = _cfg.hidden, FD = _cfg.freq_dim, T = _cfg.text_tokens;
+  const bool comfy = _comfy;
+  auto nm_ = [comfy](const std::string& d) {
+    return comfy ? comfy_name(d) : d;
+  };
   auto rd = [&](const std::string& nm, std::vector<float>* v) {
-    return relayvsr::read_f32(w, _mc, nm, v);
+    return relayvsr::read_f32(w, _mc, nm_(nm), v);
   };
   // ---- the timestep: [cos | sin] of t over FD/2 frequencies, bf16, then
   // linear_1 -> silu -> linear_2 (temb), silu -> time_proj.
@@ -408,7 +526,7 @@ MetalRelayVsrWan::fold_(std::string* err)
   std::vector<float> b1, b2, bp;
   auto raw = [&](const std::string& nm, int N, int K,
                  relayvsr::RawTensor* t) {
-    return relayvsr::read_raw(w, _mc, nm, t) &&
+    return relayvsr::read_raw(w, _mc, nm_(nm), t) &&
            t->n == (std::size_t)N * (std::size_t)K;
   };
   if (!raw("condition_embedder.time_embedder.linear_1.weight", D, FD, &w1) ||
@@ -478,22 +596,23 @@ MetalRelayVsrWan::fold_(std::string* err)
   // ---- the context: prompt_embeds -> linear_1 -> gelu(tanh) -> linear_2,
   // then each block's K = norm_k(to_k ctx) and V = to_v ctx. The cross K /
   // V projections are read UNCACHED: consumed here, never held.
-  const relayvsr::Ops& op = *_ops;
-  SharedBuffer pe = w.read("prompt_embeds", _mc, WeightSet::Residency::Copied);
-  const auto* pinfo = w.src().info("prompt_embeds");
+  relayvsr::Ops& op = *_ops;
+  // The release's [1, 512, 4096]; ComfyUI's [512, 4096].
+  const std::string pn = nm_("prompt_embeds");
+  SharedBuffer pe = w.read(pn, _mc, WeightSet::Residency::Copied);
+  const auto* pinfo = w.src().info(pn);
   if (pe.empty() || pinfo == nullptr || pinfo->dtype != "BF16" ||
-      pinfo->shape.size() != 3 || pinfo->shape[1] != T ||
-      pinfo->shape[2] != _cfg.text_dim) {
+      pinfo->shape.size() < 2 || pinfo->shape[pinfo->shape.size() - 2] != T ||
+      pinfo->shape.back() != _cfg.text_dim) {
     return fail("refvsr-wan: prompt_embeds is not bf16 [1, 512, 4096]");
   }
-  SharedBuffer l1w = w.read("condition_embedder.text_embedder.linear_1.weight",
-                            _mc, WeightSet::Residency::Copied);
-  SharedBuffer l1b = w.read("condition_embedder.text_embedder.linear_1.bias",
-                            _mc, WeightSet::Residency::Copied);
-  SharedBuffer l2w = w.read("condition_embedder.text_embedder.linear_2.weight",
-                            _mc, WeightSet::Residency::Copied);
-  SharedBuffer l2b = w.read("condition_embedder.text_embedder.linear_2.bias",
-                            _mc, WeightSet::Residency::Copied);
+  auto rdb = [&](const std::string& nm) {
+    return w.read(nm_(nm), _mc, WeightSet::Residency::Copied);
+  };
+  SharedBuffer l1w = rdb("condition_embedder.text_embedder.linear_1.weight");
+  SharedBuffer l1b = rdb("condition_embedder.text_embedder.linear_1.bias");
+  SharedBuffer l2w = rdb("condition_embedder.text_embedder.linear_2.weight");
+  SharedBuffer l2b = rdb("condition_embedder.text_embedder.linear_2.bias");
   if (l1w.empty() || l1b.empty() || l2w.empty() || l2b.empty()) {
     return fail("refvsr-wan: the text embedder is missing");
   }
@@ -516,33 +635,48 @@ MetalRelayVsrWan::fold_(std::string* err)
   for (int i = 0; i < _cfg.layers; ++i) {
     Block& b = _blocks[(std::size_t)i];
     const std::string p = fmt("blocks.{}.attn2.", i)();
-    SharedBuffer kw = w.read(p + "to_k.weight", _mc,
-                             WeightSet::Residency::Copied);
-    SharedBuffer kb = w.read(p + "to_k.bias", _mc,
-                             WeightSet::Residency::Copied);
-    SharedBuffer vw = w.read(p + "to_v.weight", _mc,
-                             WeightSet::Residency::Copied);
-    SharedBuffer vb = w.read(p + "to_v.bias", _mc,
-                             WeightSet::Residency::Copied);
-    SharedBuffer nk = w.read(p + "norm_k.weight", _mc,
-                             WeightSet::Residency::Copied);
-    if (kw.empty() || kb.empty() || vw.empty() || vb.empty() || nk.empty()) {
-      return fail(fmt("refvsr-wan: block {}'s cross K / V is missing", i)());
+    // Read UNCACHED and consumed (a ComfyUI int8 weight widened to bf16 on
+    // the way, as the forward widens one): the dense GEMM either way.
+    std::string pe2;
+    auto cproj = [&](const char* nm) {
+      const std::string wn = nm_(p + nm + ".weight");
+      return op.load_proj(w, wn, nm_(p + nm + ".bias"), D, D, kKey,
+                          /*hold=*/false, _f8.find(wn), /*cache=*/false,
+                          &pe2);
+    };
+    const relayvsr::Proj kp = cproj("to_k");
+    const relayvsr::Proj vp = cproj("to_v");
+    SharedBuffer nk = rdb(p + "norm_k.weight");
+    if (!kp.valid() || !vp.valid() || nk.empty()) {
+      return fail(pe2.empty()
+                      ? fmt("refvsr-wan: block {}'s cross K / V is missing",
+                            i)()
+                      : pe2);
     }
     b.ck = _mc->make_shared_buffer((std::size_t)T * D * 2);
     b.cv = _mc->make_shared_buffer((std::size_t)T * D * 2);
     if (b.ck.empty() || b.cv.empty()) { return fail("context K/V allocation"); }
     ComputeEncoder enc = stream.begin_compute();
-    op.gemm(enc, ctx, 0, kw, &kb, b.ck, 0, T, D, D);
+    const SharedBuffer* kw = op.dense_weight(enc, kp);
+    if (kw == nullptr) { return fail("refvsr-wan: cross K widening"); }
+    op.gemm(enc, ctx, 0, *kw, &kp.b, b.ck, 0, T, D, D);
     enc.set_function(op.rms);
     enc.set_buffer(0, b.ck); enc.set_buffer(1, nk); enc.set_buffer(2, b.ck);
     enc.set_constant(3, D); enc.set_constant(4, _cfg.eps);
     enc.dispatch({256, (unsigned)T, 1}, {256, 1, 1});
-    op.gemm(enc, ctx, 0, vw, &vb, b.cv, 0, T, D, D);
+    const SharedBuffer* vw = op.dense_weight(enc, vp);
+    if (vw == nullptr) { return fail("refvsr-wan: cross V widening"); }
+    op.gemm(enc, ctx, 0, *vw, &vp.b, b.cv, 0, T, D, D);
     enc.end();
     std::string ge;
     if (!stream.commit().wait_ok(&ge)) { return fail("context K/V: " + ge); }
   }
+  // The fold's widenings are done. Where a forward widens too (ComfyUI's
+  // int8 off the held tiers) the scratch, made at the widest such
+  // projection, is the forward's; where none does, it goes -- the plan
+  // books it only where a forward widens (MEASURED, 2x token: 12 MB over
+  // the booking with the fold's copy kept).
+  if (!op.widens()) { op.drop_widened(); }
   return true;
 }
 
@@ -560,7 +694,8 @@ MetalRelayVsrWan::ensure_scratch_(int ph, int pw, std::string* err)
   auto sc = std::make_unique<Scratch>();
   sc->ph = ph;
   sc->pw = pw;
-  const std::size_t n = (std::size_t)(ph / 8) * (pw / 8);
+  const int ts = _cfg.token_stride();
+  const std::size_t n = (std::size_t)(ph / ts) * (pw / ts);
   const std::size_t D = (std::size_t)_cfg.hidden;
   const std::size_t n4 = 4 * n;
   const std::size_t pv = 4 * (std::size_t)_cfg.in_channels;
@@ -568,7 +703,7 @@ MetalRelayVsrWan::ensure_scratch_(int ph, int pw, std::string* err)
   auto mk = [&](std::size_t bytes) {
     return _mc->make_shared_buffer(std::max<std::size_t>(bytes, 16));
   };
-  sc->lqr = mk(n4 * 768 * 2);
+  sc->lqr = mk(n4 * (std::size_t)_cfg.lq_channels() * 2);
   sc->lq1 = mk(n4 * (std::size_t)_cfg.lq_hidden1 * 2);
   sc->lq2 = mk(n * (std::size_t)_cfg.lq_hidden2 * 2);
   sc->prow = mk(n * pv * 2);
@@ -664,8 +799,16 @@ MetalRelayVsrWan::ane_stage_(int bi)
   const Block& b = _blocks[(std::size_t)bi];
   auto src = [](const relayvsr::Proj& p) {
     AneFfnSource s;
-    s.w    = &p.w;
     s.bias = &p.b;
+    if (p.stored()) {
+      // ComfyUI's int8 as stored: staged as the GPU's widening holds it.
+      s.w      = &p.i8;
+      s.scales = &p.i8s;
+      s.bits   = AneFfnSource::kInt8;
+      s.rot    = p.rot;
+    } else {
+      s.w = &p.w;
+    }
     return s;
   };
   // A GELU module: {up, down}.
@@ -682,13 +825,18 @@ MetalRelayVsrWan::keyframe(const SharedBuffer& lr, int ph, int pw,
     if (err != nullptr) { *err = m; }
     return false;
   };
-  if (ph <= 0 || pw <= 0 || ph % 8 != 0 || pw % 8 != 0) {
-    return fail("refvsr-wan: the frame must be padded to a multiple of 8");
+  // h4 x w4 the LATENT grid (1/4 of the frame at 4x, 1/8 at 2x), h8 x w8
+  // the token grid, half of it.
+  const int ls = _cfg.latent_stride(), ts = _cfg.token_stride();
+  if (ph <= 0 || pw <= 0 || ph % ts != 0 || pw % ts != 0) {
+    return fail(fmt("refvsr-wan: the frame must be padded to a multiple of "
+                    "{}", ts)());
   }
   const int C = _cfg.in_channels;
-  const int h4 = ph / 4, w4 = pw / 4, h8 = ph / 8, w8 = pw / 8;
+  const int h4 = ph / ls, w4 = pw / ls, h8 = h4 / 2, w8 = w4 / 2;
   if (noise.size() != (std::size_t)C * h4 * w4) {
-    return fail("refvsr-wan: noise is not [48, ph/4, pw/4]");
+    return fail(fmt("refvsr-wan: noise is not [48, ph/{}, pw/{}]", ls,
+                    ls)());
   }
   if (!ensure_scratch_(ph, pw, err)) { return false; }
   Scratch& s = *_sc;
@@ -697,6 +845,7 @@ MetalRelayVsrWan::keyframe(const SharedBuffer& lr, int ph, int pw,
   _ops->tune_pending();
   const relayvsr::Ops& op = *_ops;
   const long i8_0 = op.i8_gemms(), dense_0 = op.dense_gemms();
+  const long cr_0 = op.convrot_gemms(), wid_0 = op.widened_gemms();
   const int n = s.n, n4 = h4 * w4, D = _cfg.hidden, NH = _cfg.heads;
   const int PV = 4 * C, W = _cfg.context_frames;
   const std::size_t lat_bytes = (std::size_t)C * n4 * 4;
@@ -721,12 +870,14 @@ MetalRelayVsrWan::keyframe(const SharedBuffer& lr, int ph, int pw,
   // ---- the frame's rows and the noise's patch rows, summed.
   {
     ComputeEncoder enc = _stream.begin_compute();
+    const int lc = _cfg.lq_channels();
     enc.set_function(op.lq_rows);
     enc.set_buffer(0, lr); enc.set_buffer(1, s.lqr);
     enc.set_constant(2, ph); enc.set_constant(3, pw);
-    enc.dispatch({768, (unsigned)n4, 1}, {256, 1, 1});
+    enc.set_constant(4, _cfg.upscale);
+    enc.dispatch({(unsigned)lc, (unsigned)n4, 1}, {64, 1, 1});
     op.gemm(enc, s.lqr, 0, _lq_c1w, &_lq_c1b, s.lq1, 0, n4,
-            _cfg.lq_hidden1, 768);
+            _cfg.lq_hidden1, lc);
     enc.set_function(op.rms_silu);
     enc.set_buffer(0, s.lq1); enc.set_buffer(1, _lq_n1);
     enc.set_buffer(2, s.lq1);
@@ -978,8 +1129,11 @@ MetalRelayVsrWan::keyframe(const SharedBuffer& lr, int ph, int pw,
   }
   _i8_gemms = op.i8_gemms() - i8_0;
   _dense_gemms = op.dense_gemms() - dense_0;
-  prof.report(_mc, fmt("{} rows, {} int8 / {} dense GEMMs, {} ANE rows", n,
-                       _i8_gemms, _dense_gemms, _ane_rows)());
+  _cr_gemms = op.convrot_gemms() - cr_0;
+  _widened = op.widened_gemms() - wid_0;
+  prof.report(_mc, fmt("{} rows, {} int8 / {} dense GEMMs ({} ConvRot as "
+                       "stored, {} widened), {} ANE rows", n, _i8_gemms,
+                       _dense_gemms, _cr_gemms, _widened, _ane_rows)());
   ++_frame;
   return true;
 }

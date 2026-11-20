@@ -211,18 +211,30 @@ Sampler::sample(std::span<const float> logits)
     for (std::size_t i = 0; i < V; ++i) {
       idx_buf[i] = static_cast<std::int32_t>(i);
     }
-    std::sort(idx_buf.begin(), idx_buf.end(),
-              [&](std::int32_t a, std::int32_t b) {
-                return l[a] > l[b];
-              });
+    // Only the prefix the nucleus can reach is sorted: the top 128 by
+    // probability, widened 4x while their sum falls short of top_p (a
+    // vocabulary's whole sort was ~10 ms a token for DeepSeek-V4.1's
+    // 129,280 -- the decode's own step is ~18). The prefix kept, and every
+    // probability zeroed past it, are a full sort's; only the order among
+    // exactly equal probabilities at the cut may differ.
+    auto desc = [&](std::int32_t a, std::int32_t b) { return l[a] > l[b]; };
     float running_sum = 0.0f;
     std::size_t cutoff_idx = V;
-    for (std::size_t i = 0; i < V; ++i) {
-      running_sum += l[idx_buf[i]];
-      if (running_sum >= _params.top_p) {
-        cutoff_idx = i + 1;
-        break;
+    std::size_t sorted = 0;
+    for (std::size_t k = std::min<std::size_t>(128, V);;
+         k = std::min(V, k * 4)) {
+      std::partial_sort(idx_buf.begin() + (std::ptrdiff_t)sorted,
+                        idx_buf.begin() + (std::ptrdiff_t)k, idx_buf.end(),
+                        desc);
+      for (std::size_t i = sorted; i < k; ++i) {
+        running_sum += l[idx_buf[i]];
+        if (running_sum >= _params.top_p) {
+          cutoff_idx = i + 1;
+          break;
+        }
       }
+      sorted = k;
+      if (cutoff_idx < V || k == V) { break; }
     }
     if (cutoff_idx == 0) {
       cutoff_idx = 1;

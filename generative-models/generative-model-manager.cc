@@ -1,4 +1,5 @@
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/far-memory.h"
 
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
@@ -2129,17 +2130,39 @@ GenerativeModelManager::load(const LoadSpec& spec)
   }
 
   // Fast path: existing live entry. Locked briefly; the lookup is
-  // O(1) and weak_ptr::lock() is a couple of atomics.
+  // O(1) and weak_ptr::lock() is a couple of atomics. A load of the same
+  // key under way is waited for and its model shared: two loads at once
+  // would hold two copies -- each its expert cache, each its far memory
+  // (a lender taking one session fails the second) -- where the plan
+  // books one.
   {
-    lock_guard<mutex> lk(_mu);
-    auto it = _cache.find(key);
-    if (it != _cache.end()) {
-      if (auto sp = it->second.lock()) {
-        return sp;
+    unique_lock<mutex> lk(_mu);
+    for (;;) {
+      auto it = _cache.find(key);
+      if (it != _cache.end()) {
+        if (auto sp = it->second.lock()) {
+          return sp;
+        }
+        _cache.erase(it);
       }
-      _cache.erase(it);
+      if (_loading.count(key) == 0) { break; }
+      _loading_cv.wait(lk);
     }
+    _loading.insert(key);
   }
+  // this load's slot let go however it ends, waking those waiting on it
+  struct LoadingSlot {
+    GenerativeModelManager* m;
+    const Key* key;
+    ~LoadingSlot()
+    {
+      {
+        lock_guard<mutex> lk(m->_mu);
+        m->_loading.erase(*key);
+      }
+      m->_loading_cv.notify_all();
+    }
+  } loading_slot{this, &key};
 
   // Map the dtype string. We do this BEFORE the heavy IO so a typo
   // fails fast.
@@ -2253,6 +2276,19 @@ GenerativeModelManager::load(const LoadSpec& spec)
       0, bag::integer(spec.extra, load_spec::kExpertCacheMb, 0)) << 20;
   // And whether its n-gram table is asked for in memory (kNgramResident).
   const bool ngram = bag::flag(spec.extra, load_spec::kNgramResident);
+  // And far memory for its expert cache (kFarMemory), opened here; one
+  // that does not open is said, and the model loads without it.
+  std::shared_ptr<FarMemory> far;
+  if (bag::has(spec.extra, load_spec::kFarMemory)) {
+    std::string why;
+    far = open_far_memory(bag::value(spec.extra, load_spec::kFarMemory),
+                          &why);
+    if (!far && session()) {
+      session()->warn(fmt("GenerativeModelManager::load('{}'): far memory "
+                          "not opened ({}); the experts come from disk",
+                          key.hf_dir, why));
+    }
+  }
   shared_ptr<LoadedLanguageModel> lm;
   std::size_t wired = 0, wired_tmp = 0, held_back = 0, room = 0;
   {
@@ -2271,6 +2307,7 @@ GenerativeModelManager::load(const LoadSpec& spec)
     }
     {
       LmMemoryLimit cap(limit, cache, ngram);
+      LmFarMemory far_scope(far);
       // Whose its load is (common/memory-owner.h): this model's -- its
       // weights, and what marks its own use as it allocates (an expert
       // cache, its K/V) -- whatever stage asked for it.
@@ -2326,10 +2363,9 @@ GenerativeModelManager::load(const LoadSpec& spec)
     }
   }
 
-  // Re-lock and stash the result. If a racing thread already
-  // installed an entry for the same key with a live shared_ptr we
-  // hand back theirs (wastes one load, never produces UB; this is
-  // the same trade-off CoreMLModelManager makes).
+  // Re-lock and stash the result (a load of this key in flight was
+  // waited for above; a live entry here is one another path installed --
+  // theirs is handed back, as CoreMLModelManager does).
   {
     lock_guard<mutex> lk(_mu);
     auto it = _cache.find(key);

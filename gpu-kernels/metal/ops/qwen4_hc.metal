@@ -741,6 +741,516 @@ VPIPE_HCF_UP(hc_up_mix_h1_g32_f16, 1, 1, 32)
 VPIPE_HCF_UP(hc_up_mix_h2_g32_f16, 2, 1, 32)
 VPIPE_HCF_UP(hc_up_mix_h4_g32_f16, 4, 1, 32)
 
+// ---------------------------------------------------------------------
+// THE BLOCK'S TWO LAUNCHES BY HALF RUNS AND ROW PAIRS (hcf_bench). A
+// launch's floor on the M5 Ultra is ~2.9 us (an empty dependent launch)
+// and a block's 6.9 MB of weights ~7 us more: the up launch above sat on
+// it at one row, the norm's ~3 us over (its threadgroups each normed the
+// whole stream through two barriers), and each further row cost both
+// ~3 us -- a row a grid slice, re-reading the stream and the weights. The
+// twins below keep every row's arithmetic to the bit and take the rows
+// in pairs. MEASURED, a block, 1 / 2 / 4 / 8 rows: M5 Ultra 18.0 / 23.3 /
+// 37.2 / 64.4 us -> 16.5 / 19.3 / 29.3 / 51.1; M4 Pro 71 / 84 / 154 /
+// 296 -> ~41-63 / 61-65 / 111 / 208.
+// ---------------------------------------------------------------------
+
+// THE NORM'S LAUNCH BY HALF RUNS: threadgroup (g, run, z) -- down rows g
+// * 8 * RPS .., K run `run` (stream run / 2, half run % 2), rows z * MAXM
+// .. -- for MAXM rows together: the weights into registers, every row's
+// stream summed in one pass (each thread keeps the values of its half),
+// one barrier, every row's half normed into threadgroup memory (a half:
+// two rows' fit), one barrier, every row against the registers. Each
+// row's sums, norm and down rows are hc_pre_down_f16's to the bit (the
+// same thread / lane layout and order). grid {256 G, 8, ceil(M / MAXM)},
+// tg {256, 1, 1}, G = ceil(N / (8 RPS)).
+template <int RPS, int MAXM, int BR, int GS = 64>
+inline void hcf_pre_half_(
+    const device VPIPE_ELT* X, const device VPIPE_ELT* py,
+    const device float* pinj, const device float* nw,
+    device VPIPE_ELT* hcn, const device uint8_t* dw,
+    const device VPIPE_ELT* ds, const device VPIPE_ELT* db,
+    device float* parts, int N, int M, float eps, int pending,
+    threadgroup VPIPE_ELT* xs, threadgroup float* red,
+    uint3 tg, uint tid, uint sid, uint lane)
+{
+  constexpr int S = 4;
+  constexpr int H = 512 * BR;
+  constexpr int HH = H / 2;
+  constexpr int NV = 2 * BR;          // a thread's values of the stream
+  constexpr int NH = BR;              // ...of its half
+  constexpr int K = S * H;
+  constexpr int Kg = K / GS;
+  const int g = (int)tg.x, run = (int)tg.y;
+  const int s = run >> 1, rh = run & 1;
+  const int row0 = (int)tg.z * MAXM;
+  const int m_rows = min(MAXM, M - row0);
+  const int o0 = g * 8 * RPS + (int)sid * RPS;
+  const int rows_here = clamp(N - o0, 0, RPS);
+  const int kb0 = s * H + rh * HH;
+  uint2 wq[RPS][BR];
+  float wsc[RPS][BR], wbi[RPS][BR];
+  for (int r = 0; r < RPS; ++r) {
+    const int o = min(o0 + r, N - 1);
+    const device uint8_t* wp = dw + (ulong)o * K + kb0 + lane * 8;
+    const ulong gi = (ulong)o * Kg + kb0 / GS + lane / (GS / 8);
+    for (int b = 0; b < BR; ++b) {
+      wq[r][b] = *(const device uint2*)(wp + b * 256);
+      wsc[r][b] = ds[gi + b * (256 / GS)];
+      wbi[r][b] = db[gi + b * (256 / GS)];
+    }
+  }
+  // Every row's stream: the sum of squares over all of it, the values of
+  // this threadgroup's half kept (thread tid's h = tid + j 256: its half
+  // is j in [rh NH, rh NH + NH)).
+  float own[MAXM][NH];
+  for (int m = 0; m < MAXM; ++m) {
+    const int r = row0 + min(m, m_rows - 1);
+    const ulong base = ((ulong)r * S + s) * (ulong)H;
+    const float wj = pending != 0 ? pinj[r * S + s] : 0.0f;
+    float ss = 0.0f;
+    for (int j = 0; j < NV; ++j) {
+      const int h = (int)tid + j * 256;
+      VPIPE_ELT xv = X[base + h];
+      if (pending != 0) {
+        const float add =
+            (float)(VPIPE_ELT)(wj * (float)py[(ulong)r * H + h]);
+        xv = (VPIPE_ELT)((float)xv + add);
+      }
+      const float v = (float)xv;
+      ss += v * v;
+      if (j / NH == rh) { own[m][j % NH] = v; }
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) { red[m * 8 + sid] = ss; }
+  }
+  const device float* ws = nw + (ulong)s * (ulong)H;
+  float wv[NH];
+  for (int j = 0; j < NH; ++j) {
+    wv[j] = ws[(int)tid + (rh * NH + j) * 256];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int m = 0; m < MAXM; ++m) {
+    float t = lane < 8 ? red[m * 8 + lane] : 0.0f;
+    t = simd_sum(t);
+    const float rr = metal::rsqrt(t / (float)H + eps);
+    const ulong base =
+        ((ulong)(row0 + min(m, m_rows - 1)) * S + s) * (ulong)H;
+    for (int j = 0; j < NH; ++j) {
+      const int hh = (int)tid + j * 256;          // within the half
+      const VPIPE_ELT y = (VPIPE_ELT)(own[m][j] * rr * wv[j]);
+      xs[m * HH + hh] = y;
+      if (g == 0 && m < m_rows) { hcn[base + rh * HH + hh] = y; }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float res[RPS][MAXM];
+  for (int r = 0; r < RPS; ++r) {
+    for (int m = 0; m < MAXM; ++m) { res[r][m] = 0.0f; }
+  }
+  for (int b = 0; b < BR; ++b) {
+    float xt[MAXM][8];
+    float sum[MAXM];
+    for (int m = 0; m < MAXM; ++m) {
+      sum[m] = 0.0f;
+      for (int i = 0; i < 8; ++i) {
+        const VPIPE_ELT xv = xs[m * HH + b * 256 + (int)lane * 8 + i];
+        sum[m] += xv;
+        xt[m][i] = xv;
+      }
+    }
+    for (int r = 0; r < rows_here; ++r) {
+      const uint2 q = wq[r][b];
+      float acc[MAXM];
+      for (int m = 0; m < MAXM; ++m) { acc[m] = 0.0f; }
+      for (int i = 0; i < 8; ++i) {
+        const uint word = i < 4 ? q.x : q.y;
+        const float w8 = (float)((word >> (8 * (i & 3))) & 0xffu);
+        for (int m = 0; m < MAXM; ++m) { acc[m] += xt[m][i] * w8; }
+      }
+      for (int m = 0; m < MAXM; ++m) {
+        res[r][m] += wsc[r][b] * acc[m] + sum[m] * wbi[r][b];
+      }
+    }
+  }
+  for (int r = 0; r < RPS; ++r) {
+    for (int m = 0; m < MAXM; ++m) {
+      const float t = simd_sum(res[r][m]);
+      if (lane == 0 && r < rows_here && m < m_rows) {
+        parts[((ulong)(row0 + m) * kHcfRuns + run) * N + o0 + r] = t;
+      }
+    }
+  }
+}
+
+#define VPIPE_HCF_PRE_HALF(NAME, RPS, MAXM, GS)                              \
+  kernel void NAME(                                                          \
+      const device VPIPE_ELT* X     [[buffer(0)]],                           \
+      const device VPIPE_ELT* py    [[buffer(1)]],                           \
+      const device float*     pinj  [[buffer(2)]],                           \
+      const device float*     nw    [[buffer(3)]],                           \
+      device VPIPE_ELT*       hcn   [[buffer(4)]],                           \
+      const device uint8_t*   dw    [[buffer(5)]],                           \
+      const device VPIPE_ELT* ds    [[buffer(6)]],                           \
+      const device VPIPE_ELT* db    [[buffer(7)]],                           \
+      device float*           parts [[buffer(8)]],                           \
+      constant int&           N     [[buffer(10)]],                          \
+      constant int&           M     [[buffer(11)]],                          \
+      constant float&         eps   [[buffer(12)]],                          \
+      constant int&           pend  [[buffer(13)]],                          \
+      uint3 tg   [[threadgroup_position_in_grid]],                           \
+      uint  tid  [[thread_index_in_threadgroup]],                            \
+      uint  sid  [[simdgroup_index_in_threadgroup]],                         \
+      uint  lane [[thread_index_in_simdgroup]]) {                            \
+    threadgroup VPIPE_ELT xs[MAXM * 256 * kHcfBR];                           \
+    threadgroup float red[MAXM * 8];                                         \
+    hcf_pre_half_<RPS, MAXM, kHcfBR, GS>(X, py, pinj, nw, hcn, dw, ds, db,   \
+                                         parts, N, M, eps, pend, xs, red,    \
+                                         tg, tid, sid, lane);                \
+  }
+// One or two rows a threadgroup (the rest along z): four or eight kept
+// every row's values in registers past what a thread holds.
+VPIPE_HCF_PRE_HALF(hc_pre_half_m1_f16, 1, 1, 64)
+VPIPE_HCF_PRE_HALF(hc_pre_half_m2_f16, 1, 2, 64)
+VPIPE_HCF_PRE_HALF(hc_pre_half_m1_g32_f16, 1, 1, 32)
+VPIPE_HCF_PRE_HALF(hc_pre_half_m2_g32_f16, 1, 2, 32)
+
+// THE UP LAUNCH BY ROW PAIRS: threadgroup (x, z) as hc_up_mix_f16's
+// (HPS 1) for MAXM rows -- the weights, every row's down runs and the
+// normed values the mix reads all fetched before anything waits; every
+// row's activations into threadgroup memory, one barrier, every row
+// against the registers. Each row hc_up_mix_f16's to the bit. grid {256
+// H / 8, 1, ceil(M / MAXM)}, tg {256, 1, 1}.
+template <int MAXM, int GS = 64>
+inline void hcf_up_all_(
+    const device float* parts, const device uint8_t* uw,
+    const device VPIPE_ELT* us, const device VPIPE_ELT* ub,
+    const device VPIPE_ELT* hcn, device VPIPE_ELT* xmix, device float* inj,
+    device VPIPE_ELT* X, const device VPIPE_ELT* py,
+    const device float* pinj, int H, int R, int N, int M, int pending,
+    threadgroup VPIPE_ELT* acts, uint3 tg, uint tid, uint sid, uint lane)
+{
+  constexpr int S = 4;
+  constexpr int HT = 8;
+  constexpr int Q = S;
+  const int h0 = (int)tg.x * HT;
+  const int h = h0 + (int)sid;
+  const int Rg = R / GS;
+  const int row0 = (int)tg.z * MAXM;
+  const int m_rows = min(MAXM, M - row0);
+
+  bool live[2];
+  uint2 uq[Q][2];
+  float usc[Q][2], ubi[Q][2];
+  for (int c = 0; c < 2; ++c) {
+    const int kb = c * 256;
+    live[c] = kb < R && (R - kb >= 256 || R - (kb + (int)lane * 8) > 0);
+  }
+  for (int q = 0; q < Q; ++q) {
+    const int nr = q * H + h;
+    for (int c = 0; c < 2; ++c) {
+      if (live[c]) {
+        const int kb = c * 256;
+        uq[q][c] = *(const device uint2*)(uw + (ulong)nr * R + kb + lane * 8);
+        usc[q][c] = us[(ulong)nr * Rg + kb / GS + lane / (GS / 8)];
+        ubi[q][c] = ub[(ulong)nr * Rg + kb / GS + lane / (GS / 8)];
+      } else {
+        uq[q][c] = uint2(0u);
+        usc[q][c] = 0.0f;
+        ubi[q][c] = 0.0f;
+      }
+    }
+  }
+  // The normed values lane 0 mixes, every row's.
+  float nmix[MAXM][S];
+  for (int m = 0; m < MAXM; ++m) {
+    for (int s = 0; s < S; ++s) {
+      nmix[m][s] = lane == 0 && m < m_rows
+          ? (float)hcn[((ulong)(row0 + m) * S + s) * (ulong)H + h] : 0.0f;
+    }
+  }
+  const int lim = tg.x == 0 ? N : R;
+  for (int e = (int)tid; e < MAXM * lim; e += 256) {
+    const int m = e / lim, i = e % lim;
+    if (m >= m_rows) { continue; }
+    const device float* pp = parts + (ulong)(row0 + m) * kHcfRuns * N;
+    float t = 0.0f;
+    for (int k = 0; k < kHcfRuns; ++k) { t += pp[k * N + i]; }
+    const float vv = (float)(VPIPE_ELT)t / (float)S;
+    if (i < R) {
+      acts[m * kHcfMaxR + i] = (VPIPE_ELT)(vv * sigmoid_(vv));
+    } else {
+      inj[(row0 + m) * S + (i - R)] =
+          (float)(VPIPE_ELT)(2.0f * sigmoid_(vv));
+    }
+  }
+  if (pending != 0) {
+    for (int e = (int)tid; e < m_rows * S * HT; e += 256) {
+      const int m = row0 + e / (S * HT), s = (e / HT) % S;
+      const int hh = h0 + e % HT;
+      const ulong i = ((ulong)m * S + s) * (ulong)H + hh;
+      const float add =
+          (float)(VPIPE_ELT)(pinj[m * S + s] * (float)py[(ulong)m * H + hh]);
+      X[i] = (VPIPE_ELT)((float)X[i] + add);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float res[Q][MAXM];
+  for (int q = 0; q < Q; ++q) {
+    for (int m = 0; m < MAXM; ++m) { res[q][m] = 0.0f; }
+  }
+  for (int c = 0; c < 2; ++c) {
+    if (!live[c]) { continue; }
+    const int kb = c * 256;
+    const int krem = R - kb;
+    const int kvalid = R - (kb + (int)lane * 8);
+    float xt[MAXM][8];
+    float sum[MAXM];
+    for (int m = 0; m < MAXM; ++m) {
+      sum[m] = 0.0f;
+      for (int i = 0; i < 8; ++i) {
+        const float xv = (krem >= 256 || i < kvalid)
+            ? (float)acts[m * kHcfMaxR + kb + (int)lane * 8 + i] : 0.0f;
+        sum[m] += xv;
+        xt[m][i] = xv;
+      }
+    }
+    for (int q = 0; q < Q; ++q) {
+      const uint2 w2 = uq[q][c];
+      float acc[MAXM];
+      for (int m = 0; m < MAXM; ++m) { acc[m] = 0.0f; }
+      for (int i = 0; i < 8; ++i) {
+        const uint word = i < 4 ? w2.x : w2.y;
+        const float wv = (float)((word >> (8 * (i & 3))) & 0xffu);
+        for (int m = 0; m < MAXM; ++m) { acc[m] += xt[m][i] * wv; }
+      }
+      for (int m = 0; m < MAXM; ++m) {
+        res[q][m] += usc[q][c] * acc[m] + sum[m] * ubi[q][c];
+      }
+    }
+  }
+  for (int m = 0; m < MAXM; ++m) {
+    VPIPE_ELT u[Q];
+    for (int q = 0; q < Q; ++q) { u[q] = (VPIPE_ELT)simd_sum(res[q][m]); }
+    if (lane != 0 || m >= m_rows) { continue; }
+    float acc = 0.0f;
+    for (int s = 0; s < S; ++s) {
+      const float mixw = (float)(VPIPE_ELT)sigmoid_((float)u[s]);
+      acc += (float)(VPIPE_ELT)(mixw * nmix[m][s]);
+    }
+    xmix[(ulong)(row0 + m) * H + h] = (VPIPE_ELT)(acc / (float)S);
+  }
+}
+
+#define VPIPE_HCF_UP_ALL(NAME, MAXM, GS)                                     \
+  kernel void NAME(                                                          \
+      const device float*     parts [[buffer(0)]],                           \
+      const device uint8_t*   uw    [[buffer(1)]],                           \
+      const device VPIPE_ELT* us    [[buffer(2)]],                           \
+      const device VPIPE_ELT* ub    [[buffer(3)]],                           \
+      const device VPIPE_ELT* hcn   [[buffer(4)]],                           \
+      device VPIPE_ELT*       xmix  [[buffer(5)]],                           \
+      device float*           inj   [[buffer(6)]],                           \
+      device VPIPE_ELT*       X     [[buffer(7)]],                           \
+      const device VPIPE_ELT* py    [[buffer(8)]],                           \
+      const device float*     pinj  [[buffer(9)]],                           \
+      constant int&           H     [[buffer(10)]],                          \
+      constant int&           R     [[buffer(11)]],                          \
+      constant int&           N     [[buffer(12)]],                          \
+      constant int&           M     [[buffer(13)]],                          \
+      constant int&           pend  [[buffer(14)]],                          \
+      uint3 tg   [[threadgroup_position_in_grid]],                           \
+      uint  tid  [[thread_index_in_threadgroup]],                            \
+      uint  sid  [[simdgroup_index_in_threadgroup]],                         \
+      uint  lane [[thread_index_in_simdgroup]]) {                            \
+    threadgroup VPIPE_ELT acts[MAXM * kHcfMaxR];                             \
+    hcf_up_all_<MAXM, GS>(parts, uw, us, ub, hcn, xmix, inj, X, py, pinj,    \
+                          H, R, N, M, pend, acts, tg, tid, sid, lane);       \
+  }
+// Two rows a threadgroup (the rest along z); one row takes hc_up_mix_f16.
+VPIPE_HCF_UP_ALL(hc_up_all_m2_f16, 2, 64)
+VPIPE_HCF_UP_ALL(hc_up_all_m2_g32_f16, 2, 32)
+
+// ---------------------------------------------------------------------
+// THE N-GRAM PLE ROWS ON THE GPU, from ids the GPU holds (the table in
+// memory): each row's 2- and 3-gram hashed into every head as the host's
+// ple_rows_ hashes it, the row found in the table's chunks and
+// dequantized -- the host's values to the bit. So a speculative verify
+// hashes its drafts where they were drafted: no read-back between the
+// draft and the verify, the round one submission. The tokens: the two
+// before the rows (the PLE state's last ids, +1; 0 = EOS) then ids[0..n).
+// With `note`, the state's last two ids after the rows into st_out -- a
+// different buffer from st_in (a verify's ring slots); in place, the
+// separate ple_ids_note_f16 writes them after.
+// grid {32 heads, n, 1}, tg {32, 1, 1}: a simdgroup a (head, row).
+struct PleGpuArgs {
+  long mult[8];
+  long sizes[32];
+  long offsets[32];
+  long shard_rows, eos;
+  ulong shard_wb, shard_sb;    // a shard's codes / scales, bytes
+  int heads, hpn, G, D, bits, group, spc_w, spc_s;
+  int row_w, row_s, n, note, scales_bf16, elt_bf16;
+  uint ids_off;                // the state's last ids, bytes in
+  float scale;                 // ngram_embedding.weight_scale
+};
+
+inline ushort ple_bf16_bits_(float f) {
+  uint b = as_type<uint>(f);
+  b += 0x7fffu + ((b >> 16) & 1u);
+  return (ushort)(b >> 16);
+}
+
+inline float ple_16_f32_(ushort u, bool bf) {
+  return bf ? as_type<float>((uint)u << 16) : (float)as_type<half>(u);
+}
+
+// The token at index q of [h0, h1, ids...].
+inline long ple_tok_(int q, long h0, long h1, const device int* ids) {
+  return q == 0 ? h0 : q == 1 ? h1 : (long)ids[q - 2];
+}
+
+inline void ple_note_ids_(const device int* ids, const device uchar* st_in,
+                          device uchar* st_out, constant PleGpuArgs& a)
+{
+  const device int* si = (const device int*)(st_in + a.ids_off);
+  const long h0 = si[0] > 0 ? (long)si[0] - 1 : a.eos;
+  const long h1 = si[1] > 0 ? (long)si[1] - 1 : a.eos;
+  const long x = ple_tok_(a.n, h0, h1, ids);
+  const long y = ple_tok_(a.n + 1, h0, h1, ids);
+  device int* so = (device int*)(st_out + a.ids_off);
+  so[0] = (int)x + 1;
+  so[1] = (int)y + 1;
+}
+
+kernel void ple_rows_gpu_f16(
+    const device int*   ids    [[buffer(0)]],    // [n]
+    const device uchar* st_in  [[buffer(1)]],    // the PLE layer's state
+    device uchar*       st_out [[buffer(2)]],
+    device ushort*      out    [[buffer(3)]],    // [n, heads * D] elt
+    constant PleGpuArgs& a     [[buffer(4)]],
+    const device uchar* w0 [[buffer(5)]],
+    const device uchar* w1 [[buffer(6)]],
+    const device uchar* w2 [[buffer(7)]],
+    const device uchar* w3 [[buffer(8)]],
+    const device uchar* w4 [[buffer(9)]],
+    const device uchar* w5 [[buffer(10)]],
+    const device uchar* w6 [[buffer(11)]],
+    const device uchar* w7 [[buffer(12)]],
+    const device uchar* s0 [[buffer(13)]],
+    const device uchar* s1 [[buffer(14)]],
+    const device uchar* s2 [[buffer(15)]],
+    const device uchar* s3 [[buffer(16)]],
+    const device uchar* b0 [[buffer(17)]],
+    const device uchar* b1 [[buffer(18)]],
+    const device uchar* b2 [[buffer(19)]],
+    const device uchar* b3 [[buffer(20)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  const int hh = (int)tg.x, t = (int)tg.y;
+  if (hh >= a.heads || t >= a.n) { return; }
+  const device int* si = (const device int*)(st_in + a.ids_off);
+  const long h0 = si[0] > 0 ? (long)si[0] - 1 : a.eos;
+  const long h1 = si[1] > 0 ? (long)si[1] - 1 : a.eos;
+  // The reference's _shift_right_ignore_eos: the token s back is EOS when
+  // an EOS lies strictly between it and this one.
+  const int pos = t + 2;
+  long sh[8];
+  for (int s = 0; s < a.G; ++s) {
+    bool cut = false;
+    for (int q = pos - s + 1; q <= pos - 1; ++q) {
+      if (ple_tok_(q, h0, h1, ids) == a.eos) { cut = true; }
+    }
+    sh[s] = cut ? a.eos : ple_tok_(pos - s, h0, h1, ids);
+  }
+  const int g = hh / a.hpn + 2;
+  long mix = sh[0] * a.mult[0];
+  for (int k = 1; k < g; ++k) { mix ^= sh[k] * a.mult[k]; }
+  long m = mix % a.sizes[hh];
+  if (m < 0) { m += a.sizes[hh]; }
+  const long row = m + a.offsets[hh];
+  const long shard = row / a.shard_rows;
+  const ulong lr = (ulong)(row - shard * a.shard_rows);
+  const int cw = (int)(shard / a.spc_w), cs = (int)(shard / a.spc_s);
+  const device uchar* wc =
+      cw == 0 ? w0 : cw == 1 ? w1 : cw == 2 ? w2 : cw == 3 ? w3
+      : cw == 4 ? w4 : cw == 5 ? w5 : cw == 6 ? w6 : w7;
+  const device uchar* sc = cs == 0 ? s0 : cs == 1 ? s1 : cs == 2 ? s2 : s3;
+  const device uchar* bc = cs == 0 ? b0 : cs == 1 ? b1 : cs == 2 ? b2 : b3;
+  const device uchar* wp = wc + (ulong)(shard % a.spc_w) * a.shard_wb +
+                           lr * (ulong)a.row_w;
+  const ulong so = (ulong)(shard % a.spc_s) * a.shard_sb + lr * (ulong)a.row_s;
+  const device ushort* sp = (const device ushort*)(sc + so);
+  const device ushort* bp = (const device ushort*)(bc + so);
+  const bool sbf = a.scales_bf16 != 0, ebf = a.elt_bf16 != 0;
+  const uint mask = (1u << a.bits) - 1u;
+  device ushort* o = out + ((ulong)t * (ulong)a.heads + (ulong)hh) *
+                               (ulong)a.D;
+  for (int j = (int)lane; j < a.D; j += 32) {
+    const uint bit = (uint)(a.bits * j);
+    const uint byte = bit >> 3;
+    uint v = wp[byte];
+    if ((int)byte + 1 < a.row_w) { v |= (uint)wp[byte + 1] << 8; }
+    const uint q = (v >> (bit & 7u)) & mask;
+    const float scv = ple_16_f32_(sp[j / a.group], sbf);
+    const float biv = ple_16_f32_(bp[j / a.group], sbf);
+    // The table holds the dequantized value in bf16 (an f16 run rounds
+    // once); the row is multiplied by weight_scale. (Fused or not, the
+    // same: a 16-bit scale times a code of 8 bits or fewer is exact.)
+    const float dq = fma(scv, (float)q, biv);
+    const float x = (ebf ? as_type<float>((uint)ple_bf16_bits_(dq) << 16)
+                         : dq) * a.scale;
+    o[j] = ebf ? ple_bf16_bits_(x) : as_type<ushort>((half)x);
+  }
+  if (a.note != 0 && hh == 0 && t == a.n - 1 && lane == 0) {
+    ple_note_ids_(ids, st_in, st_out, a);
+  }
+}
+
+// The state's last two ids after the rows, in place (ple_rows_gpu_f16's
+// note where st_in is st_out). grid {1, 1, 1}.
+kernel void ple_ids_note_f16(
+    const device int*   ids    [[buffer(0)]],
+    const device uchar* st_in  [[buffer(1)]],
+    device uchar*       st_out [[buffer(2)]],
+    constant PleGpuArgs& a     [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+  if (tid == 0) { ple_note_ids_(ids, st_in, st_out, a); }
+}
+
+// STUDY (hcf_bench's floor): a launch that does nothing but one store a
+// threadgroup, and one that reads `n` 16-byte words, a thread four, and
+// stores one value a threadgroup.
+kernel void hc_study_empty(device float* out [[buffer(0)]],
+                           uint3 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]])
+{
+  if (tid == 0) { out[tg.x] = (float)tg.x; }
+}
+kernel void hc_study_read(const device uint4* in  [[buffer(0)]],
+                          device float*       out [[buffer(1)]],
+                          constant uint&      n   [[buffer(2)]],
+                          uint3 tg   [[threadgroup_position_in_grid]],
+                          uint  tid  [[thread_index_in_threadgroup]],
+                          uint  lane [[thread_index_in_simdgroup]])
+{
+  const uint base = (tg.x * 256u + tid) * 4u;
+  uint acc = 0u;
+  for (uint k = 0; k < 4u; ++k) {
+    const uint i = base + k;
+    if (i < n) {
+      const uint4 v = in[i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+  }
+  acc = simd_xor(acc);
+  if (lane == 0) { out[tg.x] = (float)acc; }
+}
+
+
 // hc_attn_prework_f16: a full-attention layer's projection rows into what
 // its attention reads, in ONE launch for a decode step's and a verify's
 // rows (it was thirteen: four slices, the q and k norms, three transposes,

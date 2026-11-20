@@ -34,8 +34,9 @@ namespace vpipe {
 namespace {
 
 // Booked until the first frame says, where no output size is given
-// (output_width / output_height): a 960 x 544 source (4K out).
-constexpr int kPlanH = 544, kPlanW = 960;
+// (output_width / output_height): a 3840 x 2176 OUTPUT -- a 960 x 544
+// source at 4x, 1920 x 1088 at 2x.
+constexpr int kPlanOutH = 2176, kPlanOutW = 3840;
 
 constexpr SpecExtra kDtypeChoices[] = {
   {spec_key::kChoices, "auto,u8,f32"},
@@ -45,11 +46,23 @@ constexpr SpecExtra kI8TierChoices[] = {
 };
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
-   .doc = "the RelayVSR model: a directory holding its two checkpoints -- "
-          "wan.safetensors (the keyframe DiT) and flash.safetensors (the "
-          "per-frame decoder), as kopper/RelayVSR publishes them -- or a "
-          "models-DB key (kopper/RelayVSR)",
+   .doc = "the RelayVSR model: a models-DB key -- kopper/RelayVSR (the "
+          "release, 4x), Comfy-Org/RelayVSR-x2 or Comfy-Org/RelayVSR-x4 "
+          "(ComfyUI's int8 repack) -- or a path: a directory holding a "
+          "keyframe DiT and its per-frame decoder (wan.safetensors + "
+          "flash.safetensors as kopper/RelayVSR publishes them, "
+          "wan_x2 / flash_x2 as lightx2v/RelayVSR_X2 does, or ComfyUI's "
+          "diffusion_models/ + vae/), or either checkpoint FILE. Each file "
+          "states its scale; the output is that scale times the input",
    .suggest_db = kModelRegistryDb, .suggest_db_type = "relayvsr"},
+  {.key = "scale", .type = ConfigType::Int, .required = false,
+   .doc = "the native scale, 2 or 4, where `hf_dir` holds both "
+          "(Comfy-Org/RelayVSR's root); 0 (default) takes the one the "
+          "model names. A 2x model is not a 4x one run smaller: it is its "
+          "own pair of checkpoints (lightx2v/RelayVSR_X2), retrained for "
+          "2x -- its keyframe DiT runs a quarter of the 4x one's tokens "
+          "for the same input",
+   .def_int = 0},
   {.key = "window", .type = ConfigType::Int, .required = false,
    .doc = "the release's --window-size: a keyframe every `window - 1` "
           "frames, each window of frames decoded between the two around "
@@ -59,20 +72,21 @@ constexpr ConfigKey kAttrs[] = {
           "after it arrived. 2 .. 64",
    .def_int = 16},
   {.key = "output_width", .type = ConfigType::Int, .required = false,
-   .doc = "optional: the width of the 4x frames this run will make, where "
-          "it is known before the first frame. Only the resource plan "
-          "reads it -- the working set (the keyframes' ring of keys and "
-          "values, what grows with the frame) is booked at a quarter of "
-          "it -- so a small input is planned small, and a run that "
-          "cannot fit the GPU's working set even alone is refused before "
-          "its weights are read. The stage still makes exactly 4x what "
-          "it is given, and the run books its own frame at the first "
-          "one. 0 (default) books 3840 x 2176. Give both or neither; a "
-          "multiple of 4, 32 .. 32768",
+   .doc = "optional: the width of the frames this run will make (4x or 2x "
+          "the input's, the model's scale), where it is known before the "
+          "first frame. Only the resource plan reads it -- the working set "
+          "(the keyframes' ring of keys and values, what grows with the "
+          "frame) is booked at the input it implies -- so a small input "
+          "is planned small, and a run that cannot fit the GPU's working "
+          "set even alone is refused before its weights are read. The "
+          "stage still makes exactly the scale times what it is given, "
+          "and the run books its own frame at the first one. 0 (default) "
+          "books 3840 x 2176. Give both or neither; a multiple of the "
+          "scale, 32 .. 32768",
    .def_int = 0},
   {.key = "output_height", .type = ConfigType::Int, .required = false,
-   .doc = "optional: the height of the 4x frames (see output_width); a "
-          "multiple of 4, 32 .. 32768",
+   .doc = "optional: the height of the output frames (see output_width); "
+          "a multiple of the scale, 32 .. 32768",
    .def_int = 0},
   {.key = "seed", .type = ConfigType::Int, .required = false,
    .doc = "the keyframe noise: torch's CPU normal draw from one generator "
@@ -163,7 +177,8 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "frames",
-   .doc = "the same frames at 4x, planar [3, 4H, 4W], one per frame in "
+   .doc = "the same frames at the model's scale (4x or 2x), planar "
+          "[3, sH, sW], one per frame in "
           "and in order, each carrying its input's sideband. On a clock "
           "of its own: a frame leaves once its window is complete, so "
           "the beats come out in bursts behind the ones going in",
@@ -172,10 +187,11 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "relayvsr-upscale",
-  .doc       = "4x video super-resolution by RelayVSR: a one-step 5B DiT "
-               "writes a keyframe every few frames and a small decoder "
-               "turns every frame into its 4x frame between the two "
-               "around it. Frames in, 4x frames out, in order.",
+  .doc       = "4x or 2x video super-resolution by RelayVSR: a one-step "
+               "5B DiT writes a keyframe every few frames and a small "
+               "decoder turns every frame into its upscaled frame between "
+               "the two around it. Frames in, upscaled frames out, in "
+               "order.",
   .display_name = "RelayVSR Upscale",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -217,6 +233,7 @@ RelayVsrUpscaleStage::RelayVsrUpscaleStage(const SessionContextIntf* s,
   _out_dtype = attr_str("output_dtype");
   const int out_w = (int)attr_int("output_width");
   const int out_h = (int)attr_int("output_height");
+  _scale = (int)attr_int("scale");
   if (_hf_dir.empty()) {
     fail_config(fmt("RelayVsrUpscaleStage('{}'): `hf_dir` must name the "
                     "RelayVSR model (kopper/RelayVSR)", this->id()));
@@ -227,20 +244,31 @@ RelayVsrUpscaleStage::RelayVsrUpscaleStage(const SessionContextIntf* s,
                     "[2, 64]", this->id(), _window));
     return;
   }
-  // The stage makes exactly 4x its input, so no other size is one it can
-  // be asked for.
-  auto bad_side = [](int v) { return v < 32 || v > 32768 || v % 4 != 0; };
+  if (_scale != 0 && _scale != 2 && _scale != 4) {
+    fail_config(fmt("RelayVsrUpscaleStage('{}'): scale {} is not 0, 2 or "
+                    "4", this->id(), _scale));
+    return;
+  }
+  // The stage makes exactly its scale times the input, so no other size
+  // is one it can be asked for. The scale is the model's -- read at the
+  // plan (plan_in_) -- so here a side need only be even; a 4x model
+  // refuses one not a multiple of 4 there.
+  const int mult = _scale != 0 ? _scale : 2;
+  auto bad_side = [mult](int v) {
+    return v < 32 || v > 32768 || v % mult != 0;
+  };
   if ((out_w == 0) != (out_h == 0) ||
       (out_w != 0 && (bad_side(out_w) || bad_side(out_h)))) {
     fail_config(fmt("RelayVsrUpscaleStage('{}'): output_width x "
                     "output_height {} x {} must be both 0, or both "
-                    "multiples of 4 in 32 .. 32768 (the frames are 4x the "
-                    "input's)", this->id(), out_w, out_h));
+                    "multiples of {} in 32 .. 32768 (the frames are the "
+                    "scale times the input's)", this->id(), out_w, out_h,
+                    mult));
     return;
   }
   _plan_given = out_w != 0;
-  _plan_w = out_w ? out_w / 4 : kPlanW;
-  _plan_h = out_h ? out_h / 4 : kPlanH;
+  _out_w = out_w;
+  _out_h = out_h;
   if (_out_dtype != "auto" && _out_dtype != "u8" && _out_dtype != "f32") {
     fail_config(fmt("RelayVsrUpscaleStage('{}'): output_dtype '{}' is not "
                     "one of auto|u8|f32", this->id(), _out_dtype));
@@ -282,7 +310,7 @@ RelayVsrUpscaleStage::files_(std::string* wan, std::string* flash,
   const ResolvedModel rm = resolve_model(session(), _hf_dir);
   genai::RelayVsrFiles f;
   if (!genai::resolve_relayvsr_files(rm.dir.empty() ? _hf_dir : rm.dir, &f,
-                                     err)) {
+                                     err, _scale)) {
     return false;
   }
   *wan = f.wan;
@@ -343,6 +371,28 @@ RelayVsrUpscaleStage::run_bytes_(int h, int w) const
   return genai::RelayVsrStream::run_bytes(c.wan, c.dec, h, w, _window);
 }
 
+bool
+RelayVsrUpscaleStage::plan_in_(const Configs& c, int* h, int* w,
+                               std::string* why) const
+{
+  const int s = c.wan.upscale;
+  const int ow = _plan_given ? _out_w : kPlanOutW;
+  const int oh = _plan_given ? _out_h : kPlanOutH;
+  if (ow % s != 0 || oh % s != 0) {
+    if (why != nullptr) {
+      *why = fmt("RelayVsrUpscaleStage('{}'): output_width x output_height "
+                 "{} x {} is not a {}x frame (the model's scale): give "
+                 "multiples of {}", this->id(), ow, oh, s, s)();
+    }
+    *h = oh / s;
+    *w = ow / s;
+    return false;
+  }
+  *h = oh / s;
+  *w = ow / s;
+  return true;
+}
+
 std::vector<ResourceClaim>
 RelayVsrUpscaleStage::declare_resources() const
 {
@@ -365,15 +415,17 @@ RelayVsrUpscaleStage::declare_resources() const
       out.push_back(std::move(c));
     }
   }
-  // At a launch the frame size is a quarter of the output size given
-  // (output_width x output_height), else not known: booked at kPlanH x
-  // kPlanW. Revised at the first frame either way. Never at the last
-  // run's size -- the plan is collected before reset_run_state(), so a
-  // member set by that run would still be here, and the same graph would
-  // plan differently depending on what ran before it.
+  // At a launch the frame size is the output size given (output_width x
+  // output_height) over the model's scale, else not known: booked at a
+  // 3840 x 2176 output. Revised at the first frame either way. Never at
+  // the last run's size -- the plan is collected before reset_run_state(),
+  // so a member set by that run would still be here, and the same graph
+  // would plan differently depending on what ran before it.
+  int ph = 0, pw = 0;
+  (void)plan_in_(cf, &ph, &pw);
   for (auto& c : model_memory::scratch_claims(
            scratch_label_(),
-           genai::RelayVsrStream::run_bytes(wc, dc, _plan_h, _plan_w, _window),
+           genai::RelayVsrStream::run_bytes(wc, dc, ph, pw, _window),
            {})) {
     out.push_back(std::move(c));
   }
@@ -414,8 +466,9 @@ RelayVsrUpscaleStage::declare_memory() const
                             : genai::MetalRelayVsrDecoder::weight_bytes(dc));
   // The launch's figure (see declare_resources); revise_scratch_ states
   // the run's.
-  m.scratch =
-      genai::RelayVsrStream::run_bytes(wc, dc, _plan_h, _plan_w, _window);
+  int ph = 0, pw = 0;
+  (void)plan_in_(cf, &ph, &pw);
+  m.scratch = genai::RelayVsrStream::run_bytes(wc, dc, ph, pw, _window);
   return m;
 }
 
@@ -779,11 +832,12 @@ RelayVsrUpscaleStage::initialize(RuntimeContext& ctx)
   if (_plan_given && !(_m && _m->wan)) {
     Configs cf;
     std::string why;
+    int ph = 0, pw = 0;
     if (configs_(&cf) &&
-        !fits_(genai::MetalRelayVsrWan::weight_bytes(cf.wan) +
-                   genai::MetalRelayVsrDecoder::weight_bytes(cf.dec),
-               run_bytes_(_plan_h, _plan_w), _plan_h, _plan_w,
-               Gate::kLaunch, &why)) {
+        (!plan_in_(cf, &ph, &pw, &why) ||
+         !fits_(genai::MetalRelayVsrWan::weight_bytes(cf.wan) +
+                    genai::MetalRelayVsrDecoder::weight_bytes(cf.dec),
+                run_bytes_(ph, pw), ph, pw, Gate::kLaunch, &why))) {
       withdraw_(cf.wan_file, cf.flash_file);
       session()->error(fmt("{}", why));    // throws: the stage ends here
       co_return;
@@ -900,8 +954,10 @@ RelayVsrUpscaleStage::process(RuntimeContext& ctx)
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
       session()->info(fmt(
-          "RelayVsrUpscaleStage('{}'): {}x{} -> {}x{}, {} out, a keyframe "
-          "every {} frames", this->id(), w, h, 4 * w, 4 * h,
+          "RelayVsrUpscaleStage('{}'): {}x{} -> {}x{} ({}x), {} out, a "
+          "keyframe every {} frames", this->id(), w, h,
+          _m->stream->scale() * w, _m->stream->scale() * h,
+          _m->stream->scale(),
           _f32_out ? "f32" : "u8", _window - 1));
     }
     _sb.emplace_back(_m->stream->frames_in(), tb->sideband);

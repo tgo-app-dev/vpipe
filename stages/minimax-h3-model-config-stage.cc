@@ -84,6 +84,15 @@ const ConfigKey kAttrs[] = {
           "on, so a few-step adapter on another grid is off its training. "
           "Empty (default): the model's own grid",
    .def_str = ""},
+  {.key = "schedule_shift", .type = ConfigType::Real, .required = false,
+   .doc = "the shift a SCHEDULER port's grid is computed at "
+          "(scheduler-select: normal, sgm_uniform, beta, linear_quadratic, "
+          "karras or exponential; ComfyUI's model shift, the linear form "
+          "s x / (1 + (s - 1) x)). Unset: the model's own -- `video_shift` "
+          "on the video models, 3 on MiniMax-H3-Image (its release grid "
+          "passes 0.75 at mid-schedule, shift 3's), 1 on P-H3-Image. The "
+          "scheduler stage's own shift is not read here",
+   .def_real = 0.0},
   {.key = "linear_branch", .type = ConfigType::String, .required = false,
    .doc = "OPTIONAL VDN-H3 release root -- the directory holding its "
           "config.json and linear_branch/. Given one, every main block's "
@@ -291,6 +300,7 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   _min_generation_area = attr_int("min_generation_area");
   _refine_start  = attr_real("refine_start_sigma");
   _refine_shift  = attr_real("refine_shift");
+  _schedule_shift = attr_real("schedule_shift");
   _linear_branch = attr_str("linear_branch");
   {
     const std::string t = attr_str("sigmas");
@@ -338,6 +348,11 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
   // reported and the runtime skips the stage at launch. A non-positive
   // shift collapses the schedule to a single sigma, which generates
   // noise at full cost rather than failing.
+  if (_schedule_shift < 0.0) {
+    fail_config(fmt(
+        "MiniMaxH3ModelConfigStage('{}'): schedule_shift must be > 0, or 0 "
+        "for the model's own (got {:.3f})", this->id(), _schedule_shift));
+  }
   if (!(_video_shift > 0.0) || !(_audio_shift > 0.0)) {
     fail_config(fmt(
         "MiniMaxH3ModelConfigStage('{}'): the sigma shifts must be > 0 (got "
@@ -399,6 +414,11 @@ MiniMaxH3ModelConfigStage::resolved_config() const
   if (_min_generation_area > 0) {
     o.insert_or_assign("min_generation_area",
                        FlexData::make_int(_min_generation_area));
+  }
+  // Emitted only when SET: absent is the model's own shift.
+  if (_schedule_shift > 0.0) {
+    o.insert_or_assign("schedule_shift",
+                       FlexData::make_real(_schedule_shift));
   }
   // Emitted only when SET: absent is the model's own grid.
   if (!_sigmas.empty()) {

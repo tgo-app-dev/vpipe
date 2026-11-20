@@ -1063,18 +1063,24 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
       const std::size_t un = genai::MetalQwenModel::unheld_bytes(*w, qc);
       const std::size_t gr = genai::MetalQwenModel::held_growth_bytes(*w, qc);
       const std::size_t disk = dir_weights_bytes(dir);
+      // the experts as held: a GGUF's in their own blocks where they run so
+      const std::size_t nat =
+          w->is_gguf()
+              ? genai::MetalQwenModel::gguf_native_expert_bytes(dir, qc)
+              : 0;
+      const std::size_t held = nat > 0 ? nat : ex;
       if (ex > 0 && disk > ex + un) {
         out[0] = weight_claim_streamable(
             dir, disk - ex - un + gr +
-                     ex / (std::size_t)std::max(1, qc.n_layers));
+                     held / (std::size_t)std::max(1, qc.n_layers));
         // The table asked for in memory is held with the rest where it
         // fits (the loader's lm_ngram_resident): booked as if it will be,
         // but not under a cache asked for that cannot hold every expert
         // -- the loader never takes it there.
         const bool table = ngram_resident &&
-                           (expert_cache == 0 || expert_cache >= ex);
+                           (expert_cache == 0 || expert_cache >= held);
         held_under_limit(&out[0], 0, disk - ex - (table ? 0 : un) + gr,
-                         ex);
+                         held);
       }
     }
   }

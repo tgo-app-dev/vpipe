@@ -39,6 +39,72 @@ vpipe sizes the expert cache with that in mind. The load reports the layout
 it found, e.g. `Qwen3.8-Flash-Next weights: projections w8g32; router w8g32,
 experts w4g32, shared expert w8g32 (fused decode); MTP head: fc dense, ...`.
 
+## llama.cpp's GGUFs of it
+
+vpipe also reads the model as llama.cpp writes it (GGUF architecture
+`qwen4exp`): [orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF),
+the same abliterated release, in these quantizations:
+
+| quantization | download | experts held as (gate·up / down) | an expert in memory | distance from the 5-bit pack (decisive picks) | decode, ms a token |
+|---|---|---|---|---|---|
+| IQ3_XXS | 85.2 GB | 6 / 8 bits | 4.5 MB | 0.38 (70 of 80) | 193 |
+| Q3_K_S | 88.8 GB | 8 / 4 bits | 4.5 MB | 0.44 (63) | 182 |
+| IQ3_M | 89.5 GB | 4 / 8 bits | 3.7 MB | 0.33 (73) | 129 |
+| Q3_K_M | 94.1 GB | 8 / 5 bits | 4.7 MB | 0.42 (64) | 206 |
+| Q3_K_L | 96.7 GB | 8 / 5 bits | 4.7 MB | 0.38 (71) | 234 |
+| IQ4_XS | 97.5 GB | 8 / 8 bits | 5.3 MB | 0.27 (78) | 131 (a 38 GB cache) |
+| Q4_K_S | 111.8 GB | 4 / 5 bits | 3.1 MB | 0.26 (75) | 124 |
+| Q4_K_M | 119.2 GB | 4 / 8 bits | 3.7 MB | 0.26 (77) | 143 |
+| Q5_K_S | 127.7 GB | 5 / 5 bits | 3.5 MB | 0.18 (78) | 183 |
+| Q5_K_M | 134.1 GB | 5 / 8 bits | 4.1 MB | 0.18 (77) | 167 |
+
+The distance is an 86-token turn's logits (relative L2) from the same
+release's 5-bit MLX pack (`oQ5e`) run in fp32 -- that pack's own bf16 run
+is 0.07 from it, so most of what the table shows is the GGUF's
+quantization; a decisive pick is a token where that reference leads by
+more than half a logit. The decode is a 128-token story's second half on
+an M4 Pro with 64 GB and the files on an external Thunderbolt drive, the
+expert cache held at 24 GB (85-87% of picks hit): a drive's speed and a
+cache's size move it more than the quantization does. Each one measured
+answered a short question right and wrote a fluent story.
+
+The repo is gated: accept its terms on Hugging Face and give
+`model-fetch` your token. Each quantization is split across two or three
+files; the catalogue fetches one quantization's files and registers the
+first, which opens the rest. Point `hf_dir` at that first file (a
+directory holding several quantizations would otherwise pick by name).
+
+What vpipe does with the blocks:
+
+- **The projections** (attention, the gated DeltaNet's, the hyper-
+  connections', the shared expert, the embedding and the head) are held
+  as 8-bit affine codes at group 32. Every block format in these files
+  takes that form with its own codes -- what rounds is each group's scale
+  in bf16 (0.17% of a weight), and where a format has a free offset
+  (Q4_K, Q5_K, Q5_1) the offset too (~0.45%) -- except Q6_K and IQ2_S
+  (two scales a group), which are re-encoded: 8-bit codes over each
+  group's range, ~0.5% of a weight.
+- **The routed experts** run from the expert cache as on the MLX packs,
+  in the files' own blocks wherever every expert stack is one of Q8_0,
+  IQ4_NL, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_XXS, IQ2_XS,
+  IQ2_S or IQ1_M: a slot holds each expert's gate, up and down bytes as
+  the file stores them, the decode's and a prefill's kernels read them as
+  they are, and nothing is converted on a miss -- an expert takes its
+  file's bytes. A file with another format among its experts (Q4_0, Q5_0,
+  Q5_1), or `VPIPE_QWEN_GGUF_NATIVE=0`, has them converted from their
+  blocks into the cache's affine layout as they are read, which is how the
+  table's memory and decode columns were measured -- with their own codes,
+  at the narrowest width each format takes:
+  Q4_0, Q4_K and IQ3_S at 4 bits, Q5_K / Q5_0 / Q5_1 at 5, IQ3_XXS at 6,
+  IQ4_XS / IQ4_NL / Q3_K / Q8_0 at 8 (a codebook or two scales a group
+  need the byte). The IQ4 and Q3_K experts therefore take two to three
+  times their file's bytes in memory, which a box holding every expert
+  does not notice and a smaller box pays in cache hits.
+- **The n-gram table** is read a row at a time from the file, as on the
+  MLX packs (not held in memory: `ngram_resident` does not apply).
+- **The DFlash 2 drafter** works with any of them.
+- Not read: the `-MTP` builds (their draft head) and the mmproj (pictures).
+
 ## What you need
 
 | | |

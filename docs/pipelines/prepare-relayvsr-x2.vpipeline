@@ -1,0 +1,20 @@
+{
+  "id": "prepare-relayvsr-x2",
+  "stages": [
+    {
+      "id": "fetch-relayvsr-x2",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "Comfy-Org/RelayVSR",
+        "model_variant": "Comfy-Org/RelayVSR-x2",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

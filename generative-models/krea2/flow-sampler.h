@@ -30,7 +30,25 @@ namespace genai {
 
 // ---- scheduler: the sigma schedule -------------------------------------
 struct FlowSchedulerSpec {
-  // "simple" | "karras" | "exponential" | "boogu_v1" | "unipc_flow".
+  // "simple" | "karras" | "exponential" | "boogu_v1" | "unipc_flow" |
+  // "normal" | "sgm_uniform" | "beta" | "linear_quadratic".
+  //
+  // The last four are ComfyUI's (comfy/samplers.py), computed as it
+  // computes them for a flow model: over the model's table of sigmas,
+  // sigma(t) = the time shift of t at `shift` (`shift_type`) for t = k/N,
+  // k = 1 .. N -- N = 1000 for the linear shift (ModelSamplingDiscreteFlow)
+  // and 10000 for the exponential one (ModelSamplingFlux) -- whose
+  // timestep is the sigma itself:
+  //   * normal: sigma(linspace(sigma_max, sigma_min, steps)) + [0];
+  //   * sgm_uniform: sigma(linspace(sigma_max, sigma_min, steps + 1)
+  //     [:-1]) + [0] (one point short of the smallest);
+  //   * beta: table[rint(BetaPPF(1 - i/steps; beta_alpha, beta_beta) *
+  //     (N - 1))], i = 0 .. steps - 1, repeats dropped, + [0] -- so a
+  //     LONG beta schedule can come back with fewer steps than asked
+  //     (FlowSampler::steps() counts the grid);
+  //   * linear_quadratic: Mochi's (threshold 0.025, steps / 2 linear),
+  //     which no shift moves.
+  // `shift_terminal` and `base_sigmas` do not apply to them.
   //
   // "unipc_flow" is the flow-sigma schedule of the diffusers
   // UniPCMultistepScheduler, which is what every Wan video model ships
@@ -60,6 +78,10 @@ struct FlowSchedulerSpec {
   double      shift      = 1.15;            // mu (flow-matching time-shift)
   std::string shift_type = "exponential";   // "exponential" | "linear"
   double      rho        = 7.0;             // karras curvature
+  // beta only: the Beta distribution its steps are placed by (ComfyUI's
+  // 0.6 / 0.6; RES4LYF's "beta57" is 0.5 / 0.7).
+  double      beta_alpha = 0.6;
+  double      beta_beta  = 0.6;
   // boogu_v1 only: the STATIC token count the shift's mu is read off (the
   // scheduler_config `seq_len`; 0 => use the runtime img_seq_len).
   int         seq_len    = 4096;
@@ -112,6 +134,7 @@ struct FlowSchedulerSpec {
   {
     return type == o.type && steps == o.steps && shift == o.shift &&
            shift_type == o.shift_type && rho == o.rho &&
+           beta_alpha == o.beta_alpha && beta_beta == o.beta_beta &&
            dynamic_shift == o.dynamic_shift && base_shift == o.base_shift &&
            max_shift == o.max_shift && shift_terminal == o.shift_terminal &&
            base_seq == o.base_seq && max_seq == o.max_seq &&
@@ -187,7 +210,12 @@ public:
 
   const FlowSamplerSpec&     sampler()   const noexcept { return _sampler; }
   const FlowSchedulerSpec&   scheduler() const noexcept { return _scheduler; }
-  int                        steps()     const noexcept { return _scheduler.steps; }
+  // The steps the grid takes: the spec's, or fewer where a beta
+  // schedule's repeats were dropped.
+  int steps() const noexcept
+  {
+    return _sigmas.size() >= 2 ? (int)_sigmas.size() - 1 : _scheduler.steps;
+  }
   const std::vector<double>& sigmas()    const noexcept { return _sigmas; }
 
   // Clear per-run state (multistep history + reseed the SDE RNG). Call before

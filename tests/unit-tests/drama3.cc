@@ -1613,10 +1613,12 @@ TEST(drama3, expert_cache_is_resident)
     std::vector<float> hid, ml, hl, dml, dhl, dhid;
     std::vector<MetalDrama3Model::Frame> frames;
     std::size_t held = 0;
-    int slots = 0;
-    bool ok = false;
+    int slots = 0, redos = 0;
+    bool ok = false, hs = false;
   };
-  auto run = [&](const std::string& model, std::size_t cache) {
+  // drop: every drop-th of the cache's handshake turns abandoned (the GPU
+  // runs on, the step is redone with commits)
+  auto run = [&](const std::string& model, std::size_t cache, int drop = 0) {
     Out o;
     Session sess;
     MetalCompute* mc = sess.metal_compute();
@@ -1635,6 +1637,8 @@ TEST(drama3, expert_cache_is_resident)
       return o;
     }
     o.held = m->resident_bytes();
+    o.hs = m->backbone()->expert_handshake();
+    m->backbone()->xhs_drop_every(drop);
     const int P = g.n_prompt;
     std::vector<std::int32_t> prompt(g.frames.begin(),
                                      g.frames.begin() + (std::size_t)P * 11);
@@ -1646,6 +1650,7 @@ TEST(drama3, expert_cache_is_resident)
                              &o.dhid) &&
            m->generate(prompt, P, sp, {}, &o.frames, &err);
     if (!err.empty()) { std::printf("[drama3] %s\n", err.c_str()); }
+    o.redos = m->backbone()->xhs_redos();
     if (const MoeExpertCache* c = m->backbone()->expert_cache()) {
       o.slots = c->slots();
       const auto& st = c->stats();
@@ -1692,6 +1697,28 @@ TEST(drama3, expert_cache_is_resident)
                 b.held >> 20, hid, ml, hl, dml, dhl, dh, a.frames.size(), fr);
     EXPECT_TRUE(hid && ml && hl && dml && dhl && dh && fr);
     EXPECT_TRUE(b.held < a.held / 2);
+    // Where this GPU takes the expert cache's handshake (gpu-host-
+    // handshake.h) the cached arms take it -- and redo a step whose turn
+    // was abandoned from the state it found, every output the same.
+    std::printf("[drama3] %s: the cached arm's turns %s\n",
+                fs::path(model).filename().c_str(),
+                b.hs ? "inside the running GPU work (the handshake)"
+                     : "at a commit and wait each");
+    if (b.hs) {
+      const Out d = run(model, (std::size_t)3072 << 20, 97);
+      ASSERT_TRUE(d.ok);
+      if (!d.ok) { continue; }
+      const bool all = same(a.hid, d.hid) && same(a.ml, d.ml) &&
+                       same(a.hl, d.hl) && same(a.dml, d.dml) &&
+                       same(a.dhl, d.dhl) && same(a.dhid, d.dhid) &&
+                       a.frames == d.frames;
+      std::printf("[drama3] %s, every 97th turn abandoned: %d steps "
+                  "redone, identical %d\n",
+                  fs::path(model).filename().c_str(), d.redos, all);
+      EXPECT_TRUE(b.redos == 0);
+      EXPECT_TRUE(d.redos > 0);
+      EXPECT_TRUE(all);
+    }
     // The FP8 kernels offset experts in 64 bits, so their cache is not
     // held under the affine kernels' 2^33-byte pool: a 16 GB cache puts
     // slots past 4096, the gate|up pool (2 MB a slot) past 8 GB.

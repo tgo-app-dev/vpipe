@@ -4,6 +4,7 @@
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/fp8-layout.h"
 
 #include <cstdint>
 #include <functional>
@@ -22,15 +23,23 @@ class Ops;
 }
 
 // RelayVSR's LARGE model: the keyframe generator (kopper/RelayVSR,
-// `wan.safetensors`, format refvsr-wan-v1; Apache-2.0).
+// `wan.safetensors`, format refvsr-wan-v1; Apache-2.0) -- and its native
+// 2x sibling (lightx2v/RelayVSR_X2, format relayvsr-wan-x2-v1).
 //
 // A Wan2.2-TI2V-5B-shaped DiT -- 30 blocks at 3072 (24 heads x 128), an
 // ungated gelu-tanh 14336 feed-forward, patch (1, 2, 2), 48 latent
 // channels -- retrained into a ONE-STEP generator of the keyframe's latent
-// on the 1/16 grid of the 4x output: t = 1000, latent = noise - v. The
-// low-resolution frame enters through `lq_proj` (its 4x bilinear upsample,
-// pixel-unshuffled by 16, a 1x1 conv, RMSNorm2d, SiLU, a 3x3 stride-2
-// conv, RMSNorm2d, SiLU, a linear) ADDED to the noise's patch embedding.
+// on the 1/16 grid of the output: t = 1000, latent = noise - v. The
+// low-resolution frame enters through `lq_proj` ADDED to the noise's patch
+// embedding: at 4x its 4x bilinear upsample pixel-unshuffled by 16, at 2x
+// the frame itself pixel-unshuffled by 8 (either way the latent grid, 1/4
+// or 1/8 of the frame), then a 1x1 conv, RMSNorm2d, SiLU, a 3x3 stride-2
+// conv, RMSNorm2d, SiLU, a linear.
+//
+// TWO SPELLINGS of the file are read: the release's (diffusers names, bf16)
+// and ComfyUI's repack (Comfy-Org/RelayVSR: ComfyUI's Wan names, every
+// block projection int8 ConvRot -- relayvsr-ops.h's Proj keeps those as
+// stored).
 // The text context is a constant that ships in the file (`prompt_embeds`
 // [1, 512, 4096], the reference's precomputed T5 encoding), and the
 // timestep is one constant, so the load FOLDS the timestep embedding,
@@ -69,6 +78,20 @@ class MetalRelayVsrWan {
     int rope_frames    = 8;  // temporal_rope.training_frames
     float eps       = 1e-6f;
     float timestep  = 1000.0f;
+    // The native scale (upscale_factor): 4, or 2 for the x2 checkpoint.
+    int upscale     = 4;
+    // The file stores its block projections as ComfyUI's int8 (ConvRot):
+    // what the weights' figures book (load() reads it off the file).
+    bool int8       = false;
+    // The latent grid's stride in frame pixels (4 at 4x, 8 at 2x), the
+    // token grid's (twice that, the alignment a frame is padded to), and
+    // the source rows' width (the pixel-unshuffled block: 768 or 192).
+    int latent_stride() const noexcept { return 16 / upscale; }
+    int token_stride() const noexcept { return 32 / upscale; }
+    int lq_channels() const noexcept
+    {
+      return upscale == 2 ? 3 * 8 * 8 : 3 * 16 * 16;
+    }
 
     // ACCELERATION, the stage's to set (none is in the file).
     //
@@ -118,11 +141,12 @@ class MetalRelayVsrWan {
   int keyframes() const noexcept { return _frame; }
 
   // ONE KEYFRAME. `lr` is the padded frame, channel-last [ph * pw, 3] bf16
-  // in [-1, 1] (Ops::upload in the bf16 library); ph and pw multiples of 8.
-  // `noise` is f32 [48, ph/4, pw/4]. Writes the latent, f32 [48, ph/4,
-  // pw/4], into `latent` (allocated when empty or too small). `stop`, when
-  // set, is asked between blocks; true abandons the keyframe (false
-  // returned with no error).
+  // in [-1, 1] (Ops::upload in the bf16 library); ph and pw multiples of
+  // the token stride (8 at 4x, 16 at 2x). `noise` is f32 [48, ph/l, pw/l],
+  // l the latent stride. Writes the latent, f32 [48, ph/l, pw/l], into
+  // `latent` (allocated when empty or too small). `stop`, when set, is
+  // asked between blocks; true abandons the keyframe (false returned with
+  // no error).
   bool keyframe(const metal_compute::SharedBuffer& lr, int ph, int pw,
                 const std::vector<float>& noise,
                 metal_compute::SharedBuffer* latent, std::string* err,
@@ -160,6 +184,10 @@ class MetalRelayVsrWan {
   // the feed-forward rows the Neural Engine took (summed over its blocks).
   long i8_gemms() const noexcept { return _i8_gemms; }
   long dense_gemms() const noexcept { return _dense_gemms; }
+  // ...and of those, ComfyUI int8 weights run as the token layout as
+  // stored, and widened to bf16 right before their GEMM.
+  long convrot_gemms() const noexcept { return _cr_gemms; }
+  long widened_gemms() const noexcept { return _widened; }
   long ane_rows() const noexcept { return _ane_rows; }
   // Whether the ANE tier was tried (at the first keyframe with it asked) and
   // whether its module was built: what the CoreML booking follows.
@@ -205,10 +233,15 @@ class MetalRelayVsrWan {
   // RoPE tables, f32 [1024, head_dim].
   metal_compute::SharedBuffer _rope_cos, _rope_sin;
 
+  // The file's spelling (ComfyUI's names) and its int8 projections.
+  bool _comfy = false;
+  fp8::Layout _f8;
+
   int _frame = 0;   // keyframes in this stream
   std::unique_ptr<AneFeedForward> _ane;
   bool _ane_tried = false;
   long _i8_gemms = 0, _dense_gemms = 0, _ane_rows = 0;
+  long _cr_gemms = 0, _widened = 0;
   bool _keep_debug = false;
   std::vector<float> _dbg_lq, _dbg_blk0;
 };
