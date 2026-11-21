@@ -688,6 +688,21 @@ builtin_catalog_()
      .parent_model_type = "deepseek-v4.1",
      .files = {"DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"},
      .needs_tokenizer_json = false},
+    // The release's VISION TOWER for the GGUFs above, which leave it out:
+    // its ViT and aligner (shard 1, 970 MB), the three image markers --
+    // beside the token embedding -- (shard 2, 1.3 GB) and its config.json,
+    // the release's own files alone, 2.3 GB of 510. Found beside the
+    // shards (a vision/ folder) or in this repo's directory, as the n-gram
+    // table is (DeepseekV41Config::vision_dir). Not a model of its own.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017 vision tower for a GGUF (2.3 GB, deepseek-ai)",
+     .hf_path = "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+     .model_type = "deepseek-v4.1-vision",
+     .parent_model_type = "deepseek-v4.1",
+     .files = {"config.json", "model-00001-of-00048.safetensors",
+               "model-00002-of-00048.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "deepseek-ai/DeepSeek-V4.1-Flash-1017-vision"},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;

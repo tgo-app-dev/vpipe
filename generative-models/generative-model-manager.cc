@@ -4,6 +4,7 @@
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
 #include "generative-models/lm-memory-limit.h"
+#include "generative-models/lm-vision-dir.h"
 #include "generative-models/lm-run-memory.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/model-loader.h"
@@ -95,6 +96,7 @@ GenerativeModelManager::KeyHash::operator()(const Key& k) const noexcept
   mix(hash<string>{}(k.mtp_dir));
   mix(hash<string>{}(k.draft_dir));
   mix(hash<int>{}(k.draft_bits));
+  mix(hash<string>{}(k.vision_dir));
   return h;
 }
 std::string
@@ -2079,6 +2081,8 @@ GenerativeModelManager::load(const LoadSpec& spec)
     const std::string dd = bag::text(spec.extra, load_spec::kDraftDir);
     key.draft_dir = dd.empty() ? std::string() : canonicalize_(session(), dd);
     key.draft_bits = (int)bag::integer(spec.extra, load_spec::kDraftBits, 8);
+    const std::string vd = bag::text(spec.extra, load_spec::kVisionDir);
+    key.vision_dir = vd.empty() ? std::string() : canonicalize_(session(), vd);
   }
 
   // A model kept warm from this FOLDER under another key -- other pages,
@@ -2308,6 +2312,9 @@ GenerativeModelManager::load(const LoadSpec& spec)
     {
       LmMemoryLimit cap(limit, cache, ngram);
       LmFarMemory far_scope(far);
+      // the vision tower a checkpoint does not carry, as the host
+      // resolved it (load_spec::kVisionDir; lm-vision-dir.h)
+      LmVisionDir eyes(key.vision_dir);
       // Whose its load is (common/memory-owner.h): this model's -- its
       // weights, and what marks its own use as it allocates (an expert
       // cache, its K/V) -- whatever stage asked for it.

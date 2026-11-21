@@ -68,7 +68,10 @@ std::size_t moe_expert_cache(const SessionContextIntf* session,
 // the rest of the model and that cache at most, within the limit alike.
 // `ngram_resident`: the host asks for an n-gram table read by row to be
 // held (genai::load_spec::kNgramResident) -- booked with the rest then,
-// as it may be.
+// as it may be. `vision_dir`: a vision tower the checkpoint does not carry
+// (a DeepSeek-V4.1 GGUF's), as the stage resolved it for the load
+// (load_spec::kVisionDir) -- its weights and its encode booked from it;
+// "" the one found beside the checkpoint, if any.
 std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
                                      const std::string& dir,
                                      const std::string& label,
@@ -77,7 +80,8 @@ std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
                                      int picture_tokens = 0,
                                      std::size_t memory_limit = 0,
                                      std::size_t expert_cache = 0,
-                                     bool ngram_resident = false);
+                                     bool ngram_resident = false,
+                                     const std::string& vision_dir = {});
 
 // int, on a weights claim's `extra`: the most the component will HOLD,
 // when that is less than its checkpoint weighs and it is not a floor -- a

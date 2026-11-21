@@ -75,7 +75,22 @@ it.
   -- fetch the IQ2_XXS files and the n-gram table, and register them (for
   IQ2_XS, change `model_variant`).
 - **[`deepseek-v41-flash-gguf-chat.vpipeline`](pipelines/deepseek-v41-flash-gguf-chat.vpipeline)**
-  -- the chat, text only.
+  -- the chat.
+
+**Its eyes.** The GGUFs carry no vision tower either: every tensor in
+them is the language model's. With the release's tower beside them the
+model takes pictures as the release does. That tower is three of the
+release's files: `config.json`, `model-00001-of-00048.safetensors` (the
+ViT and the aligner, 970 MB) and `model-00002-of-00048.safetensors` (the
+three image markers, beside the token embedding, 1.3 GB). The catalogue
+record `deepseek-ai/DeepSeek-V4.1-Flash-1017-vision` fetches those alone,
+2.3 GB of the release's 510. vpipe looks for them in a `vision/` folder
+beside the shards, then in a folder of the same models directory whose
+`config.json` names DeepSeek-V4.1's `vision_config`, which is where
+`model-fetch` puts them. A host can also name the folder: text-chat's
+`vision_model` (`load_spec::kVisionDir`), for a GGUF reached through a
+link or kept in another models directory. Without the tower an
+attachment is dropped, said, and the chat is text only.
 
 What vpipe does with the blocks:
 

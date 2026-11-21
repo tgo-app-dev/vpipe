@@ -294,6 +294,14 @@ private:
   std::string _hf_dir;
   // A separate MTP drafter (config "mtp_model"); "" none.
   std::string _mtp_model;
+  // A vision tower the checkpoint does not carry (config "vision_model",
+  // load_spec::kVisionDir); "" none named.
+  std::string _vision_model;
+  // That tower's folder for the checkpoint `dir` (its resolved path):
+  // the one named, else the one beside it (DeepseekV41Config::
+  // vision_dir), else "" -- ONE answer for the plan (declare_resources)
+  // and the load.
+  std::string vision_dir_(const std::string& dir) const;
   // A DFlash block drafter (config "draft_model"); "" none. Its round
   // length (0 = adaptive) and in-memory precision.
   std::string _draft_model;

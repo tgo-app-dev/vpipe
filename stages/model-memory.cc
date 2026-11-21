@@ -961,7 +961,7 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
           const std::string& label, const genai::LmRunShape& run,
           std::int64_t picture_pixels, int picture_tokens,
           std::size_t memory_limit, std::size_t expert_cache,
-          bool ngram_resident)
+          bool ngram_resident, const std::string& vision_dir_in)
 {
   const bool draft_head = run.draft_head;
   std::vector<ResourceClaim> out = weight_claims({dir});
@@ -1001,9 +1001,14 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
   // model as it is held (the FP8 projections as their codes and scales), a
   // layer's experts resident and a layer's transient, the cache's least.
   if (mcfg->architecture == "DeepseekV41ForCausalLM") {
+    // its tower where the checkpoint carries none (a GGUF's): as the
+    // stage resolved it for the load, else beside it
+    const std::string vision_dir =
+        !vision_dir_in.empty() ? vision_dir_in
+                               : genai::DeepseekV41Config::vision_dir(dir);
     std::size_t ex = 0, rest = 0, vis = 0;
-    if (genai::MetalDeepseekV41ModelExec::expert_bytes(dir, &ex, &rest,
-                                                       &vis) &&
+    if (genai::MetalDeepseekV41ModelExec::expert_bytes(
+            dir, &ex, &rest, &vis, nullptr, vision_dir) &&
         ex > 0) {
       const int layers = std::max(1, mcfg->n_layers);
       const std::size_t head =
@@ -1016,7 +1021,8 @@ lm_claims(const SessionContextIntf* session, const std::string& dir,
     genai::DeepseekV41Config dc;
     std::string err;
     const std::size_t vis_scratch =
-        vis > 0 && genai::DeepseekV41Config::from_dir(dir, &dc, &err)
+        vis > 0 && genai::DeepseekV41Config::from_dir(
+                       vision_dir.empty() ? dir : vision_dir, &dc, &err)
             ? genai::MetalDeepseekV41Vision::encode_scratch_bytes(dc)
             : 0;
     if (ex > 0) {

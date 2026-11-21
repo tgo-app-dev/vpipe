@@ -131,10 +131,14 @@ public:
   // 32 of a row; not the n-gram tables, which are read by row, nor the
   // DSpark stages), what its vision tower holds (`vision`, optional) and
   // the checkpoint's bytes on disk (`disk`, optional).
+  // `vision_dir`: a vision tower the checkpoint does not carry (a GGUF's,
+  // DeepseekV41Config::vision_dir or the host's load_spec::kVisionDir,
+  // resolved by the caller): its bytes counted in `vision`.
   static bool expert_bytes(const std::string& model_dir,
                            std::size_t* experts, std::size_t* rest,
                            std::size_t* vision = nullptr,
-                           std::size_t* disk = nullptr);
+                           std::size_t* disk = nullptr,
+                           const std::string& vision_dir = {});
   // The expert cache's size for this box (0: every expert resident) --
   // the engine's call, on the rule the other MoE models take: what the
   // model holds, its peers', the plan's scratch, `run` (K/V and
@@ -156,7 +160,8 @@ public:
   static std::size_t lm_expert_cache_bytes(
       const SessionContextIntf* session, const std::string& model_dir,
       std::size_t run, const metal_compute::MetalCompute* mc = nullptr,
-      bool dspark = false, std::size_t limit = 0, std::size_t cache = 0);
+      bool dspark = false, std::size_t limit = 0, std::size_t cache = 0,
+      const std::string& vision_dir = {});
   // Whether the DSpark draft head pays on this box -- the engine's call,
   // which text-chat asks before loading the head: only where every expert
   // is resident. Where they are cached, a checked draft reads its own
@@ -175,7 +180,8 @@ public:
   static bool dspark_pays(const SessionContextIntf* session,
                           const std::string& model_dir, std::size_t run,
                           const metal_compute::MetalCompute* mc = nullptr,
-                          std::size_t limit = 0, std::size_t cache = 0);
+                          std::size_t limit = 0, std::size_t cache = 0,
+                          const std::string& vision_dir = {});
 
 private:
   // ---- SpecDecodeExt -------------------------------------------------

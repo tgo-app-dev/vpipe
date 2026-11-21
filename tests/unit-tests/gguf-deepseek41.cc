@@ -179,6 +179,81 @@ gguf_path_()
 // The config the GGUF's keys stand for against the release's numbers, its
 // tokenizer's ids against the release's tokenizer.json, and the engram's
 // hash tables (stored in the file) against the ones the release derives.
+// A GGUF carries no vision tower: the release's is found beside it (a
+// vision/ folder) or where its record lands, <root>/deepseek-ai/
+// DeepSeek-V4.1-Flash-1017 -- its three files and a config.json naming
+// DeepSeek-V4.1's vision_config. No other folder: an MLX pack holding a
+// tower of its own beside the GGUF is not taken for it.
+TEST(deepseek41_gguf, its_vision_tower_is_found_beside_it)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() /
+      ("dsv41-vision-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  fs::remove_all(root);
+  const fs::path g = root / "AtomicChat" / "Some-GGUF";
+  fs::create_directories(g);
+  {
+    // a GGUF's header alone: version 3, no tensors, its architecture
+    std::ofstream f(g / "m-00001-of-00004.gguf", std::ios::binary);
+    auto u32 = [&](std::uint32_t x) {
+      f.write(reinterpret_cast<const char*>(&x), 4);
+    };
+    auto u64 = [&](std::uint64_t x) {
+      f.write(reinterpret_cast<const char*>(&x), 8);
+    };
+    auto str = [&](const std::string& x) {
+      u64(x.size());
+      f.write(x.data(), (std::streamsize)x.size());
+    };
+    f.write("GGUF", 4);
+    u32(3);
+    u64(0);
+    u64(1);
+    str("general.architecture");
+    u32(8);
+    str("deepseek41");
+  }
+  const std::string first = (g / "m-00001-of-00004.gguf").string();
+  using C = genai::DeepseekV41Config;
+  EXPECT_TRUE(C::vision_dir(first).empty());
+  auto tower = [](const fs::path& d, const char* type, bool whole = true) {
+    fs::create_directories(d);
+    std::ofstream(d / "config.json")
+        << "{\"model_type\": \"" << type << "\", \"vision_config\": "
+           "{\"num_hidden_layers\": 32}}";
+    std::ofstream(d / "model-00001-of-00048.safetensors") << "x";
+    if (whole) {
+      std::ofstream(d / "model-00002-of-00048.safetensors") << "x";
+    }
+  };
+  // A pack's tower, beside it in the models root: not its.
+  tower(root / "mlx-community" / "DeepSeek-V4.1-Flash-1017-oQ4e-mtp",
+        "deepseek_v41");
+  EXPECT_TRUE(C::vision_dir(first).empty());
+  // Where the record lands, a file short: not yet.
+  const fs::path rel = root / "deepseek-ai" / "DeepSeek-V4.1-Flash-1017";
+  tower(rel, "deepseek_v41", false);
+  EXPECT_TRUE(C::vision_dir(first).empty());
+  EXPECT_TRUE(!C::holds_vision(rel.string()));
+  // Whole: it.
+  tower(rel, "deepseek_v41");
+  EXPECT_TRUE(C::holds_vision(rel.string()));
+  EXPECT_TRUE(C::vision_dir(first) == rel.string());
+  EXPECT_TRUE(C::vision_dir(g.string()) == rel.string());
+  // Another model's config there: not it.
+  tower(rel, "qwen3_vl");
+  EXPECT_TRUE(C::vision_dir(first).empty());
+  tower(rel, "deepseek_v41");
+  // Beside the shards, it wins.
+  tower(g / "vision", "deepseek_v41");
+  EXPECT_TRUE(C::vision_dir(first) == (g / "vision").string());
+  // Not a GGUF: nothing looked for.
+  EXPECT_TRUE(C::vision_dir(rel.string()).empty());
+  fs::remove_all(root);
+}
+
 TEST(deepseek41_gguf, config_tokenizer_and_tables)
 {
   const std::string path = gguf_path_();

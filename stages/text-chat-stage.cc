@@ -452,6 +452,7 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   // configured value else that default.
   _hf_dir        = attr_str("hf_dir");
   _mtp_model     = attr_str("mtp_model");
+  _vision_model  = attr_str("vision_model");
   _draft_model   = attr_str("draft_model");
   _draft_block   = static_cast<int>(attr_int("draft_block_size"));
   _draft_bits    = static_cast<int>(attr_int("draft_bits"));
@@ -742,6 +743,13 @@ constexpr ConfigKey kAttrs[] = {
           "4bit beside its Qwen3.8-27B-4bit. Empty: the head the model's "
           "own directory carries, if any",
    .def_str = "", .suggest_db = kModelRegistryDb},
+  {.key = "vision_model", .type = ConfigType::String, .required = false,
+   .doc = "a vision tower a checkpoint does not carry (a models-DB key or "
+          "a directory): a DeepSeek-V4.1 GGUF's, the release's ViT, "
+          "aligner and image markers with its config.json "
+          "(deepseek-ai/DeepSeek-V4.1-Flash-1017-vision). Empty: one "
+          "beside the checkpoint, if any",
+   .def_str = "", .suggest_db = kModelRegistryDb},
   {.key = "draft_model", .type = ConfigType::String,
    .doc = "a DFlash / DFlash 2 block drafter to decode with (a models-DB "
           "key or its directory): a small model that drafts a block of "
@@ -988,7 +996,8 @@ TextChatStage::own_draft_head_(const std::string& dir) const
   return genai::MetalDeepseekV41ModelExec::dspark_pays(
       session(), dir, run, sv != nullptr ? sv->metal_compute() : nullptr,
       (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
-      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20);
+      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20,
+      vision_dir_(dir));
 #else
   (void)dir;
   return false;
@@ -1030,6 +1039,15 @@ TextChatStage::spec_scratch_bytes_(const std::string& dir) const
 #endif
 }
 
+std::string
+TextChatStage::vision_dir_(const std::string& dir) const
+{
+  if (!_vision_model.empty()) {
+    return resolve_model_dir(session(), _vision_model);
+  }
+  return genai::DeepseekV41Config::vision_dir(dir);
+}
+
 std::vector<ResourceClaim>
 TextChatStage::declare_resources() const
 {
@@ -1046,7 +1064,7 @@ TextChatStage::declare_resources() const
       session(), dirs[0], id(), run_shape_(dirs[0]), 0, 0,
       (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
       (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20,
-      _ngram_resident);
+      _ngram_resident, vision_dir_(dirs[0]));
   if (dirs.size() > 1) {
     for (auto& c : model_memory::weight_claims({dirs[1]})) {
       out.push_back(std::move(c));
@@ -1112,6 +1130,9 @@ TextChatStage::initialize(RuntimeContext& ctx)
     // a draft head the model carries but loads only when asked for: the
     // model's own directory named as its MTP drafter
     bag::set_text(spec.extra, genai::load_spec::kMtpDir, spec.hf_dir);
+  }
+  if (const std::string vd = vision_dir_(spec.hf_dir); !vd.empty()) {
+    bag::set_text(spec.extra, genai::load_spec::kVisionDir, vd);
   }
   if (!_draft_model.empty()) {
     bag::set_text(spec.extra, genai::load_spec::kDraftDir,

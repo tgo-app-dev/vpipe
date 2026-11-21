@@ -5826,6 +5826,125 @@ TEST(deepseek_v41, release_matches_reference)
 // The vision tower: the picture's patches as the processor makes them
 // (Pillow's bicubic contain + gray pad, normalized, rounded), and the span's
 // rows (ViT, aligner, the learned markers) against the fp32 reference.
+// A picture is resized as the release's ImageOps.pad resizes it: Pillow's
+// BICUBIC on 8 bits, its fixed-point arithmetic -- byte for byte (the
+// sums below Pillow 11.3's, on the same synthetic pictures), growing,
+// shrinking, one axis alone -- and the same bytes on any number of
+// threads. (A float resize was off by one at 13-886 pixels a picture.)
+TEST(deepseek_v41, a_picture_is_resized_as_pillow_does)
+{
+  struct Case { int w, h, nw, nh; std::uint64_t sum; };
+  const Case cases[] = {
+      {300, 200, 131, 87, 0x14f881f933125640ull},
+      {37, 23, 64, 41, 0x5f0fc123f230b5d3ull},
+      {1000, 70, 999, 35, 0xf6aa3f957d5c9ee8ull},
+      {64, 48, 64, 97, 0x864088651a622266ull}};
+  for (const Case& k : cases) {
+    std::vector<std::uint8_t> rgb((std::size_t)3 * k.w * k.h);
+    for (std::size_t i = 0; i < rgb.size(); ++i) {
+      rgb[i] = (std::uint8_t)((i * 2654435761u) >> 24);
+    }
+    for (const char* threads : {"1", "8"}) {
+      setenv("VPIPE_DSV41_VISION_THREADS", threads, 1);
+      std::vector<std::uint8_t> out((std::size_t)3 * k.nw * k.nh);
+      MetalDeepseekV41Vision::resize_like_pillow(rgb.data(), k.h, k.w,
+                                                 out.data(), k.nh, k.nw);
+      std::uint64_t h = 1469598103934665603ull;
+      for (std::uint8_t b : out) { h = (h ^ b) * 1099511628211ull; }
+      EXPECT_TRUE(h == k.sum);
+    }
+    unsetenv("VPIPE_DSV41_VISION_THREADS");
+  }
+}
+
+// THE TOWER'S SPEED (a bench, VPIPE_DSV41_VISION_BENCH=<a folder holding
+// the release's tower>): synthetic pictures from the tower's least to its
+// 1,024-token span, each encoded three times; the patches' time on the
+// CPU and the encode's best. VPIPE_DSV41_VISION_PROFILE=1 splits it.
+TEST(deepseek_v41, vision_bench)
+{
+  const std::string vd = env_("VPIPE_DSV41_VISION_BENCH");
+  if (vd.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mc != nullptr);
+  std::string err;
+  DeepseekV41Config cfg;
+  ASSERT_TRUE(DeepseekV41Config::from_dir(vd, &cfg, &err));
+  auto v = MetalDeepseekV41Vision::load(WeightSet::open(vd, nullptr), mc,
+                                        cfg, true, &err);
+  ASSERT_TRUE(v != nullptr);
+  if (!v) { std::printf("[dsv41] %s\n", err.c_str()); return; }
+  // the reference: the same tower on the kernels without matrix cores,
+  setenv("VPIPE_DSV41_VISION_NAX", "0", 1);
+  // in f16 (three bits finer than bf16): the tower's bf16 lands 3.3-4.5%
+  // of RMS from it either way -- the old kernels 3.3-4.5, the matrix
+  // cores' (the bias in the tile) 3.5-4.4, on an M5 Max -- bf16's own
+  // rounding through 32 layers
+  auto ref = MetalDeepseekV41Vision::load(WeightSet::open(vd, nullptr), mc,
+                                          cfg, false, &err);
+  unsetenv("VPIPE_DSV41_VISION_NAX");
+  ASSERT_TRUE(ref != nullptr);
+  using Clk = std::chrono::steady_clock;
+  for (const auto& [w, h] : std::vector<std::pair<int, int>>{
+           {544, 544}, {640, 352}, {1024, 768}, {1280, 720}, {1920, 1080},
+           {2048, 2048}, {4000, 3000}}) {
+    std::vector<std::uint8_t> rgb((std::size_t)3 * w * h);
+    for (std::size_t i = 0; i < rgb.size(); ++i) {
+      rgb[i] = (std::uint8_t)((i * 2654435761u) >> 24);
+    }
+    MetalDeepseekV41Vision::Plan pl;
+    const auto t0 = Clk::now();
+    const std::vector<float> px = MetalDeepseekV41Vision::patches(
+        cfg, rgb.data(), h, w, &pl, true);
+    const double pms =
+        std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+    // the threaded resize gives one thread's bytes
+    {
+      setenv("VPIPE_DSV41_VISION_THREADS", "1", 1);
+      MetalDeepseekV41Vision::Plan p1;
+      const std::vector<float> one = MetalDeepseekV41Vision::patches(
+          cfg, rgb.data(), h, w, &p1, true);
+      unsetenv("VPIPE_DSV41_VISION_THREADS");
+      std::size_t diff = 0;
+      for (std::size_t i = 0; i < one.size() && i < px.size(); ++i) {
+        diff += one[i] != px[i];
+      }
+      if (diff != 0 || one.size() != px.size()) {
+        std::printf("[dsv41] threaded patches differ: %zu of %zu\n", diff,
+                    px.size());
+      }
+      EXPECT_TRUE(diff == 0 && one.size() == px.size());
+    }
+    double best = 1e30;
+    int toks = 0;
+    MetalDeepseekV41Vision::Result got;
+    for (int r = 0; r < 3; ++r) {
+      const auto a = Clk::now();
+      got = v->encode_patches(px, pl);
+      best = std::min(best, std::chrono::duration<double, std::milli>(
+                                Clk::now() - a).count());
+      toks = got.n_tokens;
+    }
+    const auto want = ref->encode_patches(px, pl);
+    double se = 0, ss = 0, worst = 0;
+    ASSERT_TRUE(want.rows.size() == got.rows.size());
+    for (std::size_t i = 0; i < got.rows.size(); ++i) {
+      const double d = (double)got.rows[i] - want.rows[i];
+      se += d * d;
+      ss += (double)want.rows[i] * want.rows[i];
+      worst = std::max(worst, std::abs(d));
+    }
+    const double rel = std::sqrt(se / std::max(ss, 1e-30));
+    std::printf("[dsv41] %4dx%-4d -> %3dx%-3d patches (%5d), %4d tokens: "
+                "patches %6.1f ms, encode %7.1f ms; against the old "
+                "f16 kernels %.2f%% of RMS, worst %.4f\n", w, h, pl.vit_w,
+                pl.vit_h, pl.vit_w * pl.vit_h, toks, pms, best, 100 * rel,
+                worst);
+    EXPECT_TRUE(rel < 0.06);
+  }
+}
+
 TEST(deepseek_v41, vision_matches_reference)
 {
   const std::string gd = env_("VPIPE_DSV41_SMALL_GOLDEN");

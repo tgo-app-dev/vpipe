@@ -8,9 +8,13 @@
 #include "generative-models/weight-set.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
+#include <thread>
 
 namespace vpipe::genai {
 
@@ -69,51 +73,150 @@ py_round_(double x)
 }
 
 // Pillow's 8-bit BICUBIC resize of planar u8 [3, sh, sw] -> [3, dh, dw]:
-// a horizontal pass into an 8-bit image, then a vertical one, each rounded
-// and clipped (Pillow's 8bpc path), the taps Pillow's.
+// Pillow's BICUBIC resize on 8 bits a channel (libImaging/Resample.c), as
+// the release's ImageOps.pad runs it: each output pixel's taps from the
+// filter (a = -0.5, support 2, widened by the scale when shrinking),
+// normalized in double, rounded to integers of PRECISION_BITS = 22, summed
+// as integers from a half unit and shifted back, clipped -- a horizontal
+// pass, then a vertical one, a pass the size does not change skipped.
+// Integers make it exact (Pillow's bytes) and the rows independent, so
+// they split over threads.
+struct PilTaps {
+  std::vector<int> lo, n;       // each output's first input and its count
+  std::vector<std::int32_t> k;  // [out][ksize]
+  int ksize = 0;
+};
+
+double
+pil_bicubic_(double x)
+{
+  constexpr double a = -0.5;
+  x = std::fabs(x);
+  if (x < 1.0) { return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0; }
+  if (x < 2.0) { return (((x - 5.0) * x + 8.0) * x - 4.0) * a; }
+  return 0.0;
+}
+
+PilTaps
+pil_taps_(int in_size, int out_size)
+{
+  constexpr int kPrecisionBits = 32 - 8 - 2;
+  PilTaps t;
+  const double scale = (double)in_size / (double)out_size;
+  const double fscale = std::max(scale, 1.0);
+  const double support = 2.0 * fscale;
+  t.ksize = (int)std::ceil(support) * 2 + 1;
+  t.lo.resize((std::size_t)out_size);
+  t.n.resize((std::size_t)out_size);
+  t.k.assign((std::size_t)out_size * t.ksize, 0);
+  std::vector<double> w((std::size_t)t.ksize);
+  const double ss = 1.0 / fscale;
+  for (int xx = 0; xx < out_size; ++xx) {
+    const double center = (xx + 0.5) * scale;
+    int xmin = (int)(center - support + 0.5);
+    if (xmin < 0) { xmin = 0; }
+    int xmax = (int)(center + support + 0.5);
+    if (xmax > in_size) { xmax = in_size; }
+    xmax -= xmin;
+    double ww = 0.0;
+    for (int x = 0; x < xmax; ++x) {
+      const double v = pil_bicubic_((x + xmin - center + 0.5) * ss);
+      w[(std::size_t)x] = v;
+      ww += v;
+    }
+    for (int x = 0; x < xmax; ++x) {
+      double v = ww != 0.0 ? w[(std::size_t)x] / ww : w[(std::size_t)x];
+      v *= (double)(1 << kPrecisionBits);
+      t.k[(std::size_t)xx * t.ksize + x] =
+          (std::int32_t)(v < 0 ? std::trunc(-0.5 + v) : std::trunc(0.5 + v));
+    }
+    t.lo[(std::size_t)xx] = xmin;
+    t.n[(std::size_t)xx] = xmax;
+  }
+  return t;
+}
+
 void
 resize_bicubic_u8_(const std::uint8_t* src, int sh, int sw,
                    std::uint8_t* dst, int dh, int dw)
 {
-  std::vector<int> bx, by;
-  std::vector<float> wx, wy;
-  const int kx = metal_compute::build_cubic_coeffs(
-      sw, 0.0, dw, (double)sw / (double)dw, bx, wx);
-  const int ky = metal_compute::build_cubic_coeffs(
-      sh, 0.0, dh, (double)sh / (double)dh, by, wy);
-  auto clip8 = [](float v) {
-    return (std::uint8_t)std::min(255.0f, std::max(0.0f, std::round(v)));
+  constexpr int kPrecisionBits = 32 - 8 - 2;
+  auto clip8 = [](std::int32_t v) -> std::uint8_t {
+    v >>= kPrecisionBits;
+    return (std::uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
   };
-  std::vector<std::uint8_t> tmp((std::size_t)sh * dw);
-  for (int c = 0; c < 3; ++c) {
-    const std::uint8_t* s = src + (std::size_t)c * sh * sw;
-    for (int y = 0; y < sh; ++y) {
-      for (int x = 0; x < dw; ++x) {
-        const float* w = &wx[(std::size_t)x * kx];
-        const int x0 = bx[(std::size_t)x];
-        float acc = 0.0f;
-        for (int t = 0; t < kx && x0 + t < sw; ++t) {
-          acc += w[t] * (float)s[(std::size_t)y * sw + x0 + t];
-        }
-        tmp[(std::size_t)y * dw + x] = clip8(acc);
-      }
+  constexpr std::int32_t kHalf = 1 << (kPrecisionBits - 1);
+  // (VPIPE_DSV41_VISION_THREADS=1: one thread -- the bench's check)
+  const char* te = std::getenv("VPIPE_DSV41_VISION_THREADS");
+  const int nt = te != nullptr ? std::max(1, std::atoi(te))
+                               : (int)std::clamp<unsigned>(
+                                     std::thread::hardware_concurrency(), 1u,
+                                     8u);
+  auto rows = [nt](int n, const auto& body) {
+    if (nt == 1 || n < 64) { body(0, n); return; }
+    std::vector<std::thread> ts;
+    const int step = (n + nt - 1) / nt;
+    for (int a0 = 0; a0 < n; a0 += step) {
+      ts.emplace_back([&, a0] { body(a0, std::min(n, a0 + step)); });
     }
-    std::uint8_t* d = dst + (std::size_t)c * dh * dw;
-    for (int y = 0; y < dh; ++y) {
-      const float* w = &wy[(std::size_t)y * ky];
-      const int y0 = by[(std::size_t)y];
-      for (int x = 0; x < dw; ++x) {
-        float acc = 0.0f;
-        for (int t = 0; t < ky && y0 + t < sh; ++t) {
-          acc += w[t] * (float)tmp[(std::size_t)(y0 + t) * dw + x];
+    for (auto& t : ts) { t.join(); }
+  };
+  // horizontal: [3][sh][sw] -> [3][sh][dw], skipped at the same width
+  std::vector<std::uint8_t> mid;
+  const std::uint8_t* h = src;
+  if (dw != sw) {
+    const PilTaps tx = pil_taps_(sw, dw);
+    mid.resize((std::size_t)3 * sh * dw);
+    rows(3 * sh, [&](int r0, int r1) {
+      for (int r = r0; r < r1; ++r) {
+        const std::uint8_t* in = src + (std::size_t)r * sw;
+        std::uint8_t* out = mid.data() + (std::size_t)r * dw;
+        for (int x = 0; x < dw; ++x) {
+          const std::int32_t* k = &tx.k[(std::size_t)x * tx.ksize];
+          const int lo = tx.lo[(std::size_t)x], n = tx.n[(std::size_t)x];
+          std::int32_t acc = kHalf;
+          for (int t = 0; t < n; ++t) {
+            acc += (std::int32_t)in[lo + t] * k[t];
+          }
+          out[x] = clip8(acc);
         }
-        d[(std::size_t)y * dw + x] = clip8(acc);
       }
-    }
+    });
+    h = mid.data();
   }
+  // vertical: [3][sh][dw] -> [3][dh][dw], skipped at the same height
+  if (dh == sh) {
+    std::memcpy(dst, h, (std::size_t)3 * dh * dw);
+    return;
+  }
+  const PilTaps ty = pil_taps_(sh, dh);
+  rows(3 * dh, [&](int r0, int r1) {
+    for (int r = r0; r < r1; ++r) {
+      const int c = r / dh, y = r % dh;
+      const std::uint8_t* in = h + (std::size_t)c * sh * dw;
+      std::uint8_t* out = dst + (std::size_t)r * dw;
+      const std::int32_t* k = &ty.k[(std::size_t)y * ty.ksize];
+      const int lo = ty.lo[(std::size_t)y], n = ty.n[(std::size_t)y];
+      for (int x = 0; x < dw; ++x) {
+        std::int32_t acc = kHalf;
+        for (int t = 0; t < n; ++t) {
+          acc += (std::int32_t)in[(std::size_t)(lo + t) * dw + x] * k[t];
+        }
+        out[x] = clip8(acc);
+      }
+    }
+  });
 }
 
 }  // namespace
+
+void
+MetalDeepseekV41Vision::resize_like_pillow(const std::uint8_t* src, int sh,
+                                           int sw, std::uint8_t* dst, int dh,
+                                           int dw)
+{
+  resize_bicubic_u8_(src, sh, sw, dst, dh, dw);
+}
 
 MetalDeepseekV41Vision::~MetalDeepseekV41Vision() = default;
 
@@ -334,8 +437,27 @@ MetalDeepseekV41Vision::init_(const std::shared_ptr<WeightSet>& ws,
   metal_compute::FunctionConstants fc;
   fc.set_bool(200, false).set_bool(201, false).set_bool(300, false)
       .set_bool(301, false).set_bool(302, false);
-  _fn_attn = _lib_attn.function(
-      bf16 ? "attn_steel_h_bd64_bf16" : "attn_steel_h_bd64", fc);
+  // The matrix cores where the GPU has them (VPIPE_DSV41_VISION_NAX=0: the
+  // kernels below): the matmuls on matmul2d tiles, the attention on NAX.
+  {
+    const char* e = std::getenv("VPIPE_DSV41_VISION_NAX");
+    if (mc->supports_matrix_cores() && !(e != nullptr && std::atoi(e) == 0)) {
+      _lib_mma = mc->load_library(std::string("dense_gemm_mma") + sfx);
+      _lib_attn_nax = mc->load_library("attn_steel_nax");
+      _fn_mma = _lib_mma.function("dense_gemm_mma_t_n128_f16");
+      // the bias added in the tile's f32 destination, rounded once (a
+      // pass of its own after it cost ~1.17x the bf16 error)
+      _fn_mma_bias = _lib_mma.function("dense_gemm_mma_t_n128_bias_f16");
+      metal_compute::ComputeFunction a = _lib_attn_nax.function(
+          bf16 ? "attn_steel_nax_h_bd64_bf16" : "attn_steel_nax_h_bd64", fc);
+      _nax = _fn_mma.valid() && _fn_mma_bias.valid() && a.valid();
+      if (_nax) { _fn_attn = std::move(a); }
+    }
+  }
+  if (!_nax) {
+    _fn_attn = _lib_attn.function(
+        bf16 ? "attn_steel_h_bd64_bf16" : "attn_steel_h_bd64", fc);
+  }
   if (!_fn_attn.valid()) { return fail("attn_steel_h_bd64 did not load"); }
   _attn_params = _mc->make_shared_buffer(sizeof(SteelAttnParams));
   if (_attn_params.empty()) { return fail("out of memory"); }
@@ -390,6 +512,11 @@ MetalDeepseekV41Vision::encode_patches(const std::vector<float>& px,
                                        const Plan& pl)
 {
   Result res;
+  // VPIPE_DSV41_VISION_PROFILE=1: where an encode's time goes, on stderr
+  static const bool prof = std::getenv("VPIPE_DSV41_VISION_PROFILE") &&
+                           std::atoi(std::getenv("VPIPE_DSV41_VISION_PROFILE"));
+  using PClock = std::chrono::steady_clock;
+  const auto p0 = PClock::now();
   const DeepseekV41Config& c = _cfg;
   const int n = pl.vit_h * pl.vit_w;
   const int VD = c.vis_dim, VI = c.vis_inter, heads = c.vis_heads, hd = 64;
@@ -452,7 +579,8 @@ MetalDeepseekV41Vision::encode_patches(const std::vector<float>& px,
   }
   auto* ap = static_cast<SteelAttnParams*>(_attn_params.contents());
   {
-    const int bq = 32, bk = 16;
+    // the kernel's tiles: NAX 64 x 32, the steel one 32 x 16
+    const int bq = _nax ? 64 : 32, bk = _nax ? 32 : 16;
     ap->B = 1; ap->H = heads; ap->D = hd; ap->qL = n; ap->kL = n;
     ap->gqa_factor = 1;
     ap->scale = 1.0f / std::sqrt((float)hd);
@@ -478,6 +606,23 @@ MetalDeepseekV41Vision::encode_patches(const std::vector<float>& px,
   auto gemm = [&](const SharedBuffer& xa, const SharedBuffer& w,
                   const SharedBuffer* bias, const SharedBuffer& y, int M,
                   int N, int K) {
+    if (_nax) {
+      // matmul2d tiles of 128 x 128, the tails clamped (128 x 256 ran
+      // 7-12% slower on these shapes); a bias in the tile's own variant
+      constexpr int RN = 128;
+      enc.set_function(bias != nullptr ? _fn_mma_bias : _fn_mma);
+      enc.set_buffer(0, xa);
+      enc.set_buffer(1, w);
+      enc.set_buffer(2, bias != nullptr ? *bias : w);
+      enc.set_buffer(3, y);
+      enc.set_constant(4, K);
+      enc.set_constant(5, N);
+      enc.set_constant(6, M);
+      enc.set_constant(7, 0);
+      enc.dispatch({(unsigned)(((N + RN - 1) / RN) * 256),
+                    (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+      return;
+    }
     enc.set_function(_fn_gemm);
     enc.set_buffer(0, xa);
     enc.set_buffer(1, w);
@@ -560,7 +705,9 @@ MetalDeepseekV41Vision::encode_patches(const std::vector<float>& px,
   enc.dispatch({(unsigned)(L * H), 1, 1}, {256, 1, 1});
   gemm(h1, _al_w2, &_al_b2, h2, L, H, H);
   enc.end();
+  const auto p1 = PClock::now();
   if (!stream.commit().wait_ok()) { return res; }
+  const auto p2 = PClock::now();
   // the span: start, each cell row then a newline, end
   auto rowf = [&](const SharedBuffer& sb, std::size_t off, float* dst) {
     const auto* s = static_cast<const std::uint16_t*>(sb.contents()) + off;
@@ -585,6 +732,15 @@ MetalDeepseekV41Vision::encode_patches(const std::vector<float>& px,
     o += H;
   }
   rowf(_img_end, 0, o);
+  if (prof) {
+    const auto p3 = PClock::now();
+    auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::fprintf(stderr, "[dsv41-vision] %d patches, %d cells: host %.1f ms, "
+                 "gpu %.1f ms, span %.1f ms\n", n, L, ms(p0, p1), ms(p1, p2),
+                 ms(p2, p3));
+  }
   return res;
 }
 

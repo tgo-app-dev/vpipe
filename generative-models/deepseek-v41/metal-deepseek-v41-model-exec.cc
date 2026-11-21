@@ -46,7 +46,8 @@ MetalDeepseekV41ModelExec::expert_bytes(const std::string& model_dir,
                                         std::size_t* experts,
                                         std::size_t* rest,
                                         std::size_t* vision,
-                                        std::size_t* disk)
+                                        std::size_t* disk,
+                                        const std::string& vision_dir)
 {
   auto w = MetalLlamaWeights::open_model(model_dir);
   if (!w.has_value()) { return false; }
@@ -142,6 +143,12 @@ MetalDeepseekV41ModelExec::expert_bytes(const std::string& model_dir,
       n > 0) {
     e = n;
   }
+  // a tower the checkpoint does not carry (a GGUF's): its own files'
+  // count, from the folder the caller resolved
+  if (v == 0 && !vision_dir.empty()) {
+    std::size_t vv = 0;
+    if (expert_bytes(vision_dir, nullptr, nullptr, &vv, nullptr)) { v = vv; }
+  }
   if (experts != nullptr) { *experts = e; }
   if (rest != nullptr) { *rest = r; }
   if (vision != nullptr) { *vision = v; }
@@ -153,7 +160,7 @@ std::size_t
 MetalDeepseekV41ModelExec::lm_expert_cache_bytes(
     const SessionContextIntf* session, const std::string& model_dir,
     std::size_t run, const metal_compute::MetalCompute* mc, bool dspark,
-    std::size_t limit, std::size_t cache)
+    std::size_t limit, std::size_t cache, const std::string& vision_dir)
 {
   if (const char* e = std::getenv("VPIPE_DSV41_EXPERT_CACHE_MB")) {
     return (std::size_t)std::max(0LL, std::atoll(e)) << 20;
@@ -161,7 +168,8 @@ MetalDeepseekV41ModelExec::lm_expert_cache_bytes(
   const std::size_t ram = stream_physical_ram();
   std::size_t experts = 0, rest = 0, vision = 0, disk = 0;
   if (ram == 0 ||
-      !expert_bytes(model_dir, &experts, &rest, &vision, &disk) ||
+      !expert_bytes(model_dir, &experts, &rest, &vision, &disk,
+                    vision_dir) ||
       experts == 0) {
     return 0;
   }
@@ -169,7 +177,11 @@ MetalDeepseekV41ModelExec::lm_expert_cache_bytes(
   // largest picture with it
   DeepseekV41Config cfg;
   std::string cerr;
-  if (vision > 0 && DeepseekV41Config::from_dir(model_dir, &cfg, &cerr)) {
+  // (the tower's shape its own config's, where it lies apart)
+  if (vision > 0 &&
+      DeepseekV41Config::from_dir(vision_dir.empty() ? model_dir
+                                                     : vision_dir,
+                                  &cfg, &cerr)) {
     rest += vision + MetalDeepseekV41Vision::encode_scratch_bytes(cfg);
   }
   // and the DSpark head, held whole when loaded
@@ -221,14 +233,17 @@ MetalDeepseekV41ModelExec::dspark_pays(const SessionContextIntf* session,
                                        const std::string& model_dir,
                                        std::size_t run,
                                        const metal_compute::MetalCompute* mc,
-                                       std::size_t limit, std::size_t cache)
+                                       std::size_t limit, std::size_t cache,
+                                       const std::string& vision_dir)
 {
   if (const char* e = std::getenv("VPIPE_DSV41_DSPARK")) {
     return std::atoi(e) != 0;
   }
   if (MetalDeepseekV41Model::dspark_bytes(model_dir) == 0) { return false; }
+  // (its vision tower counted beside it, where one loads: every expert
+  // resident WITH it)
   return lm_expert_cache_bytes(session, model_dir, run, mc, true, limit,
-                               cache) == 0;
+                               cache, vision_dir) == 0;
 }
 
 std::int32_t

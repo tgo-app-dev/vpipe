@@ -51,6 +51,11 @@ public:
 
   // image_processor.plan_image_grid for a picture of this size.
   static Plan plan(const DeepseekV41Config& c, int W, int H);
+  // Pillow's BICUBIC resize of a planar [3, sh, sw] picture to [3, dh, dw]
+  // on 8 bits a channel -- its fixed-point arithmetic, its bytes -- as
+  // image_processor's ImageOps.pad runs it (patches' own; a test's).
+  static void resize_like_pillow(const std::uint8_t* src, int sh, int sw,
+                                 std::uint8_t* dst, int dh, int dw);
   // load_image: the padded picture's patches, normalized to [-1, 1] and
   // rounded to the compute dtype as the reference does, [vit_h * vit_w,
   // 3 * 14 * 14] (channel, row, column within a patch). `rgb` is planar
@@ -83,6 +88,12 @@ private:
   metal_compute::ComputeLibrary _lib, _lib_dense, _lib_attn;
   metal_compute::ComputeFunction _fn_rms, _fn_rope, _fn_add, _fn_unfold;
   metal_compute::ComputeFunction _fn_gelu, _fn_swiglu, _fn_gemm, _fn_attn;
+  // On a GPU with matrix cores (an M5): the matmuls on matmul2d tiles
+  // (dense_gemm_mma, a bias in the tile) and the attention on the NAX
+  // steel kernel (64 x 32 tiles); elsewhere the kernels above.
+  metal_compute::ComputeLibrary _lib_mma, _lib_attn_nax;
+  metal_compute::ComputeFunction _fn_mma, _fn_mma_bias;
+  bool _nax = false;
   metal_compute::SharedBuffer _patch_w, _patch_b, _norm;
   metal_compute::SharedBuffer _al_w1, _al_b1, _al_w2, _al_b2;
   metal_compute::SharedBuffer _img_start, _img_end, _img_newline;

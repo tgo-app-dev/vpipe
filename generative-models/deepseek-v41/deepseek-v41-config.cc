@@ -60,6 +60,61 @@ DeepseekV41Config::dspark_dir(const std::string& dir)
                                                         : std::string{};
 }
 
+namespace {
+
+// The release's files holding the tower (the 1017 release's split): the
+// ViT and aligner, the image markers, the config.
+constexpr const char* kVisionFiles[] = {
+    "config.json", "model-00001-of-00048.safetensors",
+    "model-00002-of-00048.safetensors"};
+
+}  // namespace
+
+bool
+DeepseekV41Config::holds_vision(const std::string& dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path d(dir);
+  for (const char* f : kVisionFiles) {
+    if (!fs::is_regular_file(d / f, ec)) { return false; }
+  }
+  std::ifstream in(d / "config.json");
+  std::stringstream ss;
+  ss << in.rdbuf();
+  try {
+    const FlexData fd = FlexData::from_json(ss.str());
+    const auto root = fd.as_object();
+    return root.contains("vision_config") &&
+           root.at("vision_config").is_object() &&
+           root.contains("model_type") &&
+           root.at("model_type").as_string("") == "deepseek_v41";
+  } catch (...) {
+    return false;
+  }
+}
+
+std::string
+DeepseekV41Config::vision_dir(const std::string& dir)
+{
+  namespace fs = std::filesystem;
+  if (find_gguf_in_dir(dir).empty()) { return {}; }
+  std::error_code ec;
+  fs::path base(dir);
+  if (fs::is_regular_file(base, ec)) {
+    base = base.parent_path();
+  }
+  if (holds_vision((base / "vision").string())) {
+    return (base / "vision").string();
+  }
+  // Fetched as its record (deepseek-ai/DeepSeek-V4.1-Flash-1017-vision):
+  // <models>/deepseek-ai/DeepSeek-V4.1-Flash-1017/, beside the GGUF's
+  // <org>/<repo>.
+  const fs::path rel = base.parent_path().parent_path() / "deepseek-ai" /
+                       "DeepSeek-V4.1-Flash-1017";
+  return holds_vision(rel.string()) ? rel.string() : std::string();
+}
+
 bool
 DeepseekV41Config::from_dir(const std::string& dir, DeepseekV41Config* out,
                             std::string* err)
@@ -94,6 +149,26 @@ DeepseekV41Config::from_dir(const std::string& dir, DeepseekV41Config* out,
           out->dspark_markov = r.dspark_markov;
           out->dspark_experts = r.dspark_experts;
           out->dspark_top_k = r.dspark_top_k;
+        }
+      }
+      // Its vision tower, where the release's is found (vision_dir): the
+      // tower's shape and the image token, the release's.
+      const std::string vd = vision_dir(dir);
+      if (!vd.empty()) {
+        DeepseekV41Config r;
+        std::string e;
+        if (from_dir(vd, &r, &e) && r.dim == out->dim &&
+            r.vis_layers > 0 && r.image_token == out->image_token) {
+          out->vis_layers = r.vis_layers;
+          out->vis_dim = r.vis_dim;
+          out->vis_heads = r.vis_heads;
+          out->vis_inter = r.vis_inter;
+          out->vis_patch = r.vis_patch;
+          out->vis_rope_theta = r.vis_rope_theta;
+          out->vis_downsample = r.vis_downsample;
+          out->vis_max_tokens = r.vis_max_tokens;
+          out->vis_min_pixels = r.vis_min_pixels;
+          out->vis_max_wh_ratio = r.vis_max_wh_ratio;
         }
       }
       return true;

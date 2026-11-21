@@ -3,6 +3,7 @@
 #include "generative-models/chat-template.h"
 #include "generative-models/context-io.h"
 #include "generative-models/lm-memory-limit.h"
+#include "generative-models/lm-vision-dir.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
 #include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
@@ -476,6 +477,9 @@ LoadedLanguageModel::LoadedLanguageModel(
     // LFM3 / LFM3-VL: gated short convolutions, sliding and global
     // attention (generative-models/lfm3/).
     const bool metal_lfm3 = family == LmFamily::kLfm3;
+    // DeepSeek-V4.1's tower where its checkpoint carries none (a GGUF's),
+    // resolved once below: sized with the model, then loaded from it.
+    std::string dsv41_vision_dir;
     // A plugin may register a new arch -> ModelExec factory. Consulted
     // BEFORE the built-in cascade below so a plugin family is selectable
     // by its config.json `architecture` string.
@@ -536,9 +540,15 @@ LoadedLanguageModel::LoadedLanguageModel(
         // for (lm-memory-limit.h)
         const std::size_t limit = LmMemoryLimit::current();
         const std::size_t asked = LmMemoryLimit::expert_cache();
+        // a vision tower the checkpoint does not carry: the host's,
+        // resolved (lm-vision-dir.h), else found beside it -- sized with
+        // the rest, loaded below
+        dsv41_vision_dir = !LmVisionDir::current().empty()
+                               ? LmVisionDir::current()
+                               : DeepseekV41Config::vision_dir(model_dir);
         o.expert_cache_bytes = MetalDeepseekV41ModelExec::
             lm_expert_cache_bytes(session, model_dir, run, mc_be, o.dspark,
-                                  limit, asked);
+                                  limit, asked, dsv41_vision_dir);
         if (o.expert_cache_bytes > 0 && session != nullptr) {
           // the cache never holds fewer than two layers' experts: a
           // layer's resident and a layer's transient (MetalDeepseekV41
@@ -706,12 +716,50 @@ LoadedLanguageModel::LoadedLanguageModel(
       if (metal_dsv41) {
         auto* dx = dynamic_cast<MetalDeepseekV41ModelExec*>(
             _impl->exec.get());
+        // A GGUF carries no tower: the release's, as resolved above (the
+        // host's, else beside it) -- its shape read from its own
+        // config.json, its image token the model's.
+        const std::string& vd = dsv41_vision_dir;
+        const bool named = !LmVisionDir::current().empty();
+        DeepseekV41Config vcfg;
+        if (dx != nullptr && dx->model() != nullptr) {
+          vcfg = dx->model()->config();
+          DeepseekV41Config r;
+          std::string e;
+          if (!vd.empty() && DeepseekV41Config::from_dir(vd, &r, &e) &&
+              r.dim == vcfg.dim && r.vis_layers > 0 &&
+              r.image_token == vcfg.image_token) {
+            vcfg.vis_layers = r.vis_layers;
+            vcfg.vis_dim = r.vis_dim;
+            vcfg.vis_heads = r.vis_heads;
+            vcfg.vis_inter = r.vis_inter;
+            vcfg.vis_patch = r.vis_patch;
+            vcfg.vis_rope_theta = r.vis_rope_theta;
+            vcfg.vis_downsample = r.vis_downsample;
+            vcfg.vis_max_tokens = r.vis_max_tokens;
+            vcfg.vis_min_pixels = r.vis_min_pixels;
+            vcfg.vis_max_wh_ratio = r.vis_max_wh_ratio;
+          } else if (named && session) {
+            session->warn(fmt("LoadedLanguageModel: '{}' holds no "
+                              "DeepSeek-V4.1 vision tower of this model "
+                              "({}); image input is unavailable", vd,
+                              !e.empty() ? e
+                              : r.image_token != vcfg.image_token
+                                  ? "another image token"
+                                  : "another width"));
+            vcfg.vis_layers = 0;
+          }
+        }
         if (dx != nullptr && dx->model() != nullptr &&
-            dx->model()->config().vis_layers > 0) {
+            vcfg.vis_layers > 0) {
           std::string verr;
           _impl->metal_dsv41_vision = MetalDeepseekV41Vision::load(
-              open_weight_set(model_dir, session), mc_be,
-              dx->model()->config(), true, &verr);
+              open_weight_set(vd.empty() ? model_dir : vd, session), mc_be,
+              vcfg, true, &verr);
+          if (_impl->metal_dsv41_vision && !vd.empty() && session) {
+            session->info(fmt("LoadedLanguageModel: the DeepSeek-V4.1 "
+                              "vision tower from {}", vd));
+          }
           if (!_impl->metal_dsv41_vision && session) {
             session->warn(fmt("LoadedLanguageModel: the DeepSeek-V4.1 vision "
                               "tower did not load ({}); image input is "

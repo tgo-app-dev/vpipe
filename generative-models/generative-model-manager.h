@@ -81,6 +81,11 @@ namespace load_spec {
 // head the model's own directory carries (optiq/mtp.safetensors, in-shard
 // mtp.*). Part of the cache key: the drafter changes what is loaded.
 inline constexpr std::string_view kMtpDir = "mtp_dir";
+// string: where a model whose checkpoint carries no VISION TOWER finds its
+// release's (a DeepSeek-V4.1 GGUF: the release's ViT, aligner and image
+// markers with its config.json). Absent: looked for beside the checkpoint
+// (DeepseekV41Config::vision_dir). Part of the cache key, as kMtpDir.
+inline constexpr std::string_view kVisionDir = "vision_dir";
 // string: a separate DFlash / DFlash 2 block DRAFTER's directory (its
 // config.json names DFlashDraftModel or DFlash2DraftModel), attached after
 // the model loads; see speculative-decode.h. Absent / "": none. Part of the
@@ -1168,6 +1173,7 @@ private:
     std::string   mtp_dir;
     std::string   draft_dir;     // load_spec::kDraftDir, canonical
     int           draft_bits = 8;
+    std::string   vision_dir;    // load_spec::kVisionDir, canonical
 
     bool operator==(const Key& o) const noexcept
     {
@@ -1177,7 +1183,8 @@ private:
           && hf_dir       == o.hf_dir
           && mtp_dir      == o.mtp_dir
           && draft_dir    == o.draft_dir
-          && draft_bits   == o.draft_bits;
+          && draft_bits   == o.draft_bits
+          && vision_dir   == o.vision_dir;
     }
   };
   struct KeyHash {

@@ -131,6 +131,16 @@ struct DeepseekV41Config {
   // GGUF's own directory when `dir` names a file), the release's mtp.*
   // shards and its config.json (a GGUF carries none); empty otherwise.
   static std::string dspark_dir(const std::string& dir);
+  // A GGUF's VISION TOWER (a GGUF carries none): the release's ViT,
+  // aligner and image markers with its config.json -- `<dir>/vision`, or
+  // `<root>/deepseek-ai/DeepSeek-V4.1-Flash-1017`, where a fetch of them
+  // as a record of their own puts them: exactly those, no other folder
+  // (a pack or the first release beside it is not the 1017 GGUF's).
+  // Empty where neither holds it.
+  static std::string vision_dir(const std::string& dir);
+  // A folder holding the release's tower: its three files (kVisionFiles)
+  // and a config.json naming DeepSeek-V4.1's vision_config.
+  static bool holds_vision(const std::string& dir);
   // False with `err` set when the file is missing, not this model, or
   // outside what the port runs.
   static bool from_dir(const std::string& dir, DeepseekV41Config* out,

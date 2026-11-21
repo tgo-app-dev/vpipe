@@ -7827,6 +7827,15 @@ const STRINGS = {
       '解碼開始時用提示詞為 MTP 起草器的 KV 預熱：草稿接受率/解碼吞吐更高，'
       + '代價是少量額外預填充（token 精確；只影響效能）。預設開啟（聊天是解'
       + '碼受限的）；若要偏向預填充吞吐可設為 false。未開啟 mtp 時無效。'],
+  'cfg.text-chat.vision_model': ['',
+      '检查点本身不带的视觉塔（模型库键名或目录）：DeepSeek-V4.1 GGUF 的视觉塔，'
+      + '即官方发布中的 ViT、对齐器与图像标记及其 config.json'
+      + '（deepseek-ai/DeepSeek-V4.1-Flash-1017-vision）。留空：使用检查点旁边的'
+      + '视觉塔（若有）',
+      '檢查點本身不帶的視覺塔（模型庫鍵名或目錄）：DeepSeek-V4.1 GGUF 的視覺塔，'
+      + '即官方發布中的 ViT、對齊器與影像標記及其 config.json'
+      + '（deepseek-ai/DeepSeek-V4.1-Flash-1017-vision）。留空：使用檢查點旁邊的'
+      + '視覺塔（若有）'],
   'cfg.text-chat.draft_model': ['',
       '用于解码的 DFlash / DFlash 2 块起草器（模型库键名或其目录）：一个依据'
       + '目标模型隐藏状态一次起草一整块 token 的小模型，再由模型在一次前向中'
