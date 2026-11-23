@@ -1263,12 +1263,15 @@ TEST(model_catalog, minimaxai_publishes_both_partitions_too) {
 // can only be told apart by it.
 TEST(model_catalog, several_models_can_share_one_repo) {
   // MiniMaxAI's repo publishes a third: its text encoder alone, which
-  // MiniMax-H3-Image conditions on.
+  // MiniMax-H3-Image conditions on. Comfy-Org's two more: the PRUNED
+  // FL2VA DiT (int8 ConvRot and bf16) pi-H3's adapters run on -- DiTs
+  // hanging off the FL2VA partition, which is why a partition is selected
+  // by its exact handle (minimax_h3_partitions_resolve_from_their_variant).
   for (const char* repo : {"Comfy-Org/MiniMax-H3", "MiniMaxAI/MiniMax-H3"}) {
     const auto h3 = catalog_all_by_path(repo);
     EXPECT_TRUE(h3.size() == (std::string(repo) == "MiniMaxAI/MiniMax-H3"
                                   ? 3u
-                                  : 2u));
+                                  : 4u));
     bool fl = false, ref = false;
     std::vector<std::string> keys;
     for (const auto* e : h3) {
@@ -1418,6 +1421,79 @@ TEST(model_catalog, shipped_prepare_pipelines_name_a_resolvable_model)
 #endif
 }
 
+// EVERY SHIPPED FETCH SELECTS ONE CATALOGUE ENTRY.
+//
+// The check above follows a fetch's REGISTRATION KEY, and takes a
+// `model_key` as that key without asking which entry the fetch selects --
+// so prepare-minimax-h3-8bit (model_variant "fl2va", model_key set) read
+// green while "fl2va" matched three entries of Comfy-Org/MiniMax-H3 and
+// the stage would have refused it. `model_key` only names the record;
+// what is DOWNLOADED is the entry `model_variant` selects, by the rule
+// model-fetch applies: a repo publishing one entry and no variant takes
+// it, anything else goes through catalog_pick_variant and must come down
+// to exactly one. This walks every shipped graph's fetches through that.
+TEST(model_catalog, shipped_fetches_select_one_entry)
+{
+#ifndef VPIPE_DOCS_PIPELINES_DIR
+  std::printf("[catalog] no docs dir defined; skipped\n");
+#else
+  namespace fs = std::filesystem;
+  const fs::path dir(VPIPE_DOCS_PIPELINES_DIR);
+  if (!fs::is_directory(dir)) {
+    std::printf("[catalog] %s is not a directory; skipped\n",
+                dir.string().c_str());
+    return;
+  }
+  int checked = 0, several = 0;
+  for (const fs::directory_entry& de : fs::directory_iterator(dir)) {
+    if (de.path().extension() != ".vpipeline") { continue; }
+    const std::string fn = de.path().filename().string();
+    std::string txt, line;
+    {
+      std::ifstream in(de.path());
+      while (std::getline(in, line)) { txt += line + "\n"; }
+    }
+    FlexData fd = FlexData::from_json(txt);
+    if (!fd.is_object()) { continue; }
+    auto root = fd.as_object();
+    if (!root.contains("stages")) { continue; }
+    const FlexData stages = root.at("stages");
+    for (const FlexData& st : stages.as_array()) {
+      auto o = st.as_object();
+      if (std::string(o.at("type").as_string("")) != "model-fetch") {
+        continue;
+      }
+      if (!o.contains("config")) { continue; }
+      const FlexData cfg = o.at("config");
+      auto c = cfg.as_object();
+      auto str = [&](const char* k) {
+        return c.contains(k) ? std::string(c.at(k).as_string("")) : "";
+      };
+      const std::string path = str("model_path");
+      const std::string variant = str("model_variant");
+      const auto cands = catalog_all_by_path(path);
+      if (cands.empty()) { continue; }  // not catalogued: fetched as typed
+      ++checked;
+      if (cands.size() > 1) { ++several; }
+      if (cands.size() == 1 && variant.empty()) { continue; }
+      std::vector<const ModelCatalogEntry*> hits;
+      const ModelCatalogEntry* e =
+          catalog_pick_variant(cands, variant, &hits);
+      if (e == nullptr) {
+        std::printf("[catalog] %s: model_variant '%s' selects %zu of the "
+                    "%zu entries of %s\n", fn.c_str(), variant.c_str(),
+                    hits.size(), cands.size(), path.c_str());
+      }
+      EXPECT_TRUE(e != nullptr);
+    }
+  }
+  std::printf("[catalog] %d shipped fetches of catalogued repos select one "
+              "entry (%d from repos publishing several)\n", checked,
+              several);
+  EXPECT_TRUE(several > 0);
+#endif
+}
+
 // THE VARIANT RULE, stated as tests rather than as a comment.
 //
 // catalog_pick_variant decides WHICH model one repo's several entries a
@@ -1459,6 +1535,41 @@ TEST(model_catalog, variant_resolution_is_exact_before_substring)
   // A miss is a miss, however close.
   EXPECT_TRUE(catalog_pick_variant(both, "turbot") == nullptr);
 
+  // VARIANT ALIASES are exact hits and nothing else. c's handle "fl2va"
+  // equals none of its fields; d's version merely contains it. Without
+  // the alias the two tie on substrings (refused); with it c wins, from
+  // either order. An alias never matches as a substring: "fl2" is d's
+  // and c's version substring alone, a tie.
+  ModelCatalogEntry c, d, e;
+  c.version = "H3-FL2VA";
+  c.name    = "x/fl2va";
+  d.version = "H3-FL2VA";
+  d.variant = "pruned";
+  d.name    = "x/fl2va-pruned";
+  e.version = "other";
+  e.name    = "x/other";
+  const std::vector<const ModelCatalogEntry*> cd = {&c, &d}, dc = {&d, &c};
+  ModelCatalogEntry c_bare = c;
+  const std::vector<const ModelCatalogEntry*> bare = {&c_bare, &d};
+  EXPECT_TRUE(catalog_pick_variant(bare, "fl2va") == nullptr);
+  {
+    FlexData list = FlexData::make_array();
+    list.as_array().push_back(std::string_view("FL2VA"));
+    c.extra = FlexData::make_object();
+    c.extra.as_object().insert_or_assign(catalog_extra::kVariantAliases,
+                                         std::move(list));
+  }
+  EXPECT_TRUE(catalog_pick_variant(cd, "fl2va") == &c);
+  EXPECT_TRUE(catalog_pick_variant(dc, "fl2va") == &c);
+  EXPECT_TRUE(catalog_pick_variant(cd, "fl2") == nullptr);
+  e.extra = c.extra;
+  const std::vector<const ModelCatalogEntry*> e1 = {&e};
+  EXPECT_TRUE(catalog_pick_variant(e1, "fl2va") == &e);
+  EXPECT_TRUE(catalog_pick_variant(e1, "fl2") == nullptr);
+  // Two entries claiming one alias is ambiguity, not a choice.
+  const std::vector<const ModelCatalogEntry*> ce = {&c, &e};
+  EXPECT_TRUE(catalog_pick_variant(ce, "fl2va") == nullptr);
+
   // `matched` carries the hit set so a refusing caller can name it: the
   // tie on an ambiguous match, and nothing on a miss.
   std::vector<const ModelCatalogEntry*> hits;
@@ -1471,31 +1582,65 @@ TEST(model_catalog, variant_resolution_is_exact_before_substring)
 }
 
 // And the shipped case the prepare pipelines depend on: one repo, two
-// partitions, and the variant string each pipeline passes.
+// partitions, and the variant string each pipeline passes -- on both
+// publishers' repos. A partition is selected by its EXACT handle
+// (variant_aliases), never by being the only substring hit: Comfy-Org's
+// repo also publishes the pruned FL2VA DiTs, whose version and name
+// contain "fl2va", and when those were added "fl2va" matched three
+// entries by substring and none exactly -- prepare-minimax-h3-8bit could
+// no longer fetch its DiT.
 TEST(model_catalog, minimax_h3_partitions_resolve_from_their_variant)
 {
-  const std::vector<const ModelCatalogEntry*> cands =
-      catalog_all_by_path("Comfy-Org/MiniMax-H3");
-  if (cands.size() < 2) {
-    std::printf("[catalog] Comfy-Org/MiniMax-H3 publishes %zu entries; "
-                "the two-partition check needs both\n", cands.size());
-    return;
+  for (const std::string pub : {"Comfy-Org", "MiniMaxAI"}) {
+    const std::vector<const ModelCatalogEntry*> cands =
+        catalog_all_by_path(pub + "/MiniMax-H3");
+    if (cands.size() < 2) {
+      std::printf("[catalog] %s/MiniMax-H3 publishes %zu entries; the "
+                  "two-partition check needs both\n", pub.c_str(),
+                  cands.size());
+      continue;
+    }
+    std::vector<const ModelCatalogEntry*> hits;
+    const ModelCatalogEntry* fl = catalog_pick_variant(cands, "fl2va", &hits);
+    EXPECT_TRUE(hits.size() == 1);
+    const ModelCatalogEntry* rf = catalog_pick_variant(cands, "ref2va");
+    ASSERT_TRUE(fl != nullptr);
+    ASSERT_TRUE(rf != nullptr);
+    if (fl == nullptr || rf == nullptr) { continue; }
+    EXPECT_TRUE(fl != rf);
+    // The NAME is what model-fetch registers under with no model_key,
+    // and therefore what a downstream `src_model` has to say.
+    EXPECT_TRUE(fl->name == pub + "/MiniMax-H3-FL2VA");
+    EXPECT_TRUE(rf->name == pub + "/MiniMax-H3-Ref2VA");
+    EXPECT_TRUE(fl->model_type == "minimax-h3-fl2va");
+    EXPECT_TRUE(rf->model_type == "minimax-h3-ref2va");
+    // Case is not part of a handle.
+    EXPECT_TRUE(catalog_pick_variant(cands, "FL2VA") == fl);
+    // Bare "h3" cannot choose between them, and must not pretend to.
+    EXPECT_TRUE(catalog_pick_variant(cands, "h3") == nullptr);
+    // Neither may an empty variant, which is the case that sends the
+    // fetch stage to its "publishes N models" refusal.
+    EXPECT_TRUE(catalog_pick_variant(cands, "") == nullptr);
   }
-  const ModelCatalogEntry* fl = catalog_pick_variant(cands, "fl2va");
-  const ModelCatalogEntry* rf = catalog_pick_variant(cands, "ref2va");
-  ASSERT_TRUE(fl != nullptr);
-  ASSERT_TRUE(rf != nullptr);
-  if (fl == nullptr || rf == nullptr) { return; }
-  EXPECT_TRUE(fl != rf);
-  // The NAME is what model-fetch registers under with no model_key, and
-  // therefore what a downstream `src_model` has to say.
-  EXPECT_TRUE(fl->name == "Comfy-Org/MiniMax-H3-FL2VA");
-  EXPECT_TRUE(rf->name == "Comfy-Org/MiniMax-H3-Ref2VA");
-  // Bare "h3" cannot choose between them, and must not pretend to.
-  EXPECT_TRUE(catalog_pick_variant(cands, "h3") == nullptr);
-  // Neither may an empty variant, which is the case that sends the fetch
-  // stage to its "publishes N models" refusal.
-  EXPECT_TRUE(catalog_pick_variant(cands, "") == nullptr);
+
+  // The pruned DiTs beside the partitions: each by its own name, and the
+  // words they share with the partition or each other refused.
+  const auto comfy = catalog_all_by_path("Comfy-Org/MiniMax-H3");
+  const std::string i8 = "Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot";
+  const std::string bf = "Comfy-Org/MiniMax-H3-FL2VA-pruned-bf16";
+  const ModelCatalogEntry* pi8 = catalog_pick_variant(comfy, i8);
+  const ModelCatalogEntry* pbf = catalog_pick_variant(comfy, bf);
+  ASSERT_TRUE(pi8 != nullptr && pbf != nullptr);
+  if (pi8 == nullptr || pbf == nullptr) { return; }
+  EXPECT_TRUE(pi8->name == i8 && pbf->name == bf);
+  EXPECT_TRUE(pi8->model_type == "minimax-h3-dit");
+  std::vector<const ModelCatalogEntry*> hits;
+  EXPECT_TRUE(catalog_pick_variant(comfy, "pruned", &hits) == nullptr);
+  EXPECT_TRUE(hits.size() == 2);
+  // A substring of the handle is not the handle: the three FL2VA entries
+  // all contain it, so it is refused.
+  EXPECT_TRUE(catalog_pick_variant(comfy, "fl2v", &hits) == nullptr);
+  EXPECT_TRUE(hits.size() == 3);
 }
 
 // The MiniMax-H3 single-image VAE, which is what makes a still out of a

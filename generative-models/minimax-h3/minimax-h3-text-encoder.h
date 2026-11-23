@@ -124,6 +124,23 @@ class MiniMaxH3TextEncoder {
   // graph whose real requirement is ~9 GB reports 58 GB and is refused.
   static std::size_t streaming_floor_bytes(const std::string& enc_dir);
 
+  // What encoding a presentation of `n` tokens allocates beside the
+  // weights: the embedding rows, the taps, the 3-axis rotary tables, the
+  // deepstack features over its `vision_rows`, the backbone's prefill
+  // over every row in one pass (forward_chunk_'s buffers and the paged
+  // K/V its pool doubles to -- MetalQwenModel::run_bytes) and the
+  // connector's output.
+  // `dense`: the stack loads dense (dense_weights(), or before a load
+  // dense_checkpoint()) -- its prefill unpacks no weights.
+  static std::size_t presentation_bytes(const Config& c, int n,
+                                        int vision_rows, int n_deepstack,
+                                        bool matrix_cores, bool dense);
+  // Whether the encoder's stack loads DENSE (MetalQwenModel::
+  // dense_checkpoint), off the weights it will read (`c.weights`, else
+  // `enc_dir`) under any of its layer spellings; false for one built w8
+  // in memory.
+  static bool dense_checkpoint(const Config& c, const std::string& enc_dir);
+
   // Size a Config from the encoder's `config.json` (`text_config`).
   static bool config_from_json(const std::string& enc_dir, Config& out,
                                std::string* err = nullptr);
@@ -168,6 +185,8 @@ class MiniMaxH3TextEncoder {
   {
     return _lm ? _lm->resident_layer_count() : 0;
   }
+  // The loaded stack's own route: its projections dense (no dequant).
+  bool dense_weights() const { return _lm && _lm->uses_dense(); }
   std::uint64_t resident_bytes() const
   {
     return _lm ? _lm->resident_bytes() : 0;

@@ -1,0 +1,267 @@
+{
+  "id": "pi-h3-first-last-to-video",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "MiniMaxAI/MiniMax-H3-FL2VA"
+      }
+    },
+    {
+      "id": "load-image",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "first.jpg"
+        ]
+      }
+    },
+    {
+      "id": "load-image-last",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": [
+          "last.jpg"
+        ]
+      }
+    },
+    {
+      "id": "first-frame",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 1344,
+        "height": 768,
+        "fit": "crop",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "last-frame",
+      "type": "image-resample",
+      "iports": [
+        {
+          "src": "load-image-last",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "width": 1344,
+        "height": 768,
+        "fit": "crop",
+        "algorithm": "lanczos"
+      }
+    },
+    {
+      "id": "vae-encode-first",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "first-frame",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae-encode-last",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "last-frame",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "From the first frame to the last: the camera glides forward through the scene as the light shifts, arriving on the final composition. Natural motion at real-time speed. Sound: ambience that follows the scene. No text."
+      }
+    },
+    {
+      "id": "diffusion-conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "first-frame",
+          "oport": 0
+        },
+        {
+          "src": "last-frame",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "minimax-h3-model-config",
+      "type": "minimax-h3-model-config",
+      "iports": [],
+      "config": {
+        "video_shift": 12.0,
+        "audio_shift": 3.0,
+        "audio_seconds": 0.0,
+        "lora": "Lakonik/pi-H3-4step-dwd",
+        "lora_scale": 1.0
+      }
+    },
+    {
+      "id": "generate-video",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "diffusion-conditioner",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode-first",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode-last",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "minimax-h3-model-config",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "height": 768,
+        "width": 1344,
+        "frames": 124,
+        "fps": 24,
+        "steps": 4,
+        "seed": 42,
+        "unload_when_idle": "always",
+        "dit_dir": "Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot"
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "generate-video",
+          "oport": 1
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "pi-h3-first-last-to-video.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

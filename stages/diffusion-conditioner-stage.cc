@@ -5032,6 +5032,22 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
           ? TensorBeat::DType::Bf16
           : TensorBeat::DType::F16;
 
+  // MiniMax-H3 conditions on a prompt's tokens VERBATIM (no template), so
+  // an EMPTY prompt is no rows at all: [0, text_dim], emitted as such when
+  // the source allows an empty prompt (a training dataset's null caption,
+  // the only one that asks). Every prompt keeps its beat, so a consumer
+  // pairing beats with prompts by order stays in step; H3 is guidance-
+  // distilled, so nothing samples against it.
+  if (_family == "minimax-h3" && prompt.empty() && n_img == 0) {
+    auto beat = std::make_unique<TensorBeatPayload>();
+    beat->dtype = TensorBeat::DType::Bf16;
+    beat->shape = {0, _enc_hidden};
+    co_await ctx.write(0, std::move(beat));
+    ++_emitted;
+    if (!_batch) { release_encoder_when_idle_(); }
+    co_return;
+  }
+
   // ---- MANDATORY content screen ----------------------------------------
   // When the family provides one: on the encoder this stage already owns,
   // on every prompt, with no config key to turn it off -- a model that

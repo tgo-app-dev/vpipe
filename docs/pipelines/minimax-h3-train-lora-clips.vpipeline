@@ -1,0 +1,199 @@
+{
+  "id": "minimax-h3-train-lora-clips",
+  "stages": [
+    {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "MiniMaxAI/MiniMax-H3-FL2VA"
+      }
+    },
+    {
+      "id": "dataset",
+      "type": "training-dataset",
+      "iports": [
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "dir": "lora-datasets/my-clips",
+        "media": "clips",
+        "trigger_word": "ohwx",
+        "resolution": [
+          384
+        ],
+        "frames": [
+          39
+        ],
+        "windows": 2,
+        "audio": "track",
+        "preview_prompts": [
+          "{trigger}",
+          "{trigger} on a sandy beach at sunset"
+        ]
+      }
+    },
+    {
+      "id": "optimizer",
+      "type": "optimizer-select",
+      "iports": [],
+      "config": {
+        "optimizer": "adamw",
+        "learning_rate": 0.0001,
+        "lr_schedule": "constant"
+      }
+    },
+    {
+      "id": "conditioner",
+      "type": "diffusion-conditioner",
+      "iports": [
+        {
+          "src": "dataset",
+          "oport": 1
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "dataset",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "audio-vae-encode",
+      "type": "audio-vae-encode",
+      "iports": [
+        {
+          "src": "dataset",
+          "oport": 3
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "train",
+      "type": "train-lora",
+      "iports": [
+        {
+          "src": "conditioner",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode",
+          "oport": 0
+        },
+        {
+          "src": "dataset",
+          "oport": 2
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        },
+        {
+          "src": "optimizer",
+          "oport": 0
+        },
+        {
+          "src": "audio-vae-encode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_dir": "lora-output",
+        "name": "my-clips-h3",
+        "rank": 32,
+        "targets": "attn_ff",
+        "preview_steps": 20
+      }
+    },
+    {
+      "id": "vae-decode",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "train",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "audio-vae-decode",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "train",
+          "oport": 3
+        },
+        {
+          "src": "model-select",
+          "oport": 0
+        }
+      ],
+      "config": {}
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save-video",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "audio-vae-decode",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "lora-output/preview-%03d.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

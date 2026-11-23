@@ -40,6 +40,16 @@ inline constexpr std::string_view kBatch = "batch";
 // prompt's own conditioning, which caption dropout trains against. Absent
 // or false, an empty prompt produces nothing, as before.
 inline constexpr std::string_view kAllowEmpty = "allow_empty";
+// On a text beat: the REQUEST it is a caption of, when it is not the
+// reader's configured one -- `references`, the files it is conditioned on
+// (a string or a list of strings, in the model's reading order; an empty
+// list is a prompt-only request), and `frames`, the generated duration
+// they are cut to (Int). training-dataset writes them on the captions of
+// a sample that names references (MiniMax-H3 Ref2VA, an image model's
+// edit pair); video-ref-encoder reads them for that beat alone. Absent:
+// the reader's own configuration, as before.
+inline constexpr std::string_view kReferences = "references";
+inline constexpr std::string_view kFrames = "frames";
 
 }  // namespace beat
 
@@ -171,6 +181,16 @@ inline constexpr std::string_view kCropBox = "crop_box";
 // returns it at the size asked for. generate-video sets it on the
 // latent; vae-decode resizes. Absent: as decoded.
 inline constexpr std::string_view kResizeTo = "resize_to";
+// DWD (decoding without a decoder): the beat is not a latent but a DiT's
+// last-step FEATURES, bf16 [rows, hidden], for a pixel head to decode.
+// `dwd_head` the file the head is in (String: an adapter's, its
+// `dwd_pixel_refiner.*`), `dwd_grid` the generated rows' DiT token grid
+// [T, h, w] (Ints; T latent frames, h x w tokens of 2 x 2 latent cells),
+// `dwd_row0` the first generated row (Int; the rows before it are
+// conditioning). vae-decode runs the head in place of a VAE.
+inline constexpr std::string_view kDwdHead = "dwd_head";
+inline constexpr std::string_view kDwdGrid = "dwd_grid";
+inline constexpr std::string_view kDwdRow0 = "dwd_row0";
 
 // The content screen refused the prompt. Bool. Set on the conditioning
 // and carried to the latent, where a decoder emits a refusal card of

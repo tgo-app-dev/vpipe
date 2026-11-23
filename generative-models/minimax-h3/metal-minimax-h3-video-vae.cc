@@ -2453,11 +2453,26 @@ MetalMiniMaxH3VideoVae::enc_conv_(ComputeEncoder& enc, const Conv3d& c,
   return To;
 }
 
-bool
-MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
+namespace {
+
+// ensure_enc_scratch_'s sizes for T frames of H x W, off the config --
+// the levels load builds from it (cin the previous level's cout, from
+// base_ch) -- so the memory figure and the allocation are one rule.
+struct EncScratchSizes {
+  std::size_t need = 0, gn_part = 0, gn_stats = 0;
+  std::size_t col_cap = 16u << 20;   // elements; see ensure_enc_scratch_
+  std::size_t bytes() const
+  {
+    return 3 * need * 2 + col_cap * 2 + std::max<std::size_t>(gn_part, 2) *
+           4 + std::max<std::size_t>(gn_stats, 2) * 4;
+  }
+};
+
+EncScratchSizes
+enc_scratch_sizes_(const MetalMiniMaxH3VideoVae::Config& c, int T, int H,
+                   int W, bool hw)
 {
-  if (_es.T == T && _es.H == H && _es.W == W) { return true; }
-  const Config& c = _cfg;
+  EncScratchSizes z;
   // The widest activation the encode ever holds. It is almost always
   // level 0's -- the spatial extent falls by 4x per level while the
   // channel count only doubles -- but derive it rather than assume it,
@@ -2466,25 +2481,44 @@ MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
       (std::size_t)T * H * W * (std::size_t)std::max(c.in_channels, c.base_ch);
   // The hardware route's inputs are reflect-padded frames, one pixel
   // all round -- the widest pad either stride uses.
-  const int pad = _use_hwconv ? 2 : 0;
+  const int pad = hw ? 2 : 0;
   // The three-pass norm's partials: every frame's bands at every level.
-  std::size_t gn_part = 0, gn_stats = 0;
   const std::size_t G = (std::size_t)c.gn_groups;
-  int t = T, h = H, w = W;
-  for (std::size_t i = 0; i < _enc_levels.size(); ++i) {
-    const EncLevel& lv = _enc_levels[i];
+  int t = T, h = H, w = W, prev = c.base_ch;
+  const std::size_t levels =
+      std::min({c.ch_mult.size(), c.space_down.size(), c.time_down.size()});
+  for (std::size_t i = 0; i < levels; ++i) {
+    const int cin = prev, cout = c.base_ch * c.ch_mult[i];
     need = std::max(need, (std::size_t)t * (h + pad) * (w + pad) *
-                              (std::size_t)std::max(lv.cin, lv.cout));
+                              (std::size_t)std::max(cin, cout));
     const std::size_t nband =
         ((std::size_t)h * w + kGnBand - 1) / kGnBand;
-    gn_part = std::max(gn_part, (std::size_t)t * nband * G * 2);
-    gn_stats = std::max(gn_stats, (std::size_t)t * G * 2);
-    if (lv.space > 1) { h = (h - 2) / 2 + 1; w = (w - 2) / 2 + 1; }
-    if (lv.time > 1) { t = (t - 1) / lv.time + 1; }
-    need = std::max(need, (std::size_t)t * h * w * (std::size_t)lv.cout);
+    z.gn_part = std::max(z.gn_part, (std::size_t)t * nband * G * 2);
+    z.gn_stats = std::max(z.gn_stats, (std::size_t)t * G * 2);
+    if (c.space_down[i] > 1) { h = (h - 2) / 2 + 1; w = (w - 2) / 2 + 1; }
+    if (c.time_down[i] > 1) { t = (t - 1) / c.time_down[i] + 1; }
+    need = std::max(need, (std::size_t)t * h * w * (std::size_t)cout);
+    prev = cout;
   }
-  need = std::max(need,
-                  (std::size_t)t * h * w * (std::size_t)(2 * c.z_channels));
+  z.need = std::max(need,
+                    (std::size_t)t * h * w * (std::size_t)(2 * c.z_channels));
+  return z;
+}
+
+}  // namespace
+
+bool
+MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
+{
+  if (_es.T == T && _es.H == H && _es.W == W) { return true; }
+  const Config& c = _cfg;
+  const EncScratchSizes z = enc_scratch_sizes_(c, T, H, W, _use_hwconv);
+  const std::size_t need = z.need, gn_part = z.gn_part,
+                    gn_stats = z.gn_stats;
+  // The old shape's buffers go first: the previous encode waited for its
+  // GPU work, and holding them while the new ones are made put both sets
+  // in memory at every change of tile shape.
+  _es = EncScratch{};
   EncScratch s;
   s.T = T; s.H = H; s.W = W;
   // The im2col band. The gather is 27x the activation, so a full frame of it
@@ -2501,7 +2535,7 @@ MetalMiniMaxH3VideoVae::ensure_enc_scratch_(int T, int H, int W)
   // ITS peak -- one cap cannot put both levels at 606, and the deeper level
   // is the one that was furthest from its optimum. A per-level band is the
   // real answer and wants its own tuner; this is the bounded version.
-  s.col_cap = 16u << 20;
+  s.col_cap = z.col_cap;
   s.a = _mc->make_shared_buffer(need * 2);
   s.b = _mc->make_shared_buffer(need * 2);
   s.c = _mc->make_shared_buffer(need * 2);
@@ -3510,6 +3544,77 @@ MetalMiniMaxH3VideoVae::encode_video(const SharedBuffer& x, int T, int H,
   if (latent_frames != nullptr) { *latent_frames = total; }
   prof_log_(T, H, W);
   return out;
+}
+
+std::size_t
+MetalMiniMaxH3VideoVae::encode_video_bytes(const Config& c, int T, int H,
+                                           int W, bool matrix_cores)
+{
+  if (T <= 0 || H <= 0 || W <= 0 || c.patch <= 0) { return 0; }
+  const std::size_t IC = (std::size_t)c.in_channels;
+  const std::size_t ZC2 = (std::size_t)(2 * c.z_channels);
+  const std::size_t p = (std::size_t)c.patch;
+  // encode()'s output: the moments of `t` frames of h x w.
+  auto moments = [&](int t, int h, int w) {
+    return ZC2 * (std::size_t)encoded_frames_for(c, t) * (h / p) * (w / p) *
+           2;
+  };
+  // encode_tiled_ of `t` frames: every tile's moments until the stitch,
+  // one tile's copy at a time, the stitched result, and the activations
+  // of the tile being encoded (the widest shape's -- they are made again
+  // at each change of shape, the old ones freed first).
+  auto tiled = [&](int t) {
+    const auto ys = minimax_h3::split_tiles(H, c.tile_size,
+                                            c.tile_overlap_min, c.patch);
+    const auto xs = minimax_h3::split_tiles(W, c.tile_size,
+                                            c.tile_overlap_min, c.patch);
+    if (ys.start.size() <= 1 && xs.start.size() <= 1) {
+      return enc_scratch_sizes_(c, t, H, W, true).bytes() + moments(t, H, W);
+    }
+    std::size_t act = 0, outs = 0, sub = 0;
+    for (std::size_t i = 0; i < ys.start.size(); ++i) {
+      for (std::size_t j = 0; j < xs.start.size(); ++j) {
+        const int th = ys.length[i], tw = xs.length[j];
+        act = std::max(act, enc_scratch_sizes_(c, t, th, tw, true).bytes());
+        outs += moments(t, th, tw);
+        sub = std::max(sub, IC * t * th * tw * 2);
+      }
+    }
+    return act + outs + std::max(sub, moments(t, H, W));
+  };
+  std::size_t b = 0;
+  if (T == 1) {
+    b = tiled(1);
+  } else {
+    // A clip in pieces of clip_length frames: the piece, the whole
+    // clip's moments, one piece's encode.
+    const int cl = std::max(1, c.clip_length);
+    const int total = video_latent_frames_for(c, T);
+    b = IC * cl * H * W * 2 + ZC2 * (std::size_t)total * (H / p) * (W / p) *
+        2 + tiled(cl);
+  }
+  // The split-K planes (kept with the VAE): a level's 3x3x3 conv deep
+  // enough to split, at the im2col band's rows, inside the plane budget.
+  if (matrix_cores) {
+    const std::size_t col = EncScratchSizes{}.col_cap;
+    std::size_t planes = 0;
+    int prev = c.base_ch;
+    for (std::size_t i = 0; i < c.ch_mult.size(); ++i) {
+      const int cout = c.base_ch * c.ch_mult[i];
+      for (int cin : {prev, cout}) {
+        const std::size_t K = (std::size_t)27 * cin;
+        const std::size_t band = col / K;
+        if (K >= (std::size_t)MmaSplitK::kMinSplitK &&
+            band >= (std::size_t)MmaSplitK::kMinSplitM) {
+          planes = std::max(planes, band * (std::size_t)cout *
+                                        MmaSplitK::kMaxS * 4);
+        }
+      }
+      prev = cout;
+    }
+    b += std::min(planes, MmaSplitK::budget_bytes());
+  }
+  return b;
 }
 
 SharedBuffer

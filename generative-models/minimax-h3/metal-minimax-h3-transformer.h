@@ -36,6 +36,7 @@ namespace genai {
 
 class WeightSet;   // generative-models/weight-set.h
 namespace minimax_h3 { class StreamKv; }   // minimax-h3-stream-kv.h
+class MiniMaxH3Trainer;   // minimax-h3-trainer.h
 
 // The MiniMax-H3 omni denoiser (MiniMaxH3DiTModel): a 33B dense
 // SINGLE-STREAM transformer that predicts video AND audio velocity from
@@ -148,6 +149,20 @@ class MetalMiniMaxH3Transformer {
     // embedding, projected onto it (see CurveBasis). Empty: those are
     // skipped (AdaLN modules) or refused (a flow map), as before.
     std::string time_mlp_dir;
+    // PRUNE AT LOAD: a RELEASED checkpoint read into ComfyUI's pruned
+    // form. Every AdaLN projection [D, 2688] (13 B parameters, 26 GB at
+    // bf16 -- 40% of the checkpoint) becomes [D, 8] over the time
+    // embedding's own 8-dim principal curve: silu(temb(t)) ~ U c(t) + m,
+    // fit here from the checkpoint's own timestep MLP (the energy past
+    // 8 dims is ~2e-9), W' = W U, b' = W m + b, in f32 (174 MB in all).
+    // Each forward then takes EXACT coordinates c(t) = U^T (s(t) - m) off
+    // the host MLP -- no table lerp. What LoRA training wants: its sigma
+    // is fresh every step, so the bake (bake_adaln) cannot serve it, and a
+    // streamed released DiT would otherwise read the whole AdaLN every
+    // step. The blocks then hold no AdaLN; adapters on the AdaLN port
+    // through U as on a pruned file. Ignored on a pruned checkpoint and on
+    // a rank. False keeps the released form (resident or baked).
+    bool prune_adaln = false;
     // The audio branch (`audio_enabled`): its patch projection and its
     // head. MiniMax-H3-Image's stack has neither, and its layouts no
     // audio rows (minimax-h3-image.h).
@@ -523,6 +538,14 @@ class MetalMiniMaxH3Transformer {
   // Bytes every slot's GPU factors hold -- what attaching the adapters
   // costs in memory, which is not what they cost on disk.
   std::size_t lora_bytes() const;
+  // Whether a bound slot overwrites weights whole (LoraSlot::sets: pi-H3)
+  // or carries a DWD pixel head -- what a reader that runs the blocks on
+  // its own (the LoRA trainer) cannot follow.
+  bool lora_overwrites() const;
+  // The slot whose DWD head is live (strength not 0), or -1; and its
+  // file (empty for none), where the head's tensors are.
+  int dwd_slot() const;
+  std::string dwd_file() const;
   // The width of the forward's [rows, rank] adapter scratch, every
   // slot's widest projection together.
   int lora_scratch_rank() const { return _lora_rank_total; }
@@ -663,8 +686,29 @@ class MetalMiniMaxH3Transformer {
     // `bf16_conditioning_v1`: the keyframe latents are rounded to bf16
     // before they are noised and packed.
     bool   bf16_conditioning = false;
+    // The grid shifted in FLOAT32, each op rounded (torch's float32
+    // tensor with Python-float scalars; MiniMaxH3Scheduler::set_sigmas)
+    // rather than in double: a pi-Flow adapter's (pi_flow_contract_of),
+    // whose `sigmas` are float32 values.
+    bool   shift_f32 = false;
     int    slot = -1;                  // which adapter slot states it
   };
+  // A pi-Flow adapter's contract (pi-H3, Lakonik/pi-H3), which no
+  // manifest states: its header's `policy_config` names a DX policy on
+  // a grid for both modalities -- one evaluation a step, which is an
+  // Euler step -- and the grid is the release's own (LakonLab's
+  // FlowEulerODEScheduler): linspace(m, 0.6 m / (N - 0.4), N) in float32
+  // for N steps, m 0.93 at 2 and 0.96 at 4, shifted 12 / 3, terminal 0.
+  // N is read off the file's path (`pi_h3_4step_...`), the only place
+  // the release says it. False with `err` empty for a file that states
+  // no such policy; false with a reason for one that does and cannot be
+  // run (no step count in its name, one the release has no grid for, a
+  // policy other than DX).
+  static bool pi_flow_contract_of(const std::string& adapter_file,
+                                  SamplingContract* out, std::string* err);
+  // The release's raw pi-Flow grid for `steps` (2 or 4), float32 values,
+  // terminal 0 included; empty for another count.
+  static std::vector<float> pi_flow_raw_grid(int steps);
   // The contract an adapter FILE states, read from the `manifest.json`
   // in its directory. False with `err` empty when there is none (no
   // manifest, or one without `sampling`); false with a reason when one
@@ -798,6 +842,41 @@ class MetalMiniMaxH3Transformer {
 
   ~MetalMiniMaxH3Transformer();   // out-of-line: _ws is fwd-declared
 
+  // What the trainer's backward reads of a forward. Each a buffer the
+  // trainer owns, sized for this forward (bf16 unless said), or null for
+  // what it does not want:
+  //   ckpt        n_layers slices [seq, hidden]: each main block's input
+  //   mods        n_layers slices [n_t * kModalityNum, 6 * hidden]: each
+  //               main block's modulation, as the block read it
+  //   fmod        [n_t, 2 * hidden]: the final layer's
+  //   final_hidden [seq, hidden]: the residual after the last block
+  //   refiner_in  n_refiner slices [n_text, hidden]: each token-refiner
+  //               block's input
+  //   refiner_out [n_text, hidden]: the refiner's output, before its
+  //               final norm
+  //   run_block   RECOMPUTE: NEVER. When set, each MAIN block runs through
+  //               it in place of the model's own: the trainer's block
+  //               forward, which keeps what its backward reads. It encodes
+  //               into `enc` (the forward's) over `x` [rows, hidden] in
+  //               place, after the ckpt / mods copies of the block are
+  //               encoded; false fails the forward.
+ private:
+  struct Block;
+
+ public:
+  struct TrainTap {
+    const metal_compute::SharedBuffer* ckpt = nullptr;
+    const metal_compute::SharedBuffer* mods = nullptr;
+    const metal_compute::SharedBuffer* fmod = nullptr;
+    const metal_compute::SharedBuffer* final_hidden = nullptr;
+    const metal_compute::SharedBuffer* refiner_in = nullptr;
+    const metal_compute::SharedBuffer* refiner_out = nullptr;
+    std::function<bool(metal_compute::ComputeEncoder& enc, int layer,
+                       const Block& b, const metal_compute::SharedBuffer& x,
+                       int rows)>
+        run_block;
+  };
+
   // Everything one denoiser evaluation needs that is not a weight. The
   // caller owns the layout and the row buffers; this is a view.
   struct Step {
@@ -860,6 +939,18 @@ class MetalMiniMaxH3Transformer {
     // MiniMax-H3-Image's step i runs head i), or -1 for the checkpoint's
     // own `final_layer.video_out`.
     int out_head = -1;
+    // DWD (dwd_slot()): also return the video rows' FEATURES for the
+    // pixel head -- the last block's hidden states LayerNormed without an
+    // affine and modulated, (1 + scale) x + shift, [scale | shift] =
+    // dwd_norm_out(silu(c(t))) at each row's timestep (Velocity::
+    // features). The last step's forward asks; a forward of a DiT with no
+    // live DWD slot fails.
+    bool dwd_features = false;
+    // A DIAL's shift for this forward (minimax-h3-dials.h): bf16
+    // [hidden] (text_shift_buffer), added to every prompt row after the
+    // token refiner -- after set_dials()'s constant shift, where the
+    // model has one. The dialled branch of a time curve; null for none.
+    const metal_compute::SharedBuffer* text_shift = nullptr;
     // TaoMate-H3's STREAMING attention (minimax-h3-stream-kv.h). Set, and
     // every main block's attention splits in two:
     //   text rows   -> the text rows alone
@@ -874,12 +965,42 @@ class MetalMiniMaxH3Transformer {
     // rows that survive this commit plus this forward's media rows. The
     // output heads do not run; the Velocity comes back ok and empty.
     bool stream_commit = false;
+    // TRAINING (minimax-h3-trainer.h): what a backward needs from this
+    // forward, copied out as it runs. Null for inference. Under a tap the
+    // attention runs dense (Sol and Sage skipped), and VDN, streaming
+    // attention and a rank are refused.
+    const TrainTap* train = nullptr;
   };
+
+  // A TRAINER's adapter, in a slot of its own after every file's: for
+  // each projection this family adapts, `fn(module, n, k, &factors)`
+  // fills the factors the forward is to read -- live buffers the trainer
+  // keeps writing -- or returns false to leave the module unadapted.
+  // Modules are this DiT's own: `blocks.<L>.attn.qkv_proj` [3 * inner,
+  // hidden] (the base's row grouping; a banded fill allowed), `...attn.
+  // out_proj`, `...mlp.fc1` ([gate | up]), `...mlp.fc2`, the same under
+  // `token_refiner.blocks.<R>.`. Strength 1; alpha folded into A as a
+  // file's is. The slot index in `*slot`; the modules bound returned (0 on
+  // failure, with `err`). The factors are never spilled.
+  using LiveLoraFn = std::function<bool(const std::string& module, int n,
+                                        int k, lora::Factors* out)>;
+  int bind_live_lora(const LiveLoraFn& fn, int* slot,
+                     std::string* err = nullptr);
+  // Unbind `slot`: nothing in it is read again; the last slot's place in
+  // the scratch is given back.
+  void release_live_lora(int slot);
+  // Whether the AdaLN was pruned at load (Config::prune_adaln), and the
+  // relative residual of its curve fit.
+  bool adaln_pruned_at_load() const noexcept { return _pruned_at_load; }
+  double adaln_prune_residual() const noexcept { return _basis.residual; }
 
   struct Velocity {
     // [num_video_rows, 96] and [num_audio_rows, audio_channels] bf16, in
     // the same row order the inputs were given in.
     metal_compute::SharedBuffer video, audio;
+    // Step::dwd_features: [num_video_rows, hidden] bf16, the rows in the
+    // video velocity's order.
+    metal_compute::SharedBuffer features;
     // Success, stated rather than read off a buffer: an AUDIO-ONLY
     // forward (no video rows) has no video velocity, and a streaming
     // commit has neither.
@@ -904,6 +1025,37 @@ class MetalMiniMaxH3Transformer {
   // What the heads hold: derived entries of `ws`, whose manager sees
   // them as it sees any cached tensor.
   std::size_t step_heads_bytes() const;
+
+  // CONSTANT DIALS (minimax-h3-dials.h), for every forward from here on
+  // until set again: `pre` [hidden] added to condition_proj's bias --
+  // the bias becomes bf16(b + pre), as ComfyUI patches it -- and `post`
+  // [hidden] added to every prompt row after the token refiner's final
+  // norm, the sum rounded to bf16. Either empty for none; both empty
+  // clears them. A forward already encoded keeps the buffers it was
+  // given. False, with `err`, for a vector not `hidden` wide.
+  bool set_dials(const std::vector<float>& pre,
+                 const std::vector<float>& post,
+                 std::string* err = nullptr);
+  bool has_dials() const
+  {
+    return !_dial_bias.empty() || !_dial_post.empty();
+  }
+  // A shift as a forward reads it (Step::text_shift): bf16 [hidden].
+  // Empty for a vector of another width.
+  metal_compute::SharedBuffer
+  text_shift_buffer(const std::vector<float>& v) const;
+  // Tests: keep a copy of the prompt rows the main blocks read (after
+  // every dial), [text rows, hidden] bf16, each forward; off by default
+  // -- the copy waits for the GPU.
+  void capture_text_rows(bool on)
+  {
+    _cap_text = on;
+    _cap_text_rows.clear();
+  }
+  const std::vector<std::uint16_t>& captured_text_rows() const
+  {
+    return _cap_text_rows;
+  }
 
   // Size the activation scratch for at least `seq` rows and `n_text`
   // text rows, and KEEP it for any forward that fits, rather than
@@ -1069,6 +1221,10 @@ class MetalMiniMaxH3Transformer {
                   std::string* err = nullptr,
                   const std::vector<std::vector<float>>* endpoints = nullptr);
   bool adaln_baked() const { return !_adaln_tab.empty(); }
+  // HOLD THE AdaLN UNBAKED: bake_adaln refuses while set. A LoRA trainer
+  // sets it -- the bake retires the projections every training step
+  // reads at its own sigma -- so a preview's denoise runs them per step.
+  void hold_adaln_unbaked(bool on) { _bake_held = on; }
 
   // Bytes the AdaLN bake will RETIRE, read from the checkpoint index
   // without loading anything -- the sum of every `adaln_proj` tensor.
@@ -1662,6 +1818,20 @@ class MetalMiniMaxH3Transformer {
                 "silently at the projection rather than at load");
 
   MetalMiniMaxH3Transformer() = default;
+  friend class MiniMaxH3Trainer;
+
+  // Prune at load (Config::prune_adaln): the curve's basis off this
+  // checkpoint's timestep MLP, then every AdaLN projection onto it, into
+  // _padaln / _final_padaln; the config then reads as pruned. False (and
+  // nothing changed) where it cannot -- the caller loads the released
+  // form instead.
+  bool prune_adaln_at_load_(WeightSet& ws, std::string* err);
+  bool _pruned_at_load = false;
+  // A backward GEMM keeps the bf16 route even where the forward takes
+  // int8 (the trainer's set_i8_backward(false)).
+  bool _i8_hold = false;
+  // hold_adaln_unbaked().
+  bool _bake_held = false;
 
   // A Linear: either a dense bf16 [N, K] matrix or an MLX-affine
   // quantized triple, plus an optional bias. Which one is detected from
@@ -2189,6 +2359,14 @@ class MetalMiniMaxH3Transformer {
   static std::size_t block_bytes_(const Block& b);
 
   Linear _video_patch, _audio_patch, _cond_proj;
+  // The constant dials (set_dials): condition_proj's bias with the pre
+  // seam's delta added, and the post seam's shift, bf16 [hidden] each;
+  // empty where no dial uses the seam.
+  metal_compute::SharedBuffer _dial_bias, _dial_post;
+  // capture_text_rows: the prompt rows the main blocks read, last
+  // forward.
+  bool _cap_text = false;
+  std::vector<std::uint16_t> _cap_text_rows;
   Linear _time_in, _time_out;                 // read to the HOST, f32
   std::vector<float> _time_in_w, _time_in_b, _time_out_w, _time_out_b;
   std::vector<float> _inv_freq;               // [rope_freq_dim], f32
@@ -2403,6 +2581,29 @@ class MetalMiniMaxH3Transformer {
     // Empty buffer: nothing for that projection.
     std::vector<metal_compute::SharedBuffer> pdelta;
     metal_compute::SharedBuffer              pdelta_final;
+    // WHOLE-TENSOR OVERWRITES ("set" tensors) beside the factors -- a
+    // distillation that fine-tunes some weights outright (pi-H3,
+    // Lakonik/pi-H3: every block's pruned AdaLN, four blocks' out / fc1
+    // / fc2, the output norm and heads). Applied WHOLE while the slot is
+    // live (strength != 0) whatever its strength, as the reference loads
+    // them before it fuses the LoRA (bind_sets_). The projections and
+    // heads are held as dense bf16 Linears (empty: none); the AdaLN's as
+    // its DIFFERENCE from the trunk's, f32 [D * 8 + D] like pdelta,
+    // added at 1 (pruned_mod_). `set_ws` keeps their entries.
+    struct SetBlock { Linear out, fc1, fc2; };
+    std::vector<SetBlock> set_blocks;   // per main block, or empty
+    Linear set_video_out, set_audio_out;
+    metal_compute::SharedBuffer set_final_norm;
+    std::vector<metal_compute::SharedBuffer> pset;
+    metal_compute::SharedBuffer              pset_final;
+    std::shared_ptr<WeightSet> set_ws;
+    int   sets     = 0;
+    // A DWD adapter (its `dwd_*` tensors): the pixel head's file, and
+    // the DiT's own half of it -- `dwd_norm_out`, the modulation of the
+    // last forward's features, f32 [2H * 8 + 2H] (see dwd_features).
+    bool  dwd      = false;
+    std::vector<float> dwd_norm;
+    std::string path;                  // the adapter's file
     int   modules  = 0;
     int   banded   = 0;
     int   max_rank = 0;
@@ -2549,6 +2750,21 @@ class MetalMiniMaxH3Transformer {
   // Read the adapter and bind its factors to the modules above. Called
   // from load() once the blocks exist.
   bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // The file's whole-tensor overwrites (LoraSlot::set_blocks & co.),
+  // in the diffusers spelling pi-H3 publishes. `*took` false for a file
+  // that carries none; false + `err` for one this DiT cannot take (the
+  // AdaLN's on a released DiT, a tensor of no known place, a rank).
+  bool bind_sets_(const std::string& path, LoraSlot& slot, bool* took,
+                  std::string* err);
+  // Main block L as a forward runs it: `b`, or -- where a live slot
+  // overwrites any of its projections -- a copy in `tmp` with them in
+  // place.
+  const Block& set_block_(int L, const Block& b, Block& tmp) const;
+  // The output norm and heads a forward runs: a live slot's
+  // overwrites, else the checkpoint's own.
+  const metal_compute::SharedBuffer& set_final_norm_() const;
+  const Linear& set_video_out_() const;
+  const Linear& set_audio_out_() const;
   // A RANK's adapter (Config::tp): bound at the checkpoint's widths, its
   // factors then cut as the weights are -- B's rows of q|k|v and fc1, A's
   // columns of the out projection and fc2 -- so a rank adds its share of
@@ -2733,6 +2949,10 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_gemm, _fn_rms, _fn_rms_heads, _fn_trope,
       _fn_modulate, _fn_gated, _fn_swiglu, _fn_transpose, _fn_residual,
       _fn_bias_add, _fn_sdpa;
+  // DWD (Step::dwd_features): the affine-free LayerNorm, and the
+  // features' modulation table [n_t, 2H] bf16 of the forward asking.
+  metal_compute::ComputeFunction _fn_ln_plain;
+  metal_compute::SharedBuffer _dwd_mod;
   // Rope written back over the fused projection, for the path that never
   // transposes. See _fused_attn.
   metal_compute::ComputeFunction _fn_rope_ip;

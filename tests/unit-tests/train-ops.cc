@@ -21,6 +21,8 @@
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "common/session.h"
+#include "generative-models/train/lora-params.h"
+#include "generative-models/train/optimizer.h"
 #include "generative-models/train/train-ops.h"
 
 #include <algorithm>
@@ -28,13 +30,24 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
 
 using namespace vpipe;
 using metal_compute::SharedBuffer;
+
+namespace {
+std::string
+fs_tmp_()
+{
+  const char* t = std::getenv("TMPDIR");
+  return t != nullptr ? std::string(t) : std::string("/tmp");
+}
+}  // namespace
 
 namespace {
 
@@ -782,4 +795,668 @@ TEST(train_ops, optimizers_step_and_write_the_loaders_shadow)
   EXPECT_TRUE(bad == 0);
   EXPECT_TRUE(shadow_bad == 0);
   EXPECT_TRUE(zero_bad == 0);
+}
+
+// ---- MiniMax-H3's block -------------------------------------------------
+//
+// Each H3 backward against central differences of its own forward in
+// double (f(x) = sum dy . y(x)), on the GPU's bf16 inputs: the RMSNorm +
+// per-row modulation (rows reading table rows by index), the plain gate,
+// SwiGLU off a fused [gate | up], the partial rotate-half RoPE written
+// back to a strided fused projection, the per-head RMSNorm in place, and
+// the banded adapter B's expand / extract.
+TEST(train_ops, h3_block_backwards_match_central_differences)
+{
+  Gpu g;
+  if (!g.ok) { return; }
+  const int rows = 5, H = 96, stride = 6 * H, n_mod = 4;
+  const float eps = 1e-5f;
+  const std::vector<float> x = randn_((std::size_t)rows * H, 1.0f, 11);
+  const std::vector<float> dy = randn_((std::size_t)rows * H, 1.0f, 12);
+  const std::vector<float> w = randn_((std::size_t)H, 0.5f, 13);
+  const std::vector<float> mod = randn_((std::size_t)n_mod * stride, 0.3f, 14);
+  const std::vector<int> idx = {2, 0, 3, 3, 1};
+  SharedBuffer bx = g.bf(x), bdy = g.bf(dy), bw = g.bf(w), bm = g.bf(mod);
+  SharedBuffer bi = g.mc->make_shared_buffer(idx.size() * 4);
+  std::memcpy(bi.contents(), idx.data(), idx.size() * 4);
+  // dx starts at 1: the kernel ADDS.
+  SharedBuffer bdx = g.f32(std::vector<float>((std::size_t)rows * H, 1.0f));
+  const int scale_off = 4 * H;
+  ASSERT_TRUE(g.run([&](metal_compute::ComputeEncoder& enc) {
+    g.ops.rms_mod_bwd(enc, bx, 0, bdy, 0, false, bw, bm, 0, bi, 0, bdx, 0,
+                      rows, H, eps, stride, scale_off, true);
+  }));
+  {
+    const std::vector<float> got = read_f32_(bdx, (std::size_t)rows * H);
+    std::vector<double> want((std::size_t)rows * H);
+    for (int r = 0; r < rows; ++r) {
+      auto f = [&](const std::vector<double>& xr) {
+        double ss = 0.0;
+        for (double v : xr) { ss += v * v; }
+        const double inv = 1.0 / std::sqrt(ss / H + eps);
+        double acc = 0.0;
+        for (int i = 0; i < H; ++i) {
+          const double sc = mod[(std::size_t)idx[r] * stride + scale_off + i];
+          acc += dy[(std::size_t)r * H + i] * (1.0 + sc) * xr[i] * inv * w[i];
+        }
+        return acc;
+      };
+      std::vector<double> xr(x.begin() + r * H, x.begin() + (r + 1) * H);
+      for (int i = 0; i < H; ++i) {
+        const double h = 1e-4, o = xr[i];
+        xr[i] = o + h; const double p = f(xr);
+        xr[i] = o - h; const double m = f(xr);
+        xr[i] = o;
+        want[(std::size_t)r * H + i] = 1.0 + (p - m) / (2.0 * h);
+      }
+    }
+    const double e = rel_l2_(got, want);
+    std::printf("[train_ops] h3 rms + per-row modulation bwd rel-L2 %.2e\n", e);
+    EXPECT_TRUE(e < 2e-3);
+  }
+  // The plain gate: dsub = gate[idx] * dh.
+  SharedBuffer bdh = g.f32(dy);
+  SharedBuffer bds = g.zeros((std::size_t)rows * H * 2);
+  ASSERT_TRUE(g.run([&](metal_compute::ComputeEncoder& enc) {
+    g.ops.gated_idx_bwd(enc, bdh, 0, bm, 0, bi, 0, bds, 0, rows, H, stride,
+                        5 * H, true);
+  }));
+  {
+    const std::vector<float> got = read_bf_(bds, (std::size_t)rows * H);
+    std::vector<double> want((std::size_t)rows * H);
+    for (int r = 0; r < rows; ++r) {
+      for (int i = 0; i < H; ++i) {
+        want[(std::size_t)r * H + i] =
+            (double)mod[(std::size_t)idx[r] * stride + 5 * H + i] *
+            dy[(std::size_t)r * H + i];
+      }
+    }
+    const double e = rel_l2_(got, want);
+    std::printf("[train_ops] h3 gated bwd rel-L2 %.2e\n", e);
+    EXPECT_TRUE(e < 5e-3);
+  }
+  // SwiGLU off [gate | up].
+  {
+    const int W = 40;
+    const std::vector<float> gu = randn_((std::size_t)rows * 2 * W, 1.0f, 21);
+    const std::vector<float> ds = randn_((std::size_t)rows * W, 1.0f, 22);
+    SharedBuffer bgu = g.bf(gu), bdsw = g.bf(ds);
+    SharedBuffer bdgu = g.zeros((std::size_t)rows * 2 * W * 2);
+    ASSERT_TRUE(g.run([&](metal_compute::ComputeEncoder& enc) {
+      g.ops.swiglu_gf_bwd(enc, bgu, bdsw, bdgu, rows, W);
+    }));
+    const std::vector<float> got = read_bf_(bdgu, (std::size_t)rows * 2 * W);
+    std::vector<double> want((std::size_t)rows * 2 * W);
+    for (int r = 0; r < rows; ++r) {
+      for (int d = 0; d < W; ++d) {
+        auto s = [](double gg, double uu) {
+          return uu * gg / (1.0 + std::exp(-gg));
+        };
+        const double gg = gu[(std::size_t)r * 2 * W + d];
+        const double uu = gu[(std::size_t)r * 2 * W + W + d];
+        const double dd = ds[(std::size_t)r * W + d];
+        const double h = 1e-5;
+        want[(std::size_t)r * 2 * W + d] =
+            dd * (s(gg + h, uu) - s(gg - h, uu)) / (2 * h);
+        want[(std::size_t)r * 2 * W + W + d] =
+            dd * (s(gg, uu + h) - s(gg, uu - h)) / (2 * h);
+      }
+    }
+    const double e = rel_l2_(got, want);
+    std::printf("[train_ops] h3 swiglu [gate | up] bwd rel-L2 %.2e\n", e);
+    EXPECT_TRUE(e < 5e-3);
+  }
+  // Partial rotate-half RoPE, back into a strided per-head fused layout,
+  // then the per-head RMSNorm in place.
+  {
+    const int T = 3, NH = 2, D = 128, rot = 96, hr = rot / 2;
+    const int ld = 3 * NH * D, hs = 3 * D, off = D;   // k of per-head qkv
+    const std::vector<float> in = randn_((std::size_t)NH * T * D, 1.0f, 31);
+    std::vector<float> cs((std::size_t)T * hr), sn((std::size_t)T * hr);
+    for (int t = 0; t < T; ++t) {
+      for (int i = 0; i < hr; ++i) {
+        const float a = 0.37f * (float)(t + 1) * (float)(i + 1);
+        cs[(std::size_t)t * hr + i] = std::cos(a);
+        sn[(std::size_t)t * hr + i] = std::sin(a);
+      }
+    }
+    SharedBuffer bin = g.f32(in), bc = g.f32(cs), bs = g.f32(sn);
+    SharedBuffer bq = g.zeros((std::size_t)T * ld * 2);
+    ASSERT_TRUE(g.run([&](metal_compute::ComputeEncoder& enc) {
+      g.ops.rope_half_bwd(enc, bin, true, bq, 0, bc, bs, NH, T, D, rot, ld,
+                          off, hs);
+    }));
+    // Want: the transpose of the forward rotation y = R x (per t, h).
+    std::vector<double> want((std::size_t)T * ld, 0.0);
+    for (int t = 0; t < T; ++t) {
+      for (int h = 0; h < NH; ++h) {
+        const float* y = in.data() + ((std::size_t)h * T + t) * D;
+        double* o = want.data() + (std::size_t)t * ld + off + h * hs;
+        for (int d = 0; d < D; ++d) { o[d] = y[d]; }
+        for (int i = 0; i < hr; ++i) {
+          const double c = cs[(std::size_t)t * hr + i];
+          const double s = sn[(std::size_t)t * hr + i];
+          // forward: y1 = x1 c - x2 s, y2 = x2 c + x1 s
+          o[i] = y[i] * c + y[i + hr] * s;
+          o[i + hr] = -y[i] * s + y[i + hr] * c;
+        }
+      }
+    }
+    std::vector<float> got = read_bf_(bq, (std::size_t)T * ld);
+    std::vector<double> wk;
+    std::vector<float> gk;
+    for (int t = 0; t < T; ++t) {
+      for (int h = 0; h < NH; ++h) {
+        for (int d = 0; d < D; ++d) {
+          const std::size_t p = (std::size_t)t * ld + off + h * hs + d;
+          wk.push_back(want[p]);
+          gk.push_back(got[p]);
+        }
+      }
+    }
+    const double e = rel_l2_(gk, wk);
+    std::printf("[train_ops] h3 partial rope bwd rel-L2 %.2e\n", e);
+    EXPECT_TRUE(e < 5e-3);
+    // The per-head norm's backward over the same place, in place.
+    const std::vector<float> xq = randn_((std::size_t)T * ld, 1.0f, 41);
+    const std::vector<float> wq = randn_((std::size_t)D, 0.5f, 42);
+    SharedBuffer bxq = g.bf(xq), bwq = g.bf(wq);
+    const std::vector<float> dq0 = read_bf_(bq, (std::size_t)T * ld);
+    ASSERT_TRUE(g.run([&](metal_compute::ComputeEncoder& enc) {
+      g.ops.rms_heads_bwd(enc, bxq, bq, bwq, T, NH, D, ld, off, hs, eps);
+    }));
+    const std::vector<float> dq1 = read_bf_(bq, (std::size_t)T * ld);
+    std::vector<double> wn;
+    std::vector<float> gn;
+    for (int t = 0; t < T; ++t) {
+      for (int h = 0; h < NH; ++h) {
+        const std::size_t b = (std::size_t)t * ld + off + h * hs;
+        auto f = [&](const std::vector<double>& xr) {
+          double ss = 0.0;
+          for (double v : xr) { ss += v * v; }
+          const double inv = 1.0 / std::sqrt(ss / D + eps);
+          double acc = 0.0;
+          for (int i = 0; i < D; ++i) {
+            acc += dq0[b + i] * xr[i] * inv * wq[i];
+          }
+          return acc;
+        };
+        std::vector<double> xr(xq.begin() + b, xq.begin() + b + D);
+        for (int i = 0; i < D; ++i) {
+          const double hh = 1e-4, o = xr[i];
+          xr[i] = o + hh; const double p = f(xr);
+          xr[i] = o - hh; const double m = f(xr);
+          xr[i] = o;
+          wn.push_back((p - m) / (2.0 * hh));
+          gn.push_back(dq1[b + i]);
+        }
+      }
+    }
+    const double en = rel_l2_(gn, wn);
+    std::printf("[train_ops] h3 per-head rms bwd (in place) rel-L2 %.2e\n",
+                en);
+    EXPECT_TRUE(en < 5e-3);
+  }
+  // A banded B as block-diagonal, and a gradient back on its band.
+  {
+    const int n = 12, r = 2, parts = 3, group = 2;
+    const std::vector<float> b = randn_((std::size_t)n * r, 1.0f, 51);
+    SharedBuffer bb = g.bf(b);
+    SharedBuffer bd = g.zeros((std::size_t)n * parts * r * 2);
+    const std::vector<float> src =
+        randn_((std::size_t)n * parts * r, 1.0f, 52);
+    SharedBuffer bsrc = g.f32(src);
+    SharedBuffer bdst = g.f32(std::vector<float>((std::size_t)n * r, 0.5f));
+    ASSERT_TRUE(g.run([&](metal_compute::ComputeEncoder& enc) {
+      g.ops.band_expand(enc, bb, 0, bd, n, r, parts, group);
+      g.ops.band_extract_acc(enc, bsrc, bdst, 0, n, r, parts, group, 2.0f);
+    }));
+    const std::vector<float> e = read_bf_(bd, (std::size_t)n * parts * r);
+    const std::vector<float> x = read_f32_(bdst, (std::size_t)n * r);
+    int bad = 0;
+    for (int j = 0; j < n; ++j) {
+      const int p = (j / group) % parts;
+      for (int c = 0; c < parts * r; ++c) {
+        const float want = c / r == p ? b[(std::size_t)j * r + c % r] : 0.0f;
+        bad += e[(std::size_t)j * parts * r + c] != want;
+      }
+      for (int c = 0; c < r; ++c) {
+        const float want =
+            0.5f + 2.0f * src[(std::size_t)j * parts * r + p * r + c];
+        bad += std::fabs(x[(std::size_t)j * r + c] - want) > 1e-6f;
+      }
+    }
+    std::printf("[train_ops] banded expand / extract: %d wrong\n", bad);
+    EXPECT_TRUE(bad == 0);
+  }
+}
+
+// 8-BIT AdamW and LoRA+, through the Optimizer over a real LoraParams set.
+// A quadratic per parameter (loss = sum (w - w*)^2 / 2, so the gradient
+// is w - w*, a target spread over five decades so the second moments of
+// a block span several of the map's decades) run 300 steps three ways:
+// AdamW in f32, AdamW with 8-bit moments, and the 8-bit run saved at 150
+// and resumed into a fresh optimizer. The 8-bit trajectory stays close to
+// f32's and converges as far; the resumed run is the uninterrupted one
+// to the bit. The dynamic map is 256 ascending codes a sign kind, 0 and 1
+// among them. LoRA+ on SGD without momentum: B's step is exactly the
+// ratio times A's for the same gradient.
+TEST(train_ops, adamw8bit_tracks_adamw_and_loraplus_scales_b)
+{
+  using namespace genai::train;
+  Gpu g;
+  if (!g.ok) { return; }
+  const std::vector<float> codes = TrainOps::adamw8_codes();
+  ASSERT_TRUE(codes.size() == 512);
+  bool sorted = true, has01 = true;
+  for (int h = 0; h < 2; ++h) {
+    const float* c = codes.data() + h * 256;
+    for (int i = 1; i < 256; ++i) { sorted = sorted && c[i] >= c[i - 1]; }
+    has01 = has01 && std::count(c, c + 256, 0.0f) == 1 &&
+            std::count(c, c + 256, 1.0f) == 1;
+  }
+  EXPECT_TRUE(sorted && has01 && codes[256] == 0.0f && codes[0] < -0.99f);
+  const std::vector<ModuleShape> mods = {{"m.0", 96, 160, {}},
+                                         {"m.1", 200, 64, {}}};
+  const std::size_t S = 300;
+  auto run = [&](const std::string& opt, int stop_at,
+                 const std::string* load, const std::string* save,
+                 std::vector<float>* out, double* loss_end) {
+    LoraParams p;
+    std::string err;
+    if (!p.create(g.mc, mods, 8, 8.0f, &err)) { return false; }
+    p.init_random(3);
+    // B starts away from zero too, so both arenas move.
+    auto* b = static_cast<float*>(p.b_master().contents());
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (std::size_t i = 0; i < p.b_elems(); ++i) { b[i] = 0.05f * nd(rng); }
+    p.refresh_shadows_cpu();
+    const std::size_t na = p.a_elems(), nb = p.b_elems();
+    std::vector<float> ta(na), tb(nb);
+    for (std::size_t i = 0; i < na; ++i) {
+      ta[i] = 0.1f * nd(rng) * std::pow(10.0f, -(float)(i % 5));
+    }
+    for (std::size_t i = 0; i < nb; ++i) {
+      tb[i] = 0.1f * nd(rng) * std::pow(10.0f, -(float)(i % 5));
+    }
+    TrainOps ops;
+    if (!ops.init(g.mc, true, &err)) { return false; }
+    OptimizerSpec spec;
+    spec.optimizer = opt;
+    spec.lr = 5e-3;
+    spec.warmup_steps = 0;
+    spec.grad_clip = 0.0;
+    spec.weight_decay = 0.0;
+    Optimizer o;
+    if (!o.init(&ops, &p, spec, (int)S, &err)) { return false; }
+    if (load != nullptr && !o.load_state(*load, &err)) {
+      std::printf("  load: %s\n", err.c_str());
+      return false;
+    }
+    for (int t = o.steps_taken(); t < stop_at; ++t) {
+      const auto* a = static_cast<const float*>(p.a_master().contents());
+      const auto* bb = static_cast<const float*>(p.b_master().contents());
+      auto* ga = static_cast<float*>(p.a_grad().contents());
+      auto* gb = static_cast<float*>(p.b_grad().contents());
+      for (std::size_t i = 0; i < na; ++i) { ga[i] = a[i] - ta[i]; }
+      for (std::size_t i = 0; i < nb; ++i) { gb[i] = bb[i] - tb[i]; }
+      double gn = 0.0, lr = 0.0;
+      if (!o.step(1, &gn, &lr, &err)) { return false; }
+    }
+    if (save != nullptr && !o.save_state(*save, &err)) { return false; }
+    const auto* a = static_cast<const float*>(p.a_master().contents());
+    const auto* bb = static_cast<const float*>(p.b_master().contents());
+    out->assign(a, a + na);
+    out->insert(out->end(), bb, bb + nb);
+    double l = 0.0;
+    for (std::size_t i = 0; i < na; ++i) {
+      l += 0.5 * std::pow(a[i] - ta[i], 2);
+    }
+    for (std::size_t i = 0; i < nb; ++i) {
+      l += 0.5 * std::pow(bb[i] - tb[i], 2);
+    }
+    *loss_end = l;
+    return true;
+  };
+  std::vector<float> w32, w8, w8r, wh;
+  double l32 = 0.0, l8 = 0.0, l8r = 0.0, lh = 0.0, l0 = 0.0;
+  std::vector<float> w0;
+  ASSERT_TRUE(run("adamw", 0, nullptr, nullptr, &w0, &l0));
+  ASSERT_TRUE(run("adamw", (int)S, nullptr, nullptr, &w32, &l32));
+  ASSERT_TRUE(run("adamw8bit", (int)S, nullptr, nullptr, &w8, &l8));
+  const std::string st = (fs_tmp_() + "/vpipe-opt8-state.bin");
+  ASSERT_TRUE(run("adamw8bit", 150, nullptr, &st, &wh, &lh));
+  ASSERT_TRUE(run("adamw8bit", (int)S, &st, nullptr, &w8r, &l8r));
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < w32.size(); ++i) {
+    num += std::pow((double)w8[i] - w32[i], 2);
+    den += std::pow((double)w32[i] - w0[i], 2);
+  }
+  const double rel = std::sqrt(num / den);
+  std::size_t resumed_off = 0;
+  for (std::size_t i = 0; i < w8.size(); ++i) {
+    resumed_off += w8[i] != w8r[i];
+  }
+  // Mid-flight, where the two can differ: 30 steps.
+  std::vector<float> m32, m8;
+  double lm32 = 0.0, lm8 = 0.0;
+  ASSERT_TRUE(run("adamw", 30, nullptr, nullptr, &m32, &lm32));
+  ASSERT_TRUE(run("adamw8bit", 30, nullptr, nullptr, &m8, &lm8));
+  double mn = 0.0, md = 0.0;
+  std::size_t mdiff = 0;
+  for (std::size_t i = 0; i < m32.size(); ++i) {
+    mn += std::pow((double)m8[i] - m32[i], 2);
+    md += std::pow((double)m32[i] - w0[i], 2);
+    mdiff += m8[i] != m32[i];
+  }
+  const double mrel = std::sqrt(mn / md);
+  std::printf("[train_ops] loss %.6f -> adamw %.3e, adamw8bit %.3e at 300 "
+              "(%.4f apart, of the distance travelled); at 30 %.3e / %.3e, "
+              "%.4f apart, %zu of %zu weights differ; resumed at 150: %zu "
+              "differ\n", l0, l32, l8, rel, lm32, lm8, mrel, mdiff,
+              m32.size(), resumed_off);
+  EXPECT_TRUE(l8 < 1e-2 * l0 && l8 < 2.0 * l32 + 1e-6 * l0);
+  EXPECT_TRUE(rel < 0.05);
+  EXPECT_TRUE(mrel < 0.05 && mdiff > m32.size() / 2);
+  EXPECT_TRUE(resumed_off == 0);
+  std::remove(st.c_str());
+
+  // LoRA+.
+  {
+    LoraParams p;
+    std::string err;
+    ASSERT_TRUE(p.create(g.mc, {{"m.0", 16, 32, {}}}, 4, 4.0f, &err));
+    p.init_random(1);
+    TrainOps ops;
+    ASSERT_TRUE(ops.init(g.mc, true, &err));
+    OptimizerSpec spec;
+    spec.optimizer = "sgd";
+    spec.lr = 1e-2;
+    spec.beta1 = 0.0;
+    spec.warmup_steps = 0;
+    spec.grad_clip = 0.0;
+    spec.weight_decay = 0.0;
+    spec.lora_plus_ratio = 16.0;
+    Optimizer o;
+    ASSERT_TRUE(o.init(&ops, &p, spec, 10, &err));
+    const std::size_t na = p.a_elems(), nb = p.b_elems();
+    std::vector<float> a0(static_cast<const float*>(p.a_master().contents()),
+                          static_cast<const float*>(p.a_master().contents()) +
+                              na);
+    std::vector<float> b0(static_cast<const float*>(p.b_master().contents()),
+                          static_cast<const float*>(p.b_master().contents()) +
+                              nb);
+    auto* ga = static_cast<float*>(p.a_grad().contents());
+    auto* gb = static_cast<float*>(p.b_grad().contents());
+    for (std::size_t i = 0; i < na; ++i) { ga[i] = 1.0f; }
+    for (std::size_t i = 0; i < nb; ++i) { gb[i] = 1.0f; }
+    double gn = 0.0, lr = 0.0;
+    ASSERT_TRUE(o.step(1, &gn, &lr, &err));
+    const auto* a1 = static_cast<const float*>(p.a_master().contents());
+    const auto* b1 = static_cast<const float*>(p.b_master().contents());
+    const double da = a0[0] - a1[0], db = b0[0] - b1[0];
+    std::printf("[train_ops] LoRA+ 16: A stepped %.6g, B %.6g (%.4fx)\n", da,
+                db, db / da);
+    EXPECT_TRUE(std::fabs(db / da - 16.0) < 1e-4);
+  }
+}
+
+// ADAFACTOR, through the Optimizer, against a restatement in double of
+// transformers' Adafactor (relative_step / scale_parameter / first moment
+// off; decay -0.8, eps1 1e-30, clip 1) on each factor as a matrix -- A
+// [rank, k] per module, B [n, rank] per module, and a FUSED group whose
+// B rows interleave (two modules' b_rows alternating) as one [2n, rank]
+// matrix, as H3's q|k|v rows are held. Four steps of random gradients
+// with weight decay: every weight within 2e-5 of the restatement; the
+// state saved at 2 and resumed lands on the uninterrupted run to the
+// bit; LoRA+ scales B's step.
+TEST(train_ops, adafactor_matches_its_restatement)
+{
+  using namespace genai::train;
+  Gpu g;
+  if (!g.ok) { return; }
+  const int R = 4;
+  std::vector<ModuleShape> mods = {{"a.0", 24, 40, {}},
+                                   {"q", 6, 16, {0, 2, 4, 6, 8, 10}},
+                                   {"k", 6, 16, {-5, -3, -1, 1, 3, 5}}};
+  const int steps = 4;
+  auto grads = [&](std::size_t n, int step) {
+    std::mt19937 rng(100 + step);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> v(n);
+    for (float& x : v) { x = nd(rng) * (0.1f + (float)(x != 0)); }
+    return v;
+  };
+  struct Run {
+    std::vector<float> a, b;
+  };
+  auto gpu_run = [&](int upto, const std::string* load,
+                     const std::string* save, double ratio, Run* out) {
+    LoraParams p;
+    std::string err;
+    if (!p.create(g.mc, mods, R, 4.0f, &err)) {
+      std::printf("  %s\n", err.c_str());
+      return false;
+    }
+    p.init_random(9);
+    auto* b = static_cast<float*>(p.b_master().contents());
+    for (std::size_t i = 0; i < p.b_elems(); ++i) {
+      b[i] = 0.01f * (float)((i * 37) % 23) - 0.1f;
+    }
+    p.refresh_shadows_cpu();
+    TrainOps ops;
+    if (!ops.init(g.mc, true, &err)) { return false; }
+    OptimizerSpec spec;
+    spec.optimizer = "adafactor";
+    spec.lr = 1e-2;
+    spec.warmup_steps = 0;
+    spec.grad_clip = 0.0;
+    spec.weight_decay = 0.1;
+    spec.lora_plus_ratio = ratio;
+    Optimizer o;
+    if (!o.init(&ops, &p, spec, steps, &err)) {
+      std::printf("  %s\n", err.c_str());
+      return false;
+    }
+    if (load != nullptr && !o.load_state(*load, &err)) {
+      std::printf("  %s\n", err.c_str());
+      return false;
+    }
+    for (int t = o.steps_taken(); t < upto; ++t) {
+      const auto ga = grads(p.a_elems(), 2 * t);
+      const auto gb = grads(p.b_elems(), 2 * t + 1);
+      std::memcpy(p.a_grad().contents(), ga.data(), ga.size() * 4);
+      std::memcpy(p.b_grad().contents(), gb.data(), gb.size() * 4);
+      double gn = 0.0, lr = 0.0;
+      if (!o.step(1, &gn, &lr, &err)) {
+        std::printf("  %s\n", err.c_str());
+        return false;
+      }
+    }
+    if (save != nullptr && !o.save_state(*save, &err)) { return false; }
+    const auto* a = static_cast<const float*>(p.a_master().contents());
+    const auto* bb = static_cast<const float*>(p.b_master().contents());
+    out->a.assign(a, a + p.a_elems());
+    out->b.assign(bb, bb + p.b_elems());
+    return true;
+  };
+  Run gpu, start;
+  ASSERT_TRUE(gpu_run(0, nullptr, nullptr, 1.0, &start));
+  ASSERT_TRUE(gpu_run(steps, nullptr, nullptr, 1.0, &gpu));
+  // The restatement. Matrices: A per module; B module 0 alone (rows
+  // [0, 24)), then q and k's interleaved rows as one [12, R] matrix.
+  struct Mat { bool isa; std::size_t off; int rows, cols; };
+  std::vector<Mat> mats = {{true, 0, R, 40}, {true, (std::size_t)R * 40, R,
+                                               16},
+                           {true, (std::size_t)R * 56, R, 16},
+                           {false, 0, 24, R}, {false, (std::size_t)24 * R, 12,
+                                               R}};
+  std::vector<double> pa(start.a.begin(), start.a.end()),
+      pb(start.b.begin(), start.b.end());
+  std::vector<std::vector<double>> rs(mats.size()), cs(mats.size());
+  for (std::size_t j = 0; j < mats.size(); ++j) {
+    rs[j].assign((std::size_t)mats[j].rows, 0.0);
+    cs[j].assign((std::size_t)mats[j].cols, 0.0);
+  }
+  for (int t = 0; t < steps; ++t) {
+    const auto ga = grads(pa.size(), 2 * t);
+    const auto gb = grads(pb.size(), 2 * t + 1);
+    const double b2t = 1.0 - std::pow((double)(t + 1), -0.8);
+    for (std::size_t j = 0; j < mats.size(); ++j) {
+      const Mat& m = mats[j];
+      const auto& gg = m.isa ? ga : gb;
+      std::vector<double>& pp = m.isa ? pa : pb;
+      auto G = [&](int r, int c) {
+        return (double)gg[m.off + (std::size_t)r * m.cols + c];
+      };
+      for (int r = 0; r < m.rows; ++r) {
+        double s = 0.0;
+        for (int c = 0; c < m.cols; ++c) { s += G(r, c) * G(r, c) + 1e-30; }
+        rs[j][(std::size_t)r] = b2t * rs[j][(std::size_t)r] +
+                                (1.0 - b2t) * s / m.cols;
+      }
+      for (int c = 0; c < m.cols; ++c) {
+        double s = 0.0;
+        for (int r = 0; r < m.rows; ++r) { s += G(r, c) * G(r, c) + 1e-30; }
+        cs[j][(std::size_t)c] = b2t * cs[j][(std::size_t)c] +
+                                (1.0 - b2t) * s / m.rows;
+      }
+      double rm = 0.0;
+      for (double v : rs[j]) { rm += v; }
+      rm /= m.rows;
+      std::vector<double> u((std::size_t)m.rows * m.cols);
+      double usq = 0.0;
+      for (int r = 0; r < m.rows; ++r) {
+        for (int c = 0; c < m.cols; ++c) {
+          const double v = G(r, c) / std::sqrt(rs[j][(std::size_t)r] / rm) /
+                           std::sqrt(cs[j][(std::size_t)c]);
+          u[(std::size_t)r * m.cols + c] = v;
+          usq += v * v;
+        }
+      }
+      const double div = std::max(std::sqrt(usq / u.size()), 1.0);
+      for (std::size_t e = 0; e < u.size(); ++e) {
+        double& w = pp[m.off + e];
+        w -= 1e-2 * 0.1 * w;
+        w -= 1e-2 * u[e] / div;
+      }
+    }
+  }
+  double worst = 0.0, moved = 0.0;
+  for (std::size_t i = 0; i < pa.size(); ++i) {
+    worst = std::max(worst, std::fabs(pa[i] - gpu.a[i]));
+    moved = std::max(moved, std::fabs(pa[i] - start.a[i]));
+  }
+  for (std::size_t i = 0; i < pb.size(); ++i) {
+    worst = std::max(worst, std::fabs(pb[i] - gpu.b[i]));
+    moved = std::max(moved, std::fabs(pb[i] - start.b[i]));
+  }
+  // Resumed at 2.
+  const std::string st = fs_tmp_() + "/vpipe-adafactor-state.bin";
+  Run half, resumed;
+  ASSERT_TRUE(gpu_run(2, nullptr, &st, 1.0, &half));
+  ASSERT_TRUE(gpu_run(steps, &st, nullptr, 1.0, &resumed));
+  std::size_t off = 0;
+  for (std::size_t i = 0; i < gpu.a.size(); ++i) {
+    off += gpu.a[i] != resumed.a[i];
+  }
+  for (std::size_t i = 0; i < gpu.b.size(); ++i) {
+    off += gpu.b[i] != resumed.b[i];
+  }
+  std::remove(st.c_str());
+  // LoRA+ at 4: B moves further, A alike.
+  Run lp;
+  ASSERT_TRUE(gpu_run(1, nullptr, nullptr, 4.0, &lp));
+  Run one;
+  ASSERT_TRUE(gpu_run(1, nullptr, nullptr, 1.0, &one));
+  double da = 0.0, db1 = 0.0, db4 = 0.0;
+  for (std::size_t i = 0; i < one.a.size(); ++i) {
+    da = std::max(da, std::fabs((double)one.a[i] - lp.a[i]));
+  }
+  for (std::size_t i = 0; i < one.b.size(); ++i) {
+    db1 = std::max(db1, std::fabs((double)one.b[i] - start.b[i]));
+    db4 = std::max(db4, std::fabs((double)lp.b[i] - start.b[i]));
+  }
+  std::printf("[train_ops] adafactor: %d steps moved weights up to %.4g, "
+              "worst %.3g from the restatement; resumed at 2: %zu differ; "
+              "LoRA+ 4: B's largest step %.4g against %.4g, A's %.3g "
+              "apart\n", steps, moved, worst, off, db4, db1, da);
+  EXPECT_TRUE(moved > 1e-3 && worst < 2e-5);
+  EXPECT_TRUE(off == 0);
+  EXPECT_TRUE(da == 0.0 && db4 > 3.0 * db1);
+}
+
+// THE RESUME FILE IS VERSIONED, and a version-1 file (written before the
+// 8-bit and Adafactor states) still loads for every optimizer that has
+// no such state: a v2 AdamW file with its trailing section cut and its
+// version set back to 1 resumes the same weights; for adamw8bit it is
+// refused, with a reason, rather than read as zeros.
+TEST(train_ops, a_version_1_optimizer_state_still_loads)
+{
+  using namespace genai::train;
+  Gpu g;
+  if (!g.ok) { return; }
+  const std::string dir = fs_tmp_();
+  auto make = [&](const std::string& opt, LoraParams* p, TrainOps* ops,
+                  Optimizer* o, std::string* err) {
+    if (!p->create(g.mc, {{"m.0", 16, 32, {}}}, 4, 4.0f, err)) {
+      return false;
+    }
+    p->init_random(2);
+    if (!ops->init(g.mc, true, err)) { return false; }
+    OptimizerSpec spec;
+    spec.optimizer = opt;
+    spec.lr = 1e-2;
+    spec.warmup_steps = 0;
+    return o->init(ops, p, spec, 4, err);
+  };
+  std::string err;
+  LoraParams p;
+  TrainOps ops;
+  Optimizer o;
+  ASSERT_TRUE(make("adamw", &p, &ops, &o, &err));
+  auto* ga = static_cast<float*>(p.a_grad().contents());
+  for (std::size_t i = 0; i < p.a_elems(); ++i) { ga[i] = 0.5f; }
+  double gn = 0.0, lr = 0.0;
+  ASSERT_TRUE(o.step(1, &gn, &lr, &err));
+  const std::string v2 = dir + "/vpipe-opt-v2.bin";
+  ASSERT_TRUE(o.save_state(v2, &err));
+  // Back to version 1: the trailing section is 8 bytes a raw buffer, all
+  // empty for AdamW -- 8 of them.
+  std::vector<char> bytes;
+  {
+    std::ifstream in(v2, std::ios::binary);
+    bytes.assign(std::istreambuf_iterator<char>(in),
+                 std::istreambuf_iterator<char>());
+  }
+  ASSERT_TRUE(bytes.size() > 64);
+  bytes.resize(bytes.size() - 8 * 8);
+  const std::uint32_t one = 1;
+  std::memcpy(bytes.data() + 4, &one, 4);
+  const std::string v1 = dir + "/vpipe-opt-v1.bin";
+  {
+    std::ofstream out(v1, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), (std::streamsize)bytes.size());
+  }
+  LoraParams p2;
+  TrainOps ops2;
+  Optimizer o2;
+  ASSERT_TRUE(make("adamw", &p2, &ops2, &o2, &err));
+  const bool loaded = o2.load_state(v1, &err);
+  std::printf("[train_ops] a version-1 AdamW state: %s%s\n",
+              loaded ? "loaded" : "REFUSED: ", loaded ? "" : err.c_str());
+  EXPECT_TRUE(loaded && o2.steps_taken() == 1);
+  EXPECT_TRUE(loaded && std::memcmp(p.a_master().contents(),
+                                    p2.a_master().contents(),
+                                    p.a_elems() * 4) == 0);
+  LoraParams p3;
+  TrainOps ops3;
+  Optimizer o3;
+  ASSERT_TRUE(make("adamw8bit", &p3, &ops3, &o3, &err));
+  err.clear();
+  EXPECT_TRUE(!o3.load_state(v1, &err) && !err.empty());
+  std::printf("[train_ops] the same file for adamw8bit: %s\n", err.c_str());
+  std::remove(v1.c_str());
+  std::remove(v2.c_str());
 }

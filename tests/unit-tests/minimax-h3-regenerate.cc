@@ -2660,8 +2660,11 @@ TEST(minimax_h3_regenerate, an_in_context_refine_books_its_draft)
   }
   EXPECT_TRUE(rows_ok);
 
-  // video-ref-encoder's booking: one clip at its canvas cap (1344 x 768)
-  // over the generated frames, wherever a clip can arrive.
+  // video-ref-encoder's booking: at least the tower over one clip at its
+  // canvas cap (1344 x 768) over the generated frames, wherever a clip
+  // can arrive -- the reference encode's arena, which also holds the
+  // clip's VAE encode and its presentation's prefill; with nothing wired,
+  // the prompt's prefill alone.
   const std::string enc = MiniMaxH3TextEncoder::resolve_encoder_dir(h3root);
   MiniMaxH3TextEncoder::Config ec;
   ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr));
@@ -2672,8 +2675,9 @@ TEST(minimax_h3_regenerate, an_in_context_refine_books_its_draft)
     VideoRefEncoderStage v(&sess, "vre", edges, c);
     std::size_t bytes = 0;
     for (const ResourceClaim& rc : v.declare_resources()) {
-      if (rc.key.rfind("vision:vre|", 0) == 0) {
-        bytes = (std::size_t)std::stoull(rc.key.substr(11));
+      const std::string lab = "reference-encode:vre|";
+      if (rc.key.rfind(lab, 0) == 0) {
+        bytes = (std::size_t)std::stoull(rc.key.substr(lab.size()));
       }
     }
     return bytes;
@@ -2684,9 +2688,10 @@ TEST(minimax_h3_regenerate, an_in_context_refine_books_its_draft)
   const std::size_t none = vision_claim({});
   const std::size_t want = MetalQwenVisionEncoder::encode_video_scratch_bytes(
       ec.vision, presented(124), 768, 1344);
-  std::printf("  video-ref-encoder books %.1f MB for a clip (%.1f with no "
-              "reference wired)\n", claimed / 1048576.0, none / 1048576.0);
-  EXPECT_TRUE(claimed == want && claimed > 0 && none == 0);
+  std::printf("  video-ref-encoder books %.1f MB for a clip, the tower "
+              "%.1f of it (%.1f with no reference wired)\n",
+              claimed / 1048576.0, want / 1048576.0, none / 1048576.0);
+  EXPECT_TRUE(claimed >= want && want > 0 && none > 0 && none < claimed);
 
   // The tower over each draft's presentation.
   std::string verr;

@@ -520,6 +520,227 @@ kernel void train_adamw(
   train_write_shadow_(shadow, i, pi, o.mul);
 }
 
+// 8-BIT AdamW: the two moments held as one-byte codes, a block of 256 a
+// threadgroup, each block scaled by its own absmax (Dettmers et al.,
+// "8-bit Optimizers via Block-wise Quantization": the dynamic map, signed
+// for m and unsigned for v, `codes` [512] sorted ascending, built on the
+// host). A step DEQUANTIZES the block's moments, runs AdamW's update in
+// f32 exactly as train_adamw, then requantizes the new moments to the
+// nearest code at the block's new absmax. `amax` [2 * blocks]: m's, v's.
+inline uchar train_nearest_code_(threadgroup const float* c, float x)
+{
+  // The last code <= x, then the nearer of it and the next.
+  int lo = 0;
+  for (int step = 128; step > 0; step >>= 1) {
+    if (lo + step < 256 && c[lo + step] <= x) { lo += step; }
+  }
+  if (lo < 255 && fabs(c[lo + 1] - x) < fabs(x - c[lo])) { ++lo; }
+  return (uchar)lo;
+}
+
+kernel void train_adamw8(
+    device float*       p      [[buffer(0)]],
+    device float*       g      [[buffer(1)]],
+    device uchar*       qm     [[buffer(2)]],
+    device uchar*       qv     [[buffer(3)]],
+    device float*       amax   [[buffer(4)]],
+    device VPIPE_ELT*   shadow [[buffer(5)]],
+    constant TrainOptParams& o [[buffer(6)]],
+    constant float*     codes  [[buffer(7)]],
+    uint i  [[thread_position_in_grid]],
+    uint t  [[thread_index_in_threadgroup]],
+    uint b  [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint ln [[thread_index_in_simdgroup]])
+{
+  threadgroup float cs[256];
+  threadgroup float cu[256];
+  threadgroup float rm[8];
+  threadgroup float rv[8];
+  threadgroup float am_new[2];
+  cs[t] = codes[t];
+  cu[t] = codes[256 + t];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const bool live = i < (uint)o.n;
+  float mi = 0.0f, vi = 0.0f;
+  if (live) {
+    const float m0 = cs[qm[i]] * amax[2 * b];
+    const float v0 = cu[qv[i]] * amax[2 * b + 1];
+    const float gi = g[i] * o.grad_scale;
+    mi = o.beta1 * m0 + (1.0f - o.beta1) * gi;
+    vi = o.beta2 * v0 + (1.0f - o.beta2) * gi * gi;
+    float pi = p[i];
+    pi -= o.lr * o.weight_decay * pi;
+    pi -= o.lr * (mi / o.bc1) / (sqrt(vi / o.bc2) + o.eps);
+    p[i] = pi;
+    g[i] = 0.0f;
+    train_write_shadow_(shadow, i, pi, o.mul);
+  }
+  const float a = simd_max(fabs(mi));
+  const float c = simd_max(vi);
+  if (ln == 0) { rm[sg] = a; rv[sg] = c; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t == 0) {
+    float x = 0.0f, y = 0.0f;
+    for (int k = 0; k < 8; ++k) { x = max(x, rm[k]); y = max(y, rv[k]); }
+    am_new[0] = x;
+    am_new[1] = y;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float am1 = am_new[0], av1 = am_new[1];
+  if (live) {
+    qm[i] = train_nearest_code_(cs, am1 > 0.0f ? mi / am1 : 0.0f);
+    qv[i] = train_nearest_code_(cu, av1 > 0.0f ? vi / av1 : 0.0f);
+  }
+  if (t == 0) {
+    amax[2 * b] = am1;
+    amax[2 * b + 1] = av1;
+  }
+}
+
+// ADAFACTOR (Shazeer & Stern; transformers' Adafactor with
+// relative_step, scale_parameter and the first moment off): every factor
+// is a matrix [rows, cols] of the arena, its squared gradient's second
+// moment kept as a row vector and a column vector. A matrix table entry:
+// its element offset, rows, cols, its row and column states' offsets in
+// the state arena, and the rows and columns of the matrices before it
+// (rcum, ccum), which is how a thread finds its matrix by binary search.
+struct TrainAfMat {
+  uint off;
+  uint rows;
+  uint cols;
+  uint row_off;
+  uint col_off;
+  uint rcum;
+  uint ccum;
+};
+
+struct TrainAfParams {
+  float grad_scale;
+  float beta2t;       // 1 - t^decay_rate
+  float eps1;         // added to every squared gradient (1e-30)
+  float lr;
+  float weight_decay;
+  float clip;         // the update's RMS threshold (1)
+  float mul;          // the shadow's multiplier
+  int   nmat;
+  int   total;        // rows (or columns) of every matrix together
+};
+
+inline uint train_af_find_(device const TrainAfMat* m, int n, uint s,
+                           bool by_rows)
+{
+  int lo = 0, hi = n - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    const uint c = by_rows ? m[mid].rcum : m[mid].ccum;
+    if (c <= s) { lo = mid; } else { hi = mid - 1; }
+  }
+  return (uint)lo;
+}
+
+// One simdgroup a row (by_rows) or a column: the mean of (g s)^2 + eps1
+// over it, into the state by the EMA.
+kernel void train_adafactor_stats(
+    device const float*      g     [[buffer(0)]],
+    device float*            st    [[buffer(1)]],
+    device const TrainAfMat* mats  [[buffer(2)]],
+    constant TrainAfParams&  o     [[buffer(3)]],
+    constant int&            rows  [[buffer(4)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint ln [[thread_index_in_simdgroup]])
+{
+  const uint s = tg * 8 + sg;
+  if (s >= (uint)o.total) { return; }
+  const bool by_rows = rows != 0;
+  const uint j = train_af_find_(mats, o.nmat, s, by_rows);
+  const TrainAfMat m = mats[j];
+  const uint i = s - (by_rows ? m.rcum : m.ccum);
+  const uint count = by_rows ? m.cols : m.rows;
+  const uint base = m.off + (by_rows ? i * m.cols : i);
+  const uint step = by_rows ? 1u : m.cols;
+  float acc = 0.0f;
+  for (uint k = ln; k < count; k += 32) {
+    const float v = g[base + k * step] * o.grad_scale;
+    acc += v * v + o.eps1;
+  }
+  acc = simd_sum(acc);
+  if (ln == 0) {
+    const float mean = acc / (float)count;
+    device float& x = st[(by_rows ? m.row_off : m.col_off) + i];
+    x = o.beta2t * x + (1.0f - o.beta2t) * mean;
+  }
+}
+
+// The update U = g s * rsqrt(row / mean(rows)) * rsqrt(col), clipped to
+// RMS `clip` per matrix, applied: one threadgroup (256) a matrix. Pass 0
+// sums U^2 into usq[j]; pass 1 applies -lr wd p and -lr U / max(1,
+// RMS(U) / clip), zeroes the gradient and writes the shadow.
+kernel void train_adafactor_update(
+    device float*            p     [[buffer(0)]],
+    device float*            g     [[buffer(1)]],
+    device const float*      st    [[buffer(2)]],
+    device const TrainAfMat* mats  [[buffer(3)]],
+    device float*            usq   [[buffer(4)]],
+    device VPIPE_ELT*        shadow [[buffer(5)]],
+    constant TrainAfParams&  o     [[buffer(6)]],
+    constant int&            pass  [[buffer(7)]],
+    uint j  [[threadgroup_position_in_grid]],
+    uint t  [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint ln [[thread_index_in_simdgroup]])
+{
+  threadgroup float part[8];
+  const TrainAfMat m = mats[j];
+  const uint n = m.rows * m.cols;
+  // The row states' mean, in a fixed order (every thread folds the
+  // partials alike).
+  float rm = 0.0f;
+  {
+    float a = 0.0f;
+    for (uint r = t; r < m.rows; r += 256) { a += st[m.row_off + r]; }
+    a = simd_sum(a);
+    if (ln == 0) { part[sg] = a; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 0; k < 8; ++k) { rm += part[k]; }
+    rm /= (float)m.rows;
+  }
+  if (pass == 0) {
+    float acc = 0.0f;
+    for (uint e = t; e < n; e += 256) {
+      const uint r = e / m.cols, c = e - r * m.cols;
+      const float u = g[m.off + e] * o.grad_scale *
+                      rsqrt(st[m.row_off + r] / rm) * rsqrt(st[m.col_off + c]);
+      acc += u * u;
+    }
+    acc = simd_sum(acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ln == 0) { part[sg] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+      float x = 0.0f;
+      for (int k = 0; k < 8; ++k) { x += part[k]; }
+      usq[j] = x;
+    }
+    return;
+  }
+  const float rms = sqrt(usq[j] / (float)n);
+  const float div = max(rms / o.clip, 1.0f);
+  for (uint e = t; e < n; e += 256) {
+    const uint r = e / m.cols, c = e - r * m.cols;
+    const uint at = m.off + e;
+    const float u = g[at] * o.grad_scale *
+                    rsqrt(st[m.row_off + r] / rm) * rsqrt(st[m.col_off + c]);
+    float pi = p[at];
+    pi -= o.lr * o.weight_decay * pi;
+    pi -= o.lr * (u / div);
+    p[at] = pi;
+    g[at] = 0.0f;
+    train_write_shadow_(shadow, at, pi, o.mul);
+  }
+}
+
 // Lion: sign of an interpolated momentum, one state.
 kernel void train_lion(
     device float*     p      [[buffer(0)]],
@@ -661,4 +882,291 @@ kernel void train_shadow(
     uint i [[thread_position_in_grid]])
 {
   if (i < (uint)n) { train_write_shadow_(shadow, i, p[i], mul); }
+}
+
+// ==== MiniMax-H3's block, backward ========================================
+//
+// H3 modulates PER ROW: each row reads its six AdaLN vectors from a table
+// row picked by idx[r] (timestep x 3 + modality), the norms are RMS with a
+// frozen gamma, the gates are plain (no tanh), q / k rotate only their
+// first `rot` dims (rotate-half), and the fused q|k|v groups its output
+// either per head or flat. The kernels below are the backward of exactly
+// those ops; the ones above stay Qwen-Image-2.1's.
+
+// ---- RMSNorm (frozen w) then a per-row modulation, backward --------------
+//
+// Forward (rms_norm_fast_f16, then adaln_modulate_idx_f16):
+//   n = x * inv * w,  inv = rsqrt(E[x^2] + eps)
+//   y = (1 + mod[idx[r] * stride + scale_off + i]) * n + shift
+// Backward, per row, with g = dy * (1 + sc) * w and xh = x * inv:
+//   dx = inv * (g - xh * mean(g * xh))
+// ADDED into dx (f32), the residual gradient's running sum. has_mod 0 is
+// the plain norm (the token refiner's, its final norm). `dout` is the
+// storage type or f32 (dout_f32 != 0). One threadgroup of TRAIN_TG
+// threads per row; 64-bit row offsets.
+kernel void train_rms_mod_bwd(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    const device VPIPE_ELT* dout   [[buffer(1)]],
+    const device float*     dout32 [[buffer(2)]],
+    const device VPIPE_ELT* w      [[buffer(3)]],
+    const device VPIPE_ELT* mod    [[buffer(4)]],
+    const device int*       idx    [[buffer(5)]],
+    device float*           dx     [[buffer(6)]],
+    constant int&   H         [[buffer(7)]],
+    constant float& eps       [[buffer(8)]],
+    constant int&   dout_f32  [[buffer(9)]],
+    constant int&   stride    [[buffer(10)]],
+    constant int&   scale_off [[buffer(11)]],
+    constant int&   has_mod   [[buffer(12)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint3 ltid     [[thread_position_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]])
+{
+  const uint row = tid.y;
+  const uint lid = ltid.x;
+  const ulong ro = (ulong)row * (ulong)H;
+  const device VPIPE_ELT* xr = x + ro;
+  const device VPIPE_ELT* sc =
+      has_mod != 0 ? mod + (long)idx[row] * (long)stride + scale_off : mod;
+  threadgroup float p1[TRAIN_TG / 32];
+
+  float s2 = 0.0f;
+  for (int i = (int)lid; i < H; i += TRAIN_TG) {
+    const float v = (float)xr[i];
+    s2 += v * v;
+  }
+  s2 = simd_sum(s2);
+  if (simd_lid == 0) { p1[simd_gid] = s2; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < TRAIN_TG / 32) ? p1[simd_lid] : 0.0f;
+    a = simd_sum(a);
+    if (simd_lid == 0) { p1[0] = a; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(p1[0] / (float)H + eps);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float a2 = 0.0f;
+  for (int i = (int)lid; i < H; i += TRAIN_TG) {
+    const float d = dout_f32 != 0 ? dout32[ro + i] : (float)dout[ro + i];
+    const float m = has_mod != 0 ? 1.0f + (float)sc[i] : 1.0f;
+    const float g = d * m * (float)w[i];
+    a2 += g * ((float)xr[i] * inv);
+  }
+  a2 = simd_sum(a2);
+  if (simd_lid == 0) { p1[simd_gid] = a2; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    float a = (simd_lid < TRAIN_TG / 32) ? p1[simd_lid] : 0.0f;
+    a = simd_sum(a);
+    if (simd_lid == 0) { p1[0] = a; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float mgx = p1[0] / (float)H;
+  device float* dxr = dx + ro;
+  for (int i = (int)lid; i < H; i += TRAIN_TG) {
+    const float d = dout_f32 != 0 ? dout32[ro + i] : (float)dout[ro + i];
+    const float m = has_mod != 0 ? 1.0f + (float)sc[i] : 1.0f;
+    const float g = d * m * (float)w[i];
+    const float xh = (float)xr[i] * inv;
+    dxr[i] += inv * (g - xh * mgx);
+  }
+}
+
+// ---- gated residual h += gate[idx[m]] * sub, backward ---------------------
+//
+// d(sub) = mod[idx[m] * stride + gate_off + n] * dh (f32 in, the storage
+// type out), for the GEMM that consumes it; has_gate 0 is the plain
+// residual (the refiner's): d(sub) = dh. The residual gradient passes
+// through untouched. Grid (N, rows).
+kernel void train_gated_idx_bwd(
+    const device float*     dh   [[buffer(0)]],
+    const device VPIPE_ELT* mod  [[buffer(1)]],
+    const device int*       idx  [[buffer(2)]],
+    device VPIPE_ELT*       dsub [[buffer(3)]],
+    constant int& N        [[buffer(4)]],
+    constant int& M        [[buffer(5)]],
+    constant int& stride   [[buffer(6)]],
+    constant int& gate_off [[buffer(7)]],
+    constant int& has_gate [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= (uint)N || gid.y >= (uint)M) { return; }
+  const ulong o = (ulong)gid.y * (ulong)N + gid.x;
+  const float g = has_gate != 0
+                      ? float(mod[(long)idx[gid.y] * (long)stride +
+                                  gate_off + gid.x])
+                      : 1.0f;
+  dsub[o] = VPIPE_ELT(g * dh[o]);
+}
+
+// ---- SwiGLU off a fused [gate | up] projection, backward ------------------
+//
+// Forward (swiglu_split_gate_first_f16): s = up * silu(gate), the gate the
+// FIRST half of each [rows, 2W] row. Backward:
+//   d(up) = ds * silu(g),  d(gate) = ds * up * sig(g) * (1 + g (1 - sig(g)))
+// into the same [gate | up] row layout. Grid n = rows * W threads.
+kernel void train_swiglu_gf_bwd(
+    const device VPIPE_ELT* gu  [[buffer(0)]],
+    const device VPIPE_ELT* ds  [[buffer(1)]],
+    device VPIPE_ELT*       dgu [[buffer(2)]],
+    constant int& rows [[buffer(3)]],
+    constant int& W    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if ((ulong)gid >= (ulong)rows * (ulong)W) { return; }
+  const uint r = gid / (uint)W;
+  const uint d = gid % (uint)W;
+  const ulong base = (ulong)r * (ulong)(2 * W);
+  const float g = float(gu[base + d]);
+  const float u = float(gu[base + W + d]);
+  const float dv = float(ds[gid]);
+  const float sg = 1.0f / (1.0f + exp(-g));
+  const float silu = g / (1.0f + exp(-g));
+  dgu[base + W + d] = VPIPE_ELT(dv * silu);
+  dgu[base + d] = VPIPE_ELT(dv * u * sg * (1.0f + g * (1.0f - sg)));
+}
+
+// ---- partial rotate-half RoPE + [H,T,D] -> strided rows, backward ---------
+//
+// The forward (transpose_rope_half_part_ftab_f16) rotates the first `rot`
+// dims of token t's head h -- pairs (i, i + rot/2), angle table [T, rot/2]
+// -- passes the rest through, and writes head-major. The backward rotates
+// by -theta and writes back where the head came FROM in the fused
+// projection: token t's row at t * ld + off + h * hs. `in` is head-major
+// [H][T][D], the storage type or f32 (in_f32 != 0: dK and dV, which
+// accumulate in f32). rot 0 is a pure strided copy (dV). Grid (D, T, H).
+kernel void train_rope_half_bwd(
+    const device VPIPE_ELT* in   [[buffer(0)]],
+    const device float*     in32 [[buffer(1)]],
+    device VPIPE_ELT*       out  [[buffer(2)]],
+    const device float*     cosb [[buffer(3)]],
+    const device float*     sinb [[buffer(4)]],
+    constant int& H      [[buffer(5)]],
+    constant int& T      [[buffer(6)]],
+    constant int& D      [[buffer(7)]],
+    constant int& rot    [[buffer(8)]],
+    constant int& ld     [[buffer(9)]],
+    constant int& off    [[buffer(10)]],
+    constant int& hs     [[buffer(11)]],
+    constant int& in_f32 [[buffer(12)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  if (d >= D) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  if (h >= H || t >= T) { return; }
+  const ulong ib = ((ulong)h * (ulong)T + (ulong)t) * (ulong)D;
+  const ulong ob = (ulong)t * (ulong)ld + (ulong)off + (ulong)h * (ulong)hs;
+  if (d >= rot) {
+    const float v = in_f32 != 0 ? in32[ib + d] : float(in[ib + d]);
+    out[ob + d] = VPIPE_ELT(v);
+    return;
+  }
+  const int half_r = rot / 2;
+  const int i = d < half_r ? d : d - half_r;
+  const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const float y1 = in_f32 != 0 ? in32[ib + i] : float(in[ib + i]);
+  const float y2 = in_f32 != 0 ? in32[ib + i + half_r]
+                               : float(in[ib + i + half_r]);
+  out[ob + d] =
+      VPIPE_ELT(d < half_r ? (y1 * c + y2 * s) : (y2 * c - y1 * s));
+}
+
+// ---- per-head RMSNorm (frozen w) on a strided projection, backward --------
+//
+// Forward (rms_norm_heads_strided_f16, in place on the fused q|k|v): head
+// h of token t, D values at t * ld + off + h * hs, y = x * inv * w.
+// Backward IN PLACE on `dq` -- the gradient sits where the head lies and
+// is replaced by the input's -- with the forward's input `x` read at the
+// same place of its own buffer. Each lane reads and writes only its own
+// elements, so in place is safe. One simdgroup per (t, h); grid (32,
+// T * H) in groups of (32, 8).
+kernel void train_rms_heads_bwd(
+    const device VPIPE_ELT* x  [[buffer(0)]],
+    device VPIPE_ELT*       dq [[buffer(1)]],
+    const device VPIPE_ELT* w  [[buffer(2)]],
+    constant int&   T   [[buffer(3)]],
+    constant int&   H   [[buffer(4)]],
+    constant int&   D   [[buffer(5)]],
+    constant int&   ld  [[buffer(6)]],
+    constant int&   off [[buffer(7)]],
+    constant int&   hs  [[buffer(8)]],
+    constant float& eps [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  const uint row = gid.y;
+  if (row >= (uint)(T * H)) { return; }
+  const uint t = row / (uint)H;
+  const uint h = row % (uint)H;
+  const ulong b = (ulong)t * (ulong)ld + (ulong)off + (ulong)h * (ulong)hs;
+  const device VPIPE_ELT* xr = x + b;
+  device VPIPE_ELT* dr = dq + b;
+  float ss = 0.0f;
+  for (int i = (int)simd_lid; i < D; i += 32) {
+    const float v = float(xr[i]);
+    ss += v * v;
+  }
+  ss = simd_sum(ss);
+  const float inv = rsqrt(ss / float(D) + eps);
+  float dot = 0.0f;
+  for (int i = (int)simd_lid; i < D; i += 32) {
+    dot += float(dr[i]) * float(w[i]) * float(xr[i]) * inv;
+  }
+  dot = simd_sum(dot) / float(D);
+  for (int i = (int)simd_lid; i < D; i += 32) {
+    const float xh = float(xr[i]) * inv;
+    dr[i] = VPIPE_ELT(inv * (float(dr[i]) * float(w[i]) - xh * dot));
+  }
+}
+
+// ---- a BANDED adapter B (lora::Factors::banded) as block-diagonal ---------
+//
+// B [n, r] of a fused projection whose output row j belongs to part
+// (j / group) % parts and contracts only over that part's r columns of
+// t = x A^T ([M, parts * r]). The backward's GEMMs want the plain
+// [n, parts * r] block-diagonal form; this writes it, zeros off the band.
+// Grid (parts * r, n).
+kernel void train_band_expand(
+    const device VPIPE_ELT* b   [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int& n     [[buffer(2)]],
+    constant int& r     [[buffer(3)]],
+    constant int& parts [[buffer(4)]],
+    constant int& group [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x;
+  const int j = (int)gid.y;
+  if (c >= parts * r || j >= n) { return; }
+  const int p = (j / group) % parts;
+  const int pc = c / r;
+  out[(ulong)j * (ulong)(parts * r) + c] =
+      pc == p ? b[(ulong)j * (ulong)r + (c - pc * r)] : VPIPE_ELT(0.0f);
+}
+
+// ...and the gradient back: dst [n, r] (f32) += src [n, parts * r] on
+// row j's own band. Grid (r, n).
+kernel void train_band_extract_acc(
+    const device float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant int&   n     [[buffer(2)]],
+    constant int&   r     [[buffer(3)]],
+    constant int&   parts [[buffer(4)]],
+    constant int&   group [[buffer(5)]],
+    constant float& alpha [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x;
+  const int j = (int)gid.y;
+  if (c >= r || j >= n) { return; }
+  const int p = (j / group) % parts;
+  dst[(ulong)j * (ulong)r + c] +=
+      alpha * src[(ulong)j * (ulong)(parts * r) + p * r + c];
 }

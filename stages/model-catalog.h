@@ -21,6 +21,7 @@ class FlexData;
 namespace catalog_extra {
 inline constexpr std::string_view kUrlFiles = "url_files";
 inline constexpr std::string_view kLocalSubdir = "local_subdir";
+inline constexpr std::string_view kVariantAliases = "variant_aliases";
 }  // namespace catalog_extra
 
 // One downloadable model in the internal HuggingFace catalogue.
@@ -143,6 +144,15 @@ struct ModelCatalogEntry {
   //              they share (FlashVSR+'s turbo/ and base/ around one VAE),
   //              where the folder is the model and a consumer handed the
   //              repository root could not tell which one was meant.
+  //   variant_aliases  [string, ...] -- handles a `model_variant` names
+  //              this entry by, matched EXACTLY (case aside) and never as
+  //              a substring; see catalog_pick_variant. For an entry whose
+  //              usual handle no field equals -- "fl2va" for MiniMax-H3's
+  //              FL2VA partition, whose version is "H3-FL2VA" -- so that a
+  //              sibling in the same repo whose fields merely CONTAIN the
+  //              handle (a pruned FL2VA DiT) does not make it ambiguous. A
+  //              host that predates the key matches the entry by
+  //              substring, as before.
   FlexData extra;
 
   std::string name;         // registration key + extract subdir (when several
@@ -231,10 +241,12 @@ catalog_all_by_path(const std::string& hf_path);
 // downloads the wrong model and registers it under the right name:
 //
 //   * `variant` is matched case-insensitively against each candidate's
-//     version, variant, name and model_type;
+//     version, variant, name and model_type, and -- exactly only -- its
+//     `variant_aliases` (catalog_extra::kVariantAliases);
 //   * an EXACT hit on any of those beats a substring hit on any of them,
-//     so "fl2va" takes the FL2VA entry even where another entry's
-//     description happens to contain the word;
+//     so "fl2va" takes the FL2VA partition (its alias) even where another
+//     entry's version or name happens to contain the word -- as the
+//     pruned FL2VA DiTs published from the same repo do;
 //   * the answer must be exactly ONE entry. Zero and two are both
 //     nullptr -- ambiguity is refused, never resolved by order;
 //   * an empty `variant` selects only when there is a single candidate.

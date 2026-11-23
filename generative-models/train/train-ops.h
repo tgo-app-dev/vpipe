@@ -159,6 +159,67 @@ class TrainOps {
                     const metal_compute::SharedBuffer& out, std::size_t oe,
                     int H, int T, int D, int ld) const;
 
+  // ---- MiniMax-H3's block (per-row modulation, plain gates) ------------
+  //
+  // dx (f32) += the backward of y = (1 + mod[idx[r] * stride + scale_off])
+  // * rms(x) * w over `rows` rows of H, w the frozen gamma; `dout` the
+  // storage type or f32. `mod` / `idx` bound at ELEMENT offsets me / ie;
+  // has_mod false is the plain RMSNorm (mod, idx unread).
+  void rms_mod_bwd(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xe,
+                   const metal_compute::SharedBuffer& dout, std::size_t de,
+                   bool dout_f32, const metal_compute::SharedBuffer& w,
+                   const metal_compute::SharedBuffer& mod, std::size_t me,
+                   const metal_compute::SharedBuffer& idx, std::size_t ie,
+                   const metal_compute::SharedBuffer& dx, std::size_t dxe,
+                   int rows, int H, float eps, int stride, int scale_off,
+                   bool has_mod) const;
+  // dsub = mod[idx[m] * stride + gate_off] * dh (f32 in, storage type
+  // out); has_gate false: dsub = dh (a plain residual).
+  void gated_idx_bwd(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& dh, std::size_t he,
+                     const metal_compute::SharedBuffer& mod, std::size_t me,
+                     const metal_compute::SharedBuffer& idx, std::size_t ie,
+                     const metal_compute::SharedBuffer& dsub, std::size_t se,
+                     int rows, int N, int stride, int gate_off,
+                     bool has_gate) const;
+  // SwiGLU off a fused [gate | up] [rows, 2W]: ds [rows, W] -> dgu in the
+  // same [gate | up] layout.
+  void swiglu_gf_bwd(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& gu,
+                     const metal_compute::SharedBuffer& ds,
+                     const metal_compute::SharedBuffer& dgu, int rows,
+                     int W) const;
+  // Partial rotate-half RoPE backward: head-major [H][T][D] in (storage
+  // type, or f32 when in_f32) -> token t's head h at t * ld + off + h * hs
+  // (+ oe) of `out`, its first `rot` dims rotated by -theta. Tables
+  // [T, rot / 2] f32. rot 0: a strided copy.
+  void rope_half_bwd(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& in, bool in_f32,
+                     const metal_compute::SharedBuffer& out, std::size_t oe,
+                     const metal_compute::SharedBuffer& cosb,
+                     const metal_compute::SharedBuffer& sinb, int H, int T,
+                     int D, int rot, int ld, int off, int hs) const;
+  // Per-head RMSNorm backward IN PLACE on `dq`, heads at t * ld + off +
+  // h * hs in both `x` (the norm's input) and `dq`.
+  void rms_heads_bwd(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& x,
+                     const metal_compute::SharedBuffer& dq,
+                     const metal_compute::SharedBuffer& w, int T, int H,
+                     int D, int ld, int off, int hs, float eps) const;
+  // A banded B [n, r] (lora::Factors::banded) as the block-diagonal
+  // [n, parts * r] its GEMMs read; and a block-diagonal gradient back onto
+  // the band: dst [n, r] (f32, from element de) += alpha * src's band.
+  void band_expand(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& b, std::size_t be,
+                   const metal_compute::SharedBuffer& out, int n, int r,
+                   int parts, int group) const;
+  void band_extract_acc(metal_compute::ComputeEncoder& enc,
+                        const metal_compute::SharedBuffer& src,
+                        const metal_compute::SharedBuffer& dst,
+                        std::size_t de, int n, int r, int parts, int group,
+                        float alpha) const;
+
   // ---- attention backward ----------------------------------------------
   //
   // Everything head-major [H][T][D] over the whole joint sequence of T
@@ -268,6 +329,55 @@ class TrainOps {
              const metal_compute::SharedBuffer& v,
              const metal_compute::SharedBuffer& shadow,
              const OptParams& o) const;
+  // 8-bit AdamW over one arena: `qm`, `qv` its moments' codes (o.n
+  // bytes each), `amax` [2 * kOpt8Block-blocks] f32, `codes` the 512
+  // sorted code values (adamw8_codes()). Whole blocks of kOpt8Block.
+  static constexpr int kOpt8Block = 256;
+  void adamw8(metal_compute::ComputeEncoder& enc,
+              const metal_compute::SharedBuffer& p,
+              const metal_compute::SharedBuffer& g,
+              const metal_compute::SharedBuffer& qm,
+              const metal_compute::SharedBuffer& qv,
+              const metal_compute::SharedBuffer& amax,
+              const metal_compute::SharedBuffer& shadow,
+              const metal_compute::SharedBuffer& codes,
+              const OptParams& o) const;
+  // ADAFACTOR over one arena. A matrix table entry (AfMat) and the pass
+  // parameters (AfParams) mirror train_ops.metal's; `stats` runs the row
+  // or column second moments (one simdgroup each, `total` of them),
+  // `update` pass 0 the update's per-matrix sum of squares into `usq`,
+  // pass 1 the step (one threadgroup a matrix).
+  struct AfMat {
+    std::uint32_t off = 0, rows = 0, cols = 0, row_off = 0, col_off = 0,
+                  rcum = 0, ccum = 0;
+  };
+  struct AfParams {
+    float grad_scale = 1.0f;
+    float beta2t = 0.0f;
+    float eps1 = 1e-30f;
+    float lr = 0.0f;
+    float weight_decay = 0.0f;
+    float clip = 1.0f;
+    float mul = 1.0f;
+    std::int32_t nmat = 0;
+    std::int32_t total = 0;
+  };
+  void adafactor_stats(metal_compute::ComputeEncoder& enc,
+                       const metal_compute::SharedBuffer& g,
+                       const metal_compute::SharedBuffer& state,
+                       const metal_compute::SharedBuffer& mats,
+                       const AfParams& o, bool rows) const;
+  void adafactor_update(metal_compute::ComputeEncoder& enc,
+                        const metal_compute::SharedBuffer& p,
+                        const metal_compute::SharedBuffer& g,
+                        const metal_compute::SharedBuffer& state,
+                        const metal_compute::SharedBuffer& mats,
+                        const metal_compute::SharedBuffer& usq,
+                        const metal_compute::SharedBuffer& shadow,
+                        const AfParams& o, int pass) const;
+  // The dynamic map's 256 signed codes then its 256 unsigned ones, each
+  // ascending (Dettmers et al.; 7 decades, more codes for larger values).
+  static std::vector<float> adamw8_codes();
   void lion(metal_compute::ComputeEncoder& enc,
             const metal_compute::SharedBuffer& p,
             const metal_compute::SharedBuffer& g,
@@ -313,10 +423,13 @@ class TrainOps {
       _lib_gemm_mma;
   metal_compute::ComputeFunction _transpose, _ln_mod_bwd, _gated_bwd,
       _swiglu_bwd, _rms_bwd, _rope_bwd, _hd_to_td, _rowdot, _lse,
-      _flow_loss, _fill, _sqnorm, _abs, _adamw, _lion, _sgd, _prod_acc,
+      _flow_loss, _fill, _sqnorm, _abs, _adamw, _adamw8, _af_stats,
+      _af_update, _lion, _sgd, _prod_acc,
       _prod_step, _ema, _shadow, _tn_32x64, _tn_64x32, _nn_64x32,
       _nn_64x64, _nt_64x64, _dq, _dkv, _pds, _nn_f32_64x64, _tn_64x64,
-      _mma_nn_f32, _mma_tn, _pds_mma;
+      _mma_nn_f32, _mma_tn, _pds_mma, _rms_mod_bwd, _gated_idx_bwd,
+      _swiglu_gf_bwd, _rope_half_bwd, _rms_heads_bwd, _band_expand,
+      _band_extract;
   bool _attn_gemm = true;
   bool _attn_mma = true;
   std::size_t _attn_budget = 0;

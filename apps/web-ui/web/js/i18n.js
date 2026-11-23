@@ -2325,6 +2325,59 @@ const STRINGS = {
   'port.training-dataset.manifest': ['',
       '一个节拍，描述每个样本以及另外两路流的顺序，给 train-lora',
       '一個節拍，描述每個樣本以及另外兩路流的順序，給 train-lora'],
+  'port.training-dataset.audio': ['',
+      '可选：每个剪辑窗口的音轨，audio_sample_rate 下的 f32 平面 [2, N]，给 '
+      + 'audio-vae-encode（每个有音轨的窗口一个，按清单顺序）',
+      '可選：每個剪輯視窗的音軌，audio_sample_rate 下的 f32 平面 [2, N]，給 '
+      + 'audio-vae-encode（每個有音軌的視窗一個，按清單順序）'],
+  'port.training-dataset.keyframes': ['',
+      '可选，给 diffusion-conditioner 的 ref_images：每个标注节拍一个图片'
+      + '列表，与标注端口同步——普通标注为空，与关键帧一起呈现的标注为该'
+      + '关键帧窗口的帧',
+      '可選，給 diffusion-conditioner 的 ref_images：每個標註節拍一個圖片'
+      + '列表，與標註連接埠同步——普通標註為空，與關鍵影格一起呈現的標註為'
+      + '該關鍵影格視窗的影格'],
+  'cfg.training-dataset.media': ['',
+      '文件夹里的内容：auto（图片，以及作为剪辑的 .mp4 .mov .mkv .webm '
+      + '.avi .m4v 文件）、pictures 或 clips。剪辑会按 `frames` 档位切成窗'
+      + '口，供视频模型（MiniMax-H3）使用',
+      '資料夾裡的內容：auto（圖片，以及作為剪輯的 .mp4 .mov .mkv .webm '
+      + '.avi .m4v 檔案）、pictures 或 clips。剪輯會按 `frames` 檔位切成視'
+      + '窗，供視訊模型（MiniMax-H3）使用'],
+  'cfg.training-dataset.fps': ['',
+      '剪辑在切分前转换到的帧率，帧按 ffmpeg 的 fps 滤镜方式整帧保留或丢弃'
+      + '（默认 24，MiniMax-H3 的）',
+      '剪輯在切分前轉換到的影格率，影格按 ffmpeg 的 fps 濾鏡方式整格保留或'
+      + '捨棄（預設 24，MiniMax-H3 的）'],
+  'cfg.training-dataset.frames': ['',
+      '剪辑窗口的帧数，或其列表：每个剪辑取它能填满的最长一档（默认 39）。'
+      + 'MiniMax-H3 取 17n + 5（22、39、56、73……）；其预览从 39 解码',
+      '剪輯視窗的影格數，或其列表：每個剪輯取它能填滿的最長一檔（預設 39）'
+      + '。MiniMax-H3 取 17n + 5（22、39、56、73……）；其預覽從 39 解碼'],
+  'cfg.training-dataset.windows': ['',
+      '一个剪辑产生的窗口数，在其上均匀分布（默认 1，即开头）；每一步训练'
+      + '一个剪辑的一个窗口',
+      '一個剪輯產生的視窗數，在其上均勻分布（預設 1，即開頭）；每一步訓練'
+      + '一個剪輯的一個視窗'],
+  'cfg.training-dataset.audio': ['',
+      '剪辑窗口的音轨：track（剪辑音频中属于它的那一段，经端口 3 给 '
+      + 'audio-vae-encode）或 none。没有音频流的剪辑无论如何都不带音轨训练',
+      '剪輯視窗的音軌：track（剪輯音訊中屬於它的那一段，經連接埠 3 給 '
+      + 'audio-vae-encode）或 none。沒有音訊串流的剪輯無論如何都不帶音軌訓練'],
+  'cfg.training-dataset.task_mix': ['',
+      '剪辑的关键帧任务及其权重：{t2va、i2va（锚定首帧）、l2va（末帧）、'
+      + 'fl2va（两者）}，例如 {"t2va": 0.5, "i2va": 0.3, "fl2va": 0.2}；每个'
+      + '窗口按种子抽取一个（默认 {"t2va": 1}）。锚点是窗口自己的帧，按静帧'
+      + '编码；关键帧端口接到条件器的 ref_images 时，其标注会与这些帧一起再'
+      + '编码一次',
+      '剪輯的關鍵影格任務及其權重：{t2va、i2va（錨定首格）、l2va（末格）、'
+      + 'fl2va（兩者）}，例如 {"t2va": 0.5, "i2va": 0.3, "fl2va": 0.2}；每個'
+      + '視窗按種子抽取一個（預設 {"t2va": 1}）。錨點是視窗自己的影格，按靜'
+      + '格編碼；關鍵影格連接埠接到條件器的 ref_images 時，其標註會與這些影'
+      + '格一起再編碼一次'],
+  'cfg.training-dataset.audio_sample_rate': ['',
+      '音轨重采样到的采样率（默认 32000，MiniMax-H3 音频 VAE 的）',
+      '音軌重新取樣到的取樣率（預設 32000，MiniMax-H3 音訊 VAE 的）'],
 
   'stage.optimizer-select.name': ['', '优化器', '最佳化器'],
   'stage.optimizer-select.doc': ['',
@@ -2333,9 +2386,13 @@ const STRINGS = {
       '選擇 train-lora 使用的最佳化器與學習率排程，作為一個 FlexData 節拍發出。'
       + '與 training-dataset 和 train-lora 配套。0 入 / 1 出（只發一次）。'],
   'cfg.optimizer-select.optimizer': ['',
-      'adamw（默认）、prodigy（自行估计步长——learning_rate 设为 1.0；对小'
+      'adamw（默认）、adamw8bit（AdamW，其矩以 8 位分块量化码保存：状态'
+      + '为四分之一）、adafactor（transformers 的 Adafactor，手动学习率：二阶'
+      + '矩分解保存，几乎没有状态；不用 beta1）、prodigy（自行估计步长——learning_rate 设为 1.0；对小'
       + '数据集较宽容）、lion 或 sgd',
-      'adamw（預設）、prodigy（自行估計步長——learning_rate 設為 1.0；對小'
+      'adamw（預設）、adamw8bit（AdamW，其矩以 8 位元分塊量化碼保存：狀態'
+      + '為四分之一）、adafactor（transformers 的 Adafactor，手動學習率：二階'
+      + '矩分解保存，幾乎沒有狀態；不用 beta1）、prodigy（自行估計步長——learning_rate 設為 1.0；對小'
       + '資料集較寬容）、lion 或 sgd'],
   'cfg.optimizer-select.learning_rate': ['',
       '0（默认）取优化器自己的默认值：adamw 1e-4、prodigy 1.0、lion 3e-5、'
@@ -2380,6 +2437,11 @@ const STRINGS = {
   'cfg.optimizer-select.bias_correction': ['',
       'prodigy：Adam 的偏差校正（默认关闭，与 prodigyopt 相同）',
       'prodigy：Adam 的偏差校正（預設關閉，與 prodigyopt 相同）'],
+  'cfg.optimizer-select.loraplus_lr_ratio': ['',
+      'LoRA+：B 因子的学习速度是 A 因子的多少倍（1，默认：关闭；LoRA+ 论文'
+      + '建议 16）',
+      'LoRA+：B 因子的學習速度是 A 因子的多少倍（1，預設：關閉；LoRA+ 論文'
+      + '建議 16）'],
   'port.optimizer-select.optimizer': ['',
       '优化器配置 {kind: optimizer, optimizer, learning_rate, ...}',
       '最佳化器組態 {kind: optimizer, optimizer, learning_rate, ...}'],
@@ -2388,12 +2450,14 @@ const STRINGS = {
   'stage.train-lora.doc': ['',
       '在扩散模型上训练 LoRA 适配器，数据来自由模型自身的条件编码器与 VAE 编码'
       + '的 training-dataset。缓存编码后的数据集，等编码器用完后再载入模型，按 '
-      + 'optimizer-select 的配置训练，并保存检查点（附预览），generate-image 的'
-      + '适配器选择器会列出它们。目前支持 Qwen-Image-2.1。',
+      + 'optimizer-select 的配置训练，并保存检查点（附预览），generate-image 与 '
+      + 'generate-video 的适配器选择器会列出它们。支持 Qwen-Image-2.1，以及 '
+      + 'MiniMax-H3（FL2VA 或 Ref2VA）的图片训练（每张图片为一帧的片段）。',
       '在擴散模型上訓練 LoRA 適配器，資料來自由模型自身的條件編碼器與 VAE 編碼'
       + '的 training-dataset。快取編碼後的資料集，等編碼器用完後再載入模型，按 '
-      + 'optimizer-select 的組態訓練，並儲存檢查點（附預覽），generate-image 的'
-      + '適配器選擇器會列出它們。目前支援 Qwen-Image-2.1。'],
+      + 'optimizer-select 的組態訓練，並儲存檢查點（附預覽），generate-image 與 '
+      + 'generate-video 的適配器選擇器會列出它們。支援 Qwen-Image-2.1，以及 '
+      + 'MiniMax-H3（FL2VA 或 Ref2VA）的圖片訓練（每張圖片為一幀的片段）。'],
   'cfg.train-lora.hf_dir': ['',
       '要训练的模型：注册键或检查点根目录（model 端口上的 model-select 节拍'
       + '会覆盖它）',
@@ -2488,6 +2552,43 @@ const STRINGS = {
       + '1e-2）',
       'M5 及更新：前向與反向使用 int8 矩陣核心 GEMM（有損，每個 GEMM 約 '
       + '1e-2）'],
+  'cfg.train-lora.dit_dir': ['',
+      '实际运行的 DiT，当 hf_dir 的管线指明了一个它不自带的 DiT 时使用'
+      + '（P-H3-Image：MiniMax-H3 FL2VA 的）；注册表键或目录',
+      '實際執行的 DiT，當 hf_dir 的管線指明了一個它不自帶的 DiT 時使用'
+      + '（P-H3-Image：MiniMax-H3 FL2VA 的）；登錄表鍵或目錄'],
+  'cfg.train-lora.base_lora': ['',
+      'MiniMax-H3：位于所训练适配器之下的冻结适配器——一个路径或一个列表'
+      + '（P-H3-Image 的 PrunaAI 适配器，或要叠加其上的风格）；记入适配器的'
+      + '元数据，作为推理时必须叠在其下的内容',
+      'MiniMax-H3：位於所訓練轉接器之下的凍結轉接器——一個路徑或一個列表'
+      + '（P-H3-Image 的 PrunaAI 轉接器，或要疊加其上的風格）；記入轉接器的'
+      + '中繼資料，作為推論時必須疊在其下的內容'],
+  'cfg.train-lora.audio_loss_weight': ['',
+      '音视频模型（MiniMax-H3）：音轨损失相对于视频损失的权重，各取自身的'
+      + '均值（默认 1）。没有音轨的剪辑无论如何都不计这一项',
+      '音視訊模型（MiniMax-H3）：音軌損失相對於視訊損失的權重，各取自身的'
+      + '均值（預設 1）。沒有音軌的剪輯無論如何都不計這一項'],
+  'port.train-lora.audio_latents': ['',
+      '可选：audio-vae-encode 对清单所列每个剪辑窗口音轨的潜变量（MiniMax-'
+      + 'H3 为 [2, C, n]），按清单顺序；不接时剪辑不带音轨训练',
+      '可選：audio-vae-encode 對清單所列每個剪輯視窗音軌的潛變數（MiniMax-'
+      + 'H3 為 [2, C, n]），按清單順序；不接時剪輯不帶音軌訓練'],
+  'port.train-lora.ref_video_rows': ['',
+      '可选（MiniMax-H3 Ref2VA）：video-ref-encoder 随每个条件输出的 '
+      + 'ref_video——参考的视频行，f32 [rows, 96]；与 ref_audio_rows 一起接',
+      '可選（MiniMax-H3 Ref2VA）：video-ref-encoder 隨每個條件輸出的 '
+      + 'ref_video——參考的視訊列，f32 [rows, 96]；與 ref_audio_rows 一起接'],
+  'port.train-lora.ref_audio_rows': ['',
+      '可选（MiniMax-H3 Ref2VA）：video-ref-encoder 的 ref_audio，参考音轨'
+      + '的行，f32 [rows, 32]',
+      '可選（MiniMax-H3 Ref2VA）：video-ref-encoder 的 ref_audio，參考音軌'
+      + '的列，f32 [rows, 32]'],
+  'port.train-lora.preview_audio': ['',
+      '可选：音视频模型的预览音轨，f32 [2, C, n]，与每个预览潜变量并列，给 '
+      + 'audio-vae-decode',
+      '可選：音視訊模型的預覽音軌，f32 [2, C, n]，與每個預覽潛變數並列，給 '
+      + 'audio-vae-decode'],
   'cfg.train-lora.resume': ['',
       'auto（默认）：继续同名的被停止的训练；never：重新开始',
       'auto（預設）：繼續同名的被停止的訓練；never：重新開始'],
@@ -4923,9 +5024,24 @@ const STRINGS = {
       + '元組數自行判斷；"always" / "never" 可強制'],
   'port.video-ref-encoder.prompt': ['',
       '提示词文本（FlexData 字符串或 {text: ...}），按原文使用——不套聊天模'
-      + '板，也不加特殊 token',
+      + '板，也不加特殊 token。对象还可以给出它自己的请求：`references`（文'
+      + '件，覆盖配置里的）和 `frames`（training-dataset 的 Ref2VA 标注）；'
+      + '`batch` 让编码器一直加载到流结束，`allow_empty` 把空提示词输出为零'
+      + '行',
       '提示詞文字（FlexData 字串或 {text: ...}），按原文使用——不套聊天範本'
-      + '，也不加特殊 token'],
+      + '，也不加特殊 token。物件還可以給出它自己的請求：`references`（檔案'
+      + '，覆蓋設定裡的）和 `frames`（training-dataset 的 Ref2VA 標註）；'
+      + '`batch` 讓編碼器一直載入到串流結束，`allow_empty` 把空提示詞輸出為'
+      + '零列'],
+  'cfg.video-ref-encoder.references_from_prompt': ['',
+      '提示词节拍给出自己的参考（{text, references: [文件], frames}：'
+      + 'training-dataset 的 Ref2VA 样本，一条标注一个请求）。像接上的参考'
+      + '端口一样，在计划中为一段剪辑的呈现预留内存；无论是否设置，节拍的 '
+      + '`references` 和 `frames` 都只对该节拍生效',
+      '提示詞節拍給出自己的參考（{text, references: [檔案], frames}：'
+      + 'training-dataset 的 Ref2VA 樣本，一條標註一個請求）。像接上的參考'
+      + '連接埠一樣，在計畫中為一段剪輯的呈現預留記憶體；無論是否設定，節拍'
+      + '的 `references` 和 `frames` 都只對該節拍生效'],
   'port.video-ref-encoder.model': ['',
       '可选的共享模型引用，来自 model-select 源；覆盖 hf_dir 配置',
       '可選的共享模型參照，來自 model-select 來源；覆寫 hf_dir 設定'],
@@ -6522,6 +6638,46 @@ const STRINGS = {
       '`lora2` 的強度，按每次前向生效，且與 `lora_scale` 相互獨立——這正是第'
       + '二個槽位的意義所在：蒸餾轉接器保持它訓練時的強度，而這一個可以隨意'
       + '掃參。填 0 會跳過它的兩個 GEMM'],
+  'cfg.minimax-h3-model-config.dials': ['',
+      '旋钮（DIALS）：无需训练的引导方向（ComfyUI-Dials / ComfyUI-MAINodes；'
+      + 'MATLOWAI/H3-Dials 发布了一套）。一个旋钮是加到每一行提示词上的「一个'
+      + '」向量——加在 token refiner 之后（`token_refiner.dials_shift` 文件），'
+      + '或加进 condition_proj 的偏置（`condition_proj.diff_b`）——其强度是带符'
+      + '号的滑块：负值偏向旋钮的 A 侧，正值偏向 B 侧。取值为若干行组成的数组'
+      + '，即 Dial Rack 的 JSON（它的 `rack` 字符串可原样粘贴）：{"dial": 文件'
+      + ', "strength": s, "on": true, "solo": false, "time": {...}}。不带 '
+      + '`time` 的行每一步都生效。带「时间曲线」的行沿片段的时间变化：'
+      + '{"type": "keys", "points": [[t, m], ...], "unit": "normalized" | '
+      + '"seconds", "interp": "linear" | "step", "smooth": 0..1, "steps": k '
+      + '(2), "audio": "follow" | "protect"}——前 k 步中 DiT 会带着旋钮再跑一次'
+      + '，两次预测按曲线在每个潜变量帧处的值混合；`protect` 让音轨保持未加旋'
+      + '钮的那一路。每条不同的曲线在它的 k 步里每步多一次前向。曲线只用于视频'
+      + '模型（不用于只生成一帧的 MiniMax-H3-Image 和 P-H3-Image），也只作用于'
+      + ' token refiner 之后那一处。文件可以是路径、`dial_dir` 下的名称或已注'
+      + '册的模型。按片段生效：新节拍里的行从下一个片段起生效',
+      '旋鈕（DIALS）：無需訓練的引導方向（ComfyUI-Dials / ComfyUI-MAINodes；'
+      + 'MATLOWAI/H3-Dials 發布了一套）。一個旋鈕是加到每一行提示詞上的「一個'
+      + '」向量——加在 token refiner 之後（`token_refiner.dials_shift` 檔案），'
+      + '或加進 condition_proj 的偏置（`condition_proj.diff_b`）——其強度是帶符'
+      + '號的滑塊：負值偏向旋鈕的 A 側，正值偏向 B 側。取值為若干行組成的陣列'
+      + '，即 Dial Rack 的 JSON（它的 `rack` 字串可原樣貼上）：{"dial": 檔案, '
+      + '"strength": s, "on": true, "solo": false, "time": {...}}。不帶 '
+      + '`time` 的行每一步都生效。帶「時間曲線」的行沿片段的時間變化：'
+      + '{"type": "keys", "points": [[t, m], ...], "unit": "normalized" | '
+      + '"seconds", "interp": "linear" | "step", "smooth": 0..1, "steps": k '
+      + '(2), "audio": "follow" | "protect"}——前 k 步中 DiT 會帶著旋鈕再跑一次'
+      + '，兩次預測按曲線在每個潛變量幀處的值混合；`protect` 讓音軌保持未加旋'
+      + '鈕的那一路。每條不同的曲線在它的 k 步裡每步多一次前向。曲線只用於視訊'
+      + '模型（不用於只生成一幀的 MiniMax-H3-Image 和 P-H3-Image），也只作用於'
+      + ' token refiner 之後那一處。檔案可以是路徑、`dial_dir` 下的名稱或已註'
+      + '冊的模型。按片段生效：新節拍裡的行從下一個片段起生效'],
+  'cfg.minimax-h3-model-config.dial_dir': ['',
+      '`dials` 各行中相对名称从哪里读取——机架里名称所相对的文件夹（ComfyUI 的 '
+      + 'models/loras：H3-Dials 仓库的根目录里有同样的 `dials/` 文件夹）。可以'
+      + '是目录或已注册的模型。留空（默认）：名称是路径或注册表键',
+      '`dials` 各行中相對名稱從哪裡讀取——機架裡名稱所相對的資料夾（ComfyUI 的 '
+      + 'models/loras：H3-Dials 倉庫的根目錄裡有同樣的 `dials/` 資料夾）。可以'
+      + '是目錄或已註冊的模型。留空（預設）：名稱是路徑或登錄檔鍵'],
   'cfg.minimax-h3-model-config.preview_vae': ['',
       '可选：用于实时预览的小型自编码器（TAE）。每走完一个去噪步，模型对'
       + '成片的干净估计会由它解码，写到去噪阶段的 `preview` 输出端口，`preview`'

@@ -325,6 +325,23 @@ private:
   // ...or its fast decoder, when `fast_decoder` names one: the released
   // VAE's weights are then never read, only its config.
   std::shared_ptr<genai::MetalMiniMaxH3FastVae> _h3_fast;
+  // DWD (sideband::kDwdHead): a pi-H3 adapter's pixel head, decoding the
+  // DiT's features in place of a VAE -- loaded from the file the beat
+  // names, at the first beat that does. `_want_dwd` is the beat in hand's
+  // ask, read before anything loads: while beats are DWD the video VAE's
+  // weights are deferred (`_h3_deferred`) until one that is a latent.
+  std::shared_ptr<genai::MetalMiniMaxH3FastVae> _h3_dwd;
+  std::string _h3_dwd_file;
+  bool _want_dwd = false;
+  bool _h3_deferred = false;
+  bool ensure_h3_dwd_(const std::string& file);
+  // The DWD head the stage feeding the latent port will hand over
+  // (GenerateVideoStage::planned_dwd_head), or empty -- plan-time, so a
+  // DWD graph claims the head and not the VAE.
+  std::string planned_dwd_head_() const;
+  // The head's weights' claim label (a decode-phase arena of this stage:
+  // they are read from the adapter's file, whose claim is the DiT's).
+  std::string dwd_head_label_() const;
   // What the H3 decoder in use was built with, as its warm hold's key.
   std::string _h3_vae_warm_key;
   static constexpr const char* kH3VaeWarmKind = "minimax-h3-video-vae";

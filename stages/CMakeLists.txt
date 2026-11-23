@@ -20,6 +20,7 @@ set(LOCAL_SOURCES
   training-dataset-stage.cc
   optimizer-select-stage.cc
   train-lora-stage.cc
+  train-lora-families.cc
   load-text-stage.cc
   load-video-stage.cc
   lora-fuse-stage.cc

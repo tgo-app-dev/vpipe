@@ -29,6 +29,7 @@
 // steps, so a run can be inspected and kept without stopping it.
 
 #include "common/job.h"
+#include "interfaces/ui-delegate-intf.h"
 #include "pipeline/runtime-context.h"
 #include "apple-silicon/tensor-beat.h"
 #include "pipeline/typed-stage.h"
@@ -79,6 +80,8 @@ public:
 private:
   // ---- config
   std::string _hf_dir;
+  std::string _dit_cfg;                 // dit_dir
+  std::vector<std::string> _base_loras; // base_lora
   std::string _output_dir;
   std::string _name;
   std::string _targets = "attn_ff";
@@ -95,6 +98,7 @@ private:
   std::uint64_t _seed = 0;
   SeedSequence _seed_seq = SeedSequence::kIncrement;
   double _caption_dropout = 0.05;
+  double _dropout = 0.05;     // this run's: 0 for a guidance-distilled model
   double _logit_mean = 0.0;
   double _logit_std = 1.0;
   double _shift = 3.0;
@@ -118,6 +122,10 @@ private:
   std::string _base_ref;     // what hf_dir named, for the metadata
   std::chrono::steady_clock::time_point _encode_t0;
   std::uint64_t _run = 0;    // training jobs finished (a sweep's count)
+  // What a host's progress view draws: "lora encode" (the encodes taken
+  // of those the manifest wants), then "lora train" (the optimizer steps
+  // of the run's total, the loss in its detail).
+  UiProgress _bar;
 
   // Commands: `save` and `preview`, served between optimizer steps.
   Job serve_commands_(RuntimeContext& ctx);
@@ -130,11 +138,33 @@ private:
     int rows = 0;
     FlexData sideband;
     std::string key;
+    // A caption encoded WITH REFERENCES (video-ref-encoder, Ref2VA): its
+    // reference rows, bf16 -- video [nrv, 96], audio [nra, 32] -- always
+    // in RAM (a picture's rows are a few MB), cached beside the caption.
+    metal_compute::SharedBuffer rv, ra;
+    int nrv = 0, nra = 0;
   };
   struct Picture {
-    metal_compute::SharedBuffer x0;   // packed, or f32 [C,h,w] until then
+    // Packed, or f32 [C,h,w] / [C,t,h,w] until then.
+    metal_compute::SharedBuffer x0;
+    int t = 1;              // latent frames: 1 for a picture
     int h = 0, w = 0;       // the latent grid
     std::string key;
+    // A clip window's SOUNDTRACK: f32 [2, C, n] until the family packs it
+    // (then its rows), always in RAM -- a few KB a window.
+    bool audio = false;     // the manifest says one comes
+    metal_compute::SharedBuffer ax0;
+    int ac = 0, an = 0;     // its channels and latents, unpacked
+    std::string akey;
+    // KEYFRAMES (bit 0 the first frame, bit 1 the last): their still
+    // latents f32 [C, 1, h, w] each until packed, then their rows in one
+    // buffer (cx0); always in RAM. And the window's own captions,
+    // presented with them (into _texts), in place of the sample's.
+    int anchors = 0;
+    std::vector<metal_compute::SharedBuffer> kx;
+    std::vector<std::string> kkeys;
+    metal_compute::SharedBuffer cx0;
+    std::vector<int> texts;
   };
   struct Sample {
     std::vector<int> texts;          // into _texts
@@ -163,6 +193,11 @@ private:
   genai::train::OptimizerSpec _opt_spec;
   std::string _family;
   std::string _dit_dir;
+  // The family's extra claims (frozen adapters, a second weight set),
+  // withdrawn with the DiT's at the run's end.
+  std::vector<std::string> _extra_dirs;
+  // The trained adapter's models-DB record: its type and its parent's.
+  std::string _adapter_type, _parent_type;
   int _total_steps = 0;
   int _step = 0;
   int _save_every = 0;
@@ -174,6 +209,8 @@ private:
   std::vector<std::string> _saved;
 
   bool load_model_(std::string* err);
+  // dit_dir and base_lora, resolved: what the families plan from.
+  genai::train::RunShape run_paths_() const;
   // Encoded bytes into the cache (a no-op without one).
   void cache_put_(const std::string& key, const TensorBeatPayload& tb,
                   bool as_bf16);
@@ -201,7 +238,14 @@ private:
     int sample = 0, pic = 0;
     int ph = 0, pw = 0;      // the picture the latent must match
     std::string file;
+    int anchor = -1;         // a keyframe's still: which of the window's
   };
+  std::vector<WantPic> _want_audio;
+  std::size_t _got_audio = 0;
+  double _audio_weight = 1.0;
+  bool _audio_wired = false;       // the audio_latents port
+  bool _refs_wired = false;        // the ref_video_rows / ref_audio_rows
+  int _audio_unwired = 0;          // soundtracks listed with it unwired
   bool plan_encode_(std::string* err);
   bool _encode_planned = false;
   std::vector<int> _want_text;

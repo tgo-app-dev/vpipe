@@ -172,21 +172,72 @@ sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
   return true;
 }
 
+bool
+dial_branches_share_a_step(const std::vector<DialBranch>& branches)
+{
+  int live = 0;
+  for (const DialBranch& b : branches) {
+    bool any = false;
+    for (const std::vector<float>* m : {&b.video, &b.audio}) {
+      for (float w : *m) { any = any || w != 0.0f; }
+    }
+    if (b.steps > 0 && any) { ++live; }
+  }
+  return live > 1;
+}
+
 std::size_t
 denoise_host_bytes(const minimax_h3::PackedLayout& L,
                    const MetalMiniMaxH3Transformer::Config& cfg,
-                   bool motion_cache, bool preview)
+                   bool motion_cache, bool preview,
+                   const std::vector<DialBranch>* dials)
 {
   const std::size_t v =
       (std::size_t)L.num_video_rows * (std::size_t)cfg.video_patch_elems();
   const std::size_t a =
       (std::size_t)L.num_audio_rows * (std::size_t)cfg.audio_channels;
   // vel_v / vel_a; rn_v / rn_a or vprev / aprev; MotionCache's rv / ra;
-  // preview_x0.
+  // preview_x0; the undialled velocity two dial branches blend against.
   std::size_t n = 2 * (v + a);
   if (motion_cache) { n += v + a; }
   if (preview) { n += v; }
+  if (dials != nullptr && dial_branches_share_a_step(*dials)) {
+    n += v + a;
+  }
   return n * sizeof(float);
+}
+
+void
+blend_dial_velocity(float* out, const float* base,
+                    const std::uint16_t* dialled_bf16, std::size_t rows,
+                    std::size_t width, const std::vector<float>& m,
+                    int cycle)
+{
+  if (m.empty() || cycle < 1) { return; }
+  const std::size_t groups = m.size() * (std::size_t)cycle;
+  if (rows % groups != 0) { return; }
+  const std::size_t per = rows / groups;
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float w = m[(r / per) % m.size()];
+    // M 0 is the undialled velocity exactly: nothing to add, and a
+    // non-finite dialled row cannot reach it.
+    if (w == 0.0f) { continue; }
+    float* o = out + r * width;
+    const std::uint16_t* d = dialled_bf16 + r * width;
+    if (base == nullptr) {
+      // torch.lerp: exact at both ends.
+      for (std::size_t k = 0; k < width; ++k) {
+        const float b = o[k], e = bf16_to_f32_(d[k]);
+        o[k] = std::fabs(w) < 0.5f ? b + w * (e - b)
+                                   : e - (e - b) * (1.0f - w);
+      }
+    } else {
+      const float* b = base + r * width;
+      for (std::size_t k = 0; k < width; ++k) {
+        o[k] += w * (bf16_to_f32_(d[k]) - b[k]);
+      }
+    }
+  }
 }
 
 bool
@@ -330,8 +381,11 @@ denoise(const DenoiseRequest& req, std::string* err)
                       req.audio_shift, req.video_shift)());
     }
   } else if (sc != nullptr) {
-    if (!sv.set_sigmas_shifted(sc->sigmas) ||
-        !sa.set_sigmas_shifted(sc->sigmas)) {
+    // A pi-Flow contract's grid is float32 values shifted in float32.
+    const std::vector<float> g32(sc->sigmas.begin(), sc->sigmas.end());
+    if (sc->shift_f32 ? !sv.set_sigmas(g32) || !sa.set_sigmas(g32)
+                      : !sv.set_sigmas_shifted(sc->sigmas) ||
+                            !sa.set_sigmas_shifted(sc->sigmas)) {
       return fail(fmt("denoise: the sampling contract's grid ({} points) "
                       "is not a strictly decreasing 1 -> 0 grid under "
                       "shifts {:.4g}/{:.4g}", sc->sigmas.size(),
@@ -523,6 +577,65 @@ denoise(const DenoiseRequest& req, std::string* err)
   bool cached_audio = false;
   int forwards = 0, reused_steps = 0, steps_run = 0;
 
+  // DIAL BRANCHES (DialBranch): which run at each step, decided here so
+  // the forward count is known before the first one.
+  const std::size_t nbr = req.dial_branches.size();
+  std::vector<char> br_zero(nbr, 0), br_one(nbr, 0);
+  for (std::size_t k = 0; k < nbr; ++k) {
+    const DialBranch& b = req.dial_branches[k];
+    if (b.shift == nullptr || b.shift->empty()) {
+      return fail(fmt("denoise: dial branch '{}' has no shift", b.label)());
+    }
+    if (b.video.empty() || nvid % (int)b.video.size() != 0) {
+      return fail(fmt("denoise: dial branch '{}' weighs {} video latent "
+                      "frames, which do not divide the {} generated rows",
+                      b.label, b.video.size(), nvid)());
+    }
+    if (!b.audio.empty() &&
+        (std::size_t)naud != (std::size_t)minimax_h3::kAudioChannels *
+                                 b.audio.size()) {
+      return fail(fmt("denoise: dial branch '{}' weighs {} audio latents "
+                      "and the clip generates {} audio rows", b.label,
+                      b.audio.size(), naud)());
+    }
+    bool z = true, o = true;
+    for (const std::vector<float>* m : {&b.video, &b.audio}) {
+      for (float w : *m) {
+        z = z && w == 0.0f;
+        o = o && w == 1.0f;
+      }
+    }
+    // An audio that is not generated has no weight to be 1.
+    br_zero[k] = z;
+    br_one[k] = o && (naud == 0 || !b.audio.empty());
+  }
+  auto live_at = [&](int i) {
+    std::vector<std::size_t> live;
+    for (std::size_t k = 0; k < nbr; ++k) {
+      if (i < req.dial_branches[k].steps && !br_zero[k]) { live.push_back(k); }
+    }
+    return live;
+  };
+  auto alone_at = [&](const std::vector<std::size_t>& live) {
+    return live.size() == 1 && br_one[live[0]];
+  };
+  // A step is one forward, plus one a live branch -- none when one
+  // branch alone runs in place of the undialled forward.
+  int units_total = 0, units_done = 0, dial_forwards = 0;
+  for (int i = 0; i < steps; ++i) {
+    const auto live = live_at(i);
+    units_total += 1 + (alone_at(live) ? 0 : (int)live.size());
+  }
+  bool stop_asked = false;
+  auto unit_done = [&]() {
+    ++units_done;
+    if (req.forward_progress &&
+        !req.forward_progress(units_done, units_total)) {
+      stop_asked = true;
+    }
+  };
+  std::vector<float> base_v, base_a;
+
   // A preview's clean estimate, filled only on a step that renders one.
   std::vector<float> preview_x0;
   // The re-noising sampler's FRESH NOISE: a stream of its own off the
@@ -687,9 +800,18 @@ denoise(const DenoiseRequest& req, std::string* err)
     float* vx = req.video + (std::size_t)ncond * PE;
     float* ax = req.audio + (std::size_t)ncaud * AC;
     const double sigma_v = sv.sigmas()[(std::size_t)i];
+    // The dial branches live this step, and whether one runs alone.
+    const std::vector<std::size_t> live = live_at(i);
+    const bool alone = alone_at(live);
     // Before anything is uploaded: a reused step never touches the GPU.
+    // Not while a dial branch is live -- the step is the blend's -- and
+    // then not asked either, so the cache counts that step as it counts
+    // a warm-up one.
+    // DWD's features are the LAST step's forward's: that one always runs.
+    const bool dwd_step = req.dwd_features != nullptr && i == steps - 1;
     const bool reuse =
-        mcache.armed() && mcache.decide(sigma_v, vx, naud > 0 ? ax : nullptr);
+        !dwd_step && live.empty() && mcache.armed() &&
+        mcache.decide(sigma_v, vx, naud > 0 ? ax : nullptr);
     bool have_aud = false;
     const auto t_fwd0 = std::chrono::steady_clock::now();
     // The GPU's credited work over the forward, for the profile's rate
@@ -704,6 +826,7 @@ denoise(const DenoiseRequest& req, std::string* err)
                      cached_audio ? vel_a.data() : nullptr);
       have_aud = cached_audio;
       ++reused_steps;
+      unit_done();
     } else {
       {
         auto* d = static_cast<std::uint16_t*>(vb.contents());
@@ -752,13 +875,19 @@ denoise(const DenoiseRequest& req, std::string* err)
       st.sage_pv8_off       = i < pv8_from;
       st.video_grid_h       = req.video_grid_h;
       st.video_grid_w       = req.video_grid_w;
+      // One dial branch alone at M 1 everywhere is its own forward, in
+      // place of the undialled one (lerp's other end, exactly).
+      st.text_shift = alone ? req.dial_branches[live[0]].shift : nullptr;
+      st.dwd_features = dwd_step;
       std::string ferr;
       MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);
       if (v.empty()) {
         return fail("denoise: step " + std::to_string(i) + ": " +
                     (ferr.empty() ? std::string("forward failed") : ferr));
       }
+      if (dwd_step) { *req.dwd_features = std::move(v.features); }
       ++forwards;
+      unit_done();
       // The GENERATED tails only. The head writes every row it was given,
       // conditioning included, and those are never stepped.
       {
@@ -778,6 +907,9 @@ denoise(const DenoiseRequest& req, std::string* err)
         }
         have_aud = true;
       }
+      // Read back, so given back: a probe's or a dial branch's forward
+      // makes its own, and the two are not held at once.
+      v = {};
       // The probe's arms, on the input the dense forward just read (the
       // buffers are uploaded once a step and not written by a forward).
       if (!sol_probe.empty() && sess != nullptr) {
@@ -819,6 +951,44 @@ denoise(const DenoiseRequest& req, std::string* err)
                          (double)arm.tau,
                          nn > 0.0 ? std::sqrt(dd / nn) : 0.0,
                          100.0 * req.dit->sol_kept_fraction(), ms));
+        }
+      }
+      // The dial branches: the same input with each branch's shift on the
+      // prompt, blended per latent frame into the undialled velocity --
+      // lerp for one, the sum of differences for several.
+      if (!alone && !live.empty()) {
+        const bool several = live.size() > 1;
+        if (several) {
+          base_v = vel_v;
+          base_a = vel_a;
+        }
+        for (std::size_t k : live) {
+          const DialBranch& b = req.dial_branches[k];
+          MetalMiniMaxH3Transformer::Step sd = st;
+          sd.text_shift = b.shift;
+          MetalMiniMaxH3Transformer::Velocity dv =
+              req.dit->forward(sd, &ferr);
+          if (dv.empty()) {
+            return fail(fmt("denoise: step {}, dial branch '{}': {}", i,
+                            b.label,
+                            ferr.empty() ? std::string("forward failed")
+                                         : ferr)());
+          }
+          ++dial_forwards;
+          blend_dial_velocity(
+              vel_v.data(), several ? base_v.data() : nullptr,
+              static_cast<const std::uint16_t*>(dv.video.contents()) +
+                  (std::size_t)ncond * PE,
+              (std::size_t)nvid, (std::size_t)PE, b.video, 1);
+          if (have_aud && !dv.audio.empty() && !b.audio.empty()) {
+            blend_dial_velocity(
+                vel_a.data(), several ? base_a.data() : nullptr,
+                static_cast<const std::uint16_t*>(dv.audio.contents()) +
+                    (std::size_t)ncaud * AC,
+                (std::size_t)naud, (std::size_t)AC, b.audio,
+                minimax_h3::kAudioChannels);
+          }
+          unit_done();
         }
       }
       // With the state the forward ran ON -- the scheduler has not
@@ -977,11 +1147,13 @@ denoise(const DenoiseRequest& req, std::string* err)
       preview_x0.clear();
     }
     if (req.progress && !req.progress(i + 1, steps)) { break; }
+    if (stop_asked) { break; }
   }
   if (req.report != nullptr) {
     req.report->steps    = steps_run;
     req.report->forwards = forwards;
     req.report->reused   = reused_steps;
+    req.report->dial_forwards = dial_forwards;
     req.report->motion_cache = mcache.armed();
     req.report->renoise  = renoise;
     req.report->update   = renoise ? StepUpdate::kRenoise
@@ -998,6 +1170,11 @@ denoise(const DenoiseRequest& req, std::string* err)
                    "forwards ran, {:.2f}x fewer", reused_steps, steps_run,
                    forwards,
                    forwards > 0 ? (double)steps_run / forwards : 1.0));
+  }
+  if (nbr > 0 && sess != nullptr) {
+    sess->info(fmt("h3-denoise: {} dial curve branch{} ran {} forward{} "
+                   "beside the steps' {}", nbr, nbr == 1 ? "" : "es",
+                   dial_forwards, dial_forwards == 1 ? "" : "s", forwards));
   }
   return true;
 }

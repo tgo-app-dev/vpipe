@@ -232,6 +232,12 @@ public:
   // oports are. Who consumes those is the runtime's business.
   StageMemory declare_memory() const override;
 
+  // A DWD adapter's file among the live adapters the model config names
+  // (pi-H3: its pixel head decodes the clip, in vae-decode, which then
+  // loads no VAE), or empty. Plan-time, off the latched model config:
+  // what vae-decode's plan asks of the stage that feeds it.
+  std::string planned_dwd_head() const;
+
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will
   // actually run rather than against an empty hf_dir.
@@ -366,6 +372,14 @@ private:
   std::string   _dit_dir;
   std::string h3_dit_(const std::string& root,
                       const std::string& partition) const;
+  // DWD's plan at a clip's planned geometry (`head` the adapter file):
+  // the head's working set with the planar-U8 clip behind it -- the
+  // decode arena in place of a VAE's -- and the features the last
+  // forward hands over (the payload in place of the latent). False where
+  // the head or the model cannot be read.
+  bool h3_dwd_plan_bytes_(const std::string& root, const std::string& head,
+                          int w, int h, int frames, std::size_t* arena,
+                          std::size_t* features) const;
   // The VDN-H3 release root the DiT was BUILT with, or empty for the
   // stock attention. Latched from the model_config beat like a LoRA
   // path -- see the `linear_branch` key on `minimax-h3-model-config`,
@@ -397,6 +411,15 @@ private:
   // resolves them -- read off the pre-launch constant, so the plan books
   // their factors and their scratch before anything loads.
   std::vector<std::string> h3_plan_lora_files_() const;
+  // The model config's DIALS (minimax-h3-dials.h) for one clip: the
+  // constant rows set on the DiT (set_dials), the rows on a time curve
+  // as `branches` over `lt` video latent frames and `alat` audio
+  // latents, their shifts held in `bufs`. `no_curves`, when set, is why
+  // this clip cannot run a curve (a still, TaoMate's streaming). False,
+  // with the reason warned, for a row that cannot run.
+  bool h3_dials_(int lt, int alat, const char* no_curves,
+                 std::vector<metal_compute::SharedBuffer>* bufs,
+                 std::vector<genai::DialBranch>* branches);
   // The graph refines a clip (init_latent wired): no soundtrack leaves
   // the stage, and the silence it holds is encoded at the denoise.
   bool refines_() const;
@@ -518,6 +541,13 @@ private:
   genai::FlowSchedulerSpec _h3_sched;
   bool _h3_sched_given = false;
   bool _h3_sched_said = false;
+  // DWD (a live pi-H3 DWD adapter): the last step's features and where
+  // their pixel head is, for the beat vae-decode decodes in place of a
+  // latent.
+  metal_compute::SharedBuffer _h3_dwd_feats;
+  std::string _h3_dwd_file;
+  int _h3_dwd_grid[3] = {0, 0, 0};
+  int _h3_dwd_row0 = 0;
   // Said once a run: MiniMax-H3-Image runs a grid not the release's.
   bool _h3i_custom_said = false;
   // The step count a MiniMax-H3 clip runs: its model config's `sigmas`

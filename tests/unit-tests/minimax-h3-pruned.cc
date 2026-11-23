@@ -24,6 +24,7 @@
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -698,4 +699,440 @@ TEST(minimax_h3_pruned, runs_as_the_released_model_it_was_pruned_from)
   for (const fs::path& f : {fr, fp, fbare, la, lt, lf, ld, fpd}) {
     fs::remove(f);
   }
+}
+
+// pi-H3 (Lakonik/pi-H3): a LoRA plus WHOLE-TENSOR OVERWRITES in the
+// diffusers spelling -- every block's pruned AdaLN, one block's out /
+// fc1 / fc2, the output AdaLN, norm and heads -- applied whole while the
+// adapter is live, and a pi-Flow sampling contract read off its header
+// and its name. Against the same DiT with those tensors PATCHED IN (the
+// Comfy names, fc1's halves swapped as ComfyUI-piFlow's key map swaps
+// them) and the LoRA in this model's own names.
+TEST(minimax_h3_pruned, pi_flow_overwrites_are_the_patched_file)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  Env noqmm("VPIPE_H3_NO_QMM_AUTOTUNE", "1");
+  Env notile("VPIPE_H3_NO_ATTN_TILE_AUTOTUNE", "1");
+  const int H = 256, A = 256, F = 512, TXT = 256, LAYERS = 2, REFINER = 1,
+            GRID = 1025, D = 18 * H, FD = 2 * H, RANK = 4;
+  const std::string P = "model.diffusion_model.";
+  std::mt19937 rng(23);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto rnd = [&](std::size_t n, float sd, float mean = 0.0f) {
+    std::vector<float> v(n);
+    for (float& x : v) { x = mean + sd * nd(rng); }
+    return v;
+  };
+  // F16, and `v` replaced by the values it holds.
+  auto f16 = [](const std::string& nm, std::vector<std::int64_t> shape,
+                std::vector<float>& v) {
+    T t{nm, "F16", std::move(shape), std::vector<std::uint8_t>(v.size() * 2)};
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      const _Float16 h = (_Float16)v[i];
+      std::memcpy(&t.bytes[i * 2], &h, 2);
+      v[i] = (float)h;
+    }
+    return t;
+  };
+  // The base DiT, by name: what the patched file replaces.
+  std::map<std::string, T> base;
+  auto put = [&](T t) { base[t.name] = std::move(t); };
+  {
+    std::vector<float> v;
+    put(f32_("video_patch_proj.weight", {H, 96}, rnd(H * 96, 0.05f)));
+    put(f32_("video_patch_proj.bias", {H}, rnd(H, 0.01f)));
+    put(f32_("audio_patch_proj.weight", {H, 32}, rnd(H * 32, 0.05f)));
+    put(f32_("audio_patch_proj.bias", {H}, rnd(H, 0.01f)));
+    v = rnd((std::size_t)H * TXT, 0.03f);
+    put(bf16_("condition_proj.weight", {H, TXT}, v));
+    v = rnd(H, 0.01f);
+    put(bf16_("condition_proj.bias", {H}, v));
+    std::vector<float> inv(16);
+    for (int i = 0; i < 16; ++i) {
+      inv[(std::size_t)i] = 1.0f / std::pow(10000.0f, (float)(2 * i) / 32.0f);
+    }
+    put(f32_("rope.inv_freq", {16}, inv));
+    for (int L = 0; L < LAYERS + REFINER; ++L) {
+      const std::string b = L < LAYERS
+          ? "blocks." + std::to_string(L) + "."
+          : "token_refiner.blocks." + std::to_string(L - LAYERS) + ".";
+      v = rnd(H, 0.02f, 1.0f); put(bf16_(b + "norm1.weight", {H}, v));
+      v = rnd(H, 0.02f, 1.0f); put(bf16_(b + "norm2.weight", {H}, v));
+      v = rnd(128, 0.02f, 1.0f); put(bf16_(b + "attn.q_norm.weight", {128}, v));
+      v = rnd(128, 0.02f, 1.0f); put(bf16_(b + "attn.k_norm.weight", {128}, v));
+      v = rnd((std::size_t)3 * A * H, 0.04f);
+      put(bf16_(b + "attn.qkv_proj.weight", {3 * A, H}, v));
+      v = rnd((std::size_t)H * A, 0.04f);
+      put(bf16_(b + "attn.out_proj.weight", {H, A}, v));
+      v = rnd((std::size_t)2 * F * H, 0.04f);
+      put(bf16_(b + "mlp.fc1.weight", {2 * F, H}, v));
+      v = rnd((std::size_t)H * F, 0.04f);
+      put(bf16_(b + "mlp.fc2.weight", {H, F}, v));
+      if (L < LAYERS) {
+        put(f32_(b + "adaln_proj.linear.weight", {D, 8}, rnd(D * 8, 0.1f)));
+        put(f32_(b + "adaln_proj.linear.bias", {D}, rnd(D, 0.05f)));
+      }
+    }
+    v = rnd(H, 0.02f, 1.0f);
+    put(bf16_("token_refiner.final_norm.weight", {H}, v));
+    v = rnd(H, 0.02f, 1.0f);
+    put(bf16_("final_layer.norm.weight", {H}, v));
+    put(f32_("final_layer.video_out.weight", {96, H}, rnd(96 * H, 0.05f)));
+    put(f32_("final_layer.video_out.bias", {96}, rnd(96, 0.01f)));
+    put(f32_("final_layer.audio_out.weight", {32, H}, rnd(32 * H, 0.05f)));
+    put(f32_("final_layer.audio_out.bias", {32}, rnd(32, 0.01f)));
+    put(f32_("final_layer.adaln_proj.linear.weight", {FD, 8},
+             rnd(FD * 8, 0.1f)));
+    put(f32_("final_layer.adaln_proj.linear.bias", {FD}, rnd(FD, 0.05f)));
+    put(f32_("adaln_t_table", {GRID, 8}, rnd(GRID * 8, 0.3f)));
+  }
+  auto write_dit = [&](const fs::path& p, const std::map<std::string, T>& m) {
+    std::vector<T> ts;
+    for (const auto& [nm, t] : m) {
+      ts.push_back(t);
+      ts.back().name = P + nm;
+    }
+    return write_st_(p, ts);
+  };
+  // The adapter (diffusers names) and the patched DiT beside it.
+  std::vector<T> ad;        // pi-H3's spelling
+  std::vector<T> ad_lora;   // its LoRA, this model's names
+  std::map<std::string, T> patched = base;
+  auto over = [&](const std::string& dname, const std::string& cname,
+                  std::vector<std::int64_t> shape, float sd, bool swap) {
+    std::size_t n = 1;
+    for (auto d : shape) { n *= (std::size_t)d; }
+    std::vector<float> v = rnd(n, sd);
+    ad.push_back(f16(dname, shape, v));
+    if (swap) {
+      const std::size_t h = n / 2;
+      std::rotate(v.begin(), v.begin() + (std::ptrdiff_t)h, v.end());
+    }
+    // The patched file stores it as the base did: F32 or BF16.
+    const std::string dt = base.at(cname).dtype;
+    patched[cname] = dt == "F32" ? f32_(cname, shape, v)
+                                 : bf16_(cname, shape, v);
+  };
+  for (int L = 0; L < LAYERS; ++L) {
+    const std::string d = "transformer_blocks." + std::to_string(L) + ".";
+    const std::string c = "blocks." + std::to_string(L) + ".";
+    over(d + "adaln_proj.linear.weight", c + "adaln_proj.linear.weight",
+         {D, 8}, 0.1f, false);
+  }
+  // Block 1 fine-tuned whole, its AdaLN bias too (pi-H3's last four).
+  over("transformer_blocks.1.adaln_proj.linear.bias",
+       "blocks.1.adaln_proj.linear.bias", {D}, 0.05f, false);
+  over("transformer_blocks.1.attn.to_out.0.weight", "blocks.1.attn.out_proj"
+       ".weight", {H, A}, 0.04f, false);
+  over("transformer_blocks.1.ff.net.0.proj.weight", "blocks.1.mlp.fc1.weight",
+       {2 * F, H}, 0.04f, true);
+  over("transformer_blocks.1.ff.net.2.weight", "blocks.1.mlp.fc2.weight",
+       {H, F}, 0.04f, false);
+  over("norm_out.linear.weight", "final_layer.adaln_proj.linear.weight",
+       {FD, 8}, 0.1f, false);
+  over("norm_out.linear.bias", "final_layer.adaln_proj.linear.bias", {FD},
+       0.05f, false);
+  over("proj_out.weight", "final_layer.video_out.weight", {96, H}, 0.05f,
+       false);
+  over("proj_out.bias", "final_layer.video_out.bias", {96}, 0.01f, false);
+  over("audio_proj_out.weight", "final_layer.audio_out.weight", {32, H},
+       0.05f, false);
+  over("audio_proj_out.bias", "final_layer.audio_out.bias", {32}, 0.01f,
+       false);
+  // The output norm's weight sits near 1, as a norm's does.
+  {
+    std::vector<float> v = rnd(H, 0.02f, 1.0f);
+    ad.push_back(f16("norm_out.norm.weight", {H}, v));
+    patched["final_layer.norm.weight"] =
+        bf16_("final_layer.norm.weight", {H}, v);
+  }
+  // Block 0's LoRA, both spellings: fc1's B halves swapped for this
+  // model's [gate; value].
+  auto lora = [&](const std::string& dmod, const std::string& cmod, int n,
+                  int k, bool swap) {
+    std::vector<float> a = rnd((std::size_t)RANK * k, 0.3f);
+    std::vector<float> b = rnd((std::size_t)n * RANK, 0.3f);
+    ad.push_back(f16(dmod + ".lora_A.weight", {RANK, k}, a));
+    ad.push_back(f16(dmod + ".lora_B.weight", {n, RANK}, b));
+    if (swap) {
+      std::rotate(b.begin(), b.begin() + (std::ptrdiff_t)(b.size() / 2),
+                  b.end());
+    }
+    ad_lora.push_back(bf16_(cmod + ".lora_A.weight", {RANK, k}, a));
+    ad_lora.push_back(bf16_(cmod + ".lora_B.weight", {n, RANK}, b));
+  };
+  lora("transformer_blocks.0.attn.to_out.0", "blocks.0.attn.out_proj", H, A,
+       false);
+  lora("transformer_blocks.0.ff.net.0.proj", "blocks.0.mlp.fc1", 2 * F, H,
+       true);
+  lora("transformer_blocks.0.ff.net.2", "blocks.0.mlp.fc2", H, F, false);
+
+  const std::map<std::string, std::string> policy = {
+      {"policy_config", "{\"image\": {\"mode\": \"grid\", \"type\": \"DX\"}, "
+                        "\"audio\": {\"mode\": \"grid\", \"type\": \"DX\"}}"}};
+  const fs::path fdit = tmp_("pi-base.safetensors");
+  const fs::path fpat = tmp_("pi-patched.safetensors");
+  const fs::path dir = tmp_("pi_h3_4step_adapter");
+  fs::create_directories(dir);
+  const fs::path fad = dir / "diffusion_pytorch_model.safetensors";
+  const fs::path flo = tmp_("pi-lora.safetensors");
+  ASSERT_TRUE(write_dit(fdit, base));
+  ASSERT_TRUE(write_dit(fpat, patched));
+  ASSERT_TRUE(write_st_(fad, ad, policy));
+  ASSERT_TRUE(write_st_(flo, ad_lora));
+  // Refusals: an unplaced whole tensor; a DWD head without its
+  // modulation; a step count the release states no grid for.
+  // DWD: the same adapter with dwd_norm_out and a (stand-in) pixel head
+  // tensor -- zero, so the features are the plain LayerNorm; and random.
+  const fs::path fdz = tmp_("pi_h3_4step_dwd_zero.safetensors");
+  const fs::path fdr = tmp_("pi_h3_4step_dwd_rand.safetensors");
+  std::vector<float> dwd_w, dwd_b;
+  {
+    std::vector<float> hv = rnd(16, 0.01f);
+    for (int k = 0; k < 2; ++k) {
+      std::vector<T> ts = ad;
+      std::vector<float> w = k == 0 ? std::vector<float>((std::size_t)FD * 8)
+                                    : rnd((std::size_t)FD * 8, 0.2f);
+      std::vector<float> b = k == 0 ? std::vector<float>((std::size_t)FD)
+                                    : rnd((std::size_t)FD, 0.1f);
+      ts.push_back(f16("dwd_norm_out.linear.weight", {FD, 8}, w));
+      ts.push_back(f16("dwd_norm_out.linear.bias", {FD}, b));
+      std::vector<float> h = hv;
+      ts.push_back(f16("dwd_pixel_refiner.norm_out.weight", {16}, h));
+      ASSERT_TRUE(write_st_(k == 0 ? fdz : fdr, ts, policy));
+      if (k == 1) { dwd_w = w; dwd_b = b; }
+    }
+  }
+  const fs::path fodd = tmp_("pi_h3_4step_odd.safetensors");
+  const fs::path fdwd = tmp_("pi_h3_4step_dwd.safetensors");
+  const fs::path f3 = tmp_("pi_h3_3step.safetensors");
+  const fs::path fcy = tmp_("pi_h3_4step_comfy.safetensors");
+  {
+    std::vector<T> ts = ad;
+    std::vector<float> v = rnd((std::size_t)A * H, 0.01f);
+    ts.push_back(f16("transformer_blocks.0.attn.to_q.weight", {A, H}, v));
+    ASSERT_TRUE(write_st_(fodd, ts, policy));
+    ts = ad;
+    v = rnd(16, 0.01f);
+    ts.push_back(f16("dwd_pixel_refiner.norm_out.weight", {16}, v));
+    ASSERT_TRUE(write_st_(fdwd, ts, policy));
+    ASSERT_TRUE(write_st_(f3, ad, policy));
+    // ComfyUI's spelling of the same (pi-H3's int8 ConvRot copies): the
+    // LoRA would bind and the overwrites be dropped -- refused instead.
+    std::vector<T> cy = ad_lora;
+    v = rnd((std::size_t)D * 8, 0.1f);
+    cy.push_back(f16("blocks.0.adaln_proj.linear.weight", {D, 8}, v));
+    ASSERT_TRUE(write_st_(fcy, cy, policy));
+  }
+
+  H3::Config pc;
+  std::string err;
+  ASSERT_TRUE(H3::config_from_json(fdit.string(), pc, &err));
+  ASSERT_TRUE(pc.pruned());
+  const int latf = 2, lath = 8, latw = 8, naud = 8, ntext = 8;
+  h3::PackedLayout lay;
+  const std::vector<int> tags((std::size_t)ntext, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, latf, lath, latw, naud,
+                                        pc.patch_h, pc.patch_w,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kFirst}, &lay));
+  auto input = [&](std::size_t n, float k) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      p[i] = rne_(std::sin((float)i * k) * 0.5f);
+    }
+    return b;
+  };
+  const metal_compute::SharedBuffer vb = input(
+      lay.video_indices.size() * (std::size_t)pc.video_patch_elems(), 0.017f);
+  const metal_compute::SharedBuffer abuf = input(
+      (std::size_t)lay.num_audio_rows * (std::size_t)pc.audio_channels,
+      0.031f);
+  const metal_compute::SharedBuffer tb =
+      input((std::size_t)ntext * pc.text_dim, 0.005f);
+  std::vector<float> uniq;
+  std::vector<int> ridx;
+  h3::build_row_timesteps(lay, 0.6f, 0.45f, 0.999f, &uniq, &ridx);
+  struct Out {
+    std::vector<std::uint16_t> v, a, f;
+    std::vector<float> pts;
+    bool loaded = false;
+    int modules = 0;
+    bool contract = false;
+    std::vector<double> sigmas;
+    std::size_t lora_bytes = 0;
+  };
+  auto run = [&](const fs::path& file, const std::vector<H3::LoraSpec>& lo,
+                 bool stream, float live = -1.0f, bool dwd = false) -> Out {
+    Out o;
+    std::unique_ptr<H3> m;
+    try {
+      m = H3::load(file.string(), mc, pc, stream, lo);
+    } catch (const std::exception& e) {
+      std::printf("[minimax_h3_pruned] refused: %s\n", e.what());
+    }
+    if (m == nullptr) { return o; }
+    o.loaded = true;
+    o.modules = lo.empty() ? 0 : m->lora_modules(0);
+    o.lora_bytes = m->lora_bytes();
+    if (live >= 0.0f) { m->set_lora_scale(0, live); }
+    if (const auto* sc = m->sampling_contract()) {
+      o.contract = true;
+      o.sigmas = sc->sigmas;
+    }
+    m->set_gemm_route(H3::GemmRoute::kSteelBm32);
+    H3::Step st;
+    st.video = &vb;
+    st.audio = &abuf;
+    st.text = &tb;
+    st.layout = &lay;
+    st.timesteps = &uniq;
+    st.row_timestep_index = &ridx;
+    st.dwd_features = dwd;
+    if (dwd) { (void)m->time_embedding(uniq, nullptr, &o.pts); }
+    std::string ferr;
+    H3::Velocity out = m->forward(st, &ferr);
+    if (out.empty()) {
+      std::printf("[minimax_h3_pruned] forward: %s\n", ferr.c_str());
+      return o;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(out.video.contents());
+    o.v.assign(p, p + out.video.byte_size() / 2);
+    const auto* q = static_cast<const std::uint16_t*>(out.audio.contents());
+    o.a.assign(q, q + out.audio.byte_size() / 2);
+    if (dwd && !out.features.empty()) {
+      const auto* f =
+          static_cast<const std::uint16_t*>(out.features.contents());
+      o.f.assign(f, f + out.features.byte_size() / 2);
+    }
+    return o;
+  };
+  const Out b0 = run(fdit, {}, false);
+  const Out x1 = run(fdit, {{fad.string(), 1.0f}}, false);
+  const Out x1s = run(fdit, {{fad.string(), 1.0f}}, true);
+  const Out q1 = run(fpat, {{flo.string(), 1.0f}}, false);
+  const Out xh = run(fdit, {{fad.string(), 0.5f}}, false);
+  const Out qh = run(fpat, {{flo.string(), 0.5f}}, false);
+  const Out x0 = run(fdit, {{fad.string(), 1.0f}}, false, 0.0f);
+  const Out odd = run(fdit, {{fodd.string(), 1.0f}}, false);
+  const Out dwd = run(fdit, {{fdwd.string(), 1.0f}}, false);
+  const Out s3 = run(fdit, {{f3.string(), 1.0f}}, false);
+  const Out cyo = run(fdit, {{fcy.string(), 1.0f}}, false);
+  ASSERT_TRUE(b0.loaded && x1.loaded && q1.loaded && !b0.v.empty());
+  const double moved = rel_(x1.v, b0.v);
+  const double vs = rel_(x1.v, q1.v), vsa = rel_(x1.a, q1.a);
+  const double half = rel_(xh.v, qh.v);
+  std::printf("[minimax_h3_pruned] pi-H3's overwrites + LoRA: %d modules, "
+              "against the patched file %.3g (audio %.3g; at strength 0.5 "
+              "%.3g), the adapter moves the base %.3g; streamed %s; at 0 %s "
+              "the base\n", x1.modules, vs, vsa, half, moved,
+              x1s.v == x1.v ? "IDENTICAL" : "DIFFERENT",
+              x0.v == b0.v ? "IDENTICAL to" : "DIFFERENT from");
+  // The patched file holds the overwrites' exact values; the adapter adds
+  // the AdaLN's as its difference from the trunk's in f32, one rounding
+  // apart at most -- so agreement to well inside the adapter's effect.
+  EXPECT_TRUE(moved > 0.1);
+  EXPECT_TRUE(vs < 2e-3 && vsa < 2e-3 && half < 2e-3);
+  EXPECT_TRUE(x1s.v == x1.v);
+  EXPECT_TRUE(x0.v == b0.v);
+  // Overwrites: 2 AdaLN weights + 1 bias, 3 projections, final AdaLN
+  // weight + bias, norm, 4 head tensors = 13; LoRA 3.
+  EXPECT_TRUE(x1.modules == 13 + 3);
+  // The release's 4-step grid, and its schedules as the reference runs
+  // them (torch float32): video at shift 12, audio at 3.
+  const std::vector<float> g = H3::pi_flow_raw_grid(4);
+  ASSERT_TRUE(x1.contract && g.size() == 5 && x1.sigmas.size() == 5);
+  std::printf("[minimax_h3_pruned] pi-Flow 4-step raw grid %.6f %.6f %.6f "
+              "%.6f %.6f\n", g[0], g[1], g[2], g[3], g[4]);
+  MiniMaxH3Scheduler sv(12.0), sa(3.0);
+  ASSERT_TRUE(sv.set_sigmas(g) && sa.set_sigmas(g));
+  const float kV[] = {0.99654f, 0.96445f, 0.8993f, 0.69565f, 0.0f};
+  const float kA[] = {0.9863f, 0.87151f, 0.69065f, 0.36364f, 0.0f};
+  bool grid_ok = sv.sigmas().size() == 5 && sa.sigmas().size() == 5;
+  for (int i = 0; grid_ok && i < 5; ++i) {
+    grid_ok = std::fabs(sv.sigmas()[(std::size_t)i] - kV[i]) < 6e-6 &&
+              std::fabs(sa.sigmas()[(std::size_t)i] - kA[i]) < 6e-6 &&
+              (double)g[(std::size_t)i] == x1.sigmas[(std::size_t)i];
+  }
+  EXPECT_TRUE(grid_ok);
+  const std::vector<float> g2 = H3::pi_flow_raw_grid(2);
+  EXPECT_TRUE(g2.size() == 3 && H3::pi_flow_raw_grid(3).empty());
+  std::printf("[minimax_h3_pruned] refused: an unplaced tensor %s, a DWD "
+              "head with no modulation %s, a 3-step grid %s, ComfyUI's "
+              "spelling %s\n",
+              odd.loaded ? "LOADED" : "refused",
+              dwd.loaded ? "LOADED" : "refused",
+              s3.loaded ? "LOADED" : "refused",
+              cyo.loaded ? "LOADED" : "refused");
+  EXPECT_TRUE(!odd.loaded && !dwd.loaded && !s3.loaded && !cyo.loaded);
+  // Booked as held: the overwrites, the AdaLN differences and the LoRA,
+  // and the patch scratch once beside them.
+  const auto fp = H3::lora_footprint(fad.string(), LAYERS, &pc);
+  const std::size_t patch = (std::size_t)D * 9 * 4;
+  std::printf("[minimax_h3_pruned] booked %zu = held %zu + patch %zu\n",
+              fp.whole, x1.lora_bytes, patch);
+  EXPECT_TRUE(fp.whole == x1.lora_bytes + patch);
+
+  // DWD's features: the video rows' last hidden states, LayerNormed
+  // without an affine, then (1 + scale) x + shift with [scale | shift] =
+  // W silu(bf16(c)) + b at each row's timestep. Zero W and b give the
+  // plain norm; the random arm is held to it through the host's formula.
+  const Out dz = run(fdit, {{fdz.string(), 1.0f}}, false, -1.0f, true);
+  const Out dr = run(fdit, {{fdr.string(), 1.0f}}, false, -1.0f, true);
+  const Out dno = run(fdit, {{fad.string(), 1.0f}}, false, -1.0f, true);
+  const std::size_t nv = lay.video_indices.size();
+  ASSERT_TRUE(dz.loaded && dr.loaded && dz.f.size() == nv * H &&
+              dr.f.size() == nv * H && dr.v == dz.v);
+  if (dz.f.size() == nv * H && dr.f.size() == nv * H &&
+      dr.pts.size() == uniq.size() * 8) {
+    double mean_err = 0.0, var_err = 0.0;
+    for (std::size_t r = 0; r < nv; ++r) {
+      double m1 = 0.0, m2 = 0.0;
+      for (int c = 0; c < H; ++c) {
+        const double x = bf16f_(dz.f[r * H + (std::size_t)c]);
+        m1 += x;
+        m2 += x * x;
+      }
+      m1 /= H;
+      mean_err = std::max(mean_err, std::fabs(m1));
+      var_err = std::max(var_err, std::fabs(m2 / H - m1 * m1 - 1.0));
+    }
+    double d = 0.0, n = 0.0;
+    for (std::size_t r = 0; r < nv; ++r) {
+      const int ti = ridx[(std::size_t)lay.video_indices[r]];
+      float sv[8];
+      for (int k = 0; k < 8; ++k) {
+        const float p = bf16f_(rne_(dr.pts[(std::size_t)ti * 8 + k]));
+        sv[k] = bf16f_(rne_(p / (1.0f + std::exp(-p))));
+      }
+      for (int c = 0; c < H; ++c) {
+        double sc = dwd_b[(std::size_t)c], sh = dwd_b[(std::size_t)(H + c)];
+        for (int k = 0; k < 8; ++k) {
+          sc += (double)dwd_w[(std::size_t)c * 8 + k] * sv[k];
+          sh += (double)dwd_w[(std::size_t)(H + c) * 8 + k] * sv[k];
+        }
+        const double want =
+            (1.0 + sc) * bf16f_(dz.f[r * H + (std::size_t)c]) + sh;
+        const double got = bf16f_(dr.f[r * H + (std::size_t)c]);
+        d += (got - want) * (got - want);
+        n += want * want;
+      }
+    }
+    const double rel = std::sqrt(d / std::max(n, 1e-30));
+    std::printf("[minimax_h3_pruned] DWD features: the plain norm's rows "
+                "mean <= %.2g, var - 1 <= %.2g; modulated %.3g from the "
+                "host's formula; the velocity the adapter's own; a "
+                "non-DWD adapter asked for them %s\n", mean_err, var_err,
+                rel, dno.loaded && dno.v.empty() ? "REFUSED" : "ran");
+    EXPECT_TRUE(mean_err < 2e-2 && var_err < 3e-2 && rel < 6e-3);
+  }
+  EXPECT_TRUE(dno.loaded && dno.v.empty());
+  for (const fs::path& f :
+       {fdit, fpat, fad, flo, fodd, fdwd, f3, fdz, fdr, fcy}) {
+    fs::remove(f);
+  }
+  fs::remove(dir);
 }

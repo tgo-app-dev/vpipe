@@ -1,6 +1,7 @@
 #include "generative-models/train/train-ops.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 namespace vpipe {
@@ -61,6 +62,9 @@ TrainOps::init(metal_compute::MetalCompute* mc, bool bf16, std::string* err)
       {&_sqnorm, &_lib_ops, "train_sqnorm_partial"},
       {&_abs, &_lib_ops, "train_abs_partial"},
       {&_adamw, &_lib_ops, "train_adamw"},
+      {&_adamw8, &_lib_ops, "train_adamw8"},
+      {&_af_stats, &_lib_ops, "train_adafactor_stats"},
+      {&_af_update, &_lib_ops, "train_adafactor_update"},
       {&_lion, &_lib_ops, "train_lion"},
       {&_sgd, &_lib_ops, "train_sgd"},
       {&_prod_acc, &_lib_ops, "train_prodigy_accum"},
@@ -77,6 +81,13 @@ TrainOps::init(metal_compute::MetalCompute* mc, bool bf16, std::string* err)
       {&_pds, &_lib_attn, std::string("attn_bwd_pds_bd128_") + tsuf},
       {&_nn_f32_64x64, &_lib_gemm, "train_gemm_nn_f32_64x64"},
       {&_tn_64x64, &_lib_gemm, "train_gemm_tn_64x64"},
+      {&_rms_mod_bwd, &_lib_ops, "train_rms_mod_bwd"},
+      {&_gated_idx_bwd, &_lib_ops, "train_gated_idx_bwd"},
+      {&_swiglu_gf_bwd, &_lib_ops, "train_swiglu_gf_bwd"},
+      {&_rope_half_bwd, &_lib_ops, "train_rope_half_bwd"},
+      {&_rms_heads_bwd, &_lib_ops, "train_rms_heads_bwd"},
+      {&_band_expand, &_lib_ops, "train_band_expand"},
+      {&_band_extract, &_lib_ops, "train_band_extract_acc"},
   };
   for (const Want& w : want) {
     *w.fn = w.lib->function(w.name);
@@ -245,6 +256,134 @@ TrainOps::rope_bwd(ComputeEncoder& enc, const SharedBuffer& in, bool in_f32,
   enc.set_constant(8, (int)(in_f32 ? 1 : 0));
   enc.dispatch({(unsigned)(D / 2), (unsigned)T, (unsigned)H},
                {(unsigned)(D / 2), 1, 1});
+}
+
+void
+TrainOps::rms_mod_bwd(ComputeEncoder& enc, const SharedBuffer& x,
+                      std::size_t xe, const SharedBuffer& dout,
+                      std::size_t de, bool dout_f32, const SharedBuffer& w,
+                      const SharedBuffer& mod, std::size_t me,
+                      const SharedBuffer& idx, std::size_t ie,
+                      const SharedBuffer& dx, std::size_t dxe, int rows,
+                      int H, float eps, int stride, int scale_off,
+                      bool has_mod) const
+{
+  if (rows <= 0) { return; }
+  enc.set_function(_rms_mod_bwd);
+  enc.set_buffer(0, x, xe * _elt);
+  enc.set_buffer(1, dout, de * (dout_f32 ? 4 : _elt));
+  enc.set_buffer(2, dout, de * (dout_f32 ? 4 : _elt));
+  enc.set_buffer(3, w);
+  enc.set_buffer(4, has_mod ? mod : w, has_mod ? me * _elt : 0);
+  enc.set_buffer(5, has_mod ? idx : w, has_mod ? ie * 4 : 0);
+  enc.set_buffer(6, dx, dxe * 4);
+  enc.set_constant(7, H);
+  enc.set_constant(8, eps);
+  enc.set_constant(9, (int)(dout_f32 ? 1 : 0));
+  enc.set_constant(10, stride);
+  enc.set_constant(11, scale_off);
+  enc.set_constant(12, (int)(has_mod ? 1 : 0));
+  enc.dispatch({(unsigned)kTg, (unsigned)rows, 1}, {(unsigned)kTg, 1, 1});
+}
+
+void
+TrainOps::gated_idx_bwd(ComputeEncoder& enc, const SharedBuffer& dh,
+                        std::size_t he, const SharedBuffer& mod,
+                        std::size_t me, const SharedBuffer& idx,
+                        std::size_t ie, const SharedBuffer& dsub,
+                        std::size_t se, int rows, int N, int stride,
+                        int gate_off, bool has_gate) const
+{
+  if (rows <= 0) { return; }
+  enc.set_function(_gated_idx_bwd);
+  enc.set_buffer(0, dh, he * 4);
+  enc.set_buffer(1, has_gate ? mod : dh, has_gate ? me * _elt : 0);
+  enc.set_buffer(2, has_gate ? idx : dh, has_gate ? ie * 4 : 0);
+  enc.set_buffer(3, dsub, se * _elt);
+  enc.set_constant(4, N);
+  enc.set_constant(5, rows);
+  enc.set_constant(6, stride);
+  enc.set_constant(7, gate_off);
+  enc.set_constant(8, (int)(has_gate ? 1 : 0));
+  enc.dispatch({(unsigned)N, (unsigned)rows, 1}, {256, 1, 1});
+}
+
+void
+TrainOps::swiglu_gf_bwd(ComputeEncoder& enc, const SharedBuffer& gu,
+                        const SharedBuffer& ds, const SharedBuffer& dgu,
+                        int rows, int W) const
+{
+  const std::size_t n = (std::size_t)rows * W;
+  if (n == 0) { return; }
+  enc.set_function(_swiglu_gf_bwd);
+  enc.set_buffer(0, gu); enc.set_buffer(1, ds); enc.set_buffer(2, dgu);
+  enc.set_constant(3, rows);
+  enc.set_constant(4, W);
+  enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+}
+
+void
+TrainOps::rope_half_bwd(ComputeEncoder& enc, const SharedBuffer& in,
+                        bool in_f32, const SharedBuffer& out, std::size_t oe,
+                        const SharedBuffer& cosb, const SharedBuffer& sinb,
+                        int H, int T, int D, int rot, int ld, int off,
+                        int hs) const
+{
+  if (T <= 0) { return; }
+  enc.set_function(_rope_half_bwd);
+  enc.set_buffer(0, in);
+  enc.set_buffer(1, in);
+  enc.set_buffer(2, out, oe * _elt);
+  enc.set_buffer(3, rot > 0 ? cosb : in);
+  enc.set_buffer(4, rot > 0 ? sinb : in);
+  enc.set_constant(5, H); enc.set_constant(6, T); enc.set_constant(7, D);
+  enc.set_constant(8, rot); enc.set_constant(9, ld);
+  enc.set_constant(10, off); enc.set_constant(11, hs);
+  enc.set_constant(12, (int)(in_f32 ? 1 : 0));
+  enc.dispatch({(unsigned)D, (unsigned)T, (unsigned)H},
+               {(unsigned)D, 1, 1});
+}
+
+void
+TrainOps::rms_heads_bwd(ComputeEncoder& enc, const SharedBuffer& x,
+                        const SharedBuffer& dq, const SharedBuffer& w, int T,
+                        int H, int D, int ld, int off, int hs,
+                        float eps) const
+{
+  if (T <= 0) { return; }
+  enc.set_function(_rms_heads_bwd);
+  enc.set_buffer(0, x); enc.set_buffer(1, dq); enc.set_buffer(2, w);
+  enc.set_constant(3, T); enc.set_constant(4, H); enc.set_constant(5, D);
+  enc.set_constant(6, ld); enc.set_constant(7, off);
+  enc.set_constant(8, hs); enc.set_constant(9, eps);
+  enc.dispatch({32, ceil_div((std::size_t)T * H, 8) * 8, 1}, {32, 8, 1});
+}
+
+void
+TrainOps::band_expand(ComputeEncoder& enc, const SharedBuffer& b,
+                      std::size_t be, const SharedBuffer& out, int n, int r,
+                      int parts, int group) const
+{
+  if (n <= 0 || r <= 0) { return; }
+  enc.set_function(_band_expand);
+  enc.set_buffer(0, b, be * _elt); enc.set_buffer(1, out);
+  enc.set_constant(2, n); enc.set_constant(3, r);
+  enc.set_constant(4, parts); enc.set_constant(5, group);
+  enc.dispatch({(unsigned)(parts * r), (unsigned)n, 1}, {64, 1, 1});
+}
+
+void
+TrainOps::band_extract_acc(ComputeEncoder& enc, const SharedBuffer& src,
+                           const SharedBuffer& dst, std::size_t de, int n,
+                           int r, int parts, int group, float alpha) const
+{
+  if (n <= 0 || r <= 0) { return; }
+  enc.set_function(_band_extract);
+  enc.set_buffer(0, src); enc.set_buffer(1, dst, de * 4);
+  enc.set_constant(2, n); enc.set_constant(3, r);
+  enc.set_constant(4, parts); enc.set_constant(5, group);
+  enc.set_constant(6, alpha);
+  enc.dispatch({(unsigned)r, (unsigned)n, 1}, {32, 1, 1});
 }
 
 void
@@ -562,6 +701,87 @@ TrainOps::adamw(ComputeEncoder& enc, const SharedBuffer& p,
   enc.set_buffer(3, v); enc.set_buffer(4, shadow);
   enc.set_constant(5, o);
   enc.dispatch({(unsigned)o.n, 1, 1}, {256, 1, 1});
+}
+
+void
+TrainOps::adamw8(ComputeEncoder& enc, const SharedBuffer& p,
+                 const SharedBuffer& g, const SharedBuffer& qm,
+                 const SharedBuffer& qv, const SharedBuffer& amax,
+                 const SharedBuffer& shadow, const SharedBuffer& codes,
+                 const OptParams& o) const
+{
+  if (o.n <= 0) { return; }
+  const std::size_t blocks = ceil_div((std::size_t)o.n, kOpt8Block);
+  enc.set_function(_adamw8);
+  enc.set_buffer(0, p); enc.set_buffer(1, g); enc.set_buffer(2, qm);
+  enc.set_buffer(3, qv); enc.set_buffer(4, amax); enc.set_buffer(5, shadow);
+  enc.set_constant(6, o);
+  enc.set_buffer(7, codes);
+  enc.dispatch({(unsigned)(blocks * kOpt8Block), 1, 1},
+               {(unsigned)kOpt8Block, 1, 1});
+}
+
+void
+TrainOps::adafactor_stats(ComputeEncoder& enc, const SharedBuffer& g,
+                          const SharedBuffer& state,
+                          const SharedBuffer& mats, const AfParams& o,
+                          bool rows) const
+{
+  if (o.total <= 0 || o.nmat <= 0) { return; }
+  const std::size_t groups = ceil_div((std::size_t)o.total, 8);
+  enc.set_function(_af_stats);
+  enc.set_buffer(0, g); enc.set_buffer(1, state); enc.set_buffer(2, mats);
+  enc.set_constant(3, o);
+  enc.set_constant(4, (int)(rows ? 1 : 0));
+  enc.dispatch({(unsigned)(groups * 256), 1, 1}, {256, 1, 1});
+}
+
+void
+TrainOps::adafactor_update(ComputeEncoder& enc, const SharedBuffer& p,
+                           const SharedBuffer& g, const SharedBuffer& state,
+                           const SharedBuffer& mats, const SharedBuffer& usq,
+                           const SharedBuffer& shadow, const AfParams& o,
+                           int pass) const
+{
+  if (o.nmat <= 0) { return; }
+  enc.set_function(_af_update);
+  enc.set_buffer(0, p); enc.set_buffer(1, g); enc.set_buffer(2, state);
+  enc.set_buffer(3, mats); enc.set_buffer(4, usq); enc.set_buffer(5, shadow);
+  enc.set_constant(6, o);
+  enc.set_constant(7, pass);
+  enc.dispatch({(unsigned)o.nmat * 256u, 1, 1}, {256, 1, 1});
+}
+
+std::vector<float>
+TrainOps::adamw8_codes()
+{
+  // Per decade i (values in [0.1, 1) x 10^(i - 6), i = 0..6): the means
+  // of a linspace(0.1, 1) of 2^i + 1 points (signed, each sign) or of
+  // 2^(i + 1) + 1 (unsigned); then 0 and 1. 256 values each.
+  auto build = [](bool sgn) {
+    std::vector<double> d;
+    for (int i = 0; i < 7; ++i) {
+      const int items = (sgn ? (1 << i) : (1 << (i + 1))) + 1;
+      const double scale = std::pow(10.0, (double)(i - 6));
+      for (int k = 0; k + 1 < items; ++k) {
+        const double b0 = 0.1 + 0.9 * (double)k / (double)(items - 1);
+        const double b1 = 0.1 + 0.9 * (double)(k + 1) / (double)(items - 1);
+        const double mean = 0.5 * (b0 + b1);
+        d.push_back(scale * mean);
+        if (sgn) { d.push_back(-scale * mean); }
+      }
+    }
+    d.push_back(0.0);
+    d.push_back(1.0);
+    std::sort(d.begin(), d.end());
+    std::vector<float> f(d.begin(), d.end());
+    f.resize(256, 0.0f);
+    return f;
+  };
+  std::vector<float> out = build(true);
+  const std::vector<float> u = build(false);
+  out.insert(out.end(), u.begin(), u.end());
+  return out;
 }
 
 void

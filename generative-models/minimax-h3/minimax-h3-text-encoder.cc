@@ -292,6 +292,54 @@ MiniMaxH3TextEncoder::streaming_floor_bytes(const std::string& enc_dir)
   return 0;
 }
 
+std::size_t
+MiniMaxH3TextEncoder::presentation_bytes(const Config& c, int n,
+                                         int vision_rows, int n_deepstack,
+                                         bool matrix_cores, bool dense)
+{
+  if (n <= 0) { return 0; }
+  const std::size_t N = (std::size_t)n, H = (std::size_t)c.lm.hidden;
+  const std::size_t taps = std::max<std::size_t>(c.taps.size(), 1);
+  std::size_t b = N * H * 2                          // the embedding rows
+                  + taps * N * H * 2                 // the taps
+                  + 2 * N * (std::size_t)c.lm.rotary_dim * 2;  // cos / sin
+  b += (std::size_t)std::max(n_deepstack, 0) *
+       (std::size_t)std::max(vision_rows, 0) * H * 2;
+  // A taps forward is forward_chunk_ over all n rows (one pass), its K/V
+  // in the context's paged pool, the MLP's second buffer (a dense, mixed
+  // or k-quant stack's; booked for a pack too -- the config cannot tell
+  // a mixed one), the dequant scratch only where the stack is quantized
+  // (`dense` says which).
+  b += MetalQwenModel::run_bytes(c.lm, n, 1, /*one_pass=*/true,
+                                 /*plain_mlp=*/true, matrix_cores, n, dense);
+  if (!c.connector.empty()) {
+    // [n, text_dim] bf16, and connect()'s 256-row f32 block on the host.
+    b += N * (std::size_t)c.text_dim * 2 +
+         256 * (taps * H + (std::size_t)c.text_dim) * 4;
+  }
+  return b;
+}
+
+bool
+MiniMaxH3TextEncoder::dense_checkpoint(const Config& c,
+                                       const std::string& enc_dir)
+{
+  if (c.lm.load_quant_bits == 8) { return false; }
+  auto wts = MetalLlamaWeights::open_model(c.weights.empty() ? enc_dir
+                                                             : c.weights);
+  if (!wts.has_value()) { return false; }
+  // streaming_floor_bytes' spellings: the release, Comfy-Org's repack, the
+  // bare Qwen3-VL / Qwen3.5 stacks.
+  for (const char* stem : {"model.language_model.layers.",
+                           "model.layers.", "language_model.layers."}) {
+    const std::string l0 = std::string(stem) + "0.mlp.down_proj";
+    if (wts->has(l0 + ".weight") || wts->has(l0 + ".scales")) {
+      return MetalQwenModel::dense_checkpoint(*wts, stem);
+    }
+  }
+  return false;
+}
+
 std::string
 MiniMaxH3TextEncoder::resolve_encoder_dir(const std::string& path)
 {

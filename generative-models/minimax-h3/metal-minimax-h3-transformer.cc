@@ -42,6 +42,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+
 namespace vpipe {
 namespace genai {
 
@@ -1100,6 +1103,57 @@ MetalMiniMaxH3Transformer::step_heads_bytes() const
   std::size_t n = 0;
   for (const Linear& l : _step_out) { n += l.w.byte_size() + l.b.byte_size(); }
   return n;
+}
+
+SharedBuffer
+MetalMiniMaxH3Transformer::text_shift_buffer(const std::vector<float>& v) const
+{
+  if ((int)v.size() != _cfg.hidden) { return {}; }
+  SharedBuffer b = _mc->make_shared_buffer(v.size() * 2);
+  if (b.empty()) { return b; }
+  auto* d = static_cast<std::uint16_t*>(b.contents());
+  for (std::size_t i = 0; i < v.size(); ++i) { d[i] = f32_to_bf16_(v[i]); }
+  return b;
+}
+
+bool
+MetalMiniMaxH3Transformer::set_dials(const std::vector<float>& pre,
+                                     const std::vector<float>& post,
+                                     std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const std::size_t H = (std::size_t)_cfg.hidden;
+  if ((!pre.empty() && pre.size() != H) ||
+      (!post.empty() && post.size() != H)) {
+    return fail(fmt("a dial must be {} wide (this DiT's hidden size)", H)());
+  }
+  // New buffers, never these rewritten: a forward encoded with the old
+  // ones keeps them by reference.
+  SharedBuffer bias, shift;
+  if (!pre.empty()) {
+    // The bias as ComfyUI patches it, `weight += strength * diff` in f32
+    // and the sum rounded once to the bias's bf16.
+    bias = _mc->make_shared_buffer(H * 2);
+    if (bias.empty()) { return fail("no memory for a dial's bias"); }
+    const auto* b = _cond_proj.b.empty()
+                        ? nullptr
+                        : static_cast<const std::uint16_t*>(
+                              _cond_proj.b.contents());
+    auto* d = static_cast<std::uint16_t*>(bias.contents());
+    for (std::size_t i = 0; i < H; ++i) {
+      d[i] = f32_to_bf16_((b != nullptr ? bf16_to_f32_(b[i]) : 0.0f) + pre[i]);
+    }
+  }
+  if (!post.empty()) {
+    shift = text_shift_buffer(post);
+    if (shift.empty()) { return fail("no memory for a dial's shift"); }
+  }
+  _dial_bias = std::move(bias);
+  _dial_post = std::move(shift);
+  return true;
 }
 
 MetalMiniMaxH3Transformer::Linear
@@ -3389,6 +3443,112 @@ MetalMiniMaxH3Transformer::lora_stack_final_() const
   return st;
 }
 
+const MetalMiniMaxH3Transformer::Block&
+MetalMiniMaxH3Transformer::set_block_(int L, const Block& b,
+                                      Block& tmp) const
+{
+  // Buffers are not copyable: the substitute block holds refcount-
+  // sharing aliases of the block's (and the overwrites') allocations,
+  // released when it goes, after the block's commit has retained them.
+  auto al = [](const SharedBuffer& s) {
+    return s.empty() ? SharedBuffer{} : s.subview(0, s.byte_size());
+  };
+  // EVERY field of a Linear: one added there must be added here, or a
+  // substitute block runs without it (the size pins the list).
+  static_assert(sizeof(Linear) == 2064,
+                "a field added to Linear must be aliased in set_block_");
+  auto lin = [&](const Linear& s, Linear& d) {
+    d.w = al(s.w); d.b = al(s.b);
+    d.codes = al(s.codes); d.scales = al(s.scales); d.qbias = al(s.qbias);
+    d.quantized = s.quantized; d.bits = s.bits; d.gu_inter = s.gu_inter;
+    d.f8 = s.f8; d.f8_scale = al(s.f8_scale); d.f8_per_row = s.f8_per_row;
+    d.f8_rot = s.f8_rot; d.f8_srel = al(s.f8_srel); d.f8_cb = al(s.f8_cb);
+    d.f8_qgroup = s.f8_qgroup; d.f8_nhi = s.f8_nhi; d.f8_swz = s.f8_swz;
+    d.f8_pq = al(s.f8_pq); d.gc = s.gc; d.n = s.n; d.k = s.k;
+    d.cscales = al(s.cscales); d.i8x = s.i8x; d.cr = s.cr;
+    d.cr_w4 = s.cr_w4; d.pc = s.pc; d.ds = s.ds; d.ps = s.ps;
+  };
+  bool any = false;
+  for (const LoraSlot& sl : _lora) {
+    if (sl.scale == 0.0f || (std::size_t)L >= sl.set_blocks.size()) {
+      continue;
+    }
+    const LoraSlot::SetBlock& sb = sl.set_blocks[(std::size_t)L];
+    if (sb.out.w.empty() && sb.fc1.w.empty() && sb.fc2.w.empty()) {
+      continue;
+    }
+    if (!any) {
+      any = true;
+      tmp.n1 = al(b.n1); tmp.n2 = al(b.n2);
+      tmp.qn = al(b.qn); tmp.kn = al(b.kn);
+      lin(b.qkv, tmp.qkv); lin(b.out, tmp.out); lin(b.fc1, tmp.fc1);
+      lin(b.fc2, tmp.fc2); lin(b.adaln, tmp.adaln);
+    }
+    if (!sb.out.w.empty()) { tmp.out = Linear{}; lin(sb.out, tmp.out); }
+    if (!sb.fc1.w.empty()) { tmp.fc1 = Linear{}; lin(sb.fc1, tmp.fc1); }
+    if (!sb.fc2.w.empty()) { tmp.fc2 = Linear{}; lin(sb.fc2, tmp.fc2); }
+  }
+  return any ? tmp : b;
+}
+
+const SharedBuffer&
+MetalMiniMaxH3Transformer::set_final_norm_() const
+{
+  for (const LoraSlot& sl : _lora) {
+    if (sl.scale != 0.0f && !sl.set_final_norm.empty()) {
+      return sl.set_final_norm;
+    }
+  }
+  return _final_norm;
+}
+
+const MetalMiniMaxH3Transformer::Linear&
+MetalMiniMaxH3Transformer::set_video_out_() const
+{
+  for (const LoraSlot& sl : _lora) {
+    if (sl.scale != 0.0f && !sl.set_video_out.w.empty()) {
+      return sl.set_video_out;
+    }
+  }
+  return _video_out;
+}
+
+const MetalMiniMaxH3Transformer::Linear&
+MetalMiniMaxH3Transformer::set_audio_out_() const
+{
+  for (const LoraSlot& sl : _lora) {
+    if (sl.scale != 0.0f && !sl.set_audio_out.w.empty()) {
+      return sl.set_audio_out;
+    }
+  }
+  return _audio_out;
+}
+
+bool
+MetalMiniMaxH3Transformer::lora_overwrites() const
+{
+  for (const LoraSlot& sl : _lora) {
+    if (sl.sets > 0 || sl.dwd) { return true; }
+  }
+  return false;
+}
+
+int
+MetalMiniMaxH3Transformer::dwd_slot() const
+{
+  for (std::size_t i = 0; i < _lora.size(); ++i) {
+    if (_lora[i].dwd && _lora[i].scale != 0.0f) { return (int)i; }
+  }
+  return -1;
+}
+
+std::string
+MetalMiniMaxH3Transformer::dwd_file() const
+{
+  const int i = dwd_slot();
+  return i < 0 ? std::string() : _lora[(std::size_t)i].path;
+}
+
 int
 MetalMiniMaxH3Transformer::lora_modules() const
 {
@@ -3427,6 +3587,16 @@ MetalMiniMaxH3Transformer::lora_bytes() const
          {&sl.time_in, &sl.time_out, &sl.end_in, &sl.end_out}) {
       n += (h->a.size() + h->b.size()) * sizeof(float);
     }
+    // Its whole-tensor overwrites (bind_sets_): bf16 projections and
+    // heads, the AdaLN's f32 differences, DWD's modulation on the host.
+    auto lb = [](const Linear& l) { return l.w.byte_size() + l.b.byte_size(); };
+    for (const LoraSlot::SetBlock& sb : sl.set_blocks) {
+      n += lb(sb.out) + lb(sb.fc1) + lb(sb.fc2);
+    }
+    n += lb(sl.set_video_out) + lb(sl.set_audio_out) +
+         sl.set_final_norm.byte_size() + sl.pset_final.byte_size();
+    for (const SharedBuffer& d : sl.pset) { n += d.byte_size(); }
+    n += sl.dwd_norm.size() * sizeof(float);
   }
   // ...and the set a streamed block's factors are read into.
   for (const BlockLora& bl : _lora_stream) {
@@ -3483,6 +3653,7 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
            n.find("norm_out.linear") != std::string::npos;
   };
   std::set<std::string> deltas;
+  bool patch = false;   // the patch scratch, booked once
   if (pruned != nullptr && pruned->pruned()) {
     for (const std::string& nm : wts->tensor_names()) {
       if (!adaln_(nm)) { continue; }
@@ -3507,6 +3678,7 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
     if (!deltas.empty()) {
       fp.whole += (std::size_t)std::max(pruned->adaln_out(),
                                         2 * pruned->hidden) * 9 * 4;
+      patch = true;
     }
     // The released MLP, to the host in f32, for an adapter that moves
     // the embedding (its tables are the denoise's: off_curve_bytes).
@@ -3645,6 +3817,50 @@ MetalMiniMaxH3Transformer::lora_footprint(const std::string& path,
       fp.rank = std::max(fp.rank, w);
     }
   }
+  // WHOLE-TENSOR OVERWRITES (bind_sets_), held resident beside the
+  // factors whether the blocks stream or not: projections and heads at
+  // bf16, an AdaLN's as its f32 difference [d * 8 + d] once a module,
+  // DWD's modulation f32 on the host. The pixel head is vae-decode's.
+  for (const std::string& nm : wts->tensor_names()) {
+    if (nm.find(".lora_") != std::string::npos ||
+        nm.find(".curve_") != std::string::npos ||
+        nm.compare(0, 18, "dwd_pixel_refiner.") == 0) {
+      continue;
+    }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    auto ends = [&](const char* x) {
+      const std::size_t k = std::strlen(x);
+      return nm.size() >= k && nm.compare(nm.size() - k, k, x) == 0;
+    };
+    std::size_t n = 1;
+    for (auto d : ti->shape) { n *= (std::size_t)d; }
+    std::size_t end = 0;
+    const int L = nm.compare(0, 19, "transformer_blocks.") == 0
+                      ? adapter_main_block_(nm, &end) : -1;
+    if (L >= 0 && n_layers > 0 && L >= n_layers) { continue; }
+    if ((L >= 0 && ends(".adaln_proj.linear.weight")) ||
+        nm == "norm_out.linear.weight") {
+      if (!ti->shape.empty()) {
+        fp.whole += (std::size_t)ti->shape[0] * 9 * 4;
+      }
+      if (!patch && pruned != nullptr && pruned->pruned()) {
+        fp.whole += (std::size_t)std::max(pruned->adaln_out(),
+                                          2 * pruned->hidden) * 9 * 4;
+        patch = true;
+      }
+    } else if (nm == "dwd_norm_out.linear.weight" ||
+               nm == "dwd_norm_out.linear.bias") {
+      fp.whole += n * 4;
+    } else if ((L >= 0 && (ends(".attn.to_out.0.weight") ||
+                           ends(".ff.net.0.proj.weight") ||
+                           ends(".ff.net.2.weight"))) ||
+               nm == "norm_out.norm.weight" || nm == "proj_out.weight" ||
+               nm == "proj_out.bias" || nm == "audio_proj_out.weight" ||
+               nm == "audio_proj_out.bias") {
+      fp.whole += n * 2;
+    }
+  }
   std::size_t set = 0;
   for (const auto& [role, b] : per_role) { set += b; }
   fp.streamed = main > 0 ? fp.whole - main + set : fp.whole;
@@ -3688,6 +3904,91 @@ MetalMiniMaxH3Transformer::set_lora_scale(int slot, float s)
   if (slot >= 0 && (std::size_t)slot < _lora.size()) {
     _lora[(std::size_t)slot].scale = s;
   }
+}
+
+// A trainer's adapter: the module walk bind_lora_ does for a file, asking
+// `fn` instead. Appended after every file's slot, so the scratch's earlier
+// regions keep their places.
+int
+MetalMiniMaxH3Transformer::bind_live_lora(const LiveLoraFn& fn, int* slot,
+                                          std::string* err)
+{
+  auto no = [&](std::string m) {
+    if (err != nullptr) { *err = "minimax-h3 live lora: " + std::move(m); }
+    return 0;
+  };
+  if (!fn) { return no("no factors"); }
+  if ((int)_lora.size() >= kMaxLoraSlots) {
+    return no(fmt("all {} adapter slots are taken", kMaxLoraSlots)());
+  }
+  if (!_fn_gemm_acc.valid()) {
+    return no("this build has no accumulating GEMM for an adapter");
+  }
+  if (_cfg.tp.active()) { return no("a rank of a split DiT"); }
+  const Config& c = _cfg;
+  const int H = c.hidden, I = c.inner(), F = c.ffn;
+  LoraSlot sl;
+  sl.scale = 1.0f;
+  int bound = 0;
+  auto ask = [&](const std::string& m, int n, int k, LoraFactors& f) {
+    LoraFactors x;
+    if (!fn(m, n, k, &x) || x.empty()) { return; }
+    if (x.banded() && !_fn_gemm_acc_band.valid()) { return; }
+    f = std::move(x);
+    ++bound;
+    if (f.banded()) { ++sl.banded; }
+    sl.max_rank = std::max(sl.max_rank, f.rank);
+  };
+  auto walk = [&](const std::string& p, BlockLora& bl) {
+    ask(p + "attn.qkv_proj", 3 * I, H, bl.qkv);
+    ask(p + "attn.out_proj", H, I, bl.out);
+    ask(p + "mlp.fc1", 2 * F, H, bl.fc1);
+    ask(p + "mlp.fc2", H, F, bl.fc2);
+  };
+  sl.blocks.resize((std::size_t)c.n_layers);
+  for (int i = 0; i < c.n_layers; ++i) {
+    walk(blk_("blocks.", i, ""), sl.blocks[(std::size_t)i]);
+  }
+  sl.refiner.resize((std::size_t)c.n_refiner);
+  for (int i = 0; i < c.n_refiner; ++i) {
+    walk(blk_("token_refiner.blocks.", i, ""), sl.refiner[(std::size_t)i]);
+  }
+  if (bound == 0) { return no("no module bound"); }
+  sl.modules = bound;
+  sl.rank_prefix = _lora_rank_total;
+  _lora_rank_total += sl.max_rank;
+  _lora.push_back(std::move(sl));
+  // A streamed DiT's spill tables are per slot: this one spills nothing.
+  if (_lora_spill.size() < _lora.size()) { _lora_spill.resize(_lora.size()); }
+  if (_lora_stream.size() < _lora.size()) {
+    _lora_stream.resize(_lora.size());
+  }
+  // The [rows, rank] scratch is sized by the slots: rebuilt next forward.
+  _s.seq = -1;
+  if (slot != nullptr) { *slot = (int)_lora.size() - 1; }
+  return bound;
+}
+
+void
+MetalMiniMaxH3Transformer::release_live_lora(int slot)
+{
+  if (slot < 0 || (std::size_t)slot >= _lora.size()) { return; }
+  if ((std::size_t)slot + 1 == _lora.size()) {
+    _lora_rank_total = _lora[(std::size_t)slot].rank_prefix;
+    _lora.pop_back();
+    if (_lora_spill.size() > _lora.size()) { _lora_spill.resize(_lora.size()); }
+    if (_lora_stream.size() > _lora.size()) {
+      _lora_stream.resize(_lora.size());
+    }
+    _s.seq = -1;
+    return;
+  }
+  // Not the last: keep its place, read nothing of it again.
+  LoraSlot& sl = _lora[(std::size_t)slot];
+  for (BlockLora& b : sl.blocks) { b = BlockLora{}; }
+  for (BlockLora& b : sl.refiner) { b = BlockLora{}; }
+  sl.scale = 0.0f;
+  sl.modules = 0;
 }
 
 float
@@ -4102,30 +4403,38 @@ MetalMiniMaxH3Transformer::pruned_mod_(ComputeEncoder& enc,
   // block's patch is read before the next block's overwrites it.
   const std::size_t nw = (std::size_t)D * 8;
   bool first = true;
+  // A slot's overwrites (pset, bind_sets_) are its difference from the
+  // trunk's weight, added WHOLE -- at 1, not the slot's strength -- while
+  // the slot is live.
   for (const LoraSlot& sl : _lora) {
-    const SharedBuffer* dp =
-        L < 0 ? &sl.pdelta_final
-              : (std::size_t)L < sl.pdelta.size() ? &sl.pdelta[(std::size_t)L]
-                                                  : nullptr;
-    if (dp == nullptr || dp->empty() || sl.scale == 0.0f ||
-        _padaln_patch.empty()) {
-      continue;
+    for (int kind = 0; kind < 2; ++kind) {
+      const auto& per = kind == 0 ? sl.pdelta : sl.pset;
+      const SharedBuffer& fin = kind == 0 ? sl.pdelta_final : sl.pset_final;
+      const SharedBuffer* dp =
+          L < 0 ? &fin
+                : (std::size_t)L < per.size() ? &per[(std::size_t)L]
+                                              : nullptr;
+      if (dp == nullptr || dp->empty() || sl.scale == 0.0f ||
+          _padaln_patch.empty()) {
+        continue;
+      }
+      const SharedBuffer& d = *dp;
+      const float s = kind == 0 ? sl.scale : 1.0f;
+      for (int part = 0; part < 2; ++part) {
+        const int n = part == 0 ? (int)nw : D;
+        const std::size_t off = part == 0 ? 0 : nw * 4;
+        enc.set_function(_fn_pruned_patch);
+        enc.set_buffer(0, _padaln_patch, off);
+        enc.set_buffer(1, part == 0 ? p.w : p.b);
+        enc.set_buffer(2, d, off);
+        enc.set_constant(3, n);
+        enc.set_constant(4, p.dtype);
+        enc.set_constant(5, s);
+        enc.set_constant(6, first ? 1 : 0);
+        enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+      }
+      first = false;
     }
-    const SharedBuffer& d = *dp;
-    for (int part = 0; part < 2; ++part) {
-      const int n = part == 0 ? (int)nw : D;
-      const std::size_t off = part == 0 ? 0 : nw * 4;
-      enc.set_function(_fn_pruned_patch);
-      enc.set_buffer(0, _padaln_patch, off);
-      enc.set_buffer(1, part == 0 ? p.w : p.b);
-      enc.set_buffer(2, d, off);
-      enc.set_constant(3, n);
-      enc.set_constant(4, p.dtype);
-      enc.set_constant(5, sl.scale);
-      enc.set_constant(6, first ? 1 : 0);
-      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
-    }
-    first = false;
   }
   enc.set_function(res != nullptr ? _fn_pruned_res : _fn_pruned_mod);
   enc.set_buffer(0, out);
@@ -4358,6 +4667,236 @@ MetalMiniMaxH3Transformer::ensure_curve_basis_(std::string* err)
 // released one pruned (W8 = W U, b8 = b + W m), and the released AdaLN's
 // view of the remainder where the file merged another. One block's
 // weight in memory at a time.
+// PRUNE AT LOAD (Config::prune_adaln). The released AdaLN reads
+// silu(temb(t)), a 2688-wide point that, over t in [0, 1], traces a curve
+// whose energy past 8 principal dims is ~2e-9 -- which is what ComfyUI's
+// pruned files store as `adaln_t_table`. So: sample the curve at 1025
+// knots off THIS checkpoint's MLP (f32), take its mean m and its 8-dim
+// principal subspace U (orthonormal; orthogonal iteration on the knots'
+// Gram matrix), and fold every projection through it on the GPU:
+// W' = W U, b' = W m + b, f32. A forward's coordinates are then exact,
+// c(t) = U^T (s(t) - m) off the host MLP (time_embedding).
+bool
+MetalMiniMaxH3Transformer::prune_adaln_at_load_(WeightSet& ws,
+                                                std::string* err)
+{
+  auto no = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  const Config& c = _cfg;
+  if (c.pruned()) { return no("the checkpoint is already pruned"); }
+  if (c.tp.active()) { return no("a rank of a split DiT holds no AdaLN"); }
+  const int M = c.time_dim, HT = c.time_hidden, FQ = c.freq_dim;
+  if ((int)_time_in_w.size() != HT * FQ ||
+      (int)_time_out_w.size() != M * HT) {
+    return no("the timestep MLP is not loaded");
+  }
+  using PClock = std::chrono::steady_clock;
+  const auto t0 = PClock::now();
+  // ---- the curve, its mean and its principal subspace -----------------
+  constexpr int G = 1025, R = 8;
+  std::vector<double> S((std::size_t)G * M);
+  {
+    const int parts = 8;
+    std::vector<std::future<void>> fs;
+    for (int pi = 0; pi < parts; ++pi) {
+      fs.push_back(std::async(std::launch::async, [&, pi]() {
+        std::vector<float> row((std::size_t)M);
+        for (int g = pi; g < G; g += parts) {
+          time_mlp_row_((double)g / (double)(G - 1), false, row.data(),
+                        /*base_only=*/true);
+          double* d = S.data() + (std::size_t)g * M;
+          for (int j = 0; j < M; ++j) {
+            const float a = row[(std::size_t)j];
+            d[j] = (double)(a / (1.0f + std::exp(-a)));
+          }
+        }
+      }));
+    }
+    for (auto& f : fs) { f.get(); }
+  }
+  double ss = 0.0;
+  for (double v : S) { ss += v * v; }
+  std::vector<double> mean((std::size_t)M, 0.0);
+  for (int g = 0; g < G; ++g) {
+    const double* d = S.data() + (std::size_t)g * M;
+    for (int j = 0; j < M; ++j) { mean[(std::size_t)j] += d[j]; }
+  }
+  for (double& v : mean) { v /= (double)G; }
+  for (int g = 0; g < G; ++g) {
+    double* d = S.data() + (std::size_t)g * M;
+    for (int j = 0; j < M; ++j) { d[j] -= mean[(std::size_t)j]; }
+  }
+  // The knots' Gram matrix, and its leading 8-dim invariant subspace.
+  std::vector<double> K((std::size_t)G * G);
+  cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, G, G, M, 1.0,
+              S.data(), M, S.data(), M, 0.0, K.data(), G);
+  auto orthonormalize = [](std::vector<double>& V, int n, int k) {
+    // Modified Gram-Schmidt over the k columns of a row-major [n, k],
+    // twice for the last digits.
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int a = 0; a < k; ++a) {
+        for (int b = 0; b < a; ++b) {
+          double dot = 0.0;
+          for (int i = 0; i < n; ++i) {
+            dot += V[(std::size_t)i * k + a] * V[(std::size_t)i * k + b];
+          }
+          for (int i = 0; i < n; ++i) {
+            V[(std::size_t)i * k + a] -= dot * V[(std::size_t)i * k + b];
+          }
+        }
+        double nn = 0.0;
+        for (int i = 0; i < n; ++i) {
+          nn += V[(std::size_t)i * k + a] * V[(std::size_t)i * k + a];
+        }
+        nn = std::sqrt(nn);
+        if (!(nn > 0.0)) { return false; }
+        for (int i = 0; i < n; ++i) { V[(std::size_t)i * k + a] /= nn; }
+      }
+    }
+    return true;
+  };
+  std::vector<double> V((std::size_t)G * R), KV((std::size_t)G * R);
+  for (int g = 0; g < G; ++g) {
+    for (int a = 0; a < R; ++a) {
+      V[(std::size_t)g * R + a] =
+          std::cos(0.37 * (double)(g + 1) * (double)(a + 1)) +
+          (a == 0 ? 1.0 : 0.0);
+    }
+  }
+  if (!orthonormalize(V, G, R)) { return no("the curve is degenerate"); }
+  for (int it = 0; it < 60; ++it) {
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, G, R, G, 1.0,
+                K.data(), G, V.data(), R, 0.0, KV.data(), R);
+    V.swap(KV);
+    if (!orthonormalize(V, G, R)) { return no("the curve is degenerate"); }
+  }
+  // U = S^T V spans the curve's subspace of the embedding; orthonormal.
+  std::vector<double> U((std::size_t)M * R);
+  cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, M, R, G, 1.0,
+              S.data(), M, V.data(), R, 0.0, U.data(), R);
+  if (!orthonormalize(U, M, R)) { return no("the curve is degenerate"); }
+  // Every knot's coordinates, and what the subspace leaves.
+  std::vector<double> P((std::size_t)G * R);
+  cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, G, R, M, 1.0,
+              S.data(), M, U.data(), R, 0.0, P.data(), R);
+  double rr = 0.0;
+  for (int g = 0; g < G; ++g) {
+    const double* d = S.data() + (std::size_t)g * M;
+    for (int j = 0; j < M; ++j) {
+      double fit = 0.0;
+      for (int a = 0; a < R; ++a) {
+        fit += P[(std::size_t)g * R + a] * U[(std::size_t)j * R + a];
+      }
+      rr += (d[j] - fit) * (d[j] - fit);
+    }
+  }
+  const double residual = ss > 0.0 ? std::sqrt(rr / ss) : 1.0;
+  if (residual > 1e-3) {
+    return no(fmt("the timestep embedding's curve does not lie in 8 dims "
+                  "(relative residual {:.3g})", residual)());
+  }
+  CurveBasis b;
+  b.mlp = M;
+  b.residual = residual;
+  b.u.resize((std::size_t)M * R);
+  b.m.resize((std::size_t)M);
+  b.pinv.resize((std::size_t)R * M);
+  for (int j = 0; j < M; ++j) {
+    b.m[(std::size_t)j] = (float)mean[(std::size_t)j];
+    for (int a = 0; a < R; ++a) {
+      const double u = U[(std::size_t)j * R + a];
+      b.u[(std::size_t)j * R + a] = (float)u;
+      b.pinv[(std::size_t)a * M + j] = (float)u;
+    }
+  }
+  std::vector<float> table((std::size_t)G * R);
+  for (std::size_t i = 0; i < table.size(); ++i) { table[i] = (float)P[i]; }
+
+  // ---- every projection onto it ----------------------------------------
+  if (!_lib_regen.valid()) {
+    _lib_regen = _mc->load_library("minimax_h3_regenerate_bf16");
+  }
+  const metal_compute::ComputeFunction fn_prune =
+      _lib_regen.function("h3_adaln_prune_f32");
+  _fn_pruned_mod = _lib_regen.function("h3_adaln_pruned_f16");
+  _fn_pruned_patch = _lib_regen.function("h3_adaln_patch_f32");
+  _fn_pruned_res = _lib_regen.function("h3_adaln_pruned_res_f16");
+  if (!fn_prune.valid() || !_fn_pruned_mod.valid() ||
+      !_fn_pruned_patch.valid() || !_fn_pruned_res.valid()) {
+    return no("the pruned AdaLN kernels are missing from this build");
+  }
+  SharedBuffer ub = _mc->make_shared_buffer(b.u.size() * 4);
+  SharedBuffer mb = _mc->make_shared_buffer(b.m.size() * 4);
+  if (ub.empty() || mb.empty()) { return no("basis allocation"); }
+  std::memcpy(ub.contents(), b.u.data(), b.u.size() * 4);
+  std::memcpy(mb.contents(), b.m.data(), b.m.size() * 4);
+  const bool had_deq = !_w_deq.empty();
+  std::vector<PrunedAdaln> blocks((std::size_t)c.n_layers);
+  PrunedAdaln fin;
+  CommandStream cs = _mc->make_command_stream();
+  std::size_t held = 0;
+  for (int L = -1; L < c.n_layers; ++L) {
+    const std::string nm = L < 0 ? std::string("final_layer.adaln_proj.linear")
+                                 : blk_("blocks.", L, "adaln_proj.linear");
+    const int D = L < 0 ? 2 * c.hidden : c.adaln_out();
+    Linear l = linear_(ws, nm, true, Retain::Streamed);
+    if (l.empty()) { return no("'" + nm + "' cannot be read"); }
+    if (l.quantized || l.gc > 0) {
+      return no("'" + nm + "' is quantized (a pack); only a dense or FP8 "
+                "AdaLN is pruned at load");
+    }
+    PrunedAdaln p;
+    p.dtype = 0;
+    p.w = _mc->make_shared_buffer((std::size_t)D * R * 4);
+    p.b = _mc->make_shared_buffer((std::size_t)D * 4);
+    if (p.w.empty() || p.b.empty()) { return no("projection allocation"); }
+    {
+      ComputeEncoder enc = cs.begin_compute();
+      Linear view;
+      const Linear* d = fp8_dense_(enc, l, view, D, M);
+      if (d == nullptr) { return no("'" + nm + "' cannot be widened"); }
+      enc.set_function(fn_prune);
+      enc.set_buffer(0, d->w);
+      enc.set_buffer(1, l.b.empty() ? d->w : l.b);
+      enc.set_buffer(2, ub);
+      enc.set_buffer(3, mb);
+      enc.set_buffer(4, p.w);
+      enc.set_buffer(5, p.b);
+      enc.set_constant(6, D);
+      enc.set_constant(7, M);
+      enc.set_constant(8, (int)(l.b.empty() ? 0 : 1));
+      enc.dispatch({(unsigned)(256 * ((D + 7) / 8)), 1, 1}, {256, 1, 1});
+    }
+    std::string gerr;
+    if (!cs.commit().wait_ok(&gerr)) { return no("the projection: " + gerr); }
+    held += p.w.byte_size() + p.b.byte_size();
+    (L < 0 ? fin : blocks[(std::size_t)L]) = std::move(p);
+  }
+  // The widening scratch an FP8 AdaLN grew is the AdaLN's, not a block's.
+  if (!had_deq) { _w_deq = SharedBuffer{}; }
+  _padaln = std::move(blocks);
+  _final_padaln = std::move(fin);
+  _final_adaln = Linear{};
+  _adaln_t_table = std::move(table);
+  _basis = std::move(b);
+  _cfg.curve_grid = G;
+  _cfg.time_dim = R;
+  if (_cfg.time_mlp_dir.empty()) { _cfg.time_mlp_dir = ws.dir(); }
+  _pruned_at_load = true;
+  if (_mc->session() != nullptr) {
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: AdaLN pruned at load -- {} projections "
+        "onto the timestep embedding's 8-dim curve (relative residual "
+        "{:.2g} over {} knots), {} MB held in place of the released "
+        "[D, {}] projections, {:.1f} s",
+        c.n_layers + 1, residual, G, held >> 20, M,
+        std::chrono::duration<double>(PClock::now() - t0).count()));
+  }
+  return true;
+}
+
 bool
 MetalMiniMaxH3Transformer::bake_pruned_off_curve_(
     const std::vector<float>& all, const std::vector<float>* all_r,
@@ -4622,6 +5161,342 @@ MetalMiniMaxH3Transformer::bind_pruned_adaln_(lora::Adapter* ad,
   return true;
 }
 
+// WHOLE-TENSOR OVERWRITES. pi-H3 (Lakonik/pi-H3) is a LoRA plus the
+// weights its distillation fine-tuned outright, both in the diffusers
+// spelling, and the reference (LakonLab's load: every non-factor key
+// assigned over the base state dict, then the LoRA fused at the
+// adapter's strength) applies the second whole whatever the strength:
+//
+//   transformer_blocks.N.adaln_proj.linear.weight [D, 8] (.bias [D])
+//                                         -> the pruned AdaLN, block N
+//   transformer_blocks.N.attn.to_out.0.weight     -> attn.out_proj
+//   transformer_blocks.N.ff.net.0.proj.weight     -> mlp.fc1, halves
+//                                                    swapped
+//   transformer_blocks.N.ff.net.2.weight          -> mlp.fc2
+//   norm_out.linear.weight [2H, 8] (.bias)        -> final AdaLN
+//   norm_out.norm.weight                          -> final_layer.norm
+//   proj_out / audio_proj_out (.weight, .bias)    -> the two heads
+//
+// (ComfyUI-piFlow's key map, read as data, is the same.) The AdaLN's are
+// [D, 8]: they read the pruned form's 8-dim point, so a released DiT --
+// whose AdaLN reads the 2688-wide embedding -- cannot take them and the
+// adapter is refused there. `dwd_*` is the pixel head (DWD): its
+// pixel refiner is vae-decode's to run; `dwd_norm_out` is the DiT's,
+// the modulation of the features it hands that head.
+bool
+MetalMiniMaxH3Transformer::bind_sets_(const std::string& path,
+                                      LoraSlot& slot, bool* took,
+                                      std::string* err)
+{
+  *took = false;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = "minimax-h3 lora: '" + path + "': " + m; }
+    return false;
+  };
+  auto ends = [](const std::string& s, const std::string& x) {
+    return s.size() >= x.size() &&
+           s.compare(s.size() - x.size(), x.size(), x) == 0;
+  };
+  auto factor = [&](const std::string& nm) {
+    return nm.find(".lora_") != std::string::npos ||
+           nm.find(".curve_") != std::string::npos || ends(nm, ".alpha") ||
+           ends(nm, ".diff") || ends(nm, ".diff_b");
+  };
+  // Header first: a file with no overwrite this reader knows is not one,
+  // whatever else it holds -- the binders after this read the rest.
+  auto wts = MetalLlamaWeights::open_model(path);
+  if (!wts.has_value()) { return true; }
+  const Config& c = _cfg;
+  const int H = c.hidden, D = c.adaln_out(), FD = 2 * H;
+  const int VPE = c.video_patch_elems(), AC = c.audio_channels;
+  const int I = full_inner_(), F = full_ffn_();
+  // Which overwrite a name is: its block (-1 top level) and its place.
+  enum class Kind {
+    kNone, kAdalnW, kAdalnB, kOut, kFc1, kFc2, kFinW, kFinB, kNorm,
+    kVoutW, kVoutB, kAoutW, kAoutB, kDwdNormW, kDwdNormB, kDwd
+  };
+  auto kind_of = [&](const std::string& nm, int* L) -> Kind {
+    *L = -1;
+    if (nm.compare(0, 4, "dwd_") == 0) {
+      if (nm == "dwd_norm_out.linear.weight") { return Kind::kDwdNormW; }
+      if (nm == "dwd_norm_out.linear.bias") { return Kind::kDwdNormB; }
+      return Kind::kDwd;
+    }
+    if (nm == "norm_out.linear.weight") { return Kind::kFinW; }
+    if (nm == "norm_out.linear.bias") { return Kind::kFinB; }
+    if (nm == "norm_out.norm.weight") { return Kind::kNorm; }
+    if (nm == "proj_out.weight") { return Kind::kVoutW; }
+    if (nm == "proj_out.bias") { return Kind::kVoutB; }
+    if (nm == "audio_proj_out.weight") { return Kind::kAoutW; }
+    if (nm == "audio_proj_out.bias") { return Kind::kAoutB; }
+    const std::string pre = "transformer_blocks.";
+    if (nm.compare(0, pre.size(), pre) != 0) { return Kind::kNone; }
+    const std::size_t dot = nm.find('.', pre.size());
+    if (dot == std::string::npos ||
+        nm.find_first_not_of("0123456789", pre.size()) != dot ||
+        dot == pre.size()) {
+      return Kind::kNone;
+    }
+    *L = std::atoi(nm.c_str() + pre.size());
+    const std::string rest = nm.substr(dot + 1);
+    if (rest == "adaln_proj.linear.weight") { return Kind::kAdalnW; }
+    if (rest == "adaln_proj.linear.bias") { return Kind::kAdalnB; }
+    if (rest == "attn.to_out.0.weight") { return Kind::kOut; }
+    if (rest == "ff.net.0.proj.weight") { return Kind::kFc1; }
+    if (rest == "ff.net.2.weight") { return Kind::kFc2; }
+    return Kind::kNone;
+  };
+  // The file's overwrites, and anything else of the model's it carries
+  // whole -- which, beside them, is a weight the adapter needs that this
+  // reader would drop: refused by name rather than run without.
+  std::vector<std::pair<std::string, Kind>> sets;
+  std::vector<int> layer;
+  std::vector<std::string> unplaced;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (factor(nm)) { continue; }
+    int L = -1;
+    const Kind k = kind_of(nm, &L);
+    if (k == Kind::kNone) {
+      unplaced.push_back(nm);
+      continue;
+    }
+    sets.emplace_back(nm, k);
+    layer.push_back(L);
+  }
+  // A pi-Flow adapter's whole tensors in another spelling (pi-H3's int8
+  // ConvRot copies, ComfyUI's names): bound as a LoRA alone it would run
+  // without the weights its distillation replaced. Refused by name.
+  if (sets.empty() && !unplaced.empty() &&
+      wts->metadata().count("policy_config") > 0) {
+    return fail(fmt("a pi-Flow adapter whose {} whole tensors are not in the "
+                    "diffusers spelling this reads (first: {}) -- pi-H3's "
+                    "int8 ConvRot copies are ComfyUI's; use the "
+                    "full-precision adapter (pi_h3_<N>step[_dwd]_adapter/)",
+                    unplaced.size(), unplaced.front())());
+  }
+  if (sets.empty()) { return true; }
+  if (!unplaced.empty()) {
+    return fail(fmt("{} whole tensor{} beside its overwrites that this DiT "
+                    "has no place for (first: {})", unplaced.size(),
+                    unplaced.size() == 1 ? "" : "s", unplaced.front())());
+  }
+  if (c.tp.active()) {
+    return fail("its whole-tensor overwrites (pi-H3's) are not cut for a "
+                "tensor-parallel rank; run it on an unsplit DiT");
+  }
+  bool adaln = false;
+  for (const auto& [nm, k] : sets) {
+    adaln = adaln || k == Kind::kAdalnW || k == Kind::kAdalnB ||
+            k == Kind::kFinW || k == Kind::kFinB;
+  }
+  if (adaln && !c.pruned()) {
+    return fail("it overwrites the AdaLN of ComfyUI's PRUNED form (an "
+                "[adaln, 8] projection over the time curve's point) and this "
+                "DiT is the released one; run it on a pruned DiT -- "
+                "Comfy-Org's minimax_h3_fl2va_pruned_* (generate-video "
+                "dit_dir)");
+  }
+  slot.set_ws = WeightSet::open(path, nullptr);
+  if (!slot.set_ws) { return fail("cannot be opened"); }
+  WeightSet& ws = *slot.set_ws;
+  const MetalLlamaWeights& src = ws.src();
+  auto shape_is = [&](const std::string& nm, std::vector<long> want) {
+    const auto* ti = src.info(nm);
+    if (ti == nullptr || ti->shape.size() != want.size()) { return false; }
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      if (ti->shape[i] != want[i]) { return false; }
+    }
+    return true;
+  };
+  // A weight held as the adapter stores it, widened once to bf16 -- a
+  // derived entry of the adapter's own set, which the slot keeps.
+  auto held = [&](const std::string& nm) {
+    return weight_(ws, nm, Retain::Cached);
+  };
+  slot.set_blocks.clear();
+  slot.pset.clear();
+  slot.pset_final = SharedBuffer{};
+  slot.dwd_norm.clear();
+  int n_sets = 0, dwd_head = 0;
+  // An AdaLN overwrite as its difference from the trunk's own weight
+  // (and bias), f32 [d * 8 + d]: pruned_mod_ adds it at 1.
+  auto pdiff = [&](int L) -> float* {
+    SharedBuffer& b = L < 0 ? slot.pset_final : slot.pset[(std::size_t)L];
+    const std::size_t d = (std::size_t)(L < 0 ? FD : D);
+    if (b.empty()) {
+      b = _mc->make_shared_buffer(d * 9 * 4);
+      if (b.empty()) { return nullptr; }
+      std::memset(b.contents(), 0, d * 9 * 4);
+    }
+    return static_cast<float*>(b.contents());
+  };
+  auto trunk_f32 = [](const SharedBuffer& b, int dtype, std::size_t i) {
+    if (dtype == 0) { return static_cast<const float*>(b.contents())[i]; }
+    if (dtype == 1) {
+      return (float)static_cast<const _Float16*>(b.contents())[i];
+    }
+    return bf16_to_f32_(static_cast<const std::uint16_t*>(b.contents())[i]);
+  };
+  for (std::size_t s = 0; s < sets.size(); ++s) {
+    const std::string& nm = sets[s].first;
+    const Kind k = sets[s].second;
+    const int L = layer[s];
+    if (L >= c.n_layers) {
+      return fail(fmt("{} names block {} of a {}-block DiT", nm, L,
+                      c.n_layers)());
+    }
+    switch (k) {
+      case Kind::kAdalnW: case Kind::kAdalnB:
+      case Kind::kFinW: case Kind::kFinB: {
+        const bool fin = k == Kind::kFinW || k == Kind::kFinB;
+        const bool w = k == Kind::kAdalnW || k == Kind::kFinW;
+        const int d = fin ? FD : D;
+        if (!shape_is(nm, w ? std::vector<long>{d, 8}
+                            : std::vector<long>{d})) {
+          return fail(fmt("{} is not [{}{}]", nm, d, w ? ", 8" : "")());
+        }
+        const PrunedAdaln& p =
+            fin ? _final_padaln : _padaln[(std::size_t)L];
+        const SharedBuffer& base = w ? p.w : p.b;
+        const std::size_t n = (std::size_t)d * (w ? 8 : 1);
+        if (base.empty() || base.byte_size() < n) {
+          return fail(fmt("the DiT holds no pruned AdaLN for {}", nm)());
+        }
+        std::vector<float> v;
+        if (!to_host_f32_(ws, _mc, nm, v) || v.size() != n) {
+          return fail(fmt("{} cannot be read", nm)());
+        }
+        if (!fin && slot.pset.empty()) {
+          slot.pset.resize((std::size_t)c.n_layers);
+        }
+        float* dst = pdiff(fin ? -1 : L);
+        if (dst == nullptr) { return fail("out of memory"); }
+        dst += w ? 0 : (std::size_t)d * 8;
+        for (std::size_t i = 0; i < n; ++i) {
+          dst[i] = v[i] - trunk_f32(base, p.dtype, i);
+        }
+        ++n_sets;
+        break;
+      }
+      case Kind::kOut: case Kind::kFc1: case Kind::kFc2: {
+        const std::vector<long> want =
+            k == Kind::kOut ? std::vector<long>{H, I}
+            : k == Kind::kFc1 ? std::vector<long>{2L * F, H}
+                              : std::vector<long>{H, F};
+        if (!shape_is(nm, want)) {
+          return fail(fmt("{} is not [{}, {}]", nm, want[0], want[1])());
+        }
+        if (slot.set_blocks.empty()) {
+          slot.set_blocks.resize((std::size_t)c.n_layers);
+        }
+        LoraSlot::SetBlock& sb = slot.set_blocks[(std::size_t)L];
+        Linear& dst = k == Kind::kOut ? sb.out
+                      : k == Kind::kFc1 ? sb.fc1 : sb.fc2;
+        if (k == Kind::kFc1) {
+          // Diffusers' SwiGLU is [value; gate], fc1 here [gate; value]:
+          // the halves swapped once, in the entry the slot keeps.
+          const std::size_t half = (std::size_t)F * (std::size_t)H;
+          MetalCompute* mc = _mc;
+          dst.w = ws.derived(std::string(kKey) + "set-fc1-swap/" + nm,
+                             [&src, mc, &nm, half]() -> SharedBuffer {
+            SharedBuffer b = to_bf16_(src, mc, nm);
+            if (b.empty() || b.byte_size() < half * 4) { return {}; }
+            auto* p = static_cast<std::uint16_t*>(b.contents());
+            std::swap_ranges(p, p + half, p + half);
+            return b;
+          });
+        } else {
+          dst.w = held(nm);
+        }
+        if (dst.w.empty()) { return fail(fmt("{} cannot be read", nm)()); }
+        ++n_sets;
+        break;
+      }
+      case Kind::kNorm:
+        if (!shape_is(nm, {H})) { return fail(nm + " is not [hidden]"); }
+        slot.set_final_norm = held(nm);
+        if (slot.set_final_norm.empty()) {
+          return fail(fmt("{} cannot be read", nm)());
+        }
+        ++n_sets;
+        break;
+      case Kind::kVoutW: case Kind::kVoutB:
+      case Kind::kAoutW: case Kind::kAoutB: {
+        const bool vid = k == Kind::kVoutW || k == Kind::kVoutB;
+        const bool w = k == Kind::kVoutW || k == Kind::kAoutW;
+        const int n = vid ? VPE : AC;
+        if (!vid && !c.audio) {
+          return fail("it overwrites the audio head of an audio-less DiT");
+        }
+        if (!shape_is(nm, w ? std::vector<long>{n, H}
+                            : std::vector<long>{n})) {
+          return fail(fmt("{} is not [{}{}]", nm, n,
+                          w ? ", hidden" : "")());
+        }
+        Linear& dst = vid ? slot.set_video_out : slot.set_audio_out;
+        (w ? dst.w : dst.b) = held(nm);
+        if ((w ? dst.w : dst.b).empty()) {
+          return fail(fmt("{} cannot be read", nm)());
+        }
+        ++n_sets;
+        break;
+      }
+      case Kind::kDwdNormW: case Kind::kDwdNormB: {
+        const bool w = k == Kind::kDwdNormW;
+        if (!shape_is(nm, w ? std::vector<long>{FD, 8}
+                            : std::vector<long>{FD})) {
+          return fail(fmt("{} is not [{}{}]", nm, FD, w ? ", 8" : "")());
+        }
+        std::vector<float> v;
+        if (!to_host_f32_(ws, _mc, nm, v)) {
+          return fail(fmt("{} cannot be read", nm)());
+        }
+        slot.dwd_norm.resize((std::size_t)FD * 9, 0.0f);
+        std::copy(v.begin(), v.end(),
+                  slot.dwd_norm.begin() + (w ? 0 : (std::ptrdiff_t)FD * 8));
+        break;
+      }
+      case Kind::kDwd: ++dwd_head; break;
+      case Kind::kNone: break;
+    }
+  }
+  // A head overwritten in one half only keeps the checkpoint's other.
+  for (Linear* l : {&slot.set_video_out, &slot.set_audio_out}) {
+    if (l->w.empty() != l->b.empty()) {
+      return fail("it overwrites half of an output head (its weight or its "
+                  "bias alone)");
+    }
+  }
+  slot.dwd = dwd_head > 0;
+  if (slot.dwd && slot.dwd_norm.empty()) {
+    return fail("its DWD head comes without dwd_norm_out, the modulation "
+                "of the features it decodes");
+  }
+  slot.sets = n_sets;
+  *took = n_sets > 0 || slot.dwd;
+  if (*took && _mc->session() != nullptr) {
+    int blocks = 0, ada = 0;
+    for (const LoraSlot::SetBlock& sb : slot.set_blocks) {
+      blocks += !sb.out.w.empty() || !sb.fc1.w.empty() || !sb.fc2.w.empty();
+    }
+    for (const SharedBuffer& b : slot.pset) { ada += !b.empty(); }
+    std::string top;
+    if (!slot.pset_final.empty()) { top += ", the output AdaLN"; }
+    if (!slot.set_final_norm.empty()) { top += ", the output norm"; }
+    if (!slot.set_video_out.w.empty() || !slot.set_audio_out.w.empty()) {
+      top += ", the heads";
+    }
+    _mc->session()->info(fmt(
+        "MetalMiniMaxH3Transformer: '{}' overwrites {} tensors whole -- the "
+        "pruned AdaLN of {} blocks, the projections of {}{} -- applied in "
+        "full while its strength is not 0{}", path, n_sets, ada, blocks, top,
+        slot.dwd ? fmt("; a DWD pixel head of {} tensors (vae-decode runs "
+                       "it)", dwd_head)()
+                 : std::string()));
+  }
+  return true;
+}
+
 // Read the adapter and bind its factors to the modules they name.
 //
 // The module names are the MODEL's own -- blocks.N.attn.qkv_proj,
@@ -4644,6 +5519,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   // model -- a family that shared that would bind an adapter to the
   // wrong projections and produce plausible wrong output.
   slot.scale = spec.scale;
+  slot.path = spec.path;
   // The sampler a manifest beside the file states (SamplingContract),
   // whichever spelling its factors take. Read first, so a malformed one
   // refuses the adapter with its path before anything is bound.
@@ -4654,7 +5530,22 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     } else if (!cerr.empty()) {
       if (err != nullptr) { *err = "minimax-h3 lora: " + cerr; }
       return false;
+    } else if (pi_flow_contract_of(spec.path, &slot.contract, &cerr)) {
+      // A pi-Flow adapter's, stated by its header and its name.
+      slot.has_contract = true;
+    } else if (!cerr.empty()) {
+      if (err != nullptr) { *err = "minimax-h3 lora: " + cerr; }
+      return false;
     }
+  }
+  // Whole-tensor overwrites (pi-H3's), beside whatever factors follow.
+  bool set_took = false;
+  if (!bind_sets_(spec.path, slot, &set_took, err)) { return false; }
+  if (set_took && !lora::Adapter::file_touches(spec.path, ".lora_")) {
+    slot.blocks.resize((std::size_t)_cfg.n_layers);
+    slot.refiner.resize((std::size_t)_cfg.n_refiner);
+    slot.modules = slot.sets;
+    return true;
   }
   // AdaLN curve branches first: a file of them alone (Open-H3-
   // Regenerate-2K's) is a slot with no LoRA factors at all.
@@ -4682,6 +5573,21 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     slot.refiner.resize((std::size_t)_cfg.n_refiner);
     slot.modules = slot.curve.branches;
     return true;
+  }
+  // A DIAL (minimax-h3-dials.h) is not an adapter: one steering vector
+  // on the prompt, no factors -- said by name, not as an adapter that
+  // adapts nothing. ComfyUI's stock loader applies the condition_proj
+  // spelling as a bias patch; here both spellings are `dials` rows.
+  if (!lora::Adapter::file_touches(spec.path, ".lora_") &&
+      (lora::Adapter::file_touches(spec.path, "token_refiner.dials_shift") ||
+       lora::Adapter::file_touches(spec.path, "condition_proj.diff_b"))) {
+    if (err != nullptr) {
+      *err = "minimax-h3 lora: '" + spec.path + "' is a DIAL (one steering "
+             "vector on the prompt), not a LoRA: give it to "
+             "minimax-h3-model-config's `dials` as {\"dial\": file, "
+             "\"strength\": s}";
+    }
+    return false;
   }
   std::string oerr;
   auto ad = lora::Adapter::open(spec.path, _mc, &oerr);
@@ -4745,7 +5651,19 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   // the backbone's projections, which is exactly why one adapter feeds
   // both halves of the hybrid.
   const bool vdn_hybrid = ad->has("transformer_blocks.0.attn.orig.to_q");
-  if (vdn_hybrid || ad->has("transformer_blocks.0.attn.to_q")) {
+  // pi-H3 adapts the out projection and the feed-forward alone (no
+  // q / k / v) and leaves its last four blocks to its overwrites, so it
+  // is told by any of its modules on any block.
+  bool diffusers_names = vdn_hybrid || set_took;
+  for (int i = 0; i < _cfg.n_layers && !diffusers_names; ++i) {
+    const std::string b = "transformer_blocks." + std::to_string(i) + ".";
+    diffusers_names = ad->has(b + "attn.to_q") ||
+                      ad->has(b + "attn.to_out.0") ||
+                      ad->has(b + "ff.net.0.proj") ||
+                      ad->has(b + "ff.net.2");
+    if (i >= 3) { break; }
+  }
+  if (diffusers_names) {
     const int HD = c.head_dim;
     const bool per_head = c.qkv_per_head;
     // Where part `pt` (0 = q, 1 = k, 2 = v) row `r` lands in the fused
@@ -4828,7 +5746,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
     // The timestep MLP (diffusers' `time_embedder.linear_1/2`) and, for
     // a flow-map adapter, its endpoint twin -- on the host, in f32.
     if (!bind_flow_map_(*ad, spec.path, slot, err)) { return false; }
-    slot.modules  = ad->modules() + slot.curve.branches;
+    slot.modules  = ad->modules() + slot.curve.branches + slot.sets;
     slot.banded   = banded;
     slot.max_rank = ad->max_rank();
     if (c.pruned() &&
@@ -4890,7 +5808,7 @@ MetalMiniMaxH3Transformer::bind_lora_(const LoraSpec& spec, LoraSlot& slot,
   // LoRA with its endpoint embedder silently left behind.
   if (!bind_flow_map_(*ad, spec.path, slot, err)) { return false; }
 
-  slot.modules  = ad->modules() + slot.curve.branches;
+  slot.modules  = ad->modules() + slot.curve.branches + slot.sets;
   slot.max_rank = ad->max_rank();
   // PRUNED: the AdaLN's `.diff` patches and full-model modules, as f32
   // deltas on the trunk's projections (counted into `modules`).
@@ -5178,6 +6096,119 @@ MetalMiniMaxH3Transformer::contract_partition(const SamplingContract& c)
   if (c.trunk == "transformer") { return "fl2va"; }
   if (c.trunk == "transformer_ref") { return "ref2va"; }
   return {};
+}
+
+std::vector<float>
+MetalMiniMaxH3Transformer::pi_flow_raw_grid(int steps)
+{
+  // The release's own (README: MAX_RAW_T = {2: 0.93, 4: 0.96},
+  // final_step_size_scale 0.6, min_raw_t 0): FlowEulerODEScheduler's
+  // np.linspace(max, (max - min) fss / (N - 1 + fss) + min, N,
+  // dtype=float32) -- numpy's in double (i * step + start, the end set
+  // to `stop`), cast once -- and the terminal 0 the scheduler appends.
+  const double m = steps == 2 ? 0.93 : steps == 4 ? 0.96 : 0.0;
+  if (m == 0.0) { return {}; }
+  const double fss = 0.6;
+  const double stop = (m - 0.0) * fss / ((double)(steps - 1) + fss) + 0.0;
+  const double step = (stop - m) / (double)(steps - 1);
+  std::vector<float> g;
+  for (int i = 0; i < steps; ++i) {
+    g.push_back((float)(i == steps - 1 ? stop : (double)i * step + m));
+  }
+  g.push_back(0.0f);
+  return g;
+}
+
+namespace {
+
+// A safetensors file's `__metadata__` (strings), or a null FlexData.
+FlexData
+safetensors_metadata_(const std::string& file)
+{
+  std::ifstream f(file, std::ios::binary);
+  if (!f) { return {}; }
+  std::uint64_t n = 0;
+  f.read(reinterpret_cast<char*>(&n), 8);
+  if (!f || n == 0 || n > (std::uint64_t)64 << 20) { return {}; }
+  std::string js((std::size_t)n, '\0');
+  f.read(js.data(), (std::streamsize)n);
+  if (!f) { return {}; }
+  const FlexData hdr = FlexData::from_json(js);
+  if (!hdr.is_object()) { return {}; }
+  const auto o = hdr.as_object();
+  if (!o.contains("__metadata__")) { return {}; }
+  FlexData md = o.at("__metadata__");
+  return md.is_object() ? md : FlexData{};
+}
+
+}  // namespace
+
+bool
+MetalMiniMaxH3Transformer::pi_flow_contract_of(const std::string& file,
+                                               SamplingContract* out,
+                                               std::string* err)
+{
+  if (err != nullptr) { err->clear(); }
+  const FlexData md = safetensors_metadata_(file);
+  if (!md.is_object()) { return false; }
+  const auto mo = md.as_object();
+  if (!mo.contains("policy_config")) { return false; }
+  const FlexData pc =
+      FlexData::from_json(std::string(mo.at("policy_config").as_string("")));
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = "'" + file + "': " + m; }
+    return false;
+  };
+  if (!pc.is_object()) { return fail("`policy_config` is not an object"); }
+  // Both modalities' policies; DX on a grid is one evaluation a step,
+  // the only one this loop runs (piflow.py: a DX policy with N = 1 is an
+  // Euler step from the step's own velocity).
+  const auto po = pc.as_object();
+  for (const char* m : {"image", "audio"}) {
+    if (!po.contains(m)) { continue; }
+    const FlexData p = po.at(m);
+    std::string type, mode;
+    if (p.is_object()) {
+      const auto pm = p.as_object();   // a view: `p` owns it
+      if (pm.contains("type")) { type = pm.at("type").as_string(""); }
+      if (pm.contains("mode")) { mode = pm.at("mode").as_string(""); }
+    }
+    if (type != "DX" || (!mode.empty() && mode != "grid")) {
+      return fail(fmt("its {} policy is '{}' ({}); this sampler runs pi-Flow's "
+                      "DX policy on a grid", m, type, mode)());
+    }
+  }
+  // The step count: the last `<N>step` in the path (the release's folders
+  // and files: pi_h3_2step_adapter/, pi_h3_4step_dwd_adapter_int8_...).
+  int steps = 0;
+  for (std::size_t p = file.find("step"); p != std::string::npos;
+       p = file.find("step", p + 1)) {
+    std::size_t q = p;
+    while (q > 0 && (file[q - 1] == '-' || file[q - 1] == '_')) { --q; }
+    std::size_t d = q;
+    while (d > 0 && std::isdigit((unsigned char)file[d - 1]) != 0) { --d; }
+    if (d < q) { steps = std::atoi(file.c_str() + d); }
+  }
+  if (steps == 0) {
+    return fail("a pi-Flow adapter whose path names no step count (the "
+                "release's `pi_h3_<N>step_...`); name its grid with the model "
+                "config's `sigmas`");
+  }
+  const std::vector<float> g = pi_flow_raw_grid(steps);
+  if (g.empty()) {
+    return fail(fmt("a {}-step pi-Flow adapter; the release states grids for "
+                    "2 and 4 steps", steps)());
+  }
+  SamplingContract c;
+  c.release = fmt("pi-H3 {}-step", steps)();
+  c.task = "fl2va";
+  c.trunk = "transformer";
+  for (float s : g) { c.sigmas.push_back((double)s); }
+  c.video_shift = 12.0;
+  c.audio_shift = 3.0;
+  c.shift_f32 = true;
+  if (out != nullptr) { *out = std::move(c); }
+  return true;
 }
 
 const MetalMiniMaxH3Transformer::SamplingContract*
@@ -5558,6 +6589,7 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_trope_band =
       m->_lib_rope.function("transpose_rope_half_part_ftab_band_f16");
   m->_fn_modulate  = m->_lib_elt.function("adaln_modulate_idx_f16");
+  m->_fn_ln_plain  = m->_lib_elt.function("layer_norm_plain_f16");
   m->_fn_gated     = m->_lib_elt.function("gated_residual_idx_f16");
   // The fused fc1 is [GATE | up] and the block computes silu(gate)*up.
   // Measured against a ComfyUI golden: gate-first 0.0058, value-first
@@ -6074,7 +7106,10 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // cached entry of the set, which the bake's reset of this member
   // could not free -- 57.8 MB a rank kept for the run that its plan
   // (tp_held_bytes) says it does not hold.
-  if (!cfg.pruned() && !cfg.tp.active()) {
+  // Pruned at load, the final layer's is folded with the blocks' below.
+  const bool prune_at_load =
+      cfg.prune_adaln && !cfg.pruned() && !cfg.tp.active();
+  if (!cfg.pruned() && !cfg.tp.active() && !prune_at_load) {
     m->_final_adaln =
         m->linear_(ws, "final_layer.adaln_proj.linear", true, r);
   }
@@ -6085,7 +7120,8 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_refiner_final_norm = m->weight_(ws, "token_refiner.final_norm.weight", r);
   if (m->_video_patch.empty() || (cfg.audio && m->_audio_patch.empty()) ||
       m->_cond_proj.empty() || m->_final_norm.empty() ||
-      (m->_final_adaln.empty() && !cfg.pruned() && !cfg.tp.active()) ||
+      (m->_final_adaln.empty() && !cfg.pruned() && !cfg.tp.active() &&
+       !prune_at_load) ||
       m->_video_out.empty() ||
       (cfg.audio && m->_audio_out.empty()) ||
       m->_refiner_final_norm.empty()) {
@@ -6171,6 +7207,22 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   // evaluation rounds 4 of the 16 entries differently). A Draw Things
   // `.ckpt` carries no table either and runs on the architecture's base,
   // the diffusers config's 10000.
+  // PRUNE AT LOAD (Config::prune_adaln): before any block loads, so the
+  // blocks are read without their AdaLN. Where it cannot be done the
+  // released form is kept, said.
+  if (prune_at_load) {
+    std::string perr;
+    if (!m->prune_adaln_at_load_(ws, &perr)) {
+      if (mc->session() != nullptr) {
+        mc->session()->warn(fmt(
+            "MetalMiniMaxH3Transformer: the AdaLN cannot be pruned at load "
+            "({}); the released projections are kept", perr));
+      }
+      m->_final_adaln =
+          m->linear_(ws, "final_layer.adaln_proj.linear", true, r);
+      if (m->_final_adaln.empty()) { return nullptr; }
+    }
+  }
   const bool dt_ckpt =
       lower_(std::filesystem::path(ws.dir()).extension().string()) ==
       ".ckpt";
@@ -6341,11 +7393,12 @@ MetalMiniMaxH3Transformer::load(std::shared_ptr<WeightSet> ws_in,
   }
   // PRUNED: the scratch a patched projection is built in (pruned_mod_),
   // the widest of a block's and the final layer's [D * 8 + D] in f32.
-  if (cfg.pruned()) {
+  if (m->_cfg.pruned()) {
     bool deltas = false;
     for (const LoraSlot& sl : m->_lora) {
-      deltas = deltas || !sl.pdelta_final.empty();
+      deltas = deltas || !sl.pdelta_final.empty() || !sl.pset_final.empty();
       for (const SharedBuffer& d : sl.pdelta) { deltas = deltas || !d.empty(); }
+      for (const SharedBuffer& d : sl.pset) { deltas = deltas || !d.empty(); }
     }
     if (deltas) {
       const std::size_t D =
@@ -6710,7 +7763,7 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   // Accelerated mode, NATIVE: the int8 activation against the checkpoint's
   // own codes, before any dequant exists. A shape it declines falls
   // through to the dequant + requant form below, nothing encoded.
-  if (_i8 && l.quantized && _quant_group == 64 &&
+  if (_i8 && !_i8_hold && l.quantized && _quant_group == 64 &&
       _i8->gemm_affine(enc, x, x_off, l.codes, l.scales, l.qbias, l.bits, y,
                        y_off, M, N, K)) {
     return true;
@@ -6744,7 +7797,8 @@ MetalMiniMaxH3Transformer::gemm_mma_(ComputeEncoder& enc, const SharedBuffer& x,
   // Takes the same dense weight the matmul2d tile would have read, so it
   // sits after the dequant and before the tile choice; a shape it does not
   // accept falls through to bf16 with nothing encoded.
-  if (_i8 && _i8->gemm(enc, x, x_off, *wdense, y, y_off, M, N, K)) {
+  if (_i8 && !_i8_hold &&
+      _i8->gemm(enc, x, x_off, *wdense, y, y_off, M, N, K)) {
     return true;
   }
   // Deep contraction (fc2, K = ffn): split it across planes and fold. Same
@@ -7713,7 +8767,7 @@ MetalMiniMaxH3Transformer::time_embedding(const std::vector<float>& timesteps,
   // [0, 1] as ComfyUI clamps it (a no-op for every timestep H3 makes) --
   // unless an adapter moves the embedding (pruned_projects_), which is
   // then the released one, projected below.
-  const bool project = pruned_projects_();
+  const bool project = pruned_projects_() || _pruned_at_load;
   if (_cfg.pruned() && !project) {
     std::vector<float> t(timesteps);
     for (float& v : t) { v = std::min(1.0f, std::max(0.0f, v)); }
@@ -7885,6 +8939,10 @@ MetalMiniMaxH3Transformer::bake_adaln(
   };
   if (schedule.empty()) { return fail("empty schedule"); }
   if (_mc == nullptr || _ws == nullptr) { return fail("no weights"); }
+  if (_bake_held) {
+    return fail("held unbaked: a LoRA trainer owns this model, and its "
+                "steps read the projections a bake would retire");
+  }
   const Config& c = _cfg;
   // Pruned, a projection is [D, 8] -- 1.5 MB, read once at load and held
   // -- so a table of its rows would hold more than it retires. What IS
@@ -9991,6 +11049,19 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       in.video->byte_size() < (std::size_t)n_video * VPE * 2) {
     return fail("video rows are smaller than num_video_rows * patch elems");
   }
+  // A training tap (Step::train) reads the plain block: dense attention
+  // over the whole sequence, one rank's weights being the whole model's.
+  if (in.train != nullptr) {
+    if (in.stream_kv != nullptr) {
+      return fail("a training forward cannot run streaming attention");
+    }
+    if (c.tp.active()) {
+      return fail("a training forward cannot run on a rank of a split DiT");
+    }
+    if (_vdn && in.video_grid_h > 0 && in.video_grid_w > 0) {
+      return fail("a training forward cannot run VDN's hybrid attention");
+    }
+  }
   // ---- the streaming attention's preconditions ------------------------
   minimax_h3::StreamKv* const skv = in.stream_kv;
   bool stage_in_qkv = false;
@@ -10048,6 +11119,10 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   }
   if (in.text->byte_size() < (std::size_t)n_text * c.text_dim * 2) {
     return fail("text conditioning is smaller than num_text_rows * text_dim");
+  }
+  if (in.text_shift != nullptr && !in.text_shift->empty() &&
+      in.text_shift->byte_size() < (std::size_t)c.hidden * 2) {
+    return fail("a dial's shift is narrower than the hidden size");
   }
   // What the FIRST forward spends before it can report a single block.
   // It is not small and it was not visible: the bar opens, the AdaLN
@@ -10273,6 +11348,41 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     _pcoords = _mc->make_shared_buffer(pts.size() * 4);
     if (_pcoords.empty()) { return fail("pruned AdaLN points allocation"); }
     std::memcpy(_pcoords.contents(), pts.data(), pts.size() * 4);
+    // DWD: the features' modulation, [n_t, 2H] bf16 [scale | shift] --
+    // the reference's dwd_norm_out, linear(silu(c)) + b on the point it
+    // casts to bf16 (MiniMaxH3DWDAdaLayerNormOut), summed in f32.
+    if (in.dwd_features) {
+      const int ds = dwd_slot();
+      if (ds < 0) {
+        return fail("DWD features asked of a DiT with no live DWD adapter");
+      }
+      const std::vector<float>& wn = _lora[(std::size_t)ds].dwd_norm;
+      const int FD = 2 * H;
+      if (wn.size() != (std::size_t)FD * 9 ||
+          pts.size() != (std::size_t)n_t * 8) {
+        return fail("the DWD modulation does not fit this DiT");
+      }
+      _dwd_mod = _mc->make_shared_buffer((std::size_t)n_t * FD * 2);
+      if (_dwd_mod.empty()) { return fail("DWD modulation allocation"); }
+      auto* dm = static_cast<std::uint16_t*>(_dwd_mod.contents());
+      for (int i = 0; i < n_t; ++i) {
+        float sv[8];
+        for (int k = 0; k < 8; ++k) {
+          const float pb = bf16_to_f32_(
+              f32_to_bf16_(pts[(std::size_t)i * 8 + (std::size_t)k]));
+          sv[k] = silu_bf16_(pb);
+        }
+        for (int n = 0; n < FD; ++n) {
+          float acc = wn[(std::size_t)FD * 8 + (std::size_t)n];
+          for (int k = 0; k < 8; ++k) {
+            acc += wn[(std::size_t)n * 8 + (std::size_t)k] * sv[k];
+          }
+          dm[(std::size_t)i * FD + (std::size_t)n] = f32_to_bf16_(acc);
+        }
+      }
+    }
+  } else if (in.dwd_features) {
+    return fail("DWD features need ComfyUI's pruned DiT");
   }
   // The curve branches' c(t), one block of n_t rows per curve slot. The
   // buffer is fresh every forward: the last one's command buffers may
@@ -10381,7 +11491,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // setting (it is the ablation that says the filter works), so it has
   // to mean "unchanged model", not "same answer, different kernel".
   const bool sol_on = (bool)_sol && !vdn_linear && !in.dense_attention &&
-                      c.sol.dense_layers < c.n_layers && !sattn;
+                      c.sol.dense_layers < c.n_layers && !sattn &&
+                      in.train == nullptr;
   _sol_fwd = c.sol;
   if (in.sol_routing) {
     _sol_fwd.tau = in.sol_tau;
@@ -10393,7 +11504,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   // there. `_attn_nax` is resolved further down, so this is re-tested at
   // the point the functions are built rather than assumed here.
   const bool sage_want = (bool)_sage && c.sage.enabled &&
-                         c.sage.dense_layers < c.n_layers && !sattn;
+                         c.sage.dense_layers < c.n_layers && !sattn &&
+                         in.train == nullptr;
   // THE QUERY TILE, once the three specialisations that own the tile size are
   // known. DENSE-ONLY: the spans block list, Sage's int8 scale arrays and
   // Sol's blocks are each built for one query tile, so a forward using any of
@@ -11055,6 +12167,22 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
   } tp_end{_tp_pipe.get()};
   {
     ComputeEncoder enc = stream.begin_compute();
+    // TRAINING: `n` elements of `src` from element `so` into `dst` from
+    // element `doff` -- a tap's copy (Step::train). The destination at a
+    // byte offset: a checkpoint arena is n_layers slices and passes 2^31
+    // elements.
+    const TrainTap* const tap = in.train;
+    auto tap_copy = [&](const SharedBuffer& src, std::size_t so,
+                        const SharedBuffer* dst, std::size_t doff,
+                        std::size_t n) {
+      if (dst == nullptr || dst->empty() || n == 0) { return; }
+      enc.set_function(_fn_copy);
+      enc.set_buffer(0, src, so * 2);
+      enc.set_buffer(1, *dst, doff * 2);
+      enc.set_constant(2, 0);
+      enc.set_constant(3, (int)n);
+      enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+    };
     auto psplit = [&](double& acc) {
       if (!prof) { return; }
       enc.end();
@@ -12826,24 +13954,49 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         src += (std::size_t)r.count;
       }
     }
-    // A prompt longer than a band is projected a text band at a time, on
-    // the whole prompt's route: every scratch a GEMM grows (the int8
-    // context's activations among them) is booked at a band's rows.
-    if (tband > 0) {
-      _route_rows = n_text;
-      for (int r0 = 0; r0 < n_text; r0 += tband) {
-        gemm_(enc, *in.text, (std::size_t)r0 * c.text_dim, _cond_proj, s.txt,
-              (std::size_t)r0 * H, std::min(tband, n_text - r0), H,
-              c.text_dim);
+    {
+      // A pre-seam dial (set_dials) is condition_proj with its bias
+      // patched: `_dial_bias` swapped in for `b` while these GEMMs are
+      // encoded, and back however the block is left. Both stay alive in
+      // members, so the encoded work reads the patched one either way.
+      struct BiasSwap {
+        SharedBuffer& a;
+        SharedBuffer& b;
+        bool on;
+        BiasSwap(SharedBuffer& x, SharedBuffer& y)
+            : a(x), b(y), on(!y.empty())
+        {
+          if (on) { std::swap(a, b); }
+        }
+        ~BiasSwap()
+        {
+          if (on) { std::swap(a, b); }
+        }
+      } bias_swap(_cond_proj.b, _dial_bias);
+      const Linear& cond = _cond_proj;
+      // A prompt longer than a band is projected a text band at a time, on
+      // the whole prompt's route: every scratch a GEMM grows (the int8
+      // context's activations among them) is booked at a band's rows.
+      if (tband > 0) {
+        _route_rows = n_text;
+        for (int r0 = 0; r0 < n_text; r0 += tband) {
+          gemm_(enc, *in.text, (std::size_t)r0 * c.text_dim, cond, s.txt,
+                (std::size_t)r0 * H, std::min(tband, n_text - r0), H,
+                c.text_dim);
+        }
+        _route_rows = 0;
+      } else {
+        gemm_(enc, *in.text, 0, cond, s.txt, 0, n_text, H, c.text_dim);
       }
-      _route_rows = 0;
-    } else {
-      gemm_(enc, *in.text, 0, _cond_proj, s.txt, 0, n_text, H, c.text_dim);
     }
     psplit(t_in);
 
     // ---- 2. the text refiner -----------------------------------------
     for (std::size_t ri = 0; ri < _refiner.size(); ++ri) {
+      if (tap != nullptr) {
+        tap_copy(s.txt, 0, tap->refiner_in,
+                 ri * (std::size_t)n_text * H, (std::size_t)n_text * H);
+      }
       if (tband > 0) {
         // On the whole prompt's GEMM routes, as a main band takes the
         // sequence's.
@@ -12855,9 +14008,35 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       }
       if (!tp_err.empty()) { return fail(tp_err); }
     }
+    if (tap != nullptr) {
+      tap_copy(s.txt, 0, tap->refiner_out, 0, (std::size_t)n_text * H);
+    }
     // Its final norm writes straight into the packed sequence's text
     // rows, which are rows [0, n_text) -- no separate copy.
     rms(s.txt, 0, _refiner_final_norm, s.x, 0, n_text, H, c.final_norm_eps);
+    // The post seam's dials, where the DiT reads the prompt: the model's
+    // constant shift, then this forward's (a time curve's branch) -- each
+    // added to every prompt row in bf16, as ComfyUI's dial wrappers add
+    // `context + shift` one after the other.
+    const SharedBuffer* const shifts[] = {&_dial_post, in.text_shift};
+    for (const SharedBuffer* sh : shifts) {
+      if (sh == nullptr || sh->empty()) { continue; }
+      enc.set_function(_fn_bias_add);
+      enc.set_buffer(0, s.x, 0);
+      enc.set_buffer(1, *sh);
+      enc.set_constant(2, H);
+      enc.set_constant(3, (unsigned)((std::size_t)n_text * H));
+      enc.dispatch({(unsigned)((std::size_t)n_text * H), 1, 1}, {256, 1, 1});
+    }
+    if (_cap_text) {
+      enc.end();
+      _flops.flush(stream);
+      stream.commit().wait();
+      const auto* p = static_cast<const std::uint16_t*>(s.x.contents());
+      _cap_text_rows.assign(p, p + (std::size_t)n_text * H);
+      enc = stream.begin_compute();
+      mark = std::chrono::steady_clock::now();
+    }
     psplit(t_in);
     xdump("after refiner write");
 
@@ -13272,7 +14451,11 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
           ++sp_blocks;
         }
       }
-      const Block& b = streaming ? *bp : _blocks[(std::size_t)Lx];
+      // A live slot's whole-tensor overwrites in place of the block's
+      // own projections (bind_sets_), for every path below.
+      Block b_set;
+      const Block& b = set_block_(
+          Lx, streaming ? *bp : _blocks[(std::size_t)Lx], b_set);
       const auto t_ready = std::chrono::steady_clock::now();
       // Its adapters' factors, spilled at load, read in beside it.
       if (streaming && !fill_lora_(Lx)) { return {}; }
@@ -13453,9 +14636,22 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
         std::string kerr;
         if (!skv->acquire(Lx, &kerr)) { return fail(kerr); }
       }
+      if (tap != nullptr) {
+        const std::size_t RH = (std::size_t)seq * H;
+        const std::size_t MT = (std::size_t)n_t * c.adaln_out();
+        tap_copy(s.x, 0, tap->ckpt, (std::size_t)Lx * RH, RH);
+        tap_copy(*mod_buf, mod_off, tap->mods, (std::size_t)Lx * MT, MT);
+      }
       bprobe = xprobe && Lx == 0;
       trip_blk = Lx;
-      if (band > 0) {
+      if (tap != nullptr && tap->run_block) {
+        // The trainer's own block forward, keeping its activations
+        // (recompute: never): the whole sequence, as its backward reads.
+        if (!tap->run_block(enc, Lx, b, s.x, seq)) {
+          return fail("block " + std::to_string(Lx) + "'s training forward "
+                      "did not encode");
+        }
+      } else if (band > 0) {
         _route_rows = seq;
         block_banded(b, Lx);
         _route_rows = 0;
@@ -13736,10 +14932,14 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
     // 2560 x 1440 refine past ~379 frames) and 2^32 (a grid's threads),
     // past which the rows were modulated from the wrong channels, and
     // then not at all.
+    if (tap != nullptr) {
+      tap_copy(s.x, 0, tap->final_hidden, 0, (std::size_t)seq * H);
+      tap_copy(*fmod_buf, fmod_off, tap->fmod, 0, (std::size_t)n_t * 2 * H);
+    }
     for (int r0 = 0; r0 < seq; r0 += kBandRows) {
       const int n = std::min(kBandRows, seq - r0);
       const std::size_t e0 = (std::size_t)r0 * H;
-      rms(s.x, e0, _final_norm, s.proj, e0, n, H, c.final_norm_eps);
+      rms(s.x, e0, set_final_norm_(), s.proj, e0, n, H, c.final_norm_eps);
       enc.set_function(_fn_modulate);
       enc.set_buffer(0, s.proj, e0 * 2);
       enc.set_buffer(1, *fmod_buf, fmod_off * 2);
@@ -13758,7 +14958,8 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       // A per-step head (set_step_heads) in place of the checkpoint's
       // own when the step names one.
       const Linear& vout =
-          in.out_head >= 0 ? _step_out[(std::size_t)in.out_head] : _video_out;
+          in.out_head >= 0 ? _step_out[(std::size_t)in.out_head]
+                           : set_video_out_();
       std::size_t dst = 0;
       for (const h3::RowRun& r : L.video_runs) {
         if (r.count > 0) {
@@ -13772,8 +14973,46 @@ MetalMiniMaxH3Transformer::forward(const Step& in, std::string* err)
       std::size_t dst = 0;
       for (const h3::RowRun& r : L.audio_runs) {
         if (r.count > 0) {
-          gemm_(enc, s.proj, (std::size_t)r.start * H, _audio_out, out.audio,
-                dst * AC, r.count, AC, H);
+          gemm_(enc, s.proj, (std::size_t)r.start * H, set_audio_out_(),
+                out.audio, dst * AC, r.count, AC, H);
+        }
+        dst += (std::size_t)r.count;
+      }
+    }
+    // DWD: the video rows' features, gathered as the velocity is: the
+    // last block's hidden states, LayerNormed without an affine, then
+    // (1 + scale) x + shift at each row's timestep -- in row bands, the
+    // modulation's int total as the final norm's.
+    if (in.dwd_features) {
+      std::size_t nv = 0;
+      for (const h3::RowRun& r : L.video_runs) { nv += (std::size_t)r.count; }
+      out.features = _mc->make_shared_buffer(std::max<std::size_t>(nv, 1) *
+                                             (std::size_t)H * 2);
+      if (out.features.empty()) { return fail("DWD features allocation"); }
+      std::size_t dst = 0;
+      for (const h3::RowRun& r : L.video_runs) {
+        for (int r0 = 0; r0 < r.count; r0 += kBandRows) {
+          const int n = std::min(kBandRows, r.count - r0);
+          const std::size_t so = ((std::size_t)r.start + r0) * H;
+          const std::size_t dof = (dst + (std::size_t)r0) * H;
+          enc.set_function(_fn_ln_plain);
+          enc.set_buffer(0, s.x, so * 2);
+          enc.set_buffer(1, out.features, dof * 2);
+          enc.set_constant(2, H);
+          enc.set_constant(3, c.final_norm_eps);
+          enc.dispatch({256, (unsigned)n, 1}, {256, 1, 1});
+          enc.set_function(_fn_modulate);
+          enc.set_buffer(0, out.features, dof * 2);
+          enc.set_buffer(1, _dwd_mod);
+          enc.set_buffer(2, s.tstep_idx,
+                         ((std::size_t)r.start + r0) * sizeof(int));
+          enc.set_buffer(3, out.features, dof * 2);
+          enc.set_constant(4, H);
+          enc.set_constant(5, 2 * H);
+          enc.set_constant(6, 0);
+          enc.set_constant(7, H);
+          enc.set_constant(8, n * H);
+          enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
         }
         dst += (std::size_t)r.count;
       }

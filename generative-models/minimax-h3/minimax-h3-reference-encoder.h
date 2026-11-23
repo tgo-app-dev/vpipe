@@ -2,7 +2,10 @@
 #define GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_REFERENCE_ENCODER_H
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/qwen3/metal-qwen-vision.h"
 
 #include <cstdint>
 #include <functional>
@@ -457,6 +460,43 @@ double audio_reference_seconds(const MediaReference& m, double max_seconds);
 std::size_t audio_encode_bytes(const std::vector<MediaReference>& refs,
                                const ReferencePlan& plan,
                                const MetalMiniMaxH3AudioVae* vae);
+
+// The models' shapes the rest of a request's working set follows, off
+// their configs -- so a plan can ask before anything loads. A null
+// config is a model the request does not run.
+struct ReferenceShapes {
+  const MetalMiniMaxH3VideoVae::Config* video_vae = nullptr;
+  const MetalQwenVisionEncoder::Config* vision    = nullptr;
+  const MiniMaxH3TextEncoder::Config*   text      = nullptr;
+  bool matrix_cores = false;
+  bool text_dense   = false;   // the encoder's stack loads dense
+};
+
+// What encode_references() holds at its peak for `refs`, beside the
+// models' weights and the soundtracks' encodes (audio_encode_bytes):
+// the request's own pixels, every reference's DiT rows and tower
+// output (both held to the end), and the widest of its stretches -- a
+// reference's canvas with either the tower's read of it or the video
+// VAE's encode (MetalMiniMaxH3VideoVae::encode_video_bytes, its input
+// and the posterior sample), and the presentation's encode
+// (MiniMaxH3TextEncoder::presentation_bytes). One reference at a time,
+// the VAE's activations given back before the presentation. Sized by the
+// geometry the encode resolves, so a request's real pictures and clips
+// are what it books. `presentation_tokens`: the presentation's length
+// when it is known, else < 0 and bounded -- the tower's tokens, a label
+// and the block markers each, and `text_tokens` for the prompt.
+std::size_t reference_encode_bytes(const std::vector<MediaReference>& refs,
+                                   const ReferencePlan& plan,
+                                   const ReferenceShapes& shapes,
+                                   int presentation_tokens,
+                                   int text_tokens = 512);
+// The same off the loaded models, the presentation's length counted by
+// the conditioner's own builder (MiniMaxH3TextEncoder::
+// build_presentation, on the grids the tower will produce).
+std::size_t reference_encode_bytes(const std::vector<MediaReference>& refs,
+                                   std::string_view prompt,
+                                   const ReferencePlan& plan,
+                                   const ReferenceEncoders& models);
 
 // Normalize and encode a whole `ref2va` request.
 //

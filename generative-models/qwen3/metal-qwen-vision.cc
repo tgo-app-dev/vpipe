@@ -715,6 +715,57 @@ MetalQwenVisionEncoder::encode_video_scratch_bytes(const Config& c,
   return encode_bytes_(c, n, (std::int64_t)n_frames * th * tw);
 }
 
+std::size_t
+MetalQwenVisionEncoder::encode_image_scratch_bytes(const Config& c, int H,
+                                                   int W,
+                                                   std::int64_t max_pixels)
+{
+  const Grid g = grid_for(c, 1, H, W, false, max_pixels);
+  if (g.tokens <= 0) { return 0; }
+  const int P = std::max(1, c.patch_size);
+  return encode_bytes_(c, (std::size_t)g.h * g.w,
+                       (std::int64_t)g.h * P * g.w * P);
+}
+
+MetalQwenVisionEncoder::Grid
+MetalQwenVisionEncoder::grid_for(const Config& c, int n_frames, int H, int W,
+                                 bool video, std::int64_t max_pixels)
+{
+  Grid g;
+  if (n_frames <= 0 || H <= 0 || W <= 0) { return g; }
+  const int P = std::max(1, c.patch_size), S = std::max(1, c.spatial_merge);
+  const int T = std::max(1, c.temporal_patch);
+  const int factor = P * S;
+  int th = 0, tw = 0;
+  if (video) {
+    smart_resize_video_(n_frames, H, W, factor, T, c.video_min_pixels,
+                        c.video_max_pixels, &th, &tw);
+  } else {
+    // A caller's budget tightens the checkpoint's bound, never loosens it,
+    // and never below the smallest picture the bound admits.
+    const int hi = max_pixels > 0
+        ? (int)std::max<std::int64_t>(
+              c.min_pixels, std::min<std::int64_t>(max_pixels, c.max_pixels))
+        : c.max_pixels;
+    smart_resize_(H, W, factor, c.min_pixels, hi, &th, &tw);
+  }
+  g.h = th / P;
+  g.w = tw / P;
+  // An image tiles its one frame across the temporal patch; a clip
+  // merges consecutive frames in groups of T, repeating the last one
+  // when the count does not divide.
+  g.t = video ? (n_frames + T - 1) / T : 1;
+  g.tokens = g.t * g.h * g.w / (S * S);
+  return g;
+}
+
+std::size_t
+MetalQwenVisionEncoder::result_bytes(const Config& c, int tokens)
+{
+  return (std::size_t)std::max(tokens, 0) * (std::size_t)c.out_hidden * 2 *
+         (1 + c.deepstack_indexes.size());
+}
+
 MetalQwenVisionEncoder::Result
 MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 {
@@ -763,26 +814,11 @@ MetalQwenVisionEncoder::encode_(const std::uint8_t* rgb, int n_frames, int H,
   const float scale = 1.0f / std::sqrt((float)hd);
   Result res;
 
-  const int factor = P * S;
-  int th, tw;
-  if (video) {
-    smart_resize_video_(n_frames, H, W, factor, T, c.video_min_pixels,
-                        c.video_max_pixels, &th, &tw);
-  } else {
-    // A caller's budget tightens the checkpoint's bound, never loosens it,
-    // and never below the smallest picture the bound admits.
-    const int hi = max_pixels > 0
-        ? (int)std::max<std::int64_t>(
-              c.min_pixels, std::min<std::int64_t>(max_pixels, c.max_pixels))
-        : c.max_pixels;
-    smart_resize_(H, W, factor, c.min_pixels, hi, &th, &tw);
-  }
-  const int grid_h = th / P, grid_w = tw / P;
+  // The grid, by the rule the memory figures read (grid_for).
+  const Grid grid = grid_for(c, n_frames, H, W, video, max_pixels);
+  const int grid_h = grid.h, grid_w = grid.w, grid_t = grid.t;
+  const int th = grid_h * P, tw = grid_w * P;
   const int mw = grid_w / S;
-  // An image tiles its one frame across the temporal patch; a clip
-  // merges consecutive frames in groups of T, repeating the last one
-  // when the count does not divide.
-  const int grid_t = video ? (n_frames + T - 1) / T : 1;
   const int per_cell = grid_h * grid_w;
   const int n_patches = grid_t * per_cell;
   const int n_im = n_patches / (S * S);

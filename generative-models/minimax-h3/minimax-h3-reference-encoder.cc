@@ -481,6 +481,254 @@ audio_encode_bytes(const std::vector<MediaReference>& refs,
   return most;
 }
 
+namespace {
+
+// What encode_references does with one reference's pixels, sized without
+// them: the canvas it is put on (the VAE's input), what the resize holds
+// beside it, and the tower's read -- the loop's branches, in its order.
+struct RefGeometry {
+  int nf = 0, th = 0, tw = 0;      // the canvas: frames, height, width
+  std::size_t resize_tmp = 0;      // MiniMax-H3-Image's picture pre-cut
+  bool tower_video = false;
+  int vf = 1, vh = 0, vw = 0;      // what the tower reads
+  std::size_t tower_copy = 0;      // its own copy, or the sampled frames
+  std::vector<float> secs;         // a clip's block timestamps
+};
+
+bool
+reference_geometry_(const MediaReference& m, std::size_t i,
+                    const ReferencePlan& plan, int cell, RefGeometry* g)
+{
+  if (m.kind == MediaReference::Kind::kImage && plan.edge_min > 0) {
+    int bw = 0, bh = 0;
+    h3i::bound_short_edge(m.width, m.height, plan.edge_min, plan.edge_max,
+                          plan.canvas_multiple, &bw, &bh);
+    g->th = bh / cell * cell;
+    g->tw = bw / cell * cell;
+    g->nf = 1;
+    g->resize_tmp = (std::size_t)3 * bh * bw;
+  } else if (m.kind == MediaReference::Kind::kImage &&
+             plan.area_min_pixels > 0) {
+    std::int64_t lo = plan.area_min_pixels;
+    if (i == 0 && plan.first_min_pixels > 0) {
+      lo = std::max(lo, plan.first_min_pixels);
+    }
+    ph3::size_in_area_range(m.width, m.height, lo, plan.area_max_pixels,
+                            plan.canvas_multiple, &g->tw, &g->th);
+    g->nf = 1;
+  } else if (m.kind == MediaReference::Kind::kImage) {
+    const int edge = m.short_edge >= 0 ? m.short_edge
+                                       : plan.reference_image_short_edge;
+    if (!resolve_reference_image_size(m.height, m.width, edge,
+                                      plan.canvas_multiple,
+                                      plan.reference_image_max_pixels,
+                                      &g->th, &g->tw)) {
+      return false;
+    }
+    g->nf = 1;
+  } else {
+    const int edge =
+        m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
+    if (!video_reference_geometry(m.num_frames, m.height, m.width, m.fps,
+                                  target_frames_(m, plan),
+                                  plan.canvas_multiple, edge,
+                                  plan.canvas_max_pixels, &g->nf, &g->th,
+                                  &g->tw, kFps)) {
+      return false;
+    }
+  }
+  if (g->th <= 0 || g->tw <= 0 || g->nf <= 0) { return false; }
+  // The tower's read of it.
+  if (m.kind == MediaReference::Kind::kImage && plan.vision_edge > 0) {
+    h3i::bound_short_edge(m.width, m.height, plan.vision_edge,
+                          plan.vision_edge, plan.canvas_multiple, &g->vw,
+                          &g->vh);
+    g->tower_copy = (std::size_t)3 * g->vh * g->vw;
+  } else if (m.kind == MediaReference::Kind::kImage &&
+             plan.vision_pixels > 0) {
+    ph3::size_at_area(m.width, m.height, plan.vision_pixels,
+                      plan.canvas_multiple, &g->vw, &g->vh);
+    g->tower_copy = (std::size_t)3 * g->vh * g->vw;
+  } else if (m.kind == MediaReference::Kind::kImage) {
+    g->vh = g->th;
+    g->vw = g->tw;
+  } else {
+    std::vector<int> idx;
+    if (!condition_frame_indices(g->nf, kFps, plan.video_sample_fps,
+                                 plan.temporal_patch, &idx, &g->secs)) {
+      return false;
+    }
+    g->tower_video = true;
+    g->vf = (int)idx.size();
+    g->vh = g->th;
+    g->vw = g->tw;
+    g->tower_copy = (std::size_t)3 * g->th * g->tw * idx.size();
+  }
+  return true;
+}
+
+// reference_encode_bytes' arithmetic, with a hook for the presentation's
+// length once the tower's grids are known.
+std::size_t
+reference_encode_bytes_(
+    const std::vector<MediaReference>& refs, const ReferencePlan& plan,
+    const ReferenceShapes& sh,
+    const std::function<int(const std::vector<MetalQwenVisionEncoder::Grid>&,
+                            const std::vector<RefGeometry>&)>& count,
+    int text_tokens)
+{
+  const MetalMiniMaxH3VideoVae::Config* vc = sh.video_vae;
+  const MetalQwenVisionEncoder::Config* tc = sh.vision;
+  const int cell = vc != nullptr ? vc->patch : 16;
+  std::size_t inputs = 0, rows = 0, results = 0, widest = 0;
+  int vision_rows = 0, blocks = 0;
+  std::vector<MetalQwenVisionEncoder::Grid> grids(refs.size());
+  std::vector<RefGeometry> geos(refs.size());
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    const MediaReference& m = refs[i];
+    // The request's own data, held to the end.
+    inputs += m.rgb.size() + m.pcm.size() * sizeof(float) +
+              m.video_latent.size() * sizeof(float) +
+              m.audio_latent.size() * sizeof(float);
+    if (m.has_audio_latent()) {
+      rows += (std::size_t)2 * m.audio_latent_channels *
+              m.audio_latent_frames * sizeof(float);
+    }
+    if (m.kind == MediaReference::Kind::kAudio) { continue; }
+    // A carried latent with no pixels: its rows, nothing else runs.
+    if (m.has_video_latent() && m.rgb.empty()) {
+      rows += (std::size_t)m.latent_z * m.latent_frames * m.latent_height *
+              m.latent_width * sizeof(float);
+      continue;
+    }
+    RefGeometry& g = geos[i];
+    if (!reference_geometry_(m, i, plan, cell, &g)) { continue; }
+    const std::size_t px = (std::size_t)3 * g.nf * g.th * g.tw;
+    // The tower's stretch: the canvas, its copy, its forward.
+    std::size_t tower = 0;
+    if (tc != nullptr && m.presented) {
+      const MetalQwenVisionEncoder::Grid gr = MetalQwenVisionEncoder::
+          grid_for(*tc, g.vf, g.vh, g.vw, g.tower_video);
+      grids[i] = gr;
+      tower = g.tower_copy +
+              (g.tower_video
+                   ? MetalQwenVisionEncoder::encode_video_scratch_bytes(
+                         *tc, g.vf, g.vh, g.vw)
+                   : MetalQwenVisionEncoder::encode_image_scratch_bytes(
+                         *tc, g.vh, g.vw));
+      results += MetalQwenVisionEncoder::result_bytes(*tc, gr.tokens);
+      vision_rows += gr.tokens;
+      blocks += gr.t;
+    }
+    // The VAE's: its input, the encode, the posterior sample (and its
+    // cut); the rows it leaves.
+    std::size_t vae = 0;
+    if (vc != nullptr && !m.has_video_latent()) {
+      const int use =
+          vae_frames_(m.kind == MediaReference::Kind::kVideo, g.nf, *vc);
+      const int lf = MetalMiniMaxH3VideoVae::video_latent_frames_for(*vc,
+                                                                     use);
+      const std::size_t fh = (std::size_t)g.th / vc->patch;
+      const std::size_t fw = (std::size_t)g.tw / vc->patch;
+      vae = (std::size_t)3 * use * g.th * g.tw * 2 +
+            MetalMiniMaxH3VideoVae::encode_video_bytes(*vc, use, g.th, g.tw,
+                                                       sh.matrix_cores);
+      const std::size_t lat =
+          (std::size_t)vc->z_channels * lf * fh * fw * sizeof(float);
+      if (plan.posterior_seed >= 0) { vae += 2 * lat; }
+      rows += lat;
+    } else if (m.has_video_latent()) {
+      rows += (std::size_t)m.latent_z * m.latent_frames * m.latent_height *
+              m.latent_width * sizeof(float);
+    }
+    widest = std::max(widest, px + g.resize_tmp + std::max(tower, vae));
+  }
+  // The presentation.
+  if (sh.text != nullptr) {
+    int n = count ? count(grids, geos) : -1;
+    if (n < 0) {
+      // Bounded: the prompt, a label per reference, the vision rows and
+      // each block's markers and timestamp.
+      n = text_tokens + 16 * (int)refs.size() + vision_rows + 16 * blocks;
+    }
+    const int n_ds =
+        tc != nullptr ? (int)tc->deepstack_indexes.size() : 0;
+    widest = std::max(widest, MiniMaxH3TextEncoder::presentation_bytes(
+                                  *sh.text, n, vision_rows, n_ds,
+                                  sh.matrix_cores, sh.text_dense));
+  }
+  return inputs + rows + results + widest;
+}
+
+}  // namespace
+
+std::size_t
+reference_encode_bytes(const std::vector<MediaReference>& refs,
+                       const ReferencePlan& plan,
+                       const ReferenceShapes& shapes,
+                       int presentation_tokens, int text_tokens)
+{
+  return reference_encode_bytes_(
+      refs, plan, shapes,
+      [presentation_tokens](
+          const std::vector<MetalQwenVisionEncoder::Grid>&,
+          const std::vector<RefGeometry>&) { return presentation_tokens; },
+      text_tokens);
+}
+
+std::size_t
+reference_encode_bytes(const std::vector<MediaReference>& refs,
+                       std::string_view prompt, const ReferencePlan& plan,
+                       const ReferenceEncoders& models)
+{
+  ReferenceShapes sh;
+  if (models.video_vae != nullptr) {
+    sh.video_vae = &models.video_vae->config();
+  }
+  if (models.vision != nullptr) { sh.vision = &models.vision->config(); }
+  if (models.text != nullptr) {
+    sh.text = &models.text->config();
+    sh.text_dense = models.text->dense_weights();
+  }
+  sh.matrix_cores = models.mc != nullptr && models.mc->supports_matrix_cores();
+  // The conditioner's own count, on the grids the tower will make: its
+  // builder reads a result's grid alone.
+  auto count = [&](const std::vector<MetalQwenVisionEncoder::Grid>& grids,
+                   const std::vector<RefGeometry>& geos) -> int {
+    if (models.text == nullptr) { return -1; }
+    std::vector<MetalQwenVisionEncoder::Result> fake(refs.size());
+    std::vector<MiniMaxH3TextEncoder::Reference> pres;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      if (!refs[i].presented) { continue; }
+      MiniMaxH3TextEncoder::Reference p;
+      p.kind = refs[i].kind == MediaReference::Kind::kImage
+                   ? MiniMaxH3TextEncoder::Reference::Kind::kImage
+               : refs[i].kind == MediaReference::Kind::kVideo
+                   ? MiniMaxH3TextEncoder::Reference::Kind::kVideo
+                   : MiniMaxH3TextEncoder::Reference::Kind::kAudio;
+      p.has_audio = refs[i].has_soundtrack();
+      if (refs[i].kind != MediaReference::Kind::kAudio &&
+          grids[i].tokens > 0) {
+        MetalQwenVisionEncoder::Result& r = fake[i];
+        r.n_tokens = grids[i].tokens;
+        r.grid_t = grids[i].t;
+        r.grid_h = grids[i].h;
+        r.grid_w = grids[i].w;
+        p.vision = &r;
+        p.block_seconds = geos[i].secs;
+      }
+      pres.push_back(std::move(p));
+    }
+    MiniMaxH3TextEncoder::Presentation P;
+    if (!models.text->build_presentation(pres, prompt, &P, nullptr)) {
+      return -1;
+    }
+    return P.size();
+  };
+  return reference_encode_bytes_(refs, plan, sh, count,
+                                 (int)prompt.size());
+}
+
 bool
 encode_references(const std::vector<MediaReference>& refs,
                   std::string_view prompt, const ReferencePlan& plan,
@@ -1095,6 +1343,13 @@ encode_references(const std::vector<MediaReference>& refs,
     r.posterior_draws.push_back(post_draws);
     done_work += work[i];
     report(done_work, label + ": done");
+  }
+
+  // The VAE's activations back before the presentation: kept, they sat
+  // beside the conditioner's prefill (reference_encode_bytes books the
+  // two apart). The next encode makes them again.
+  if (models.video_vae != nullptr) {
+    models.video_vae->release_encode_scratch();
   }
 
   // ---- the presentation ------------------------------------------------

@@ -7,6 +7,8 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "common/flex-bag.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 
@@ -14,8 +16,8 @@
 #include "common/lmdb-db.h"
 #include "common/lmdb-env.h"
 #include "common/lmdb-txn.h"
+#include "generative-models/gen-input.h"
 #include "generative-models/generative-model-manager.h"
-#include "generative-models/qwen-image/qwen-image21-lora-trainer.h"
 #include "generative-models/weight-set.h"
 #endif
 
@@ -41,6 +43,31 @@ constexpr unsigned kLatentPort = 1;
 constexpr unsigned kManifestPort = 2;
 constexpr unsigned kModelPort = 3;
 constexpr unsigned kOptimizerPort = 4;
+constexpr unsigned kAudioPort = 5;
+constexpr unsigned kRefVideoPort = 6;
+constexpr unsigned kRefAudioPort = 7;
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// The cache keys of a caption's reference rows.
+std::string
+ref_key_(const std::string& text_key, const char* which)
+{
+  return text_key.empty() ? std::string()
+                          : genai::train::cache_key({text_key, which});
+}
+
+// Whether a conditioning's sideband names references (a Ref2VA caption).
+bool
+names_references_(const FlexData& sb)
+{
+  if (!sb.is_object()) { return false; }
+  FlexData b = sb;
+  auto o = b.as_object();
+  if (!o.contains(genai::cond_sideband::kReferences)) { return false; }
+  const FlexData r = o.at(genai::cond_sideband::kReferences);
+  return r.is_array() && r.as_array().size() > 0;
+}
+#endif
 
 constexpr SpecExtra kTargetChoices[] = {
   {spec_key::kChoices, "attn_ff,attn"},
@@ -67,8 +94,27 @@ const ConfigKey kAttrs[] = {
    .doc = "the model to train on: a registry key or a checkpoint root "
           "(overridden by a model-select beat on the model port)",
    .suggest_db = "__vpipe_model_registry",
-   .suggest_db_type = "qwen-image-21",
+   .suggest_db_type = "qwen-image-21,minimax-h3-fl2va,minimax-h3-ref2va",
    .model_channel = "image-model"},
+  {.key = "dit_dir",
+   .type = ConfigType::String,
+   .doc = "the DiT that runs, when hf_dir's pipeline names one it does not "
+          "carry (P-H3-Image: MiniMax-H3 FL2VA's); a registry key or a "
+          "directory",
+   .suggest_db = "__vpipe_model_registry",
+   .suggest_db_type = "minimax-h3-fl2va",
+   .is_path = true,
+   .path_kind = "dir"},
+  {.key = "base_lora",
+   .type = ConfigType::Any,
+   .doc = "MiniMax-H3: frozen adapter(s) beneath the one trained -- a path "
+          "or a list (P-H3-Image's PrunaAI adapter, or a style to stack "
+          "on); recorded in the adapter's metadata as what inference must "
+          "stack beneath it",
+   .suggest_db = "__vpipe_model_registry",
+   .suggest_db_type = "minimax-h3-lora",
+   .is_path = true,
+   .path_filter = "weights"},
   {.key = "output_dir",
    .type = ConfigType::String,
    .required = true,
@@ -186,6 +232,12 @@ const ConfigKey kAttrs[] = {
    .type = ConfigType::Bool,
    .doc = "M5 and later: int8 matrix-core GEMMs in the forward and the "
           "backward (lossy, ~1e-2 per GEMM)"},
+  {.key = "audio_loss_weight",
+   .type = ConfigType::Real,
+   .doc = "an audio-video model (MiniMax-H3): the soundtrack's loss beside "
+          "the video's, each its own mean (default 1). A clip without a "
+          "soundtrack takes none either way",
+   .def_real = 1.0},
   {.key = "resume",
    .type = ConfigType::String,
    .doc = "auto (default): continue a run of the same name that was "
@@ -225,6 +277,20 @@ const PortSpec kIports[] = {
    .doc = "OPTIONAL optimizer-select spec (default AdamW); several beats "
           "run one training job each",
    .type = &typeid(FlexDataPayload)},
+  {.name = "audio_latents",
+   .doc = "OPTIONAL: audio-vae-encode's latent of every clip window's "
+          "soundtrack the manifest lists ([2, C, n] for MiniMax-H3), in "
+          "its order; unwired, clips train without their soundtracks",
+   .type = &typeid(TensorBeatPayload)},
+  {.name = "ref_video_rows",
+   .doc = "OPTIONAL (MiniMax-H3 Ref2VA): video-ref-encoder's ref_video "
+          "beside every conditioning it emits -- the references' video "
+          "rows, f32 [rows, 96]; wired with ref_audio_rows",
+   .type = &typeid(TensorBeatPayload)},
+  {.name = "ref_audio_rows",
+   .doc = "OPTIONAL (MiniMax-H3 Ref2VA): video-ref-encoder's ref_audio, "
+          "the references' soundtrack rows, f32 [rows, 32]",
+   .type = &typeid(TensorBeatPayload)},
 };
 
 const PortSpec kOports[] = {
@@ -235,8 +301,13 @@ const PortSpec kOports[] = {
    .doc = "one beat per saved adapter {path, step, loss, trigger_word}",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "metrics",
-   .doc = "one beat per step {step, loss, lr, grad_norm, sec}",
+   .doc = "one beat per step {step, total, loss, lr, grad_norm, sec}; an "
+          "audio-video model adds loss_video and loss_audio",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "preview_audio",
+   .doc = "OPTIONAL: an audio-video model's preview soundtracks, f32 "
+          "[2, C, n] beside each preview latent, for audio-vae-decode",
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 
 const ConfigKey kSaveResults[] = {
@@ -287,8 +358,9 @@ const StageSpec kSpec = {
          "dataset encoded by the model's own conditioner and VAE. Caches "
          "the encoded dataset, loads the model once the encoders are done, "
          "trains with the optimizer-select spec, and saves checkpoints "
-         "(with previews) that generate-image's adapter pickers offer. "
-         "Qwen-Image-2.1 today.",
+         "(with previews) that generate-image's and generate-video's "
+         "adapter pickers offer. Qwen-Image-2.1, and MiniMax-H3 (FL2VA or "
+         "Ref2VA) on pictures, each a one-frame clip.",
   .display_name = "Train LoRA",
   .category = StageCategory::Generative,
   .iports = kIports,
@@ -346,6 +418,23 @@ TrainLoraStage::TrainLoraStage(const SessionContextIntf* s, std::string id,
   _resume = attr_str("resume");
   _register = attr_bool("register");
   _cache_cfg = attr_str("cache");
+  _audio_weight = attr_real("audio_loss_weight");
+  _dit_cfg = attr_str("dit_dir");
+  {
+    auto o = this->config().as_object();
+    if (o.contains("base_lora")) {
+      const FlexData b = o.at("base_lora");
+      if (b.is_array()) {
+        auto a = b.as_array();
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          const std::string v(a.at(i).as_string(""));
+          if (!v.empty()) { _base_loras.push_back(v); }
+        }
+      } else if (b.is_string() && !std::string(b.as_string("")).empty()) {
+        _base_loras.push_back(std::string(b.as_string("")));
+      }
+    }
+  }
   if (_cache_cfg.empty()) { _cache_cfg = "auto"; }
   if (!parse_seed_sequence(attr_str("seed_sequence"), &_seed_seq)) {
     fail_config(fmt("TrainLoraStage('{}'): seed_sequence must be increment, "
@@ -416,10 +505,13 @@ TrainLoraStage::reset_run_state()
   _encode_planned = false;
   _want_text.clear();
   _want_pic.clear();
+  _want_audio.clear();
   _got_text = 0;
   _got_pic = 0;
+  _got_audio = 0;
   _step = 0;
   _saved.clear();
+  _bar.finish();
 #endif
 }
 
@@ -461,6 +553,31 @@ TrainLoraStage::draw_sigma(const std::string& mode, std::uint64_t seed,
   return std::clamp(u, 1e-4, 1.0 - 1e-4);
 }
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+genai::train::RunShape
+TrainLoraStage::run_paths_() const
+{
+  genai::train::RunShape r;
+  if (!_dit_cfg.empty()) { r.dit_dir = resolve_model_dir(session(), _dit_cfg); }
+  for (const std::string& b : _base_loras) {
+    // A registry key names a file (a LoRA record's local_path) or a
+    // directory holding one.
+    std::string p = resolve_model_dir(session(), b);
+    std::error_code ec;
+    if (fs::is_directory(p, ec)) {
+      for (const auto& e : fs::directory_iterator(p, ec)) {
+        if (e.path().extension() == ".safetensors") {
+          p = e.path().string();
+          break;
+        }
+      }
+    }
+    r.base_loras.push_back(p);
+  }
+  return r;
+}
+#endif
+
 std::vector<ResourceClaim>
 TrainLoraStage::declare_resources() const
 {
@@ -469,12 +586,31 @@ TrainLoraStage::declare_resources() const
   // encode's to declare; this stage loads only after they are done.
   std::vector<ResourceClaim> v;
   if (_hf_dir.empty()) { return v; }
-  const std::string root = resolve_model_dir(session(), _hf_dir);
-  const std::string dit = (fs::path(root) / "transformer").string();
-  static const std::vector<std::string_view> kStems = {
-      "transformer_blocks."};
-  v.push_back(model_memory::weight_claim_streamable(
-      dit, model_memory::streaming_floor_bytes(dit, kStems)));
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  const ResolvedModel rm = resolve_model(session(), _hf_dir);
+  const std::string root =
+      rm.dir.empty() ? resolve_model_dir(session(), _hf_dir) : rm.dir;
+  const genai::train::RunShape run = run_paths_();
+  for (const genai::train::LoraFamily* f : genai::train::lora_families()) {
+    std::string why;
+    if (!f->claims(root, rm.model_type, run, &why)) { continue; }
+    std::string dit;
+    std::size_t floor = 0;
+    if (f->claim(root, rm.model_type, run, &dit, &floor)) {
+      v.push_back(model_memory::weight_claim_streamable(dit, floor));
+    }
+    // What the run holds beside the DiT (frozen adapters, a second weight
+    // set), each at what it holds.
+    for (const auto& e : f->extra_claims(root, rm.model_type, run)) {
+      ResourceClaim c = model_memory::weight_claim_streamable(e.path,
+                                                              e.floor);
+      bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                       (std::int64_t)e.held);
+      v.push_back(std::move(c));
+    }
+    break;
+  }
+#endif
   // The step's activations and the adapter's state, before any geometry
   // is known: revised to the measured figures once training starts.
   for (auto& c : model_memory::scratch_claims(
@@ -547,7 +683,8 @@ TrainLoraStage::settle_cache_(std::string* err)
   }
   for (const Sample& s : _samples) {
     for (const Picture& p : s.pics) {
-      total += (std::size_t)std::max(_latent_c, 1) * p.h * p.w * 2;
+      total += (std::size_t)std::max(_latent_c, 1) * p.t * p.h * p.w * 2;
+      total += (std::size_t)2 * p.ac * p.an * 2;
     }
   }
   const std::size_t budget = model_memory::phys_ram() / 8;
@@ -571,6 +708,30 @@ TrainLoraStage::settle_cache_(std::string* err)
   _cache_bytes = 0;
   for (std::size_t i = 0; i < _texts.size(); ++i) {
     Text& t = _texts[i];
+    // A cached caption with references: its rows back into RAM.
+    if (names_references_(t.sideband) && t.nrv + t.nra == 0 &&
+        t.rv.empty() && t.ra.empty()) {
+      for (int k = 0; k < 2; ++k) {
+        const std::string rk = ref_key_(t.key, k == 0 ? "video" : "audio");
+        const auto* e = _cache.find(rk);
+        if (e == nullptr || e->shape.size() != 2) {
+          *err = "a cached caption's reference rows are not in '" +
+                 _cache.dir() + "' -- run again to re-encode them";
+          return false;
+        }
+        metal_compute::SharedBuffer& b = k == 0 ? t.rv : t.ra;
+        (k == 0 ? t.nrv : t.nra) = (int)e->shape[0];
+        if (e->bytes == 0) { continue; }
+        b = mc->make_shared_buffer((std::size_t)e->bytes);
+        if (!_cache.read(rk, b.contents(), (std::size_t)e->bytes, err)) {
+          return false;
+        }
+      }
+    }
+    _cache_bytes += t.rv.byte_size() + t.ra.byte_size();
+    // An EMPTY conditioning (MiniMax-H3's empty prompt: no rows) holds
+    // nothing, in RAM or the cache.
+    if (t.rows == 0) { continue; }
     if (!keep[i]) {
       if (!t.key.empty() && _cache.has(t.key)) { t.buf = {}; }
       if (!t.buf.empty()) { _cache_bytes += t.buf.byte_size(); }
@@ -592,6 +753,46 @@ TrainLoraStage::settle_cache_(std::string* err)
   }
   for (Sample& s : _samples) {
     for (Picture& p : s.pics) {
+      // A soundtrack stays in RAM in either mode (a few KB a window):
+      // back from the cache when this run did not encode it.
+      if (p.audio && p.ax0.empty()) {
+        const auto* e = _cache.find(p.akey);
+        if (e == nullptr) {
+          *err = "a cached soundtrack vanished from '" + _cache.dir() + "'";
+          return false;
+        }
+        std::vector<std::uint16_t> b((std::size_t)e->bytes / 2);
+        if (!_cache.read(p.akey, b.data(), (std::size_t)e->bytes, err)) {
+          return false;
+        }
+        p.ax0 = mc->make_shared_buffer(b.size() * 4);
+        auto* d = static_cast<float*>(p.ax0.contents());
+        for (std::size_t i = 0; i < b.size(); ++i) {
+          d[i] = genai::train::bf16_to_f32(b[i]);
+        }
+      }
+      if (p.audio) { _cache_bytes += p.ax0.byte_size() / 2; }
+      // The keyframes' stills likewise stay in RAM.
+      for (std::size_t k = 0; k < p.kx.size(); ++k) {
+        if (p.kx[k].empty()) {
+          const auto* e = _cache.find(p.kkeys[k]);
+          if (e == nullptr) {
+            *err = "a cached keyframe vanished from '" + _cache.dir() + "'";
+            return false;
+          }
+          std::vector<std::uint16_t> b((std::size_t)e->bytes / 2);
+          if (!_cache.read(p.kkeys[k], b.data(), (std::size_t)e->bytes,
+                           err)) {
+            return false;
+          }
+          p.kx[k] = mc->make_shared_buffer(b.size() * 4);
+          auto* d = static_cast<float*>(p.kx[k].contents());
+          for (std::size_t i = 0; i < b.size(); ++i) {
+            d[i] = genai::train::bf16_to_f32(b[i]);
+          }
+        }
+        _cache_bytes += p.kx[k].byte_size() / 2;
+      }
       if (_disk) {
         if (!p.key.empty() && _cache.has(p.key)) { p.x0 = {}; continue; }
         _cache_bytes += p.x0.byte_size() / 2;
@@ -629,7 +830,7 @@ TrainLoraStage::text_(int ti, const Text** out, Text* scratch,
                       std::string* err)
 {
   const Text& t = _texts[(std::size_t)ti];
-  if (!t.buf.empty()) { *out = &t; return true; }
+  if (!t.buf.empty() || t.rows == 0) { *out = &t; return true; }
   auto* mc = session()->services()->metal_compute();
   const auto* e = _cache.find(t.key);
   if (e == nullptr) {
@@ -639,6 +840,8 @@ TrainLoraStage::text_(int ti, const Text** out, Text* scratch,
   scratch->rows = t.rows;
   scratch->sideband = t.sideband;
   scratch->key = t.key;
+  scratch->nrv = t.nrv;
+  scratch->nra = t.nra;
   scratch->buf = mc->make_shared_buffer((std::size_t)e->bytes);
   if (!_cache.read(t.key, scratch->buf.contents(), (std::size_t)e->bytes,
                    err)) {
@@ -656,7 +859,7 @@ TrainLoraStage::latent_(const Picture& p,
 {
   if (!p.x0.empty()) { *out = &p.x0; return true; }
   const auto* e = _cache.find(p.key);
-  if (e == nullptr || e->shape.size() != 3) {
+  if (e == nullptr || (e->shape.size() != 3 && e->shape.size() != 4)) {
     *err = "latent " + p.key + " is in neither RAM nor the cache";
     return false;
   }
@@ -668,8 +871,8 @@ TrainLoraStage::latent_(const Picture& p,
   for (std::size_t i = 0; i < b.size(); ++i) {
     chw[i] = genai::train::bf16_to_f32(b[i]);
   }
-  *scratch = _trainer->pack_latent(chw.data(), (int)e->shape[0], p.h, p.w,
-                                  err);
+  *scratch = _trainer->pack_latent(chw.data(), (int)e->shape[0], p.t, p.h,
+                                  p.w, err);
   *out = scratch;
   return !scratch->empty();
 }
@@ -684,11 +887,12 @@ TrainLoraStage::validate_(double* loss, std::string* err)
     const Sample& s = _samples[(std::size_t)_val[i]];
     if (s.pics.empty() || s.texts.empty()) { continue; }
     const Picture& p = s.pics.front();
+    const std::vector<int>& tl = p.texts.empty() ? s.texts : p.texts;
     Text scratch;
     const Text* t = nullptr;
     metal_compute::SharedBuffer xs;
     const metal_compute::SharedBuffer* xp = nullptr;
-    if (!text_(s.texts.front(), &t, &scratch, err) ||
+    if (!text_(tl.front(), &t, &scratch, err) ||
         !latent_(p, &xp, &xs, err)) {
       return false;
     }
@@ -714,7 +918,32 @@ TrainLoraStage::validate_(double* loss, std::string* err)
     ts.sideband = &t->sideband;
     ts.grid_h = p.h;
     ts.grid_w = p.w;
+    ts.frames = p.t;
     ts.sigma = (float)sigma;
+    ts.seed = mix_(0x76616c69646174ull ^ mix_(i * 5 + 1));
+    if (p.anchors != 0) {
+      ts.anchors = p.anchors;
+      ts.cond_x0 = &p.cx0;
+    } else if (t->nrv + t->nra > 0) {
+      // The caption's references (in RAM on its entry, never a scratch).
+      const Text& tr = _texts[(std::size_t)tl.front()];
+      ts.cond_x0 = &tr.rv;
+      ts.cond_audio = &tr.ra;
+    }
+    metal_compute::SharedBuffer anoise;
+    if (!p.ax0.empty()) {
+      const std::size_t an = p.ax0.byte_size() / 2;
+      anoise = mc->make_shared_buffer(an * 2);
+      std::mt19937_64 rng(mix_(0x61756469306f6eull ^ mix_(i)));
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      auto* d = static_cast<std::uint16_t*>(anoise.contents());
+      for (std::size_t j = 0; j < an; ++j) {
+        d[j] = genai::train::f32_to_bf16(nd(rng));
+      }
+      ts.audio_x0 = &p.ax0;
+      ts.audio_noise = &anoise;
+      ts.audio_weight = (float)_audio_weight;
+    }
     double l = 0.0;
     if (!_trainer->eval_loss(ts, &l, err)) { return false; }
     sum += l;
@@ -742,98 +971,130 @@ TrainLoraStage::load_model_(std::string* err)
     *err = "no model -- set hf_dir or wire a model-select source";
     return false;
   }
-  const std::string root = resolve_model_dir(session(), _hf_dir);
-  _dit_dir = (fs::path(root) / "transformer").string();
-  if (!genai::QwenImage21LoraTrainer::claims(_dit_dir)) {
-    *err = "'" + _hf_dir + "' is not a model this stage can train (today: "
-           "Qwen-Image-2.1)";
-    return false;
-  }
-  _family = "qwen-image-21";
-
-  // The largest geometry this run will train at, for the plan below.
-  int max_rows = 0, max_text = 0;
-  for (const Sample& s : _samples) {
-    for (const Picture& p : s.pics) {
-      max_rows = std::max(max_rows, p.h * p.w);
+  const ResolvedModel rm = resolve_model(session(), _hf_dir);
+  const std::string root =
+      rm.dir.empty() ? resolve_model_dir(session(), _hf_dir) : rm.dir;
+  // WHICH FAMILY: the first that claims the checkpoint. One that knows it
+  // but cannot train it says why.
+  const genai::train::LoraFamily* fam = nullptr;
+  genai::train::RunShape run = run_paths_();
+  for (const genai::train::LoraFamily* f : genai::train::lora_families()) {
+    std::string why;
+    if (f->claims(root, rm.model_type, run, &why)) { fam = f; break; }
+    if (!why.empty()) {
+      *err = "'" + _hf_dir + "': " + why;
+      return false;
     }
   }
-  for (const Text& t : _texts) { max_text = std::max(max_text, t.rows); }
-
-  genai::QwenImage21LoraTrainer::LoadArgs a;
-  a.mc = mc;
-  if (!genai::MetalQwenImage21Transformer::Config::read_dims(_dit_dir,
-                                                             &a.cfg)) {
-    *err = "'" + _dit_dir + "' has no Qwen-Image-2.1 config";
+  if (fam == nullptr) {
+    *err = "'" + _hf_dir + "' is not a model this stage can train (today: "
+           "Qwen-Image-2.1, MiniMax-H3 FL2VA / Ref2VA)";
     return false;
   }
-  a.cfg.ane_ffn = _ane_forward;
-  a.cfg.ane_qkv = _ane_forward;
-  a.cfg.i8_gemm = _i8;
-  // THE ADAPTER'S STATE: masters, gradients, shadows and the optimizer's
-  // moments, per parameter -- from the dims, before anything loads.
-  const std::size_t H = (std::size_t)a.cfg.hidden;
-  const std::size_t FF = H * (std::size_t)a.cfg.mlp_ratio;
-  const std::size_t per_block = _targets == "attn"
-      ? 8 * H : 8 * H + 3 * (H + FF);
-  const std::size_t params =
-      per_block * (std::size_t)_rank * (std::size_t)a.cfg.n_layers;
-  const std::size_t state =
-      params * (10 + genai::train::Optimizer::state_bytes_per_param(
-                         _opt_spec));
-  const std::size_t dit_bytes = model_memory::dir_weights_bytes(_dit_dir);
-  // The recompute arena at the widest bucket, from the dims alone.
-  const std::size_t arena_est =
-      genai::QwenImage21Trainer::arena_bytes(a.cfg, max_rows + max_text,
-                                             _rank, false);
+  _family = fam->name();
+  _extra_dirs.clear();
+  for (const auto& e : fam->extra_claims(root, rm.model_type, run)) {
+    _extra_dirs.push_back(e.path);
+  }
+
+  // The widest sample this run trains, for the plan below.
+  for (const Sample& s : _samples) {
+    for (const Picture& p : s.pics) {
+      run.max_cells = std::max(run.max_cells, p.t * p.h * p.w);
+      run.max_frames = std::max(run.max_frames, p.t);
+      run.max_grid_h = std::max(run.max_grid_h, p.h);
+      run.max_grid_w = std::max(run.max_grid_w, p.w);
+      run.max_anchors =
+          std::max(run.max_anchors, __builtin_popcount((unsigned)p.anchors));
+    }
+  }
+  for (const Text& t : _texts) {
+    run.max_text = std::max(run.max_text, t.rows);
+    run.max_cond_rows = std::max(run.max_cond_rows, t.nrv + t.nra);
+  }
+  run.rank = _rank;
+  run.targets = _targets;
+  run.opt_bytes_per_param =
+      genai::train::Optimizer::state_bytes_per_param(_opt_spec, _rank);
+  run.cache_bytes = _cache_bytes;
+  run.headroom = model_memory::kStreamHeadroom;
+  run.ram = model_memory::phys_ram();
+  run.ane = _ane_forward;
+  run.i8 = _i8;
+  genai::train::LoadPlan plan;
+  if (!fam->plan(root, rm.model_type, run, &plan, err)) { return false; }
+  _dit_dir = plan.dit_dir;
   // STREAMING, by training's own rule. The generation rule sizes a DiT
   // against the text encoder beside it; here the encoders are done and
   // released before this loads, so what shares the box is the step's
   // transient -- activations and the adapter's state -- and the cache.
   // Irreversible, so the larger headroom.
-  bool stream = dit_bytes + arena_est + state + _cache_bytes +
-                    model_memory::kStreamHeadroom >
+  bool stream = plan.held_bytes + plan.arena_recompute + plan.state_bytes +
+                    _cache_bytes + model_memory::kStreamHeadroom >
                 model_memory::phys_ram();
   if (const char* e = std::getenv("VPIPE_TRAIN_STREAM")) {
     stream = std::atoi(e) != 0;
   }
-  a.stream_blocks = stream;
+  genai::train::LoraFamily::LoadArgs a;
   a.ws = genai::open_weight_set(_dit_dir, session());
-  auto t = genai::QwenImage21LoraTrainer::load(a, err);
-  if (t == nullptr) { return false; }
-  // KEEP ALL when the box holds it -- about a quarter of a step saved.
-  const std::size_t keep_arena =
-      genai::QwenImage21Trainer::arena_bytes(a.cfg, max_rows + max_text,
-                                             _rank, true);
-  const std::size_t held = stream ? model_memory::streaming_floor_bytes(
-                                        _dit_dir, {"transformer_blocks."})
-                                  : dit_bytes;
-  bool keep = false;
-  if (_recompute == "never") {
-    keep = true;
-  } else if (_recompute == "auto") {
-    keep = held + keep_arena + state + _cache_bytes +
-               model_memory::kHeadroom <= model_memory::phys_ram();
+  if (!plan.aux_dir.empty()) {
+    a.aux_ws = genai::open_weight_set(plan.aux_dir, session());
   }
+  a.mc = mc;
+  a.root = root;
+  a.model_type = rm.model_type;
+  a.plan = &plan;
+  a.stream_blocks = stream;
+  a.run = &run;
+  auto t = fam->load(a, err);
+  if (t == nullptr) { return false; }
+  // KEEP ALL when the box holds it -- about a quarter of a step saved --
+  // where the family can.
+  const std::size_t held = stream ? plan.floor_bytes : plan.held_bytes;
+  bool keep = false;
+  if (plan.arena_keep > 0) {
+    if (_recompute == "never") {
+      keep = true;
+    } else if (_recompute == "auto") {
+      keep = held + plan.arena_keep + plan.state_bytes + _cache_bytes +
+                 model_memory::kHeadroom <= model_memory::phys_ram();
+    }
+  }
+  const std::size_t arena = keep ? plan.arena_keep : plan.arena_recompute;
   FlexData o = FlexData::make_object();
   o.as_object().insert_or_assign(genai::train::opt::kKeepAll,
                                  FlexData::make_bool(keep));
   o.as_object().insert_or_assign(genai::train::opt::kAneBackward,
                                  FlexData::make_bool(_ane_backward));
   t->set_options(o);
-  _reserve_bytes = (keep ? keep_arena : arena_est) + state + _cache_bytes +
+  _reserve_bytes = arena + plan.state_bytes + _cache_bytes +
                    model_memory::kHeadroom;
   session()->info(fmt(
-      "TrainLoraStage('{}'): {} DiT {} ({} MB on disk), activations {} "
-      "({} MB at the widest bucket, {} rows), {} MB of cached samples",
-      this->id(), _family, stream ? "STREAMED" : "resident", dit_bytes >> 20,
-      keep ? "kept for every block" : "recomputed per block",
-      (keep ? keep_arena : arena_est) >> 20, max_rows + max_text,
-      _cache_bytes >> 20));
+      "TrainLoraStage('{}'): {} DiT {} ({} MB held, {} MB streaming at the "
+      "least){}, activations {} ({} MB at the widest sample: {} frame(s) "
+      "of {}x{} latents, {} text rows), adapter state {} MB, {} MB of "
+      "cached samples", this->id(), _family,
+      stream ? "STREAMED" : "resident", plan.held_bytes >> 20,
+      plan.floor_bytes >> 20, plan.note.empty() ? "" : "; " + plan.note,
+      keep ? "kept for every block" : "recomputed per block", arena >> 20,
+      run.max_frames, run.max_grid_w, run.max_grid_h, run.max_text,
+      plan.state_bytes >> 20, _cache_bytes >> 20));
+  _adapter_type = t->adapter_model_type();
+  _parent_type = t->parent_model_type();
   _trainer = std::move(t);
   if (auto* mgr = session()->services()->generative_model_manager()) {
+    // The step's activations, the adapter's state, and the encoded
+    // samples this run keeps in RAM (all of them, or what a disk cache
+    // leaves resident: the previews' texts, soundtracks, keyframes and
+    // reference rows) -- held from here to the run's end.
     mgr->revise_scratch("train-lora-arena",
-                        (keep ? keep_arena : arena_est) + state);
+                        arena + plan.state_bytes + _cache_bytes);
+    // What the model HOLDS, which the claim made at launch from the
+    // checkpoint could not know: a DiT pruned at load keeps its AdaLN as
+    // 174 MB where the checkpoint carries 26 GB, and a streamed one its
+    // floor (the manager holds a revision there at the least).
+    mgr->revise_declaration(_dit_dir,
+                            (std::size_t)_trainer->resident_bytes());
   }
   return true;
 }
@@ -845,6 +1106,15 @@ TrainLoraStage::start_training_(std::string* err)
   if (!_ops.valid() && !_ops.init(mc, true, err)) { return false; }
   // The seed of this training job: a sweep's jobs follow seed_sequence.
   _run_seed = generation_seed(_seed_seq, _seed, _run);
+  // Caption dropout keeps a guided model's unconditional pass working; a
+  // guidance-distilled family has none.
+  _dropout = _caption_dropout;
+  if (!_trainer->trains_unconditional() && _caption_dropout > 0.0) {
+    session()->info(fmt("TrainLoraStage('{}'): {} is guidance-distilled -- "
+                        "no unconditional pass to keep -- so caption "
+                        "dropout is off", this->id(), _family));
+    _dropout = 0.0;
+  }
   std::vector<genai::train::ModuleShape> mods = _trainer->modules(_targets);
   const float alpha = _alpha > 0.0 ? (float)_alpha : (float)_rank;
   if (!_params.create(mc, mods, _rank, alpha, err)) { return false; }
@@ -978,6 +1248,9 @@ TrainLoraStage::save_(bool final_save, std::string* err)
   meta["vpipe.steps"] = std::to_string(_step);
   meta["vpipe.samples"] = std::to_string(_samples.size());
   meta["vpipe.optimizer"] = _opt_spec.to_flex().to_json();
+  if (_trainer) {
+    for (const auto& [k, v] : _trainer->metadata()) { meta[k] = v; }
+  }
   char nm[64];
   std::snprintf(nm, sizeof nm, "-%06d", _step);
   const std::string path =
@@ -1030,8 +1303,13 @@ TrainLoraStage::register_(const std::string& path)
     ro.insert_or_assign("local_path", FlexData::make_string(path));
     ro.insert_or_assign("source", FlexData::make_string(_base_ref));
     ro.insert_or_assign("model_type",
-                        FlexData::make_string(_family + "-lora"));
-    ro.insert_or_assign("parent_model_type", FlexData::make_string(_family));
+                        FlexData::make_string(_adapter_type.empty()
+                                                  ? _family + "-lora"
+                                                  : _adapter_type));
+    ro.insert_or_assign("parent_model_type",
+                        FlexData::make_string(_parent_type.empty()
+                                                  ? _family
+                                                  : _parent_type));
     ro.insert_or_assign("param_class", FlexData::make_string("LoRA"));
     ro.insert_or_assign("trigger_word", FlexData::make_string(_trigger));
     ro.insert_or_assign("lora_trained", FlexData::make_bool(true));
@@ -1121,19 +1399,96 @@ TrainLoraStage::plan_encode_(std::string* err)
                                  : std::string();
       if (po.contains("cached") && po.at("cached").as_bool(false)) {
         const genai::train::SampleCache::Entry* ce = _cache.find(p.key);
-        if (ce == nullptr || ce->shape.size() != 3) {
+        if (ce == nullptr ||
+            (ce->shape.size() != 3 && ce->shape.size() != 4)) {
           *err = fmt("picture {} of '{}' is marked cached but is not in "
                      "'{}' -- was the cache changed during the run? Run "
                      "again to re-encode it", i, file, _cache.dir())();
           return false;
         }
+        const bool timed = ce->shape.size() == 4;
         _latent_c = (int)ce->shape[0];
-        p.h = (int)ce->shape[1];
-        p.w = (int)ce->shape[2];
+        p.t = timed ? (int)ce->shape[1] : 1;
+        p.h = (int)ce->shape[timed ? 2 : 1];
+        p.w = (int)ce->shape[timed ? 3 : 2];
       } else {
         _want_pic.push_back(WantPic{(int)si, (int)i,
                                     (int)po.at("h").as_int(0),
                                     (int)po.at("w").as_int(0), file});
+      }
+      // A keyframe window's captions, presented with its keyframes: the
+      // conditioner's encodes after the sample's own, in picture order.
+      if (po.contains("captions")) {
+        const FlexData pcap = po.at("captions");
+        const FlexData pk =
+            po.contains("caption_keys") ? po.at("caption_keys") : FlexData();
+        const FlexData pc = po.contains("caption_cached")
+                                ? po.at("caption_cached") : FlexData();
+        auto pa2 = pcap.as_array();
+        for (std::size_t j = 0; j < pa2.size(); ++j) {
+          const int idx = text_slot(
+              str_at(pk, j), bool_at(pc, j),
+              fmt("presented caption {} of picture {} of '{}'", j, i,
+                  file)());
+          if (idx < 0) { return false; }
+          p.texts.push_back(idx);
+        }
+      }
+      // Its anchors: the stills that follow the window on the latents
+      // port, or the cache's.
+      if (po.contains("anchors")) {
+        const FlexData an = po.at("anchors");
+        const FlexData akeys =
+            po.contains("anchor_keys") ? po.at("anchor_keys") : FlexData();
+        const FlexData acached = po.contains("anchor_cached")
+                                     ? po.at("anchor_cached") : FlexData();
+        auto aa = an.as_array();
+        for (std::size_t k = 0; k < aa.size(); ++k) {
+          const std::string end(aa.at(k).as_string(""));
+          p.anchors |= end == "first" ? 1 : end == "last" ? 2 : 0;
+          p.kkeys.push_back(str_at(akeys, k));
+          p.kx.emplace_back();
+          if (bool_at(acached, k)) {
+            const genai::train::SampleCache::Entry* ke =
+                _cache.find(p.kkeys.back());
+            if (ke == nullptr) {
+              *err = fmt("a keyframe of picture {} of '{}' is marked cached "
+                         "but is not in '{}' -- run again to re-encode it",
+                         i, file, _cache.dir())();
+              return false;
+            }
+          } else {
+            _want_pic.push_back(WantPic{(int)si, (int)i,
+                                        (int)po.at("h").as_int(0),
+                                        (int)po.at("w").as_int(0), file,
+                                        (int)k});
+          }
+        }
+      }
+      // A clip window's soundtrack: read back from the cache, or awaited
+      // on the audio port in the manifest's order.
+      if (po.contains("audio") && po.at("audio").as_bool(false)) {
+        if (!_audio_wired) {
+          ++_audio_unwired;
+        } else {
+          p.audio = true;
+          p.akey = po.contains("audio_key")
+              ? std::string(po.at("audio_key").as_string("")) : std::string();
+          if (po.contains("audio_cached") &&
+              po.at("audio_cached").as_bool(false)) {
+            const genai::train::SampleCache::Entry* ae = _cache.find(p.akey);
+            if (ae == nullptr || ae->shape.size() != 3) {
+              *err = fmt("the soundtrack of picture {} of '{}' is marked "
+                         "cached but is not in '{}' -- run again to "
+                         "re-encode it", i, file, _cache.dir())();
+              return false;
+            }
+            p.ac = (int)ae->shape[1];
+            p.an = (int)ae->shape[2];
+          } else {
+            _want_audio.push_back(WantPic{(int)si, (int)i, 0, 0, file});
+          }
+        }
       }
       s.pics.push_back(std::move(p));
     }
@@ -1224,7 +1579,8 @@ TrainLoraStage::previews_(RuntimeContext& ctx, int which, int steps,
     r.text = &t.buf;
     r.text_rows = t.rows;
     r.sideband = &t.sideband;
-    if (_null_text >= 0 && cfg != 1.0) {
+    if (_null_text >= 0 && cfg != 1.0 &&
+        _texts[(std::size_t)_null_text].rows > 0) {
       const Text& nt = _texts[(std::size_t)_null_text];
       r.neg_text = &nt.buf;
       r.neg_rows = nt.rows;
@@ -1232,22 +1588,43 @@ TrainLoraStage::previews_(RuntimeContext& ctx, int which, int steps,
     }
     r.grid_h = gp.h;
     r.grid_w = gp.w;
+    r.frames = gp.t;
     r.steps = steps;
     r.cfg = (float)cfg;
     r.seed = seed + i;
+    // An audio-video family's soundtrack too, when something reads it.
+    genai::train::PreviewAudio pa;
+    const bool want_audio = ctx.num_oports() > 3 && ctx.has_consumers(3);
+    if (want_audio) { r.audio = &pa; }
     std::vector<float> chw;
     if (!_trainer->preview(r, &chw, err)) { co_return; }
     auto tb = std::make_unique<TensorBeatPayload>();
     tb->dtype = TensorBeat::DType::F32;
-    tb->shape = {_trainer->latent_channels(), gp.h, gp.w};
+    const std::vector<std::int64_t> shape =
+        _trainer->latent_shape(gp.t, gp.h, gp.w);
+    tb->shape.assign(shape.begin(), shape.end());
     tb->resize_contiguous(chw.size());
     std::memcpy(tb->as_f32(), chw.data(), chw.size() * 4);
     FlexData sb = FlexData::make_object();
     auto so = sb.as_object();
     so.insert_or_assign("step", FlexData::make_int(_step));
     so.insert_or_assign("prompt", FlexData::make_string(_preview_prompts[i]));
-    tb->sideband = std::move(sb);
+    tb->sideband = sb;
     co_await ctx.write(0, std::move(tb));
+    if (want_audio && !pa.latent.empty()) {
+      auto ab = std::make_unique<TensorBeatPayload>();
+      ab->dtype = TensorBeat::DType::F32;
+      ab->shape.assign(pa.shape.begin(), pa.shape.end());
+      ab->resize_contiguous(pa.latent.size());
+      std::memcpy(ab->as_f32(), pa.latent.data(), pa.latent.size() * 4);
+      if (pa.latents_per_second > 0.0) {
+        sb.as_object().insert_or_assign(
+            sideband::kLatentsPerSecond,
+            FlexData::make_real(pa.latents_per_second));
+      }
+      ab->sideband = std::move(sb);
+      co_await ctx.write(3, std::move(ab));
+    }
     ++*n;
   }
 }
@@ -1314,6 +1691,7 @@ TrainLoraStage::process(RuntimeContext& ctx)
   auto* mc = session()->services()->metal_compute();
   auto fail = [&](const std::string& m) {
     session()->error(fmt("TrainLoraStage('{}'): {}", this->id(), m));
+    _bar.finish();
     _phase = Phase::kDone;
     ctx.signal_done();
   };
@@ -1387,6 +1765,7 @@ TrainLoraStage::process(RuntimeContext& ctx)
     }
     _phase = Phase::kEncode;
     _encode_t0 = std::chrono::steady_clock::now();
+    _bar = session()->open_progress("lora encode");
     co_return;
   }
 
@@ -1403,8 +1782,26 @@ TrainLoraStage::process(RuntimeContext& ctx)
   if (_phase == Phase::kEncode) {
     if (!_encode_planned) {
       _encode_planned = true;
+      _audio_wired = ctx.num_iports() > kAudioPort &&
+                     ctx.iport_connected(kAudioPort);
+      const bool rv = ctx.num_iports() > kRefVideoPort &&
+                      ctx.iport_connected(kRefVideoPort);
+      const bool ra = ctx.num_iports() > kRefAudioPort &&
+                      ctx.iport_connected(kRefAudioPort);
+      if (rv != ra) {
+        fail("ref_video_rows and ref_audio_rows are wired together "
+             "(video-ref-encoder's oports 1 and 2) or not at all");
+        co_return;
+      }
+      _refs_wired = rv;
       std::string perr;
       if (!plan_encode_(&perr)) { fail(perr); co_return; }
+      if (_audio_unwired > 0) {
+        session()->info(fmt("TrainLoraStage('{}'): the manifest lists {} "
+                            "soundtracks and the audio_latents port is not "
+                            "wired; the clips train without them",
+                            this->id(), _audio_unwired));
+      }
     }
     // One conditioning beat into its slot, RAM and the cache.
     auto take_text = [&](const BeatPayloadIntf* cb, int idx) {
@@ -1412,12 +1809,50 @@ TrainLoraStage::process(RuntimeContext& ctx)
                           : nullptr;
       if (tb == nullptr || tb->shape.size() != 2) { return false; }
       Text& t = _texts[(std::size_t)idx];
-      t.buf = copy_beat_(mc, *tb);
       t.rows = (int)tb->shape[0];
+      if (t.rows > 0) { t.buf = copy_beat_(mc, *tb); }
       t.sideband = tb->sideband;
       _cache_bytes += t.buf.byte_size();
       cache_put_(t.key, *tb, false);
       return true;
+    };
+    // A caption's reference rows (video-ref-encoder's oports 1 and 2,
+    // emitted beside its conditioning): f32 rows, rounded to bf16 as
+    // the forward reads them, kept in RAM and cached beside the caption.
+    auto take_refs = [&](const BeatPayloadIntf* vb, const BeatPayloadIntf* ab,
+                         int idx, std::string* why) {
+      Text& t = _texts[(std::size_t)idx];
+      auto one = [&](const BeatPayloadIntf* b, int width, const char* which,
+                     metal_compute::SharedBuffer* dst, int* n) {
+        const auto* tb = b ? dynamic_cast<const TensorBeatPayload*>(b)
+                           : nullptr;
+        if (tb == nullptr || tb->dtype != TensorBeat::DType::F32 ||
+            tb->shape.size() != 2 ||
+            (tb->shape[0] > 0 && tb->shape[1] != width)) {
+          *why = fmt("a caption's reference {} rows did not arrive as f32 "
+                     "[rows, {}] -- is video-ref-encoder's oport {} wired "
+                     "here?", which, width,
+                     std::string(which) == "video" ? 1 : 2)();
+          return false;
+        }
+        *n = (int)tb->shape[0];
+        // Cached even when empty (an audio-only request's video rows), so
+        // a rerun reading the caption back finds both halves.
+        cache_put_(ref_key_(t.key, which), *tb, true);
+        if (*n == 0) { return true; }
+        const auto bytes = tb->materialize_contiguous();
+        const std::size_t m = bytes.size() / 4;
+        *dst = mc->make_shared_buffer(m * 2);
+        const auto* src = reinterpret_cast<const float*>(bytes.data());
+        auto* d = static_cast<std::uint16_t*>(dst->contents());
+        for (std::size_t j = 0; j < m; ++j) {
+          d[j] = genai::train::f32_to_bf16(src[j]);
+        }
+        _cache_bytes += m * 2;
+        return true;
+      };
+      return one(vb, 96, "video", &t.rv, &t.nrv) &&
+             one(ab, 32, "audio", &t.ra, &t.nra);
     };
     // One latent into its picture: f32 [C,h,w], rounded to the storage
     // type now, exactly as packing would -- so a latent read back from
@@ -1427,14 +1862,18 @@ TrainLoraStage::process(RuntimeContext& ctx)
       const auto* tb = lb ? dynamic_cast<const TensorBeatPayload*>(lb)
                           : nullptr;
       if (tb == nullptr || tb->dtype != TensorBeat::DType::F32 ||
-          tb->shape.size() != 3) {
+          (tb->shape.size() != 3 && tb->shape.size() != 4)) {
         *why = fmt("the latent of sample {} ('{}') did not arrive as f32 "
-                   "[C,h,w] -- vae-encode and the training-dataset "
-                   "disagree", w.sample, w.file)();
+                   "[C,h,w] (or a video VAE's [C,t,h,w]) -- vae-encode and "
+                   "the training-dataset disagree", w.sample, w.file)();
         return false;
       }
-      const int lc = (int)tb->shape[0], lh = (int)tb->shape[1],
-                lw = (int)tb->shape[2];
+      // A video VAE's latent carries a time axis: one frame for a picture.
+      const bool timed = tb->shape.size() == 4;
+      const int lc = (int)tb->shape[0];
+      const int lt = timed ? (int)tb->shape[1] : 1;
+      const int lh = (int)tb->shape[timed ? 2 : 1];
+      const int lw = (int)tb->shape[timed ? 3 : 2];
       // The picture and its latent agree on a scale, or the VAE was
       // handed something else.
       if (lh <= 0 || lw <= 0 || w.ph % lh != 0 || w.pw % lw != 0 ||
@@ -1447,6 +1886,25 @@ TrainLoraStage::process(RuntimeContext& ctx)
       const std::size_t n = bytes.size() / 4;
       Picture& p =
           _samples[(std::size_t)w.sample].pics[(std::size_t)w.pic];
+      if (w.anchor >= 0) {
+        // A keyframe's still: one latent frame of the window's grid.
+        if (lt != 1) {
+          *why = fmt("a keyframe of sample {} ('{}') arrived as {} latent "
+                     "frames, not a still's one", w.sample, w.file, lt)();
+          return false;
+        }
+        metal_compute::SharedBuffer& k = p.kx[(std::size_t)w.anchor];
+        k = mc->make_shared_buffer(bytes.size());
+        const auto* src = reinterpret_cast<const float*>(bytes.data());
+        auto* dst = static_cast<float*>(k.contents());
+        for (std::size_t j = 0; j < n; ++j) {
+          dst[j] = genai::train::bf16_to_f32(genai::train::f32_to_bf16(src[j]));
+        }
+        _cache_bytes += n * 2;
+        cache_put_(p.kkeys[(std::size_t)w.anchor], *tb, true);
+        return true;
+      }
+      p.t = lt;
       p.h = lh;
       p.w = lw;
       _latent_c = lc;
@@ -1466,17 +1924,64 @@ TrainLoraStage::process(RuntimeContext& ctx)
       return true;
     };
 
+    // One soundtrack latent into its clip window: f32 [2, C, n], rounded
+    // to the storage type now, as a latent is.
+    auto take_audio = [&](const BeatPayloadIntf* ab, const WantPic& w,
+                          std::string* why) {
+      const auto* tb = ab ? dynamic_cast<const TensorBeatPayload*>(ab)
+                          : nullptr;
+      if (tb == nullptr || tb->dtype != TensorBeat::DType::F32 ||
+          tb->shape.size() != 3 || tb->shape[0] != 2) {
+        *why = fmt("the soundtrack of sample {} ('{}') did not arrive as "
+                   "f32 [2, C, n] -- audio-vae-encode and the "
+                   "training-dataset disagree", w.sample, w.file)();
+        return false;
+      }
+      Picture& p =
+          _samples[(std::size_t)w.sample].pics[(std::size_t)w.pic];
+      p.ac = (int)tb->shape[1];
+      p.an = (int)tb->shape[2];
+      const auto bytes = tb->materialize_contiguous();
+      const std::size_t n = bytes.size() / 4;
+      p.ax0 = mc->make_shared_buffer(bytes.size());
+      const auto* src = reinterpret_cast<const float*>(bytes.data());
+      auto* dst = static_cast<float*>(p.ax0.contents());
+      for (std::size_t j = 0; j < n; ++j) {
+        dst[j] = genai::train::bf16_to_f32(genai::train::f32_to_bf16(src[j]));
+      }
+      _cache_bytes += n * 2;
+      cache_put_(p.akey, *tb, true);
+      return true;
+    };
+
     const bool want_t = _got_text < _want_text.size();
     const bool want_p = _got_pic < _want_pic.size();
-    if (want_t || want_p) {
+    const bool want_a = _got_audio < _want_audio.size();
+    if (want_t || want_p || want_a) {
+      _bar.update(_got_text + _got_pic + _got_audio,
+                  _want_text.size() + _want_pic.size() + _want_audio.size(),
+                  fmt("{} captions, {} pictures{}", _want_text.size(),
+                      _want_pic.size(),
+                      _want_audio.empty()
+                          ? std::string()
+                          : fmt(", {} soundtracks", _want_audio.size())())());
       std::vector<unsigned> ports;
       if (want_t && !ctx.eos(kCondPort)) { ports.push_back(kCondPort); }
       if (want_p && !ctx.eos(kLatentPort)) { ports.push_back(kLatentPort); }
+      if (want_a && !ctx.eos(kAudioPort)) { ports.push_back(kAudioPort); }
+      if (want_a && ctx.eos(kAudioPort)) {
+        fail(fmt("the soundtracks ended after {} of {} -- audio-vae-encode "
+                 "and the training-dataset disagree (is audio-vae-encode "
+                 "current: it must encode a batch beat by beat?)",
+                 _got_audio, _want_audio.size())());
+        co_return;
+      }
       if (want_t && ctx.eos(kCondPort)) {
         fail(fmt("the conditioning ended after {} of {} encodes -- the "
-                 "diffusion-conditioner and the training-dataset disagree "
-                 "about how many captions there are (is the conditioner "
-                 "current: it must accept allow_empty?)", _got_text,
+                 "conditioner (diffusion-conditioner or video-ref-encoder) "
+                 "and the training-dataset disagree about how many captions "
+                 "there are: it skipped one (see its warning above), or it "
+                 "is older than allow_empty / batch prompts", _got_text,
                  _want_text.size())());
         co_return;
       }
@@ -1493,6 +1998,23 @@ TrainLoraStage::process(RuntimeContext& ctx)
         if (!take_text(cb.get(), idx)) {
           fail(fmt("conditioning {} of {} did not arrive as a [rows, dim] "
                    "tensor", _got_text, _want_text.size())());
+          co_return;
+        }
+        if (_refs_wired) {
+          // Its reference rows: written ahead of the conditioning by the
+          // same request, so these reads do not wait.
+          auto vb = co_await ctx.read(kRefVideoPort);
+          auto ab = co_await ctx.read(kRefAudioPort);
+          std::string why;
+          if (!take_refs(vb.get(), ab.get(), idx, &why)) {
+            fail(why);
+            co_return;
+          }
+        } else if (names_references_(_texts[(std::size_t)idx].sideband)) {
+          fail("a caption arrived encoded with references and "
+               "ref_video_rows / ref_audio_rows are not wired: wire "
+               "video-ref-encoder's oports 1 and 2 to train-lora's iports 6 "
+               "and 7");
           co_return;
         }
         ++_got_text;
@@ -1513,21 +2035,44 @@ TrainLoraStage::process(RuntimeContext& ctx)
           }
         }
       }
-      if (_got_text < _want_text.size() || _got_pic < _want_pic.size()) {
+      while (_got_audio < _want_audio.size() &&
+             ctx.backlog(kAudioPort) > 0) {
+        auto ab = co_await ctx.read(kAudioPort);
+        std::string why;
+        if (!take_audio(ab.get(), _want_audio[_got_audio], &why)) {
+          fail(why);
+          co_return;
+        }
+        ++_got_audio;
+      }
+      if (_got_text < _want_text.size() || _got_pic < _want_pic.size() ||
+          _got_audio < _want_audio.size()) {
         co_return;
       }
     }
+    _bar.update(_got_text + _got_pic + _got_audio,
+                _want_text.size() + _want_pic.size() + _want_audio.size(),
+                fmt("{} captions, {} pictures", _want_text.size(),
+                    _want_pic.size())());
     // Then the END of both streams. The encoders let go of their models
     // before they signal it, and the model below must not load beside
     // them: a trainer that starts while the conditioner still holds its
     // encoder runs its whole course with that much less room. A beat
     // past what the manifest promised is a disagreement, not a spare.
-    for (const unsigned p : {kCondPort, kLatentPort}) {
+    for (const unsigned p : {kCondPort, kLatentPort, kAudioPort,
+                             kRefVideoPort, kRefAudioPort}) {
+      if (p == kAudioPort && !_audio_wired) { continue; }
+      if ((p == kRefVideoPort || p == kRefAudioPort) && !_refs_wired) {
+        continue;
+      }
       while (ctx.iport_connected(p) && !ctx.eos(p)) {
         auto extra = co_await ctx.read(p);
         if (extra) {
           fail(fmt("more {} arrived than the training-dataset's manifest "
-                   "lists", p == kCondPort ? "conditionings" : "latents")());
+                   "lists", p == kCondPort    ? "conditionings"
+                            : p == kLatentPort ? "latents"
+                            : p == kAudioPort  ? "soundtracks"
+                                               : "reference rows")());
           co_return;
         }
       }
@@ -1566,6 +2111,10 @@ TrainLoraStage::process(RuntimeContext& ctx)
             u.holders, u.parked ? ", parked" : ""));
       }
     }
+    // The load streams a DiT of many GB in: the train report opens
+    // here, indeterminate, rather than leave the encode's at its end.
+    _bar = session()->open_progress("lora train");
+    _bar.update(0, 0, "loading the model");
     if (!load_model_(&err)) { fail(err); co_return; }
     {
       // What the GPU's working set holds before the model and after it:
@@ -1586,14 +2135,83 @@ TrainLoraStage::process(RuntimeContext& ctx)
         const auto* chw = static_cast<const float*>(p.x0.contents());
         std::string perr;
         metal_compute::SharedBuffer packed =
-            _trainer->pack_latent(chw, C, p.h, p.w, &perr);
+            _trainer->pack_latent(chw, C, p.t, p.h, p.w, &perr);
         if (packed.empty()) { fail(perr); co_return; }
         p.x0 = std::move(packed);
+      }
+    }
+    // Every keyframe's still, into one buffer of rows a window, first
+    // then last -- the conditioning rows of its layout.
+    for (Sample& s : _samples) {
+      for (Picture& p : s.pics) {
+        if (p.kx.empty()) { continue; }
+        std::vector<metal_compute::SharedBuffer> rows;
+        std::size_t total = 0;
+        for (const metal_compute::SharedBuffer& k : p.kx) {
+          std::string perr;
+          metal_compute::SharedBuffer r = _trainer->pack_latent(
+              static_cast<const float*>(k.contents()), C, 1, p.h, p.w,
+              &perr);
+          if (r.empty()) { fail("a keyframe: " + perr); co_return; }
+          total += r.byte_size();
+          rows.push_back(std::move(r));
+        }
+        p.cx0 = mc->make_shared_buffer(total);
+        std::size_t off = 0;
+        for (const metal_compute::SharedBuffer& r : rows) {
+          std::memcpy(static_cast<std::uint8_t*>(p.cx0.contents()) + off,
+                      r.contents(), r.byte_size());
+          off += r.byte_size();
+        }
+        p.kx.clear();
+      }
+    }
+    // And every soundtrack, at the latents the family lays out for its
+    // clip: a window's audio latent can come one short of the count the
+    // layout rounds to (the codec's hop), which is held from its last.
+    {
+      int dropped = 0;
+      for (Sample& s : _samples) {
+        for (Picture& p : s.pics) {
+          if (!p.audio || p.ax0.empty()) { continue; }
+          const int want = _trainer->audio_latents(p.t);
+          if (want <= 0) {
+            p.audio = false;
+            p.ax0 = {};
+            ++dropped;
+            continue;
+          }
+          if (p.an < want - 1) {
+            fail(fmt("a soundtrack latent of {} frames is too short for "
+                     "its {}-latent-frame clip ({} wanted)", p.an, p.t,
+                     want)());
+            co_return;
+          }
+          const auto* src = static_cast<const float*>(p.ax0.contents());
+          std::vector<float> fit((std::size_t)2 * p.ac * want);
+          for (int r = 0; r < 2 * p.ac; ++r) {
+            for (int i = 0; i < want; ++i) {
+              fit[(std::size_t)r * want + i] =
+                  src[(std::size_t)r * p.an + std::min(i, p.an - 1)];
+            }
+          }
+          std::string perr;
+          metal_compute::SharedBuffer packed = _trainer->pack_audio(
+              fit.data(), 2, p.ac, want, want, &perr);
+          if (packed.empty()) { fail(perr); co_return; }
+          p.ax0 = std::move(packed);
+        }
+      }
+      if (dropped > 0) {
+        session()->info(fmt("TrainLoraStage('{}'): {} trains without "
+                            "soundtracks; {} were dropped", this->id(),
+                            _family, dropped));
       }
     }
     if (!start_training_(&err)) { fail(err); co_return; }
     _trainer->set_stop([&ctx]() { return ctx.stop_requested(); });
     _phase = Phase::kTrain;
+    _bar.update(_step, (std::uint64_t)_total_steps);
     co_return;
   }
 
@@ -1629,6 +2247,13 @@ TrainLoraStage::process(RuntimeContext& ctx)
       // A sweep: another optimizer beat trains another adapter on the
       // same cache.
       _trainer.reset();
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->revise_declaration(_dit_dir, 0);
+        for (const std::string& x : _extra_dirs) {
+          mgr->revise_declaration(x, 0);
+        }
+      }
+      _bar.finish();
       _phase = Phase::kDone;
       ctx.signal_done();
       co_return;
@@ -1636,6 +2261,9 @@ TrainLoraStage::process(RuntimeContext& ctx)
     const auto t0 = std::chrono::steady_clock::now();
     const int E = (int)_epoch_slots.size();
     double loss = 0.0, fwd = 0.0, bwd = 0.0;
+    // An audio-video family's two means, unweighted.
+    double loss_v = 0.0, loss_a = 0.0;
+    int parts = 0, aparts = 0;
     for (int b = 0; b < _batch; ++b) {
       const std::uint64_t g = (std::uint64_t)_step * _batch + b;
       const int epoch = (int)(g / (std::uint64_t)E);
@@ -1649,8 +2277,11 @@ TrainLoraStage::process(RuntimeContext& ctx)
       const Sample& s = _samples[(std::size_t)_epoch_slots[order[pos]]];
       const std::uint64_t k = mix_(_run_seed ^ mix_(g * 7 + 3));
       const Picture& p = s.pics[(std::size_t)(k % s.pics.size())];
-      int ti = s.texts[(std::size_t)((k >> 16) % s.texts.size())];
-      if (unit_(k ^ 0xabcdefull) < _caption_dropout && _null_text >= 0) {
+      // A keyframe window's captions are its own (presented with them).
+      const std::vector<int>& tl = p.texts.empty() ? s.texts : p.texts;
+      int ti = tl[(std::size_t)((k >> 16) % tl.size())];
+      if (unit_(k ^ 0xabcdefull) < _dropout && _null_text >= 0 &&
+          _texts[(std::size_t)_null_text].rows > 0) {
         ti = _null_text;
       }
       Text tscratch;
@@ -1689,7 +2320,35 @@ TrainLoraStage::process(RuntimeContext& ctx)
       ts.sideband = &t.sideband;
       ts.grid_h = p.h;
       ts.grid_w = p.w;
+      ts.frames = p.t;
       ts.sigma = (float)sigma;
+      // What the family draws itself (a missing soundtrack's noise).
+      ts.seed = mix_(_run_seed ^ mix_(g * 13 + 7));
+      if (p.anchors != 0) {
+        ts.anchors = p.anchors;
+        ts.cond_x0 = &p.cx0;
+      } else if (t.nrv + t.nra > 0) {
+        // The caption's references: its conditioning rows (in RAM on its
+        // entry, never a scratch).
+        const Text& tr = _texts[(std::size_t)ti];
+        ts.cond_x0 = &tr.rv;
+        ts.cond_audio = &tr.ra;
+      }
+      // The window's soundtrack and its noise, from (seed, sample number).
+      metal_compute::SharedBuffer anoise;
+      if (!p.ax0.empty()) {
+        const std::size_t an = p.ax0.byte_size() / 2;
+        anoise = mc->make_shared_buffer(an * 2);
+        std::mt19937_64 rng(mix_(_run_seed ^ mix_(g * 17 + 9)));
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        auto* d = static_cast<std::uint16_t*>(anoise.contents());
+        for (std::size_t i = 0; i < an; ++i) {
+          d[i] = genai::train::f32_to_bf16(nd(rng));
+        }
+        ts.audio_x0 = &p.ax0;
+        ts.audio_noise = &anoise;
+        ts.audio_weight = (float)_audio_weight;
+      }
       genai::train::StepStats st;
       std::string err;
       if (!_trainer->step(ts, &st, &err)) {
@@ -1700,6 +2359,7 @@ TrainLoraStage::process(RuntimeContext& ctx)
           session()->info(fmt("TrainLoraStage('{}'): stopped at step {}; "
                               "the run resumes from here", this->id(),
                               _step));
+          _bar.finish();
           _phase = Phase::kDone;
           ctx.signal_done();
           co_return;
@@ -1710,6 +2370,8 @@ TrainLoraStage::process(RuntimeContext& ctx)
       loss += st.loss;
       fwd += st.forward_ms;
       bwd += st.backward_ms;
+      if (st.loss_video >= 0.0) { loss_v += st.loss_video; ++parts; }
+      if (st.loss_audio >= 0.0) { loss_a += st.loss_audio; ++aparts; }
     }
     double gnorm = 0.0, lr = 0.0;
     std::string err;
@@ -1731,7 +2393,21 @@ TrainLoraStage::process(RuntimeContext& ctx)
       o.insert_or_assign("lr", FlexData::make_real(lr));
       o.insert_or_assign("grad_norm", FlexData::make_real(gnorm));
       o.insert_or_assign("sec", FlexData::make_real(sec));
+      o.insert_or_assign("total", FlexData::make_int(_total_steps));
+      if (parts > 0) {
+        o.insert_or_assign("loss_video", FlexData::make_real(loss_v / parts));
+      }
+      // Over the samples that carried a soundtrack.
+      if (aparts > 0) {
+        o.insert_or_assign("loss_audio",
+                           FlexData::make_real(loss_a / aparts));
+      }
       co_await ctx.write(2, make_payload<FlexDataPayload>(std::move(m)));
+    }
+    {
+      _bar.update((std::uint64_t)_step, (std::uint64_t)_total_steps,
+                  fmt("loss {:.4f} (mean {:.4f})", loss,
+                      _loss_sum / std::max(_loss_n, 1))());
     }
     if (_step == 1 || _step % 10 == 0 || _step == _total_steps) {
       session()->info(fmt(

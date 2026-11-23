@@ -1,5 +1,7 @@
 #include "stages/minimax-h3-image-host.h"
 #include "stages/video-ref-encoder-stage.h"
+
+#include "common/beat-keys.h"
 #include "generative-models/gen-input.h"
 #include "generative-models/generative-model-manager.h"
 
@@ -157,6 +159,14 @@ const ConfigKey kAttrs[] = {
           "`whole_references` keeps), and the layout the DiT builds is "
           "sized from the same number",
    .def_int = 121},
+  {.key = "references_from_prompt", .type = ConfigType::Bool,
+   .required = false,
+   .doc = "the prompt beats name their own references ({text, references: "
+          "[files], frames}: training-dataset's Ref2VA samples, a caption a "
+          "request). Books a clip's presentation in the plan, as a wired "
+          "reference port does; a beat's `references` and `frames` hold "
+          "for that beat whether or not this is set",
+   .def_bool = false},
   {.key = "reference_image_short_edge", .type = ConfigType::Int,
    .required = false,
    .doc = "what an image reference's short edge is scaled to (2048 for the "
@@ -285,7 +295,11 @@ const ConfigKey kAttrs[] = {
 const PortSpec kIports[] = {
   {.name = "prompt",
    .doc = "prompt text (FlexData string or {text: ...}), used VERBATIM -- no "
-          "chat template and no special tokens",
+          "chat template and no special tokens. An object may also name its "
+          "own request: `references` (files, over the config's) and `frames` "
+          "(training-dataset's Ref2VA captions); `batch` keeps the encoders "
+          "loaded to the stream's end, `allow_empty` an empty prompt as no "
+          "rows",
    .type = &typeid(FlexDataPayload), .tags = "text", .clock_group = 0},
   {.name = "model",
    .doc = "OPTIONAL shared model reference from a model-select source; "
@@ -482,6 +496,10 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
     // form, which is why `_references_said` is kept.
   }
   _frames           = attr_int("frames");
+  _cfg_frames       = _frames;
+  _cfg_references   = _references;
+  _cfg_references_said = _references_said;
+  _beat_refs_cfg    = attr_bool("references_from_prompt");
   _ref_short_edge   = attr_int("reference_image_short_edge");
   // Whether the graph SAID it, as opposed to taking the schema default.
   // An absent key is "no opinion", and here the two published recipes
@@ -607,6 +625,51 @@ VideoRefEncoderStage::apply_constant(unsigned iport, const FlexData& beat)
   apply_model_select_beat(beat, _hf_dir);
 }
 
+VideoRefEncoderStage::BeatRequest
+VideoRefEncoderStage::read_beat_request(const FlexData& prompt)
+{
+  BeatRequest r;
+  if (!prompt.is_object()) { return r; }
+  FlexData p = prompt;
+  auto o = p.as_object();
+  auto flag = [&](std::string_view k) {
+    return o.contains(k) && o.at(k).as_bool(false);
+  };
+  r.batch = flag(beat::kBatch);
+  r.allow_empty = flag(beat::kAllowEmpty);
+  if (o.contains(beat::kReferences)) {
+    const FlexData v = o.at(beat::kReferences);
+    r.has_references = true;
+    if (v.is_string()) {
+      if (!std::string(v.as_string("")).empty()) {
+        r.references.push_back(std::string(v.as_string("")));
+      }
+    } else if (v.is_array()) {
+      auto a = v.as_array();
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        const FlexData e = a.at(i);
+        if (!e.is_string() || std::string(e.as_string("")).empty()) {
+          r.error = "references[" + std::to_string(i) + "] is not a path";
+          return r;
+        }
+        r.references.push_back(std::string(e.as_string("")));
+      }
+    } else if (!v.is_null()) {
+      r.error = "references is neither a path nor a list of them";
+      return r;
+    }
+  }
+  if (o.contains(beat::kFrames)) {
+    const std::int64_t f = o.at(beat::kFrames).as_int(0);
+    if (f <= 0) {
+      r.error = "frames is not a positive count";
+      return r;
+    }
+    r.frames = (int)f;
+  }
+  return r;
+}
+
 #ifndef VPIPE_BUILD_APPLE_SILICON
 
 Job VideoRefEncoderStage::initialize(RuntimeContext&) { co_return; }
@@ -627,6 +690,11 @@ VideoRefEncoderStage::reset_run_state()
   // beat is never latched and the stage keeps the previous run's model.
   _model_latched   = false;
   _unload_resolved = false;
+  _batch           = false;
+  _refenc_booked   = 0;
+  _references      = _cfg_references;
+  _references_said = _cfg_references_said;
+  _frames          = _cfg_frames;
   // A run's beats pair among themselves, never with the last run's.
   static_assert(kNumRefPorts == (unsigned)kRefInputs);
   _prompt_in.reset();
@@ -755,58 +823,29 @@ VideoRefEncoderStage::declare_resources() const
     }
   }
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  // THE VISION TOWER'S WORK over one reference CLIP: the clip at this
-  // stage's canvas cap (`reference_video_max_pixels`; 1344 x 768 the
-  // release's) for the generated duration, sampled at `video_sample_fps`
-  // and sized by the tower's video rule -- encode_video_scratch_bytes.
-  // Open-H3-Regenerate-2K-IC's draft is exactly that, and it is always
-  // presented. One reference at a time, so one is booked; wherever a
-  // clip can arrive (a reference port wired, or a `references` list).
-  // A picture's presentation, at the 2048 short edge, is not.
-  bool can_clip = !_references.empty();
-  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
-    can_clip = can_clip ||
-               (iport_edges().size() > p && iport_edges()[p].v != nullptr);
-  }
-  if (can_clip && !genai::ph3::is_root(root)) {
-    genai::MiniMaxH3TextEncoder::Config ec;
-    std::vector<int> idx;
-    std::vector<float> secs;
-    if (genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr) &&
-        h3::condition_frame_indices(h3::align_num_frames(_frames, 17, 5),
-                                    h3::kFps, _video_sample_fps,
-                                    ec.vision.temporal_patch, &idx, &secs)) {
-      const double s =
-          std::sqrt((double)std::max<std::int64_t>(_vid_max_pixels, 1) /
-                    (1344.0 * 768.0));
-      const std::size_t vb =
-          genai::MetalQwenVisionEncoder::encode_video_scratch_bytes(
-              ec.vision, (int)idx.size(), (int)std::lround(768.0 * s),
-              (int)std::lround(1344.0 * s));
-      for (auto& c : model_memory::scratch_claims(
-               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
-        out.push_back(std::move(c));
-      }
-    }
-  }
   // P-H3-Image's connector beside the encoder (f32, held whole), phased
-  // and released with it -- and the tower's work: it reads its own copy
-  // of each picture at about the manifest's vision_pixels (at most 1.2x:
-  // size_at_area keeps a gridded picture within 20%), one at a time.
+  // and released with it.
   if (const std::string cd = genai::ph3::connector_dir(root); !cd.empty()) {
     for (auto& c : model_memory::weight_claims({cd})) {
       out.push_back(std::move(c));
     }
-    genai::ph3::Manifest man;
-    genai::MiniMaxH3TextEncoder::Config ec;
-    if (genai::ph3::read_manifest(root, &man, nullptr) &&
-        genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr)) {
-      const std::size_t vb = genai::MetalQwenVisionEncoder::
-          encode_scratch_bytes(ec.vision, man.vision_pixels * 6 / 5);
-      for (auto& c : model_memory::scratch_claims(
-               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
-        out.push_back(std::move(c));
-      }
+  }
+  // THE REFERENCE ENCODE'S WORK -- the vision tower's read of a
+  // reference, the video VAE's encode of it, the presentation's prefill
+  // through the encoder -- one arena at the widest of them (they run one
+  // at a time) plus what every reference leaves held
+  // (h3::reference_encode_bytes). The request is not known here, so the
+  // launch books the largest one config admits: a clip at the canvas cap
+  // over the generated frames, or a picture at the reference image cap
+  // (P-H3-Image's and MiniMax-H3-Image's at their largest), wherever a
+  // reference can arrive; the prompt alone otherwise. process() states
+  // each request's own figure, off its real pictures and clips, before
+  // it encodes.
+  const std::size_t rb = launch_reference_bytes_(root, enc, vvae);
+  if (rb > 0) {
+    for (auto& c : model_memory::scratch_claims(
+             reference_encode_label_(), rb, model_memory::kPhaseCondition)) {
+      out.push_back(std::move(c));
     }
   }
   return out;
@@ -908,6 +947,105 @@ VideoRefEncoderStage::claimed_dirs_() const
     }
   }
   return d;
+}
+
+std::string
+VideoRefEncoderStage::reference_encode_label_() const
+{
+  return "reference-encode:" + this->id();
+}
+
+std::size_t
+VideoRefEncoderStage::launch_reference_bytes_(const std::string& root,
+                                              const std::string& enc,
+                                              const std::string& vvae) const
+{
+  genai::MiniMaxH3TextEncoder::Config ec;
+  if (enc.empty() ||
+      !genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr)) {
+    return 0;
+  }
+  // The pool and the weights the stage loads it with (load_models_).
+  if (_max_prompt_tokens > 0) { ec.lm.max_seq = _max_prompt_tokens; }
+  if (!genai::h3i::is_root(root)) { ec.weights = weights_path_(_enc_weights); }
+  genai::MetalMiniMaxH3VideoVae::Config vc;
+  const std::string vdir = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(
+      root);
+  const bool have_vae = genai::MetalMiniMaxH3VideoVae::config_from_json(
+      vdir.empty() ? (vvae.empty() ? root : vvae) : vdir, vc, nullptr);
+  auto* mc = session()->services()->metal_compute();
+  h3::ReferenceShapes sh;
+  sh.video_vae = have_vae ? &vc : nullptr;
+  sh.vision = &ec.vision;
+  sh.text = &ec;
+  sh.matrix_cores = mc != nullptr && mc->supports_matrix_cores();
+  sh.text_dense = genai::MiniMaxH3TextEncoder::dense_checkpoint(ec, enc);
+
+  h3::ReferencePlan plan;
+  plan.target_frames = h3::align_num_frames(_frames, 17, 5);
+  plan.reference_image_short_edge =
+      ref_image_short_edge(_ref_short_edge, _ref_short_edge_set, _partition);
+  plan.canvas_short_edge = _vid_short_edge;
+  plan.canvas_max_pixels = (std::int64_t)_vid_max_pixels;
+  plan.reference_image_max_pixels = (std::int64_t)_img_max_pixels;
+  plan.video_sample_fps = _video_sample_fps;
+  const bool h3i = genai::h3i::is_root(root);
+  genai::ph3::Manifest man;
+  const bool ph3 = genai::ph3::is_root(root) &&
+                   genai::ph3::read_manifest(root, &man, nullptr);
+  if (h3i) {
+    plan.edge_min = genai::h3i::kReferenceMinShortEdge;
+    plan.edge_max = genai::h3i::kReferenceMaxShortEdge;
+    plan.vision_edge = genai::h3i::kVisionShortEdge;
+    plan.canvas_multiple = genai::h3i::kCanvasMultiple;
+    plan.posterior_seed = 0;
+  } else if (ph3) {
+    plan.area_min_pixels = man.reference_min_pixels;
+    plan.area_max_pixels = man.reference_max_pixels;
+    plan.first_min_pixels = man.canvas_min_pixels;
+    plan.vision_pixels = man.vision_pixels;
+    plan.canvas_multiple = genai::ph3::kCanvasMultiple;
+    plan.posterior_seed = (std::int64_t)genai::ph3::kConditionEncodeSeed;
+  }
+  // The prompt arrives on a port: the text rows generate-video plans.
+  const int text = 512;
+
+  bool can_ref = !_cfg_references.empty() || _beat_refs_cfg;
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    can_ref = can_ref ||
+              (iport_edges().size() > p && iport_edges()[p].v != nullptr);
+  }
+  std::size_t most =
+      h3::reference_encode_bytes({}, plan, sh, -1, text);
+  if (!can_ref) { return most; }
+  // A picture at the largest the plan's rule keeps: a square at the
+  // reference short edge (under the pixel cap); MiniMax-H3-Image's at
+  // its largest short edge; P-H3-Image's at its largest area.
+  h3::MediaReference pic;
+  pic.kind = h3::MediaReference::Kind::kImage;
+  pic.num_frames = 1;
+  int side = std::max(1, plan.reference_image_short_edge);
+  if (h3i) { side = plan.edge_max; }
+  if (ph3) {
+    side = (int)std::sqrt((double)std::max<std::int64_t>(
+        man.reference_max_pixels, 1));
+  }
+  pic.height = pic.width = side;
+  most = std::max(most, h3::reference_encode_bytes({pic}, plan, sh, -1,
+                                                   text));
+  if (h3i || ph3) { return most; }
+  // A clip at the canvas cap (1344 x 768 the release's) for the
+  // generated duration.
+  const double sc = std::sqrt(
+      (double)std::max<std::int64_t>(_vid_max_pixels, 1) / (1344.0 * 768.0));
+  h3::MediaReference clip;
+  clip.kind = h3::MediaReference::Kind::kVideo;
+  clip.num_frames = plan.target_frames;
+  clip.height = (int)std::lround(768.0 * sc);
+  clip.width = (int)std::lround(1344.0 * sc);
+  clip.fps = h3::kFps;
+  return std::max(most, h3::reference_encode_bytes({clip}, plan, sh, -1,
+                                                   text));
 }
 
 std::string
@@ -1790,6 +1928,10 @@ VideoRefEncoderStage::unload_models_()
   _video_vae.reset();
   _audio_vae.reset();
   _unloaded = true;
+  _refenc_booked = 0;
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(reference_encode_label_(), 0);
+  }
   // The phase claims' other half (decide_resources): the release they
   // promised, which the manager audits at the end of the launch. A dir
   // left unphased is not audited, so naming it costs nothing.
@@ -1847,6 +1989,9 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     auto pb = co_await ctx.read(0);
     const Took took = _prompt_in.took(pb != nullptr);
     if (round.note(took) || took == Took::kNone) {
+      // A batch's end: its encoders are let go now, before the stage
+      // that trains on them loads beside them.
+      if (_batch && !_unloaded) { unload_models_(); }
       ctx.signal_done();
       co_return;
     }
@@ -1875,6 +2020,19 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     co_return;
   }
   const std::string prompt = prompt_of_(pfd->data);
+  // The beat's own request, over the config's.
+  const BeatRequest br = read_beat_request(pfd->data);
+  if (!br.error.empty()) {
+    session()->warn(fmt("VideoRefEncoderStage('{}'): the prompt beat's {}; "
+                        "skipping", this->id(), br.error));
+    co_return;
+  }
+  _batch = _batch || br.batch;
+  _references = br.has_references ? br.references : _cfg_references;
+  // A batch's caption without `references` is a prompt-only request,
+  // said: the dataset sends one for each caption it has.
+  _references_said = br.has_references || br.batch || _cfg_references_said;
+  _frames = br.frames > 0 ? br.frames : _cfg_frames;
 
   resolve_unload_policy_();
   if (_unloaded && !reload_models_()) {
@@ -2122,6 +2280,32 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     co_return;
   }
 
+  // THE EMPTY PROMPT of a batch (`allow_empty`: training-dataset's, for
+  // caption dropout) with nothing to present is no rows at all -- what
+  // diffusion-conditioner emits for it -- a prompt-only request.
+  if (prompt.empty() && prompt_only && br.allow_empty) {
+    for (unsigned port : {1u, 2u}) {
+      auto t = std::make_unique<TensorBeatPayload>();
+      t->dtype = TensorBeat::DType::F32;
+      t->shape = {0, 1};
+      co_await ctx.write(port, std::move(t));
+    }
+    auto t = std::make_unique<TensorBeatPayload>();
+    t->dtype = TensorBeat::DType::Bf16;
+    t->shape = {0, _enc->config().text_dim};
+    FlexData sb = FlexData::make_object();
+    auto o = sb.as_object();
+    o.insert_or_assign("partition", FlexData::make_string("ref2va"));
+    o.insert_or_assign(genai::cond_sideband::kTokenTags,
+                       FlexData::make_array());
+    o.insert_or_assign(genai::cond_sideband::kReferences,
+                       FlexData::make_array());
+    t->sideband = std::move(sb);
+    co_await ctx.write(0, std::move(t));
+    ++_emitted;
+    co_return;
+  }
+
   // Those kept WHOLE, by their number in this request; every other one
   // is truncated to the generated duration.
   for (int n : _whole_refs) {
@@ -2177,7 +2361,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   if (_enc->streams_resident_set()) {
     _enc->set_residency_reserve(model_memory::residency_reserve_beside(
         session(), model_memory::kPhaseCondition));
-    _enc->set_residency_schedule(_unload_idle ? 1 : 4);
+    _enc->set_residency_schedule(_unload_idle && !_batch ? 1 : 4);
   }
 
   // The audio encode's arena at THIS request's longest soundtrack (a
@@ -2245,7 +2429,9 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // generate-video's `seed` -- and the rows left clean: generate-video
   // noises them with the same generator after the picture's noise.
   if (_h3i) {
-    if (refs.empty()) {
+    // A training batch's caption without pictures (its previews) is the
+    // model's text-to-image conditioning: the prompt, presented alone.
+    if (refs.empty() && !_batch) {
       session()->warn(fmt(
           "VideoRefEncoderStage('{}'): a MiniMax-H3-Image edit needs a "
           "picture to edit; text-to-image goes through "
@@ -2262,7 +2448,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   }
   std::string ph3_prompt;
   if (_ph3) {
-    if (refs.empty()) {
+    if (refs.empty() && !_batch) {
       session()->warn(fmt(
           "VideoRefEncoderStage('{}'): a P-H3-Image edit needs a picture "
           "to edit; text-to-image goes through diffusion-conditioner. "
@@ -2278,13 +2464,24 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     if (!this->config().as_object().contains("condition_noise_aug")) {
       plan.condition_noise_aug = genai::ph3::kConditionNoiseAug;
     }
-    ph3_prompt = genai::ph3::edit_prompt(prompt);
+    ph3_prompt = refs.empty() ? prompt : genai::ph3::edit_prompt(prompt);
+  }
+  const std::string_view said_prompt =
+      _ph3 ? std::string_view(ph3_prompt) : std::string_view(prompt);
+  // The reference encode's arena at THIS request -- its pictures' and
+  // clips' own canvases, the tower's grids, the presentation's length --
+  // before any of it is allocated. The most a request has needed, since
+  // the encoder's K/V pool keeps what it grew to while it is loaded.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    _refenc_booked = std::max(
+        _refenc_booked,
+        h3::reference_encode_bytes(refs, said_prompt, plan, models));
+    mgr->revise_scratch(reference_encode_label_(), _refenc_booked);
   }
   h3::EncodedReferences enc;
   std::string eerr;
-  const bool encoded = h3::encode_references(
-      refs, _ph3 ? std::string_view(ph3_prompt) : std::string_view(prompt),
-      plan, models, &enc, &eerr);
+  const bool encoded = h3::encode_references(refs, said_prompt, plan,
+                                             models, &enc, &eerr);
   // Before the warn, so a failure does not leave a part-filled bar
   // sitting under the message that explains it.
   bar.finish();
@@ -2413,7 +2610,7 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // carries, so it says what ran rather than what was asked for.
   report_fits_(enc);
   ++_emitted;
-  if (_unload_idle) { unload_models_(); }
+  if (_unload_idle && !_batch) { unload_models_(); }
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

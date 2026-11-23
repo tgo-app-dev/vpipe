@@ -36,6 +36,8 @@
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "stages/model-quantize-stage.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
@@ -44,6 +46,7 @@
 #include "generative-models/shared/stream-sizing.h"
 #include "stages/model-memory.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -53,6 +56,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1589,4 +1593,194 @@ TEST(minimax_h3_text_enc, nvfp4_awq_repack_streams_as_it_holds)
               model_memory::dir_weights_bytes(nv) >> 20, file >> 20,
               (int)same(g1, want), (int)same(g2, want), (int)same(g3, want),
               (int)same(g4, want));
+}
+
+// What a reference request ALLOCATES against what it books
+// (h3::reference_encode_bytes): the tower's read of each reference, the
+// video VAE's encode of it and the presentation's prefill through the
+// encoder, one at a time, beside what every reference leaves held. The
+// device's peak allocation is sampled through encode_references for
+// pictures and clips under each image model's rules; the booking may
+// carry host bytes the device does not see, so it must cover the peak,
+// and the presentation's length it counts (the encoder's own builder on
+// the tower's grids) must be the encode's. Env:
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH (the encoder, run at 2 layers, with
+// its tower) and VPIPE_MINIMAX_H3_TEST_MODEL_PATH (a root with the video
+// VAE).
+TEST(minimax_h3_text_enc, a_request_allocates_what_it_books)
+{
+  namespace h3 = minimax_h3;
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  const char* h3root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0' || h3root == nullptr ||
+      *h3root == '\0') {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEXT_ENC_PATH / "
+                "VPIPE_MINIMAX_H3_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &err));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  cfg.lm.max_seq = 16384;
+  auto enc = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  auto tower = MiniMaxH3TextEncoder::load_vision(root, mc, cfg, &err);
+  MetalMiniMaxH3VideoVae::Config vc;
+  const std::string vdir = MetalMiniMaxH3VideoVae::resolve_vae_dir(h3root);
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(vdir, vc, &err));
+  auto vae = MetalMiniMaxH3VideoVae::load(vdir, mc, vc);
+  ASSERT_TRUE(enc != nullptr && tower != nullptr && vae != nullptr);
+  if (enc == nullptr || tower == nullptr || vae == nullptr) { return; }
+  // The route the plan reads off the checkpoint is the one it loaded.
+  const bool dense_ckpt = MiniMaxH3TextEncoder::dense_checkpoint(cfg, root);
+  std::printf("  the encoder's stack: %s as loaded, %s off the checkpoint\n",
+              enc->dense_weights() ? "dense" : "packed",
+              dense_ckpt ? "dense" : "packed");
+  EXPECT_TRUE(dense_ckpt == enc->dense_weights());
+
+  auto media = [](h3::MediaReference::Kind kind, int frames, int H, int W,
+                  int seed) {
+    h3::MediaReference m;
+    m.kind = kind;
+    m.num_frames = frames;
+    m.height = H;
+    m.width = W;
+    m.fps = h3::kFps;
+    m.rgb.resize((std::size_t)frames * 3 * H * W);
+    for (std::size_t i = 0; i < m.rgb.size(); ++i) {
+      m.rgb[i] = (std::uint8_t)(((i + seed) * 2654435761u) >> 24);
+    }
+    return m;
+  };
+  using K = h3::MediaReference::Kind;
+  h3::ReferenceEncoders models;
+  models.mc = mc;
+  models.vision = tower.get();
+  models.video_vae = vae.get();
+  models.text = enc.get();
+
+  struct Case {
+    const char* name;
+    std::vector<h3::MediaReference> refs;
+    int image_model;   // 0 Ref2VA, 1 MiniMax-H3-Image, 2 P-H3-Image
+  };
+  std::vector<Case> cases;
+  cases.push_back({"prompt only", {}, 0});
+  cases.push_back({"a picture 1024x768", {media(K::kImage, 1, 768, 1024, 1)},
+                   0});
+  {
+    // At its own 2048 short edge: 5,472 tokens, past the band line where
+    // a matrix-core prefill takes the band tuner's probe weight.
+    h3::MediaReference big = media(K::kImage, 1, 768, 1024, 8);
+    big.short_edge = 2048;
+    cases.push_back({"a picture past the band", {big}, 0});
+  }
+  cases.push_back({"a clip 22 x 640x352",
+                   {media(K::kVideo, 22, 352, 640, 2)}, 0});
+  cases.push_back({"a picture and a clip",
+                   {media(K::kImage, 1, 600, 800, 3),
+                    media(K::kVideo, 39, 352, 640, 4)}, 0});
+  cases.push_back({"MiniMax-H3-Image: 1536x1024",
+                   {media(K::kImage, 1, 1024, 1536, 5)}, 1});
+  cases.push_back({"P-H3-Image: two pictures",
+                   {media(K::kImage, 1, 1024, 1024, 6),
+                    media(K::kImage, 1, 512, 768, 7)}, 2});
+  // The video VAE's encoder half loads at its first encode -- weights,
+  // which its own claim books, not this arena -- so one small request
+  // runs first, unmeasured.
+  {
+    h3::ReferencePlan plan;
+    plan.target_frames = 39;
+    plan.patch_h = 2;
+    plan.patch_w = 2;
+    h3::EncodedReferences warm;
+    std::string e;
+    ASSERT_TRUE(h3::encode_references({media(K::kImage, 1, 256, 256, 9)},
+                                      kPrompt, plan, models, &warm, &e));
+  }
+  bool all_cover = true, all_counted = true, all_released = true;
+  for (Case& c : cases) {
+    h3::ReferencePlan plan;
+    plan.target_frames = 39;
+    plan.patch_h = 2;
+    plan.patch_w = 2;
+    // A Ref2VA picture on a 768 short edge (its rule; the release's 2048
+    // is minutes of a 2-layer run for the same check).
+    plan.reference_image_short_edge = 768;
+    if (c.image_model == 1) {
+      plan.edge_min = h3i::kReferenceMinShortEdge;
+      plan.edge_max = h3i::kReferenceMaxShortEdge;
+      plan.vision_edge = h3i::kVisionShortEdge;
+      plan.canvas_multiple = h3i::kCanvasMultiple;
+      plan.posterior_seed = 7;
+      plan.posterior_one_stream = true;
+    } else if (c.image_model == 2) {
+      plan.area_min_pixels = 512 * 512;
+      plan.area_max_pixels = 1024 * 1024;
+      plan.first_min_pixels = 768 * 768;
+      plan.vision_pixels = 1024 * 1024;
+      plan.canvas_multiple = 16;
+      plan.posterior_seed = 42;
+    }
+    const std::size_t booked =
+        h3::reference_encode_bytes(c.refs, kPrompt, plan, models);
+    (void)mc->memory_budget_settled();
+    const std::size_t before = mc->memory_budget().allocated;
+    std::atomic<std::size_t> peak{before};
+    std::atomic<bool> done{false};
+    std::thread sampler([&] {
+      while (!done.load()) {
+        peak = std::max(peak.load(), mc->memory_budget().allocated);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+    });
+    h3::EncodedReferences out;
+    std::string e;
+    const bool ok =
+        h3::encode_references(c.refs, kPrompt, plan, models, &out, &e);
+    done = true;
+    sampler.join();
+    ASSERT_TRUE(ok);
+    if (!ok) { std::printf("  %s: %s\n", c.name, e.c_str()); continue; }
+    const std::size_t grew = peak.load() - before;
+    // The count the booking took is the encode's own: the figure at the
+    // encode's length, through the shapes, is the same figure.
+    h3::ReferenceShapes sh;
+    sh.video_vae = &vae->config();
+    sh.vision = &tower->config();
+    sh.text = &enc->config();
+    sh.matrix_cores = mc->supports_matrix_cores();
+    sh.text_dense = enc->dense_weights();
+    const std::size_t at_n =
+        h3::reference_encode_bytes(c.refs, plan, sh, out.n_tokens);
+    std::printf("  %-30s %5d tokens: peak growth %7.1f MB, booked %7.1f "
+                "MB (%.2fx)%s\n", c.name, out.n_tokens, grew / 1048576.0,
+                booked / 1048576.0,
+                grew > 0 ? (double)booked / (double)grew : 0.0,
+                at_n == booked ? "" : "  [COUNT DIFFERS]");
+    all_cover = all_cover && grew <= booked;
+    all_counted = all_counted && at_n == booked;
+    // The VAE's activations were given back before the presentation: a
+    // request's growth is measured from the one before it, so a set kept
+    // across requests would sit in `before` unseen -- and in the real
+    // run beside the next presentation's prefill.
+    (void)mc->memory_budget_settled();
+    const std::size_t held = mc->memory_budget().allocated;
+    vae->release_encode_scratch();
+    (void)mc->memory_budget_settled();
+    const std::size_t after = mc->memory_budget().allocated;
+    const std::size_t kept = held > after ? held - after : 0;
+    if (kept > 0) {
+      std::printf("  %-30s the VAE kept %.1f MB of activations\n", c.name,
+                  kept / 1048576.0);
+    }
+    all_released = all_released && kept == 0;
+  }
+  EXPECT_TRUE(all_cover);
+  EXPECT_TRUE(all_counted);
+  EXPECT_TRUE(all_released);
 }

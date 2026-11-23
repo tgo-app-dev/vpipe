@@ -70,6 +70,12 @@ arrives in **8–16 steps** instead of 30+.
     - [Where vpipe differs from the release](#where-vpipe-differs-from-the-release)
     - [What six steps cost](#what-six-steps-cost)
     - [Checked without the release](#checked-without-the-release)
+  - [Two or four steps, no VAE decoder — pi-H3](#two-or-four-steps-no-vae-decoder--pi-h3)
+    - [Get the base and the adapters](#get-the-base-and-the-adapters)
+    - [What the adapter changes](#what-the-adapter-changes)
+    - [DWD: frames straight from the transformer](#dwd-frames-straight-from-the-transformer)
+    - [What two and four steps cost](#what-two-and-four-steps-cost)
+  - [Steering with dials — ComfyUI-Dials' files](#steering-with-dials--comfyui-dials-files)
   - [Three steps, streamed — TaoMate-H3](#three-steps-streamed--taomate-h3)
   - [A draft at 2K — Open-H3-Regenerate-2K](#a-draft-at-2k--open-h3-regenerate-2k)
     - [Get it, then run it](#get-it-then-run-it)
@@ -223,6 +229,14 @@ you want to see the model work before spending the hours and the 115 GB.
   an opening frame, or references through them, each on the schedule its
   adapter's manifest names (see
   [Six steps, any reference](#six-steps-any-reference--pika-h3-flex)).
+- **[`prepare-pi-h3.vpipeline`](pipelines/prepare-pi-h3.vpipeline)**
+  / **[`pi-h3-text-to-video.vpipeline`](pipelines/pi-h3-text-to-video.vpipeline)**,
+  **[`…-first-frame-to-video`](pipelines/pi-h3-first-frame-to-video.vpipeline)**,
+  **[`…-first-last-to-video`](pipelines/pi-h3-first-last-to-video.vpipeline)**
+  — fetch Comfy-Org's pruned FL2VA DiT and pi-H3's **2- and 4-step**
+  adapters, and run text, an opening frame, or both ends through the 4-step
+  one, whose pixel head decodes the frames itself (see
+  [Two or four steps, no VAE decoder](#two-or-four-steps-no-vae-decoder--pi-h3)).
 - **[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)**
   / **[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline)**
   — fetch TaoLiveAIGC's **3-step** adapter and run its **streaming** method:
@@ -2933,6 +2947,238 @@ There is nothing to run the release against on a Mac (its package needs an
   gives the base output to the bit. The six-step loop runs re-noised and
   reproduces itself from a seed; another seed or Euler moves it. The plan
   books what the load holds, to the byte.
+
+### Two or four steps, no VAE decoder — pi-H3
+
+[pi-H3](https://huggingface.co/Lakonik/pi-H3) distills the FL2VA transformer
+into **2 or 4 sampling steps** (pi-Flow v2) for text, first-frame and
+last-frame video with its soundtrack. Its **DWD** adapters ("Decoding Without
+a Decoder", the ones the release recommends) also predict the frames
+directly at the last step, so the clip skips the VAE decoder too.
+
+| record | steps | video out |
+|---|---|---|
+| `Lakonik/pi-H3-4step-dwd` | 4 | the adapter's pixel head (recommended) |
+| `Lakonik/pi-H3-2step-dwd` | 2 | the adapter's pixel head |
+| `Lakonik/pi-H3-4step` | 4 | the video VAE |
+| `Lakonik/pi-H3-2step` | 2 | the video VAE |
+
+The adapters are trained on H3's **pruned** form (see
+[Pruned files](#pruned-files)), so they run on a pruned DiT —
+Comfy-Org's `minimax_h3_fl2va_pruned_int8_convrot.safetensors` (21 GB),
+the one ComfyUI-piFlow runs, or its bf16 twin (40 GB) — named in
+`generate-video`'s `dit_dir`, with the text encoder and the VAEs from the
+FL2VA model as usual. On the released DiT they are refused, by name.
+
+#### Get the base and the adapters
+
+[`prepare-pi-h3.vpipeline`](pipelines/prepare-pi-h3.vpipeline) fetches the
+pruned int8 DiT (`Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot`) and all
+four adapters (3.8 GB each with DWD, 0.5 GB without):
+
+```sh
+vpipe --launch docs/pipelines/prepare-pi-h3.vpipeline
+```
+
+The text encoder and the VAEs come from `MiniMaxAI/MiniMax-H3-FL2VA`
+([Step 1](#step-1--prepare-the-model)). Not fetched: the adapters' int8
+ConvRot copies, which are for ComfyUI.
+
+Three graphs, 1344 × 768 and 124 frames, the 4-step DWD adapter:
+
+- [`pi-h3-text-to-video.vpipeline`](pipelines/pi-h3-text-to-video.vpipeline)
+  — a prompt.
+- [`pi-h3-first-frame-to-video.vpipeline`](pipelines/pi-h3-first-frame-to-video.vpipeline)
+  — a prompt and an opening frame; drop a `reference.jpg` beside it.
+- [`pi-h3-first-last-to-video.vpipeline`](pipelines/pi-h3-first-last-to-video.vpipeline)
+  — a prompt, `first.jpg` and `last.jpg`.
+
+```json
+"lora": "Lakonik/pi-H3-4step-dwd",
+"lora_scale": 1.0
+```
+
+and on `generate-video`:
+
+```json
+"dit_dir": "Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot"
+```
+
+**You do not set a step count, a grid or a decoder.** The adapter's header
+names its policy (pi-Flow's DX policy on a grid: one evaluation a step, which
+is an Euler step), its folder names its step count, and vpipe runs the
+release's grid at the model's shifts (12 for video, 3 for audio):
+
+| steps | video sigmas | audio sigmas |
+|---|---|---|
+| 4 | 0.99654, 0.96445, 0.89930, 0.69565, 0 | 0.98630, 0.87151, 0.69065, 0.36364, 0 |
+| 2 | 0.99377, 0.86534, 0 | 0.97552, 0.61635, 0 |
+
+The log says so:
+
+```
+MetalMiniMaxH3Transformer: '.../pi_h3_4step_dwd_adapter/...' states a
+sampling contract (pi-H3 4-step): 4 steps on its own grid, Euler, shifts 12/3
+```
+
+A file renamed so its path no longer says `2step` or `4step` is refused;
+name its grid with the model config's `sigmas` then (the video's sigmas
+above, the audio follows).
+
+#### What the adapter changes
+
+Beside a rank-64 LoRA on the out projection and the feed-forward, an adapter
+**overwrites** weights whole: every block's pruned AdaLN, the output norm,
+its AdaLN and both heads — and with DWD, blocks 46–49's out and feed-forward
+projections outright. The release loads those over the base and then fuses
+the LoRA at the adapter's strength, so vpipe applies them **whole whenever
+the adapter's strength is not 0**, and the LoRA at the strength. Keep
+`lora_scale` at **1.0**; at 0 the model and its sampler are the base again.
+The overwrites are held beside the DiT (2.2 GB for DWD's four blocks in
+bf16, ~175 MB of AdaLN differences) and booked with the adapter.
+
+#### DWD: frames straight from the transformer
+
+At the last step the DiT hands its last block's hidden states — LayerNormed
+and modulated by the adapter's own output AdaLN — to `vae-decode` in place of
+a latent, and `vae-decode` runs the adapter's **pixel head**: the last 8
+layers of the Sol-H3 decoder (the fast decoder's blocks, windows and global
+tokens), fed by a projection of each DiT token into 2 × 2 decoder tokens, and
+a separate one-frame projection for every native block's first latent. The
+video VAE is not loaded at all; the head is 1.1 GB. The launch's memory plan
+knows it too: a DWD graph books the head, its working set and the features
+in the decode phase and no VAE decoder — 3.1 GB there for a 832 × 480 × 73
+clip, where the same graph decoded by the VAE books 5.8 GB.
+
+```
+VaeDecodeStage('vae-decode'): DWD pixel head from '.../pi_h3_4step_dwd_adapter/
+diffusion_pytorch_model.safetensors' in 0.5 s -- 8 layers over 5376-wide
+features, 1123 MB held
+```
+
+The graph is the same shape either way (`generate-video` → `vae-decode`);
+the beat says which.
+
+#### What two and four steps cost
+
+Measured on an M4 Pro (64 GB), the int8 pruned DiT streamed from the internal
+SSD, the README's fox prompt at 640 × 352 × 73, whole graph: the 4-step
+adapter **195 s** (about 70 s a step), the 4-step DWD adapter **163 s** —
+the same shot, 25.6 dB apart. On an M5, `i8_gemm` with `i8_gemm_tier: token`
+runs the pruned file's int8 ConvRot codes as stored.
+
+### Steering with dials — ComfyUI-Dials' files
+
+A **dial** is a training-free steering direction: one vector, the width of
+the DiT's hidden size, made from prompt pairs (the mean refined prompt of
+each pair's B side less its A side). It is added to **every prompt row**,
+so it changes *how much* of a quality any prompt gets — more motion, colder
+light, dread — without being a word in the prompt. Its strength is a signed
+slider: negative moves the clip toward the pair's A side, positive toward
+its B side. H3 is guidance-distilled, so a negative prompt does nothing;
+dials give that kind of control back, in both directions.
+
+The files are ComfyUI-Dials' and ComfyUI-MAINodes', and both work on every
+H3 graph here — FL2VA, Ref2VA, Pika H3 Flex, HyperFlow, P-H3-Image and
+MiniMax-H3-Image. MATLOWAI/H3-Dials publishes a set (motion, eight
+"villainy" flavours, dramatic light, storm, ink wash, impact frame, ...),
+with suggested strengths in its README. A dial file holds ONE tensor, and
+which one says where it goes:
+
+| file's tensor | where it is added |
+|---|---|
+| `diffusion_model.token_refiner.dials_shift` | after the token refiner, where the DiT reads the prompt — most dials |
+| `diffusion_model.condition_proj.diff_b` | into `condition_proj`'s bias, before the refiner (ComfyUI's stock LoRA loader applies it too); about 0.6× the effect a unit |
+
+Put them on `minimax-h3-model-config`'s `dials`, an array of rows in the
+Dial Rack's own JSON — a rack's `rack` string from a ComfyUI workflow pastes
+as it is:
+
+```json
+"dial_dir": "/path/to/MATLOWAI/H3-Dials",
+"dials": [
+  {"dial": "dials/h3_motion.safetensors", "strength": 0.5},
+  {"dial": "dials/h3_impact_frame.safetensors", "strength": 4.5,
+   "time": {"type": "keys",
+            "points": [[0, 0], [0.4, 0], [0.45, 1], [0.55, 1], [0.6, 0]],
+            "steps": 6, "audio": "protect"}}
+]
+```
+
+`dial_dir` is the folder relative names are read from — ComfyUI's
+`models/loras`, whose `dials/` subfolder the H3-Dials repository's root
+holds too. A `dial` can also be an absolute path or a registered model.
+`on: false` turns a row off, `solo: true` runs the soloed rows alone, and a
+row at strength 0 does nothing, as in the rack. Several constant rows are
+summed into one shift, in double, so their order does not matter.
+
+**A row without `time` is constant**: on every forward of every step. It
+costs nothing measurable — a few thousand additions on the prompt rows.
+
+**A row with a time curve follows it over the clip.** H3 is one sequence:
+every video and audio token reads the same prompt, so a prompt-side dial
+cannot vary over time on its own. For the first `steps` sampling steps
+(k, default 2), the DiT runs a second time on the same latent with the dial,
+and the two predictions are blended per latent frame:
+
+    v = v0 + M(t) · (v_dial − v0)
+
+M for a video latent frame is the curve's mean over the pixel frames it
+covers (1, 4, 4, 4, 4 a group of five); for an audio latent, the curve at
+its start (40 a second). After step k the row is off. The curve:
+
+| key | meaning |
+|---|---|
+| `points` | `[time, value]` keys, times strictly increasing; held flat before the first and after the last |
+| `unit` | `normalized` (default: 0 the first frame, 1 the clip's end) or `seconds` |
+| `interp` | `linear` (default) or `step` (each key's value held until the next) |
+| `smooth` | 0..1, linear keys only: the slope ramps across each key instead of jumping, still through every key and without overshoot |
+| `steps` | k, the blend steps (default 2) |
+| `audio` | `follow` (default: the soundtrack takes the same curve) or `protect` (it takes the undialled prediction) |
+
+Each **distinct** curve is one more forward a step for its k steps — rows
+sharing a curve share one branch. A curve at 0 everywhere costs nothing, and
+one curve alone at 1 everywhere runs in place of the undialled forward.
+MATLOWAI's notes for Pika H3 Flex: on its six steps with reference pictures
+the look is written in steps 3 to 6, so look dials want `"steps": 6`;
+`audio: protect` keeps most look dials' soundtracks within a few LU of the
+undialled one (storm and aura still change it).
+
+What the rack also does and this does not, each refused by name: hold
+rows, step envelopes, per-block strengths, wired dials (`input`), curves
+driven by a feature of the music (`"type": "audio"`), the de-rope hold map.
+A time curve needs a clip: MiniMax-H3-Image and P-H3-Image make one frame,
+so they take constant rows only, and TaoMate-H3's streaming (its own
+chunked steps) takes constant rows only too. A dial made for another family
+(MOSS-Image's, Krea 2's) is refused, and so is a dial file put in a `lora`
+slot — it is not an adapter. A DiT split across Macs (`tensor_parallel`)
+runs each rank's own loop, so every rank's graph must carry the same rows:
+a curve adds forwards, and the ranks exchange at every one.
+
+What it measured, on an M4 Pro 64 GB: the released FL2VA DiT (streamed off
+an external drive) with Pika H3 Flex's adapter, 384 × 256 × 22 frames, six
+steps, seed 42, the shipped Pika text-to-video graph with a punch prompt.
+The log names each row and the curve's weight per latent frame:
+
+    h3_motion_hook (post) +0.5: constant
+    h3_impact_frame (post) +4.5: linear curve over 5 keys, blend steps 0-5, audio protect
+    curve 'h3_impact_frame': blended on steps 0-5, video M by latent frame [0 x3, 0.8, 0.05, 0 x2], audio protected
+
+| run | forwards | denoise | whole graph |
+|---|---|---|---|
+| no dials | 6 | 33 s | 52 s |
+| motion +0.5, impact frame 4.5 on a pulse (k = 6) | 6 + 6 | 65 s | 83 s |
+| the impact frame's pulse alone | 6 + 6 | 65 s | 83 s |
+
+The pulse lands where the curve puts it: frames 10–12 go from a mean
+brightness of about 88 to 153–170 (the white ink starburst over the punch)
+and the shot is back by frame 14. Frames at M 0 take the undialled
+prediction, but only for the latent of that step: from the next step on
+every frame attends to the pulse's frames, so on a clip this short (0.9 s,
+the pulse a fifth of it) the rest of the clip came out as a different take
+of the same shot — about 11 dB from the undialled one — rather than the
+same frames. The constant motion dial changes every frame, as constant
+rows do.
 
 ### Three steps, streamed — TaoMate-H3
 

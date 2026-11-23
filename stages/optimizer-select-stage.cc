@@ -25,8 +25,12 @@ constexpr SpecExtra kSchedChoices[] = {
 const ConfigKey kAttrs[] = {
   {.key = "optimizer",
    .type = ConfigType::String,
-   .doc = "adamw (default), prodigy (estimates its own step size -- set "
-          "learning_rate 1.0; forgiving on a small dataset), lion, or sgd",
+   .doc = "adamw (default), adamw8bit (AdamW with its moments held as "
+          "8-bit block-quantized codes: a quarter of the state), adafactor "
+          "(transformers' Adafactor at a manual learning rate: a factored "
+          "second moment, almost no state; beta1 unused), prodigy "
+          "(estimates its own step size -- set learning_rate 1.0; forgiving "
+          "on a small dataset), lion, or sgd",
    .def_str = "adamw",
    .extra = kOptChoices},
   {.key = "learning_rate",
@@ -85,6 +89,11 @@ const ConfigKey kAttrs[] = {
   {.key = "bias_correction",
    .type = ConfigType::Bool,
    .doc = "prodigy: Adam's bias correction (default off, as prodigyopt)"},
+  {.key = "loraplus_lr_ratio",
+   .type = ConfigType::Real,
+   .doc = "LoRA+: the B factors learn this many times faster than the A "
+          "factors (1, default: off; LoRA+'s paper suggests 16)",
+   .def_real = 1.0},
 };
 
 const PortSpec kOports[] = {
@@ -129,6 +138,7 @@ OptimizerSelectStage::OptimizerSelectStage(const SessionContextIntf* s,
   o.ema = attr_real("ema");
   o.prodigy_d_coef = attr_real("prodigy_d_coef");
   o.bias_correction = attr_bool("bias_correction");
+  o.lora_plus_ratio = attr_real("loraplus_lr_ratio");
   // Validated by the one parser train-lora reads it with, so the two
   // cannot disagree about what is legal.
   std::string err;

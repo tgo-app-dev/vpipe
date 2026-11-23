@@ -547,11 +547,13 @@ MetalMusic3Ar::run_bytes(const Config& c, int prefix, int frames,
       c.context, (std::int64_t)std::max(prefix, 1) + std::max(frames, 0) + 1);
   const MetalQwenModel::Config q = qwen_config_(c);
   // Both contexts' K/V; each prompt prefilled on its own.
+  // Not w8 in memory, the release's bf16 LM loads dense.
   std::size_t b = MetalQwenModel::run_bytes(
       q, 2 * per, 2, /*one_pass=*/false,
       /*plain_mlp=*/c.lm_quant_bits != 8, matrix_cores,
       /*prompt_rows=*/std::min<std::int64_t>(std::max(prefix, 1),
-                                             music3::kMaxPromptTokens));
+                                             music3::kMaxPromptTokens),
+      /*dense=*/c.lm_quant_bits != 8);
   // The batched step's scratch at two rows (ensure_bscratch_: the logits
   // row and the page table are the bulk of it).
   b += 2 * ((std::size_t)c.vocab + 8 * (std::size_t)c.ffn +

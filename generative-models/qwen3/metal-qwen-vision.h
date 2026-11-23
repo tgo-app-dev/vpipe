@@ -158,6 +158,22 @@ public:
   // grid, by the video rule, and every frame's pixels on the host.
   static std::size_t encode_video_scratch_bytes(const Config& c,
                                                 int n_frames, int H, int W);
+  // The same for encode() of ONE H x W picture: its own grid, by the
+  // image rule under `max_pixels` as encode() takes it.
+  static std::size_t encode_image_scratch_bytes(const Config& c, int H,
+                                                int W,
+                                                std::int64_t max_pixels = 0);
+  // The grid encode() / encode_video() resize a picture or a clip of H x
+  // W onto, and the tokens it yields -- Result's grid_t / grid_h /
+  // grid_w / n_tokens, before anything runs. One rule with the encode.
+  struct Grid {
+    int t = 1, h = 0, w = 0, tokens = 0;
+  };
+  static Grid grid_for(const Config& c, int n_frames, int H, int W,
+                       bool video, std::int64_t max_pixels = 0);
+  // A Result's bytes for `tokens` tokens: its embeddings and every
+  // deepstack feature, all of them held as long as the Result is.
+  static std::size_t result_bytes(const Config& c, int tokens);
 
   // Encode a CLIP: `rgb` is `n_frames` consecutive [3, H, W] U8 planes.
   //

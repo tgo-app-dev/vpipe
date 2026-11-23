@@ -108,10 +108,18 @@ QwenImage21LoraTrainer::latent_channels() const noexcept
 }
 
 SharedBuffer
-QwenImage21LoraTrainer::pack_latent(const float* chw, int c, int h, int w,
-                                    std::string* err)
+QwenImage21LoraTrainer::pack_latent(const float* chw, int c, int t, int h,
+                                    int w, std::string* err)
 {
   const int IC = _m->config().in_channels;
+  if (t != 1) {
+    if (err != nullptr) {
+      *err = "qwen-image-2.1 trainer: a picture's latent has one frame, "
+             "not " + std::to_string(t) + " -- the latents are not from "
+             "this model's VAE";
+    }
+    return {};
+  }
   if (c != IC || (h % 2) != 0 || (w % 2) != 0) {
     if (err != nullptr) {
       *err = "qwen-image-2.1 trainer: a latent must be [" +
@@ -367,9 +375,11 @@ QwenImage21LoraTrainer::set_options(const FlexData& o)
 }
 
 std::size_t
-QwenImage21LoraTrainer::arena_bytes(int grid_h, int grid_w, int text_rows,
-                                    int rank, bool keep_all) const
+QwenImage21LoraTrainer::arena_bytes(int frames, int grid_h, int grid_w,
+                                    int text_rows, int rank,
+                                    bool keep_all) const
 {
+  (void)frames;
   return QwenImage21Trainer::arena_bytes(_m->config(),
                                          text_rows + grid_h * grid_w, rank,
                                          keep_all);

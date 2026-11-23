@@ -7,6 +7,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "stages/model-config-source.h"
+#include "generative-models/minimax-h3/minimax-h3-dials.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 
 #include <string>
@@ -230,6 +231,38 @@ const ConfigKey kAttrs[] = {
   lora_slots::qkv_layout_key(6), lora_slots::scale_key(6),
   lora_slots::path_key(7, "minimax-h3-lora"),
   lora_slots::qkv_layout_key(7), lora_slots::scale_key(7),
+  {.key = "dials", .type = ConfigType::Any, .required = false,
+   .doc = "DIALS: training-free steering directions (ComfyUI-Dials / "
+          "ComfyUI-MAINodes; MATLOWAI/H3-Dials publishes a set). A dial "
+          "is ONE vector added to every prompt row -- after the token "
+          "refiner (`token_refiner.dials_shift` files) or into "
+          "condition_proj's bias (`condition_proj.diff_b`) -- and its "
+          "strength is a signed slider: negative toward the dial's A "
+          "side, positive toward its B side. An array of rows, the Dial "
+          "Rack's JSON (its `rack` string pastes as it is): "
+          "{\"dial\": file, \"strength\": s, \"on\": true, \"solo\": "
+          "false, \"time\": {...}}. A row without `time` applies on every "
+          "step. A row with a TIME CURVE follows it over the clip: "
+          "{\"type\": \"keys\", \"points\": [[t, m], ...], \"unit\": "
+          "\"normalized\" | \"seconds\", \"interp\": \"linear\" | "
+          "\"step\", \"smooth\": 0..1, \"steps\": k (2), \"audio\": "
+          "\"follow\" | \"protect\"} -- for the first k steps the DiT "
+          "runs again with the dial and the two predictions are blended "
+          "per latent frame by the curve's value there; `protect` keeps "
+          "the soundtrack the undialled one. Each distinct curve costs "
+          "one more forward a step for its k steps. Curves are for the "
+          "video models (not MiniMax-H3-Image or P-H3-Image, which make "
+          "one frame) and the post seam. A file is a path, a name under "
+          "`dial_dir`, or a registered model. Per clip: a new beat's "
+          "rows apply from the next clip",
+   .def_str = ""},
+  {.key = "dial_dir", .type = ConfigType::String, .required = false,
+   .doc = "where `dials` rows' relative names are read from -- the "
+          "folder a rack's names are relative to (ComfyUI's models/loras: "
+          "the H3-Dials repository's root holds the same `dials/` "
+          "folder). A directory or a registered model. Empty (default): "
+          "names are paths or registry keys",
+   .def_str = "", .is_path = true, .path_kind = "dir"},
   // The live-preview keys every family's config source shares; see
   // stages/latent-preview.h. For H3 the TAE is madebyollin's `taeh3`
   // (temporal, 4x in time) or Kijai's 2D one (a frame per latent frame).
@@ -260,8 +293,9 @@ const PortSpec kOports[] = {
           "{model_family: minimax-h3, video_shift, audio_shift, "
           "condition_timestep, condition_audio_timestep, audio_seconds, "
           "refine_start_sigma, refine_shift, +sigmas (an array of reals), "
-          "+lora .. +lora8 and their scales, +taomate, +preview_vae and "
-          "its three knobs}, for a generate-video model_config iport",
+          "+lora .. +lora8 and their scales, +dials (the rows) and "
+          "+dial_dir, +taomate, +preview_vae and its three knobs}, for a "
+          "generate-video model_config iport",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
 };
@@ -317,6 +351,17 @@ MiniMaxH3ModelConfigStage::MiniMaxH3ModelConfigStage(
     sl.path  = attr_str(lora_slots::kPath[i]);
     sl.scale = attr_real(lora_slots::kScale[i]);
     sl.qkv   = attr_str(lora_slots::kQkvLayout[i]);
+  }
+  _dial_dir = attr_str("dial_dir");
+  // `this->`: the constructor's own `config` was moved into the base.
+  if (this->config().is_object() &&
+      this->config().as_object().contains("dials")) {
+    const FlexData v = this->config().as_object().at("dials");
+    std::string why;
+    if (!genai::minimax_h3::parse_dial_rows(v, &_dials, &why)) {
+      fail_config(fmt("MiniMaxH3ModelConfigStage('{}'): {}", this->id(),
+                      why));
+    }
   }
   _taomate       = attr_str("taomate");
   if (_taomate.empty()) { _taomate = "auto"; }
@@ -453,6 +498,15 @@ MiniMaxH3ModelConfigStage::resolved_config() const
                          FlexData::make_string(sl.qkv));
     }
   }
+  // Emitted only when SET, as the LoRA keys are. Every row goes, off
+  // and soloed ones included: which apply is the consumer's rule.
+  if (!_dials.empty()) {
+    o.insert_or_assign("dials",
+                       genai::minimax_h3::dial_rows_to_flex(_dials));
+  }
+  if (!_dial_dir.empty()) {
+    o.insert_or_assign("dial_dir", FlexData::make_string(_dial_dir));
+  }
   // Emitted only off its default, which the consumer applies anyway.
   if (_taomate != "auto") {
     o.insert_or_assign("taomate", FlexData::make_string(_taomate));
@@ -492,7 +546,9 @@ MiniMaxH3ModelConfigStage::report_config(const FlexData& fd) const
       _cond_timestep, _cond_audio_timestep,
       _audio_seconds > 0.0 ? fmt("{:.3f} s", _audio_seconds)()
                            : std::string("as long as the video"),
-      adapters,
+      adapters + (_dials.empty()
+                      ? std::string()
+                      : fmt(", {} dial row(s)", _dials.size())()),
       _preview.enabled()
           ? fmt(", previews every {} step(s)", _preview.every)()
           : std::string()));

@@ -1,0 +1,66 @@
+{
+  "id": "prepare-pi-h3",
+  "stages": [
+    {
+      "id": "fetch-base",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Comfy-Org/MiniMax-H3",
+        "model_variant": "Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-pi-h3-4step-dwd",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Lakonik/pi-H3",
+        "model_variant": "Lakonik/pi-H3-4step-dwd",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-pi-h3-2step-dwd",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Lakonik/pi-H3",
+        "model_variant": "Lakonik/pi-H3-2step-dwd",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-pi-h3-4step",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Lakonik/pi-H3",
+        "model_variant": "Lakonik/pi-H3-4step",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    },
+    {
+      "id": "fetch-pi-h3-2step",
+      "type": "model-fetch",
+      "config": {
+        "model_path": "Lakonik/pi-H3",
+        "model_variant": "Lakonik/pi-H3-2step",
+        "hf_token": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

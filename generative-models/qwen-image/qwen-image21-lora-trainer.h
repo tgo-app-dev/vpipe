@@ -37,8 +37,9 @@ class QwenImage21LoraTrainer final : public train::LoraTrainer {
   std::vector<train::ModuleShape>
   modules(const std::string& targets) const override;
   int bind(train::LoraParams* params, std::string* err) override;
-  metal_compute::SharedBuffer pack_latent(const float* chw, int c, int h,
-                                          int w, std::string* err) override;
+  metal_compute::SharedBuffer pack_latent(const float* chw, int c, int t,
+                                          int h, int w,
+                                          std::string* err) override;
   int latent_channels() const noexcept override;
   bool step(const train::TrainSample& s, train::StepStats* out,
             std::string* err) override;
@@ -49,8 +50,8 @@ class QwenImage21LoraTrainer final : public train::LoraTrainer {
                std::string* err) override;
   void set_stop(std::function<bool()> stop) override;
   void set_options(const FlexData& o) override;
-  std::size_t arena_bytes(int grid_h, int grid_w, int text_rows, int rank,
-                          bool keep_all) const override;
+  std::size_t arena_bytes(int frames, int grid_h, int grid_w, int text_rows,
+                          int rank, bool keep_all) const override;
   std::uint64_t resident_bytes() const override;
 
   MetalQwenImage21Transformer* model() const noexcept { return _m.get(); }

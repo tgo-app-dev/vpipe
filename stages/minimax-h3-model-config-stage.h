@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 #define VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 
+#include "generative-models/minimax-h3/minimax-h3-dials.h"
 #include "stages/latent-preview.h"
 #include "stages/lora-slots.h"
 #include "stages/model-config-source.h"
@@ -58,6 +59,9 @@ namespace vpipe {
 //                              pairing is a few-step Turbo distillation
 //                              and style or identity adapters, with
 //                              independent, live strengths
+//   dials (+ dial_dir) -- steering DIALS (minimax-h3-dials.h): rows of
+//                              {dial, strength, time}, constant or on a
+//                              time curve over the clip
 //   preview_vae (+ preview_every, preview_max_edge, preview_frames) --
 //                              a tiny autoencoder for LIVE previews on
 //                              generate-video's `preview` oport; see
@@ -106,6 +110,10 @@ private:
     std::string qkv;
   };
   std::array<LoraSlot, lora_slots::kSlots> _lora;
+  // The dial rows (`dials`, minimax-h3-dials.h) and where their relative
+  // names are read from (`dial_dir`).
+  std::vector<genai::minimax_h3::DialRow> _dials;
+  std::string _dial_dir;
   // TaoMate-H3's streaming method: "auto" (run it when an adapter slot
   // holds the TaoMate adapter), "on", "off".
   std::string _taomate;

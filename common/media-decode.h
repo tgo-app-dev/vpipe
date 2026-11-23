@@ -2,6 +2,7 @@
 #define VPIPE_COMMON_MEDIA_DECODE_H
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -96,8 +97,12 @@ struct DecodedVideo {
   // a reference conditioned at the wrong speed, with nothing to raise
   // about it.
   double fps        = 0.0;
-  // `num_frames` consecutive planar [3,H,W] u8 planes.
+  // `num_frames` consecutive planar [3,H,W] u8 planes -- or, from
+  // decode_video_frames, one plane for each frame `keep` asked for, in
+  // order, `kept` the source index of each (num_frames then counts every
+  // frame decoded).
   std::vector<std::uint8_t> rgb;
+  std::vector<int> kept;
 
   // The soundtrack, when the container has one. Planar, like
   // DecodedAudio, and 0 channels when there is none. Decoded WHOLE,
@@ -157,6 +162,16 @@ decode_video_file(const FFmpegLibraries* libs,
                   double                 max_seconds       = 0.0,
                   int                    audio_sample_rate = 0,
                   std::string*           error             = nullptr);
+// decode_video_file, storing only the frames `keep(index, fps)` asks for
+// (index from 0 in decode order, fps the container's): the rest are
+// decoded and dropped, so the frames held are the ones a caller reads,
+// not every frame up to the last of them. A training dataset's windows
+// over a long clip are the case: their frames, not the clip.
+std::optional<DecodedVideo>
+decode_video_frames(const FFmpegLibraries* libs, const std::string& path,
+                    double max_seconds, int audio_sample_rate,
+                    const std::function<bool(int, double)>& keep,
+                    std::string* error = nullptr);
 
 std::optional<DecodedAudio>
 decode_audio_bytes(const FFmpegLibraries*         libs,

@@ -1436,6 +1436,18 @@ the record's `local_path` is the folder itself, so every stage handed the
 model gets the variant it names rather than the repository root. A host
 that predates the key ignores it and registers the root.
 
+**A handle for one of a repo's entries.** A graph or host picks one of a
+repo's several entries with `model_variant`. The string is matched, case
+aside, against each entry's version, variant, name and model_type. An exact
+hit wins; otherwise the string must be a substring of exactly one entry, and
+anything else is refused. When the handle people write equals none of those
+fields, set `catalog_extra::kVariantAliases` in `extra` to a list of
+handles. They are matched exactly, never as substrings. MiniMax-H3's
+partition entries carry `"fl2va"` and `"ref2va"`: without them, the pruned
+FL2VA DiTs published from the same repo, whose version and name contain
+`fl2va`, would make `"fl2va"` match three entries and select none. A host
+that predates the key matches the entry by substring, as before.
+
 **Mirrors.** `hf_path` is a HuggingFace coordinate, and it stays the entry's
 identity — the registry key and the on-disk directory come from it whichever
 server actually served the download. `model-fetch` can pull from a mirror

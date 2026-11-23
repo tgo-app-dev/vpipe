@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -22,6 +23,40 @@ local_subdir_extra_(const char* sub)
   extra.as_object().insert_or_assign(catalog_extra::kLocalSubdir,
                                      FlexData::make_string(sub));
   return extra;
+}
+
+// An `extra` holding `variant_aliases` (see ModelCatalogEntry::extra).
+FlexData
+variant_aliases_extra_(std::initializer_list<const char*> aliases)
+{
+  FlexData list = FlexData::make_array();
+  for (const char* a : aliases) {
+    list.as_array().push_back(FlexData::make_string(a));
+  }
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert_or_assign(catalog_extra::kVariantAliases,
+                                     std::move(list));
+  return extra;
+}
+
+// Whether `w` (lowercased) is one of e's variant_aliases, compared
+// lowercased. Exact only: an alias is a handle, not a description.
+bool
+variant_alias_hit_(const ModelCatalogEntry& e, const std::string& w)
+{
+  if (!e.extra.is_object()) { return false; }
+  FlexData extra = e.extra;  // as_object() is a view: keep its owner
+  auto o = extra.as_object();
+  if (!o.contains(catalog_extra::kVariantAliases)) { return false; }
+  FlexData list = o.at(catalog_extra::kVariantAliases);
+  if (!list.is_array()) { return false; }
+  auto a = list.as_array();
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    std::string v(a.at(i).as_string(""));
+    for (char& c : v) { c = (char)tolower((unsigned char)c); }
+    if (!v.empty() && v == w) { return true; }
+  }
+  return false;
 }
 
 // The models that ship WITH vpipe. `model_catalog()` below returns this
@@ -2465,6 +2500,12 @@ builtin_catalog_()
      .inputs = {"text", "image"}, .outputs = {"video", "audio"},
      .files = kMiniMaxH3FL2VAFiles,
      .needs_tokenizer_json = false,
+     // "fl2va" names this partition EXACTLY (catalog_pick_variant): no
+     // field equals it, and a substring hit stops being unique the moment
+     // the repo publishes anything else carrying the word -- as
+     // Comfy-Org's, with its pruned FL2VA DiTs, does. Same on every
+     // partition record, both publishers.
+     .extra = variant_aliases_extra_({"fl2va"}),
      // NAMED, because the Ref2VA entry below is published from this same
      // repo and lands in this same directory. Without a name both would
      // register under the repo path and the second fetch would overwrite
@@ -2543,6 +2584,7 @@ builtin_catalog_()
            .dest = "tokenizer/tokenizer_config.json"}},
      .weight_format = "comfyui",
      .needs_tokenizer_json = false,
+     .extra = variant_aliases_extra_({"fl2va"}),
      .name = "Comfy-Org/MiniMax-H3-FL2VA"},
     // The Ref2VA partition: the OTHER half of MiniMax-H3.
     //
@@ -2571,6 +2613,7 @@ builtin_catalog_()
      .outputs = {"video", "audio"},
      .files = kMiniMaxH3Ref2VAFiles,
      .needs_tokenizer_json = false,
+     .extra = variant_aliases_extra_({"ref2va"}),
      // The other half of the shared-repo pair -- see the FL2VA entry
      // above for why both are named. One directory, two records.
      .name = "MiniMaxAI/MiniMax-H3-Ref2VA"},
@@ -2602,6 +2645,7 @@ builtin_catalog_()
            .dest = "tokenizer/tokenizer_config.json"}},
      .weight_format = "comfyui",
      .needs_tokenizer_json = false,
+     .extra = variant_aliases_extra_({"ref2va"}),
      .name = "Comfy-Org/MiniMax-H3-Ref2VA"},
     // MiniMax-H3 Turbo: a few-step distillation LoRA for the FL2VA
     // partition. 4 steps instead of ~20 for joint video + synchronized
@@ -3090,6 +3134,84 @@ builtin_catalog_()
                "LICENSE", "NOTICE"},
      .needs_tokenizer_json = false,
      .name = "Pika-Labs/Pika-H3-Flex-ref2va"},
+    // pi-H3 (Lakonik/pi-H3; Hansheng Chen et al.): pi-Flow v2 2- and
+    // 4-step distillations of the FL2VA DiT -- text, first frame, last
+    // frame -- trained on ComfyUI's PRUNED form, so they run on a pruned
+    // DiT (the two records below, named by generate-video's dit_dir) with
+    // the base's encoder and VAEs. Each is a rank-64 LoRA on the out and
+    // feed-forward projections plus WHOLE-TENSOR OVERWRITES (every block's
+    // pruned AdaLN, the output norm and heads; the DWD ones also blocks
+    // 46-49 outright), applied whole while the adapter is live. Its grid
+    // is the release's (pi-Flow's DX policy, one Euler step a step, shifts
+    // 12 / 3), read off its header and its folder's step count. The DWD
+    // adapters ("Decoding Without a Decoder", recommended) also carry a
+    // pixel head: the last step's features decode straight to frames in
+    // vae-decode, no VAE decoder. A record per adapter, each its folder.
+    // NOT fetched: the int8 ConvRot copies (ComfyUI's spelling). MiniMax
+    // H3 Community License.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "33B",
+     .variant = "pruned DiT, int8 ConvRot (Comfy-Org; pi-H3's base)",
+     .hf_path = "Comfy-Org/MiniMax-H3",
+     .model_type = "minimax-h3-dit",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"diffusion_models/minimax_h3_fl2va_pruned_int8_convrot"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+     .name = "Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "33B",
+     .variant = "pruned DiT, bf16 (Comfy-Org)",
+     .hf_path = "Comfy-Org/MiniMax-H3",
+     .model_type = "minimax-h3-dit",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"),
+     .name = "Comfy-Org/MiniMax-H3-FL2VA-pruned-bf16"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "pi-H3 4-step DWD (no VAE decoder; recommended), pruned DiT",
+     .hf_path = "Lakonik/pi-H3",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"pi_h3_4step_dwd_adapter/diffusion_pytorch_model.safetensors",
+               "pi_h3_4step_dwd_adapter/config.json", "LICENSE.md",
+               "NOTICE"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("pi_h3_4step_dwd_adapter"),
+     .name = "Lakonik/pi-H3-4step-dwd"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "pi-H3 2-step DWD (no VAE decoder), pruned DiT",
+     .hf_path = "Lakonik/pi-H3",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"pi_h3_2step_dwd_adapter/diffusion_pytorch_model.safetensors",
+               "pi_h3_2step_dwd_adapter/config.json", "LICENSE.md",
+               "NOTICE"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("pi_h3_2step_dwd_adapter"),
+     .name = "Lakonik/pi-H3-2step-dwd"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "pi-H3 4-step (VAE-decoded), pruned DiT",
+     .hf_path = "Lakonik/pi-H3",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"pi_h3_4step_adapter/diffusion_pytorch_model.safetensors",
+               "pi_h3_4step_adapter/config.json", "LICENSE.md", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("pi_h3_4step_adapter"),
+     .name = "Lakonik/pi-H3-4step"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "pi-H3 2-step (VAE-decoded), pruned DiT",
+     .hf_path = "Lakonik/pi-H3",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"pi_h3_2step_adapter/diffusion_pytorch_model.safetensors",
+               "pi_h3_2step_adapter/config.json", "LICENSE.md", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("pi_h3_2step_adapter"),
+     .name = "Lakonik/pi-H3-2step"},
     // Video Rebirth's HyperFlow: an 8-step FLOW-MAP self-distillation,
     // and not a Turbo adapter in the sense of the entries above. Beside
     // the ordinary per-block factors it carries an ENDPOINT timestep
@@ -3794,6 +3916,7 @@ catalog_pick_variant(const std::vector<const ModelCatalogEntry*>& cands,
       if (f == w) { is_exact = true; }
       else if (f.find(w) != std::string::npos) { is_part = true; }
     }
+    if (!is_exact && variant_alias_hit_(*e, w)) { is_exact = true; }
     if (is_exact)     { exact.push_back(e); }
     else if (is_part) { part.push_back(e); }
   }

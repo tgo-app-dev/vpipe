@@ -248,6 +248,18 @@ class MetalMiniMaxH3VideoVae {
   // tile. 0 for a decoder that reads no still. An image-only decoder's
   // decode_working_bytes is this figure.
   static std::size_t still_decode_bytes(const Config& c, int lh, int lw);
+  // What encode_video() allocates beside the weights for T frames of H x
+  // W (T 1: a still), the moments it returns included: the clip it pads
+  // (T > 1), every tile's moments until they are stitched, a tile's
+  // copy, the stitched clip, and the widest tile's activations -- kept
+  // on the VAE after the encode until release_encode_scratch(). And the
+  // split-K planes a deep level's GEMM keeps on matrix cores. The input
+  // is the caller's.
+  static std::size_t encode_video_bytes(const Config& c, int T, int H,
+                                        int W, bool matrix_cores);
+  // Give back the encoder's activations (they are kept between encodes
+  // of one shape); the next encode allocates them again.
+  void release_encode_scratch() { _es = EncScratch{}; }
 
   // Decode one latent grid. `z` is CHANNEL-FIRST [z_channels, T, h, w]
   // bf16 -- the layout the DiT's unpatchify produces -- and the result is

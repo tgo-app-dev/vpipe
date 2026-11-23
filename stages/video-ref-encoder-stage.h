@@ -70,7 +70,14 @@ struct MediaProbe;
 //
 //   iport0  prompt       FlexDataPayload (string or {text: ...}),
 //                        required. Used VERBATIM -- no chat template,
-//                        no special tokens.
+//                        no special tokens. An object may name its own
+//                        request -- `references` (files, over the
+//                        config's list) and `frames` -- for that beat
+//                        alone: training-dataset's Ref2VA captions, one
+//                        sample's request each. `batch: true` keeps the
+//                        encoders loaded to the stream's end (then lets
+//                        them go); `allow_empty` emits an empty prompt
+//                        with nothing to present as [0, 5120].
 //   iport1  model        OPTIONAL FlexDataPayload model reference (a
 //                        `model-select` source); overrides hf_dir so
 //                        the encoder / DiT / vae stages of a graph
@@ -414,6 +421,32 @@ private:
   // must not be confused -- see process().
   bool          _references_said = false;
   int           _frames = 121;
+  // The config's own, restored at every request: a prompt beat may name
+  // its own request (`references`, `frames` -- training-dataset's Ref2VA
+  // samples), which holds for that beat alone.
+  std::vector<std::string> _cfg_references;
+  bool          _cfg_references_said = false;
+  int           _cfg_frames = 121;
+  // `references_from_prompt`: the plan books a clip's presentation, as a
+  // wired reference port does, because a beat may carry one.
+  bool          _beat_refs_cfg = false;
+  // A BATCH (training-dataset's captions, `batch: true`): the encoders
+  // stay loaded for every beat and are let go at the end of the stream.
+  bool          _batch = false;
+
+ public:
+  // What a prompt beat says of its own request (public for tests).
+  struct BeatRequest {
+    bool has_references = false;       // `references` named, even empty
+    std::vector<std::string> references;
+    int frames = 0;                    // 0: the config's
+    bool batch = false;
+    bool allow_empty = false;
+    std::string error;                 // a malformed field, said
+  };
+  static BeatRequest read_beat_request(const FlexData& prompt);
+
+ private:
   int           _ref_short_edge = 2048;
   // Whether the GRAPH set the short edge, as distinct from inheriting
   // the schema default. The two published recipes disagree -- 2048 is
@@ -540,6 +573,13 @@ private:
   ClaimedDirs claimed_dirs_() const;
   // The audio encode's scratch label (a condition-phase arena).
   std::string audio_encode_label_() const;
+  // The reference encode's arena (tower, video VAE, presentation): its
+  // label, its launch figure, and the most a request has stated.
+  std::string reference_encode_label_() const;
+  std::size_t launch_reference_bytes_(const std::string& root,
+                                      const std::string& enc,
+                                      const std::string& vvae) const;
+  std::size_t _refenc_booked = 0;
 #endif
 };
 

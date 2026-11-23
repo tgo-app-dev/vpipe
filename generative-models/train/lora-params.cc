@@ -183,9 +183,33 @@ LoraParams::create(metal_compute::MetalCompute* mc,
     x.k = m.k;
     x.a_off = _na;
     x.b_off = _nb;
+    if (!m.b_rows.empty()) {
+      if ((int)m.b_rows.size() != m.n) {
+        if (err != nullptr) {
+          *err = "lora params: " + m.name + "'s row map is not n rows";
+        }
+        return false;
+      }
+      const long row0 = (long)(_nb / (std::size_t)rank);
+      x.b_rows.resize((std::size_t)m.n);
+      for (int i = 0; i < m.n; ++i) {
+        x.b_rows[(std::size_t)i] = (int)(row0 + m.b_rows[(std::size_t)i]);
+      }
+    }
     _na += (std::size_t)rank * m.k;
     _nb += (std::size_t)m.n * rank;
     _mods.push_back(std::move(x));
+  }
+  // Every mapped row inside the arena.
+  for (const Module& x : _mods) {
+    for (int r : x.b_rows) {
+      if (r < 0 || (std::size_t)r * (std::size_t)rank >= _nb) {
+        if (err != nullptr) {
+          *err = "lora params: " + x.name + "'s row map leaves the arena";
+        }
+        return false;
+      }
+    }
   }
   auto make = [&](std::size_t elems, std::size_t esz) {
     SharedBuffer b = mc->make_shared_buffer(elems * esz);
@@ -321,7 +345,21 @@ LoraParams::load(const std::string& path, int* loaded, std::string* err)
     for (std::size_t i = 0; i < a.size(); ++i) {
       am[m.a_off + i] = a[i] * rescale;
     }
-    std::memcpy(bm + m.b_off, b.data(), b.size() * 4);
+    if (m.b_rows.empty()) {
+      std::memcpy(bm + m.b_off, b.data(), b.size() * 4);
+    } else {
+      if ((int)m.b_rows.size() != m.n) {
+        if (err != nullptr) {
+          *err = "adapter module " + m.name + ": its row map is not n rows";
+        }
+        return false;
+      }
+      for (int i = 0; i < m.n; ++i) {
+        std::memcpy(bm + (std::size_t)m.b_rows[(std::size_t)i] * _rank,
+                    b.data() + (std::size_t)i * _rank,
+                    (std::size_t)_rank * 4);
+      }
+    }
     ++n;
   }
   if (loaded != nullptr) { *loaded = n; }
@@ -342,6 +380,12 @@ LoraParams::save(const std::string& path,
   std::vector<OutTensor> out;
   out.reserve(_mods.size() * 2);
   for (const Module& m : _mods) {
+    if (!m.b_rows.empty() && (int)m.b_rows.size() != m.n) {
+      if (err != nullptr) {
+        *err = "adapter module " + m.name + ": its row map is not n rows";
+      }
+      return false;
+    }
     OutTensor ta, tb;
     ta.name = "transformer." + m.name + ".lora_A.weight";
     tb.name = "transformer." + m.name + ".lora_B.weight";
@@ -355,8 +399,13 @@ LoraParams::save(const std::string& path,
     for (std::size_t i = 0; i < (std::size_t)_rank * m.k; ++i) {
       da[i] = f32_to_bf16(a[m.a_off + i]);
     }
-    for (std::size_t i = 0; i < (std::size_t)m.n * _rank; ++i) {
-      db[i] = f32_to_bf16(b[m.b_off + i]);
+    for (std::size_t i = 0; i < (std::size_t)m.n; ++i) {
+      const std::size_t src =
+          m.b_rows.empty() ? m.b_off + i * (std::size_t)_rank
+                           : (std::size_t)m.b_rows[i] * (std::size_t)_rank;
+      for (std::size_t c = 0; c < (std::size_t)_rank; ++c) {
+        db[i * (std::size_t)_rank + c] = f32_to_bf16(b[src + c]);
+      }
     }
     out.push_back(std::move(ta));
     out.push_back(std::move(tb));

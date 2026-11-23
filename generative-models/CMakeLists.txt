@@ -183,6 +183,9 @@ set(LOCAL_SOURCES
   minimax-h3/minimax-h3-scheduler.cc
   minimax-h3/minimax-h3-text-encoder.cc
   minimax-h3/minimax-h3-denoise.cc
+  minimax-h3/minimax-h3-trainer.cc
+  minimax-h3/minimax-h3-lora-trainer.cc
+  minimax-h3/minimax-h3-dials.cc
   minimax-h3/minimax-h3-taomate.cc
   minimax-h3/minimax-h3-stream-kv.cc
   lora-fusion.cc
@@ -329,6 +332,8 @@ set(LOCAL_HEADERS
   minimax-h3/minimax-h3-denoise.h
   minimax-h3/minimax-h3-taomate.h
   minimax-h3/minimax-h3-stream-kv.h
+  minimax-h3/minimax-h3-trainer.h
+  minimax-h3/minimax-h3-lora-trainer.h
   train/train-ops.h
   train/lora-params.h
   train/optimizer.h

@@ -17,6 +17,9 @@ using metal_compute::SharedBuffer;
 
 namespace {
 
+// Adafactor's second-moment decay: beta2 at step t is 1 - t^kAfDecay.
+constexpr double kAfDecay = -0.8;
+
 namespace k {
 constexpr const char* kKind = "kind";
 constexpr const char* kKindValue = "optimizer";
@@ -36,6 +39,7 @@ constexpr const char* kDCoef = "prodigy_d_coef";
 constexpr const char* kD0 = "prodigy_d0";
 constexpr const char* kGrowth = "prodigy_growth";
 constexpr const char* kBiasCorr = "bias_correction";
+constexpr const char* kLoraPlus = "loraplus_lr_ratio";
 }  // namespace k
 
 bool
@@ -103,6 +107,7 @@ OptimizerSpec::to_flex() const
   o.insert_or_assign(k::kD0, FlexData::make_real(prodigy_d0));
   o.insert_or_assign(k::kGrowth, FlexData::make_real(prodigy_growth));
   o.insert_or_assign(k::kBiasCorr, FlexData::make_bool(bias_correction));
+  o.insert_or_assign(k::kLoraPlus, FlexData::make_real(lora_plus_ratio));
   return fd;
 }
 
@@ -163,12 +168,13 @@ OptimizerSpec::from_flex(const FlexData& f, OptimizerSpec* out,
   if (o.contains(k::kBiasCorr)) {
     s.bias_correction = o.at(k::kBiasCorr).as_bool(s.bias_correction);
   }
+  real(k::kLoraPlus, &s.lora_plus_ratio);
   if (s.lr < 0.0 || s.beta1 < 0.0 || s.beta1 >= 1.0 || s.beta2 < 0.0 ||
       s.beta2 >= 1.0 || s.eps <= 0.0 || s.weight_decay < 0.0 ||
       s.min_lr_ratio < 0.0 || s.min_lr_ratio > 1.0 || s.restarts < 1 ||
       s.grad_clip < 0.0 || s.ema < 0.0 || s.ema >= 1.0 ||
       s.prodigy_d0 <= 0.0 || s.prodigy_d_coef <= 0.0 ||
-      s.prodigy_growth < 1.0) {
+      s.prodigy_growth < 1.0 || s.lora_plus_ratio <= 0.0) {
     return fail("an optimizer value is out of range");
   }
   *out = s;
@@ -176,10 +182,19 @@ OptimizerSpec::from_flex(const FlexData& f, OptimizerSpec* out,
 }
 
 std::size_t
-Optimizer::state_bytes_per_param(const OptimizerSpec& s) noexcept
+Optimizer::state_bytes_per_param(const OptimizerSpec& s, int rank) noexcept
 {
   std::size_t b = 0;
   if (s.optimizer == "adamw") { b = 8; }
+  // Two code bytes, and the block scales (8 bytes a 256) rounded up.
+  else if (s.optimizer == "adamw8bit") { b = 3; }
+  // A row and a column vector a factor: (rows + cols) * 4 bytes over
+  // rows * cols parameters, one of them the rank -- under 8 / rank bytes
+  // a parameter (the plan rounds it up: 1 from rank 8).
+  else if (s.optimizer == "adafactor") {
+    const int r = std::max(rank, 1);
+    b = (std::size_t)((8 + r - 1) / r);
+  }
   else if (s.optimizer == "prodigy") { b = 16; }   // m, v, s, x0
   else { b = 4; }                                    // lion, sgd: m
   if (s.ema > 0.0) { b += 4; }
@@ -205,8 +220,45 @@ Optimizer::init(const TrainOps* ops, LoraParams* params,
   }
   metal_compute::MetalCompute* mc = ops->mc();
   const std::size_t na = params->a_elems(), nb = params->b_elems();
-  _m_a = zeros_(mc, na * 4);
-  _m_b = zeros_(mc, nb * 4);
+  if (spec.optimizer == "adamw8bit") {
+    // Codes of 0 and zero scales: both moments start at zero.
+    const std::vector<float> codes = TrainOps::adamw8_codes();
+    _codes = zeros_(mc, codes.size() * 4);
+    if (!_codes.empty()) {
+      std::memcpy(_codes.contents(), codes.data(), codes.size() * 4);
+    }
+    // The code of 0 is the same index in either map's table; find it.
+    std::uint8_t zs = 0, zu = 0;
+    for (int i = 0; i < 256; ++i) {
+      if (codes[(std::size_t)i] == 0.0f) { zs = (std::uint8_t)i; }
+      if (codes[(std::size_t)(256 + i)] == 0.0f) { zu = (std::uint8_t)i; }
+    }
+    auto fill = [&](std::size_t n, std::uint8_t v) {
+      SharedBuffer b = zeros_(mc, n);
+      if (!b.empty()) { std::memset(b.contents(), v, b.byte_size()); }
+      return b;
+    };
+    const std::size_t B = TrainOps::kOpt8Block;
+    _qm_a = fill(na, zs);
+    _qm_b = fill(nb, zs);
+    _qv_a = fill(na, zu);
+    _qv_b = fill(nb, zu);
+    _am_a = zeros_(mc, ((na + B - 1) / B) * 2 * 4);
+    _am_b = zeros_(mc, ((nb + B - 1) / B) * 2 * 4);
+    if (_codes.empty() || _qm_a.empty() || _qm_b.empty() || _qv_a.empty() ||
+        _qv_b.empty() || _am_a.empty() || _am_b.empty()) {
+      if (err != nullptr) { *err = "optimizer: state allocation failed"; }
+      return false;
+    }
+  }
+  if (spec.optimizer == "adafactor" && !build_adafactor_(err)) {
+    return false;
+  }
+  // Lion's and SGD's momentum, AdamW's and Prodigy's first moment.
+  if (spec.optimizer != "adamw8bit" && spec.optimizer != "adafactor") {
+    _m_a = zeros_(mc, na * 4);
+    _m_b = zeros_(mc, nb * 4);
+  }
   if (spec.optimizer == "adamw" || spec.optimizer == "prodigy") {
     _v_a = zeros_(mc, na * 4);
     _v_b = zeros_(mc, nb * 4);
@@ -228,7 +280,90 @@ Optimizer::init(const TrainOps* ops, LoraParams* params,
   }
   const int groups = TrainOps::reduce_groups(std::max(na, nb));
   _part = zeros_(mc, (std::size_t)groups * 2 * 4);
-  if (_m_a.empty() || _m_b.empty() || _part.empty()) {
+  if ((spec.optimizer != "adamw8bit" && spec.optimizer != "adafactor" &&
+       (_m_a.empty() || _m_b.empty())) ||
+      _part.empty()) {
+    if (err != nullptr) { *err = "optimizer: state allocation failed"; }
+    return false;
+  }
+  return true;
+}
+
+bool
+Optimizer::build_adafactor_(std::string* err)
+{
+  metal_compute::MetalCompute* mc = _ops->mc();
+  const int rank = _p->rank();
+  // A: each module's [rank, k]. B: its [n, rank] rows -- where a fused
+  // group's rows interleave (b_rows), the group's span as one matrix.
+  std::vector<TrainOps::AfMat> ma, mb;
+  for (const LoraParams::Module& m : _p->modules()) {
+    TrainOps::AfMat a;
+    a.off = (std::uint32_t)m.a_off;
+    a.rows = (std::uint32_t)rank;
+    a.cols = (std::uint32_t)m.k;
+    ma.push_back(a);
+  }
+  std::vector<std::pair<std::size_t, std::size_t>> spans;   // [row0, row1)
+  for (const LoraParams::Module& m : _p->modules()) {
+    std::size_t r0 = m.b_off / (std::size_t)rank, r1 = r0 + (std::size_t)m.n;
+    if (!m.b_rows.empty()) {
+      r0 = (std::size_t)*std::min_element(m.b_rows.begin(), m.b_rows.end());
+      r1 = (std::size_t)*std::max_element(m.b_rows.begin(), m.b_rows.end()) +
+           1;
+    }
+    spans.push_back({r0, r1});
+  }
+  std::sort(spans.begin(), spans.end());
+  std::vector<std::pair<std::size_t, std::size_t>> merged;
+  for (const auto& sp : spans) {
+    if (!merged.empty() && sp.first < merged.back().second) {
+      merged.back().second = std::max(merged.back().second, sp.second);
+    } else {
+      merged.push_back(sp);
+    }
+  }
+  std::size_t covered = 0;
+  for (const auto& sp : merged) {
+    TrainOps::AfMat b;
+    b.off = (std::uint32_t)(sp.first * (std::size_t)rank);
+    b.rows = (std::uint32_t)(sp.second - sp.first);
+    b.cols = (std::uint32_t)rank;
+    covered += sp.second - sp.first;
+    mb.push_back(b);
+  }
+  if (covered * (std::size_t)rank != _p->b_elems()) {
+    if (err != nullptr) {
+      *err = "optimizer: adafactor could not tile the B factors' rows";
+    }
+    return false;
+  }
+  auto build = [&](std::vector<TrainOps::AfMat>& v, AfArena* A) {
+    std::uint32_t cur = 0, rc = 0, cc = 0;
+    for (TrainOps::AfMat& m : v) {
+      m.row_off = cur;
+      cur += m.rows;
+      m.col_off = cur;
+      cur += m.cols;
+      m.rcum = rc;
+      m.ccum = cc;
+      rc += m.rows;
+      cc += m.cols;
+    }
+    A->nmat = (int)v.size();
+    A->rows = (int)rc;
+    A->cols = (int)cc;
+    A->mats = zeros_(mc, v.size() * sizeof(TrainOps::AfMat));
+    A->state = zeros_(mc, (std::size_t)cur * 4);
+    A->usq = zeros_(mc, v.size() * 4);
+    if (A->mats.empty() || A->state.empty() || A->usq.empty()) {
+      return false;
+    }
+    std::memcpy(A->mats.contents(), v.data(),
+                v.size() * sizeof(TrainOps::AfMat));
+    return true;
+  };
+  if (!build(ma, &_af_a) || !build(mb, &_af_b)) {
     if (err != nullptr) { *err = "optimizer: state allocation failed"; }
     return false;
   }
@@ -364,8 +499,48 @@ Optimizer::step(int accum, double* grad_norm, double* lr_used,
                              _p->a_shadow(), o);
           o.n = (int)nb;
           o.mul = 1.0f;
+          // LoRA+: B's step that many times A's.
+          o.dlr = (float)(dlr * _spec.lora_plus_ratio);
           _ops->prodigy_step(enc, _p->b_master(), _p->b_grad(), _m_b, _v_b,
                              _p->b_shadow(), o);
+          if (!_ema_a.empty()) {
+            _ops->ema(enc, _p->a_master(), _ema_a, (float)_spec.ema, na);
+            _ops->ema(enc, _p->b_master(), _ema_b, (float)_spec.ema, nb);
+          }
+        })) {
+      return false;
+    }
+    ++_t;
+    return true;
+  }
+
+  if (opt == "adafactor") {
+    TrainOps::AfParams af;
+    af.grad_scale = (float)scale;
+    af.beta2t = (float)(1.0 - std::pow((double)t1, kAfDecay));
+    af.eps1 = 1e-30f;
+    af.weight_decay = (float)_spec.weight_decay;
+    af.clip = 1.0f;
+    if (!run([&](metal_compute::ComputeEncoder& enc) {
+          for (int arena = 0; arena < 2; ++arena) {
+            const bool isa = arena == 0;
+            const AfArena& A = isa ? _af_a : _af_b;
+            af.lr = (float)(isa ? lr : lr * _spec.lora_plus_ratio);
+            af.mul = isa ? _p->a_mul() : 1.0f;
+            af.nmat = A.nmat;
+            const SharedBuffer& p = isa ? _p->a_master() : _p->b_master();
+            const SharedBuffer& g = isa ? _p->a_grad() : _p->b_grad();
+            af.total = A.rows;
+            _ops->adafactor_stats(enc, g, A.state, A.mats, af, true);
+            af.total = A.cols;
+            _ops->adafactor_stats(enc, g, A.state, A.mats, af, false);
+            _ops->adafactor_update(enc, p, g, A.state, A.mats, A.usq,
+                                   isa ? _p->a_shadow() : _p->b_shadow(), af,
+                                   0);
+            _ops->adafactor_update(enc, p, g, A.state, A.mats, A.usq,
+                                   isa ? _p->a_shadow() : _p->b_shadow(), af,
+                                   1);
+          }
           if (!_ema_a.empty()) {
             _ops->ema(enc, _p->a_master(), _ema_a, (float)_spec.ema, na);
             _ops->ema(enc, _p->b_master(), _ema_b, (float)_spec.ema, nb);
@@ -384,11 +559,16 @@ Optimizer::step(int accum, double* grad_norm, double* lr_used,
           const bool isa = arena == 0;
           o.n = (int)(isa ? na : nb);
           o.mul = isa ? _p->a_mul() : 1.0f;
+          // LoRA+: B learns lora_plus_ratio times as fast as A.
+          o.lr = (float)(isa ? lr : lr * _spec.lora_plus_ratio);
           const SharedBuffer& p = isa ? _p->a_master() : _p->b_master();
           const SharedBuffer& g = isa ? _p->a_grad() : _p->b_grad();
           const SharedBuffer& s = isa ? _p->a_shadow() : _p->b_shadow();
           const SharedBuffer& m = isa ? _m_a : _m_b;
-          if (opt == "adamw") {
+          if (opt == "adamw8bit") {
+            _ops->adamw8(enc, p, g, isa ? _qm_a : _qm_b, isa ? _qv_a : _qv_b,
+                         isa ? _am_a : _am_b, s, _codes, o);
+          } else if (opt == "adamw") {
             _ops->adamw(enc, p, g, m, isa ? _v_a : _v_b, s, o);
           } else if (opt == "lion") {
             _ops->lion(enc, p, g, m, s, o);
@@ -412,7 +592,10 @@ Optimizer::step(int accum, double* grad_norm, double* lr_used,
 namespace {
 
 constexpr std::uint32_t kStateMagic = 0x4f54504fu;   // "OPTO"
-constexpr std::uint32_t kStateVersion = 1;
+// 2: the 8-bit moments and Adafactor's row / column states after version
+// 1's arenas (a version-1 file still loads, for every optimizer but those
+// two).
+constexpr std::uint32_t kStateVersion = 2;
 
 }  // namespace
 
@@ -450,6 +633,14 @@ Optimizer::save_state(const std::string& path, std::string* err) const
   arena(_s_a, na); arena(_s_b, nb);
   arena(_x0_a, na); arena(_x0_b, nb);
   arena(_ema_a, na); arena(_ema_b, nb);
+  // The 8-bit moments, by their byte sizes.
+  auto raw = [&](const SharedBuffer& b) {
+    const std::uint64_t n = b.empty() ? 0 : b.byte_size();
+    put(&n, 8);
+    if (n > 0) { put(b.contents(), n); }
+  };
+  raw(_qm_a); raw(_qm_b); raw(_qv_a); raw(_qv_b); raw(_am_a); raw(_am_b);
+  raw(_af_a.state); raw(_af_b.state);
   o.close();
   if (!o) {
     if (err != nullptr) { *err = "short write to " + tmp; }
@@ -481,7 +672,7 @@ Optimizer::load_state(const std::string& path, std::string* err)
   std::uint64_t na = 0, nb = 0;
   std::int32_t t = 0;
   if (!get(&magic, 4) || !get(&ver, 4) || magic != kStateMagic ||
-      ver != kStateVersion) {
+      ver < 1 || ver > kStateVersion) {
     return fail("not an optimizer state file: " + path);
   }
   if (!get(&na, 8) || !get(&nb, 8) || na != _p->a_elems() ||
@@ -504,6 +695,22 @@ Optimizer::load_state(const std::string& path, std::string* err)
       !arena(_x0_a, na) || !arena(_x0_b, nb) || !arena(_ema_a, na) ||
       !arena(_ema_b, nb)) {
     return fail("the optimizer state does not match this optimizer");
+  }
+  auto raw = [&](const SharedBuffer& b) {
+    std::uint64_t n = 0;
+    if (!get(&n, 8)) { return false; }
+    const std::uint64_t want = b.empty() ? 0 : b.byte_size();
+    if (n != want) { return false; }
+    return n == 0 || get(b.contents(), n);
+  };
+  if (ver >= 2) {
+    if (!raw(_qm_a) || !raw(_qm_b) || !raw(_qv_a) || !raw(_qv_b) ||
+        !raw(_am_a) || !raw(_am_b) || !raw(_af_a.state) ||
+        !raw(_af_b.state)) {
+      return fail("the optimizer state does not match this optimizer");
+    }
+  } else if (!_qm_a.empty() || !_af_a.state.empty()) {
+    return fail("the optimizer state predates 8-bit AdamW and Adafactor");
   }
   _t = t;
   _p->refresh_shadows_cpu();

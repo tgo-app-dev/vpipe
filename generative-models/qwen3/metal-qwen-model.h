@@ -774,11 +774,25 @@ public:
   // beside it. `prompt_rows` > 0: the longest prompt a context prefills,
   // where that is less than the K/V -- several contexts each prefilled
   // on its own (MiniMax-Music3's prompt and its guidance twin); else the
-  // prompt is the K/V's tokens up to max_seq.
+  // prompt is the K/V's tokens up to max_seq. `dense`: the stack's
+  // projections are dense as loaded (uses_dense(); before a load,
+  // dense_checkpoint()) -- read where they lie, so the dequant scratch is
+  // only the band tuner's probe, on matrix cores past kMmaBand rows; a
+  // quantized or mixed stack books it at the widest projection it unpacks.
   static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens,
                                int contexts, bool one_pass, bool plain_mlp,
                                bool matrix_cores,
-                               std::int64_t prompt_rows = 0);
+                               std::int64_t prompt_rows = 0,
+                               bool dense = false);
+  // Whether a checkpoint's stack loads DENSE, before it loads: the
+  // loader's probe on one layer (`layers_stem` + "0."), its down
+  // projection a plain float `.weight` with no affine `.scales` (or a raw
+  // MoE's fused experts likewise). Anything else -- GGUF k-quants, NVFP4,
+  // int8 / FP8 tensors a loader may decode, a pack -- answers false, which
+  // books the dequant scratch. A caller that builds the stack w8 in memory
+  // (Config::load_quant_bits) asks for false itself.
+  static bool dense_checkpoint(const MetalLlamaWeights& wts,
+                               const std::string& layers_stem);
   std::size_t verify_scratch_held() const;
 
   // Sizes of a raw-source backbone, from the checkpoint alone -- for a

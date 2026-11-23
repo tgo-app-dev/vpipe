@@ -1,5 +1,8 @@
 #include "stages/minimax-h3-image-host.h"
 #include "stages/generate-video-stage.h"
+
+#include "apple-silicon/metal-compute/tensor-beat-bridge.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-fast-vae.h"
 #include "generative-models/shared/torch-randn.h"
 #include "generative-models/gen-input.h"
 #include "generative-models/tensor-parallel.h"
@@ -26,6 +29,7 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-dials.h"
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 #include "generative-models/minimax-h3/minimax-h3-taomate.h"
@@ -1869,6 +1873,8 @@ GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
     rank += T::lora_footprint(f, c.n_layers, c.pruned() ? &c : nullptr).rank;
   }
   n += (std::size_t)rows * (std::size_t)rank * 2;
+  // (A DWD adapter's features outlive the forward: the payload claim in
+  // declare_resources books them, from the denoise through the decode.)
   return n;
 }
 
@@ -1888,6 +1894,76 @@ GenerateVideoStage::h3_plan_lora_files_() const
     if (!f.empty()) { out.push_back(f); }
   }
   return out;
+}
+
+bool
+GenerateVideoStage::h3_dwd_plan_bytes_(const std::string& root,
+                                       const std::string& head, int w, int h,
+                                       int frames, std::size_t* arena,
+                                       std::size_t* features) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  genai::MetalMiniMaxH3FastVae::Config hc;
+  genai::MetalMiniMaxH3VideoVae::Config vc;
+  genai::MetalMiniMaxH3Transformer::Config tc;
+  const std::string part =
+      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
+          resolve_model(session(), _hf_dir).model_type);
+  if (!genai::MetalMiniMaxH3FastVae::config_from_dwd(head, &hc) ||
+      !genai::MetalMiniMaxH3VideoVae::config_from_json(
+          genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root), vc,
+          nullptr) ||
+      !genai::MetalMiniMaxH3Transformer::config_from_json(h3_dit_(root, part),
+                                                          tc, nullptr) ||
+      vc.patch <= 0 || tc.patch_h <= 0 || tc.patch_w <= 0) {
+    return false;
+  }
+  const int T = genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(
+      vc, frames);
+  const int lh = h / vc.patch, lw = w / vc.patch;
+  if (T <= 0 || lh <= 0 || lw <= 0) { return false; }
+  // The head's working set over the clip, its bf16 output in, and the
+  // planar-U8 clip this stage buffers behind it.
+  *arena = genai::MetalMiniMaxH3FastVae::scratch_bytes(hc, T, lh, lw) +
+           (std::size_t)genai::MetalMiniMaxH3FastVae::decoded_frames(hc, T) *
+               (std::size_t)h * (std::size_t)w * 3;
+  // Every video row the last forward returns: the clip's, and its two
+  // keyframe anchors' at most (the plan's sequence: h3_plan_seq_).
+  const std::size_t cells = (std::size_t)(lh / tc.patch_h) *
+                            (std::size_t)(lw / tc.patch_w);
+  *features = ((std::size_t)T + 2) * cells * (std::size_t)tc.hidden * 2;
+  return true;
+#else
+  (void)root; (void)head; (void)w; (void)h; (void)frames;
+  (void)arena; (void)features;
+  return false;
+#endif
+}
+
+std::string
+GenerateVideoStage::planned_dwd_head() const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  if (!_model_cfg.is_object()) { return {}; }
+  const auto o = _model_cfg.as_object();   // a view: `_model_cfg` owns it
+  for (int i = 0; i < kH3LoraSlots; ++i) {
+    const std::string_view kp = lora_slots::kPath[i];
+    if (!o.contains(kp)) { continue; }
+    const std::string p(o.at(kp).as_string(""));
+    if (p.empty()) { continue; }
+    // At strength 0 the adapter is off and the DiT emits latents.
+    const std::string_view ks = lora_slots::kScale[i];
+    if (o.contains(ks) && o.at(ks).as_real(1.0) == 0.0) { continue; }
+    std::string ignored;
+    const std::string f = resolve_adapter_file(session(), p, &ignored);
+    if (!f.empty() &&
+        genai::lora::Adapter::file_touches(
+            f, "dwd_pixel_refiner.feature_expand")) {
+      return f;
+    }
+  }
+#endif
+  return {};
 }
 
 int
@@ -2132,6 +2208,17 @@ GenerateVideoStage::declare_resources() const
           ah / vc.patch, aw / vc.patch);
     }
   }
+  // DWD (pi-H3): the adapter's pixel head decodes in vae-decode in place
+  // of the VAE, so its working set is the arena; the features are the
+  // payload the latent was. (vae-decode claims the head's weights.)
+  const std::string dwd_head = planned_dwd_head();
+  std::size_t dwd_feats = 0;
+  if (!dwd_head.empty() && arena_bytes != model_memory::kUnknownArena) {
+    std::size_t a = 0;
+    if (h3_dwd_plan_bytes_(root, dwd_head, aw, ah, af, &a, &dwd_feats)) {
+      arena_bytes = a;
+    }
+  }
   std::vector<ResourceClaim> arena = model_memory::scratch_claims(
       "vae-decode", arena_bytes, model_memory::kPhaseDecode);
   // The LATENT this stage emits, alive from the denoise that writes it
@@ -2157,8 +2244,9 @@ GenerateVideoStage::declare_resources() const
     // 0 from a family that declines to size its own latent, and the
     // claim is then skipped rather than filled in from a built-in.
     const std::size_t latent =
-        fam != nullptr
-            ? fam->latent_bytes(root, aw, ah, af)
+        fam != nullptr ? fam->latent_bytes(root, aw, ah, af)
+        : dwd_feats > 0
+            ? dwd_feats
             : genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
     if (latent > 0) {
       for (auto& c : model_memory::payload_claims(
@@ -2528,6 +2616,13 @@ GenerateVideoStage::declare_memory() const
   // describe different clips.
   m.outputs.resize(2, 0);
   m.outputs[0] = genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
+  // DWD: the features the head decodes, in the latent's place.
+  if (const std::string head = planned_dwd_head(); !head.empty()) {
+    std::size_t a = 0, f = 0;
+    if (h3_dwd_plan_bytes_(root, head, aw, ah, af, &a, &f)) {
+      m.outputs[0] = f;
+    }
+  }
   if (_fps > 0.0 && !refines_() && !genai::ph3::is_root(root) &&
       !genai::h3i::is_root(root)) {
     const int alf = genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
@@ -4483,7 +4578,13 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   // they count against physical RAM only. MEASURED on an M5 Pro 24 GB at
   // 1344x768x328 (98887 rows): charging the ANE's 3.1 GB to the working set
   // refused a clip that runs GPU-only.
-  const std::size_t gpu_need = dit + vdn + sol + sage + i8 + lora;
+  // AND A DWD ADAPTER'S FEATURES (pi-H3): the last forward's video rows
+  // at the hidden width, bf16 -- they outlive the forward into the decode.
+  const std::size_t dwd =
+      _h3_dit && _h3_dit->dwd_slot() >= 0
+          ? L.video_indices.size() * (std::size_t)_h3_cfg.hidden * 2
+          : 0;
+  const std::size_t gpu_need = dit + vdn + sol + sage + i8 + lora + dwd;
   // THE PLAN'S DENOISE FIGURE, SET TO THIS FORWARD'S. The launch booked
   // `<id>-h3-dit` at a planned sequence -- the canvas, two anchors, 512
   // text rows -- and the rows it could not know arrive only here: a
@@ -4494,14 +4595,17 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
   if (auto* gm = session()->services()->generative_model_manager()) {
     const std::string label = fmt("{}-h3-dit", this->id())();
     const std::size_t booked = gm->declared_scratch(label);
-    if (booked > 0 && gpu_need > booked + booked / 10) {
+    // A DWD adapter's features are the latent payload's in the plan,
+    // from the denoise through the decode: not this label's.
+    const std::size_t fwd = gpu_need - dwd;
+    if (booked > 0 && fwd > booked + booked / 10) {
       session()->info(fmt(
           "GenerateVideoStage('{}'): the {}-row forward's activations take "
           "~{} MB where the launch booked ~{} MB (references and vision "
           "rows are known only now); the plan now carries this figure",
-          this->id(), seq, gpu_need >> 20, booked >> 20));
+          this->id(), seq, fwd >> 20, booked >> 20));
     }
-    gm->revise_scratch(label, gpu_need);
+    gm->revise_scratch(label, fwd);
   }
   // AND WHAT THE CALLER HOLDS BESIDE THE FORWARD for the whole denoise --
   // TaoMate-H3's clean-K/V cache, which at 864x480 is larger than every
@@ -5028,6 +5132,137 @@ GenerateVideoStage::parse_h3_guide_(const TensorBeatPayload* video,
   return out->video != nullptr || out->audio != nullptr;
 }
 
+namespace {
+
+// "0 x12, 0.25, 1 x20": a weight per frame, runs of one value counted.
+std::string
+dial_runs_(const std::vector<float>& m)
+{
+  std::string s;
+  for (std::size_t i = 0; i < m.size();) {
+    const double v = std::round((double)m[i] * 100.0) / 100.0;
+    std::size_t j = i + 1;
+    while (j < m.size() &&
+           std::round((double)m[j] * 100.0) / 100.0 == v) {
+      ++j;
+    }
+    s += fmt("{}{:.4g}", s.empty() ? "" : ", ", v)();
+    if (j - i > 1) { s += fmt(" x{}", j - i)(); }
+    i = j;
+  }
+  return s;
+}
+
+}  // namespace
+
+bool
+GenerateVideoStage::h3_dials_(int lt, int alat, const char* no_curves,
+                              std::vector<metal_compute::SharedBuffer>* bufs,
+                              std::vector<genai::DialBranch>* branches)
+{
+  namespace fs = std::filesystem;
+  bufs->clear();
+  branches->clear();
+  if (!_h3_dit) { return false; }
+  auto refuse = [&](const std::string& m) {
+    session()->warn(fmt("GenerateVideoStage('{}'): dials: {}; skipping",
+                        this->id(), m));
+    return false;
+  };
+  std::vector<h3::DialRow> rows;
+  FlexData dir_ref;
+  if (_model_cfg.is_object()) {
+    const auto o = _model_cfg.as_object();
+    if (o.contains("dials")) {
+      std::string why;
+      if (!h3::parse_dial_rows(o.at("dials"), &rows, &why)) {
+        return refuse(why);
+      }
+    }
+    if (o.contains("dial_dir")) { dir_ref = o.at("dial_dir"); }
+  }
+  rows = h3::active_dial_rows(rows);
+  if (rows.empty()) {
+    // A clip without dials after one with them: the DiT's constant ones
+    // go.
+    if (_h3_dit->has_dials()) { _h3_dit->set_dials({}, {}); }
+    return true;
+  }
+  // Where relative names are read from: a directory (confined first
+  // under the web-ui's sandbox, as its browser wrote it), else a
+  // registered model.
+  std::string dir;
+  const std::string dref(dir_ref.as_string(""));
+  if (!dref.empty()) {
+    std::error_code ec;
+    if (session()->fs_sandboxed()) {
+      std::string cerr;
+      const fs::path c = session()->confine_path(dref, false, &cerr);
+      if (cerr.empty() && !c.empty() && fs::is_directory(c, ec)) {
+        dir = c.string();
+      }
+    }
+    if (dir.empty() && fs::is_directory(fs::path(dref), ec)) { dir = dref; }
+    if (dir.empty()) {
+      const std::string m = resolve_model_dir(session(), dref);
+      if (!m.empty() && fs::is_directory(fs::path(m), ec)) { dir = m; }
+    }
+    if (dir.empty()) {
+      return refuse(fmt("dial_dir '{}' is not a directory or a registered "
+                        "model", dref)());
+    }
+  }
+  std::vector<h3::Dial> dials;
+  for (const h3::DialRow& r : rows) {
+    std::string file;
+    std::error_code ec;
+    const fs::path p(r.dial);
+    if (!dir.empty() && p.is_relative() &&
+        fs::is_regular_file(fs::path(dir) / p, ec)) {
+      file = (fs::path(dir) / p).string();
+    }
+    std::string why;
+    if (file.empty()) { file = resolve_adapter_file(session(), r.dial, &why); }
+    if (file.empty()) {
+      return refuse(fmt("'{}': {}{}", r.dial, why,
+                        dir.empty() ? std::string()
+                                    : fmt(" (nor under dial_dir '{}')",
+                                          dir)())());
+    }
+    h3::Dial d;
+    if (!h3::read_dial(file, _h3_cfg.hidden, &d, &why)) { return refuse(why); }
+    dials.push_back(std::move(d));
+  }
+  h3::DialPlan plan;
+  std::string why;
+  if (!h3::compile_dial_plan(rows, dials, &plan, &why)) { return refuse(why); }
+  if (!plan.groups.empty() && no_curves != nullptr) {
+    return refuse(fmt("a time curve cannot run here: {}", no_curves)());
+  }
+  if (!_h3_dit->set_dials(plan.pre, plan.post, &why)) { return refuse(why); }
+  std::string curves;
+  bufs->reserve(plan.groups.size());
+  for (const h3::DialPlan::Group& g : plan.groups) {
+    genai::DialBranch b;
+    b.label = g.label;
+    b.steps = g.curve.steps;
+    h3::dial_frame_weights(g.curve, lt, alat, _fps, &b.video, &b.audio);
+    bufs->push_back(_h3_dit->text_shift_buffer(g.shift));
+    if (bufs->back().empty()) { return refuse("no memory for a dial"); }
+    b.shift = &bufs->back();
+    curves += fmt("\n  curve '{}': blended on steps 0-{}, video M by "
+                  "latent frame [{}], audio {}", g.label, b.steps - 1,
+                  dial_runs_(b.video),
+                  g.curve.protect_audio
+                      ? std::string("protected (the undialled branch's)")
+                      : fmt("M by latent [{}]", dial_runs_(b.audio))())();
+    branches->push_back(std::move(b));
+  }
+  session()->info(fmt("GenerateVideoStage('{}'): {} dial row(s){}{}",
+                      this->id(), rows.size(), plan.report, curves));
+  return true;
+}
+
 bool
 GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
                             int ref_frames, bool ref_last_only,
@@ -5211,19 +5446,33 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     }
     _h3_dit->set_vdn_radius(narrow);
   }
+  // The model config's dials: the constant ones on the DiT, a time
+  // curve's as a branch of the loop. Before the preflight, which books
+  // what a curve's blend holds.
+  std::vector<metal_compute::SharedBuffer> dial_bufs;
+  std::vector<genai::DialBranch> dial_branches;
+  if (!h3_dials_(lt, alat,
+                 _ph3 || _h3i ? "this model makes one frame and no "
+                                "soundtrack, so there is no clip time to "
+                                "follow -- give the row no `time`"
+                              : nullptr,
+                 &dial_bufs, &dial_branches)) {
+    return false;
+  }
   // What the denoise holds on the host beside the forward: the latent
   // state this stage owns (both modalities, references included) and the
   // loop's own buffers -- the velocity read back, a re-noising or
   // res_multistep step's extra state, MotionCache's residual, a preview's
-  // estimate. Physical RAM, paged if it must be; 384 bytes a video row
-  // each, ~51 MB a buffer at 2K x 124 frames.
+  // estimate, the undialled velocity dial curves blend against.
+  // Physical RAM, paged if it must be; 384 bytes a video row each, ~51 MB
+  // a buffer at 2K x 124 frames.
   const std::size_t host =
       ((std::size_t)L.video_indices.size() * c.video_patch_elems() +
        (std::size_t)L.audio_indices.size() * c.audio_channels) *
           sizeof(float) +
       genai::denoise_host_bytes(
           L, c, genai::motion_cache::config_from_flex(&_accel).enabled,
-          _preview && _preview->active());
+          _preview && _preview->active(), &dial_branches);
   const bool booked = preflight_h3_scratch_(L.seq_len, text_rows, L,
                                             lh / c.patch_h, lw / c.patch_w,
                                             host);
@@ -5770,15 +6019,20 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   DenoiseProgress prog(&bar, bar_steps, /*forwards_per_step=*/1);
   ScopedBlockProgress<genai::MetalMiniMaxH3Transformer> hook(_h3_dit.get(),
                                                              prog);
-  req.progress = [&](int step, int total) {
-    // `total` is the count the SCHEDULER settled on, which can fall
-    // short of `_steps`: the shift can collapse duplicate sigmas, and a
-    // flow-map adapter runs its own grid. Adopting it is what makes the
-    // bar finish at 100% whatever the schedule turned out to be.
+  // Counted in FORWARDS: a dial curve's steps run more than one, and a
+  // bar counting steps would sit still through each extra one. Without a
+  // curve a step is one forward, and the two counts are the same.
+  req.dial_branches = dial_branches;
+  req.forward_progress = [&](int done, int total) {
+    // `total` is what the SCHEDULER settled on (plus the curves'
+    // forwards), which can fall short of `_steps`: the shift can collapse
+    // duplicate sigmas, and a flow-map adapter runs its own grid.
+    // Adopting it is what makes the bar finish at 100% whatever the
+    // schedule turned out to be.
     prog.set_steps(total);
-    // `step` is 1-based on entry here; end_step takes the 0-based index
+    // `done` is 1-based on entry here; end_step takes the 0-based index
     // it just finished, and re-syncs the bar to the exact boundary.
-    prog.end_step(step - 1);
+    prog.end_step(done - 1);
     return true;
   };
   // Live previews, when process() opened a preview for this clip. The
@@ -5797,6 +6051,11 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
                        total);
     };
   }
+  // DWD: the last step's features for the pixel head, in place of the
+  // latent the VAE would decode.
+  _h3_dwd_feats = metal_compute::SharedBuffer{};
+  _h3_dwd_file.clear();
+  if (_h3_dit->dwd_slot() >= 0) { req.dwd_features = &_h3_dwd_feats; }
   std::string derr;
   const bool ok = genai::denoise(req, &derr);
   bar.finish();
@@ -5823,6 +6082,19 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     return false;
   }
 
+  if (req.dwd_features != nullptr) {
+    if (_h3_dwd_feats.empty()) {
+      session()->warn(fmt("GenerateVideoStage('{}'): the DWD adapter's last "
+                          "step returned no features; skipping",
+                          this->id()));
+      return false;
+    }
+    _h3_dwd_file = _h3_dit->dwd_file();
+    _h3_dwd_grid[0] = lt;
+    _h3_dwd_grid[1] = lh / c.patch_h;
+    _h3_dwd_grid[2] = lw / c.patch_w;
+    _h3_dwd_row0 = L.num_condition_video_rows;
+  }
   // Unpatchify the GENERATED video rows back to a [z, T, lh, lw] grid.
   // Each row is one (1, patch_h, patch_w) cell of z_channels, and the
   // conditioning rows lead the block, so the generated ones start at
@@ -5908,6 +6180,20 @@ GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
         "GenerateVideoStage('{}'): TaoMate-H3 was validated at a 480, 768 "
         "or 1088 short edge; {}x{} runs, untested", this->id(), _width,
         _height));
+  }
+  // Constant dials are the DiT's own, on every forward of the stream; a
+  // time curve blends the steps of one denoise, which this method does
+  // not run.
+  {
+    std::vector<metal_compute::SharedBuffer> bufs;
+    std::vector<genai::DialBranch> branches;
+    if (!h3_dials_(0, 0,
+                   "TaoMate-H3's streaming runs its own chunked steps, "
+                   "not the denoise a curve blends -- give the row no "
+                   "`time`, or set `taomate: off`",
+                   &bufs, &branches)) {
+      return false;
+    }
   }
   // Whole 5-second requests: the first carries the clip's 5-frame
   // prefix (124 native frames), each later one 119 more. The fewest that
@@ -6960,10 +7246,24 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     }
 
     auto vout = std::make_unique<TensorBeatPayload>();
-    vout->dtype = TensorBeat::DType::F32;
-    vout->shape = {vshape[0], vshape[1], vshape[2], vshape[3]};
-    vout->resize_contiguous(vlat.size());
-    std::memcpy(vout->as_f32(), vlat.data(), vlat.size() * sizeof(float));
+    const bool dwd = !_h3_dwd_feats.empty();
+    if (dwd) {
+      // DWD: the features, handed over where they lie (zero-copy), for the
+      // pixel head in vae-decode; the latent is not decoded.
+      const std::size_t H = (std::size_t)_h3_cfg.hidden;
+      const std::size_t rows = _h3_dwd_feats.byte_size() / (H * 2);
+      static_cast<TensorBeat&>(*vout) =
+          metal_compute::to_tensor_beat(std::move(_h3_dwd_feats));
+      vout->dtype = TensorBeat::DType::Bf16;
+      vout->shape = {(std::int64_t)rows, (std::int64_t)H};
+      vout->strides.clear();
+      vout->storage_offset = 0;
+    } else {
+      vout->dtype = TensorBeat::DType::F32;
+      vout->shape = {vshape[0], vshape[1], vshape[2], vshape[3]};
+      vout->resize_contiguous(vlat.size());
+      std::memcpy(vout->as_f32(), vlat.data(), vlat.size() * sizeof(float));
+    }
     if (rp != nullptr) {
       // A refine carries what its input said about itself -- the frame
       // count and rate it stands for, and a crop box a latent-upscale
@@ -7003,12 +7303,31 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       }
       vout->sideband = std::move(sb);
     }
+    if (dwd) {
+      FlexData& sb = vout->sideband;
+      if (!sb.is_object()) { sb = FlexData::make_object(); }
+      auto so = sb.as_object();
+      so.insert_or_assign(sideband::kDwdHead,
+                          FlexData::make_string(_h3_dwd_file));
+      FlexData g = FlexData::make_array();
+      for (int k = 0; k < 3; ++k) {
+        g.as_array().push_back(FlexData::make_int(_h3_dwd_grid[k]));
+      }
+      so.insert_or_assign(sideband::kDwdGrid, std::move(g));
+      so.insert_or_assign(sideband::kDwdRow0,
+                          FlexData::make_int(_h3_dwd_row0));
+    }
     ++_emitted;
     session()->info(fmt(
-        "GenerateVideoStage('{}'): emitted MiniMax-H3 latents #{} -- video "
-        "[{}, {}, {}, {}] + audio [{}, {}, {}]", this->id(), _emitted,
-        vshape[0], vshape[1], vshape[2], vshape[3], ashape[0], ashape[1],
-        ashape[2]));
+        "GenerateVideoStage('{}'): emitted MiniMax-H3 {} #{} -- video "
+        "[{}, {}, {}, {}]{} + audio [{}, {}, {}]", this->id(),
+        dwd ? "DWD features" : "latents", _emitted, vshape[0], vshape[1],
+        vshape[2], vshape[3],
+        dwd ? fmt(" decoded by the adapter's pixel head ({} x {} x {} "
+                  "tokens)", _h3_dwd_grid[0], _h3_dwd_grid[1],
+                  _h3_dwd_grid[2])()
+            : std::string(),
+        ashape[0], ashape[1], ashape[2]));
     tag_model_(*vout);
     co_await ctx.write(0, std::move(vout));
 

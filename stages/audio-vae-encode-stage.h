@@ -52,6 +52,11 @@ namespace vpipe {
 // a live feed, and a stage that grew without limit on an open microphone
 // would fail as an OOM rather than as a message.
 //
+// A BATCH is the exception: a beat whose sideband says beat::kBatch (a
+// training dataset's soundtracks, one a clip) is a WHOLE soundtrack, and
+// is encoded and emitted as it arrives, the encoder held until the
+// stream ends -- one latent per beat, in order.
+//
 // ONE BEAT PER RUN, and the oport closes behind it. A `generate-video`
 // asked for a SECOND request then reads a closed port, gets nothing, and
 // generates unreferenced — the same shape as `vae-encode` feeding
@@ -118,10 +123,18 @@ private:
   std::vector<std::vector<float>> _pcm;
   int  _rate = 0;
   bool _overflowed = false;
+  // A BATCH (beat::kBatch on a beat's sideband: a training dataset's
+  // soundtracks): every beat is a whole soundtrack, encoded and emitted
+  // as it arrives, the encoder held until the stream ends.
+  bool _batch = false;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::VaeModelFamily*                  _vae_family = nullptr;
   std::unique_ptr<genai::AudioVaeEncoder> _plugin_enc;
+  // The built-in H3 encoder's working set as booked (its longest
+  // soundtrack so far), under encode_label_().
+  std::size_t _enc_booked = 0;
+  std::string encode_label_() const { return "audio-encode:" + this->id(); }
   bool _family_probed = false;
 
   void ensure_loaded_();
@@ -133,6 +146,11 @@ private:
   // Append one beat's samples. False (with a message already logged)
   // when the beat does not fit the stream being built.
   bool accumulate_(const class TensorBeatPayload& tb);
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Encode what `_pcm` holds into a latent beat; null (with a message
+  // logged) when it cannot.
+  std::unique_ptr<class TensorBeatPayload> encode_gathered_();
+#endif
   // The acceleration settings as a BAG, for a registered VAE family.
   // See generative-models/shared/accel-settings.h. Every tier in it is
   // off unless a graph asks: a codec's output is looked at directly, so

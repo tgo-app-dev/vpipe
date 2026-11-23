@@ -223,11 +223,14 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-layout.cc
         minimax-h3-taomate.cc
         minimax-h3-regenerate.cc
+        minimax-h3-train.cc
         minimax-h3-guide.cc
         pika-h3-flex.cc
+        pi-h3.cc
         minimax-h3-sampler.cc
         minimax-h3-pruned.cc
         minimax-h3-whole.cc
+        minimax-h3-dials.cc
         vdn-geometry.cc
         vdn-delta-solve.cc
         vdn-linear-features.cc

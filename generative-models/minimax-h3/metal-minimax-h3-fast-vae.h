@@ -105,6 +105,18 @@ class MetalMiniMaxH3FastVae {
     float ane_rows   = 0.0f;
     int   ane_layers = 0;
 
+    // DWD (pi-H3's pixel head, Lakonik/pi-H3: Decoding Without a
+    // Decoder): the DiT's own last-step features in place of a latent.
+    // `feature_dim` their width (the DiT's hidden; 0 = the latent
+    // decoder), each DiT token -- 2 x 2 latent cells -- expanded by
+    // `feature_expand` into 2 x 2 tokens of this stream; the layers are
+    // the decoder's last `n_layers` (its 16..23 at 8, the same shift
+    // parity as 0..7), and a native block's first latent decodes to its
+    // one frame through a projection of its own (first_frame_proj_out).
+    // Its tensors under `dwd_pixel_refiner.` in the adapter's file.
+    int feature_dim = 0;
+    bool dwd() const { return feature_dim > 0; }
+
     int rope_dim() const { return (int)((double)head_dim * rope_dim_ratio); }
     int patch_elems() const { return out_channels * patch_t * patch * patch; }
     int global_tokens() const { return n_register + 1; }
@@ -123,6 +135,17 @@ class MetalMiniMaxH3FastVae {
   // is not this decoder.
   static bool config_from(const WeightSet& ws, const std::string& vae_dir,
                           Config* out, std::string* err = nullptr);
+  // The DWD head's config off an adapter file's `dwd_pixel_refiner.*`
+  // tensors and the Sol decoder's constants (the reference's sol_h3
+  // model.py). False with a reason when the file carries none.
+  static bool config_from_dwd(const WeightSet& ws, Config* out,
+                              std::string* err = nullptr);
+  // The same off the FILE's header alone, for a plan before anything
+  // loads.
+  static bool config_from_dwd(const std::string& file, Config* out,
+                              std::string* err = nullptr);
+  // The tensor prefix of a DWD head in an adapter file.
+  static constexpr const char* kDwdPrefix = "dwd_pixel_refiner.";
 
   static std::unique_ptr<MetalMiniMaxH3FastVae>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
@@ -147,6 +170,15 @@ class MetalMiniMaxH3FastVae {
   metal_compute::SharedBuffer
   decode(const float* z, int T, int h, int w, std::string* err = nullptr);
 
+  // DWD: decode the DiT's features -- bf16 [T * h2 * w2, feature_dim]
+  // from row `row0` of `feats`, DiT tokens (t, i, j) in raster order --
+  // into what decode() returns for a [T, 2 h2, 2 w2] latent. Config::dwd
+  // only.
+  metal_compute::SharedBuffer
+  decode_features(const metal_compute::SharedBuffer& feats,
+                  std::size_t row0, int T, int h2, int w2,
+                  std::string* err = nullptr);
+
   // Device bytes decode() allocates beside the weights at its high water
   // for a [T, h, w] latent, its output included. From the config alone,
   // so a plan can ask before load; the instance method is this with
@@ -159,12 +191,21 @@ class MetalMiniMaxH3FastVae {
   // Every weight as held: bf16 projections (or their int8 layout), f32
   // norms, gates and the head's bias. From the file's headers and a tier,
   // for a plan.
+  // A DWD head's file: its `dwd_pixel_refiner.*` tensors alone.
   static std::size_t weight_bytes(const std::string& file, int i8_tier);
   std::size_t weight_bytes() const noexcept { return _weight_bytes; }
 
   // The ANE tier's module bytes (one runtime-weight module for every
   // layer), for the plan's claim.
   static std::size_t ane_runtime_bytes(const Config& c) noexcept;
+
+  // Give back a decode's working set -- the stream, the bands, the
+  // pools, the ring, the geometry's tables, the int8 context's scratch
+  // -- which the next decode makes again. It is kept otherwise (a decode
+  // at the same geometry reuses it), and a plan books it in the decode
+  // alone: a stage keeping the model across clips calls this after each
+  // decode, or the working set sits through the next clip's denoise.
+  void release_scratch();
 
   // Progress after each layer: (done, total) layers.
   void set_progress(std::function<void(int, int)> fn)
@@ -232,6 +273,11 @@ class MetalMiniMaxH3FastVae {
   bool build_geometry_(int T, int h, int w, std::string* err);
 
   bool load_(std::string* err);
+  // decode() and decode_features(): `z` or `feats` for the stream's
+  // first rows, the layers and the head the same.
+  metal_compute::SharedBuffer
+  decode_(const float* z, const metal_compute::SharedBuffer* feats,
+          std::size_t row0, int T, int h, int w, std::string* err);
   bool bind_kernels_(std::string* err);
   Proj proj_(const std::string& name, int N, int K, std::string* err);
 
@@ -289,6 +335,11 @@ class MetalMiniMaxH3FastVae {
   metal_compute::SharedBuffer _ln_w, _ln_b;         // f32 [D]
   Proj _head;                                       // [patch_elems, D]
   metal_compute::SharedBuffer _head_bias;           // f32
+  // DWD: feature_expand [4 D, feature_dim] (bf16 bias), the first-frame
+  // head [3 * 256, D] bf16 and its f32 bias; the tensors' prefix.
+  Proj _expand;
+  metal_compute::SharedBuffer _head1_w, _head1_bias;
+  std::string _prefix;
   metal_compute::SharedBuffer _rope;                // f32 [2][3][16][8]
   std::size_t _weight_bytes = 0;
 
@@ -317,7 +368,7 @@ class MetalMiniMaxH3FastVae {
       _lib_attn, _lib_attn_nax;
   metal_compute::ComputeFunction _fn_gemm, _fn_mma, _fn_mma_wide,
       _fn_bias_add, _fn_swiglu, _fn_embed, _fn_norm, _fn_gated, _fn_post,
-      _fn_copy, _fn_unpatch;
+      _fn_copy, _fn_unpatch, _fn_expand, _fn_unpatch1;
   // The flash kernel per (align_Q, align_K).
   metal_compute::ComputeFunction _fn_attn[2][2];
   bool _use_mma2 = false;

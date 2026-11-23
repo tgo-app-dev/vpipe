@@ -16,6 +16,8 @@
 
 #include "minitest.h"
 
+#include "common/beat-keys.h"
+
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
@@ -116,6 +118,8 @@ public:
   // When set, the SECOND beat claims this rate instead -- the
   // mid-stream change the stage must refuse rather than splice.
   int second_rate = 0;
+  // Every beat marked as one of a series (beat::kBatch).
+  bool batch = false;
 
   Job
   process(RuntimeContext& ctx) override
@@ -139,6 +143,9 @@ public:
         (emitted == 1 && second_rate > 0) ? second_rate : rate;
     sb.as_object().insert_or_assign("sample_rate",
                                     FlexData::make_int((std::int64_t)r));
+    if (batch) {
+      sb.as_object().insert_or_assign(beat::kBatch, FlexData::make_bool(true));
+    }
     b->sideband = std::move(sb);
     ++emitted;
     co_await ctx.write(0, std::move(b));
@@ -215,7 +222,7 @@ struct Result {
 
 Result
 run_(int n_beats, int per_beat, int src_rate, int second_rate,
-     const char* hf_dir)
+     const char* hf_dir, bool batch = false)
 {
   g_seen = Seen{};
   Session sess;
@@ -227,6 +234,7 @@ run_(int n_beats, int per_beat, int src_rate, int second_rate,
   src_u->per_beat = per_beat;
   src_u->rate     = src_rate;
   src_u->second_rate = second_rate;
+  src_u->batch = batch;
   src_u->allocate_oports(1);
   auto* src = static_cast<PcmSource*>(pl->insert_stage(std::move(src_u)));
 
@@ -292,6 +300,24 @@ TEST(audio_vae_encode, accumulates_every_beat_and_encodes_once_at_eos)
   EXPECT_TRUE(r.dim == 128);
   EXPECT_TRUE(r.rate == 16000);
   EXPECT_TRUE(r.seconds > 0.29 && r.seconds < 0.31);
+}
+
+// A BATCH (a training dataset's soundtracks): every beat is a whole
+// soundtrack of its own, encoded and emitted as it arrives -- one encode
+// and one latent per beat, each over that beat's samples alone.
+TEST(audio_vae_encode, a_batch_encodes_each_beat_alone)
+{
+  EXPECT_TRUE(register_stub_());
+  const Result r = run_(/*n_beats=*/3, /*per_beat=*/1600, 16000, 0,
+                        "/ut/aenc-model", /*batch=*/true);
+  EXPECT_TRUE(g_seen.calls == 3);
+  EXPECT_TRUE(g_seen.n_samples == 1600);
+  // The last encode was the last beat's alone: its first sample is beat
+  // 2's, channel 0.
+  EXPECT_TRUE(g_seen.first == 2000.0f);
+  EXPECT_TRUE(r.beats == 3);
+  EXPECT_TRUE(r.rows == 1600 / 640);
+  EXPECT_TRUE(r.seconds > 0.099 && r.seconds < 0.101);
 }
 
 TEST(audio_vae_encode, a_rate_the_encoder_does_not_want_is_refused)

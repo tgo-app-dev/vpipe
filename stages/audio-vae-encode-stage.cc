@@ -1,9 +1,11 @@
 #include "generative-models/shared/accel-settings.h"
 #include "stages/audio-vae-encode-stage.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
 #include "generative-models/weight-set.h"
 
 #include "apple-silicon/tensor-beat.h"
+#include "common/beat-keys.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/perf-scope.h"
@@ -72,7 +74,9 @@ const PortSpec kIports[] = {
   {.name = "audio",
    .doc = "f32 PCM, rank-1 [N] mono or rank-2 [channels, N] PLANAR, in "
           "[-1, 1]; sideband.sample_rate names the rate. EVERY beat is "
-          "accumulated and the encode runs ONCE at EOS",
+          "accumulated and the encode runs ONCE at EOS -- except a BATCH "
+          "beat (sideband batch: true, a training dataset's soundtracks), "
+          "which is a whole soundtrack encoded and emitted alone",
    .type = &typeid(TensorBeatPayload),
    // BOTH spellings, because the tree has both and either can drive
    // this: `audio-to-pcm` tags its output "pcm-samples" and
@@ -157,6 +161,13 @@ public:
   int sample_rate() const override { return _cfg.sample_rate; }
   int channels() const override { return 2; }
   std::uint64_t resident_bytes() const override { return _bytes; }
+  // What one encode of `samples` holds on the device beyond the weights.
+  std::size_t
+  encode_bytes(int samples) const
+  {
+    return genai::MetalMiniMaxH3AudioVae::encode_scratch_bytes(_cfg, samples,
+                                                               2);
+  }
   bool
   encode(const genai::AudioVaeEncodeRequest& req, std::vector<float>* out,
          std::vector<int>* shape, std::string* err) override
@@ -369,6 +380,7 @@ AudioVaeEncodeStage::reset_run_state()
   _pcm.clear();
   _rate = 0;
   _overflowed = false;
+  _batch = false;
 }
 
 StageMemory
@@ -430,9 +442,19 @@ AudioVaeEncodeStage::declare_resources() const
     // VAE a checkpoint with one codec for both uses.
     return f->declare_resources(root, root);
   }
-  // MiniMax-H3's, built in -- where ensure_loaded_ would load it.
+  // MiniMax-H3's, built in -- where ensure_loaded_ would load it -- and
+  // its encode's working set: no beat has said how long until one comes,
+  // so a placeholder, revised to the longest soundtrack before it runs.
   const std::string h3 = h3_audio_vae_(root);
-  if (!h3.empty()) { return model_memory::weight_claims({h3}); }
+  if (!h3.empty()) {
+    std::vector<ResourceClaim> v = model_memory::weight_claims({h3});
+    for (auto& c : model_memory::scratch_claims(
+             encode_label_(), model_memory::kUnknownArena,
+             model_memory::kPhaseCondition)) {
+      v.push_back(std::move(c));
+    }
+    return v;
+  }
   return {};
 }
 
@@ -559,9 +581,45 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
 
   auto in = co_await ctx.read(0);
   if (in) {
+    const auto* tb = dynamic_cast<const TensorBeatPayload*>(in.get());
+    // A BATCH beat (beat::kBatch on its sideband: a training dataset's
+    // soundtracks) is one WHOLE soundtrack of its own, encoded and
+    // emitted now, the encoder held until the stream ends.
+    bool batch = false;
+    if (tb != nullptr && tb->sideband.is_object()) {
+      FlexData sb = tb->sideband;
+      auto o = sb.as_object();
+      batch = o.contains(beat::kBatch) && o.at(beat::kBatch).as_bool(false);
+    }
+    if (batch) {
+      _batch = true;
+      _pcm.clear();
+      _rate = 0;
+      _overflowed = false;
+      if (accumulate_(*tb)) {
+        auto out = encode_gathered_();
+        _pcm.clear();
+        _rate = 0;
+        if (out != nullptr) {
+          // The beat's place in its series, for the consumer pairing
+          // soundtracks with clips by order.
+          out->sideband.as_object().insert_or_assign(
+              beat::kBatch, FlexData::make_bool(true));
+          co_await ctx.write(0, std::move(out));
+          co_return;
+        }
+      }
+      // The series promised a soundtrack here: a missing one would pair
+      // every later one with the wrong clip.
+      session()->error(fmt("AudioVaeEncodeStage('{}'): a soundtrack of a "
+                           "batch did not encode; stopping the series",
+                           this->id()));
+      ctx.signal_done();
+      co_return;
+    }
     // Still streaming: buffer and wait. The encode needs the WHOLE clip
     // (see the header), so nothing is emitted per beat.
-    if (const auto* tb = dynamic_cast<const TensorBeatPayload*>(in.get())) {
+    if (tb != nullptr) {
       accumulate_(*tb);
     } else {
       session()->warn(fmt(
@@ -572,28 +630,45 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
   }
 
   // ---- EOS: encode what was gathered, then close -------------------------
+  if (_batch) {
+    // A BATCH emitted each soundtrack as it came; the encoder goes with
+    // the stream, and its working set with it.
+    if (_plugin_enc) { _plugin_enc->release_idle(); }
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->revise_scratch(encode_label_(), 0);
+      _enc_booked = 0;
+    }
+    ctx.signal_done();
+    co_return;
+  }
+  auto out = encode_gathered_();
+  if (out != nullptr) { co_await ctx.write(0, std::move(out)); }
+  // The reference is ONE beat and the stream is over; closing here is
+  // what lets a downstream generate-video see EOS on the port rather
+  // than waiting for a second reference that never comes.
+  ctx.signal_done();
+}
+
+std::unique_ptr<TensorBeatPayload>
+AudioVaeEncodeStage::encode_gathered_()
+{
   const int ch = (int)_pcm.size();
   const int n  = ch > 0 ? (int)_pcm[0].size() : 0;
   if (ch == 0 || n == 0) {
     session()->warn(fmt(
         "AudioVaeEncodeStage('{}'): the stream ended with no PCM; no "
         "reference emitted", this->id()));
-    ctx.signal_done();
-    co_return;
+    return nullptr;
   }
   ensure_loaded_();
-  if (!_plugin_enc) {
-    ctx.signal_done();
-    co_return;
-  }
+  if (!_plugin_enc) { return nullptr; }
   const int want_rate = _plugin_enc->sample_rate();
   if (_rate <= 0) {
     session()->warn(fmt(
         "AudioVaeEncodeStage('{}'): no beat named a sample rate and none is "
         "configured; refusing to guess. Set config.sample_rate, or use a "
         "producer that stamps it", this->id()));
-    ctx.signal_done();
-    co_return;
+    return nullptr;
   }
   if (want_rate > 0 && _rate != want_rate) {
     // REFUSED, not resampled. This stage owns no resampler, and encoding
@@ -606,8 +681,7 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
         "stage does not resample, because a silent rate mismatch is a "
         "reference of the right length at the wrong pitch", this->id(),
         _family, want_rate, _rate, want_rate));
-    ctx.signal_done();
-    co_return;
+    return nullptr;
   }
 
   // Flatten to the planar block the family takes.
@@ -629,6 +703,18 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
   req.n_samples   = n;
   req.sample_rate = _rate;
 
+  // The built-in encoder's working set at this soundtrack's length,
+  // booked before it runs (the longest so far: a batch's windows run one
+  // after another in the same arena).
+  if (const auto* h = dynamic_cast<const H3AudioEncoder*>(_plugin_enc.get())) {
+    const std::size_t b = h->encode_bytes(n);
+    if (b > _enc_booked) {
+      _enc_booked = b;
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->revise_scratch(encode_label_(), b);
+      }
+    }
+  }
   std::vector<float> lat;
   std::vector<int> shape;
   std::string err;
@@ -642,22 +728,19 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
       session()->warn(fmt(
           "AudioVaeEncodeStage('{}'): family '{}' threw encoding: {}",
           this->id(), _family, e.what()));
-      ctx.signal_done();
-      co_return;
+      return nullptr;
     } catch (...) {
       session()->warn(fmt(
           "AudioVaeEncodeStage('{}'): family '{}' threw a non-standard "
           "exception encoding", this->id(), _family));
-      ctx.signal_done();
-      co_return;
+      return nullptr;
     }
   }
   if (!ok || lat.empty() || shape.empty()) {
     session()->warn(fmt(
         "AudioVaeEncodeStage('{}'): the {} encoder produced nothing ({})",
         this->id(), _family, err.empty() ? "no reason given" : err));
-    ctx.signal_done();
-    co_return;
+    return nullptr;
   }
   std::size_t want = 1;
   for (int d : shape) { want *= (std::size_t)std::max(0, d); }
@@ -665,8 +748,7 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
     session()->warn(fmt(
         "AudioVaeEncodeStage('{}'): the {} encoder returned {} values for a "
         "shape holding {}", this->id(), _family, lat.size(), want));
-    ctx.signal_done();
-    co_return;
+    return nullptr;
   }
 
   auto out = std::make_unique<TensorBeatPayload>();
@@ -687,16 +769,18 @@ AudioVaeEncodeStage::process(RuntimeContext& ctx)
   for (std::size_t i = 0; i < shape.size(); ++i) {
     dims += (i ? ", " : "") + std::to_string(shape[i]);
   }
-  session()->info(fmt(
+  const auto line = fmt(
       "AudioVaeEncodeStage('{}'): {} encoded a {:.2f} s reference ({} x {} "
       "samples at {} Hz) -> latent [{}]", this->id(), _family,
-      (double)n / _rate, ch, n, _rate, dims));
-  if (_unload_idle) { _plugin_enc->release_idle(); }
-  co_await ctx.write(0, std::move(out));
-  // The reference is ONE beat and the stream is over; closing here is
-  // what lets a downstream generate-video see EOS on the port rather
-  // than waiting for a second reference that never comes.
-  ctx.signal_done();
+      (double)n / _rate, ch, n, _rate, dims);
+  // A batch is a dataset: a line per soundtrack is noise.
+  if (_batch) {
+    session()->log_debug(line);
+  } else {
+    session()->info(line);
+  }
+  if (_unload_idle && !_batch) { _plugin_enc->release_idle(); }
+  return out;
 }
 
 #else   // !VPIPE_BUILD_APPLE_SILICON

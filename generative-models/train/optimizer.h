@@ -27,7 +27,14 @@ namespace genai {
 namespace train {
 
 struct OptimizerSpec {
-  std::string optimizer = "adamw";        // adamw | prodigy | lion | sgd
+  // adamw | adamw8bit | adafactor | prodigy | lion | sgd. adamw8bit is
+  // AdamW with its two moments held as one-byte block-quantized codes (2
+  // bytes a parameter against 8; the update itself in f32). adafactor is
+  // transformers' Adafactor with a manual learning rate (relative_step,
+  // scale_parameter and the first moment off; decay -0.8, eps 1e-30,
+  // update clipped to RMS 1): each factor's squared-gradient moment kept
+  // as a row and a column vector -- almost no state.
+  std::string optimizer = "adamw";
   double lr = 0.0;                        // 0: the optimizer's default
   double beta1 = 0.9;
   double beta2 = 0.999;
@@ -46,9 +53,14 @@ struct OptimizerSpec {
   double prodigy_d0 = 1e-6;
   double prodigy_growth = 1e30;           // how fast d may grow a step
   bool bias_correction = false;           // Prodigy's use_bias_correction
+  // LoRA+ (Hayou et al.): the B factors learn this many times faster
+  // than the A factors (kohya's loraplus_lr_ratio; 16 its paper's
+  // suggestion). 1: off.
+  double lora_plus_ratio = 1.0;
 
   // The choice lists the stage offers, in the editor's order.
-  static constexpr const char* kOptimizers = "adamw,prodigy,lion,sgd";
+  static constexpr const char* kOptimizers =
+      "adamw,adamw8bit,adafactor,prodigy,lion,sgd";
   static constexpr const char* kSchedules =
       "auto,constant,linear,cosine,cosine_restarts";
 
@@ -86,8 +98,12 @@ class Optimizer {
   // Prodigy's current step-size estimate (1 for the others).
   double prodigy_d() const noexcept { return _d; }
 
-  // Bytes of optimizer state per parameter, for the plan.
-  static std::size_t state_bytes_per_param(const OptimizerSpec& s) noexcept;
+  // Bytes of optimizer state per parameter, for the plan, at the
+  // adapter's `rank` (Adafactor's state is per row and per column: at
+  // most 8 / rank bytes a parameter, a factor being [rank, k] or
+  // [n, rank]; 0 takes rank 1, the bound).
+  static std::size_t state_bytes_per_param(const OptimizerSpec& s,
+                                           int rank = 0) noexcept;
 
   // The whole state -- moments, Prodigy's accumulators, EMA, the step
   // count -- so a resumed run continues the same trajectory.
@@ -106,6 +122,18 @@ class Optimizer {
   metal_compute::SharedBuffer _m_a, _m_b, _v_a, _v_b;
   metal_compute::SharedBuffer _s_a, _s_b, _x0_a, _x0_b, _num;
   metal_compute::SharedBuffer _ema_a, _ema_b;
+  // adamw8bit: the moments' codes (a byte an element), each arena's block
+  // scales [2 * blocks] and the 512 code values.
+  metal_compute::SharedBuffer _qm_a, _qm_b, _qv_a, _qv_b, _am_a, _am_b;
+  metal_compute::SharedBuffer _codes;
+  // adafactor, per arena: its matrices (TrainOps::AfMat), their row and
+  // column states, and the update's per-matrix sums of squares.
+  struct AfArena {
+    metal_compute::SharedBuffer mats, state, usq;
+    int nmat = 0, rows = 0, cols = 0;
+  };
+  AfArena _af_a, _af_b;
+  bool build_adafactor_(std::string* err);
   metal_compute::SharedBuffer _part;
   double _d = 1.0;
   double _d_max = 0.0;

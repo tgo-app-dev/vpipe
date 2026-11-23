@@ -11,6 +11,7 @@
 #include "generative-models/gemma4/metal-gemma-model.h"
 #include "generative-models/lfm3/metal-lfm3-model.h"
 #include "generative-models/llama3/metal-llama-model.h"
+#include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 
@@ -41,6 +42,33 @@ uniform_affine_(const std::string& dir, const ModelConfig& c)
     if (v.is_object() || v.is_bool()) { return false; }
   }
   return true;
+}
+
+// Whether a Qwen-path checkpoint loads its stack DENSE (MetalQwenModel::
+// dense_checkpoint), under whichever tensor prefix it was saved with --
+// the loader finds its own at load; the plan tries the ones in use, and
+// the first that holds layer 0 decides. A GGUF never does.
+bool
+dense_qwen_(const std::string& dir, const MetalQwenModel::Config& c)
+{
+  if (dir.size() > 5 && dir.compare(dir.size() - 5, 5, ".gguf") == 0) {
+    return false;
+  }
+  auto wts = MetalLlamaWeights::open_model(dir);
+  if (!wts.has_value()) { return false; }
+  for (const std::string& stem :
+       {c.weight_prefix + c.model_seg, std::string("model.language_model."),
+        std::string("model."), std::string("language_model.model."),
+        std::string("language_model."), std::string()}) {
+    const std::string l0 = stem + "layers.0.";
+    if (wts->has(l0 + "mlp.down_proj.weight") ||
+        wts->has(l0 + "mlp.down_proj.scales") ||
+        wts->has(l0 + "mlp.experts.down_proj") ||
+        wts->has(l0 + "mlp.switch_mlp.down_proj.weight")) {
+      return MetalQwenModel::dense_checkpoint(*wts, stem + "layers.");
+    }
+  }
+  return false;
 }
 
 // The K/V `shape` can hold on a model whose contexts stop at `cap` tokens.
@@ -105,8 +133,10 @@ lm_run_bytes(const SessionContextIntf* session, const std::string& dir,
       c.page_tokens = shape.page_tokens;
       c.max_pages = (int)shape.max_pages;
       const std::int64_t kv = kv_bound_(shape, c.max_seq);
-      return MetalQwenModel::run_bytes(c, kv, ctxs, shape.one_pass,
-                                       !uniform_affine_(dir, *mc), cores);
+      const bool affine = uniform_affine_(dir, *mc);
+      return MetalQwenModel::run_bytes(c, kv, ctxs, shape.one_pass, !affine,
+                                       cores, 0,
+                                       !affine && dense_qwen_(dir, c));
     }
     case LmFamily::kGemma: {
       // as LoadedLanguageModel loads it: the pool capped at 128 pages, the

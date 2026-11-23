@@ -87,6 +87,43 @@ struct SamplerChoice {
 bool sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
                               std::string* why = nullptr);
 
+// A DIAL ON A TIME CURVE (minimax-h3-dials.h): for steps [0, steps) the
+// loop runs the DiT a second time on the step's input with `shift` on
+// the prompt (Step::text_shift) and blends the two velocities per latent
+// frame, v = v0 + M (v_dial - v0) -- `video` M for each GENERATED video
+// latent frame (its rows, gh x gw of them, in the generated tail's
+// order), `audio` M for each audio latent (both stereo rows). From step
+// `steps` on, the branch is off. Two or more live on one step add their
+// differences from the one undialled velocity. A branch whose M is 0
+// everywhere costs nothing; one alone with M 1 everywhere runs ITS
+// forward in place of the undialled one.
+struct DialBranch {
+  std::string label;
+  // bf16 [hidden] (MetalMiniMaxH3Transformer::text_shift_buffer);
+  // borrowed for the call.
+  const metal_compute::SharedBuffer* shift = nullptr;
+  int steps = 0;
+  std::vector<float> video;   // one a generated latent frame
+  std::vector<float> audio;   // one an audio latent; empty: no audio rows
+};
+
+// Blend a dialled branch's velocity into `out`, `rows` rows of `width`
+// over `frames` equal groups of rows (`m` one weight a group): as
+// torch.lerp(base, dialled, m) where `base` is null (out holds the base),
+// else out += m (dialled - base) -- the several-branch form. Audio's
+// stereo rows run their latents twice over: `cycle` repeats the groups
+// that many times (1 for video).
+void blend_dial_velocity(float* out, const float* base,
+                         const std::uint16_t* dialled_bf16, std::size_t rows,
+                         std::size_t width, const std::vector<float>& m,
+                         int cycle);
+
+// Whether two or more of `branches` run on one step: every branch is
+// live from step 0, so whether two have a weight that is not 0. The loop
+// then keeps the undialled velocity beside the step's (the several-
+// branch blend reads it); one branch blends in place.
+bool dial_branches_share_a_step(const std::vector<DialBranch>& branches);
+
 // What one denoise() holds on the HOST beside the forward, f32 over the
 // GENERATED rows it steps -- for a caller judging a clip against
 // physical RAM (generate-video hands it to its preflight as pageable
@@ -95,10 +132,14 @@ bool sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
 // step's previous x0, never both -- counted whatever the update, so on
 // an Euler run it is a bound by that state; MotionCache's residual when
 // `motion_cache`; a preview's clean estimate (video only) when
-// `preview`. Not the caller's `video` / `audio` buffers, which it owns.
-std::size_t denoise_host_bytes(const minimax_h3::PackedLayout& L,
-                               const MetalMiniMaxH3Transformer::Config& cfg,
-                               bool motion_cache, bool preview);
+// `preview`; the undialled velocity where `dials` share a step
+// (dial_branches_share_a_step). Not the caller's `video` / `audio`
+// buffers, which it owns.
+std::size_t
+denoise_host_bytes(const minimax_h3::PackedLayout& L,
+                   const MetalMiniMaxH3Transformer::Config& cfg,
+                   bool motion_cache, bool preview,
+                   const std::vector<DialBranch>* dials = nullptr);
 
 // What a denoise did, for a caller that wants to report or assert it.
 // `forwards` is the transformer calls that RAN; `reused` the steps
@@ -110,6 +151,8 @@ struct DenoiseReport {
   int  steps        = 0;
   int  forwards     = 0;
   int  reused       = 0;
+  // The extra forwards dial branches ran (DialBranch), beside `forwards`.
+  int  dial_forwards = 0;
   bool motion_cache = false;
   // The steps re-noised (an adapter's sampling contract, or asked for)
   // rather than stepped by Euler.
@@ -232,6 +275,13 @@ struct DenoiseRequest {
   // (shared/motion-cache.h), which decides per step whether to run the
   // forward at all. Borrowed; null reads as every default, i.e. off.
   const FlexData* accel = nullptr;
+  // DWD (MetalMiniMaxH3Transformer::dwd_slot): when set, the LAST
+  // step's forward also returns the video rows' features for the pixel
+  // head (Step::dwd_features), moved here -- [conditioning + generated
+  // video rows, hidden] bf16, the generated ones from
+  // `layout->num_condition_video_rows`. That step always runs its
+  // forward.
+  metal_compute::SharedBuffer* dwd_features = nullptr;
   // Filled when set.
   DenoiseReport* report = nullptr;
   double video_shift = 12.0;
@@ -252,6 +302,14 @@ struct DenoiseRequest {
   // Per-step progress. Return false to stop early; the state keeps
   // whatever steps have run.
   std::function<bool(int step, int total)> progress;
+  // The same in FORWARDS, after every one and after a reused step: a
+  // step counts one, plus one for each dial branch it ran. Equal to
+  // `progress` without dial branches. Return false to stop early.
+  std::function<bool(int done, int total)> forward_progress;
+
+  // Dials on time curves (DialBranch), blended in the first steps. The
+  // constant dials are the DiT's own (set_dials), on every forward.
+  std::vector<DialBranch> dial_branches;
 
   // A LATENT PREVIEW. After step `step` (1-based, of `total`) for which
   // `preview_due` says yes, `preview` gets the model's clean estimate

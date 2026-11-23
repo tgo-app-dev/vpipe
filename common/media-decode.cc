@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <utility>
 
@@ -604,7 +605,8 @@ decode_video_impl_(const FFmpegLibraries* libs,
                    const string&          path,
                    double                 max_seconds,
                    int                    audio_sample_rate,
-                   string*                error)
+                   string*                error,
+                   const std::function<bool(int, double)>* keep = nullptr)
 {
   if (!libs || !libs->valid()) {
     set_err_(error, "FFmpeg libraries unavailable");
@@ -658,7 +660,8 @@ decode_video_impl_(const FFmpegLibraries* libs,
   SwsPtr sws(nullptr, SwsDeleter{libs});
   int sw_w = 0, sw_h = 0, sw_fmt = -1;
 
-  // One decoded frame -> one planar [3,H,W] u8 plane appended to `rgb`.
+  // One decoded frame -> one planar [3,H,W] u8 plane appended to `rgb`
+  // (or, under `keep`, only a frame it asks for: `kept` its index).
   auto append_frame = [&](const AVFrame* f) -> bool {
     if (f->width <= 0 || f->height <= 0) {
       set_err_(error, "decoded frame has invalid dimensions");
@@ -699,11 +702,19 @@ decode_video_impl_(const FFmpegLibraries* libs,
         return false;
       }
     }
+    if (keep != nullptr && !(*keep)(out.num_frames, out.fps)) {
+      ++out.num_frames;   // decoded, not stored
+      return true;
+    }
     libs->swscale().api.scale(sws.get(), f->data, f->linesize, 0, H,
                               gbrp->data, gbrp->linesize);
     const size_t plane = static_cast<size_t>(3) * H * W;
-    out.rgb.resize(plane * static_cast<size_t>(out.num_frames + 1));
-    uint8_t* base = out.rgb.data() + plane * out.num_frames;
+    const size_t stored = keep != nullptr
+                              ? out.kept.size()
+                              : static_cast<size_t>(out.num_frames);
+    out.rgb.resize(plane * (stored + 1));
+    uint8_t* base = out.rgb.data() + plane * stored;
+    if (keep != nullptr) { out.kept.push_back(out.num_frames); }
     const int src_plane_for_channel[3] = {2, 0, 1};   // GBRP -> R,G,B
     for (int c = 0; c < 3; ++c) {
       const int      sp    = src_plane_for_channel[c];
@@ -1018,6 +1029,16 @@ decode_video_file(const FFmpegLibraries* libs,
 {
   return decode_video_impl_(libs, path, max_seconds, audio_sample_rate,
                             error);
+}
+
+optional<DecodedVideo>
+decode_video_frames(const FFmpegLibraries* libs, const string& path,
+                    double max_seconds, int audio_sample_rate,
+                    const std::function<bool(int, double)>& keep,
+                    string* error)
+{
+  return decode_video_impl_(libs, path, max_seconds, audio_sample_rate,
+                            error, &keep);
 }
 
 }

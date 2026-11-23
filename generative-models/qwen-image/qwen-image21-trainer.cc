@@ -928,6 +928,12 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
       enc.set_buffer(12, V.mlm, mo); enc.set_buffer(13, V.mls, mo);
       enc.dispatch({(unsigned)(32 * p.NQ), (unsigned)(4 * NH), 1},
                    {32, 4, 1});
+      // The meter: the recompute is work the GPU does again, as its
+      // GEMMs (lin_ tallies them) are -- the forward's own pairs.
+      m._flops.attention(NH,
+                         sg.causal ? causal_pairs(sg.qL, sg.qL_off)
+                                   : (long long)sg.qL * sg.kL,
+                         Hd);
     }
     transpose(V.ao, V.af, NH, ROWS);
     mark("re.attn");
@@ -1119,9 +1125,25 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
     }
 
     mark("bw.elt");
+    // The meter (perf-flops): this block's backward -- the GEMMs lin_
+    // tallied (a recomputed forward's too) and the attention's backward,
+    // FIVE matmul units against the forward's two (S again from the
+    // exported statistics, dP = dO V^T, dV = P^T dO, dQ = dS K, dK =
+    // dS^T Q): 2.5x its forward, FlashAttention-2's count. The fused
+    // form runs seven (S and dP twice); the op is counted once, whatever
+    // route runs it. Credited as its buffer retires; the head's backward
+    // rides on block NL-1's. Unflushed, the tally was dropped by the
+    // next forward's begin(): a training step read at a third of its
+    // rate.
+    for (const train::AttnSegment& sg : segs) {
+      const long long pairs = sg.causal ? causal_pairs(sg.qL, sg.qL_off)
+                                        : (long long)sg.qL * sg.kL;
+      m._flops.add(attention_flops(NH, pairs, Hd) / 2 * 5);
+    }
     // Streamed: the next block down is read under this one's GPU work,
     // into the slot this block is not using.
     enc.end();
+    m._flops.flush(st);
     CommandStream::Fence fence = st.commit();
     if (!held && L > 0) {
       const bool nh = (L - 1) < (int)m._blocks.size() &&

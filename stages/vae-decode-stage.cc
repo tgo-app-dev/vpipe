@@ -1,6 +1,9 @@
 #include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/shared/accel-settings.h"
 #include "stages/vae-decode-stage.h"
+
+#include "apple-silicon/metal-compute/tensor-beat-bridge.h"
+#include "stages/generate-video-stage.h"
 #include "stages/color-fix.h"
 #include "common/host-report.h"
 #include "common/flex-bag.h"
@@ -557,6 +560,22 @@ VaeDecodeStage::declare_resources() const
   // leave the condition and the denoise free of a VAE that is there --
   // and a peer that lets the same checkpoint go after the condition
   // (video-ref-encoder) would then have it counted in neither.
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // DWD (pi-H3): the latents are a DiT's features, decoded by its
+  // adapter's pixel head -- the VAE is never loaded, so not claimed. The
+  // head's weights are read from the adapter's file, whose own claim is
+  // generate-video's (its LoRA and overwrites, held privately, the
+  // denoise's under `always`): they are booked as this stage's decode-
+  // phase arena, so they count where they are held and nowhere else.
+  // Its working set and the clip are generate-video's "vae-decode" arena,
+  // the features its payload.
+  if (const std::string head = planned_dwd_head_(); !head.empty()) {
+    return model_memory::scratch_claims(
+        dwd_head_label_(),
+        genai::MetalMiniMaxH3FastVae::weight_bytes(head, fast_i8_tier_()),
+        model_memory::kPhaseDecode);
+  }
+#endif
   const std::string vdir = vae_dir_for_release_();
   const bool waits = iport_edges().size() > kModelPort &&
                      iport_edges()[kModelPort].v != nullptr;
@@ -630,6 +649,24 @@ std::string
 VaeDecodeStage::ane_claim_label_() const
 {
   return "ane-ffn/" + std::string(this->id());
+}
+
+std::string
+VaeDecodeStage::dwd_head_label_() const
+{
+  return "dwd-head:" + std::string(this->id());
+}
+
+std::string
+VaeDecodeStage::planned_dwd_head_() const
+{
+  // The stage feeding the latent port, asked directly: the only producer
+  // of DWD features is generate-video, and nothing else can know them
+  // before a beat arrives.
+  if (iport_edges().empty()) { return {}; }
+  const auto* gv =
+      dynamic_cast<const GenerateVideoStage*>(iport_edges()[0].v);
+  return gv != nullptr ? gv->planned_dwd_head() : std::string();
 }
 
 Job
@@ -792,6 +829,16 @@ VaeDecodeStage::declare_memory() const
   // narrowed.
   std::size_t held = 0;
 #ifdef VPIPE_BUILD_APPLE_SILICON
+  // DWD: the adapter's pixel head, and no VAE (see declare_resources).
+  // Named apart from its file: generate-video holds the FILE (the DiT's
+  // adapter), and holdings of one source merge at the larger -- the head
+  // is other bytes, held by this stage alone.
+  if (const std::string head = planned_dwd_head_(); !head.empty()) {
+    m.hold(head + "#" + genai::MetalMiniMaxH3FastVae::kDwdPrefix,
+           genai::MetalMiniMaxH3FastVae::weight_bytes(head, fast_i8_tier_()),
+           0, /*releases=*/true);
+    return m;
+  }
   if (!fast_decoder_file_().empty()) {
     held = genai::MetalMiniMaxH3FastVae::weight_bytes(vae_dir,
                                                       fast_i8_tier_());
@@ -962,7 +1009,7 @@ VaeDecodeStage::unload_vae_()
   // never unloaded a Wan VAE at all: with only _wan_vae held every
   // tested pointer was null and this returned early.
   if (!_vae && !_flux2_vae && !_wan_vae && !_h3_vae && !_h3_fast &&
-      !_plugin_dec && !_tiny) {
+      !_h3_dwd && !_plugin_dec && !_tiny) {
     return;
   }
   // SETTLED when the policy is `auto`. The manager owns the checkpoint,
@@ -976,6 +1023,19 @@ VaeDecodeStage::unload_vae_()
   _wan_vae.reset();
   _h3_vae.reset();
   _h3_fast.reset();
+  // A DWD head's buffers are its own (its set, the adapter file's,
+  // caches nothing); the set it read from is settled as the VAE's.
+  if (_h3_dwd) {
+    _h3_dwd.reset();
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+        mgr->drop_weights(_h3_dwd_file);
+      } else {
+        mgr->pool_weights(_h3_dwd_file);
+      }
+    }
+    _h3_dwd_file.clear();
+  }
   _plugin_dec.reset();
   // The tiny decoder's MemBlock memories are its scratch: an open stream
   // keeps it, and it goes with the stream's last beat.
@@ -1012,6 +1072,53 @@ VaeDecodeStage::reload_vae_()
   _unloaded = false;
   _load_attempted = false;      // let ensure_loaded_ run its body again
   ensure_loaded_();
+}
+
+bool
+VaeDecodeStage::ensure_h3_dwd_(const std::string& file)
+{
+  if (_h3_dwd && _h3_dwd_file == file) { return true; }
+  _h3_dwd.reset();
+  _h3_dwd_file.clear();
+  auto* mc = session()->services()->metal_compute();
+  std::shared_ptr<genai::WeightSet> ws =
+      file.empty() ? nullptr : genai::open_weight_set(file, session());
+  genai::MetalMiniMaxH3FastVae::Config fcfg;
+  std::string ferr;
+  if (!ws || !genai::MetalMiniMaxH3FastVae::config_from_dwd(*ws, &fcfg,
+                                                            &ferr)) {
+    session()->warn(fmt(
+        "VaeDecodeStage('{}'): the DWD beat names '{}', which holds no pixel "
+        "head ({}); skipping", this->id(), file,
+        ferr.empty() ? std::string("unreadable") : ferr));
+    return false;
+  }
+  // The fast decoder's tiers: the stage's i8 tier and tuning (its ANE
+  // share is the released decoders' grant, not this head's).
+  fcfg.i8_tier = fast_i8_tier_();
+  fcfg.autotune = _autotune;
+  const auto t0 = std::chrono::steady_clock::now();
+  _h3_dwd = genai::MetalMiniMaxH3FastVae::load(ws, mc, fcfg, &ferr);
+  if (!_h3_dwd) {
+    session()->warn(fmt("VaeDecodeStage('{}'): the DWD pixel head in '{}' did "
+                        "not load ({}); skipping", this->id(), file, ferr));
+    return false;
+  }
+  _h3_dwd_file = file;
+  // What it holds, at the tier that engaged.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(dwd_head_label_(), _h3_dwd->weight_bytes());
+  }
+  load_note_(fmt(
+      "VaeDecodeStage('{}'): DWD pixel head from '{}' in {:.1f} s -- {} "
+      "layers over {}-wide features, {} MB held; GEMMs {}, attention {}",
+      this->id(), file,
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count(),
+      fcfg.n_layers, fcfg.feature_dim, _h3_dwd->weight_bytes() >> 20,
+      _h3_dwd->matrix_cores() ? "matmul2d" : "steel",
+      _h3_dwd->nax_attention() ? "matrix-core flash" : "steel flash"));
+  return true;
 }
 
 bool
@@ -1355,6 +1462,12 @@ VaeDecodeStage::ensure_loaded_()
     return;
   }
 
+  // A DWD beat decodes with its adapter's pixel head: no VAE weights
+  // until a latent asks for them.
+  if (_family == "minimax-h3" && _want_dwd) {
+    _h3_deferred = true;
+    return;
+  }
   if (_family == "minimax-h3" && !_fast_decoder.empty()) {
     // THE FAST DECODER: its own weights, the released VAE's config (the
     // latent statistics) and nothing else of it.
@@ -2245,23 +2358,37 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   // A latent its model's TINY decoder decodes needs no VAE weights: read
   // its ask before anything loads, so they wait for a latent that does.
   _want_tiny = false;
+  _want_dwd = false;
   if (const auto* lt = dynamic_cast<const TensorBeatPayload*>(in.get());
       lt != nullptr && lt->sideband.is_object()) {
     FlexData sb = lt->sideband;          // as_object() is a view: keep it
     auto o = sb.as_object();
     _want_tiny = o.contains(sideband::kDecoder) &&
                  o.at(sideband::kDecoder).as_string() == "tiny";
+    _want_dwd = o.contains(sideband::kDwdHead) &&
+                !o.at(sideband::kDwdHead).as_string("").empty();
   }
   // NOW there is work for it. First latent => first load (the model-select
   // branch above deliberately only recorded the directory); a later one =>
   // reload if a previous beat dropped the VAE to leave the denoise room.
   ensure_loaded_();
-  if (_unloaded) { reload_vae_(); }
+  // A latent after DWD beats loads the VAE they deferred.
+  if (_h3_deferred && !_want_dwd) {
+    _h3_deferred = false;
+    _load_attempted = false;
+    ensure_loaded_();
+  }
+  if (_unloaded && !_want_dwd) { reload_vae_(); }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
   // A video latent carries a time axis, so the wan family arrives 4-D
-  // ([z, T, H/8, W/8]) where every image VAE here is 3-D.
-  if (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32 ||
-      (tbp->shape.size() != 3 && tbp->shape.size() != 4)) {
+  // ([z, T, H/8, W/8]) where every image VAE here is 3-D. A DWD beat is
+  // a DiT's features, bf16 [rows, hidden].
+  const bool dwd_beat = _want_dwd && tbp != nullptr &&
+                        tbp->dtype == TensorBeat::DType::Bf16 &&
+                        tbp->shape.size() == 2;
+  if (!dwd_beat &&
+      (tbp == nullptr || tbp->dtype != TensorBeat::DType::F32 ||
+       (tbp->shape.size() != 3 && tbp->shape.size() != 4))) {
     session()->warn(fmt(
         "VaeDecodeStage('{}'): expected an f32 [z,H/8,W/8] latent TensorBeat "
         "(or [z,T,H/8,W/8] for a video VAE), got {}; skipping", this->id(),
@@ -2418,13 +2545,52 @@ VaeDecodeStage::process(RuntimeContext& ctx)
   // ---- Wan video VAE: input [z_dim, T, h8, w8]; decode to
   // ---- MiniMax-H3: a ViT decoder over a 16x-compressed latent --------
   if (_family == "minimax-h3") {
-    if (!_h3_vae && !_h3_fast) {
+    // DWD: a DiT's features, decoded by the pixel head of the adapter the
+    // beat names (pi-H3), loaded at the first beat that names it.
+    int dwd_T = 0, dwd_h2 = 0, dwd_w2 = 0;
+    std::int64_t dwd_row0 = 0;
+    if (dwd_beat) {
+      FlexData sb = tbp->sideband;        // as_object() is a view: keep it
+      auto o = sb.as_object();
+      const std::string file(o.at(sideband::kDwdHead).as_string(""));
+      if (o.contains(sideband::kDwdGrid) &&
+          o.at(sideband::kDwdGrid).is_array()) {
+        FlexData g = o.at(sideband::kDwdGrid);
+        auto ga = g.as_array();
+        if (ga.size() == 3) {
+          dwd_T = (int)ga[0].as_int(0);
+          dwd_h2 = (int)ga[1].as_int(0);
+          dwd_w2 = (int)ga[2].as_int(0);
+        }
+      }
+      if (o.contains(sideband::kDwdRow0)) {
+        dwd_row0 = o.at(sideband::kDwdRow0).as_int(0);
+      }
+      if (!ensure_h3_dwd_(file)) { co_return; }
+      const std::int64_t need_rows =
+          dwd_row0 + (std::int64_t)dwd_T * dwd_h2 * dwd_w2;
+      if (dwd_T <= 0 || dwd_h2 <= 0 || dwd_w2 <= 0 || dwd_row0 < 0 ||
+          tbp->shape[1] != _h3_dwd->config().feature_dim ||
+          tbp->shape[0] < need_rows) {
+        session()->warn(fmt(
+            "VaeDecodeStage('{}'): DWD features [{}, {}] do not hold a [{}, "
+            "{}, {}] grid of {}-wide tokens from row {}; skipping",
+            this->id(), tbp->shape[0], tbp->shape[1], dwd_T, dwd_h2, dwd_w2,
+            _h3_dwd->config().feature_dim, dwd_row0));
+        co_return;
+      }
+    }
+    // The decoder this beat runs: the DWD head, the fast decoder, or (null
+    // here) the released VAE.
+    genai::MetalMiniMaxH3FastVae* const fastd =
+        dwd_beat ? _h3_dwd.get() : _h3_fast.get();
+    if (!_h3_vae && !fastd) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): MiniMax-H3 VAE not loaded; skipping",
           this->id()));
       co_return;
     }
-    if (tbp->shape.size() != 4) {
+    if (!dwd_beat && tbp->shape.size() != 4) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): the MiniMax-H3 VAE decodes a VIDEO latent "
           "[z, T, H/16, W/16]; got a {}-D tensor. Skipping", this->id(),
@@ -2433,16 +2599,16 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     }
     // The geometry from whichever decoder is loaded: the fast one takes
     // the released VAE's.
-    const int vz = _h3_fast ? _h3_fast->config().z_channels
+    const int vz = fastd ? fastd->config().z_channels
                             : _h3_vae->config().z_channels;
-    const int vp = _h3_fast ? _h3_fast->config().patch
+    const int vp = fastd ? fastd->config().patch
                             : _h3_vae->config().patch;
-    const int vpt = _h3_fast ? _h3_fast->config().patch_t
+    const int vpt = fastd ? fastd->config().patch_t
                              : _h3_vae->config().patch_t;
-    const int Cz = (int)tbp->shape[0];
-    const int LT = (int)tbp->shape[1];
-    const int lh = (int)tbp->shape[2];
-    const int lw = (int)tbp->shape[3];
+    const int Cz = dwd_beat ? vz : (int)tbp->shape[0];
+    const int LT = dwd_beat ? dwd_T : (int)tbp->shape[1];
+    const int lh = dwd_beat ? 2 * dwd_h2 : (int)tbp->shape[2];
+    const int lw = dwd_beat ? 2 * dwd_w2 : (int)tbp->shape[3];
     if (Cz != vz || LT <= 0 || lh <= 0 || lw <= 0) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): latent [{}, {}, {}, {}] does not match "
@@ -2467,7 +2633,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // with its encoder in the graph came back at the canvas, 2048^2 for
     // 1024^2.
     const bool h3_image_2d = _h3_vae && _h3_vae->config().rope_axes == 2;
-    if (one_frame && _h3_fast) {
+    if (one_frame && fastd) {
       session()->warn(fmt(
           "VaeDecodeStage('{}'): this is a single-frame latent (a picture), "
           "and the fast decoder decodes clips; unset fast_decoder for it. "
@@ -2501,7 +2667,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
     // The fast decoder takes the whitened f32 latent as it is: it folds
     // the un-whitening into its embedding.
     metal_compute::SharedBuffer z;
-    if (!_h3_fast) {
+    if (!fastd) {
       z = mc->make_shared_buffer(nz * 2);
       if (z.empty()) { co_return; }
       const auto& vc = _h3_vae->config();
@@ -2543,7 +2709,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // rather than preflighting an allocation of nothing.
       const std::size_t out_frames =
           one_frame ? 1u
-          : _h3_fast ? (std::size_t)_h3_fast->decoded_frames(LT)
+          : fastd ? (std::size_t)fastd->decoded_frames(LT)
                      : (std::size_t)_h3_vae->decoded_frames(LT);
       const std::size_t px = (std::size_t)(lh * vp) *
                              (std::size_t)(lw * vp) * out_frames;
@@ -2560,9 +2726,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // frame-only decoder (P-H3-Image's) is always that, and it is the
       // figure generate-video's plan booked for it.
       const bool image_only =
-          !_h3_fast && !_h3_vae->config().decodes_video();
+          !fastd && !_h3_vae->config().decodes_video();
       const std::size_t need =
-          (_h3_fast ? _h3_fast->scratch_bytes(LT, lh, lw)
+          (fastd ? fastd->scratch_bytes(LT, lh, lw)
            : (image_only || one_frame)
                ? genai::MetalMiniMaxH3VideoVae::still_decode_bytes(
                      _h3_vae->config(), lh, lw)
@@ -2594,6 +2760,8 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // acquire one. Revising here is what makes the ledger describe
       // this clip rather than a guess about clips in general, and it is
       // the same declare-then-revise the streaming DiTs use for weights.
+      // (A DWD beat's features are generate-video's payload claim, and
+      // the head's weights this stage's own: neither is in the arena.)
       revise_decode_arena_(need);
 
       auto* mcb = session()->services()->metal_compute();
@@ -2690,7 +2858,7 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // the only unit the decode passes through often enough to be worth
       // reporting, and it is what the bar counts.
       UiProgress bar = session()->open_progress("vae decode");
-      if (_h3_fast) {
+      if (fastd) {
         if (tp_split_asked_()) {
           session()->warn(fmt("VaeDecodeStage('{}'): tensor_parallel: the "
                               "fast decoder decodes a clip whole -- the "
@@ -2699,14 +2867,26 @@ VaeDecodeStage::process(RuntimeContext& ctx)
         }
         // A layer at a time over the whole clip; a stop lands between
         // layers (each commits and waits).
-        _h3_fast->set_progress([&bar](int done, int total) {
+        fastd->set_progress([&bar](int done, int total) {
           bar.update((std::uint64_t)done, (std::uint64_t)total);
         });
-        _h3_fast->set_stop([&ctx]() { return ctx.stop_requested(); });
-        rgb = _h3_fast->decode(tbp->as_f32(), LT, lh, lw, &derr);
-        F = rgb.empty() ? 0 : _h3_fast->decoded_frames(LT);
-        _h3_fast->set_progress(nullptr);
-        _h3_fast->set_stop(nullptr);
+        fastd->set_stop([&ctx]() { return ctx.stop_requested(); });
+        if (dwd_beat) {
+          // Read where they lie: the beat's buffer is the DiT's own.
+          const metal_compute::SharedBuffer fb =
+              metal_compute::from_tensor_beat(*mc, *tbp);
+          rgb = fastd->decode_features(fb, (std::size_t)dwd_row0, dwd_T,
+                                       dwd_h2, dwd_w2, &derr);
+        } else {
+          rgb = fastd->decode(tbp->as_f32(), LT, lh, lw, &derr);
+        }
+        F = rgb.empty() ? 0 : fastd->decoded_frames(LT);
+        fastd->set_progress(nullptr);
+        fastd->set_stop(nullptr);
+        // Its working set given back (the output is its own buffer): the
+        // plan books it in the decode alone, and a model kept for the
+        // next clip would hold it through that clip's denoise.
+        fastd->release_scratch();
       } else {
         _h3_vae->set_tile_progress([&bar](int done, int total) {
           bar.update((std::uint64_t)(done < 0 ? 0 : done),
@@ -2739,9 +2919,9 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       // module's bytes when the tier armed, 0 when it declined. Both ways,
       // every clip, so the ledger follows a reload that arms after one that
       // did not.
-      const bool tried = _h3_fast ? _h3_fast->ane_attempted()
+      const bool tried = fastd ? fastd->ane_attempted()
                                   : _h3_vae->ane_attempted();
-      const bool armed = _h3_fast ? _h3_fast->ane_armed()
+      const bool armed = fastd ? fastd->ane_armed()
                                   : _h3_vae->ane_armed();
       if (tried) {
         if (!armed) { _ane_bytes = 0; }

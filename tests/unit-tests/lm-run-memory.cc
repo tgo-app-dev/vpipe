@@ -360,3 +360,73 @@ TEST(lm_run_memory, the_cache_is_at_most_what_the_host_asks)
   EXPECT_TRUE(mgr->planned_weight_bytes(dir) == rest + ex / 2);
   mgr->clear_declarations();
 }
+
+// A stack's route, read off the checkpoint before it loads
+// (MetalQwenModel::dense_checkpoint, the loader's probe): a bf16 stack
+// reads dense, an MLX pack does not -- and a dense stack books no dequant
+// scratch but the band tuner's probe (its q|k|v weight) on matrix cores
+// past kMmaBand rows, where a quantized one books its widest unpacked
+// projection. minimax_h3_text_enc.a_request_allocates_what_it_books
+// holds the dense figure to a real prefill (MiniMax-H3's encoder, past
+// the band line too). Env: VPIPE_QWEN_DENSE_TEST_MODEL_PATH (a bf16
+// Qwen-path stack, an LM or an encoder) and / or
+// VPIPE_QWEN35_TEST_MODEL_PATH (an MLX pack); configs and headers only.
+TEST(lm_run_memory, a_dense_stack_books_no_dequant_scratch)
+{
+  bool ran = false;
+  for (const char* e : {"VPIPE_QWEN_DENSE_TEST_MODEL_PATH",
+                        "VPIPE_QWEN35_TEST_MODEL_PATH"}) {
+    const std::string dir = env_(e);
+    if (dir.empty()) { continue; }
+    const bool want_dense =
+        std::string(e) == "VPIPE_QWEN_DENSE_TEST_MODEL_PATH";
+    ModelLoader loader(nullptr);
+    const auto mc = loader.load_config(dir);
+    ASSERT_TRUE(mc.has_value());
+    if (!mc.has_value()) { continue; }
+    MetalQwenModel::Config c = MetalQwenModel::config_from(*mc);
+    auto wts = MetalLlamaWeights::open_model(dir);
+    ASSERT_TRUE(wts.has_value());
+    if (!wts.has_value()) { continue; }
+    bool dense = false, found = false;
+    for (const std::string& stem :
+         {c.weight_prefix + c.model_seg, std::string("model.language_model."),
+          std::string("model."), std::string("language_model.")}) {
+      if (wts->has(stem + "layers.0.mlp.down_proj.weight")) {
+        dense = MetalQwenModel::dense_checkpoint(*wts, stem + "layers.");
+        found = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(found);
+    for (const bool cores : {false, true}) {
+      const std::size_t probe = ((c.attn_output_gate ? 2 : 1) *
+                                     (std::size_t)c.qd() +
+                                 2 * (std::size_t)c.kd()) *
+                                (std::size_t)c.hidden * 2;
+      const std::size_t lo_d = MetalQwenModel::run_bytes(
+          c, 2048, 1, true, true, cores, 0, true);
+      const std::size_t lo_q = MetalQwenModel::run_bytes(
+          c, 2048, 1, true, true, cores, 0, false);
+      const std::size_t hi_d = MetalQwenModel::run_bytes(
+          c, 8192, 1, true, true, cores, 0, true);
+      const std::size_t hi_q = MetalQwenModel::run_bytes(
+          c, 8192, 1, true, true, cores, 0, false);
+      std::printf("[lm-run] %s: %s%s; one pass, dense / quantized: 2048 "
+                  "rows %.1f / %.1f MB, 8192 rows %.1f / %.1f MB\n",
+                  dir.c_str(), dense ? "dense" : "packed",
+                  cores ? " (matrix cores)" : "", lo_d / 1048576.0,
+                  lo_q / 1048576.0, hi_d / 1048576.0, hi_q / 1048576.0);
+      // Below the band line a dense stack books no scratch at all; past
+      // it, on matrix cores, exactly the probe's weight comes back.
+      EXPECT_TRUE(lo_d < lo_q && hi_d < hi_q);
+      EXPECT_TRUE((hi_q - hi_d) + (cores ? probe : 0) == (lo_q - lo_d));
+    }
+    EXPECT_TRUE(dense == want_dense);
+    ran = true;
+  }
+  if (!ran) {
+    std::printf("  SKIP: VPIPE_QWEN_DENSE_TEST_MODEL_PATH / "
+                "VPIPE_QWEN35_TEST_MODEL_PATH unset\n");
+  }
+}

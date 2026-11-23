@@ -46,6 +46,10 @@ struct ModuleShape {
   std::string name;   // the module path, e.g. "transformer_blocks.3.attn.to_q"
   int n = 0;
   int k = 0;
+  // Optional: where B's rows live (Module::b_rows), RELATIVE to this
+  // module's own place in the arena -- negative for a module of a fused
+  // group whose rows interleave with the ones before it. Empty: in order.
+  std::vector<int> b_rows;
 };
 
 class LoraParams {
@@ -57,6 +61,15 @@ class LoraParams {
     std::size_t a_off = 0;   // elements into the A arenas
     std::size_t b_off = 0;   // elements into the B arenas
     lora::Factors live;      // shadow subviews, bound into the model
+    // WHERE B's ROWS LIVE, when not at b_off in file order: row i of the
+    // file's B [n, rank] is row b_rows[i] of the B arena (rank-wide rows
+    // from the arena's start). A family whose forward fuses modules --
+    // MiniMax-H3's q|k|v, one banded B in the base's row order, and its
+    // fc1, whose diffusers spelling swaps the halves -- keeps the arena in
+    // the FORWARD's order and maps the file's rows here; save() and load()
+    // read through it, nothing else does (the optimizer is elementwise).
+    // Empty: b_off, in order. `live` is not meaningful for such a module.
+    std::vector<int> b_rows;
   };
 
   // Allocate every arena for `mods` at `rank`. Masters are zero and the

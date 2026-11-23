@@ -287,6 +287,72 @@ kernel void h3fv_embed_f32(
   x[(long)r * D + d] = acc;
 }
 
+// pi-H3's DWD head (Lakonik/pi-H3): its input is the DiT's last-step
+// features through `feature_expand` -- a DiT token (t, i, j), 2 x 2 latent
+// cells, expanded to e_h * e_w Sol tokens of D each, its columns (a, b, d)
+// a-major (the reference's view(t, h, w, e_h, e_w, D).permute to
+// (t, h, e_h, w, e_w)) -- into the f32 stream at Sol token
+// (t, 2 i + a, 2 j + b), the stream's raster order.
+//   0:g [n, 4 D] (the GEMM's rows, its bias in) 1:x(f32) [rows, D]
+//   2:tok0 (DiT token) 3:n 4:h2 5:w2 6:D     grid {D, 4, n}
+kernel void h3fv_expand_f32(
+    const device VPIPE_ELT* g    [[buffer(0)]],
+    device float*           x    [[buffer(1)]],
+    constant int&           tok0 [[buffer(2)]],
+    constant int&           n    [[buffer(3)]],
+    constant int&           h2   [[buffer(4)]],
+    constant int&           w2   [[buffer(5)]],
+    constant int&           D    [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x, c = (int)gid.y, r = (int)gid.z;
+  if (d >= D || c >= 4 || r >= n) { return; }
+  const int tok = tok0 + r;
+  const int t = tok / (h2 * w2);
+  const int rem = tok - t * h2 * w2;
+  const int i = rem / w2, j = rem - (rem / w2) * w2;
+  const int a = c >> 1, b = c & 1;
+  const long row = ((long)t * (2 * h2) + 2 * i + a) * (long)(2 * w2) +
+                   2 * j + b;
+  x[row * D + d] = float(g[(long)r * 4 * D + (long)c * D + d]);
+}
+
+// DWD's FIRST-FRAME head: a native block's first latent decodes to ONE
+// frame, from its own projection g1 [n, 3 * 256] (channel, py, px) and
+// bias -- the frame h3fv_unpatch_f16 wrote there from the 4-frame head
+// (its last, the one kept after the trim) overwritten. pt - trim == 1.
+//   0:g1 1:bias1(f32) 2:out 3:tok0 4:n 5:H 6:W 7:F 8:tb 9:trim 10:pt
+//   grid {3 * 256, n}
+kernel void h3fv_unpatch_first_f16(
+    const device VPIPE_ELT* g1    [[buffer(0)]],
+    const device float*     bias1 [[buffer(1)]],
+    device VPIPE_ELT*       out   [[buffer(2)]],
+    constant int&           tok0  [[buffer(3)]],
+    constant int&           n     [[buffer(4)]],
+    constant int&           H     [[buffer(5)]],
+    constant int&           W     [[buffer(6)]],
+    constant int&           F     [[buffer(7)]],
+    constant int&           tb    [[buffer(8)]],
+    constant int&           trim  [[buffer(9)]],
+    constant int&           pt    [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int e = (int)gid.x, r = (int)gid.y;
+  if (r >= n || e >= 3 * 256) { return; }
+  const int tok = tok0 + r;
+  const int t = tok / (H * W);
+  if (t % tb != 0) { return; }
+  const int rem = tok - t * H * W;
+  const int y = rem / W, x = rem - (rem / W) * W;
+  const int oc = e / 256;
+  const int py = (e / 16) % 16, px = e % 16;
+  const int fo = t * pt + trim - trim * (t / tb + 1);
+  const long W16 = (long)W * 16, H16 = (long)H * 16;
+  const long o = (((long)oc * F + fo) * H16 + (long)y * 16 + py) * W16 +
+                 (long)x * 16 + px;
+  out[o] = VPIPE_ELT(float(g1[(long)r * 768 + e]) + bias1[e]);
+}
+
 // One threadgroup (256 threads) a row of the f32 stream, into the element
 // type: RMSNorm with a weight (`ln` 0), or LayerNorm with a weight and a
 // bias (`ln` 1). D a multiple of 256.
@@ -528,4 +594,52 @@ kernel void h3fv_unpatch_f16(
   const long o = (((long)oc * F + fo) * H16 + (long)y * 16 + py) * W16 +
                  (long)x * 16 + px;
   out[o] = VPIPE_ELT(float(g[(long)r * PE + e]) + bias[e]);
+}
+
+// PRUNE AT LOAD (the DiT's Config::prune_adaln): a RELEASED AdaLN
+// projection W [D, K] (+ b [D]) onto the time embedding's own principal
+// curve, silu(temb(t)) ~ U c(t) + m with U [K, 8] orthonormal --
+//   wp[j, i] = sum_k W[j, k] U[k, i],   bp[j] = b[j] + sum_k W[j, k] m[k]
+// -- every sum in f32, the result f32: what h3_adaln_pruned_f16 then reads
+// as a pruned file's [D, 8] projection (wdt 0). One simdgroup a row, eight
+// rows a threadgroup of 256; run once a block, at load.
+//   0:W [D, K] 1:b [D] 2:U [K, 8] 3:m [K] 4:wp [D, 8] 5:bp [D] 6:D 7:K
+//   8:has_b   grid {256 * ceil(D / 8)}, threadgroups of 256
+kernel void h3_adaln_prune_f32(
+    const device VPIPE_ELT* W  [[buffer(0)]],
+    const device VPIPE_ELT* b  [[buffer(1)]],
+    const device float*     U  [[buffer(2)]],
+    const device float*     m  [[buffer(3)]],
+    device float*           wp [[buffer(4)]],
+    device float*           bp [[buffer(5)]],
+    constant int&           D  [[buffer(6)]],
+    constant int&           K  [[buffer(7)]],
+    constant int&       has_b  [[buffer(8)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const int j = (int)(tg * 8u + sg);
+  if (j >= D) { return; }
+  const device VPIPE_ELT* w = W + (long)j * K;
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f,
+        a6 = 0.0f, a7 = 0.0f, am = 0.0f;
+  for (int k = (int)lane; k < K; k += 32) {
+    const float v = float(w[k]);
+    const device float* u = U + (long)k * 8;
+    a0 = fma(v, u[0], a0); a1 = fma(v, u[1], a1);
+    a2 = fma(v, u[2], a2); a3 = fma(v, u[3], a3);
+    a4 = fma(v, u[4], a4); a5 = fma(v, u[5], a5);
+    a6 = fma(v, u[6], a6); a7 = fma(v, u[7], a7);
+    am = fma(v, m[k], am);
+  }
+  a0 = simd_sum(a0); a1 = simd_sum(a1); a2 = simd_sum(a2);
+  a3 = simd_sum(a3); a4 = simd_sum(a4); a5 = simd_sum(a5);
+  a6 = simd_sum(a6); a7 = simd_sum(a7); am = simd_sum(am);
+  if (lane == 0) {
+    device float* o = wp + (long)j * 8;
+    o[0] = a0; o[1] = a1; o[2] = a2; o[3] = a3;
+    o[4] = a4; o[5] = a5; o[6] = a6; o[7] = a7;
+    bp[j] = am + (has_b != 0 ? float(b[j]) : 0.0f);
+  }
 }

@@ -834,7 +834,8 @@ MetalQwenModel::handshake_bytes(const Config& c)
 std::size_t
 MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
                           int contexts, bool one_pass, bool plain_mlp,
-                          bool matrix_cores, std::int64_t prompt_rows)
+                          bool matrix_cores, std::int64_t prompt_rows,
+                          bool dense)
 {
   const std::size_t ctxs = (std::size_t)std::max(contexts, 1);
   // a context's recurrent state: every linear layer's conv tail (f16) and
@@ -900,10 +901,25 @@ MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
       e4 += 3 * E + tiles + 1 + 2 * npad + (steel ? tiles : 0);
     }
   }
-  // the dequantized weight a GEMM of many rows reads (the matrix-core
-  // route's every projection; a dense, mixed or k-quant model's fused ones)
-  if (plain_mlp || matrix_cores) {
+  // the dequantized weight a GEMM of many rows reads, by the stack's
+  // route. A k-quant or mixed stack unpacks every projection on any GPU
+  // (kqmm_ / aqmm_ / the fused dequants): its fused q|k|v and GDN
+  // in-projection, and each MLP projection alone; an affine one on
+  // matrix cores, its gate|up fused. A DENSE stack reads its weights
+  // where they lie (dense_gemm_): only the band tuner's probe borrows the
+  // scratch, its q|k|v weight, on matrix cores past kMmaBand rows.
+  // MEASURED (MiniMax-H3's bf16 encoder, a 24-token prompt): 8 MB grown,
+  // the whole booking 227 -> 47 MB on the M4 Pro and 550 -> 50 on the M5
+  // Ultra once the stack's route was asked rather than assumed quantized.
+  if (dense) {
+    if (matrix_cores && n > (std::size_t)kMmaBand) {
+      e2 += ((c.attn_output_gate ? 2 : 1) * qd + 2 * kd) * H;
+    }
+  } else if (plain_mlp || matrix_cores) {
     std::size_t wdeq = std::max(Nfq, Nf) * H;
+    // kqmm_ / aqmm_ take an MLP projection whole: [ffn, H] (gate, up)
+    // and [H, ffn] (down) -- wider than the fused q|k|v on most shapes.
+    if (plain_mlp && !c.is_moe()) { wdeq = std::max(wdeq, ffn * H); }
     if (matrix_cores && !c.is_moe()) { wdeq = std::max(wdeq, 2 * ffn * H); }
     e2 += wdeq;
   }
@@ -951,6 +967,28 @@ MetalQwenModel::run_bytes(const Config& c, std::int64_t kv_tokens,
     b += (std::size_t)MtpHead::kCtxTokens * c.n_kv_heads * D * 2 * 2;
   }
   return b + xhs + ctxs * state * (1 + ring);
+}
+
+bool
+MetalQwenModel::dense_checkpoint(const MetalLlamaWeights& wts,
+                                 const std::string& layers_stem)
+{
+  // load()'s dense probe (one layer stands for the stack: every layer of
+  // a dense checkpoint is dense), on plain float weights only -- a
+  // k-quant or NVFP4 `.weight` has no `.scales` either, and the loader
+  // tells those apart by dtype before it asks.
+  auto plain = [&](const std::string& name) {
+    const auto* wi = wts.info(name);
+    return wi != nullptr && (wi->dtype == "BF16" || wi->dtype == "F16" ||
+                             wi->dtype == "F32");
+  };
+  const std::string base = layers_stem + "0.";
+  const std::string dp = base + "mlp.down_proj";
+  if (wts.has(dp + ".weight") || wts.has(dp + ".scales")) {
+    return plain(dp + ".weight") && !wts.has(dp + ".scales");
+  }
+  const std::string ep = base + "mlp.experts.down_proj";
+  return plain(ep) && !wts.has(ep + ".scales");
 }
 
 void

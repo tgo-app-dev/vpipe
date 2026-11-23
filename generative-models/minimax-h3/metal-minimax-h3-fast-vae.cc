@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <string>
 #include <utility>
@@ -171,6 +172,21 @@ MetalMiniMaxH3FastVae::effective_i8_tier(int i8_tier, bool matrix_cores)
 
 namespace {
 
+// What the decoder KEEPS: a derived entry of its weight set -- except a
+// DWD head's. That set is its adapter's FILE, whose manager key is the
+// DiT's adapter claim (generate-video's), and the manager counts a key at
+// the larger of what its set caches and what was claimed: the head's
+// cached bytes would hide inside the DiT's figure (or exceed it) under
+// someone else's name, beside the head's own booking (vae-decode's
+// `dwd-head:<id>`, at weight_bytes()). So the head builds into buffers
+// of its own, which go with the model; its set caches nothing.
+metal_compute::SharedBuffer
+kept_(WeightSet& w, bool dwd, const std::string& key,
+      const std::function<metal_compute::SharedBuffer()>& build)
+{
+  return dwd ? build() : w.derived(key, build);
+}
+
 // The fast tier's group for K, as I8GemmContext::fast_group picks it.
 int
 fast_group_for_(int K)
@@ -315,6 +331,101 @@ MetalMiniMaxH3FastVae::config_from(const WeightSet& ws,
   return true;
 }
 
+namespace {
+
+bool config_from_dwd_src_(const MetalLlamaWeights& src,
+                          MetalMiniMaxH3FastVae::Config* out,
+                          std::string* err);
+
+}  // namespace
+
+bool
+MetalMiniMaxH3FastVae::config_from_dwd(const WeightSet& ws, Config* out,
+                                       std::string* err)
+{
+  return config_from_dwd_src_(ws.src(), out, err);
+}
+
+bool
+MetalMiniMaxH3FastVae::config_from_dwd(const std::string& file, Config* out,
+                                       std::string* err)
+{
+  auto wts = MetalLlamaWeights::open_model(file);
+  if (!wts.has_value()) {
+    if (err != nullptr) { *err = "'" + file + "' cannot be read"; }
+    return false;
+  }
+  return config_from_dwd_src_(*wts, out, err);
+}
+
+namespace {
+
+bool
+config_from_dwd_src_(const MetalLlamaWeights& src,
+                     MetalMiniMaxH3FastVae::Config* out, std::string* err)
+{
+  using Config = MetalMiniMaxH3FastVae::Config;
+  constexpr const char* kDwdPrefix = MetalMiniMaxH3FastVae::kDwdPrefix;
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  // The Sol decoder's constants (sol_h3/model.py: 32 heads of 64, rotary
+  // on 48, theta 100, window 16, block 5, shift 2, 4 registers, eps 1e-5,
+  // patch 16 x 4 frames, 3 frames trimmed): this class's defaults. What
+  // the file says is its widths and its depth.
+  Config c;
+  const std::string P = kDwdPrefix;
+  const auto* n1 = src.info(P + "blocks.0.norm1.weight");
+  const auto* w2 = src.info(P + "blocks.0.ff.w2.weight");
+  const auto* fe = src.info(P + "feature_expand.weight");
+  const auto* rt = src.info(P + "register_tokens");
+  const auto* po = src.info(P + "proj_out.weight");
+  const auto* p1 = src.info(P + "first_frame_proj_out.weight");
+  if (n1 == nullptr || w2 == nullptr || fe == nullptr || rt == nullptr ||
+      po == nullptr || p1 == nullptr ||
+      src.info(P + "norm_out.bias") == nullptr) {
+    return fail("no DWD pixel head (dwd_pixel_refiner.: blocks.*, "
+                "feature_expand, register_tokens, norm_out, proj_out, "
+                "first_frame_proj_out)");
+  }
+  c.dim = (int)n1->shape[0];
+  if (w2->shape.size() != 2 || (int)w2->shape[0] != c.dim) {
+    return fail("blocks.0.ff.w2 is not [dim, ffn]");
+  }
+  c.ffn_inner = (int)w2->shape[1];
+  int L = 0;
+  while (src.info(P + blk_(L, "norm1.weight")) != nullptr) { ++L; }
+  c.n_layers = L;
+  // feature_expand [e_h e_w dim, features]: a DiT token's 2 x 2 cells.
+  if (fe->shape.size() != 2 || (int)fe->shape[0] != 4 * c.dim) {
+    return fail("feature_expand is not [4 * dim, features]: this head reads "
+                "DiT tokens of 2 x 2 latent cells");
+  }
+  c.feature_dim = (int)fe->shape[1];
+  if (rt->shape.size() != 3 || (int)rt->shape[1] != c.n_register ||
+      (int)rt->shape[2] != c.dim) {
+    return fail("register_tokens is not [1, 4, dim]");
+  }
+  if (po->shape.size() != 2 || (int)po->shape[0] != c.patch_elems()) {
+    return fail("proj_out is not [3 * 4 * 16^2, dim]");
+  }
+  if (p1->shape.size() != 2 ||
+      (int)p1->shape[0] != c.out_channels * c.patch * c.patch ||
+      c.patch_t - c.frames_to_trim != 1) {
+    return fail("first_frame_proj_out is not [3 * 16^2, dim]");
+  }
+  if (c.dim != c.n_heads * c.head_dim || c.dim % 256 != 0 ||
+      c.dim > 4096 || L == 0 || c.feature_dim % 8 != 0) {
+    return fail("a head shape this port does not run (32 heads of 64, dim "
+                "a multiple of 256 up to 4096)");
+  }
+  *out = c;
+  return true;
+}
+
+}  // namespace
+
 int
 MetalMiniMaxH3FastVae::decoded_frames(const Config& c, int T)
 {
@@ -349,9 +460,9 @@ MetalMiniMaxH3FastVae::scratch_bytes(const Config& c, int T, int h, int w)
   // The tables: every token's q and k rows, both shifts, and the global
   // keys' moves.
   b += (4 * N + 4 * nwin * 2 * S * (nb + 1)) * 4;
-  // The latent as handed over (f32), and the output, ImageNet-normalized
-  // bf16.
-  b += (std::size_t)c.z_channels * N * 4;
+  // The latent as handed over (f32) -- a DWD head reads the caller's
+  // features where they lie -- and the output, ImageNet-normalized bf16.
+  if (!c.dwd()) { b += (std::size_t)c.z_channels * N * 4; }
   b += (std::size_t)c.out_channels * decoded_frames(c, T) * hw *
        (std::size_t)(c.patch * c.patch) * 2;
   // The small ones -- the rotary table, the identity map, the global
@@ -372,10 +483,24 @@ MetalMiniMaxH3FastVae::weight_bytes(const std::string& file, int i8_tier)
   auto wts = MetalLlamaWeights::open_model(file);
   if (!wts.has_value()) { return 0; }
   const bool held = i8_tier >= 1;
+  // A DWD head's file is an adapter's: its own tensors alone, named
+  // under the prefix.
+  const std::string P = kDwdPrefix;
+  const bool dwd = wts->info(P + "feature_expand.weight") != nullptr;
   std::size_t b = 0;
-  for (const std::string& nm : wts->tensor_names()) {
-    const auto* ti = wts->info(nm);
+  for (const std::string& full : wts->tensor_names()) {
+    const auto* ti = wts->info(full);
     if (ti == nullptr) { continue; }
+    if (dwd && full.compare(0, P.size(), P) != 0) { continue; }
+    const std::string nm = dwd ? full.substr(P.size()) : full;
+    // DWD: feature_expand and the first-frame head bf16 (their biases
+    // bf16 and f32), as the head is.
+    if (dwd && (nm == "feature_expand.weight" ||
+                nm == "first_frame_proj_out.weight" ||
+                nm == "feature_expand.bias")) {
+      b += numel_(ti->shape) * 2;
+      continue;
+    }
     const std::size_t n = numel_(ti->shape);
     // post_quant_conv folds into the embedding's affine map, which is
     // x_embedder's size: nothing of it is held.
@@ -470,9 +595,12 @@ MetalMiniMaxH3FastVae::bind_kernels_(std::string* err)
   _fn_post     = _lib_regen.function("h3fv_qkv_post_f16");
   _fn_copy     = _lib_regen.function("h3fv_copy_rows_f16");
   _fn_unpatch  = _lib_regen.function("h3fv_unpatch_f16");
+  _fn_expand   = _lib_regen.function("h3fv_expand_f32");
+  _fn_unpatch1 = _lib_regen.function("h3fv_unpatch_first_f16");
   if (!_fn_gemm.valid() || !_fn_bias_add.valid() || !_fn_swiglu.valid() ||
       !_fn_embed.valid() || !_fn_norm.valid() || !_fn_gated.valid() ||
-      !_fn_post.valid() || !_fn_copy.valid() || !_fn_unpatch.valid()) {
+      !_fn_post.valid() || !_fn_copy.valid() || !_fn_unpatch.valid() ||
+      (_cfg.dwd() && (!_fn_expand.valid() || !_fn_unpatch1.valid()))) {
     if (err != nullptr) { *err = "a fast H3 decoder kernel is missing"; }
     return false;
   }
@@ -525,23 +653,24 @@ MetalMiniMaxH3FastVae::proj_(const std::string& name, int N, int K,
   p.n = N;
   p.k = K;
   const std::size_t nk = (std::size_t)N * K;
-  p.b = w.derived(std::string(kKey) + "bf16|" + name + ".bias",
-                  [&]() -> SharedBuffer {
-                    return bf16_tensor_(w, mc, name + ".bias",
-                                        (std::size_t)N);
-                  });
+  p.b = kept_(w, _cfg.dwd(),
+              std::string(kKey) + "bf16|" + name + ".bias",
+              [&]() -> SharedBuffer {
+                return bf16_tensor_(w, mc, name + ".bias", (std::size_t)N);
+              });
   // A tier that holds the int8 layout converts each projection once, the
   // bf16 built only to be converted and then dropped.
   const int gc = (_i8_tier >= 1) ? _i8->fast_group(K) : 0;
   if (gc == 0) {
-    p.w = w.derived(std::string(kKey) + "bf16|" + name + ".weight",
-                    [&]() -> SharedBuffer {
-                      return bf16_tensor_(w, mc, name + ".weight", nk);
-                    });
+    p.w = kept_(w, _cfg.dwd(),
+                std::string(kKey) + "bf16|" + name + ".weight",
+                [&]() -> SharedBuffer {
+                  return bf16_tensor_(w, mc, name + ".weight", nk);
+                });
     _weight_bytes += p.w.byte_size();
   } else {
     const std::size_t sb = I8GemmContext::fast_scale_bytes(N, K, gc);
-    SharedBuffer both = w.derived(
+    SharedBuffer both = kept_(w, _cfg.dwd(),
         std::string(kKey) + _i8->layout_tag(gc) + "|" + name + ".weight",
         [&]() -> SharedBuffer {
           SharedBuffer f = bf16_tensor_(w, mc, name + ".weight", nk);
@@ -608,9 +737,48 @@ MetalMiniMaxH3FastVae::load_(std::string* err)
     }
   }
 
+  _prefix = c.dwd() ? kDwdPrefix : "";
+  const std::string P = _prefix;
+  // DWD: the features' expansion and the first-frame head, bf16 as the
+  // head is (they write the stream's first state and the pixels).
+  if (c.dwd()) {
+    const int FD = c.feature_dim, PE1 = c.out_channels * c.patch * c.patch;
+    _expand.n = 4 * D;
+    _expand.k = FD;
+    _expand.w = kept_(w, _cfg.dwd(), std::string(kKey) + "bf16|" + P +
+                              "feature_expand.weight",
+                          [&]() -> SharedBuffer {
+                            return bf16_tensor_(w, mc,
+                                                P + "feature_expand.weight",
+                                                (std::size_t)4 * D * FD);
+                          });
+    _expand.b = kept_(w, _cfg.dwd(), std::string(kKey) + "bf16|" + P +
+                              "feature_expand.bias",
+                          [&]() -> SharedBuffer {
+                            return bf16_tensor_(w, mc,
+                                                P + "feature_expand.bias",
+                                                (std::size_t)4 * D);
+                          });
+    _head1_w = kept_(w, _cfg.dwd(), std::string(kKey) + "bf16|" + P +
+                             "first_frame_proj_out.weight",
+                         [&]() -> SharedBuffer {
+                           return bf16_tensor_(
+                               w, mc, P + "first_frame_proj_out.weight",
+                               (std::size_t)PE1 * D);
+                         });
+    _head1_bias = f32_tensor_(w, mc, P + "first_frame_proj_out.bias",
+                              (std::size_t)PE1);
+    if (_expand.w.empty() || _expand.b.empty() || _head1_w.empty() ||
+        _head1_bias.empty()) {
+      return fail("cannot read the DWD head's feature_expand / "
+                  "first_frame_proj_out");
+    }
+    _weight_bytes += _expand.w.byte_size() + _expand.b.byte_size() +
+                     _head1_w.byte_size() + _head1_bias.byte_size();
+  }
   // The embedding: (z * std + mean) through post_quant_conv (a 1x1x1
   // conv) and x_embedder is one affine map, folded once in double.
-  {
+  if (!c.dwd()) {
     std::vector<double> wc((std::size_t)Z * Z), bc(Z), we((std::size_t)D * Z),
         be(D);
     auto rd = [&](const std::string& nm, std::size_t n,
@@ -658,11 +826,11 @@ MetalMiniMaxH3FastVae::load_(std::string* err)
     }
     _weight_bytes += _embed_a.byte_size() + _embed_c.byte_size();
   }
-  _registers = f32_tensor_(w, mc, "register_tokens",
+  _registers = f32_tensor_(w, mc, P + "register_tokens",
                            (std::size_t)c.n_register * D);
-  _ln_w = f32_tensor_(w, mc, "norm_out.weight", (std::size_t)D);
-  _ln_b = f32_tensor_(w, mc, "norm_out.bias", (std::size_t)D);
-  _head_bias = f32_tensor_(w, mc, "proj_out.bias",
+  _ln_w = f32_tensor_(w, mc, P + "norm_out.weight", (std::size_t)D);
+  _ln_b = f32_tensor_(w, mc, P + "norm_out.bias", (std::size_t)D);
+  _head_bias = f32_tensor_(w, mc, P + "proj_out.bias",
                            (std::size_t)c.patch_elems());
   if (_registers.empty() || _ln_w.empty() || _ln_b.empty() ||
       _head_bias.empty()) {
@@ -673,10 +841,11 @@ MetalMiniMaxH3FastVae::load_(std::string* err)
   // The head stays bf16 at every tier: it writes the pixels.
   _head.n = c.patch_elems();
   _head.k = D;
-  _head.w = w.derived(std::string(kKey) + "bf16|proj_out.weight",
+  _head.w = kept_(w, _cfg.dwd(),
+                  std::string(kKey) + "bf16|" + P + "proj_out.weight",
                       [&]() -> SharedBuffer {
                         return bf16_tensor_(
-                            w, mc, "proj_out.weight",
+                            w, mc, P + "proj_out.weight",
                             (std::size_t)c.patch_elems() * D);
                       });
   if (_head.w.empty()) { return fail("cannot read proj_out.weight"); }
@@ -685,21 +854,21 @@ MetalMiniMaxH3FastVae::load_(std::string* err)
   _blocks.resize((std::size_t)c.n_layers);
   for (int L = 0; L < c.n_layers; ++L) {
     Block& b = _blocks[(std::size_t)L];
-    b.n1 = f32_tensor_(w, mc, blk_(L, "norm1.weight"), (std::size_t)D);
-    b.n2 = f32_tensor_(w, mc, blk_(L, "norm2.weight"), (std::size_t)D);
-    b.s1 = f32_tensor_(w, mc, blk_(L, "scale1"), (std::size_t)D);
-    b.s2 = f32_tensor_(w, mc, blk_(L, "scale2"), (std::size_t)D);
+    b.n1 = f32_tensor_(w, mc, P + blk_(L, "norm1.weight"), (std::size_t)D);
+    b.n2 = f32_tensor_(w, mc, P + blk_(L, "norm2.weight"), (std::size_t)D);
+    b.s1 = f32_tensor_(w, mc, P + blk_(L, "scale1"), (std::size_t)D);
+    b.s2 = f32_tensor_(w, mc, P + blk_(L, "scale2"), (std::size_t)D);
     if (b.n1.empty() || b.n2.empty() || b.s1.empty() || b.s2.empty()) {
       return fail(fmt("cannot read block {}'s norms and gates", L)());
     }
     _weight_bytes += 4 * (std::size_t)D * 4;
-    b.qkv = proj_(blk_(L, "attn.to_qkv"), 3 * D, D, err);
+    b.qkv = proj_(P + blk_(L, "attn.to_qkv"), 3 * D, D, err);
     if (b.qkv.n == 0) { return false; }
-    b.out = proj_(blk_(L, "attn.to_out"), D, D, err);
+    b.out = proj_(P + blk_(L, "attn.to_out"), D, D, err);
     if (b.out.n == 0) { return false; }
-    b.w1 = proj_(blk_(L, "ff.w1"), 2 * F, D, err);
+    b.w1 = proj_(P + blk_(L, "ff.w1"), 2 * F, D, err);
     if (b.w1.n == 0) { return false; }
-    b.w2 = proj_(blk_(L, "ff.w2"), D, F, err);
+    b.w2 = proj_(P + blk_(L, "ff.w2"), D, F, err);
     if (b.w2.n == 0) { return false; }
   }
 
@@ -844,6 +1013,15 @@ MetalMiniMaxH3FastVae::build_geometry_(int T, int h, int w, std::string* err)
   }
   _geo = std::move(g);
   return true;
+}
+
+void
+MetalMiniMaxH3FastVae::release_scratch()
+{
+  _s = Scratch{};
+  _geo = Geometry{};
+  _wdeq = SharedBuffer{};
+  if (_i8) { _i8->release_scratch(); }
 }
 
 bool
@@ -1148,12 +1326,46 @@ SharedBuffer
 MetalMiniMaxH3FastVae::decode(const float* z, int T, int h, int w,
                               std::string* err)
 {
+  if (_cfg.dwd()) {
+    if (err != nullptr) { *err = "a DWD head decodes features, not latents"; }
+    return {};
+  }
+  return decode_(z, nullptr, 0, T, h, w, err);
+}
+
+SharedBuffer
+MetalMiniMaxH3FastVae::decode_features(const SharedBuffer& feats,
+                                       std::size_t row0, int T, int h2,
+                                       int w2, std::string* err)
+{
+  if (!_cfg.dwd()) {
+    if (err != nullptr) { *err = "not a DWD head: it decodes latents"; }
+    return {};
+  }
+  const std::size_t need = (row0 + (std::size_t)T * h2 * w2) *
+                           (std::size_t)_cfg.feature_dim * 2;
+  if (feats.empty() || feats.byte_size() < need) {
+    if (err != nullptr) {
+      *err = fmt("the features hold {} bytes where [{} x {} x {}, {}] from "
+                 "row {} need {}", feats.byte_size(), T, h2, w2,
+                 _cfg.feature_dim, row0, need)();
+    }
+    return {};
+  }
+  return decode_(nullptr, &feats, row0, T, 2 * h2, 2 * w2, err);
+}
+
+SharedBuffer
+MetalMiniMaxH3FastVae::decode_(const float* z, const SharedBuffer* feats,
+                               std::size_t row0, int T, int h, int w,
+                               std::string* err)
+{
   auto fail = [&](std::string m) -> SharedBuffer {
     if (err != nullptr) { *err = std::move(m); }
     return {};
   };
   const Config& c = _cfg;
-  if (z == nullptr || T <= 0 || h <= 0 || w <= 0) {
+  if ((z == nullptr && feats == nullptr) || T <= 0 || h <= 0 || w <= 0) {
     return fail("empty latent");
   }
   const int D = c.dim, F = c.ffn_inner, Z = c.z_channels;
@@ -1172,9 +1384,16 @@ MetalMiniMaxH3FastVae::decode(const float* z, int T, int h, int w,
   const std::size_t W16 = (std::size_t)w * c.patch;
   SharedBuffer out = _mc->make_shared_buffer(
       (std::size_t)c.out_channels * Fo * H16 * W16 * 2);
-  SharedBuffer zb = _mc->make_shared_buffer((std::size_t)Z * N * 4);
-  if (out.empty() || zb.empty()) { return fail("allocation failed"); }
-  std::memcpy(zb.contents(), z, (std::size_t)Z * N * 4);
+  SharedBuffer zb;
+  if (feats == nullptr) {
+    zb = _mc->make_shared_buffer((std::size_t)Z * N * 4);
+    if (!zb.empty()) {
+      std::memcpy(zb.contents(), z, (std::size_t)Z * N * 4);
+    }
+  }
+  if (out.empty() || (feats == nullptr && zb.empty())) {
+    return fail("allocation failed");
+  }
   Scratch& s = _s;
   _i8_gemms = _dense_gemms = 0;
   _ane_rows = 0;
@@ -1201,15 +1420,37 @@ MetalMiniMaxH3FastVae::decode(const float* z, int T, int h, int w,
   // for every native block.
   {
     ComputeEncoder enc = stream.begin_compute();
-    enc.set_function(_fn_embed);
-    enc.set_buffer(0, zb);
-    enc.set_buffer(1, _embed_a);
-    enc.set_buffer(2, _embed_c);
-    enc.set_buffer(3, s.x);
-    enc.set_constant(4, N);
-    enc.set_constant(5, D);
-    enc.set_constant(6, Z);
-    enc.dispatch({(unsigned)D, (unsigned)N, 1}, {64, 4, 1});
+    if (feats != nullptr) {
+      // DWD: each band of DiT tokens through feature_expand (its bias in),
+      // then into the 2 x 2 stream tokens each covers.
+      const int FD = c.feature_dim, h2 = h / 2, w2 = w / 2;
+      const int Nd = T * h2 * w2;
+      for (int a = 0; a < Nd; a += kBand) {
+        const int n = std::min(kBand, Nd - a);
+        gemm_(enc, *feats, (row0 + (std::size_t)a) * FD, _expand, s.ff, 0,
+              n);
+        enc.set_function(_fn_expand);
+        enc.set_buffer(0, s.ff);
+        enc.set_buffer(1, s.x);
+        enc.set_constant(2, a);
+        enc.set_constant(3, n);
+        enc.set_constant(4, h2);
+        enc.set_constant(5, w2);
+        enc.set_constant(6, D);
+        enc.dispatch({(unsigned)D, 4, (unsigned)n}, {256, 1, 1});
+      }
+    } else {
+      enc.set_function(_fn_embed);
+      enc.set_buffer(0, zb);
+      enc.set_buffer(1, _embed_a);
+      enc.set_buffer(2, _embed_c);
+      enc.set_buffer(3, s.x);
+      enc.set_constant(4, N);
+      enc.set_constant(5, D);
+      enc.set_constant(6, Z);
+      enc.dispatch({(unsigned)D, (unsigned)N, 1}, {64, 4, 1});
+      _flops.add(2ull * (std::uint64_t)N * D * Z);
+    }
     // Host-written: the embedding writes rows [0, N), these [N, M).
     auto* xg = static_cast<float*>(s.x.contents()) + (std::size_t)N * D;
     const auto* reg = static_cast<const float*>(_registers.contents());
@@ -1219,7 +1460,6 @@ MetalMiniMaxH3FastVae::decode(const float* z, int T, int h, int w,
       std::memset(gb + (std::size_t)c.n_register * D, 0,
                   (std::size_t)D * 4);
     }
-    _flops.add(2ull * (std::uint64_t)N * D * Z);
     if (!commit_wait(enc)) { return {}; }
   }
 
@@ -1423,6 +1663,26 @@ MetalMiniMaxH3FastVae::decode(const float* z, int T, int h, int w,
         enc.set_constant(10, c.patch_t);
         enc.dispatch({(unsigned)c.patch_elems(), (unsigned)n, 1},
                      {256, 1, 1});
+        // DWD: a native block's first latent's one frame from its own
+        // head, over the frame the 4-frame head left there.
+        if (c.dwd()) {
+          const int PE1 = c.out_channels * c.patch * c.patch;
+          _flops.gemm(n, PE1, D);
+          dense_(enc, s.hb, 0, _head1_w, nullptr, s.y, 0, n, PE1, D);
+          enc.set_function(_fn_unpatch1);
+          enc.set_buffer(0, s.y);
+          enc.set_buffer(1, _head1_bias);
+          enc.set_buffer(2, out);
+          enc.set_constant(3, a);
+          enc.set_constant(4, n);
+          enc.set_constant(5, h);
+          enc.set_constant(6, w);
+          enc.set_constant(7, Fo);
+          enc.set_constant(8, tb);
+          enc.set_constant(9, c.frames_to_trim);
+          enc.set_constant(10, c.patch_t);
+          enc.dispatch({(unsigned)PE1, (unsigned)n, 1}, {256, 1, 1});
+        }
       }
     }
     if (!commit_wait(enc)) { return {}; }
