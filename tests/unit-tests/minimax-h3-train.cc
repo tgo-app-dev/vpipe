@@ -504,6 +504,30 @@ diff_(const std::vector<std::uint16_t>& a,
 
 }  // namespace
 
+// THE LAYOUT TWO RANKS COMPARE. A machine that finds no partition word
+// for an FL2VA DiT and one that finds "fl2va" train the same thing, so
+// they must agree; Ref2VA, MiniMax-H3-Image and P-H3-Image each train
+// otherwise, whatever the partition word says.
+TEST(minimax_h3_train, ranks_agree_on_the_layout_not_the_partition_word)
+{
+  using T = genai::MiniMaxH3LoraTrainer;
+  using V = T::Variant;
+  EXPECT_TRUE(T::layout_type_of(V::kVideo, "") ==
+              T::layout_type_of(V::kVideo, "fl2va"));
+  EXPECT_TRUE(T::layout_type_of(V::kVideo, "fl2va") !=
+              T::layout_type_of(V::kVideo, "ref2va"));
+  EXPECT_TRUE(T::layout_type_of(V::kVideo, "") !=
+              T::layout_type_of(V::kVideo, "ref2va"));
+  EXPECT_TRUE(T::layout_type_of(V::kH3i, "") ==
+              T::layout_type_of(V::kH3i, "fl2va"));
+  EXPECT_TRUE(T::layout_type_of(V::kH3i, "") !=
+              T::layout_type_of(V::kVideo, ""));
+  EXPECT_TRUE(T::layout_type_of(V::kPh3, "fl2va") !=
+              T::layout_type_of(V::kVideo, "fl2va"));
+  EXPECT_TRUE(T::layout_type_of(V::kPh3, "") !=
+              T::layout_type_of(V::kH3i, ""));
+}
+
 // ONE FORWARD. A fresh adapter (B = 0) is exactly the base; and the
 // adapter the trainer saves, bound again from the file by the model's own
 // binder -- the diffusers decomposition, q|k|v fused and banded for this

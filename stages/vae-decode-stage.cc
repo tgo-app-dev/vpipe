@@ -7,6 +7,7 @@
 #include "stages/color-fix.h"
 #include "common/host-report.h"
 #include "common/flex-bag.h"
+#include "generative-models/vae-host-ext.h"
 #include "common/beat-keys.h"
 
 #include <cstring>
@@ -158,6 +159,20 @@ VaeDecodeStage::~VaeDecodeStage()
                              _h3_vae_warm_key, std::move(_h3_vae), b,
                              _keep_loaded);
       }
+    }
+  }
+  // A pi-H3 adapter's DWD pixel head, alike: the next clip of the same
+  // adapter decodes without reading it again (~0.4 s a clip on an M5).
+  if (_h3_dwd && _keep_loaded > 0 && !_unload_idle &&
+      !_h3_dwd_warm_key.empty() && session() != nullptr) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      session()->info(fmt("VaeDecodeStage('{}'): the DWD pixel head kept "
+                          "warm for {:.0f} s", this->id(), _keep_loaded));
+      // Its working set given back first: the hold is its weights alone.
+      _h3_dwd->release_scratch();
+      const std::size_t b = _h3_dwd->weight_bytes();
+      mgr->keep_model_warm(kH3DwdWarmKind, _h3_dwd_file, _h3_dwd_warm_key,
+                           std::move(_h3_dwd), b, _keep_loaded);
     }
   }
   if ((_vae || _flux2_vae) && _keep_loaded > 0 && !_unload_idle &&
@@ -565,15 +580,39 @@ VaeDecodeStage::declare_resources() const
   // adapter's pixel head -- the VAE is never loaded, so not claimed. The
   // head's weights are read from the adapter's file, whose own claim is
   // generate-video's (its LoRA and overwrites, held privately, the
-  // denoise's under `always`): they are booked as this stage's decode-
-  // phase arena, so they count where they are held and nowhere else.
-  // Its working set and the clip are generate-video's "vae-decode" arena,
-  // the features its payload.
+  // denoise's under `always`): they are booked as this stage's arena,
+  // so they count where they are held and nowhere else. Its working set
+  // and the clip are generate-video's "vae-decode" arena, the features
+  // its payload.
+  // Kept warm (`keep_loaded`) and held now, the head is taken back as the
+  // stage starts (see process()): an unphased arena, alive through every
+  // phase. Else it loads at the first beat, the decode's alone.
+  //
+  // Through every phase only where a hold of it is THERE as the plan is
+  // made: held from before the launch, its bytes are counted nowhere
+  // else (the plan's warm sweep skips a hold whose file a claim names --
+  // generate-video's adapter). Without one it loads at the first beat
+  // and the decode phase is exact; one under another tier or tuning, or
+  // released by the sweep, is dropped and the head loads cold -- booked
+  // a little early, the safe way.
+  _dwd_plan_head.clear();
+  _dwd_plan_warm = false;
   if (const std::string head = planned_dwd_head_(); !head.empty()) {
+    _dwd_plan_head = head;
+    if (dwd_early_()) {
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        const std::string dir = dwd_canonical(head);
+        for (const auto& w : mgr->warm_report()) {
+          if (w.kind == kH3DwdWarmKind && w.dir == dir) {
+            _dwd_plan_warm = true;
+          }
+        }
+      }
+    }
     return model_memory::scratch_claims(
         dwd_head_label_(),
         genai::MetalMiniMaxH3FastVae::weight_bytes(head, fast_i8_tier_()),
-        model_memory::kPhaseDecode);
+        _dwd_plan_warm ? std::string_view() : model_memory::kPhaseDecode);
   }
 #endif
   const std::string vdir = vae_dir_for_release_();
@@ -649,6 +688,32 @@ std::string
 VaeDecodeStage::ane_claim_label_() const
 {
   return "ane-ffn/" + std::string(this->id());
+}
+
+bool
+VaeDecodeStage::dwd_early_() const
+{
+  // By config alone, so the plan's booking and the load agree: `auto`'s
+  // later answer (unload after each beat on a tight box) only lets the
+  // head go after the decode.
+  return _keep_loaded > 0 &&
+         (_unload_cfg == model_memory::UnloadPolicy::kAuto ||
+          _unload_cfg == model_memory::UnloadPolicy::kKeep);
+}
+
+std::string
+VaeDecodeStage::dwd_warm_key(const std::string& canonical_file, int i8_tier,
+                             bool autotune)
+{
+  return fmt("{}|i8 {}|tune {}", canonical_file, i8_tier, autotune ? 1 : 0)();
+}
+
+std::string
+VaeDecodeStage::dwd_canonical(const std::string& file)
+{
+  std::error_code ec;
+  const auto c = std::filesystem::canonical(file, ec);
+  return ec ? file : c.string();
 }
 
 std::string
@@ -1028,6 +1093,8 @@ VaeDecodeStage::unload_vae_()
   if (_h3_dwd) {
     _h3_dwd.reset();
     if (auto* mgr = session()->services()->generative_model_manager()) {
+      // Its arena no longer held: the phases after this see the room.
+      mgr->revise_scratch(dwd_head_label_(), 0);
       if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
         mgr->drop_weights(_h3_dwd_file);
       } else {
@@ -1075,11 +1142,34 @@ VaeDecodeStage::reload_vae_()
 }
 
 bool
-VaeDecodeStage::ensure_h3_dwd_(const std::string& file)
+VaeDecodeStage::ensure_h3_dwd_(const std::string& file, bool warm_only)
 {
-  if (_h3_dwd && _h3_dwd_file == file) { return true; }
+  // Compared as the manager keys it (canonical): the plan names the head
+  // as generate-video resolves its adapter, the beat as the DiT holds it
+  // -- spelled apart, the head taken back would be freed and read again.
+  const std::string canon = dwd_canonical(file);
+  if (_h3_dwd && _h3_dwd_file == canon) { return true; }
   _h3_dwd.reset();
   _h3_dwd_file.clear();
+  // KEPT WARM by an earlier graph (keep_loaded): the same file, tier and
+  // tuning -- taken back before anything is read.
+  const int i8_tier = fast_i8_tier_();
+  const std::string key = dwd_warm_key(canon, i8_tier, _autotune);
+  if (!file.empty() && _keep_loaded > 0 && !_unload_idle) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      if (auto warm = mgr->take_warm<genai::MetalMiniMaxH3FastVae>(
+              kH3DwdWarmKind, canon, key)) {
+        _h3_dwd = std::move(warm);
+        _h3_dwd_file = canon;
+        _h3_dwd_warm_key = key;
+        mgr->revise_scratch(dwd_head_label_(), _h3_dwd->weight_bytes());
+        load_note_(fmt("VaeDecodeStage('{}'): the DWD pixel head kept warm "
+                       "is taken back", this->id()));
+        return true;
+      }
+    }
+  }
+  if (warm_only) { return false; }
   auto* mc = session()->services()->metal_compute();
   std::shared_ptr<genai::WeightSet> ws =
       file.empty() ? nullptr : genai::open_weight_set(file, session());
@@ -1095,7 +1185,7 @@ VaeDecodeStage::ensure_h3_dwd_(const std::string& file)
   }
   // The fast decoder's tiers: the stage's i8 tier and tuning (its ANE
   // share is the released decoders' grant, not this head's).
-  fcfg.i8_tier = fast_i8_tier_();
+  fcfg.i8_tier = i8_tier;
   fcfg.autotune = _autotune;
   const auto t0 = std::chrono::steady_clock::now();
   _h3_dwd = genai::MetalMiniMaxH3FastVae::load(ws, mc, fcfg, &ferr);
@@ -1104,7 +1194,8 @@ VaeDecodeStage::ensure_h3_dwd_(const std::string& file)
                         "not load ({}); skipping", this->id(), file, ferr));
     return false;
   }
-  _h3_dwd_file = file;
+  _h3_dwd_file = canon;
+  _h3_dwd_warm_key = key;
   // What it holds, at the tier that engaged.
   if (auto* mgr = session()->services()->generative_model_manager()) {
     mgr->revise_scratch(dwd_head_label_(), _h3_dwd->weight_bytes());
@@ -2342,6 +2433,26 @@ VaeDecodeStage::process(RuntimeContext& ctx)
       apply_model_select_beat(mfd->data, _hf_dir);
     }
   }
+  // A DWD head the plan already names (pi-H3), KEPT WARM by the clip
+  // before -- held as the plan was made -- taken back NOW, its ~1 GB
+  // booked from then (declare_resources), rather than after the last step, where
+  // its read and build were the whole gap between the denoise and the
+  // decode (~0.4 s of a 5-second clip on an M5). Taken back only: a COLD
+  // load here ran beside the conditioner's and the DiT's kernel tuning,
+  // which then timed its candidates on a busier GPU and chose other
+  // routes from one process to the next -- the clip no longer the same
+  // for its seed (its routes untuned, it was). A head not kept warm
+  // loads at the first beat, as before. Once a run.
+  // The plan's latched answer (declare_resources): generate-video's
+  // config is not read here -- its driver rewrites it as it starts. The
+  // warm hold alone would already spare the load (taken back at the first
+  // beat is a pointer moved); taken back HERE it is also safe from the
+  // hold's time running out, or a later launch's sweep, during the
+  // denoise -- do not move it to the first beat.
+  if (_dwd_plan_warm) {
+    _dwd_plan_warm = false;
+    (void)ensure_h3_dwd_(_dwd_plan_head, /*warm_only=*/true);
+  }
   auto in = co_await ctx.read(0);
   if (!in) {                                    // upstream EOS -> close oport
     // Frames held for a cross-fade that never came go out as they are.
@@ -3288,7 +3399,14 @@ VaeDecodeStage::process(RuntimeContext& ctx)
           (std::size_t)((int)tbp->shape[tbp->shape.size() - 2] * sc) *
           (std::size_t)((int)tbp->shape[tbp->shape.size() - 1] * sc) *
           (std::size_t)(want > 0 ? want : 1);
-      revise_decode_arena_(px * 3 * 2 + px * 3);
+      // ...and what the decoder holds while it runs, where its family
+      // says (an in-tree extension; a plugin's decoder cannot).
+      std::size_t working = 0;
+      if (auto* wb = static_cast<genai::VaeWorkingBytes*>(
+              _plugin_dec->query_extension(genai::kVaeWorkingBytesExt))) {
+        working = wb->working_bytes(req.shape);
+      }
+      revise_decode_arena_(px * 3 * 2 + px * 3 + working);
     }
     std::string derr;
     bool ok = false;

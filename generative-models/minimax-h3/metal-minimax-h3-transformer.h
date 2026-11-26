@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -299,6 +300,58 @@ class MetalMiniMaxH3Transformer {
     // same whether its ANE (or its peer's) runs.
     TpShare tp;
 
+    // HYPERFLOW H3 FLASH (VideoRebirthAI/hyperflow-h3-flash): a
+    // compressed few-step H3, read from its ComfyUI single file (bare H3
+    // names, flat qkv, ComfyUI's int8 ConvRot). Three changes to the
+    // architecture, all stated by the file:
+    //
+    //   * BLOCKS LEFT OUT. The release drops some of the 50 blocks
+    //     (FL2VA 6, 21, 22; Ref2VA 9) -- identities -- and the file
+    //     renumbers the rest from 0, so `n_layers` counts the kept ones.
+    //     `dropped_blocks` (the `hyperflow` metadata's) maps a kept
+    //     block back to the release's index, which is what an adapter
+    //     trained on the full model names (src_layer).
+    //   * LOW-RANK PROJECTIONS. Some projections are `up @ down` --
+    //     `<proj>.down.weight` [rank, in] and `.up.weight` [out, rank],
+    //     bf16, ranks padded to 64 -- in place of a weight; q / k / v
+    //     each its own pair beside a fused int8 q|k|v elsewhere. Held
+    //     resident beside the blocks (LowRank) and run as two skinny
+    //     GEMMs.
+    //   * TWO TIMES. An `endpoint_time_embedder` embeds each step's
+    //     endpoint r beside t, blended before the AdaLN as a flow-map
+    //     adapter's is (FlowMap), with the base weights its own. It has
+    //     no single-time mode: every forward needs its endpoints.
+    bool flash = false;
+    std::vector<int> dropped_blocks;    // the release's indices, sorted
+    // PI-H3 ON FLASH (BennyDaBall930/comfyui_hyperflow_int8_nodes' pi-H3
+    // Adapter for HyperFlow, its "pi-H3 time path"): the stock PRUNED DiT
+    // (Comfy-Org's minimax_h3_fl2va_pruned_*) whose curve table and
+    // AdaLN projections this Flash DiT's blocks then run under -- every
+    // block's [D, 8] by its release index -- single-time, Flash's
+    // two-time embedding unused. Only those tensors of it are read. What
+    // lets an adapter trained on the pruned form (pi-H3: its AdaLN and
+    // final-layer overwrites, LoRA, DWD) bind on Flash's blocks as on the
+    // pruned DiT. Empty: Flash as released. Ignored on any other DiT.
+    std::string curve_from;
+    // The release's index of kept block `L` (L itself with none dropped).
+    int src_layer(int L) const
+    {
+      for (int d : dropped_blocks) {
+        if (d <= L) { ++L; }
+      }
+      return L;
+    }
+    // The kept block the release's `S` is, or -1 where it was dropped.
+    int kept_layer(int S) const
+    {
+      int L = S;
+      for (int d : dropped_blocks) {
+        if (d == S) { return -1; }
+        if (d < S) { --L; }
+      }
+      return L;
+    }
+
     int inner() const { return n_heads * head_dim; }        // 7168
     int video_patch_elems() const
     {
@@ -538,6 +591,10 @@ class MetalMiniMaxH3Transformer {
   // Bytes every slot's GPU factors hold -- what attaching the adapters
   // costs in memory, which is not what they cost on disk.
   std::size_t lora_bytes() const;
+  // Bytes the slots' own weight sets (LoraSlot::set_ws) keep cached --
+  // the entries bind_sets_ read through them. lora_bytes() counts the
+  // buffers the slots hold, never these; a test reads both.
+  std::size_t lora_cached_bytes() const;
   // Whether a bound slot overwrites weights whole (LoraSlot::sets: pi-H3)
   // or carries a DWD pixel head -- what a reader that runs the blocks on
   // its own (the LoRA trainer) cannot follow.
@@ -552,6 +609,16 @@ class MetalMiniMaxH3Transformer {
   // GEMMs run on ComfyUI's int8 ConvRot (or W4A8) codes as stored, on the
   // token tier (Linear::cr), since load -- engagement, for a test.
   std::uint64_t convrot_native_gemms() const { return _cr_gemms; }
+  // FOR TESTS: main block `block`'s projection `which` (0 q|k|v, 1 out,
+  // 2 fc1, 3 fc2) read as a forward reads it -- a rank's share on a rank
+  // -- and widened to bf16 as a band under the int8 row floor runs it
+  // (i8_dense_; a dense one as it is), [n, k] row-major, with its n and
+  // k. Empty where it holds no weight. It grows the model's dequant
+  // scratch to that projection and keeps it: call it on a model of its
+  // own, not one whose memory a test reads after.
+  std::vector<std::uint16_t> widened_for_test(int block, int which,
+                                              int* n = nullptr,
+                                              int* k = nullptr);
   // Of the projections held from the load, how many are in the int8
   // tier's layout: the refiner's (`refiner`), else the main blocks'.
   // The refiner keeps its own whatever the tier (text rows, under the
@@ -583,6 +650,8 @@ class MetalMiniMaxH3Transformer {
   // factors are as tp_cut_lora_ cuts them -- q|k|v's and fc1's B to the
   // share's rows, the out projection's and fc2's A to its columns -- and
   // which streams them as any H3 does (its streamed set of cut factors).
+  // `pruned` is the DiT's Config, pruned or not: a Flash one's blocks
+  // are counted by the release's index, the dropped left out.
   static LoraFootprint lora_footprint(const std::string& path,
                                       int n_layers = 0,
                                       const Config* pruned = nullptr,
@@ -648,8 +717,19 @@ class MetalMiniMaxH3Transformer {
   // Null when no slot carries a flow-map adapter.
   const FlowMap* flow_map() const
   {
-    return _flow.slot >= 0 ? &_flow : nullptr;
+    return (_flow.slot >= 0 || _flow_builtin) ? &_flow : nullptr;
   }
+  // HyperFlow H3 Flash (Config::flash) samples one of a few grids, by
+  // step count (4, 6 -- the default -- or 8); this picks the one
+  // flow_map() then carries. False, said, for another count or another
+  // DiT.
+  bool set_flash_steps(int steps, std::string* err = nullptr);
+  // The step counts set_flash_steps() takes (empty: not Flash).
+  std::vector<int> flash_step_counts() const;
+  // Config::curve_from checked and applied to `cfg` (the pruned form's
+  // curve_grid and AdaLN width); false, said, where the named stock DiT
+  // will not serve. For a caller sizing the model before it loads.
+  static bool on_stock_curve(Config& cfg, std::string* err = nullptr);
   // Whether a forward NEEDS endpoints: a flow-map adapter is bound and
   // its slot's strength is not 0. At 0 the adapter is off in both of
   // its halves -- the LoRA and the blend move together, because one on
@@ -859,7 +939,9 @@ class MetalMiniMaxH3Transformer {
   //               forward, which keeps what its backward reads. It encodes
   //               into `enc` (the forward's) over `x` [rows, hidden] in
   //               place, after the ckpt / mods copies of the block are
-  //               encoded; false fails the forward.
+  //               encoded; false fails the forward. On a rank of a split
+  //               DiT it completes the block's partial sums itself: it may
+  //               commit `stream` and begin `enc` anew.
  private:
   struct Block;
 
@@ -871,7 +953,8 @@ class MetalMiniMaxH3Transformer {
     const metal_compute::SharedBuffer* final_hidden = nullptr;
     const metal_compute::SharedBuffer* refiner_in = nullptr;
     const metal_compute::SharedBuffer* refiner_out = nullptr;
-    std::function<bool(metal_compute::ComputeEncoder& enc, int layer,
+    std::function<bool(metal_compute::CommandStream& stream,
+                       metal_compute::ComputeEncoder& enc, int layer,
                        const Block& b, const metal_compute::SharedBuffer& x,
                        int rows)>
         run_block;
@@ -1315,13 +1398,17 @@ class MetalMiniMaxH3Transformer {
   }
   // What a STREAMING model holds beyond its weight set's cached entries
   // (the trunk): the promoted blocks, the slot pair and the AdaLN tables
-  // the bake built -- not the adapter factors kept with promoted blocks,
-  // which the adapter file's own claim books. The figure a per-clip
-  // holding correction adds to the set's -- promoted blocks are this
-  // model's own buffers, which the set never sees; so, a RANK's, are its
-  // refiner's cut projections. 0 for a preloaded model, whose blocks are
-  // the set's.
+  // the bake built, Flash's low-rank pairs held as its own buffers -- not
+  // the adapter factors kept with promoted blocks, which the adapter
+  // file's own claim books. The figure a per-clip holding correction adds
+  // to the set's -- promoted blocks are this model's own buffers, which
+  // the set never sees; so, a RANK's, are its refiner's cut projections.
+  // 0 for a preloaded model, whose blocks are the set's.
   std::size_t streamed_holding_bytes() const;
+  // Config::flash: the low-rank pairs held as this model's own buffers,
+  // not its weight set's entries -- the banded q|k|v pairs, or on a rank
+  // every pair at its cut. Within streamed_holding_bytes() when streaming.
+  std::size_t lowrank_own_bytes() const noexcept { return _lr_banded_bytes; }
   // EVERYTHING this model holds in WEIGHTS but the adapter factors
   // (lora_bytes()): its weight set's entries and its own buffers -- a
   // streaming model's promoted blocks, slot pair and AdaLN tables
@@ -1406,7 +1493,11 @@ class MetalMiniMaxH3Transformer {
   // a rank with no generation open fails. False, with `err`, when this
   // is not a rank or the worker could not start. One already open is
   // ended first.
-  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  // `first_seq`: the exchange count it starts from -- a training run's,
+  // whose stage carried its dataset across the channel first, every rank
+  // alike.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err,
+                           std::uint64_t first_seq = 0);
   // ...and its end, on every way out (a stage's guard): anything still
   // posted abandoned -- the channel first given a stop that is always
   // true, so an exchange waiting on a peer returns -- the worker joined,
@@ -1414,6 +1505,33 @@ class MetalMiniMaxH3Transformer {
   // channel let go. Nothing when none is open.
   void end_tp_generation();
   bool tp_generation_open() const { return _tp_pipe != nullptr; }
+  // Bytes in bulk between forwards, through the open generation's channel
+  // (TpBulk): `mine` out (null: zeros), the others' sum back into
+  // `others` (null: discarded). A training run's gradients and the
+  // adapter it saves; never while a forward runs.
+  bool tp_bulk(const void* mine, void* others, std::size_t bytes,
+               TpDType dtype, std::string* err);
+  // The exchange count, for a stage that goes on past the model.
+  std::uint64_t tp_seq() const { return _tp_seq; }
+  // A TRAINING run's ranks meet before each forward's first block (an
+  // 8-byte exchange once its tuning is done): a rank's GEMM tuning of a
+  // new length, unequal across GPUs, is then waited out on the peer's
+  // CPU, not by its GPU parked on a partial. For the open generation:
+  // end_tp_generation clears it. Inference never asks (its ranks' counts
+  // stay the protocol they were).
+  void set_tp_meet(bool on) { _tp_meet = on; }
+  // A RANK whose forwards' lengths vary (a training run's samples): its
+  // exchange buffers, whenever one grows, made `bytes` at the least --
+  // the widest sample's [rows, hidden] bf16 -- so each is made once. A
+  // transport registers each buffer it is handed with its device (RDMA),
+  // and a device refuses a page registered again past a few times: a
+  // buffer regrown sample after sample ran out of them. The eight BAND
+  // buffers at `band_bytes` -- the widest sample's band, not its rows.
+  void set_tp_exchange_floor(std::size_t bytes, std::size_t band_bytes = 0)
+  {
+    _tp_floor_bytes = bytes;
+    _tp_band_floor_bytes = band_bytes;
+  }
 
   // The model a RANK of a split DiT is (Config::tp): `c`'s heads and
   // feed-forward rows narrowed to the share's, as load() narrows its own
@@ -1897,8 +2015,14 @@ class MetalMiniMaxH3Transformer {
     // entry a preloaded block holds.
     bool ds = false;
     bool ps = false;
+    // A LOW-RANK projection (Config::flash): y = up (down x), the pair a
+    // resident LowRank entry holds -- A the down factor(s), B the up --
+    // and nothing else of this Linear is set. Only gemm_ reads it; every
+    // fused, ANE or tier route sees no weight of its own and stays away.
+    const lora::Factors* lr = nullptr;
     bool is_fp8() const { return f8 != fp8::Format::kNone; }
     bool empty() const {
+      if (lr != nullptr) { return lr->empty(); }
       return (quantized || is_fp8() || gc > 0) ? codes.empty() : w.empty();
     }
   };
@@ -2156,6 +2280,8 @@ class MetalMiniMaxH3Transformer {
     metal_compute::SharedBuffer txt, temb, mod, fmod;
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
+    // [seq, _lr_rank_max]: a low-rank projection's x A^T (Config::flash).
+    metal_compute::SharedBuffer lr;
     // The banded layout's band of queries gathered head-major for Sol
     // ([H, band, D], beside ob and oh); empty in the whole layout.
     metal_compute::SharedBuffer qb;
@@ -2369,6 +2495,39 @@ class MetalMiniMaxH3Transformer {
   std::vector<std::uint16_t> _cap_text_rows;
   Linear _time_in, _time_out;                 // read to the HOST, f32
   std::vector<float> _time_in_w, _time_in_b, _time_out_w, _time_out_b;
+  // Config::flash: its ENDPOINT embedder's own weights, to the host in
+  // f32 as the base one's are (empty for every other DiT).
+  std::vector<float> _end_in_w, _end_in_b, _end_out_w, _end_out_b;
+  // Config::flash: each kept block's LOW-RANK projections (a Linear's
+  // `lr` points here), held resident whether the blocks stream or not
+  // -- 2.7 GB for FL2VA's 17 such blocks. q|k|v is BANDED
+  // (lora::Factors::banded): q's, k's and v's downs stacked at one part
+  // rank, their ups side by side, each output third contracting over
+  // its own part. Empty entries: the projection is a weight of its own.
+  struct LowRank { lora::Factors qkv, out, fc1, fc2; };
+  // What scratch_bytes() books for _s.lr per row before any file is
+  // read: above both releases' widest (FL2VA's 3 x 1664 q|k|v); load
+  // refuses a file past it, so the estimate cannot be short.
+  static constexpr int kFlashRankBound = 5120;
+  std::vector<LowRank> _lowrank;
+  int _lr_rank_max = 0;                       // the [rows, rank] scratch
+  // Bytes of the banded q|k|v pairs, the model's own buffers (held_bytes).
+  std::size_t _lr_banded_bytes = 0;
+  // lowrank_gemm_ found no scratch: the forward fails on it.
+  bool _lr_failed = false;
+  bool load_lowrank_(WeightSet& ws, std::string* err);
+  const lora::Factors* lowrank_of_(const std::string& nm) const;
+  // y = B (A x) for a low-rank Linear, then every adapter on top.
+  void lowrank_gemm_(metal_compute::ComputeEncoder& enc,
+                     const metal_compute::SharedBuffer& x, std::size_t x_off,
+                     const lora::Factors& f,
+                     const metal_compute::SharedBuffer& y, std::size_t y_off,
+                     int M, int N, int K, const LoraStack* lora);
+  metal_compute::ComputeFunction _fn_fill_zero;
+  // Config::flash: its two-time blend is the model's own, not a slot's
+  // (two_time_active() then always), and its grids one per step count.
+  bool _flow_builtin = false;
+  std::map<int, std::vector<float>> _flash_grids;   // raw, by steps
   std::vector<float> _inv_freq;               // [rope_freq_dim], f32
   std::vector<Block> _refiner;                // 2 blocks, no AdaLN
   metal_compute::SharedBuffer _refiner_final_norm;
@@ -2387,6 +2546,10 @@ class MetalMiniMaxH3Transformer {
   // set_step_heads: one head a step, and the set they are derived in.
   std::vector<Linear> _step_out;
   std::shared_ptr<WeightSet> _step_ws;
+  // Config::curve_from: the stock pruned DiT the curve table and AdaLN
+  // are read from -- kept for the model's life (a mapped tensor points
+  // into it) and opened through the manager, which books it.
+  std::shared_ptr<WeightSet> _curve_ws;
 
   int _quant_bits = 0;
   // Tensor parallel: a whole block's partial, copied out of the scratch
@@ -2407,6 +2570,10 @@ class MetalMiniMaxH3Transformer {
   // pair alive from its projection to its residual.
   std::shared_ptr<TpChannel> _tp_ch;
   std::unique_ptr<TpOverlap> _tp_pipe;
+  std::unique_ptr<TpBulk> _tp_bulk;     // tp_bulk's buffers
+  std::size_t _tp_floor_bytes = 0;      // set_tp_exchange_floor
+  std::size_t _tp_band_floor_bytes = 0;
+  bool _tp_meet = false;                // set_tp_meet
   metal_compute::SharedBuffer _tp_part[4];
   metal_compute::SharedBuffer _tp_recv[4];
   // A share of one of a block's projections, cut from the checkpoint's
@@ -2449,7 +2616,8 @@ class MetalMiniMaxH3Transformer {
   // An EXCHANGE BUFFER at least `bytes` long: one too short is forgotten
   // by the channel (TpChannel::forget) before it is replaced. False when
   // there is no room.
-  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes,
+                  bool band = false);
   int _quant_group = 64;
 
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_rope,
@@ -2770,6 +2938,12 @@ class MetalMiniMaxH3Transformer {
   // columns of the out projection and fc2 -- so a rank adds its share of
   // each delta and the two ranks' sum is the whole one.
   bool tp_cut_lora_(LoraSlot& slot, std::string* err);
+  // One projection's factors cut to the rank's share as its weight is
+  // (tp_part_): by rows, B's -- a banded q|k|v's group then the share's
+  // inner width -- by columns, A's. An adapter's (tp_cut_lora_) and
+  // HyperFlow H3 Flash's low-rank pairs (load_lowrank_) alike.
+  bool tp_cut_factors_(LoraFactors& f, TpCut c, const std::string& where,
+                       std::string* err);
   // A file of AdaLN curve branches into slot.curve (true, with `*took`
   // set); `*took` false for a file that carries none.
   bool bind_curves_(const std::string& path, LoraSlot& slot, bool* took,
@@ -2879,11 +3053,15 @@ class MetalMiniMaxH3Transformer {
   bool lora_gemm_a_(metal_compute::ComputeEncoder& enc,
                     const metal_compute::SharedBuffer& x, std::size_t x_off,
                     const LoraFactors& lf, int M, int K, float scale,
-                    std::size_t lora_off = 0);
+                    std::size_t lora_off = 0,
+                    const metal_compute::SharedBuffer* t = nullptr);
+  // `t`: the [M, rank] scratch, `_s.lora` unless given (a low-rank
+  // projection's own, `_s.lr`).
   void lora_gemm_b_(metal_compute::ComputeEncoder& enc, const LoraFactors& lf,
                     const metal_compute::SharedBuffer& y, std::size_t y_off,
                     int M, int N, bool scale_applied, float scale,
-                    std::size_t lora_off = 0);
+                    std::size_t lora_off = 0,
+                    const metal_compute::SharedBuffer* t = nullptr);
   // Every attached adapter, back to back. The standalone form, for the
   // modulation projections that do not go through gemm_.
   void lora_apply_(metal_compute::ComputeEncoder& enc,

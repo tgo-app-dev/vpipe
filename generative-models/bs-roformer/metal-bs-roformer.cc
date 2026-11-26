@@ -706,7 +706,7 @@ MetalBsRoformer::gemm_(ComputeEncoder& enc, const SharedBuffer& x,
     // The transformer's projections are TALL -- frames x bands rows
     // (95k a chunk) against a K of 256-1024 -- so the activation is the
     // big operand and the 128x256 tile, re-reading it half as often,
-    // wins: MEASURED 2.4-3.4% a chunk on the M5 (tgo-m5-1), interleaved.
+    // wins: MEASURED 2.4-3.4% a chunk on the M5, interleaved.
     // The tree-wide rule (deep K only) was tuned on prefill shapes, and
     // the mask head's GEMMs (M = frames) keep it.
     const bool wide = M >= 16384 || mma_use_wide_tile(N, K);

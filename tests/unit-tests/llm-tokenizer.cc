@@ -162,6 +162,36 @@ TEST(llm_tokenizer, synthesized_qwen_tokenizer_round_trips)
   EXPECT_TRUE(tok->special_token_id("<|begin_of_text|>") == 100);
 }
 
+// A VIEW ends where it says, not where its string does: the Qwen / Llama-3
+// pre-token scanner took " " of " hello" (a view of its first byte) as the
+// lead of a letter run and read on into "h" -- past the input. Owned
+// strings hid it (their terminating '\0' is no letter).
+TEST(llm_tokenizer, a_view_is_encoded_to_its_end)
+{
+  const char* vocab_json = R"json({
+      "a": 0, "b": 1, "c": 2, "h": 3, "e": 4, "l": 5, "o": 6,
+      "w": 7, "r": 8, "d": 9, "Ġ": 10, "Ã": 11, "±": 12,
+      "ab": 13, "abc": 14, "he": 15, "ll": 16, "hell": 17,
+      "hello": 18, "Ġh": 19, "world": 20
+  })json";
+  const char* merges_txt =
+      "#version: 0.2\n"
+      "a b\nab c\nh e\nl l\nhe ll\nhell o\nĠ h\nw o\nwo r\n"
+      "wor l\nworl d\n";
+  const char* cfg_json = R"json({"added_tokens_decoder": {}})json";
+  std::string err;
+  const std::string js =
+      build_qwen_asr_tokenizer_json(vocab_json, merges_txt, cfg_json, err);
+  Session sess;
+  auto tok = genai::Tokenizer::from_huggingface_string(js, "synth", &sess);
+  ASSERT_TRUE(tok != nullptr);
+  const std::string text = " hello";
+  const auto view = tok->encode(std::string_view(text).substr(0, 1));
+  const auto owned = tok->encode(std::string(" "));
+  EXPECT_TRUE(view == owned);
+  EXPECT_TRUE(view.size() == 1u && view[0] == 10);
+}
+
 TEST(llm_tokenizer, ascii_round_trip_through_bpe)
 {
   Session sess;

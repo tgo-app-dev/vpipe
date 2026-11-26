@@ -922,6 +922,18 @@ kernel void bias_add_rows_f16(
   y[gid] = VPIPE_ELT(float(y[gid]) + float(bias[gid % (uint)N]));
 }
 
+// y[i] = 0 for i < n: a destination the accumulating GEMMs then add
+// into (a low-rank projection's banded second factor, which has no
+// writing form). 0:y 1:n.  grid (n).
+kernel void fill_zero_f16(
+    device VPIPE_ELT* y [[buffer(0)]],
+    constant uint&    n [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= n) { return; }
+  y[gid] = VPIPE_ELT(0.0f);
+}
+
 // out[i] = clamp(in[i], lo, hi). Serves the Gemma-4 audio ClippableLinear
 // input/output bounds and ReLU (lo=0, hi=+big). In-place safe.
 //   0:in 1:out 2:n 3:lo(float) 4:hi(float).  grid (n).

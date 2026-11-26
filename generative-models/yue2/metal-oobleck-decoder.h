@@ -63,6 +63,7 @@ class ComputeEncoder;
 namespace vpipe::genai {
 
 class WeightSet;
+class MetalLlamaWeights;
 
 class MetalOobleckDecoder {
 public:
@@ -85,6 +86,9 @@ public:
     // halves the latter).
     int in_proj      = 0;
     int hidden       = 0;
+    // Prepended to every tensor name: Stable Audio Open's checkpoint keeps
+    // the autoencoder under "pretransform.model.".
+    std::string prefix;
     int hop() const;
     // The narrowest -- last -- stage's width, which with the longest
     // sequence makes the widest activation.
@@ -100,6 +104,15 @@ public:
   static bool is_oobleck_dir(const std::string& dir);
   // MiniMax-Music3's vocoder directory (the DAC layout).
   static bool is_music3_vocoder_dir(const std::string& dir);
+  // What a load of the Oobleck layout HOLDS, off the tensors' headers --
+  // for a stage that books the decoder before it loads, where the file
+  // holds more than the decoder (Stable Audio Open's: the whole model):
+  // every conv under `<prefix>decoder.layers.` narrowed to f16 with its
+  // weight norm folded, its bias f16, each snake's alpha and beta f32 --
+  // the derived entries init_oobleck_ caches, byte for byte. 0 for the
+  // DAC layout (not sized here).
+  static std::size_t held_bytes(const MetalLlamaWeights& src,
+                                const Config& c);
 
   static std::unique_ptr<MetalOobleckDecoder> load(
       std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,

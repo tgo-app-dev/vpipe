@@ -63,6 +63,10 @@ arrives in **8–16 steps** instead of 30+.
     - [Fetch it, then name it](#fetch-it-then-name-it)
     - [What makes it different](#what-makes-it-different)
     - [What it costs](#what-it-costs-1)
+  - [Four to eight steps, a smaller DiT — HyperFlow H3 Flash](#four-to-eight-steps-a-smaller-dit--hyperflow-h3-flash)
+    - [Get it](#get-it-1)
+    - [What is different about it](#what-is-different-about-it)
+    - [What it costs](#what-it-costs-2)
   - [Six steps, any reference — Pika H3 Flex](#six-steps-any-reference--pika-h3-flex)
     - [Get the two adapters](#get-the-two-adapters)
     - [What the manifest decides](#what-the-manifest-decides)
@@ -79,7 +83,7 @@ arrives in **8–16 steps** instead of 30+.
   - [Three steps, streamed — TaoMate-H3](#three-steps-streamed--taomate-h3)
   - [A draft at 2K — Open-H3-Regenerate-2K](#a-draft-at-2k--open-h3-regenerate-2k)
     - [Get it, then run it](#get-it-then-run-it)
-    - [What it costs](#what-it-costs-2)
+    - [What it costs](#what-it-costs-3)
     - [Against the release](#against-the-release)
   - [The draft in context — Open-H3-Regenerate-2K-IC](#the-draft-in-context--open-h3-regenerate-2k-ic)
     - [Fetch the IC release, then run it](#fetch-the-ic-release-then-run-it)
@@ -93,7 +97,7 @@ arrives in **8–16 steps** instead of 30+.
   - [Pictures — P-H3-Image](#pictures--p-h3-image)
     - [Get it, then run it](#get-it-then-run-it-1)
     - [What is read off the checkpoint](#what-is-read-off-the-checkpoint)
-    - [What it costs](#what-it-costs-3)
+    - [What it costs](#what-it-costs-4)
     - [Checked against the reference](#checked-against-the-reference)
   - [Pictures through H3's VAE — the Image VAE](#pictures-through-h3s-vae--the-image-vae)
   - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
@@ -2736,6 +2740,126 @@ vpipe that is `sol_dense_steps: 2`, `sol_dense_layers: 2` and `sol_tau: 1.0` on
 unrouted model exactly, but the combination's picture quality has not been
 measured here — judge it on a seed you know. See
 [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing).
+
+### Four to eight steps, a smaller DiT — HyperFlow H3 Flash
+
+[HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash)
+(Video Rebirth) is HyperFlow's flow map distilled into a **smaller DiT** rather
+than an adapter on the released one: 13.7B parameters for FL2VA (13.9B for
+Ref2VA) against ~31B, sampled in **4, 6 or 8** steps. vpipe reads its ComfyUI
+single files, int8 ConvRot, 16 GB each; the text encoder and VAEs are the
+base's.
+
+#### Get it
+
+Two catalogue entries, one a partition, each named by `generate-video`'s
+`dit_dir`:
+
+```json
+"dit_dir": "VideoRebirthAI/hyperflow-h3-flash-fl2va-int8-convrot"
+```
+
+(`...-ref2va-int8-convrot` for a Ref2VA graph). A path to the `.safetensors`
+works as well. Keep the base partition on `model-select` for the encoder and
+VAEs, name no Turbo or HyperFlow adapter, and choose the grid with `steps`:
+**4**, **6** (the release's default) or **8** — any other count is refused.
+Keep the shifts at 12 / 3.
+[`hyperflow-h3-flash-text-to-video.vpipeline`](pipelines/hyperflow-h3-flash-text-to-video.vpipeline)
+is the step-2 graph so changed.
+
+```
+MetalMiniMaxH3Transformer: HyperFlow H3 Flash: 47 blocks (3 of the release's
+left out), 68 low-rank projections held resident (2.80 GB, widest rank 4992)
+GenerateVideoStage('generate-video'): HyperFlow H3 Flash -- its 6-step grid,
+two-time embedding at gate 0.25, shifts 12/3
+```
+
+#### What is different about it
+
+Three changes to the architecture, each stated by the file:
+
+- **Blocks left out.** FL2VA drops blocks 6, 21 and 22, Ref2VA block 9; the
+  file renumbers the rest from 0 and its `hyperflow` metadata names the ones
+  dropped. An adapter trained on the full model still binds by the release's
+  block indices; what it puts on a dropped block is skipped, said.
+- **Low-rank projections.** 17 of FL2VA's blocks (19 of Ref2VA's) hold some
+  projections as `up @ down` pairs, ranks padded to 64. They are held
+  resident beside the blocks (2.8 / 3.3 GB) and run as two skinny GEMMs; q, k
+  and v each have their own pair, run banded into the one flat q|k|v output.
+  The other projections are ComfyUI int8 ConvRot and take the int8 tiers as
+  any such checkpoint does.
+- **Two times, built in.** The endpoint embedder of
+  [HyperFlow](#eight-steps--hyperflow) is part of the model, with weights of
+  its own, so every forward needs its `(t, r)` pairs — there is no
+  single-time mode, and a flow-map adapter on top is refused. Its AdaLN reads
+  16 dimensions.
+- **Split across two machines** (`tensor_parallel`, feature
+  `tensor-parallel-flash/1`). A rank reads each low-rank pair whole and cuts
+  it as an adapter's factors are cut: q|k|v's and fc1's ups by the share's
+  rows (q|k|v's bands then the share's heads wide), the out projection's and
+  fc2's downs by its columns, each then a partial sum the block's exchanges
+  complete. The int8 ConvRot projections are read as stored, as a pruned
+  DiT's are under
+  [pi-H3](#two-or-four-steps-no-vae-decoder--pi-h3): ONLY on the `token`
+  and `token_plain` tiers, a share's heads on even heads and its
+  feed-forward rows on multiples of 256. On Flash's two times or pi-H3's
+  stock curve alike.
+
+**pi-H3 on Flash.** pi-H3's adapters were trained on the PRUNED form's time
+modulation, which Flash does not have. Name the stock pruned DiT as
+`curve_dit` beside Flash's `dit_dir`, and pi-H3's adapter on the config stage,
+and Flash's blocks run under the stock curve and its AdaLN, single-time —
+BennyDaBall930's recipe (comfyui_hyperflow_int8_nodes, pi-H3 Adapter for
+HyperFlow, its "pi-H3 time path"). pi-H3 then binds as on the pruned DiT:
+its LoRA and overwrites by the release's block indices (those on blocks 6, 21
+and 22 skipped, said), its final layer, its DWD head and its 4-step sampler.
+
+```json
+"dit_dir": "VideoRebirthAI/hyperflow-h3-flash-fl2va-int8-convrot",
+"curve_dit": "Comfy-Org/MiniMax-H3-FL2VA-pruned-int8-convrot"
+```
+
+Only the stock file's curve table and AdaLN are read, by the release's block
+index, and the file is opened through the model manager and kept for the
+model's life. On this path the model is single-time: a flow-map adapter is
+refused, as is the VDN branch. Its AdaLN (about 0.15 GB, copied out of the
+stock file) is held beside the model but not yet in the launch's memory plan;
+the model manager sees it once loaded. On the M5 Max, 832 × 480
+× 73 with Sol: 23.4 s in all, 22.9 GB peak, against 29.7 s and 27.4 GB for
+pi-H3 on the pruned DiT itself.
+
+A graph that does not say `steps` gets 6. The low-rank pairs are counted in
+the memory plan as resident (every pair, padded as held, and the streaming
+slots sized by the widest block without its pairs), and an adapter's
+footprint is counted by the release's block index, the dropped blocks left
+out.
+
+Not yet: tensor parallel (its low-rank pairs are not cut to a share), the VDN
+branch (trained per block on all 50), the Neural Engine on a low-rank block,
+and LoRA training (`train-lora` refuses Flash: its low-rank projections have
+no backward). Checked against the plain H3 it is made of — a synthetic
+released DiT with the same blocks removed, every pair multiplied out and the
+endpoint embedder carried by a flow-map adapter — to 1.1% relative; the
+streamed forms (slot pair, single slot, no slots) and the preloaded one byte
+for byte, a slot first built from a low-rank block then refilled with weights;
+and pi-H3's path against the pruned DiT made of the same blocks under the
+stock AdaLN by release index, to 1.1%
+(`hyperflow_h3_flash.runs_as_the_plain_h3_it_is_made_of`).
+
+#### What it costs
+
+Measured on an M5 Max (64 GB) from the int8 file, 832 × 480 × 39, everything
+in (load, encode, denoise, decode):
+
+| | steps | time | peak memory |
+|---|---:|---:|---:|
+| HyperFlow H3 Flash | 4 | 26.6 s | |
+| HyperFlow H3 Flash | 6 | 31.9 s | 19.2 GB |
+| HyperFlow H3 Flash | 8 | 38.0 s | |
+| released FL2VA, bf16, 4-step Turbo LoRA | 4 | 34.4 s | 45.6 GB |
+
+A first frame at the int8 Per Token tier took 28.6 s at 6 steps, and Ref2VA
+from one picture 34.9 s (21.7 GB).
 
 ### Six steps, any reference — Pika H3 Flex
 

@@ -1,0 +1,19 @@
+{
+  "id": "prepare-magi2-preview",
+  "stages": [
+    {
+      "id": "fetch-magi2-preview",
+      "type": "model-fetch",
+      "iports": [],
+      "config": {
+        "model_path": "sand-ai/MAGI-2-preview",
+        "hf_token": "",
+        "source": "",
+        "base_path": "./models",
+        "skip_existing_files": true,
+        "overwrite_existing": false
+      }
+    }
+  ],
+  "subpipelines": []
+}

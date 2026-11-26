@@ -123,6 +123,14 @@ class QwenImage21Trainer {
 
   MetalQwenImage21Transformer* model() const noexcept { return _m; }
 
+  // A RANK (the model's Config::tp): each module's cut of the whole
+  // adapter -- q / k / v's and gate / proj's B rows and to_out's and the
+  // down projection's A columns the share's, the other factor whole (its
+  // gradient summed across the ranks by the caller).
+  bool split_cuts(const std::vector<train::ModuleShape>& mods,
+                  std::map<std::string, train::ModuleCut>* out,
+                  std::string* err) const;
+
  private:
   using QWeight = MetalQwenImage21Transformer::QWeight;
   using BlockLora = MetalQwenImage21Transformer::BlockLora;
@@ -138,6 +146,16 @@ class QwenImage21Trainer {
   static const Proj* projs_();
 
   QwenImage21Trainer() = default;
+
+  // The widths a step works at: a rank's share's, else the model's.
+  struct Widths { int H = 0, NH = 0, HI = 0, FF = 0; };
+  static Widths widths_(const MetalQwenImage21Transformer::Config& c);
+  // `part` [rows, H] bf16, this rank's partial sum, completed in place by
+  // the other ranks' through the model's channel (lane 4, _tp_send).
+  bool tp_reduce_(metal_compute::CommandStream& st,
+                  metal_compute::ComputeEncoder& enc,
+                  const metal_compute::SharedBuffer& part, int rows,
+                  std::string* err);
 
   bool ensure_arena_(int rows, bool keep);
   // The weight as a dense [N, K] operand: itself, or widened / dequantized

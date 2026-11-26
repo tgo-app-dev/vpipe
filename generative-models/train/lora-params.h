@@ -33,6 +33,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -50,6 +51,21 @@ struct ModuleShape {
   // module's own place in the arena -- negative for a module of a fused
   // group whose rows interleave with the ones before it. Empty: in order.
   std::vector<int> b_rows;
+};
+
+// A RANK'S SHARE of one module (a DiT split across hosts by heads and
+// feed-forward rows, generative-models/tensor-parallel.h): where its
+// factors sit in the WHOLE module's file tensors, A [rank, whole_k] and
+// B [whole_n, rank]. A's columns [a_col0, a_col0 + k) are the share's;
+// file row i of the share's B is whole row b_src[i] (empty: row i, B
+// whole). A factor every rank holds whole -- q|k|v's and fc1's A, the
+// out projection's and fc2's B -- is SHARED: its gradient is each rank's
+// partial, summed across them before an update.
+struct ModuleCut {
+  int whole_n = 0, whole_k = 0;
+  int a_col0 = 0;
+  std::vector<int> b_src;
+  bool a_shared = false, b_shared = false;
 };
 
 class LoraParams {
@@ -78,6 +94,15 @@ class LoraParams {
               const std::vector<ModuleShape>& mods, int rank, float alpha,
               std::string* err);
 
+  // A RANK'S SHARE: each module's cut, by name (every module, or none).
+  // From here on init_random draws the WHOLE adapter's values and keeps
+  // the share's, load() reads a whole adapter file and keeps the share's,
+  // and save_gathered() writes the whole adapter -- so a split run starts
+  // where the unsplit one would, and what it saves binds anywhere.
+  bool set_cuts(const std::map<std::string, ModuleCut>& cuts,
+                std::string* err);
+  bool split() const noexcept { return !_cuts.empty(); }
+
   // A Kaiming-uniform (PEFT's default: bound 1 / sqrt(k)), B zero -- so
   // step 0 is exactly the base model. Writes the shadows on the CPU.
   void init_random(std::uint64_t seed);
@@ -85,7 +110,25 @@ class LoraParams {
   // Masters from an adapter file of matching modules and rank (any float
   // dtype). Modules the file lacks keep their current values; a module
   // of the wrong shape is refused. `loaded` counts the modules read.
+  // Split (set_cuts): the file is the whole adapter's.
   bool load(const std::string& path, int* loaded, std::string* err);
+
+  // The SHARED factors' gradients (ModuleCut::a_shared / b_shared), in
+  // arena order: [offset, count) of the A grads, then of the B grads.
+  struct Span { bool b = false; std::size_t off = 0, n = 0; };
+  std::vector<Span> shared_grad_spans() const;
+
+  // SAVED SPLIT: each module's whole A and B, every rank's share in its
+  // place (a shared factor from the rank given `own_shared`, the others
+  // contributing zeros), summed across the ranks by `gather` -- in place,
+  // f32 -- and written by the rank given `write`, as save() writes.
+  using Gather = std::function<bool(std::vector<float>& v, std::string*)>;
+  bool save_gathered(const std::string& path,
+                     const std::map<std::string, std::string>& meta,
+                     bool write, bool own_shared, const Gather& gather,
+                     std::string* err,
+                     const metal_compute::SharedBuffer* ema_a = nullptr,
+                     const metal_compute::SharedBuffer* ema_b = nullptr) const;
 
   // The adapter as bf16, from the masters (or from `ema`, an f32 arena of
   // the masters' layout), with `meta` added to alpha and rank.
@@ -131,6 +174,7 @@ class LoraParams {
   float _alpha = 0.0f;
   std::size_t _na = 0, _nb = 0;
   std::vector<Module> _mods;
+  std::vector<ModuleCut> _cuts;   // by module, when split
   metal_compute::SharedBuffer _a_m, _b_m, _a_g, _b_g, _a_s, _b_s;
 };
 

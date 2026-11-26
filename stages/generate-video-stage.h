@@ -30,6 +30,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,6 +38,9 @@
 namespace vpipe {
 
 struct TensorBeat;
+namespace genai {
+struct VideoPlanContext;
+}  // namespace genai
 
 // Video DiT denoiser: text (and optionally keyframe or reference latents)
 // -> a latent VIDEO, plus a latent SOUNDTRACK from the families that
@@ -237,6 +241,26 @@ public:
   // loads no VAE), or empty. Plan-time, off the latched model config:
   // what vae-decode's plan asks of the stage that feeds it.
   std::string planned_dwd_head() const;
+  // What a registered family's plan extension (video-host-ext.h) is told
+  // beside the root: the latched model config, this stage's acceleration
+  // bag and whether the box's GPU has matrix cores.
+  // `fam` / `root`: a registered family's, so a RANK's plan carries its
+  // share (plugin_tp_share_); null / empty, none.
+  genai::VideoPlanContext video_plan_context_(
+      genai::VideoModelFamily* fam = nullptr,
+      const std::string& root = {}) const;
+  // A registered family as one RANK of a DiT split across hosts
+  // (`tensor_parallel`; video-host-ext.h's VideoTensorParallel): its share
+  // of the family's widths. False, with `err`, where the family does not
+  // split or the share does not fit -- or, `transport`, where no
+  // transport is registered under the bag's name.
+  bool plugin_tp_share_(genai::VideoModelFamily* fam,
+                        const std::string& root, bool transport,
+                        genai::TpShare* out, std::string* err) const;
+  // ...the share the plan context points at (video_plan_context_).
+  mutable genai::TpShare _plan_tp;
+  // The registered family's share since it loaded; inactive, not a rank.
+  genai::TpShare _plugin_tp;
 
   // Latch a `model-select` constant before the planning phase, so
   // the claim above is made against the model this graph will
@@ -370,6 +394,7 @@ private:
   // MiniMax-H3 only: a DiT checkpoint in place of the one under _hf_dir
   // (the text encoder and the VAEs still come from there). See h3_dit_.
   std::string   _dit_dir;
+  std::string   _curve_dit;      // `curve_dit` (Config::curve_from)
   std::string h3_dit_(const std::string& root,
                       const std::string& partition) const;
   // DWD's plan at a clip's planned geometry (`head` the adapter file):
@@ -556,6 +581,8 @@ private:
   // MiniMax-H3-Image the release's 6, or -- a scheduler wired and
   // `steps` said -- the larger, which bounds what the port can ask.
   int h3_steps_() const;
+  // HyperFlow H3 Flash with `steps` unsaid: its default 6 grid.
+  bool h3_flash_default_() const;
   // A scheduler port's grid on MiniMax-H3: the spec's type (anything but
   // `simple`, which is the model's own grid) over h3_sched_steps_() at
   // h3_schedule_shift_(), ComfyUI's way (genai::FlowSchedulerSpec, the
@@ -666,6 +693,10 @@ private:
   // revised the plan to, so a clip that moved nothing does not replan.
   void correct_plugin_holding_(const char* when);
   std::size_t _plugin_load_floor_ = 0;
+  // ...and per source, for a generator that answers each one
+  // (genai::VideoHeldBySource): its load floor and last revised preload.
+  std::map<std::string, std::size_t> _plugin_source_floor_;
+  std::map<std::string, std::size_t> _plugin_source_revised_;
   // The int8 layout's growth a PRELOADED H3 holds beside its files when
   // its w4 projections' layout is held (Config::i8_hold_w4); 0 when it
   // converts per projection or streams. Set at load, read by
@@ -811,6 +842,9 @@ private:
   // opened as a clip's denoise starts, let go when it ends). Null, with
   // `err`, when there is no such transport or it refuses (or throws).
   std::shared_ptr<genai::TpChannel> open_tp_channel_(std::string* err);
+  // ...for `share` (a registered family's rank).
+  std::shared_ptr<genai::TpChannel>
+  open_tp_channel_(const genai::TpShare& share, std::string* err);
   // `L` and the PATCH grid are here because the VDN branch's scratch is
   // sized by the video geometry rather than by the packed sequence, and
   // it is the half of the forward's memory that used to go unplanned.

@@ -327,21 +327,48 @@ private:
   std::shared_ptr<genai::MetalMiniMaxH3FastVae> _h3_fast;
   // DWD (sideband::kDwdHead): a pi-H3 adapter's pixel head, decoding the
   // DiT's features in place of a VAE -- loaded from the file the beat
-  // names, at the first beat that does. `_want_dwd` is the beat in hand's
-  // ask, read before anything loads: while beats are DWD the video VAE's
-  // weights are deferred (`_h3_deferred`) until one that is a latent.
+  // names, at the first beat that does; KEPT WARM between graphs under
+  // `keep_loaded`, by its file, tier and tuning (kH3DwdWarmKind), and
+  // then -- a hold there as the plan is made -- taken back AS THE STAGE
+  // STARTS. Never loaded cold then: a load beside the other stages'
+  // kernel tuning made their routes, and the clip, vary from one process
+  // to the next. `_want_dwd` is the beat in hand's ask, read before
+  // anything loads: while beats are DWD the video VAE's weights are
+  // deferred (`_h3_deferred`) until one that is a latent.
   std::shared_ptr<genai::MetalMiniMaxH3FastVae> _h3_dwd;
   std::string _h3_dwd_file;
+  std::string _h3_dwd_warm_key;
+  // The plan's answer, LATCHED where it is made (declare_resources, before
+  // any driver runs): the head generate-video will hand over, and whether
+  // a warm hold of it was there then -- process() reads these, never
+  // generate-video's config, which that stage's own driver rewrites as
+  // it starts. Cleared once used: a run's.
+  mutable std::string _dwd_plan_head;
+  mutable bool _dwd_plan_warm = false;
   bool _want_dwd = false;
   bool _h3_deferred = false;
-  bool ensure_h3_dwd_(const std::string& file);
+  // `warm_only`: taken back from a warm hold, else nothing (no load).
+  bool ensure_h3_dwd_(const std::string& file, bool warm_only = false);
+ public:
+  // The warm hold of a DWD head: its kind, and its key -- the adapter
+  // file (canonical), the int8 tier and whether kernels are tuned.
+  static constexpr const char* kH3DwdWarmKind = "minimax-h3-dwd-head";
+  static std::string dwd_warm_key(const std::string& canonical_file,
+                                  int i8_tier, bool autotune);
+  // `file` as the manager keys holds: canonical, else as given.
+  static std::string dwd_canonical(const std::string& file);
+ private:
   // The DWD head the stage feeding the latent port will hand over
   // (GenerateVideoStage::planned_dwd_head), or empty -- plan-time, so a
   // DWD graph claims the head and not the VAE.
   std::string planned_dwd_head_() const;
-  // The head's weights' claim label (a decode-phase arena of this stage:
-  // they are read from the adapter's file, whose claim is the DiT's).
+  // The head's weights' claim label (an arena of this stage, held from
+  // its start -- it loads as the stage starts: they are read from the
+  // adapter's file, whose claim is the DiT's).
   std::string dwd_head_label_() const;
+  // Models are kept warm here, by config (`keep_loaded`, policy auto or
+  // keep): a DWD head is kept between graphs.
+  bool dwd_early_() const;
   // What the H3 decoder in use was built with, as its warm hold's key.
   std::string _h3_vae_warm_key;
   static constexpr const char* kH3VaeWarmKind = "minimax-h3-video-vae";

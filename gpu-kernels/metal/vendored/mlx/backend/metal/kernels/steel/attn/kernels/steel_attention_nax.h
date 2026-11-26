@@ -133,6 +133,20 @@ constant bool pv_int8_set [[function_constant(308)]];
 constant bool pv_int8 =
     is_function_constant_defined(pv_int8_set) ? pv_int8_set : false;
 
+// vpipe: SINKS UNDER THE SMOOTHED INT8 QK. K is quantized as K - mean(K)
+// over tokens, which moves every key's score in a row by -q.mean -- exact
+// for a softmax over the keys alone, but a sink is a logit of its own and
+// must move with them, or its share of the row's mass is off by
+// exp(q.mean). With this (and has_sinks, qk_int8) each row's sink is
+// taken as sink - scale * q.mean, q the row's query as bound at buffer 0
+// and the mean K's as the prologue subtracted it ([KVH, BD] f32 at buffer
+// 22, MetalSageAttention::bind). MEASURED before it (sage_attention.
+// int8_pv_held, sinks taking a large share): cosine 0.76 against f64.
+constant bool qk_sink_shift_set [[function_constant(311)]];
+constant bool qk_sink_shift =
+    is_function_constant_defined(qk_sink_shift_set) ? qk_sink_shift_set
+                                                    : false;
+
 template <typename T>
 struct TransformScale {
   T scale;
@@ -238,6 +252,9 @@ template <
     const device uint8_t* V8 [[buffer(19), function_constant(pv_int8)]],
     const device float* v_scale [[buffer(20), function_constant(pv_int8)]],
     const device float* v_mean [[buffer(21), function_constant(pv_int8)]],
+    // vpipe: K's mean as the smoothing subtracted it (qk_sink_shift).
+    const device float* k_mean [[buffer(22),
+                                 function_constant(qk_sink_shift)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -354,11 +371,39 @@ template <
     max_score[i] = Limits<AccumType>::finite_min;
   }
 
+  // vpipe: each row's sink as the scores see it -- shifted by the smoothed
+  // int8 QK's q.mean where qk_sink_shift says (see it above).
+  metal::vec<AccumType, kRowsPT> sink_row{0};
   if (has_sinks) {
+    const AccumType s0 = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
-      max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
-      sum_score[i] = 1;
+      AccumType s2 = s0;
+      if (qk_int8 && qk_sink_shift) {
+        const int r = sm + i * otile_t::kFragRowsJump;
+        if (int(tid.x) * BQ + tm + r < params->qL) {
+          const size_t kvh =
+              size_t(params->H) / size_t(max(1, params->gqa_factor));
+          const device float* mu =
+              k_mean + (size_t(tid.z) * kvh + size_t(kv_head_idx)) * BD;
+          const device T* qr = Q + int64_t(r) * params->Q_strides[2];
+          float dot = 0.0f;
+          for (short c = 0; c < BD; ++c) {
+            dot = fma(float(qr[c]), mu[c], dot);
+          }
+          s2 -= AccumType(float(scale2) * dot);
+        }
+      }
+      sink_row[i] = s2;
+      // Under the int8 P*V the sink stays OUT of the running max: P is
+      // quantized to 8 bits against that max, and a sink above the keys'
+      // scores would squeeze them into the bottom of the grid while
+      // holding no V itself. Its mass is added to the sum after the loop
+      // -- the same softmax.
+      if (!pv_int8) {
+        max_score[i] = s2;
+        sum_score[i] = 1;
+      }
     }
   }
 
@@ -1008,6 +1053,17 @@ template <
     }
   }
 
+  // vpipe: the sink's mass, kept out of the int8 P*V's running max (see
+  // its init), now in the sum: exp2(sink - max), the max as rescaled and
+  // stepped down. A row that attended no key reads +inf here, and is zero
+  // below as an empty row is.
+  if (pv_int8 && has_sinks) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      sum_score[i] += fast::exp2(sink_row[i] - max_score[i]);
+    }
+  }
+
   // vpipe: the int8 P*V's held product into O, its offset out first.
   if (pv_int8) {
     VPIPE_PV8_FIX();
@@ -1071,8 +1127,20 @@ template <
   Otile.template row_bin_op<MulOp>(rcp);
 
   // vpipe: the int8 P*V's V scale and mean back, after the normalize, so a
-  // row that attended nothing stays zero.
+  // row that attended nothing stays zero. The mean comes back over the
+  // KEYS' share of the softmax mass: a sink's share holds no V. Its weight
+  // at the end is exp2(sink - max) -- it entered as 1 at max = sink and
+  // has been rescaled with the sum ever since, step-downs included -- so
+  // the keys hold 1 - that over the sum. Without a sink they hold it all.
   if (pv_int8) {
+    metal::vec<AccumType, kRowsPT> keys_share;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      keys_share[i] =
+          has_sinks
+              ? AccumType(1) - fast::exp2(sink_row[i] - max_score[i]) * rcp[i]
+              : AccumType(1);
+    }
     STEEL_PRAGMA_UNROLL
     for (short id = 0; id < TD; id++) {
       thread auto& of = Otile.frag_at(0, id);
@@ -1084,7 +1152,14 @@ template <
         for (short ii = 0; ii < otile_t::kFragThrRows; ii++) {
           if (rcp[ii] != AccumType(0)) {
             const auto loc = ii * otile_t::kFragThrCols + jj;
-            of[loc] = of[loc] * (AccumType)vc + (AccumType)mu;
+            // Without a sink, the expression as it always was (the same
+            // bits for every caller before sinks were taken here).
+            if (has_sinks) {
+              of[loc] = of[loc] * (AccumType)vc +
+                        (AccumType)mu * keys_share[ii];
+            } else {
+              of[loc] = of[loc] * (AccumType)vc + (AccumType)mu;
+            }
           }
         }
       }

@@ -649,6 +649,7 @@ Coverage, and what each family's plan-time bound is actually worth:
 | LTX-2.5 | rounded config geometry | vae-decode (family path) | exact |
 | MiniMax-H3 | rounded config geometry | vae-decode (video path) | exact |
 | wan | rounded config geometry | vae-decode (video path) | exact |
+| MAGI-2-preview | its turbo decoder's walk at the model's one clip length (`video_vae_working_bytes`) | vae-decode (family path: the frames plus the decoder's own working set) | the decode's device peak within its booking |
 
 > **The Qwen-Image VAE spells its width `base_dim` and ships no
 > `block_out_channels` at all** — every quantized Krea-2 and

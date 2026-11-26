@@ -25,9 +25,15 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
+#include "generative-models/tensor-parallel.h"
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -238,6 +244,47 @@ struct Env {
   const char* k;
   Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
   ~Env() { ::unsetenv(k); }
+};
+
+// TWO RANKS IN ONE PROCESS (as tensor-parallel.cc's): each exchange
+// leaves this rank's partial under its seq and takes the peer's.
+struct PairLink {
+  std::mutex              mu;
+  std::condition_variable cv;
+  struct Entry {
+    std::vector<std::uint8_t> part[2];
+    bool has[2] = {false, false};
+    int  taken = 0;
+  };
+  std::map<std::uint64_t, Entry> at;
+};
+struct PairChannel final : TpChannel {
+  std::shared_ptr<PairLink>  link;
+  int                        me = 0;
+  std::atomic<std::uint64_t> exchanges{0};
+  PairChannel(std::shared_ptr<PairLink> l, int r) : link(std::move(l)), me(r)
+  {
+  }
+  bool exchange(const void* partial, void* others, std::size_t bytes,
+                TpDType, std::uint64_t seq, std::string* err) override
+  {
+    const auto* p = static_cast<const std::uint8_t*>(partial);
+    std::unique_lock<std::mutex> lk(link->mu);
+    PairLink::Entry& e = link->at[seq];
+    e.part[me].assign(p, p + bytes);
+    e.has[me] = true;
+    link->cv.notify_all();
+    if (!link->cv.wait_for(lk, std::chrono::seconds(60),
+                           [&]() { return e.has[1 - me]; }) ||
+        e.part[1 - me].size() != bytes) {
+      if (err != nullptr) { *err = "the ranks are out of step"; }
+      return false;
+    }
+    std::memcpy(others, e.part[1 - me].data(), bytes);
+    exchanges.fetch_add(1);
+    if (++e.taken == 2) { link->at.erase(seq); }
+    return true;
+  }
 };
 
 }  // namespace
@@ -964,6 +1011,7 @@ TEST(minimax_h3_pruned, pi_flow_overwrites_are_the_patched_file)
     bool contract = false;
     std::vector<double> sigmas;
     std::size_t lora_bytes = 0;
+    std::size_t lora_cached = 0;
   };
   auto run = [&](const fs::path& file, const std::vector<H3::LoraSpec>& lo,
                  bool stream, float live = -1.0f, bool dwd = false) -> Out {
@@ -978,6 +1026,7 @@ TEST(minimax_h3_pruned, pi_flow_overwrites_are_the_patched_file)
     o.loaded = true;
     o.modules = lo.empty() ? 0 : m->lora_modules(0);
     o.lora_bytes = m->lora_bytes();
+    o.lora_cached = m->lora_cached_bytes();
     if (live >= 0.0f) { m->set_lora_scale(0, live); }
     if (const auto* sc = m->sampling_contract()) {
       o.contract = true;
@@ -1038,6 +1087,136 @@ TEST(minimax_h3_pruned, pi_flow_overwrites_are_the_patched_file)
   EXPECT_TRUE(vs < 2e-3 && vsa < 2e-3 && half < 2e-3);
   EXPECT_TRUE(x1s.v == x1.v);
   EXPECT_TRUE(x0.v == b0.v);
+  // SPLIT: the same adapter on two ranks -- a head each, half the
+  // feed-forward rows each -- its overwrites of block 1's projections cut
+  // as the weights are, its AdaLN, norm and heads whole on both. The two
+  // ranks' velocities are the same; against the unsplit model the split
+  // differs by the bf16 rounding of two partial sums in place of one.
+  struct Split {
+    std::vector<std::uint16_t> v[2];
+    std::uint64_t exchanges = 0;
+    bool ok = false;
+    std::size_t lora_bytes[2] = {0, 0};
+    std::size_t lora_cached[2] = {0, 0};
+    TpShare tp[2];
+  };
+  auto split_run = [&](const std::vector<H3::LoraSpec>& lo,
+                       const fs::path& dit) {
+    Split sp;
+    auto link = std::make_shared<PairLink>();
+    std::shared_ptr<PairChannel> ch[2];
+    std::unique_ptr<H3> m[2];
+    bool loaded = true;
+    for (int r = 0; r < 2 && loaded; ++r) {
+      H3::Config c = pc;
+      c.tp = TpShare{};
+      c.tp.rank = r;
+      c.tp.ranks = 2;
+      c.tp.n_heads = pc.n_heads;
+      c.tp.n_ffn = pc.ffn;
+      c.tp.head0 = r == 0 ? 0 : 1;
+      c.tp.head1 = r == 0 ? 1 : pc.n_heads;
+      c.tp.ffn0 = r == 0 ? 0 : F / 2;
+      c.tp.ffn1 = r == 0 ? F / 2 : F;
+      try {
+        m[r] = H3::load(dit.string(), mc, c, false, lo);
+      } catch (const std::exception& e) {
+        std::printf("[minimax_h3_pruned] split refused: %s\n", e.what());
+      }
+      loaded = m[r] != nullptr;
+      if (!loaded) { break; }
+      sp.lora_bytes[r] = m[r]->lora_bytes();
+      sp.lora_cached[r] = m[r]->lora_cached_bytes();
+      sp.tp[r] = c.tp;
+      m[r]->set_gemm_route(H3::GemmRoute::kSteelBm32);
+      ch[r] = std::make_shared<PairChannel>(link, r);
+      std::string berr;
+      loaded = m[r]->begin_tp_generation(ch[r], &berr);
+      if (!loaded) { std::printf("  begin: %s\n", berr.c_str()); }
+    }
+    if (!loaded) { return sp; }
+    std::vector<std::uint16_t>* sv = sp.v;
+    bool ok[2] = {false, false};
+    auto fwd = [&](int r) {
+      H3::Step st;
+      st.video = &vb;
+      st.audio = &abuf;
+      st.text = &tb;
+      st.layout = &lay;
+      st.timesteps = &uniq;
+      st.row_timestep_index = &ridx;
+      std::string ferr;
+      H3::Velocity out = m[r]->forward(st, &ferr);
+      if (out.empty()) {
+        std::printf("[minimax_h3_pruned] split forward %d: %s\n", r,
+                    ferr.c_str());
+        return;
+      }
+      const auto* p = static_cast<const std::uint16_t*>(out.video.contents());
+      sv[r].assign(p, p + out.video.byte_size() / 2);
+      ok[r] = true;
+    };
+    std::thread t1([&]() { fwd(1); });
+    fwd(0);
+    t1.join();
+    sp.ok = ok[0] && ok[1];
+    sp.exchanges = ch[0]->exchanges.load();
+    return sp;
+  };
+  {
+    // The split's own cost, the base alone: the bf16 rounding of two
+    // partial sums in place of one. The adapter's split is held to it.
+    // ...and the PATCHED file's (the overwrites written into the DiT, its
+    // LoRA alone): what splitting this very model costs, nothing cut but
+    // the weights -- the adapter's cut overwrites are held to that.
+    const Split sb = split_run({}, fdit);
+    const Split sa = split_run({{fad.string(), 1.0f}}, fdit);
+    const Split sq = split_run({{flo.string(), 1.0f}}, fpat);
+    ASSERT_TRUE(sb.ok && sa.ok && sq.ok);
+    const double base_split = rel_(sb.v[0], b0.v);
+    const double split = rel_(sa.v[0], x1.v);
+    const double patched_split = rel_(sq.v[0], q1.v);
+    const double split_vs_patched = rel_(sa.v[0], sq.v[0]);
+    std::printf("[minimax_h3_pruned] the patched file split %.3g from its "
+                "own; the adapter's split %.3g from the patched file's "
+                "split\n", patched_split, split_vs_patched);
+    std::printf("[minimax_h3_pruned] pi-H3 split over two ranks: %s, "
+                "%.3g from the unsplit model -- the base's split %.3g from "
+                "its own (the adapter moves the base %.3g), %llu "
+                "exchanges\n",
+                sa.v[0] == sa.v[1] ? "the ranks IDENTICAL"
+                                   : "the ranks DIFFER",
+                split, base_split, moved,
+                (unsigned long long)sa.exchanges);
+    EXPECT_TRUE(sa.v[0] == sa.v[1]);
+    EXPECT_TRUE(split < 1.5 * patched_split + 1e-3 && split < moved / 20);
+    EXPECT_TRUE(split_vs_patched < 2e-3);
+    EXPECT_TRUE(sa.exchanges > 0);
+    // A RANK holds its cut of each overwrite alone (bind_sets_ reads them
+    // uncached), and lora_footprint books that share -- not the whole
+    // tensors beside the cuts.
+    for (int r = 0; r < 2; ++r) {
+      const auto fr = H3::lora_footprint(fad.string(), LAYERS, &pc,
+                                         &sa.tp[r]);
+      const std::size_t patch = (std::size_t)D * 9 * 4;
+      std::printf("[minimax_h3_pruned] rank %d booked %zu = held %zu + "
+                  "patch %zu\n", r, fr.whole, sa.lora_bytes[r], patch);
+      EXPECT_TRUE(fr.whole == sa.lora_bytes[r] + patch);
+    }
+    // ...and its slot's weight set caches none of those overwrites whole:
+    // what the unsplit model's set keeps, less block 1's out, fc1 and fc2
+    // (lora_bytes() sees the cuts either way, never the set's cache).
+    const std::size_t whole_proj =
+        ((std::size_t)H * (std::size_t)pc.inner() +
+         (std::size_t)2 * F * H + (std::size_t)H * F) *
+        2;
+    for (int r = 0; r < 2; ++r) {
+      std::printf("[minimax_h3_pruned] rank %d's set caches %zu, the "
+                  "unsplit model's %zu, the projection overwrites %zu\n",
+                  r, sa.lora_cached[r], x1.lora_cached, whole_proj);
+      EXPECT_TRUE(sa.lora_cached[r] + whole_proj == x1.lora_cached);
+    }
+  }
   // Overwrites: 2 AdaLN weights + 1 bias, 3 projections, final AdaLN
   // weight + bias, norm, 4 head tensors = 13; LoRA 3.
   EXPECT_TRUE(x1.modules == 13 + 3);
@@ -1135,4 +1314,345 @@ TEST(minimax_h3_pruned, pi_flow_overwrites_are_the_patched_file)
     fs::remove(f);
   }
   fs::remove(dir);
+}
+
+// pi-H3 SPLIT ON THE REAL FILES: Comfy-Org's PRUNED FL2VA DiT in int8
+// ConvRot -- its codes cut by rows, and on the rotation's 256-column group
+// edges, with their row scales -- under Lakonik's 4-step DWD adapter, its
+// block overwrites cut as the weights are, on the int8 Per Token tier the
+// codes run as stored. Two ranks (28 heads and 7,168 feed-forward rows
+// each) over an in-process link against the unsplit model, with the
+// adapter and without: the ranks' velocities the same.
+//
+// Both sides run the codes NATIVELY, as most of a clip's rows do: a
+// rank's bands are at least kTpMinBand, past the int8 GEMM's row floor;
+// this small clip's 72 rows are not, so the floor is lowered to take
+// them. Below it a projection runs dense from the codes widened per GEMM
+// -- exact on a rank too. A real clip does take
+// it: a rank's last band need only clear half a band (9,654 rows: 7 x
+// 1,280 + 694), so every main block's last band widens there while the
+// unsplit model runs those rows natively.
+//
+// The split is held to the error the int8 file carries anyway: with the
+// bf16 pruned DiT given, the split's distance from it within 1.5 times
+// the unsplit int8 model's (measured on the M5 Max: 0.152 against 0.169
+// plain, 0.247 against 0.319 under the adapter); else within twice what
+// the tier itself does to the model against its widened forward (1.56
+// times plain, measured). A small clip: 2 x 8 x 8 latents, 8 audio rows,
+// 8 text rows; preloaded (VPIPE_PI_H3_STREAM: streamed, as generate-video
+// runs them -- on a 64 GB Mac stream the bf16 DiT: it is 40 GB).
+// Env: VPIPE_PI_H3_PRUNED_DIT (minimax_h3_fl2va_pruned_int8_convrot.
+// safetensors), VPIPE_PI_H3_ADAPTER (pi_h3_4step_dwd_adapter/diffusion_
+// pytorch_model.safetensors), VPIPE_PI_H3_BF16_DIT (optional: the bf16
+// pruned DiT).
+TEST(minimax_h3_pruned, pi_h3_splits_over_the_int8_convrot_dit)
+{
+  const char* dit = std::getenv("VPIPE_PI_H3_PRUNED_DIT");
+  const char* adp = std::getenv("VPIPE_PI_H3_ADAPTER");
+  if (dit == nullptr || adp == nullptr) {
+    std::printf("  SKIP: VPIPE_PI_H3_PRUNED_DIT / VPIPE_PI_H3_ADAPTER "
+                "unset\n");
+    return;
+  }
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  Env noqmm("VPIPE_H3_NO_QMM_AUTOTUNE", "1");
+  Env notile("VPIPE_H3_NO_ATTN_TILE_AUTOTUNE", "1");
+  Env minm("VPIPE_I8_GEMM_MIN_M", "1");   // a clip's native path
+  const bool stream = std::getenv("VPIPE_PI_H3_STREAM") != nullptr;
+  H3::Config pc;
+  std::string err;
+  ASSERT_TRUE(H3::config_from_json(dit, pc, &err));
+  ASSERT_TRUE(pc.pruned());
+  pc.i8_gemm = true;
+  pc.i8_tier = 2;   // token: ConvRot's codes as stored
+  pc.autotune = false;
+  const int latf = 2, lath = 8, latw = 8, naud = 8, ntext = 8;
+  h3::PackedLayout lay;
+  const std::vector<int> tags((std::size_t)ntext, h3::kTextTag);
+  ASSERT_TRUE(h3::build_packed_sequence(tags, latf, lath, latw, naud,
+                                        pc.patch_h, pc.patch_w,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kFirst}, &lay));
+  auto input = [&](std::size_t n, float k) {
+    metal_compute::SharedBuffer b = mc->make_shared_buffer(n * 2);
+    auto* p = static_cast<std::uint16_t*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      p[i] = rne_(std::sin((float)i * k) * 0.5f);
+    }
+    return b;
+  };
+  const metal_compute::SharedBuffer vb = input(
+      lay.video_indices.size() * (std::size_t)pc.video_patch_elems(), 0.017f);
+  const metal_compute::SharedBuffer abuf = input(
+      (std::size_t)lay.num_audio_rows * (std::size_t)pc.audio_channels,
+      0.031f);
+  const metal_compute::SharedBuffer tb =
+      input((std::size_t)ntext * pc.text_dim, 0.005f);
+  std::vector<float> uniq;
+  std::vector<int> ridx;
+  h3::build_row_timesteps(lay, 0.6f, 0.45f, 0.999f, &uniq, &ridx);
+  auto step = [&]() {
+    H3::Step st;
+    st.video = &vb;
+    st.audio = &abuf;
+    st.text = &tb;
+    st.layout = &lay;
+    st.timesteps = &uniq;
+    st.row_timestep_index = &ridx;
+    return st;
+  };
+  auto read = [](const H3::Velocity& v) {
+    const auto* p = static_cast<const std::uint16_t*>(v.video.contents());
+    return std::vector<std::uint16_t>(p, p + v.video.byte_size() / 2);
+  };
+  std::uint64_t whole_native = 0;
+  auto whole = [&](const std::vector<H3::LoraSpec>& lo, bool i8 = true,
+                   H3::GemmRoute route = H3::GemmRoute::kSteelBm32) {
+    H3::Config cw = pc;
+    if (!i8) {
+      cw.i8_gemm = false;   // ConvRot widened per GEMM: no int8 tier
+      cw.i8_tier = 0;
+    }
+    std::unique_ptr<H3> m = H3::load(dit, mc, cw, stream, lo);
+    if (m == nullptr) { return std::vector<std::uint16_t>{}; }
+    m->set_gemm_route(route);
+    std::string ferr;
+    H3::Velocity v = m->forward(step(), &ferr);
+    if (i8) { whole_native += m->convrot_native_gemms(); }
+    if (v.empty()) { std::printf("  whole: %s\n", ferr.c_str()); }
+    return v.empty() ? std::vector<std::uint16_t>{} : read(v);
+  };
+  const int h = pc.n_heads / 2, f = pc.ffn / 2;
+  struct Ranks {
+    std::vector<std::uint16_t> v[2];
+    std::uint64_t exchanges = 0;
+    std::uint64_t native = 0;
+  };
+  auto split = [&](const std::vector<H3::LoraSpec>& lo,
+                   const char* path = nullptr,
+                   const H3::Config* base = nullptr) {
+    if (path == nullptr) { path = dit; }
+    if (base == nullptr) { base = &pc; }
+    Ranks out;
+    auto link = std::make_shared<PairLink>();
+    std::shared_ptr<PairChannel> ch[2];
+    std::unique_ptr<H3> m[2];
+    for (int r = 0; r < 2; ++r) {
+      H3::Config c = *base;
+      c.tp = TpShare{};
+      c.tp.rank = r;
+      c.tp.ranks = 2;
+      c.tp.n_heads = pc.n_heads;
+      c.tp.n_ffn = pc.ffn;
+      c.tp.head0 = r == 0 ? 0 : h;
+      c.tp.head1 = r == 0 ? h : pc.n_heads;
+      c.tp.ffn0 = r == 0 ? 0 : f;
+      c.tp.ffn1 = r == 0 ? f : pc.ffn;
+      m[r] = H3::load(path, mc, c, stream, lo);
+      if (m[r] == nullptr) { return out; }
+      m[r]->set_gemm_route(H3::GemmRoute::kSteelBm32);
+      ch[r] = std::make_shared<PairChannel>(link, r);
+      std::string berr;
+      if (!m[r]->begin_tp_generation(ch[r], &berr)) {
+        std::printf("  begin: %s\n", berr.c_str());
+        return out;
+      }
+    }
+    auto fwd = [&](int r) {
+      std::string ferr;
+      H3::Velocity v = m[r]->forward(step(), &ferr);
+      if (v.empty()) {
+        std::printf("  rank %d: %s\n", r, ferr.c_str());
+        return;
+      }
+      out.v[r] = read(v);
+    };
+    std::thread t1([&]() { fwd(1); });
+    fwd(0);
+    t1.join();
+    out.native = m[0]->convrot_native_gemms();
+    out.exchanges = ch[0]->exchanges.load();
+    return out;
+  };
+  auto minus = [](const std::vector<std::uint16_t>& a,
+                  const std::vector<std::uint16_t>& b) {
+    std::vector<std::uint16_t> d(a.size());
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      d[i] = rne_(bf16f_(a[i]) - bf16f_(b[i]));
+    }
+    return d;
+  };
+  const std::vector<H3::LoraSpec> lo = {{adp, 1.0f}};
+  const std::vector<std::uint16_t> wb = whole({}), wa = whole(lo);
+  // What the tier itself does to the model: the Per Token forward
+  // against the widened one.
+  const std::vector<std::uint16_t> wbw = whole({}, false);
+  const std::vector<std::uint16_t> waw = whole(lo, false);
+  // VPIPE_PI_H3_BF16_DIT: the same pruned DiT in bf16, run whole with no
+  // int8 -- the reference both int8 forwards are measured from.
+  std::vector<std::uint16_t> fb, fa;
+  const char* bf = std::getenv("VPIPE_PI_H3_BF16_DIT");
+  H3::Config cb;
+  if (bf != nullptr) {
+    std::string berr;
+    ASSERT_TRUE(H3::config_from_json(bf, cb, &berr));
+    cb.i8_gemm = false;
+    cb.i8_tier = 0;
+    cb.autotune = false;
+    auto run = [&](const std::vector<H3::LoraSpec>& l,
+                   H3::GemmRoute route = H3::GemmRoute::kSteelBm32) {
+      std::unique_ptr<H3> m = H3::load(bf, mc, cb, stream, l);
+      if (m == nullptr) { return std::vector<std::uint16_t>{}; }
+      m->set_gemm_route(route);
+      std::string ferr;
+      H3::Velocity v = m->forward(step(), &ferr);
+      return v.empty() ? std::vector<std::uint16_t>{} : read(v);
+    };
+    fb = run({});
+    fa = run(lo);
+    ASSERT_TRUE(!fb.empty() && !fa.empty());
+    // SENSITIVITY: the same unsplit forward with only its GEMMs' order of
+    // summation changed (the MMA tile in place of steel's) -- what any
+    // reordering of a sum moves each model by, a split's included.
+    const auto mma = H3::GemmRoute::kMma128;
+    const std::vector<std::uint16_t> fbm = run({}, mma), fam = run(lo, mma);
+    const std::vector<std::uint16_t> wbm = whole({}, false, mma);
+    const std::vector<std::uint16_t> wam = whole(lo, false, mma);
+    ASSERT_TRUE(!fbm.empty() && !fam.empty() && !wbm.empty() &&
+                !wam.empty());
+    std::printf("[minimax_h3_pruned] a GEMM route changed, unsplit: the "
+                "bf16 DiT moves %.3g plain, %.3g under the adapter; the "
+                "int8 file widened %.3g, %.3g\n", rel_(fbm, fb),
+                rel_(fam, fa), rel_(wbm, wbw), rel_(wam, waw));
+  }
+  // WEIGHT EXACTNESS: a projection widened as a band under the int8 row
+  // floor runs it, on each rank and unsplit -- each rank's bytes the
+  // whole one's rows (q|k|v, fc1) or columns (out, fc2), to the bit.
+  {
+    H3::Config cw = pc;
+    std::unique_ptr<H3> mw = H3::load(dit, mc, cw, true, lo);
+    std::unique_ptr<H3> mr[2];
+    H3::Config cr[2];
+    for (int r = 0; r < 2; ++r) {
+      cr[r] = pc;
+      cr[r].tp = TpShare{};
+      cr[r].tp.rank = r;
+      cr[r].tp.ranks = 2;
+      cr[r].tp.n_heads = pc.n_heads;
+      cr[r].tp.n_ffn = pc.ffn;
+      cr[r].tp.head0 = r == 0 ? 0 : h;
+      cr[r].tp.head1 = r == 0 ? h : pc.n_heads;
+      cr[r].tp.ffn0 = r == 0 ? 0 : f;
+      cr[r].tp.ffn1 = r == 0 ? f : pc.ffn;
+      mr[r] = H3::load(dit, mc, cr[r], true, lo);
+    }
+    ASSERT_TRUE(mw != nullptr && mr[0] != nullptr && mr[1] != nullptr);
+    const int HD = pc.head_dim, I = pc.inner(), F = pc.ffn;
+    int checked = 0, same = 0;
+    for (const int blk : {0, 19, 47}) {
+      for (int which = 0; which < 4; ++which) {
+        int wn = 0, wk = 0;
+        const std::vector<std::uint16_t> w =
+            mw->widened_for_test(blk, which, &wn, &wk);
+        for (int r = 0; r < 2; ++r) {
+          int sn = 0, sk = 0;
+          const std::vector<std::uint16_t> sv =
+              mr[r]->widened_for_test(blk, which, &sn, &sk);
+          const TpShare& t = cr[r].tp;
+          // The whole's rows and columns the share should hold.
+          std::vector<std::pair<int, int>> rows;
+          int k0 = 0, k1 = wk;
+          if (which == 0) {
+            if (pc.qkv_per_head) {
+              rows = {{t.head0 * 3 * HD, t.head1 * 3 * HD}};
+            } else {
+              for (int part = 0; part < 3; ++part) {
+                rows.push_back({part * I + t.head0 * HD,
+                                part * I + t.head1 * HD});
+              }
+            }
+          } else if (which == 2) {
+            rows = {{t.ffn0, t.ffn1}, {F + t.ffn0, F + t.ffn1}};
+          } else {
+            rows = {{0, wn}};
+            k0 = which == 1 ? t.head0 * HD : t.ffn0;
+            k1 = which == 1 ? t.head1 * HD : t.ffn1;
+          }
+          bool eq = !w.empty() && !sv.empty() && sk == k1 - k0;
+          int sr = 0;
+          for (const auto& [ra, rb] : rows) {
+            for (int row = ra; row < rb && eq; ++row, ++sr) {
+              eq = sr < sn &&
+                   std::memcmp(&sv[(std::size_t)sr * sk],
+                               &w[(std::size_t)row * wk + k0],
+                               (std::size_t)sk * 2) == 0;
+            }
+          }
+          eq = eq && sr == sn;
+          ++checked;
+          if (eq) { ++same; }
+          if (!eq) {
+            std::printf("  block %d projection %d rank %d: %dx%d share of "
+                        "%dx%d DIFFERS\n", blk, which, r, sn, sk, wn, wk);
+          }
+        }
+      }
+    }
+    std::printf("[minimax_h3_pruned] widened shares: %d / %d IDENTICAL to "
+                "the whole projection's rows or columns (blocks 0, 19, 47, "
+                "under the adapter)\n", same, checked);
+    EXPECT_TRUE(checked == 24 && same == checked);
+  }
+  const Ranks sb = split({}), sa = split(lo);
+  ASSERT_TRUE(!wb.empty() && !wa.empty() && !wbw.empty() && !waw.empty() &&
+              !sb.v[0].empty() && !sb.v[1].empty() && !sa.v[0].empty() &&
+              !sa.v[1].empty());
+  const double plain = rel_(sb.v[0], wb), adapted = rel_(sa.v[0], wa);
+  const double moved = rel_(wa, wb);
+  const double delta = rel_(minus(sa.v[0], sb.v[0]), minus(wa, wb));
+  const double own = rel_(wb, wbw), own_a = rel_(wa, waw);
+  std::printf("[minimax_h3_pruned] pi-H3 on the int8 ConvRot pruned DiT, "
+              "split %d / %d heads, %d / %d ffn rows%s: the ranks %s; the "
+              "plain split %.3g from the unsplit model, under the adapter "
+              "%.3g (it moves the model %.3g, its delta split vs unsplit "
+              "%.3g); the tier itself %.3g / %.3g from the widened model; "
+              "%llu exchanges, %llu / %llu native int8 GEMMs\n", h,
+              pc.n_heads - h, f, pc.ffn - f, stream ? ", streamed" : "",
+              sa.v[0] == sa.v[1] && sb.v[0] == sb.v[1] ? "IDENTICAL"
+                                                       : "DIFFER",
+              plain, adapted, moved, delta, own, own_a,
+              (unsigned long long)sa.exchanges,
+              (unsigned long long)whole_native,
+              (unsigned long long)(sb.native + sa.native));
+  EXPECT_TRUE(sa.v[0] == sa.v[1] && sb.v[0] == sb.v[1]);
+  EXPECT_TRUE(sa.exchanges > 0);
+  EXPECT_TRUE(whole_native > 0 && sb.native > 0 && sa.native > 0);
+  if (!fb.empty()) {
+    const double wf = rel_(wb, fb), wfa = rel_(wa, fa);
+    const double sf = rel_(sb.v[0], fb), sfa = rel_(sa.v[0], fa);
+    std::printf("[minimax_h3_pruned] from the bf16 DiT: unsplit %.3g "
+                "plain, %.3g under the adapter; split %.3g, %.3g\n", wf,
+                wfa, sf, sfa);
+    EXPECT_TRUE(sf < 1.5 * wf);
+    EXPECT_TRUE(sfa < 1.5 * wfa);
+    // THE CONTROL: the bf16 DiT itself split, dense on both ranks -- what
+    // a rank's widened rows run (the codes widened per GEMM are dense
+    // bf16 too). Its distance from its own unsplit forward is what two
+    // bf16 partial sums cost under this DiT's activations, with no int8
+    // anywhere.
+    const Ranks cbs = split({}, bf, &cb), cas = split(lo, bf, &cb);
+    ASSERT_TRUE(!cbs.v[0].empty() && !cas.v[0].empty());
+    const double cp = rel_(cbs.v[0], fb), ca = rel_(cas.v[0], fa);
+    std::printf("[minimax_h3_pruned] the bf16 DiT split, dense: %.3g "
+                "plain, %.3g under the adapter from its unsplit forward; "
+                "the ranks %s\n", cp, ca,
+                cbs.v[0] == cbs.v[1] && cas.v[0] == cas.v[1] ? "IDENTICAL"
+                                                             : "DIFFER");
+    EXPECT_TRUE(cbs.v[0] == cbs.v[1] && cas.v[0] == cas.v[1]);
+  } else {
+    EXPECT_TRUE(plain < std::max(1e-2, 2.0 * own));
+    EXPECT_TRUE(adapted < std::max(1e-2, 2.0 * own_a));
+  }
 }

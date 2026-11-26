@@ -93,6 +93,28 @@ MiniMaxH3LoraTrainer::load(const LoadArgs& a, std::string* err)
   }
   if (a.floor_seq > 0) {
     t->_m->set_scratch_floor(a.floor_seq, a.floor_text);
+    // A rank's exchange buffers at the widest sample from the first: the
+    // samples' lengths vary, and each regrowth is a new registration.
+    // Its eight band buffers at the WIDEST BAND ANY SAMPLE CUTS, which is
+    // not the widest sample's: the bands are balanced, so a shorter
+    // sequence can cut wider ones (a 2,561-row sample 1,408-row bands
+    // where a 4,388-row one cuts 1,152). The most over every length up
+    // to the widest -- band_rows without the prompt's rule, which only
+    // ever runs a block whole.
+    if (a.cfg.tp.active()) {
+      const std::size_t row = (std::size_t)a.cfg.hidden * 2;
+      int band = 0;
+      for (int s = 1; s <= a.floor_seq; ++s) {
+        band = std::max(band, MetalMiniMaxH3Transformer::band_rows(a.cfg, s));
+      }
+      const std::size_t whole = (std::size_t)a.floor_seq * row;
+      const std::size_t banded = (std::size_t)band * row;
+      t->_m->set_tp_exchange_floor(whole, banded);
+      // The bands' eight and the bulk's two chunks (TpBulk's default).
+      // Send and others are the plan's already: plan_arena_bytes counts
+      // scratch_bytes' rank term, 2 x [seq, hidden] at the widest sample.
+      t->_split_bytes = 8 * banded + 2 * ((std::size_t)32 << 20);
+    }
   }
   std::string e;
   t->_t = MiniMaxH3Trainer::create(t->_m.get(), &e);
@@ -747,6 +769,14 @@ MiniMaxH3LoraTrainer::parent_model_type() const
   if (_variant == Variant::kH3i) { return "minimax-h3-image"; }
   return _partition.empty() ? std::string("minimax-h3")
                             : "minimax-h3-" + _partition;
+}
+
+std::string
+MiniMaxH3LoraTrainer::layout_type_of(Variant v, const std::string& partition)
+{
+  if (v == Variant::kPh3) { return "p-h3-image"; }
+  if (v == Variant::kH3i) { return "minimax-h3-image"; }
+  return partition == "ref2va" ? "minimax-h3-ref2va" : "minimax-h3";
 }
 
 }  // namespace genai

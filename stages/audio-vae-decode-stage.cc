@@ -13,6 +13,7 @@
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-provenance.h"
 #include "stages/model-registry.h"
 
@@ -232,7 +233,16 @@ AudioVaeDecodeStage::declare_resources() const
     // ROLE is what tells them apart.
     const std::string a =
         f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
-    if (!a.empty()) { return model_memory::weight_claims({a}); }
+    if (!a.empty()) {
+      // At what the family says its decoder holds of that file, where it
+      // says: a file can carry far more than the codec (MAGI-2's Stable
+      // Audio Open, the whole model), and its size on disk would book it.
+      std::vector<ResourceClaim> out = model_memory::weight_claims({a});
+      model_memory::claims_at_holdings(
+          &out, f->declare_holdings(root,
+                                    genai::VaeModelFamily::kRoleAudio));
+      return out;
+    }
     // No separate audio file: the family's single answer is the right
     // one, which is what a checkpoint with one VAE for both means.
     return f->declare_resources(root, vae_dir);

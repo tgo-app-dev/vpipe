@@ -1056,9 +1056,13 @@ MetalQwenImage21Transformer::load_tp_block_(WeightSet& ws, int L, Block& b,
 }
 
 bool
-MetalQwenImage21Transformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
+MetalQwenImage21Transformer::tp_buffer_(SharedBuffer& b, std::size_t bytes,
+                                        bool band)
 {
   if (b.byte_size() >= bytes) { return true; }
+  // Grown, to the floor where one is set (set_tp_exchange_floor); a
+  // banded lane's to its band's.
+  bytes = std::max(bytes, band ? _tp_band_floor_bytes : _tp_floor_bytes);
   if (!b.empty() && _tp_pipe != nullptr) { _tp_pipe->forget(b); }
   b = SharedBuffer{};
   b = _mc->make_shared_buffer(bytes);
@@ -1067,7 +1071,7 @@ MetalQwenImage21Transformer::tp_buffer_(SharedBuffer& b, std::size_t bytes)
 
 bool
 MetalQwenImage21Transformer::begin_tp_generation(
-    std::shared_ptr<TpChannel> ch, std::string* err)
+    std::shared_ptr<TpChannel> ch, std::string* err, std::uint64_t first_seq)
 {
   auto fail = [&](const std::string& why) {
     if (err != nullptr) { *err = "tensor parallel: " + why; }
@@ -1076,15 +1080,16 @@ MetalQwenImage21Transformer::begin_tp_generation(
   end_tp_generation();
   if (!_cfg.tp.active()) { return fail("this model is not a rank"); }
   if (!ch) { return fail("no channel to the other ranks"); }
-  // Four lanes: a block's bands alternate between two for the attention's
-  // partials and two for the feed-forward's (forward()'s rank tail).
-  auto pipe = std::make_unique<TpOverlap>(_mc, ch, 4, TpDType::kBF16);
+  // Five lanes: a block's bands alternate between two for the attention's
+  // partials and two for the feed-forward's (forward()'s rank tail); the
+  // fifth a training step's (the trainer's _tp_send).
+  auto pipe = std::make_unique<TpOverlap>(_mc, ch, 5, TpDType::kBF16);
   if (!pipe->valid()) {
     return fail("no events or thread for the exchanges");
   }
   _tp_ch = std::move(ch);
   _tp_pipe = std::move(pipe);
-  _tp_seq = 0;
+  _tp_seq = first_seq;
   // The stop the stage set before the picture, which the channel polls
   // while it waits on the others.
   try {
@@ -1111,9 +1116,11 @@ MetalQwenImage21Transformer::end_tp_generation()
   // Every buffer the channel was handed forgotten before it goes (a
   // transport may keep a device's registration of each).
   if (_tp_ch) {
+    if (_tp_bulk != nullptr) { _tp_bulk->forget(*_tp_ch); }
     for (const SharedBuffer* b :
-         {&_tp_part[0], &_tp_part[1], &_tp_part[2], &_tp_part[3],
-          &_tp_recv[0], &_tp_recv[1], &_tp_recv[2], &_tp_recv[3]}) {
+         {&_tp_send, &_tp_others, &_tp_part[0], &_tp_part[1], &_tp_part[2],
+          &_tp_part[3], &_tp_recv[0], &_tp_recv[1], &_tp_recv[2],
+          &_tp_recv[3]}) {
       if (b->empty()) { continue; }
       try {
         _tp_ch->forget(b->contents(), b->byte_size());
@@ -1127,12 +1134,34 @@ MetalQwenImage21Transformer::end_tp_generation()
   }
   _tp_ch.reset();
   _tp_seq = 0;
+  _tp_meet = false;
   // THE BUFFERS GO WITH THE PICTURE. The plan books them with the
   // forward's activations alone (forward_scratch_bytes), and the
   // transport's registration of them went with the forget above; kept,
   // they sat unbooked beside the decode and in a DiT kept warm.
   for (SharedBuffer& b : _tp_part) { b = SharedBuffer{}; }
   for (SharedBuffer& b : _tp_recv) { b = SharedBuffer{}; }
+  _tp_send = SharedBuffer{};
+  _tp_others = SharedBuffer{};
+}
+
+bool
+MetalQwenImage21Transformer::tp_bulk(const void* mine, void* others,
+                                     std::size_t bytes, TpDType dtype,
+                                     std::string* err)
+{
+  if (_tp_pipe == nullptr) {
+    if (err != nullptr) { *err = "tensor parallel: no generation is open"; }
+    return false;
+  }
+  if (_tp_bulk == nullptr) { _tp_bulk = std::make_unique<TpBulk>(_mc); }
+  std::string e;
+  if (!_tp_bulk->exchange(*_tp_pipe, mine, others, bytes, dtype, &_tp_seq,
+                          &e)) {
+    if (err != nullptr) { *err = "tensor parallel: " + e; }
+    return false;
+  }
+  return true;
 }
 
 bool
@@ -2208,8 +2237,12 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     return fail("qwen-image-2.1 forward: a rank with no channel "
                 "(begin_tp_generation)");
   }
-  if (rank && req.train != nullptr) {
-    return fail("qwen-image-2.1 forward: a rank runs no training forward");
+  // A rank's training forward keeps each block's input and the final
+  // layer's, all whole on every rank; its intermediates (TrainKeep) are
+  // a whole model's alone -- a rank's backward recomputes each block.
+  if (rank && req.train != nullptr && req.train->keep != nullptr) {
+    return fail("qwen-image-2.1 forward: a rank keeps no block's "
+                "intermediates (its backward recomputes them)");
   }
   std::string tp_err;
   if (JT <= 0 || IMG <= 0 || _cfg.n_heads * Hd != H) {
@@ -2404,11 +2437,36 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
     for (const auto& bd : tp_bands) { widest = std::max(widest, bd.second); }
     const std::size_t pb = (std::size_t)widest * (std::size_t)H * 2;
     const int lanes = tp_bands.size() > 1 ? 4 : 1;
+    // Every lane at the band floor (set_tp_exchange_floor: the widest run
+    // any sample cuts, a whole block's included) -- lane 0 too when this
+    // block goes whole, or a short sample would grow it to the whole
+    // floor and register it again.
     for (int k = 0; k < lanes; ++k) {
-      if (!tp_buffer_(_tp_part[k], pb) || !tp_buffer_(_tp_recv[k], pb)) {
+      if (!tp_buffer_(_tp_part[k], pb, true) ||
+          !tp_buffer_(_tp_recv[k], pb, true)) {
         return fail("qwen-image-2.1 forward: tensor parallel: no room for "
                     "the partial sums");
       }
+    }
+  }
+
+  // A TRAINING RANK MEETS ITS PEER HERE, ON THE CPU (set_tp_meet), its
+  // int8 tuning and buffers done and nothing yet encoded: a rank that
+  // measured a shape longer, or paged its blocks in, is waited out by the
+  // other's CPU, not by its GPU parked on a band's sum, which the
+  // watchdog counts. Every rank runs the same forwards, so the meetings
+  // pair; the rows are compared.
+  if (_tp_meet && _tp_pipe != nullptr) {
+    const std::int64_t mine = ROWS;
+    std::int64_t other = -1;
+    std::string e;
+    if (!tp_bulk(&mine, &other, sizeof mine, TpDType::kF32, &e)) {
+      return fail("qwen-image-2.1 forward: before the blocks: " + e);
+    }
+    if (other != mine) {
+      return fail(fmt("qwen-image-2.1 forward: tensor parallel: this "
+                      "rank's forward is {} rows, the other's {}", mine,
+                      other)());
     }
   }
 
@@ -3395,7 +3453,10 @@ MetalQwenImage21Transformer::forward(const Request& req, std::string* err)
       auto step_a = [&](int k) {
         const int r0 = tp_bands[(std::size_t)k].first;
         const int n = tp_bands[(std::size_t)k].second;
-        lin(af, (std::size_t)r0 * HI, b->ow, _tp_part[k % la], 0, n, H, HI);
+        // Its adapter's term a partial too: A cut by the share's heads'
+        // columns, B whole (QwenImage21Trainer::split_cuts).
+        lin(af, (std::size_t)r0 * HI, b->ow, _tp_part[k % la], 0, n, H, HI,
+            LB(&BlockLora::o));
         va[(std::size_t)k] = post(k % la, n);
       };
       auto step_b = [&](int k) {
@@ -4347,7 +4408,13 @@ MetalQwenImage21Transformer::bind_live_lora(int slot, const LiveLoraFn& fn)
 {
   if (slot < 0 || slot >= kMaxLoraSlots || !fn) { return 0; }
   if (!_lora.valid() && !_lora.init(_mc, _use_mma2)) { return 0; }
-  const int H = _cfg.hidden, FF = _cfg.hidden * _cfg.mlp_ratio;
+  // A RANK's at its share's widths: q / k / v and gate / proj its rows,
+  // to_out and the down projection its columns (QwenImage21Trainer::
+  // split_cuts says which of the whole each is).
+  const bool rank = _cfg.tp.active();
+  const int H = _cfg.hidden;
+  const int HI = rank ? _cfg.tp.heads() * _cfg.head_dim : H;
+  const int FF = rank ? _cfg.tp.ffn() : _cfg.hidden * _cfg.mlp_ratio;
   _lora_blk[slot].clear();
   _lora_blk[slot].resize((std::size_t)_cfg.n_layers);
   _lora_fix[slot] = FixedLora{};
@@ -4361,10 +4428,10 @@ MetalQwenImage21Transformer::bind_live_lora(int slot, const LiveLoraFn& fn)
   };
   for (int L = 0; L < _cfg.n_layers; ++L) {
     BlockLora& d = _lora_blk[slot][(std::size_t)L];
-    ask(block_module(L, "attn.to_q"), H, H, &d.q);
-    ask(block_module(L, "attn.to_k"), H, H, &d.k);
-    ask(block_module(L, "attn.to_v"), H, H, &d.v);
-    ask(block_module(L, "attn.to_out.0"), H, H, &d.o);
+    ask(block_module(L, "attn.to_q"), HI, H, &d.q);
+    ask(block_module(L, "attn.to_k"), HI, H, &d.k);
+    ask(block_module(L, "attn.to_v"), HI, H, &d.v);
+    ask(block_module(L, "attn.to_out.0"), H, HI, &d.o);
     ask(block_module(L, "img_mlp.gate_layer"), FF, H, &d.gate);
     ask(block_module(L, "img_mlp.proj"), FF, H, &d.proj);
     ask(block_module(L, "img_mlp.out"), H, FF, &d.out);

@@ -91,22 +91,68 @@ class QwenImage21Family final : public LoraFamily {
     const std::string dit = dit_(root);
     MetalQwenImage21Transformer::Config cfg;
     if (!config_(dit, r, &cfg, err)) { return false; }
+    // A RANK OF A SPLIT RUN: its share of every block's seven projections
+    // -- the weights, the step's intermediates and the adapter at the
+    // share's widths -- every block recomputed, on the GPU alone.
+    const bool rank = r.tp.active();
+    if (rank) {
+      if (r.tp.n_heads != cfg.n_heads ||
+          r.tp.n_ffn != cfg.hidden * cfg.mlp_ratio) {
+        *err = fmt("the share is of {} heads and {} rows, the DiT has {} "
+                   "and {}", r.tp.n_heads, r.tp.n_ffn, cfg.n_heads,
+                   cfg.hidden * cfg.mlp_ratio)();
+        return false;
+      }
+      if (r.ane) {
+        *err = "a rank of a split run trains on the GPU alone (no `ane`)";
+        return false;
+      }
+      cfg.ane_ffn = cfg.ane_qkv = false;
+      cfg.tp = r.tp;
+    }
     out->dit_dir = dit;
     // THE ADAPTER'S STATE, per parameter -- from the dims, before
-    // anything loads.
+    // anything loads; a rank's at its share's widths.
     const std::size_t H = (std::size_t)cfg.hidden;
-    const std::size_t FF = H * (std::size_t)cfg.mlp_ratio;
+    const std::size_t HI =
+        rank ? (std::size_t)r.tp.heads() * (std::size_t)cfg.head_dim : H;
+    const std::size_t FF =
+        rank ? (std::size_t)r.tp.ffn() : H * (std::size_t)cfg.mlp_ratio;
     const std::size_t per_block =
-        r.targets == "attn" ? 8 * H : 8 * H + 3 * (H + FF);
+        r.targets == "attn" ? 4 * (H + HI) : 4 * (H + HI) + 3 * (H + FF);
     out->state_bytes = state_bytes_(per_block * (std::size_t)r.rank *
                                         (std::size_t)cfg.n_layers, r);
-    out->held_bytes = model_memory::dir_weights_bytes(dit);
-    out->floor_bytes =
-        model_memory::streaming_floor_bytes(dit, {"transformer_blocks."});
+    if (rank) {
+      std::size_t floor = 0;
+      out->held_bytes =
+          MetalQwenImage21Transformer::tp_held_bytes(dit, cfg, nullptr,
+                                                     &floor);
+      out->floor_bytes = floor;
+      out->note = fmt("RANK {} of {}: heads [{}, {}) of {}, feed-forward "
+                      "rows [{}, {}) of {}", r.tp.rank, r.tp.ranks,
+                      r.tp.head0, r.tp.head1, r.tp.n_heads, r.tp.ffn0,
+                      r.tp.ffn1, r.tp.n_ffn)();
+    } else {
+      out->held_bytes = model_memory::dir_weights_bytes(dit);
+      out->floor_bytes =
+          model_memory::streaming_floor_bytes(dit, {"transformer_blocks."});
+    }
     out->arena_recompute = QwenImage21Trainer::arena_bytes(
         cfg, r.max_cells + r.max_text, r.rank, false);
-    out->arena_keep = QwenImage21Trainer::arena_bytes(
-        cfg, r.max_cells + r.max_text, r.rank, true);
+    out->arena_keep = rank ? 0
+                           : QwenImage21Trainer::arena_bytes(
+                                 cfg, r.max_cells + r.max_text, r.rank, true);
+    return true;
+  }
+
+  bool
+  split_dims(const std::string& root, const std::string&, const RunShape& r,
+             int* n_heads, int* n_ffn, std::string* err) const override
+  {
+    MetalQwenImage21Transformer::Config cfg;
+    if (!config_(dit_(root), r, &cfg, err)) { return false; }
+    *n_heads = cfg.n_heads;
+    *n_ffn = cfg.hidden * cfg.mlp_ratio;
     return true;
   }
 
@@ -118,6 +164,12 @@ class QwenImage21Family final : public LoraFamily {
     la.ws = a.ws;
     la.stream_blocks = a.stream_blocks;
     if (!config_(a.plan->dit_dir, *a.run, &la.cfg, err)) { return nullptr; }
+    // A rank's share (RunShape::tp): the load narrows the model to it.
+    if (a.run->tp.active()) {
+      la.cfg.tp = a.run->tp;
+      la.cfg.ane_ffn = la.cfg.ane_qkv = false;
+      la.floor_rows = a.run->max_cells + a.run->max_text;
+    }
     return QwenImage21LoraTrainer::load(la, err);
   }
 };
@@ -268,8 +320,70 @@ class MiniMaxH3Family final : public LoraFamily {
       }
       out->aux_dir = man.heads_file;
     }
-    out->state_bytes = state_bytes_(params_(cfg, r), r);
+    // A RANK OF A SPLIT RUN: its share of every block's four projections
+    // -- the weights, the step's activations and the adapter at the
+    // share's widths -- its AdaLN pruned at load (a rank holds none to
+    // run unbaked); its blocks' activations kept where the box holds
+    // them, at the share's widths (the stage has the ranks agree).
+    const bool rank = r.tp.active();
+    if (rank) {
+      // The video DiT and MiniMax-H3-Image's (its step heads whole on
+      // each rank: they read the residual stream, whole everywhere).
+      if (variant_(root) == V::kPh3) {
+        *err = "P-H3-Image does not train split across hosts yet";
+        return false;
+      }
+      if (r.tp.n_heads != cfg.n_heads || r.tp.n_ffn != cfg.ffn) {
+        *err = fmt("the share is of {} heads and {} rows, the DiT has {} "
+                   "and {}", r.tp.n_heads, r.tp.n_ffn, cfg.n_heads,
+                   cfg.ffn)();
+        return false;
+      }
+      if (r.ane) {
+        *err = "a rank of a split run trains on the GPU alone (no `ane`)";
+        return false;
+      }
+    }
+    M::Config tcfg = cfg;
+    tcfg.tp = r.tp;
+    const M::Config rcfg = M::rank_config(tcfg);
+    out->state_bytes = state_bytes_(params_(rcfg, r), r);
     const std::size_t widen = M::fp8_widen_bytes(dit, cfg);
+    if (rank) {
+      out->arena_recompute = MiniMaxH3LoraTrainer::plan_arena_bytes(
+          rcfg, r.max_frames, r.max_grid_h, r.max_grid_w, r.max_text, r.rank,
+          widen, r.max_anchors, r.max_cond_rows);
+      out->arena_keep = MiniMaxH3LoraTrainer::plan_arena_bytes(
+          rcfg, r.max_frames, r.max_grid_h, r.max_grid_w, r.max_text, r.rank,
+          widen, r.max_anchors, r.max_cond_rows, true);
+      std::size_t base = 0, base_floor = 0;
+      for (const std::string& l : r.base_loras) {
+        const auto fp = M::lora_footprint(l, cfg.n_layers, nullptr, &r.tp);
+        base += fp.whole;
+        base_floor += fp.streamed;
+      }
+      std::size_t floor = 0;
+      const std::size_t held =
+          M::tp_held_bytes(dit, tcfg, 0, nullptr, &floor);
+      const std::size_t adaln = cfg.pruned() ? 0 : pruned_adaln_bytes_(cfg);
+      // (MiniMax-H3-Image's per-step heads are booked as an extra
+      // folder, whole on every rank, as for the whole model.)
+      out->held_bytes = held + base + adaln;
+      out->floor_bytes = floor + base_floor + adaln;
+      out->note = fmt("RANK {} of {}: heads [{}, {}) of {}, feed-forward rows "
+                      "[{}, {}) of {}; AdaLN {}", r.tp.rank, r.tp.ranks,
+                      r.tp.head0, r.tp.head1, r.tp.n_heads, r.tp.ffn0,
+                      r.tp.ffn1, r.tp.n_ffn,
+                      cfg.pruned() ? "already pruned" : "pruned at load")();
+      out->opts = FlexData::make_object();
+      auto oo = out->opts.as_object();
+      oo.insert_or_assign("prune_adaln", FlexData::make_bool(!cfg.pruned()));
+      oo.insert_or_assign("dit_partition", FlexData::make_string(part));
+      oo.insert_or_assign("partition",
+                          FlexData::make_string(M::partition_of(root, part)));
+      oo.insert_or_assign("variant", FlexData::make_int((int)variant_(root)));
+      return true;
+    }
     out->arena_recompute = MiniMaxH3LoraTrainer::plan_arena_bytes(
         cfg, r.max_frames, r.max_grid_h, r.max_grid_w, r.max_text, r.rank,
         widen, r.max_anchors, r.max_cond_rows);
@@ -347,6 +461,25 @@ class MiniMaxH3Family final : public LoraFamily {
     return true;
   }
 
+  bool
+  split_dims(const std::string& root, const std::string& model_type,
+             const RunShape& r, int* n_heads, int* n_ffn,
+             std::string* err) const override
+  {
+    if (variant_(root) == V::kPh3) {
+      *err = "P-H3-Image does not train split across hosts yet";
+      return false;
+    }
+    M::Config cfg;
+    if (!M::config_from_json(dit_of_(root, model_type, r), cfg, err,
+                             partition_(model_type))) {
+      return false;
+    }
+    *n_heads = cfg.n_heads;
+    *n_ffn = cfg.ffn;
+    return true;
+  }
+
   std::unique_ptr<LoraTrainer>
   load(const LoadArgs& a, std::string* err) const override
   {
@@ -392,6 +525,8 @@ class MiniMaxH3Family final : public LoraFamily {
       la.partition.clear();
     }
     la.cfg.prune_adaln = oo.at("prune_adaln").as_bool(false);
+    // A rank's share (RunShape::tp): the load narrows the model to it.
+    if (a.run != nullptr && a.run->tp.active()) { la.cfg.tp = a.run->tp; }
     // int8 matrix-core GEMMs in the tap forward, and the backward's dX
     // GEMMs on the same route (MiniMaxH3Trainer::set_i8_backward).
     la.cfg.i8_gemm = a.run != nullptr && a.run->i8;

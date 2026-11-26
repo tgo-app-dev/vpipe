@@ -13,6 +13,7 @@
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
+#include "generative-models/tensor-parallel.h"
 #include "generative-models/train/lora-params.h"
 
 #include <cstdint>
@@ -205,6 +206,57 @@ class LoraTrainer {
     return std::string(family()) + "-lora";
   }
   virtual std::string parent_model_type() const { return family(); }
+  // What two ranks of one run must agree on to train the same thing:
+  // the kind of model as it trains, not as its files are named. Two
+  // machines may name one checkpoint differently (a record, a filename, a
+  // manifest, none) where the training is the same; a family whose
+  // names carry no such difference keeps its parent's type.
+  virtual std::string layout_type() const { return parent_model_type(); }
+
+  // ---- A RANK OF A SPLIT RUN (RunShape::tp) ---------------------------
+  // The DiT is split across hosts by heads and feed-forward rows
+  // (generative-models/tensor-parallel.h), each a train-lora stage of its
+  // own, stepping together: every rank's adapter is its share
+  // (LoraParams::set_cuts), every forward and backward exchanges partial
+  // sums through the channel, and between steps the stage carries the
+  // rest -- the shared factors' gradients, the norm, the adapter saved
+  // whole -- through split_bulk(). A family that cannot is never handed
+  // a share: its plan refuses one.
+
+  // Whether this trainer is a rank.
+  virtual bool split() const { return false; }
+  // Each module's cut, for the parameters before they are initialized.
+  virtual bool split_cuts(const std::vector<ModuleShape>& mods,
+                          std::map<std::string, ModuleCut>* out,
+                          std::string* err) const
+  {
+    (void)mods; (void)out;
+    if (err != nullptr) { *err = std::string(family()) + " is not split"; }
+    return false;
+  }
+  // The run's channel, from exchange `first_seq` on (every rank alike);
+  // and its end, on every way out.
+  virtual bool split_begin(std::shared_ptr<TpChannel> ch,
+                           std::uint64_t first_seq, std::string* err)
+  {
+    (void)ch; (void)first_seq;
+    if (err != nullptr) { *err = std::string(family()) + " is not split"; }
+    return false;
+  }
+  virtual void split_end() {}
+  // What a rank's exchange buffers hold at the run's widest sample -- the
+  // block's partials, its bands', the bulk's -- BEYOND what the family's
+  // plan arena (LoadPlan::arena_*) already books, for the stage to add.
+  virtual std::size_t split_exchange_bytes() const { return 0; }
+  // Bytes in bulk between steps (TpBulk): `mine` out (null: zeros), the
+  // others' sum into `others` (null: discarded).
+  virtual bool split_bulk(const void* mine, void* others, std::size_t bytes,
+                          TpDType dtype, std::string* err)
+  {
+    (void)mine; (void)others; (void)bytes; (void)dtype;
+    if (err != nullptr) { *err = std::string(family()) + " is not split"; }
+    return false;
+  }
 
   virtual void* query_extension(std::string_view) { return nullptr; }
 };
@@ -240,6 +292,11 @@ struct RunShape {
   // adapters beneath the trained one), resolved to paths.
   std::string dit_dir;
   std::vector<std::string> base_loras;
+  // A RANK OF A SPLIT RUN: this host's share of the heads and the
+  // feed-forward rows (inactive: the whole DiT). The plan books the
+  // share's weights, step and adapter; a family that cannot split
+  // refuses one.
+  TpShare tp;
 };
 
 struct LoadPlan {
@@ -307,6 +364,19 @@ class LoraFamily {
   };
   virtual std::unique_ptr<LoraTrainer> load(const LoadArgs& a,
                                             std::string* err) const = 0;
+  // A SPLIT RUN's widths (RunShape::tp): the DiT's attention heads and
+  // feed-forward rows, which a rank's share tiles. False, with `*err`,
+  // for a family that does not train split.
+  virtual bool split_dims(const std::string& root,
+                          const std::string& model_type, const RunShape& r,
+                          int* n_heads, int* n_ffn, std::string* err) const
+  {
+    (void)root; (void)model_type; (void)r; (void)n_heads; (void)n_ffn;
+    if (err != nullptr) {
+      *err = std::string(name()) + " does not train split across hosts";
+    }
+    return false;
+  }
 };
 
 // Every family this build trains, in the order they are asked.

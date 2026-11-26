@@ -22,15 +22,22 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <utility>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace vpipe {
 
@@ -249,6 +256,31 @@ const ConfigKey kAttrs[] = {
    .doc = "offer the finished adapter in the model registry, so "
           "generate-image's LoRA pickers list it (default on)",
    .def_bool = true},
+  {.key = "tensor_parallel",
+   .type = ConfigType::Object,
+   .required = false,
+   .doc = "this stage as one RANK of a run split across two hosts "
+          "(MiniMax-H3's video DiT): {rank, ranks: 2, heads: [first, end], "
+          "ffn: [first, end] -- unsaid, an even split -- transport: the "
+          "name a plugin registered its transport under, params: that "
+          "transport's own}. Rank 0 is the graph with the dataset and its "
+          "encoders, and hands the encoded dataset and the run's settings "
+          "to rank 1, a train-lora stage alone (hf_dir, output_dir, name); "
+          "the ranks keep their blocks' activations (recompute) only "
+          "where both can; rank 0 writes the checkpoints, whole"},
+  {.key = "data_parallel",
+   .type = ConfigType::Object,
+   .required = false,
+   .doc = "this stage as one rank of a run whose steps' samples are shared "
+          "between two hosts, each holding the whole model (any family): "
+          "{rank, ranks: 2, samples: [rank 0's, rank 1's] -- each a "
+          "multiple of batch_size, 1 and 1 unsaid -- transport, params}. "
+          "A step is batch_size x (both) samples, in the one seeded order; "
+          "each rank trains its own, then the gradients are summed and "
+          "every rank takes the same optimizer step. Rank 0 is the graph "
+          "with the dataset, handed over as tensor_parallel's is; rank 0 "
+          "writes the adapter and makes the previews. Not with "
+          "tensor_parallel"},
   {.key = "cache",
    .type = ConfigType::String,
    .doc = "where the encoded dataset lives while training: ram, disk (read "
@@ -420,6 +452,14 @@ TrainLoraStage::TrainLoraStage(const SessionContextIntf* s, std::string id,
   _cache_cfg = attr_str("cache");
   _audio_weight = attr_real("audio_loss_weight");
   _dit_cfg = attr_str("dit_dir");
+  if (this->config().as_object().contains("tensor_parallel")) {
+    _tp_cfg = this->config().as_object().at("tensor_parallel");
+    if (!_tp_cfg.is_object()) { _tp_cfg = FlexData(); }
+  }
+  if (this->config().as_object().contains("data_parallel")) {
+    _dp_cfg = this->config().as_object().at("data_parallel");
+    if (!_dp_cfg.is_object()) { _dp_cfg = FlexData(); }
+  }
   {
     auto o = this->config().as_object();
     if (o.contains("base_lora")) {
@@ -511,6 +551,10 @@ TrainLoraStage::reset_run_state()
   _got_audio = 0;
   _step = 0;
   _saved.clear();
+  tp_close_();
+  _tp = genai::TpShare{};
+  _tp_seq = 0;
+  _tp_seed_given = false;
   _bar.finish();
 #endif
 }
@@ -956,6 +1000,14 @@ TrainLoraStage::validate_(double* loss, std::string* err)
 std::string
 TrainLoraStage::resume_dir_() const
 {
+  // A follower's is named for its rank: two hosts sharing an output
+  // folder (a network share) keep theirs apart, and a relaunch that swaps
+  // the ranks finds the other's state recorded as another rank's
+  // (resume_matches_). Rank 0's -- and a whole run's -- as before.
+  if (tp_follower_()) {
+    return (fs::path(_output_dir) /
+            fmt("{}.rank{}.resume", _name, rank_index_())()).string();
+  }
   return (fs::path(_output_dir) / (_name + ".resume")).string();
 }
 
@@ -1021,6 +1073,7 @@ TrainLoraStage::load_model_(std::string* err)
   run.ram = model_memory::phys_ram();
   run.ane = _ane_forward;
   run.i8 = _i8;
+  run.tp = _tp;
   genai::train::LoadPlan plan;
   if (!fam->plan(root, rm.model_type, run, &plan, err)) { return false; }
   _dit_dir = plan.dit_dir;
@@ -1061,14 +1114,16 @@ TrainLoraStage::load_model_(std::string* err)
     }
   }
   const std::size_t arena = keep ? plan.arena_keep : plan.arena_recompute;
+  _keep_all = keep;
+  _arena_recompute = plan.arena_recompute;
   FlexData o = FlexData::make_object();
   o.as_object().insert_or_assign(genai::train::opt::kKeepAll,
                                  FlexData::make_bool(keep));
   o.as_object().insert_or_assign(genai::train::opt::kAneBackward,
                                  FlexData::make_bool(_ane_backward));
   t->set_options(o);
-  _reserve_bytes = arena + plan.state_bytes + _cache_bytes +
-                   model_memory::kHeadroom;
+  _state_reserve = plan.state_bytes + _cache_bytes + model_memory::kHeadroom;
+  _reserve_bytes = arena + _state_reserve;
   session()->info(fmt(
       "TrainLoraStage('{}'): {} DiT {} ({} MB held, {} MB streaming at the "
       "least){}, activations {} ({} MB at the widest sample: {} frame(s) "
@@ -1104,8 +1159,17 @@ TrainLoraStage::start_training_(std::string* err)
 {
   auto* mc = session()->services()->metal_compute();
   if (!_ops.valid() && !_ops.init(mc, true, err)) { return false; }
+  _fault = Fault{};
+  if (const char* e = std::getenv("VPIPE_TRAIN_FAULT")) {
+    int r = -1, st = -1;
+    char what[16] = {};
+    if (std::sscanf(e, "%d:%d:%15s", &r, &st, what) == 3) {
+      _fault = Fault{r, st, what};
+    }
+  }
   // The seed of this training job: a sweep's jobs follow seed_sequence.
-  _run_seed = generation_seed(_seed_seq, _seed, _run);
+  _run_seed = _tp_seed_given ? _tp_seed
+                             : generation_seed(_seed_seq, _seed, _run);
   // Caption dropout keeps a guided model's unconditional pass working; a
   // guidance-distilled family has none.
   _dropout = _caption_dropout;
@@ -1118,6 +1182,41 @@ TrainLoraStage::start_training_(std::string* err)
   std::vector<genai::train::ModuleShape> mods = _trainer->modules(_targets);
   const float alpha = _alpha > 0.0 ? (float)_alpha : (float)_rank;
   if (!_params.create(mc, mods, _rank, alpha, err)) { return false; }
+  // A RANK: its adapter is its share of the whole (each module's cut), so
+  // it starts where the unsplit run would and saves the whole.
+  if (tp_split_()) {
+    std::map<std::string, genai::train::ModuleCut> cuts;
+    if (!_trainer->split_cuts(mods, &cuts, err) ||
+        !_params.set_cuts(cuts, err)) {
+      return false;
+    }
+    if (_opt_spec.optimizer == "prodigy") {
+      *err = "tensor_parallel: Prodigy's step size is a whole adapter's "
+             "estimate; a split run takes another optimizer";
+      return false;
+    }
+    // adamw8bit scales its moments' codes per block of the arena: a block
+    // holding a SHARED factor's parameters and a cut one's would code the
+    // shared ones by a rank's own maximum, and the ranks' copies -- alike
+    // by construction otherwise -- would part.
+    if (_opt_spec.optimizer == "adamw8bit") {
+      const std::size_t blk = genai::train::TrainOps::kOpt8Block;
+      for (const auto& sp : _params.shared_grad_spans()) {
+        const std::size_t end = sp.off + sp.n;
+        const std::size_t len =
+            sp.b ? _params.b_elems() : _params.a_elems();
+        if (sp.off % blk != 0 || (end % blk != 0 && end != len)) {
+          *err = fmt("tensor_parallel: adamw8bit codes its moments in "
+                     "blocks of {}, and this share at rank {} puts a "
+                     "shared factor and a cut one in one block (rank x "
+                     "the share's heads must be even, rank x its "
+                     "feed-forward rows a multiple of {}); another "
+                     "optimizer or share", blk, _rank, blk)();
+          return false;
+        }
+      }
+    }
+  }
   _params.init_random(_run_seed);
   if (!_init_from.empty()) {
     int loaded = 0;
@@ -1130,6 +1229,43 @@ TrainLoraStage::start_training_(std::string* err)
   if (bound != (int)mods.size()) {
     if (err->empty()) { *err = "the adapter did not bind"; }
     return false;
+  }
+  // The run's channel, from where the dataset's exchanges left it.
+  if (tp_split_() && !_trainer->split_begin(_tp_ch, _tp_seq, err)) {
+    return false;
+  }
+  // Both ranks loaded the same model and laid the adapter out alike; and
+  // what their exchanges hold beside the plan, booked.
+  if (tp_rank_()) {
+    if (!tp_check_layout_(err)) { return false; }
+    const std::size_t sb = split_reserve_bytes_();
+    _state_reserve += sb;
+    _reserve_bytes += sb;
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->revise_scratch("train-lora-arena",
+                          _reserve_bytes - model_memory::kHeadroom);
+    }
+  }
+  // A RANK keeps its blocks' activations only where every rank does: a
+  // kept block's forward and a recomputed one's backward exchange
+  // differently, so the ranks' exchanges would pair the wrong sums.
+  if (tp_split_()) {
+    const std::int64_t mine = _keep_all ? 1 : 0;
+    std::int64_t other = 0;
+    if (!_trainer->split_bulk(&mine, &other, sizeof mine,
+                              genai::TpDType::kF32, err)) {
+      return false;
+    }
+    if (_keep_all && other == 0) {
+      _keep_all = false;
+      FlexData o = FlexData::make_object();
+      o.as_object().insert_or_assign(genai::train::opt::kKeepAll,
+                                     FlexData::make_bool(false));
+      _trainer->set_options(o);
+      _reserve_bytes = _arena_recompute + _state_reserve;
+      session()->info(fmt("TrainLoraStage('{}'): the other rank recomputes "
+                          "its blocks; so does this one", this->id()));
+    }
   }
   // The schedule.
   int epoch_len = 0;
@@ -1150,9 +1286,9 @@ TrainLoraStage::start_training_(std::string* err)
   if (_steps_cfg > 0) {
     _total_steps = _steps_cfg;
   } else if (_epochs_cfg > 0) {
-    _total_steps = std::max(1, _epochs_cfg * epoch_len / _batch);
+    _total_steps = std::max(1, _epochs_cfg * epoch_len / global_batch_());
   } else {
-    _total_steps = auto_steps(trained, epoch_len, _batch);
+    _total_steps = auto_steps(trained, epoch_len, global_batch_());
   }
   _save_every = _save_every_cfg > 0
       ? _save_every_cfg
@@ -1166,6 +1302,22 @@ TrainLoraStage::start_training_(std::string* err)
   }
   if (!_opt.init(&_ops, &_params, _opt_spec, _total_steps, err)) {
     return false;
+  }
+  // A RANK's norm is every rank's: each share once, the shared factors --
+  // summed already, held alike -- once. (Cleared otherwise: _opt outlives
+  // a run.)
+  _opt.set_global_sq({});
+  if (tp_split_()) {
+    _opt.set_global_sq([this](double local, double* global,
+                              std::string* e) {
+      double other = 0.0;
+      if (!_trainer->split_bulk(&local, &other, sizeof local,
+                                genai::TpDType::kF32, e)) {
+        return false;
+      }
+      *global = local + other - _tp_repl_sq;
+      return true;
+    });
   }
   // A STREAMED model keeps nothing until it is told what else needs the
   // box: residency refuses every block until a reserve is declared, and a
@@ -1183,56 +1335,192 @@ TrainLoraStage::start_training_(std::string* err)
   _step = 0;
   _loss_sum = 0.0;
   _loss_n = 0;
-  if (_resume == "auto" && !resume_(err)) {
+  // A RANK resumes only where every rank would, at the same step: the
+  // newest step BOTH hold (each keeps its last kResumeKept states, so a
+  // rank that died between its peer's write and its own goes back one
+  // checkpoint, not to the start). EVERY rank exchanges, whatever its own
+  // `resume` says (rank 0's settings do not carry it): an exchange one
+  // rank skipped would pair each later one with the wrong partner, their
+  // counts -- the transport's check -- in step. -1 none; -2 `resume:
+  // never` here.
+  bool resume = _resume == "auto";
+  std::int64_t at = -1;
+  if (tp_rank_()) {
+    std::int64_t mine[kResumeKept], other[kResumeKept];
+    for (int i = 0; i < kResumeKept; ++i) {
+      mine[i] = resume ? -1 : -2;
+      other[i] = -1;
+    }
+    if (resume) {
+      std::vector<std::string> broken;
+      const std::vector<ResumeSlot> held = resume_slots_(nullptr, &broken);
+      for (const std::string& b : broken) {
+        session()->warn(fmt("TrainLoraStage('{}'): {}; passed over",
+                            this->id(), b));
+      }
+      for (std::size_t i = 0; i < held.size() && i < (std::size_t)kResumeKept;
+           ++i) {
+        mine[i] = held[i].step;
+      }
+    }
+    if (!bulk_(mine, other, sizeof mine, genai::TpDType::kF32, err)) {
+      return false;
+    }
+    if (mine[0] == -2 || other[0] == -2) {
+      resume = false;
+    } else {
+      for (int i = 0; i < kResumeKept && at < 0; ++i) {
+        for (int k = 0; k < kResumeKept; ++k) {
+          if (mine[i] >= 0 && mine[i] == other[k]) {
+            at = mine[i];
+            break;
+          }
+        }
+      }
+      if (at < 0) { resume = false; }
+    }
+    auto list = [](const std::int64_t* v) {
+      std::string o;
+      for (int i = 0; i < kResumeKept; ++i) {
+        if (v[i] < 0 && i > 0) { break; }
+        o += (o.empty() ? "" : ", ") + std::to_string(v[i]);
+      }
+      return o;
+    };
+    if (at < 0 && (mine[0] >= 0 || other[0] >= 0)) {
+      session()->warn(fmt("TrainLoraStage('{}'): the ranks hold no resume "
+                          "state at one step (this rank {}, the other {}; "
+                          "-1 none, -2 resume: never); starting over",
+                          this->id(), list(mine), list(other)));
+    } else if (at >= 0 && (at != mine[0] || at != other[0])) {
+      session()->warn(fmt("TrainLoraStage('{}'): the ranks' newest resume "
+                          "states are at steps {} and {}; resuming at {}, "
+                          "the newest both hold", this->id(), mine[0],
+                          other[0], at));
+    }
+  }
+  if (resume && !resume_(at, err)) {
     if (!err->empty()) { return false; }
+  }
+  // ...and both did: a rank that read nothing back would train other
+  // samples than its peer at every step from here.
+  if (tp_rank_()) {
+    const std::int64_t at = _step;
+    std::int64_t peer = -1;
+    if (!bulk_(&at, &peer, sizeof at, genai::TpDType::kF32, err)) {
+      return false;
+    }
+    if (at != peer) {
+      *err = fmt("the ranks resumed at steps {} and {}", at, peer)();
+      return false;
+    }
+    // What the two start from, and their first update, compared
+    // (tp_agree_).
+    _tp_first_checks = 2;
   }
   session()->info(fmt(
       "TrainLoraStage('{}'): training {} modules at rank {} (alpha {}) for "
       "{} steps of {} over {} samples ({} a epoch{}), {} {}; checkpoints "
-      "every {}", this->id(), bound, _rank, alpha, _total_steps, _batch,
-      trained, epoch_len,
+      "every {}{}", this->id(), bound, _rank, alpha, _total_steps,
+      global_batch_(), trained, epoch_len,
       _val.empty() ? std::string()
                    : fmt("; {} held out", _val.size())(),
-      _opt_spec.optimizer, _opt_spec.effective_lr(), _save_every));
+      _opt_spec.optimizer, _opt_spec.effective_lr(), _save_every,
+      dp_rank_() ? fmt("; DATA PARALLEL rank {} of 2: samples [{}, {}) of "
+                       "each step's {}", _dp_rank, local_first_(),
+                       local_first_() + local_count_(), global_batch_())()
+                 : std::string()));
   return true;
 }
 
 bool
-TrainLoraStage::resume_(std::string* err)
+TrainLoraStage::resume_(std::int64_t at, std::string* err)
 {
   err->clear();
-  const fs::path dir = resume_dir_();
-  std::error_code ec;
-  if (!fs::is_regular_file(dir / "run.json", ec)) { return false; }
-  FlexData run;
-  try {
-    std::ifstream in(dir / "run.json");
-    run = FlexData::from_json(in);
-  } catch (...) {
+  bool others = false;
+  std::vector<std::string> broken;
+  const std::vector<ResumeSlot> held = resume_slots_(&others, &broken);
+  if (at < 0) {   // a whole run (a RANK said so at the exchange)
+    for (const std::string& b : broken) {
+      session()->warn(fmt("TrainLoraStage('{}'): {}; passed over",
+                          this->id(), b));
+    }
+  }
+  if (held.empty()) {
+    if (at < 0 && !broken.empty()) {
+      session()->warn(fmt("TrainLoraStage('{}'): no resume state in '{}' "
+                          "loads; starting over", this->id(),
+                          resume_dir_()));
+    }
+    if (others) {
+      session()->warn(fmt(
+          "TrainLoraStage('{}'): a resume state is in '{}' but it is for a "
+          "different run; starting over", this->id(), resume_dir_()));
+    }
     return false;
   }
-  if (!run.is_object()) { return false; }
-  auto o = run.as_object();
-  const int step = (int)o.at("step").as_int(0);
-  const std::uint64_t seed = (std::uint64_t)o.at("seed").as_int(0);
-  const int total = (int)o.at("total_steps").as_int(0);
-  const std::int64_t samples = o.at("samples").as_int(0);
-  if (seed != _run_seed || total != _total_steps ||
-      samples != (std::int64_t)_samples.size()) {
-    session()->warn(fmt(
-        "TrainLoraStage('{}'): a resume state is in '{}' but it is for a "
-        "different run (seed, length or dataset); starting over",
-        this->id(), dir.string()));
-    return false;
+  // A load that failed past its check (a read error, a file changed
+  // since) left part of it in the live optimizer: an older state that
+  // loads overwrites all of it, a fresh start would not.
+  std::string half_read;
+  for (const ResumeSlot& r : held) {
+    if (at >= 0 && r.step != at) { continue; }
+    const std::string path = (r.dir / "optimizer.bin").string();
+    std::string e;
+    const bool fits = _opt.check_state(path, &e);
+    if (!fits || !_opt.load_state(path, &e)) {
+      // A RANK loads the one step both agreed on, or fails: the peer
+      // reads its own. A whole run falls back to the older state.
+      if (at >= 0) {
+        *err = e;
+        return false;
+      }
+      if (fits) { half_read = e; }
+      session()->warn(fmt("TrainLoraStage('{}'): the resume state at step "
+                          "{} does not load ({}); trying the one before",
+                          this->id(), r.step, e));
+      continue;
+    }
+    _step = (int)r.step;
+    // What came after it is an abandoned run's: gone, before a later
+    // agreement could pair it with the peer's real state at that step.
+    resume_tidy_(r.step);
+    session()->info(fmt("TrainLoraStage('{}'): resumed at step {} of {}",
+                        this->id(), _step, _total_steps));
+    return true;
   }
-  if (!_opt.load_state((dir / "optimizer.bin").string(), err)) {
-    return false;
+  if (at >= 0) {
+    *err = fmt("the resume state at step {} is gone", at)();
+  } else if (!half_read.empty()) {
+    *err = fmt("no resume state in '{}' loads, and the last read stopped "
+               "part way ({}); move the folder aside to start over",
+               resume_dir_(), half_read)();
   }
-  _step = step;
-  session()->info(fmt("TrainLoraStage('{}'): resumed at step {} of {}",
-                      this->id(), _step, _total_steps));
-  return true;
+  return false;
 }
+
+namespace {
+
+// On the DRIVE, not in its cache: fsync on macOS hands the data to the
+// drive, whose cache a power cut loses (F_FULLFSYNC flushes it). A file
+// or the folder that names it; best effort -- a save does not fail for
+// it.
+void
+full_sync_(const fs::path& p)
+{
+  const int fd = ::open(p.c_str(), O_RDONLY);
+  if (fd < 0) { return; }
+#ifdef F_FULLFSYNC
+  if (::fcntl(fd, F_FULLFSYNC) == 0) {
+    ::close(fd);
+    return;
+  }
+#endif
+  (void)::fsync(fd);
+  ::close(fd);
+}
+
+}  // namespace
 
 bool
 TrainLoraStage::save_(bool final_save, std::string* err)
@@ -1257,23 +1545,58 @@ TrainLoraStage::save_(bool final_save, std::string* err)
       (fs::path(_output_dir) /
        (_name + (final_save ? std::string() : std::string(nm)) +
         ".safetensors")).string();
-  if (!_params.save(path, meta, err)) { return false; }
+  // A RANK's adapter is gathered whole; rank 0 writes it.
+  auto save_one = [&](const std::string& at,
+                      const metal_compute::SharedBuffer* ea,
+                      const metal_compute::SharedBuffer* eb) {
+    // A data-parallel follower holds rank 0's adapter, bit for bit:
+    // rank 0's file is the run's.
+    if (_dp_rank > 0) { return true; }
+    if (!_params.split()) { return _params.save(at, meta, err, ea, eb); }
+    auto gather = [this](std::vector<float>& v, std::string* e) {
+      std::vector<float> o(v.size());
+      if (!_trainer->split_bulk(v.data(), o.data(), v.size() * 4,
+                                genai::TpDType::kF32, e)) {
+        return false;
+      }
+      for (std::size_t i = 0; i < v.size(); ++i) { v[i] += o[i]; }
+      return true;
+    };
+    return _params.save_gathered(at, meta, _tp.rank == 0, _tp.rank == 0,
+                                 gather, err, ea, eb);
+  };
+  if (!save_one(path, nullptr, nullptr)) { return false; }
   if (_opt.has_ema()) {
     const std::string ep =
         (fs::path(_output_dir) /
          (_name + (final_save ? std::string() : std::string(nm)) +
           "-ema.safetensors")).string();
-    if (!_params.save(ep, meta, err, &_opt.ema_a(), &_opt.ema_b())) {
-      return false;
-    }
+    if (!save_one(ep, &_opt.ema_a(), &_opt.ema_b())) { return false; }
   }
-  _saved.push_back(path);
-  session()->info(fmt("TrainLoraStage('{}'): step {}: saved '{}'{}", id(),
-                      _step, path, _opt.has_ema() ? " (and its EMA)" : ""));
-  // The resume state beside it: the optimizer's whole state and the step.
+  // A follower wrote nothing: its beats name no file (rank 0's is on
+  // rank 0's disk), and say who wrote it.
+  _saved.push_back(tp_follower_() ? std::string() : path);
+  if (tp_follower_()) {
+    session()->info(fmt("TrainLoraStage('{}'): step {}: the adapter {} "
+                        "rank 0, which writes it", id(), _step,
+                        dp_rank_() ? "held alike by" : "gathered to"));
+  } else {
+    session()->info(fmt("TrainLoraStage('{}'): step {}: saved '{}'{}", id(),
+                        _step, path, _opt.has_ema() ? " (and its EMA)" : ""));
+  }
+  // The resume state beside it: the optimizer's whole state and the step,
+  // in a folder of its own, written under a .tmp name and renamed whole
+  // -- a host that dies mid-write leaves the state before it as it was.
   const fs::path rd = resume_dir_();
-  fs::create_directories(rd, ec);
-  if (!_opt.save_state((rd / "optimizer.bin").string(), err)) { return false; }
+  char sn[32];
+  std::snprintf(sn, sizeof sn, "step-%06d", _step);
+  const fs::path slot = rd / sn;
+  const fs::path tmp = rd / (std::string(sn) + ".tmp");
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp, ec);
+  if (!_opt.save_state((tmp / "optimizer.bin").string(), err)) {
+    return false;
+  }
   FlexData run = FlexData::make_object();
   auto ro = run.as_object();
   ro.insert_or_assign("step", FlexData::make_int(_step));
@@ -1282,9 +1605,39 @@ TrainLoraStage::save_(bool final_save, std::string* err)
   ro.insert_or_assign("samples",
                       FlexData::make_int((std::int64_t)_samples.size()));
   {
-    std::ofstream o(rd / "run.json");
-    o << run.to_json();
+    // The kind of run, the batch and -- a rank -- its rank and share.
+    const FlexData rr = rank_record_();
+    FlexData c = rr;
+    auto co = c.as_object();
+    for (const auto& k : {"mode", "batch_size", "global_batch", "rank",
+                          "share", "dp_samples"}) {
+      if (co.contains(k)) { ro.insert_or_assign(k, co.at(k)); }
+    }
   }
+  {
+    std::ofstream o(tmp / "run.json");
+    o << run.to_json();
+    o.flush();
+    if (!o) {
+      *err = fmt("could not write '{}'", (tmp / "run.json").string())();
+      return false;
+    }
+  }
+  // Both files on the drive BEFORE the rename names them: a rename can
+  // reach the drive ahead of the data it names, and a power cut then
+  // leaves a whole-looking slot of empty files (check_state passes such
+  // a slot over -- for the one before, which this keeps the next save).
+  full_sync_(tmp / "optimizer.bin");
+  full_sync_(tmp / "run.json");
+  fs::remove_all(slot, ec);
+  fs::rename(tmp, slot, ec);
+  if (ec) {
+    *err = fmt("could not keep the resume state '{}': {}", slot.string(),
+               ec.message())();
+    return false;
+  }
+  full_sync_(rd);
+  resume_tidy_(_step);
   if (final_save) {
     // The run is complete: nothing to resume.
     fs::remove_all(rd, ec);
@@ -1528,6 +1881,9 @@ TrainLoraStage::checkpoint_(RuntimeContext& ctx, FlexData* out,
   FlexData c = FlexData::make_object();
   auto co = c.as_object();
   co.insert_or_assign("path", FlexData::make_string(_saved.back()));
+  if (tp_follower_()) {
+    co.insert_or_assign("written_by_rank", FlexData::make_int(0));
+  }
   co.insert_or_assign("step", FlexData::make_int(_step));
   co.insert_or_assign("loss",
                       FlexData::make_real(_loss_sum / std::max(_loss_n, 1)));
@@ -1645,6 +2001,12 @@ TrainLoraStage::serve_commands_(RuntimeContext& ctx)
     }
     const std::string name(cmd->name());
     std::string err;
+    // A RANK runs a command where every rank does, between steps: taken
+    // now, run at the next step's agreement (tp_control_), answered then.
+    if (tp_rank_() && (name == "save" || name == "preview")) {
+      _tp_pending.push_back(cmd);
+      continue;
+    }
     if (name == "save") {
       // Twice at one step is one checkpoint.
       FlexData r;
@@ -1690,6 +2052,11 @@ TrainLoraStage::process(RuntimeContext& ctx)
 #else
   auto* mc = session()->services()->metal_compute();
   auto fail = [&](const std::string& m) {
+    // A RANK lets go of the run's channel BEFORE it raises (error()
+    // throws, so nothing after it runs): the other rank's exchange then
+    // returns at once (TpChannel: a channel let go) where it would wait
+    // on a peer that is gone -- with a stop that never fires mid-step.
+    if (tp_rank_() || _tp_ch) { tp_close_(); }
     session()->error(fmt("TrainLoraStage('{}'): {}", this->id(), m));
     _bar.finish();
     _phase = Phase::kDone;
@@ -1723,6 +2090,39 @@ TrainLoraStage::process(RuntimeContext& ctx)
           co_return;
         }
       }
+    }
+    // A FOLLOWER of a split run: no dataset here -- rank 0's, encoded,
+    // with the run's settings, over the run's channel.
+    if (_tp_cfg.is_object() && _dp_cfg.is_object()) {
+      fail("tensor_parallel and data_parallel: a run is one or the other");
+      co_return;
+    }
+    if (par_cfg_().is_object() &&
+        par_cfg_().as_object().contains("rank") &&
+        par_cfg_().as_object().at("rank").as_int(0) > 0) {
+      // Rank 0 refuses init_from for the run; one given here would start
+      // this rank where rank 0 does not (a shared factor apart from the
+      // first step).
+      if (!_init_from.empty()) {
+        fail(std::string(par_key_()) + ": init_from is not shared between "
+             "hosts yet");
+        co_return;
+      }
+      std::string err;
+      if (!tp_open_(&err)) {
+        fail(std::string(par_key_()) + ": " + err);
+        co_return;
+      }
+      _tp_ch->set_stop([&ctx]() { return ctx.stop_requested(); });
+      _bar = session()->open_progress("lora encode");
+      _bar.update(0, 0, "waiting for rank 0's dataset");
+      _encode_t0 = std::chrono::steady_clock::now();
+      const bool got = tp_receive_(&err);
+      _tp_ch->set_stop({});
+      if (!got) { fail(err); co_return; }
+      _encode_planned = true;
+      _phase = Phase::kEncode;
+      co_return;
     }
     if (!ctx.iport_connected(kManifestPort)) {
       fail("the manifest port is not wired -- connect a training-dataset");
@@ -2080,6 +2480,23 @@ TrainLoraStage::process(RuntimeContext& ctx)
 
     std::string err;
     if (!settle_cache_(&err)) { fail(err); co_return; }
+    // RANK 0 of a split run: the encoded dataset to the other rank,
+    // before either loads its share.
+    if (par_cfg_().is_object() && !tp_follower_()) {
+      if (!_init_from.empty()) {
+        fail(std::string(par_key_()) + ": init_from is not shared between "
+             "hosts yet");
+        co_return;
+      }
+      if (!tp_open_(&err)) {
+        fail(std::string(par_key_()) + ": " + err);
+        co_return;
+      }
+      _tp_ch->set_stop([&ctx]() { return ctx.stop_requested(); });
+      const bool shipped = tp_ship_(&err);
+      _tp_ch->set_stop({});
+      if (!shipped) { fail(err); co_return; }
+    }
     session()->info(fmt(
         "TrainLoraStage('{}'): encoded {} samples ({} captions, {} MB "
         "{}) in {:.1f} s; loading the model", this->id(),
@@ -2209,7 +2626,40 @@ TrainLoraStage::process(RuntimeContext& ctx)
       }
     }
     if (!start_training_(&err)) { fail(err); co_return; }
-    _trainer->set_stop([&ctx]() { return ctx.stop_requested(); });
+    // A RANK stops between steps alone, where every rank agrees to
+    // (tp_control_): one stopping inside a step would leave the others'
+    // exchanges waiting on partials that never come.
+    if (tp_rank_()) {
+      _trainer->set_stop([]() { return false; });
+      // ...but the CHANNEL gives a wait up once a stop has been asked and
+      // has stood for kPeerGrace: a live peer meets this rank at the next
+      // agreement well inside it, so the other rank is gone, and this
+      // one's user can still end it (the run fails; its last checkpoint
+      // resumes). Without it the channel polls the stop above: never.
+      if (_tp_ch) {
+        // At least 10 minutes, and 4x the longest train call (agreement,
+        // checkpoint, previews, step) this rank has made -- its waits
+        // hold the peer's slower work, so a live peer stays inside it.
+        _tp_grace_ms = std::make_shared<std::atomic<std::int64_t>>(600000);
+        auto since = std::make_shared<std::atomic<std::int64_t>>(-1);
+        auto stop = [&ctx, since, grace = _tp_grace_ms]() {
+          if (!ctx.stop_requested()) { return false; }
+          const std::int64_t now =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+          std::int64_t t0 = -1;
+          (void)since->compare_exchange_strong(t0, now);
+          return now - since->load() > grace->load();
+        };
+        try {
+          _tp_ch->set_stop(stop);
+        } catch (...) {
+        }
+      }
+    } else {
+      _trainer->set_stop([&ctx]() { return ctx.stop_requested(); });
+    }
     _phase = Phase::kTrain;
     _bar.update(_step, (std::uint64_t)_total_steps);
     co_return;
@@ -2217,16 +2667,56 @@ TrainLoraStage::process(RuntimeContext& ctx)
 
   // ---- TRAIN: one optimizer step per call ------------------------------
   if (_phase == Phase::kTrain) {
+    // A RANK's longest call, for its channel's patience (_tp_grace_ms).
+    struct CallTime {
+      std::shared_ptr<std::atomic<std::int64_t>> g;
+      std::chrono::steady_clock::time_point t0 =
+          std::chrono::steady_clock::now();
+      ~CallTime()
+      {
+        if (!g) { return; }
+        const std::int64_t ms = 4 *
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        if (ms > g->load()) { g->store(ms); }
+      }
+    } call_time{_tp_grace_ms};
+    // A RANK: what every rank does now -- stop, save, preview -- agreed
+    // before each step (and the run's end), whichever rank was asked.
+    if (tp_rank_()) {
+      bool stopped = false;
+      std::string err;
+      co_await tp_agree_(ctx, &stopped, &err);
+      if (!err.empty()) { fail(err); co_return; }
+      if (stopped) { co_return; }
+      // FAULTS for tests: this rank gone mid-run, or its copy of what
+      // both hold parted from the other's.
+      if (fault_("step")) {
+        fail("an injected fault at step " + std::to_string(_step));
+        co_return;
+      }
+      if (fault_("part")) {
+        auto* m = static_cast<float*>(_params.a_master().contents());
+        const auto sp = _params.shared_grad_spans();
+        const std::size_t at = sp.empty() ? 0 : sp.front().off;
+        if (_params.a_elems() > at) { m[at] += 1e-3f; }
+      }
+    }
     if (_step >= _total_steps) {
       std::string err;
       if (!save_(true, &err)) {
         fail("saving the adapter failed: " + err);
         co_return;
       }
-      if (_register && !_saved.empty()) { register_(_saved.back()); }
+      if (_register && !_saved.empty() && !tp_follower_()) {
+        register_(_saved.back());
+      }
       FlexData done = FlexData::make_object();
       auto d = done.as_object();
       d.insert_or_assign("path", FlexData::make_string(_saved.back()));
+      if (tp_follower_()) {
+        d.insert_or_assign("written_by_rank", FlexData::make_int(0));
+      }
       d.insert_or_assign("step", FlexData::make_int(_step));
       d.insert_or_assign("final", FlexData::make_bool(true));
       if (!_val.empty()) {
@@ -2245,7 +2735,8 @@ TrainLoraStage::process(RuntimeContext& ctx)
       co_await ctx.write(1, make_payload<FlexDataPayload>(std::move(done)));
       ++_run;
       // A sweep: another optimizer beat trains another adapter on the
-      // same cache.
+      // same cache. A rank's run is its channel's: let go with it.
+      tp_close_();
       _trainer.reset();
       if (auto* mgr = session()->services()->generative_model_manager()) {
         mgr->revise_declaration(_dit_dir, 0);
@@ -2264,8 +2755,11 @@ TrainLoraStage::process(RuntimeContext& ctx)
     // An audio-video family's two means, unweighted.
     double loss_v = 0.0, loss_a = 0.0;
     int parts = 0, aparts = 0;
-    for (int b = 0; b < _batch; ++b) {
-      const std::uint64_t g = (std::uint64_t)_step * _batch + b;
+    // This rank's samples of the step (all of them, unless the step's
+    // samples are shared between hosts: data_parallel).
+    const int gb = global_batch_(), b0 = local_first_();
+    for (int b = b0; b < b0 + local_count_(); ++b) {
+      const std::uint64_t g = (std::uint64_t)_step * gb + b;
       const int epoch = (int)(g / (std::uint64_t)E);
       const int pos = (int)(g % (std::uint64_t)E);
       // This epoch's order: a seeded permutation, so resuming at any step
@@ -2375,17 +2869,41 @@ TrainLoraStage::process(RuntimeContext& ctx)
     }
     double gnorm = 0.0, lr = 0.0;
     std::string err;
-    if (!_opt.step(_batch, &gnorm, &lr, &err)) {
+    // A RANK: the shared factors' gradients are every rank's partial.
+    if (tp_split_() && !tp_sync_gradients_(&err)) {
+      fail("tensor parallel: summing the gradients: " + err);
+      co_return;
+    }
+    // A DATA-PARALLEL rank: every gradient, and the losses, every rank's
+    // samples' -- the step's, summed.
+    if (dp_rank_()) {
+      double sums[5] = {loss, loss_v, (double)parts, loss_a,
+                        (double)aparts};
+      if (!dp_sync_gradients_(sums, 5, &err)) {
+        fail("data parallel: summing the gradients: " + err);
+        co_return;
+      }
+      loss = sums[0];
+      loss_v = sums[1];
+      parts = (int)std::lround(sums[2]);
+      loss_a = sums[3];
+      aparts = (int)std::lround(sums[4]);
+    }
+    if (!_opt.step(gb, &gnorm, &lr, &err)) {
       fail("optimizer step failed: " + err);
       co_return;
     }
     ++_step;
-    loss /= _batch;
+    loss /= gb;
     _loss_sum += loss;
     ++_loss_n;
     const double sec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
-    {
+    // A RANK stopped: nothing written now -- a stop closes the outputs,
+    // and a write to one would end this stage before the next step's
+    // agreement saves the run with the other rank.
+    const bool tp_stopping = tp_rank_() && ctx.stop_requested();
+    if (!tp_stopping) {
       FlexData m = FlexData::make_object();
       auto o = m.as_object();
       o.insert_or_assign("step", FlexData::make_int(_step));
@@ -2417,8 +2935,21 @@ TrainLoraStage::process(RuntimeContext& ctx)
           _loss_sum / std::max(_loss_n, 1), lr, gnorm, sec, fwd / 1000.0,
           bwd / 1000.0));
     }
+    // ...and the next agreement -- the one the other rank holds before
+    // its next step -- held now: no further call comes after a stop.
+    if (tp_stopping) {
+      bool stopped = false;
+      co_await tp_agree_(ctx, &stopped, &err);
+      if (!err.empty()) { fail(err); }
+      co_return;
+    }
     const bool save_now = _step % _save_every == 0 && _step < _total_steps;
-    if (save_now) {
+    // A RANK's scheduled checkpoint and preview after the next agreement
+    // (tp_agree_): a stop asked meanwhile is the other rank's too, and
+    // neither then saves or previews alone.
+    if (save_now && tp_rank_()) {
+      _tp_due_save = true;
+    } else if (save_now) {
       FlexData c;
       co_await checkpoint_(ctx, &c, &err);
       if (!err.empty()) { fail(err); co_return; }
@@ -2426,7 +2957,9 @@ TrainLoraStage::process(RuntimeContext& ctx)
     const bool preview_now =
         _preview_every > 0 && !_preview_texts.empty() &&
         (_step % _preview_every == 0 || _step == _total_steps);
-    if (preview_now) {
+    if (preview_now && tp_rank_()) {
+      _tp_due_preview = true;
+    } else if (preview_now) {
       int n = 0;
       co_await previews_(ctx, -1, _preview_steps, _preview_cfg,
                          _preview_seed, &n, &err);

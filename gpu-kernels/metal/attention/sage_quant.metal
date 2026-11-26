@@ -344,3 +344,26 @@ kernel void sage_quant_v_channel_u8(
         (uchar)(qi + 128);
   }
 }
+
+// THE SINKS MARKER. Not a step of the prologue: its PRESENCE says this
+// host's flash kernel (attn_steel_nax) takes an attention WITH SINKS
+// (constant 302) under the int8 QK -- constant 311 declared, each row's
+// sink shifted by -scale q.mean as the smoothed keys' scores are, K's
+// mean read at buffer 22 -- and that under the int8 P*V the sink's mass
+// stays out of the running max and V's mean comes back over the keys'
+// share alone. Both arrived with this entry, and a library is built from
+// one tree, so a toolkit looks this name up rather than the kernel's
+// constants, which a function cannot be asked for: a host that predates
+// it runs a function built with 311 as one without, and its sinks read
+// unshifted (cosine 0.76 against f64 where a sink takes a large share),
+// with no error anywhere. MetalSageAttention::sinks_available().
+//
+// Dispatched, it writes the constant it marks, so a test can tell the
+// entry is this one and not a name that happened to resolve.
+//   0:out (uint [1]); one thread.
+kernel void sage_sinks_marker(
+    device uint* out [[buffer(0)]],
+    uint         tid [[thread_position_in_grid]])
+{
+  if (tid == 0) { out[0] = 311u; }
+}

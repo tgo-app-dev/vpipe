@@ -2359,6 +2359,107 @@ builtin_catalog_()
      .needs_tokenizer_json = false,
      .extra = local_subdir_extra_("base"),
      .name = "ruchangyao/FlashVSR_plus-base"},
+    // MAGI-2-preview (sand-ai, Apache-2.0): text- and image-to-video WITH
+    // its soundtrack, by a 114B multi-head-MoE DiT (preview/, 228 GB bf16
+    // in 56 shards, no config -- its shapes are read off the tensors)
+    // conditioned on Qwen3.5-27B (text_encoder/), decoded by a distilled
+    // turbo decoder (turbo_vae/: a TRAINING STATE, its EMA the model) and
+    // Stable Audio Open's autoencoder (stable-audio-open-1.0/, of which
+    // only the decoder is read); the Wan2.2 VAE (vae/) encodes an
+    // image-to-video picture, and refiner/ is the 1080p second stage. The
+    // generate-video family "magi2" (generative-models/magi2/). 307 GB.
+    {.family = "MAGI-2", .version = "preview", .param_class = "114B",
+     .variant = "release (sand-ai)",
+     .hf_path = "sand-ai/MAGI-2-preview",
+     .model_type = "magi2",
+     .inputs = {"text", "image"}, .outputs = {"video", "audio"},
+     .files = {"README.md", "preview/model-00001-of-00056.safetensors",
+               "preview/model-00002-of-00056.safetensors",
+               "preview/model-00003-of-00056.safetensors",
+               "preview/model-00004-of-00056.safetensors",
+               "preview/model-00005-of-00056.safetensors",
+               "preview/model-00006-of-00056.safetensors",
+               "preview/model-00007-of-00056.safetensors",
+               "preview/model-00008-of-00056.safetensors",
+               "preview/model-00009-of-00056.safetensors",
+               "preview/model-00010-of-00056.safetensors",
+               "preview/model-00011-of-00056.safetensors",
+               "preview/model-00012-of-00056.safetensors",
+               "preview/model-00013-of-00056.safetensors",
+               "preview/model-00014-of-00056.safetensors",
+               "preview/model-00015-of-00056.safetensors",
+               "preview/model-00016-of-00056.safetensors",
+               "preview/model-00017-of-00056.safetensors",
+               "preview/model-00018-of-00056.safetensors",
+               "preview/model-00019-of-00056.safetensors",
+               "preview/model-00020-of-00056.safetensors",
+               "preview/model-00021-of-00056.safetensors",
+               "preview/model-00022-of-00056.safetensors",
+               "preview/model-00023-of-00056.safetensors",
+               "preview/model-00024-of-00056.safetensors",
+               "preview/model-00025-of-00056.safetensors",
+               "preview/model-00026-of-00056.safetensors",
+               "preview/model-00027-of-00056.safetensors",
+               "preview/model-00028-of-00056.safetensors",
+               "preview/model-00029-of-00056.safetensors",
+               "preview/model-00030-of-00056.safetensors",
+               "preview/model-00031-of-00056.safetensors",
+               "preview/model-00032-of-00056.safetensors",
+               "preview/model-00033-of-00056.safetensors",
+               "preview/model-00034-of-00056.safetensors",
+               "preview/model-00035-of-00056.safetensors",
+               "preview/model-00036-of-00056.safetensors",
+               "preview/model-00037-of-00056.safetensors",
+               "preview/model-00038-of-00056.safetensors",
+               "preview/model-00039-of-00056.safetensors",
+               "preview/model-00040-of-00056.safetensors",
+               "preview/model-00041-of-00056.safetensors",
+               "preview/model-00042-of-00056.safetensors",
+               "preview/model-00043-of-00056.safetensors",
+               "preview/model-00044-of-00056.safetensors",
+               "preview/model-00045-of-00056.safetensors",
+               "preview/model-00046-of-00056.safetensors",
+               "preview/model-00047-of-00056.safetensors",
+               "preview/model-00048-of-00056.safetensors",
+               "preview/model-00049-of-00056.safetensors",
+               "preview/model-00050-of-00056.safetensors",
+               "preview/model-00051-of-00056.safetensors",
+               "preview/model-00052-of-00056.safetensors",
+               "preview/model-00053-of-00056.safetensors",
+               "preview/model-00054-of-00056.safetensors",
+               "preview/model-00055-of-00056.safetensors",
+               "preview/model-00056-of-00056.safetensors",
+               "preview/model.safetensors.index.json",
+               "refiner/model-00001-of-00003.safetensors",
+               "refiner/model-00002-of-00003.safetensors",
+               "refiner/model-00003-of-00003.safetensors",
+               "refiner/model.safetensors.index.json",
+               "stable-audio-open-1.0/model.safetensors",
+               "stable-audio-open-1.0/model.safetensors.md5",
+               "stable-audio-open-1.0/model_config.json",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/merges.txt",
+               "text_encoder/model.safetensors-00001-of-00011.safetensors",
+               "text_encoder/model.safetensors-00002-of-00011.safetensors",
+               "text_encoder/model.safetensors-00003-of-00011.safetensors",
+               "text_encoder/model.safetensors-00004-of-00011.safetensors",
+               "text_encoder/model.safetensors-00005-of-00011.safetensors",
+               "text_encoder/model.safetensors-00006-of-00011.safetensors",
+               "text_encoder/model.safetensors-00007-of-00011.safetensors",
+               "text_encoder/model.safetensors-00008-of-00011.safetensors",
+               "text_encoder/model.safetensors-00009-of-00011.safetensors",
+               "text_encoder/model.safetensors-00010-of-00011.safetensors",
+               "text_encoder/model.safetensors-00011-of-00011.safetensors",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/preprocessor_config.json",
+               "text_encoder/tokenizer.json",
+               "text_encoder/tokenizer_config.json",
+               "text_encoder/video_preprocessor_config.json",
+               "text_encoder/vocab.json",
+               "turbo_vae/TurboV3-Wan22-TinyShallow_7_7.json",
+               "turbo_vae/checkpoint.ckpt", "vae/Wan2.2_VAE.pth"},
+     .needs_tokenizer_json = false},
     // RelayVSR (kopperx, "Large-Small Model Collaboration for Efficient
     // Real-World Video Super-Resolution", arXiv 2609.37850; Apache-2.0):
     // streaming 4x video super-resolution by two models in relay -- a
@@ -3099,6 +3200,75 @@ builtin_catalog_()
                ".safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui"},
+    // The rest of the 768p line, each version's SPLIT copy alone (the
+    // one to reach for, see the grouping note at the head of this
+    // section): the 4-step v1.0, v1.1 and v1.3, the 8-step v1.1 and
+    // v1.2, and the reference partition's 4-step v1.0 and 8-step v1.1 --
+    // so a caller can offer each version and fetch only its file.
+    //
+    // Read off the filenames, as the v1.2 pair above: fl2v / ref2v, the
+    // steps, 768p, bf16. The shift is the 768p line's 6 throughout,
+    // including the reference 4-step v1.0, whose v0.1 above ran at the
+    // checkpoint's 12. The 8-step v1.2 is the first of the line to adapt
+    // `norm_out.linear` and to state an alpha per module (`.alpha`
+    // tensors, 128 over rank 128) where the others state one alpha (8)
+    // in `__metadata__`; the binder reads the per-module one first.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.0 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.0"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.1 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.1"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.3 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.3_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.3"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.1 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step-768p-v1.1"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.2 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step-768p-v1.2"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.0 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_4step_v1.0_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-4step-768p-v1.0"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.1 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_8step_v1.1_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-v1.1"},
     // Pika H3 Flex (Pika Labs / Mellis, Inc.): a six-step post-training
     // of both DiTs, published as two rank-128 FP32 adapters in the
     // diffusers decomposition (fused here for the DiT actually loaded),
@@ -3134,6 +3304,41 @@ builtin_catalog_()
                "LICENSE", "NOTICE"},
      .needs_tokenizer_json = false,
      .name = "Pika-Labs/Pika-H3-Flex-ref2va"},
+    // HyperFlow H3 Flash (VideoRebirthAI/hyperflow-h3-flash; Video
+    // Rebirth): MiniMax-H3 compressed and distilled to 4, 6 or 8 steps --
+    // blocks left out (FL2VA 6, 21, 22; Ref2VA 9), low-rank projections,
+    // ComfyUI's int8 ConvRot elsewhere, and a timestep embedder for each
+    // step's ENDPOINT built in. Its ComfyUI single files, one a
+    // partition, named by generate-video's dit_dir; the text encoder and
+    // VAEs are the base's. The diffusers folders, the GGUFs and the bf16
+    // copy are not fetched. MiniMax H3 Community License.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "14B",
+     .variant = "HyperFlow H3 Flash, int8 ConvRot (4 / 6 / 8 steps)",
+     .hf_path = "VideoRebirthAI/hyperflow-h3-flash",
+     .model_type = "minimax-h3-dit",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"fl2va_int8_convrot_comfyui/"
+               "minimax_h3_fl2va_hyperflow_flash_14b-int8_convrot.safetensors",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "fl2va_int8_convrot_comfyui/"
+         "minimax_h3_fl2va_hyperflow_flash_14b-int8_convrot.safetensors"),
+     .name = "VideoRebirthAI/hyperflow-h3-flash-fl2va-int8-convrot"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "14B",
+     .variant = "HyperFlow H3 Flash, int8 ConvRot (4 / 6 / 8 steps)",
+     .hf_path = "VideoRebirthAI/hyperflow-h3-flash",
+     .model_type = "minimax-h3-dit",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"ref2va_int8_convrot_comfyui/"
+               "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot"
+               ".safetensors",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_(
+         "ref2va_int8_convrot_comfyui/"
+         "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"),
+     .name = "VideoRebirthAI/hyperflow-h3-flash-ref2va-int8-convrot"},
     // pi-H3 (Lakonik/pi-H3; Hansheng Chen et al.): pi-Flow v2 2- and
     // 4-step distillations of the FL2VA DiT -- text, first frame, last
     // frame -- trained on ComfyUI's PRUNED form, so they run on a pruned
@@ -3752,6 +3957,10 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // RelayVSR: frames in, the same frames at 4x (or 2x) out
     // (relayvsr-upscale).
     set({"video"}, {"video"});
+  } else if (mt == "magi2") {
+    // MAGI-2-preview: a prompt (and optionally a picture) in, a clip and
+    // its soundtrack out, from one denoise over both.
+    set({"text", "image"}, {"video", "audio"});
   } else if (mt == "minimax-h3-fl2va") {
     // The only entry whose OUTPUT is two modalities: one denoise loop
     // over one packed sequence emits the clip and its soundtrack

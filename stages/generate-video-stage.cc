@@ -35,6 +35,7 @@
 #include "generative-models/minimax-h3/minimax-h3-taomate.h"
 #include "generative-models/spec-keys.h"
 #include "generative-models/shared/motion-cache.h"
+#include "generative-models/video-host-ext.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/llama3/metal-llama-weights.h"
@@ -146,6 +147,13 @@ const ConfigKey kAttrs[] = {
    .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va,"
                       "minimax-h3-image",
    .model_channel = "diffusion-model"},
+  {.key = "curve_dit", .type = ConfigType::String, .required = false,
+   .doc = "MiniMax-H3 only, with a HyperFlow H3 Flash dit_dir: the stock "
+          "PRUNED DiT (Comfy-Org's minimax_h3_fl2va_pruned_*, a file or a "
+          "catalogue name) whose time curve and AdaLN projections Flash's "
+          "blocks then run under, single-time -- what a pi-H3 adapter on "
+          "Flash needs (its AdaLN overwrites are the pruned form's). Only "
+          "those tensors are read. Empty: Flash as released."},
   {.key = "dit_dir", .type = ConfigType::String, .required = false,
    .doc = "MiniMax-H3 only: a DiT checkpoint to run in place of the one "
           "under hf_dir, whose text encoder and VAEs are still used -- a "
@@ -203,11 +211,13 @@ const ConfigKey kAttrs[] = {
           "group), 'token' (int8 per weight row x per token after a "
           "256-wide Hadamard rotation: the fastest) or 'token_plain' (the "
           "same unrotated, which reads a Draw Things i8x checkpoint's "
-          "codes as stored). Taken by minimax-h3; others run accurate. "
+          "codes as stored). Taken by minimax-h3 and magi2; others run "
+          "accurate. "
           "Env VPIPE_I8_TIER overrides",
    .def_str = "accurate", .extra = kI8TierChoices},
   {.key = "tensor_parallel", .type = ConfigType::Object, .required = false,
-   .doc = "this stage as one RANK of a MiniMax H3 DiT split across hosts "
+   .doc = "this stage as one RANK of a MiniMax H3 or MAGI-2 DiT split "
+          "across hosts "
           "(generative-models/tensor-parallel.h): {rank, ranks, heads: "
           "[first, end], ffn: [first, end] -- unsaid, an even split -- "
           "transport: the name a plugin registered its transport under, "
@@ -223,7 +233,13 @@ const ConfigKey kAttrs[] = {
           "affine weights; adapters, the int8 tiers and the ANE tier take "
           "the share's widths (the ANE splitting each band's rows with the "
           "GPU, its bands a rank's without it); no VDN or TaoMate's "
-          "streaming (its adapter as a LoRA, taomate: off, takes the share)"},
+          "streaming (its adapter as a LoRA, taomate: off, takes the share). "
+          "MAGI-2: heads are the preview DiT's 24 query heads, ffn counts "
+          "EXPERTS of each MoE head's 256 (the shared, modality and mm "
+          "MLPs at the same fraction); two partial sums a layer, a guided "
+          "pair's exchanges under each other's work; a refine splits its "
+          "refiner at the same fractions, its bands' exchanges under the "
+          "next band's work"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
           "block matmuls instead of bf16, at int8 quality. Independent of "
@@ -367,7 +383,8 @@ const ConfigKey kAttrs[] = {
           "sage_pv8_all_rows. MEASURED on an M5 Ultra, MiniMax-H3 at "
           "1344x768 x 362 frames (109k rows, 16 steps): the attention 2.46 "
           "s against sage_attn's 2.90, the denoise 1927 s against 2110. "
-          "MiniMax-H3 only; matrix cores only, as sage_attn",
+          "MiniMax-H3 and MAGI-2 (every query row there, its sinks "
+          "included); matrix cores only, as sage_attn",
    .def_bool = false},
   {.key = "sage_pv8_from_step", .type = ConfigType::Int, .required = false,
    .doc = "the first sampling step sage_pv8 runs at; the steps before "
@@ -815,6 +832,7 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
 {
   _hf_dir = attr_str("hf_dir");
   _dit_dir = attr_str("dit_dir");
+  _curve_dit = attr_str("curve_dit");
   _h3_lora_model_slot.fill(-1);
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
@@ -1870,7 +1888,7 @@ GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
   // run whole, a band's 28 MB banded.
   int rank = 0;
   for (const std::string& f : loras) {
-    rank += T::lora_footprint(f, c.n_layers, c.pruned() ? &c : nullptr).rank;
+    rank += T::lora_footprint(f, c.n_layers, &c).rank;
   }
   n += (std::size_t)rows * (std::size_t)rank * 2;
   // (A DWD adapter's features outlive the forward: the payload claim in
@@ -1940,6 +1958,70 @@ GenerateVideoStage::h3_dwd_plan_bytes_(const std::string& root,
 #endif
 }
 
+genai::VideoPlanContext
+GenerateVideoStage::video_plan_context_(genai::VideoModelFamily* fam,
+                                        const std::string& root) const
+{
+  genai::VideoPlanContext c;
+  c.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+  c.accel = &_accel;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mc = session() != nullptr ? session()->services()->metal_compute()
+                                  : nullptr;
+  c.matrix_cores = mc != nullptr && mc->supports_matrix_cores();
+#endif
+  // A RANK books its share (a share that does not fit is refused at the
+  // load; the plan books the whole model then).
+  _plan_tp = {};
+  if (fam != nullptr && _tp_cfg.is_object() &&
+      plugin_tp_share_(fam, root, false, &_plan_tp, nullptr) &&
+      _plan_tp.active()) {
+    c.tp = &_plan_tp;
+  }
+  return c;
+}
+
+bool
+GenerateVideoStage::plugin_tp_share_(genai::VideoModelFamily* fam,
+                                     const std::string& root,
+                                     bool transport, genai::TpShare* out,
+                                     std::string* err) const
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = why; }
+    return false;
+  };
+  *out = {};
+  if (!_tp_cfg.is_object()) { return true; }
+  auto* tpx = fam != nullptr
+                  ? static_cast<genai::VideoTensorParallel*>(
+                        fam->query_extension(genai::kVideoTensorParallelExt))
+                  : nullptr;
+  if (tpx == nullptr) {
+    return fail(fmt("family '{}' does not split across hosts",
+                    fam != nullptr ? std::string(fam->tag())
+                                   : std::string("?"))());
+  }
+  int nh = 0, nf = 0;
+  std::string werr;
+  if (!tpx->tp_widths(root, &nh, &nf, &werr)) { return fail(werr); }
+  std::string terr;
+  if (!genai::TpShare::from_flex(_tp_cfg, nh, nf, out, &terr)) {
+    return fail(terr);
+  }
+  if (transport) {
+    auto o = _tp_cfg.as_object();
+    const std::string tname =
+        o.contains("transport") ? std::string(o.at("transport").as_string(""))
+                                : std::string();
+    if (genai::find_tp_transport(tname) == nullptr) {
+      return fail(fmt("no transport named '{}' -- a plugin registers it",
+                      tname)());
+    }
+  }
+  return true;
+}
+
 std::string
 GenerateVideoStage::planned_dwd_head() const
 {
@@ -1973,6 +2055,11 @@ GenerateVideoStage::h3_steps_() const
       genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
           _model_cfg);
   if (p.sigmas.size() >= 2) { return (int)p.sigmas.size() - 1; }
+  // HyperFlow H3 Flash's grids are 4, 6 and 8 steps, the release's
+  // default 6: a graph that does not say `steps` gets that, not the
+  // stage's 40 (which set_flash_steps would refuse). Decided here, at use,
+  // so a DiT swapped in later reads its own.
+  if (h3_flash_default_()) { return 6; }
   if (_h3i) {
     // The release's grid -- unless a scheduler is wired, which runs
     // `steps` when they are said (h3_sched_steps_): bound by the larger.
@@ -1984,6 +2071,14 @@ GenerateVideoStage::h3_steps_() const
                          : _h3i_manifest.steps();
   }
   return _steps;
+}
+
+bool
+GenerateVideoStage::h3_flash_default_() const
+{
+  return _h3_cfg.flash && _h3_cfg.curve_from.empty() &&
+         !(this->config().is_object() &&
+           this->config().as_object().contains("steps"));
 }
 
 int
@@ -2173,15 +2268,45 @@ GenerateVideoStage::declare_resources() const
   // Otherwise the MARKER: an unrounded estimate is not a conservative
   // bound, it is an optimistic one, and a presence marker that the
   // first beat replaces is the honest answer to "how big will this be".
+  // Whose formulas size the beat-shaped terms. A registered family's
+  // latent and soundtrack are ITS shape -- channel count, spatial and
+  // temporal compression all differ -- so a built-in's formula over a
+  // plugin's geometry is a confident number for the wrong model. Asked
+  // once, here, and used for both the payload sizes below and the
+  // holdings in declare_memory().
+  genai::VideoModelFamily* fam = genai::VideoModelRegistry::get().claim_for(
+      session(), root, resolve_model(session(), _hf_dir).model_type);
+  // ...and the clip it PRODUCES, where its model config makes that
+  // another than the request's (MAGI-2's refine: twice the frames on a
+  // larger grid), which is what the decode and the latent are.
+  const FlexData* mcfg = _model_cfg.is_object() ? &_model_cfg : nullptr;
+  auto* cplan = fam != nullptr
+                    ? static_cast<genai::VideoConfigPlan*>(
+                          fam->query_extension(genai::kVideoConfigPlanExt))
+                    : nullptr;
+  const genai::VideoPlanContext pctx = video_plan_context_(fam, root);
   int aw = _width, ah = _height, af = _frames;
+  int ow = 0, oh = 0, of = 0;
   std::size_t arena_bytes = model_memory::kUnknownArena;
   if (planned_geometry_(root, &aw, &ah, &af)) {
+    double ofps = _fps;
+    if (cplan == nullptr ||
+        !cplan->output_clip(root, mcfg, aw, ah, af, &ow, &oh, &of, &ofps)) {
+      ow = aw; oh = ah; of = af;
+    }
     // The clip, and what the VAE holds to make it -- which for the Wan
     // VAE at FlashVSR's 1920x1152 is several times the clip. Booked as
     // the clip alone, that decode read as 530 MB and ran into 9.5 GB of
     // swap.
-    arena_bytes = model_memory::video_decode_scratch_bytes(aw, ah, af) +
-                  model_memory::video_vae_working_bytes(root, aw, ah);
+    std::size_t vae_work = 0;
+    if (cplan != nullptr) {
+      vae_work = cplan->decode_working_bytes(root, ow, oh, of);
+    }
+    if (vae_work == 0) {
+      vae_work = model_memory::video_vae_working_bytes(root, ow, oh);
+    }
+    arena_bytes = model_memory::video_decode_scratch_bytes(ow, oh, of) +
+                  vae_work;
   } else {
     session()->log_debug(fmt(
         "GenerateVideoStage('{}'): no rounding rule for '{}', so the decode "
@@ -2230,21 +2355,13 @@ GenerateVideoStage::declare_resources() const
   // phases and is frequently larger than the VAE decoding it. Sized from
   // the same rounded geometry the arena uses, so the two cannot describe
   // different clips.
-  // Whose formulas size the beat-shaped terms. A registered family's
-  // latent and soundtrack are ITS shape -- channel count, spatial and
-  // temporal compression all differ -- so a built-in's formula over a
-  // plugin's geometry is a confident number for the wrong model. Asked
-  // once, here, and used for both the payload sizes below and the
-  // holdings in declare_memory().
-  genai::VideoModelFamily* fam = genai::VideoModelRegistry::get().claim_for(
-      session(), root, resolve_model(session(), _hf_dir).model_type);
 
   if (arena_bytes != model_memory::kUnknownArena && aw > 0 && ah > 0 &&
       af > 0) {
     // 0 from a family that declines to size its own latent, and the
     // claim is then skipped rather than filled in from a built-in.
     const std::size_t latent =
-        fam != nullptr ? fam->latent_bytes(root, aw, ah, af)
+        fam != nullptr ? fam->latent_bytes(root, ow, oh, of)
         : dwd_feats > 0
             ? dwd_feats
             : genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
@@ -2260,8 +2377,10 @@ GenerateVideoStage::declare_resources() const
     // stage; this is what the stage holds while making it, and for a
     // family like FlashVSR it is the larger of the two by far.
     if (fam != nullptr) {
-      const std::size_t den = fam->denoise_scratch_bytes(
-          root, aw, ah, af, _model_cfg.is_object() ? &_model_cfg : nullptr);
+      const std::size_t den =
+          cplan != nullptr
+              ? cplan->config_denoise_scratch_bytes(root, aw, ah, af, pctx)
+              : fam->denoise_scratch_bytes(root, aw, ah, af, mcfg);
       if (den > 0) {
         for (auto& c : model_memory::scratch_claims(
                  fmt("{}-denoise", this->id())(), den,
@@ -2320,7 +2439,10 @@ GenerateVideoStage::declare_resources() const
     // read back at load; see the plugin branch of load.
     const bool ane = genai::accel::flag(&_accel, genai::accel::kAneFfn);
     std::vector<ResourceClaim> out;
-    for (auto& c : fam->declare_resources(root)) {
+    // A family whose weights follow its model config (MAGI-2's refiner)
+    // answers with the config in hand.
+    for (auto& c : cplan != nullptr ? cplan->config_resources(root, pctx)
+                                    : fam->declare_resources(root)) {
       std::size_t ub = 0;
       int un = 0;
       if (model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
@@ -2408,13 +2530,15 @@ GenerateVideoStage::declare_resources() const
     using T = genai::MetalMiniMaxH3Transformer;
     T::Config tc;
     const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
+    tc.curve_from = _h3_cfg.curve_from;
+    (void)T::on_stock_curve(tc, nullptr);
     tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
     // A rank holds its cut of the split projections' factors.
     const genai::TpShare share = h3_tp_share_(tc);
     bool off_curve = false;
     int bound_steps = h3_steps_();
     for (const std::string& f : h3_plan_lora_files_()) {
-      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr,
+      const auto fp = T::lora_footprint(f, nl, &tc,
                                         share.active() ? &share : nullptr);
       off_curve = off_curve || (tc.pruned() && T::moves_time_embedding(f));
       bound_steps = std::max(bound_steps, T::flow_map_steps(f));
@@ -2525,7 +2649,12 @@ GenerateVideoStage::declare_memory() const
       session(), root, resolve_model(session(), _hf_dir).model_type);
 
   if (fam != nullptr) {
-    m.holdings = fam->declare_holdings(root);
+    const FlexData* mcfg = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    auto* cplan = static_cast<genai::VideoConfigPlan*>(
+        fam->query_extension(genai::kVideoConfigPlanExt));
+    const genai::VideoPlanContext pctx = video_plan_context_(fam, root);
+    m.holdings = cplan != nullptr ? cplan->config_holdings(root, pctx)
+                                  : fam->declare_holdings(root);
     // The POLICY is the stage's, not the family's: `unload_when_idle` is
     // this stage's config key, and a family cannot see it. The family
     // said what it holds and how small it can get; this says what
@@ -2542,11 +2671,24 @@ GenerateVideoStage::declare_memory() const
     int fw = _width, fh = _height, ff = _frames;
     if (!planned_geometry_(root, &fw, &fh, &ff)) { return m; }
     m.outputs.resize(2, 0);
-    m.outputs[0] = fam->latent_bytes(root, fw, fh, ff);
+    // The clip the request PRODUCES (a second stage at twice the rate on
+    // a larger grid) is the latent's.
+    {
+      int ow = fw, oh = fh, of = ff;
+      double ofps = _fps;
+      if (cplan == nullptr ||
+          !cplan->output_clip(root, mcfg, fw, fh, ff, &ow, &oh, &of,
+                              &ofps)) {
+        ow = fw; oh = fh; of = ff;
+      }
+      m.outputs[0] = fam->latent_bytes(root, ow, oh, of);
+    }
     // Same figure as the denoise claim in declare_resources, in this
     // ledger's terms, so the two plans cannot disagree about it.
-    m.scratch = fam->denoise_scratch_bytes(
-        root, fw, fh, ff, _model_cfg.is_object() ? &_model_cfg : nullptr);
+    m.scratch =
+        cplan != nullptr
+            ? cplan->config_denoise_scratch_bytes(root, fw, fh, ff, pctx)
+            : fam->denoise_scratch_bytes(root, fw, fh, ff, mcfg);
     std::size_t alat = 0, apcm = 0, aarena = 0;
     if (_fps > 0.0 &&
         fam->audio_cost(root, ff, _fps, &alat, &apcm, &aarena)) {
@@ -2597,10 +2739,12 @@ GenerateVideoStage::declare_memory() const
     using T = genai::MetalMiniMaxH3Transformer;
     T::Config tc;
     const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
+    tc.curve_from = _h3_cfg.curve_from;
+    (void)T::on_stock_curve(tc, nullptr);
     tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
     const genai::TpShare share = h3_tp_share_(tc);
     for (const std::string& f : h3_plan_lora_files_()) {
-      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr,
+      const auto fp = T::lora_footprint(f, nl, &tc,
                                         share.active() ? &share : nullptr);
       m.hold(f, fp.whole, fp.streamed,
              _unload_cfg == model_memory::UnloadPolicy::kDestroy);
@@ -2880,6 +3024,24 @@ GenerateVideoStage::resolve_config_()
         // partition has the released one, which a full-model adapter's
         // AdaLN modules and a flow map need on it (Config::time_mlp_dir).
         // Named only: it is read when an adapter asks.
+        // pi-H3 on HyperFlow H3 Flash: the stock curve and AdaLN under
+        // Flash's blocks (Config::curve_from) -- the pruned form from here
+        // on, sized and booked as one.
+        if (_h3_cfg.flash && !_curve_dit.empty()) {
+          _h3_cfg.curve_from =
+              genai::MetalMiniMaxH3Transformer::resolve_dit_dir(
+                  resolve_model_dir(session(), _curve_dit), want_partition);
+          std::string cerr;
+          if (!genai::MetalMiniMaxH3Transformer::on_stock_curve(_h3_cfg,
+                                                                &cerr)) {
+            session()->warn(fmt("GenerateVideoStage('{}'): curve_dit: {}; "
+                                "the stage will not run", id(), cerr));
+            _family.clear();
+          }
+        } else if (!_curve_dit.empty()) {
+          session()->warn(fmt("GenerateVideoStage('{}'): curve_dit is for a "
+                              "HyperFlow H3 Flash dit_dir; ignored", id()));
+        }
         _h3_cfg.time_mlp_dir = h3_time_mlp_dir_(_root, want_partition,
                                                 _h3_cfg);
       }
@@ -3417,6 +3579,36 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
     _preview->submit(std::vector<float>(p, p + t.elems()), t.shape[0],
                      t.shape[1], t.shape[2], t.shape[3], step, total);
   };
+  // A RANK opens this clip's channel to the other ranks and lets it go
+  // however the clip ends -- one channel a clip on every rank, so the
+  // ranks stay paired clip for clip.
+  genai::VideoTpClip* tp_clip = nullptr;
+  if (_plugin_tp.active()) {
+    tp_clip = static_cast<genai::VideoTpClip*>(
+        _plugin_gen->query_extension(genai::kVideoTpClipExt));
+    std::string terr;
+    std::shared_ptr<genai::TpChannel> ch =
+        open_tp_channel_(_plugin_tp, &terr);
+    if (tp_clip == nullptr) {
+      terr = fmt("family '{}' loaded a rank that takes no channel",
+                 _family)();
+    }
+    if (tp_clip == nullptr || !ch ||
+        !tp_clip->begin_tp_generation(
+            std::move(ch), [&ctx]() { return ctx.stop_requested(); },
+            &terr)) {
+      session()->warn(fmt("GenerateVideoStage('{}'): tensor_parallel: {}; "
+                          "skipping", this->id(), terr));
+      return false;
+    }
+  }
+  struct TpEnded {
+    genai::VideoTpClip* clip;
+    ~TpEnded()
+    {
+      if (clip != nullptr) { clip->end_tp_generation(); }
+    }
+  } tp_ended{tp_clip};
   try {
     const bool ok = _plugin_gen->generate(req, out);
     bar.finish();
@@ -3452,6 +3644,37 @@ void
 GenerateVideoStage::correct_plugin_holding_(const char* when)
 {
   if (!_plugin_gen) { return; }
+  // A generator that says what it holds of EACH source (an in-tree
+  // family; video-host-ext.h): every holding corrected, and in BOTH
+  // ledgers -- the manager's declaration is what its peers size against,
+  // and what such a family holds beyond its weight set (held experts, its
+  // slots) no set reports.
+  if (auto* by = static_cast<genai::VideoHeldBySource*>(
+          _plugin_gen->query_extension(genai::kVideoHeldBySourceExt))) {
+    StageMemory m = declare_memory();
+    auto* mgr = session()->services() != nullptr
+                    ? session()->services()->generative_model_manager()
+                    : nullptr;
+    bool moved = false;
+    for (StageHolding& h : m.holdings) {
+      const std::size_t held = by->held_bytes(h.source);
+      if (held == 0) { continue; }
+      std::size_t& f = _plugin_source_floor_[h.source];
+      const bool first = f == 0;
+      f = correct_loaded_holding(h, held, f);
+      std::size_t& rev = _plugin_source_revised_[h.source];
+      if (!first && h.preload == rev) { continue; }
+      rev = h.preload;
+      moved = true;
+      if (mgr != nullptr) { mgr->revise_declaration(h.source, h.preload); }
+      session()->log_debug(fmt(
+          "GenerateVideoStage('{}'): '{}' holds {} MB of '{}' {}; the plan "
+          "holds it at {} MB, floor {} MB", this->id(), _family, held >> 20,
+          h.source, when, h.preload >> 20, h.floor >> 20));
+    }
+    if (moved) { revise_memory(m); }
+    return;
+  }
   const std::size_t held = (std::size_t)_plugin_gen->resident_bytes();
   // 0 is the documented "cannot answer cheaply". Overwriting a real
   // plan-time figure with a decline would report the checkpoint as free.
@@ -3488,6 +3711,31 @@ GenerateVideoStage::ensure_expert_(int which)
   if (_plugin_family != nullptr) {
     resolve_config_();
     if (!_have_cfg) { return false; }
+    // TENSOR PARALLEL: this stage as one RANK of the family's DiT split
+    // across hosts (video-host-ext.h's VideoTensorParallel), its share of
+    // the family's widths -- refused by name where the family does not
+    // split. Its channel is opened per clip (run_plugin_family_). A
+    // generator kept from a launch with another share is let go.
+    genai::TpShare tp_share;
+    if (_tp_cfg.is_object()) {
+      std::string terr;
+      if (!plugin_tp_share_(_plugin_family, _root, true, &tp_share,
+                            &terr)) {
+        session()->error(fmt("GenerateVideoStage('{}'): tensor_parallel: {}",
+                             this->id(), terr));
+        return false;
+      }
+    }
+    auto same_share = [](const genai::TpShare& a, const genai::TpShare& b) {
+      return a.active() == b.active() &&
+             (!a.active() ||
+              (a.rank == b.rank && a.ranks == b.ranks &&
+               a.head0 == b.head0 && a.head1 == b.head1 &&
+               a.ffn0 == b.ffn0 && a.ffn1 == b.ffn1));
+    };
+    if (_plugin_gen && !same_share(tp_share, _plugin_tp)) {
+      _plugin_gen.reset();
+    }
     if (_plugin_gen) { return true; }
     auto* pmc = session()->services()->metal_compute();
     if (pmc == nullptr) { return false; }
@@ -3554,8 +3802,26 @@ GenerateVideoStage::ensure_expert_(int which)
     if (create_extra.as_object().size() > 0) {
       args.borrowed_extra = &create_extra;
     }
+    if (tp_share.active()) {
+      auto o = _tp_cfg.as_object();
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): rank {} of {} of '{}': heads [{}, {}) "
+          "of {}, feed-forward rows [{}, {}) of {}, through '{}' (a channel "
+          "each clip)", this->id(), tp_share.rank, tp_share.ranks, _family,
+          tp_share.head0, tp_share.head1, tp_share.n_heads, tp_share.ffn0,
+          tp_share.ffn1, tp_share.n_ffn,
+          std::string(o.at("transport").as_string(""))));
+    }
+    _plugin_tp = tp_share;
     try {
-      _plugin_gen = _plugin_family->load(args);
+      if (tp_share.active()) {
+        auto* tpx = static_cast<genai::VideoTensorParallel*>(
+            _plugin_family->query_extension(
+                genai::kVideoTensorParallelExt));
+        _plugin_gen = tpx->load_rank(args, tp_share);
+      } else {
+        _plugin_gen = _plugin_family->load(args);
+      }
     } catch (const std::exception& e) {
       session()->error(fmt(
           "GenerateVideoStage('{}'): family '{}' threw loading '{}': {}; "
@@ -3588,6 +3854,8 @@ GenerateVideoStage::ensure_expert_(int which)
     // on. See correct_plugin_holding_.
     _plugin_load_floor_ = 0;
     _plugin_revised_    = 0;
+    _plugin_source_floor_.clear();
+    _plugin_source_revised_.clear();
     correct_plugin_holding_("after loading");
     // THE IDLE POLICY, which this arm never resolved: under `auto` a
     // registered family kept its DiT for the life of the run, beside a
@@ -3976,6 +4244,7 @@ GenerateVideoStage::ensure_expert_(int which)
                           c.ane_int8 ? 1 : 0, c.ane_int8_plain ? 1 : 0,
                           c.ane_rows, c.ane_layers, c.qkv_per_head ? 1 : 0,
                           stream_blocks ? 1 : 0, c.time_mlp_dir)();
+      if (!c.curve_from.empty()) { k += "|curve " + c.curve_from; }
       if (c.tp.active()) {
         k += fmt("|tp {}/{} heads {}-{} ffn {}-{}", c.tp.rank, c.tp.ranks,
                  c.tp.head0, c.tp.head1, c.tp.ffn0, c.tp.ffn1)();
@@ -4087,6 +4356,42 @@ GenerateVideoStage::ensure_expert_(int which)
             _h3_dit->vdn_checkpoint_radius()));
       }
     }
+    // HYPERFLOW H3 FLASH (VideoRebirthAI/hyperflow-h3-flash): a DiT that
+    // samples its own grids -- 4, 6 or 8 steps, `steps` choosing -- with
+    // the two-time embedding built in. Its blocks are not the release's
+    // 50, so a per-block branch trained on those (VDN) has nowhere to go.
+    // Keyed on the config, not the grids: Flash under the stock pruned
+    // curve (curve_dit) has none and still lacks those blocks.
+    if (_h3_dit && _h3_dit->config().flash && !vdn_dir_().empty()) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): HyperFlow H3 Flash left blocks of "
+          "the release out; the VDN branch, trained per block on all 50, "
+          "cannot run on it", this->id()));
+      return false;
+    }
+    if (_h3_dit && !_h3_dit->flash_step_counts().empty()) {
+      std::string ferr;
+      const int fsteps = h3_flash_default_() ? 6 : _steps;
+      if (!_h3_dit->set_flash_steps(fsteps, &ferr)) {
+        session()->error(fmt("GenerateVideoStage('{}'): {} (`steps`)",
+                             this->id(), ferr));
+        return false;
+      }
+      const auto& fm = *_h3_dit->flow_map();
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): HyperFlow H3 Flash -- its {}-step grid, "
+          "two-time embedding at gate {:.4g}, shifts {:.4g}/{:.4g}",
+          this->id(), fsteps, fm.gate, _h3_params.video_shift,
+          _h3_params.audio_shift));
+      if (std::fabs(fm.video_shift - _h3_params.video_shift) > 1e-6 ||
+          std::fabs(fm.audio_shift - _h3_params.audio_shift) > 1e-6) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): HyperFlow H3 Flash samples at shifts "
+            "{:.4g}/{:.4g} and this graph runs {:.4g}/{:.4g}", this->id(),
+            fm.video_shift, fm.audio_shift, _h3_params.video_shift,
+            _h3_params.audio_shift));
+      }
+    } else
     // A FLOW-MAP adapter (HyperFlow) brings its own sampling grid, and
     // denoise() runs it in place of `steps` -- so say so here, once,
     // rather than let a graph that asks for 40 steps quietly get 8.
@@ -4405,11 +4710,18 @@ GenerateVideoStage::correct_h3_holding_()
 std::shared_ptr<genai::TpChannel>
 GenerateVideoStage::open_tp_channel_(std::string* err)
 {
+  return open_tp_channel_(_h3_cfg.tp, err);
+}
+
+std::shared_ptr<genai::TpChannel>
+GenerateVideoStage::open_tp_channel_(const genai::TpShare& share,
+                                     std::string* err)
+{
   auto fail = [&](const std::string& why) {
     if (err != nullptr) { *err = why; }
     return std::shared_ptr<genai::TpChannel>();
   };
-  if (!_h3_cfg.tp.active() || !_tp_cfg.is_object()) {
+  if (!share.active() || !_tp_cfg.is_object()) {
     return fail("this stage is not a rank");
   }
   auto o = _tp_cfg.as_object();
@@ -4426,7 +4738,7 @@ GenerateVideoStage::open_tp_channel_(std::string* err)
   std::string terr;
   std::shared_ptr<genai::TpChannel> ch;
   try {
-    ch = tr->open(params, _h3_cfg.tp, &terr);
+    ch = tr->open(params, share, &terr);
   } catch (const std::exception& e) {
     ch.reset();
     terr = std::string("it threw: ") + e.what();
@@ -6665,10 +6977,16 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       // plugin arm never did it.
       FlexData sb = res.sideband.is_object() ? res.sideband
                                              : FlexData::make_object();
-      sb.as_object().insert_or_assign(sideband::kFps,
-                                      FlexData::make_real(_fps));
-      sb.as_object().insert_or_assign(
-          sideband::kFrames, FlexData::make_int((std::int64_t)_frames));
+      // A family that changed the clip's rate or length (MAGI-2's refine:
+      // twice the frames, at twice the rate) said so, and it stands.
+      auto so = sb.as_object();
+      if (!so.contains(sideband::kFps)) {
+        so.insert_or_assign(sideband::kFps, FlexData::make_real(_fps));
+      }
+      if (!so.contains(sideband::kFrames)) {
+        so.insert_or_assign(sideband::kFrames,
+                            FlexData::make_int((std::int64_t)_frames));
+      }
       vout->sideband = std::move(sb);
     }
     ++_emitted;

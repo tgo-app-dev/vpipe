@@ -1398,6 +1398,30 @@ I8GemmContext::tune_pending(MetalCompute* mc)
   _tune_y = {};
 }
 
+bool
+I8GemmContext::reserve(int m, int k_act, int n_w, int k_w)
+{
+  if (!_on || _mc == nullptr) { return false; }
+  auto need = [&](SharedBuffer& b, std::size_t bytes) {
+    if (bytes == 0) { return true; }
+    if (b.empty() || b.byte_size() < bytes) {
+      b = SharedBuffer();
+      b = _mc->make_shared_buffer(bytes);
+    }
+    return !b.empty();
+  };
+  bool ok = true;
+  if (m > 0 && k_act > 0) {
+    ok = need(_xq, act_codes_bytes(m, k_act, _group)) &&
+         need(_as, act_scale_bytes(m, k_act, _group));
+  }
+  if (ok && n_w > 0 && k_w > 0) {
+    ok = need(_wq, act_codes_bytes(n_w, k_w, _group)) &&
+         need(_ws, act_scale_bytes(n_w, k_w, _group));
+  }
+  return ok;
+}
+
 void
 I8GemmContext::release_scratch()
 {

@@ -142,6 +142,12 @@ public:
   // in the same layout and type. `seq` counts the generation's exchanges
   // from 0 on every rank alike: a transport checks it to catch ranks out
   // of step.
+  // WITH TWO RANKS `others` is the peer's partial BYTE FOR BYTE -- copied,
+  // never added into zeros -- so a host may send records through it (a
+  // training run's dataset, flags, integers): -0, a NaN's payload and a
+  // denormal come back as they went. A transport that cannot promise it
+  // (one that sums whatever the rank count) is refused by such a host at
+  // its first exchange, which probes it.
   // False, with `err`, when the link failed or the run was stopped; the
   // run then fails. A channel LET GO -- a rank that refused its clip
   // after opening it, so the ranks stay paired clip for clip -- should

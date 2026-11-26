@@ -21,6 +21,10 @@ namespace h3 = minimax_h3;
 
 namespace {
 
+// The overlap's lane a training step's exchanges post from (the model's
+// lanes 0-3 are its forward's band partials).
+constexpr int kTrainLane = 4;
+
 // The steel flash-attention parameter block, as attn_steel.metal reads it.
 struct SteelAttnParams {
   int B, H, D;
@@ -90,8 +94,20 @@ MiniMaxH3Trainer::create(MetalMiniMaxH3Transformer* model, std::string* err)
     return fail("minimax-h3 trainer: the attention backward is head_dim "
                 "128 only");
   }
-  if (c.tp.active()) {
-    return fail("minimax-h3 trainer: a rank of a split DiT does not train");
+  // A RANK (Config::tp) trains its share: every block recomputed, its
+  // partial sums crossing where the forward's do (block_pass_), the
+  // adapter its share of the whole (split_cuts). Not on the ANE: its
+  // modules are the GPU's share's.
+  if (c.tp.active() && (c.ane_ffn || c.ane_qkv)) {
+    return fail("minimax-h3 trainer: a rank of a split DiT trains on the "
+                "GPU alone");
+  }
+  // HyperFlow H3 Flash (Config::flash): its low-rank projections have
+  // no dense weight for the backward to transpose (dense_), and its
+  // blocks are not the release's an adapter names.
+  if (c.flash) {
+    return fail("minimax-h3 trainer: HyperFlow H3 Flash does not train "
+                "(its low-rank projections have no backward here)");
   }
   if (!model->_steel_ok) {
     return fail("minimax-h3 trainer: the steel flash attention is off "
@@ -338,6 +354,68 @@ MiniMaxH3Trainer::bind(train::LoraParams* params, std::string* err)
   }
   _slot = slot;
   return (int)params->modules().size();
+}
+
+bool
+MiniMaxH3Trainer::split_cuts(const std::vector<train::ModuleShape>& mods,
+                             std::map<std::string, train::ModuleCut>* out,
+                             std::string* err) const
+{
+  const M::Config& c = _m->_cfg;
+  const TpShare& tp = c.tp;
+  if (!tp.active()) {
+    if (err != nullptr) { *err = "minimax-h3 trainer: not a rank"; }
+    return false;
+  }
+  const int H = c.hidden, HD = c.head_dim;
+  const int I = c.inner(), F = c.ffn;               // the share's
+  const int WI = tp.n_heads * HD, WF = tp.n_ffn;    // the whole's
+  const int q0 = tp.head0 * HD, f0 = tp.ffn0;
+  out->clear();
+  for (const train::ModuleShape& ms : mods) {
+    auto ends = [&](const char* leaf) {
+      const std::string l(leaf);
+      return ms.name.size() >= l.size() &&
+             ms.name.compare(ms.name.size() - l.size(), l.size(), l) == 0;
+    };
+    train::ModuleCut k;
+    if (ends(".attn.to_q") || ends(".attn.to_k") || ends(".attn.to_v")) {
+      // B [I, r]: the share's heads' rows of each projection; A whole.
+      k.whole_n = WI;
+      k.whole_k = H;
+      k.b_src.resize((std::size_t)I);
+      for (int i = 0; i < I; ++i) { k.b_src[(std::size_t)i] = q0 + i; }
+      k.a_shared = true;
+    } else if (ends(".attn.to_out.0")) {
+      // A [r, I]: the share's heads' columns; B whole.
+      k.whole_n = H;
+      k.whole_k = WI;
+      k.a_col0 = q0;
+      k.b_shared = true;
+    } else if (ends(".ff.net.0.proj")) {
+      // diffusers' [value; gate], each half at the share's rows.
+      k.whole_n = 2 * WF;
+      k.whole_k = H;
+      k.b_src.resize((std::size_t)(2 * F));
+      for (int i = 0; i < F; ++i) {
+        k.b_src[(std::size_t)i] = f0 + i;
+        k.b_src[(std::size_t)(F + i)] = WF + f0 + i;
+      }
+      k.a_shared = true;
+    } else if (ends(".ff.net.2")) {
+      k.whole_n = H;
+      k.whole_k = WF;
+      k.a_col0 = f0;
+      k.b_shared = true;
+    } else {
+      if (err != nullptr) {
+        *err = "minimax-h3 trainer: no split for module " + ms.name;
+      }
+      return false;
+    }
+    (*out)[ms.name] = std::move(k);
+  }
+  return true;
 }
 
 std::size_t
@@ -858,12 +936,85 @@ MiniMaxH3Trainer::keep_acts_(int L) const
 }
 
 bool
+MiniMaxH3Trainer::tp_reduce_(CommandStream* st, ComputeEncoder& enc,
+                             const SharedBuffer& part, int rows,
+                             std::string* err)
+{
+  M& m = *_m;
+  if (!m._cfg.tp.active()) { return true; }
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) {
+      *err = "minimax-h3 trainer: tensor parallel: " + why;
+    }
+    return false;
+  };
+  if (st == nullptr || m._tp_pipe == nullptr) {
+    return fail("a rank's partial sum with no generation open");
+  }
+  const int H = m._cfg.hidden;
+  const std::size_t bytes = (std::size_t)rows * (std::size_t)H * 2;
+  if (!m.tp_buffer_(m._tp_send, bytes) || !m.tp_buffer_(m._tp_others, bytes)) {
+    return fail("no room for a block's partial sums");
+  }
+  // POSTED (TpOverlap), the GPU never drained: it copies the partial
+  // into the send buffer and signals, the buffer submitted at once (a
+  // signal runs only once committed, and the worker waits on it); the
+  // worker hands it to the channel. Nothing is copied on the CPU.
+  //
+  // The others' sum is waited for HERE, on the CPU, not by the GPU: a
+  // command buffer parked on an event only the peer's progress sets is
+  // killed by the GPU's watchdog when the peer stalls for seconds (its
+  // first step's tuning, a page-in) -- seen at 768 as "GPU command
+  // buffer timeout". Nothing of this rank's work is left to hide the
+  // exchange under: every op after it reads the sum. (Row bands that
+  // would, measured at a training sample's 2,000 rows: 3.1-3.7 s a step
+  // against 2.2 -- each band's GPU work no more than its handoff.)
+  {
+    const std::size_t n = (std::size_t)rows * H;
+    enc.set_function(m._fn_copy);
+    enc.set_buffer(0, part);
+    enc.set_buffer(1, m._tp_send);
+    enc.set_constant(2, 0);
+    enc.set_constant(3, (int)n);
+    enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  }
+  const TpOverlap::Ticket t = m._tp_pipe->post(
+      kTrainLane, m._tp_send, m._tp_others, bytes, m._tp_seq++);
+  enc.end();
+  m._flops.flush(*st);
+  st->encode_signal(*t.ready, t.ready_at);
+  // Its fence watched while the sum is waited for: a faulted buffer
+  // never signals, and the wait would never end.
+  CommandStream::Fence f = st->commit();
+  if (!m._tp_pipe->wait_done(t.done_at, [&f]() { return f.errored(); })) {
+    enc = st->begin_compute();
+    return fail(m._tp_pipe->failed() ? m._tp_pipe->error()
+                                     : std::string("the exchange stopped"));
+  }
+  enc = st->begin_compute();
+  // part += the others' (bf16), as the forward completes its partials:
+  // two ranks add a + b and b + a, the same sum.
+  const int elt_h = M::elt_rows(H);
+  enc.set_function(m._fn_residual);
+  for (int r0 = 0; r0 < rows; r0 += elt_h) {
+    const int n = std::min(elt_h, rows - r0);
+    const std::size_t eo = (std::size_t)r0 * H * 2;
+    enc.set_buffer(0, part, eo);
+    enc.set_buffer(1, m._tp_others, eo);
+    enc.set_buffer(2, part, eo);
+    enc.set_constant(3, n * H);
+    enc.dispatch({(unsigned)(n * H), 1, 1}, {256, 1, 1});
+  }
+  return true;
+}
+
+bool
 MiniMaxH3Trainer::block_pass_(ComputeEncoder& enc, Pass pass, bool refiner,
                               int L, const Block& b, const SharedBuffer& x,
                               std::size_t xe, int rows,
                               const SharedBuffer& mod, std::size_t me,
                               const SharedBuffer& dres, const Acts& a,
-                              std::string* err)
+                              std::string* err, CommandStream* st)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = "minimax-h3 trainer: " + m; }
@@ -1065,6 +1216,8 @@ MiniMaxH3Trainer::block_pass_(ComputeEncoder& enc, Pass pass, bool refiner,
     }
     transpose(a.oh, a.ob, NH, rows);
     proj(a.ob, b.out, _ao, H, I, lo_out);
+    // A rank's share of the out projection, completed by the others'.
+    if (!tp_reduce_(st, enc, _ao, rows, err)) { return false; }
     // x1 = x + gate1 attn (the refiner: + attn).
     {
       const std::size_t n = (std::size_t)rows * H;
@@ -1094,6 +1247,9 @@ MiniMaxH3Trainer::block_pass_(ComputeEncoder& enc, Pass pass, bool refiner,
   if (pass == Pass::kForward) {
     const M::LoraStack lo_fc2 = m.lora_stack_(refiner, L, &BlockLora::fc2);
     proj(a.sw, b.fc2, _ao, H, F, lo_fc2);
+    // A rank's share of fc2, completed by the others' (the out
+    // projection's was above).
+    if (!tp_reduce_(st, enc, _ao, rows, err)) { return false; }
     const std::size_t n = (std::size_t)rows * H;
     SharedBuffer xo = x.subview(xe * 2, n * 2);
     enc.set_function(m._fn_copy);
@@ -1122,6 +1278,8 @@ MiniMaxH3Trainer::block_pass_(ComputeEncoder& enc, Pass pass, bool refiner,
   }
   lora_bwd_(enc, refiner, L, &BlockLora::fc1, a.h2, H, _dgu, 2 * F, _dh, H,
             rows, 2 * F, H);
+  // A rank's dh2 is its feed-forward rows' share: summed across them.
+  if (!tp_reduce_(st, enc, _dh, rows, err)) { return false; }
   _ops.rms_mod_bwd(enc, a.x1, 0, _dh, 0, false, b.n2, mod, me, _aidx, 0,
                    dres, 0, rows, H, eps, stride6, 4 * H, modulated);
 
@@ -1162,6 +1320,8 @@ MiniMaxH3Trainer::block_pass_(ComputeEncoder& enc, Pass pass, bool refiner,
   }
   lora_bwd_(enc, refiner, L, &BlockLora::qkv, a.h1, H, _qkvn, 3 * I, _dh, H,
             rows, 3 * I, H);
+  // ...and dh1 its heads' share.
+  if (!tp_reduce_(st, enc, _dh, rows, err)) { return false; }
   _ops.rms_mod_bwd(enc, x, xe, _dh, 0, false, b.n1, mod, me, _aidx, 0,
                    dres, 0, rows, H, eps, stride6, H, modulated);
   // The meter (perf-flops): the attention's backward, five matmul units
@@ -1191,6 +1351,9 @@ MiniMaxH3Trainer::step(const Sample& smp, Result* out, std::string* err,
   if (m.two_time_active()) {
     return fail("a flow-map adapter is live; set its strength to 0 for "
                 "training steps");
+  }
+  if (c.tp.active() && !m.tp_generation_open()) {
+    return fail("a rank's step with no channel to the other ranks");
   }
   const h3::PackedLayout& L = *smp.layout;
   const int seq = L.seq_len, n_text = L.num_text_rows;
@@ -1234,12 +1397,12 @@ MiniMaxH3Trainer::step(const Sample& smp, Result* out, std::string* err,
   // trainer's own, keeping its activations for the backward below.
   std::string kerr;
   if (_keep_all) {
-    tap.run_block = [this, MT, &kerr](ComputeEncoder& enc, int Lx,
-                                      const Block& b, const SharedBuffer& x,
-                                      int rows) {
+    tap.run_block = [this, MT, &kerr](CommandStream& cs, ComputeEncoder& enc,
+                                      int Lx, const Block& b,
+                                      const SharedBuffer& x, int rows) {
       return block_pass_(enc, Pass::kForward, false, Lx, b, x, 0, rows,
                          _mods, (std::size_t)Lx * MT, _dres, keep_acts_(Lx),
-                         &kerr);
+                         &kerr, &cs);
     };
   }
   M::Step st;
@@ -1353,7 +1516,7 @@ MiniMaxH3Trainer::step(const Sample& smp, Result* out, std::string* err,
       const bool ok = block_pass_(
           enc, _keep_all ? Pass::kBackward : Pass::kRecompute, false, Lx, *b,
           _ckpt, (std::size_t)Lx * RH, seq, _mods, (std::size_t)Lx * MT,
-          _dres, _keep_all ? keep_acts_(Lx) : scratch_acts_(), err);
+          _dres, _keep_all ? keep_acts_(Lx) : scratch_acts_(), err, &bs);
       enc.end();
       if (!ok) { return false; }
     }
@@ -1390,7 +1553,7 @@ MiniMaxH3Trainer::step(const Sample& smp, Result* out, std::string* err,
         const bool ok = block_pass_(
             enc, Pass::kRecompute, true, R, m._refiner[(std::size_t)R],
             _ref_in, (std::size_t)R * n_text * H, n_text, _zero, 0, _dres_t,
-            scratch_acts_(), err);
+            scratch_acts_(), err, &bs);
         enc.end();
         if (!ok) { return false; }
       }
@@ -1407,6 +1570,14 @@ MiniMaxH3Trainer::step(const Sample& smp, Result* out, std::string* err,
     out->loss = smp.weight * (lv + (audio_loss ? smp.audio_weight * la : 0.0));
     out->forward_ms = fwd_ms;
     out->backward_ms = ms_since_(t_b0);
+    if (c.tp.active() && m._mc->session() != nullptr) {
+      const TpOverlap::Stats ts = m._tp_pipe->take_stats();
+      m._mc->session()->log_debug(fmt(
+          "[h3-train] tensor parallel backward: {} exchanges, {:.1f} MB, "
+          "link {:.1f} ms, waiting for the GPU {:.1f} ms, backward {:.1f} ms",
+          ts.exchanges, (double)ts.bytes / 1e6, ts.link_ms, ts.idle_ms,
+          out->backward_ms));
+    }
     if (keep_pred) {
       out->pred_video = std::move(v.video);
       out->pred_audio = std::move(v.audio);

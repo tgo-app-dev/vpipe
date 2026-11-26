@@ -62,7 +62,8 @@ struct FlowSchedulerSpec {
   // is the scheduler's own, not the exponential/linear pair), a terminal 0
   // is appended, and sigma[0] is nudged down by 1e-6 when it lands exactly
   // on 1 so that log(alpha) = log(1 - sigma) stays finite in the first
-  // UniPC update.
+  // UniPC update. `base_sigmas` (steps of them), when given, replace the
+  // base grid; at shift 1 they run exactly as written.
   //
   // "boogu_v1" is Boogu-Image's FlowMatchEulerDiscreteScheduler time-shifting:
   // its sigma convention is INVERTED relative to every other schedule here --

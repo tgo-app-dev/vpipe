@@ -147,6 +147,13 @@ add_vpipe_metal_kernel(rife SRC ops/rife.metal)
 add_vpipe_metal_kernel(relayvsr SRC ops/relayvsr.metal)
 add_vpipe_metal_kernel(relayvsr_bf16 SRC ops/relayvsr.metal
                        DEFINES VPIPE_ELT=bfloat)
+# MAGI-2-preview (generative-models/magi2/): its f32 GEMM (adapters, router,
+# hyper-connection projections), the hyper-connections' pre / post steps,
+# per-modality norms, q/k norm + element-wise rope, the attention gate,
+# swiglu7 and the multi-head MoE (top-k, fused grouped experts, combine).
+# bf16 only: the model runs in bf16.
+add_vpipe_metal_kernel(magi2_bf16 SRC ops/magi2.metal
+                       DEFINES VPIPE_ELT=bfloat)
 # Open-H3-Regenerate-2K: MiniMax-H3's latent upscaler (its folded-affine
 # GroupNorm, temporal depthwise conv and bilinear resize) and the LMS
 # Sharp curve branch on the DiT's AdaLN (generative-models/minimax-h3/).
@@ -338,6 +345,12 @@ add_vpipe_metal_kernel(deepseek_v41_nax_bf16 SRC ops/deepseek_v41_nax.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS}
                        DEPENDS ${GROUPED_NAX_HDRS} ops/ggml_native.h)
+# MAGI-2-preview's routed experts on the matrix cores: gate / up, swiglu7
+# and down fused per 64-row work item (the twin of magi2_moe_expert).
+add_vpipe_metal_kernel(magi2_nax_bf16 SRC ops/magi2_nax.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
 # 4-bit -> dense weight expansion feeding the matrix-core dense GEMM
 # (dequant-once then dense_gemm_mma; faster than fused dequant-in-loop).
 add_vpipe_metal_kernel(affine_dequant SRC quant/affine_dequant.metal)

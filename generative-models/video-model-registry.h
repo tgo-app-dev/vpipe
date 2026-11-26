@@ -216,8 +216,21 @@ struct VideoGenResult {
   double latents_per_second = 0.0; // stamped on the audio beat
   // WHAT THE FAMILY WANTS SAID BACK, for anything this struct has no
   // field for -- realized sparsity, a chosen variant, a per-step
-  // statistic. The stage forwards it onto the beat's sideband and reads
-  // none of it, so a family adding one costs nobody a rebuild.
+  // statistic. The stage forwards it onto the video beat's sideband, so a
+  // family adding one costs nobody a rebuild.
+  //
+  // It reads TWO of its keys, and only to leave them alone:
+  // sideband::kFps (real: frames per second of the clip the latent
+  // decodes to) and sideband::kFrames (int: that clip's PIXEL frames).
+  // A family whose clip is not the one asked for -- a second stage at
+  // twice the rate and length -- sets them, and they stand; one that
+  // leaves either out gets the stage's own (its `fps`, and the frame
+  // count align_frames() settled). vae-decode stamps the decoded frames
+  // with that rate, so the encoders downstream write the file at it.
+  // Two limits: the launch plan books the clip the stage was configured
+  // for (the latent payload, the decode arena), not the one returned;
+  // and a host older than this rule replaced both keys with its own
+  // values, whatever the family set.
   FlexData sideband;
 };
 

@@ -10,9 +10,12 @@
 
 #include "minitest.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
+#include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/kernel-contract.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "generative-models/shared/sage-attention.h"
 #include "interfaces/session-services-intf.h"
@@ -20,6 +23,7 @@
 #include "gpu-kernels/metal/vendored/mlx/backend/metal/kernels/steel/attn/params.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -50,7 +54,9 @@ static_assert(sizeof(contract::SteelAttnParams) ==
 static_assert(genai::sage::kQkInt8Constant == contract::kAttnQkInt8 &&
                   genai::sage::kPvInt8Constant == contract::kAttnPvInt8 &&
                   genai::sage::kQTokenScaleConstant ==
-                      contract::kAttnQTokenScale,
+                      contract::kAttnQTokenScale &&
+                  genai::sage::kSinkShiftConstant ==
+                      contract::kAttnSinkShift,
               "kernel contract: Sage's function constants");
 
 bool
@@ -121,6 +127,30 @@ TEST(kernel_contract, every_contracted_kernel_resolves)
                     std::string(k.entry).c_str());
       }
       ++checked;
+      // ...and an attention WITH SINKS under both: the sinks shifted as
+      // the smoothed keys are (kAttnSinkShift), the int8 QK alone and
+      // with its P*V.
+      for (const bool pv8 : {false, true}) {
+        FunctionConstants sf;
+        sf.set_bool(contract::kAttnAlignQ, true)
+            .set_bool(contract::kAttnAlignK, true)
+            .set_bool(contract::kAttnHasMask, false)
+            .set_bool(contract::kAttnCausal, false)
+            .set_bool(contract::kAttnSinks, true)
+            .set_bool(contract::kAttnQkInt8, true)
+            .set_bool(contract::kAttnSinkShift, true)
+            .set_bool(contract::kAttnPvInt8, pv8)
+            .set_bool(contract::kAttnQTokenScale, pv8);
+        const bool sok = lib.function(k.entry, sf).valid();
+        EXPECT_TRUE(sok);
+        if (!sok) {
+          std::printf("[contract] %s :: %s does not build with sinks "
+                      "under the int8 QK%s\n",
+                      std::string(k.library).c_str(),
+                      std::string(k.entry).c_str(), pv8 ? " and P*V" : "");
+        }
+        ++checked;
+      }
     }
   }
   for (const contract::QuantFamily& q : contract::kQuantFamilies) {
@@ -164,4 +194,39 @@ TEST(kernel_contract, every_contracted_kernel_resolves)
   std::printf("[contract] revision %d: %d entry points resolve\n",
               contract::kRevision, checked);
   EXPECT_TRUE(checked > 40);
+}
+
+// THE SINKS MARKER is the entry it says it is: dispatched, it writes the
+// constant whose presence it marks (kAttnSinkShift), in both twins -- so
+// a toolkit that finds the name finds this kernel, not a name that
+// happened to resolve.
+TEST(kernel_contract, the_sinks_marker_names_its_constant)
+{
+  Session sess;
+  MetalCompute* mc = sess.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  for (const char* ln : {"sage_quant", "sage_quant_bf16"}) {
+    const ComputeLibrary lib = mc->load_library(ln);
+    ComputeFunction fn;
+    if (lib.valid()) { fn = lib.function("sage_sinks_marker"); }
+    ASSERT_TRUE(fn.valid());
+    if (!fn.valid()) { return; }
+    SharedBuffer out = mc->make_shared_buffer(4);
+    ASSERT_TRUE(!out.empty());
+    if (out.empty()) { return; }
+    *static_cast<std::uint32_t*>(out.contents()) = 0;
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      e.set_function(fn);
+      e.set_buffer(0, out);
+      e.dispatch({1, 1, 1}, {1, 1, 1});
+    }
+    std::string err;
+    ASSERT_TRUE(st.commit().wait_ok(&err));
+    const std::uint32_t got = *static_cast<std::uint32_t*>(out.contents());
+    std::printf("[contract] %s :: sage_sinks_marker wrote %u\n", ln,
+                (unsigned)got);
+    EXPECT_TRUE(got == (std::uint32_t)contract::kAttnSinkShift);
+  }
 }

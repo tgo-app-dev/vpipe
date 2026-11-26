@@ -91,14 +91,16 @@ make_head_(int T, float bias, std::uint32_t seed)
 
 // Attention in double precision: the reference every arm is scored
 // against.
+// `sink`: a per-head logit in the softmax's denominator alone (no value),
+// as attention sinks are; -inf for none.
 std::vector<double>
-attend_ref_(const Head& h, double scale)
+attend_ref_(const Head& h, double scale, double sink = -HUGE_VAL)
 {
   const int T = h.t;
   std::vector<double> out((std::size_t)T * kD, 0.0);
   std::vector<double> s((std::size_t)T);
   for (int i = 0; i < T; ++i) {
-    double m = -1e300;
+    double m = sink;
     for (int j = 0; j < T; ++j) {
       double d = 0.0;
       for (int c = 0; c < kD; ++c) {
@@ -108,7 +110,7 @@ attend_ref_(const Head& h, double scale)
       s[(std::size_t)j] = d * scale;
       m = std::max(m, s[(std::size_t)j]);
     }
-    double z = 0.0;
+    double z = std::exp(sink - m);
     for (int j = 0; j < T; ++j) {
       s[(std::size_t)j] = std::exp(s[(std::size_t)j] - m);
       z += s[(std::size_t)j];
@@ -847,6 +849,7 @@ TEST(sage_attention, int8_pv_held)
   struct Bufs {
     int H = 0, T = 0, NQ = 0, NK = 0;
     SharedBuffer q, k, v, o, q8, k8, v8, qs, ks, vs, km, vm, part, p;
+    SharedBuffer sk;      // per-head sinks (f16), bound where an arm has them
   };
   auto make = [&](int H, int T) {
     Bufs b;
@@ -880,12 +883,13 @@ TEST(sage_attention, int8_pv_held)
     }
     return b;
   };
-  auto fn = [&](const Arm& a, int T, bool bf16) {
+  auto fn = [&](const Arm& a, int T, bool bf16, bool sinks = false) {
     FunctionConstants fc;
     fc.set_bool(200, (T % kBQ) == 0).set_bool(201, (T % kBK) == 0)
-        .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, sinks)
         .set_bool(303, false).set_bool(304, false).set_bool(305, false)
-        .set_bool(306, a.qk8).set_bool(308, a.pv8).set_bool(310, a.pv8);
+        .set_bool(306, a.qk8).set_bool(308, a.pv8).set_bool(310, a.pv8)
+        .set_bool(311, sinks && a.qk8);
     return lib.function(bf16 ? "attn_steel_nax_h_bd128_bf16"
                              : "attn_steel_nax_h_bd128", fc);
   };
@@ -953,6 +957,10 @@ TEST(sage_attention, int8_pv_held)
     e.set_function(f);
     e.set_buffer(0, b.q); e.set_buffer(1, b.k); e.set_buffer(2, b.v);
     e.set_buffer(3, b.o); e.set_buffer(4, b.p);
+    if (!b.sk.empty()) {
+      e.set_buffer(7, b.sk);
+      e.set_buffer(22, b.km);   // the sink's shift, under 311
+    }
     if (a.qk8) {
       e.set_buffer(15, b.q8); e.set_buffer(16, b.k8);
       e.set_buffer(17, b.qs); e.set_buffer(18, b.ks);
@@ -1070,6 +1078,75 @@ TEST(sage_attention, int8_pv_held)
     // V's int8 grid is what is left here (the output, V's mean, is near
     // zero); an overrun of int32 would be noise.
     EXPECT_TRUE(c > 0.99);
+  }
+
+  // ---- SINKS (constant 302: a logit per head in the denominator alone --
+  //      MAGI-2's preview DiT). The int8 P*V adds V's mean back after the
+  //      normalize, and a sink's share of the mass holds no V, so the mean
+  //      must come back over the keys' share alone. V carries a large
+  //      common offset (+4 a channel) so a missed share shows: the sinks
+  //      below take a large part of each row's mass.
+  for (const int T : {1024, 1000}) {
+    const int H = 2;
+    const float sink[2] = {7.0f, 8.0f};
+    std::vector<Head> heads;
+    for (int h = 0; h < H; ++h) {
+      heads.push_back(make_head_(T, /*bias=*/5.0f, 0x51c0000u + h));
+      for (float& x : heads.back().v) { x += 4.0f; }
+    }
+    const double scale = 1.0 / std::sqrt((double)kD);
+    std::vector<std::vector<double>> refs;
+    for (int h = 0; h < H; ++h) {
+      refs.push_back(attend_ref_(heads[(std::size_t)h], scale,
+                                 (double)sink[h]));
+    }
+    Bufs b = make(H, T);
+    b.sk = mc->make_shared_buffer((std::size_t)H * 2);
+    ASSERT_TRUE(!b.p.empty() && !b.part.empty() && !b.sk.empty());
+    if (b.sk.empty()) { return; }
+    auto* sp = static_cast<std::uint16_t*>(b.sk.contents());
+    for (int h = 0; h < H; ++h) { sp[h] = f2h_(sink[h]); }
+    auto* qp = static_cast<std::uint16_t*>(b.q.contents());
+    auto* kp = static_cast<std::uint16_t*>(b.k.contents());
+    auto* vp = static_cast<std::uint16_t*>(b.v.contents());
+    for (int h = 0; h < H; ++h) {
+      for (std::size_t i = 0; i < (std::size_t)T * kD; ++i) {
+        const std::size_t o = (std::size_t)h * T * kD + i;
+        qp[o] = f2h_(heads[(std::size_t)h].q[i]);
+        kp[o] = f2h_(heads[(std::size_t)h].k[i]);
+        vp[o] = f2h_(heads[(std::size_t)h].v[i]);
+      }
+    }
+    std::printf("[sage-pv8] sinks T=%d:", T);
+    double c_qk8 = 0.0;
+    for (const Arm& a : arms) {
+      ComputeFunction f = fn(a, T, false, /*sinks=*/true);
+      ASSERT_TRUE(f.valid());
+      if (!f.valid()) { return; }
+      ASSERT_TRUE(run(b, a, f, qf) >= 0.0);
+      const auto* o = static_cast<const std::uint16_t*>(b.o.contents());
+      double c = 0.0, rl = 0.0;
+      for (int h = 0; h < H; ++h) {
+        std::vector<double> got(refs[(std::size_t)h].size());
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+          got[i] = (double)h2f_(o[(std::size_t)h * T * kD + i]);
+          const double d = got[i] - refs[(std::size_t)h][i];
+          num += d * d;
+          den += refs[(std::size_t)h][i] * refs[(std::size_t)h][i];
+        }
+        c += cos_sim_(got, refs[(std::size_t)h]) / H;
+        rl += std::sqrt(num / std::max(den, 1e-30)) / H;
+      }
+      std::printf("  %s cos %.6f rel %.2e |", a.name, c, rl);
+      EXPECT_TRUE(c > (a.qk8 ? 0.999 : 0.99999));
+      if (a.qk8 && !a.pv8) { c_qk8 = c; }
+      if (a.pv8) {
+        EXPECT_TRUE(c > c_qk8 - 0.0005);
+        EXPECT_TRUE(rl < 2e-2);
+      }
+    }
+    std::printf("\n");
   }
 
   // ---- speed

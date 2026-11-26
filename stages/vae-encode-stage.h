@@ -155,6 +155,13 @@ private:
   // The VAE's weight claims (declare_resources adds the scratch).
   std::vector<ResourceClaim> declare_weights_() const;
   std::size_t planned_scratch_() const;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // A registered family's encode working set (vae-host-ext.h), 0 when it
+  // does not say.
+  static std::size_t encode_working_(genai::VaeModelFamily* f,
+                                     const std::string& root, int frames,
+                                     int h, int w);
+#endif
   void revise_scratch_(std::size_t bytes);
   std::size_t _scratch_stated = 0;
 

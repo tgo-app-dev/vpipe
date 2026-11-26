@@ -38,6 +38,7 @@ class MetalSageAttention;
 class MetalSolAttention;
 class I8GemmContext;
 class TpOverlap;
+class TpBulk;
 
 // Qwen-Image-2.1's DiT (QwenImage21Transformer2DModel), on metal-compute.
 //
@@ -315,8 +316,36 @@ class MetalQwenImage21Transformer {
   // the stage before the first forward, let go after the last however
   // the picture ends; the exchange count new with it. False, with
   // `err`, on a model that is not a rank or a channel that cannot run.
-  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  // `first_seq`: the exchange count to go on from (a training run's
+  // channel, used before the model by the stage).
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err,
+                           std::uint64_t first_seq = 0);
   void end_tp_generation();
+  bool tp_generation_open() const { return _tp_pipe != nullptr; }
+  // Bytes in bulk between forwards, through the open generation's channel
+  // (TpBulk): `mine` out (null: zeros), the others' sum back into
+  // `others` (null: discarded). A training run's gradients and the
+  // adapter it saves; never while a forward runs.
+  bool tp_bulk(const void* mine, void* others, std::size_t bytes,
+               TpDType dtype, std::string* err);
+  // The exchange count, for a stage that goes on past the model.
+  std::uint64_t tp_seq() const { return _tp_seq; }
+  // A TRAINING run's ranks meet before each forward's first block (an
+  // 8-byte exchange once its int8 tuning is done): a rank's tuning or
+  // page-in, unequal across Macs, is then waited out on the peer's CPU,
+  // not by its GPU parked on a partial. For the open generation:
+  // end_tp_generation clears it. Inference never asks.
+  void set_tp_meet(bool on) { _tp_meet = on; }
+  // A RANK whose forwards' lengths vary (a training run's samples): each
+  // exchange buffer, when it grows, made `bytes` at the least -- the
+  // widest sample's [rows, hidden] bf16 -- so it is made once. A
+  // transport registers each buffer with its device (RDMA), and a device
+  // refuses a page registered again past a few times.
+  void set_tp_exchange_floor(std::size_t bytes, std::size_t band_bytes = 0)
+  {
+    _tp_floor_bytes = bytes;
+    _tp_band_floor_bytes = band_bytes;
+  }
   // The exchange buffers it holds: grown at a forward's start, let go
   // with the picture's channel (end_tp_generation).
   std::size_t tp_exchange_bytes() const
@@ -588,7 +617,8 @@ class MetalQwenImage21Transformer {
                                      const I8GemmContext* fast,
                                      const std::string& pfx);
   // An exchange buffer at least `bytes`: one replaced is forgotten first.
-  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes,
+                  bool band = false);
   bool load_fixed_(WeightSet& ws);
 
   // BlockSlots' four callbacks; see shared/block-slots.h.
@@ -850,6 +880,13 @@ class MetalQwenImage21Transformer {
   // start to its widest band (tp_buffer_), let go with the picture's
   // channel (end_tp_generation).
   metal_compute::SharedBuffer _tp_part[4], _tp_recv[4];
+  // A training step's own exchanges (QwenImage21Trainer::tp_reduce_), the
+  // overlap's lane 4, and tp_bulk's buffers; the exchange buffers' floor.
+  metal_compute::SharedBuffer _tp_send, _tp_others;
+  std::unique_ptr<TpBulk> _tp_bulk;
+  std::size_t _tp_floor_bytes = 0;
+  std::size_t _tp_band_floor_bytes = 0;  // the band lanes' (floored bands)
+  bool _tp_meet = false;                 // set_tp_meet
   // Set by the trainer around a backward GEMM it keeps off the int8
   // pipe (QwenImage21Trainer::set_i8_backward).
   bool _i8_hold = false;

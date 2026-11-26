@@ -402,6 +402,42 @@ look like a hang.
 Ship the family's knobs as a `ModelConfigSourceStage` (above), not as keys
 on `generate-video`.
 
+### The clip you hand back: its rate and its length
+
+`VideoGenResult::sideband` goes out as the latent beat's sideband,
+forwarded as you wrote it. `generate-video` reads two of its keys, and
+only to leave them alone: `sideband::kFps` (real, the frames per second
+of the clip the latent decodes to) and `sideband::kFrames` (int, that
+clip's **pixel** frames, not latent frames). When the clip you return is
+not the one the stage asked for -- a second stage that refines to twice
+the rate and length, as MAGI-2's 1080p preset does -- set both, and they
+stand:
+
+```cpp
+// a refine at twice the asked-for rate: To latent frames, decoding to
+// 4 (To - 1) + 1 pixel frames
+if (!out->sideband.is_object()) { out->sideband = FlexData::make_object(); }
+auto so = out->sideband.as_object();
+so.insert_or_assign(vpipe::sideband::kFps,
+                    FlexData::make_real(2.0 * req.fps));
+so.insert_or_assign(vpipe::sideband::kFrames,
+                    FlexData::make_int(4 * (To - 1) + 1));
+```
+
+Leave either out and the stage writes its own: the request's `fps`, and
+the frame count your `align_frames()` settled (`req.frames`). `vae-decode` stamps the decoded
+frames with the latent's rate, so `rgb-to-video` and the save stages
+write the file at it.
+
+Two limits. The launch plan books the clip the stage was **configured**
+for -- the latent payload `generate-video` hands on and the decode arena
+`vae-decode` holds are sized from the request's geometry, not from what
+you return -- so a family whose clip is larger is booked short
+downstream; book what you can in your own `declare_resources()`. And a
+host older than this rule replaced both keys with its own `fps` and
+`frames` whatever you set, so there your clip is labelled at the rate
+the graph asked for.
+
 ### Live previews
 
 `generate-video` can stream a **live preview** of the clip while it
@@ -578,10 +614,17 @@ inside a DiT is followed by dozens of blocks and a decode. The settings
 are plumbed so the trade can be measured, which is not the same as
 recommending it.
 
-`VaeModelFamily::Role` is a **name**, not an enumerator: `kRoleVideo`
-and `kRoleAudio` are the two the host asks for today, and a third codec
-costs nobody a rebuild. A family handed a role it does not know must
-return an empty path, never a guess at the nearest one.
+`VaeModelFamily::Role` is a **name**, not an enumerator: `kRoleVideo`,
+`kRoleAudio` and `kRoleVideoEncode` are the three the host asks for
+today, and another codec costs nobody a rebuild. A family handed a role
+it does not know must return an empty path, never a guess at the nearest
+one. `kRoleVideoEncode` names the video ENCODER's file where it is not
+the decoder's (a decoder retrained alone, beside the encoder it was
+trained against): vae-encode asks it first, for its claim, its release
+and `declare_holdings`, and takes `kRoleVideo`'s answer when it is
+empty -- so a family with one file never answers it. A host older than
+the role never asks it and books the encode under `kRoleVideo`'s file;
+the encode itself is yours and runs the same.
 
 ### Family profiles: what your model knows that the host cannot
 
@@ -990,6 +1033,32 @@ when a config asked for the int8 P·V and the host could not give it. Pass
 `pv8` to `scratch_bytes()` / `private_bytes()` so the plan books V's
 uint8 copy and Q's per-token scales; a family that turns it on part way
 through a run calls `reserve_pv8(true)` so the scratch is built once.
+
+**An attention with sinks** (constant 302, a logit per head in the
+denominator alone) needs the flash kernel to move each row's sink with
+the smoothed keys' scores -- smoothing subtracts K's mean, which shifts
+every score in a row by `-q·mean` -- and, under the int8 P·V, to keep
+the sink's mass off V's mean. The kernel does both under
+`kAttnSinkShift` (311), K's mean at buffer 22, which `bind()` binds.
+311 is optional in the kernel contract: on a host that predates it, a
+function built with it is the function without it, and its sinks read
+wrong with no error anywhere. So ask for the gate when you load, and
+build the function from `sink_constants()`:
+
+```cpp
+_sage = MetalSageAttention::load_for_model(mc, /*bf16=*/true, sage_cfg,
+                                           "my-dit", &fatal,
+                                           /*with_sinks=*/true);
+// null, not fatal, where sinks_available() is false: stay dense.
+fc.set_bool(contract::kAttnSinks, true)
+  .set_bool(vpipe::genai::sage::kQkInt8Constant, true);
+MetalSageAttention::sink_constants(fc, sage_cfg);  // 311 = smooth_k
+MetalSageAttention::pv8_constants(fc, _sage->pv8_for(sage_cfg));
+```
+
+`sink_constants()` takes the config because 311 must follow
+`smooth_k`: an unsmoothed `prepare()` (the A/B) writes no mean, and a
+function reading one there subtracts whatever the buffer last held.
 
 #### `autotune` — whether your kernel tuners measure
 
@@ -1576,26 +1645,26 @@ returns; and it calls `forget` on every buffer it handed first. Expect `open`
 again once that stage's last channel is gone, and let a peer's channel going
 fail an exchange still waiting for it.
 
-MiniMax H3 is the first family to run split (shares of dense or affine
-weights, its blocks in row bands, each band's exchanges under the next band's
-work; no VDN or TaoMate's streaming yet -- TaoMate's adapter as a LoRA,
-`taomate: off`, binds at the share (feature `"tensor-parallel-taomate-lora/1"`)
--- and MotionCache off on a rank -- each of its skips
-is judged from that rank's own sums). A rank takes the ANE tier (`ane_ffn`,
-`ane_qkv`, `ane_int8`; feature `"tensor-parallel-ane/1"`): its modules its
-share's widths, staged from its cut projections, and each band's rows split
-between the two engines -- the qkv's in the band's first pass, the
+MiniMax H3 is the first family to run split (shares of dense or affine weights,
+or of ComfyUI's int8 ConvRot on the token tiers alone, its blocks in row bands,
+each band's exchanges under the next band's work; no VDN or TaoMate's streaming
+yet -- TaoMate's adapter as a LoRA, `taomate: off`, binds at the share (feature
+`"tensor-parallel-taomate-lora/1"`) -- and MotionCache off on a rank -- each of
+its skips is judged from that rank's own sums). A rank takes the ANE tier
+(`ane_ffn`, `ane_qkv`, `ane_int8`; feature `"tensor-parallel-ane/1"`): its
+modules its share's widths, staged from its cut projections, and each band's
+rows split between the two engines -- the qkv's in the band's first pass, the
 feed-forward's straight into the band's exchange buffer -- so the bands, and
-the exchanges under them, are those of a rank without it. A rank's bands
-follow its rows and its floor alone, never its ANE, so a pair may mix a rank
-with the tier and one without (an M4 beside an M5), and a rank whose plan
-refuses the module, or that drops it for a clip, stays in step. A rank takes
-runtime adapters -- bound at the checkpoint's widths, their factors then cut as
-the weights are: B's rows of q|k|v and fc1, A's columns of the out projection
-and fc2, so the ranks' deltas sum to the whole one -- and the int8 tiers past
+the exchanges under them, are those of a rank without it. A rank's bands follow
+its rows and its floor alone, never its ANE, so a pair may mix a rank with the
+tier and one without (an M4 beside an M5), and a rank whose plan refuses the
+module, or that drops it for a clip, stays in step. A rank takes runtime
+adapters -- bound at the checkpoint's widths, their factors then cut as the
+weights are: B's rows of q|k|v and fc1, A's columns of the out projection and
+fc2, so the ranks' deltas sum to the whole one -- and the int8 tiers past
 accurate, its dense share converted at the group its own width takes (a width
-no group divides stays on accurate: give a rank whole groups of four heads,
-512 columns, for every tier's rotation). A transport sees none of this: the
+no group divides stays on accurate: give a rank whole groups of four heads, 512
+columns, for every tier's rotation). A transport sees none of this: the
 partials are the same shape whatever runs. A rank's memory is booked at its
 share, in the plan that refuses graphs as in the report: its share of the
 projections in the layout it holds them in (bf16, an affine pack's codes, or
@@ -1683,6 +1752,18 @@ from the first: a share given `min_band_rows` cuts every block's rows into
 bands (Fibo 2.0's injection running through each band, row by row), one
 without exchanges whole blocks -- state the floor alike to both ranks. A rank
 of either takes no runtime LoRA and no ANE tier.
+
+MAGI-2-preview runs split through generate-video's `tensor_parallel`
+(feature `"tensor-parallel-magi2/1"`): its preview DiT by its query heads
+and by EXPERTS -- a share's feed-forward rows count each MoE head's routed
+experts, a rank holding a run of every head's (one read a head) and the
+shared, modality and mm-layer MLPs cut by rows at the same fraction; the
+routing whole on every rank, each computing only the picks on its own
+experts. TWO partials a layer a sample, a guided step's two samples
+interleaved so each one's exchange crosses under the other's work. A
+refine splits its refiner at the preview share's fractions (its heads in
+whole kv groups) on the clip's one channel after the preview, its output
+projection and MLP in row bands whose partials cross under the next band.
 
 An image rank's EXCHANGE BUFFERS are its picture's, in all six families:
 made at the picture's first forward at its widest band, and freed -- after
@@ -2103,7 +2184,33 @@ older peer refuses such a rank by name) and
 given, a prompt longer than its band is banded -- its blocks and its text
 refiner, each band's partials exchanged; unsaid, such a prompt runs every
 block whole. A host states it alike to every rank, and only to a peer listing
-it).
+it) and
+`"tensor-parallel-pi-h3/1"` (a MiniMax H3 rank takes pi-H3: the adapter's
+whole-tensor overwrites of a block's out / fc1 / fc2 cut to the share, and a
+pruned DiT in ComfyUI's int8 ConvRot read as stored. A rank reads that file
+ONLY on the int8 tiers `token` and `token_plain`: on `accurate`, on `fast` or
+with int8 off it refuses it by name, where the unsplit model widens it per
+GEMM -- so a host splitting that file asks for a token tier on both ranks. Its
+columns are cut on the rotation's 256-column group edges, so a share's heads
+must start and end on an even head (128-wide heads) and its feed-forward rows
+on a multiple of 256; a share off those edges is refused by name. A host asks
+a peer for it before handing it a pi-H3 rank) and
+`"tensor-parallel-train/1"` (train-lora's `tensor_parallel`: a MiniMax H3
+LoRA trained split, rank 0 handing the others its encoded dataset and
+settings, the adapter saved whole by rank 0) and `"data-parallel-train/1"`
+(train-lora's `data_parallel`: any family's LoRA trained with each step's
+samples shared between hosts, the gradients summed) and
+`"tensor-parallel-train-images/1"` (train-lora's `tensor_parallel` for
+Qwen-Image-2.1 and MiniMax-H3-Image too) and `"tensor-parallel-magi2/1"`
+(generate-video's `tensor_parallel` for MAGI-2-preview: its preview DiT by
+heads and experts, its refiner at the same fractions; a host asks a peer
+for it before handing it a MAGI-2 rank) and `"tensor-parallel-flash/1"`
+(generate-video's `tensor_parallel` over HyperFlow H3 Flash's DiT: each
+rank reads its low-rank pairs whole and cuts them as an adapter's factors
+are -- q|k|v's and fc1's ups by the share's rows, the out projection's and
+fc2's downs by its columns -- on Flash's own two times or pi-H3's stock
+curve; an older rank refuses a Flash share by name, so ask a peer
+for it first).
 
 ## Where your stages show up
 

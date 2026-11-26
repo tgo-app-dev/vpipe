@@ -15,6 +15,9 @@
 #include "generative-models/z-image/z-image-layout.h"
 #include "generative-models/fibo2/fibo2-layout.h"
 #include "generative-models/moss-image/metal-moss-image-transformer.h"
+#include "generative-models/magi2/magi2-family.h"
+#include "generative-models/magi2/magi2-layout.h"
+#include "generative-models/magi2/magi2-text.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -941,6 +944,27 @@ encoder_config_moss_image_(const SessionContextIntf* s,
   return c;
 }
 
+// MAGI-2-preview: Qwen3.5-27B, the VL model's text stack (weights under
+// `model.language_model.`, the vision tower beside it unread), read
+// through the LM's own config mapping as MOSS-Image's hybrid is; tapped,
+// not decoded; the release's 7000-token cap.
+genai::MetalQwenModel::Config
+encoder_config_magi2_(const SessionContextIntf* s, const std::string& enc_dir)
+{
+  genai::MetalQwenModel::Config c;
+  genai::ModelLoader loader(s);
+  const auto mcfg = loader.load_config(enc_dir);
+  if (mcfg.has_value()) { c = genai::MetalQwenModel::config_from(*mcfg); }
+  c.use_bf16 = true;
+  c.backbone_only = true;
+  c.weight_prefix = "model.language_model.";
+  c.model_seg = "";
+  c.zero_centered_norm = true;
+  c.max_seq = genai::magi2::kMaxTextTokens + 256;
+  c.page_tokens = 256;
+  return c;
+}
+
 genai::MetalQwenModel::Config encoder_config_qie_()
 {
   genai::MetalQwenModel::Config c;
@@ -1492,6 +1516,8 @@ DiffusionConditionerStage::load_encoder_(metal_compute::MetalCompute* mc)
       : _family == "z-image" ? encoder_config_z_image_(_enc_cfg_dir)
       : _family == "moss-image"
           ? encoder_config_moss_image_(session(), _enc_cfg_dir)
+      : _family == "magi2"
+          ? encoder_config_magi2_(session(), _enc_cfg_dir)
       : _profile != nullptr ? encoder_config_profile_(_profile)
       : encoder_config_krea2_();
   // A family with a content screen GENERATES on these weights, so the
@@ -1912,6 +1938,36 @@ DiffusionConditionerStage::declare_resources() const
                "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
         out.push_back(std::move(c));
       }
+    }
+  }
+  // MAGI-2-PREVIEW'S ENCODER RUN: a Qwen3.5-27B prefill of up to its
+  // 7000-token prompt (each prompt, and the negative, one after the
+  // other in one context) -- the activations of the one piece, the K/V
+  // of its full-attention layers, the hybrid's recurrent state, the
+  // embedded rows, and the tap with the picture's token beside it. Its
+  // weights stream (the floor above); this is what it runs in, booked
+  // in the condition phase.
+  if (!enc.empty() &&
+      genai::magi2::is_root(resolve_model_dir(session(), _hf_dir))) {
+    const genai::MetalQwenModel::Config ec =
+        encoder_config_magi2_(session(), enc);
+    const auto w = genai::MetalLlamaWeights::open_model(enc);
+    auto* svc = session() != nullptr ? session()->services() : nullptr;
+    auto* mc = svc != nullptr ? svc->metal_compute() : nullptr;
+    const bool mma = mc != nullptr && mc->supports_matrix_cores();
+    const std::int64_t n = genai::magi2::kMaxTextTokens;
+    const bool dense =
+        w.has_value() && genai::MetalQwenModel::dense_checkpoint(
+                             *w, ec.weight_prefix + "layers.");
+    const std::size_t rb =
+        genai::MetalQwenModel::run_bytes(ec, n, 1, /*one_pass=*/true,
+                                         /*plain_mlp=*/true, mma, n,
+                                         dense) +
+        2 * (std::size_t)(n + 1) * (std::size_t)ec.hidden * 2;
+    for (auto& c : model_memory::scratch_claims(
+             "magi2-text:" + this->id(), rb,
+             model_memory::kPhaseCondition)) {
+      out.push_back(std::move(c));
     }
   }
   // NOT THE DiT. The stage that loads it declares the one it loads --
@@ -2412,6 +2468,7 @@ DiffusionConditionerStage::ensure_loaded_()
       : _family == "wan" ? "umT5-XXL"
       : _family == "z-image" ? "Qwen3 dense"
       : _family == "moss-image" ? "Qwen3.5 hybrid, final norm"
+      : _family == "magi2" ? "Qwen3.5 hybrid, hidden_states[-3]"
       : _family == "minimax-h3"
           ? (_h3_enc && _h3_enc->has_connector()
                  ? "Qwen3-VL, 5 taps through P-H3-Image's connector"
@@ -2697,7 +2754,8 @@ single_tap_(const std::string& family, const FlexData* profile)
   return profile != nullptr || family == "qwen-image-edit" ||
          family == "boogu-image" || family == "wan" ||
          family == "minimax-h3" || family == "qwen-image-21" ||
-         family == "z-image" || family == "moss-image";
+         family == "z-image" || family == "moss-image" ||
+         family == "magi2";
 }
 
 SharedBuffer
@@ -3709,6 +3767,91 @@ DiffusionConditionerStage::encode_(const std::string& text, const char* which,
         "(tap layer {} of {}, un-normed)", this->id(), which, n, EH,
         NL - 2, NL));
     return taps;
+  }
+
+  if (_family == "magi2") {
+    // MAGI-2-preview (the release's qwen35.py and inference_engine.py,
+    // read): the RAW prompt -- a JSON caption turned into its compact
+    // markdown -- every CJK character its own pre-token, at most 7000
+    // tokens, and the condition is hidden_states[-3]: the UN-NORMED output
+    // of the third-to-last layer, every row. Image-to-video (a picture
+    // wired) addresses the picture from the prompt ("...reference_layer:
+    // The first frame refers to <Figure 1>") and appends its SPECIAL
+    // TOKEN: the mean of the condition's rows over the tokens that overlap
+    // "<Figure 1>", rounded to bf16 -- the beat's last row, which the
+    // sideband counts (magi2::kFigureRows). The negative is the release's
+    // fixed prompt, encoded the same way and shown no picture.
+    const int NL = _encoder->config().n_layers;
+    const bool figure = n_img > 0 && !as_given;
+    std::string body = genai::magi2::normalize_prompt(text);
+    if (figure) {
+      body = genai::magi2::normalize_prompt(
+          genai::magi2::with_figure_reference(text));
+    }
+    std::vector<std::int32_t> ids = genai::magi2::encode(*_tokenizer, body);
+    if (ids.empty()) { return {}; }
+    if ((int)ids.size() >= genai::magi2::kMaxTextTokens) {
+      session()->log_normal(fmt(
+          "DiffusionConditionerStage('{}'): prompt truncated to {} tokens, "
+          "this model's limit", this->id(), genai::magi2::kMaxTextTokens));
+    }
+    std::vector<int> span;
+    if (figure) {
+      span = genai::magi2::target_span(*_tokenizer, ids, body,
+                                       genai::magi2::kFigureToken);
+      if (span.empty()) {
+        session()->warn(fmt(
+            "DiffusionConditionerStage('{}'): the prompt's \"{}\" was cut "
+            "off by the {}-token limit; image-to-video needs it", this->id(),
+            genai::magi2::kFigureToken, genai::magi2::kMaxTextTokens));
+        return {};
+      }
+    }
+    const int n = (int)ids.size();
+    SharedBuffer x = embed_rows_(ids);
+    if (x.empty()) { return {}; }
+    genai::ContextManager* cm = _encoder->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer taps;
+    {
+      PerfAuxScope _perf(session(), kPerfLaneLLM, kGvidLlmDitText,
+                         kPerfLlmDitTextBegin, (std::uint64_t)n);
+      taps = _encoder->forward_embeddings_taps(
+          cid, x, n, std::vector<int>{NL - genai::magi2::kTapFromEnd},
+          /*key_valid_len=*/0, nullptr);
+    }
+    cm->release(cid);
+    if (taps.empty()) { return {}; }
+    if (!figure) {
+      n_real_out = n;
+      session()->log_debug(fmt(
+          "DiffusionConditionerStage('{}'): [{}] magi2 -> [{}, {}] bf16 "
+          "(layer {} of {}, un-normed)", this->id(), which, n, EH,
+          NL - genai::magi2::kTapFromEnd, NL));
+      return taps;
+    }
+    SharedBuffer out = mc->make_shared_buffer((std::size_t)(n + 1) * EH * 2);
+    if (out.empty()) { return {}; }
+    std::memcpy(out.contents(), taps.contents(), (std::size_t)n * EH * 2);
+    {
+      const auto* tp = static_cast<const std::uint16_t*>(taps.contents());
+      auto* op = static_cast<std::uint16_t*>(out.contents()) +
+                 (std::size_t)n * EH;
+      for (int h = 0; h < EH; ++h) {
+        double acc = 0.0;
+        for (int r : span) {
+          acc += bf16_to_f32_(tp[(std::size_t)r * EH + h]);
+        }
+        op[h] = f32_to_bf16_((float)(acc / (double)span.size()));
+      }
+    }
+    n_real_out = n + 1;
+    session()->log_debug(fmt(
+        "DiffusionConditionerStage('{}'): [{}] magi2 -> [{} + 1 special, {}] "
+        "bf16 (layer {} of {}; the picture's token over {} prompt tokens)",
+        this->id(), which, n, EH, NL - genai::magi2::kTapFromEnd, NL,
+        span.size()));
+    return out;
   }
 
   if (_family == "moss-image") {
@@ -5007,8 +5150,22 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
   }
 
   // Vision tokens (QIE + ref image) -- shared by the positive + negative encode.
+  // MAGI-2 runs no vision tower here: a wired picture only says the clip
+  // is image-to-video, which changes the prompt (see encode_).
   int n_img = 0;
-  SharedBuffer vtok = vision_tokens_(mc, n_img);
+  SharedBuffer vtok;
+  if (_family == "magi2") {
+    n_img = (_n_ref > 0 && !_ref_rgb.empty() && !_ref_rgb[0].empty())
+                ? _n_ref : 0;
+    if (n_img > 1) {
+      session()->warn(fmt(
+          "DiffusionConditionerStage('{}'): MAGI-2 takes one picture; the "
+          "first of the {} wired is the clip's", this->id(), n_img));
+      n_img = 1;
+    }
+  } else {
+    vtok = vision_tokens_(mc, n_img);
+  }
 
   // Shape helper for the family conditioning tensor.
   auto shape_for = [&](int rows) -> std::vector<std::int64_t> {
@@ -5091,7 +5248,7 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
           ? fibo2_neg
           : !_negative_prompt.empty()
                 || (_grounded_negative && n_img > 0 && !vtok.empty())
-                || _family == "moss-image";
+                || _family == "moss-image" || _family == "magi2";
   size_encoder_residency_(emit_neg ? 2 : 1);
 
   int n_real = 0;
@@ -5133,7 +5290,12 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
                           : _negative_prompt,
                       "negative", n_neg, SharedBuffer{}, 0,
                       /*as_given=*/true)
-            : encode_(_negative_prompt, "negative", n_neg, vtok, n_img);
+            : _family == "magi2"
+                ? encode_(_negative_prompt.empty()
+                              ? genai::magi2::negative_prompt()
+                              : _negative_prompt,
+                          "negative", n_neg, SharedBuffer{}, 0)
+                : encode_(_negative_prompt, "negative", n_neg, vtok, n_img);
     if (!nc.empty()) {
       auto nb = to_beat_(nc, shape_for(n_neg), cdt);
       // The negative is a sequence of its own -- its text a different
@@ -5161,6 +5323,14 @@ DiffusionConditionerStage::process(RuntimeContext& ctx)
     // The TARGET image's slots are not included -- the consumer knows
     // that geometry and this stage does not.
     if (!cond_sb.is_null()) { beat->sideband = std::move(cond_sb); }
+    // MAGI-2: the picture's special token is the beat's last row.
+    if (_family == "magi2" && n_img > 0) {
+      if (!beat->sideband.is_object()) {
+        beat->sideband = FlexData::make_object();
+      }
+      beat->sideband.as_object().insert_or_assign(
+          genai::magi2::kFigureRows, FlexData::make_int(1));
+    }
     // MiniMax-H3's per-row modality tags, when the presentation showed
     // the conditioner a keyframe: which rows are a vision block is known
     // only here, and the DiT's layout tags them video.

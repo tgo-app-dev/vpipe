@@ -1,4 +1,7 @@
 #include "stages/model-memory.h"
+#include "generative-models/magi2/magi2-family.h"
+#include "generative-models/magi2/magi2-layout.h"
+#include "generative-models/magi2/metal-magi2-turbo.h"
 #include "stages/model-memory-host.h"
 
 #include "common/host-report.h"
@@ -742,6 +745,21 @@ video_vae_working_bytes(const std::string& root, int width, int height)
 {
   namespace fs = std::filesystem;
   if (root.empty() || width <= 0 || height <= 0) { return 0; }
+  // MAGI-2-preview's turbo decoder: its windows' work buffers, the f32
+  // clip it builds and the latent, at the model's one length (10 s).
+  {
+    genai::magi2::Layout l;
+    if (genai::magi2::resolve_layout(root, &l)) {
+      std::size_t scratch = 0;
+      const int T = genai::magi2::latent_frames(
+          genai::magi2::kTrainedFrames);
+      if (genai::MetalMagi2Turbo::plan(l.turbo, T, height / 16, width / 16,
+                                       nullptr, &scratch)) {
+        return scratch;
+      }
+      return 0;
+    }
+  }
   const std::string vae = resolve_vae_dir(root);
   if (vae.empty()) { return 0; }
   // A file is a natively-named checkpoint (FlashVSR's Wan2.1_VAE.pth); a
@@ -1176,6 +1194,27 @@ weight_claims(std::vector<std::string> dirs)
     out.push_back(ResourceClaim{std::string(kWeightsKind), std::move(d)});
   }
   return out;
+}
+
+void
+claims_at_holdings(std::vector<ResourceClaim>* claims,
+                   const std::vector<StageHolding>& holdings)
+{
+  if (claims == nullptr) { return; }
+  namespace fs = std::filesystem;
+  auto canon = [](const std::string& p) {
+    std::error_code ec;
+    const fs::path c = fs::weakly_canonical(fs::path(p), ec);
+    return ec ? p : c.string();
+  };
+  for (const StageHolding& h : holdings) {
+    if (h.preload == 0 || h.source.empty()) { continue; }
+    const std::string hs = canon(h.source);
+    for (ResourceClaim& c : *claims) {
+      if (c.kind != kWeightsKind || canon(c.key) != hs) { continue; }
+      bag::set_integer(c.extra, kClaimHeldBytes, (std::int64_t)h.preload);
+    }
+  }
 }
 
 ResourceClaim

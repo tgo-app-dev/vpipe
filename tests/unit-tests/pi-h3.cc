@@ -277,12 +277,13 @@ TEST(pi_h3, a_dwd_graph_books_its_head_not_the_vae)
   };
   struct Plan {
     std::size_t dec = 0, head = 0, arena = 0, payload = 0;
+    std::string head_phase = "unset";
     std::vector<std::string> vae_weights;   // vae-decode's weight claims
     std::string asked;                      // what vae-decode was told
     // The declared (report) ledger's holdings, which merge by source.
     std::vector<std::string> gen_src, dec_src;
   };
-  auto plan = [&](const std::string& adapter) {
+  auto plan = [&](const std::string& adapter, double keep = 0) {
     Plan out;
     Session sess;
     auto* mgr = sess.generative_model_manager();
@@ -307,7 +308,10 @@ TEST(pi_h3, a_dwd_graph_books_its_head_not_the_vae)
     mc.as_object().insert("lora_scale", FlexData::make_real(1.0));
     gen.apply_constant(kModelCfgPort, mc);
     VaeDecodeStage dec(&sess, "dec",
-                       std::vector<InEdge>{{&gen, 0}, {&sel, 0}}, cfg({}));
+                       std::vector<InEdge>{{&gen, 0}, {&sel, 0}},
+                       keep > 0 ? cfg({{"keep_loaded",
+                                        FlexData::make_real(keep)}})
+                                : cfg({}));
     AudioVaeDecodeStage adec(&sess, "adec", std::vector<InEdge>{}, cfg({}));
     const std::vector<Stage*> stages = {&sel, &gen, &dec, &adec};
     const auto planners = ResourcePlannerRegistry::get().all();
@@ -335,6 +339,13 @@ TEST(pi_h3, a_dwd_graph_books_its_head_not_the_vae)
     }
     const auto dc = dec.declare_resources();
     out.head = bytes_of(dc, "dwd-head:dec");
+    // Held from the stage's start (it loads as the stage starts, beside
+    // the denoise): an unphased arena.
+    for (const ResourceClaim& c : dc) {
+      if (c.key.compare(0, 13, "dwd-head:dec|") == 0) {
+        out.head_phase = c.phase;
+      }
+    }
     for (const ResourceClaim& c : dc) {
       if (c.kind == model_memory::kWeightsKind) {
         out.vae_weights.push_back(c.key);
@@ -398,6 +409,14 @@ TEST(pi_h3, a_dwd_graph_books_its_head_not_the_vae)
   for (const std::string& g : d.gen_src) { holds_adapter |= g == dwd; }
   EXPECT_TRUE(apart && holds_adapter);
   EXPECT_TRUE(head > 0 && d.head == head && v.head == 0);
+  // Nothing kept warm here (no keep_loaded): the decode's alone; kept
+  // warm by config but no hold there yet (a first clip): the decode's
+  // too -- it loads at the first beat. (A hold there:
+  // the_head_is_kept_warm_and_taken_back.)
+  EXPECT_TRUE(d.head_phase == model_memory::kPhaseDecode);
+  const Plan kept = plan(dwd, 600);
+  EXPECT_TRUE(kept.head == head &&
+              kept.head_phase == model_memory::kPhaseDecode);
   EXPECT_TRUE(d.vae_weights.empty() && v.vae_weights.size() == 1);
   EXPECT_TRUE(d.arena == arena && d.payload == feats);
   EXPECT_TRUE(v.arena > 0 && v.payload > 0 && v.payload != d.payload);
@@ -405,6 +424,124 @@ TEST(pi_h3, a_dwd_graph_books_its_head_not_the_vae)
   EXPECT_TRUE(vae > 0 &&
               d.dec + vae + v.arena + v.payload ==
                   v.dec + head + d.arena + d.payload);
+}
+
+// THE HEAD KEPT WARM between clips (vae-decode's `keep_loaded`): a hold
+// of it there as the plan is made books it through every phase (it is
+// taken back as the stage starts); it survives a launch's sweep beside
+// the adapter file's claim (generate-video's) and is handed back as the
+// same object under its key; another int8 tier drops it, and a launch
+// that claims other weights alone lets it go. With the real head.
+//   VPIPE_MINIMAX_H3_TEST_MODEL_PATH, VPIPE_PI_H3_BASE,
+//   VPIPE_PI_H3_DWD_ADAPTER
+TEST(pi_h3, the_head_is_kept_warm_and_taken_back)
+{
+  const std::string root = env_("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  const std::string base = env_("VPIPE_PI_H3_BASE");
+  const std::string file = adapter_file_();
+  if (root.empty() || base.empty() || file.empty()) {
+    std::printf("  SKIP: VPIPE_MINIMAX_H3_TEST_MODEL_PATH / VPIPE_PI_H3_BASE "
+                "/ VPIPE_PI_H3_DWD_ADAPTER unset\n");
+    return;
+  }
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  MetalCompute* mc = sess.metal_compute();
+  ASSERT_TRUE(mgr != nullptr && mc != nullptr);
+  if (mgr == nullptr || mc == nullptr) { return; }
+  auto ws = open_weight_set(file, &sess);
+  ASSERT_TRUE(ws != nullptr);
+  if (!ws) { return; }
+  MetalMiniMaxH3FastVae::Config hc;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3FastVae::config_from_dwd(*ws, &hc, &err));
+  std::shared_ptr<MetalMiniMaxH3FastVae> head =
+      MetalMiniMaxH3FastVae::load(ws, mc, hc, &err);
+  ASSERT_TRUE(head != nullptr);
+  if (!head) { return; }
+  MetalMiniMaxH3FastVae* const same = head.get();
+  std::weak_ptr<MetalMiniMaxH3FastVae> seen = head;
+  const std::string canon = VaeDecodeStage::dwd_canonical(file);
+  // The tier vae-decode keys it by: none asked, this GPU's answer.
+  const int tier = MetalMiniMaxH3FastVae::effective_i8_tier(
+      -1, mc->supports_matrix_cores());
+  const std::string key = VaeDecodeStage::dwd_warm_key(canon, tier, true);
+  const std::size_t bytes = head->weight_bytes();
+  mgr->keep_model_warm(VaeDecodeStage::kH3DwdWarmKind, canon, key,
+                       std::move(head), bytes, 60.0);
+  EXPECT_TRUE(!seen.expired() && mgr->warm_model_bytes(canon) == bytes);
+
+  // The plan with the hold there, models kept warm: booked unphased.
+  auto cfg = [&](std::vector<std::pair<std::string, FlexData>> kv) {
+    FlexData c = FlexData::make_object();
+    c.as_object().insert("hf_dir", FlexData::make_string(root));
+    for (auto& [k, v] : kv) { c.as_object().insert(k, std::move(v)); }
+    return c;
+  };
+  auto head_phase = [&](double keep) {
+    ModelSelectStage sel(&sess, "sel", std::vector<InEdge>{}, cfg({}));
+    GenerateVideoStage gen(
+        &sess, "gen", std::vector<InEdge>{},
+        cfg({{"width", FlexData::make_int(832)},
+             {"height", FlexData::make_int(480)},
+             {"frames", FlexData::make_int(73)},
+             {"fps", FlexData::make_real(24.0)},
+             {"dit_dir", FlexData::make_string(base)}}));
+    FlexData m = FlexData::make_object();
+    m.as_object().insert("lora", FlexData::make_string(file));
+    m.as_object().insert("lora_scale", FlexData::make_real(1.0));
+    gen.apply_constant(9, m);
+    VaeDecodeStage dec(&sess, "dec",
+                       std::vector<InEdge>{{&gen, 0}, {&sel, 0}},
+                       keep > 0 ? cfg({{"keep_loaded",
+                                        FlexData::make_real(keep)}})
+                                : cfg({}));
+    std::string phase = "none";
+    for (const ResourceClaim& c : dec.declare_resources()) {
+      if (c.key.compare(0, 13, "dwd-head:dec|") == 0) { phase = c.phase; }
+    }
+    return phase;
+  };
+  EXPECT_TRUE(head_phase(600).empty());
+  // Not kept warm by config: the decode's alone, hold or not.
+  EXPECT_TRUE(head_phase(0) == model_memory::kPhaseDecode);
+
+  // A launch claiming the adapter file (generate-video's) keeps it.
+  mgr->clear_declarations();
+  mgr->declare_weights(file, 1u << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 0);
+  EXPECT_TRUE(!seen.expired());
+  mgr->clear_declarations();
+  // Taken back under its key: the very head kept.
+  auto got = mgr->take_warm<MetalMiniMaxH3FastVae>(
+      VaeDecodeStage::kH3DwdWarmKind, canon, key);
+  ASSERT_TRUE(got != nullptr);
+  EXPECT_TRUE(got.get() == same);
+  EXPECT_TRUE(mgr->warm_model_bytes(canon) == 0);
+  // No hold now: the decode's alone.
+  EXPECT_TRUE(head_phase(600) == model_memory::kPhaseDecode);
+  // Kept again, asked under another tier: dropped.
+  mgr->keep_model_warm(VaeDecodeStage::kH3DwdWarmKind, canon, key,
+                       std::move(got), bytes, 60.0);
+  EXPECT_TRUE(mgr->take_warm<MetalMiniMaxH3FastVae>(
+                  VaeDecodeStage::kH3DwdWarmKind, canon,
+                  VaeDecodeStage::dwd_warm_key(canon, tier + 1, true)) ==
+              nullptr);
+  EXPECT_TRUE(seen.expired());
+  // Kept again, and a launch that claims other weights alone: let go.
+  {
+    std::shared_ptr<MetalMiniMaxH3FastVae> again =
+        MetalMiniMaxH3FastVae::load(ws, mc, hc, &err);
+    ASSERT_TRUE(again != nullptr);
+    if (!again) { return; }
+    seen = again;
+    mgr->keep_model_warm(VaeDecodeStage::kH3DwdWarmKind, canon, key,
+                         std::move(again), bytes, 60.0);
+  }
+  mgr->declare_weights(base, 1u << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 1);
+  EXPECT_TRUE(seen.expired());
+  mgr->clear_declarations();
 }
 
 // WHAT THE HEAD HOLDS AND WHAT A DECODE ALLOCATES, against what the plan

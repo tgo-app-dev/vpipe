@@ -6,6 +6,7 @@
 #include <memory>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace vpipe::genai::torch_zip {
@@ -821,6 +822,30 @@ read_index(int fd, std::uint64_t size, std::vector<Tensor>* out,
       }
     }
     ok = walk_("", *d, blobs, out, err);
+    // ...and its SIBLINGS too, under their own keys: a training state
+    // keeps the EMA model the release decodes with beside the raw one
+    // (`ema_state_dict`). Additive -- the unwrapped names are as they
+    // were -- and best effort: a sibling this reader cannot index (or
+    // whose names collide) is left out rather than failing a load that
+    // reads what it needs from `state_dict`.
+    if (ok && d != top.get()) {
+      std::unordered_set<std::string> have;
+      for (const Tensor& t : *out) { have.insert(t.name); }
+      for (const auto& kv : top->dict) {
+        if (kv.first->k != Value::K::Str || kv.first->s == "state_dict" ||
+            kv.second->k != Value::K::Dict) {
+          continue;
+        }
+        std::vector<Tensor> more;
+        std::string serr;
+        if (!walk_(kv.first->s + ".", *kv.second, blobs, &more, &serr)) {
+          continue;
+        }
+        for (Tensor& t : more) {
+          if (have.insert(t.name).second) { out->push_back(std::move(t)); }
+        }
+      }
+    }
   } else {
     return fail_(err, "the checkpoint holds neither a tensor nor a dict of "
                       "them");

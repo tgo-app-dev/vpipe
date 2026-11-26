@@ -118,6 +118,84 @@ dac_config_(const FlexData& fd, MetalOobleckDecoder::Config* out,
 
 }  // namespace
 
+namespace {
+
+// stable-audio-tools' model_config.json: {"sample_rate": .., "model":
+// {"pretransform": {"type": "autoencoder", "config": {"decoder": {"type":
+// "oobleck", "config": {...}}, "latent_dim": ..}}}}.
+bool
+sao_config_(std::istream& in, MetalOobleckDecoder::Config* out,
+            std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  FlexData fd;
+  try {
+    fd = FlexData::from_json(in);
+  } catch (const std::exception& e) {
+    return fail(std::string("model_config.json: ") + e.what());
+  }
+  if (!fd.is_object()) { return fail("model_config.json is not an object"); }
+  auto o = fd.as_object();
+  if (!o.contains("model")) { return fail("model_config.json: no model"); }
+  const FlexData model = o.at("model");
+  if (!model.is_object() || !model.as_object().contains("pretransform")) {
+    return fail("model_config.json: no pretransform");
+  }
+  const FlexData pt = model.as_object().at("pretransform");
+  if (!pt.is_object() || !pt.as_object().contains("config")) {
+    return fail("model_config.json: no pretransform config");
+  }
+  const FlexData pc = pt.as_object().at("config");
+  if (!pc.is_object() || !pc.as_object().contains("decoder")) {
+    return fail("model_config.json: no decoder");
+  }
+  const FlexData dec = pc.as_object().at("decoder");
+  auto deco = dec.as_object();
+  if (!deco.contains("type") || deco.at("type").as_string() != "oobleck" ||
+      !deco.contains("config")) {
+    return fail("model_config.json: the decoder is not an Oobleck one");
+  }
+  const FlexData dcf = deco.at("config");
+  auto d = dcf.as_object();
+  MetalOobleckDecoder::Config c;
+  c.prefix = "pretransform.model.";
+  c.sample_rate = o.contains("sample_rate")
+                      ? (int)o.at("sample_rate").as_int(44100)
+                      : 44100;
+  auto geti = [&](const char* k, int v) {
+    return d.contains(k) ? (int)d.at(k).as_int(v) : v;
+  };
+  c.latent_dim = geti("latent_dim", c.latent_dim);
+  c.channels = geti("channels", c.channels);
+  c.out_channels = geti("out_channels", c.out_channels);
+  c.final_tanh = d.contains("final_tanh") ? d.at("final_tanh").as_bool(true)
+                                          : true;
+  auto ints = [&](const char* k, std::vector<int>* dst) {
+    if (!d.contains(k)) { return; }
+    const FlexData a = d.at(k);
+    if (!a.is_array()) { return; }
+    dst->clear();
+    for (const FlexData& v : a.as_array()) { dst->push_back((int)v.as_int()); }
+  };
+  ints("c_mults", &c.c_mults);
+  ints("strides", &c.strides);
+  if ((d.contains("use_nearest_upsample") &&
+       d.at("use_nearest_upsample").as_bool(false)) ||
+      !(d.contains("use_snake") && d.at("use_snake").as_bool(false))) {
+    return fail("unsupported Oobleck decoder options");
+  }
+  if (c.c_mults.size() != c.strides.size() || c.c_mults.empty()) {
+    return fail("decoder c_mults and strides disagree");
+  }
+  *out = c;
+  return true;
+}
+
+}  // namespace
+
 bool
 MetalOobleckDecoder::config_from_dir(const std::string& dir, Config* out,
                                      std::string* err)
@@ -127,7 +205,15 @@ MetalOobleckDecoder::config_from_dir(const std::string& dir, Config* out,
     return false;
   };
   std::ifstream in(std::filesystem::path(dir) / "config.json");
-  if (!in) { return fail("no config.json under " + dir); }
+  if (!in) {
+    // Stable Audio Open's checkpoint (stable-audio-tools): its
+    // model_config.json, the autoencoder as the pretransform of a
+    // diffusion model -- the same Oobleck decoder under
+    // "pretransform.model.".
+    std::ifstream sao(std::filesystem::path(dir) / "model_config.json");
+    if (!sao) { return fail("no config.json under " + dir); }
+    return sao_config_(sao, out, err);
+  }
   FlexData fd;
   try {
     fd = FlexData::from_json(in);
@@ -212,6 +298,34 @@ MetalOobleckDecoder::is_music3_vocoder_dir(const std::string& dir)
 }
 
 MetalOobleckDecoder::~MetalOobleckDecoder() = default;
+
+std::size_t
+MetalOobleckDecoder::held_bytes(const MetalLlamaWeights& src,
+                                const Config& c)
+{
+  if (c.layout != Layout::kOobleck) { return 0; }
+  const std::string dp = c.prefix + "decoder.layers.";
+  auto ends = [](const std::string& n, const char* x) {
+    const std::size_t k = std::strlen(x);
+    return n.size() > k && n.compare(n.size() - k, k, x) == 0;
+  };
+  std::size_t b = 0;
+  for (const std::string& nm : src.tensor_names()) {
+    if (nm.compare(0, dp.size(), dp) != 0 || ends(nm, ".weight_g")) {
+      continue;
+    }
+    const auto* ti = src.info(nm);
+    if (ti == nullptr) { continue; }
+    std::size_t n = 1;
+    for (const auto d : ti->shape) { n *= (std::size_t)d; }
+    if (ends(nm, ".weight_v") || ends(nm, ".weight") || ends(nm, ".bias")) {
+      b += n * 2;                        // f16
+    } else if (ends(nm, ".alpha") || ends(nm, ".beta")) {
+      b += n * 4;                        // f32
+    }
+  }
+  return b;
+}
 
 std::unique_ptr<MetalOobleckDecoder>
 MetalOobleckDecoder::load(const std::string& dir, MetalCompute* mc,
@@ -448,11 +562,12 @@ MetalOobleckDecoder::init_oobleck_(WeightSet& w, std::string* err)
   // decoder.layers: [0] the input conv, [1..n] the upsample blocks from
   // the widest down, [n+1] the closing SnakeBeta, [n+2] the output conv.
   const int nb = (int)cfg.strides.size();
-  _conv_in = conv_(w, "decoder.layers.0", false, 1, 1);
-  if (_conv_in.empty()) { return fail("decoder.layers.0 missing"); }
+  const std::string dp = _cfg.prefix + "decoder.layers.";
+  _conv_in = conv_(w, dp + "0", false, 1, 1);
+  if (_conv_in.empty()) { return fail(dp + "0 missing"); }
   _blocks.resize((std::size_t)nb);
   for (int bi = 0; bi < nb; ++bi) {
-    const std::string p = "decoder.layers." + std::to_string(bi + 1);
+    const std::string p = dp + std::to_string(bi + 1);
     Block& b = _blocks[(std::size_t)bi];
     b.rate = cfg.strides[(std::size_t)(nb - 1 - bi)];
     b.act = snake_(w, p + ".layers.0");
@@ -474,8 +589,8 @@ MetalOobleckDecoder::init_oobleck_(WeightSet& w, std::string* err)
       }
     }
   }
-  _act_out = snake_(w, "decoder.layers." + std::to_string(nb + 1));
-  _conv_out = conv_(w, "decoder.layers." + std::to_string(nb + 2), false,
+  _act_out = snake_(w, dp + std::to_string(nb + 1));
+  _conv_out = conv_(w, dp + std::to_string(nb + 2), false,
                     1, 1);
   if (_act_out.empty() || _conv_out.empty() ||
       _conv_out.cout != cfg.out_channels) {

@@ -42,10 +42,15 @@
 #include "generative-models/train/optimizer.h"
 #include "generative-models/train/sample-cache.h"
 #include "generative-models/train/train-ops.h"
+#include "generative-models/tensor-parallel.h"
+#include "generative-models/shared/tp-overlap.h"
+#include "pipeline/stage-command.h"
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -111,6 +116,13 @@ private:
   bool _ane_backward = false;
   bool _i8 = false;
   bool _register = true;
+  // `tensor_parallel`: this stage as one RANK of a run split across
+  // hosts (train-lora-split.cc). Null: the whole DiT here.
+  FlexData _tp_cfg;
+  // `data_parallel`: this stage as one rank of a run whose steps' SAMPLES
+  // are shared between hosts, each with the whole model. At most one of
+  // the two.
+  FlexData _dp_cfg;
 
   // ---- run state
   enum class Phase : std::uint8_t { kStart, kEncode, kTrain, kDone };
@@ -204,6 +216,11 @@ private:
   int _preview_every = 0;
   std::uint64_t _run_seed = 0;
   std::size_t _reserve_bytes = 0;
+  // The run's activations kept (recompute: never) or not, and what the
+  // reserve is without them: a rank falls back where the other cannot.
+  bool _keep_all = false;
+  std::size_t _arena_recompute = 0;
+  std::size_t _state_reserve = 0;
   double _loss_sum = 0.0;
   int _loss_n = 0;
   std::vector<std::string> _saved;
@@ -253,9 +270,187 @@ private:
   std::size_t _got_text = 0, _got_pic = 0;
   bool start_training_(std::string* err);
   bool save_(bool final_save, std::string* err);
-  bool resume_(std::string* err);
+  // The state at step `at` read back (-1: the newest that loads -- a
+  // whole run's); false with `err` empty when there is none.
+  bool resume_(std::int64_t at, std::string* err);
   void register_(const std::string& path);
   std::string resume_dir_() const;
+
+  // ---- A RANK OF A SPLIT RUN (`tensor_parallel`; train-lora-split.cc) --
+  // Every rank is a train-lora stage of its own, on its own host,
+  // stepping together. Rank 0 encodes the dataset and hands it to the
+  // others whole, before any model loads -- so every rank trains on the
+  // same bytes, and the others need no encoders, no dataset, no cache --
+  // with the run's settings, which theirs then are. Then each loads its
+  // share; each forward and backward exchanges partial sums (the
+  // family's); between steps every rank agrees on what comes next -- a
+  // stop, a checkpoint, a preview, whichever rank was asked
+  // (tp_control_) -- the shared factors' gradients are summed and the
+  // norm taken over every rank's share. Checkpoints are the WHOLE
+  // adapter, gathered, written by rank 0; the resume state is written
+  // by every rank (its adapter whole, its optimizer state its share's).
+  genai::TpShare _tp;
+  std::shared_ptr<genai::TpChannel> _tp_ch;
+  std::uint64_t _tp_seq = 0;          // exchanges before the model's
+  bool _tp_seed_given = false;        // a follower's: rank 0's run seed
+  std::uint64_t _tp_seed = 0;
+  double _tp_repl_sq = 0.0;           // the shared gradients' sum of squares
+  // How long the channel waits on the peer once a stop is asked before
+  // it gives up (the peer is gone): the train calls' longest, x 4.
+  std::shared_ptr<std::atomic<std::int64_t>> _tp_grace_ms;
+  // Commands rank 0 took, answered once every rank has run them.
+  std::vector<std::shared_ptr<StageCommand>> _tp_pending;
+  // ---- A RANK OF A DATA-PARALLEL RUN (`data_parallel`) ---------------
+  // As a split run's -- the dataset handed over, every step agreed, the
+  // resume state every rank's -- but each rank holds the WHOLE model and
+  // trains its own samples of each step: rank r `_batch` x samples[r] of
+  // them, in the one seeded order, the step's batch every rank's summed.
+  // After its backward each rank's gradients (and losses) are summed
+  // across the ranks, so every rank takes the same optimizer step and
+  // holds the same adapter. Rank 0 alone writes it and makes previews.
+  int _dp_rank = -1;
+  int _dp_k[2] = {1, 1};              // samples[r]: each rank's multiple
+  std::unique_ptr<genai::TpOverlap> _dp_pipe;
+  std::unique_ptr<genai::TpBulk> _dp_bulk;
+  // A rank of either kind of run; one that splits the model; a follower.
+  bool tp_rank_() const { return _tp.active() || _dp_rank >= 0; }
+  bool tp_split_() const { return _tp.active(); }
+  bool dp_rank_() const { return _dp_rank >= 0; }
+  bool tp_follower_() const
+  {
+    return (_tp.active() && _tp.rank > 0) || _dp_rank > 0;
+  }
+  int rank_index_() const { return _tp.active() ? _tp.rank : _dp_rank; }
+  // The run's configuration of either kind (null: neither).
+  const FlexData& par_cfg_() const
+  {
+    return _dp_cfg.is_object() ? _dp_cfg : _tp_cfg;
+  }
+  const char* par_key_() const
+  {
+    return _dp_cfg.is_object() ? "data_parallel" : "tensor_parallel";
+  }
+  // A step's samples, every rank's, and this rank's first and count.
+  int global_batch_() const
+  {
+    return dp_rank_() ? _batch * (_dp_k[0] + _dp_k[1]) : _batch;
+  }
+  int local_first_() const
+  {
+    return _dp_rank > 0 ? _batch * _dp_k[0] : 0;
+  }
+  int local_count_() const
+  {
+    return dp_rank_() ? _batch * _dp_k[_dp_rank] : _batch;
+  }
+  // Bytes to and from the other rank between steps: a split run's
+  // through the model's channel, a data-parallel run's through its own.
+  bool bulk_(const void* mine, void* others, std::size_t bytes,
+             genai::TpDType dtype, std::string* err);
+  // Every rank's gradients (and `sums`, n of them: the step's losses)
+  // summed into each rank's.
+  bool dp_sync_gradients_(double* sums, int n, std::string* err);
+  // The channel of a data-parallel run (tp_open_ for one).
+  bool dp_open_(std::string* err);
+  // The share (its widths the family's) and the channel.
+  bool tp_open_(std::string* err);
+  // Rank 0: the dataset and the run's settings out; a follower: in.
+  bool tp_ship_(std::string* err);
+  bool tp_receive_(std::string* err);
+  // The shared factors' gradients summed across the ranks.
+  bool tp_sync_gradients_(std::string* err);
+  // What every rank does next, agreed: each rank's flags OR'd, rank 0's
+  // preview arguments.
+  struct TpControl {
+    bool stop = false, save = false, preview = false;
+    int prompt = -1, steps = 0;
+    double cfg = 0.0;
+    std::int64_t seed = -1;
+    // What each rank decided alone from state both hold -- a checkpoint
+    // or preview due -- agreed rather than assumed.
+    bool due_save = false, due_preview = false;
+    // Every `check_every` steps, a digest of what both ranks hold alike
+    // (masters_digest_): 0 between checks.
+    std::uint64_t digest = 0;
+  };
+  bool tp_control_(const TpControl& mine, TpControl* all, std::string* err);
+  // The agreement before a step -- or, a stop asked after this step's,
+  // the next one's, held at once -- and what it decides: `*stopped` the
+  // run saved for its resume and ended; else the checkpoint and preview
+  // the last step was due, and the commands taken, run on every rank.
+  Job tp_agree_(RuntimeContext& ctx, bool* stopped, std::string* err);
+  bool _tp_due_save = false, _tp_due_preview = false;
+  void tp_close_();
+  // THE HANDSHAKE, the first exchange of a run's channel: both ranks
+  // configured as one run (the protocol, the kind of run, the ranks, the
+  // share and its extra), and a transport that copies bytes (its probe).
+  // Refused on both, naming the field, on any mismatch.
+  bool tp_handshake_(std::string* err);
+  // ...and once each has its model and adapter (start_training_): the
+  // same DiT (its checkpoint's headers), the same frozen adapters, the
+  // same modules laid out alike.
+  bool tp_check_layout_(std::string* err);
+  // A digest of what every rank holds alike: a split run's shared
+  // factors' masters, a data-parallel run's whole adapter.
+  std::uint64_t masters_digest_() const;
+  int _tp_check_every = 50;           // `check_every`; 0: never
+  // The run's first agreements checked whatever check_every says (set
+  // by start_training_; counted down alike on every rank).
+  int _tp_first_checks = 0;
+  // The digests exchanged now, outside an agreement (before a state is
+  // written); false, with the parting said, where they differ.
+  bool tp_alike_(std::string* err);
+  std::string parted_(std::uint64_t mine, std::uint64_t other) const;
+  // The gradient sync's host copies, sized once (and booked): macOS
+  // keeps a freed large allocation in the footprint.
+  std::vector<float> _sync_mine, _sync_others;
+  // The bytes a rank's exchanges hold beside the plan's (booked).
+  std::size_t split_reserve_bytes_() const;
+  // FAULTS, for tests (VPIPE_TRAIN_FAULT="<rank>:<step>:<what>"): this
+  // rank fails at the start of that step's train call ("step"), its
+  // preview at that step fails ("preview"), or a shared master is nudged
+  // there ("part") -- a GPU's arithmetic parting the ranks.
+  struct Fault {
+    int rank = -1, step = -1;
+    std::string what;
+  } _fault;
+  bool fault_(const char* what) const
+  {
+    return _fault.rank == rank_index_() && _fault.step == _step &&
+           _fault.what == what;
+  }
+  // A resume state's run.json is this run's (its seed, length, dataset,
+  // batch, and -- a rank -- the kind of run, the rank and its share);
+  // `why` the first field that is not.
+  bool resume_matches_(const FlexData& run, std::string* why) const;
+  // What run.json records of a rank (resume_matches_ checks it).
+  FlexData rank_record_() const;
+  // THE RESUME STATES KEPT -- the last kResumeKept checkpoints' (review
+  // 4b): a rank that died between its peer's write and its own still
+  // holds the step before, which the ranks agree on (newest held by
+  // both) rather than starting over. Each in `step-NNNNNN/` of the
+  // resume folder (optimizer.bin + run.json), written under a .tmp name
+  // and renamed whole; the folder's own run.json the newest's record.
+  // An older layout's state -- the two files at the folder's root -- is
+  // read as one more.
+  static constexpr int kResumeKept = 2;
+  struct ResumeSlot {
+    std::int64_t step = -1;
+    std::filesystem::path dir;   // where its optimizer.bin and run.json are
+  };
+  // This run's states here, newest first (run.json matching, both files
+  // there, the optimizer's check_state passed); `others` -- if given --
+  // set when a state for another run was passed over, `broken` what was
+  // passed over as not loading.
+  std::vector<ResumeSlot> resume_slots_(
+      bool* others = nullptr,
+      std::vector<std::string>* broken = nullptr) const;
+  // After a save at `upto` (or a resume there): the states past it --
+  // an abandoned run's, which a later agreement could pair with a peer's
+  // real one -- gone, then all but the newest kResumeKept, the .tmp
+  // leftovers and the older layout's files; the folder's run.json the
+  // newest kept's.
+  void resume_tidy_(std::int64_t upto) const;
 #endif
 };
 

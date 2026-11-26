@@ -3,6 +3,7 @@ set(LOCAL_TEST_SOURCES
   image-model-registry.cc
   image-references.cc
   video-generation-inputs.cc
+  video-tensor-parallel.cc
   buffer-stage.cc
   byte-track-stage.cc
   call-stage.cc
@@ -224,11 +225,13 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-taomate.cc
         minimax-h3-regenerate.cc
         minimax-h3-train.cc
+        minimax-h3-train-split.cc
         minimax-h3-guide.cc
         pika-h3-flex.cc
         pi-h3.cc
         minimax-h3-sampler.cc
         minimax-h3-pruned.cc
+        hyperflow-h3-flash.cc
         minimax-h3-whole.cc
         minimax-h3-dials.cc
         vdn-geometry.cc
@@ -281,6 +284,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         bs-roformer.cc
         rife.cc
         relayvsr.cc
+        magi2.cc
         drama3.cc
         deepseek-v41.cc
         host-handshake.cc

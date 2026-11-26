@@ -574,12 +574,21 @@ public:
   // implements this interface has to be rebuilt for a value it does not
   // handle. A string costs one comparison and never does that.
   //
-  // The two the host asks for today are named below. A family that is
+  // The three the host asks for today are named below. A family that is
   // handed a role it does not know must return an empty path, which the
   // caller reads as "this family has no such codec" -- never a guess at
   // the nearest one.
   static constexpr std::string_view kRoleVideo = "video";
   static constexpr std::string_view kRoleAudio = "audio";
+  // THE VIDEO ENCODER'S FILE, where it is not the decoder's: vae-encode
+  // asks this role first and falls back to kRoleVideo on an empty answer,
+  // for its claim, its release and its holdings (declare_holdings) alike.
+  // So only a family whose encode reads another checkpoint answers it --
+  // a decoder retrained alone, shipped beside the encoder it was trained
+  // against. A host that predates the role never asks it, and books such
+  // an encode under kRoleVideo's answer: the plan names the wrong file,
+  // the encode itself is the family's and runs the same.
+  static constexpr std::string_view kRoleVideoEncode = "video-encode";
 
   // WHERE this family's weights actually live under `root`, when that
   // is not a directory the host can find on its own.

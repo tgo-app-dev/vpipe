@@ -3061,6 +3061,14 @@ qi21_split_(MetalCompute* mc, const fs::path& dir, const QI::Config& cfg,
 
 }  // namespace
 
+// The small random Qwen-Image-2.1 DiT, for the training tests
+// (minimax-h3-train-split.cc's split step of a family).
+bool
+qi21_small_for_tests(const fs::path& dir, bool w8)
+{
+  return write_qi21_small_(dir, w8);
+}
+
 // A QWEN-IMAGE-2.1 DiT SPLIT between two ranks is the unsplit one: each
 // holds its share of every block's heads (to_q / to_k / to_v by their
 // rows, to_out by its columns) and feed-forward rows (gate_layer and

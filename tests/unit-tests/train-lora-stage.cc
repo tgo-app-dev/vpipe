@@ -33,10 +33,14 @@
 #include "generative-models/minimax-h3/minimax-h3-trainer.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/train/lora-params.h"
+#include "generative-models/tensor-parallel.h"
 #include "generative-models/weight-set.h"
 #include "stages/model-memory-host.h"
 #include "minimax-h3-synthetic.h"
 
+#include <mutex>
+#include <condition_variable>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1036,6 +1040,15 @@ struct H3Run {
   // for the empty and the preview prompts).
   bool refs = false;
   std::string recompute;   // the stage's `recompute`, when set
+  // `tensor_parallel`: this run as rank 0 of a split one.
+  FlexData tp;
+  // `data_parallel`: this run as rank 0 of one whose steps' samples are
+  // shared; `batch` the stage's batch_size.
+  FlexData dp;
+  int batch = 1;
+  std::string optimizer;   // the optimizer-select's, when set
+  // Errors and warnings the run's session said.
+  std::vector<std::string> said;
   std::function<void(PipelineRuntime*, const BeatPayloadIntf*)> on_ckpt;
   std::vector<std::unique_ptr<BeatPayloadIntf>> previews, ckpts, metrics,
       preview_audio;
@@ -1135,6 +1148,9 @@ struct H3Run {
       return tb;
     };
     Session sess;
+    sess.set_log_listener([this](int level, std::string_view text) {
+      if (level <= 1) { said.push_back(std::string(text)); }
+    });
     auto pl = std::make_unique<Pipeline>("p", &sess);
     auto src = [&](const char* id) {
       auto u = std::make_unique<Beats>(&sess, id, std::vector<InEdge>{},
@@ -1230,6 +1246,10 @@ struct H3Run {
     ocfg.as_object().insert_or_assign("learning_rate",
                                       FlexData::make_real(1e-2));
     ocfg.as_object().insert_or_assign("warmup_steps", FlexData::make_int(0));
+    if (!optimizer.empty()) {
+      ocfg.as_object().insert_or_assign("optimizer",
+                                        FlexData::make_string(optimizer));
+    }
     auto opt = pl->insert_stage(std::make_unique<OptimizerSelectStage>(
         &sess, "opt", std::vector<InEdge>{}, ocfg));
     FlexData cfg = FlexData::make_object();
@@ -1248,6 +1268,11 @@ struct H3Run {
       o.insert_or_assign("resume", FlexData::make_string(resume));
       if (!recompute.empty()) {
         o.insert_or_assign("recompute", FlexData::make_string(recompute));
+      }
+      if (tp.is_object()) { o.insert_or_assign("tensor_parallel", tp); }
+      if (dp.is_object()) { o.insert_or_assign("data_parallel", dp); }
+      if (batch > 1) {
+        o.insert_or_assign("batch_size", FlexData::make_int(batch));
       }
     }
     const InEdge none{nullptr, 0};
@@ -1481,6 +1506,106 @@ TEST(train_lora, minimax_h3_a_stopped_run_resumes_the_same_adapter)
               "%zu bytes, %s\n", fa.size(), fc.size(),
               fa == fc ? "IDENTICAL" : "DIFFERENT");
   EXPECT_TRUE(!fa.empty() && fa == fc);
+  fs::remove_all(root);
+}
+
+// THE LAST TWO STATES KEPT (a whole run): one whose newest state does
+// not load -- its host gone mid-write -- resumes from the state before,
+// a resume folder of the older layout (the two files at its root) still
+// resumes, and one whose every state is cut short starts over as a fresh
+// run would. Each way the adapter is the uninterrupted run's.
+TEST(train_lora, minimax_h3_resumes_past_a_broken_state_or_an_old_layout)
+{
+  pin_h3_tuners_();
+  const fs::path root = fs::temp_directory_path() / "vpipe-ut-train-h3-kept";
+  fs::remove_all(root);
+  fs::create_directories(root);
+  const fs::path model = root / "h3-synthetic.safetensors";
+  ASSERT_TRUE(h3_synthetic::write_synthetic_(model));
+  const int kSteps = 40;
+  auto run = [&](const fs::path& out, const std::string& resume, int stop_at,
+                 H3Run* r) {
+    r->model = model;
+    r->out = out;
+    r->steps = kSteps;
+    r->save_every = 8;
+    r->preview_every = -1;
+    r->resume = resume;
+    if (stop_at > 0) {
+      auto seen = std::make_shared<int>(0);
+      r->on_ckpt = [seen, stop_at](PipelineRuntime* rt,
+                                   const BeatPayloadIntf*) {
+        if (++*seen == stop_at) { rt->pause(); }
+      };
+    }
+    r->run();
+  };
+  H3Run a;
+  run(root / "a", "never", 0, &a);
+  ASSERT_TRUE(a.config_error.empty());
+  H3Run b;
+  run(root / "b", "auto", 2, &b);
+  ASSERT_TRUE(b.config_error.empty());
+  const fs::path rd = root / "b" / "ut-h3.resume";
+  std::vector<int> steps;
+  for (const auto& e : fs::directory_iterator(rd)) {
+    const std::string n = e.path().filename().string();
+    if (e.is_directory() && n.rfind("step-", 0) == 0) {
+      steps.push_back(std::atoi(n.c_str() + 5));
+    }
+  }
+  std::sort(steps.rbegin(), steps.rend());
+  std::printf("[train_lora] minimax-h3: stopped, %zu states kept (newest "
+              "%d)\n", steps.size(), steps.empty() ? -1 : steps[0]);
+  ASSERT_TRUE(steps.size() == 2 && steps[0] > steps[1]);
+  auto slot = [&](const fs::path& d, int st) {
+    char sn[32];
+    std::snprintf(sn, sizeof sn, "step-%06d", st);
+    return d / "ut-h3.resume" / sn;
+  };
+  // The older layout: a copy of the stopped run, its newest state's two
+  // files at the folder's root and no slots.
+  fs::copy(root / "b", root / "old", fs::copy_options::recursive);
+  {
+    const fs::path od = root / "old" / "ut-h3.resume";
+    fs::copy_file(slot(root / "old", steps[0]) / "optimizer.bin",
+                  od / "optimizer.bin", fs::copy_options::overwrite_existing);
+    fs::copy_file(slot(root / "old", steps[0]) / "run.json",
+                  od / "run.json", fs::copy_options::overwrite_existing);
+    fs::remove_all(slot(root / "old", steps[0]));
+    fs::remove_all(slot(root / "old", steps[1]));
+  }
+  // Every state cut short: started over -- from the seed's draw, not
+  // from the part of a state a failed read had already put in the
+  // masters (the check runs before a byte is read in).
+  fs::copy(root / "b", root / "cut", fs::copy_options::recursive);
+  fs::resize_file(slot(root / "cut", steps[0]) / "optimizer.bin", 100);
+  fs::resize_file(slot(root / "cut", steps[1]) / "optimizer.bin", 100);
+  // The newest state cut short.
+  fs::resize_file(slot(root / "b", steps[0]) / "optimizer.bin", 100);
+  H3Run c;
+  run(root / "b", "auto", 0, &c);
+  ASSERT_TRUE(c.config_error.empty());
+  H3Run d;
+  run(root / "old", "auto", 0, &d);
+  ASSERT_TRUE(d.config_error.empty());
+  H3Run e;
+  run(root / "cut", "auto", 0, &e);
+  ASSERT_TRUE(e.config_error.empty());
+  std::printf("[train_lora] minimax-h3: past a broken state %zu steps, from "
+              "the old layout %zu, every state cut %zu\n", c.metrics.size(),
+              d.metrics.size(), e.metrics.size());
+  EXPECT_TRUE((int)c.metrics.size() == kSteps - steps[1]);
+  EXPECT_TRUE((int)d.metrics.size() == kSteps - steps[0]);
+  EXPECT_TRUE((int)e.metrics.size() == kSteps);
+  const std::vector<char> fa = bytes_of_(a.out / "ut-h3.safetensors");
+  EXPECT_TRUE(!fa.empty());
+  EXPECT_TRUE(fa == bytes_of_(root / "b" / "ut-h3.safetensors"));
+  EXPECT_TRUE(fa == bytes_of_(root / "old" / "ut-h3.safetensors"));
+  EXPECT_TRUE(fa == bytes_of_(root / "cut" / "ut-h3.safetensors"));
+  // A finished run leaves nothing to resume.
+  EXPECT_TRUE(!fs::exists(rd) && !fs::exists(root / "old" / "ut-h3.resume") &&
+              !fs::exists(root / "cut" / "ut-h3.resume"));
   fs::remove_all(root);
 }
 
@@ -2163,5 +2288,985 @@ TEST(train_lora, claims_what_a_run_holds_beside_its_dit)
                 heads ? "yes" : "NO");
     EXPECT_TRUE(heads);
   }
+  fs::remove_all(root);
+}
+
+// ---- a run split across two ranks ------------------------------------------
+
+namespace {
+
+// Two ranks of one process paired by an in-process transport: each
+// exchange hands each rank the other's bytes.
+struct PairLink2 {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::map<std::uint64_t, std::vector<std::uint8_t>> part[2];
+  bool gone[2] = {false, false};   // a rank's channel let go
+  void reset()
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    part[0].clear();
+    part[1].clear();
+    gone[0] = gone[1] = false;
+  }
+};
+
+struct PairChan2 final : genai::TpChannel {
+  PairLink2* link = nullptr;
+  int me = 0;
+  // Let go, it releases the peer's waits at once (TpChannel's contract).
+  ~PairChan2() override
+  {
+    std::lock_guard<std::mutex> lk(link->mu);
+    link->gone[me] = true;
+    link->cv.notify_all();
+  }
+  bool exchange(const void* partial, void* others, std::size_t bytes,
+                genai::TpDType, std::uint64_t seq, std::string* err) override
+  {
+    const auto* p = static_cast<const std::uint8_t*>(partial);
+    std::unique_lock<std::mutex> lk(link->mu);
+    link->part[me][seq].assign(p, p + bytes);
+    link->cv.notify_all();
+    auto& theirs = link->part[1 - me];
+    if (!link->cv.wait_for(lk, std::chrono::seconds(120), [&]() {
+          return theirs.count(seq) > 0 || link->gone[1 - me];
+        })) {
+      if (err != nullptr) { *err = "the peer never came"; }
+      return false;
+    }
+    if (theirs.count(seq) == 0) {
+      if (err != nullptr) { *err = "the peer let go of its channel"; }
+      return false;
+    }
+    if (theirs[seq].size() != bytes) {
+      if (err != nullptr) { *err = "the ranks are out of step"; }
+      return false;
+    }
+    std::memcpy(others, theirs[seq].data(), bytes);
+    return true;
+  }
+};
+
+struct PairTransport2 final : genai::TpTransport {
+  PairLink2 link;
+  std::string_view name() const override { return "ut-train-pair"; }
+  std::shared_ptr<genai::TpChannel> open(const FlexData&,
+                                         const genai::TpShare& share,
+                                         std::string*) override
+  {
+    auto c = std::make_shared<PairChan2>();
+    c->link = &link;
+    c->me = share.rank;
+    return c;
+  }
+};
+
+PairTransport2*
+pair_transport2_()
+{
+  static PairTransport2* t = []() {
+    auto u = std::make_unique<PairTransport2>();
+    PairTransport2* p = u.get();
+    genai::register_tp_transport(std::move(u));
+    return p;
+  }();
+  return t;
+}
+
+FlexData
+tp_of_(int rank)
+{
+  return FlexData::from_json(
+      "{\"rank\": " + std::to_string(rank) +
+      ", \"ranks\": 2, \"transport\": \"ut-train-pair\"}");
+}
+
+// Rank 1: a train-lora stage alone -- the model, where it writes, its
+// share -- its dataset and settings rank 0's.
+void
+follower_run_(const fs::path& model, const fs::path& out,
+              std::vector<std::unique_ptr<BeatPayloadIntf>>* ckpts,
+              std::vector<std::unique_ptr<BeatPayloadIntf>>* metrics,
+              std::string* error, const std::string& resume = "never",
+              const char* key = "tensor_parallel",
+              const FlexData& par = FlexData(),
+              std::vector<std::string>* said = nullptr)
+{
+  Session sess;
+  if (said != nullptr) {
+    sess.set_log_listener([said](int level, std::string_view text) {
+      if (level <= 1) { said->push_back(std::string(text)); }
+    });
+  }
+  auto pl = std::make_unique<Pipeline>("p1", &sess);
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert_or_assign("hf_dir", FlexData::make_string(model.string()));
+    o.insert_or_assign("output_dir", FlexData::make_string(out.string()));
+    o.insert_or_assign("name", FlexData::make_string("ut-h3"));
+    o.insert_or_assign("register", FlexData::make_bool(false));
+    o.insert_or_assign("resume", FlexData::make_string(resume));
+    o.insert_or_assign(key, par.is_object() ? par : tp_of_(1));
+  }
+  auto tr_u = std::make_unique<TrainLoraStage>(&sess, "train",
+                                               std::vector<InEdge>{}, cfg);
+  *error = tr_u->config_error();
+  if (!error->empty()) { return; }
+  auto* tr = pl->insert_stage(std::move(tr_u));
+  CbSink* sinks[4];
+  for (int p = 0; p < 4; ++p) {
+    auto s = std::make_unique<CbSink>(
+        &sess, "fsink" + std::to_string(p),
+        std::vector<InEdge>{{tr, (unsigned)p}}, FlexData::make_object());
+    sinks[p] = static_cast<CbSink*>(pl->insert_stage(std::move(s)));
+  }
+  PipelineRuntime rt(pl.get(), &sess);
+  if (!rt.launch()) { *error = "launch failed"; return; }
+  rt.wait_idle();
+  rt.stop();
+  *ckpts = std::move(sinks[1]->got);
+  *metrics = std::move(sinks[2]->got);
+}
+
+std::vector<float>
+adapter_values_(const fs::path& p)
+{
+  std::vector<float> v;
+  std::shared_ptr<genai::WeightSet> ws = genai::WeightSet::open(p.string(),
+                                                                nullptr);
+  if (!ws) { return v; }
+  std::vector<std::string> names = ws->src().tensor_names();
+  std::sort(names.begin(), names.end());
+  for (const std::string& n : names) {
+    const auto* info = ws->src().info(n);
+    std::vector<std::uint8_t> raw(info->nbytes);
+    if (!ws->src().read_into(n, raw.data(), raw.size())) { return {}; }
+    const auto* s16 = reinterpret_cast<const std::uint16_t*>(raw.data());
+    for (std::size_t i = 0; i < raw.size() / 2; ++i) {
+      v.push_back(genai::train::bf16_to_f32(s16[i]));
+    }
+  }
+  return v;
+}
+
+}  // namespace
+
+// A RUN SPLIT ACROSS TWO RANKS trains the adapter the whole model does.
+// Rank 0 is the ordinary graph -- the dataset's encodes, the optimizer --
+// and rank 1 a train-lora stage alone, in a session of its own, over an
+// in-process transport: rank 0 hands it the encoded dataset and the run's
+// settings, and each loads its share of the synthetic H3 (a head and 256
+// rows). Against the same run unsplit:
+//   - both ranks report the same loss at every step (the residual stream
+//     is whole on each), within the split's rounding of the unsplit run's;
+//   - rank 0 writes the checkpoints and the final adapter, WHOLE -- bound
+//     by the model's own binder on every module -- close to the unsplit
+//     adapter; rank 1 writes none, its checkpoints beats beside rank 0's.
+TEST(train_lora, minimax_h3_trains_split_across_two_ranks)
+{
+  pin_h3_tuners_();
+  PairTransport2* tr = pair_transport2_();
+  tr->link.reset();
+  const fs::path root = fs::temp_directory_path() / "vpipe-ut-train-split";
+  fs::remove_all(root);
+  fs::create_directories(root);
+  const fs::path model = root / "h3-synthetic.safetensors";
+  ASSERT_TRUE(h3_synthetic::write_synthetic_(model));
+  H3Run whole;
+  whole.model = model;
+  whole.out = root / "whole";
+  whole.steps = 12;
+  whole.save_every = 6;
+  whole.preview_every = 6;
+  whole.run();
+  ASSERT_TRUE(whole.config_error.empty());
+
+  H3Run r0;
+  r0.model = model;
+  r0.out = root / "rank0";
+  r0.steps = 12;
+  r0.save_every = 6;
+  r0.preview_every = 6;
+  r0.tp = tp_of_(0);
+  std::vector<std::unique_ptr<BeatPayloadIntf>> c1, m1;
+  std::string e1;
+  std::thread t1([&]() {
+    follower_run_(model, root / "rank1", &c1, &m1, &e1);
+  });
+  r0.run();
+  t1.join();
+  ASSERT_TRUE(r0.config_error.empty());
+  ASSERT_TRUE(e1.empty());
+  std::printf("[train_lora] split: %zu / %zu metrics, %zu / %zu checkpoints "
+              "(whole %zu, %zu)\n", r0.metrics.size(), m1.size(),
+              r0.ckpts.size(), c1.size(), whole.metrics.size(),
+              whole.ckpts.size());
+  ASSERT_TRUE(r0.metrics.size() == 12 && m1.size() == 12 &&
+              whole.metrics.size() == 12);
+  if (r0.metrics.size() != 12 || m1.size() != 12) { return; }
+  double worst = 0.0;
+  bool alike = true;
+  for (std::size_t i = 0; i < 12; ++i) {
+    const double l0 = flex_of_(r0.metrics[i].get()).as_object()
+                          .at("loss").as_real(-1.0);
+    const double l1 = flex_of_(m1[i].get()).as_object()
+                          .at("loss").as_real(-2.0);
+    const double lw = flex_of_(whole.metrics[i].get()).as_object()
+                          .at("loss").as_real(-3.0);
+    alike = alike && l0 == l1;
+    worst = std::max(worst, std::fabs(l0 - lw) / std::max(lw, 1e-9));
+    if (i == 0 || i == 11) {
+      std::printf("[train_lora] split: step %zu loss %.5f (rank 1 %.5f), "
+                  "whole %.5f\n", i + 1, l0, l1, lw);
+    }
+  }
+  std::printf("[train_lora] split: the ranks' losses alike: %s; worst "
+              "against the whole run %.3e\n", alike ? "yes" : "NO", worst);
+  EXPECT_TRUE(alike);
+  EXPECT_TRUE(worst < 5e-2);
+  EXPECT_TRUE(fs::exists(r0.out / "ut-h3-000006.safetensors"));
+  EXPECT_TRUE(fs::exists(r0.out / "ut-h3.safetensors"));
+  EXPECT_TRUE(!fs::exists(root / "rank1" / "ut-h3.safetensors"));
+  EXPECT_TRUE(c1.size() == r0.ckpts.size());
+  const std::vector<float> a = adapter_values_(r0.out / "ut-h3.safetensors");
+  const std::vector<float> w = adapter_values_(whole.out / "ut-h3.safetensors");
+  ASSERT_TRUE(!a.empty() && a.size() == w.size());
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    num += ((double)a[i] - w[i]) * ((double)a[i] - w[i]);
+    den += (double)w[i] * w[i];
+  }
+  const double rel = std::sqrt(num / std::max(den, 1e-30));
+  // AdamW's first steps go by each gradient's sign, which the split's
+  // rounding flips where a gradient is near zero: the adapters part by a
+  // few percent where the losses agree to a fraction of one.
+  std::printf("[train_lora] split: the adapter after 12 steps, against the "
+              "whole run's: rel-L2 %.3e\n", rel);
+  EXPECT_TRUE(rel < 0.15);
+  // Previews ran on both ranks, the split forward's (rank 0's emitted).
+  EXPECT_TRUE(r0.previews.size() == whole.previews.size());
+  {
+    Session sess;
+    genai::MetalMiniMaxH3Transformer::Config cfg;
+    std::string err;
+    ASSERT_TRUE(genai::MetalMiniMaxH3Transformer::config_from_json(
+        model.string(), cfg, &err));
+    genai::MetalMiniMaxH3Transformer::LoraSpec sp;
+    sp.path = (r0.out / "ut-h3.safetensors").string();
+    auto m = genai::MetalMiniMaxH3Transformer::load(
+        model.string(), sess.metal_compute(), cfg, false, {sp});
+    ASSERT_TRUE(m != nullptr);
+    if (m != nullptr) { EXPECT_TRUE(m->lora_modules(0) == 3 * 4); }
+  }
+  fs::remove_all(root);
+}
+
+// A SPLIT RUN STOPPED on rank 0 stops on both, at the same step -- agreed
+// before the next one -- each saving its resume state there (rank 1
+// writing no adapter), and resumed on both it trains the adapter the
+// uninterrupted split run does, byte for byte.
+namespace {
+
+// A two-rank run stopped and resumed (the tests below): `data` a
+// data-parallel one (samples [1, 2]), else split.
+struct StopResume {
+  bool ok = false, follower_ok = true, no_final = false, no_rank1 = false;
+  int at0 = -1, at1 = -1, steps = 0;
+  std::size_t resumed = 0, resumed1 = 0;
+  bool identical = false;
+  // lose_newest: the states each rank kept after the stop, and the step
+  // the resumed run started from.
+  int kept0 = 0, kept1 = 0, older = -1, resumed_at = -1;
+};
+
+// `lose_newest`: stopped at the SECOND checkpoint, rank 1's newest state
+// then deleted -- its host gone between its peer's write and its own --
+// or, `cut`, its optimizer.bin cut short in place (a power cut before
+// its data reached the drive: the slot and its record whole-looking).
+StopResume
+stopped_resumes_(bool data, bool lose_newest = false, bool cut = false)
+{
+  StopResume out;
+  const char* what = data ? "data parallel" : "split";
+  auto par_of = [data](int rank) {
+    return data ? FlexData::from_json(
+                      "{\"rank\": " + std::to_string(rank) +
+                      ", \"ranks\": 2, \"samples\": [1, 2], "
+                      "\"transport\": \"ut-train-pair\"}")
+                : tp_of_(rank);
+  };
+  pin_h3_tuners_();
+  PairTransport2* tr = pair_transport2_();
+  const fs::path root = fs::temp_directory_path() /
+                      (data ? "vpipe-ut-train-dp-res" : "vpipe-ut-train-split-res");
+  fs::remove_all(root);
+  fs::create_directories(root);
+  const fs::path model = root / "h3-synthetic.safetensors";
+  if (!h3_synthetic::write_synthetic_(model)) { return out; }
+  const int kSteps = 24;
+  auto split = [&](const fs::path& out0, const fs::path& out1,
+                   const std::string& resume, bool stop, H3Run* r0,
+                   std::vector<std::unique_ptr<BeatPayloadIntf>>* m1) {
+    tr->link.reset();
+    r0->model = model;
+    r0->out = out0;
+    r0->steps = kSteps;
+    r0->save_every = 8;
+    r0->preview_every = -1;
+    r0->resume = resume;
+    if (data) {
+      r0->dp = par_of(0);
+    } else {
+      r0->tp = par_of(0);
+    }
+    if (stop) {
+      auto seen = std::make_shared<int>(0);
+      const int at = lose_newest ? 2 : 1;
+      r0->on_ckpt = [seen, at](PipelineRuntime* rt, const BeatPayloadIntf*) {
+        if (++*seen == at) { rt->pause(); }
+      };
+    }
+    std::vector<std::unique_ptr<BeatPayloadIntf>> c1;
+    std::string e1;
+    std::thread t([&]() {
+      follower_run_(model, out1, &c1, m1, &e1, resume,
+                    data ? "data_parallel" : "tensor_parallel",
+                    par_of(1));
+    });
+    r0->run();
+    t.join();
+    out.follower_ok = out.follower_ok && e1.empty();
+  };
+  H3Run a;
+  std::vector<std::unique_ptr<BeatPayloadIntf>> am1;
+  split(root / "a0", root / "a1", "never", false, &a, &am1);
+  if (!a.config_error.empty()) { return out; }
+
+  H3Run b;
+  std::vector<std::unique_ptr<BeatPayloadIntf>> bm1;
+  split(root / "b0", root / "b1", "auto", true, &b, &bm1);
+  // Rank 1's state is named for its rank (two hosts may share a folder).
+  auto step_of = [](const fs::path& dir, const char* leaf = "ut-h3.resume") {
+    std::ifstream in(dir / leaf / "run.json");
+    if (!in) { return -1; }
+    FlexData run = FlexData::from_json(in);
+    return (int)run.as_object().at("step").as_int(-1);
+  };
+  const int at0 = step_of(root / "b0"),
+            at1 = step_of(root / "b1", "ut-h3.rank1.resume");
+  std::printf("[train_lora] %s stopped: rank 0 at step %d, rank 1 at %d "
+              "(%zu / %zu metrics)\n", what, at0, at1, b.metrics.size(),
+              bm1.size());
+  out.at0 = at0;
+  out.at1 = at1;
+  out.steps = kSteps;
+  out.no_final = !fs::exists(root / "b0" / "ut-h3.safetensors");
+  out.no_rank1 = !fs::exists(root / "b1" / "ut-h3-000008.safetensors");
+  if (!(at0 > 0 && at0 < kSteps && at0 == at1)) { return out; }
+  // The steps of the states a rank kept, newest first.
+  auto kept = [](const fs::path& dir) {
+    std::vector<int> v;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      const std::string n = e.path().filename().string();
+      if (e.is_directory() && n.rfind("step-", 0) == 0) {
+        v.push_back(std::atoi(n.c_str() + 5));
+      }
+    }
+    std::sort(v.rbegin(), v.rend());
+    return v;
+  };
+  const fs::path r1 = root / "b1" / "ut-h3.rank1.resume";
+  const std::vector<int> k0 = kept(root / "b0" / "ut-h3.resume"),
+                         k1 = kept(r1);
+  out.kept0 = (int)k0.size();
+  out.kept1 = (int)k1.size();
+  if (lose_newest) {
+    if (k1.size() < 2 || k1[0] != at1) { return out; }
+    // Rank 1 never wrote its newest: that state gone, its record the
+    // one before's.
+    char sn[32];
+    std::snprintf(sn, sizeof sn, "step-%06d", k1[0]);
+    if (cut) {
+      fs::resize_file(r1 / sn / "optimizer.bin", 100);
+    } else {
+      fs::remove_all(r1 / sn);
+      std::snprintf(sn, sizeof sn, "step-%06d", k1[1]);
+      fs::copy_file(r1 / sn / "run.json", r1 / "run.json",
+                    fs::copy_options::overwrite_existing);
+    }
+    out.older = k1[1];
+  }
+
+  H3Run c;
+  std::vector<std::unique_ptr<BeatPayloadIntf>> cm1;
+  split(root / "b0", root / "b1", "auto", false, &c, &cm1);
+  std::printf("[train_lora] %s resumed: %zu / %zu steps\n", what,
+              c.metrics.size(), cm1.size());
+  out.resumed = c.metrics.size();
+  out.resumed1 = cm1.size();
+  for (const std::string& w : c.said) {
+    // The ranks' warning when they go back from their newest.
+    const auto k = w.find("resuming at ");
+    if (k != std::string::npos) {
+      out.resumed_at = std::atoi(w.c_str() + k + 12);
+    }
+  }
+  const std::vector<char> fa = bytes_of_(root / "a0" / "ut-h3.safetensors");
+  const std::vector<char> fc = bytes_of_(root / "b0" / "ut-h3.safetensors");
+  std::printf("[train_lora] %s: uninterrupted %zu bytes, stopped and "
+              "resumed %zu, %s\n", what, fa.size(), fc.size(),
+              fa == fc ? "IDENTICAL" : "DIFFERENT");
+  out.identical = !fa.empty() && fa == fc;
+  out.ok = true;
+  fs::remove_all(root);
+  return out;
+}
+
+}  // namespace
+
+TEST(train_lora, minimax_h3_a_split_run_stopped_resumes_on_both_ranks)
+{
+  const StopResume r = stopped_resumes_(false);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(r.follower_ok && r.no_final && r.no_rank1);
+  EXPECT_TRUE(r.at0 == r.at1);
+  EXPECT_TRUE((int)r.resumed == r.steps - r.at0 && r.resumed1 == r.resumed);
+  EXPECT_TRUE(r.identical);
+}
+
+// A RANK THAT DIED between its peer's write and its own: each keeps its
+// last two states, and the ranks resume at the newest step BOTH hold --
+// one checkpoint back, not the start -- rank 0's newer state let go, the
+// adapter byte for byte the uninterrupted run's.
+TEST(train_lora, minimax_h3_a_split_run_resumes_at_the_newest_step_both_hold)
+{
+  const StopResume r = stopped_resumes_(false, true);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(r.follower_ok && r.at0 == r.at1 && r.at0 > 8);
+  EXPECT_TRUE(r.kept0 == 2 && r.kept1 == 2);
+  EXPECT_TRUE(r.older > 0 && r.older < r.at0 && r.resumed_at == r.older);
+  EXPECT_TRUE((int)r.resumed == r.steps - r.older &&
+              r.resumed1 == r.resumed);
+  EXPECT_TRUE(r.identical);
+}
+
+// ...and one whose newest optimizer.bin is CUT SHORT where it lies: that
+// state is not offered at the agreement (it does not load), so the
+// ranks agree on the step before -- not on a state one of them fails to
+// read at every restart.
+TEST(train_lora, minimax_h3_a_split_run_resumes_past_a_rank_s_cut_state)
+{
+  const StopResume r = stopped_resumes_(false, true, true);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(r.follower_ok && r.at0 == r.at1 && r.at0 > 8);
+  EXPECT_TRUE(r.older > 0 && r.older < r.at0 && r.resumed_at == r.older);
+  EXPECT_TRUE((int)r.resumed == r.steps - r.older &&
+              r.resumed1 == r.resumed);
+  EXPECT_TRUE(r.identical);
+}
+
+// A DATA-PARALLEL RUN stopped resumes on both ranks alike: the same
+// agreement before each step, each rank's resume state (rank 1 writing
+// no adapter), the adapter byte for byte the uninterrupted run's.
+TEST(train_lora, minimax_h3_a_data_parallel_run_stopped_resumes)
+{
+  const StopResume r = stopped_resumes_(true);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(r.follower_ok && r.no_final && r.no_rank1);
+  EXPECT_TRUE(r.at0 == r.at1);
+  EXPECT_TRUE((int)r.resumed == r.steps - r.at0 && r.resumed1 == r.resumed);
+  EXPECT_TRUE(r.identical);
+}
+
+// A DATA-PARALLEL RUN is the one-host run whose batch is both ranks'
+// samples. Two ranks, each the whole synthetic H3 in a session of its
+// own over the in-process transport, rank 0 one sample a step and rank 1
+// two (samples [1, 2]), against one host's run at batch_size 3 -- the
+// same samples, noise and sigmas, every one keyed by its place in the
+// step:
+//   - both ranks report the same loss every step -- the step's, summed
+//     across them -- and the one-host run's within float rounding (its
+//     three gradients summed on the GPU, theirs a two and a one summed
+//     after);
+//   - rank 0 writes the checkpoints and the adapter, rank 1 none; the
+//     adapter the one-host run's to the same rounding;
+//   - previews are rank 0's alone.
+TEST(train_lora, minimax_h3_trains_data_parallel_across_two_ranks)
+{
+  pin_h3_tuners_();
+  PairTransport2* tr = pair_transport2_();
+  tr->link.reset();
+  const fs::path root = fs::temp_directory_path() / "vpipe-ut-train-dp";
+  fs::remove_all(root);
+  fs::create_directories(root);
+  const fs::path model = root / "h3-synthetic.safetensors";
+  ASSERT_TRUE(h3_synthetic::write_synthetic_(model));
+  H3Run whole;
+  whole.model = model;
+  whole.out = root / "whole";
+  whole.steps = 8;
+  whole.save_every = 4;
+  whole.preview_every = 4;
+  whole.batch = 3;
+  whole.run();
+  ASSERT_TRUE(whole.config_error.empty());
+
+  auto dp_of = [](int rank) {
+    return FlexData::from_json(
+        "{\"rank\": " + std::to_string(rank) +
+        ", \"ranks\": 2, \"samples\": [1, 2], "
+        "\"transport\": \"ut-train-pair\"}");
+  };
+  H3Run r0;
+  r0.model = model;
+  r0.out = root / "rank0";
+  r0.steps = 8;
+  r0.save_every = 4;
+  r0.preview_every = 4;
+  r0.dp = dp_of(0);
+  std::vector<std::unique_ptr<BeatPayloadIntf>> c1, m1;
+  std::string e1;
+  std::thread t1([&]() {
+    follower_run_(model, root / "rank1", &c1, &m1, &e1, "never",
+                  "data_parallel", dp_of(1));
+  });
+  r0.run();
+  t1.join();
+  ASSERT_TRUE(r0.config_error.empty());
+  ASSERT_TRUE(e1.empty());
+  std::printf("[train_lora] data parallel: %zu / %zu metrics, %zu / %zu "
+              "checkpoints, %zu previews (whole %zu, %zu, %zu)\n",
+              r0.metrics.size(), m1.size(), r0.ckpts.size(), c1.size(),
+              r0.previews.size(), whole.metrics.size(), whole.ckpts.size(),
+              whole.previews.size());
+  ASSERT_TRUE(r0.metrics.size() == 8 && m1.size() == 8 &&
+              whole.metrics.size() == 8);
+  if (r0.metrics.size() != 8 || m1.size() != 8) { return; }
+  double worst = 0.0;
+  bool alike = true;
+  for (std::size_t i = 0; i < 8; ++i) {
+    const double l0 = flex_of_(r0.metrics[i].get()).as_object()
+                          .at("loss").as_real(-1.0);
+    const double l1 = flex_of_(m1[i].get()).as_object()
+                          .at("loss").as_real(-2.0);
+    const double lw = flex_of_(whole.metrics[i].get()).as_object()
+                          .at("loss").as_real(-3.0);
+    alike = alike && l0 == l1;
+    worst = std::max(worst, std::fabs(l0 - lw) / std::max(lw, 1e-9));
+    if (i == 0 || i == 7) {
+      std::printf("[train_lora] data parallel: step %zu loss %.6f (rank 1 "
+                  "%.6f), one host %.6f\n", i + 1, l0, l1, lw);
+    }
+  }
+  std::printf("[train_lora] data parallel: the ranks' losses alike: %s; "
+              "worst against one host %.3e\n", alike ? "yes" : "NO", worst);
+  EXPECT_TRUE(alike);
+  EXPECT_TRUE(worst < 2e-3);
+  EXPECT_TRUE(fs::exists(r0.out / "ut-h3-000004.safetensors"));
+  EXPECT_TRUE(fs::exists(r0.out / "ut-h3.safetensors"));
+  EXPECT_TRUE(!fs::exists(root / "rank1" / "ut-h3.safetensors"));
+  EXPECT_TRUE(r0.previews.size() == whole.previews.size());
+  const std::vector<float> a = adapter_values_(r0.out / "ut-h3.safetensors");
+  const std::vector<float> w = adapter_values_(whole.out / "ut-h3.safetensors");
+  ASSERT_TRUE(!a.empty() && a.size() == w.size());
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    num += ((double)a[i] - w[i]) * ((double)a[i] - w[i]);
+    den += (double)w[i] * w[i];
+  }
+  const double rel = std::sqrt(num / std::max(den, 1e-30));
+  std::printf("[train_lora] data parallel: the adapter after 8 steps, "
+              "against one host's at batch 3: rel-L2 %.3e\n", rel);
+  EXPECT_TRUE(rel < 5e-2);
+  fs::remove_all(root);
+}
+
+// ---- a two-rank run's failure paths ----------------------------------------
+//
+// Each pairs rank 0 (H3Run) with a follower over the in-process transport,
+// whose channel let go releases the peer's waits at once, as TpChannel
+// asks of a transport. What these hold: a rank that fails ends the run on
+// BOTH, promptly -- the other's exchange returns and it fails too, never
+// waiting out a transport's timeout -- and two ranks not set up as one
+// run are refused on both before anything trains.
+namespace {
+
+struct PairResult {
+  H3Run r0;
+  std::vector<std::unique_ptr<BeatPayloadIntf>> c1, m1;
+  std::string e1;
+  std::vector<std::string> said1;
+  double seconds = 0.0;
+};
+
+bool
+said_(const std::vector<std::string>& said, const std::string& what)
+{
+  for (const std::string& s : said) {
+    if (s.find(what) != std::string::npos) { return true; }
+  }
+  return false;
+}
+
+// `data`: data parallel (samples [1, 2]) else split; `par1` rank 1's own
+// configuration where it differs (the key `key1`); `model1` rank 1's DiT
+// where it is not rank 0's.
+void
+pair_run_(const fs::path& root, bool data, PairResult* out, int steps,
+          const std::string& resume0 = "never",
+          const std::string& resume1 = "never",
+          FlexData par0 = FlexData(), FlexData par1 = FlexData(),
+          const char* key1 = nullptr, const fs::path& model1 = {})
+{
+  auto par_of = [data](int rank) {
+    return FlexData::from_json(
+        "{\"rank\": " + std::to_string(rank) + ", \"ranks\": 2, " +
+        (data ? std::string("\"samples\": [1, 2], ") : std::string()) +
+        "\"check_every\": 4, \"transport\": \"ut-train-pair\"}");
+  };
+  PairTransport2* tr = pair_transport2_();
+  tr->link.reset();
+  const fs::path model = root / "h3-synthetic.safetensors";
+  out->r0.model = model;
+  out->r0.out = root / "r0";
+  out->r0.steps = steps;
+  out->r0.resume = resume0;
+  if (!par0.is_object()) { par0 = par_of(0); }
+  if (!par1.is_object()) { par1 = par_of(1); }
+  if (data) {
+    out->r0.dp = par0;
+  } else {
+    out->r0.tp = par0;
+  }
+  const char* k1 = key1 != nullptr ? key1
+                                   : data ? "data_parallel"
+                                          : "tensor_parallel";
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread t([&]() {
+    follower_run_(model1.empty() ? model : model1, root / "r1", &out->c1,
+                  &out->m1, &out->e1, resume1, k1, par1, &out->said1);
+  });
+  out->r0.run();
+  t.join();
+  out->seconds = std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t0).count();
+}
+
+fs::path
+pair_root_(const char* name)
+{
+  const fs::path root = fs::temp_directory_path() / name;
+  fs::remove_all(root);
+  fs::create_directories(root);
+  if (!h3_synthetic::write_synthetic_(root / "h3-synthetic.safetensors")) {
+    return {};
+  }
+  return root;
+}
+
+// What both ranks said, for a failed test to show.
+void
+show_(const char* what, const PairResult& r)
+{
+  std::printf("[train_lora] %s: %zu / %zu metrics in %.1f s\n", what,
+              r.r0.metrics.size(), r.m1.size(), r.seconds);
+  for (const std::string& s : r.r0.said) {
+    std::printf("[train_lora]   rank 0: %s\n", s.substr(0, 240).c_str());
+  }
+  for (const std::string& s : r.said1) {
+    std::printf("[train_lora]   rank 1: %s\n", s.substr(0, 240).c_str());
+  }
+}
+
+}  // namespace
+
+// TWO RANKS NOT SET UP AS ONE RUN are refused at the handshake, on both,
+// naming what differs: shares that do not tile the model (rank 1 given
+// feed-forward rows rank 0 also holds), and one rank split while the
+// other runs data parallel.
+TEST(train_lora, two_ranks_not_set_up_as_one_run_are_refused)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-hs");
+  ASSERT_TRUE(!root.empty());
+  {
+    PairResult r;
+    pair_run_(root, false, &r, 4, "never", "never", FlexData(),
+              FlexData::from_json(
+                  "{\"rank\": 1, \"ranks\": 2, \"ffn\": [0, 1], "
+                  "\"check_every\": 4, \"transport\": \"ut-train-pair\"}"));
+    show_("shares that do not tile", r);
+    EXPECT_TRUE(r.r0.metrics.empty() && r.m1.empty());
+    EXPECT_TRUE(said_(r.r0.said, "do not tile"));
+    EXPECT_TRUE(said_(r.said1, "do not tile"));
+  }
+  {
+    PairResult r;
+    pair_run_(root, false, &r, 4, "never", "never", FlexData(),
+              FlexData::from_json(
+                  "{\"rank\": 1, \"ranks\": 2, \"samples\": [1, 1], "
+                  "\"check_every\": 4, \"transport\": \"ut-train-pair\"}"),
+              "data_parallel");
+    show_("split against data parallel", r);
+    EXPECT_TRUE(r.r0.metrics.empty() && r.m1.empty());
+    EXPECT_TRUE(said_(r.r0.said, "not configured as one run"));
+    EXPECT_TRUE(said_(r.said1, "not configured as one run"));
+  }
+  fs::remove_all(root);
+}
+
+// THE DiT TWO RANKS HOLD, told by its data as well as its headers:
+// MiniMax H3's FL2VA and Ref2VA DiTs have byte-identical safetensors
+// headers, so a rank on one and a rank on the other passed a check of
+// headers alone and trained a model of two halves, whose shared factors
+// stay alike (no check catches it later). Rank 1 on a TWIN of the
+// synthetic DiT -- its first weight's low byte changed, the header the
+// same -- is refused on both ranks, naming the DiT; on a COPY under
+// another name the pair trains.
+TEST(train_lora, a_split_run_tells_two_dits_of_one_header_apart)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-twin");
+  ASSERT_TRUE(!root.empty());
+  const fs::path src = root / "h3-synthetic.safetensors";
+  const fs::path copy = root / "h3-copy.safetensors";
+  const fs::path twin = root / "h3-twin.safetensors";
+  std::error_code ec;
+  fs::copy_file(src, copy, ec);
+  ASSERT_TRUE(!ec);
+  fs::copy_file(src, twin, ec);
+  ASSERT_TRUE(!ec);
+  {
+    // The data's first byte: a little-endian bf16 or f32 value's lowest
+    // mantissa bit, so the weight stays a finite number.
+    std::fstream f(twin, std::ios::in | std::ios::out | std::ios::binary);
+    std::uint64_t len = 0;
+    f.read(reinterpret_cast<char*>(&len), 8);
+    char c = 0;
+    f.seekg((std::streamoff)(8 + len));
+    f.read(&c, 1);
+    c = (char)(c ^ 0x01);
+    f.seekp((std::streamoff)(8 + len));
+    f.write(&c, 1);
+    ASSERT_TRUE((bool)f);
+  }
+  {
+    PairResult r;
+    pair_run_(root, false, &r, 4, "never", "never", FlexData(), FlexData(),
+              nullptr, twin);
+    show_("rank 1 on a twin of one header", r);
+    EXPECT_TRUE(r.r0.metrics.empty() && r.m1.empty());
+    EXPECT_TRUE(said_(r.r0.said, "checkpoints differ"));
+    EXPECT_TRUE(said_(r.said1, "checkpoints differ"));
+  }
+  {
+    PairResult r;
+    pair_run_(root, false, &r, 4, "never", "never", FlexData(), FlexData(),
+              nullptr, copy);
+    show_("rank 1 on a copy", r);
+    EXPECT_TRUE(r.r0.metrics.size() == 4 && r.m1.size() == 4);
+  }
+  fs::remove_all(root);
+}
+
+// ADAMW8BIT codes its moments in blocks of 256 of the arena: a share
+// that puts a shared factor and a cut one in one block (rank 4 x 100
+// feed-forward rows) is refused, on both ranks; the even share -- every
+// factor on a block's edge -- trains, the ranks' shared factors alike at
+// every check (check_every 4: a digest of them in the step's agreement).
+TEST(train_lora, a_split_run_on_adamw8bit_keeps_its_shared_factors_alike)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-a8");
+  ASSERT_TRUE(!root.empty());
+  {
+    PairResult r;
+    r.r0.optimizer = "adamw8bit";
+    pair_run_(root, false, &r, 4, "never", "never",
+              FlexData::from_json(
+                  "{\"rank\": 0, \"ranks\": 2, \"ffn\": [0, 100], "
+                  "\"check_every\": 4, \"transport\": \"ut-train-pair\"}"),
+              FlexData::from_json(
+                  "{\"rank\": 1, \"ranks\": 2, \"ffn\": [100, 512], "
+                  "\"check_every\": 4, \"transport\": \"ut-train-pair\"}"));
+    show_("adamw8bit, a misaligned share", r);
+    EXPECT_TRUE(r.r0.metrics.empty() && r.m1.empty());
+    EXPECT_TRUE(said_(r.r0.said, "adamw8bit codes its moments"));
+    EXPECT_TRUE(said_(r.said1, "adamw8bit codes its moments"));
+  }
+  {
+    PairResult r;
+    r.r0.optimizer = "adamw8bit";
+    r.r0.save_every = 6;
+    pair_run_(root, false, &r, 12);
+    show_("adamw8bit, the even share", r);
+    ASSERT_TRUE(r.r0.metrics.size() == 12 && r.m1.size() == 12);
+    bool alike = true;
+    for (std::size_t i = 0; i < 12; ++i) {
+      alike = alike && flex_of_(r.r0.metrics[i].get()).as_object()
+                               .at("loss").as_real(-1.0) ==
+                           flex_of_(r.m1[i].get()).as_object()
+                               .at("loss").as_real(-2.0);
+    }
+    EXPECT_TRUE(alike);
+    EXPECT_TRUE(fs::exists(r.r0.out / "ut-h3.safetensors"));
+  }
+  fs::remove_all(root);
+}
+
+// A RANK THAT FAILS MID-RUN (VPIPE_TRAIN_FAULT: rank 1 at step 5) lets go
+// of its channel as it fails, so the other rank -- inside its next
+// exchange -- fails too at once: both end in seconds, not at a
+// transport's timeout (the test transport's is 120 s). Split and data
+// parallel.
+TEST(train_lora, a_rank_failing_mid_run_ends_the_run_on_both)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-fault");
+  ASSERT_TRUE(!root.empty());
+  ::setenv("VPIPE_TRAIN_FAULT", "1:5:step", 1);
+  for (const bool data : {false, true}) {
+    PairResult r;
+    pair_run_(root, data, &r, 12);
+    show_(data ? "data parallel, rank 1 failing" : "split, rank 1 failing",
+          r);
+    EXPECT_TRUE(r.seconds < 60.0);
+    EXPECT_TRUE(r.r0.metrics.size() == 5 && r.m1.size() == 5);
+    EXPECT_TRUE(!fs::exists(r.r0.out / "ut-h3.safetensors"));
+    EXPECT_TRUE(said_(r.said1, "an injected fault"));
+    EXPECT_TRUE(!r.r0.said.empty());
+  }
+  ::unsetenv("VPIPE_TRAIN_FAULT");
+  fs::remove_all(root);
+}
+
+// A SPLIT RUN'S PREVIEW FAILING on one rank (rank 1's, at step 6) ends the
+// run on both: the ranks' preview forwards are one forward, and a rank
+// that went on would pair its next exchange with the other's preview.
+TEST(train_lora, a_preview_failing_on_one_rank_ends_the_split_run)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-pvfault");
+  ASSERT_TRUE(!root.empty());
+  ::setenv("VPIPE_TRAIN_FAULT", "1:6:preview", 1);
+  PairResult r;
+  r.r0.preview_every = 6;
+  pair_run_(root, false, &r, 12);
+  ::unsetenv("VPIPE_TRAIN_FAULT");
+  show_("split, rank 1's preview failing", r);
+  EXPECT_TRUE(r.seconds < 60.0);
+  EXPECT_TRUE(r.r0.metrics.size() == 6 && r.m1.size() == 6);
+  EXPECT_TRUE(said_(r.said1, "a preview failed"));
+  EXPECT_TRUE(!r.r0.said.empty());
+  EXPECT_TRUE(!fs::exists(r.r0.out / "ut-h3.safetensors"));
+  fs::remove_all(root);
+}
+
+// RANKS THAT PART -- one's copy of what both hold nudged at step 3, as a
+// GPU whose arithmetic differs would -- are caught at the next check
+// (step 4), on both, split and data parallel.
+TEST(train_lora, ranks_that_part_are_caught_at_the_next_check)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-part");
+  ASSERT_TRUE(!root.empty());
+  ::setenv("VPIPE_TRAIN_FAULT", "1:3:part", 1);
+  for (const bool data : {false, true}) {
+    PairResult r;
+    pair_run_(root, data, &r, 12);
+    show_(data ? "data parallel, parted" : "split, parted", r);
+    EXPECT_TRUE(r.r0.metrics.size() == 4 && r.m1.size() == 4);
+    EXPECT_TRUE(said_(r.r0.said, "no longer hold the same"));
+    EXPECT_TRUE(said_(r.said1, "no longer hold the same"));
+  }
+  ::unsetenv("VPIPE_TRAIN_FAULT");
+  fs::remove_all(root);
+}
+
+// NO STATE IS WRITTEN PARTED, and a pair that parts at once is told at
+// once. Rank 1 nudged at step 5, a checkpoint due at step 6 (check_every
+// 4, so no digest rides that agreement): the digests are compared before
+// it is written, and neither the adapter nor a resume state is. Nudged at
+// step 0, the run's second agreement (its first update) catches it.
+// Split and data parallel.
+TEST(train_lora, a_parted_run_writes_no_state_and_is_caught_at_once)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-part-save");
+  ASSERT_TRUE(!root.empty());
+  for (const bool data : {false, true}) {
+    ::setenv("VPIPE_TRAIN_FAULT", "1:5:part", 1);
+    PairResult r;
+    r.r0.save_every = 6;
+    pair_run_(root, data, &r, 12);
+    ::unsetenv("VPIPE_TRAIN_FAULT");
+    show_(data ? "data parallel, parted before a checkpoint"
+               : "split, parted before a checkpoint", r);
+    EXPECT_TRUE(r.r0.metrics.size() == 6 && r.m1.size() == 6);
+    EXPECT_TRUE(said_(r.r0.said, "no longer hold the same"));
+    EXPECT_TRUE(said_(r.said1, "no longer hold the same"));
+    EXPECT_TRUE(!fs::exists(r.r0.out / "ut-h3-000006.safetensors"));
+    EXPECT_TRUE(!fs::exists(r.r0.out / "ut-h3.resume" / "run.json"));
+    EXPECT_TRUE(!fs::exists(root / "r1" / "ut-h3.rank1.resume" /
+                            "run.json"));
+    fs::remove_all(root / "r0");
+    fs::remove_all(root / "r1");
+
+    ::setenv("VPIPE_TRAIN_FAULT", "1:0:part", 1);
+    PairResult q;
+    pair_run_(root, data, &q, 12);
+    ::unsetenv("VPIPE_TRAIN_FAULT");
+    show_(data ? "data parallel, parted at step 0"
+               : "split, parted at step 0", q);
+    EXPECT_TRUE(q.r0.metrics.size() == 1 && q.m1.size() == 1);
+    EXPECT_TRUE(said_(q.r0.said, "no longer hold the same"));
+    fs::remove_all(root / "r0");
+    fs::remove_all(root / "r1");
+  }
+  fs::remove_all(root);
+}
+
+// `resume: never` ON ONE RANK only: both start over, in step -- every
+// rank exchanges its resume step whatever its own setting -- and the run
+// trains the adapter an uninterrupted one does, byte for byte.
+TEST(train_lora, resume_never_on_one_rank_starts_both_over)
+{
+  pin_h3_tuners_();
+  const fs::path root = pair_root_("vpipe-ut-train-never");
+  ASSERT_TRUE(!root.empty());
+  PairResult a;
+  a.r0.save_every = 4;
+  pair_run_(root, false, &a, 8);
+  ASSERT_TRUE(a.r0.metrics.size() == 8);
+  const std::vector<char> whole = bytes_of_(a.r0.out / "ut-h3.safetensors");
+  fs::remove_all(root / "r0");
+  fs::remove_all(root / "r1");
+  // Stopped at its first checkpoint: both hold a resume state.
+  PairResult b;
+  b.r0.save_every = 4;
+  b.r0.on_ckpt = [](PipelineRuntime* rt, const BeatPayloadIntf*) {
+    rt->pause();
+  };
+  pair_run_(root, false, &b, 8, "auto", "auto");
+  const bool both = fs::exists(root / "r0" / "ut-h3.resume" / "run.json") &&
+                    fs::exists(root / "r1" / "ut-h3.rank1.resume" /
+                               "run.json");
+  std::printf("[train_lora] stopped at %zu steps; both hold a resume "
+              "state: %s\n", b.r0.metrics.size(), both ? "yes" : "NO");
+  ASSERT_TRUE(both && b.r0.metrics.size() < 8);
+  PairResult c;
+  c.r0.save_every = 4;
+  pair_run_(root, false, &c, 8, "auto", "never");
+  show_("rank 0 auto, rank 1 never", c);
+  EXPECT_TRUE(c.r0.metrics.size() == 8 && c.m1.size() == 8);
+  EXPECT_TRUE(said_(c.r0.said, "starting over"));
+  const std::vector<char> again = bytes_of_(c.r0.out / "ut-h3.safetensors");
+  std::printf("[train_lora] started over: %s the uninterrupted run's\n",
+              !whole.empty() && whole == again ? "IDENTICAL to"
+                                               : "DIFFERENT from");
+  EXPECT_TRUE(!whole.empty() && whole == again);
   fs::remove_all(root);
 }

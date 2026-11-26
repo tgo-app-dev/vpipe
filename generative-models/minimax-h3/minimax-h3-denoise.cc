@@ -497,8 +497,11 @@ denoise(const DenoiseRequest& req, std::string* err)
                            "projections per step", berr));
     }
     // A rank of a split DiT holds no AdaLN projection (load() leaves it
-    // in the checkpoint): its modulation is the bake's or nothing.
-    if (!baked && req.dit->config().tp.active()) {
+    // in the checkpoint): its modulation is the bake's -- or, PRUNED (a
+    // pruned checkpoint, or a split training run's, pruned at load), its
+    // curve's, which runs any schedule unbaked.
+    if (!baked && req.dit->config().tp.active() &&
+        !req.dit->config().pruned()) {
       return fail("denoise: a rank of a split DiT needs the AdaLN bake ("
                   + berr + ")");
     }

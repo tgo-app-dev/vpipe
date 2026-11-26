@@ -74,6 +74,16 @@ inline constexpr int kQkInt8Constant = 306;
 // is false on a host that predates them.
 inline constexpr int kPvInt8Constant = 308;
 inline constexpr int kQTokenScaleConstant = 310;
+// ...and for an attention WITH SINKS (302), the sink shifted as the keys
+// were: smoothing K moves every key's score in a row by -q.mean, which
+// softmax over the keys alone does not see but a sink's logit does. Set it
+// through MetalSageAttention::sink_constants (it follows smooth_k: K's
+// mean, read at buffer 22, which bind() binds, is written only by a
+// smoothing prepare()). Optional in the kernel contract (kAttnSinkShift):
+// a kernel that predates it does not declare it, reads it as false and
+// its sinks wrong, so an attention with sinks takes Sage only where
+// MetalSageAttention::sinks_available() says so.
+inline constexpr int kSinkShiftConstant = 311;
 
 struct Config {
   bool enabled = false;

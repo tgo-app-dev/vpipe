@@ -24,7 +24,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1451,4 +1453,208 @@ TEST(metal_sage_attention, a_reservation_covers_smaller_calls)
   EXPECT_TRUE(plain_big == size_of(big, false));
   EXPECT_TRUE(plain_small == size_of(small, false));
   EXPECT_TRUE(plain->scratch_builds() == 2);
+}
+
+namespace {
+
+// Attention in double with a SINK: a logit of its own in the denominator,
+// holding no V (MAGI-2's preview DiT, constant 302).
+std::vector<double> ref_sink_(const std::vector<float>& q,
+                              const std::vector<float>& k,
+                              const std::vector<float>& v, int h, int tokens,
+                              double scale, double sink)
+{
+  std::vector<double> out((std::size_t)tokens * kD, 0.0);
+  std::vector<double> s((std::size_t)tokens);
+  const std::size_t base = (std::size_t)h * tokens * kD;
+  for (int i = 0; i < tokens; ++i) {
+    double m = sink;
+    for (int j = 0; j < tokens; ++j) {
+      double d = 0.0;
+      for (int c = 0; c < kD; ++c) {
+        d += (double)q[base + (std::size_t)i * kD + c] *
+             (double)k[base + (std::size_t)j * kD + c];
+      }
+      s[(std::size_t)j] = d * scale;
+      m = m > s[(std::size_t)j] ? m : s[(std::size_t)j];
+    }
+    double z = std::exp(sink - m);
+    for (int j = 0; j < tokens; ++j) {
+      s[(std::size_t)j] = std::exp(s[(std::size_t)j] - m);
+      z += s[(std::size_t)j];
+    }
+    for (int j = 0; j < tokens; ++j) {
+      const double w = s[(std::size_t)j] / z;
+      for (int c = 0; c < kD; ++c) {
+        out[(std::size_t)i * kD + c] +=
+            w * (double)v[base + (std::size_t)j * kD + c];
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+// AN ATTENTION WITH SINKS (302) through the driver, and the gate in front
+// of it. sinks_available() is this host's answer (the contract's optional
+// sage_sinks_marker); under VPIPE_SAGE_NO_SINKS=1 it reads as an older
+// host's, where load_for_model(..., with_sinks) declines -- null, not
+// fatal -- and without with_sinks loads as ever. Then the attention:
+// sink_constants() sets 311 EXACTLY when the keys were smoothed, scored
+// against f64 for smoothing on and off, the int8 QK alone and with its
+// P*V. The smoothing-on arms run first, so K's mean is left in the
+// driver's scratch: a function built with 311 regardless (the mutation
+// arm) then shifts the sinks by a mean the unsmoothed keys never lost,
+// and must read worse than the arm built as sink_constants() says.
+TEST(metal_sage_attention, an_attention_with_sinks_passes_the_gate)
+{
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  if (!MetalSageAttention::available(mc)) { return; }
+  const int bq = MetalSageAttention::nax_query_block();
+  const int bk = MetalSageAttention::nax_key_block();
+  std::string err;
+
+  // ---- the gate
+  sage::Config cfg;
+  cfg.enabled = true;
+  {
+    std::unique_ptr<MetalSageAttention> s =
+        MetalSageAttention::load(mc, /*bf16=*/false, &err);
+    ASSERT_TRUE(s != nullptr && s->sinks_available());
+    bool fatal = true;
+    EXPECT_TRUE(MetalSageAttention::load_for_model(mc, false, cfg, "test",
+                                                   &fatal, true) != nullptr);
+    EXPECT_TRUE(!fatal);
+    ::setenv("VPIPE_SAGE_NO_SINKS", "1", 1);
+    std::unique_ptr<MetalSageAttention> old =
+        MetalSageAttention::load(mc, /*bf16=*/false, &err);
+    const bool old_sinks = old != nullptr && old->sinks_available();
+    const bool old_pv8 = old != nullptr && old->pv8_available();
+    fatal = true;
+    const bool declined = MetalSageAttention::load_for_model(
+                              mc, false, cfg, "test", &fatal, true) ==
+                          nullptr;
+    const bool declined_fatal = fatal;
+    const bool plain = MetalSageAttention::load_for_model(
+                           mc, false, cfg, "test", &fatal, false) != nullptr;
+    ::unsetenv("VPIPE_SAGE_NO_SINKS");
+    std::printf("[sage-sinks] gate: here %d, an older host's %d (its P*V "
+                "%d); with sinks there declined %d (fatal %d), without "
+                "loaded %d\n", (int)s->sinks_available(), (int)old_sinks,
+                (int)old_pv8, (int)declined, (int)declined_fatal,
+                (int)plain);
+    EXPECT_TRUE(old != nullptr && !old_sinks && old_pv8);
+    EXPECT_TRUE(declined && !declined_fatal && plain);
+    for (const bool smooth : {true, false}) {
+      sage::Config c2 = cfg;
+      c2.smooth_k = smooth;
+      FunctionConstants a, b;
+      MetalSageAttention::sink_constants(a, c2);
+      b.set_bool(sage::kSinkShiftConstant, smooth);
+      EXPECT_TRUE(a.signature() == b.signature());
+    }
+  }
+
+  // ---- the attention
+  std::unique_ptr<MetalSageAttention> sage =
+      MetalSageAttention::load(mc, /*bf16=*/false, &err);
+  ASSERT_TRUE(sage != nullptr && sage->pv8_available());
+  if (!sage || !sage->pv8_available()) { return; }
+  const int H = 2, T = 1000;
+  const float sink[2] = {7.0f, 8.0f};
+  Rig r;
+  if (!r.init(mc, H, T)) { return; }
+  r.set_strides((std::int64_t)H * T * kD, (std::int64_t)T * kD, kD);
+  // force: -1 as sink_constants says, 0 / 1 that value regardless.
+  auto build = [&](const sage::Config& c, bool pv8, int force) {
+    FunctionConstants fc;
+    fc.set_bool(200, (T % bq) == 0).set_bool(201, (T % bk) == 0)
+        .set_bool(300, false).set_bool(301, false).set_bool(302, true)
+        .set_bool(303, false).set_bool(304, false).set_bool(305, false)
+        .set_bool(sage::kQkInt8Constant, true);
+    MetalSageAttention::sink_constants(fc, c);
+    if (force >= 0) { fc.set_bool(sage::kSinkShiftConstant, force == 1); }
+    MetalSageAttention::pv8_constants(fc, pv8);
+    return r.lib.function("attn_steel_nax_h_bd128", fc);
+  };
+  std::vector<float> q, k, v;
+  fill_(&q, &k, &v, H, T, 0x5157a001u);
+  const std::size_t n = (std::size_t)H * T * kD;
+  SharedBuffer qb = mc->make_shared_buffer(n * 2);
+  SharedBuffer kb = mc->make_shared_buffer(n * 2);
+  SharedBuffer vb = mc->make_shared_buffer(n * 2);
+  SharedBuffer ob = mc->make_shared_buffer(n * 2);
+  SharedBuffer sb = mc->make_shared_buffer((std::size_t)H * 2);
+  ASSERT_TRUE(!ob.empty() && !sb.empty());
+  if (ob.empty() || sb.empty()) { return; }
+  auto* qp = static_cast<std::uint16_t*>(qb.contents());
+  auto* kp = static_cast<std::uint16_t*>(kb.contents());
+  auto* vp = static_cast<std::uint16_t*>(vb.contents());
+  for (std::size_t i = 0; i < n; ++i) {
+    qp[i] = f2h_(q[i]); kp[i] = f2h_(k[i]); vp[i] = f2h_(v[i]);
+  }
+  auto* sp = static_cast<std::uint16_t*>(sb.contents());
+  for (int h = 0; h < H; ++h) { sp[h] = f2h_(sink[h]); }
+  std::vector<std::vector<double>> refs;
+  for (int h = 0; h < H; ++h) {
+    refs.push_back(ref_sink_(q, k, v, h, T, r.scale, (double)sink[h]));
+  }
+  // One arm: cosine against f64 over every head.
+  auto arm = [&](const sage::Config& c, bool pv8, int force) {
+    ComputeFunction f = build(c, pv8, force);
+    if (!f.valid()) { return -1.0; }
+    sage::Config sc = c;
+    sc.pv8 = pv8;
+    const MetalSageAttention::Operand qo{&qb, 0, kD, T * kD};
+    const MetalSageAttention::Operand ko{&kb, 0, kD, T * kD};
+    const MetalSageAttention::Operand vo{&vb, 0, kD, T * kD};
+    CommandStream st = mc->make_command_stream();
+    {
+      ComputeEncoder e = st.begin_compute();
+      if (!sage->prepare(e, qo, ko, H, H, T, T, kD, bq, bk, sc, &err,
+                         pv8 ? &vo : nullptr)) {
+        return -1.0;
+      }
+      e.set_function(f);
+      e.set_buffer(0, qb); e.set_buffer(1, kb); e.set_buffer(2, vb);
+      e.set_buffer(3, ob);
+      e.set_buffer(4, r.pb);
+      e.set_buffer(7, sb);
+      sage->bind(e);
+      e.dispatch({32u * (unsigned)r.fn_blocks(), 4u * (unsigned)H, 1},
+                 {32, 4, 1});
+    }
+    if (!st.commit().wait_ok(&err)) { return -1.0; }
+    const auto* o = static_cast<const std::uint16_t*>(ob.contents());
+    double cs = 0.0;
+    for (int h = 0; h < H; ++h) {
+      std::vector<double> got(refs[(std::size_t)h].size());
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        got[i] = (double)h2f_(o[(std::size_t)h * T * kD + i]);
+      }
+      cs += cos_(got, refs[(std::size_t)h]) / H;
+    }
+    return cs;
+  };
+  double c[2][2] = {};  // [smooth][pv8]
+  for (const bool smooth : {true, false}) {
+    sage::Config sc = cfg;
+    sc.smooth_k = smooth;
+    for (const bool pv8 : {false, true}) {
+      c[smooth ? 1 : 0][pv8 ? 1 : 0] = arm(sc, pv8, -1);
+    }
+  }
+  sage::Config off = cfg;
+  off.smooth_k = false;
+  const double mut = arm(off, false, 1);
+  std::printf("[sage-sinks] cos vs f64, smoothed: QK8 %.6f + PV8 %.6f | "
+              "unsmoothed: QK8 %.6f + PV8 %.6f | unsmoothed with 311 set "
+              "anyway (a stale mean): %.6f\n", c[1][0], c[1][1], c[0][0],
+              c[0][1], mut);
+  EXPECT_TRUE(c[1][0] > 0.999 && c[1][1] > 0.999);
+  EXPECT_TRUE(c[0][0] > 0.999 && c[0][1] > 0.999);
+  EXPECT_TRUE(mut < c[0][0] - 0.01);
 }

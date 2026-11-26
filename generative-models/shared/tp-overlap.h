@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -90,6 +91,11 @@ public:
   // was posted to finish first.
   bool exchange_now(const void* partial, void* others, std::size_t bytes,
                     std::uint64_t seq, std::string* err);
+  // ...of `dtype` elements, not the overlap's own (a training run's f32
+  // gradients, or bytes a rank hands its peer whole: with two ranks the
+  // others' sum is the peer's own, its type unread).
+  bool exchange_now(const void* partial, void* others, std::size_t bytes,
+                    TpDType dtype, std::uint64_t seq, std::string* err);
 
   // An exchange buffer about to be freed or replaced (TpChannel::forget):
   // told to the channel once what was posted has been answered, never
@@ -97,6 +103,16 @@ public:
   void forget(const metal_compute::SharedBuffer& b);
 
   const metal_compute::Event& done() const { return _done; }
+
+  // The CPU's wait for exchange `done_at` (a Ticket's) to be answered:
+  // for a caller that hands the GPU no wait on the peer's progress. False
+  // where the overlap failed or was abandoned (its waits released).
+  // `gpu_failed`, polled while it waits: true once the command buffer
+  // that signals the partial has faulted -- its signal then never comes,
+  // and the worker would wait for it for ever -- and the overlap is
+  // abandoned with that reason.
+  bool wait_done(std::uint64_t done_at,
+                 const std::function<bool()>& gpu_failed = {});
 
   bool failed() const { return _failed.load(std::memory_order_acquire); }
   std::string error() const;
@@ -126,6 +142,8 @@ public:
   Stats take_stats();
 
 private:
+  bool call_exchange_(const void* partial, void* others, std::size_t bytes,
+                      TpDType dtype, std::uint64_t seq, std::string* err);
   struct Job {
     const void*   partial = nullptr;
     void*         others  = nullptr;
@@ -167,6 +185,34 @@ private:
 
   std::mutex                 _ch_mu;     // the channel, one caller at a time
   std::thread                _th;
+};
+
+// BYTES IN BULK between a run's GPU work: a training run's gradients,
+// the adapter gathered to be saved, a dataset handed to a peer. Carried
+// through two exchange buffers of its own, `chunk` bytes each, kept at
+// one address until forget() -- the channel's contract
+// (tensor-parallel.h) -- however much is handed across. `mine` null
+// sends zeros; `others` null takes nothing back. `*seq` counts on as the
+// run's own does.
+class TpBulk {
+public:
+  explicit TpBulk(metal_compute::MetalCompute* mc,
+                  std::size_t chunk = (std::size_t)32 << 20)
+      : _mc(mc), _chunk(chunk)
+  {
+  }
+  bool exchange(TpOverlap& pipe, const void* mine, void* others,
+                std::size_t bytes, TpDType dtype, std::uint64_t* seq,
+                std::string* err);
+  // Before the overlap, or its channel, goes; or -- the overlap gone --
+  // straight to the channel, as a model lets go of its own buffers.
+  void forget(TpOverlap& pipe);
+  void forget(TpChannel& ch);
+
+private:
+  metal_compute::MetalCompute* _mc = nullptr;
+  std::size_t _chunk = 0;
+  metal_compute::SharedBuffer _send, _recv;
 };
 
 // A RANK'S FLOOR for its row bands: TpShare::extra's

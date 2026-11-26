@@ -3509,15 +3509,15 @@ const STRINGS = {
       + 'fast（块权重以旋转后的 int8 按粗分组存放）、token（权重按'
       + '行、激活按 token 各取一个 int8 尺度，先做 256 宽的 Hadamard 旋转：最'
       + '快）或 token_plain（同上但不旋转，直接读取 Draw Things i8x 检查点的'
-      + '原始编码）。minimax-h3 支持，其他模型按 accurate 运行。环境变量 '
-      + 'VPIPE_I8_TIER 可覆盖',
+      + '原始编码）。minimax-h3 与 magi2 支持，其他模型按 accurate 运行。'
+      + '环境变量 VPIPE_I8_TIER 可覆盖',
       'i8_gemm 使用哪一檔 int8 GEMM：accurate（預設；兩側運算元都按 64 分組，'
       + 'bf16 權重每次呼叫量化時各組先做 Hadamard 旋轉）、'
       + 'fast（區塊權重以旋轉後的 int8 按粗分組存放）、token（權重按'
       + '列、活化按 token 各取一個 int8 尺度，先做 256 寬的 Hadamard 旋轉：最'
       + '快）或 token_plain（同上但不旋轉，直接讀取 Draw Things i8x 檢查點的'
-      + '原始編碼）。minimax-h3 支援，其他模型按 accurate 執行。環境變數 '
-      + 'VPIPE_I8_TIER 可覆寫'],
+      + '原始編碼）。minimax-h3 與 magi2 支援，其他模型按 accurate 執行。'
+      + '環境變數 VPIPE_I8_TIER 可覆寫'],
   'cfg.generate-video.i8_gemm': ['',
       '加速模式（有损）：DiT 大块矩阵乘改用动态 int8 GEMM 代替 bf16，精度即'
       + ' int8 水平。只有前向会为矩阵核心物化稠密权重的模型族才会采用；纯 '
@@ -3672,7 +3672,8 @@ const STRINGS = {
       + 'prompt 与配乐的 query 行仍只用 sage_attn，除非设置 '
       + 'sage_pv8_all_rows。在 M5 Ultra 上实测，MiniMax-H3 1344x768 x 362 帧'
       + '（109k 行，16 步）：注意力 2.46 秒，sage_attn 为 2.90；去噪由 2110 '
-      + '秒降到 1927 秒。仅 MiniMax-H3 支持；与 sage_attn 一样仅限矩阵核心',
+      + '秒降到 1927 秒。MiniMax-H3 与 MAGI-2 支持（MAGI-2 上覆盖所有 '
+      + 'query 行，含其 sink）；与 sage_attn 一样仅限矩阵核心',
       '配合 sage_attn：P*V 乘積也放到 INT8 上做（失真，比單開 sage_attn 更'
       + '甚）。flash 核心把乘積以 int32 跨 key 塊保持，不留 f32 輸出塊——P 以 '
       + 'uint8 對照該列的當前最大值，V 每通道一個涵蓋整條序列的 scale，再加 '
@@ -3680,7 +3681,8 @@ const STRINGS = {
       + 'prompt 與配樂的 query 列仍只用 sage_attn，除非設定 '
       + 'sage_pv8_all_rows。在 M5 Ultra 上實測，MiniMax-H3 1344x768 x 362 幀'
       + '（109k 行，16 步）：注意力 2.46 秒，sage_attn 為 2.90；去噪由 2110 '
-      + '秒降到 1927 秒。僅 MiniMax-H3 支援；與 sage_attn 一樣僅限矩陣核心'],
+      + '秒降到 1927 秒。MiniMax-H3 與 MAGI-2 支援（MAGI-2 上涵蓋所有 '
+      + 'query 列，含其 sink）；與 sage_attn 一樣僅限矩陣核心'],
   'cfg.generate-video.sage_pv8_from_step': ['',
       'sage_pv8 开始生效的第一个采样步；之前的步只用 sage_attn。-1——默认值'
       + '——由模型族决定：MiniMax-H3 前四分之一的步不用它，这些步决定一个片段'
@@ -5707,6 +5709,76 @@ const STRINGS = {
       'FlashVSR 參數，作為一個 FlexData 物件 {model_family: flashvsr, '
       + '+kv_ratio, +sparse_ratio, +local_range}，供 generate-video 的 '
       + 'model_config 輸入埠使用'],
+
+  // ---- MAGI-2 Model Config (model-specific-config) ----
+  'stage.magi2-model-config.name': ['',
+      'MAGI-2 模型配置', 'MAGI-2 模型設定'],
+  'stage.magi2-model-config.doc': ['',
+      '源：MAGI-2-preview 的采样参数——步数、流的 shift，以及视频与音频的引导'
+      + '强度——以及把预览精修成更大、帧率翻倍的片段（参考实现的 1080p 预设）。'
+      + '发出一个节拍即结束；若接了 trigger 输入端口，则每收到一个节拍发出一个。',
+      '來源：MAGI-2-preview 的取樣參數——步數、流的 shift，以及視訊與音訊的引'
+      + '導強度——以及把預覽精修成更大、影格率加倍的片段（參考實作的 1080p 預'
+      + '設）。發出一個節拍即結束；若接了 trigger 輸入埠，則每收到一個節拍發出'
+      + '一個。'],
+  'cfg.magi2-model-config.steps': ['',
+      '去噪步数，每步是条件与负向两路一起批量的一次前向（不填时取参考实现的 '
+      + '100；填写时优先于 generate-video 自己的 steps）',
+      '去雜訊步數，每步是條件與負向兩路一起批次的一次前向（不填時取參考實作'
+      + '的 100；填寫時優先於 generate-video 自己的 steps）'],
+  'cfg.magi2-model-config.shift': ['',
+      '采样网格的流 shift（不填时取参考实现的 7）：越大，越多步数花在高噪声'
+      + '段',
+      '取樣網格的流 shift（不填時取參考實作的 7）：越大，越多步數花在高雜訊'
+      + '段'],
+  'cfg.magi2-model-config.video_guidance': ['',
+      '视频相对负向提示词的无分类器引导（不填时取参考实现的 5；取 1 时每步只'
+      + '跑一路，不用负向）',
+      '視訊相對負向提示詞的無分類器引導（不填時取參考實作的 5；取 1 時每步只'
+      + '跑一路，不用負向）'],
+  'cfg.magi2-model-config.audio_guidance': ['',
+      '音轨的无分类器引导（不填时取参考实现的 7）',
+      '音軌的無分類器引導（不填時取參考實作的 7）'],
+  'cfg.magi2-model-config.refine_width': ['',
+      '把预览精修到这个宽度（像素；与 refine_height 一起）：参考实现的 1080p '
+      + '预设，用它的精修器（refiner/）把 896 x 512 的预览精修到 1920 x 1088，'
+      + '片段帧率是预览的两倍（25 fps，2T - 1 个潜变量帧）。向下取整到整 16 像'
+      + '素格。不填时预览就是片段',
+      '把預覽精修到這個寬度（像素；與 refine_height 一起）：參考實作的 1080p '
+      + '預設，用它的精修器（refiner/）把 896 x 512 的預覽精修到 1920 x 1088，'
+      + '片段影格率是預覽的兩倍（25 fps，2T - 1 個潛變數影格）。向下取整到整 '
+      + '16 像素格。不填時預覽就是片段'],
+  'cfg.magi2-model-config.refine_height': ['',
+      '精修的高度（像素；与 refine_width 一起）',
+      '精修的高度（像素；與 refine_width 一起）'],
+  'cfg.magi2-model-config.refine_steps': ['',
+      '精修的去噪步数，每步一次条件前向和一次负向前向（不填时取参考实现的 5）',
+      '精修的去雜訊步數，每步一次條件前向和一次負向前向（不填時取參考實作的 '
+      + '5）'],
+  'cfg.magi2-model-config.refine_shift': ['',
+      '精修网格的流 shift（不填时取参考实现的 5）',
+      '精修網格的流 shift（不填時取參考實作的 5）'],
+  'cfg.magi2-model-config.refine_guidance': ['',
+      '精修相对负向提示词的无分类器引导（不填时取参考实现的 2；取 1 时每步只'
+      + '跑一次前向）',
+      '精修相對負向提示詞的無分類器引導（不填時取參考實作的 2；取 1 時每步只'
+      + '跑一次前向）'],
+  'port.magi2-model-config.trigger': ['',
+      '可选：用于触发重新发出配置的节拍（chrono 计时、提示词源、反馈回路都'
+      + '行）。任何载荷都可以——收到本身就是信号。不接线时，本阶段在整段运行中'
+      + '只发出一次',
+      '可選：用於觸發重新發出組態的節拍（chrono 計時、提示詞來源、回饋迴路都'
+      + '行）。任何載荷都可以——收到本身就是訊號。不接線時，本階段在整段執行中'
+      + '只發出一次'],
+  'port.magi2-model-config.model_config': ['',
+      'MAGI-2 参数，作为一个 FlexData 对象 {model_family: magi2, +steps, '
+      + '+shift, +video_guidance, +audio_guidance, +refine_width, '
+      + '+refine_height, +refine_steps, +refine_shift, +refine_guidance}，供 '
+      + 'generate-video 的 model_config 输入端口使用',
+      'MAGI-2 參數，作為一個 FlexData 物件 {model_family: magi2, +steps, '
+      + '+shift, +video_guidance, +audio_guidance, +refine_width, '
+      + '+refine_height, +refine_steps, +refine_shift, +refine_guidance}，供 '
+      + 'generate-video 的 model_config 輸入埠使用'],
 
   // ---- FlashVSR Source Encoder (model-specific-config) ----
   'stage.flashvsr-src-encoder.name': ['',

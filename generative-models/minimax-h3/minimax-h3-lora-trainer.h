@@ -137,6 +137,38 @@ class MiniMaxH3LoraTrainer final : public train::LoraTrainer {
     return "minimax-h3-lora";
   }
   std::string parent_model_type() const override;
+  // Only Ref2VA trains otherwise (its packed sequence, its references):
+  // FL2VA and a checkpoint that names no partition train alike, so one
+  // machine's "" and another's "fl2va" for the same DiT agree.
+  std::string layout_type() const override
+  {
+    return layout_type_of(_variant, _partition);
+  }
+  static std::string layout_type_of(Variant v, const std::string& partition);
+  // A rank (LoadArgs::cfg.tp): its share's cuts, its channel, bulk bytes.
+  bool split() const override { return _m->config().tp.active(); }
+  bool split_cuts(const std::vector<train::ModuleShape>& mods,
+                  std::map<std::string, train::ModuleCut>* out,
+                  std::string* err) const override
+  {
+    return _t->split_cuts(mods, out, err);
+  }
+  bool split_begin(std::shared_ptr<TpChannel> ch, std::uint64_t first_seq,
+                   std::string* err) override
+  {
+    if (!_m->begin_tp_generation(std::move(ch), err, first_seq)) {
+      return false;
+    }
+    _m->set_tp_meet(true);   // a rank's tuning waited out on the CPU
+    return true;
+  }
+  void split_end() override { _m->end_tp_generation(); }
+  std::size_t split_exchange_bytes() const override { return _split_bytes; }
+  bool split_bulk(const void* mine, void* others, std::size_t bytes,
+                  TpDType dtype, std::string* err) override
+  {
+    return _m->tp_bulk(mine, others, bytes, dtype, err);
+  }
   Variant variant() const noexcept { return _variant; }
 
   MetalMiniMaxH3Transformer* model() const noexcept { return _m.get(); }
@@ -184,6 +216,7 @@ class MiniMaxH3LoraTrainer final : public train::LoraTrainer {
   std::vector<float> _h3i_run;            // grid_as_run
   double _vshift = 12.0, _ashift = 3.0;
   // The model before its trainer: the trainer unbinds as it goes.
+  std::size_t _split_bytes = 0;         // split_exchange_bytes
   std::unique_ptr<MetalMiniMaxH3Transformer> _m;
   std::unique_ptr<MiniMaxH3Trainer> _t;
   std::function<bool()> _stop;

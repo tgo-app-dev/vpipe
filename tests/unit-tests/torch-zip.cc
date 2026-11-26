@@ -322,6 +322,50 @@ TEST(torch_zip, names_follow_the_object_graph)
   }
 }
 
+// A TRAINING STATE: `state_dict` unwrapped as before, and its sibling
+// dicts kept under their own keys -- the EMA model a release decodes with
+// sits in `ema_state_dict` (MAGI-2's turbo decoder). An epoch count beside
+// them is no tensor and is left out.
+TEST(torch_zip, a_training_state_keeps_its_ema_beside_the_model)
+{
+  Pickle pk;
+  pk.op('}');                                        // EMPTY_DICT
+  pk.str("epoch");
+  pk.i32(3);
+  pk.op('s');
+  pk.str("state_dict");
+  pk.begin_dict();
+  pk.str("w");
+  pk.tensor("HalfStorage", "0", 2, 0, {2}, {1});
+  pk.end_dict();
+  pk.op('s');
+  pk.str("ema_state_dict");
+  pk.begin_dict();
+  pk.str("w");
+  pk.tensor("HalfStorage", "1", 2, 0, {2}, {1});
+  pk.end_dict();
+  pk.op('s');
+  Zip z;
+  z.add("archive/data.pkl", pk.done());
+  z.add("archive/data/0", {0, 0, 0, 0});
+  z.add("archive/data/1", {1, 1, 1, 1});
+  const fs::path p = write_tmp_("vpipe-torchzip-ema", z.finish());
+  std::vector<torch_zip::Tensor> t;
+  std::string err;
+  const bool ok = index_of_(p, &t, &err);
+  if (!ok) { std::printf("  ema: %s\n", err.c_str()); }
+  bool raw = false, ema = false;
+  for (const auto& x : t) {
+    raw = raw || x.name == "w";
+    ema = ema || x.name == "ema_state_dict.w";
+  }
+  std::printf("[torch_zip] training state: %zu tensors, raw %d ema %d\n",
+              t.size(), raw ? 1 : 0, ema ? 1 : 0);
+  EXPECT_TRUE(ok && t.size() == 2 && raw && ema);
+  std::error_code ec;
+  fs::remove(p, ec);
+}
+
 // What it will not do, each refused with a message naming why. The first
 // is the one that matters: a pickle naming any global off the allowlist
 // is not executed, not skipped -- the read fails.

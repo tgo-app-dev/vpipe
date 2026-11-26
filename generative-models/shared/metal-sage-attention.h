@@ -77,9 +77,20 @@ class MetalSageAttention {
   // graph that runs today un-runnable on half the boxes it runs on now.
   // The last case IS one: a model that asked for Sage and quietly ran
   // dense would be reported as a Sage run and its numbers believed.
+  //
+  // `with_sinks`: the attention Sage would run has SINKS (constant 302).
+  // A fourth answer then --
+  //
+  //   asked, host predates sinks  -> null, *fatal false, said ONCE
+  //
+  // -- where sinks_available() is false: there the flash kernel reads a
+  // sink unshifted under the smoothed keys and counts V's mean over its
+  // mass, which is a wrong answer, not a slower one, and the attention
+  // stays dense as on a box without matrix cores.
   static std::unique_ptr<MetalSageAttention>
   load_for_model(metal_compute::MetalCompute* mc, bool bf16,
-                 const sage::Config& cfg, const char* who, bool* fatal);
+                 const sage::Config& cfg, const char* who, bool* fatal,
+                 bool with_sinks = false);
 
   ~MetalSageAttention();
 
@@ -197,8 +208,9 @@ class MetalSageAttention {
                        int q_tokens, std::string* err);
 
   // Bind the four operands at buffers 15..18 onto a dispatch whose
-  // function was built with constant 306 true. Call AFTER set_function
-  // and the caller's own binds, like any other bind.
+  // function was built with constant 306 true -- and K's mean at 22, which
+  // an attention with sinks reads under sage::kSinkShiftConstant. Call
+  // AFTER set_function and the caller's own binds, like any other bind.
   //
   // Binding these onto a function built WITHOUT 306 is harmless (the
   // slots are unused); the reverse is not, and is why prepare() refuses
@@ -225,6 +237,29 @@ class MetalSageAttention {
   // load()). The flash kernel's constants 308 and 310 arrived with them,
   // so their presence is also the answer for the kernel.
   bool pv8_available() const noexcept { return _pv8_kernels; }
+
+  // AN ATTENTION WITH SINKS (302) under the int8 QK. Smoothing K moves
+  // every score in a row by -q.mean, which a softmax over the keys alone
+  // does not see and a sink's logit does, so the flash kernel takes each
+  // row's sink shifted with them -- constant 311
+  // (sage::kSinkShiftConstant), K's mean at buffer 22, which bind()
+  // binds -- and under the int8 P*V keeps the sink's mass out of the
+  // running max and V's mean off it. Whether this host's flash kernel
+  // does: the optional entry sage_sinks_marker arrived with both (the
+  // kernel contract's kAttnSinkShift). FALSE, the caller keeps an
+  // attention with sinks DENSE: a host without it runs a function built
+  // with 311 as one without, and reads its sinks wrong, silently.
+  // load_for_model(..., with_sinks) asks it for you.
+  bool sinks_available() const noexcept { return _sink_kernels; }
+
+  // Constant 311, for a caller building the flash function of an
+  // attention with sinks (with 302 and 306) where sinks_available() said
+  // so. It FOLLOWS cfg.smooth_k, which is why it takes the config: with
+  // the keys unsmoothed (the A/B) no score moved, and prepare() writes
+  // no mean for buffer 22 to hold -- a function built with 311 there
+  // would subtract whatever the buffer last held.
+  static void sink_constants(metal_compute::FunctionConstants& fc,
+                             const sage::Config& cfg);
 
   // Whether a prepare() under `cfg` will make the int8 P*V's operands:
   // asked for AND available. BUILD THE FLASH FUNCTION FROM THIS, not
@@ -328,6 +363,7 @@ class MetalSageAttention {
   int  _heads = 0, _kvh = 0, _qt = 0, _kt = 0, _d = 0, _bq = 0, _bk = 0;
   bool _pv8 = false;         // the scratch's geometry has pv8's buffers
   bool _pv8_kernels = false; // the library carries pv8's four kernels
+  bool _sink_kernels = false; // the flash kernel takes sinks (marker)
   bool _reserve_pv8 = false; // build pv8's buffers from the first call
   bool _reserved = false;    // the scratch is a reserve()d capacity
   int  _builds = 0;          // scratch builds, see scratch_builds()

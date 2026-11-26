@@ -13,6 +13,7 @@
 #define VPIPE_STAGES_MODEL_MEMORY_HOST_H
 
 #include "generative-models/lm-run-memory.h"
+#include "pipeline/memory-plan.h"
 #include "stages/model-memory.h"
 
 #include <cstddef>
@@ -93,6 +94,16 @@ std::vector<ResourceClaim> lm_claims(const SessionContextIntf* session,
 // (pipeline/resource-claim-delivery.h). Host-only: host stages set it;
 // no plugin is offered it yet.
 inline constexpr std::string_view kClaimHeldBytes = "held_bytes";
+
+// A REGISTERED CODEC'S CLAIMS AT WHAT ITS FAMILY SAYS IT HOLDS: each
+// weights claim in `claims` whose checkpoint a holding in `holdings` names
+// (by canonical path) gets kClaimHeldBytes = that holding's preload --
+// the family's own figure for a file that weighs more than the codec it
+// loads (MAGI-2's Stable Audio Open file is the whole model; its Wan2.2
+// VAE's encoder half is all its picture encoder keeps). A holding with no
+// preload, or naming nothing claimed, changes nothing.
+void claims_at_holdings(std::vector<ResourceClaim>* claims,
+                        const std::vector<StageHolding>& holdings);
 
 // THE RESIDENCY RESERVE of a model resident in `phase` that grows a
 // resident set by measurement -- a conditioning encoder streaming through

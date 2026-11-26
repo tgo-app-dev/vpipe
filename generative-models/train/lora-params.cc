@@ -238,13 +238,21 @@ LoraParams::init_random(std::uint64_t seed)
   std::mt19937_64 g(seed);
   auto* a = static_cast<float*>(_a_m.contents());
   auto* b = static_cast<float*>(_b_m.contents());
-  for (const Module& m : _mods) {
+  for (std::size_t mi = 0; mi < _mods.size(); ++mi) {
+    const Module& m = _mods[mi];
+    // SPLIT: the whole module's draws, in the whole's order, the share's
+    // columns kept -- the values the unsplit run starts from.
+    const int wk = _cuts.empty() ? m.k : _cuts[mi].whole_k;
+    const int c0 = _cuts.empty() ? 0 : _cuts[mi].a_col0;
     // PEFT's init: kaiming_uniform_(a=sqrt(5)), whose bound over a fan-in
-    // of k is 1 / sqrt(k).
-    const float bound = 1.0f / std::sqrt((float)m.k);
+    // of k is 1 / sqrt(k) -- the whole module's.
+    const float bound = 1.0f / std::sqrt((float)wk);
     std::uniform_real_distribution<float> d(-bound, bound);
-    for (std::size_t i = 0; i < (std::size_t)_rank * m.k; ++i) {
-      a[m.a_off + i] = d(g);
+    for (std::size_t i = 0; i < (std::size_t)_rank * wk; ++i) {
+      const float v = d(g);
+      const int col = (int)(i % (std::size_t)wk);
+      if (col < c0 || col >= c0 + m.k) { continue; }
+      a[m.a_off + (i / (std::size_t)wk) * m.k + (std::size_t)(col - c0)] = v;
     }
     for (std::size_t i = 0; i < (std::size_t)m.n * _rank; ++i) {
       b[m.b_off + i] = 0.0f;
@@ -328,12 +336,37 @@ LoraParams::load(const std::string& path, int* loaded, std::string* err)
   auto* am = static_cast<float*>(_a_m.contents());
   auto* bm = static_cast<float*>(_b_m.contents());
   int n = 0;
-  for (Module& m : _mods) {
+  for (std::size_t mi = 0; mi < _mods.size(); ++mi) {
+    Module& m = _mods[mi];
     std::vector<float> a, b;
     std::vector<std::int64_t> sa, sb;
     const bool ha = read(m.name, "A", &a, &sa);
     const bool hb = read(m.name, "B", &b, &sb);
     if (!ha && !hb) { continue; }
+    // SPLIT: the whole module's factors, cut to the share.
+    const ModuleCut* cut = _cuts.empty() ? nullptr : &_cuts[mi];
+    const int wn = cut != nullptr ? cut->whole_n : m.n;
+    const int wk = cut != nullptr ? cut->whole_k : m.k;
+    if (ha && hb && cut != nullptr && sa.size() == 2 && sb.size() == 2 &&
+        sa[0] == _rank && sa[1] == wk && sb[0] == wn && sb[1] == _rank) {
+      std::vector<float> ca((std::size_t)_rank * m.k);
+      for (int r = 0; r < _rank; ++r) {
+        std::memcpy(ca.data() + (std::size_t)r * m.k,
+                    a.data() + (std::size_t)r * wk + cut->a_col0,
+                    (std::size_t)m.k * 4);
+      }
+      std::vector<float> cb((std::size_t)m.n * _rank);
+      for (int i = 0; i < m.n; ++i) {
+        const int src = cut->b_src.empty() ? i : cut->b_src[(std::size_t)i];
+        std::memcpy(cb.data() + (std::size_t)i * _rank,
+                    b.data() + (std::size_t)src * _rank,
+                    (std::size_t)_rank * 4);
+      }
+      a = std::move(ca);
+      b = std::move(cb);
+      sa = {_rank, m.k};
+      sb = {m.n, _rank};
+    }
     if (!ha || !hb || sa.size() != 2 || sb.size() != 2 ||
         sa[0] != _rank || sa[1] != m.k || sb[0] != m.n || sb[1] != _rank) {
       if (err != nullptr) {
@@ -365,6 +398,149 @@ LoraParams::load(const std::string& path, int* loaded, std::string* err)
   if (loaded != nullptr) { *loaded = n; }
   refresh_shadows_cpu();
   return true;
+}
+
+bool
+LoraParams::set_cuts(const std::map<std::string, ModuleCut>& cuts,
+                     std::string* err)
+{
+  std::vector<ModuleCut> v;
+  v.reserve(_mods.size());
+  for (const Module& m : _mods) {
+    auto it = cuts.find(m.name);
+    if (it == cuts.end()) {
+      if (err != nullptr) { *err = "lora params: no cut for " + m.name; }
+      return false;
+    }
+    const ModuleCut& c = it->second;
+    if (c.whole_k < m.k || c.a_col0 < 0 || c.a_col0 + m.k > c.whole_k ||
+        c.whole_n < m.n ||
+        (!c.b_src.empty() && (int)c.b_src.size() != m.n) ||
+        (c.b_src.empty() && c.whole_n != m.n) ||
+        (c.a_shared && c.whole_k != m.k) ||
+        (c.b_shared && c.whole_n != m.n)) {
+      if (err != nullptr) {
+        *err = "lora params: " + m.name + "'s cut does not fit its share";
+      }
+      return false;
+    }
+    // A shared B is summed across the ranks from its rows at b_off
+    // (shared_grad_spans); a fused row map puts them elsewhere, and its
+    // gradient would never be summed -- the ranks' copies drifting
+    // apart without a word.
+    if (c.b_shared && !m.b_rows.empty()) {
+      if (err != nullptr) {
+        *err = "lora params: " + m.name + "'s B is shared and fused";
+      }
+      return false;
+    }
+    for (int r : c.b_src) {
+      if (r < 0 || r >= c.whole_n) {
+        if (err != nullptr) {
+          *err = "lora params: " + m.name + "'s cut leaves the module";
+        }
+        return false;
+      }
+    }
+    v.push_back(c);
+  }
+  _cuts = std::move(v);
+  return true;
+}
+
+std::vector<LoraParams::Span>
+LoraParams::shared_grad_spans() const
+{
+  std::vector<Span> out;
+  auto add = [&](bool b, std::size_t off, std::size_t n) {
+    if (!out.empty() && out.back().b == b &&
+        out.back().off + out.back().n == off) {
+      out.back().n += n;
+    } else {
+      out.push_back({b, off, n});
+    }
+  };
+  for (std::size_t mi = 0; mi < _cuts.size(); ++mi) {
+    const Module& m = _mods[mi];
+    if (_cuts[mi].a_shared) {
+      add(false, m.a_off, (std::size_t)_rank * m.k);
+    }
+  }
+  for (std::size_t mi = 0; mi < _cuts.size(); ++mi) {
+    const Module& m = _mods[mi];
+    // A shared B is in file order at b_off (no fused row map: the out
+    // projection's and fc2's).
+    if (_cuts[mi].b_shared && m.b_rows.empty()) {
+      add(true, m.b_off, (std::size_t)m.n * _rank);
+    }
+  }
+  return out;
+}
+
+bool
+LoraParams::save_gathered(const std::string& path,
+                          const std::map<std::string, std::string>& meta,
+                          bool write, bool own_shared, const Gather& gather,
+                          std::string* err, const SharedBuffer* ema_a,
+                          const SharedBuffer* ema_b) const
+{
+  if (_cuts.size() != _mods.size()) {
+    if (err != nullptr) { *err = "lora params: not a split adapter"; }
+    return false;
+  }
+  const auto* a = static_cast<const float*>(
+      (ema_a != nullptr ? *ema_a : _a_m).contents());
+  const auto* b = static_cast<const float*>(
+      (ema_b != nullptr ? *ema_b : _b_m).contents());
+  std::vector<OutTensor> out;
+  if (write) { out.reserve(_mods.size() * 2); }
+  const std::size_t r = (std::size_t)_rank;
+  std::vector<float> wa, wb;
+  for (std::size_t mi = 0; mi < _mods.size(); ++mi) {
+    const Module& m = _mods[mi];
+    const ModuleCut& c = _cuts[mi];
+    wa.assign(r * (std::size_t)c.whole_k, 0.0f);
+    if (!c.a_shared || own_shared) {
+      for (std::size_t i = 0; i < r; ++i) {
+        std::memcpy(wa.data() + i * c.whole_k + c.a_col0,
+                    a + m.a_off + i * m.k, (std::size_t)m.k * 4);
+      }
+    }
+    wb.assign((std::size_t)c.whole_n * r, 0.0f);
+    if (!c.b_shared || own_shared) {
+      for (int i = 0; i < m.n; ++i) {
+        const std::size_t src =
+            m.b_rows.empty() ? m.b_off + (std::size_t)i * r
+                             : (std::size_t)m.b_rows[(std::size_t)i] * r;
+        const std::size_t dst =
+            (std::size_t)(c.b_src.empty() ? i : c.b_src[(std::size_t)i]);
+        std::memcpy(wb.data() + dst * r, b + src, r * 4);
+      }
+    }
+    if (!gather(wa, err) || !gather(wb, err)) { return false; }
+    if (!write) { continue; }
+    OutTensor ta, tb;
+    ta.name = "transformer." + m.name + ".lora_A.weight";
+    tb.name = "transformer." + m.name + ".lora_B.weight";
+    ta.dtype = tb.dtype = "BF16";
+    ta.shape = {_rank, c.whole_k};
+    tb.shape = {c.whole_n, _rank};
+    ta.bytes.resize(wa.size() * 2);
+    tb.bytes.resize(wb.size() * 2);
+    auto* da = reinterpret_cast<std::uint16_t*>(ta.bytes.data());
+    auto* db = reinterpret_cast<std::uint16_t*>(tb.bytes.data());
+    for (std::size_t i = 0; i < wa.size(); ++i) { da[i] = f32_to_bf16(wa[i]); }
+    for (std::size_t i = 0; i < wb.size(); ++i) { db[i] = f32_to_bf16(wb[i]); }
+    out.push_back(std::move(ta));
+    out.push_back(std::move(tb));
+  }
+  if (!write) { return true; }
+  std::map<std::string, std::string> md = meta;
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%g", (double)_alpha);
+  md["alpha"] = buf;
+  md["rank"] = std::to_string(_rank);
+  return write_safetensors(path, out, md, err);
 }
 
 bool

@@ -19,6 +19,7 @@
 #include "generative-models/train/lora-params.h"
 #include "generative-models/train/train-ops.h"
 
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -90,6 +91,13 @@ class Optimizer {
   // reports the pre-clip gradient norm and the learning rate used.
   bool step(int accum, double* grad_norm, double* lr_used, std::string* err);
 
+  // A SPLIT RUN's global norm: this rank's sum of squares in, every
+  // rank's out -- each rank's share counted once, the shared factors
+  // once -- so every rank clips by the same norm. Unset: the local sum.
+  using GlobalSq = std::function<bool(double local, double* global,
+                                      std::string* err)>;
+  void set_global_sq(GlobalSq f) { _global_sq = std::move(f); }
+
   int steps_taken() const noexcept { return _t; }
   const OptimizerSpec& spec() const noexcept { return _spec; }
   bool has_ema() const noexcept { return !_ema_a.empty(); }
@@ -108,7 +116,15 @@ class Optimizer {
   // The whole state -- moments, Prodigy's accumulators, EMA, the step
   // count -- so a resumed run continues the same trajectory.
   bool save_state(const std::string& path, std::string* err) const;
+  // load_state runs check_state first, so a state that does not fit
+  // leaves this optimizer as it was.
   bool load_state(const std::string& path, std::string* err);
+  // Whether the state at `path` fits THIS optimizer -- its header, the
+  // adapter's shape, which arenas it holds, every length and the file's
+  // exact size -- reading only those (a few hundred bytes) and writing
+  // nothing. A file cut short (a host gone before its data reached the
+  // drive) fails here, before a resume agrees on it.
+  bool check_state(const std::string& path, std::string* err) const;
 
  private:
   const TrainOps* _ops = nullptr;
@@ -135,6 +151,7 @@ class Optimizer {
   AfArena _af_a, _af_b;
   bool build_adafactor_(std::string* err);
   metal_compute::SharedBuffer _part;
+  GlobalSq _global_sq;
   double _d = 1.0;
   double _d_max = 0.0;
   double _d_num = 0.0;

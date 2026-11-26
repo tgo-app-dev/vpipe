@@ -180,10 +180,41 @@
 // refused on a rank, a clip at a time.
 #define VPIPE_FEATURE_TENSOR_PARALLEL_TAOMATE_LORA \
   "tensor-parallel-taomate-lora/1"
+// A MiniMax H3 rank binds pi-H3's adapters -- their whole-tensor
+// overwrites cut to the share as the weights they replace -- over a
+// pruned DiT in bf16, or in ComfyUI's int8 ConvRot on the int8 Per Token
+// tier (its codes cut on the rotation's group edges).
+#define VPIPE_FEATURE_TENSOR_PARALLEL_PI_H3 "tensor-parallel-pi-h3/1"
+// train-lora's `tensor_parallel`: a MiniMax H3 LoRA trained split across
+// hosts -- each a rank of the DiT, rank 0 handing the others its encoded
+// dataset and settings, the adapter saved whole by rank 0.
+#define VPIPE_FEATURE_TENSOR_PARALLEL_TRAIN "tensor-parallel-train/1"
+// train-lora's `data_parallel`: a LoRA of any family trained with each
+// step's samples shared between hosts, each holding the whole model, the
+// gradients summed every step.
+#define VPIPE_FEATURE_DATA_PARALLEL_TRAIN "data-parallel-train/1"
+// train-lora's `tensor_parallel` for the picture models: Qwen-Image-2.1's
+// trainer on a rank (its share's projections, three partial sums a
+// block) and MiniMax-H3-Image's DiT (the H3 trainer, its step heads whole
+// on each rank).
+#define VPIPE_FEATURE_TENSOR_PARALLEL_TRAIN_IMAGES \
+  "tensor-parallel-train-images/1"
 // generative-models/far-memory.h: another machine's memory lent through a
 // plugin's transport -- a Mixture of Experts' expert cache's far tier
 // (text-chat's `far_memory`).
 #define VPIPE_FEATURE_FAR_MEMORY "far-memory/1"
+// generate-video's `tensor_parallel` for MAGI-2-preview's preview DiT: a
+// share's heads its query heads, its feed-forward rows EXPERTS of each
+// MoE head's (the shared, modality and mm MLPs cut at the same fraction),
+// two partial sums a layer. A host states a rank only to a peer listing
+// this.
+#define VPIPE_FEATURE_TENSOR_PARALLEL_MAGI2 "tensor-parallel-magi2/1"
+// generate-video's `tensor_parallel` over HyperFlow H3 Flash's DiT: its
+// low-rank projections' pairs cut to the share as an adapter's factors
+// are (q|k|v's and fc1's ups by rows, the out projection's and fc2's
+// downs by columns), on its own two-time embedding or pi-H3's stock
+// curve. A Flash rank is stated only to a peer listing this.
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FLASH "tensor-parallel-flash/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }

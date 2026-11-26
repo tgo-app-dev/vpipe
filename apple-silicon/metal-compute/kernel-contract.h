@@ -237,6 +237,13 @@ inline constexpr ToolkitKernel kToolkitKernels[] = {
   {"sage_quant", "sage_v_absmax_chunk"},
   {"sage_quant", "sage_v_absmax_reduce"},
   {"sage_quant", "sage_quant_v_channel_u8"},
+  // ...and the sinks MARKER: never part of the prologue, its presence
+  // says the flash kernel takes an attention with sinks under the int8
+  // QK and P*V (kAttnSinkShift, below). Optional: a toolkit on a host
+  // older than it finds it invalid and keeps such an attention dense
+  // (MetalSageAttention::sinks_available() false). Dispatched, it writes
+  // 311 into its one output word.
+  {"sage_quant", "sage_sinks_marker"},
   // Sol-Attn's routing (shared/metal-sol-attention.h); its exact blocks
   // run on the steel kernels above.
   {"sol_attn_mma", "sol_summaries_mma"},
@@ -349,6 +356,25 @@ inline constexpr int kAttnQkInt8  = 306;   // SageAttention int8 QK path
 // sets them only where the sage_quant_token family resolves.
 inline constexpr int kAttnPvInt8      = 308;
 inline constexpr int kAttnQTokenScale = 310;
+// ...and, on the attn_steel_nax entries with kAttnSinks AND kAttnQkInt8
+// set, the sinks taken as the smoothed keys' scores are: smoothing K
+// (K minus its mean over tokens, which the int8 QK does) moves every
+// score in a row by -q.mean, which a softmax over the keys alone does not
+// see and a sink's logit does, so with kAttnSinkShift each row's sink is
+// read as sink - scale * q.mean -- q the row's query as bound at buffer
+// 0, the mean K's as the prologue subtracted it, [B, KVH, D] fp32 at
+// buffer 22 (MetalSageAttention::bind). Set it exactly when the keys were
+// smoothed (MetalSageAttention::sink_constants). And with kAttnSinks
+// under kAttnPvInt8 the same entries keep the sink's mass out of the
+// running max -- P is quantized against it -- and bring V's mean back
+// over the keys' share of the mass alone: no constant of its own, it
+// arrived with this one. Optional: a host that predates it does not
+// declare 311, and a function built with it set there reads its sinks
+// unshifted and counts V's mean over their mass -- a wrong answer, with
+// no error anywhere -- so a toolkit takes an attention with sinks under
+// the int8 QK only where the sage_sinks_marker entry resolves
+// (MetalSageAttention::sinks_available()), and keeps it dense elsewhere.
+inline constexpr int kAttnSinkShift   = 311;
 
 }  // namespace contract
 }  // namespace metal_compute

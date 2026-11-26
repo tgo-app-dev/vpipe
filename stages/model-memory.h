@@ -326,9 +326,11 @@ std::size_t video_decode_scratch_bytes(int width, int height, int frames);
 // held for the whole clip and its chunk pool is at full resolution, and
 // at FlashVSR's 1920x1152 the two are several times the clip itself. The
 // figure is MetalWanVae::decode_peak_bytes(), the one its own preflight
-// refuses on. 0 for every other VAE, whose video decode stays booked by
-// video_decode_scratch_bytes() alone. Reads the VAE's config (or, for a
-// natively-named checkpoint, its header) -- no model load.
+// refuses on -- and MAGI-2-preview's turbo decoder, its windows' working
+// set at the model's one clip length. 0 for every other VAE, whose video
+// decode stays booked by video_decode_scratch_bytes() alone. Reads the
+// VAE's config (or, for a natively-named checkpoint, its header) -- no
+// model load.
 std::size_t video_vae_working_bytes(const std::string& root, int width,
                                     int height);
 

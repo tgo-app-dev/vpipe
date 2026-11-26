@@ -56,6 +56,7 @@
 #include <cstddef>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -124,6 +125,15 @@ class MiniMaxH3Trainer {
   // the forward reads its shadows. Sets the q/k/v and fc1 modules' row
   // maps. Returns the modules bound (0 on failure).
   int bind(train::LoraParams* params, std::string* err);
+
+  // A RANK of a split DiT (Config::tp): each module's place in the whole
+  // adapter (train::ModuleCut) -- q|k|v's and fc1's B rows at the share's
+  // heads and feed-forward rows, the out projection's and fc2's A
+  // columns -- for LoraParams::set_cuts, BEFORE it is initialized. False
+  // when the model is whole.
+  bool split_cuts(const std::vector<train::ModuleShape>& mods,
+                  std::map<std::string, train::ModuleCut>* out,
+                  std::string* err) const;
 
   // Forward, loss and backward for one sample. ADDS into the parameters'
   // gradients; the optimizer consumes and zeroes them.
@@ -217,12 +227,23 @@ class MiniMaxH3Trainer {
   // block's output written over x; kBackward its backward from `a`. The
   // residual gradient in `dres` (f32 [rows, H]) is read and replaced.
   enum class Pass { kRecompute, kForward, kBackward };
+  // A RANK (Config::tp): `st` is the stream `enc` encodes into, where a
+  // partial sum crosses to the other ranks -- the out projection, fc2 (a
+  // kept forward), and each half's input gradient (fc1's, q|k|v's):
+  // tp_reduce_; null for a pass that crosses nothing (a whole DiT).
   bool block_pass_(metal_compute::ComputeEncoder& enc, Pass pass,
                    bool refiner, int L, const Block& b,
                    const metal_compute::SharedBuffer& x, std::size_t xe,
                    int rows, const metal_compute::SharedBuffer& mod,
                    std::size_t me, const metal_compute::SharedBuffer& dres,
-                   const Acts& a, std::string* err);
+                   const Acts& a, std::string* err,
+                   metal_compute::CommandStream* st = nullptr);
+  // `part` [rows, H] bf16, this rank's partial sum, completed in place by
+  // the other ranks' (the model's channel; its exchange buffers).
+  bool tp_reduce_(metal_compute::CommandStream* st,
+                  metal_compute::ComputeEncoder& enc,
+                  const metal_compute::SharedBuffer& part, int rows,
+                  std::string* err);
   // A streamed main block, read into a slot (the model's pair) or `local`;
   // and its predecessor's read issued under the current block's work.
   const Block* acquire_(int L, Block& local, std::string* err);

@@ -285,12 +285,17 @@ FlowSchedulerSpec::sigmas(int img_seq_len_override) const
   //     `shift_type` selects, so shift_type does not apply here.
   // sigma[0] is nudged off an exact 1 because the first UniPC update takes
   // log(alpha) = log(1 - sigma), which is -inf at 1.
+  //   * `base_sigmas` (S of them) replace the base grid -- a model whose
+  //     scheduler spaces it otherwise (MAGI-2: linspace(0.999, 0, S+1)
+  //     [:-1]) passes its own, and at shift 1 they run as written.
   if (type == "unipc_flow") {
     std::vector<double> sig((std::size_t)S + 1);
     const double lo = 1.0 / (double)(num_train > 0 ? num_train : 1000);
+    const bool given = (int)base_sigmas.size() == S;
     for (int i = 0; i < S; ++i) {
       const double r = (double)i / (double)S;          // [:-1] of S+1 points
-      const double base = 1.0 + r * (lo - 1.0);
+      const double base = given ? base_sigmas[(std::size_t)i]
+                                : 1.0 + r * (lo - 1.0);
       sig[(std::size_t)i] = shift * base / (1.0 + (shift - 1.0) * base);
     }
     if (S > 0 && std::fabs(sig[0] - 1.0) < 1e-6) { sig[0] -= 1e-6; }

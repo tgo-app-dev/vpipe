@@ -101,6 +101,13 @@ bool
 TpOverlap::exchange_now(const void* partial, void* others, std::size_t bytes,
                         std::uint64_t seq, std::string* err)
 {
+  return exchange_now(partial, others, bytes, _dtype, seq, err);
+}
+
+bool
+TpOverlap::exchange_now(const void* partial, void* others, std::size_t bytes,
+                        TpDType dtype, std::uint64_t seq, std::string* err)
+{
   {
     std::unique_lock<std::mutex> lk(_mu);
     _idle.wait(lk, [&]() { return _q.empty(); });
@@ -114,7 +121,7 @@ TpOverlap::exchange_now(const void* partial, void* others, std::size_t bytes,
   if (fake_link_()) {
     std::memset(others, 0, bytes);
   } else {
-    ok = call_exchange_(partial, others, bytes, seq, err);
+    ok = call_exchange_(partial, others, bytes, dtype, seq, err);
   }
   std::lock_guard<std::mutex> lk(_mu);
   ++_stats.exchanges;
@@ -128,9 +135,17 @@ TpOverlap::call_exchange_(const void* partial, void* others,
                           std::size_t bytes, std::uint64_t seq,
                           std::string* err)
 {
+  return call_exchange_(partial, others, bytes, _dtype, seq, err);
+}
+
+bool
+TpOverlap::call_exchange_(const void* partial, void* others,
+                          std::size_t bytes, TpDType dtype,
+                          std::uint64_t seq, std::string* err)
+{
   std::lock_guard<std::mutex> lk(_ch_mu);
   try {
-    return _ch->exchange(partial, others, bytes, _dtype, seq, err);
+    return _ch->exchange(partial, others, bytes, dtype, seq, err);
   } catch (const std::exception& e) {
     if (err != nullptr) {
       *err = std::string("the channel threw: ") + e.what();
@@ -216,6 +231,27 @@ TpOverlap::wait_ready_(metal_compute::Event& ev, std::uint64_t v)
   return true;
 }
 
+bool
+TpOverlap::wait_done(std::uint64_t done_at,
+                     const std::function<bool()>& gpu_failed)
+{
+  // As the worker waits for the GPU: a short spin -- the answer is
+  // usually a link's round trip away -- then the kernel's wait.
+  const auto t0 = Clock::now();
+  while (_done.signaled_value() < done_at) {
+    // A FAULTED command buffer (out of memory, a page fault, the
+    // watchdog) runs nothing after the fault, its signal included: the
+    // worker would wait on `ready` for ever, and this wait on it.
+    if (gpu_failed && gpu_failed()) {
+      abandon("the GPU work that writes the partial failed");
+      break;
+    }
+    if (Clock::now() - t0 < std::chrono::microseconds(200)) { continue; }
+    (void)_done.wait(done_at, std::chrono::milliseconds(2));
+  }
+  return !failed();
+}
+
 void
 TpOverlap::run_()
 {
@@ -279,6 +315,60 @@ TpOverlap::run_()
       _stats.idle_ms += idle;
     }
     if (_q.empty()) { _idle.notify_all(); }
+  }
+}
+
+bool
+TpBulk::exchange(TpOverlap& pipe, const void* mine, void* others,
+                 std::size_t bytes, TpDType dtype, std::uint64_t* seq,
+                 std::string* err)
+{
+  if (bytes == 0) { return true; }
+  if (_send.empty() || _recv.empty()) {
+    _send = _mc->make_shared_buffer(_chunk);
+    _recv = _mc->make_shared_buffer(_chunk);
+    if (_send.empty() || _recv.empty()) {
+      if (err != nullptr) { *err = "no room for the bulk exchange buffers"; }
+      return false;
+    }
+  }
+  const auto* src = static_cast<const std::uint8_t*>(mine);
+  auto* dst = static_cast<std::uint8_t*>(others);
+  for (std::size_t off = 0; off < bytes; off += _chunk) {
+    const std::size_t n = std::min(_chunk, bytes - off);
+    if (src != nullptr) {
+      std::memcpy(_send.contents(), src + off, n);
+    } else {
+      std::memset(_send.contents(), 0, n);
+    }
+    if (!pipe.exchange_now(_send.contents(), _recv.contents(), n, dtype,
+                           (*seq)++, err)) {
+      return false;
+    }
+    if (dst != nullptr) { std::memcpy(dst + off, _recv.contents(), n); }
+  }
+  return true;
+}
+
+void
+TpBulk::forget(TpOverlap& pipe)
+{
+  pipe.forget(_send);
+  pipe.forget(_recv);
+  _send = metal_compute::SharedBuffer{};
+  _recv = metal_compute::SharedBuffer{};
+}
+
+void
+TpBulk::forget(TpChannel& ch)
+{
+  for (metal_compute::SharedBuffer* b : {&_send, &_recv}) {
+    if (b->empty()) { continue; }
+    try {
+      ch.forget(b->contents(), b->byte_size());
+    } catch (...) {
+    }
+    *b = metal_compute::SharedBuffer{};
   }
 }
 

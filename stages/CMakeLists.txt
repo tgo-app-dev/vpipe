@@ -20,6 +20,7 @@ set(LOCAL_SOURCES
   training-dataset-stage.cc
   optimizer-select-stage.cc
   train-lora-stage.cc
+  train-lora-split.cc
   train-lora-families.cc
   load-text-stage.cc
   load-video-stage.cc
@@ -46,6 +47,7 @@ set(LOCAL_SOURCES
   qwen-image-edit-model-config-stage.cc
   vosr-model-config-stage.cc
   flashvsr-model-config-stage.cc
+  magi2-model-config-stage.cc
   scheduler-select-stage.cc
   diffusion-conditioner-stage.cc
   generate-image-stage.cc

@@ -41,7 +41,9 @@
 namespace vpipe::genai::torch_zip {
 
 struct Tensor {
-  // A state_dict key, with nested dicts joined by '.'. A checkpoint whose
+  // A state_dict key, with nested dicts joined by '.' (a training
+  // checkpoint's `state_dict` unwrapped; its other dicts, e.g.
+  // `ema_state_dict`, kept under their own keys). A checkpoint whose
   // top-level object is a bare tensor names it after its archive, which
   // is what torch.save() named the file's root ("posi_prompt").
   std::string               name;

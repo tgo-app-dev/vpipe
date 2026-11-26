@@ -257,6 +257,167 @@ the tuners vote run to run.
 
 Not yet for H3: `ane`.
 
+### Split across two hosts (`tensor_parallel`)
+
+MiniMax-H3's video DiT (FL2VA, Ref2VA), MiniMax-H3-Image's DiT and
+Qwen-Image-2.1's (the feature `tensor-parallel-train-images/1` for the
+last two) train split across two hosts, as
+generate-video splits a clip (generative-models/tensor-parallel.h): each
+host a RANK holding its share of every block's heads and feed-forward
+rows. Give `train-lora` a `tensor_parallel` object on each:
+`{rank, ranks: 2, heads: [first, end], ffn: [first, end], transport,
+params}`.
+
+- **Rank 0** is the ordinary graph: the dataset, its encoders and the
+  optimizer. Once the dataset is encoded, it hands rank 1 the encoded
+  samples and the run's settings over the transport, before either
+  loads its share.
+- **Rank 1** is a `train-lora` stage alone, with `hf_dir`, `output_dir`,
+  `name` and its `tensor_parallel`. It needs no dataset, no encoders and
+  no cache, and both ranks train on the same bytes. The run's settings
+  are rank 0's. It holds the whole encoded dataset in RAM, whatever rank
+  0's `cache` (booked and said); rank 0 sends it a tensor at a time, a
+  disk cache's entries read back one by one.
+- **Set up as one run**, checked: the channel's first exchange is a
+  HANDSHAKE -- the protocol, the kind of run, the ranks, their shares
+  (which must tile the model) and the shares' extras (`min_band_rows`:
+  the bands each cuts), `check_every`. Once both have loaded, a second
+  check: the DiT's checkpoint (its safetensors headers and 4 KB of each
+  file's data at three places -- MiniMax H3's FL2VA and Ref2VA DiTs
+  have identical headers), the model's kind as it trains (MiniMax H3:
+  Ref2VA or not -- FL2VA and a checkout that names no partition train
+  alike, so they agree), the frozen `base_lora`s (sampled the same
+  way), the adapter's modules and shared factors. A mismatch
+  fails both ranks, naming the field. The handshake also PROBES the
+  transport: its peer's bytes must come back as they went (-0,
+  denormals, NaN payloads), since the dataset and the control records
+  cross as raw bytes (TpChannel's two-rank contract).
+- **Alike, checked:** every `check_every` steps (50; 0 never), at the
+  run's first two steps and before anything is written (a checkpoint, a
+  stop's resume state, the last adapter), the ranks compare a digest of
+  the shared factors' masters. Both ranks update them alike by
+  construction, unless their GPUs' arithmetic differs (an M4 paired with
+  an M5 is not promised to match): the run then fails -- after its first
+  step, for such a pair -- and nothing parted is ever saved, so its last
+  checkpoint resumes it.
+- **Each step** keeps every block's activations at the share's widths
+  where both ranks can hold them (`recompute`, as unsplit; the ranks
+  agree, else both recompute). Kept, the forward exchanges each block's
+  out projection and fc2, and the backward each half's input gradient;
+  recomputed, the forward exchanges as a clip's does and the backward
+  three times a block (the recompute's out projection too). The GPU is
+  never drained for one: it copies the partial out and signals, and the
+  link's worker sends it. The backward's sums are waited for on the CPU
+  (a command buffer parked on the peer's progress is killed by the GPU's
+  watchdog when the peer stalls -- seen at 768); the forward's band
+  pipeline waits on the GPU, so the ranks MEET on the CPU first -- an
+  8-byte exchange before each forward's first block, once its tuning is
+  done. What a rank does before its first block -- GEMM tuning of a new
+  length (0.2-1.6 s, the two GPUs' times apart), scratch, residency and
+  wiring -- is then waited out by the peer's CPU, not by its GPU, and
+  the two forwards' rows are compared. What a rank does BETWEEN blocks
+  is not: a streamed rank's block reads and promotions while its blocks
+  first come in hold the peer's GPU on that block's sum, a block's worth
+  at a time (keep the DiT on the internal drive).
+  Row bands overlapped as a clip's were measured slower at a training
+  sample's ~2,000 rows (3.1-3.7 s a step against 2.3): each band's work
+  is no more than its handoff. Each rank's AdaLN is pruned at load.
+- **The adapter** is each rank's share of the whole: q|k|v's and fc1's B
+  by rows, the out projection's and fc2's A by columns. The other factor
+  of each is held whole on both ranks, and its gradient is summed across
+  them after the backward. The gradient's norm counts every share once.
+  A rank initialized from the seed holds the whole run's values, and
+  `init_from` is not split yet.
+- **Checkpoints** are the whole adapter, gathered from both ranks and
+  written by rank 0. Each rank writes its own resume state: rank 0's
+  `<name>.resume/`, rank 1's `<name>.rank1.resume/` (two hosts may share
+  a folder), recording the kind of run, the rank, its share and the
+  batch -- a state written for another rank, share or batch is not
+  resumed. Each keeps its last two states (below).
+- **Commands and stops** are agreed before each step: a stop, `save` or
+  `preview` asked of either rank runs on both, at the same step. A run
+  stopped resumes on both ranks where they stopped -- at the newest
+  step BOTH hold: a rank that died between its peer's write and its own
+  goes back one checkpoint, the other's newer state let go. Ranks that
+  hold no step alike start over, and so do both when either says
+  `resume: never`. A rank that fails -- a step, a checkpoint, a preview (one
+  rank's preview is half of the ranks' one forward) -- lets go of its
+  channel as it fails, and the other rank's exchange returns: both end.
+  A peer that vanishes (a host's crash, a pulled cable) leaves a stop
+  asked to wait max(10 min, 4x the rank's longest step) before the
+  channel gives up.
+- **Not split:** Prodigy (its step size is a whole adapter's estimate)
+  and `ane`. `adamw8bit` codes its moments per 256 parameters of the
+  arena, so a share that puts a shared factor and a cut one in one block
+  is refused (rank x the share's heads even, rank x its feed-forward rows
+  a multiple of 256: an even split of the released models is).
+  `adafactor` trains split, the ranks alike, but takes a cut factor's
+  row and column statistics and its update clip over the rank's share:
+  not the unsplit run's update.
+- **Memory** booked beside the plan: a rank's exchange buffers at the
+  widest sample (the block's partials whole, its bands' at a band), the
+  bulk exchanges' two 32 MB chunks, and the shared gradients' host
+  copies, made once.
+
+**Measured** on an M5 Max 64 GB (rank 0, 18 of 56 heads) and an M5 Ultra
+(38), over three TB5 cables with RDMA: FL2VA on four fox clips at 384,
+rank 16. A step takes 2.8 s, against 5.6 s on the Max alone, whose DiT
+streams. The Max holds 12.6 GB of DiT, the Ultra 26.2 GB. The losses
+match the whole run's step for step, and the adapter is as far from the
+whole run's as two whole runs are from each other. Each rank keeping its
+activations and its exchanges posted (above), a step takes 2.3 s.
+
+Qwen-Image-2.1's rank recomputes every block (no keep-all, no ANE
+backward) and exchanges three partial sums a block: the recompute's out
+projection, gate|up's input gradient and q|k|v's. A rank's live adapter
+is bound at its share's widths. MiniMax-H3-Image's per-step output heads
+are whole on every rank. Measured at 512 on the feltbot pictures, rank
+16, on an M5 Max and an M5 Ultra: MiniMax-H3-Image split 0.8 s a step
+against the Ultra alone's 1.0; Qwen-Image-2.1 (its 8-bit pack) split
+1.2 s, no faster than the Max alone (1.2) and slower than the Ultra
+alone (0.9) -- the model is small, neither Mac short of compute;
+data-parallel is its way to two hosts.
+
+### Steps shared between two hosts (`data_parallel`)
+
+Any family trains DATA-PARALLEL on two hosts: each holds the whole model
+and trains its own samples of every step, and after each backward the two
+sum their gradients, so both take the same optimizer step and hold the
+same adapter. Give `train-lora` a `data_parallel` object on each:
+
+    {"rank": 0, "ranks": 2, "samples": [1, 2],
+     "transport": "<a plugin's transport>", "params": {...}}
+
+- **A step** is `batch_size` x (both samples) samples, taken in the one
+  seeded order: rank 0 the first `batch_size` x samples[0], rank 1 the
+  rest. Give the faster host the larger count. Each sample's noise,
+  sigma and caption are keyed by its place in the step, so the run is
+  the one-host run at that batch size: the losses agree to float
+  rounding (1e-4 on the small golden), and so does the adapter.
+- **Rank 0** is the graph with the dataset and hands it over as a split
+  run's does; rank 1 is a train-lora stage alone. Stops, checkpoints and
+  previews are agreed between steps, the same way. Rank 0 alone writes
+  the adapter and makes the previews; every rank writes its resume state,
+  and a stopped run resumes on both.
+- **Each host loads the model its own way.** A host short of memory
+  streams its blocks, and may prune the AdaLN at load where the other
+  keeps it: their samples then train on forwards 0.46% apart. Hosts
+  whose checkpoints differ (a compressed copy) are warned of, not
+  refused.
+- **Checked as a split run is:** the handshake (`samples` alike), the
+  adapter's layout, and every `check_every` steps a digest of the whole
+  adapter. Resume states are per rank, as a split run's.
+- Not with `tensor_parallel`, nor `init_from` yet.
+
+Measured between an M5 Max (64 GB, its DiT streamed) and an M5 Ultra on
+the fox clips at 384, rank 16, `samples: [1, 2]`: a step of 3 samples in
+5.7 s -- the Max's one in 5.6, the Ultra's two in 5.4, the gradients'
+sum 0.1 -- 1.9 s a sample, against 2.3 split and 2.8 on the Ultra alone.
+The picture models the same way, at 512: MiniMax-H3-Image 2.0 s a step
+of 3 (0.67 s a sample, the Max streaming its DiT) against 0.8 split and
+1.0 on the Ultra alone; Qwen-Image-2.1 1.7-1.9 s a step of 3 (about
+0.6 s a sample) against 0.9 on the Ultra alone.
+
 ## Stages
 
 ### `training-dataset`
@@ -316,7 +477,7 @@ Its ports:
 
 | key | default | meaning |
 |---|---|---|
-| `output_dir`, `name` | required | `<name>.safetensors`, `<name>-000500.safetensors` per checkpoint, `<name>.resume/` |
+| `output_dir`, `name` | required | `<name>.safetensors`, `<name>-000500.safetensors` per checkpoint, `<name>.resume/` (a follower rank's `<name>.rank1.resume/`) |
 | `rank`, `alpha` | 16, = rank | |
 | `targets` | `attn_ff` | `attn_ff` (q, k, v, out and the feed-forward) or `attn` |
 | `init_from` | — | continue from an adapter of the same targets and rank |
@@ -507,7 +668,16 @@ training run learns 98% of what bf16 does over the same steps.
   optimizer state. Rerunning the graph with `resume: auto` continues from
   there and gives the same result as a run that never stopped: noise,
   sigmas and sample order are functions of the seed and the sample
-  number.
+  number. The resume folder keeps the last two states, each in
+  `step-NNNNNN/` (`optimizer.bin`, `run.json`), written under a `.tmp`
+  name and renamed whole; the folder's own `run.json` is the newest's
+  record. Each is on the drive before it is renamed into place. A state
+  that does not load -- cut short, or for another optimizer -- is passed
+  over for the one before (two ranks agree only on states each can
+  load); a whole run whose every state fails part way through a read
+  stops rather than start over from what it read. Resuming at a step
+  lets go of any state past it. A folder of the older layout (the two
+  files at its root) still resumes.
 - **Metrics.** One beat per step on the metrics port: the step and the
   run's total, loss, learning rate, gradient norm and step time.
 - **Progress.** The stage opens a progress report while it encodes,

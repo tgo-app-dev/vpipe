@@ -6,6 +6,7 @@
 #include "generative-models/shared/kernel-autotune.h"
 #include "generative-models/shared/tuned-answers.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <string_view>
@@ -684,6 +685,29 @@ class I8GemmContext {
   // memory-bounded box so the idle scratch doesn't crowd out a large
   // downstream allocation.
   void release_scratch();
+
+  // THE SCRATCH AT A FORWARD'S LARGEST SHAPES, made BEFORE its first GEMM:
+  // the activation's codes and scales for m rows of depth k_act (any tier's
+  // layout: the padded contraction, the finest group's scales), and a
+  // per-call weight's for an [n_w, k_w] one (0 for none: a holding tier's
+  // weights are held). Without it every larger shape allocates the larger
+  // copy while the command buffer that read the smaller still holds it, so
+  // a forward encoded as ONE command buffer holds every size its shapes
+  // grew through until it completes. Grow-only like the GEMMs' own, and
+  // called with no command buffer in flight a growth frees the old copy at
+  // once. False when an allocation fails. What it holds for those shapes
+  // is reserve_bytes() -- each buffer the largest of the shapes asked.
+  bool reserve(int m, int k_act, int n_w, int k_w);
+  static std::size_t act_codes_bytes(int m, int k, int group = 64)
+  {
+    return (std::size_t)m * (std::size_t)(((k + group - 1) / group) * group);
+  }
+  static std::size_t act_scale_bytes(int m, int k, int group = 64)
+  {
+    const std::size_t g = (std::size_t)((k + group - 1) / group) * 2;
+    const std::size_t f = (std::size_t)(k / 256) * 2;     // fast, finest
+    return (std::size_t)m * std::max(std::max(g, f), (std::size_t)4);
+  }
 
   // ---- split-K over the 512-groups ---------------------------------
   //

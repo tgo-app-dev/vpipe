@@ -3,8 +3,10 @@
 #include "common/flex-data.h"
 #include "generative-models/gen-input.h"
 #include "generative-models/krea2/flow-sampler.h"
+#include "generative-models/shared/tp-overlap.h"
 #include "generative-models/weight-set.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -82,6 +84,30 @@ QwenImage21LoraTrainer::load(const LoadArgs& a, std::string* err)
                                             a.stream_blocks);
   if (t->_m == nullptr) {
     return fail("qwen-image-2.1 trainer: the DiT did not load");
+  }
+  if (a.cfg.tp.active() && a.floor_rows > 0) {
+    // The lanes' buffers (four banded, two buffers each; lane 0 alone for
+    // a block exchanged whole) at the WIDEST RUN ANY SAMPLE CUTS -- not
+    // the widest sample's: the bands are balanced, so a shorter block
+    // cuts wider ones (3,071 rows two of 1,536 at a floor of 1,024, where
+    // 4,600 cut four of 1,150), and a block under two floors goes whole
+    // on lane 0 (2,047 rows). The forward floors every lane at this.
+    const std::size_t row = (std::size_t)a.cfg.hidden * 2;
+    const int floor = tp_band_floor(a.cfg.tp);
+    int widest = 0;
+    bool bands = false;
+    for (int r = 1; r <= a.floor_rows; ++r) {
+      const auto b = tp_row_bands(r, floor);
+      bands = bands || b.size() > 1;
+      for (const auto& bd : b) { widest = std::max(widest, bd.second); }
+    }
+    const std::size_t whole = (std::size_t)a.floor_rows * row;
+    const std::size_t banded = (std::size_t)widest * row;
+    t->_m->set_tp_exchange_floor(whole, banded);
+    // Send and others at the whole floor (the arena books neither), the
+    // lanes', the bulk's two chunks.
+    t->_split_bytes = 2 * whole + (bands ? 8 : 2) * banded +
+                      2 * ((std::size_t)32 << 20);
   }
   std::string e;
   t->_t = QwenImage21Trainer::create(t->_m.get(), &e);

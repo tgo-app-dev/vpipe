@@ -1,4 +1,6 @@
 #include "generative-models/qwen-image/qwen-image21-trainer.h"
+
+#include "generative-models/shared/tp-overlap.h"
 #include "generative-models/shared/i8-gemm.h"
 
 #include "apple-silicon/metal-compute/command-stream.h"
@@ -20,6 +22,10 @@ using metal_compute::ComputeEncoder;
 using metal_compute::SharedBuffer;
 
 namespace {
+
+// The overlap's lane a training step's exchanges post from (the model's
+// lanes 0-3 are its forward's band partials).
+constexpr int kTrainLane = 4;
 
 // The steel flash-attention parameter block, as attn_steel.metal reads it.
 // Mirrored per family, like the model's own.
@@ -117,11 +123,26 @@ QwenImage21Trainer::~QwenImage21Trainer()
   if (_m != nullptr && _slot >= 0) { _m->release_live_lora(_slot); }
 }
 
+QwenImage21Trainer::Widths
+QwenImage21Trainer::widths_(const MetalQwenImage21Transformer::Config& c)
+{
+  // A RANK (Config::tp) works its share: its heads (NH, HI = their
+  // width) and feed-forward rows (FF); H, the residual stream's, whole.
+  Widths w;
+  const bool rank = c.tp.active();
+  w.H = c.hidden;
+  w.NH = rank ? c.tp.heads() : c.n_heads;
+  w.HI = w.NH * c.head_dim;
+  w.FF = rank ? c.tp.ffn() : c.hidden * c.mlp_ratio;
+  return w;
+}
+
 std::vector<train::ModuleShape>
 QwenImage21Trainer::modules(const std::string& targets) const
 {
   const auto& c = _m->_cfg;
-  const int H = c.hidden, FF = c.hidden * c.mlp_ratio;
+  const Widths w = widths_(c);
+  const int H = w.H, HI = w.HI, FF = w.FF;
   const bool ff = targets != "attn";
   std::vector<train::ModuleShape> v;
   for (int L = 0; L < c.n_layers; ++L) {
@@ -130,7 +151,11 @@ QwenImage21Trainer::modules(const std::string& targets) const
       if (p.ff && !ff) { continue; }
       const std::string leaf = p.leaf;
       int n = H, k = H;
-      if (leaf == "img_mlp.gate_layer" || leaf == "img_mlp.proj") {
+      if (leaf == "attn.to_q" || leaf == "attn.to_k" || leaf == "attn.to_v") {
+        n = HI;
+      } else if (leaf == "attn.to_out.0") {
+        k = HI;
+      } else if (leaf == "img_mlp.gate_layer" || leaf == "img_mlp.proj") {
         n = FF;
       } else if (leaf == "img_mlp.out") {
         k = FF;
@@ -185,27 +210,144 @@ QwenImage21Trainer::bind(train::LoraParams* params, std::string* err)
   return bound;
 }
 
+bool
+QwenImage21Trainer::split_cuts(const std::vector<train::ModuleShape>& mods,
+                               std::map<std::string, train::ModuleCut>* out,
+                               std::string* err) const
+{
+  const auto& c = _m->_cfg;
+  const TpShare& tp = c.tp;
+  if (!tp.active()) {
+    if (err != nullptr) { *err = "qwen-image-2.1 trainer: not a rank"; }
+    return false;
+  }
+  const Widths w = widths_(c);
+  const int H = w.H, HI = w.HI, FF = w.FF;
+  const int WI = tp.n_heads * c.head_dim, WF = tp.n_ffn;
+  const int q0 = tp.head0 * c.head_dim, f0 = tp.ffn0;
+  out->clear();
+  for (const train::ModuleShape& ms : mods) {
+    auto ends = [&](const char* leaf) {
+      const std::string l(leaf);
+      return ms.name.size() >= l.size() &&
+             ms.name.compare(ms.name.size() - l.size(), l.size(), l) == 0;
+    };
+    train::ModuleCut k;
+    if (ends(".attn.to_q") || ends(".attn.to_k") || ends(".attn.to_v")) {
+      // B [HI, r]: the share's heads' rows; A whole.
+      k.whole_n = WI;
+      k.whole_k = H;
+      k.b_src.resize((std::size_t)HI);
+      for (int i = 0; i < HI; ++i) { k.b_src[(std::size_t)i] = q0 + i; }
+      k.a_shared = true;
+    } else if (ends(".attn.to_out.0")) {
+      // A [r, HI]: the share's heads' columns; B whole.
+      k.whole_n = H;
+      k.whole_k = WI;
+      k.a_col0 = q0;
+      k.b_shared = true;
+    } else if (ends(".img_mlp.gate_layer") || ends(".img_mlp.proj")) {
+      k.whole_n = WF;
+      k.whole_k = H;
+      k.b_src.resize((std::size_t)FF);
+      for (int i = 0; i < FF; ++i) { k.b_src[(std::size_t)i] = f0 + i; }
+      k.a_shared = true;
+    } else if (ends(".img_mlp.out")) {
+      k.whole_n = H;
+      k.whole_k = WF;
+      k.a_col0 = f0;
+      k.b_shared = true;
+    } else {
+      if (err != nullptr) {
+        *err = "qwen-image-2.1 trainer: no split for module " + ms.name;
+      }
+      return false;
+    }
+    (*out)[ms.name] = std::move(k);
+  }
+  return true;
+}
+
+bool
+QwenImage21Trainer::tp_reduce_(CommandStream& st, ComputeEncoder& enc,
+                               const SharedBuffer& part, int rows,
+                               std::string* err)
+{
+  MetalQwenImage21Transformer& m = *_m;
+  if (!m._cfg.tp.active()) { return true; }
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) {
+      *err = "qwen-image-2.1 trainer: tensor parallel: " + why;
+    }
+    return false;
+  };
+  if (m._tp_pipe == nullptr) {
+    return fail("a rank's partial sum with no generation open");
+  }
+  const int H = m._cfg.hidden;
+  const std::size_t n = (std::size_t)rows * H;
+  const std::size_t bytes = n * 2;
+  if (!m.tp_buffer_(m._tp_send, bytes) || !m.tp_buffer_(m._tp_others, bytes)) {
+    return fail("no room for a block's partial sums");
+  }
+  // POSTED, the GPU never drained (as MiniMax-H3's trainer): the GPU
+  // copies the partial out and signals, the buffer submitted at once;
+  // the others' sum awaited on the CPU -- never a GPU wait on the peer's
+  // progress, which the GPU's watchdog ends where the peer stalls.
+  enc.set_function(m._fn_copy_rows);
+  enc.set_buffer(0, part); enc.set_buffer(1, m._tp_send);
+  enc.set_constant(2, 0); enc.set_constant(3, 0);
+  enc.set_constant(4, rows); enc.set_constant(5, H);
+  enc.set_constant(6, H); enc.set_constant(7, H);
+  enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  const TpOverlap::Ticket t =
+      m._tp_pipe->post(kTrainLane, m._tp_send, m._tp_others, bytes,
+                       m._tp_seq++);
+  enc.end();
+  m._flops.flush(st);
+  st.encode_signal(*t.ready, t.ready_at);
+  // Its fence watched while the sum is waited for: a faulted buffer
+  // never signals, and the wait would never end.
+  CommandStream::Fence f = st.commit();
+  if (!m._tp_pipe->wait_done(t.done_at, [&f]() { return f.errored(); })) {
+    enc = st.begin_compute();
+    return fail(m._tp_pipe->failed() ? m._tp_pipe->error()
+                                     : std::string("the exchange stopped"));
+  }
+  enc = st.begin_compute();
+  // part += the others' (bf16): two ranks add a + b and b + a alike.
+  enc.set_function(m._fn_residual);
+  enc.set_buffer(0, part); enc.set_buffer(1, m._tp_others);
+  enc.set_buffer(2, part); enc.set_constant(3, (int)n);
+  enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+  return true;
+}
+
 std::size_t
 QwenImage21Trainer::arena_bytes(const MetalQwenImage21Transformer::Config& c,
                                 int rows, int rank, bool keep) noexcept
 {
-  const std::size_t S = (std::size_t)rows, H = (std::size_t)c.hidden;
-  const std::size_t FF = H * (std::size_t)c.mlp_ratio;
-  const std::size_t NH = (std::size_t)c.n_heads, NL = (std::size_t)c.n_layers;
+  // A rank's at its share's widths (widths_).
+  const Widths w = widths_(c);
+  const std::size_t S = (std::size_t)rows, H = (std::size_t)w.H;
+  const std::size_t HI = (std::size_t)w.HI, FF = (std::size_t)w.FF;
+  const std::size_t NH = (std::size_t)w.NH, NL = (std::size_t)c.n_layers;
   std::size_t b = 0;
   b += NL * S * H * 2;                 // checkpoints
   b += S * H * 2 * 2;                  // final hidden, head scratch
   const std::size_t n = keep ? NL : 1;
-  b += n * S * H * 2 * 10;             // kept [S, H] intermediates
+  b += n * S * H * 2 * 3;              // kept [S, H]: h1, x1, h2
+  b += n * S * HI * 2 * 7;             // ...[S, HI]: q, k pre; qh kh vh ao af
   b += n * S * FF * 2 * 3;             // G, U, swiglu
   b += n * NH * S * 4 * 2;             // ml
   b += NH * S * 4 * 2;                 // lse, dsum
-  if (!keep) { b += S * H * 2 * 4; }   // the recompute's own scratch
-  b += S * H * 4 * 3;                  // dres, dK, dV (f32)
-  b += S * H * 2 * 7;                  // da, dh, daf, dO, dQ, dqn, dkn
+  if (!keep) { b += S * HI * 2 * 3 + S * H * 2; }   // the recompute's own
+  b += S * H * 4 + S * HI * 4 * 2;     // dres; dK, dV (f32)
+  b += S * H * 2 * 2 + S * HI * 2 * 5; // da, dh; daf, dO, dQ, dqn, dkn
   b += S * FF * 2 * 3;                 // ds, [dG | dU]
-  b += S * H * 2 * 3;                  // stacked dq | dk | dv
-  b += H * FF * 2 * 2 * 2;             // W^T (2FF wide) + dequant scratch
+  b += S * HI * 2 * 3;                 // stacked dq | dk | dv
+  b += std::max({2 * FF, 3 * HI, H}) * H * 2;          // W^T
+  b += std::max({FF, HI, H}) * H * 2;                  // dequant scratch
   b += S * (std::size_t)std::max(rank, 1) * 2 * 2;   // u, t
   // The attention backward's P^T / dS^T planes (its GEMM form).
   b += train::TrainOps::attn_scratch_bytes((int)NH, (int)S, (int)S);
@@ -218,9 +360,10 @@ QwenImage21Trainer::ensure_arena_(int rows, bool keep)
   if (rows <= _rows && keep == _keep_alloc) { return true; }
   metal_compute::MetalCompute* mc = _m->_mc;
   const auto& c = _m->_cfg;
-  const std::size_t S = (std::size_t)rows, H = (std::size_t)c.hidden;
-  const std::size_t FF = H * (std::size_t)c.mlp_ratio;
-  const std::size_t NH = (std::size_t)c.n_heads;
+  const Widths w = widths_(c);
+  const std::size_t S = (std::size_t)rows, H = (std::size_t)w.H;
+  const std::size_t HI = (std::size_t)w.HI, FF = (std::size_t)w.FF;
+  const std::size_t NH = (std::size_t)w.NH;
   const std::size_t NL = (std::size_t)c.n_layers;
   const int R = std::max(1, _p != nullptr ? _p->rank() : 1);
   auto bf = [&](std::size_t elems) {
@@ -232,15 +375,15 @@ QwenImage21Trainer::ensure_arena_(int rows, bool keep)
   // The kept intermediates: n_layers slices when keeping, one when the
   // backward recomputes each block.
   const std::size_t n = keep ? NL : 1;
-  _k.h1 = bf(n * S * H); _k.qpre = bf(n * S * H); _k.kpre = bf(n * S * H);
-  _k.qh = bf(n * S * H); _k.kh = bf(n * S * H); _k.vh = bf(n * S * H);
-  _k.ao = bf(n * S * H); _k.af = bf(n * S * H);
+  _k.h1 = bf(n * S * H); _k.qpre = bf(n * S * HI); _k.kpre = bf(n * S * HI);
+  _k.qh = bf(n * S * HI); _k.kh = bf(n * S * HI); _k.vh = bf(n * S * HI);
+  _k.ao = bf(n * S * HI); _k.af = bf(n * S * HI);
   _k.x1 = bf(n * S * H); _k.h2 = bf(n * S * H);
   _k.g = bf(n * S * FF); _k.u = bf(n * S * FF); _k.s = bf(n * S * FF);
   _k.mlm = f32(n * NH * S); _k.mls = f32(n * NH * S);
   // Recompute-only scratch (the forward keeps these itself otherwise).
   if (!keep) {
-    _vb = bf(S * H); _qn = bf(S * H); _kn = bf(S * H); _tmp = bf(S * H);
+    _vb = bf(S * HI); _qn = bf(S * HI); _kn = bf(S * HI); _tmp = bf(S * H);
   } else {
     _vb = SharedBuffer{}; _qn = SharedBuffer{}; _kn = SharedBuffer{};
     _tmp = SharedBuffer{};
@@ -256,12 +399,12 @@ QwenImage21Trainer::ensure_arena_(int rows, bool keep)
   _tnorm = bf(S * H);
   _dres = f32(S * H);
   _da = bf(S * H); _ds = bf(S * FF); _dgu = bf(S * 2 * FF);
-  _dh = bf(S * H); _daf = bf(S * H); _do = bf(S * H); _dqh = bf(S * H);
-  _dk32 = f32(S * H); _dv32 = f32(S * H);
+  _dh = bf(S * H); _daf = bf(S * HI); _do = bf(S * HI); _dqh = bf(S * HI);
+  _dk32 = f32(S * HI); _dv32 = f32(S * HI);
   _lse2 = f32(NH * S); _dsum = f32(NH * S);
-  _dqn = bf(S * H); _dkn = bf(S * H); _dqkv = bf(S * 3 * H);
-  _wt = bf(std::max(2 * FF * H, 3 * H * H));
-  _deq = bf(FF * H);
+  _dqn = bf(S * HI); _dkn = bf(S * HI); _dqkv = bf(S * 3 * HI);
+  _wt = bf(std::max({2 * FF, 3 * HI, H}) * H);
+  _deq = bf(std::max({FF, HI, H}) * H);
   _lu = bf(S * (std::size_t)R); _lt = bf(S * (std::size_t)R);
   const SharedBuffer* all[] = {
       &_k.h1, &_k.qpre, &_k.kpre, &_k.qh, &_k.kh, &_k.vh, &_k.ao, &_k.af,
@@ -597,8 +740,13 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
   const qi21::Layout& lay = *smp.layout;
   const auto& c = m._cfg;
   const int ROWS = lay.joint_len;
-  const int H = c.hidden, NH = c.n_heads, Hd = c.head_dim;
-  const int FF = H * c.mlp_ratio;
+  // A RANK (Config::tp): its share's heads and feed-forward rows; three
+  // partial sums a block completed by the others' (tp_reduce_): the
+  // recompute's out projection, gate|up's input gradient and q|k|v's.
+  const bool rank = c.tp.active();
+  const Widths w = widths_(c);
+  const int H = w.H, NH = w.NH, HI = w.HI, Hd = c.head_dim;
+  const int FF = w.FF;
   const int NL = c.n_layers;
   const int TGT = lay.target_len;
   const int CI = c.in_channels, CO = c.out_channels;
@@ -608,6 +756,14 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
                 "trained yet; text-to-image only");
   }
   const bool keep = _keep_all;
+  if (rank && keep) {
+    return fail("qwen-image-2.1 trainer: a rank recomputes each block (keep "
+                "all is a whole model's)");
+  }
+  if (rank && !m.tp_generation_open()) {
+    return fail("qwen-image-2.1 trainer: a rank's step with no channel to "
+                "the other ranks");
+  }
   if (!ensure_arena_(ROWS, keep)) {
     return fail("qwen-image-2.1 trainer: arena allocation failed");
   }
@@ -694,7 +850,7 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
   // THE LOSS SCALE: a power of two near n / 2 takes dL/dpred to O(1),
   // where the ANE's fp16 represents it. Exact to undo, and a no-op for a
   // GPU-only backward, whose bf16 has f32's exponent range.
-  const bool ane_bwd = _ane_bwd && _m->_mc->session() != nullptr;
+  const bool ane_bwd = _ane_bwd && !rank && _m->_mc->session() != nullptr;
   _loss_scale = 1.0f;
   if (ane_bwd) {
     _loss_scale = std::exp2(std::round(std::log2(0.5 * (double)n_out)));
@@ -754,6 +910,7 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
   const int A_BQ = nax ? 64 : 32;
   const int A_BK = nax ? 32 : 16;
   const std::size_t RH = (std::size_t)ROWS * H;
+  const std::size_t RHI = (std::size_t)ROWS * HI;
 
   for (int L = NL - 1; L >= 0; --L) {
     if (_stop && _stop()) {
@@ -804,13 +961,13 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
           mls;
     } V;
     V.h1 = _k.h1.subview(sl * RH * 2, RH * 2);
-    V.qpre = _k.qpre.subview(sl * RH * 2, RH * 2);
-    V.kpre = _k.kpre.subview(sl * RH * 2, RH * 2);
-    V.qh = _k.qh.subview(sl * RH * 2, RH * 2);
-    V.kh = _k.kh.subview(sl * RH * 2, RH * 2);
-    V.vh = _k.vh.subview(sl * RH * 2, RH * 2);
-    V.ao = _k.ao.subview(sl * RH * 2, RH * 2);
-    V.af = _k.af.subview(sl * RH * 2, RH * 2);
+    V.qpre = _k.qpre.subview(sl * RHI * 2, RHI * 2);
+    V.kpre = _k.kpre.subview(sl * RHI * 2, RHI * 2);
+    V.qh = _k.qh.subview(sl * RHI * 2, RHI * 2);
+    V.kh = _k.kh.subview(sl * RHI * 2, RHI * 2);
+    V.vh = _k.vh.subview(sl * RHI * 2, RHI * 2);
+    V.ao = _k.ao.subview(sl * RHI * 2, RHI * 2);
+    V.af = _k.af.subview(sl * RHI * 2, RHI * 2);
     V.x1 = _k.x1.subview(sl * RH * 2, RH * 2);
     V.h2 = _k.h2.subview(sl * RH * 2, RH * 2);
     V.g = _k.g.subview(sl * ROWS * FFe * 2, ROWS * FFe * 2);
@@ -879,11 +1036,12 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
              (std::size_t)bd.mod_row * 4 * H, V.h1, (std::size_t)bd.start * H,
              bd.rows);
     }
-    m.lin_(enc, _zero, V.h1, 0, b->qw, V.qpre, 0, ROWS, H, H,
+    m.lin_(enc, _zero, V.h1, 0, b->qw, V.qpre, 0, ROWS, HI, H,
            LB(&BlockLora::q));
-    m.lin_(enc, _zero, V.h1, 0, b->kw, V.kpre, 0, ROWS, H, H,
+    m.lin_(enc, _zero, V.h1, 0, b->kw, V.kpre, 0, ROWS, HI, H,
            LB(&BlockLora::k));
-    m.lin_(enc, _zero, V.h1, 0, b->vw, _vb, 0, ROWS, H, H, LB(&BlockLora::v));
+    m.lin_(enc, _zero, V.h1, 0, b->vw, _vb, 0, ROWS, HI, H,
+           LB(&BlockLora::v));
     mark("re.qkv");
     rms(V.qpre, b->nq, _qn, ROWS * NH, Hd);
     rms(V.kpre, b->nk, _kn, ROWS * NH, Hd);
@@ -937,7 +1095,10 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
     }
     transpose(V.ao, V.af, NH, ROWS);
     mark("re.attn");
-    m.lin_(enc, _zero, V.af, 0, b->ow, _tmp, 0, ROWS, H, H, LB(&BlockLora::o));
+    m.lin_(enc, _zero, V.af, 0, b->ow, _tmp, 0, ROWS, H, HI,
+           LB(&BlockLora::o));
+    // A rank's share of the out projection, completed by the others'.
+    if (rank && !tp_reduce_(st, enc, _tmp, ROWS, err)) { return false; }
     // x1 = x + tanh(g1) attn, in place on a copy of the checkpoint.
     enc.set_function(m._fn_copy_rows);
     enc.set_buffer(0, _ckpt); enc.set_buffer(1, V.x1);
@@ -1059,6 +1220,8 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
     lora_bwd_(enc, L, &BlockLora::proj, V.h2, 0, H, _dgu, (std::size_t)FF,
               2 * FF, _dh, 0, H, ROWS, FF, H);
     mark("bw.lora");
+    // A rank's dh2 is its feed-forward rows' share: summed across them.
+    if (rank && !tp_reduce_(st, enc, _dh, ROWS, err)) { return false; }
     for (const Band& bd : bands) {
       const std::size_t o = (std::size_t)bd.start * H;
       _ops.ln_mod_bwd(enc, V.x1, o, _dh, o, false, _modb,
@@ -1072,17 +1235,17 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
                           (std::size_t)bd.mod_row * 4 * H + H, _da,
                           (std::size_t)bd.start * H, bd.rows, H);
     }
-    if (!transpose_in_(enc, b->ow, H, H, H, 0)) {
+    if (!transpose_in_(enc, b->ow, H, HI, H, 0)) {
       return fail("qwen-image-2.1 trainer: an out weight is not readable");
     }
-    back_gemm_(enc, _da, ROWS, H, H, _daf);
+    back_gemm_(enc, _da, ROWS, H, HI, _daf);
     mark("bw.gemm.o");
-    lora_bwd_(enc, L, &BlockLora::o, V.af, 0, H, _da, 0, H, _daf, 0, H, ROWS,
-              H, H);
+    lora_bwd_(enc, L, &BlockLora::o, V.af, 0, HI, _da, 0, H, _daf, 0, HI,
+              ROWS, H, HI);
     mark("bw.lora");
     transpose(_daf, _do, ROWS, NH);
-    _ops.fill_f32(enc, _dk32, 0, 0.0f, RH);
-    _ops.fill_f32(enc, _dv32, 0, 0.0f, RH);
+    _ops.fill_f32(enc, _dk32, 0, 0.0f, RHI);
+    _ops.fill_f32(enc, _dv32, 0, 0.0f, RHI);
     _ops.attn_backward(enc, V.qh, V.kh, V.vh, V.ao, _do, V.mlm, V.mls, _lse2,
                        _dsum, _dqh, _dk32, _dv32, NH, ROWS, Hd, ascale, segs);
     mark("bw.attn");
@@ -1090,33 +1253,35 @@ QwenImage21Trainer::step(const Sample& smp, Result* out, std::string* err,
     _ops.rope_bwd(enc, _dk32, true, _dkn, _rcos, _rsin, 0, NH, ROWS, Hd);
     // [dq | dk | dv], stacked for one GEMM.
     _ops.rms_bwd(enc, V.qpre, 0, _dqn, 0, b->nq, _dqkv, 0, ROWS * NH, Hd,
-                 eps, NH, 3 * H);
-    _ops.rms_bwd(enc, V.kpre, 0, _dkn, 0, b->nk, _dqkv, (std::size_t)H,
-                 ROWS * NH, Hd, eps, NH, 3 * H);
-    _ops.hd_f32_to_td(enc, _dv32, _dqkv, (std::size_t)2 * H, NH, ROWS, Hd,
-                      3 * H);
+                 eps, NH, 3 * HI);
+    _ops.rms_bwd(enc, V.kpre, 0, _dkn, 0, b->nk, _dqkv, (std::size_t)HI,
+                 ROWS * NH, Hd, eps, NH, 3 * HI);
+    _ops.hd_f32_to_td(enc, _dv32, _dqkv, (std::size_t)2 * HI, NH, ROWS, Hd,
+                      3 * HI);
     if (ab) {
       if (!back_split_(abt[2], L, st, enc, _dqkv, _dh, ROWS, err)) {
         return false;
       }
     } else {
-      if (!transpose_in_(enc, b->qw, H, H, 3 * H, 0) ||
-          !transpose_in_(enc, b->kw, H, H, 3 * H, H) ||
-          !transpose_in_(enc, b->vw, H, H, 3 * H, 2 * H)) {
+      if (!transpose_in_(enc, b->qw, HI, H, 3 * HI, 0) ||
+          !transpose_in_(enc, b->kw, HI, H, 3 * HI, HI) ||
+          !transpose_in_(enc, b->vw, HI, H, 3 * HI, 2 * HI)) {
         return fail("qwen-image-2.1 trainer: a q/k/v weight is not "
                     "readable");
       }
       mark("bw.elt+transpose");
-      back_gemm_(enc, _dqkv, ROWS, 3 * H, H, _dh);
+      back_gemm_(enc, _dqkv, ROWS, 3 * HI, H, _dh);
     }
     mark("bw.gemm.qkv");
-    lora_bwd_(enc, L, &BlockLora::q, V.h1, 0, H, _dqkv, 0, 3 * H, _dh, 0, H,
-              ROWS, H, H);
-    lora_bwd_(enc, L, &BlockLora::k, V.h1, 0, H, _dqkv, (std::size_t)H,
-              3 * H, _dh, 0, H, ROWS, H, H);
-    lora_bwd_(enc, L, &BlockLora::v, V.h1, 0, H, _dqkv, (std::size_t)2 * H,
-              3 * H, _dh, 0, H, ROWS, H, H);
+    lora_bwd_(enc, L, &BlockLora::q, V.h1, 0, H, _dqkv, 0, 3 * HI, _dh, 0, H,
+              ROWS, HI, H);
+    lora_bwd_(enc, L, &BlockLora::k, V.h1, 0, H, _dqkv, (std::size_t)HI,
+              3 * HI, _dh, 0, H, ROWS, HI, H);
+    lora_bwd_(enc, L, &BlockLora::v, V.h1, 0, H, _dqkv, (std::size_t)2 * HI,
+              3 * HI, _dh, 0, H, ROWS, HI, H);
     mark("bw.lora");
+    // ...and dh1 its heads' share.
+    if (rank && !tp_reduce_(st, enc, _dh, ROWS, err)) { return false; }
     for (const Band& bd : bands) {
       const std::size_t o = (std::size_t)bd.start * H;
       _ops.ln_mod_bwd(enc, _ckpt, x0e + o, _dh, o, false, _modb,

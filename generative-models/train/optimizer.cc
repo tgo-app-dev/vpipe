@@ -423,6 +423,11 @@ Optimizer::step(int accum, double* grad_norm, double* lr_used,
   double sq = 0.0;
   const auto* pp = static_cast<const float*>(_part.contents());
   for (int i = 0; i < ga + gb; ++i) { sq += (double)pp[i]; }
+  if (_global_sq) {
+    double all = 0.0;
+    if (!_global_sq(sq, &all, err)) { return false; }
+    sq = all;
+  }
   const double inv_acc = 1.0 / (double)std::max(accum, 1);
   const double gnorm = std::sqrt(sq) * inv_acc;
   if (!std::isfinite(gnorm)) {
@@ -656,8 +661,86 @@ Optimizer::save_state(const std::string& path, std::string* err) const
 }
 
 bool
+Optimizer::check_state(const std::string& path, std::string* err) const
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  std::error_code ec;
+  const std::uint64_t size = std::filesystem::file_size(path, ec);
+  if (ec) { return fail("cannot open " + path); }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { return fail("cannot open " + path); }
+  // save_state's layout walked: what it reads, read; what it holds,
+  // stepped over -- never past the end (pos <= size throughout).
+  std::uint64_t pos = 0;
+  bool cut = false;
+  auto get = [&](void* p, std::size_t n) {
+    if (n > size - pos) { cut = true; return false; }
+    in.read(static_cast<char*>(p), (std::streamsize)n);
+    if (!in) { cut = true; return false; }
+    pos += n;
+    return true;
+  };
+  auto skip = [&](std::uint64_t n) {
+    if (n > size - pos) { cut = true; return false; }
+    pos += n;
+    in.seekg((std::streamoff)pos);
+    if (!in) { cut = true; return false; }
+    return true;
+  };
+  std::uint32_t magic = 0, ver = 0;
+  std::uint64_t na = 0, nb = 0;
+  if (!get(&magic, 4) || !get(&ver, 4) || magic != kStateMagic ||
+      ver < 1 || ver > kStateVersion) {
+    return fail("not an optimizer state file: " + path);
+  }
+  if (!get(&na, 8) || !get(&nb, 8) || na != _p->a_elems() ||
+      nb != _p->b_elems()) {
+    return fail("the optimizer state is for a different adapter shape");
+  }
+  auto arena = [&](const SharedBuffer& b, std::uint64_t n) {
+    std::uint8_t present = 0;
+    if (!get(&present, 1)) { return false; }
+    if ((present != 0) == b.empty()) { return false; }
+    return present == 0 || skip(n * 4);
+  };
+  auto raw = [&](const SharedBuffer& b) {
+    std::uint64_t n = 0;
+    if (!get(&n, 8)) { return false; }
+    const std::uint64_t want = b.empty() ? 0 : b.byte_size();
+    return n == want && skip(n);
+  };
+  bool ok = skip(4 + 8 + 8 + 8) &&   // t, d, d_max, d_num
+            arena(_p->a_master(), na) && arena(_p->b_master(), nb) &&
+            arena(_m_a, na) && arena(_m_b, nb) && arena(_v_a, na) &&
+            arena(_v_b, nb) && arena(_s_a, na) && arena(_s_b, nb) &&
+            arena(_x0_a, na) && arena(_x0_b, nb) && arena(_ema_a, na) &&
+            arena(_ema_b, nb);
+  if (ok && ver >= 2) {
+    ok = raw(_qm_a) && raw(_qm_b) && raw(_qv_a) && raw(_qv_b) &&
+         raw(_am_a) && raw(_am_b) && raw(_af_a.state) && raw(_af_b.state);
+  } else if (ok && (!_qm_a.empty() || !_af_a.state.empty())) {
+    return fail("the optimizer state predates 8-bit AdamW and Adafactor");
+  }
+  if (!ok && cut) {
+    return fail("the optimizer state is cut short (" + std::to_string(size) +
+                " bytes): " + path);
+  }
+  if (!ok || pos != size) {
+    return fail("the optimizer state does not match this optimizer");
+  }
+  return true;
+}
+
+bool
 Optimizer::load_state(const std::string& path, std::string* err)
 {
+  // Checked whole before a byte is written: the reads below go straight
+  // into the live masters and moments, and a file that fails half way
+  // would leave a mix of the two behind for whatever runs next.
+  if (!check_state(path, err)) { return false; }
   std::ifstream in(path, std::ios::binary);
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }

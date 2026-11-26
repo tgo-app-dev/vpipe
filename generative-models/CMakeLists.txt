@@ -135,6 +135,19 @@ set(LOCAL_SOURCES
   relayvsr/metal-relayvsr-wan.cc
   relayvsr/metal-relayvsr-decoder.cc
   relayvsr/relayvsr-stream.cc
+  magi2/metal-magi2-dit.cc
+  magi2/metal-magi2-refiner.cc
+  magi2/magi2-accel.cc
+  magi2/magi2-audio.cc
+  magi2/magi2-family.cc
+  magi2/magi2-image-encoder.cc
+  magi2/magi2-layout.cc
+  magi2/magi2-preview.cc
+  magi2/magi2-refine.cc
+  magi2/magi2-schedule.cc
+  magi2/magi2-text.cc
+  magi2/magi2-vae-family.cc
+  magi2/metal-magi2-turbo.cc
   drama3/drama3-prompt.cc
   drama3/metal-drama3-tower.cc
   deepseek-v41/deepseek-v41-config.cc
@@ -251,6 +264,19 @@ set(LOCAL_HEADERS
   relayvsr/metal-relayvsr-wan.h
   relayvsr/metal-relayvsr-decoder.h
   relayvsr/relayvsr-stream.h
+  magi2/metal-magi2-dit.h
+  magi2/metal-magi2-refiner.h
+  magi2/magi2-accel.h
+  magi2/magi2-audio.h
+  magi2/magi2-family.h
+  magi2/magi2-image-encoder.h
+  magi2/magi2-latent.h
+  magi2/magi2-layout.h
+  magi2/magi2-preview.h
+  magi2/magi2-refine.h
+  magi2/magi2-schedule.h
+  magi2/magi2-text.h
+  magi2/metal-magi2-turbo.h
   drama3/drama3-prompt.h
   drama3/metal-drama3-tower.h
   deepseek-v41/deepseek-v41-config.h

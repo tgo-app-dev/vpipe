@@ -209,6 +209,11 @@ llama3_match_one_(const char* data, size_t len, size_t pos,
   // --- Alt 2: [^\r\n\p{L}\p{N}]?\p{L}+ ------------------------------
   {
     auto try_word_at = [&](size_t start) -> size_t {
+      // A lone lead character at the end (" " of " A" cut at 1) leaves
+      // nothing to read: utf8_next_ would decode the byte PAST the input
+      // -- the caller's next byte when the text is a view into a longer
+      // string, which then ran the pre-token on into it.
+      if (start >= len) { return 0; }
       size_t cp_len;
       uint32_t cp = utf8_next_(data, len, start, &cp_len);
       if (!is_letter_cp_(cp)) { return 0; }

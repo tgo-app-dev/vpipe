@@ -12,6 +12,7 @@
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/shared/torch-randn.h"
+#include "generative-models/vae-host-ext.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
@@ -475,8 +476,11 @@ VaeEncodeStage::vae_dir_for_release_() const
   if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
           session(), root, vae_dir,
           resolve_model(session(), _hf_dir).model_type)) {
-    const std::string p = f->vae_path(root,
-                                      genai::VaeModelFamily::kRoleVideo);
+    // The encoder's own file first, where the family keeps one apart
+    // from its decoder's.
+    using genai::VaeModelFamily;
+    std::string p = f->vae_path(root, VaeModelFamily::kRoleVideoEncode);
+    if (p.empty()) { p = f->vae_path(root, VaeModelFamily::kRoleVideo); }
     if (!p.empty()) { return p; }
   }
 #endif
@@ -526,15 +530,39 @@ VaeEncodeStage::planned_scratch_() const
   const std::size_t px = resize ? (std::size_t)_target_w * _target_h
                                 : (std::size_t)1024 * 1024;
   std::size_t frames = 1;
+  std::size_t working = 0;
 #ifdef VPIPE_BUILD_APPLE_SILICON
-  if (!_hf_dir.empty() &&
-      builtin_vae_family(resolve_vae_dir(
-          resolve_model_dir(session(), _hf_dir))) == "wan") {
-    frames = (std::size_t)std::max(1, _frames);
+  if (!_hf_dir.empty()) {
+    const std::string root = resolve_model_dir(session(), _hf_dir);
+    if (builtin_vae_family(resolve_vae_dir(root)) == "wan") {
+      frames = (std::size_t)std::max(1, _frames);
+    }
+    // A registered encoder's own working set, where its family says.
+    if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+            session(), root, resolve_vae_dir(root),
+            resolve_model(session(), _hf_dir).model_type)) {
+      working = encode_working_(f, root, (int)frames,
+                                resize ? _target_h : 1024,
+                                resize ? _target_w : 1024);
+    }
   }
 #endif
-  return frames * px * 8 + frames * px * 3 / 2;
+  return frames * px * 8 + frames * px * 3 / 2 + working;
 }
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+std::size_t
+VaeEncodeStage::encode_working_(genai::VaeModelFamily* f,
+                                const std::string& root, int frames, int h,
+                                int w)
+{
+  auto* x = f != nullptr ? static_cast<genai::VaeEncodeWorkingBytes*>(
+                               f->query_extension(
+                                   genai::kVaeEncodeWorkingBytesExt))
+                         : nullptr;
+  return x != nullptr ? x->encode_working_bytes(root, frames, h, w) : 0;
+}
+#endif
 
 void
 VaeEncodeStage::revise_scratch_(std::size_t bytes)
@@ -628,6 +656,22 @@ VaeEncodeStage::declare_weights_() const
                          (std::int64_t)h3);
       }
     }
+#ifdef VPIPE_BUILD_APPLE_SILICON
+    // A registered family's encoder at what the family says it holds of
+    // that file (MAGI-2's picture encoder keeps the Wan2.2 VAE's encoder
+    // half), by the role that named it.
+    const std::string root = resolve_model_dir(session(), _hf_dir);
+    if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+            session(), root, resolve_vae_dir(root),
+            resolve_model(session(), _hf_dir).model_type)) {
+      using genai::VaeModelFamily;
+      for (std::string_view role : {VaeModelFamily::kRoleVideoEncode,
+                                    VaeModelFamily::kRoleVideo}) {
+        model_memory::claims_at_holdings(&out,
+                                         f->declare_holdings(root, role));
+      }
+    }
+#endif
     return out;
   }
   // Nothing names it that way: the root IS the checkpoint (a standalone
@@ -1639,8 +1683,12 @@ VaeEncodeStage::encode_one_(const TensorBeat& in_tb, const std::string& what,
     // The family's API takes floats, so this one path keeps the vector.
     Pixels pix(smp, in_scale, in_off, stacked, in_frames, 3, 3, 3, sH, sW,
                H, W, pad);
+    // ...and the encoder's own working set, where its family says.
     revise_scratch_(Pixels::float_bytes(stacked, in_frames, 3, 3, sH, sW,
-                                        H, W));
+                                        H, W) +
+                    encode_working_(_vae_family,
+                                    resolve_model_dir(session(), _hf_dir),
+                                    in_frames, H, W));
     const std::vector<float>& norm = pix.floats();
     let_go();
 

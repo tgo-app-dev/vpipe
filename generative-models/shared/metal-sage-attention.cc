@@ -87,13 +87,20 @@ MetalSageAttention::load(MetalCompute* mc, bool bf16, std::string* err)
   s->_fn_vq8    = s->_lib.function("sage_quant_v_channel_u8");
   s->_pv8_kernels = s->_fn_qtok.valid() && s->_fn_vam.valid() &&
                     s->_fn_var.valid() && s->_fn_vq8.valid();
+  // OPTIONAL alike, and never dispatched: the marker's presence is the
+  // answer for the flash kernel's sinks (sinks_available()).
+  // VPIPE_SAGE_NO_SINKS=1 reads it as absent -- an older host's answer,
+  // for the test of what a caller with sinks does there.
+  const char* ns = std::getenv("VPIPE_SAGE_NO_SINKS");
+  s->_sink_kernels = s->_lib.function("sage_sinks_marker").valid() &&
+                     !(ns != nullptr && ns[0] != '\0' && ns[0] != '0');
   return s;
 }
 
 std::unique_ptr<MetalSageAttention>
 MetalSageAttention::load_for_model(MetalCompute* mc, bool bf16,
                                    const sage::Config& cfg, const char* who,
-                                   bool* fatal)
+                                   bool* fatal, bool with_sinks)
 {
   if (fatal != nullptr) { *fatal = false; }
   if (!cfg.enabled) { return {}; }
@@ -112,6 +119,17 @@ MetalSageAttention::load_for_model(MetalCompute* mc, bool bf16,
     if (fatal != nullptr) { *fatal = true; }
     if (sess != nullptr) {
       sess->log_normal(fmt("{}: sage_attn requested but {}", who, err));
+    }
+    return {};
+  }
+  // An attention with sinks on a host whose flash kernel predates them
+  // would read the sinks wrong (sinks_available()): dense, and said, as
+  // on a box without matrix cores.
+  if (with_sinks && !s->sinks_available()) {
+    if (sess != nullptr) {
+      sess->log_normal(fmt(
+          "{}: sage_attn asked for but this host's attention kernels "
+          "predate sinks under it -- attention stays dense", who));
     }
     return {};
   }
@@ -804,6 +822,7 @@ MetalSageAttention::bind(ComputeEncoder& e, int q_row0) const
     e.set_buffer(16, _k8);
     e.set_buffer(17, _qs, (std::size_t)q_row0 * 4);
     e.set_buffer(18, _ks);
+    e.set_buffer(22, _km);
     if (_pv8_ready) {
       e.set_buffer(19, _v8);
       e.set_buffer(20, _vs);
@@ -815,6 +834,8 @@ MetalSageAttention::bind(ComputeEncoder& e, int q_row0) const
   e.set_buffer(16, _k8);
   e.set_buffer(17, _qs);
   e.set_buffer(18, _ks);
+  // K's mean, for a kernel with sinks (sage::kSinkShiftConstant).
+  e.set_buffer(22, _km);
   if (_pv8_ready) {
     e.set_buffer(19, _v8);
     e.set_buffer(20, _vs);
@@ -830,6 +851,15 @@ MetalSageAttention::pv8_constants(metal_compute::FunctionConstants& fc,
   // 308 the int8 PV (its held uint8 form), 310 Q per token.
   fc.set_bool(sage::kPvInt8Constant, on)
       .set_bool(sage::kQTokenScaleConstant, on);
+}
+
+void
+MetalSageAttention::sink_constants(metal_compute::FunctionConstants& fc,
+                                   const sage::Config& cfg)
+{
+  // 311 the sinks shifted by -scale q.mean: only where the keys were
+  // smoothed, which is also the only prepare() that writes K's mean.
+  fc.set_bool(sage::kSinkShiftConstant, cfg.smooth_k);
 }
 
 }  // namespace genai

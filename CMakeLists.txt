@@ -195,6 +195,12 @@ add_subdirectory(tests)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# The header is a BYPRODUCT, declared: Ninja otherwise decides what to
+# rebuild before the target rewrites it, so the files that include it
+# (vpipe-version.cc, plugin/plugin-context.cc) kept the last build's hash
+# in a reused build dir. Declared, Ninja re-checks them once it is written
+# (restat: a header rewritten only on change still rebuilds nothing when
+# unchanged). Unix Makefiles did not have the problem.
 add_custom_target(vpipe_version ALL
     COMMAND ${CMAKE_COMMAND}
         -DOUTPUT_FILE=${CMAKE_BINARY_DIR}/vpipe-version.h
@@ -202,6 +208,7 @@ add_custom_target(vpipe_version ALL
         -DVERSION_MAJOR=${PROJECT_VERSION_MAJOR}
         -DVERSION_MINOR=${PROJECT_VERSION_MINOR}
         -P ${CMAKE_SOURCE_DIR}/cmake/generate-version.cmake
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/vpipe-version.h
     COMMENT "Generating vpipe-version.h"
     VERBATIM
 )
